@@ -1,5 +1,15 @@
 # Changelog
 
+## [Unreleased]
+
+### Git
+
+- The Git Manager **Merge…** dialog has an **Into** picker. Choose another local branch to merge into it without checking it out: your files and checked-out branch stay as they are, a merge that would conflict is refused before anything changes, and a branch checked out in another worktree is blocked.
+- The Merge dialog lists remote branches as sources.
+- Source Control has **Merge into current branch…**: pick a local or remote branch, **Fetch** it, and merge it into the checked-out branch. A merge in progress shows **Commit merge** and **Abort**, with **Ours**, **Theirs**, and **Mark resolved** for each conflicted file.
+- Source Control and the Git Manager Changes tab no longer lose their file list while a merge has conflicts, and conflicted files appear once.
+- On Git older than 2.38, the merge preview says which Git version it needs instead of reporting unrelated histories.
+
 ## [v0.8.2] - 2026-10-07
 
 BiBCode v0.8.2 makes the left panel easier to read with lifted project and repository cards, adds projects from the Repositories view on any environment, keeps repositories in name order, lets New Branch start from any local or remote branch without switching to it, warns before targeting the main branch in a pull or merge request, and shows progress while a chat panel opens on a slow remote server. This release includes the changes since v0.8.1.

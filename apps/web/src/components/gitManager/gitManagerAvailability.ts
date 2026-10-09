@@ -17,6 +17,8 @@ export const GIT_MANAGER_TAG_DISABLED_REASON =
   "This environment does not support Git Manager tag operations.";
 export const GIT_MANAGER_PULL_REQUESTS_DISABLED_REASON =
   "This environment does not support Git Manager pull request operations.";
+export const GIT_MANAGER_MERGE_INTO_DISABLED_REASON =
+  "This environment does not support merging into a branch that is not checked out.";
 export const GIT_MANAGER_LIVE_SIGNAL_DISABLED_REASON =
   "This environment does not support Git Manager live updates. Use Refresh to load new repository data.";
 
@@ -27,6 +29,7 @@ export interface GitManagerCapabilityDisabledReasons {
   readonly tag: string | null;
   readonly pullRequests: string | null;
   readonly liveSignal: string | null;
+  readonly mergeInto: string | null;
 }
 
 export function resolveGitManagerCapabilityDisabledReasons(
@@ -53,6 +56,10 @@ export function resolveGitManagerCapabilityDisabledReasons(
         : GIT_MANAGER_PULL_REQUESTS_DISABLED_REASON,
     liveSignal:
       capabilities?.gitManagerLiveSignal === true ? null : GIT_MANAGER_LIVE_SIGNAL_DISABLED_REASON,
+    mergeInto:
+      capabilities?.gitManagerMergeIntoOperations === true
+        ? null
+        : GIT_MANAGER_MERGE_INTO_DISABLED_REASON,
   };
 }
 

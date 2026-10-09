@@ -18,6 +18,7 @@ const gitManagerCapabilities = [
   "gitManagerCommitOperations",
   "gitManagerBranchSyncOperations",
   "gitManagerStashMergeOperations",
+  "gitManagerMergeIntoOperations",
   "gitManagerPartialStaging",
   "gitManagerRewriteOperations",
   "gitManagerTagOperations",

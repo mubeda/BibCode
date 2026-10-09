@@ -50,11 +50,11 @@ vi.mock("../toolbar/GitManagerOperationBanner", () => ({
     operation === null ? null : <div data-operation-event={operation._tag} />,
 }));
 
-import { GitManagerMergeDialog } from "./GitManagerMergeDialog";
+import { GitManagerMergeDialog, type GitManagerMergeDialogProps } from "./GitManagerMergeDialog";
 
 const cleanPreview: GitManagerMergePreview = {
   _tag: "clean",
-  source: "feature",
+  source: "refs/heads/feature",
   current: "main",
   ahead: 2,
   behind: 0,
@@ -81,6 +81,8 @@ async function renderDialog(
   refs: ReadonlyArray<GitManagerRefEntry>,
   onOpenChange = vi.fn(),
   disabledReason: string | null = null,
+  remoteRefs: ReadonlyArray<GitManagerRefEntry> = [],
+  extra: Partial<GitManagerMergeDialogProps> = {},
 ) {
   await act(async () =>
     root?.render(
@@ -90,20 +92,53 @@ async function renderDialog(
         scope={{ environmentId: "env-a" as never, cwd: "/repo" }}
         projectRef={{ environmentId: "env-a", projectId: "project-a" } as never}
         refs={refs}
+        remoteRefs={remoteRefs}
         recentNames={["feature"]}
         onOpenChange={onOpenChange}
+        {...extra}
       />,
     ),
   );
   return onOpenChange;
 }
 
-function buttonWithText(text: string): HTMLButtonElement {
+function buttonWithText(text: string): HTMLButtonElement;
+function buttonWithText(text: string, options: { optional: true }): HTMLButtonElement | null;
+function buttonWithText(text: string, options?: { optional: true }): HTMLButtonElement | null {
   const button = [...container.querySelectorAll("button")].find(
     (candidate) => candidate.textContent === text,
   );
-  if (!(button instanceof HTMLButtonElement)) throw new Error(`Missing button: ${text}`);
-  return button;
+  if (button instanceof HTMLButtonElement) return button;
+  if (options?.optional) return null;
+  throw new Error(`Missing button: ${text}`);
+}
+
+function targetInput(): HTMLInputElement {
+  const input = document.querySelector<HTMLInputElement>("#git-manager-merge-target");
+  if (!input) throw new Error("Missing Into input");
+  return input;
+}
+
+async function chooseTarget(label: string) {
+  await act(async () => {
+    targetInput().focus();
+    targetInput()
+      .closest('[data-slot="input-control"]')
+      ?.parentElement?.querySelector<HTMLButtonElement>('[data-slot="combobox-trigger"]')
+      ?.click();
+  });
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(
+      targetInput(),
+      label,
+    );
+    targetInput().dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  const option = [...document.querySelectorAll<HTMLElement>('[role="option"]')].find(
+    (item) => item.textContent?.trim() === label,
+  );
+  if (!option) throw new Error(`Missing Into option: ${label}`);
+  await act(async () => option.click());
 }
 
 beforeEach(() => {
@@ -187,6 +222,269 @@ describe("GitManagerMergeDialog", () => {
     expect(container.textContent).toContain("feature");
   });
 
+  it("lists remote branches and sends their full ref with the repository-level block", async () => {
+    const message = "Merge is blocked: the working tree has uncommitted changes.";
+    const main = {
+      ...branch("main", true),
+      blocked: [{ operation: "merge", code: "dirty-working-tree", message }],
+    } as GitManagerRefEntry;
+    h.preview = { ...cleanPreview, source: "refs/remotes/origin/topic" };
+    await renderDialog([main, branch("feature")], vi.fn(), null, [branch("origin/topic")]);
+    expect(container.textContent).toContain("origin/topic");
+    await act(async () => buttonWithText("origin/topic").click());
+    expect(h.previewMerge).toHaveBeenLastCalledWith(
+      expect.objectContaining({ input: { cwd: "/repo", source: "refs/remotes/origin/topic" } }),
+    );
+    expect(buttonWithText("Merge")).toMatchObject({ disabled: true, title: message });
+  });
+
+  it("merges the checked-out branch into another branch with merge-into", async () => {
+    h.preview = { ...cleanPreview, source: "refs/heads/main", current: "release" };
+    await renderDialog([branch("main", true), branch("release")], vi.fn(), null, [], {
+      mergeIntoAvailable: true,
+    });
+    await chooseTarget("release");
+    expect(container.textContent).toContain("`release` is updated without checking it out.");
+    expect(buttonWithText("Squash merge", { optional: true })).toBeNull();
+    await act(async () => buttonWithText("main").click());
+    await act(async () => buttonWithText("Merge").click());
+    expect(h.runOperation).toHaveBeenLastCalledWith(
+      expect.anything(),
+      {
+        environmentId: "env-a",
+        input: {
+          _tag: "merge-into",
+          cwd: "/repo",
+          projectId: "project-a",
+          source: "refs/heads/main",
+          target: "release",
+        },
+      },
+      expect.any(Function),
+    );
+  });
+
+  it("keeps Merge disabled until the preview matches the chosen target", async () => {
+    h.preview = { ...cleanPreview, current: "main" };
+    await renderDialog(
+      [branch("main", true), branch("release"), branch("feature")],
+      vi.fn(),
+      null,
+      [],
+      { mergeIntoAvailable: true },
+    );
+    await chooseTarget("release");
+    expect(buttonWithText("Merge").disabled).toBe(true);
+  });
+
+  it("hides the Into picker without the capability", async () => {
+    await renderDialog([branch("main", true), branch("feature")]);
+    expect(document.querySelector("#git-manager-merge-target")).toBeNull();
+  });
+
+  it("allows merging into the current branch when Git is too old to preview", async () => {
+    h.preview = null;
+    h.error = "Merge preview needs Git 2.38 or later on this environment (found 2.34.1).";
+    await renderDialog([branch("main", true), branch("feature")]);
+    expect(buttonWithText("Merge").disabled).toBe(false);
+    expect(container.textContent).toContain("found 2.34.1");
+  });
+
+  it("keeps merge-into disabled when Git is too old to preview", async () => {
+    h.preview = null;
+    h.error = "Merge preview needs Git 2.38 or later on this environment (found 2.34.1).";
+    await renderDialog([branch("main", true), branch("release")], vi.fn(), null, [], {
+      mergeIntoAvailable: true,
+    });
+    await chooseTarget("release");
+    expect(buttonWithText("Merge").disabled).toBe(true);
+  });
+
+  it("fetches the selected source's remote, then asks for fresh refs", async () => {
+    const onRefsStale = vi.fn();
+    h.preview = { ...cleanPreview, source: "refs/remotes/origin/topic" };
+    await renderDialog([branch("main", true)], vi.fn(), null, [branch("origin/topic")], {
+      remotes: ["origin"],
+      onRefsStale,
+    });
+    await act(async () => buttonWithText("origin/topic").click());
+    await act(async () => buttonWithText("Fetch").click());
+    expect(h.runOperation).toHaveBeenLastCalledWith(
+      expect.anything(),
+      {
+        environmentId: "env-a",
+        input: { _tag: "fetch", cwd: "/repo", projectId: "project-a", remote: "origin" },
+      },
+      expect.any(Function),
+    );
+    await act(async () =>
+      h.onEvent?.({ _tag: "finished", operation: "fetch", message: "Fetched." }),
+    );
+    expect(onRefsStale).toHaveBeenCalledTimes(1);
+  });
+
+  it("fetches each remote in turn for a local source", async () => {
+    const onRefsStale = vi.fn();
+    await renderDialog([branch("main", true), branch("feature")], vi.fn(), null, [], {
+      remotes: ["origin", "upstream"],
+      onRefsStale,
+    });
+    await act(async () => buttonWithText("Fetch").click());
+    expect(h.runOperation).toHaveBeenLastCalledWith(
+      expect.anything(),
+      expect.objectContaining({ input: expect.objectContaining({ remote: "origin" }) }),
+      expect.any(Function),
+    );
+    await act(async () =>
+      h.onEvent?.({ _tag: "finished", operation: "fetch", message: "Fetched." }),
+    );
+    expect(h.runOperation).toHaveBeenLastCalledWith(
+      expect.anything(),
+      expect.objectContaining({ input: expect.objectContaining({ remote: "upstream" }) }),
+      expect.any(Function),
+    );
+    expect(onRefsStale).not.toHaveBeenCalled();
+    await act(async () =>
+      h.onEvent?.({ _tag: "finished", operation: "fetch", message: "Fetched." }),
+    );
+    expect(onRefsStale).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the dialog open and shows a failed fetch", async () => {
+    const onOpenChange = await renderDialog(
+      [branch("main", true), branch("feature")],
+      vi.fn(),
+      null,
+      [],
+      { remotes: ["origin"] },
+    );
+    await act(async () => buttonWithText("Fetch").click());
+    await act(async () =>
+      h.onEvent?.({
+        _tag: "failed",
+        operation: "fetch",
+        code: "authentication",
+        message: "Authentication failed.",
+        blocked: null,
+      }),
+    );
+    expect(onOpenChange).not.toHaveBeenCalledWith(false);
+    expect(container.textContent).toContain("Authentication failed.");
+  });
+
+  it("reports whether a fetch or merge is running", async () => {
+    const onRunningChange = vi.fn();
+    await renderDialog([branch("main", true), branch("feature")], vi.fn(), null, [], {
+      remotes: ["origin"],
+      onRunningChange,
+    });
+    await act(async () => buttonWithText("Fetch").click());
+    expect(onRunningChange).toHaveBeenLastCalledWith(true);
+    await act(async () =>
+      h.onEvent?.({ _tag: "finished", operation: "fetch", message: "Fetched." }),
+    );
+    expect(onRunningChange).toHaveBeenLastCalledWith(false);
+  });
+
+  it("refreshes refs when a later remote fails after an earlier fetch succeeded", async () => {
+    const onRefsStale = vi.fn();
+    await renderDialog([branch("main", true), branch("feature")], vi.fn(), null, [], {
+      remotes: ["origin", "upstream"],
+      onRefsStale,
+    });
+    await act(async () => buttonWithText("Fetch").click());
+    await act(async () =>
+      h.onEvent?.({ _tag: "finished", operation: "fetch", message: "Fetched." }),
+    );
+    await act(async () =>
+      h.onEvent?.({
+        _tag: "failed",
+        operation: "fetch",
+        code: "authentication",
+        message: "Authentication failed.",
+        blocked: null,
+      }),
+    );
+    expect(onRefsStale).toHaveBeenCalledTimes(1);
+    expect(container.textContent).toContain("Authentication failed.");
+  });
+
+  it("clears its owner's busy state when unmounted mid-operation", async () => {
+    const onRunningChange = vi.fn();
+    await renderDialog([branch("main", true), branch("feature")], vi.fn(), null, [], {
+      remotes: ["origin"],
+      onRunningChange,
+    });
+    await act(async () => buttonWithText("Fetch").click());
+    expect(onRunningChange).toHaveBeenLastCalledWith(true);
+    await act(async () => root?.unmount());
+    root = null;
+    expect(onRunningChange).toHaveBeenLastCalledWith(false);
+  });
+
+  it("shows a refs loading failure with a Retry action", async () => {
+    const onRefsStale = vi.fn();
+    await renderDialog([], vi.fn(), null, [], {
+      refsError: "Could not load branches.",
+      onRefsStale,
+    });
+    expect(container.textContent).toContain("Could not load branches.");
+    expect(container.textContent).not.toContain("No source branches found.");
+    await act(async () => buttonWithText("Retry").click());
+    expect(onRefsStale).toHaveBeenCalledTimes(1);
+  });
+
+  it("locks the source choice while a fetch runs so the preview stays the fetched one", async () => {
+    await renderDialog(
+      [branch("main", true), branch("feature")],
+      vi.fn(),
+      null,
+      [branch("origin/topic")],
+      {
+        remotes: ["origin"],
+      },
+    );
+    await act(async () => buttonWithText("Fetch").click());
+    expect(buttonWithText("origin/topic").disabled).toBe(true);
+    expect(buttonWithText("feature").disabled).toBe(true);
+    await act(async () =>
+      h.onEvent?.({ _tag: "finished", operation: "fetch", message: "Fetched." }),
+    );
+    expect(buttonWithText("origin/topic").disabled).toBe(false);
+  });
+
+  it("explains a failed preview on the disabled Merge button", async () => {
+    h.preview = null;
+    h.error = "The current HEAD could not be resolved for merge preview.";
+    await renderDialog([branch("main", true), branch("feature")]);
+    expect(buttonWithText("Merge")).toMatchObject({
+      disabled: true,
+      title: "The current HEAD could not be resolved for merge preview.",
+    });
+  });
+
+  it("closes on a conflicted current-branch merge so the panel strip shows", async () => {
+    const onOpenChange = await renderDialog(
+      [branch("main", true), branch("feature")],
+      vi.fn(),
+      null,
+      [],
+      { targetMode: "current-branch" },
+    );
+    expect(buttonWithText("Squash merge", { optional: true })).toBeNull();
+    await act(async () => buttonWithText("Merge").click());
+    await act(async () =>
+      h.onEvent?.({
+        _tag: "failed",
+        operation: "merge",
+        code: "conflicts",
+        message: "Conflicts.",
+        blocked: null,
+      }),
+    );
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+  });
+
   it("closes on finished and stays open with the failure code on failed", async () => {
     const onOpenChange = await renderDialog([branch("main", true), branch("feature")]);
     await act(async () => buttonWithText("Merge").click());
@@ -198,7 +496,7 @@ describe("GitManagerMergeDialog", () => {
           _tag: "merge",
           cwd: "/repo",
           projectId: "project-a",
-          source: "feature",
+          source: "refs/heads/feature",
           noVerify: false,
         },
       },

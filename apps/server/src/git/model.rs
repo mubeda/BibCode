@@ -111,6 +111,9 @@ pub struct VcsStatusLocalResult {
     pub default_ref_name: Option<String>,
     pub has_working_tree_changes: bool,
     pub working_tree: VcsWorkingTree,
+    /// Repository operation left in progress; absent when none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_in_progress: Option<crate::git::GitManagerInProgressKind>,
 }
 
 impl VcsStatusLocalResult {
@@ -126,6 +129,7 @@ impl VcsStatusLocalResult {
             default_ref_name: None,
             has_working_tree_changes: false,
             working_tree: VcsWorkingTree::default(),
+            operation_in_progress: None,
         }
     }
 

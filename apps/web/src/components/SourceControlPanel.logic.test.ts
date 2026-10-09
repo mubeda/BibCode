@@ -82,6 +82,20 @@ describe("groupFilesByArea", () => {
     expect(groups.unstaged.map((f) => f.path)).toEqual(["b.ts", "d.ts"]);
     expect(groups.untracked.map((f) => f.path)).toEqual(["c.txt"]);
   });
+
+  it("groups conflicted files apart from ordinary changes when asked to", () => {
+    const files = [
+      { path: "a.txt", insertions: 0, deletions: 0, status: "conflicted", area: "unstaged" },
+      { path: "b.txt", insertions: 1, deletions: 0, status: "modified", area: "unstaged" },
+    ] as const;
+    const separated = groupFilesByArea(files, { separateConflicts: true });
+    expect(separated.conflicted.map((file) => file.path)).toEqual(["a.txt"]);
+    expect(separated.unstaged.map((file) => file.path)).toEqual(["b.txt"]);
+
+    const ordinary = groupFilesByArea(files);
+    expect(ordinary.conflicted).toEqual([]);
+    expect(ordinary.unstaged.map((file) => file.path)).toEqual(["a.txt", "b.txt"]);
+  });
 });
 
 describe("isFileStaged", () => {

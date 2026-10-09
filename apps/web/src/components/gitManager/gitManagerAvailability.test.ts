@@ -10,6 +10,7 @@ import { describe, expect, it } from "vite-plus/test";
 import {
   GIT_MANAGER_BRANCH_SYNC_DISABLED_REASON,
   GIT_MANAGER_LIVE_SIGNAL_DISABLED_REASON,
+  GIT_MANAGER_MERGE_INTO_DISABLED_REASON,
   GIT_MANAGER_PULL_REQUESTS_DISABLED_REASON,
   GIT_MANAGER_REWRITE_DISABLED_REASON,
   GIT_MANAGER_STASH_MERGE_DISABLED_REASON,
@@ -121,6 +122,7 @@ describe("resolveGitManagerCapabilityDisabledReasons", () => {
       tag: GIT_MANAGER_TAG_DISABLED_REASON,
       pullRequests: GIT_MANAGER_PULL_REQUESTS_DISABLED_REASON,
       liveSignal: GIT_MANAGER_LIVE_SIGNAL_DISABLED_REASON,
+      mergeInto: GIT_MANAGER_MERGE_INTO_DISABLED_REASON,
     });
   });
 
@@ -131,6 +133,7 @@ describe("resolveGitManagerCapabilityDisabledReasons", () => {
           gitManagerReads: true,
           gitManagerBranchSyncOperations: true,
           gitManagerLiveSignal: true,
+          gitManagerMergeIntoOperations: true,
         }),
       },
     } as ServerConfig;
@@ -142,6 +145,7 @@ describe("resolveGitManagerCapabilityDisabledReasons", () => {
       tag: GIT_MANAGER_TAG_DISABLED_REASON,
       pullRequests: GIT_MANAGER_PULL_REQUESTS_DISABLED_REASON,
       liveSignal: null,
+      mergeInto: null,
     });
   });
 });

@@ -25,6 +25,7 @@ const MUTATING_OPERATIONS: &[&str] = &[
     "force-move",
     "force-push",
     "merge",
+    "merge-into",
     "publish-branch",
     "pull",
     "push",
@@ -325,7 +326,7 @@ fn add_worktree_occupancy_reasons(
             move_message.clone(),
         ));
     }
-    for operation in ["fetch", "pull"] {
+    for operation in ["fetch", "pull", "merge-into"] {
         blocked.push(blocked_reason(
             operation,
             BlockedCode::WorktreeCheckedOut,
@@ -680,6 +681,7 @@ mod tests {
             "force-move",
             "force-push",
             "merge",
+            "merge-into",
             "publish-branch",
             "pull",
             "push",
@@ -731,6 +733,7 @@ mod tests {
             "force-move",
             "force-push",
             "merge",
+            "merge-into",
             "publish-branch",
             "pull",
             "push",
@@ -952,6 +955,7 @@ mod tests {
                 "delete-branch",
                 "fetch",
                 "force-move",
+                "merge-into",
                 "pull",
                 "rebase",
                 "rename-branch",

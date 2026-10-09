@@ -33,6 +33,22 @@ describe("buildChangeRows", () => {
     expect(rows[0]!.conflicted).toBe(false);
   });
 
+  it("keeps a conflicted file visible under the Modified filter", () => {
+    const rows = buildChangeRows({
+      files: [
+        { path: "a.txt", insertions: 0, deletions: 0, status: "conflicted", area: "unstaged" },
+        { path: "b.txt", insertions: 2, deletions: 0, status: "untracked", area: "untracked" },
+      ],
+      conflictedPaths: ["a.txt"],
+      submodulePaths: [],
+      filterText: "",
+      filters: { included: false, excluded: false, new: false, modified: true, deleted: false },
+      excludedPaths: new Set(),
+    });
+
+    expect(rows.map((row) => row.path)).toEqual(["a.txt"]);
+  });
+
   it("AND-combines text and boolean filters and reports included rows hidden by them", () => {
     const rows = buildChangeRows({
       files: [

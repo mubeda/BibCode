@@ -9,15 +9,25 @@ export interface WorkingTreeFile {
 }
 
 export interface WorkingTreeGroups {
+  /** Unmerged paths of a merge in progress; staging one marks it resolved. */
+  readonly conflicted: WorkingTreeFile[];
   readonly staged: WorkingTreeFile[];
   readonly unstaged: WorkingTreeFile[];
   readonly untracked: WorkingTreeFile[];
 }
 
-export function groupFilesByArea(files: readonly WorkingTreeFile[]): WorkingTreeGroups {
-  const groups: WorkingTreeGroups = { staged: [], unstaged: [], untracked: [] };
+/**
+ * `separateConflicts` moves conflicted paths into their own group; only do so while a
+ * dedicated conflict section renders, or they would vanish from the panel.
+ */
+export function groupFilesByArea(
+  files: readonly WorkingTreeFile[],
+  options: { readonly separateConflicts?: boolean } = {},
+): WorkingTreeGroups {
+  const groups: WorkingTreeGroups = { conflicted: [], staged: [], unstaged: [], untracked: [] };
   for (const file of files) {
-    if (file.area === "staged") groups.staged.push(file);
+    if (options.separateConflicts && file.status === "conflicted") groups.conflicted.push(file);
+    else if (file.area === "staged") groups.staged.push(file);
     else if (file.area === "untracked") groups.untracked.push(file);
     else groups.unstaged.push(file);
   }

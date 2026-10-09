@@ -41,6 +41,7 @@ function makeInput(
     hasPrimaryRemote?: boolean;
     stagedCount?: number;
     stageableCount?: number;
+    mergeAvailable?: boolean;
   } = {},
 ): SourceControlPrimaryActionInput {
   return {
@@ -50,6 +51,7 @@ function makeInput(
     hasPrimaryRemote: args.hasPrimaryRemote ?? true,
     stagedCount: args.stagedCount ?? 0,
     stageableCount: args.stageableCount ?? 0,
+    mergeAvailable: args.mergeAvailable ?? true,
   };
 }
 
@@ -298,11 +300,12 @@ describe("buildSourceControlMenuItems — always-rendered, disabled-with-reason"
       "commit_push_pr",
       "push",
       "pull",
+      "merge",
       "create_pr",
     ]);
     assert.deepEqual(
       items.map((item) => item.group),
-      ["commit", "commit", "commit", "remote", "remote", "remote"],
+      ["commit", "commit", "commit", "remote", "remote", "remote", "remote"],
     );
   });
 
@@ -368,6 +371,7 @@ describe("buildSourceControlMenuItems — always-rendered, disabled-with-reason"
       "commit_push_pr",
       "push",
       "pull",
+      "merge",
       "create_pr",
       "publish",
     ]);
@@ -401,6 +405,7 @@ describe("buildSourceControlMenuItems — always-rendered, disabled-with-reason"
       "commit_push_pr",
       "push",
       "pull",
+      "merge",
       "open_pr",
     ]);
     assert.deepInclude(menuItem(items, "open_pr"), {
@@ -467,6 +472,7 @@ describe("buildSourceControlMenuItems — always-rendered, disabled-with-reason"
       "commit_push",
       "push",
       "pull",
+      "merge",
     ]);
   });
 
@@ -475,12 +481,49 @@ describe("buildSourceControlMenuItems — always-rendered, disabled-with-reason"
       status: { refName: "bibcode/deadbeef", aheadCount: 2 },
       stagedCount: 3,
     });
-    assert.deepEqual(menuIds(buildSourceControlMenuItems(input)), ["commit", "pull", "create_pr"]);
+    assert.deepEqual(menuIds(buildSourceControlMenuItems(input)), [
+      "commit",
+      "pull",
+      "merge",
+      "create_pr",
+    ]);
     assert.equal(
       resolveSourceControlPrimaryAction(
         makeInput({ status: { refName: "bibcode/deadbeef", aheadCount: 2 } }),
       ).kind,
       "none",
+    );
+  });
+});
+
+describe("buildSourceControlMenuItems — Merge into current branch", () => {
+  it.each([
+    [{ refName: null }, "Check out a branch to merge into."],
+    [{ operationInProgress: "merge" as const }, "Finish or abort the current merge first."],
+    [{ hasWorkingTreeChanges: true }, "Commit your changes before merging."],
+  ])("gates Merge into current branch (%o)", (overrides, reason) => {
+    const items = buildSourceControlMenuItems(makeInput({ status: overrides }));
+    assert.deepInclude(menuItem(items, "merge"), {
+      label: "Merge into current branch…",
+      disabled: true,
+      reason,
+      kind: "open_merge",
+      group: "remote",
+    });
+  });
+
+  it("enables Merge into current branch on a clean checked-out branch", () => {
+    const items = buildSourceControlMenuItems(makeInput());
+    assert.deepInclude(menuItem(items, "merge"), { disabled: false, kind: "open_merge" });
+  });
+
+  it("explains a missing merge capability first", () => {
+    const items = buildSourceControlMenuItems(
+      makeInput({ status: { refName: null }, mergeAvailable: false }),
+    );
+    assert.equal(
+      menuItem(items, "merge").reason,
+      "This environment does not support Git Manager stash and merge operations.",
     );
   });
 });

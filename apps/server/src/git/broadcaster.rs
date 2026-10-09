@@ -2499,7 +2499,8 @@ mod tests {
                     "GitVcsDriver.statusDetailsLocal.remotes" => (0, String::new()),
                     "GitVcsDriver.defaultRef.originHead"
                     | "GitVcsDriver.remoteProvider"
-                    | "GitVcsDriver.statusDetailsRemote.defaultDelta" => (1, String::new()),
+                    | "GitVcsDriver.statusDetailsRemote.defaultDelta"
+                    | "GitManager.getRefs.inProgressPaths" => (1, String::new()),
                     "GitVcsDriver.defaultRef.candidate" => (0, String::new()),
                     "GitVcsDriver.currentRef" => (0, "main\n".to_owned()),
                     "GitManager.signal.refs" => {
@@ -2551,7 +2552,9 @@ mod tests {
                         (0, "# branch.head main\n".to_owned())
                     }
                     "GitVcsDriver.currentRef" => (0, "main\n".to_owned()),
-                    "GitVcsDriver.remoteProvider" => (1, String::new()),
+                    "GitVcsDriver.remoteProvider" | "GitManager.getRefs.inProgressPaths" => {
+                        (1, String::new())
+                    }
                     "GitManager.signal.refs" => {
                         (0, "deadbeef\trefs/heads/main\t/repository\n".to_owned())
                     }
@@ -2627,9 +2630,9 @@ mod tests {
                             ),
                         )
                     }
-                    "GitVcsDriver.defaultRef.originHead" | "GitVcsDriver.defaultRef.candidate" => {
-                        (1, String::new())
-                    }
+                    "GitVcsDriver.defaultRef.originHead"
+                    | "GitVcsDriver.defaultRef.candidate"
+                    | "GitManager.getRefs.inProgressPaths" => (1, String::new()),
                     "GitManager.signal.refs" => {
                         (0, format!("deadbeef\trefs/heads/{branch}\t/repository\n"))
                     }
@@ -2828,7 +2831,8 @@ mod tests {
                     "GitVcsDriver.statusDetailsLocal.remotes"
                     | "GitVcsDriver.remoteProvider"
                     | "GitVcsDriver.defaultRef.originHead"
-                    | "GitVcsDriver.defaultRef.candidate" => Ok(Self::output(1, String::new())),
+                    | "GitVcsDriver.defaultRef.candidate"
+                    | "GitManager.getRefs.inProgressPaths" => Ok(Self::output(1, String::new())),
                     "GitManager.signal.refs" => Ok(Self::output(
                         0,
                         "deadbeef\trefs/heads/main\t/repository\n".to_owned(),
@@ -3071,7 +3075,9 @@ mod tests {
                     "GitVcsDriver.defaultRef.originHead" => {
                         (0, "refs/remotes/origin/main\n".to_owned())
                     }
-                    "GitVcsDriver.remoteProvider" => (1, String::new()),
+                    "GitVcsDriver.remoteProvider" | "GitManager.getRefs.inProgressPaths" => {
+                        (1, String::new())
+                    }
                     "GitVcsDriver.statusDetailsRemote.defaultDelta" => {
                         (0, format!("{}\n", usize::from(self.fetch_count() > 0) * 2))
                     }

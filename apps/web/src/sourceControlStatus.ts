@@ -13,6 +13,7 @@ export const WORKING_TREE_STATUS_BADGE: Record<VcsWorkingTreeFileStatus, Working
   renamed: { letter: "R", className: "text-warning", label: "Renamed" },
   copied: { letter: "C", className: "text-success", label: "Copied" },
   untracked: { letter: "U", className: "text-success", label: "Untracked" },
+  conflicted: { letter: "!", className: "text-destructive", label: "Conflicted" },
 };
 
 export function workingTreeStatusBadge(

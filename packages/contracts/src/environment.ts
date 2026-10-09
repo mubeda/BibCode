@@ -45,6 +45,9 @@ export const ExecutionEnvironmentCapabilities = Schema.Struct({
   gitManagerStashMergeOperations: Schema.Boolean.pipe(
     Schema.withDecodingDefault(Effect.succeed(false)),
   ),
+  gitManagerMergeIntoOperations: Schema.Boolean.pipe(
+    Schema.withDecodingDefault(Effect.succeed(false)),
+  ),
   gitManagerPartialStaging: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   gitManagerRewriteOperations: Schema.Boolean.pipe(
     Schema.withDecodingDefault(Effect.succeed(false)),
