@@ -500,12 +500,26 @@ async function observe(seed) {
       throw new Error("The packaged primary bootstrap is unavailable.");
     }
     const bearer = await bridge.getLocalEnvironmentBearerToken();
-    const descriptorResponse = await fetch(
-      new URL("/.well-known/bibcode/environment", bootstrap.httpBaseUrl),
-    );
-    if (!descriptorResponse.ok) {
-      throw new Error("The environment descriptor request failed.");
-    }
+    const descriptorResponse = await new Promise((resolve, reject) => {
+      const startedAt = Date.now();
+      const poll = () => {
+        fetch(new URL("/.well-known/bibcode/environment", bootstrap.httpBaseUrl))
+          .then((response) => {
+            if (response.ok) return resolve(response);
+            if (Date.now() - startedAt >= 5000) {
+              return reject(new Error("The environment descriptor request failed."));
+            }
+            setTimeout(poll, 200);
+          })
+          .catch(() => {
+            if (Date.now() - startedAt >= 5000) {
+              return reject(new Error("The environment descriptor request failed."));
+            }
+            setTimeout(poll, 200);
+          });
+      };
+      poll();
+    });
     const descriptor = await descriptorResponse.json();
     const ticketResponse = await fetch(
       new URL("/api/auth/websocket-ticket", bootstrap.httpBaseUrl),
@@ -606,7 +620,21 @@ async function observe(seed) {
 
 describe("seeded packaged upgrade ${input.lane} ${input.phase}", () => {
   it("uses public desktop and authenticated RPC boundaries", async () => {
-    const observation = await observe(${input.phase === "seed-and-install" ? "true" : "false"});
+    const observation = await (async () => {
+      let lastError;
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        try {
+          return await observe(${input.phase === "seed-and-install" ? "true" : "false"});
+        } catch (error) {
+          lastError = error;
+          const message = String(error && error.message ? error.message : error);
+          const retryable = /Load failed|environment descriptor request failed|Timed out opening RPC|RPC failed|Timed out waiting for orchestration\\.subscribeShell/.test(message);
+          if (!retryable || attempt === 1) throw error;
+          await browser.pause(250);
+        }
+      }
+      throw lastError;
+    })();
     NodeFS.writeFileSync(input.resultPath, JSON.stringify(observation));
     ${
       input.phase === "seed-and-install" && input.lane === "remote-install"
@@ -975,11 +1003,15 @@ try {
     $observation.fileVersion = $file.VersionInfo.FileVersion
     $observation.sha256 = (Get-FileHash -LiteralPath $observation.path -Algorithm SHA256).Hash
   }
-  $suffix = '-' + $env:BIBCODE_SEEDED_CANDIDATE_VERSION + '-installer.exe'
-  $observation.installers = @(Get-CimInstance Win32_Process | Where-Object {
-    $_.Name.EndsWith($suffix, [System.StringComparison]::OrdinalIgnoreCase)
+  # Process enumeration stays inside the 10s probe bound. A full CIM snapshot
+  # exceeds it on Windows ARM64 and hides whether the installer has exited.
+  $suffix = '-' + $env:BIBCODE_SEEDED_CANDIDATE_VERSION + '-installer'
+  $observation.installers = @(Get-Process -ErrorAction SilentlyContinue | Where-Object {
+    $_.ProcessName.EndsWith($suffix, [System.StringComparison]::OrdinalIgnoreCase)
   } | ForEach-Object {
-    [ordered]@{ pid = $_.ProcessId; parentPid = $_.ParentProcessId; path = $_.ExecutablePath }
+    $imagePath = $null
+    try { $imagePath = $_.Path } catch { $imagePath = $null }
+    [ordered]@{ pid = $_.Id; parentPid = $null; path = $imagePath }
   })
 } catch {
   $observation.error = $_.FullyQualifiedErrorId

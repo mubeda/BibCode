@@ -25,6 +25,7 @@ import {
   assertSeededUpgradeBuildVersion,
   assertWebDriverPhaseExit,
   windowsCandidateIsInstalled,
+  windowsUpgradeObservationScript,
   readWindowsCandidateProbe,
   terminateSeededUpgradeChild,
   SeededUpgradeCommandTimeoutError,
@@ -1832,6 +1833,25 @@ describe("seeded packaged desktop upgrade harness", () => {
     expect(combined).toContain("orchestration.dispatchCommand");
     expect(combined).toContain("project.create");
     expect(combined).toContain("orchestration.subscribeShell");
+    expect(combined).toContain("Load failed");
+    expect(verify).toContain('request("orchestration.subscribeShell", {}, true)');
+    const startupRetry =
+      /Load failed|environment descriptor request failed|Timed out opening RPC|RPC failed|Timed out waiting for orchestration\.subscribeShell/;
+    expect(verify).toContain(startupRetry.source);
+    expect(
+      startupRetry.test("WebDriverError: Load failed when running execute/sync with method POST"),
+    ).toBe(true);
+    expect(
+      startupRetry.test(
+        "WebDriverError: Timed out waiting for orchestration.subscribeShell. when running execute/sync",
+      ),
+    ).toBe(true);
+    expect(
+      startupRetry.test("The candidate application version was not running after update."),
+    ).toBe(false);
+    expect(windowsUpgradeObservationScript).toContain("Get-Process -ErrorAction SilentlyContinue");
+    expect(windowsUpgradeObservationScript).not.toContain("Get-CimInstance");
+    expect(windowsUpgradeObservationScript).toContain("-installer");
     expect(combined).toContain("getProjectDataStatuses");
     expect(combined).toContain("getUpdateState");
     expect(seed).toContain("downloadUpdate");

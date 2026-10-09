@@ -55,7 +55,8 @@ typed deadline only after the exact owned child emits `close`, including pipe
 closure. Exit status or a kill request alone is insufficient. The installed
 candidate poll records that deadline as unavailable and retries within its
 existing overall bound; a five-second cleanup deadline, failed spawn, or other
-cleanup error stays fatal. Keep unavailable observations in the private handoff
+cleanup error stays fatal. The sample enumerates installer processes with
+`Get-Process` so the ten-second bound can finish on ARM64. Keep unavailable observations in the private handoff
 log and retain the strict version/hash/no-installer predicate. Hermetic support
 tests cover exit-before-close, cleanup failure, transient samples, and an
 all-unavailable poll; actual installer qualification remains CI-only.
