@@ -134,6 +134,31 @@ export class PreviewAutomationTargetNotEditableHostError extends Schema.TaggedEr
   }
 }
 
+/**
+ * The tab's page can't load: the gateway refused it, or this client can't
+ * reach it. The automation status shape has no failure field, so the reason
+ * travels in this error's message.
+ */
+export class PreviewAutomationPageUnreachableError extends Schema.TaggedError<PreviewAutomationPageUnreachableError>()(
+  "PreviewAutomationPageUnreachableError",
+  {
+    requestId: TrimmedNonEmptyString,
+    operation: PreviewAutomationOperation,
+    environmentId: EnvironmentId,
+    threadId: ThreadId,
+    tabId: Schema.NullOr(PreviewTabId),
+    reason: Schema.String,
+  },
+) {
+  get responseTag() {
+    return "PreviewAutomationExecutionError" as const;
+  }
+
+  override get message(): string {
+    return `Preview tab ${this.tabId ?? "unassigned"} couldn't load its page: ${this.reason}`;
+  }
+}
+
 const targetNotEditableDiagnostics = (
   cause: unknown,
 ): {
@@ -212,6 +237,7 @@ export const PreviewAutomationHostError = Schema.Union([
   PreviewAutomationTargetUnavailableError,
   PreviewAutomationRecordingNotActiveError,
   PreviewAutomationTargetNotEditableHostError,
+  PreviewAutomationPageUnreachableError,
   PreviewAutomationOperationError,
 ]);
 export type PreviewAutomationHostError = typeof PreviewAutomationHostError.Type;

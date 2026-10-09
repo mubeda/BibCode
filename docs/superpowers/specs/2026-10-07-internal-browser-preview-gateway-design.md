@@ -63,26 +63,19 @@ Owner: `apps/server/src/preview/gateway/` (new module), wired from
 
 ### Admission
 
-RPC `preview.gatewayOpen({ threadId, port })` →
+RPC `preview.gatewayOpen({ threadId, url })` (the canonical loopback URL, so the server can reject HTTPS itself) →
 `{ gatewayPort, capability, expiresAtMs }`.
 
 - Requires `orchestration:operate` (the same grant `preview.open` already needs
   in `apps/server/src/auth/scope.rs`). A gateway gives full read/write access to
   the upstream service, so read scope is not enough.
 - Target host is always server loopback; the client sends only a port.
-- Admitted ports, per thread:
-  - ports attributed (Phase 0 port attribution) to a terminal or provider
-    process of **that thread**; or
-  - a port the user explicitly entered or clicked in that thread's UI, or an
-    agent of that thread named in `preview_open`/`open-url` (recorded on the
-    thread's preview state).
-
-  Host-wide discovered ports not attributed to the thread are **not** admitted
-  without that explicit action. Anything else → `PreviewError::TargetNotAdmitted`.
-- Upstream address family: use the address the scanner saw the port listening
-  on (`127.0.0.1` or `::1`; the scanner keeps the family instead of normalizing
-  `::1` to IPv4). For explicitly named ports with no scan record, try
-  `127.0.0.1` then `::1`.
+- Admitted: any **loopback** port the caller names. Every `gatewayOpen` call is an
+  explicit user or agent action (click, URL-bar submit, agent `preview_open`,
+  claimed `open-url` request) by an `orchestration:operate` caller, so no
+  separate attribution or explicit-port list is kept. Non-loopback hosts and
+  non-HTTP schemes → `PreviewError::TargetNotAdmitted`.
+- Upstream address family: try `127.0.0.1` then `::1` (first that accepts).
 - HTTP upstreams only. An `https://localhost:<port>` target is rejected with
   "HTTPS dev servers can't be previewed through the gateway yet; serve over HTTP
   or open it on <environment> directly." TLS upstreams are out of scope.
@@ -121,8 +114,9 @@ RPC `preview.gatewayOpen({ threadId, port })` →
 4. Gateway sessions are bound to the granting principal: each request and each
    live connection checks the principal through the auth service
    (`authenticate_token` semantics; cached for at most 30 s). Expiry or
-   revocation ends the gateway session and cancels its live connections through
-   the existing revocation connection registry. Maximum gateway session lifetime
+   revocation ends the gateway session and closes its live connections within
+   that 30 s window (a periodic check, not the revocation connection registry,
+   which would list every preview connection as a connected client). Maximum gateway session lifetime
    is the principal's expiry; a listener closing also ends its sessions.
 
 ### Request Origin check
@@ -194,7 +188,8 @@ non-local environments:
 | Local primary | not used (loopback is already correct) |
 | LAN / tailnet / WSL | `http://<environment host>:<gatewayPort>` |
 | SSH (desktop-managed) | `http://127.0.0.1:<localPort>` from `DesktopBridge.sshForward` |
-| Relay | `unreachable`: "Previews of server ports aren't available over BiBCode Connect yet." |
+| Relay | `unreachable` (Phase 0 copy) |
+| Public-IP bearer host | `unreachable` (Phase 0 copy): gateway traffic is plain HTTP and is not exposed to public binds in this phase |
 
 3. Navigate to the bootstrap URL carrying the original path, query (including
    the companion's `?key=`), and fragment.
@@ -216,8 +211,10 @@ non-local environments:
   ControlMaster `-O forward` when the connection has a control socket, otherwise
   a dedicated `ssh -N -L` child admitted and reaped by the same owner.
 - Local port is any free loopback port, so collisions do not occur.
-- Released with the gateway target (tab close) or the tunnel; idempotent per
-  `(environmentId, remotePort)`.
+- Released when the last client tab using it closes or its gateway port changes
+  (client reference count), or with the tunnel; idempotent per
+  `(environmentId, remotePort)`; at most 8 forwards per tunnel (least recently
+  requested evicted) so leaks can't exhaust the shared SSH child capacity.
 - Follows the existing SSH process admission, cancellation, and reaping rules.
 
 ### Browser mode
@@ -244,7 +241,7 @@ non-local environments:
 - The server mints a per-session token scoped to one thread and one
   capability: requesting an open for that thread. Lifetime: the provider or
   terminal session.
-- Injected as `BIBCODE_OPEN_URL_TOKEN` and `BIBCODE_OPEN_URL_ENDPOINT` into
+- Injected as `BIBCODE_OPEN_URL_AUTH` and `BIBCODE_OPEN_URL_ENDPOINT` into
   provider launches (`production/provider_runtime.rs`, alongside the MCP
   credential) and terminal spawns (`terminal/pty.rs` env assembly).
 
@@ -274,8 +271,7 @@ non-local environments:
   `POST /api/preview/open-url` route on the main server) with
   `authorization: Bearer <token>`. Header authentication, so section 1's Origin
   rule does not apply.
-- The server records the URL's port as explicitly named for the thread
-  (admission) and emits `PreviewEvent::OpenRequested { requestId, threadId, url }`.
+- The server emits `PreviewEvent::OpenRequested { requestId, threadId, url }`.
   It does **not** create a tab itself.
 - Exit 0 and print the URL when no client is subscribed, so the calling tool
   does not fail. Network/auth failure → print the URL, exit 0, log to stderr.
@@ -329,9 +325,8 @@ child follow `desktop_preview_set_bounds` on panel move/resize?
 
 - Rust unit/integration (`apps/server`):
   - Section 1 Origin enforcement (cookie vs bearer, HTTP vs WS).
-  - Admission: operate scope required; port attributed to another thread or
-    unattributed and not explicitly named → rejected; HTTPS target rejected;
-    `::1`-only upstream reached.
+  - Admission: operate scope required; non-loopback or non-HTTP target →
+    rejected; HTTPS target rejected; `::1`-only upstream reached.
   - Capability single-use, expiry, binding to principal; bootstrap `to` must be
     a path; bootstrap sets the cookie and returns the `location.replace` page.
   - Principal revocation cancels a live gateway WebSocket.

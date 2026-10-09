@@ -7,6 +7,9 @@ import * as Cause from "effect/Cause";
 import { AsyncResult } from "effect/unstable/reactivity";
 import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
+const { releasePreviewTab } = vi.hoisted(() => ({ releasePreviewTab: vi.fn() }));
+vi.mock("~/browser/previewGateway", () => ({ releasePreviewTab }));
+
 import {
   applyPreviewServerSnapshot,
   readThreadPreviewState,
@@ -33,7 +36,10 @@ const snapshot: PreviewSessionSnapshot = {
   updatedAt: "2026-06-18T19:00:00.000Z",
 };
 
-beforeEach(resetPreviewStateForTests);
+beforeEach(() => {
+  resetPreviewStateForTests();
+  releasePreviewTab.mockClear();
+});
 
 describe("closePreviewSession", () => {
   it("suppresses stale server snapshots while the close is in flight", async () => {
@@ -57,9 +63,12 @@ describe("closePreviewSession", () => {
     applyPreviewServerSnapshot(threadRef, snapshot);
     expect(readThreadPreviewState(threadRef).sessions).toEqual({});
 
+    expect(releasePreviewTab).not.toHaveBeenCalled();
     finishClose?.();
     await closing;
     expect(closePreview).toHaveBeenCalledWith({ threadId: "thread-1", tabId: "tab-1" });
+    // Its SSH forwards go at once, even when no preview view is mounted.
+    expect(releasePreviewTab).toHaveBeenCalledWith("local", "tab-1");
   });
 
   it("restores the last snapshot when the server close fails", async () => {
@@ -73,6 +82,7 @@ describe("closePreviewSession", () => {
     });
 
     expect(result._tag).toBe("Failure");
+    expect(releasePreviewTab).not.toHaveBeenCalled();
     expect(readThreadPreviewState(threadRef).snapshot).toEqual(snapshot);
     expect(readThreadPreviewState(threadRef).sessions).toEqual({ [snapshot.tabId]: snapshot });
   });

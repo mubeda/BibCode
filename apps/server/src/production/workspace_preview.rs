@@ -16,7 +16,11 @@ use crate::{
         PreviewAutomationBroker, PreviewAutomationHost, PreviewAutomationOperation,
         PreviewAutomationResponse, PreviewAutomationStreamEvent,
     },
-    preview::{PreviewError, PreviewManager, PreviewNavStatus, PreviewViewportSetting},
+    preview::{
+        PreviewError, PreviewManager, PreviewNavStatus, PreviewViewportSetting,
+        gateway::registry::{GatewayError, PreviewGateway},
+    },
+    rpc::RpcSessionContext,
     workspace::WorkspaceRpc,
 };
 
@@ -38,6 +42,7 @@ const WORKSPACE_METHODS: &[&str] = &[
     "review.getDiffPreview",
 ];
 const PREVIEW_METHODS: &[&str] = &[
+    "preview.claimOpenRequest",
     "preview.close",
     "preview.list",
     "preview.navigate",
@@ -55,6 +60,7 @@ pub struct WorkspacePreviewRpcServices {
     preview: PreviewManager,
     automation: PreviewAutomationBroker,
     automation_state: Arc<Mutex<AutomationRpcState>>,
+    gateway: Option<PreviewGateway>,
 }
 
 #[derive(Default)]
@@ -86,7 +92,15 @@ impl WorkspacePreviewRpcServices {
             preview,
             automation,
             automation_state: Arc::new(Mutex::new(AutomationRpcState::default())),
+            gateway: None,
         }
+    }
+
+    /// Serves `preview.gatewayOpen` from `gateway`; without one the method is not registered.
+    #[must_use]
+    pub fn with_gateway(mut self, gateway: PreviewGateway) -> Self {
+        self.gateway = Some(gateway);
+        self
     }
 }
 
@@ -107,6 +121,12 @@ pub fn register_workspace_preview_rpc(
             let services = services.clone();
             async move { services.handle_preview(request, cancellation).await }
         });
+    }
+    if let Some(gateway) = services.gateway.clone() {
+        registry.register_unary_with_context(
+            "preview.gatewayOpen",
+            move |request, context, _cancellation| gateway_open(gateway.clone(), request, context),
+        );
     }
     let preview = services.preview.clone();
     let workspace = services.workspace.clone();
@@ -214,7 +234,10 @@ fn preview_event_stream(
                 event = events.recv() => match event {
                     Ok(event) => {
                         let value = match serde_json::to_value(event) {
-                            Ok(value) => value,
+                            Ok(mut value) => {
+                                normalize_camel_case_fields(&mut value);
+                                value
+                            }
                             Err(error) => {
                                 let _ = sender.send(Err(json!({
                                     "_tag": "PreviewEventEncodeError",
@@ -332,6 +355,11 @@ impl WorkspacePreviewRpcServices {
                     .await
                     .map_err(preview_error)?;
                 Ok(Value::Null)
+            }
+            "preview.claimOpenRequest" => {
+                let input: PreviewClaimOpenRequestInput = decode(payload, method)?;
+                let claimed = self.preview.claim_open_request(&input.request_id).await;
+                Ok(json!({ "claimed": claimed }))
             }
             "preview.list" => {
                 let input: PreviewThreadInput = decode(payload, method)?;
@@ -726,6 +754,64 @@ struct PreviewTabInput {
 #[serde(rename_all = "camelCase")]
 struct PreviewThreadInput {
     thread_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PreviewGatewayOpenInput {
+    thread_id: String,
+    url: String,
+}
+
+/// Opens a gateway target for the caller's own session, which the capability is bound to,
+/// on the address the caller's connection reached the server on.
+async fn gateway_open(
+    gateway: PreviewGateway,
+    request: RpcRequest,
+    context: RpcSessionContext,
+) -> RpcResult {
+    let input: PreviewGatewayOpenInput = decode(request.payload, "preview.gatewayOpen")?;
+    let Some(principal) = context.principal() else {
+        return Err(gateway_error(&GatewayError::Unavailable(
+            "the preview gateway needs an authenticated session".to_owned(),
+        )));
+    };
+    let opened = gateway
+        .open(
+            &input.thread_id,
+            &input.url,
+            &principal.session_id,
+            principal.expires_at_ms,
+            context.reach(),
+        )
+        .await
+        .map_err(|error| gateway_error(&error))?;
+    Ok(json!({
+        "gatewayPort": opened.gateway_port,
+        "capability": opened.capability,
+        "expiresAtMs": opened.expires_at_ms,
+    }))
+}
+
+fn gateway_error(error: &GatewayError) -> Value {
+    let reason = match error {
+        GatewayError::NotAdmitted => "not-admitted",
+        GatewayError::HttpsUnsupported => "https-unsupported",
+        GatewayError::NoUpstream => "no-upstream",
+        GatewayError::NotReachable(_) => "not-reachable",
+        GatewayError::Unavailable(_) => "unavailable",
+    };
+    json!({
+        "_tag": "PreviewGatewayError",
+        "reason": reason,
+        "message": error.to_string(),
+    })
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PreviewClaimOpenRequestInput {
+    request_id: String,
 }
 
 #[derive(Deserialize)]

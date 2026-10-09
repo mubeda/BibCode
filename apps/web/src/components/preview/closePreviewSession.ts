@@ -6,6 +6,7 @@ import type {
   ScopedThreadRef,
 } from "@bibcode/contracts";
 
+import { releasePreviewTab } from "~/browser/previewGateway";
 import { beginPreviewSessionClose, cancelPreviewSessionClose } from "~/previewStateStore";
 
 interface ClosePreviewSessionInput<E> {
@@ -32,6 +33,9 @@ export async function closePreviewSession<E>(
   });
   if (result._tag === "Failure") {
     cancelPreviewSessionClose(input.threadRef, input.snapshot, input.tabId);
+  } else {
+    // A closed tab never comes back: its SSH forwards go now, not after its grace period.
+    releasePreviewTab(input.threadRef.environmentId, input.tabId);
   }
   return result;
 }

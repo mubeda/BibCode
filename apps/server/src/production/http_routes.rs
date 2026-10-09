@@ -14,6 +14,7 @@ use tokio_util::sync::CancellationToken;
 pub const MAX_JSON_BODY_BYTES: usize = 1024 * 1024;
 pub const MAX_DIAGNOSTIC_BODY_BYTES: usize = 512 * 1024;
 pub const MAX_MCP_BODY_BYTES: usize = 4 * 1024 * 1024;
+const MAX_OPEN_URL_BODY_BYTES: usize = 16 * 1024;
 
 const NO_STORE: &str = "no-store";
 
@@ -54,6 +55,13 @@ pub type McpHandler = Arc<
         + Send
         + Sync,
 >;
+/// `(body, context)` for `POST /api/preview/open-url`. The handler authenticates the request
+/// itself: the route accepts only an open-url bearer token, never a session.
+pub type OpenUrlHandler = Arc<
+    dyn Fn(Vec<u8>, RouteContext) -> BoxFuture<Result<JsonRouteResponse, HttpRouteError>>
+        + Send
+        + Sync,
+>;
 pub type TransferDownloadHandler = Arc<
     dyn Fn(String, RouteContext) -> BoxFuture<Result<TransferDownloadHttpOutcome, HttpRouteError>>
         + Send
@@ -83,6 +91,8 @@ pub struct HttpRoutesState {
     pub mcp: McpHandler,
     pub transfer_download: TransferDownloadHandler,
     pub transfer_upload: TransferUploadHandler,
+    /// Answers `503` until the production runtime replaces it.
+    pub open_url: OpenUrlHandler,
 }
 
 impl HttpRoutesState {
@@ -104,6 +114,17 @@ impl HttpRoutesState {
             mcp,
             transfer_download,
             transfer_upload,
+            open_url: Arc::new(|_body, _context| {
+                Box::pin(async {
+                    Err(HttpRouteError::new(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        json!({
+                            "_tag": "NativeRuntimeUnavailableError",
+                            "message": "The native production runtime is unavailable."
+                        }),
+                    ))
+                })
+            }),
         }
     }
 }
@@ -279,6 +300,7 @@ where
             "/api/transfers/{token}",
             get(transfer_download).post(transfer_upload),
         )
+        .route("/api/preview/open-url", post(preview_open_url))
         .route("/mcp", post(mcp_post).delete(mcp_delete))
 }
 
@@ -608,6 +630,26 @@ async fn transfer_upload(
                 "limit": limit
             }),
         ),
+        Err(error) => error.into_response(),
+    }
+}
+
+/// Bearer-only: deliberately skips `state.authorize`, which would also accept a session cookie.
+async fn preview_open_url(State(state): State<HttpRoutesState>, request: Request) -> Response {
+    let cancellation = CancellationToken::new();
+    let _guard = CancellationGuard(cancellation.clone());
+    let (parts, body) = request.into_parts();
+    let body = match to_bytes(body, MAX_OPEN_URL_BODY_BYTES).await {
+        Ok(body) => body.to_vec(),
+        Err(_) => return payload_too_large(),
+    };
+    let context = RouteContext {
+        headers: parts.headers,
+        uri: parts.uri,
+        cancellation,
+    };
+    match (state.open_url)(body, context).await {
+        Ok(response) => json_response(response.status, response.headers, response.body),
         Err(error) => error.into_response(),
     }
 }

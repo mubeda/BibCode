@@ -19,8 +19,10 @@ import {
   useThreadPreviewState,
 } from "~/previewStateStore";
 import { resolvePreviewTarget } from "~/browser/browserTargetResolver";
-import { showPreviewUnreachableNotice } from "~/browser/linkNotices";
+import { showPreviewUnreachableMessage, showPreviewUnreachableNotice } from "~/browser/linkNotices";
 import { navigateDesktopTab } from "~/browser/desktopTabLifetime";
+import { canonicalizePreviewUrl, resolveForNavigation } from "~/browser/previewGateway";
+import { failPreviewTabNavigation } from "~/browser/previewTabFailure";
 import { useEnvironment, useEnvironmentHttpBaseUrl } from "~/state/environments";
 import { previewEnvironment } from "~/state/preview";
 import { useAtomCommand } from "~/state/use-atom-command";
@@ -79,6 +81,8 @@ export function PreviewView({ threadRef, tabId: requestedTabId, configuredUrls, 
   const browserContainerRef = useRef<HTMLDivElement | null>(null);
   const pickActiveRef = useRef(false);
   const isMountedRef = useRef(true);
+  /** The latest URL submission; an older one still resolving must not win. */
+  const submissionRef = useRef(0);
   const previewState = useThreadPreviewState(threadRef);
   const addPreviewAnnotation = useComposerDraftStore((store) => store.addPreviewAnnotation);
   const addAttachment = useComposerDraftStore((store) => store.addAttachment);
@@ -87,6 +91,9 @@ export function PreviewView({ threadRef, tabId: requestedTabId, configuredUrls, 
   const open = useAtomCommand(previewEnvironment.open);
   const navigate = useAtomCommand(previewEnvironment.navigate, "preview navigation");
   const resize = useAtomCommand(previewEnvironment.resize, "preview viewport resize");
+  // Gateway refusals become a notice or the tab's failed state, with their own copy.
+  const gatewayOpen = useAtomCommand(previewEnvironment.gatewayOpen, { reportFailure: false });
+  const reportStatus = useAtomCommand(previewEnvironment.reportStatus, "preview status report");
 
   usePreviewSession(threadRef);
 
@@ -98,6 +105,14 @@ export function PreviewView({ threadRef, tabId: requestedTabId, configuredUrls, 
   }, []);
 
   const tabId = requestedTabId ?? previewState.activeTabId;
+
+  // A submission or reload still resolving belongs to the tab it started on.
+  useEffect(
+    () => () => {
+      submissionRef.current += 1;
+    },
+    [tabId, threadRef.environmentId, threadRef.threadId],
+  );
   const snapshot = tabId ? (previewState.sessions[tabId] ?? null) : null;
   const desktopOverlay = tabId ? (previewState.desktopByTabId[tabId] ?? null) : null;
   const navStatus = snapshot?.navStatus ?? { _tag: "Idle" as const };
@@ -107,7 +122,10 @@ export function PreviewView({ threadRef, tabId: requestedTabId, configuredUrls, 
   const canGoBack = desktopOverlay?.canGoBack ?? snapshot?.canGoBack ?? false;
   const canGoForward = desktopOverlay?.canGoForward ?? snapshot?.canGoForward ?? false;
   const refreshDisabled = navStatus._tag === "Idle";
-  const isUnreachable = navStatus._tag === "LoadFailed";
+  // This client's own failure wins: the shared tab may be fine for others.
+  const localFailure = tabId ? previewState.localFailures[tabId] : undefined;
+  const failure = localFailure ?? (navStatus._tag === "LoadFailed" ? navStatus : null);
+  const isUnreachable = failure !== null;
   const showEmptyState = shouldShowPreviewEmptyState(snapshot);
   const controller = desktopOverlay?.controller ?? "none";
   const loadProgress = useLoadingProgress(loading);
@@ -148,16 +166,45 @@ export function PreviewView({ threadRef, tabId: requestedTabId, configuredUrls, 
     return () => observer.disconnect();
   }, []);
 
+  /**
+   * Resolves a canonical URL to what this client can load. Returns null when
+   * it can't (after showing why) or when `isCurrent` says the request was
+   * overtaken meanwhile (silently). `forTabId` ties an SSH forward to that tab.
+   */
+  const resolveForThisClient = useCallback(
+    async (canonicalUrl: string, forTabId: string | undefined, isCurrent: () => boolean) => {
+      const target = await resolveForNavigation({
+        environmentId: threadRef.environmentId,
+        threadId: threadRef.threadId,
+        canonicalUrl,
+        gatewayOpen,
+        ...(forTabId === undefined ? {} : { tabId: forTabId }),
+      });
+      if (!isCurrent()) return null;
+      if (target.kind === "ok") return target.url;
+      showPreviewUnreachableMessage(target.message, canonicalUrl);
+      return null;
+    },
+    [gatewayOpen, threadRef],
+  );
+
   const handleSubmitUrl = useCallback(
     async (next: string) => {
+      const submission = ++submissionRef.current;
+      const superseded = () => submission !== submissionRef.current || !isMountedRef.current;
       try {
         const resolution = resolvePreviewTarget(threadRef.environmentId, next);
         if (resolution.kind === "unreachable") {
           showPreviewUnreachableNotice(resolution);
           return;
         }
-        const resolvedUrl = resolution.url;
+        // Shared state carries the canonical URL; only this client's webview
+        // gets the address it can actually load.
+        const canonicalUrl = resolution.url;
         if (tabId && previewBridge) {
+          // Resolve first so a refused gateway leaves the shared tab untouched.
+          const resolvedUrl = await resolveForThisClient(canonicalUrl, tabId, () => !superseded());
+          if (resolvedUrl === null) return;
           // Commit the canonical snapshot before driving the native webview.
           // Native Loading/Success events can then enrich that snapshot
           // without a fast load leaving a new tab stuck on Idle or allowing
@@ -167,30 +214,66 @@ export function PreviewView({ threadRef, tabId: requestedTabId, configuredUrls, 
             input: {
               threadId: threadRef.threadId,
               tabId,
-              url: resolvedUrl,
+              url: canonicalUrl,
             },
           });
           if (result._tag === "Failure") throw squashAtomCommandFailure(result);
           updatePreviewServerSnapshot(threadRef, result.value);
+          if (superseded()) return;
           await navigateDesktopTab(tabId, resolvedUrl);
-          rememberPreviewUrl(threadRef, resolvedUrl);
+          rememberPreviewUrl(threadRef, canonicalUrl);
         } else {
           await openPreviewSession({
             openPreview: open,
             threadRef,
-            url: resolvedUrl,
+            url: canonicalUrl,
           });
         }
       } catch {
         // Server-side `failed` event renders the unreachable view.
       }
     },
-    [navigate, open, tabId, threadRef],
+    [navigate, open, resolveForThisClient, tabId, threadRef],
   );
 
   const handleRefresh = useCallback(() => {
-    if (previewBridge && tabId) void previewBridge.refresh(tabId);
-  }, [tabId]);
+    if (!previewBridge || !tabId) return;
+    // A gateway capability is single use, so reloading a gateway tab
+    // re-bootstraps it (and re-establishes any SSH forward). A tab this
+    // client failed resolves its failed URL again whatever the target: the
+    // native view may still hold the previous page, or nothing at all.
+    const reloadUrl = localFailure?.url ?? url;
+    if (
+      !reloadUrl ||
+      (!localFailure && resolvePreviewTarget(threadRef.environmentId, reloadUrl).kind !== "gateway")
+    ) {
+      void previewBridge.refresh(tabId);
+      return;
+    }
+    // A reload is a navigation too: a newer submission or unmount cancels it.
+    const submission = ++submissionRef.current;
+    const isCurrent = () => submission === submissionRef.current && isMountedRef.current;
+    void resolveForNavigation({
+      environmentId: threadRef.environmentId,
+      threadId: threadRef.threadId,
+      canonicalUrl: reloadUrl,
+      gatewayOpen,
+      tabId,
+    })
+      .then((target) => {
+        if (!isCurrent()) return;
+        if (target.kind === "ok") return navigateDesktopTab(tabId, target.url);
+        // Nothing loads, so fail the tab (here only, or shared for a refusal).
+        return failPreviewTabNavigation({
+          threadRef,
+          tabId,
+          url: reloadUrl,
+          failure: target,
+          reportStatus,
+        });
+      })
+      .catch(() => undefined);
+  }, [gatewayOpen, localFailure, reportStatus, tabId, threadRef, url]);
 
   const handleZoomIn = useCallback(() => {
     if (previewBridge && tabId) void previewBridge.zoomIn(tabId);
@@ -259,8 +342,12 @@ export function PreviewView({ threadRef, tabId: requestedTabId, configuredUrls, 
 
   const handleOpenInBrowser = useCallback(() => {
     if (!localApi || !url) return;
-    void localApi.shell.openExternal(url).catch(() => undefined);
-  }, [url]);
+    // The stored URL is canonical; a remote server's loopback must not open
+    // this computer's localhost.
+    void resolveForThisClient(url, undefined, () => isMountedRef.current)
+      .then((resolved) => (resolved === null ? undefined : localApi.shell.openExternal(resolved)))
+      .catch(() => undefined);
+  }, [resolveForThisClient, url]);
 
   const handleCapture = useCallback(
     (record: boolean) => {
@@ -537,7 +624,11 @@ export function PreviewView({ threadRef, tabId: requestedTabId, configuredUrls, 
       try {
         const annotation = await previewBridge.pickElement(tabId);
         if (!annotation) return;
-        addPreviewAnnotation(threadRef, annotation);
+        // The agent sees the canonical page URL, never this client's gateway origin.
+        addPreviewAnnotation(threadRef, {
+          ...annotation,
+          pageUrl: canonicalizePreviewUrl(annotation.pageUrl),
+        });
         const screenshotFile = await previewAnnotationScreenshotFile(annotation);
         if (screenshotFile && annotation.screenshot) {
           addAttachment(threadRef, {
@@ -731,12 +822,12 @@ export function PreviewView({ threadRef, tabId: requestedTabId, configuredUrls, 
             {controller === "agent" ? "Agent controlling browser" : "Human control"}
           </div>
         ) : null}
-        {navStatus._tag === "LoadFailed" ? (
+        {failure !== null ? (
           <div className="absolute inset-0 z-10 bg-background">
             <PreviewUnreachable
-              url={navStatus.url}
-              code={navStatus.code}
-              description={navStatus.description}
+              url={failure.url}
+              code={failure.code}
+              description={failure.description}
               onReload={handleRefresh}
             />
           </div>

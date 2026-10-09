@@ -5,8 +5,9 @@ import { useEffect, useRef, useState } from "react";
 import { ProjectDataRecoveryDialog } from "./components/desktop/ProjectDataRecoveryDialog";
 import { ConnectionDatabaseRecoveryDialog } from "./components/ConnectionDatabaseRecoveryDialog";
 import { PreviewAutomationHosts } from "./components/preview/PreviewAutomationHosts";
+import { OpenPromptBanner } from "./components/preview/OpenPromptBanner";
+import { OpenRequestRouter } from "./components/preview/OpenRequestRouter";
 import { PreviewNewWindowRouter } from "./components/preview/PreviewNewWindowRouter";
-import { previewBridge } from "./components/preview/previewBridge";
 import { AppAtomRegistryProvider } from "./rpc/atomRegistry";
 import type { AppRouter } from "./router";
 import { ThreadLifecycleReconciler } from "./ThreadLifecycleReconciler";
@@ -166,11 +167,15 @@ export function AppRoot({ router }: { readonly router: AppRouter }) {
             void router.navigate({ to: "/settings/remote-servers", search: { tab: "share" } });
           }}
         />
-      ) : (
-        <ServerReloadPrompt />
-      )}
-      {previewBridge ? <PreviewAutomationHosts /> : null}
+      ) : null}
+      {/* Top banners stack, so a pending open never covers the reload prompt. */}
+      <div className="fixed inset-x-0 top-0 z-50 flex flex-col">
+        {isDesktopHost ? null : <ServerReloadPrompt />}
+        <OpenPromptBanner router={router} />
+      </div>
+      <PreviewAutomationHosts />
       <PreviewNewWindowRouter />
+      <OpenRequestRouter router={router} />
     </AppAtomRegistryProvider>
   );
 }
