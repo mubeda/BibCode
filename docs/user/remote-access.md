@@ -76,6 +76,32 @@ proxy the chosen HTTPS address to the local BiBCode backend, then let the deskto
 app rescan it. The native `bibcode` CLI does not currently provide Tailscale
 Serve setup flags.
 
+### Reverse proxies
+
+Run the reverse proxy on the same machine as the BiBCode server and have it send
+the browser's host in `X-Forwarded-Host`. BiBCode trusts `X-Forwarded-Host` and
+`X-Forwarded-Proto` only from a proxy on the same machine. For nginx:
+
+```nginx
+location / {
+  proxy_pass http://127.0.0.1:3773;
+  proxy_set_header X-Forwarded-Host $http_host;
+  proxy_set_header X-Forwarded-Proto $scheme;
+  proxy_http_version 1.1;
+  proxy_set_header Upgrade $http_upgrade;
+  proxy_set_header Connection "upgrade";
+}
+```
+
+Without `X-Forwarded-Host`, nginx sends `Host: 127.0.0.1:3773`, and a browser
+signed in with its session cookie gets `403` on every change and on the live
+connection. Clients that use a bearer token are not affected.
+
+Previews of a dev server that listens on the server's loopback are not available
+through a reverse proxy, through Tailscale Serve, or on a public address. Their
+ports are not proxied. Connect over the LAN, the tailnet IP, or an SSH tunnel to
+use them.
+
 ## Update a remote server
 
 For a desktop-hosted release, choose **Update to v…** on its sidebar card or in

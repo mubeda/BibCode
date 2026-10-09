@@ -6,18 +6,27 @@ import { describePreviewError } from "./errorCodeMessages";
 
 interface Props {
   url: string;
-  /** Chromium net error code, e.g. -105. */
+  /** Chromium net error code, e.g. -105; 0 when BiBCode itself explains the failure. */
   code: number;
-  /** Stringified Chromium error, e.g. "ERR_NAME_NOT_RESOLVED". */
+  /**
+   * Stringified Chromium error, e.g. "ERR_NAME_NOT_RESOLVED"; with code 0, a
+   * full sentence (a gateway refusal or this client's own reach failing).
+   */
   description: string;
   onReload: () => void;
 }
 
-/** Theme-aware tailwind port of Chromium's "This site can't be reached" page. */
+/**
+ * Theme-aware tailwind port of Chromium's "This site can't be reached" page.
+ * For BiBCode's own reasons the site may be fine, so the heading says it
+ * can't be shown here instead.
+ */
 export function PreviewUnreachable({ url, code, description, onReload }: Props) {
   const [showDetails, setShowDetails] = useState(false);
   const host = safeHost(url) ?? url;
-  const friendly = describePreviewError(code, description);
+  // BiBCode's own reason already says what to do; network tips and codes don't apply.
+  const ownReason = code === 0 && description.length > 0;
+  const friendly = ownReason ? description : `${describePreviewError(code, description)}.`;
   const errorLabel = description.length > 0 ? description : `ERR_${Math.abs(code) || "FAILED"}`;
 
   return (
@@ -25,13 +34,13 @@ export function PreviewUnreachable({ url, code, description, onReload }: Props) 
       <div className="mx-auto flex w-full max-w-xl flex-1 flex-col px-8 py-12 sm:py-16">
         <ErrorIcon className="mb-6 size-12 text-muted-foreground/70" />
         <h1 className="mb-3 text-2xl font-semibold leading-tight text-foreground">
-          This site can&rsquo;t be reached
+          {ownReason ? <>Can&rsquo;t show this page here</> : <>This site can&rsquo;t be reached</>}
         </h1>
         <p className="text-sm leading-relaxed text-muted-foreground">
-          <span className="font-semibold text-foreground">{host}</span>: {friendly}.
+          <span className="font-semibold text-foreground">{host}</span>: {friendly}
         </p>
 
-        {showDetails ? (
+        {showDetails && !ownReason ? (
           <div className="mt-6 rounded-lg border border-border bg-muted/40 p-4 text-sm">
             <p className="mb-2 font-medium text-foreground">Try:</p>
             <ul className="list-disc space-y-1 pl-5 text-muted-foreground">
@@ -42,19 +51,23 @@ export function PreviewUnreachable({ url, code, description, onReload }: Props) 
           </div>
         ) : null}
 
-        <div className="mt-8 text-xs uppercase tracking-wide text-muted-foreground/70">
-          {errorLabel}
-        </div>
+        {ownReason ? null : (
+          <div className="mt-8 text-xs uppercase tracking-wide text-muted-foreground">
+            {errorLabel}
+          </div>
+        )}
 
         <div className="mt-auto flex items-center gap-2 pt-8">
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            onClick={() => setShowDetails((value) => !value)}
-          >
-            {showDetails ? "Hide details" : "Details"}
-          </Button>
+          {ownReason ? null : (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() => setShowDetails((value) => !value)}
+            >
+              {showDetails ? "Hide details" : "Details"}
+            </Button>
+          )}
           <div className="flex-1" />
           <Button type="button" size="sm" onClick={onReload}>
             Reload

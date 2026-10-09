@@ -71,6 +71,11 @@ pub trait OrchestrationEffectCallbacks: Send + Sync {
 
     fn refresh_workspace<'a>(&'a self, cwd: &'a Path) -> BoxEffectFuture<'a, ()>;
 
+    /// Closes the thread's preview tabs and gateway targets.
+    fn close_previews<'a>(&'a self, _thread_id: &'a str) -> BoxEffectFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
     fn setup_script_is_running<'a>(
         &'a self,
         _thread_id: &'a str,
@@ -965,6 +970,9 @@ async fn cleanup_deleted_thread(
     }
     if let Err(error) = callbacks.close_terminals(thread_id).await {
         tracing::debug!(thread_id, %error, "thread deletion cleanup skipped terminal close");
+    }
+    if let Err(error) = callbacks.close_previews(thread_id).await {
+        tracing::debug!(thread_id, %error, "thread deletion cleanup skipped preview close");
     }
 }
 

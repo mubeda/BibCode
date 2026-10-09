@@ -10,7 +10,7 @@
  * @module Preview
  */
 import { Schema } from "effect";
-import { ThreadId, TrimmedNonEmptyString } from "./baseSchemas.ts";
+import { PortSchema, ThreadId, TrimmedNonEmptyString } from "./baseSchemas.ts";
 
 const Url = TrimmedNonEmptyString.check(Schema.isMaxLength(2048));
 const Title = Schema.String.check(Schema.isMaxLength(512));
@@ -191,6 +191,32 @@ export const PreviewListInput = Schema.Struct({
 });
 export type PreviewListInput = typeof PreviewListInput.Type;
 
+export const PreviewClaimOpenRequestInput = Schema.Struct({
+  requestId: TrimmedNonEmptyString,
+});
+export type PreviewClaimOpenRequestInput = typeof PreviewClaimOpenRequestInput.Type;
+
+/** `claimed` is false when another client claimed the request first or it expired. */
+export const PreviewClaimOpenRequestResult = Schema.Struct({
+  claimed: Schema.Boolean,
+});
+export type PreviewClaimOpenRequestResult = typeof PreviewClaimOpenRequestResult.Type;
+
+/** `url` is the canonical loopback URL; the server admits only plain-HTTP loopback targets. */
+export const PreviewGatewayOpenInput = Schema.Struct({
+  threadId: ThreadId,
+  url: Url,
+});
+export type PreviewGatewayOpenInput = typeof PreviewGatewayOpenInput.Type;
+
+/** `capability` bootstraps one gateway session on `gatewayPort` before `expiresAtMs`. */
+export const PreviewGatewayOpenResult = Schema.Struct({
+  gatewayPort: PortSchema,
+  capability: TrimmedNonEmptyString,
+  expiresAtMs: Schema.Finite,
+});
+export type PreviewGatewayOpenResult = typeof PreviewGatewayOpenResult.Type;
+
 export const PreviewListResult = Schema.Struct({
   sessions: Schema.Array(PreviewSessionSnapshot),
 });
@@ -234,12 +260,26 @@ const PreviewClosedEvent = Schema.Struct({
   type: Schema.Literal("closed"),
 });
 
+/**
+ * A command in the thread (an agent's `$BROWSER`, a CLI) asked to open `url`.
+ * It names no tab: the first client to claim `requestId` opens it.
+ */
+export const PreviewOpenRequestedEvent = Schema.Struct({
+  type: Schema.Literal("openRequested"),
+  threadId: TrimmedNonEmptyString,
+  requestId: TrimmedNonEmptyString,
+  url: Url,
+  createdAt: Schema.String,
+});
+export type PreviewOpenRequestedEvent = typeof PreviewOpenRequestedEvent.Type;
+
 export const PreviewEvent = Schema.Union([
   PreviewOpenedEvent,
   PreviewNavigatedEvent,
   PreviewResizedEvent,
   PreviewFailedEvent,
   PreviewClosedEvent,
+  PreviewOpenRequestedEvent,
 ]);
 export type PreviewEvent = typeof PreviewEvent.Type;
 
@@ -294,6 +334,26 @@ export class PreviewInvalidUrlError extends Schema.TaggedError<PreviewInvalidUrl
     return `Invalid preview URL (${this.reason}${protocol}; input length ${this.inputLength}).`;
   }
 }
+
+/**
+ * Why `preview.gatewayOpen` refused: `not-admitted` (not a plain-HTTP loopback URL),
+ * `https-unsupported`, `no-upstream` (nothing listens on the port), `not-reachable` (the
+ * caller reached the server on a public address or through a reverse proxy), or
+ * `unavailable`.
+ */
+export class PreviewGatewayError extends Schema.TaggedError<PreviewGatewayError>()(
+  "PreviewGatewayError",
+  {
+    reason: Schema.Literals([
+      "not-admitted",
+      "https-unsupported",
+      "no-upstream",
+      "not-reachable",
+      "unavailable",
+    ]),
+    message: Schema.String,
+  },
+) {}
 
 export const PreviewError = Schema.Union([PreviewSessionLookupError, PreviewInvalidUrlError]);
 export type PreviewError = typeof PreviewError.Type;

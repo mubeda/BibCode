@@ -3,6 +3,8 @@ import { describe, expect, it } from "vite-plus/test";
 
 import {
   DiscoveredLocalServer,
+  PreviewClaimOpenRequestInput,
+  PreviewClaimOpenRequestResult,
   PreviewEvent,
   PreviewInvalidUrlError,
   PreviewNavStatus,
@@ -274,6 +276,39 @@ describe("PreviewEvent", () => {
       createdAt: "2026-01-01T00:00:00.000Z",
     });
     expect(event.type).toBe("closed");
+  });
+
+  it("decodes openRequested without a tab", () => {
+    const wire = {
+      type: "openRequested",
+      threadId: "t",
+      requestId: "open_1",
+      url: "http://localhost:5173/",
+      createdAt: "2026-01-01T00:00:00.000Z",
+    };
+    expect(decodePreviewEvent(wire)).toEqual(wire);
+  });
+
+  it("rejects openRequested without a request id", () => {
+    expect(() =>
+      decodePreviewEvent({
+        type: "openRequested",
+        threadId: "t",
+        url: "http://localhost:5173/",
+        createdAt: "2026-01-01T00:00:00.000Z",
+      }),
+    ).toThrow();
+  });
+});
+
+describe("preview.claimOpenRequest", () => {
+  it("decodes its input and result", () => {
+    const decodeInput = Schema.decodeSync(PreviewClaimOpenRequestInput);
+    expect(decodeInput({ requestId: "open_1" })).toEqual({ requestId: "open_1" });
+    expect(() => decodeInput({ requestId: "" })).toThrow();
+    expect(Schema.decodeSync(PreviewClaimOpenRequestResult)({ claimed: false })).toEqual({
+      claimed: false,
+    });
   });
 });
 

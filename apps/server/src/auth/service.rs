@@ -77,6 +77,8 @@ pub enum AuthError {
     ScopeNotGranted,
     ScopeRequired(String),
     CurrentSessionRevokeNotAllowed,
+    /// A cookie-authenticated mutation or WebSocket upgrade from an untrusted `Origin`.
+    Forbidden,
     Internal(String),
 }
 
@@ -96,6 +98,8 @@ pub struct AuthService {
     /// Redeemed single-use websocket ticket ids, pruned by expiry.
     redeemed_websocket_tickets: Arc<std::sync::Mutex<HashMap<String, i64>>>,
     dpop: DpopVerifier,
+    /// Non-request origins that may use the session cookie for mutations: the dev UI only.
+    trusted_cookie_origins: Arc<[String]>,
 }
 
 pub(crate) struct AuthenticatedConnectionGuard {
@@ -485,6 +489,18 @@ impl AuthService {
                     expires_at_ms: now_ms().saturating_add(DESKTOP_BOOTSTRAP_TTL_MS),
                 });
         let (access_events, _) = broadcast::channel(ACCESS_EVENT_CAPACITY);
+        // Only a dev UI served from another origin uses the cookie cross-origin. The desktop
+        // app (`bibcode://app`) never sends it: its requests carry a bearer token with
+        // `credentials: "omit"`, and its WebSockets authenticate with a ticket.
+        let trusted_cookie_origins = config
+            .dev_url
+            .as_ref()
+            .map(|dev_url| dev_url.origin())
+            // An opaque origin serializes as `null`, which sandboxed frames send.
+            .filter(url::Origin::is_tuple)
+            .map(|origin| origin.ascii_serialization())
+            .into_iter()
+            .collect();
         Self {
             descriptor: AuthDescriptor {
                 policy,
@@ -508,6 +524,7 @@ impl AuthService {
             authority_watcher_running: Arc::new(AtomicBool::new(false)),
             redeemed_websocket_tickets: Arc::new(std::sync::Mutex::new(HashMap::new())),
             dpop: DpopVerifier::new(secret_store),
+            trusted_cookie_origins,
         }
     }
 
@@ -560,6 +577,11 @@ impl AuthService {
     #[must_use]
     pub fn cookie_name(&self) -> &str {
         &self.descriptor.session_cookie_name
+    }
+
+    #[must_use]
+    pub(crate) fn trusted_cookie_origins(&self) -> &[String] {
+        &self.trusted_cookie_origins
     }
 
     #[must_use]
@@ -1009,6 +1031,19 @@ impl AuthService {
         } else {
             Err(AuthError::ScopeRequired(required_scope.to_owned()))
         }
+    }
+
+    /// Expiry of `session_id` while it exists, is not revoked, and has not expired.
+    /// Repository failures count as inactive so callers fail closed.
+    pub(crate) async fn active_session_expiry(&self, session_id: &str) -> Option<i64> {
+        let observed_at = now_ms();
+        self.refresh_session_from_repository(session_id, observed_at)
+            .await
+            .ok()?;
+        let state = self.state.lock().await;
+        let session = state.sessions.get(session_id)?;
+        (session.revoked_at_ms.is_none() && session.expires_at_ms > observed_at)
+            .then_some(session.expires_at_ms)
     }
 
     async fn refresh_session_from_repository(
@@ -3743,6 +3778,44 @@ mod tests {
             .with_desktop("desktop-test-seed")
             .expect("desktop config");
         AuthService::new(&config, vec![7_u8; 32])
+    }
+
+    #[tokio::test]
+    async fn active_session_expiry_requires_a_live_unrevoked_session() {
+        let auth = service();
+        let issue = || {
+            auth.exchange_bootstrap(
+                "desktop-test-seed",
+                None,
+                ClientMetadata::default(),
+                None,
+                SessionTransport::Plain,
+            )
+        };
+        let live = issue().await.expect("session should issue");
+        let live_id = live.principal.session_id;
+        let expected = auth.state.lock().await.sessions[&live_id].expires_at_ms;
+        assert_eq!(auth.active_session_expiry(&live_id).await, Some(expected));
+        assert_eq!(auth.active_session_expiry("missing").await, None);
+
+        auth.state
+            .lock()
+            .await
+            .sessions
+            .get_mut(&live_id)
+            .expect("session record")
+            .expires_at_ms = now_ms() - 1;
+        assert_eq!(auth.active_session_expiry(&live_id).await, None);
+
+        let revoked = issue().await.expect("session should issue");
+        auth.revoke_client("administrator", &revoked.principal.session_id)
+            .await
+            .expect("revoke session");
+        assert_eq!(
+            auth.active_session_expiry(&revoked.principal.session_id)
+                .await,
+            None
+        );
     }
 
     #[tokio::test]

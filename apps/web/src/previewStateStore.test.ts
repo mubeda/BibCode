@@ -17,6 +17,7 @@ import {
   removePreviewThread,
   resetPreviewStateForTests,
   setActivePreviewTab,
+  setPreviewLocalFailure,
   updatePreviewServerSnapshot,
   isPreviewSupportedInRuntime,
 } from "./previewStateStore";
@@ -148,6 +149,66 @@ describe("previewStateStore (single-tab)", () => {
       width: 412,
       height: 915,
     });
+  });
+
+  it("ignores a replayed event older than the session it would replace", () => {
+    // OpenRequestRouter keeps the events atom alive, so a later session-sync mount
+    // replays its last value after reconciling a newer session list.
+    const stale = makeSnapshot({ updatedAt: "2026-01-01T00:00:01.000Z" });
+    const fresh = makeSnapshot({
+      navStatus: { _tag: "Loading", url: "http://localhost:5173/b", title: "" },
+      updatedAt: "2026-01-01T00:00:05.000Z",
+    });
+    reconcilePreviewServerSessions(ref, [fresh]);
+
+    applyPreviewServerEvent(ref, {
+      type: "navigated",
+      threadId: "thread-1",
+      tabId: stale.tabId,
+      createdAt: stale.updatedAt,
+      snapshot: stale,
+    });
+    applyPreviewServerEvent(ref, {
+      type: "failed",
+      threadId: "thread-1",
+      tabId: stale.tabId,
+      createdAt: "2026-01-01T00:00:02.000Z",
+      url: "http://localhost:5173/",
+      title: "",
+      code: -105,
+      description: "ERR_NAME_NOT_RESOLVED",
+    });
+
+    expect(readThreadPreviewState(ref).sessions[fresh.tabId]).toEqual(fresh);
+  });
+
+  it("keeps sub-millisecond order between server timestamps", () => {
+    const newer = makeSnapshot({ updatedAt: "2026-01-01T00:00:01.123900Z" });
+    reconcilePreviewServerSessions(ref, [newer]);
+    const olderReply = makeSnapshot({
+      navStatus: { _tag: "Loading", url: "http://localhost:5173/old", title: "" },
+      updatedAt: "2026-01-01T00:00:01.123100Z",
+    });
+    updatePreviewServerSnapshot(ref, olderReply);
+
+    expect(readThreadPreviewState(ref).sessions[newer.tabId]).toEqual(newer);
+  });
+
+  it("compares event times as instants, whatever their fractional digits", () => {
+    reconcilePreviewServerSessions(ref, [makeSnapshot({ updatedAt: "2026-01-01T00:00:01.1Z" })]);
+    const later = makeSnapshot({
+      navStatus: { _tag: "Loading", url: "http://localhost:5173/b", title: "" },
+      updatedAt: "2026-01-01T00:00:01.15Z",
+    });
+    applyPreviewServerEvent(ref, {
+      type: "navigated",
+      threadId: "thread-1",
+      tabId: later.tabId,
+      createdAt: later.updatedAt,
+      snapshot: later,
+    });
+
+    expect(readThreadPreviewState(ref).sessions[later.tabId]).toEqual(later);
   });
 
   it("failed event flips the snapshot to LoadFailed when tabId matches", () => {
@@ -626,5 +687,43 @@ describe("previewStateStore (single-tab)", () => {
       desktopOverlay: null,
       recentlySeenUrls: [first.navStatus._tag === "Idle" ? "" : first.navStatus.url],
     });
+  });
+});
+
+describe("client-local preview failures", () => {
+  const failure = {
+    url: "http://localhost:5173/",
+    code: 0,
+    description: "Build box isn't connected. Reconnect it, then open the link again.",
+  };
+
+  it("keeps a tab's local failure out of its shared snapshot", () => {
+    applyPreviewServerSnapshot(ref, makeSnapshot());
+    setPreviewLocalFailure(ref, "tab_a", failure);
+
+    const state = readThreadPreviewState(ref);
+    expect(state.localFailures).toEqual({ tab_a: failure });
+    expect(state.sessions.tab_a?.navStatus._tag).toBe("Loading");
+
+    setPreviewLocalFailure(ref, "tab_a", null);
+    expect(readThreadPreviewState(ref).localFailures).toEqual({});
+  });
+
+  it("forgets a closed or vanished tab's local failure", () => {
+    applyPreviewServerSnapshot(ref, makeSnapshot({ tabId: "tab_a" }));
+    applyPreviewServerSnapshot(ref, makeSnapshot({ tabId: "tab_b" }));
+    setPreviewLocalFailure(ref, "tab_a", failure);
+    setPreviewLocalFailure(ref, "tab_b", failure);
+
+    applyPreviewServerEvent(ref, {
+      type: "closed",
+      threadId: ThreadId.make("thread-1"),
+      tabId: "tab_a",
+      createdAt: "2026-01-01T00:00:01.000Z",
+    } as never);
+    expect(Object.keys(readThreadPreviewState(ref).localFailures)).toEqual(["tab_b"]);
+
+    reconcilePreviewServerSessions(ref, []);
+    expect(readThreadPreviewState(ref).localFailures).toEqual({});
   });
 });

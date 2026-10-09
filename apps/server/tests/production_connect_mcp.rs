@@ -92,6 +92,7 @@ async fn setup_service(
             "architecture":"x64"
         }),
         mcp_endpoint: "http://127.0.0.1:43123/mcp".into(),
+        open_url_endpoint: "http://127.0.0.1:43123/api/preview/open-url".into(),
         now_epoch_seconds: Arc::new(|| 1_700_000_000),
         max_mcp_credentials: 4,
         max_mcp_sessions: 4,
@@ -206,6 +207,7 @@ async fn setup_service_with_failures(
             environment_id: "env-1".into(),
             descriptor: json!({"environmentId":"env-1"}),
             mcp_endpoint: "http://127.0.0.1:43123/mcp".into(),
+            open_url_endpoint: "http://127.0.0.1:43123/api/preview/open-url".into(),
             now_epoch_seconds: Arc::new(|| 1_700_000_000),
             max_mcp_credentials: 4,
             max_mcp_sessions: 4,

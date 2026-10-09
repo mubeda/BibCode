@@ -180,6 +180,7 @@ async fn persistent_callbacks_sign_link_proofs_and_verify_health_requests_end_to
                 "architecture": "x64"
             }),
             mcp_endpoint: "http://127.0.0.1:43123/mcp".to_owned(),
+            open_url_endpoint: "http://127.0.0.1:43123/api/preview/open-url".to_owned(),
             now_epoch_seconds: Arc::new(|| NOW),
             max_mcp_credentials: 4,
             max_mcp_sessions: 4,

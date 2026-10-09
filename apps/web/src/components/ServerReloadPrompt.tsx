@@ -25,7 +25,7 @@ export function ServerReloadPrompt() {
   return (
     <div
       role="status"
-      className="fixed inset-x-0 top-0 z-50 flex flex-wrap items-center justify-center gap-3 border-b border-border bg-background px-4 py-2 text-sm"
+      className="flex flex-wrap items-center justify-center gap-3 border-b border-border bg-background px-4 py-2 text-sm"
     >
       <span>BiBCode on this server was updated to v{version}. Reload to use it.</span>
       <Button size="xs" onClick={() => window.location.reload()}>

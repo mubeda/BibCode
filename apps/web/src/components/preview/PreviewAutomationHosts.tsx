@@ -17,6 +17,7 @@ import {
   type PreviewViewportSetting,
   type ScopedThreadRef,
 } from "@bibcode/contracts";
+import { normalizePreviewUrl } from "@bibcode/shared/preview";
 import { resolvePreviewViewport } from "@bibcode/shared/previewViewport";
 import { useCallback, useContext, useEffect, useMemo, useState } from "react";
 import { Atom } from "effect/unstable/reactivity";
@@ -25,11 +26,18 @@ import {
   applyPreviewServerSnapshot,
   readThreadPreviewState,
   reconcilePreviewServerSessions,
+  setPreviewLocalFailure,
   updatePreviewServerSnapshot,
 } from "~/previewStateStore";
 import { supportsPreviewRuntimeCapability } from "~/previewRuntimeCapabilities";
 import { useRightPanelStore } from "~/rightPanelStore";
 import { resolveBrowserNavigationTarget } from "~/browser/browserTargetResolver";
+import {
+  canonicalizePreviewUrl,
+  type GatewayOpenMutation,
+  isGatewayBootstrapUrl,
+  resolveForNavigation,
+} from "~/browser/previewGateway";
 import {
   readActiveBrowserRecordingTabId,
   startBrowserRecording,
@@ -42,11 +50,14 @@ import { previewEnvironment } from "~/state/preview";
 import { useAtomQueryRunner } from "~/state/use-atom-query-runner";
 import { useAtomCommand } from "~/state/use-atom-command";
 
-import { previewBridge } from "./previewBridge";
+import { enqueueOpenPrompt } from "~/browser/openPromptQueue";
+
+import { isBrowserMode, previewBridge } from "./previewBridge";
 import {
   PreviewAutomationNavigationTimeoutError,
   PreviewAutomationOperationError,
   PreviewAutomationOverlayTimeoutError,
+  PreviewAutomationPageUnreachableError,
   PreviewAutomationRecordingNotActiveError,
   PreviewAutomationTargetUnavailableError,
   PreviewAutomationViewportTimeoutError,
@@ -69,10 +80,47 @@ import { isPreviewViewportReady } from "./previewViewportReadiness";
  */
 const NAVIGATION_ONLY_OPERATIONS = ["status", "open", "navigate"] as const;
 
+/**
+ * A plain browser has no internal browser: it reports that, and turns an
+ * agent's `open` into a prompt the user answers with a click.
+ */
+const BROWSER_MODE_OPERATIONS = ["status", "open"] as const;
+
+const NO_AUTOMATION_STATUS: PreviewAutomationStatus = {
+  available: false,
+  visible: false,
+  tabId: null,
+  url: null,
+  title: null,
+  loading: false,
+};
+
 const supportedAutomationOperations = () =>
-  supportsPreviewRuntimeCapability(previewBridge, "automation")
-    ? [...PREVIEW_AUTOMATION_OPERATIONS]
-    : [...NAVIGATION_ONLY_OPERATIONS];
+  isBrowserMode()
+    ? [...BROWSER_MODE_OPERATIONS]
+    : supportsPreviewRuntimeCapability(previewBridge, "automation")
+      ? [...PREVIEW_AUTOMATION_OPERATIONS]
+      : [...NAVIGATION_ONLY_OPERATIONS];
+
+/**
+ * Browser mode: no tab to drive, so `open` asks the user and returns at once;
+ * an `open` without an address has nothing to ask about.
+ */
+const handleBrowserModeRequest = (
+  threadRef: ScopedThreadRef,
+  request: PreviewAutomationRequest,
+): PreviewAutomationStatus | { readonly status: "pending-user" } => {
+  const url =
+    request.operation === "open" ? (request.input as PreviewAutomationOpenInput).url : undefined;
+  if (url === undefined) return NO_AUTOMATION_STATUS;
+  // Both throw: an address that is not http(s), or one this client can never reach.
+  const canonicalUrl = resolveBrowserNavigationTarget(threadRef.environmentId, {
+    kind: "url",
+    url: normalizePreviewUrl(url),
+  }).resolvedUrl;
+  enqueueOpenPrompt({ source: "agent", url: canonicalUrl, threadRef });
+  return { status: "pending-user" };
+};
 
 const waitForDesktopOverlay = async (
   threadRef: ScopedThreadRef,
@@ -99,7 +147,7 @@ const waitForDesktopOverlay = async (
 
 const waitForNavigationReadiness = async (
   threadRef: ScopedThreadRef,
-  requestId: string,
+  requestContext: RequestContext,
   tabId: string,
   readiness: PreviewAutomationNavigateInput["readiness"],
   timeoutMs: number,
@@ -113,19 +161,25 @@ const waitForNavigationReadiness = async (
   if (!previewBridge || targetReadiness === "none") return;
   const deadline = Date.now() + timeoutMs;
   while (Date.now() <= deadline) {
-    if (targetReadiness === "domContentLoaded") {
-      const readyState = await previewBridge.automation.evaluate(tabId, {
-        expression: "document.readyState",
-      });
-      if (readyState === "interactive" || readyState === "complete") return;
-    } else {
-      const status = await previewBridge.automation.status(tabId);
-      if (!status.loading) return;
+    // A failed load on this client's gateway origin never becomes ready.
+    assertNoLocalFailure(threadRef, tabId, requestContext);
+    // A gateway bootstrap page loads first and then replaces itself with the
+    // real page, so it never counts as ready. Check the raw native URL.
+    const status = await previewBridge.automation.status(tabId);
+    if (!isGatewayBootstrapUrl(status.url)) {
+      if (targetReadiness === "domContentLoaded") {
+        const readyState = await previewBridge.automation.evaluate(tabId, {
+          expression: "document.readyState",
+        });
+        if (readyState === "interactive" || readyState === "complete") return;
+      } else if (!status.loading) {
+        return;
+      }
     }
     await new Promise<void>((resolve) => window.setTimeout(resolve, 50));
   }
   throw new PreviewAutomationNavigationTimeoutError({
-    requestId,
+    requestId: requestContext.requestId,
     environmentId: threadRef.environmentId,
     threadId: threadRef.threadId,
     tabId,
@@ -236,7 +290,11 @@ const currentStatus = async (
   if (tabId && previewBridge && state.desktopByTabId[tabId]) {
     const status = await previewBridge.automation.status(tabId);
     // A detached native tab keeps its last overlay; its session is the truth then.
-    if (status.available) return { ...status, visible, ...viewportStatus };
+    if (status.available) {
+      // The webview may sit on this client's gateway origin; agents see the canonical URL.
+      const url = status.url === null ? null : canonicalizePreviewUrl(status.url);
+      return { ...status, url, visible, ...viewportStatus };
+    }
   }
   const navStatus = snapshot?.navStatus;
   return {
@@ -248,6 +306,94 @@ const currentStatus = async (
     loading: navStatus?._tag === "Loading",
     ...viewportStatus,
   };
+};
+
+type RequestContext = Omit<
+  ConstructorParameters<typeof PreviewAutomationPageUnreachableError>[0],
+  "reason" | "tabId"
+>;
+
+const requestContext = (
+  environmentId: EnvironmentId,
+  request: PreviewAutomationRequest,
+): RequestContext => ({
+  requestId: request.requestId,
+  operation: request.operation,
+  environmentId,
+  threadId: request.threadId,
+});
+
+/** Throws the reason this client couldn't load the tab's page, if it couldn't. */
+const assertNoLocalFailure = (
+  threadRef: ScopedThreadRef,
+  tabId: string | null,
+  context: RequestContext,
+): void => {
+  const failure = tabId ? readThreadPreviewState(threadRef).localFailures[tabId] : undefined;
+  if (failure === undefined) return;
+  throw new PreviewAutomationPageUnreachableError({
+    ...context,
+    tabId,
+    reason: failure.code === 0 ? failure.description : `${failure.description} (${failure.code})`,
+  });
+};
+
+/**
+ * A fresh tab's native host resolves its URL after `open` returns. Waits until
+ * the first page starts loading, and fails with the reason when it can't.
+ */
+const waitForFirstNavigation = async (
+  threadRef: ScopedThreadRef,
+  tabId: string,
+  timeoutMs: number,
+  context: RequestContext,
+): Promise<void> => {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() <= deadline) {
+    assertNoLocalFailure(threadRef, tabId, context);
+    const state = readThreadPreviewState(threadRef);
+    const navStatus = state.sessions[tabId]?.navStatus;
+    if (navStatus?._tag === "LoadFailed") {
+      throw new PreviewAutomationPageUnreachableError({
+        ...context,
+        tabId,
+        reason: navStatus.description,
+      });
+    }
+    if ((state.desktopByTabId[tabId]?.url ?? null) !== null) return;
+    await new Promise<void>((resolve) => window.setTimeout(resolve, 50));
+  }
+  throw new PreviewAutomationNavigationTimeoutError({
+    requestId: context.requestId,
+    environmentId: context.environmentId,
+    threadId: context.threadId,
+    tabId,
+    readiness: "load",
+    timeoutMs,
+  });
+};
+
+/** Resolves a canonical URL for this client's native view, failing with the user-facing reason. */
+const resolveNativeUrl = async (
+  threadRef: ScopedThreadRef,
+  tabId: string,
+  canonicalUrl: string,
+  gatewayOpen: GatewayOpenMutation,
+  context: RequestContext,
+): Promise<string> => {
+  const target = await resolveForNavigation({
+    environmentId: threadRef.environmentId,
+    threadId: threadRef.threadId,
+    canonicalUrl,
+    gatewayOpen,
+    tabId,
+  });
+  if (target.kind === "unreachable") {
+    throw new PreviewAutomationPageUnreachableError({ ...context, tabId, reason: target.message });
+  }
+  // An earlier failure must not fail the navigation that is about to start.
+  setPreviewLocalFailure(threadRef, tabId, null);
+  return target.url;
 };
 
 const raiseAtomCommandFailure = (result: Parameters<typeof squashAtomCommandFailure>[0]): never => {
@@ -262,7 +408,8 @@ const raisePreviewAutomationHostError = (
 
 export function PreviewAutomationHosts() {
   const { environments } = useEnvironments();
-  if (!previewBridge?.automation) return null;
+  // A desktop bridge without an automation surface hosts nothing; no bridge is browser mode.
+  if (!isBrowserMode() && !previewBridge?.automation) return null;
   return (
     <>
       {/*
@@ -305,6 +452,9 @@ function PreviewAutomationHost(props: { readonly environmentId: EnvironmentId })
   const resize = useAtomCommand(previewEnvironment.resize, {
     reportFailure: false,
   });
+  const gatewayOpen = useAtomCommand(previewEnvironment.gatewayOpen, {
+    reportFailure: false,
+  });
   const respondToAutomation = useAtomCommand(
     previewEnvironment.respondToAutomation,
     "preview automation response",
@@ -324,6 +474,9 @@ function PreviewAutomationHost(props: { readonly environmentId: EnvironmentId })
       };
       let tabId = request.tabId ?? null;
       try {
+        if (isBrowserMode() && (request.operation === "status" || request.operation === "open")) {
+          return handleBrowserModeRequest(threadRef, request);
+        }
         let state = readThreadPreviewState(threadRef);
         const needsSessionSync = needsPreviewAutomationSessionSync(state, request.tabId);
         if (needsSessionSync) {
@@ -357,9 +510,13 @@ function PreviewAutomationHost(props: { readonly environmentId: EnvironmentId })
           await waitForDesktopOverlay(threadRef, request.requestId, readyTabId, request.timeoutMs);
           return { bridge, tabId: readyTabId };
         };
+        const context = requestContext(environmentId, request);
         switch (request.operation) {
-          case "status":
-            return await currentStatus(threadRef, tabId);
+          case "status": {
+            const status = await currentStatus(threadRef, tabId);
+            assertNoLocalFailure(threadRef, status.tabId ?? tabId, context);
+            return status;
+          }
           case "open": {
             const input = request.input as PreviewAutomationOpenInput;
             let activeTabId = resolvePreviewAutomationOpenTab(
@@ -373,8 +530,9 @@ function PreviewAutomationHost(props: { readonly environmentId: EnvironmentId })
             const reusedExistingTab = activeTabId !== null;
             tabId = activeTabId;
             // Resolve first: a server-loopback URL must never load this
-            // computer's localhost for a remote environment.
-            const resolvedUrl = input.url
+            // computer's localhost for a remote environment. Shared state
+            // stores the canonical URL; the native view resolves it per client.
+            const canonicalUrl = input.url
               ? resolveBrowserNavigationTarget(environmentId, { kind: "url", url: input.url })
                   .resolvedUrl
               : null;
@@ -383,7 +541,7 @@ function PreviewAutomationHost(props: { readonly environmentId: EnvironmentId })
                 environmentId,
                 input: {
                   threadId: request.threadId,
-                  ...(resolvedUrl ? { url: resolvedUrl } : {}),
+                  ...(canonicalUrl ? { url: canonicalUrl } : {}),
                 },
               });
               if (result._tag === "Failure") {
@@ -410,18 +568,27 @@ function PreviewAutomationHost(props: { readonly environmentId: EnvironmentId })
                 activeTabId,
                 request.timeoutMs,
               );
+              if (!reusedExistingTab && canonicalUrl !== null) {
+                await waitForFirstNavigation(threadRef, activeTabId, request.timeoutMs, context);
+              }
             }
-            if (reusedExistingTab && resolvedUrl !== null && previewBridge) {
-              await previewBridge.navigate(activeTabId, resolvedUrl);
+            if (reusedExistingTab && canonicalUrl !== null && previewBridge) {
+              await previewBridge.navigate(
+                activeTabId,
+                await resolveNativeUrl(threadRef, activeTabId, canonicalUrl, gatewayOpen, context),
+              );
               await waitForNavigationReadiness(
                 threadRef,
-                request.requestId,
+                context,
                 activeTabId,
                 "load",
                 request.timeoutMs,
               );
             }
-            return await currentStatus(threadRef, activeTabId);
+            const status = await currentStatus(threadRef, activeTabId);
+            // A reused tab may have failed on this client; never report it as fine.
+            assertNoLocalFailure(threadRef, activeTabId, context);
+            return status;
           }
           case "navigate": {
             const ready = await requireReadyTab();
@@ -433,10 +600,19 @@ function PreviewAutomationHost(props: { readonly environmentId: EnvironmentId })
                 url: input.url!,
               },
             );
-            await ready.bridge.navigate(ready.tabId, resolution.resolvedUrl);
+            await ready.bridge.navigate(
+              ready.tabId,
+              await resolveNativeUrl(
+                threadRef,
+                ready.tabId,
+                resolution.resolvedUrl,
+                gatewayOpen,
+                context,
+              ),
+            );
             await waitForNavigationReadiness(
               threadRef,
-              request.requestId,
+              context,
               ready.tabId,
               input.readiness ?? "load",
               input.timeoutMs ?? request.timeoutMs,
@@ -561,7 +737,7 @@ function PreviewAutomationHost(props: { readonly environmentId: EnvironmentId })
         });
       }
     },
-    [environmentId, listPreviews, open, registry, resize],
+    [environmentId, gatewayOpen, listPreviews, open, registry, resize],
   );
   const [requestHandlerAtom] = useState(() => Atom.make({ handle: handleRequest }));
   const setRequestHandler = useAtomSet(requestHandlerAtom);

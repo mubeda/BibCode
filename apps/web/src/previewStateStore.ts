@@ -27,6 +27,17 @@ export interface DesktopPreviewOverlay {
   controller: "human" | "agent" | "none";
 }
 
+/**
+ * A page this client couldn't load although other clients may: its own SSH
+ * forward, session or network reach failed. `code` 0 means `description` is a
+ * full sentence from BiBCode rather than a network error name.
+ */
+export interface PreviewLocalFailure {
+  readonly url: string;
+  readonly code: number;
+  readonly description: string;
+}
+
 export interface ThreadPreviewState {
   snapshot: PreviewSessionSnapshot | null;
   sessions: Record<string, PreviewSessionSnapshot>;
@@ -35,6 +46,8 @@ export interface ThreadPreviewState {
   activeTabId: string | null;
   desktopOverlay: DesktopPreviewOverlay | null;
   desktopByTabId: Record<string, DesktopPreviewOverlay>;
+  /** This client's own load failures by tab; never sent to the server. */
+  localFailures: Record<string, PreviewLocalFailure>;
   recentlySeenUrls: string[];
 }
 
@@ -45,6 +58,7 @@ const EMPTY_THREAD_PREVIEW_STATE: ThreadPreviewState = Object.freeze({
   activeTabId: null,
   desktopOverlay: null,
   desktopByTabId: {},
+  localFailures: {},
   recentlySeenUrls: [] as string[],
 });
 
@@ -133,6 +147,7 @@ const removeSession = (current: ThreadPreviewState, tabId: string): ThreadPrevie
   if (!current.sessions[tabId]) return current;
   const { [tabId]: _closed, ...sessions } = current.sessions;
   const { [tabId]: _desktop, ...desktopByTabId } = current.desktopByTabId;
+  const { [tabId]: _failure, ...localFailures } = current.localFailures;
   const nextSnapshot = latestSnapshot(sessions);
   const activeTabId =
     current.activeTabId === tabId ? (nextSnapshot?.tabId ?? null) : current.activeTabId;
@@ -141,6 +156,7 @@ const removeSession = (current: ThreadPreviewState, tabId: string): ThreadPrevie
     ...current,
     sessions,
     desktopByTabId,
+    localFailures,
     activeTabId: snapshot?.tabId ?? null,
     snapshot,
     desktopOverlay: snapshot ? (desktopByTabId[snapshot.tabId] ?? null) : null,
@@ -181,6 +197,28 @@ export function subscribeThreadPreviewState(
   });
 }
 
+const RFC3339_FRACTION = /^(.*?)(?:\.(\d+))?(Z|[+-]\d\d:\d\d)$/i;
+
+/** Whole seconds plus the fraction padded to a fixed width, so digit strings compare. */
+function instant(value: string): readonly [number, string] | null {
+  const match = RFC3339_FRACTION.exec(value);
+  const seconds = match ? Date.parse(`${match[1]}${match[3]}`) : Number.NaN;
+  return Number.isNaN(seconds) ? null : [seconds, (match?.[2] ?? "").padEnd(12, "0")];
+}
+
+/**
+ * Server timestamps are RFC 3339 with variable fractional digits ("…01.1Z" is
+ * earlier than "…01.15Z") and finer than milliseconds, so compare instants at
+ * full precision, never raw strings or `Date.parse`.
+ */
+function isAfter(a: string | undefined, b: string): boolean {
+  if (a === undefined) return false;
+  const x = instant(a);
+  const y = instant(b);
+  if (!x || !y) return a > b;
+  return x[0] !== y[0] ? x[0] > y[0] : x[1] > y[1];
+}
+
 export function applyPreviewServerEvent(ref: ScopedThreadRef, event: PreviewEvent): void {
   updateThreadPreviewState(ref, (current) => {
     switch (event.type) {
@@ -189,6 +227,10 @@ export function applyPreviewServerEvent(ref: ScopedThreadRef, event: PreviewEven
       case "resized": {
         const snapshot = event.snapshot;
         if (current.suppressedTabIds.has(snapshot.tabId)) return current;
+        // A replayed event (the events atom outlives session syncs) must not regress newer state.
+        if (isAfter(current.sessions[snapshot.tabId]?.updatedAt, snapshot.updatedAt)) {
+          return current;
+        }
         const recentlySeenUrls =
           snapshot.navStatus._tag === "Idle"
             ? current.recentlySeenUrls
@@ -207,7 +249,7 @@ export function applyPreviewServerEvent(ref: ScopedThreadRef, event: PreviewEven
       }
       case "failed": {
         const existing = current.sessions[event.tabId];
-        if (!existing) return current;
+        if (!existing || isAfter(existing.updatedAt, event.createdAt)) return current;
         const failedSnapshot = {
           ...existing,
           navStatus: {
@@ -228,6 +270,8 @@ export function applyPreviewServerEvent(ref: ScopedThreadRef, event: PreviewEven
       }
       case "closed":
         return removeSession(current, event.tabId);
+      case "openRequested":
+        return current;
     }
   });
 }
@@ -246,11 +290,12 @@ export function applyPreviewServerSnapshot(
         activeTabId: null,
         desktopOverlay: null,
         desktopByTabId: {},
+        localFailures: {},
       };
     }
     if (current.suppressedTabIds.has(snapshot.tabId)) return current;
     const existing = current.sessions[snapshot.tabId];
-    if (existing && existing.updatedAt > snapshot.updatedAt) return current;
+    if (isAfter(existing?.updatedAt, snapshot.updatedAt)) return current;
     const recentlySeenUrls = rememberSnapshotUrl(current.recentlySeenUrls, snapshot);
     return {
       ...current,
@@ -276,7 +321,7 @@ export function updatePreviewServerSnapshot(
   updateThreadPreviewState(ref, (current) => {
     if (current.suppressedTabIds.has(snapshot.tabId)) return current;
     const existing = current.sessions[snapshot.tabId];
-    if (existing && existing.updatedAt > snapshot.updatedAt) return current;
+    if (isAfter(existing?.updatedAt, snapshot.updatedAt)) return current;
     const sessions = { ...current.sessions, [snapshot.tabId]: snapshot };
     const activeTabId =
       current.activeTabId && sessions[current.activeTabId] ? current.activeTabId : snapshot.tabId;
@@ -307,7 +352,8 @@ export function reconcilePreviewServerSessions(
     for (const snapshot of snapshots) {
       if (current.suppressedTabIds.has(snapshot.tabId)) continue;
       const existing = current.sessions[snapshot.tabId];
-      const next = existing && existing.updatedAt > snapshot.updatedAt ? existing : snapshot;
+      const next =
+        existing && isAfter(existing.updatedAt, snapshot.updatedAt) ? existing : snapshot;
       sessions[next.tabId] = next;
       recentlySeenUrls = rememberSnapshotUrl(recentlySeenUrls, next);
     }
@@ -321,12 +367,16 @@ export function reconcilePreviewServerSessions(
     const desktopByTabId = Object.fromEntries(
       Object.entries(current.desktopByTabId).filter(([tabId]) => sessions[tabId] !== undefined),
     );
+    const localFailures = Object.fromEntries(
+      Object.entries(current.localFailures).filter(([tabId]) => sessions[tabId] !== undefined),
+    );
     return {
       ...current,
       sessions,
       activeTabId,
       snapshot,
       desktopByTabId,
+      localFailures,
       desktopOverlay: activeTabId ? (desktopByTabId[activeTabId] ?? null) : null,
       recentlySeenUrls,
     };
@@ -347,6 +397,22 @@ export function applyPreviewDesktopState(
       desktopByTabId,
       desktopOverlay: current.activeTabId === tabId ? overlay : current.desktopOverlay,
     };
+  });
+}
+
+/** Sets or clears (`null`) a tab's client-local load failure. */
+export function setPreviewLocalFailure(
+  ref: ScopedThreadRef,
+  tabId: string,
+  failure: PreviewLocalFailure | null,
+): void {
+  updateThreadPreviewState(ref, (current) => {
+    if (failure === null) {
+      if (!(tabId in current.localFailures)) return current;
+      const { [tabId]: _cleared, ...localFailures } = current.localFailures;
+      return { ...current, localFailures };
+    }
+    return { ...current, localFailures: { ...current.localFailures, [tabId]: failure } };
   });
 }
 

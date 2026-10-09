@@ -10,13 +10,21 @@ const copyLinkAction = (url: string) => ({
 export function showPreviewUnreachableNotice(
   resolution: Extract<PreviewTargetResolution, { kind: "unreachable" }>,
 ): void {
+  showPreviewUnreachableMessage(
+    UNREACHABLE_MESSAGES[resolution.reason](resolution.environmentLabel),
+    resolution.url,
+  );
+}
+
+/** The same notice for a resolution that failed after the gateway was asked. */
+export function showPreviewUnreachableMessage(message: string, url: string): void {
   toastManager.add(
     stackedThreadToast({
       type: "warning",
       title: "Can't open this address here",
-      description: `${UNREACHABLE_MESSAGES[resolution.reason](resolution.environmentLabel)} (${resolution.url})`,
+      description: `${message} (${url})`,
       actionVariant: "outline",
-      actionProps: copyLinkAction(resolution.url),
+      actionProps: copyLinkAction(url),
     }),
   );
 }

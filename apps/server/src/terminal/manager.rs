@@ -114,7 +114,21 @@ pub struct TerminalManagerOptions {
     pub subprocess_poll_interval: Duration,
     pub subprocess_inspector: Option<Arc<dyn TerminalSubprocessInspector>>,
     pub launch_preparer: Option<Arc<dyn TerminalLaunchPreparer>>,
+    /// Server-owned variables merged into every spawn's environment after the caller's, so
+    /// they win. Called with the thread id once per process start, never for an open that
+    /// finds the terminal running.
+    pub session_env: Option<TerminalSessionEnv>,
 }
+
+/// See [`TerminalManagerOptions::session_env`].
+pub type TerminalSessionEnv = Arc<
+    dyn for<'a> Fn(
+            &'a str,
+            &'a mut std::collections::BTreeMap<String, String>,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>
+        + Send
+        + Sync,
+>;
 
 impl std::fmt::Debug for TerminalManagerOptions {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -132,7 +146,27 @@ impl std::fmt::Debug for TerminalManagerOptions {
                 "launch_preparer",
                 &self.launch_preparer.as_ref().map(|_| "configured"),
             )
+            .field(
+                "session_env",
+                &self.session_env.as_ref().map(|_| "configured"),
+            )
             .finish()
+    }
+}
+
+impl TerminalManagerOptions {
+    /// Wraps a [`Self::session_env`] hook; the bound lets a closure infer its signature.
+    pub fn session_env_hook<F>(hook: F) -> TerminalSessionEnv
+    where
+        F: for<'a> Fn(
+                &'a str,
+                &'a mut std::collections::BTreeMap<String, String>,
+            ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        Arc::new(hook)
     }
 }
 
@@ -145,6 +179,7 @@ impl Default for TerminalManagerOptions {
             subprocess_poll_interval: DEFAULT_SUBPROCESS_POLL_INTERVAL,
             subprocess_inspector: None,
             launch_preparer: None,
+            session_env: None,
         }
     }
 }
@@ -1953,6 +1988,10 @@ impl TerminalManager {
             }
             // Reopening an exited session keeps its center-panel marker.
             carry_over = session.carry_over();
+        }
+        let mut input = input;
+        if let Some(session_env) = self.inner.options.session_env.as_ref() {
+            session_env(&input.thread_id, &mut input.env).await;
         }
 
         let mut private_values = Vec::new();
@@ -7474,6 +7513,73 @@ mod tests {
         assert!(
             processes.iter().all(|process| process.is_killed()),
             "one failed kill must not prevent later terminals from being signaled"
+        );
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn terminal_env_contains_open_url_vars() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(HistoryTestBackend::default());
+        let issued = Arc::new(StdMutex::new(Vec::<String>::new()));
+        let hook_issued = issued.clone();
+        let manager = TerminalManager::new(
+            backend.clone(),
+            TerminalManagerOptions {
+                subprocess_poll_interval: Duration::ZERO,
+                session_env: Some(TerminalManagerOptions::session_env_hook(
+                    move |thread_id, env| {
+                        let issued = hook_issued.clone();
+                        Box::pin(async move {
+                            let mut issued = issued.lock().unwrap();
+                            let token = format!("{thread_id}-token-{}", issued.len());
+                            issued.push(token.clone());
+                            crate::open_url::OpenUrlSession {
+                                endpoint: "http://127.0.0.1:3773/api/preview/open-url".to_owned(),
+                                token,
+                                shim_dir: PathBuf::from("/state/runtime/open-url"),
+                            }
+                            .apply(env);
+                        })
+                    },
+                )),
+                ..TerminalManagerOptions::default()
+            },
+        );
+        let mut input =
+            TerminalOpenInput::new("thread-open-url", "term", root.path().to_path_buf(), 80, 24);
+        input.env.insert("BROWSER".to_owned(), "firefox".to_owned());
+        input
+            .env
+            .insert("PATH".to_owned(), "/client/bin".to_owned());
+
+        manager.open(input.clone()).await.unwrap();
+        // Opening a running terminal again spawns nothing and issues nothing.
+        manager.open(input.clone()).await.unwrap();
+        manager.restart(input).await.unwrap();
+
+        let spawns = backend.spawns();
+        assert_eq!(spawns.len(), 2, "open and restart each spawn once");
+        let separator = if cfg!(windows) { ';' } else { ':' };
+        for (spawn, token) in spawns.iter().zip(issued.lock().unwrap().iter()) {
+            assert_eq!(spawn.env["BIBCODE_OPEN_URL_AUTH"], *token);
+            assert_eq!(
+                spawn.env["BIBCODE_OPEN_URL_ENDPOINT"],
+                "http://127.0.0.1:3773/api/preview/open-url"
+            );
+            assert_eq!(spawn.env["BROWSER"], "bibcode-open-url");
+            assert_eq!(spawn.env["BRAINSTORM_OPEN_CMD"], "bibcode-open-url");
+            assert_eq!(
+                spawn.env["PATH"],
+                format!("/state/runtime/open-url{separator}/client/bin")
+            );
+        }
+        assert_eq!(
+            *issued.lock().unwrap(),
+            vec![
+                "thread-open-url-token-0".to_owned(),
+                "thread-open-url-token-1".to_owned()
+            ]
         );
         manager.shutdown().await;
     }

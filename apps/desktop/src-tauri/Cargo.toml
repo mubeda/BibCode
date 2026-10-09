@@ -51,6 +51,7 @@ uuid.workspace = true
 windows-sys = { workspace = true, features = [
   "Win32_Foundation",
   "Win32_Security_Cryptography",
+  "Win32_System_Console",
   "Win32_System_IO",
 ] }
 

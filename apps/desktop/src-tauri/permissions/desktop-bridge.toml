@@ -22,6 +22,8 @@ commands.allow = [
   "desktop_bridge_discover_ssh_hosts",
   "desktop_bridge_ensure_ssh_environment",
   "desktop_bridge_disconnect_ssh_environment",
+  "desktop_bridge_ssh_forward",
+  "desktop_bridge_release_ssh_forward",
   "desktop_bridge_fetch_environment_descriptor",
   "desktop_bridge_bootstrap_ssh_bearer_session",
   "desktop_bridge_fetch_ssh_session_state",

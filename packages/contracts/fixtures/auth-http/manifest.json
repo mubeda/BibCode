@@ -122,6 +122,12 @@
           "fingerprint": "c039e5b3393bc4ce03005ce34ceffb1518a878ae4d3d2b6af25cb52e5cfd1ca4"
         },
         {
+          "status": 403,
+          "contentType": "application/json",
+          "schema": "EnvironmentOperationForbiddenError",
+          "fingerprint": "c7553306f39de83068b0b62c4affbf0febfac8914c651152601cf60a240944a4"
+        },
+        {
           "status": 500,
           "contentType": "application/json",
           "schema": "EnvironmentInternalError",
@@ -161,6 +167,12 @@
           "contentType": "application/json",
           "schema": "EnvironmentAuthInvalidError",
           "fingerprint": "c039e5b3393bc4ce03005ce34ceffb1518a878ae4d3d2b6af25cb52e5cfd1ca4"
+        },
+        {
+          "status": 403,
+          "contentType": "application/json",
+          "schema": "EnvironmentOperationForbiddenError",
+          "fingerprint": "c7553306f39de83068b0b62c4affbf0febfac8914c651152601cf60a240944a4"
         },
         {
           "status": 403,
@@ -212,6 +224,12 @@
         {
           "status": 403,
           "contentType": "application/json",
+          "schema": "EnvironmentOperationForbiddenError",
+          "fingerprint": "c7553306f39de83068b0b62c4affbf0febfac8914c651152601cf60a240944a4"
+        },
+        {
+          "status": 403,
+          "contentType": "application/json",
           "schema": "EnvironmentScopeRequiredError",
           "fingerprint": "68a57af6244a95a76a7c1f21cfd8dc0de362a3926986dd3ac5461465e1c78e99"
         },
@@ -259,6 +277,12 @@
         {
           "status": 403,
           "contentType": "application/json",
+          "schema": "EnvironmentOperationForbiddenError",
+          "fingerprint": "c7553306f39de83068b0b62c4affbf0febfac8914c651152601cf60a240944a4"
+        },
+        {
+          "status": 403,
+          "contentType": "application/json",
           "schema": "EnvironmentScopeRequiredError",
           "fingerprint": "68a57af6244a95a76a7c1f21cfd8dc0de362a3926986dd3ac5461465e1c78e99"
         },
@@ -294,6 +318,12 @@
         {
           "status": 403,
           "contentType": "application/json",
+          "schema": "EnvironmentOperationForbiddenError",
+          "fingerprint": "c7553306f39de83068b0b62c4affbf0febfac8914c651152601cf60a240944a4"
+        },
+        {
+          "status": 403,
+          "contentType": "application/json",
           "schema": "EnvironmentScopeRequiredError",
           "fingerprint": "68a57af6244a95a76a7c1f21cfd8dc0de362a3926986dd3ac5461465e1c78e99"
         },
@@ -325,6 +355,12 @@
           "contentType": "application/json",
           "schema": "EnvironmentAuthInvalidError",
           "fingerprint": "c039e5b3393bc4ce03005ce34ceffb1518a878ae4d3d2b6af25cb52e5cfd1ca4"
+        },
+        {
+          "status": 403,
+          "contentType": "application/json",
+          "schema": "EnvironmentOperationForbiddenError",
+          "fingerprint": "c7553306f39de83068b0b62c4affbf0febfac8914c651152601cf60a240944a4"
         },
         {
           "status": 403,
@@ -370,6 +406,12 @@
         {
           "status": 403,
           "contentType": "application/json",
+          "schema": "EnvironmentOperationForbiddenError",
+          "fingerprint": "c7553306f39de83068b0b62c4affbf0febfac8914c651152601cf60a240944a4"
+        },
+        {
+          "status": 403,
+          "contentType": "application/json",
           "schema": "EnvironmentScopeRequiredError",
           "fingerprint": "68a57af6244a95a76a7c1f21cfd8dc0de362a3926986dd3ac5461465e1c78e99"
         },
@@ -401,6 +443,12 @@
           "contentType": "application/json",
           "schema": "EnvironmentAuthInvalidError",
           "fingerprint": "c039e5b3393bc4ce03005ce34ceffb1518a878ae4d3d2b6af25cb52e5cfd1ca4"
+        },
+        {
+          "status": 403,
+          "contentType": "application/json",
+          "schema": "EnvironmentOperationForbiddenError",
+          "fingerprint": "c7553306f39de83068b0b62c4affbf0febfac8914c651152601cf60a240944a4"
         },
         {
           "status": 403,
@@ -447,7 +495,7 @@
           "status": 403,
           "contentType": "application/json",
           "schema": "EnvironmentOperationForbiddenError",
-          "fingerprint": "6b958e53586d02b5c106f20748b3083bb5395e186ee5519bfcbe94283190ec11"
+          "fingerprint": "c7553306f39de83068b0b62c4affbf0febfac8914c651152601cf60a240944a4"
         },
         {
           "status": 403,
@@ -483,6 +531,12 @@
           "contentType": "application/json",
           "schema": "EnvironmentAuthInvalidError",
           "fingerprint": "c039e5b3393bc4ce03005ce34ceffb1518a878ae4d3d2b6af25cb52e5cfd1ca4"
+        },
+        {
+          "status": 403,
+          "contentType": "application/json",
+          "schema": "EnvironmentOperationForbiddenError",
+          "fingerprint": "c7553306f39de83068b0b62c4affbf0febfac8914c651152601cf60a240944a4"
         },
         {
           "status": 403,
@@ -525,7 +579,7 @@
       "schema": "EnvironmentOperationForbiddenError",
       "status": 403,
       "contentType": "application/json",
-      "fingerprint": "6b958e53586d02b5c106f20748b3083bb5395e186ee5519bfcbe94283190ec11",
+      "fingerprint": "c7553306f39de83068b0b62c4affbf0febfac8914c651152601cf60a240944a4",
       "fixture": "errors/operation-forbidden.json"
     },
     {
@@ -640,7 +694,7 @@
     "AuthWebSocketTicketResult": "bdaf306908553902221f7e52e7febb43db6827353c40ff572ce058ba88ec1127",
     "EnvironmentAuthInvalidError": "c039e5b3393bc4ce03005ce34ceffb1518a878ae4d3d2b6af25cb52e5cfd1ca4",
     "EnvironmentInternalError": "34acb16b174e2da13f6082cf3afe41a45e80e41816f7fe6eb7a1173ee015ea53",
-    "EnvironmentOperationForbiddenError": "6b958e53586d02b5c106f20748b3083bb5395e186ee5519bfcbe94283190ec11",
+    "EnvironmentOperationForbiddenError": "c7553306f39de83068b0b62c4affbf0febfac8914c651152601cf60a240944a4",
     "EnvironmentRequestInvalidError": "c17879c795c3f9e092ced6a9ac3fa2f0ea85c4370d062c84d68ec03c1bd2e3c3",
     "EnvironmentScopeRequiredError": "68a57af6244a95a76a7c1f21cfd8dc0de362a3926986dd3ac5461465e1c78e99"
   },

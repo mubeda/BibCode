@@ -84,7 +84,7 @@ const authRouteContract = [
     path: "/api/auth/websocket-ticket",
     requestContentTypes: [],
     successStatuses: [200],
-    errorStatuses: [401, 500],
+    errorStatuses: [401, 403, 500],
   },
   {
     name: "pairingCredential",

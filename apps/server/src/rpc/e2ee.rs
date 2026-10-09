@@ -41,6 +41,7 @@ use crate::{
     },
     config::ServerConfig,
     http::spawn_session_expiration_guard,
+    preview::gateway::registry::ClientReach,
 };
 
 pub(crate) const MAX_E2EE_CIPHERTEXT_BYTES: usize = 65_535;
@@ -940,9 +941,14 @@ enum EstablishOutcome {
 
 /// Runs the complete `/ws-e2ee` lifecycle: Noise NK, encrypted credential
 /// bootstrap, then the unchanged RPC protocol over encrypted records.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Explicit transport handoff from the HTTP upgrade"
+)]
 pub(crate) async fn run_e2ee_session(
     socket: WebSocket,
     peer_ip: IpAddr,
+    reach: Option<ClientReach>,
     preauth_admission: E2eePreauthAdmission,
     auth: AuthService,
     registry: RpcRegistry,
@@ -1130,6 +1136,7 @@ pub(crate) async fn run_e2ee_session(
         ws_reader,
         channel,
         admission,
+        reach,
         interleave,
         auth,
         registry,
@@ -1185,6 +1192,7 @@ async fn run_established_e2ee<W, R>(
     ws_reader: R,
     channel: E2eeChannel,
     admission: EstablishedE2eeAdmission,
+    reach: Option<ClientReach>,
     interleave: bool,
     auth: AuthService,
     registry: RpcRegistry,
@@ -1405,7 +1413,7 @@ async fn run_established_e2ee<W, R>(
         liveness,
         reader_stream,
         registry,
-        context,
+        context.with_reach(reach),
         session_shutdown.clone(),
         Some(RpcOutboundBudget::new(
             E2EE_RESOURCE_BUDGET.global_outbound(),
@@ -2170,6 +2178,7 @@ mod tests {
                 },
                 _permit: permit,
             },
+            None,
             true,
             auth.clone(),
             registry,

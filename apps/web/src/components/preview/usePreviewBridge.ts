@@ -9,7 +9,12 @@ import type {
 import { useEffect, useRef } from "react";
 
 import { useBrowserPointerStore } from "~/browser/browserPointerStore";
-import { applyPreviewDesktopState, type DesktopPreviewOverlay } from "~/previewStateStore";
+import { canonicalizePreviewUrl, isGatewayClientUrl } from "~/browser/previewGateway";
+import {
+  applyPreviewDesktopState,
+  type DesktopPreviewOverlay,
+  setPreviewLocalFailure,
+} from "~/previewStateStore";
 import { previewEnvironment } from "~/state/preview";
 import { useAtomCommand } from "~/state/use-atom-command";
 
@@ -35,13 +40,31 @@ export function usePreviewBridge(input: { threadRef: ScopedThreadRef; tabId: str
     lastReportedUrl.current = null;
     lastReportedKind.current = null;
     lastDesktopNavStatus.current = null;
-    const unsubscribe = bridge.onStateChange((changedTabId, state) => {
+    const unsubscribe = bridge.onStateChange((changedTabId, nativeState) => {
       if (changedTabId !== tabId) return;
+      // The webview may sit on a client-specific gateway origin; everything
+      // shared or compared below uses the canonical URL.
+      const state = canonicalizeDesktopState(nativeState);
       if (shouldClearBrowserPointer(lastDesktopNavStatus.current, state.navStatus)) {
         clearBrowserPointer(tabId);
       }
+      if (startsNavigation(lastDesktopNavStatus.current, state.navStatus)) {
+        setPreviewLocalFailure(threadRef, tabId, null);
+      }
       lastDesktopNavStatus.current = state.navStatus;
       applyPreviewDesktopState(threadRef, tabId, projectDesktopState(state));
+      // This client couldn't reach its own gateway origin (a dropped SSH
+      // forward, a LAN route): another client may load the page fine, so the
+      // failure stays on this client instead of failing the shared tab.
+      if (
+        state.navStatus.kind === "LoadFailed" &&
+        nativeState.navStatus.kind === "LoadFailed" &&
+        isGatewayClientUrl(nativeState.navStatus.url)
+      ) {
+        const { url, code, description } = state.navStatus;
+        setPreviewLocalFailure(threadRef, tabId, { url, code, description });
+        return;
+      }
       const reported = buildReportInput({
         threadId: threadRef.threadId,
         tabId,
@@ -59,6 +82,26 @@ export function usePreviewBridge(input: { threadRef: ScopedThreadRef; tabId: str
     });
     return unsubscribe;
   }, [bridge, clearBrowserPointer, reportStatus, tabId, threadRef]);
+}
+
+function canonicalizeDesktopState(state: DesktopPreviewTabState): DesktopPreviewTabState {
+  if (state.navStatus.kind === "Idle") return state;
+  const url = canonicalizePreviewUrl(state.navStatus.url);
+  return url === state.navStatus.url ? state : { ...state, navStatus: { ...state.navStatus, url } };
+}
+
+/**
+ * A new page load began or finished: Loading, or a page newly settled (after
+ * a failure or another URL). A repeated Success for the same page, such as a
+ * zoom change, is not one; the native host may skip Loading on history moves.
+ */
+function startsNavigation(
+  previous: DesktopPreviewTabState["navStatus"] | null,
+  current: DesktopPreviewTabState["navStatus"],
+): boolean {
+  if (current.kind === "Loading") return true;
+  if (current.kind !== "Success" || previous === null || previous.kind === "Idle") return false;
+  return previous.kind !== "Success" || previous.url !== current.url;
 }
 
 function shouldClearBrowserPointer(

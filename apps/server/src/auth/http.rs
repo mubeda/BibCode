@@ -670,6 +670,19 @@ async fn authenticate_request_for_method(
         .map(str::trim);
     let token = cookie.or(bearer).or(dpop).filter(|value| !value.is_empty());
     let token = token.ok_or(AuthError::MissingCredential)?;
+    // The cookie wins the chain above, so a present cookie is the credential.
+    // Browsers attach it cross-site; only same-origin pages may mutate with it.
+    let mutates = !matches!(method, "GET" | "HEAD" | "OPTIONS")
+        || headers
+            .get(header::UPGRADE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.eq_ignore_ascii_case("websocket"));
+    if cookie.is_some()
+        && mutates
+        && !cookie_request_origin_allowed(headers, auth.trusted_cookie_origins())
+    {
+        return Err(AuthError::Forbidden);
+    }
     let principal = auth
         .authenticate_token(token, super::SessionTransport::Plain)
         .await?;
@@ -692,6 +705,44 @@ async fn authenticate_request_for_method(
         return Err(AuthError::InvalidCredential);
     }
     Ok(principal)
+}
+
+/// True when `Origin` is a trusted app origin or the request's own
+/// `http(s)://<Host>` origin.
+pub(crate) fn cookie_request_origin_allowed(headers: &HeaderMap, trusted: &[String]) -> bool {
+    let Some(origin) = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    if trusted
+        .iter()
+        .any(|candidate| candidate.eq_ignore_ascii_case(origin))
+    {
+        return true;
+    }
+    let Some(host) = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    let Ok(url) = url::Url::parse(origin) else {
+        return false;
+    };
+    matches!(url.scheme(), "http" | "https")
+        && url.path() == "/"
+        && url
+            .host_str()
+            .map(|origin_host| {
+                let port = url
+                    .port()
+                    .map(|port| format!(":{port}"))
+                    .unwrap_or_default();
+                format!("{origin_host}{port}")
+            })
+            .is_some_and(|authority| authority.eq_ignore_ascii_case(host))
 }
 
 fn require_scope(principal: &super::model::Principal, scope: &str) -> Result<(), AuthError> {
@@ -790,6 +841,11 @@ impl IntoResponse for HttpAuthError {
                 "EnvironmentOperationForbiddenError",
                 json!({ "code": "operation_forbidden", "reason": "current_session_revoke_not_allowed", "traceId": trace_id }),
             ),
+            AuthError::Forbidden => error_response(
+                StatusCode::FORBIDDEN,
+                "EnvironmentOperationForbiddenError",
+                json!({ "code": "operation_forbidden", "reason": "origin_not_allowed", "traceId": trace_id }),
+            ),
             AuthError::Internal(diagnostic) => {
                 tracing::error!(%trace_id, %diagnostic, "environment authentication failed");
                 error_response(
@@ -840,7 +896,11 @@ fn request_url(headers: &HeaderMap, uri: &Uri) -> Result<String, AuthError> {
 
 fn request_method(uri: &Uri) -> &'static str {
     match uri.path() {
-        "/api/auth/session" | "/api/auth/pairing-links" | "/api/auth/clients" | "/ws" => "GET",
+        "/api/auth/session"
+        | "/api/auth/share-state"
+        | "/api/auth/pairing-links"
+        | "/api/auth/clients"
+        | "/ws" => "GET",
         _ => "POST",
     }
 }
@@ -971,6 +1031,66 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn cookie_origin_matches_host_or_the_dev_origin() {
+        use axum::http::{HeaderMap, HeaderValue, header};
+
+        let config = crate::config::ServerConfig::new(std::env::temp_dir())
+            .with_dev_url("http://localhost:5733/app".parse().expect("dev URL"));
+        let auth = crate::auth::AuthService::new(&config, vec![7_u8; 32]);
+        let trusted = auth.trusted_cookie_origins();
+        let allowed = |host: Option<&str>, origin: Option<&str>| {
+            let mut headers = HeaderMap::new();
+            if let Some(host) = host {
+                headers.insert(header::HOST, HeaderValue::from_str(host).expect("host"));
+            }
+            if let Some(origin) = origin {
+                headers.insert(
+                    header::ORIGIN,
+                    HeaderValue::from_str(origin).expect("origin"),
+                );
+            }
+            super::cookie_request_origin_allowed(&headers, trusted)
+        };
+
+        assert_eq!(trusted, ["http://localhost:5733"]);
+        assert!(allowed(None, Some("http://localhost:5733")));
+        // The desktop app never authenticates with the cookie, so its origins get no pass.
+        for origin in ["bibcode://app", "bibcode-dev://app"] {
+            assert!(!allowed(Some("127.0.0.1:3773"), Some(origin)), "{origin}");
+        }
+        assert!(allowed(
+            Some("127.0.0.1:3773"),
+            Some("http://127.0.0.1:3773")
+        ));
+        assert!(allowed(Some("[::1]:3773"), Some("http://[::1]:3773")));
+        assert!(allowed(Some("Example.test"), Some("https://example.test")));
+        assert!(!allowed(Some("127.0.0.1:3773"), None));
+        assert!(!allowed(Some("127.0.0.1:3773"), Some("null")));
+        let opaque_dev = crate::config::ServerConfig::new(std::env::temp_dir())
+            .with_dev_url("file:///tmp/app".parse().expect("opaque dev URL"));
+        let opaque_auth = crate::auth::AuthService::new(&opaque_dev, vec![7_u8; 32]);
+        assert!(opaque_auth.trusted_cookie_origins().is_empty());
+        assert!(!allowed(
+            Some("127.0.0.1:3773"),
+            Some("http://127.0.0.1:3774")
+        ));
+        assert!(!allowed(Some("[::1]:3773"), Some("http://[::2]:3773")));
+        assert!(!allowed(
+            Some("127.0.0.1:3773"),
+            Some("ws://127.0.0.1:3773")
+        ));
+        assert!(!allowed(
+            Some("127.0.0.1:3773"),
+            Some("http://127.0.0.1:3773/x")
+        ));
+        assert!(!allowed(None, Some("http://127.0.0.1:3773")));
+        assert!(!allowed(
+            Some("localhost:5734"),
+            Some("http://localhost:5734.evil")
+        ));
     }
 
     #[test]

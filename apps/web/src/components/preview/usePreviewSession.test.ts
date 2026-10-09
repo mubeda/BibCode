@@ -13,8 +13,11 @@ const harness = vi.hoisted(() => ({
   applySnapshot: vi.fn(),
   applyEvent: vi.fn(),
   readState: vi.fn(),
+  releasePreviewTab: vi.fn(),
   openCommand: { label: "preview-open" },
 }));
+
+vi.mock("~/browser/previewGateway", () => ({ releasePreviewTab: harness.releasePreviewTab }));
 
 vi.mock("@effect/atom-react", () => ({
   useAtomValue: (atom: unknown) => {
@@ -82,6 +85,7 @@ beforeEach(() => {
   harness.reconcileSessions.mockReset();
   harness.applySnapshot.mockReset();
   harness.applyEvent.mockReset();
+  harness.releasePreviewTab.mockReset();
   harness.readState.mockReset();
   harness.readState.mockReturnValue({ snapshot: null });
 });
@@ -216,6 +220,31 @@ describe("usePreviewSession", () => {
       "navigated",
       "closed",
     ]);
+    registry.dispose();
+  });
+
+  it("releases a closed tab's SSH forwards at once", async () => {
+    harness.eventsInitial = AsyncResult.initial(false);
+    const atom = captureSyncAtom("thread-close");
+    const registry = AtomRegistry.make();
+    registry.mount(atom);
+    await Promise.resolve();
+
+    const eventsAtom = harness.eventsAtoms[0] as Atom.Writable<unknown>;
+    registry.set(
+      eventsAtom,
+      AsyncResult.success({
+        threadId: ThreadId.make("thread-close"),
+        type: "navigated",
+        tabId: "t",
+      }),
+    );
+    registry.set(
+      eventsAtom,
+      AsyncResult.success({ threadId: ThreadId.make("thread-close"), type: "closed", tabId: "t" }),
+    );
+    await vi.waitFor(() => expect(harness.releasePreviewTab).toHaveBeenCalledTimes(1));
+    expect(harness.releasePreviewTab).toHaveBeenCalledWith(environmentId, "t");
     registry.dispose();
   });
 
