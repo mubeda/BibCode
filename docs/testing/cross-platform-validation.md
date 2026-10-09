@@ -332,6 +332,19 @@ new notice; conflicting runtime identities, stale attempt/state guards, steers,
 and already delivered rows must not trigger a fresh launch. Nonaccepted outcomes
 and unknown-reason decoding retain their existing behavior.
 
+With OpenCode, stop the server while a message is still sending, delete that
+session on the OpenCode server, and restart: the message must become uncertain
+with "The provider no longer has the conversation this message was sent to, so
+BiBCode can't tell whether it arrived. Retry sends it to a new conversation.",
+nothing may be resent automatically, and a further restart must leave it
+unchanged. An explicit **Retry** must deliver it once in a new conversation with
+the muted new-conversation notice.
+
+Send a message in a chat panel whose provider takes several seconds to start,
+then close the panel's tab before the client shows it running: no turn may start
+or keep running in the workspace, and **Reopen closed chat** must deliver the
+message once.
+
 Verify enqueue without a turn-start event or working projection, oldest-first
 promotion once per settle, explicit Send now clearing only its row's hold,
 interrupt/error holds, approval and user-input gates, and withdrawal without

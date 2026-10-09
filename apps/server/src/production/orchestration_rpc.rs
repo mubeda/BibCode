@@ -400,6 +400,18 @@ async fn dispatch_prepared_command(
             created_at,
             ..
         } => Some((command_id.clone(), thread_id.clone(), created_at.clone())),
+        // Closing a chat panel archives it. The server stops its work, including a delivery
+        // claimed but not yet visible to clients as a running session.
+        OrchestrationCommand::ThreadArchive {
+            command_id,
+            thread_id,
+        } => dispatch
+            .repositories()
+            .get_thread(thread_id.clone())
+            .await
+            .map_err(|error| orchestration_error("OrchestrationDispatchCommandError", error))?
+            .filter(|thread| thread.kind == "panel")
+            .map(|_| (command_id.clone(), thread_id.clone(), now_iso())),
         _ => None,
     };
     let is_delivery_resolution = matches!(
@@ -502,7 +514,7 @@ async fn dispatch_prepared_command(
             if let Err(error) = result
                 && !matches!(error, ProviderRuntimeError::SessionNotFound { .. })
             {
-                tracing::warn!(%error, "provider interrupt failed after cancelling message delivery");
+                tracing::warn!(%error, "provider interrupt failed after cancelling provider work");
             }
         } else if !is_delivery_resolution && !route_before_admission {
             route_orchestration_command(
@@ -2121,6 +2133,7 @@ mod tests {
     #[derive(Default)]
     struct ModelMutationProbe {
         set_model_calls: AtomicUsize,
+        interrupt_calls: AtomicUsize,
         fail_set_model_calls: AtomicUsize,
         pause_next_set_model: std::sync::Mutex<Option<Arc<ModelMutationPause>>>,
     }
@@ -2160,6 +2173,7 @@ mod tests {
             &self,
             _turn_id: Option<String>,
         ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+            self.interrupt_calls.fetch_add(1, Ordering::SeqCst);
             Box::pin(async { Ok(()) })
         }
 
@@ -3617,6 +3631,122 @@ mod tests {
                 .as_str()
                 .is_some_and(|message| message.to_ascii_lowercase().contains("conflict"))
         );
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn archiving_a_chat_panel_interrupts_its_provider_work_on_the_server() {
+        let engine = migrated_engine().await;
+        let state = tempfile::tempdir().expect("provider state");
+        let mut commands = vec![json!({
+            "type":"project.create",
+            "commandId":"panel-close-project",
+            "projectId":"panel-close-project",
+            "title":"Panel Close Project",
+            "workspaceRoot":state.path(),
+            "defaultModelSelection":null,
+            "createdAt":CREATED_AT
+        })];
+        for (thread_id, kind, host) in [
+            ("host", "workspace", None),
+            ("side", "workspace", None),
+            ("panel", "panel", Some("host")),
+        ] {
+            commands.push(json!({
+                "type":"thread.create",
+                "commandId":format!("create-{thread_id}"),
+                "threadId":thread_id,
+                "projectId":"panel-close-project",
+                "title":thread_id,
+                "kind":kind,
+                "hostThreadId":host,
+                "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+                "runtimeMode":"full-access",
+                "interactionMode":"default",
+                "branch":null,
+                "worktreePath":null,
+                "createdAt":CREATED_AT
+            }));
+        }
+        for command in commands {
+            engine
+                .dispatch(decode_command(command))
+                .await
+                .expect("fixture command");
+        }
+        let probe = Arc::new(ModelMutationProbe::default());
+        let provider = Arc::new(ProviderRuntimeSupervisor::start(
+            engine.clone(),
+            Arc::new(ModelMutationProbeFactory(probe.clone())),
+            ActivityProjection::new(ActivityRepository::new(
+                engine.repositories().database().clone(),
+            )),
+            SupervisorOptions::default(),
+        ));
+        for thread_id in ["side", "panel"] {
+            provider
+                .launch(ProviderLaunchRequest {
+                    thread_id: thread_id.to_owned(),
+                    activity_causal_revision: 0,
+                    provider: "codex".to_owned(),
+                    provider_label: "Codex".to_owned(),
+                    provider_instance_id: Some("codex".to_owned()),
+                    binary_path: "probe".to_owned(),
+                    cwd: state.path().to_path_buf(),
+                    runtime_mode: "full-access".to_owned(),
+                    interaction_mode: "default".to_owned(),
+                    model: Some("gpt-5".to_owned()),
+                    options: Vec::new(),
+                    custom_models: Vec::new(),
+                    service_tier: None,
+                    effort: None,
+                    agent: None,
+                    resume_cursor: None,
+                    environment: Default::default(),
+                    endpoint: None,
+                    server_password: None,
+                    mcp: None,
+                    codex_home: None,
+                    open_url: None,
+                })
+                .await
+                .expect("provider launches");
+        }
+        let registration = ProviderRegistration {
+            provider: provider.clone(),
+            settings_root: state.path().to_path_buf(),
+            attachments: AttachmentMaterializer::new(state.path().join("attachments")),
+            turn_delivery: Arc::new(TurnDeliveryService::start_with_router(
+                engine.clone(),
+                1,
+                Arc::new(|_| Box::pin(async { Ok(()) })),
+            )),
+            uploads: test_upload_registry(),
+        };
+
+        // Archiving an ordinary thread leaves its provider work alone.
+        dispatch_prepared_for_test(
+            &engine,
+            Some(registration.clone()),
+            decode_command(
+                json!({"type":"thread.archive","commandId":"archive-side","threadId":"side"}),
+            ),
+        )
+        .await
+        .expect("side thread archives");
+        assert_eq!(probe.interrupt_calls.load(Ordering::SeqCst), 0);
+
+        // Closing a chat panel stops its work even when no client saw a running session.
+        dispatch_prepared_for_test(
+            &engine,
+            Some(registration),
+            decode_command(
+                json!({"type":"thread.archive","commandId":"archive-panel","threadId":"panel"}),
+            ),
+        )
+        .await
+        .expect("panel archives");
+        assert_eq!(probe.interrupt_calls.load(Ordering::SeqCst), 1);
         engine.shutdown().await;
     }
 

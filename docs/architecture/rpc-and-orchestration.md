@@ -1948,7 +1948,11 @@ those placeholders and bound running turns continue to block automatic
 promotion. An archived `panel` thread (a closed chat panel) never promotes
 automatically, and delivery neither selects nor claims its pending rows, so
 neither its queue nor a prompt sent just before closing starts work after its
-tab closed; unarchiving it resumes both. Explicit Send now remains available under its client gate.
+tab closed; unarchiving it resumes both. A delivery claimed before the panel
+closed is refused at the provider supervisor before any driver I/O and returns
+to pending, and accepting `thread.archive` for a panel interrupts its provider
+session on the server, so closing a panel stops its work without relying on the
+client's view of the session. Explicit Send now remains available under its client gate.
 
 Pending start deliveries from older clients also wait while the session is
 running or starting; the SQLite claim repeats this check so a stale worker read
@@ -2027,7 +2031,12 @@ the same way inside `launch_session`: before the new cursor is saved, the saved
 cursor is cleared and the same guarded update releases the start, so the retry is
 delivered once in the new conversation instead of failing its identity check; a
 crash between those steps leaves a cursorless runtime the next retry recovers
-from. Reconciliation launches never release a frozen start. The new conversation receives the thread's earlier
+from. Reconciliation launches never release a frozen start. A restart
+reconciliation whose launch finds the frozen conversation gone starts nothing:
+it shuts the replacement down, keeps the saved cursor and the frozen row, and
+settles the row uncertain because whether the lost conversation received it is
+unknowable, so a later restart reaches the same answer. An explicit Retry then
+releases it into a new conversation as above. The new conversation receives the thread's earlier
 messages ([context handoff](./providers.md#resume-failures-and-context-handoff)),
 and the user message shows "Sent in a new conversation with a summary of earlier
 messages." in muted status text. A

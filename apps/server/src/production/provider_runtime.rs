@@ -278,6 +278,9 @@ pub enum ProviderDeliveryOutcome {
     Refused { detail: String },
 }
 
+/// What an undelivered turn shows when restart recovery finds its conversation gone.
+pub(crate) const RECONCILED_CONVERSATION_LOST_DETAIL: &str = "The provider no longer has the conversation this message was sent to, so BiBCode can't tell whether it arrived. Retry sends it to a new conversation.";
+
 /// What a steer shows when the turn it was steering is no longer running.
 pub(crate) const STEER_TARGET_GONE_DETAIL: &str =
     "The selected turn is no longer available for steering.";
@@ -286,7 +289,14 @@ pub(crate) const STEER_TARGET_GONE_DETAIL: &str =
 pub enum ProviderReconciliationOutcome {
     Found,
     Absent,
-    Unavailable { detail: String },
+    Unavailable {
+        detail: String,
+    },
+    /// The conversation the delivery was frozen to is gone, so whether it arrived is unknowable.
+    /// The delivery stays frozen to it; an explicit retry releases it into a new conversation.
+    ConversationLost {
+        detail: String,
+    },
 }
 
 pub struct ProviderDeliveryHandle {
@@ -467,6 +477,9 @@ pub enum ProviderRuntimeError {
     StaleSession { thread_id: String, action: String },
     #[error("thread {thread_id} already has an active provider runtime")]
     SessionAlreadyExists { thread_id: String },
+    /// A reconciliation launch found the frozen conversation gone and started nothing.
+    #[error("the provider no longer has thread {thread_id}'s frozen conversation")]
+    FrozenConversationLost { thread_id: String },
     #[error("provider {provider} is not supported")]
     UnsupportedProvider { provider: String },
     #[error("provider {provider} does not support {capability} while a session is running")]
@@ -532,6 +545,9 @@ enum SupervisorMessage {
         context_handoff: bool,
         /// The frozen start this launch resumes the conversation for.
         frozen_delivery: Option<Box<ProviderTurnDelivery>>,
+        /// Fail with `FrozenConversationLost`, keeping the saved cursor, instead of continuing in
+        /// a new conversation when the requested one is gone.
+        abort_on_lost_resume: bool,
         /// The frozen start released into a new conversation, when the old one was gone.
         response: oneshot::Sender<Result<Option<ProviderTurnDelivery>, ProviderRuntimeError>>,
     },
@@ -1057,7 +1073,18 @@ impl ProviderRuntimeSupervisor {
     }
 
     pub async fn launch(&self, request: ProviderLaunchRequest) -> Result<(), ProviderRuntimeError> {
-        self.launch_with_context_handoff(request, false, None)
+        self.launch_with_context_handoff(request, false, None, false)
+            .await
+            .map(|_| ())
+    }
+
+    /// Resumes a frozen delivery's conversation only to look the delivery up; a conversation the
+    /// provider no longer has fails with `FrozenConversationLost` and nothing is replaced.
+    async fn launch_for_reconciliation(
+        &self,
+        request: ProviderLaunchRequest,
+    ) -> Result<(), ProviderRuntimeError> {
+        self.launch_with_context_handoff(request, false, None, true)
             .await
             .map(|_| ())
     }
@@ -1071,6 +1098,7 @@ impl ProviderRuntimeSupervisor {
         mut request: ProviderLaunchRequest,
         context_handoff: bool,
         frozen_delivery: Option<ProviderTurnDelivery>,
+        abort_on_lost_resume: bool,
     ) -> Result<Option<ProviderTurnDelivery>, ProviderRuntimeError> {
         if request.mcp.is_none()
             && let Some(connect) = self.connect_mcp.read().await.clone()
@@ -1101,6 +1129,7 @@ impl ProviderRuntimeSupervisor {
             request: Box::new(request),
             context_handoff,
             frozen_delivery: frozen_delivery.map(Box::new),
+            abort_on_lost_resume,
             response,
         })
         .await
@@ -1786,6 +1815,7 @@ async fn deliver_orchestration_turn_with_identity(
                     request,
                     started_new_conversation,
                     frozen_delivery.clone(),
+                    false,
                 )
                 .await
             {
@@ -1957,6 +1987,9 @@ pub(crate) fn delivery_detail(
         }
         ProviderRuntimeError::SessionAlreadyExists { .. } => {
             "A session is already running for this thread.".to_owned()
+        }
+        ProviderRuntimeError::FrozenConversationLost { .. } => {
+            RECONCILED_CONVERSATION_LOST_DETAIL.to_owned()
         }
         ProviderRuntimeError::Shutdown | ProviderRuntimeError::QueueClosed => {
             "BiBCode was shutting down.".to_owned()
@@ -2138,10 +2171,18 @@ pub async fn reconcile_orchestration_turn(
                     detail: error.to_string(),
                 };
             }
-            if let Err(error) = supervisor.launch(request).await {
-                return ProviderReconciliationOutcome::Unavailable {
-                    detail: error.to_string(),
-                };
+            match supervisor.launch_for_reconciliation(request).await {
+                Ok(()) => {}
+                Err(ProviderRuntimeError::FrozenConversationLost { .. }) => {
+                    return ProviderReconciliationOutcome::ConversationLost {
+                        detail: RECONCILED_CONVERSATION_LOST_DETAIL.to_owned(),
+                    };
+                }
+                Err(error) => {
+                    return ProviderReconciliationOutcome::Unavailable {
+                        detail: error.to_string(),
+                    };
+                }
             }
             supervisor
                 .reconcile_turn(row)
@@ -2891,6 +2932,29 @@ mod workspace_loss_tests {
                 .is_none()
         );
         assert_eq!(f.driver.shutdowns.load(Ordering::SeqCst), 1);
+        f.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn closed_chat_panel_delivery_claimed_before_close_is_not_sent() {
+        let f = Fixture::new(true).await;
+        f.engine.repositories().database().call(|connection| {
+            connection.execute_batch(&format!("UPDATE projection_threads SET kind = 'panel', archived_at = '{BEFORE_LOSS}' WHERE thread_id = 't1'"))?;
+            Ok(())
+        }).await.unwrap();
+        let delivery = f
+            .supervisor
+            .deliver_turn(turn("closed", false), "closed-key".into())
+            .await
+            .unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(1), delivery.completion())
+            .await
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            ProviderDeliveryOutcome::DefinitelyNotSent { .. }
+        ));
+        assert_eq!(f.driver.sends.load(Ordering::SeqCst), 0);
         f.shutdown().await;
     }
 
@@ -3793,6 +3857,7 @@ mod workspace_loss_tests {
             f.launch.clone(),
             false,
             None,
+            false,
             None,
             None,
             terminal_sender,
@@ -5026,6 +5091,7 @@ async fn run_supervisor(
                 request,
                 context_handoff,
                 frozen_delivery,
+                abort_on_lost_resume,
                 response,
             } => {
                 let result = launch_session(
@@ -5036,6 +5102,7 @@ async fn run_supervisor(
                     *request,
                     context_handoff,
                     frozen_delivery.as_deref(),
+                    abort_on_lost_resume,
                     operational_log.as_ref(),
                     None,
                     terminal_sender.clone(),
@@ -5256,6 +5323,28 @@ async fn run_supervisor(
                                 "thread {thread_id} already has provider work awaiting ordered completion"
                             ),
                         });
+                    }
+                    // A chat panel closed after its delivery was claimed starts nothing; the row
+                    // waits for the panel to reopen. A turn already past this check is stopped by
+                    // the interrupt that follows the archive.
+                    // ponytail: an archive landing during driver send relies on the provider honouring
+                    // that interrupt; deferring interrupts behind the delivery generation would close it.
+                    if engine
+                        .repositories()
+                        .get_thread(thread_id.clone())
+                        .await
+                        .map_err(|error| ProviderRuntimeError::Persistence(error.to_string()))?
+                        .is_some_and(|thread| thread.kind == "panel" && thread.archived_at.is_some())
+                    {
+                        let detail = "The chat panel was closed before its message started.".to_owned();
+                        let outcome = if frozen_delivery.as_ref().is_some_and(|row| row.mode == TurnDeliveryMode::Steer) {
+                            ProviderDeliveryOutcome::Rejected { detail }
+                        } else {
+                            ProviderDeliveryOutcome::DefinitelyNotSent { detail }
+                        };
+                        let (response, completion) = oneshot::channel();
+                        let _ = response.send(outcome);
+                        return Ok(ProviderDeliveryHandle { completion });
                     }
                     if let Some(entry) = sessions.get_mut(&thread_id)
                         && let Some(settled) = entry.pending_stream_settlement.as_mut()
@@ -6654,6 +6743,7 @@ fn normalize_agent_activity_transition_error(error: ProviderRuntimeError) -> Pro
         ProviderRuntimeError::SessionNotFound { .. } => "session missing",
         ProviderRuntimeError::StaleSession { .. } => "session stale",
         ProviderRuntimeError::SessionAlreadyExists { .. } => "session conflict",
+        ProviderRuntimeError::FrozenConversationLost { .. } => "provider conversation lost",
         ProviderRuntimeError::UnsupportedProvider { .. } => "unsupported provider",
         ProviderRuntimeError::UnsupportedCapability { .. } => "unsupported capability",
         ProviderRuntimeError::ActivityTargetUnsupported { .. } => "targeted activity unsupported",
@@ -6679,6 +6769,7 @@ async fn launch_session(
     mut request: ProviderLaunchRequest,
     context_handoff: bool,
     frozen_delivery: Option<&ProviderTurnDelivery>,
+    abort_on_lost_resume: bool,
     operational_log: Option<&ProviderOperationalLog>,
     inherited_activity_lifecycle: Option<SharedActivityLifecycle>,
     terminal_sender: mpsc::UnboundedSender<SupervisorMessage>,
@@ -6779,6 +6870,24 @@ async fn launch_session(
         .is_some_and(|requested| {
             started.resume_cursor.as_ref().and_then(resume_string) != Some(requested)
         });
+    if resume_lost && abort_on_lost_resume {
+        let _ = driver.shutdown().await;
+        // Keep the requested cursor: the explicit retry releases its delivery from it.
+        persist_runtime(
+            &engine.repositories(),
+            &request,
+            "error",
+            request.resume_cursor.clone(),
+            runtime_payload_with_context_handoff(
+                Some(json!({ "error": "provider conversation not found" })),
+                context_handoff,
+            ),
+        )
+        .await?;
+        return Err(ProviderRuntimeError::FrozenConversationLost {
+            thread_id: request.thread_id,
+        });
+    }
     let released = match frozen_delivery {
         Some(row) if resume_lost && row.provider_session_id.is_some() => {
             match release_frozen_delivery(&engine.repositories(), &request, row).await {
@@ -7517,6 +7626,7 @@ async fn restart_session(
         launch,
         context_handoff,
         None,
+        false,
         operational_log,
         inherited_activity_lifecycle,
         terminal_sender.ok_or_else(|| ProviderRuntimeError::SessionNotFound {

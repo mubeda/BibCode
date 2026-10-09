@@ -2410,7 +2410,8 @@ struct FrozenRetryFixture {
     command: OrchestrationCommand,
     state: Arc<StdMutex<DriverState>>,
     supervisor: ProviderRuntimeSupervisor,
-    _events: mpsc::Sender<ProviderEvent>,
+    /// One event stream per launch: a reconciliation launch and the retry after it.
+    _events: [mpsc::Sender<ProviderEvent>; 2],
 }
 
 impl FrozenRetryFixture {
@@ -2459,11 +2460,12 @@ impl FrozenRetryFixture {
             ..DriverState::default()
         }));
         let (events, events_rx) = mpsc::channel(1);
+        let (retry_events, retry_events_rx) = mpsc::channel(1);
         let supervisor = ProviderRuntimeSupervisor::start(
             engine.clone(),
             Arc::new(FakeFactory {
                 state: state.clone(),
-                events: StdMutex::new(VecDeque::from([events_rx])),
+                events: StdMutex::new(VecDeque::from([events_rx, retry_events_rx])),
             }),
             activity_projection(&engine),
             SupervisorOptions::default(),
@@ -2476,7 +2478,7 @@ impl FrozenRetryFixture {
             command,
             state,
             supervisor,
-            _events: events,
+            _events: [events, retry_events],
         }
     }
 
@@ -2995,6 +2997,92 @@ async fn frozen_retry_whose_conversation_is_gone_continues_in_the_replacement() 
             .unwrap()
             .resume_cursor,
         Some(json!({"sessionId":"new-conversation"}))
+    );
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn restart_recovery_whose_conversation_is_gone_leaves_an_explicit_retry_working() {
+    let fixture = FrozenRetryFixture::new(
+        Some("route-cursor"),
+        Some(json!({"sessionId":"old-conversation"})),
+    )
+    .await;
+    seed_thread_history(&fixture.engine).await;
+    // The provider no longer has the frozen conversation and starts a new one each time.
+    let replacement = |session: &str| {
+        Ok(StartedSession {
+            resume_cursor: Some(json!({"sessionId":session})),
+            runtime_payload: None,
+            activity_capabilities: ActivityCapabilities::none(),
+        })
+    };
+    fixture.state.lock().unwrap().start_results = VecDeque::from([
+        replacement("abandoned-conversation"),
+        replacement("new-conversation"),
+    ]);
+
+    let outcome = reconcile_orchestration_turn(
+        &fixture.supervisor,
+        &fixture.engine,
+        &fixture.settings.path().to_path_buf(),
+        fixture.row.clone(),
+    )
+    .await;
+
+    // Whether the lost conversation received it is unknowable; nothing is sent, and the delivery
+    // and saved cursor stay with the lost conversation so a restart reaches the same answer.
+    assert!(
+        matches!(
+            outcome,
+            ProviderReconciliationOutcome::ConversationLost { .. }
+        ),
+        "reconciling into a replacement conversation must report the loss: {outcome:?}"
+    );
+    assert!(fixture.state.lock().unwrap().sends.is_empty());
+    let repositories = fixture.engine.repositories();
+    let row = repositories
+        .get_provider_turn_delivery(fixture.row.command_id.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.provider_session_id.as_deref(), Some("old-conversation"));
+    assert_eq!(
+        repositories
+            .get_provider_session_runtime("t1".to_owned())
+            .await
+            .unwrap()
+            .unwrap()
+            .resume_cursor,
+        Some(json!({"sessionId":"old-conversation"}))
+    );
+
+    // An explicit retry releases it into a new conversation instead of failing identity checks.
+    let retry = fixture.deliver().await;
+    assert!(
+        matches!(
+            retry,
+            ProviderDeliveryOutcome::AcceptedInNewConversation { .. }
+        ),
+        "a retry after reconciliation found the conversation gone must be accepted: {retry:?}"
+    );
+    {
+        let state = fixture.state.lock().unwrap();
+        assert_eq!(state.launches.len(), 2);
+        assert_eq!(
+            state.sends,
+            [format!("{THREAD_HISTORY_CONTEXT}preserve this retry")]
+        );
+    }
+    assert_eq!(
+        repositories
+            .get_provider_turn_delivery(fixture.row.command_id.clone())
+            .await
+            .unwrap()
+            .unwrap()
+            .provider_session_id
+            .as_deref(),
+        Some("new-conversation")
     );
     fixture.close().await;
 }
