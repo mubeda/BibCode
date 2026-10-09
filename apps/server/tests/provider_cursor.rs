@@ -467,6 +467,40 @@ async fn cursor_runtime_starts_a_new_session_when_the_saved_one_cannot_be_loaded
 }
 
 #[tokio::test]
+async fn cursor_runtime_keeps_the_saved_session_when_load_fails_transiently() {
+    let (connection, incoming, mut peer) = scripted_peer();
+    let runtime = CursorSessionRuntime::new(
+        CursorSessionOptions {
+            thread_id: "cursor-busy-thread".to_owned(),
+            cwd: "/tmp/project".to_owned(),
+            runtime_mode: "full-access".to_owned(),
+            interaction_mode: "default".to_owned(),
+            model: "default".to_owned(),
+            resume_session_id: Some("cursor-kept".to_owned()),
+            mcp_servers: Vec::new(),
+        },
+        connection,
+        incoming,
+    );
+    peer.expect_request("initialize")
+        .respond(json!({ "protocolVersion": 1 }));
+    peer.expect_request("authenticate")
+        .respond(json!({ "status": "ok" }));
+    peer.expect_request("session/load")
+        .expect_params(json!({ "sessionId": "cursor-kept" }))
+        .respond_error(json!({ "code": -32603, "message": "Internal error" }));
+    peer.expect_no_request();
+    let peer_task = tokio::spawn(peer.run());
+
+    let error = runtime
+        .start()
+        .await
+        .expect_err("a transient load error must not replace the session");
+    assert!(error.to_string().contains("Internal error"), "{error}");
+    peer_task.await.expect("peer");
+}
+
+#[tokio::test]
 async fn cursor_fast_mode_uses_acp_config_update() {
     let (connection, incoming, mut peer) = scripted_peer();
     let runtime = CursorSessionRuntime::new(

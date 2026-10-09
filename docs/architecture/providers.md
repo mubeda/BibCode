@@ -445,7 +445,9 @@ provider says the old one is gone:
 
 - Codex starts a new thread when `thread/resume` fails with a recoverable error.
 - Cursor sends `session/new` on the same connection when `session/load` returns a
-  JSON-RPC error; transport failures still fail the launch.
+  JSON-RPC error saying the session or conversation is gone (for example "not
+  found" or "does not exist"); any other JSON-RPC error and transport failures
+  still fail the launch and keep the saved session id for the next attempt.
 - OpenCode creates a new session when `GET /session/{id}` returns 404; any other
   status still fails the launch and is retried.
 - Claude passes `--resume` only when the transcript
