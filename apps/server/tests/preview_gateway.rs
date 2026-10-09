@@ -560,8 +560,10 @@ async fn a_refused_upstream_is_retried_once_on_the_other_loopback_family() {
     let app = Router::new().route("/", get(|| async { "from ipv6" }));
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let refused: SocketAddr = format!("127.0.0.1:{}", ipv6.port()).parse().unwrap();
-    if TcpStream::connect(refused).await.is_ok() {
-        println!("skipping: something listens on {refused}");
+    // Bound but never listening: connections are refused, and no parallel test can take the port.
+    let reserved = tokio::net::TcpSocket::new_v4().unwrap();
+    if let Err(error) = reserved.bind(refused) {
+        println!("skipping: {refused} is taken ({error})");
         return;
     }
     let issuer = Arc::new(CapabilityIssuer::new(vec![9; 32]));
