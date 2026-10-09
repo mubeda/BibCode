@@ -444,8 +444,12 @@ installation. Before cleanup and relaunch, the harness waits for the installed
 executable's exact candidate `ProductVersion`, a readable SHA-256, and no
 candidate-named updater installer. Its bounded `windows-install-handoff.log`
 records path/version/hash and installer PID/image-path observations without
-command lines or credentials. The probe uses `Get-Process`, not a
-`Win32_Process` snapshot, so the ten-second sample can finish on ARM64. Inspect that artifact on timeout; the later public
+command lines or credentials. The probe looks up the candidate installer with
+`Get-Process -Name` and hashes the executable only after its product version
+is already the candidate, so the ten-second sample can finish on ARM64. The
+protected-baseline install command stays open until the host exits into that
+installer. Ending the command on the first `protecting` event stops the host
+before NSIS starts. Inspect that artifact on timeout; the later public
 runtime-version and retained-data checks remain required.
 Each PowerShell observation keeps its ten-second command bound. A command
 deadline becomes an unavailable sample only after the exact child emits
