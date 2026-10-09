@@ -63,10 +63,10 @@
       "verificationDate": "2026-09-04",
       "status": "partial",
       "ledgerClosure": {
-        "rows": 221,
+        "rows": 224,
         "statuses": {
           "green": 112,
-          "current": 63,
+          "current": 66,
           "blocked": 42,
           "removed": 4
         }
@@ -310,7 +310,7 @@
   "inventorySummary": {
     "javascriptDirect": 81,
     "javascriptLedger": 83,
-    "rustRegistry": 112,
+    "rustRegistry": 115,
     "rustPath": 3,
     "rustGit": 1,
     "actions": 9,
@@ -1812,6 +1812,18 @@
       "status": "green"
     },
     {
+      "key": "rust:workspace:http-body-util",
+      "name": "http-body-util",
+      "current": "0.1.5",
+      "target": "0.1.5",
+      "channel": "stable",
+      "source": "https://crates.io/crates/http-body-util",
+      "cohort": "rust-current",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "current",
+      "notes": "Preview gateway HTTP/1 body helpers (Empty, Full, BoxBody). Target equals the version already declared in the workspace manifest; no newer release was judged."
+    },
+    {
       "key": "rust:workspace:httpdate",
       "name": "httpdate",
       "current": "1.0.3",
@@ -1821,6 +1833,30 @@
       "cohort": "rust-current",
       "platforms": ["linux", "macos", "windows"],
       "status": "current"
+    },
+    {
+      "key": "rust:workspace:hyper",
+      "name": "hyper",
+      "current": "1.11.1",
+      "target": "1.11.1",
+      "channel": "stable",
+      "source": "https://crates.io/crates/hyper",
+      "cohort": "rust-current",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "current",
+      "notes": "Preview gateway HTTP/1 server and client. Enabled features are client, http1, and server. Target equals the version already declared in the workspace manifest; no newer release was judged."
+    },
+    {
+      "key": "rust:workspace:hyper-util",
+      "name": "hyper-util",
+      "current": "0.1.20",
+      "target": "0.1.20",
+      "channel": "stable",
+      "source": "https://crates.io/crates/hyper-util",
+      "cohort": "rust-current",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "current",
+      "notes": "Preview gateway Tokio IO and timer adapters. The enabled feature is tokio only. Target equals the version already declared in the workspace manifest; no newer release was judged."
     },
     {
       "key": "rust:workspace:if-addrs",
