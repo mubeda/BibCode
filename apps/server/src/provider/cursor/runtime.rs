@@ -27,6 +27,27 @@ use super::{
 const PROVIDER: &str = "cursor";
 const FIXED_EVENT_TIME: &str = "2026-07-10T00:00:00.000Z";
 
+/// Phrases that mean the saved Cursor session itself is gone. A `session/load`
+/// error that does not say this can be transient, so the saved id must be kept.
+const GONE_CURSOR_SESSION_SNIPPETS: &[&str] = &[
+    "not found",
+    "does not exist",
+    "doesn't exist",
+    "no such session",
+    "unknown session",
+    "missing session",
+];
+
+/// `true` only when Cursor reported that this session cannot be loaded again.
+fn session_load_is_permanently_gone(message: &str) -> bool {
+    let lowered = message.to_ascii_lowercase();
+    let names_session = lowered.contains("session") || lowered.contains("conversation");
+    names_session
+        && GONE_CURSOR_SESSION_SNIPPETS
+            .iter()
+            .any(|snippet| lowered.contains(snippet))
+}
+
 #[derive(Clone, Debug)]
 pub struct CursorSessionOptions {
     pub thread_id: String,
@@ -242,9 +263,11 @@ impl CursorSessionRuntime {
                     .await
                 {
                     Ok(response) => response,
-                    // Cursor refused to load the saved session, so retrying it cannot succeed;
-                    // continue in a new session on the same connection, as Codex does.
-                    Err(AcpProtocolError::RemoteRequest { .. }) => {
+                    // The saved session is gone, so loading it again cannot succeed. Any other
+                    // provider error may be transient and must keep the saved id for the next try.
+                    Err(AcpProtocolError::RemoteRequest { message, .. })
+                        if session_load_is_permanently_gone(&message) =>
+                    {
                         loaded_session_id = None;
                         connection.request("session/new", new_session).await?
                     }
@@ -1331,5 +1354,19 @@ mod tests {
                 .expect("connection loss should resolve receipt")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn only_a_missing_session_load_error_abandons_the_saved_session() {
+        assert!(session_load_is_permanently_gone("Session not found"));
+        assert!(session_load_is_permanently_gone(
+            "The conversation does not exist"
+        ));
+        assert!(!session_load_is_permanently_gone("Internal error"));
+        assert!(!session_load_is_permanently_gone("rate limit exceeded"));
+        assert!(!session_load_is_permanently_gone(
+            "Unknown error while loading session"
+        ));
+        assert!(!session_load_is_permanently_gone("model not found"));
     }
 }
