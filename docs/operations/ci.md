@@ -1,7 +1,18 @@
 # CI Quality Gates
 
 `.github/workflows/ci.yml` runs on pull requests and pushes to `main`. It has
-four job groups:
+four job groups.
+
+CI and Seeded Packaged Desktop Upgrade each set
+`concurrency.group` to `${{ github.workflow }}-${{ github.ref }}` with
+`cancel-in-progress: true`. A later push to the same branch or pull request
+cancels that workflow's older run, so a burst of merges does not leave a
+native matrix queued for every superseded commit. GitHub keeps a workflow
+run's status at `queued` until every job has left the queue. One macOS job
+still waiting for `macos-26` or `macos-26-intel` therefore lists the whole
+run as queued after Check, Test, and the other native rows have already
+started. Inspect the jobs, not only the run status, before treating the
+workflow as idle.
 
 - **Check** runs `vp check`, workspace typechecking (`vpr typecheck`),
   `cargo fmt --all --check`, Clippy with warnings denied, and the complete
