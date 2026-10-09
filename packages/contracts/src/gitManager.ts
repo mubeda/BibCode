@@ -267,6 +267,13 @@ export const GitManagerOperationRequest = Schema.Union([
     source: TrimmedNonEmptyStringSchema,
     noVerify: Schema.Boolean,
   }),
+  Schema.TaggedStruct("merge-into", {
+    ...GitManagerOperationBase.fields,
+    /** Full ref: `refs/heads/<name>` or `refs/remotes/<remote>/<name>`. */
+    source: TrimmedNonEmptyStringSchema,
+    /** Local branch updated without checking it out. */
+    target: TrimmedNonEmptyStringSchema,
+  }),
   Schema.TaggedStruct("rebase", {
     ...GitManagerOperationBase.fields,
     base: TrimmedNonEmptyStringSchema,
@@ -407,6 +414,8 @@ export type GitManagerRemoteTags = typeof GitManagerRemoteTags.Type;
 export const GitManagerPreviewMergeInput = Schema.Struct({
   cwd: TrimmedNonEmptyStringSchema,
   source: TrimmedNonEmptyStringSchema,
+  /** Compare against this local branch instead of HEAD; servers without merge-into ignore it. */
+  target: Schema.optionalKey(TrimmedNonEmptyStringSchema),
 });
 export type GitManagerPreviewMergeInput = typeof GitManagerPreviewMergeInput.Type;
 

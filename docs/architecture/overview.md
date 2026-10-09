@@ -139,7 +139,10 @@ flowchart TB
   safety convergence.
 
   One status observation reads porcelain-v2 branch and file state once and runs
-  staged or unstaged numstat only for areas that are present. A failed porcelain
+  staged or unstaged numstat only for areas that are present. Each unmerged path
+  appears once, as an unstaged `conflicted` entry, and the Git Manager detector
+  reports any merge, rebase, cherry-pick, revert, or squash left in progress as
+  optional `operationInProgress` (omitted when the probe fails). A failed porcelain
   read whose repository probe also refuses the folder becomes the non-repository
   result, which says, when the server can tell, whether no repository exists, Git
   cannot read one, or Git refuses to trust it. A readable non-work-tree result
@@ -1392,7 +1395,10 @@ See [RPC and orchestration](./rpc-and-orchestration.md) and
 - Git Manager force-push always uses `--force-with-lease`. Its execution paths
   forbid bare `--force`, `--ignore-other-worktrees`, forced
   `git worktree add -f`, and plumbing `update-ref` as ways to bypass the
-  server's worktree-aware guards.
+  server's worktree-aware guards. `merge-into` publishes its merge commit with
+  fast-forward-only `git fetch . <commit>:refs/heads/<target>`, which Git
+  refuses for a branch checked out, rebased, or bisected in any worktree; it
+  never uses `update-ref`.
 - Git worktree registration, directory availability, and path ownership are
   resolved by the server catalog. Clients do not infer recovery from directory
   existence or treat a degraded observation as an authoritative empty set.

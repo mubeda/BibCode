@@ -463,7 +463,7 @@ pub(crate) async fn run_subscriber(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn default_list_query(cwd: &std::path::Path) -> ListQuery {
     use crate::pull_requests::model::{ListSort, ListState};
     ListQuery {
