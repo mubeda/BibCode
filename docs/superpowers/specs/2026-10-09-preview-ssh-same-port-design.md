@@ -37,9 +37,9 @@ Owner: `apps/desktop/src-tauri/src/ssh.rs`, `bridge.rs`.
   command `desktop_bridge_ssh_forward` gains `preferred_local_port: Option<u16>`.
   It still returns the actual local port.
 - `SshEnvironmentManager::ensure_port_forward` keeps one live forward per remote
-  (gateway) port. It honours the preference when it creates a forward, or when
-  the live forward for that remote port sits on a different local port than the
-  preference; otherwise it reuses the live forward as today.
+  (gateway) port. It honours the preference only when it creates a forward; a
+  live forward for that remote port is reused whatever its local port, so an
+  open fallback tab never switches origin.
 - A preferred port binds **both** `127.0.0.1:P` and `[::1]:P`: two `-L`
   arguments on one `ssh -N` child with `ExitOnForwardFailure=yes`. Binding only
   IPv4 would let a local process on `[::1]:P` (Node ≥ 17 binds `::1` for
@@ -61,8 +61,8 @@ Owner: `apps/web/src/browser/previewGateway.ts`.
   HTTPS refusal, capability), then `bridge.sshForward(target, gatewayPort,
   preferred)`, where `preferred` is the canonical URL's port, omitted below 1024.
 - Returned port equals the preference → the client origin is the canonical
-  origin (`http://localhost:5173`, or `127.0.0.1` / `[::1]` if the URL used
-  that host), and the bootstrap URL is built on it. Otherwise the client origin
+  origin (always `http://localhost:P`: the resolver canonicalizes loopback
+  hosts to `localhost`), and the bootstrap URL is built on it. Otherwise the client origin
   is `http://127.0.0.1:<port>` as today.
 - `canonicalOrigins` maps the client origin to the canonical origin in both
   cases (identity for same-port), so the URL bar, history, and agent tools keep
@@ -97,8 +97,7 @@ Rust (`ssh.rs` tests):
   `[::1]:P:127.0.0.1:R`; with IPv6 loopback unavailable, only the first.
 - A busy preferred port (IPv4 or IPv6) falls back to one `127.0.0.1:<random>`
   bind; a preferred port below 1024 is ignored.
-- A live forward on the preferred port is reused; one on another port is
-  replaced when the preference is free.
+- A live forward is reused whatever its local port.
 - An ssh child that fails its preferred-port forward is retried on a random port.
 
 Web (`previewGateway.test.ts`):
