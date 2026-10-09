@@ -241,6 +241,14 @@ desktop machine listens on port 8123. With **Open links in** set to
   Repeat on port 8124 with the local server bound to IPv6 only
   (`--bind ::1`): the preview again opens on a random `127.0.0.1` port with the
   note for `localhost:8124`.
+- **Separate preview storage.** Connect a second SSH environment, run the same
+  `python3 -m http.server 8123 --bind 127.0.0.1` there, and preview
+  `http://localhost:8123/` from a thread on each environment in turn. In the
+  first, run `localStorage.setItem("probe", "first")` from the preview's
+  developer tools; in the second, `localStorage.getItem("probe")` returns
+  `null`. Switching back to the first environment's preview still returns
+  `"first"`, and a preview from the local environment keeps the data it had
+  before.
 - With **Open links in** set to **System browser**, the same click opens the
   system browser at `http://localhost:8123/` (at `http://127.0.0.1:<local port>/`
   when port 8123 is busy on the desktop machine), and the listing loads.

@@ -1376,7 +1376,12 @@ export interface DesktopBridge {
 }
 
 export interface DesktopPreviewBridge {
-  createTab: (tabId: string) => Promise<void>;
+  /**
+   * `environmentId` selects the preview storage: each environment's previews
+   * keep their own cookies, storage, and service workers; `null` or absent is
+   * the local environment's profile.
+   */
+  createTab: (tabId: string, environmentId?: string | null) => Promise<void>;
   closeTab: (tabId: string) => Promise<void>;
   /**
    * Electron-era API: associate a renderer-mounted `<webview>`. Absent on
@@ -1400,10 +1405,10 @@ export interface DesktopPreviewBridge {
   hardReload: (tabId: string) => Promise<void>;
   /** Open the guest webview's DevTools (detached). */
   openDevTools: (tabId: string) => Promise<void>;
-  /** Drop cookies + storage data for the preview partition (all tabs). */
-  clearCookies: () => Promise<void>;
-  /** Drop the HTTP cache for the preview partition (all tabs). */
-  clearCache: () => Promise<void>;
+  /** Drop cookies + storage data from `tabId`'s environment's preview storage (all its tabs). */
+  clearCookies: (tabId: string) => Promise<void>;
+  /** Drop the HTTP cache from `tabId`'s environment's preview storage (all its tabs). */
+  clearCache: (tabId: string) => Promise<void>;
   /**
    * Electron-era one-shot config for mounting a preview `<webview>`. Absent
    * on the Tauri host, which owns webview configuration natively. Replaces three
