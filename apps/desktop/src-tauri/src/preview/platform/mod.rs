@@ -5,6 +5,8 @@ mod macos;
 #[cfg(target_os = "macos")]
 #[allow(unused_imports)]
 pub use macos::MacosWebviewOps as Platform;
+#[cfg(target_os = "macos")]
+pub use macos::remove_data_store;
 
 #[cfg(target_os = "windows")]
 mod windows;

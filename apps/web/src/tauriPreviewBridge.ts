@@ -250,6 +250,8 @@ export function createTauriPreviewBridge(deps: PreviewBridgeDeps): DesktopPrevie
         tabId,
       ).then((artifact) => ({ ...artifact, tabId })),
     revealArtifact: (path) => invoke("desktop_preview_reveal_artifact", { path }),
+    forgetEnvironment: (environmentId) =>
+      invoke("desktop_preview_forget_environment", { environmentId }),
     copyArtifactToClipboard: unsupported("preview.copyArtifactToClipboard"),
     recording: {
       startScreencast: unsupported("preview.recording"),
