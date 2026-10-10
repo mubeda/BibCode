@@ -237,7 +237,11 @@ export function createBrowserFollowupProtocolObserver(
     slowTransport: () => boolean;
   } & BrowserInitialHooks,
 ) {
-  const requests = new Map<string, { tag: string; payload: unknown }>();
+  const requests = new Map<
+    string,
+    | { kind: "active"; tag: string; payload: unknown }
+    | { kind: "interrupted"; tag: "terminal.attach"; payload: unknown }
+  >();
   const appendEnds = new Map<string, number>();
   const rendererConnections = new Set<string>();
   const attachments = new Map<
@@ -265,6 +269,7 @@ export function createBrowserFollowupProtocolObserver(
       attachRequests: browserInitialCardinality(
         [...requests.values()].filter(
           (request) =>
+            request.kind === "active" &&
             request.tag === "terminal.attach" &&
             decode<TerminalAttachInput>(TerminalAttachInput, request.payload).sizeClaim != null,
         ).length,
@@ -326,7 +331,8 @@ export function createBrowserFollowupProtocolObserver(
       );
     for (const value of values) {
       const request = requests.get(value.entry);
-      if (request?.tag !== "terminal.attach") throw terminalRefused("current-attachment-invalid");
+      if (request?.kind !== "active" || request.tag !== "terminal.attach")
+        throw terminalRefused("current-attachment-invalid");
       const payload = decode<typeof TerminalAttachInput.Type>(TerminalAttachInput, request.payload);
       const snapshot = value.snapshot;
       if (
@@ -368,6 +374,19 @@ export function createBrowserFollowupProtocolObserver(
   ) => {
     if (closed) throw refused();
     if (direction === "request") {
+      if (value._tag === "Interrupt") {
+        const entry = key(connection, value.requestId),
+          request = requests.get(entry);
+        if (request?.kind === "active" && request.tag === "terminal.attach") {
+          requests.set(entry, {
+            kind: "interrupted",
+            tag: "terminal.attach",
+            payload: request.payload,
+          });
+          if (attachments.get(connection)?.entry === entry) attachments.delete(connection);
+        }
+        return;
+      }
       if (value._tag === "Request" && value.tag === "subscribeServerConfig") {
         key(connection, value.id);
         rendererConnections.add(connection);
@@ -378,7 +397,7 @@ export function createBrowserFollowupProtocolObserver(
       const entry = key(connection, value.id);
       if (requests.has(entry) || requests.size >= 128) throw refused();
       if (value.tag !== "terminal.resize") {
-        requests.set(entry, { tag: value.tag, payload: value.payload });
+        requests.set(entry, { kind: "active", tag: value.tag, payload: value.payload });
       }
       if (value.tag === "terminal.resize") {
         try {
@@ -387,7 +406,10 @@ export function createBrowserFollowupProtocolObserver(
             value.payload,
           );
           const live = [...requests.entries()].filter(
-            ([id, request]) => id.startsWith(connection + ":") && request.tag === "terminal.attach",
+            ([id, request]) =>
+              id.startsWith(connection + ":") &&
+              request.kind === "active" &&
+              request.tag === "terminal.attach",
           );
           if (
             terminalFailed ||
@@ -419,7 +441,7 @@ export function createBrowserFollowupProtocolObserver(
           requests.delete(entry);
           throw error;
         }
-        requests.set(entry, { tag: value.tag, payload: value.payload });
+        requests.set(entry, { kind: "active", tag: value.tag, payload: value.payload });
       }
       if (value.tag === "uploads.append") {
         const payload = decode<typeof UploadAppendInput.Type>(UploadAppendInput, value.payload);
@@ -447,6 +469,10 @@ export function createBrowserFollowupProtocolObserver(
     const entry = key(connection, value.requestId),
       request = requests.get(entry);
     if (!request) return;
+    if (request.kind === "interrupted") {
+      if (value._tag === "Exit") requests.delete(entry);
+      return;
+    }
     if (value._tag === "Exit") {
       if (request.tag === "terminal.attach") {
         if (attachments.get(connection)?.entry === entry) attachments.delete(connection);

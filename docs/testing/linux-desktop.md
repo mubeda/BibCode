@@ -2608,6 +2608,16 @@ that same mount before the unchanged replay wait. This public focus action lets
 the supported size-owner policy claim a foreign snapshot, including matching
 geometry. Do not type keys, reset identities, reload, inject events or bypass
 PID, history, sequence, live-claim and cleanup checks.
+The QA protocol observers retire only a matching `terminal.attach` request on
+the client's existing `Interrupt`. Keep the interrupted request bounded until
+its final reply, and exclude its queued chunks from current attachment evidence.
+A same-connection replacement may deliver its snapshot or resize before the old
+final reply; that late reply must not remove the replacement in either observer
+layer. Current renderer count, distinct claims, PID, history and grid checks
+remain mandatory. Unsignaled duplicate snapshots remain refused. The manual
+helper gate replays these orderings through the actual terminal receipt caller
+for both renderer roles and verifies unchanged raw forwarding and original
+deadline identity.
 An initial reconnect failure retains one nullable closed actor census before
 main-window restoration and observer cleanup. It distinguishes the existing
 focus and replay waits using their last observations, live configuration-request

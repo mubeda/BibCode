@@ -141,6 +141,7 @@ it("runs every fixed-endpoint browser composition file with exclusive file owner
     "apps/desktop/e2e/support/release-visual-browser-followups-caller.test.ts",
     "apps/desktop/e2e/support/release-visual-browser-followups-caller-resources.test.ts",
     "apps/desktop/e2e/support/release-visual-browser-followups-caller-protocol.test.ts",
+    "apps/desktop/e2e/support/release-visual-terminal-replacement.test.mjs",
     "apps/desktop/e2e/support/release-visual-browser-followups-owner.test.ts",
     "apps/desktop/e2e/support/release-visual-browser-followups-producer.test.ts",
     "apps/desktop/e2e/support/release-visual-browser-followups-protocol.test.ts",

@@ -63,7 +63,7 @@ export function createBrowserFollowupReplayObserver(
 ) {
   let base: ReturnType<typeof createBrowserFollowupProtocolObserver> | undefined;
   const requests = new Map<string, string>(),
-    snapshots = new Map<string, TerminalSessionSnapshot>();
+    snapshots = new Map<string, { entry: string; snapshot: TerminalSessionSnapshot }>();
   const uploadRequests = new Map<string, string>();
   let closed = false,
     failed = false;
@@ -126,10 +126,10 @@ export function createBrowserFollowupReplayObserver(
     }
     if (snapshots.size < 1) throw markBrowserTerminalGuard(refused(), "attachment-count-none");
     if (snapshots.size > 2) throw markBrowserTerminalGuard(refused(), "attachment-count-many");
-    for (const [connection, value] of snapshots) {
+    for (const [connection, { snapshot }] of snapshots) {
       if (!base!.rendererConnection(connection))
         throw markBrowserTerminalGuard(refused(), "current-attachment-invalid");
-      check(value);
+      check(snapshot);
     }
   };
   return {
@@ -141,6 +141,14 @@ export function createBrowserFollowupReplayObserver(
     ) => {
       try {
         base!.observe(connection, direction, value);
+        if (direction === "request" && value._tag === "Interrupt") {
+          const entry = connection + ":" + value.requestId;
+          if (requests.get(entry) === connection) {
+            requests.delete(entry);
+            if (snapshots.get(connection)?.entry === entry) snapshots.delete(connection);
+          }
+          return;
+        }
         if (
           direction === "request" &&
           value._tag === "Request" &&
@@ -175,7 +183,7 @@ export function createBrowserFollowupReplayObserver(
           if (!requests.has(key)) return;
           if (value._tag === "Exit") {
             requests.delete(key);
-            snapshots.delete(connection);
+            if (snapshots.get(connection)?.entry === key) snapshots.delete(connection);
             return;
           }
           if (!Array.isArray(value.values)) throw refused();
@@ -183,13 +191,16 @@ export function createBrowserFollowupReplayObserver(
             const event = decode<TerminalAttachStreamEvent>(TerminalAttachStreamEvent, raw);
             if (event.type === "snapshot") {
               check(event.snapshot);
-              snapshots.set(connection, event.snapshot);
+              snapshots.set(connection, { entry: key, snapshot: event.snapshot });
             } else if (event.type === "output") {
               const previous = snapshots.get(connection);
-              if (!previous) throw refused();
-              const current = { ...previous, history: previous.history + event.data };
+              if (!previous || previous.entry !== key) throw refused();
+              const current = {
+                ...previous.snapshot,
+                history: previous.snapshot.history + event.data,
+              };
               check(current);
-              snapshots.set(connection, current);
+              snapshots.set(connection, { entry: key, snapshot: current });
             } else if (["exited", "closed", "error", "restarted", "cleared"].includes(event.type))
               throw refused();
           }
