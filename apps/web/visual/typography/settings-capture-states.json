@@ -38,7 +38,8 @@
       "actions": [
         {
           "action": "scrollIntoView",
-          "text": "Trace Diagnostics"
+          "selector": "span.min-w-0.truncate",
+          "text": "Spans"
         }
       ],
       "owners": ["StatBlock", "DiagnosticsLastChecked", "DiagnosticsSettingsPanel"],

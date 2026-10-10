@@ -56,45 +56,48 @@ export async function interactWithFixture(browser, actions) {
       await browser.keys("Escape");
       continue;
     }
-    const selector = await browser.execute((action) => {
-      const candidates = [
-        ...document.querySelectorAll(
-          action.selector ?? "button, input, textarea, [role], label, h1, h2, h3, p",
-        ),
-      ].filter((element) => {
-        const role =
-          element.getAttribute("role") ??
-          { BUTTON: "button", INPUT: "textbox", TEXTAREA: "textbox" }[element.tagName];
-        const labelId = element.getAttribute("aria-labelledby");
-        const label =
-          element.getAttribute("aria-label") ??
-          (labelId
-            ? labelId
-                .split(" ")
-                .map((id) => document.getElementById(id)?.textContent ?? "")
-                .join(" ")
-            : null) ??
-          (element.id
-            ? document.querySelector(`label[for="${CSS.escape(element.id)}"]`)?.textContent
-            : null) ??
-          element.textContent;
-        const name = label?.trim().replace(/\s+/g, " ");
-        const rect = element.getBoundingClientRect();
-        const expected = action.name ?? action.text;
-        return (
-          rect.width > 0 &&
-          rect.height > 0 &&
-          (!action.role || role === action.role) &&
-          (action.name_prefix
-            ? name?.startsWith(action.name_prefix)
-            : expected === undefined || name === expected)
-        );
-      });
-      const element = candidates[action.index ?? 0];
-      if (!element) return null;
-      element.setAttribute("data-typography-action", "current");
-      return "[data-typography-action='current']";
-    }, action);
+    const findSelector = () =>
+      browser.execute((action) => {
+        const candidates = [
+          ...document.querySelectorAll(
+            action.selector ?? "button, input, textarea, [role], label, h1, h2, h3, p",
+          ),
+        ].filter((element) => {
+          const role =
+            element.getAttribute("role") ??
+            { BUTTON: "button", INPUT: "textbox", TEXTAREA: "textbox" }[element.tagName];
+          const labelId = element.getAttribute("aria-labelledby");
+          const label =
+            element.getAttribute("aria-label") ??
+            (labelId
+              ? labelId
+                  .split(" ")
+                  .map((id) => document.getElementById(id)?.textContent ?? "")
+                  .join(" ")
+              : null) ??
+            (element.id
+              ? document.querySelector(`label[for="${CSS.escape(element.id)}"]`)?.textContent
+              : null) ??
+            element.textContent;
+          const name = label?.trim().replace(/\s+/g, " ");
+          const rect = element.getBoundingClientRect();
+          const expected = action.name ?? action.text;
+          return (
+            rect.width > 0 &&
+            rect.height > 0 &&
+            (!action.role || role === action.role) &&
+            (action.name_prefix
+              ? name?.startsWith(action.name_prefix)
+              : expected === undefined || name === expected)
+          );
+        });
+        const element = candidates[action.index ?? 0];
+        if (!element) return null;
+        element.setAttribute("data-typography-action", "current");
+        return "[data-typography-action='current']";
+      }, action);
+    await browser.waitUntil(async () => (await findSelector()) !== null, { timeout: 5_000 });
+    const selector = await findSelector();
     if (!selector) throw new Error("Typography interaction target missing.");
     const element = await browser.$(selector);
     await element.waitForDisplayed({ timeout: 10_000 });
@@ -182,6 +185,7 @@ export async function captureFixtures({
           { state: "initial", actions: [], visible_text: fixture.anchors },
         ]) {
           let stage = "interaction";
+          let witnessFailure;
           try {
             await interact(browser, state.actions);
             await browser.executeAsync((done) =>
@@ -198,6 +202,14 @@ export async function captureFixtures({
                 }),
               ),
             );
+            await browser.executeAsync((done) =>
+              Promise.all([
+                document.fonts.load('12px "DM Sans Variable"'),
+                document.fonts.load('12px "JetBrains Mono"'),
+              ])
+                .then(() => document.fonts.ready)
+                .then(() => done(true)),
+            );
             stage = "visible-text";
             await browser.waitUntil(
               async () =>
@@ -207,7 +219,7 @@ export async function captureFixtures({
                   const roots = [
                     section,
                     ...document.querySelectorAll(
-                      "[data-slot$='popup'], [role='dialog'], [role='listbox'], [role='tooltip']",
+                      "[data-slot$='popup'], [data-slot='menu-sub-content'], [role='dialog'], [role='listbox'], [role='tooltip']",
                     ),
                   ].filter(Boolean);
                   return anchors.every((anchor) =>
@@ -287,6 +299,13 @@ export async function captureFixtures({
                 jetbrains: document.fonts.check('12px "JetBrains Mono"'),
               },
             }));
+            witnessFailure = {
+              fixtureMatches: witness.fixture === fixture.id,
+              renderingFailed: witness.status === "failed",
+              themeMatches: witness.dark === (theme === "dark"),
+              fonts: witness.fonts,
+              linuxWebkitGate: witness.linuxWebkitGate,
+            };
             if (
               witness.fixture !== fixture.id ||
               witness.status === "failed" ||
@@ -335,6 +354,7 @@ export async function captureFixtures({
               theme,
               status: "capture-refused",
               stage,
+              ...(stage === "witness" ? { witnessFailure } : {}),
             });
           }
           await NodeFSP.writeFile(
