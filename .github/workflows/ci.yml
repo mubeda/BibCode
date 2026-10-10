@@ -6,6 +6,12 @@ on:
     branches:
       - main
 
+# One run per branch or pull request. Superseded pushes were keeping full
+# native matrices, including macos-26 and macos-26-intel, queued for hours.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   check:
     name: Check
