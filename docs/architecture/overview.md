@@ -792,7 +792,9 @@ maintenance owner admits status and other read traffic, rejects new mutating
 HTTP and WebSocket RPC operations, and keeps a permit until every admitted
 mutation has committed or failed. RPC mutability comes from the typed method
 inventory; long-lived read streams therefore never hold a mutation permit, and
-unknown methods fail closed as mutations. Each admitted mutation has a bounded,
+unknown methods fail closed as mutations. `previewAutomation.connect` is one of
+those read streams: the desktop shell holds it for the window lifetime to
+register an in-memory automation host. Each admitted mutation has a bounded,
 sanitized operation label and age for diagnostics, without arguments, query
 values, or payloads. Preparation then drains existing mutation permits with a
 bound, quiesces runtime-owned writers, queues, providers, terminals, and
