@@ -1,6 +1,6 @@
 # Desktop preview automation and annotation — design
 
-Status: proposed 2026-10-09; awaiting approval.
+Status: approved 2026-10-09 (synthetic input on every platform).
 Research input (historical, verify before reuse):
 `docs/plans/2026-10-06-internal-browser-and-mobile-emulator-research.md` §2.5 rows
 9–10 (picker/annotate, real agent automation) and §5 Phase 2 item 11.
