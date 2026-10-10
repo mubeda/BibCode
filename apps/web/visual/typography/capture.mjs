@@ -6,6 +6,7 @@ import * as NodeHttp from "node:http";
 import * as NodeModule from "node:module";
 import * as NodePath from "node:path";
 import * as NodeURL from "node:url";
+import { normalizeWebDriverRequest } from "../../../desktop/e2e/support/webdriver-request.ts";
 
 export async function serveGallery(directory) {
   const server = NodeHttp.createServer(async (request, response) => {
@@ -389,6 +390,7 @@ async function main() {
         ? {
             connectionRetryTimeout: 15_000,
             connectionRetryCount: 0,
+            transformRequest: normalizeWebDriverRequest,
             capabilities: {
               browserName: "chrome",
               "wdio:enforceWebDriverClassic": true,
@@ -407,6 +409,7 @@ async function main() {
             port: 4444,
             connectionRetryTimeout: 15_000,
             connectionRetryCount: 0,
+            transformRequest: normalizeWebDriverRequest,
             capabilities: {
               browserName: "MiniBrowser",
               "webkitgtk:browserOptions": { binary: process.env.BIBCODE_FIXTURE_WEBKIT_BROWSER },
