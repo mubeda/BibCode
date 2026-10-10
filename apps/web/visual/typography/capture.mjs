@@ -184,6 +184,20 @@ export async function captureFixtures({
           let stage = "interaction";
           try {
             await interact(browser, state.actions);
+            await browser.executeAsync((done) =>
+              requestAnimationFrame(() =>
+                requestAnimationFrame(() => {
+                  const transitions = document
+                    .getAnimations()
+                    .filter(
+                      (animation) => animation.effect?.getComputedTiming().iterations !== Infinity,
+                    );
+                  Promise.allSettled(transitions.map((animation) => animation.finished)).then(() =>
+                    done(true),
+                  );
+                }),
+              ),
+            );
             stage = "visible-text";
             await browser.waitUntil(
               async () =>
