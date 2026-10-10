@@ -384,9 +384,16 @@ afterEach(async () => {
 });
 
 describe("useAddProjectWorkflow public adapter", () => {
-  it.each(["success", "command-failure", "pending"])(
-    "executes the actual original QA import and pinned SDK against the real controlled form/public hook: %s",
-    async (outcome) => {
+  it.each([
+    { caller: "remote-updates", outcome: "success" },
+    { caller: "remote-updates", outcome: "command-failure" },
+    { caller: "remote-updates", outcome: "pending" },
+    { caller: "delivery-retry", outcome: "success" },
+    { caller: "delivery-retry", outcome: "command-failure" },
+    { caller: "delivery-retry", outcome: "pending" },
+  ])(
+    "executes the actual $caller QA import and pinned SDK against the real controlled form/public hook: $outcome",
+    async ({ caller, outcome }) => {
       let settle: () => void = () => {};
       if (outcome === "pending") {
         const pending = new Promise<void>((resolve) => {
@@ -449,72 +456,108 @@ describe("useAddProjectWorkflow public adapter", () => {
         },
       };
       const deadline = new Error("Inert original composer readiness deadline.");
-      const source = NodeFS.readFileSync(
+      const observerSource = NodeFS.readFileSync(
         new NodeURL.URL("../../../../desktop/e2e/qualify-remote-updates.ts", import.meta.url),
         "utf8",
       );
+      const source =
+        caller === "remote-updates"
+          ? observerSource
+          : NodeFS.readFileSync(
+              new NodeURL.URL("../../../../desktop/e2e/qualify-delivery-retry.ts", import.meta.url),
+              "utf8",
+            );
       const start = source.indexOf("async function importProject(");
-      const end = source.indexOf("async function setTheme(", start);
+      const end = source.indexOf(
+        caller === "remote-updates"
+          ? "async function setTheme("
+          : "async function selectClaudeModel(",
+        start,
+      );
       const clickStart = source.indexOf("const click = async");
-      const clickEnd = source.indexOf("const text = async", clickStart);
+      const clickEnd = source.indexOf(
+        caller === "remote-updates" ? "const text = async" : "const row =",
+        clickStart,
+      );
+      expect(start).toBeGreaterThan(0);
+      expect(end).toBeGreaterThan(start);
+      expect(clickStart).toBeGreaterThan(0);
+      expect(clickEnd).toBeGreaterThan(clickStart);
+      const selectClaudeModel = vi.fn().mockResolvedValue(undefined);
+      const context = {
+        phase: () => {},
+        step: () => {},
+        importModelBinding: undefined,
+        selectClaudeModel,
+        workspace: async () => {},
+        SUCCESS_IMPORT_PHASES: {},
+        composer: "owned-composer",
+        owner: { until: async (read: () => Promise<boolean>) => expect(await read()).toBe(true) },
+        element: (selector: string) => {
+          if (selector !== "button=Open project")
+            return {
+              waitForDisplayed: async () => {},
+              waitForClickable: async () => {},
+              waitForEnabled: async () => {},
+              click: async () => {},
+            };
+          const button = Array.from(document.querySelectorAll<HTMLButtonElement>("button")).find(
+            (node) => node.textContent === "Open project",
+          )!;
+          expect(button.type).toBe("submit");
+          expect(button.form).toBe(path.form);
+          expect(button.disabled).toBe(false);
+          return {
+            waitForDisplayed: async () => expect(button.isConnected).toBe(true),
+            waitForClickable: async () => expect(button.disabled).toBe(false),
+            waitForEnabled: async () => expect(button.disabled).toBe(false),
+            click: () =>
+              sdk.click.call({
+                elementId: "owned-submit",
+                elementClick: async () => {
+                  actions.push("click");
+                  await act(async () => button.click());
+                },
+              }),
+          };
+        },
+        required: () => ({
+          $$: (selector: string) => Array.from(document.querySelectorAll(selector)),
+          $: (selector: string) => ({
+            elementId: selector === "#add-project-host-path" ? path.id : undefined,
+            isDisplayed: async () => true,
+            isExisting: async () => true,
+            getValue: async () => path.value,
+            isFocused: async () => document.activeElement === path,
+            setValue: (value: string) => sdk.setValue.call(endpoint, value),
+            waitForDisplayed: async () => {
+              if (
+                selector === "owned-composer" &&
+                !document.querySelector('[data-testid="composer-editor"]')
+              )
+                throw deadline;
+            },
+          }),
+        }),
+      };
       const run = NodeVM.runInNewContext(
         NodeModule.stripTypeScriptTypes(
           source.slice(clickStart, clickEnd) + source.slice(start, end),
         ) + "\nimportProject",
         {
-          phase: () => {},
-          workspace: async () => {},
-          SUCCESS_IMPORT_PHASES: {},
-          composer: "owned-composer",
-          owner: { until: async (read: () => Promise<boolean>) => expect(await read()).toBe(true) },
-          element: (selector: string) => {
-            if (selector !== "button=Open project")
-              return {
-                waitForDisplayed: async () => {},
-                waitForClickable: async () => {},
-                click: async () => {},
-              };
-            const button = Array.from(document.querySelectorAll<HTMLButtonElement>("button")).find(
-              (node) => node.textContent === "Open project",
-            )!;
-            expect(button.type).toBe("submit");
-            expect(button.form).toBe(path.form);
-            expect(button.disabled).toBe(false);
-            return {
-              waitForDisplayed: async () => expect(button.isConnected).toBe(true),
-              waitForClickable: async () => expect(button.disabled).toBe(false),
-              click: () =>
-                sdk.click.call({
-                  elementId: "owned-submit",
-                  elementClick: async () => {
-                    actions.push("click");
-                    await act(async () => button.click());
-                  },
-                }),
-            };
-          },
-          required: () => ({
-            $$: (selector: string) => Array.from(document.querySelectorAll(selector)),
-            $: (selector: string) => ({
-              elementId: selector === "#add-project-host-path" ? path.id : undefined,
-              isDisplayed: async () => true,
-              isExisting: async () => true,
-              getValue: async () => path.value,
-              isFocused: async () => document.activeElement === path,
-              setValue: (value: string) => sdk.setValue.call(endpoint, value),
-              waitForDisplayed: async () => {
-                if (
-                  selector === "owned-composer" &&
-                  !document.querySelector('[data-testid="composer-editor"]')
-                )
-                  throw deadline;
-              },
-            }),
+          ...context,
+          b: () => ({
+            $: (selector: string) =>
+              selector === "#add-project-host-path" || selector === "owned-composer"
+                ? context.required().$(selector)
+                : context.element(selector),
           }),
         },
       ) as (host: unknown) => Promise<void>;
       try {
-        const result = run({ project: "/code/owned", devUrl: "owned" });
+        const result = run(
+          caller === "remote-updates" ? { project: "/code/owned", devUrl: "owned" } : "/code/owned",
+        );
         if (outcome === "success") await expect(result).resolves.toBeUndefined();
         else await expect(result).rejects.toBe(deadline);
         expect(actions).toEqual(["clear", "keys", "click"]);
@@ -525,16 +568,33 @@ describe("useAddProjectWorkflow public adapter", () => {
         expect(harness.replaceMainWithTerminal).not.toHaveBeenCalled();
         if (outcome === "success") {
           expect(harness.navigate).toHaveBeenCalledTimes(1);
+          expect(harness.navigate).toHaveBeenCalledWith({
+            to: "/$environmentId/$threadId",
+            params: { environmentId, threadId: defaultThreadId },
+          });
+          expect(harness.createThread).not.toHaveBeenCalled();
+          expect(harness.onOpenChange).toHaveBeenCalledTimes(1);
           expect(harness.onOpenChange).toHaveBeenCalledWith(false);
           expect(document.querySelector("#add-project-host-path")).toBeNull();
+          expect(document.querySelector('[data-testid="composer-editor"]')).not.toBeNull();
         } else {
-          expect(document.querySelector("#add-project-host-path")).not.toBeNull();
+          expect(document.querySelector("#add-project-host-path")).toBe(path);
+          expect(path.value).toBe("/code/owned");
+          expect(currentWorkflow.hostPath).toBe("/code/owned");
+          expect(path.disabled).toBe(outcome === "pending");
           expect(currentWorkflow.error).toBeNull();
           expect(currentWorkflow.busy).toBe(outcome === "pending");
+          expect(harness.navigate).not.toHaveBeenCalled();
           expect(harness.onOpenChange).not.toHaveBeenCalled();
+          expect(document.querySelector('[data-testid="composer-editor"]')).toBeNull();
         }
-        const readStart = source.indexOf("            const observer =");
-        const readEnd = source.indexOf(
+        if (caller === "delivery-retry") {
+          expect(selectClaudeModel).toHaveBeenCalledTimes(outcome === "success" ? 1 : 0);
+          if (outcome === "success")
+            expect(selectClaudeModel).toHaveBeenCalledWith("import", undefined);
+        }
+        const readStart = observerSource.indexOf("            const observer =");
+        const readEnd = observerSource.indexOf(
           "          },\n          {\n            checkAgain:",
           readStart,
         );
@@ -542,7 +602,7 @@ describe("useAddProjectWorkflow public adapter", () => {
         expect(readEnd).toBeGreaterThan(readStart);
         const read = NodeVM.runInNewContext(
           NodeModule.stripTypeScriptTypes(
-            "function read(input){" + source.slice(readStart, readEnd) + "}\nread",
+            "function read(input){" + observerSource.slice(readStart, readEnd) + "}\nread",
           ),
           {
             window,
