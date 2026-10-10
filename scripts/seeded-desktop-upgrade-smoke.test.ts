@@ -686,7 +686,10 @@ describe("generated remote sharing grant handoff", () => {
         (error: Error) => error.message,
       );
       await vi.runAllTimersAsync();
-      expect(await outcome).toBe("Remote verification pairing grant unavailable.");
+      expect(String(await outcome)).toContain("Remote verification pairing grant unavailable.");
+      expect(String(await outcome)).toContain("status=");
+      expect(String(await outcome)).toContain("attempts=");
+      expect(String(await outcome)).toContain("endpointChanged=false");
       expect(String(await outcome)).not.toContain("fixture-private");
       expect(fixture.fetch.mock.calls.length).toBeGreaterThan(1);
       expect(fixture.files.size).toBe(0);
@@ -709,6 +712,38 @@ describe("generated remote sharing grant handoff", () => {
     expect(fixture.driver).toHaveBeenCalledOnce();
     expect(fixture.files.size).toBeGreaterThan(0);
     expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("uses the bootstrap published after the restarted server replaces the cached endpoint", async () => {
+    vi.useFakeTimers();
+    const fixture = remoteGrantFixture([[publicPairingGrant]]);
+    let reads = 0;
+    fixture.context.window.desktopBridge.getLocalEnvironmentBootstraps = () => {
+      reads += 1;
+      return [
+        {
+          id: "primary",
+          httpBaseUrl: reads === 1 ? "http://127.0.0.1:1" : "http://127.0.0.1:43123",
+          bootstrapToken: "fixture-desktop-bootstrap",
+        },
+      ];
+    };
+    fixture.fetch.mockImplementation(async (url: URL) => {
+      if (url.origin === "http://127.0.0.1:1") throw new Error("fixture-private-reset");
+      return { ok: true, status: 200, json: async () => [publicPairingGrant] };
+    });
+    const outcome = fixture.run().then(
+      () => null,
+      (error: Error) => error.message,
+    );
+    await vi.runAllTimersAsync();
+    expect(await outcome).toBeNull();
+    expect(reads).toBeGreaterThan(1);
+    expect(fixture.driver).toHaveBeenCalledOnce();
+    expect(fixture.fetch.mock.calls.map((call) => call[0]?.origin)).toEqual([
+      "http://127.0.0.1:1",
+      "http://127.0.0.1:43123",
+    ]);
   });
 
   it("records share and credential steps without the grant or its endpoint", () => {
@@ -810,9 +845,9 @@ describe("generated remote sharing grant handoff", () => {
       }),
     );
     await vi.runAllTimersAsync();
-    expect(await outcome).toMatchObject({
-      message: "Remote verification pairing grant unavailable.",
-    });
+    expect((await outcome).message).toContain("Remote verification pairing grant unavailable.");
+    expect((await outcome).message).toContain("status=none");
+    expect((await outcome).message).not.toContain("fixture-private");
     expect((await outcome).elapsed).toBeGreaterThan(0);
     expect((await outcome).elapsed).toBeLessThan(30_000);
     expect(aborted.mock.calls.length).toBeGreaterThan(1);
