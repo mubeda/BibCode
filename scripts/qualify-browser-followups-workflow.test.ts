@@ -22,6 +22,20 @@ const workflow = YAML.parse(
     "utf8",
   ),
 );
+it("checks the native origin and matching pairing profile before the split-origin browser fixture", () => {
+  const steps = workflow.jobs.visual_core.steps;
+  const gate = steps.find(
+    (step: { name?: string }) => step.name === "Verify cookie origin and pairing profile contracts",
+  );
+  expect(gate.if).toBe("${{ inputs.scene_selection == 'release-visual-browser-followups' }}");
+  expect(gate.run.trim().split("\n")).toEqual([
+    "cargo test -p bibcode-server --lib auth::http::tests::cookie_origin_matches_host_or_the_dev_origin -j 2 -- --exact",
+    "cargo test -p bibcode-server --lib config::tests::pairing_commands_preserve_dev_url_and_select_the_matching_state -j 2 -- --exact",
+  ]);
+  expect(steps.indexOf(gate)).toBeLessThan(
+    steps.findIndex((step: { name?: string }) => step.name === "Build guarded production CLI"),
+  );
+});
 it("registers only the fixed browser selection and contained scalar owner", () => {
   const choices = workflow.on.workflow_dispatch.inputs.scene_selection.options;
   expect(

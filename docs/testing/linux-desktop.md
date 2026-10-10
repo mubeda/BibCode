@@ -2578,6 +2578,14 @@ WebSocket endpoint remains 4887. Bind that hint in the immutable build recipe;
 missing or stale hints fail admission. Node bearer forwarding alone does not
 prove this browser cookie flow. Preserve hosted blank backend/dev configuration
 and the server's existing CORS, cookie and ticket authorization policies.
+The primary Rust server must also receive `--dev-url http://127.0.0.1:4885`
+so its cookie-authenticated WebSocket upgrade trusts the actual UI origin.
+This option selects the `dev` data profile. Move the freshly owned provider
+settings into that profile before startup, and use the identical dev URL for
+both the initial and follow-up pairing issuers. Keep a single active settings
+directory. Ordinary same-origin selections retain their `userdata` profile.
+The manual CI lane checks the existing Rust cookie-origin and pairing-profile
+contracts before building the server; run those native checks only in CI.
 Verify that primary descriptor discovery and the stored broker HTTP target use
 the same resolved UI HTTP route as authentication, from one topology snapshot.
 Its registration cache identity must include that effective HTTP address, while

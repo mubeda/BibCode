@@ -98,6 +98,7 @@ const runControllerSource = (
       readBrowserInitialFailure: () => null,
       readBrowserTerminalReceiptFailure: () => null,
       importEvidenceOwner: null,
+      primaryProfile: { directory: "userdata", args: [] },
       config: { selection: "delivery-retry-ui" },
       settingsFollowupUsageFixtures: [],
       browserFollowupResources: [],
@@ -1730,9 +1731,7 @@ describe("delivery controller admission", () => {
     };
     try {
       const context = prepareDesktopUiTestContext(env, undefined, "question-multiselect-v1");
-      const start = controller.indexOf(
-        '      const settingsPath = NodePath.join(context.stateRoot, "userdata", "settings.json");',
-      );
+      const start = controller.indexOf("      const primaryProfile =");
       const end = controller.indexOf("      configured.enableProviderUpdateChecks = false;", start);
       expect(start).toBeGreaterThan(0);
       expect(end).toBeGreaterThan(start);

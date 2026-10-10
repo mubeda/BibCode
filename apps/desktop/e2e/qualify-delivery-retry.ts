@@ -1525,7 +1525,20 @@ export async function runDeliveryRetryQualification() {
         await gitProjectFixture.verifyCloneAlias();
         childEnv.GIT_CONFIG_GLOBAL = gitProjectFixture.cloneGitConfig;
       }
-      const settingsPath = NodePath.join(context.stateRoot, "userdata", "settings.json");
+      const primaryProfile =
+        config.selection === "release-visual-browser-followups"
+          ? { directory: "dev", args: ["--dev-url", origin] }
+          : { directory: "userdata", args: [] };
+      if (primaryProfile.directory === "dev")
+        NodeFS.renameSync(
+          NodePath.join(context.stateRoot, "userdata"),
+          NodePath.join(context.stateRoot, primaryProfile.directory),
+        );
+      const settingsPath = NodePath.join(
+        context.stateRoot,
+        primaryProfile.directory,
+        "settings.json",
+      );
       const configured = JSON.parse(NodeFS.readFileSync(settingsPath, "utf8"));
       const ownedCursorInstance =
         config.selection === "release-visual-cursor-question"
@@ -1684,6 +1697,7 @@ export async function runDeliveryRetryQualification() {
           config.assets,
           "--no-browser",
           "--no-startup-pairing-offer",
+          ...primaryProfile.args,
         ],
         serverEnvironment,
         "primary",
@@ -1726,7 +1740,7 @@ export async function runDeliveryRetryQualification() {
       step("pair-issue-credential");
       const grant = await owner.json(
         config.binary,
-        ["pairing", "issue", "--base-dir", context.stateRoot, "--json"],
+        ["pairing", "issue", "--base-dir", context.stateRoot, "--json", ...primaryProfile.args],
         childEnv,
       );
       step("pair-check-credential");
@@ -2916,7 +2930,7 @@ export async function runDeliveryRetryQualification() {
         await type("Owned visual review draft");
         const grant = await owner.json(
           config.binary,
-          ["pairing", "issue", "--base-dir", context.stateRoot, "--json"],
+          ["pairing", "issue", "--base-dir", context.stateRoot, "--json", ...primaryProfile.args],
           childEnv,
         );
         const credential =

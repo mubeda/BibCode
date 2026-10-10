@@ -46,7 +46,18 @@ it.each(["owned", "missing", "credential", "physical", "caller"])(
         browserFollowup: mode === "missing" ? null : {},
         type: async (value: string) => events.push(value),
         owner: {
-          json: async () => ({ credential: mode === "credential" ? "bad" : "inert-credential" }),
+          json: async (_binary: string, args: string[]) => {
+            expect(args).toEqual([
+              "pairing",
+              "issue",
+              "--base-dir",
+              "/inert/state",
+              "--json",
+              "--dev-url",
+              "http://127.0.0.1:4885",
+            ]);
+            return { credential: mode === "credential" ? "bad" : "inert-credential" };
+          },
         },
         config: { binary: "/inert/binary", fixture: "/inert/fixture", evidence: "/inert/evidence" },
         context: {
@@ -55,6 +66,7 @@ it.each(["owned", "missing", "credential", "physical", "caller"])(
           fixtureUserHomePath: "/inert/home",
         },
         childEnv: { CI: "true" },
+        primaryProfile: { directory: "dev", args: ["--dev-url", "http://127.0.0.1:4885"] },
         fixtureAccessToken: async (origin: string) => {
           expect(origin).toBe("http://127.0.0.1:4887");
           return "inert-access";
@@ -312,10 +324,18 @@ it.each(["browser", "ordinary"])(
           setValue: async (value: string) => expect(value).toBe("inert-credential"),
         }),
       };
+    const settingsBytes = Buffer.from('{"providers":{"inert":{"enabled":false}}}');
+    NodeFS.mkdirSync(NodePath.join(context.stateRoot, "userdata"), { recursive: true });
+    NodeFS.writeFileSync(
+      NodePath.join(context.stateRoot, "userdata", "settings.json"),
+      settingsBytes,
+    );
     const start = source.indexOf(
         "      let browserFollowup: Awaited<ReturnType<typeof prepareBrowserFollowupCaller>>",
       ),
       end = source.indexOf("      let settingsFollowupUsage:", start),
+      profileStart = source.indexOf("      const primaryProfile ="),
+      profileEnd = source.indexOf("      const configured =", profileStart),
       probeStart = source.indexOf("      const primaryPort ="),
       prefixEnd = source.indexOf(
         '      if (config.selection === "release-visual-git-project") {',
@@ -327,6 +347,7 @@ it.each(["browser", "ordinary"])(
     const run = code(
       "async function startup(){" +
         source.slice(start, end) +
+        source.slice(profileStart, profileEnd) +
         source.slice(probeStart, prefixEnd) +
         "\nreturn browserFollowup;}\nstartup",
       {
@@ -351,6 +372,12 @@ it.each(["browser", "ordinary"])(
           spawn: (_binary: string, args: string[]) => {
             expect(args[args.indexOf("--port") + 1]).toBe(mode === "browser" ? "4897" : "4885");
             expect(args[args.indexOf("--static-dir") + 1]).toBe(assets);
+            if (mode === "browser")
+              expect(args.slice(args.indexOf("--dev-url"), args.indexOf("--dev-url") + 2)).toEqual([
+                "--dev-url",
+                origin,
+              ]);
+            else expect(args).not.toContain("--dev-url");
             events.push("server-start");
             serverStarted = true;
             backend.listen(mode === "browser" ? 4897 : 4885, "127.0.0.1");
@@ -364,7 +391,14 @@ it.each(["browser", "ordinary"])(
             throw new Error("Inert readiness deadline");
           },
           json: async (_binary: string, args: string[]) => {
-            expect(args).toEqual(["pairing", "issue", "--base-dir", context.stateRoot, "--json"]);
+            expect(args).toEqual([
+              "pairing",
+              "issue",
+              "--base-dir",
+              context.stateRoot,
+              "--json",
+              ...(mode === "browser" ? ["--dev-url", origin] : []),
+            ]);
             return { credential: "inert-credential" };
           },
         },
@@ -401,6 +435,15 @@ it.each(["browser", "ordinary"])(
     ) as () => Promise<Awaited<ReturnType<typeof prepareBrowserFollowupCaller>>>;
     try {
       const prepared = await run();
+      const directory = mode === "browser" ? "dev" : "userdata";
+      expect(
+        NodeFS.readFileSync(NodePath.join(context.stateRoot, directory, "settings.json")),
+      ).toEqual(settingsBytes);
+      expect(
+        NodeFS.existsSync(
+          NodePath.join(context.stateRoot, mode === "browser" ? "userdata" : "dev"),
+        ),
+      ).toBe(false);
       if (mode === "browser") {
         await prepared.verify();
         expect(resources).toHaveLength(1);

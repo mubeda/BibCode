@@ -114,6 +114,11 @@ jobs:
           cargo fmt --all --check
           cargo test -p bibcode-server --test server_runtime -j 2
           cargo clippy -p bibcode-server --all-targets -j 2 -- -D warnings
+      - name: Verify cookie origin and pairing profile contracts
+        if: ${{ inputs.scene_selection == 'release-visual-browser-followups' }}
+        run: |
+          cargo test -p bibcode-server --lib auth::http::tests::cookie_origin_matches_host_or_the_dev_origin -j 2 -- --exact
+          cargo test -p bibcode-server --lib config::tests::pairing_commands_preserve_dev_url_and_select_the_matching_state -j 2 -- --exact
       - name: Build guarded production CLI
         run: cargo build -p bibcode-server --bin bibcode --features hermetic-test-guard -j 2
       - name: Copy immutable inputs outside Cargo output
