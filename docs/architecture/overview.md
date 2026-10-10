@@ -839,11 +839,14 @@ exit instead of resuming a partially quiesced runtime. The host marks those
 exits as expected, stops every backend from the captured running set, and does
 not invoke the platform installer until every included backend has committed
 and stopped. On Windows the passive NSIS package then replaces
-`bibcode-desktop.exe`. Its preinstall hook ends a same-user
-`bibcode-desktop.exe` and retries deleting that installed file for up to 15
+`bibcode-desktop.exe`. Its preinstall hook, only for passive and silent
+installers and only when that installed executable is already present, ends a
+same-user `bibcode-desktop.exe` and retries deleting that file for up to 15
 seconds, so a brief lock after the updater exits does not become the
-template's file-in-use dialog. A file that is still locked after that
-retry reaches the template dialog unchanged. Linux and macOS still relaunch
+template's file-in-use dialog. Interactive installers skip the hook and keep
+the template prompt and Restart Manager shutdown, which runs the normal exit
+path. A file that is still locked after that retry reaches the template dialog
+unchanged. Linux and macOS still relaunch
 in-process after install. A prepare, cancel, commit, stop, or installer failure attempts to
 restart the exact prior running set before update coordination is released.
 Any restart onto a port its stopped predecessor held (this update recovery, a
