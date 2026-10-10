@@ -1,0 +1,378 @@
+import * as NodeCrypto from "node:crypto";
+import * as NodeFSP from "node:fs/promises";
+import * as NodeHttp from "node:http";
+import * as NodeModule from "node:module";
+import * as NodePath from "node:path";
+import * as NodeURL from "node:url";
+
+export async function serveGallery(directory) {
+  const server = NodeHttp.createServer(async (request, response) => {
+    try {
+      const path = new URL(request.url, "http://localhost").pathname;
+      const candidate = NodePath.resolve(
+        directory,
+        `.${decodeURIComponent(path === "/" ? "/index.html" : path)}`,
+      );
+      if (!candidate.startsWith(`${NodePath.resolve(directory)}${NodePath.sep}`))
+        throw new Error("Gallery path refused.");
+      const extension = NodePath.extname(candidate);
+      response.setHeader(
+        "Content-Type",
+        {
+          ".html": "text/html",
+          ".js": "text/javascript",
+          ".css": "text/css",
+          ".woff": "font/woff",
+          ".woff2": "font/woff2",
+        }[extension] ?? "application/octet-stream",
+      );
+      response.end(await NodeFSP.readFile(candidate));
+    } catch {
+      response.writeHead(404);
+      response.end();
+    }
+  });
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("Gallery listener refused.");
+  return {
+    url: `http://127.0.0.1:${address.port}`,
+    close: () =>
+      new Promise((resolve, reject) =>
+        server.close((error) => (error ? reject(error) : resolve())),
+      ),
+  };
+}
+
+export async function interactWithFixture(browser, actions) {
+  for (const action of actions) {
+    if (action.action === "escape") {
+      await browser.keys("Escape");
+      continue;
+    }
+    const selector = await browser.execute((action) => {
+      const candidates = [
+        ...document.querySelectorAll(
+          action.selector ?? "button, input, textarea, [role], label, h1, h2, h3, p",
+        ),
+      ].filter((element) => {
+        const role =
+          element.getAttribute("role") ??
+          { BUTTON: "button", INPUT: "textbox", TEXTAREA: "textbox" }[element.tagName];
+        const labelId = element.getAttribute("aria-labelledby");
+        const label =
+          element.getAttribute("aria-label") ??
+          (labelId
+            ? labelId
+                .split(" ")
+                .map((id) => document.getElementById(id)?.textContent ?? "")
+                .join(" ")
+            : null) ??
+          (element.id
+            ? document.querySelector(`label[for="${CSS.escape(element.id)}"]`)?.textContent
+            : null) ??
+          element.textContent;
+        const name = label?.trim().replace(/\s+/g, " ");
+        const rect = element.getBoundingClientRect();
+        const expected = action.name ?? action.text;
+        return (
+          rect.width > 0 &&
+          rect.height > 0 &&
+          (!action.role || role === action.role) &&
+          (action.name_prefix
+            ? name?.startsWith(action.name_prefix)
+            : expected === undefined || name === expected)
+        );
+      });
+      const element = candidates[action.index ?? 0];
+      if (!element) return null;
+      element.setAttribute("data-typography-action", "current");
+      return "[data-typography-action='current']";
+    }, action);
+    if (!selector) throw new Error("Typography interaction target missing.");
+    const element = await browser.$(selector);
+    await element.waitForDisplayed({ timeout: 10_000 });
+    if (action.action === "click") await element.click();
+    else if (action.action === "press") {
+      await element.click();
+      await browser.keys(action.key);
+    } else if (action.action === "fill") await element.setValue(action.value);
+    else if (action.action === "hover") await element.moveTo();
+    else if (action.action === "focus")
+      await browser.execute((element) => element.focus(), element);
+    else if (action.action === "scrollIntoView") await element.scrollIntoView({ block: "center" });
+    else throw new Error("Typography interaction refused.");
+    await browser.execute(() =>
+      document
+        .querySelectorAll("[data-typography-action]")
+        .forEach((element) => element.removeAttribute("data-typography-action")),
+    );
+  }
+}
+
+export async function captureFixtures({
+  browser,
+  gallery,
+  output,
+  source,
+  engine,
+  selectedIds,
+  interact = interactWithFixture,
+}) {
+  const observations = [];
+  const failures = [];
+  await NodeFSP.mkdir(output, { recursive: true });
+  try {
+    await browser.setWindowSize(1440, 1200);
+    const paint = engine === "webkitgtk" ? "&paint=linux-webkit" : "";
+    await browser.url(`${gallery.url}/?fixture=badge&theme=light${paint}`);
+    await browser.waitUntil(
+      async () =>
+        browser.execute(() => document.getElementById("typography-fixture-metadata") !== null),
+      { timeout: 15_000 },
+    );
+    const catalog = await browser.execute(() =>
+      JSON.parse(document.getElementById("typography-fixture-metadata").textContent),
+    );
+    const fixtures = selectedIds ? catalog.filter(({ id }) => selectedIds.includes(id)) : catalog;
+    if (fixtures.length === 0 || (selectedIds && fixtures.length !== selectedIds.length))
+      throw new Error("Capture selection refused.");
+    for (const fixture of fixtures) {
+      for (const theme of ["light", "dark"]) {
+        await browser.url(`${gallery.url}/?fixture=${fixture.id}&theme=${theme}${paint}`);
+        await browser.executeAsync((done) =>
+          Promise.all([
+            document.fonts.load('12px "DM Sans Variable"'),
+            document.fonts.load('12px "JetBrains Mono"'),
+          ])
+            .then(() => document.fonts.ready)
+            .then(() => done(true)),
+        );
+        for (const state of fixture.captureStates ?? [
+          { state: "initial", actions: [], visible_text: fixture.anchors },
+        ]) {
+          let stage = "interaction";
+          try {
+            await interact(browser, state.actions);
+            stage = "visible-text";
+            await browser.waitUntil(
+              async () =>
+                browser.execute((anchors) => {
+                  if (document.documentElement.dataset.fixtureStatus === "failed") return false;
+                  const section = document.querySelector("[data-typography-fixture]");
+                  const roots = [
+                    section,
+                    ...document.querySelectorAll(
+                      "[data-slot$='popup'], [role='dialog'], [role='listbox'], [role='tooltip']",
+                    ),
+                  ].filter(Boolean);
+                  return anchors.every((anchor) =>
+                    roots.some((root) =>
+                      [...root.querySelectorAll("*")].some((element) => {
+                        const rect = element.getBoundingClientRect();
+                        const style = getComputedStyle(element);
+                        const ownText = [...element.childNodes]
+                          .filter((node) => node.nodeType === Node.TEXT_NODE)
+                          .map((node) => node.textContent)
+                          .join("")
+                          .trim();
+                        const controlText =
+                          (element instanceof HTMLInputElement ||
+                            element instanceof HTMLTextAreaElement) &&
+                          element.value === ""
+                            ? element.placeholder
+                            : "";
+                        if (
+                          !`${ownText}${controlText}`.includes(anchor) ||
+                          rect.width <= 0 ||
+                          rect.height <= 0 ||
+                          rect.left < 0 ||
+                          rect.top < 0 ||
+                          rect.right > innerWidth ||
+                          rect.bottom > innerHeight ||
+                          Number.parseFloat(style.fontSize) < 12
+                        )
+                          return false;
+                        for (let parent = element; parent; parent = parent.parentElement) {
+                          const computed = getComputedStyle(parent);
+                          if (
+                            computed.visibility !== "visible" ||
+                            computed.display === "none" ||
+                            Number.parseFloat(computed.opacity) === 0
+                          )
+                            return false;
+                          if (
+                            /(hidden|clip|auto|scroll)/.test(
+                              `${computed.overflowX} ${computed.overflowY}`,
+                            )
+                          ) {
+                            const clip = parent.getBoundingClientRect();
+                            if (
+                              rect.left < clip.left - 1 ||
+                              rect.right > clip.right + 1 ||
+                              rect.top < clip.top - 1 ||
+                              rect.bottom > clip.bottom + 1
+                            )
+                              return false;
+                          }
+                        }
+                        return true;
+                      }),
+                    ),
+                  );
+                }, state.visible_text),
+              {
+                timeout: 10_000,
+                timeoutMsg: `Visible typography anchors missing: ${fixture.id}/${state.state}`,
+              },
+            );
+            stage = "witness";
+            const witness = await browser.execute(() => ({
+              fixture: document.documentElement.dataset.fixtureId,
+              status: document.documentElement.dataset.fixtureStatus,
+              dark: document.documentElement.classList.contains("dark"),
+              linuxWebkitGate: document.documentElement.hasAttribute("data-linux-webkit"),
+              userAgent: navigator.userAgent,
+              viewport: {
+                width: window.innerWidth,
+                height: window.innerHeight,
+                devicePixelRatio: window.devicePixelRatio,
+              },
+              fonts: {
+                dmSans: document.fonts.check('12px "DM Sans Variable"'),
+                jetbrains: document.fonts.check('12px "JetBrains Mono"'),
+              },
+            }));
+            if (
+              witness.fixture !== fixture.id ||
+              witness.status === "failed" ||
+              witness.dark !== (theme === "dark") ||
+              !witness.fonts.dmSans ||
+              !witness.fonts.jetbrains
+            )
+              throw new Error("Typography capture witness refused.");
+            if (engine === "webkitgtk" && !witness.linuxWebkitGate)
+              throw new Error("Native Linux WebKit fixture gate missing.");
+            const filename = `${fixture.id}-${state.state}-${theme}.png`;
+            stage = "image-save";
+            const bytes = await browser.saveScreenshot(NodePath.join(output, filename));
+            stage = "source-hash";
+            const hashes = Object.fromEntries(
+              await Promise.all(
+                fixture.modules.map(async (path) => [
+                  path,
+                  NodeCrypto.createHash("sha256")
+                    .update(
+                      await NodeFSP.readFile(
+                        NodePath.resolve(import.meta.dirname, "../../src", path),
+                      ),
+                    )
+                    .digest("hex"),
+                ]),
+              ),
+            );
+            observations.push({
+              source,
+              engine,
+              id: fixture.id,
+              state: state.state,
+              theme,
+              modules: hashes,
+              owners: state.owners ?? fixture.owners,
+              anchors: state.visible_text,
+              witness,
+              filename,
+              sha256: NodeCrypto.createHash("sha256").update(bytes).digest("hex"),
+            });
+          } catch {
+            failures.push({
+              id: fixture.id,
+              state: state.state,
+              theme,
+              status: "capture-refused",
+              stage,
+            });
+          }
+          await NodeFSP.writeFile(
+            NodePath.join(output, "manifest.json"),
+            JSON.stringify({ source, engine, complete: false, observations, failures }, null, 2),
+          );
+        }
+      }
+    }
+    await NodeFSP.writeFile(
+      NodePath.join(output, "manifest.json"),
+      JSON.stringify(
+        { source, engine, complete: failures.length === 0, observations, failures },
+        null,
+        2,
+      ),
+    );
+    if (failures.length > 0)
+      throw new Error(
+        `Typography capture refused ${failures.length} states; inspect the source-joined manifest.`,
+      );
+    return observations;
+  } finally {
+    try {
+      await browser.deleteSession();
+    } finally {
+      await gallery.close();
+    }
+  }
+}
+
+async function main() {
+  if (process.env.GITHUB_ACTIONS !== "true") throw new Error("Native browser capture is CI-only.");
+  const engine = process.argv[2];
+  if (engine !== "chromium" && engine !== "webkitgtk") throw new Error("Capture engine refused.");
+  const source = process.env.BIBCODE_TYPOGRAPHY_SOURCE;
+  if (!source || !/^[a-f0-9]{40}$/.test(source)) throw new Error("Capture source refused.");
+  const requireDesktop = NodeModule.createRequire(
+    NodePath.resolve(import.meta.dirname, "../../../desktop/package.json"),
+  );
+  const { remote } = await import(
+    NodeURL.pathToFileURL(requireDesktop.resolve("webdriverio")).href
+  );
+  const gallery = await serveGallery(
+    NodePath.resolve(import.meta.dirname, "../../dist-typography"),
+  );
+  let browser;
+  try {
+    browser = await remote(
+      engine === "chromium"
+        ? {
+            capabilities: {
+              browserName: "chrome",
+              "goog:chromeOptions": { args: ["--headless=new", "--disable-dev-shm-usage"] },
+            },
+            logLevel: "error",
+          }
+        : {
+            hostname: "127.0.0.1",
+            port: 4444,
+            capabilities: {
+              browserName: "MiniBrowser",
+              "webkitgtk:browserOptions": { binary: process.env.BIBCODE_FIXTURE_WEBKIT_BROWSER },
+            },
+            logLevel: "error",
+          },
+    );
+  } catch (error) {
+    await gallery.close();
+    throw error;
+  }
+  await captureFixtures({
+    browser,
+    gallery,
+    output: NodePath.resolve(process.argv[3] ?? `typography-artifacts/${engine}`),
+    source,
+    engine,
+  });
+}
+
+if (process.argv[1] && import.meta.url === NodeURL.pathToFileURL(process.argv[1]).href)
+  await main();

@@ -1,0 +1,58 @@
+name: Typography fixtures
+
+on:
+  pull_request:
+    paths:
+      - apps/web/**
+      - packages/**
+      - .github/workflows/typography-fixtures.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: typography-fixtures-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  capture:
+    name: Typography ${{ matrix.engine }}
+    runs-on: ubuntu-24.04
+    env:
+      BIBCODE_TYPOGRAPHY_SOURCE: ${{ github.event.pull_request.head.sha }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        engine: [chromium, webkitgtk]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - uses: voidzero-dev/setup-vp@1b32467adbe183473499fd9d5d372c3ed9641754 # v1.18.0
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: true
+      - name: Check capture caller
+        run: node --test apps/web/visual/typography/*.node-test.mjs
+      - name: Build actual component gallery
+        working-directory: apps/web
+        run: node ../../scripts/run-local-vp.mjs build --config visual/typography/vite.config.mjs
+      - name: Extract runner-local native WebKitGTK tools
+        if: matrix.engine == 'webkitgtk'
+        run: node apps/web/visual/typography/prepare-webkit.mjs
+      - name: Capture Chromium component fixtures
+        if: matrix.engine == 'chromium'
+        run: node apps/web/visual/typography/capture.mjs chromium typography-artifacts/chromium
+      - name: Capture native Linux WebKit component paint
+        if: matrix.engine == 'webkitgtk'
+        run: |
+          xvfb-run -a sh -c '"$BIBCODE_FIXTURE_WEBKIT_DRIVER" --port=4444 & driver_pid=$!; trap "kill $driver_pid; wait $driver_pid" EXIT; node apps/web/visual/typography/capture.mjs webkitgtk typography-artifacts/webkitgtk'
+      - name: Preserve original captures and source manifest
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: typography-${{ matrix.engine }}-${{ github.event.pull_request.head.sha }}
+          path: typography-artifacts/${{ matrix.engine }}
+          if-no-files-found: error

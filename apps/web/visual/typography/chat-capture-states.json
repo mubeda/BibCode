@@ -1,0 +1,32 @@
+{
+  "chat-markdown-file-tooltip": [
+    {
+      "state": "file-path-tooltip",
+      "actions": [
+        {
+          "action": "hover",
+          "selector": ".chat-markdown-file-link",
+          "index": 0
+        }
+      ],
+      "owners": ["MarkdownFileLink"],
+      "visible_text": ["src/left/typography-link.ts"],
+      "widget_selectors": [".markdown-file-link-tooltip-scroll"],
+      "note": "Required changed private tooltip text. Wait until the tooltip is displayed; do not credit the visible chip label alone."
+    }
+  ],
+  "chat-provider-picker-open": [
+    {
+      "state": "actual-popup-models",
+      "actions": [],
+      "owners": ["ProviderModelPicker"],
+      "visible_text": ["Typography Sol", "TC", "Typography Reviewed model"],
+      "widget_selectors": [
+        "[data-chat-provider-model-picker]",
+        "[data-model-picker-content]",
+        "[role=\"combobox\"]"
+      ],
+      "note": "CI_ONLY layout-dependent row visibility; HappyDOM admission covers trigger/actual popup structure only."
+    }
+  ]
+}
