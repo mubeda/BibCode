@@ -212,6 +212,16 @@ describe("first visual batch workflow boundary", () => {
             "release-visual-browser-followups",
           ],
         },
+        import_evidence_public_spki: {
+          description: "Optional RSA public SPKI for one encrypted owned import failure",
+          type: "string",
+          default: "",
+        },
+        import_evidence_public_sha256: {
+          description: "SHA256 of the decoded public SPKI",
+          type: "string",
+          default: "",
+        },
       },
     });
   });
