@@ -1,6 +1,6 @@
 # Browser-mode iframe previews — design
 
-Status: approved 2026-10-09 (navigation reporter injected; same-host framing).
+Status: implemented 2026-10-09 (navigation reporter injected; same-host framing); see Implementation notes.
 Builds on: [preview gateway (Phase 1)](2026-10-07-internal-browser-preview-gateway-design.md)
 ("Browser mode opens gateway targets in a new top-level tab (no iframe)") and
 [SSH same-port](2026-10-09-preview-ssh-same-port-design.md). Second of the Phase 1
@@ -98,6 +98,49 @@ Back, Forward, and Reload work.
   CSP-blocked fallback state.
 - Runbook: browser mode on a LAN server — preview a Vite app in the panel,
   navigate, Back/Forward, HMR, and an HTTPS UI falling back to a tab.
+
+## Implementation notes (2026-10-09)
+
+Where the shipped behavior narrows or departs from the decisions above:
+
+- **Bridge, not a new surface.** Browser mode implements `DesktopPreviewBridge`
+  with iframes (`apps/web/src/browser/framePreviewBridge.ts`) mounted inside
+  each tab's `BrowserSurfaceSlot`, so they share the panel's stacking and focus
+  context (the narrow-window sheet included), and `PreviewView` is unchanged
+  apart from capability gating (`screenshot`, `pageTools`). A slot that
+  remounts (the panel moving into the sheet) takes its frame along, which
+  reloads the page it last reported.
+- **Same host only.** The gateway keeps a UI origin only when its host equals
+  the gateway's, so the panel frames only gateways on the page's own host.
+  Other environments' gateway links open in new tabs. A same-host server's
+  loopback goes through its gateway rather than direct, keeping the literal
+  loopback address a direct open would load; HTTPS and `*.localhost` names,
+  which the gateway refuses, still open directly in a new tab.
+- **UI policy.** The served UI adds `frame-src 'self' http://<its host>:*`;
+  IPv6 hosts get no host source, so an IPv6 page frames nothing and keeps the
+  new-tab behavior.
+- **HTTPS fallback.** An HTTPS page has no preview bridge: there is no Browser
+  surface, the preview shortcut explains why, and links open in new tabs. The
+  panel state with **Open again** was not built.
+- **Link setting.** **Open links in** stays desktop-only. In browser mode
+  gateway links on the page's host open in the panel (modifier-click: new tab)
+  and every other link opens a new tab.
+- **Leaving the frame.** A same-host page opens directly (no gateway) in a new
+  tab or without a thread. The reporter opens plain clicks on links to other
+  origins in a new tab, except links to the server's `localhost`, which it asks
+  BiBCode to open as new preview tabs (`onNewWindowRequest`); a redirect to another host is blocked by the browser
+  inside the frame, and Reload returns to the last reported page.
+- **Keys inside the frame.** BiBCode's shortcuts don't reach the host while the
+  frame has focus (no key relay); the reporter keeps Ctrl/Cmd+R and F5 to the
+  frame. A page script's `window.open` of a loopback URL still opens this
+  computer's localhost.
+- **Failures stay local.** A frame's refusal never fails the shared tab.
+- **Hidden surfaces.** Like the desktop's native views, a frame closes when
+  its surface stops being the active one, so switching to Terminal and back
+  reloads the page.
+- **Deferred.** Back/Forward disabled without the Navigation API, or on a page
+  whose CSP blocks the reporter, have no explanatory tooltip; the first frame
+  `load` (the bootstrap page) settles the tab before the reporter speaks.
 
 ## Out of scope
 
