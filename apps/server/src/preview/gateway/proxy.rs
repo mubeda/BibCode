@@ -23,7 +23,7 @@ use hyper::{
     header::{
         ACCEPT, ACCEPT_ENCODING, AUTHORIZATION, CACHE_CONTROL, CONNECTION, CONTENT_DISPOSITION,
         CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, HOST, HeaderMap, HeaderName,
-        HeaderValue, LOCATION, ORIGIN, RETRY_AFTER, SET_COOKIE, TRANSFER_ENCODING, UPGRADE,
+        HeaderValue, LOCATION, ORIGIN, RETRY_AFTER, SET_COOKIE, TRANSFER_ENCODING, UPGRADE, VARY,
     },
     http::uri::Authority,
     server::conn::http1 as server_http1,
@@ -338,20 +338,60 @@ async fn serve_connection(stream: TcpStream, state: Arc<Listener>) {
     }
 }
 
-/// Every response, the gateway's own pages included, may be framed by BiBCode's UI on
-/// the same host (see `frame::apply_frame_policy`).
+/// Responses to a preview a browser-mode BiBCode UI opened, the gateway's own pages
+/// included, may be framed by that UI only (see `frame::apply_frame_policy`). Other
+/// sessions (desktop views, system-browser tabs) keep the upstream's framing rules,
+/// and only the preview's own pages may frame them.
 async fn handle(state: Arc<Listener>, request: Request<Incoming>) -> Response<ProxyBody> {
+    let ui_origin = framing_ui_origin(&state, &request);
+    let mut response = handle_request(state, request).await;
+    let gateway_page = response.extensions().get::<GatewayPage>().is_some();
+    let headers = response.headers_mut();
+    match ui_origin {
+        Some(ui_origin) => frame::apply_frame_policy(headers, &ui_origin),
+        // A gateway page (expired link, nothing listening) holds no upstream content or
+        // authority, so a frame whose session is gone can still explain what happened.
+        None if gateway_page => {}
+        None => frame::apply_self_only_framing(headers),
+    }
+    // The framing rules depend on the gateway session.
+    headers.append(VARY, HeaderValue::from_static("cookie"));
+    response
+}
+
+/// Marks a response the gateway wrote itself (its own pages), as opposed to one
+/// forwarded from the upstream.
+#[derive(Clone, Copy)]
+struct GatewayPage;
+
+/// The BiBCode UI allowed to frame this request's preview: a bootstrap's validated
+/// `ui=`, or else the browser's current session's, so opening the same target in a
+/// tab (which replaces the shared cookie) keeps an open frame working.
+fn framing_ui_origin(state: &Listener, request: &Request<Incoming>) -> Option<String> {
+    let current = state
+        .session_for(request.headers())
+        .and_then(|session| session.ui_origin);
+    if request.uri().path() != BOOTSTRAP_PATH {
+        return current;
+    }
     let host = request
         .headers()
         .get(HOST)
         .and_then(|value| value.to_str().ok())
         .filter(|host| valid_host(host))
-        .map(str::to_owned);
-    let mut response = handle_request(state, request).await;
-    if let Some(host) = host {
-        frame::apply_frame_policy(response.headers_mut(), &host);
-    }
-    response
+        .unwrap_or_default();
+    bootstrap_ui_origin(request.uri().query().unwrap_or_default(), host).or(current)
+}
+
+/// The validated BiBCode UI origin a bootstrap link carries in `ui=`.
+fn bootstrap_ui_origin(query: &str, host: &str) -> Option<String> {
+    query.split('&').find_map(|pair| {
+        let (name, value) = pair.split_once('=')?;
+        (name == "ui")
+            .then(|| percent_decode_str(value).decode_utf8().ok())
+            .flatten()
+            .and_then(|ui| frame::validated_ui_origin(&ui, host))
+    })
 }
 
 async fn handle_request(state: Arc<Listener>, request: Request<Incoming>) -> Response<ProxyBody> {
@@ -366,7 +406,8 @@ async fn handle_request(state: Arc<Listener>, request: Request<Incoming>) -> Res
         return bad_request();
     };
     if request.uri().path() == BOOTSTRAP_PATH {
-        return bootstrap(&state, request.uri().query().unwrap_or_default(), &host).await;
+        let ui_origin = framing_ui_origin(&state, &request);
+        return bootstrap(&state, request.uri().query().unwrap_or_default(), ui_origin).await;
     }
     if request.uri().path() == frame::FRAME_SCRIPT_PATH {
         return frame_script();
@@ -419,8 +460,12 @@ async fn handle_request(state: Arc<Listener>, request: Request<Incoming>) -> Res
     .await
 }
 
-async fn bootstrap(state: &Listener, query: &str, host: &str) -> Response<ProxyBody> {
-    let (mut cap, mut to, mut ui) = (None, None, None);
+async fn bootstrap(
+    state: &Listener,
+    query: &str,
+    ui_origin: Option<String>,
+) -> Response<ProxyBody> {
+    let (mut cap, mut to) = (None, None);
     for pair in query.split('&') {
         let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
         let decoded = percent_decode_str(value)
@@ -430,7 +475,6 @@ async fn bootstrap(state: &Listener, query: &str, host: &str) -> Response<ProxyB
         match name {
             "cap" => cap = decoded,
             "to" => to = decoded,
-            "ui" => ui = decoded,
             _ => {}
         }
     }
@@ -455,11 +499,13 @@ async fn bootstrap(state: &Listener, query: &str, host: &str) -> Response<ProxyB
     let Some(expiry) = state.principal_expiry(&claims.session_id).await else {
         return expired();
     };
-    let id = state.ctx.sessions.create(&claims, expiry);
+    let id = state
+        .ctx
+        .sessions
+        .create(&claims, expiry, ui_origin.clone());
     state
         .checked()
         .insert(claims.session_id.clone(), now_millis());
-    let ui_origin = ui.and_then(|ui| frame::validated_ui_origin(&ui, host));
     let mut response = html(StatusCode::OK, bootstrap_page(&to, ui_origin.as_deref()));
     // Lax: an OAuth provider's top-level GET redirect back to the app carries
     // it; cross-site subrequests do not, and the Origin rule refuses cross-site
@@ -754,6 +800,7 @@ fn html(status: StatusCode, body: String) -> Response<ProxyBody> {
         HeaderValue::from_static("text/html; charset=utf-8"),
     );
     headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response.extensions_mut().insert(GatewayPage);
     response
 }
 

@@ -35,12 +35,14 @@ Back, Forward, and Reload work.
    reverse proxy) cannot frame the HTTP gateway. Then the preview keeps opening
    in a new tab, with the panel showing "Opened in a new tab: this BiBCode
    page is served over HTTPS and previews are HTTP" and an **Open again** action.
-3. **Framing headers.** The gateway answers every response for a framed target
-   with `Content-Security-Policy: frame-ancestors http://<host>:*
-   https://<host>:*` (the request's host) and drops upstream `X-Frame-Options`
-   and `frame-ancestors` directives, so dev servers that forbid framing still
-   preview. Only pages on the same host can frame them, and those still need
-   the cookie.
+3. **Framing headers.** The bootstrap's validated UI origin is kept in the
+   gateway session; responses for that session answer
+   `Content-Security-Policy: frame-ancestors 'self' <that UI origin>` and drop the
+   upstream's `X-Frame-Options` and `frame-ancestors` directives, so dev
+   servers that forbid framing still preview, and only the BiBCode UI that
+   opened the preview can frame it. Sessions without a UI origin (desktop,
+   system-browser tabs) keep the upstream's rules (tightened 2026-10-09 after a
+   security review).
 4. **Navigation reporting (recommended).** For `text/html` responses the gateway
    inserts `<script src="/__bibcode/frame.js"></script>` as the first element
    of `<head>` (a same-origin script, allowed by `script-src 'self'`). The
