@@ -443,12 +443,15 @@ In the CI-only seeded upgrade lanes, the updater host exiting is not proof of
 installation. Before cleanup and relaunch, the harness waits for the installed
 executable's exact candidate `ProductVersion`, a readable SHA-256, and no
 candidate-named updater installer. Its bounded `windows-install-handoff.log`
-records path/version/hash and installer PID observations without command lines
-or credentials. The probe reads version metadata in a four-second runspace and
-lists installers with `tasklist.exe`, because `Get-Process` did not return
-inside a ten-second sample on the ARM64 runner. It hashes the executable only
-after its product version is already the candidate. Each observation keeps a
-twenty-second command bound so a slow PowerShell startup can still print JSON.
+records path, version, hash, read and installer-lookup timings, and installer
+PID observations without command lines or credentials. The probe reads the
+executable in-process and lists installers with `tasklist.exe`. PowerShell
+produced no JSON within a twenty-second sample on the ARM64 runner, including
+after the host had exited, so a sample is no longer a PowerShell process. Each
+file read and installer lookup has its own short bound. The probe hashes the
+executable only after its product version is already the candidate. A read or
+lookup that hits its bound is an unavailable sample: the log keeps the timings
+and any version already read, and that sample does not satisfy the predicate.
 The protected-baseline install command stays open until the host exits into that
 installer. Ending the command on the first `protecting` event stops the host
 before NSIS starts. Inspect that artifact on timeout; the later public
