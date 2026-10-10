@@ -55,10 +55,30 @@ export function pinBrowserFollowupTerminalReplay(
     sequence: value.sequence,
   });
 }
+export interface BrowserTerminalPredecessor {
+  readonly baseline: ReturnType<typeof pinBrowserFollowupTerminalReplay>;
+  readonly protocol: ReturnType<
+    ReturnType<typeof createBrowserFollowupProtocolObserver>["privateTerminalPredecessor"]
+  >;
+  readonly replay: {
+    readonly requests: Array<[string, string]>;
+    readonly snapshots: Array<[string, { entry: string; snapshot: TerminalSessionSnapshot }]>;
+    readonly closed: boolean;
+    readonly failed: boolean;
+  };
+  readonly theme: "light" | "dark";
+}
 /** Claims and live attachment retirement remain the reviewed B1 source of truth; this adds the original bootstrap join. */
 export function createBrowserFollowupReplayObserver(
   input: Parameters<typeof createBrowserFollowupProtocolObserver>[0] & {
     baseline: ReturnType<typeof pinBrowserFollowupTerminalReplay>;
+    theme?: "light" | "dark";
+    observeTerminalRefusal?: (value: {
+      connection: string;
+      direction: "request" | "reply";
+      message: Readonly<Record<string, unknown>>;
+      predecessor: BrowserTerminalPredecessor | null;
+    }) => void;
   },
 ) {
   let base: ReturnType<typeof createBrowserFollowupProtocolObserver> | undefined;
@@ -96,6 +116,30 @@ export function createBrowserFollowupReplayObserver(
     throw error;
   }
 
+  const privateTerminalPredecessor = (
+    incomingConnection?: string,
+    incomingRequestId?: unknown,
+  ): BrowserTerminalPredecessor | null => {
+    try {
+      if (input.theme === undefined || requests.size > 128 || snapshots.size > 2) return null;
+      const value = {
+        baseline: input.baseline,
+        protocol: base!.privateTerminalPredecessor(incomingConnection, incomingRequestId),
+        replay: {
+          requests: [...requests.entries()],
+          snapshots: [...snapshots.entries()],
+          closed,
+          failed,
+        },
+        theme: input.theme,
+      };
+      const serialized = JSON.stringify(value);
+      if (Buffer.byteLength(serialized) > 256 * 1024) return null;
+      return JSON.parse(serialized) as BrowserTerminalPredecessor;
+    } catch {
+      return null;
+    }
+  };
   const throwIfFailed = () => {
     if (failed) throw originalFailure;
     if (closed) throw refused();
@@ -134,11 +178,19 @@ export function createBrowserFollowupReplayObserver(
   };
   return {
     ...base,
+    privateTerminalPredecessor,
     observe: (
       connection: string,
       direction: "request" | "reply",
       value: Readonly<Record<string, unknown>>,
     ) => {
+      const predecessor =
+        input.observeTerminalRefusal && !failed
+          ? privateTerminalPredecessor(
+              connection,
+              direction === "request" && value._tag === "Request" ? value.id : undefined,
+            )
+          : null;
       try {
         base!.observe(connection, direction, value);
         if (direction === "request" && value._tag === "Interrupt") {
@@ -209,6 +261,11 @@ export function createBrowserFollowupReplayObserver(
         if (!failed) {
           failed = true;
           originalFailure = error;
+          try {
+            input.observeTerminalRefusal?.({ connection, direction, message: value, predecessor });
+          } catch {
+            /* Optional evidence cannot replace the original refusal. */
+          }
           try {
             input.observeInitialFailure?.(error);
           } catch {

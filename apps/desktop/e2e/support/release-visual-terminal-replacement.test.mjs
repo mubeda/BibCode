@@ -18,9 +18,10 @@ function frame(message, client) {
   if (client) for (let i = 0; i < body.length; i++) body[i] ^= mask[i % 4];
   return Buffer.concat(client ? [header, mask, body] : [header, body]);
 }
-function fixture() {
+function fixture(extra = {}) {
   const census = {};
   const observer = createBrowserFollowupReplayObserver({
+    ...extra,
     registerInitialOwners: (owners) => Object.assign(census, owners),
     baseline: {
       threadId: "owned-thread",
@@ -253,4 +254,44 @@ it("unsignaled second snapshot remains refused", async () => {
   NodeAssert.equal(result.error, result.deadline);
   NodeAssert.deepEqual(result.guards, ["observer-unavailable"]);
   NodeAssert.deepEqual(result.captures, []);
+});
+
+it("joins the original refusal to immutable pre-mutation terminal state once", () => {
+  const captured = [];
+  const h = fixture({ theme: "light", observeTerminalRefusal: (value) => captured.push(value) });
+  const before = h.observer.privateTerminalPredecessor();
+  h.snapshot("primary", "2");
+  NodeAssert.equal(h.refusals.length, 1);
+  NodeAssert.equal(captured.length, 1);
+  NodeAssert.deepEqual(captured[0].predecessor, before);
+  NodeAssert.equal(captured[0].connection, "primary");
+  NodeAssert.equal(captured[0].direction, "reply");
+  NodeAssert.equal(captured[0].message._tag, "Chunk");
+  NodeAssert.equal(before.protocol.attachments.length, 2);
+  NodeAssert.equal(before.replay.snapshots.length, 2);
+  NodeAssert.equal(before.protocol.failed, false);
+  NodeAssert.equal(before.replay.failed, false);
+  h.snapshot("second", "2");
+  NodeAssert.equal(captured.length, 1);
+  h.observer.close();
+  NodeAssert.equal(before.protocol.attachments.length, 2);
+  NodeAssert.equal(before.replay.snapshots.length, 2);
+});
+it("preserves the exact observer failure when the optional evidence sink throws", () => {
+  const fault = new Error("optional sink failure");
+  let selected;
+  const h = fixture({
+    theme: "light",
+    observeTerminalRefusal: () => {
+      throw fault;
+    },
+    observeInitialFailure: (error) => {
+      selected ??= error;
+    },
+  });
+  h.snapshot("primary", "2");
+  NodeAssert.equal(h.refusals.length, 1);
+  NodeAssert.notEqual(h.refusals[0], fault);
+  NodeAssert.equal(h.refusals[0], selected);
+  h.observer.close();
 });

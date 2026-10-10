@@ -54,6 +54,7 @@ it("registers only the fixed browser selection and contained scalar owner", () =
     "BIBCODE_IMPORT_EVIDENCE_PUBLIC_SHA256",
     "BIBCODE_IMPORT_EVIDENCE_PUBLIC_SPKI",
     "BIBCODE_IMPORT_EVIDENCE_SELECTED",
+    "BIBCODE_TERMINAL_EVIDENCE_SELECTED",
     "BIBCODE_UPLOAD_SERVER",
   ]);
 });
@@ -142,6 +143,7 @@ it("runs every fixed-endpoint browser composition file with exclusive file owner
     "apps/desktop/e2e/support/release-visual-browser-followups-caller-resources.test.ts",
     "apps/desktop/e2e/support/release-visual-browser-followups-caller-protocol.test.ts",
     "apps/desktop/e2e/support/release-visual-terminal-replacement.test.mjs",
+    "apps/desktop/e2e/support/release-visual-terminal-evidence.test.mjs",
     "apps/desktop/e2e/support/release-visual-browser-followups-owner.test.ts",
     "apps/desktop/e2e/support/release-visual-browser-followups-producer.test.ts",
     "apps/desktop/e2e/support/release-visual-browser-followups-protocol.test.ts",
@@ -159,4 +161,39 @@ it("runs every fixed-endpoint browser composition file with exclusive file owner
       .filter((step: { run?: string }) => step.run?.includes("--no-file-parallelism"))
       .map((step: { name: string }) => step.name),
   ).toEqual(["Verify browser follow-up composition and current public controls"]);
+});
+
+it("retains only the five encrypted terminal parts under the explicit opt-in", () => {
+  const step = workflow.jobs.visual_core.steps.find(
+    (value: { name?: string }) => value.name === "Retain optional encrypted terminal refusal",
+  );
+  expect(step).toBeDefined();
+  expect(step.if).toContain("github.event_name == 'workflow_dispatch'");
+  expect(step.if).toContain("inputs.scene_selection == 'release-visual-browser-followups'");
+  expect(step.if).toContain("inputs.import_evidence_public_spki != ''");
+  expect(step.if).toContain("inputs.import_evidence_public_sha256 != ''");
+  expect(step.with["if-no-files-found"]).toBe("ignore");
+  expect(
+    step.with.path
+      .trim()
+      .split("\n")
+      .map((value: string) => value.slice(value.lastIndexOf("/") + 1)),
+  ).toEqual([
+    "context.json",
+    "reply.aesgcm.bin",
+    "key.rsa-oaep-sha256.bin",
+    "nonce.bin",
+    "tag.bin",
+  ]);
+  expect(step.with.path).not.toMatch(/\.log|\.pem|\*/);
+  expect(
+    step.with.path
+      .split("\n")
+      .filter(Boolean)
+      .every((value: string) => value.includes("/terminal-private/ready/")),
+  ).toBe(true);
+  const run = workflow.jobs.visual_core.steps.find(
+    (value: { name?: string }) => value.name === "Run contained browser follow-up original batch",
+  );
+  expect(run.env.BIBCODE_TERMINAL_EVIDENCE_SELECTED).toBe(run.env.BIBCODE_IMPORT_EVIDENCE_SELECTED);
 });

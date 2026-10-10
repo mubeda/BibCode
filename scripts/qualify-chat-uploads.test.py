@@ -30,6 +30,7 @@ class ImportEvidenceEnvironmentTests(unittest.TestCase):
             'GITHUB_EVENT_NAME': 'workflow_dispatch', 'GITHUB_JOB': 'visual_core',
             'GITHUB_SHA': '2' * 40, 'GITHUB_RUN_ID': '123', 'GITHUB_RUN_ATTEMPT': '1',
             'BIBCODE_IMPORT_EVIDENCE_SELECTED': 'true',
+            'BIBCODE_TERMINAL_EVIDENCE_SELECTED': 'true',
             'BIBCODE_IMPORT_EVIDENCE_PUBLIC_SPKI': 'inert-public-spki',
             'BIBCODE_IMPORT_EVIDENCE_PUBLIC_SHA256': 'a' * 64,
             'UNRELATED_SECRET': 'must-not-forward',
@@ -41,6 +42,7 @@ class ImportEvidenceEnvironmentTests(unittest.TestCase):
         self.assertEqual(value['GITHUB_SHA'], '1' * 40)
         self.assertEqual(value['GITHUB_JOB'], 'visual_core')
         self.assertEqual(value['BIBCODE_IMPORT_EVIDENCE_PUBLIC_SPKI'], 'inert-public-spki')
+        self.assertEqual(value['BIBCODE_TERMINAL_EVIDENCE_SELECTED'], 'true')
         self.assertNotIn('UNRELATED_SECRET', value)
         self.assertNotIn('HOME', value)
 

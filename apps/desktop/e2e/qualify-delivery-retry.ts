@@ -3,6 +3,7 @@ import {
   type BrowserTerminalGuardReason,
 } from "./support/release-visual-browser-followups-source.ts";
 import { observeOwnedBrowserAlert } from "./support/owned-browser-alert.ts";
+import { createTerminalEvidenceOwner } from "./support/release-visual-terminal-evidence.ts";
 import { createImportEvidenceOwner } from "./support/release-visual-import-evidence.ts";
 import * as NodeOS from "node:os";
 import {
@@ -716,6 +717,7 @@ export async function runDeliveryRetryQualification() {
     theme: string;
   } | null = null;
   let importEvidenceOwner: ReturnType<typeof createImportEvidenceOwner> | null = null;
+  let terminalEvidenceOwner: ReturnType<typeof createTerminalEvidenceOwner> | null = null;
   const readBrowserInitialFailure = (): {
     readonly error: unknown;
     readonly value: BrowserInitialJoin | null;
@@ -1415,6 +1417,13 @@ export async function runDeliveryRetryQualification() {
             env: process.env,
             evidenceRoot: config.evidence,
             // oxlint-disable-next-line bibcode/no-global-process-runtime -- The standalone CI controller injects its actual host platform into evidence admission once.
+            platform: NodeOS.platform(),
+          });
+        if (process.env.BIBCODE_TERMINAL_EVIDENCE_SELECTED === "true")
+          terminalEvidenceOwner ??= createTerminalEvidenceOwner({
+            env: process.env,
+            evidenceRoot: config.evidence,
+            // oxlint-disable-next-line bibcode/no-global-process-runtime -- Standalone CI host admission.
             platform: NodeOS.platform(),
           });
         step("visual-browser-followups-resource-prepare");
@@ -2944,6 +2953,7 @@ export async function runDeliveryRetryQualification() {
         browserTerminalReceiptFailure = null;
         await runBrowserFollowupCaller({
           CI: childEnv.CI,
+          ...(terminalEvidenceOwner ? { terminalEvidence: terminalEvidenceOwner } : {}),
           prepared: browserFollowup,
           observeInitialFailure: (error, value) => {
             if (
@@ -3402,6 +3412,7 @@ export async function runDeliveryRetryQualification() {
       phase,
       theme,
       browserImportEvidenceStatus: importEvidenceOwner?.status() ?? "disabled",
+      browserTerminalEvidenceStatus: terminalEvidenceOwner?.status() ?? "disabled",
       failure: classifyQualificationFailure(error),
       browserTerminalReceiptGuard:
         config.selection === "release-visual-browser-followups" &&
@@ -3485,6 +3496,7 @@ export async function runDeliveryRetryQualification() {
     });
   } finally {
     importEvidenceOwner?.close();
+    terminalEvidenceOwner?.close();
     const processes = owner.processes.map(({ child, role, log, spawnFailure }) =>
       projectQualificationProcess({
         role,

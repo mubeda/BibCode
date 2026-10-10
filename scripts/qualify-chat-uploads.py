@@ -445,7 +445,7 @@ def import_evidence_environment(scenario, source, environment):
         return {}
     names = ['GITHUB_ACTIONS', 'GITHUB_EVENT_NAME', 'GITHUB_JOB',
              'GITHUB_RUN_ID', 'GITHUB_RUN_ATTEMPT',
-             'BIBCODE_IMPORT_EVIDENCE_SELECTED', 'BIBCODE_IMPORT_EVIDENCE_PUBLIC_SPKI',
+             'BIBCODE_IMPORT_EVIDENCE_SELECTED', 'BIBCODE_TERMINAL_EVIDENCE_SELECTED', 'BIBCODE_IMPORT_EVIDENCE_PUBLIC_SPKI',
              'BIBCODE_IMPORT_EVIDENCE_PUBLIC_SHA256']
     return {**{name: environment.get(name, '') for name in names}, 'GITHUB_SHA': source}
 

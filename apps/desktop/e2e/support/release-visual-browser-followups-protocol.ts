@@ -607,6 +607,43 @@ export function createBrowserFollowupProtocolObserver(
   };
   return {
     observe,
+    privateTerminalPredecessor: (incomingConnection?: string, incomingRequestId?: unknown) => {
+      const terminalRequests = [...requests.entries()].filter(
+        ([, value]) => value.tag === "terminal.attach" || value.tag === "terminal.resize",
+      );
+      const actors = new Set(
+        terminalRequests.map(([entry]) => entry.slice(0, entry.lastIndexOf(":"))),
+      );
+      if (incomingConnection !== undefined && rendererConnections.has(incomingConnection))
+        actors.add(incomingConnection);
+      return {
+        requests: terminalRequests,
+        attachments: [...attachments.entries()],
+        rendererConnections: [...rendererConnections].filter((connection) =>
+          actors.has(connection),
+        ),
+        closed,
+        failed: terminalFailed,
+        originalClaim,
+        secondClaim,
+        ambiguous:
+          requests.size > 128 ||
+          actors.size > 2 ||
+          attachments.size > 2 ||
+          (incomingRequestId !== undefined &&
+            requests.size >= 128 &&
+            requests.size !== terminalRequests.length) ||
+          (typeof incomingRequestId === "string" &&
+            (() => {
+              const request = requests.get(incomingConnection + ":" + incomingRequestId);
+              return (
+                request !== undefined &&
+                request.tag !== "terminal.attach" &&
+                request.tag !== "terminal.resize"
+              );
+            })()),
+      };
+    },
     upload: (): BrowserFollowupUploadReceipt => {
       if (
         closed ||

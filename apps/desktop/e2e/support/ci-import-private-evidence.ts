@@ -28,6 +28,9 @@ function positiveCanonicalInteger(value: string | undefined): number | null {
 export function admitImportEvidenceRecipient(
   env: Readonly<Record<string, string | undefined>>,
   platform: string,
+  scope:
+    | "browser-owned-project-import"
+    | "browser-owned-terminal-observer-refusal" = "browser-owned-project-import",
 ): ImportEvidenceAdmission | null {
   if (
     platform !== "linux" ||
@@ -81,7 +84,7 @@ export function admitImportEvidenceRecipient(
     const context = Buffer.from(
       JSON.stringify({
         version: 1,
-        scope: "browser-owned-project-import",
+        scope,
         alg: "RSA-OAEP-SHA256",
         enc: "AES-256-GCM",
         source,
@@ -177,7 +180,11 @@ function assertAbsent(path: string): void {
   throw new Error(OMITTED);
 }
 
-export function publishImportFailure(evidenceRoot: string, parts: ImportEvidenceEnvelope): void {
+export function publishImportFailure(
+  evidenceRoot: string,
+  parts: ImportEvidenceEnvelope,
+  namespace: "import-private" | "terminal-private" = "import-private",
+): void {
   const descriptors: number[] = [];
   try {
     const expectedFields = ["ciphertext", "context", "nonce", "tag", "wrappedKey"];
@@ -198,7 +205,7 @@ export function publishImportFailure(evidenceRoot: string, parts: ImportEvidence
       throw new Error(OMITTED);
     const rootDescriptor = openPrivateDirectory(evidenceRoot);
     descriptors.push(rootDescriptor);
-    const owned = NodePath.join(evidenceRoot, "import-private");
+    const owned = NodePath.join(evidenceRoot, namespace);
     NodeFS.mkdirSync(owned, { mode: 0o700 });
     assertDirectoryPin(evidenceRoot, rootDescriptor);
     const ownedDescriptor = openPrivateDirectory(owned);

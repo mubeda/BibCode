@@ -213,7 +213,7 @@ describe("first visual batch workflow boundary", () => {
           ],
         },
         import_evidence_public_spki: {
-          description: "Optional RSA public SPKI for one encrypted owned import failure",
+          description: "Optional RSA public SPKI for encrypted owned import or terminal failure",
           type: "string",
           default: "",
         },

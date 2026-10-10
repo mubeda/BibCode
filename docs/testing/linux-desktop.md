@@ -2670,6 +2670,26 @@ disabled, not-observed, pending, success, failure-encrypted or failure-omitted.
 Evidence parsing, key or publication failure cannot replace the original import
 error, change its deadline or affect forwarded bytes. A status or decrypted reply
 does not establish visual acceptance; the full 82 rows / 164 originals remain required.
+The same optional public recipient inputs also select one encrypted terminal
+observer refusal. Its distinct authenticated scope is
+browser-owned-terminal-observer-refusal. Before the existing observer mutates
+its state, copy only the pinned terminal request lifecycle, at most two current
+attachments, replay request/snapshot ownership, baseline and closed/failed/claim
+flags. Publish only when that exact original attach/resize message or matched
+stream reply causes the first observer refusal. The combined header-free message
+and predecessor are limited to 256 KiB and 128 tracked terminal requests. Any
+missing, ambiguous, unrelated, oversized or already failed state omits capture.
+Attach commands must be absent. Environment must be absent or contain exactly
+the three source-defined OSC colors for the fixture theme; any other entry omits
+the entire bundle. No additional RPC, polling, auth, headers, provider traffic or
+raw logs are retained. The optional issue29-terminal-private artifact lists the
+same five encrypted files under terminal-private/ready. Failure.json records
+only browserTerminalEvidenceStatus. Authenticate the distinct context and all
+archive evidence before decrypting locally, then replay the original message
+with its exact predecessor privately before selecting a fix. The local private
+key never enters CI. Evidence faults preserve existing forwarding, errors,
+timeouts and cleanup. This diagnostic does not implement product encrypted
+transfers and does not reduce the 82 rows / 164 originals.
 The single terminal marker command must emit an explicit leading newline before
 its exact output line, then keep the same long-running sleep process. This
 establishes a raw line boundary after shell control sequences. Preserve the

@@ -39,6 +39,7 @@ it.each(["owned", "missing", "credential", "physical", "caller"])(
         branch: "inert-branch",
         commonDirectory: "/inert/common",
       };
+    const terminalSink = { capture: () => {} };
     let safe = true;
     const run = code(
       "async function run(){" + source.slice(source.indexOf("\n", begin) + 1, end) + "}\nrun",
@@ -73,6 +74,7 @@ it.each(["owned", "missing", "credential", "physical", "caller"])(
         },
         browser: {},
         theme: "light",
+        terminalEvidenceOwner: terminalSink,
         workspace,
         readOwnedGitProjectDescriptor: async () => ({}),
         readOwnedGitProjectSnapshot: async () => ({}),
@@ -102,11 +104,13 @@ it.each(["owned", "missing", "credential", "physical", "caller"])(
           observeUnsafeCleanup: () => void;
           readSnapshot: () => Promise<unknown>;
           accessToken: string;
+          terminalEvidence: typeof terminalSink;
         }) => {
           events.push("caller");
           await input.verifyPhysical();
           expect(input.patch()).toBe("inert original Git patch");
           expect(input.accessToken).toBe("inert-access");
+          expect(input.terminalEvidence).toBe(terminalSink);
           if (mode === "caller") {
             input.observeUnsafeCleanup();
             throw fault;
@@ -199,6 +203,7 @@ it.each(["safe", "unsafe", "failure"])(
         settingsFollowupUsageFixtures: [],
         pullRequestsHostingOwners: [],
         importEvidenceOwner: null,
+        terminalEvidenceOwner: null,
         browserFollowupResources: [
           {
             close: async () => {
@@ -365,6 +370,7 @@ it.each(["browser", "ordinary"])(
         serverEnvironment: childEnv,
         browserFollowupResources: resources,
         importEvidenceOwner: null,
+        terminalEvidenceOwner: null,
         process: { env: {} },
         deliveryConfiguration: () => config,
         check: (value: boolean) => expect(value).toBe(true),

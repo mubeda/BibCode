@@ -381,3 +381,26 @@ describe("publication refusal and ownership boundaries", () => {
     });
   });
 });
+
+it("binds terminal ciphertext to a separate authenticated scope and private namespace", () => {
+  const admitted = admitImportEvidenceRecipient(
+    environment(),
+    "linux",
+    "browser-owned-terminal-observer-refusal",
+  );
+  NodeAssert.ok(admitted);
+  const parts = sealImportFailure(admitted, Buffer.from("owned terminal refusal"));
+  NodeAssert.equal(
+    JSON.parse(parts.context.toString()).scope,
+    "browser-owned-terminal-observer-refusal",
+  );
+  NodeAssert.equal(decrypt(parts).toString(), "owned terminal refusal");
+  withRoot((root) => {
+    publishImportFailure(root, parts, "terminal-private");
+    NodeAssert.deepEqual(NodeFS.readdirSync(root), ["terminal-private"]);
+    NodeAssert.equal(
+      NodeFS.readdirSync(NodePath.join(root, "terminal-private", "ready")).length,
+      5,
+    );
+  });
+});

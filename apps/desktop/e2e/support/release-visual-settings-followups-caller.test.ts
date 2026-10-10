@@ -480,6 +480,7 @@ it.each(["current", "stale-browse", "stale-path"])(
     if (mode === "stale-path") body = body.replaceAll("Type a path instead", "Type path");
     const run = NodeVM.runInNewContext(NodeModule.stripTypeScriptTypes(body) + "\nimportProject", {
       importEvidenceOwner: null,
+      terminalEvidenceOwner: null,
       importModelBinding: undefined,
       step: () => {},
       click: async (selector: string) => {

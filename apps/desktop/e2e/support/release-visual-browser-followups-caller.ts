@@ -11,6 +11,7 @@ import type { OrchestrationReadModel } from "../../../../packages/contracts/src/
 
 import { type TerminalSummary } from "../../../../packages/contracts/src/terminal.ts";
 import { startThrottleProxy } from "../../../../scripts/throttle-proxy.ts";
+import type { createTerminalEvidenceOwner } from "./release-visual-terminal-evidence.ts";
 import type { createImportEvidenceOwner } from "./release-visual-import-evidence.ts";
 import { prepareBrowserFollowupPng } from "./release-visual-browser-followups-fixture.ts";
 import {
@@ -513,6 +514,7 @@ export async function runBrowserFollowupCaller(input: {
   observeUnsafeCleanup: () => void;
   observeInitialFailure?: (error: unknown, value: BrowserInitialJoin | null) => void;
   observeTerminalReceiptFailure?: (error: unknown, reason: BrowserTerminalGuardReason) => void;
+  terminalEvidence?: Pick<ReturnType<typeof createTerminalEvidenceOwner>, "capture">;
 }) {
   if (input.CI !== "true") throw refused();
   let cleanupBinding: ReturnType<typeof bindBrowserFollowupTarget> | undefined;
@@ -618,6 +620,10 @@ export async function runBrowserFollowupCaller(input: {
             startBrowserFollowupReplayNetwork({
               CI: input.CI,
               baseline: baseline!,
+              theme: input.theme,
+              ...(input.terminalEvidence
+                ? { observeTerminalRefusal: input.terminalEvidence.capture }
+                : {}),
               slowTransport: () => false,
               png: NodeFS.readFileSync(input.prepared.png.path),
               cwd: input.cwd,

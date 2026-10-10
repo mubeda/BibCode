@@ -135,7 +135,10 @@ export async function startBrowserFollowupTransport(
     CI: string | undefined;
     listenPort: number;
     targetPort: number;
-    observer: ReturnType<typeof createBrowserFollowupProtocolObserver>;
+    observer: Pick<
+      ReturnType<typeof createBrowserFollowupProtocolObserver>,
+      "observe" | "rendererConnection" | "connectionClosed" | "close"
+    >;
   } & BrowserInitialHooks,
 ) {
   if (
