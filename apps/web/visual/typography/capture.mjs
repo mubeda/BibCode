@@ -412,6 +412,7 @@ async function main() {
             transformRequest: normalizeWebDriverRequest,
             capabilities: {
               browserName: "MiniBrowser",
+              "wdio:enforceWebDriverClassic": true,
               "webkitgtk:browserOptions": { binary: process.env.BIBCODE_FIXTURE_WEBKIT_BROWSER },
             },
             logLevel: "error",

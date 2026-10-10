@@ -1,7 +1,7 @@
 import "@fontsource-variable/dm-sans/index.css";
 import "@fontsource/jetbrains-mono/400.css";
 import "@fontsource/jetbrains-mono/500.css";
-import "../../src/index.css";
+import "./gallery.css";
 import { RegistryContext } from "@effect/atom-react";
 import { AtomRegistry } from "effect/unstable/reactivity";
 import { Component, type ErrorInfo, type ReactNode } from "react";
