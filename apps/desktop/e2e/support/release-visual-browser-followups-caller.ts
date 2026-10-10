@@ -11,6 +11,7 @@ import type { OrchestrationReadModel } from "../../../../packages/contracts/src/
 
 import { type TerminalSummary } from "../../../../packages/contracts/src/terminal.ts";
 import { startThrottleProxy } from "../../../../scripts/throttle-proxy.ts";
+import type { createImportEvidenceOwner } from "./release-visual-import-evidence.ts";
 import { prepareBrowserFollowupPng } from "./release-visual-browser-followups-fixture.ts";
 import {
   startBrowserFollowupReplayNetwork,
@@ -267,6 +268,9 @@ export async function prepareBrowserFollowupCaller(input: {
   admitOwner: () => Promise<void>;
   verifyInputs: () => Promise<void>;
   observeUnsafeCleanup: () => void;
+  importEvidence?:
+    | Pick<ReturnType<typeof createImportEvidenceOwner>, "observeData" | "connectionClosed">
+    | undefined;
 }) {
   if (input.CI !== "true") throw refused();
   await input.admitOwner();
@@ -292,11 +296,24 @@ export async function prepareBrowserFollowupCaller(input: {
       observeUnsafeCleanup: input.observeUnsafeCleanup,
     });
     resources.push(hosted.close);
+    const importEvidence = input.importEvidence;
     const proxy = await startThrottleProxy({
       listenHost: "127.0.0.1",
       listenPort: 4887,
       targetHost: "127.0.0.1",
       targetPort: 4897,
+      ...(importEvidence
+        ? {
+            observeTraffic: (connection: string, direction: "request" | "reply", bytes: Buffer) => {
+              importEvidence.observeData(connection, direction, bytes);
+              return undefined;
+            },
+            observeClosed: (connection: string) => {
+              importEvidence.connectionClosed(connection);
+              return undefined;
+            },
+          }
+        : {}),
     });
     const bootstrapClose = joinBrowserFollowupCleanup([proxy.close], input.observeUnsafeCleanup);
     resources.push(bootstrapClose);

@@ -48,6 +48,7 @@ function pace(
   destination: NodeNet.Socket,
   rate: () => number,
   frozen: () => boolean,
+  observe?: ((bytes: Buffer) => undefined) | undefined,
 ): () => void {
   const queue: Array<Buffer> = [];
   let queued = 0;
@@ -96,6 +97,13 @@ function pace(
     }
     if (queued >= QUEUE_HIGH_WATER_BYTES) source.pause();
     schedule(nextSendAt - Date.now());
+    if (observe) {
+      try {
+        observe(Buffer.from(data));
+      } catch {
+        // Optional evidence cannot affect forwarding or replace an owned error.
+      }
+    }
   });
   source.on("end", () => {
     ended = true;
@@ -112,10 +120,18 @@ export async function startThrottleProxy(options: {
   readonly targetHost: string;
   readonly targetPort: number;
   readonly initial?: Partial<LinkSettings>;
+  readonly observeTraffic?:
+    | ((connection: string, direction: "request" | "reply", bytes: Buffer) => undefined)
+    | undefined;
+  readonly observeClosed?: ((connection: string) => undefined) | undefined;
 }): Promise<ThrottleProxy> {
   let settings: LinkSettings = { ...UNTHROTTLED, ...options.initial };
   const sockets = new Set<NodeNet.Socket>();
+  const observeTraffic = options.observeTraffic;
+  let ordinal = 0;
   const server = NodeNet.createServer((client) => {
+    const connection = "connection-" + ++ordinal;
+    let closureObserved = false;
     const upstream = NodeNet.connect(options.targetPort, options.targetHost);
     sockets.add(client);
     sockets.add(upstream);
@@ -124,12 +140,14 @@ export async function startThrottleProxy(options: {
       client,
       () => settings.down,
       () => settings.frozen,
+      observeTraffic ? (bytes) => observeTraffic(connection, "reply", bytes) : undefined,
     );
     const stopUp = pace(
       client,
       upstream,
       () => settings.up,
       () => settings.frozen,
+      observeTraffic ? (bytes) => observeTraffic(connection, "request", bytes) : undefined,
     );
     const destroyBoth = (): void => {
       stopDown();
@@ -138,6 +156,14 @@ export async function startThrottleProxy(options: {
       upstream.destroy();
       sockets.delete(client);
       sockets.delete(upstream);
+      if (!closureObserved) {
+        closureObserved = true;
+        try {
+          options.observeClosed?.(connection);
+        } catch {
+          // Optional evidence cannot affect socket cleanup.
+        }
+      }
     };
     client.on("error", destroyBoth);
     upstream.on("error", destroyBoth);

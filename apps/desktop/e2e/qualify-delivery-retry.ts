@@ -3,6 +3,8 @@ import {
   type BrowserTerminalGuardReason,
 } from "./support/release-visual-browser-followups-source.ts";
 import { observeOwnedBrowserAlert } from "./support/owned-browser-alert.ts";
+import { createImportEvidenceOwner } from "./support/release-visual-import-evidence.ts";
+import * as NodeOS from "node:os";
 import {
   projectPrViewportObservation,
   projectModelClickObservation,
@@ -713,6 +715,7 @@ export async function runDeliveryRetryQualification() {
     value: BrowserInitialJoin | null;
     theme: string;
   } | null = null;
+  let importEvidenceOwner: ReturnType<typeof createImportEvidenceOwner> | null = null;
   const readBrowserInitialFailure = (): {
     readonly error: unknown;
     readonly value: BrowserInitialJoin | null;
@@ -1018,6 +1021,7 @@ export async function runDeliveryRetryQualification() {
     project: string,
     bindSource?: () => Promise<GitProjectVisualSelection>,
   ) {
+    importEvidenceOwner?.pinProject(project);
     importModelBinding = bindSource ? null : undefined;
     step("import-open-project-menu");
     await click('[data-testid="sidebar-add-project-trigger"]');
@@ -1406,9 +1410,17 @@ export async function runDeliveryRetryQualification() {
       delete childEnv.BIBCODE_HERMETIC_GUARD;
       let browserFollowup: Awaited<ReturnType<typeof prepareBrowserFollowupCaller>> | null = null;
       if (config.selection === "release-visual-browser-followups") {
+        if (process.env.BIBCODE_IMPORT_EVIDENCE_SELECTED === "true")
+          importEvidenceOwner ??= createImportEvidenceOwner({
+            env: process.env,
+            evidenceRoot: config.evidence,
+            // oxlint-disable-next-line bibcode/no-global-process-runtime -- The standalone CI controller injects its actual host platform into evidence admission once.
+            platform: NodeOS.platform(),
+          });
         step("visual-browser-followups-resource-prepare");
         browserFollowup = await prepareBrowserFollowupCaller({
           CI: childEnv.CI,
+          ...(importEvidenceOwner ? { importEvidence: importEvidenceOwner } : {}),
           root: runRoot,
           primaryAssets: config.assets,
           hostedAssets: NodePath.join(NodePath.dirname(config.assets), "hosted-web"),
@@ -3374,6 +3386,7 @@ export async function runDeliveryRetryQualification() {
     write("failure", {
       phase,
       theme,
+      browserImportEvidenceStatus: importEvidenceOwner?.status() ?? "disabled",
       failure: classifyQualificationFailure(error),
       browserTerminalReceiptGuard:
         config.selection === "release-visual-browser-followups" &&
@@ -3456,6 +3469,7 @@ export async function runDeliveryRetryQualification() {
           : null,
     });
   } finally {
+    importEvidenceOwner?.close();
     const processes = owner.processes.map(({ child, role, log, spawnFailure }) =>
       projectQualificationProcess({
         role,

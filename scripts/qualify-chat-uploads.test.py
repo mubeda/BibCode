@@ -23,6 +23,41 @@ qualification = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(qualification)
 
 
+class ImportEvidenceEnvironmentTests(unittest.TestCase):
+    def environment(self):
+        return {
+            'CI': 'true', 'GITHUB_ACTIONS': 'true',
+            'GITHUB_EVENT_NAME': 'workflow_dispatch', 'GITHUB_JOB': 'visual_core',
+            'GITHUB_SHA': '2' * 40, 'GITHUB_RUN_ID': '123', 'GITHUB_RUN_ATTEMPT': '1',
+            'BIBCODE_IMPORT_EVIDENCE_SELECTED': 'true',
+            'BIBCODE_IMPORT_EVIDENCE_PUBLIC_SPKI': 'inert-public-spki',
+            'BIBCODE_IMPORT_EVIDENCE_PUBLIC_SHA256': 'a' * 64,
+            'UNRELATED_SECRET': 'must-not-forward',
+        }
+
+    def test_selected_manual_import_forwards_only_public_admission(self):
+        value = qualification.import_evidence_environment(
+            'release-visual-browser-followups', '1' * 40, self.environment())
+        self.assertEqual(value['GITHUB_SHA'], '1' * 40)
+        self.assertEqual(value['GITHUB_JOB'], 'visual_core')
+        self.assertEqual(value['BIBCODE_IMPORT_EVIDENCE_PUBLIC_SPKI'], 'inert-public-spki')
+        self.assertNotIn('UNRELATED_SECRET', value)
+        self.assertNotIn('HOME', value)
+
+    def test_other_scenarios_and_unadmitted_roles_forward_nothing(self):
+        for field, value in [('CI', 'false'), ('GITHUB_ACTIONS', 'false'),
+                             ('GITHUB_EVENT_NAME', 'pull_request'), ('GITHUB_JOB', 'other'),
+                             ('BIBCODE_IMPORT_EVIDENCE_SELECTED', 'false'),
+                             ('BIBCODE_IMPORT_EVIDENCE_PUBLIC_SPKI', ''),
+                             ('BIBCODE_IMPORT_EVIDENCE_PUBLIC_SHA256', '')]:
+            env = self.environment()
+            env[field] = value
+            self.assertEqual(qualification.import_evidence_environment(
+                'release-visual-browser-followups', '1' * 40, env), {})
+        self.assertEqual(qualification.import_evidence_environment(
+            'release-visual-settings', '1' * 40, self.environment()), {})
+
+
 class SettingsFollowupBoundariesTests(unittest.TestCase):
     def test_actual_entrypoint_closes_private_native_failures(self):
         tree = ast.parse(SOURCE.read_text())

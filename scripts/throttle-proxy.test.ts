@@ -39,6 +39,62 @@ function readAll(port: number, onData?: (total: number) => void): Promise<Buffer
 }
 
 describe("startThrottleProxy", () => {
+  it.each(["observe", "throw"])(
+    "keeps both directions original when an optional observer mutates its copy: %s",
+    async (mode) => {
+      const payload = Buffer.from("Owned proxy observation payload");
+      const server = NodeNet.createServer((socket) =>
+        socket.once("data", (bytes) => socket.end(bytes)),
+      );
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+      cleanups.push(() => new Promise<void>((resolve) => server.close(() => resolve())));
+      const address = server.address();
+      if (address === null || typeof address === "string") throw new Error("Inert port missing");
+      const seen: Array<{ connection: string; direction: string; bytes: Buffer }> = [];
+      let closedCount = 0;
+      let resolveClosed: () => void = () => {};
+      const closed = new Promise<void>((resolve) => {
+        resolveClosed = resolve;
+      });
+      const proxy = await startThrottleProxy({
+        listenHost: "127.0.0.1",
+        listenPort: 0,
+        targetHost: "127.0.0.1",
+        targetPort: address.port,
+        observeTraffic: (connection, direction, bytes) => {
+          seen.push({ connection, direction, bytes: Buffer.from(bytes) });
+          bytes.fill(0);
+          if (mode === "throw") throw undefined;
+          return undefined;
+        },
+        observeClosed: () => {
+          closedCount++;
+          resolveClosed();
+          if (mode === "throw") throw undefined;
+          return undefined;
+        },
+      });
+      cleanups.push(proxy.close);
+      const received = await new Promise<Buffer>((resolve, reject) => {
+        const client = NodeNet.connect(proxy.port, "127.0.0.1", () => client.write(payload));
+        const parts: Buffer[] = [];
+        client.on("data", (bytes: Buffer) => parts.push(bytes));
+        client.on("end", () => resolve(Buffer.concat(parts)));
+        client.on("error", reject);
+      });
+      expect(received).toEqual(payload);
+      expect(seen.length).toBeGreaterThanOrEqual(2);
+      await closed;
+      expect(closedCount).toBe(1);
+      expect(new Set(seen.map((value) => value.connection)).size).toBe(1);
+      for (const direction of ["request", "reply"])
+        expect(
+          Buffer.concat(
+            seen.filter((value) => value.direction === direction).map((value) => value.bytes),
+          ),
+        ).toEqual(payload);
+    },
+  );
   it("paces server-to-client bytes at the configured rate", async () => {
     const payload = Buffer.alloc(64 * 1024, 120);
     const target = await servePayload(payload);

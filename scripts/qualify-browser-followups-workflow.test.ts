@@ -35,7 +35,39 @@ it("registers only the fixed browser selection and contained scalar owner", () =
         "python3 -B scripts/qualify-chat-uploads.py --scenario release-visual-browser-followups",
     );
   expect(run.if).toBe("${{ inputs.scene_selection == 'release-visual-browser-followups' }}");
-  expect(Object.keys(run.env).sort()).toEqual(["BIBCODE_DELIVERY_UI_WEB", "BIBCODE_UPLOAD_SERVER"]);
+  expect(Object.keys(run.env).sort()).toEqual([
+    "BIBCODE_DELIVERY_UI_WEB",
+    "BIBCODE_IMPORT_EVIDENCE_PUBLIC_SHA256",
+    "BIBCODE_IMPORT_EVIDENCE_PUBLIC_SPKI",
+    "BIBCODE_IMPORT_EVIDENCE_SELECTED",
+    "BIBCODE_UPLOAD_SERVER",
+  ]);
+});
+it("keeps private import evidence optional and publishes only the encrypted envelope", () => {
+  const inputs = workflow.on.workflow_dispatch.inputs;
+  expect(inputs.import_evidence_public_spki.default).toBe("");
+  expect(inputs.import_evidence_public_sha256.default).toBe("");
+  const step = workflow.jobs.visual_core.steps.find(
+    (value: { name?: string }) => value.name === "Retain optional encrypted import failure",
+  );
+  expect(step.if).toContain("github.event_name == 'workflow_dispatch'");
+  expect(step.if).toContain("inputs.scene_selection == 'release-visual-browser-followups'");
+  expect(step.if).toContain("inputs.import_evidence_public_spki != ''");
+  expect(step.if).toContain("inputs.import_evidence_public_sha256 != ''");
+  expect(step.with["if-no-files-found"]).toBe("ignore");
+  expect(
+    step.with.path
+      .trim()
+      .split("\n")
+      .map((value: string) => value.slice(value.lastIndexOf("/") + 1)),
+  ).toEqual([
+    "context.json",
+    "reply.aesgcm.bin",
+    "key.rsa-oaep-sha256.bin",
+    "nonce.bin",
+    "tag.bin",
+  ]);
+  expect(step.with.path).not.toMatch(/\.log|\.pem|\*/);
 });
 it("builds two fresh immutable current-source modes and preserves guarded Rust", () => {
   const steps = workflow.jobs.visual_core.steps,
@@ -99,6 +131,10 @@ it("runs every fixed-endpoint browser composition file with exclusive file owner
     "apps/desktop/e2e/support/release-visual-browser-followups-producer.test.ts",
     "apps/desktop/e2e/support/release-visual-browser-followups-protocol.test.ts",
     "apps/desktop/e2e/support/release-visual-browser-followups-transport.test.ts",
+    "apps/desktop/e2e/support/ci-import-private-evidence.test.ts",
+    "apps/desktop/e2e/support/release-visual-import-evidence.test.ts",
+    "apps/desktop/e2e/support/release-visual-import-evidence.integration.test.ts",
+    "scripts/throttle-proxy.test.ts",
     "scripts/build-browser-followup-ui.test.mjs",
     "apps/desktop/e2e/support/release-visual-browser-followups-wiring.test.ts",
     "scripts/qualify-browser-followups-workflow.test.ts",

@@ -2623,6 +2623,27 @@ unavailable replay owner preserves the authenticated code of its first stored
 failure when present, otherwise uses observer-unavailable. This projects only
 the existing private marker without inspecting the error or re-evaluating a
 guard. The code does not establish the earlier native event or its cause.
+The manual browser-followups job optionally accepts import_evidence_public_spki
+and import_evidence_public_sha256 for one encrypted project-import failure.
+Use a fresh RSA 3072 public SPKI with exponent 65537 and its decoded-DER SHA256;
+keep the private key outside the repository and CI. Empty inputs disable capture.
+The contained runner forwards only public recipient context for this selected
+manual job. A passive observer watches copied normal bytes, binds the renderer's
+project.create dispatch to the pinned fixture path and request, and seals at most
+one matching Failure reply, limited to 256 KiB. It adds no RPC call or polling.
+Auth frames, request headers and plaintext are excluded from retained evidence.
+The reply uses AES-256-GCM with source/run/attempt/role/recipient context as AAD,
+and an RSAOAEP-SHA256 wrapped key. Five 0600 files are published atomically beneath
+the owned 0700 evidence directory's import-private/ready namespace. The separate
+optional issue29-import-private artifact lists only context.json,
+reply.aesgcm.bin, key.rsa-oaep-sha256.bin, nonce.bin and tag.bin. No matching
+failure means no ciphertext artifact. Authenticate the GitHub run, source,
+attempt, role, recipient and archive digest before decrypting privately; never
+print the decrypted reply. Failure.json contains only browserImportEvidenceStatus:
+disabled, not-observed, pending, success, failure-encrypted or failure-omitted.
+Evidence parsing, key or publication failure cannot replace the original import
+error, change its deadline or affect forwarded bytes. A status or decrypted reply
+does not establish visual acceptance; the full 82 rows / 164 originals remain required.
 The single terminal marker command must emit an explicit leading newline before
 its exact output line, then keep the same long-running sleep process. This
 establishes a raw line boundary after shell control sequences. Preserve the

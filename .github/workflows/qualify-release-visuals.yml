@@ -22,6 +22,14 @@ on:
           - release-visual-settings-followups
           - release-visual-pull-requests
           - release-visual-browser-followups
+      import_evidence_public_spki:
+        description: Optional RSA public SPKI for one encrypted owned import failure
+        type: string
+        default: ""
+      import_evidence_public_sha256:
+        description: SHA256 of the decoded public SPKI
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -70,11 +78,11 @@ jobs:
       - name: Verify browser follow-up composition and current public controls
         if: ${{ inputs.scene_selection == 'release-visual-browser-followups' }}
         run: |
-          vp test run --no-file-parallelism apps/desktop/e2e/support/release-visual-browser-followups-caller.test.ts apps/desktop/e2e/support/release-visual-browser-followups-caller-resources.test.ts apps/desktop/e2e/support/release-visual-browser-followups-caller-protocol.test.ts apps/desktop/e2e/support/release-visual-browser-followups-owner.test.ts apps/desktop/e2e/support/release-visual-browser-followups-producer.test.ts apps/desktop/e2e/support/release-visual-browser-followups-protocol.test.ts apps/desktop/e2e/support/release-visual-browser-followups-transport.test.ts scripts/build-browser-followup-ui.test.mjs apps/desktop/e2e/support/release-visual-browser-followups-wiring.test.ts scripts/qualify-browser-followups-workflow.test.ts
+          vp test run --no-file-parallelism apps/desktop/e2e/support/release-visual-browser-followups-caller.test.ts apps/desktop/e2e/support/release-visual-browser-followups-caller-resources.test.ts apps/desktop/e2e/support/release-visual-browser-followups-caller-protocol.test.ts apps/desktop/e2e/support/release-visual-browser-followups-owner.test.ts apps/desktop/e2e/support/release-visual-browser-followups-producer.test.ts apps/desktop/e2e/support/release-visual-browser-followups-protocol.test.ts apps/desktop/e2e/support/release-visual-browser-followups-transport.test.ts apps/desktop/e2e/support/ci-import-private-evidence.test.ts apps/desktop/e2e/support/release-visual-import-evidence.test.ts apps/desktop/e2e/support/release-visual-import-evidence.integration.test.ts scripts/throttle-proxy.test.ts scripts/build-browser-followup-ui.test.mjs apps/desktop/e2e/support/release-visual-browser-followups-wiring.test.ts scripts/qualify-browser-followups-workflow.test.ts
       - name: Verify compiled browser follow-up public controls
         if: ${{ inputs.scene_selection == 'release-visual-browser-followups' }}
         working-directory: apps/web
-        run: vp test run --project unit src/release-visual-browser-followups.public.test.tsx
+        run: vp test run --project unit src/release-visual-browser-followups.public.test.tsx src/components/add-project/useAddProjectWorkflow.public.test.tsx
       - name: Build immutable primary and hosted follow-up UI separately
         if: ${{ inputs.scene_selection == 'release-visual-browser-followups' }}
         run: |
@@ -131,7 +139,23 @@ jobs:
         env:
           BIBCODE_UPLOAD_SERVER: ${{ runner.temp }}/issue29-visual-build/bibcode
           BIBCODE_DELIVERY_UI_WEB: ${{ runner.temp }}/issue29-visual-build/web
+          BIBCODE_IMPORT_EVIDENCE_SELECTED: "${{ github.event_name == 'workflow_dispatch' && inputs.import_evidence_public_spki != '' && inputs.import_evidence_public_sha256 != '' }}"
+          BIBCODE_IMPORT_EVIDENCE_PUBLIC_SPKI: ${{ inputs.import_evidence_public_spki }}
+          BIBCODE_IMPORT_EVIDENCE_PUBLIC_SHA256: ${{ inputs.import_evidence_public_sha256 }}
         run: python3 -B scripts/qualify-chat-uploads.py --scenario release-visual-browser-followups
+      - name: Retain optional encrypted import failure
+        if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.scene_selection == 'release-visual-browser-followups' && inputs.import_evidence_public_spki != '' && inputs.import_evidence_public_sha256 != '' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: issue29-import-private-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: ignore
+          retention-days: 7
+          path: |
+            ${{ runner.temp }}/issue29-browser-followups-${{ github.run_id }}/import-private/ready/context.json
+            ${{ runner.temp }}/issue29-browser-followups-${{ github.run_id }}/import-private/ready/reply.aesgcm.bin
+            ${{ runner.temp }}/issue29-browser-followups-${{ github.run_id }}/import-private/ready/key.rsa-oaep-sha256.bin
+            ${{ runner.temp }}/issue29-browser-followups-${{ github.run_id }}/import-private/ready/nonce.bin
+            ${{ runner.temp }}/issue29-browser-followups-${{ github.run_id }}/import-private/ready/tag.bin
       - name: Retain finite browser follow-up original evidence
         if: ${{ always() && inputs.scene_selection == 'release-visual-browser-followups' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a

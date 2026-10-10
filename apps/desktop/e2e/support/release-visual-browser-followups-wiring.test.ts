@@ -185,6 +185,7 @@ it.each(["safe", "unsafe", "failure"])(
         networkProofs: [],
         settingsFollowupUsageFixtures: [],
         pullRequestsHostingOwners: [],
+        importEvidenceOwner: null,
         browserFollowupResources: [
           {
             close: async () => {
@@ -341,6 +342,7 @@ it.each(["browser", "ordinary"])(
         origin,
         serverEnvironment: childEnv,
         browserFollowupResources: resources,
+        importEvidenceOwner: null,
         process: { env: {} },
         deliveryConfiguration: () => config,
         check: (value: boolean) => expect(value).toBe(true),

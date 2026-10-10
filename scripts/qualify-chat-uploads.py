@@ -432,6 +432,24 @@ def prepare_native_launcher_tools(fixture, which=shutil.which):
         path.chmod(0o700)
 
 
+def import_evidence_environment(scenario, source, environment):
+    """Forward public recipient context only for the explicitly selected manual batch."""
+    if (scenario != 'release-visual-browser-followups'
+            or environment.get('CI') != 'true'
+            or environment.get('GITHUB_ACTIONS') != 'true'
+            or environment.get('GITHUB_EVENT_NAME') != 'workflow_dispatch'
+            or environment.get('GITHUB_JOB') != 'visual_core'
+            or environment.get('BIBCODE_IMPORT_EVIDENCE_SELECTED') != 'true'
+            or not environment.get('BIBCODE_IMPORT_EVIDENCE_PUBLIC_SPKI')
+            or not environment.get('BIBCODE_IMPORT_EVIDENCE_PUBLIC_SHA256')):
+        return {}
+    names = ['GITHUB_ACTIONS', 'GITHUB_EVENT_NAME', 'GITHUB_JOB',
+             'GITHUB_RUN_ID', 'GITHUB_RUN_ATTEMPT',
+             'BIBCODE_IMPORT_EVIDENCE_SELECTED', 'BIBCODE_IMPORT_EVIDENCE_PUBLIC_SPKI',
+             'BIBCODE_IMPORT_EVIDENCE_PUBLIC_SHA256']
+    return {**{name: environment.get(name, '') for name in names}, 'GITHUB_SHA': source}
+
+
 def network_environment(host_namespace, ip):
     """Only the checked private PID1 may publish identities to its child helper."""
     if os.getpid() != 1:
@@ -513,6 +531,7 @@ def inner(evidence, fixture, node, server, chrome, driver, git, dirname, host_na
             'BIBCODE_UPLOAD_CHROME': chrome, 'BIBCODE_UPLOAD_DRIVER': driver,
             'BIBCODE_UPLOAD_SOURCE': source,
             **trusted_network,
+            **import_evidence_environment(scenario, source, os.environ),
         }
         if scenario == 'remote-updates-ui':
             environment.update({'BIBCODE_RELEASE_UI_FAKE_HOST': str(Path(fake_host).resolve(strict=True)),

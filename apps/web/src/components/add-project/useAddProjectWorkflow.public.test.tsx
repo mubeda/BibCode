@@ -488,6 +488,7 @@ describe("useAddProjectWorkflow public adapter", () => {
         phase: () => {},
         step: () => {},
         importModelBinding: undefined,
+        importEvidenceOwner: null,
         selectClaudeModel,
         workspace: async () => {},
         SUCCESS_IMPORT_PHASES: {},
