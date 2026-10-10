@@ -37,9 +37,13 @@ flowchart TB
   content is hosted in Tauri child webviews; preview automation is brokered by
   the Rust server and consumed by the React host. On the Tauri desktop host only
   tab status, open, and navigate are supported and advertised; snapshot, click,
-  type, and the other automation calls are not yet. Its single native view
-  drives only the visible tab, so open always shows the tab, and a request for a
-  thread that is not on screen times out. In browser mode there is no child
+  type, and the other automation calls are not yet. Its native views drive
+  only the visible tab, so open always shows the tab, and a request for a
+  thread that is not on screen times out. The desktop keeps one long-lived
+  native view per environment's preview storage (the local environment keeps
+  the original profile; each other environment gets its own), because
+  recreating child webviews while switching tabs disconnected the app; logical
+  tabs rebind to their environment's view. In browser mode there is no child
   webview: the client advertises only status and open, and open shows a prompt
   and returns `pending-user` at once; the page opens only if the user clicks Open. The server prefers the host
   with more operations, so a connected desktop serves automation first.
