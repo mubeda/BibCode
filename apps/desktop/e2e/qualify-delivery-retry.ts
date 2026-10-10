@@ -3356,6 +3356,7 @@ export async function runDeliveryRetryQualification() {
                               ? qualifiedProviderChatScenes.length
                               : deliveryScenes.length) && assertions.length === 2,
     );
+    write("assertions", { captures, assertions });
     success = true;
   } catch (error) {
     const originalCursorFailure = readCursorOriginalFailure();

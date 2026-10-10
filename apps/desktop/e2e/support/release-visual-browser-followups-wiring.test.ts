@@ -160,6 +160,7 @@ it.each([
       deliveryThemes: ["light", "dark"],
       config: { selection: "release-visual-browser-followups" },
       check: (value: boolean) => (admitted = value),
+      write: () => {},
     });
     expect(admitted).toBe(accepted);
   },

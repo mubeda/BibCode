@@ -1249,6 +1249,14 @@ release source before treating a later run as final-source evidence. This lane
 has no automatic push trigger; a preparation result does not qualify the full
 release matrix, Playwright, or Tauri/native dialogs.
 
+The seven-name receipt allowlist has six files on success because
+`failure.json` is written only on failure. After all captures and both theme
+assertions pass the complete caller's admission, the controller republishes
+`assertions.json` before marking success. Its captures and assertions must
+exactly match the final `result.json`; an earlier incremental mirror is not
+complete evidence. Preserve stale artifacts unchanged and qualify a fresh run
+after correcting the writer.
+
 Each theme uses the existing real pairing, public project import, exact Claude
 model selection, and managed-worktree create/select/tooltip/Git identity
 checks. The same keyboard worktree opener serves the create-ref preview; its

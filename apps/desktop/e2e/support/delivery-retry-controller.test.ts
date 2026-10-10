@@ -47,6 +47,51 @@ import { gitProjectVisualScenes } from "./release-visual-git-project.ts";
 import * as CoreCapture from "./release-visual-core.ts";
 import { prepareSettingsFollowupCallerUsage } from "./release-visual-settings-followups-caller.ts";
 
+it.each(["complete", "missing-capture", "missing-theme"])(
+  "publishes the final current assertion mirror only after full caller admission: %s",
+  (mode) => {
+    const source = NodeFS.readFileSync(
+      NodePath.resolve("apps/desktop/e2e/qualify-delivery-retry.ts"),
+      "utf8",
+    );
+    const start = source.indexOf("    check(\n      captures.length ==="),
+      end = source.indexOf("    success = true;", start) + "    success = true;".length;
+    const captures = Array.from({ length: mode === "missing-capture" ? 17 : 18 }, (_, i) => ({
+        file: "original-" + i,
+      })),
+      assertions =
+        mode === "missing-theme" ? [{ theme: "light" }] : [{ theme: "light" }, { theme: "dark" }],
+      writes: unknown[] = [],
+      refused = new Error("original admission refusal");
+    const run = () =>
+      NodeVM.runInNewContext(
+        NodeModule.stripTypeScriptTypes(source.slice(start, end)) + "\nsuccess",
+        {
+          captures,
+          assertions,
+          deliveryThemes: ["light", "dark"],
+          visualScenes: Array.from({ length: 9 }),
+          config: { selection: "release-visual-core" },
+          success: false,
+          check: (value: boolean) => {
+            if (!value) throw refused;
+          },
+          write: (name: string, value: unknown) => {
+            expect(name).toBe("assertions");
+            writes.push(JSON.parse(JSON.stringify(value)));
+          },
+        },
+      );
+    if (mode === "complete") {
+      expect(run()).toBe(true);
+      expect(writes).toEqual([{ captures, assertions }]);
+    } else {
+      expect(run).toThrow(refused);
+      expect(writes).toEqual([]);
+    }
+  },
+);
+
 it.each([
   [22, 2, true],
   [20, 2, false],
@@ -75,6 +120,7 @@ it.each([
       check: (value: boolean) => {
         admitted = value;
       },
+      write: () => {},
     });
     expect(admitted).toBe(accepted);
   },
