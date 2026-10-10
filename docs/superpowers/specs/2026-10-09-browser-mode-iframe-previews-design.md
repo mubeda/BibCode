@@ -48,7 +48,9 @@ Back, Forward, and Reload work.
    with the UI origin as `targetOrigin` on load, `popstate`, `hashchange`, and
    `history.pushState`/`replaceState`, and obeys `{ command: "back" |
    "forward" | "reload" }` messages from that origin only. The panel maps the
-   reported gateway URL back to the canonical `localhost` URL. Pages whose CSP
+   reported gateway URL back to the canonical `localhost` URL. Back and Forward
+   need the Navigation API (it traverses only the frame's history; `history`
+   would move BiBCode's own tab); without it they are disabled. Pages whose CSP
    blocks it (`strict-dynamic`, nonce-only) still preview; the address bar then
    shows the last opened URL and Back/Forward are disabled with a tooltip
    ("This page doesn't allow BiBCode to follow its navigation").

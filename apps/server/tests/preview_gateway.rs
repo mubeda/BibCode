@@ -133,6 +133,59 @@ async fn ws_echo(
     })
 }
 
+/// An HTML page that forbids framing, as many dev servers' security middleware does.
+async fn framed_page() -> Response {
+    let mut response = "<!doctype html><html><head><title>App</title></head><body>hi</body></html>"
+        .into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        "text/html; charset=utf-8".parse().unwrap(),
+    );
+    headers.insert(header::X_FRAME_OPTIONS, "DENY".parse().unwrap());
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        "frame-ancestors 'none'; img-src 'self'".parse().unwrap(),
+    );
+    response
+}
+
+/// HTML the upstream compressed anyway: it must pass through untouched.
+async fn compressed_page() -> Response {
+    let mut response = vec![
+        0x1f_u8, 0x8b, 0x08, 0x00, b'<', b'h', b'e', b'a', b'd', b'>',
+    ]
+    .into_response();
+    let headers = response.headers_mut();
+    headers.insert(header::CONTENT_TYPE, "text/html".parse().unwrap());
+    headers.insert(header::CONTENT_ENCODING, "gzip".parse().unwrap());
+    response
+}
+
+/// An HTML export the app offers as a download: it must reach the user unmodified.
+async fn html_download() -> Response {
+    let mut response = "<html><head><title>Export</title></head></html>".into_response();
+    let headers = response.headers_mut();
+    headers.insert(header::CONTENT_TYPE, "text/html".parse().unwrap());
+    headers.insert(
+        header::CONTENT_DISPOSITION,
+        "attachment; filename=export.html".parse().unwrap(),
+    );
+    response
+}
+
+/// HTML that forbids intermediaries from changing it.
+async fn untransformable_page() -> Response {
+    let mut response = "<html><head><title>Signed</title></head></html>".into_response();
+    let headers = response.headers_mut();
+    headers.insert(header::CONTENT_TYPE, "text/html".parse().unwrap());
+    headers.insert(
+        header::CACHE_CONTROL,
+        "public, no-transform".parse().unwrap(),
+    );
+    response
+}
+
 async fn start_upstream() -> (SocketAddr, Upstream) {
     let upstream = Upstream::default();
     let app = Router::new()
@@ -141,6 +194,10 @@ async fn start_upstream() -> (SocketAddr, Upstream) {
         .route("/redirect", get(redirect))
         .route("/body", any(body))
         .route("/ws", get(ws_echo))
+        .route("/page", get(framed_page))
+        .route("/gz", get(compressed_page))
+        .route("/download", get(html_download))
+        .route("/signed", get(untransformable_page))
         .with_state(upstream.clone());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -287,6 +344,182 @@ fn closed_port() -> u16 {
         .local_addr()
         .unwrap()
         .port()
+}
+
+#[tokio::test]
+async fn bibcode_can_frame_previews_and_follow_their_navigation() {
+    let (upstream, _) = start_upstream().await;
+    let gateway = Gateway::default_for(upstream).await;
+    let cookie = gateway.session_cookie().await;
+
+    let page = gateway
+        .http
+        .get(format!("{}/page", gateway.base))
+        .header(header::COOKIE, &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(page.status(), 200);
+    assert!(page.headers().get(header::X_FRAME_OPTIONS).is_none());
+    assert!(
+        page.headers()
+            .get(header::CONTENT_LENGTH)
+            .is_none_or(|length| { length.to_str().unwrap().parse::<usize>().unwrap() > 70 })
+    );
+    let policies: Vec<&str> = page
+        .headers()
+        .get_all(header::CONTENT_SECURITY_POLICY)
+        .iter()
+        .map(|value| value.to_str().unwrap())
+        .collect();
+    assert_eq!(
+        policies,
+        [
+            "img-src 'self'",
+            "frame-ancestors http://127.0.0.1:* https://127.0.0.1:*"
+        ]
+    );
+    assert_eq!(
+        page.text().await.unwrap(),
+        "<!doctype html><html><head><script src=\"/__bibcode/frame.js\"></script>\
+<title>App</title></head><body>hi</body></html>"
+    );
+
+    // Compressed HTML is never rewritten.
+    let compressed = gateway
+        .http
+        .get(format!("{}/gz", gateway.base))
+        .header(header::COOKIE, &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        compressed.bytes().await.unwrap().as_ref(),
+        [0x1f, 0x8b, 0x08, 0x00, b'<', b'h', b'e', b'a', b'd', b'>']
+    );
+
+    // Downloads are never rewritten.
+    let download = gateway
+        .http
+        .get(format!("{}/download", gateway.base))
+        .header(header::COOKIE, &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        download.text().await.unwrap(),
+        "<html><head><title>Export</title></head></html>"
+    );
+
+    // `no-transform` HTML is never rewritten.
+    let signed = gateway
+        .http
+        .get(format!("{}/signed", gateway.base))
+        .header(header::COOKIE, &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        signed.text().await.unwrap(),
+        "<html><head><title>Signed</title></head></html>"
+    );
+
+    // Navigations ask the upstream for HTML it can inject into.
+    let echoed: BTreeMap<String, String> = gateway
+        .http
+        .get(format!("{}/echo", gateway.base))
+        .header(header::COOKIE, &cookie)
+        .header("sec-fetch-dest", "iframe")
+        .header(header::ACCEPT_ENCODING, "gzip, br")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(echoed["accept-encoding"], "identity");
+    // Plain-HTTP LAN pages get no Fetch Metadata; a page load still asks for HTML.
+    let echoed: BTreeMap<String, String> = gateway
+        .http
+        .get(format!("{}/echo", gateway.base))
+        .header(header::COOKIE, &cookie)
+        .header(header::ACCEPT, "text/html,application/xhtml+xml,*/*;q=0.8")
+        .header(header::ACCEPT_ENCODING, "gzip, br")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(echoed["accept-encoding"], "identity");
+    // Other requests keep their negotiation.
+    let echoed: BTreeMap<String, String> = gateway
+        .http
+        .get(format!("{}/echo", gateway.base))
+        .header(header::COOKIE, &cookie)
+        .header(header::ACCEPT, "application/json")
+        .header(header::ACCEPT_ENCODING, "gzip, br")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(echoed["accept-encoding"], "gzip, br");
+
+    // The reporter needs no session; it does nothing outside BiBCode's frame.
+    let script = gateway
+        .http
+        .get(format!("{}/__bibcode/frame.js", gateway.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(script.status(), 200);
+    assert_eq!(
+        script.headers()[header::CONTENT_TYPE],
+        "text/javascript; charset=utf-8"
+    );
+    assert!(
+        script
+            .text()
+            .await
+            .unwrap()
+            .contains("bibcode-preview-frame")
+    );
+}
+
+#[tokio::test]
+async fn bootstrap_remembers_only_a_ui_origin_on_the_gateway_host() {
+    let (upstream, _) = start_upstream().await;
+    let gateway = Gateway::default_for(upstream).await;
+    let bootstrap = |ui: &str| {
+        let url = format!(
+            "{}/__bibcode/bootstrap?cap={}&to=%2F&ui={}",
+            gateway.base,
+            gateway.capability(),
+            percent_encoding::utf8_percent_encode(ui, percent_encoding::NON_ALPHANUMERIC)
+        );
+        let http = gateway.http.clone();
+        async move { http.get(url).send().await.unwrap() }
+    };
+
+    let framed = bootstrap("http://127.0.0.1:3773").await;
+    assert_eq!(
+        framed.headers()[header::CONTENT_SECURITY_POLICY],
+        "frame-ancestors http://127.0.0.1:* https://127.0.0.1:*"
+    );
+    let page = framed.text().await.unwrap();
+    assert!(
+        page.contains(r#"sessionStorage.setItem("bibcode-ui-origin","http://127.0.0.1:3773")"#),
+        "{page}"
+    );
+
+    let foreign = bootstrap("http://evil.example:3773")
+        .await
+        .text()
+        .await
+        .unwrap();
+    assert!(!foreign.contains("sessionStorage"), "{foreign}");
 }
 
 #[tokio::test]

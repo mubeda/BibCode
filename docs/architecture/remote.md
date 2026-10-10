@@ -1151,6 +1151,31 @@ address)` gets its own listener on an ephemeral port, so two clients that
   reaches the upstream. Only after that exact match does the gateway rewrite
   `Origin` to `http://localhost:<port>` on these requests, so upstreams that
   compare `Origin` with `Host` accept them.
+- **Framing (browser mode).** Every gateway response, its own pages
+  included, carries `Content-Security-Policy: frame-ancestors http://<host>:*
+https://<host>:*` for the request's host; the upstream's `X-Frame-Options` and
+  `frame-ancestors` directives are dropped from each of its policies (its other
+  directives stay). IPv6 hosts get no gateway `frame-ancestors`, since browsers
+  don't parse IPv6 host sources; the cookie rule below still applies. Only
+  pages on the server's host may frame a preview, and a frame from another site
+  never carries the `Lax` gateway cookie. The bootstrap accepts `ui=<origin>`
+  and keeps it only when it is a bare `http`/`https` origin on that host, in the
+  frame's `sessionStorage`. `GET /__bibcode/frame.js` (no session needed) is a
+  navigation reporter: inside a frame with a stored UI origin it posts
+  `{ type: "bibcode-preview-frame", url, title, canGoBack, canGoForward }` to
+  that origin on load, `popstate`, `hashchange`, history changes, and title
+  changes, and obeys `bibcode-preview-command` back/forward/reload messages from
+  it only. Back and Forward use the Navigation API, which traverses only the
+  frame's own history; without it they are reported unavailable (the joint
+  `history` would move BiBCode's own tab). The gateway inserts the reporter right after the first `<head>` tag
+  of uncompressed `200` `text/html` responses found in the first 64 KiB
+  (outside comments, quoted attribute values, and script or style contents;
+  never in downloads or `Cache-Control: no-transform` responses, and a page
+  whose body starts before any `<head>`, or whose pre-head script uses HTML's
+  escaped script state, streams untouched)
+  (dropping `content-length`), and asks the upstream for `accept-encoding:
+identity` on page loads (document or iframe Fetch Metadata, or, on plain-HTTP
+  origins that send none, an `Accept` naming `text/html`).
 - **Forwarding.** `Host` becomes `localhost:<port>`. The gateway strips
   BiBCode's session cookie, every `bibcode-gw-*` cookie, `authorization`,
   `dpop`, and hop-by-hop headers, including `proxy-connection`. In responses
