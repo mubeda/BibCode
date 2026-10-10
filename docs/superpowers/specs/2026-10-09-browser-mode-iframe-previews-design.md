@@ -1,6 +1,6 @@
 # Browser-mode iframe previews — design
 
-Status: proposed 2026-10-09; awaiting approval.
+Status: approved 2026-10-09 (navigation reporter injected; same-host framing).
 Builds on: [preview gateway (Phase 1)](2026-10-07-internal-browser-preview-gateway-design.md)
 ("Browser mode opens gateway targets in a new top-level tab (no iframe)") and
 [SSH same-port](2026-10-09-preview-ssh-same-port-design.md). Second of the Phase 1
