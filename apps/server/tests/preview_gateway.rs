@@ -305,6 +305,24 @@ impl Gateway {
             .unwrap()
     }
 
+    /// `name=value` of a fresh gateway session cookie for a preview framed by `ui`.
+    async fn framed_session_cookie(&self, ui: &str) -> String {
+        let response = self
+            .http
+            .get(format!(
+                "{}/__bibcode/bootstrap?cap={}&to=%2F&ui={}",
+                self.base,
+                self.capability(),
+                percent_encoding::utf8_percent_encode(ui, percent_encoding::NON_ALPHANUMERIC)
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let set_cookie = response.headers()[header::SET_COOKIE].to_str().unwrap();
+        set_cookie.split(';').next().unwrap().to_owned()
+    }
+
     /// `name=value` of a fresh gateway session cookie.
     async fn session_cookie(&self) -> String {
         let response = self.bootstrap_with(&self.capability()).await;
@@ -350,7 +368,8 @@ fn closed_port() -> u16 {
 async fn bibcode_can_frame_previews_and_follow_their_navigation() {
     let (upstream, _) = start_upstream().await;
     let gateway = Gateway::default_for(upstream).await;
-    let cookie = gateway.session_cookie().await;
+    // A session opened by a browser-mode BiBCode UI, which frames the preview.
+    let cookie = gateway.framed_session_cookie("http://127.0.0.1:3773").await;
 
     let page = gateway
         .http
@@ -376,7 +395,7 @@ async fn bibcode_can_frame_previews_and_follow_their_navigation() {
         policies,
         [
             "img-src 'self'",
-            "frame-ancestors http://127.0.0.1:* https://127.0.0.1:*"
+            "frame-ancestors 'self' http://127.0.0.1:3773"
         ]
     );
     assert_eq!(
@@ -489,6 +508,129 @@ async fn bibcode_can_frame_previews_and_follow_their_navigation() {
 }
 
 #[tokio::test]
+async fn previews_not_opened_by_a_framing_ui_keep_the_upstream_framing_rules() {
+    let (upstream, _) = start_upstream().await;
+    let gateway = Gateway::default_for(upstream).await;
+    // Desktop views and system-browser tabs bootstrap without a UI origin.
+    let cookie = gateway.session_cookie().await;
+
+    let page = gateway
+        .http
+        .get(format!("{}/page", gateway.base))
+        .header(header::COOKIE, &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(page.headers()[header::X_FRAME_OPTIONS], "DENY");
+    let policies: Vec<&str> = page
+        .headers()
+        .get_all(header::CONTENT_SECURITY_POLICY)
+        .iter()
+        .map(|value| value.to_str().unwrap())
+        .collect();
+    // The upstream's rules stay; only the preview's own pages may frame it.
+    assert_eq!(
+        policies,
+        [
+            "frame-ancestors 'none'; img-src 'self'",
+            "frame-ancestors 'self'"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn an_expired_preview_explains_itself_inside_the_frame() {
+    let (upstream, _) = start_upstream().await;
+    let gateway = Gateway::default_for(upstream).await;
+    // The session is gone (expired or revoked): its UI origin is unknown now.
+    let expired = gateway
+        .http
+        .get(format!("{}/page", gateway.base))
+        .header(header::COOKIE, "bibcode-gw-1=gone")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(expired.status(), 401);
+    // A gateway-owned page carries no upstream content, so any frame may show it.
+    assert!(
+        expired
+            .headers()
+            .get(header::CONTENT_SECURITY_POLICY)
+            .is_none()
+    );
+    assert!(expired.headers().get(header::X_FRAME_OPTIONS).is_none());
+}
+
+#[tokio::test]
+async fn framing_rules_vary_with_the_gateway_session() {
+    let (upstream, _) = start_upstream().await;
+    let gateway = Gateway::default_for(upstream).await;
+    let cookie = gateway.session_cookie().await;
+    let page = gateway
+        .http
+        .get(format!("{}/page", gateway.base))
+        .header(header::COOKIE, &cookie)
+        .send()
+        .await
+        .unwrap();
+    let vary: Vec<&str> = page
+        .headers()
+        .get_all(header::VARY)
+        .iter()
+        .map(|value| value.to_str().unwrap())
+        .collect();
+    assert!(
+        vary.iter()
+            .any(|value| value.eq_ignore_ascii_case("cookie")),
+        "{vary:?}"
+    );
+}
+
+#[tokio::test]
+async fn opening_a_framed_preview_in_a_tab_keeps_the_frame_working() {
+    let (upstream, _) = start_upstream().await;
+    let gateway = Gateway::default_for(upstream).await;
+    let framed = gateway.framed_session_cookie("http://127.0.0.1:3773").await;
+
+    // The same browser opens the target in a tab: no `ui`, the shared cookie is replaced.
+    let response = gateway
+        .http
+        .get(format!(
+            "{}/__bibcode/bootstrap?cap={}&to=%2F",
+            gateway.base,
+            gateway.capability()
+        ))
+        .header(header::COOKIE, &framed)
+        .send()
+        .await
+        .unwrap();
+    let replaced = response.headers()[header::SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+
+    let page = gateway
+        .http
+        .get(format!("{}/page", gateway.base))
+        .header(header::COOKIE, &replaced)
+        .send()
+        .await
+        .unwrap();
+    assert!(page.headers().get(header::X_FRAME_OPTIONS).is_none());
+    assert_eq!(
+        page.headers()
+            .get_all(header::CONTENT_SECURITY_POLICY)
+            .iter()
+            .next_back()
+            .unwrap(),
+        "frame-ancestors 'self' http://127.0.0.1:3773"
+    );
+}
+
+#[tokio::test]
 async fn bootstrap_remembers_only_a_ui_origin_on_the_gateway_host() {
     let (upstream, _) = start_upstream().await;
     let gateway = Gateway::default_for(upstream).await;
@@ -506,7 +648,7 @@ async fn bootstrap_remembers_only_a_ui_origin_on_the_gateway_host() {
     let framed = bootstrap("http://127.0.0.1:3773").await;
     assert_eq!(
         framed.headers()[header::CONTENT_SECURITY_POLICY],
-        "frame-ancestors http://127.0.0.1:* https://127.0.0.1:*"
+        "frame-ancestors 'self' http://127.0.0.1:3773"
     );
     let page = framed.text().await.unwrap();
     assert!(
@@ -514,11 +656,16 @@ async fn bootstrap_remembers_only_a_ui_origin_on_the_gateway_host() {
         "{page}"
     );
 
-    let foreign = bootstrap("http://evil.example:3773")
-        .await
-        .text()
-        .await
-        .unwrap();
+    let foreign = bootstrap("http://evil.example:3773").await;
+    // A foreign UI gains no session origin: the bootstrap is a gateway page, and the
+    // upstream pages it leads to answer `frame-ancestors 'self'`.
+    assert!(
+        foreign
+            .headers()
+            .get(header::CONTENT_SECURITY_POLICY)
+            .is_none()
+    );
+    let foreign = foreign.text().await.unwrap();
     assert!(!foreign.contains("sessionStorage"), "{foreign}");
 }
 

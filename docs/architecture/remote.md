@@ -1151,16 +1151,27 @@ address)` gets its own listener on an ephemeral port, so two clients that
   reaches the upstream. Only after that exact match does the gateway rewrite
   `Origin` to `http://localhost:<port>` on these requests, so upstreams that
   compare `Origin` with `Host` accept them.
-- **Framing (browser mode).** Every gateway response, its own pages
-  included, carries `Content-Security-Policy: frame-ancestors http://<host>:*
-https://<host>:*` for the request's host; the upstream's `X-Frame-Options` and
-  `frame-ancestors` directives are dropped from each of its policies (its other
-  directives stay). IPv6 hosts get no gateway `frame-ancestors`, since browsers
-  don't parse IPv6 host sources; the cookie rule below still applies. Only
+- **Framing (browser mode).** The bootstrap accepts `ui=<origin>` and keeps it
+  only when it is a bare `http`/`https` origin on the gateway's own host,
+  canonicalized; the gateway session remembers it and the bootstrap page stores
+  it in the frame's `sessionStorage`. Every response for such a session (and its
+  bootstrap) carries `Content-Security-Policy: frame-ancestors 'self' <that origin>`
+  (`'self'` for frames nested in the preview),
+  and the upstream's `X-Frame-Options` and `frame-ancestors` directives are
+  dropped from each of its policies (its other directives stay, byte for byte),
+  so only that BiBCode UI can frame the preview. IPv6 origins get no gateway
+  `frame-ancestors`, since browsers don't parse IPv6 host sources; a frame from
+  another site never carries the `Lax` gateway cookie. Sessions without a UI
+  origin (desktop views, system-browser tabs) keep the upstream's framing rules
+  and add `frame-ancestors 'self'`, so a same-site sibling cannot frame them
+  with the gateway cookie. A bootstrap without `ui` keeps the UI origin of the
+  browser's current session for that target, so opening a framed preview in a
+  tab does not break the frame. The gateway's own pages (expired link, nothing
+  listening) carry no upstream content, so without a session origin they get no
+  framing restriction and still explain themselves inside a frame. Every
+  response varies by `Cookie`. Only
   pages on the server's host may frame a preview, and a frame from another site
-  never carries the `Lax` gateway cookie. The bootstrap accepts `ui=<origin>`
-  and keeps it only when it is a bare `http`/`https` origin on that host, in the
-  frame's `sessionStorage`. `GET /__bibcode/frame.js` (no session needed) is a
+  never carries the `Lax` gateway cookie. `GET /__bibcode/frame.js` (no session needed) is a
   navigation reporter: inside a frame with a stored UI origin it posts
   `{ type: "bibcode-preview-frame", url, title, canGoBack, canGoForward }` to
   that origin on load, `popstate`, `hashchange`, history changes, and title

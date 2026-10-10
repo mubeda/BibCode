@@ -75,25 +75,22 @@ pub const FRAME_SCRIPT: &str = r#"(() => {
 })();
 "#;
 
-/// The request's host without its port, as written in the `Host` header.
-fn host_name(host_header: &str) -> &str {
-    if host_header.starts_with('[')
-        && let Some(end) = host_header.find(']')
-    {
-        return &host_header[..=end];
-    }
-    host_header
-        .rsplit_once(':')
-        .filter(|(_, port)| !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()))
-        .map_or(host_header, |(host, _)| host)
+/// Only the BiBCode UI that opened the preview, and the preview's own pages
+/// (frames nested inside it), may frame it. `None` for an IPv6 origin: browsers
+/// don't parse IPv6 host sources, so the gateway cookie (which another site's
+/// frame never carries) is the only guard there.
+pub fn frame_ancestors_policy(ui_origin: &str) -> Option<String> {
+    (!ui_origin.contains("://[")).then(|| format!("frame-ancestors 'self' {ui_origin}"))
 }
 
-/// Only pages on the gateway's own host may frame it; they still need the
-/// gateway cookie, which another site's frame never carries. `None` for IPv6
-/// hosts: browsers don't parse IPv6 host sources, so that cookie is the guard.
-pub fn frame_ancestors_policy(host_header: &str) -> Option<String> {
-    let host = host_name(host_header);
-    (!host.starts_with('[')).then(|| format!("frame-ancestors http://{host}:* https://{host}:*"))
+/// For a preview no BiBCode UI frames (a desktop view, a system-browser tab):
+/// the upstream's own rules stay, and only the preview's own pages may frame it,
+/// so a same-site sibling cannot frame it with the gateway cookie.
+pub fn apply_self_only_framing(headers: &mut HeaderMap) {
+    headers.append(
+        CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("frame-ancestors 'self'"),
+    );
 }
 
 /// An upstream CSP header value without `frame-ancestors` directives; one value
@@ -132,8 +129,9 @@ pub fn strip_frame_ancestors(value: &[u8]) -> Option<Vec<u8>> {
     (!policies.is_empty()).then(|| policies.join(b", ".as_slice()))
 }
 
-/// Replaces the upstream's framing restrictions with the gateway's policy.
-pub fn apply_frame_policy(headers: &mut HeaderMap, host_header: &str) {
+/// Lets `ui_origin` (a validated BiBCode UI origin) frame the response:
+/// replaces the upstream's framing restrictions with the gateway's policy.
+pub fn apply_frame_policy(headers: &mut HeaderMap, ui_origin: &str) {
     headers.remove(X_FRAME_OPTIONS);
     let policies: Vec<HeaderValue> = headers
         .get_all(CONTENT_SECURITY_POLICY)
@@ -145,7 +143,7 @@ pub fn apply_frame_policy(headers: &mut HeaderMap, host_header: &str) {
     for policy in policies {
         headers.append(CONTENT_SECURITY_POLICY, policy);
     }
-    if let Some(policy) = frame_ancestors_policy(host_header)
+    if let Some(policy) = frame_ancestors_policy(ui_origin)
         && let Ok(policy) = HeaderValue::from_str(&policy)
     {
         headers.append(CONTENT_SECURITY_POLICY, policy);
@@ -431,17 +429,13 @@ mod tests {
     const TAG: &str = r#"<script src="/__bibcode/frame.js"></script>"#;
 
     #[test]
-    fn frame_ancestors_allow_only_the_gateway_host() {
+    fn frame_ancestors_allow_only_the_ui_that_opened_the_preview() {
         assert_eq!(
-            frame_ancestors_policy("box.lan:41000").as_deref(),
-            Some("frame-ancestors http://box.lan:* https://box.lan:*")
+            frame_ancestors_policy("http://box.lan:3773").as_deref(),
+            Some("frame-ancestors 'self' http://box.lan:3773")
         );
         // Browsers don't parse IPv6 host sources; the cookie alone keeps other sites out.
-        assert_eq!(frame_ancestors_policy("[::1]:41000"), None);
-        assert_eq!(
-            frame_ancestors_policy("192.168.1.5").as_deref(),
-            Some("frame-ancestors http://192.168.1.5:* https://192.168.1.5:*")
-        );
+        assert_eq!(frame_ancestors_policy("http://[::1]:3773"), None);
     }
 
     #[test]
@@ -475,7 +469,7 @@ mod tests {
             )
             .unwrap(),
         );
-        apply_frame_policy(&mut headers, "box.lan:41000");
+        apply_frame_policy(&mut headers, "http://box.lan:3773");
         let policies: Vec<&[u8]> = headers
             .get_all(CONTENT_SECURITY_POLICY)
             .iter()
@@ -485,7 +479,7 @@ mod tests {
             policies,
             [
                 "script-src 'none'; report-uri /résultats".as_bytes(),
-                b"frame-ancestors http://box.lan:* https://box.lan:*".as_slice()
+                b"frame-ancestors 'self' http://box.lan:3773".as_slice()
             ]
         );
     }
@@ -494,7 +488,7 @@ mod tests {
     fn ipv6_hosts_get_no_gateway_frame_ancestors() {
         let mut headers = HeaderMap::new();
         headers.insert(X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
-        apply_frame_policy(&mut headers, "[fd00::1]:41000");
+        apply_frame_policy(&mut headers, "http://[fd00::1]:3773");
         assert!(headers.get(X_FRAME_OPTIONS).is_none());
         assert!(headers.get(CONTENT_SECURITY_POLICY).is_none());
     }
@@ -511,7 +505,7 @@ mod tests {
             CONTENT_SECURITY_POLICY,
             HeaderValue::from_static("frame-ancestors 'self'"),
         );
-        apply_frame_policy(&mut headers, "box.lan:41000");
+        apply_frame_policy(&mut headers, "http://box.lan:3773");
         assert!(headers.get(X_FRAME_OPTIONS).is_none());
         let policies: Vec<&str> = headers
             .get_all(CONTENT_SECURITY_POLICY)
@@ -520,10 +514,7 @@ mod tests {
             .collect();
         assert_eq!(
             policies,
-            [
-                "img-src *",
-                "frame-ancestors http://box.lan:* https://box.lan:*"
-            ]
+            ["img-src *", "frame-ancestors 'self' http://box.lan:3773"]
         );
     }
 
