@@ -312,7 +312,9 @@ const remoteRetentionFixture = async () => {
     stdout: "fixture-private-returned-token",
     stderr: "private receipt write failed",
   }));
-  const copyBoundedEvidence = vi.fn(async () => {});
+  const copyBoundedEvidence = vi.fn(
+    async (_input: { readonly withholdLanes?: ReadonlyArray<string> }): Promise<void> => {},
+  );
   const cleanup = vi.fn(async () => {});
   const context = NodeVM.createContext({
     NodeFS,
