@@ -130,6 +130,20 @@ pub struct ThreadMessageInput {
     pub attachments: Vec<Value>,
 }
 
+/// One historical message appended by `thread.history.import`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ImportedThreadMessage {
+    #[serde(rename = "messageId")]
+    pub message_id: String,
+    pub role: String,
+    pub text: String,
+    #[serde(rename = "createdAt")]
+    pub created_at: String,
+}
+
+/// The most messages one `thread.history.import` command appends.
+pub const MAX_IMPORTED_THREAD_MESSAGES: usize = 200;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionInput {
     #[serde(rename = "threadId")]
@@ -444,6 +458,15 @@ pub enum OrchestrationCommand {
         worktree_path: Option<String>,
         #[serde(rename = "createdAt")]
         created_at: String,
+    },
+    /// Server-internal: appends an imported CLI session's transcript without starting a turn.
+    #[serde(rename = "thread.history.import")]
+    ThreadHistoryImport {
+        #[serde(rename = "commandId")]
+        command_id: String,
+        #[serde(rename = "threadId")]
+        thread_id: String,
+        messages: Vec<ImportedThreadMessage>,
     },
     #[serde(rename = "thread.delete")]
     ThreadDelete {
@@ -1063,6 +1086,7 @@ struct ProjectState {
 struct ThreadState {
     project_id: String,
     kind: String,
+    host_thread_id: Option<String>,
     runtime_mode: String,
     interaction_mode: String,
     branch: Option<String>,
@@ -2723,6 +2747,8 @@ fn spawn_worker(
                             let wake_delivery = match &command {
                                 OrchestrationCommand::ThreadSessionSet { session, .. } => session.status == "ready",
                                 OrchestrationCommand::ThreadTurnPromote { .. } | OrchestrationCommand::ThreadTurnSteer { .. } | OrchestrationCommand::ThreadTurnDeliveryResolve { .. } => true,
+                                // A reopened chat panel's queue becomes promotable again.
+                                OrchestrationCommand::ThreadUnarchive { .. } => true,
                                 OrchestrationCommand::ThreadActivityAppend { activity, .. } => matches!(activity.kind.as_str(), "approval.resolved" | "user-input.resolved" | "provider.user-input.respond.failed"),
                                 _ => false,
                             };
@@ -3908,15 +3934,30 @@ async fn plan_command(
                     ),
                 );
             }
-            Ok(vec![make_event(
-                "thread.deleted",
-                "thread",
-                thread_id,
-                occurred_at,
-                command_id,
-                metadata,
-                json!({"threadId":thread_id,"deletedAt":occurred_at}),
-            )])
+            // Chat panels (live or closed, so archived) go with their host thread,
+            // in stable id order (the model is a BTreeMap), before the host itself.
+            Ok(model
+                .threads
+                .iter()
+                .filter(|(_, candidate)| {
+                    candidate.kind == "panel"
+                        && candidate.deleted_at.is_none()
+                        && candidate.host_thread_id.as_deref() == Some(thread_id.as_str())
+                })
+                .map(|(panel_id, _)| panel_id)
+                .chain([thread_id])
+                .map(|deleted_id| {
+                    make_event(
+                        "thread.deleted",
+                        "thread",
+                        deleted_id,
+                        occurred_at,
+                        command_id,
+                        metadata.clone(),
+                        json!({"threadId":deleted_id,"deletedAt":occurred_at}),
+                    )
+                })
+                .collect())
         }
         OrchestrationCommand::ThreadArchive {
             command_id,
@@ -4105,6 +4146,7 @@ async fn plan_command(
                         ThreadState {
                             project_id: create.project_id.clone(),
                             kind: "workspace".to_owned(),
+                            host_thread_id: None,
                             runtime_mode: create.runtime_mode.clone(),
                             interaction_mode: create.interaction_mode.clone(),
                             branch: create.branch.clone(),
@@ -4525,6 +4567,65 @@ async fn plan_command(
             metadata,
             json!({"threadId":thread_id,"turnCount":turn_count}),
         ),
+        OrchestrationCommand::ThreadHistoryImport {
+            command_id,
+            thread_id,
+            messages,
+        } => {
+            require_thread(model, command, thread_id)?;
+            // Checked by the engine worker, so a turn admitted after the importer's own check
+            // still keeps CLI history out of the thread's new conversation.
+            if repositories
+                .get_thread(thread_id.clone())
+                .await
+                .map_err(wrap_persistence)?
+                .is_some_and(|thread| {
+                    thread.latest_turn_id.is_some() || thread.latest_user_message_at.is_some()
+                })
+            {
+                return invariant(
+                    command,
+                    "This thread was used before its history import.".to_owned(),
+                );
+            }
+            if messages.is_empty() || messages.len() > MAX_IMPORTED_THREAD_MESSAGES {
+                return invariant(
+                    command,
+                    format!(
+                        "A history import carries 1 to {MAX_IMPORTED_THREAD_MESSAGES} messages."
+                    ),
+                );
+            }
+            if let Some(message) = messages
+                .iter()
+                .find(|message| !matches!(message.role.as_str(), "user" | "assistant"))
+            {
+                return invariant(
+                    command,
+                    format!(
+                        "Imported message '{}' has unsupported role '{}'.",
+                        message.message_id, message.role
+                    ),
+                );
+            }
+            // Marks history so effects take no checkpoint baseline for a turn that never ran.
+            let mut metadata = metadata;
+            metadata["historyImport"] = json!(true);
+            Ok(messages
+                .iter()
+                .map(|message| {
+                    make_event(
+                        "thread.message-sent",
+                        "thread",
+                        thread_id,
+                        &message.created_at,
+                        command_id,
+                        metadata.clone(),
+                        json!({"threadId":thread_id,"messageId":message.message_id,"role":message.role,"text":message.text,"attachments":[],"turnId":null,"streaming":false,"createdAt":message.created_at,"updatedAt":message.created_at}),
+                    )
+                })
+                .collect())
+        }
     }
 }
 
@@ -5264,6 +5365,10 @@ fn apply_to_model(model: &mut CommandModel, events: &VecDeque<OrchestrationEvent
                                 .and_then(Value::as_str)
                                 .unwrap_or("workspace")
                                 .to_owned(),
+                            host_thread_id: payload
+                                .get("hostThreadId")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned),
                             runtime_mode: payload
                                 .get("runtimeMode")
                                 .and_then(Value::as_str)
@@ -5453,6 +5558,7 @@ async fn load_command_model(
                 ThreadState {
                     project_id: thread.project_id.clone(),
                     kind: thread.kind.clone(),
+                    host_thread_id: thread.host_thread_id.clone(),
                     runtime_mode: thread.runtime_mode.clone(),
                     interaction_mode: thread.interaction_mode.clone(),
                     branch: thread.branch.clone(),
@@ -6592,6 +6698,7 @@ impl OrchestrationCommand {
             Self::WorktreeDetachResolved { .. } => "worktree.detach-resolved",
             Self::WorktreeBranchReconcileResolved { .. } => "worktree.branch-reconcile-resolved",
             Self::ThreadCreate { .. } => "thread.create",
+            Self::ThreadHistoryImport { .. } => "thread.history.import",
             Self::ThreadDelete { .. } => "thread.delete",
             Self::ThreadArchive { .. } => "thread.archive",
             Self::ThreadUnarchive { .. } => "thread.unarchive",
@@ -6627,6 +6734,7 @@ impl OrchestrationCommand {
             | Self::WorktreeDetachResolved { command_id, .. }
             | Self::WorktreeBranchReconcileResolved { command_id, .. }
             | Self::ThreadCreate { command_id, .. }
+            | Self::ThreadHistoryImport { command_id, .. }
             | Self::ThreadDelete { command_id, .. }
             | Self::ThreadArchive { command_id, .. }
             | Self::ThreadUnarchive { command_id, .. }
@@ -6660,6 +6768,7 @@ impl OrchestrationCommand {
             | Self::WorktreeAdoptResolved { .. }
             | Self::WorktreeDetachResolved { .. }
             | Self::WorktreeBranchReconcileResolved { .. }
+            | Self::ThreadHistoryImport { .. }
             | Self::ThreadDelete { .. }
             | Self::ThreadArchive { .. }
             | Self::ThreadUnarchive { .. }
@@ -6697,6 +6806,7 @@ impl OrchestrationCommand {
             Self::WorktreeDetachResolved { project_id, .. } => ("project", project_id),
             Self::WorktreeBranchReconcileResolved { thread_id, .. } => ("thread", thread_id),
             Self::ThreadCreate { thread_id, .. }
+            | Self::ThreadHistoryImport { thread_id, .. }
             | Self::ThreadDelete { thread_id, .. }
             | Self::ThreadArchive { thread_id, .. }
             | Self::ThreadUnarchive { thread_id, .. }
@@ -6730,6 +6840,7 @@ impl OrchestrationCommand {
                 | Self::WorktreeAdoptResolved { .. }
                 | Self::WorktreeDetachResolved { .. }
                 | Self::WorktreeBranchReconcileResolved { .. }
+                | Self::ThreadHistoryImport { .. }
         )
     }
 }
@@ -7252,6 +7363,120 @@ mod tests {
             assert_eq!(
                 engine.read_events(0).await.expect("events").len(),
                 event_count
+            );
+            engine.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn thread_delete_cascades_to_live_and_archived_host_panels() {
+            let engine = detach_engine().await;
+            for (id, kind, host) in [
+                ("host", "workspace", None),
+                ("other-host", "workspace", None),
+                ("panel-live", "panel", Some("host")),
+                ("panel-archived", "panel", Some("host")),
+                ("panel-gone", "panel", Some("host")),
+                ("other-panel", "panel", Some("other-host")),
+            ] {
+                engine
+                    .dispatch(OrchestrationCommand::ThreadCreate {
+                        command_id: format!("create-{id}"),
+                        thread_id: id.to_owned(),
+                        project_id: PROJECT_ID.to_owned(),
+                        title: id.to_owned(),
+                        kind: Some(kind.to_owned()),
+                        host_thread_id: host.map(str::to_owned),
+                        model_selection: json!({"instanceId":"codex","model":"gpt-5"}),
+                        runtime_mode: "full-access".to_owned(),
+                        interaction_mode: "default".to_owned(),
+                        branch: None,
+                        worktree_path: None,
+                        created_at: "2026-10-08T00:00:01Z".to_owned(),
+                    })
+                    .await
+                    .expect("thread");
+            }
+            engine
+                .dispatch(OrchestrationCommand::ThreadArchive {
+                    command_id: "archive-panel".into(),
+                    thread_id: "panel-archived".into(),
+                })
+                .await
+                .expect("archive");
+            engine
+                .dispatch(OrchestrationCommand::ThreadDelete {
+                    command_id: "delete-panel-gone".into(),
+                    thread_id: "panel-gone".into(),
+                })
+                .await
+                .expect("delete panel");
+            engine
+                .repositories()
+                .upsert_provider_session_runtime(crate::persistence::ProviderSessionRuntime {
+                    thread_id: "panel-archived".into(),
+                    provider_name: "codex".into(),
+                    provider_instance_id: Some("codex".into()),
+                    adapter_key: "codex-app-server".into(),
+                    runtime_mode: "full-access".into(),
+                    status: "suspended".into(),
+                    last_seen_at: "2026-10-08T00:00:02Z".into(),
+                    resume_cursor: Some(json!({"threadId":"panel-archived"})),
+                    runtime_payload: None,
+                })
+                .await
+                .unwrap();
+
+            engine
+                .dispatch(OrchestrationCommand::ThreadDelete {
+                    command_id: "delete-host".into(),
+                    thread_id: "host".into(),
+                })
+                .await
+                .expect("delete host");
+
+            let events = engine
+                .read_events(0)
+                .await
+                .expect("events")
+                .into_iter()
+                .filter(|event| event.event.command_id.as_deref() == Some("delete-host"))
+                .map(|event| (event.event.event_type, event.event.aggregate_id))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                events,
+                vec![
+                    ("thread.deleted".to_owned(), "panel-archived".to_owned()),
+                    ("thread.deleted".to_owned(), "panel-live".to_owned()),
+                    ("thread.deleted".to_owned(), "host".to_owned()),
+                ]
+            );
+            let snapshot = load_snapshot(&engine.repositories())
+                .await
+                .expect("snapshot");
+            for (thread_id, deleted) in [
+                ("panel-archived", true),
+                ("panel-live", true),
+                ("host", true),
+                ("other-host", false),
+                ("other-panel", false),
+            ] {
+                assert_eq!(
+                    snapshot
+                        .threads
+                        .iter()
+                        .find(|thread| thread.thread_id == thread_id)
+                        .map(|thread| thread.deleted_at.is_some()),
+                    Some(deleted),
+                    "{thread_id} deleted"
+                );
+            }
+            assert!(
+                engine
+                    .repositories()
+                    .get_provider_session_runtime("panel-archived".into())
+                    .await
+                    .unwrap()
+                    .is_none()
             );
             engine.shutdown().await;
         }
@@ -11305,6 +11530,53 @@ mod tests {
             ["activity-other-turn"]
         );
         reopened.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn history_import_refuses_a_thread_that_already_started_a_turn() {
+        const CREATED_AT: &str = "2026-10-08T10:00:00.000Z";
+        let database = Database::open_in_memory().await.expect("database");
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("migrations");
+        let engine = OrchestrationEngine::start(database, EngineOptions::default())
+            .await
+            .expect("engine");
+        for value in [
+            json!({"type":"project.create","commandId":"project","projectId":"p1","title":"P","workspaceRoot":"C:/repo","createdAt":CREATED_AT}),
+            json!({"type":"thread.create","commandId":"used","threadId":"used","projectId":"p1","title":"Used","modelSelection":{"instanceId":"codex","model":"gpt-5"},"runtimeMode":"full-access","createdAt":CREATED_AT}),
+            json!({"type":"thread.create","commandId":"fresh","threadId":"fresh","projectId":"p1","title":"Fresh","modelSelection":{"instanceId":"codex","model":"gpt-5"},"runtimeMode":"full-access","createdAt":CREATED_AT}),
+            // Another client starts a turn before the import's history lands.
+            json!({"type":"thread.turn.start","commandId":"turn","threadId":"used","message":{"messageId":"m-user","role":"user","text":"hello","attachments":[]},"createdAt":CREATED_AT}),
+        ] {
+            engine
+                .dispatch(serde_json::from_value(value).unwrap())
+                .await
+                .expect("setup command");
+        }
+        let import = |thread_id: &str| OrchestrationCommand::ThreadHistoryImport {
+            command_id: format!("{thread_id}:history"),
+            thread_id: thread_id.to_owned(),
+            messages: vec![ImportedThreadMessage {
+                message_id: format!("{thread_id}:000000"),
+                role: "user".to_owned(),
+                text: "from the CLI".to_owned(),
+                created_at: CREATED_AT.to_owned(),
+            }],
+        };
+        assert!(matches!(
+            engine.dispatch(import("used")).await,
+            Err(OrchestrationError::Invariant { .. })
+        ));
+        engine
+            .dispatch(import("fresh"))
+            .await
+            .expect("an unused thread accepts its history");
+        engine.shutdown().await;
     }
 
     #[tokio::test]

@@ -66,6 +66,12 @@ vi.mock("./components/preview/PreviewAutomationHosts", () => ({
 vi.mock("./components/preview/PreviewNewWindowRouter", () => ({
   PreviewNewWindowRouter: () => null,
 }));
+vi.mock("./components/preview/OpenRequestRouter", () => ({
+  OpenRequestRouter: () => null,
+}));
+vi.mock("./components/preview/OpenPromptBanner", () => ({
+  OpenPromptBanner: () => null,
+}));
 vi.mock("./components/settings/UpdateServerDialog", () => ({
   RemoteUpdateConfirmationCoordinator: () => null,
 }));
@@ -484,5 +490,112 @@ describe("AppRoot thread lifecycle reconciliation", () => {
     expect(useCenterPanelStore.getState().byThreadKey[scopedThreadKey(ARCHIVED_REF)]).toBeDefined();
     expect(useRightPanelStore.getState().byThreadKey[scopedThreadKey(ARCHIVED_REF)]).toBeDefined();
     expect(useCenterPanelStore.getState().byThreadKey[scopedThreadKey(DRAFT_REF)]).toBeDefined();
+  });
+  it("drops a chat panel tab adopted from another client once that panel is archived", async () => {
+    const PANEL_ID = ThreadId.make("remote-panel-thread");
+    const shellThread = (id: ThreadId, extra: Record<string, unknown> = {}) =>
+      ({
+        id,
+        archivedAt: null,
+        title: "Host",
+        ...extra,
+      }) as OrchestrationShellSnapshot["threads"][number];
+    const host = shellThread(HOST_ID, { kind: "workspace" });
+    const panel = shellThread(PANEL_ID, {
+      kind: "panel",
+      hostThreadId: HOST_ID,
+      title: "Panel — Claude",
+    });
+    const withThreads = (
+      snapshotSequence: number,
+      threads: OrchestrationShellSnapshot["threads"],
+    ): OrchestrationShellSnapshot => ({ ...snapshot(snapshotSequence, []), threads });
+    const hostSurfaces = () =>
+      selectThreadCenterPanelState(useCenterPanelStore.getState().byThreadKey, HOST_REF).surfaces;
+
+    publishShellState(ENVIRONMENT_ID, shellState("live", withThreads(60, [host, panel])));
+    h.archivedStates.set(ENVIRONMENT_ID, {
+      snapshots: [{ environmentId: ENVIRONMENT_ID, snapshot: snapshot(60, []) }],
+      error: null,
+      isLoading: false,
+    });
+    await act(async () => root.render(<AppRoot router={{} as AppRouter} />));
+    expect(hostSurfaces()).toContainEqual(
+      expect.objectContaining({ kind: "chat", threadId: PANEL_ID, providerLabel: "Claude" }),
+    );
+
+    h.archivedStates.set(ENVIRONMENT_ID, {
+      snapshots: [
+        {
+          environmentId: ENVIRONMENT_ID,
+          snapshot: withThreads(61, [{ ...panel, archivedAt: "2026-10-08T00:00:00.000Z" }]),
+        },
+      ],
+      error: null,
+      isLoading: false,
+    });
+    await act(async () => {
+      publishShellState(ENVIRONMENT_ID, shellState("live", withThreads(61, [host])));
+      root.render(<AppRoot router={{} as AppRouter} />);
+    });
+
+    expect(hostSurfaces()).not.toContainEqual(
+      expect.objectContaining({ kind: "chat", threadId: PANEL_ID }),
+    );
+  });
+  it("drops a persisted tab whose chat panel was closed while this client was away", async () => {
+    const PANEL_ID = ThreadId.make("panel-closed-elsewhere");
+    const RESERVED_ID = ThreadId.make("panel-being-reopened");
+    const shellThread = (id: ThreadId, extra: Record<string, unknown> = {}) =>
+      ({
+        id,
+        archivedAt: null,
+        title: "Host",
+        ...extra,
+      }) as OrchestrationShellSnapshot["threads"][number];
+    const archivedPanel = (id: ThreadId) =>
+      shellThread(id, {
+        kind: "panel",
+        hostThreadId: HOST_ID,
+        title: "Panel — Codex",
+        archivedAt: "2026-10-08T00:00:00.000Z",
+      });
+    // The layout persisted before another client closed (archived) the panel.
+    useCenterPanelStore.getState().openChatPanel(HOST_REF, PANEL_ID, "Codex");
+    // A reopen in flight keeps its reserved tab until the panel is live again.
+    useCenterPanelStore.getState().reserveChatPanel(HOST_REF, RESERVED_ID, "Codex");
+    publishShellState(
+      ENVIRONMENT_ID,
+      shellState("live", {
+        ...snapshot(70, []),
+        threads: [shellThread(HOST_ID, { kind: "workspace" })],
+      }),
+    );
+    h.archivedStates.set(ENVIRONMENT_ID, {
+      snapshots: [
+        {
+          environmentId: ENVIRONMENT_ID,
+          snapshot: {
+            ...snapshot(70, []),
+            threads: [archivedPanel(PANEL_ID), archivedPanel(RESERVED_ID)],
+          },
+        },
+      ],
+      error: null,
+      isLoading: false,
+    });
+
+    await act(async () => root.render(<AppRoot router={{} as AppRouter} />));
+
+    const surfaces = selectThreadCenterPanelState(
+      useCenterPanelStore.getState().byThreadKey,
+      HOST_REF,
+    ).surfaces;
+    expect(surfaces).not.toContainEqual(
+      expect.objectContaining({ kind: "chat", threadId: PANEL_ID }),
+    );
+    expect(surfaces).toContainEqual(
+      expect.objectContaining({ kind: "chat", threadId: RESERVED_ID }),
+    );
   });
 });

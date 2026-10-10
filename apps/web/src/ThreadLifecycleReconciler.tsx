@@ -120,7 +120,10 @@ function EnvironmentThreadLifecycleReconciler({
       lastArchivedRefreshSequenceRef.current = null;
       const retainedThreadIds = new Set<ThreadId>([
         ...liveSnapshot.threads.map((thread) => thread.id),
-        ...archivedSnapshot.threads.map((thread) => thread.id),
+        // A closed chat panel is archived and keeps no tab; reopening reserves a new one.
+        ...archivedSnapshot.threads.flatMap((thread) =>
+          thread.kind === "panel" ? [] : [thread.id],
+        ),
         ...draftThreadIds,
       ]);
       reconcileThreadPanelState(environmentId, retainedThreadIds);

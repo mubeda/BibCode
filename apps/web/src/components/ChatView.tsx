@@ -4352,6 +4352,14 @@ function ChatViewContent(props: ChatViewProps) {
       workspaceUnavailable,
     ],
   );
+  const reopenCenterChatPanel = centerPanelActions.reopenChatPanel;
+  const handleReopenChatPanel = useCallback(
+    (threadId: ThreadId, providerLabel: string) => {
+      if (!activeThreadRef) return;
+      void reopenCenterChatPanel(activeThreadRef, threadId, providerLabel);
+    },
+    [activeThreadRef, reopenCenterChatPanel],
+  );
   const openCenterTerminal = useCallback(
     async (
       placement: CenterTerminalPlacement,
@@ -6634,6 +6642,7 @@ function ChatViewContent(props: ChatViewProps) {
           mode="embedded"
           threadRef={activeThreadRef}
           gitCwd={gitCwd}
+          projectRef={activeProjectRef}
           workspaceUnavailable={workspaceUnavailable}
         />
       </Suspense>
@@ -6973,6 +6982,7 @@ function ChatViewContent(props: ChatViewProps) {
                   settings={settings}
                   canCreatePanel={centerPanelLaunchContext !== null}
                   onCreateChatPanel={handleCreateChatPanel}
+                  onReopenChatPanel={handleReopenChatPanel}
                   onOpenTerminalPanel={handleOpenTerminalPanel}
                   onOpenProviderTerminalPanel={handleOpenProviderTerminalPanel}
                   onRunProjectScript={runProjectScript}

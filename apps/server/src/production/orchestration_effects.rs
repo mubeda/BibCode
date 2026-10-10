@@ -71,6 +71,11 @@ pub trait OrchestrationEffectCallbacks: Send + Sync {
 
     fn refresh_workspace<'a>(&'a self, cwd: &'a Path) -> BoxEffectFuture<'a, ()>;
 
+    /// Closes the thread's preview tabs and gateway targets.
+    fn close_previews<'a>(&'a self, _thread_id: &'a str) -> BoxEffectFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
     fn setup_script_is_running<'a>(
         &'a self,
         _thread_id: &'a str,
@@ -623,16 +628,8 @@ async fn process_event(
         "thread.turn-start-requested" => {
             ensure_baseline(engine, callbacks, event, cancellation).await
         }
-        "thread.message-sent" => {
-            let payload = &event.event.payload;
-            if payload.get("role").and_then(Value::as_str) == Some("user")
-                && payload.get("streaming").and_then(Value::as_bool) == Some(false)
-                && payload.get("turnId").is_none_or(Value::is_null)
-            {
-                ensure_baseline(engine, callbacks, event, cancellation).await
-            } else {
-                Ok(())
-            }
+        "thread.message-sent" if needs_turn_baseline(event) => {
+            ensure_baseline(engine, callbacks, event, cancellation).await
         }
         "thread.turn-diff-completed"
             if event.event.payload.get("status").and_then(Value::as_str) == Some("missing") =>
@@ -704,6 +701,21 @@ async fn resolve_workspace(
         .get_project(thread.project_id)
         .await?
         .map(|project| process_compatible_path(PathBuf::from(project.workspace_root))))
+}
+
+/// A user message that starts a turn needs the turn's checkpoint baseline. Imported CLI history
+/// starts no turn, so it must not capture one (or spawn Git once per historical prompt).
+fn needs_turn_baseline(event: &OrchestrationEvent) -> bool {
+    let payload = &event.event.payload;
+    payload.get("role").and_then(Value::as_str) == Some("user")
+        && payload.get("streaming").and_then(Value::as_bool) == Some(false)
+        && payload.get("turnId").is_none_or(Value::is_null)
+        && event
+            .event
+            .metadata
+            .get("historyImport")
+            .and_then(Value::as_bool)
+            != Some(true)
 }
 
 async fn ensure_baseline(
@@ -958,6 +970,9 @@ async fn cleanup_deleted_thread(
     }
     if let Err(error) = callbacks.close_terminals(thread_id).await {
         tracing::debug!(thread_id, %error, "thread deletion cleanup skipped terminal close");
+    }
+    if let Err(error) = callbacks.close_previews(thread_id).await {
+        tracing::debug!(thread_id, %error, "thread deletion cleanup skipped preview close");
     }
 }
 
@@ -1383,6 +1398,48 @@ mod tests {
         OrchestrationEngine::start(database, EngineOptions::default())
             .await
             .expect("engine")
+    }
+
+    #[tokio::test]
+    async fn imported_history_captures_no_turn_baseline() {
+        const AT: &str = "2026-10-08T00:00:00Z";
+        let engine = empty_event_log().await;
+        for value in [
+            json!({"type":"project.create","commandId":"project","projectId":"p","title":"P","workspaceRoot":"C:/repo","createdAt":AT}),
+            json!({"type":"thread.create","commandId":"thread","threadId":"t","projectId":"p","title":"T","modelSelection":{"instanceId":"codex","model":"gpt-5"},"runtimeMode":"full-access","createdAt":AT}),
+            json!({"type":"thread.history.import","commandId":"history","threadId":"t","messages":[
+                {"messageId":"h-0","role":"user","text":"old prompt","createdAt":AT},
+                {"messageId":"h-1","role":"assistant","text":"old answer","createdAt":AT}
+            ]}),
+            json!({"type":"thread.turn.start","commandId":"turn","threadId":"t","message":{"messageId":"live","role":"user","text":"continue","attachments":[]},"createdAt":AT}),
+        ] {
+            engine
+                .dispatch(serde_json::from_value(value).unwrap())
+                .await
+                .expect("command");
+        }
+        let baselines = engine
+            .read_events(0)
+            .await
+            .expect("events")
+            .into_iter()
+            .filter(|event| event.event.event_type == "thread.message-sent")
+            .map(|event| {
+                (
+                    event.event.payload["messageId"].clone(),
+                    needs_turn_baseline(&event),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            baselines,
+            [
+                (json!("h-0"), false),
+                (json!("h-1"), false),
+                (json!("live"), true),
+            ]
+        );
+        engine.shutdown().await;
     }
 
     async fn append_reactor_event(

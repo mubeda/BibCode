@@ -288,6 +288,102 @@ async fn project_entries_stream_starts_with_a_resync_signal() {
 }
 
 #[tokio::test]
+async fn preview_event_stream_uses_contract_camel_case_keys() {
+    let temp = TempDir::new().expect("temporary base directory");
+    let preview = PreviewManager::new();
+    let mut registry = RpcRegistry::empty();
+    register_workspace_preview_rpc(
+        &mut registry,
+        WorkspacePreviewRpcServices::new(
+            WorkspaceRpc::new(WorkspaceService::default()),
+            preview.clone(),
+            mcp::preview_automation::PreviewAutomationBroker::new(),
+        ),
+    );
+    let handle = ServerRuntime::start_with_registry(test_config(&temp), registry)
+        .await
+        .expect("server starts");
+    let (mut socket, _) = connect_async(format!("ws://{}/ws", handle.local_addr()))
+        .await
+        .expect("WebSocket connects");
+    send_json(
+        &mut socket,
+        json!({
+            "_tag": "Request",
+            "id": "31",
+            "tag": "subscribePreviewEvents",
+            "payload": {},
+            "headers": []
+        }),
+    )
+    .await;
+    // A unary round trip after the subscribe request: the subscription is live once it answers.
+    assert!(matches!(
+        request(
+            &mut socket,
+            "32",
+            "preview.list",
+            json!({"threadId": "thread-1"})
+        )
+        .await,
+        ServerMessage::Exit { .. }
+    ));
+
+    let opened = preview
+        .open("thread-1", Some("http://localhost:5173"))
+        .await
+        .expect("open");
+    preview
+        .resize(
+            "thread-1",
+            &opened.tab_id,
+            bibcode_server::preview::PreviewViewportSetting::Preset {
+                preset_id: "iphone-se".to_owned(),
+                width: 375,
+                height: 667,
+            },
+        )
+        .await
+        .expect("resize");
+    preview
+        .request_open("thread-1", "http://localhost:5173/docs")
+        .await
+        .expect("request open");
+
+    let mut values = Vec::new();
+    while values.len() < 3 {
+        match next_server_message(&mut socket).await {
+            ServerMessage::Chunk { values: chunk, .. } => {
+                values.extend(chunk);
+                send_json(
+                    &mut socket,
+                    serde_json::to_value(ClientMessage::Ack {
+                        request_id: RequestId::try_from("31").expect("request id"),
+                    })
+                    .expect("ack"),
+                )
+                .await;
+            }
+            message => panic!("expected a preview event chunk, got {message:?}"),
+        }
+    }
+    assert_eq!(values[0]["type"], "opened");
+    assert_eq!(values[0]["threadId"], "thread-1");
+    assert_eq!(values[0]["tabId"], opened.tab_id.as_str());
+    assert_eq!(values[1]["type"], "resized");
+    assert_eq!(values[1]["snapshot"]["viewport"]["presetId"], "iphone-se");
+    assert!(values[1]["snapshot"]["viewport"].get("preset_id").is_none());
+    assert_eq!(values[2]["type"], "openRequested");
+    assert_eq!(values[2]["threadId"], "thread-1");
+    assert!(values[2]["requestId"].is_string());
+    assert!(values[2]["createdAt"].is_string());
+
+    socket.close(None).await.expect("close WebSocket");
+    handle.shutdown();
+    handle.join().await.expect("server joins");
+}
+
+#[tokio::test]
 async fn preview_automation_connect_stream_is_bounded_and_cancellable() {
     let temp = TempDir::new().expect("temporary base directory");
     let mut registry = RpcRegistry::empty();

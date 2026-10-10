@@ -2,7 +2,8 @@
 
 This runbook validates adding and reconnecting a desktop-managed SSH
 environment: the remote launch, the pairing script, the saved standard-scope
-bearer, and the relaunch of a remote server that stopped under a live tunnel.
+bearer, the relaunch of a remote server that stopped under a live tunnel, and
+previews of the remote host's dev servers through the preview gateway.
 The behavior it checks is described in
 [Remote access architecture](../architecture/remote.md#desktop-managed-ssh) and
 the [user guide](../user/remote-access.md#desktop-managed-ssh).
@@ -189,6 +190,97 @@ A stuck scenario is a failure: record the environment row's message. A pairing
 step that exceeds its limit reads "The remote host did not issue a pairing
 credential within 30 seconds. Check the connection; BiBCode keeps trying." and
 the row stays **Connecting…** while BiBCode retries.
+
+### Preview gateway over SSH
+
+Run these after scenario 1 with the environment connected, from a thread on
+it. They check the [preview gateway](../architecture/remote.md#preview-gateway)
+and its [SSH port forward](../architecture/remote.md#desktop-managed-ssh) end
+to end; the user-facing behavior is in
+[Previewing the server's dev servers](../user/workspace-ui.md#previewing-the-servers-dev-servers).
+Record each as its own row (evidence class, result, exact message) in the
+report's SSH environment evidence section.
+
+**Dev server.** In the thread's terminal, run
+`printf '<script>document.write(location.origin)</script>' > origin.html` and
+then `python3 -m http.server 8123 --bind 127.0.0.1`. Make sure nothing on the
+desktop machine listens on port 8123. With **Open links in** set to
+**BiBCode browser**, click `http://localhost:8123/` in the chat:
+
+- The BiBCode browser shows the directory listing, and its address bar shows
+  `http://localhost:8123/`, never the `/__bibcode/bootstrap` hop. Open
+  `http://localhost:8123/origin.html`: the page shows `http://localhost:8123`,
+  the same origin as on the server.
+- On the desktop machine, an
+  `ssh … -N -L [::1]:8123:127.0.0.1:<remote> -L 127.0.0.1:8123:127.0.0.1:<remote>`
+  child is running (only the `127.0.0.1` forward when the machine has no IPv6
+  loopback), and port 8123 listens on loopback only (`ss -ltnp` on Linux,
+  `lsof -nP -iTCP -sTCP:LISTEN` on macOS, `netstat -ano` on Windows).
+- **Reload** loads the page again. Stop the server and press **Reload**: the
+  gateway's listener is still open, so the tab shows the gateway's own `502`
+  page, titled "Nothing is listening", with "Nothing is listening on port 8123
+  on <environment>." The address bar still shows `http://localhost:8123/`.
+  This is a page inside the tab, not BiBCode's "Can't show this page here"
+  overlay, which appears only when the listener has already closed and
+  BiBCode opens the address again. Start the server again and press
+  **Reload**: the page returns.
+- `https://localhost:8123/` shows "HTTPS dev servers can't be previewed through
+  the gateway yet; serve over HTTP or open it on <environment> directly."
+- Open a second preview tab on another address, such as `https://example.com`,
+  then switch back to the first within a minute: no new forward `ssh` child
+  starts. Stay on the second tab for over a minute: the first tab's forward
+  `ssh` child exits.
+- Close the preview tab: the forward's `ssh` child exits at once.
+- **Busy local port.** Close the preview tab. On the desktop machine run
+  `python3 -m http.server 8123 --bind 127.0.0.1`, then click
+  `http://localhost:8123/origin.html` again: the address bar still shows
+  `http://localhost:8123/origin.html`, the page shows
+  `http://127.0.0.1:<random port>`, the forward binds `127.0.0.1:<random port>`,
+  and a note "localhost:8123 is in use on this computer" appears once; another
+  click on the same address shows no further note. Stop the local server.
+  Repeat on port 8124 with the local server bound to IPv6 only
+  (`--bind ::1`): the preview again opens on a random `127.0.0.1` port with the
+  note for `localhost:8124`.
+- **Separate preview storage.** Connect a second SSH environment, run the same
+  `python3 -m http.server 8123 --bind 127.0.0.1` there, and preview
+  `http://localhost:8123/` from a thread on each environment in turn. In the
+  first, run `localStorage.setItem("probe", "first")` from the preview's
+  developer tools; in the second, `localStorage.getItem("probe")` returns
+  `null`. Switching back to the first environment's preview still returns
+  `"first"`, and a preview from the local environment keeps the data it had
+  before.
+- With **Open links in** set to **System browser**, the same click opens the
+  system browser at `http://localhost:8123/` (at `http://127.0.0.1:<local port>/`
+  when port 8123 is busy on the desktop machine), and the listing loads.
+  That forward is held by a 5-minute lease: with no BiBCode browser tab on the
+  same address, its `ssh` child exits about 5 minutes after the click, and the
+  system-browser page stops loading.
+
+**Brainstorming companion.** This needs Node.js on the remote host and the
+superpowers plugin's brainstorming scripts copied there. Set **Open links in**
+back to **BiBCode browser** first: the request opens like a clicked link. In
+the thread's
+terminal, run its `scripts/start-server.sh --open` with the default bind host
+(the companion opens a browser only for a `127.0.0.1` or `localhost` bind, and
+only when no browser is connected yet). Note `screen_dir` from the JSON it
+prints, then write an HTML file into that directory:
+
+- The companion runs `$BRAINSTORM_OPEN_CMD` with its keyed
+  `http://localhost:<port>/?key=<hex>` address. The desktop opens it as a
+  BiBCode browser tab in the same thread, and the companion's first screen
+  loads instead of a 403 page.
+- Write a second HTML file, or change the first: the page reloads on its own.
+  That proves the companion's WebSocket, which requires `Origin` to match
+  `Host`, works through the gateway.
+- No browser opens on the remote host.
+
+Stop the companion with its `stop-server.sh` when done.
+
+**Revocation.** With the companion page (or another page that holds a
+WebSocket) open, revoke the desktop's device on the host's Share tab. Within
+30 s the page's WebSocket closes: a new screen file no longer reloads it. After
+the desktop pairs again, as in scenario 7, **Reload** loads the page through a
+new gateway session.
 
 ### Cleanup
 

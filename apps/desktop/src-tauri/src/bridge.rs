@@ -2029,6 +2029,28 @@ pub async fn desktop_bridge_disconnect_ssh_environment(
 }
 
 #[tauri::command]
+pub async fn desktop_bridge_ssh_forward(
+    app: AppHandle<DesktopRuntime>,
+    ssh: State<'_, SshEnvironmentManager>,
+    prompts: State<'_, SshPasswordPromptManager>,
+    target: SshEnvironmentTarget,
+    remote_port: u16,
+    preferred_local_port: Option<u16>,
+) -> Result<u16, String> {
+    ssh.ensure_port_forward(&app, &prompts, target, remote_port, preferred_local_port)
+        .await
+}
+
+#[tauri::command]
+pub async fn desktop_bridge_release_ssh_forward(
+    ssh: State<'_, SshEnvironmentManager>,
+    target: SshEnvironmentTarget,
+    remote_port: u16,
+) -> Result<(), String> {
+    ssh.release_port_forward(target, remote_port).await
+}
+
+#[tauri::command]
 pub fn desktop_bridge_resolve_ssh_password_prompt(
     prompts: State<'_, SshPasswordPromptManager>,
     request_id: String,
@@ -4250,6 +4272,8 @@ mod tests {
                 desktop_bridge_discover_ssh_hosts,
                 desktop_bridge_ensure_ssh_environment,
                 desktop_bridge_disconnect_ssh_environment,
+                desktop_bridge_ssh_forward,
+                desktop_bridge_release_ssh_forward,
                 desktop_bridge_fetch_environment_descriptor,
                 desktop_bridge_bootstrap_ssh_bearer_session,
                 desktop_bridge_fetch_ssh_session_state,
@@ -4549,6 +4573,21 @@ mod tests {
             )
             .is_err()
         );
+        assert_eq!(
+            invoke(
+                "desktop_bridge_ssh_forward",
+                json!({"target":unreachable_target,"remotePort":5173}),
+            )
+            .unwrap_err(),
+            json!("SSH connection is not active."),
+        );
+        assert!(
+            invoke(
+                "desktop_bridge_release_ssh_forward",
+                json!({"target":unreachable_target,"remotePort":5173}),
+            )
+            .is_ok()
+        );
         assert!(
             invoke(
                 "desktop_bridge_save_diagnostic_logs",
@@ -4671,6 +4710,8 @@ mod tests {
             "desktop_bridge_set_connection_catalog",
             "desktop_bridge_ensure_ssh_environment",
             "desktop_bridge_disconnect_ssh_environment",
+            "desktop_bridge_ssh_forward",
+            "desktop_bridge_release_ssh_forward",
             "desktop_bridge_set_tailscale_serve_enabled",
             "desktop_bridge_set_wsl_backend_enabled",
             "desktop_bridge_set_wsl_only",

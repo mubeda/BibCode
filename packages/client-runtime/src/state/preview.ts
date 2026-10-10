@@ -1,4 +1,5 @@
 import { WS_METHODS } from "@bibcode/contracts";
+import * as Stream from "effect/Stream";
 import { Atom } from "effect/unstable/reactivity";
 
 import type { EnvironmentRegistry } from "../connection/registry.ts";
@@ -16,6 +17,13 @@ export const previewAutomationHostFocusConcurrencyKey = (value: {
     readonly connectionId: string;
   };
 }): string => JSON.stringify([value.environmentId, value.input.clientId, value.input.connectionId]);
+
+/**
+ * A stream atom keeps only the last value of each chunk; one event per chunk
+ * lets subscribers see every event, so an open request is never dropped.
+ */
+export const deliverEachPreviewEvent = <A, E, R>(stream: Stream.Stream<A, E, R>) =>
+  Stream.rechunk(stream, 1);
 
 export function createPreviewEnvironmentAtoms<R, E>(
   runtime: Atom.AtomRuntime<EnvironmentRegistry | R, E>,
@@ -37,6 +45,7 @@ export function createPreviewEnvironmentAtoms<R, E>(
     events: createEnvironmentRpcSubscriptionAtomFamily(runtime, {
       label: "environment-data:preview:events",
       tag: WS_METHODS.subscribePreviewEvents,
+      transform: deliverEachPreviewEvent,
     }),
     discoveredServers: createEnvironmentRpcSubscriptionAtomFamily(runtime, {
       label: "environment-data:preview:discovered-servers",
@@ -55,6 +64,16 @@ export function createPreviewEnvironmentAtoms<R, E>(
       tag: WS_METHODS.previewOpen,
       scheduler: lifecycleScheduler,
       concurrency: lifecycleConcurrency,
+    }),
+    gatewayOpen: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:preview:gateway-open",
+      tag: WS_METHODS.previewGatewayOpen,
+      scheduler: lifecycleScheduler,
+      concurrency: lifecycleConcurrency,
+    }),
+    claimOpenRequest: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:preview:claim-open-request",
+      tag: WS_METHODS.previewClaimOpenRequest,
     }),
     navigate: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:preview:navigate",

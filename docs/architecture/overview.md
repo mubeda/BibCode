@@ -48,9 +48,18 @@ second window-state source.
   content is hosted in Tauri child webviews; preview automation is brokered by
   the Rust server and consumed by the React host. On the Tauri desktop host only
   tab status, open, and navigate are supported and advertised; snapshot, click,
-  type, and the other automation calls are not yet. Its single native view
-  drives only the visible tab, so open always shows the tab, and a request for a
-  thread that is not on screen times out. Typography and text-contrast
+  type, and the other automation calls are not yet. Its native views drive
+  only the visible tab, so open always shows the tab, and a request for a
+  thread that is not on screen times out. The desktop keeps one long-lived
+  native view per environment's preview storage (the local environment keeps
+  the original profile; each other environment gets its own), because
+  recreating child webviews while switching tabs disconnected the app; logical
+  tabs rebind to their environment's view. In browser mode there is no child
+  webview: the client advertises only status and open, and open shows a prompt
+  and returns `pending-user` at once; the page opens only if the user clicks Open. The server prefers the host
+  with more operations, so a connected desktop serves automation first.
+  Loopback dev servers on a remote environment load through the server's
+  preview gateway. Typography and text-contrast
   rules live in [`UI.md`](../../UI.md).
 - **Desktop adapter (`apps/web/src/tauriDesktopBridge.ts`)** installs
   `window.desktopBridge` only when Tauri globals are present. Tauri commands and
@@ -151,7 +160,10 @@ second window-state source.
   safety convergence.
 
   One status observation reads porcelain-v2 branch and file state once and runs
-  staged or unstaged numstat only for areas that are present. A failed porcelain
+  staged or unstaged numstat only for areas that are present. Each unmerged path
+  appears once, as an unstaged `conflicted` entry, and the Git Manager detector
+  reports any merge, rebase, cherry-pick, revert, or squash left in progress as
+  optional `operationInProgress` (omitted when the probe fails). A failed porcelain
   read whose repository probe also refuses the folder becomes the non-repository
   result, which says, when the server can tell, whether no repository exists, Git
   cannot read one, or Git refuses to trust it. A readable non-work-tree result
@@ -717,6 +729,19 @@ environment shares the host process. SSH forwarding is owned by the Tauri host;
 provider, terminal, and managed relay processes are supervised by the server.
 Neither path introduces a production Node server or packaged helper sidecar.
 
+The server can also open preview gateway listeners. Each one reverse-proxies
+one loopback dev server for one thread to a client that is not on the server's
+host. A listener binds an ephemeral port on the local address the caller's RPC
+connection arrived on, and the server refuses callers that reached it on a
+public address or through a reverse proxy. It is opened through
+`preview.gatewayOpen` and closed when its tabs close, after 10 idle minutes,
+when its thread is deleted, or at shutdown. Agent and terminal sessions reach
+clients the other way: their `$BROWSER` shim posts to
+`POST /api/preview/open-url`, and the server broadcasts an `openRequested`
+event that one client claims. See
+[Preview gateway](remote.md#preview-gateway) and
+[Open requests and automation hosts](remote.md#open-requests-and-automation-hosts).
+
 When WSL-only mode is selected, that intent is authoritative even if an older
 persisted document has a stale disabled-backend flag. WSL planning and primary
 startup fail closed as a tagged `wsl-primary-unavailable` desktop state. The
@@ -974,8 +999,10 @@ valid panel thread. The reservation is renderer-local and remains protected
 from older authoritative snapshots until a snapshot actually observes the new
 thread; normal remote-deletion reconciliation resumes after that observation.
 Authoritative thread removal later clears every surface that references that
-thread. This ordering is shared by browser and all desktop hosts; it does not
-depend on a WebView-specific scheduling delay.
+thread. Reopening a closed (archived) chat panel reserves its surface the same
+way before unarchiving the thread and removes it on a confirmed failure. This
+ordering is shared by browser and all desktop hosts; it does not depend on a
+WebView-specific scheduling delay.
 
 Center-panel layout is renderer-local, but the panels it holds are shared.
 Center terminals open or attach with `centerPanel: true`; the terminal manager
@@ -988,6 +1015,11 @@ center terminal session or live panel thread the first time it sees one, as an
 inactive tab in the host thread's focused group, skipping terminal ids reserved
 by an in-flight local open and chat panels still pending locally. Adoption only
 on first sight keeps a local close from being undone by later status updates.
+Closing a chat panel archives its thread; a tracked panel thread that leaves the
+live list (archived or deleted) loses its tab on every client unless it is
+still pending locally, and is adopted again if it is unarchived. Lifecycle
+reconciliation does not retain archived panel threads, so a tab persisted by a
+client that was away when the panel closed is dropped too.
 The reconciler reads the raw `subscribeTerminalMetadata` stream as whole
 delivered batches (an atom alone keeps only a batch's last event). Metadata
 `remove` events carry a `reason`: only `closed` (an explicit close) drops the
@@ -1398,7 +1430,10 @@ See [RPC and orchestration](./rpc-and-orchestration.md) and
 - Git Manager force-push always uses `--force-with-lease`. Its execution paths
   forbid bare `--force`, `--ignore-other-worktrees`, forced
   `git worktree add -f`, and plumbing `update-ref` as ways to bypass the
-  server's worktree-aware guards.
+  server's worktree-aware guards. `merge-into` publishes its merge commit with
+  fast-forward-only `git fetch . <commit>:refs/heads/<target>`, which Git
+  refuses for a branch checked out, rebased, or bisected in any worktree; it
+  never uses `update-ref`.
 - Git worktree registration, directory availability, and path ownership are
   resolved by the server catalog. Clients do not infer recovery from directory
   existence or treat a degraded observation as an authoritative empty set.

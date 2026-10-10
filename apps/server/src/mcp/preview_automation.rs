@@ -328,7 +328,14 @@ impl PreviewAutomationBroker {
                                 .iter()
                                 .any(|operation| operation == &input.operation)
                     })
-                    .max_by_key(|connection| connection.focus_order)
+                    // A fuller host (desktop) beats a browser-only one the user touched
+                    // later; focus breaks ties between equally capable hosts.
+                    .max_by_key(|connection| {
+                        (
+                            connection.supported_operations.len(),
+                            connection.focus_order,
+                        )
+                    })
                     .ok_or_else(|| {
                         PreviewAutomationError::new(
                             "PreviewAutomationNoAvailableHostError",
@@ -452,6 +459,79 @@ mod tests {
             );
         }
         assert_eq!(PreviewAutomationOperation::from_wire("unknown"), None);
+    }
+
+    #[tokio::test]
+    async fn prefers_the_fuller_host_over_a_more_recently_focused_browser() {
+        let broker = PreviewAutomationBroker::new();
+        let mut desktop = broker.connect(PreviewAutomationHost {
+            client_id: "desktop".into(),
+            environment_id: "environment".into(),
+            supported_operations: vec![
+                PreviewAutomationOperation::Status,
+                PreviewAutomationOperation::Open,
+                PreviewAutomationOperation::Navigate,
+            ],
+        });
+        let PreviewAutomationStreamEvent::Connected {
+            connection_id: desktop_connection,
+        } = desktop.recv().await.unwrap()
+        else {
+            panic!("expected connected event")
+        };
+        // A browser-only host the user touched last must not take status/open.
+        let mut browser = broker.connect(PreviewAutomationHost {
+            client_id: "browser".into(),
+            environment_id: "environment".into(),
+            supported_operations: vec![
+                PreviewAutomationOperation::Status,
+                PreviewAutomationOperation::Open,
+            ],
+        });
+        browser.recv().await.unwrap();
+        broker.focus_host("browser", "environment").await.unwrap();
+
+        for operation in [
+            PreviewAutomationOperation::Status,
+            PreviewAutomationOperation::Open,
+        ] {
+            let invoke_broker = broker.clone();
+            let invoke = tokio::spawn(async move { invoke_broker.invoke(input(operation)).await });
+            let PreviewAutomationStreamEvent::Request { request, .. } =
+                tokio::time::timeout(Duration::from_secs(1), desktop.recv())
+                    .await
+                    .expect("the desktop host should receive the request")
+                    .unwrap()
+            else {
+                panic!("expected request event on the desktop host")
+            };
+            broker
+                .respond(PreviewAutomationResponse {
+                    client_id: "desktop".into(),
+                    connection_id: desktop_connection.clone(),
+                    request_id: request.request_id,
+                    ok: true,
+                    result: Some(json!({"ok":true})),
+                    error: None,
+                })
+                .await
+                .unwrap();
+            assert_eq!(invoke.await.unwrap().unwrap()["ok"], true);
+        }
+        assert!(browser.try_recv().is_err());
+
+        // With only the browser host left, it still serves status.
+        assert!(broker.disconnect("desktop", &desktop_connection));
+        let invoke_broker = broker.clone();
+        let invoke = tokio::spawn(async move {
+            invoke_broker
+                .invoke(input(PreviewAutomationOperation::Status))
+                .await
+        });
+        let PreviewAutomationStreamEvent::Request { .. } = browser.recv().await.unwrap() else {
+            panic!("expected request event on the browser host")
+        };
+        invoke.abort();
     }
 
     #[tokio::test]

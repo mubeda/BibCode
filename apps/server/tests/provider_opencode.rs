@@ -1963,6 +1963,33 @@ async fn opencode_runtime_failure_boundaries_reject_invalid_sessions_and_http_st
 }
 
 #[tokio::test]
+async fn opencode_runtime_starts_a_new_session_only_when_the_saved_one_is_gone() {
+    let state = Arc::new(TestServerState::default());
+    let app = Router::new()
+        .route("/session", post(create_session))
+        .route("/session/{session_id}", get(resume_session))
+        .route("/event", get(subscribe_permission_events))
+        .with_state(state);
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let address: SocketAddr = listener.local_addr().expect("addr");
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+    let runtime = OpenCodeSessionRuntime::new(
+        &format!("http://{address}"),
+        "opencode-lost-thread",
+        "/tmp/project",
+        None,
+    );
+
+    // Any other failure may be transient, so the saved session is kept for a retry.
+    assert!(runtime.resume("bad").await.is_err());
+    assert_eq!(runtime.resume("gone").await.unwrap(), "session-1");
+    runtime.stop().await.expect("runtime stops");
+    server.abort();
+}
+
+#[tokio::test]
 async fn opencode_runtime_maps_transport_loss_across_every_live_operation() {
     let state = Arc::new(TestServerState::default());
     let app = Router::new()
@@ -6775,6 +6802,8 @@ async fn invalid_json_session() -> &'static str {
 async fn resume_session(Path(session_id): Path<String>) -> StatusCode {
     if session_id == "bad" {
         StatusCode::BAD_GATEWAY
+    } else if session_id == "gone" {
+        StatusCode::NOT_FOUND
     } else {
         StatusCode::OK
     }

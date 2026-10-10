@@ -19,6 +19,7 @@ use crate::diagnostics::redact_sensitive_text;
 use crate::source_control::{self, ProviderHosts};
 
 use super::manager::graph::MAX_DIFF_BUFFER_SIZE;
+use super::manager::in_progress::detect_in_progress_operation;
 use super::worktree::{WorktreePruneDryRunRecord, parse_worktree_prune_dry_run};
 use super::{
     ChangeRequest, CreateWorktreeInput, GitCommandDiagnostics, GitCommandError,
@@ -148,6 +149,7 @@ pub struct GitRepository {
     runner: Arc<dyn GitProcessRunner>,
     worktree_settings: Arc<dyn WorktreeBaseDirectoryProvider>,
     worktree_porcelain_z_supported: Arc<Mutex<Option<bool>>>,
+    git_version: Arc<Mutex<Option<crate::git::GitVersion>>>,
     command_timeout: Duration,
     /// `-c` configuration placed before the subcommand of every command this variant runs.
     command_config: &'static [&'static str],
@@ -203,6 +205,7 @@ impl Default for GitRepository {
             runner: Arc::new(ProcessRunner),
             worktree_settings: Arc::new(DefaultWorktreeBaseDirectory),
             worktree_porcelain_z_supported: Arc::new(Mutex::new(None)),
+            git_version: Arc::new(Mutex::new(None)),
             command_timeout: DEFAULT_TIMEOUT,
             command_config: &[],
             discovery_environment: |name| std::env::var_os(name),
@@ -369,6 +372,7 @@ impl GitRepository {
             runner: Arc::new(ProcessRunner),
             worktree_settings,
             worktree_porcelain_z_supported: Arc::new(Mutex::new(None)),
+            git_version: Arc::new(Mutex::new(None)),
             command_timeout: DEFAULT_TIMEOUT,
             command_config: &[],
             discovery_environment: |name| std::env::var_os(name),
@@ -389,6 +393,7 @@ impl GitRepository {
             runner,
             worktree_settings: Arc::new(DefaultWorktreeBaseDirectory),
             worktree_porcelain_z_supported: Arc::new(Mutex::new(None)),
+            git_version: Arc::new(Mutex::new(None)),
             command_timeout: DEFAULT_TIMEOUT,
             command_config: &[],
             discovery_environment: |name| std::env::var_os(name),
@@ -1470,25 +1475,64 @@ impl GitRepository {
         .await
     }
 
+    /// `git --version`, read once per repository value and cached; `None` when unparseable.
+    pub(crate) async fn git_manager_git_version(
+        &self,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<crate::git::GitVersion>, GitCommandError> {
+        if let Some(version) = *self
+            .git_version
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        {
+            return Ok(Some(version));
+        }
+        let output = self
+            .git_manager_bounded_read(
+                "GitManager.gitVersion",
+                cwd,
+                &strings(&["--version"]),
+                true,
+                4 * 1024,
+                cancellation,
+            )
+            .await?;
+        let version = crate::git::GitVersion::parse(&output.stdout);
+        if let Some(version) = version {
+            *self
+                .git_version
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(version);
+        }
+        Ok(version)
+    }
+
     pub(crate) async fn git_manager_merge_tree(
         &self,
         cwd: &Path,
         ours_tip: &str,
         theirs_tip: &str,
+        attr_source: Option<&str>,
         cancellation: &CancellationToken,
     ) -> Result<ProcessOutput, GitCommandError> {
+        let mut args = Vec::new();
+        if let Some(tree) = attr_source {
+            args.push(format!("--attr-source={tree}"));
+        }
+        args.extend(strings(&[
+            "merge-tree",
+            "--write-tree",
+            "--name-only",
+            "--no-messages",
+            "-z",
+            ours_tip,
+            theirs_tip,
+        ]));
         self.git_manager_bounded_read(
             "GitManager.previewMerge.mergeTree",
             cwd,
-            &[
-                "merge-tree".into(),
-                "--write-tree".into(),
-                "--name-only".into(),
-                "--no-messages".into(),
-                "-z".into(),
-                ours_tip.into(),
-                theirs_tip.into(),
-            ],
+            &args,
             true,
             GIT_MANAGER_TIPS_OUTPUT_LIMIT,
             cancellation,
@@ -2292,15 +2336,22 @@ impl GitRepository {
             }
             (false, false) => (HashMap::new(), HashMap::new()),
         };
-        let remotes = self
-            .execute_read(
+        let remote_args = strings(&["remote"]);
+        let (remotes, in_progress) = tokio::join!(
+            self.execute_read(
                 "GitVcsDriver.statusDetailsLocal.remotes",
                 cwd,
-                &strings(&["remote"]),
+                &remote_args,
                 true,
                 cancellation,
-            )
-            .await?;
+            ),
+            // ponytail: one `rev-parse --git-path` per status read; cache the resolved
+            // paths per worktree if status reads become a measured hot spot.
+            detect_in_progress_operation(self, cwd, cancellation),
+        );
+        let remotes = remotes?;
+        // A failed probe degrades to no field; status must not fail because of it.
+        let operation_in_progress = in_progress.ok().flatten().map(|operation| operation.kind);
         let remote_names: Vec<&str> = remotes.stdout.lines().map(str::trim).collect();
         let has_primary_remote = remote_names.contains(&"origin");
         let (ref_name, upstream_ref, ahead_count, behind_count) =
@@ -2323,6 +2374,19 @@ impl GitRepository {
                     deletions: 0,
                     status: Some(VcsWorkingTreeFileStatus::Untracked),
                     area: Some(VcsStagingArea::Untracked),
+                });
+                continue;
+            }
+            if record.unmerged {
+                // One entry per conflicted path: staging it is how the user marks it resolved.
+                let (insertions, deletions) =
+                    unstaged_stats.get(&record.path).copied().unwrap_or((0, 0));
+                files.push(VcsWorkingTreeFile {
+                    path: record.path,
+                    insertions,
+                    deletions,
+                    status: Some(VcsWorkingTreeFileStatus::Conflicted),
+                    area: Some(VcsStagingArea::Unstaged),
                 });
                 continue;
             }
@@ -2372,6 +2436,7 @@ impl GitRepository {
                 default_ref_name,
                 has_working_tree_changes: !working_tree.files.is_empty(),
                 working_tree,
+                operation_in_progress,
             },
             remote: StatusRemoteObservation {
                 upstream_ref,
@@ -4507,6 +4572,145 @@ impl GitRepository {
         args.push(source.to_owned());
         self.execute("GitManager.merge", cwd, &args, true, cancellation)
             .await
+    }
+
+    pub(crate) async fn git_manager_is_ancestor(
+        &self,
+        cwd: &Path,
+        ancestor: &str,
+        descendant: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.git_manager_bounded_read(
+            "GitManager.mergeInto.isAncestor",
+            cwd,
+            &[
+                "merge-base".into(),
+                "--is-ancestor".into(),
+                ancestor.into(),
+                descendant.into(),
+            ],
+            true,
+            4 * 1024,
+            cancellation,
+        )
+        .await
+    }
+
+    /// `commit.gpgSign`; commit-tree ignores it, so callers pass `-S` themselves. Exit 1
+    /// means the key is unset; any other non-zero exit (an invalid boolean) is not "off".
+    pub(crate) async fn git_manager_commit_gpg_sign(
+        &self,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.git_manager_bounded_read(
+            "GitManager.mergeInto.gpgSign",
+            cwd,
+            &strings(&["config", "--bool", "--get", "commit.gpgSign"]),
+            true,
+            4 * 1024,
+            cancellation,
+        )
+        .await
+    }
+
+    /// Exit 0 prints the branch a symbolic ref points at; exit 1 means a regular ref.
+    pub(crate) async fn git_manager_symbolic_ref(
+        &self,
+        cwd: &Path,
+        reference: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        self.git_manager_bounded_read(
+            "GitManager.mergeInto.symbolicRef",
+            cwd,
+            &["symbolic-ref".into(), "-q".into(), reference.into()],
+            true,
+            4 * 1024,
+            cancellation,
+        )
+        .await
+    }
+
+    pub(crate) async fn git_manager_commit_tree(
+        &self,
+        cwd: &Path,
+        tree: &str,
+        parents: [&str; 2],
+        message: &str,
+        sign: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        let mut args = vec!["commit-tree".to_owned()];
+        if sign {
+            args.push("-S".to_owned());
+        }
+        args.extend([
+            tree.to_owned(),
+            "-p".to_owned(),
+            parents[0].to_owned(),
+            "-p".to_owned(),
+            parents[1].to_owned(),
+            "-F".to_owned(),
+            "-".to_owned(),
+        ]);
+        self.execute_with_stdin(
+            "GitManager.mergeInto.commitTree",
+            cwd,
+            &args,
+            message.as_bytes().to_vec(),
+            true,
+            cancellation,
+        )
+        .await
+    }
+
+    /// Fast-forward-only publish: Git refuses a branch checked out, rebased, or bisected
+    /// in any worktree, which `update-ref` would not (docs/architecture/overview.md).
+    pub(crate) async fn git_manager_publish_merge(
+        &self,
+        cwd: &Path,
+        commit: &str,
+        target: &str,
+        source: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
+        let mut environment = git_environment();
+        environment.push((
+            "GIT_REFLOG_ACTION".into(),
+            format!("merge-into {source}").into(),
+        ));
+        self.execute_with_environment(
+            "GitManager.mergeInto.publish",
+            cwd,
+            &[
+                "-c".into(),
+                "maintenance.auto=false".into(),
+                "-c".into(),
+                "fetch.writeCommitGraph=false".into(),
+                // A configured bundle URI would otherwise be downloaded and imported
+                // into refs/bundles/ by this local self-fetch.
+                "-c".into(),
+                "fetch.bundleURI=".into(),
+                "fetch".into(),
+                "--no-tags".into(),
+                "--no-prune".into(),
+                "--no-recurse-submodules".into(),
+                "--no-write-fetch-head".into(),
+                "--quiet".into(),
+                ".".into(),
+                format!("{commit}:refs/heads/{target}"),
+            ],
+            GitExecutionOptions {
+                allow_non_zero_exit: true,
+                max_output_bytes: DEFAULT_OUTPUT_LIMIT,
+                output_policy: OutputPolicy::Truncate,
+            },
+            environment,
+            cancellation,
+        )
+        .await
     }
 
     pub(crate) async fn git_manager_squash_merge_commit(
@@ -7604,9 +7808,10 @@ mod tests {
     };
     use crate::test_support::TestSandbox;
 
-    const EXPECTED_FUSED_OPERATIONS: [&str; 4] = [
+    const EXPECTED_FUSED_OPERATIONS: [&str; 5] = [
         "GitVcsDriver.statusDetailsLocal.status",
         "GitVcsDriver.statusDetailsLocal.remotes",
+        "GitManager.getRefs.inProgressPaths",
         "GitVcsDriver.defaultRef.originHead",
         "GitVcsDriver.remoteProvider",
     ];
@@ -7685,6 +7890,10 @@ mod tests {
                         process_output("origin\n"),
                     ),
                     (
+                        "GitManager.getRefs.inProgressPaths".into(),
+                        no_in_progress_paths(),
+                    ),
+                    (
                         "GitVcsDriver.defaultRef.originHead".into(),
                         process_output("refs/remotes/origin/main\n"),
                     ),
@@ -7723,6 +7932,10 @@ mod tests {
                     (
                         "GitVcsDriver.statusDetailsLocal.remotes".into(),
                         process_output("origin\n"),
+                    ),
+                    (
+                        "GitManager.getRefs.inProgressPaths".into(),
+                        no_in_progress_paths(),
                     ),
                     (
                         "GitVcsDriver.defaultRef.originHead".into(),
@@ -7837,6 +8050,16 @@ mod tests {
             "{} has no stall guard",
             request.operation
         );
+    }
+
+    /// Eleven `--git-path` answers that name no existing file, so the probe reports no operation.
+    fn no_in_progress_paths() -> ProcessOutput {
+        process_output(
+            &(0..11)
+                .map(|index| format!(".git/bibcode-none-{index}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
     }
 
     impl GitProcessRunner for RecordingGitRunner {

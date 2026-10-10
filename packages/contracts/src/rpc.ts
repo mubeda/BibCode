@@ -42,6 +42,13 @@ import {
 
 import { ExternalLauncherError, LaunchEditorInput } from "./editor.ts";
 import {
+  AgentSessionImportInput,
+  AgentSessionImportResult,
+  AgentSessionScanInput,
+  AgentSessionScanResult,
+  AgentSessionsError,
+} from "./agentSessions.ts";
+import {
   AuthAccessStreamError,
   AuthAccessStreamEvent,
   EnvironmentAuthorizationError,
@@ -224,8 +231,13 @@ import {
 } from "./terminal.ts";
 import {
   DiscoveredLocalServerList,
+  PreviewClaimOpenRequestInput,
+  PreviewClaimOpenRequestResult,
   PreviewCloseInput,
   PreviewError,
+  PreviewGatewayError,
+  PreviewGatewayOpenInput,
+  PreviewGatewayOpenResult,
   PreviewEvent,
   PreviewListInput,
   PreviewListResult,
@@ -417,6 +429,10 @@ export const WS_METHODS = {
   projectsDeleteEntry: "projects.deleteEntry",
   projectsDuplicateEntry: "projects.duplicateEntry",
 
+  // CLI session import methods
+  agentSessionsScan: "agentSessions.scan",
+  agentSessionsImport: "agentSessions.import",
+
   // Shell methods
   shellOpenInEditor: "shell.openInEditor",
 
@@ -517,6 +533,8 @@ export const WS_METHODS = {
   previewClose: "preview.close",
   previewList: "preview.list",
   previewReportStatus: "preview.reportStatus",
+  previewClaimOpenRequest: "preview.claimOpenRequest",
+  previewGatewayOpen: "preview.gatewayOpen",
   previewAutomationConnect: "previewAutomation.connect",
   previewAutomationRespond: "previewAutomation.respond",
   previewAutomationFocusHost: "previewAutomation.focusHost",
@@ -575,6 +593,18 @@ export const WsAuthConfirmPairingRpc = Rpc.make(WS_METHODS.authConfirmPairing, {
   payload: AuthConfirmPairingEmpty,
   success: AuthConfirmPairingEmpty,
   error: EnvironmentAuthorizationError,
+});
+
+export const WsAgentSessionsScanRpc = Rpc.make(WS_METHODS.agentSessionsScan, {
+  payload: AgentSessionScanInput,
+  success: AgentSessionScanResult,
+  error: Schema.Union([AgentSessionsError, EnvironmentRpcError]),
+});
+
+export const WsAgentSessionsImportRpc = Rpc.make(WS_METHODS.agentSessionsImport, {
+  payload: AgentSessionImportInput,
+  success: AgentSessionImportResult,
+  error: Schema.Union([AgentSessionsError, EnvironmentRpcError]),
 });
 
 export const WsServerUpsertKeybindingRpc = Rpc.make(WS_METHODS.serverUpsertKeybinding, {
@@ -1501,6 +1531,18 @@ export const WsPreviewReportStatusRpc = Rpc.make(WS_METHODS.previewReportStatus,
   error: Schema.Union([PreviewError, EnvironmentRpcError]),
 });
 
+export const WsPreviewClaimOpenRequestRpc = Rpc.make(WS_METHODS.previewClaimOpenRequest, {
+  payload: PreviewClaimOpenRequestInput,
+  success: PreviewClaimOpenRequestResult,
+  error: EnvironmentRpcError,
+});
+
+export const WsPreviewGatewayOpenRpc = Rpc.make(WS_METHODS.previewGatewayOpen, {
+  payload: PreviewGatewayOpenInput,
+  success: PreviewGatewayOpenResult,
+  error: Schema.Union([PreviewGatewayError, EnvironmentRpcError]),
+});
+
 export const WsPreviewAutomationConnectRpc = Rpc.make(WS_METHODS.previewAutomationConnect, {
   payload: PreviewAutomationHost,
   success: PreviewAutomationStreamEvent,
@@ -1704,6 +1746,8 @@ export const WsRpcGroup = RpcGroup.make(
   WsUploadsGetRpc,
   WsUploadsCancelRpc,
   WsAuthConfirmPairingRpc,
+  WsAgentSessionsScanRpc,
+  WsAgentSessionsImportRpc,
   WsServerGetConfigRpc,
   WsServerGetProviderCapabilitiesRpc,
   WsServerRefreshProvidersRpc,
@@ -1820,6 +1864,8 @@ export const WsRpcGroup = RpcGroup.make(
   WsPreviewCloseRpc,
   WsPreviewListRpc,
   WsPreviewReportStatusRpc,
+  WsPreviewClaimOpenRequestRpc,
+  WsPreviewGatewayOpenRpc,
   WsPreviewAutomationConnectRpc,
   WsPreviewAutomationRespondRpc,
   WsPreviewAutomationFocusHostRpc,

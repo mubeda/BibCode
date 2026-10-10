@@ -17,7 +17,7 @@ const bearer = (httpBaseUrl: string) =>
 describe("browser target resolver", () => {
   beforeEach(() => readPreparedConnection.mockReset());
 
-  it("maps environment ports onto a private network host", async () => {
+  it("keeps environment ports canonical on a private network host", async () => {
     readPreparedConnection.mockReturnValue(bearer("http://192.168.1.25:3773"));
     const { resolveBrowserNavigationTarget } = await import("./browserTargetResolver");
     expect(
@@ -28,8 +28,8 @@ describe("browser target resolver", () => {
       }),
     ).toEqual({
       requestedUrl: "http://localhost:5173/dashboard",
-      resolvedUrl: "http://192.168.1.25:5173/dashboard",
-      resolutionKind: "direct-private-network",
+      resolvedUrl: "http://localhost:5173/dashboard",
+      resolutionKind: "direct",
       environmentId: "environment-1",
     });
   });
@@ -58,14 +58,14 @@ describe("browser target resolver", () => {
     ).toThrow(UNREACHABLE_MESSAGES["public-host"]("Build box"));
   });
 
-  it("refuses environment-port automation targets over SSH", async () => {
+  it("keeps environment-port automation targets canonical over SSH", async () => {
     readPreparedConnection.mockReturnValue(
       conn({ _tag: "SshConnectionTarget", connectionId: "ssh:1" }, "http://127.0.0.1:45123/"),
     );
     const { resolveBrowserNavigationTarget } = await import("./browserTargetResolver");
-    expect(() =>
-      resolveBrowserNavigationTarget(env, { kind: "environment-port", port: 5173 }),
-    ).toThrow("This address is on Build box, not this computer.");
+    expect(
+      resolveBrowserNavigationTarget(env, { kind: "environment-port", port: 5173 }).resolvedUrl,
+    ).toBe("http://localhost:5173/");
   });
 
   it("normalizes schemeless localhost server-picker values", async () => {
@@ -102,14 +102,16 @@ describe("browser target resolver", () => {
     });
   });
 
-  it("maps a primary served from a remote LAN host onto that host", async () => {
+  it("routes a primary served from a remote LAN host through its gateway", async () => {
     readPreparedConnection.mockReturnValue(
       conn({ _tag: "PrimaryConnectionTarget" }, "http://192.168.1.25:3773"),
     );
     const { resolvePreviewTarget } = await import("./browserTargetResolver");
     expect(resolvePreviewTarget(env, "http://localhost:5173/")).toEqual({
-      kind: "reachable",
-      url: "http://192.168.1.25:5173/",
+      kind: "gateway",
+      via: "host",
+      host: "192.168.1.25",
+      url: "http://localhost:5173/",
     });
   });
 
@@ -117,17 +119,21 @@ describe("browser target resolver", () => {
     readPreparedConnection.mockReturnValue(bearer("http://192.168.1.25:3773"));
     const { resolvePreviewTarget } = await import("./browserTargetResolver");
     expect(resolvePreviewTarget(env, "http://0.0.0.0:3000/")).toEqual({
-      kind: "reachable",
-      url: "http://192.168.1.25:3000/",
+      kind: "gateway",
+      via: "host",
+      host: "192.168.1.25",
+      url: "http://localhost:3000/",
     });
   });
 
-  it("reaches tailnet addresses", async () => {
+  it("reaches tailnet addresses through the gateway", async () => {
     readPreparedConnection.mockReturnValue(bearer("http://100.64.0.10:3773"));
     const { resolvePreviewTarget } = await import("./browserTargetResolver");
     expect(resolvePreviewTarget(env, "http://localhost:5173/")).toEqual({
-      kind: "reachable",
-      url: "http://100.64.0.10:5173/",
+      kind: "gateway",
+      via: "host",
+      host: "100.64.0.10",
+      url: "http://localhost:5173/",
     });
   });
 
@@ -137,9 +143,8 @@ describe("browser target resolver", () => {
     );
     const { resolvePreviewTarget } = await import("./browserTargetResolver");
     expect(resolvePreviewTarget(env, "http://localhost:5173/")).toEqual({
-      kind: "unreachable",
-      reason: "ssh",
-      environmentLabel: "Build box",
+      kind: "gateway",
+      via: "ssh",
       url: "http://localhost:5173/",
     });
   });
@@ -175,14 +180,16 @@ describe("browser target resolver", () => {
     });
   });
 
-  it("rewrites desktop-local WSL loopback onto the VM address", async () => {
+  it("routes desktop-local WSL loopback through the gateway on the VM address", async () => {
     readPreparedConnection.mockReturnValue(
       conn({ _tag: "BearerConnectionTarget", connectionId: "local:wsl" }, "http://172.22.1.5:3773"),
     );
     const { resolvePreviewTarget } = await import("./browserTargetResolver");
     expect(resolvePreviewTarget(env, "http://localhost:5173/x")).toEqual({
-      kind: "reachable",
-      url: "http://172.22.1.5:5173/x",
+      kind: "gateway",
+      via: "host",
+      host: "172.22.1.5",
+      url: "http://localhost:5173/x",
     });
   });
 
@@ -214,7 +221,7 @@ describe("browser target resolver", () => {
     expect(readPreparedConnection).not.toHaveBeenCalled();
   });
 
-  it("brackets private IPv6 environment hosts", async () => {
+  it("routes private IPv6 environment hosts through the gateway", async () => {
     readPreparedConnection.mockReturnValue(bearer("http://[fd12::5]:3773"));
     const { resolveBrowserNavigationTarget, resolvePreviewTarget } =
       await import("./browserTargetResolver");
@@ -224,10 +231,12 @@ describe("browser target resolver", () => {
         port: 5173,
         path: "/app?mode=test",
       }).resolvedUrl,
-    ).toBe("http://[fd12::5]:5173/app?mode=test");
+    ).toBe("http://localhost:5173/app?mode=test");
     expect(resolvePreviewTarget(env, "http://localhost:5173/")).toEqual({
-      kind: "reachable",
-      url: "http://[fd12::5]:5173/",
+      kind: "gateway",
+      via: "host",
+      host: "fd12::5",
+      url: "http://localhost:5173/",
     });
   });
 
@@ -306,21 +315,25 @@ describe("browser target resolver", () => {
     ).toThrow(UNREACHABLE_MESSAGES["public-host"]("Build box"));
   });
 
-  it("maps wildcard HTTPS discovery onto the private environment host", async () => {
+  it("keeps the scheme of wildcard HTTPS discovery so the gateway can refuse it", async () => {
     readPreparedConnection.mockReturnValue(bearer("http://10.0.0.2:4321"));
     const { resolvePreviewTarget } = await import("./browserTargetResolver");
     expect(resolvePreviewTarget(env, "https://0.0.0.0/path")).toEqual({
-      kind: "reachable",
-      url: "https://10.0.0.2/path",
+      kind: "gateway",
+      via: "host",
+      host: "10.0.0.2",
+      url: "https://localhost/path",
     });
   });
 
-  it("rewrites loopback onto a non-IP environment host name", async () => {
+  it("routes loopback on a non-IP environment host name through the gateway", async () => {
     readPreparedConnection.mockReturnValue(bearer("http://devbox:3773"));
     const { resolvePreviewTarget } = await import("./browserTargetResolver");
     expect(resolvePreviewTarget(env, "http://localhost:5173")).toEqual({
-      kind: "reachable",
-      url: "http://devbox:5173/",
+      kind: "gateway",
+      via: "host",
+      host: "devbox",
+      url: "http://localhost:5173/",
     });
   });
 
@@ -345,21 +358,27 @@ describe("browser target resolver", () => {
     },
   );
 
-  it.each(loopbackForms)("rewrites %s onto a LAN environment host", async (raw) => {
+  it.each(loopbackForms)("canonicalizes %s for a LAN environment gateway", async (raw) => {
     readPreparedConnection.mockReturnValue(bearer("http://192.168.1.25:3773"));
     const { resolvePreviewTarget } = await import("./browserTargetResolver");
     expect(resolvePreviewTarget(env, raw)).toEqual({
-      kind: "reachable",
-      url: "http://192.168.1.25:8000/x",
+      kind: "gateway",
+      via: "host",
+      host: "192.168.1.25",
+      url: "http://localhost:8000/x",
     });
   });
 
-  it.each(loopbackForms)("refuses %s over SSH", async (raw) => {
+  it.each(loopbackForms)("canonicalizes %s for an SSH gateway", async (raw) => {
     readPreparedConnection.mockReturnValue(
       conn({ _tag: "SshConnectionTarget", connectionId: "ssh:1" }, "http://127.0.0.1:45123/"),
     );
     const { resolvePreviewTarget } = await import("./browserTargetResolver");
-    expect(resolvePreviewTarget(env, raw)).toMatchObject({ kind: "unreachable", reason: "ssh" });
+    expect(resolvePreviewTarget(env, raw)).toEqual({
+      kind: "gateway",
+      via: "ssh",
+      url: "http://localhost:8000/x",
+    });
   });
 
   it("treats a malformed connection base URL as disconnected instead of throwing", async () => {
@@ -378,19 +397,20 @@ describe("browser target resolver", () => {
   it("resolves agent url targets through the environment topology", async () => {
     const { resolveBrowserNavigationTarget } = await import("./browserTargetResolver");
     readPreparedConnection.mockReturnValue(
-      conn({ _tag: "SshConnectionTarget", connectionId: "ssh:1" }, "http://127.0.0.1:45123/"),
+      conn({ _tag: "RelayConnectionTarget" }, "https://abc.connect.example.com"),
     );
     expect(() =>
       resolveBrowserNavigationTarget(env, { kind: "url", url: "http://localhost:3000" }),
     ).toThrow("This address is on Build box, not this computer.");
 
+    // Gateway-backed targets stay canonical; each client resolves them for its own view.
     readPreparedConnection.mockReturnValue(bearer("http://192.168.1.25:3773"));
     expect(
-      resolveBrowserNavigationTarget(env, { kind: "url", url: "http://localhost:3000/app" }),
+      resolveBrowserNavigationTarget(env, { kind: "url", url: "http://0.0.0.0:3000/app" }),
     ).toEqual({
-      requestedUrl: "http://localhost:3000/app",
-      resolvedUrl: "http://192.168.1.25:3000/app",
-      resolutionKind: "direct-private-network",
+      requestedUrl: "http://0.0.0.0:3000/app",
+      resolvedUrl: "http://localhost:3000/app",
+      resolutionKind: "direct",
       environmentId: "environment-1",
     });
     expect(

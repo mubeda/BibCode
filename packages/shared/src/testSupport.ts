@@ -17,6 +17,7 @@ export function makeTestExecutionEnvironmentCapabilities(
     gitManagerCommitOperations: false,
     gitManagerBranchSyncOperations: false,
     gitManagerStashMergeOperations: false,
+    gitManagerMergeIntoOperations: false,
     gitManagerPartialStaging: false,
     gitManagerRewriteOperations: false,
     gitManagerTagOperations: false,

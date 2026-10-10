@@ -75,7 +75,11 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         | "vcs.refreshStatus"
         | "vcs.refreshWorktreeCatalog"
         | "worktree.getRemovalPlan" => Some(SCOPE_ORCHESTRATION_READ),
-        "git.preparePullRequestThread"
+        // Scan reads CLI transcripts (first prompts included) from the server host's home
+        // directory, outside BiBCode's data, so read-only credentials must not see them.
+        "agentSessions.import"
+        | "agentSessions.scan"
+        | "git.preparePullRequestThread"
         | "git.resolvePullRequest"
         | "git.runStackedAction"
         | "gitManager.commit"
@@ -94,7 +98,9 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         | "uploads.get"
         | "uploads.cancel"
         | "orchestration.dispatchCommand"
+        | "preview.claimOpenRequest"
         | "preview.close"
+        | "preview.gatewayOpen"
         | "preview.navigate"
         | "preview.open"
         | "preview.refresh"
@@ -201,6 +207,14 @@ mod tests {
         );
         assert_eq!(
             required_scope("server.updateSettings"),
+            Some(SCOPE_ORCHESTRATION_OPERATE)
+        );
+        assert_eq!(
+            required_scope("agentSessions.scan"),
+            Some(SCOPE_ORCHESTRATION_OPERATE)
+        );
+        assert_eq!(
+            required_scope("agentSessions.import"),
             Some(SCOPE_ORCHESTRATION_OPERATE)
         );
         assert_eq!(
@@ -311,6 +325,11 @@ mod tests {
                 "wrong activity mutation scope for {method}"
             );
         }
+        assert_eq!(
+            required_scope("preview.gatewayOpen"),
+            Some(SCOPE_ORCHESTRATION_OPERATE),
+            "a gateway gives read/write access to the upstream, so reading is not enough"
+        );
         assert_eq!(
             required_scope("vcs.cancelClone"),
             Some(SCOPE_ORCHESTRATION_OPERATE),

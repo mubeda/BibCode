@@ -101,6 +101,7 @@ const FILE_TREE_GIT_STATUS: Record<VcsWorkingTreeFileStatus, GitStatus> = {
   renamed: "renamed",
   copied: "added",
   untracked: "untracked",
+  conflicted: "modified",
 };
 
 const FILE_TREE_GIT_STATUS_PRIORITY: Record<GitStatus, number> = {

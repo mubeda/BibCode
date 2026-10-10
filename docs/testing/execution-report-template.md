@@ -149,6 +149,7 @@ Delete the unused result values above. Do not leave an ambiguous status.
 | Branch create/checkout/rename/delete and occupied-branch redirect         |        |                                      |                                   |
 | Fetch/pull/push/publish/force-with-lease states                           |        |                                      |                                   |
 | Native stash list, entry diff, apply/pop/drop, and merge preview          |        |                                      |                                   |
+| Merge into a non-checked-out branch; Source Control merge entry and Fetch |        |                                      |                                   |
 | In-progress and conflicted repository presentation                        |        |                                      |                                   |
 | Tag create/delete/push and all four image-diff modes                      |        |                                      |                                   |
 | Explicit pull-request/check refresh and no idle provider refresh          |        |                                      |                                   |
@@ -202,6 +203,9 @@ Delete the unused result values above. Do not leave an ambiguous status.
 - Other installed or development copies excluded:
 - External tool, command, and path used for the Files Refresh rescan:
 - Authentication-dependent scenarios unavailable:
+- Linux preview child webview geometry, per backend (native Wayland and
+  `BIBCODE_GDK_BACKEND=x11`): scale, screenshot after the split drag, and any
+  step where the preview did not follow its panel:
 
 ## External-worktree scenario
 
@@ -295,10 +299,40 @@ See [Desktop-managed SSH environments](./ssh-environments.md).
 | 6   | Dead link (optional)         |                |        |                        |
 | 7   | Revocation (optional)        |                |        |                        |
 | 8   | Hung pairing (optional)      |                |        |                        |
+| 9   | Preview: dev server          |                |        |                        |
+| 10  | Preview: Reload/HTTPS/502    |                |        |                        |
+| 11  | Preview: forward lifetime    |                |        |                        |
+| 12  | Preview: system browser      |                |        |                        |
+| 13  | Preview: brainstorming       |                |        |                        |
+| 14  | Preview: revocation          |                |        |                        |
 
+- Preview forward `ssh` children and their listen addresses (rows 9–12):
 - Devices for this desktop on the host after (count, access):
 - Cleanup (environment removed, device revoked, no leftover managed server or
   pairing command):
+
+## Preview gateway evidence
+
+See [Preview gateway](./cross-platform-validation.md#preview-gateway).
+
+- Client (desktop or browser tab), environment address, and evidence class:
+- Server bind host and each gateway port with its listen address:
+- Gateway cookie attributes (never the value):
+- Exact `bibcode-open-url` path, exit codes, and printed output:
+
+| Scenario                         | Result | Screenshot, command, or log evidence | Exact message or finding |
+| -------------------------------- | ------ | ------------------------------------ | ------------------------ |
+| LAN preview                      |        |                                      |                          |
+| Bind and reach (proxied refusal) |        |                                      |                          |
+| Browser-mode cross-site boot     |        |                                      |                          |
+| Cross-port 403                   |        |                                      |                          |
+| Revocation                       |        |                                      |                          |
+| Commands that open a browser     |        |                                      |                          |
+| Off-screen open-request prompt   |        |                                      |                          |
+| Agent open in a browser tab      |        |                                      |                          |
+
+- Pending native checks (Windows console attach, Codex environment and
+  `workspace-write` sandbox, 8-hour credential fallback): result or unavailable:
 
 ## Process and temporary-root cleanup
 

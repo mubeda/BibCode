@@ -144,6 +144,8 @@ function installTauriHarness(options?: {
           remotePort: 3773,
           remoteServerKind: "managed",
         });
+      case "desktop_bridge_ssh_forward":
+        return Promise.resolve(45123);
       case "desktop_bridge_show_context_menu":
         if ("rejectContextMenu" in (options ?? {})) {
           return Promise.reject(options?.rejectContextMenu);
@@ -1201,6 +1203,9 @@ describe("tauriDesktopBridge", () => {
     await expect(bridge.setClientSettings({} as never)).resolves.toBeNull();
     await expect(bridge.discoverSshHosts()).resolves.toBeNull();
     await expect(bridge.disconnectSshEnvironment(sshTarget)).resolves.toBeNull();
+    await expect(bridge.sshForward(sshTarget, 5173)).resolves.toBe(45123);
+    await expect(bridge.sshForward(sshTarget, 41000, 5173)).resolves.toBe(45123);
+    await expect(bridge.releaseSshForward(sshTarget, 5173)).resolves.toBeNull();
     await expect(bridge.resolveSshPasswordPrompt?.("request-1", "secret")).resolves.toBeNull();
     await expect(bridge.getServerExposureState()).resolves.toBeNull();
     await expect(bridge.applyServerExposure("network-accessible")).resolves.toBeNull();
@@ -1240,6 +1245,19 @@ describe("tauriDesktopBridge", () => {
     expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_discover_ssh_hosts", undefined);
     expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_disconnect_ssh_environment", {
       target: sshTarget,
+    });
+    expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_ssh_forward", {
+      target: sshTarget,
+      remotePort: 5173,
+    });
+    expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_ssh_forward", {
+      target: sshTarget,
+      remotePort: 41000,
+      preferredLocalPort: 5173,
+    });
+    expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_release_ssh_forward", {
+      target: sshTarget,
+      remotePort: 5173,
     });
     expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_apply_server_exposure", {
       desired: "network-accessible",

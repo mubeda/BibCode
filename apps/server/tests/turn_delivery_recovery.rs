@@ -731,6 +731,7 @@ fn crash_launch(provider: &str, state: &Path) -> ProviderLaunchRequest {
                     .unwrap_or_else(|| Path::new(".")),
             )
         }),
+        open_url: None,
     }
 }
 

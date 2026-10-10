@@ -246,4 +246,27 @@ describe("center panel adoption", () => {
       scopedThreadKey(scopeThreadRef(ENV, ThreadId.make("missing-host"))),
     );
   });
+  it("drops a tracked panel's tab when it leaves the live list and re-adopts it on return", () => {
+    const tracker = createCenterPanelAdoptionTracker();
+    applyPanelThreadAdoption(ENV, tracker, [
+      hostThread,
+      panelThread("panel-a"),
+      panelThread("panel-b"),
+    ]);
+    expect(surfaceIds()).toEqual([HOST_SURFACE_ID, "chat:panel-a", "chat:panel-b"]);
+    useCenterPanelStore.setState({
+      pendingChatPanelThreadKeys: new Set([
+        scopedThreadKey(scopeThreadRef(ENV, ThreadId.make("panel-b"))),
+      ]),
+    });
+
+    // Archived or deleted elsewhere; a panel still pending locally keeps its tab.
+    applyPanelThreadAdoption(ENV, tracker, [hostThread]);
+    expect(surfaceIds()).toEqual([HOST_SURFACE_ID, "chat:panel-b"]);
+
+    // Reopened elsewhere: adopted again as an inactive tab.
+    applyPanelThreadAdoption(ENV, tracker, [hostThread, panelThread("panel-a")]);
+    expect(surfaceIds()).toEqual([HOST_SURFACE_ID, "chat:panel-b", "chat:panel-a"]);
+    expect(activeSurfaceId()).toBe(HOST_SURFACE_ID);
+  });
 });

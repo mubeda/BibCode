@@ -417,10 +417,15 @@ impl ConfiguredGitManagerRpcServices {
             }
             "gitManager.previewMerge" => {
                 let input: GitManagerPreviewMergeInput = decode(request.payload, &request.tag)?;
-                let preview =
-                    merge::preview(&self.repository, &input.cwd, &input.source, &cancellation)
-                        .await
-                        .map_err(|error| merge_error(&request.tag, error))?;
+                let preview = merge::preview(
+                    &self.repository,
+                    &input.cwd,
+                    &input.source,
+                    input.target.as_deref(),
+                    &cancellation,
+                )
+                .await
+                .map_err(|error| merge_error(&request.tag, error))?;
                 Ok(merge_preview_value(preview))
             }
             "gitManager.listPullRequests" => {
@@ -1151,6 +1156,8 @@ struct GitManagerGetDiffInput {
 struct GitManagerPreviewMergeInput {
     cwd: PathBuf,
     source: String,
+    #[serde(default)]
+    target: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1707,6 +1714,21 @@ fn merge_error(operation: &str, error: GitManagerMergeError) -> Value {
             operation,
             "invalid-merge-source",
             "The requested merge source could not be resolved.",
+        ),
+        GitManagerMergeError::InvalidTarget => operation_error(
+            operation,
+            "local-branch-not-found",
+            "The merge target branch no longer exists; refresh the repository refs.",
+        ),
+        GitManagerMergeError::GitTooOld { found } => operation_error(
+            operation,
+            "git-too-old",
+            &format!("Merge preview needs Git 2.38 or later on this environment (found {found})."),
+        ),
+        GitManagerMergeError::MergeTreeFailed { detail } => operation_error(
+            operation,
+            "merge-tree-failed",
+            &format!("Git could not compute the merge preview: {detail}"),
         ),
         GitManagerMergeError::CurrentUnavailable => operation_error(
             operation,

@@ -325,6 +325,24 @@ fails before removing files; close that process and retry the same row. If Git
 removal succeeds but deleting the sidebar row fails, retrying that stale row is
 safe even when a new worktree has since reused the old folder.
 
+### Importing CLI sessions
+
+To continue a conversation you started in Claude Code or Codex outside
+BiBCode, open the project menu and choose **Import CLI sessions…**. The dialog
+lists the sessions run in the project's folder on the server in the last 30
+days, newest first, with the provider, last activity and message count. Select
+sessions (or **Select all**) and choose **Import**. Each becomes a thread with
+the session's recent messages (up to 200, always including the first prompt); your
+next message in it continues the same CLI conversation. BiBCode opens the most
+recently active imported thread and reports how many sessions were imported or
+skipped and why.
+
+A session imported earlier shows **Already imported** with **Open**; importing
+it again does nothing. Conversations started in BiBCode, sessions run in a
+subfolder, and sessions run in another worktree are not listed. Only the
+default Claude Code and Codex providers are scanned, and a provider turned off
+in settings is skipped.
+
 ## Center Panel
 
 Terminal input pauses if delivery fails. **Reconnect input** reattaches to the
@@ -339,6 +357,9 @@ thread. While present, it remains mounted throughout layout and tab changes. The
 chat header `+` menu contains:
 
 - enabled AI providers, which create new chat panels
+- Reopen closed chat, which lists this thread's ten most recently closed chat
+  panels, newest first; it is disabled with **No closed chats** when there are
+  none, and offers a retry when closed chats could not be loaded
 - Open Terminal, which creates a shell terminal panel in the current worktree
 - enabled provider terminal actions, which launch the selected provider CLI in
   the current worktree using that provider instance's configured binary path
@@ -347,7 +368,13 @@ chat header `+` menu contains:
 Each extra chat panel is an isolated AI session. For contributors, this is
 implemented as a hidden sibling thread with `kind: "panel"` that shares the host
 thread's project, branch, and worktree. Panel threads are hidden from the left
-panel and are deleted when their tab closes. A new chat panel's tab shows
+panel and from Settings → Archived. Closing a chat panel's tab stops its running
+turn, keeps its queued messages waiting, and archives the panel thread, so its
+history is kept and it can resume;
+**Reopen closed chat** brings it back as the active tab (messages queued
+behind a stopped turn then offer **Send now**), and a
+**Failed to reopen chat panel** toast gives the reason if that fails. Deleting
+the host thread deletes its chat panels, open or closed. A new chat panel's tab shows
 **Opening chat…** until the server confirms the panel thread; if creation fails,
 the tab closes and a **Failed to open chat panel** toast gives the reason.
 
@@ -359,8 +386,8 @@ client connected to the same server. A panel opened on another client is added
 to this client's host thread as a new tab in the focused pane without switching
 to it; its terminal history or chat messages load when you open the tab.
 Closing a panel closes it on every client: closing a terminal tab ends its
-session, and closing a chat panel deletes its thread. Tab order and splits stay
-per client.
+session, and closing a chat panel archives its thread. A reopened chat panel
+returns to every client. Tab order and splits stay per client.
 
 Only the focused center pane may programmatically focus its terminal. Moving
 focus to a chat pane leaves visible terminals mounted but prevents them from
@@ -478,6 +505,17 @@ remains in the timeline with its copy button so you can prepare the corrected
 message. Other failed deliveries still offer Retry and Dismiss; uncertain
 deliveries still warn that Retry could send a duplicate.
 
+When BiBCode cannot resume a thread's provider conversation (the provider no
+longer has it, for example after its history was cleared), it starts a new one
+and the thread shows **Couldn't resume the previous <provider> conversation.
+Started a new one with a summary of this thread.** Your next message reaches the
+provider together with the thread's earlier messages (up to the last 40, about
+24,000 characters, oldest left out first), so the agent can pick up where it left
+off; the thread still shows only what you typed. A provider command starting with
+`/` is sent as written, and the summary goes with the next ordinary message. A
+retried message that had to start a new conversation shows **Sent in a new
+conversation with a summary of earlier messages.**
+
 ### Composer context window
 
 In the normal composer footer, controls remain visible in this order: MCP
@@ -540,7 +578,8 @@ center creation actions, so new chats and terminals open there.
 Drag pane dividers to resize them. Layout, focus, tab order, and split ratios
 persist across reloads. Closing a split pane merges its tabs into the adjacent
 layout without closing chats or terminals. Explicit tab close commands remain
-pane-local and do close their underlying panel thread or terminal session.
+pane-local and do archive their chat panel thread or end their terminal
+session.
 
 ## Git Manager
 
@@ -647,7 +686,17 @@ whenever the source has commits the current branch lacks, it records a merge
 commit. Both modes override repository merge settings such as `merge.ff` or
 branch merge options that would otherwise skip the commit, squash, or reject
 the merge. A source with no commits the current branch lacks is reported as
-nothing to merge and Merge stays disabled. **Rebase…** opens a branch chooser
+nothing to merge and Merge stays disabled. Sources include remote branches,
+listed under **Remote**. **Into** chooses the branch to merge into; it defaults
+to the checked-out branch. Choosing another local branch updates that branch
+without checking it out: your files and the checked-out branch do not change,
+the checked-out branch can be the source, Squash is not offered, and commit
+hooks do not run (commit signing is still honored). A merge into another branch
+that would conflict stays disabled with a hint to check that branch out and
+merge there, and a branch checked out in another worktree is blocked with the
+worktree's path. On Git older than 2.38 there is no preview: a merge into the
+checked-out branch stays available, and merging into another branch is
+disabled. **Rebase…** opens a branch chooser
 and warns when the rewrite will require updating an upstream with
 force-with-lease.
 Repositories with a merge, rebase, cherry-pick, or revert in progress show a
@@ -922,14 +971,10 @@ the setting is not shown.
 
 A link to `localhost`, a `*.localhost` name, any `127.x.x.x` address, `::1`, or a
 wildcard address (`0.0.0.0`, `[::]`) means the server's machine, not this
-computer. From a thread on a LAN, tailnet (`100.64.0.0/10`), or WSL environment,
-or one reached by a host name such as `devbox` or `box.lan`, it opens on the
-server's address. From a thread on an SSH or BiBCode Connect environment, or one
-reached by a public IP address, BiBCode shows "Can't open this address here"
-with the address and **Copy link**, and does not open this computer's
-`localhost`, whatever the target, modifier, or setting; reaching those ports is
-not supported yet. If the thread's environment isn't connected, the notice says
-so and asks you to reconnect it.
+computer. From a thread on this computer's own server it opens directly. From
+any other thread BiBCode never opens this computer's `localhost`, whatever the
+target, modifier, or setting; see
+[Previewing the server's dev servers](#previewing-the-servers-dev-servers).
 
 A file outside the thread's workspace can't be previewed; the notice offers
 **Open in editor**. If the system browser fails to open a link, the notice shows
@@ -940,9 +985,139 @@ sandbox with no origin of their own, so their scripts can't use `localStorage`
 or cookies. The agent's `preview_open` tool works on desktop for opening and
 navigating a tab; reading the page, clicking, and typing aren't supported yet.
 On desktop it always shows the tab it opens, and a request for a thread that
-isn't on screen times out.
+isn't on screen times out. In a browser tab, `preview_open` shows the open
+prompt (below) and tells the agent the open is waiting for you.
 A server a terminal starts is listed as a discovered port for that terminal and
 its thread.
+
+### Previewing the server's dev servers
+
+A dev server or tool listening on the server's loopback, such as
+`http://localhost:5173`, opens through the server's preview gateway when the
+thread's environment is:
+
+- on a LAN, tailnet (`100.64.0.0/10`), or WSL address, or reached by a host
+  name such as `devbox` or `box.lan`; the preview loads from
+  `http://<server address>:<gateway port>`;
+- desktop-managed SSH, on desktop only; the desktop forwards the gateway port
+  over the SSH connection. The preview loads from the same address as on the
+  server, such as `http://localhost:5173`, so sign-in redirects and other
+  links to that address keep working. When that port is already in use on
+  your computer, it loads from `http://127.0.0.1:<local port>` instead, and a
+  note says the port is in use and that apps expecting it (OAuth sign-in, for
+  example) may not work until you free it.
+
+The gateway opens one port per thread and dev-server port, so the client must
+be able to reach that host on ports other than BiBCode's own. The BiBCode
+browser's address bar and the thread's shared tab state keep showing the
+`localhost` address, and its **Reload** opens the address through the gateway
+again. A
+gateway port closes when its last BiBCode browser tab closes, after 10 minutes
+without connections, when its thread is deleted, or when the server stops.
+Closing a system-browser or browser tab doesn't close it; the idle timeout
+does.
+
+Over SSH, the desktop keeps a tab's forward for a minute after you switch to
+another tab, so switching back reuses it; closing the tab ends its forward at
+once. An address opened in the system browser keeps its forward for 5 minutes.
+
+The previewed app runs on a new origin, not `localhost`. The gateway sends the
+app `Host: localhost:<port>`, but anything the browser checks against the page's
+own origin breaks if the app hard-codes `localhost`: OAuth redirect URLs, CORS
+allowlists, and links or scripts that name `http://localhost:<port>`.
+
+These cases show "Can't open this address here" with the address and **Copy
+link**:
+
+| Situation                                                           | Message                                                                                                               |
+| ------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| BiBCode Connect, a public IP address, or SSH in a browser tab       | "This address is on <environment>, not this computer. Opening its ports from here isn't supported yet."               |
+| The environment isn't connected, or its SSH connection is down      | "<environment> isn't connected. Reconnect it, then open the link again."                                              |
+| An `https://` dev server                                            | "HTTPS dev servers can't be previewed through the gateway yet; serve over HTTP or open it on <environment> directly." |
+| Nothing listens on the port                                         | "Nothing is listening on port <port> on <environment>."                                                               |
+| The server refused the address                                      | "BiBCode can only preview plain HTTP addresses on <environment>'s own localhost."                                     |
+| You reached the server on a public address                          | "Previews aren't available on a public address. Open it on <environment> directly."                                   |
+| You reached the server through a reverse proxy or Tailscale Serve   | "Previews aren't available through a proxied address. Open it on <environment> directly."                             |
+| The gateway or SSH forward failed, or this client's session expired | "Couldn't open a preview connection to <environment>. Try again, or reconnect <environment> if it keeps failing."     |
+| A terminal with no thread                                           | "Open this address from a thread's chat or terminal to reach it from here."                                           |
+
+When a BiBCode browser tab's address can't load, the tab shows the reason in
+place of the page, and **Reload** resolves the address again and reopens it.
+For BiBCode's own reasons (the messages above) the page reads "Can't show this
+page here" and shows the sentence alone, without network error codes or
+connection tips. A network error reads "This site can't be reached".
+
+A refusal about the address itself (HTTPS, nothing listening, an address the
+server won't preview) shows the same on every client. A failure on this
+computer's side shows on this computer only, because another client may load
+the page fine: its SSH forward, its BiBCode session, the public or proxied
+address it reached the server on, or a failure resolving or forwarding the
+address. After a page has loaded, a dropped forward shows the webview's own
+error page instead; **Reload** recovers. An agent asking for the tab's status,
+or opening a new tab, gets the same reason as an error.
+
+Gateway traffic is plain HTTP on the server's address, outside BiBCode's
+encrypted transport, so previews need a direct private route to the server: a
+LAN, tailnet, or WSL address, or a desktop-managed SSH connection. When the
+environment's address is a public IP address, BiBCode doesn't use the gateway.
+When you reach the server on a public address under a host name, or through a
+reverse proxy or Tailscale Serve, the server refuses the preview with the
+messages above. See [Reverse proxies](./remote-access.md#reverse-proxies).
+
+**In a browser tab**, a gateway link opens a new browser tab. The tab opens
+blank at once and loads the preview after BiBCode resolves it; if resolution
+fails, the tab closes and the notice appears. If the browser blocks the new
+tab, a bar at the top of the window asks again:
+
+- "Agent wants to open <address>": the agent's `preview_open`.
+- "A command wants to open <address>": a `$BROWSER` request (below).
+- "A command in “<thread title>” wants to open <address>": a `$BROWSER`
+  request from a thread that isn't on screen, on desktop too. Its button reads
+  **Show thread and open**.
+- "Your browser blocked a new tab for <address>": a click whose tab was
+  blocked, followed by "Allow pop-ups for this site to open links directly."
+
+**Open** opens the address from your click (**Show thread and open** first
+shows the thread the bar names); **Copy link** copies the address and keeps the request;
+**Dismiss** drops the request. The bar shows one request at a time, with
+"(N more waiting)" when more are queued, and keeps a request whose open failed
+so you can try again. The gateway pages a preview tab can show:
+
+- "This preview link expired. Go back to BiBCode and open it again." The
+  preview's sign-in is gone: the link was already used or is older than 60
+  seconds, or your BiBCode session ended or was revoked. A live preview stops
+  within 30 seconds of its BiBCode session being revoked.
+- "Nothing is listening on port <port> on <environment>." The dev server
+  stopped.
+- "This request didn't come from the preview itself, so the gateway blocked
+  it." Another page, such as another preview, tried to send data or open a
+  live connection to this one.
+- "This preview has too many open connections. Try again in a moment."
+
+Reloading such a browser tab works while its gateway port is open. After the
+port closes, the tab shows a connection error or the expired page; open the
+link again from BiBCode, which starts a new gateway session.
+
+**Commands that open a browser.** Every agent and terminal session gets
+`BROWSER` and `BRAINSTORM_OPEN_CMD` set to `bibcode-open-url` (a
+`bibcode-open-url.exe` on Windows), so tools that launch a browser through
+either variable, such as the brainstorming companion, ask BiBCode instead of
+opening a browser on the server's machine. One BiBCode client takes the
+request. A visible client showing that thread takes it at once. Otherwise,
+after 2 seconds, a visible client takes it and asks with the "A command in
+“<thread title>” wants to open" bar; a client whose window is hidden takes it
+only while showing the thread. On desktop, a request from a thread on screen
+opens like a clicked link, in the system browser when the thread is only shown
+in a side panel. In a browser tab it always waits for **Open** on the bar. A
+request no client takes within 60 seconds is dropped.
+
+`bibcode-open-url` prints the address instead when it has no BiBCode session
+(for example, run outside an agent or terminal session) or when BiBCode can't
+take the request. Its credential lasts 8 hours from the start of the agent or
+terminal session and is not renewed, so a longer session falls back to
+printing. It also prints when the command can't reach BiBCode, for example
+inside a sandbox without network access. See
+[Provider architecture](../architecture/providers.md) for the mechanism.
 
 ### Activity and targeted Stop
 
@@ -1030,12 +1205,24 @@ The Source Control panel is Orca-parity for the shipped local Git workflow:
   editor, ignore file name, and ignore parent folder when the corresponding host
   actions are available.
 - Commit history and AI commit-message generation are available in the panel.
+- **Merge into current branch…** in the dropdown opens the merge dialog for the
+  checked-out branch with local and remote sources. **Fetch** refreshes the
+  selected remote branch's remote, or every remote for a local source, before
+  you merge; Merge records a merge commit. The entry explains why it is
+  disabled: no Git Manager support on the environment, a detached HEAD, an
+  operation already in progress, or uncommitted changes.
+- While a merge is in progress the panel shows a merge strip. **Commit merge**
+  stays disabled until every conflict is resolved and staged; **Abort** asks
+  for confirmation and restores the pre-merge state. **Merge Changes** lists
+  each conflicted file with **Ours**, **Theirs**, **Mark resolved** (stage the
+  file as you edited it) and open-in-editor. The usual Commit action is hidden
+  until the merge finishes.
 - Successful saves from the built-in file editor notify active Source Control
   subscriptions immediately. Periodic status polling remains a fallback for
   changes made by external tools.
 
-Stash and amend are intentionally not present in this right-panel Source
-Control surface; this matches the Orca reference behavior for this pass. The
+Stash, amend, rebase, and squash merges are intentionally not present in this
+right-panel Source Control surface; this matches the Orca reference behavior for this pass. The
 project-scoped Git Manager is a separate centre surface and does provide stash
 operations and amend.
 

@@ -29,6 +29,60 @@ The request cannot override server-owned provider settings or credentials. It
 uses the same authenticated environment RPC path in browser and desktop clients.
 See [provider capability ownership and lifecycle](./providers.md#workspace-capability-discovery).
 
+## CLI session import
+
+`agentSessions.scan { projectId }` and
+`agentSessions.import { projectId, sessions: [{ provider, sessionId }] }` are
+unary RPCs that both require `orchestration:operate`, because scan returns
+transcript content (first prompts as titles) from the server host's home
+directory, outside BiBCode's own data. They are owned by
+[`agent_sessions_rpc`](../../apps/server/src/production/agent_sessions_rpc.rs);
+the bounded transcript reader is
+[`agent_sessions`](../../apps/server/src/agent_sessions/mod.rs). Both fail with
+`AgentSessionsError { message }`.
+
+Scan reads Claude Code and Codex transcripts on the **server host** for the
+built-in `claudeAgent` and `codex` instances (a disabled driver is not
+scanned). It lists sessions whose first recorded working directory is the
+project's workspace root after canonicalization, whose file changed in the last
+30 days, newest first, at most 200 (`truncated` reports more). Each candidate
+carries title, last activity and visible message count. `alreadyImported` is set
+once thread `import:<instanceId>:<sessionId>` was deleted or its history command
+was accepted, and `threadId` names that thread while it is live; an import
+interrupted before its history committed stays selectable. Sessions another
+BiBCode thread already runs (a `provider_turn_outbox.provider_session_id` or a
+`provider_session_runtime` cursor owned by a thread other than their import)
+are left out, because BiBCode's own conversations write into the same homes;
+import skips them too. The scan keeps only metadata; import reads the
+transcript again.
+
+Import handles each requested session independently and reports it as
+`imported { sessionId, threadId }` or `skipped { sessionId, reason }`. It
+re-reads and re-validates the transcript, then:
+
+1. dispatches `thread.create` with command ID `<threadId>:create`, unless an
+   interrupted import already created the thread;
+2. inserts a `suspended` `provider_session_runtime` row with the CLI session as
+   its resume cursor only when the thread has no row, turn, or user message yet
+   (see
+   [imported CLI sessions](./providers.md#imported-cli-sessions)); a thread that
+   started its own conversation before an interrupted import finished keeps it
+   and the session is skipped;
+3. dispatches the server-internal `thread.history.import` with command ID
+   `<threadId>:history`, which emits one `thread.message-sent` per message
+   (`turnId: null`, `streaming: false`, no attachments) for at most 200
+   messages: the first user message and the latest ones. Its events carry
+   `metadata.historyImport: true`, so effects capture no checkpoint baseline
+   for them; the first real turn takes its own. The engine rejects it
+   once the thread has a turn or a user message, so a turn another client
+   started during the import keeps CLI history out of its conversation.
+
+Both commands use a digest of the step and thread ID, so a retry after a
+partial failure replays the committed steps; an accepted history command marks
+the session imported. A deleted import keeps its thread ID and is skipped
+rather than recreated. `thread.history.import` is rejected by public
+`orchestration.dispatchCommand` like every other server-internal command.
+
 ## Session establishment
 
 `ConnectionResolver` first produces a `PreparedConnection`. Remote bearer and
@@ -281,8 +335,11 @@ A physical observation starts with one
 `git -c core.quotePath=false status --porcelain=2 --branch --untracked-files=all`.
 Its headers supply branch, upstream, and ahead/behind state. Staged and
 unstaged numstat commands run concurrently only when the porcelain records show
-those areas. Default-ref, remote-provider, and pull-request enrichment remain
-separate when the requested result needs them. If porcelain fails, only a
+those areas. Each unmerged record yields one `conflicted` entry in the unstaged
+area, and the Git Manager in-progress detector runs alongside the remote-name
+read to fill optional `operationInProgress`; a failed probe omits the field and
+never fails status. Default-ref, remote-provider, and pull-request enrichment
+remain separate when the requested result needs them. If porcelain fails, only a
 successful existing repository probe returning false maps to the compatible
 non-repository result; otherwise the original structured Git error is returned.
 Status and background-observation Git reads use `GIT_OPTIONAL_LOCKS=0`. Fetch
@@ -426,6 +483,33 @@ command in the current supervised-process implementation—and exactly one
 `finished` or `failed` event. Client interrupt and socket cancellation reach the
 supervised child process.
 
+`merge-into {source, target}` merges a full source ref into a local branch that
+is not checked out, without touching any worktree. It is advertised by the
+`gitManagerMergeIntoOperations` capability; an older server cannot decode the
+variant, so clients send it only when advertised. The server refuses a target
+that is checked out in the selected worktree (`target-is-current`), missing or
+written as a revision expression (`local-branch-not-found`), a symbolic ref
+(`invalid-request`), or checked out in another worktree (blocked
+`worktree-checked-out`); a dirty selected worktree does not block it. On Git
+older than 2.38 it fails with `git-too-old`. Otherwise it resolves
+`refs/heads/<target>` and the source once, reports "Already up to date." when
+the source is already contained, and computes the merge with
+`merge-tree --write-tree` (with `--attr-source=<target>` on Git 2.43 or
+later). A conflict fails with `conflicts` before any write, because no checkout
+holds the conflict; unrelated histories fail with `unrelated-histories`. The
+commit is created with `commit-tree -p <target> -p <source>`, passing `-S` when
+`commit.gpgSign` is true, and published with
+`git -c maintenance.auto=false -c fetch.writeCommitGraph=false -c fetch.bundleURI= fetch --no-tags --no-prune --no-recurse-submodules --no-write-fetch-head --quiet . <commit>:refs/heads/<target>`
+and `GIT_REFLOG_ACTION="merge-into <source>"`. Git's refusal for a branch in use
+by any worktree maps to blocked `worktree-checked-out`; any other publish failure
+re-reads the target and reports `non-fast-forward` if it moved, or Git's error
+otherwise. Commit and merge hooks do not run; a `reference-transaction` hook
+does and can reject the publish. `gitManager.previewMerge` accepts an optional
+`target` and then compares against `refs/heads/<target>`, returning
+`current = target`; it fails with `git-too-old` below Git 2.38 and with
+`merge-tree-failed` (carrying Git's first stderr line) for any merge-tree result
+other than clean, conflicted, or Git's unrelated-histories refusal.
+
 Branch selections send `branch-checkout.name` as a fully qualified
 `refs/heads/<branch>` or `refs/remotes/<remote>/<branch>` ref, keeping local
 names that resemble remote refs unambiguous. The server resolves that exact snapshot
@@ -467,9 +551,14 @@ Background failures preserve loaded commits and offer a Retry action.
 
 Every Git Manager mutation revalidates the selected checkout after admission;
 operations with server-authored blocked conditions recompute those reasons
-there as well. Mutations then reuse
-`WorktreeCatalogService`'s existing project lock followed by its optional
-physical-repository lock. The non-waiting acquisition returns the structured
+there as well. Mutations reuse `WorktreeCatalogService`'s existing project lock followed by
+its optional physical-repository lock. Inside those locks, branch and sync
+operations then take the checkout's status-mutation guard before building that
+refs snapshot and hold it through execution, so `vcs.*` writes, which take the
+guard but not the project lock, cannot change the repository between validation
+and execution. Unlike `vcs.*` failures that reach no Git effect, a branch or
+sync operation that ends blocked still fences status reads, because it held the
+guard while validating. The non-waiting acquisition returns the structured
 `operation-in-flight` blocked reason when either lock is occupied; there is no
 second Git Manager lock and no silently queued competing operation. The client
 uses each returned `GitManagerBlockedReason.message` verbatim in disabled-state
@@ -1135,7 +1224,10 @@ and derives project, `panel` kind, branch, and worktree path. The panel
 thread records the host as `hostThreadId` on `thread.created`, persisted in
 `projection_threads.host_thread_id` and emitted on thread shells and details so
 every client can open the panel under its host; public `thread.create` rejects a
-client-supplied `hostThreadId`. Similarly,
+client-supplied `hostThreadId`. A generic `thread.delete` emits `thread.deleted`
+for every non-deleted panel whose `hostThreadId` is the deleted thread, live or
+archived, in id order before the thread's own event and in the same command, so
+the existing deletion effects clean up their sessions and terminals. Similarly,
 `worktree.retarget` accepts project/thread IDs, an opaque worktree key, and an
 expected catalog generation. It refreshes and revalidates present
 nonprimary/nonbare membership and exclusive ownership before dispatching the
@@ -1888,7 +1980,14 @@ failed does not block promotion; resolution metadata records that prior state
 so a rejected head can be dismissed without stranding its tail. Dismissal of
 sending or uncertain work does not prove the provider received nothing, so
 those placeholders and bound running turns continue to block automatic
-promotion. Explicit Send now remains available under its client gate.
+promotion. An archived `panel` thread (a closed chat panel) never promotes
+automatically, and delivery neither selects nor claims its pending rows, so
+neither its queue nor a prompt sent just before closing starts work after its
+tab closed; unarchiving it resumes both. A delivery claimed before the panel
+closed is refused at the provider supervisor before any driver I/O and returns
+to pending, and accepting `thread.archive` for a panel interrupts its provider
+session on the server, so closing a panel stops its work without relying on the
+client's view of the session. Explicit Send now remains available under its client gate.
 
 Pending start deliveries from older clients also wait while the session is
 running or starting; the SQLite claim repeats this check so a stale worker read
@@ -1902,8 +2001,9 @@ command-id convention and require the automatic gate. Client **Send now** may
 promote the head when the session is neither running nor starting and no
 pending/sending row exists, including a held head. It clears only that hold.
 The delivery service registers its existing `Arc<Notify>` with the engine;
-after committed ready, steer, promote, resolve, and relevant request-resolution
-commands, the engine wakes the worker without retaining the service itself.
+after committed ready, steer, promote, resolve, unarchive, and relevant
+request-resolution commands, the engine wakes the worker without retaining the
+service itself.
 The event's `createdAt` is the promote command's time. Its message projector
 stamps the addressed user message's `created_at` and `updated_at` to that time
 in the same transaction, so the promoted prompt appears after the preceding
@@ -1926,7 +2026,8 @@ reconciliation or provider claiming; restart preserves their queued state and
 payload until an eligible promotion or explicit user action. Before delivery
 starts, startup reconciles abandoned live runtime rows and every projected
 session still starting, connecting, or running without a live runtime row,
-including rows removed by graceful shutdown. It settles the abandoned turn's
+including sessions whose row graceful shutdown left `suspended` (the row keeps its
+resume cursor). It settles the abandoned turn's
 streaming assistant messages, clears the active turn, and projects the existing
 restart error as `session_stopped`. That error settlement holds queued messages
 for explicit **Send now** and releases the pending-start claim gate. Completed
@@ -1959,8 +2060,21 @@ receipt, FIFO position, payload, model/options and delivery key. It refuses chan
 delivery ownership or newly restored/conflicting runtime identity; another native
 session's cursor remains a rejection. The retry starts without resume, freezes to
 the new native session, and immediate acceptance records `startedNewConversation`
-with the delivered state. The user message shows "Sent in a new conversation. The
-agent won't remember earlier messages in this thread." in muted status text. A
+with the delivered state. A retry that resumes its frozen session but finds the
+provider no longer has it (the driver starts a different conversation) recovers
+the same way inside `launch_session`: before the new cursor is saved, the saved
+cursor is cleared and the same guarded update releases the start, so the retry is
+delivered once in the new conversation instead of failing its identity check; a
+crash between those steps leaves a cursorless runtime the next retry recovers
+from. Reconciliation launches never release a frozen start. A restart
+reconciliation whose launch finds the frozen conversation gone starts nothing:
+it shuts the replacement down, keeps the saved cursor and the frozen row, and
+settles the row uncertain because whether the lost conversation received it is
+unknowable, so a later restart reaches the same answer. An explicit Retry then
+releases it into a new conversation as above. The new conversation receives the thread's earlier
+messages ([context handoff](./providers.md#resume-failures-and-context-handoff)),
+and the user message shows "Sent in a new conversation with a summary of earlier
+messages." in muted status text. A
 still-resumable frozen session resumes normally without that notice. Automatic
 reconciliation never unfreezes ambiguous work. Nonaccepted fresh attempts keep
 their existing outcomes and no notice; the fact is not retained for a later

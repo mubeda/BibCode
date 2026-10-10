@@ -27,6 +27,27 @@ use super::{
 const PROVIDER: &str = "cursor";
 const FIXED_EVENT_TIME: &str = "2026-07-10T00:00:00.000Z";
 
+/// Phrases that mean the saved Cursor session itself is gone. A `session/load`
+/// error that does not say this can be transient, so the saved id must be kept.
+const GONE_CURSOR_SESSION_SNIPPETS: &[&str] = &[
+    "not found",
+    "does not exist",
+    "doesn't exist",
+    "no such session",
+    "unknown session",
+    "missing session",
+];
+
+/// `true` only when Cursor reported that this session cannot be loaded again.
+fn session_load_is_permanently_gone(message: &str) -> bool {
+    let lowered = message.to_ascii_lowercase();
+    let names_session = lowered.contains("session") || lowered.contains("conversation");
+    names_session
+        && GONE_CURSOR_SESSION_SNIPPETS
+            .iter()
+            .any(|snippet| lowered.contains(snippet))
+}
+
 #[derive(Clone, Debug)]
 pub struct CursorSessionOptions {
     pub thread_id: String,
@@ -230,26 +251,36 @@ impl CursorSessionRuntime {
         connection
             .request("authenticate", json!({ "methodId": "cursor_login" }))
             .await?;
-        let response = if let Some(session_id) = self.inner.options.resume_session_id.clone() {
-            connection
-                .request("session/load", json!({ "sessionId": session_id }))
-                .await?
-        } else {
-            connection
-                .request(
-                    "session/new",
-                    json!({
-                        "cwd": self.inner.options.cwd,
-                        "mcpServers": self.inner.options.mcp_servers,
-                    }),
-                )
-                .await?
+        let new_session = json!({
+            "cwd": self.inner.options.cwd,
+            "mcpServers": self.inner.options.mcp_servers,
+        });
+        let mut loaded_session_id = self.inner.options.resume_session_id.clone();
+        let response = match loaded_session_id.clone() {
+            Some(session_id) => {
+                match connection
+                    .request("session/load", json!({ "sessionId": session_id }))
+                    .await
+                {
+                    Ok(response) => response,
+                    // The saved session is gone, so loading it again cannot succeed. Any other
+                    // provider error may be transient and must keep the saved id for the next try.
+                    Err(AcpProtocolError::RemoteRequest { message, .. })
+                        if session_load_is_permanently_gone(&message) =>
+                    {
+                        loaded_session_id = None;
+                        connection.request("session/new", new_session).await?
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            None => connection.request("session/new", new_session).await?,
         };
         let session_id = response
             .get("sessionId")
             .and_then(Value::as_str)
             .map(str::to_owned)
-            .or_else(|| self.inner.options.resume_session_id.clone());
+            .or(loaded_session_id);
         let session_id = session_id.ok_or(CursorRuntimeError::MissingProviderSessionId)?;
         *self.inner.provider_session_id.lock().await = Some(session_id.clone());
         let config_options = response
@@ -1477,5 +1508,19 @@ mod tests {
             }
         }
         assert!(resolved && completed);
+    }
+
+    #[test]
+    fn only_a_missing_session_load_error_abandons_the_saved_session() {
+        assert!(session_load_is_permanently_gone("Session not found"));
+        assert!(session_load_is_permanently_gone(
+            "The conversation does not exist"
+        ));
+        assert!(!session_load_is_permanently_gone("Internal error"));
+        assert!(!session_load_is_permanently_gone("rate limit exceeded"));
+        assert!(!session_load_is_permanently_gone(
+            "Unknown error while loading session"
+        ));
+        assert!(!session_load_is_permanently_gone("model not found"));
     }
 }

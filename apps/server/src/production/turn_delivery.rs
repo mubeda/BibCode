@@ -748,6 +748,9 @@ async fn recover_sending(
         let (next_state, detail) = match outcome {
             ProviderReconciliationOutcome::Found => (TurnDeliveryState::Delivered, None),
             ProviderReconciliationOutcome::Absent => (TurnDeliveryState::Pending, None),
+            ProviderReconciliationOutcome::ConversationLost { detail } => {
+                (TurnDeliveryState::Uncertain, Some(detail))
+            }
             ProviderReconciliationOutcome::Unavailable { detail }
                 if matches!(row.provider_kind.as_str(), "codex" | "opencode") =>
             {
@@ -839,6 +842,17 @@ async fn fill_available_slots(
                 .await
                 .map_err(|error| error.to_string())?
                 .is_some_and(|session| matches!(session.status.as_str(), "running" | "starting"))
+        {
+            continue;
+        }
+        // A closed (archived) chat panel starts nothing until it is reopened; unarchive wakes
+        // delivery. The claim repeats this check.
+        if engine
+            .repositories()
+            .get_thread(row.thread_id.clone())
+            .await
+            .map_err(|error| error.to_string())?
+            .is_some_and(|thread| thread.kind == "panel" && thread.archived_at.is_some())
         {
             continue;
         }
@@ -2013,6 +2027,68 @@ mod tests {
         assert_eq!(message.delivery_state.as_deref(), Some("queued"));
         assert_eq!(message.delivery_reason, None);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn restart_recovery_marks_a_delivery_uncertain_when_its_conversation_is_lost() {
+        let database = Database::open_in_memory().await.expect("database");
+        database.call(|connection| {
+            run_migrations(connection, None)?;
+            connection.execute(
+                "INSERT INTO orchestration_command_receipts (command_id, aggregate_kind, aggregate_id, accepted_at, result_sequence, status, error, payload_digest) VALUES ('recover', 'thread', 'thread-1', '2026-08-01T00:00:00Z', 0, 'accepted', NULL, 'digest')",
+                [],
+            )?;
+            connection.execute(
+                "INSERT INTO provider_turn_outbox (command_id, thread_id, message_id, provider_instance_id, provider_kind, provider_session_id, delivery_key, payload_json, state, attempts, last_error, created_at, updated_at) VALUES ('recover', 'thread-1', 'message-1', 'opencode', 'opencode', NULL, 'key', '{}', 'sending', 1, NULL, '2026-08-01T00:00:00Z', '2026-08-01T00:00:01Z')",
+                [],
+            )?;
+            Ok(())
+        }).await.expect("seed");
+        let engine = OrchestrationEngine::start(database, EngineOptions::default())
+            .await
+            .expect("engine");
+        let routed = Arc::new(AtomicUsize::new(0));
+        let router: ProviderDeliveryRouter = Arc::new({
+            let routed = routed.clone();
+            move |_, _| {
+                routed.fetch_add(1, Ordering::SeqCst);
+                Box::pin(ready(ProviderDeliveryOutcome::Accepted { turn_id: None }))
+            }
+        });
+        let service = TurnDeliveryService::start_with_delivery_router(
+            engine.clone(),
+            1,
+            router,
+            Arc::new(|_| {
+                Box::pin(ready(ProviderReconciliationOutcome::ConversationLost {
+                    detail: "conversation lost".to_owned(),
+                }))
+            }),
+        );
+
+        let row = timeout(Duration::from_secs(5), async {
+            loop {
+                let row = engine
+                    .repositories()
+                    .get_provider_turn_delivery("recover".to_owned())
+                    .await
+                    .expect("outbox")
+                    .expect("delivery");
+                if row.state != TurnDeliveryState::Sending {
+                    break row;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("recovery settles the row");
+        // Unknowable arrival waits for the user's explicit retry instead of resending.
+        assert_eq!(row.state, TurnDeliveryState::Uncertain);
+        assert_eq!(row.last_error.as_deref(), Some("conversation lost"));
+        assert_eq!(routed.load(Ordering::SeqCst), 0);
+
+        service.shutdown().await;
         engine.shutdown().await;
     }
 
