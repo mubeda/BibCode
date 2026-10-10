@@ -976,6 +976,19 @@ export function verifySeededUpgradeOutcome(
   }
 }
 
+export function remoteEvidenceReadFailure(
+  error: unknown,
+): SeededDesktopUpgradeSmokeError | undefined {
+  const code =
+    typeof error === "object" && error !== null && "code" in error
+      ? (error as { readonly code?: unknown }).code
+      : undefined;
+  if (code !== "ENOENT") return undefined;
+  return new SeededDesktopUpgradeSmokeError(
+    "The remote-install lane finished without remote-rpc.json.",
+  );
+}
+
 export function assertWebDriverPhaseExit(input: {
   readonly exitCode: number;
   readonly installAttempted: boolean;
@@ -2297,9 +2310,15 @@ const runUpgradeLane = async (input: {
     });
   }
   if (input.lane === "remote-install") {
-    const remote = await readObservation<
-      Omit<RemoteInstallEvidence, "preUpdateBackups"> & { widened: boolean }
-    >(NodePath.join(input.layout.evidenceDirectory, "remote-rpc.json"));
+    const remotePath = NodePath.join(input.layout.evidenceDirectory, "remote-rpc.json");
+    let remote: Omit<RemoteInstallEvidence, "preUpdateBackups"> & { widened: boolean };
+    try {
+      remote = await readObservation(remotePath);
+    } catch (error) {
+      const failure = remoteEvidenceReadFailure(error);
+      if (failure !== undefined) throw failure;
+      throw error;
+    }
     await writePrivateJson(
       NodePath.join(input.layout.evidenceDirectory, "remote-host.json"),
       remote,
