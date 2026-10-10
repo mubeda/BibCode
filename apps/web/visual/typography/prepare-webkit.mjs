@@ -12,17 +12,31 @@ export async function prepareWebkit({
   const directory = await NodeFSP.mkdtemp(NodePath.join(runnerTemp, "typography-webkit-"));
   const extracted = NodePath.join(directory, "root");
   await NodeFSP.mkdir(extracted);
+  const lists = NodePath.join(directory, "lists");
+  const cache = NodePath.join(directory, "cache");
+  await NodeFSP.mkdir(NodePath.join(lists, "partial"), { recursive: true });
+  await NodeFSP.mkdir(cache);
+  const aptOptions = ["-o", `Dir::State::Lists=${lists}`, "-o", `Dir::Cache=${cache}`];
   function run(command, args) {
     const result = spawnSync(command, args, {
       cwd: directory,
       encoding: "utf8",
       timeout: 180_000,
     });
-    if (result.status !== 0) throw new Error(`Runner-local WebKit preparation failed: ${command}.`);
+    if (result.status !== 0) {
+      const reason = /404\s+Not Found/.test(result.stderr ?? "")
+        ? "stale-download"
+        : /Unable to locate package|no installation candidate/.test(result.stderr ?? "")
+          ? "missing-package"
+          : "command-failed";
+      throw new Error(`Runner-local WebKit preparation failed: ${command}, ${reason}.`);
+    }
     return result.stdout;
   }
   const required = ["webkit2gtk-driver", "libwebkit2gtk-4.1-0", "libjavascriptcoregtk-4.1-0"];
+  run("apt-get", [...aptOptions, "update"]);
   const dependencies = run("apt-cache", [
+    ...aptOptions,
     "depends",
     "--recurse",
     "--no-recommends",
@@ -43,7 +57,7 @@ export async function prepareWebkit({
     if (installed.status !== 0 || installed.stdout.trim() !== "install ok installed")
       packages.add(name);
   }
-  run("apt-get", ["download", ...packages]);
+  run("apt-get", [...aptOptions, "download", ...packages]);
   for (const name of await NodeFSP.readdir(directory))
     if (name.endsWith(".deb")) run("dpkg-deb", ["-x", NodePath.join(directory, name), extracted]);
   const driver = NodePath.join(extracted, "usr/bin/WebKitWebDriver");

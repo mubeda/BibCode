@@ -15,7 +15,7 @@ node ../../scripts/run-local-vp.mjs test run --config visual/typography/vite.con
 The capture caller has a hermetic Node check from the repository root:
 
 ```sh
-node --test apps/web/visual/typography/capture.node-test.mjs
+node --test apps/web/visual/typography/*.node-test.mjs
 ```
 
 Browser captures run in GitHub Actions. The capture command serves only its
@@ -23,6 +23,18 @@ built gallery on a disposable loopback listener, performs public component
 interactions and saves unmodified light/dark PNGs with a manifest. The manifest
 records the source commit, module hashes, named owners, observed text, theme,
 fonts, viewport and image hash. A failed witness is not an accepted capture.
+
+The startup gate first captures the real Badge in both themes under a short
+external process deadline. It uses the runner's installed Chrome and matching
+driver, with bounded page/script waits and an early bootstrap record. This
+smoke gate does not establish the full changed-component inventory. Complete
+that inventory in subsequent capture batches before accepting the issue.
+
+The root coverage policy treats this development-only directory like desktop
+UI automation. Its compiler and typed service aliases run in the dedicated
+gallery test lane, enforced by the workflow and coverage-policy check. The
+application source must not import these fixture services; the production
+coverage roots and 90% thresholds remain unchanged.
 
 WebKitGTK captures explicitly enable the production `data-linux-webkit` CSS
 gate after checking the native Linux WebKit user agent. The fixture page has

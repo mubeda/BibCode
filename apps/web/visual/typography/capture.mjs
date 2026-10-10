@@ -1,4 +1,6 @@
 import * as NodeCrypto from "node:crypto";
+import * as NodeChildProcess from "node:child_process";
+import * as NodeFS from "node:fs";
 import * as NodeFSP from "node:fs/promises";
 import * as NodeHttp from "node:http";
 import * as NodeModule from "node:module";
@@ -121,13 +123,21 @@ export async function captureFixtures({
   engine,
   selectedIds,
   interact = interactWithFixture,
+  progress = () => undefined,
 }) {
   const observations = [];
   const failures = [];
+  const scope = {
+    kind: selectedIds ? "selected-fixtures" : "all-catalog",
+    fixtures: selectedIds ?? null,
+  };
   await NodeFSP.mkdir(output, { recursive: true });
   try {
+    progress("viewport");
     await browser.setWindowSize(1440, 1200);
+    await browser.setTimeout({ pageLoad: 20_000, script: 15_000 });
     const paint = engine === "webkitgtk" ? "&paint=linux-webkit" : "";
+    progress("gallery-start");
     await browser.url(`${gallery.url}/?fixture=badge&theme=light${paint}`);
     await browser.waitUntil(
       async () =>
@@ -142,6 +152,7 @@ export async function captureFixtures({
       throw new Error("Capture selection refused.");
     for (const fixture of fixtures) {
       for (const theme of ["light", "dark"]) {
+        progress(`${fixture.id}-${theme}`);
         await browser.url(`${gallery.url}/?fixture=${fixture.id}&theme=${theme}${paint}`);
         await browser.executeAsync((done) =>
           Promise.all([
@@ -225,7 +236,7 @@ export async function captureFixtures({
                   );
                 }, state.visible_text),
               {
-                timeout: 10_000,
+                timeout: 5_000,
                 timeoutMsg: `Visible typography anchors missing: ${fixture.id}/${state.state}`,
               },
             );
@@ -298,7 +309,11 @@ export async function captureFixtures({
           }
           await NodeFSP.writeFile(
             NodePath.join(output, "manifest.json"),
-            JSON.stringify({ source, engine, complete: false, observations, failures }, null, 2),
+            JSON.stringify(
+              { source, engine, scope, complete: false, observations, failures },
+              null,
+              2,
+            ),
           );
         }
       }
@@ -306,7 +321,7 @@ export async function captureFixtures({
     await NodeFSP.writeFile(
       NodePath.join(output, "manifest.json"),
       JSON.stringify(
-        { source, engine, complete: failures.length === 0, observations, failures },
+        { source, engine, scope, complete: failures.length === 0, observations, failures },
         null,
         2,
       ),
@@ -331,6 +346,32 @@ async function main() {
   if (engine !== "chromium" && engine !== "webkitgtk") throw new Error("Capture engine refused.");
   const source = process.env.BIBCODE_TYPOGRAPHY_SOURCE;
   if (!source || !/^[a-f0-9]{40}$/.test(source)) throw new Error("Capture source refused.");
+  const output = NodePath.resolve(process.argv[3] ?? `typography-artifacts/${engine}`);
+  await NodeFSP.mkdir(output, { recursive: true });
+  const bootstrap = async (phase) => {
+    process.stdout.write(`TYPOGRAPHY_STAGE ${engine} ${phase}\n`);
+    await NodeFSP.writeFile(
+      NodePath.join(output, "bootstrap.json"),
+      JSON.stringify({ source, engine, phase }),
+    );
+  };
+  await bootstrap("runtime-import");
+  if (engine === "chromium") {
+    const chrome = "/usr/bin/google-chrome";
+    const driver = "/usr/local/share/chromedriver-linux64/chromedriver";
+    await NodeFSP.access(chrome, NodeFS.constants.X_OK);
+    await NodeFSP.access(driver, NodeFS.constants.X_OK);
+    const chromeVersion = NodeChildProcess.execFileSync(chrome, ["--version"], {
+      encoding: "utf8",
+      timeout: 10_000,
+    });
+    const driverVersion = NodeChildProcess.execFileSync(driver, ["--version"], {
+      encoding: "utf8",
+      timeout: 10_000,
+    });
+    if (chromeVersion.match(/\d+/)?.[0] !== driverVersion.match(/\d+/)?.[0])
+      throw new Error("Runner Chrome and driver versions differ.");
+  }
   const requireDesktop = NodeModule.createRequire(
     NodePath.resolve(import.meta.dirname, "../../../desktop/package.json"),
   );
@@ -338,22 +379,34 @@ async function main() {
     NodeURL.pathToFileURL(requireDesktop.resolve("webdriverio")).href
   );
   const gallery = await serveGallery(
-    NodePath.resolve(import.meta.dirname, "../../dist-typography"),
+    NodePath.resolve(import.meta.dirname, "../../dist/typography"),
   );
   let browser;
+  await bootstrap("driver-start");
   try {
     browser = await remote(
       engine === "chromium"
         ? {
+            connectionRetryTimeout: 15_000,
+            connectionRetryCount: 0,
             capabilities: {
               browserName: "chrome",
-              "goog:chromeOptions": { args: ["--headless=new", "--disable-dev-shm-usage"] },
+              "wdio:enforceWebDriverClassic": true,
+              "wdio:chromedriverOptions": {
+                binary: "/usr/local/share/chromedriver-linux64/chromedriver",
+              },
+              "goog:chromeOptions": {
+                binary: "/usr/bin/google-chrome",
+                args: ["--headless=new", "--disable-dev-shm-usage"],
+              },
             },
             logLevel: "error",
           }
         : {
             hostname: "127.0.0.1",
             port: 4444,
+            connectionRetryTimeout: 15_000,
+            connectionRetryCount: 0,
             capabilities: {
               browserName: "MiniBrowser",
               "webkitgtk:browserOptions": { binary: process.env.BIBCODE_FIXTURE_WEBKIT_BROWSER },
@@ -362,15 +415,19 @@ async function main() {
           },
     );
   } catch (error) {
+    await bootstrap("driver-refused");
     await gallery.close();
     throw error;
   }
+  await bootstrap("driver-ready");
   await captureFixtures({
     browser,
     gallery,
-    output: NodePath.resolve(process.argv[3] ?? `typography-artifacts/${engine}`),
+    output,
     source,
     engine,
+    selectedIds: process.argv[4] === "smoke" ? ["badge"] : undefined,
+    progress: (stage) => process.stdout.write(`TYPOGRAPHY_STAGE ${engine} ${stage}\n`),
   });
 }
 

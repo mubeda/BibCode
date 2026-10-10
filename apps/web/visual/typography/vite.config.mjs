@@ -48,6 +48,6 @@ export default defineConfig({
     alias: { "~": NodePath.resolve(import.meta.dirname, "../../src") },
     dedupe: ["react", "react-dom"],
   },
-  build: { outDir: "../../dist-typography", emptyOutDir: true },
+  build: { outDir: "../../dist/typography", emptyOutDir: true },
   test: { include: ["*.test.{ts,tsx}"], environment: "node" },
 });

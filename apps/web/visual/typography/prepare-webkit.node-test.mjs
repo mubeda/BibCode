@@ -26,6 +26,7 @@ NodeTest.test(
               stdout: args.at(-1) === "libc6" ? "install ok installed" : "",
             };
           if (command === "apt-get") {
+            if (args.at(-1) === "update") return { status: 0, stdout: "" };
             // A test-owned archive substitutes only the external package transport.
             NodeFS.writeFileSync(
               NodePath.join(options.cwd, "owned-fixture.deb"),
@@ -51,7 +52,13 @@ NodeTest.test(
       NodeAssert.equal(result.packages.includes("libowned-fixture"), true);
       NodeAssert.equal(result.packages.includes("libc6"), false);
       NodeAssert.equal(calls.at(-1).command, "dpkg-deb");
-      NodeAssert.deepEqual(calls.find(({ command }) => command === "apt-get").args, [
+      const aptCalls = calls.filter(({ command }) => command === "apt-get");
+      NodeAssert.equal(aptCalls[0].args.at(-1), "update");
+      NodeAssert.equal(
+        aptCalls[1].args[1].startsWith(`Dir::State::Lists=${result.directory}`),
+        true,
+      );
+      NodeAssert.deepEqual(aptCalls[1].args.slice(4), [
         "download",
         "webkit2gtk-driver",
         "libwebkit2gtk-4.1-0",

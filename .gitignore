@@ -7,7 +7,6 @@ node_modules
 *.log
 *.tsbuildinfo
 apps/*/dist
-apps/web/dist-typography
 typography-artifacts/
 apps/*/src-tauri/gen/
 apps/*/src-tauri/target/
