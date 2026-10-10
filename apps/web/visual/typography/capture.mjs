@@ -123,13 +123,17 @@ export async function captureFixtures({
   source,
   engine,
   selectedIds,
+  group,
   interact = interactWithFixture,
   progress = () => undefined,
 }) {
+  if (group && !["core", "git", "settings"].includes(group))
+    throw new Error("Typography group refused.");
   const observations = [];
   const failures = [];
   const scope = {
-    kind: selectedIds ? "selected-fixtures" : "all-catalog",
+    kind: group ? "grouped-fixtures" : selectedIds ? "selected-fixtures" : "all-catalog",
+    group: group ?? null,
     fixtures: selectedIds ?? null,
   };
   await NodeFSP.mkdir(output, { recursive: true });
@@ -148,7 +152,18 @@ export async function captureFixtures({
     const catalog = await browser.execute(() =>
       JSON.parse(document.getElementById("typography-fixture-metadata").textContent),
     );
-    const fixtures = selectedIds ? catalog.filter(({ id }) => selectedIds.includes(id)) : catalog;
+    const belongsToGroup = ({ id }) =>
+      group === "git"
+        ? /^(git-|pr-)/.test(id)
+        : group === "settings"
+          ? /^(settings-|status-)/.test(id)
+          : !/^(git-|pr-|settings-|status-)/.test(id);
+    const fixtures = selectedIds
+      ? catalog.filter(({ id }) => selectedIds.includes(id))
+      : group
+        ? catalog.filter(belongsToGroup)
+        : catalog;
+    scope.fixtures = fixtures.map(({ id }) => id);
     if (fixtures.length === 0 || (selectedIds && fixtures.length !== selectedIds.length))
       throw new Error("Capture selection refused.");
     for (const fixture of fixtures) {
@@ -413,7 +428,10 @@ async function main() {
             capabilities: {
               browserName: "MiniBrowser",
               "wdio:enforceWebDriverClassic": true,
-              "webkitgtk:browserOptions": { binary: process.env.BIBCODE_FIXTURE_WEBKIT_BROWSER },
+              "webkitgtk:browserOptions": {
+                binary: "/usr/lib/x86_64-linux-gnu/webkit2gtk-4.1/MiniBrowser",
+                args: ["--automation"],
+              },
             },
             logLevel: "error",
           },
@@ -431,6 +449,7 @@ async function main() {
     source,
     engine,
     selectedIds: process.argv[4] === "smoke" ? ["badge"] : undefined,
+    group: process.argv[5],
     progress: (stage) => process.stdout.write(`TYPOGRAPHY_STAGE ${engine} ${stage}\n`),
   });
 }
