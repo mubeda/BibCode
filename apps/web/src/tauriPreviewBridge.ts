@@ -310,6 +310,8 @@ export function createTauriPreviewBridge(deps: PreviewBridgeDeps): DesktopPrevie
     recording: false,
     automation: false,
     imageClipboard: false,
+    screenshot: true,
+    pageTools: true,
   });
   return bridge;
 }

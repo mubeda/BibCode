@@ -18,11 +18,16 @@ const INJECT_SCAN_LIMIT: usize = 64 * 1024;
 const FRAME_SCRIPT_TAG: &[u8] = b"<script src=\"/__bibcode/frame.js\"></script>";
 
 /// Posts the frame's URL, title, and history state to the BiBCode UI that
-/// framed it (the origin the bootstrap stored), and obeys back/forward/reload
-/// commands from that origin only. Does nothing when not framed.
+/// framed it (the origin the bootstrap stored), obeys back/forward/reload
+/// commands from that origin only, sends links to other origins out of the
+/// frame (asking BiBCode to open the server's localhost ones), and keeps the
+/// reload keys to the frame. Does nothing when not framed.
 pub const FRAME_SCRIPT: &str = r#"(() => {
   "use strict";
-  if (window.top === window) return;
+  // Only the frame BiBCode itself holds (BiBCode is always the top window): a
+  // page's own nested frames keep their links and keys, and their reports
+  // would reach only that page.
+  if (window.top === window || window.parent !== window.top) return;
   let uiOrigin = null;
   try { uiOrigin = sessionStorage.getItem("bibcode-ui-origin"); } catch (_) {}
   if (!uiOrigin) return;
@@ -64,6 +69,38 @@ pub const FRAME_SCRIPT: &str = r#"(() => {
   };
   if (document.readyState === "loading") addEventListener("DOMContentLoaded", watchTitle);
   else watchTitle();
+  // A link to another origin leaves what BiBCode can follow (and another host
+  // is blocked by the UI's framing policy). One to the server's localhost (the
+  // app's own absolute link, or another dev server) means the server, not this
+  // computer, however it is opened: BiBCode opens it as a tab. A plain click to
+  // any other origin opens a new browser tab instead.
+  const followLink = (event) => {
+    if (event.defaultPrevented || (event.type === "auxclick" && event.button !== 1)) return;
+    const link = event.target instanceof Element ? event.target.closest("a[href]") : null;
+    if (!link || link.hasAttribute("download")) return;
+    let url;
+    try { url = new URL(link.href, location.href); } catch (_) { return; }
+    if (!/^https?:$/.test(url.protocol) || url.origin === location.origin) return;
+    if (/^(localhost|.+\.localhost|127(\.\d+){3}|\[::1\]|0\.0\.0\.0|\[::\])$/.test(url.hostname)) {
+      event.preventDefault();
+      try { window.parent.postMessage({ type: "bibcode-preview-open", url: url.href }, uiOrigin); } catch (_) {}
+      return;
+    }
+    if (event.type !== "click" || event.button !== 0) return;
+    if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    if (typeof link.target !== "string" || (link.target && link.target !== "_self")) return;
+    event.preventDefault();
+    window.open(url.href, "_blank", "noopener");
+  };
+  addEventListener("click", followLink);
+  addEventListener("auxclick", followLink);
+  // The browser's reload keys would reload BiBCode itself from inside the frame.
+  addEventListener("keydown", (event) => {
+    const reloadKey = event.key === "F5" || ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "r");
+    if (!reloadKey || event.defaultPrevented || event.altKey) return;
+    event.preventDefault();
+    location.reload();
+  });
   addEventListener("message", (event) => {
     if (event.origin !== uiOrigin || event.source !== window.parent) return;
     const data = event.data;

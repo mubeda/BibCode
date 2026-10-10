@@ -1171,7 +1171,10 @@ address)` gets its own listener on an ephemeral port, so two clients that
   framing restriction and still explain themselves inside a frame. Every
   response varies by `Cookie`. Only
   pages on the server's host may frame a preview, and a frame from another site
-  never carries the `Lax` gateway cookie. `GET /__bibcode/frame.js` (no session needed) is a
+  never carries the `Lax` gateway cookie. The UI's own policy, in turn, adds
+  `frame-src 'self' http://<request host>:*` (the `Host` it was loaded from,
+  letters, digits, dots, and hyphens only; no host source for IPv6), so the page
+  may frame its host's gateways on their per-target ports. `GET /__bibcode/frame.js` (no session needed) is a
   navigation reporter: inside a frame with a stored UI origin it posts
   `{ type: "bibcode-preview-frame", url, title, canGoBack, canGoForward }` to
   that origin on load, `popstate`, `hashchange`, history changes, and title
