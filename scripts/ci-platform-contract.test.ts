@@ -47,6 +47,10 @@ interface WorkflowJob {
 }
 
 interface Workflow {
+  readonly concurrency?: {
+    readonly group?: string;
+    readonly "cancel-in-progress"?: boolean;
+  };
   readonly on?: Record<string, unknown>;
   readonly jobs?: Record<string, WorkflowJob>;
 }
@@ -69,6 +73,16 @@ function allStepCommands(job: WorkflowJob): string {
 }
 
 describe("cross-platform CI contract", () => {
+  it("cancels superseded CI and seeded-upgrade runs on the same ref", () => {
+    for (const path of [CI_WORKFLOW_PATH, DESKTOP_UPGRADE_WORKFLOW_PATH]) {
+      const { workflow } = readWorkflow(path);
+      expect(workflow.concurrency).toEqual({
+        group: "${{ github.workflow }}-${{ github.ref }}",
+        "cancel-in-progress": true,
+      });
+    }
+  });
+
   it("serializes package tests directly in CI and release preflight", () => {
     for (const [path, job] of [
       [CI_WORKFLOW_PATH, "test"],
