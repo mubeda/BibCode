@@ -3,8 +3,10 @@
 // @effect-diagnostics globalConsole:off - The standalone harness reports bounded progress.
 // @effect-diagnostics globalFetch:off - The standalone harness probes its loopback update server.
 // @effect-diagnostics globalTimers:off - The standalone harness owns bounded process timeouts.
+// @effect-diagnostics globalDate:off - The standalone harness timestamps host samples outside Effect.
 import * as NodePath from "node:path";
 import * as NodeChildProcess from "node:child_process";
+import * as NodeCrypto from "node:crypto";
 import * as NodeFS from "node:fs";
 import * as NodeUtil from "node:util";
 import * as NodeURL from "node:url";
@@ -427,6 +429,7 @@ export function createSeededUpgradeDriverSpec(input: {
   readonly remoteSecretPath?: string;
   readonly remoteUploadSecretPath?: string;
   readonly remoteEvidencePath?: string;
+  readonly remoteTracePath?: string;
   readonly appBinaryPath?: string;
   readonly platform?: SeededUpgradePlatform;
 }): string {
@@ -639,19 +642,46 @@ describe("seeded packaged upgrade ${input.lane} ${input.phase}", () => {
     ${
       input.phase === "seed-and-install" && input.lane === "remote-install"
         ? `
+    const traceRemote = (entry) => {
+      try {
+        if (typeof input.remoteTracePath !== "string") return;
+        const text = typeof entry.message === "string" ? entry.message : "";
+        const message = text
+          .replace(/https?:\\/\\/\\S+/gi, "[url]")
+          .replace(/[A-Za-z0-9+/=_-]{20,}/g, "[redacted]")
+          .slice(0, 240);
+        const line = { at: new Date().toISOString(), step: entry.step };
+        if (typeof entry.found === "boolean") line.found = entry.found;
+        if (typeof entry.clicked === "boolean") line.clicked = entry.clicked;
+        if (typeof entry.widened === "boolean") line.widened = entry.widened;
+        if (message.length > 0) line.message = message;
+        NodeFS.appendFileSync(input.remoteTracePath, JSON.stringify(line) + "\\n");
+      } catch {
+        // A trace write must not replace the credential failure it records.
+      }
+    };
     await browser.execute(() => { window.location.hash = "/settings/remote-servers?tab=share"; });
+    let found = false;
+    let clicked = false;
     let widened = false;
     try {
       await browser.waitUntil(async () => browser.execute(() => [...document.querySelectorAll("button")].some((button) => button.textContent?.trim() === "Generate pairing offer")), { timeout: 30000, interval: 100 });
-      const generated = await browser.execute(() => {
+      found = true;
+      clicked = await browser.execute(() => {
         const button = [...document.querySelectorAll("button")].find((entry) => entry.textContent?.trim() === "Generate pairing offer");
         if (!button || button.disabled) return false;
         button.click(); return true;
       });
-      if (generated) await browser.waitUntil(async () => browser.execute(async () => (await window.desktopBridge.getServerExposureState()).mode === "network-accessible"), { timeout: 60000, interval: 250 });
-      widened = generated;
-    } catch { widened = false; }
-    const credentials = await browser.execute(async (widened) => {
+      if (clicked) await browser.waitUntil(async () => browser.execute(async () => (await window.desktopBridge.getServerExposureState()).mode === "network-accessible"), { timeout: 60000, interval: 250 });
+      widened = clicked;
+      traceRemote({ step: "share-ui", found, clicked, widened });
+    } catch (error) {
+      traceRemote({ step: "share-ui", found, clicked, widened: false, message: String(error && error.message ? error.message : error) });
+      widened = false;
+    }
+    let credentials;
+    try {
+    credentials = await browser.execute(async (widened) => {
       const bootstrap = window.desktopBridge.getLocalEnvironmentBootstraps().find((entry) => entry.id === "primary");
       if (!bootstrap?.httpBaseUrl || !bootstrap.bootstrapToken) throw new Error("Remote verification bootstrap unavailable.");
       if (widened) {
@@ -700,8 +730,14 @@ describe("seeded packaged upgrade ${input.lane} ${input.phase}", () => {
       }
       return { endpoint: bootstrap.httpBaseUrl, bootstrapToken: bootstrap.bootstrapToken };
     }, widened);
+    traceRemote({ step: "credentials-returned" });
     // Private receipt is outside retained evidence; the controller uses it to redact logs.
     NodeFS.writeFileSync(input.remoteSecretPath, JSON.stringify(credentials), { mode: 0o600 });
+    traceRemote({ step: "receipt-written" });
+    } catch (error) {
+      traceRemote({ step: "credentials", message: String(error && error.message ? error.message : error) });
+      throw error;
+    }
     NodeFS.writeFileSync(input.resultPath, JSON.stringify({ ...observation, installAttempted: false }));
     const { runRemoteInstallDriver } = await import(input.remoteInstallDriverPath);
     const evidence = await runRemoteInstallDriver({
@@ -989,104 +1025,214 @@ export async function readWindowsCandidateProbe(
   }
 }
 
-// Read-only, CI-only evidence. Paths and versions cross as environment values,
-// never PowerShell source; process command lines and credentials are not collected.
-export const windowsUpgradeObservationScript = `
-$ErrorActionPreference = 'Stop'
-[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
-$observation = [ordered]@{
-  observedAtUtc = [System.DateTime]::UtcNow.ToString('o')
-  path = $env:BIBCODE_SEEDED_APPLICATION_PATH
-  exists = $false
-  productVersion = $null
-  fileVersion = $null
-  sha256 = $null
-  installers = @()
-  error = $null
-}
-try {
-  $observation.exists = Test-Path -LiteralPath $observation.path -PathType Leaf
-  if ($observation.exists) {
-    # Version and hash open the installed executable. Bound that read so a
-    # locked file cannot consume the whole sample; tasklist still runs below.
-    $reader = [powershell]::Create().AddScript({
-      param($Path, $Candidate)
-      $file = Get-Item -LiteralPath $Path
-      $product = [string]$file.VersionInfo.ProductVersion
-      $fileVersion = [string]$file.VersionInfo.FileVersion
-      $hash = $null
-      if ($product -eq $Candidate) {
-        $hash = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash
-      }
-      [pscustomobject]@{ productVersion = $product; fileVersion = $fileVersion; sha256 = $hash }
-    }).AddArgument($observation.path).AddArgument($env:BIBCODE_SEEDED_CANDIDATE_VERSION)
-    $pending = $reader.BeginInvoke()
-    if (-not $pending.AsyncWaitHandle.WaitOne(4000)) {
-      $reader.Stop()
-      $observation.error = "version metadata timed out"
-    } else {
-      $read = @($reader.EndInvoke($pending)) | Select-Object -First 1
-      $observation.productVersion = $read.productVersion
-      $observation.fileVersion = $read.fileVersion
-      $observation.sha256 = $read.sha256
-    }
-    $reader.Dispose()
-  }
-  # tasklist returns within the sample. Enumerating processes through the
-  # process cmdlet did not: on the ARM64 runner every 10s sample died at the
-  # command deadline, including after the host had exited. Image names longer
-  # than 25 characters are truncated.
-  $expected = $env:BIBCODE_SEEDED_PRODUCT_NAME + '-' + $env:BIBCODE_SEEDED_CANDIDATE_VERSION + '-installer.exe'
-  $installers = @()
-  foreach ($row in @(& tasklist.exe /FO CSV /NH)) {
-    if ($row -match '^"([^"]+)","([0-9]+)"') {
-      $image = $Matches[1]
-      $isInstaller = $image.Equals($expected, [System.StringComparison]::OrdinalIgnoreCase) -or (
-        $expected.StartsWith($image, [System.StringComparison]::OrdinalIgnoreCase) -and $image.Length -ge 25
-      )
-      if ($isInstaller) {
-        $installers += [ordered]@{ pid = [int]$Matches[2]; parentPid = $null; path = $null }
-      }
-    }
-  }
-  $observation.installers = @($installers)
-} catch {
-  $observation.error = $_.FullyQualifiedErrorId
-}
-$observation | ConvertTo-Json -Compress -Depth 4
-`;
+const probeStepTimedOut = (cause: unknown): boolean => {
+  if (typeof cause !== "object" || cause === null) return false;
+  const value = cause as {
+    readonly code?: unknown;
+    readonly killed?: unknown;
+    readonly name?: unknown;
+  };
+  return (
+    value.killed === true ||
+    value.code === "ABORT_ERR" ||
+    value.code === "ETIMEDOUT" ||
+    value.name === "AbortError" ||
+    value.name === "TimeoutError"
+  );
+};
 
-async function waitForWindowsInstalledCandidate(input: {
+const probeStepFailure = (cause: unknown, label: string): string => {
+  if (probeStepTimedOut(cause)) return `${label} timed out`;
+  const code =
+    typeof cause === "object" && cause !== null && "code" in cause ? cause.code : undefined;
+  return `${label} ${typeof code === "string" && code.length > 0 ? code : "failed"}`;
+};
+
+const readAlignedProductVersion = (bytes: Buffer, base: number, offset: number): string | null => {
+  const misalignment = (offset - base) % 4;
+  const aligned = misalignment === 0 ? offset : offset + (4 - misalignment);
+  const chars: string[] = [];
+  let cursor = aligned;
+  while (cursor + 1 < bytes.length && chars.length <= 128) {
+    const code = bytes[cursor]! | (bytes[cursor + 1]! << 8);
+    if (code === 0) return chars.length > 0 ? chars.join("") : null;
+    if (code < 32 || code > 126) return null;
+    chars.push(String.fromCharCode(code));
+    cursor += 2;
+  }
+  return null;
+};
+
+/** UTF-16 ProductVersion from a VERSIONINFO resource, aligned to that resource. */
+export function productVersionFromExecutableBytes(bytes: Buffer): string | null {
+  const marker = Buffer.from("VS_VERSION_INFO\u0000", "utf16le");
+  const key = Buffer.from("ProductVersion\u0000", "utf16le");
+  let from = 0;
+  while (from + marker.length <= bytes.length) {
+    const markerAt = bytes.indexOf(marker, from);
+    if (markerAt < 0) return null;
+    if (markerAt < 6) {
+      from = markerAt + 2;
+      continue;
+    }
+    const base = markerAt - 6;
+    const length = bytes.readUInt16LE(base);
+    const end =
+      length > marker.length + 6 && base + length <= bytes.length
+        ? base + length
+        : Math.min(bytes.length, markerAt + 8_192);
+    let cursor = markerAt + marker.length;
+    while (cursor < end) {
+      const index = bytes.indexOf(key, cursor);
+      if (index < 0 || index >= end) break;
+      const value = readAlignedProductVersion(bytes, base, index + key.length);
+      if (value !== null) return value;
+      cursor = index + 2;
+    }
+    from = markerAt + 2;
+  }
+  return null;
+}
+
+/** tasklist truncates image names at 25 characters. Command lines are not read. */
+export function windowsInstallerProcesses(
+  csv: string,
+  expectedExe: string,
+): Array<{ readonly pid: number; readonly parentPid: null; readonly path: null }> {
+  const expected = expectedExe.toLowerCase();
+  const installers: Array<{ readonly pid: number; readonly parentPid: null; readonly path: null }> =
+    [];
+  for (const row of csv.split(/\r?\n/)) {
+    const match = /^"([^"]+)","(\d+)"/.exec(row);
+    if (match === null) continue;
+    const image = match[1]!;
+    const normalized = image.toLowerCase();
+    const isInstaller =
+      normalized === expected || (expected.startsWith(normalized) && image.length >= 25);
+    if (!isInstaller) continue;
+    installers.push({ pid: Number(match[2]), parentPid: null, path: null });
+  }
+  return installers;
+}
+
+const windowsProbeStepMs = 8_000;
+
+export async function observeWindowsInstalledCandidate(input: {
+  readonly appBinaryPath: string;
+  readonly candidateVersion: string;
+  readonly productName?: string;
+  readonly readFile?: (path: string) => Promise<Buffer>;
+  readonly listProcesses?: () => Promise<string>;
+}): Promise<{
+  readonly observedAtUtc: string;
+  readonly path: string;
+  readonly exists: boolean;
+  readonly productVersion: string | null;
+  readonly sha256: string | null;
+  readonly installers: ReadonlyArray<{
+    readonly pid: number;
+    readonly parentPid: null;
+    readonly path: null;
+  }>;
+  readonly error: string | null;
+  readonly readMs: number | null;
+  readonly tasklistMs: number | null;
+}> {
+  const productName = input.productName ?? "BiBCode";
+  const expectedExe = `${productName}-${input.candidateVersion}-installer.exe`;
+  const readFile =
+    input.readFile ??
+    ((path: string) =>
+      NodeFS.promises.readFile(path, { signal: AbortSignal.timeout(windowsProbeStepMs) }));
+  const listProcesses =
+    input.listProcesses ??
+    (() =>
+      new Promise<string>((resolve, reject) => {
+        NodeChildProcess.execFile(
+          "tasklist.exe",
+          ["/FO", "CSV", "/NH"],
+          { timeout: windowsProbeStepMs, windowsHide: true, maxBuffer: 4 * 1024 * 1024 },
+          (error, stdout) => {
+            if (error) reject(error);
+            else resolve(stdout);
+          },
+        );
+      }));
+  const errors: string[] = [];
+  let exists = false;
+  let productVersion: string | null = null;
+  let sha256: string | null = null;
+  let readMs: number | null = null;
+  const readStarted = Date.now();
+  try {
+    const bytes = await readFile(input.appBinaryPath);
+    readMs = Date.now() - readStarted;
+    exists = true;
+    productVersion = productVersionFromExecutableBytes(bytes);
+    if (productVersion === input.candidateVersion) {
+      sha256 = NodeCrypto.createHash("sha256").update(bytes).digest("hex");
+    }
+  } catch (cause) {
+    readMs = Date.now() - readStarted;
+    const code =
+      typeof cause === "object" && cause !== null && "code" in cause ? cause.code : undefined;
+    exists = code !== "ENOENT";
+    errors.push(probeStepFailure(cause, "executable read"));
+  }
+  let installers: Array<{ readonly pid: number; readonly parentPid: null; readonly path: null }> =
+    [];
+  let tasklistMs: number | null = null;
+  const listStarted = Date.now();
+  try {
+    installers = windowsInstallerProcesses(await listProcesses(), expectedExe);
+    tasklistMs = Date.now() - listStarted;
+  } catch (cause) {
+    tasklistMs = Date.now() - listStarted;
+    errors.push(probeStepFailure(cause, "installer lookup"));
+  }
+  return {
+    observedAtUtc: new Date().toISOString(),
+    path: input.appBinaryPath,
+    exists,
+    productVersion,
+    sha256,
+    installers,
+    error: errors.length > 0 ? errors.join("; ") : null,
+    readMs,
+    tasklistMs,
+  };
+}
+
+export async function waitForWindowsInstalledCandidate(input: {
   readonly appBinaryPath: string;
   readonly candidateVersion: string;
   readonly evidenceDirectory: string;
   readonly timeoutMs: number;
+  readonly intervalMs?: number;
+  readonly now?: () => number;
+  readonly sleep?: (milliseconds: number) => Promise<void>;
+  readonly readFile?: (path: string) => Promise<Buffer>;
+  readonly listProcesses?: () => Promise<string>;
 }): Promise<void> {
   await waitForUpgradeCondition({
     description: `Windows candidate ${input.candidateVersion} at the installed application path`,
-    intervalMs: 1_000,
+    intervalMs: input.intervalMs ?? 1_000,
+    now: input.now,
+    sleep: input.sleep,
     timeoutMs: input.timeoutMs,
     probe: async () => {
-      const { exitCode, observation } = await readWindowsCandidateProbe(() =>
-        runBoundedCommand({
-          command: "powershell.exe",
-          args: ["-NoProfile", "-NonInteractive", "-Command", windowsUpgradeObservationScript],
-          cwd: NodePath.dirname(input.appBinaryPath),
-          env: {
-            ...process.env,
-            BIBCODE_SEEDED_APPLICATION_PATH: input.appBinaryPath,
-            BIBCODE_SEEDED_CANDIDATE_VERSION: input.candidateVersion,
-            BIBCODE_SEEDED_PRODUCT_NAME: "BiBCode",
-          },
-          timeoutMs: 20_000,
-        }),
-      );
+      const observation = await observeWindowsInstalledCandidate({
+        appBinaryPath: input.appBinaryPath,
+        candidateVersion: input.candidateVersion,
+        ...(input.readFile === undefined ? {} : { readFile: input.readFile }),
+        ...(input.listProcesses === undefined ? {} : { listProcesses: input.listProcesses }),
+      });
       await NodeFS.promises.appendFile(
         NodePath.join(input.evidenceDirectory, "windows-install-handoff.log"),
-        `${JSON.stringify({ exitCode, observation })}\n`,
+        `${JSON.stringify({ exitCode: observation.error === null ? 0 : null, observation })}\n`,
         { mode: 0o600 },
       );
-      return exitCode === 0 && windowsCandidateIsInstalled(observation, input.candidateVersion);
+      return windowsCandidateIsInstalled(observation, input.candidateVersion);
     },
   });
 }
@@ -1860,6 +2006,7 @@ const runWebDriverPhase = async (input: {
             remoteSecretPath,
             remoteUploadSecretPath,
             remoteEvidencePath: NodePath.join(input.evidenceDirectory, "remote-rpc.json"),
+            remoteTracePath: NodePath.join(input.evidenceDirectory, "remote-credential-trace.log"),
           }
         : {}),
     }),
@@ -2190,10 +2337,20 @@ const copyBoundedEvidence = async (input: {
     ["remote-install", input.layout.remoteInstall],
   ] as const;
   for (const [lane, layout] of lanes) {
-    if (input.withholdLanes?.includes(lane)) continue;
+    const withheld = input.withholdLanes?.includes(lane) === true;
     if (!NodeFS.existsSync(layout.evidenceDirectory)) continue;
     for (const source of await walkFiles(layout.evidenceDirectory)) {
       if (!/\.(?:json|log|txt)$/i.test(source)) continue;
+      // Raw remote WebDriver logs can contain a grant returned before the receipt
+      // write. Keep only the redacted trace and the secret-free phase marker.
+      if (
+        withheld &&
+        (NodePath.dirname(source) !== layout.evidenceDirectory ||
+          (NodePath.basename(source) !== "remote-credential-trace.log" &&
+            NodePath.basename(source) !== "seed-and-install.log"))
+      ) {
+        continue;
+      }
       const bounded = redactAndBoundUpgradeEvidence(
         await NodeFS.promises.readFile(source, "utf8"),
         {
@@ -2207,20 +2364,19 @@ const copyBoundedEvidence = async (input: {
         bounded,
       );
     }
-    if (NodeFS.existsSync(layout.dataRoot)) {
-      const tree = (await walkFiles(layout.dataRoot))
-        .map((path) => NodePath.relative(layout.dataRoot, path))
-        .slice(0, 1_000)
-        .join("\n");
-      await NodeFS.promises.writeFile(
-        NodePath.join(input.artifactDirectory, `${lane}-root-tree.txt`),
-        redactAndBoundUpgradeEvidence(tree, {
-          maxBytes: 32 * 1024,
-          roots: [layout.dataRoot],
-          secrets: input.secrets,
-        }),
-      );
-    }
+    if (withheld || !NodeFS.existsSync(layout.dataRoot)) continue;
+    const tree = (await walkFiles(layout.dataRoot))
+      .map((path) => NodePath.relative(layout.dataRoot, path))
+      .slice(0, 1_000)
+      .join("\n");
+    await NodeFS.promises.writeFile(
+      NodePath.join(input.artifactDirectory, `${lane}-root-tree.txt`),
+      redactAndBoundUpgradeEvidence(tree, {
+        maxBytes: 32 * 1024,
+        roots: [layout.dataRoot],
+        secrets: input.secrets,
+      }),
+    );
   }
   if (NodeFS.existsSync(input.requestLogPath)) {
     await NodeFS.promises.writeFile(
@@ -2233,6 +2389,8 @@ const copyBoundedEvidence = async (input: {
     );
   }
 };
+
+export { copyBoundedEvidence };
 
 export async function runSeededDesktopUpgradeSmoke(
   input: SeededDesktopUpgradeSmokeInput,
