@@ -658,6 +658,7 @@ describe("seeded packaged upgrade ${input.lane} ${input.phase}", () => {
         const bearer = await window.desktopBridge.getLocalEnvironmentBearerToken();
         // Exposure precedes minting. Stay below the embedded driver's 30-second command bound.
         const deadline = Date.now() + 20000;
+        let sawTransportFailure = false;
         while (Date.now() < deadline) {
           const controller = new AbortController();
           const timeout = setTimeout(() => controller.abort(), Math.min(5000, deadline - Date.now()));
@@ -669,10 +670,19 @@ describe("seeded packaged upgrade ${input.lane} ${input.phase}", () => {
             });
             if (!response.ok) throw new Error();
             links = await response.json();
+            sawTransportFailure = false;
           } catch {
-            throw new Error("Remote verification pairing grant unavailable.");
+            // Widening restarts the server. A refused request is not the grant;
+            // keep polling until the deadline without copying transport details.
+            sawTransportFailure = true;
+            links = null;
           } finally {
             clearTimeout(timeout);
+          }
+          if (links === null) {
+            if (Date.now() >= deadline) break;
+            await new Promise((resolve) => setTimeout(resolve, Math.max(0, Math.min(250, deadline - Date.now()))));
+            continue;
           }
           if (!Array.isArray(links)) throw new Error("Remote verification pairing grant response invalid.");
           // AuthPairingLink publishes reach and credential; offHost is server-private metadata.
@@ -685,6 +695,7 @@ describe("seeded packaged upgrade ${input.lane} ${input.phase}", () => {
           }
           await new Promise((resolve) => setTimeout(resolve, Math.max(0, Math.min(250, deadline - Date.now()))));
         }
+        if (sawTransportFailure) throw new Error("Remote verification pairing grant unavailable.");
         throw new Error("Remote verification has no live native sharing grant.");
       }
       return { endpoint: bootstrap.httpBaseUrl, bootstrapToken: bootstrap.bootstrapToken };
@@ -996,23 +1007,49 @@ $observation = [ordered]@{
 try {
   $observation.exists = Test-Path -LiteralPath $observation.path -PathType Leaf
   if ($observation.exists) {
-    $file = Get-Item -LiteralPath $observation.path
-    $observation.productVersion = $file.VersionInfo.ProductVersion
-    $observation.fileVersion = $file.VersionInfo.FileVersion
-    # Hash only the candidate. Hashing the old executable on every sample
-    # exceeds the 10s probe bound on Windows ARM64.
-    if ($observation.productVersion -eq $env:BIBCODE_SEEDED_CANDIDATE_VERSION) {
-      $observation.sha256 = (Get-FileHash -LiteralPath $observation.path -Algorithm SHA256).Hash
+    # Version and hash open the installed executable. Bound that read so a
+    # locked file cannot consume the whole sample; tasklist still runs below.
+    $reader = [powershell]::Create().AddScript({
+      param($Path, $Candidate)
+      $file = Get-Item -LiteralPath $Path
+      $product = [string]$file.VersionInfo.ProductVersion
+      $fileVersion = [string]$file.VersionInfo.FileVersion
+      $hash = $null
+      if ($product -eq $Candidate) {
+        $hash = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash
+      }
+      [pscustomobject]@{ productVersion = $product; fileVersion = $fileVersion; sha256 = $hash }
+    }).AddArgument($observation.path).AddArgument($env:BIBCODE_SEEDED_CANDIDATE_VERSION)
+    $pending = $reader.BeginInvoke()
+    if (-not $pending.AsyncWaitHandle.WaitOne(4000)) {
+      $reader.Stop()
+      $observation.error = "version metadata timed out"
+    } else {
+      $read = @($reader.EndInvoke($pending)) | Select-Object -First 1
+      $observation.productVersion = $read.productVersion
+      $observation.fileVersion = $read.fileVersion
+      $observation.sha256 = $read.sha256
+    }
+    $reader.Dispose()
+  }
+  # tasklist returns within the sample. Enumerating processes through the
+  # process cmdlet did not: on the ARM64 runner every 10s sample died at the
+  # command deadline, including after the host had exited. Image names longer
+  # than 25 characters are truncated.
+  $expected = $env:BIBCODE_SEEDED_PRODUCT_NAME + '-' + $env:BIBCODE_SEEDED_CANDIDATE_VERSION + '-installer.exe'
+  $installers = @()
+  foreach ($row in @(& tasklist.exe /FO CSV /NH)) {
+    if ($row -match '^"([^"]+)","([0-9]+)"') {
+      $image = $Matches[1]
+      $isInstaller = $image.Equals($expected, [System.StringComparison]::OrdinalIgnoreCase) -or (
+        $expected.StartsWith($image, [System.StringComparison]::OrdinalIgnoreCase) -and $image.Length -ge 25
+      )
+      if ($isInstaller) {
+        $installers += [ordered]@{ pid = [int]$Matches[2]; parentPid = $null; path = $null }
+      }
     }
   }
-  # Name lookup stays inside the 10s probe bound. Listing every process
-  # exceeds it on Windows ARM64 and hides whether the installer has exited.
-  $installerName = $env:BIBCODE_SEEDED_PRODUCT_NAME + '-' + $env:BIBCODE_SEEDED_CANDIDATE_VERSION + '-installer'
-  $observation.installers = @(Get-Process -Name $installerName -ErrorAction SilentlyContinue | ForEach-Object {
-    $imagePath = $null
-    try { $imagePath = $_.Path } catch { $imagePath = $null }
-    [ordered]@{ pid = $_.Id; parentPid = $null; path = $imagePath }
-  })
+  $observation.installers = @($installers)
 } catch {
   $observation.error = $_.FullyQualifiedErrorId
 }
@@ -1041,7 +1078,7 @@ async function waitForWindowsInstalledCandidate(input: {
             BIBCODE_SEEDED_CANDIDATE_VERSION: input.candidateVersion,
             BIBCODE_SEEDED_PRODUCT_NAME: "BiBCode",
           },
-          timeoutMs: 10_000,
+          timeoutMs: 20_000,
         }),
       );
       await NodeFS.promises.appendFile(
@@ -1873,23 +1910,37 @@ const runWebDriverPhase = async (input: {
       installAttempted = false;
     }
   }
-  const privateSecrets =
-    input.lane === "remote-install"
-      ? await readRemoteFixtureSecrets({
-          credentialReceiptPath: remoteSecretPath,
-          uploadReceiptPath: remoteUploadSecretPath,
-          requireCredentialReceipt: true,
-          requireUploadReceipt: installAttempted,
-        })
-      : [];
-  await NodeFS.promises.writeFile(
-    NodePath.join(input.evidenceDirectory, `${input.phase}.log`),
-    redactAndBoundUpgradeEvidence(`${result.stdout}\n${result.stderr}`, {
-      maxBytes: 64 * 1024,
-      roots: [input.dataRoot, input.runRoot],
-      secrets: privateSecrets,
-    }),
-  );
+  const phaseLogPath = NodePath.join(input.evidenceDirectory, `${input.phase}.log`);
+  const writePhaseLog = async (body: string, secrets: ReadonlyArray<string>): Promise<void> => {
+    await NodeFS.promises.writeFile(
+      phaseLogPath,
+      redactAndBoundUpgradeEvidence(body, {
+        maxBytes: 64 * 1024,
+        roots: [input.dataRoot, input.runRoot],
+        secrets,
+      }),
+    );
+  };
+  let privateSecrets: ReadonlyArray<string> = [];
+  if (input.lane === "remote-install") {
+    try {
+      privateSecrets = await readRemoteFixtureSecrets({
+        credentialReceiptPath: remoteSecretPath,
+        uploadReceiptPath: remoteUploadSecretPath,
+        requireCredentialReceipt: true,
+        requireUploadReceipt: installAttempted,
+      });
+    } catch (error) {
+      if (isMissingCredentialReceipt(error)) {
+        await writePhaseLog(
+          "Remote WebDriver output was withheld because the private credential receipt was not published.\n",
+          [],
+        );
+      }
+      throw error;
+    }
+  }
+  await writePhaseLog(`${result.stdout}\n${result.stderr}`, privateSecrets);
   assertWebDriverPhaseExit({
     exitCode: result.exitCode,
     installAttempted,
@@ -2119,11 +2170,18 @@ const runUpgradeLane = async (input: {
   );
 };
 
+const missingCredentialReceiptMessage = "The private remote credential receipt is unavailable.";
+
+const isMissingCredentialReceipt = (error: unknown): boolean =>
+  error instanceof SeededDesktopUpgradeSmokeError &&
+  error.message === missingCredentialReceiptMessage;
+
 const copyBoundedEvidence = async (input: {
   readonly artifactDirectory: string;
   readonly layout: SeededUpgradeRunLayout;
   readonly requestLogPath: string;
   readonly secrets: ReadonlyArray<string>;
+  readonly withholdLanes?: ReadonlyArray<string>;
 }): Promise<void> => {
   await NodeFS.promises.mkdir(input.artifactDirectory, { recursive: true });
   const lanes = [
@@ -2132,6 +2190,7 @@ const copyBoundedEvidence = async (input: {
     ["remote-install", input.layout.remoteInstall],
   ] as const;
   for (const [lane, layout] of lanes) {
+    if (input.withholdLanes?.includes(lane)) continue;
     if (!NodeFS.existsSync(layout.evidenceDirectory)) continue;
     for (const source of await walkFiles(layout.evidenceDirectory)) {
       if (!/\.(?:json|log|txt)$/i.test(source)) continue;
@@ -2487,6 +2546,7 @@ export async function runSeededDesktopUpgradeSmoke(
     } catch {
       /* Before the remote phase, no install marker is expected. */
     }
+    let withholdLanes: ReadonlyArray<string> = [];
     try {
       secrets.push(
         ...(await readRemoteFixtureSecrets({
@@ -2496,19 +2556,35 @@ export async function runSeededDesktopUpgradeSmoke(
           requireUploadReceipt: installAttempted,
         })),
       );
-    } catch {
-      failure ??= new SeededDesktopUpgradeSmokeError(
-        "Private remote fixture receipts were invalid; evidence was not retained.",
-      );
-      safeToRetainEvidence = false;
+    } catch (error) {
+      if (isMissingCredentialReceipt(error)) {
+        // The receipt was never published, so raw remote logs may contain a
+        // returned grant. Keep every earlier lane and a secret-free marker.
+        withholdLanes = ["remote-install"];
+        failure ??= error;
+      } else {
+        failure ??= new SeededDesktopUpgradeSmokeError(
+          "Private remote fixture receipts were invalid; evidence was not retained.",
+        );
+        safeToRetainEvidence = false;
+      }
     }
-    if (safeToRetainEvidence)
+    if (safeToRetainEvidence) {
+      await NodeFS.promises.mkdir(input.artifactDirectory, { recursive: true });
+      if (withholdLanes.length > 0) {
+        await NodeFS.promises.writeFile(
+          NodePath.join(input.artifactDirectory, "remote-install-phase-withheld.txt"),
+          "Remote WebDriver output was withheld because the private credential receipt was not published.\n",
+        );
+      }
       await copyBoundedEvidence({
         artifactDirectory: input.artifactDirectory,
         layout,
         requestLogPath,
         secrets,
+        withholdLanes,
       }).catch(() => undefined);
+    }
     try {
       await cleanup.cleanup();
     } catch (cleanupError) {
