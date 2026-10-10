@@ -633,8 +633,12 @@ pairing offer --endpoint http://<address>:3773` and confirm the dialog refuses
   evidence; do not substitute a manually created rule. Run the host-independent
   deletion-spawn and policy-denial tests, then reproduce a deletion denial
   natively and confirm the app reports incomplete cleanup rather than claiming
-  the rule was removed. A missing rule is benign only when the persistent
-  firewall store can be queried and its absence verified. Capture the shared
+  the rule was removed. A missing rule is benign only when `netsh advfirewall firewall show rule`
+  has queried the store and reported that no rule matches. Deletion uses the
+  same `netsh` program, not PowerShell: on the Windows ARM64 runner a
+  PowerShell firewall query did not finish inside the five-second caller
+  budget, the widen failed closed, and the another-device grant was never
+  minted. Capture the shared
   runbook's four explicit ceremony outcomes: authoritative local-only
   confirmation even after cancellation failure, another live access reason kept
   wide, cancellation and cleanup both unconfirmed, and cleanup topology
@@ -649,7 +653,7 @@ pairing offer --endpoint http://<address>:3773` and confirm the dialog refuses
   Burst multiple requests while one command is in flight and confirm the worker
   retains only the latest pending desired state, reports superseded callers
   explicitly, and applies that latest state after mandatory late cleanup.
-  Separately confirm a hung `netsh` or PowerShell child is terminated and reaped
+  Separately confirm a hung `netsh` child is terminated and reaped
   by its 15-second process timeout and never retains the exposure coordinator
   indefinitely;
 
