@@ -327,6 +327,9 @@ const remoteRetentionFixture = async () => {
     createSeededUpgradeWdioConfig,
     readRemoteFixtureSecrets,
     redactAndBoundUpgradeEvidence,
+    isMissingCredentialReceipt: (error: unknown) =>
+      error instanceof SeededDesktopUpgradeSmokeError &&
+      error.message === "The private remote credential receipt is unavailable.",
     assertWebDriverPhaseExit,
     assertRemoteInstallPort,
     SeededDesktopUpgradeSmokeError,
@@ -383,9 +386,12 @@ describe("remote phase receipt retention boundaries", () => {
     const fixture = await remoteRetentionFixture();
     try {
       const error = await fixture.runPhase().catch((error: unknown) => error);
-      expect(
-        NodeFS.existsSync(NodePath.join(fixture.evidenceDirectory, "seed-and-install.log")),
-      ).toBe(false);
+      const log = await NodeFS.promises.readFile(
+        NodePath.join(fixture.evidenceDirectory, "seed-and-install.log"),
+        "utf8",
+      );
+      expect(log).toContain("private credential receipt was not published");
+      expect(log).not.toContain("fixture-private-returned-token");
       expect(error).toBeInstanceOf(SeededDesktopUpgradeSmokeError);
       expect(String(error)).not.toContain("fixture-private-returned-token");
     } finally {
@@ -401,8 +407,18 @@ describe("remote phase receipt retention boundaries", () => {
           fixture.runCommand.mockRejectedValue(new Error("fixture launch failure"));
         await fixture.runPhase().catch(() => undefined);
         const finalError = await fixture.finalize();
-        expect(fixture.copyBoundedEvidence).not.toHaveBeenCalled();
+        expect(fixture.copyBoundedEvidence).toHaveBeenCalledOnce();
+        expect(fixture.copyBoundedEvidence.mock.calls[0]?.[0]?.withholdLanes).toEqual([
+          "remote-install",
+        ]);
+        const marker = await NodeFS.promises.readFile(
+          NodePath.join(fixture.root, "retained", "remote-install-phase-withheld.txt"),
+          "utf8",
+        );
+        expect(marker).toContain("private credential receipt was not published");
+        expect(marker).not.toContain("fixture-private-returned-token");
         expect(finalError).toBeInstanceOf(SeededDesktopUpgradeSmokeError);
+        expect(String(finalError)).not.toContain("fixture-private-returned-token");
         expect(fixture.cleanup).toHaveBeenCalledOnce();
       } finally {
         await fixture.dispose();
@@ -647,6 +663,7 @@ describe("generated remote sharing grant handoff", () => {
   it.each(["http", "body", "transport"])(
     "sanitizes %s failures before any private handoff",
     async (failure) => {
+      vi.useFakeTimers();
       const fixture = remoteGrantFixture([[publicPairingGrant]]);
       fixture.fetch.mockImplementation(async () => {
         if (failure === "transport") throw new Error("fixture-private-network-detail");
@@ -657,11 +674,35 @@ describe("generated remote sharing grant handoff", () => {
           },
         };
       });
-      await expect(fixture.run()).rejects.toThrow("Remote verification pairing grant unavailable.");
+      const outcome = fixture.run().then(
+        () => "unexpected success",
+        (error: Error) => error.message,
+      );
+      await vi.runAllTimersAsync();
+      expect(await outcome).toBe("Remote verification pairing grant unavailable.");
+      expect(String(await outcome)).not.toContain("fixture-private");
+      expect(fixture.fetch.mock.calls.length).toBeGreaterThan(1);
       expect(fixture.files.size).toBe(0);
       expect(fixture.driver).not.toHaveBeenCalled();
     },
   );
+
+  it("retries a restart-time pairing refusal until the grant is published", async () => {
+    vi.useFakeTimers();
+    const fixture = remoteGrantFixture([[publicPairingGrant]]);
+    fixture.fetch
+      .mockRejectedValueOnce(new Error("fixture-private-reset"))
+      .mockResolvedValueOnce({ ok: true, json: async () => [publicPairingGrant] });
+    const outcome = fixture.run().then(
+      () => null,
+      (error: Error) => error.message,
+    );
+    await vi.runAllTimersAsync();
+    expect(await outcome).toBeNull();
+    expect(fixture.driver).toHaveBeenCalledOnce();
+    expect(fixture.files.size).toBeGreaterThan(0);
+    expect(vi.getTimerCount()).toBe(0);
+  });
 
   it("aborts a stalled grant request before the embedded driver command deadline", async () => {
     vi.useFakeTimers();
@@ -693,7 +734,7 @@ describe("generated remote sharing grant handoff", () => {
     });
     expect((await outcome).elapsed).toBeGreaterThan(0);
     expect((await outcome).elapsed).toBeLessThan(30_000);
-    expect(aborted).toHaveBeenCalledOnce();
+    expect(aborted.mock.calls.length).toBeGreaterThan(1);
     expect(fixture.driver).not.toHaveBeenCalled();
     expect(fixture.files.size).toBe(0);
     expect(vi.getTimerCount()).toBe(0);
@@ -1849,14 +1890,15 @@ describe("seeded packaged desktop upgrade harness", () => {
     expect(
       startupRetry.test("The candidate application version was not running after update."),
     ).toBe(false);
-    expect(windowsUpgradeObservationScript).toContain(
-      "Get-Process -Name $installerName -ErrorAction SilentlyContinue",
-    );
+    expect(windowsUpgradeObservationScript).toContain("tasklist.exe /FO CSV /NH");
+    expect(windowsUpgradeObservationScript).not.toContain("Get-Process");
     expect(windowsUpgradeObservationScript).not.toContain("Get-CimInstance");
-    expect(windowsUpgradeObservationScript).toContain("-installer");
+    expect(windowsUpgradeObservationScript).toContain("-installer.exe");
     expect(windowsUpgradeObservationScript).toContain("BIBCODE_SEEDED_PRODUCT_NAME");
+    expect(windowsUpgradeObservationScript).toContain("version metadata timed out");
+    expect(windowsUpgradeObservationScript).toContain("if ($product -eq $Candidate)");
     expect(windowsUpgradeObservationScript).toContain(
-      "$observation.productVersion -eq $env:BIBCODE_SEEDED_CANDIDATE_VERSION",
+      ".AddArgument($env:BIBCODE_SEEDED_CANDIDATE_VERSION)",
     );
     expect(seed).not.toContain('state?.phase === "protecting") finish');
     expect(seed).not.toContain("setTimeout(resolve, 30000)");
