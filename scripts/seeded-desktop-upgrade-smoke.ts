@@ -682,53 +682,78 @@ describe("seeded packaged upgrade ${input.lane} ${input.phase}", () => {
     let credentials;
     try {
     credentials = await browser.execute(async (widened) => {
-      const bootstrap = window.desktopBridge.getLocalEnvironmentBootstraps().find((entry) => entry.id === "primary");
-      if (!bootstrap?.httpBaseUrl || !bootstrap.bootstrapToken) throw new Error("Remote verification bootstrap unavailable.");
-      if (widened) {
-        const bearer = await window.desktopBridge.getLocalEnvironmentBearerToken();
-        // Exposure precedes minting. Stay below the embedded driver's 30-second command bound.
-        const deadline = Date.now() + 20000;
-        let sawTransportFailure = false;
-        while (Date.now() < deadline) {
-          const controller = new AbortController();
-          const timeout = setTimeout(() => controller.abort(), Math.min(5000, deadline - Date.now()));
-          let links;
+      const readBootstrap = () => window.desktopBridge.getLocalEnvironmentBootstraps().find((entry) => entry.id === "primary");
+      if (!widened) {
+        const bootstrap = readBootstrap();
+        if (!bootstrap?.httpBaseUrl || !bootstrap.bootstrapToken) throw new Error("Remote verification bootstrap unavailable.");
+        return { endpoint: bootstrap.httpBaseUrl, bootstrapToken: bootstrap.bootstrapToken };
+      }
+      // The bridge cache updates when the restarted backend is ready. Hold neither
+      // the first endpoint nor the first bearer across that publication.
+      const deadline = Date.now() + 20000;
+      let sawTransportFailure = false;
+      let attempts = 0;
+      let lastStatus = null;
+      let endpointChanged = false;
+      let previousEndpoint = null;
+      while (Date.now() < deadline) {
+        attempts += 1;
+        const bootstrap = readBootstrap();
+        const endpoint = bootstrap && typeof bootstrap.httpBaseUrl === "string" ? bootstrap.httpBaseUrl : "";
+        if (previousEndpoint !== null && endpoint !== previousEndpoint) endpointChanged = true;
+        if (endpoint.length > 0) previousEndpoint = endpoint;
+        let links = null;
+        if (!endpoint || !bootstrap?.bootstrapToken) {
+          sawTransportFailure = true;
+        } else {
+          let bearer = null;
           try {
-            const response = await fetch(new URL("/api/auth/pairing-links", bootstrap.httpBaseUrl), {
-              headers: { authorization: "Bearer " + bearer },
-              signal: controller.signal,
-            });
-            if (!response.ok) throw new Error();
-            links = await response.json();
-            sawTransportFailure = false;
+            bearer = await window.desktopBridge.getLocalEnvironmentBearerToken();
           } catch {
-            // Widening restarts the server. A refused request is not the grant;
-            // keep polling until the deadline without copying transport details.
+            bearer = null;
+          }
+          if (typeof bearer !== "string" || bearer.length === 0) {
             sawTransportFailure = true;
-            links = null;
-          } finally {
-            clearTimeout(timeout);
+          } else {
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), Math.min(5000, deadline - Date.now()));
+            try {
+              const response = await fetch(new URL("/api/auth/pairing-links", endpoint), {
+                headers: { authorization: "Bearer " + bearer },
+                signal: controller.signal,
+              });
+              if (!response.ok) {
+                if (typeof response.status === "number") lastStatus = response.status;
+                throw new Error();
+              }
+              links = await response.json();
+              sawTransportFailure = false;
+            } catch {
+              // A refused request is not the grant. Keep polling without copying
+              // transport details, URLs, or response bodies.
+              sawTransportFailure = true;
+              links = null;
+            } finally {
+              clearTimeout(timeout);
+            }
           }
-          if (links === null) {
-            if (Date.now() >= deadline) break;
-            await new Promise((resolve) => setTimeout(resolve, Math.max(0, Math.min(250, deadline - Date.now()))));
-            continue;
-          }
+        }
+        if (links !== null) {
           if (!Array.isArray(links)) throw new Error("Remote verification pairing grant response invalid.");
-          // AuthPairingLink publishes reach and credential; offHost is server-private metadata.
           const grant = links.find((link) => link !== null && typeof link === "object" &&
             link.reach === "another-device" && typeof link.id === "string" && link.id.trim().length > 0 &&
             typeof link.credential === "string" && link.credential.trim().length > 0);
           if (grant && Date.now() < deadline) {
-            // Redeeming the offered grant keeps the wide listener alive across the update.
-            return { endpoint: bootstrap.httpBaseUrl, bootstrapToken: grant.credential };
+            return { endpoint, bootstrapToken: grant.credential };
           }
-          await new Promise((resolve) => setTimeout(resolve, Math.max(0, Math.min(250, deadline - Date.now()))));
         }
-        if (sawTransportFailure) throw new Error("Remote verification pairing grant unavailable.");
-        throw new Error("Remote verification has no live native sharing grant.");
+        if (Date.now() >= deadline) break;
+        await new Promise((resolve) => setTimeout(resolve, Math.max(0, Math.min(250, deadline - Date.now()))));
       }
-      return { endpoint: bootstrap.httpBaseUrl, bootstrapToken: bootstrap.bootstrapToken };
+      const detail = "status=" + (typeof lastStatus === "number" ? String(lastStatus) : "none") +
+        " attempts=" + attempts + " endpointChanged=" + endpointChanged;
+      if (sawTransportFailure) throw new Error("Remote verification pairing grant unavailable. " + detail);
+      throw new Error("Remote verification has no live native sharing grant.");
     }, widened);
     traceRemote({ step: "credentials-returned" });
     // Private receipt is outside retained evidence; the controller uses it to redact logs.
