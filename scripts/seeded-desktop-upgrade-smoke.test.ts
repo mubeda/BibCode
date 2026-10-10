@@ -24,6 +24,7 @@ import {
   assertBaselineVersionIsOlder,
   assertSeededUpgradeBuildVersion,
   assertWebDriverPhaseExit,
+  remoteEvidenceReadFailure,
   windowsCandidateIsInstalled,
   productVersionFromExecutableBytes,
   windowsInstallerProcesses,
@@ -2010,6 +2011,18 @@ describe("seeded packaged desktop upgrade harness", () => {
         timeoutMs: 20,
       }),
     ).rejects.toThrow(/candidate restart.*20ms/);
+  });
+
+  it("reports a missing remote evidence file without a filesystem crash", () => {
+    const missing = remoteEvidenceReadFailure(
+      Object.assign(new Error("ENOENT: no such file or directory, open 'remote-rpc.json'"), {
+        code: "ENOENT",
+      }),
+    );
+    expect(missing).toBeInstanceOf(Error);
+    expect(missing?.message).toBe("The remote-install lane finished without remote-rpc.json.");
+    expect(missing?.message.includes("no such file")).toBe(false);
+    expect(remoteEvidenceReadFailure(new Error("invalid"))).toBeUndefined();
   });
 
   it("accepts a nonzero seed phase only after the updater install was issued", () => {
