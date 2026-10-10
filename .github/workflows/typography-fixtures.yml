@@ -83,9 +83,9 @@ jobs:
       - name: Build actual component gallery
         working-directory: apps/web
         run: node ../../scripts/run-local-vp.mjs build --config visual/typography/vite.config.mjs
-      - name: Prove native WebKit startup and actual Badge painting
+      - name: Capture affected native WebKit popovers
         run: |
-          timeout --signal=TERM --kill-after=15s 180s dbus-run-session -- xvfb-run -a sh -c 'WebKitWebDriver --port=4444 & driver_pid=$!; trap "kill $driver_pid; wait $driver_pid" EXIT; node apps/web/visual/typography/capture.mjs webkitgtk typography-artifacts/webkitgtk smoke'
+          timeout --signal=TERM --kill-after=15s 600s dbus-run-session -- xvfb-run -a sh -c 'WebKitWebDriver --port=4444 & driver_pid=$!; trap "kill $driver_pid; wait $driver_pid" EXIT; node apps/web/visual/typography/capture.mjs webkitgtk typography-artifacts/webkitgtk selected git-create-options-users,git-create-options-labels,git-create-options-milestones,git-create-request,git-create-request-branches,git-new-branch-popup,pr-apply-suggestions-popup,pr-base-branch-popup,pr-confirm-action,pr-picker-labels,pr-picker-milestone,pr-dismiss-review,pr-review-popup'
       - name: Preserve original captures and source manifest
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

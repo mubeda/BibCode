@@ -30,6 +30,13 @@ driver, with bounded page/script waits and an early bootstrap record. This
 smoke gate does not establish the full changed-component inventory. Complete
 that inventory in subsequent capture batches before accepting the issue.
 
+To fill a reviewed gap without repeating accepted fixtures, pass `selected` and
+a comma-separated list of catalog IDs after the engine and output directory.
+The caller refuses missing or unknown IDs and records the exact selected scope.
+For example, the GTK lane selects the affected PR/MR and branch popovers; it
+requires both themes with the native Linux WebKit CSS gate. Combine these
+selected packets with the full Chromium groups by current module hash.
+
 The root coverage policy treats this development-only directory like desktop
 UI automation. Its compiler and typed service aliases run in the dedicated
 gallery test lane, enforced by the workflow and coverage-policy check. The

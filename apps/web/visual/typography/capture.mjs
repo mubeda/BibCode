@@ -100,7 +100,7 @@ export async function interactWithFixture(browser, actions) {
     await element.waitForDisplayed({ timeout: 10_000 });
     if (action.action === "click") await element.click();
     else if (action.action === "press") {
-      await element.click();
+      await browser.execute((element) => element.focus(), element);
       await browser.keys(action.key);
     } else if (action.action === "fill") await element.setValue(action.value);
     else if (action.action === "hover") await element.moveTo();
@@ -357,6 +357,8 @@ export async function captureFixtures({
 }
 
 async function main() {
+  if (process.argv[4] === "selected" && !process.argv[5])
+    throw new Error("Typography selected fixture IDs missing.");
   if (process.env.GITHUB_ACTIONS !== "true") throw new Error("Native browser capture is CI-only.");
   const engine = process.argv[2];
   if (engine !== "chromium" && engine !== "webkitgtk") throw new Error("Capture engine refused.");
@@ -448,8 +450,13 @@ async function main() {
     output,
     source,
     engine,
-    selectedIds: process.argv[4] === "smoke" ? ["badge"] : undefined,
-    group: process.argv[5],
+    selectedIds:
+      process.argv[4] === "smoke"
+        ? ["badge"]
+        : process.argv[4] === "selected"
+          ? process.argv[5]?.split(",")
+          : undefined,
+    group: process.argv[4] === "selected" ? undefined : process.argv[5],
     progress: (stage) => process.stdout.write(`TYPOGRAPHY_STAGE ${engine} ${stage}\n`),
   });
 }

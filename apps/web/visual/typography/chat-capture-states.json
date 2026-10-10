@@ -20,13 +20,13 @@
       "state": "actual-popup-models",
       "actions": [],
       "owners": ["ProviderModelPicker"],
-      "visible_text": ["Typography Sol", "TC", "Typography Reviewed model"],
+      "visible_text": ["Typography Sol", "TC", "Reviewed", "Typography Codex"],
       "widget_selectors": [
         "[data-chat-provider-model-picker]",
         "[data-model-picker-content]",
-        "[role=\"combobox\"]"
+        "[data-model-picker-model-slug=\"typography-reviewed\"]"
       ],
-      "note": "CI_ONLY layout-dependent row visibility; HappyDOM admission covers trigger/actual popup structure only."
+      "note": "Current unlocked ModelPickerContent uses preferShortName; the real second row is Reviewed. TC is the actual trigger accent badge. Require the row inside the actual popup and its provider footer; no replacement renderer."
     }
   ]
 }

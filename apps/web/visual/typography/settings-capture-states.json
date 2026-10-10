@@ -35,7 +35,12 @@
   "settings-diagnostics-panel": [
     {
       "state": "trace-summary",
-      "actions": [],
+      "actions": [
+        {
+          "action": "scrollIntoView",
+          "text": "Trace Diagnostics"
+        }
+      ],
       "owners": ["StatBlock", "DiagnosticsLastChecked", "DiagnosticsSettingsPanel"],
       "visible_text": ["Spans", "Checked"]
     },
@@ -72,8 +77,22 @@
           "text": "Slowest Spans"
         }
       ],
-      "owners": ["TraceIdCell", "DiagnosticsTable"],
-      "visible_text": ["fixture.trace.slow", "trace-0123456789ab...vwxyz-9876"]
+      "owners": ["DiagnosticsTable"],
+      "visible_text": ["fixture.trace.slow"]
+    },
+    {
+      "state": "trace-id",
+      "actions": [
+        {
+          "action": "scrollIntoView",
+          "selector": "span.font-mono.text-xs",
+          "text": "trace-0123456789ab...vwxyz-9876",
+          "index": 0
+        }
+      ],
+      "owners": ["TraceIdCell"],
+      "visible_text": ["trace-0123456789ab...vwxyz-9876"],
+      "note": "Reveal the actual right-hand Trace column through its scroller; the name/table witness remains in slow-spans."
     }
   ],
   "settings-keybindings": [
@@ -128,6 +147,13 @@
       "state": "shortcut-edit-copy",
       "actions": [
         {
+          "action": "fill",
+          "role": "textbox",
+          "name": "When expression",
+          "value": "terminalFocus && (!composerFocus || threadFocus)",
+          "selector": "input[aria-label=\"When expression\"]"
+        },
+        {
           "action": "escape"
         },
         {
@@ -139,7 +165,7 @@
       ],
       "owners": ["KeybindingTableRow"],
       "visible_text": ["Edit"],
-      "note": "Close the condition popover first. Focus makes the real opacity-0 Edit label visible."
+      "note": "Restore the original fixture clause through the real expression input before closing; incremental invalid typing leaves a dirty row and hides the shortcut pill."
     }
   ],
   "settings-provider-last-checked": [

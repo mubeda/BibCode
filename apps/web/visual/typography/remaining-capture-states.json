@@ -31,18 +31,29 @@
           "selector": "button[aria-label=\"Diff scope: Branch changes\"]"
         },
         {
-          "action": "hover",
-          "selector": "[role=\"menuitem\"]",
+          "action": "focus",
+          "selector": "[data-slot=\"menu-sub-trigger\"]",
           "text": "Turn"
+        },
+        {
+          "action": "press",
+          "selector": "[data-slot=\"menu-sub-trigger\"]",
+          "text": "Turn",
+          "key": "ArrowRight"
         }
       ],
-      "text_site_selectors": ["[role=\"menuitem\"] span.ml-auto.text-xs"],
-      "note": "Actual DiffPanel emits completedAt formatted labels through formatShortTimestamp; join original pixels with the current client timestamp format.",
+      "text_site_selectors": [
+        "[data-slot=\"menu-sub-content\"] [data-slot=\"menu-item\"] span.ml-auto.text-xs"
+      ],
+      "note": "Open the actual Turn submenu by keyboard. Review both runtime-formatted timestamps in the original.",
       "state": "scope-turn-timestamps",
       "visible_text": ["Turn 1", "Turn 2"]
     },
     {
       "actions": [
+        {
+          "action": "escape"
+        },
         {
           "action": "escape"
         },
@@ -56,9 +67,10 @@
           "value": "no-typography-ref-match"
         }
       ],
-      "note": "Start from a fresh initial state, or close scope menu before clicking comparison target.",
+      "note": "Close the nested Turn submenu and its parent before opening the comparison picker.",
       "state": "comparison-empty-refs",
-      "visible_text": ["Branch", "Remote", "No matching refs."]
+      "visible_text": ["Branch", "Remote", "No matching refs."],
+      "text_site_selectors": []
     }
   ],
   "diff-panel-raw": [
