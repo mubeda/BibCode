@@ -5,8 +5,9 @@
 //! thousands of watches. Registering them overflows the kernel's event queue (every walk
 //! opens each directory), the overflow requests a rescan, and the rescan walks again.
 //! Git status never reads those directories, so this tree watches every other directory
-//! non-recursively and skips them. Directories that appear later, and changed ignore
-//! rules, are reconciled by a worker thread with the same Git answers.
+//! non-recursively and skips them. Directories that appear later (created, or renamed
+//! into place), and changed ignore rules, are reconciled by a worker thread with the
+//! same Git answers.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -349,7 +350,11 @@ impl PrunedWatcher {
                             if changes_contents(event.kind) {
                                 let _ = changes.send(Change::Rules(path.clone()));
                             }
-                        } else if matches!(event.kind, notify::EventKind::Create(_)) {
+                        } else if directory_arrived(event.kind) {
+                            // inotify reports a renamed directory as Modify(Name), and
+                            // notify drops the watch on the old name. It only installs
+                            // one at the new name when the parent watch is recursive,
+                            // which these are not, so the worker adds it.
                             let _ = changes.send(Change::Created(path.clone()));
                         }
                     }
@@ -444,6 +449,17 @@ impl PrunedWatcher {
         }
         Ok(())
     }
+}
+
+/// A directory may have appeared under a watched parent: created, or renamed
+/// into place (`MOVED_TO`). File renames use the same kind; the worker keeps
+/// only directories.
+fn directory_arrived(kind: notify::EventKind) -> bool {
+    matches!(
+        kind,
+        notify::EventKind::Create(_)
+            | notify::EventKind::Modify(notify::event::ModifyKind::Name(_))
+    )
 }
 
 fn changes_contents(kind: notify::EventKind) -> bool {
@@ -803,6 +819,78 @@ mod tests {
         // Un-ignoring `build/` brings it into the watch.
         fs::write(root.join(".gitignore"), "node_modules/\n").unwrap();
         assert!(observed(&events, &root.join("build/out/file")));
+
+        watcher.unwatch(&root).unwrap();
+    }
+
+    #[test]
+    fn a_renamed_directory_stays_watched_and_an_ignored_rename_does_not() {
+        let temp = worktree();
+        let root = temp.path().canonicalize().unwrap();
+        let (sender, events) = mpsc::channel();
+        let mut watcher = PrunedWatcher::new(
+            move |event: notify::Result<notify::Event>| {
+                if let Ok(event) = event {
+                    for path in event.paths {
+                        let _ = sender.send(path);
+                    }
+                }
+            },
+            notify::Config::default(),
+        )
+        .unwrap();
+        watcher.watch(&root, RecursiveMode::Recursive).unwrap();
+        let until = |events: &mpsc::Receiver<PathBuf>, wanted: &Path| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let mut seen = Vec::new();
+            while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
+                match events.recv_timeout(left) {
+                    Ok(path) if path == wanted => return Some(seen),
+                    Ok(path) => seen.push(path),
+                    Err(_) => return None,
+                }
+            }
+            None
+        };
+        let observed = |events: &mpsc::Receiver<PathBuf>, file: &Path| {
+            for _ in 0..20 {
+                fs::write(file, "x").unwrap();
+                if until(events, file).is_some() {
+                    return true;
+                }
+            }
+            false
+        };
+
+        // `src/lib` is watched at registration. `git mv` / `rename(2)` then reports
+        // MOVED_TO, not Create, and notify drops the watch it had on the old name.
+        assert!(observed(&events, &root.join("src/lib/file.rs")));
+        fs::rename(root.join("src/lib"), root.join("src/renamed")).unwrap();
+        assert!(
+            observed(&events, &root.join("src/renamed/again.rs")),
+            "a renamed directory must stay watched"
+        );
+
+        // Renaming onto an ignored name must not bring that tree back into the watch.
+        // The parent still reports the rename itself; only later files inside would
+        // show that a watch was added.
+        fs::rename(root.join("src/renamed"), root.join("src/node_modules")).unwrap();
+        fs::create_dir(root.join("src/fresh")).unwrap();
+        let hidden = root.join("src/node_modules/hidden.rs");
+        let fresh = root.join("src/fresh/file.rs");
+        let mut saw_fresh = false;
+        let mut leaked = false;
+        for _ in 0..20 {
+            fs::write(&hidden, "x").unwrap();
+            fs::write(&fresh, "x").unwrap();
+            if let Some(before) = until(&events, &fresh) {
+                saw_fresh = true;
+                leaked = before.iter().any(|path| path == &hidden);
+                break;
+            }
+        }
+        assert!(saw_fresh, "a directory created after the rename is watched");
+        assert!(!leaked, "an ignored rename is not watched");
 
         watcher.unwatch(&root).unwrap();
     }
