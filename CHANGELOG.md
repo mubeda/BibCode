@@ -10,7 +10,7 @@ BiBCode v0.9.3 ends the macOS freezes caused by a page-wide label scan after eve
 - Scrolling up a long conversation no longer holds the interface. A finished message's code blocks show at once and are colored right after, one at a time, instead of all being colored while their rows appear. In a 100-turn test thread, the time the interface stalled while scrolling to the top fell from about 2 s to under 0.7 s. (#103)
 - The server no longer keeps a full copy of each open thread for every client that shows it. During agent turns that copy grew by about twice the thread's new content, and it was kept for as long as the thread stayed open. (#101)
 - The process history behind the status bar's resource readout keeps its hour in about 0.5 MB instead of 3 to 15 MB. (#100)
-- The desktop reads the local server's connection details from memory instead of asking the app on every check, which slowed the web view's memory growth on Linux. (#96)
+- The desktop reads the local server's connection details from memory instead of asking the app on every check, which slowed the web view's memory growth on Linux. A restart still replaces those details at once: a read that was already in flight cannot put the old address and token back. (#96)
 
 ### Terminals
 
