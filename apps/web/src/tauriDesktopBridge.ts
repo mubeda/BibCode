@@ -166,17 +166,29 @@ async function tauriInvokeDesktop<T>(command: string, args?: Record<string, unkn
 }
 
 function refreshLocalEnvironmentBootstraps(): Promise<readonly DesktopEnvironmentBootstrap[]> {
-  localEnvironmentBootstrapsRefresh ??= tauriInvoke<DesktopEnvironmentBootstrap[]>(
+  if (localEnvironmentBootstrapsRefresh !== null) return localEnvironmentBootstrapsRefresh;
+  // `desktop:backend-ready` drops this slot and installs the restarted topology itself.
+  // A read that started before that event must not write its answer afterwards: the
+  // 30 s throttle would then keep the old port and token.
+  const refresh = tauriInvoke<DesktopEnvironmentBootstrap[]>(
     "desktop_bridge_get_local_environment_bootstraps",
   )
-    .then((bootstraps) => {
-      cachedLocalEnvironmentBootstraps = bootstraps;
-      return bootstraps;
-    })
+    .then(
+      (bootstraps) => {
+        if (localEnvironmentBootstrapsRefresh !== refresh) return cachedLocalEnvironmentBootstraps;
+        cachedLocalEnvironmentBootstraps = bootstraps;
+        return bootstraps;
+      },
+      (error: unknown) => {
+        if (localEnvironmentBootstrapsRefresh !== refresh) return cachedLocalEnvironmentBootstraps;
+        throw error;
+      },
+    )
     .finally(() => {
-      localEnvironmentBootstrapsRefresh = null;
+      if (localEnvironmentBootstrapsRefresh === refresh) localEnvironmentBootstrapsRefresh = null;
     });
-  return localEnvironmentBootstrapsRefresh;
+  localEnvironmentBootstrapsRefresh = refresh;
+  return refresh;
 }
 
 function getCachedLocalEnvironmentBootstraps(): readonly DesktopEnvironmentBootstrap[] {
@@ -194,7 +206,9 @@ function getCachedLocalEnvironmentBootstraps(): readonly DesktopEnvironmentBoots
 
 function applyBackendReady(payload: TauriDesktopBackendReadyPayload): void {
   cachedLocalEnvironmentBootstraps = payload.bootstraps;
+  // Drop any read already in flight so its later answer cannot replace this topology.
   localEnvironmentBootstrapsRefresh = null;
+  localEnvironmentBootstrapsRefreshedAt = Date.now();
   localEnvironmentBearerToken = null;
 }
 

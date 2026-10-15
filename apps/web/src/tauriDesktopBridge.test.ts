@@ -461,6 +461,58 @@ describe("tauriDesktopBridge", () => {
     expect(topologyReads()).toBe(afterFirstRead + 1);
   });
 
+  it("keeps the backend-ready topology when an older bootstrap read finishes later", async () => {
+    const previous = {
+      id: "primary",
+      label: "Local",
+      httpBaseUrl: "http://127.0.0.1:3773",
+      wsBaseUrl: "ws://127.0.0.1:3773",
+      bootstrapToken: "old-token",
+    };
+    const restarted = {
+      ...previous,
+      httpBaseUrl: "http://127.0.0.1:4888",
+      wsBaseUrl: "ws://127.0.0.1:4888",
+      bootstrapToken: "new-token",
+    };
+    const harness = installTauriHarness({ localEnvironmentBootstraps: [previous] });
+    const bridge = await installBridge();
+    const now = vi.spyOn(Date, "now").mockReturnValue(5_000_000);
+    let releaseStaleRead: (bootstraps: readonly unknown[]) => void = () => {};
+    const staleRead = new Promise<readonly unknown[]>((resolve) => {
+      releaseStaleRead = resolve;
+    });
+    harness.invoke.mockImplementationOnce((command: string) => {
+      if (command !== "desktop_bridge_get_local_environment_bootstraps") {
+        throw new Error(`unexpected command ${command}`);
+      }
+      return staleRead;
+    });
+
+    now.mockReturnValue(5_030_000);
+    bridge.getLocalEnvironmentBootstraps();
+    harness.listeners.get("desktop:backend-ready")?.({
+      payload: { reason: "restarted", bootstraps: [restarted] },
+    });
+    expect(bridge.getLocalEnvironmentBootstraps()).toEqual([restarted]);
+
+    releaseStaleRead([previous]);
+    await staleRead;
+    await Promise.resolve();
+    expect(bridge.getLocalEnvironmentBootstraps()).toEqual([restarted]);
+
+    const readsAfterRestart = harness.invoke.mock.calls.filter(
+      ([command]) => command === "desktop_bridge_get_local_environment_bootstraps",
+    ).length;
+    now.mockReturnValue(5_050_000);
+    expect(bridge.getLocalEnvironmentBootstraps()).toEqual([restarted]);
+    expect(
+      harness.invoke.mock.calls.filter(
+        ([command]) => command === "desktop_bridge_get_local_environment_bootstraps",
+      ).length,
+    ).toBe(readsAfterRestart);
+  });
+
   it("keeps asking on every read while the primary bootstrap is unknown", async () => {
     let primaryKnown = true;
     const primaryBootstrap = {
