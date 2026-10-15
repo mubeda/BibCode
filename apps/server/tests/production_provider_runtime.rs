@@ -11013,6 +11013,156 @@ async fn checkpoint_rpc_rewinds_the_provider_once_before_restoring_files() {
     engine.shutdown().await;
 }
 
+/// Background work keeps the provider process up after its turn is `ready`. Revert must not
+/// restore files under that process, or rewind the conversation while it is still writing.
+#[tokio::test]
+async fn checkpoint_revert_refuses_while_background_work_is_running() {
+    let repository = initialize_repository();
+    let engine = engine().await;
+    for (turn_count, content) in [(0, "baseline\n"), (1, "one\n"), (2, "two\n")] {
+        project_checkpoint(&engine, repository.path(), turn_count, content).await;
+    }
+    let state = Arc::new(StdMutex::new(DriverState {
+        rollback_workspace: Some(repository.path().to_path_buf()),
+        ..DriverState::default()
+    }));
+    let (events_tx, events_rx) = mpsc::channel(8);
+    let supervisor = Arc::new(ProviderRuntimeSupervisor::start(
+        engine.clone(),
+        Arc::new(FakeFactory {
+            state: state.clone(),
+            events: StdMutex::new(VecDeque::from([events_rx])),
+        }),
+        activity_projection(&engine),
+        SupervisorOptions::default(),
+    ));
+    let mut provider_launch = launch();
+    provider_launch.cwd = repository.path().to_path_buf();
+    supervisor.launch(provider_launch).await.unwrap();
+    let effects = OrchestrationEffects::start(
+        engine.clone(),
+        Arc::new(GitRepository::default()),
+        supervisor_effects(&supervisor, &engine, repository.path()),
+        EffectsOptions::default(),
+    )
+    .await
+    .unwrap();
+
+    let background_work = |event_type: &str, turn_id: Option<&str>, payload: Value| ProviderEvent {
+        native_event_id: None,
+        event_type: event_type.to_owned(),
+        thread_id: "t1".to_owned(),
+        turn_id: turn_id.map(str::to_owned),
+        item_id: None,
+        request_id: None,
+        payload,
+        activity: Vec::new(),
+        activity_controls: Default::default(),
+    };
+    events_tx
+        .send(background_work(
+            "session.background-work",
+            None,
+            json!({ "liveTasks": 1 }),
+        ))
+        .await
+        .unwrap();
+    events_tx
+        .send(background_work("turn.started", Some("barrier"), json!({})))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let running = engine
+                .repositories()
+                .get_thread_session("t1".to_owned())
+                .await
+                .unwrap()
+                .is_some_and(|session| session.status == "running");
+            if running {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the barrier turn is projected after the background-work event");
+    events_tx
+        .send(background_work(
+            "turn.completed",
+            Some("barrier"),
+            json!({ "state": "completed" }),
+        ))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let ready = engine
+                .repositories()
+                .get_thread_session("t1".to_owned())
+                .await
+                .unwrap()
+                .is_some_and(|session| {
+                    session.status == "ready" && session.active_turn_id.is_none()
+                });
+            if ready {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the barrier turn ends with the session ready and the background work still reported");
+
+    let mut events = engine.subscribe_events();
+    engine
+        .dispatch(
+            serde_json::from_value(json!({
+                "type":"thread.checkpoint.revert",
+                "commandId":"revert-during-background-work",
+                "threadId":"t1",
+                "turnCount":1,
+                "createdAt":NOW
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    wait_for_event(&mut events, |event| {
+        event.event.event_type == "thread.activity-appended"
+            && event.event.payload["activity"]["kind"] == "checkpoint.revert.failed"
+    })
+    .await;
+    let recorded = engine.read_events(0).await.unwrap();
+    assert!(
+        recorded.iter().any(|event| {
+            event.event.payload["activity"]["kind"] == "checkpoint.revert.failed"
+                && event.event.payload["activity"]["payload"]["detail"]
+                    .as_str()
+                    .is_some_and(|detail| {
+                        detail.contains(
+                            "Stop the running background work before reverting checkpoints.",
+                        )
+                    })
+        }),
+        "background work reaches the work log"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repository.path().join("tracked.txt"))
+            .unwrap()
+            .replace("\r\n", "\n"),
+        "two\n"
+    );
+    assert!(
+        state.lock().unwrap().rollbacks.is_empty(),
+        "background work must be refused before the provider rewinds"
+    );
+
+    effects.shutdown().await;
+    supervisor.shutdown().await.unwrap();
+    engine.shutdown().await;
+}
+
 /// A failed provider rewind leaves everything as it was: files, checkpoint refs and messages.
 #[tokio::test]
 async fn checkpoint_rpc_reports_effect_failure_without_a_direct_or_second_rollback() {

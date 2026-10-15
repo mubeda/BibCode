@@ -7625,6 +7625,21 @@ async fn rewind_session(
         .ok_or_else(|| ProviderRuntimeError::SessionNotFound {
             thread_id: thread_id.to_owned(),
         })?;
+    // A turn that already finished can still have background work in this process. Idle
+    // suspension leaves that process up, and the effect's `running` check does not see it.
+    // Restoring files then (or rewinding under it) lands on a workspace the process is
+    // still writing.
+    if entry
+        .activity_lifecycle
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .has_recent_live_activity()
+    {
+        return Err(ProviderRuntimeError::Provider {
+            provider: entry.launch.provider.clone(),
+            detail: "Stop the running background work before reverting checkpoints.".to_owned(),
+        });
+    }
     if !crate::provider::supports_conversation_rewind(&entry.launch.provider) {
         return Ok(ProviderRewind::FilesOnly {
             provider_label: entry.launch.provider_label.clone(),
