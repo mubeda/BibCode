@@ -2269,7 +2269,11 @@ rewound.
 
 The effect also refuses a revert while the thread's session is `running`,
 whichever client asked for it. A running turn would write over the restored
-files, or the rewind would cut it off.
+files, or the rewind would cut it off. The supervisor also refuses while the
+session still reports recent background work (a Claude background task, or a
+subagent or work item Activity still has as running). Idle suspension keeps
+that process up after the turn ends, and restoring files under it would not
+leave the checkpoint.
 
 Once the provider has rewound, the revert must be recorded, or a retry would
 rewind the provider again. Shutdown therefore waits for step 3 instead of
