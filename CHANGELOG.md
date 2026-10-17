@@ -11,6 +11,7 @@
 - OpenCode 2 update notices and update actions use `@opencode/cli`, Windows npm installs of OpenCode 2 are recognized, and an OpenCode version BiBCode cannot drive (3.x or later) shows an actionable error instead of reading Ready.
 - Fixed: OpenCode 1.18.32 and 1.19 rejected every message BiBCode sent, because its delivery id was not a `msg_` id. Deliveries now use an id OpenCode accepts.
 - Fixed: an inherited `OPENCODE_PASSWORD` no longer breaks the OpenCode servers BiBCode starts.
+- Fixed: a message OpenCode refuses, or that never reaches it, no longer sits as "Delivery uncertain" and holds the chat. A refusal shows as failed, and a connection that never opened is retried.
 
 ## [v0.9.4] - 2026-10-15
 
