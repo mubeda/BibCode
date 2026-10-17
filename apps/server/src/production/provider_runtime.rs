@@ -11618,6 +11618,78 @@ impl OpenCodeDriver {
     }
 }
 
+/// How an OpenCode send is stored. A request OpenCode never accepted must not become an
+/// uncertain delivery: that tells the user it may have arrived and holds later messages.
+fn opencode_delivery_outcome(
+    result: Result<String, crate::provider::opencode::runtime::OpenCodeRuntimeError>,
+) -> ProviderDeliveryOutcome {
+    use crate::provider::opencode::runtime::OpenCodeRuntimeError;
+    match result {
+        Ok(turn_id) => ProviderDeliveryOutcome::Accepted {
+            turn_id: Some(turn_id),
+        },
+        Err(
+            error @ (OpenCodeRuntimeError::MissingSession
+            | OpenCodeRuntimeError::InvalidResponse(_)
+            | OpenCodeRuntimeError::NotSent(_)),
+        ) => ProviderDeliveryOutcome::DefinitelyNotSent {
+            detail: delivery_detail(&provider_error("opencode")(error), None),
+        },
+        Err(error @ OpenCodeRuntimeError::RequestRefused(_)) => ProviderDeliveryOutcome::Rejected {
+            detail: delivery_detail(&provider_error("opencode")(error), None),
+        },
+        Err(error) => ProviderDeliveryOutcome::Ambiguous {
+            detail: delivery_detail(&provider_error("opencode")(error), None),
+        },
+    }
+}
+
+#[cfg(test)]
+mod opencode_delivery_outcome_tests {
+    use super::{ProviderDeliveryOutcome, opencode_delivery_outcome};
+    use crate::provider::opencode::runtime::OpenCodeRuntimeError;
+
+    #[test]
+    fn a_refused_opencode_request_fails_the_delivery() {
+        let outcome = opencode_delivery_outcome(Err(OpenCodeRuntimeError::RequestRefused(
+            "prompt returned HTTP 400".to_owned(),
+        )));
+        assert_eq!(
+            outcome,
+            ProviderDeliveryOutcome::Rejected {
+                detail: "OpenCode refused this message: prompt returned HTTP 400".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn an_unsent_opencode_request_is_retried() {
+        let outcome = opencode_delivery_outcome(Err(OpenCodeRuntimeError::NotSent(
+            "connection refused".to_owned(),
+        )));
+        assert_eq!(
+            outcome,
+            ProviderDeliveryOutcome::DefinitelyNotSent {
+                detail: "OpenCode request failed before the turn was sent: connection refused"
+                    .to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn an_ambiguous_opencode_http_error_stays_uncertain() {
+        let outcome = opencode_delivery_outcome(Err(OpenCodeRuntimeError::Http(
+            "prompt returned HTTP 502".to_owned(),
+        )));
+        assert_eq!(
+            outcome,
+            ProviderDeliveryOutcome::Ambiguous {
+                detail: "OpenCode HTTP request failed: prompt returned HTTP 502".to_owned(),
+            }
+        );
+    }
+}
+
 impl ProviderDriver for OpenCodeDriver {
     fn owns_native_work(&self) -> bool {
         self.child.is_some()
@@ -11694,21 +11766,7 @@ impl ProviderDriver for OpenCodeDriver {
                     .send_turn(Some(&text), attachments, Some(&delivery_key))
                     .await
             };
-            match result {
-                Ok(turn_id) => ProviderDeliveryOutcome::Accepted {
-                    turn_id: Some(turn_id),
-                },
-                Err(error @ crate::provider::opencode::runtime::OpenCodeRuntimeError::MissingSession)
-                | Err(error @ crate::provider::opencode::runtime::OpenCodeRuntimeError::InvalidResponse(_))
-                | Err(error @ crate::provider::opencode::runtime::OpenCodeRuntimeError::NotSent(_)) => {
-                    ProviderDeliveryOutcome::DefinitelyNotSent {
-                        detail: delivery_detail(&provider_error("opencode")(error), None),
-                    }
-                }
-                Err(error) => ProviderDeliveryOutcome::Ambiguous {
-                    detail: delivery_detail(&provider_error("opencode")(error), None),
-                },
-            }
+            opencode_delivery_outcome(result)
         })
     }
     fn reconcile(
