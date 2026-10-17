@@ -1753,52 +1753,76 @@ async fn a_retried_rewind_after_a_restart_is_applied_once() {
     runtime.stop().await.expect("stop");
 }
 
-/// Marking the rewind finished may fail, applied or not. The rewind then fails, and its retry with
-/// the same key after a restart drops nothing more; once it succeeds, no later runtime holds
-/// prompts for it.
+/// Marking the rewind finished may lose its answer, whether or not OpenCode applied the write.
+/// A mark that landed is read back and the rewind succeeds, so the checkpoint revert is recorded
+/// and prompts are not held. A mark that did not land fails the rewind; prompts wait, and a retry
+/// after a restart drops nothing more.
 #[tokio::test]
 async fn a_lost_finished_mark_still_applies_the_rewind_once() {
-    for applied in [true, false] {
-        let (endpoint, replay) = serve("background").await;
-        let runtime = v2_runtime(&endpoint);
-        runtime.resume(&replay.root).await.expect("resumes");
-        replay
-            .fail_next_finished_record
-            .store(true, Ordering::SeqCst);
-        replay
-            .apply_lost_finished_record
-            .store(applied, Ordering::SeqCst);
+    let (endpoint, replay) = serve("background").await;
+    let runtime = v2_runtime(&endpoint);
+    runtime.resume(&replay.root).await.expect("resumes");
+    replay
+        .fail_next_finished_record
+        .store(true, Ordering::SeqCst);
+    replay
+        .apply_lost_finished_record
+        .store(true, Ordering::SeqCst);
 
-        runtime
-            .rollback_thread(1, "transcript-a")
-            .await
-            .expect_err("success is not recorded with the session");
-        assert!(
-            runtime.has_unfinished_rewind().await,
-            "prompts wait for the retry"
-        );
-        runtime.stop().await.expect("stop");
+    runtime
+        .rollback_thread(1, "transcript-a")
+        .await
+        .expect("the finished mark landed, so the rewind succeeded");
+    assert!(
+        !runtime.has_unfinished_rewind().await,
+        "prompts are not held once the mark is known to have landed"
+    );
+    runtime
+        .rollback_thread(1, "transcript-a")
+        .await
+        .expect("a same-key retry drops nothing");
+    assert_eq!(replay.requests_to("/revert/stage").len(), 1);
+    runtime.stop().await.expect("stop");
 
-        let runtime = v2_runtime(&endpoint);
-        runtime.resume(&replay.root).await.expect("resumes");
-        runtime
-            .rollback_thread(1, "transcript-a")
-            .await
-            .expect("the rewind already happened");
-        assert_eq!(
-            replay.requests_to("/revert/stage").len(),
-            1,
-            "applied: {applied}"
-        );
-        assert!(!runtime.has_unfinished_rewind().await);
-        runtime.stop().await.expect("stop");
+    let runtime = v2_runtime(&endpoint);
+    runtime.resume(&replay.root).await.expect("resumes");
+    assert!(!runtime.has_unfinished_rewind().await);
+    runtime
+        .rollback_thread(1, "transcript-a")
+        .await
+        .expect("a restart retry drops nothing");
+    assert_eq!(replay.requests_to("/revert/stage").len(), 1);
+    runtime.stop().await.expect("stop");
 
-        // A later runtime, as after an idle suspension, does not hold prompts.
-        let runtime = v2_runtime(&endpoint);
-        runtime.resume(&replay.root).await.expect("resumes");
-        assert!(!runtime.has_unfinished_rewind().await, "applied: {applied}");
-        runtime.stop().await.expect("stop");
-    }
+    let (endpoint, replay) = serve("background").await;
+    let runtime = v2_runtime(&endpoint);
+    runtime.resume(&replay.root).await.expect("resumes");
+    replay
+        .fail_next_finished_record
+        .store(true, Ordering::SeqCst);
+    replay
+        .apply_lost_finished_record
+        .store(false, Ordering::SeqCst);
+
+    runtime
+        .rollback_thread(1, "transcript-a")
+        .await
+        .expect_err("the finished mark did not land");
+    assert!(
+        runtime.has_unfinished_rewind().await,
+        "prompts wait for the retry"
+    );
+    runtime.stop().await.expect("stop");
+
+    let runtime = v2_runtime(&endpoint);
+    runtime.resume(&replay.root).await.expect("resumes");
+    runtime
+        .rollback_thread(1, "transcript-a")
+        .await
+        .expect("the rewind already happened");
+    assert_eq!(replay.requests_to("/revert/stage").len(), 1);
+    assert!(!runtime.has_unfinished_rewind().await);
+    runtime.stop().await.expect("stop");
 }
 
 /// A record saved before rewinds were keyed belongs to the rewind retried after the restart.

@@ -7,6 +7,7 @@
 - OpenCode 2 works as a provider: chats (messages, slash commands, permissions, questions and **Stop**), streamed replies, and the follow-up turns OpenCode starts itself to deliver a background subagent's result, which now show as running.
 - Subagent activity is tracked for OpenCode 2, and the provider row lists its models (with variants), agents, commands and skills. A slash skill attaches the skill, and a command wins over a skill of the same name.
 - **Revert to this message** rewinds OpenCode 2 conversations turn by turn, then restores the files. An interrupted rewind is finished by reverting again, and the session stays open until it is.
+- Fixed: a checkpoint revert whose OpenCode 2 rewind had already landed no longer reports failure when only the confirmation was lost. The conversation, files and transcript stay together, including after BiBCode restarts.
 - OpenCode 2 terminals open with arguments it accepts (it has no `--model`): observed through `--server`/`--session`, or, when they cannot be observed, as `--standalone` with the selected model.
 - OpenCode 2 update notices and update actions use `@opencode/cli`, Windows npm installs of OpenCode 2 are recognized, and an OpenCode version BiBCode cannot drive (3.x or later) shows an actionable error instead of reading Ready.
 - Fixed: OpenCode 1.18.32 and 1.19 rejected every message BiBCode sent, because its delivery id was not a `msg_` id. Deliveries now use an id OpenCode accepts.
