@@ -2964,13 +2964,39 @@ impl OpenCodeSessionRuntime {
             finished: false,
         };
         // Success needs the record marked finished, or a later runtime would restore the progress
-        // and hold prompts for a retry that never comes. A failed write fails the rewind, and its
-        // retry (same key) marks it finished, applied or not, without dropping more.
+        // and hold prompts for a retry that never comes. The mark's answer can be lost after
+        // OpenCode applied it: reading the session back tells those apart. A finished record
+        // means the rewind succeeded, so the caller records the checkpoint revert. Anything else
+        // fails the rewind and prompts wait; the retry (same key) marks it finished without
+        // dropping more.
         let finished = V2RewindProgress {
             finished: true,
             ..self.inner.v2.lock().await.rewind.clone()
         };
-        self.v2_store_rewind(&session_id, &finished).await?;
+        if let Err(error) = self.v2_store_rewind(&session_id, &finished).await {
+            let recorded = within_rewind_deadline(async {
+                self.v2_get_json(self.v2_url(&["session", &session_id], false)?)
+                    .await
+                    .ok_or_else(|| {
+                        OpenCodeRuntimeError::Http("the session could not be read".to_owned())
+                    })
+            })
+            .await
+            .ok()
+            .and_then(|session| {
+                session
+                    .pointer("/data/metadata/bibcode/rewind")
+                    .and_then(V2RewindProgress::from_json)
+            });
+            let landed = recorded.is_some_and(|progress| {
+                progress.finished
+                    && progress.key.as_deref() == Some(rewind_key)
+                    && progress.dropped >= num_turns
+            });
+            if !landed {
+                return Err(error);
+            }
+        }
         {
             let mut v2 = self.inner.v2.lock().await;
             v2.rewind = V2RewindProgress::default();

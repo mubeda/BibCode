@@ -222,9 +222,11 @@ drops only the turns still missing and prompts wait; a different key starts
 afresh. The idle deadline keeps the session up until the rewind settles (see
 Unsettled driver state below), and the progress is also kept with the OpenCode
 session itself, in its metadata under `bibcode.rewind` (no BiBCode schema): it
-is written before each stage, marked finished before the rewind reports success
-(a failed mark fails the rewind, and its retry drops nothing more), and restored when a session is resumed after a restart, which also
-clears a leftover stage. A same-key retry after a finished rewind drops
+is written before each stage and marked finished before the rewind reports success.
+A mark whose answer is lost is read back: when the finished record landed, the rewind
+succeeds so the checkpoint revert is recorded; when it did not, the rewind fails and
+its retry drops nothing more. The record is restored when a session is resumed after
+a restart, which also clears a leftover stage. A same-key retry after a finished rewind drops
 nothing, so a rewind that succeeded but whose completion BiBCode never recorded
 is applied once. Other providers ignore the key: Codex `thread/revert` takes no
 idempotency field. A revert still staged on the session
