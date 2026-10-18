@@ -308,9 +308,11 @@ pub(super) async fn send_batch(
 /// than `to`. The sensor then goes back to the vector it held before the press, so it
 /// matches the screen and a later app does not turn unexpectedly. A failed read is no such
 /// evidence: the poll falls back to the tracker's orientation, which follows the scrcpy
-/// display. With no evidence at all the turn is taken as asked: the sensor stays where it
-/// was sent, the tracker records the skin at `to`, and `to` is returned. A guest slower
-/// than the window has its turn undone, and the user presses again.
+/// display. The skin is recorded at `to` when the sensor is sent, unless the display is
+/// already in that class, so a display that changes class during the window derives `to`
+/// instead of the shape fallback. With no evidence at all the turn is taken as asked: the
+/// sensor stays where it was sent and `to` is returned. A guest slower than the window has
+/// its turn undone, and the user presses again.
 pub(super) async fn rotate(
     client: &EmulatorClient,
     tracker: &OrientationTracker,
@@ -325,6 +327,19 @@ pub(super) async fn rotate(
         .await
         .map_err(|error| emulator_failure("rotate", &error))?;
     *sensor = to;
+    // The skin follows the sensor as soon as the vector is sent. Record it now unless the
+    // scrcpy display is already in `to`'s class: a session packet that arrives while every
+    // read fails then derives `to` instead of the shape fallback, which is always
+    // `Landscape` or `Portrait`. Without this, Rotate right (portrait to reverse landscape,
+    // or landscape to reverse portrait) publishes the other member of the class for the
+    // rest of the window and every tap is mirrored. A display already in the class is left
+    // alone, so a 180° request does not claim the turn before the guest takes it.
+    let display_in_class = tracker
+        .display_turned()
+        .is_some_and(|turned| turned == is_landscape(to));
+    if !display_in_class {
+        tracker.report_skin(to);
+    }
     let deadline = tokio::time::Instant::now() + timing.window;
     let mut read = false;
     loop {
@@ -676,6 +691,35 @@ mod tests {
         assert_eq!(tracker.current(), Orientation::ReverseLandscape);
         assert_eq!(*fake.rotations.lock().unwrap(), [[0.0, 0.0, -90.0]]);
         assert_eq!(*sensor.lock().await, Orientation::ReverseLandscape);
+    }
+
+    /// Rotate right while every read fails: the guest turns wide before the window ends.
+    /// The shape fallback would publish `Landscape` for the rest of the window and mirror
+    /// taps. The skin was recorded when the sensor was sent, so the wide display is
+    /// `ReverseLandscape` immediately.
+    #[tokio::test]
+    async fn a_wide_display_while_reads_fail_is_the_orientation_asked_for() {
+        let (fake, client, tracker, sensor) = emulator().await;
+        fake.fail_screenshots();
+        let release = fake.hold_next_screenshot();
+        let display = display(&tracker, 576, 1280);
+        let tracked = Arc::clone(&tracker);
+        let ended = tokio::spawn(async move {
+            rotate(
+                &client,
+                &tracker,
+                &sensor,
+                FAST_ROTATION,
+                Orientation::ReverseLandscape,
+            )
+            .await
+        });
+        wait_until(|| fake.screenshots_entered() >= 1).await;
+        display.set(1280, 576);
+        assert_eq!(tracked.current(), Orientation::ReverseLandscape);
+        drop(release);
+        assert_eq!(ended.await.unwrap().unwrap(), Orientation::ReverseLandscape);
+        assert_eq!(tracked.current(), Orientation::ReverseLandscape);
     }
 
     /// With every read failing, a video display that stays tall is the evidence of refusal.

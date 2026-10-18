@@ -2032,12 +2032,14 @@ later. A turn no read has shown by then counts as refused only on positive
 evidence, a read that succeeded or a scrcpy display still in the other class,
 and the sensor is put back to the vector it held before the press, so it
 matches the screen. A failed read is no such evidence: it falls back to the
-derived orientation (which follows the scrcpy display). With no evidence at all
-the turn is taken as asked: the sensor stays where it was sent, the skin is
-recorded at the requested orientation (it follows the sensor), and
-`device.rotate` returns the request, so its result, the catalog, and the touch
-mapping agree. One device's rotates run one at a time, so an older one never
-undoes a newer one. `device.rotate` returns `{ orientation }`, the orientation
+derived orientation (which follows the scrcpy display). The skin is recorded at
+the requested orientation when the sensor is sent, unless the scrcpy display is
+already in that class, so a display that changes class while the reads fail
+derives the request instead of the shape fallback (`landscape` or `portrait`).
+With no evidence at all the turn is taken as asked: the sensor stays where it
+was sent, and `device.rotate` returns the request, so its result, the catalog,
+and the touch mapping agree. One device's rotates run one at a time, so an
+older one never undoes a newer one. `device.rotate` returns `{ orientation }`, the orientation
 the device ended in, and the client says when it differs from the request
 ("Pixel 8 didn't rotate. The app on screen may lock its orientation, or
 auto-rotate may be off on the device."). The catalog, touch mapping, JPEG

@@ -10,7 +10,10 @@ use std::{
     },
 };
 
-use tokio::{net::TcpListener, sync::watch};
+use tokio::{
+    net::TcpListener,
+    sync::{oneshot, watch},
+};
 use tokio_stream::{
     Stream, StreamExt,
     wrappers::{TcpListenerStream, WatchStream},
@@ -62,6 +65,10 @@ pub(crate) struct FakeHandle {
     fail_rotation: Arc<AtomicBool>,
     fail_screenshots: Arc<AtomicBool>,
     skin_follows_sensor: Arc<AtomicBool>,
+    /// Set by `hold_next_screenshot`; the next `getScreenshot` waits on it.
+    screenshot_hold: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
+    /// `getScreenshot` calls that have started, including one still waiting on the hold.
+    screenshot_entered: Arc<AtomicUsize>,
 }
 
 impl FakeHandle {
@@ -74,6 +81,20 @@ impl FakeHandle {
     /// `streamScreenshot` keeps working.
     pub(crate) fn fail_screenshots(&self) {
         self.fail_screenshots.store(true, Ordering::SeqCst);
+    }
+
+    /// Holds the next `getScreenshot` until the sender is dropped or it sends. The call
+    /// counts in [`screenshots_entered`](Self::screenshots_entered) before it waits, so a
+    /// test can act once `rotate` is blocked in its first read, after it recorded the skin.
+    pub(crate) fn hold_next_screenshot(&self) -> oneshot::Sender<()> {
+        let (sender, receiver) = oneshot::channel();
+        *self.screenshot_hold.lock().expect("screenshot hold") = Some(receiver);
+        sender
+    }
+
+    /// How many `getScreenshot` calls have started.
+    pub(crate) fn screenshots_entered(&self) -> usize {
+        self.screenshot_entered.load(Ordering::SeqCst)
     }
 
     /// Makes each `setPhysicalModel` rotation set the reported rotation, as a real
@@ -148,6 +169,8 @@ pub(crate) struct FakeController {
     fail_rotation: Arc<AtomicBool>,
     fail_screenshots: Arc<AtomicBool>,
     skin_follows_sensor: Arc<AtomicBool>,
+    screenshot_hold: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
+    screenshot_entered: Arc<AtomicUsize>,
 }
 
 /// Counts one open stream until dropped.
@@ -187,6 +210,8 @@ impl FakeController {
             fail_rotation: Arc::default(),
             fail_screenshots: Arc::default(),
             skin_follows_sensor: Arc::default(),
+            screenshot_hold: Arc::default(),
+            screenshot_entered: Arc::default(),
         };
         let service = EmulatorControllerServer::with_interceptor(
             Self {
@@ -202,6 +227,8 @@ impl FakeController {
                 fail_rotation: handle.fail_rotation.clone(),
                 fail_screenshots: handle.fail_screenshots.clone(),
                 skin_follows_sensor: handle.skin_follows_sensor.clone(),
+                screenshot_hold: handle.screenshot_hold.clone(),
+                screenshot_entered: handle.screenshot_entered.clone(),
             },
             require_token,
         );
@@ -315,6 +342,11 @@ impl EmulatorController for FakeController {
         &self,
         request: Request<proto::ImageFormat>,
     ) -> Result<Response<proto::Image>, Status> {
+        self.screenshot_entered.fetch_add(1, Ordering::SeqCst);
+        let hold = self.screenshot_hold.lock().expect("screenshot hold").take();
+        if let Some(hold) = hold {
+            let _ = hold.await;
+        }
         if self.fail_screenshots.load(Ordering::SeqCst) {
             return Err(Status::unavailable("fake screenshot failure"));
         }
