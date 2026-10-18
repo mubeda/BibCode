@@ -2104,8 +2104,11 @@ because a still screen encodes nothing unasked. Only a socket that newly falls
 behind asks at overflow. One already waiting that also loses the config or key
 unit (often the answer to its own reset, arriving while its queue is still
 full) asks once more when its reader drains the queue, under the same limit,
-unless a key unit has reached it since; a socket that never drains asks
-nothing more. A socket that accepts no frame for 10 s closes as `slow`.
+unless a key unit has reached it since. That key is queued only after the
+latest config: a dropped one (a rotation's new parameter set) is copied from
+the hub's cache ahead of the key, and when the copy does not fit the key is
+not accepted. A socket that never drains asks nothing more. A socket that
+accepts no frame for 10 s closes as `slow`.
 Rejections close with code 4400 and one of `expired`, `reused`, `wrongChannel`,
 `wrongDevice`, `limit`, `disabled`, `stopped`, `failed`, `unauthorized`, or
 `slow`; a wrong pinned key or prologue closes with 4403 `host-identity`.

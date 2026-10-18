@@ -249,6 +249,11 @@ struct SubscriberSlot {
     /// Bumped when a unit is dropped: deltas queued before it are discarded unsent.
     generation: Arc<AtomicU64>,
     waiting_for_key: bool,
+    /// The latest config was dropped, so a following key unit must not be accepted until
+    /// [`HubState::cached_config`] is queued ahead of it. The client prepends its last config
+    /// to every key frame; a key without the config that belongs to it (a rotation's new
+    /// parameter set) is decoded with the previous one and the picture freezes.
+    needs_config: bool,
     /// Set when the socket, already waiting for a key unit, overflows on that key unit or the
     /// config before it, and cleared when a key unit reaches it. Its reader asks for a key
     /// unit once when it drains the queue, since a still screen sends no other.
@@ -417,6 +422,7 @@ impl MediaHub {
                 queued_bytes: queued_bytes.clone(),
                 generation: generation.clone(),
                 waiting_for_key: true,
+                needs_config: false,
                 missed_key: missed_key.clone(),
                 closed: closed.clone(),
             };
@@ -556,6 +562,11 @@ impl MediaHub {
     /// never asks here. When that one drops a key unit or the config before it, its reader
     /// asks once on draining the queue (see [`MediaSubscriber::next_frame`]), so a socket
     /// that stays blocked never asks again.
+    ///
+    /// A key unit is queued only after the latest config. If that config was dropped, the
+    /// hub queues its cached copy first; when the copy does not fit, the key is not
+    /// accepted and the socket keeps waiting. Accepting the key alone would leave the
+    /// client to prepend the previous parameter set.
     fn dispatch(&self, unit: &VideoUnit) {
         let frame = Bytes::from(encode_frame(unit));
         let delta = unit.kind == UnitKind::Delta;
@@ -564,13 +575,33 @@ impl MediaHub {
         if unit.kind == UnitKind::Config {
             state.cached_config = Some(frame.clone());
         }
+        let cached_config = state.cached_config.clone();
         let mut overflowed = false;
         state.subscribers.retain_mut(|slot| {
             if delta && slot.waiting_for_key {
                 return true;
             }
+            // The client prepends whatever config it has to this key. A rotation's new
+            // parameter set must be ahead of the key in the queue, or the picture freezes.
+            if unit.kind == UnitKind::Key
+                && slot.needs_config
+                && let Some(config) = &cached_config
+            {
+                match slot.offer(config, false) {
+                    Offer::Sent => slot.needs_config = false,
+                    Offer::Overflow => {
+                        slot.missed_key.store(true, Ordering::Release);
+                        slot.skip_to_key();
+                        return true;
+                    }
+                    Offer::Closed => return false,
+                }
+            }
             match slot.offer(&frame, delta) {
                 Offer::Sent => {
+                    if unit.kind == UnitKind::Config {
+                        slot.needs_config = false;
+                    }
                     if unit.kind == UnitKind::Key {
                         slot.waiting_for_key = false;
                         // A key unit makes good any it missed, so a drain asks for none.
@@ -583,7 +614,11 @@ impl MediaHub {
                     // stays stalled must not make the encoder restart every second for
                     // everyone else. One already waiting drops only a config or a key unit
                     // here (deltas skip it), and may have dropped the answer to its own
-                    // reset, so its reader asks again once it drains.
+                    // reset, so its reader asks again once it drains. A dropped config
+                    // stays owed: the next key unit queues the cache ahead of itself.
+                    if unit.kind == UnitKind::Config {
+                        slot.needs_config = true;
+                    }
                     if slot.waiting_for_key {
                         slot.missed_key.store(true, Ordering::Release);
                     } else {
@@ -978,6 +1013,29 @@ mod tests {
 
     fn config() -> VideoUnit {
         unit(UnitKind::Config, 0)
+    }
+
+    fn config_with(data: &'static [u8]) -> VideoUnit {
+        VideoUnit {
+            kind: UnitKind::Config,
+            pts_us: 0,
+            data: Bytes::from_static(data),
+        }
+    }
+
+    fn frame_pts(frame: &[u8]) -> u64 {
+        u64::from_be_bytes(frame[1..9].try_into().expect("pts"))
+    }
+
+    /// The next frame that is not a keepalive. A paused-time advance can queue one while
+    /// the socket's queue is empty.
+    async fn next_media(watcher: &mut Watcher) -> Bytes {
+        loop {
+            let frame = watcher.subscriber.next_frame().await.expect("a frame");
+            if frame[0] != 3 {
+                return frame;
+            }
+        }
     }
 
     fn key(pts_us: u64) -> VideoUnit {
@@ -1480,29 +1538,43 @@ mod tests {
         );
     }
 
-    /// A dropped config is made good by the key unit that follows it, so draining after
-    /// that asks for nothing and the socket keeps its deltas.
+    /// A rotation's config is dropped while the queue is full. One freed slot would fit
+    /// the key unit that follows and used to be accepted alone; the client would prepend
+    /// its previous parameter set and the rotated picture would freeze. The slot takes
+    /// the cached config instead, and the key waits until a later one can follow it.
     #[tokio::test(start_paused = true)]
-    async fn a_key_that_lands_after_a_dropped_config_ends_the_miss() {
+    async fn a_key_that_fits_after_a_dropped_config_waits_for_that_config() {
+        const OLD: &[u8] = b"old-sps";
+        const NEW: &[u8] = b"new-sps";
         let hub = HubFixture::new();
         let mut slow = hub.subscribe_with_capacity(2);
         hub.wait_written(1).await;
-        hub.feed([config(), key(1)]).await;
+        hub.feed([config_with(OLD), key(1)]).await;
         tokio::time::advance(RESET_MIN_INTERVAL).await;
-        hub.feed([delta(2)]).await;
+        // The new parameter set does not fit. This socket was keeping up, so the drop
+        // starts a wait and the config stays owed.
+        hub.feed([config_with(NEW)]).await;
         hub.wait_written(2).await;
-        // The answer's config is dropped; the reader then takes one frame, so its key fits.
-        hub.feed([config()]).await;
-        assert_eq!(
-            slow.subscriber.next_frame().await.map(|frame| frame[0]),
-            Some(0)
-        );
-        hub.feed([key(3)]).await;
+        assert_eq!(hub.resets(), 2);
+        let first = next_media(&mut slow).await;
+        assert_eq!(&first[FRAME_HEADER_BYTES..], OLD);
+        // One slot is free: enough for the key unit, not for the config and the key.
+        hub.feed([key(2)]).await;
+        let old_key = next_media(&mut slow).await;
+        assert_eq!((old_key[0], frame_pts(&old_key)), (1, 1));
+        let rotated = next_media(&mut slow).await;
+        assert_eq!(&rotated[FRAME_HEADER_BYTES..], NEW);
+        // The key unit did not land. Draining asks for one, once the reset window allows.
+        assert_eq!(hub.resets(), 2, "the refused key asked for nothing yet");
         tokio::time::advance(RESET_MIN_INTERVAL).await;
-        assert_eq!(received_media(&mut slow).await, [("key", 1), ("key", 3)]);
+        assert_eq!(hub.resets(), 3);
+        hub.wait_written(3).await;
+        hub.feed([key(3)]).await;
+        let recovery = next_media(&mut slow).await;
+        assert_eq!((recovery[0], frame_pts(&recovery)), (1, 3));
         hub.feed([delta(4)]).await;
-        assert_eq!(received_media(&mut slow).await, [("delta", 4)]);
-        assert_eq!(hub.resets(), 2, "the drain asked for nothing");
+        let delta = next_media(&mut slow).await;
+        assert_eq!((delta[0], frame_pts(&delta)), (2, 4));
     }
 
     /// A key unit can reach the socket between its reader taking the last frame (which
