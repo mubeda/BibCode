@@ -2347,16 +2347,22 @@ to pending, where it waits the same way.
 The slow part of a revert does not hold the effects worker, which serves every
 thread. The worker parks the reverting thread, and a waiter does the
 preparation off the worker: it takes the reservation, which can wait for a
-delivery in flight, then runs step 1 and the busy check, which only read the
-checkout. If the provider can rewind, it then reopens a session that was
-suspended while idle, which can be a cold start. Meanwhile the thread's later
-effects, such as a turn baseline, queue behind the revert in event order, and
-other threads' checkpoint work goes on. Once the preparation is done, the
-worker runs the rewind and the restore, then the queued effects. Every effect
-that writes still runs on the worker one at a time, so checkpoint work on a
-checkout that sibling threads share never overlaps. A parked thread holds at
-most 64 events, and at most four threads are parked at once; past either bound
-the worker waits for the revert itself, as it did before parking.
+delivery in flight, then takes the checkout's revert gate and runs step 1 and
+the busy check. If the provider can rewind, it then reopens a session that was
+suspended while idle, which can be a cold start, still holding that gate. The
+thread's later effects, such as a turn baseline, queue behind the revert in
+event order. Other threads' checkpoint work goes on, except a revert of the
+same checkout: it waits off the worker until this one has rewound and restored.
+A cold reopen therefore cannot restore after a sibling revert that was asked
+for later and finished sooner. Chats that share a project checkout (no
+worktree of their own) use that gate; distinct worktrees do not. Once the
+preparation is done, the worker runs the rewind and the restore, then the
+queued effects, and drops the gate. Every effect that writes still runs on the
+worker one at a time. A parked thread holds at most 64 events, and at most
+four threads are prepared at once. Past the event bound the worker waits for
+that thread's revert. Past the preparation bound it waits until one parked
+revert finishes, then prepares the next off the worker, so the worker never
+blocks on a checkout gate another preparation holds.
 The reservation is in memory only. That is enough because a revert never
 outlives its process: the effects worker does not replay a revert requested
 before a restart.

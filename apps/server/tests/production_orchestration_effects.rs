@@ -19,7 +19,7 @@ use orchestration_effects::{
 };
 use serde_json::json;
 use tempfile::TempDir;
-use tokio::sync::broadcast;
+use tokio::sync::{Notify, broadcast, oneshot};
 
 const NOW: &str = "2026-07-10T10:00:00.000Z";
 const ORCHESTRATION_EFFECTS_INTEGRATION_DEADLINE: Duration = Duration::from_secs(30);
@@ -45,6 +45,14 @@ struct CallbackState {
     refresh_error: Mutex<Option<String>>,
     setup_scripts: Mutex<Vec<SetupScriptLaunch>>,
     setup_error: Mutex<Option<String>>,
+    /// When set, that thread's provider reopen waits until `release` is notified.
+    slow_prepare: Mutex<Option<SlowPrepare>>,
+}
+
+struct SlowPrepare {
+    thread_id: String,
+    started: Mutex<Option<oneshot::Sender<()>>>,
+    release: Arc<Notify>,
 }
 
 impl OrchestrationEffectCallbacks for CallbackState {
@@ -53,6 +61,30 @@ impl OrchestrationEffectCallbacks for CallbackState {
         _thread_id: &'a str,
     ) -> BoxEffectFuture<'a, Option<PathBuf>> {
         Box::pin(async move { Ok(self.cwd.lock().unwrap().clone()) })
+    }
+
+    fn prepare_provider_rewind<'a>(&'a self, thread_id: &'a str) -> BoxEffectFuture<'a, ()> {
+        let slow = self
+            .slow_prepare
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|prepare| prepare.thread_id == thread_id)
+            .map(|prepare| {
+                (
+                    prepare.started.lock().unwrap().take(),
+                    Arc::clone(&prepare.release),
+                )
+            });
+        Box::pin(async move {
+            if let Some((started, release)) = slow {
+                if let Some(started) = started {
+                    let _ = started.send(());
+                }
+                release.notified().await;
+            }
+            Ok(())
+        })
     }
 
     fn rollback_provider<'a>(
@@ -790,6 +822,147 @@ async fn reverts_workspace_provider_history_and_stale_checkpoint_refs() {
             &orchestration_effects::checkpoint_ref("t1", 2)
         ],
     ));
+
+    effects.shutdown().await;
+    engine.shutdown().await;
+}
+
+/// Two chats that share a checkout must restore in the order they were asked. A revert whose
+/// provider is still reopening holds that checkout, so a faster sibling cannot restore and then
+/// be wiped by the earlier `git restore` / `git clean`.
+#[tokio::test]
+async fn earlier_revert_of_a_shared_checkout_restores_before_a_later_one() {
+    let repository = initialize_repository().await;
+    let engine = engine(repository.path()).await;
+    dispatch(
+        &engine,
+        json!({
+            "type":"thread.create", "commandId":"thread-2", "threadId":"t2", "projectId":"p1",
+            "title":"Sibling", "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+            "runtimeMode":"full-access", "branch":null, "worktreePath":null, "createdAt":NOW
+        }),
+    )
+    .await;
+    let (started_tx, started_rx) = oneshot::channel();
+    let release = Arc::new(Notify::new());
+    let callbacks = Arc::new(CallbackState::default());
+    *callbacks.cwd.lock().unwrap() = Some(repository.path().to_path_buf());
+    *callbacks.slow_prepare.lock().unwrap() = Some(SlowPrepare {
+        thread_id: "t1".to_owned(),
+        started: Mutex::new(Some(started_tx)),
+        release: Arc::clone(&release),
+    });
+    let effects = OrchestrationEffects::start(
+        engine.clone(),
+        Arc::new(GitRepository::default()),
+        callbacks.clone(),
+        EffectsOptions::default(),
+    )
+    .await
+    .unwrap();
+
+    orchestration_effects::capture_checkpoint(repository.path(), "t1", 0)
+        .await
+        .unwrap();
+    orchestration_effects::capture_checkpoint(repository.path(), "t2", 0)
+        .await
+        .unwrap();
+    std::fs::write(repository.path().join("tracked.txt"), "alpha\n").unwrap();
+    orchestration_effects::capture_checkpoint(repository.path(), "t1", 1)
+        .await
+        .unwrap();
+    std::fs::write(repository.path().join("tracked.txt"), "alpha-2\n").unwrap();
+    orchestration_effects::capture_checkpoint(repository.path(), "t1", 2)
+        .await
+        .unwrap();
+    std::fs::write(repository.path().join("tracked.txt"), "beta\n").unwrap();
+    orchestration_effects::capture_checkpoint(repository.path(), "t2", 1)
+        .await
+        .unwrap();
+    for (thread_id, turn_count) in [("t1", 1), ("t1", 2), ("t2", 1)] {
+        dispatch(
+            &engine,
+            json!({
+                "type":"thread.turn.diff.complete",
+                "commandId":format!("diff-{thread_id}-{turn_count}"),
+                "threadId":thread_id, "turnId":format!("{thread_id}-turn-{turn_count}"),
+                "checkpointTurnCount":turn_count,
+                "checkpointRef":orchestration_effects::checkpoint_ref(thread_id, turn_count),
+                "status":"ready", "files":[], "assistantMessageId":format!("a-{thread_id}-{turn_count}"),
+                "completedAt":NOW, "createdAt":NOW
+            }),
+        )
+        .await;
+    }
+
+    let mut events = engine.subscribe_events();
+    dispatch(
+        &engine,
+        json!({
+            "type":"thread.checkpoint.revert", "commandId":"revert-t1", "threadId":"t1",
+            "turnCount":1, "createdAt":NOW
+        }),
+    )
+    .await;
+    tokio::time::timeout(ORCHESTRATION_EFFECTS_INTEGRATION_DEADLINE, started_rx)
+        .await
+        .expect("t1 reaches its provider reopen")
+        .expect("reopen started");
+    dispatch(
+        &engine,
+        json!({
+            "type":"thread.checkpoint.revert", "commandId":"revert-t2", "threadId":"t2",
+            "turnCount":0, "createdAt":NOW
+        }),
+    )
+    .await;
+    // Long enough for an unblocked sibling to rewind and restore while t1 is still reopening.
+    let sibling_slipped_ahead = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if callbacks
+                .rollbacks
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(thread_id, _)| thread_id == "t2")
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .is_ok();
+    assert!(
+        !sibling_slipped_ahead,
+        "t2 restored while t1 was still reopening its provider"
+    );
+    release.notify_one();
+
+    wait_for_event(&mut events, "thread.reverted", |event| {
+        event.event.payload["threadId"] == "t1"
+    })
+    .await;
+    wait_for_event(&mut events, "thread.reverted", |event| {
+        event.event.payload["threadId"] == "t2"
+    })
+    .await;
+    assert_eq!(
+        callbacks
+            .rollbacks
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(thread_id, _)| thread_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["t1", "t2"]
+    );
+    assert_eq!(
+        std::fs::read_to_string(repository.path().join("tracked.txt"))
+            .unwrap()
+            .replace("\r\n", "\n"),
+        "baseline\n"
+    );
 
     effects.shutdown().await;
     engine.shutdown().await;
