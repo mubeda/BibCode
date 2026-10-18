@@ -169,6 +169,18 @@ pub enum OpenCodeRuntimeError {
 /// delivery, so it ends as not sent and the delivery is retried.
 const DELIVERY_LOOKUP_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// What a keyed lookup found, without sending anything.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum OpenCodeDeliveryLookup {
+    Absent,
+    /// This runtime still holds the turn, so the delivery stays that turn.
+    ActiveTurn(String),
+    /// OpenCode still reports the session working.
+    Busy,
+    /// The message is present and the session is idle.
+    Idle,
+}
+
 async fn within_rewind_deadline<T>(
     request: impl std::future::Future<Output = Result<T, OpenCodeRuntimeError>>,
 ) -> Result<T, OpenCodeRuntimeError> {
@@ -1178,19 +1190,35 @@ impl OpenCodeSessionRuntime {
         let Some(message_id) = message_id else {
             return Ok(None);
         };
+        match self.lookup_delivery(message_id).await.map_err(not_sent)? {
+            OpenCodeDeliveryLookup::Absent => Ok(None),
+            OpenCodeDeliveryLookup::ActiveTurn(turn_id) => Ok(Some(turn_id)),
+            OpenCodeDeliveryLookup::Busy => Err(OpenCodeRuntimeError::NotSent(
+                "OpenCode is still working on this message".to_owned(),
+            )),
+            OpenCodeDeliveryLookup::Idle => Err(OpenCodeRuntimeError::AlreadyDelivered),
+        }
+    }
+
+    /// Looks a delivery's message up and, when it is already there, whether its turn is still
+    /// running. A failed lookup is returned as-is so the caller can retry it. Restart recovery
+    /// and a resend share this so they agree on idle versus busy.
+    pub(crate) async fn lookup_delivery(
+        &self,
+        message_id: &str,
+    ) -> Result<OpenCodeDeliveryLookup, OpenCodeRuntimeError> {
         let exists = tokio::time::timeout(DELIVERY_LOOKUP_TIMEOUT, self.message_exists(message_id))
             .await
             .unwrap_or_else(|_| {
                 Err(OpenCodeRuntimeError::Http(
                     "the message lookup took too long".to_owned(),
                 ))
-            })
-            .map_err(not_sent)?;
+            })?;
         if !exists {
-            return Ok(None);
+            return Ok(OpenCodeDeliveryLookup::Absent);
         }
         if let Some(turn_id) = self.inner.active_turn_id.lock().await.clone() {
-            return Ok(Some(turn_id));
+            return Ok(OpenCodeDeliveryLookup::ActiveTurn(turn_id));
         }
         let session_id = self.session_id().await?;
         let working = tokio::time::timeout(
@@ -1200,11 +1228,9 @@ impl OpenCodeSessionRuntime {
         .await
         .unwrap_or(Err(()));
         match working {
-            Ok(false) => Err(OpenCodeRuntimeError::AlreadyDelivered),
-            Ok(true) => Err(OpenCodeRuntimeError::NotSent(
-                "OpenCode is still working on this message".to_owned(),
-            )),
-            Err(()) => Err(OpenCodeRuntimeError::NotSent(
+            Ok(false) => Ok(OpenCodeDeliveryLookup::Idle),
+            Ok(true) => Ok(OpenCodeDeliveryLookup::Busy),
+            Err(()) => Err(OpenCodeRuntimeError::Http(
                 "OpenCode's session status could not be read".to_owned(),
             )),
         }

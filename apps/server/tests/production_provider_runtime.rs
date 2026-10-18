@@ -3528,15 +3528,25 @@ async fn assert_opencode_restart_reconciliation(
             get(|| async { Json(json!({"data":[]})) }),
         )
         .route(
+            "/session/status",
+            get(move || async move {
+                if mode == "busy" {
+                    Json(json!({ "native-opencode-session": { "type": "busy" } }))
+                } else {
+                    Json(json!({}))
+                }
+            }),
+        )
+        .route(
             "/session/{session_id}/message/{message_id}",
             get(
                 move |AxumPath((session_id, message_id)): AxumPath<(String, String)>| async move {
                     match mode {
                         // Only the delivery key's `msg_` id reads back.
-                        "found" if !message_id.starts_with("msg_") => {
+                        "found" | "busy" if !message_id.starts_with("msg_") => {
                             StatusCode::NOT_FOUND.into_response()
                         }
-                        "found" => (
+                        "found" | "busy" => (
                             StatusCode::OK,
                             Json(json!({
                                 "info":{
@@ -3660,6 +3670,27 @@ async fn assert_opencode_restart_reconciliation(
             format!("msg_{}", row.delivery_key.replace('-', ""))
         );
     }
+    if mode == "found" || mode == "busy" {
+        let pending = engine
+            .repositories()
+            .list_turns_by_thread(row.thread_id.clone())
+            .await
+            .expect("turns")
+            .into_iter()
+            .filter(|turn| turn.turn_id.is_none() && turn.state == "running")
+            .count();
+        if mode == "found" {
+            assert_eq!(
+                pending, 0,
+                "an idle session releases the pending turn so later messages can send"
+            );
+        } else {
+            assert_eq!(
+                pending, 1,
+                "a busy session keeps the pending turn until OpenCode ends it"
+            );
+        }
+    }
 
     if let Some(delivery) = delivery {
         delivery.shutdown().await;
@@ -3676,6 +3707,8 @@ async fn assert_opencode_restart_reconciliation(
 #[tokio::test]
 async fn durable_opencode_restart_reconciliation_uses_real_adapter_and_exact_key() {
     assert_opencode_restart_reconciliation("found", ProviderReconciliationOutcome::Found, false)
+        .await;
+    assert_opencode_restart_reconciliation("busy", ProviderReconciliationOutcome::Found, false)
         .await;
     assert_opencode_restart_reconciliation("absent", ProviderReconciliationOutcome::Absent, true)
         .await;

@@ -424,9 +424,10 @@ Idle suspension must never stop work the provider still runs:
   it, and the session is not suspended meanwhile. A runtime that no longer
   holds it (after a restart) reads OpenCode's session status and leaves the
   delivery pending while the session is busy. That covers an explicit
-  retry of an uncertain delivery and a retry after a 408 or 429; restart
-  recovery reconciles the same way but keeps the marker, since it cannot tell
-  whether the turn still runs. A failed lookup sent nothing, so the
+  retry of an uncertain delivery and a retry after a 408 or 429. Restart
+  recovery reads the same status: an idle session records the delivery
+  delivered and clears the pending marker, and a busy session keeps the marker
+  until OpenCode ends the turn. A failed lookup sent nothing, so the
   delivery is retried. A request whose answer was lost, or a server or gateway
   error, keeps its turn for OpenCode's own events to end and leaves the delivery
   uncertain). A turn such a driver did not send, one the

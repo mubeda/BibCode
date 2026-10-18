@@ -316,6 +316,9 @@ pub(crate) const STEER_TARGET_GONE_DETAIL: &str =
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProviderReconciliationOutcome {
     Found,
+    /// The provider already has the message and is idle, so the delivery is finished and started
+    /// no turn here. Restart recovery clears the pending turn marker.
+    FoundWithoutTurn,
     Absent,
     Unavailable {
         detail: String,
@@ -11814,9 +11817,13 @@ impl ProviderDriver for OpenCodeDriver {
         delivery_key: String,
     ) -> BoxRuntimeFuture<'_, ProviderReconciliationOutcome> {
         Box::pin(async move {
-            match self.runtime.message_exists(&delivery_key).await {
-                Ok(true) => ProviderReconciliationOutcome::Found,
-                Ok(false) => ProviderReconciliationOutcome::Absent,
+            use crate::provider::opencode::runtime::OpenCodeDeliveryLookup;
+            match self.runtime.lookup_delivery(&delivery_key).await {
+                Ok(OpenCodeDeliveryLookup::Absent) => ProviderReconciliationOutcome::Absent,
+                Ok(OpenCodeDeliveryLookup::Idle) => ProviderReconciliationOutcome::FoundWithoutTurn,
+                Ok(OpenCodeDeliveryLookup::ActiveTurn(_) | OpenCodeDeliveryLookup::Busy) => {
+                    ProviderReconciliationOutcome::Found
+                }
                 Err(error) => ProviderReconciliationOutcome::Unavailable {
                     detail: error.to_string(),
                 },

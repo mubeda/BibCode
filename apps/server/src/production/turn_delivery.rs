@@ -758,11 +758,18 @@ async fn recover_sending(
                 }
             }
         };
-        let (next_state, detail) = match outcome {
-            ProviderReconciliationOutcome::Found => (TurnDeliveryState::Delivered, None),
-            ProviderReconciliationOutcome::Absent => (TurnDeliveryState::Pending, None),
+        let (next_state, detail, reason) = match outcome {
+            ProviderReconciliationOutcome::Found => (TurnDeliveryState::Delivered, None, None),
+            // The message is present and the session is idle, so no turn is still running. The
+            // pending marker would hold every later message.
+            ProviderReconciliationOutcome::FoundWithoutTurn => (
+                TurnDeliveryState::Delivered,
+                None,
+                Some(TurnDeliveryFailureReason::FoundWithoutTurn),
+            ),
+            ProviderReconciliationOutcome::Absent => (TurnDeliveryState::Pending, None, None),
             ProviderReconciliationOutcome::ConversationLost { detail } => {
-                (TurnDeliveryState::Uncertain, Some(detail))
+                (TurnDeliveryState::Uncertain, Some(detail), None)
             }
             ProviderReconciliationOutcome::Unavailable { detail }
                 if matches!(row.provider_kind.as_str(), "codex" | "opencode") =>
@@ -776,20 +783,23 @@ async fn recover_sending(
                 continue;
             }
             ProviderReconciliationOutcome::Unavailable { detail } => {
-                (TurnDeliveryState::Uncertain, Some(detail))
+                (TurnDeliveryState::Uncertain, Some(detail), None)
             }
         };
         let command_id = row.command_id.clone();
         let transitioned = engine
-            .transition_turn_delivery(TurnDeliveryTransition {
-                turn_id: None,
-                command_id: row.command_id,
-                expected_states: vec![TurnDeliveryState::Sending],
-                expected_attempt: row.attempts,
-                next_state,
-                detail,
-                updated_at: now(),
-            })
+            .transition_turn_delivery_with_reason(
+                TurnDeliveryTransition {
+                    turn_id: None,
+                    command_id: row.command_id,
+                    expected_states: vec![TurnDeliveryState::Sending],
+                    expected_attempt: row.attempts,
+                    next_state,
+                    detail,
+                    updated_at: now(),
+                },
+                reason,
+            )
             .await
             .map_err(|error| error.to_string())?;
         if transitioned {

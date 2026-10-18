@@ -6089,10 +6089,10 @@ fn apply_turns_projector_tx(
             transaction.execute("INSERT INTO projection_turns (thread_id, turn_id, pending_message_id, source_proposed_plan_thread_id, source_proposed_plan_id, assistant_message_id, state, requested_at, started_at, completed_at, checkpoint_turn_count, checkpoint_ref, checkpoint_status, checkpoint_files_json) VALUES (?, NULL, ?, ?, ?, NULL, 'running', ?, NULL, NULL, NULL, NULL, NULL, '[]')", params![thread_id, required_str(payload,"messageId")?, optional_string(payload.pointer("/sourceProposedPlan/threadId")), optional_string(payload.pointer("/sourceProposedPlan/planId")), required_str(payload,"createdAt")?])?;
         }
         // A delivery recorded delivered because the provider already had the message, with no
-        // turn of its runtime still running (an explicit retry found it), started no turn here.
-        // Its pending marker would stay running and hold queued follow-ups, so it goes. Only that
-        // explicit outcome clears it: an accepted turn keeps its marker until its session update,
-        // and restart recovery keeps it, since it cannot tell whether that turn still runs.
+        // turn still running (an explicit retry, or restart recovery that found the session
+        // idle), started no turn here. Its pending marker would stay running and hold queued
+        // follow-ups, so it goes. An accepted turn keeps its marker until its session update,
+        // and recovery of a session OpenCode still reports busy keeps it too.
         "thread.turn-delivery-updated"
             if event
                 .event
@@ -11378,10 +11378,11 @@ mod tests {
         assert_eq!(workspace_root, "/canonical/requested-workspace");
     }
 
-    /// A delivery recorded delivered because the provider already had the message (found by an
-    /// explicit retry) clears its own pending turn marker, which would
-    /// otherwise stay running and hold queued follow-ups. Another message's marker is kept, and so
-    /// is the marker of an ordinary delivered turn, which its own session update settles.
+    /// A delivery recorded delivered because the provider already had the message and no turn is
+    /// still running (an explicit retry, or restart recovery of an idle session) clears its own
+    /// pending turn marker, which would otherwise stay running and hold queued follow-ups. Another
+    /// message's marker is kept, and so is the marker of an ordinary delivered turn, which its own
+    /// session update settles.
     #[tokio::test]
     async fn a_delivery_delivered_without_a_turn_clears_its_pending_turn() {
         let database = Database::open_in_memory().await.expect("database");
