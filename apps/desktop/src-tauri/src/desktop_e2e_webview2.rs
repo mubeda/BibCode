@@ -167,8 +167,43 @@ fn probe_page(
         answered.store(true, Ordering::Relaxed);
         tracing::warn!(target: TARGET, "webview2_stall_page_state navigation={navigation} result={result}");
     })?;
-    call_devtools(core, "Debugger.enable", &serde_json::json!({}), |_| {})?;
-    call_devtools(core, "Debugger.pause", &serde_json::json!({}), |_| {})
+    // DevTools may handle calls out of order, so the pause waits for the debugger to be on.
+    let pausing = core.clone();
+    call_devtools(
+        core,
+        "Debugger.enable",
+        &serde_json::json!({}),
+        move |result| {
+            if let Some(error) = result.strip_prefix("error ") {
+                tracing::warn!(target: TARGET, "webview2_stall_debugger_unavailable navigation={navigation} {error}");
+                return;
+            }
+            let disabling = pausing.clone();
+            let paused = call_devtools(
+                &pausing,
+                "Debugger.pause",
+                &serde_json::json!({}),
+                move |result| {
+                    if let Some(error) = result.strip_prefix("error ") {
+                        tracing::warn!(target: TARGET, "webview2_stall_pause_failed navigation={navigation} {error}");
+                        disable_debugger(&disabling);
+                    }
+                },
+            );
+            if let Err(error) = paused {
+                tracing::warn!(target: TARGET, %error, "webview2_stall_pause_failed navigation={navigation}");
+                disable_debugger(&pausing);
+            }
+        },
+    )
+}
+
+/// Turns the debugger back off after a pause that did not happen; a pause that did happen is
+/// resumed and turned off by the `Debugger.paused` handler.
+fn disable_debugger(core: &ICoreWebView2) {
+    if let Err(error) = call_devtools(core, "Debugger.disable", &serde_json::json!({}), |_| {}) {
+        tracing::warn!(target: TARGET, %error, "webview2_stall_resume_failed method=Debugger.disable");
+    }
 }
 
 /// Calls a DevTools method and hands its JSON result, or its error, to `answered`.

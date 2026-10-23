@@ -376,7 +376,9 @@ fn desktop_e2e_reload_main_document(window: tauri::WebviewWindow<bridge::Desktop
 /// each document before its scripts so the web app can set its test plugin up to match.
 #[cfg(feature = "desktop-e2e")]
 fn desktop_e2e_reload_variant_script() -> String {
+    // Read as the harness reads it (`reload-variant.ts`), which rejects any other value.
     let variant = std::env::var("BIBCODE_E2E_RELOAD_VARIANT")
+        .map(|variant| variant.trim().to_ascii_uppercase())
         .ok()
         .filter(|variant| matches!(variant.as_str(), "A" | "B" | "C" | "D" | "E"))
         .unwrap_or_else(|| "A".to_owned());
