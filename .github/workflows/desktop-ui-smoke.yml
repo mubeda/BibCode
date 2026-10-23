@@ -2,6 +2,19 @@ name: Packaged Desktop UI Smoke
 
 on:
   workflow_dispatch:
+    inputs:
+      spec:
+        description: "One spec to run instead of the full sequence, e.g. ./specs/composer-message-queue.e2e.ts"
+        required: false
+        default: ""
+      reload_variants:
+        description: "Comma-separated reload experiments (A-E, see apps/desktop/e2e/support/reload-variant.ts); each runs against the same build"
+        required: false
+        default: ""
+      repeat:
+        description: "How many times each reload experiment runs"
+        required: false
+        default: "1"
   workflow_call:
 
 permissions:
@@ -178,12 +191,48 @@ jobs:
         shell: bash
         env:
           BIBCODE_E2E_ARTIFACT_DIR: ${{ runner.temp }}/bibcode-desktop-ui-artifacts
+          BIBCODE_E2E_SPEC: ${{ inputs.spec }}
+          RELOAD_VARIANTS: ${{ inputs.reload_variants }}
+          RELOAD_REPEAT: ${{ inputs.repeat }}
         run: |
-          if [[ "$BIBCODE_E2E_PLATFORM" == "linux" ]]; then
-            xvfb-run --auto-servernum vp run test:ui:desktop
-          else
-            vp run test:ui:desktop
+          run_smoke() {
+            if [[ "$BIBCODE_E2E_PLATFORM" == "linux" ]]; then
+              xvfb-run --auto-servernum vp run test:ui:desktop
+            else
+              vp run test:ui:desktop
+            fi
+          }
+          # A run that hung can leave the app alive, and the single-instance plugin would then
+          # hand the next launch to it.
+          stop_app() {
+            case "$BIBCODE_E2E_PLATFORM" in
+              win)
+                MSYS_NO_PATHCONV=1 taskkill /F /T /IM BiBCode.exe >/dev/null 2>&1 || true
+                MSYS_NO_PATHCONV=1 taskkill /F /T /IM bibcode-desktop.exe >/dev/null 2>&1 || true
+                ;;
+              *) pkill -f "$BIBCODE_E2E_APP_PATH" >/dev/null 2>&1 || true ;;
+            esac
+          }
+          if [[ -z "$RELOAD_VARIANTS" ]]; then
+            run_smoke
+            exit
           fi
+          # Each reload experiment gets its own app launch, state and evidence directory.
+          base="$BIBCODE_E2E_ARTIFACT_DIR"
+          mkdir -p "$base"
+          status=0
+          for variant in ${RELOAD_VARIANTS//,/ }; do
+            for attempt in $(seq 1 "${RELOAD_REPEAT:-1}"); do
+              export BIBCODE_E2E_RELOAD_VARIANT="$variant"
+              export BIBCODE_E2E_ARTIFACT_DIR="$base/$variant-$attempt"
+              mkdir -p "$BIBCODE_E2E_ARTIFACT_DIR"
+              if run_smoke; then result=pass; else result=fail; status=1; fi
+              stop_app
+              echo "reload variant $variant attempt $attempt: $result" | tee -a "$base/reload-variants.log"
+              echo "::notice title=Reload variant $variant attempt $attempt::$result"
+            done
+          done
+          exit "$status"
 
       - name: Collect macOS application crash summaries
         if: always() && matrix.platform == 'mac'
@@ -254,4 +303,6 @@ jobs:
           path: |
             ${{ runner.temp }}/bibcode-desktop-ui-artifacts/*.png
             ${{ runner.temp }}/bibcode-desktop-ui-artifacts/*.log
+            ${{ runner.temp }}/bibcode-desktop-ui-artifacts/*/*.png
+            ${{ runner.temp }}/bibcode-desktop-ui-artifacts/*/*.log
           if-no-files-found: warn

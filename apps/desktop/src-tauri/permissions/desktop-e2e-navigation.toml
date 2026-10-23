@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "allow-desktop-e2e-navigation"
+description = "Allows the packaged desktop E2E harness to reload the main document natively."
+commands.allow = ["desktop_e2e_reload_main_document"]

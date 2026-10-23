@@ -254,6 +254,8 @@ pub(crate) fn build_main_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result
     let window = builder.build()?;
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     watch_web_content_process(&window);
+    #[cfg(all(feature = "desktop-e2e", target_os = "windows"))]
+    crate::desktop_e2e_webview2::install(&window);
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     let _ = window;
     Ok(())

@@ -278,6 +278,8 @@ pub fn run() {
         preview::commands::desktop_preview_tunnel_close,
         #[cfg(feature = "desktop-e2e")]
         desktop_e2e_prepare_for_exit,
+        #[cfg(feature = "desktop-e2e")]
+        desktop_e2e_reload_main_document,
     ]);
     builder
         .build(desktop_context())
@@ -356,6 +358,31 @@ async fn desktop_e2e_prepare_for_exit(
     prepare_desktop_runtime_for_exit(&app_handle).await
 }
 
+/// Reloads the main document natively (WebView2 `Reload()`, WebKit `reload`), for the
+/// packaged UI harness's reload experiments. It answers first: the invoke's own request would
+/// otherwise still be open when its document goes away.
+#[cfg(all(feature = "desktop-e2e", not(test)))]
+#[tauri::command]
+fn desktop_e2e_reload_main_document(window: tauri::WebviewWindow<bridge::DesktopRuntime>) {
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if let Err(error) = window.reload() {
+            tracing::warn!(target: "bibcode::desktop_e2e", %error, "desktop_e2e_native_reload_failed");
+        }
+    });
+}
+
+/// The reload experiment the packaged UI harness runs (`BIBCODE_E2E_RELOAD_VARIANT`), handed to
+/// each document before its scripts so the web app can set its test plugin up to match.
+#[cfg(feature = "desktop-e2e")]
+fn desktop_e2e_reload_variant_script() -> String {
+    let variant = std::env::var("BIBCODE_E2E_RELOAD_VARIANT")
+        .ok()
+        .filter(|variant| matches!(variant.as_str(), "A" | "B" | "C" | "D" | "E"))
+        .unwrap_or_else(|| "A".to_owned());
+    format!("window.__BIBCODE_E2E_RELOAD_VARIANT__ = {variant:?};")
+}
+
 fn desktop_context<R: tauri::Runtime>() -> tauri::Context<R> {
     tauri::generate_context!()
 }
@@ -364,6 +391,7 @@ fn desktop_context<R: tauri::Runtime>() -> tauri::Context<R> {
 fn desktop_e2e_logging_plugin<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin<R> {
     let mut page_loads = desktop_e2e_page_load::PageLoadTracker::new();
     tauri::plugin::Builder::new("desktop-e2e-logging")
+        .js_init_script(desktop_e2e_reload_variant_script())
         .setup(|app, _api| {
             let server_log = config::state_dir(app)
                 .map_err(std::io::Error::other)?
@@ -388,6 +416,8 @@ mod crash_monitor;
 mod data_safety;
 #[cfg(any(feature = "desktop-e2e", test))]
 mod desktop_e2e_page_load;
+#[cfg(all(feature = "desktop-e2e", target_os = "windows"))]
+mod desktop_e2e_webview2;
 #[cfg(target_os = "linux")]
 mod display_loss;
 mod firewall;
@@ -487,7 +517,8 @@ mod tests {
                 "allow-desktop-bridge",
                 "core:default",
                 "wdio:default",
-                "allow-desktop-e2e-lifecycle"
+                "allow-desktop-e2e-lifecycle",
+                "allow-desktop-e2e-navigation"
             ]))
         );
     }

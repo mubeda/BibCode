@@ -8,6 +8,7 @@ import {
   waitForProviderInputLogEntry,
 } from "../support/provider-input-log.ts";
 import { queuedCardIdsInVisualOrder } from "../support/queued-card-order.ts";
+import { desktopUiReloadVariant } from "../support/reload-variant.ts";
 import { completeDesktopUiSlowTurn, desktopUiFixture } from "../support/test-project.ts";
 import {
   ensureMainSidebarOpen,
@@ -240,9 +241,10 @@ describe("packaged composer message queue", () => {
         { kind: "steer", prompt: "second" },
       ]);
 
-      // Uses browser.refresh() and waits for the native document lifecycle;
-      // reloadSession() would restart the provider instead of testing a reload.
-      await refreshDesktopUiDocument();
+      // Reloads (by WebDriver refresh unless BIBCODE_E2E_RELOAD_VARIANT picks another
+      // experiment) and waits for the native document lifecycle; reloadSession() would
+      // restart the provider instead of testing a reload.
+      await refreshDesktopUiDocument(undefined, desktopUiReloadVariant());
       await installDesktopUiMotionGuard();
       await waitForComposerDisplayed();
       expect(await assertQueuedCards(["fourth"])).toEqual(fourthIds);
