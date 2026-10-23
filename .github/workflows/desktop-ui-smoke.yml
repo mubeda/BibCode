@@ -16,9 +16,9 @@ on:
         required: false
         default: "1"
       trace_modes:
-        description: "Comma-separated Windows WebView2 trace modes (off, events, full); each runs every reload experiment"
+        description: "Comma-separated Windows WebView2 trace modes (off, events, full; empty is full); each runs every reload experiment"
         required: false
-        default: "full"
+        default: ""
   workflow_call:
 
 permissions:
@@ -218,17 +218,18 @@ jobs:
               *) pkill -f "$BIBCODE_E2E_APP_PATH" >/dev/null 2>&1 || true ;;
             esac
           }
-          if [[ -z "$RELOAD_VARIANTS" ]]; then
+          if [[ -z "$RELOAD_VARIANTS" && -z "$TRACE_MODES" ]]; then
             run_smoke
             exit
           fi
+          variants="${RELOAD_VARIANTS:-A}"
           # Each reload experiment gets its own app launch, state and evidence directory.
           base="$BIBCODE_E2E_ARTIFACT_DIR"
           mkdir -p "$base"
           status=0
           traces="${TRACE_MODES:-full}"
           for trace in ${traces//,/ }; do
-            for variant in ${RELOAD_VARIANTS//,/ }; do
+            for variant in ${variants//,/ }; do
               for attempt in $(seq 1 "${RELOAD_REPEAT:-1}"); do
                 export BIBCODE_E2E_WEBVIEW2_TRACE="$trace"
                 export BIBCODE_E2E_RELOAD_VARIANT="$variant"

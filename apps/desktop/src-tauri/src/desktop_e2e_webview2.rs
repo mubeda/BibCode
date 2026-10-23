@@ -110,17 +110,19 @@ pub(crate) fn install<R: Runtime>(window: &WebviewWindow<R>) {
     let window = window.clone();
     let watchdog = std::thread::Builder::new()
         .name("bibcode-e2e-webview2-trace".into())
-        .spawn(move || watch_for_stalls(&window, &trace));
+        .spawn(move || watch_for_stalls(&window, &trace, mode == TraceMode::Full));
     if let Err(error) = watchdog {
         tracing::warn!(target: TARGET, %error, "webview2_trace_watchdog_unavailable");
     }
 }
 
-fn watch_for_stalls<R: Runtime>(window: &WebviewWindow<R>, trace: &Shared) {
+/// `pause` is whether a stall may pause the page's JavaScript: only the full trace installs
+/// the `Debugger.paused` handler that resumes it.
+fn watch_for_stalls<R: Runtime>(window: &WebviewWindow<R>, trace: &Shared, pause: bool) {
     loop {
         std::thread::sleep(CHECK_EVERY);
         if let Some(navigation) = due_stall_report(trace) {
-            report_stall(window, trace, navigation);
+            report_stall(window, trace, navigation, pause);
         }
     }
 }
@@ -137,7 +139,12 @@ fn due_stall_report(trace: &Shared) -> Option<u64> {
     Some(navigation.id)
 }
 
-fn report_stall<R: Runtime>(window: &WebviewWindow<R>, trace: &Shared, navigation: u64) {
+fn report_stall<R: Runtime>(
+    window: &WebviewWindow<R>,
+    trace: &Shared,
+    navigation: u64,
+    pause: bool,
+) {
     {
         let trace = lock(trace);
         let elapsed = trace
@@ -165,7 +172,7 @@ fn report_stall<R: Runtime>(window: &WebviewWindow<R>, trace: &Shared, navigatio
         tracing::warn!(target: TARGET, "webview2_stall_ui_thread_answered navigation={navigation}");
         // SAFETY: Tauri runs this closure on the UI thread that owns the controller.
         let probe = unsafe { webview.controller().CoreWebView2() }
-            .and_then(|core| probe_page(&core, navigation, page_answered));
+            .and_then(|core| probe_page(&core, navigation, page_answered, pause));
         if let Err(error) = probe {
             tracing::warn!(target: TARGET, %error, "webview2_stall_probe_failed navigation={navigation}");
         }
@@ -184,12 +191,13 @@ fn report_stall<R: Runtime>(window: &WebviewWindow<R>, trace: &Shared, navigatio
     }
 }
 
-/// Asks the page, through DevTools, for its document state, then pauses its JavaScript to
-/// learn where it is. A page whose main thread is stuck answers neither.
+/// Asks the page, through DevTools, for its document state, then, when `pause`, pauses its
+/// JavaScript to learn where it is. A page whose main thread is stuck answers neither.
 fn probe_page(
     core: &ICoreWebView2,
     navigation: u64,
     answered: Arc<AtomicBool>,
+    pause: bool,
 ) -> windows::core::Result<()> {
     let expression = "JSON.stringify({readyState: document.readyState, href: location.origin + location.pathname, scripts: document.scripts.length, visibility: document.visibilityState})";
     let parameters = serde_json::json!({
@@ -201,6 +209,9 @@ fn probe_page(
         answered.store(true, Ordering::Relaxed);
         tracing::warn!(target: TARGET, "webview2_stall_page_state navigation={navigation} result={result}");
     })?;
+    if !pause {
+        return Ok(());
+    }
     // DevTools may handle calls out of order, so the pause waits for the debugger to be on.
     let pausing = core.clone();
     call_devtools(
