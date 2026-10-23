@@ -13,7 +13,15 @@ export async function setDesktopUiWindowSize(width: number, height: number): Pro
       width: window.innerWidth,
       height: window.innerHeight,
     }));
-  const scale = Number.isFinite(devicePixelRatio) && devicePixelRatio > 0 ? devicePixelRatio : 1;
+  // A host whose WebDriver plugin sets window rects in CSS pixels at a pixel ratio above 1
+  // (WDIO 1.5 at 200% Windows scaling) names the ratio its corrections use instead.
+  const rectScale = Number(process.env.BIBCODE_E2E_WINDOW_RECT_SCALE);
+  const scale =
+    Number.isFinite(rectScale) && rectScale > 0
+      ? rectScale
+      : Number.isFinite(devicePixelRatio) && devicePixelRatio > 0
+        ? devicePixelRatio
+        : 1;
   let previous:
     | { width: number; height: number; outerWidth: number; outerHeight: number }
     | undefined;
