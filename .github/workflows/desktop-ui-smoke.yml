@@ -24,7 +24,7 @@ jobs:
   desktop_ui_smoke:
     name: Desktop UI - ${{ matrix.label }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 120
+    timeout-minutes: 200
     strategy:
       fail-fast: false
       matrix:
