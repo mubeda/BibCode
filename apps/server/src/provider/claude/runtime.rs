@@ -1583,6 +1583,10 @@ pub struct ClaudeProviderRuntime {
     /// ignored in that window answered one of them; the rest follow the turn once the write is
     /// replayed or acknowledged, as a `/compact` is from its `result` alone.
     follow_ups_awaiting_replay: usize,
+    /// The open turn is a task answer started because an error result ended the delivered
+    /// turn before its write was read. That answer's own `task-notification` result may end
+    /// it while the write still awaits replay; any other result in the window stays ignored.
+    early_follow_up: bool,
     turn_input_cancellation: CancellationToken,
     delivery_acknowledgement_cancellation: CancellationToken,
     active_assistant_item_id: Option<String>,
@@ -1637,6 +1641,7 @@ impl ClaudeProviderRuntime {
             turn_input_awaiting_replay: None,
             follow_ups_after_turn: 0,
             follow_ups_awaiting_replay: 0,
+            early_follow_up: false,
             turn_input_cancellation: CancellationToken::new(),
             delivery_acknowledgement_cancellation: CancellationToken::new(),
             active_assistant_item_id: None,
@@ -1710,6 +1715,7 @@ impl ClaudeProviderRuntime {
         self.reset_delivery_acknowledgements();
         self.follow_ups_after_turn = 0;
         self.follow_ups_awaiting_replay = 0;
+        self.early_follow_up = false;
         self.runtime_mode = Some(runtime_mode);
         vec![
             self.event(
@@ -1754,6 +1760,7 @@ impl ClaudeProviderRuntime {
         self.current_turn_id = Some(input.turn_id.clone());
         self.turn_open = true;
         self.turn_input_awaiting_replay = None;
+        self.early_follow_up = false;
         vec![self.event(
             "turn.started",
             Some(input.turn_id),
@@ -1792,6 +1799,7 @@ impl ClaudeProviderRuntime {
     pub fn stop_awaiting_turn_input(&mut self, write: u64) {
         if self.turn_input_awaiting_replay == Some(write) {
             self.turn_input_awaiting_replay = None;
+            self.early_follow_up = false;
             let pending = std::mem::take(&mut self.follow_ups_awaiting_replay);
             if self.turn_open {
                 self.follow_ups_after_turn = self.follow_ups_after_turn.saturating_add(pending);
@@ -1816,13 +1824,25 @@ impl ClaudeProviderRuntime {
     }
 
     pub fn handle_message(&mut self, message: ClaudeMessage) -> Vec<CanonicalEvent> {
+        self.dispatch_message(message, false)
+    }
+
+    /// `result_answers_follow_up` is set from the raw frame's `origin.kind`. A decoded
+    /// `ResultMessage` drops that field, and `handle_message` does not have it.
+    fn dispatch_message(
+        &mut self,
+        message: ClaudeMessage,
+        result_answers_follow_up: bool,
+    ) -> Vec<CanonicalEvent> {
         match message {
             ClaudeMessage::StreamEvent(message) => {
                 self.handle_stream_event(message.parent_tool_use_id, message.event)
             }
             ClaudeMessage::User(message) => self.handle_user_message(message.message.content),
             ClaudeMessage::Assistant(message) => self.handle_assistant_message(message),
-            ClaudeMessage::Result(message) => self.handle_result_message(message),
+            ClaudeMessage::Result(message) => {
+                self.handle_result_message(message, result_answers_follow_up)
+            }
         }
     }
 
@@ -2066,10 +2086,17 @@ impl ClaudeProviderRuntime {
                 ..ClaudeRuntimeOutput::default()
             };
         };
+        // Only the answer's own result may end a follow-up opened while a write still
+        // awaits replay. `handle_message` cannot see `origin`; this frame still has it.
+        let result_answers_follow_up = value.get("type").and_then(Value::as_str) == Some("result")
+            && value.pointer("/origin/kind").and_then(Value::as_str) == Some("task-notification");
         let events = match claude_message_route(&message) {
-            ClaudeMessageRoute::Root => self.handle_message(message),
+            ClaudeMessageRoute::Root => self.dispatch_message(message, result_answers_follow_up),
             ClaudeMessageRoute::ForwardedTaskLifecycle { parent_tool_use_id } => {
-                correlate_forwarded_task_events(self.handle_message(message), &parent_tool_use_id)
+                correlate_forwarded_task_events(
+                    self.dispatch_message(message, result_answers_follow_up),
+                    &parent_tool_use_id,
+                )
             }
             ClaudeMessageRoute::SuppressedChildText => Vec::new(),
         };
@@ -2463,6 +2490,7 @@ impl ClaudeProviderRuntime {
         self.delivery_acknowledgement_cancellation.cancel();
         self.follow_ups_after_turn = 0;
         self.follow_ups_awaiting_replay = 0;
+        self.early_follow_up = false;
         let error_message = if is_interrupted_error(error) {
             "Claude runtime interrupted.".to_owned()
         } else {
@@ -2517,6 +2545,7 @@ impl ClaudeProviderRuntime {
         self.turn_open = self.current_turn_id.is_some();
         self.follow_ups_after_turn = 0;
         self.follow_ups_awaiting_replay = 0;
+        self.early_follow_up = false;
         self.runtime_mode = Some(snapshot.runtime_mode);
         self.pending_approvals = snapshot
             .pending_approvals
@@ -2717,11 +2746,24 @@ impl ClaudeProviderRuntime {
         events
     }
 
-    fn handle_result_message(&mut self, message: ResultMessage) -> Vec<CanonicalEvent> {
+    fn handle_result_message(
+        &mut self,
+        message: ResultMessage,
+        answers_follow_up: bool,
+    ) -> Vec<CanonicalEvent> {
         // Seen right after a suspended session resumes: Claude reports a result before it
         // replays the new message. Ending the new turn there leaves its work running while
         // the thread reads ready. An error still ends it; Claude can fail before reading.
-        if self.turn_input_awaiting_replay.is_some() && !message.is_error {
+        // Captured before completion: opening the answer below clears it, and it has to be
+        // put back so a later result in this window is still ignored.
+        let awaiting_replay = self.turn_input_awaiting_replay;
+        // The answer opened for an error above ends on its own task-notification result.
+        // Another result before the write is read still belongs to earlier work.
+        let completes_early_follow_up = awaiting_replay.is_some()
+            && !message.is_error
+            && self.early_follow_up
+            && answers_follow_up;
+        if awaiting_replay.is_some() && !message.is_error && !completes_early_follow_up {
             // It answered a task notification replayed in the same window.
             self.follow_ups_awaiting_replay = self.follow_ups_awaiting_replay.saturating_sub(1);
             tracing::info!(
@@ -2729,6 +2771,9 @@ impl ClaudeProviderRuntime {
                 "ignored a Claude result that arrived before the turn's input was read"
             );
             return Vec::new();
+        }
+        if completes_early_follow_up {
+            self.early_follow_up = false;
         }
         self.stop_turn_input();
         self.turn_open = false;
@@ -2784,12 +2829,26 @@ impl ClaudeProviderRuntime {
         // Claude dequeued a task notification during the turn that just ended and answers it
         // now: the answer gets its turn before the idle deadline this result arms can expire.
         // An interrupted turn is the user stopping Claude, so no answer is assumed to follow.
+        // An error before the write is read closes this turn the same way, which would also
+        // arm that deadline while a queued answer is still outstanding. Open the answer in
+        // this batch and keep ignoring unrelated results until the write is read.
         if interrupted {
             self.follow_ups_after_turn = 0;
             self.follow_ups_awaiting_replay = 0;
+            self.early_follow_up = false;
+        } else if awaiting_replay.is_some() && self.follow_ups_awaiting_replay > 0 {
+            let pending = std::mem::take(&mut self.follow_ups_awaiting_replay);
+            self.follow_ups_after_turn = self.follow_ups_after_turn.saturating_add(pending - 1);
+            events.extend(self.start_follow_up_turn());
+            self.turn_input_awaiting_replay = awaiting_replay;
+            self.early_follow_up = true;
         } else if self.follow_ups_after_turn > 0 {
             self.follow_ups_after_turn -= 1;
             events.extend(self.start_follow_up_turn());
+            if awaiting_replay.is_some() {
+                self.turn_input_awaiting_replay = awaiting_replay;
+                self.early_follow_up = true;
+            }
         }
         events
     }
