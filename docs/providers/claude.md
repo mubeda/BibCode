@@ -299,7 +299,10 @@ version of BiBCode), resuming it makes Claude deliver the stopped tasks'
 notification first. Claude can report that turn's `result` before it reads the
 new message; BiBCode ignores that `result` and logs `ignored a Claude result
 that arrived before the turn's input was read`, then the new message runs as
-its own turn.
+its own turn. Only a `result` whose `origin.kind` is `task-notification` retires
+one of those queued notifications. A different result in the same window, such
+as the turn that was already running, does not, so the task's answer still gets
+a turn once the new message is read.
 
 ## Activity observation
 
