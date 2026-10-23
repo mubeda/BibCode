@@ -15,6 +15,10 @@ on:
         description: "How many times each reload experiment runs"
         required: false
         default: "1"
+      trace_modes:
+        description: "Comma-separated Windows WebView2 trace modes (off, events, full); each runs every reload experiment"
+        required: false
+        default: "full"
   workflow_call:
 
 permissions:
@@ -194,6 +198,7 @@ jobs:
           BIBCODE_E2E_SPEC: ${{ inputs.spec }}
           RELOAD_VARIANTS: ${{ inputs.reload_variants }}
           RELOAD_REPEAT: ${{ inputs.repeat }}
+          TRACE_MODES: ${{ inputs.trace_modes }}
         run: |
           run_smoke() {
             if [[ "$BIBCODE_E2E_PLATFORM" == "linux" ]]; then
@@ -221,15 +226,19 @@ jobs:
           base="$BIBCODE_E2E_ARTIFACT_DIR"
           mkdir -p "$base"
           status=0
-          for variant in ${RELOAD_VARIANTS//,/ }; do
-            for attempt in $(seq 1 "${RELOAD_REPEAT:-1}"); do
-              export BIBCODE_E2E_RELOAD_VARIANT="$variant"
-              export BIBCODE_E2E_ARTIFACT_DIR="$base/$variant-$attempt"
-              mkdir -p "$BIBCODE_E2E_ARTIFACT_DIR"
-              if run_smoke; then result=pass; else result=fail; status=1; fi
-              stop_app
-              echo "reload variant $variant attempt $attempt: $result" | tee -a "$base/reload-variants.log"
-              echo "::notice title=Reload variant $variant attempt $attempt::$result"
+          traces="${TRACE_MODES:-full}"
+          for trace in ${traces//,/ }; do
+            for variant in ${RELOAD_VARIANTS//,/ }; do
+              for attempt in $(seq 1 "${RELOAD_REPEAT:-1}"); do
+                export BIBCODE_E2E_WEBVIEW2_TRACE="$trace"
+                export BIBCODE_E2E_RELOAD_VARIANT="$variant"
+                export BIBCODE_E2E_ARTIFACT_DIR="$base/$trace-$variant-$attempt"
+                mkdir -p "$BIBCODE_E2E_ARTIFACT_DIR"
+                if run_smoke; then result=pass; else result=fail; status=1; fi
+                stop_app
+                echo "trace $trace variant $variant attempt $attempt: $result" | tee -a "$base/reload-variants.log"
+                echo "::notice title=Trace $trace variant $variant attempt $attempt::$result"
+              done
             done
           done
           exit "$status"

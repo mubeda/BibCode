@@ -57,14 +57,48 @@ fn lock(trace: &Shared) -> MutexGuard<'_, Trace> {
     trace.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// How much of the trace runs, from `BIBCODE_E2E_WEBVIEW2_TRACE`: `off`, `events` (the
+/// WebView2 events and the stall watchdog, without a DevTools session), or `full` (the
+/// default). Attaching DevTools changes how the page loads, so a run can leave it out.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TraceMode {
+    Off,
+    Events,
+    Full,
+}
+
+fn trace_mode() -> TraceMode {
+    match std::env::var("BIBCODE_E2E_WEBVIEW2_TRACE")
+        .map(|mode| mode.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Ok("off") => TraceMode::Off,
+        Ok("events") => TraceMode::Events,
+        _ => TraceMode::Full,
+    }
+}
+
 /// Starts tracing the main window's webview; a failure is logged, never fatal.
 pub(crate) fn install<R: Runtime>(window: &WebviewWindow<R>) {
+    let mode = trace_mode();
+    tracing::info!(
+        target: TARGET,
+        "webview2_trace mode={}",
+        match mode {
+            TraceMode::Off => "off",
+            TraceMode::Events => "events",
+            TraceMode::Full => "full",
+        }
+    );
+    if mode == TraceMode::Off {
+        return;
+    }
     let trace = Shared::default();
     let handlers = trace.clone();
     let installed = window.with_webview(move |webview| {
         // SAFETY: Tauri runs this closure on the UI thread that owns the controller.
         let result = unsafe { webview.controller().CoreWebView2() }
-            .and_then(|core| subscribe(&core, &handlers));
+            .and_then(|core| subscribe(&core, &handlers, mode == TraceMode::Full));
         if let Err(error) = result {
             tracing::warn!(target: TARGET, %error, "webview2_trace_unavailable");
         }
@@ -266,7 +300,7 @@ fn text<'a>(value: &'a Value, path: &[&str]) -> &'a str {
         .unwrap_or("")
 }
 
-fn subscribe(core: &ICoreWebView2, trace: &Shared) -> windows::core::Result<()> {
+fn subscribe(core: &ICoreWebView2, trace: &Shared, devtools: bool) -> windows::core::Result<()> {
     let mut token = 0;
     log_runtime_version(core);
 
@@ -390,7 +424,10 @@ fn subscribe(core: &ICoreWebView2, trace: &Shared) -> windows::core::Result<()> 
     // SAFETY: COM calls on the UI thread that owns `core`.
     unsafe { core.add_ProcessFailed(&handler, &mut token) }?;
 
-    subscribe_devtools(core, trace)
+    if devtools {
+        subscribe_devtools(core, trace)?;
+    }
+    Ok(())
 }
 
 fn subscribe_devtools(core: &ICoreWebView2, trace: &Shared) -> windows::core::Result<()> {
