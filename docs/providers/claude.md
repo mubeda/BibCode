@@ -291,8 +291,12 @@ the answer's turn as that `result` ends the first one, so the idle deadline the
 `result` arms cannot stop Claude while it answers. This holds for `/compact`
 too, which Claude never replays: a notification that arrives while a delivered
 message awaits its replay starts its answer's turn once the message is replayed
-or, for a local command, acknowledged by its `result`. An interrupted turn
-starts no answer.
+or, for a local command, acknowledged by its `result`. An error result still
+ends that delivered turn before the write is read. A notification already
+queued then opens its answer in the same step, and only that answer's own
+`task-notification` result ends it; any other result before the write is read
+stays ignored, so idle suspension still waits for the answer. An interrupted
+turn starts no answer.
 
 If a session was stopped while background work ran (for example by an earlier
 version of BiBCode), resuming it makes Claude deliver the stopped tasks'

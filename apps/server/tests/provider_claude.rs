@@ -4186,6 +4186,56 @@ fn claude_runtime_keeps_a_follow_up_replayed_while_a_local_command_awaits_its_re
     assert_eq!(kinds[1].0, "turn.started", "{kinds:?}");
 }
 
+/// An error result before the write is read ends the delivered turn, which arms idle suspension.
+/// A task notification already queued in that window must open its answer in the same step, or
+/// the deadline can suspend Claude while it is still answering. A result that is not that
+/// answer stays ignored; the answer's own result ends the turn it opened.
+#[test]
+fn claude_runtime_opens_a_follow_up_when_an_error_result_ends_the_turn_before_replay() {
+    let mut runtime = ClaudeProviderRuntime::new("thread-1".to_owned(), "session-root".to_owned());
+    runtime.start_turn(TurnInput {
+        turn_id: "message".to_owned(),
+        input: "next step".to_owned(),
+    });
+    runtime.await_turn_input(7);
+    runtime.handle_raw_value(&claude_task_notification_turn(), 1_000);
+
+    let mut failed = claude_result_frame(None);
+    failed["is_error"] = json!(true);
+    failed["subtype"] = json!("error_max_turns");
+    failed["stop_reason"] = Value::Null;
+    let failed = runtime.handle_raw_value(&failed, 2_000);
+    let kinds = failed
+        .events
+        .iter()
+        .map(|event| (event.event_type.as_str(), event.turn_id.as_deref()))
+        .collect::<Vec<_>>();
+    assert_eq!(kinds.len(), 2, "{kinds:?}");
+    assert_eq!(kinds[0], ("turn.completed", Some("message")));
+    assert_eq!(kinds[1].0, "turn.started", "{kinds:?}");
+    let follow_up_turn = kinds[1].1.expect("the answer's turn").to_owned();
+    assert_ne!(follow_up_turn, "message");
+
+    let unrelated = runtime.handle_raw_value(&claude_result_frame(None), 3_000);
+    assert!(
+        unrelated.events.is_empty(),
+        "a result that is not the answer stays ignored: {:?}",
+        unrelated.events
+    );
+
+    let ended = runtime.handle_raw_value(&claude_result_frame(Some("task-notification")), 4_000);
+    let kinds = ended
+        .events
+        .iter()
+        .map(|event| (event.event_type.as_str(), event.turn_id.as_deref()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        kinds,
+        vec![("turn.completed", Some(follow_up_turn.as_str()))],
+        "the answer's result ends its turn and opens no other"
+    );
+}
+
 /// After a resume Claude can answer a finished task before it reads the new message. That answer's
 /// result is ignored while the message awaits its replay, so the notification it answered must not
 /// open another turn once the message's own turn ends.
