@@ -21,6 +21,7 @@ import {
   type ThreadId,
   type TurnId,
   type KeybindingCommand,
+  type OrchestrationReasoning,
   OrchestrationThreadActivity,
   ProviderInteractionMode,
   ProviderDriverKind,
@@ -126,6 +127,7 @@ import {
   deriveActivePlanState,
   findSidebarProposedPlan,
   findLatestProposedPlan,
+  deriveReasoningWorkEntries,
   deriveWorkLogEntries,
   hasActionableProposedPlan,
   isLatestTurnSettled,
@@ -134,6 +136,7 @@ import { type LegendListRef } from "@legendapp/list/react";
 import {
   getAnchoredTurnMetrics,
   getTimelinePageScrollOffset,
+  rowToggleNeedsEndReveal,
   timelineScrollAnimates,
   type TimelineScrollMode,
 } from "./chat/timelineScrollAnchoring";
@@ -377,6 +380,7 @@ import { ProjectFilesPreloader } from "./files/ProjectFilesPreloader";
 const ATTACHMENT_ONLY_BOOTSTRAP_PROMPT =
   "[User attached one or more files without additional text. Respond using the conversation context and the attachments.]";
 const EMPTY_ACTIVITIES: OrchestrationThreadActivity[] = [];
+const EMPTY_REASONING: ReadonlyArray<OrchestrationReasoning> = [];
 const EMPTY_PROVIDERS: ServerProvider[] = [];
 const EMPTY_PROVIDER_SKILLS: ServerProvider["skills"] = [];
 const EMPTY_PENDING_USER_INPUT_ANSWERS: Record<string, PendingUserInputDraftAnswer> = {};
@@ -2628,7 +2632,15 @@ function ChatViewContent(props: ChatViewProps) {
     lockedProvider ?? providerBinding.driver ?? unlockedSelectedProvider;
   const phase = derivePhase(activeThread?.session ?? null);
   const threadActivities = activeThread?.activities ?? EMPTY_ACTIVITIES;
-  const workLogEntries = useMemo(() => deriveWorkLogEntries(threadActivities), [threadActivities]);
+  const threadReasoning = activeThread?.reasoning ?? EMPTY_REASONING;
+  // Thoughts sort among tool calls by the time each began (#173).
+  const workLogEntries = useMemo(
+    () => [
+      ...deriveWorkLogEntries(threadActivities),
+      ...deriveReasoningWorkEntries(threadReasoning),
+    ],
+    [threadActivities, threadReasoning],
+  );
   const pendingApprovals = useMemo(
     () => derivePendingApprovals(threadActivities),
     [threadActivities],
@@ -4212,6 +4224,34 @@ function ChatViewContent(props: ChatViewProps) {
       showScrollDebouncer.current.maybeExecute(scrollPillThreadIdRef.current);
     }
   }, []);
+
+  // A Thinking row toggled at the end of an anchored turn changes layout but not
+  // `timelineEntries`, so the follow effect below never sees it (#173). One pass reveals the
+  // end again once the row re-measured; the other modes keep their own place.
+  const onReasoningRowToggle = useCallback(() => {
+    if (
+      !rowToggleNeedsEndReveal({
+        mode: timelineScrollModeRef.current,
+        wasAtEnd: isAtEndRef.current,
+      }) ||
+      liveFollowUserScrollGenerationRef.current !== anchorUserScrollGenerationRef.current
+    ) {
+      return;
+    }
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        const list = legendListRef.current;
+        const metrics = list ? getActiveTimelineTurnMetrics(list) : null;
+        if (!list || !metrics || metrics.scrollDeltaToRevealEnd <= 1) {
+          return;
+        }
+        void list.scrollToOffset({
+          offset: list.getState().scroll + metrics.scrollDeltaToRevealEnd,
+          animated: false,
+        });
+      });
+    });
+  }, [getActiveTimelineTurnMetrics]);
 
   // Follows the end after new timeline entries render; an empty timeline has nothing to follow.
   useEffect(() => {
@@ -7016,6 +7056,7 @@ function ChatViewContent(props: ChatViewProps) {
                       contentInsetEndAdjustment={composerOverlayHeight}
                       onIsAtEndChange={onIsAtEndChange}
                       onManualNavigation={cancelTimelineLiveFollowForUserNavigation}
+                      onReasoningRowToggle={onReasoningRowToggle}
                     />
 
                     {/* scroll to end pill — shown when user has scrolled away from the live edge */}

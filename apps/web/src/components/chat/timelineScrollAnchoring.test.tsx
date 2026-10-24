@@ -3,6 +3,7 @@ import {
   getAnchoredTurnMetrics,
   getRowBottom,
   getTimelinePageScrollOffset,
+  rowToggleNeedsEndReveal,
 } from "./timelineScrollAnchoring";
 
 function buildState({
@@ -156,5 +157,16 @@ describe("timeline scroll anchoring", () => {
 
     expect(withoutComposer?.overflowsUsableViewport).toBe(false);
     expect(withComposer?.overflowsUsableViewport).toBe(true);
+  });
+});
+
+describe("rowToggleNeedsEndReveal", () => {
+  it("asks for one reveal pass only for a toggle at the end of an anchored turn", () => {
+    expect(rowToggleNeedsEndReveal({ mode: "anchoring-new-turn", wasAtEnd: true })).toBe(true);
+    expect(rowToggleNeedsEndReveal({ mode: "anchoring-new-turn", wasAtEnd: false })).toBe(false);
+    // Following the end keeps it in view by itself; a reader scrolled away keeps their place.
+    expect(rowToggleNeedsEndReveal({ mode: "following-end", wasAtEnd: true })).toBe(false);
+    expect(rowToggleNeedsEndReveal({ mode: "free-scrolling", wasAtEnd: true })).toBe(false);
+    expect(rowToggleNeedsEndReveal({ mode: "free-scrolling", wasAtEnd: false })).toBe(false);
   });
 });

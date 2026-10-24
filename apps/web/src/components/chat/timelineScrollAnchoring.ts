@@ -1,5 +1,18 @@
 export type TimelineScrollMode = "following-end" | "anchoring-new-turn" | "free-scrolling";
 
+/**
+ * Whether a row the reader just expanded or collapsed needs one pass that reveals the end of
+ * the turn (#173). Only an anchored new turn does, and only when the list was at its end:
+ * there the end follows `timelineEntries` changes, which a toggle does not make. Following
+ * the end already keeps it in view, and a reader scrolled away keeps their place.
+ */
+export function rowToggleNeedsEndReveal(input: {
+  readonly mode: TimelineScrollMode;
+  readonly wasAtEnd: boolean;
+}): boolean {
+  return input.mode === "anchoring-new-turn" && input.wasAtEnd;
+}
+
 /** Programmatic timeline scrolls jump instead of gliding when the user asks for reduced motion. */
 export function timelineScrollAnimates(): boolean {
   return (

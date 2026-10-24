@@ -8,6 +8,7 @@ import {
 } from "../../session-logic";
 import { type ChatMessage, type ProposedPlan, type TurnDiffSummary } from "../../types";
 import { type MessageId, type OrchestrationLatestTurn, type TurnId } from "@bibcode/contracts";
+import { latestThoughtLine } from "@bibcode/client-runtime/state/reasoning";
 import { isQueuedTimelineMessage, type QueuedCardStatus } from "../ChatView.logic";
 
 export const MAX_VISIBLE_WORK_LOG_ENTRIES = 1;
@@ -156,6 +157,8 @@ export type MessagesTimelineRow =
       hiddenCount: number;
       expanded: boolean;
       onlyToolEntries: boolean;
+      /** The hidden entries include a thought, so they read as steps, not tool calls. */
+      hidesReasoning: boolean;
     }
   | {
       kind: "turn-fold";
@@ -195,6 +198,11 @@ export type MessagesTimelineRow =
        * undifferentiated wait made the provider's lag look like BiBCode hanging.
        */
       answerDelivered: boolean;
+      /**
+       * The running turn's newest thought, one line, when no visible row already shows it
+       * and the answer is not yet delivered.
+       */
+      latestThought: string | null;
     };
 
 export interface StableMessagesTimelineRowsState {
@@ -399,6 +407,9 @@ function deriveTurnFolds(input: {
       if (entry.message.streaming) {
         group.hasStreamingMessage = true;
       }
+    } else if (entry.kind === "work" && entry.entry.reasoning?.streaming === true) {
+      // A thought still streaming keeps its turn open, as a streaming message does.
+      group.hasStreamingMessage = true;
     }
   }
 
@@ -629,6 +640,7 @@ export function deriveMessagesTimelineRows(input: {
             hiddenCount: hiddenEntries.length,
             expanded,
             onlyToolEntries: visibleGroupedEntries.every((entry) => workLogEntryIsToolLike(entry)),
+            hidesReasoning: hiddenEntries.some((entry) => entry.tone === "reasoning"),
           });
         }
       }
@@ -699,6 +711,9 @@ export function deriveMessagesTimelineRows(input: {
       id: "working-indicator-row",
       createdAt: input.activeTurnStartedAt,
       answerDelivered,
+      latestThought: answerDelivered
+        ? null
+        : deriveLatestThought(timelineEntries, unsettledTurnId, nextRows),
     });
   }
 
@@ -715,6 +730,36 @@ export function deriveMessagesTimelineRows(input: {
     });
   }
   return nextRows;
+}
+
+/**
+ * The running turn's newest thought as one line, or null when it is already the newest
+ * visible work row, which shows it in full.
+ */
+function deriveLatestThought(
+  timelineEntries: ReadonlyArray<TimelineEntry>,
+  unsettledTurnId: TurnId | null,
+  rows: ReadonlyArray<MessagesTimelineRow>,
+): string | null {
+  if (unsettledTurnId === null) {
+    return null;
+  }
+  const thought = timelineEntries.findLast(
+    (entry): entry is Extract<TimelineEntry, { kind: "work" }> =>
+      entry.kind === "work" &&
+      entry.entry.turnId === unsettledTurnId &&
+      entry.entry.reasoning !== undefined,
+  );
+  if (thought?.entry.reasoning === undefined) {
+    return null;
+  }
+  const newestWorkRow = rows.findLast(
+    (row): row is Extract<MessagesTimelineRow, { kind: "work" }> => row.kind === "work",
+  );
+  if (newestWorkRow?.groupedEntries.at(-1)?.id === thought.entry.id) {
+    return null;
+  }
+  return latestThoughtLine(thought.entry.reasoning);
 }
 
 export function computeStableMessagesTimelineRows(
@@ -750,7 +795,11 @@ function isRowUnchanged(a: MessagesTimelineRow, b: MessagesTimelineRow): boolean
     }
     case "working": {
       const bw = b as typeof a;
-      return a.createdAt === bw.createdAt && a.answerDelivered === bw.answerDelivered;
+      return (
+        a.createdAt === bw.createdAt &&
+        a.answerDelivered === bw.answerDelivered &&
+        a.latestThought === bw.latestThought
+      );
     }
 
     case "turn-fold": {
@@ -771,7 +820,8 @@ function isRowUnchanged(a: MessagesTimelineRow, b: MessagesTimelineRow): boolean
         a.groupId === bw.groupId &&
         a.hiddenCount === bw.hiddenCount &&
         a.expanded === bw.expanded &&
-        a.onlyToolEntries === bw.onlyToolEntries
+        a.onlyToolEntries === bw.onlyToolEntries &&
+        a.hidesReasoning === bw.hidesReasoning
       );
     }
 
