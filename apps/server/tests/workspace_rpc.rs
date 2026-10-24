@@ -73,6 +73,13 @@ async fn workspace_unavailable_rejects_file_search_and_review_before_side_effect
             "review.getDiffPreview",
             json!({"cwd":path_string(root.path()),"baseRef":null}),
         ),
+        (
+            "review.readFileVersion",
+            json!({
+                "cwd": path_string(root.path()),
+                "version": {"_tag": "blob", "oid": "0".repeat(40)},
+            }),
+        ),
     ] {
         let error = rpc
             .handle(method, payload)
@@ -2523,6 +2530,7 @@ fn owned_rpc_inventory_matches_task_six_contract_methods() {
             "filesystem.browse",
             "assets.createUrl",
             "review.getDiffPreview",
+            "review.readFileVersion",
         ]
     );
 }

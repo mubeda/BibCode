@@ -36,6 +36,7 @@ pub use process::{OutputPolicy, ProcessError, ProcessOutput, ProcessRequest, Pro
 pub(crate) use repository::BoxGitProcessFuture;
 pub(crate) use repository::GitProcessRunner;
 pub(crate) use repository::git_environment;
+pub(crate) use repository::git_read_environment;
 pub use repository::{
     BoxWorktreeBaseDirectoryFuture, GitManagerCommitOutcome, GitManagerHeadCommit, GitRepository,
     WorktreeBaseDirectoryProvider,

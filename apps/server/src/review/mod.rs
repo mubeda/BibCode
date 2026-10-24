@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
 
 pub type ReviewFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Option<ReviewDiffPreviewResult>, ReviewError>> + Send + 'a>>;
@@ -77,8 +78,83 @@ pub fn validate_review_diff_options(
     Ok(())
 }
 
+pub type ReviewFileVersionFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<ReviewFileVersion, ReviewError>> + Send + 'a>>;
+
+/// `review.readFileVersion`: one side of a changed file, named by the content it must have.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewReadFileVersionInput {
+    pub cwd: String,
+    pub version: ReviewFileVersionRequest,
+}
+
+/// A blob by its object ID, or the working-tree file whose current content the patch named.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "_tag",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase"
+)]
+pub enum ReviewFileVersionRequest {
+    Blob { oid: String },
+    Worktree { path: String, expected_oid: String },
+}
+
+/// Why a version has no text to show.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReviewFileVersionUnavailable {
+    Missing,
+    Binary,
+    TooLarge,
+    NotAFile,
+    /// The working-tree file no longer has the content the patch named.
+    Changed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "_tag",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase"
+)]
+pub enum ReviewFileVersion {
+    Text {
+        contents: String,
+        byte_length: u64,
+    },
+    Unavailable {
+        reason: ReviewFileVersionUnavailable,
+        byte_length: Option<u64>,
+    },
+}
+
+/// Lowercase hex, 40 digits (SHA-1) or 64 (SHA-256). Such an ID can be neither an option nor
+/// a path.
+#[must_use]
+pub fn is_git_object_id(value: &str) -> bool {
+    matches!(value.len(), 40 | 64)
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 pub trait ReviewBackend: Send + Sync {
     fn get_diff_preview<'a>(&'a self, input: &'a ReviewDiffPreviewInput) -> ReviewFuture<'a>;
+
+    /// Reads one side of a changed file. `cancellation` is the request's: it stops Git.
+    fn read_file_version<'a>(
+        &'a self,
+        _input: &'a ReviewReadFileVersionInput,
+        _cancellation: &'a CancellationToken,
+    ) -> ReviewFileVersionFuture<'a> {
+        Box::pin(async {
+            Err(ReviewError::Backend(
+                "review.readFileVersion is not supported".to_owned(),
+            ))
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -104,6 +180,23 @@ impl ReviewService {
             generated_at: now_millis(),
             sources: Vec::new(),
         })
+    }
+
+    pub async fn read_file_version(
+        &self,
+        input: ReviewReadFileVersionInput,
+        cancellation: &CancellationToken,
+    ) -> Result<ReviewFileVersion, ReviewError> {
+        let oid = match &input.version {
+            ReviewFileVersionRequest::Blob { oid } => oid,
+            ReviewFileVersionRequest::Worktree { expected_oid, .. } => expected_oid,
+        };
+        if !is_git_object_id(oid) {
+            return Err(ReviewError::InvalidRequest(
+                "An object ID must be 40 or 64 lowercase hexadecimal digits.".to_owned(),
+            ));
+        }
+        self.backend.read_file_version(&input, cancellation).await
     }
 }
 
