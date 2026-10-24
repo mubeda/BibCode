@@ -3083,8 +3083,9 @@ Run the
 their client change. Everything below needs a real Android SDK.
 
 **Host.** Use a server host with the Android SDK (`emulator` and
-`platform-tools`), at least two AVDs (four for the limit in step 9), and
-hardware acceleration: KVM on Linux
+`platform-tools`), at least two AVDs (five images for the limit in step 9:
+five AVDs, or on a macOS host AVDs and `Shutdown` simulators that make
+five), and hardware acceleration: KVM on Linux
 (`emulator -accel-check` succeeds), the Hypervisor framework on macOS, or
 WHPX/AEHD on Windows. Record the SDK path, `emulator -version`, `adb version`,
 the AVD's name, API level, and ABI, and the platform page's acceleration
@@ -3219,8 +3220,9 @@ Record each client's OS, app or browser version, and profile type.
    only it. Open a second desktop window on the other thread: both windows show
    video at once. Stop the other thread's device from the first thread: the
    panel asks first, and **Cancel** leaves it running. Start AVDs until four
-   devices run (any mix with iOS on a macOS host): **Start** for a fifth image
-   is disabled with "Four devices are running. Stop one to start another."
+   devices run (any mix with iOS on a macOS host), then pick the fifth image:
+   **Start** is disabled with "Four devices are running. Stop one to start
+   another."
    Delete the second thread: its emulator is reaped (the platform page's process
    check) while the first thread's keeps running, and the first thread's panel,
    if it showed the deleted thread's device, shows it stopped with **Start**
