@@ -1873,12 +1873,8 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   // ------------------------------------------------------------------
   const onComposerCommandKey = (key: ComposerCommandKey, event: KeyboardEvent) => {
     if (key === "PageUp" || key === "PageDown") {
+      // The editor offers a page key only once the draft has no use for it.
       if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return false;
-      // While the key can still move the caret to another line of the draft, it belongs to the editor.
-      const { value, expandedCursor } = readComposerSnapshot();
-      const draftInKeyDirection =
-        key === "PageUp" ? value.slice(0, expandedCursor) : value.slice(expandedCursor);
-      if (draftInKeyDirection.includes("\n")) return false;
       onPageTimeline(key, event.repeat);
       return true;
     }

@@ -437,7 +437,8 @@ PageUp and PageDown in the composer scroll the timeline by about a screen, so
 you can read back without leaving the draft. While the key can still move the
 caret to another line of a multi-line draft, it moves the caret instead:
 PageUp scrolls once the caret is on the first line, PageDown once it is on the
-last. With Shift, Alt, Ctrl, or Cmd held, the keys keep their usual meaning.
+last. A long paragraph's wrapped lines count as lines. With text selected, or
+with Shift, Alt, Ctrl, or Cmd held, the keys keep their usual meaning.
 These keys and the minimap jump instead of scrolling smoothly when the system
 asks for reduced motion.
 

@@ -26,7 +26,7 @@ import {
 import { act, createRef, useLayoutEffect } from "react";
 import { createRoot } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vite-plus/test";
 
 import {
   INLINE_TERMINAL_CONTEXT_PLACEHOLDER,
@@ -431,6 +431,89 @@ function setDoctoredTokenSelection(editor: LexicalEditor, tokenType: string, off
     },
     { discrete: true },
   );
+}
+
+function pageKeyEvent(key: "PageUp" | "PageDown") {
+  return Object.assign(keyEvent(), { key });
+}
+
+/**
+ * Presses a page key and reports whether the editor offered it to the composer, which claims
+ * it. Lexical's own keydown handling reports every key handled, so the offer is the signal.
+ */
+function pressPageKey(
+  editor: LexicalEditor,
+  onCommandKeyDown: ReturnType<typeof vi.fn>,
+  key: "PageUp" | "PageDown",
+): boolean {
+  onCommandKeyDown.mockClear();
+  const event = pageKeyEvent(key);
+  editor.dispatchCommand(KEY_DOWN_COMMAND, event);
+  const offered = onCommandKeyDown.mock.calls.length > 0;
+  // A claimed key loses its default; one left to the editor keeps it.
+  expect(event.preventDefault).toHaveBeenCalledTimes(offered ? 1 : 0);
+  return offered;
+}
+
+/** The key of the text node on the given line of a single-paragraph draft. */
+function textLineKey(editor: LexicalEditor, line: number): string {
+  return editor.getEditorState().read(() => {
+    const textNodes = $paragraph()
+      .getChildren()
+      .filter((child) => child.getType() === "text");
+    const node = textNodes[line];
+    if (!node) throw new Error(`expected a text node on line ${line}`);
+    return node.getKey();
+  });
+}
+
+function placeCaretInLine(editor: LexicalEditor, line: number, offset: number): void {
+  const key = textLineKey(editor, line);
+  setCollapsedSelection(editor, () => ({ key, offset, type: "text" }));
+}
+
+/**
+ * Lays the draft out in a real root element that wraps every `lineLength` characters. happy-dom
+ * lays nothing out, so each range reports one 20px box per line it covers, 24px apart. The
+ * returned `placeCaret` puts both the browser's caret and the editor's there.
+ */
+function layOutWrappedDraft(editor: LexicalEditor, text: string, lineLength: number) {
+  const root = document.createElement("div");
+  const textNode = document.createTextNode(text);
+  root.append(textNode);
+  document.body.append(root);
+  editor.getRootElement = () => root;
+  const lastLine = Math.max(0, Math.ceil(text.length / lineLength) - 1);
+  const lineOf = (offset: number) => Math.min(lastLine, Math.floor(offset / lineLength));
+  const textOffset = (container: Node, offset: number) =>
+    container === textNode ? offset : offset === 0 ? 0 : text.length;
+  onTestFinished(() => root.remove());
+  const getClientRects = vi.spyOn(Range.prototype, "getClientRects");
+  onTestFinished(() => getClientRects.mockRestore());
+  getClientRects.mockImplementation(function (this: Range) {
+    const start = textOffset(this.startContainer, this.startOffset);
+    const end = textOffset(this.endContainer, this.endOffset);
+    const firstLine = lineOf(start);
+    const endLine = start === end ? firstLine : lineOf(end - 1);
+    const boxes = [];
+    for (let line = firstLine; line <= endLine; line += 1) {
+      boxes.push({
+        top: line * 24,
+        bottom: line * 24 + 20,
+        height: 20,
+        left: 0,
+        right: 8,
+        width: 8,
+      });
+    }
+    return boxes as unknown as DOMRectList;
+  });
+  return {
+    placeCaret: (offset: number) => {
+      document.getSelection()?.collapse(textNode, offset);
+      placeCaretInLine(editor, 0, offset);
+    },
+  };
 }
 
 async function flushMicrotasks(): Promise<void> {
@@ -1357,20 +1440,81 @@ describe("ComposerCommandKeyPlugin", () => {
   it("delegates PageUp and PageDown and leaves other keys to the editor", () => {
     const onCommandKeyDown = vi.fn((key: ComposerCommandKey) => key === "PageDown");
     const { editor } = renderEditor({ value: "hello", onCommandKeyDown });
+    placeCaretInLine(editor, 0, 2);
 
     // Unclaimed, the key keeps its default: the editor moves the caret.
-    const pageUp = Object.assign(keyEvent(), { key: "PageUp" });
+    const pageUp = pageKeyEvent("PageUp");
     editor.dispatchCommand(KEY_DOWN_COMMAND, pageUp);
     expect(onCommandKeyDown).toHaveBeenCalledWith("PageUp", pageUp);
     expect(pageUp.preventDefault).not.toHaveBeenCalled();
 
-    const pageDown = Object.assign(keyEvent(), { key: "PageDown" });
+    const pageDown = pageKeyEvent("PageDown");
     expect(editor.dispatchCommand(KEY_DOWN_COMMAND, pageDown)).toBe(true);
     expect(pageDown.preventDefault).toHaveBeenCalled();
 
     onCommandKeyDown.mockClear();
     editor.dispatchCommand(KEY_DOWN_COMMAND, Object.assign(keyEvent(), { key: "Home" }));
     expect(onCommandKeyDown).not.toHaveBeenCalled();
+  });
+
+  it("offers a page key only once the caret has no line of the draft in its direction", () => {
+    const onCommandKeyDown = vi.fn(() => true);
+    const { editor } = renderEditor({ value: "one\ntwo\nthree", onCommandKeyDown });
+    const offered = (key: "PageUp" | "PageDown") => pressPageKey(editor, onCommandKeyDown, key);
+
+    // Middle line: both keys move the caret.
+    placeCaretInLine(editor, 1, 1);
+    expect(offered("PageUp")).toBe(false);
+    expect(offered("PageDown")).toBe(false);
+    // First line: only PageDown has a line to move to.
+    placeCaretInLine(editor, 0, 1);
+    expect(offered("PageUp")).toBe(true);
+    expect(offered("PageDown")).toBe(false);
+    // Last line: only PageUp has a line to move to.
+    placeCaretInLine(editor, 2, 5);
+    expect(offered("PageUp")).toBe(false);
+    expect(offered("PageDown")).toBe(true);
+  });
+
+  it("leaves page keys to the editor while a range is selected", () => {
+    const onCommandKeyDown = vi.fn(() => true);
+    const { editor } = renderEditor({ value: "one\ntwo\nthree", onCommandKeyDown });
+    placeCaretInLine(editor, 0, 1);
+    expect(pressPageKey(editor, onCommandKeyDown, "PageUp")).toBe(true);
+
+    // Selecting "two" with the mouse leaves the earlier caret behind in the snapshot.
+    const key = textLineKey(editor, 1);
+    setRangeSelection(editor, () => ({
+      anchor: { key, offset: 0, type: "text" },
+      focus: { key, offset: 3, type: "text" },
+    }));
+    expect(pressPageKey(editor, onCommandKeyDown, "PageUp")).toBe(false);
+    expect(pressPageKey(editor, onCommandKeyDown, "PageDown")).toBe(false);
+  });
+
+  it("counts a long paragraph's wrapped lines as lines of the draft", () => {
+    const onCommandKeyDown = vi.fn(() => true);
+    const text = "a".repeat(30);
+    const { editor } = renderEditor({ value: text, onCommandKeyDown });
+    // No line break anywhere: the paragraph wraps to three lines of ten characters.
+    const { placeCaret } = layOutWrappedDraft(editor, text, 10);
+    const offered = (key: "PageUp" | "PageDown") => pressPageKey(editor, onCommandKeyDown, key);
+
+    // Middle line: both keys move the caret.
+    placeCaret(15);
+    expect(offered("PageUp")).toBe(false);
+    expect(offered("PageDown")).toBe(false);
+    // First line: only PageDown has a line to move to.
+    placeCaret(4);
+    expect(offered("PageUp")).toBe(true);
+    expect(offered("PageDown")).toBe(false);
+    // At the start of the second line, the caret already sits below the first.
+    placeCaret(10);
+    expect(offered("PageUp")).toBe(false);
+    // Last line: only PageUp has a line to move to.
+    placeCaret(25);
+    expect(offered("PageUp")).toBe(false);
+    expect(offered("PageDown")).toBe(true);
   });
 
   it("swallows Enter during IME composition without delegating", () => {
