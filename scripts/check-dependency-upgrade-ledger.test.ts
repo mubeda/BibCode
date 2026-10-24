@@ -628,6 +628,7 @@ describe("dependency upgrade ledger validation", () => {
 
     expect(Object.keys(workspace.patchedDependencies).sort()).toEqual([
       "@effect/vitest@4.0.2",
+      "@pierre/diffs@1.3.6",
       "@pierre/trees@1.0.0-beta.6",
       "@wdio/tauri-plugin@1.2.0",
       "effect@4.0.2",
