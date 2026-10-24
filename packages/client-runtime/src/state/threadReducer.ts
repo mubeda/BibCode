@@ -257,6 +257,7 @@ export function applyThreadDetailEvent(
           : {}),
         turnId: event.payload.turnId,
         streaming: event.payload.streaming,
+        ...(event.payload.resendOf !== undefined ? { resendOf: event.payload.resendOf } : {}),
         createdAt: event.payload.createdAt,
         updatedAt: event.payload.updatedAt,
       };
@@ -381,15 +382,49 @@ export function applyThreadDetailEvent(
               }
             : thread.latestTurn;
 
+      // The compaction's own turn started.
+      const compaction =
+        thread.compaction !== undefined &&
+        event.payload.compactionId !== undefined &&
+        event.payload.session.status === "running"
+          ? { ...thread.compaction, state: "running" as const }
+          : thread.compaction;
+
       return {
         kind: "updated",
         thread: {
           ...thread,
           session: event.payload.session,
           latestTurn,
+          ...(compaction !== undefined ? { compaction } : {}),
           updatedAt: event.occurredAt,
         },
       };
+    }
+
+    // ── Conversation compaction ─────────────────────────────────────
+    case "thread.compact-requested":
+      return {
+        kind: "updated",
+        thread: {
+          ...thread,
+          compaction: {
+            trigger: event.payload.trigger,
+            state: "requested",
+            ...(event.payload.failedMessageId !== undefined
+              ? { failedMessageId: event.payload.failedMessageId }
+              : {}),
+          },
+          updatedAt: event.occurredAt,
+        },
+      };
+
+    case "thread.compacted": {
+      if (thread.compaction === undefined) {
+        return { kind: "unchanged" };
+      }
+      const { compaction: _settled, ...settled } = thread;
+      return { kind: "updated", thread: { ...settled, updatedAt: event.occurredAt } };
     }
 
     case "thread.session-stop-requested":

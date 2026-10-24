@@ -9,6 +9,7 @@ import {
   ProjectId,
   type ModelSelection,
   type OrchestrationSessionStatus,
+  type OrchestrationThreadCompaction,
   type TurnDelivery,
   type ProviderDriverKind,
   type ProviderInstanceId,
@@ -624,13 +625,30 @@ export function selectQueuedMessages(messages: ReadonlyArray<ChatMessage>): Chat
   return messages.filter(isQueuedTimelineMessage);
 }
 
+/**
+ * The phase the composer works in. While a conversation compaction is unsettled it behaves as
+ * during a running turn, even before the compaction's turn starts: what is sent is queued and
+ * Stop is offered, which interrupts the compaction.
+ */
+export function composerPhaseWhileCompacting(
+  phase: SessionPhase,
+  compacting: boolean,
+): SessionPhase {
+  return compacting ? "running" : phase;
+}
+
 export function shouldEnqueueOnSend(input: {
   phase: SessionPhase;
   sessionStatus: OrchestrationSessionStatus | null;
   hasPendingDelivery: boolean;
+  /** A conversation compaction is unsettled: the server queues what is sent meanwhile. */
+  compacting?: boolean;
 }): boolean {
   return (
-    input.phase === "running" || input.sessionStatus === "starting" || input.hasPendingDelivery
+    input.phase === "running" ||
+    input.sessionStatus === "starting" ||
+    input.hasPendingDelivery ||
+    input.compacting === true
   );
 }
 
@@ -841,28 +859,44 @@ export function threadErrorAttribution(input: {
   }
 }
 
-/** The message the thread error's Compact action sends: the provider's own compaction command. */
+/**
+ * The message the thread error's Compact action sends where the server cannot compact the
+ * conversation itself (an older server, or a provider without `supportsCompaction`): the
+ * provider's own compaction command.
+ */
 export const COMPACT_CONVERSATION_COMMAND = "/compact";
 
 /**
- * Whether the thread error offers to compact the conversation, and why it cannot yet.
+ * Whether the thread error offers to compact the conversation, how, and why it cannot yet.
  *
  * Only a provider's `context_limit` failure offers it: the conversation no longer fits the
- * context window, and compacting it is how the user continues. While the thread is working (a
- * running turn, which includes a compaction, or a message still being sent) the action is
- * disabled with its reason, so it can never queue a second compaction.
+ * context window, and compacting it is how the user continues. A provider whose snapshot
+ * says `supportsCompaction` is compacted by the server (`thread.compact`); otherwise the action
+ * sends `/compact` as a message. While the server recovers the failure itself (it compacts,
+ * then sends the message again) nothing is offered: the banner says what is happening. While
+ * the thread is working, or another compaction is unsettled, the action is disabled with its
+ * reason, so it can never queue a second compaction.
  */
 export function threadErrorCompactAction(input: {
   readonly isBiBCodeAction: boolean;
   readonly errorClass: string | null | undefined;
   readonly busy: boolean;
-}): { readonly disabledReason: string | null } | null {
+  readonly supportsCompaction?: boolean;
+  readonly compaction?: OrchestrationThreadCompaction | undefined;
+}): { readonly disabledReason: string | null; readonly via: "command" | "message" } | null {
   if (input.isBiBCodeAction || input.errorClass !== "context_limit") {
     return null;
   }
-  return {
-    disabledReason: input.busy ? "Wait for the current work to finish, then compact." : null,
-  };
+  if (input.compaction?.trigger === "contextRecovery") {
+    return null;
+  }
+  const disabledReason =
+    input.compaction !== undefined
+      ? "Compacting the conversation…"
+      : input.busy
+        ? "Wait for the current work to finish, then compact."
+        : null;
+  return { disabledReason, via: input.supportsCompaction === true ? "command" : "message" };
 }
 
 /**

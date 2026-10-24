@@ -38,6 +38,7 @@ import {
   findBlockingDelivery,
   waitsBehind,
   shouldEnqueueOnSend,
+  composerPhaseWhileCompacting,
   isQueuedTimelineMessage,
 } from "./ChatView.logic";
 import { queuedMessageCache } from "./chat/queuedMessageCache";
@@ -1523,6 +1524,7 @@ function ChatViewContent(props: ChatViewProps) {
   const revertThreadCheckpoint = useAtomCommand(threadEnvironment.revertCheckpoint, {
     reportFailure: false,
   });
+  const compactThread = useAtomCommand(threadEnvironment.compact, { reportFailure: false });
   const openPreview = useAtomCommand(previewEnvironment.open, { reportFailure: false });
   const closePreview = useAtomCommand(previewEnvironment.close, "preview close");
   const { environments } = useEnvironments();
@@ -2711,6 +2713,10 @@ function ChatViewContent(props: ChatViewProps) {
     [blockingId, blockingCreatedAt, blockingOffersRetry],
   );
   const supportsTurnSteer = providerBinding.status?.supportsTurnSteer === true;
+  const supportsCompaction = providerBinding.status?.supportsCompaction === true;
+  const compaction = activeThread?.compaction;
+  const compactionFailedMessageId = compaction?.failedMessageId ?? null;
+  const composerPhase = composerPhaseWhileCompacting(phase, compaction !== undefined);
   const hasPendingApproval = activePendingApproval !== null;
   const hasPendingUserInput = activePendingUserInput !== null;
   const queueSessionStatus = activeThread?.session?.status ?? null;
@@ -5254,6 +5260,7 @@ function ChatViewContent(props: ChatViewProps) {
       phase,
       sessionStatus: activeThread?.session?.status ?? null,
       hasPendingDelivery: canCancelPendingSend,
+      compacting: compaction !== undefined,
     });
     if (
       !activeThread ||
@@ -5960,7 +5967,12 @@ function ChatViewContent(props: ChatViewProps) {
         if (message.delivery?.state === "queued") await onCancelQueuedMessage(message.id);
       }
 
-      if (phase !== "running" && cancellableDeliveryThreadId && cancellableDeliveryMessageId) {
+      if (
+        compaction === undefined &&
+        phase !== "running" &&
+        cancellableDeliveryThreadId &&
+        cancellableDeliveryMessageId
+      ) {
         const result = await resolveTurnDelivery({
           environmentId,
           input: {
@@ -6348,11 +6360,29 @@ function ChatViewContent(props: ChatViewProps) {
     ],
   );
 
-  // The context-limit error's recovery: sends the provider's compaction command to the same
-  // session as an ordinary message, so it is delivered, queued and confirmed like any other.
-  // It never resends the failed message; the user does that once the compaction finishes.
+  // The context-limit error's recovery. A provider the server can compact gets `thread.compact`,
+  // which compacts the conversation the next message continues and shows its step. Otherwise
+  // (an older server, or a provider without the capability) it sends the provider's compaction
+  // command to the same session as an ordinary message, delivered, queued and confirmed like any
+  // other. Neither resends the failed message; the user does that once the compaction finishes.
   const onCompactConversation = useCallback(async () => {
     if (!activeThread || !isServerThread || isSendBusy || isConnecting || sendInFlightRef.current) {
+      return;
+    }
+    if (supportsCompaction) {
+      const threadIdForCompaction = activeThread.id;
+      setThreadError(threadIdForCompaction, null);
+      const result = await compactThread({
+        environmentId,
+        input: { threadId: threadIdForCompaction },
+      });
+      if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
+        const error = squashAtomCommandFailure(result);
+        setThreadError(
+          threadIdForCompaction,
+          error instanceof Error ? error.message : "BiBCode could not compact the conversation.",
+        );
+      }
       return;
     }
     const sendCtx = composerRef.current?.getSendContext();
@@ -6416,6 +6446,7 @@ function ChatViewContent(props: ChatViewProps) {
   }, [
     activeThread,
     beginLocalDispatch,
+    compactThread,
     composerRef,
     environmentId,
     interactionMode,
@@ -6426,6 +6457,7 @@ function ChatViewContent(props: ChatViewProps) {
     runtimeMode,
     setThreadError,
     startThreadTurn,
+    supportsCompaction,
   ]);
   const threadErrorCompact =
     threadError === null || !isServerThread
@@ -6434,6 +6466,8 @@ function ChatViewContent(props: ChatViewProps) {
           isBiBCodeAction: localServerError !== null,
           errorClass: serverThread?.session?.lastErrorClass ?? null,
           busy: phase === "running" || isSendBusy || isConnecting,
+          supportsCompaction,
+          compaction: serverThread?.compaction,
         });
   // `threadErrorCompact` is a fresh object each render; its presence and reason are the inputs.
   const offersCompact = threadErrorCompact !== null;
@@ -6978,6 +7012,7 @@ function ChatViewContent(props: ChatViewProps) {
                       onResolveTurnDelivery={onResolveTurnDelivery}
                       resolvingTurnDeliveryMessageId={resolvingTurnDeliveryMessageId}
                       blockingDelivery={blockingDelivery}
+                      compactionFailedMessageId={compactionFailedMessageId}
                       instanceLabels={instanceLabels}
                       isRevertingCheckpoint={isRevertingCheckpoint}
                       onImageExpand={onExpandTimelineImage}
@@ -7045,7 +7080,7 @@ function ChatViewContent(props: ChatViewProps) {
                             activeThread={activeThread}
                             isServerThread={isServerThread}
                             isLocalDraftThread={isLocalDraftThread}
-                            phase={phase}
+                            phase={composerPhase}
                             isConnecting={isConnecting}
                             isSendBusy={
                               isSendBusy || hasActiveAttachmentUpload || applicationSendBusy
