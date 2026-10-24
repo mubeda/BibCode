@@ -9,7 +9,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vite-plus/test";
 import ChatMarkdown from "../../ChatMarkdown";
 import { findScopeOccurrences } from "./threadFindHighlights";
-import { countFindOccurrences, prepareFindQuery, projectFindSource } from "./threadFindText";
+import { locateFindOccurrences, prepareFindQuery, projectFindSource } from "./threadFindText";
 
 vi.mock("../../ui/menu", () => ({
   Menu: ({ children }: { children?: ReactNode }) => <>{children}</>,
@@ -228,10 +228,16 @@ function parityMismatches(container: HTMLElement, text: string, lineBreaks: bool
   const mismatches: string[] = [];
   for (const query of queriesFor(container)) {
     const folded = prepareFindQuery(query)!;
-    const projected = countFindOccurrences(segments, folded);
-    const rendered = findScopeOccurrences(scope, folded).length;
+    // Each occurrence by the details blocks that hold it: find maps the j-th occurrence in one
+    // block to the j-th one the DOM shows there.
+    const projected = locateFindOccurrences(segments, folded)
+      .map((occurrence) => occurrence.segment.details.join("."))
+      .join("|");
+    const rendered = findScopeOccurrences(scope, folded)
+      .map((occurrence) => occurrence.segment.details.join("."))
+      .join("|");
     if (projected !== rendered) {
-      mismatches.push(`${JSON.stringify(query)}: projected ${projected}, rendered ${rendered}`);
+      mismatches.push(`${JSON.stringify(query)}: projected [${projected}], rendered [${rendered}]`);
     }
   }
   return mismatches;

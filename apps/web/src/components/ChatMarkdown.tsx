@@ -463,7 +463,11 @@ function MarkdownDetails({
         {summaryContent ? <span>{summaryContent}</span> : <span data-find-ignore="">Details</span>}
       </CollapsibleTrigger>
       <CollapsiblePanel>
-        <div className="pb-3 ps-6 text-foreground/80" data-markdown-details-content="">
+        <div
+          className="pb-3 ps-6 text-foreground/80"
+          // Find in thread reads the ordinal to tell which block a match is in.
+          data-markdown-details-content={ordinal ?? ""}
+        >
           {content}
         </div>
       </CollapsiblePanel>

@@ -9,6 +9,7 @@ import {
   buildProposedPlanMarkdownFilename,
   downloadPlanAsTextFile,
   normalizePlanMarkdownForExport,
+  proposedPlanCanCollapse,
   proposedPlanTitle,
   stripDisplayedPlanMarkdown,
 } from "../../proposedPlan";
@@ -87,8 +88,7 @@ export const ProposedPlanCard = memo(function ProposedPlanCard({
   const savePathInputId = useId();
   const authoredTitle = proposedPlanTitle(planMarkdown);
   const title = authoredTitle ?? "Proposed plan";
-  const lineCount = planMarkdown.split("\n").length;
-  const canCollapse = planMarkdown.length > 900 || lineCount > 20;
+  const canCollapse = proposedPlanCanCollapse(planMarkdown);
   const displayedPlanMarkdown = stripDisplayedPlanMarkdown(planMarkdown);
   const collapsedPreview = canCollapse
     ? buildCollapsedProposedPlanPreviewMarkdown(planMarkdown, { maxLines: 10 })
