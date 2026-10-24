@@ -15,6 +15,7 @@ import {
   useEffectEvent,
   useId,
   useImperativeHandle,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -58,7 +59,7 @@ import {
   type AnnotatableCodeViewHandle,
   type AnnotatableCodeViewProps,
 } from "./AnnotatableCodeView";
-import { DiffFileList } from "./DiffFileList";
+import { DiffFileFilterControls, DiffFileList, DiffFilePicker } from "./DiffFileList";
 import { useCommentDraftStore } from "./useCommentDraftStore";
 
 export interface DiffCompareViewProps {
@@ -126,6 +127,20 @@ export function DiffCompareView(props: DiffCompareViewProps) {
     [threadRef],
   );
 
+  // Below 640 px the list column would squeeze the two versions, so it becomes a picker.
+  const rootRef = useRef<HTMLDivElement>(null);
+  const [narrow, setNarrow] = useState(false);
+  useLayoutEffect(() => {
+    const root = rootRef.current;
+    if (!root || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(([entry]) => {
+      const width = entry?.contentRect.width ?? 0;
+      setNarrow(width > 0 && width < NARROW_COMPARE_WIDTH);
+    });
+    observer.observe(root);
+    return () => observer.disconnect();
+  }, []);
+
   // F7 and Shift+F7 by default, while focus is anywhere in Compare: the list or the diff.
   const keybindings = useAtomValue(primaryServerKeybindingsAtom);
   const paneRef = useRef<ComparePaneHandle>(null);
@@ -137,17 +152,37 @@ export function DiffCompareView(props: DiffCompareViewProps) {
   };
 
   return (
-    <div className="flex min-h-0 min-w-0 flex-1" onKeyDown={onKeyDown}>
-      <DiffFileList
-        className="w-60 shrink-0 border-r border-border"
-        filters={filters}
-        rows={visibleRows}
-        selectedKey={selectedRow?.key ?? null}
-        totalCount={rows.length}
-        visibleCount={visibleRows.length}
-        onFiltersChange={setFilters}
-        onSelect={selectRow}
-      />
+    <div
+      ref={rootRef}
+      className={cn("flex min-h-0 min-w-0 flex-1", narrow && "flex-col")}
+      onKeyDown={onKeyDown}
+    >
+      {narrow ? (
+        <>
+          <DiffFileFilterControls
+            filters={filters}
+            totalCount={rows.length}
+            visibleCount={visibleRows.length}
+            onFiltersChange={setFilters}
+          />
+          <DiffFilePicker
+            rows={visibleRows}
+            selectedKey={selectedRow?.key ?? null}
+            onSelect={selectRow}
+          />
+        </>
+      ) : (
+        <DiffFileList
+          className="w-60 shrink-0 border-r border-border"
+          filters={filters}
+          rows={visibleRows}
+          selectedKey={selectedRow?.key ?? null}
+          totalCount={rows.length}
+          visibleCount={visibleRows.length}
+          onFiltersChange={setFilters}
+          onSelect={selectRow}
+        />
+      )}
       <div className="flex min-h-0 min-w-0 flex-1 flex-col">
         {selectedRow ? (
           // Keyed by path: a refreshed patch keeps the pane, and what it learned about the file.
@@ -167,6 +202,8 @@ export function DiffCompareView(props: DiffCompareViewProps) {
     </div>
   );
 }
+
+const NARROW_COMPARE_WIDTH = 640;
 
 const DIFF_FOCUS_CONTEXT = {
   diffFocus: true,
