@@ -148,6 +148,17 @@ pub fn register_device_rpc(registry: &mut RpcRegistry, devices: DeviceManager) {
     );
     register_op(
         registry,
+        "device.refreshCatalog",
+        &devices,
+        |devices, _payload| async move {
+            // Bypasses the 30 s discovery cache, so a device created since then is listed;
+            // the catalog stream publishes what changed.
+            devices.refresh_now().await;
+            Ok(Value::Null)
+        },
+    );
+    register_op(
+        registry,
         "device.close",
         &devices,
         |devices, payload| async move {
@@ -267,7 +278,10 @@ mod tests {
     use super::*;
     use crate::{
         ServerConfig, ServerHandle, ServerRuntime,
-        device::{android::testing::ManagerFixture, catalog::DeviceState},
+        device::{
+            android::testing::{FakeSdk, ManagerFixture},
+            catalog::DeviceState,
+        },
     };
 
     type Socket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
@@ -439,6 +453,35 @@ mod tests {
             .expect("device closes");
         harness
             .chunk_until(&catalog, |value| value["devices"][0]["state"] == "stopped")
+            .await;
+        harness.stop().await;
+        fixture.manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn refresh_catalog_lists_an_image_added_since_the_last_discovery() {
+        let mut fixture = ManagerFixture::ready(&["Pixel"]).await;
+        let mut harness = Harness::start(fixture.manager.clone()).await;
+        let catalog = harness.request("device.subscribeCatalog", json!({})).await;
+        harness
+            .chunk_until(&catalog, |value| {
+                value["platforms"][0]["images"][0]["id"] == "Pixel"
+            })
+            .await;
+        // An AVD created in Android Studio while that discovery is still cached.
+        fixture.sdk = std::mem::replace(&mut fixture.sdk, FakeSdk::new())
+            .avds(&["Pixel", "Tablet"])
+            .write();
+        assert_eq!(
+            harness.call("device.refreshCatalog", json!({})).await,
+            Ok(Value::Null)
+        );
+        harness
+            .chunk_until(&catalog, |value| {
+                value["platforms"][0]["images"]
+                    .as_array()
+                    .is_some_and(|images| images.iter().any(|image| image["id"] == "Tablet"))
+            })
             .await;
         harness.stop().await;
         fixture.manager.shutdown().await;
@@ -621,6 +664,7 @@ mod tests {
         let mut harness = Harness::start(fixture.manager.clone()).await;
         for (method, payload) in [
             ("device.subscribeCatalog", json!({})),
+            ("device.refreshCatalog", json!({})),
             ("device.subscribeFrames", json!({ "deviceId": "d" })),
             (
                 "device.open",

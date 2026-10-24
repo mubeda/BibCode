@@ -46,6 +46,7 @@ vi.mock("./deviceAvailability", () => ({
 vi.mock("../../state/device", () => ({
   deviceEnvironment: {
     catalog: (args: unknown) => ({ __q: "catalog", args }),
+    refreshCatalog: { __cmd: "refreshCatalog" },
     open: { __cmd: "open" },
     close: { __cmd: "close" },
     rotate: { __cmd: "rotate" },
@@ -716,6 +717,58 @@ describe("DevicePanel", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("looks for devices again from the toolbar, one refresh at a time (#169)", async () => {
+    let settle: (result: CommandResult) => void = () => {};
+    h.results.refreshCatalog = () =>
+      new Promise<CommandResult>((resolve) => {
+        settle = resolve;
+      });
+    const container = await render();
+    const refresh = button(container, "Refresh devices");
+    await click(refresh);
+    expect(h.calls).toEqual([
+      { command: "refreshCatalog", input: { environmentId: ENVIRONMENT_ID, input: {} } },
+    ]);
+    // Still focusable while it looks, so a keyboard user does not lose their place.
+    expect(refresh.disabled).toBe(false);
+    expect(refresh.getAttribute("aria-busy")).toBe("true");
+    await click(refresh);
+    expect(h.calls).toHaveLength(1);
+
+    await act(async () => settle({ _tag: "Success", value: null }));
+    expect(refresh.getAttribute("aria-busy")).toBeNull();
+    await click(refresh);
+    expect(h.calls).toHaveLength(2);
+  });
+
+  it("says when looking for devices failed", async () => {
+    h.results.refreshCatalog = { _tag: "Failure", error: undefined };
+    const container = await render();
+    await click(button(container, "Refresh devices"));
+    expect(container.querySelector("[role='alert']")?.textContent).toContain(
+      "Could not look for devices. Try again.",
+    );
+  });
+
+  it("offers Refresh when no virtual device exists yet (#169)", async () => {
+    withCatalog(
+      catalog({
+        availability: {
+          kind: "noAvds",
+          message:
+            "This server's Android SDK has no virtual devices. Create one in Android Studio's Device Manager.",
+        },
+        images: [],
+      }),
+    );
+    const container = await render();
+    expect(container.textContent).toContain("This server's Android SDK has no virtual devices.");
+    await click(button(container, "Refresh devices"));
+    expect(h.calls).toEqual([
+      { command: "refreshCatalog", input: { environmentId: ENVIRONMENT_ID, input: {} } },
+    ]);
   });
 
   it("says previews are off, with a way to Settings, while the setting is off", async () => {
