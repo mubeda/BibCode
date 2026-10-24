@@ -146,13 +146,13 @@ describe("diff file rows", () => {
 describe("compare plans", () => {
   it("reads a blob and the working file in the working tree, and two blobs elsewhere", () => {
     const [modified] = rows(MODIFIED);
-    expect(planCompareFile(modified!, "working-tree", { legacyTurnPatch: false })).toEqual({
+    expect(planCompareFile(modified!, "working-tree", { liveTurnPatches: false })).toEqual({
       kind: "versions",
       old: { _tag: "blob", oid: OLD_ID },
       new: { _tag: "worktree", path: "src/app.ts", expectedOid: NEW_ID },
     });
     for (const scope of ["branch", "turn"] as const) {
-      expect(planCompareFile(modified!, scope, { legacyTurnPatch: false })).toEqual({
+      expect(planCompareFile(modified!, scope, { liveTurnPatches: false })).toEqual({
         kind: "versions",
         old: { _tag: "blob", oid: OLD_ID },
         new: { _tag: "blob", oid: NEW_ID },
@@ -163,7 +163,7 @@ describe("compare plans", () => {
   it("requests nothing for files the patch already explains", () => {
     const plans = rows(MIXED)
       .slice(1)
-      .map((row) => planCompareFile(row, "working-tree", { legacyTurnPatch: false }));
+      .map((row) => planCompareFile(row, "working-tree", { liveTurnPatches: false }));
     expect(plans).toEqual([
       { kind: "patch", reason: "added" },
       { kind: "patch", reason: "deleted" },
@@ -186,10 +186,10 @@ describe("compare plans", () => {
 
   it("falls back to hunks only for abbreviated IDs, naming why", () => {
     const [short] = rows(MODIFIED.replace(`${OLD_ID}..${NEW_ID}`, "1111111..2222222"));
-    const older = planCompareFile(short!, "working-tree", { legacyTurnPatch: false });
+    const older = planCompareFile(short!, "working-tree", { liveTurnPatches: false });
     expect(older).toEqual({ kind: "patch", reason: "abbreviated-ids" });
     expect(describePatchOnlyReason("abbreviated-ids")).toBe("Full files need a newer server.");
-    expect(planCompareFile(short!, "turn", { legacyTurnPatch: true })).toEqual({
+    expect(planCompareFile(short!, "turn", { liveTurnPatches: true })).toEqual({
       kind: "patch",
       reason: "legacy-turn",
     });

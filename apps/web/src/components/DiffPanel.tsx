@@ -485,9 +485,9 @@ export default function DiffPanel({
     : selectedGitScope === "unstaged"
       ? "working-tree"
       : "branch";
-  // This server reports `truncated` on every turn patch, live or stored; an older one never
-  // does. Abbreviated IDs with the key present therefore mean a stored patch.
-  const legacyTurnPatch =
+  // A server that computes turn patches live reports `truncated` on every one, live or stored;
+  // an older one never does. Short IDs with the key present therefore mean a stored patch.
+  const liveTurnPatches =
     selectedTurn !== undefined &&
     activeCheckpointDiff.data !== null &&
     activeCheckpointDiff.data !== undefined &&
@@ -529,9 +529,14 @@ export default function DiffPanel({
       contextLines: compareContextLines,
       contextFiles: contextRenderablePatch?.kind === "files" ? contextRenderablePatch.files : null,
       contextPending: wantsContextPatch && contextPending,
-      // An older server ignores the count and does not echo it.
-      contextSupported:
-        contextPatch === null || contextPatch === undefined ? null : "contextLines" in contextPatch,
+      // A patch that ignored the count does not echo it: a stored turn patch on a current
+      // server (which reports `truncated`), or any patch from an older one.
+      contextUnavailableReason:
+        contextPatch === null || contextPatch === undefined || "contextLines" in contextPatch
+          ? null
+          : selectedTurn !== undefined && "truncated" in contextPatch
+            ? "Saved before full files were kept, so its context lines can't change."
+            : "Update the server to change context lines.",
       onLinesChange: updateCompareLines,
       onContextLinesChange: updateCompareContextLines,
     }),
@@ -541,6 +546,7 @@ export default function DiffPanel({
       contextPatch,
       contextPending,
       contextRenderablePatch,
+      selectedTurn,
       updateCompareContextLines,
       updateCompareLines,
       wantsContextPatch,
@@ -976,7 +982,7 @@ export default function DiffPanel({
                 cwd={activeCwd}
                 environmentId={activeThread.environmentId}
                 files={renderableFiles}
-                legacyTurnPatch={legacyTurnPatch}
+                liveTurnPatches={liveTurnPatches}
                 lineFilter={compareLineFilter}
                 options={compareOptions}
                 scope={compareScope}

@@ -159,7 +159,12 @@ const SUBMODULE_MODE = "160000";
 export function planCompareFile(
   row: DiffFileRow,
   scope: DiffCompareScope,
-  options: { readonly legacyTurnPatch: boolean },
+  /**
+   * `liveTurnPatches`: the server computes turn patches from checkpoint refs, which print full
+   * IDs, so short IDs in a turn patch mean one it stored before. It says so by reporting
+   * `truncated` on every turn patch.
+   */
+  options: { readonly liveTurnPatches: boolean },
 ): ComparePlan {
   const { fileDiff } = row;
   if (fileDiff.mode === SUBMODULE_MODE || fileDiff.prevMode === SUBMODULE_MODE) {
@@ -186,7 +191,7 @@ export function planCompareFile(
   if (!isFullObjectId(fileDiff.prevObjectId) || !isFullObjectId(fileDiff.newObjectId)) {
     return {
       kind: "patch",
-      reason: scope === "turn" && options.legacyTurnPatch ? "legacy-turn" : "abbreviated-ids",
+      reason: scope === "turn" && options.liveTurnPatches ? "legacy-turn" : "abbreviated-ids",
     };
   }
   return {
