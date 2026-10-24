@@ -43,6 +43,7 @@ import { useClientSettings, useUpdateClientSettings } from "../hooks/useSettings
 import { formatShortTimestamp } from "../timestampFormat";
 import { DiffPanelLoadingState, DiffPanelShell, type DiffPanelMode } from "./DiffPanelShell";
 import { AnnotatableCodeView, type AnnotatableCodeViewHandle } from "./diffs/AnnotatableCodeView";
+import { DiffCompareView } from "./diffs/DiffCompareView";
 import { ToggleGroup, Toggle } from "./ui/toggle-group";
 import { Switch } from "./ui/switch";
 import {
@@ -200,6 +201,7 @@ export default function DiffPanel({
   // Remembered across reloads and restarts, unlike wrap and whitespace, which reset to their
   // Settings defaults.
   const diffRenderMode = settings.diffRenderMode;
+  const diffViewMode = settings.diffViewMode;
   const [wordWrap, setWordWrap] = useState(settings.wordWrap);
   const [diffIgnoreWhitespace, setDiffIgnoreWhitespace] = useState(settings.diffIgnoreWhitespace);
   const [baseRefQuery, setBaseRefQuery] = useState("");
@@ -430,6 +432,33 @@ export default function DiffPanel({
         compactPartialHunkOffsets: selectedTurnId === null,
       }),
     [resolvedTheme, selectedPatch, selectedTurnId],
+  );
+  const compareScope = selectedTurn
+    ? "turn"
+    : selectedGitScope === "unstaged"
+      ? "working-tree"
+      : "branch";
+  // This server reports `truncated` on every turn patch, live or stored; an older one never
+  // does. Abbreviated IDs with the key present therefore mean a stored patch.
+  const legacyTurnPatch =
+    selectedTurn !== undefined &&
+    activeCheckpointDiff.data !== null &&
+    activeCheckpointDiff.data !== undefined &&
+    "truncated" in activeCheckpointDiff.data;
+  const revalidateSelectedPatch = useCallback(() => {
+    // Only the working tree has a side read from disk, so only its patch can go stale.
+    if (selectedTurnId === null) revalidateBranchDiffPreview();
+  }, [revalidateBranchDiffPreview, selectedTurnId]);
+  const compareOptions = useMemo(
+    () => ({
+      lineDiffType: "none" as const,
+      overflow: wordWrap ? ("wrap" as const) : ("scroll" as const),
+      theme: resolveDiffThemeName(resolvedTheme),
+      themeType: resolvedTheme as DiffThemeType,
+      unsafeCSS: DIFF_PANEL_UNSAFE_CSS,
+      layout: { paddingTop: 0, paddingBottom: 8, gap: 0 },
+    }),
+    [resolvedTheme, wordWrap],
   );
   const renderableFiles = useMemo(() => {
     if (!renderablePatch || renderablePatch.kind !== "files") {
@@ -703,24 +732,46 @@ export default function DiffPanel({
       </div>
       <div className="flex shrink-0 items-center gap-1 [-webkit-app-region:no-drag]">
         <ToggleGroup
+          aria-label="Diff view"
           className="shrink-0"
           variant="outline"
           size="xs"
-          value={[diffRenderMode]}
+          value={[diffViewMode]}
           onValueChange={(value) => {
             const next = value[0];
-            if ((next === "stacked" || next === "split") && next !== diffRenderMode) {
-              updateClientSettings({ diffRenderMode: next });
+            if ((next === "changes" || next === "compare") && next !== diffViewMode) {
+              updateClientSettings({ diffViewMode: next });
             }
           }}
         >
-          <Toggle aria-label="Stacked diff view" value="stacked">
-            <Rows3Icon className="size-3" />
+          <Toggle className="px-2 text-xs" value="changes">
+            Changes
           </Toggle>
-          <Toggle aria-label="Split diff view" value="split">
-            <Columns2Icon className="size-3" />
+          <Toggle className="px-2 text-xs" value="compare">
+            Compare
           </Toggle>
         </ToggleGroup>
+        {diffViewMode === "changes" ? (
+          <ToggleGroup
+            className="shrink-0"
+            variant="outline"
+            size="xs"
+            value={[diffRenderMode]}
+            onValueChange={(value) => {
+              const next = value[0];
+              if ((next === "stacked" || next === "split") && next !== diffRenderMode) {
+                updateClientSettings({ diffRenderMode: next });
+              }
+            }}
+          >
+            <Toggle aria-label="Stacked diff view" value="stacked">
+              <Rows3Icon className="size-3" />
+            </Toggle>
+            <Toggle aria-label="Split diff view" value="split">
+              <Columns2Icon className="size-3" />
+            </Toggle>
+          </ToggleGroup>
+        ) : null}
         <Tooltip>
           <TooltipTrigger
             render={
@@ -822,6 +873,25 @@ export default function DiffPanel({
                   </p>
                 </div>
               )
+            ) : renderablePatch.kind === "files" && diffViewMode === "compare" && activeCwd ? (
+              <DiffCompareView
+                composerDraftTarget={composerDraftTarget}
+                cwd={activeCwd}
+                environmentId={activeThread.environmentId}
+                files={renderableFiles}
+                legacyTurnPatch={legacyTurnPatch}
+                options={compareOptions}
+                scope={compareScope}
+                sectionId={reviewSectionId}
+                sectionTitle={reviewSectionTitle}
+                threadRef={
+                  activeThreadRef ?? {
+                    environmentId: activeThread.environmentId,
+                    threadId: activeThread.id,
+                  }
+                }
+                onRevalidatePatch={revalidateSelectedPatch}
+              />
             ) : renderablePatch.kind === "files" ? (
               <div
                 className="min-h-0 flex-1"

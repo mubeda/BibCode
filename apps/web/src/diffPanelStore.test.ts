@@ -3,6 +3,8 @@ import { EnvironmentId, ThreadId, TurnId } from "@bibcode/contracts";
 import { beforeEach, describe, expect, it } from "vite-plus/test";
 
 import {
+  selectThreadCompareFile,
+  selectThreadCompareFilters,
   selectThreadDiffPanelRefreshRequest,
   selectThreadDiffPanelSelection,
   useDiffPanelStore,
@@ -16,6 +18,8 @@ describe("diffPanelStore", () => {
       byThreadKey: {},
       branchBaseRefByThreadKey: {},
       gitRefreshRequestByThreadKey: {},
+      compareFileByThreadKey: {},
+      compareFiltersByThreadKey: {},
     }),
   );
 
@@ -149,5 +153,39 @@ describe("diffPanelStore", () => {
     const before = useDiffPanelStore.getState();
     useDiffPanelStore.getState().removeThread(THREAD_REF);
     expect(useDiffPanelStore.getState()).toBe(before);
+  });
+
+  it("remembers Compare's file per thread, and its filters only in memory", () => {
+    const store = useDiffPanelStore.getState();
+    expect(selectThreadCompareFile(store.compareFileByThreadKey, THREAD_REF)).toBeNull();
+    expect(selectThreadCompareFilters(store.compareFiltersByThreadKey, THREAD_REF)).toEqual({
+      status: "all",
+      query: "",
+    });
+    store.selectCompareFile(THREAD_REF, "src/app.ts");
+    store.setCompareFilters(THREAD_REF, { status: "added", query: "app" });
+
+    const state = useDiffPanelStore.getState();
+    expect(selectThreadCompareFile(state.compareFileByThreadKey, THREAD_REF)).toBe("src/app.ts");
+    expect(selectThreadCompareFilters(state.compareFiltersByThreadKey, THREAD_REF)).toEqual({
+      status: "added",
+      query: "app",
+    });
+    const persisted = useDiffPanelStore.persist.getOptions().partialize?.(state) as Record<
+      string,
+      unknown
+    >;
+    expect(persisted).toHaveProperty("compareFileByThreadKey", {
+      ["environment-1:thread-1"]: "src/app.ts",
+    });
+    expect(persisted, "a reload never opens Compare with files hidden").not.toHaveProperty(
+      "compareFiltersByThreadKey",
+    );
+
+    useDiffPanelStore.getState().removeThread(THREAD_REF);
+    expect(useDiffPanelStore.getState()).toMatchObject({
+      compareFileByThreadKey: {},
+      compareFiltersByThreadKey: {},
+    });
   });
 });

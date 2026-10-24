@@ -1,4 +1,13 @@
-import { useLayoutEffect, useRef, useState, type CSSProperties, type ReactNode } from "react";
+import {
+  useImperativeHandle,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type CSSProperties,
+  type KeyboardEventHandler,
+  type ReactNode,
+  type Ref,
+} from "react";
 
 import { cn } from "~/lib/utils";
 
@@ -46,6 +55,11 @@ export function visibleRowRange(
   };
 }
 
+/** Scrolls a row into view, mounting it if it was outside the window. */
+export interface WindowedListHandle {
+  scrollToIndex: (index: number) => void;
+}
+
 interface WindowedListProps<T> {
   items: readonly T[];
   /** Every row's fixed height in pixels; it must match the rendered row. */
@@ -58,6 +72,10 @@ interface WindowedListProps<T> {
   "aria-label"?: string;
   /** The opaque surface under the rows, for LCD text on Linux WebKit. */
   textSurface?: "background" | "card" | "sidebar" | "popover";
+  /** For a listbox that keeps focus on the scroller and moves its active row with keys. */
+  listRef?: Ref<WindowedListHandle>;
+  onKeyDown?: KeyboardEventHandler<HTMLDivElement>;
+  "aria-activedescendant"?: string;
 }
 
 /**
@@ -75,6 +93,23 @@ export function WindowedList<T>(props: WindowedListProps<T>) {
   const total = offsets[offsets.length - 1]!;
   const { start, end } = visibleRowRange(offsets, viewport.scrollTop, viewport.height);
   const indices = Array.from({ length: end - start }, (_, index) => start + index);
+  useImperativeHandle(
+    props.listRef,
+    () => ({
+      scrollToIndex: (index) => {
+        const scroller = scrollerRef.current;
+        const top = offsets[index];
+        const bottom = offsets[index + 1];
+        if (!scroller || top === undefined || bottom === undefined) return;
+        const visibleBottom = scroller.scrollTop + scroller.clientHeight;
+        if (top < scroller.scrollTop) scroller.scrollTop = top;
+        else if (bottom > visibleBottom) scroller.scrollTop = bottom - scroller.clientHeight;
+        else return;
+        setViewport((current) => ({ ...current, scrollTop: scroller.scrollTop }));
+      },
+    }),
+    [offsets],
+  );
   const focusedIndex =
     focusedKey === null ? -1 : items.findIndex((item) => itemKey(item) === focusedKey);
   if (focusedIndex !== -1 && (focusedIndex < start || focusedIndex >= end)) {
@@ -130,6 +165,8 @@ export function WindowedList<T>(props: WindowedListProps<T>) {
       style={props.style}
       role={props.role}
       aria-label={props["aria-label"]}
+      aria-activedescendant={props["aria-activedescendant"]}
+      onKeyDown={props.onKeyDown}
       onScroll={(event) => {
         // Re-render only when the window moves; the stored offset may lag by
         // less than a row, which the overscan absorbs.
