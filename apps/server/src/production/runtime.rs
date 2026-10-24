@@ -1042,7 +1042,8 @@ const MAX_UNTRACKED_REVIEW_FILES: usize = 500;
 const MAX_UNTRACKED_REVIEW_FILE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_UNTRACKED_REVIEW_TOTAL_BYTES: u64 = 32 * 1024 * 1024;
 /// Each review preview source is bounded like a Git Manager commit diff.
-const MAX_REVIEW_SOURCE_DIFF_BYTES: usize = crate::git::manager::graph::MAX_REASONABLE_DIFF_SIZE;
+pub(super) const MAX_REVIEW_SOURCE_DIFF_BYTES: usize =
+    crate::git::manager::graph::MAX_REASONABLE_DIFF_SIZE;
 
 /// Keeps a diff within `limit`, cut at the last complete file. A diff that was
 /// captured incompletely is always treated as truncated.
@@ -1101,17 +1102,18 @@ impl ReviewBackend for GitReviewBackend {
                 }));
             }
 
-            let ignore_whitespace = input.ignore_whitespace.unwrap_or(false);
-            let tracked_worktree = run_review_diff(
-                &input.cwd,
-                review_diff_args(ignore_whitespace, Some("HEAD"), false),
-            )
-            .await?;
+            crate::review::validate_review_diff_options(
+                input.base_ref.as_deref(),
+                input.context_lines,
+            )?;
+            let options = ReviewDiffOptions {
+                ignore_whitespace: input.ignore_whitespace.unwrap_or(false),
+                context_lines: input.context_lines,
+            };
+            let tracked_worktree =
+                run_review_diff(&input.cwd, review_diff_args(options, &["HEAD"], true)).await?;
             let untracked = if tracked_worktree.truncated {
-                BoundedReviewDiff {
-                    diff: String::new(),
-                    truncated: false,
-                }
+                BoundedReviewDiff::empty()
             } else {
                 untracked_review_diff(
                     &input.cwd,
@@ -1129,39 +1131,38 @@ impl ReviewBackend for GitReviewBackend {
             let branch_diff = match (&base_ref, &status.ref_name) {
                 (Some(base_ref), Some(_)) => {
                     let range = format!("{base_ref}...HEAD");
-                    run_review_diff(
-                        &input.cwd,
-                        review_diff_args(ignore_whitespace, Some(&range), true),
-                    )
-                    .await?
+                    run_review_diff(&input.cwd, review_diff_args(options, &[&range], false)).await?
                 }
-                _ => BoundedReviewDiff {
-                    diff: String::new(),
-                    truncated: false,
-                },
+                _ => BoundedReviewDiff::empty(),
             };
             let sources = vec![
-                review_source(
-                    "working-tree",
-                    "working-tree",
-                    "Dirty worktree",
-                    Some("HEAD".to_owned()),
-                    None,
-                    working_tree_diff,
-                    tracked_worktree.truncated || untracked.truncated || working_tree_truncated,
-                ),
-                review_source(
-                    "branch-range",
-                    "branch-range",
-                    base_ref.as_ref().map_or_else(
-                        || "Against base branch".to_owned(),
-                        |base| format!("Against {base}"),
-                    ),
-                    base_ref,
-                    Some(status.ref_name.unwrap_or_else(|| "HEAD".to_owned())),
-                    branch_diff.diff,
-                    branch_diff.truncated,
-                ),
+                ReviewSource {
+                    context_lines: options.context_lines,
+                    ..review_source(
+                        "working-tree",
+                        "working-tree",
+                        "Dirty worktree",
+                        Some("HEAD".to_owned()),
+                        None,
+                        working_tree_diff,
+                        tracked_worktree.truncated || untracked.truncated || working_tree_truncated,
+                    )
+                },
+                ReviewSource {
+                    context_lines: options.context_lines,
+                    ..review_source(
+                        "branch-range",
+                        "branch-range",
+                        base_ref.as_ref().map_or_else(
+                            || "Against base branch".to_owned(),
+                            |base| format!("Against {base}"),
+                        ),
+                        base_ref,
+                        Some(status.ref_name.unwrap_or_else(|| "HEAD".to_owned())),
+                        branch_diff.diff,
+                        branch_diff.truncated,
+                    )
+                },
             ];
             Ok(Some(ReviewDiffPreviewResult {
                 cwd: input.cwd.clone(),
@@ -1173,25 +1174,58 @@ impl ReviewBackend for GitReviewBackend {
 }
 
 /// One review preview source, bounded at the patch cap; `truncated` says later files were dropped.
-struct BoundedReviewDiff {
-    diff: String,
-    truncated: bool,
+pub(super) struct BoundedReviewDiff {
+    pub(super) diff: String,
+    pub(super) truncated: bool,
+    /// Whether Git exited successfully. A run the runner stopped at the cap is truncated, not
+    /// successful.
+    pub(super) succeeded: bool,
+    /// Git's exit code, when it exited rather than died of a signal.
+    pub(super) exit_code: Option<i32>,
 }
 
-fn review_diff_args(ignore_whitespace: bool, target: Option<&str>, three_dot: bool) -> Vec<String> {
+impl BoundedReviewDiff {
+    fn empty() -> Self {
+        Self {
+            diff: String::new(),
+            truncated: false,
+            succeeded: true,
+            exit_code: Some(0),
+        }
+    }
+}
+
+/// The diff options a review or turn patch shares.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct ReviewDiffOptions {
+    pub(super) ignore_whitespace: bool,
+    /// `-U<N>`, already checked to be at most `MAX_REVIEW_CONTEXT_LINES`.
+    pub(super) context_lines: Option<u8>,
+}
+
+/// `git diff` arguments for a review or turn patch. `--full-index` prints whole object IDs, so
+/// a client can read either side of a file by its blob ID. `pathspec_separator` ends the
+/// revisions with `--`.
+pub(super) fn review_diff_args(
+    options: ReviewDiffOptions,
+    revisions: &[&str],
+    pathspec_separator: bool,
+) -> Vec<String> {
     let mut args = vec![
         "diff".to_owned(),
         "--no-ext-diff".to_owned(),
         "--patch".to_owned(),
         "--minimal".to_owned(),
+        "--full-index".to_owned(),
     ];
-    if ignore_whitespace {
+    if options.ignore_whitespace {
         args.push("--ignore-all-space".to_owned());
     }
-    if let Some(target) = target {
-        args.push(target.to_owned());
+    if let Some(lines) = options.context_lines {
+        args.push(format!("-U{lines}"));
     }
-    if !three_dot {
+    args.extend(revisions.iter().map(|revision| (*revision).to_owned()));
+    if pathspec_separator {
         args.push("--".to_owned());
     }
     args
@@ -1219,7 +1253,22 @@ async fn spawn_review_git(
     .await
 }
 
-async fn run_review_diff(cwd: &str, args: Vec<String>) -> Result<BoundedReviewDiff, ReviewError> {
+/// Runs a review or turn `git diff` and keeps at most the patch cap of its output.
+///
+/// Dropping the future kills Git (`kill_on_drop`) and reports nothing: the request was
+/// cancelled.
+pub(super) async fn run_review_diff(
+    cwd: &str,
+    args: Vec<String>,
+) -> Result<BoundedReviewDiff, ReviewError> {
+    run_review_diff_bounded(cwd, args, MAX_REVIEW_SOURCE_DIFF_BYTES).await
+}
+
+async fn run_review_diff_bounded(
+    cwd: &str,
+    args: Vec<String>,
+    limit: usize,
+) -> Result<BoundedReviewDiff, ReviewError> {
     let mut child = spawn_review_git(review_git(|command| {
         command
             .args(["-C", cwd])
@@ -1232,9 +1281,26 @@ async fn run_review_diff(cwd: &str, args: Vec<String>) -> Result<BoundedReviewDi
     }))
     .await
     .map_err(|error| ReviewError::Backend(error.to_string()))?;
+    let started = std::time::Instant::now();
     let stdout = child.stdout.take().expect("piped git stdout");
-    let captured = capture_review_diff(stdout, MAX_REVIEW_SOURCE_DIFF_BYTES).await;
-    if !matches!(&captured, Ok((_, false))) {
+    let captured = capture_review_diff(stdout, limit).await;
+    settle_review_git(child, started, captured).await
+}
+
+/// Reaps a review Git child once its output is captured, and reports its exit.
+///
+/// The runner stops Git itself when the capture reached the cap or failed. That kill is a
+/// requested stop, so the Profiler does not read its SIGKILL as a crash.
+async fn settle_review_git(
+    mut child: tokio::process::Child,
+    started: std::time::Instant,
+    captured: std::io::Result<(String, bool)>,
+) -> Result<BoundedReviewDiff, ReviewError> {
+    use crate::diagnostics::profiler::exits;
+
+    let pid = child.id();
+    let requested = !matches!(&captured, Ok((_, false)));
+    if requested {
         // Stop git once the capture is complete or failed; `wait` reaps it.
         let _ = child.start_kill();
     }
@@ -1242,14 +1308,33 @@ async fn run_review_diff(cwd: &str, args: Vec<String>) -> Result<BoundedReviewDi
         .wait()
         .await
         .map_err(|error| ReviewError::Backend(error.to_string()))?;
+    if let Some(pid) = pid
+        && exits::watching()
+    {
+        exits::report_exit(
+            exits::Watch::Signals,
+            &exits::Exited {
+                kind: "command",
+                label: "git",
+                exe: "git",
+                pid,
+                started,
+            },
+            &status,
+            requested,
+        );
+    }
     let (diff, truncated) = captured.map_err(|error| ReviewError::Backend(error.to_string()))?;
+    let succeeded = status.success();
     Ok(BoundedReviewDiff {
-        diff: if status.success() || truncated {
+        diff: if succeeded || truncated {
             diff
         } else {
             String::new()
         },
         truncated,
+        succeeded,
+        exit_code: status.code(),
     })
 }
 
@@ -1280,6 +1365,7 @@ fn review_source(
         diff,
         diff_hash,
         truncated,
+        context_lines: None,
     }
 }
 
@@ -1376,6 +1462,8 @@ async fn untracked_review_diff(cwd: &str, limit: usize) -> Result<BoundedReviewD
     Ok(BoundedReviewDiff {
         diff: diffs.join("\n"),
         truncated,
+        succeeded: true,
+        exit_code: Some(0),
     })
 }
 
@@ -3175,6 +3263,7 @@ mod tests {
             cwd: repository.path().to_string_lossy().into_owned(),
             base_ref: None,
             ignore_whitespace: Some(false),
+            context_lines: None,
         };
         let preview = GitReviewBackend
             .get_diff_preview(&input)
@@ -3224,6 +3313,7 @@ mod tests {
             cwd: repository.path().to_string_lossy().into_owned(),
             base_ref: None,
             ignore_whitespace: Some(false),
+            context_lines: None,
         };
         for (mnemonic, no_prefix, source, destination) in [
             ("true", "false", "a/", "b/"),
@@ -3260,19 +3350,55 @@ mod tests {
     #[test]
     fn review_diff_helpers_cover_empty_binary_text_and_whitespace_options() {
         assert_eq!(
-            review_diff_args(true, Some("main...HEAD"), true),
+            review_diff_args(
+                ReviewDiffOptions {
+                    ignore_whitespace: true,
+                    context_lines: None,
+                },
+                &["main...HEAD"],
+                false,
+            ),
             vec![
                 "diff",
                 "--no-ext-diff",
                 "--patch",
                 "--minimal",
+                "--full-index",
                 "--ignore-all-space",
                 "main...HEAD",
             ]
         );
         assert_eq!(
-            review_diff_args(false, None, false),
-            vec!["diff", "--no-ext-diff", "--patch", "--minimal", "--"]
+            review_diff_args(ReviewDiffOptions::default(), &[], true),
+            vec![
+                "diff",
+                "--no-ext-diff",
+                "--patch",
+                "--minimal",
+                "--full-index",
+                "--"
+            ]
+        );
+        assert_eq!(
+            review_diff_args(
+                ReviewDiffOptions {
+                    ignore_whitespace: false,
+                    context_lines: Some(0),
+                },
+                &["from^{commit}", "to^{commit}"],
+                true,
+            ),
+            vec![
+                "diff",
+                "--no-ext-diff",
+                "--patch",
+                "--minimal",
+                "--full-index",
+                "-U0",
+                "from^{commit}",
+                "to^{commit}",
+                "--",
+            ]
         );
         assert_eq!(join_review_diffs("", ""), "");
         assert_eq!(join_review_diffs("left\n", "right\n"), "left\nright");
@@ -3294,6 +3420,7 @@ mod tests {
             true,
         );
         assert_eq!(source.id, "working-tree");
+        assert_eq!(source.context_lines, None);
         assert_eq!(source.diff_hash.len(), 64);
         assert!(source.truncated);
         assert!(now_millis() > 0);
@@ -3308,6 +3435,7 @@ mod tests {
                 cwd: directory.path().to_string_lossy().into_owned(),
                 base_ref: None,
                 ignore_whitespace: None,
+                context_lines: None,
             })
             .await
             .expect("review succeeds")
@@ -3334,7 +3462,7 @@ mod tests {
                 assert_eq!(
                     run_review_diff(
                         &directory.to_string_lossy(),
-                        review_diff_args(false, Some("HEAD"), false),
+                        review_diff_args(ReviewDiffOptions::default(), &["HEAD"], true),
                     )
                     .await
                     .expect("tracked review diff")
@@ -3486,9 +3614,12 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     async fn review_both_diffs(repository: &str) {
-        let tracked = run_review_diff(repository, review_diff_args(false, None, false))
-            .await
-            .expect("tracked review diff");
+        let tracked = run_review_diff(
+            repository,
+            review_diff_args(ReviewDiffOptions::default(), &[], true),
+        )
+        .await
+        .expect("tracked review diff");
         assert!(tracked.diff.contains("+two"), "{}", tracked.diff);
         let untracked = untracked_review_diff(repository, MAX_REVIEW_SOURCE_DIFF_BYTES)
             .await
@@ -3591,9 +3722,12 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         assert!(
-            run_review_diff("\0", review_diff_args(false, Some("HEAD"), false))
-                .await
-                .is_err()
+            run_review_diff(
+                "\0",
+                review_diff_args(ReviewDiffOptions::default(), &["HEAD"], true)
+            )
+            .await
+            .is_err()
         );
         assert!(
             untracked_review_diff("\0", MAX_REVIEW_SOURCE_DIFF_BYTES)
@@ -3632,6 +3766,7 @@ mod tests {
                 cwd: repository.path().to_string_lossy().into_owned(),
                 base_ref: Some("main".to_owned()),
                 ignore_whitespace: None,
+                context_lines: None,
             })
             .await
             .expect("detached review")
@@ -3708,5 +3843,198 @@ mod tests {
             .expect("capture bounded diff");
         assert!(truncated);
         assert_eq!(diff, first, "the incomplete last file is discarded");
+    }
+
+    /// A repository whose `lines.txt` changed one line in the middle of twenty, committed as
+    /// `base` and then modified in the working tree.
+    fn review_context_repository() -> TempDir {
+        let repository = TempDir::new().expect("temporary repository");
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repository.path())
+                .output()
+                .expect("git starts");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "--quiet"]);
+        git(&["checkout", "--quiet", "-b", "main"]);
+        git(&["config", "user.email", "test@bibcode.local"]);
+        git(&["config", "user.name", "BiBCode Test"]);
+        let lines = (1..=20)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        std::fs::write(repository.path().join("lines.txt"), &lines).expect("base file");
+        git(&["add", "lines.txt"]);
+        git(&["commit", "--quiet", "-m", "base"]);
+        std::fs::write(
+            repository.path().join("lines.txt"),
+            lines.replace("line 10\n", "line ten\n"),
+        )
+        .expect("modified file");
+        repository
+    }
+
+    fn review_input(repository: &TempDir, context_lines: Option<u8>) -> ReviewDiffPreviewInput {
+        ReviewDiffPreviewInput {
+            cwd: repository.path().to_string_lossy().into_owned(),
+            base_ref: None,
+            ignore_whitespace: Some(false),
+            context_lines,
+        }
+    }
+
+    #[tokio::test]
+    async fn review_diffs_carry_full_object_ids_and_honour_context_lines() {
+        let repository = review_context_repository();
+        let service = ReviewService::new(Arc::new(GitReviewBackend));
+        let default = service
+            .get_diff_preview(review_input(&repository, None))
+            .await
+            .expect("default review");
+        let index_line = default.sources[0]
+            .diff
+            .lines()
+            .find(|line| line.starts_with("index "))
+            .expect("index line");
+        let ids = index_line["index ".len()..]
+            .split(' ')
+            .next()
+            .expect("object id range");
+        let (from, to) = ids.split_once("..").expect("two object ids");
+        for id in [from, to] {
+            assert!(
+                id.len() == 40 || id.len() == 64,
+                "the index line carries full object ids: {index_line}"
+            );
+        }
+        assert_eq!(default.sources[0].context_lines, None);
+        assert!(default.sources[0].diff.contains("@@ -7,7 +7,7 @@"));
+
+        let none = service
+            .get_diff_preview(review_input(&repository, Some(0)))
+            .await
+            .expect("zero context review");
+        assert!(none.sources[0].diff.contains("@@ -10 +10 @@"));
+        assert_eq!(none.sources[0].context_lines, Some(0));
+        let wide = service
+            .get_diff_preview(review_input(&repository, Some(7)))
+            .await
+            .expect("wide context review");
+        assert!(wide.sources[0].diff.contains("@@ -3,15 +3,15 @@"));
+        assert_eq!(wide.sources[0].context_lines, Some(7));
+        assert_eq!(wide.sources[1].context_lines, Some(7));
+        let encoded = serde_json::to_value(&default.sources[0]).expect("source encodes");
+        assert!(
+            encoded.get("contextLines").is_none(),
+            "an omitted count is not echoed"
+        );
+    }
+
+    #[tokio::test]
+    async fn review_diffs_refuse_out_of_range_context_and_option_like_base_refs() {
+        let repository = review_context_repository();
+        let service = ReviewService::new(Arc::new(GitReviewBackend));
+        assert!(matches!(
+            service
+                .get_diff_preview(review_input(&repository, Some(100)))
+                .await,
+            Err(ReviewError::InvalidRequest(_))
+        ));
+        assert!(
+            serde_json::from_value::<ReviewDiffPreviewInput>(json!({
+                "cwd": "/repo",
+                "baseRef": null,
+                "ignoreWhitespace": null,
+                "contextLines": -1,
+            }))
+            .is_err(),
+            "a negative count never decodes"
+        );
+
+        let output = repository.path().join("written-by-git.txt");
+        let mut input = review_input(&repository, None);
+        input.base_ref = Some(format!("--output={}", output.display()));
+        assert!(matches!(
+            service.get_diff_preview(input.clone()).await,
+            Err(ReviewError::InvalidRequest(_))
+        ));
+        assert!(matches!(
+            GitReviewBackend.get_diff_preview(&input).await,
+            Err(ReviewError::InvalidRequest(_))
+        ));
+        assert!(!output.exists(), "Git never saw the option");
+    }
+
+    /// A Git child that waits on its open stdin until it is killed.
+    fn blocking_git() -> tokio::process::Child {
+        let mut command = Command::new("git");
+        command
+            .args(["cat-file", "--batch"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        command.spawn().expect("git starts")
+    }
+
+    #[tokio::test]
+    async fn review_git_the_runner_stops_is_not_reported_as_a_crash() {
+        let exits = crate::diagnostics::profiler::exits::CapturedExits::start();
+        let repository = review_context_repository();
+        // Far more than a pipe holds, so Git is still writing when the runner stops it.
+        std::fs::write(
+            repository.path().join("lines.txt"),
+            "changed\n".repeat(256 * 1024),
+        )
+        .expect("large change");
+        let capped = run_review_diff_bounded(
+            &repository.path().to_string_lossy(),
+            review_diff_args(ReviewDiffOptions::default(), &["HEAD"], true),
+            16,
+        )
+        .await
+        .expect("capped review diff");
+        assert!(capped.truncated);
+        assert!(!capped.succeeded, "the runner killed Git at the cap");
+
+        let child = blocking_git();
+        let failed = settle_review_git(
+            child,
+            std::time::Instant::now(),
+            Err(std::io::Error::other("injected capture failure")),
+        )
+        .await;
+        assert!(failed.is_err());
+        assert!(
+            exits.take().is_empty(),
+            "a kill the runner asked for is a requested stop"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn review_git_killed_from_outside_is_reported_as_a_crash() {
+        let exits = crate::diagnostics::profiler::exits::CapturedExits::start();
+        let child = blocking_git();
+        let pid = child.id().expect("git pid");
+        // SAFETY: `pid` is the live, unreaped child spawned above.
+        assert_eq!(
+            unsafe { libc::kill(i32::try_from(pid).expect("pid fits"), libc::SIGKILL) },
+            0
+        );
+        let settled =
+            settle_review_git(child, std::time::Instant::now(), Ok((String::new(), false)))
+                .await
+                .expect("settled review diff");
+        assert!(!settled.succeeded);
+        assert_eq!(settled.exit_code, None);
+        let findings = exits.take();
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(findings[0].contains(&"git".to_owned()), "{findings:?}");
     }
 }

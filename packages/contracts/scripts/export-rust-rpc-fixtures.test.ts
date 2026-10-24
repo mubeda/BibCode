@@ -105,13 +105,13 @@ describe("RPC wire fixture exporter", () => {
     expect(manifest.expectedTopLevelStreamShapes).toBe(79);
     expect(manifest.expectedOrchestrationEventShapes).toBe(24);
     expect(manifest.streamShapeFixtures).toHaveLength(79);
-    expect(manifest.typedFailureFixtures).toHaveLength(335);
+    expect(manifest.typedFailureFixtures).toHaveLength(337);
     expect(manifest.staleMethodIdentifiers).toEqual([
       "projects.add",
       "projects.list",
       "projects.remove",
     ]);
-    expect(manifest.fixtures).toHaveLength(450);
+    expect(manifest.fixtures).toHaveLength(452);
     expect(manifest.fixtures).toContain("exit-response-too-large.json");
     expect(manifest.typedFailureFixtures).toContain("typed-failures/vcs__clone-04.json");
     expect(manifest.typedFailureFixtures).toEqual(
@@ -121,7 +121,7 @@ describe("RPC wire fixture exporter", () => {
       ]),
     );
     expect(manifest.fixtures).toEqual([...manifest.fixtures].toSorted());
-    expect(Object.keys(manifest.schemaFingerprints)).toHaveLength(414);
+    expect(Object.keys(manifest.schemaFingerprints)).toHaveLength(416);
 
     for (const relativePath of manifest.fixtures) {
       const contents = io.writes.get(NodePath.join(outputDirectory, relativePath));

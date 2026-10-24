@@ -1713,7 +1713,11 @@ export const WsOrchestrationDispatchCommandRpc = Rpc.make(
 export const WsOrchestrationGetTurnDiffRpc = Rpc.make(ORCHESTRATION_WS_METHODS.getTurnDiff, {
   payload: OrchestrationGetTurnDiffInput,
   success: OrchestrationRpcSchemas.getTurnDiff.output,
-  error: Schema.Union([OrchestrationGetTurnDiffError, EnvironmentRpcError]),
+  error: Schema.Union([
+    OrchestrationGetTurnDiffError,
+    WorkspaceUnavailableError,
+    EnvironmentRpcError,
+  ]),
 });
 
 export const WsOrchestrationGetFullThreadDiffRpc = Rpc.make(
@@ -1721,7 +1725,11 @@ export const WsOrchestrationGetFullThreadDiffRpc = Rpc.make(
   {
     payload: OrchestrationGetFullThreadDiffInput,
     success: OrchestrationRpcSchemas.getFullThreadDiff.output,
-    error: Schema.Union([OrchestrationGetFullThreadDiffError, EnvironmentRpcError]),
+    error: Schema.Union([
+      OrchestrationGetFullThreadDiffError,
+      WorkspaceUnavailableError,
+      EnvironmentRpcError,
+    ]),
   },
 );
 

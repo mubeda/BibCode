@@ -2496,6 +2496,7 @@ async fn review_accepts_projects_outside_server_root_and_returns_empty_sources()
             cwd: path_string(outside.path()),
             base_ref: None,
             ignore_whitespace: None,
+            context_lines: None,
         })
         .await
         .expect("review");

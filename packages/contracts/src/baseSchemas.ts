@@ -17,6 +17,14 @@ export const NonNegativeInt = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
 export const PositiveInt = Schema.Int.check(Schema.isGreaterThanOrEqualTo(1));
 export const PortSchema = Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 65535 }));
 
+/** The most context lines a diff request may ask Git for (`-U<N>`). */
+export const DIFF_CONTEXT_LINES_MAX = 99;
+/** Lines of context around each change in a review or turn patch. */
+export const DiffContextLines = Schema.Int.check(
+  Schema.isBetween({ minimum: 0, maximum: DIFF_CONTEXT_LINES_MAX }),
+);
+export type DiffContextLines = typeof DiffContextLines.Type;
+
 export const IsoDateTime = Schema.String;
 export type IsoDateTime = typeof IsoDateTime.Type;
 

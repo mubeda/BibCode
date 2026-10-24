@@ -1561,10 +1561,16 @@ fn transfer_error_wire(cwd: &str, relative_path: &str, error: &TransferError) ->
 }
 
 fn review_wire_error(error: ReviewError) -> Value {
-    json!({
-        "_tag": "Defect",
-        "message": error.to_string(),
-    })
+    match error {
+        ReviewError::InvalidRequest(message) => json!({
+            "_tag": "InvalidRequest",
+            "message": message,
+        }),
+        error @ ReviewError::Backend(_) => json!({
+            "_tag": "Defect",
+            "message": error.to_string(),
+        }),
+    }
 }
 
 fn defect(message: &str) -> Value {
@@ -3416,6 +3422,10 @@ mod tests {
         assert_eq!(
             review_wire_error(ReviewError::Backend("failed".to_owned()))["_tag"],
             "Defect"
+        );
+        assert_eq!(
+            review_wire_error(ReviewError::InvalidRequest("refused".to_owned())),
+            json!({ "_tag": "InvalidRequest", "message": "refused" })
         );
         assert_eq!(defect("failed")["message"], "failed");
     }
