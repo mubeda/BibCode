@@ -1,10 +1,6 @@
 import { scopeThreadRef } from "@bibcode/client-runtime/environment";
-import {
-  EnvironmentId,
-  type GitActionProgressEvent,
-  ThreadId,
-  type VcsStatusResult,
-} from "@bibcode/contracts";
+import { VcsActionRemoteFailureError } from "@bibcode/client-runtime/state/vcs";
+import { EnvironmentId, ThreadId, type VcsStatusResult } from "@bibcode/contracts";
 import * as Cause from "effect/Cause";
 import { AsyncResult } from "effect/reactivity";
 import type { Dispatch, ReactElement, SetStateAction } from "react";
@@ -1321,23 +1317,22 @@ describe("SourceControlPanel", () => {
     expect(testState.toast.close).toHaveBeenCalledWith("toast-1");
   });
 
-  it("shows what Git said when the server reports the failure (#157)", async () => {
+  it("names the failed step and shows what Git said (#157, #174)", async () => {
     const gitError = "fatal: pre-commit hook rejected the commit";
-    testState.runAction.mockImplementationOnce(
-      async (input: { actionId: string; onProgress?: (event: GitActionProgressEvent) => void }) => {
-        input.onProgress?.({
-          actionId: input.actionId,
-          cwd: "/repo",
-          action: "commit",
-          kind: "action_failed",
-          phase: null,
-          message: gitError,
-        } as GitActionProgressEvent);
-        // The settled error names only the action and phase, never the remote text.
-        return AsyncResult.failure(
-          Cause.fail(new Error("Source control action 'commit' failed during execution.")),
-        );
-      },
+    testState.runAction.mockImplementationOnce(async (input: { actionId: string }) =>
+      AsyncResult.failure(
+        Cause.fail(
+          new VcsActionRemoteFailureError({
+            actionId: input.actionId,
+            transportActionId: input.actionId,
+            action: "commit",
+            environmentId: ENVIRONMENT_ID,
+            cwd: "/repo",
+            phase: "commit",
+            remoteMessage: gitError,
+          }),
+        ),
+      ),
     );
     render(buildProps());
 
@@ -1345,7 +1340,7 @@ describe("SourceControlPanel", () => {
     await flushPromises();
     expect(testState.toast.update).toHaveBeenLastCalledWith(
       "toast-1",
-      expect.objectContaining({ title: "Action failed", description: gitError }),
+      expect.objectContaining({ title: "Commit failed", description: gitError }),
     );
   });
 

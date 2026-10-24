@@ -10,6 +10,7 @@ import {
   type VcsPullResult,
   type VcsStatusResult,
 } from "@bibcode/contracts";
+import { VcsActionRemoteFailureError } from "@bibcode/client-runtime/state/vcs";
 import * as Cause from "effect/Cause";
 import * as Option from "effect/Option";
 import { AsyncResult } from "effect/reactivity";
@@ -1400,27 +1401,28 @@ staticDescribe("stacked action results", () => {
     );
   });
 
-  it("shows what Git said when the server reports the failure (#157)", async () => {
+  it("names the failed step and shows what Git said (#157, #174)", async () => {
     const gitError =
       "fatal: The upstream branch of your current branch does not match the name of your current branch.";
-    testState.stackedAction.run.mockImplementation(
-      async (input: { actionId: string; onProgress: (event: GitActionProgressEvent) => void }) => {
-        input.onProgress({
-          actionId: input.actionId,
-          cwd: "/repo",
-          action: "push",
-          kind: "action_failed",
-          phase: null,
-          message: gitError,
-        } as GitActionProgressEvent);
-        // The settled error names only the action and phase, never the remote text.
-        return failure("Source control action 'push' failed during execution.");
-      },
+    testState.stackedAction.run.mockImplementation(async (input: { actionId: string }) =>
+      AsyncResult.failure(
+        Cause.fail(
+          new VcsActionRemoteFailureError({
+            actionId: input.actionId,
+            transportActionId: input.actionId,
+            action: "push",
+            environmentId: ENVIRONMENT_ID,
+            cwd: "/repo",
+            phase: "push",
+            remoteMessage: gitError,
+          }),
+        ),
+      ),
     );
     await runPush();
     expect(testState.toast.update).toHaveBeenLastCalledWith(
       "toast-1",
-      expect.objectContaining({ type: "error", title: "Action failed", description: gitError }),
+      expect.objectContaining({ type: "error", title: "Push failed", description: gitError }),
     );
   });
 

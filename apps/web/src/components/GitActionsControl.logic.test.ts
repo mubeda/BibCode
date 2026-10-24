@@ -1,4 +1,5 @@
-import type { VcsStatusResult } from "@bibcode/contracts";
+import { VcsActionRemoteFailureError } from "@bibcode/client-runtime/state/vcs";
+import { EnvironmentId, type VcsStatusResult } from "@bibcode/contracts";
 import { assert, describe, it } from "vite-plus/test";
 import {
   buildGitActionProgressStages,
@@ -9,7 +10,32 @@ import {
   resolveLiveThreadBranchUpdate,
   resolveQuickAction,
   resolveThreadBranchUpdate,
+  stackedActionFailureTitle,
 } from "./GitActionsControl.logic";
+
+describe("stackedActionFailureTitle", () => {
+  const failedAt = (phase: VcsActionRemoteFailureError["phase"]) =>
+    new VcsActionRemoteFailureError({
+      actionId: "a",
+      transportActionId: "a",
+      action: "commit_push",
+      environmentId: EnvironmentId.make("env-1"),
+      cwd: "/repo",
+      phase,
+      remoteMessage: "reason",
+    });
+
+  it("names the step the server reported (#174)", () => {
+    assert.equal(stackedActionFailureTitle(failedAt("branch")), "Creating the branch failed");
+    assert.equal(stackedActionFailureTitle(failedAt("commit")), "Commit failed");
+    assert.equal(stackedActionFailureTitle(failedAt("push")), "Push failed");
+  });
+
+  it("stays generic when the step is unknown", () => {
+    assert.equal(stackedActionFailureTitle(failedAt(null)), "Action failed");
+    assert.equal(stackedActionFailureTitle(new Error("offline")), "Action failed");
+  });
+});
 
 function status(overrides: Partial<VcsStatusResult> = {}): VcsStatusResult {
   return {

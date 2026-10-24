@@ -128,10 +128,12 @@ export class VcsActionRemoteFailureError extends Schema.TaggedError<VcsActionRem
     environmentId: EnvironmentId,
     cwd: Schema.String,
     phase: Schema.NullOr(GitActionProgressPhase),
-    remoteMessageLength: Schema.Finite,
+    /** What the server reported, already redacted there; the user's next step depends on it. */
+    remoteMessage: Schema.String,
   },
 ) {
   override get message(): string {
+    if (this.remoteMessage.trim()) return this.remoteMessage;
     const phase = this.phase === null ? "execution" : this.phase;
     return `Source control action '${this.action}' failed during ${phase}.`;
   }
@@ -321,7 +323,7 @@ export function consumeVcsActionProgress<E, R>(
               environmentId: input.target.environmentId,
               cwd: input.target.cwd,
               phase: terminalEvent.phase,
-              remoteMessageLength: terminalEvent.message.length,
+              remoteMessage: terminalEvent.message,
             }),
           );
         }

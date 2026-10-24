@@ -1398,6 +1398,10 @@ The Source Control panel is Orca-parity for the shipped local Git workflow:
   editor, ignore file name, and ignore parent folder when the corresponding host
   actions are available.
 - Commit history and AI commit-message generation are available in the panel.
+- A failed commit or push names the step that failed, such as **Push failed**
+  or **Commit failed**, and shows Git's own reason beneath it, for example a
+  rejected push or a failing hook. The chat-header Git actions control shows
+  the same failure.
 - **Merge into current branch…** in the dropdown opens the merge dialog for the
   checked-out branch with local and remote sources. **Fetch** refreshes the
   selected remote branch's remote, or every remote for a local source, before
