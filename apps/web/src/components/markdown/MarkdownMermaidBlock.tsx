@@ -339,6 +339,8 @@ export function MarkdownMermaidBlock({
   const problem = tooLong ? TOO_LONG : entry?.kind === "problem" ? entry.problem : null;
   const failedLoad = loadFailure?.source === source && diagram === null ? loadFailure : null;
   const showDiagram = diagram !== null && !showingSource;
+  // The block re-renders with every streamed delta of its message.
+  const fencedSource = useMemo(() => fencedMermaidSource(source), [source]);
   // React sets innerHTML again for every new object, which would replace the SVG on each render.
   const diagramMarkup = useMemo(
     () => (diagram ? { __html: diagram.diagram.svg } : null),
@@ -368,7 +370,7 @@ export function MarkdownMermaidBlock({
         {showDiagram ? (
           <div
             className="chat-markdown-mermaid"
-            data-markdown-copy={fencedMermaidSource(source)}
+            data-markdown-copy={fencedSource}
             data-markdown-atomic=""
             // Sanitized by the diagram SVG sanitizer, parsed in this same HTML context.
             dangerouslySetInnerHTML={diagramMarkup!}
