@@ -2729,8 +2729,9 @@ and highlights fenced code with Shiki through the `@pierre/diffs` shared
 highlighter. Its render cost depends on whether the message is streaming:
 
 - **Finished messages.** A code block whose highlight is not cached renders as
-  a plain block at once. A queue then highlights one block per task, newest
-  first, and drops blocks that unmounted. Highlighted HTML is kept in an LRU
+  a plain block at once. A queue (`components/markdown/renderQueue.ts`, shared
+  with Mermaid diagrams) then highlights one block per task, newest first, and
+  drops blocks that unmounted. Highlighted HTML is kept in an LRU
   cache (500 entries, 50 MB) keyed by the code's hash, length, language and
   theme, so a remounted row, such as one scrolled back into view, shows its
   highlight at once.
@@ -2757,3 +2758,91 @@ highlighter. Its render cost depends on whether the message is streaming:
 
 The streamed result equals a full parse and a full highlight of the same text.
 The unit tests compare every streamed prefix with one.
+
+#### Mermaid diagrams
+
+A fenced block whose language is exactly `mermaid` draws as a diagram in every
+`ChatMarkdown` surface (messages, the Plan sidebar, Proposed Plan cards and the
+rendered Markdown file view) once its own closing fence has arrived, so the
+renderer never sees partial source:
+
+- **Gate.** `components/markdown/mermaidFence.ts` reads what the parser decided
+  rather than parsing CommonMark again. The block's source slice must start
+  with a fence run, end at a closing run, and hold exactly one line more than
+  its opening line and body. A fence ended by its container or by the end of
+  the text, raw-HTML `language-mermaid`, an empty body, and a fence a Proposed
+  Plan preview cut open stay ordinary code blocks. While a reply streams, a
+  closing run counts only once a line ending follows it. The gate gives every
+  fence the same answer under the incremental parser, whose reused nodes keep
+  absolute positions.
+- **Drawing.** `components/markdown/MarkdownMermaidBlock.tsx` shows the
+  highlighted source until the diagram is ready, then the diagram in the same
+  code-block card, with **Show source**. On a cache miss it loads, in order,
+  one shared import of `components/markdown/mermaidRenderer.ts`, Pele's chunk
+  for the diagram type (`pele/lazy`; the full Pele bundle is never imported)
+  and the page fonts, checking for cancellation after each, then runs one job
+  in the render queue: Pele's `render()` and the sanitizer, in the same task.
+  Nothing Mermaid-related loads before the first closed fence. A source over
+  25,000 characters shows an error without loading anything; Pele also refuses
+  more than 500 edges or 1,000,000 characters of output. Diagrams keep their
+  authored direction (`autoDirection: false`, no `maxWidth`), so the output
+  depends only on the source and the fonts, and narrow panes scale the SVG
+  down. Mermaid theme directives are not applied: Pele colors shapes through
+  `--pele-*` variables that `.chat-markdown-mermaid` maps onto the app's
+  tokens, so a theme switch recolors a diagram without drawing it again.
+- **Cache and concurrency.** Drawn diagrams and diagram errors live in a
+  module LRU (100 entries, 16 MB) keyed by the font key and the full source,
+  never a hash, and pending jobs are keyed the same way, so a block joins only
+  a job for its exact source. A remount, a theme switch or a second surface
+  draws from the cache in the same commit. A source replaced during a load
+  (a reply's final text, a snapshot), and an unmount, cancel the attempt; a job
+  is cancelled only when its last waiting block leaves, and a result shows only
+  in a block that still holds its source. A failed renderer import is cleared
+  so **Retry** can try again.
+- **Copy.** The diagram host carries `data-markdown-copy` (the fenced source)
+  and `data-markdown-atomic`, so `markdown-clipboard.ts` copies a selection
+  inside or across a diagram as its source, and the HTML flavor as an escaped
+  code block.
+- **Reading position.** A diagram replacing its source, or **Show source**,
+  changes the block's height. In the timeline, a row wholly above the first
+  visible row is held by LegendList's `maintainVisibleContentPosition.size`;
+  inside the first visible row, above the viewport's top edge, the block
+  commits its swap through the timeline's reading anchor
+  (`chat/readingAnchor.ts`), which commits with `flushSync` and scrolls by the
+  height change. While the list follows its end, `maintainScrollAtEnd` holds
+  the newest line. The file view and the Plan sidebar rely on browser scroll
+  anchoring, which WebKit before Safari 27 (which may include WebKitGTK) lacks,
+  so there a diagram drawing above the reading position shifts it once.
+
+**SVG trust boundary.** Diagram sources are untrusted: agent output, pasted
+text, plans and workspace Markdown files. The SVG Pele draws from them reaches
+the DOM through `dangerouslySetInnerHTML`, outside the `rehype-sanitize` pass,
+so `components/markdown/mermaidSanitizer.ts` is the boundary, and it holds
+without relying on Pele's own filtering (Pele runs with links and images off
+and no icon or math hooks). It is a dedicated DOMPurify instance with
+allowlists at three levels:
+
+- elements: the shape, text, title and gradient elements Pele emits, so no
+  `a`, `image`, `style`, `foreignObject`, `use` or animation element;
+- attributes: geometry, presentation and ARIA attributes, so no `href`, `src`,
+  event handler, `filter`, `mask`, `clip-path`, `marker-*` or `cursor`;
+- CSS, which DOMPurify does not parse: `style` keeps only the properties Pele
+  writes (and its `--_x` custom properties), with values that call only `var`,
+  `rgb`, `rgba`, `hsl` or `hsla` and hold no backslash, comment, at-rule,
+  brace or semicolon; `fill` and `stroke` may instead be a same-document
+  `url(#id)`. A blocklist would miss `image-set("/x" 1x)` and the escaped
+  `u\72l(`. Both production CSPs allow same-origin image loads without a
+  violation event, so these value rules, not the CSP, carry the resource
+  boundary; the CSP (`script-src 'self'`, no `'unsafe-eval'`) is the last
+  layer for script.
+
+Classes other than Pele's own `pele` and `pele-*` are dropped so app CSS cannot
+reach diagram nodes, and the host sets `contain: content` so nothing paints
+over app UI. If DOMPurify reports itself unsupported, which would return its
+input unchanged, the sanitizer throws and the block shows "Couldn't draw this
+diagram." A corpus covering every diagram type Pele draws must sanitize with
+nothing removed, so a Pele upgrade that emits new markup fails a test instead
+of losing output or widening the boundary; a guard test keeps `eval` and the
+`Function` constructor out of the installed Pele and DOMPurify builds. Diagram
+source and Pele's messages, which can quote it, are never logged: a failure
+logs only `{ operation, code }`.
