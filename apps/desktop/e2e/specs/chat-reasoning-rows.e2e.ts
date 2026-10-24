@@ -24,9 +24,14 @@ const preparedArtifactDirectory: string = artifactDirectory;
 const preparedProjectPath: string = projectPath;
 const visibleSurfaceSelector = '[data-center-surface-host][data-visible="true"]';
 const visibleComposerFormSelector = `${visibleSurfaceSelector} [data-chat-composer-form="true"]`;
-const thoughtHeaderSelector = `${visibleSurfaceSelector} [data-reasoning-id] > button`;
 /** A row edge within this many pixels counts as in place. */
 const LAYOUT_SLACK_PX = 2;
+/** Every reasoning id the timeline has shown, so each turn's new thought can be told apart. */
+const seenThoughtIds = new Set<string>();
+let firstTurnThoughtId: string | null = null;
+
+const thoughtHeaderSelector = (id: string) =>
+  `${visibleSurfaceSelector} [data-reasoning-id="${id}"] > button`;
 
 function composerEditor() {
   return browser.$(visibleComposerFormSelector).$('[data-testid="composer-editor"]');
@@ -108,29 +113,80 @@ async function send(prompt: string): Promise<void> {
   await expect(editor).toHaveText("");
 }
 
+function readThoughtIds(): Promise<string[]> {
+  return browser.execute(
+    (surfaceSelector: string) =>
+      [...document.querySelectorAll<HTMLElement>(`${surfaceSelector} [data-reasoning-id]`)].flatMap(
+        (row) => (row.dataset.reasoningId ? [row.dataset.reasoningId] : []),
+      ),
+    visibleSurfaceSelector,
+  );
+}
+
+/** Sends a reasoning prompt and returns the id of the Thinking row its turn streams. */
+async function sendAndAwaitNewThought(prompt: string): Promise<string> {
+  for (const id of await readThoughtIds()) seenThoughtIds.add(id);
+  await send(prompt);
+  let thoughtId: string | null = null;
+  await browser.waitUntil(
+    async () => {
+      thoughtId = (await readThoughtIds()).find((id) => !seenThoughtIds.has(id)) ?? null;
+      return thoughtId !== null;
+    },
+    { timeoutMsg: "The turn's thought did not show as a Thinking row." },
+  );
+  seenThoughtIds.add(thoughtId!);
+  return thoughtId!;
+}
+
+async function thoughtHeaderText(id: string): Promise<string> {
+  const header = browser.$(thoughtHeaderSelector(id));
+  await header.waitForExist();
+  return (await header.getText()).trim();
+}
+
+/** Clicks a Thinking header through the DOM, then waits for the list to re-measure it. */
+async function toggleThought(id: string): Promise<void> {
+  const clicked = await browser.execute((selector: string) => {
+    const header = document.querySelector<HTMLButtonElement>(selector);
+    header?.click();
+    return header !== null;
+  }, thoughtHeaderSelector(id));
+  expect(clicked).toBe(true);
+  await browser.executeAsync((done: () => void) => {
+    requestAnimationFrame(() => requestAnimationFrame(() => done()));
+  });
+}
+
 interface EndGeometry {
-  /** The line's bottom, or null when the line is not rendered. */
-  readonly lineBottom: number | null;
-  readonly lineTop: number | null;
+  /** The element's edges, or null when it is not rendered. */
+  readonly bottom: number | null;
+  readonly top: number | null;
   /** Where the composer overlay starts: the visible timeline ends there. */
   readonly visibleBottom: number;
   readonly visibleTop: number;
 }
 
-/** Where `line` sits against the part of the timeline the composer leaves visible. */
-function readEndGeometry(line: string): Promise<EndGeometry> {
+/**
+ * Where the end of the turn sits against the part of the timeline the composer leaves
+ * visible: the paragraph reading `line`, or the working row while the turn runs.
+ */
+function readEndGeometry(line: string | null): Promise<EndGeometry> {
   return browser.execute(
-    (surfaceSelector: string, text: string) => {
+    (surfaceSelector: string, text: string | null) => {
       const surface = document.querySelector<HTMLElement>(surfaceSelector);
       const composer = surface?.querySelector<HTMLElement>('[data-chat-composer-overlay="true"]');
-      const lineElement = [...(surface?.querySelectorAll<HTMLElement>("p, li") ?? [])].find(
-        (element) => element.textContent?.trim() === text,
-      );
+      const end =
+        text === null
+          ? surface?.querySelector<HTMLElement>('[data-timeline-row-kind="working"]')
+          : [...(surface?.querySelectorAll<HTMLElement>("p, li") ?? [])].find(
+              (element) => element.textContent?.trim() === text,
+            );
       const surfaceRect = surface?.getBoundingClientRect();
-      const lineRect = lineElement?.getBoundingClientRect();
+      const endRect = end?.getBoundingClientRect();
       return {
-        lineBottom: lineRect?.bottom ?? null,
-        lineTop: lineRect?.top ?? null,
+        bottom: endRect?.bottom ?? null,
+        top: endRect?.top ?? null,
         visibleBottom:
           composer?.getBoundingClientRect().top ?? surfaceRect?.bottom ?? window.innerHeight,
         visibleTop: surfaceRect?.top ?? 0,
@@ -141,50 +197,25 @@ function readEndGeometry(line: string): Promise<EndGeometry> {
   );
 }
 
-async function expectEndVisible(line: string, context: string): Promise<void> {
+async function expectEndVisible(line: string | null, context: string): Promise<void> {
   await browser.waitUntil(
     async () => {
       const geometry = await readEndGeometry(line);
       return (
-        geometry.lineBottom !== null &&
-        geometry.lineTop !== null &&
-        geometry.lineBottom <= geometry.visibleBottom + LAYOUT_SLACK_PX &&
-        geometry.lineTop >= geometry.visibleTop - LAYOUT_SLACK_PX
+        geometry.bottom !== null &&
+        geometry.top !== null &&
+        geometry.bottom <= geometry.visibleBottom + LAYOUT_SLACK_PX &&
+        geometry.top >= geometry.visibleTop - LAYOUT_SLACK_PX
       );
     },
     { timeoutMsg: `${context}: the end of the turn was not visible.` },
   );
 }
 
-/** Scrolls the visible timeline to its very end, as a reader dragging to the bottom would. */
-async function scrollTimelineToEnd(): Promise<void> {
-  await browser.execute((surfaceSelector: string) => {
-    const row = document.querySelector<HTMLElement>(`${surfaceSelector} [data-timeline-row-id]`);
-    let scroller = row?.parentElement ?? null;
-    while (scroller && scroller.scrollHeight <= scroller.clientHeight) {
-      scroller = scroller.parentElement;
-    }
-    if (scroller) {
-      scroller.scrollTop = scroller.scrollHeight;
-      scroller.dispatchEvent(new Event("scroll"));
-    }
-  }, visibleSurfaceSelector);
-}
-
-async function thoughtHeaderText(): Promise<string> {
-  const header = browser.$(thoughtHeaderSelector);
-  await header.waitForExist();
-  return (await header.getText()).trim();
-}
-
-/** Clicks the Thinking header through the DOM, wherever the list keeps it. */
-async function toggleThought(): Promise<void> {
-  await browser.execute((selector: string) => {
-    document.querySelector<HTMLButtonElement>(selector)?.click();
-  }, thoughtHeaderSelector);
-  // Two frames: the row re-renders, then the list re-measures it.
-  await browser.executeAsync((done: () => void) => {
-    requestAnimationFrame(() => requestAnimationFrame(() => done()));
+async function waitForAnswer(line: string): Promise<void> {
+  await browser.waitUntil(async () => (await readEndGeometry(line)).bottom !== null, {
+    timeout: 30_000,
+    timeoutMsg: `The answer ending "${line}" did not arrive.`,
   });
 }
 
@@ -198,24 +229,24 @@ describe("Chat reasoning rows", () => {
   });
 
   it("streams a Thinking row right after a send and keeps the anchored turn's end visible", async () => {
-    await send(`Explain the parser ${desktopUiFixture.reasoningTurnMarker}`);
-    await browser.waitUntil(
-      async () =>
-        (await thoughtHeaderText()).startsWith(
-          `Thinking - ${desktopUiFixture.reasoningThoughtStart}`,
-        ),
-      { timeoutMsg: "The streaming thought did not show as a Thinking row." },
+    const thoughtId = await sendAndAwaitNewThought(
+      `Explain the parser ${desktopUiFixture.reasoningTurnMarker}`,
     );
+    firstTurnThoughtId = thoughtId;
+    expect(await thoughtHeaderText(thoughtId)).toMatch(/^Thinking - Fixture thinking step 1/);
     await browser.saveScreenshot(
       NodePath.join(preparedArtifactDirectory, "reasoning-thinking-row-streaming.png"),
     );
-    await expectEndVisible(desktopUiFixture.reasoningAnswerLastLine, "Anchored new turn");
+    const answerEnd = desktopUiFixture.reasoningAnswerLastLine("Explain the parser");
+    await waitForAnswer(answerEnd);
+    await expectEndVisible(answerEnd, "Anchored new turn");
   });
 
   it("folds the finished thought under Worked for and shows it when the fold opens", async () => {
+    const thoughtId = firstTurnThoughtId!;
     const fold = browser.$(`${visibleSurfaceSelector} [data-timeline-row-kind="turn-fold"] button`);
     await fold.waitForDisplayed({ timeoutMsg: "The finished turn did not fold." });
-    expect(await browser.$(thoughtHeaderSelector).isExisting()).toBe(false);
+    expect(await browser.$(thoughtHeaderSelector(thoughtId)).isExisting()).toBe(false);
     await fold.click();
     const previousSteps = browser.$(
       `//*[@data-center-surface-host and @data-visible="true"]//button[contains(normalize-space(), "previous step")]`,
@@ -224,52 +255,63 @@ describe("Chat reasoning rows", () => {
       timeoutMsg: "The opened fold did not offer the thought as a previous step.",
     });
     await previousSteps.click();
-    expect(await thoughtHeaderText()).toMatch(
-      new RegExp(`^Thought - ${desktopUiFixture.reasoningThoughtStart.replaceAll(".", "\\.")}`),
-    );
+    // The finished thought previews its whole first sentence.
+    expect(
+      (await thoughtHeaderText(thoughtId)).startsWith(
+        `Thought - ${desktopUiFixture.reasoningThoughtStart}`,
+      ),
+    ).toBe(true);
     await browser.saveScreenshot(
       NodePath.join(preparedArtifactDirectory, "reasoning-thought-row-in-fold.png"),
     );
   });
 
-  it("keeps the end visible when the thought is expanded at the end", async () => {
-    await scrollTimelineToEnd();
-    await expectEndVisible(desktopUiFixture.reasoningAnswerLastLine, "Before the toggle");
-    await toggleThought();
-    expect(await browser.$(thoughtHeaderSelector).getAttribute("aria-expanded")).toBe("true");
-    await expectEndVisible(desktopUiFixture.reasoningAnswerLastLine, "Expanded at the end");
-    await toggleThought();
-  });
-
   it("keeps the thought's header in place when it is expanded away from the end", async () => {
+    const thoughtId = firstTurnThoughtId!;
     await browser.execute((selector: string) => {
       document.querySelector<HTMLElement>(selector)?.scrollIntoView({ block: "center" });
-    }, thoughtHeaderSelector);
+    }, thoughtHeaderSelector(thoughtId));
     const headerTop = () =>
       browser.execute(
         (selector: string) => document.querySelector(selector)?.getBoundingClientRect().top ?? null,
-        thoughtHeaderSelector,
+        thoughtHeaderSelector(thoughtId),
       );
     const before = await headerTop();
     expect(before).not.toBeNull();
-    await toggleThought();
-    expect(await browser.$(thoughtHeaderSelector).getAttribute("aria-expanded")).toBe("true");
+    await toggleThought(thoughtId);
+    expect(await browser.$(thoughtHeaderSelector(thoughtId)).getAttribute("aria-expanded")).toBe(
+      "true",
+    );
     const after = await headerTop();
     expect(Math.abs((after ?? Number.NaN) - (before ?? 0))).toBeLessThanOrEqual(LAYOUT_SLACK_PX);
     await browser.saveScreenshot(
       NodePath.join(preparedArtifactDirectory, "reasoning-thought-expanded.png"),
     );
-    await toggleThought();
+    await toggleThought(thoughtId);
+  });
+
+  it("keeps the end visible when a streaming thought is expanded at the end", async () => {
+    // The newest thought, still streaming, sits just above the working row at the end.
+    const thoughtId = await sendAndAwaitNewThought(
+      `Think it over ${desktopUiFixture.slowReasoningTurnMarker}`,
+    );
+    await expectEndVisible(null, "Before the toggle");
+    await toggleThought(thoughtId);
+    expect(await browser.$(thoughtHeaderSelector(thoughtId)).getAttribute("aria-expanded")).toBe(
+      "true",
+    );
+    await expectEndVisible(null, "Expanded at the end");
+    await waitForAnswer(desktopUiFixture.reasoningAnswerLastLine("Think it over", true));
   });
 
   it("keeps the end visible while a thought streams into a thread reopened at its end", async () => {
-    await send(`Keep going ${desktopUiFixture.slowReasoningTurnMarker}`);
-    await browser.waitUntil(async () => (await thoughtHeaderText()).startsWith("Thinking - "), {
-      timeoutMsg: "The slow thought did not start streaming.",
-    });
-    // Reopening the thread drops the anchor: the list follows its end while the turn runs.
+    await sendAndAwaitNewThought(`Keep going ${desktopUiFixture.slowReasoningTurnMarker}`);
+    // Reopening the thread drops the send's anchor: the list follows its end while the turn runs.
     await refreshDesktopUiDocument();
     await waitForComposerDisplayed();
-    await expectEndVisible(desktopUiFixture.slowReasoningAnswerLastLine, "Following the end");
+    await expectEndVisible(null, "Following the end while thinking");
+    const answerEnd = desktopUiFixture.reasoningAnswerLastLine("Keep going", true);
+    await waitForAnswer(answerEnd);
+    await expectEndVisible(answerEnd, "Following the end");
   });
 });
