@@ -579,7 +579,8 @@ capability gated by the selected provider instance:
 | Claude           | Supported          | Supported              |
 | Cursor           | Disabled           | Disabled               |
 | Grok             | Disabled           | Disabled               |
-| OpenCode         | Disabled           | Disabled               |
+| OpenCode 2       | Disabled           | Supported              |
+| OpenCode 1       | Disabled           | Disabled               |
 | Other or unknown | Disabled           | Disabled               |
 
 Disabled providers still show the corresponding control with an unavailable

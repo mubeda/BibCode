@@ -33,6 +33,25 @@ a notice and chats use the server's default model. Reverting to a checkpoint
 rewinds the OpenCode 2 conversation, then restores the files. The provider
 terminal is observed too (see below).
 
+OpenCode 2 chats also show context and compaction. The context meter reads
+each step's token usage (input, output, reasoning and cache, which is how
+OpenCode counts it) against the model's `limit.context` from `/api/model`,
+read once per chat and again for a selected model that read did not list;
+when the catalog cannot be read, the meter shows the tokens without a maximum.
+`/compact` (in the `/` menu) asks OpenCode to compact the conversation with
+`POST /api/session/{id}/compact` under the message's own id, so restart
+recovery finds it exactly. OpenCode 2 takes no instructions for a compaction,
+so `/compact` followed by text is sent as a command. A compaction, OpenCode's
+automatic ones included, shows as a **Conversation compaction** step in the
+work log, failed with OpenCode's reason when it fails. While OpenCode retries
+an upstream error, the work log shows a warning with the attempt and, when the
+provider asked for one, the wait before the next try. OpenCode compacts on its
+own when the provider rejects a conversation as too long, and its errors do not
+say that the context is full, so a failed OpenCode turn does not offer
+**Compact conversation**; send `/compact` instead. OpenCode 1 shows none of
+these. The compaction, retry and usage shapes come from OpenCode 2.1.4's event
+schema (`packages/schema/src/session-event.ts`), not from captured frames.
+
 The provider row reads OpenCode's `--version` on every check, including the
 quick one, so a version BiBCode cannot drive never reads Ready. A version
 BiBCode cannot drive (3.x or later) shows an error asking you to set

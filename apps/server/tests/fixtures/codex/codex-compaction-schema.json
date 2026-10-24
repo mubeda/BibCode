@@ -1,0 +1,52 @@
+{
+  "source": "codex-cli 0.164.0: `codex app-server generate-json-schema` (stable and --experimental agree). ErrorNotification from v2/ErrorNotification.json (without its definitions), ContextCompactionThreadItem from definitions.ThreadItem in v2/ItemStartedNotification.json, ThreadCompactStartParams and ThreadCompactStartResponse from their v2 files, and the error notification method from ServerNotification.json. Regenerate when the supported Codex version changes.",
+  "errorNotificationMethod": "error",
+  "ErrorNotification": {
+    "properties": {
+      "error": {
+        "$ref": "#/definitions/TurnError"
+      },
+      "threadId": {
+        "type": "string"
+      },
+      "turnId": {
+        "type": "string"
+      },
+      "willRetry": {
+        "type": "boolean"
+      }
+    },
+    "required": ["error", "threadId", "turnId", "willRetry"],
+    "title": "ErrorNotification",
+    "type": "object"
+  },
+  "ContextCompactionThreadItem": {
+    "properties": {
+      "id": {
+        "type": "string"
+      },
+      "type": {
+        "enum": ["contextCompaction"],
+        "title": "ContextCompactionThreadItemType",
+        "type": "string"
+      }
+    },
+    "required": ["id", "type"],
+    "title": "ContextCompactionThreadItem",
+    "type": "object"
+  },
+  "ThreadCompactStartParams": {
+    "properties": {
+      "threadId": {
+        "type": "string"
+      }
+    },
+    "required": ["threadId"],
+    "title": "ThreadCompactStartParams",
+    "type": "object"
+  },
+  "ThreadCompactStartResponse": {
+    "title": "ThreadCompactStartResponse",
+    "type": "object"
+  }
+}

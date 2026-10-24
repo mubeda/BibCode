@@ -12,11 +12,16 @@ Cursor, and OpenCode are enabled by default; Grok is disabled. Explicitly saved
 values, including `enabled: false`, are preserved.
 
 `supportsContextWindowUsage` is provider-inventory metadata, not a UI guess or
-a property of an individual usage event. Codex and Claude are the only initial
-providers that advertise this capability; an absent capability means that the
-client must show the feature as unavailable even if stale activity exists for a
-thread. The capability does not change ordinary provider execution or activity
-support.
+a property of an individual usage event. Codex and Claude always advertise this
+capability. OpenCode advertises it when its chats run on version 2: the local
+CLI's version, which every probe reads, or, with a Server URL, that server's
+API, which only a full probe reads (the local CLI says nothing about the
+server). A probe that reads no version, such as a Server URL's quick probe,
+keeps the last answer. A full probe that cannot reach the server falls back to
+the local CLI, so the capability stays absent until a later full probe reaches
+the server again. An absent capability means that the client must show the
+feature as unavailable even if stale activity exists for a thread. The
+capability does not change ordinary provider execution or activity support.
 
 `supportsMcpStatus` follows the same inventory-owned rule. Codex and Claude
 advertise it because their adapters publish canonical `mcp.status.updated`
@@ -412,9 +417,11 @@ There is no timeout that releases an admitted writer before completion.
 Suppression, write failure or actor shutdown does not reinterpret provider
 `Accepted` as not sent and never redelivers the input. Publication acknowledgement
 precedes `DeliveryComplete`, so deferred configuration and explicit stop cannot
-overtake it. Steer acceptance never publishes running state. Actor persistence
-awaits and core drain can delay lifecycle controls; unrelated pumps retain
-independent fences.
+overtake it. An acceptance that names no turn (a Codex `/compact`, whose turn
+Codex reports after answering) keeps the active turn the pump already
+projected instead of clearing it, so Stop can still settle that turn. Steer
+acceptance never publishes running state. Actor persistence awaits and core
+drain can delay lifecycle controls; unrelated pumps retain independent fences.
 
 When a provider reports a fatal `session.exited` or its event stream ends, the
 supervisor preserves that event and any already-projected turn failure, and
