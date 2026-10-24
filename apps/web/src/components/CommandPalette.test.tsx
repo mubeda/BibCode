@@ -709,16 +709,21 @@ describe("palette shell", () => {
   });
 
   it("returns focus to the find input after Find in thread, not to the composer", async () => {
+    // The chat the palette was opened from, such as a panel chat over a hidden host tab.
+    const opener = { id: "panel-chat-composer" };
+    vi.stubGlobal("document", { activeElement: opener });
     openPalette();
     const popup = captured.commandPopups.at(-1) as { finalFocus?: () => boolean };
+    // The palette itself takes focus once it opens.
+    vi.stubGlobal("document", { activeElement: { id: "palette-input" } });
     executeValue("action:find-in-thread");
     await flushPromises();
-    expect(testState.openThreadFind).toHaveBeenCalledWith(null);
+    expect(testState.openThreadFind).toHaveBeenCalledWith(opener);
     expect(rerender()).not.toContain('data-testid="command-popup"');
 
     // The popup closing runs its final focus.
     expect(popup.finalFocus?.()).toBe(false);
-    expect(testState.focusThreadFindInput).toHaveBeenCalledTimes(1);
+    expect(testState.focusThreadFindInput).toHaveBeenCalledWith(opener);
     expect(testState.composerHandleRef.current?.focusAtEnd).not.toHaveBeenCalled();
   });
 
