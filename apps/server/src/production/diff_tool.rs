@@ -242,10 +242,16 @@ struct LauncherState {
     /// Each running launch's registration, kept until its process exits. A shutdown leaves
     /// them here, so the survivors are still registered when ownership is frozen.
     registrations: Mutex<HashMap<u64, ProcessRegistration>>,
+    /// `LAUNCH_WINDOW`, except in a test that must stay inside the window.
+    launch_window: Duration,
 }
 
 impl DiffToolLauncher {
     pub(crate) fn new(registry: ProcessAttributionRegistry) -> Self {
+        Self::with_launch_window(registry, LAUNCH_WINDOW)
+    }
+
+    fn with_launch_window(registry: ProcessAttributionRegistry, launch_window: Duration) -> Self {
         Self {
             state: Arc::new(LauncherState {
                 registry,
@@ -253,6 +259,7 @@ impl DiffToolLauncher {
                 reapers: TaskTracker::new(),
                 running: Mutex::new(0),
                 registrations: Mutex::new(HashMap::new()),
+                launch_window,
             }),
         }
     }
@@ -422,7 +429,7 @@ impl DiffToolLauncher {
         self.state
             .reapers
             .spawn(async move { launcher.reap(running).await });
-        match tokio::time::timeout(LAUNCH_WINDOW, exited).await {
+        match tokio::time::timeout(self.state.launch_window, exited).await {
             // Some launchers hand the files to a running app and return at once.
             Ok(Ok(WindowExit::Exited { status, .. })) if status.success() => Ok(()),
             Ok(Ok(WindowExit::Exited { status, detail })) => {
@@ -1262,7 +1269,9 @@ ps -o pgid= -p $$ | tr -d ' ' >> "$dir/pgids"
         repository.write("tracked.txt", "after\n");
         let tool = FakeTool::install(&repository, "exec sleep 30");
         let registry = ProcessAttributionRegistry::new();
-        let launcher = DiffToolLauncher::new(registry.clone());
+        // A window long enough that a slow start never ends it before the tool runs.
+        let launcher =
+            DiffToolLauncher::with_launch_window(registry.clone(), Duration::from_secs(60));
         let input = repository.open(file("tracked.txt", None), ReviewDiffToolScope::WorkingTree);
 
         // The client goes away while the launch waits to see the tool fail.
