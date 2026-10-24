@@ -15238,6 +15238,11 @@ async fn claude_thinking_display_probe_reads_the_allowed_values() {
             "printf '%s\\n' \"error: unknown option '--thinking-display'\" >&2; exit 1",
             false,
         ),
+        (
+            "lists-other-values",
+            "printf '%s\\n' \"error: argument '$2' is invalid. Allowed choices are omitted, highlights.\" >&2; exit 1",
+            false,
+        ),
     ] {
         let probe_context = ClaudeActivityProbeTestContext::new();
         let temp = TempDir::new().unwrap();
