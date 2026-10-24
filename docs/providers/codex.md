@@ -116,6 +116,35 @@ workspace meter can therefore explain that Codex compacts context automatically
 when needed, while still showing the current active usage and maximum
 independently.
 
+## Compaction and retries
+
+Codex compacts the conversation on its own as the context fills. To compact on
+demand, send `/compact` (it is in the `/` menu): BiBCode asks Codex for
+`thread/compact/start` on the thread instead of sending the text to the model.
+Codex runs the compaction as a turn of its own, and the work log shows it as a
+**Conversation compaction** step while it runs, whether Codex or you started it.
+Codex takes no instructions for a compaction, so `/compact` followed by text is
+sent as an ordinary message. A `/compact` steered into a running turn is
+refused and waits in the queue until that turn ends.
+
+A turn that fails because the conversation no longer fits the model's context
+window (`codexErrorInfo: contextWindowExceeded`) says that Codex ran out of
+context and offers **Compact conversation**, which sends `/compact`. BiBCode
+never resends the failed message itself.
+
+While Codex retries an upstream failure (an `error` notification with
+`willRetry: true`), the work log shows a warning such as "Codex is retrying
+after an upstream error: …". A failure Codex does not retry ends the turn as
+before.
+
+A compaction carries no user message, so restart recovery cannot find it in
+the thread: if BiBCode stops between Codex accepting `/compact` and BiBCode
+recording that, the compaction is sent again after the restart.
+
+These shapes come from the schema that `codex app-server generate-json-schema`
+writes for the supported Codex version (0.164.0); the excerpts BiBCode's tests
+read are in `apps/server/tests/fixtures/codex`.
+
 ## Steering a running turn
 
 While Codex is working, Enter adds a queued message. **Steer** on the first

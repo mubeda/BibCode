@@ -412,9 +412,11 @@ There is no timeout that releases an admitted writer before completion.
 Suppression, write failure or actor shutdown does not reinterpret provider
 `Accepted` as not sent and never redelivers the input. Publication acknowledgement
 precedes `DeliveryComplete`, so deferred configuration and explicit stop cannot
-overtake it. Steer acceptance never publishes running state. Actor persistence
-awaits and core drain can delay lifecycle controls; unrelated pumps retain
-independent fences.
+overtake it. An acceptance that names no turn (a Codex `/compact`, whose turn
+Codex reports after answering) keeps the active turn the pump already
+projected instead of clearing it, so Stop can still settle that turn. Steer
+acceptance never publishes running state. Actor persistence awaits and core
+drain can delay lifecycle controls; unrelated pumps retain independent fences.
 
 When a provider reports a fatal `session.exited` or its event stream ends, the
 supervisor preserves that event and any already-projected turn failure, and
