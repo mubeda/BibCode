@@ -697,6 +697,21 @@ describe("useThreadFind", () => {
     await settle(() => statusText().includes("1/1"));
   });
 
+  it("builds no more ranges than it paints in a reply with thousands of matches", async () => {
+    await mountTimeline({
+      latestTurn: null,
+      timelineEntries: [message("reply", "assistant", "a ".repeat(3000), 0)],
+    });
+    const createRange = vi.spyOn(document, "createRange");
+    await type(await openFind(), "a");
+    await settle(() => (registry.get(FIND_HIGHLIGHT_NAME)?.ranges.length ?? 0) > 0);
+    await wait(100);
+
+    expect(registry.get(FIND_HIGHLIGHT_NAME)?.ranges).toHaveLength(1000);
+    // The paint limit, its active match, and the few the settle locates on its way.
+    expect(createRange.mock.calls.length).toBeLessThan(1100);
+  });
+
   it("reissues a scroll once when the row moved while it was held back", async () => {
     const { render } = await mountTimeline({
       latestTurn: null,
