@@ -1913,4 +1913,70 @@ describe("applyThreadDetailEvent", () => {
       expect(applyThreadDetailEvent(baseThread, event(type, {})).kind).toBe("unchanged");
     });
   });
+
+  describe("conversation compaction", () => {
+    const requested = event("thread.compact-requested", {
+      compactionId: "compaction:1",
+      trigger: "contextRecovery",
+      failedMessageId: MessageId.make("failed"),
+      createdAt: "2026-04-02T00:00:00.000Z",
+    });
+
+    it("shows the unsettled compaction until it settles", () => {
+      const result = applyThreadDetailEvent(baseThread, requested);
+      expect(result).toMatchObject({
+        kind: "updated",
+        thread: {
+          compaction: { trigger: "contextRecovery", state: "requested", failedMessageId: "failed" },
+        },
+      });
+      if (result.kind !== "updated") throw new Error("expected an update");
+      const running = applyThreadDetailEvent(
+        result.thread,
+        event("thread.session-set", {
+          compactionId: "compaction:1",
+          session: {
+            threadId: baseThread.id,
+            status: "running",
+            providerName: "claudeAgent",
+            runtimeMode: "full-access",
+            activeTurnId: TurnId.make("compaction-turn"),
+            lastError: null,
+            updatedAt: "2026-04-02T00:00:01.000Z",
+          },
+        }),
+      );
+      if (running.kind !== "updated") throw new Error("expected an update");
+      expect(running.thread.compaction?.state).toBe("running");
+      const settled = applyThreadDetailEvent(
+        running.thread,
+        event("thread.compacted", {
+          compactionId: "compaction:1",
+          outcome: "completed",
+          createdAt: "2026-04-02T00:00:02.000Z",
+        }),
+      );
+      if (settled.kind !== "updated") throw new Error("expected an update");
+      expect(settled.thread.compaction).toBeUndefined();
+      expect(Object.hasOwn(settled.thread, "compaction")).toBe(false);
+    });
+
+    it("keeps the failed message a copy sends again", () => {
+      const result = applyThreadDetailEvent(
+        baseThread,
+        event("thread.message-sent", {
+          messageId: MessageId.make("resend:failed"),
+          role: "user",
+          text: "continue",
+          turnId: null,
+          streaming: false,
+          resendOf: MessageId.make("failed"),
+          createdAt: "2026-04-02T00:00:00.000Z",
+          updatedAt: "2026-04-02T00:00:00.000Z",
+        }),
+      );
+      if (result.kind !== "updated") throw new Error("expected an update");
+      expect(result.thread.messages[0]?.resendOf).toBe("failed");
+    });
+  });
 });

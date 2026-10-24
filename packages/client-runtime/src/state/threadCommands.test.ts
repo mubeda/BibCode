@@ -17,6 +17,7 @@ vi.mock("./runtime.ts", () => ({
 vi.mock("../operations/commands.ts", () => {
   const names = [
     "archiveThread",
+    "compactThread",
     "createThread",
     "deleteThread",
     "interruptThreadTurn",
@@ -83,6 +84,7 @@ describe("createThreadEnvironmentAtoms", () => {
       ["respondToUserInput", "respondToThreadUserInput"],
       ["revertCheckpoint", "revertThreadCheckpoint"],
       ["stopSession", "stopThreadSession"],
+      ["compact", "compactThread"],
     ] as const;
 
     expect(Object.keys(atoms)).toEqual([
