@@ -10,6 +10,7 @@ import * as NodePath from "node:path";
 
 import { afterEach, describe, expect, it } from "vite-plus/test";
 
+import { mermaidFixturePrompts, mermaidFixtureReplies } from "./mermaid-fixture.ts";
 import { readProviderInputLog } from "./provider-input-log.ts";
 import {
   archiveAndCleanupDesktopUiTestContext,
@@ -522,6 +523,35 @@ describe("generated provider shims", () => {
     expect(readProviderInputLog(fixture.context.providerInputLogPath)).toMatchObject([
       { provider: "codex", prompt: "$refactor" },
     ]);
+  });
+
+  it("answers the Mermaid fixture prompts with their diagram replies", () => {
+    const fixture = prepareProviderFixture();
+    const responses = exchangeJsonLines(
+      fixture,
+      "codex",
+      ["app-server"],
+      [
+        { id: 1, method: "initialize" },
+        {
+          id: 2,
+          method: "turn/start",
+          params: { input: [{ type: "text", text: mermaidFixturePrompts.many }] },
+        },
+      ],
+    );
+
+    expect(responses).toContainEqual(
+      expect.objectContaining({
+        method: "item/agentMessage/delta",
+        params: expect.objectContaining({
+          delta: mermaidFixtureReplies[mermaidFixturePrompts.many],
+        }),
+      }),
+    );
+    expect(mermaidFixtureReplies[mermaidFixturePrompts.many]?.match(/```mermaid/g)).toHaveLength(
+      101,
+    );
   });
 
   it("speaks Claude control, skill reload, stream, and result protocols", () => {

@@ -5,6 +5,7 @@ import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 
 import { desktopActivityFixture, desktopActivityMarkerFileName } from "./activity-events.ts";
+import { mermaidFixtureReplies } from "./mermaid-fixture.ts";
 
 const FIXTURE_PROJECT_NAME = "BiBCode UI Fixture";
 const STREAMED_RESPONSE = "BiBCode deterministic streamed fixture response.";
@@ -115,6 +116,7 @@ if (process.argv.includes("--help")) {
 
 const send = (message) => process.stdout.write(JSON.stringify(message) + "\n");
 const streamResponse = ${JSON.stringify(STREAMED_RESPONSE)};
+const promptReplies = ${JSON.stringify(mermaidFixtureReplies)};
 const activity = ${JSON.stringify(desktopActivityFixture)};
 const activityStartedAt = Math.floor(Date.now() / 1000);
 const activityObservedAt = () => Math.max(activityStartedAt, Math.floor(Date.now() / 1000));
@@ -458,7 +460,7 @@ reader.on("line", (line) => {
         threadId: "bibcode-ui-provider-thread",
         turnId,
         itemId: "bibcode-ui-message-" + turnId,
-        delta: streamResponse
+        delta: Object.hasOwn(promptReplies, prompt) ? promptReplies[prompt] : streamResponse
       } });
       if (prompt.includes("[[slow]]")) {
         slowTurnTimer = setTimeout(completeTurn, slowTurnTimeoutMs);
