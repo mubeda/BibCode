@@ -5,11 +5,9 @@
  */
 import { detectType, load, PeleError, render, type RenderOptions } from "pele/lazy";
 
-import { MERMAID_SOURCE_LIMIT } from "./mermaidFence";
+import { MERMAID_EDGE_LIMIT, MERMAID_SOURCE_LIMIT } from "./mermaidFence";
 import { sanitizeDiagramSvg } from "./mermaidSanitizer";
 
-/** mermaid.js's own `maxEdges` default, so a diagram it would refuse is refused here too. */
-export const MERMAID_EDGE_LIMIT = 500;
 /** A quarter of Pele's default: caps the DOM one block can add. */
 const MERMAID_OUTPUT_LIMIT = 1_000_000;
 

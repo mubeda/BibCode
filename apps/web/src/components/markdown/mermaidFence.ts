@@ -5,10 +5,14 @@ export interface SourcePosition {
 }
 
 /**
- * The longest diagram source drawn, mermaid.js's own `maxTextSize` default. A longer source
- * shows an error before any renderer code loads.
+ * The longest diagram source drawn. A longer source shows an error before any renderer code
+ * loads. It started at mermaid.js's own `maxTextSize` default, 50,000; one render cannot be
+ * interrupted, and a 50,000-character sequence diagram took 90 ms to draw and sanitize in
+ * Chromium on the reference machine against the 50 ms budget, so it is halved.
  */
-export const MERMAID_SOURCE_LIMIT = 50_000;
+export const MERMAID_SOURCE_LIMIT = 25_000;
+/** mermaid.js's own `maxEdges` default, so a diagram it would refuse is refused here too. */
+export const MERMAID_EDGE_LIMIT = 500;
 
 const LINE_ENDING = /\r\n|\r|\n/g;
 const FENCE_OPENING = /^(?:`{3,}|~{3,})/;

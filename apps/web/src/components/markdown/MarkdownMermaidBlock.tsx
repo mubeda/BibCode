@@ -12,7 +12,7 @@ import {
   MarkdownCodeBlockWrapAction,
 } from "./MarkdownCodeBlock";
 import { reportMarkdownActionFailure } from "./markdownActionFailure";
-import { MERMAID_SOURCE_LIMIT } from "./mermaidFence";
+import { MERMAID_EDGE_LIMIT, MERMAID_SOURCE_LIMIT } from "./mermaidFence";
 import type { MermaidDiagram, MermaidDiagramProblem, MermaidFonts } from "./mermaidRenderer";
 import { scheduleRender } from "./renderQueue";
 
@@ -180,8 +180,12 @@ function problemMessage(problem: MermaidDiagramProblem): string {
     case "unsupported":
       return "Diagram type not supported.";
     case "too-large":
-      if (problem.limit === "edges") return "Too large to draw: over 500 edges.";
-      if (problem.limit === "characters") return "Too large to draw: over 50,000 characters.";
+      if (problem.limit === "edges") {
+        return `Too large to draw: over ${MERMAID_EDGE_LIMIT.toLocaleString("en-US")} edges.`;
+      }
+      if (problem.limit === "characters") {
+        return `Too large to draw: over ${MERMAID_SOURCE_LIMIT.toLocaleString("en-US")} characters.`;
+      }
       return "Too large to draw.";
     case "failed":
       return "Couldn't draw this diagram.";
