@@ -43,6 +43,9 @@ const h = vi.hoisted(() => {
     },
     openInPreferredEditor: vi.fn(async (_path: string) => ({ _tag: "Success" }) as unknown),
     openDiffFilePrimaryAction: vi.fn(),
+    updateClientSettings: vi.fn((patch: Record<string, unknown>) => {
+      state.settings = { ...state.settings, ...patch };
+    }),
     diffPreviewRefresh: vi.fn(),
     stateIndex: 0,
     stateSeeds: new Map<number, unknown>(),
@@ -161,6 +164,7 @@ vi.mock("../hooks/useTheme", () => ({
 vi.mock("../hooks/useSettings", () => ({
   useClientSettings: (selector?: (settings: unknown) => unknown) =>
     selector ? selector(h.settings) : h.settings,
+  useUpdateClientSettings: () => h.updateClientSettings,
 }));
 
 vi.mock("../hooks/useTurnDiffSummaries", () => ({
@@ -419,7 +423,16 @@ beforeEach(() => {
   h.gitRefreshRequestId = 0;
   h.thread = thread;
   h.project = project;
-  h.settings = { wordWrap: false, diffIgnoreWhitespace: false, timestampFormat: "24h" };
+  h.settings = {
+    wordWrap: false,
+    diffIgnoreWhitespace: false,
+    timestampFormat: "24h",
+    diffRenderMode: "stacked",
+    diffViewMode: "changes",
+    diffCompareLines: "all",
+    diffCompareContextLines: 3,
+  };
+  h.updateClientSettings.mockClear();
   h.resolvedTheme = "dark";
   h.serverConfig = { availableEditors: ["vscode"] };
   h.turnDiffSummaries = [];
@@ -513,13 +526,24 @@ describe("DiffPanel: files patch", () => {
     expect(files[1]!.filePath).toBe("z/last.ts");
   });
 
-  it("drives the render-mode toggle group", () => {
+  it("remembers Stacked/Split in client settings, so a remount keeps it", () => {
     render();
     const toggleGroup = capturedLast("toggleGroup");
     const onValueChange = toggleGroup["onValueChange"] as (value: string[]) => void;
-    expect(() => onValueChange(["split"])).not.toThrow();
-    expect(() => onValueChange(["stacked"])).not.toThrow();
-    expect(() => onValueChange(["unknown"])).not.toThrow();
+    onValueChange(["split"]);
+    expect(h.updateClientSettings).toHaveBeenCalledWith({ diffRenderMode: "split" });
+
+    // A new mount reads the saved choice instead of starting stacked.
+    render();
+    expect(capturedLast("toggleGroup")["value"]).toEqual(["split"]);
+    const options = capturedLast("annotatableCodeView")["options"] as { diffStyle: string };
+    expect(options.diffStyle).toBe("split");
+
+    h.updateClientSettings.mockClear();
+    const remounted = capturedLast("toggleGroup")["onValueChange"] as (value: string[]) => void;
+    remounted(["split"]);
+    remounted(["unknown"]);
+    expect(h.updateClientSettings, "an unchanged choice writes nothing").not.toHaveBeenCalled();
     expect(() => onValueChange([])).not.toThrow();
   });
 
@@ -601,9 +625,9 @@ describe("DiffPanel: files patch", () => {
   });
 
   it("collapses an already-collapsed file back open (delete branch)", () => {
-    // Seed the collapsed-files state (useState index 4) so the toggle takes the
+    // Seed the collapsed-files state (useState index 3) so the toggle takes the
     // delete branch instead of the add branch.
-    h.stateSeeds.set(4, {
+    h.stateSeeds.set(3, {
       scopeKey: `${environmentId}:${threadId}:branch`,
       fileKeys: new Set(["file-a"]),
     });

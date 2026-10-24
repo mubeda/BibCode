@@ -301,6 +301,64 @@ describe("ClientSettings terminal theme", () => {
   });
 });
 
+describe("ClientSettings Diff panel", () => {
+  it("defaults to Changes, Stacked, All lines and three context lines", () => {
+    expect(decodeClientSettings({})).toMatchObject({
+      diffViewMode: "changes",
+      diffRenderMode: "stacked",
+      diffCompareLines: "all",
+      diffCompareContextLines: 3,
+    });
+    expect(DEFAULT_CLIENT_SETTINGS.diffViewMode).toBe("changes");
+  });
+
+  it("keeps explicit choices and recovers malformed or out-of-range values", () => {
+    expect(
+      decodeClientSettings({
+        diffViewMode: "compare",
+        diffRenderMode: "split",
+        diffCompareLines: "changes",
+        diffCompareContextLines: 7,
+      }),
+    ).toMatchObject({
+      diffViewMode: "compare",
+      diffRenderMode: "split",
+      diffCompareLines: "changes",
+      diffCompareContextLines: 7,
+    });
+    for (const diffCompareContextLines of [-1, 100, 2.5, "7"]) {
+      expect(decodeClientSettings({ diffCompareContextLines, wordWrap: false })).toMatchObject({
+        diffCompareContextLines: 3,
+        wordWrap: false,
+      });
+    }
+    expect(
+      decodeClientSettings({
+        diffViewMode: "review",
+        diffRenderMode: "over-under",
+        diffCompareLines: "same",
+      }),
+    ).toMatchObject({
+      diffViewMode: "changes",
+      diffRenderMode: "stacked",
+      diffCompareLines: "all",
+    });
+  });
+
+  it("patches each preference on its own", () => {
+    const contextOnly = decodeClientSettingsPatch({ diffCompareContextLines: 0 });
+    expect(contextOnly).toMatchObject({ diffCompareContextLines: 0 });
+    expect(contextOnly).not.toHaveProperty("diffViewMode");
+    expect(contextOnly).not.toHaveProperty("diffRenderMode");
+    expect(contextOnly).not.toHaveProperty("diffCompareLines");
+    expect(decodeClientSettingsPatch({ diffViewMode: "compare" })).toMatchObject({
+      diffViewMode: "compare",
+    });
+    expect(() => decodeClientSettingsPatch({ diffCompareContextLines: 100 })).toThrow();
+    expect(() => decodeClientSettingsPatch({ diffRenderMode: "unified" })).toThrow();
+  });
+});
+
 describe("ClientSettings word wrap", () => {
   it("defaults word wrap on", () => {
     expect(decodeClientSettings({}).wordWrap).toBe(true);
