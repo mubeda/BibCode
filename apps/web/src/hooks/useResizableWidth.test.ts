@@ -7,6 +7,7 @@ const hooks = vi.hoisted(() => {
   let cursor = 0;
   let stateSlots = new Map<number, unknown>();
   let refSlots = new Map<number, { current: unknown }>();
+  let cleanups = new Map<number, (() => void) | void>();
 
   return {
     beginRender(): void {
@@ -16,10 +17,22 @@ const hooks = vi.hoisted(() => {
       cursor = 0;
       stateSlots = new Map();
       refSlots = new Map();
+      cleanups = new Map();
+    },
+    /** Runs every mounted effect's cleanup, as React does on unmount. */
+    unmount(): void {
+      for (const cleanup of cleanups.values()) cleanup?.();
+      cleanups = new Map();
     },
     useCallback<T>(callback: T): T {
       cursor += 1;
       return callback;
+    },
+    // Mount-only: the hook's effects take stable dependencies.
+    useEffect(effect: () => (() => void) | void): void {
+      const index = cursor;
+      cursor += 1;
+      if (!cleanups.has(index)) cleanups.set(index, effect());
     },
     useRef<T>(initialValue: T): { current: T } {
       const index = cursor;
@@ -67,6 +80,7 @@ vi.mock("react", async (importOriginal) => {
   return {
     ...actual,
     useCallback: hooks.useCallback,
+    useEffect: hooks.useEffect,
     useRef: hooks.useRef,
     useState: hooks.useState,
   };
@@ -329,6 +343,52 @@ describe("useResizableWidth pointer handling", () => {
     expect(frames.cancelled).toEqual([frameId]);
     expect(storage.writes).toEqual([]);
     expect(renderHook().width).toBe(410);
+  });
+
+  it("rolls a drag whose pointer capture is lost back without persisting", () => {
+    const frames = installAnimationFrames();
+    storage.stored = 410;
+    const first = renderHook();
+    const target = beginDrag(first.handlers);
+    first.handlers.onPointerMove(pointerEvent(target.element, { clientX: 170 }));
+    const frameId = [...frames.callbacks.keys()][0]!;
+
+    first.handlers.onLostPointerCapture(pointerEvent(target.element));
+
+    expect(frames.cancelled).toEqual([frameId]);
+    expect(document.body.style.cursor).toBe("");
+    expect(document.body.style.userSelect).toBe("");
+    expect(storage.writes).toEqual([]);
+    expect(renderHook().width).toBe(410);
+  });
+
+  it("ignores the capture loss that follows a completed drag", () => {
+    const first = renderHook();
+    const target = beginDrag(first.handlers);
+    first.handlers.onPointerMove(pointerEvent(target.element, { clientX: 180 }));
+    first.handlers.onPointerUp(pointerEvent(target.element, { clientX: 180 }));
+
+    renderHook().handlers.onLostPointerCapture(pointerEvent(target.element));
+
+    expect(storage.writes).toMatchObject([{ value: 400 }]);
+    expect(renderHook().width).toBe(400);
+  });
+
+  it("releases the page and drops the pending frame when unmounted mid-drag", () => {
+    const frames = installAnimationFrames();
+    const first = renderHook();
+    const target = beginDrag(first.handlers);
+    first.handlers.onPointerMove(pointerEvent(target.element, { clientX: 180 }));
+    const frameId = [...frames.callbacks.keys()][0]!;
+    expect(document.body.style.userSelect).toBe("none");
+
+    hooks.unmount();
+
+    expect(frames.cancelled).toEqual([frameId]);
+    expect(target.releasePointerCapture).toHaveBeenCalledWith(7);
+    expect(document.body.style.cursor).toBe("");
+    expect(document.body.style.userSelect).toBe("");
+    expect(storage.writes).toEqual([]);
   });
 
   it("tolerates already-released and throwing pointer capture state", () => {
