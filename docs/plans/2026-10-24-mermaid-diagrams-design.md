@@ -1,6 +1,6 @@
 # Mermaid Diagrams in Chat Markdown
 
-Status: Proposed 2026-10-24; awaiting approval. Issue #171. Pele `render()` on
+Status: Approved 2026-10-24 with every recommended answer. Issue #171. Pele `render()` on
 the main thread through the #103 queue, a dedicated allowlist DOMPurify instance
 as the SVG trust boundary, and no change to contracts, the server or
 persistence. Revised after review (see Review).

@@ -1,6 +1,6 @@
 # Open File Disk Changes: Pierre Undo Boundary
 
-Status: Proposed 2026-10-24; awaiting approval. This covers only the prerequisite
+Status: Approved 2026-10-24 with every recommended answer. This covers only the prerequisite
 named in issue #180 and in rule 3 of
 [the approved design](./2026-10-23-open-file-disk-changes-design.md#reconciling-a-disk-version).
 It is implemented with #180, after v0.11.0 is published.

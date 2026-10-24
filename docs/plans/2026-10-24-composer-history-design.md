@@ -1,6 +1,6 @@
 # Composer History
 
-Status: Proposed 2026-10-24; awaiting approval. Design for issue 141, verified
+Status: Approved 2026-10-24 with every recommended answer. Design for issue 141, verified
 against `4e023ac5ff` (v0.11.0).
 
 ## Problem

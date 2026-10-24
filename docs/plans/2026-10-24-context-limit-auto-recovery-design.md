@@ -1,6 +1,6 @@
 # Context-Limit Auto-Recovery
 
-Status: Proposed 2026-10-24; awaiting approval.
+Status: Approved 2026-10-24 with every recommended answer.
 
 Issue #160, the part left after v0.11.0. Depends on #163 (Codex) and #164
 (OpenCode) for their providers; this document sets the provider seam they
