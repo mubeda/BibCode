@@ -157,8 +157,12 @@ elsewhere it stays visible but disabled, with a note explaining that a new
 branch will be created from it through the server's safe suffixed-branch flow.
 If the branch list fails to load, the dialog says so and a typed name still
 creates a new branch. Edited names are preserved. Typing an exact local
-or remote branch selects that ref without repeating the same value as a result
-row below the input. If the chosen remote branch becomes local before submit,
+or remote branch selects that ref and hides the result rows below the input.
+Picking a row fills the field with that branch, which closes the list the same
+way; editing the field clears the choice and brings the rows back. The field is
+the choice, so it survives reopening the dialog for the same project and
+switching between Smart and Branch; opening the dialog for another project
+clears it. If the chosen remote branch becomes local before submit,
 the server reuses it when free and still suffixes it when another worktree owns
 it.
 
