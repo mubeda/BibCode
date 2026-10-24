@@ -47,6 +47,9 @@ const h = vi.hoisted(() => {
       state.settings = { ...state.settings, ...patch };
     }),
     diffPreviewRefresh: vi.fn(),
+    contextPreviewArgs: [] as unknown[],
+    contextCheckpointTargets: [] as unknown[],
+    contextCheckpointDiff: { data: null as unknown, error: null as unknown, isPending: false },
     stateIndex: 0,
     stateSeeds: new Map<number, unknown>(),
     captured: {} as Record<string, Record<string, unknown>>,
@@ -138,6 +141,10 @@ vi.mock("../state/server", () => ({
 vi.mock("../state/review", () => ({
   reviewEnvironment: {
     diffPreview: (_args: unknown) => ({ key: "review.diffPreview" }),
+    contextDiffPreview: (args: unknown) => {
+      h.contextPreviewArgs.push(args);
+      return { key: "review.contextDiffPreview" };
+    },
   },
 }));
 
@@ -175,7 +182,15 @@ vi.mock("../hooks/useTurnDiffSummaries", () => ({
 }));
 
 vi.mock("~/lib/checkpointDiffState", () => ({
-  useCheckpointDiff: (_target: unknown, _options: unknown) => h.checkpointDiff,
+  useCheckpointDiff: (
+    target: { contextLines?: number },
+    options: { enabled?: boolean } | undefined,
+  ) => {
+    if (target.contextLines === undefined) return h.checkpointDiff;
+    if (options?.enabled === false) return { data: null, error: null, isPending: false };
+    h.contextCheckpointTargets.push(target);
+    return h.contextCheckpointDiff;
+  },
 }));
 
 vi.mock("../editorPreferences", () => ({
@@ -200,7 +215,7 @@ vi.mock("@bibcode/client-runtime/errors", () => ({
 }));
 
 vi.mock("../lib/diffRendering", () => ({
-  getRenderablePatch: () => h.renderablePatch,
+  getRenderablePatch: (patch: string | undefined) => (patch ? h.renderablePatch : null),
   resolveFileDiffPath: (fileDiff: { path: string }) => fileDiff.path,
   buildFileDiffRenderKey: (fileDiff: { key: string }) => fileDiff.key,
   getDiffCollapseIconClassName: () => "collapse-icon",
@@ -440,6 +455,9 @@ beforeEach(() => {
     diffCompareContextLines: 3,
   };
   h.updateClientSettings.mockClear();
+  h.contextPreviewArgs.length = 0;
+  h.contextCheckpointTargets.length = 0;
+  h.contextCheckpointDiff = { data: null, error: null, isPending: false };
   h.resolvedTheme = "dark";
   h.serverConfig = { availableEditors: ["vscode"] };
   h.turnDiffSummaries = [];
@@ -553,6 +571,74 @@ describe("DiffPanel: Changes and Compare", () => {
     expect(h.storeApi.selectGitScope).not.toHaveBeenCalled();
     expect(h.storeApi.selectBranchBaseRef).not.toHaveBeenCalled();
     expect(capturedLast("diffCompareView")["scope"]).toBe("branch");
+  });
+
+  it("asks for a context patch only for Changes only, with the saved count", () => {
+    h.settings = { ...h.settings, diffViewMode: "compare", diffCompareLines: "all" };
+    render();
+    expect(h.contextPreviewArgs, "All lines reuses the default patch").toEqual([]);
+    expect(capturedLast("diffCompareView")["lineFilter"]).toMatchObject({
+      lines: "all",
+      contextFiles: null,
+      contextSupported: null,
+    });
+
+    h.settings = {
+      ...h.settings,
+      diffCompareLines: "changes",
+      diffCompareContextLines: 7,
+      diffIgnoreWhitespace: false,
+    };
+    h.queryDataByKey.set("review.contextDiffPreview", {
+      cwd: "/repo",
+      sources: [{ kind: "branch-range", diff: "CONTEXT_PATCH", contextLines: 7 }],
+    });
+    render();
+    expect(h.contextPreviewArgs.at(-1)).toMatchObject({
+      input: { cwd: "/wt", contextLines: 7, ignoreWhitespace: false },
+    });
+    const lineFilter = capturedLast("diffCompareView")["lineFilter"] as Record<string, unknown>;
+    expect(lineFilter).toMatchObject({ lines: "changes", contextLines: 7, contextSupported: true });
+    expect(lineFilter["contextFiles"]).not.toBeNull();
+    (lineFilter["onContextLinesChange"] as (value: number) => void)(9);
+    expect(h.updateClientSettings).toHaveBeenCalledWith({ diffCompareContextLines: 9 });
+    (lineFilter["onLinesChange"] as (value: string) => void)("all");
+    expect(h.updateClientSettings).toHaveBeenCalledWith({ diffCompareLines: "all" });
+
+    // An older server ignores the count and does not echo it.
+    h.settings = { ...h.settings, diffCompareLines: "changes" };
+    h.queryDataByKey.set("review.contextDiffPreview", {
+      cwd: "/repo",
+      sources: [{ kind: "branch-range", diff: "CONTEXT_PATCH" }],
+    });
+    render();
+    expect(capturedLast("diffCompareView")["lineFilter"]).toMatchObject({
+      contextSupported: false,
+    });
+  });
+
+  it("asks for a turn's context patch through the checkpoint families", () => {
+    h.settings = {
+      ...h.settings,
+      diffViewMode: "compare",
+      diffCompareLines: "changes",
+      diffCompareContextLines: 0,
+    };
+    h.turnDiffSummaries = [summary(turnIdA, 2, "2026-01-01T00:00:00.000Z")];
+    h.diffSelection = { kind: "turn", turnId: turnIdA, filePath: null, revealRequestId: 0 };
+    h.checkpointDiff = { data: { diff: "CP", truncated: false }, error: null, isPending: false };
+    h.contextCheckpointDiff = { data: null, error: null, isPending: true };
+    render();
+    expect(h.contextCheckpointTargets.at(-1)).toMatchObject({
+      fromTurnCount: 1,
+      toTurnCount: 2,
+      contextLines: 0,
+    });
+    expect(h.contextPreviewArgs).toEqual([]);
+    expect(capturedLast("diffCompareView")["lineFilter"]).toMatchObject({
+      contextPending: true,
+      contextSupported: null,
+    });
   });
 
   it("marks a turn patch from this server that has short IDs as a stored one", () => {

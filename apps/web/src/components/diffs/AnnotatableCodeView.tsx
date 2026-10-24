@@ -81,6 +81,11 @@ export interface AnnotatableCodeViewProps {
     filePath: string;
     fileKey: string;
     collapsed: boolean;
+    /**
+     * The file comments are placed against, when the rendered one has other hunks: Compare
+     * renders a patch with its own context count, while comments index the default hunks.
+     */
+    commentFileDiff?: FileDiffMetadata;
   }>;
   sectionId: string;
   sectionTitle: string;
@@ -135,7 +140,7 @@ export function AnnotatableCodeView({
   const filesByKey = useMemo(() => new Map(files.map((file) => [file.fileKey, file])), [files]);
   const items = useMemo<CodeViewDiffItem<DiffCommentAnnotationGroup>[]>(
     () =>
-      files.map(({ fileDiff, filePath, fileKey, collapsed }) => {
+      files.map(({ fileDiff, filePath, fileKey, collapsed, commentFileDiff }) => {
         const persisted = reviewComments
           .filter(
             (comment) =>
@@ -144,7 +149,7 @@ export function AnnotatableCodeView({
               (comment.fenceLanguage ?? "diff") === "diff",
           )
           .reduce<DiffCommentLineAnnotation[]>((annotations, comment) => {
-            const range = restoreDiffReviewCommentRange(fileDiff, comment);
+            const range = restoreDiffReviewCommentRange(commentFileDiff ?? fileDiff, comment);
             if (!range) return annotations;
             return appendAnnotationEntry(annotations, range, {
               id: comment.id,
@@ -200,7 +205,7 @@ export function AnnotatableCodeView({
         sectionId,
         sectionTitle,
         filePath: file.filePath,
-        fileDiff: file.fileDiff,
+        fileDiff: file.commentFileDiff ?? file.fileDiff,
         range: entry.range,
         text,
       });
@@ -224,7 +229,7 @@ export function AnnotatableCodeView({
         sectionId,
         sectionTitle,
         filePath: file.filePath,
-        fileDiff: file.fileDiff,
+        fileDiff: file.commentFileDiff ?? file.fileDiff,
         range,
         text: "",
       });
