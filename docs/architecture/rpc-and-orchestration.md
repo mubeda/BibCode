@@ -695,7 +695,11 @@ Git's or the host CLI's own reason. The server redacts that output with
 pass-through: `VcsActionRemoteFailureError` keeps the message and uses it as
 its user-facing text, falling back to the action and phase only when the
 message is empty. The Source Control toasts title the failure by step ("Push
-failed", "Commit failed") and show that message beneath it.
+failed", "Commit failed") and show that message beneath it. The terminal
+`action_finished` or `action_failed` item arrives ahead of the RPC exit, so
+`consumeVcsActionProgress` settles from it: a transport failure after it, such
+as a socket closing before the exit, does not replace the server's result or
+reason.
 
 ### Pull Requests flow
 

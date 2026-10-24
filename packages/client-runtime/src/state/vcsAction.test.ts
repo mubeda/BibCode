@@ -896,6 +896,80 @@ describe("vcsActionState", () => {
     }),
   );
 
+  // The terminal event arrives as a stream item before the RPC exit; a socket that
+  // closes between the two must not replace what the server already decided (#174).
+  class TransportClosed extends Schema.TaggedError<TransportClosed>()("TransportClosed", {}) {}
+
+  it.effect("keeps the server's failure when the connection drops after it", () =>
+    Effect.gen(function* () {
+      const target = { environmentId, cwd };
+      const transportActionId = createVcsActionTransportId(target, actionId);
+      const remoteMessage = "fatal: pre-commit hook rejected the commit";
+      const error = yield* consumeVcsActionProgress(
+        Stream.concat(
+          Stream.fromIterable<GitActionProgressEvent>([
+            {
+              actionId: transportActionId,
+              action,
+              cwd,
+              kind: "action_failed",
+              phase: "commit",
+              message: remoteMessage,
+            },
+          ]),
+          Stream.fail(new TransportClosed()),
+        ),
+        { target, transportActionId, actionId, action, onProgress: () => Effect.void },
+      ).pipe(Effect.flip);
+
+      expect(error).toBeInstanceOf(VcsActionRemoteFailureError);
+      expect(error).toMatchObject({ phase: "commit", remoteMessage });
+    }),
+  );
+
+  it.effect("keeps the server's result when the connection drops after it", () =>
+    Effect.gen(function* () {
+      const target = { environmentId, cwd };
+      const transportActionId = createVcsActionTransportId(target, actionId);
+      const actual = yield* consumeVcsActionProgress(
+        Stream.concat(
+          Stream.fromIterable<GitActionProgressEvent>([
+            { actionId: transportActionId, action, cwd, kind: "action_finished", result },
+          ]),
+          Stream.fail(new TransportClosed()),
+        ),
+        { target, transportActionId, actionId, action, onProgress: () => Effect.void },
+      );
+
+      expect(actual).toEqual(result);
+    }),
+  );
+
+  it.effect("reports a connection drop before any terminal event as the transport error", () =>
+    Effect.gen(function* () {
+      const target = { environmentId, cwd };
+      const transportActionId = createVcsActionTransportId(target, actionId);
+      const error = yield* consumeVcsActionProgress(
+        Stream.concat(
+          Stream.fromIterable<GitActionProgressEvent>([
+            {
+              actionId: transportActionId,
+              action,
+              cwd,
+              kind: "phase_started",
+              phase: "push",
+              label: "Pushing...",
+            },
+          ]),
+          Stream.fail(new TransportClosed()),
+        ),
+        { target, transportActionId, actionId, action, onProgress: () => Effect.void },
+      ).pipe(Effect.flip);
+
+      expect(error).toBeInstanceOf(TransportClosed);
+    }),
+  );
+
   it.effect("reports a missing terminal event as a protocol failure", () =>
     Effect.gen(function* () {
       const target = { environmentId, cwd };
