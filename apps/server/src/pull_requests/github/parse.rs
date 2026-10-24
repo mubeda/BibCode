@@ -543,6 +543,7 @@ pub(super) fn detail(
             checks: check_count,
             files: changed_files,
         },
+        pipeline: None,
     };
     Ok(DetailRaw {
         merge_commit_sha: optional(&pr["mergeCommit"], "oid"),

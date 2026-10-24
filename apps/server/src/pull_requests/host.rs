@@ -263,6 +263,7 @@ impl HostCommandRunner {
         method: &str,
         path: &str,
         body: &serde_json::Value,
+        budget: Budget,
         c: &CancellationToken,
     ) -> Result<CommandOutput, ProcessFailure> {
         let private_file = crate::source_control::PrivateJsonBody::write(
@@ -283,7 +284,7 @@ impl HostCommandRunner {
                 OsStr::new("--input"),
                 private_file.path().as_os_str(),
             ],
-            Budget::Mutation,
+            budget,
             None,
             c,
         )
@@ -894,6 +895,7 @@ cat "$8"
                     method,
                     endpoint,
                     &body,
+                    Budget::Mutation,
                     &CancellationToken::new(),
                 )
                 .await
@@ -943,8 +945,14 @@ cat "$8"
             let scope = scope(&s);
             let c = CancellationToken::new();
             let body = serde_json::json!({ "body": "private body never in argv" });
-            let call =
-                runner.glab_api_with_body(&scope, "POST", "projects/team%2Frepo/notes", &body, &c);
+            let call = runner.glab_api_with_body(
+                &scope,
+                "POST",
+                "projects/team%2Frepo/notes",
+                &body,
+                Budget::Mutation,
+                &c,
+            );
             let inspect = async {
                 let path = tokio::time::timeout(Duration::from_secs(2), async {
                     loop {

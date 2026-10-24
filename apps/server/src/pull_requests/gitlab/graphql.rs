@@ -7,6 +7,38 @@ pub const DETAIL_METADATA_QUERY: &str = r#"query($projectPath:ID!, $iid:String!)
   } }
 }"#;
 
+/// The diff-head pipeline's stages for the detail join: GitLab's stage order,
+/// stage status and detailed status (`SUCCESS_WITH_WARNINGS`). A separate
+/// document, so an older host's failure degrades only the stage strip.
+pub const PIPELINE_STAGES_QUERY: &str = r#"query PullRequestsGitLabPipelineStages($projectPath:ID!, $iid:String!) {
+  project(fullPath:$projectPath) { mergeRequest(iid:$iid) {
+    headPipeline {
+      id status
+      stages { nodes { name status detailedStatus { name } } }
+    }
+  } }
+}"#;
+
+/// The same, plus up to 100 jobs per stage (trigger jobs included), for the
+/// poller's active ticks and `getChecks`.
+pub const PIPELINE_QUERY: &str = r#"query PullRequestsGitLabPipeline($projectPath:ID!, $iid:String!) {
+  project(fullPath:$projectPath) { mergeRequest(iid:$iid) {
+    headPipeline {
+      id status
+      stages { nodes {
+        name status detailedStatus { name }
+        jobs(first:100) {
+          pageInfo { hasNextPage }
+          nodes {
+            name status allowFailure webPath startedAt finishedAt duration
+            downstreamPipeline { path }
+          }
+        }
+      } }
+    }
+  } }
+}"#;
+
 // A bounded metadata-only fallback when REST diff output hits the patch cap.
 pub const FILES_METADATA_QUERY: &str = r#"query($projectPath:ID!, $iid:String!) {
   project(fullPath:$projectPath) { mergeRequest(iid:$iid) { diffStats { path additions deletions } } }

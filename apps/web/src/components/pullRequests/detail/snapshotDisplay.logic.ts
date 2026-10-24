@@ -3,6 +3,55 @@ export function newerObservedAt(current: number | null, incoming: number): boole
   return current === null || incoming > current;
 }
 
+/**
+ * The copy with the highest `revision` (the server's read generation) across
+ * every source, ignoring missing ones, so a copy on screen never moves back
+ * whichever read answers last. A copy without a revision (an older server, or
+ * a row an older build stored) ranks as 0 and never beats a stamped one; on a
+ * tie the earlier candidate wins, so with no revisions at all the first
+ * candidate present (the live value) is shown, as before.
+ */
+export function newestCopy<C extends { readonly revision?: number | undefined }>(
+  candidates: readonly (C | null | undefined)[],
+): C | null {
+  let newest: C | null = null;
+  for (const candidate of candidates) {
+    if (candidate == null) continue;
+    if (newest === null || (candidate.revision ?? 0) > (newest.revision ?? 0)) newest = candidate;
+  }
+  return newest;
+}
+
+/** The newest copy shown so far for one key (a merge request). */
+export interface KeptCopy<C> {
+  readonly key: unknown;
+  readonly copy: C;
+}
+
+/**
+ * `newestCopy` over `candidates` and the copy kept for `key`, so a source that
+ * drops out (a tab switch re-keys the snapshot read, which then has not
+ * answered or has failed) never moves the screen back to an older revision.
+ * The kept copy changes only for a strictly higher revision, or for another
+ * key; on a tie a candidate wins, so with no revisions the live value still
+ * shows first. `kept` is returned unchanged when nothing moved.
+ */
+export function keepNewestCopy<C extends { readonly revision?: number | undefined }>(
+  kept: KeptCopy<C> | null,
+  key: unknown,
+  candidates: readonly (C | null | undefined)[],
+): { shown: C | null; kept: KeptCopy<C> | null } {
+  const previous = kept?.key === key ? kept : null;
+  const shown = newestCopy([...candidates, previous?.copy]);
+  if (
+    shown !== null &&
+    (previous === null || (shown.revision ?? 0) > (previous.copy.revision ?? 0))
+  ) {
+    return { shown, kept: { key, copy: shown } };
+  }
+  return { shown, kept: previous };
+}
+
 export interface SnapshotCopy<P> {
   readonly payload: P;
   readonly observedAt: number;

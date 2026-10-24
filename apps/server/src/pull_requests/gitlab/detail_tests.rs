@@ -73,6 +73,10 @@ case "$1 $2" in
   'api projects/gitlab-org%2Fcli/merge_requests/3941/diffs?per_page=50&page='*) cat diffs.json ;;
   'api --method') test "$5" = -H && test "$6" = 'Content-Type: application/json' && test "$7" = --input || exit 65
     if grep -q 'resolveNote' "$8"; then cat invalid-field.json
+    elif grep -q 'PullRequestsGitLabPipeline' "$8"; then
+      if [ -e graph-error ]; then echo 'HTTP 500' >&2; exit 1; fi
+      if [ -e pipeline-graph.json ]; then cat pipeline-graph.json
+      else echo '{"data":{"project":{"mergeRequest":{"headPipeline":null}}}}'; fi
     elif grep -q 'PullRequestsGitLabTimeline' "$8"; then
       if grep -q 'after-100' "$8" && [ -e timeline-next.json ]; then cat timeline-next.json; else cat timeline.json; fi
     else cat metadata.json; fi ;;
@@ -272,6 +276,179 @@ async fn pull_requests_gitlab_detail_obeys_host_answers_and_reads_reviewers_rule
         1
     );
     assert!(calls.lines().all(|l| l.ends_with("--hostname gitlab.com")));
+}
+
+fn pipeline_graph_body(jobs: bool) -> Value {
+    let stage = |name: &str, status: &str, detailed: &str, job: &str| {
+        let mut stage =
+            json!({"name": name, "status": status, "detailedStatus": {"name": detailed}});
+        if jobs {
+            stage["jobs"] = json!({"pageInfo": {"hasNextPage": name == "test"}, "nodes": [
+                {"name": job, "status": status.to_ascii_uppercase(), "allowFailure": false,
+                 "webPath": format!("/gitlab-org/cli/-/jobs/{job}"), "startedAt": null,
+                 "finishedAt": null, "duration": 5, "downstreamPipeline": null}
+            ]});
+        }
+        stage
+    };
+    json!({"data":{"project":{"mergeRequest":{"headPipeline":{
+        "id": "gid://gitlab/Ci::Pipeline/9",
+        "status": "SUCCESS",
+        "stages": {"nodes": [
+            stage("build", "success", "SUCCESS", "compile"),
+            // GitLab computed this over every job, the ones past the cap too.
+            stage("test", "success", "SUCCESS_WITH_WARNINGS", "unit"),
+        ]},
+    }}}}})
+}
+
+#[tokio::test]
+async fn pull_requests_gitlab_detail_shows_the_pipeline_header_and_stages_on_first_paint() {
+    let (s, host, scope) = fixture();
+    let mut v: Value =
+        serde_json::from_str(&fs::read_to_string(s.path("detail.json")).unwrap()).unwrap();
+    v["head_pipeline"]["ref"] = json!("refs/merge-requests/3941/head");
+    v["head_pipeline"]["sha"] = json!("head-sha");
+    v["head_pipeline"]["detailed_status"] = json!({"group": "success-with-warnings"});
+    fs::write(s.path("detail.json"), v.to_string()).unwrap();
+    fs::write(
+        s.path("pipeline-graph.json"),
+        pipeline_graph_body(false).to_string(),
+    )
+    .unwrap();
+    let c = CancellationToken::new();
+    let context = host.context(&scope, &c).await.unwrap();
+    let d = host
+        .detail(&scope, 3941, &context, &c)
+        .await
+        .unwrap()
+        .detail_without_permissions;
+    let copy = d.pipeline.expect("a GitLab detail carries its pipeline");
+    assert!(
+        copy.checks.is_none(),
+        "the detail join reads stages, not jobs"
+    );
+    let Pipeline::Present(p) = copy.pipeline else {
+        panic!("a present pipeline");
+    };
+    assert_eq!(p.id, 9);
+    assert_eq!(p.kind, PipelineKind::MergeRequest);
+    assert_eq!(p.is_for_head, Some(true));
+    assert!(
+        p.warnings,
+        "the REST detailed status gives the header its warnings"
+    );
+    let stages = p.stages.unwrap();
+    assert_eq!(stages[1].name, "test");
+    assert!(
+        stages[1].warnings,
+        "a stage's allowed failure past the job cap still shows on first paint"
+    );
+    assert_eq!(
+        p.url.as_deref(),
+        Some("https://git.acme.example/team/sub/repo/-/pipelines/9"),
+        "built on the project's own web URL, never taken from the response"
+    );
+    let calls = fs::read_to_string(s.path("calls")).unwrap();
+    assert_eq!(
+        calls
+            .lines()
+            .filter(|l| l.starts_with("api --method"))
+            .count(),
+        2,
+        "the stages query is the eighth read of the one wave"
+    );
+}
+
+#[tokio::test]
+async fn pull_requests_gitlab_detail_graphql_pipeline_error_gives_null_stages_without_failing_get()
+{
+    let (s, host, scope) = fixture();
+    fs::write(s.path("graph-error"), "").unwrap();
+    let c = CancellationToken::new();
+    let context = host.context(&scope, &c).await.unwrap();
+    let d = host
+        .detail(&scope, 3941, &context, &c)
+        .await
+        .expect("the stage strip degrades on its own")
+        .detail_without_permissions;
+    let Pipeline::Present(p) = d.pipeline.unwrap().pipeline else {
+        panic!("the REST header still shows");
+    };
+    assert_eq!(p.id, 9);
+    assert_eq!(p.stages, None);
+    assert_eq!(p.is_for_head, None);
+}
+
+#[tokio::test]
+async fn pull_requests_gitlab_detail_without_pipeline_access_is_hidden_and_none_is_none() {
+    let (s, host, scope) = fixture();
+    let c = CancellationToken::new();
+    let context = host.context(&scope, &c).await.unwrap();
+    let mut v: Value =
+        serde_json::from_str(&fs::read_to_string(s.path("detail.json")).unwrap()).unwrap();
+    v.as_object_mut().unwrap().remove("head_pipeline");
+    fs::write(s.path("detail.json"), v.to_string()).unwrap();
+    let d = host.detail(&scope, 3941, &context, &c).await.unwrap();
+    assert_eq!(
+        d.detail_without_permissions.pipeline.unwrap().pipeline,
+        Pipeline::Hidden
+    );
+    v["head_pipeline"] = Value::Null;
+    fs::write(s.path("detail.json"), v.to_string()).unwrap();
+    let d = host.detail(&scope, 3941, &context, &c).await.unwrap();
+    assert_eq!(
+        d.detail_without_permissions.pipeline.unwrap().pipeline,
+        Pipeline::None
+    );
+}
+
+#[tokio::test]
+async fn pull_requests_gitlab_checks_read_the_gating_pipeline_in_stage_order_through_graphql() {
+    let (s, host, scope) = fixture();
+    fs::write(
+        s.path("pipeline-graph.json"),
+        pipeline_graph_body(true).to_string(),
+    )
+    .unwrap();
+    let checks = host
+        .checks(&scope, 3941, &CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        checks
+            .groups
+            .iter()
+            .map(|g| g.name.as_str())
+            .collect::<Vec<_>>(),
+        ["build", "test"]
+    );
+    assert_eq!(checks.groups[0].checks[0].duration_seconds, Some(5.0));
+    assert!(checks.truncated);
+    assert_eq!(checks.summary, CheckSummary::Success);
+    let calls = fs::read_to_string(s.path("calls")).unwrap();
+    assert!(
+        !calls.contains("pipelines?per_page=1"),
+        "the REST read is only the fallback"
+    );
+    // A host that rejects the query falls back to the REST read.
+    fs::write(s.path("graph-error"), "").unwrap();
+    fs::write(
+        s.path("pipelines.json"),
+        json!([{"id":9,"project_id":2,"web_url":"https://gitlab.com/pipeline/9"}]).to_string(),
+    )
+    .unwrap();
+    fs::write(
+        s.path("jobs.json"),
+        json!([{"name":"compile","stage":"build","status":"success"}]).to_string(),
+    )
+    .unwrap();
+    let checks = host
+        .checks(&scope, 3941, &CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(checks.groups[0].name, "build");
+    assert!(!checks.truncated);
 }
 
 #[tokio::test]

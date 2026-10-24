@@ -12,17 +12,337 @@ pub(super) fn invalid(operation: &str) -> PullRequestsOperationError {
     PullRequestsOperationError::new(operation, "invalid_response")
 }
 
-/// The four fields the poller reads from one `GET merge_requests/:iid` response.
-pub(super) fn probe_fingerprint(
+/// What the poller reads from one `GET merge_requests/:iid` response: the
+/// change-detection fingerprint, the pipeline header, and the state that
+/// decides its cadence.
+pub(super) struct Probe {
+    pub fingerprint: super::refresh::ProbeFingerprint,
+    pub header: Pipeline,
+    pub state: PullRequestState,
+}
+
+pub(super) fn probe(
     value: &Value,
+    project_web_url: Option<&str>,
     operation: &str,
-) -> Result<super::refresh::ProbeFingerprint, PullRequestsOperationError> {
-    Ok(super::refresh::ProbeFingerprint {
-        updated_at: string(value, "updated_at", operation)?,
-        user_notes_count: value["user_notes_count"].as_u64().unwrap_or(0),
-        pipeline_id: value["head_pipeline"]["id"].as_u64(),
-        pipeline_status: optional(&value["head_pipeline"], "status"),
+) -> Result<Probe, PullRequestsOperationError> {
+    let header = pipeline_header(value, project_web_url);
+    let state = match value["state"].as_str() {
+        Some("merged") => PullRequestState::Merged,
+        Some("closed") => PullRequestState::Closed,
+        _ => PullRequestState::Open,
+    };
+    Ok(Probe {
+        fingerprint: super::refresh::ProbeFingerprint {
+            updated_at: string(value, "updated_at", operation)?,
+            user_notes_count: value["user_notes_count"].as_u64().unwrap_or(0),
+            pipeline_id: value["head_pipeline"]["id"].as_u64(),
+            pipeline_status: optional(&value["head_pipeline"], "status"),
+            sha: optional(value, "sha").unwrap_or_default(),
+            detailed_merge_status: optional(value, "detailed_merge_status").unwrap_or_default(),
+            merge_when_pipeline_succeeds: value["merge_when_pipeline_succeeds"]
+                .as_bool()
+                .unwrap_or(false),
+            state: optional(value, "state").unwrap_or_default(),
+            pipeline_warnings: matches!(&header, Pipeline::Present(p) if p.warnings),
+        },
+        header,
+        state,
     })
+}
+
+/// GitLab's 13 pipeline and job statuses (REST lowercase, GraphQL uppercase).
+pub(super) fn pipeline_status(raw: &str) -> PipelineStatus {
+    match raw.to_ascii_lowercase().as_str() {
+        "created" => PipelineStatus::Created,
+        "waiting_for_resource" | "preparing" | "pending" => PipelineStatus::Queued,
+        "running" => PipelineStatus::Running,
+        "waiting_for_callback" => PipelineStatus::Waiting,
+        "manual" => PipelineStatus::Manual,
+        "scheduled" => PipelineStatus::Scheduled,
+        "canceling" => PipelineStatus::Canceling,
+        "success" => PipelineStatus::Success,
+        "failed" => PipelineStatus::Failed,
+        "canceled" => PipelineStatus::Canceled,
+        "skipped" => PipelineStatus::Skipped,
+        _ => PipelineStatus::Unknown,
+    }
+}
+
+/// The pipeline's kind follows its ref: GitLab names merge request, merged
+/// results and merge train refs under `refs/merge-requests/<iid>/`.
+pub(super) fn pipeline_kind(git_ref: &str, source_branch: Option<&str>) -> PipelineKind {
+    if let Some(rest) = git_ref.strip_prefix("refs/merge-requests/")
+        && let Some((iid, suffix)) = rest.split_once('/')
+        && !iid.is_empty()
+        && iid.bytes().all(|b| b.is_ascii_digit())
+    {
+        return match suffix {
+            "head" => PipelineKind::MergeRequest,
+            "merge" => PipelineKind::MergedResults,
+            "train" => PipelineKind::MergeTrain,
+            _ => PipelineKind::Other,
+        };
+    }
+    if source_branch.is_some_and(|branch| !branch.is_empty() && branch == git_ref) {
+        PipelineKind::Branch
+    } else {
+        PipelineKind::Other
+    }
+}
+
+/// `scheme://authority` of the project's web URL, the origin every pipeline
+/// and job link is built on.
+pub(super) fn web_origin(web_url: &str) -> Option<&str> {
+    let (scheme, rest) = web_url.split_once("://")?;
+    if !matches!(scheme, "http" | "https") || rest.is_empty() {
+        return None;
+    }
+    let end = rest.find('/').unwrap_or(rest.len());
+    (end > 0).then(|| &web_url[..scheme.len() + 3 + end])
+}
+
+/// A host-relative path (`/group/project/-/jobs/1`) on the project's origin.
+/// Anything that is not a plain absolute path is dropped, not followed.
+fn host_link(origin: Option<&str>, path: &Value) -> Option<String> {
+    let path = path.as_str()?;
+    if !path.starts_with('/') || path.starts_with("//") || path.contains(['\\', '\n', '\r']) {
+        return None;
+    }
+    origin.map(|origin| format!("{origin}{path}"))
+}
+
+/// The REST `head_pipeline` header. The key is exposed only to an account
+/// that can view pipelines, so an absent key is `Hidden` and `null` is `None`.
+pub(super) fn pipeline_header(request: &Value, project_web_url: Option<&str>) -> Pipeline {
+    let Some(head) = request.get("head_pipeline") else {
+        return Pipeline::Hidden;
+    };
+    let Some(id) = head["id"].as_u64() else {
+        return Pipeline::None;
+    };
+    let git_ref = optional(head, "ref").unwrap_or_default();
+    let source_branch = request["source_branch"].as_str();
+    Pipeline::Present(PresentPipeline {
+        id,
+        status: head["status"]
+            .as_str()
+            .map_or(PipelineStatus::Unknown, pipeline_status),
+        warnings: head["detailed_status"]["group"].as_str() == Some("success-with-warnings"),
+        kind: pipeline_kind(&git_ref, source_branch),
+        git_ref,
+        sha: optional(head, "sha").unwrap_or_default(),
+        is_for_head: None,
+        url: project_web_url
+            .filter(|url| web_origin(url).is_some())
+            .map(|url| format!("{}/-/pipelines/{id}", url.trim_end_matches('/'))),
+        updated_at: optional(head, "updated_at").unwrap_or_default(),
+        started_at: optional(head, "started_at"),
+        finished_at: optional(head, "finished_at"),
+        duration_seconds: head["duration"].as_f64().filter(|seconds| *seconds >= 0.0),
+        stages: None,
+    })
+}
+
+/// The GraphQL `headPipeline` read: GitLab's stage order, stage statuses and,
+/// for the full query, each stage's jobs as `Checks` groups.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct PipelineGraph {
+    pub id: u64,
+    pub status: Option<PipelineStatus>,
+    /// `None` when the account cannot read jobs (`read_build`).
+    pub stages: Option<Vec<PipelineStage>>,
+    /// The job groups, when the query selected jobs and they could be read.
+    pub checks: Option<Checks>,
+}
+
+/// `Ok(None)` when GitLab has no pipeline for the request's diff head.
+pub(super) fn pipeline_graph(
+    value: &Value,
+    project_web_url: Option<&str>,
+    operation: &str,
+) -> Result<Option<PipelineGraph>, PullRequestsOperationError> {
+    use crate::pull_requests::read;
+    let request = &value["data"]["project"]["mergeRequest"];
+    let Some(head) = request.as_object().and_then(|r| r.get("headPipeline")) else {
+        return Err(invalid(operation));
+    };
+    if head.is_null() {
+        return Ok(None);
+    }
+    let id = string(head, "id", operation)?
+        .strip_prefix("gid://gitlab/Ci::Pipeline/")
+        .and_then(|id| id.parse::<u64>().ok())
+        .ok_or_else(|| invalid(operation))?;
+    let status = head["status"].as_str().map(pipeline_status);
+    let origin = project_web_url.and_then(web_origin);
+    let stage_nodes = match &head["stages"] {
+        Value::Null => None,
+        stages => Some(
+            stages["nodes"]
+                .as_array()
+                .ok_or_else(|| invalid(operation))?,
+        ),
+    };
+    let Some(stage_nodes) = stage_nodes else {
+        return Ok(Some(PipelineGraph {
+            id,
+            status,
+            stages: None,
+            checks: None,
+        }));
+    };
+    let mut stages = Vec::with_capacity(stage_nodes.len());
+    let mut rows = Vec::new();
+    let mut with_jobs = true;
+    let mut truncated = false;
+    for node in stage_nodes {
+        let name = string(node, "name", operation)?;
+        stages.push(PipelineStage {
+            name: name.clone(),
+            status: node["status"]
+                .as_str()
+                .map_or(PipelineStatus::Unknown, pipeline_status),
+            warnings: node["detailedStatus"]["name"].as_str() == Some("SUCCESS_WITH_WARNINGS"),
+        });
+        let Some(jobs) = node.get("jobs").filter(|jobs| !jobs.is_null()) else {
+            with_jobs = false;
+            continue;
+        };
+        let (jobs, more) = graphql_nodes(jobs, operation)?;
+        truncated |= more;
+        for job in jobs {
+            let started_at = optional(job, "startedAt");
+            let completed_at = optional(job, "finishedAt");
+            let state = match job["status"].as_str().map(pipeline_status) {
+                Some(PipelineStatus::Success) => CheckState::Success,
+                Some(PipelineStatus::Failed) if job["allowFailure"].as_bool() == Some(true) => {
+                    CheckState::Neutral
+                }
+                Some(PipelineStatus::Failed) => CheckState::Failure,
+                Some(PipelineStatus::Canceled) => CheckState::Cancelled,
+                Some(PipelineStatus::Skipped | PipelineStatus::Manual) => CheckState::Skipped,
+                _ => CheckState::Pending,
+            };
+            rows.push((
+                name.clone(),
+                Check {
+                    name: string(job, "name", operation)?,
+                    state,
+                    url: host_link(origin, &job["downstreamPipeline"]["path"])
+                        .or_else(|| host_link(origin, &job["webPath"])),
+                    duration_seconds: job["duration"]
+                        .as_f64()
+                        .filter(|seconds| *seconds >= 0.0)
+                        .or_else(|| read::duration(started_at.as_deref(), completed_at.as_deref())),
+                    started_at,
+                    completed_at,
+                },
+            ));
+        }
+    }
+    let checks = with_jobs.then(|| {
+        let url = project_web_url
+            .filter(|url| web_origin(url).is_some())
+            .map(|url| format!("{}/-/pipelines/{id}", url.trim_end_matches('/')));
+        // Rows arrive stage by stage, so the groups keep GitLab's stage order.
+        let mut checks = read::grouped_checks(rows, url);
+        // GitLab computed the pipeline's own status over every job.
+        if let Some(status) = status {
+            checks.summary = checks_summary(status);
+        }
+        checks.truncated = truncated;
+        checks
+    });
+    Ok(Some(PipelineGraph {
+        id,
+        status,
+        stages: Some(stages),
+        checks,
+    }))
+}
+
+fn checks_summary(status: PipelineStatus) -> CheckSummary {
+    match status {
+        PipelineStatus::Success => CheckSummary::Success,
+        PipelineStatus::Failed => CheckSummary::Failure,
+        PipelineStatus::Created
+        | PipelineStatus::Queued
+        | PipelineStatus::Running
+        | PipelineStatus::Waiting
+        | PipelineStatus::Canceling => CheckSummary::Pending,
+        PipelineStatus::Manual
+        | PipelineStatus::Scheduled
+        | PipelineStatus::Canceled
+        | PipelineStatus::Skipped
+        | PipelineStatus::Unknown => CheckSummary::Neutral,
+    }
+}
+
+/// What the GraphQL read gave for the pipeline this tick.
+pub(super) enum GraphRead<'a> {
+    /// Not attempted, or it failed: the REST header stands alone.
+    Missing,
+    Read(Option<&'a PipelineGraph>),
+}
+
+/// The pipeline copy, or `Race` when the two reads saw different pipelines
+/// (a push or a same-commit rerun between them).
+#[derive(Debug, PartialEq)]
+pub(super) enum Combined {
+    Copy(Pipeline),
+    Race,
+}
+
+/// Combines the REST header with the GraphQL read only when both name the
+/// same pipeline; `stored` lends its stages to the REST header of the same id.
+pub(super) fn combine_pipeline(
+    rest: &Pipeline,
+    graph: GraphRead<'_>,
+    stored: Option<&Pipeline>,
+) -> Combined {
+    let stored_stages = |id: u64| match stored {
+        Some(Pipeline::Present(stored)) if stored.id == id => stored.stages.clone(),
+        _ => None,
+    };
+    match (rest, graph) {
+        (Pipeline::Hidden, _) => Combined::Copy(Pipeline::Hidden),
+        (Pipeline::None, GraphRead::Read(Some(_))) => Combined::Race,
+        (Pipeline::None, _) => Combined::Copy(Pipeline::None),
+        (Pipeline::Present(header), GraphRead::Read(Some(graph))) if graph.id == header.id => {
+            Combined::Copy(Pipeline::Present(PresentPipeline {
+                is_for_head: Some(true),
+                stages: graph.stages.clone(),
+                ..header.clone()
+            }))
+        }
+        (Pipeline::Present(_), GraphRead::Read(Some(_))) => Combined::Race,
+        (Pipeline::Present(header), GraphRead::Read(None)) => {
+            Combined::Copy(Pipeline::Present(PresentPipeline {
+                is_for_head: Some(false),
+                stages: stored_stages(header.id),
+                ..header.clone()
+            }))
+        }
+        (Pipeline::Present(header), GraphRead::Missing) => {
+            Combined::Copy(Pipeline::Present(PresentPipeline {
+                is_for_head: None,
+                stages: stored_stages(header.id),
+                ..header.clone()
+            }))
+        }
+    }
+}
+
+/// A unary read must answer: a race reads like a failed GraphQL read.
+pub(super) fn unary_pipeline(rest: &Pipeline, graph: GraphRead<'_>) -> Pipeline {
+    match combine_pipeline(rest, graph, None) {
+        Combined::Copy(pipeline) => pipeline,
+        Combined::Race => match combine_pipeline(rest, GraphRead::Missing, None) {
+            Combined::Copy(pipeline) => pipeline,
+            Combined::Race => Pipeline::None,
+        },
+    }
 }
 
 pub(super) fn create_defaults(
@@ -493,6 +813,7 @@ pub(super) fn detail(
             checks: None,
             files: changed_files,
         },
+        pipeline: None,
     };
     Ok(DetailRaw {
         merge_commit_sha: optional(v, "merge_commit_sha")
@@ -1217,6 +1538,347 @@ mod mapping_tests {
         ] {
             assert_eq!(system_event(body), event, "{body}");
         }
+    }
+}
+
+#[cfg(test)]
+mod pipeline_tests {
+    use super::*;
+    use serde_json::json;
+
+    const WEB_URL: &str = "https://gitlab.example/team/repo";
+
+    fn request(head: Value) -> Value {
+        json!({"iid": 42, "source_branch": "feature/login", "head_pipeline": head})
+    }
+
+    fn header(id: u64) -> Pipeline {
+        pipeline_header(
+            &request(
+                json!({"id": id, "status": "running", "ref": "refs/merge-requests/42/head", "sha": "abc1234def", "updated_at": "t"}),
+            ),
+            Some(WEB_URL),
+        )
+    }
+
+    fn graph(id: u64) -> PipelineGraph {
+        PipelineGraph {
+            id,
+            status: Some(PipelineStatus::Running),
+            stages: Some(vec![PipelineStage {
+                name: "test".into(),
+                status: PipelineStatus::Running,
+                warnings: false,
+            }]),
+            checks: None,
+        }
+    }
+
+    fn present(pipeline: &Pipeline) -> &PresentPipeline {
+        match pipeline {
+            Pipeline::Present(p) => p,
+            other => panic!("expected a present pipeline, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_absent_head_pipeline_is_hidden_and_null_is_none() {
+        assert_eq!(
+            pipeline_header(&json!({"iid": 1}), Some(WEB_URL)),
+            Pipeline::Hidden
+        );
+        assert_eq!(
+            pipeline_header(&request(Value::Null), Some(WEB_URL)),
+            Pipeline::None
+        );
+        let p = header(4821);
+        let p = present(&p);
+        assert_eq!(p.id, 4821);
+        assert_eq!(
+            p.url.as_deref(),
+            Some("https://gitlab.example/team/repo/-/pipelines/4821"),
+            "the link is built on the project's own URL"
+        );
+        assert_eq!(p.is_for_head, None);
+        assert_eq!(p.stages, None);
+    }
+
+    #[test]
+    fn the_kind_follows_the_ref() {
+        for (git_ref, kind) in [
+            ("refs/merge-requests/42/head", PipelineKind::MergeRequest),
+            ("refs/merge-requests/42/merge", PipelineKind::MergedResults),
+            ("refs/merge-requests/42/train", PipelineKind::MergeTrain),
+            ("feature/login", PipelineKind::Branch),
+            ("main", PipelineKind::Other),
+            ("refs/merge-requests/x/head", PipelineKind::Other),
+            ("", PipelineKind::Other),
+        ] {
+            assert_eq!(
+                pipeline_kind(git_ref, Some("feature/login")),
+                kind,
+                "{git_ref}"
+            );
+        }
+    }
+
+    #[test]
+    fn all_thirteen_statuses_map_and_an_unknown_one_is_unknown() {
+        for (raw, status) in [
+            ("created", PipelineStatus::Created),
+            ("waiting_for_resource", PipelineStatus::Queued),
+            ("preparing", PipelineStatus::Queued),
+            ("pending", PipelineStatus::Queued),
+            ("running", PipelineStatus::Running),
+            ("waiting_for_callback", PipelineStatus::Waiting),
+            ("manual", PipelineStatus::Manual),
+            ("scheduled", PipelineStatus::Scheduled),
+            ("canceling", PipelineStatus::Canceling),
+            ("success", PipelineStatus::Success),
+            ("failed", PipelineStatus::Failed),
+            ("canceled", PipelineStatus::Canceled),
+            ("skipped", PipelineStatus::Skipped),
+            ("RUNNING", PipelineStatus::Running),
+            ("a_status_from_the_future", PipelineStatus::Unknown),
+        ] {
+            assert_eq!(pipeline_status(raw), status, "{raw}");
+        }
+    }
+
+    #[test]
+    fn rest_detailed_status_gives_the_header_its_warnings() {
+        let head = |group: &str| json!({"id": 1, "status": "success", "detailed_status": {"group": group}});
+        assert!(
+            present(&pipeline_header(
+                &request(head("success-with-warnings")),
+                None
+            ))
+            .warnings
+        );
+        assert!(!present(&pipeline_header(&request(head("success")), None)).warnings);
+    }
+
+    fn graph_response(stages: Value) -> Value {
+        json!({"data":{"project":{"mergeRequest":{"headPipeline":{
+            "id": "gid://gitlab/Ci::Pipeline/4821",
+            "status": "SUCCESS",
+            "stages": stages,
+        }}}}})
+    }
+
+    fn job(name: &str, status: &str) -> Value {
+        json!({"name": name, "status": status, "allowFailure": false, "webPath": format!("/team/repo/-/jobs/{name}"),
+            "startedAt": "2026-10-24T10:00:00Z", "finishedAt": "2026-10-24T10:01:00Z", "duration": 60, "downstreamPipeline": null})
+    }
+
+    fn stage(name: &str, status: &str, detailed: &str, jobs: Vec<Value>, more: bool) -> Value {
+        json!({"name": name, "status": status, "detailedStatus": {"name": detailed},
+            "jobs": {"pageInfo": {"hasNextPage": more}, "nodes": jobs}})
+    }
+
+    #[test]
+    fn the_graph_keeps_stage_order_trigger_jobs_and_truncation() {
+        let mut trigger = job("deploy-downstream", "SUCCESS");
+        trigger["webPath"] = Value::Null;
+        trigger["downstreamPipeline"] = json!({"path": "/team/other/-/pipelines/77"});
+        let value = graph_response(json!({"nodes": [
+            stage("build", "success", "SUCCESS", vec![job("compile", "SUCCESS")], false),
+            stage("test", "success", "SUCCESS_WITH_WARNINGS", vec![job("unit", "SUCCESS")], true),
+            stage("deploy", "success", "SUCCESS", vec![trigger], false),
+        ]}));
+        let graph = pipeline_graph(&value, Some(WEB_URL), "op")
+            .unwrap()
+            .unwrap();
+        assert_eq!(graph.id, 4821, "the id is the end of the global ID");
+        let stages = graph.stages.unwrap();
+        assert_eq!(
+            stages.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            ["build", "test", "deploy"],
+            "GitLab's stage order, not newest job first"
+        );
+        assert!(
+            stages[1].warnings,
+            "the stage's detailed status gives its warnings"
+        );
+        assert!(!stages[0].warnings);
+        let checks = graph.checks.unwrap();
+        assert!(checks.truncated, "a stage with more jobs truncates");
+        assert_eq!(checks.summary, CheckSummary::Success);
+        assert_eq!(
+            checks
+                .groups
+                .iter()
+                .map(|g| g.name.as_str())
+                .collect::<Vec<_>>(),
+            ["build", "test", "deploy"]
+        );
+        assert_eq!(
+            checks.groups[2].checks[0].url.as_deref(),
+            Some("https://gitlab.example/team/other/-/pipelines/77"),
+            "a trigger job lists in its stage and links its downstream pipeline"
+        );
+        assert_eq!(
+            checks.groups[0].checks[0].url.as_deref(),
+            Some("https://gitlab.example/team/repo/-/jobs/compile")
+        );
+        assert_eq!(checks.groups[0].checks[0].duration_seconds, Some(60.0));
+        assert_eq!(
+            checks.pipeline_url.as_deref(),
+            Some("https://gitlab.example/team/repo/-/pipelines/4821")
+        );
+    }
+
+    #[test]
+    fn job_links_never_follow_response_text_off_the_project_origin() {
+        let mut outside = job("outside", "SUCCESS");
+        outside["webPath"] = json!("//evil.example/x");
+        let mut absolute = job("absolute", "SUCCESS");
+        absolute["webPath"] = json!("https://evil.example/x");
+        let value = graph_response(json!({"nodes": [
+            stage("build", "success", "SUCCESS", vec![outside, absolute], false),
+        ]}));
+        let checks = pipeline_graph(&value, Some(WEB_URL), "op")
+            .unwrap()
+            .unwrap()
+            .checks
+            .unwrap();
+        assert!(
+            checks.groups[0]
+                .checks
+                .iter()
+                .all(|check| check.url.is_none())
+        );
+    }
+
+    #[test]
+    fn an_allowed_failure_reads_neutral_and_the_stage_keeps_gitlab_warnings() {
+        let mut allowed = job("lint", "FAILED");
+        allowed["allowFailure"] = json!(true);
+        let value = graph_response(json!({"nodes": [
+            stage("test", "success", "SUCCESS_WITH_WARNINGS", vec![allowed, job("unit", "FAILED")], false),
+        ]}));
+        let graph = pipeline_graph(&value, None, "op").unwrap().unwrap();
+        let checks = graph.checks.unwrap();
+        assert_eq!(checks.groups[0].checks[0].state, CheckState::Neutral);
+        assert_eq!(checks.groups[0].checks[1].state, CheckState::Failure);
+        assert!(graph.stages.unwrap()[0].warnings);
+    }
+
+    #[test]
+    fn a_stages_only_read_has_no_checks_and_null_stages_mean_no_job_access() {
+        let value = graph_response(json!({"nodes": [
+            {"name": "build", "status": "running", "detailedStatus": {"name": "RUNNING"}},
+        ]}));
+        let graph = pipeline_graph(&value, None, "op").unwrap().unwrap();
+        assert_eq!(graph.stages.unwrap().len(), 1);
+        assert!(graph.checks.is_none());
+        let graph = pipeline_graph(&graph_response(Value::Null), None, "op")
+            .unwrap()
+            .unwrap();
+        assert!(graph.stages.is_none() && graph.checks.is_none());
+    }
+
+    #[test]
+    fn a_missing_head_pipeline_is_invalid_and_null_is_no_diff_head_pipeline() {
+        let none = json!({"data":{"project":{"mergeRequest":{"headPipeline": null}}}});
+        assert_eq!(pipeline_graph(&none, None, "op").unwrap(), None);
+        let metadata = json!({"data":{"project":{"mergeRequest":{"commitCount": 2}}}});
+        assert!(pipeline_graph(&metadata, None, "op").is_err());
+        let bad_id = json!({"data":{"project":{"mergeRequest":{"headPipeline":{"id":"gid://gitlab/Ci::Build/1","stages":null}}}}});
+        assert!(pipeline_graph(&bad_id, None, "op").is_err());
+    }
+
+    #[test]
+    fn every_row_of_the_combining_table() {
+        let stored = Pipeline::Present(PresentPipeline {
+            stages: graph(9).stages,
+            ..present(&header(9)).clone()
+        });
+        // id N and id N: header from REST, stages from GraphQL.
+        let Combined::Copy(both) =
+            combine_pipeline(&header(9), GraphRead::Read(Some(&graph(9))), None)
+        else {
+            panic!("a copy");
+        };
+        assert_eq!(present(&both).is_for_head, Some(true));
+        assert_eq!(present(&both).stages, graph(9).stages);
+        assert_eq!(present(&both).git_ref, "refs/merge-requests/42/head");
+        // id N and null: an older commit; stages from a stored copy of N only.
+        let Combined::Copy(older) =
+            combine_pipeline(&header(9), GraphRead::Read(None), Some(&stored))
+        else {
+            panic!("a copy");
+        };
+        assert_eq!(present(&older).is_for_head, Some(false));
+        assert!(present(&older).stages.is_some());
+        let Combined::Copy(older) =
+            combine_pipeline(&header(10), GraphRead::Read(None), Some(&stored))
+        else {
+            panic!("a copy");
+        };
+        assert!(present(&older).stages.is_none());
+        // id N and id M, or null and id M: a race, nothing is written.
+        assert_eq!(
+            combine_pipeline(&header(10), GraphRead::Read(Some(&graph(9))), None),
+            Combined::Race
+        );
+        assert_eq!(
+            combine_pipeline(&Pipeline::None, GraphRead::Read(Some(&graph(9))), None),
+            Combined::Race
+        );
+        // null and null: none. Absent and not read: hidden.
+        assert_eq!(
+            combine_pipeline(&Pipeline::None, GraphRead::Read(None), None),
+            Combined::Copy(Pipeline::None)
+        );
+        assert_eq!(
+            combine_pipeline(&Pipeline::Hidden, GraphRead::Missing, None),
+            Combined::Copy(Pipeline::Hidden)
+        );
+        // id N and a failed read: the REST header, stored stages of N, unknown head.
+        let Combined::Copy(failed) =
+            combine_pipeline(&header(9), GraphRead::Missing, Some(&stored))
+        else {
+            panic!("a copy");
+        };
+        assert_eq!(present(&failed).is_for_head, None);
+        assert!(present(&failed).stages.is_some());
+    }
+
+    #[test]
+    fn a_same_commit_rerun_or_a_push_between_the_reads_never_answers_older_commit_unasked() {
+        // A unary read must answer: a race reads like a failed GraphQL read.
+        for rest in [header(10), Pipeline::None] {
+            let pipeline = unary_pipeline(&rest, GraphRead::Read(Some(&graph(9))));
+            if let Pipeline::Present(p) = &pipeline {
+                assert_eq!(p.is_for_head, None, "a rerun is never `Older commit`");
+                assert!(p.stages.is_none());
+            } else {
+                assert_eq!(pipeline, Pipeline::None);
+            }
+        }
+        // A push between the reads: GraphQL has no diff-head pipeline for the
+        // REST id, which is now true.
+        let pushed = unary_pipeline(&header(9), GraphRead::Read(None));
+        assert_eq!(present(&pushed).is_for_head, Some(false));
+    }
+
+    #[test]
+    fn the_web_origin_is_scheme_and_authority() {
+        assert_eq!(
+            web_origin("https://gitlab.example/team/repo"),
+            Some("https://gitlab.example")
+        );
+        assert_eq!(
+            web_origin("http://git.local:8080/a"),
+            Some("http://git.local:8080")
+        );
+        assert_eq!(
+            web_origin("https://gitlab.example"),
+            Some("https://gitlab.example")
+        );
+        assert_eq!(web_origin("javascript:alert(1)"), None);
+        assert_eq!(web_origin("ftp://x/y"), None);
     }
 }
 

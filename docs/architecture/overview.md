@@ -2654,7 +2654,13 @@ See [RPC and orchestration](./rpc-and-orchestration.md) and
   creates managed workspace ownership for new worktrees, and keeps started Git
   writes alive through client disconnect until settlement (with the documented
   24-hour per-command safety ceiling). Only `gh`, `glab`, and `git` run through
-  the module’s process boundary; it owns no HTTP client or background poller. See
+  the module’s process boundary; it owns no HTTP client and spawns no task. Its
+  one recurring read is GitLab's subscription poller, which runs cooperatively
+  inside the `pullRequests.subscribe` calls of a visible list or merge request
+  and stops with the last of them: it lists every 20 s, probes each subscribed
+  merge request, reads a running pipeline's stages and jobs every 10 s for at
+  most three of them, and stores one `pipeline` display row the merge box and
+  the Pipelines tab paint from. See
   [Pull Requests contract boundary](./rpc-and-orchestration.md#pull-requests-contract-boundary).
 - The right panel (`rightPanelStore`) can show one request per tab, with no new
   server contract. `pullRequest` surfaces (`pullRequest:<number>`, with the

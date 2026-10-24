@@ -1,9 +1,14 @@
 import { getChangeRequestTerminologyForKind } from "@bibcode/shared/sourceControl";
-import type { PullRequestsChecks as Checks, PullRequestsContext } from "@bibcode/contracts";
+import type {
+  PullRequestsChecks as Checks,
+  PullRequestsContext,
+  PullRequestsPipeline,
+} from "@bibcode/contracts";
 import { CircleCheckIcon, CircleDotIcon, CircleMinusIcon, CircleXIcon } from "lucide-react";
 import { memo } from "react";
 import { PullRequestsExternalLink } from "../shared/PullRequestsMarkdown";
 import { checksSummaryLabel } from "./pullRequestsDetail.logic";
+import { PullRequestsPipelineSummary } from "./PullRequestsPipelineSummary";
 const STATES = {
   pending: { Icon: CircleDotIcon, color: "text-amber-600 dark:text-amber-400" },
   success: { Icon: CircleCheckIcon, color: "text-green-600 dark:text-green-400" },
@@ -55,9 +60,18 @@ const CheckGroup = memo(function CheckGroup({ group }: { group: Checks["groups"]
 export const PullRequestsChecks = memo(function PullRequestsChecks({
   checks,
   context,
+  pipeline = null,
+  branch = "",
+  settled = true,
 }: {
   checks: Checks;
   context: Extract<PullRequestsContext, { status: "available" }>;
+  /** The gating pipeline's summary (GitLab, newer servers); it replaces the bare link. */
+  pipeline?: PullRequestsPipeline | null;
+  /** The request's source branch, for the summary. */
+  branch?: string;
+  /** This mount's live read has answered; earlier copies never announce. */
+  settled?: boolean;
 }) {
   const empty = checks.groups.every((group) => group.checks.length === 0);
   return (
@@ -66,11 +80,26 @@ export const PullRequestsChecks = memo(function PullRequestsChecks({
       className="min-h-0 flex-1 space-y-3 overflow-auto p-4"
       data-text-surface="background"
     >
-      {checks.pipelineUrl ? (
+      {pipeline ? (
+        <PullRequestsPipelineSummary pipeline={pipeline} branch={branch} settled={settled} />
+      ) : checks.pipelineUrl ? (
         <p className="text-sm">
           <PullRequestsExternalLink href={checks.pipelineUrl}>
             Open pipeline
           </PullRequestsExternalLink>
+        </p>
+      ) : null}
+      {checks.truncated ? (
+        <p className="text-sm text-muted-foreground">
+          Showing the first 100 jobs of a stage.{" "}
+          {checks.pipelineUrl ? (
+            <PullRequestsExternalLink href={checks.pipelineUrl}>
+              Open the pipeline
+            </PullRequestsExternalLink>
+          ) : (
+            "Open the pipeline"
+          )}{" "}
+          for the rest.
         </p>
       ) : null}
       <p className="text-sm text-muted-foreground">

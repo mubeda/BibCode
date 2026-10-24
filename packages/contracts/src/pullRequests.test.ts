@@ -691,6 +691,73 @@ describe("PullRequests snapshots and change events", () => {
     });
   });
 
+  const pipelineCopy = {
+    revision: 1_761_300_000_123,
+    pipeline: {
+      _tag: "present",
+      id: 4821,
+      status: "running",
+      warnings: false,
+      kind: "merge_request",
+      ref: "refs/merge-requests/42/head",
+      sha: "abc1234def",
+      isForHead: true,
+      url: "https://gitlab.example/team/repo/-/pipelines/4821",
+      updatedAt: "2026-10-24T10:00:00Z",
+      startedAt: "2026-10-24T09:58:00Z",
+      finishedAt: null,
+      durationSeconds: null,
+      stages: [
+        { name: "build", status: "success", warnings: true },
+        { name: "test", status: "running", warnings: false },
+      ],
+    },
+    checks: {
+      groups: [],
+      summary: "pending",
+      pipelineUrl: null,
+      revision: 1_761_300_000_123,
+      truncated: true,
+    },
+  } as const;
+
+  it("decodes the pipeline additions and keeps them optional for older peers", () => {
+    expect(decodePullRequestsDetail(detail).pipeline).toBeUndefined();
+    expect(decodePullRequestsDetail({ ...detail, pipeline: pipelineCopy }).pipeline).toEqual(
+      pipelineCopy,
+    );
+    for (const pipeline of [{ _tag: "none" }, { _tag: "hidden" }]) {
+      expect(
+        decodePullRequestsDetail({ ...detail, pipeline: { ...pipelineCopy, pipeline } }),
+      ).toMatchObject({ pipeline: { pipeline } });
+    }
+    expect(() =>
+      decodePullRequestsDetail({
+        ...detail,
+        pipeline: { ...pipelineCopy, pipeline: { ...pipelineCopy.pipeline, status: "pending" } },
+      }),
+    ).toThrow();
+    const snapshot = { list: null, detail: null, tab: null };
+    expect(decodePullRequestsSnapshot(snapshot).pipeline).toBeUndefined();
+    expect(decodePullRequestsSnapshot({ ...snapshot, pipeline: null }).pipeline).toBeNull();
+    expect(
+      decodePullRequestsSnapshot({
+        ...snapshot,
+        pipeline: { payload: pipelineCopy, observedAt: 2 },
+      }).pipeline,
+    ).toEqual({ payload: pipelineCopy, observedAt: 2 });
+    const changed = {
+      list: false,
+      detail: false,
+      timeline: false,
+      commits: false,
+      checks: true,
+      files: false,
+    };
+    expect(decodePullRequestsChanged(changed).pipeline).toBeUndefined();
+    expect(decodePullRequestsChanged({ ...changed, pipeline: true }).pipeline).toBe(true);
+  });
+
   it("rejects a changed event that omits checks", () => {
     expect(() =>
       decodePullRequestsChanged({

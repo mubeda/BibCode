@@ -4,6 +4,9 @@ import type {
   PullRequestsFile,
   PullRequestsHostCapabilities,
   PullRequestsMergeReadiness,
+  PullRequestsPipeline,
+  PullRequestsPipelineKind,
+  PullRequestsPipelineStatus,
   PullRequestsProviderKind,
   PullRequestsTimelineItem,
 } from "@bibcode/contracts";
@@ -71,6 +74,63 @@ const CHECKS_LABELS = {
 };
 export function checksSummaryLabel(checks: PullRequestsChecks): string {
   return CHECKS_LABELS[checks.summary];
+}
+type PresentPipeline = Extract<PullRequestsPipeline, { _tag: "present" }>;
+const PIPELINE_KINDS: Record<PullRequestsPipelineKind, string> = {
+  merge_request: "Merge request pipeline",
+  merged_results: "Merged results pipeline",
+  merge_train: "Merge train pipeline",
+  branch: "Branch pipeline",
+  other: "Pipeline",
+};
+const PIPELINE_STATUSES: Record<PullRequestsPipelineStatus, string> = {
+  created: "created",
+  queued: "queued",
+  running: "running",
+  waiting: "waiting",
+  manual: "waiting for a manual job",
+  scheduled: "scheduled",
+  canceling: "canceling",
+  success: "passed",
+  failed: "failed",
+  canceled: "canceled",
+  skipped: "skipped",
+  unknown: "status unknown",
+};
+/** "Merge request pipeline", or plain "Pipeline" for a ref GitLab did not name. */
+export function pipelineKindLabel(kind: PullRequestsPipelineKind): string {
+  return PIPELINE_KINDS[kind];
+}
+/** The status words for a pipeline or one of its stages. */
+export function pipelineStatusLabel(status: PullRequestsPipelineStatus, warnings: boolean): string {
+  return status === "success" && warnings ? "passed with warnings" : PIPELINE_STATUSES[status];
+}
+const TERMINAL_PIPELINE_STATUSES: ReadonlySet<PullRequestsPipelineStatus> = new Set([
+  "success",
+  "failed",
+  "canceled",
+  "skipped",
+]);
+export function isTerminalPipelineStatus(status: PullRequestsPipelineStatus): boolean {
+  return TERMINAL_PIPELINE_STATUSES.has(status);
+}
+/**
+ * The commit a pipeline ran for, shortened. Only merge request and branch
+ * pipelines run on a commit the user pushed; a merged-results or train
+ * pipeline's SHA is a merge commit GitLab made, so it is not shown.
+ */
+export function pipelineShortSha(pipeline: PresentPipeline): string | null {
+  if (pipeline.kind !== "merge_request" && pipeline.kind !== "branch") return null;
+  const sha = pipeline.sha.trim();
+  return sha === "" ? null : sha.slice(0, 7);
+}
+/** The polite announcement for a pipeline that finished while on screen. */
+export function pipelineFinishedAnnouncement(
+  id: number,
+  status: PullRequestsPipelineStatus,
+  warnings: boolean,
+): string {
+  return `Pipeline #${id} ${pipelineStatusLabel(status, warnings)}.`;
 }
 const EVENT_LABELS: Record<string, string> = {
   labeled: "labeled",
