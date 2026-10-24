@@ -39,7 +39,11 @@ import { stackedThreadToast, toastManager } from "~/components/ui/toast";
 import { type DraftId, useComposerDraftStore } from "~/composerDraftStore";
 import { buildFileReviewComment } from "~/reviewCommentContext";
 import { assetEnvironment } from "~/state/assets";
-import { useEnvironmentHttpBaseUrl, usePrimaryEnvironmentId } from "~/state/environments";
+import {
+  useEnvironmentConnectionState,
+  useEnvironmentHttpBaseUrl,
+  usePrimaryEnvironmentId,
+} from "~/state/environments";
 import { previewEnvironment } from "~/state/preview";
 import { projectEnvironment } from "~/state/projects";
 import { useAtomCommand } from "~/state/use-atom-command";
@@ -307,8 +311,19 @@ function useFileEditingSession({
   const writeFile = useAtomCommand(projectEnvironment.writeFile);
   const writeFileIfUnchanged = useAtomCommand(projectEnvironment.writeFileIfUnchanged);
   return useMemo(() => {
-    if (!enabled || !relativePath || !file.data || file.data.truncated) return null;
-    const base = { version: file.data.version, contents: file.data.contents };
+    if (!enabled || !relativePath || !file.data) return null;
+    // Only a server read (or a guarded save's committed version) says what is on disk and whether
+    // the server guards saves: an optimistic draft has no version and would turn both off.
+    const disk = file.disk;
+    if (file.data.truncated || disk === null || disk.truncated) {
+      // Nothing new starts here; a session that already holds the file's text keeps it. When
+      // the file grew past the read limit, only a guarded session stays, so its edits and its
+      // Overwrite disk choice remain on screen and an unguarded save cannot write old text.
+      const existing = editingSessions.get(relativePath);
+      if (existing === undefined || (file.data.truncated && !existing.watchesDisk)) return null;
+      return editingSessions.getOrCreate(relativePath, () => existing);
+    }
+    const base = { version: disk.version, contents: disk.contents };
     return editingSessions.getOrCreate(
       relativePath,
       () =>
@@ -339,6 +354,7 @@ function useFileEditingSession({
     enabled,
     environmentId,
     file.data,
+    file.disk,
     onConflictChange,
     onPendingChange,
     relativePath,
@@ -366,6 +382,9 @@ function useFileDiskWatch({
   const getFileVersion = useAtomCommand(projectEnvironment.getFileVersion, {
     reportFailure: false,
   });
+  const connection = useEnvironmentConnectionState(environmentId).data;
+  // A new connection generation: the file may have changed while the environment was away.
+  const reconnectSignal = connection?.phase === "connected" ? connection.generation : null;
   useEffect(() => {
     if (!session?.watchesDisk) return;
     const watcher = new FileDiskWatcher({
@@ -380,8 +399,8 @@ function useFileDiskWatch({
     return () => watcher.dispose();
   }, [cwd, environmentId, getFileVersion, session]);
   useEffect(() => {
-    if (diskCheckSignal !== null) session?.requestDiskCheck();
-  }, [diskCheckSignal, session]);
+    if (diskCheckSignal !== null || reconnectSignal !== null) session?.requestDiskCheck();
+  }, [diskCheckSignal, reconnectSignal, session]);
 }
 
 /**
@@ -765,7 +784,9 @@ export default function FilePreviewPanel({
   const renderMarkdownSource =
     isMarkdown && (markdownSourceView.path === relativePath || revealLine !== null);
   const renderMarkdown = isMarkdown && !renderMarkdownSource && !file.data?.truncated;
-  if (session && file.data && !file.data.truncated && !renderMarkdown) {
+  // A truncated read is shown read-only unless a guarded session kept the file's text.
+  const truncatedPreview = file.data?.truncated === true && session === null;
+  if (session && file.data && !renderMarkdown) {
     void session.editor;
   }
   const sessionSnapshot = useSyncExternalStore(
@@ -922,7 +943,7 @@ export default function FilePreviewPanel({
           canUndo={!renderMarkdown && !deletedOnDisk && sessionSnapshot.canUndo}
           canRedo={!renderMarkdown && !deletedOnDisk && sessionSnapshot.canRedo}
           cleanStatus={
-            file.data?.truncated || (file.error && file.data === null)
+            truncatedPreview || (file.error && file.data === null)
               ? "Editing unavailable"
               : workspaceUnavailable
           }
@@ -960,7 +981,7 @@ export default function FilePreviewPanel({
           onOverwrite={() => session.overwriteDisk()}
         />
       ) : null}
-      {relativePath && file.data?.truncated ? (
+      {relativePath && file.data && truncatedPreview ? (
         <div className="shrink-0 border-b border-amber-500/20 bg-amber-500/8 px-3 py-1.5 text-xs text-amber-700 dark:text-amber-300">
           Preview limited to the first 1 MB of a {file.data.byteLength.toLocaleString()} byte file.
         </div>
@@ -996,7 +1017,7 @@ export default function FilePreviewPanel({
                 threadRef={threadRef}
                 contents={file.data.contents}
               />
-            ) : file.data.truncated ? (
+            ) : truncatedPreview ? (
               <Virtualizer
                 key={`${relativePath}:${resolvedTheme}:${file.data.byteLength}`}
                 className="file-preview-virtualizer min-h-0 flex-1 overflow-auto"
@@ -1027,7 +1048,10 @@ export default function FilePreviewPanel({
                 key={`${relativePath}:${resolvedTheme}`}
                 session={session}
                 composerDraftTarget={composerDraftTarget}
-                contents={session.retainedContents ?? file.data.contents}
+                contents={
+                  session.retainedContents ??
+                  (file.data.truncated ? session.documentContents : file.data.contents)
+                }
                 resolvedTheme={resolvedTheme}
                 revealRequestId={revealRequestId}
                 wordWrap={wordWrap}
