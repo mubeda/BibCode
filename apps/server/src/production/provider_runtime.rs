@@ -18938,6 +18938,7 @@ done
         }
     }
 
+    #[cfg(unix)]
     async fn claude_events_until_exit(driver: &super::ClaudeDriver) -> Vec<super::ProviderEvent> {
         let mut events = Vec::new();
         let _ = timeout(Duration::from_secs(10), async {
