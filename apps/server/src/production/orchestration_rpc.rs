@@ -1363,7 +1363,31 @@ fn thread_snapshot_value(snapshot: &crate::orchestration::Snapshot, thread_id: &
         .max()
         .unwrap_or(0);
     let rows = thread_detail_rows(snapshot, thread);
-    let detail = thread_detail(thread, &rows);
+    let mut detail = thread_detail(thread, &rows);
+    // Only the thread stream carries reasoning; a client that does not know the field drops it.
+    detail
+        .as_object_mut()
+        .expect("thread detail is an object")
+        .insert(
+            "reasoning".to_owned(),
+            Value::Array(
+                snapshot
+                    .reasoning
+                    .iter()
+                    .filter(|row| row.thread_id == thread.thread_id)
+                    .map(|row| {
+                        json!({
+                            "id": row.reasoning_id,
+                            "turnId": row.turn_id,
+                            "text": row.text,
+                            "streaming": row.is_streaming,
+                            "createdAt": row.created_at,
+                            "updatedAt": row.updated_at,
+                        })
+                    })
+                    .collect(),
+            ),
+        );
     Ok(json!({ "snapshotSequence": sequence, "thread": detail }))
 }
 
@@ -2221,6 +2245,7 @@ mod tests {
                     updated_at: "2026-07-11T00:00:00.005Z".to_owned(),
                 },
             ],
+            reasoning: Vec::new(),
             activities: vec![ProjectionThreadActivity {
                 activity_id: "activity-tool".to_owned(),
                 thread_id: "thread-1".to_owned(),
@@ -6950,6 +6975,12 @@ mod tests {
             json!({"type":"thread.turn.start","commandId":"c06","threadId":"t1","message":{"messageId":"m-user","role":"user","text":"hello","attachments":[]},"createdAt":at(3)}),
             json!({"type":"thread.session.set","commandId":"c07","threadId":"t1","session":{"threadId":"t1","status":"running","providerName":"codex","providerInstanceId":"codex","runtimeMode":"approval-required","activeTurnId":"turn-1","lastError":null,"updatedAt":at(4)},"createdAt":at(4)}),
             json!({"type":"thread.activity.append","commandId":"c08","threadId":"t1","activity":{"id":"a1","tone":"tool","kind":"command","summary":"ran","payload":{"step":1},"turnId":"turn-1","createdAt":at(5)},"createdAt":at(5)}),
+            // Reasoning (#173): a streamed thought settled without text, then a summary
+            // that arrives whole and replaces nothing.
+            json!({"type":"thread.reasoning.delta","commandId":"c08r1","threadId":"t1","reasoningId":"reasoning:t1:item:r1","delta":"Weighing ","turnId":"turn-1","createdAt":at(16)}),
+            json!({"type":"thread.reasoning.delta","commandId":"c08r2","threadId":"t1","reasoningId":"reasoning:t1:item:r1","delta":"options","turnId":"turn-1","createdAt":at(17)}),
+            json!({"type":"thread.reasoning.complete","commandId":"c08r3","threadId":"t1","reasoningId":"reasoning:t1:item:r1","turnId":"turn-1","createdAt":at(18)}),
+            json!({"type":"thread.reasoning.complete","commandId":"c08r4","threadId":"t1","reasoningId":"reasoning:t1:item:r2","text":"**Plan**\n\nRead the file","turnId":"turn-1","createdAt":at(19)}),
             json!({"type":"thread.message.assistant.delta","commandId":"c09","threadId":"t1","messageId":"m-assistant","delta":"hel","turnId":"turn-1","createdAt":at(6)}),
             json!({"type":"thread.message.assistant.delta","commandId":"c10","threadId":"t1","messageId":"m-assistant","delta":"lo","turnId":"turn-1","createdAt":at(7)}),
             json!({"type":"thread.activity.append","commandId":"c11","threadId":"t1","activity":{"id":"a2","tone":"info","kind":"status","summary":"working","payload":{"step":2},"turnId":"turn-1","createdAt":at(8)},"createdAt":at(8)}),
