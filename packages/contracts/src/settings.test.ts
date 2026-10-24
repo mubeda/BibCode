@@ -318,6 +318,19 @@ describe("ClientSettings word wrap", () => {
   });
 });
 
+describe("ClientSettings verbose chat", () => {
+  it("defaults verbose chat off, including stored settings written before the key", () => {
+    expect(decodeClientSettings({}).verboseChat).toBe(false);
+    expect(decodeClientSettings({ wordWrap: false }).verboseChat).toBe(false);
+    expect(DEFAULT_UNIFIED_SETTINGS.verboseChat).toBe(false);
+  });
+
+  it("decodes a stored choice and a patch", () => {
+    expect(decodeClientSettings({ verboseChat: true }).verboseChat).toBe(true);
+    expect(decodeClientSettingsPatch({ verboseChat: true }).verboseChat).toBe(true);
+  });
+});
+
 describe("ClientSettings usage status bar", () => {
   it("defaults the usage display and status bar items", () => {
     const settings = decodeClientSettings({});

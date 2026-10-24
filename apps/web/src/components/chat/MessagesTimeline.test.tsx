@@ -8,6 +8,7 @@ import {
 } from "@bibcode/contracts";
 import { act, createRef, type ComponentProps, type ReactNode, type Ref } from "react";
 import type { WorkLogEntry } from "../../session-logic";
+import { formatShortTimestamp } from "../../timestampFormat";
 import { renderToStaticMarkup } from "react-dom/server";
 import { createRoot, type Root } from "react-dom/client";
 import { Window } from "happy-dom";
@@ -231,6 +232,7 @@ function buildProps() {
     markdownCwd: undefined,
     resolvedTheme: "light" as const,
     timestampFormat: "locale" as const,
+    verboseChat: false,
     workspaceRoot: undefined,
     anchorMessageId: null,
     onAnchorReady: () => {},
@@ -1220,6 +1222,141 @@ describe("MessagesTimeline work groups", () => {
       expect(container.textContent).toContain("Entry 0");
     },
   );
+});
+
+describe("MessagesTimeline verbose chat", () => {
+  const settledTurn = {
+    turnId: TURN_ID,
+    state: "completed" as const,
+    startedAt: MESSAGE_CREATED_AT,
+    completedAt: LATER_CREATED_AT,
+  };
+  const turnEntries = () => [
+    buildUserTimelineEntry("Do the work."),
+    buildWorkTimelineEntry("entry-work", {
+      turnId: TURN_ID,
+      label: "Read file",
+      command: "cat notes.txt",
+    }),
+    buildAssistantTimelineEntry({
+      id: "entry-terminal",
+      messageId: "message-terminal",
+      text: "All done now.",
+      turnId: TURN_ID,
+    }),
+  ];
+  const workRow = (container: HTMLElement) =>
+    container.querySelector<HTMLElement>('div[role="button"][aria-label^="Read file"]');
+
+  it("starts a settled tool row expanded and collapses it on click", async () => {
+    const container = await mountTimeline({
+      verboseChat: true,
+      latestTurn: settledTurn,
+      timelineEntries: turnEntries(),
+    });
+
+    expect(container.textContent).not.toContain("Worked for");
+    expect(workRow(container)?.getAttribute("aria-expanded")).toBe("true");
+    expect(workRow(container)?.querySelector("pre")?.textContent).toContain("cat notes.txt");
+
+    await click(workRow(container)!);
+
+    expect(workRow(container)?.getAttribute("aria-expanded")).toBe("false");
+    expect(workRow(container)?.querySelector("pre")).toBeNull();
+  });
+
+  it("keeps a collapsed tool row collapsed after it remounts", async () => {
+    const MessagesTimeline = await loadMessagesTimeline();
+    const entries = turnEntries();
+    const container = await mountTimeline({
+      verboseChat: true,
+      latestTurn: settledTurn,
+      timelineEntries: entries,
+    });
+    await click(workRow(container)!);
+    const mounted = mountedTrees.at(-1)!;
+    const renderEntries = (timelineEntries: typeof entries) =>
+      act(async () =>
+        mounted.root.render(
+          <MessagesTimeline
+            {...buildProps()}
+            verboseChat
+            latestTurn={settledTurn}
+            timelineEntries={timelineEntries}
+          />,
+        ),
+      );
+
+    // LegendList unmounts a row that leaves its render window.
+    await renderEntries(entries.filter((entry) => entry.kind !== "work"));
+    expect(workRow(container)).toBeNull();
+    await renderEntries(entries);
+
+    expect(workRow(container)?.getAttribute("aria-expanded")).toBe("false");
+  });
+
+  it("applies the setting to an open timeline and keeps following the end", async () => {
+    const MessagesTimeline = await loadMessagesTimeline();
+    const container = await mountTimeline({
+      latestTurn: settledTurn,
+      timelineEntries: turnEntries(),
+    });
+    expect(container.textContent).toContain("Worked for 5.0s");
+    expect(workRow(container)).toBeNull();
+
+    const mounted = mountedTrees.at(-1)!;
+    await act(async () =>
+      mounted.root.render(
+        <MessagesTimeline
+          {...buildProps()}
+          verboseChat
+          latestTurn={settledTurn}
+          timelineEntries={turnEntries()}
+        />,
+      ),
+    );
+
+    expect(container.textContent).not.toContain("Worked for");
+    expect(workRow(container)?.querySelector("pre")?.textContent).toContain("cat notes.txt");
+    expect(h.legendListProps?.["maintainScrollAtEnd"]).toMatchObject({
+      on: { dataChange: true, itemLayout: true },
+    });
+  });
+
+  it("leaves the running turn's tool rows collapsed", async () => {
+    const container = await mountTimeline({
+      verboseChat: true,
+      isWorking: true,
+      activeTurnInProgress: true,
+      runningTurnId: TURN_ID,
+      latestTurn: { ...settledTurn, state: "running", completedAt: null },
+      timelineEntries: turnEntries(),
+    });
+
+    expect(workRow(container)?.getAttribute("aria-expanded")).toBe("false");
+    expect(workRow(container)?.querySelector("pre")).toBeNull();
+  });
+
+  it("reveals the time on tool rows and on the Worked-for row", async () => {
+    const time = formatShortTimestamp(MESSAGE_CREATED_AT, "24-hour");
+    const folded = await mountTimeline({
+      timestampFormat: "24-hour",
+      latestTurn: settledTurn,
+      timelineEntries: turnEntries(),
+    });
+    const verbose = await mountTimeline({
+      timestampFormat: "24-hour",
+      verboseChat: true,
+      latestTurn: settledTurn,
+      timelineEntries: turnEntries(),
+    });
+
+    expect(
+      folded.querySelector('[data-timeline-row-kind="turn-fold"] [data-timeline-row-time]')
+        ?.textContent,
+    ).toBe(time);
+    expect(workRow(verbose)?.querySelector("[data-timeline-row-time]")?.textContent).toBe(time);
+  });
 });
 
 describe("MessagesTimeline work entry rows", () => {

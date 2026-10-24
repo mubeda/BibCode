@@ -4,6 +4,7 @@ import {
   computeStableMessagesTimelineRows,
   computeMessageDurationStart,
   deriveMessagesTimelineRows,
+  isWorkEntryInUnsettledTurn,
   normalizeCompactToolLabel,
   resolveAssistantMessageCopyState,
   resolveTimelineIsAtEnd,
@@ -1252,6 +1253,135 @@ describe("deriveMessagesTimelineRows", () => {
     expect(rows.find((row) => row.kind === "turn-fold")).toMatchObject({
       label: "Worked for 1.0s",
     });
+  });
+});
+
+describe("verbose chat rows", () => {
+  const verboseUserEntry = {
+    id: "user-entry",
+    kind: "message" as const,
+    createdAt: "2026-01-01T00:00:00Z",
+    message: {
+      id: "user-1" as never,
+      role: "user" as const,
+      text: "Build it",
+      turnId: null,
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-01T00:00:00Z",
+      streaming: false,
+    },
+  };
+  const verboseWorkEntry = (id: string, second: number) => ({
+    id: `${id}-entry`,
+    kind: "work" as const,
+    createdAt: `2026-01-01T00:00:0${second}Z`,
+    entry: {
+      id,
+      createdAt: `2026-01-01T00:00:0${second}Z`,
+      turnId: "turn-1" as never,
+      label: `Run ${id}`,
+      command: `echo ${id}`,
+      tone: "tool" as const,
+    },
+  });
+  const verboseAssistantEntry = (id: string, text: string, second: number) => ({
+    id: `${id}-entry`,
+    kind: "message" as const,
+    createdAt: `2026-01-01T00:00:0${second}Z`,
+    message: {
+      id: id as never,
+      role: "assistant" as const,
+      text,
+      turnId: "turn-1" as never,
+      createdAt: `2026-01-01T00:00:0${second}Z`,
+      updatedAt: `2026-01-01T00:00:0${second}Z`,
+      streaming: false,
+    },
+  });
+  const verboseTimelineEntries = [
+    verboseUserEntry,
+    verboseAssistantEntry("commentary", "Looking around first.", 1),
+    verboseWorkEntry("work-1", 2),
+    verboseWorkEntry("work-2", 3),
+    verboseWorkEntry("work-3", 4),
+    verboseAssistantEntry("answer", "Done", 5),
+  ];
+  const deriveVerboseRows = (
+    input: Partial<Parameters<typeof deriveMessagesTimelineRows>[0]> = {},
+  ) =>
+    deriveMessagesTimelineRows({
+      timelineEntries: verboseTimelineEntries,
+      isWorking: false,
+      activeTurnStartedAt: null,
+      turnDiffSummaryByAssistantMessageId: new Map(),
+      revertTurnCountByUserMessageId: new Map(),
+      ...input,
+    });
+
+  it("keeps a settled turn open with every work entry and no fold or toggle row", () => {
+    const rows = deriveVerboseRows({ verboseChat: true });
+
+    expect(rows.map((row) => row.id)).toEqual([
+      "user-entry",
+      "commentary-entry",
+      "work-1",
+      "work-2",
+      "work-3",
+      "answer-entry",
+    ]);
+    expect(rows.some((row) => row.kind === "turn-fold" || row.kind === "work-toggle")).toBe(false);
+    expect(rows.find((row) => row.id === "answer-entry")).toMatchObject({
+      showAssistantMeta: true,
+    });
+  });
+
+  it("folds the same settled turn while the setting is off", () => {
+    expect(deriveVerboseRows({ verboseChat: false }).map((row) => row.id)).toEqual([
+      "user-entry",
+      "turn-fold:turn-1",
+      "answer-entry",
+    ]);
+    expect(deriveVerboseRows({ verboseChat: false })).toEqual(deriveVerboseRows());
+  });
+
+  it("shows every entry of a settled work group without a toggle row", () => {
+    const rows = deriveVerboseRows({
+      verboseChat: true,
+      timelineEntries: [
+        verboseWorkEntry("work-1", 2),
+        verboseWorkEntry("work-2", 3),
+        verboseWorkEntry("work-3", 4),
+      ],
+    });
+
+    expect(rows.map((row) => row.id)).toEqual(["work-1", "work-2", "work-3"]);
+  });
+
+  it("derives a running turn's rows the same with the setting on and off", () => {
+    const running = {
+      runningTurnId: "turn-1" as never,
+      latestTurn: {
+        turnId: "turn-1" as never,
+        state: "running" as const,
+        startedAt: "2026-01-01T00:00:00Z",
+        completedAt: null,
+      },
+      isWorking: true,
+      activeTurnStartedAt: "2026-01-01T00:00:00Z",
+    };
+    const verboseRows = deriveVerboseRows({ ...running, verboseChat: true });
+
+    expect(verboseRows).toEqual(deriveVerboseRows({ ...running, verboseChat: false }));
+    expect(verboseRows.some((row) => row.kind === "work-toggle")).toBe(true);
+  });
+
+  it("starts work entries expanded only outside the unsettled turn", () => {
+    const entry = verboseWorkEntry("work-1", 2).entry;
+
+    expect(isWorkEntryInUnsettledTurn(entry, null)).toBe(false);
+    expect(isWorkEntryInUnsettledTurn(entry, "turn-1" as never)).toBe(true);
+    expect(isWorkEntryInUnsettledTurn(entry, "turn-2" as never)).toBe(false);
+    expect(isWorkEntryInUnsettledTurn({ ...entry, turnId: null }, null)).toBe(false);
   });
 });
 
