@@ -735,7 +735,7 @@ export function GeneralSettingsPanel() {
 
         <SettingsRow
           title="Verbose chat"
-          description="Show every tool call and its output. Finished turns stay open."
+          description="Show every tool call and its output. Finished turns start open."
           resetAction={
             settings.verboseChat !== DEFAULT_UNIFIED_SETTINGS.verboseChat ? (
               <SettingResetButton

@@ -824,7 +824,7 @@ describe("GeneralSettingsPanel", () => {
     expect(h.updateSettings).toHaveBeenCalledWith({ enableAssistantStreaming: true });
 
     expect(markup).toContain("Verbose chat");
-    expect(markup).toContain("Show every tool call and its output. Finished turns stay open.");
+    expect(markup).toContain("Show every tool call and its output. Finished turns start open.");
     invoke(control("switch", "Show every tool call and its output"), "onCheckedChange", true);
     expect(h.updateSettings).toHaveBeenCalledWith({ verboseChat: true });
 

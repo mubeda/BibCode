@@ -1247,6 +1247,8 @@ describe("MessagesTimeline verbose chat", () => {
   ];
   const workRow = (container: HTMLElement) =>
     container.querySelector<HTMLElement>('div[role="button"][aria-label^="Read file"]');
+  const foldButton = (container: HTMLElement) =>
+    container.querySelector<HTMLButtonElement>('[data-timeline-row-kind="turn-fold"] button');
 
   it("starts a settled tool row expanded and collapses it on click", async () => {
     const container = await mountTimeline({
@@ -1255,7 +1257,7 @@ describe("MessagesTimeline verbose chat", () => {
       timelineEntries: turnEntries(),
     });
 
-    expect(container.textContent).not.toContain("Worked for");
+    expect(foldButton(container)?.getAttribute("aria-expanded")).toBe("true");
     expect(workRow(container)?.getAttribute("aria-expanded")).toBe("true");
     expect(workRow(container)?.querySelector("pre")?.textContent).toContain("cat notes.txt");
 
@@ -1316,11 +1318,107 @@ describe("MessagesTimeline verbose chat", () => {
       ),
     );
 
-    expect(container.textContent).not.toContain("Worked for");
+    expect(foldButton(container)?.getAttribute("aria-expanded")).toBe("true");
     expect(workRow(container)?.querySelector("pre")?.textContent).toContain("cat notes.txt");
     expect(h.legendListProps?.["maintainScrollAtEnd"]).toMatchObject({
       on: { dataChange: true, itemLayout: true },
     });
+  });
+
+  it("folds a finished turn with one click and opens it with another", async () => {
+    const container = await mountTimeline({
+      verboseChat: true,
+      latestTurn: settledTurn,
+      timelineEntries: turnEntries(),
+    });
+    expect(foldButton(container)?.textContent).toContain("Worked for 5.0s");
+
+    await click(foldButton(container)!);
+    expect(foldButton(container)?.getAttribute("aria-expanded")).toBe("false");
+    expect(workRow(container)).toBeNull();
+    expect(container.textContent).toContain("All done now.");
+
+    await click(foldButton(container)!);
+    expect(foldButton(container)?.getAttribute("aria-expanded")).toBe("true");
+    expect(workRow(container)).not.toBeNull();
+  });
+
+  it("opens a run of tool calls and folds it to the newest with one click", async () => {
+    const container = await mountTimeline({
+      verboseChat: true,
+      timelineEntries: [
+        buildWorkTimelineEntry("work-1", { label: "First", command: "echo one" }),
+        buildWorkTimelineEntry("work-2", { label: "Second", command: "echo two" }),
+        buildWorkTimelineEntry("work-3", { label: "Third", command: "echo three" }),
+      ],
+    });
+    const toggle = container.querySelector<HTMLButtonElement>(
+      '[data-timeline-row-kind="work-toggle"] button',
+    );
+    expect(toggle?.getAttribute("aria-expanded")).toBe("true");
+    expect(toggle?.textContent).toBe("Show fewer tool calls");
+    expect(container.textContent).toContain("echo one");
+
+    await click(toggle!);
+    expect(toggle?.textContent).toBe("+2 previous tool calls");
+    expect(container.textContent).not.toContain("echo one");
+    expect(container.textContent).toContain("echo three");
+  });
+
+  it("keeps a turn the user folded folded when the next turn starts", async () => {
+    const MessagesTimeline = await loadMessagesTimeline();
+    const entries = turnEntries();
+    const container = await mountTimeline({
+      verboseChat: true,
+      latestTurn: settledTurn,
+      timelineEntries: entries,
+    });
+    await click(foldButton(container)!);
+    const mounted = mountedTrees.at(-1)!;
+
+    await act(async () =>
+      mounted.root.render(
+        <MessagesTimeline
+          {...buildProps()}
+          verboseChat
+          latestTurn={{
+            turnId: TurnId.make("turn-next"),
+            state: "running",
+            startedAt: LATER_CREATED_AT,
+            completedAt: null,
+          }}
+          timelineEntries={entries}
+        />,
+      ),
+    );
+
+    expect(foldButton(container)?.getAttribute("aria-expanded")).toBe("false");
+  });
+
+  it("folds a turn the user opened when the next turn starts, with the setting off", async () => {
+    const MessagesTimeline = await loadMessagesTimeline();
+    const entries = turnEntries();
+    const container = await mountTimeline({ latestTurn: settledTurn, timelineEntries: entries });
+    await click(foldButton(container)!);
+    expect(foldButton(container)?.getAttribute("aria-expanded")).toBe("true");
+    const mounted = mountedTrees.at(-1)!;
+
+    await act(async () =>
+      mounted.root.render(
+        <MessagesTimeline
+          {...buildProps()}
+          latestTurn={{
+            turnId: TurnId.make("turn-next"),
+            state: "running",
+            startedAt: LATER_CREATED_AT,
+            completedAt: null,
+          }}
+          timelineEntries={entries}
+        />,
+      ),
+    );
+
+    expect(foldButton(container)?.getAttribute("aria-expanded")).toBe("false");
   });
 
   it("leaves the running turn's tool rows collapsed", async () => {
