@@ -940,8 +940,17 @@ its project method as text. Edit the merge subject/body, choose branch deletion
 and optional auto-merge, then inspect the confirmation's method and target before
 merging. A read-only viewer sees the server reason without a method picker.
 **Auto-merge enabled** means merging has been scheduled, not completed; use
-**Disable auto-merge** to cancel it. GitHub disables bypass while auto-merge is
-selected, and the server rejects the auto-merge/bypass combination on GitHub.
+**Disable auto-merge** to cancel it. If GitLab refuses the cancellation, the
+action reports an error with GitLab's reason instead of succeeding. GitHub
+disables bypass while auto-merge is selected, and the server rejects the
+auto-merge/bypass combination on GitHub.
+
+When GitLab blocks a merge, the merge box names the reason GitLab reports, such
+as missing approvals, unresolved threads, a blocking merge request dependency,
+locked paths or a policy rule. Under **Pipelines must succeed** it says whether
+the pipeline is still running, failed, was canceled, was skipped, is waiting for
+a manual job, or has not run at all. Only GitLab's short-lived checking states
+read “GitLab is still computing mergeability; refresh in a moment”.
 The normal confirmation title is “Merge pull request” on GitHub and “Merge
 merge request” on GitLab. Request-specific recovery messages and accessibility
 labels use the same host vocabulary; the module remains **Pull Requests**.
@@ -1478,6 +1487,11 @@ The Source Control panel is Orca-parity for the shipped local Git workflow:
   editor, ignore file name, and ignore parent folder when the corresponding host
   actions are available.
 - Commit history and AI commit-message generation are available in the panel.
+- A failed commit or push names the step that failed, such as **Push failed**
+  or **Commit failed**, and shows Git's own reason beneath it, for example a
+  rejected push or a failing hook. The chat-header Git actions control shows
+  the same failure, and the create pull or merge request dialog names a failed
+  branch, commit or publish step the same way instead of blaming the request.
 - **Merge into current branch…** in the dropdown opens the merge dialog for the
   checked-out branch with local and remote sources. **Fetch** refreshes the
   selected remote branch's remote, or every remote for a local source, before
