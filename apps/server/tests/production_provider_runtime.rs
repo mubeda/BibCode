@@ -14836,6 +14836,7 @@ fn claude_launch_arguments_preserve_controls_and_gate_activity_flags() {
             include_hook_events: true,
             forward_subagent_text: true,
             transcript_recovery: false,
+            thinking_display: false,
         },
     );
     for required in [
@@ -14963,13 +14964,14 @@ async fn claude_activity_probe_is_cached_by_executable_identity() {
             include_hook_events: true,
             forward_subagent_text: true,
             transcript_recovery: false,
+            thinking_display: false,
         }
     );
     assert_eq!(second, first);
     assert_eq!(
         std::fs::read_to_string(count_path).expect("probe count"),
-        "xx",
-        "one version and one help invocation should serve repeated turns"
+        "xxx",
+        "one version, one help and one thinking-display invocation should serve repeated turns"
     );
 }
 
@@ -15004,13 +15006,14 @@ async fn claude_activity_probe_singleflights_concurrent_misses() {
                 include_hook_events: true,
                 forward_subagent_text: true,
                 transcript_recovery: false,
+                thinking_display: false,
             }
         );
     }
     assert_eq!(
         std::fs::read_to_string(count_path).expect("probe count"),
-        "xx",
-        "concurrent misses must share one version/help probe"
+        "xxx",
+        "concurrent misses must share one version/help/thinking-display probe"
     );
 }
 
@@ -15120,6 +15123,7 @@ async fn claude_activity_probe_test_contexts_isolate_concurrent_cache_mutation()
                 include_hook_events: true,
                 forward_subagent_text: true,
                 transcript_recovery: false,
+                thinking_display: false,
             }
         );
     }
@@ -15173,14 +15177,129 @@ async fn claude_activity_probe_retries_transient_failures_without_poisoning_cach
             include_hook_events: true,
             forward_subagent_text: true,
             transcript_recovery: false,
+            thinking_display: false,
         }
     );
     assert_eq!(
         std::fs::read_to_string(count_path).expect("probe count"),
-        "xxx",
-        "a failed version probe must be retried, then cache the successful version/help pair"
+        "xxxx",
+        "a failed version probe must be retried, then cache the successful probe"
     );
     assert_eq!(probe_context.cache_len(), 1);
+}
+
+/// #173: `--thinking-display summarized` is passed only to a CLI that rejects an invalid value
+/// and names `summarized` among the values it allows.
+#[test]
+fn claude_launch_arguments_ask_for_summarized_thinking_only_when_supported() {
+    let mut request = launch();
+    request.provider = "claudeAgent".to_owned();
+    let with_flag = build_claude_launch_arguments_for_test(
+        &request,
+        "session",
+        ClaudeActivitySupport {
+            thinking_display: true,
+            ..ClaudeActivitySupport::default()
+        },
+    );
+    assert!(
+        with_flag
+            .windows(2)
+            .any(|window| window == ["--thinking-display", "summarized"]),
+        "{with_flag:?}"
+    );
+    let without_flag = build_claude_launch_arguments_for_test(
+        &request,
+        "session",
+        ClaudeActivitySupport::default(),
+    );
+    assert!(
+        !without_flag
+            .iter()
+            .any(|argument| argument == "--thinking-display"),
+        "{without_flag:?}"
+    );
+}
+
+/// A CLI that knows `--thinking-display` rejects the probe's invalid value and lists the
+/// allowed ones; one that does not either ignores it under `--version` or rejects it as unknown.
+#[cfg(unix)]
+#[tokio::test]
+async fn claude_thinking_display_probe_reads_the_allowed_values() {
+    for (case, answer, expected) in [
+        (
+            "lists-summarized",
+            "printf '%s\\n' \"error: option '--thinking-display <mode>' argument '$2' is invalid. Allowed choices are summarized, omitted, highlights.\" >&2; exit 1",
+            true,
+        ),
+        ("ignores-it", "printf '%s\\n' '2.1.0 (Claude Code)'", false),
+        (
+            "rejects-it",
+            "printf '%s\\n' \"error: unknown option '--thinking-display'\" >&2; exit 1",
+            false,
+        ),
+    ] {
+        let probe_context = ClaudeActivityProbeTestContext::new();
+        let temp = TempDir::new().unwrap();
+        let script = format!(
+            "#!/bin/sh\ncase \"$1\" in\n  --version) printf '%s\\n' '2.1.310 (Claude Code)';;\n  --help) printf '%s\\n' '--include-hook-events --forward-subagent-text';;\n  --thinking-display) {answer};;\n  *) exit 1;;\nesac\n"
+        );
+        let executable = executable_fixture(&temp, &format!("claude-thinking-{case}"), &script, "");
+        let support = probe_context
+            .probe(executable.to_string_lossy().as_ref())
+            .await;
+        assert_eq!(
+            support,
+            ClaudeActivitySupport {
+                include_hook_events: true,
+                forward_subagent_text: true,
+                transcript_recovery: false,
+                thinking_display: expected,
+            },
+            "{case}"
+        );
+    }
+}
+
+/// A thinking-display probe that runs out of time says nothing about the flag: nothing is
+/// cached, and a later launch probes again.
+#[cfg(unix)]
+#[tokio::test]
+async fn claude_thinking_display_probe_timeout_is_not_cached() {
+    let probe_context = ClaudeActivityProbeTestContext::new();
+    let temp = TempDir::new().unwrap();
+    let marker_path = temp.path().join("thinking-timed-out-once");
+    let script = format!(
+        "#!/bin/sh\ncase \"$1\" in\n  --version) printf '%s\\n' '2.1.310 (Claude Code)';;\n  --help) printf '%s\\n' '--include-hook-events';;\n  --thinking-display) if [ ! -f '{marker}' ]; then touch '{marker}'; sleep 12; fi; printf '%s\\n' 'Allowed choices are summarized, omitted' >&2; exit 1;;\n  *) exit 1;;\nesac\n",
+        marker = marker_path.display(),
+    );
+    let executable = executable_fixture(&temp, "claude-thinking-timeout", &script, "");
+    let binary_path = executable.to_string_lossy().into_owned();
+    assert_eq!(
+        probe_context.probe(&binary_path).await,
+        ClaudeActivitySupport::default(),
+        "the launch that met the timeout runs without the flags"
+    );
+    let later = timeout(Duration::from_secs(20), async {
+        loop {
+            let support = probe_context.probe(&binary_path).await;
+            if support != ClaudeActivitySupport::default() {
+                return support;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .unwrap_or_default();
+    assert_eq!(
+        later,
+        ClaudeActivitySupport {
+            include_hook_events: true,
+            forward_subagent_text: false,
+            transcript_recovery: false,
+            thinking_display: true,
+        }
+    );
 }
 
 /// Claude reads the BiBCode MCP server from a file only this user can read: on the command line
@@ -15317,6 +15436,7 @@ async fn assert_claude_probe_recovers_after_one_bad_help(case: &str, first_help:
             include_hook_events: true,
             forward_subagent_text: true,
             transcript_recovery: false,
+            thinking_display: false,
         },
         "{case}: a later launch of the same working Claude gets the activity flags"
     );
@@ -15352,8 +15472,8 @@ async fn claude_activity_probe_invalidates_on_executable_metadata_and_version_ch
     assert_eq!(changed, ClaudeActivitySupport::default());
     assert_eq!(
         std::fs::read_to_string(count_path).expect("probe count"),
-        "xxxx",
-        "metadata/version changes must execute a new version/help probe"
+        "xxxxxx",
+        "metadata/version changes must execute a new probe"
     );
 }
 
@@ -15800,6 +15920,7 @@ async fn native_claude_driver_closes_hook_sink_and_event_channel_after_natural_e
 case "$1" in
   --version) printf '%s\n' '2.1.218'; exit 0;;
   --help) printf '%s\n' '--include-hook-events --forward-subagent-text'; exit 0;;
+  --thinking-display) exit 1;;
 esac
 while [ "$#" -gt 0 ]; do
   if [ "$1" = "--settings" ]; then
