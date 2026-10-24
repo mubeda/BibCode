@@ -871,17 +871,22 @@ export const COMPACT_CONVERSATION_COMMAND = "/compact";
  *
  * Only a provider's `context_limit` failure offers it: the conversation no longer fits the
  * context window, and compacting it is how the user continues. A provider whose snapshot
- * says `supportsCompaction` is compacted by the server (`thread.compact`); otherwise the action
- * sends `/compact` as a message. While the server recovers the failure itself (it compacts,
- * then sends the message again) nothing is offered: the banner says what is happening. While
- * the thread is working, or another compaction is unsettled, the action is disabled with its
- * reason, so it can never queue a second compaction.
+ * says `supportsCompaction` is compacted by the server (`thread.compact`). An older server
+ * advertises no capability at all; there the action sends `/compact` as a message, and only
+ * for Claude, the one provider that understood it. Any other provider without the capability
+ * is offered nothing. While the server recovers the failure itself (it compacts, then sends the
+ * message again) nothing is offered: the banner says what is happening. While the thread is
+ * working, or another compaction is unsettled, the action is disabled with its reason, so it
+ * can never queue a second compaction.
  */
 export function threadErrorCompactAction(input: {
   readonly isBiBCodeAction: boolean;
   readonly errorClass: string | null | undefined;
   readonly busy: boolean;
-  readonly supportsCompaction?: boolean;
+  /** The provider's driver kind, such as `claudeAgent`. */
+  readonly providerDriver: string | null | undefined;
+  /** The provider snapshot's `supportsCompaction`, `undefined` from an older server. */
+  readonly supportsCompaction?: boolean | undefined;
   readonly compaction?: OrchestrationThreadCompaction | undefined;
 }): { readonly disabledReason: string | null; readonly via: "command" | "message" } | null {
   if (input.isBiBCodeAction || input.errorClass !== "context_limit") {
@@ -890,13 +895,22 @@ export function threadErrorCompactAction(input: {
   if (input.compaction?.trigger === "contextRecovery") {
     return null;
   }
+  const via =
+    input.supportsCompaction === true
+      ? "command"
+      : input.supportsCompaction === undefined && input.providerDriver === "claudeAgent"
+        ? "message"
+        : null;
+  if (via === null) {
+    return null;
+  }
   const disabledReason =
     input.compaction !== undefined
       ? "Compacting the conversation…"
       : input.busy
         ? "Wait for the current work to finish, then compact."
         : null;
-  return { disabledReason, via: input.supportsCompaction === true ? "command" : "message" };
+  return { disabledReason, via };
 }
 
 /**

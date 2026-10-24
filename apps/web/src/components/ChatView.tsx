@@ -6466,7 +6466,8 @@ function ChatViewContent(props: ChatViewProps) {
           isBiBCodeAction: localServerError !== null,
           errorClass: serverThread?.session?.lastErrorClass ?? null,
           busy: phase === "running" || isSendBusy || isConnecting,
-          supportsCompaction,
+          providerDriver: providerBinding.driver,
+          supportsCompaction: providerBinding.status?.supportsCompaction,
           compaction: serverThread?.compaction,
         });
   // `threadErrorCompact` is a fresh object each render; its presence and reason are the inputs.
