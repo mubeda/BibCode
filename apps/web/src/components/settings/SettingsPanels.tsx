@@ -1059,6 +1059,36 @@ export function AgentsSettingsPanel() {
           }
         />
         <SettingsRow
+          title="Always show Activity"
+          description="Keep the Activity button above the chat even before any subagent or background task runs."
+          status={
+            settings.enableChatAgentActivity ? null : "Turn on Chat agent activity to show it."
+          }
+          resetAction={
+            settings.activityDockAlwaysVisible !==
+            DEFAULT_UNIFIED_SETTINGS.activityDockAlwaysVisible ? (
+              <SettingResetButton
+                label="Activity button visibility"
+                onClick={() =>
+                  updateSettings({
+                    activityDockAlwaysVisible: DEFAULT_UNIFIED_SETTINGS.activityDockAlwaysVisible,
+                  })
+                }
+              />
+            ) : null
+          }
+          control={
+            <Switch
+              checked={settings.activityDockAlwaysVisible}
+              disabled={!settings.enableChatAgentActivity}
+              onCheckedChange={(checked) =>
+                updateSettings({ activityDockAlwaysVisible: Boolean(checked) })
+              }
+              aria-label="Always show Activity"
+            />
+          }
+        />
+        <SettingsRow
           title="AI Terminal agent activity"
           titleTag={
             <Badge variant="warning" size="sm">

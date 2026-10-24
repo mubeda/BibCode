@@ -64,7 +64,6 @@ import {
   isConnectionUnavailable,
 } from "@bibcode/client-runtime/connection";
 import {
-  scopedProjectKey,
   scopedThreadKey,
   scopeProjectRef,
   scopeThreadRef,
@@ -115,7 +114,6 @@ import {
 import { isDesktopHost } from "../env";
 import { readLocalApi } from "../localApi";
 import { useDiffPanelStore } from "../diffPanelStore";
-import { selectActivityDockExpanded, useActivityDockStore } from "../activityDockStore";
 import { parseStandaloneComposerBiBCodeAction } from "../composer-logic";
 import {
   derivePendingApprovals,
@@ -540,32 +538,20 @@ interface ActivityStateTarget {
 const ActivityDockBinding = memo(function ActivityDockBinding({
   target,
   threadRef,
-  projectId,
   compact,
+  alwaysVisible,
   avoidRightPanelSheet,
 }: {
   readonly target: ActivityStateTarget;
   readonly threadRef: ScopedThreadRef;
-  readonly projectId: ProjectId;
   readonly compact: boolean;
+  readonly alwaysVisible: boolean;
   readonly avoidRightPanelSheet: boolean;
 }) {
   const stateValueAtom = useMemo(() => environmentActivity.stateValueAtom(target), [target]);
   const activityState =
     useAtomValue(stateValueAtom) ?? (EMPTY_ENVIRONMENT_ACTIVITY_STATE as EnvironmentActivityState);
   const snapshot = useMemo(() => activitySnapshotForState(activityState), [activityState]);
-  const projectKey = useMemo(
-    () => scopedProjectKey(scopeProjectRef(target.environmentId, projectId)),
-    [projectId, target.environmentId],
-  );
-  const expanded = useActivityDockStore((state) =>
-    selectActivityDockExpanded(state.expandedByProject, projectKey),
-  );
-  const setExpanded = useActivityDockStore((state) => state.setExpanded);
-  const onExpandedChange = useCallback(
-    (nextExpanded: boolean) => setExpanded(projectKey, nextExpanded),
-    [projectKey, setExpanded],
-  );
   const onOpenSection = useCallback(
     (section: ActivitySection) =>
       useRightPanelStore.getState().openActivity(threadRef, section, target.input),
@@ -578,10 +564,9 @@ const ActivityDockBinding = memo(function ActivityDockBinding({
   return (
     <ActivityDock
       snapshot={snapshot}
-      expanded={expanded}
       compact={compact}
+      alwaysVisible={alwaysVisible}
       avoidRightPanelSheet={avoidRightPanelSheet}
-      onExpandedChange={onExpandedChange}
       onOpenSection={onOpenSection}
     />
   );
@@ -1288,7 +1273,6 @@ const PersistentThreadTerminalPanel = memo(function PersistentThreadTerminalPane
       owner="right-panel"
       threadRef={threadRef}
       threadId={threadRef.threadId}
-      projectId={project.id}
       cwd={cwd}
       worktreePath={worktreePath}
       runtimeEnv={runtimeEnv}
@@ -1328,7 +1312,6 @@ interface LiveCenterPanelWorkspaceProps {
   readonly terminalLabelsById: ReadonlyMap<string, string>;
   readonly renderFocusedActions: CenterPanelWorkspaceProps["renderFocusedActions"];
   readonly hostChatSurfaceBody: ReactNode;
-  readonly hostThread: Thread;
   readonly hostThreadRef: ScopedThreadRef;
   readonly centerTerminalLaunchContext: {
     readonly cwd: string;
@@ -1357,7 +1340,6 @@ const LiveCenterPanelWorkspace = memo(function LiveCenterPanelWorkspace({
   terminalLabelsById,
   renderFocusedActions,
   hostChatSurfaceBody,
-  hostThread,
   hostThreadRef,
   centerTerminalLaunchContext,
   keybindings,
@@ -1391,7 +1373,6 @@ const LiveCenterPanelWorkspace = memo(function LiveCenterPanelWorkspace({
           return (
             <CenterTerminalPanel
               threadRef={hostThreadRef}
-              projectId={hostThread.projectId}
               surface={surface}
               launchContext={centerTerminalLaunchContext}
               keybindings={keybindings}
@@ -1407,7 +1388,6 @@ const LiveCenterPanelWorkspace = memo(function LiveCenterPanelWorkspace({
     [
       centerTerminalLaunchContext,
       hostChatSurfaceBody,
-      hostThread.projectId,
       hostThreadRef,
       keybindings,
       onAddTerminalContext,
@@ -2144,23 +2124,6 @@ function ChatViewContent(props: ChatViewProps) {
     workspaceUnavailableRef.current = workspaceUnavailable;
   }, [workspaceUnavailable]);
   const readWorkspaceUnavailable = useCallback(() => workspaceUnavailableRef.current, []);
-  const consumeActivityDockEscapeClose = useCallback(() => {
-    if (!activeThread) {
-      return false;
-    }
-    const projectKey = scopedProjectKey(
-      scopeProjectRef(activeThread.environmentId, activeThread.projectId),
-    );
-    const state = useActivityDockStore.getState();
-    if (!selectActivityDockExpanded(state.expandedByProject, projectKey)) {
-      return false;
-    }
-    state.setExpanded(projectKey, false);
-    return !selectActivityDockExpanded(
-      useActivityDockStore.getState().expandedByProject,
-      projectKey,
-    );
-  }, [activeThread]);
   const activeEnvironmentShell = useEnvironmentQuery(
     activeThread ? environmentShell.stateAtom(activeThread.environmentId) : null,
   );
@@ -6937,8 +6900,12 @@ function ChatViewContent(props: ChatViewProps) {
                       <ActivityDockBinding
                         target={activityStateTarget}
                         threadRef={activeThreadRef}
-                        projectId={activeThread.projectId}
                         compact={shouldUseCompactActivityDock}
+                        // The setting covers the chat's own activity; a terminal scope keeps the record rule.
+                        alwaysVisible={
+                          settings.activityDockAlwaysVisible &&
+                          activityStateTarget.input._tag === "thread"
+                        }
                         avoidRightPanelSheet={shouldUsePlanSidebarSheet && effectiveRightPanelOpen}
                       />
                     ) : null}
@@ -7184,7 +7151,6 @@ function ChatViewContent(props: ChatViewProps) {
                 />
               )}
               hostChatSurfaceBody={hostChatSurfaceBody}
-              hostThread={activeThread}
               hostThreadRef={activeThreadRef}
               centerTerminalLaunchContext={centerTerminalLaunchContext}
               keybindings={keybindings}
@@ -7239,11 +7205,7 @@ function ChatViewContent(props: ChatViewProps) {
         </RightPanelTabs>
       ) : null}
       {effectiveRightPanelOpen && shouldUsePlanSidebarSheet && activeThreadRef ? (
-        <RightPanelSheet
-          open
-          onClose={planSidebarOpen ? closePlanSidebar : closePreviewPanel}
-          consumeEscapeClose={consumeActivityDockEscapeClose}
-        >
+        <RightPanelSheet open onClose={planSidebarOpen ? closePlanSidebar : closePreviewPanel}>
           <RightPanelTabs
             mode="sheet"
             {...(!isPanel ? { layoutControls: panelToggleControls } : {})}

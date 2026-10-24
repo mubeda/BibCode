@@ -162,6 +162,46 @@ describe("rightPanelStore", () => {
     });
   });
 
+  it("brings an open Activity panel to the front on the requested section without closing it", () => {
+    useRightPanelStore.getState().openActivity(refA, "subagents");
+    useRightPanelStore.getState().open(refA, "sourceControl");
+    expect(
+      selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA),
+    ).toMatchObject({ isOpen: true, activeSurfaceId: "sourceControl" });
+
+    useRightPanelStore.getState().openActivity(refA, "backgroundTasks");
+
+    const state = selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA);
+    expect(state.isOpen).toBe(true);
+    expect(state.activeSurfaceId).toBe("activity");
+    expect(state.surfaces.filter((surface) => surface.kind === "activity")).toHaveLength(1);
+    expect(
+      selectActiveRightPanelSurface(useRightPanelStore.getState().byThreadKey, refA),
+    ).toMatchObject({ section: "backgroundTasks" });
+  });
+
+  it("keeps the open record when the Activity button reopens the same section", () => {
+    useRightPanelStore.getState().openActivity(refA, "subagents");
+    useRightPanelStore.getState().navigateActivity(refA, {
+      section: "subagents",
+      selectedRecordKind: "actor",
+      selectedRecordId: "actor-1",
+    });
+
+    useRightPanelStore.getState().openActivity(refA, "subagents");
+
+    expect(
+      selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA).isOpen,
+    ).toBe(true);
+    expect(
+      selectActiveRightPanelSurface(useRightPanelStore.getState().byThreadKey, refA),
+    ).toMatchObject({
+      section: "subagents",
+      selectedRecordKind: "actor",
+      selectedRecordId: "actor-1",
+    });
+  });
+
   it("selects and clears actor and work-item activity routes", () => {
     useRightPanelStore.getState().openActivity(refA, "subagents");
     useRightPanelStore.getState().navigateActivity(refA, {
