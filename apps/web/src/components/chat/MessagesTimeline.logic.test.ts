@@ -83,6 +83,23 @@ describe("timeline minimap geometry", () => {
     expect(targets(0, [null, 500])).toEqual({ previous: null, next: 1 });
   });
 
+  it("measures each step from where the list's jump lands, below its header", () => {
+    // Row positions exclude the list header, while a jump to a row scrolls past it too: with a
+    // 16px header, jumping to the turn at 500 lands at 492, not 476.
+    const targets = (scrollTop: number) =>
+      resolveTimelineMinimapStepTargets({
+        itemTops: [12, 500, 1000],
+        scrollTop,
+        maxScrollTop: 1500,
+        listStartOffset: 16,
+      });
+
+    // Having jumped to the middle turn, Previous goes on to the first turn.
+    expect(targets(492)).toEqual({ previous: 0, next: 2 });
+    // Having jumped to the first turn, nothing is before it.
+    expect(targets(4)).toEqual({ previous: null, next: 1 });
+  });
+
   it("requires a finite viewport with enough side gutter", () => {
     expect(resolveTimelineMinimapHasPersistentGutter(Number.NaN)).toBe(false);
     expect(resolveTimelineMinimapHasPersistentGutter(0)).toBe(false);

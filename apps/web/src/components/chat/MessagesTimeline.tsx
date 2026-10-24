@@ -27,7 +27,7 @@ import {
   type ReactNode,
 } from "react";
 import { flushSync } from "react-dom";
-import { LegendList, type LegendListRef } from "@legendapp/list/react";
+import { LegendList, type LegendListMetrics, type LegendListRef } from "@legendapp/list/react";
 import { FileDiff } from "@pierre/diffs/react";
 import {
   deriveTimelineEntries,
@@ -366,6 +366,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   );
   const [minimapHasPersistentGutter, setMinimapHasPersistentGutter] = useState(false);
   const [minimapStepTargets, setMinimapStepTargets] = useState(NO_MINIMAP_STEP_TARGETS);
+  const { listHeaderSize, onListMetricsChange } = useListHeaderSize();
   const { handleAnchorReady, handleAnchorSizeChanged } = useStableAnchorCallbacks(
     anchorMessageId,
     onAnchorReady,
@@ -419,13 +420,14 @@ export const MessagesTimeline = memo(function MessagesTimeline({
         0,
         (state.contentLength ?? Number.POSITIVE_INFINITY) - (state.scrollLength ?? 0),
       ),
+      listStartOffset: listHeaderSize,
     });
     setMinimapStepTargets((current) =>
       current.previous === nextStepTargets.previous && current.next === nextStepTargets.next
         ? current
         : nextStepTargets,
     );
-  }, [listRef, minimapItems, minimapStripMap, onIsAtEndChange]);
+  }, [listHeaderSize, listRef, minimapItems, minimapStripMap, onIsAtEndChange]);
 
   useEffect(() => {
     const frame = requestAnimationFrame(handleScroll);
@@ -581,6 +583,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
                 size: false,
               }}
               onScroll={handleScroll}
+              onMetricsChange={onListMetricsChange}
               className="scrollbar-gutter-both h-full min-h-0 overflow-x-hidden overscroll-y-contain px-3 [overflow-anchor:none] sm:px-5"
               ListHeaderComponent={TIMELINE_LIST_HEADER}
               ListFooterComponent={TIMELINE_LIST_FOOTER}
@@ -645,6 +648,20 @@ function useFoldPreviousTurnOnNewTurn(
       return next;
     });
   }, [latestTurn, setExpandedTurnIds]);
+}
+
+/**
+ * The list header's measured height. Row positions start below it, but a jump to a row scrolls
+ * past it as well. Kept out of `MessagesTimeline`'s scope for the reason given on
+ * `useFoldPreviousTurnOnNewTurn`.
+ */
+function useListHeaderSize() {
+  const [listHeaderSize, setListHeaderSize] = useState(0);
+  const onListMetricsChange = useCallback(
+    (metrics: LegendListMetrics) => setListHeaderSize(metrics.headerSize),
+    [],
+  );
+  return { listHeaderSize, onListMetricsChange };
 }
 
 /**
