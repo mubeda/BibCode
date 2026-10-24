@@ -11,6 +11,7 @@ import type {
   PullRequestsContext,
   PullRequestsDetail,
   PullRequestsFiles as PullRequestsFilesData,
+  PullRequestsPipelineCopy,
   PullRequestsTimeline,
   ScopedProjectRef,
 } from "@bibcode/contracts";
@@ -40,7 +41,7 @@ import {
   selectListSort,
   selectListTab,
 } from "../list/pullRequestsList.logic";
-import { newerObservedAt, newestCopy } from "./snapshotDisplay.logic";
+import { keepNewestCopy, newerObservedAt, type KeptCopy } from "./snapshotDisplay.logic";
 import { PullRequestsQueryState } from "./PullRequestsQueryState";
 import { PullRequestsHeader } from "./PullRequestsHeader";
 import { PullRequestsConversation } from "./PullRequestsConversation";
@@ -251,20 +252,29 @@ export function PullRequestsDetailView({
   // its stored copy and the poller's row, so the screen never moves back
   // whichever answers last. Without revisions (an older server) the live
   // value wins, as before.
+  // The newest copy shown so far is kept per request too: a tab switch re-keys
+  // the snapshot read, and until it answers (or when it fails) the poller's
+  // row is missing from the candidates.
   const storedPipeline = snapshotQuery.data?.pipeline?.payload ?? null;
-  const shownPipeline = newestCopy([
+  const [keptPipeline, setKeptPipeline] = useState<KeptCopy<PullRequestsPipelineCopy> | null>(null);
+  const pipelineChoice = keepNewestCopy(keptPipeline, request, [
     detailQuery.data?.pipeline,
     paintedDetail?.payload.pipeline,
     storedPipeline,
   ]);
-  const displayedChecks =
+  if (pipelineChoice.kept !== keptPipeline) setKeptPipeline(pipelineChoice.kept);
+  const shownPipeline = pipelineChoice.shown;
+  const [keptChecks, setKeptChecks] = useState<KeptCopy<PullRequestsChecksData> | null>(null);
+  const checksChoice =
     tab === "checks"
-      ? newestCopy([
+      ? keepNewestCopy(keptChecks, request, [
           checksQuery.data,
           paintedActivePayload ? (paintedActivePayload as PullRequestsChecksData) : null,
           storedPipeline?.checks,
         ])
       : null;
+  if (checksChoice !== null && checksChoice.kept !== keptChecks) setKeptChecks(checksChoice.kept);
+  const displayedChecks = checksChoice?.shown ?? null;
   const displayedFiles =
     filesQuery.data ??
     (tab === "files" && paintedActivePayload
