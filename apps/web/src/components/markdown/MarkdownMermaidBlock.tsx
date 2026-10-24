@@ -2,6 +2,7 @@ import { CodeIcon } from "lucide-react";
 import { use, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import { LRUCache } from "../../lib/lruCache";
+import { codeFenceFor } from "../../markdown-clipboard";
 import { ReadingAnchorContext } from "../chat/readingAnchor";
 import { Button } from "../ui/button";
 import { RetryButton } from "../ui/retry-button";
@@ -194,8 +195,7 @@ function problemMessage(problem: MermaidDiagramProblem): string {
 
 /** The fenced source a copied selection inside the diagram becomes. */
 function fencedMermaidSource(source: string): string {
-  const longestRun = Math.max(0, ...[...source.matchAll(/`{3,}/g)].map((run) => run[0].length));
-  const fence = "`".repeat(Math.max(3, longestRun + 1));
+  const fence = codeFenceFor(source);
   return `${fence}mermaid\n${source}\n${fence}`;
 }
 
@@ -346,8 +346,10 @@ export function MarkdownMermaidBlock({
   const problem = tooLong ? TOO_LONG : entry?.kind === "problem" ? entry.problem : null;
   const failedLoad = loadFailure?.source === source && diagram === null ? loadFailure : null;
   const showDiagram = diagram !== null && !showingSource;
-  // The block re-renders with every streamed delta of its message.
-  const fencedSource = useMemo(() => fencedMermaidSource(source), [source]);
+  // Only a drawn diagram copies as its fenced source, and the block re-renders with every
+  // streamed delta of its message.
+  const drawn = diagram !== null;
+  const fencedSource = useMemo(() => (drawn ? fencedMermaidSource(source) : null), [drawn, source]);
   // React sets innerHTML again for every new object, which would replace the SVG on each render.
   const diagramMarkup = useMemo(
     () => (diagram ? { __html: diagram.diagram.svg } : null),
@@ -377,7 +379,7 @@ export function MarkdownMermaidBlock({
         {showDiagram ? (
           <div
             className="chat-markdown-mermaid"
-            data-markdown-copy={fencedSource}
+            data-markdown-copy={fencedSource!}
             data-markdown-atomic=""
             // Sanitized by the diagram SVG sanitizer, parsed in this same HTML context.
             dangerouslySetInnerHTML={diagramMarkup!}
