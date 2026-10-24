@@ -885,8 +885,17 @@ its project method as text. Edit the merge subject/body, choose branch deletion
 and optional auto-merge, then inspect the confirmation's method and target before
 merging. A read-only viewer sees the server reason without a method picker.
 **Auto-merge enabled** means merging has been scheduled, not completed; use
-**Disable auto-merge** to cancel it. GitHub disables bypass while auto-merge is
-selected, and the server rejects the auto-merge/bypass combination on GitHub.
+**Disable auto-merge** to cancel it. If GitLab refuses the cancellation, the
+action reports an error with GitLab's reason instead of succeeding. GitHub
+disables bypass while auto-merge is selected, and the server rejects the
+auto-merge/bypass combination on GitHub.
+
+When GitLab blocks a merge, the merge box names the reason GitLab reports, such
+as missing approvals, unresolved threads, a blocking merge request dependency,
+locked paths or a policy rule. Under **Pipelines must succeed** it says whether
+the pipeline is still running, failed, was canceled, was skipped, is waiting for
+a manual job, or has not run at all. Only GitLab's short-lived checking states
+read “GitLab is still computing mergeability; refresh in a moment”.
 The normal confirmation title is “Merge pull request” on GitHub and “Merge
 merge request” on GitLab. Request-specific recovery messages and accessibility
 labels use the same host vocabulary; the module remains **Pull Requests**.
