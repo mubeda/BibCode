@@ -2720,6 +2720,10 @@ mod workspace_loss_tests {
         /// What `compact` answers, and the events it reports (`$id` is the compaction id).
         compact_script: Arc<std::sync::Mutex<Option<CompactScript>>>,
         compact_calls: Arc<std::sync::Mutex<Vec<String>>>,
+        /// `compact` reports its scripted events and then never answers, as a request the
+        /// provider took but did not reply to.
+        compact_hangs: Arc<AtomicBool>,
+        interrupts: Arc<AtomicUsize>,
     }
 
     type CompactScript = (ProviderCompactionStart, Vec<ProviderEvent>);
@@ -2787,7 +2791,10 @@ mod workspace_loss_tests {
             &self,
             _: Option<String>,
         ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
-            Box::pin(async { Ok(()) })
+            Box::pin(async {
+                self.interrupts.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
         }
 
         fn compact(&self, compaction_id: String) -> BoxRuntimeFuture<'_, ProviderCompactionStart> {
@@ -2812,6 +2819,9 @@ mod workspace_loss_tests {
                     }
                 }
                 self.events_changed.notify_one();
+                if self.compact_hangs.load(Ordering::SeqCst) {
+                    std::future::pending::<()>().await;
+                }
                 start
             })
         }
@@ -3360,6 +3370,220 @@ mod workspace_loss_tests {
         let row = f.engine.thread_compaction(&id).await.unwrap().unwrap();
         assert_eq!(row.state, "interrupted");
         assert!(row.stop_requested);
+        f.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_compaction_request_the_provider_never_answers_is_still_bounded() {
+        with_bounds(
+            Duration::from_millis(300),
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+        );
+        let f = Fixture::new(true).await;
+        let id = request_compaction(&f).await;
+        // The provider starts the compaction's turn but never answers the request itself.
+        f.driver.compact_hangs.store(true, Ordering::SeqCst);
+        script(
+            &f,
+            started_compaction(),
+            vec![core_event(
+                "turn.started",
+                "compaction-turn",
+                json!({"compactionId":"$id"}),
+            )],
+        );
+        let row = drive(&f, &id).await;
+        assert_eq!(row.state, "failed");
+        assert_eq!(
+            row.detail.as_deref(),
+            Some("BiBCode couldn't confirm whether the conversation was compacted.")
+        );
+        assert_eq!(row.turn_id.as_deref(), Some("compaction-turn"));
+        assert!(
+            f.driver.interrupts.load(Ordering::SeqCst) >= 1,
+            "the bound interrupts the turn first"
+        );
+        assert!(
+            f.supervisor
+                .capture_session_identity("t1")
+                .await
+                .unwrap()
+                .is_none(),
+            "then ends the session that may hold it"
+        );
+        f.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_stop_asked_for_before_the_provider_names_the_turn_still_interrupts_it() {
+        let f = Fixture::new(true).await;
+        let id = request_compaction(&f).await;
+        // Stop reached the row while the request was on its way: nothing was running for the
+        // runtime to interrupt yet.
+        f.engine
+            .repositories()
+            .database()
+            .call(|connection| {
+                connection.execute("UPDATE thread_compactions SET stop_requested = 1", [])?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        script(
+            &f,
+            started_compaction(),
+            vec![core_event(
+                "turn.started",
+                "compaction-turn",
+                json!({"compactionId":"$id"}),
+            )],
+        );
+        let driving = {
+            let (supervisor, engine, root, id) = (
+                f.supervisor.clone(),
+                f.engine.clone(),
+                f._root.path().to_path_buf(),
+                id.clone(),
+            );
+            tokio::spawn(async move {
+                drive_thread_compaction(&supervisor, &engine, &root, &id, &CancellationToken::new())
+                    .await
+            })
+        };
+        timeout(Duration::from_secs(5), async {
+            while f.driver.interrupts.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the compaction's turn is interrupted once the provider names it");
+        crate::diagnostics::profiler::provider_turns::take_recorded();
+        enqueue(
+            &f,
+            [core_event(
+                "turn.completed",
+                "compaction-turn",
+                json!({"state":"interrupted", "compactionId":id}),
+            )],
+        );
+        timeout(Duration::from_secs(5), driving)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let row = f.engine.thread_compaction(&id).await.unwrap().unwrap();
+        assert_eq!(row.state, "interrupted");
+        f.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_claude_instance_that_disables_compaction_reads_as_not_compacting_automatically() {
+        let f = Fixture::new(false).await;
+        let mut launch = f.launch.clone();
+        launch.provider = "claudeAgent".into();
+        launch.provider_instance_id = Some("claudeAgent".into());
+        let cursor = json!({"sessionId":"claude-session"});
+        let tagged = |launch: &ProviderLaunchRequest| {
+            let mut reading = json!({"usedTokens": 961_230, "compactsAutomatically": true});
+            tag_context_window_reading(&mut reading, launch, Some(&cursor));
+            reading
+        };
+        let reading = tagged(&launch);
+        assert_eq!(reading["providerInstanceId"], "claudeAgent");
+        assert_eq!(reading["conversationId"], "claude-session");
+        assert_eq!(reading["compactsAutomatically"], true);
+        for (name, value, disabled) in [
+            ("DISABLE_COMPACT", "1", true),
+            ("DISABLE_AUTO_COMPACT", "true", true),
+            ("DISABLE_COMPACT", "0", false),
+            ("DISABLE_COMPACT", "false", false),
+            ("DISABLE_COMPACT", "", false),
+        ] {
+            let mut launch = launch.clone();
+            launch.environment.insert(name.into(), value.into());
+            assert_eq!(
+                tagged(&launch)["compactsAutomatically"],
+                !disabled,
+                "{name}={value}"
+            );
+        }
+        // The variables are Claude's: another provider's reading is left as reported.
+        let mut codex = f.launch.clone();
+        codex
+            .environment
+            .insert("DISABLE_COMPACT".into(), "1".into());
+        assert_eq!(tagged(&codex)["compactsAutomatically"], true);
+        f.shutdown().await;
+    }
+
+    /// The `provider.compaction` records made on this thread since the last call.
+    fn recorded_compactions() -> Vec<Value> {
+        crate::diagnostics::profiler::provider_turns::take_recorded()
+            .into_iter()
+            .filter(|(kind, _)| *kind == "provider.compaction")
+            .map(|(_, evidence)| evidence)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_compaction_stopped_before_its_effect_ran_is_still_recorded() {
+        let f = Fixture::new(true).await;
+        let id = request_compaction(&f).await;
+        f.engine
+            .dispatch(
+                serde_json::from_value(json!({
+                    "type":"thread.turn.interrupt", "commandId":"stop", "threadId":"t1",
+                    "createdAt":BEFORE_LOSS,
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        recorded_compactions();
+        let row = drive(&f, &id).await;
+        assert_eq!(row.state, "interrupted");
+        assert!(f.driver.compact_calls.lock().unwrap().is_empty());
+        let recorded = recorded_compactions();
+        assert_eq!(recorded.len(), 1, "{recorded:?}");
+        assert_eq!(recorded[0]["outcome"], "interrupted");
+        assert_eq!(recorded[0]["reason"], "stopped");
+        assert_eq!(recorded[0]["trigger"], "manual");
+        f.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_failed_codex_turn_records_one_provider_turn_failure() {
+        let f = Fixture::new(true).await;
+        crate::diagnostics::profiler::provider_turns::take_recorded();
+        enqueue(
+            &f,
+            [
+                core_event("turn.started", "turn-1", json!({})),
+                core_event(
+                    "turn.completed",
+                    "turn-1",
+                    json!({"state":"failed", "errorMessage":"The context window is full.",
+                        "errorClass":"provider_error", "providerReason":"contextWindowExceeded"}),
+                ),
+            ],
+        );
+        timeout(Duration::from_secs(5), async {
+            while f.session().await.status != "error" {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the failed turn is projected");
+        let failures: Vec<Value> = crate::diagnostics::profiler::provider_turns::take_recorded()
+            .into_iter()
+            .filter(|(kind, _)| *kind == "provider.turn-failed")
+            .map(|(_, evidence)| evidence)
+            .collect();
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(failures[0]["provider"], "codex");
+        assert_eq!(failures[0]["terminalReason"], "context_window_exceeded");
+        assert_eq!(failures[0]["errorClass"], "provider_error");
         f.shutdown().await;
     }
 
@@ -8470,11 +8694,16 @@ pub async fn drive_thread_compaction(
         .thread_compaction(compaction_id)
         .await
         .map_err(|error| error.to_string())?
-        .filter(ThreadCompactionRow::is_unsettled)
     else {
         return Ok(());
     };
     let started = std::time::Instant::now();
+    if !row.is_unsettled() {
+        // A Stop settled it before the effect read it: the effect runs once per request, so
+        // this is its only record.
+        record_settled_compaction(engine, &row, Some("stopped"), started).await;
+        return Ok(());
+    }
     let mut wait = engine
         .compaction_waiters()
         .register(&row.thread_id, compaction_id);
@@ -8521,7 +8750,7 @@ pub async fn drive_thread_compaction(
 
 /// Records how a compaction settled in the Profiler, from the row's final state: a Stop asked
 /// for during it makes it `interrupted` even if the provider completed it.
-async fn record_settled_compaction(
+pub(crate) async fn record_settled_compaction(
     engine: &OrchestrationEngine,
     row: &ThreadCompactionRow,
     reason: Option<&str>,
@@ -8725,21 +8954,27 @@ async fn run_thread_compaction(
     let label = session.provider_label.clone();
     let couldnt_compact = format!("{label} couldn't compact the conversation.");
     let mut turn_known = false;
-    match session
-        .identity
-        .driver
-        .compact(row.compaction_id.clone())
-        .await
-    {
+    // Every bound counts from the request. The request is bounded too: a provider that takes
+    // it but never answers (a Codex request has no deadline of its own) is treated as one whose
+    // outcome is unknown, so the thread is never held past the bounds.
+    let (_, _, start_bound) = compaction_bounds();
+    let requested_at = tokio::time::Instant::now();
+    let start = tokio::select! {
+        start = tokio::time::timeout(
+            start_bound,
+            session.identity.driver.compact(row.compaction_id.clone()),
+        ) => start.unwrap_or_else(|_| ProviderCompactionStart::Unknown {
+            detail: "the provider did not answer the compaction request".to_owned(),
+        }),
+        () = session.ended.cancelled() => ProviderCompactionStart::Unknown {
+            detail: "the session ended during the compaction request".to_owned(),
+        },
+    };
+    match start {
         ProviderCompactionStart::Started { turn_id } => {
             if let Some(turn_id) = turn_id {
                 turn_known = true;
-                if let Err(error) = engine
-                    .record_thread_compaction_turn(&row.compaction_id, &turn_id, &now())
-                    .await
-                {
-                    tracing::warn!(%error, "a compaction's turn could not be recorded");
-                }
+                compaction_turn_known(supervisor, engine, row, &turn_id).await;
             }
         }
         ProviderCompactionStart::NotStarted { detail } => {
@@ -8765,10 +9000,35 @@ async fn run_thread_compaction(
             &session,
             wait,
             turn_known,
-            couldnt_compact,
+            requested_at,
         )
         .await,
     )
+}
+
+/// The compaction's turn is known: records it, and interrupts it when a Stop was asked for
+/// before it existed (the interrupt then found nothing running to stop).
+async fn compaction_turn_known(
+    supervisor: &ProviderRuntimeSupervisor,
+    engine: &OrchestrationEngine,
+    row: &ThreadCompactionRow,
+    turn_id: &str,
+) {
+    if let Err(error) = engine
+        .record_thread_compaction_turn(&row.compaction_id, turn_id, &now())
+        .await
+    {
+        tracing::warn!(%error, "a compaction's turn could not be recorded");
+    }
+    if engine
+        .thread_compaction(&row.compaction_id)
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|row| row.stop_requested)
+    {
+        interrupt_compaction_turn(supervisor, &row.thread_id, turn_id).await;
+    }
 }
 
 /// Waits for the compaction's tagged turn to end, interrupting it at the bound and ending its
@@ -8780,11 +9040,15 @@ async fn await_compaction_turn(
     session: &CompactionSession,
     wait: &mut crate::orchestration::engine::CompactionWait,
     mut turn_known: bool,
-    couldnt_compact: String,
+    requested_at: tokio::time::Instant,
 ) -> CompactionRun {
+    let couldnt_compact = format!(
+        "{} couldn't compact the conversation.",
+        session.provider_label
+    );
     let (bound, grace, start_bound) = compaction_bounds();
-    let deadline = tokio::time::Instant::now() + bound;
-    let mut start_deadline = (!turn_known).then(|| tokio::time::Instant::now() + start_bound);
+    let deadline = requested_at + bound;
+    let mut start_deadline = (!turn_known).then(|| requested_at + start_bound);
     let mut grace_deadline: Option<tokio::time::Instant> = None;
     let mut bounded = false;
     let outcome = loop {
@@ -8816,22 +9080,8 @@ async fn await_compaction_turn(
                 };
                 turn_known = true;
                 start_deadline = None;
-                if let Err(error) = engine
-                    .record_thread_compaction_turn(&row.compaction_id, &turn_id, &now())
-                    .await
-                {
-                    tracing::warn!(%error, "a compaction's turn could not be recorded");
-                }
                 // A Stop asked for before the turn started stops it now.
-                if engine
-                    .thread_compaction(&row.compaction_id)
-                    .await
-                    .ok()
-                    .flatten()
-                    .is_some_and(|row| row.stop_requested)
-                {
-                    interrupt_compaction_turn(supervisor, &row.thread_id, &turn_id).await;
-                }
+                compaction_turn_known(supervisor, engine, row, &turn_id).await;
             }
             () = start_sleep => {
                 start_deadline = None;
@@ -10287,19 +10537,7 @@ async fn project_provider_event(
             let Some(mut payload) = context_window_activity_payload(&event.payload) else {
                 return Ok(());
             };
-            // Which instance and conversation the reading came from, which an automatic
-            // compaction requires to match its own.
-            if let Some(object) = payload.as_object_mut() {
-                if let Some(instance_id) = &launch.provider_instance_id {
-                    object.insert("providerInstanceId".to_owned(), json!(instance_id));
-                }
-                if let Some(conversation_id) = resume_cursor
-                    .as_ref()
-                    .and_then(|cursor| resume_cursor_conversation_id(&launch.provider, cursor))
-                {
-                    object.insert("conversationId".to_owned(), json!(conversation_id));
-                }
-            }
+            tag_context_window_reading(&mut payload, launch, resume_cursor.as_ref());
             OrchestrationCommand::ThreadActivityAppend {
                 command_id,
                 thread_id: event.thread_id,
@@ -10464,6 +10702,41 @@ async fn settle_streaming_assistant_message_rows(
     match first_persistent_error {
         Some(detail) => Err(ProviderRuntimeError::Orchestration(detail)),
         None => Ok(()),
+    }
+}
+
+/// Tags a context-window reading with the instance and conversation it came from, which an
+/// automatic compaction requires to match its own. A Claude instance whose environment sets
+/// `DISABLE_AUTO_COMPACT` or `DISABLE_COMPACT` reads as not compacting automatically: Claude
+/// reports the first through `isAutoCompactEnabled`, but no recorded response confirms it does
+/// for the second, so BiBCode does not depend on it.
+fn tag_context_window_reading(
+    payload: &mut Value,
+    launch: &ProviderLaunchRequest,
+    resume_cursor: Option<&Value>,
+) {
+    let Some(object) = payload.as_object_mut() else {
+        return;
+    };
+    if let Some(instance_id) = &launch.provider_instance_id {
+        object.insert("providerInstanceId".to_owned(), json!(instance_id));
+    }
+    if let Some(conversation_id) =
+        resume_cursor.and_then(|cursor| resume_cursor_conversation_id(&launch.provider, cursor))
+    {
+        object.insert("conversationId".to_owned(), json!(conversation_id));
+    }
+    let compaction_disabled = matches!(launch.provider.as_str(), "claude" | "claudeAgent")
+        && ["DISABLE_AUTO_COMPACT", "DISABLE_COMPACT"]
+            .iter()
+            .any(|name| {
+                launch.environment.get(*name).is_some_and(|value| {
+                    let value = value.trim();
+                    !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false")
+                })
+            });
+    if compaction_disabled {
+        object.insert("compactsAutomatically".to_owned(), json!(false));
     }
 }
 

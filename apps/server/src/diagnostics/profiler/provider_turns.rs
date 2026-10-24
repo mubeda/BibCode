@@ -18,11 +18,35 @@ use super::{
 /// `other`: the reason is part of the fingerprint and must stay a stable, content-free name.
 const MAX_REASON_CHARS: usize = 64;
 
+#[cfg(test)]
+thread_local! {
+    /// The evidence of every record call on this thread, whether or not the profiler is on, so a
+    /// test (on a single-threaded runtime) can see which code paths record and how often.
+    static RECORDED: std::cell::RefCell<Vec<(&'static str, serde_json::Value)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The records made on this thread since the last call: each event kind with its evidence.
+#[cfg(test)]
+pub(crate) fn take_recorded() -> Vec<(&'static str, serde_json::Value)> {
+    RECORDED.with(|recorded| std::mem::take(&mut *recorded.borrow_mut()))
+}
+
+#[cfg(test)]
+fn note_recorded(kind: &'static str, evidence: serde_json::Value) {
+    RECORDED.with(|recorded| recorded.borrow_mut().push((kind, evidence)));
+}
+
 /// Records one failed provider turn as a `provider.turn-failed` event and finding. Never
 /// records message text: only `provider`, the provider's own reason when it gave one (Claude's
 /// `terminal_reason`, Codex's error variant, OpenCode's error name), and the canonical
 /// `error_class`. Does nothing while the profiler is off.
 pub fn record_turn_failure(provider: &str, provider_reason: Option<&str>, error_class: &str) {
+    #[cfg(test)]
+    note_recorded(
+        "provider.turn-failed",
+        turn_failure_finding(provider, provider_reason, error_class).evidence,
+    );
     if !is_enabled() {
         return;
     }
@@ -88,6 +112,8 @@ pub struct CompactionRecord<'a> {
 /// `provider.compaction-failed` finding. Never records message, summary or error text. Does
 /// nothing while the profiler is off.
 pub fn record_compaction(record: CompactionRecord<'_>) {
+    #[cfg(test)]
+    note_recorded("provider.compaction", compaction_evidence(record));
     if !is_enabled() {
         return;
     }

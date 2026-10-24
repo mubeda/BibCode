@@ -735,15 +735,16 @@ async fn settle_unrun_compaction(
     compaction_id: &str,
     detail: &str,
 ) {
-    let still_unsettled = engine
+    let Some(row) = engine
         .thread_compaction(compaction_id)
         .await
         .ok()
         .flatten()
-        .is_some_and(|row| row.is_unsettled());
-    if !still_unsettled {
+        .filter(crate::orchestration::engine::ThreadCompactionRow::is_unsettled)
+    else {
         return;
-    }
+    };
+    let started = std::time::Instant::now();
     let settled = engine
         .dispatch(OrchestrationCommand::ThreadCompactionSettle {
             command_id: format!("server:compaction-settle:{compaction_id}"),
@@ -755,8 +756,19 @@ async fn settle_unrun_compaction(
             created_at: now_iso(),
         })
         .await;
-    if let Err(error) = settled {
-        tracing::warn!(thread_id, %error, "an unrun conversation compaction could not be settled");
+    match settled {
+        Ok(_) => {
+            super::provider_runtime::record_settled_compaction(
+                engine,
+                &row,
+                Some("not_started"),
+                started,
+            )
+            .await;
+        }
+        Err(error) => {
+            tracing::warn!(thread_id, %error, "an unrun conversation compaction could not be settled");
+        }
     }
     engine.wake_turn_delivery();
 }
@@ -1946,6 +1958,41 @@ mod tests {
         OrchestrationEngine::start(database, EngineOptions::default())
             .await
             .expect("engine")
+    }
+
+    #[tokio::test]
+    async fn a_compaction_that_could_not_run_is_settled_and_recorded() {
+        const AT: &str = "2026-10-24T00:00:00Z";
+        let engine = empty_event_log().await;
+        for value in [
+            json!({"type":"project.create","commandId":"project","projectId":"p","title":"P","workspaceRoot":"C:/repo","createdAt":AT}),
+            json!({"type":"thread.create","commandId":"thread","threadId":"t","projectId":"p","title":"T","modelSelection":{"instanceId":"claudeAgent","model":"claude-opus"},"runtimeMode":"full-access","createdAt":AT}),
+        ] {
+            engine
+                .dispatch(serde_json::from_value(value).unwrap())
+                .await
+                .unwrap();
+        }
+        engine
+            .repositories()
+            .database()
+            .call(|connection| {
+                connection.execute("INSERT INTO thread_compactions (compaction_id, thread_id, trigger, state, provider_instance_id, provider_kind, created_at, updated_at) VALUES ('c', 't', 'manual', 'requested', 'claudeAgent', 'claudeAgent', '2026-10-24T00:00:00Z', '2026-10-24T00:00:00Z')", [])?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        crate::diagnostics::profiler::provider_turns::take_recorded();
+        settle_unrun_compaction(&engine, "t", "c", "The workspace is unavailable.").await;
+        let row = engine.thread_compaction("c").await.unwrap().unwrap();
+        assert_eq!(row.state, "failed");
+        let recorded = crate::diagnostics::profiler::provider_turns::take_recorded();
+        assert_eq!(recorded.len(), 1, "{recorded:?}");
+        assert_eq!(recorded[0].0, "provider.compaction");
+        assert_eq!(recorded[0].1["outcome"], "failed");
+        assert_eq!(recorded[0].1["reason"], "not_started");
+        assert_eq!(recorded[0].1["provider"], "claude");
+        engine.shutdown().await;
     }
 
     #[tokio::test]
