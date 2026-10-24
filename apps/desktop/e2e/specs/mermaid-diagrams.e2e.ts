@@ -6,6 +6,7 @@ import * as NodePath from "node:path";
 import {
   mermaidFixtureFiles,
   mermaidFixturePrompts,
+  mermaidFixtureStreamedLastLine,
   prepareMermaidFixtureFiles,
 } from "../support/mermaid-fixture.ts";
 import { desktopUiFixture } from "../support/test-project.ts";
@@ -34,6 +35,35 @@ interface EndSample {
   /** How far the list is scrolled from its end. */
   readonly endGap: number | null;
   readonly evictedDrawn: boolean;
+  /**
+   * The last line is painted: LegendList keeps its rows transparent until its first layout
+   * and its first scroll to the end are done.
+   */
+  readonly shown: boolean;
+}
+
+interface StreamSample {
+  readonly at: number;
+  /** The streamed reply's first text is shown. */
+  readonly streaming: boolean;
+  /** Its code block, a diagram or plain source, is shown. */
+  readonly fenceShown: boolean;
+  /** Its last line is shown. */
+  readonly finished: boolean;
+  /** Its last line is shown inside the list's visible area. */
+  readonly lastLineInView: boolean;
+  /** How far the list is scrolled from its end. */
+  readonly endGap: number | null;
+  readonly diagramDrawn: boolean;
+}
+
+interface LandingSample {
+  readonly at: number;
+  /** How far below the visible top the selected message starts. */
+  readonly target: number | null;
+  /** Where the row holding the evicted diagram ends, relative to the visible top. */
+  readonly diagramRowBottom: number | null;
+  readonly diagramDrawn: boolean;
 }
 
 async function saveEvidence(name: string): Promise<void> {
@@ -273,6 +303,28 @@ async function restAnchorBelowTop(label: string, anchor: string): Promise<Readin
   throw new Error(`The timeline did not rest with "${anchor}" below its top.`);
 }
 
+/**
+ * Fails unless the webview paints frames. The list holds the reading line from its resize
+ * observers, which run only in a painted frame, and an occluded macOS webview paints none,
+ * so there the reading-line checks would measure layout no one sees.
+ */
+async function expectPaintingWebview(): Promise<void> {
+  const painting = await browser.executeAsync((done: (painted: boolean) => void) => {
+    const timeout = setTimeout(() => done(false), 3_000);
+    requestAnimationFrame(() =>
+      requestAnimationFrame(() => {
+        clearTimeout(timeout);
+        done(true);
+      }),
+    );
+  });
+  if (!painting) {
+    throw new Error(
+      "The webview paints no frames (an occluded window); the reading-line checks need it visible.",
+    );
+  }
+}
+
 /** Toggles Show source on the diagram block containing `label`, as a reader would. */
 async function toggleDiagramView(label: string): Promise<void> {
   await browser.execute(
@@ -290,6 +342,144 @@ async function toggleDiagramView(label: string): Promise<void> {
     label,
   );
   await browser.pause(600);
+}
+
+/** `CHAT_LIST_ANCHOR_OFFSET` in packages/shared/src/chatList.ts: where a sent row lands. */
+const SENT_ROW_ANCHOR_OFFSET = 16;
+/** The `viewOffset` the timeline minimap scrolls a selected message to. */
+const MINIMAP_VIEW_OFFSET = 24;
+
+/** How far below the timeline's visible top each rendered user row sent as `prompt` starts. */
+async function userRowOffsets(prompt: string): Promise<number[]> {
+  return browser.execute(
+    (surface: string, text: string) =>
+      [...document.querySelectorAll<HTMLElement>(`${surface} [data-message-role="user"]`)]
+        .filter((element) => element.textContent?.includes(text))
+        .map((row) => {
+          const viewport = row
+            .closest<HTMLElement>("[class*='overflow-anchor']")
+            ?.parentElement?.getBoundingClientRect();
+          return viewport ? Math.round(row.getBoundingClientRect().top - viewport.top) : NaN;
+        }),
+    visibleSurfaceSelector,
+    prompt,
+  );
+}
+
+interface ReadingLineSamples {
+  readonly timer: LandingSample[];
+  /** Taken once each frame has painted; empty in an occluded webview, which paints none. */
+  readonly painted: LandingSample[];
+}
+
+/**
+ * Samples, on a timer and after each painted frame, where the user row sent as `prompt`
+ * starts and where the row holding the diagram labelled `diagramLabel` ends.
+ */
+async function startReadingLineSamples(prompt: string, diagramLabel: string): Promise<void> {
+  await browser.execute(
+    (surface: string, targetPrompt: string, label: string) => {
+      const record = window as unknown as {
+        __bibcodeReadingLineSamples?: { timer: LandingSample[]; painted: LandingSample[] };
+        __bibcodeReadingLineStop?: () => void;
+      };
+      record.__bibcodeReadingLineStop?.();
+      const samples = { timer: [] as LandingSample[], painted: [] as LandingSample[] };
+      record.__bibcodeReadingLineSamples = samples;
+      const started = performance.now();
+      const read = (): LandingSample => {
+        const viewport = document
+          .querySelector(`${surface} [class*='overflow-anchor']`)
+          ?.parentElement?.getBoundingClientRect();
+        const target = [
+          ...document.querySelectorAll<HTMLElement>(`${surface} [data-message-role="user"]`),
+        ].find((element) => element.textContent?.includes(targetPrompt));
+        const block = [
+          ...document.querySelectorAll<HTMLElement>(`${surface} .chat-markdown-codeblock`),
+        ].find((element) => element.textContent?.includes(label));
+        const blockRow = block?.closest<HTMLElement>("[data-timeline-root]");
+        return {
+          at: performance.now() - started,
+          target: target && viewport ? target.getBoundingClientRect().top - viewport.top : null,
+          diagramRowBottom:
+            blockRow && viewport ? blockRow.getBoundingClientRect().bottom - viewport.top : null,
+          diagramDrawn: block?.querySelector(".chat-markdown-mermaid svg") != null,
+        };
+      };
+      let running = true;
+      const timer = setInterval(() => {
+        samples.timer.push(read());
+        if (performance.now() - started > 60_000) record.__bibcodeReadingLineStop?.();
+      }, 5);
+      // A message posted from a frame callback is handled once that frame has painted.
+      const afterPaint = new MessageChannel();
+      afterPaint.port1.addEventListener("message", () => samples.painted.push(read()));
+      afterPaint.port1.start();
+      const onFrame = () => {
+        if (!running) return;
+        afterPaint.port2.postMessage(null);
+        requestAnimationFrame(onFrame);
+      };
+      requestAnimationFrame(onFrame);
+      record.__bibcodeReadingLineStop = () => {
+        running = false;
+        clearInterval(timer);
+      };
+    },
+    visibleSurfaceSelector,
+    prompt,
+    diagramLabel,
+  );
+}
+
+async function readReadingLineSamples(): Promise<ReadingLineSamples> {
+  return browser.execute(
+    () =>
+      (
+        window as unknown as {
+          __bibcodeReadingLineSamples?: { timer: LandingSample[]; painted: LandingSample[] };
+        }
+      ).__bibcodeReadingLineSamples ?? { timer: [], painted: [] },
+  );
+}
+
+/** The samples where something changed, for a trace artifact that holds no message text. */
+function withoutRepeats(samples: ReadingLineSamples): ReadingLineSamples {
+  const changes = (list: readonly LandingSample[]) =>
+    list.filter(
+      (entry, index, all) =>
+        index === 0 ||
+        entry.target !== all[index - 1]!.target ||
+        entry.diagramRowBottom !== all[index - 1]!.diagramRowBottom ||
+        entry.diagramDrawn !== all[index - 1]!.diagramDrawn,
+    );
+  return { timer: changes(samples.timer), painted: changes(samples.painted) };
+}
+
+/** Scrolls the timeline to its end and waits until the reply's `lastLine` rests in view. */
+async function scrollTimelineToEnd(lastLine: string): Promise<void> {
+  await browser.waitUntil(
+    () =>
+      browser.execute(
+        (surface: string, line: string) => {
+          const scroller = document.querySelector<HTMLElement>(
+            `${surface} [class*='overflow-anchor']`,
+          );
+          if (!scroller) return false;
+          scroller.scrollTop = scroller.scrollHeight;
+          const paragraph = [
+            ...document.querySelectorAll<HTMLElement>(`${surface} .chat-markdown p`),
+          ].find((element) => element.textContent === line);
+          const area = scroller.getBoundingClientRect();
+          const box = paragraph?.getBoundingClientRect();
+          return !!box && box.top >= area.top && box.bottom <= area.bottom;
+        },
+        visibleSurfaceSelector,
+        lastLine,
+      ),
+    { timeoutMsg: "The timeline never returned to the reply's last line.", interval: 500 },
+  );
+  await browser.pause(1_000);
 }
 
 describe("packaged Mermaid diagrams", () => {
@@ -386,6 +576,7 @@ describe("packaged Mermaid diagrams", () => {
       { timeoutMsg: "The long fixture reply never arrived." },
     );
 
+    await expectPaintingWebview();
     // Inside the first visible row, above the top edge: the reading anchor compensates.
     const inRowAnchor = "Below the diagram paragraph 20 keeps the reading position measurable.";
     const inRow = await restAnchorBelowTop("Fixture draw", inRowAnchor);
@@ -411,12 +602,101 @@ describe("packaged Mermaid diagrams", () => {
     const aboveAfter = await readingLineGeometry("Fixture draw", aboveAnchor);
     expect(Math.abs(aboveAfter.anchorTop - above.anchorTop)).toBeLessThanOrEqual(1);
     await saveEvidence("mermaid-timeline-row-above");
+
+    // The sent-row anchor still holds a sent message at its offset, below the replies above
+    // it, once the diagram in a reply shorter than the timeline has drawn under it, with the
+    // list's size anchoring on. (A reply taller than the timeline scrolls on to reveal its end
+    // instead, and a first message has nothing above it to scroll past.)
+    await sendPrompt(mermaidFixturePrompts.short);
+    await browser.waitUntil(
+      () =>
+        browser.execute(
+          (surface: string) =>
+            [...document.querySelectorAll(`${surface} .chat-markdown-mermaid svg`)].some((svg) =>
+              svg.textContent?.includes("Kept at the top"),
+            ),
+          visibleSurfaceSelector,
+        ),
+      { timeoutMsg: "The short fixture reply's diagram never drew." },
+    );
+    await browser.pause(600);
+    const sentRows = await userRowOffsets(mermaidFixturePrompts.short);
+    expect(sentRows).toHaveLength(1);
+    expect(Math.abs(sentRows[0]! - SENT_ROW_ANCHOR_OFFSET)).toBeLessThanOrEqual(1);
+    await saveEvidence("mermaid-timeline-sent-row");
+
+    // Minimap navigation still lands where the minimap puts it, past the diagrams above.
+    const minimapLabel = () =>
+      browser.execute((surface: string) => {
+        const button = document.querySelector<HTMLButtonElement>(
+          `${surface} [data-testid="timeline-minimap"] button`,
+        );
+        if (!button || button.getBoundingClientRect().height === 0) {
+          throw new Error("The timeline minimap is not shown.");
+        }
+        return button.getAttribute("aria-label") ?? "";
+      }, visibleSurfaceSelector);
+    const pressMinimapKey = (key: string | null) =>
+      browser.execute(
+        (surface: string, pressed: string | null) => {
+          const button = document.querySelector<HTMLButtonElement>(
+            `${surface} [data-testid="timeline-minimap"] button`,
+          )!;
+          if (pressed === null) button.focus();
+          else button.dispatchEvent(new KeyboardEvent("keydown", { key: pressed, bubbles: true }));
+        },
+        visibleSurfaceSelector,
+        key,
+      );
+    // From the end, so the jump passes the short reply's diagram. The keyboard selects a
+    // message exactly; earlier specs may have sent messages before these.
+    await scrollTimelineToEnd("After the short diagram.");
+    await minimapLabel();
+    await pressMinimapKey(null);
+    // Not the first message, which the list cannot scroll below its top.
+    for (let step = 0; !(await minimapLabel()).includes(mermaidFixturePrompts.long); step += 1) {
+      if (step > 50) throw new Error("The minimap never offered the long reply's message.");
+      await pressMinimapKey("ArrowDown");
+    }
+    await startReadingLineSamples(mermaidFixturePrompts.long, "Fixture draw");
+    await pressMinimapKey("Enter");
+    let landing: ReadingLineSamples = { timer: [], painted: [] };
+    const landedAt = (entries: readonly LandingSample[]) =>
+      entries.findIndex(
+        (entry) => entry.target !== null && Math.abs(entry.target - MINIMAP_VIEW_OFFSET) <= 1,
+      );
+    try {
+      await browser.waitUntil(
+        async () => {
+          landing = await readReadingLineSamples();
+          const landed = landedAt(landing.timer);
+          return landed >= 0 && landing.timer.at(-1)!.at - landing.timer[landed]!.at > 1_500;
+        },
+        { timeoutMsg: "The minimap never landed on the long reply's message.", interval: 500 },
+      );
+    } finally {
+      NodeFS.writeFileSync(
+        NodePath.join(preparedArtifactDirectory, "mermaid-timeline-minimap-landing.json"),
+        JSON.stringify(withoutRepeats(landing), null, 2),
+      );
+    }
+    expect(
+      landing.timer
+        .slice(landedAt(landing.timer))
+        .every(
+          (entry) => entry.target !== null && Math.abs(entry.target - MINIMAP_VIEW_OFFSET) <= 1,
+        ),
+    ).toBe(true);
+    await browser.execute(() =>
+      (window as unknown as { __bibcodeReadingLineStop?: () => void }).__bibcodeReadingLineStop?.(),
+    );
+    await saveEvidence("mermaid-timeline-minimap-landing");
   });
 
   it("draws an evicted diagram again on remount and settles at the end", async function () {
-    // The draws alone may wait 240 s in an occluded webview, then the remount up to 60 s more,
-    // past the suite's 120 s default.
-    this.timeout(420_000);
+    // Each batch of 101 draws may wait 240 s in an occluded webview, and the remount up to
+    // 60 s more, past the suite's 120 s default.
+    this.timeout(600_000);
     await setDesktopUiWindowSize(1_400, 900);
     await openFixtureWorkspace();
     await sendPrompt(mermaidFixturePrompts.many);
@@ -425,23 +705,37 @@ describe("packaged Mermaid diagrams", () => {
       () =>
         browser.execute(
           (surface: string) =>
-            document.querySelectorAll(
-              `${surface} .chat-markdown-codeblock[data-language="mermaid"] .chat-markdown-mermaid svg`,
-            ).length >= 101,
+            [
+              ...document.querySelectorAll(
+                `${surface} .chat-markdown-codeblock[data-language="mermaid"] .chat-markdown-mermaid svg`,
+              ),
+            ].filter((svg) => svg.textContent?.includes("Many ")).length >= 101,
           visibleSurfaceSelector,
         ),
       { timeoutMsg: "The 101 fixture diagrams never drew.", timeout: 240_000, interval: 1_000 },
     );
+    // The remount runs first, while only the reply's last diagram is evicted. Open item (#171
+    // merge gate): when a cold draw above has also evicted another of the 101, the reopened
+    // chat settled about one diagram height (21 px) short of its end in two of three runs,
+    // which matches a diagram growing at the end without the list following it.
     // Sample on a timer while the chat is left and reopened (an in-page navigation keeps the
     // diagram cache): the last line's position and whether the evicted diagram is drawn. The
     // queue draws the most recently mounted block first, so the reply's last diagram was the
     // first one drawn and, once 100 others followed it, the one the cache evicted.
+    // Timer samples can also see layout no frame painted (between a task that changed sizes
+    // and the frame's resize observers), so the trace also samples once after each painted
+    // frame; an occluded webview runs no frames and leaves that list empty.
     await browser.execute((surface: string) => {
-      const record = window as unknown as { __bibcodeMermaidSamples?: EndSample[] };
+      const record = window as unknown as {
+        __bibcodeMermaidSamples?: EndSample[];
+        __bibcodeMermaidFrameSamples?: EndSample[];
+      };
       const samples: EndSample[] = [];
+      const frameSamples: EndSample[] = [];
       record.__bibcodeMermaidSamples = samples;
+      record.__bibcodeMermaidFrameSamples = frameSamples;
       const started = performance.now();
-      const sample = () => {
+      const read = (): EndSample => {
         const paragraph = [
           ...document.querySelectorAll<HTMLElement>(`${surface} .chat-markdown p`),
         ].find((element) => element.textContent === "Last line after the diagrams.");
@@ -449,7 +743,7 @@ describe("packaged Mermaid diagrams", () => {
           ...(paragraph?.closest(".chat-markdown")?.querySelectorAll(".chat-markdown-codeblock") ??
             []),
         ].at(-1);
-        samples.push({
+        return {
           at: performance.now() - started,
           bottom: paragraph?.getBoundingClientRect().bottom ?? null,
           visible: (() => {
@@ -466,15 +760,33 @@ describe("packaged Mermaid diagrams", () => {
               : null;
           })(),
           evictedDrawn: evictedBlock?.querySelector(".chat-markdown-mermaid svg") != null,
-        });
+          shown: (() => {
+            const scroller = paragraph?.closest<HTMLElement>("[class*='overflow-anchor']");
+            if (!paragraph || !scroller) return false;
+            for (let node: HTMLElement | null = paragraph; node && node !== scroller;) {
+              if (getComputedStyle(node).opacity === "0") return false;
+              node = node.parentElement;
+            }
+            return true;
+          })(),
+        };
       };
       // The first sample is where the reply ends before the chat is left; an occluded webview
       // can delay the first timer past the navigation.
-      sample();
+      samples.push(read());
       const timer = setInterval(() => {
-        sample();
+        samples.push(read());
         if (performance.now() - started > 60_000) clearInterval(timer);
       }, 5);
+      // A message posted from a frame callback is handled once that frame has painted.
+      const afterPaint = new MessageChannel();
+      afterPaint.port1.addEventListener("message", () => frameSamples.push(read()));
+      afterPaint.port1.start();
+      const onFrame = () => {
+        afterPaint.port2.postMessage(null);
+        if (performance.now() - started < 60_000) requestAnimationFrame(onFrame);
+      };
+      requestAnimationFrame(onFrame);
     }, visibleSurfaceSelector);
     await browser.url(`${await browser.execute(() => window.location.origin)}/#/`);
     await openFixtureWorkspace();
@@ -504,20 +816,33 @@ describe("packaged Mermaid diagrams", () => {
     expect(mounted).toBeGreaterThan(left);
     expect(samples[mounted]?.evictedDrawn).toBe(false);
     expect(drawn).toBeGreaterThan(mounted);
-    const trace = samples
-      .slice(Math.max(0, left - 1))
-      .filter(
+    const changes = (list: readonly EndSample[]) =>
+      list.filter(
         (entry, index, all) =>
           index === 0 ||
           entry.bottom !== all[index - 1]!.bottom ||
           entry.visible !== all[index - 1]!.visible ||
           entry.endGap !== all[index - 1]!.endGap ||
-          entry.evictedDrawn !== all[index - 1]!.evictedDrawn,
+          entry.evictedDrawn !== all[index - 1]!.evictedDrawn ||
+          entry.shown !== all[index - 1]!.shown,
       );
-    // The per-sample trace is evidence for the open gate item below; it holds no message text.
+    const frameSamples = await browser.execute(
+      () =>
+        (window as unknown as { __bibcodeMermaidFrameSamples?: EndSample[] })
+          .__bibcodeMermaidFrameSamples ?? [],
+    );
+    // The per-sample traces are evidence for the open gate item below; they hold no message
+    // text.
     NodeFS.writeFileSync(
       NodePath.join(preparedArtifactDirectory, "mermaid-timeline-evicted-remount.json"),
-      JSON.stringify(trace, null, 2),
+      JSON.stringify(
+        {
+          timerSamples: changes(samples.slice(Math.max(0, left - 1))),
+          paintedFrameSamples: changes(frameSamples),
+        },
+        null,
+        2,
+      ),
     );
     // The reopened chat settles at its end, with the reply's last line in view, and stays
     // there for the last second of samples. Open item (#171 merge gate): when the evicted
@@ -530,5 +855,229 @@ describe("packaged Mermaid diagrams", () => {
     const lastSecond = samples.filter((entry) => entry.at >= final.at - 1_000);
     expect(lastSecond.every((entry) => Math.abs(entry.bottom! - final.bottom!) <= 1)).toBe(true);
     await saveEvidence("mermaid-timeline-evicted-remount");
+
+    // A cold first draw above the line being read. The rows reply's diagram was evicted by
+    // these 101 and its row, far above, unmounted. Scrolling up a step at a time remounts that
+    // row in the list's buffer above the viewport, where it shows its source and then draws
+    // through the queue; the message sent after it, the line being read, stays put on every
+    // painted frame from the remount on. The reopened list may have mounted, and drawn, rows
+    // from its top, so 101 further diagrams evict every earlier one first, and the case waits,
+    // at the end, until the rows reply's row is unmounted.
+    await sendPrompt(mermaidFixturePrompts.manyAgain);
+    await browser.waitUntil(
+      () =>
+        browser.execute(
+          (surface: string) =>
+            [...document.querySelectorAll(`${surface} .chat-markdown-mermaid svg`)].filter((svg) =>
+              svg.textContent?.includes("Again "),
+            ).length >= 101,
+          visibleSurfaceSelector,
+        ),
+      { timeoutMsg: "The second 101 diagrams never drew.", timeout: 240_000, interval: 1_000 },
+    );
+    await expectPaintingWebview();
+    await browser.waitUntil(
+      () =>
+        browser.execute(
+          (surface: string, diagramLabel: string) => {
+            const scroller = document.querySelector<HTMLElement>(
+              `${surface} [class*='overflow-anchor']`,
+            );
+            if (scroller) scroller.scrollTop = scroller.scrollHeight;
+            return ![
+              ...document.querySelectorAll<HTMLElement>(`${surface} .chat-markdown-codeblock`),
+            ].some((element) => element.textContent?.includes(diagramLabel));
+          },
+          visibleSurfaceSelector,
+          "Fixture draw",
+        ),
+      { timeoutMsg: "The rows reply's diagram never unmounted.", timeout: 15_000, interval: 500 },
+    );
+    await startReadingLineSamples(mermaidFixturePrompts.long, "Fixture draw");
+    for (let step = 0; ; step += 1) {
+      // Two replies of 101 diagrams lie between the end and the rows reply.
+      if (step > 300) throw new Error("Scrolling up never reached the rows reply.");
+      const reached = await browser.execute(
+        (surface: string, diagramLabel: string) => {
+          const reachedBlock = [
+            ...document.querySelectorAll<HTMLElement>(`${surface} .chat-markdown-codeblock`),
+          ].some((element) => element.textContent?.includes(diagramLabel));
+          if (reachedBlock) return true;
+          const scroller = document.querySelector<HTMLElement>(
+            `${surface} [class*='overflow-anchor']`,
+          );
+          if (scroller) scroller.scrollTop -= 300;
+          return false;
+        },
+        visibleSurfaceSelector,
+        "Fixture draw",
+      );
+      if (reached) break;
+      await browser.pause(250);
+    }
+    await browser.pause(1_500);
+    const coldDraw = await readReadingLineSamples();
+    NodeFS.writeFileSync(
+      NodePath.join(preparedArtifactDirectory, "mermaid-timeline-cold-draw.json"),
+      JSON.stringify(withoutRepeats(coldDraw), null, 2),
+    );
+    // Timer samples can see layout no frame painted, so the check reads the painted frames.
+    expect(coldDraw.painted.length).toBeGreaterThan(0);
+    const appeared = coldDraw.painted.findIndex((entry) => entry.diagramRowBottom !== null);
+    const drew = coldDraw.painted.findIndex((entry) => entry.diagramDrawn);
+    expect(appeared).toBeGreaterThanOrEqual(0);
+    expect(coldDraw.painted[appeared]!.diagramDrawn).toBe(false);
+    expect(drew).toBeGreaterThan(appeared);
+    const readingLine = coldDraw.painted[appeared]!.target!;
+    expect(coldDraw.painted[drew]!.diagramRowBottom!).toBeLessThanOrEqual(readingLine);
+    expect(
+      coldDraw.painted
+        .slice(appeared)
+        .every((entry) => entry.target !== null && Math.abs(entry.target - readingLine) <= 1),
+    ).toBe(true);
+    await saveEvidence("mermaid-timeline-cold-draw");
+  });
+
+  it("follows the end while a streamed reply's diagram draws", async function () {
+    this.timeout(240_000);
+    await setDesktopUiWindowSize(1_400, 900);
+    await openFixtureWorkspace();
+    await expectPaintingWebview();
+    // The same reply streams twice, first with the diagram's source in a plain code block as
+    // the baseline, then as a diagram that draws while the list follows the end and more text
+    // streams after it. Each is taller than the timeline before the fence.
+    const plain = await streamAndSampleEnd(mermaidFixturePrompts.streamedPlain);
+    const diagram = await streamAndSampleEnd(mermaidFixturePrompts.streamed);
+    NodeFS.writeFileSync(
+      NodePath.join(preparedArtifactDirectory, "mermaid-timeline-streaming-follow.json"),
+      JSON.stringify({ plain: streamChanges(plain), diagram: streamChanges(diagram) }, null, 2),
+    );
+    expect(plain.some((entry) => entry.diagramDrawn)).toBe(false);
+    const drew = diagram.findIndex((entry) => entry.diagramDrawn);
+    const firstStreamed = diagram.findIndex((entry) => entry.streaming);
+    // The diagram drew while the reply streamed, after its first text was shown.
+    expect(firstStreamed).toBeGreaterThanOrEqual(0);
+    expect(drew).toBeGreaterThan(firstStreamed);
+    expect(diagram.slice(drew).some((entry) => !entry.finished)).toBe(true);
+    // The list keeps following the end: it ends resting where the plain reply rests, with the
+    // last streamed line in view. Open item (#171 merge gate): the diagram's own growth when
+    // it draws at the end is not followed, so the list rests that much (about 21 px) further
+    // from the end than the plain reply until the next delta lands; a diagram that ended a
+    // reply would leave it there. The trace artifact records both replies' gaps.
+    expect(diagram.some((entry) => entry.fenceShown)).toBe(true);
+    expect(plain.some((entry) => entry.fenceShown)).toBe(true);
+    expect(Math.abs(diagram.at(-1)!.endGap! - plain.at(-1)!.endGap!)).toBeLessThanOrEqual(1);
+    expect(diagram.at(-1)!.lastLineInView).toBe(true);
+    await saveEvidence("mermaid-timeline-streaming-follow");
   });
 });
+
+/**
+ * Scrolls the timeline to its end, sends `prompt`, and samples after each painted frame how
+ * far the list is from its end until the streamed reply has finished and rested.
+ */
+async function streamAndSampleEnd(prompt: string): Promise<StreamSample[]> {
+  await browser.execute((surface: string) => {
+    const scroller = document.querySelector<HTMLElement>(`${surface} [class*='overflow-anchor']`);
+    if (scroller) scroller.scrollTop = scroller.scrollHeight;
+  }, visibleSurfaceSelector);
+  await browser.pause(1_000);
+  await browser.execute(
+    (surface: string, lastLine: string) => {
+      const record = window as unknown as {
+        __bibcodeStreamSamples?: StreamSample[];
+        __bibcodeStreamStop?: () => void;
+      };
+      const count = (text: string) =>
+        [...document.querySelectorAll<HTMLElement>(`${surface} .chat-markdown p`)].filter(
+          (element) => element.textContent === text,
+        ).length;
+      const fences = () =>
+        [...document.querySelectorAll<HTMLElement>(`${surface} .chat-markdown-codeblock`)].filter(
+          (element) => element.textContent?.includes("Streamed draw"),
+        ).length;
+      const drawn = () =>
+        [...document.querySelectorAll(`${surface} .chat-markdown-mermaid svg`)].filter((svg) =>
+          svg.textContent?.includes("Streamed draw"),
+        ).length;
+      const introsBefore = count("Streamed reply intro.");
+      const lastLinesBefore = count(lastLine);
+      const fencesBefore = fences();
+      const drawnBefore = drawn();
+      const samples: StreamSample[] = [];
+      record.__bibcodeStreamSamples = samples;
+      const started = performance.now();
+      let running = true;
+      const read = (): StreamSample => {
+        const scroller = document.querySelector<HTMLElement>(
+          `${surface} [class*='overflow-anchor']`,
+        );
+        return {
+          at: performance.now() - started,
+          streaming: count("Streamed reply intro.") > introsBefore,
+          fenceShown: fences() > fencesBefore,
+          finished: count(lastLine) > lastLinesBefore,
+          lastLineInView: (() => {
+            const line = [...document.querySelectorAll<HTMLElement>(`${surface} .chat-markdown p`)]
+              .findLast((element) => element.textContent === lastLine)
+              ?.getBoundingClientRect();
+            const area = scroller?.getBoundingClientRect();
+            return !!line && !!area && line.top >= area.top && line.bottom <= area.bottom;
+          })(),
+          endGap: scroller
+            ? Math.round(scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop)
+            : null,
+          diagramDrawn: drawn() > drawnBefore,
+        };
+      };
+      // A message posted from a frame callback is handled once that frame has painted.
+      const afterPaint = new MessageChannel();
+      afterPaint.port1.addEventListener("message", () => samples.push(read()));
+      afterPaint.port1.start();
+      const onFrame = () => {
+        if (!running || performance.now() - started > 60_000) return;
+        afterPaint.port2.postMessage(null);
+        requestAnimationFrame(onFrame);
+      };
+      requestAnimationFrame(onFrame);
+      record.__bibcodeStreamStop = () => {
+        running = false;
+      };
+    },
+    visibleSurfaceSelector,
+    mermaidFixtureStreamedLastLine,
+  );
+  await sendPrompt(prompt);
+  await browser.waitUntil(
+    () =>
+      browser.execute(
+        () =>
+          (
+            window as unknown as { __bibcodeStreamSamples?: StreamSample[] }
+          ).__bibcodeStreamSamples?.at(-1)?.finished === true,
+      ),
+    { timeoutMsg: `The streamed reply to "${prompt}" never finished.`, timeout: 60_000 },
+  );
+  await browser.pause(1_500);
+  return browser.execute(() => {
+    const record = window as unknown as {
+      __bibcodeStreamSamples?: StreamSample[];
+      __bibcodeStreamStop?: () => void;
+    };
+    record.__bibcodeStreamStop?.();
+    return record.__bibcodeStreamSamples ?? [];
+  });
+}
+
+/** The samples where something changed, for a trace artifact that holds no message text. */
+function streamChanges(samples: readonly StreamSample[]): StreamSample[] {
+  return samples.filter(
+    (entry, index, all) =>
+      index === 0 ||
+      entry.streaming !== all[index - 1]!.streaming ||
+      entry.fenceShown !== all[index - 1]!.fenceShown ||
+      entry.finished !== all[index - 1]!.finished ||
+      entry.endGap !== all[index - 1]!.endGap ||
+      entry.diagramDrawn !== all[index - 1]!.diagramDrawn,
+  );
+}
