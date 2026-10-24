@@ -978,7 +978,8 @@ two of them, the panel says so instead of showing no changes.
     **Next file**.
   - **All lines** shows the whole file. **Changes only** shows the changes with
     **Context lines** around them (3 by default, up to 99); collapsed regions
-    still expand.
+    still expand. If the changes with that count fail to load, Compare says so
+    with **Retry**.
   - **Previous change** and **Next change** step through the blocks of
     changes; **F7** and **Shift+F7** do the same while Compare has focus.
   - A file that Compare cannot show in full says why: added and deleted files
@@ -1564,10 +1565,6 @@ The Files surface is a full file manager for the active workspace:
 
 ## Current limitations
 
-- Compare reads the working tree's side relative to the project folder, while
-  Git names changed files from the repository root. For a project that is a
-  subdirectory of a repository, the working tree's files therefore show their
-  changed lines only.
 - In Compare, a line comment can start only on a line that is part of Git's
   default hunks, the same lines Changes shows.
 - **Open with** is not available for remote environments, and it opens the

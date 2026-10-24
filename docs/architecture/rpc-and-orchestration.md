@@ -731,13 +731,16 @@ changed file, named by the content it must have rather than by a revision:
 - **`worktree { path, expectedOid }`** reads the working-tree file once and
   hashes its bytes with `git hash-object --stdin --path=<path>`, which applies
   that path's clean filters and end-of-line rules as `git diff` did when it
-  printed the ID. A different ID returns `changed`. The path goes through the
-  workspace's `resolve_relative` and `canonical_existing_within`: an absolute
-  path, `..` or a symlink that leaves the root is refused, a symlink, directory
-  or submodule is `not-a-file`, and a path that no longer exists is `missing`.
-  Paths resolve against `cwd`, while a tracked patch names paths from the
-  repository root, so a project rooted in a repository subdirectory gets
-  `missing` here.
+  printed the ID. A different ID returns `changed`. The path is named from the
+  top of `cwd`'s repository (`git rev-parse --show-toplevel`), as the patch
+  names it, so a project rooted in a repository subdirectory reads its files
+  too. It goes through the workspace's `resolve_relative` and
+  `canonical_existing_within` against that top: an absolute path, `..` or a
+  symlink that leaves the repository is refused, a symlink, directory or
+  submodule is `not-a-file`, and a path that no longer exists is `missing`.
+  The read reaches no further than the blob reads, which already cover the
+  whole repository, and returns text only for bytes that hash to the ID the
+  client names.
 - **Results.** `text { contents, byteLength }` is lossy UTF-8, as the patch
   is. `unavailable { reason, byteLength }` says why there is none: `missing`,
   `binary` (a NUL byte), `too-large` (over the 4,375,000-byte patch cap, with
@@ -774,15 +777,23 @@ patch the panel already loaded:
   its object IDs and hunk ranges stay the same, so a refresh of the patch
   hydrates it again only when the file changed.
 - **`changed`.** A working file that moved past the patch revalidates the
-  patch once. Only a read of the new object ID that is `changed` again shows
-  "This file is changing." with **Refresh**, so a file an agent keeps writing
-  never loops.
+  patch and reads the file again, once. Only a read after that request that is
+  `changed` again, of a new object ID or of the same one when the refreshed
+  patch names the same content, shows "This file is changing." with
+  **Refresh**, so a file an agent keeps writing never loops and a file never
+  loads forever. Metadata is kept across refreshes only for a file with both
+  full object IDs: a file shown from its hunks alone, such as an untracked
+  one, takes each new patch as it is.
 - **Line filter.** **All lines** renders the hydrated default patch with
   `expandUnchanged`. **Changes only** requests the patch again with
   `contextLines`, renders that file hydrated with its gaps collapsed, and keeps
   the default patch's file for placing comments, whose positions index its
   hunks. The count commits 300 ms after typing stops. A result without
-  `contextLines` disables the field with its reason.
+  `contextLines` disables the field with its reason. A failed request shows
+  its error with **Retry**, an explicit refresh of that query, never the
+  default patch under the chosen count.
+- **Truncation.** A truncated patch, review or turn, shows the truncation
+  banner, and an empty truncated patch never reads as "No net changes".
 - **Navigation.** `diff.nextChange` and `diff.previousChange` (F7 and
   Shift+F7, `when: "diffFocus"`) are resolved by a `keydown` handler on the
   Compare root with `diffFocus` set, and scroll to each block of changes by
@@ -812,8 +823,10 @@ its temporary pre-image files and the user's `difftool.<tool>.cmd`.
   the button.
 - **`review.openDiffTool`** (`mutation_unary`, `orchestration:operate`, like
   `shell.openInEditor`, long-running) builds
-  `git -C <cwd> difftool -y --trust-exit-code [--dir-diff] --tool=<id> [-M]
-  <revs> -- [paths]`. `--trust-exit-code` makes Git return the tool's
+  `git -C <top> difftool -y --trust-exit-code [--dir-diff] --tool=<id> [-M]
+  <revs> -- [paths]`, where `<top>` is `cwd`'s repository top
+  (`rev-parse --show-toplevel`), because the patch names paths from there,
+  also for a project in a subdirectory. `--trust-exit-code` makes Git return the tool's
   failure. The revisions come from the scope: `HEAD` for the working tree;
   for a branch, the base (or the repository's default ref) resolved with
   `rev-parse --verify --quiet --end-of-options <base>^{commit}`, then
@@ -834,9 +847,13 @@ its temporary pre-image files and the user's `difftool.<tool>.cmd`.
   returns `opened`, and a non-zero exit returns `ReviewDiffToolError` with
   reason `launch-failed`, the last 2 KiB of stderr with the exit code, and the
   command for **Copy command**. At most 16 launches run at once
-  (`too-many-open`), and a launch after shutdown began is `shutting-down`. A
-  reaper then waits for the exit, reports it, logs a late failure with the tool
-  ID and exit code only, deletes the log and drops the registration.
+  (`too-many-open`), and a launch after shutdown began is `shutting-down`. The
+  child goes to its reaper as soon as it starts, and the launch only listens
+  for an exit within the window, so a request dropped during the window
+  (a client that disconnects) leaves the slot, the registration, the log and
+  the exit report with the reaper. The reaper waits for the exit, reports it,
+  logs a failure after the window with the tool ID and exit code only, deletes
+  the log and drops the registration.
 - **Surviving shutdown.** A diff app holds the user's edits: the working-tree
   side is the real file, and with `--dir-diff` Git copies an edited temporary
   file back only when the tool exits. So the launcher registers each
