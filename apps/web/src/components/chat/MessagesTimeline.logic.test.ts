@@ -408,7 +408,7 @@ describe("deriveMessagesTimelineRows", () => {
           },
         },
       ],
-      expandedTurnIds: new Set(["turn-1" as never]),
+      turnFoldChoices: new Map([["turn-1" as never, true]]),
       isWorking: false,
       activeTurnStartedAt: null,
       turnDiffSummaryByAssistantMessageId: new Map(),
@@ -623,7 +623,7 @@ describe("deriveMessagesTimelineRows", () => {
 
     const expandedRows = deriveMessagesTimelineRows({
       timelineEntries,
-      expandedTurnIds: new Set(["turn-1" as never]),
+      turnFoldChoices: new Map([["turn-1" as never, true]]),
       isWorking: false,
       activeTurnStartedAt: null,
       turnDiffSummaryByAssistantMessageId: new Map(),
@@ -988,7 +988,7 @@ describe("deriveMessagesTimelineRows", () => {
           },
         },
       ],
-      expandedTurnIds: new Set(["turn-1" as never]),
+      turnFoldChoices: new Map([["turn-1" as never, true]]),
       isWorking: false,
       activeTurnStartedAt: null,
       turnDiffSummaryByAssistantMessageId: new Map(),
@@ -1092,7 +1092,7 @@ describe("deriveMessagesTimelineRows", () => {
     const collapsedRows = deriveMessagesTimelineRows(baseInput);
     const expandedRows = deriveMessagesTimelineRows({
       ...baseInput,
-      expandedWorkGroupIds: new Set(["work-group:work-entry-1"]),
+      workGroupChoices: new Map([["work-group:work-entry-1", true]]),
     });
 
     expect(collapsedRows.map((row) => row.id)).toEqual(["work-3", "work-toggle:work-entry-1"]);
@@ -1354,21 +1354,37 @@ describe("verbose chat rows", () => {
       ...input,
     });
 
-  it("keeps a settled turn open with every work entry and no fold or toggle row", () => {
+  it("opens a settled turn and its work group, keeping their rows to fold them", () => {
     const rows = deriveVerboseRows({ verboseChat: true });
 
     expect(rows.map((row) => row.id)).toEqual([
       "user-entry",
+      "turn-fold:turn-1",
       "commentary-entry",
       "work-1",
       "work-2",
       "work-3",
+      "work-toggle:work-1-entry",
       "answer-entry",
     ]);
-    expect(rows.some((row) => row.kind === "turn-fold" || row.kind === "work-toggle")).toBe(false);
+    expect(rows.find((row) => row.kind === "turn-fold")).toMatchObject({ expanded: true });
+    expect(rows.find((row) => row.kind === "work-toggle")).toMatchObject({
+      expanded: true,
+      hiddenCount: 2,
+    });
     expect(rows.find((row) => row.id === "answer-entry")).toMatchObject({
       showAssistantMeta: true,
     });
+  });
+
+  it("folds a settled turn the user folded with the setting on", () => {
+    const rows = deriveVerboseRows({
+      verboseChat: true,
+      turnFoldChoices: new Map([["turn-1" as never, false]]),
+    });
+
+    expect(rows.map((row) => row.id)).toEqual(["user-entry", "turn-fold:turn-1", "answer-entry"]);
+    expect(rows.find((row) => row.kind === "turn-fold")).toMatchObject({ expanded: false });
   });
 
   it("folds the same settled turn while the setting is off", () => {
@@ -1380,17 +1396,32 @@ describe("verbose chat rows", () => {
     expect(deriveVerboseRows({ verboseChat: false })).toEqual(deriveVerboseRows());
   });
 
-  it("shows every entry of a settled work group without a toggle row", () => {
-    const rows = deriveVerboseRows({
+  it("opens a settled work group and folds it again on the user's choice", () => {
+    // Outside any turn, so no turn fold hides the group.
+    const timelineEntries = [
+      verboseWorkEntry("work-1", 2),
+      verboseWorkEntry("work-2", 3),
+      verboseWorkEntry("work-3", 4),
+    ].map((timelineEntry) => ({
+      ...timelineEntry,
+      entry: { ...timelineEntry.entry, turnId: null },
+    }));
+    const opened = deriveVerboseRows({ verboseChat: true, timelineEntries });
+    const folded = deriveVerboseRows({
       verboseChat: true,
-      timelineEntries: [
-        verboseWorkEntry("work-1", 2),
-        verboseWorkEntry("work-2", 3),
-        verboseWorkEntry("work-3", 4),
-      ],
+      timelineEntries,
+      workGroupChoices: new Map([["work-group:work-1-entry", false]]),
     });
 
-    expect(rows.map((row) => row.id)).toEqual(["work-1", "work-2", "work-3"]);
+    expect(opened.map((row) => row.id)).toEqual([
+      "work-1",
+      "work-2",
+      "work-3",
+      "work-toggle:work-1-entry",
+    ]);
+    expect(opened.at(-1)).toMatchObject({ kind: "work-toggle", expanded: true });
+    expect(folded.map((row) => row.id)).toEqual(["work-3", "work-toggle:work-1-entry"]);
+    expect(folded.at(-1)).toMatchObject({ kind: "work-toggle", expanded: false });
   });
 
   it("derives a running turn's rows the same with the setting on and off", () => {
@@ -2029,7 +2060,7 @@ describe("queued timeline rows", () => {
       ...base,
       isWorking: false,
       timelineEntries,
-      expandedTurnIds: new Set([turnId]),
+      turnFoldChoices: new Map([[turnId, true]]),
     });
     expect(expanded.map((row) => row.id)).toEqual([
       "user",

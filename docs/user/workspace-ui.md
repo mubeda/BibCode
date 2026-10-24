@@ -418,12 +418,14 @@ calls shows its newest call with a **+N previous tool calls** row, and a tool
 call opens to its command, output, and changed files when clicked. Hover or
 focus a tool call or a **Worked for** row to see its time.
 
-**Settings → General → Verbose chat** (off by default) keeps finished turns
-open: no **Worked for** fold, every tool call in a run, and each tool call open
-to its output. The turn still running looks the same either way until it
-finishes. Clicking a tool call collapses it, and that choice holds until you
-switch threads or reload. The setting applies to open threads at once and is
-stored on this device.
+**Settings → General → Verbose chat** (off by default) opens finished turns:
+each **Worked for** row starts open, each run of tool calls shows every call
+above a **Show fewer tool calls** row, and each tool call starts open to its
+output. One click on a **Worked for** row folds that turn again, and one click
+on **Show fewer tool calls** or a tool call collapses it. The turn still running
+looks the same either way until it finishes. A turn you fold stays folded when
+the next turn starts; each choice holds until you switch threads or reload. The
+setting applies to open threads at once and is stored on this device.
 
 With a mouse or trackpad, a thread with two or more of your messages shows a
 minimap at the timeline's left edge, one mark per message. Hover it to preview

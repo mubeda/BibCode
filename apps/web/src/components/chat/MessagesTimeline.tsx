@@ -161,8 +161,9 @@ interface TimelineRowSharedState {
   queuedMessageErrors: Readonly<Record<string, string>>;
   onImageExpand: (preview: ExpandedImagePreview) => void;
   onOpenTurnDiff: (turnId: TurnId, filePath?: string) => void;
-  onToggleTurnFold: (turnId: TurnId) => void;
-  onToggleWorkGroup: (groupId: string, anchorElement?: HTMLElement) => void;
+  /** `expanded` is what the row shows now; the toggle flips it. */
+  onToggleTurnFold: (turnId: TurnId, expanded: boolean) => void;
+  onToggleWorkGroup: (groupId: string, expanded: boolean, anchorElement?: HTMLElement) => void;
 }
 
 interface TimelineRowActivityState {
@@ -276,36 +277,25 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   onIsAtEndChange,
   onManualNavigation,
 }: MessagesTimelineProps) {
-  const [expandedTurnIds, setExpandedTurnIds] = useState<ReadonlySet<TurnId>>(new Set());
-  const [expandedWorkGroupIds, setExpandedWorkGroupIds] = useState<ReadonlySet<string>>(new Set());
+  const [turnFoldChoices, setTurnFoldChoices] = useState<ReadonlyMap<TurnId, boolean>>(
+    () => new Map(),
+  );
+  const [workGroupChoices, setWorkGroupChoices] = useState<ReadonlyMap<string, boolean>>(
+    () => new Map(),
+  );
   const [minimapStripMap] = useState(() => new Map<string, HTMLSpanElement>());
   const [workEntryExpandedChoices] = useState(() => new Map<string, boolean>());
 
-  const onToggleTurnFold = useCallback((turnId: TurnId) => {
-    setExpandedTurnIds((existing) => {
-      const next = new Set(existing);
-      if (next.has(turnId)) {
-        next.delete(turnId);
-      } else {
-        next.add(turnId);
-      }
-      return next;
-    });
+  // A toggle flips what the row shows, which Verbose chat opens by default.
+  const onToggleTurnFold = useCallback((turnId: TurnId, expanded: boolean) => {
+    setTurnFoldChoices((existing) => new Map(existing).set(turnId, !expanded));
   }, []);
   const onToggleWorkGroup = useCallback(
-    (groupId: string, anchorElement?: HTMLElement) => {
+    (groupId: string, expanded: boolean, anchorElement?: HTMLElement) => {
       const anchorBottomBeforeToggle = anchorElement?.getBoundingClientRect().bottom ?? null;
 
       flushSync(() => {
-        setExpandedWorkGroupIds((existing) => {
-          const next = new Set(existing);
-          if (next.has(groupId)) {
-            next.delete(groupId);
-          } else {
-            next.add(groupId);
-          }
-          return next;
-        });
+        setWorkGroupChoices((existing) => new Map(existing).set(groupId, !expanded));
       });
 
       if (anchorBottomBeforeToggle === null || !anchorElement) {
@@ -326,7 +316,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
     [listRef],
   );
 
-  useFoldPreviousTurnOnNewTurn(latestTurn, setExpandedTurnIds);
+  useFoldPreviousTurnOnNewTurn(latestTurn, setTurnFoldChoices);
 
   const rawRows = useMemo(
     () =>
@@ -336,8 +326,8 @@ export const MessagesTimeline = memo(function MessagesTimeline({
         queuedStatuses,
         latestTurn,
         runningTurnId,
-        expandedTurnIds,
-        expandedWorkGroupIds,
+        turnFoldChoices,
+        workGroupChoices,
         verboseChat,
         isWorking,
         activeTurnStartedAt,
@@ -350,8 +340,8 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       queuedStatuses,
       latestTurn,
       runningTurnId,
-      expandedTurnIds,
-      expandedWorkGroupIds,
+      turnFoldChoices,
+      workGroupChoices,
       verboseChat,
       isWorking,
       activeTurnStartedAt,
@@ -612,7 +602,9 @@ export const MessagesTimeline = memo(function MessagesTimeline({
 
 /**
  * An in-session interrupt leaves its turn expanded so the user keeps their place; the next
- * turn (or a reload, since this is local state) folds it.
+ * turn (or a reload, since this is local state) drops that and any other open choice on the
+ * previous turn, so it folds unless Verbose chat keeps it open. A turn the user folded stays
+ * folded.
  *
  * Kept out of `MessagesTimeline`'s own scope on purpose: every closure a component creates
  * shares one scope, so a memoized callback recreated on a different change than another
@@ -620,7 +612,9 @@ export const MessagesTimeline = memo(function MessagesTimeline({
  */
 function useFoldPreviousTurnOnNewTurn(
   latestTurn: TimelineLatestTurn | null,
-  setExpandedTurnIds: (update: (existing: ReadonlySet<TurnId>) => ReadonlySet<TurnId>) => void,
+  setTurnFoldChoices: (
+    update: (existing: ReadonlyMap<TurnId, boolean>) => ReadonlyMap<TurnId, boolean>,
+  ) => void,
 ) {
   const previousLatestTurnRef = useRef(latestTurn);
   useEffect(() => {
@@ -631,23 +625,19 @@ function useFoldPreviousTurnOnNewTurn(
     }
     if (latestTurn.turnId === previous.turnId) {
       if (previous.state === "running" && latestTurn.state === "interrupted") {
-        setExpandedTurnIds((existing) => {
-          const next = new Set(existing);
-          next.add(latestTurn.turnId);
-          return next;
-        });
+        setTurnFoldChoices((existing) => new Map(existing).set(latestTurn.turnId, true));
       }
       return;
     }
-    setExpandedTurnIds((existing) => {
-      if (!existing.has(previous.turnId)) {
+    setTurnFoldChoices((existing) => {
+      if (existing.get(previous.turnId) !== true) {
         return existing;
       }
-      const next = new Set(existing);
+      const next = new Map(existing);
       next.delete(previous.turnId);
       return next;
     });
-  }, [latestTurn, setExpandedTurnIds]);
+  }, [latestTurn, setTurnFoldChoices]);
 }
 
 /**
@@ -1310,7 +1300,7 @@ function TurnFoldTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "turn-
         type="button"
         aria-expanded={row.expanded}
         data-scroll-anchor-ignore
-        onClick={() => ctx.onToggleTurnFold(row.turnId)}
+        onClick={() => ctx.onToggleTurnFold(row.turnId, row.expanded)}
         className="flex cursor-pointer select-none items-center gap-1 rounded-md px-1 text-xs text-muted-foreground tabular-nums transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/70"
       >
         <span>{row.label}</span>
@@ -1575,7 +1565,7 @@ function WorkGroupToggleTimelineRow({
       onClick={(event) => {
         const anchorElement =
           event.currentTarget.closest<HTMLElement>("[data-timeline-row-id]") ?? event.currentTarget;
-        ctx.onToggleWorkGroup(row.groupId, anchorElement);
+        ctx.onToggleWorkGroup(row.groupId, row.expanded, anchorElement);
       }}
     >
       <span className="flex size-5 shrink-0 items-center justify-center text-muted-foreground">

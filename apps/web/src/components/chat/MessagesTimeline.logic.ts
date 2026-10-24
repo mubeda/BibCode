@@ -507,9 +507,14 @@ export function deriveMessagesTimelineRows(input: {
   queuedStatuses?: ReadonlyArray<QueuedCardStatus>;
   latestTurn?: TimelineLatestTurn | null;
   runningTurnId?: TurnId | null;
-  expandedTurnIds?: ReadonlySet<TurnId>;
-  expandedWorkGroupIds?: ReadonlySet<string>;
-  /** Settled turns keep every entry visible: no turn folds, no work-group toggles. */
+  /** Turns the user opened (true) or folded (false); the rest follow `verboseChat`. */
+  turnFoldChoices?: ReadonlyMap<TurnId, boolean>;
+  /** Long work groups the user opened or folded; the rest follow `verboseChat`. */
+  workGroupChoices?: ReadonlyMap<string, boolean>;
+  /**
+   * Settled turns and their long work groups start open, still behind their fold and toggle
+   * rows so one click folds them. The turn still running is the same either way.
+   */
   verboseChat?: boolean;
   isWorking: boolean;
   activeTurnStartedAt: string | null;
@@ -533,14 +538,13 @@ export function deriveMessagesTimelineRows(input: {
     latestTurn: input.latestTurn ?? null,
     unsettledTurnId,
   });
-  const { answerMessageIds } = turnFolds;
-  // Running turns never fold, so verbose chat drops only settled turns' folds.
-  const foldsByAnchorEntryId: ReadonlyMap<string, TurnFold> = input.verboseChat
-    ? new Map()
-    : turnFolds.foldsByAnchorEntryId;
+  const { answerMessageIds, foldsByAnchorEntryId } = turnFolds;
+  // Running turns never fold, so the setting opens only settled turns.
+  const isTurnExpanded = (turnId: TurnId) =>
+    input.turnFoldChoices?.get(turnId) ?? input.verboseChat === true;
   const collapsedEntryIds = new Set<string>();
   for (const fold of foldsByAnchorEntryId.values()) {
-    if (!input.expandedTurnIds?.has(fold.turnId)) {
+    if (!isTurnExpanded(fold.turnId)) {
       for (const entryId of fold.hiddenEntryIds) {
         collapsedEntryIds.add(entryId);
       }
@@ -561,7 +565,7 @@ export function deriveMessagesTimelineRows(input: {
         createdAt: turnFold.createdAt,
         turnId: turnFold.turnId,
         label: turnFold.label,
-        expanded: input.expandedTurnIds?.has(turnFold.turnId) ?? false,
+        expanded: isTurnExpanded(turnFold.turnId),
       });
     }
 
@@ -598,12 +602,12 @@ export function deriveMessagesTimelineRows(input: {
           });
         } else {
           const groupId = `work-group:${timelineEntry.id}`;
-          const showEveryEntry =
-            input.verboseChat === true &&
-            !visibleGroupedEntries.some((entry) =>
-              isWorkEntryInUnsettledTurn(entry, unsettledTurnId),
-            );
-          const expanded = showEveryEntry || (input.expandedWorkGroupIds?.has(groupId) ?? false);
+          const expanded =
+            input.workGroupChoices?.get(groupId) ??
+            (input.verboseChat === true &&
+              !visibleGroupedEntries.some((entry) =>
+                isWorkEntryInUnsettledTurn(entry, unsettledTurnId),
+              ));
           const hiddenEntries = visibleGroupedEntries.slice(0, -MAX_VISIBLE_WORK_LOG_ENTRIES);
           const visibleEntries = visibleGroupedEntries.slice(-MAX_VISIBLE_WORK_LOG_ENTRIES);
           const renderedEntries = expanded ? [...hiddenEntries, ...visibleEntries] : visibleEntries;
@@ -617,19 +621,15 @@ export function deriveMessagesTimelineRows(input: {
             });
           }
 
-          if (!showEveryEntry) {
-            nextRows.push({
-              kind: "work-toggle",
-              id: `work-toggle:${timelineEntry.id}`,
-              createdAt: timelineEntry.createdAt,
-              groupId,
-              hiddenCount: hiddenEntries.length,
-              expanded,
-              onlyToolEntries: visibleGroupedEntries.every((entry) =>
-                workLogEntryIsToolLike(entry),
-              ),
-            });
-          }
+          nextRows.push({
+            kind: "work-toggle",
+            id: `work-toggle:${timelineEntry.id}`,
+            createdAt: timelineEntry.createdAt,
+            groupId,
+            hiddenCount: hiddenEntries.length,
+            expanded,
+            onlyToolEntries: visibleGroupedEntries.every((entry) => workLogEntryIsToolLike(entry)),
+          });
         }
       }
       index = cursor - 1;
