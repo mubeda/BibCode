@@ -308,8 +308,8 @@
     }
   },
   "inventorySummary": {
-    "javascriptDirect": 84,
-    "javascriptLedger": 86,
+    "javascriptDirect": 87,
+    "javascriptLedger": 89,
     "rustRegistry": 138,
     "rustPath": 3,
     "rustGit": 1,
@@ -770,6 +770,18 @@
       "status": "current"
     },
     {
+      "key": "js:apps/web:@types/hast",
+      "name": "@types/hast",
+      "current": "^3.0.5",
+      "target": "^3.0.5",
+      "channel": "stable",
+      "source": "https://www.npmjs.com/package/@types/hast",
+      "cohort": "javascript-current",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "current",
+      "notes": "Declared for the Find in thread projection's syntax tree types; the lockfile already resolved this version through react-markdown."
+    },
+    {
       "key": "js:apps/web:@types/mdast",
       "name": "@types/mdast",
       "current": "^4.0.4",
@@ -1043,6 +1055,30 @@
       "status": "current"
     },
     {
+      "key": "js:apps/web:remark-parse",
+      "name": "remark-parse",
+      "current": "^11.0.0",
+      "target": "^11.0.0",
+      "channel": "stable",
+      "source": "https://www.npmjs.com/package/remark-parse",
+      "cohort": "javascript-current",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "current",
+      "notes": "Declared so Find in thread runs the chat Markdown pipeline as react-markdown does; the lockfile already resolved this version through react-markdown."
+    },
+    {
+      "key": "js:apps/web:remark-rehype",
+      "name": "remark-rehype",
+      "current": "^11.1.2",
+      "target": "^11.1.2",
+      "channel": "stable",
+      "source": "https://www.npmjs.com/package/remark-rehype",
+      "cohort": "javascript-current",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "current",
+      "notes": "Declared so Find in thread runs the chat Markdown pipeline as react-markdown does; the lockfile already resolved this version through react-markdown."
+    },
+    {
       "key": "js:apps/web:tailwind-merge",
       "name": "tailwind-merge",
       "current": "^3.4.0",
@@ -1074,7 +1110,7 @@
       "cohort": "javascript-current",
       "platforms": ["linux", "macos", "windows"],
       "status": "current",
-      "notes": "Declared for the incremental streaming Markdown parser plugin types; the lockfile already resolved this version through react-markdown."
+      "notes": "A runtime dependency since Find in thread runs the chat Markdown pipeline; also typed by the incremental streaming Markdown parser plugin. The lockfile already resolved this version through react-markdown."
     },
     {
       "key": "js:apps/web:zustand",
