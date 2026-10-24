@@ -2774,8 +2774,15 @@ The fixture Codex provider then answers its diagram prompts in the timeline: a
 **Show source** swap on a diagram inside the first visible row above the top
 edge, and on one in a row wholly above the viewport, moves a reading-anchor
 paragraph by at most 1 px; and after a reply with 101 diagrams, reopening the
-chat draws the evicted first diagram again through the queue without moving the
-reply's last line by more than 1 px. Rerun it alone with
+chat draws the evicted diagram (the reply's last, which the queue drew first)
+again through the queue, and the reopened chat settles at its end with the
+reply's last line in view and still. The scenario keeps a per-sample trace of the
+last line as `mermaid-timeline-evicted-remount.json`; when the redraw lands
+before the list's first scroll to the end, the end can converge in steps for a
+few frames after it first shows, which is an open item of the diagram merge
+gate. Its page scripts wait on timers rather than animation frames,
+which stop in an occluded macOS webview; such a webview also throttles timers,
+so drawing the 101 diagrams can take minutes there. Rerun it alone with
 `BIBCODE_E2E_SPEC=./specs/mermaid-diagrams.e2e.ts`, and retain its
 `mermaid-*.png` screenshots with the other UI artifacts. In browser mode, check
 the same fixture files served by a release `bibcode` server in Chromium and
