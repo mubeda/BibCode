@@ -428,11 +428,23 @@ calls shows its newest call with a **+N previous tool calls** row, and a tool
 call opens to its command, output, and changed files when clicked. Hover or
 focus a tool call or a **Worked for** row to see its time.
 
+The provider's reasoning (Claude's thinking, Codex's reasoning summaries) shows
+as one collapsed line among the tool calls, in the order it happened:
+**Thought - <what it is about>**, or **Thinking - …** while the provider is still
+thinking. Click the line, or focus it and press Enter or Space, to read the whole
+thought; while it streams, the open thought follows its newest text until you
+scroll up in it. A finished turn's thoughts fold under **Worked for** with its
+tool calls, and a hidden run that includes a thought reads **+N previous steps**.
+A thought is never shown as the turn's answer. Providers that send no thinking
+text (Claude models from Opus 4.7 on, when the Claude CLI cannot ask for
+summaries) show no thought rows.
+
 **Settings → General → Verbose chat** (off by default) opens finished turns:
 each **Worked for** row starts open, each run of tool calls shows every call
 above a **Show fewer tool calls** row, and each tool call starts open to its
-output. One click on a **Worked for** row folds that turn again, and one click
-on **Show fewer tool calls** or a tool call collapses it. The turn still running
+output. Thoughts open the same way tool calls do. One click on a **Worked for**
+row folds that turn again, and one click on **Show fewer tool calls** or a tool
+call collapses it. The turn still running
 looks the same either way until it finishes. A turn you fold stays folded when
 the next turn starts; each choice holds until you switch threads or reload. The
 setting applies to open threads at once and is stored on this device.
@@ -598,8 +610,12 @@ level title in the menu are red; lower levels remain neutral.
 
 While a provider turn is active, the timeline shows a reversed paint-and-fade
 dotted square followed by `Waiting for` and a whole-second elapsed timer, such
-as `Waiting for 3s`. The timer is anchored to the persisted user-message time
-after reload and never moves backward when the provider start time arrives.
+as `Waiting for 3s`. While the provider thinks, the same line adds its latest
+thought after the timer, as in `Waiting for 12s · Planning the migration`,
+truncated to one line; it is left out when the thought is already the newest row
+above, and once the answer has arrived. The timer is anchored to the persisted
+user-message time after reload and never moves backward when the provider start
+time arrives.
 The animation uses the current theme's muted foreground and becomes static when
 reduced motion is requested. A later `pending` delivery blocked behind an
 unresolved failed or uncertain delivery shows the

@@ -615,6 +615,45 @@ subprocess fixture, record that evidence as unavailable with its exact blocker
 and assign the missing run to a capable host. Never infer a packaged or native
 provider pass from static checks or unit tests.
 
+### Provider reasoning rows
+
+Claude thinking and Codex reasoning summaries are chat reasoning entries
+([Provider reasoning](../architecture/rpc-and-orchestration.md#provider-reasoning)).
+For a change to provider reasoning, its persistence, or the Thinking rows, run
+the server seams (the coalescer and settlement tests drive the real event pump
+on a paused clock), then the client and renderer seams:
+
+```sh
+cargo test -p bibcode-server --lib reasoning
+cargo test -p bibcode-server --test provider_claude --test provider_codex --test orchestration --test production_provider_runtime
+vp test run packages/contracts/src/orchestration.test.ts packages/client-runtime/src/state/reasoning.test.ts packages/client-runtime/src/state/threadReducer.test.ts packages/client-runtime/src/state/threadStreamParity.test.ts
+cd apps/web && vp test run --project unit src/components/chat/MessagesTimeline.logic.test.ts src/components/chat/MessagesTimeline.test.tsx src/components/chat/timelineScrollAnchoring.test.tsx
+```
+
+Component tests replace the virtualized list with a mock, so they cannot show
+scrolling. The packaged `chat-reasoning-rows.e2e.ts` runs on the real list: a
+Claude prompt containing `[[reasoning]]` makes the fixture stream a thinking
+block over about two seconds, a tool call and an answer long enough to overflow
+(`[[reasoning:slow]]` thinks for about ten seconds). The spec checks the
+anchored turn's end while it streams, the fold and its **+N previous steps** row,
+expanding the thought at the end and away from it, and the end while a thought
+streams into a thread reopened at its end. Check the fixture frames, then run the
+spec alone with `BIBCODE_E2E_SPEC=./specs/chat-reasoning-rows.e2e.ts`:
+
+```sh
+node scripts/run-local-vp.mjs test run apps/desktop/e2e/support/provider-shims.test.ts
+vp run test:ui:desktop:build
+vp run test:ui:desktop
+```
+
+A live check needs a real Claude CLI and model and a real Codex session. Record
+whether the Claude probe line reports `thinking_display`, that Thought rows sit
+in order around tool calls and fold with the turn, that the working row shows
+the latest thought, and that the number of `thread.reasoning-sent` events in
+SQLite stays near one per 250 ms of thinking rather than one per delta. Put a
+sentinel phrase in a prompt that the model will think about and confirm it is
+absent from `server.log`, the provider operational log and the profiler JSONL.
+
 ### Selecting other focused coverage
 
 For the Pull Requests web shell/detail/review, settings, and auth-host display,
