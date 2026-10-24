@@ -23,6 +23,43 @@ export const PLATFORM_LABELS: Readonly<Record<DevicePlatform, string>> = {
 /** Appended to an image that already runs outside BiBCode, which the picker lists disabled. */
 export const IN_USE_ELSEWHERE_SUFFIX = " — Running outside BiBCode";
 
+/** The most devices one server runs at once; it refuses a fifth. */
+export const MAX_RUNNING_DEVICES = 4;
+
+/**
+ * Appended to an image whose device runs: in this thread, in another thread (by its title, once
+ * known), or with no owner. The picker still lists it, so the user need not remember it.
+ */
+export function runningSuffix(
+  owner:
+    | { readonly kind: "here" }
+    | { readonly kind: "thread"; readonly title: string | null }
+    | { readonly kind: "none" },
+): string {
+  if (owner.kind === "here") return " — Running here";
+  if (owner.kind === "thread" && owner.title !== null) return ` — Running in ${owner.title}`;
+  return " — Running";
+}
+
+/** Under the toolbar while the pane shows a device another thread started. */
+export const startedInNote = (title: string | null) =>
+  title === null ? "Started in another thread." : `Started in ${title}.`;
+
+/** The confirmation before stopping a device another thread started. */
+export const stopConfirmTitle = (name: string) => `Stop ${name}?`;
+export const stopConfirmDescription = (title: string | null) =>
+  `It was started in ${title ?? "another thread"}.`;
+
+/** When no image is free to start: each one runs, in another thread or this one. */
+export const EVERY_DEVICE_RUNNING_MESSAGE = "Every device is running. Pick one to show it.";
+
+/** A device that stopped, shown until it starts again or drops out of the catalog. */
+export const stoppedTitle = (name: string) => `${name} stopped.`;
+/** What Start does for a stopped device: this thread's, or nobody's, starts again. */
+export const STOPPED_RESTART_HINT = "Press Start to start it again.";
+/** What Start does for a device another thread started and that stopped. */
+export const STOPPED_START_HINT = "Press Start to start it.";
+
 /**
  * The availability kinds whose images still open, as screenshots without input: the platform
  * is listed with its images, and its devices show why they are view only.
@@ -54,9 +91,11 @@ export const DEVICE_DISABLED_REASONS = {
   startFirst: "Start the device first",
   notBooted: "Available once the device has booted",
   stopping: "The device is stopping",
-  running: "Stop the running device to start another",
+  alreadyRunning: "The device is already running",
+  limit: "Four devices are running. Stop one to start another.",
   noAvd: "Create a virtual device in Android Studio's Device Manager first",
   noImage: "No device can start on this server",
+  pickFirst: "Pick a device first",
   starting: "The device is starting",
   cannotRotate: "Rotation isn't available for iOS simulators yet",
   rotating: "Rotating…",
@@ -133,11 +172,8 @@ export function deviceStateLabel(device: DeviceSnapshot): string {
 /** A device RPC failure, as the pane shows it. */
 export interface DeviceErrorView {
   readonly message: string;
-  /**
-   * For a device limit: the running device's display name, which the pane offers to stop. The
-   * pane finds that device by the platform it tried to start on, never by this name.
-   */
-  readonly runningName: string | null;
+  /** A start was refused at the device limit; the pane offers to stop each live device. */
+  readonly limit: boolean;
   /** Device previews were turned off meanwhile; the pane offers Settings. */
   readonly disabled: boolean;
 }
@@ -152,31 +188,27 @@ function taggedField(error: unknown, field: string): string | null {
 
 /**
  * Maps a device RPC failure to actionable copy. The server's messages already say what to do
- * (set `ANDROID_HOME`, create an AVD, stop the running device, try again), so they are kept;
- * the pane adds the action button.
+ * (set `ANDROID_HOME`, create an AVD, stop a running device, try again), so they are kept;
+ * the pane adds the action buttons.
  */
 export function describeDeviceError(error: unknown, fallback: string): DeviceErrorView {
   const tag = taggedField(error, "_tag");
   const message = taggedField(error, "message");
   const plain = (text: string): DeviceErrorView => ({
     message: text,
-    runningName: null,
+    limit: false,
     disabled: false,
   });
   switch (tag) {
     case "DevicePreviewsDisabledError":
-      return { message: DEVICE_PREVIEWS_OFF_MESSAGE, runningName: null, disabled: true };
-    case "DeviceLimitError": {
-      const running = taggedField(error, "running");
+      return { message: DEVICE_PREVIEWS_OFF_MESSAGE, limit: false, disabled: true };
+    case "DeviceLimitError":
+      // The server says which limit: four devices, or one per platform on an older server.
       return {
-        message:
-          running === null
-            ? "Another device is already running. Stop it before starting another."
-            : `${running} is already running. Stop it before starting another device.`,
-        runningName: running,
+        message: message ?? "Too many devices are running. Stop one to start another.",
+        limit: true,
         disabled: false,
       };
-    }
     case "DeviceBusyError":
       return plain(
         message ??
