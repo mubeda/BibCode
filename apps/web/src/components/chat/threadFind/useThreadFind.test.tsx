@@ -160,12 +160,16 @@ interface FakeHighlight {
 }
 const registry = new Map<string, FakeHighlight>();
 
-beforeAll(() => {
+// Importing the timeline is slow while the whole suite runs, as in MessagesTimeline.test.tsx.
+const SLOW_TIMELINE_TIMEOUT_MS = 60_000;
+
+beforeAll(async () => {
   Object.defineProperty(HTMLElement.prototype, "getAnimations", {
     configurable: true,
     value: () => [],
   });
-});
+  await import("../MessagesTimeline");
+}, SLOW_TIMELINE_TIMEOUT_MS);
 
 beforeEach(() => {
   registry.clear();
@@ -324,7 +328,7 @@ async function mountTimeline(overrides: Partial<MessagesTimelineProps>): Promise
   };
 }
 
-async function settle(predicate: () => boolean, timeoutMs = 4000): Promise<void> {
+async function settle(predicate: () => boolean, timeoutMs = 10_000): Promise<void> {
   const started = Date.now();
   while (!predicate()) {
     if (Date.now() - started > timeoutMs) throw new Error("timed out waiting for find");
@@ -379,31 +383,35 @@ const foldButton = (container: HTMLElement) =>
   container.querySelector<HTMLButtonElement>('[data-timeline-row-kind="turn-fold"] button');
 
 describe("useThreadFind", () => {
-  it("opens a folded turn, scrolls its row into view and paints the match in a 500-row thread", async () => {
-    const { container } = await mountTimeline({
-      timelineEntries: longThread([
-        message("user-x", "user", "do the thing", 600),
-        message("commentary", "assistant", "Looking for the needle first.", 601, TURN),
-        message("final", "assistant", "Done.", 602, TURN),
-      ]),
-    });
-    expect(foldButton(container)?.getAttribute("aria-expanded")).toBe("false");
+  it(
+    "opens a folded turn, scrolls its row into view and paints the match in a 500-row thread",
+    async () => {
+      const { container } = await mountTimeline({
+        timelineEntries: longThread([
+          message("user-x", "user", "do the thing", 600),
+          message("commentary", "assistant", "Looking for the needle first.", 601, TURN),
+          message("final", "assistant", "Done.", 602, TURN),
+        ]),
+      });
+      expect(foldButton(container)?.getAttribute("aria-expanded")).toBe("false");
 
-    await type(await openFind(), "needle");
-    await settle(() => activeRange() !== null);
+      await type(await openFind(), "needle");
+      await settle(() => activeRange() !== null);
 
-    expect(foldButton(container)?.getAttribute("aria-expanded")).toBe("true");
-    const list = h.lists[0]!;
-    const commentaryIndex = list.data.findIndex((row) => row.id === "commentary");
-    expect(list.scrollToIndex).toHaveBeenCalledWith({
-      index: commentaryIndex,
-      animated: false,
-      viewPosition: 0.3,
-    });
-    expect(rowOf(activeRange()?.startContainer)).toBe("commentary");
-    expect(activeRange()?.toString()).toBe("needle");
-    expect(statusText()).toContain("1/1");
-  });
+      expect(foldButton(container)?.getAttribute("aria-expanded")).toBe("true");
+      const list = h.lists[0]!;
+      const commentaryIndex = list.data.findIndex((row) => row.id === "commentary");
+      expect(list.scrollToIndex).toHaveBeenCalledWith({
+        index: commentaryIndex,
+        animated: false,
+        viewPosition: 0.3,
+      });
+      expect(rowOf(activeRange()?.startContainer)).toBe("commentary");
+      expect(activeRange()?.toString()).toBe("needle");
+      expect(statusText()).toContain("1/1");
+    },
+    SLOW_TIMELINE_TIMEOUT_MS,
+  );
 
   it("reaches a command behind a fold and a collapsed group, and ignores tool output", async () => {
     const { container } = await mountTimeline({
