@@ -660,10 +660,11 @@ fn stoppable(device: &DeviceSnapshot) -> bool {
     )
 }
 
-/// A device owner as `device.open` names it, trimmed, so every published owner decodes as a
-/// `ThreadId`; blank is refused.
+/// A device owner as `device.open` names it, trimmed as the client's `ThreadId` decode trims
+/// (ECMAScript whitespace, not `str::trim`'s), so every published owner decodes unchanged;
+/// blank is refused.
 fn normalize_owner(owner: Option<&str>) -> Result<Option<String>, DeviceOpError> {
-    match owner.map(str::trim) {
+    match owner.map(crate::ecmascript::trim) {
         None => Ok(None),
         Some("") => Err(DeviceOpError::InvalidInput(
             "threadId must name a thread.".to_owned(),
@@ -1958,6 +1959,14 @@ mod platform_tests {
                 "message": "threadId must name a thread.",
             })
         );
+        // The client's `ThreadId` trims as ECMAScript does, which takes U+FEFF and leaves
+        // U+0085, unlike `str::trim`: a BOM-only owner would publish an id the client
+        // cannot decode, failing the whole catalog.
+        let bom = manager
+            .open(Platform::Android, "Tablet", Some("\u{feff}"))
+            .await
+            .unwrap_err();
+        assert_eq!(bom.to_rpc_error()["_tag"], "DeviceInputError");
         let unowned = manager
             .open(Platform::Android, "Tablet", None)
             .await
@@ -1975,6 +1984,66 @@ mod platform_tests {
         wait_state(&manager, &unowned, DeviceState::Ready).await;
         assert_eq!(android.launches(), 2);
         manager.shutdown().await;
+    }
+
+    /// The catalog the server publishes with owned, unowned, and ended devices, which the
+    /// TypeScript contract decodes and encodes back unchanged (`device.test.ts`).
+    /// Regenerate with `BIBCODE_UPDATE_DEVICE_FIXTURE=1`.
+    #[tokio::test]
+    async fn the_owned_catalog_fixture_matches_the_wire() {
+        let android = FakeBackend::new(Platform::Android, &["Pixel", "Tablet", "Fold"]);
+        let (manager, _enabled) = fake_manager(vec![android]);
+        manager.issue_descending_ids();
+        let owned = manager
+            .open(Platform::Android, "Pixel", Some(" t1 "))
+            .await
+            .unwrap();
+        let unowned = manager
+            .open(Platform::Android, "Tablet", None)
+            .await
+            .unwrap();
+        let ended = manager
+            .open(Platform::Android, "Fold", Some("t2"))
+            .await
+            .unwrap();
+        wait_state(&manager, &owned, DeviceState::Ready).await;
+        wait_state(&manager, &unowned, DeviceState::Ready).await;
+        wait_state(&manager, &ended, DeviceState::Ready).await;
+        manager.close(&ended).await.unwrap();
+        wait_state(&manager, &ended, DeviceState::Stopped).await;
+        let catalog = serde_json::to_value(&*manager.catalog().borrow()).unwrap();
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../packages/contracts/fixtures/device/catalog.json");
+        if std::env::var_os("BIBCODE_UPDATE_DEVICE_FIXTURE").is_some() {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(
+                &path,
+                serde_json::to_string_pretty(&catalog).unwrap() + "\n",
+            )
+            .unwrap();
+        }
+        let committed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("committed fixture"))
+                .expect("fixture JSON");
+        assert_eq!(catalog, committed, "regenerate the device catalog fixture");
+        manager.shutdown().await;
+    }
+
+    /// An owner is published as the client's `ThreadId` decode would leave it, so it
+    /// round-trips unchanged: ECMAScript whitespace, U+FEFF included, is trimmed, and
+    /// U+0085, which ECMAScript keeps, stays.
+    #[test]
+    fn an_owner_is_trimmed_as_the_clients_thread_id_is() {
+        assert_eq!(
+            super::normalize_owner(Some("\u{feff}\u{3000} t1\t\u{feff}")).unwrap(),
+            Some("t1".to_owned())
+        );
+        assert_eq!(
+            super::normalize_owner(Some("t1\u{85}")).unwrap(),
+            Some("t1\u{85}".to_owned())
+        );
+        assert!(super::normalize_owner(Some("\u{feff} \u{2028}")).is_err());
+        assert_eq!(super::normalize_owner(None).unwrap(), None);
     }
 
     #[tokio::test]

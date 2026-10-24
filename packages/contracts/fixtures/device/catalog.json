@@ -1,0 +1,59 @@
+{
+  "devices": [
+    {
+      "canRotate": true,
+      "deviceId": "device-09999",
+      "height": 2532,
+      "imageId": "Pixel",
+      "orientation": "portrait",
+      "platform": "android",
+      "state": "ready",
+      "threadId": "t1",
+      "width": 1170
+    },
+    {
+      "canRotate": true,
+      "deviceId": "device-09998",
+      "height": 2532,
+      "imageId": "Tablet",
+      "orientation": "portrait",
+      "platform": "android",
+      "state": "ready",
+      "width": 1170
+    },
+    {
+      "canRotate": true,
+      "deviceId": "device-09997",
+      "height": 2532,
+      "imageId": "Fold",
+      "orientation": "portrait",
+      "platform": "android",
+      "state": "stopped",
+      "threadId": "t2",
+      "width": 1170
+    }
+  ],
+  "platforms": [
+    {
+      "availability": {
+        "kind": "ready",
+        "message": ""
+      },
+      "images": [
+        {
+          "displayName": "iPhone Pixel",
+          "id": "Pixel"
+        },
+        {
+          "displayName": "iPhone Tablet",
+          "id": "Tablet"
+        },
+        {
+          "displayName": "iPhone Fold",
+          "id": "Fold"
+        }
+      ],
+      "platform": "android"
+    }
+  ]
+}

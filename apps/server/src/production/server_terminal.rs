@@ -12,6 +12,7 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
+use crate::ecmascript::trim as trim_ecmascript;
 use crate::{
     cloud::{RelayClientInstallEvent, RelayClientService, RelayClientStatus},
     diagnostics::{
@@ -1419,32 +1420,6 @@ const TERMINAL_LAUNCH_ARGUMENT_MAX_COUNT: usize = 64;
 const TERMINAL_LAUNCH_LABEL_MAX_LENGTH: usize = 128;
 const TERMINAL_SIZE_CLAIM_MAX_LENGTH: usize = 128;
 const PROVIDER_TERMINAL_ACTIVITY_SLUG_MAX_LENGTH: usize = 64;
-
-fn is_ecmascript_trim_character(character: char) -> bool {
-    matches!(
-        character,
-        '\u{0009}'
-            | '\u{000a}'
-            | '\u{000b}'
-            | '\u{000c}'
-            | '\u{000d}'
-            | '\u{0020}'
-            | '\u{00a0}'
-            | '\u{1680}'
-            | '\u{2000}'
-            ..='\u{200a}'
-                | '\u{2028}'
-                | '\u{2029}'
-                | '\u{202f}'
-                | '\u{205f}'
-                | '\u{3000}'
-                | '\u{feff}'
-    )
-}
-
-fn trim_ecmascript(value: &str) -> &str {
-    value.trim_matches(is_ecmascript_trim_character)
-}
 
 fn is_provider_terminal_activity_slug(value: &str) -> bool {
     let mut characters = value.chars();
