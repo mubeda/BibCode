@@ -219,10 +219,11 @@ function lineEditCost(original: string, replacement: string): number {
   return original.length + replacement.length - 2 * (prefix + suffix);
 }
 
-function sum(values: readonly string[], from: number, to: number): number {
-  let total = 0;
-  for (let index = from; index < to; index += 1) total += values[index]!.length;
-  return total;
+/** `starts[i]` is the total length of `lines[0, i)`, so any run's length costs one subtraction. */
+function lengthPrefixes(lines: readonly string[]): number[] {
+  const starts = [0];
+  for (const line of lines) starts.push(starts[starts.length - 1]! + line.length);
+  return starts;
 }
 
 /**
@@ -246,14 +247,16 @@ function hunkEdits(
     lineEditCost(oldLines[oldCount - 1 - index]!, newLines[newCount - 1 - index]!),
   );
   const extra = Math.abs(oldCount - newCount);
-  const extraLines = oldCount > newCount ? oldLines : newLines;
+  // The block fallback for a hunk too costly to diff can be most of the file: keep this linear.
+  const extraStarts = lengthPrefixes(oldCount > newCount ? oldLines : newLines);
+  const extraLength = (split: number) => extraStarts[split + extra]! - extraStarts[split]!;
   let frontCost = 0;
   let backCost = back.reduce((total, cost) => total + cost, 0);
-  let best = { split: 0, cost: backCost + sum(extraLines, 0, extra) };
+  let best = { split: 0, cost: backCost + extraLength(0) };
   for (let split = 1; split <= paired; split += 1) {
     frontCost += front[split - 1]!;
     backCost -= back[paired - split]!;
-    const cost = frontCost + backCost + sum(extraLines, split, split + extra);
+    const cost = frontCost + backCost + extraLength(split);
     if (cost < best.cost) best = { split, cost };
   }
 
@@ -266,7 +269,7 @@ function hunkEdits(
   };
   for (let index = 0; index < best.split; index += 1) pair(index, index);
   if (oldCount > newCount) {
-    const removed = sum(oldLines, best.split, best.split + extra);
+    const removed = extraLength(best.split);
     if (removed > 0) edits.push({ start: offset, end: offset + removed, text: "" });
     offset += removed;
   } else if (extra > 0) {
