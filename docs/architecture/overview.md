@@ -1998,7 +1998,8 @@ actionable message. The catalog lists one entry per platform, each with its
 own `availability` and `images` (`{ id, displayName, inUseElsewhere? }`), and
 every device as
 `{ deviceId, platform, imageId, state, orientation, canRotate }`. A discovery
-result serves for 30 s; the MCP `device_list` tool always reruns it. Display
+result serves for 30 s; `device.refreshCatalog` (the panel's **Refresh
+devices**) and the MCP `device_list` tool always rerun it. Display
 names are unique within a platform: where two images would share one, as two
 simulators of the same name and OS or AVDs whose names differ only by `_`, each
 gets `·` and a tag, the AVD's name or the last four characters of the
@@ -2433,9 +2434,9 @@ so a dropped `device.close` or `device_close` request still stops the device,
 and closing a device that just failed waits for its process to be reaped. The
 manager emits
 `device.lifecycle` while the profiler is on (see [Profiler](#profiler)), and
-`device.open`, `device.close`, `device.input`, and `device.rotate` are in
-`is_long_running` because they wait on discovery, the emulator, or the
-simulator.
+`device.open`, `device.refreshCatalog`, `device.close`, `device.input`, and
+`device.rotate` are in `is_long_running` because they wait on discovery, the
+emulator, or the simulator.
 
 **Native verification items.** Each of these behaviors lives in one function
 and was checked on a real Pixel_8 AVD (API 35, macOS host): the discovery file

@@ -1244,7 +1244,10 @@ says why (for example Android SDK not found, no virtual devices, Xcode not
 found, or no simulators) and what to do; the other platform still works. A
 simulator already running outside BiBCode, for example in Xcode's Simulator
 app, is listed as "— Running outside BiBCode" and cannot be picked: shut it
-down there first.
+down there first. The list is read when the panel opens and kept for 30
+seconds; after creating a device in Android Studio or Xcode, choose **Refresh
+devices** (the circular-arrows button beside the list, or the button under the
+message when no device can start yet) to see it without restarting BiBCode.
 
 **Use it.** Pick a device and choose **Start**. The state pill moves through
 **Starting…** and **Booting…** to **Ready**; a first boot can take a few

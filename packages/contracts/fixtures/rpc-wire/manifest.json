@@ -62,6 +62,10 @@
       "mode": "unary"
     },
     {
+      "name": "device.refreshCatalog",
+      "mode": "unary"
+    },
+    {
       "name": "device.rotate",
       "mode": "unary"
     },
@@ -748,6 +752,8 @@
     "typed-failures/device__input-01.json",
     "typed-failures/device__open-00.json",
     "typed-failures/device__open-01.json",
+    "typed-failures/device__refreshCatalog-00.json",
+    "typed-failures/device__refreshCatalog-01.json",
     "typed-failures/device__rotate-00.json",
     "typed-failures/device__rotate-01.json",
     "typed-failures/filesystem__browse-00.json",
@@ -1087,6 +1093,8 @@
     "typed-failures/device__input-01.json": "f21e4233466694c02754d2a3c0317c089f31f6634947c5fcc16d02c4997c35cf",
     "typed-failures/device__open-00.json": "cb72d09f21daecbf9fe73f32bd9873a53972d49260aff65533807d27a6f53f02",
     "typed-failures/device__open-01.json": "f21e4233466694c02754d2a3c0317c089f31f6634947c5fcc16d02c4997c35cf",
+    "typed-failures/device__refreshCatalog-00.json": "cb72d09f21daecbf9fe73f32bd9873a53972d49260aff65533807d27a6f53f02",
+    "typed-failures/device__refreshCatalog-01.json": "f21e4233466694c02754d2a3c0317c089f31f6634947c5fcc16d02c4997c35cf",
     "typed-failures/device__rotate-00.json": "cb72d09f21daecbf9fe73f32bd9873a53972d49260aff65533807d27a6f53f02",
     "typed-failures/device__rotate-01.json": "f21e4233466694c02754d2a3c0317c089f31f6634947c5fcc16d02c4997c35cf",
     "stream-shapes/device__subscribeCatalog-00.json": "676f097ee8099e909e6e9f44f6133c48486327731f6660a693b1857f435730d2",
@@ -1617,6 +1625,8 @@
     "typed-failures/device__input-01.json",
     "typed-failures/device__open-00.json",
     "typed-failures/device__open-01.json",
+    "typed-failures/device__refreshCatalog-00.json",
+    "typed-failures/device__refreshCatalog-01.json",
     "typed-failures/device__rotate-00.json",
     "typed-failures/device__rotate-01.json",
     "typed-failures/filesystem__browse-00.json",

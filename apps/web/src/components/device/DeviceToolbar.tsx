@@ -10,6 +10,7 @@ import {
   ClipboardPasteIcon,
   PlayIcon,
   PowerIcon,
+  RefreshCwIcon,
   RotateCcwIcon,
   RotateCwIcon,
   SquareIcon,
@@ -149,7 +150,9 @@ export function DeviceToolbar({
   pickerLocked,
   viewOnly,
   rotating,
+  refreshing,
   onSelectImage,
+  onRefresh,
   onStart,
   onStop,
   onRotate,
@@ -171,7 +174,11 @@ export function DeviceToolbar({
   readonly viewOnly: boolean;
   /** A rotate of the shown device is in flight: another press would start from a stale turn. */
   readonly rotating: boolean;
+  /** The device list is being read again. */
+  readonly refreshing: boolean;
   readonly onSelectImage: (platform: DevicePlatform, imageId: string) => void;
+  /** Reads the device list again, for a device created since it was read. */
+  readonly onRefresh: () => void;
   readonly onStart: () => void;
   readonly onStop: () => void;
   readonly onRotate: (direction: RotateDirection) => void;
@@ -236,6 +243,17 @@ export function DeviceToolbar({
           ))}
         </SelectPopup>
       </Select>
+      {/* Stays focusable while it looks; the pane ignores presses meanwhile. */}
+      <Button
+        size="icon-xs"
+        variant="ghost"
+        aria-label="Refresh devices"
+        title="Look for new devices"
+        aria-busy={refreshing || undefined}
+        onClick={onRefresh}
+      >
+        <RefreshCwIcon className={cn(refreshing && "animate-spin")} />
+      </Button>
       <ToolbarButton
         label="Start"
         disabledReason={startDisabledReason}
