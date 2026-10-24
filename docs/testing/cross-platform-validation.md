@@ -2688,7 +2688,12 @@ sizes. Cover relevant:
   and their providers, and names a disconnected environment and a manual-update
   provider as skipped. Cancel runs nothing. Confirm, leave Settings while an
   update runs, and return: each environment shows its own result until
-  **Clear**, and no server restarts;
+  **Clear**, and neither this app nor its primary server restarts. With only a
+  disconnected environment outdated, the skip reason shows without opening the
+  dialog. With a remote desktop host that reports a server update, the same
+  confirmation lists its server version and running work; after confirming, the
+  host restarts only once its providers show **Updated**, its Remote Servers
+  row shows the same progress, and a manual host is listed as skipped;
 - with **Settings → General → Theme** on **System**, switch the operating system
   between light and dark while the app shows the home screen and again while it
   shows a thread: the window follows each switch without a reload; with

@@ -1,5 +1,6 @@
 import type { ConnectionCatalogEntry } from "@bibcode/client-runtime/connection";
 import type { ServerConfig } from "@bibcode/contracts";
+import { useAtomValue } from "@effect/atom-react";
 import { useMemo } from "react";
 
 import {
@@ -8,6 +9,8 @@ import {
   usePrimaryEnvironmentId,
 } from "~/state/environments";
 import { isDesktopLocalConnectionTarget } from "~/connection/desktopLocal";
+import { selectRemoteUpdateControlCapability } from "~/connection/environmentCompat";
+import { serverUpdateSnapshots } from "~/state/providerUpdateAll";
 import type { ProviderUpdateEnvironmentInput } from "./ProviderUpdateAll.logic";
 import {
   buildLocalEnvironmentUpdateGroups,
@@ -110,29 +113,58 @@ export function useLocalEnvironmentUpdateGroups(): {
 /**
  * Every environment, primary first, with its connection and last provider
  * snapshot: the input of the "Update all" plan, which includes SSH, relay, and
- * direct environments as well as the local ones.
+ * direct environments as well as the local ones. A connected remote environment
+ * that advertises `remoteUpdateControl` also carries its `updater.status`
+ * snapshot, so the plan can follow its providers with a server install. Local
+ * environments never carry one, so the plan never restarts this app.
  */
 export function useProviderUpdateEnvironments(): ReadonlyArray<ProviderUpdateEnvironmentInput> {
   const { environments } = useEnvironments();
   const primaryEnvironmentId = usePrimaryEnvironmentId();
+  const serverUpdateKey = useMemo(
+    () =>
+      JSON.stringify(
+        environments
+          .filter(
+            (environment) =>
+              !isLocalConnectionTarget(environment.entry.target) &&
+              environment.connection.phase === "connected" &&
+              selectRemoteUpdateControlCapability(environment.serverConfig),
+          )
+          .map((environment) => environment.environmentId),
+      ),
+    [environments],
+  );
+  const snapshots = useAtomValue(serverUpdateSnapshots(serverUpdateKey));
 
   return useMemo(
     () =>
       environments
         .map((environment) => {
           const isPrimary = environment.environmentId === primaryEnvironmentId;
+          const input: ProviderUpdateEnvironmentInput = {
+            environmentId: environment.environmentId,
+            label: environmentUpdateLabel(environment, isPrimary),
+            connected: environment.connection.phase === "connected",
+            providers: environment.serverConfig?.providers ?? [],
+          };
           return {
             isPrimary,
-            input: {
-              environmentId: environment.environmentId,
-              label: environmentUpdateLabel(environment, isPrimary),
-              connected: environment.connection.phase === "connected",
-              providers: environment.serverConfig?.providers ?? [],
-            },
+            input: snapshots.has(environment.environmentId)
+              ? {
+                  ...input,
+                  serverUpdate: {
+                    progress:
+                      environment.serverConfig?.environment.capabilities.remoteUpdateProgress ===
+                      true,
+                    snapshot: snapshots.get(environment.environmentId) ?? null,
+                  },
+                }
+              : input,
           };
         })
         .toSorted((left, right) => Number(right.isPrimary) - Number(left.isPrimary))
         .map(({ input }) => input),
-    [environments, primaryEnvironmentId],
+    [environments, primaryEnvironmentId, snapshots],
   );
 }
