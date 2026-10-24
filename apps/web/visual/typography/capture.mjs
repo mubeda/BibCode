@@ -8,10 +8,15 @@ import * as NodePath from "node:path";
 import * as NodeURL from "node:url";
 import { normalizeWebDriverRequest } from "../../../desktop/e2e/support/webdriver-request.ts";
 
+/** Paths the hostile diagram fixture names. A request for one means a diagram loaded a URL. */
+const MERMAID_PROBE_PREFIX = "/mermaid-probe/";
+
 export async function serveGallery(directory) {
+  const probeRequests = [];
   const server = NodeHttp.createServer(async (request, response) => {
     try {
       const path = new URL(request.url, "http://localhost").pathname;
+      if (path.startsWith(MERMAID_PROBE_PREFIX)) probeRequests.push(path);
       const candidate = NodePath.resolve(
         directory,
         `.${decodeURIComponent(path === "/" ? "/index.html" : path)}`,
@@ -43,6 +48,7 @@ export async function serveGallery(directory) {
   if (!address || typeof address === "string") throw new Error("Gallery listener refused.");
   return {
     url: `http://127.0.0.1:${address.port}`,
+    probeRequests,
     close: () =>
       new Promise((resolve, reject) =>
         server.close((error) => (error ? reject(error) : resolve())),
@@ -374,6 +380,9 @@ export async function captureFixtures({
         }
       }
     }
+    // Sanitized diagram SVG must load nothing, and same-origin loads raise no CSP event.
+    if (gallery.probeRequests?.length > 0)
+      failures.push({ status: "mermaid-probe-request", paths: [...gallery.probeRequests] });
     await NodeFSP.writeFile(
       NodePath.join(output, "manifest.json"),
       JSON.stringify(

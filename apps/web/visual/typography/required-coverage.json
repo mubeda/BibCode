@@ -112,6 +112,18 @@
     "owners": ["GitManagerSyncButton"]
   },
   {
+    "module": "components/markdown/MarkdownCodeBlock.tsx",
+    "owners": ["MarkdownCodeBlock"]
+  },
+  {
+    "module": "components/markdown/MarkdownMermaidBlock.tsx",
+    "owners": ["MarkdownMermaidBlock"]
+  },
+  {
+    "module": "components/markdown/mermaidSanitizer.ts",
+    "owners": ["sanitizeDiagramSvg"]
+  },
+  {
     "module": "components/preview/PreviewView.tsx",
     "owners": ["PreviewView"]
   },
