@@ -221,6 +221,8 @@ class ThreadFindSession {
   #latestOptions: UseThreadFindOptions | null = null;
   #input: HTMLInputElement | null = null;
   #dataIdentity: ReadonlyArray<unknown> = [];
+  /** The data changed while a first scan, with nothing counted yet, was in flight. */
+  #dataChangedDuringScan = false;
 
   constructor(callbacks: SessionCallbacks) {
     this.#callbacks = callbacks;
@@ -322,6 +324,7 @@ class ThreadFindSession {
     this.#typingTimer = null;
     if (this.#recountTimer !== null) clearTimeout(this.#recountTimer);
     this.#recountTimer = null;
+    this.#dataChangedDuringScan = false;
     this.#observer?.disconnect();
     this.#observer = null;
     if (this.#paintFrame !== null) cancelAnimationFrame(this.#paintFrame);
@@ -386,8 +389,17 @@ class ThreadFindSession {
       identity.length !== this.#dataIdentity.length ||
       identity.some((value, index) => value !== this.#dataIdentity[index]);
     this.#dataIdentity = identity;
-    if (!changed) return;
-    if (!this.#open || this.#scannedQuery === null || this.#recountTimer !== null) return;
+    if (!changed || !this.#open) return;
+    if (this.#scannedQuery === null) {
+      // The first scan is still projecting the copy it started with: recount once it ends.
+      if (this.#scanSignal !== null) this.#dataChangedDuringScan = true;
+      return;
+    }
+    this.#scheduleRecount();
+  }
+
+  #scheduleRecount(): void {
+    if (this.#recountTimer !== null) return;
     this.#recountTimer = setTimeout(() => {
       this.#recountTimer = null;
       this.#runSearch("recount");
@@ -456,6 +468,8 @@ class ThreadFindSession {
           : 0;
     const signal = { aborted: false };
     this.#scanSignal = signal;
+    // This scan reads the data as it is now; only later changes call for a recount.
+    this.#dataChangedDuringScan = false;
     if (this.#scannedQuery !== folded) {
       this.#setStatus({ kind: "searching" });
     }
@@ -486,6 +500,10 @@ class ThreadFindSession {
         this.#counts = outcome.counts;
         this.#scannedQuery = folded;
         this.#rowRanges.clear();
+        if (this.#dataChangedDuringScan) {
+          this.#dataChangedDuringScan = false;
+          this.#scheduleRecount();
+        }
         if (outcome.total === 0) {
           this.#active = null;
           this.#reveal = null;

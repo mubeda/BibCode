@@ -30,6 +30,9 @@ import { openThreadFindForTarget } from "./useThreadFind";
 const h = vi.hoisted(() => ({
   loadState: { status: "live", error: null, hasData: true } as ThreadFindLoadState,
   loadStateListeners: new Set<() => void>(),
+  /** While true, every projection waits until the test releases it, as a busy worker does. */
+  holdProjections: false,
+  heldProjections: [] as Array<() => void>,
   lists: [] as Array<{
     start: number;
     scroll: number;
@@ -58,6 +61,22 @@ vi.mock("../../../state/threads", async () => {
         },
         () => h.loadState,
       ),
+  };
+});
+
+vi.mock("./threadFindWorkerProjector", async () => {
+  const { projectFindSource } = await import("./threadFindText");
+  type Source = Parameters<typeof projectFindSource>[0];
+  type Context = Parameters<typeof projectFindSource>[1];
+  return {
+    createWorkerFindProjector: () => ({
+      project: (source: Source, context: Context) =>
+        h.holdProjections
+          ? new Promise((resolve) => {
+              h.heldProjections.push(() => resolve(projectFindSource(source, context)));
+            })
+          : projectFindSource(source, context),
+    }),
   };
 });
 
@@ -174,6 +193,8 @@ beforeAll(async () => {
 beforeEach(() => {
   registry.clear();
   h.lists.length = 0;
+  h.holdProjections = false;
+  h.heldProjections.length = 0;
   h.loadState = { status: "live", error: null, hasData: true };
   setFindHighlightSupportForTests({
     registry: {
@@ -651,6 +672,28 @@ describe("useThreadFind", () => {
     await act(async () => {
       input.dispatchEvent(new CompositionEvent("compositionend", { bubbles: true }));
     });
+    await settle(() => statusText().includes("1/1"));
+  });
+
+  it("recounts after the first scan when the thread changed while it was projecting", async () => {
+    const { render } = await mountTimeline({
+      latestTurn: null,
+      timelineEntries: [message("reply", "assistant", "still streaming", 0)],
+    });
+    h.holdProjections = true;
+    const input = await openFind();
+    await type(input, "needle");
+    await settle(() => h.heldProjections.length > 0);
+
+    // The final patch adds the word while the first projection is still pending.
+    await render({
+      timelineEntries: [message("reply", "assistant", "still streaming, now with a needle", 0)],
+    });
+    h.holdProjections = false;
+    await act(async () => {
+      for (const release of h.heldProjections.splice(0)) release();
+    });
+
     await settle(() => statusText().includes("1/1"));
   });
 
