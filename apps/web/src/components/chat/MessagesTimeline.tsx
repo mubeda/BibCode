@@ -74,11 +74,21 @@ import { DiffStatLabel, hasNonZeroStat } from "./DiffStatLabel";
 import { MessageCopyButton } from "./MessageCopyButton";
 import { TurnDeliveryNotice } from "./TurnDeliveryNotice";
 import {
+  applyTimelineDisclosureChange,
   computeStableMessagesTimelineRows,
   deriveMessagesTimelineRows,
   deriveUnsettledTurnId,
-  isWorkEntryInUnsettledTurn,
+  detailsDisclosureKey,
+  detailsOpenForScope,
+  EMPTY_TIMELINE_DISCLOSURES,
+  type EntryDisclosure,
+  MESSAGE_BODY_DISCLOSURE_KEY,
   normalizeCompactToolLabel,
+  PROPOSED_PLAN_DISCLOSURE_KEY,
+  type TimelineDisclosureChange,
+  type TimelineDisclosures,
+  toolCallDisplayedCommand,
+  TOOL_ROW_DISCLOSURE_KEY,
   resolveAssistantMessageCopyState,
   resolveTimelineIsAtEnd,
   resolveTimelineMinimapHasPersistentGutter,
@@ -100,31 +110,32 @@ import {
   deriveDisplayedUserMessageState,
   type ParsedTerminalContextEntry,
 } from "~/lib/terminalContext";
-import {
-  extractTrailingElementContexts,
-  type ParsedElementContextEntry,
-} from "~/lib/elementContext";
-import {
-  extractTrailingPreviewAnnotation,
-  type ParsedPreviewAnnotation,
-} from "~/lib/previewAnnotation";
+import { type ParsedElementContextEntry } from "~/lib/elementContext";
+import { type ParsedPreviewAnnotation } from "~/lib/previewAnnotation";
 import { cn } from "~/lib/utils";
 import { useUiStateStore } from "~/uiStateStore";
 import { type TimestampFormat } from "@bibcode/contracts/settings";
 import { formatChatTimestampTooltip, formatShortTimestamp } from "../../timestampFormat";
 import { formatMemoryBytes as formatBytes } from "../status-bar/statusBarFormat";
 
+import { buildInlineTerminalContextText } from "./userMessageTerminalContexts";
 import {
-  buildInlineTerminalContextText,
-  formatInlineTerminalContextLabel,
-  textContainsInlineTerminalContextLabels,
-} from "./userMessageTerminalContexts";
+  deriveSentUserMessageBody,
+  deriveUserMessageBodyLayout,
+  userMessageMarkdownParts,
+  type UserMessageMarkdownPart,
+} from "./userMessageBody";
+import {
+  ASSISTANT_MESSAGE_FIND_SCOPE,
+  markdownFindScope,
+  PLAN_BODY_FIND_SCOPE,
+  TOOL_COMMAND_FIND_SCOPE,
+} from "./threadFind/threadFindScopes";
 import { SkillInlineText } from "./SkillInlineText";
 import { formatWorkspaceRelativePath } from "../../filePathDisplay";
 import {
   buildReviewCommentRenderablePatch,
   formatReviewCommentFence,
-  parseReviewCommentMessageSegments,
   type ReviewCommentContext,
 } from "../../reviewCommentContext";
 
@@ -137,9 +148,6 @@ import {
 
 interface TimelineRowSharedState {
   timestampFormat: TimestampFormat;
-  verboseChat: boolean;
-  /** Each tool row's expand/collapse choice, kept for when LegendList remounts the row. */
-  workEntryExpandedChoices: Map<string, boolean>;
   routeThreadKey: string;
   threadRef: ScopedThreadRef | null;
   markdownCwd: string | undefined;
@@ -164,6 +172,8 @@ interface TimelineRowSharedState {
   /** `expanded` is what the row shows now; the toggle flips it. */
   onToggleTurnFold: (turnId: TurnId, expanded: boolean) => void;
   onToggleWorkGroup: (groupId: string, expanded: boolean, anchorElement?: HTMLElement) => void;
+  /** Sets one of an entry's own disclosures: its tool row, long body, plan or a details block. */
+  onSetEntryDisclosure: (entryId: string, key: string, open: boolean) => void;
 }
 
 interface TimelineRowActivityState {
@@ -277,25 +287,28 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   onIsAtEndChange,
   onManualNavigation,
 }: MessagesTimelineProps) {
-  const [turnFoldChoices, setTurnFoldChoices] = useState<ReadonlyMap<TurnId, boolean>>(
-    () => new Map(),
-  );
-  const [workGroupChoices, setWorkGroupChoices] = useState<ReadonlyMap<string, boolean>>(
-    () => new Map(),
-  );
+  const [disclosures, setDisclosures] = useState<TimelineDisclosures>(EMPTY_TIMELINE_DISCLOSURES);
   const [minimapStripMap] = useState(() => new Map<string, HTMLSpanElement>());
-  const [workEntryExpandedChoices] = useState(() => new Map<string, boolean>());
 
-  // A toggle flips what the row shows, which Verbose chat opens by default.
-  const onToggleTurnFold = useCallback((turnId: TurnId, expanded: boolean) => {
-    setTurnFoldChoices((existing) => new Map(existing).set(turnId, !expanded));
+  const changeDisclosures = useCallback((change: TimelineDisclosureChange) => {
+    setDisclosures((current) => applyTimelineDisclosureChange(current, change));
   }, []);
+  // A toggle flips what the row shows, which Verbose chat opens by default.
+  const onToggleTurnFold = useCallback(
+    (turnId: TurnId, expanded: boolean) => changeDisclosures({ turns: [[turnId, !expanded]] }),
+    [changeDisclosures],
+  );
+  const onSetEntryDisclosure = useCallback(
+    (entryId: string, key: string, open: boolean) =>
+      changeDisclosures({ entries: [[entryId, key, open]] }),
+    [changeDisclosures],
+  );
   const onToggleWorkGroup = useCallback(
     (groupId: string, expanded: boolean, anchorElement?: HTMLElement) => {
       const anchorBottomBeforeToggle = anchorElement?.getBoundingClientRect().bottom ?? null;
 
       flushSync(() => {
-        setWorkGroupChoices((existing) => new Map(existing).set(groupId, !expanded));
+        changeDisclosures({ groups: [[groupId, !expanded]] });
       });
 
       if (anchorBottomBeforeToggle === null || !anchorElement) {
@@ -313,10 +326,10 @@ export const MessagesTimeline = memo(function MessagesTimeline({
         list.scrollToOffset({ offset: currentScroll + delta, animated: false });
       }
     },
-    [listRef],
+    [changeDisclosures, listRef],
   );
 
-  useFoldPreviousTurnOnNewTurn(latestTurn, setTurnFoldChoices);
+  useFoldPreviousTurnOnNewTurn(latestTurn, setDisclosures);
 
   const rawRows = useMemo(
     () =>
@@ -326,8 +339,9 @@ export const MessagesTimeline = memo(function MessagesTimeline({
         queuedStatuses,
         latestTurn,
         runningTurnId,
-        turnFoldChoices,
-        workGroupChoices,
+        turnFoldChoices: disclosures.turns,
+        workGroupChoices: disclosures.groups,
+        entryDisclosures: disclosures.entries,
         verboseChat,
         isWorking,
         activeTurnStartedAt,
@@ -340,8 +354,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       queuedStatuses,
       latestTurn,
       runningTurnId,
-      turnFoldChoices,
-      workGroupChoices,
+      disclosures,
       verboseChat,
       isWorking,
       activeTurnStartedAt,
@@ -451,8 +464,6 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   const sharedState = useMemo<TimelineRowSharedState>(
     () => ({
       timestampFormat,
-      verboseChat,
-      workEntryExpandedChoices,
       routeThreadKey,
       threadRef: parseScopedThreadKey(routeThreadKey),
       markdownCwd,
@@ -474,11 +485,10 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       onOpenTurnDiff,
       onToggleTurnFold,
       onToggleWorkGroup,
+      onSetEntryDisclosure,
     }),
     [
       timestampFormat,
-      verboseChat,
-      workEntryExpandedChoices,
       routeThreadKey,
       markdownCwd,
       resolvedTheme,
@@ -499,6 +509,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       onOpenTurnDiff,
       onToggleTurnFold,
       onToggleWorkGroup,
+      onSetEntryDisclosure,
     ],
   );
   const unsettledTurnId = deriveUnsettledTurnId(latestTurn, runningTurnId);
@@ -612,9 +623,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
  */
 function useFoldPreviousTurnOnNewTurn(
   latestTurn: TimelineLatestTurn | null,
-  setTurnFoldChoices: (
-    update: (existing: ReadonlyMap<TurnId, boolean>) => ReadonlyMap<TurnId, boolean>,
-  ) => void,
+  setDisclosures: (update: (existing: TimelineDisclosures) => TimelineDisclosures) => void,
 ) {
   const previousLatestTurnRef = useRef(latestTurn);
   useEffect(() => {
@@ -625,19 +634,21 @@ function useFoldPreviousTurnOnNewTurn(
     }
     if (latestTurn.turnId === previous.turnId) {
       if (previous.state === "running" && latestTurn.state === "interrupted") {
-        setTurnFoldChoices((existing) => new Map(existing).set(latestTurn.turnId, true));
+        setDisclosures((existing) =>
+          applyTimelineDisclosureChange(existing, { turns: [[latestTurn.turnId, true]] }),
+        );
       }
       return;
     }
-    setTurnFoldChoices((existing) => {
-      if (existing.get(previous.turnId) !== true) {
+    setDisclosures((existing) => {
+      if (existing.turns.get(previous.turnId) !== true) {
         return existing;
       }
-      const next = new Map(existing);
-      next.delete(previous.turnId);
-      return next;
+      const turns = new Map(existing.turns);
+      turns.delete(previous.turnId);
+      return { ...existing, turns };
     });
-  }, [latestTurn, setTurnFoldChoices]);
+  }, [latestTurn, setDisclosures]);
 }
 
 /**
@@ -1059,7 +1070,9 @@ const TimelineRowContent = memo(function TimelineRowContent({ row }: { row: Time
       data-message-id={row.kind === "message" ? row.message.id : undefined}
       data-message-role={row.kind === "message" ? row.message.role : undefined}
     >
-      {row.kind === "work" ? <WorkGroupSection groupedEntries={row.groupedEntries} /> : null}
+      {row.kind === "work" ? (
+        <WorkGroupSection groupedEntries={row.groupedEntries} expanded={row.expanded} />
+      ) : null}
       {row.kind === "work-toggle" ? <WorkGroupToggleTimelineRow row={row} /> : null}
       {row.kind === "turn-fold" ? <TurnFoldTimelineRow row={row} /> : null}
       {row.kind === "message" && row.message.role === "user" ? <UserTimelineRow row={row} /> : null}
@@ -1093,6 +1106,8 @@ const QueuedTimelineRow = memo(function QueuedTimelineRow({
       onCancel={ctx.onCancelQueuedMessage}
     >
       <CollapsibleUserMessageBody
+        entryId={row.id}
+        disclosure={row.disclosure}
         text={displayed.visibleText}
         terminalContexts={displayed.contexts}
         skills={ctx.skills}
@@ -1117,21 +1132,8 @@ const AttachmentUploadTimelineNotice = memo(function AttachmentUploadTimelineNot
 function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" }> }) {
   const ctx = use(TimelineRowCtx);
   const userImages = row.message.attachments ?? [];
-  const displayedUserMessage = deriveDisplayedUserMessageState(row.message.text);
-  const terminalContexts = displayedUserMessage.contexts;
-  const previewAnnotations: ParsedPreviewAnnotation[] = [];
-  let visibleText = displayedUserMessage.visibleText;
-  while (true) {
-    const extracted = extractTrailingPreviewAnnotation(visibleText);
-    if (!extracted.annotation) break;
-    previewAnnotations.unshift(extracted.annotation);
-    visibleText = extracted.promptText;
-  }
-  const elementContextState = extractTrailingElementContexts(visibleText);
-  const elementContexts = [
-    ...displayedUserMessage.elementContexts,
-    ...elementContextState.contexts,
-  ];
+  const sentBody = deriveSentUserMessageBody(row.message.text);
+  const { elementContexts, previewAnnotations, terminalContexts } = sentBody;
   const previewImages = userImages.filter(
     (
       attachment,
@@ -1221,7 +1223,9 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
           </div>
         ) : null}
         <CollapsibleUserMessageBody
-          text={elementContextState.promptText}
+          entryId={row.id}
+          disclosure={row.disclosure}
+          text={sentBody.bodyText}
           terminalContexts={terminalContexts}
           skills={ctx.skills}
           markdownCwd={ctx.markdownCwd}
@@ -1255,9 +1259,7 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
           </Tooltip>
           <div className="flex items-center gap-0.5">
             {canRevertAgentWork && <RevertUserMessageButton messageId={row.message.id} />}
-            {displayedUserMessage.copyText && (
-              <MessageCopyButton text={displayedUserMessage.copyText} variant="ghost" />
-            )}
+            {sentBody.copyText && <MessageCopyButton text={sentBody.copyText} variant="ghost" />}
           </div>
         </div>
       </div>
@@ -1344,7 +1346,11 @@ function AssistantTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "mess
   return (
     <>
       <div className="relative min-w-0 px-1 py-0.5">
-        <ChatMarkdown
+        <TimelineChatMarkdown
+          entryId={row.id}
+          disclosure={row.disclosure}
+          // The placeholder for an empty reply is not the reply's text.
+          scope={row.message.text ? ASSISTANT_MESSAGE_FIND_SCOPE : undefined}
           text={messageText}
           cwd={ctx.markdownCwd}
           threadRef={ctx.threadRef ?? undefined}
@@ -1399,6 +1405,17 @@ function ProposedPlanTimelineRow({
   row: Extract<TimelineRow, { kind: "proposed-plan" }>;
 }) {
   const ctx = use(TimelineRowCtx);
+  const { onSetEntryDisclosure } = ctx;
+  const entryId = row.id;
+  const onExpandedChange = useCallback(
+    (expanded: boolean) => onSetEntryDisclosure(entryId, PROPOSED_PLAN_DISCLOSURE_KEY, expanded),
+    [entryId, onSetEntryDisclosure],
+  );
+  const onDetailsOpenChange = useCallback(
+    (ordinal: number, open: boolean) =>
+      onSetEntryDisclosure(entryId, detailsDisclosureKey(PLAN_BODY_FIND_SCOPE, ordinal), open),
+    [entryId, onSetEntryDisclosure],
+  );
 
   return (
     <div className="min-w-0 px-1 py-0.5">
@@ -1408,6 +1425,10 @@ function ProposedPlanTimelineRow({
         threadRef={ctx.threadRef ?? undefined}
         cwd={ctx.markdownCwd}
         workspaceRoot={ctx.workspaceRoot}
+        expanded={row.disclosure?.get(PROPOSED_PLAN_DISCLOSURE_KEY) ?? false}
+        onExpandedChange={onExpandedChange}
+        detailsOpen={detailsOpenForScope(row.disclosure, PLAN_BODY_FIND_SCOPE)}
+        onDetailsOpenChange={onDetailsOpenChange}
       />
     </div>
   );
@@ -1513,8 +1534,10 @@ function WorkingTimer({ createdAt }: { createdAt: string | null }) {
 /** Renders one or more already-derived work log rows. Overflow expansion is modeled as LegendList data. */
 const WorkGroupSection = memo(function WorkGroupSection({
   groupedEntries,
+  expanded,
 }: {
   groupedEntries: Extract<MessagesTimelineRow, { kind: "work" }>["groupedEntries"];
+  expanded: boolean;
 }) {
   const { workspaceRoot } = use(TimelineRowCtx);
   const nonEmptyEntries = useMemo(
@@ -1541,6 +1564,7 @@ const WorkGroupSection = memo(function WorkGroupSection({
             key={workEntry.id}
             workEntry={workEntry}
             workspaceRoot={workspaceRoot}
+            expanded={expanded}
           />
         ))}
       </div>
@@ -1788,13 +1812,16 @@ function shouldCollapseUserMessage(text: string): boolean {
 }
 
 const CollapsibleUserMessageBody = memo(function CollapsibleUserMessageBody(props: {
+  entryId: string;
+  disclosure: EntryDisclosure | undefined;
   text: string;
   terminalContexts: ParsedTerminalContextEntry[];
   skills: ReadonlyArray<Pick<ServerProviderSkill, "name" | "displayName">>;
   markdownCwd: string | undefined;
   footer?: ReactNode;
 }) {
-  const [expanded, setExpanded] = useState(false);
+  const { onSetEntryDisclosure } = use(TimelineRowCtx);
+  const expanded = props.disclosure?.get(MESSAGE_BODY_DISCLOSURE_KEY) ?? false;
   const hasVisibleBody = props.text.trim().length > 0 || props.terminalContexts.length > 0;
   const canCollapse = hasVisibleBody && shouldCollapseUserMessage(props.text);
   const isCollapsed = canCollapse && !expanded;
@@ -1818,6 +1845,8 @@ const CollapsibleUserMessageBody = memo(function CollapsibleUserMessageBody(prop
           }
         >
           <UserMessageBody
+            entryId={props.entryId}
+            disclosure={props.disclosure}
             text={props.text}
             terminalContexts={props.terminalContexts}
             skills={props.skills}
@@ -1840,7 +1869,9 @@ const CollapsibleUserMessageBody = memo(function CollapsibleUserMessageBody(prop
               variant="ghost"
               aria-expanded={expanded}
               data-scroll-anchor-ignore
-              onClick={() => setExpanded((value) => !value)}
+              onClick={() =>
+                onSetEntryDisclosure(props.entryId, MESSAGE_BODY_DISCLOSURE_KEY, !expanded)
+              }
               className="-ml-1 h-6 rounded-md px-1.5 text-xs text-muted-foreground hover:bg-muted/55 hover:text-foreground/85"
             >
               {expanded ? "Show less" : "Show full message"}
@@ -1856,167 +1887,129 @@ const CollapsibleUserMessageBody = memo(function CollapsibleUserMessageBody(prop
 });
 
 const UserMessageBody = memo(function UserMessageBody(props: {
+  entryId: string;
+  disclosure: EntryDisclosure | undefined;
   text: string;
   terminalContexts: ParsedTerminalContextEntry[];
   skills: ReadonlyArray<Pick<ServerProviderSkill, "name" | "displayName">>;
   markdownCwd: string | undefined;
 }) {
   const ctx = use(TimelineRowCtx);
-  const renderInlineMarkdownSegment = (text: string, key: string) => {
-    const leadingWhitespace = /^\s+/.exec(text)?.[0] ?? "";
-    const textWithoutLeadingWhitespace = text.slice(leadingWhitespace.length);
-    const trailingWhitespace = /\s+$/.exec(textWithoutLeadingWhitespace)?.[0] ?? "";
-    const content = textWithoutLeadingWhitespace.slice(
-      0,
-      textWithoutLeadingWhitespace.length - trailingWhitespace.length,
-    );
-
+  const layout = deriveUserMessageBodyLayout(props.text, props.terminalContexts);
+  // Parts are numbered in render order, as Find in thread numbers them.
+  const scopeByPart = new Map(
+    userMessageMarkdownParts(layout).map((part, index) => [part, markdownFindScope(index)]),
+  );
+  const renderMarkdown = (part: UserMessageMarkdownPart) => {
+    const scope = scopeByPart.get(part);
+    if (scope === undefined) return null;
     return (
-      <Fragment key={key}>
-        {leadingWhitespace ? <span aria-hidden="true">{leadingWhitespace}</span> : null}
-        {content ? (
-          <ChatMarkdown
-            text={content}
-            cwd={props.markdownCwd}
-            threadRef={ctx.threadRef ?? undefined}
-            skills={props.skills}
-            className="text-foreground"
-            lineBreaks
-          />
-        ) : null}
-        {trailingWhitespace ? <span aria-hidden="true">{trailingWhitespace}</span> : null}
-      </Fragment>
+      <TimelineChatMarkdown
+        key={part.key}
+        entryId={props.entryId}
+        disclosure={props.disclosure}
+        scope={scope}
+        text={part.text}
+        cwd={props.markdownCwd}
+        threadRef={ctx.threadRef ?? undefined}
+        skills={props.skills}
+        className="text-foreground"
+        lineBreaks
+      />
     );
   };
+  const renderInlinePart = (part: UserMessageMarkdownPart) => (
+    <Fragment key={part.key}>
+      {part.leadingWhitespace ? <span aria-hidden="true">{part.leadingWhitespace}</span> : null}
+      {renderMarkdown(part)}
+      {part.trailingWhitespace ? <span aria-hidden="true">{part.trailingWhitespace}</span> : null}
+    </Fragment>
+  );
 
-  const reviewCommentSegments = parseReviewCommentMessageSegments(props.text);
-  if (reviewCommentSegments.some((segment) => segment.kind === "review-comment")) {
-    return (
-      <div className="space-y-3 text-sm leading-relaxed text-foreground">
-        {reviewCommentSegments.map((segment) =>
-          segment.kind === "text" ? (
-            segment.text.trim().length > 0 ? (
-              <div key={segment.id} className="wrap-break-word">
-                <ChatMarkdown
-                  text={segment.text.trim()}
-                  cwd={props.markdownCwd}
-                  threadRef={ctx.threadRef ?? undefined}
-                  skills={props.skills}
-                  className="text-foreground"
-                  lineBreaks
-                />
+  switch (layout.kind) {
+    case "review-comments":
+      return (
+        <div className="space-y-3 text-sm leading-relaxed text-foreground">
+          {layout.parts.map((part) =>
+            part.kind === "markdown" ? (
+              <div key={part.key} className="wrap-break-word">
+                {renderMarkdown(part)}
               </div>
-            ) : null
-          ) : (
-            <UserMessageReviewCommentCard key={segment.comment.id} comment={segment.comment} />
-          ),
-        )}
-      </div>
-    );
-  }
-
-  if (props.terminalContexts.length > 0) {
-    const hasEmbeddedInlineLabels = textContainsInlineTerminalContextLabels(
-      props.text,
-      props.terminalContexts,
-    );
-    const inlinePrefix = buildInlineTerminalContextText(props.terminalContexts);
-    const inlineNodes: ReactNode[] = [];
-
-    if (hasEmbeddedInlineLabels) {
-      let cursor = 0;
-
-      for (const context of props.terminalContexts) {
-        const label = formatInlineTerminalContextLabel(context.header);
-        const matchIndex = props.text.indexOf(label, cursor);
-        if (matchIndex === -1) {
-          inlineNodes.length = 0;
-          break;
-        }
-        if (matchIndex > cursor) {
-          inlineNodes.push(
-            renderInlineMarkdownSegment(
-              props.text.slice(cursor, matchIndex),
-              `user-terminal-context-inline-before:${context.header}:${cursor}`,
+            ) : (
+              <UserMessageReviewCommentCard key={part.comment.id} comment={part.comment} />
             ),
-          );
-        }
-        inlineNodes.push(
-          <UserMessageTerminalContextInlineLabel
-            key={`user-terminal-context-inline:${context.header}`}
-            context={context}
-          />,
-        );
-        cursor = matchIndex + label.length;
-      }
-
-      if (inlineNodes.length > 0) {
-        if (cursor < props.text.length) {
-          inlineNodes.push(
-            renderInlineMarkdownSegment(
-              props.text.slice(cursor),
-              `user-message-terminal-context-inline-rest:${cursor}`,
+          )}
+        </div>
+      );
+    case "inline-terminal-contexts":
+      return (
+        <div className="whitespace-pre-wrap wrap-break-word text-sm leading-relaxed text-foreground">
+          {layout.parts.map((part) =>
+            part.kind === "markdown" ? (
+              renderInlinePart(part)
+            ) : (
+              <UserMessageTerminalContextInlineLabel key={part.key} context={part.context} />
             ),
-          );
-        }
-
-        return (
-          <div className="whitespace-pre-wrap wrap-break-word text-sm leading-relaxed text-foreground">
-            {inlineNodes}
-          </div>
-        );
+          )}
+        </div>
+      );
+    case "leading-terminal-contexts": {
+      if (!layout.markdown && buildInlineTerminalContextText(layout.contexts).length === 0) {
+        return null;
       }
-    }
-
-    for (const context of props.terminalContexts) {
-      inlineNodes.push(
-        <UserMessageTerminalContextInlineLabel
-          key={`user-terminal-context-inline:${context.header}`}
-          context={context}
-        />,
-      );
-      inlineNodes.push(
-        <span key={`user-terminal-context-inline-space:${context.header}`} aria-hidden="true">
-          {" "}
-        </span>,
+      return (
+        <div className="whitespace-pre-wrap wrap-break-word text-sm leading-relaxed text-foreground">
+          {layout.contexts.map((context) => (
+            <Fragment key={`user-terminal-context-inline:${context.header}`}>
+              <UserMessageTerminalContextInlineLabel context={context} />
+              <span aria-hidden="true"> </span>
+            </Fragment>
+          ))}
+          {layout.markdown ? renderMarkdown(layout.markdown) : null}
+        </div>
       );
     }
-
-    if (props.text.length > 0) {
-      inlineNodes.push(
-        <ChatMarkdown
-          key="user-message-terminal-context-inline-text"
-          text={props.text}
-          cwd={props.markdownCwd}
-          threadRef={ctx.threadRef ?? undefined}
-          skills={props.skills}
-          className="text-foreground"
-          lineBreaks
-        />,
-      );
-    } else if (inlinePrefix.length === 0) {
-      return null;
-    }
-
-    return (
-      <div className="whitespace-pre-wrap wrap-break-word text-sm leading-relaxed text-foreground">
-        {inlineNodes}
-      </div>
-    );
+    case "markdown":
+      return layout.markdown ? renderMarkdown(layout.markdown) : null;
   }
+});
 
-  if (props.text.length === 0) {
-    return null;
-  }
-
+/**
+ * `ChatMarkdown` for a timeline entry: its `<details>` blocks follow the timeline's disclosure
+ * owner, and its text is marked as one Find in thread scope.
+ */
+const TimelineChatMarkdown = memo(function TimelineChatMarkdown(props: {
+  entryId: string;
+  disclosure: EntryDisclosure | undefined;
+  scope: string | undefined;
+  text: string;
+  cwd: string | undefined;
+  threadRef: ScopedThreadRef | undefined;
+  skills: ReadonlyArray<Pick<ServerProviderSkill, "name" | "displayName">>;
+  isStreaming?: boolean;
+  className?: string;
+  lineBreaks?: boolean;
+}) {
+  const { onSetEntryDisclosure } = use(TimelineRowCtx);
+  const { entryId, scope } = props;
+  const detailsScope = scope ?? "";
+  const onDetailsOpenChange = useCallback(
+    (ordinal: number, open: boolean) =>
+      onSetEntryDisclosure(entryId, detailsDisclosureKey(detailsScope, ordinal), open),
+    [detailsScope, entryId, onSetEntryDisclosure],
+  );
   return (
     <ChatMarkdown
       text={props.text}
-      cwd={props.markdownCwd}
-      threadRef={ctx.threadRef ?? undefined}
+      cwd={props.cwd}
+      threadRef={props.threadRef}
       skills={props.skills}
-      className="text-foreground"
-      lineBreaks
+      {...(props.isStreaming !== undefined ? { isStreaming: props.isStreaming } : {})}
+      {...(props.className !== undefined ? { className: props.className } : {})}
+      {...(props.lineBreaks !== undefined ? { lineBreaks: props.lineBreaks } : {})}
+      detailsOpen={detailsOpenForScope(props.disclosure, detailsScope)}
+      onDetailsOpenChange={onDetailsOpenChange}
+      findScope={scope}
     />
   );
 });
@@ -2215,42 +2208,40 @@ function workEntryPreview(
     : `${displayPath} +${workEntry.changedFiles!.length - 1} more`;
 }
 
-function workEntryRawCommand(
-  workEntry: Pick<TimelineWorkEntry, "command" | "rawCommand">,
-): string | null {
-  const rawCommand = workEntry.rawCommand?.trim();
-  if (!rawCommand || !workEntry.command) {
-    return null;
-  }
-  return rawCommand === workEntry.command.trim() ? null : rawCommand;
+interface ToolCallExpandedBlock {
+  readonly text: string;
+  /** The command, which Find in thread searches; the rest is output and changed files. */
+  readonly isCommand: boolean;
 }
 
 function buildToolCallExpandedBody(
   workEntry: TimelineWorkEntry,
   workspaceRoot: string | undefined,
-): string | null {
-  const blocks: string[] = [];
+): ToolCallExpandedBlock[] | null {
+  const blocks: ToolCallExpandedBlock[] = [];
   if (workEntry.itemType === "mcp_tool_call" && workEntry.toolData !== undefined) {
-    blocks.push(`MCP call\n${JSON.stringify(workEntry.toolData, null, 2)}`);
+    blocks.push({
+      text: `MCP call\n${JSON.stringify(workEntry.toolData, null, 2)}`,
+      isCommand: false,
+    });
   }
-  const raw = workEntryRawCommand(workEntry);
-  if (raw?.trim()) {
-    blocks.push(raw.trim());
-  } else if (workEntry.command?.trim()) {
-    blocks.push(workEntry.command.trim());
+  const command = toolCallDisplayedCommand(workEntry);
+  if (command) {
+    blocks.push({ text: command, isCommand: true });
   }
   if (workEntry.detail?.trim()) {
-    blocks.push(workEntry.detail.trim());
+    blocks.push({ text: workEntry.detail.trim(), isCommand: false });
   }
   const changedFiles = workEntry.changedFiles ?? [];
   if (changedFiles.length > 0) {
-    blocks.push(
-      changedFiles
+    blocks.push({
+      text: changedFiles
         .map((filePath) => formatWorkspaceRelativePath(filePath, workspaceRoot))
         .join("\n"),
-    );
+      isCommand: false,
+    });
   }
-  return blocks.length > 0 ? blocks.join("\n\n") : null;
+  return blocks.length > 0 ? blocks : null;
 }
 
 function workEntryIconName(workEntry: TimelineWorkEntry): WorkEntryIconName {
@@ -2304,20 +2295,13 @@ const stopRowToggle = (e: { stopPropagation: () => void }) => e.stopPropagation(
 const SimpleWorkEntryRow = memo(function SimpleWorkEntryRow(props: {
   workEntry: TimelineWorkEntry;
   workspaceRoot: string | undefined;
+  expanded: boolean;
 }) {
-  const { workEntry, workspaceRoot } = props;
-  const { verboseChat, workEntryExpandedChoices } = use(TimelineRowCtx);
+  const { workEntry, workspaceRoot, expanded } = props;
+  const { onSetEntryDisclosure } = use(TimelineRowCtx);
   const activity = use(TimelineRowActivityCtx);
-  // The user's choice wins; until they make one, Verbose chat opens rows outside a running turn.
-  const [expandedChoice, setExpandedChoice] = useState(
-    () => workEntryExpandedChoices.get(workEntry.id) ?? null,
-  );
-  const expanded =
-    expandedChoice ??
-    (verboseChat && !isWorkEntryInUnsettledTurn(workEntry, activity.unsettledTurnId));
   const toggleExpanded = () => {
-    workEntryExpandedChoices.set(workEntry.id, !expanded);
-    setExpandedChoice(!expanded);
+    onSetEntryDisclosure(workEntry.id, TOOL_ROW_DISCLOSURE_KEY, !expanded);
   };
   const iconConfig = workToneIcon(workEntry.tone);
   const entryIconName = workEntryIconName(workEntry);
@@ -2460,7 +2444,16 @@ const SimpleWorkEntryRow = memo(function SimpleWorkEntryRow(props: {
           onPointerDown={stopRowToggle}
         >
           <pre className="max-h-64 cursor-text overflow-auto whitespace-pre-wrap break-words font-mono text-xs leading-relaxed text-muted-foreground select-text">
-            {expandedBody}
+            {expandedBody.map((block, index) => (
+              <Fragment key={block.isCommand ? "command" : index}>
+                {index > 0 ? "\n\n" : null}
+                {block.isCommand ? (
+                  <span data-find-scope={TOOL_COMMAND_FIND_SCOPE}>{block.text}</span>
+                ) : (
+                  block.text
+                )}
+              </Fragment>
+            ))}
           </pre>
         </div>
       ) : null}

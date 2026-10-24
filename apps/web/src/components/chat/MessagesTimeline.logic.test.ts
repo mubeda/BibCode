@@ -1,9 +1,12 @@
 import { ProviderDriverKind } from "@bibcode/contracts";
 import { describe, expect, it } from "vite-plus/test";
 import {
+  applyTimelineDisclosureChange,
   computeStableMessagesTimelineRows,
   computeMessageDurationStart,
   deriveMessagesTimelineRows,
+  detailsOpenForScope,
+  EMPTY_TIMELINE_DISCLOSURES,
   isWorkEntryInUnsettledTurn,
   locateTimelineEntry,
   normalizeCompactToolLabel,
@@ -1621,6 +1624,122 @@ describe("locateTimelineEntry", () => {
   });
 });
 
+describe("entry disclosure rows", () => {
+  const at = (second: number) => `2026-01-01T00:00:0${second}Z`;
+  const message = (id: string, role: "user" | "assistant", second: number) => ({
+    id: `${id}-entry`,
+    kind: "message" as const,
+    createdAt: at(second),
+    message: {
+      id: id as never,
+      role,
+      text: `${role} text`,
+      turnId: null,
+      createdAt: at(second),
+      updatedAt: at(second),
+      streaming: false,
+    },
+  });
+  const tool = {
+    id: "tool-entry",
+    kind: "work" as const,
+    createdAt: at(2),
+    entry: {
+      id: "tool",
+      createdAt: at(2),
+      turnId: null,
+      label: "Run tool",
+      command: "echo tool",
+      tone: "tool" as const,
+    },
+  };
+  const entries = [message("user", "user", 0), message("answer", "assistant", 1), tool];
+  const derive = (input: Partial<Parameters<typeof deriveMessagesTimelineRows>[0]> = {}) =>
+    deriveMessagesTimelineRows({
+      timelineEntries: entries,
+      isWorking: false,
+      activeTurnStartedAt: null,
+      turnDiffSummaryByAssistantMessageId: new Map(),
+      revertTurnCountByUserMessageId: new Map(),
+      ...input,
+    });
+  const workRow = (rows: MessagesTimelineRow[]) => rows.find((row) => row.kind === "work");
+
+  it("opens a tool row by its own choice, or by Verbose chat until it has one", () => {
+    expect(workRow(derive())).toMatchObject({ expanded: false });
+    expect(workRow(derive({ verboseChat: true }))).toMatchObject({ expanded: true });
+    const closed = new Map([["tool", new Map([["tool", false]])]]);
+    expect(workRow(derive({ verboseChat: true, entryDisclosures: closed }))).toMatchObject({
+      expanded: false,
+    });
+    const opened = new Map([["tool", new Map([["tool", true]])]]);
+    expect(workRow(derive({ entryDisclosures: opened }))).toMatchObject({ expanded: true });
+  });
+
+  it("hands each row its own disclosure and keeps rows whose disclosure did not change", () => {
+    const userDisclosure = new Map([["body", true]]);
+    const first = derive({ entryDisclosures: new Map([["user-entry", userDisclosure]]) });
+    expect(first.find((row) => row.id === "user-entry")).toMatchObject({
+      disclosure: userDisclosure,
+    });
+
+    const stable = computeStableMessagesTimelineRows(first, { byId: new Map(), result: [] });
+    const answerDisclosure = new Map([["details:md:0:0", true]]);
+    const next = computeStableMessagesTimelineRows(
+      derive({
+        entryDisclosures: new Map([
+          ["user-entry", userDisclosure],
+          ["answer-entry", answerDisclosure],
+        ]),
+      }),
+      stable,
+    );
+
+    expect(next.result[0]).toBe(stable.result[0]);
+    expect(next.result[1]).not.toBe(stable.result[1]);
+    expect(next.result[1]).toMatchObject({ disclosure: answerDisclosure });
+  });
+});
+
+describe("timeline disclosure owner", () => {
+  it("applies a change and keeps every map it does not touch", () => {
+    const opened = applyTimelineDisclosureChange(EMPTY_TIMELINE_DISCLOSURES, {
+      turns: [["turn-1" as never, true]],
+      entries: [
+        ["entry-a", "body", true],
+        ["entry-b", "details:md:0:2", true],
+      ],
+    });
+    expect(opened.turns.get("turn-1" as never)).toBe(true);
+    expect(opened.groups).toBe(EMPTY_TIMELINE_DISCLOSURES.groups);
+    expect(opened.entries.get("entry-a")?.get("body")).toBe(true);
+
+    const next = applyTimelineDisclosureChange(opened, {
+      entries: [["entry-b", "details:md:0:2", false]],
+    });
+    expect(next.turns).toBe(opened.turns);
+    // Only the entry that changed gets a new disclosure, so only its row re-renders.
+    expect(next.entries.get("entry-a")).toBe(opened.entries.get("entry-a"));
+    expect(next.entries.get("entry-b")).not.toBe(opened.entries.get("entry-b"));
+    // A change that changes nothing returns the same state.
+    expect(applyTimelineDisclosureChange(next, { turns: [["turn-1" as never, true]] })).toBe(next);
+  });
+
+  it("reads one Markdown part's details choices by ordinal, the same map each time", () => {
+    const disclosure = new Map([
+      ["details:md:0:1", true],
+      ["details:md:1:0", false],
+      ["body", true],
+    ]);
+    const forPart = detailsOpenForScope(disclosure, "md:0");
+    expect([...forPart]).toEqual([[1, true]]);
+    expect(detailsOpenForScope(disclosure, "md:0")).toBe(forPart);
+    expect([...detailsOpenForScope(disclosure, "md:1")]).toEqual([[0, false]]);
+    expect(detailsOpenForScope(undefined, "md:0").size).toBe(0);
+    expect(detailsOpenForScope(undefined, "md:0")).toBe(detailsOpenForScope(new Map(), "md:0"));
+  });
+});
+
 describe("settled turn answer visibility", () => {
   const turnId = "turn-1" as never;
   const at = (seconds: number) => new Date(Date.UTC(2026, 0, 1, 0, 0, seconds)).toISOString();
@@ -1874,6 +1993,7 @@ describe("computeStableMessagesTimelineRows", () => {
       id: "plan",
       createdAt: "2026-01-01T00:00:00Z",
       proposedPlan: plan,
+      disclosure: undefined,
     };
     const initial = computeStableMessagesTimelineRows([working, proposed], {
       byId: new Map(),
