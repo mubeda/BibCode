@@ -41,6 +41,7 @@ const baseThread: OrchestrationThread = {
   archivedAt: null,
   deletedAt: null,
   messages: [],
+  reasoning: [],
   proposedPlans: [],
   activities: [],
   checkpoints: [],
@@ -634,6 +635,68 @@ describe("applyThreadDetailEvent", () => {
     });
   });
 
+  describe("thread.reasoning-sent", () => {
+    const reasoningEvent = (
+      sequence: number,
+      payload: { text: string; streaming: boolean; reasoningId?: string },
+    ) =>
+      decodeOrchestrationEvent(
+        event(
+          "thread.reasoning-sent",
+          {
+            reasoningId: payload.reasoningId ?? "reasoning:thread-1:item:a",
+            text: payload.text,
+            streaming: payload.streaming,
+            turnId: "turn-1",
+            createdAt: `2026-04-02T00:00:0${sequence}.000Z`,
+            updatedAt: `2026-04-02T00:00:0${sequence}.000Z`,
+          },
+          sequence,
+        ),
+      );
+    const apply = (thread: OrchestrationThread, next: OrchestrationEvent) => {
+      const result = applyThreadDetailEvent(thread, next);
+      return result.kind === "updated" ? result.thread : thread;
+    };
+
+    it("appends deltas, replaces on a completion with text, and keeps text without one", () => {
+      let thread = apply(baseThread, reasoningEvent(1, { text: "Weighing ", streaming: true }));
+      thread = apply(thread, reasoningEvent(2, { text: "options", streaming: true }));
+      expect(thread.reasoning).toEqual([
+        {
+          id: "reasoning:thread-1:item:a",
+          turnId: "turn-1",
+          text: "Weighing options",
+          streaming: true,
+          createdAt: "2026-04-02T00:00:01.000Z",
+          updatedAt: "2026-04-02T00:00:02.000Z",
+        },
+      ]);
+      const settled = apply(thread, reasoningEvent(3, { text: "", streaming: false }));
+      expect(settled.reasoning[0]).toMatchObject({ text: "Weighing options", streaming: false });
+      const replaced = apply(thread, reasoningEvent(3, { text: "A\n\nB", streaming: false }));
+      expect(replaced.reasoning[0]).toMatchObject({ text: "A\n\nB", streaming: false });
+      expect(replaced.messages).toEqual([]);
+      expect(replaced.latestTurn).toBeNull();
+    });
+
+    it("creates an entry from a completion with text and ignores one without", () => {
+      const created = apply(
+        baseThread,
+        reasoningEvent(1, { text: "Only the summary", streaming: false, reasoningId: "b" }),
+      );
+      expect(created.reasoning.map((entry) => [entry.id, entry.text])).toEqual([
+        ["b", "Only the summary"],
+      ]);
+      expect(
+        applyThreadDetailEvent(
+          baseThread,
+          reasoningEvent(1, { text: "", streaming: false, reasoningId: "c" }),
+        ).kind,
+      ).toBe("unchanged");
+    });
+  });
+
   describe("thread.session-set", () => {
     it("settles a running latestTurn when the session leaves the running status", () => {
       const threadWithRunningTurn: OrchestrationThread = {
@@ -1109,6 +1172,14 @@ describe("applyThreadDetailEvent", () => {
             updatedAt: "2026-04-01T03:00:00.000Z",
           },
         ],
+        reasoning: ["turn-1", "turn-2"].map((turn) => ({
+          id: `reasoning:thread-1:turn:${turn}`,
+          turnId: TurnId.make(turn),
+          text: `Thinking about ${turn}`,
+          streaming: false,
+          createdAt: "2026-04-01T02:00:00.000Z",
+          updatedAt: "2026-04-01T02:00:00.000Z",
+        })),
         checkpoints: [
           {
             turnId: TurnId.make("turn-1"),
@@ -1151,6 +1222,7 @@ describe("applyThreadDetailEvent", () => {
         expect(result.thread.checkpoints[0]?.turnId).toBe("turn-1");
         // msg-3 (turn-2) is filtered, msg-1 (no turn) and msg-2 (turn-1) remain
         expect(result.thread.messages).toHaveLength(2);
+        expect(result.thread.reasoning.map((entry) => entry.turnId)).toEqual(["turn-1"]);
         expect(result.thread.latestTurn?.turnId).toBe("turn-1");
       }
     });
@@ -1809,6 +1881,7 @@ describe("applyThreadDetailEvent", () => {
               updatedAt: "updated",
             },
           ],
+          reasoning: [],
           proposedPlans: [
             {
               id: "global-plan",
@@ -1868,6 +1941,7 @@ describe("applyThreadDetailEvent", () => {
         thread: {
           latestTurn: null,
           messages: [{ id: "system" }, { id: "unbound" }],
+          reasoning: [],
           proposedPlans: [{ id: "global-plan" }],
           activities: [{ id: "global-activity" }],
           checkpoints: [],

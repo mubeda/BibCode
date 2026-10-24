@@ -166,6 +166,7 @@ const CACHED_THREAD: OrchestrationThread = {
   archivedAt: null,
   deletedAt: null,
   messages: [],
+  reasoning: [],
   proposedPlans: [],
   activities: [],
   checkpoints: [],

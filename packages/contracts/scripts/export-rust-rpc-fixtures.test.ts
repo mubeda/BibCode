@@ -103,7 +103,7 @@ describe("RPC wire fixture exporter", () => {
     expect(manifest.methods.filter(({ mode }) => mode === "stream")).toHaveLength(24);
     expect(manifest.streamMethodCount).toBe(24);
     expect(manifest.expectedTopLevelStreamShapes).toBe(79);
-    expect(manifest.expectedOrchestrationEventShapes).toBe(24);
+    expect(manifest.expectedOrchestrationEventShapes).toBe(25);
     expect(manifest.streamShapeFixtures).toHaveLength(79);
     expect(manifest.typedFailureFixtures).toHaveLength(335);
     expect(manifest.staleMethodIdentifiers).toEqual([
