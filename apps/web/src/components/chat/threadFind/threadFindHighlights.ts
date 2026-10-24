@@ -170,3 +170,167 @@ export function findScopeOccurrences(scope: Element, query: string): DomFindOccu
   }
   return occurrences;
 }
+
+function sameDetailsPath(a: ReadonlyArray<number>, b: ReadonlyArray<number>): boolean {
+  return a.length === b.length && a.every((ordinal, index) => ordinal === b[index]);
+}
+
+/** Every occurrence in one row's scopes, as ranges in reading order. */
+export function collectRowRanges(row: Element, query: string): Range[] {
+  const ranges: Range[] = [];
+  for (const scope of row.querySelectorAll(`[${FIND_SCOPE_ATTRIBUTE}]`)) {
+    for (const occurrence of findScopeOccurrences(scope, query)) {
+      const range = rangeForSegmentOffsets(
+        occurrence.segment,
+        occurrence.start,
+        occurrence.start + query.length,
+      );
+      if (range) ranges.push(range);
+    }
+  }
+  return ranges;
+}
+
+/**
+ * Where an occurrence is: its scope, the details blocks around it, and its index among the
+ * occurrences there. All occurrences in one block show or hide together, so the same index
+ * finds it in the DOM whatever else is open.
+ */
+export interface FindOccurrenceTarget {
+  readonly scope: string;
+  readonly details: ReadonlyArray<number>;
+  readonly index: number;
+}
+
+/** The range of a target occurrence in a mounted row, or null when it is not rendered. */
+export function locateTargetRange(
+  row: Element,
+  target: FindOccurrenceTarget,
+  query: string,
+): Range | null {
+  for (const scope of row.querySelectorAll(`[${FIND_SCOPE_ATTRIBUTE}]`)) {
+    if (scope.getAttribute(FIND_SCOPE_ATTRIBUTE) !== target.scope) continue;
+    const matching = findScopeOccurrences(scope, query).filter((occurrence) =>
+      sameDetailsPath(occurrence.segment.details, target.details),
+    );
+    const occurrence = matching[target.index];
+    if (!occurrence) return null;
+    return rangeForSegmentOffsets(
+      occurrence.segment,
+      occurrence.start,
+      occurrence.start + query.length,
+    );
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// CSS Custom Highlight API, with one owner per document
+// ---------------------------------------------------------------------------
+
+export const FIND_HIGHLIGHT_NAME = "bibcode-find";
+export const FIND_ACTIVE_HIGHLIGHT_NAME = "bibcode-find-active";
+/** Marks the active match's row when the engine cannot paint highlights. */
+export const FIND_ACTIVE_ROW_ATTRIBUTE = "data-find-active-row";
+/** Painting covers mounted rows only, nearest the active match first, up to this many. */
+export const MAX_PAINTED_FIND_RANGES = 1000;
+
+export interface FindHighlightSupport {
+  readonly registry: {
+    set(name: string, highlight: unknown): unknown;
+    delete(name: string): unknown;
+  };
+  createHighlight(ranges: ReadonlyArray<Range>, priority: number): unknown;
+}
+
+let supportOverride: FindHighlightSupport | null | undefined;
+
+/** Replaces the engine's highlight registry; `undefined` restores feature detection. */
+export function setFindHighlightSupportForTests(
+  support: FindHighlightSupport | null | undefined,
+): void {
+  supportOverride = support;
+}
+
+interface HighlightConstructor {
+  new (...ranges: Range[]): { priority: number };
+}
+
+/** The registry, when the engine has `CSS.highlights` (Chromium 105, Safari 17.2, Firefox 140). */
+export function readFindHighlightSupport(): FindHighlightSupport | null {
+  if (supportOverride !== undefined) return supportOverride;
+  const css = (globalThis as { CSS?: { highlights?: FindHighlightSupport["registry"] } }).CSS;
+  const HighlightClass = (globalThis as { Highlight?: HighlightConstructor }).Highlight;
+  if (!css?.highlights || typeof HighlightClass !== "function") return null;
+  const registry = css.highlights;
+  return {
+    registry,
+    createHighlight: (ranges, priority) => {
+      const highlight = new HighlightClass(...ranges);
+      highlight.priority = priority;
+      return highlight;
+    },
+  };
+}
+
+interface FindHighlightOwner {
+  readonly token: symbol;
+  readonly revoke: () => void;
+}
+
+/** The surface whose find is open. Only it writes or deletes the two registry entries. */
+let highlightOwner: FindHighlightOwner | null = null;
+
+function clearRegistry(): void {
+  const support = readFindHighlightSupport();
+  support?.registry.delete(FIND_HIGHLIGHT_NAME);
+  support?.registry.delete(FIND_ACTIVE_HIGHLIGHT_NAME);
+}
+
+/**
+ * Makes `token` the owner. Opening find in another surface closes the current one first:
+ * its highlights are cleared and `revoke` closes its bar.
+ */
+export function claimFindHighlights(token: symbol, revoke: () => void): void {
+  if (highlightOwner && highlightOwner.token !== token) {
+    const previous = highlightOwner;
+    highlightOwner = null;
+    clearRegistry();
+    previous.revoke();
+  }
+  highlightOwner = { token, revoke };
+}
+
+/** Clears the highlights if `token` owns them; another surface's close leaves them alone. */
+export function releaseFindHighlights(token: symbol): void {
+  if (highlightOwner?.token !== token) return;
+  highlightOwner = null;
+  clearRegistry();
+}
+
+export function ownsFindHighlights(token: symbol): boolean {
+  return highlightOwner?.token === token;
+}
+
+/** Removes the painted matches, keeping ownership; only the owner can. */
+export function clearFindHighlights(token: symbol): void {
+  if (highlightOwner?.token === token) clearRegistry();
+}
+
+/** Paints the matches; returns false when the engine cannot, so the caller shows the ring. */
+export function paintFindHighlights(
+  token: symbol,
+  ranges: ReadonlyArray<Range>,
+  active: Range | null,
+): boolean {
+  if (highlightOwner?.token !== token) return false;
+  const support = readFindHighlightSupport();
+  if (!support) return false;
+  support.registry.set(FIND_HIGHLIGHT_NAME, support.createHighlight(ranges, 0));
+  if (active) {
+    support.registry.set(FIND_ACTIVE_HIGHLIGHT_NAME, support.createHighlight([active], 1));
+  } else {
+    support.registry.delete(FIND_ACTIVE_HIGHLIGHT_NAME);
+  }
+  return true;
+}

@@ -280,6 +280,8 @@ export type MessagesTimelineRow =
       id: string;
       createdAt: string;
       turnId: TurnId;
+      /** The turn's first entry, which the fold row stands in for while folded. */
+      anchorEntryId: string;
       label: string;
       expanded: boolean;
     }
@@ -885,6 +887,7 @@ export function deriveMessagesTimelineRows(
         id: `turn-fold:${turnFold.turnId}`,
         createdAt: turnFold.createdAt,
         turnId: turnFold.turnId,
+        anchorEntryId: turnFold.anchorEntryId,
         label: turnFold.label,
         expanded: isTurnExpanded(turnFold.turnId),
       });
@@ -1076,7 +1079,12 @@ function isRowUnchanged(a: MessagesTimelineRow, b: MessagesTimelineRow): boolean
 
     case "turn-fold": {
       const bf = b as typeof a;
-      return a.createdAt === bf.createdAt && a.label === bf.label && a.expanded === bf.expanded;
+      return (
+        a.createdAt === bf.createdAt &&
+        a.anchorEntryId === bf.anchorEntryId &&
+        a.label === bf.label &&
+        a.expanded === bf.expanded
+      );
     }
 
     case "proposed-plan": {

@@ -281,6 +281,11 @@
   --success-foreground: var(--color-emerald-700);
   --warning: var(--color-amber-500);
   --warning-foreground: var(--color-amber-700);
+  /* Find in thread: every match, and the active one, which differs by lightness, not hue. */
+  --find-match: var(--color-amber-200);
+  --find-match-foreground: var(--color-neutral-900);
+  --find-match-active: var(--color-amber-500);
+  --find-match-active-foreground: var(--color-neutral-950);
 
   @variant dark {
     color-scheme: dark;
@@ -319,7 +324,29 @@
     --success-foreground: var(--color-emerald-400);
     --warning: var(--color-amber-500);
     --warning-foreground: var(--color-amber-400);
+    --find-match: color-mix(in srgb, var(--color-amber-400) 35%, var(--background));
+    --find-match-foreground: var(--color-neutral-50);
+    --find-match-active: var(--color-amber-300);
+    --find-match-active-foreground: var(--color-neutral-950);
   }
+}
+
+/* Find in thread paints matches with the CSS Custom Highlight API, which takes only text
+   colors; an engine without it rings the active match's row instead. */
+::highlight(bibcode-find) {
+  background-color: var(--find-match);
+  color: var(--find-match-foreground);
+}
+
+::highlight(bibcode-find-active) {
+  background-color: var(--find-match-active);
+  color: var(--find-match-active-foreground);
+}
+
+[data-find-active-row] {
+  border-radius: calc(var(--radius) - 2px);
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
 }
 
 /* Secondary text on a dark sidebar card is brighter than the global muted grey,

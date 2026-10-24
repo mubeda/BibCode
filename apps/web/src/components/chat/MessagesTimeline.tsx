@@ -105,6 +105,8 @@ import {
 } from "./MessagesTimeline.logic";
 import { timelineScrollAnimates } from "./timelineScrollAnchoring";
 import { TerminalContextInlineChip } from "./TerminalContextInlineChip";
+import { ThreadFind } from "./threadFind/ThreadFindBar";
+import type { ThreadFindInput } from "./threadFind/useThreadFind";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import {
   deriveDisplayedUserMessageState,
@@ -240,7 +242,16 @@ interface MessagesTimelineProps {
   contentInsetEndAdjustment: number;
   onIsAtEndChange: (isAtEnd: boolean) => void;
   onManualNavigation: () => void;
+  /** The server thread Find in thread reports the load state of; null for a draft. */
+  findThreadRef?: ScopedThreadRef | null;
+  /** The chat surface's root, so Mod+F inside it opens this timeline's find. */
+  findSurfaceRoot?: HTMLElement | null;
+  isHostFindSurface?: boolean;
+  /** Closing find returns focus to the composer. */
+  onFindFocusComposer?: () => void;
 }
+
+const NO_FIND_FOCUS = () => {};
 
 // ---------------------------------------------------------------------------
 // MessagesTimeline — list owner
@@ -287,6 +298,10 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   contentInsetEndAdjustment,
   onIsAtEndChange,
   onManualNavigation,
+  findThreadRef = null,
+  findSurfaceRoot = null,
+  isHostFindSurface = false,
+  onFindFocusComposer = NO_FIND_FOCUS,
 }: MessagesTimelineProps) {
   const [disclosures, setDisclosures] = useState<TimelineDisclosures>(EMPTY_TIMELINE_DISCLOSURES);
   const [minimapStripMap] = useState(() => new Map<string, HTMLSpanElement>());
@@ -543,72 +558,113 @@ export const MessagesTimeline = memo(function MessagesTimeline({
     () => ({ uploads: attachmentUploads, onCancel: onCancelAttachmentUpload }),
     [attachmentUploads, onCancelAttachmentUpload],
   );
-
-  if (rows.length === 0 && !isWorking) {
-    return (
-      <div className="flex h-full items-center justify-center">
-        <p className="text-sm text-muted-foreground">Send a message to start the conversation.</p>
-      </div>
-    );
-  }
+  const findInput = useMemo<ThreadFindInput>(
+    () => ({
+      timelineEntries,
+      queuedMessages,
+      queuedStatuses,
+      latestTurn,
+      runningTurnId,
+      verboseChat,
+      skills,
+      cwd: markdownCwd,
+      disclosures,
+      rows,
+    }),
+    [
+      disclosures,
+      latestTurn,
+      markdownCwd,
+      queuedMessages,
+      queuedStatuses,
+      rows,
+      runningTurnId,
+      skills,
+      timelineEntries,
+      verboseChat,
+    ],
+  );
+  // Kept at one place in the tree, beside the empty state and the list alike, so an open find
+  // survives a thread loading its first rows and can say the thread is still loading.
+  const threadFind = (
+    <ThreadFind
+      threadRef={findThreadRef}
+      input={findInput}
+      listRef={listRef}
+      timelineElement={timelineViewportElement}
+      contentInsetEndAdjustment={contentInsetEndAdjustment}
+      changeDisclosures={changeDisclosures}
+      onManualNavigation={onManualNavigation}
+      onFocusComposer={onFindFocusComposer}
+      surfaceRoot={findSurfaceRoot}
+      isHostSurface={isHostFindSurface}
+    />
+  );
 
   return (
-    <TimelineRowCtx value={sharedState}>
-      <AttachmentUploadCtx value={attachmentUploadState}>
-        <TimelineRowActivityCtx value={activityState}>
-          <div ref={setTimelineViewportElement} className="relative h-full min-h-0">
-            <LegendList<MessagesTimelineRow>
-              ref={listRef}
-              data={rows}
-              keyExtractor={keyExtractor}
-              getItemType={getItemType}
-              renderItem={renderItem}
-              estimatedItemSize={90}
-              initialScrollAtEnd
-              recycleItems={false}
-              {...(anchoredEndSpace ? { anchoredEndSpace } : {})}
-              contentInsetEndAdjustment={contentInsetEndAdjustment}
-              maintainScrollAtEnd={
-                anchoredEndSpace
-                  ? false
-                  : {
-                      animated: false,
-                      on: {
-                        dataChange: true,
-                        itemLayout: true,
-                        layout: true,
-                      },
-                    }
-              }
-              maintainVisibleContentPosition={{
-                data: true,
-                size: false,
-              }}
-              onScroll={handleScroll}
-              onMetricsChange={onListMetricsChange}
-              className="scrollbar-gutter-both h-full min-h-0 overflow-x-hidden overscroll-y-contain px-3 [overflow-anchor:none] sm:px-5"
-              ListHeaderComponent={TIMELINE_LIST_HEADER}
-              ListFooterComponent={TIMELINE_LIST_FOOTER}
-            />
-            <TimelineMinimap
-              items={minimapItems}
-              bottomInset={contentInsetEndAdjustment}
-              hasPersistentGutter={minimapHasPersistentGutter}
-              stepTargets={minimapStepTargets}
-              stripMap={minimapStripMap}
-              onSelect={(item) => {
-                onManualNavigation();
-                void listRef.current?.scrollToIndex({
-                  index: item.rowIndex,
-                  animated: timelineScrollAnimates(),
-                  viewOffset: TIMELINE_MINIMAP_JUMP_OFFSET,
-                });
-              }}
-            />
-          </div>
-        </TimelineRowActivityCtx>
-      </AttachmentUploadCtx>
-    </TimelineRowCtx>
+    <div ref={setTimelineViewportElement} className="relative h-full min-h-0">
+      {rows.length === 0 && !isWorking ? (
+        <div className="flex h-full items-center justify-center">
+          <p className="text-sm text-muted-foreground">Send a message to start the conversation.</p>
+        </div>
+      ) : (
+        <TimelineRowCtx value={sharedState}>
+          <AttachmentUploadCtx value={attachmentUploadState}>
+            <TimelineRowActivityCtx value={activityState}>
+              <LegendList<MessagesTimelineRow>
+                ref={listRef}
+                data={rows}
+                keyExtractor={keyExtractor}
+                getItemType={getItemType}
+                renderItem={renderItem}
+                estimatedItemSize={90}
+                initialScrollAtEnd
+                recycleItems={false}
+                {...(anchoredEndSpace ? { anchoredEndSpace } : {})}
+                contentInsetEndAdjustment={contentInsetEndAdjustment}
+                maintainScrollAtEnd={
+                  anchoredEndSpace
+                    ? false
+                    : {
+                        animated: false,
+                        on: {
+                          dataChange: true,
+                          itemLayout: true,
+                          layout: true,
+                        },
+                      }
+                }
+                maintainVisibleContentPosition={{
+                  data: true,
+                  size: false,
+                }}
+                onScroll={handleScroll}
+                onMetricsChange={onListMetricsChange}
+                className="scrollbar-gutter-both h-full min-h-0 overflow-x-hidden overscroll-y-contain px-3 [overflow-anchor:none] sm:px-5"
+                ListHeaderComponent={TIMELINE_LIST_HEADER}
+                ListFooterComponent={TIMELINE_LIST_FOOTER}
+              />
+              <TimelineMinimap
+                items={minimapItems}
+                bottomInset={contentInsetEndAdjustment}
+                hasPersistentGutter={minimapHasPersistentGutter}
+                stepTargets={minimapStepTargets}
+                stripMap={minimapStripMap}
+                onSelect={(item) => {
+                  onManualNavigation();
+                  void listRef.current?.scrollToIndex({
+                    index: item.rowIndex,
+                    animated: timelineScrollAnimates(),
+                    viewOffset: TIMELINE_MINIMAP_JUMP_OFFSET,
+                  });
+                }}
+              />
+            </TimelineRowActivityCtx>
+          </AttachmentUploadCtx>
+        </TimelineRowCtx>
+      )}
+      {threadFind}
+    </div>
   );
 });
 
