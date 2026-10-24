@@ -11,7 +11,7 @@ import {
   Minimize2Icon,
   WrapTextIcon,
 } from "lucide-react";
-import type { ScopedThreadRef, ServerProviderSkill } from "@bibcode/contracts";
+import type { EditorId, ScopedThreadRef, ServerProviderSkill } from "@bibcode/contracts";
 import {
   isAtomCommandInterrupted,
   squashAtomCommandFailure,
@@ -19,11 +19,13 @@ import {
 } from "@bibcode/client-runtime/state/runtime";
 import * as Cause from "effect/Cause";
 import { AsyncResult } from "effect/reactivity";
+import { toHtml } from "hast-util-to-html";
 import React, {
   Children,
   Suspense,
   type ClipboardEvent as ReactClipboardEvent,
   type MouseEvent as ReactMouseEvent,
+  createContext,
   isValidElement,
   use,
   useCallback,
@@ -43,6 +45,7 @@ import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
 import { renderSkillInlineMarkdownChildren } from "./chat/SkillInlineText";
 import { CHAT_FILE_TAG_CHIP_CLASS_NAME, FileTagChipContent } from "./chat/FileTagChip";
+import { HighlightedCodeLines } from "./chat/HighlightedCodeLines";
 import { PierreEntryIcon } from "./chat/PierreEntryIcon";
 import { hasSpecificPierreIconForFileName, syntheticFileNameForLanguageId } from "../pierre-icons";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "./ui/tooltip";
@@ -54,7 +57,9 @@ import { stackedThreadToast, toastManager } from "./ui/toast";
 import { useOpenInPreferredEditor } from "../editorPreferences";
 import { resolveDiffThemeName, type DiffThemeName } from "../lib/diffRendering";
 import { fnv1a32 } from "../lib/diffRendering";
+import { createIncrementalHighlightedDocument } from "../lib/incrementalHighlighting";
 import { LRUCache } from "../lib/lruCache";
+import { createIncrementalMarkdownPlugin } from "../markdown-incremental";
 import { useTheme } from "../hooks/useTheme";
 import { getClientSettings } from "../hooks/useSettings";
 import {
@@ -120,6 +125,9 @@ interface ChatMarkdownProps {
 }
 
 const EMPTY_MARKDOWN_SKILLS: ReadonlyArray<Pick<ServerProviderSkill, "name" | "displayName">> = [];
+// A stable empty list, so the markdown components keep their identity before the server
+// config loads.
+const NO_AVAILABLE_EDITORS: ReadonlyArray<EditorId> = [];
 
 const CODE_FENCE_LANGUAGE_REGEX = /(?:^|\s)language-([^\s]+)/;
 const MAX_HIGHLIGHT_CACHE_ENTRIES = 500;
@@ -656,9 +664,13 @@ function SuspenseShikiCodeBlock({
   isStreaming,
   fallback,
 }: SuspenseShikiCodeBlockProps) {
+  // A block that streamed keeps its line-by-line renderer when the reply finishes, so its
+  // highlight and any text selection in it stay in place.
+  const [hasStreamed, setHasStreamed] = useState(isStreaming);
+  if (isStreaming && !hasStreamed) setHasStreamed(true);
   const language = extractFenceLanguage(className);
   const cacheKey = createHighlightCacheKey(code, language, themeName);
-  const cachedHighlightedHtml = !isStreaming ? highlightedCodeCache.get(cacheKey) : null;
+  const cachedHighlightedHtml = !hasStreamed ? highlightedCodeCache.get(cacheKey) : null;
 
   if (cachedHighlightedHtml != null) {
     return (
@@ -669,7 +681,7 @@ function SuspenseShikiCodeBlock({
     );
   }
 
-  if (!isStreaming) {
+  if (!hasStreamed) {
     return (
       <DeferredShikiCodeBlock
         code={code}
@@ -817,6 +829,10 @@ function DeferredShikiCodeBlock({
   );
 }
 
+/**
+ * A block that is streaming or has streamed, highlighted during render: each delta tokenizes
+ * only the unfinished line and keeps the DOM of the completed lines.
+ */
 function UncachedShikiCodeBlock({
   code,
   language,
@@ -825,23 +841,37 @@ function UncachedShikiCodeBlock({
   isStreaming,
 }: UncachedShikiCodeBlockProps) {
   const highlighter = use(getHighlighterPromise(language));
-  const highlightedHtml = useMemo(
-    () => highlightWith(highlighter, code, language, themeName),
-    [code, highlighter, language, themeName],
+  const highlight = useMemo(
+    () => createIncrementalHighlightedDocument(highlighter, language, themeName),
+    [highlighter, language, themeName],
   );
+  const highlighted = useMemo(() => {
+    try {
+      return highlight(code);
+    } catch (error) {
+      console.warn(
+        `Code highlighting failed for language "${language}", falling back to plain text.`,
+        error instanceof Error ? error.message : error,
+      );
+      return highlighter.codeToHast(code, { lang: "text", theme: themeName });
+    }
+  }, [code, highlight, highlighter, language, themeName]);
 
   useEffect(() => {
     if (!isStreaming) {
+      const highlightedHtml = toHtml(highlighted);
       highlightedCodeCache.set(
         cacheKey,
         highlightedHtml,
         estimateHighlightedSize(highlightedHtml, code),
       );
     }
-  }, [cacheKey, code, highlightedHtml, isStreaming]);
+  }, [cacheKey, code, highlighted, isStreaming]);
 
   return (
-    <div className="chat-markdown-shiki" dangerouslySetInnerHTML={{ __html: highlightedHtml }} />
+    <div className="chat-markdown-shiki">
+      <HighlightedCodeLines root={highlighted} />
+    </div>
   );
 }
 
@@ -1352,6 +1382,28 @@ function areMarkdownFileLinkPropsEqual(
   );
 }
 
+type MarkdownFileLinkMeta = NonNullable<ReturnType<typeof resolveMarkdownFileLinkMeta>>;
+
+/**
+ * The values that change with every streamed delta. The markdown components read them here
+ * instead of closing over them, so the components keep their identity while a reply streams:
+ * React then updates the rendered blocks in place instead of mounting them again, which keeps
+ * their DOM, their highlight and their state, such as an open details block.
+ */
+interface ChatMarkdownDocument {
+  readonly text: string;
+  readonly isStreaming: boolean;
+  readonly fileLinkMetaByHref: ReadonlyMap<string, MarkdownFileLinkMeta>;
+  readonly fileLinkParentSuffixByPath: ReadonlyMap<string, string>;
+}
+
+const ChatMarkdownDocumentContext = createContext<ChatMarkdownDocument>({
+  text: "",
+  isStreaming: false,
+  fileLinkMetaByHref: new Map(),
+  fileLinkParentSuffixByPath: new Map(),
+});
+
 function ChatMarkdown({
   text,
   cwd,
@@ -1374,14 +1426,11 @@ function ChatMarkdown({
   const serverConfig = useAtomValue(serverEnvironment.configValueAtom(environmentId));
   const openInPreferredEditor = useOpenInPreferredEditor(
     environmentId,
-    serverConfig?.availableEditors ?? [],
+    serverConfig?.availableEditors ?? NO_AVAILABLE_EDITORS,
   );
   const diffThemeName = resolveDiffThemeName(resolvedTheme);
   const markdownFileLinkMetaByHref = useMemo(() => {
-    const metaByHref = new Map<
-      string,
-      NonNullable<ReturnType<typeof resolveMarkdownFileLinkMeta>>
-    >();
+    const metaByHref = new Map<string, MarkdownFileLinkMeta>();
     for (const href of extractMarkdownLinkHrefs(text)) {
       const normalizedHref = normalizeMarkdownLinkHrefKey(href);
       if (metaByHref.has(normalizedHref)) continue;
@@ -1396,6 +1445,21 @@ function ChatMarkdown({
     const filePaths = [...markdownFileLinkMetaByHref.values()].map((meta) => meta.filePath);
     return buildFileLinkParentSuffixByPath(filePaths);
   }, [markdownFileLinkMetaByHref]);
+  const markdownDocument = useMemo<ChatMarkdownDocument>(
+    () => ({
+      text,
+      isStreaming,
+      fileLinkMetaByHref: markdownFileLinkMetaByHref,
+      fileLinkParentSuffixByPath,
+    }),
+    [fileLinkParentSuffixByPath, isStreaming, markdownFileLinkMetaByHref, text],
+  );
+  // While a reply streams, reparse only the text after its last completed code block. A
+  // finished reply takes one full parse.
+  const incrementalMarkdownPlugin = useMemo(
+    () => (isStreaming ? createIncrementalMarkdownPlugin() : null),
+    [isStreaming],
+  );
   const markdownUrlTransform = useCallback((href: string) => {
     return rewriteMarkdownFileUriHref(href) ?? defaultUrlTransform(href);
   }, []);
@@ -1439,6 +1503,7 @@ function ChatMarkdown({
         return <p {...props}>{renderSkillInlineMarkdownChildren(children, skills)}</p>;
       },
       li({ node, children, ...props }) {
+        const { text } = use(ChatMarkdownDocumentContext);
         const listItemStart = node?.position?.start.offset;
         const markerOffset =
           typeof listItemStart === "number" ? findTaskListMarkerOffset(text, listItemStart) : null;
@@ -1478,8 +1543,9 @@ function ChatMarkdown({
         );
       },
       a({ node, href, children, ...props }) {
+        const { fileLinkMetaByHref, fileLinkParentSuffixByPath } = use(ChatMarkdownDocumentContext);
         const normalizedHref = href ? normalizeMarkdownLinkHrefKey(href) : "";
-        const fileLinkMeta = normalizedHref ? markdownFileLinkMetaByHref.get(normalizedHref) : null;
+        const fileLinkMeta = normalizedHref ? fileLinkMetaByHref.get(normalizedHref) : null;
         if (!fileLinkMeta) {
           const faviconHost = resolveExternalLinkHost(href);
           const isSameDocumentLink = href?.startsWith("#") ?? false;
@@ -1625,9 +1691,15 @@ function ChatMarkdown({
         return <MarkdownTable {...props} />;
       },
       details({ node: _node, children, open: detailsOpen }) {
-        return <MarkdownDetails open={detailsOpen}>{children}</MarkdownDetails>;
+        // A toggle survives new text; an edited `open` attribute starts the block over.
+        return (
+          <MarkdownDetails key={detailsOpen ? "open" : "closed"} open={detailsOpen}>
+            {children}
+          </MarkdownDetails>
+        );
       },
       pre({ node, children, ...props }) {
+        const { isStreaming } = use(ChatMarkdownDocumentContext);
         const codeBlock = extractCodeBlock(children);
         if (!codeBlock) {
           return <pre {...props}>{children}</pre>;
@@ -1660,16 +1732,12 @@ function ChatMarkdown({
     [
       diffThemeName,
       environmentId,
-      fileLinkParentSuffixByPath,
-      isStreaming,
-      markdownFileLinkMetaByHref,
       onTaskListChange,
       openInPreferredEditor,
       openPreview,
       openMarkdownFileInPreview,
       resolvedTheme,
       skills,
-      text,
       threadRef,
     ],
   );
@@ -1682,18 +1750,21 @@ function ChatMarkdown({
       )}
       onCopy={handleCopy}
     >
-      <ReactMarkdown
-        remarkPlugins={
-          lineBreaks
-            ? [remarkGfm, remarkBreaks, remarkPreserveCodeMeta]
-            : [remarkGfm, remarkPreserveCodeMeta]
-        }
-        rehypePlugins={[rehypeRaw, [rehypeSanitize, CHAT_MARKDOWN_SANITIZE_SCHEMA]]}
-        components={markdownComponents}
-        urlTransform={markdownUrlTransform}
-      >
-        {text}
-      </ReactMarkdown>
+      <ChatMarkdownDocumentContext value={markdownDocument}>
+        <ReactMarkdown
+          remarkPlugins={[
+            remarkGfm,
+            ...(lineBreaks ? [remarkBreaks] : []),
+            remarkPreserveCodeMeta,
+            ...(incrementalMarkdownPlugin ? [incrementalMarkdownPlugin] : []),
+          ]}
+          rehypePlugins={[rehypeRaw, [rehypeSanitize, CHAT_MARKDOWN_SANITIZE_SCHEMA]]}
+          components={markdownComponents}
+          urlTransform={markdownUrlTransform}
+        >
+          {text}
+        </ReactMarkdown>
+      </ChatMarkdownDocumentContext>
     </div>
   );
 }
