@@ -144,6 +144,19 @@ describe("FileEditingSession disk reconciliation", () => {
     });
   });
 
+  it("waits for an IME composition to end before reloading", () => {
+    const { session } = createSession();
+    const cacheKey = session.cacheKey;
+    session.setComposing(true);
+
+    check(session, { _tag: "present", version: "v2" }, { version: "v2", contents: "new\n" });
+    expect(session.cacheKey).toBe(cacheKey);
+
+    session.setComposing(false);
+    check(session, { _tag: "present", version: "v2" }, { version: "v2", contents: "new\n" });
+    expect(session.cacheKey).not.toBe(cacheKey);
+  });
+
   it("adopts a disk version whose text already matches the document", async () => {
     vi.useFakeTimers();
     const { session, persist } = createSession();
