@@ -2126,7 +2126,11 @@ flag and persists a queued outbox row; other states rewrite it to false and use
 normal pending delivery. While a compaction of the thread is unsettled,
 admission treats the thread as running and queues every start, also one sent
 without `queued` (an older client), so nothing is admitted ahead of the copy a
-recovery sends. The original request digest still owns command replay.
+recovery sends. The engine checks this again on its sequential worker, in the
+admission's own command, because a recovery can begin between the RPC's check
+and admission: a start admitted then becomes queued (outbox row, message and
+stored payload) with no turn-start event or pending marker. The original
+request digest still owns command replay.
 Admission stores the model selection even when the request omitted it, together
 with the turn's modes and provider route. Queued admission records the user
 message and complete delivery metadata without a turn-start event, pending turn,
@@ -2196,7 +2200,10 @@ tab closed; unarchiving it resumes both. A delivery claimed before the panel
 closed is refused at the provider supervisor before any driver I/O and returns
 to pending, and accepting `thread.archive` for a panel interrupts its provider
 session on the server, so closing a panel stops its work without relying on the
-client's view of the session. Explicit Send now remains available under its client gate.
+client's view of the session. Explicit Send now remains available under its client gate,
+except while a compaction of the thread is unsettled: promotion of any kind is
+refused then, because a promoted start would sit ahead of a recovery's copy
+with a marker of its own.
 
 Pending start deliveries from older clients also wait while the session is
 running or starting; the SQLite claim repeats this check so a stale worker read
@@ -2387,14 +2394,23 @@ wins, checks that the live session has the recorded instance and conversation
 (otherwise it settles `failed`, "The thread's provider or conversation changed,
 so it wasn't compacted."), and calls the driver's `compact` (see
 [Providers](./providers.md#conversation-compaction)). `NotStarted` settles
-`failed`; `Unknown` marks the row `unresolved`, with no retry. The event pump
-reports the tagged turn's start and end to the effect. The bound is 15 minutes:
-then the effect interrupts the turn and, if that is not confirmed within 30
-seconds, stops the session it captured (`stop_session_if_current`); an
-`Unknown` request whose turn does not start within 60 seconds is ended the same
-way, and settles `failed` with "BiBCode couldn't confirm whether the
-conversation was compacted." Settlement (`thread.compaction.settle`, internal)
-runs in one transaction and wakes delivery.
+`failed`; `Unknown` marks the row `unresolved`, with no retry. A request the
+driver has not answered within 60 seconds (or whose session ends meanwhile)
+counts as `Unknown`, so a provider that never answers cannot hold the thread.
+The event pump reports the tagged turn's start and end to the effect; once the
+turn is known, a Stop asked for before it existed interrupts it. Every bound
+counts from the request. The bound is 15 minutes: then the effect interrupts
+the turn and, if that is not confirmed within 30 seconds, stops the session it
+captured (`stop_session_if_current`); an `Unknown` request whose turn does not
+start within 60 seconds is ended the same way, and settles `failed` with
+"BiBCode couldn't confirm whether the conversation was compacted." Settlement
+(`thread.compaction.settle`, internal) runs in one transaction and wakes
+delivery.
+
+While a compaction is unsettled, a pending start's marker (a guarded message
+that waits, unsent, behind it) is neither bound nor deleted by an untagged
+running session update either, such as a turn the provider starts on its own:
+no turn can be that message's until the claim takes it.
 
 **Recovery.** A failed `turn.completed` passes its context-limit facts on the
 internal `thread.session.set` as `contextLimit`. In that transaction the engine
@@ -2404,7 +2420,8 @@ a delivered start of a user message that is not itself a copy, has no
 recovery row and no failed or stopped guard; the provider supports compaction;
 the latest context-window reading tagged with the failed delivery's instance
 and conversation says `compactsAutomatically: true` (an untagged reading never
-matches); and nothing else of the thread is unsettled, pending or sending
+matches, and a reading of a Claude instance whose environment sets
+`DISABLE_AUTO_COMPACT` or `DISABLE_COMPACT` is tagged `false`); and nothing else of the thread is unsettled, pending or sending
 (a steer written during the failing turn is input the provider reads next), and
 the thread is neither deleted nor an archived panel. An eligible failure
 projects the session `error` with `lastErrorClass: context_limit` and the text

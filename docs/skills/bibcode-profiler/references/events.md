@@ -289,7 +289,9 @@ carries message or error text.
 
 ### provider.compaction
 
-One per conversation compaction BiBCode asked for, when it settles (see
+One per conversation compaction BiBCode asked for, when it settles, however it
+settles: also one a Stop settled before anything was sent, and one that could
+not run at all (see
 [Context-limit recovery](../../../architecture/rpc-and-orchestration.md#context-limit-recovery)).
 A failed one is also a
 [`provider.compaction-failed`](findings.md#providercompaction-failed) finding,
