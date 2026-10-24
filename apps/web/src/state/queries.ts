@@ -127,6 +127,8 @@ export function useCheckpointDiff(
     target.threadId !== null &&
     target.fromTurnCount !== null &&
     target.toTurnCount !== null;
+  const context =
+    typeof target.contextLines === "number" ? { contextLines: target.contextLines } : null;
   const fullThreadTarget =
     enabled && target.fromTurnCount === 0
       ? {
@@ -135,6 +137,7 @@ export function useCheckpointDiff(
             threadId: target.threadId!,
             toTurnCount: target.toTurnCount!,
             ignoreWhitespace: target.ignoreWhitespace,
+            ...context,
           },
         }
       : null;
@@ -147,14 +150,23 @@ export function useCheckpointDiff(
             fromTurnCount: target.fromTurnCount!,
             toTurnCount: target.toTurnCount!,
             ignoreWhitespace: target.ignoreWhitespace,
+            ...context,
           },
         }
       : null;
   const fullThread = useEnvironmentQuery(
-    fullThreadTarget === null ? null : orchestrationEnvironment.fullThreadDiff(fullThreadTarget),
+    fullThreadTarget === null
+      ? null
+      : context === null
+        ? orchestrationEnvironment.fullThreadDiff(fullThreadTarget)
+        : orchestrationEnvironment.fullThreadContextDiff(fullThreadTarget),
   );
   const turn = useEnvironmentQuery(
-    turnTarget === null ? null : orchestrationEnvironment.turnDiff(turnTarget),
+    turnTarget === null
+      ? null
+      : context === null
+        ? orchestrationEnvironment.turnDiff(turnTarget)
+        : orchestrationEnvironment.turnContextDiff(turnTarget),
   );
   return fullThreadTarget === null ? turn : fullThread;
 }

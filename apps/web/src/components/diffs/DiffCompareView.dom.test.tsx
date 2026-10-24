@@ -40,7 +40,12 @@ vi.mock("./AnnotatableCodeView", () => ({
 
 import { useDiffPanelStore } from "~/diffPanelStore";
 
-import { DiffCompareView, type DiffCompareViewProps } from "./DiffCompareView";
+import {
+  DiffCompareView,
+  parseContextLines,
+  type CompareLineFilter,
+  type DiffCompareViewProps,
+} from "./DiffCompareView";
 
 const environmentId = EnvironmentId.make("environment-1");
 const threadRef = { environmentId, threadId: ThreadId.make("thread-1") };
@@ -90,6 +95,17 @@ describe("DiffCompareView", () => {
   let container: HTMLDivElement;
   let root: Root;
   const onRevalidatePatch = vi.fn();
+  const onLinesChange = vi.fn();
+  const onContextLinesChange = vi.fn();
+  const allLines: CompareLineFilter = {
+    lines: "all",
+    contextLines: 3,
+    contextFiles: null,
+    contextPending: false,
+    contextSupported: null,
+    onLinesChange,
+    onContextLinesChange,
+  };
 
   beforeEach(() => {
     (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -97,6 +113,8 @@ describe("DiffCompareView", () => {
     h.requested.length = 0;
     h.codeView.length = 0;
     onRevalidatePatch.mockClear();
+    onLinesChange.mockClear();
+    onContextLinesChange.mockClear();
     useDiffPanelStore.setState({ compareFileByThreadKey: {}, compareFiltersByThreadKey: {} });
     container = document.createElement("div");
     document.body.append(container);
@@ -121,6 +139,7 @@ describe("DiffCompareView", () => {
           scope="working-tree"
           sectionId="unstaged"
           sectionTitle="Working tree"
+          lineFilter={allLines}
           threadRef={threadRef}
           onRevalidatePatch={onRevalidatePatch}
           {...overrides}
@@ -152,6 +171,104 @@ describe("DiffCompareView", () => {
     expect(file!.fileDiff.additionLines).toHaveLength(12);
     expect(lastCodeView()["options"]).toMatchObject({ expandUnchanged: true });
     expect(container.textContent).not.toContain("Loading full file…");
+  });
+
+  it("shows Changes only from the context patch, with gaps, and comments on the default hunks", async () => {
+    const [defaultFile] = parse(modified("src/a.ts", OLD_A, NEW_A));
+    const [contextFile] = parse(
+      [
+        "diff --git a/src/a.ts b/src/a.ts",
+        `index ${OLD_A}..${NEW_A} 100644`,
+        "--- a/src/a.ts",
+        "+++ b/src/a.ts",
+        "@@ -6 +6 @@",
+        "-line 6",
+        "+line six",
+      ].join("\n"),
+    );
+    h.versions.set(blobKey(OLD_A), { _tag: "text", contents: lines(), byteLength: 1 });
+    h.versions.set(worktreeKey("src/a.ts", NEW_A), {
+      _tag: "text",
+      contents: lines({ 6: "line six" }),
+      byteLength: 1,
+    });
+    const changesOnly = { ...allLines, lines: "changes" as const, contextLines: 0 };
+    await render([defaultFile!], {
+      lineFilter: { ...changesOnly, contextFiles: [contextFile!], contextSupported: true },
+    });
+    const view = lastCodeView();
+    expect(view["options"]).toMatchObject({ expandUnchanged: false });
+    const [shown] = view["files"] as Array<{
+      fileDiff: FileDiffMetadata;
+      commentFileDiff: FileDiffMetadata;
+    }>;
+    expect(shown!.fileDiff.isPartial, "the full files fill the gaps for expansion").toBe(false);
+    expect(shown!.fileDiff.hunks[0]!.additionCount, "Git's -U0 hunk").toBe(1);
+    expect(shown!.commentFileDiff).toBe(defaultFile);
+
+    // Still loading the context patch: the default hunks show meanwhile.
+    await render([defaultFile!], { lineFilter: { ...changesOnly, contextPending: true } });
+    expect(container.textContent).toContain("Loading changes…");
+    const [pending] = lastCodeView()["files"] as Array<{ fileDiff: FileDiffMetadata }>;
+    expect(pending!.fileDiff.hunks[0]!.additionCount).toBe(3);
+  });
+
+  it("switches the line filter and commits the context count after typing stops", async () => {
+    vi.useFakeTimers();
+    try {
+      await render(parse(modified("src/a.ts", OLD_A, NEW_A)));
+      expect(container.querySelector('input[type="number"]'), "All lines has no count").toBeNull();
+      const changesToggle = [...container.querySelectorAll("button")].find(
+        (button) => button.textContent === "Changes only",
+      )!;
+      await act(async () => changesToggle.click());
+      expect(onLinesChange).toHaveBeenCalledWith("changes");
+
+      await render(parse(modified("src/a.ts", OLD_A, NEW_A)), {
+        lineFilter: { ...allLines, lines: "changes" },
+      });
+      const field = container.querySelector<HTMLInputElement>('input[type="number"]')!;
+      const type = async (value: string) =>
+        act(async () => {
+          const setValue = Object.getOwnPropertyDescriptor(
+            HTMLInputElement.prototype,
+            "value",
+          )!.set!;
+          setValue.call(field, value);
+          field.dispatchEvent(new Event("input", { bubbles: true }));
+        });
+      await type("1");
+      await type("12");
+      await act(async () => vi.advanceTimersByTime(299));
+      expect(onContextLinesChange, "no commit while typing").not.toHaveBeenCalled();
+      await act(async () => vi.advanceTimersByTime(1));
+      expect(onContextLinesChange).toHaveBeenCalledTimes(1);
+      expect(onContextLinesChange).toHaveBeenCalledWith(12);
+
+      await type("100");
+      await act(async () => vi.advanceTimersByTime(300));
+      expect(onContextLinesChange, "out of range never commits").toHaveBeenCalledTimes(1);
+      await act(async () => {
+        field.dispatchEvent(new FocusEvent("blur"));
+        field.dispatchEvent(new FocusEvent("focusout", { bubbles: true }));
+      });
+      expect(field.value, "blur restores the saved count").toBe("3");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("disables the count with its reason when the server ignores it", async () => {
+    await render(parse(modified("src/a.ts", OLD_A, NEW_A)), {
+      lineFilter: { ...allLines, lines: "changes", contextSupported: false },
+    });
+    const field = container.querySelector<HTMLInputElement>('input[type="number"]')!;
+    expect(field.disabled).toBe(true);
+    const reason = document.getElementById(field.getAttribute("aria-describedby")!);
+    expect(reason?.textContent).toBe("Update the server to change context lines.");
+    expect(parseContextLines(" 7 ")).toBe(7);
+    expect(parseContextLines("-1")).toBeNull();
+    expect(parseContextLines("")).toBeNull();
   });
 
   it("reads two blobs for branch and turn scopes", async () => {
@@ -186,16 +303,14 @@ describe("DiffCompareView", () => {
 
   it("brings the row End selects into a long list's window", async () => {
     // The list measures a 280px viewport: ten rows plus overscan, not two hundred.
-    const height = vi
-      .spyOn(HTMLElement.prototype, "getBoundingClientRect")
-      .mockReturnValue({
-        height: 280,
-        width: 240,
-        top: 0,
-        left: 0,
-        bottom: 280,
-        right: 240,
-      } as DOMRect);
+    const height = vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue({
+      height: 280,
+      width: 240,
+      top: 0,
+      left: 0,
+      bottom: 280,
+      right: 240,
+    } as DOMRect);
     const clientHeight = vi
       .spyOn(HTMLElement.prototype, "clientHeight", "get")
       .mockReturnValue(280);

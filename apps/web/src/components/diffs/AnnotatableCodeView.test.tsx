@@ -294,6 +294,35 @@ describe("AnnotatableCodeView", () => {
     });
   });
 
+  it("places and builds comments against the comment file when one is given", () => {
+    const commentFileDiff = { name: "src/app.ts", hunks: [] } as unknown as FileDiffMetadata;
+    harness.reviewComments.push({
+      id: "comment-1",
+      sectionId: "turn-1",
+      filePath: "src/app.ts",
+      fenceLanguage: "diff",
+      rangeLabel: "+3",
+      text: "note",
+    });
+    harness.restoreDiffReviewCommentRange.mockReturnValue({ start: 3, end: 3, side: "additions" });
+    const props = renderView({ files: [{ ...files[0]!, commentFileDiff }] });
+    expect(harness.restoreDiffReviewCommentRange).toHaveBeenCalledWith(
+      commentFileDiff,
+      expect.objectContaining({ id: "comment-1" }),
+    );
+
+    const beginComment = (props.options as Record<string, unknown>).onLineSelectionEnd as (
+      range: SelectedLineRange | null,
+      context: { item: Record<string, unknown> },
+    ) => void;
+    beginComment({ start: 4, end: 4, side: "additions" } as SelectedLineRange, {
+      item: { type: "diff", id: "file-1" },
+    });
+    expect(harness.buildDiffReviewComment).toHaveBeenCalledWith(
+      expect.objectContaining({ fileDiff: commentFileDiff }),
+    );
+  });
+
   it("appends a draft, disables selection, and submits it", () => {
     const range = {
       start: 7,

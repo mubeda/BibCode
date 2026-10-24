@@ -202,6 +202,10 @@ export default function DiffPanel({
   // Settings defaults.
   const diffRenderMode = settings.diffRenderMode;
   const diffViewMode = settings.diffViewMode;
+  const compareLines = settings.diffCompareLines;
+  const compareContextLines = settings.diffCompareContextLines;
+  // Only Compare's Changes only asks for a second patch; All lines and Changes share the default.
+  const wantsContextPatch = diffViewMode === "compare" && compareLines === "changes";
   const [wordWrap, setWordWrap] = useState(settings.wordWrap);
   const [diffIgnoreWhitespace, setDiffIgnoreWhitespace] = useState(settings.diffIgnoreWhitespace);
   const [baseRefQuery, setBaseRefQuery] = useState("");
@@ -358,11 +362,54 @@ export default function DiffPanel({
         })
       : null,
   );
+  const contextCheckpointDiff = useCheckpointDiff(
+    {
+      environmentId: activeThread?.environmentId ?? null,
+      threadId: activeThreadId,
+      fromTurnCount: selectedCheckpointRange?.fromTurnCount ?? null,
+      toTurnCount: selectedCheckpointRange?.toTurnCount ?? null,
+      ignoreWhitespace: diffIgnoreWhitespace,
+      cacheScope: selectedTurn ? `turn:${selectedTurn.turnId}` : null,
+      contextLines: compareContextLines,
+    },
+    {
+      enabled:
+        wantsContextPatch &&
+        workspaceUnavailable === null &&
+        isGitRepo &&
+        selectedTurn !== undefined,
+    },
+  );
+  const contextDiffPreview = useEnvironmentQuery(
+    wantsContextPatch &&
+      workspaceUnavailable === null &&
+      selectedTurnId === null &&
+      activeThread &&
+      activeCwd
+      ? reviewEnvironment.contextDiffPreview({
+          environmentId: activeThread.environmentId,
+          input: {
+            cwd: activeCwd,
+            ...(selectedBaseRef ? { baseRef: selectedBaseRef } : {}),
+            ignoreWhitespace: diffIgnoreWhitespace,
+            contextLines: compareContextLines,
+          },
+        })
+      : null,
+  );
   const revalidateBranchDiffPreview = branchDiffPreview.revalidate;
+  const revalidateContextDiffPreview = contextDiffPreview.revalidate;
   useEffect(() => {
     if (workspaceUnavailable || gitRefreshRequestId === 0 || selectedTurnId !== null) return;
     revalidateBranchDiffPreview();
-  }, [revalidateBranchDiffPreview, gitRefreshRequestId, selectedTurnId, workspaceUnavailable]);
+    revalidateContextDiffPreview();
+  }, [
+    revalidateBranchDiffPreview,
+    revalidateContextDiffPreview,
+    gitRefreshRequestId,
+    selectedTurnId,
+    workspaceUnavailable,
+  ]);
   const selectedGitSource = branchDiffPreview.data?.sources.find(
     (source) => source.kind === (selectedGitScope === "unstaged" ? "working-tree" : "branch-range"),
   );
@@ -447,8 +494,58 @@ export default function DiffPanel({
     "truncated" in activeCheckpointDiff.data;
   const revalidateSelectedPatch = useCallback(() => {
     // Only the working tree has a side read from disk, so only its patch can go stale.
-    if (selectedTurnId === null) revalidateBranchDiffPreview();
-  }, [revalidateBranchDiffPreview, selectedTurnId]);
+    if (selectedTurnId !== null) return;
+    revalidateBranchDiffPreview();
+    revalidateContextDiffPreview();
+  }, [revalidateBranchDiffPreview, revalidateContextDiffPreview, selectedTurnId]);
+  const contextPatch = selectedTurn
+    ? contextCheckpointDiff.data
+    : contextDiffPreview.data?.sources.find(
+        (source) =>
+          source.kind === (selectedGitScope === "unstaged" ? "working-tree" : "branch-range"),
+      );
+  const contextPatchText = wantsContextPatch ? contextPatch?.diff : undefined;
+  const contextRenderablePatch = useMemo(
+    () =>
+      getRenderablePatch(contextPatchText, `diff-panel-context:${resolvedTheme}`, {
+        compactPartialHunkOffsets: selectedTurnId === null,
+      }),
+    [contextPatchText, resolvedTheme, selectedTurnId],
+  );
+  const updateCompareLines = useCallback(
+    (lines: "all" | "changes") => updateClientSettings({ diffCompareLines: lines }),
+    [updateClientSettings],
+  );
+  const updateCompareContextLines = useCallback(
+    (contextLines: number) => updateClientSettings({ diffCompareContextLines: contextLines }),
+    [updateClientSettings],
+  );
+  const contextPending = selectedTurn
+    ? contextCheckpointDiff.isPending
+    : contextDiffPreview.isPending;
+  const compareLineFilter = useMemo(
+    () => ({
+      lines: compareLines,
+      contextLines: compareContextLines,
+      contextFiles: contextRenderablePatch?.kind === "files" ? contextRenderablePatch.files : null,
+      contextPending: wantsContextPatch && contextPending,
+      // An older server ignores the count and does not echo it.
+      contextSupported:
+        contextPatch === null || contextPatch === undefined ? null : "contextLines" in contextPatch,
+      onLinesChange: updateCompareLines,
+      onContextLinesChange: updateCompareContextLines,
+    }),
+    [
+      compareContextLines,
+      compareLines,
+      contextPatch,
+      contextPending,
+      contextRenderablePatch,
+      updateCompareContextLines,
+      updateCompareLines,
+      wantsContextPatch,
+    ],
+  );
   const compareOptions = useMemo(
     () => ({
       lineDiffType: "none" as const,
@@ -880,6 +977,7 @@ export default function DiffPanel({
                 environmentId={activeThread.environmentId}
                 files={renderableFiles}
                 legacyTurnPatch={legacyTurnPatch}
+                lineFilter={compareLineFilter}
                 options={compareOptions}
                 scope={compareScope}
                 sectionId={reviewSectionId}

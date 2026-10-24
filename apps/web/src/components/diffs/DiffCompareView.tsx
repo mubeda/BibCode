@@ -1,6 +1,19 @@
 import type { FileDiffMetadata } from "@pierre/diffs";
-import type { EnvironmentId, ScopedThreadRef } from "@bibcode/contracts";
-import { useCallback, useDeferredValue, useEffect, useEffectEvent, useMemo, useState } from "react";
+import {
+  DIFF_CONTEXT_LINES_MAX,
+  type DiffCompareLines,
+  type EnvironmentId,
+  type ScopedThreadRef,
+} from "@bibcode/contracts";
+import {
+  useCallback,
+  useDeferredValue,
+  useEffect,
+  useEffectEvent,
+  useId,
+  useMemo,
+  useState,
+} from "react";
 
 import { type DraftId } from "~/composerDraftStore";
 import {
@@ -21,11 +34,13 @@ import {
   type DiffFileFilters,
   type DiffFileRow,
 } from "~/lib/diffCompareModel";
+import { resolveFileDiffPath } from "~/lib/diffRendering";
 import { cn } from "~/lib/utils";
 import { useEnvironmentQuery } from "~/state/query";
 import { reviewEnvironment } from "~/state/review";
 
 import { Button } from "../ui/button";
+import { Toggle, ToggleGroup } from "../ui/toggle-group";
 import {
   AnnotatableCodeView,
   type AnnotatableCodeViewHandle,
@@ -49,7 +64,21 @@ export interface DiffCompareViewProps {
   readonly options: AnnotatableCodeViewProps["options"];
   /** Asks for the patch again, as the panel's refresh does. */
   readonly onRevalidatePatch: () => void;
+  readonly lineFilter: CompareLineFilter;
   readonly viewerRef?: React.Ref<AnnotatableCodeViewHandle>;
+}
+
+/** **All lines** or **Changes only**, with the context count the second one asks Git for. */
+export interface CompareLineFilter {
+  readonly lines: DiffCompareLines;
+  readonly contextLines: number;
+  /** The patch with `contextLines`, parsed; null for All lines and until it loads. */
+  readonly contextFiles: ReadonlyArray<FileDiffMetadata> | null;
+  readonly contextPending: boolean;
+  /** Whether the server applied the count; null until it answers. */
+  readonly contextSupported: boolean | null;
+  readonly onLinesChange: (lines: DiffCompareLines) => void;
+  readonly onContextLinesChange: (contextLines: number) => void;
 }
 
 /**
@@ -132,6 +161,7 @@ function DiffComparePane({
   composerDraftTarget,
   options,
   onRevalidatePatch,
+  lineFilter,
   viewerRef,
 }: DiffComparePaneProps) {
   const plan = planCompareFile(row, scope, { legacyTurnPatch });
@@ -179,12 +209,19 @@ function DiffComparePane({
   const [pinned, setPinned] = useState({ identity, fileDiff: row.fileDiff });
   if (pinned.identity !== identity) setPinned({ identity, fileDiff: row.fileDiff });
   const baseFile = pinned.identity === identity ? pinned.fileDiff : row.fileDiff;
+  // Changes only shows the patch Git printed with the chosen context count; All lines, and a
+  // context patch still on its way, show the default patch. Both name the same versions.
+  const contextFile =
+    lineFilter.lines === "changes"
+      ? (lineFilter.contextFiles?.find((file) => resolveFileDiffPath(file) === row.path) ?? null)
+      : null;
+  const patchFile = contextFile ?? baseFile;
   const hydration = useMemo(
     () =>
-      versions.kind === "ready" ? hydrateCompareFile(baseFile, versions.old, versions.new) : null,
-    [baseFile, versions],
+      versions.kind === "ready" ? hydrateCompareFile(patchFile, versions.old, versions.new) : null,
+    [patchFile, versions],
   );
-  const shownFile = hydration?.kind === "hydrated" ? hydration.fileDiff : baseFile;
+  const shownFile = hydration?.kind === "hydrated" ? hydration.fileDiff : patchFile;
 
   let note: string | null = null;
   if (plan.kind === "patch") {
@@ -203,8 +240,17 @@ function DiffComparePane({
     (versions.kind === "loading" || (changed && !stillChanging));
   // Keyed by path, which a refreshed patch keeps; the patch's own key changes with any file.
   const files = useMemo(
-    () => [{ fileDiff: shownFile, filePath: row.path, fileKey: row.path, collapsed: false }],
-    [row.path, shownFile],
+    () => [
+      {
+        fileDiff: shownFile,
+        filePath: row.path,
+        fileKey: row.path,
+        collapsed: false,
+        // Comments index the default patch's hunks, whatever the context count.
+        commentFileDiff: baseFile,
+      },
+    ],
+    [baseFile, row.path, shownFile],
   );
 
   return (
@@ -217,8 +263,13 @@ function DiffComparePane({
           <span className="shrink-0 text-xs text-muted-foreground" role="status">
             Loading full file…
           </span>
+        ) : lineFilter.lines === "changes" && lineFilter.contextPending ? (
+          <span className="shrink-0 text-xs text-muted-foreground" role="status">
+            Loading changes…
+          </span>
         ) : null}
       </div>
+      {plan.kind === "notice" ? null : <CompareLineControls lineFilter={lineFilter} />}
       {plan.kind === "notice" ? (
         <CompareMessage>{describeCompareNotice(plan.notice)}</CompareMessage>
       ) : stillChanging ? (
@@ -254,13 +305,119 @@ function DiffComparePane({
                 ...options,
                 diffStyle: "split",
                 disableFileHeader: true,
-                expandUnchanged: hydration?.kind === "hydrated",
+                expandUnchanged: lineFilter.lines === "all" && hydration?.kind === "hydrated",
               }}
             />
           </div>
         </>
       )}
     </>
+  );
+}
+
+const UNSUPPORTED_CONTEXT = "Update the server to change context lines.";
+
+function CompareLineControls({ lineFilter }: { readonly lineFilter: CompareLineFilter }) {
+  const reasonId = useId();
+  const unsupported = lineFilter.lines === "changes" && lineFilter.contextSupported === false;
+  return (
+    <div className="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-1 border-b border-border px-3 py-1">
+      <ToggleGroup
+        aria-label="Lines"
+        size="xs"
+        value={[lineFilter.lines]}
+        variant="outline"
+        onValueChange={(value) => {
+          const next = value[0];
+          if ((next === "all" || next === "changes") && next !== lineFilter.lines) {
+            lineFilter.onLinesChange(next);
+          }
+        }}
+      >
+        <Toggle className="px-2 text-xs" value="all">
+          All lines
+        </Toggle>
+        <Toggle className="px-2 text-xs" value="changes">
+          Changes only
+        </Toggle>
+      </ToggleGroup>
+      {lineFilter.lines === "changes" ? (
+        <ContextLinesField
+          disabledReasonId={unsupported ? reasonId : null}
+          value={lineFilter.contextLines}
+          onCommit={lineFilter.onContextLinesChange}
+        />
+      ) : null}
+      {unsupported ? (
+        <span className="text-xs text-muted-foreground" id={reasonId}>
+          {UNSUPPORTED_CONTEXT}
+        </span>
+      ) : null}
+    </div>
+  );
+}
+
+const CONTEXT_COMMIT_DELAY_MS = 300;
+
+/** A whole number from 0 to 99, or null for anything else (empty, negative, too large). */
+export function parseContextLines(text: string): number | null {
+  if (!/^\d{1,2}$/.test(text.trim())) return null;
+  const value = Number(text.trim());
+  return value <= DIFF_CONTEXT_LINES_MAX ? value : null;
+}
+
+/**
+ * The context count. Typing changes only the field; the count commits 300 ms after the last
+ * keystroke, on Enter and on blur, so each committed value asks for one patch.
+ */
+function ContextLinesField({
+  value,
+  disabledReasonId,
+  onCommit,
+}: {
+  readonly value: number;
+  /** The visible reason the field is disabled, by element ID; null when it is enabled. */
+  readonly disabledReasonId: string | null;
+  readonly onCommit: (value: number) => void;
+}) {
+  const [draft, setDraft] = useState(String(value));
+  const [shown, setShown] = useState(value);
+  if (shown !== value) {
+    setShown(value);
+    setDraft(String(value));
+  }
+  const commit = useEffectEvent((text: string) => {
+    const next = parseContextLines(text);
+    if (next !== null && next !== value) onCommit(next);
+  });
+  useEffect(() => {
+    if (draft === String(value)) return;
+    const timer = window.setTimeout(() => commit(draft), CONTEXT_COMMIT_DELAY_MS);
+    return () => window.clearTimeout(timer);
+  }, [draft, value]);
+
+  return (
+    <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
+      Context lines
+      <input
+        aria-describedby={disabledReasonId ?? undefined}
+        className="h-6 w-12 rounded-md border border-input bg-background px-1.5 text-xs text-foreground tabular-nums outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-64"
+        disabled={disabledReasonId !== null}
+        inputMode="numeric"
+        max={DIFF_CONTEXT_LINES_MAX}
+        min={0}
+        type="number"
+        value={draft}
+        onBlur={() => {
+          if (parseContextLines(draft) === null) setDraft(String(value));
+          else commit(draft);
+        }}
+        onChange={(event) => setDraft(event.target.value)}
+        onKeyDown={(event) => {
+          if (event.key === "Enter") commit(draft);
+        }}
+      />
+    </label>
   );
 }
 
