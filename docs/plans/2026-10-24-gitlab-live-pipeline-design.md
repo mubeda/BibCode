@@ -80,7 +80,7 @@ The issue's acceptance criteria that this design owns:
   (`poll.rs:300-309`). The next tick sees an unchanged fingerprint.
 - **Checks read.** `checks()` reads `merge_requests/:iid/pipelines?per_page=1`,
   then one page of 100 jobs (`gitlab/mod.rs:633-673`). The Jobs API returns jobs
-  newest first, with a stage *name* and no position. `grouped_checks` orders
+  newest first, with a stage _name_ and no position. `grouped_checks` orders
   groups by first appearance (`pull_requests/read.rs:111-131`), so the
   Pipelines tab lists the last stage first. Trigger jobs are on a separate
   endpoint and are not shown. The `head_pipeline` selection is defect 5
@@ -271,6 +271,7 @@ from the issue.
 
    The tick that first sees a pipeline leave the active set still runs the
    pipeline read once, so the strip shows the final stages.
+
 6. **Probe every subscribed number; activate at most 3.** The poller probes
    each distinct subscribed number. The first 3 in join order may be active
    or fast; the rest stay idle. No subscribe is refused: a refused subscriber
@@ -309,8 +310,18 @@ All additions are optional, so an older peer on either side still decodes
 
 ```ts
 const PullRequestsPipelineStatus = Schema.Literals([
-  "created", "queued", "running", "waiting", "manual", "scheduled",
-  "canceling", "success", "failed", "canceled", "skipped", "unknown",
+  "created",
+  "queued",
+  "running",
+  "waiting",
+  "manual",
+  "scheduled",
+  "canceling",
+  "success",
+  "failed",
+  "canceled",
+  "skipped",
+  "unknown",
 ]);
 export const PullRequestsPipelineStage = Schema.Struct({
   name: Schema.String,
@@ -318,7 +329,7 @@ export const PullRequestsPipelineStage = Schema.Struct({
   warnings: Schema.Boolean, // GitLab's detailed status is SUCCESS_WITH_WARNINGS
 });
 export const PullRequestsPipeline = Schema.Union([
-  Schema.TaggedStruct("none", {}),   // head_pipeline is null
+  Schema.TaggedStruct("none", {}), // head_pipeline is null
   Schema.TaggedStruct("hidden", {}), // head_pipeline key absent: no pipeline access
   Schema.TaggedStruct("present", {
     id: Schema.Number,
@@ -337,7 +348,7 @@ export const PullRequestsPipeline = Schema.Union([
   }),
 ]);
 export const PullRequestsPipelineCopy = Schema.Struct({
-  revision: Schema.Number,                  // generation taken before the read
+  revision: Schema.Number, // generation taken before the read
   pipeline: PullRequestsPipeline,
   checks: Schema.NullOr(PullRequestsChecks), // job groups, when the read had them
 });
@@ -388,21 +399,22 @@ No new RPC method. No migration: `pipeline` is a new free-text snapshot kind.
   reads see the merge request at slightly different moments, so the copy is
   combined only when they agree:
 
-  | REST `head_pipeline` | GraphQL `headPipeline` | Copy |
-  | --- | --- | --- |
-  | id N | id N | Header from REST, stages and jobs from GraphQL, `isForHead: true` |
-  | id N | `null` | `isForHead: false`; stages from the stored copy if it is for N, otherwise `null`; the number leaves active mode and turns fast |
-  | id N | id M | A race (a push or a same-commit rerun between the reads): no copy is written this tick, and the number stays fast |
-  | `null` | id M | The same race |
-  | `null` | `null` | `none` |
-  | absent | not read | `hidden` |
-  | id N | read failed | Header from REST, stages from the stored copy if it is for N, otherwise `null`; `isForHead: null` |
+  | REST `head_pipeline` | GraphQL `headPipeline` | Copy                                                                                                                           |
+  | -------------------- | ---------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+  | id N                 | id N                   | Header from REST, stages and jobs from GraphQL, `isForHead: true`                                                              |
+  | id N                 | `null`                 | `isForHead: false`; stages from the stored copy if it is for N, otherwise `null`; the number leaves active mode and turns fast |
+  | id N                 | id M                   | A race (a push or a same-commit rerun between the reads): no copy is written this tick, and the number stays fast              |
+  | `null`               | id M                   | The same race                                                                                                                  |
+  | `null`               | `null`                 | `none`                                                                                                                         |
+  | absent               | not read               | `hidden`                                                                                                                       |
+  | id N                 | read failed            | Header from REST, stages from the stored copy if it is for N, otherwise `null`; `isForHead: null`                              |
 
   A same-commit rerun keeps `diff_head_pipeline` non-null, so it shows as a
   race for at most one tick and never as "Older commit". Only the poller can
   defer a write. The unary `get` and `getChecks` must answer, so for them a
   race row behaves like the "read failed" row: the REST header,
   `stages: null` and `isForHead: null`.
+
 - `gitlab/mod.rs`: `detail` joins `PIPELINE_STAGES_QUERY` into its first wave
   and combines it by the same table, with no stored copy; any failure except
   cancellation gives `stages: null`. `probe` returns
@@ -465,12 +477,12 @@ No new RPC method. No migration: `pipeline` is a new free-text snapshot kind.
   `Fenced` or `Failed`. A `Failed` write raises no name and logs one
   `tracing::warn!` with the kind and the error code only.
 
-| Observed this tick | `detail` | `timeline` | `checks` | `pipeline` |
-| --- | --- | --- | --- | --- |
-| `updated_at` or notes change | yes | yes | — | — |
-| `sha`, `state`, `detailed_merge_status`, `merge_when_pipeline_succeeds` | yes | — | — | — |
-| `head_pipeline` id or status change | only on a `ci_must_pass` bucket change (decision 2) | — | yes | when the row is written |
-| Stage, job or warnings change only | — | — | — | yes |
+| Observed this tick                                                      | `detail`                                            | `timeline` | `checks` | `pipeline`              |
+| ----------------------------------------------------------------------- | --------------------------------------------------- | ---------- | -------- | ----------------------- |
+| `updated_at` or notes change                                            | yes                                                 | yes        | —        | —                       |
+| `sha`, `state`, `detailed_merge_status`, `merge_when_pipeline_succeeds` | yes                                                 | —          | —        | —                       |
+| `head_pipeline` id or status change                                     | only on a `ci_must_pass` bucket change (decision 2) | —          | yes      | when the row is written |
+| Stage, job or warnings change only                                      | —                                                   | —          | —        | yes                     |
 
 `commits` and `files` follow `updated_at` and the subscriber's tab, as today.
 `checks` on a status change stays so that an older client still re-reads its
@@ -555,16 +567,16 @@ tab.
 
 ## GitLab version handling
 
-| Host | Change | Live-pipeline behavior |
-| --- | --- | --- |
-| All | `head_pipeline` is "exposed only if the current user can view pipelines" | Absent key is `hidden`; `null` is `none` |
-| All | GraphQL `headPipeline` is the diff-head pipeline | Source of `isForHead`, combined only on matching ids |
-| All | CE never creates `/train` refs; merged results and trains are paid tiers | Kind from `ref`; no version gate |
-| Newer hosts | `canceling` and `waiting_for_callback` statuses (13 in the current API) | Mapped; unknown strings become `unknown` |
-| 16.4 | `DetailedStatus.group` deprecated in favor of `name` | The queries select `name`; a host without it fails the read, which degrades to no strip; REST `detailed_status.group` still gives the header's warnings |
-| 17.7 | Auto-merge for merge trains generally available | "Merge train pipeline" comes from the ref alone |
-| 19.2 | `trigger_jobs` replaces deprecated `bridges` | Not needed: GraphQL stage jobs include trigger jobs; the REST fallback uses defect 5's choice |
-| `read_build` missing | GraphQL `stages` is authorized on `read_build` | `stages: null`; no strip, header still shown |
+| Host                 | Change                                                                   | Live-pipeline behavior                                                                                                                                  |
+| -------------------- | ------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| All                  | `head_pipeline` is "exposed only if the current user can view pipelines" | Absent key is `hidden`; `null` is `none`                                                                                                                |
+| All                  | GraphQL `headPipeline` is the diff-head pipeline                         | Source of `isForHead`, combined only on matching ids                                                                                                    |
+| All                  | CE never creates `/train` refs; merged results and trains are paid tiers | Kind from `ref`; no version gate                                                                                                                        |
+| Newer hosts          | `canceling` and `waiting_for_callback` statuses (13 in the current API)  | Mapped; unknown strings become `unknown`                                                                                                                |
+| 16.4                 | `DetailedStatus.group` deprecated in favor of `name`                     | The queries select `name`; a host without it fails the read, which degrades to no strip; REST `detailed_status.group` still gives the header's warnings |
+| 17.7                 | Auto-merge for merge trains generally available                          | "Merge train pipeline" comes from the ref alone                                                                                                         |
+| 19.2                 | `trigger_jobs` replaces deprecated `bridges`                             | Not needed: GraphQL stage jobs include trigger jobs; the REST fallback uses defect 5's choice                                                           |
+| `read_build` missing | GraphQL `stages` is authorized on `read_build`                           | `stages: null`; no strip, header still shown                                                                                                            |
 
 The other GraphQL fields used carry no Experiment or "Introduced in" notes in
 the current reference. An unknown version attempts the read, and a failure
@@ -576,40 +588,40 @@ fix.
 
 ## Edge cases
 
-| Case | Handling |
-| --- | --- |
-| No pipeline | `none`; readiness copy (defect 2) explains the block |
-| Pipeline being created after a push | `sha` raises `detail`; REST `head_pipeline` keeps the old one until GitLab creates one (`update_head_pipeline`), GraphQL returns `null`, so "Older commit" shows and the number is fast; the new id appears on the next fast tick |
-| Same-commit rerun | The two reads can name different ids for one tick; nothing is written, the number stays fast, and the next tick agrees; never "Older commit" |
-| Push between the REST and GraphQL reads | GraphQL `null` for the REST id: "Older commit", which is now true |
-| Merged-results pipeline | Its `sha` is a merge commit and is not shown; staleness comes from GraphQL, never from `sha` |
-| Branch and MR pipelines coexist | Header and stages follow `head_pipeline` / `headPipeline`, so the tab and the gate agree |
-| No pipeline access | `hidden`; no pipeline read is attempted |
-| Can see pipelines, not jobs | Header only; the pipeline read stops for that id |
-| Blocking manual job | Status `manual`; one final pipeline read, then fast, then idle; a stage shows the manual icon |
-| Trigger and downstream jobs | Listed in their stage; the downstream pipeline is linked |
-| More than 100 jobs in a stage | `truncated` copy in the tab; the stage's warnings still come from GitLab's detailed status |
-| Failed `allow_failure` job | Stage and pipeline `warnings`: "passed with warnings", not red |
-| Transient mergeability | Fast for at most 6 ticks; never rendered as a failure |
-| Pipeline runs for hours | 30 min quiet cap halves the rate |
-| Tab switch | The subscription is re-keyed; the new lease updates the watcher map and inherits the host's backoff; a restarted poller's first tick waits 10 s on Conversation or Pipelines |
-| Hidden document | The stream drops (existing); on return, `readSnapshot` paints the last rows |
-| Two windows, two numbers | Both probed; up to 3 numbers active or fast; the rest idle-probed |
-| Two filters, one number | Each list key's poller probes it; both sets of subscribers get every name through revisions |
-| Logout or sign-in failure during a read | Its writes are fenced; a poller auth failure ends the stream and deletes the host's rows |
-| 429, including a totals read | Host-wide ladder, kept across hand-offs and re-keys |
+| Case                                    | Handling                                                                                                                                                                                                                          |
+| --------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| No pipeline                             | `none`; readiness copy (defect 2) explains the block                                                                                                                                                                              |
+| Pipeline being created after a push     | `sha` raises `detail`; REST `head_pipeline` keeps the old one until GitLab creates one (`update_head_pipeline`), GraphQL returns `null`, so "Older commit" shows and the number is fast; the new id appears on the next fast tick |
+| Same-commit rerun                       | The two reads can name different ids for one tick; nothing is written, the number stays fast, and the next tick agrees; never "Older commit"                                                                                      |
+| Push between the REST and GraphQL reads | GraphQL `null` for the REST id: "Older commit", which is now true                                                                                                                                                                 |
+| Merged-results pipeline                 | Its `sha` is a merge commit and is not shown; staleness comes from GraphQL, never from `sha`                                                                                                                                      |
+| Branch and MR pipelines coexist         | Header and stages follow `head_pipeline` / `headPipeline`, so the tab and the gate agree                                                                                                                                          |
+| No pipeline access                      | `hidden`; no pipeline read is attempted                                                                                                                                                                                           |
+| Can see pipelines, not jobs             | Header only; the pipeline read stops for that id                                                                                                                                                                                  |
+| Blocking manual job                     | Status `manual`; one final pipeline read, then fast, then idle; a stage shows the manual icon                                                                                                                                     |
+| Trigger and downstream jobs             | Listed in their stage; the downstream pipeline is linked                                                                                                                                                                          |
+| More than 100 jobs in a stage           | `truncated` copy in the tab; the stage's warnings still come from GitLab's detailed status                                                                                                                                        |
+| Failed `allow_failure` job              | Stage and pipeline `warnings`: "passed with warnings", not red                                                                                                                                                                    |
+| Transient mergeability                  | Fast for at most 6 ticks; never rendered as a failure                                                                                                                                                                             |
+| Pipeline runs for hours                 | 30 min quiet cap halves the rate                                                                                                                                                                                                  |
+| Tab switch                              | The subscription is re-keyed; the new lease updates the watcher map and inherits the host's backoff; a restarted poller's first tick waits 10 s on Conversation or Pipelines                                                      |
+| Hidden document                         | The stream drops (existing); on return, `readSnapshot` paints the last rows                                                                                                                                                       |
+| Two windows, two numbers                | Both probed; up to 3 numbers active or fast; the rest idle-probed                                                                                                                                                                 |
+| Two filters, one number                 | Each list key's poller probes it; both sets of subscribers get every name through revisions                                                                                                                                       |
+| Logout or sign-in failure during a read | Its writes are fenced; a poller auth failure ends the stream and deletes the host's rows                                                                                                                                          |
+| 429, including a totals read            | Host-wide ladder, kept across hand-offs and re-keys                                                                                                                                                                               |
 
 ## Request budget and rate limits
 
 Per hour, for one open merge request in one list key (derived from source;
 the harness phase below confirms it):
 
-| Mode | List | Totals | Probe | Pipeline read | Total |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Today, any state | 180 | 270 | 180 | — | 630 |
-| Idle | 180 | ≤ 40 | 180 | — | about 400 |
-| Active | 180 | ≤ 40 | 360 | 360 | about 940 |
-| Active, after the 30 min quiet cap | 180 | ≤ 40 | 180 | 180 | about 580 |
+| Mode                               | List | Totals | Probe | Pipeline read |     Total |
+| ---------------------------------- | ---: | -----: | ----: | ------------: | --------: |
+| Today, any state                   |  180 |    270 |   180 |             — |       630 |
+| Idle                               |  180 |   ≤ 40 |   180 |             — | about 400 |
+| Active                             |  180 |   ≤ 40 |   360 |           360 | about 940 |
+| Active, after the 30 min quiet cap |  180 |   ≤ 40 |   180 |           180 | about 580 |
 
 Totals cost three reads per reload: 12 time-based reloads an hour (36) plus
 one reload per list change. The fast state adds at most 3 probes per episode
@@ -620,12 +632,12 @@ readiness changes: about two or three per pipeline lifetime from
 except the rare bucket case (decision 2). The issue's "about 900" counted no
 totals; 940 meets it.
 
-| Environment | Limit | One active | Three active numbers (2,380) |
-| --- | --- | ---: | ---: |
-| Self-managed, default | Authenticated API limit disabled by default | — | — |
-| Self-managed, limit on | 7,200 per 3,600 s per user (default) | 13% | 33% |
-| GitLab.com today | 2,000 per minute per user | under 1% | about 2% |
-| GitLab.com proposed Free (not in effect) | 5,000 per hour per user and per top-level group; 100 per minute burst | 19% | 48% |
+| Environment                              | Limit                                                                 | One active | Three active numbers (2,380) |
+| ---------------------------------------- | --------------------------------------------------------------------- | ---------: | ---------------------------: |
+| Self-managed, default                    | Authenticated API limit disabled by default                           |          — |                            — |
+| Self-managed, limit on                   | 7,200 per 3,600 s per user (default)                                  |        13% |                          33% |
+| GitLab.com today                         | 2,000 per minute per user                                             |   under 1% |                     about 2% |
+| GitLab.com proposed Free (not in effect) | 5,000 per hour per user and per top-level group; 100 per minute burst |        19% |                          48% |
 
 Under the proposed Free limit, web and Git traffic count too, and the group
 limit is shared by everyone in the group. The 3-number activation cap, the
@@ -763,17 +775,17 @@ before approval (Verification).
 
 ## Files to change
 
-| Area | Files |
-| --- | --- |
-| Contracts | `packages/contracts/src/pullRequests.ts`, `pullRequests.test.ts`, regenerated `packages/contracts/fixtures/` |
-| Server model | `apps/server/src/pull_requests/model.rs` |
-| Server reads | `apps/server/src/pull_requests/gitlab/{parse.rs,graphql.rs,mod.rs,detail_tests.rs}`, `pull_requests/host.rs` (budget argument), `pull_requests/cache.rs` (`get_any_age`) |
-| Poller | `apps/server/src/pull_requests/gitlab/{poll.rs,refresh.rs}`, `snapshot_store.rs` (`put` outcome), `pull_requests/mod.rs` (`read_snapshot`, `subscribe` error handling, shared fenced write path, tripwire fields) |
-| Stream | `apps/server/src/production/pull_requests_rpc.rs` (`forward_changed_to_stream` reports delivery) |
-| Harness | `apps/server/tests/pull_requests_gitlab_load_harness.rs`, `pull_requests_detail_reads.rs` |
-| Web | `apps/web/src/components/pullRequests/detail/{PullRequestsDetailView.tsx,PullRequestsMergeBox.tsx,PullRequestsChecks.tsx,PullRequestsConversation.tsx,pullRequestsDetail.logic.ts,snapshotDisplay.logic.ts}`, new `PullRequestsPipelineSummary.tsx` and tests |
-| Living docs | `docs/architecture/rpc-and-orchestration.md`, `docs/integrations/source-control-providers.md`, `docs/architecture/overview.md`, `docs/user/workspace-ui.md`, the module doc in `poll.rs` |
-| Runbook | `docs/testing/cross-platform-validation.md` (Pull Requests section): add the live-pipeline check |
+| Area         | Files                                                                                                                                                                                                                                                         |
+| ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Contracts    | `packages/contracts/src/pullRequests.ts`, `pullRequests.test.ts`, regenerated `packages/contracts/fixtures/`                                                                                                                                                  |
+| Server model | `apps/server/src/pull_requests/model.rs`                                                                                                                                                                                                                      |
+| Server reads | `apps/server/src/pull_requests/gitlab/{parse.rs,graphql.rs,mod.rs,detail_tests.rs}`, `pull_requests/host.rs` (budget argument), `pull_requests/cache.rs` (`get_any_age`)                                                                                      |
+| Poller       | `apps/server/src/pull_requests/gitlab/{poll.rs,refresh.rs}`, `snapshot_store.rs` (`put` outcome), `pull_requests/mod.rs` (`read_snapshot`, `subscribe` error handling, shared fenced write path, tripwire fields)                                             |
+| Stream       | `apps/server/src/production/pull_requests_rpc.rs` (`forward_changed_to_stream` reports delivery)                                                                                                                                                              |
+| Harness      | `apps/server/tests/pull_requests_gitlab_load_harness.rs`, `pull_requests_detail_reads.rs`                                                                                                                                                                     |
+| Web          | `apps/web/src/components/pullRequests/detail/{PullRequestsDetailView.tsx,PullRequestsMergeBox.tsx,PullRequestsChecks.tsx,PullRequestsConversation.tsx,pullRequestsDetail.logic.ts,snapshotDisplay.logic.ts}`, new `PullRequestsPipelineSummary.tsx` and tests |
+| Living docs  | `docs/architecture/rpc-and-orchestration.md`, `docs/integrations/source-control-providers.md`, `docs/architecture/overview.md`, `docs/user/workspace-ui.md`, the module doc in `poll.rs`                                                                      |
+| Runbook      | `docs/testing/cross-platform-validation.md` (Pull Requests section): add the live-pipeline check                                                                                                                                                              |
 
 No new module file, so `SOURCES` is unchanged; no new dependency.
 
@@ -926,17 +938,17 @@ then update the living docs in the same change.
 Codex reviewed the first draft. Each finding was checked against the code at
 4e023ac5ff before it was accepted.
 
-| # | Finding | Disposition |
-| --- | --- | --- |
-| 1 | An older live response can overwrite a newer pipeline snapshot through `shownCopy` | Accepted. Confirmed at `snapshotDisplay.logic.ts:41-49`. Every pipeline copy now carries the read's `revision`, and the client shows the highest across sources (Decision 3, Client); a test covers both completion orders |
-| 2 | Pollers with different list keys consume each other's change detection | Accepted. Confirmed: the probe row is per number, the broadcast per list key (`poll.rs:397-406`). Names now come from per-name revisions in the probe row, and each subscriber tracks what it was sent (Delivery), which also recovers dropped and lagged events. A registry-wide broadcast was considered (Alternative H) |
-| 3 | Rows survive logout and poller auth failures | Accepted. Confirmed at `poll.rs:164-170` and `mod.rs:292-305`, `:975-1009`. Auth failures end the poller and run `invalidate_failed_context`, and the host fence moves into the shared write path, covering `store_read` too |
-| 4 | Two rows with equal generations are not atomic, and write outcomes are invisible | Accepted. Confirmed at `snapshot_store.rs:87-104` and `poll.rs:203-231`. The poller writes one `pipeline` row with header, stages and jobs; `put` reports its outcome; a failed write raises nothing |
-| 5 | REST and GraphQL can describe different pipelines | Accepted. Confirmed from `diff_head_pipeline`. Copies combine only on matching ids, with a table for `null` and mismatches; a same-commit rerun never shows "Older commit" |
-| 6 | The stage query cannot supply "passed with warnings" | Accepted. `StageType` has `detailedStatus`, not a warnings field. Both queries select `detailedStatus { name }` (`SUCCESS_WITH_WARNINGS`; `group` is deprecated since 16.4), REST `detailed_status.group` covers the header, and both feed the fingerprint |
-| 7 | A totals 429 is invisible, and backoff resets on hand-off | Accepted. Confirmed at `gitlab/mod.rs:208-225` and `poll.rs:418-419`. `counts()` propagates errors, and the ladder lives in the `Registry` per host |
-| 8 | The budget and detail invalidation fail the issue's acceptance criterion | Accepted. Tab totals are reused while polling (Decision 7, about 940 an hour), pipeline status changes raise `detail` only on a rare bucket change (Decision 2), and the harness answers events as the real client does. Counting the fallback timer's reads (one eight-read `get` plus a tab read every 20 s) gives about 1,600 an hour, more than an idle probe, so no subscribe is refused (Decision 6) |
-| 9 | No fast mode for pipeline creation or transient mergeability | Accepted. A bounded probe-only fast state covers a push, transient `detailed_merge_status`, a just-finished pipeline and an id race, and the first tick waits 10 s on Conversation or Pipelines. "Creating pipeline…" copy is not adopted, because REST cannot know it |
-| 10 | GraphQL reads take `Budget::Mutation`, not `Budget::Read` | Accepted. Confirmed at `host.rs:260-286`. `glab_api_with_body` takes a budget from `budget_for(operation)` |
-| 11 | `readSnapshot` is not local and short | Accepted. Confirmed at `context.rs:360-370`. The claim is corrected and the `git` spawn is counted in the local cost. It stays out of `is_long_running`, because on the polled path only that spawn runs, and listing it would hide a slow database read |
-| — | Simpler alternative: one revisioned payload, totals reuse, detail only on metadata or readiness changes | Adopted, except that readiness copy stays in the server's `detail` (defect 2) rather than moving to the probe, so that the five-way copy is not duplicated in the client. That is what the decision 2 exception keeps correct |
+| #   | Finding                                                                                                 | Disposition                                                                                                                                                                                                                                                                                                                                                                                                |
+| --- | ------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | An older live response can overwrite a newer pipeline snapshot through `shownCopy`                      | Accepted. Confirmed at `snapshotDisplay.logic.ts:41-49`. Every pipeline copy now carries the read's `revision`, and the client shows the highest across sources (Decision 3, Client); a test covers both completion orders                                                                                                                                                                                 |
+| 2   | Pollers with different list keys consume each other's change detection                                  | Accepted. Confirmed: the probe row is per number, the broadcast per list key (`poll.rs:397-406`). Names now come from per-name revisions in the probe row, and each subscriber tracks what it was sent (Delivery), which also recovers dropped and lagged events. A registry-wide broadcast was considered (Alternative H)                                                                                 |
+| 3   | Rows survive logout and poller auth failures                                                            | Accepted. Confirmed at `poll.rs:164-170` and `mod.rs:292-305`, `:975-1009`. Auth failures end the poller and run `invalidate_failed_context`, and the host fence moves into the shared write path, covering `store_read` too                                                                                                                                                                               |
+| 4   | Two rows with equal generations are not atomic, and write outcomes are invisible                        | Accepted. Confirmed at `snapshot_store.rs:87-104` and `poll.rs:203-231`. The poller writes one `pipeline` row with header, stages and jobs; `put` reports its outcome; a failed write raises nothing                                                                                                                                                                                                       |
+| 5   | REST and GraphQL can describe different pipelines                                                       | Accepted. Confirmed from `diff_head_pipeline`. Copies combine only on matching ids, with a table for `null` and mismatches; a same-commit rerun never shows "Older commit"                                                                                                                                                                                                                                 |
+| 6   | The stage query cannot supply "passed with warnings"                                                    | Accepted. `StageType` has `detailedStatus`, not a warnings field. Both queries select `detailedStatus { name }` (`SUCCESS_WITH_WARNINGS`; `group` is deprecated since 16.4), REST `detailed_status.group` covers the header, and both feed the fingerprint                                                                                                                                                 |
+| 7   | A totals 429 is invisible, and backoff resets on hand-off                                               | Accepted. Confirmed at `gitlab/mod.rs:208-225` and `poll.rs:418-419`. `counts()` propagates errors, and the ladder lives in the `Registry` per host                                                                                                                                                                                                                                                        |
+| 8   | The budget and detail invalidation fail the issue's acceptance criterion                                | Accepted. Tab totals are reused while polling (Decision 7, about 940 an hour), pipeline status changes raise `detail` only on a rare bucket change (Decision 2), and the harness answers events as the real client does. Counting the fallback timer's reads (one eight-read `get` plus a tab read every 20 s) gives about 1,600 an hour, more than an idle probe, so no subscribe is refused (Decision 6) |
+| 9   | No fast mode for pipeline creation or transient mergeability                                            | Accepted. A bounded probe-only fast state covers a push, transient `detailed_merge_status`, a just-finished pipeline and an id race, and the first tick waits 10 s on Conversation or Pipelines. "Creating pipeline…" copy is not adopted, because REST cannot know it                                                                                                                                     |
+| 10  | GraphQL reads take `Budget::Mutation`, not `Budget::Read`                                               | Accepted. Confirmed at `host.rs:260-286`. `glab_api_with_body` takes a budget from `budget_for(operation)`                                                                                                                                                                                                                                                                                                 |
+| 11  | `readSnapshot` is not local and short                                                                   | Accepted. Confirmed at `context.rs:360-370`. The claim is corrected and the `git` spawn is counted in the local cost. It stays out of `is_long_running`, because on the polled path only that spawn runs, and listing it would hide a slow database read                                                                                                                                                   |
+| —   | Simpler alternative: one revisioned payload, totals reuse, detail only on metadata or readiness changes | Adopted, except that readiness copy stays in the server's `detail` (defect 2) rather than moving to the probe, so that the five-way copy is not duplicated in the client. That is what the decision 2 exception keeps correct                                                                                                                                                                              |
