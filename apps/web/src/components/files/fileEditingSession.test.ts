@@ -171,7 +171,7 @@ describe("FileEditingSession", () => {
     });
     await vi.advanceTimersByTimeAsync(500);
 
-    expect(persist).toHaveBeenCalledWith("src/new.ts", "renamed contents");
+    expect(persist).toHaveBeenCalledWith("src/new.ts", "renamed contents", null);
   });
 
   it("invalidates existing source history without eagerly constructing a replacement", () => {
@@ -278,7 +278,7 @@ describe("FileEditingSession", () => {
     expect(persist).not.toHaveBeenCalled();
     expect(session.getSnapshot().save).toMatchObject({ phase: "pending", canSave: true });
     await expect(session.flush()).resolves.toBe("saved");
-    expect(persist).toHaveBeenCalledWith("src/app.ts", "active draft");
+    expect(persist).toHaveBeenCalledWith("src/app.ts", "active draft", null);
   });
 
   it("delegates redo, flush, and settle and stops notifications after unsubscribe/dispose", async () => {
@@ -303,12 +303,12 @@ describe("FileEditingSession", () => {
       contents: "flush me",
     });
     await expect(session.flush()).resolves.toBe("saved");
-    expect(persist).toHaveBeenCalledWith("src/app.ts", "flush me");
+    expect(persist).toHaveBeenCalledWith("src/app.ts", "flush me", null);
     (editor.options["onChange"] as (file: { contents: string }) => void)({
       contents: "settle me",
     });
     await expect(session.settle()).resolves.toBe("saved");
-    expect(persist).toHaveBeenLastCalledWith("src/app.ts", "settle me");
+    expect(persist).toHaveBeenLastCalledWith("src/app.ts", "settle me", null);
 
     unsubscribe();
     const notificationsBeforeDispose = listener.mock.calls.length;
@@ -365,7 +365,7 @@ describe("FileEditingSession", () => {
     expect(reopened.editor).toBe(editor);
     expect(createSession).toHaveBeenCalledOnce();
     await expect(reopened.flush()).resolves.toBe("failed");
-    expect(persist).toHaveBeenLastCalledWith("src/app.ts", "retryable contents");
+    expect(persist).toHaveBeenLastCalledWith("src/app.ts", "retryable contents", null);
     expect(reopened.getSnapshot().save).toMatchObject({
       phase: "failed",
       canSave: true,
@@ -442,7 +442,7 @@ describe("FileEditingSession", () => {
     await vi.advanceTimersByTimeAsync(500);
 
     expect(handler).toHaveBeenCalledOnce();
-    expect(persist).toHaveBeenCalledWith("src/app.ts", "without handler");
+    expect(persist).toHaveBeenCalledWith("src/app.ts", "without handler", null);
   });
 
   it("holds edits during a delayed rename and saves them to the renamed path after release", async () => {
@@ -486,7 +486,7 @@ describe("FileEditingSession", () => {
     expect(persist).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(1);
     expect(persist).toHaveBeenCalledOnce();
-    expect(persist).toHaveBeenCalledWith("src/new.ts", "edited during rename");
+    expect(persist).toHaveBeenCalledWith("src/new.ts", "edited during rename", null);
   });
 
   it("releases edits to the original path after a delayed rename fails", async () => {
@@ -524,7 +524,7 @@ describe("FileEditingSession", () => {
     command.resolve();
     await mutation;
     await vi.advanceTimersByTimeAsync(500);
-    expect(persist).toHaveBeenCalledWith("src/old.ts", "edited during failed rename");
+    expect(persist).toHaveBeenCalledWith("src/old.ts", "edited during failed rename", null);
   });
 
   it("discards destination edits after delayed rename success and contains cleanup failure", async () => {
@@ -573,7 +573,7 @@ describe("FileEditingSession", () => {
       await vi.advanceTimersByTimeAsync(500);
 
       expect(persist).toHaveBeenCalledOnce();
-      expect(persist).toHaveBeenCalledWith("src/new.ts", "source edit");
+      expect(persist).toHaveBeenCalledWith("src/new.ts", "source edit", null);
       expect(destinationEditor.cleanUp).toHaveBeenCalledOnce();
       expect(registry.get("src/new.ts")).toBe(source);
       expect(reportError).toHaveBeenCalledWith(
@@ -624,8 +624,8 @@ describe("FileEditingSession", () => {
     await vi.advanceTimersByTimeAsync(500);
 
     expect(persist.mock.calls).toEqual([
-      ["src/old.ts", "source edit"],
-      ["src/new.ts", "destination edit"],
+      ["src/old.ts", "source edit", null],
+      ["src/new.ts", "destination edit", null],
     ]);
     expect(registry.get("src/old.ts")).toBe(source);
     expect(registry.get("src/new.ts")).toBe(destination);
@@ -670,8 +670,8 @@ describe("FileEditingSession", () => {
     await vi.advanceTimersByTimeAsync(500);
 
     expect(persist.mock.calls).toEqual([
-      ["src/old.ts", "source edit"],
-      ["src/new.ts", "destination edit"],
+      ["src/old.ts", "source edit", null],
+      ["src/new.ts", "destination edit", null],
     ]);
     expect(registry.get("src/old.ts")).toBe(source);
     expect(registry.get("src/new.ts")).toBe(destination);
@@ -751,7 +751,7 @@ describe("FileEditingSession", () => {
     await vi.advanceTimersByTimeAsync(500);
 
     expect(persist).toHaveBeenCalledOnce();
-    expect(persist).toHaveBeenCalledWith("docs/readme.md", "unrelated");
+    expect(persist).toHaveBeenCalledWith("docs/readme.md", "unrelated", null);
     lease!.release();
   });
 });

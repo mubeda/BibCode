@@ -55,6 +55,8 @@ import {
   normalizeFileCommentRange,
   remapFileCommentAnnotations,
 } from "./fileCommentAnnotations";
+import { FileDiskConflictBar, fileDiskConflictSaveReason } from "./FileDiskConflictBar";
+import { FileDiskWatcher } from "./fileDiskWatcher";
 import { installFileEditorDismissal } from "./fileEditorDismissal";
 import { FileEditorToolbar } from "./FileEditorToolbar";
 import { FileEditingSession, type FileEditingSessionSnapshot } from "./fileEditingSession";
@@ -64,8 +66,10 @@ import { projectFileCacheKey } from "./fileContentRevision";
 import { fileBreadcrumbs } from "./filePath";
 import { isMarkdownPreviewFile, setMarkdownTaskChecked } from "./filePreviewMode";
 import {
+  clearProjectFileQueryData,
   confirmProjectFileQueryData,
   getOptimisticProjectFileQueryData,
+  rereadProjectFile,
   setProjectFileQueryData,
   useProjectFileQuery,
 } from "./projectFilesQueryState";
@@ -83,8 +87,12 @@ interface FilePreviewPanelProps {
   revealRequestId: number;
   onOpenFile: (relativePath: string) => void;
   onPendingChange: (relativePath: string, pending: boolean) => void;
+  /** A file's edits conflict with a newer state on disk, or no longer do. */
+  onConflictChange?: (relativePath: string, conflicted: boolean) => void;
   editingSessions: FileEditingSessionRegistry<FileEditingSession<FileCommentAnnotationGroup>>;
   workspaceUnavailable?: string | null;
+  /** Changes when the thread's turn ends, which often means its agent edited files. */
+  diskCheckSignal?: string | null;
 }
 
 const FILE_EXPLORER_STORAGE_KEY = "bibcode.fileExplorerOpen";
@@ -94,6 +102,8 @@ const UNAVAILABLE_SESSION_SNAPSHOT: FileEditingSessionSnapshot = {
   save: { phase: "clean", canSave: false, confirmedRevision: 0 },
   canUndo: false,
   canRedo: false,
+  conflict: null,
+  deletedOnDisk: false,
 };
 
 const subscribeUnavailable = (): (() => void) => () => {};
@@ -282,6 +292,7 @@ function useFileEditingSession({
   relativePath,
   file,
   onPendingChange,
+  onConflictChange,
   enabled,
 }: {
   editingSessions: FilePreviewPanelProps["editingSessions"];
@@ -290,11 +301,14 @@ function useFileEditingSession({
   relativePath: string | null;
   file: ReturnType<typeof useProjectFileQuery>;
   onPendingChange: FilePreviewPanelProps["onPendingChange"];
+  onConflictChange: FilePreviewPanelProps["onConflictChange"];
   enabled: boolean;
 }): FileEditingSession<FileCommentAnnotationGroup> | null {
   const writeFile = useAtomCommand(projectEnvironment.writeFile);
+  const writeFileIfUnchanged = useAtomCommand(projectEnvironment.writeFileIfUnchanged);
   return useMemo(() => {
     if (!enabled || !relativePath || !file.data || file.data.truncated) return null;
+    const base = { version: file.data.version, contents: file.data.contents };
     return editingSessions.getOrCreate(
       relativePath,
       () =>
@@ -302,16 +316,21 @@ function useFileEditingSession({
           cwd,
           relativePath,
           debounceMs: FILE_SAVE_DEBOUNCE_MS,
-          persist: (savePath, contents) =>
-            writeFile({
-              environmentId,
-              input: { cwd, relativePath: savePath, contents },
-            }),
+          base,
+          // A server that returned no version has no guarded write either: save as before.
+          persist: (savePath, contents, precondition) =>
+            precondition === null
+              ? writeFile({ environmentId, input: { cwd, relativePath: savePath, contents } })
+              : writeFileIfUnchanged({
+                  environmentId,
+                  input: { cwd, relativePath: savePath, contents, precondition },
+                }),
           onPendingChange: (savePath, pending) => onPendingChange(savePath, pending),
-          onConfirmed: (savePath, contents) => {
-            setProjectFileQueryData(environmentId, cwd, savePath, contents);
+          onConfirmed: (savePath, contents, version) => {
+            setProjectFileQueryData(environmentId, cwd, savePath, contents, version);
             confirmProjectFileQueryData(environmentId, cwd, savePath, contents);
           },
+          onConflictChange: (savePath, conflicted) => onConflictChange?.(savePath, conflicted),
         }),
     );
   }, [
@@ -320,10 +339,49 @@ function useFileEditingSession({
     enabled,
     environmentId,
     file.data,
+    onConflictChange,
     onPendingChange,
     relativePath,
     writeFile,
+    writeFileIfUnchanged,
   ]);
+}
+
+/**
+ * Watches the shown file's disk version while it is shown: a clean file reloads, an edited one
+ * shows the conflict bar. Only the visible session is watched; a background one meets the disk
+ * at its next save, which the server refuses if the file changed.
+ */
+function useFileDiskWatch({
+  session,
+  environmentId,
+  cwd,
+  diskCheckSignal,
+}: {
+  session: FileEditingSession<FileCommentAnnotationGroup> | null;
+  environmentId: EnvironmentId;
+  cwd: string;
+  diskCheckSignal: string | null;
+}): void {
+  const getFileVersion = useAtomCommand(projectEnvironment.getFileVersion, {
+    reportFailure: false,
+  });
+  useEffect(() => {
+    if (!session?.watchesDisk) return;
+    const watcher = new FileDiskWatcher({
+      session,
+      getVersion: async (relativePath) => {
+        const result = await getFileVersion({ environmentId, input: { cwd, relativePath } });
+        return result._tag === "Success" ? result.value : null;
+      },
+      readFile: (relativePath) => rereadProjectFile(environmentId, cwd, relativePath),
+    });
+    watcher.start();
+    return () => watcher.dispose();
+  }, [cwd, environmentId, getFileVersion, session]);
+  useEffect(() => {
+    if (diskCheckSignal !== null) session?.requestDiskCheck();
+  }, [diskCheckSignal, session]);
 }
 
 /**
@@ -377,6 +435,20 @@ function EditableFileSurface({
   const surfaceRef = useRef<HTMLDivElement>(null);
   const selectionFrameRef = useRef<number | null>(null);
   useFileSaveShortcut(surfaceRef, session);
+  useEffect(() => {
+    const surface = surfaceRef.current;
+    if (!surface) return;
+    // Composition events cross Pierre's shadow root; a disk reload waits for the IME to finish.
+    const start = () => session.setComposing(true);
+    const end = () => session.setComposing(false);
+    surface.addEventListener("compositionstart", start);
+    surface.addEventListener("compositionend", end);
+    return () => {
+      surface.removeEventListener("compositionstart", start);
+      surface.removeEventListener("compositionend", end);
+      session.setComposing(false);
+    };
+  }, [session]);
   useEffect(() => {
     session.setEditorChangeHandler((nextFile, nextLineAnnotations) => {
       if (!nextLineAnnotations) return;
@@ -656,8 +728,10 @@ export default function FilePreviewPanel({
   revealRequestId,
   onOpenFile,
   onPendingChange,
+  onConflictChange,
   editingSessions,
   workspaceUnavailable = null,
+  diskCheckSignal = null,
 }: FilePreviewPanelProps) {
   const { resolvedTheme } = useTheme();
   const wordWrap = useClientSettings((settings) => settings.wordWrap);
@@ -677,8 +751,10 @@ export default function FilePreviewPanel({
     relativePath,
     file,
     onPendingChange,
+    onConflictChange,
     enabled: workspaceUnavailable === null,
   });
+  useFileDiskWatch({ session, environmentId, cwd, diskCheckSignal });
   const [explorerOpen, setExplorerOpen] = useState(initialExplorerOpen);
   const [markdownSourceView, setMarkdownSourceView] = useState<{
     path: string | null;
@@ -697,6 +773,8 @@ export default function FilePreviewPanel({
     session?.getSnapshot ?? readUnavailable,
     session?.getSnapshot ?? readUnavailable,
   );
+  const diskConflict = sessionSnapshot.conflict;
+  const deletedOnDisk = sessionSnapshot.deletedOnDisk;
   const canOpenInBrowser =
     relativePath !== null && canPreviewAnyUrlInRuntime() && isBrowserPreviewFile(relativePath);
   const absolutePath = relativePath ? resolvePathLinkTarget(relativePath, cwd) : null;
@@ -841,13 +919,14 @@ export default function FilePreviewPanel({
           savePhase={sessionSnapshot.save.phase}
           confirmedRevision={sessionSnapshot.save.confirmedRevision}
           canSave={sessionSnapshot.save.canSave}
-          canUndo={!renderMarkdown && sessionSnapshot.canUndo}
-          canRedo={!renderMarkdown && sessionSnapshot.canRedo}
+          canUndo={!renderMarkdown && !deletedOnDisk && sessionSnapshot.canUndo}
+          canRedo={!renderMarkdown && !deletedOnDisk && sessionSnapshot.canRedo}
           cleanStatus={
             file.data?.truncated || (file.error && file.data === null)
               ? "Editing unavailable"
               : workspaceUnavailable
           }
+          saveBlockedReason={diskConflict ? fileDiskConflictSaveReason(diskConflict) : null}
           markdownView={
             isMarkdown
               ? {
@@ -868,6 +947,19 @@ export default function FilePreviewPanel({
           onRedo={() => session?.redo()}
         />
       ) : null}
+      {session && diskConflict ? (
+        <FileDiskConflictBar
+          conflict={diskConflict}
+          confirmReload={renderMarkdown || diskConflict.reason === "deleted"}
+          onReload={() => {
+            // A task ticked during the conflict left an overlay the views would prefer over the
+            // disk text the conflict's read put in the query.
+            clearProjectFileQueryData(environmentId, cwd, session.relativePath);
+            session.reloadFromDisk();
+          }}
+          onOverwrite={() => session.overwriteDisk()}
+        />
+      ) : null}
       {relativePath && file.data?.truncated ? (
         <div className="shrink-0 border-b border-amber-500/20 bg-amber-500/8 px-3 py-1.5 text-xs text-amber-700 dark:text-amber-300">
           Preview limited to the first 1 MB of a {file.data.byteLength.toLocaleString()} byte file.
@@ -880,7 +972,14 @@ export default function FilePreviewPanel({
             relativePath ? "flex" : "hidden",
           )}
         >
-          {relativePath && file.error && file.data === null ? (
+          {relativePath && deletedOnDisk ? (
+            <div
+              className="flex min-h-0 flex-1 items-center justify-center px-6 text-center text-xs leading-relaxed text-muted-foreground"
+              data-file-deleted-on-disk
+            >
+              Deleted on disk. It reopens here if the file comes back.
+            </div>
+          ) : relativePath && file.error && file.data === null ? (
             <div className="flex min-h-0 flex-1 items-center justify-center px-6 text-center text-xs leading-relaxed text-destructive">
               {file.error}
             </div>

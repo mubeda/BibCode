@@ -77,6 +77,7 @@ import {
   confirmProjectFileQueryData,
   getOptimisticProjectFileQueryData,
   getProjectFileQueryAtom,
+  rereadProjectFile,
   resolveProjectFileQueryData,
   setProjectFileQueryData,
 } from "./projectFilesQueryState";
@@ -139,5 +140,36 @@ describe("confirmProjectFileQueryData", () => {
     );
     expect(queryContents()).toBe("- [ ] first\n- [ ] typed\n");
     expect(panelContents()).toBe("- [ ] first\n- [ ] typed\n");
+  });
+});
+
+describe("rereadProjectFile", () => {
+  const path = "NOTES.md";
+  const contentsOf = (data: ProjectReadFileResult | null | undefined) => data?.contents ?? null;
+
+  afterEach(() => clearProjectFileQueryData(environmentId, "/repo", path));
+
+  it("reads past a fresh cached read and a lingering overlay, so every view shows the disk", async () => {
+    server.disk = "mine\n";
+    const queryAtom = getProjectFileQueryAtom(environmentId, "/repo", path);
+    const unmount = appAtomRegistry.mount(queryAtom);
+    const cached = () =>
+      Option.getOrNull(
+        AsyncResult.value(appAtomRegistry.get(queryAtom)),
+      ) as ProjectReadFileResult | null;
+    await vi.waitFor(() => expect(contentsOf(cached())).toBe("mine\n"));
+    const readsBefore = server.reads;
+    setProjectFileQueryData(environmentId, "/repo", path, "mine\n", "v-mine");
+    server.disk = "agent\n";
+
+    const read = await rereadProjectFile(environmentId, "/repo", path);
+
+    expect(read?.contents).toBe("agent\n");
+    expect(server.reads).toBe(readsBefore + 1);
+    expect(getOptimisticProjectFileQueryData(environmentId, "/repo", path)).toBeNull();
+    expect(contentsOf(resolveProjectFileQueryData(environmentId, "/repo", path, cached()))).toBe(
+      "agent\n",
+    );
+    unmount();
   });
 });

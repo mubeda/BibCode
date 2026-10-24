@@ -51,6 +51,22 @@ describe("project files queries", () => {
     ).toBe(true);
   });
 
+  it("carries the version a guarded save committed in the optimistic file", () => {
+    setProjectFileQueryData(environmentId, "/repo", "convex.json", "{}", "v-saved");
+    expect(getOptimisticProjectFileQueryData(environmentId, "/repo", "convex.json")).toEqual({
+      relativePath: "convex.json",
+      contents: "{}",
+      byteLength: 2,
+      truncated: false,
+      version: "v-saved",
+    });
+
+    setProjectFileQueryData(environmentId, "/repo", "convex.json", "{}");
+    expect(
+      getOptimisticProjectFileQueryData(environmentId, "/repo", "convex.json"),
+    ).not.toHaveProperty("version");
+  });
+
   it("builds entry and file queries and resolves missing paths", () => {
     expect(getProjectEntriesQueryAtom(environmentId, "/repo")).toBeDefined();
     expect(getProjectFileQueryAtom(environmentId, "/repo", "convex.json")).toBeDefined();
