@@ -265,6 +265,15 @@ update with the tool's input, not one per fragment, and the tool's completion
 carries the same complete input. Versions before 0.11.0 recorded an update for
 every fragment; threads keep those activities and still load them.
 
+The tool's result, such as a command's output or a file it read, is recorded
+on the same update and completion. A result whose JSON is larger than 16 KiB is
+recorded as a preview: the first 16 KiB of its text, followed by
+`[Tool result truncated by BiBCode]`. Images and other parts of such a result
+that are not text are left out. A thread's records are replayed to every
+client that opens it, so a command that printed megabytes is not sent with
+every replay; the full result stays in Claude's own session transcript. Codex
+and Cursor already leave command output off their records.
+
 ## Background work and idle suspension
 
 BiBCode suspends an idle chat session 60 seconds after its turn ends and
