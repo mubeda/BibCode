@@ -904,6 +904,41 @@ describe("ChatMarkdown", () => {
     });
   });
 
+  describe("stable components", () => {
+    it("keeps rendered blocks and their state across a theme switch", async () => {
+      writeThemePreference("light");
+      const ChatMarkdown = ChatMarkdownComponent!;
+      const text = "```ts\nconst a = 1;\n```\n\n- [ ] task\n\n[link](https://example.com)";
+      const container = document.createElement("div");
+      document.body.append(container);
+      const root = createRoot(container);
+      mountedTrees.push({ container, root });
+      await act(async () => root.render(<ChatMarkdown text={text} cwd={undefined} />));
+      const block = container.querySelector(".chat-markdown-codeblock");
+      const wrap = () =>
+        container.querySelector<HTMLElement>(".chat-markdown-codeblock button[aria-pressed]");
+      const wrappedBefore = wrap()?.getAttribute("aria-pressed");
+      await click(wrap()!);
+      const listItem = container.querySelector("li");
+      const link = container.querySelector("a");
+
+      writeThemePreference("dark");
+      // A changed prop re-renders the memoized component, which then reads the new theme.
+      await act(async () =>
+        root.render(<ChatMarkdown text={text} cwd={undefined} className="themed" />),
+      );
+
+      for (let attempt = 0; !container.innerHTML.includes("pierre-dark"); attempt++) {
+        if (attempt > 100) throw new Error("the block was never highlighted in the dark theme");
+        await act(async () => new Promise((resolve) => setTimeout(resolve, 20)));
+      }
+      expect(container.querySelector(".chat-markdown-codeblock")).toBe(block);
+      expect(wrap()?.getAttribute("aria-pressed")).not.toBe(wrappedBefore);
+      expect(container.querySelector("li")).toBe(listItem);
+      expect(container.querySelector("a")).toBe(link);
+    });
+  });
+
   describe("streaming replies", () => {
     const STREAMED_LANGUAGES = ["ts", "py", "js", "sh"] as const;
 

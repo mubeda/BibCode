@@ -2745,13 +2745,15 @@ highlighter. Its render cost depends on whether the message is streaming:
   unchanged. `chat/HighlightedCodeLines.tsx` renders one memoized element per
   line, so completed lines keep their DOM. A block that streamed keeps this
   renderer when the reply finishes and stores its HTML in the cache.
-- **Stable components.** The Markdown components read the values that change
-  with every delta (the text, whether it streams, file-link metadata) from a
-  context rather than closing over them, so they keep their identity while a
-  reply streams. React then updates rendered blocks in place, and their state,
-  such as a block's line-wrap toggle or an open details block, survives the
-  next delta. A details block whose `open` attribute is edited starts over
-  from it. A theme change rebuilds the components and highlights again.
+- **Stable components.** The Markdown components are defined once, at module
+  scope, and read every value that can change (the text, whether it streams,
+  the theme, file-link metadata, the environment, thread, skills and
+  handlers) from one context rather than closing over them, so they keep
+  their identity for the life of the page. React then updates rendered blocks
+  in place, and their state, such as a block's line-wrap toggle or an open
+  details block, survives the next delta and a theme switch. A details block
+  whose `open` attribute is edited starts over from it. A theme switch
+  highlights code blocks again in the new theme.
 
 The streamed result equals a full parse and a full highlight of the same text.
 The unit tests compare every streamed prefix with one.
