@@ -2531,6 +2531,8 @@ fn owned_rpc_inventory_matches_task_six_contract_methods() {
             "assets.createUrl",
             "review.getDiffPreview",
             "review.readFileVersion",
+            "review.listDiffTools",
+            "review.openDiffTool",
         ]
     );
 }

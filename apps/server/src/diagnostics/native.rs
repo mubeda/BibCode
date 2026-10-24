@@ -23,6 +23,9 @@ pub struct NativeProcessSampler {
 pub(crate) struct RuntimeProcessOwnership {
     roots: Vec<ProcessIdentity>,
     captured: Vec<ProcessIdentity>,
+    /// Processes shutdown leaves running, with their descendants: never roots, and spared by
+    /// a standalone server's cleanup of its own descendants.
+    survivors: Vec<ProcessIdentity>,
 }
 
 impl RuntimeProcessOwnership {
@@ -30,12 +33,27 @@ impl RuntimeProcessOwnership {
         Self {
             roots,
             captured: Vec::new(),
+            survivors: Vec::new(),
         }
+    }
+
+    #[must_use]
+    pub(crate) fn with_survivors(mut self, survivors: Vec<ProcessIdentity>) -> Self {
+        self.survivors = survivors;
+        self
+    }
+
+    pub(crate) fn survivors(&self) -> &[ProcessIdentity] {
+        &self.survivors
     }
 
     fn capture(rows: &[ProcessRow], roots: Vec<ProcessIdentity>) -> Self {
         let captured = runtime_owned_process_identities(rows, &roots);
-        Self { roots, captured }
+        Self {
+            roots,
+            captured,
+            survivors: Vec::new(),
+        }
     }
 }
 
@@ -130,32 +148,48 @@ impl NativeProcessSampler {
         ))
     }
 
+    /// Kills every descendant of `root_pid` except each survivor and its own descendants.
     pub(crate) async fn cleanup_descendants(
         &self,
         root_pid: u32,
+        survivors: &[ProcessIdentity],
     ) -> Result<ProcessCleanupReport, SignalError> {
         let rows = self
             .sample()
             .await
             .map_err(|error| SignalError::Read(error.to_string()))?;
-        let mut descendants = build_descendant_entries(&rows, root_pid);
-        descendants.sort_by_key(|entry| std::cmp::Reverse(entry.depth));
-        let identities = descendants
-            .into_iter()
-            .filter_map(|entry| {
-                rows.iter()
-                    .find(|row| row.pid == entry.pid)
-                    .map(|row| ProcessIdentity {
-                        pid: row.pid,
-                        started_at: row.started_at,
-                    })
-            })
-            .collect::<Vec<_>>();
+        let identities = descendants_to_clean_up(&rows, root_pid, survivors);
         Ok(cleanup_runtime_process_identities(
             &identities,
             |identity| signal_process_identity(identity, ProcessSignal::Kill),
         ))
     }
+}
+
+/// `root_pid`'s descendants, deepest first, without the survivors and what they started. A
+/// survivor is matched by its start time as well as its pid, so a reused pid is not spared.
+fn descendants_to_clean_up(
+    rows: &[ProcessRow],
+    root_pid: u32,
+    survivors: &[ProcessIdentity],
+) -> Vec<ProcessIdentity> {
+    let spared = runtime_owned_process_identities(rows, survivors)
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let mut descendants = build_descendant_entries(rows, root_pid);
+    descendants.sort_by_key(|entry| std::cmp::Reverse(entry.depth));
+    descendants
+        .into_iter()
+        .filter_map(|entry| {
+            rows.iter()
+                .find(|row| row.pid == entry.pid)
+                .map(|row| ProcessIdentity {
+                    pid: row.pid,
+                    started_at: row.started_at,
+                })
+        })
+        .filter(|identity| !spared.contains(identity))
+        .collect()
 }
 
 fn runtime_owned_process_identities(
@@ -1343,6 +1377,40 @@ mod tests {
                     started_at: 20,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn standalone_descendant_cleanup_spares_survivors_and_their_children() {
+        let row = |pid: u32, ppid: u32, started_at: u64| {
+            let mut row = ProcessRow::fixture(pid, ppid, "process");
+            row.started_at = started_at;
+            row
+        };
+        let identity = |pid: u32, started_at: u64| ProcessIdentity { pid, started_at };
+        let rows = [
+            row(10, 1, 10),
+            row(20, 10, 20),
+            row(21, 20, 21),
+            // `git difftool` and the diff app it started.
+            row(30, 10, 30),
+            row(31, 30, 31),
+            // A process that reused a survivor's pid after it exited.
+            row(40, 10, 45),
+        ];
+        let survivors = [identity(30, 30), identity(40, 40)];
+
+        let mut killed = descendants_to_clean_up(&rows, 10, &survivors);
+        killed.sort_by_key(|identity| identity.pid);
+        assert_eq!(
+            killed,
+            [identity(20, 20), identity(21, 21), identity(40, 45)],
+            "the survivor and its child stay; a reused pid is not spared"
+        );
+        assert_eq!(
+            descendants_to_clean_up(&rows, 10, &[]).len(),
+            5,
+            "without survivors every descendant is cleaned up"
         );
     }
 

@@ -156,6 +156,10 @@ pub fn is_long_running(method: &str) -> bool {
             | "device.close"
             | "device.input"
             | "device.rotate"
+            // `--tool-help` probes about 30 tools (1.7 s measured), and a launch waits up to
+            // 1 s on an external program.
+            | "review.listDiffTools"
+            | "review.openDiffTool"
     )
 }
 
@@ -1126,6 +1130,8 @@ mod tests {
             "device.input",
             "device.rotate",
             "server.getProviderCapabilities",
+            "review.listDiffTools",
+            "review.openDiffTool",
         ] {
             book.observe(method, "success", 1_500.0, 0.0, None);
         }

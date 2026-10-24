@@ -611,6 +611,7 @@ mod tests {
                     label: "external/provider".to_owned(),
                     source: RegistrationSource::Provider,
                     driver: None,
+                    survives_shutdown: false,
                 },
             )
             .expect("registration should fit");

@@ -141,6 +141,8 @@ pub const ACTIVE_RPC_METHODS: &[RpcMethodSpec] = &[
     mutation_unary("pullRequests.runAction"),
     read_stream("pullRequests.subscribe"),
     read_unary("review.getDiffPreview"),
+    read_unary("review.listDiffTools"),
+    mutation_unary("review.openDiffTool"),
     read_unary("review.readFileVersion"),
     mutation_unary("server.consumeCodexRateLimitReset"),
     read_unary("server.discoverSourceControl"),

@@ -56,6 +56,43 @@ pub enum ReviewError {
     /// A request the server refuses before it starts Git.
     #[error("{0}")]
     InvalidRequest(String),
+    /// A diff app that did not open, with the command for the user to run themselves.
+    #[error("{}", .0.message)]
+    DiffTool(ReviewDiffToolFailure),
+}
+
+/// Why `review.openDiffTool` did not open the app.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReviewDiffToolFailureReason {
+    LaunchFailed,
+    TooManyOpen,
+    ShuttingDown,
+    InvalidRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewDiffToolFailure {
+    pub reason: ReviewDiffToolFailureReason,
+    pub message: String,
+    /// The `git difftool` command, for **Copy command**; only the requesting client sees it.
+    pub command: Vec<String>,
+}
+
+impl ReviewDiffToolFailure {
+    #[must_use]
+    pub fn new(
+        reason: ReviewDiffToolFailureReason,
+        message: impl Into<String>,
+        command: Vec<String>,
+    ) -> Self {
+        Self {
+            reason,
+            message: message.into(),
+            command,
+        }
+    }
 }
 
 /// Refuses review inputs that must never reach Git: a context count outside `0..=99`, and a
@@ -140,6 +177,114 @@ pub fn is_git_object_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+/// `review.listDiffTools`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewListDiffToolsInput {
+    pub cwd: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReviewDiffToolKind {
+    /// One of Git's own tools, found on this computer.
+    Builtin,
+    /// A `difftool.<tool>.cmd` from the user's Git config.
+    Custom,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewDiffTool {
+    pub id: String,
+    pub label: String,
+    pub kind: ReviewDiffToolKind,
+}
+
+/// The Git config key a default tool came from, in Git's own `--gui` order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReviewDiffToolDefaultSource {
+    #[serde(rename = "diff.guitool")]
+    DiffGuiTool,
+    #[serde(rename = "merge.guitool")]
+    MergeGuiTool,
+    #[serde(rename = "diff.tool")]
+    DiffTool,
+    #[serde(rename = "merge.tool")]
+    MergeTool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewDiffToolList {
+    pub tools: Vec<ReviewDiffTool>,
+    pub default_tool_id: Option<String>,
+    pub default_source: Option<ReviewDiffToolDefaultSource>,
+}
+
+/// `review.openDiffTool`: what to open, and the scope whose revisions to compare.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewOpenDiffToolInput {
+    pub cwd: String,
+    pub tool_id: String,
+    pub target: ReviewDiffToolTarget,
+    pub scope: ReviewDiffToolScope,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "_tag",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase"
+)]
+pub enum ReviewDiffToolTarget {
+    File {
+        path: String,
+        #[serde(default)]
+        previous_path: Option<String>,
+    },
+    All,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "_tag",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase"
+)]
+pub enum ReviewDiffToolScope {
+    WorkingTree,
+    Branch {
+        #[serde(default)]
+        base_ref: Option<String>,
+    },
+    Turn {
+        thread_id: String,
+        from_turn_count: i64,
+        to_turn_count: i64,
+    },
+}
+
+pub type ReviewDiffToolListFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<ReviewDiffToolList, ReviewError>> + Send + 'a>>;
+pub type ReviewDiffToolOpenFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<(), ReviewError>> + Send + 'a>>;
+
+/// Lists and launches diff apps through `git difftool` on the server's computer.
+pub trait DiffToolBackend: Send + Sync {
+    fn list_diff_tools<'a>(
+        &'a self,
+        input: &'a ReviewListDiffToolsInput,
+        cancellation: &'a CancellationToken,
+    ) -> ReviewDiffToolListFuture<'a>;
+
+    fn open_diff_tool<'a>(
+        &'a self,
+        input: &'a ReviewOpenDiffToolInput,
+    ) -> ReviewDiffToolOpenFuture<'a>;
+}
+
 pub trait ReviewBackend: Send + Sync {
     fn get_diff_preview<'a>(&'a self, input: &'a ReviewDiffPreviewInput) -> ReviewFuture<'a>;
 
@@ -160,11 +305,40 @@ pub trait ReviewBackend: Send + Sync {
 #[derive(Clone)]
 pub struct ReviewService {
     backend: Arc<dyn ReviewBackend>,
+    diff_tools: Option<Arc<dyn DiffToolBackend>>,
 }
 
 impl ReviewService {
     pub fn new(backend: Arc<dyn ReviewBackend>) -> Self {
-        Self { backend }
+        Self {
+            backend,
+            diff_tools: None,
+        }
+    }
+
+    /// Serves `review.listDiffTools` and `review.openDiffTool` from `diff_tools`.
+    #[must_use]
+    pub fn with_diff_tools(mut self, diff_tools: Arc<dyn DiffToolBackend>) -> Self {
+        self.diff_tools = Some(diff_tools);
+        self
+    }
+
+    pub async fn list_diff_tools(
+        &self,
+        input: ReviewListDiffToolsInput,
+        cancellation: &CancellationToken,
+    ) -> Result<ReviewDiffToolList, ReviewError> {
+        let diff_tools = self.diff_tools.as_ref().ok_or_else(|| {
+            ReviewError::Backend("review.listDiffTools is not configured".to_owned())
+        })?;
+        diff_tools.list_diff_tools(&input, cancellation).await
+    }
+
+    pub async fn open_diff_tool(&self, input: ReviewOpenDiffToolInput) -> Result<(), ReviewError> {
+        let diff_tools = self.diff_tools.as_ref().ok_or_else(|| {
+            ReviewError::Backend("review.openDiffTool is not configured".to_owned())
+        })?;
+        diff_tools.open_diff_tool(&input).await
     }
 
     pub async fn get_diff_preview(
