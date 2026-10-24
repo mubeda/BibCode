@@ -1,6 +1,5 @@
 import {
   EnvironmentId,
-  ProjectId,
   ProviderInstanceId,
   ThreadId,
   type ResolvedKeybindingsConfig,
@@ -120,7 +119,6 @@ import ThreadTerminalPanel, {
 const TEST_ENVIRONMENT_ID = EnvironmentId.make("environment-terminal-panel");
 const TEST_THREAD_ID = ThreadId.make("thread-terminal-panel");
 const TEST_THREAD_REF = scopeThreadRef(TEST_ENVIRONMENT_ID, TEST_THREAD_ID);
-const TEST_PROJECT_ID = ProjectId.make("project-terminal-panel");
 const EMPTY_KEYBINDINGS: ResolvedKeybindingsConfig = [];
 
 beforeEach(() => {
@@ -135,7 +133,6 @@ function panelProps(overrides: Partial<PanelProps> = {}): PanelProps {
     owner: "right-panel",
     threadRef: TEST_THREAD_REF,
     threadId: TEST_THREAD_ID,
-    projectId: TEST_PROJECT_ID,
     cwd: "/repo",
     terminalIds: ["term-1"],
     activeTerminalId: "term-1",
@@ -279,7 +276,6 @@ function viewportProps(overrides: Partial<ViewportProps> = {}): ViewportProps {
   return {
     threadRef: TEST_THREAD_REF,
     threadId: TEST_THREAD_ID,
-    projectId: TEST_PROJECT_ID,
     terminalId: "term-1",
     terminalLabel: "Terminal 1",
     cwd: "/repo",

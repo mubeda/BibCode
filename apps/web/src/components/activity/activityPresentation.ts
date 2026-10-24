@@ -34,15 +34,22 @@ function isSectionVisible(
   capability: boolean,
   health: ActivitySectionHealth,
   counts: { readonly active: number; readonly done: number },
+  alwaysVisible: boolean,
 ): boolean {
-  if (health.state === "unsupported" || !hasRecords(counts)) {
+  if (health.state === "unsupported") {
     return false;
+  }
+  if (!hasRecords(counts)) {
+    // An empty section shows only when the provider claims it, so an idle
+    // button never stands in for activity BiBCode cannot see.
+    return alwaysVisible && capability;
   }
   return capability || health.state === "stale" || health.state === "error";
 }
 
 export function selectActivityDockVisibility(
   snapshot: ActivitySnapshot | null,
+  { alwaysVisible = false }: { readonly alwaysVisible?: boolean } = {},
 ): ActivityDockVisibility {
   if (snapshot === null) {
     return {
@@ -56,11 +63,13 @@ export function selectActivityDockVisibility(
     snapshot.capabilities.actors,
     snapshot.sections.subagents,
     snapshot.counts.subagents,
+    alwaysVisible,
   );
   const showBackgroundTasks = isSectionVisible(
     snapshot.capabilities.backgroundWork,
     snapshot.sections.backgroundTasks,
     snapshot.counts.backgroundTasks,
+    alwaysVisible,
   );
   return {
     visible: showSubagents || showBackgroundTasks,

@@ -14,6 +14,7 @@ import type { ActivityRightPanelSurface } from "~/rightPanelStore";
 import { Alert, AlertAction, AlertDescription } from "~/components/ui/alert";
 import { Button } from "~/components/ui/button";
 import { ScrollArea } from "~/components/ui/scroll-area";
+import { Tabs, TabsList, TabsTab } from "~/components/ui/tabs";
 import { ActivityRecordDetail } from "./ActivityRecordDetail";
 import { ActivityRoster, reconcileActivityRosterRecords } from "./ActivityRoster";
 
@@ -54,6 +55,9 @@ export interface ActivityPanelProps {
   readonly onRetryCancellation?: (rootActorId: ActivityRecordId, operationRevision: number) => void;
   readonly cancellationError?: string | null;
   readonly now?: string;
+  /** The Activity button asked for this panel: take focus and scroll to the top of the section. */
+  readonly focusRequested?: boolean;
+  readonly onFocusRequestHandled?: () => void;
 }
 
 function detailMatchesRoute(
@@ -85,6 +89,70 @@ function loadingDetailForRoute(route: ActivityPanelRoute): ActivityDetailQueryRe
     loading: true,
     error: null,
   };
+}
+
+const ACTIVITY_SECTIONS = ["subagents", "backgroundTasks"] as const;
+const SECTION_TAB_LABEL: Record<ActivityPanelRoute["section"], string> = {
+  subagents: "Subagents",
+  backgroundTasks: "Background tasks",
+};
+
+/**
+ * Peer tabs for the sections this provider reports, plus the routed one so an
+ * unsupported section the route still points at keeps a way out. One section
+ * alone needs no tabs.
+ */
+function ActivitySectionTabs({
+  section,
+  sections,
+  onSelect,
+}: {
+  readonly section: ActivityPanelRoute["section"];
+  readonly sections: ActivitySnapshot["sections"];
+  readonly onSelect: (section: ActivityPanelRoute["section"]) => void;
+}) {
+  const reachable = ACTIVITY_SECTIONS.filter(
+    (candidate) => candidate === section || sections[candidate].state !== "unsupported",
+  );
+  if (reachable.length < 2) {
+    return null;
+  }
+  return (
+    <Tabs
+      className="shrink-0 gap-0"
+      value={section}
+      onValueChange={(value) => {
+        if (value === "subagents" || value === "backgroundTasks") onSelect(value);
+      }}
+    >
+      <TabsList aria-label="Activity sections" className="mx-3 mt-3">
+        {reachable.map((candidate) => {
+          const state = sections[candidate].state;
+          const degraded = state === "error" || state === "stale" ? state : null;
+          const StatusIcon = degraded === "error" ? TriangleAlertIcon : RefreshCwIcon;
+          return (
+            <TabsTab
+              className="flex items-center gap-1.5 outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              key={candidate}
+              value={candidate}
+            >
+              {SECTION_TAB_LABEL[candidate]}
+              {degraded === null ? null : (
+                <>
+                  <StatusIcon
+                    aria-hidden="true"
+                    className="size-3.5"
+                    data-activity-tab-status={degraded}
+                  />
+                  <span className="sr-only"> ({degraded})</span>
+                </>
+              )}
+            </TabsTab>
+          );
+        })}
+      </TabsList>
+    </Tabs>
+  );
 }
 
 function RetryBanner({
@@ -125,7 +193,10 @@ export function ActivityPanel({
   onRetryCancellation,
   cancellationError = null,
   now,
+  focusRequested = false,
+  onFocusRequestHandled,
 }: ActivityPanelProps) {
+  const panelRef = useRef<HTMLDivElement>(null);
   const headingRef = useRef<HTMLHeadingElement>(null);
   const selectedForFocusRef = useRef<string | null>(null);
   const handledRemovalRef = useRef<string | null>(null);
@@ -202,6 +273,24 @@ export function ActivityPanel({
     }
   }, [headingFocusKey]);
 
+  // The request lives outside the panel, so honouring it is a DOM side effect.
+  // The selected section tab is the focus target; one section alone focuses the panel.
+  useEffect(() => {
+    if (!focusRequested) {
+      return;
+    }
+    const panel = panelRef.current;
+    if (panel !== null) {
+      const viewport = panel.querySelector<HTMLElement>('[data-slot="scroll-area-viewport"]');
+      if (viewport !== null) {
+        viewport.scrollTop = 0;
+      }
+      const selectedTab = panel.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]');
+      (selectedTab ?? panel).focus({ preventScroll: true });
+    }
+    onFocusRequestHandled?.();
+  }, [focusRequested, onFocusRequestHandled]);
+
   useEffect(() => {
     if (!removed || route.selectedRecordKind === null || route.selectedRecordId === null) {
       return;
@@ -261,6 +350,11 @@ export function ActivityPanel({
   const focusRestored = useCallback(() => {
     setRestoreFocusRecordId(null);
   }, []);
+  const selectSection = useCallback(
+    (section: ActivityPanelRoute["section"]) =>
+      onNavigate({ section, selectedRecordKind: null, selectedRecordId: null }),
+    [onNavigate],
+  );
 
   const rosterContent = (
     <ActivityRoster
@@ -280,7 +374,19 @@ export function ActivityPanel({
   );
 
   return (
-    <div className="flex size-full min-h-0 flex-col bg-background" data-activity-panel>
+    <div
+      aria-label="Activity"
+      className="flex size-full min-h-0 flex-col bg-background outline-none"
+      data-activity-panel
+      ref={panelRef}
+      role="region"
+      tabIndex={-1}
+    >
+      <ActivitySectionTabs
+        onSelect={selectSection}
+        section={route.section}
+        sections={snapshot.sections}
+      />
       {snapshot.observationState === "stale" || snapshot.observationState === "reconnecting" ? (
         <RetryBanner message="Activity data is stale. Showing the last known activity." stale />
       ) : snapshot.observationState === "error" ? (

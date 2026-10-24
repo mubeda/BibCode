@@ -28,7 +28,6 @@ import {
   type TerminalSize,
   type TerminalResizeInput,
   type ThreadId,
-  type ProjectId,
 } from "@bibcode/contracts";
 import { getTerminalLabel } from "@bibcode/shared/terminalLabels";
 import * as Schema from "effect/Schema";
@@ -790,7 +789,6 @@ export function resolveTerminalSelectionActionPosition(options: {
 interface TerminalViewportProps {
   threadRef: ScopedThreadRef;
   threadId: ThreadId;
-  projectId: ProjectId;
   terminalId: string;
   terminalLabel: string;
   cwd: string;
@@ -830,7 +828,6 @@ interface CodexThemeRestartError {
 export function TerminalViewport({
   threadRef,
   threadId,
-  projectId,
   terminalId,
   terminalLabel,
   cwd,
@@ -2435,7 +2432,6 @@ export function TerminalViewport({
         >
           <ProviderTerminalActivityDock
             threadRef={threadRef}
-            projectId={projectId}
             terminalId={terminalId}
             activity={command.activity}
             visible={shouldRender}
@@ -2532,7 +2528,6 @@ interface ThreadTerminalPanelProps {
   readonly owner: TerminalPanelOwner;
   threadRef: ScopedThreadRef;
   threadId: ThreadId;
-  projectId: ProjectId;
   cwd: string;
   worktreePath?: string | null;
   runtimeEnv?: Record<string, string>;
@@ -2611,7 +2606,6 @@ export default function ThreadTerminalPanel({
   owner,
   threadRef,
   threadId,
-  projectId,
   cwd,
   worktreePath,
   runtimeEnv,
@@ -2928,7 +2922,6 @@ export default function ThreadTerminalPanel({
                         <TerminalViewport
                           threadRef={threadRef}
                           threadId={threadId}
-                          projectId={projectId}
                           terminalId={terminalId}
                           terminalLabel={terminalLabelById.get(terminalId) ?? "Terminal"}
                           cwd={terminalLaunchLocation.cwd}
@@ -2961,7 +2954,6 @@ export default function ThreadTerminalPanel({
                   key={resolvedActiveTerminalId}
                   threadRef={threadRef}
                   threadId={threadId}
-                  projectId={projectId}
                   terminalId={resolvedActiveTerminalId}
                   terminalLabel={terminalLabelById.get(resolvedActiveTerminalId) ?? "Terminal"}
                   cwd={activeTerminalLaunchLocation.cwd}

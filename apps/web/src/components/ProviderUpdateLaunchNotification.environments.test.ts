@@ -6,6 +6,7 @@ const harness = vi.hoisted(() => ({
   primaryEnvironmentId: "primary",
   capturedInputs: [] as Array<Record<string, unknown>>,
   displayInputs: [] as Array<Record<string, unknown>>,
+  snapshotKeys: [] as string[],
 }));
 
 vi.mock("react", async (importOriginal) => ({
@@ -18,6 +19,17 @@ vi.mock("~/state/environments", () => ({
 }));
 vi.mock("~/connection/desktopLocal", () => ({
   isDesktopLocalConnectionTarget: (target: { local?: boolean }) => target.local === true,
+}));
+vi.mock("@effect/atom-react", () => ({
+  useAtomValue: (atom: { readonly snapshotKey: string }) => {
+    harness.snapshotKeys.push(atom.snapshotKey);
+    return new Map(
+      (JSON.parse(atom.snapshotKey) as string[]).map((id) => [id, { state: `snapshot-${id}` }]),
+    );
+  },
+}));
+vi.mock("~/state/providerUpdateAll", () => ({
+  serverUpdateSnapshots: (snapshotKey: string) => ({ snapshotKey }),
 }));
 vi.mock("./ProviderUpdateLaunchNotification.logic", () => ({
   buildLocalEnvironmentUpdateGroups: (inputs: Array<Record<string, unknown>>) => {
@@ -33,7 +45,10 @@ vi.mock("./ProviderUpdateLaunchNotification.logic", () => ({
   },
 }));
 
-import { useLocalEnvironmentUpdateGroups } from "./ProviderUpdateLaunchNotification.environments";
+import {
+  useLocalEnvironmentUpdateGroups,
+  useProviderUpdateEnvironments,
+} from "./ProviderUpdateLaunchNotification.environments";
 
 function environment(
   id: string,
@@ -43,6 +58,7 @@ function environment(
     local?: boolean;
     remote?: boolean;
     withConfig?: boolean;
+    remoteUpdateControl?: boolean;
   } = {},
 ) {
   return {
@@ -54,12 +70,19 @@ function environment(
         : { _tag: "BearerConnectionTarget", local: options.local, remote: options.remote },
     },
     connection: { phase },
-    serverConfig: options.withConfig
-      ? {
-          environment: { platform: { os: "linux" } },
-          providers: [{ instanceId: id }],
-        }
-      : null,
+    serverConfig:
+      options.withConfig || options.remoteUpdateControl !== undefined
+        ? {
+            environment: {
+              platform: { os: "linux" },
+              capabilities: {
+                remoteUpdateControl: options.remoteUpdateControl === true,
+                remoteUpdateProgress: true,
+              },
+            },
+            providers: [{ instanceId: id }],
+          }
+        : null,
   };
 }
 
@@ -68,6 +91,37 @@ beforeEach(() => {
   harness.primaryEnvironmentId = "primary";
   harness.capturedInputs = [];
   harness.displayInputs = [];
+  harness.snapshotKeys = [];
+});
+
+describe("useProviderUpdateEnvironments", () => {
+  it("gives only connected remote environments with update control a server snapshot", () => {
+    harness.environments = [
+      environment("ssh", "connected", { remote: true, remoteUpdateControl: true }),
+      environment("relay", "connected", { remote: true, remoteUpdateControl: false }),
+      environment("offline", "offline", { remote: true, remoteUpdateControl: true }),
+      environment("wsl", "connected", { local: true, remoteUpdateControl: true }),
+      environment("primary", "connected", { primary: true, remoteUpdateControl: true }),
+    ];
+
+    const inputs = useProviderUpdateEnvironments();
+
+    expect(harness.snapshotKeys).toEqual([JSON.stringify(["ssh"])]);
+    expect(inputs.map((input) => input.environmentId)).toEqual([
+      "primary",
+      "ssh",
+      "relay",
+      "offline",
+      "wsl",
+    ]);
+    expect(inputs.map((input) => input.serverUpdate)).toEqual([
+      undefined,
+      { progress: true, snapshot: { state: "snapshot-ssh" } },
+      undefined,
+      undefined,
+      undefined,
+    ]);
+  });
 });
 
 describe("useLocalEnvironmentUpdateGroups", () => {

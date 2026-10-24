@@ -967,6 +967,27 @@ clients keep their previous `checkedAt` until a content change or a
 user-triggered refresh publishes, or until they reconnect and receive a fresh
 snapshot.
 
+Clients start updates only through `server.updateProvider` on the environment
+that owns the provider. The primary toast and the desktop-local rows update
+their own targets. **Settings → Providers → Update all…** is client
+orchestration over the same method (`apps/web/src/components/ProviderUpdateAll.logic.ts`):
+it plans every connected environment, sends each one-click candidate with that
+environment's id, driver, and instance id, and runs at most two environments at
+a time through `fanOutRemoteUpdateChecks`. Calls within one environment still
+share its serial config scheduler. The per-environment summary lives in a
+keep-alive atom (`apps/web/src/state/providerUpdateAll.ts`), so it survives
+navigation, and the RPCs continue after the page unmounts. The same
+confirmation can include a connected remote environment's server install
+([remote](remote.md) describes it). The run starts that install only after the
+environment's provider calls have all settled as updated; a failed, unchanged,
+or unconfirmed provider update skips it, so the action never restarts a host
+while one of its provider updates is in flight. Every phase has an expiry: an
+environment's provider calls get six minutes each, the server's five-minute
+command timeout plus its queue, and a server install gets the remote-update
+coordinator's budgets plus two minutes. A call that has not settled by then,
+such as one on a socket that died without a close event, is reported as
+unconfirmed, so the run always reaches a final state and a new one can start.
+
 An update reservation is bound to the complete maintenance target and settings
 generation. After acquiring the per-command lock, the server rereads settings,
 re-resolves the target and action, and rejects a queued update if its binary,

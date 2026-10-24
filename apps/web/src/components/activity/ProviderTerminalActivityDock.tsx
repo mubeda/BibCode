@@ -3,17 +3,14 @@ import {
   EMPTY_ENVIRONMENT_ACTIVITY_STATE,
   type EnvironmentActivityState,
 } from "@bibcode/client-runtime/state/activity";
-import { scopedProjectKey, scopeProjectRef } from "@bibcode/client-runtime/environment";
 import type {
   ActivityScopeRef,
   ActivitySection,
-  ProjectId,
   ProviderTerminalActivityLaunch,
   ScopedThreadRef,
 } from "@bibcode/contracts";
 import { useCallback, useMemo } from "react";
 
-import { selectActivityDockExpanded, useActivityDockStore } from "~/activityDockStore";
 import { useRightPanelStore } from "~/rightPanelStore";
 import { environmentActivity } from "~/state/activity";
 
@@ -22,7 +19,6 @@ import { activitySnapshotForState, selectActivityDockVisibility } from "./activi
 
 export interface ProviderTerminalActivityDockProps {
   readonly threadRef: ScopedThreadRef;
-  readonly projectId: ProjectId;
   readonly terminalId: string;
   readonly activity: ProviderTerminalActivityLaunch | undefined;
   readonly visible: boolean;
@@ -36,7 +32,6 @@ interface EligibleProviderTerminalActivityDockProps extends Omit<
 
 function EligibleProviderTerminalActivityDock({
   threadRef,
-  projectId,
   terminalId,
   compact,
 }: EligibleProviderTerminalActivityDockProps) {
@@ -59,18 +54,6 @@ function EligibleProviderTerminalActivityDock({
   const activityState =
     useAtomValue(stateValueAtom) ?? (EMPTY_ENVIRONMENT_ACTIVITY_STATE as EnvironmentActivityState);
   const snapshot = useMemo(() => activitySnapshotForState(activityState), [activityState]);
-  const projectKey = useMemo(
-    () => scopedProjectKey(scopeProjectRef(threadRef.environmentId, projectId)),
-    [projectId, threadRef.environmentId],
-  );
-  const expanded = useActivityDockStore((current) =>
-    selectActivityDockExpanded(current.expandedByProject, projectKey),
-  );
-  const setExpanded = useActivityDockStore((current) => current.setExpanded);
-  const onExpandedChange = useCallback(
-    (nextExpanded: boolean) => setExpanded(projectKey, nextExpanded),
-    [projectKey, setExpanded],
-  );
   const onOpenSection = useCallback(
     (section: ActivitySection) =>
       useRightPanelStore
@@ -90,15 +73,7 @@ function EligibleProviderTerminalActivityDock({
     return null;
   }
 
-  return (
-    <ActivityDock
-      snapshot={snapshot}
-      expanded={expanded}
-      compact={compact}
-      onExpandedChange={onExpandedChange}
-      onOpenSection={onOpenSection}
-    />
-  );
+  return <ActivityDock snapshot={snapshot} compact={compact} onOpenSection={onOpenSection} />;
 }
 
 export function ProviderTerminalActivityDock(props: ProviderTerminalActivityDockProps) {
@@ -108,7 +83,6 @@ export function ProviderTerminalActivityDock(props: ProviderTerminalActivityDock
   return (
     <EligibleProviderTerminalActivityDock
       threadRef={props.threadRef}
-      projectId={props.projectId}
       terminalId={props.terminalId}
       compact={props.compact}
     />

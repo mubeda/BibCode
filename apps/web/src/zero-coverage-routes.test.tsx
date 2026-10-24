@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
 
-import { EnvironmentId, ProjectId, ThreadId } from "@bibcode/contracts";
+import { EnvironmentId, ThreadId } from "@bibcode/contracts";
 import { act, type ComponentPropsWithoutRef, type ReactElement, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
@@ -383,7 +383,6 @@ describe("center terminal and preview surfaces", () => {
     ) => (
       <CenterTerminalPanel
         threadRef={threadRef}
-        projectId={ProjectId.make("project-1")}
         surface={{
           id: "terminal:terminal-1",
           kind: "terminal",
