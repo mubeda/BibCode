@@ -335,8 +335,15 @@ class ThreadFindSession {
     this.#query = query;
     this.#callbacks.setQuery(query);
     this.#composing = composing;
-    if (composing) return;
     if (this.#typingTimer !== null) clearTimeout(this.#typingTimer);
+    this.#typingTimer = null;
+    if (composing) {
+      // Nothing scans or navigates until composition ends, which schedules the scan again.
+      if (this.#scanSignal) this.#scanSignal.aborted = true;
+      this.#scanSignal = null;
+      this.#invalidateNavigation();
+      return;
+    }
     const kind: ScanKind =
       previous.length > 0 && query.startsWith(previous) && this.#active !== null ? "extend" : "new";
     this.#typingTimer = setTimeout(() => {
@@ -413,9 +420,11 @@ class ThreadFindSession {
   // -- scanning ------------------------------------------------------------
 
   #runSearch(kind: ScanKind): void {
-    if (!this.#open) return;
+    if (!this.#open || this.#composing) return;
     if (this.#scanSignal) this.#scanSignal.aborted = true;
     this.#scanSignal = null;
+    // A new query retires the previous one's navigation, its settle included.
+    if (kind === "new") this.#invalidateNavigation();
     const loadStatus = this.#loadStatus();
     if (loadStatus) {
       this.#resetResults();
@@ -480,7 +489,7 @@ class ThreadFindSession {
         if (outcome.total === 0) {
           this.#active = null;
           this.#reveal = null;
-          this.#supersedePendingScroll();
+          this.#invalidateNavigation();
           this.#setStatus({ kind: "none", stale: this.#isStale() });
           this.#schedulePaint();
           return;
@@ -671,6 +680,12 @@ class ThreadFindSession {
       index = current;
     }
     this.#markRow(rowId);
+  }
+
+  /** Retires every navigation in flight: its wait for the row, its held-back scroll and its settle. */
+  #invalidateNavigation(): void {
+    this.#generation += 1;
+    this.#supersedePendingScroll();
   }
 
   #supersedePendingScroll(): void {

@@ -356,6 +356,39 @@ async function type(input: HTMLInputElement, value: string): Promise<void> {
   });
 }
 
+/** Types while an input method composes, as the bar's change handler sees it. */
+async function compose(input: HTMLInputElement, value: string): Promise<void> {
+  await act(async () => {
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!;
+    setter.call(input, value);
+    input.dispatchEvent(new InputEvent("input", { bubbles: true, isComposing: true }));
+  });
+}
+
+async function wait(ms: number): Promise<void> {
+  await act(async () => new Promise((resolve) => setTimeout(resolve, ms)));
+}
+
+/** Holds animation frames until the test runs them. */
+function holdAnimationFrames(): { flush: (frames: number) => Promise<void> } {
+  const queue: FrameRequestCallback[] = [];
+  vi.spyOn(globalThis, "requestAnimationFrame").mockImplementation((callback) => {
+    queue.push(callback);
+    return queue.length;
+  });
+  vi.spyOn(globalThis, "cancelAnimationFrame").mockImplementation(() => {});
+  return {
+    flush: async (frames) => {
+      for (let frame = 0; frame < frames; frame += 1) {
+        await act(async () => {
+          for (const callback of queue.splice(0)) callback(performance.now());
+          await new Promise((resolve) => setTimeout(resolve, 0));
+        });
+      }
+    },
+  };
+}
+
 async function press(
   element: HTMLElement,
   key: string,
@@ -574,6 +607,51 @@ describe("useThreadFind", () => {
     expect(list.deferred).toHaveLength(0);
     expect(findInput()).toBeNull();
     expect(registry.size).toBe(0);
+  });
+
+  it("stops a settling navigation when the query is replaced by one with no matches", async () => {
+    await mountTimeline({
+      latestTurn: null,
+      timelineEntries: [message("a", "user", "alpha one", 0)],
+    });
+    const list = h.lists[0]!;
+    const frames = holdAnimationFrames();
+    const input = await openFind();
+    await type(input, "alpha");
+    // The scroll lands at once; the settle that follows waits on frames.
+    for (let attempt = 0; attempt < 50 && list.scrollToIndex.mock.calls.length === 0; attempt++) {
+      await frames.flush(1);
+      await wait(20);
+    }
+    expect(list.scrollToIndex).toHaveBeenCalledTimes(1);
+
+    await type(input, "zzz-no-match");
+    await settle(() => statusText().includes("No results"));
+    list.scrollToOffset.mockClear();
+    await frames.flush(12);
+
+    // The obsolete match is never scrolled into the band.
+    expect(list.scrollToOffset).not.toHaveBeenCalled();
+  });
+
+  it("neither scans nor navigates while an input method composes", async () => {
+    await mountTimeline({
+      latestTurn: null,
+      timelineEntries: [message("a", "user", "alpha one", 0)],
+    });
+    const list = h.lists[0]!;
+    const input = await openFind();
+    await type(input, "alpha");
+    await compose(input, "alpha o");
+    await wait(400);
+    expect(statusText()).not.toContain("1/1");
+    expect(list.scrollToIndex).not.toHaveBeenCalled();
+
+    // Composition ends: the composed query is searched.
+    await act(async () => {
+      input.dispatchEvent(new CompositionEvent("compositionend", { bubbles: true }));
+    });
+    await settle(() => statusText().includes("1/1"));
   });
 
   it("reissues a scroll once when the row moved while it was held back", async () => {
