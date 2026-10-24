@@ -116,6 +116,20 @@ workspace meter can therefore explain that Codex compacts context automatically
 when needed, while still showing the current active usage and maximum
 independently.
 
+## Reasoning summaries
+
+The root thread's reasoning summaries show in the chat as collapsed **Thought**
+rows, one per reasoning item (see the
+[Workspace UI](../user/workspace-ui.md#reading-the-timeline)). Each
+`item/reasoning/summaryTextDelta` streams into its item's row, and a part after
+the first starts after a blank line. The item's `item/completed` carries the
+whole `summary[]`, joined the same way, and replaces what streamed, so a stream
+that lost or cut parts still ends with the complete summary; a summary that
+streamed nothing is shown from its completion. Raw reasoning
+(`item/reasoning/textDelta`, an item's `content[]`) is never shown or stored.
+BiBCode sends no `summary` setting, so Codex's own `model_reasoning_summary`
+applies. The Subagents surface keeps its own **Reasoning summary** entries.
+
 ## Steering a running turn
 
 While Codex is working, Enter adds a queued message. **Steer** on the first
