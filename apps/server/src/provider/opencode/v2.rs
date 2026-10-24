@@ -210,6 +210,8 @@ pub(crate) fn classify_error(error: &Value) -> OpenCodeFailure {
         stop_reason,
         class,
         message,
+        // A plain name for the Profiler: `provider.auth` reads `provider_auth`.
+        reason: (!kind.is_empty()).then(|| kind.replace('.', "_")),
     }
 }
 
@@ -219,6 +221,7 @@ fn interrupted() -> OpenCodeFailure {
         stop_reason: "cancelled",
         class: "unknown",
         message: "The turn was stopped.".to_owned(),
+        reason: None,
     }
 }
 
@@ -891,6 +894,8 @@ mod tests {
             failure.message,
             "mock provider rejected the request (HTTP 400)"
         );
+        // A plain name for the Profiler.
+        assert_eq!(failure.reason.as_deref(), Some("provider_invalid-request"));
         let interrupted = translate("interrupt");
         let Some(V2Output::TurnEnded(Some(failure))) = interrupted.last() else {
             panic!("interrupted turn: {interrupted:?}");
