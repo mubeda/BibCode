@@ -174,11 +174,6 @@ export function focusThreadFindInput(target: EventTarget | null): boolean {
   return true;
 }
 
-/** Whether a find surface is registered, so the palette lists Find in thread. */
-export function hasThreadFindSurface(): boolean {
-  return surfaces.size > 0;
-}
-
 // ---------------------------------------------------------------------------
 // The session
 // ---------------------------------------------------------------------------

@@ -32,6 +32,8 @@ export interface ShortcutMatchContext {
   terminalOpen: boolean;
   previewFocus: boolean;
   previewOpen: boolean;
+  /** Focus is in a chat surface (its timeline, composer or find bar), or nowhere. */
+  chatFocus: boolean;
   [key: string]: boolean;
 }
 
@@ -123,6 +125,7 @@ function resolveContext(options: ShortcutMatchOptions | undefined): ShortcutMatc
     terminalOpen: false,
     previewFocus: false,
     previewOpen: false,
+    chatFocus: false,
     ...options?.context,
   };
 }
@@ -266,6 +269,65 @@ export function shortcutLabelForCommand(
   const platform = resolvePlatform(resolvedOptions);
   const shortcut = findEffectiveShortcutForCommand(keybindings, command, resolvedOptions);
   return shortcut ? formatShortcutLabel(shortcut, platform) : null;
+}
+
+/**
+ * Find in thread's built-in key. It is not a shipped rule: an older client cannot decode a
+ * command it does not know, and users who saved a keybinding never receive new defaults.
+ */
+const CHAT_FIND_FALLBACK_SHORTCUT: KeybindingShortcut = {
+  key: "f",
+  metaKey: false,
+  ctrlKey: false,
+  shiftKey: false,
+  altKey: false,
+  modKey: true,
+};
+
+/** Mod+F with no other modifier. */
+export function isChatFindFallbackShortcut(
+  event: ShortcutEventLike,
+  platform = navigator.platform,
+): boolean {
+  return matchesShortcut(event, CHAT_FIND_FALLBACK_SHORTCUT, platform);
+}
+
+function keybindingsNameChatFind(keybindings: ResolvedKeybindingsConfig): boolean {
+  return keybindings.some((binding) => binding.command === "chat.find");
+}
+
+/**
+ * Whether a keydown opens Find in thread: a rule that resolves to `chat.find`, or the built-in
+ * Mod+F inside a chat surface when no rule claimed the key and none names `chat.find`.
+ */
+export function shouldOpenChatFind(
+  command: KeybindingCommand | null,
+  event: ShortcutEventLike,
+  keybindings: ResolvedKeybindingsConfig,
+  context: Pick<ShortcutMatchContext, "chatFocus">,
+  platform = navigator.platform,
+): boolean {
+  if (command === "chat.find") return true;
+  if (command !== null) return false;
+  return (
+    context.chatFocus &&
+    !keybindingsNameChatFind(keybindings) &&
+    isChatFindFallbackShortcut(event, platform)
+  );
+}
+
+/** The key that opens Find in thread: a rule's, or the built-in Mod+F. */
+export function chatFindShortcutLabel(
+  keybindings: ResolvedKeybindingsConfig,
+  platform = navigator.platform,
+): string | null {
+  if (keybindingsNameChatFind(keybindings)) {
+    return shortcutLabelForCommand(keybindings, "chat.find", {
+      platform,
+      context: { chatFocus: true },
+    });
+  }
+  return formatShortcutLabel(CHAT_FIND_FALLBACK_SHORTCUT, platform);
 }
 
 export function threadJumpCommandForIndex(index: number): ThreadJumpKeybindingCommand | null {

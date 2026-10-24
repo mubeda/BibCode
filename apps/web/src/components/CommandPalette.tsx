@@ -11,6 +11,7 @@ import {
   ArrowUpIcon,
   FolderPlusIcon,
   MessageSquareIcon,
+  SearchIcon,
   SettingsIcon,
   SmartphoneIcon,
   SquarePenIcon,
@@ -62,7 +63,8 @@ import { CommandPaletteResults } from "./CommandPaletteResults";
 import { ProjectFavicon } from "./ProjectFavicon";
 import { ThreadRowLeadingStatus, ThreadRowTrailingStatus } from "./ThreadStatusIndicators";
 import { primaryServerKeybindingsAtom } from "../state/server";
-import { resolveShortcutCommand } from "../keybindings";
+import { chatFindShortcutLabel, resolveShortcutCommand } from "../keybindings";
+import { focusThreadFindInput, openThreadFindForTarget } from "./chat/threadFind/useThreadFind";
 import { useRightPanelStore } from "../rightPanelStore";
 import { useDevicePreviewsAvailability } from "./device/deviceAvailability";
 import {
@@ -233,6 +235,8 @@ function OpenCommandPaletteDialog(props: {
   });
   const keybindings = useAtomValue(primaryServerKeybindingsAtom);
   const [viewStack, setViewStack] = useState<CommandPaletteView[]>([]);
+  // The executed item's focus target, read by `finalFocus` as the palette closes.
+  const finalFocusTargetRef = useRef<(() => void) | null>(null);
   const currentView = viewStack.at(-1) ?? null;
   const paletteMode = getCommandPaletteMode({ currentView, isBrowsing: false });
   const projectTitleById = useMemo(
@@ -430,6 +434,25 @@ function OpenCommandPaletteDialog(props: {
     },
   });
 
+  if (activeThread) {
+    const findShortcutLabel = chatFindShortcutLabel(keybindings);
+    actionItems.push({
+      kind: "action",
+      value: "action:find-in-thread",
+      searchTerms: ["find", "search", "thread", "match", "text"],
+      title: "Find in thread",
+      icon: <SearchIcon className={ITEM_ICON_CLASS} />,
+      ...(findShortcutLabel ? { shortcutLabel: findShortcutLabel } : {}),
+      run: async () => {
+        openThreadFindForTarget(null);
+      },
+      // Typing right after choosing the action goes into the find bar.
+      finalFocus: () => {
+        focusThreadFindInput(null);
+      },
+    });
+  }
+
   if (activeThread && deviceAvailability.enabled) {
     const threadRef = scopeThreadRef(activeThread.environmentId, activeThread.id);
     actionItems.push({
@@ -487,6 +510,7 @@ function OpenCommandPaletteDialog(props: {
     }
 
     if (!item.keepOpen) {
+      finalFocusTargetRef.current = item.finalFocus ?? null;
       setOpen(false);
     }
 
@@ -508,7 +532,13 @@ function OpenCommandPaletteDialog(props: {
       data-command-palette="true"
       data-testid="command-palette"
       finalFocus={() => {
-        composerHandleRef?.current?.focusAtEnd();
+        const focusTarget = finalFocusTargetRef.current;
+        finalFocusTargetRef.current = null;
+        if (focusTarget) {
+          focusTarget();
+        } else {
+          composerHandleRef?.current?.focusAtEnd();
+        }
         return false;
       }}
       onBackdropPointerDown={() => {

@@ -1,5 +1,15 @@
 import type { KeybindingRule } from "@bibcode/contracts";
-import { MAX_KEYBINDINGS_COUNT, MAX_WHEN_EXPRESSION_DEPTH } from "@bibcode/contracts";
+import {
+  KeybindingShortcut,
+  KeybindingWhenNode,
+  MAX_KEYBINDINGS_COUNT,
+  MAX_WHEN_EXPRESSION_DEPTH,
+  MODEL_PICKER_KEYBINDING_COMMANDS,
+  ResolvedKeybindingsConfig,
+  SCRIPT_RUN_COMMAND_PATTERN,
+  THREAD_KEYBINDING_COMMANDS,
+} from "@bibcode/contracts";
+import * as Schema from "effect/Schema";
 import { describe, expect, it } from "vite-plus/test";
 import {
   compileResolvedKeybindingRule,
@@ -304,5 +314,64 @@ describe("DEFAULT_KEYBINDINGS", () => {
   it("compiles every default binding into the resolved defaults", () => {
     expect(DEFAULT_RESOLVED_KEYBINDINGS.length).toBe(DEFAULT_KEYBINDINGS.length);
     expect(DEFAULT_RESOLVED_KEYBINDINGS.every((rule) => rule.shortcut.key.length > 0)).toBe(true);
+  });
+});
+
+// The closed command list a v0.11.0 client decodes resolved rules against.
+const V0_11_0_STATIC_COMMANDS = [
+  "sidebar.toggle",
+  "terminal.newCenter",
+  "terminal.split",
+  "terminal.splitVertical",
+  "terminal.new",
+  "terminal.close",
+  "rightPanel.toggle",
+  "diff.toggle",
+  "preview.toggle",
+  "preview.refresh",
+  "preview.focusUrl",
+  "preview.zoomIn",
+  "preview.zoomOut",
+  "preview.resetZoom",
+  "commandPalette.toggle",
+  "chat.new",
+  "chat.newLocal",
+  "editor.openFavorite",
+  "thread.steerQueuedMessage",
+  ...MODEL_PICKER_KEYBINDING_COMMANDS,
+  ...THREAD_KEYBINDING_COMMANDS,
+] as const;
+const decodeInOlderClient = Schema.decodeUnknownSync(
+  Schema.Array(
+    Schema.Struct({
+      command: Schema.Union([Schema.Literals(V0_11_0_STATIC_COMMANDS), SCRIPT_RUN_COMMAND_PATTERN]),
+      shortcut: KeybindingShortcut,
+      whenAst: Schema.optional(KeybindingWhenNode),
+    }),
+  ),
+);
+const decodeInThisClient = Schema.decodeUnknownSync(ResolvedKeybindingsConfig);
+
+describe("keybinding compatibility across client and server versions", () => {
+  it("ships defaults an older client can decode, so Mod+F stays a built-in fallback", () => {
+    expect(() => decodeInOlderClient(DEFAULT_RESOLVED_KEYBINDINGS)).not.toThrow();
+    expect(DEFAULT_KEYBINDINGS.some((rule) => rule.command === "chat.find")).toBe(false);
+  });
+
+  it("decodes an older server's resolved list in this client", () => {
+    const olderServerList = compileResolvedKeybindingsConfig([
+      { key: "mod+k", command: "commandPalette.toggle", when: "!terminalFocus" },
+      { key: "mod+n", command: "chat.new", when: "!terminalFocus" },
+      { key: "mod+shift+[", command: "thread.previous" },
+    ]);
+    expect(() => decodeInThisClient(olderServerList)).not.toThrow();
+  });
+
+  it("documents that an older client cannot decode a user rule naming chat.find", () => {
+    const userList = compileResolvedKeybindingsConfig([
+      { key: "mod+shift+f", command: "chat.find", when: "chatFocus" },
+    ]);
+    expect(() => decodeInThisClient(userList)).not.toThrow();
+    expect(() => decodeInOlderClient(userList)).toThrow();
   });
 });

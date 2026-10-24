@@ -65,6 +65,7 @@ const STATIC_KEYBINDING_COMMANDS = [
   "commandPalette.toggle",
   "chat.new",
   "chat.newLocal",
+  "chat.find",
   "editor.openFavorite",
   "thread.steerQueuedMessage",
   ...MODEL_PICKER_KEYBINDING_COMMANDS,

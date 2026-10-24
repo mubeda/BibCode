@@ -30,6 +30,7 @@ vi.mock("../rpc/atomRegistry", () => ({
 
 import {
   MAX_HIDDEN_MOUNTED_PREVIEW_THREADS,
+  isChatSurfaceFocus,
   buildLocalDraftThread,
   buildRevertCheckpointConfirmation,
   buildExpiredTerminalContextToastCopy,
@@ -1830,5 +1831,29 @@ describe("buildRevertCheckpointConfirmation", () => {
         provider: { driver: ProviderDriverKind.make("codex") },
       }),
     ).toContain("This will discard newer messages");
+  });
+});
+
+describe("isChatSurfaceFocus", () => {
+  // A stand-in for an element: `closest` answers whether it sits in a chat surface.
+  const element = (inChat: boolean) =>
+    ({
+      closest: (selector: string) => (inChat && selector === "[data-chat-surface]" ? {} : null),
+    }) as unknown as Element;
+  const body = element(false);
+
+  it("is true for the timeline, the composer or the find bar", () => {
+    const input = element(true);
+    expect(isChatSurfaceFocus(input, input, body)).toBe(true);
+  });
+
+  it("is true when nothing is focused", () => {
+    expect(isChatSurfaceFocus(body, body, body)).toBe(true);
+    expect(isChatSurfaceFocus(null, null, body)).toBe(true);
+  });
+
+  it("is false in the right panel, a terminal or a preview", () => {
+    const editor = element(false);
+    expect(isChatSurfaceFocus(editor, editor, body)).toBe(false);
   });
 });

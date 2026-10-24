@@ -65,6 +65,7 @@ import {
 
 const h = vi.hoisted(() => {
   return {
+    openThreadFindTargets: [] as Array<EventTarget | null>,
     captured: {} as Record<string, unknown>,
     atomValuesByKey: new Map<string, unknown>(),
     commandCalls: [] as Array<{ key: string; input: unknown }>,
@@ -457,6 +458,13 @@ vi.mock("./chat/ChatComposer", () => ({
     h.captured["chatComposer"] = props;
     h.chatComposerProps.push(props);
     return <div data-mock="chat-composer" />;
+  },
+}));
+
+vi.mock("./chat/threadFind/useThreadFind", () => ({
+  openThreadFindForTarget: (target: EventTarget | null) => {
+    h.openThreadFindTargets.push(target);
+    return true;
   },
 }));
 
@@ -965,6 +973,7 @@ function publishSeededStoreState(store: unknown): void {
 
 beforeEach(() => {
   attachmentAdmissionOwner.dispose();
+  h.openThreadFindTargets.length = 0;
   h.captured = {};
   h.atomValuesByKey.clear();
   h.atomValuesByKey.set("atom:keybindings", []);
@@ -6444,4 +6453,100 @@ describe("ChatView adopted workspace availability", () => {
       expect(h.commandCalls.some((call) => call.key === "thread.startTurn")).toBe(false);
     },
   );
+});
+
+describe("ChatView find in thread", () => {
+  async function mountServerRoute() {
+    vi.unstubAllGlobals();
+    Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+    Object.defineProperty(Element.prototype, "getAnimations", {
+      configurable: true,
+      value: () => [],
+    });
+    const addWindowListener = vi.spyOn(window, "addEventListener");
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    await act(async () => {
+      root.render(
+        <ChatView
+          environmentId={environmentId}
+          threadId={threadId}
+          routeKind="server"
+          reserveTitleBarControlInset
+        />,
+      );
+      await Promise.resolve();
+    });
+    const keydown = addWindowListener.mock.calls.findLast(
+      ([eventName]) => eventName === "keydown",
+    )?.[1] as EventListener;
+    return {
+      keydown,
+      cleanup: async () => {
+        await act(async () => root.unmount());
+        container.remove();
+        addWindowListener.mockRestore();
+      },
+    };
+  }
+
+  const modF = () =>
+    new KeyboardEvent("keydown", {
+      key: "f",
+      metaKey: navigator.platform.toLowerCase().includes("mac"),
+      ctrlKey: !navigator.platform.toLowerCase().includes("mac"),
+      bubbles: true,
+      cancelable: true,
+    });
+
+  it("gives the timeline its chat surface and opens find on Mod+F", async () => {
+    seedEnvironment(makeEnvironmentPresentation());
+    seedProject(makeProject());
+    seedServerThread(makeThread());
+    seedGitStatus(true);
+    const { keydown, cleanup } = await mountServerRoute();
+    try {
+      const timeline = capturedProps<Record<string, unknown>>("messagesTimeline");
+      expect((timeline["findSurfaceRoot"] as HTMLElement).hasAttribute("data-chat-surface")).toBe(
+        true,
+      );
+      expect(timeline["isHostFindSurface"]).toBe(true);
+      expect(timeline["findThreadRef"]).toEqual({ environmentId, threadId });
+
+      const event = modF();
+      await act(async () => keydown(event));
+      expect(h.openThreadFindTargets).toHaveLength(1);
+      expect(event.defaultPrevented).toBe(true);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it("leaves Mod+F to a user rule that binds it to another command", async () => {
+    seedEnvironment(makeEnvironmentPresentation());
+    seedProject(makeProject());
+    seedServerThread(makeThread());
+    seedGitStatus(true);
+    h.atomValuesByKey.set("atom:keybindings", [
+      {
+        command: "sidebar.toggle",
+        shortcut: {
+          key: "f",
+          metaKey: false,
+          ctrlKey: false,
+          shiftKey: false,
+          altKey: false,
+          modKey: true,
+        },
+      },
+    ]);
+    const { keydown, cleanup } = await mountServerRoute();
+    try {
+      await act(async () => keydown(modF()));
+      expect(h.openThreadFindTargets).toHaveLength(0);
+    } finally {
+      await cleanup();
+    }
+  });
 });
