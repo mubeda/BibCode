@@ -156,8 +156,8 @@ export function CreateWorktreeDialog({
   const [formError, setFormError] = useState<string | null>(null);
   const agentSelectionTouchedRef = useRef(false);
   const previousOpenRef = useRef(false);
-  // The row the dialog last opened for: the source names that project's branches.
-  const openedForProjectRef = useRef<ScopedProjectRef | null>(null);
+  // The project whose branches the Create From text names, set where the user types or picks it.
+  const sourceProjectRef = useRef<ScopedProjectRef | null>(null);
   const refsEnabledRef = useRef(false);
 
   const selectProjectTarget = useCallback((nextProjectRef: ScopedProjectRef | null) => {
@@ -200,13 +200,14 @@ export function CreateWorktreeDialog({
   const handleSourceTextChange = useCallback(
     (value: string) => {
       setSourceText(value);
+      sourceProjectRef.current = projectRef;
       clearBranchSelection();
       if (mode === "github" || mode === "smart") {
         const item = parseGitHubWorkItem(value);
         if (item) applySuggestedName(githubWorkItemBranchName(item));
       }
     },
-    [applySuggestedName, clearBranchSelection, mode],
+    [applySuggestedName, clearBranchSelection, mode, projectRef],
   );
 
   const handleBranchSelect = useCallback(
@@ -223,11 +224,12 @@ export function CreateWorktreeDialog({
   const handleBranchRowPick = useCallback(
     (ref: RefLike) => {
       setSourceText(ref.name);
+      sourceProjectRef.current = projectRef;
       handleBranchSelect(ref);
       // The picked row goes away with the list, so focus stays on the field.
       sourceInputRef.current?.focus();
     },
-    [handleBranchSelect],
+    [handleBranchSelect, projectRef],
   );
 
   const handleProjectChange = useCallback(
@@ -249,14 +251,14 @@ export function CreateWorktreeDialog({
       agentSelectionTouchedRef.current = false;
       setReuseSelectedBranch(false);
       setName(forgetAutomaticName);
-      // Opening for another project's row clears the source, as changing Project does.
+      // Opening for a project other than the one whose branches the source names clears it, as
+      // changing Project does; the dialog may have last shown another project than it opened for.
       if (
         defaultProjectRef !== null &&
-        !sameProjectRef(openedForProjectRef.current, defaultProjectRef)
+        !sameProjectRef(sourceProjectRef.current, defaultProjectRef)
       ) {
         setSourceText("");
       }
-      openedForProjectRef.current = defaultProjectRef;
     }
     const firstProject = projects[0];
     const firstProjectRef = firstProject

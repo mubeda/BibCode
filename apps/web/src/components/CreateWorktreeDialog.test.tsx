@@ -1865,6 +1865,47 @@ if (browserRuntime) {
       container.remove();
     });
 
+    it("clears another project's branch when reopening for the original row (#151)", async () => {
+      const secondProjectId = ProjectId.make("project-two");
+      const secondEnvironmentId = EnvironmentId.make("remote");
+      const secondProjectRef = scopeProjectRef(secondEnvironmentId, secondProjectId);
+      testState.projects = [
+        project(),
+        project({
+          id: secondProjectId,
+          environmentId: secondEnvironmentId,
+          title: "Repo B",
+          workspaceRoot: "/repo-b",
+        }),
+      ];
+      // Both projects have the branch, so a stale field would select the first one's.
+      testState.refs = [{ name: "main" }, { name: "feature/login" }];
+      const { container, root } = await mountDialog(true, PROJECT_REF);
+
+      const projectSelect = captured.selects.find((select) =>
+        select.items?.some((item) => item.label === "Repo B"),
+      );
+      await React.act(async () =>
+        projectSelect?.onValueChange?.(scopedProjectKey(secondProjectRef)),
+      );
+      await React.act(async () => requiredButton(container, "Branch").click());
+      await React.act(async () => requiredButton(container, "feature/login").click());
+      expect(
+        requiredElement<HTMLInputElement>(container, "input[placeholder='Search branches']").value,
+      ).toBe("feature/login");
+
+      await renderDialog(root, false, PROJECT_REF);
+      await renderDialog(root, true, PROJECT_REF);
+
+      expect(
+        requiredElement<HTMLInputElement>(container, "input[placeholder='Search branches']").value,
+      ).toBe("");
+      expect(requiredButton(container, "Create worktree").disabled).toBe(true);
+
+      await React.act(async () => root.unmount());
+      container.remove();
+    });
+
     it("disables Create when the selected ref disappears from refreshed results", async () => {
       testState.refs = [{ name: "main", current: false, worktreePath: null }];
       const { container, root } = await mountDialog(true, PROJECT_REF);
