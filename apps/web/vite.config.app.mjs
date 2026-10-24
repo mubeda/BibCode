@@ -52,6 +52,25 @@ const unitTestProject = {
   },
 };
 
+/**
+ * Workers have no `document`. The Markdown parser decodes named character references through
+ * `decode-named-character-reference`, whose browser build parses them with a DOM element at
+ * import time; a worker bundle takes the package's DOM-free build instead (its `worker`
+ * export), as Find in thread's projection worker parses Markdown.
+ */
+function workerSafeCharacterReferences() {
+  return {
+    name: "bibcode:worker-safe-character-references",
+    enforce: "pre",
+    async resolveId(source, importer, options) {
+      if (source !== "decode-named-character-reference") return null;
+      const resolved = await this.resolve(source, importer, { ...options, skipSelf: true });
+      if (!resolved) return null;
+      return { ...resolved, id: resolved.id.replace(/index\.dom\.js$/, "index.js") };
+    },
+  };
+}
+
 function resolveDevProxyTarget(wsUrl) {
   if (!wsUrl) {
     return undefined;
@@ -121,6 +140,9 @@ export default defineConfig(({ mode } = {}) => {
     resolve: {
       tsconfigPaths: true,
       dedupe: ["react", "react-dom"],
+    },
+    worker: {
+      plugins: () => [workerSafeCharacterReferences()],
     },
     server: {
       host,
