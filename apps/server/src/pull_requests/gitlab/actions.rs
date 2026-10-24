@@ -139,7 +139,22 @@ impl GitLabHost {
                 });
             }
             DisableAutoMerge { .. } => {
-                let endpoint = format!("{path}/cancel_merge_when_pipeline_succeeds");
+                const NOT_CANCELLED: &str =
+                    "GitLab did not cancel auto-merge. Refresh to see whether it is still on.";
+                // GitLab 19.5 added `cancel_auto_merge`, which refuses with HTTP 403 or 409,
+                // and deprecated the older endpoint. An unread version keeps the older one.
+                let current = context.host_version.is_some_and(|version| {
+                    version
+                        >= HostVersion {
+                            major: 19,
+                            minor: 5,
+                        }
+                });
+                let endpoint = if current {
+                    format!("{path}/cancel_auto_merge")
+                } else {
+                    format!("{path}/cancel_merge_when_pipeline_succeeds")
+                };
                 let output = self
                     .runner
                     .glab(
@@ -150,14 +165,19 @@ impl GitLabHost {
                         c,
                     )
                     .await
-                    .map_err(|f| from_process_error(OP, "glab", &f.error, &f.stderr))?;
-                // A refusal is HTTP 201 with `"status": "error"` in the body (#156).
+                    .map_err(|f| {
+                        let mut error = from_process_error(OP, "glab", &f.error, &f.stderr);
+                        if current && error.code == "host_rejected" {
+                            // A 409: the merge request is not set to auto-merge (#156).
+                            error.message = NOT_CANCELLED.into();
+                        }
+                        error
+                    })?;
+                // The older endpoint refuses with HTTP 201 and `"status": "error"` (#156).
                 let body: Value = serde_json::from_str(&output.stdout).unwrap_or_default();
-                if body["status"] == "error" {
+                if !current && body["status"] == "error" {
                     let mut error = PullRequestsOperationError::new(OP, "host_rejected");
-                    error.message =
-                        "GitLab did not cancel auto-merge. Refresh to see whether it is still on."
-                            .into();
+                    error.message = NOT_CANCELLED.into();
                     error.host_detail = body["message"]
                         .as_str()
                         .map(|message| message.chars().take(240).collect());
