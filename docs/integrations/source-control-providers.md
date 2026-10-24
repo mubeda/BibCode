@@ -43,7 +43,12 @@ the server conservatively requires Owner access. Unsupported operations show
 the host's reason. GitHub rejects auto-merge combined with bypass; GitLab
 requires both permissions when both choices are selected. For GitLab merge
 message writes, the API payload sends both `auto_merge` (renamed in 17.11) and
-`merge_when_pipeline_succeeds` for older hosts.
+`merge_when_pipeline_succeeds` for older hosts. **Disable auto-merge** posts to
+`cancel_auto_merge` on GitLab 19.5+, which refuses with HTTP 403 or 409. Older
+hosts, and hosts whose version cannot be read, use the deprecated
+`cancel_merge_when_pipeline_succeeds`, which answers a refusal with HTTP 201 and
+`"status": "error"`, so the server reads its body. A refusal on either endpoint
+fails the action.
 
 “Clone from URL” is a generic Git clone. It does not require BiBCode to identify
 the hosting provider, but the URL's normal SSH or HTTPS credentials must work on

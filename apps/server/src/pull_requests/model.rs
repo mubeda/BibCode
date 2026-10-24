@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::host::HostVersion;
 use crate::source_control::ProviderKind;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -1133,6 +1134,8 @@ pub struct ActionContext {
     pub merge_commit_sha: Option<String>,
     pub reviewers: Vec<String>,
     pub assignees: Vec<String>,
+    /// The host version read with the context; `None` when unread or not version-gated.
+    pub host_version: Option<HostVersion>,
 }
 
 impl From<&DetailRaw> for ActionContext {
@@ -1150,6 +1153,7 @@ impl From<&DetailRaw> for ActionContext {
                 .map(|r| r.actor.login.clone())
                 .collect(),
             assignees: detail.assignees.iter().map(|a| a.login.clone()).collect(),
+            host_version: None,
         }
     }
 }

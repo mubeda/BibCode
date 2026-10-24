@@ -685,9 +685,21 @@ while `push.default` is unset or `simple` (Git's default spelled out) and no
 push remote (`remote.pushDefault`, `branch.<name>.pushRemote`) or push refspec
 (`remote.<name>.push`, which outranks `push.default`) is configured. The branch then tracks
 `<remote>/<branch>`, so ahead/behind counts against what was pushed. The
-upstream it started from is never written, and nothing is forced. An
-`action_failed` event's `message` carries Git's own error, which the Source
-Control toasts show; the settled client error keeps only the action and phase.
+upstream it started from is never written, and nothing is forced.
+
+An `action_failed` event names the step that failed in `phase` (`branch`,
+`commit`, `push` or `pr`), or `null` when the request was refused before any
+step ran (#174). Its `message` is the failure's wire `detail`, which carries
+Git's or the host CLI's own reason. The server redacts that output with
+`redact_sensitive_text` when it builds the detail, so the client is a
+pass-through: `VcsActionRemoteFailureError` keeps the message and uses it as
+its user-facing text, falling back to the action and phase only when the
+message is empty. The Source Control toasts title the failure by step ("Push
+failed", "Commit failed") and show that message beneath it. The terminal
+`action_finished` or `action_failed` item arrives ahead of the RPC exit, so
+`consumeVcsActionProgress` settles from it: a transport failure after it, such
+as a socket closing before the exit, does not replace the server's result or
+reason.
 
 ### Pull Requests flow
 
