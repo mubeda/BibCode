@@ -126,6 +126,7 @@ const h = vi.hoisted(() => {
     settingsListeners: new Set<() => void>(),
     centerHeaderDensityByGroupId: new Map<string, "expanded" | "compact">(),
     chatHeaderActionsInstanceCount: 0,
+    messagesTimelineInstanceCount: 0,
   };
 });
 
@@ -471,6 +472,8 @@ vi.mock("./chat/threadFind/useThreadFind", () => ({
 vi.mock("./chat/MessagesTimeline", () => ({
   MessagesTimeline: (props: Record<string, unknown>) => {
     h.captured["messagesTimeline"] = props;
+    // A new instance is a new find session: its query and selection start over.
+    useState(() => ++h.messagesTimelineInstanceCount);
     return (
       <div
         data-mock="messages-timeline"
@@ -1034,6 +1037,7 @@ beforeEach(() => {
   h.settingsListeners.clear();
   h.centerHeaderDensityByGroupId.clear();
   h.chatHeaderActionsInstanceCount = 0;
+  h.messagesTimelineInstanceCount = 0;
 
   for (const { store, pristine } of resettableStores) {
     store.setState({ ...pristine }, true);
@@ -6520,6 +6524,53 @@ describe("ChatView find in thread", () => {
       expect(event.defaultPrevented).toBe(true);
     } finally {
       await cleanup();
+    }
+  });
+
+  it("starts a new timeline, and so a new find, for the same thread id in another environment", async () => {
+    seedEnvironment(makeEnvironmentPresentation());
+    seedProject(makeProject());
+    seedServerThread(makeThread());
+    seedGitStatus(true);
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    const renderIn = async (nextEnvironmentId: EnvironmentId) => {
+      await act(async () => {
+        root.render(
+          <ChatView
+            environmentId={nextEnvironmentId}
+            threadId={threadId}
+            routeKind="server"
+            reserveTitleBarControlInset
+          />,
+        );
+        await Promise.resolve();
+      });
+    };
+    vi.unstubAllGlobals();
+    Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+    Object.defineProperty(Element.prototype, "getAnimations", {
+      configurable: true,
+      value: () => [],
+    });
+    try {
+      await renderIn(environmentId);
+      expect(h.messagesTimelineInstanceCount).toBe(1);
+
+      const nextEnvironmentId = EnvironmentId.make("environment-remote");
+      seedEnvironment(makeEnvironmentPresentation({ environmentId: nextEnvironmentId }));
+      seedProject(makeProject({ environmentId: nextEnvironmentId }));
+      seedServerThread(makeThread({ environmentId: nextEnvironmentId }));
+      await renderIn(nextEnvironmentId);
+
+      expect(capturedProps<Record<string, unknown>>("messagesTimeline")["routeThreadKey"]).toBe(
+        scopedThreadKey(scopeThreadRef(nextEnvironmentId, threadId)),
+      );
+      expect(h.messagesTimelineInstanceCount).toBe(2);
+    } finally {
+      await act(async () => root.unmount());
+      container.remove();
     }
   });
 
