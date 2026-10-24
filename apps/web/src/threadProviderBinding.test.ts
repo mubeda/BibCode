@@ -51,6 +51,7 @@ function thread(overrides: Partial<Thread> = {}): Thread {
     interactionMode: "default",
     session: null,
     messages: [],
+    reasoning: [],
     proposedPlans: [],
     activities: [],
     checkpoints: [],

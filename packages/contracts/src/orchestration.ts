@@ -367,6 +367,23 @@ export const OrchestrationMessage = Schema.Struct({
 });
 export type OrchestrationMessage = typeof OrchestrationMessage.Type;
 
+export const OrchestrationReasoningId = TrimmedNonEmptyString;
+export type OrchestrationReasoningId = typeof OrchestrationReasoningId.Type;
+
+/**
+ * One block of provider reasoning: a Claude thinking block or a Codex reasoning summary.
+ * It is never a message: no handoff, turn pointer or answer selection reads it.
+ */
+export const OrchestrationReasoning = Schema.Struct({
+  id: OrchestrationReasoningId,
+  turnId: Schema.NullOr(TurnId),
+  text: Schema.String,
+  streaming: Schema.Boolean,
+  createdAt: IsoDateTime,
+  updatedAt: IsoDateTime,
+});
+export type OrchestrationReasoning = typeof OrchestrationReasoning.Type;
+
 export const OrchestrationProposedPlanId = TrimmedNonEmptyString;
 export type OrchestrationProposedPlanId = typeof OrchestrationProposedPlanId.Type;
 
@@ -504,6 +521,10 @@ export const OrchestrationThread = Schema.Struct({
   archivedAt: Schema.NullOr(IsoDateTime).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
   deletedAt: Schema.NullOr(IsoDateTime),
   messages: Schema.Array(OrchestrationMessage),
+  /** Provider reasoning, from the thread stream only; absent from older servers. */
+  reasoning: Schema.Array(OrchestrationReasoning).pipe(
+    Schema.withDecodingDefault(Effect.succeed([])),
+  ),
   proposedPlans: Schema.Array(OrchestrationProposedPlan).pipe(
     Schema.withDecodingDefault(Effect.succeed([])),
   ),
@@ -1018,6 +1039,27 @@ const ThreadMessageAssistantCompleteCommand = Schema.Struct({
   createdAt: IsoDateTime,
 });
 
+const ThreadReasoningDeltaCommand = Schema.Struct({
+  type: Schema.Literal("thread.reasoning.delta"),
+  commandId: CommandId,
+  threadId: ThreadId,
+  reasoningId: OrchestrationReasoningId,
+  delta: Schema.String,
+  turnId: Schema.optional(TurnId),
+  createdAt: IsoDateTime,
+});
+
+/** With `text`, the text replaces what streamed; without it, only a streaming entry settles. */
+const ThreadReasoningCompleteCommand = Schema.Struct({
+  type: Schema.Literal("thread.reasoning.complete"),
+  commandId: CommandId,
+  threadId: ThreadId,
+  reasoningId: OrchestrationReasoningId,
+  text: Schema.optional(Schema.String),
+  turnId: Schema.optional(TurnId),
+  createdAt: IsoDateTime,
+});
+
 const ThreadProposedPlanUpsertCommand = Schema.Struct({
   type: Schema.Literal("thread.proposed-plan.upsert"),
   commandId: CommandId,
@@ -1061,6 +1103,8 @@ const InternalOrchestrationCommand = Schema.Union([
   ThreadSessionSetCommand,
   ThreadMessageAssistantDeltaCommand,
   ThreadMessageAssistantCompleteCommand,
+  ThreadReasoningDeltaCommand,
+  ThreadReasoningCompleteCommand,
   ThreadProposedPlanUpsertCommand,
   ThreadTurnDiffCompleteCommand,
   ThreadActivityAppendCommand,
@@ -1103,6 +1147,7 @@ export const OrchestrationEventType = Schema.Literals([
   "thread.runtime-mode-set",
   "thread.interaction-mode-set",
   "thread.message-sent",
+  "thread.reasoning-sent",
   "thread.turn-start-requested",
   "thread.turn-steer-requested",
   "thread.turn-interrupt-requested",
@@ -1221,6 +1266,16 @@ export const ThreadMessageSentPayload = Schema.Struct({
   role: OrchestrationMessageRole,
   text: Schema.String,
   attachments: Schema.optional(Schema.Array(ChatAttachment)),
+  turnId: Schema.NullOr(TurnId),
+  streaming: Schema.Boolean,
+  createdAt: IsoDateTime,
+  updatedAt: IsoDateTime,
+});
+
+export const ThreadReasoningSentPayload = Schema.Struct({
+  threadId: ThreadId,
+  reasoningId: OrchestrationReasoningId,
+  text: Schema.String,
   turnId: Schema.NullOr(TurnId),
   streaming: Schema.Boolean,
   createdAt: IsoDateTime,
@@ -1396,6 +1451,11 @@ export const OrchestrationEvent = Schema.Union([
     ...EventBaseFields,
     type: Schema.Literal("thread.message-sent"),
     payload: ThreadMessageSentPayload,
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("thread.reasoning-sent"),
+    payload: ThreadReasoningSentPayload,
   }),
   Schema.Struct({
     ...EventBaseFields,
