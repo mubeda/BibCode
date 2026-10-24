@@ -1323,6 +1323,19 @@ lets xterm answer. `CSI ? 996 n` stays swallowed (xterm does not implement it).
 The PTY reader keeps its synchronous answers and original transcript bytes.
 Input is never filtered by reply shape.
 
+When the replayed session has exited, the renderer writes a mode reset to
+xterm after the history, never to the PTY or into stored history. RIS precedes
+the history, so the renderer scans the history for the screen it ends on and
+leaves an alternate screen the way it was entered (`?47`, `?1047` or `?1049`),
+saving the cursor first. A main-screen history gets no alternate-screen toggle,
+which would restore a stale saved cursor. The reset then turns off application
+cursor keys and keypad, every mouse protocol and encoding, focus reports and
+bracketed paste, shows the cursor, and pops Kitty keyboard flags and
+modifyOtherKeys (xterm 6 ignores those two). A history with no ESC is written
+unchanged, and a running session's replay keeps the modes its program enabled.
+The status comes from the transcript runtime's metadata, which a snapshot
+updates before it fans out the reset.
+
 Without `terminalSizeOwnership`, clients retain local fit-and-resize behavior
 and live replies, with conditional server-color-query suppression. Every replay
 is guarded on that transitional path, so startup-history queries are not

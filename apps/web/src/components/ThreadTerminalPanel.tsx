@@ -879,7 +879,7 @@ export function TerminalViewport({
   const rendererRef = useRef<{
     readonly sizeClaim: string;
     dismissSizeNotice(): void;
-    render(signal: TerminalRenderSignal, claimOnAttach: boolean): void;
+    render(signal: TerminalRenderSignal, claimOnAttach: boolean, exited: boolean): void;
     size(trigger: TerminalSizeTrigger): void;
   } | null>(null);
   const [inputError, setInputError] = useState<string | null>(null);
@@ -1519,7 +1519,7 @@ export function TerminalViewport({
       else if (size?.sizeClaim === sizeClaim) handleSizeTrigger("layout");
       else updateSizeNotice();
     };
-    const render = (signal: TerminalRenderSignal, claimOnAttach: boolean) => {
+    const render = (signal: TerminalRenderSignal, claimOnAttach: boolean, exited: boolean) => {
       if (disposed) return;
       if (signal.type === "delta") {
         outputSink.push(signal.data);
@@ -1554,6 +1554,7 @@ export function TerminalViewport({
         sizeOwnership &&
           signal.firstAttachmentGrant === true &&
           signal.size?.sizeClaim === sizeClaim,
+        exited,
       );
       terminal.clearSelection();
     };
@@ -2074,10 +2075,11 @@ export function TerminalViewport({
       return;
     let generation: number | null = null;
     const attachment = transcriptRuntime.attachRenderer((signal) => {
-      const nextGeneration = transcriptRuntime.metadata().generation;
-      const claimOnAttach = signal.type === "reset" && generation !== nextGeneration;
-      generation = nextGeneration;
-      renderer.render(signal, claimOnAttach);
+      const metadata = transcriptRuntime.metadata();
+      const claimOnAttach = signal.type === "reset" && generation !== metadata.generation;
+      generation = metadata.generation;
+      // A reset is published after its snapshot's status, so this is the replayed session's.
+      renderer.render(signal, claimOnAttach, metadata.status === "exited");
     }, renderer.sizeClaim);
     return () => attachment.detach();
   }, [shouldRender, transcriptRuntime, rendererEpoch]);
