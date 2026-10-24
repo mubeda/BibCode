@@ -44,7 +44,16 @@ cargo test -p bibcode-server --lib diagnostics::native::tests:: -j 2
 cargo test -p bibcode-server --lib diagnostics::resource_sampler::tests:: -j 2
 cargo test -p bibcode-server --lib diagnostics::monitor::tests:: -j 2
 cargo test -p bibcode-server --lib production::server_terminal::tests::embedded_host_cleanup_preserves_unmanaged_host_descendants -j 2 -- --exact
+cargo test -p bibcode-server --lib diagnostics::registry::tests::a_surviving_registration_is_no_shutdown_root -j 2 -- --exact
+cargo test -p bibcode-server --lib production::runtime::tests::quiesce_in_ -j 2
 ```
+
+A registration marked `survives_shutdown` (a diff app opened through
+**Open with**) must never be a shutdown root, and a standalone server's
+descendant sweep must spare it and its descendants while still ending an
+ordinary registered helper. The quiesce tests check both on Linux, where
+cleanup signals through a pidfd; on macOS cleanup ends nothing, so only the
+survivors' half applies there.
 
 Construction must leave the native process table empty. The first diagnostics
 read starts the background sampler; its first sample must discover the current
@@ -2992,6 +3001,21 @@ agent turn edit two files so the thread has a turn with checkpoints.
    picks up the new version.
 7. Quit and relaunch the app. Compare, Split, **Changes only** and 7 context
    lines are all restored, and the selected file is reselected.
+8. **Open with**, with the platform's diff apps installed (Beyond Compare and
+   FileMerge on macOS, Meld and KDiff3 on Linux, WinMerge on Windows):
+   - the menu lists them with the default marked, and `git config
+     diff.guitool <tool>` moves the default to that tool;
+   - in Compare, open the selected file, the deleted file and the rename in
+     each scope, and **All files in** for the turn; the app shows the right
+     two versions. In Changes, the toolbar's menu opens every file;
+   - the untracked file's menu says to stage it, and a thread in an SSH
+     environment says where it runs;
+   - set `difftool.broken.cmd` to `exit 3` and choose it: the alert shows Git's
+     message and **Copy command**, whose command reproduces the failure in a
+     terminal;
+   - with a diff app still open, quit the desktop app, and separately stop a
+     standalone server from its terminal with Ctrl+C: the diff app stays
+     open.
 
 Record screenshots at the normal and minimum window sizes, in light and dark.
 

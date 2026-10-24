@@ -934,6 +934,17 @@ runtime's provider, terminal, helper, or tunnel children. PID reuse is excluded 
 identity checks, registry entries leave with their process owners, and shutdown
 is idempotent without awaiting while the registry lock is held.
 
+A registration marked `survives_shutdown` is never a root. The Diff panel's
+**Open with** marks each `git difftool` it starts this way, because the diff
+app above it may hold unsaved edits to the user's files. Freezing ownership
+returns these survivors separately, and a standalone server's final sweep of
+its own descendants spares each survivor and everything under it, matched by
+creation time. The launcher stops taking launches before the freeze and keeps
+its registrations, so an app still open is a survivor when ownership is
+captured. Every other registration (providers, terminals, the desktop UI and
+helpers) is a root as before. See
+[Open with](./rpc-and-orchestration.md#open-with).
+
 Preparation is single-flight and returns a lease-bound identifier. Commit and
 cancel must present that identifier. Commit sends its HTTP response before the
 backend exits cleanly; cancellation, preparation failure, and lease expiry also
@@ -1792,7 +1803,10 @@ it.
   signal, nothing that dies with it is. A SIGKILL BiBCode did not send is
   labelled likely OOM. The Diff panel's review and turn patches report their
   `git` child the same way; the runner's own kill, at the patch cap or after a
-  failed read, is a requested stop.
+  failed read, is a requested stop. A diff app opened through **Open with**
+  runs under a `git difftool` whose reaper reports it as the label
+  `git-difftool`, counting signals only; an exit code, which a diff tool may
+  use to mean "differences found", is logged and never a finding.
 - **Webview.** On desktop, the end of the main window's web content process (on
   Windows, any WebView2 process failure) is a `crash.webview` finding.
   - Linux hooks WebKitGTK `web-process-terminated` (except `TerminatedByApi`).

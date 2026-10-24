@@ -242,7 +242,9 @@ A panic that ended the process also leaves a `crash.unclean-exit` or
   - commands such as `git`: signals only. This includes the Diff panel's
     review and turn patches. Their runner kills Git itself at the patch cap or
     after a failed read, and that kill is a requested stop, so it never counts
-    as an out-of-memory `SIGKILL`;
+    as an out-of-memory `SIGKILL`. A diff app opened through **Open with** is
+    reported as `git-difftool` when its `git difftool` exits: signals only,
+    since a diff tool's exit code may just mean differences were found;
   - the BiBCode Connect tunnel connector (`command`, labelled by its
     executable, such as `bibcode-connect`): signals and non-zero exits, noticed
     within 5 s; its relay preview hostnames are withdrawn until the next link

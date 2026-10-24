@@ -558,8 +558,9 @@ shared procedure owns authenticated list/detail/files evidence.
 
 Include the shared [Diff Compare scenario](./cross-platform-validation.md#diff-compare-scenario):
 Changes and Compare, the explained file states, the filters, Changes only with
-7 context lines, F7 and Shift+F7, and the quit-and-relaunch check that the
-view, Split, the line filter and the count are restored.
+7 context lines, F7 and Shift+F7, the quit-and-relaunch check that the view,
+Split, the line filter and the count are restored, and **Open with** in Meld
+and KDiff3, including an app that stays open when BiBCode quits.
 
 Include the shared [slow-link liveness scenario](./cross-platform-validation.md#slow-link-liveness-scenario)
 when a browser client and a development or standalone server are available on
