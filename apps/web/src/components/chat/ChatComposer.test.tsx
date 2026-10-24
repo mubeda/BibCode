@@ -2172,12 +2172,9 @@ describe("ChatComposer menu selection", () => {
 // ---------------------------------------------------------------------------
 
 describe("ChatComposer command keys", () => {
-  it.each([
-    ["an empty draft", "", 0],
-    ["a single-line draft", "fix the build", 4],
-  ])("pages the timeline from %s", (_case, value, cursor) => {
+  // The editor offers a page key only once the draft has no use for it (ComposerPromptEditor).
+  it("pages the timeline with an offered page key", () => {
     const { spies } = renderComposer();
-    setEditorSnapshot(value, cursor);
     const onKey = editorProps()["onCommandKeyDown"] as CommandKey;
 
     expect(onKey("PageUp", keyEvent())).toBe(true);
@@ -2188,31 +2185,14 @@ describe("ChatComposer command keys", () => {
     ]);
   });
 
-  it("leaves PageUp and PageDown to the editor when they would move the caret", () => {
+  it("leaves a page key with a modifier to the editor and the browser", () => {
     const { spies } = renderComposer();
     const onKey = editorProps()["onCommandKeyDown"] as CommandKey;
 
-    // Middle line: both keys move the caret.
-    setEditorSnapshot("one\ntwo\nthree", 5);
-    expect(onKey("PageUp", keyEvent())).toBe(false);
-    expect(onKey("PageDown", keyEvent())).toBe(false);
-    // First line: only PageDown has a line to move to.
-    setEditorSnapshot("one\ntwo", 1);
-    expect(onKey("PageDown", keyEvent())).toBe(false);
-    expect(onKey("PageUp", keyEvent())).toBe(true);
-    // Last line: only PageUp has a line to move to.
-    setEditorSnapshot("one\ntwo", 6);
-    expect(onKey("PageUp", keyEvent())).toBe(false);
-    expect(onKey("PageDown", keyEvent())).toBe(true);
     // Shift extends the selection.
-    setEditorSnapshot("", 0);
     expect(onKey("PageUp", keyEvent({ shiftKey: true }))).toBe(false);
     expect(onKey("PageDown", keyEvent({ altKey: true }))).toBe(false);
-
-    expect(spies.onPageTimeline.mock.calls).toEqual([
-      ["PageUp", false],
-      ["PageDown", false],
-    ]);
+    expect(spies.onPageTimeline).not.toHaveBeenCalled();
   });
 
   it("toggles interaction mode on Shift+Tab", () => {
