@@ -380,6 +380,8 @@ vi.mock("../keybindings", () => ({
   resolveShortcutCommand: (event: { key?: string }) =>
     typeof event.key === "string" ? (h.shortcutCommandByKey.get(event.key) ?? null) : null,
   shortcutLabelForCommand: () => h.shortcutLabel,
+  // Find in thread opens only for a resolved chat.find here; its fallback has its own tests.
+  shouldOpenChatFind: (command: string | null) => command === "chat.find",
 }));
 
 vi.mock("../commandPaletteContext", () => ({
