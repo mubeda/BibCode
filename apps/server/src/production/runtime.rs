@@ -1196,7 +1196,10 @@ impl ReviewBackend for GitReviewBackend {
                     read_review_blob(root, oid, cancellation).await
                 }
                 ReviewFileVersionRequest::Worktree { path, expected_oid } => {
-                    read_review_worktree_file(root, path, expected_oid, cancellation).await
+                    // The patch names files from the repository's top, also for a project in
+                    // a subdirectory of it.
+                    let top = review_repository_top(root, cancellation).await?;
+                    read_review_worktree_file(&top, path, expected_oid, cancellation).await
                 }
             }
         })
@@ -1235,6 +1238,33 @@ fn review_version_git(
 
 fn review_version_error(error: crate::git::ProcessError) -> ReviewError {
     ReviewError::Backend(error.to_string())
+}
+
+/// The top of the repository `cwd` is in: where `git diff` starts the paths it prints.
+async fn review_repository_top(
+    cwd: &Path,
+    cancellation: &CancellationToken,
+) -> Result<PathBuf, ReviewError> {
+    let output = crate::git::ProcessRunner
+        .run_bytes(
+            review_version_git(
+                cwd,
+                "Review.readFileVersion.top",
+                &["rev-parse", "--show-toplevel"],
+                Vec::new(),
+                64 * 1024,
+            ),
+            cancellation,
+        )
+        .await
+        .map_err(review_version_error)?;
+    let top = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if top.is_empty() {
+        return Err(ReviewError::Backend(
+            "git rev-parse printed no repository top".to_owned(),
+        ));
+    }
+    Ok(PathBuf::from(top))
 }
 
 /// Reads a blob by its full object ID with one `git cat-file --batch`. No filter or text
@@ -4553,6 +4583,31 @@ mod tests {
                 "{refused}"
             );
         }
+    }
+
+    /// A project in a subdirectory of its repository still gets patches whose paths start at
+    /// the repository's top, and a worktree read names the file the same way.
+    #[tokio::test]
+    async fn worktree_versions_read_repository_paths_from_a_subdirectory_project() {
+        let repository = VersionRepository::new();
+        std::fs::create_dir(repository.path().join("sub")).expect("subdirectory");
+        repository.write("sub/inner.txt", "inner before\n");
+        repository.git(&["add", "sub/inner.txt"]);
+        repository.git(&["commit", "--quiet", "-m", "inner"]);
+        repository.write("sub/inner.txt", "inner after\n");
+        let current = repository.git(&["hash-object", "sub/inner.txt"]);
+        let project = repository.path().join("sub").to_string_lossy().into_owned();
+        let read = GitReviewBackend
+            .read_file_version(
+                &ReviewReadFileVersionInput {
+                    cwd: project,
+                    version: worktree("sub/inner.txt", current),
+                },
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("read");
+        assert_eq!(read, text("inner after\n"));
     }
 
     /// Under `core.autocrlf=true` the checkout has CRLF while Git hashes LF, so the read must
