@@ -1,6 +1,6 @@
 # GitLab Live Pipeline
 
-Status: Proposed 2026-10-24; awaiting approval.
+Status: Approved 2026-10-24 with every recommended answer.
 
 Scope: the live-pipeline part of issue #156 ("Proposed design: live pipeline
 without new transport", GitLab version handling, edge cases). The readiness

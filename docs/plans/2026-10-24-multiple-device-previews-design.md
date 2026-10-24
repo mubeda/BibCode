@@ -1,6 +1,6 @@
 # Multiple Device Previews
 
-Status: Proposed 2026-10-24; awaiting approval. Issue #170.
+Status: Approved 2026-10-24 with every recommended answer. Issue #170.
 
 ## Problem
 

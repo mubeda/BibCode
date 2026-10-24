@@ -1,6 +1,6 @@
 # MCP Server for Outside Agents
 
-Status: Proposed 2026-10-24; awaiting approval. Issue #139. Implemented last in
+Status: Approved 2026-10-24 with every recommended answer. Issue #139. Implemented last in
 the batch after v0.11.0.
 
 ## Goal

@@ -1,6 +1,6 @@
 # Reasoning as Thinking Rows
 
-Status: Proposed 2026-10-24; awaiting approval. Issue #173. Builds on #167
+Status: Approved 2026-10-24 with every recommended answer. Issue #173. Builds on #167
 (v0.11.0) and composes with #142 (Verbose chat) and the Worked-for fold (#154).
 
 ## Problem

@@ -1,6 +1,6 @@
 # Find in Thread
 
-Status: Proposed 2026-10-24; awaiting approval. Design for #175.
+Status: Approved 2026-10-24 with every recommended answer. Design for #175.
 
 ## Problem
 
