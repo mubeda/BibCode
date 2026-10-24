@@ -573,6 +573,88 @@ pub struct Detail {
     pub permissions: Permissions,
     pub url: String,
     pub tab_counts: TabCounts,
+    /// The gating pipeline as this read saw it (GitLab); its `checks` is `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipeline: Option<PipelineCopy>,
+}
+
+/// GitLab's pipeline statuses, folded to what the merge box shows.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum PipelineStatus {
+    Created,
+    Queued,
+    Running,
+    Waiting,
+    Manual,
+    Scheduled,
+    Canceling,
+    Success,
+    Failed,
+    Canceled,
+    Skipped,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PipelineStage {
+    pub name: String,
+    pub status: PipelineStatus,
+    /// The host's detailed status is "passed with warnings".
+    pub warnings: bool,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PipelineKind {
+    MergeRequest,
+    MergedResults,
+    MergeTrain,
+    Branch,
+    Other,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PresentPipeline {
+    pub id: u64,
+    pub status: PipelineStatus,
+    pub warnings: bool,
+    pub kind: PipelineKind,
+    #[serde(rename = "ref")]
+    pub git_ref: String,
+    pub sha: String,
+    /// `None` when it is unknown whether the pipeline ran for the latest commit.
+    pub is_for_head: Option<bool>,
+    pub url: Option<String>,
+    pub updated_at: String,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub duration_seconds: Option<f64>,
+    /// `None` when the stages could not be read.
+    pub stages: Option<Vec<PipelineStage>>,
+}
+
+/// `None` when the host reports no pipeline, `Hidden` when the account cannot
+/// view pipelines (the host omits the field).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "_tag", rename_all = "lowercase")]
+pub enum Pipeline {
+    None,
+    Hidden,
+    Present(PresentPipeline),
+}
+
+/// One self-consistent pipeline observation. `revision` is the snapshot
+/// generation the read took before its first host call; the client shows the
+/// copy with the highest revision across every source.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PipelineCopy {
+    pub revision: i64,
+    pub pipeline: Pipeline,
+    pub checks: Option<Checks>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -731,6 +813,12 @@ pub struct Checks {
     pub groups: Vec<CheckGroup>,
     pub summary: CheckSummary,
     pub pipeline_url: Option<String>,
+    /// The read's snapshot generation, so the client keeps the newer copy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<i64>,
+    /// A stage listed more jobs than the read returned.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -811,6 +899,9 @@ pub struct Snapshot {
     pub list: Option<SnapshotPayload<ListPage>>,
     pub detail: Option<SnapshotPayload<Detail>>,
     pub tab: Option<SnapshotTab>,
+    /// The poller's pipeline row for the number.
+    #[serde(default)]
+    pub pipeline: Option<SnapshotPayload<PipelineCopy>>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -822,6 +913,21 @@ pub struct Changed {
     pub commits: bool,
     pub checks: bool,
     pub files: bool,
+    /// The stored pipeline row changed; older clients ignore it.
+    #[serde(default)]
+    pub pipeline: bool,
+}
+
+impl Changed {
+    pub fn any(&self) -> bool {
+        self.list
+            || self.detail
+            || self.timeline
+            || self.commits
+            || self.checks
+            || self.files
+            || self.pipeline
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]

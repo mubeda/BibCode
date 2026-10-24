@@ -230,12 +230,18 @@ async fn pull_requests_gitlab_warm_actions_reuse_context_but_refresh_permissions
         (&json!([]), "awards"),
         (&json!([]), "issues"),
         (&metadata, "graphql"),
+        (
+            &json!({"data":{"project":{"mergeRequest":{"headPipeline":null}}}}),
+            "pipeline-graphql",
+        ),
     ] {
         f.response(value.clone());
         f.role(role);
     }
     service.get(f.root.path(), 14, &c).await.unwrap();
-    assert_eq!(f.count() - before, 8);
+    // The origin read plus the eight reads of the detail wave, the pipeline
+    // stages query among them.
+    assert_eq!(f.count() - before, 9);
     eprintln!(
         "GitLab post-action detail: {} total processes",
         f.count() - before

@@ -4,6 +4,7 @@
 mod executable_fixture;
 
 use std::{
+    collections::HashMap,
     fs,
     io::ErrorKind,
     path::{Path, PathBuf},
@@ -18,7 +19,7 @@ use bibcode_server::persistence::{Database, run_migrations};
 use bibcode_server::pull_requests::{
     ContextRead, PullRequestsService,
     host::HostCommandRunner,
-    model::{Changed, Context, ListQuery, SubscribeInput},
+    model::{Changed, Context, ListQuery, SubscribeInput, SubscribeTab},
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -41,6 +42,8 @@ const MR_NUMBER: u64 = 42;
 struct Hit {
     method: String,
     path: String,
+    /// Which GraphQL document a `POST graphql` carried.
+    graphql: Option<&'static str>,
     status: u16,
     start_ms: u128,
     end_ms: u128,
@@ -53,16 +56,67 @@ struct Api {
     inflight: AtomicUsize,
     max_inflight: AtomicUsize,
     list_page: String,
-    detail: String,
+    /// Per merge request number: its REST body and its GraphQL pipeline answer.
+    merge_requests: Mutex<HashMap<u64, (Value, Value)>>,
     timeline: String,
     metadata: String,
 }
 
 impl Api {
+    fn new(rtt_ms: u64) -> Self {
+        Self {
+            started: Instant::now(),
+            rtt_ms: AtomicU64::new(rtt_ms),
+            hits: Mutex::new(Vec::new()),
+            inflight: AtomicUsize::new(0),
+            max_inflight: AtomicUsize::new(0),
+            list_page: list_page(),
+            merge_requests: Mutex::new(HashMap::from([(
+                MR_NUMBER,
+                (detail_body(MR_NUMBER), no_pipeline_graph()),
+            )])),
+            timeline: timeline_body(),
+            metadata: metadata_body(),
+        }
+    }
+
     fn snapshot_and_clear(&self) -> (Vec<Hit>, usize) {
         let hits = std::mem::take(&mut *self.hits.lock().expect("hit log"));
         let max_inflight = self.max_inflight.swap(0, Ordering::AcqRel);
         (hits, max_inflight)
+    }
+
+    /// Sets one merge request's head pipeline, merge status and GraphQL stages.
+    fn set_pipeline(
+        &self,
+        number: u64,
+        id: u64,
+        status: &str,
+        merge_status: &str,
+        stages: &[(&str, &str)],
+    ) {
+        let mut detail = detail_body(number);
+        detail["detailed_merge_status"] = json!(merge_status);
+        detail["head_pipeline"] = json!({
+            "id": id,
+            "status": status,
+            "ref": format!("refs/merge-requests/{number}/head"),
+            "sha": detail["sha"],
+            "updated_at": "2026-10-24T10:00:00Z",
+            "detailed_status": {"group": status},
+        });
+        let mut merge_requests = self.merge_requests.lock().expect("merge requests");
+        if let Some((previous, _)) = merge_requests.get(&number) {
+            detail["updated_at"] = previous["updated_at"].clone();
+        }
+        merge_requests.insert(number, (detail, pipeline_graph(id, status, stages)));
+    }
+
+    fn touch(&self, number: u64, updated_at: &str) {
+        let mut merge_requests = self.merge_requests.lock().expect("merge requests");
+        if let Some((detail, _)) = merge_requests.get_mut(&number) {
+            detail["updated_at"] = json!(updated_at);
+        }
     }
 }
 
@@ -91,17 +145,7 @@ async fn gitlab_list_and_merge_request_loads_record_requests_and_wall_time() {
     fs::create_dir(&cwd).expect("checkout dir");
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let address = listener.local_addr().expect("local addr");
-    let api = Arc::new(Api {
-        started: Instant::now(),
-        rtt_ms: AtomicU64::new(rtt_ms),
-        hits: Mutex::new(Vec::new()),
-        inflight: AtomicUsize::new(0),
-        max_inflight: AtomicUsize::new(0),
-        list_page: list_page(),
-        detail: detail_body(),
-        timeline: timeline_body(),
-        metadata: metadata_body(),
-    });
+    let api = Arc::new(Api::new(rtt_ms));
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let server = tokio::spawn(serve(listener, Arc::clone(&api), shutdown_rx));
     let log_path = root.path().join("glab-calls.jsonl");
@@ -197,7 +241,9 @@ async fn gitlab_list_and_merge_request_loads_record_requests_and_wall_time() {
         );
     }
     assert_eq!(samples[0].list.http, 7, "list http requests");
-    assert_eq!(samples[0].mr.http, 26, "merge request http requests");
+    // 27 since the detail join reads the pipeline stages (the eighth read of
+    // its first wave), so the stage strip is on screen at first paint.
+    assert_eq!(samples[0].mr.http, 27, "merge request http requests");
     if rtt_ms >= 100 {
         let list_inflight = samples
             .iter()
@@ -229,23 +275,16 @@ async fn gitlab_subscribed_merge_request_polling_records_host_requests() {
     fs::create_dir(&cwd).expect("checkout dir");
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let address = listener.local_addr().expect("local addr");
-    let api = Arc::new(Api {
-        started: Instant::now(),
-        rtt_ms: AtomicU64::new(RTT_MS),
-        hits: Mutex::new(Vec::new()),
-        inflight: AtomicUsize::new(0),
-        max_inflight: AtomicUsize::new(0),
-        list_page: list_page(),
-        detail: detail_body(),
-        timeline: timeline_body(),
-        metadata: metadata_body(),
-    });
+    let api = Arc::new(Api::new(RTT_MS));
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let server = tokio::spawn(serve(listener, Arc::clone(&api), shutdown_rx));
     let log_path = root.path().join("glab-calls.jsonl");
     let glab = write_glab(root.path(), &format!("http://{address}"), &log_path);
     let gh = write_gh(root.path());
-    let runner = HostCommandRunner::new(root.path().join("state")).with_commands(gh, glab, "git");
+    // Every local `git` spawn (one per `readSnapshot`) is counted too.
+    let git_log = root.path().join("git-calls.log");
+    let git = write_git(root.path(), &git_log);
+    let runner = HostCommandRunner::new(root.path().join("state")).with_commands(gh, glab, git);
     let token = CancellationToken::new();
     runner
         .git(&cwd, &["init", "-q", "-b", "main"], &token)
@@ -400,8 +439,13 @@ async fn gitlab_subscribed_merge_request_polling_records_host_requests() {
         format_tick_sample(&unchanged_detail)
     );
 
+    let active = active_pipeline_phase(&service, &cwd, &api, &log_path, &git_log).await;
+    let delivery = delivery_phase(&service, &cwd, &api).await;
+
     let report = json!({
         "rttMs": RTT_MS,
+        "activePipeline": active,
+        "delivery": delivery,
         "detailBandMs": {
             "minWallMs": detail_band.min_wall_ms,
             "medianWallMs": detail_band.median_wall_ms,
@@ -436,6 +480,323 @@ struct DetailBand {
     min_wall_ms: u128,
     max_wall_ms: u128,
     median_wall_ms: u128,
+}
+
+fn tab_input(
+    cwd: &Path,
+    number: u64,
+    tab: SubscribeTab,
+    list: Option<&ListQuery>,
+) -> SubscribeInput {
+    let query = list.cloned().unwrap_or_else(|| list_query(cwd));
+    let mut value = serde_json::to_value(query).expect("list query value");
+    let object = value.as_object_mut().expect("list query object");
+    object.insert("number".into(), json!(number));
+    object.insert("tab".into(), json!(tab));
+    serde_json::from_value(value).expect("subscribe input")
+}
+
+/// A subscription answered the way the detail view answers it: `detail` with
+/// `get`, `pipeline` and `list` with `readSnapshot`, and `checks` without
+/// `pipeline` on the Pipelines tab with `getChecks`.
+fn answering_client(
+    service: &PullRequestsService,
+    cwd: &Path,
+    input: SubscribeInput,
+    events: Arc<Mutex<Vec<Changed>>>,
+    cancel: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<Changed>();
+    let emit = move |changed: Changed| sender.send(changed).is_ok();
+    let subscribe_service = service.clone();
+    let subscribe_input = input.clone();
+    let subscribe_cancel = cancel.clone();
+    let subscription = tokio::spawn(async move {
+        let _ = subscribe_service
+            .subscribe(subscribe_input, &emit, &subscribe_cancel)
+            .await;
+    });
+    let client = service.clone();
+    let cwd = cwd.to_path_buf();
+    tokio::spawn(async move {
+        let number = input.number.expect("a detail subscription");
+        let on_checks = input.tab == Some(SubscribeTab::Checks);
+        loop {
+            let changed = tokio::select! {
+                () = cancel.cancelled() => break,
+                changed = receiver.recv() => match changed { Some(changed) => changed, None => break },
+            };
+            events.lock().expect("events").push(changed.clone());
+            let c = CancellationToken::new();
+            if changed.detail {
+                let _ = client.get(&cwd, number, &c).await;
+            }
+            if changed.pipeline || changed.list {
+                let _ = client.read_snapshot(input.clone(), &c).await;
+            }
+            if changed.checks && !changed.pipeline && on_checks {
+                let _ = client.checks(&cwd, number, &c).await;
+            }
+        }
+        let _ = subscription.await;
+    })
+}
+
+fn count_hits(hits: &[Hit], keep: impl Fn(&Hit) -> bool) -> usize {
+    hits.iter().filter(|hit| keep(hit)).count()
+}
+
+/// One list key, one number, two subscribers of it (Conversation and
+/// Pipelines) over a simulated pipeline lifetime: stage progress, then a
+/// finish that changes the merge status. Counts every host request, `glab`
+/// and `git` spawn, and derives the hourly figure from the measured window.
+async fn active_pipeline_phase(
+    service: &PullRequestsService,
+    cwd: &Path,
+    api: &Arc<Api>,
+    log_path: &Path,
+    git_log: &Path,
+) -> Value {
+    api.set_pipeline(
+        MR_NUMBER,
+        900,
+        "running",
+        "ci_still_running",
+        &[
+            ("build", "success"),
+            ("test", "running"),
+            ("deploy", "created"),
+        ],
+    );
+    let cancel = CancellationToken::new();
+    let (conversation_events, checks_events) = (Arc::default(), Arc::default());
+    let clients = [
+        answering_client(
+            service,
+            cwd,
+            tab_input(cwd, MR_NUMBER, SubscribeTab::Conversation, None),
+            Arc::clone(&conversation_events),
+            cancel.clone(),
+        ),
+        answering_client(
+            service,
+            cwd,
+            tab_input(cwd, MR_NUMBER, SubscribeTab::Checks, None),
+            Arc::clone(&checks_events),
+            cancel.clone(),
+        ),
+    ];
+    // The first tick sees the new pipeline and merge status (and answers
+    // `detail`); measuring starts after it.
+    tokio::time::sleep(Duration::from_secs(16)).await;
+    let _ = fs::write(log_path, "");
+    let _ = fs::write(git_log, "");
+    api.snapshot_and_clear();
+    // Stage and job progress only: the merge status stays `ci_still_running`.
+    let started = Instant::now();
+    tokio::time::sleep(Duration::from_secs(25)).await;
+    api.set_pipeline(
+        MR_NUMBER,
+        900,
+        "running",
+        "ci_still_running",
+        &[
+            ("build", "success"),
+            ("test", "success"),
+            ("deploy", "running"),
+        ],
+    );
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    let progress_window = started.elapsed();
+    let progress = api.hits.lock().expect("hit log").clone();
+    let progress_glab = read_glab_args(log_path);
+    let progress_git = fs::read_to_string(git_log)
+        .unwrap_or_default()
+        .lines()
+        .count();
+    // The finish: the pipeline passes and the merge status settles.
+    api.set_pipeline(
+        MR_NUMBER,
+        900,
+        "success",
+        "mergeable",
+        &[
+            ("build", "success"),
+            ("test", "success"),
+            ("deploy", "success"),
+        ],
+    );
+    tokio::time::sleep(Duration::from_secs(25)).await;
+    cancel.cancel();
+    for client in clients {
+        let _ = client.await;
+    }
+    let all = api.snapshot_and_clear().0;
+
+    let pipeline_reads = count_hits(&progress, |hit| hit.graphql == Some("pipeline"));
+    let probes = count_hits(&progress, |hit| {
+        hit.method == "GET" && is_probe_path(&hit.path, MR_NUMBER)
+    });
+    let lists = progress_glab
+        .iter()
+        .filter(|args| args.len() >= 2 && args[0] == "mr" && args[1] == "list")
+        .count();
+    let totals = progress_glab
+        .iter()
+        .filter(|args| args.len() >= 2 && args[0] == "api" && args[1] == "-i")
+        .count();
+    let progress_joins = detail_join_hits_in(&progress);
+    let per_hour = |count: usize| count as f64 * 3600.0 / progress_window.as_secs_f64();
+    assert_eq!(
+        progress_joins,
+        0,
+        "no detail join from stage, job or status ticks: {}",
+        format_hits(&progress)
+    );
+    assert!(
+        pipeline_reads >= 4 && pipeline_reads <= probes,
+        "one pipeline read per active tick for both subscribers: {pipeline_reads} reads, {probes} probes"
+    );
+    assert!(
+        lists * 2 <= probes + 1,
+        "the list keeps its 20 s cadence: {lists} lists, {probes} probes"
+    );
+    assert!(
+        totals <= 3,
+        "the unchanged page reuses its totals: {totals}"
+    );
+    // 360 probes, 360 pipeline reads and 180 list reads at exact 10 s ticks;
+    // the tick's own run time stretches real ticks a little. The totals add
+    // at most about 40 an hour in steady state (a reload every 5 minutes).
+    let ticking = per_hour(probes + pipeline_reads + lists);
+    assert!(
+        (500.0..=950.0).contains(&ticking),
+        "about 900 tick requests an hour per active merge request, measured {ticking:.0}"
+    );
+    let hourly = per_hour(probes + pipeline_reads + lists + totals);
+    let events = |log: &Arc<Mutex<Vec<Changed>>>| log.lock().expect("events").clone();
+    for log in [&conversation_events, &checks_events] {
+        let events = events(log);
+        assert!(events.iter().any(|changed| changed.pipeline), "{events:?}");
+        assert!(
+            events.iter().any(|changed| changed.detail),
+            "the merge status change raises detail: {events:?}"
+        );
+    }
+    json!({
+        "progressWindowSeconds": progress_window.as_secs(),
+        "probes": probes,
+        "pipelineReads": pipeline_reads,
+        "listReads": lists,
+        "totalsReads": totals,
+        "hostRequestsPerHour": hourly.round(),
+        "probesPerHour": per_hour(probes).round(),
+        "pipelineReadsPerHour": per_hour(pipeline_reads).round(),
+        "listReadsPerHour": per_hour(lists).round(),
+        "totalsReadsPerHour": per_hour(totals).round(),
+        "detailJoinHitsDuringProgress": progress_joins,
+        "glabSpawnsDuringProgress": progress_glab.len(),
+        "gitSpawnsDuringProgress": progress_git,
+        "gitSpawnsPerHour": per_hour(progress_git).round(),
+        "detailJoinHitsIncludingFinish": detail_join_hits_in(&all),
+    })
+}
+
+/// A second list key on the same number and four numbers in all: every
+/// subscriber of the shared number hears its change whichever poller saw it,
+/// and three numbers of the first key are active.
+async fn delivery_phase(service: &PullRequestsService, cwd: &Path, api: &Arc<Api>) -> Value {
+    for number in 1..=3 {
+        api.set_pipeline(
+            number,
+            910 + number,
+            "running",
+            "ci_still_running",
+            &[("test", "running")],
+        );
+    }
+    api.set_pipeline(
+        MR_NUMBER,
+        920,
+        "running",
+        "ci_still_running",
+        &[("test", "running")],
+    );
+    api.snapshot_and_clear();
+    let mut other = list_query(cwd);
+    other.target_branch = Some("main".into());
+    let cancel = CancellationToken::new();
+    let mut logs = Vec::new();
+    let mut tasks = Vec::new();
+    let mut subscribe = |input: SubscribeInput| {
+        let log: Arc<Mutex<Vec<Changed>>> = Arc::default();
+        logs.push((
+            input.number,
+            input.list.target_branch.clone(),
+            Arc::clone(&log),
+        ));
+        let service = service.clone();
+        let cancel = cancel.clone();
+        tasks.push(tokio::spawn(async move {
+            let emit = move |changed: Changed| {
+                log.lock().expect("events").push(changed);
+                true
+            };
+            let _ = service.subscribe(input, &emit, &cancel).await;
+        }));
+    };
+    for number in [MR_NUMBER, 1, 2, 3] {
+        subscribe(tab_input(cwd, number, SubscribeTab::Conversation, None));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    subscribe(tab_input(
+        cwd,
+        MR_NUMBER,
+        SubscribeTab::Conversation,
+        Some(&other),
+    ));
+    tokio::time::sleep(Duration::from_secs(25)).await;
+    api.touch(MR_NUMBER, "2026-10-24T12:00:00Z");
+    tokio::time::sleep(Duration::from_secs(25)).await;
+    cancel.cancel();
+    for task in tasks {
+        let _ = task.await;
+    }
+    let hits = api.snapshot_and_clear().0;
+    let reads = |number: u64| {
+        count_hits(&hits, |hit| {
+            hit.graphql == Some("pipeline") && hit.path.ends_with(&format!("#{number}"))
+        })
+    };
+    assert!(
+        reads(1) > 0 && reads(2) > 0,
+        "the first three numbers of the key are active"
+    );
+    assert_eq!(reads(3), 0, "the fourth number of the key stays idle");
+    for (number, branch, log) in &logs {
+        let events = log.lock().expect("events").clone();
+        assert!(
+            events.iter().any(|changed| changed.detail),
+            "number {number:?} on {branch:?} heard its names: {events:?}"
+        );
+        if *number == Some(MR_NUMBER) {
+            assert!(
+                events
+                    .iter()
+                    .any(|changed| changed.detail && changed.timeline),
+                "both list keys deliver the shared number's change on {branch:?}: {events:?}"
+            );
+        }
+    }
+    json!({
+        "pipelineReads": {
+            "shared": reads(MR_NUMBER),
+            "first": reads(1),
+            "second": reads(2),
+            "fourthInJoinOrder": reads(3),
+        },
+        "subscribers": logs.len(),
+    })
 }
 
 struct TickSample {
@@ -499,7 +860,10 @@ async fn subscribe_until(
     api.snapshot_and_clear();
     let events = Arc::new(Mutex::new(Vec::new()));
     let recorded = Arc::clone(&events);
-    let emit_changed = move |event: Changed| recorded.lock().expect("events").push(event);
+    let emit_changed = move |event: Changed| {
+        recorded.lock().expect("events").push(event);
+        true
+    };
     let subscribe_token = CancellationToken::new();
     let subscribe_cancel = subscribe_token.clone();
     let subscribe_service = service.clone();
@@ -597,20 +961,27 @@ fn is_probe_path(path: &str, number: u64) -> bool {
     path == merge_request_path(number)
 }
 
-fn is_detail_join_path(path: &str, number: u64) -> bool {
+/// A read of the detail join (or the unary tab reads), never the poller's
+/// probe or its GraphQL pipeline read.
+fn is_detail_join_hit(hit: &Hit, number: u64) -> bool {
+    let path = hit.path.as_str();
     let prefix = merge_request_path(number);
-    path.starts_with(&prefix)
-        && path != prefix
-        && (path.contains("/approvals")
-            || path.contains("/reviewers")
-            || path.contains("/approval_state")
-            || path.contains("/award_emoji")
-            || path.contains("/closes_issues")
-            || path.contains("/notes/")
-            || path.contains("/pipelines")
-            || path.contains("/resource_")
-            || path.contains("/versions"))
-        || path == "/api/v4/graphql"
+    match hit.graphql {
+        Some(document) => matches!(document, "metadata" | "stages" | "timeline"),
+        None => {
+            path.starts_with(&prefix)
+                && path != prefix
+                && (path.contains("/approvals")
+                    || path.contains("/reviewers")
+                    || path.contains("/approval_state")
+                    || path.contains("/award_emoji")
+                    || path.contains("/closes_issues")
+                    || path.contains("/notes/")
+                    || path.contains("/pipelines")
+                    || path.contains("/resource_")
+                    || path.contains("/versions"))
+        }
+    }
 }
 
 fn probe_hits_in(hits: &[Hit]) -> usize {
@@ -621,7 +992,7 @@ fn probe_hits_in(hits: &[Hit]) -> usize {
 
 fn detail_join_hits_in(hits: &[Hit]) -> usize {
     hits.iter()
-        .filter(|hit| is_detail_join_path(&hit.path, MR_NUMBER))
+        .filter(|hit| is_detail_join_hit(hit, MR_NUMBER))
         .count()
 }
 
@@ -791,14 +1162,49 @@ fn list_page() -> String {
     serde_json::to_string(&rows).expect("list json")
 }
 
-fn detail_body() -> String {
+fn detail_body(number: u64) -> Value {
     let mut detail: Value =
         serde_json::from_str(include_str!("fixtures/pull_requests/gitlab_detail.json"))
             .expect("detail fixture");
-    detail["iid"] = json!(MR_NUMBER);
-    detail["web_url"] = json!("https://git.acme.example/team/sub/repo/-/merge_requests/42");
+    detail["iid"] = json!(number);
+    detail["web_url"] = json!(format!(
+        "https://git.acme.example/team/sub/repo/-/merge_requests/{number}"
+    ));
     detail["description"] = json!("A realistic description body for the merge request.");
-    serde_json::to_string(&detail).expect("detail json")
+    detail
+}
+
+fn no_pipeline_graph() -> Value {
+    json!({"data":{"project":{"mergeRequest":{"headPipeline": null}}}})
+}
+
+/// The GraphQL pipeline answer: one job per stage, in the stage's status.
+fn pipeline_graph(id: u64, status: &str, stages: &[(&str, &str)]) -> Value {
+    let nodes: Vec<Value> = stages
+        .iter()
+        .map(|(name, stage_status)| {
+            json!({
+                "name": name,
+                "status": stage_status,
+                "detailedStatus": {"name": stage_status.to_ascii_uppercase()},
+                "jobs": {"pageInfo": {"hasNextPage": false}, "nodes": [{
+                    "name": format!("{name}-job"),
+                    "status": stage_status.to_ascii_uppercase(),
+                    "allowFailure": false,
+                    "webPath": format!("/team/sub/repo/-/jobs/{name}"),
+                    "startedAt": null,
+                    "finishedAt": null,
+                    "duration": null,
+                    "downstreamPipeline": null,
+                }]},
+            })
+        })
+        .collect();
+    json!({"data":{"project":{"mergeRequest":{"headPipeline":{
+        "id": format!("gid://gitlab/Ci::Pipeline/{id}"),
+        "status": status.to_ascii_uppercase(),
+        "stages": {"nodes": nodes},
+    }}}}})
 }
 
 fn metadata_body() -> String {
@@ -1003,6 +1409,19 @@ if __name__ == "__main__":
     path
 }
 
+/// Logs every `git` spawn, then runs the real `git`.
+fn write_git(root: &Path, log_path: &Path) -> PathBuf {
+    let path = root.join("git-logged");
+    executable_fixture::write_executable(
+        &path,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {:?}\nexec git \"$@\"\n",
+            log_path.display().to_string()
+        ),
+    );
+    path
+}
+
 fn write_gh(root: &Path) -> PathBuf {
     let path = root.join("gh");
     executable_fixture::write_executable(
@@ -1067,6 +1486,25 @@ async fn handle(mut socket: tokio::net::TcpStream, api: Arc<Api>) -> std::io::Re
         tokio::time::sleep(Duration::from_millis(rtt)).await;
     }
     let (status, total, payload) = respond(&api, &method, &path, &body);
+    let text = String::from_utf8_lossy(&body);
+    let graphql = (method == "POST" && path == "/api/v4/graphql").then(|| {
+        if text.contains("PullRequestsGitLabPipelineStages") {
+            "stages"
+        } else if text.contains("PullRequestsGitLabPipeline") {
+            "pipeline"
+        } else if text.contains("discussions(") {
+            "timeline"
+        } else if text.contains("diffStatsSummary") {
+            "metadata"
+        } else {
+            "other"
+        }
+    });
+    // A pipeline read is tagged with its merge request number.
+    let path = match graphql {
+        Some("pipeline" | "stages") => format!("{path}#{}", graphql_iid(&body).unwrap_or(0)),
+        _ => path,
+    };
     let mut head = format!(
         "HTTP/1.1 {status} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
         if status == 200 { "OK" } else { "Not Found" },
@@ -1082,6 +1520,7 @@ async fn handle(mut socket: tokio::net::TcpStream, api: Arc<Api>) -> std::io::Re
     api.hits.lock().expect("hit log").push(Hit {
         method,
         path,
+        graphql,
         status,
         start_ms,
         end_ms,
@@ -1102,10 +1541,48 @@ fn content_length(header: &str) -> usize {
         .unwrap_or(0)
 }
 
+fn graphql_iid(body: &[u8]) -> Option<u64> {
+    serde_json::from_slice::<Value>(body).ok()?["variables"]["iid"]
+        .as_str()?
+        .parse()
+        .ok()
+}
+
 fn respond(api: &Api, method: &str, path: &str, body: &[u8]) -> (u16, Option<u64>, Vec<u8>) {
     let (route, query) = path.split_once('?').unwrap_or((path, ""));
     let project = "/api/v4/projects/team%2Fsub%2Frepo";
     let mr = format!("{project}/merge_requests/{MR_NUMBER}");
+    // A merge request body (the probe and the detail read) for any known number.
+    if method == "GET"
+        && let Some(number) = route
+            .strip_prefix(&format!("{project}/merge_requests/"))
+            .and_then(|number| number.parse::<u64>().ok())
+    {
+        return match api
+            .merge_requests
+            .lock()
+            .expect("merge requests")
+            .get(&number)
+        {
+            Some((detail, _)) => (200, None, detail.to_string().into_bytes()),
+            None => (404, None, br#"{"error":"merge request"}"#.to_vec()),
+        };
+    }
+    if method == "POST"
+        && route == "/api/v4/graphql"
+        && String::from_utf8_lossy(body).contains("PullRequestsGitLabPipeline")
+    {
+        let graph = graphql_iid(body)
+            .and_then(|number| {
+                api.merge_requests
+                    .lock()
+                    .expect("merge requests")
+                    .get(&number)
+                    .map(|(_, graph)| graph.clone())
+            })
+            .unwrap_or_else(no_pipeline_graph);
+        return (200, None, graph.to_string().into_bytes());
+    }
     let payload = if method == "GET" && route == "/api/v4/user" {
         br#"{"username":"alice","name":"Alice","id":7}"#.to_vec()
     } else if method == "GET" && route == "/api/v4/version" {
@@ -1114,8 +1591,6 @@ fn respond(api: &Api, method: &str, path: &str, body: &[u8]) -> (u16, Option<u64
         include_bytes!("fixtures/pull_requests/gitlab_project.json").to_vec()
     } else if method == "GET" && route == format!("{project}/merge_requests") {
         return list_response(query, &api.list_page);
-    } else if method == "GET" && route == mr {
-        api.detail.as_bytes().to_vec()
     } else if method == "GET" && route == format!("{mr}/approvals") {
         include_bytes!("fixtures/pull_requests/gitlab_approvals.json").to_vec()
     } else if method == "GET" && route == format!("{mr}/reviewers") {
