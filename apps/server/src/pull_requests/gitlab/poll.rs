@@ -1255,6 +1255,8 @@ pub(crate) async fn run_subscriber(
         Some(number) => load_raised(database, &host_key, &scope.repository, number).await,
         None => Raised::default(),
     };
+    #[cfg(all(test, unix))]
+    test_progress::JOINED.with(|joined| joined.set(joined.get() + 1));
     let mut delivery = Delivery {
         number,
         tab,
@@ -1311,8 +1313,12 @@ pub(crate) async fn run_subscriber(
             return shared.outcome();
         }
         let generation = snapshot_store::next_generation();
+        #[cfg(all(test, unix))]
+        let ticking = test_progress::Ticking::enter();
         let report = run_tick(&inputs, generation).await;
         let _ = shared.events.send(report.tick);
+        #[cfg(all(test, unix))]
+        drop(ticking);
         if c.is_cancelled() {
             continue;
         }
@@ -1353,6 +1359,36 @@ pub(crate) async fn run_subscriber(
                     tracing::debug!("GitLab poller ticks recovered");
                 }
             }
+        }
+    }
+}
+
+/// Progress the paused-clock tests wait on instead of a fixed amount of real
+/// time, per test thread: subscribers that finished joining, and ticks in
+/// flight. A tick in flight is the only work a test cannot see from outside.
+#[cfg(all(test, unix))]
+mod test_progress {
+    use std::cell::Cell;
+
+    thread_local! {
+        pub(super) static JOINED: Cell<usize> = const { Cell::new(0) };
+        pub(super) static TICKING: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Counts one tick from its start until its event is broadcast, or until
+    /// the subscriber driving it is dropped mid-tick.
+    pub(super) struct Ticking;
+
+    impl Ticking {
+        pub(super) fn enter() -> Self {
+            TICKING.with(|ticking| ticking.set(ticking.get() + 1));
+            Self
+        }
+    }
+
+    impl Drop for Ticking {
+        fn drop(&mut self) {
+            TICKING.with(|ticking| ticking.set(ticking.get().saturating_sub(1)));
         }
     }
 }
@@ -1578,12 +1614,26 @@ esac
         emit: &'a (dyn Fn(Changed) -> bool + Send + Sync),
         c: &'a CancellationToken,
     ) -> Subscriber<'a> {
+        CREATED.with(|created| created.set(created.get() + 1));
         Subscriber {
             future: Box::pin(run_subscriber(
                 registry, host, database, scope, list_query, list_key, number, tab, emit, c,
             )),
             result: None,
         }
+    }
+
+    thread_local! {
+        /// Subscribers this test thread created, against `test_progress::JOINED`.
+        static CREATED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Every created subscriber has finished joining (its first database read)
+    /// and no tick is in flight.
+    fn settled() -> bool {
+        test_progress::TICKING.with(|ticking| ticking.get()) == 0
+            && test_progress::JOINED.with(|joined| joined.get())
+                >= CREATED.with(|created| created.get())
     }
 
     async fn poll_all(subscribers: &mut [Subscriber<'_>]) {
@@ -1607,8 +1657,27 @@ esac
     /// The tiny real sleep gives it that chance without slowing down the
     /// common case, where the condition is already satisfied after the
     /// first iteration or two.
+    ///
+    /// A tick that came due starts on the first poll after the clock moved,
+    /// so this waits until every subscriber has joined and no tick is in
+    /// flight (however slow a loaded machine runs the fake `glab`), then
+    /// polls a little longer so every subscriber forwards the last event.
     async fn drive(subscribers: &mut [Subscriber<'_>]) {
-        for _ in 0..200 {
+        drive_for(subscribers, 20).await;
+        for _ in 0..30_000 {
+            if settled() {
+                break;
+            }
+            poll_all(subscribers).await;
+            std::thread::sleep(Duration::from_millis(1));
+            tokio::task::yield_now().await;
+        }
+        drive_for(subscribers, 20).await;
+    }
+
+    /// Polls for a fixed number of rounds, for a tick deliberately held open.
+    async fn drive_for(subscribers: &mut [Subscriber<'_>], rounds: usize) {
+        for _ in 0..rounds {
             poll_all(subscribers).await;
             std::thread::sleep(Duration::from_millis(1));
             tokio::task::yield_now().await;
@@ -3101,7 +3170,8 @@ esac
         let mut subs = [b.subscriber(None, None, &emit, &c)];
         drive(&mut subs).await;
         tokio::time::advance(Duration::from_secs(20)).await;
-        drive(&mut subs).await;
+        // The list read is held open until `release`: only start the tick.
+        drive_for(&mut subs, 200).await;
         c.cancel();
         drive(&mut subs).await;
         fs::write(b.s.path("release"), "").unwrap();
