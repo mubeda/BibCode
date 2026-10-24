@@ -2343,7 +2343,7 @@ mod device_tools {
         let neither = fixture
             .tools
             .call(
-                &scope_for("t3"),
+                &scope_for("idle-thread"),
                 "screenshot",
                 json!({}),
                 CancellationToken::new(),
