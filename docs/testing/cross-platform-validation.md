@@ -650,9 +650,14 @@ cargo test -p bibcode-server --test pull_requests_detail_reads -j 2
 cargo test -p bibcode-server --test pull_requests_review_actions -j 2
 cargo test -p bibcode-server --test pull_requests_edit_merge_actions -j 2
 cargo test -p bibcode-server --test pull_requests_checkout -j 2
+cargo test -p bibcode-server --test pull_requests_gitlab_load_harness -j 2
 cargo test -p bibcode-server --test rpc_wire -j 2
 cargo test -p bibcode-server registers_every -j 2
 ```
+
+For GitLab poller, pipeline or snapshot changes, also run the ignored polling
+harness with `bash scripts/measure-gitlab-merge-request-load.sh` and record its
+`HARNESS_SUBSCRIBE_JSON` (requests an hour, spawns, delivery) in the report.
 
 For provider detection of self-hosted hosts (the recorded host observation,
 remote parsing, status classification, and the create action's provider check
@@ -2423,6 +2428,18 @@ never count a sandbox-denied listener test as passed or skipped.
     state. Refresh reloads detail plus the active tab (including timeline in
     Files); reopening a cached tab refreshes it before displaying its previous result. Exercise an expired
     authentication response and verify context recovery and Retry.
+    Live pipeline (GitLab, a project with **Pipelines must succeed** and a
+    pipeline with several stages, one manual job and one allowed failure): with
+    the request open on Conversation, the merge box must name the pipeline kind,
+    linked number, status, commit and branch, and its stage strip must advance
+    within about 10 s of GitLab with no Refresh; the Pipelines tab must show the
+    same pipeline and the same stages. Push a commit: **Older commit** may show
+    until the new pipeline appears, within about 10 s of GitLab creating it.
+    Rerun a finished pipeline on the same commit: **Older commit** must never
+    show. A Guest account must see “You can't view pipelines in this project.”
+    Sign out of `glab` while watching: the subscription must end, the request's
+    stored copies must go, and the view must show the sign-in error on its next
+    read. Hide the window: polling must stop until it is shown again.
 11. Verify real GitHub split patches and GitLab synthetic-header patches render
     in Files, including renamed files. Scroll far enough to exercise list and
     diff virtualization. Viewed must survive tab changes and reload. Test the
