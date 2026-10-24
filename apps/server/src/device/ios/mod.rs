@@ -1283,7 +1283,7 @@ mod tests {
             .write();
         let hid = RecordingHid::new();
         let (manager, _enabled) = live_fake_ios(&sim, &hid);
-        let id = manager.open(Platform::Ios, "UDID-1").await.unwrap();
+        let id = manager.open(Platform::Ios, "UDID-1", None).await.unwrap();
         let ready = wait_state(&manager, &id, DeviceState::Ready).await;
         assert!(ready.can_rotate);
         manager.input(&id, vec![tap_down(0.5, 0.5)]).await.unwrap();
@@ -1318,7 +1318,7 @@ mod tests {
             .write();
         let hid = RecordingHid::new();
         let (manager, _enabled) = live_fake_ios(&sim, &hid);
-        let id = manager.open(Platform::Ios, "UDID-1").await.unwrap();
+        let id = manager.open(Platform::Ios, "UDID-1", None).await.unwrap();
         wait_state(&manager, &id, DeviceState::Ready).await;
         manager
             .input(
@@ -1360,7 +1360,7 @@ mod tests {
         let hid = RecordingHid::new();
         hid.set_keyboard(false);
         let (manager, _enabled) = live_fake_ios(&sim, &hid);
-        let id = manager.open(Platform::Ios, "UDID-1").await.unwrap();
+        let id = manager.open(Platform::Ios, "UDID-1", None).await.unwrap();
         wait_state(&manager, &id, DeviceState::Ready).await;
         let refused = manager
             .input(
@@ -1401,7 +1401,7 @@ mod tests {
         let hid = RecordingHid::new();
         hid.set_keyboard(false);
         let (manager, _enabled) = live_fake_ios(&sim, &hid);
-        let id = manager.open(Platform::Ios, "UDID-1").await.unwrap();
+        let id = manager.open(Platform::Ios, "UDID-1", None).await.unwrap();
         wait_state(&manager, &id, DeviceState::Ready).await;
         let refused = manager
             .input(
@@ -1450,7 +1450,7 @@ mod tests {
         String,
     ) {
         let (manager, enabled) = live_fake_ios(sim, hid);
-        let id = manager.open(Platform::Ios, "UDID-1").await.unwrap();
+        let id = manager.open(Platform::Ios, "UDID-1", None).await.unwrap();
         wait_state(&manager, &id, DeviceState::Ready).await;
         (manager, enabled, id)
     }
@@ -2075,7 +2075,7 @@ mod tests {
             .write();
         let hid = RecordingHid::new();
         let (manager, _enabled) = live_fake_ios(&sim, &hid);
-        let id = manager.open(Platform::Ios, "UDID-1").await.unwrap();
+        let id = manager.open(Platform::Ios, "UDID-1", None).await.unwrap();
         wait_state(&manager, &id, DeviceState::Ready).await;
         for orientation in [
             Orientation::Landscape,
@@ -2100,7 +2100,7 @@ mod tests {
             .device("UDID-1", "iPhone 17 Pro", "iOS 27.0")
             .write();
         let (manager, _enabled) = ios_manager(&sim);
-        let id = manager.open(Platform::Ios, "UDID-1").await.unwrap();
+        let id = manager.open(Platform::Ios, "UDID-1", None).await.unwrap();
         wait_state(&manager, &id, DeviceState::Ready).await;
         sim.set_state("UDID-1", "Shutdown");
         let failed = wait_state(&manager, &id, DeviceState::Failed).await;
@@ -2179,10 +2179,37 @@ mod tests {
         let catalog = manager.catalog().borrow().clone();
         assert!(catalog.platforms[0].images[0].in_use_elsewhere);
         assert!(matches!(
-            manager.open(Platform::Ios, "UDID-1").await,
+            manager.open(Platform::Ios, "UDID-1", None).await,
             Err(DeviceOpError::Busy { .. })
         ));
         assert!(sim.calls().iter().all(|c| !c.starts_with("boot")));
+    }
+
+    /// A simulator BiBCode booted is not "running outside BiBCode": opening it again returns
+    /// its device instead of `Busy`, and boots nothing.
+    #[tokio::test]
+    async fn reopening_a_simulator_bibcode_booted_returns_its_device() {
+        let sim = FakeXcrun::new()
+            .device("UDID-1", "iPhone 17 Pro", "iOS 27.0")
+            .write();
+        let (manager, _enabled) = ios_manager(&sim);
+        let id = manager
+            .open(Platform::Ios, "UDID-1", Some("t1"))
+            .await
+            .unwrap();
+        wait_state(&manager, &id, DeviceState::Ready).await;
+        let again = manager.open(Platform::Ios, "UDID-1", Some("t2")).await;
+        assert_eq!(again.as_deref(), Ok(id.as_str()));
+        assert_eq!(
+            sim.calls()
+                .iter()
+                .filter(|call| call.starts_with("boot "))
+                .count(),
+            1,
+            "{:?}",
+            sim.calls()
+        );
+        manager.shutdown().await;
     }
 
     /// Issue #131: two simulators with the same name and OS are told apart in the catalog the
@@ -2228,7 +2255,7 @@ mod tests {
             .state("UDID-2", "Booted")
             .write();
         let (manager, _enabled) = ios_manager(&sim);
-        let id = manager.open(Platform::Ios, "UDID-1").await.unwrap();
+        let id = manager.open(Platform::Ios, "UDID-1", None).await.unwrap();
         let ready = wait_state(&manager, &id, DeviceState::Ready).await;
         assert_eq!((ready.width, ready.height), (Some(60), Some(130)));
         assert!(!ready.can_rotate);
@@ -2263,7 +2290,7 @@ mod tests {
             .device("UDID-1", "iPhone 17 Pro", "iOS 27.0")
             .write();
         let (manager, _enabled) = ios_manager(&sim);
-        let id = manager.open(Platform::Ios, "UDID-1").await.unwrap();
+        let id = manager.open(Platform::Ios, "UDID-1", None).await.unwrap();
         wait_state(&manager, &id, DeviceState::Ready).await;
         let refused = manager
             .input(
@@ -2307,7 +2334,7 @@ mod tests {
             availability.kind,
             crate::device::catalog::AvailabilityKind::XcodeUnsupported
         );
-        let id = manager.open(Platform::Ios, "UDID-1").await.unwrap();
+        let id = manager.open(Platform::Ios, "UDID-1", None).await.unwrap();
         let ready = wait_state(&manager, &id, DeviceState::Ready).await;
         assert_eq!((ready.width, ready.height), (Some(60), Some(130)));
         manager.shutdown().await;
@@ -2322,7 +2349,7 @@ mod tests {
             .bootstatus_blocks()
             .write();
         let (manager, _enabled) = ios_manager(&sim);
-        let id = manager.open(Platform::Ios, "UDID-1").await.unwrap();
+        let id = manager.open(Platform::Ios, "UDID-1", None).await.unwrap();
         wait_state(&manager, &id, DeviceState::Booting).await;
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             while !sim.calls().iter().any(|c| c == "bootstatus UDID-1 -b") {
@@ -2350,7 +2377,7 @@ mod tests {
             .boot_fails("Unable to boot device in current state: Booted")
             .write();
         let (manager, _enabled) = ios_manager(&sim);
-        let id = manager.open(Platform::Ios, "UDID-1").await.unwrap();
+        let id = manager.open(Platform::Ios, "UDID-1", None).await.unwrap();
         let failed = wait_state(&manager, &id, DeviceState::Failed).await;
         assert_eq!(
             failed.failure.as_deref(),

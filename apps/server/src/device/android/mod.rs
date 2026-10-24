@@ -588,7 +588,7 @@ mod tests {
         let mut catalog = fixture.manager.catalog();
         let id = fixture
             .manager
-            .open(Platform::Android, "Pixel")
+            .open(Platform::Android, "Pixel", None)
             .await
             .expect("open Pixel");
         let first_ready = tokio::time::timeout(Duration::from_secs(20), async {
@@ -661,7 +661,7 @@ mod tests {
             ManagerFixture::with_sdk(|sdk| sdk.avds(&["Pixel"]).adb_forwards_to(source.port)).await;
         let id = fixture
             .manager
-            .open(Platform::Android, "Pixel")
+            .open(Platform::Android, "Pixel", None)
             .await
             .expect("open Pixel");
         let ready = fixture.wait_state(&id, DeviceState::Ready).await;

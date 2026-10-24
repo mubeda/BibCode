@@ -114,7 +114,7 @@ impl DeviceTools {
             Some(id) => id.to_owned(),
             None => self.only_image(platform).await?,
         };
-        let device_id = self.manager.open(platform, &image_id).await?;
+        let device_id = self.manager.open(platform, &image_id, None).await?;
         let ready = tokio::select! {
             ready = self.manager.wait_ready(&device_id, self.boot_timeout) => ready,
             () = cancellation.cancelled() => {
