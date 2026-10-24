@@ -67,7 +67,11 @@ import {
   shouldUseCompactComposerPrimaryActions,
   shouldUseCompactComposerFooter,
 } from "../composerFooterLayout";
-import { type ComposerPromptEditorHandle, ComposerPromptEditor } from "../ComposerPromptEditor";
+import {
+  type ComposerCommandKey,
+  type ComposerPromptEditorHandle,
+  ComposerPromptEditor,
+} from "../ComposerPromptEditor";
 import { ProviderModelPicker } from "./ProviderModelPicker";
 import { ComposerCommandMenu } from "./ComposerCommandMenu";
 import { buildComposerCommandItems, type ComposerCommandItem } from "./composerCommandItems";
@@ -196,6 +200,18 @@ const composerItemMatchesTrigger = (
   }
   return item.type === "file-reference" || item.type === "agent-reference";
 };
+
+/** A trigger the user closed with Escape: it stays closed while that token is typed on. */
+type DismissedComposerTrigger = Pick<ComposerTrigger, "kind" | "rangeStart">;
+
+const isDismissedComposerTrigger = (
+  trigger: ComposerTrigger | null,
+  dismissed: DismissedComposerTrigger | null,
+): boolean =>
+  trigger !== null &&
+  dismissed !== null &&
+  trigger.kind === dismissed.kind &&
+  trigger.rangeStart === dismissed.rangeStart;
 
 const syncTerminalContextsByIds = (
   contexts: ReadonlyArray<TerminalContextDraft>,
@@ -990,6 +1006,8 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   const [isComposerPrimaryActionsCompact, setIsComposerPrimaryActionsCompact] = useState(false);
   const [isComposerModelPickerOpen, setIsComposerModelPickerOpen] = useState(false);
   const [isComposerFocused, setIsComposerFocused] = useState(false);
+  const [dismissedComposerTrigger, setDismissedComposerTrigger] =
+    useState<DismissedComposerTrigger | null>(null);
   const isMobileViewport = useMediaQuery("max-sm");
   const isComposerCollapsedMobile = isMobileViewport && !isComposerFocused;
 
@@ -1006,6 +1024,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   const composerSurfaceRef = useRef<HTMLDivElement>(null);
   const composerSelectLockRef = useRef(false);
   const composerMenuOpenRef = useRef(false);
+  const dismissedComposerTriggerRef = useRef<DismissedComposerTrigger | null>(null);
   const composerMenuItemsRef = useRef<ReadonlyArray<ComposerCommandItem>>([]);
   const activeComposerMenuItemRef = useRef<ComposerCommandItem | null>(null);
   const composerBlurFrameRef = useRef<number | null>(null);
@@ -1029,6 +1048,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       collapseExpandedComposerCursor(prompt, prompt.length, composerInlineTokenContext),
     );
     setComposerTrigger(detectComposerTrigger(prompt, prompt.length, composerCapabilities.trigger));
+    setDismissedComposerTrigger(null);
     setIsDragOverComposer(false);
   }
   // Drag depth counts per thread/draft, so a switch mid-drag starts again from zero.
@@ -1066,9 +1086,18 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   // ------------------------------------------------------------------
   // Derived: composer trigger / menu
   // ------------------------------------------------------------------
-  const composerTriggerKind = composerTrigger?.kind ?? null;
-  const pathTriggerQuery =
-    composerTrigger?.kind === "provider-reference" ? composerTrigger.query : "";
+  // A new trigger, or the same one gone, ends an Escape dismissal.
+  if (
+    dismissedComposerTrigger !== null &&
+    !isDismissedComposerTrigger(composerTrigger, dismissedComposerTrigger)
+  ) {
+    setDismissedComposerTrigger(null);
+  }
+  const menuTrigger = isDismissedComposerTrigger(composerTrigger, dismissedComposerTrigger)
+    ? null
+    : composerTrigger;
+  const composerTriggerKind = menuTrigger?.kind ?? null;
+  const pathTriggerQuery = menuTrigger?.kind === "provider-reference" ? menuTrigger.query : "";
   const isPathTrigger = composerTriggerKind === "provider-reference";
   const workspaceEntries = useComposerPathSearch({
     environmentId,
@@ -1079,22 +1108,22 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   const composerMenuResult = useMemo(
     () =>
       buildComposerCommandItems({
-        trigger: composerTrigger,
+        trigger: menuTrigger,
         providerInstanceId: selectedInstanceId,
         capabilities: composerCapabilities,
         pathSearch: workspaceEntries,
       }),
-    [composerCapabilities, composerTrigger, selectedInstanceId, workspaceEntries],
+    [composerCapabilities, menuTrigger, selectedInstanceId, workspaceEntries],
   );
   const composerMenuItems = composerMenuResult.items;
 
-  const composerMenuOpen = Boolean(composerTrigger);
+  const composerMenuOpen = Boolean(menuTrigger);
   const { revalidateIfStale: revalidateProviderCapabilitiesIfStale } = providerCapabilities;
   useEffect(() => {
     if (composerMenuOpen) revalidateProviderCapabilitiesIfStale();
   }, [composerMenuOpen, revalidateProviderCapabilitiesIfStale]);
-  const composerMenuSearchKey = composerTrigger
-    ? `${composerTrigger.kind}:${composerTrigger.query.trim().toLowerCase()}`
+  const composerMenuSearchKey = menuTrigger
+    ? `${menuTrigger.kind}:${menuTrigger.query.trim().toLowerCase()}`
     : null;
   const activeComposerMenuItem = useMemo(() => {
     const activeItemId = resolveComposerMenuActiveItemId({
@@ -1115,9 +1144,10 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
 
   useLayoutEffect(() => {
     composerMenuOpenRef.current = composerMenuOpen;
+    dismissedComposerTriggerRef.current = dismissedComposerTrigger;
     composerMenuItemsRef.current = composerMenuItems;
     activeComposerMenuItemRef.current = activeComposerMenuItem;
-  }, [activeComposerMenuItem, composerMenuItems, composerMenuOpen]);
+  }, [activeComposerMenuItem, composerMenuItems, composerMenuOpen, dismissedComposerTrigger]);
 
   const nonPersistedComposerAttachmentIdSet = useMemo(
     () => new Set(nonPersistedComposerAttachmentIds),
@@ -1864,13 +1894,24 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   // ------------------------------------------------------------------
   // Callbacks: command key
   // ------------------------------------------------------------------
-  const onComposerCommandKey = (
-    key: "ArrowDown" | "ArrowUp" | "Enter" | "Tab",
-    event: KeyboardEvent,
-  ) => {
+  const onComposerCommandKey = (key: ComposerCommandKey, event: KeyboardEvent) => {
     if (isSteerQueuedMessageShortcut(event, keybindings, { context: { editableFocus: true } })) {
       event.preventDefault();
       if (!isProviderBindingConflicted) onSteerQueuedMessage?.();
+      return true;
+    }
+    const { trigger } = resolveActiveComposerTrigger();
+    // A dismissed menu stays closed, so Enter sends and Tab moves on, also before it re-renders.
+    const menuIsActive =
+      !isDismissedComposerTrigger(trigger, dismissedComposerTriggerRef.current) &&
+      (composerMenuOpenRef.current || trigger !== null);
+    if (key === "Escape") {
+      // Escape closes the menu for this token, for a `/usr/bin` that is not a command; with no
+      // menu it is left to the page.
+      if (!menuIsActive || trigger === null) return false;
+      const dismissed = { kind: trigger.kind, rangeStart: trigger.rangeStart };
+      dismissedComposerTriggerRef.current = dismissed;
+      setDismissedComposerTrigger(dismissed);
       return true;
     }
     if (isProviderBindingConflicted) return true;
@@ -1878,8 +1919,6 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       toggleInteractionMode();
       return true;
     }
-    const { trigger } = resolveActiveComposerTrigger();
-    const menuIsActive = composerMenuOpenRef.current || trigger !== null;
     if (menuIsActive) {
       const currentItems = composerMenuItemsRef.current;
       const selectedItem = activeComposerMenuItemRef.current ?? currentItems[0];

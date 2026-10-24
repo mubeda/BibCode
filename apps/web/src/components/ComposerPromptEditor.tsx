@@ -24,6 +24,7 @@ import {
   KEY_ARROW_RIGHT_COMMAND,
   KEY_ARROW_UP_COMMAND,
   KEY_ENTER_COMMAND,
+  KEY_ESCAPE_COMMAND,
   KEY_TAB_COMMAND,
   COMMAND_PRIORITY_HIGH,
   KEY_BACKSPACE_COMMAND,
@@ -1083,27 +1084,21 @@ interface ComposerPromptEditorProps {
     cursorAdjacentToMention: boolean,
     terminalContextIds: string[],
   ) => void;
-  onCommandKeyDown?: (
-    key: "ArrowDown" | "ArrowUp" | "Enter" | "Tab",
-    event: KeyboardEvent,
-  ) => boolean;
+  onCommandKeyDown?: (key: ComposerCommandKey, event: KeyboardEvent) => boolean;
   onPaste: React.ClipboardEventHandler<HTMLElement>;
   editorRef: React.RefObject<ComposerPromptEditorHandle | null>;
 }
 
+/** The keys the composer's command menu handles before the editor does. */
+export type ComposerCommandKey = "ArrowDown" | "ArrowUp" | "Enter" | "Tab" | "Escape";
+
 function ComposerCommandKeyPlugin(props: {
-  onCommandKeyDown?: (
-    key: "ArrowDown" | "ArrowUp" | "Enter" | "Tab",
-    event: KeyboardEvent,
-  ) => boolean;
+  onCommandKeyDown?: (key: ComposerCommandKey, event: KeyboardEvent) => boolean;
 }) {
   const [editor] = useLexicalComposerContext();
 
   useEffect(() => {
-    const handleCommand = (
-      key: "ArrowDown" | "ArrowUp" | "Enter" | "Tab",
-      event: KeyboardEvent | null,
-    ): boolean => {
+    const handleCommand = (key: ComposerCommandKey, event: KeyboardEvent | null): boolean => {
       if (!props.onCommandKeyDown || !event) {
         return false;
       }
@@ -1112,6 +1107,8 @@ function ComposerCommandKeyPlugin(props: {
         event.stopPropagation();
         return true;
       }
+      // Escape during IME composition cancels the composition, not the menu.
+      if (key === "Escape" && event.isComposing) return false;
 
       const handled = props.onCommandKeyDown(key, event);
       if (handled) {
@@ -1141,12 +1138,18 @@ function ComposerCommandKeyPlugin(props: {
       (event) => handleCommand("Tab", event),
       COMMAND_PRIORITY_HIGH,
     );
+    const unregisterEscape = editor.registerCommand(
+      KEY_ESCAPE_COMMAND,
+      (event) => handleCommand("Escape", event),
+      COMMAND_PRIORITY_HIGH,
+    );
 
     return () => {
       unregisterArrowDown();
       unregisterArrowUp();
       unregisterEnter();
       unregisterTab();
+      unregisterEscape();
     };
   }, [editor, props]);
 

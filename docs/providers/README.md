@@ -30,6 +30,12 @@ active repository or worktree. User skills outside the repository remain
 available even when the repository has no skills. Use `$` for Codex and `/` for
 Claude, Cursor, and OpenCode. Each provider's native visibility and name
 precedence apply; disabled or non-invocable native skills are not suggestions.
+Like `@` for files and agents, `$` and `/` open the menu at the start of any
+word, mid-prompt too, while BiBCode's own `:` actions open it only at the start
+of a line. Escape closes the menu for that word, and a space ends the word, so
+an absolute path such as `/usr/bin` stays plain text. A command or skill picked
+mid-prompt is inserted as text; whether the agent runs it as a command is up to
+the provider, which may treat only a message that starts with `/` as one.
 
 Discovery uses that provider instance's configured home and environment on the
 machine running the server. Changing projects, provider settings, or refreshing
