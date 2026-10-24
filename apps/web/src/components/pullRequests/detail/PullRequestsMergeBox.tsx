@@ -1,4 +1,9 @@
-import type { PullRequestsContext, PullRequestsDetail, ScopedProjectRef } from "@bibcode/contracts";
+import type {
+  PullRequestsContext,
+  PullRequestsDetail,
+  PullRequestsPipelineCopy,
+  ScopedProjectRef,
+} from "@bibcode/contracts";
 import { CircleCheckIcon, CircleDotIcon, CircleXIcon, TriangleAlertIcon } from "lucide-react";
 import { memo } from "react";
 import {
@@ -8,6 +13,7 @@ import {
 import { formatRelativeTimeLabel } from "../../../timestampFormat";
 import { PullRequestsRevertButton } from "../edit/PullRequestsSecondaryActions";
 import { readinessPresentation } from "./pullRequestsDetail.logic";
+import { PullRequestsPipelineSummary } from "./PullRequestsPipelineSummary";
 const TONES = {
   success: { Icon: CircleCheckIcon, color: "text-green-600 dark:text-green-400" },
   warning: { Icon: TriangleAlertIcon, color: "text-amber-600 dark:text-amber-400" },
@@ -19,6 +25,7 @@ export const PullRequestsMergeBox = memo(function PullRequestsMergeBox({
   live = detail,
   context,
   projectRef,
+  pipeline = detail.pipeline ?? null,
 }: {
   projectRef: ScopedProjectRef;
   detail: PullRequestsDetail;
@@ -29,6 +36,8 @@ export const PullRequestsMergeBox = memo(function PullRequestsMergeBox({
    */
   live?: PullRequestsDetail | null;
   context: Extract<PullRequestsContext, { status: "available" }>;
+  /** The newest pipeline copy across the live read and the stored rows. */
+  pipeline?: PullRequestsPipelineCopy | null;
 }) {
   const presentation = readinessPresentation(detail.readiness, context.capabilities.vocabulary);
   const tone = TONES[presentation.tone];
@@ -44,6 +53,13 @@ export const PullRequestsMergeBox = memo(function PullRequestsMergeBox({
         <tone.Icon aria-hidden="true" className={`mt-0.5 size-5 shrink-0 ${tone.color}`} />
         <h2 className="text-sm font-semibold">{presentation.title}</h2>
       </header>
+      {pipeline && !merged && !closed ? (
+        <PullRequestsPipelineSummary
+          pipeline={pipeline.pipeline}
+          branch={detail.headBranch}
+          settled={live !== null}
+        />
+      ) : null}
       {presentation.lines.length > 0 ? (
         <ul className="list-inside list-disc space-y-1 text-sm text-muted-foreground">
           {presentation.lines.map((line) => (

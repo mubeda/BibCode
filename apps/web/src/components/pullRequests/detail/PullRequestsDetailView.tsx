@@ -40,7 +40,7 @@ import {
   selectListSort,
   selectListTab,
 } from "../list/pullRequestsList.logic";
-import { newerObservedAt } from "./snapshotDisplay.logic";
+import { newerObservedAt, newestCopy } from "./snapshotDisplay.logic";
 import { PullRequestsQueryState } from "./PullRequestsQueryState";
 import { PullRequestsHeader } from "./PullRequestsHeader";
 import { PullRequestsConversation } from "./PullRequestsConversation";
@@ -213,7 +213,10 @@ export function PullRequestsDetailView({
           ? timelineQuery.revalidate
           : refreshTimelineAtom)();
       if (changed.commits) (tab === "commits" ? commitsQuery.revalidate : refreshCommitsAtom)();
-      if (changed.checks) (tab === "checks" ? checksQuery.revalidate : refreshChecksAtom)();
+      // The poller's pipeline row already holds the new header, stages and jobs:
+      // paint it from storage instead of reading the jobs from the host again.
+      if (changed.pipeline) snapshotQuery.revalidate();
+      else if (changed.checks) (tab === "checks" ? checksQuery.revalidate : refreshChecksAtom)();
       if (changed.files) (tab === "files" ? filesQuery.revalidate : refreshFilesAtom)();
     },
   );
@@ -244,11 +247,24 @@ export function PullRequestsDetailView({
     (tab === "commits" && paintedActivePayload
       ? (paintedActivePayload as PullRequestsCommitsData)
       : null);
+  // One pipeline copy is shown: the highest revision across the live detail,
+  // its stored copy and the poller's row, so the screen never moves back
+  // whichever answers last. Without revisions (an older server) the live
+  // value wins, as before.
+  const storedPipeline = snapshotQuery.data?.pipeline?.payload ?? null;
+  const shownPipeline = newestCopy([
+    detailQuery.data?.pipeline,
+    paintedDetail?.payload.pipeline,
+    storedPipeline,
+  ]);
   const displayedChecks =
-    checksQuery.data ??
-    (tab === "checks" && paintedActivePayload
-      ? (paintedActivePayload as PullRequestsChecksData)
-      : null);
+    tab === "checks"
+      ? newestCopy([
+          checksQuery.data,
+          paintedActivePayload ? (paintedActivePayload as PullRequestsChecksData) : null,
+          storedPipeline?.checks,
+        ])
+      : null;
   const displayedFiles =
     filesQuery.data ??
     (tab === "files" && paintedActivePayload
@@ -377,11 +393,18 @@ export function PullRequestsDetailView({
                           timeline={displayedTimeline}
                           detailsRefreshing={detailQuery.isPending}
                           liveDetail={liveDetail}
+                          pipeline={shownPipeline}
                         />
                       ) : tab === "commits" && displayedCommits ? (
                         <PullRequestsCommits commits={displayedCommits} />
                       ) : tab === "checks" && displayedChecks ? (
-                        <PullRequestsChecks checks={displayedChecks} context={context} />
+                        <PullRequestsChecks
+                          checks={displayedChecks}
+                          context={context}
+                          pipeline={shownPipeline?.pipeline ?? null}
+                          branch={detail.headBranch}
+                          settled={liveDetail !== null}
+                        />
                       ) : tab === "files" && displayedFiles ? (
                         <Suspense
                           fallback={
