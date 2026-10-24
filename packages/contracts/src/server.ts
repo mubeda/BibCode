@@ -209,6 +209,12 @@ export const ServerProvider = Schema.Struct({
   supportsTurnSteer: Schema.optional(Schema.Boolean),
   supportsConversationRewind: Schema.optional(Schema.Boolean),
   supportsContextWindowUsage: Schema.optional(Schema.Boolean),
+  /**
+   * The server compacts this instance's conversations on request (`thread.compact`) and recovers
+   * a turn that failed at the context limit. Absent from older servers, where the Compact action
+   * sends `/compact` instead.
+   */
+  supportsCompaction: Schema.optional(Schema.Boolean),
   enabled: Schema.Boolean,
   installed: Schema.Boolean,
   version: Schema.NullOr(TrimmedNonEmptyString),

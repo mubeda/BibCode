@@ -86,6 +86,19 @@ const decodeLegacyTurnDelivery = Schema.decodeUnknownSync(
   }),
 );
 
+/** A message as a client that predates `resendOf` decodes it. */
+const decodeOlderMessage = Schema.decodeUnknownSync(
+  Schema.Struct({
+    id: Schema.String,
+    role: Schema.String,
+    text: Schema.String,
+    turnId: Schema.NullOr(Schema.String),
+    streaming: Schema.Boolean,
+    createdAt: Schema.String,
+    updatedAt: Schema.String,
+  }),
+);
+
 describe("delivery failure reasons", () => {
   const delivery = { state: "failed", provider: "codex" };
 
@@ -126,6 +139,130 @@ describe("delivery failure reasons", () => {
       updatedAt: "2026-09-26T00:00:00Z",
     });
     expect(payload.delivery).toEqual({ ...delivery, reason: "modelSelectionRefused" });
+  });
+});
+
+describe("conversation compaction contracts", () => {
+  const message = {
+    id: "resend:message-1",
+    role: "user",
+    text: "continue",
+    turnId: null,
+    streaming: false,
+    createdAt: "2026-10-24T00:00:00Z",
+    updatedAt: "2026-10-24T00:00:00Z",
+  };
+
+  it("keeps the failed message a copy sends again", () => {
+    expect(decodeOrchestrationMessageSync({ ...message, resendOf: "message-1" }).resendOf).toBe(
+      "message-1",
+    );
+  });
+
+  it("lets an older client decode a copy as an ordinary message", () => {
+    const decoded = decodeOlderMessage({ ...message, resendOf: "message-1" });
+    expect(decoded.text).toBe("continue");
+    expect(Object.hasOwn(decoded, "resendOf")).toBe(false);
+  });
+
+  it("dispatches thread.compact as a client command", () => {
+    const command = {
+      type: "thread.compact",
+      commandId: "compact-1",
+      threadId: "thread-1",
+      createdAt: "2026-10-24T00:00:00Z",
+    };
+    expect(decodeClientOrchestrationCommandSync(command)).toEqual(command);
+  });
+
+  it("keeps the settlement and session tags internal", () => {
+    expect(() =>
+      decodeClientOrchestrationCommandSync({
+        type: "thread.compaction.settle",
+        commandId: "settle-1",
+        threadId: "thread-1",
+        compactionId: "compaction:1",
+        outcome: "completed",
+        createdAt: "2026-10-24T00:00:00Z",
+      }),
+    ).toThrow();
+    expect(
+      decodeOrchestrationCommandSync({
+        type: "thread.compaction.settle",
+        commandId: "settle-1",
+        threadId: "thread-1",
+        compactionId: "compaction:1",
+        outcome: "completed",
+        createdAt: "2026-10-24T00:00:00Z",
+      }),
+    ).toMatchObject({ outcome: "completed" });
+  });
+
+  it("round-trips the requested and settled events", () => {
+    const base = {
+      sequence: 1,
+      eventId: "event-1",
+      aggregateKind: "thread",
+      aggregateId: "thread-1",
+      occurredAt: "2026-10-24T00:00:00Z",
+      commandId: "command-1",
+      causationEventId: null,
+      correlationId: "command-1",
+      metadata: {},
+    };
+    for (const event of [
+      {
+        ...base,
+        type: "thread.compact-requested",
+        payload: {
+          threadId: "thread-1",
+          compactionId: "compaction:1",
+          trigger: "contextRecovery",
+          failedMessageId: "message-1",
+          createdAt: "2026-10-24T00:00:00Z",
+        },
+      },
+      {
+        ...base,
+        type: "thread.compacted",
+        payload: {
+          threadId: "thread-1",
+          compactionId: "compaction:1",
+          outcome: "failed",
+          detail: "Claude couldn't compact the conversation.",
+          createdAt: "2026-10-24T00:00:00Z",
+        },
+      },
+    ]) {
+      expect(encodeOrchestrationEventSync(decodeOrchestrationEventSync(event))).toEqual(event);
+    }
+  });
+
+  it("shows an unsettled compaction on the thread shell and omits it from older servers", () => {
+    const shell = {
+      id: "thread-1",
+      projectId: "project-1",
+      title: "Thread",
+      modelSelection: { instanceId: "claudeAgent", model: "claude-opus" },
+      runtimeMode: "full-access",
+      branch: null,
+      worktreePath: null,
+      latestTurn: null,
+      createdAt: "2026-10-24T00:00:00Z",
+      updatedAt: "2026-10-24T00:00:00Z",
+      session: null,
+      latestUserMessageAt: null,
+      hasPendingApprovals: false,
+      hasPendingUserInput: false,
+      hasActionableProposedPlan: false,
+    };
+    expect(decodeShell(shell).compaction).toBeUndefined();
+    expect(
+      decodeShell({
+        ...shell,
+        compaction: { trigger: "contextRecovery", state: "running", failedMessageId: "message-1" },
+      }).compaction,
+    ).toEqual({ trigger: "contextRecovery", state: "running", failedMessageId: "message-1" });
   });
 });
 
