@@ -2720,3 +2720,38 @@ arena. The server starts it right after the crash hook; the desktop host starts
 it after the PATH hydration, which must run before any thread exists. Other
 platforms and C libraries do not start it. The thread holds no other resource
 and ends with the process.
+
+### Chat Markdown rendering
+
+`ChatMarkdown` (`apps/web/src/components/ChatMarkdown.tsx`) renders every chat
+message with `react-markdown`, `remark-gfm`, `rehype-raw` and `rehype-sanitize`,
+and highlights fenced code with Shiki through the `@pierre/diffs` shared
+highlighter. Its render cost depends on whether the message is streaming:
+
+- **Finished messages.** A code block whose highlight is not cached renders as
+  a plain block at once. A queue then highlights one block per task, newest
+  first, and drops blocks that unmounted. Highlighted HTML is kept in an LRU
+  cache (500 entries, 50 MB) keyed by the code's hash, length, language and
+  theme, so a remounted row, such as one scrolled back into view, shows its
+  highlight at once.
+- **Streaming messages.** Each delta parses only the text after the last
+  completed prefix and reuses that prefix's parsed nodes
+  (`apps/web/src/markdown-incremental.ts`). The prefix ends at a closed
+  top-level code fence followed by a blank line. A document with a link or
+  footnote definition, a CR or a byte-order mark takes a full parse. Code
+  blocks are highlighted during render by `lib/incrementalHighlighting.ts`,
+  which resumes Shiki from the grammar state after the last completed line,
+  tokenizes only the last line and returns the completed lines' nodes
+  unchanged. `chat/HighlightedCodeLines.tsx` renders one memoized element per
+  line, so completed lines keep their DOM. A block that streamed keeps this
+  renderer when the reply finishes and stores its HTML in the cache.
+- **Stable components.** The Markdown components read the values that change
+  with every delta (the text, whether it streams, file-link metadata) from a
+  context rather than closing over them, so they keep their identity while a
+  reply streams. React then updates rendered blocks in place, and their state,
+  such as a block's line-wrap toggle or an open details block, survives the
+  next delta. A details block whose `open` attribute is edited starts over
+  from it. A theme change rebuilds the components and highlights again.
+
+The streamed result equals a full parse and a full highlight of the same text.
+The unit tests compare every streamed prefix with one.
