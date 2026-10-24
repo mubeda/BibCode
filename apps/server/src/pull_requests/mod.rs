@@ -2237,6 +2237,7 @@ esac"#,
         assert!(!s.path("calls").exists(), "zero glab calls");
     }
 
+    #[cfg(unix)]
     fn pipeline_copy(revision: i64) -> PipelineCopy {
         PipelineCopy {
             revision,
@@ -2259,6 +2260,8 @@ esac"#,
         }
     }
 
+    /// Its fake host tools are shell scripts.
+    #[cfg(unix)]
     #[tokio::test]
     async fn gitlab_poller_read_snapshot_returns_the_pipeline_row_with_zero_glab_calls() {
         let s = crate::test_support::TestSandbox::new("pr-read-snapshot-pipeline");
