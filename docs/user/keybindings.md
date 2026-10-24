@@ -64,6 +64,18 @@ Some keys are fixed and cannot be rebound here. In the composer, PageUp and
 PageDown scroll the chat timeline once the caret cannot move to another line
 of the draft (see [Workspace UI](./workspace-ui.md#reading-the-timeline)).
 
+**Mod+F** opens Find in thread (see
+[Workspace UI](./workspace-ui.md#finding-text-in-a-chat)). It is built in rather
+than a default rule, so it is not listed above and does not appear as a default
+row in **Settings → Keybindings**. It applies when focus is in a chat (its
+timeline, composer, or find bar) or nowhere, when no rule claims Mod+F there,
+and when no rule names `chat.find`. A rule that binds Mod+F to another command
+wins, and a rule that binds `chat.find` to another key replaces Mod+F. Mod+F in
+the file editor, Settings, a terminal, or a preview keeps its own meaning.
+While the find bar is open, Enter and Shift+Enter, Mod+G and Mod+Shift+G, and
+F3 and Shift+F3 move between matches; these keys belong to the bar and are not
+commands.
+
 The native server validates overrides in
 [`apps/server/src/production/keybindings.rs`](../../apps/server/src/production/keybindings.rs)
 and exposes the resolved file path and configuration issues through
@@ -102,6 +114,7 @@ surface them.
 - `commandPalette.toggle`: open or close the global command palette
 - `chat.new`: create a new worktree/chat thread preserving the active context where possible
 - `chat.newLocal`: create a new chat thread for the active project in a new environment (local/worktree determined by app settings (default `local`))
+- `chat.find`: open Find in thread in the chat that holds focus, or the host chat. It has no default rule; binding it replaces the built-in Mod+F. A client older than this command cannot decode a server configuration that names it, so on such a client every rule from that server fails to load until the rule is removed; an updated client is unaffected
 - `modelPicker.toggle`: open/close the model picker
 - `editor.openFavorite`: open current project/worktree in the last-used editor
 - `thread.previous` / `thread.next`: jump through visible left-panel workspace cards
@@ -151,6 +164,7 @@ Currently available context keys:
 - `previewOpen`
 - `modelPickerOpen`
 - `editableFocus`
+- `chatFocus`
 
 Supported operators:
 
@@ -166,6 +180,10 @@ Examples:
 - `"when": "terminalFocus || terminalOpen"`
 
 Unknown condition keys evaluate to `false`.
+
+`chatFocus` is true when focus is in a chat's timeline, composer, or find bar,
+or nowhere. No default rule uses it; it is there for `chat.find` rules such as
+`{ "key": "mod+shift+f", "command": "chat.find", "when": "chatFocus" }`.
 
 `terminalFocus` is true when either a center or right-panel terminal owns focus.
 `terminalOpen` is true when the active thread has at least one terminal surface

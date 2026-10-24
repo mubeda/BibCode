@@ -2762,7 +2762,14 @@ and ends with the process.
 `ChatMarkdown` (`apps/web/src/components/ChatMarkdown.tsx`) renders every chat
 message with `react-markdown`, `remark-gfm`, `rehype-raw` and `rehype-sanitize`,
 and highlights fenced code with Shiki through the `@pierre/diffs` shared
-highlighter. Its render cost depends on whether the message is streaming:
+highlighter. The plugin lists, sanitize schema, URL transform, file-link chip
+label and skill-token splitter live in
+`apps/web/src/components/chatMarkdownPipeline.ts`, which Find in thread
+(`apps/web/src/components/chat/threadFind/`) also runs to project each entry to
+the text a reader sees; a parity test keeps the two counting the same text. An
+entry above 16 KB is projected in a module worker that receives only the
+entry's text, never the query. Its render cost depends on whether the message
+is streaming:
 
 - **Finished messages.** A code block whose highlight is not cached renders as
   a plain block at once. A queue then highlights one block per task, newest
