@@ -75,6 +75,8 @@ import { TurnDeliveryNotice } from "./TurnDeliveryNotice";
 import {
   computeStableMessagesTimelineRows,
   deriveMessagesTimelineRows,
+  deriveUnsettledTurnId,
+  isWorkEntryInUnsettledTurn,
   normalizeCompactToolLabel,
   resolveAssistantMessageCopyState,
   resolveTimelineIsAtEnd,
@@ -130,6 +132,9 @@ import {
 
 interface TimelineRowSharedState {
   timestampFormat: TimestampFormat;
+  verboseChat: boolean;
+  /** Each tool row's expand/collapse choice, kept for when LegendList remounts the row. */
+  workEntryExpandedChoices: Map<string, boolean>;
   routeThreadKey: string;
   threadRef: ScopedThreadRef | null;
   markdownCwd: string | undefined;
@@ -159,6 +164,7 @@ interface TimelineRowActivityState {
   isWorking: boolean;
   isRevertingCheckpoint: boolean;
   activeTurnInProgress: boolean;
+  unsettledTurnId: TurnId | null;
 }
 
 const TimelineRowCtx = createContext<TimelineRowSharedState>(null!);
@@ -207,6 +213,7 @@ interface MessagesTimelineProps {
   markdownCwd: string | undefined;
   resolvedTheme: "light" | "dark";
   timestampFormat: TimestampFormat;
+  verboseChat: boolean;
   workspaceRoot: string | undefined;
   skills?: ReadonlyArray<Pick<ServerProviderSkill, "name" | "displayName">>;
   anchorMessageId: MessageId | null;
@@ -253,6 +260,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   markdownCwd,
   resolvedTheme,
   timestampFormat,
+  verboseChat,
   workspaceRoot,
   skills = EMPTY_TIMELINE_SKILLS,
   anchorMessageId,
@@ -265,6 +273,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   const [expandedTurnIds, setExpandedTurnIds] = useState<ReadonlySet<TurnId>>(new Set());
   const [expandedWorkGroupIds, setExpandedWorkGroupIds] = useState<ReadonlySet<string>>(new Set());
   const [minimapStripMap] = useState(() => new Map<string, HTMLSpanElement>());
+  const [workEntryExpandedChoices] = useState(() => new Map<string, boolean>());
 
   const onToggleTurnFold = useCallback((turnId: TurnId) => {
     setExpandedTurnIds((existing) => {
@@ -323,6 +332,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
         runningTurnId,
         expandedTurnIds,
         expandedWorkGroupIds,
+        verboseChat,
         isWorking,
         activeTurnStartedAt,
         turnDiffSummaryByAssistantMessageId,
@@ -336,6 +346,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       runningTurnId,
       expandedTurnIds,
       expandedWorkGroupIds,
+      verboseChat,
       isWorking,
       activeTurnStartedAt,
       turnDiffSummaryByAssistantMessageId,
@@ -424,6 +435,8 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   const sharedState = useMemo<TimelineRowSharedState>(
     () => ({
       timestampFormat,
+      verboseChat,
+      workEntryExpandedChoices,
       routeThreadKey,
       threadRef: parseScopedThreadKey(routeThreadKey),
       markdownCwd,
@@ -448,6 +461,8 @@ export const MessagesTimeline = memo(function MessagesTimeline({
     }),
     [
       timestampFormat,
+      verboseChat,
+      workEntryExpandedChoices,
       routeThreadKey,
       markdownCwd,
       resolvedTheme,
@@ -470,13 +485,15 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       onToggleWorkGroup,
     ],
   );
+  const unsettledTurnId = deriveUnsettledTurnId(latestTurn, runningTurnId);
   const activityState = useMemo<TimelineRowActivityState>(
     () => ({
       isWorking,
       isRevertingCheckpoint,
       activeTurnInProgress,
+      unsettledTurnId,
     }),
-    [activeTurnInProgress, isRevertingCheckpoint, isWorking],
+    [activeTurnInProgress, isRevertingCheckpoint, isWorking, unsettledTurnId],
   );
 
   // Stable renderItem — no closure deps. Row components read shared state
@@ -1188,7 +1205,7 @@ function TurnFoldTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "turn-
   const Icon = row.expanded ? ChevronDownIcon : ChevronRightIcon;
 
   return (
-    <div className="border-b border-border/60 pb-2 pt-1">
+    <div className="group/timeline-row flex items-center border-b border-border/60 pb-2 pt-1">
       <button
         type="button"
         aria-expanded={row.expanded}
@@ -1199,7 +1216,34 @@ function TurnFoldTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "turn-
         <span>{row.label}</span>
         <Icon className="size-3.5" />
       </button>
+      <TimelineRowTime createdAt={row.createdAt} className="ms-auto pe-1" />
     </div>
+  );
+}
+
+/**
+ * A tool or fold row's time, shown while the row is hovered or focused, as a message's time is.
+ * Hidden, it takes no room, so a tool row's preview keeps its full width.
+ */
+function TimelineRowTime({ createdAt, className }: { createdAt: string; className: string }) {
+  const { timestampFormat } = use(TimelineRowCtx);
+  return (
+    <Tooltip>
+      <TooltipTrigger
+        render={
+          <span
+            data-timeline-row-time
+            className={cn(
+              "hidden shrink-0 text-muted-foreground text-xs tabular-nums group-focus-within/timeline-row:inline group-hover/timeline-row:inline",
+              className,
+            )}
+          />
+        }
+      >
+        {formatShortTimestamp(createdAt, timestampFormat)}
+      </TooltipTrigger>
+      <TooltipPopup>{formatChatTimestampTooltip(createdAt, timestampFormat)}</TooltipPopup>
+    </Tooltip>
   );
 }
 
@@ -2172,8 +2216,19 @@ const SimpleWorkEntryRow = memo(function SimpleWorkEntryRow(props: {
   workspaceRoot: string | undefined;
 }) {
   const { workEntry, workspaceRoot } = props;
+  const { verboseChat, workEntryExpandedChoices } = use(TimelineRowCtx);
   const activity = use(TimelineRowActivityCtx);
-  const [expanded, setExpanded] = useState(false);
+  // The user's choice wins; until they make one, Verbose chat opens rows outside a running turn.
+  const [expandedChoice, setExpandedChoice] = useState(
+    () => workEntryExpandedChoices.get(workEntry.id) ?? null,
+  );
+  const expanded =
+    expandedChoice ??
+    (verboseChat && !isWorkEntryInUnsettledTurn(workEntry, activity.unsettledTurnId));
+  const toggleExpanded = () => {
+    workEntryExpandedChoices.set(workEntry.id, !expanded);
+    setExpandedChoice(!expanded);
+  };
   const iconConfig = workToneIcon(workEntry.tone);
   const entryIconName = workEntryIconName(workEntry);
   const heading = toolWorkEntryHeading(workEntry);
@@ -2212,11 +2267,12 @@ const SimpleWorkEntryRow = memo(function SimpleWorkEntryRow(props: {
         role: "button" as const,
         tabIndex: 0 as const,
         "aria-label": displayText,
-        onClick: () => setExpanded((v) => !v),
+        "aria-expanded": expanded,
+        onClick: toggleExpanded,
         onKeyDown: (e: KeyboardEvent<HTMLDivElement>) => {
           if (e.key === "Enter" || e.key === " ") {
             e.preventDefault();
-            setExpanded((v) => !v);
+            toggleExpanded();
           }
         },
       }
@@ -2225,7 +2281,7 @@ const SimpleWorkEntryRow = memo(function SimpleWorkEntryRow(props: {
   return (
     <div
       className={cn(
-        "flex flex-col rounded-md px-0.5 py-0.5 transition-colors",
+        "group/timeline-row flex flex-col rounded-md px-0.5 py-0.5 transition-colors",
         canExpand &&
           "cursor-pointer hover:bg-accent/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/70",
       )}
@@ -2248,6 +2304,7 @@ const SimpleWorkEntryRow = memo(function SimpleWorkEntryRow(props: {
             </p>
           </div>
           <div className="flex shrink-0 items-center gap-px text-muted-foreground">
+            <TimelineRowTime createdAt={workEntry.createdAt} className="me-1" />
             <span
               className="flex size-4 shrink-0 items-center justify-center"
               aria-hidden={!canExpand}

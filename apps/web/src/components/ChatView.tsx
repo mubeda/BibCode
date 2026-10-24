@@ -6980,6 +6980,7 @@ function ChatViewContent(props: ChatViewProps) {
                       markdownCwd={gitCwd ?? undefined}
                       resolvedTheme={resolvedTheme}
                       timestampFormat={timestampFormat}
+                      verboseChat={settings.verboseChat}
                       workspaceRoot={activeWorkspaceRoot}
                       skills={activeProviderStatus?.skills ?? EMPTY_PROVIDER_SKILLS}
                       anchorMessageId={timelineAnchorMessageId}

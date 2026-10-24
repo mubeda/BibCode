@@ -268,7 +268,7 @@ function isSubstantiveAssistantText(text: string): boolean {
  * user sends a message, the previous turn is still the "active" one until the
  * server creates the new turn, and folding must not flicker through that window.
  */
-function deriveUnsettledTurnId(
+export function deriveUnsettledTurnId(
   latestTurn: TimelineLatestTurn | null,
   runningTurnId: TurnId | null,
 ): TurnId | null {
@@ -280,6 +280,14 @@ function deriveUnsettledTurnId(
   }
   const isSettled = latestTurn.completedAt !== null && latestTurn.state !== "running";
   return isSettled ? null : latestTurn.turnId;
+}
+
+/** The turn still running, which Verbose chat leaves as it is with the setting off. */
+export function isWorkEntryInUnsettledTurn(
+  entry: Pick<WorkLogEntry, "turnId">,
+  unsettledTurnId: TurnId | null,
+): boolean {
+  return unsettledTurnId !== null && entry.turnId === unsettledTurnId;
 }
 
 /**
@@ -463,6 +471,8 @@ export function deriveMessagesTimelineRows(input: {
   runningTurnId?: TurnId | null;
   expandedTurnIds?: ReadonlySet<TurnId>;
   expandedWorkGroupIds?: ReadonlySet<string>;
+  /** Settled turns keep every entry visible: no turn folds, no work-group toggles. */
+  verboseChat?: boolean;
   isWorking: boolean;
   activeTurnStartedAt: string | null;
   turnDiffSummaryByAssistantMessageId: ReadonlyMap<MessageId, TurnDiffSummary>;
@@ -480,11 +490,16 @@ export function deriveMessagesTimelineRows(input: {
     input.latestTurn ?? null,
     input.runningTurnId ?? null,
   );
-  const { foldsByAnchorEntryId, answerMessageIds } = deriveTurnFolds({
+  const turnFolds = deriveTurnFolds({
     timelineEntries,
     latestTurn: input.latestTurn ?? null,
     unsettledTurnId,
   });
+  const { answerMessageIds } = turnFolds;
+  // Running turns never fold, so verbose chat drops only settled turns' folds.
+  const foldsByAnchorEntryId: ReadonlyMap<string, TurnFold> = input.verboseChat
+    ? new Map()
+    : turnFolds.foldsByAnchorEntryId;
   const collapsedEntryIds = new Set<string>();
   for (const fold of foldsByAnchorEntryId.values()) {
     if (!input.expandedTurnIds?.has(fold.turnId)) {
@@ -545,7 +560,12 @@ export function deriveMessagesTimelineRows(input: {
           });
         } else {
           const groupId = `work-group:${timelineEntry.id}`;
-          const expanded = input.expandedWorkGroupIds?.has(groupId) ?? false;
+          const showEveryEntry =
+            input.verboseChat === true &&
+            !visibleGroupedEntries.some((entry) =>
+              isWorkEntryInUnsettledTurn(entry, unsettledTurnId),
+            );
+          const expanded = showEveryEntry || (input.expandedWorkGroupIds?.has(groupId) ?? false);
           const hiddenEntries = visibleGroupedEntries.slice(0, -MAX_VISIBLE_WORK_LOG_ENTRIES);
           const visibleEntries = visibleGroupedEntries.slice(-MAX_VISIBLE_WORK_LOG_ENTRIES);
           const renderedEntries = expanded ? [...hiddenEntries, ...visibleEntries] : visibleEntries;
@@ -559,15 +579,19 @@ export function deriveMessagesTimelineRows(input: {
             });
           }
 
-          nextRows.push({
-            kind: "work-toggle",
-            id: `work-toggle:${timelineEntry.id}`,
-            createdAt: timelineEntry.createdAt,
-            groupId,
-            hiddenCount: hiddenEntries.length,
-            expanded,
-            onlyToolEntries: visibleGroupedEntries.every((entry) => workLogEntryIsToolLike(entry)),
-          });
+          if (!showEveryEntry) {
+            nextRows.push({
+              kind: "work-toggle",
+              id: `work-toggle:${timelineEntry.id}`,
+              createdAt: timelineEntry.createdAt,
+              groupId,
+              hiddenCount: hiddenEntries.length,
+              expanded,
+              onlyToolEntries: visibleGroupedEntries.every((entry) =>
+                workLogEntryIsToolLike(entry),
+              ),
+            });
+          }
         }
       }
       index = cursor - 1;

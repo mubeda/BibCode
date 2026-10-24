@@ -190,6 +190,7 @@ export const ClientSettingsSchema = Schema.Struct({
     Schema.catchDecoding(() => Effect.succeedSome(DEFAULT_USAGE_PERCENTAGE_DISPLAY)),
     Schema.withDecodingDefault(Effect.succeed(DEFAULT_USAGE_PERCENTAGE_DISPLAY)),
   ),
+  verboseChat: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   wordWrap: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
 });
 export type ClientSettings = typeof ClientSettingsSchema.Type;
@@ -735,6 +736,7 @@ export const ClientSettingsPatch = Schema.Struct({
   terminalFontPreference: Schema.optionalKey(TerminalFontPreference),
   terminalThemePreference: Schema.optionalKey(TerminalThemePreference),
   usagePercentageDisplay: Schema.optionalKey(UsagePercentageDisplay),
+  verboseChat: Schema.optionalKey(Schema.Boolean),
   wordWrap: Schema.optionalKey(Schema.Boolean),
 });
 export type ClientSettingsPatch = typeof ClientSettingsPatch.Type;

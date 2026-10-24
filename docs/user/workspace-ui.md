@@ -410,6 +410,21 @@ idle center terminal when possible and otherwise open a new center terminal.
 The retired bottom terminal drawer and its bottom-toolbar toggle no longer
 exist.
 
+### Reading the timeline
+
+A finished turn folds its commentary and tool calls behind a **Worked for**
+row, leaving its answer visible; click the row to open the turn. A run of tool
+calls shows its newest call with a **+N previous tool calls** row, and a tool
+call opens to its command, output, and changed files when clicked. Hover or
+focus a tool call or a **Worked for** row to see its time.
+
+**Settings → General → Verbose chat** (off by default) keeps finished turns
+open: no **Worked for** fold, every tool call in a run, and each tool call open
+to its output. The turn still running looks the same either way until it
+finishes. Clicking a tool call collapses it, and that choice holds until you
+switch threads or reload. The setting applies to open threads at once and is
+stored on this device.
+
 ### Uploading chat attachments
 
 When the server supports staged attachments and a message's total encoded
