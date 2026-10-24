@@ -330,6 +330,10 @@
       "mode": "unary"
     },
     {
+      "name": "review.readFileVersion",
+      "mode": "unary"
+    },
+    {
       "name": "server.consumeCodexRateLimitReset",
       "mode": "unary"
     },
@@ -872,6 +876,9 @@
     "typed-failures/review__getDiffPreview-01.json",
     "typed-failures/review__getDiffPreview-02.json",
     "typed-failures/review__getDiffPreview-03.json",
+    "typed-failures/review__readFileVersion-00.json",
+    "typed-failures/review__readFileVersion-01.json",
+    "typed-failures/review__readFileVersion-02.json",
     "typed-failures/server__consumeCodexRateLimitReset-00.json",
     "typed-failures/server__consumeCodexRateLimitReset-01.json",
     "typed-failures/server__discoverSourceControl-00.json",
@@ -1237,6 +1244,9 @@
     "typed-failures/review__getDiffPreview-01.json": "2ce5c89ac988f67153377ac2cfbabd6af7c67391e8d2c36af2304e1d7cd7caa2",
     "typed-failures/review__getDiffPreview-02.json": "ac9e7618ae2ed5aeb4271e4133d1ebaff18ee3d9e6341eda7735f34081ca9287",
     "typed-failures/review__getDiffPreview-03.json": "f21e4233466694c02754d2a3c0317c089f31f6634947c5fcc16d02c4997c35cf",
+    "typed-failures/review__readFileVersion-00.json": "2ce5c89ac988f67153377ac2cfbabd6af7c67391e8d2c36af2304e1d7cd7caa2",
+    "typed-failures/review__readFileVersion-01.json": "ac9e7618ae2ed5aeb4271e4133d1ebaff18ee3d9e6341eda7735f34081ca9287",
+    "typed-failures/review__readFileVersion-02.json": "f21e4233466694c02754d2a3c0317c089f31f6634947c5fcc16d02c4997c35cf",
     "typed-failures/server__consumeCodexRateLimitReset-00.json": "6e23dade8593c0a59319f4ff081d53d3261c82f9223eed493544c12438f8a17c",
     "typed-failures/server__consumeCodexRateLimitReset-01.json": "f21e4233466694c02754d2a3c0317c089f31f6634947c5fcc16d02c4997c35cf",
     "typed-failures/server__discoverSourceControl-00.json": "950333bb892eba89420d696b2674275ebe5de296311ca5d2045b4963fc596274",
@@ -1745,6 +1755,9 @@
     "typed-failures/review__getDiffPreview-01.json",
     "typed-failures/review__getDiffPreview-02.json",
     "typed-failures/review__getDiffPreview-03.json",
+    "typed-failures/review__readFileVersion-00.json",
+    "typed-failures/review__readFileVersion-01.json",
+    "typed-failures/review__readFileVersion-02.json",
     "typed-failures/server__consumeCodexRateLimitReset-00.json",
     "typed-failures/server__consumeCodexRateLimitReset-01.json",
     "typed-failures/server__discoverSourceControl-00.json",

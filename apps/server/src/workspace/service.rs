@@ -80,7 +80,7 @@ impl WorkspaceService {
         self
     }
 
-    async fn permit(&self) -> Result<OwnedSemaphorePermit, WorkspaceError> {
+    pub(crate) async fn permit(&self) -> Result<OwnedSemaphorePermit, WorkspaceError> {
         self.permits
             .clone()
             .acquire_owned()

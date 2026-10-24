@@ -41,6 +41,7 @@ const WORKSPACE_METHODS: &[&str] = &[
     "projects.searchEntries",
     "projects.writeFile",
     "review.getDiffPreview",
+    "review.readFileVersion",
 ];
 const PREVIEW_METHODS: &[&str] = &[
     "preview.claimOpenRequest",

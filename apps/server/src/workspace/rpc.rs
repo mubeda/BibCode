@@ -8,7 +8,9 @@ use std::time::{Duration, Instant};
 
 use crate::assets::{AssetAccess, AssetError, AssetIssueRequest, AssetResource};
 use crate::git::StatusMutationGuard;
-use crate::review::{ReviewDiffPreviewInput, ReviewError, ReviewService};
+use crate::review::{
+    ReviewDiffPreviewInput, ReviewError, ReviewReadFileVersionInput, ReviewService,
+};
 use crate::transfer::archive::ArchiveLimits;
 use crate::transfer::{self, TransferAccess, TransferError};
 use crate::worktree_catalog::{
@@ -30,7 +32,7 @@ use super::{EntryKind, SearchLimits, WorkspaceError, WorkspaceSearchIndex, Works
 
 const PROJECT_ENTRIES_MAX_LIMIT: usize = 200;
 
-pub const TASK_SIX_RPC_METHODS: [&str; 13] = [
+pub const TASK_SIX_RPC_METHODS: [&str; 14] = [
     "projects.searchEntries",
     "projects.listEntries",
     "projects.readFile",
@@ -44,6 +46,7 @@ pub const TASK_SIX_RPC_METHODS: [&str; 13] = [
     "filesystem.browse",
     "assets.createUrl",
     "review.getDiffPreview",
+    "review.readFileVersion",
 ];
 
 type AssetContextFuture<'a> =
@@ -621,6 +624,25 @@ impl WorkspaceRpc {
                 let input: ReviewDiffPreviewInput = decode(payload)?;
                 let _admission = self.acquire_path(&input.cwd).await?;
                 self.handle_review_get_diff_preview(input).await
+            }
+            "review.readFileVersion" => {
+                let input: ReviewReadFileVersionInput = decode(payload)?;
+                let _admission = self.acquire_path(&input.cwd).await?;
+                // Reads share the workspace's operation permits with file reads and writes.
+                let _permit =
+                    self.service.permit().await.map_err(
+                        |error| json!({ "_tag": "Defect", "message": error.to_string() }),
+                    )?;
+                let review_service = self
+                    .dependencies
+                    .review_service
+                    .as_ref()
+                    .ok_or_else(|| defect("review.readFileVersion is not configured"))?;
+                let result = review_service
+                    .read_file_version(input, &cancellation)
+                    .await
+                    .map_err(review_wire_error)?;
+                encode(result).map_err(|error| defect(&error.to_string()))
             }
             _ => Err(json!({
                 "_tag": "Defect",

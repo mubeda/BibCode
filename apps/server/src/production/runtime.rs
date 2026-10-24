@@ -94,8 +94,9 @@ use crate::{
     },
     provider_usage::{ProviderUsageService, production_fetchers},
     review::{
-        ReviewBackend, ReviewDiffPreviewInput, ReviewDiffPreviewResult, ReviewError, ReviewService,
-        ReviewSource,
+        ReviewBackend, ReviewDiffPreviewInput, ReviewDiffPreviewResult, ReviewError,
+        ReviewFileVersion, ReviewFileVersionRequest, ReviewFileVersionUnavailable,
+        ReviewReadFileVersionInput, ReviewService, ReviewSource,
     },
     rpc::RpcRegistry,
     server_settings::ProviderSettingsStore,
@@ -1171,6 +1172,278 @@ impl ReviewBackend for GitReviewBackend {
             }))
         })
     }
+
+    fn read_file_version<'a>(
+        &'a self,
+        input: &'a ReviewReadFileVersionInput,
+        cancellation: &'a CancellationToken,
+    ) -> crate::review::ReviewFileVersionFuture<'a> {
+        Box::pin(async move {
+            let root = Path::new(&input.cwd);
+            match &input.version {
+                ReviewFileVersionRequest::Blob { oid } => {
+                    read_review_blob(root, oid, cancellation).await
+                }
+                ReviewFileVersionRequest::Worktree { path, expected_oid } => {
+                    read_review_worktree_file(root, path, expected_oid, cancellation).await
+                }
+            }
+        })
+    }
+}
+
+/// A review version read waits at most this long for Git.
+const REVIEW_VERSION_GIT_TIMEOUT: Duration = Duration::from_secs(30);
+/// `<oid> SP <type> SP <size> LF` for a 64-digit ID and a 20-digit size, with room to spare.
+const REVIEW_BLOB_HEADER_LIMIT: usize = 128;
+
+fn review_version_git(
+    root: &Path,
+    operation: &str,
+    args: &[&str],
+    stdin: Vec<u8>,
+    max_output_bytes: usize,
+) -> crate::git::ProcessRequest {
+    let mut env = crate::git::git_read_environment();
+    // A partial clone must never fetch a missing object from the network for a read.
+    env.push(("GIT_NO_LAZY_FETCH".into(), "1".into()));
+    crate::git::ProcessRequest {
+        operation: operation.to_owned(),
+        command: PathBuf::from("git"),
+        args: args.iter().map(std::ffi::OsString::from).collect(),
+        cwd: root.to_path_buf(),
+        env,
+        stdin: Some(stdin),
+        timeout: REVIEW_VERSION_GIT_TIMEOUT,
+        max_output_bytes,
+        output_policy: crate::git::OutputPolicy::Error,
+        append_truncation_marker: false,
+        allow_non_zero_exit: false,
+    }
+}
+
+fn review_version_error(error: crate::git::ProcessError) -> ReviewError {
+    ReviewError::Backend(error.to_string())
+}
+
+/// Reads a blob by its full object ID with one `git cat-file --batch`. No filter or text
+/// conversion applies, and nothing touches the working tree.
+async fn read_review_blob(
+    root: &Path,
+    oid: &str,
+    cancellation: &CancellationToken,
+) -> Result<ReviewFileVersion, ReviewError> {
+    let limit = MAX_REVIEW_SOURCE_DIFF_BYTES;
+    let read = crate::git::ProcessRunner
+        .run_bytes(
+            review_version_git(
+                root,
+                "Review.readFileVersion.blob",
+                &["cat-file", "--batch"],
+                format!("{oid}\n").into_bytes(),
+                limit + REVIEW_BLOB_HEADER_LIMIT,
+            ),
+            cancellation,
+        )
+        .await;
+    let output = match read {
+        Ok(output) => output.stdout,
+        // Past the cap, a second, tiny read says what the object is and how large.
+        Err(crate::git::ProcessError::OutputLimit { .. }) => {
+            let check = crate::git::ProcessRunner
+                .run_bytes(
+                    review_version_git(
+                        root,
+                        "Review.readFileVersion.blobCheck",
+                        &["cat-file", "--batch-check"],
+                        format!("{oid}\n").into_bytes(),
+                        REVIEW_BLOB_HEADER_LIMIT,
+                    ),
+                    cancellation,
+                )
+                .await
+                .map_err(review_version_error)?;
+            return Ok(match parse_review_blob_header(&check.stdout) {
+                ReviewBlobHeader::Object {
+                    kind: "blob", size, ..
+                } => review_unavailable(ReviewFileVersionUnavailable::TooLarge, Some(size)),
+                ReviewBlobHeader::Object { size, .. } => {
+                    review_unavailable(ReviewFileVersionUnavailable::NotAFile, Some(size))
+                }
+                ReviewBlobHeader::Missing => {
+                    review_unavailable(ReviewFileVersionUnavailable::Missing, None)
+                }
+            });
+        }
+        Err(error) => return Err(review_version_error(error)),
+    };
+    match parse_review_blob_header(&output) {
+        ReviewBlobHeader::Missing => Ok(review_unavailable(
+            ReviewFileVersionUnavailable::Missing,
+            None,
+        )),
+        ReviewBlobHeader::Object { kind, size, .. } if kind != "blob" => Ok(review_unavailable(
+            ReviewFileVersionUnavailable::NotAFile,
+            Some(size),
+        )),
+        ReviewBlobHeader::Object { size, .. }
+            if usize::try_from(size).map_or(true, |size| size > limit) =>
+        {
+            Ok(review_unavailable(
+                ReviewFileVersionUnavailable::TooLarge,
+                Some(size),
+            ))
+        }
+        ReviewBlobHeader::Object {
+            size,
+            header_length,
+            ..
+        } => {
+            let end = header_length + usize::try_from(size).unwrap_or(usize::MAX);
+            let contents = output.get(header_length..end).ok_or_else(|| {
+                ReviewError::Backend("git cat-file returned a short object".to_owned())
+            })?;
+            Ok(review_text(contents, size))
+        }
+    }
+}
+
+enum ReviewBlobHeader<'a> {
+    Missing,
+    Object {
+        kind: &'a str,
+        size: u64,
+        /// The header line's length, its newline included.
+        header_length: usize,
+    },
+}
+
+/// Parses `cat-file --batch` output's first line. Anything that is not an object header is
+/// read as missing, as Git prints `<oid> missing` for an unknown ID.
+fn parse_review_blob_header(output: &[u8]) -> ReviewBlobHeader<'_> {
+    let Some(newline) = output.iter().position(|byte| *byte == b'\n') else {
+        return ReviewBlobHeader::Missing;
+    };
+    let Ok(line) = std::str::from_utf8(&output[..newline]) else {
+        return ReviewBlobHeader::Missing;
+    };
+    let mut fields = line.split(' ');
+    match (fields.next(), fields.next(), fields.next(), fields.next()) {
+        (Some(_), Some(kind), Some(size), None) => match size.parse::<u64>() {
+            Ok(size) => ReviewBlobHeader::Object {
+                kind,
+                size,
+                header_length: newline + 1,
+            },
+            Err(_) => ReviewBlobHeader::Missing,
+        },
+        _ => ReviewBlobHeader::Missing,
+    }
+}
+
+fn review_unavailable(
+    reason: ReviewFileVersionUnavailable,
+    byte_length: Option<u64>,
+) -> ReviewFileVersion {
+    ReviewFileVersion::Unavailable {
+        reason,
+        byte_length,
+    }
+}
+
+/// Text decoded the way the patch is: lossy UTF-8. A NUL byte marks a binary file.
+fn review_text(contents: &[u8], byte_length: u64) -> ReviewFileVersion {
+    if contents.contains(&0) {
+        return review_unavailable(ReviewFileVersionUnavailable::Binary, Some(byte_length));
+    }
+    ReviewFileVersion::Text {
+        contents: String::from_utf8_lossy(contents).into_owned(),
+        byte_length,
+    }
+}
+
+/// Reads the working-tree file the patch named, and checks it still has that content: its
+/// bytes are hashed by `git hash-object --stdin --path=<path>`, which applies the path's clean
+/// filters and end-of-line rules as `git diff` did when it printed the ID.
+async fn read_review_worktree_file(
+    root: &Path,
+    relative_path: &str,
+    expected_oid: &str,
+    cancellation: &CancellationToken,
+) -> Result<ReviewFileVersion, ReviewError> {
+    use crate::workspace::{
+        WorkspaceError,
+        paths::{canonical_existing_within, resolve_relative},
+    };
+
+    let limit = MAX_REVIEW_SOURCE_DIFF_BYTES;
+    let refused = |error: WorkspaceError| ReviewError::InvalidRequest(error.to_string());
+    let (target, normalized) = resolve_relative(root, relative_path).map_err(refused)?;
+    match canonical_existing_within(root, &target).await {
+        Ok(_) => {}
+        Err(WorkspaceError::Operation { source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            return Ok(review_unavailable(
+                ReviewFileVersionUnavailable::Missing,
+                None,
+            ));
+        }
+        Err(error @ WorkspaceError::ResolvedPathOutsideRoot { .. }) => return Err(refused(error)),
+        Err(error) => return Err(ReviewError::Backend(error.to_string())),
+    }
+    // The path itself, not what it points at: a symlink, a directory or a submodule has no
+    // text of its own to compare.
+    let metadata = tokio::fs::symlink_metadata(&target)
+        .await
+        .map_err(|error| ReviewError::Backend(error.to_string()))?;
+    if !metadata.file_type().is_file() {
+        return Ok(review_unavailable(
+            ReviewFileVersionUnavailable::NotAFile,
+            None,
+        ));
+    }
+    if usize::try_from(metadata.len()).map_or(true, |length| length > limit) {
+        return Ok(review_unavailable(
+            ReviewFileVersionUnavailable::TooLarge,
+            Some(metadata.len()),
+        ));
+    }
+    let mut bytes = Vec::new();
+    tokio::fs::File::open(&target)
+        .await
+        .map_err(|error| ReviewError::Backend(error.to_string()))?
+        .take(limit as u64 + 1)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|error| ReviewError::Backend(error.to_string()))?;
+    if bytes.len() > limit {
+        return Ok(review_unavailable(
+            ReviewFileVersionUnavailable::TooLarge,
+            Some(bytes.len() as u64),
+        ));
+    }
+    let path_argument = format!("--path={normalized}");
+    let hashed = crate::git::ProcessRunner
+        .run_bytes(
+            review_version_git(
+                root,
+                "Review.readFileVersion.hash",
+                &["hash-object", "--stdin", &path_argument],
+                bytes.clone(),
+                REVIEW_BLOB_HEADER_LIMIT,
+            ),
+            cancellation,
+        )
+        .await
+        .map_err(review_version_error)?;
+    if String::from_utf8_lossy(&hashed.stdout).trim() != expected_oid {
+        return Ok(review_unavailable(
+            ReviewFileVersionUnavailable::Changed,
+            Some(bytes.len() as u64),
+        ));
+    }
+    Ok(review_text(&bytes, bytes.len() as u64))
 }
 
 /// One review preview source, bounded at the patch cap; `truncated` says later files were dropped.
@@ -4036,5 +4309,325 @@ mod tests {
         let findings = exits.take();
         assert_eq!(findings.len(), 1, "{findings:?}");
         assert!(findings[0].contains(&"git".to_owned()), "{findings:?}");
+    }
+
+    /// A repository with `modified.txt`, `deleted.txt`, `renamed-old.txt`, `binary.dat` and a
+    /// large file committed, then modified, deleted and renamed in the working tree.
+    struct VersionRepository {
+        directory: TempDir,
+    }
+
+    impl VersionRepository {
+        fn new() -> Self {
+            let repository = Self {
+                directory: TempDir::new().expect("temporary repository"),
+            };
+            repository.git(&["init", "--quiet"]);
+            repository.git(&["config", "user.email", "test@bibcode.local"]);
+            repository.git(&["config", "user.name", "BiBCode Test"]);
+            repository.write("modified.txt", "before\n");
+            repository.write("deleted.txt", "deleted contents\n");
+            repository.write("renamed-old.txt", "renamed contents\nsecond line\n");
+            std::fs::write(repository.path().join("binary.dat"), b"bin\0ary").expect("binary");
+            std::fs::write(
+                repository.path().join("large.txt"),
+                "x".repeat(MAX_REVIEW_SOURCE_DIFF_BYTES + 1),
+            )
+            .expect("large file");
+            repository.git(&["add", "."]);
+            repository.git(&["commit", "--quiet", "-m", "base"]);
+            repository.write("modified.txt", "after\n");
+            std::fs::remove_file(repository.path().join("deleted.txt")).expect("delete");
+            repository.git(&["mv", "renamed-old.txt", "renamed-new.txt"]);
+            repository
+        }
+
+        fn path(&self) -> &Path {
+            self.directory.path()
+        }
+
+        fn cwd(&self) -> String {
+            self.path().to_string_lossy().into_owned()
+        }
+
+        fn write(&self, name: &str, contents: &str) {
+            std::fs::write(self.path().join(name), contents).expect("fixture file");
+        }
+
+        fn git(&self, args: &[&str]) -> String {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(self.path())
+                .output()
+                .expect("git starts");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        }
+
+        async fn read(&self, version: ReviewFileVersionRequest) -> ReviewFileVersion {
+            self.try_read(version).await.expect("version read")
+        }
+
+        async fn try_read(
+            &self,
+            version: ReviewFileVersionRequest,
+        ) -> Result<ReviewFileVersion, ReviewError> {
+            ReviewService::new(Arc::new(GitReviewBackend))
+                .read_file_version(
+                    ReviewReadFileVersionInput {
+                        cwd: self.cwd(),
+                        version,
+                    },
+                    &CancellationToken::new(),
+                )
+                .await
+        }
+    }
+
+    fn blob(oid: impl Into<String>) -> ReviewFileVersionRequest {
+        ReviewFileVersionRequest::Blob { oid: oid.into() }
+    }
+
+    fn worktree(path: &str, expected_oid: impl Into<String>) -> ReviewFileVersionRequest {
+        ReviewFileVersionRequest::Worktree {
+            path: path.to_owned(),
+            expected_oid: expected_oid.into(),
+        }
+    }
+
+    fn text(contents: &str) -> ReviewFileVersion {
+        ReviewFileVersion::Text {
+            contents: contents.to_owned(),
+            byte_length: contents.len() as u64,
+        }
+    }
+
+    fn unavailable(
+        reason: ReviewFileVersionUnavailable,
+        byte_length: Option<u64>,
+    ) -> ReviewFileVersion {
+        ReviewFileVersion::Unavailable {
+            reason,
+            byte_length,
+        }
+    }
+
+    #[tokio::test]
+    async fn blob_versions_read_old_sides_and_checkpoint_only_files() {
+        let repository = VersionRepository::new();
+        for (path, contents) in [
+            ("modified.txt", "before\n"),
+            ("deleted.txt", "deleted contents\n"),
+            ("renamed-old.txt", "renamed contents\nsecond line\n"),
+        ] {
+            let oid = repository.git(&["rev-parse", &format!("HEAD:{path}")]);
+            assert_eq!(repository.read(blob(oid)).await, text(contents), "{path}");
+        }
+
+        // A file that only a checkpoint holds: never committed, and gone from the checkout.
+        repository.write("checkpoint-only.txt", "held by a checkpoint\n");
+        crate::production::orchestration_effects::capture_checkpoint(
+            repository.path(),
+            "thread-versions",
+            1,
+        )
+        .await
+        .expect("checkpoint");
+        std::fs::remove_file(repository.path().join("checkpoint-only.txt")).expect("delete");
+        let reference =
+            crate::production::orchestration_effects::checkpoint_ref("thread-versions", 1);
+        let oid = repository.git(&["rev-parse", &format!("{reference}:checkpoint-only.txt")]);
+        assert_eq!(
+            repository.read(blob(oid)).await,
+            text("held by a checkpoint\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn blob_versions_explain_what_has_no_text() {
+        let repository = VersionRepository::new();
+        assert_eq!(
+            repository.read(blob("1".repeat(40))).await,
+            unavailable(ReviewFileVersionUnavailable::Missing, None)
+        );
+        for revision in ["HEAD^{tree}", "HEAD"] {
+            let oid = repository.git(&["rev-parse", revision]);
+            assert!(
+                matches!(
+                    repository.read(blob(oid)).await,
+                    ReviewFileVersion::Unavailable {
+                        reason: ReviewFileVersionUnavailable::NotAFile,
+                        byte_length: Some(_),
+                    }
+                ),
+                "{revision}"
+            );
+        }
+        let large = repository.git(&["rev-parse", "HEAD:large.txt"]);
+        assert_eq!(
+            repository.read(blob(large)).await,
+            unavailable(
+                ReviewFileVersionUnavailable::TooLarge,
+                Some(MAX_REVIEW_SOURCE_DIFF_BYTES as u64 + 1)
+            )
+        );
+        let binary = repository.git(&["rev-parse", "HEAD:binary.dat"]);
+        assert_eq!(
+            repository.read(blob(binary)).await,
+            unavailable(ReviewFileVersionUnavailable::Binary, Some(7))
+        );
+        for malformed in ["abc123", &"A".repeat(40), "--x"] {
+            assert!(
+                matches!(
+                    repository.try_read(blob(malformed)).await,
+                    Err(ReviewError::InvalidRequest(_))
+                ),
+                "{malformed}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_version_read_stops_before_git_runs() {
+        let repository = VersionRepository::new();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let oid = repository.git(&["rev-parse", "HEAD:modified.txt"]);
+        let read = GitReviewBackend
+            .read_file_version(
+                &ReviewReadFileVersionInput {
+                    cwd: repository.cwd(),
+                    version: blob(oid),
+                },
+                &cancellation,
+            )
+            .await;
+        assert!(
+            matches!(&read, Err(ReviewError::Backend(message)) if message.contains("cancelled")),
+            "{read:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn worktree_versions_check_the_patch_still_names_the_file() {
+        let repository = VersionRepository::new();
+        let current = repository.git(&["hash-object", "modified.txt"]);
+        assert_eq!(
+            repository
+                .read(worktree("modified.txt", current.clone()))
+                .await,
+            text("after\n")
+        );
+        repository.write("modified.txt", "edited after the patch\n");
+        assert_eq!(
+            repository.read(worktree("modified.txt", current)).await,
+            unavailable(ReviewFileVersionUnavailable::Changed, Some(23))
+        );
+        assert_eq!(
+            repository
+                .read(worktree("deleted.txt", "2".repeat(40)))
+                .await,
+            unavailable(ReviewFileVersionUnavailable::Missing, None)
+        );
+        for refused in ["../outside.txt", "/etc/hosts"] {
+            assert!(
+                matches!(
+                    repository.try_read(worktree(refused, "2".repeat(40))).await,
+                    Err(ReviewError::InvalidRequest(_))
+                ),
+                "{refused}"
+            );
+        }
+    }
+
+    /// Under `core.autocrlf=true` the checkout has CRLF while Git hashes LF, so the read must
+    /// hash through the path's filters to match the ID `git diff` printed.
+    #[tokio::test]
+    async fn worktree_versions_match_the_patch_id_under_autocrlf() {
+        let repository = VersionRepository::new();
+        repository.git(&["config", "core.autocrlf", "true"]);
+        repository.write("crlf.txt", "one\r\ntwo\r\n");
+        repository.git(&["add", "crlf.txt"]);
+        repository.git(&["commit", "--quiet", "-m", "crlf"]);
+        repository.write("crlf.txt", "one\r\nthree\r\n");
+        let preview = GitReviewBackend
+            .get_diff_preview(&ReviewDiffPreviewInput {
+                cwd: repository.cwd(),
+                base_ref: None,
+                ignore_whitespace: None,
+                context_lines: None,
+            })
+            .await
+            .expect("review")
+            .expect("preview");
+        let diff = &preview.sources[0].diff;
+        let section = &diff[diff.find("diff --git a/crlf.txt").expect("crlf section")..];
+        let index_line = section
+            .lines()
+            .find(|line| line.starts_with("index "))
+            .expect("index line");
+        let new_id = index_line["index ".len()..]
+            .split(' ')
+            .next()
+            .and_then(|ids| ids.split_once(".."))
+            .map(|(_, new)| new.to_owned())
+            .expect("new id");
+        assert_eq!(
+            repository.read(worktree("crlf.txt", new_id)).await,
+            text("one\r\nthree\r\n")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn worktree_versions_refuse_symlinks() {
+        let repository = VersionRepository::new();
+        let outside = TempDir::new().expect("outside directory");
+        std::fs::write(outside.path().join("secret.txt"), "secret\n").expect("outside file");
+        std::os::unix::fs::symlink(
+            outside.path().join("secret.txt"),
+            repository.path().join("escape.txt"),
+        )
+        .expect("escaping symlink");
+        std::os::unix::fs::symlink("modified.txt", repository.path().join("link.txt"))
+            .expect("inner symlink");
+        assert!(matches!(
+            repository
+                .try_read(worktree("escape.txt", "2".repeat(40)))
+                .await,
+            Err(ReviewError::InvalidRequest(_))
+        ));
+        assert_eq!(
+            repository.read(worktree("link.txt", "2".repeat(40))).await,
+            unavailable(ReviewFileVersionUnavailable::NotAFile, None)
+        );
+    }
+
+    #[test]
+    fn file_version_wire_shapes_match_the_contract() {
+        assert_eq!(
+            serde_json::to_value(text("a")).expect("text encodes"),
+            json!({ "_tag": "text", "contents": "a", "byteLength": 1 })
+        );
+        assert_eq!(
+            serde_json::to_value(unavailable(ReviewFileVersionUnavailable::TooLarge, Some(9)))
+                .expect("unavailable encodes"),
+            json!({ "_tag": "unavailable", "reason": "too-large", "byteLength": 9 })
+        );
+        assert_eq!(
+            serde_json::to_value(unavailable(ReviewFileVersionUnavailable::NotAFile, None))
+                .expect("unavailable encodes"),
+            json!({ "_tag": "unavailable", "reason": "not-a-file", "byteLength": null })
+        );
+        let input = serde_json::from_value::<ReviewReadFileVersionInput>(json!({
+            "cwd": "/repo",
+            "version": { "_tag": "worktree", "path": "a.txt", "expectedOid": "f".repeat(40) },
+        }))
+        .expect("input decodes");
+        assert_eq!(input.version, worktree("a.txt", "f".repeat(40)));
     }
 }

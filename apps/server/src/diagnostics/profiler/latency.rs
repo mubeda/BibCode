@@ -1144,6 +1144,8 @@ mod tests {
         // git command timeout. A slow one is a slowness worth reporting.
         assert!(!is_long_running("worktree.adopt"));
         assert!(!is_long_running("gitManager.previewMerge"));
+        // A local, bounded read: a slow one is worth reporting.
+        assert!(!is_long_running("review.readFileVersion"));
     }
 
     #[test]

@@ -716,6 +716,43 @@ the server from the thread ID and the turn counts; the client sends no ref
 names. An older server serves only stored rows, which a turn captured by it
 never had, and never returns `WorkspaceUnavailableError` for these methods.
 
+### Full-file reads
+
+`review.readFileVersion` (`read_unary`, `review:write`) returns one side of a
+changed file, named by the content it must have rather than by a revision:
+
+- **`blob { oid }`** reads the object with one `git cat-file --batch`, with the
+  read environment plus `GIT_NO_LAZY_FETCH=1`, so a partial clone never
+  fetches from the network. The ID must be 40 or 64 lowercase hex digits,
+  which is neither an option nor a path. A deleted file, a rename's old side
+  and a branch or checkpoint file absent from the checkout are all read this
+  way, without touching the working tree. No filter or text conversion
+  applies.
+- **`worktree { path, expectedOid }`** reads the working-tree file once and
+  hashes its bytes with `git hash-object --stdin --path=<path>`, which applies
+  that path's clean filters and end-of-line rules as `git diff` did when it
+  printed the ID. A different ID returns `changed`. The path goes through the
+  workspace's `resolve_relative` and `canonical_existing_within`: an absolute
+  path, `..` or a symlink that leaves the root is refused, a symlink, directory
+  or submodule is `not-a-file`, and a path that no longer exists is `missing`.
+  Paths resolve against `cwd`, while a tracked patch names paths from the
+  repository root, so a project rooted in a repository subdirectory gets
+  `missing` here.
+- **Results.** `text { contents, byteLength }` is lossy UTF-8, as the patch
+  is. `unavailable { reason, byteLength }` says why there is none: `missing`,
+  `binary` (a NUL byte), `too-large` (over the 4,375,000-byte patch cap, with
+  the size from `cat-file --batch-check`), `not-a-file` or `changed`.
+- **Bounds.** The method is dispatched in `WorkspaceRpc` behind the same
+  `acquire_path` admission as `getDiffPreview`, and shares the workspace's 32
+  operation permits. Each Git step has a 30 s timeout and the request's
+  cancellation.
+
+The client keeps version reads and patches with a `contextLines` in their own
+query families with `idleTtlMs: 0`. Releasing one interrupts a read in flight
+and drops its result, so moving to another file, or to another context count,
+keeps no multi-megabyte result behind. The default patch keeps today's
+family, so Changes and Compare's **All lines** share it.
+
 ## Pull Requests contract boundary
 
 `packages/contracts/src/pullRequests.ts` defines the repository-scoped Pull

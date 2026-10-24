@@ -156,6 +156,8 @@ import {
   ReviewDiffPreviewError,
   ReviewDiffPreviewInput,
   ReviewDiffPreviewResult,
+  ReviewReadFileVersionInput,
+  ReviewReadFileVersionResult,
 } from "./review.ts";
 import { KeybindingsConfigError } from "./keybindings.ts";
 import {
@@ -528,6 +530,7 @@ export const WS_METHODS = {
 
   // Review methods
   reviewGetDiffPreview: "review.getDiffPreview",
+  reviewReadFileVersion: "review.readFileVersion",
 
   // Activity methods
   activityGetSnapshot: "activity.getSnapshot",
@@ -1464,6 +1467,13 @@ export const WsReviewGetDiffPreviewRpc = Rpc.make(WS_METHODS.reviewGetDiffPrevie
   ]),
 });
 
+/** One side of a changed file, for the Diff panel's Compare view. */
+export const WsReviewReadFileVersionRpc = Rpc.make(WS_METHODS.reviewReadFileVersion, {
+  payload: ReviewReadFileVersionInput,
+  success: ReviewReadFileVersionResult,
+  error: Schema.Union([WorkspaceUnavailableError, WorkspaceIdentityError, EnvironmentRpcError]),
+});
+
 export const WsTerminalOpenRpc = Rpc.make(WS_METHODS.terminalOpen, {
   payload: TerminalOpenInput,
   success: TerminalSessionSnapshot,
@@ -1972,6 +1982,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsPullRequestsReadSnapshotRpc,
   WsPullRequestsSubscribeRpc,
   WsReviewGetDiffPreviewRpc,
+  WsReviewReadFileVersionRpc,
   WsTerminalOpenRpc,
   WsTerminalAttachRpc,
   WsTerminalWriteRpc,
