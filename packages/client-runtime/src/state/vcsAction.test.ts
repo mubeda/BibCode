@@ -833,11 +833,13 @@ describe("vcsActionState", () => {
     }),
   );
 
-  it.effect("retains structural remote failure context without copying the remote payload", () =>
+  // The server redacts the detail before it leaves (#174), so the client passes it through.
+  it.effect("keeps the server's failure reason as the error's user-facing text", () =>
     Effect.gen(function* () {
       const target = { environmentId, cwd };
       const transportActionId = createVcsActionTransportId(target, actionId);
-      const remoteMessage = "The remote rejected the push with credential=do-not-log.";
+      const remoteMessage =
+        "! [rejected] main -> main (fetch first)\nerror: failed to push some refs to 'origin'";
       const error = yield* consumeVcsActionProgress(
         Stream.fromIterable<GitActionProgressEvent>([
           {
@@ -866,11 +868,31 @@ describe("vcsActionState", () => {
         environmentId,
         cwd,
         phase: "push",
-        remoteMessageLength: remoteMessage.length,
+        remoteMessage,
       });
-      expect(error).not.toHaveProperty("detail");
-      expect(error.message).toBe("Source control action 'commit_push' failed during push.");
-      expect(error.message).not.toContain(remoteMessage);
+      expect(error.message).toBe(remoteMessage);
+    }),
+  );
+
+  it.effect("falls back to the action and phase when the server sends no reason", () =>
+    Effect.gen(function* () {
+      const target = { environmentId, cwd };
+      const transportActionId = createVcsActionTransportId(target, actionId);
+      const error = yield* consumeVcsActionProgress(
+        Stream.fromIterable<GitActionProgressEvent>([
+          {
+            actionId: transportActionId,
+            action,
+            cwd,
+            kind: "action_failed",
+            phase: null,
+            message: "  ",
+          },
+        ]),
+        { target, transportActionId, actionId, action, onProgress: () => Effect.void },
+      ).pipe(Effect.flip);
+
+      expect(error.message).toBe("Source control action 'commit_push' failed during execution.");
     }),
   );
 

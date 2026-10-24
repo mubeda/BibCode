@@ -84,6 +84,7 @@ import {
   requiresDefaultBranchConfirmation,
   resolveDefaultBranchActionDialogCopy,
   resolveQuickAction,
+  stackedActionFailureTitle,
 } from "./GitActionsControl.logic";
 import { SourceControlChangesList } from "./SourceControlChangesList";
 import { SourceControlCommits } from "./SourceControlCommits";
@@ -487,18 +488,12 @@ export default function SourceControlPanel({
         timeout: 0,
         data: threadToastData,
       });
-      // The settled failure names only the action and phase; the server's own report
-      // carries what Git said, which the error toast shows instead (#157).
-      const remoteFailure: { message: string | null } = { message: null };
       // Create MR/PR publishes the branch first, then reviews it in the shared dialog.
       const result = await runAction.run({
         actionId: randomUUID(),
         action: action === "create_pr" ? "push" : action,
         ...(message ? { commitMessage: message } : {}),
         ...commitInput,
-        onProgress: (event) => {
-          if (event.kind === "action_failed") remoteFailure.message = event.message;
-        },
       });
       if (result._tag === "Failure") {
         if (isAtomCommandInterrupted(result)) {
@@ -510,8 +505,8 @@ export default function SourceControlPanel({
           toastId,
           stackedThreadToast({
             type: "error",
-            title: "Action failed",
-            description: remoteFailure.message ?? sourceControlErrorMessage(error),
+            title: stackedActionFailureTitle(error),
+            description: sourceControlErrorMessage(error),
             data: threadToastData,
           }),
         );

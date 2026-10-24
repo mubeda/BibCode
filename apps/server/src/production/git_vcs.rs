@@ -1614,7 +1614,8 @@ impl GitVcsRpcServices {
                 }),
                 Err(error) => json!({
                     "actionId": input.action_id, "cwd": input.cwd, "action": input.action,
-                    "kind": "action_failed", "phase": Value::Null,
+                    // The step that failed, or null for a request refused before any (#174).
+                    "kind": "action_failed", "phase": failed_phase,
                     "message": error.get("detail").and_then(Value::as_str).unwrap_or("Git action failed."),
                 }),
             };
@@ -5496,6 +5497,54 @@ esac
         }))
         .unwrap();
         assert!(validate_stacked_action_input(&input).is_err());
+    }
+
+    /// #174: a failure names the step it happened in and carries Git's own reason, so
+    /// Source Control can say "Push failed" and why instead of a generic message.
+    #[tokio::test]
+    async fn stacked_push_failure_reports_the_push_phase_and_git_reason() {
+        let sandbox = crate::test_support::TestSandbox::new("git-vcs-push-failure-phase");
+        let repository = sandbox.root().join("repository");
+        tokio::fs::create_dir_all(&repository)
+            .await
+            .expect("repository directory");
+        git(&sandbox, &repository, &["init", "-q", "-b", "main"]).await;
+        git(
+            &sandbox,
+            &repository,
+            &["config", "user.email", "fixture@example.test"],
+        )
+        .await;
+        git(&sandbox, &repository, &["config", "user.name", "Fixture"]).await;
+        tokio::fs::write(repository.join("base.txt"), "base\n")
+            .await
+            .expect("base file");
+        git(&sandbox, &repository, &["add", "base.txt"]).await;
+        git(&sandbox, &repository, &["commit", "-q", "-m", "base"]).await;
+        let services = GitVcsRpcServices::with_repository(
+            Arc::new(GitRepository::with_runner_for_test(Arc::new(
+                CapturedGitRunner::new(&sandbox),
+            ))),
+            Arc::default(),
+        );
+        let mut stream = services.stacked_action_stream(
+            rpc_request(
+                "git.runStackedAction",
+                json!({"actionId": "push-without-remote", "cwd": repository, "action": "push"}),
+            ),
+            CancellationToken::new(),
+        );
+        let started = stream.recv().await.expect("start chunk").expect("start");
+        assert_eq!(started[0]["kind"], "action_started");
+        let failed = stream.recv().await.expect("final chunk").expect("final")[0].clone();
+
+        assert_eq!(failed["kind"], "action_failed", "{failed}");
+        assert_eq!(failed["phase"], "push", "{failed}");
+        let message = failed["message"].as_str().expect("message");
+        assert!(
+            message.contains("origin") || message.contains("push destination"),
+            "Git's own reason reaches the client: {message}"
+        );
     }
 
     /// A reviewed pull request: the fixture repository tracks a local bare
