@@ -1,7 +1,7 @@
 // @vitest-environment happy-dom
 import { Terminal } from "@xterm/xterm";
 import { describe, expect, it } from "vite-plus/test";
-import { installTerminalReplyGuard } from "./terminalReplyGuard";
+import { installTerminalReplyGuard, writeTerminalBuffer } from "./terminalReplyGuard";
 
 const queries = "\x1b[c\x1b[>c\x1b[5n\x1b[6n\x1b[?6n\x1b[4$p\x1b[?7$p\x1bP$qm\x1b\\\x1b]4;1;?\x07";
 const write = (terminal: Terminal, data: string) =>
@@ -187,5 +187,96 @@ describe("terminal reply guard", () => {
     expect(guard.acceptInput()).toBe(true);
     guard.dispose();
     expect(guard.acceptInput()).toBe(false);
+  });
+});
+
+describe("exited shell replay", () => {
+  const inputModes = "\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h\x1b[?1004h\x1b[?2004h";
+  const replayed = async (history: string, exited: boolean) => {
+    const terminal = new Terminal();
+    const guard = installTerminalReplyGuard(terminal, () => true);
+    guard.replay(history, false, exited);
+    await write(terminal, "");
+    guard.dispose();
+    return terminal;
+  };
+
+  it("turns off the input modes a dead shell left on", async () => {
+    const terminal = await replayed(`${inputModes}$ exit\r\n`, true);
+    expect(terminal.modes.mouseTrackingMode).toBe("none");
+    expect(terminal.modes.sendFocusMode).toBe(false);
+    expect(terminal.modes.bracketedPasteMode).toBe(false);
+    expect(terminal.buffer.active.type).toBe("normal");
+    terminal.dispose();
+  });
+
+  it("keeps a running program's modes", async () => {
+    const terminal = await replayed(`\x1b[?1049h${inputModes}tui`, false);
+    expect(terminal.modes.mouseTrackingMode).toBe("any");
+    expect(terminal.modes.sendFocusMode).toBe(true);
+    expect(terminal.modes.bracketedPasteMode).toBe(true);
+    expect(terminal.buffer.active.type).toBe("alternate");
+    terminal.dispose();
+  });
+
+  // Only 1049 saves and restores the main cursor; 47 and 1047 keep the program's.
+  it.each([
+    ["\x1b[?1049h", [0, 1]],
+    ["\x1b[?1049;1000h", [0, 1]],
+    ["\x1b[?01049h", [0, 1]],
+    ["\x1b[?1047h", [3, 1]],
+    ["\x1b[?47h", [3, 1]],
+  ])("leaves the alternate screen entered with %j the same way", async (enter, cursor) => {
+    const terminal = await replayed(`main\r\n${enter}tui`, true);
+    expect(terminal.buffer.active.type).toBe("normal");
+    expect([terminal.buffer.active.cursorX, terminal.buffer.active.cursorY]).toEqual(cursor);
+    expect(terminal.modes.mouseTrackingMode).toBe("none");
+    terminal.dispose();
+  });
+
+  it("does not restore a stale saved cursor on the main screen", async () => {
+    // The shell saved the cursor at the top, printed two lines, then exited.
+    const terminal = await replayed("\x1b7\x1b[?2004hone\r\ntwo\r\n$ ", true);
+    expect(terminal.buffer.active.type).toBe("normal");
+    expect([terminal.buffer.active.cursorX, terminal.buffer.active.cursorY]).toEqual([2, 2]);
+    expect(terminal.modes.bracketedPasteMode).toBe(false);
+    terminal.dispose();
+  });
+
+  it("keeps the main cursor after a program already left the alternate screen", async () => {
+    const terminal = await replayed("one\r\n$ \x1b[?1049hfull\x1b[?1049l\r\n$ \x1b[?1000h", true);
+    expect(terminal.buffer.active.type).toBe("normal");
+    expect([terminal.buffer.active.cursorX, terminal.buffer.active.cursorY]).toEqual([2, 2]);
+    expect(terminal.modes.mouseTrackingMode).toBe("none");
+    terminal.dispose();
+  });
+
+  it("writes the reset after the history, and only for escape-bearing exited history", () => {
+    const writes: Array<[string, boolean]> = [];
+    const terminal = {
+      write: (data: string, callback?: () => void) => writes.push([data, callback !== undefined]),
+    };
+    const onParsed = () => {};
+
+    writeTerminalBuffer(terminal, "plain output\r\n", onParsed, true);
+    expect(writes).toEqual([
+      ["\x1bc", false],
+      ["plain output\r\n", true],
+    ]);
+
+    writes.length = 0;
+    writeTerminalBuffer(terminal, "\x1b[?1000hmouse", onParsed, false);
+    expect(writes).toEqual([
+      ["\x1bc", false],
+      ["\x1b[?1000hmouse", true],
+    ]);
+
+    writes.length = 0;
+    writeTerminalBuffer(terminal, "\x1b[?1000hmouse", onParsed, true);
+    expect(writes.map(([data]) => data).slice(0, 2)).toEqual(["\x1bc", "\x1b[?1000hmouse"]);
+    expect(writes[1]![1]).toBe(false);
+    expect(writes).toHaveLength(3);
+    expect(writes[2]![0]).toContain("1000");
+    expect(writes[2]![1]).toBe(true);
   });
 });
