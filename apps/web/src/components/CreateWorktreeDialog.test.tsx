@@ -1532,6 +1532,40 @@ if (browserRuntime) {
       container.remove();
     });
 
+    it("creates from a picked branch whose name is a number, not GitHub # (#151)", async () => {
+      testState.refs = [{ name: "main" }, { name: "2026" }];
+      const { container, root } = await mountDialog();
+      await setInputValue(
+        requiredElement<HTMLInputElement>(container, "input[placeholder='Worktree name']"),
+        "investigation",
+      );
+      await setInputValue(
+        requiredElement<HTMLInputElement>(
+          container,
+          "input[placeholder='Type #1234 or search branches']",
+        ),
+        "0",
+      );
+      await React.act(async () => requiredButton(container, "2026").click());
+
+      expect(container.textContent).toContain("Interpreting as: branch");
+      await React.act(async () => requiredButton(container, "Create worktree").click());
+      await React.act(async () => flushPromises());
+      expect(testState.createWorktree).toHaveBeenCalledWith(
+        expect.objectContaining({
+          input: expect.objectContaining({
+            title: "investigation",
+            refName: "2026",
+            newRefName: "investigation",
+            baseRefName: "2026",
+          }),
+        }),
+      );
+
+      await React.act(async () => root.unmount());
+      container.remove();
+    });
+
     it("preserves a manually edited name and leaves branch reuse off", async () => {
       testState.refs = [{ name: "feature/login", isRemote: false }];
       const { container, root } = await mountDialog();
