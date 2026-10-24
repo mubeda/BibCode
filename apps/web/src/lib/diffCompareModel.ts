@@ -152,6 +152,20 @@ function isFullObjectId(value: string | undefined): value is string {
 
 const SUBMODULE_MODE = "160000";
 
+/** The empty blob's ID in SHA-1 and SHA-256 repositories, whole or abbreviated. */
+const EMPTY_BLOB_IDS = [
+  "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+  "473a0f4c3be8a93681a267e3b1e9a7dcda1185436fe141f7749120a303721813",
+];
+
+function isEmptyBlobId(value: string | undefined): boolean {
+  return (
+    value !== undefined &&
+    value.length >= 7 &&
+    EMPTY_BLOB_IDS.some((emptyId) => emptyId.startsWith(value))
+  );
+}
+
 /**
  * What a file needs for Compare. The working tree's current side is read from disk and
  * checked against the patch's object ID; every other side is a blob.
@@ -175,6 +189,15 @@ export function planCompareFile(
       kind: "notice",
       notice: { kind: "renamed", previousPath: row.previousPath ?? row.path },
     };
+  }
+  // An added or deleted file with no hunks is binary, unless that side is the empty file, which
+  // Git also prints without hunks.
+  if (
+    (fileDiff.type === "new" || fileDiff.type === "deleted") &&
+    fileDiff.hunks.length === 0 &&
+    !isEmptyBlobId(fileDiff.type === "new" ? fileDiff.newObjectId : fileDiff.prevObjectId)
+  ) {
+    return { kind: "notice", notice: { kind: "binary" } };
   }
   if (fileDiff.type === "new") return { kind: "patch", reason: "added" };
   if (fileDiff.type === "deleted") return { kind: "patch", reason: "deleted" };

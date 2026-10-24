@@ -473,13 +473,18 @@ export default function DiffPanel({
   const gitDiff = selectedGitSource?.diff;
 
   const selectedPatch = selectedTurn ? activeCheckpointDiff.data?.diff : gitDiff;
-  const isSelectedPatchTruncated = !selectedTurn && selectedGitSource?.truncated === true;
+  // A current server bounds turn patches too; an older one never sets the key.
+  const isSelectedPatchTruncated = selectedTurn
+    ? activeCheckpointDiff.data?.truncated === true
+    : selectedGitSource?.truncated === true;
   const isLoadingSelectedPatch = selectedTurn
     ? activeCheckpointDiff.isPending
     : branchDiffPreview.isPending;
   const selectedPatchError = selectedTurn ? activeCheckpointDiff.error : branchDiffPreview.error;
   const hasResolvedPatch = typeof selectedPatch === "string";
-  const hasNoNetChanges = hasResolvedPatch && selectedPatch.trim().length === 0;
+  // An empty patch cut at the cap left out files that did change.
+  const hasNoNetChanges =
+    hasResolvedPatch && selectedPatch.trim().length === 0 && !isSelectedPatchTruncated;
   const renderablePatch = useMemo(
     () =>
       getRenderablePatch(selectedPatch, `diff-panel:${resolvedTheme}`, {
@@ -542,12 +547,26 @@ export default function DiffPanel({
   const contextPending = selectedTurn
     ? contextCheckpointDiff.isPending
     : contextDiffPreview.isPending;
+  const contextError = wantsContextPatch
+    ? selectedTurn
+      ? contextCheckpointDiff.error
+      : contextDiffPreview.error
+    : null;
+  const refreshContextCheckpointDiff = contextCheckpointDiff.refresh;
+  const refreshContextDiffPreview = contextDiffPreview.refresh;
+  // An explicit Retry, so it also clears a connection cut-off.
+  const retryContextPatch = useCallback(() => {
+    if (selectedTurnId !== null) refreshContextCheckpointDiff();
+    else refreshContextDiffPreview();
+  }, [refreshContextCheckpointDiff, refreshContextDiffPreview, selectedTurnId]);
   const compareLineFilter = useMemo(
     () => ({
       lines: compareLines,
       contextLines: compareContextLines,
       contextFiles: contextRenderablePatch?.kind === "files" ? contextRenderablePatch.files : null,
       contextPending: wantsContextPatch && contextPending,
+      contextError,
+      onRetryContext: retryContextPatch,
       // A patch that ignored the count does not echo it: a stored turn patch on a current
       // server (which reports `truncated`), or any patch from an older one.
       contextUnavailableReason:
@@ -562,8 +581,10 @@ export default function DiffPanel({
     [
       compareContextLines,
       compareLines,
+      contextError,
       contextPatch,
       contextPending,
+      retryContextPatch,
       contextRenderablePatch,
       selectedTurn,
       updateCompareContextLines,

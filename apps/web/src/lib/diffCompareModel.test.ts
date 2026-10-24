@@ -184,6 +184,40 @@ describe("compare plans", () => {
     expect(describePatchOnlyReason("deleted")).toBe("Deleted");
   });
 
+  it("explains an added or deleted binary file, but not an empty one", () => {
+    const EMPTY_BLOB = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391";
+    const plans = rows(
+      [
+        "diff --git a/image.png b/image.png",
+        "new file mode 100644",
+        `index ${"0".repeat(40)}..${NEW_ID}`,
+        "Binary files /dev/null and b/image.png differ",
+        "diff --git a/old.png b/old.png",
+        "deleted file mode 100644",
+        `index ${OLD_ID}..${"0".repeat(40)}`,
+        "Binary files a/old.png and /dev/null differ",
+        // Untracked: the server writes no index line.
+        "diff --git a/untracked.bin b/untracked.bin",
+        "new file mode 100644",
+        "Binary files /dev/null and b/untracked.bin differ",
+        "diff --git a/empty.txt b/empty.txt",
+        "new file mode 100644",
+        `index ${"0".repeat(40)}..${EMPTY_BLOB}`,
+        "diff --git a/emptied.txt b/emptied.txt",
+        "deleted file mode 100644",
+        `index ${EMPTY_BLOB}..${"0".repeat(40)}`,
+        "",
+      ].join("\n"),
+    ).map((row) => [row.path, planCompareFile(row, "working-tree", { liveTurnPatches: false })]);
+    expect(Object.fromEntries(plans)).toEqual({
+      "image.png": { kind: "notice", notice: { kind: "binary" } },
+      "old.png": { kind: "notice", notice: { kind: "binary" } },
+      "untracked.bin": { kind: "notice", notice: { kind: "binary" } },
+      "empty.txt": { kind: "patch", reason: "added" },
+      "emptied.txt": { kind: "patch", reason: "deleted" },
+    });
+  });
+
   it("falls back to hunks only for abbreviated IDs, naming why", () => {
     const [short] = rows(MODIFIED.replace(`${OLD_ID}..${NEW_ID}`, "1111111..2222222"));
     const older = planCompareFile(short!, "working-tree", { liveTurnPatches: false });

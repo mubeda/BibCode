@@ -93,6 +93,10 @@ export interface CompareLineFilter {
   /** The patch with `contextLines`, parsed; null for All lines and until it loads. */
   readonly contextFiles: ReadonlyArray<FileDiffMetadata> | null;
   readonly contextPending: boolean;
+  /** Why the patch with `contextLines` failed to load; null while it loads or once it has. */
+  readonly contextError: string | null;
+  /** Asks for the patch with `contextLines` again. */
+  readonly onRetryContext: () => void;
   /** Why the count cannot change for this patch, shown beside the disabled field; else null. */
   readonly contextUnavailableReason: string | null;
   readonly onLinesChange: (lines: DiffCompareLines) => void;
@@ -231,9 +235,11 @@ interface Revalidation {
   readonly forOid: string | null;
   /** Counts requests, so each one asks for the patch exactly once. */
   readonly request: number;
+  /** The working file's read when the request was made; a different one is the read again. */
+  readonly readBefore: unknown;
 }
 
-const NO_REVALIDATION: Revalidation = { forOid: null, request: 0 };
+const NO_REVALIDATION: Revalidation = { forOid: null, request: 0, readBefore: null };
 
 function DiffComparePane({
   environmentId,
@@ -277,27 +283,44 @@ function DiffComparePane({
       : null;
   const changed = changedOid !== null;
 
-  // A working file that moved past the patch asks for the patch once: the new patch names a new
-  // object ID, which is a new read. Only when that read is `changed` too does the pane say the
-  // file is changing, so an agent that keeps writing never causes a loop.
+  // A working file that moved past the patch asks for the patch, and reads the file again, once:
+  // a new patch names a new object ID, which is a new read, and a patch that names the same
+  // content leaves the second read to say what the file holds. Only a read after that request
+  // that is `changed` too makes the pane say the file is changing, so an agent that keeps
+  // writing never causes a loop and a file never loads forever.
   const [revalidation, setRevalidation] = useState<Revalidation>(NO_REVALIDATION);
-  if (changedOid !== null && revalidation.forOid === null) {
-    setRevalidation({ forOid: changedOid, request: revalidation.request + 1 });
-  }
+  const requestRevalidation = (forOid: string) =>
+    setRevalidation({
+      forOid,
+      request: revalidation.request + 1,
+      readBefore: newVersion.data,
+    });
+  if (changedOid !== null && revalidation.forOid === null) requestRevalidation(changedOid);
+  const readAgain =
+    revalidation.request > 0 &&
+    newVersion.data !== revalidation.readBefore &&
+    !newVersion.isPending;
   const stillChanging =
-    changedOid !== null && revalidation.forOid !== null && changedOid !== revalidation.forOid;
+    changedOid !== null &&
+    revalidation.forOid !== null &&
+    (changedOid !== revalidation.forOid || readAgain);
   const revalidatePatch = useEffectEvent(onRevalidatePatch);
+  const revalidateNewVersion = useEffectEvent(newVersion.revalidate);
   useEffect(() => {
-    if (revalidation.request > 0) revalidatePatch();
+    if (revalidation.request === 0) return;
+    revalidatePatch();
+    revalidateNewVersion();
   }, [revalidation.request]);
 
   // A refreshed patch parses into new objects even when this file did not change. Keep the
   // metadata while its versions and hunks stay the same, so the file hydrates once per version
-  // pair and the view does not redraw.
+  // pair and the view does not redraw. Only full object IDs name the contents: a file shown
+  // from its hunks alone, such as an untracked one, takes each new patch as it is.
   const identity = compareFileIdentity(row);
   const [pinned, setPinned] = useState({ identity, fileDiff: row.fileDiff });
   if (pinned.identity !== identity) setPinned({ identity, fileDiff: row.fileDiff });
-  const baseFile = pinned.identity === identity ? pinned.fileDiff : row.fileDiff;
+  const baseFile =
+    plan.kind === "versions" && pinned.identity === identity ? pinned.fileDiff : row.fileDiff;
   // Changes only shows the patch Git printed with the chosen context count; All lines, and a
   // context patch still on its way, show the default patch. Both name the same versions.
   const contextFile =
@@ -305,6 +328,7 @@ function DiffComparePane({
       ? (lineFilter.contextFiles?.find((file) => resolveFileDiffPath(file) === row.path) ?? null)
       : null;
   const patchFile = contextFile ?? baseFile;
+  const contextFailed = lineFilter.lines === "changes" && lineFilter.contextError !== null;
   const hydration = useMemo(
     () =>
       versions.kind === "ready" ? hydrateCompareFile(patchFile, versions.old, versions.new) : null,
@@ -378,7 +402,7 @@ function DiffComparePane({
           <span className="shrink-0 text-xs text-muted-foreground" role="status">
             Loading full file…
           </span>
-        ) : lineFilter.lines === "changes" && lineFilter.contextPending ? (
+        ) : lineFilter.lines === "changes" && lineFilter.contextPending && !contextFailed ? (
           <span className="shrink-0 text-xs text-muted-foreground" role="status">
             Loading changes…
           </span>
@@ -408,15 +432,24 @@ function DiffComparePane({
       {plan.kind === "notice" ? null : <CompareLineControls lineFilter={lineFilter} />}
       {plan.kind === "notice" ? (
         <CompareMessage>{describeCompareNotice(plan.notice)}</CompareMessage>
+      ) : contextFailed ? (
+        // Never the default patch under a count it was not printed with.
+        <CompareMessage>
+          <span>Couldn't load the changes with {lineFilter.contextLines} context lines.</span>
+          <span>{lineFilter.contextError}</span>
+          <Button size="xs" variant="outline" onClick={lineFilter.onRetryContext}>
+            Retry
+          </Button>
+        </CompareMessage>
       ) : stillChanging ? (
         <CompareMessage>
           <span>This file is changing.</span>
           <Button
             size="xs"
             variant="outline"
-            onClick={() =>
-              setRevalidation({ forOid: changedOid, request: revalidation.request + 1 })
-            }
+            onClick={() => {
+              if (changedOid !== null) requestRevalidation(changedOid);
+            }}
           >
             Refresh
           </Button>

@@ -9,6 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test"
 const h = vi.hoisted(() => ({
   versions: new Map<string, ReviewReadFileVersionResult>(),
   requested: [] as string[],
+  revalidated: [] as string[],
   codeView: [] as Array<Record<string, unknown>>,
   scrollTo: vi.fn(),
 }));
@@ -35,6 +36,9 @@ vi.mock("~/state/query", () => ({
       data: atom ? (h.versions.get(atom.key) ?? null) : null,
       error: null,
       isPending: atom !== null && !h.versions.has(atom.key),
+      revalidate: () => {
+        if (atom) h.revalidated.push(atom.key);
+      },
     };
   },
 }));
@@ -112,7 +116,9 @@ describe("DiffCompareView", () => {
     contextLines: 3,
     contextFiles: null,
     contextPending: false,
+    contextError: null,
     contextUnavailableReason: null,
+    onRetryContext: () => undefined,
     onLinesChange,
     onContextLinesChange,
   };
@@ -121,6 +127,7 @@ describe("DiffCompareView", () => {
     (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
     h.versions.clear();
     h.requested.length = 0;
+    h.revalidated.length = 0;
     h.codeView.length = 0;
     h.scrollTo.mockClear();
     onRevalidatePatch.mockClear();
@@ -282,6 +289,27 @@ describe("DiffCompareView", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("says a context patch failed, with Retry, instead of showing other context", async () => {
+    const onRetryContext = vi.fn();
+    await render(parse(modified("src/a.ts", OLD_A, NEW_A)), {
+      lineFilter: {
+        ...allLines,
+        lines: "changes",
+        contextLines: 7,
+        contextError: "The connection dropped before the result arrived.",
+        onRetryContext,
+      },
+    });
+    expect(container.textContent).toContain("Couldn't load the changes with 7 context lines.");
+    expect(container.textContent).toContain("The connection dropped before the result arrived.");
+    expect(container.querySelector('[data-testid="code-view"]')).toBeNull();
+    const retry = [...container.querySelectorAll("button")].find(
+      (button) => button.textContent === "Retry",
+    )!;
+    await act(async () => retry.click());
+    expect(onRetryContext).toHaveBeenCalledTimes(1);
   });
 
   it("disables the count with its reason when the server ignores it", async () => {
@@ -489,6 +517,64 @@ describe("DiffCompareView", () => {
     )!;
     await act(async () => refresh.click());
     expect(onRevalidatePatch).toHaveBeenCalledTimes(2);
+  });
+
+  it("reads the working file again when the refreshed patch names the same content", async () => {
+    const patch = parse(modified("src/a.ts", OLD_A, NEW_A));
+    const changed = (): ReviewReadFileVersionResult => ({
+      _tag: "unavailable",
+      reason: "changed",
+      byteLength: 9,
+    });
+    h.versions.set(blobKey(OLD_A), { _tag: "text", contents: lines(), byteLength: 1 });
+    h.versions.set(worktreeKey("src/a.ts", NEW_A), changed());
+    await render(patch);
+    expect(onRevalidatePatch).toHaveBeenCalledTimes(1);
+    // The patch comes back unchanged, so only a second read can tell what the file holds.
+    expect(h.revalidated).toEqual([worktreeKey("src/a.ts", NEW_A)]);
+    expect(container.textContent).toContain("Loading full file…");
+
+    // That read finds it changing still: the pane says so instead of loading forever.
+    h.versions.set(worktreeKey("src/a.ts", NEW_A), changed());
+    await render(patch);
+    expect(container.textContent).toContain("This file is changing.");
+    expect(container.textContent).not.toContain("Loading full file…");
+
+    // Refresh asks for both again, and a file back at the patch's content shows in full.
+    const refresh = [...container.querySelectorAll("button")].find(
+      (button) => button.textContent === "Refresh",
+    )!;
+    await act(async () => refresh.click());
+    expect(onRevalidatePatch).toHaveBeenCalledTimes(2);
+    expect(h.revalidated).toHaveLength(2);
+    h.versions.set(worktreeKey("src/a.ts", NEW_A), {
+      _tag: "text",
+      contents: lines({ 6: "line six" }),
+      byteLength: 1,
+    });
+    await render(patch);
+    expect(container.textContent).not.toContain("This file is changing.");
+    expect(lastCodeView()["options"]).toMatchObject({ expandUnchanged: true });
+  });
+
+  it("shows an untracked file's new text after a refresh with the same line count", async () => {
+    const untracked = (text: string) =>
+      parse(
+        [
+          "diff --git a/notes.txt b/notes.txt",
+          "new file mode 100644",
+          "--- /dev/null",
+          "+++ b/notes.txt",
+          "@@ -0,0 +1,1 @@",
+          `+${text}`,
+        ].join("\n"),
+      );
+    const shownLines = () =>
+      (lastCodeView()["files"] as Array<{ fileDiff: FileDiffMetadata }>)[0]!.fileDiff.additionLines;
+    await render(untracked("first draft"));
+    expect(shownLines().join("")).toContain("first draft");
+    await render(untracked("second draft"));
+    expect(shownLines().join("")).toContain("second draft");
   });
 
   it("explains files that have nothing more to show, without reading them", async () => {
