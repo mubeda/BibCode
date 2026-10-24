@@ -12,11 +12,16 @@ Cursor, and OpenCode are enabled by default; Grok is disabled. Explicitly saved
 values, including `enabled: false`, are preserved.
 
 `supportsContextWindowUsage` is provider-inventory metadata, not a UI guess or
-a property of an individual usage event. Codex and Claude are the only initial
-providers that advertise this capability; an absent capability means that the
-client must show the feature as unavailable even if stale activity exists for a
-thread. The capability does not change ordinary provider execution or activity
-support.
+a property of an individual usage event. Codex and Claude always advertise this
+capability. OpenCode advertises it when its chats run on version 2: the local
+CLI's version, which every probe reads, or, with a Server URL, that server's
+API, which only a full probe reads (the local CLI says nothing about the
+server). A probe that reads no version, such as a Server URL's quick probe,
+keeps the last answer. A full probe that cannot reach the server falls back to
+the local CLI, so the capability stays absent until a later full probe reaches
+the server again. An absent capability means that the client must show the
+feature as unavailable even if stale activity exists for a thread. The
+capability does not change ordinary provider execution or activity support.
 
 `supportsMcpStatus` follows the same inventory-owned rule. Codex and Claude
 advertise it because their adapters publish canonical `mcp.status.updated`

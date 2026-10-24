@@ -123,6 +123,19 @@ and `live_opencode_2_terminal_observation` list the environment they need; the
 server's default model must be a scripted local endpoint so no provider credits
 are spent.
 
+Compaction and retries apply to Codex and OpenCode 2. Send `/compact` and
+confirm a **Conversation compaction** step in the work log, no `/compact` text
+reaching the model, and the next message continuing the conversation. On
+OpenCode 2, also confirm the context meter shows usage against the model's
+window after the first reply. A Codex turn that fails with
+`contextWindowExceeded` offers **Compact conversation**. The focused checks are
+`cargo test -p bibcode-server --lib -j 2 -- codex::runtime opencode::v2` and
+`native_process_adapters_cover_live_codex_claude_cursor_and_grok_commands`.
+Their compaction and retry frames come from Codex's generated app-server
+schema and OpenCode 2.1.4's event schema, not from live captures, so record a
+live compaction on each provider in the execution report when one is
+available.
+
 ## Revision and worktree preflight
 
 Use GitHub CLI for GitHub metadata and Git for worktree/revision operations.

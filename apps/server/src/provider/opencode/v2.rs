@@ -142,6 +142,26 @@ pub(crate) fn model_variants(
         })
 }
 
+/// Each model's context window (`limit.context`) from `GET /api/model`, keyed by provider and
+/// model id.
+pub(crate) fn context_windows(models: &Value) -> HashMap<(String, String), u64> {
+    models
+        .get("data")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|model| {
+            let provider_id = model.get("providerID")?.as_str()?;
+            let model_id = model.get("id")?.as_str()?;
+            let window = model
+                .pointer("/limit/context")?
+                .as_u64()
+                .filter(|window| *window > 0)?;
+            Some(((provider_id.to_owned(), model_id.to_owned()), window))
+        })
+        .collect()
+}
+
 /// Classify an OpenCode 2 structured error (`{type, message, status?}`).
 pub(crate) fn classify_error(error: &Value) -> OpenCodeFailure {
     let kind = error
@@ -382,6 +402,23 @@ pub(crate) enum V2Output {
     FormSettled {
         form_id: String,
     },
+    /// A root step's context usage (a `thread.token-usage.updated` usage without its maximum),
+    /// with the model the step ran on once a step reported it.
+    Usage {
+        usage: Value,
+        model: Option<(String, String)>,
+    },
+    /// A root compaction step: `inProgress`, then `completed` or `failed` with OpenCode's reason.
+    Compaction {
+        item_id: String,
+        status: &'static str,
+        detail: Option<String>,
+    },
+    /// OpenCode scheduled another try of an upstream failure.
+    Retry {
+        message: String,
+        class: &'static str,
+    },
 }
 
 /// Folds the global OpenCode 2 event stream into the root session's turn lifecycle. Events of
@@ -392,6 +429,10 @@ pub(crate) struct V2TurnTranslator {
     descendants: HashSet<String>,
     text: HashMap<String, String>,
     error: Option<OpenCodeFailure>,
+    /// The model (provider id, model id) the root's latest step ran on.
+    step_model: Option<(String, String)>,
+    /// The item id of the root compaction that is running.
+    compaction: Option<String>,
 }
 
 impl V2TurnTranslator {
@@ -401,7 +442,35 @@ impl V2TurnTranslator {
             descendants: HashSet::new(),
             text: HashMap::new(),
             error: None,
+            step_model: None,
+            compaction: None,
         }
+    }
+
+    /// A root step's usage: the context it used, counted as OpenCode counts it (every token
+    /// figure of the step, cache included).
+    fn usage(&self, data: &Value) -> Option<V2Output> {
+        let tokens = data.get("tokens")?;
+        let count = |pointer: &str| {
+            tokens
+                .pointer(pointer)
+                .and_then(Value::as_u64)
+                .unwrap_or_default()
+        };
+        let (input, output, reasoning) = (count("/input"), count("/output"), count("/reasoning"));
+        let (read, write) = (count("/cache/read"), count("/cache/write"));
+        let used = input + output + reasoning + read + write;
+        (used > 0).then(|| V2Output::Usage {
+            usage: json!({
+                "usedTokens": used,
+                "lastUsedTokens": used,
+                "inputTokens": input,
+                "cachedInputTokens": read,
+                "outputTokens": output,
+                "reasoningOutputTokens": reasoning,
+            }),
+            model: self.step_model.clone(),
+        })
     }
 
     /// Records a descendant found by reading the session tree, such as on resume.
@@ -537,6 +606,15 @@ impl V2TurnTranslator {
                     _ => Vec::new(),
                 }
             }
+            "session.step.started" => {
+                if let (Some(provider_id), Some(model_id)) = (
+                    data.pointer("/model/providerID").and_then(Value::as_str),
+                    data.pointer("/model/id").and_then(Value::as_str),
+                ) {
+                    self.step_model = Some((provider_id.to_owned(), model_id.to_owned()));
+                }
+                Vec::new()
+            }
             "session.step.ended" => data
                 .get("assistantMessageID")
                 .and_then(Value::as_str)
@@ -544,12 +622,71 @@ impl V2TurnTranslator {
                     message_id: message_id.to_owned(),
                 })
                 .into_iter()
+                .chain(self.usage(data))
                 .collect(),
             "session.step.failed" => {
                 if let Some(error) = data.get("error") {
                     self.error = Some(classify_error(error));
                 }
-                Vec::new()
+                self.usage(data).into_iter().collect()
+            }
+            "session.compaction.started" => {
+                let item_id = compaction_item_id(event, data);
+                self.compaction = Some(item_id.clone());
+                vec![V2Output::Compaction {
+                    item_id,
+                    status: "inProgress",
+                    detail: None,
+                }]
+            }
+            // An automatic compaction can fail without having started. The summary
+            // (`ended.text`) is conversation content and is not carried.
+            "session.compaction.ended" | "session.compaction.failed" => {
+                let item_id = self
+                    .compaction
+                    .take()
+                    .unwrap_or_else(|| compaction_item_id(event, data));
+                let failed = kind == "session.compaction.failed";
+                // A defect's message is a multi-line trace; its first line says what failed.
+                let detail = data
+                    .pointer("/error/message")
+                    .and_then(Value::as_str)
+                    .and_then(|message| message.lines().next())
+                    .map(str::trim)
+                    .filter(|message| failed && !message.is_empty())
+                    .map(str::to_owned);
+                vec![V2Output::Compaction {
+                    item_id,
+                    status: if failed { "failed" } else { "completed" },
+                    detail,
+                }]
+            }
+            "session.retry.scheduled" => {
+                let Some(error) = data.get("error") else {
+                    return Vec::new();
+                };
+                let failure = classify_error(error);
+                let attempt = data.get("attempt").and_then(Value::as_u64);
+                let wait = error
+                    .get("retryAfterMs")
+                    .and_then(Value::as_u64)
+                    .filter(|wait| *wait > 0)
+                    .map(|wait| wait.div_ceil(1_000));
+                let when = match (attempt, wait) {
+                    (Some(attempt), Some(wait)) => {
+                        format!(" (attempt {attempt}, next try in {wait} s)")
+                    }
+                    (Some(attempt), None) => format!(" (attempt {attempt})"),
+                    (None, Some(wait)) => format!(" (next try in {wait} s)"),
+                    (None, None) => String::new(),
+                };
+                vec![V2Output::Retry {
+                    message: format!(
+                        "OpenCode is retrying after an upstream error{when}: {}",
+                        failure.message
+                    ),
+                    class: failure.class,
+                }]
             }
             "session.execution.succeeded" => {
                 self.text.clear();
@@ -574,6 +711,15 @@ impl V2TurnTranslator {
             _ => Vec::new(),
         }
     }
+}
+
+/// A compaction's item id: OpenCode's compaction message id (the request's `inputID`) when the
+/// event names it, else the event's own id.
+fn compaction_item_id(event: &Value, data: &Value) -> String {
+    let id = non_empty(data.get("inputID"))
+        .or_else(|| non_empty(event.get("id")))
+        .map_or_else(|| uuid::Uuid::new_v4().to_string(), str::to_owned);
+    format!("compaction:{id}")
 }
 
 fn text_key(message_id: &str, data: &Value) -> String {
@@ -778,6 +924,172 @@ mod tests {
             text_of(&outputs),
             "Hello",
             "an unseen stream is shown whole"
+        );
+    }
+
+    fn usage_of(outputs: &[V2Output]) -> Vec<(Value, Option<(String, String)>)> {
+        outputs
+            .iter()
+            .filter_map(|output| match output {
+                V2Output::Usage { usage, model } => Some((usage.clone(), model.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A step's token usage (captured from OpenCode 2.0.29) is the context it used, counted as
+    /// OpenCode counts it: input, output, reasoning and both cache figures.
+    #[test]
+    fn each_root_step_reports_the_context_it_used_and_its_model() {
+        assert_eq!(
+            usage_of(&translate("hello")),
+            vec![(
+                json!({
+                    "usedTokens": 16,
+                    "lastUsedTokens": 16,
+                    "inputTokens": 11,
+                    "cachedInputTokens": 0,
+                    "outputTokens": 5,
+                    "reasoningOutputTokens": 0,
+                }),
+                Some(("mock".to_owned(), "mock-model".to_owned())),
+            )]
+        );
+        let mut translator = V2TurnTranslator::new("ses_root");
+        let tokens =
+            json!({"input":1000,"output":200,"reasoning":50,"cache":{"read":300,"write":10}});
+        let outputs = translator.handle(&json!({"type":"session.step.ended","data":{
+            "sessionID":"ses_child","assistantMessageID":"msg_c","finish":"stop","cost":0,"tokens":tokens}}));
+        assert!(
+            usage_of(&outputs).is_empty(),
+            "a subagent's usage is not the root's"
+        );
+        let outputs = translator.handle(&json!({"type":"session.step.failed","data":{
+            "sessionID":"ses_root","assistantMessageID":"msg_a",
+            "error":{"type":"provider.transport","message":"reset"},"tokens":tokens}}));
+        assert_eq!(usage_of(&outputs)[0].0["usedTokens"], 1560);
+        assert_eq!(
+            usage_of(&outputs)[0].1,
+            None,
+            "no step reported its model yet"
+        );
+    }
+
+    /// Compaction events, shaped as OpenCode 2.1.4's `session-event.ts` defines them (no 2.x
+    /// server was available to capture them), become one compaction step each. The summary text
+    /// is conversation content and is never carried.
+    #[test]
+    fn root_compactions_become_compaction_steps() {
+        let mut translator = V2TurnTranslator::new("ses_root");
+        let mut outputs = Vec::new();
+        for event in [
+            json!({"id":"evt_1","type":"session.compaction.started","data":{
+                "sessionID":"ses_root","reason":"manual","inputID":"msg_compact"}}),
+            json!({"id":"evt_2","type":"session.compaction.delta","data":{
+                "sessionID":"ses_root","text":"secret summary"}}),
+            json!({"id":"evt_3","type":"session.compaction.ended","data":{
+                "sessionID":"ses_root","reason":"manual","text":"secret summary","cost":0,
+                "model":{"id":"mock-model","providerID":"mock"},
+                "tokens":{"input":1,"output":1,"reasoning":0,"cache":{"read":0,"write":0}}}}),
+            json!({"id":"evt_4","type":"session.compaction.started","data":{
+                "sessionID":"ses_child","reason":"auto"}}),
+            json!({"id":"evt_5","type":"session.compaction.failed","data":{
+                "sessionID":"ses_root","reason":"auto",
+                "error":{"type":"compaction.failed","message":"The summary request failed\n  at step (runner.ts:1)"}}}),
+        ] {
+            outputs.extend(translator.handle(&event));
+        }
+        let steps = outputs
+            .iter()
+            .filter_map(|output| match output {
+                V2Output::Compaction {
+                    item_id,
+                    status,
+                    detail,
+                } => Some((item_id.as_str(), *status, detail.as_deref())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            steps,
+            [
+                ("compaction:msg_compact", "inProgress", None),
+                ("compaction:msg_compact", "completed", None),
+                (
+                    "compaction:evt_5",
+                    "failed",
+                    Some("The summary request failed")
+                ),
+            ]
+        );
+        assert!(!format!("{outputs:?}").contains("secret summary"));
+    }
+
+    /// A retry OpenCode schedules (2.1.4 `session.retry.scheduled`) names the attempt and, when
+    /// the provider asked for one, the wait.
+    #[test]
+    fn a_scheduled_retry_names_its_attempt_and_wait() {
+        let mut translator = V2TurnTranslator::new("ses_root");
+        let retry = |session: &str, retry_after: Option<u64>| {
+            let mut error =
+                json!({"type":"provider.rate-limit","message":"Rate limit reached","status":429});
+            if let Some(retry_after) = retry_after {
+                error["retryAfterMs"] = json!(retry_after);
+            }
+            json!({"type":"session.retry.scheduled","data":{
+                "sessionID":session,"assistantMessageID":"msg_a","attempt":2,"at":1,"error":error}})
+        };
+        let retries = [
+            retry("ses_root", Some(29_001)),
+            retry("ses_root", None),
+            retry("ses_child", Some(1_000)),
+        ]
+        .iter()
+        .flat_map(|event| translator.handle(event))
+        .filter_map(|output| match output {
+            V2Output::Retry { message, class } => Some((message, class)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+        assert_eq!(
+            retries,
+            [
+                (
+                    "OpenCode is retrying after an upstream error (attempt 2, next try in 30 s): \
+                     Rate limit reached (HTTP 429)"
+                        .to_owned(),
+                    "provider_error"
+                ),
+                (
+                    "OpenCode is retrying after an upstream error (attempt 2): Rate limit \
+                     reached (HTTP 429)"
+                        .to_owned(),
+                    "provider_error"
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_catalog_gives_each_model_its_context_window() {
+        let path = format!(
+            "{}/tests/fixtures/opencode-v2/catalog.exchanges.json",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let exchanges: Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let models = exchanges["exchanges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|exchange| {
+                exchange["path"].as_str().unwrap().split('?').next() == Some("/api/model")
+            })
+            .unwrap()["response"]
+            .clone();
+        assert_eq!(
+            context_windows(&models).get(&("mock".to_owned(), "mock-model".to_owned())),
+            Some(&200_000)
         );
     }
 
@@ -1059,12 +1371,22 @@ pub(crate) mod catalog {
         )
     }
 
-    /// Commands, then skills as `source: "skill"` entries (BiBCode offers both under `/`).
+    /// Commands, then `/compact`, then skills as `source: "skill"` entries (BiBCode offers all of
+    /// them under `/`). `/compact` is always OpenCode 2's compaction, which is not one of its
+    /// commands, so a command of that name is not offered.
     pub(crate) fn commands(commands: &Value, skills: &Value) -> Value {
+        let compact = json!({
+            "name": "compact",
+            "source": "command",
+            "description": "Compact the conversation to free up context",
+        });
         Value::Array(
             data(commands)
                 .filter_map(|command| {
-                    let name = command.get("name").and_then(Value::as_str)?;
+                    let name = command
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .filter(|name| *name != "compact")?;
                     let mut out = json!({ "name": name, "source": "command" });
                     for key in ["description", "template"] {
                         if let Some(value) = command.get(key) {
@@ -1073,6 +1395,7 @@ pub(crate) mod catalog {
                     }
                     Some(out)
                 })
+                .chain(std::iter::once(compact))
                 .chain(data(skills).filter_map(|skill| {
                     let id = skill.get("id").and_then(Value::as_str)?;
                     let mut out = json!({ "name": id, "source": "skill" });
@@ -1165,7 +1488,11 @@ pub(crate) mod catalog {
                 .iter()
                 .map(|command| command["name"].as_str().unwrap())
                 .collect::<Vec<_>>();
-            assert_eq!(command_names, ["init", "review"]);
+            assert_eq!(
+                command_names,
+                ["init", "review", "compact"],
+                "OpenCode 2's compaction is offered after its own commands"
+            );
             let skill_names = snapshot
                 .skills
                 .iter()

@@ -90,6 +90,11 @@ struct ProviderCapabilities {
     skills: Vec<Value>,
     agents: Vec<Value>,
     issues: Vec<String>,
+    /// The instance's chats report context-window usage. Codex and Claude always do; OpenCode
+    /// only from version 2, which only a full probe can tell. Published as the provider
+    /// snapshot's `supportsContextWindowUsage`, never with the workspace capabilities.
+    #[serde(skip)]
+    context_window_usage: bool,
 }
 
 struct ClaudeProbeMetadata {
@@ -574,6 +579,7 @@ async fn probe_one_snapshot(
                 slash_commands: inventory.commands,
                 skills: inventory.skills,
                 agents: inventory.agents,
+                context_window_usage: protocol == opencode::OpenCodeProtocol::V2,
                 ..ProviderCapabilities::default()
             };
             return ProviderProbeResult::new(
@@ -603,7 +609,10 @@ async fn probe_one_snapshot(
                     "ready",
                     json!({ "status": "unknown" }),
                     default_models,
-                    ProviderCapabilities::default(),
+                    ProviderCapabilities {
+                        context_window_usage: true,
+                        ..ProviderCapabilities::default()
+                    },
                     Some(OPENCODE_2_CATALOG_UNREADABLE),
                     checked_at,
                     "available",
@@ -839,6 +848,14 @@ async fn probe_one_snapshot(
             }
         }
         "opencode" => {
+            // Chats with a Server URL run on that server, whose own API answered above.
+            capabilities.context_window_usage = definition.endpoint.is_none()
+                && matches!(
+                    version.as_deref().map(opencode::cli_support),
+                    Some(opencode::OpenCodeCliSupport::Supported(
+                        opencode::OpenCodeProtocol::V2
+                    ))
+                );
             // A version BiBCode cannot drive is reported without starting its server.
             if let Some(opencode::OpenCodeCliSupport::Unsupported(unsupported)) =
                 version.as_deref().map(opencode::cli_support)
@@ -1944,7 +1961,9 @@ fn snapshot_owned_message(
     if matches!(definition.driver.as_str(), "codex" | "claudeAgent") {
         result["supportsMcpStatus"] = json!(true);
     }
-    if matches!(definition.driver.as_str(), "codex" | "claudeAgent") {
+    if matches!(definition.driver.as_str(), "codex" | "claudeAgent")
+        || capabilities.context_window_usage
+    {
         result["supportsContextWindowUsage"] = json!(true);
     }
     result
@@ -2466,11 +2485,16 @@ mod tests {
                 assert_eq!(snapshot["models"][0]["slug"], "mock/mock-model");
                 let skills = snapshot["skills"].as_array().expect("skills");
                 assert!(skills.iter().any(|skill| skill["name"] == "report"));
+                let commands = snapshot["slashCommands"].as_array().expect("commands");
+                assert!(commands.iter().any(|command| command["name"] == "compact"));
+                assert_eq!(snapshot["supportsContextWindowUsage"], true);
             } else if version == "2 without catalogs" {
                 assert_eq!(snapshot["installed"], true);
                 assert_eq!(snapshot["status"], "ready");
                 assert_eq!(snapshot["message"], OPENCODE_2_CATALOG_UNREADABLE);
+                assert_eq!(snapshot["supportsContextWindowUsage"], true);
             } else {
+                assert!(snapshot.get("supportsContextWindowUsage").is_none());
                 assert_eq!(snapshot["status"], "error");
                 assert_eq!(
                     snapshot["message"],
@@ -2478,6 +2502,52 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Chats with a Server URL run on that server, so only its API tells whether they report
+    /// context usage: an OpenCode 1 server whose catalogs cannot be read falls back to the local
+    /// CLI, but a local OpenCode 2 CLI does not make that server's chats report usage.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_server_url_reports_context_usage_from_its_own_version_not_the_local_cli() {
+        use crate::provider::opencode::server_fixtures;
+        let root = tempfile::tempdir().expect("inventory root");
+        let executable = root.path().join("opencode");
+        crate::test_support::executable_fixture::write_executable(
+            &executable,
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then printf 'opencode v2.0.29\\n'; exit 0; fi\nexit 1\n",
+        );
+        let (endpoint, server) = server_fixtures::serve(server_fixtures::v1("secret")).await;
+        let settings = json!({
+            "enableProviderUpdateChecks": false,
+            "providerInstances": {
+                "remote": {
+                    "driver": "opencode",
+                    "enabled": true,
+                    "config": {
+                        "binaryPath": executable,
+                        "serverUrl": endpoint,
+                        "serverPassword": "secret"
+                    }
+                }
+            }
+        });
+
+        let providers = probe_full(
+            &settings,
+            Some("remote"),
+            root.path(),
+            &ProviderMaintenance::new(),
+        )
+        .await;
+        server.abort();
+
+        let snapshot = &providers[0].snapshot;
+        assert_eq!(snapshot["version"], "opencode v2.0.29", "{snapshot:#}");
+        assert!(
+            snapshot.get("supportsContextWindowUsage").is_none(),
+            "{snapshot:#}"
+        );
     }
 
     #[cfg(unix)]
