@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vite-plus/test";
-import { newerObservedAt, newestCopy, shownCopy } from "./snapshotDisplay.logic";
+import { keepNewestCopy, newerObservedAt, newestCopy, shownCopy } from "./snapshotDisplay.logic";
 
 describe("newestCopy", () => {
   interface Copy {
@@ -30,6 +30,48 @@ describe("newestCopy", () => {
     const stored: Copy = { name: "stored", state: "running" };
     expect(newestCopy([liveOnly, stored])).toBe(liveOnly);
     expect(newestCopy([null, stored])).toBe(stored);
+  });
+});
+
+describe("keepNewestCopy", () => {
+  interface Copy {
+    readonly state: string;
+    readonly revision?: number;
+  }
+  const older: Copy = { state: "running", revision: 10 };
+  const newer: Copy = { state: "passed", revision: 12 };
+
+  it("keeps the newest copy when its source drops out", () => {
+    // A tab switch re-keys the snapshot read, so the poller's row is missing
+    // until it answers; a failed read leaves it missing longer.
+    const first = keepNewestCopy(null, "mr-14", [older, newer]);
+    expect(first.shown).toBe(newer);
+    const next = keepNewestCopy(first.kept, "mr-14", [older, null]);
+    expect(next.shown).toBe(newer);
+    expect(next.kept).toBe(first.kept);
+  });
+
+  it("replaces the kept copy only with a strictly higher revision", () => {
+    const first = keepNewestCopy(null, "mr-14", [newer]);
+    const tie: Copy = { state: "passed again", revision: 12 };
+    const tied = keepNewestCopy(first.kept, "mr-14", [tie]);
+    expect(tied.shown).toBe(tie);
+    expect(tied.kept).toBe(first.kept);
+    const later: Copy = { state: "failed", revision: 13 };
+    expect(keepNewestCopy(first.kept, "mr-14", [later]).kept?.copy).toBe(later);
+  });
+
+  it("drops a copy kept for another key", () => {
+    const first = keepNewestCopy(null, "mr-14", [newer]);
+    expect(keepNewestCopy(first.kept, "mr-15", [older]).shown).toBe(older);
+    expect(keepNewestCopy(first.kept, "mr-15", [null])).toEqual({ shown: null, kept: null });
+  });
+
+  it("still shows the live value first when no copy has a revision", () => {
+    const stored: Copy = { state: "stored" };
+    const live: Copy = { state: "live" };
+    const first = keepNewestCopy(null, "mr-14", [null, stored]);
+    expect(keepNewestCopy(first.kept, "mr-14", [live, stored]).shown).toBe(live);
   });
 });
 
