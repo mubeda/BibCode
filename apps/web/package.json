@@ -36,6 +36,8 @@
     "@xterm/xterm": "^6.0.0",
     "class-variance-authority": "^0.7.1",
     "effect": "catalog:",
+    "hast-util-to-html": "^9.0.5",
+    "hast-util-to-jsx-runtime": "^2.3.6",
     "jose": "catalog:",
     "lexical": "^0.50.0",
     "lucide-react": "^1.40.0",
@@ -56,6 +58,7 @@
     "@tailwindcss/vite": "^4.3.3",
     "@tanstack/router-plugin": "^1.168.35",
     "@types/babel__core": "^7.20.5",
+    "@types/mdast": "^4.0.4",
     "@types/react": "~19.2.18",
     "@types/react-dom": "~19.2.6",
     "@vercel/config": "^0.7.0",
@@ -67,6 +70,7 @@
     "happy-dom": "^20.13.2",
     "msw": "2.15.0",
     "tailwindcss": "^4.3.3",
+    "unified": "^11.0.5",
     "vite": "catalog:",
     "vite-plus": "catalog:"
   }

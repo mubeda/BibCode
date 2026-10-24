@@ -308,8 +308,8 @@
     }
   },
   "inventorySummary": {
-    "javascriptDirect": 80,
-    "javascriptLedger": 82,
+    "javascriptDirect": 84,
+    "javascriptLedger": 86,
     "rustRegistry": 138,
     "rustPath": 3,
     "rustGit": 1,
@@ -770,6 +770,18 @@
       "status": "current"
     },
     {
+      "key": "js:apps/web:@types/mdast",
+      "name": "@types/mdast",
+      "current": "^4.0.4",
+      "target": "^4.0.4",
+      "channel": "stable",
+      "source": "https://www.npmjs.com/package/@types/mdast",
+      "cohort": "javascript-current",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "current",
+      "notes": "Declared for the incremental streaming Markdown parser types; the lockfile already resolved this version through react-markdown."
+    },
+    {
       "key": "js:apps/web:@types/react",
       "name": "@types/react",
       "current": "~19.2.18",
@@ -894,6 +906,30 @@
       "platforms": ["linux", "macos", "windows"],
       "status": "green",
       "notes": "Compatible in-range lockfile refresh for v0.11.0 (pnpm 24-hour release-age gate; the 14-day rule applies only to newly chosen declared targets)."
+    },
+    {
+      "key": "js:apps/web:hast-util-to-html",
+      "name": "hast-util-to-html",
+      "current": "^9.0.5",
+      "target": "^9.0.5",
+      "channel": "stable",
+      "source": "https://www.npmjs.com/package/hast-util-to-html",
+      "cohort": "javascript-current",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "current",
+      "notes": "Declared for streamed code-block highlighting; the lockfile already resolved this version through Shiki."
+    },
+    {
+      "key": "js:apps/web:hast-util-to-jsx-runtime",
+      "name": "hast-util-to-jsx-runtime",
+      "current": "^2.3.6",
+      "target": "^2.3.6",
+      "channel": "stable",
+      "source": "https://www.npmjs.com/package/hast-util-to-jsx-runtime",
+      "cohort": "javascript-current",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "current",
+      "notes": "Declared for streamed code-block highlighting; the lockfile already resolved this version through react-markdown."
     },
     {
       "key": "js:apps/web:lexical",
@@ -1027,6 +1063,18 @@
       "cohort": "react-ui",
       "platforms": ["linux", "macos", "windows"],
       "status": "green"
+    },
+    {
+      "key": "js:apps/web:unified",
+      "name": "unified",
+      "current": "^11.0.5",
+      "target": "^11.0.5",
+      "channel": "stable",
+      "source": "https://www.npmjs.com/package/unified",
+      "cohort": "javascript-current",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "current",
+      "notes": "Declared for the incremental streaming Markdown parser plugin types; the lockfile already resolved this version through react-markdown."
     },
     {
       "key": "js:apps/web:zustand",
