@@ -24,6 +24,10 @@ pub enum WorkspaceError {
     AlreadyExists { path: PathBuf },
     #[error("workspace entry was not found: {path}", path = .path.display())]
     NotFound { path: PathBuf },
+    #[error("workspace file changed on disk since it was read: {path}", path = .path.display())]
+    FileChangedOnDisk { path: PathBuf },
+    #[error("workspace file was deleted on disk since it was read: {path}", path = .path.display())]
+    FileMissingOnDisk { path: PathBuf },
     #[error("a current project is required to browse relative path: {partial_path}")]
     CurrentProjectRequired { partial_path: String },
     #[allow(dead_code)]
@@ -65,6 +69,8 @@ impl WorkspaceError {
             Self::BinaryFile { .. } => "binary_file",
             Self::AlreadyExists { .. } => "entry_already_exists",
             Self::NotFound { .. } | Self::RootNotFound { .. } => "path_not_found",
+            Self::FileChangedOnDisk { .. } => "file_changed_on_disk",
+            Self::FileMissingOnDisk { .. } => "file_missing_on_disk",
             _ => "operation_failed",
         }
     }
@@ -95,7 +101,9 @@ impl WorkspaceError {
             Self::NotFile { path }
             | Self::BinaryFile { path }
             | Self::AlreadyExists { path }
-            | Self::NotFound { path } => {
+            | Self::NotFound { path }
+            | Self::FileChangedOnDisk { path }
+            | Self::FileMissingOnDisk { path } => {
                 object.insert("resolvedPath".to_owned(), json!(path.to_string_lossy()));
             }
             Self::Operation {
