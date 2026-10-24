@@ -2978,9 +2978,10 @@ pub(crate) fn can_promote_queued_provider_turn_on(
              ))
              AND NOT EXISTS(SELECT 1 FROM provider_turn_outbox AS active
                WHERE active.thread_id = queued.thread_id AND active.state IN ('pending', 'sending'))
-             -- An unsettled compaction holds the thread; the copy it may admit goes first.
-             AND (? = 0 OR NOT EXISTS(SELECT 1 FROM thread_compactions AS compaction
-               WHERE compaction.thread_id = queued.thread_id AND compaction.state IN ('requested', 'running', 'unresolved')))
+             -- An unsettled compaction holds the thread, for Send now too: the copy it may admit
+             -- goes first, and a promoted start would wait behind the compaction with a marker.
+             AND NOT EXISTS(SELECT 1 FROM thread_compactions AS compaction
+               WHERE compaction.thread_id = queued.thread_id AND compaction.state IN ('requested', 'running', 'unresolved'))
              AND queued.command_id = (
                SELECT next.command_id FROM provider_turn_outbox AS next
                JOIN orchestration_command_receipts AS receipt ON receipt.command_id = next.command_id
@@ -2988,7 +2989,7 @@ pub(crate) fn can_promote_queued_provider_turn_on(
                ORDER BY receipt.result_sequence, next.created_at, next.command_id LIMIT 1
              )
          )",
-        params![thread_id, message_id, automatic, automatic], |row| row.get(0),
+        params![thread_id, message_id, automatic], |row| row.get(0),
     ).map_err(Into::into)
 }
 

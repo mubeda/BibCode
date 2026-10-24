@@ -2951,6 +2951,55 @@ fn spawn_worker(
     })
 }
 
+/// While a compaction of the thread is unsettled, an admitted start is queued whatever it asked
+/// for, so nothing is admitted ahead of the copy a recovery sends or with a marker the
+/// compaction turn could take. The RPC checks this early too, but a recovery can begin between
+/// that check and admission; here it runs on the worker, which serializes it with the command
+/// that begins one.
+async fn queue_start_behind_unsettled_compaction(
+    repositories: &Repositories,
+    command: &mut OrchestrationCommand,
+    admission: Option<&mut CommandAdmission>,
+) -> Result<(), OrchestrationError> {
+    let OrchestrationCommand::ThreadTurnStart {
+        thread_id, queued, ..
+    } = command
+    else {
+        return Ok(());
+    };
+    let Some(turn) = admission
+        .and_then(|admission| admission.provider_turn.as_mut())
+        .filter(|turn| turn.state == TurnDeliveryState::Pending)
+    else {
+        return Ok(());
+    };
+    if *queued == Some(true) {
+        return Ok(());
+    }
+    let thread = thread_id.clone();
+    let compacting = repositories
+        .database()
+        .call(move |connection| compaction::unsettled_compaction_on(connection, &thread))
+        .await
+        .map_err(wrap_persistence)?
+        .is_some();
+    if compacting {
+        *queued = Some(true);
+        turn.state = TurnDeliveryState::Queued;
+        if let Some(payload) = turn.payload.as_object_mut() {
+            payload.insert("queued".to_owned(), json!(true));
+        }
+    }
+    Ok(())
+}
+
+/// A pending marker (of a `projection_turns` row) whose message waits, unsent, behind the
+/// thread's unsettled compaction, as a guarded start does. No turn can be that message's yet: the
+/// claim refuses the thread until the compaction settles. So an untagged running update, such
+/// as a turn the provider starts on its own, neither binds nor deletes it.
+const MARKER_WAITS_BEHIND_COMPACTION: &str = "(EXISTS(SELECT 1 FROM thread_compactions AS compaction WHERE compaction.thread_id = projection_turns.thread_id AND compaction.state IN ('requested', 'running', 'unresolved'))
+    AND EXISTS(SELECT 1 FROM provider_turn_outbox AS waiting WHERE waiting.thread_id = projection_turns.thread_id AND waiting.message_id = projection_turns.pending_message_id AND waiting.mode = 'start' AND waiting.state = 'pending'))";
+
 struct ProcessEnvelopeInput<'a> {
     command: OrchestrationCommand,
     admission: Option<CommandAdmission>,
@@ -2969,7 +3018,7 @@ async fn process_envelope(
 ) -> Result<ProcessEnvelopeOutcome, OrchestrationError> {
     let ProcessEnvelopeInput {
         mut command,
-        admission,
+        mut admission,
         command_claim,
         cancellation,
         commit_fence,
@@ -3046,6 +3095,7 @@ async fn process_envelope(
         Some(value) => value.to_owned(),
         None => current_timestamp(repositories.database()).await?,
     };
+    queue_start_behind_unsettled_compaction(repositories, &mut command, admission.as_mut()).await?;
 
     if let OrchestrationCommand::ThreadTurnDeliveryResolve {
         command_id,
@@ -5666,6 +5716,20 @@ fn request_compaction_tx(
         };
         target
     };
+    // A manual compaction of a context-limit error keeps that error's message, so a failure
+    // keeps the error's class (and its Compact action) once the compaction's turn has cleared it.
+    let context_limit_error = if guarded_delivery_command_id.is_none() {
+        transaction
+            .query_row(
+                "SELECT last_error FROM projection_thread_sessions WHERE thread_id = ? AND last_error_class = 'context_limit'",
+                [thread_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten()
+    } else {
+        None
+    };
     compaction::insert_compaction_tx(
         transaction,
         &compaction::NewCompaction {
@@ -5679,7 +5743,7 @@ fn request_compaction_tx(
             target: &target,
             failed_message_id: None,
             guarded_delivery_command_id,
-            detail: None,
+            detail: context_limit_error.as_deref(),
             created_at,
         },
     )?;
@@ -6910,12 +6974,12 @@ fn apply_turns_projector_tx(
                     let updated = if existing_turn {
                         let updated = transaction.execute("UPDATE projection_turns SET state = 'running', started_at = COALESCE(started_at, ?) WHERE thread_id = ? AND turn_id = ?", params![updated_at, thread_id, turn_id])?;
                         transaction.execute(
-                            "DELETE FROM projection_turns WHERE thread_id = ? AND turn_id IS NULL",
+                            &format!("DELETE FROM projection_turns WHERE thread_id = ? AND turn_id IS NULL AND NOT {MARKER_WAITS_BEHIND_COMPACTION}"),
                             [&thread_id],
                         )?;
                         updated
                     } else {
-                        transaction.execute("UPDATE projection_turns SET turn_id = ?, state = 'running', started_at = COALESCE(started_at, ?) WHERE row_id = (SELECT row_id FROM projection_turns WHERE thread_id = ? AND turn_id IS NULL ORDER BY row_id DESC LIMIT 1)", params![turn_id, updated_at, thread_id])?
+                        transaction.execute(&format!("UPDATE projection_turns SET turn_id = ?, state = 'running', started_at = COALESCE(started_at, ?) WHERE row_id = (SELECT row_id FROM projection_turns WHERE thread_id = ? AND turn_id IS NULL AND NOT {MARKER_WAITS_BEHIND_COMPACTION} ORDER BY row_id DESC LIMIT 1)"), params![turn_id, updated_at, thread_id])?
                     };
                     if updated == 0 {
                         transaction.execute(
