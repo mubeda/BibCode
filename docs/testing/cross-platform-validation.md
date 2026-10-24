@@ -371,6 +371,33 @@ then close the panel's tab before the client shows it running: no turn may start
 or keep running in the workspace, and **Reopen closed chat** must deliver the
 message once.
 
+Composer **History** (needs Claude Code 2.0.73 or later on the server host):
+
+- With no Claude Code session running, check whether `<Claude config
+  dir>/sessions/` still exists and record the platform's answer; a missing
+  directory reads every session as "Can't tell whether it's open". Then run a
+  BiBCode Claude panel and record whether its process writes an entry there
+  and with which `entrypoint` (`sdk-rust` is expected and skipped).
+- Run `claude` in a worktree, send a prompt, `/rename` it, and exit. In that
+  worktree thread, **History** must list it under **Claude Code terminal** with
+  the new name and branch, and **This thread** must list the same closed chats
+  as **Reopen closed chat**. **Continue**, send a message, then run
+  `claude --resume <id>` in a terminal there: the BiBCode turn must be in its
+  conversation, and the panel must run in the thread's permission mode.
+- With `claude` still open in the terminal, the row must read **Open in a
+  terminal · Continue in a copy**. Continue the copy and send: the terminal's
+  conversation must have no BiBCode turn, and History must list the source but
+  not the copy.
+- On a remote environment, the empty state must add "Only sessions run on
+  <label> appear here."; against a server without the `cliSessionHistory`
+  capability, the section must ask to update it while **This thread** still
+  works. With a read-only primary connection, the button must be disabled with
+  "This connection can only view threads."
+- Measure `agentSessions.listForThread` (its `rpc.timing` or the profiler's
+  trace) on a folder with 200 terminal sessions and on one with 1,000 Desktop
+  sessions and 5 terminal sessions; record both durations. Over 1 s on either
+  means the listing budget needs lowering.
+
 Verify enqueue without a turn-start event or working projection, oldest-first
 promotion once per settle, explicit Send now clearing only its row's hold,
 interrupt/error holds, approval and user-input gates, and withdrawal without

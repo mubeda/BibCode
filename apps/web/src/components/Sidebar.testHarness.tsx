@@ -469,6 +469,7 @@ vi.mock("../state/threads", () => ({
   threadEnvironment: {
     updateMetadata: { label: "thread.updateMetadata" },
     create: { label: "thread.create" },
+    unarchive: { label: "thread.unarchive" },
   },
   useEnvironmentThread: h.spies.useEnvironmentThread,
 }));

@@ -21,6 +21,9 @@ const h = vi.hoisted(() => ({
   closeAllSurfaces: vi.fn(),
   dropSurface: vi.fn(),
   mergeGroup: vi.fn(),
+  openChatPanel: vi.fn(),
+  openInPanel: vi.fn(),
+  openInPanelResult: { _tag: "Success", value: undefined } as unknown,
 }));
 
 vi.mock("react", () => ({
@@ -51,8 +54,13 @@ vi.mock("~/centerPanelStore", () => ({
       closeAllSurfaces: h.closeAllSurfaces,
       dropSurface: h.dropSurface,
       mergeGroup: h.mergeGroup,
+      openChatPanel: h.openChatPanel,
     }),
   },
+}));
+
+vi.mock("~/state/projects", () => ({
+  projectEnvironment: { openAgentSessionInPanel: "open-in-panel" },
 }));
 
 vi.mock("~/lib/utils", () => ({
@@ -79,6 +87,7 @@ vi.mock("~/state/use-atom-command", () => ({
       archive: h.archiveThread,
       unarchive: h.unarchiveThread,
       interrupt: h.interruptTurn,
+      "open-in-panel": h.openInPanel,
     })[command],
 }));
 
@@ -103,6 +112,8 @@ beforeEach(() => {
     Promise.resolve(h.archiveResults.shift() ?? { _tag: "Success", value: undefined }),
   );
   h.unarchiveThread.mockImplementation(() => Promise.resolve(h.unarchiveResult));
+  h.openInPanelResult = { _tag: "Success", value: undefined };
+  h.openInPanel.mockImplementation(() => Promise.resolve(h.openInPanelResult));
   h.interruptTurn.mockImplementation(() =>
     Promise.resolve({ _tag: "Failure", cause: new Error("no running turn") }),
   );
@@ -430,5 +441,95 @@ describe("center panel actions", () => {
     expect(h.removeThread).not.toHaveBeenCalled();
     expect(h.releaseChatPanelReservation).toHaveBeenCalledWith(panelRef);
     expect(h.addToast).not.toHaveBeenCalled();
+  });
+
+  it("continues a terminal session in a panel of the host and makes it the active tab", async () => {
+    const actions = useCenterPanelActions({ onCloseTerminal });
+    const opened = {
+      threadId: ThreadId.make("import:claudeAgent:session-1"),
+      hostThreadId: hostRef.threadId,
+      outcome: "created",
+    };
+    h.openInPanelResult = { _tag: "Success", value: opened };
+
+    await expect(
+      actions.openSessionPanel(hostRef, {
+        sessionId: "session-1",
+        mode: "resume",
+        title: "Flaky test",
+      }),
+    ).resolves.toEqual(opened);
+    expect(h.openInPanel).toHaveBeenCalledWith({
+      environmentId: hostRef.environmentId,
+      input: {
+        commandId: "command-panel-create",
+        hostThreadId: hostRef.threadId,
+        sessionId: "session-1",
+        mode: "resume",
+      },
+    });
+    expect(h.openChatPanel).toHaveBeenCalledWith(hostRef, opened.threadId, "Flaky test");
+    expect(h.unarchiveThread).not.toHaveBeenCalled();
+  });
+
+  it("reopens an existing closed panel of the host and leaves other threads to the caller", async () => {
+    const actions = useCenterPanelActions({ onCloseTerminal });
+    const closed = ThreadId.make("import:claudeAgent:session-2");
+    h.shells.set(closed, { archivedAt: "2026-10-20T10:00:00.000Z" });
+    h.openInPanelResult = {
+      _tag: "Success",
+      value: { threadId: closed, hostThreadId: hostRef.threadId, outcome: "existing" },
+    };
+    await actions.openSessionPanel(hostRef, {
+      sessionId: "session-2",
+      mode: "resume",
+      title: "Old",
+    });
+    expect(h.reserveChatPanel).toHaveBeenCalledWith(hostRef, closed, "Old");
+    expect(h.unarchiveThread).toHaveBeenCalledWith({
+      environmentId: hostRef.environmentId,
+      input: { threadId: closed },
+    });
+
+    vi.clearAllMocks();
+    const elsewhere = {
+      threadId: ThreadId.make("import:claudeAgent:session-3"),
+      hostThreadId: null,
+      outcome: "existing",
+    };
+    h.openInPanel.mockResolvedValueOnce({ _tag: "Success", value: elsewhere });
+    await expect(
+      actions.openSessionPanel(hostRef, { sessionId: "session-3", mode: "resume", title: "Side" }),
+    ).resolves.toEqual(elsewhere);
+    expect(h.openChatPanel).not.toHaveBeenCalled();
+    expect(h.reserveChatPanel).not.toHaveBeenCalled();
+  });
+
+  it("shows why a session did not open and resolves nothing", async () => {
+    const actions = useCenterPanelActions({ onCloseTerminal });
+    h.openInPanelResult = {
+      _tag: "Failure",
+      cause: new Error("This session is open in a terminal. Choose Continue in a copy."),
+    };
+    await expect(
+      actions.openSessionPanel(hostRef, { sessionId: "session-4", mode: "resume", title: "Live" }),
+    ).resolves.toBeNull();
+    expect(h.addToast).toHaveBeenCalledWith({
+      type: "error",
+      title: "Couldn't open the session",
+      description: "This session is open in a terminal. Choose Continue in a copy.",
+    });
+    expect(h.openChatPanel).not.toHaveBeenCalled();
+  });
+
+  it("activates a live panel thread and reopens a closed one", async () => {
+    const actions = useCenterPanelActions({ onCloseTerminal });
+    const live = ThreadId.make("live-panel");
+    h.shells.set(live, { archivedAt: null });
+    await actions.openPanelThread(hostRef, live, "Live");
+    expect(h.openChatPanel).toHaveBeenCalledWith(hostRef, live, "Live");
+    expect(h.unarchiveThread).not.toHaveBeenCalled();
+    await actions.openPanelThread(hostRef, live, "Live", true);
+    expect(h.unarchiveThread).toHaveBeenCalledTimes(1);
   });
 });

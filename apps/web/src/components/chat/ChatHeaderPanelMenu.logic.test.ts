@@ -1,8 +1,39 @@
-import { ProviderDriverKind, ProviderInstanceId } from "@bibcode/contracts";
+import { ProviderDriverKind, ProviderInstanceId, ThreadId } from "@bibcode/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
 import type { ProviderInstanceEntry } from "~/providerInstances";
-import { buildPanelMenuModel } from "./ChatHeaderPanelMenu.logic";
+import {
+  MAX_CLOSED_CHATS,
+  buildPanelMenuModel,
+  selectClosedChatPanels,
+} from "./ChatHeaderPanelMenu.logic";
+
+/** Reopen closed chat and History's This thread both list exactly this. */
+describe("selectClosedChatPanels", () => {
+  const host = ThreadId.make("host");
+  const panel = (index: number, overrides: Record<string, unknown> = {}) => ({
+    id: ThreadId.make(`panel-${index}`),
+    title: `Panel ${index}`,
+    kind: "panel" as const,
+    hostThreadId: host,
+    archivedAt: `2026-10-${String(10 + index).padStart(2, "0")}T00:00:00.000Z`,
+    ...overrides,
+  });
+
+  it("keeps the host's closed panels, most recently closed first, up to the limit", () => {
+    const threads = [
+      ...Array.from({ length: 12 }, (_, index) => panel(index)),
+      panel(20, { archivedAt: null }),
+      panel(21, { hostThreadId: ThreadId.make("other-host") }),
+      panel(22, { kind: "workspace" }),
+    ];
+    const closed = selectClosedChatPanels(threads as never, host);
+    expect(closed).toHaveLength(MAX_CLOSED_CHATS);
+    expect(closed.map((chat) => chat.id)).toEqual(
+      Array.from({ length: MAX_CLOSED_CHATS }, (_, index) => `panel-${11 - index}`),
+    );
+  });
+});
 
 function makeEntry(input: {
   instanceId: string;
