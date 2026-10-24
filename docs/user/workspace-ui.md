@@ -1506,7 +1506,8 @@ The Files surface is a full file manager for the active workspace:
   changes made to the file outside BiBCode.
 - An open file follows changes made on disk, for example by an agent. While the
   file is shown and the window is visible, BiBCode checks it every two seconds,
-  and at once when the window regains focus or a turn ends.
+  and at once when the window regains focus, the connection comes back, or a
+  turn ends.
   - A file without unsaved edits reloads in place. The caret and comments stay
     where they were, and Undo brings the previous text back as an unsaved edit.
   - A file with unsaved edits keeps them and shows **Changed on disk.** (or
@@ -1524,7 +1525,8 @@ The Files surface is a full file manager for the active workspace:
     window or a file in a background tab. If the check fails, the bar appears.
   - A file without unsaved edits that is deleted on disk shows **Deleted on
     disk.** and reopens if the file comes back. A file that becomes binary, or
-    grows past 1 MB, can only be overwritten.
+    grows past 1 MB, can only be overwritten; the text you were editing stays
+    on screen until you choose.
 
 ## Current limitations
 

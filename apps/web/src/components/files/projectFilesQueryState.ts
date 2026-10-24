@@ -235,11 +235,20 @@ export function useFileTreeEntries(
   return query;
 }
 
+export interface ProjectFileQueryState extends ProjectQueryState<ProjectReadFileResult> {
+  /**
+   * What the disk held at the last read, or at the last save that reported its version: a session
+   * takes its base and its version capability from this, never from `data`. An optimistic draft
+   * without a version (a ticked task not yet saved) shows in `data` but says nothing about disk.
+   */
+  readonly disk: ProjectReadFileResult | null;
+}
+
 export function useProjectFileQuery(
   environmentId: EnvironmentId,
   cwd: string,
   relativePath: string | null,
-): ProjectQueryState<ProjectReadFileResult> {
+): ProjectFileQueryState {
   const atom = getProjectFileQueryAtom(environmentId, cwd, relativePath);
   const result = useAtomValue(atom);
   const refreshAtom = useAtomRefresh(atom);
@@ -252,6 +261,7 @@ export function useProjectFileQuery(
 
   return {
     data: optimisticFile?.data ?? data,
+    disk: optimisticFile?.data.version === undefined ? data : optimisticFile.data,
     error: errorMessage(result),
     isPending: result.waiting,
     refresh,

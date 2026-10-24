@@ -2683,9 +2683,13 @@ sizes. Cover relevant:
   Markdown view); delete the open file and verify **Deleted on disk.**; make
   an unsaved edit, change the file outside BiBCode, and at once switch to
   another right-panel tab: whether the poll or that switch's save runs first,
-  the disk keeps the outside change and the file's tab shows the amber dot. On
-  Windows, repeat the clean-tab reload with a WSL-hosted workspace on a Windows
-  path, where read latency sets the poll's cost;
+  the disk keeps the outside change and the file's tab shows the amber dot;
+  with unsaved edits, grow the file past 1 MB from outside, then reopen its tab
+  after 30 s or reconnect the environment: the edits and **Overwrite disk** stay
+  and the 1 MB preview does not replace them; change the file while the
+  environment is disconnected and verify the tab reconciles as soon as it
+  reconnects. On Windows, repeat the clean-tab reload with a WSL-hosted
+  workspace on a Windows path, where read latency sets the poll's cost;
 - Files path-kind changes: replace a file with a directory containing nested
   entries while the tree is open, then select a descendant and replace its
   directory with a file. Exercise automatic refresh and **Refresh**; neither
