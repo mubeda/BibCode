@@ -48,6 +48,7 @@ const h = vi.hoisted(() => {
     }),
     diffPreviewRefresh: vi.fn(),
     contextPreviewArgs: [] as unknown[],
+    commentDraft: null as unknown,
     contextCheckpointTargets: [] as unknown[],
     contextCheckpointDiff: { data: null as unknown, error: null as unknown, isPending: false },
     stateIndex: 0,
@@ -255,6 +256,13 @@ vi.mock("./diffs/AnnotatableCodeView", () => ({
   },
 }));
 
+vi.mock("./diffs/useCommentDraftStore", () => ({
+  useCommentDraftStore: (_ref: unknown, sectionId: string) => ({
+    sectionId,
+    draft: h.commentDraft,
+  }),
+}));
+
 vi.mock("./diffs/DiffCompareView", () => ({
   DiffCompareView: (props: Record<string, unknown>) => {
     h.capture("diffCompareView", props);
@@ -455,6 +463,7 @@ beforeEach(() => {
     diffCompareContextLines: 3,
   };
   h.updateClientSettings.mockClear();
+  h.commentDraft = null;
   h.contextPreviewArgs.length = 0;
   h.contextCheckpointTargets.length = 0;
   h.contextCheckpointDiff = { data: null, error: null, isPending: false };
@@ -561,6 +570,18 @@ describe("DiffPanel: Changes and Compare", () => {
 
     (compare["onRevalidatePatch"] as () => void)();
     expect(h.diffPreviewRefresh).toHaveBeenCalledTimes(1);
+  });
+
+  it("gives Changes the section's draft store, which Compare shares", () => {
+    h.commentDraft = { id: "draft-1", filePath: "src/a.ts" };
+    render();
+    expect(capturedLast("annotatableCodeView")["draftStore"]).toEqual({
+      sectionId: "branch",
+      draft: h.commentDraft,
+    });
+    h.settings = { ...h.settings, diffViewMode: "compare" };
+    render();
+    expect(capturedLast("diffCompareView")["sectionId"]).toBe("branch");
   });
 
   it("keeps the scope and base ref across a switch, since both live in the panel store", () => {

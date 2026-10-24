@@ -126,7 +126,12 @@ describe("DiffCompareView", () => {
     onRevalidatePatch.mockClear();
     onLinesChange.mockClear();
     onContextLinesChange.mockClear();
-    useDiffPanelStore.setState({ compareFileByThreadKey: {}, compareFiltersByThreadKey: {} });
+    useDiffPanelStore.setState({
+      compareFileByThreadKey: {},
+      compareFiltersByThreadKey: {},
+      commentDraftBySectionKey: {},
+      commentDraftTextById: {},
+    });
     container = document.createElement("div");
     document.body.append(container);
     root = createRoot(container);
@@ -326,6 +331,25 @@ describe("DiffCompareView", () => {
     await press({ key: "F7", shiftKey: true });
     expect(h.scrollTo).toHaveBeenLastCalledWith(expect.objectContaining({ lineNumber: 2 }));
     expect(button("Previous change").getAttribute("aria-disabled")).toBe("true");
+  });
+
+  it("shows an unsent comment started in Changes, with its text, after switching", async () => {
+    // Changes stored the draft in the panel store, keyed by section; Compare reads the same one.
+    const draft = {
+      id: "draft-1",
+      filePath: "src/a.ts",
+      range: { start: 6, end: 6, side: "additions" as const },
+      rangeLabel: "+6",
+    };
+    useDiffPanelStore.getState().setCommentDraft(threadRef, "unstaged", draft);
+    useDiffPanelStore.getState().setCommentDraftText("draft-1", "half-written");
+    await render(parse(modified("src/a.ts", OLD_A, NEW_A)));
+    const store = lastCodeView()["draftStore"] as {
+      draft: unknown;
+      readDraftText: (id: string) => string;
+    };
+    expect(store.draft).toEqual(draft);
+    expect(store.readDraftText("draft-1")).toBe("half-written");
   });
 
   it("reads two blobs for branch and turn scopes", async () => {
