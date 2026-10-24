@@ -156,7 +156,7 @@ impl FakeXcrun {
             },
         );
         format!(
-            "#!/bin/sh\ndir=\"{dir}\"\nif [ \"$1\" = xcodebuild ] && [ \"$2\" = -checkFirstLaunchStatus ]; then echo checkFirstLaunchStatus >> \"$dir/first-launch-checks\"; exit {first_launch}; fi\nif [ \"$1\" = xcodebuild ]; then echo 'Xcode 27.0'; echo 'Build version 27A266a'; exit 0; fi\n[ \"$1\" = simctl ] && shift\necho \"$*\" >> \"$dir/calls\"\ncase \"$1\" in\n  help) {help} ;;\n  list) {list} ;;\n  boot) {boot} ;;\n  bootstatus) {bootstatus} ;;\n  shutdown) echo Shutdown > \"$dir/state/$2\" ;;\n  io) cp \"$dir/screenshot.jpg\" \"$5\" ;;\n  pbcopy) {pbcopy} ;;\n  *) echo \"unknown simctl command $1\" >&2; exit 1 ;;\nesac\n",
+            "#!/bin/sh\ndir=\"{dir}\"\nif [ \"$1\" = xcodebuild ] && [ \"$2\" = -checkFirstLaunchStatus ]; then echo checkFirstLaunchStatus >> \"$dir/first-launch-checks\"; exit {first_launch}; fi\nif [ \"$1\" = xcodebuild ]; then echo 'Xcode 27.0'; echo 'Build version 27A266a'; exit 0; fi\n[ \"$1\" = simctl ] && shift\necho \"$*\" >> \"$dir/calls\"\ncase \"$1\" in\n  help) {help} ;;\n  list) held=; if mv \"$dir/hold-list\" \"$dir/list-held\" 2>/dev/null; then held=1; while [ ! -e \"$dir/release-list\" ]; do sleep 0.02; done; fi; {list}; if [ -n \"$held\" ]; then : > \"$dir/list-delivered\"; fi ;;\n  boot) {boot} ;;\n  bootstatus) {bootstatus} ;;\n  shutdown) echo Shutdown > \"$dir/state/$2\" ;;\n  io) cp \"$dir/screenshot.jpg\" \"$5\" ;;\n  pbcopy) {pbcopy} ;;\n  *) echo \"unknown simctl command $1\" >&2; exit 1 ;;\nesac\n",
             list = self.list_script(),
             bootstatus = if self.bootstatus_blocks {
                 "sleep 60"
@@ -213,6 +213,36 @@ impl FakeXcrun {
         let temp = states.join(format!("{udid}.tmp"));
         std::fs::write(&temp, state).expect("write state");
         std::fs::rename(temp, states.join(udid)).expect("publish state");
+    }
+
+    /// The next `simctl list` waits, once it has started, until [`release_listing`]: the
+    /// state poll's copy of the registrations is then older than the simulators' states, which
+    /// the listing reads only once it is released. Other listings are not held.
+    ///
+    /// [`release_listing`]: Self::release_listing
+    pub(crate) fn hold_next_listing(&self) {
+        std::fs::write(self.dir.path().join("hold-list"), "").expect("arm the listing hold");
+    }
+
+    /// Waits until a held listing has started.
+    pub(crate) async fn listing_held(&self) {
+        self.wait_for("list-held", "no listing was held").await;
+    }
+
+    /// Lets the held listing finish and waits until it has printed.
+    pub(crate) async fn release_listing(&self) {
+        std::fs::write(self.dir.path().join("release-list"), "").expect("release the listing");
+        self.wait_for("list-delivered", "the held listing never finished")
+            .await;
+    }
+
+    async fn wait_for(&self, marker: &str, failure: &str) {
+        let path = self.dir.path().join(marker);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !path.exists() {
+            assert!(std::time::Instant::now() < deadline, "{failure}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     /// Every `simctl` call so far, its arguments after `simctl`.
