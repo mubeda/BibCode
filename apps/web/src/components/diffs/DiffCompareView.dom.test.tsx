@@ -10,7 +10,15 @@ const h = vi.hoisted(() => ({
   versions: new Map<string, ReviewReadFileVersionResult>(),
   requested: [] as string[],
   codeView: [] as Array<Record<string, unknown>>,
+  scrollTo: vi.fn(),
 }));
+
+vi.mock("@effect/atom-react", async () => {
+  const { DEFAULT_RESOLVED_KEYBINDINGS } = await import("@bibcode/shared/keybindings");
+  return { useAtomValue: () => DEFAULT_RESOLVED_KEYBINDINGS };
+});
+
+vi.mock("~/state/server", () => ({ primaryServerKeybindingsAtom: {} }));
 
 vi.mock("~/state/review", () => ({
   reviewEnvironment: {
@@ -34,7 +42,9 @@ vi.mock("~/state/query", () => ({
 vi.mock("./AnnotatableCodeView", () => ({
   AnnotatableCodeView: (props: Record<string, unknown>) => {
     h.codeView.push(props);
-    return <div data-testid="code-view" />;
+    const viewerRef = props["viewerRef"] as { current: unknown } | undefined;
+    if (viewerRef) viewerRef.current = { scrollTo: h.scrollTo };
+    return <div data-testid="code-view" tabIndex={0} />;
   },
 }));
 
@@ -102,7 +112,7 @@ describe("DiffCompareView", () => {
     contextLines: 3,
     contextFiles: null,
     contextPending: false,
-    contextSupported: null,
+    contextUnavailableReason: null,
     onLinesChange,
     onContextLinesChange,
   };
@@ -112,6 +122,7 @@ describe("DiffCompareView", () => {
     h.versions.clear();
     h.requested.length = 0;
     h.codeView.length = 0;
+    h.scrollTo.mockClear();
     onRevalidatePatch.mockClear();
     onLinesChange.mockClear();
     onContextLinesChange.mockClear();
@@ -134,7 +145,7 @@ describe("DiffCompareView", () => {
           cwd="/repo"
           environmentId={environmentId}
           files={files}
-          legacyTurnPatch={false}
+          liveTurnPatches={false}
           options={{ theme: "pierre-light" }}
           scope="working-tree"
           sectionId="unstaged"
@@ -194,7 +205,7 @@ describe("DiffCompareView", () => {
     });
     const changesOnly = { ...allLines, lines: "changes" as const, contextLines: 0 };
     await render([defaultFile!], {
-      lineFilter: { ...changesOnly, contextFiles: [contextFile!], contextSupported: true },
+      lineFilter: { ...changesOnly, contextFiles: [contextFile!] },
     });
     const view = lastCodeView();
     expect(view["options"]).toMatchObject({ expandUnchanged: false });
@@ -260,7 +271,11 @@ describe("DiffCompareView", () => {
 
   it("disables the count with its reason when the server ignores it", async () => {
     await render(parse(modified("src/a.ts", OLD_A, NEW_A)), {
-      lineFilter: { ...allLines, lines: "changes", contextSupported: false },
+      lineFilter: {
+        ...allLines,
+        lines: "changes",
+        contextUnavailableReason: "Update the server to change context lines.",
+      },
     });
     const field = container.querySelector<HTMLInputElement>('input[type="number"]')!;
     expect(field.disabled).toBe(true);
@@ -269,6 +284,48 @@ describe("DiffCompareView", () => {
     expect(parseContextLines(" 7 ")).toBe(7);
     expect(parseContextLines("-1")).toBeNull();
     expect(parseContextLines("")).toBeNull();
+  });
+
+  it("moves between changes with F7, Shift+F7 and the buttons, and stops at the ends", async () => {
+    const twoHunks = [
+      "diff --git a/src/a.ts b/src/a.ts",
+      `index ${OLD_A}..${NEW_A} 100644`,
+      "--- a/src/a.ts",
+      "+++ b/src/a.ts",
+      "@@ -2 +2 @@",
+      "-line 2",
+      "+line two",
+      "@@ -10 +10 @@",
+      "-line 10",
+      "+line ten",
+    ].join("\n");
+    await render(parse(twoHunks));
+    const button = (label: string) =>
+      container.querySelector<HTMLButtonElement>(`button[aria-label="${label}"]`)!;
+    expect(button("Previous change").getAttribute("aria-disabled")).toBe("true");
+    const diff = container.querySelector<HTMLElement>('[data-testid="code-view"]')!;
+    const press = async (init: KeyboardEventInit) =>
+      act(async () => {
+        diff.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, ...init }));
+      });
+
+    await press({ key: "F7" });
+    expect(h.scrollTo).toHaveBeenLastCalledWith({
+      type: "line",
+      id: "src/a.ts",
+      lineNumber: 2,
+      side: "additions",
+      align: "center",
+    });
+    await act(async () => button("Next change").click());
+    expect(h.scrollTo).toHaveBeenLastCalledWith(expect.objectContaining({ lineNumber: 10 }));
+    expect(button("Next change").getAttribute("aria-disabled")).toBe("true");
+    await press({ key: "F7" });
+    expect(h.scrollTo, "no more changes past the last").toHaveBeenCalledTimes(2);
+
+    await press({ key: "F7", shiftKey: true });
+    expect(h.scrollTo).toHaveBeenLastCalledWith(expect.objectContaining({ lineNumber: 2 }));
+    expect(button("Previous change").getAttribute("aria-disabled")).toBe("true");
   });
 
   it("reads two blobs for branch and turn scopes", async () => {

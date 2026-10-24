@@ -3,16 +3,24 @@ import {
   DIFF_CONTEXT_LINES_MAX,
   type DiffCompareLines,
   type EnvironmentId,
+  type ResolvedKeybindingsConfig,
   type ScopedThreadRef,
 } from "@bibcode/contracts";
+import { useAtomValue } from "@effect/atom-react";
+import { ChevronDownIcon, ChevronUpIcon } from "lucide-react";
 import {
   useCallback,
   useDeferredValue,
   useEffect,
   useEffectEvent,
   useId,
+  useImperativeHandle,
   useMemo,
+  useRef,
   useState,
+  type KeyboardEvent,
+  type ReactNode,
+  type Ref,
 } from "react";
 
 import { type DraftId } from "~/composerDraftStore";
@@ -28,6 +36,7 @@ import {
   describeUnavailableVersion,
   filterDiffFileRows,
   hydrateCompareFile,
+  listChangeTargets,
   planCompareFile,
   resolveCompareVersions,
   type DiffCompareScope,
@@ -36,11 +45,14 @@ import {
 } from "~/lib/diffCompareModel";
 import { resolveFileDiffPath } from "~/lib/diffRendering";
 import { cn } from "~/lib/utils";
+import { resolveShortcutCommand, shortcutLabelForCommand } from "~/keybindings";
 import { useEnvironmentQuery } from "~/state/query";
 import { reviewEnvironment } from "~/state/review";
+import { primaryServerKeybindingsAtom } from "~/state/server";
 
 import { Button } from "../ui/button";
 import { Toggle, ToggleGroup } from "../ui/toggle-group";
+import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import {
   AnnotatableCodeView,
   type AnnotatableCodeViewHandle,
@@ -55,8 +67,11 @@ export interface DiffCompareViewProps {
   readonly scope: DiffCompareScope;
   /** The default patch's files, sorted as Changes shows them. */
   readonly files: ReadonlyArray<FileDiffMetadata>;
-  /** A turn patch the server stored before checkpoints kept full files. */
-  readonly legacyTurnPatch: boolean;
+  /**
+   * The server computes turn patches live from checkpoints, so a turn patch with short IDs is
+   * one it stored before checkpoints kept full files.
+   */
+  readonly liveTurnPatches: boolean;
   readonly sectionId: string;
   readonly sectionTitle: string;
   readonly composerDraftTarget: ScopedThreadRef | DraftId;
@@ -65,7 +80,6 @@ export interface DiffCompareViewProps {
   /** Asks for the patch again, as the panel's refresh does. */
   readonly onRevalidatePatch: () => void;
   readonly lineFilter: CompareLineFilter;
-  readonly viewerRef?: React.Ref<AnnotatableCodeViewHandle>;
 }
 
 /** **All lines** or **Changes only**, with the context count the second one asks Git for. */
@@ -75,8 +89,8 @@ export interface CompareLineFilter {
   /** The patch with `contextLines`, parsed; null for All lines and until it loads. */
   readonly contextFiles: ReadonlyArray<FileDiffMetadata> | null;
   readonly contextPending: boolean;
-  /** Whether the server applied the count; null until it answers. */
-  readonly contextSupported: boolean | null;
+  /** Why the count cannot change for this patch, shown beside the disabled field; else null. */
+  readonly contextUnavailableReason: string | null;
   readonly onLinesChange: (lines: DiffCompareLines) => void;
   readonly onContextLinesChange: (contextLines: number) => void;
 }
@@ -111,8 +125,18 @@ export function DiffCompareView(props: DiffCompareViewProps) {
     [threadRef],
   );
 
+  // F7 and Shift+F7 by default, while focus is anywhere in Compare: the list or the diff.
+  const keybindings = useAtomValue(primaryServerKeybindingsAtom);
+  const paneRef = useRef<ComparePaneHandle>(null);
+  const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    const command = resolveShortcutCommand(event, keybindings, { context: DIFF_FOCUS_CONTEXT });
+    if (command !== "diff.nextChange" && command !== "diff.previousChange") return;
+    event.preventDefault();
+    paneRef.current?.goToChange(command === "diff.nextChange" ? 1 : -1);
+  };
+
   return (
-    <div className="flex min-h-0 min-w-0 flex-1">
+    <div className="flex min-h-0 min-w-0 flex-1" onKeyDown={onKeyDown}>
       <DiffFileList
         className="w-60 shrink-0 border-r border-border"
         filters={filters}
@@ -126,7 +150,13 @@ export function DiffCompareView(props: DiffCompareViewProps) {
       <div className="flex min-h-0 min-w-0 flex-1 flex-col">
         {selectedRow ? (
           // Keyed by path: a refreshed patch keeps the pane, and what it learned about the file.
-          <DiffComparePane key={selectedRow.path} {...props} row={selectedRow} />
+          <DiffComparePane
+            key={selectedRow.path}
+            {...props}
+            keybindings={keybindings}
+            paneRef={paneRef}
+            row={selectedRow}
+          />
         ) : (
           <div className="flex flex-1 items-center justify-center px-3 text-xs text-muted-foreground">
             No file selected.
@@ -137,8 +167,23 @@ export function DiffCompareView(props: DiffCompareViewProps) {
   );
 }
 
+const DIFF_FOCUS_CONTEXT = {
+  diffFocus: true,
+  terminalFocus: false,
+  terminalOpen: false,
+  previewFocus: false,
+  previewOpen: false,
+} as const;
+
+/** Moves the diff to the next (+1) or previous (-1) block of changes. */
+interface ComparePaneHandle {
+  goToChange: (direction: 1 | -1) => void;
+}
+
 interface DiffComparePaneProps extends DiffCompareViewProps {
   readonly row: DiffFileRow;
+  readonly keybindings: ResolvedKeybindingsConfig;
+  readonly paneRef: Ref<ComparePaneHandle>;
 }
 
 /** The patch was asked for again because the working file had moved past `forOid`. */
@@ -154,7 +199,7 @@ function DiffComparePane({
   environmentId,
   cwd,
   scope,
-  legacyTurnPatch,
+  liveTurnPatches,
   row,
   sectionId,
   sectionTitle,
@@ -162,9 +207,10 @@ function DiffComparePane({
   options,
   onRevalidatePatch,
   lineFilter,
-  viewerRef,
+  keybindings,
+  paneRef,
 }: DiffComparePaneProps) {
-  const plan = planCompareFile(row, scope, { legacyTurnPatch });
+  const plan = planCompareFile(row, scope, { liveTurnPatches });
   const versionTarget = (version: "old" | "new") =>
     plan.kind === "versions"
       ? reviewEnvironment.fileVersion({
@@ -238,6 +284,32 @@ function DiffComparePane({
     plan.kind === "versions" &&
     versionError === null &&
     (versions.kind === "loading" || (changed && !stillChanging));
+  // Where Next and Previous change go: the first line of each block of changes. The pane
+  // remounts per file, so the position starts before the first change of each.
+  const changeTargets = useMemo(() => listChangeTargets(shownFile), [shownFile]);
+  const [changeIndex, setChangeIndex] = useState(-1);
+  const codeViewRef = useRef<AnnotatableCodeViewHandle>(null);
+  const goToChange = (direction: 1 | -1) => {
+    const next = changeIndex + direction;
+    const target = changeTargets[next];
+    if (!target) return;
+    setChangeIndex(next);
+    codeViewRef.current?.scrollTo({
+      type: "line",
+      id: row.path,
+      lineNumber: target.lineNumber,
+      side: target.side,
+      align: "center",
+    });
+  };
+  useImperativeHandle(paneRef, () => ({ goToChange }));
+  const nextLabel = shortcutLabelForCommand(keybindings, "diff.nextChange", {
+    context: DIFF_FOCUS_CONTEXT,
+  });
+  const previousLabel = shortcutLabelForCommand(keybindings, "diff.previousChange", {
+    context: DIFF_FOCUS_CONTEXT,
+  });
+
   // Keyed by path, which a refreshed patch keeps; the patch's own key changes with any file.
   const files = useMemo(
     () => [
@@ -268,6 +340,26 @@ function DiffComparePane({
             Loading changes…
           </span>
         ) : null}
+        {plan.kind === "notice" ? null : (
+          <>
+            <ChangeNavigationButton
+              disabled={changeIndex <= 0}
+              label="Previous change"
+              shortcut={previousLabel}
+              onClick={() => goToChange(-1)}
+            >
+              <ChevronUpIcon aria-hidden="true" className="size-3.5" />
+            </ChangeNavigationButton>
+            <ChangeNavigationButton
+              disabled={changeIndex >= changeTargets.length - 1}
+              label="Next change"
+              shortcut={nextLabel}
+              onClick={() => goToChange(1)}
+            >
+              <ChevronDownIcon aria-hidden="true" className="size-3.5" />
+            </ChangeNavigationButton>
+          </>
+        )}
       </div>
       {plan.kind === "notice" ? null : <CompareLineControls lineFilter={lineFilter} />}
       {plan.kind === "notice" ? (
@@ -300,7 +392,7 @@ function DiffComparePane({
               renderHeaderPrefix={() => null}
               sectionId={sectionId}
               sectionTitle={sectionTitle}
-              {...(viewerRef ? { viewerRef } : {})}
+              viewerRef={codeViewRef}
               options={{
                 ...options,
                 diffStyle: "split",
@@ -315,11 +407,52 @@ function DiffComparePane({
   );
 }
 
-const UNSUPPORTED_CONTEXT = "Update the server to change context lines.";
+/**
+ * Previous or Next change. At either end it stays focusable, so its tooltip can say why it does
+ * nothing, instead of turning into a control that cannot explain itself.
+ */
+function ChangeNavigationButton({
+  disabled,
+  label,
+  shortcut,
+  onClick,
+  children,
+}: {
+  readonly disabled: boolean;
+  readonly label: string;
+  readonly shortcut: string | null;
+  readonly onClick: () => void;
+  readonly children: ReactNode;
+}) {
+  return (
+    <Tooltip>
+      <TooltipTrigger
+        render={
+          <Button
+            aria-disabled={disabled}
+            aria-label={label}
+            className={cn("shrink-0", disabled && "opacity-64")}
+            size="icon-xs"
+            variant="ghost"
+            onClick={() => {
+              if (!disabled) onClick();
+            }}
+          />
+        }
+      >
+        {children}
+      </TooltipTrigger>
+      <TooltipPopup side="bottom">
+        {disabled ? "No more changes." : shortcut ? `${label} (${shortcut})` : label}
+      </TooltipPopup>
+    </Tooltip>
+  );
+}
 
 function CompareLineControls({ lineFilter }: { readonly lineFilter: CompareLineFilter }) {
   const reasonId = useId();
-  const unsupported = lineFilter.lines === "changes" && lineFilter.contextSupported === false;
+  const unavailableReason =
+    lineFilter.lines === "changes" ? lineFilter.contextUnavailableReason : null;
   return (
     <div className="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-1 border-b border-border px-3 py-1">
       <ToggleGroup
@@ -343,14 +476,14 @@ function CompareLineControls({ lineFilter }: { readonly lineFilter: CompareLineF
       </ToggleGroup>
       {lineFilter.lines === "changes" ? (
         <ContextLinesField
-          disabledReasonId={unsupported ? reasonId : null}
+          disabledReasonId={unavailableReason === null ? null : reasonId}
           value={lineFilter.contextLines}
           onCommit={lineFilter.onContextLinesChange}
         />
       ) : null}
-      {unsupported ? (
+      {unavailableReason !== null ? (
         <span className="text-xs text-muted-foreground" id={reasonId}>
-          {UNSUPPORTED_CONTEXT}
+          {unavailableReason}
         </span>
       ) : null}
     </div>

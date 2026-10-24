@@ -549,7 +549,7 @@ describe("DiffPanel: Changes and Compare", () => {
     const compare = capturedLast("diffCompareView");
     expect(compare["scope"]).toBe("branch");
     expect(compare["cwd"]).toBe("/wt");
-    expect(compare["legacyTurnPatch"]).toBe(false);
+    expect(compare["liveTurnPatches"]).toBe(false);
     expect((compare["files"] as Array<{ path: string }>).map((file) => file.path)).toEqual([
       "src/a.ts",
       "src/b.ts",
@@ -580,7 +580,7 @@ describe("DiffPanel: Changes and Compare", () => {
     expect(capturedLast("diffCompareView")["lineFilter"]).toMatchObject({
       lines: "all",
       contextFiles: null,
-      contextSupported: null,
+      contextUnavailableReason: null,
     });
 
     h.settings = {
@@ -598,7 +598,11 @@ describe("DiffPanel: Changes and Compare", () => {
       input: { cwd: "/wt", contextLines: 7, ignoreWhitespace: false },
     });
     const lineFilter = capturedLast("diffCompareView")["lineFilter"] as Record<string, unknown>;
-    expect(lineFilter).toMatchObject({ lines: "changes", contextLines: 7, contextSupported: true });
+    expect(lineFilter).toMatchObject({
+      lines: "changes",
+      contextLines: 7,
+      contextUnavailableReason: null,
+    });
     expect(lineFilter["contextFiles"]).not.toBeNull();
     (lineFilter["onContextLinesChange"] as (value: number) => void)(9);
     expect(h.updateClientSettings).toHaveBeenCalledWith({ diffCompareContextLines: 9 });
@@ -613,7 +617,7 @@ describe("DiffPanel: Changes and Compare", () => {
     });
     render();
     expect(capturedLast("diffCompareView")["lineFilter"]).toMatchObject({
-      contextSupported: false,
+      contextUnavailableReason: "Update the server to change context lines.",
     });
   });
 
@@ -637,21 +641,49 @@ describe("DiffPanel: Changes and Compare", () => {
     expect(h.contextPreviewArgs).toEqual([]);
     expect(capturedLast("diffCompareView")["lineFilter"]).toMatchObject({
       contextPending: true,
-      contextSupported: null,
+      contextUnavailableReason: null,
     });
   });
 
-  it("marks a turn patch from this server that has short IDs as a stored one", () => {
+  it("says a stored turn patch, not the server, is why its context cannot change", () => {
+    h.settings = { ...h.settings, diffViewMode: "compare", diffCompareLines: "changes" };
+    h.turnDiffSummaries = [summary(turnIdA, 2, "2026-01-01T00:00:00.000Z")];
+    h.diffSelection = { kind: "turn", turnId: turnIdA, filePath: null, revealRequestId: 0 };
+    h.checkpointDiff = { data: { diff: "CP", truncated: false }, error: null, isPending: false };
+    h.contextCheckpointDiff = {
+      data: { diff: "CP", truncated: false },
+      error: null,
+      isPending: false,
+    };
+    render();
+    expect(capturedLast("diffCompareView")["lineFilter"]).toMatchObject({
+      contextUnavailableReason:
+        "Saved before full files were kept, so its context lines can't change.",
+    });
+
+    // A live turn patch echoes the count it applied.
+    h.contextCheckpointDiff = {
+      data: { diff: "CP", truncated: false, contextLines: 3 },
+      error: null,
+      isPending: false,
+    };
+    render();
+    expect(capturedLast("diffCompareView")["lineFilter"]).toMatchObject({
+      contextUnavailableReason: null,
+    });
+  });
+
+  it("tells Compare whether turn patches come from checkpoints", () => {
     h.settings = { ...h.settings, diffViewMode: "compare" };
     h.turnDiffSummaries = [summary(turnIdA, 2, "2026-01-01T00:00:00.000Z")];
     h.diffSelection = { kind: "turn", turnId: turnIdA, filePath: null, revealRequestId: 0 };
     h.checkpointDiff = { data: { diff: "CP", truncated: false }, error: null, isPending: false };
     render();
-    expect(capturedLast("diffCompareView")).toMatchObject({ scope: "turn", legacyTurnPatch: true });
+    expect(capturedLast("diffCompareView")).toMatchObject({ scope: "turn", liveTurnPatches: true });
 
     h.checkpointDiff = { data: { diff: "CP" }, error: null, isPending: false };
     render();
-    expect(capturedLast("diffCompareView")["legacyTurnPatch"], "an older server").toBe(false);
+    expect(capturedLast("diffCompareView")["liveTurnPatches"], "an older server").toBe(false);
   });
 
   it("shows a turn error's message rather than an empty selection", () => {
