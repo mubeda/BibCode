@@ -203,6 +203,15 @@ export class FileEditingSession<LAnnotation, A = unknown, E = unknown> {
     return this.coordinator.hasPendingWork() ? this.coordinator.getLatestContents() : null;
   }
 
+  /**
+   * The text this session's document holds: the latest edit, saved or not, else the disk text it
+   * was read from. A surface shows this when the file query cannot seed the document, such as a
+   * read cut short at the read limit.
+   */
+  get documentContents(): string {
+    return this.localText();
+  }
+
   /** Whether the server versions this file, so its disk state can be watched and guarded. */
   get watchesDisk(): boolean {
     return this.base !== null && !this.disposed;
@@ -369,7 +378,9 @@ export class FileEditingSession<LAnnotation, A = unknown, E = unknown> {
         if (base.kind === "missing") return "settled";
         if (this.coordinator.hasPendingWork()) {
           this.recordConflict("deleted", { kind: "missing" });
-        } else {
+        } else if (!this.composing) {
+          // While composing, the editor holds text Pierre has not committed yet; the next check
+          // after the composition records the deletion, as a conflict once that text lands.
           this.markDeletedOnDisk();
         }
         return "settled";
@@ -385,6 +396,14 @@ export class FileEditingSession<LAnnotation, A = unknown, E = unknown> {
           // The disk is back at the state the edits were based on: they are ordinary edits again.
           this.clearConflict();
           this.publish();
+          return "settled";
+        }
+        if (
+          this.conflict?.disk?.kind === "present" &&
+          this.conflict.disk.version === disk.version
+        ) {
+          // The conflict already holds this version's text: settle it without reading the file.
+          if (this.conflict.disk.contents === this.localText()) this.adoptBase(this.conflict.disk);
           return "settled";
         }
         return "read";
