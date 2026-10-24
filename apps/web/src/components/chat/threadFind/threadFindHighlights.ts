@@ -59,7 +59,10 @@ function walkDomChildren(walk: DomWalk, parent: Node): void {
     if (
       SKIPPED_TAGS.has(tag) ||
       element.hasAttribute(FIND_IGNORE_ATTRIBUTE) ||
-      element.hasAttribute("hidden")
+      element.hasAttribute("hidden") ||
+      // React hides a committed subtree that suspends again, such as a streaming code block
+      // loading a grammar, while its fallback shows the same text.
+      (element as HTMLElement).style?.display === "none"
     ) {
       continue;
     }

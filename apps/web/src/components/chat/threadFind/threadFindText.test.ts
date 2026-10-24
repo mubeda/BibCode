@@ -109,6 +109,36 @@ describe("threadFindText projection", () => {
     expect(occurrences("summary")).toEqual([[]]);
   });
 
+  it("flags text in nested details with every enclosing ordinal", () => {
+    const text = [
+      "<details>",
+      "<summary>Outer</summary>",
+      "",
+      "outer body",
+      "",
+      "<details>",
+      "<summary>Inner title</summary>",
+      "",
+      "inner body",
+      "",
+      "</details>",
+      "",
+      "</details>",
+    ].join("\n");
+    const paths = (query: string) =>
+      locateFindOccurrences(project(text), prepareFindQuery(query)!).map(
+        (occurrence) => occurrence.segment.details,
+      );
+    expect(paths("outer body")).toEqual([[0]]);
+    expect(paths("inner title")).toEqual([[0]]);
+    expect(paths("inner body")).toEqual([[0, 1]]);
+  });
+
+  it("reads a raw line break as whitespace, inside details too", () => {
+    expect(count("one<br>two", "one two")).toBe(1);
+    expect(count("<details>one<br>two</details>", "one two")).toBe(1);
+  });
+
   it("drops what the sanitizer drops and shows nothing for an image", () => {
     const text = 'Safe <script>alert("x")</script> <img src="a.png" alt="picture"> text';
     expect(count(text, "alert")).toBe(0);

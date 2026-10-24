@@ -271,11 +271,13 @@ function walkChildren(
   walk: ProjectionWalk,
   parent: Element | HastRoot,
   context: WalkContext,
+  skip?: Element,
 ): void {
   const tableStructure = parent.type === "element" && TABLE_STRUCTURE_TAGS.has(parent.tagName);
   const { children } = parent;
   for (let index = 0; index < children.length; index += 1) {
     const child = children[index]!;
+    if (child === skip) continue;
     if (child.type === "text") {
       if (tableStructure && child.value.trim().length === 0) continue;
       emitText(walk, child.value, context);
@@ -307,14 +309,7 @@ function walkDetails(walk: ProjectionWalk, element: Element, context: WalkContex
     ...context,
     details: ordinal === null ? context.details : [...context.details, ordinal],
   };
-  for (const child of element.children) {
-    if (child === summary) continue;
-    if (child.type === "text") {
-      emitText(walk, child.value, inner);
-    } else if (child.type === "element") {
-      walkElement(walk, child, inner);
-    }
-  }
+  walkChildren(walk, element, inner, summary);
   flush(walk);
 }
 
