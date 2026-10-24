@@ -598,7 +598,7 @@ describe("generated provider shims", () => {
     interface StreamEventFrame {
       readonly type?: string;
       readonly content_block?: { readonly type?: string };
-      readonly delta?: { readonly type?: string };
+      readonly delta?: { readonly type?: string; readonly text?: string };
     }
     const streamEvents = responses
       .filter((response) => response.type === "stream_event")
@@ -613,6 +613,11 @@ describe("generated provider shims", () => {
         .map((event) => event.delta?.type),
     );
     expect([...deltaTypes].toSorted()).toEqual(["signature_delta", "text_delta", "thinking_delta"]);
+    // Each answer names its prompt, so a later turn's answer is told apart from this one.
+    const answer = streamEvents
+      .flatMap((event) => (event.delta?.type === "text_delta" ? [event.delta.text ?? ""] : []))
+      .join("");
+    expect(answer).toContain("Fixture reasoning answer line 24 (Think it through).");
     expect(responses).toContainEqual(
       expect.objectContaining({
         type: "user",

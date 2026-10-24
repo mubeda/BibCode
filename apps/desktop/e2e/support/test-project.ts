@@ -20,8 +20,9 @@ const REASONING_TURN_STEPS = Array.from(
   (_, step) => `Fixture thinking step ${step + 1} weighs the parser. `,
 );
 const REASONING_ANSWER_LINES = 24;
-const reasoningAnswerLine = (variant: string, line: number) =>
-  `Fixture ${variant} answer line ${line}.`;
+/** An answer line names its prompt without the marker, so each turn's answer is its own. */
+const reasoningAnswerLine = (variant: string, line: number, label: string) =>
+  `Fixture ${variant} answer line ${line} (${label}).`;
 
 const nativeActionLogFixtureSource = String.raw`
 import fs from "node:fs";
@@ -539,6 +540,7 @@ export function appendProviderInput(provider, prompt, kind = "start", turnId) {
 `.trimStart();
 
 const claudeFixtureSource = String.raw`
+import { randomUUID } from "node:crypto";
 import readline from "node:readline";
 import { appendProviderInput, promptTextFromParts } from "./provider-input-log-fixture.mjs";
 
@@ -563,12 +565,13 @@ const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // A thinking block streamed over about two seconds (ten when slow), a tool call, then a long
 // answer: the frames Claude sends with summarized thinking.
-async function streamReasoningTurn(sessionId, slow) {
+async function streamReasoningTurn(sessionId, slow, prompt) {
   const stepDelayMs = slow ? 650 : 130;
   const variant = slow ? "slow reasoning" : "reasoning";
+  const label = prompt.replace(/\[\[[^\]]*\]\]/g, "").trim();
   const reasoningAnswer = Array.from(
     { length: ${REASONING_ANSWER_LINES} },
-    (_, line) => "Fixture " + variant + " answer line " + (line + 1) + "."
+    (_, line) => "Fixture " + variant + " answer line " + (line + 1) + " (" + label + ")."
   ).join("\n\n");
   const event = (uuid, streamEvent) => send({
     type: "stream_event",
@@ -577,7 +580,11 @@ async function streamReasoningTurn(sessionId, slow) {
     parent_tool_use_id: null,
     event: streamEvent
   });
-  event("reasoning-message", { type: "message_start", message: { id: "bibcode-ui-reasoning-message" } });
+  // Claude message ids are unique, so each turn's thinking block is its own entry.
+  event("reasoning-message", {
+    type: "message_start",
+    message: { id: "bibcode-ui-reasoning-" + randomUUID() }
+  });
   event("reasoning-start", {
     type: "content_block_start",
     index: 0,
@@ -710,7 +717,7 @@ reader.on("line", (line) => {
   send(message);
   const slowReasoning = prompt.includes(${JSON.stringify(SLOW_REASONING_TURN_MARKER)});
   if (slowReasoning || prompt.includes(${JSON.stringify(REASONING_TURN_MARKER)})) {
-    void streamReasoningTurn(sessionId, slowReasoning);
+    void streamReasoningTurn(sessionId, slowReasoning, prompt);
     return;
   }
   send({
@@ -1390,6 +1397,7 @@ export const desktopUiFixture = {
   reasoningTurnMarker: REASONING_TURN_MARKER,
   slowReasoningTurnMarker: SLOW_REASONING_TURN_MARKER,
   reasoningThoughtStart: "Fixture thinking step 1 weighs the parser.",
-  reasoningAnswerLastLine: reasoningAnswerLine("reasoning", REASONING_ANSWER_LINES),
-  slowReasoningAnswerLastLine: reasoningAnswerLine("slow reasoning", REASONING_ANSWER_LINES),
+  /** The last line of the answer to a reasoning prompt whose text, markers aside, is `label`. */
+  reasoningAnswerLastLine: (label: string, slow = false) =>
+    reasoningAnswerLine(slow ? "slow reasoning" : "reasoning", REASONING_ANSWER_LINES, label),
 } as const;
