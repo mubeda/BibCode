@@ -118,6 +118,8 @@ struct Replay {
     failing_ask_lists: std::sync::atomic::AtomicUsize,
     /// How many more session-tree reads (`GET /api/session?parentID=`) answer HTTP 500.
     failing_session_tree: std::sync::atomic::AtomicUsize,
+    /// How many times the model catalog (`GET /api/model`) was read.
+    model_reads: std::sync::atomic::AtomicUsize,
 }
 
 impl Replay {
@@ -185,7 +187,7 @@ async fn record(
         let (status, response) = exchange(replay.scenario, "POST", "/prompt");
         return (StatusCode::from_u16(status).unwrap(), Json(response)).into_response();
     }
-    if path.ends_with("/command") {
+    if path.ends_with("/command") || path.ends_with("/compact") {
         replay.prompted.notify_one();
     }
     if path.ends_with("/reply") {
@@ -420,7 +422,8 @@ async fn captured_list_json(State(replay): State<Arc<Replay>>, uri: OriginalUri)
     Json(response)
 }
 
-async fn models() -> Json<Value> {
+async fn models(State(replay): State<Arc<Replay>>) -> Json<Value> {
+    replay.model_reads.fetch_add(1, Ordering::SeqCst);
     Json(exchange("catalog", "GET", "/api/model").1)
 }
 
@@ -508,6 +511,7 @@ async fn serve(scenario: &'static str) -> (String, Arc<Replay>) {
         extra_forms: StdMutex::new(Vec::new()),
         failing_ask_lists: std::sync::atomic::AtomicUsize::new(0),
         failing_session_tree: std::sync::atomic::AtomicUsize::new(0),
+        model_reads: std::sync::atomic::AtomicUsize::new(0),
     });
     let app = Router::new()
         .route("/api/session", post(record).get(captured_list))
@@ -536,6 +540,7 @@ async fn serve(scenario: &'static str) -> (String, Arc<Replay>) {
         )
         .route("/api/session/{session_id}/prompt", post(record))
         .route("/api/session/{session_id}/command", post(record))
+        .route("/api/session/{session_id}/compact", post(record))
         .route("/api/session/{session_id}/model", post(record))
         .route("/api/session/{session_id}/agent", post(record))
         .route("/api/session/{session_id}/interrupt", post(record))
@@ -749,6 +754,139 @@ async fn a_prompt_creates_the_session_and_streams_one_turn() {
     assert_eq!(
         completed[0].payload,
         json!({ "state": "completed", "stopReason": "completed" })
+    );
+    runtime.stop().await.expect("stop");
+}
+
+/// A step's token usage reaches the context meter against the model's window from `/api/model`
+/// (both captured from OpenCode 2.0.29).
+#[tokio::test]
+async fn a_step_reports_its_context_usage_against_the_models_window() {
+    let (endpoint, _replay) = serve("hello").await;
+    let runtime = v2_runtime(&endpoint);
+    runtime.start().await.expect("session starts");
+    runtime
+        .send_turn(Some("SAY_HELLO please"), Vec::new(), None)
+        .await
+        .expect("prompt is accepted");
+    let events = until_turns_complete(&runtime, 1).await;
+    let usage = of_type(&events, "thread.token-usage.updated");
+    assert_eq!(usage.len(), 1, "{events:#?}");
+    assert_eq!(usage[0].payload["usage"]["usedTokens"], 16);
+    assert_eq!(usage[0].payload["usage"]["maxTokens"], 200_000);
+    runtime.stop().await.expect("stop");
+}
+
+/// The model catalog is read for the context meter once, and once more when the chat switches
+/// to a model the last read did not list (one added to the server since, say).
+#[tokio::test]
+async fn the_model_catalog_is_read_again_for_a_model_it_did_not_list() {
+    let (endpoint, replay) = serve("hello").await;
+    let runtime = v2_runtime(&endpoint);
+    runtime.start().await.expect("session starts");
+    let reads = || replay.model_reads.load(Ordering::SeqCst);
+    let started = reads();
+    let mut after_each_prompt = Vec::new();
+    for model in [None, None, Some("mock/added-model"), None] {
+        if let Some(model) = model {
+            runtime.set_model(model).await.expect("model is selected");
+        }
+        runtime
+            .send_turn(Some("SAY_HELLO please"), Vec::new(), None)
+            .await
+            .expect("prompt is sent");
+        after_each_prompt.push(reads() - started);
+    }
+    assert_eq!(after_each_prompt, [1, 1, 2, 2]);
+    runtime.stop().await.expect("stop");
+}
+
+/// `/compact` is OpenCode 2's compaction request, under the delivery's message id, never a
+/// command. The captured `hello` execution stands in for the one OpenCode runs to compact.
+#[tokio::test]
+async fn compact_requests_a_compaction_under_the_delivery_id() {
+    let (endpoint, replay) = serve("hello").await;
+    let runtime = v2_runtime(&endpoint);
+    runtime.start().await.expect("session starts");
+    let turn_id = runtime
+        .send_command("compact", "", Some("3f2a1b9c-0000-4000-8000-000000000000"))
+        .await
+        .expect("compaction is accepted");
+    let events = until_turns_complete(&runtime, 1).await;
+    let compactions = replay
+        .requests_to("/compact")
+        .into_iter()
+        .map(|(_, _, body)| body)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        compactions,
+        [json!({ "id": "msg_3f2a1b9c000040008000000000000000", "delivery": "steer" })]
+    );
+    assert!(replay.requests_to("/command").is_empty());
+    assert_eq!(
+        of_type(&events, "turn.completed")[0].turn_id.as_deref(),
+        Some(turn_id.as_str())
+    );
+    runtime.stop().await.expect("stop");
+}
+
+/// Compaction and retry events, shaped as OpenCode 2.1.4's `session-event.ts` defines them (no
+/// 2.x server was available to capture them), reach the work log as a compaction step and a
+/// warning.
+#[tokio::test]
+async fn compactions_and_retries_reach_the_work_log() {
+    let (endpoint, replay) = serve("hello").await;
+    let runtime = v2_runtime(&endpoint);
+    runtime.start().await.expect("session starts");
+    let root = replay.root.clone();
+    for event in [
+        json!({"id":"evt_1","type":"session.compaction.started","data":{
+            "sessionID":root,"reason":"auto"}}),
+        json!({"id":"evt_2","type":"session.compaction.failed","data":{
+            "sessionID":root,"reason":"auto",
+            "error":{"type":"provider.transport","message":"Connection reset"}}}),
+        json!({"id":"evt_3","type":"session.retry.scheduled","data":{
+            "sessionID":root,"assistantMessageID":"msg_a","attempt":1,"at":1,
+            "error":{"type":"provider.internal","message":"Overloaded","status":529}}}),
+    ] {
+        runtime.handle_v2_event(event).await;
+    }
+    let events = drain(&runtime).await;
+    let shown = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.event_type.as_str(),
+                "item.started" | "item.completed" | "runtime.warning"
+            )
+        })
+        .map(|event| {
+            (
+                event.event_type.as_str(),
+                event.item_id.as_deref(),
+                event.payload.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        shown,
+        [
+            (
+                "item.started",
+                Some("compaction:evt_1"),
+                json!({"itemType":"context_compaction","status":"inProgress","title":"Conversation compaction"})
+            ),
+            (
+                "item.completed",
+                Some("compaction:evt_1"),
+                json!({"itemType":"context_compaction","status":"failed","title":"Conversation compaction","detail":"Connection reset"})
+            ),
+            (
+                "runtime.warning",
+                None,
+                json!({"message":"OpenCode is retrying after an upstream error (attempt 1): Overloaded (HTTP 529)","class":"provider_error"})
+            ),
+        ]
     );
     runtime.stop().await.expect("stop");
 }

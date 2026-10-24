@@ -35,6 +35,7 @@ pub(crate) async fn discover_capabilities(
             skills: discovered.skills,
             agents: discovered.agents,
             issues: discovered.issues,
+            ..ProviderCapabilities::default()
         }
     } else if definition.driver == "opencode" && definition.endpoint.is_some() {
         tokio::select! {
