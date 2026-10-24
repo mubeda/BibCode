@@ -697,6 +697,20 @@ while a run is active; the rail's existing status observation remains bounded.
 Progress replaces the action, a failed row offers **Retry** and **Dismiss**, and
 a failed card retains **Retry** beside its explained badge.
 
+**Settings → Providers → Update all…** is a third starter. Its one confirmation
+lists, beside each environment's provider updates, the server install of every
+connected remote environment whose snapshot reports `update-available` from an
+automatic installer, with `remoteUpdateConfirmation` lines and the same
+`updater.activeWork` counts; a `manual` host there is named as skipped with the
+manual copy. The primary and desktop-local environments never get a server
+install from it, so it never restarts this app. After confirmation it runs the
+same `update` command for an environment only once that environment's
+`server.updateProvider` calls have settled as updated, and never after a failed,
+unchanged, or unconfirmed one, so it cannot restart a host under its own
+provider install. The install joins the environment's shared `run`, so its
+Remote Servers row shows the same progress
+([providers](providers.md) describes the provider half).
+
 Manual hosts expose **Show update steps**, using install kind, host OS and
 architecture, and SSH launch state. Windows archive checks use PowerShell;
 SSH steps require verifying the current server before stopping it. There is no
