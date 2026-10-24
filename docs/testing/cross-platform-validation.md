@@ -2679,7 +2679,8 @@ sizes. Cover relevant:
 - Activity subagents and background tasks, including elapsed time and keyboard
   navigation. One click or **Enter** on the **Activity** button opens the panel
   on the section with an error or running work and, with the panel open, keeps
-  it open. With **Settings → Agents → Always show Activity** on, a new chat on a
+  it open and moves focus to the section's tab; the **Background tasks** tab
+  reaches the other section. With **Settings → Agents → Always show Activity** on, a new chat on a
   provider that reports activity shows the muted **Activity** button before its
   first subagent; with it off, the button waits for a record;
 - with an outdated provider on the primary and on a connected remote

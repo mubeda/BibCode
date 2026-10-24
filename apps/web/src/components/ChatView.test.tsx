@@ -3193,6 +3193,41 @@ describe("ChatView", () => {
       }
     });
 
+    it("brings an open Activity panel back into focus at the top of its section", async () => {
+      const panelThreadId = ThreadId.make("thread-panel-refocus");
+      const panelThreadRef = scopeThreadRef(environmentId, panelThreadId);
+      const child = actor("actor-refocus", "Refocus reviewer");
+      const snapshot = activitySnapshot({ _tag: "thread", threadId: panelThreadId }, [child]);
+      seedEnvironment(makeEnvironmentPresentation());
+      seedProject(makeProject());
+      seedServerThread(makeThread({ id: panelThreadId, title: "Refocus thread" }));
+      seedGitStatus(true);
+      seedActivityState(environmentId, snapshot.scope, snapshot);
+      seedActivityQueries(environmentId, snapshot, [child]);
+
+      const { container, root } = await mountActivityPanel(panelThreadRef);
+      try {
+        await openSubagents(container);
+        const panel = container.querySelector<HTMLElement>("[data-activity-panel]")!;
+        await vi.waitFor(() => expect(panel.contains(document.activeElement)).toBe(true));
+        const pill = container.querySelector<HTMLButtonElement>(
+          'button[aria-label^="Open Activity: Subagents"]',
+        )!;
+        pill.focus();
+        const viewport = panel.querySelector<HTMLElement>('[data-slot="scroll-area-viewport"]')!;
+        viewport.scrollTop = 200;
+
+        await click(pill);
+
+        await vi.waitFor(() => expect(panel.contains(document.activeElement)).toBe(true));
+        expect(viewport.scrollTop).toBe(0);
+        expect(container.querySelector("[data-activity-panel]")).toBe(panel);
+      } finally {
+        await act(async () => root.unmount());
+        container.remove();
+      }
+    });
+
     it("opens a panel chat activity inspector in the compact sheet", async () => {
       const child = actor("actor-panel-compact", "Compact panel reviewer");
       const snapshot = activitySnapshot({ _tag: "thread", threadId }, [child]);

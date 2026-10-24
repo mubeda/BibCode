@@ -1317,13 +1317,17 @@ active scope and the combined **Active** and **Done** counts. One click, or
 **Enter** or **Space**, opens the Activity panel on the section that needs you:
 the one with an error, else the one with running work (Subagents first), else
 the one with the most recent record. With the panel already open, the button
-brings it to the front on that section and never closes it. A stale or error
-icon on the button means a section, or the whole observation, is degraded;
-errors win over stale. A section that fails before its first record still marks
-the button, and a click opens it on that error. The button's accessible name and tooltip give the counts
-for each section. Each Subagents row in the panel shows one provider icon for
-its actor, and the same Activity presentation is used in the inline right panel
-and its responsive sheet.
+brings it to the front on that section, moves focus into it, scrolls to the top
+of the section, and never closes it; an open record stays open. When the
+provider reports both sections, **Subagents** and **Background tasks** tabs at
+the top of the panel switch between them, and a tab marks a stale or failing
+section. A stale or error icon on the button means a section, or the whole
+observation, is degraded; errors win over stale. A section that fails before its
+first record still marks the button, and a click opens it on that error. The
+button's accessible name and tooltip give the counts for each section. Each
+Subagents row in the panel shows one provider icon for its actor, and the same
+Activity presentation is used in the inline right panel and its responsive
+sheet.
 
 **Settings → Agents → Always show Activity** (on by default) keeps the button
 above a chat whose provider reports subagents or background tasks even before

@@ -5,6 +5,7 @@ import { createJSONStorage } from "zustand/middleware";
 
 import {
   migratePersistedRightPanelState,
+  selectActivityFocusRequested,
   selectActiveRightPanel,
   selectActiveRightPanelSurface,
   selectThreadRightPanelState,
@@ -16,7 +17,7 @@ const refB = scopeThreadRef("env-1" as EnvironmentId, ThreadId.make("thread-B"))
 const refAOtherEnvironment = scopeThreadRef("env-2" as EnvironmentId, ThreadId.make("thread-A"));
 
 beforeEach(() => {
-  useRightPanelStore.setState({ byThreadKey: {} });
+  useRightPanelStore.setState({ byThreadKey: {}, activityFocusRequests: {} });
 });
 
 describe("rightPanelStore", () => {
@@ -199,6 +200,36 @@ describe("rightPanelStore", () => {
       section: "subagents",
       selectedRecordKind: "actor",
       selectedRecordId: "actor-1",
+    });
+  });
+
+  it("asks the Activity panel to take focus on every open until the panel handles it", () => {
+    const focusRequested = (ref: typeof refA) =>
+      selectActivityFocusRequested(useRightPanelStore.getState(), ref);
+    useRightPanelStore.getState().openActivity(refA, "subagents");
+    expect(focusRequested(refA)).toBe(true);
+    expect(focusRequested(refB)).toBe(false);
+
+    useRightPanelStore.getState().acknowledgeActivityFocus(refA);
+    expect(focusRequested(refA)).toBe(false);
+
+    // Reopening the same section with a record open asks again.
+    useRightPanelStore.getState().navigateActivity(refA, {
+      section: "subagents",
+      selectedRecordKind: "actor",
+      selectedRecordId: "actor-1",
+    });
+    expect(focusRequested(refA)).toBe(false);
+    useRightPanelStore.getState().openActivity(refA, "subagents");
+    expect(focusRequested(refA)).toBe(true);
+  });
+
+  it("never persists a pending Activity focus request", () => {
+    useRightPanelStore.getState().openActivity(refA, "subagents");
+    const partialize = useRightPanelStore.persist.getOptions().partialize;
+
+    expect(partialize?.(useRightPanelStore.getState())).toEqual({
+      byThreadKey: useRightPanelStore.getState().byThreadKey,
     });
   });
 
