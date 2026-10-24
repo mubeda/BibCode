@@ -2636,6 +2636,15 @@ sizes. Cover relevant:
   [read-only list/detail/files smoke](#pull-requests-web-shell-validation) with
   route, selected tab and real patch evidence;
 - thread creation, switching, persistence, and streaming;
+- Mermaid diagrams in light and dark: a ` ```mermaid ` block in a streamed
+  reply shows its source until its closing fence arrives and then draws in
+  the code-block card with **Show source** and **Copy**; an invalid diagram
+  keeps its source under a line-numbered error; a drawn diagram recolors on a
+  theme switch without flashing its source; a selection copied from inside a
+  diagram pastes as its fenced source; the clipped Proposed Plan preview keeps
+  a fence it cut open as source; and a diagram drawing above the line being
+  read in the chat leaves that line in place (the maintained Mermaid scenario
+  below automates the rendered-file and timeline checks);
 - the [durable message queue](#durable-message-queue): FIFO cards, native steer,
   Cancel restoration, reload and restart persistence, promotion, Stop drain,
   holds, and unsupported-provider explanations;
@@ -2751,6 +2760,27 @@ by the native platform page, set
 `vp run test:ui:desktop` invocation. Retain its named `pierre-*.png` screenshots
 with the other bounded UI artifacts; do not put fixture state or screenshots in
 the repository.
+
+The maintained Mermaid scenario (`apps/desktop/e2e/specs/mermaid-diagrams.e2e.ts`)
+runs under the packaged app's production CSP and is part of the default suite.
+It writes valid, invalid and hostile diagram files into the fixture project and
+opens each in the Files rendered view: the valid diagram draws and recolors on
+a theme switch without its SVG being replaced, the invalid one shows its
+line-numbered error, and the hostile one leaves no `a`, `image`,
+`foreignObject`, `style`, `use` or `script` under `.chat-markdown-mermaid`, no
+`/mermaid-probe/` entry in `performance.getEntriesByType("resource")` (a
+same-origin load raises no CSP event) and no `securitypolicyviolation` event.
+The fixture Codex provider then answers its diagram prompts in the timeline: a
+**Show source** swap on a diagram inside the first visible row above the top
+edge, and on one in a row wholly above the viewport, moves a reading-anchor
+paragraph by at most 1 px; and after a reply with 101 diagrams, reopening the
+chat draws the evicted first diagram again through the queue without moving the
+reply's last line by more than 1 px. Rerun it alone with
+`BIBCODE_E2E_SPEC=./specs/mermaid-diagrams.e2e.ts`, and retain its
+`mermaid-*.png` screenshots with the other UI artifacts. In browser mode, check
+the same fixture files served by a release `bibcode` server in Chromium and
+Safari: the console shows no CSP violation and the server log no
+`/mermaid-probe/` request.
 
 At final packaged shutdown, inspect the raw worker and server logs. Provider and
 terminal owners, operational logs, orchestration, and the SQLite worker must all
