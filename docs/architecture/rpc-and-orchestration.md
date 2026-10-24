@@ -792,6 +792,72 @@ patch the panel already loaded:
   persisted per thread in `bibcode:diff-panel-state:v1`; the filters are kept
   in memory only.
 
+### Open with
+
+**Open with** hands a file, or every file of the scope, to a diff app through
+`git difftool` on the server's computer
+(`apps/server/src/production/diff_tool.rs`). Git owns each tool's arguments,
+its temporary pre-image files and the user's `difftool.<tool>.cmd`.
+
+- **`review.listDiffTools`** (`read_unary`, `review:write`, long-running) runs
+  `git difftool --tool-help` with `LC_ALL=C` and an empty `LANGUAGE`, so the
+  headings are stable, and a 30 s timeout. It keeps the first section only:
+  built-ins marked "(requires a graphical session)" and the `user-defined:`
+  entries, once each. The default is the first of `diff.guitool`,
+  `merge.guitool`, `diff.tool` and `merge.tool` whose value is listed, which is
+  Git's own `--gui` order, and `defaultSource` names the key. When Git
+  succeeds but nothing parses, the configured `diff.guitool` or `diff.tool` is
+  still offered. There is no server cache; the client keeps the list for ten
+  minutes per environment and `cwd` and asks for it when the pointer reaches
+  the button.
+- **`review.openDiffTool`** (`mutation_unary`, `orchestration:operate`, like
+  `shell.openInEditor`, long-running) builds
+  `git -C <cwd> difftool -y --trust-exit-code [--dir-diff] --tool=<id> [-M]
+  <revs> -- [paths]`. `--trust-exit-code` makes Git return the tool's
+  failure. The revisions come from the scope: `HEAD` for the working tree;
+  for a branch, the base (or the repository's default ref) resolved with
+  `rev-parse --verify --quiet --end-of-options <base>^{commit}`, then
+  `<base-oid>...HEAD`; for a turn, both checkpoint refs `^{commit}`, built
+  from the thread ID and turn counts. A rename passes both paths with `-M`.
+  Paths are checked lexically by `resolve_relative` and never against the
+  disk, so a deleted file, a rename's old path and a file only a base or a
+  checkpoint holds are valid; they follow `--` with `GIT_LITERAL_PATHSPECS=1`.
+  The tool ID matches `[A-Za-z0-9][A-Za-z0-9._-]*` and is passed only as the
+  value of `--tool=`. The environment adds `GIT_TERMINAL_PROMPT=0`, and the
+  AppImage environment is isolated.
+- **Launch.** Stdin and stdout are null and stderr goes to a log in the
+  temporary directory. The child has no kill-on-drop and starts in its own
+  process group, so a terminal's Ctrl+C to a standalone server does not reach
+  it; on Windows it uses `CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP |
+  CREATE_BREAKAWAY_FROM_JOB` and retries without breakaway when the job
+  forbids it. The server waits up to 1 s: an exit 0 or a process still running
+  returns `opened`, and a non-zero exit returns `ReviewDiffToolError` with
+  reason `launch-failed`, the last 2 KiB of stderr with the exit code, and the
+  command for **Copy command**. At most 16 launches run at once
+  (`too-many-open`), and a launch after shutdown began is `shutting-down`. A
+  reaper then waits for the exit, reports it, logs a late failure with the tool
+  ID and exit code only, deletes the log and drops the registration.
+- **Surviving shutdown.** A diff app holds the user's edits: the working-tree
+  side is the real file, and with `--dir-diff` Git copies an edited temporary
+  file back only when the tool exits. So the launcher registers each
+  `git difftool` with `register_identity` (`External`/`Helper`, label
+  `diff app`) and `survives_shutdown`. `freeze_and_snapshot_ownership`
+  leaves survivors out of the roots that ownership cleanup kills, and a
+  standalone server's cleanup of its own descendants spares each survivor and
+  its descendants, matched by start time so a reused PID is not spared. In
+  `quiesce_for_update` the launcher's `shutdown()` runs before ownership is
+  frozen: it stops accepting launches and cancels the reapers without
+  signalling their children, and keeps their registrations. A Windows job
+  that forbids breakaway still ends the app with BiBCode.
+- **Client.** The menu is enabled for the primary environment only, the gate
+  the header's **Open in** picker uses, and for a server with the
+  `reviewDiffTools` capability. A remote thread, an older server, an untracked
+  file and an empty list each show their reason in the menu. The default is
+  the server's `defaultToolId`, then `diffToolLastChoice` in `ClientSettings`,
+  then the first tool; VS Code is left out of folder comparisons. A remote
+  environment's diff app would need a `DesktopBridge` command that downloads
+  both versions, which is out of scope.
+
 ## Pull Requests contract boundary
 
 `packages/contracts/src/pullRequests.ts` defines the repository-scoped Pull

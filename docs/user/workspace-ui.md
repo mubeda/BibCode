@@ -989,6 +989,24 @@ two of them, the panel says so instead of showing no changes.
     with the reason. A working file that keeps changing says "This file is
     changing." with **Refresh**.
 
+**Open with** opens the changes in a diff app such as Beyond Compare, Meld,
+KDiff3, WinMerge or FileMerge, through `git difftool`. In Changes, the
+toolbar's **Open with** opens every file of the scope. In Compare, the one
+beside the file opens that file, and **All files in** opens every file. The
+menu lists the apps Git finds on the computer, including your own
+`difftool.<tool>.cmd`, with the default marked: the one `git config
+diff.guitool` or `diff.tool` names, then the last one you chose, then the
+first listed. A failed launch shows Git's message with **Copy command**, so
+you can run it yourself. The app stays open when BiBCode quits, so unsaved
+edits in it are kept.
+
+- It works for threads on this computer only. For another environment the menu
+  says where the thread runs.
+- Untracked files can't open on their own; stage one to compare it.
+- With no app found, the menu says to install one or set
+  `git config diff.tool`.
+- In a browser, the app opens on the computer running the server.
+
 The view, the layout, the line filter and the context count are remembered
 across restarts, and Compare remembers the selected file for each thread. Its
 filters reset when the page reloads, so it never opens with files hidden.
@@ -1552,6 +1570,11 @@ The Files surface is a full file manager for the active workspace:
   changed lines only.
 - In Compare, a line comment can start only on a line that is part of Git's
   default hunks, the same lines Changes shows.
+- **Open with** is not available for remote environments, and it opens the
+  current versions in Git, not the exact patch the panel loaded. A diff app
+  that returns at once may find Git's temporary copy already gone. On Windows,
+  a diff app still open in a worktree keeps that worktree from being removed,
+  and a job that forbids breakaway closes the app with BiBCode.
 
 - Device previews run one Android emulator and one iOS simulator at a time per
   environment, and iOS simulators only on macOS servers. iOS takes a single
