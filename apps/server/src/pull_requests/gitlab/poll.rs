@@ -1499,6 +1499,7 @@ case "$1 $2" in
     if [ -e list-signed-out ]; then echo 'HTTP 401' >&2; exit 1; fi
     cat list.json ;;
   'api -i') if [ -e totals-rate-limited ]; then echo 'HTTP 429' >&2; exit 1; fi
+    if [ -e totals-signed-out ]; then echo 'HTTP 401' >&2; exit 1; fi
     printf 'HTTP/2 200 OK\r\nx-total: 0\r\n\r\n[]' ;;
   'api projects/gitlab-org%2Fcli/merge_requests/3941/approvals') cat approvals.json ;;
   'api projects/gitlab-org%2Fcli/merge_requests/3941/reviewers') cat reviewers.json ;;
@@ -2682,6 +2683,42 @@ esac
         }
         for subscriber in &subs {
             let error = subscriber.result.clone().unwrap().unwrap_err();
+            assert_eq!(error.code, "not_authenticated");
+        }
+        tick(&mut subs, 60).await;
+        assert_eq!(lists(&b.s), 1, "the ended poller reads nothing more");
+    }
+
+    /// A sign-in failure on the totals read, which follows a good list read,
+    /// ends the poller like one on any other read.
+    #[tokio::test(start_paused = true)]
+    async fn gitlab_poller_auth_failure_on_the_totals_read_ends_every_subscriber() {
+        let b = bench().await;
+        fs::write(b.s.path("totals-signed-out"), "").unwrap();
+        let (log1, log2) = (Log::default(), Log::default());
+        let (emit1, emit2) = (emitter(&log1), emitter(&log2));
+        let c = CancellationToken::new();
+        let mut subs = [
+            b.subscriber(Some(3941), Some(SubscribeTab::Conversation), &emit1, &c),
+            b.subscriber(None, None, &emit2, &c),
+        ];
+        drive(&mut subs).await;
+        tokio::time::advance(Duration::from_secs(10)).await;
+        for _ in 0..5000 {
+            poll_all(&mut subs).await;
+            if subs_done(&subs) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+            tokio::task::yield_now().await;
+        }
+        assert!(count(&b.s, "api -i") >= 1, "the totals were read");
+        for subscriber in &subs {
+            let error = subscriber
+                .result
+                .clone()
+                .expect("the poller ended")
+                .unwrap_err();
             assert_eq!(error.code, "not_authenticated");
         }
         tick(&mut subs, 60).await;

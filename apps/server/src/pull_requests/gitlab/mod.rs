@@ -236,13 +236,19 @@ impl GitLabHost {
         // Independent host round trips: read the three totals together.
         let (open, closed, merged) =
             tokio::join!(total("opened"), total("closed"), total("merged"));
-        // A 429 on any of them reaches the caller, so the poller backs off.
+        // A 429 or a sign-in failure on any of them reaches the caller, so
+        // the poller backs off or ends instead of keeping old totals.
         let errors = [&open, &closed, &merged];
-        if let Some(Err(error)) = errors
-            .iter()
-            .find(|result| matches!(result, Err(error) if error.code == "rate_limited"))
-        {
-            return Err(error.clone());
+        for codes in [
+            &["rate_limited"][..],
+            &["not_authenticated", "forbidden"][..],
+        ] {
+            if let Some(Err(error)) = errors
+                .iter()
+                .find(|result| matches!(result, Err(error) if codes.contains(&error.code)))
+            {
+                return Err(error.clone());
+            }
         }
         Ok(ListCounts {
             open: Some(open?),
@@ -280,7 +286,14 @@ impl GitLabHost {
                     .await
                 {
                     Ok(counts) => Some(counts),
-                    Err(error) if matches!(error.code, "rate_limited" | "timeout") => {
+                    // A 429 backs the poller off, and a sign-in failure ends
+                    // it; only another failure keeps the last good totals.
+                    Err(error)
+                        if matches!(
+                            error.code,
+                            "rate_limited" | "timeout" | "not_authenticated" | "forbidden"
+                        ) =>
+                    {
                         return Err(error);
                     }
                     Err(_) => cached.as_ref().map(|(_, counts)| counts.clone()),
