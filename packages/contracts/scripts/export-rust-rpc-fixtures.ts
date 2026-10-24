@@ -200,6 +200,7 @@ const fixtureEnvironmentDescriptor = {
     worktreeCatalogRefreshReason: true,
     vcsStatusSummary: true,
     deviceCatalogRefresh: true,
+    cliSessionHistory: true,
     activityProtocolVersion: 2,
   },
 } as const;
@@ -978,8 +979,8 @@ for (const rpc of [...WsRpcGroup.requests.values()].toSorted((left, right) =>
   }
 }
 
-if (methods.length !== 159) {
-  throw new Error(`Expected 159 active RPC methods, found ${methods.length}.`);
+if (methods.length !== 161) {
+  throw new Error(`Expected 161 active RPC methods, found ${methods.length}.`);
 }
 const streamMethodCount = methods.filter(({ mode }) => mode === "stream").length;
 if (streamMethodCount !== 24) {
@@ -995,8 +996,8 @@ if (streamShapeFixtures.length !== topLevelStreamShapeCount) {
     `Exported ${streamShapeFixtures.length} stream shape fixtures, expected ${topLevelStreamShapeCount}.`,
   );
 }
-if (typedFailureFixtures.length !== 337) {
-  throw new Error(`Expected 337 typed failure fixtures, found ${typedFailureFixtures.length}.`);
+if (typedFailureFixtures.length !== 341) {
+  throw new Error(`Expected 341 typed failure fixtures, found ${typedFailureFixtures.length}.`);
 }
 if (orchestrationEventShapeCount !== 24) {
   throw new Error(`Expected 24 orchestration event shapes, found ${orchestrationEventShapeCount}.`);

@@ -111,6 +111,10 @@ describe("execution environment contracts", () => {
       true,
     );
   });
+  it("defaults terminal session History off for older servers and preserves advertised support", () => {
+    expect(decodeTerminalCapabilities({}).cliSessionHistory).toBe(false);
+    expect(decodeTerminalCapabilities({ cliSessionHistory: true }).cliSessionHistory).toBe(true);
+  });
   it("pins the remote protocol window constants", () => {
     expect(REMOTE_PROTOCOL_VERSION).toBe(1);
     expect(MIN_COMPATIBLE_REMOTE_PROTOCOL).toBe(1);

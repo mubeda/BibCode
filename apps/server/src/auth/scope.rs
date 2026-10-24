@@ -80,9 +80,11 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         | "vcs.refreshStatus"
         | "vcs.refreshWorktreeCatalog"
         | "worktree.getRemovalPlan" => Some(SCOPE_ORCHESTRATION_READ),
-        // Scan reads CLI transcripts (first prompts included) from the server host's home
-        // directory, outside BiBCode's data, so read-only credentials must not see them.
+        // Scan and History read CLI transcripts (first prompts included) from the server host's
+        // home directory, outside BiBCode's data, so read-only credentials must not see them.
         "agentSessions.import"
+        | "agentSessions.listForThread"
+        | "agentSessions.openInPanel"
         | "agentSessions.scan"
         | "git.preparePullRequestThread"
         | "git.resolvePullRequest"
@@ -228,6 +230,14 @@ mod tests {
         );
         assert_eq!(
             required_scope("agentSessions.import"),
+            Some(SCOPE_ORCHESTRATION_OPERATE)
+        );
+        assert_eq!(
+            required_scope("agentSessions.listForThread"),
+            Some(SCOPE_ORCHESTRATION_OPERATE)
+        );
+        assert_eq!(
+            required_scope("agentSessions.openInPanel"),
             Some(SCOPE_ORCHESTRATION_OPERATE)
         );
         assert_eq!(

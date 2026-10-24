@@ -52,7 +52,10 @@ project's workspace root after canonicalization, whose file changed in the last
 carries title, last activity and visible message count. `alreadyImported` is set
 once thread `import:<instanceId>:<sessionId>` was deleted or its history command
 was accepted, and `threadId` names that thread while it is live; an import
-interrupted before its history committed stays selectable. Sessions another
+interrupted before its history committed stays selectable. `hostThreadId` is
+set when that thread is a chat panel (a session continued from History), so the
+dialog's **Open** shows the host with the panel active. Sessions run in a
+worktree are not matched here; they belong to the worktree thread's History. Sessions another
 BiBCode thread already runs (a `provider_turn_outbox.provider_session_id` or a
 `provider_session_runtime` cursor owned by a thread other than their import)
 are left out, because BiBCode's own conversations write into the same homes;
@@ -85,6 +88,92 @@ partial failure replays the committed steps; an accepted history command marks
 the session imported. A deleted import keeps its thread ID and is skipped
 rather than recreated. `thread.history.import` is rejected by public
 `orchestration.dispatchCommand` like every other server-internal command.
+
+### Terminal sessions in History
+
+`agentSessions.listForThread { threadId }` and
+`agentSessions.openInPanel { commandId, hostThreadId, sessionId, mode }` serve
+the composer's **History** menu. Both require `orchestration:operate`, fail
+with `AgentSessionsError { message }` (fixed texts, never transcript content),
+and exist only on servers that advertise the `cliSessionHistory` capability
+(decoded `false` when absent); a client shows an older server's thread only
+its closed chats. They read only the built-in `claudeAgent` instance's config
+directory; when that instance is off they fail with "Claude Code is turned off
+on the server. Turn it on in Settings → Providers."
+
+**List.** The server resolves the folder from the thread row: the thread, or
+its host when it is a chat panel; the host's worktree, else the project's
+workspace root. The client names no path. Listing reads the entry names of
+`<config dir>/projects/` and keeps the directories that encode the folder or
+its canonical path (a name Claude shortened past 200 characters matches by its
+first 200), then stats only their `*.jsonl` files within the 30-day window.
+One request opens at most 1,000 transcripts and reads at most 64 MiB; a file
+whose stem is not a resumable UUID, is owned by another BiBCode thread, or was
+seen already is rejected by name without being opened. Per transcript, newest
+first, until 200 rows or the budget runs out (`truncated`):
+
+- a head read takes the first cwd, which must match the folder, and the first
+  `entrypoint`, which must be `cli` or absent; it stops at the first record
+  that excludes the session (`sdk-*`, including BiBCode's own `sdk-rust`,
+  `claude-desktop`, or any other) or at the first visible prompt;
+- a tail read of the last 64 KiB takes the last `customTitle`, `aiTitle` and
+  `gitBranch`; when it holds no title, a backward walk in 256 KiB steps
+  searches the raw bytes for a buried `custom-title` or `aiTitle`, parsing only
+  the matching line, within 16 MiB of the budget;
+- the title is the last custom title, then the AI title, then the first prompt
+  line (100 characters), then "Untitled session".
+
+Liveness reads `<config dir>/sessions/*.json` once (at most 256 files of
+64 KiB, fields `sessionId`, `pid` and `entrypoint`): a file naming the session
+whose process runs makes it `live`; BiBCode's own `sdk-rust` entries are
+skipped. Only a complete read makes the rest `closed`; a missing or unreadable
+directory, more than 256 files, or one file that is unreadable, unparsable or
+oversized leaves every session not found live `unknown`. Claude Code keeps
+the directory once it created it (observed on macOS with 2.1.310), so a
+missing one means a version that writes none. Each row also reports
+`importedThread { threadId, hostThreadId, archived, resumeRefused }` for an
+import whose history committed, or `importDeleted`. `copySupported` is whether
+the published provider inventory's Claude version is 2.0.73 or later. The read
+runs off the async runtime and stops between files and records once the RPC is
+cancelled, which a closed menu does.
+
+**Open** creates a chat panel of the host and returns
+`{ threadId, hostThreadId, outcome: created | existing }`:
+
+1. It reads the host (live, not a panel) and resolves the folder as listing
+   does. A copy (`mode: fork`) is refused unless `copySupported`.
+2. The thread ID is `import:claudeAgent:<sessionId>` to resume, or
+   `copy:claudeAgent:<forkId>` for a copy, where `forkId` is a UUID v4 taken
+   from a SHA-256 of a fixed domain string, the command ID and the session ID:
+   a retry with the same command ID reaches the same copy, every other command
+   makes a new one. Because a copy's thread is not an import of `forkId`, the
+   owner filter leaves the copy out of History and the Import dialog once its
+   transcript exists beside the source's.
+3. A thread with that ID whose history committed returns `existing` with its
+   own host (`null` for a sidebar thread); one in another project is refused;
+   a deleted resume thread is refused ("This session's chat was deleted. Choose
+   Continue in a copy."); an interrupted import finishes and keeps its own kind
+   and host.
+4. It reloads the transcript through the folder's directories (walking every
+   project only when they do not hold it), keeps only a terminal session, and
+   for a resume checks liveness again: `live` or `unknown` is refused ("This
+   session is open in a terminal. Choose Continue in a copy."). This read takes
+   no lock.
+5. Under the project mutation lock it re-reads the host and requires the folder
+   from step 1 ("This thread's folder changed. Try again."), then dispatches
+   `thread.create` as `<threadId>:create` with `kind: panel`, the host's ID,
+   branch, worktree and runtime mode, interaction mode `default`, the import's
+   model selection, and the session's title (`<title> (copy)` for a copy). The
+   engine refuses a panel whose host was deleted meanwhile ("The thread was
+   deleted.", see the
+   [worktree catalog](./worktree-catalog.md#discovery-policy-and-adoption)).
+6. It inserts the suspended runtime row in the host's runtime mode with cursor
+   `{"sessionId": id}`, or `{"sessionId": forkId, "forkedFrom": sessionId}`
+   for a copy, and dispatches `thread.history.import` as `<threadId>:history`,
+   as import does.
+
+Closing the menu does not cancel an open in flight; two clients resuming one
+session reach the same thread, and the later one gets `existing`.
 
 ## Session establishment
 
@@ -2939,8 +3028,11 @@ the monotonic clock, each holding 100 log-scale buckets that grow by a factor of
   `server.updateProvider`, `server.refreshProviders`, and
   `server.refreshProviderUsage`; `worktree.createManaged` and `worktree.remove`
   (which deletes the whole tree, dependencies and build output included); and
-  `agentSessions.import`. They still emit `rpc.timing`, but never raise
-  `rpc.slow` or count toward saturation.
+  `agentSessions.import` and `agentSessions.openInPanel` (a whole transcript
+  read and a wait on the project mutation lock). `agentSessions.listForThread`
+  stays out: its per-request budget bounds it, so a slow listing is a finding.
+  They still emit `rpc.timing`, but never raise `rpc.slow` or count toward
+  saturation.
 - **Hangs.** Each 5 s tick checks the unary requests still in flight. One past
   its budget, 10 s or 300 s for a long-running method, raises one `rpc.hang`
   finding (error) before it finishes. Streams are log-only and never hang-checked,

@@ -25,6 +25,7 @@ pub mod remote_update_rpc;
 mod repository_identity;
 pub mod runtime;
 pub mod server_terminal;
+pub mod step_gate;
 pub mod transfer_routes;
 pub mod turn_delivery;
 pub mod uploads_rpc;

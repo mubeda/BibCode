@@ -105,11 +105,11 @@ fn model_from_initialization(value: &Value) -> Option<Value> {
     Some(model(slug, &name, descriptors))
 }
 
-fn supports(version: Option<[u64; 3]>, minimum: [u64; 3]) -> bool {
+pub(crate) fn supports(version: Option<[u64; 3]>, minimum: [u64; 3]) -> bool {
     version.is_some_and(|version| version >= minimum)
 }
 
-fn semantic_version(value: &str) -> Option<[u64; 3]> {
+pub(crate) fn semantic_version(value: &str) -> Option<[u64; 3]> {
     value
         .split(|character: char| !(character.is_ascii_digit() || character == '.'))
         .filter(|candidate| !candidate.is_empty())
