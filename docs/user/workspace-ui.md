@@ -811,6 +811,11 @@ labelled browser links without loading avatars or image URLs. File diffs load
 near the viewport,
 with **Viewed** saved per request, a local **Ignore whitespace** toggle, and
 host links for unavailable or oversized content and a Binary file fallback.
+When the detail is wide enough to show the file list beside the diffs, drag the
+divider between them, or focus it and use the arrow keys, Home and End, to
+resize the list. The width is remembered in this browser; a narrower window
+shrinks the list only until there is room again, and double-clicking the
+divider restores the default.
 
 ### Checkout for local verification
 
