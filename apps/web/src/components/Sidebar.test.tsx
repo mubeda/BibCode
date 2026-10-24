@@ -743,6 +743,7 @@ staticDescribe("Sidebar full render", () => {
     expect(markup).toContain(`data-testid="environment-card-header-${ENV_REMOTE}"`);
     expect(markup).toContain("2 environments");
     expect(markup).toContain("Repositories · all environments");
+    // Read-only apart from Pull Requests: no menu, rename, remove or drag.
     expect(markup).not.toContain('data-testid="repository-group-actions"');
     // The view always groups by repository, so the sort menu offers no grouping choice.
     expect(markup).not.toContain("Group projects");
@@ -3645,6 +3646,57 @@ staticDescribe("grouped and remote projects", () => {
       to: "/project/$environmentId/$projectId/pull-requests",
       params: { environmentId: ENV_REMOTE, projectId: ProjectId.make("project-a-remote") },
     });
+  });
+
+  it("puts one Pull Requests button on the repository row, not its environment rows", () => {
+    groupedScenario();
+    h.uiStore.setState({ sidebarView: "repositories" });
+    render(<Sidebar />);
+    expect(findProps(byTestId("pull-requests-button"))).toBeNull();
+    expect(
+      captured("TooltipTrigger").filter(
+        (entry) =>
+          (entry.props["render"] as React.ReactElement<Record<string, unknown>> | undefined)?.props[
+            "data-testid"
+          ] === "repository-pull-requests-button",
+      ),
+    ).toHaveLength(1);
+    expect(
+      mustFindProps(byAriaLabel("Pull Requests for repo-a"), "repository Pull Requests button"),
+    ).toBeDefined();
+  });
+
+  it("opens the chosen environment's Pull Requests from the repository row", async () => {
+    groupedScenario();
+    h.uiStore.setState({ sidebarView: "repositories" });
+    render(<Sidebar />);
+    fakeLocalApi();
+    h.spies.contextMenuShow.mockImplementation(
+      async (items: Array<{ id: string }>) => items[1]!.id,
+    );
+
+    const click = mouseEvent();
+    invoke(
+      mustFindProps(byTestId("repository-pull-requests-button"), "repository Pull Requests button"),
+      "onClick",
+      click,
+    );
+    await flush();
+
+    expect(click.stopPropagation).toHaveBeenCalled();
+    expect(h.spies.contextMenuShow).toHaveBeenCalled();
+    expect(h.spies.navigate).toHaveBeenCalledWith({
+      to: "/project/$environmentId/$projectId/pull-requests",
+      params: { environmentId: ENV_REMOTE, projectId: ProjectId.make("project-a-remote") },
+    });
+  });
+
+  it("hides the repository row's Pull Requests button when disabled in settings", () => {
+    groupedScenario();
+    h.uiStore.setState({ sidebarView: "repositories" });
+    h.state.clientSettings.pullRequestsEnabled = false;
+    render(<Sidebar />);
+    expect(findProps(byTestId("repository-pull-requests-button"))).toBeNull();
   });
 
   it("does not navigate when the grouped-project picker is unavailable or cancelled", async () => {
