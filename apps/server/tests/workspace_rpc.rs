@@ -1630,6 +1630,65 @@ async fn concurrent_guarded_writes_from_one_base_let_exactly_one_through() {
     }
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn a_named_pipe_in_place_of_an_open_file_is_refused_without_blocking() {
+    /// Opening a pipe with no writer for reading blocks; the request must not get that far. If it
+    /// does, a writer releases the blocked reader so the test fails instead of hanging.
+    async fn returns_without_blocking<T>(
+        fifo: &Path,
+        request: impl std::future::Future<Output = T>,
+    ) -> T {
+        match tokio::time::timeout(Duration::from_secs(5), request).await {
+            Ok(output) => output,
+            Err(_) => {
+                let fifo = fifo.to_path_buf();
+                std::thread::spawn(move || {
+                    drop(std::fs::OpenOptions::new().write(true).open(fifo))
+                });
+                panic!("the request blocked opening a named pipe");
+            }
+        }
+    }
+
+    let root = TempDir::new().expect("root");
+    let cwd = path_string(root.path());
+    let fifo_path = root.path().join("notes.txt");
+    let fifo = std::process::Command::new("mkfifo")
+        .arg(&fifo_path)
+        .output()
+        .expect("mkfifo starts");
+    assert!(fifo.status.success(), "mkfifo failed");
+    let rpc = WorkspaceRpc::new(WorkspaceService::default());
+
+    let version = returns_without_blocking(
+        &fifo_path,
+        rpc.handle(
+            "projects.getFileVersion",
+            json!({ "cwd": cwd, "relativePath": "notes.txt" }),
+        ),
+    )
+    .await
+    .expect_err("a pipe is not a file");
+    assert_eq!(version["_tag"], "ProjectReadFileError");
+    assert_eq!(version["failure"], "path_not_file");
+
+    let write = returns_without_blocking(
+        &fifo_path,
+        write_if_unchanged(
+            &rpc,
+            &cwd,
+            "notes.txt",
+            "mine\n",
+            json!({ "_tag": "version", "version": sha256_hex(b"base\n") }),
+        ),
+    )
+    .await
+    .expect_err("a pipe is not a file");
+    assert_eq!(write["_tag"], "ProjectWriteFileError");
+    assert_eq!(write["failure"], "path_not_file");
+}
+
 #[tokio::test]
 async fn workspace_rpc_rejects_every_malformed_input_shape_and_unknown_methods() {
     let rpc = WorkspaceRpc::new(WorkspaceService::default());

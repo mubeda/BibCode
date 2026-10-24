@@ -103,6 +103,20 @@ enum ScannedFile {
 ///
 /// `binary` matches `read_file`'s test: a NUL byte within the first read-limit bytes.
 fn scan_file_blocking(path: &Path) -> Result<ScannedFile, WorkspaceError> {
+    // Stat before opening, as `read_file` does: opening a named pipe with no writer for reading
+    // blocks, so a pipe put in place of the file would stall every check and guarded save.
+    match std::fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => {
+            return Err(WorkspaceError::NotFile {
+                path: path.to_path_buf(),
+            });
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ScannedFile::Missing);
+        }
+        Err(error) => return Err(WorkspaceError::operation("stat", path, error)),
+    }
     let mut file = match std::fs::File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -110,14 +124,6 @@ fn scan_file_blocking(path: &Path) -> Result<ScannedFile, WorkspaceError> {
         }
         Err(error) => return Err(WorkspaceError::operation("open", path, error)),
     };
-    let metadata = file
-        .metadata()
-        .map_err(|error| WorkspaceError::operation("stat", path, error))?;
-    if !metadata.is_file() {
-        return Err(WorkspaceError::NotFile {
-            path: path.to_path_buf(),
-        });
-    }
     let mut hasher = Sha256::new();
     let mut buffer = vec![0_u8; VERSION_SCAN_CHUNK_BYTES];
     let mut byte_length = 0_u64;
@@ -155,24 +161,30 @@ async fn scan_file(path: PathBuf) -> Result<ScannedFile, WorkspaceError> {
 
 /// One lock per canonical file path, so a guarded write's check and write are atomic against
 /// every other write BiBCode makes to that file. Entries are dropped once nobody holds them.
+///
+/// Keys ignore case. An existing path canonicalizes to its on-disk spelling, but a missing one
+/// keeps the caller's, and on a case-insensitive volume (the default on Windows and macOS) two
+/// spellings name one file. Folding costs nothing on a case-sensitive volume beyond making
+/// writes to names that differ only in case wait for each other.
 #[derive(Clone, Default)]
 struct PathLocks {
-    locks: Arc<StdMutex<HashMap<PathBuf, Weak<Mutex<()>>>>>,
+    locks: Arc<StdMutex<HashMap<String, Weak<Mutex<()>>>>>,
 }
 
 impl PathLocks {
     async fn lock(&self, path: &Path) -> OwnedMutexGuard<()> {
+        let key = path.to_string_lossy().to_lowercase();
         let lock = {
             let mut locks = self
                 .locks
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             locks.retain(|_, lock| lock.strong_count() > 0);
-            match locks.get(path).and_then(Weak::upgrade) {
+            match locks.get(&key).and_then(Weak::upgrade) {
                 Some(lock) => lock,
                 None => {
                     let lock = Arc::new(Mutex::new(()));
-                    locks.insert(path.to_path_buf(), Arc::downgrade(&lock));
+                    locks.insert(key, Arc::downgrade(&lock));
                     lock
                 }
             }
@@ -664,6 +676,66 @@ mod tests {
             second,
             Err(WorkspaceError::FileChangedOnDisk { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn guarded_writes_to_spellings_of_one_missing_file_share_its_lock() {
+        // Only an existing path canonicalizes to its on-disk spelling; a missing one keeps the
+        // caller's. On a case-insensitive volume both names below are one file, so the second
+        // write must not pass its absence check while the first is between check and write.
+        let root = TempDir::new().unwrap();
+        let (entered, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let release = Arc::new(Semaphore::new(0));
+        let service = WorkspaceService::default().with_write_hook_for_test(Arc::new(
+            HoldAfterPreconditionCheck {
+                entered,
+                release: release.clone(),
+            },
+        ));
+        let recreate = |relative_path: &'static str| {
+            let service = service.clone();
+            let root = root.path().to_path_buf();
+            tokio::spawn(async move {
+                service
+                    .write_file_if_unchanged(
+                        &root,
+                        relative_path,
+                        relative_path,
+                        &WritePrecondition::Missing,
+                    )
+                    .await
+                    .map(|outcome| outcome.version)
+            })
+        };
+
+        let first = recreate("docs/Notes.txt");
+        entered_rx
+            .recv()
+            .await
+            .expect("first write passed its check");
+        let second = recreate("docs/notes.txt");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), entered_rx.recv())
+                .await
+                .is_err(),
+            "a second spelling of the missing file passed its check while the first held it"
+        );
+
+        release.add_permits(2);
+        first.await.unwrap().unwrap();
+        let second = second.await.unwrap();
+        if root.path().join("docs/notes.txt").exists()
+            && std::fs::read(root.path().join("docs/notes.txt")).unwrap() == b"docs/Notes.txt"
+        {
+            // Case-insensitive: the second write found the first one's file and was refused.
+            assert!(matches!(
+                second,
+                Err(WorkspaceError::FileChangedOnDisk { .. })
+            ));
+        } else {
+            // Case-sensitive: two distinct files, both created.
+            second.unwrap();
+        }
     }
 
     #[test]
