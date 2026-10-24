@@ -21,6 +21,7 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
     match method {
         "assets.createUrl"
         | "device.createMediaTicket"
+        | "device.refreshCatalog"
         | "device.subscribeCatalog"
         | "device.subscribeFrames"
         | "filesystem.browse"
@@ -309,6 +310,7 @@ mod tests {
         }
         for (method, scope) in [
             ("device.subscribeCatalog", SCOPE_ORCHESTRATION_READ),
+            ("device.refreshCatalog", SCOPE_ORCHESTRATION_READ),
             ("device.subscribeFrames", SCOPE_ORCHESTRATION_READ),
             ("device.createMediaTicket", SCOPE_ORCHESTRATION_READ),
             ("device.open", SCOPE_ORCHESTRATION_OPERATE),

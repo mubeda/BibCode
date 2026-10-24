@@ -69,6 +69,7 @@ pub const ACTIVE_RPC_METHODS: &[RpcMethodSpec] = &[
     read_unary("device.createMediaTicket"),
     mutation_unary("device.input"),
     mutation_unary("device.open"),
+    read_unary("device.refreshCatalog"),
     mutation_unary("device.rotate"),
     read_stream("device.subscribeCatalog"),
     read_stream("device.subscribeFrames"),
@@ -266,7 +267,9 @@ mod tests {
         ] {
             assert!(ACTIVE_RPC_METHODS.contains(&mutation_unary(name)), "{name}");
         }
-        assert!(ACTIVE_RPC_METHODS.contains(&read_unary("device.createMediaTicket")));
+        for name in ["device.createMediaTicket", "device.refreshCatalog"] {
+            assert!(ACTIVE_RPC_METHODS.contains(&read_unary(name)), "{name}");
+        }
     }
 
     #[test]

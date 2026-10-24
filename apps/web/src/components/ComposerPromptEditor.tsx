@@ -25,6 +25,7 @@ import {
   KEY_ARROW_UP_COMMAND,
   KEY_DOWN_COMMAND,
   KEY_ENTER_COMMAND,
+  KEY_ESCAPE_COMMAND,
   KEY_TAB_COMMAND,
   COMMAND_PRIORITY_HIGH,
   KEY_BACKSPACE_COMMAND,
@@ -1090,7 +1091,14 @@ interface ComposerPromptEditorProps {
 }
 
 /** Keys the composer may claim before the editor handles them. */
-export type ComposerCommandKey = "ArrowDown" | "ArrowUp" | "Enter" | "Tab" | "PageUp" | "PageDown";
+export type ComposerCommandKey =
+  | "ArrowDown"
+  | "ArrowUp"
+  | "Enter"
+  | "Tab"
+  | "Escape"
+  | "PageUp"
+  | "PageDown";
 
 /**
  * Whether a page key still has work in the draft, so the editor keeps it: a range is selected,
@@ -1176,6 +1184,8 @@ function ComposerCommandKeyPlugin(props: {
         event.stopPropagation();
         return true;
       }
+      // Escape during IME composition cancels the composition, not the menu.
+      if (key === "Escape" && event.isComposing) return false;
 
       const handled = props.onCommandKeyDown(key, event);
       if (handled) {
@@ -1216,6 +1226,11 @@ function ComposerCommandKeyPlugin(props: {
           : false,
       COMMAND_PRIORITY_HIGH,
     );
+    const unregisterEscape = editor.registerCommand(
+      KEY_ESCAPE_COMMAND,
+      (event) => handleCommand("Escape", event),
+      COMMAND_PRIORITY_HIGH,
+    );
 
     return () => {
       unregisterArrowDown();
@@ -1223,6 +1238,7 @@ function ComposerCommandKeyPlugin(props: {
       unregisterEnter();
       unregisterTab();
       unregisterPageKeys();
+      unregisterEscape();
     };
   }, [editor, props]);
 

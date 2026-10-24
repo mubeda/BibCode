@@ -568,6 +568,7 @@ export const WS_METHODS = {
 
   // Device preview methods
   deviceSubscribeCatalog: "device.subscribeCatalog",
+  deviceRefreshCatalog: "device.refreshCatalog",
   deviceOpen: "device.open",
   deviceClose: "device.close",
   deviceInput: "device.input",
@@ -1609,6 +1610,12 @@ export const WsDeviceSubscribeCatalogRpc = Rpc.make(WS_METHODS.deviceSubscribeCa
   stream: true,
 });
 
+/** Reruns device discovery now, past its 30 s cache; changes arrive on the catalog stream. */
+export const WsDeviceRefreshCatalogRpc = Rpc.make(WS_METHODS.deviceRefreshCatalog, {
+  payload: Schema.Struct({}),
+  error: DeviceRpcFailure,
+});
+
 export const WsDeviceOpenRpc = Rpc.make(WS_METHODS.deviceOpen, {
   payload: DeviceOpenInput,
   success: DeviceOpenResult,
@@ -1993,6 +2000,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsPreviewAutomationRespondRpc,
   WsPreviewAutomationFocusHostRpc,
   WsDeviceSubscribeCatalogRpc,
+  WsDeviceRefreshCatalogRpc,
   WsDeviceOpenRpc,
   WsDeviceCloseRpc,
   WsDeviceInputRpc,

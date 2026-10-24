@@ -21,7 +21,8 @@
             "worktreeCatalog": true,
             "worktreeCatalogRefreshReason": true,
             "vcsStatusSummary": true,
-            "activityProtocolVersion": 2
+            "activityProtocolVersion": 2,
+            "deviceCatalogRefresh": true
           }
         },
         "auth": {

@@ -157,8 +157,14 @@ elsewhere it stays visible but disabled, with a note explaining that a new
 branch will be created from it through the server's safe suffixed-branch flow.
 If the branch list fails to load, the dialog says so and a typed name still
 creates a new branch. Edited names are preserved. Typing an exact local
-or remote branch selects that ref without repeating the same value as a result
-row below the input. If the chosen remote branch becomes local before submit,
+or remote branch selects that ref and hides the result rows below the input.
+Picking a row fills the field with that branch, which closes the list the same
+way; editing the field clears the choice and brings the rows back. In Smart, a
+field that exactly names a branch is that branch even when the name is a number
+such as `2026`; type `#2026` for the GitHub item instead. The field is
+the choice, so it survives reopening the dialog for the same project and
+switching between Smart and Branch; opening the dialog for another project
+clears it. If the chosen remote branch becomes local before submit,
 the server reuses it when free and still suffixes it when another worktree owns
 it.
 
@@ -1289,7 +1295,12 @@ says why (for example Android SDK not found, no virtual devices, Xcode not
 found, or no simulators) and what to do; the other platform still works. A
 simulator already running outside BiBCode, for example in Xcode's Simulator
 app, is listed as "— Running outside BiBCode" and cannot be picked: shut it
-down there first.
+down there first. The list is read when the panel opens and kept for 30
+seconds; after creating a device in Android Studio or Xcode, choose **Refresh
+devices** (the circular-arrows button beside the list, or the button under the
+message when no device can start yet) to see it without restarting BiBCode.
+A server running an older BiBCode has no **Refresh devices**; close and reopen
+the panel after 30 seconds instead.
 
 **Use it.** Pick a device and choose **Start**. The state pill moves through
 **Starting…** and **Booting…** to **Ready**; a first boot can take a few

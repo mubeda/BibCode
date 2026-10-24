@@ -11,19 +11,26 @@ export interface DevicePreviewsAvailability {
   readonly supported: boolean;
   /** `enableDevicePreviews` is on. */
   readonly enabled: boolean;
+  /**
+   * The server has `device.refreshCatalog` (the `deviceCatalogRefresh` capability). An older
+   * server answers an unknown method with a defect that breaks the whole RPC session.
+   */
+  readonly catalogRefresh: boolean;
 }
 
 export function devicePreviewsAvailability(
   serverConfig: ServerConfig | null | undefined,
 ): DevicePreviewsAvailability {
   if (serverConfig === null || serverConfig === undefined) {
-    return { known: false, supported: false, enabled: false };
+    return { known: false, supported: false, enabled: false, catalogRefresh: false };
   }
-  const supported = serverConfig.environment.capabilities.devicePreviews === true;
+  const { capabilities } = serverConfig.environment;
+  const supported = capabilities.devicePreviews === true;
   return {
     known: true,
     supported,
     enabled: supported && serverConfig.settings.enableDevicePreviews === true,
+    catalogRefresh: supported && capabilities.deviceCatalogRefresh === true,
   };
 }
 
