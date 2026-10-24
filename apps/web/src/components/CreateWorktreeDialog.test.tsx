@@ -92,6 +92,7 @@ interface CapturedButtonProps {
 }
 
 interface CapturedInputProps {
+  readonly ref?: React.Ref<HTMLInputElement>;
   readonly placeholder?: string;
   readonly value?: string;
   readonly onChange?: (event: { target: { value: string } }) => void;
@@ -239,6 +240,7 @@ vi.mock("./ui/input", () => ({
     captured.inputs.push(props);
     return (
       <input
+        ref={props.ref}
         value={props.value}
         placeholder={props.placeholder}
         readOnly={typeof document === "undefined"}
@@ -1474,6 +1476,96 @@ if (browserRuntime) {
       container.remove();
     });
 
+    it("closes the branch list on a pick and shows the branch in the field (#151)", async () => {
+      testState.refs = [{ name: "main" }, { name: "feature-PFS-2272-alpha" }];
+      const { container, root } = await mountDialog();
+      const rowsNamed = (name: string) =>
+        Array.from(container.querySelectorAll("button")).filter(
+          (button) => button.textContent?.trim() === name,
+        );
+
+      await React.act(async () => requiredButton(container, "Branch").click());
+      const sourceInput = requiredElement<HTMLInputElement>(
+        container,
+        "input[placeholder='Search branches']",
+      );
+      await React.act(async () => requiredButton(container, "feature-PFS-2272-alpha").click());
+
+      expect(sourceInput.value).toBe("feature-PFS-2272-alpha");
+      expect(rowsNamed("main")).toHaveLength(0);
+      expect(rowsNamed("feature-PFS-2272-alpha")).toHaveLength(0);
+      expect(document.activeElement).toBe(sourceInput);
+      expect(requiredButton(container, "Create worktree").disabled).toBe(false);
+
+      // Editing the field drops the pick and brings the list back.
+      await setInputValue(sourceInput, "feature");
+      expect(rowsNamed("feature-PFS-2272-alpha")).toHaveLength(1);
+      expect(requiredButton(container, "Create worktree").disabled).toBe(true);
+
+      await React.act(async () => root.unmount());
+      container.remove();
+    });
+
+    it("closes the Smart rows on a branch pick (#151)", async () => {
+      testState.refs = [
+        { name: "main" },
+        { name: "origin/main", isRemote: true, remoteName: "origin" },
+      ];
+      const { container, root } = await mountDialog();
+      const sourceInput = requiredElement<HTMLInputElement>(
+        container,
+        "input[placeholder='Type #1234 or search branches']",
+      );
+
+      await setInputValue(sourceInput, "mai");
+      await React.act(async () => requiredButton(container, "main").click());
+
+      expect(sourceInput.value).toBe("main");
+      expect(
+        Array.from(container.querySelectorAll("button")).filter((button) =>
+          button.textContent?.includes("origin/main"),
+        ),
+      ).toHaveLength(0);
+      expect(requiredButton(container, "Create worktree").disabled).toBe(false);
+
+      await React.act(async () => root.unmount());
+      container.remove();
+    });
+
+    it("creates from a picked branch whose name is a number, not GitHub # (#151)", async () => {
+      testState.refs = [{ name: "main" }, { name: "2026" }];
+      const { container, root } = await mountDialog();
+      await setInputValue(
+        requiredElement<HTMLInputElement>(container, "input[placeholder='Worktree name']"),
+        "investigation",
+      );
+      await setInputValue(
+        requiredElement<HTMLInputElement>(
+          container,
+          "input[placeholder='Type #1234 or search branches']",
+        ),
+        "0",
+      );
+      await React.act(async () => requiredButton(container, "2026").click());
+
+      expect(container.textContent).toContain("Interpreting as: branch");
+      await React.act(async () => requiredButton(container, "Create worktree").click());
+      await React.act(async () => flushPromises());
+      expect(testState.createWorktree).toHaveBeenCalledWith(
+        expect.objectContaining({
+          input: expect.objectContaining({
+            title: "investigation",
+            refName: "2026",
+            newRefName: "investigation",
+            baseRefName: "2026",
+          }),
+        }),
+      );
+
+      await React.act(async () => root.unmount());
+      container.remove();
+    });
+
     it("preserves a manually edited name and leaves branch reuse off", async () => {
       testState.refs = [{ name: "feature/login", isRemote: false }];
       const { container, root } = await mountDialog();
@@ -1773,6 +1865,47 @@ if (browserRuntime) {
       container.remove();
     });
 
+    it("clears another project's branch when reopening for the original row (#151)", async () => {
+      const secondProjectId = ProjectId.make("project-two");
+      const secondEnvironmentId = EnvironmentId.make("remote");
+      const secondProjectRef = scopeProjectRef(secondEnvironmentId, secondProjectId);
+      testState.projects = [
+        project(),
+        project({
+          id: secondProjectId,
+          environmentId: secondEnvironmentId,
+          title: "Repo B",
+          workspaceRoot: "/repo-b",
+        }),
+      ];
+      // Both projects have the branch, so a stale field would select the first one's.
+      testState.refs = [{ name: "main" }, { name: "feature/login" }];
+      const { container, root } = await mountDialog(true, PROJECT_REF);
+
+      const projectSelect = captured.selects.find((select) =>
+        select.items?.some((item) => item.label === "Repo B"),
+      );
+      await React.act(async () =>
+        projectSelect?.onValueChange?.(scopedProjectKey(secondProjectRef)),
+      );
+      await React.act(async () => requiredButton(container, "Branch").click());
+      await React.act(async () => requiredButton(container, "feature/login").click());
+      expect(
+        requiredElement<HTMLInputElement>(container, "input[placeholder='Search branches']").value,
+      ).toBe("feature/login");
+
+      await renderDialog(root, false, PROJECT_REF);
+      await renderDialog(root, true, PROJECT_REF);
+
+      expect(
+        requiredElement<HTMLInputElement>(container, "input[placeholder='Search branches']").value,
+      ).toBe("");
+      expect(requiredButton(container, "Create worktree").disabled).toBe(true);
+
+      await React.act(async () => root.unmount());
+      container.remove();
+    });
+
     it("disables Create when the selected ref disappears from refreshed results", async () => {
       testState.refs = [{ name: "main", current: false, worktreePath: null }];
       const { container, root } = await mountDialog(true, PROJECT_REF);
@@ -1810,7 +1943,7 @@ if (browserRuntime) {
       container.remove();
     });
 
-    it("clears a selected branch when reopening the same scoped project", async () => {
+    it("selects the branch the field still names when reopening the same scoped project", async () => {
       testState.refs = [{ name: "main", current: false, worktreePath: null }];
       const { container, root } = await mountDialog(true, PROJECT_REF);
 
@@ -1821,7 +1954,11 @@ if (browserRuntime) {
       await renderDialog(root, false, PROJECT_REF);
       await renderDialog(root, true, PROJECT_REF);
 
-      expect(requiredButton(container, "Create worktree").disabled).toBe(true);
+      // A pick is the field's text, so it is read again from the refreshed refs.
+      expect(
+        requiredElement<HTMLInputElement>(container, "input[placeholder='Search branches']").value,
+      ).toBe("main");
+      expect(requiredButton(container, "Create worktree").disabled).toBe(false);
 
       await React.act(async () => root.unmount());
       container.remove();
@@ -1842,6 +1979,8 @@ if (browserRuntime) {
         "Custom workspace",
       );
       await renderDialog(root, false, PROJECT_REF);
+      // The branch is gone by the time the dialog opens again.
+      testState.refs = [];
       await renderDialog(root, true, PROJECT_REF);
 
       expect(
@@ -1852,14 +1991,14 @@ if (browserRuntime) {
           container,
           "input[placeholder='Type #1234 or search branches']",
         ).value,
-      ).toBe("feature");
+      ).toBe("feature/login");
       expect(requiredButton(container, "Create worktree").disabled).toBe(true);
 
       await React.act(async () => root.unmount());
       container.remove();
     });
 
-    it("does not use a branch search after switching Create From modes", async () => {
+    it("reads a picked branch from the field after switching Create From modes", async () => {
       testState.refs = [{ name: "feature/login", isRemote: false }];
       const { container, root } = await mountDialog(true, PROJECT_REF);
 
@@ -1875,7 +2014,14 @@ if (browserRuntime) {
       );
       await React.act(async () => requiredButton(container, "Smart").click());
 
-      expect(requiredButton(container, "Create worktree").disabled).toBe(true);
+      expect(
+        requiredElement<HTMLInputElement>(
+          container,
+          "input[placeholder='Type #1234 or search branches']",
+        ).value,
+      ).toBe("feature/login");
+      expect(container.textContent).toContain("Interpreting as: branch");
+      expect(requiredButton(container, "Create worktree").disabled).toBe(false);
 
       await React.act(async () => root.unmount());
       container.remove();

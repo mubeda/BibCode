@@ -81,23 +81,52 @@ describe("detectComposerTrigger", () => {
     expect(detectComposerTrigger(":plan", 5, profile)?.kind).toBe("bibcode-action");
   });
 
-  it("detects colon and slash triggers only as the current line's single token", () => {
+  it("detects colon triggers only as the current line's single token", () => {
     expect(detectComposerTrigger(":plan", 5, allCapabilities)).toEqual({
       kind: "bibcode-action",
       query: "plan",
       rangeStart: 0,
       rangeEnd: 5,
     });
+    expect(detectComposerTrigger("prefix :plan", 12, allCapabilities)).toBeNull();
+    expect(detectComposerTrigger(":plan now", 9, allCapabilities)).toBeNull();
+  });
+
+  it("detects slash triggers as the token under the cursor, mid-line too (#152)", () => {
     expect(detectComposerTrigger("/review", 7, allCapabilities)).toEqual({
       kind: "provider-slash",
       query: "review",
       rangeStart: 0,
       rangeEnd: 7,
     });
-    expect(detectComposerTrigger("prefix :plan", 12, allCapabilities)).toBeNull();
-    expect(detectComposerTrigger("prefix /review", 14, allCapabilities)).toBeNull();
-    expect(detectComposerTrigger(":plan now", 9, allCapabilities)).toBeNull();
+    expect(detectComposerTrigger("prefix /review", 14, allCapabilities)).toEqual({
+      kind: "provider-slash",
+      query: "review",
+      rangeStart: 7,
+      rangeEnd: 14,
+    });
+    expect(detectComposerTrigger("create an issue using /", 23, allCapabilities)).toEqual({
+      kind: "provider-slash",
+      query: "",
+      rangeStart: 22,
+      rangeEnd: 23,
+    });
+    // The cursor inside an earlier token reads that token only up to the cursor.
+    expect(detectComposerTrigger("run /code-review now", 9, allCapabilities)).toEqual({
+      kind: "provider-slash",
+      query: "code",
+      rangeStart: 4,
+      rangeEnd: 9,
+    });
+    // Typing past the token ends it, as for references.
     expect(detectComposerTrigger("/review now", 11, allCapabilities)).toBeNull();
+    expect(detectComposerTrigger("run /review now", 15, allCapabilities)).toBeNull();
+    // A slash inside a token is not a trigger: relative paths and URLs stay text.
+    expect(detectComposerTrigger("open src/app", 12, allCapabilities)).toBeNull();
+    expect(detectComposerTrigger("see https://example.com/a", 25, allCapabilities)).toBeNull();
+    expect(
+      detectComposerTrigger("prefix /review", 14, { ...allCapabilities, providerSlash: false }),
+    ).toBeNull();
   });
 
   it("supports line-start triggers after newlines", () => {

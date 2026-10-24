@@ -16,9 +16,10 @@ import {
 } from "@bibcode/client-runtime/state/runtime";
 import { useNavigate } from "@tanstack/react-router";
 import * as Cause from "effect/Cause";
-import { SmartphoneIcon, TriangleAlertIcon } from "lucide-react";
+import { RefreshCwIcon, SmartphoneIcon, TriangleAlertIcon } from "lucide-react";
 import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
+import { cn } from "../../lib/utils";
 import { deviceEnvironment } from "../../state/device";
 import { useEnvironmentQuery } from "../../state/query";
 import { useAtomCommand } from "../../state/use-atom-command";
@@ -211,7 +212,13 @@ export function DevicePanel({ environmentId }: { readonly environmentId: Environ
     );
   }
   // Keyed so switching to a thread on another environment starts from a clean pane.
-  return <DeviceSession key={environmentId} environmentId={environmentId} />;
+  return (
+    <DeviceSession
+      key={environmentId}
+      environmentId={environmentId}
+      canRefresh={availability.catalogRefresh}
+    />
+  );
 }
 
 function isDisabledFailure(cause: Cause.Cause<unknown>): boolean {
@@ -264,8 +271,12 @@ interface InputErrorNote {
 /** Each platform's reason it cannot run devices, under its own heading. */
 function UnavailablePlatforms({
   platforms,
+  action,
+  error,
 }: {
   readonly platforms: ReadonlyArray<DevicePlatformCatalog>;
+  readonly action: ReactNode;
+  readonly error: string | null;
 }) {
   return (
     <div className="flex min-h-0 flex-1 items-center justify-center p-6">
@@ -282,12 +293,25 @@ function UnavailablePlatforms({
             <p className="text-xs text-muted-foreground">{listed.availability.message}</p>
           </div>
         ))}
+        {action}
+        {error === null ? null : (
+          <p role="alert" className="text-xs text-destructive">
+            {error}
+          </p>
+        )}
       </div>
     </div>
   );
 }
 
-function DeviceSession({ environmentId }: { readonly environmentId: EnvironmentId }) {
+function DeviceSession({
+  environmentId,
+  canRefresh,
+}: {
+  readonly environmentId: EnvironmentId;
+  /** The server has `device.refreshCatalog`; an older one shows no Refresh devices. */
+  readonly canRefresh: boolean;
+}) {
   const catalogQuery = useEnvironmentQuery(deviceEnvironment.catalog({ environmentId, input: {} }));
   const { data: catalog, emission, revalidate } = catalogQuery;
   // The server ends the catalog with "off" while previews are off. A cached stream that ended
@@ -300,6 +324,7 @@ function DeviceSession({ environmentId }: { readonly environmentId: EnvironmentI
     revalidate();
   }, [disabledFailure, revalidate]);
 
+  const runRefresh = useAtomCommand(deviceEnvironment.refreshCatalog, { reportFailure: false });
   const runOpen = useAtomCommand(deviceEnvironment.open, { reportFailure: false });
   const runClose = useAtomCommand(deviceEnvironment.close, { reportFailure: false });
   const runRotate = useAtomCommand(deviceEnvironment.rotate, { reportFailure: false });
@@ -308,6 +333,7 @@ function DeviceSession({ environmentId }: { readonly environmentId: EnvironmentI
   const [followedDeviceId, setFollowedDeviceId] = useState<string | null>(null);
   const [pickedImage, setPickedImage] = useState<DeviceImageSelection | null>(null);
   const [startPending, setStartPending] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
   const [actionError, setActionError] = useState<PaneError | null>(null);
   const [inputError, setInputError] = useState<InputErrorNote | null>(null);
   const [stillImages, setStillImages] = useState<StillImages | null>(null);
@@ -473,6 +499,17 @@ function DeviceSession({ environmentId }: { readonly environmentId: EnvironmentI
     else queue?.releaseAll();
   }, []);
 
+  // Discovery is cached for 30 s, so a device created meanwhile shows only once this reads it
+  // again; the catalog stream then carries the change.
+  const refreshDevices = async () => {
+    if (refreshing) return;
+    setRefreshing(true);
+    setActionError(null);
+    const result = await runRefresh({ environmentId, input: {} });
+    if (!mountedRef.current) return;
+    setRefreshing(false);
+    reportFailure(result, "Could not look for devices. Try again.");
+  };
   const start = async () => {
     if (selectedImage === null) return;
     const { platform, imageId } = selectedImage;
@@ -569,7 +606,25 @@ function DeviceSession({ environmentId }: { readonly environmentId: EnvironmentI
 
   // With no platform able to open a device and nothing running, each platform says why.
   if (!catalog.platforms.some(opensImages) && !catalog.devices.some(isRunning)) {
-    return <UnavailablePlatforms platforms={catalog.platforms} />;
+    return (
+      <UnavailablePlatforms
+        platforms={catalog.platforms}
+        error={actionError?.message ?? null}
+        action={
+          catalog.platforms.length === 0 || !canRefresh ? null : (
+            <Button
+              size="xs"
+              variant="outline"
+              aria-busy={refreshing || undefined}
+              onClick={() => void refreshDevices()}
+            >
+              <RefreshCwIcon className={cn(refreshing && "animate-spin")} />
+              Refresh devices
+            </Button>
+          )
+        }
+      />
+    );
   }
 
   const shownAvailability =
@@ -635,7 +690,9 @@ function DeviceSession({ environmentId }: { readonly environmentId: EnvironmentI
         pickerLocked={startPending}
         viewOnly={inputDisabledReason !== null}
         rotating={device !== null && rotatingDeviceIds.has(device.deviceId)}
+        refreshing={refreshing}
         onSelectImage={selectImage}
+        onRefresh={canRefresh ? () => void refreshDevices() : null}
         onStart={() => void start()}
         onStop={() => {
           if (device !== null) void stop(device.deviceId);
@@ -735,7 +792,9 @@ function DeviceSession({ environmentId }: { readonly environmentId: EnvironmentI
               {selectedImage !== null
                 ? "Pick a device and press Start."
                 : androidOnly
-                  ? "Create a virtual device in Android Studio's Device Manager, then come back."
+                  ? canRefresh
+                    ? "Create a virtual device in Android Studio's Device Manager, then choose Refresh devices."
+                    : "Create a virtual device in Android Studio's Device Manager, then come back."
                   : "No device can start on this server yet."}
             </PanelMessage>
           )

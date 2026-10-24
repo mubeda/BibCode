@@ -62,6 +62,10 @@
       "mode": "unary"
     },
     {
+      "name": "device.refreshCatalog",
+      "mode": "unary"
+    },
+    {
       "name": "device.rotate",
       "mode": "unary"
     },
@@ -748,6 +752,8 @@
     "typed-failures/device__input-01.json",
     "typed-failures/device__open-00.json",
     "typed-failures/device__open-01.json",
+    "typed-failures/device__refreshCatalog-00.json",
+    "typed-failures/device__refreshCatalog-01.json",
     "typed-failures/device__rotate-00.json",
     "typed-failures/device__rotate-01.json",
     "typed-failures/filesystem__browse-00.json",
@@ -1087,6 +1093,8 @@
     "typed-failures/device__input-01.json": "f21e4233466694c02754d2a3c0317c089f31f6634947c5fcc16d02c4997c35cf",
     "typed-failures/device__open-00.json": "cb72d09f21daecbf9fe73f32bd9873a53972d49260aff65533807d27a6f53f02",
     "typed-failures/device__open-01.json": "f21e4233466694c02754d2a3c0317c089f31f6634947c5fcc16d02c4997c35cf",
+    "typed-failures/device__refreshCatalog-00.json": "cb72d09f21daecbf9fe73f32bd9873a53972d49260aff65533807d27a6f53f02",
+    "typed-failures/device__refreshCatalog-01.json": "f21e4233466694c02754d2a3c0317c089f31f6634947c5fcc16d02c4997c35cf",
     "typed-failures/device__rotate-00.json": "cb72d09f21daecbf9fe73f32bd9873a53972d49260aff65533807d27a6f53f02",
     "typed-failures/device__rotate-01.json": "f21e4233466694c02754d2a3c0317c089f31f6634947c5fcc16d02c4997c35cf",
     "stream-shapes/device__subscribeCatalog-00.json": "676f097ee8099e909e6e9f44f6133c48486327731f6660a693b1857f435730d2",
@@ -1304,12 +1312,12 @@
     "stream-shapes/subscribePreviewEvents-04.json": "0e8bac1a898590398b306a6611fd4676d2c1d122d5029999c62a462fdf938ea5",
     "stream-shapes/subscribePreviewEvents-05.json": "e90b7e4ce2b85d04010ece2f05878ca18fcfc97a7e00e6675717aea37f63da1c",
     "stream-shapes/subscribeProjectEntries-00.json": "fb0eccee51b5c2656e762ae9e52783c5c9a78ef4b3f7c46a9a1dcdfa609c8670",
-    "stream-shapes/subscribeServerConfig-00.json": "6f80433fd5cd7a57538ad750f8d89e9a311206c8e517225241d5e543f168419a",
+    "stream-shapes/subscribeServerConfig-00.json": "ab67013898f985f63d28efce8c0abc83d26335cf0958eef150e9167e5801f0ed",
     "stream-shapes/subscribeServerConfig-01.json": "e379d6e60a352e6fe1c1b5a45e50097dd1a5d56f237488d7d7df614cb27d6ce9",
     "stream-shapes/subscribeServerConfig-02.json": "957408443e817af1c3222b4270e35db79c0e0c2ea0ac659ad2b7a88ba9362446",
     "stream-shapes/subscribeServerConfig-03.json": "44a3dddf17f52f741d1de921f509d0f7ef335b71fc24bfb5ceb34ea581aa5bd6",
-    "stream-shapes/subscribeServerLifecycle-00.json": "d7ee26881a528f3fc4263a008d9b787c18f583e3182fe2a6bc92601597c4d7af",
-    "stream-shapes/subscribeServerLifecycle-01.json": "5a32ea2f12f009d429aef960aaddd2c3054d5171bed56fce73ddffa032921278",
+    "stream-shapes/subscribeServerLifecycle-00.json": "8b3a0c4c4cc1a1f00b4e1ed367abe92b63de54538c9e0f0cca74f0960ffeb0ff",
+    "stream-shapes/subscribeServerLifecycle-01.json": "584831ef5b8cbf72f4df6ae739643e0fc6420fa5e99cfd46329e943ee5119ad6",
     "stream-shapes/subscribeTerminalEvents-00.json": "a33bc3be33b80b3bade2e3e4e7f6f25f2ca7c9ba87dd3ea9a781b4f3cb5bea82",
     "stream-shapes/subscribeTerminalEvents-01.json": "c65433f5ba3ebe8e6f7017398c99dff865f351e8c3b9708f4be20b73f8bdff81",
     "stream-shapes/subscribeTerminalEvents-02.json": "e00813631aca2b627480406ffac3369f82397ae64f4044f02f16e263e248cec4",
@@ -1617,6 +1625,8 @@
     "typed-failures/device__input-01.json",
     "typed-failures/device__open-00.json",
     "typed-failures/device__open-01.json",
+    "typed-failures/device__refreshCatalog-00.json",
+    "typed-failures/device__refreshCatalog-01.json",
     "typed-failures/device__rotate-00.json",
     "typed-failures/device__rotate-01.json",
     "typed-failures/filesystem__browse-00.json",

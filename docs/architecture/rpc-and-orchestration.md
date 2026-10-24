@@ -3038,26 +3038,34 @@ disconnected clients are remembered. The fields are in the
 
 ## Device previews flow
 
-[Device previews](./overview.md#device-previews) add seven methods, registered
+[Device previews](./overview.md#device-previews) add eight methods, registered
 in `production/device_rpc.rs` through the session wrappers. Each first checks
 `DeviceManager::enabled()` and fails with `DevicePreviewsDisabledError` while
 `enableDevicePreviews` is off; a stream fails at subscribe. Other failures are
 the typed `DeviceRpcError` union in `packages/contracts/src/device.ts`.
 
-| Method                     | Kind   | Scope                   | Payload and result                                                                                       |
-| -------------------------- | ------ | ----------------------- | -------------------------------------------------------------------------------------------------------- |
-| `device.subscribeCatalog`  | stream | `orchestration:read`    | The current catalog (per platform: availability and images; devices), then every change.                 |
-| `device.open`              | unary  | `orchestration:operate` | `{ platform, imageId }` → `{ deviceId }` at `starting`; boot progress arrives in the catalog.            |
-| `device.close`             | unary  | `orchestration:operate` | `{ deviceId }`; returns once the device has ended (up to the 10 s stop timeout).                         |
-| `device.input`             | unary  | `orchestration:operate` | `{ deviceId, events }`: 1 to 64 touch, key, or text events. The client keeps one batch in flight.        |
-| `device.rotate`            | unary  | `orchestration:operate` | `{ deviceId, orientation }` → `{ orientation }` the device ended in; the catalog shows what it reports.  |
-| `device.subscribeFrames`   | stream | `orchestration:read`    | `{ deviceId }` → JPEG frames `{ seq, width, height, orientation, jpegBase64 }`, conflated to the latest. |
-| `device.createMediaTicket` | unary  | `orchestration:read`    | `{ deviceId }` → `{ ticket, expiresAtMs }` for one H.264 media socket on this connection's channel.      |
+| Method                     | Kind   | Scope                   | Payload and result                                                                                        |
+| -------------------------- | ------ | ----------------------- | --------------------------------------------------------------------------------------------------------- |
+| `device.subscribeCatalog`  | stream | `orchestration:read`    | The current catalog (per platform: availability and images; devices), then every change.                  |
+| `device.refreshCatalog`    | unary  | `orchestration:read`    | `{}`; reruns every platform's discovery past its 30 s cache. Changes arrive on `device.subscribeCatalog`. |
+| `device.open`              | unary  | `orchestration:operate` | `{ platform, imageId }` → `{ deviceId }` at `starting`; boot progress arrives in the catalog.             |
+| `device.close`             | unary  | `orchestration:operate` | `{ deviceId }`; returns once the device has ended (up to the 10 s stop timeout).                          |
+| `device.input`             | unary  | `orchestration:operate` | `{ deviceId, events }`: 1 to 64 touch, key, or text events. The client keeps one batch in flight.         |
+| `device.rotate`            | unary  | `orchestration:operate` | `{ deviceId, orientation }` → `{ orientation }` the device ended in; the catalog shows what it reports.   |
+| `device.subscribeFrames`   | stream | `orchestration:read`    | `{ deviceId }` → JPEG frames `{ seq, width, height, orientation, jpegBase64 }`, conflated to the latest.  |
+| `device.createMediaTicket` | unary  | `orchestration:read`    | `{ deviceId }` → `{ ticket, expiresAtMs }` for one H.264 media socket on this connection's channel.       |
 
-`device.close`, `device.input`, and `device.rotate` are in the profiler's
-`is_long_running` list, because they wait on the emulator: a stop (up to 10 s),
-a stalled input stream (up to 5 s), and reading back a rotation (about 2.5 s
-on Android, 1.2 s on iOS).
+`device.refreshCatalog`, `device.close`, `device.input`, and `device.rotate` are
+in the profiler's `is_long_running` list, because they wait on discovery or the
+emulator: `emulator -list-avds` and `simctl` (with the Xcode probes on macOS), a
+stop (up to 10 s), a stalled input stream (up to 5 s), and reading back a
+rotation (about 2.5 s on Android, 1.2 s on iOS).
+
+`device.refreshCatalog` is newer than the other device methods, so servers that
+have it also advertise the `deviceCatalogRefresh` capability (decoded `false`
+when absent). Clients call it only when that capability is on: an older server
+answers an unknown method with a connection-level defect that fails every
+request in flight and silences the config stream.
 
 H.264 video does not travel over RPC. The ticket from
 `device.createMediaTicket` opens `/api/device-media` or

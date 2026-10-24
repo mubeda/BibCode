@@ -3105,7 +3105,13 @@ Record each client's OS, app or browser version, and profile type.
 2. **Availability.** Open the Device panel: it lists the AVDs. On a host
    without the SDK, without platform-tools, without AVDs, or without
    acceleration (one at a time, where you can arrange it), the panel names
-   the problem and the fix. Record each message.
+   the problem and the fix. Record each message. With the panel open, create
+   an AVD in Android Studio's Device Manager (on a host with none, the first
+   one), then choose **Refresh devices**, by keyboard as well as by pointer:
+   the new AVD is listed without reopening the panel or restarting BiBCode.
+   Against a server older than the client, the panel shows no **Refresh
+   devices** and every other device action still works; record that too where
+   an older server is available.
 3. **Start and discovery (native item 1).** Choose an AVD and **Start**. The
    pill moves through **Starting…** and **Booting…** to **Ready** within
    180 s. Record the boot time. While it runs, list `pid_*.ini` in each

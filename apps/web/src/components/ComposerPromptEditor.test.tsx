@@ -18,6 +18,7 @@ import {
   KEY_BACKSPACE_COMMAND,
   KEY_DOWN_COMMAND,
   KEY_ENTER_COMMAND,
+  KEY_ESCAPE_COMMAND,
   KEY_TAB_COMMAND,
   type ElementNode,
   type LexicalEditor,
@@ -1435,6 +1436,20 @@ describe("ComposerCommandKeyPlugin", () => {
     const up = keyEvent();
     editor.dispatchCommand(KEY_ARROW_UP_COMMAND, up);
     expect(onCommandKeyDown).toHaveBeenCalledWith("ArrowUp", up);
+
+    const escape = keyEvent();
+    expect(editor.dispatchCommand(KEY_ESCAPE_COMMAND, escape)).toBe(true);
+    expect(onCommandKeyDown).toHaveBeenCalledWith("Escape", escape);
+    expect(escape.stopPropagation).toHaveBeenCalled();
+  });
+
+  it("leaves Escape to the IME while it composes", () => {
+    const onCommandKeyDown = vi.fn(() => true);
+    const { editor } = renderEditor({ value: "hello", onCommandKeyDown });
+
+    const composing = keyEvent({ isComposing: true });
+    expect(editor.dispatchCommand(KEY_ESCAPE_COMMAND, composing)).toBe(false);
+    expect(onCommandKeyDown).not.toHaveBeenCalled();
   });
 
   it("delegates PageUp and PageDown and leaves other keys to the editor", () => {
