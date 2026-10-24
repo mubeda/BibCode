@@ -362,6 +362,11 @@ export const OrchestrationMessage = Schema.Struct({
   turnId: Schema.NullOr(TurnId),
   streaming: Schema.Boolean,
   delivery: Schema.optional(TurnDelivery),
+  /**
+   * The failed message this one sends again: the server's copy of a message whose turn hit the
+   * context limit, admitted once the conversation was compacted. Absent from older servers.
+   */
+  resendOf: Schema.optional(MessageId),
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
 });
@@ -484,6 +489,29 @@ export const OrchestrationLatestTurn = Schema.Struct({
 });
 export type OrchestrationLatestTurn = typeof OrchestrationLatestTurn.Type;
 
+/** Why a conversation compaction ran: the user asked, a context-limit failure, or the guard. */
+export const ThreadCompactionTrigger = Schema.Literals(["manual", "contextRecovery", "guard"]);
+export type ThreadCompactionTrigger = typeof ThreadCompactionTrigger.Type;
+
+/** An unsettled compaction: asked for, its turn running, or its outcome not known yet. */
+export const ThreadCompactionState = Schema.Literals(["requested", "running", "unresolved"]);
+export type ThreadCompactionState = typeof ThreadCompactionState.Type;
+
+export const ThreadCompactionOutcome = Schema.Literals(["completed", "failed", "interrupted"]);
+export type ThreadCompactionOutcome = typeof ThreadCompactionOutcome.Type;
+
+/**
+ * The thread's unsettled conversation compaction. While it is set the server queues new messages
+ * and sends nothing, so the composer asks for queued admission as it does while a turn runs.
+ */
+export const OrchestrationThreadCompaction = Schema.Struct({
+  trigger: ThreadCompactionTrigger,
+  state: ThreadCompactionState,
+  /** The message a context-limit recovery sends again once the compaction succeeds. */
+  failedMessageId: Schema.optional(MessageId),
+});
+export type OrchestrationThreadCompaction = typeof OrchestrationThreadCompaction.Type;
+
 export const OrchestrationThread = Schema.Struct({
   id: ThreadId,
   projectId: ProjectId,
@@ -510,6 +538,8 @@ export const OrchestrationThread = Schema.Struct({
   activities: Schema.Array(OrchestrationThreadActivity),
   checkpoints: Schema.Array(OrchestrationCheckpointSummary),
   session: Schema.NullOr(OrchestrationSession),
+  /** Present while a conversation compaction is unsettled; absent from older servers. */
+  compaction: Schema.optional(OrchestrationThreadCompaction),
 });
 export type OrchestrationThread = typeof OrchestrationThread.Type;
 
@@ -591,6 +621,8 @@ export const OrchestrationThreadShell = Schema.Struct({
     ),
   ),
   conversationPreview: Schema.optional(Schema.NullOr(OrchestrationConversationPreview)),
+  /** Present while a conversation compaction is unsettled; absent from older servers. */
+  compaction: Schema.optional(OrchestrationThreadCompaction),
 });
 export type OrchestrationThreadShell = typeof OrchestrationThreadShell.Type;
 
@@ -944,6 +976,14 @@ const ThreadSessionStopCommand = Schema.Struct({
   createdAt: IsoDateTime,
 });
 
+/** Compacts the conversation the thread's next message would continue. */
+const ThreadCompactCommand = Schema.Struct({
+  type: Schema.Literal("thread.compact"),
+  commandId: CommandId,
+  threadId: ThreadId,
+  createdAt: IsoDateTime,
+});
+
 const DispatchableClientOrchestrationCommand = Schema.Union([
   ProjectCreateCommand,
   ClientProjectMetaUpdateCommand,
@@ -964,6 +1004,7 @@ const DispatchableClientOrchestrationCommand = Schema.Union([
   ThreadUserInputRespondCommand,
   ThreadCheckpointRevertCommand,
   ThreadSessionStopCommand,
+  ThreadCompactCommand,
 ]);
 export type DispatchableClientOrchestrationCommand =
   typeof DispatchableClientOrchestrationCommand.Type;
@@ -988,14 +1029,39 @@ export const ClientOrchestrationCommand = Schema.Union([
   ThreadUserInputRespondCommand,
   ThreadCheckpointRevertCommand,
   ThreadSessionStopCommand,
+  ThreadCompactCommand,
 ]);
 export type ClientOrchestrationCommand = typeof ClientOrchestrationCommand.Type;
+
+/** What the provider reported about a turn it failed at the context limit. */
+const ThreadContextLimitFacts = Schema.Struct({
+  turnId: TurnId,
+  /** The provider refused the turn's input before any assistant text, tool call or compaction. */
+  beforeOutput: Schema.optional(Schema.Boolean),
+  /** `false` when the provider said compacting cannot help. */
+  compactable: Schema.optional(Schema.Boolean),
+});
 
 const ThreadSessionSetCommand = Schema.Struct({
   type: Schema.Literal("thread.session.set"),
   commandId: CommandId,
   threadId: ThreadId,
   session: OrchestrationSession,
+  /** The compaction a running update's turn belongs to; that turn takes no message's marker. */
+  compactionId: Schema.optional(TrimmedNonEmptyString),
+  /** A failed turn's context-limit facts, which decide an automatic recovery. */
+  contextLimit: Schema.optional(ThreadContextLimitFacts),
+  createdAt: IsoDateTime,
+});
+
+/** Settles a conversation compaction once its outcome is known. */
+const ThreadCompactionSettleCommand = Schema.Struct({
+  type: Schema.Literal("thread.compaction.settle"),
+  commandId: CommandId,
+  threadId: ThreadId,
+  compactionId: TrimmedNonEmptyString,
+  outcome: ThreadCompactionOutcome,
+  detail: Schema.optional(TrimmedNonEmptyString),
   createdAt: IsoDateTime,
 });
 
@@ -1065,6 +1131,7 @@ const InternalOrchestrationCommand = Schema.Union([
   ThreadTurnDiffCompleteCommand,
   ThreadActivityAppendCommand,
   ThreadRevertCompleteCommand,
+  ThreadCompactionSettleCommand,
 ]);
 export type InternalOrchestrationCommand = typeof InternalOrchestrationCommand.Type;
 
@@ -1087,6 +1154,7 @@ export const OrchestrationCommand = Schema.Union([
   ThreadUserInputRespondCommand,
   ThreadCheckpointRevertCommand,
   ThreadSessionStopCommand,
+  ThreadCompactCommand,
   InternalOrchestrationCommand,
 ]);
 export type OrchestrationCommand = typeof OrchestrationCommand.Type;
@@ -1116,6 +1184,8 @@ export const OrchestrationEventType = Schema.Literals([
   "thread.proposed-plan-upserted",
   "thread.turn-diff-completed",
   "thread.activity-appended",
+  "thread.compact-requested",
+  "thread.compacted",
 ]);
 export type OrchestrationEventType = typeof OrchestrationEventType.Type;
 
@@ -1223,6 +1293,7 @@ export const ThreadMessageSentPayload = Schema.Struct({
   attachments: Schema.optional(Schema.Array(ChatAttachment)),
   turnId: Schema.NullOr(TurnId),
   streaming: Schema.Boolean,
+  resendOf: Schema.optional(MessageId),
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
 });
@@ -1297,6 +1368,8 @@ export const ThreadSessionStopRequestedPayload = Schema.Struct({
 export const ThreadSessionSetPayload = Schema.Struct({
   threadId: ThreadId,
   session: OrchestrationSession,
+  /** Set when the running turn is a conversation compaction BiBCode asked for. */
+  compactionId: Schema.optional(TrimmedNonEmptyString),
 });
 
 export const ThreadProposedPlanUpsertedPayload = Schema.Struct({
@@ -1318,6 +1391,22 @@ export const ThreadTurnDiffCompletedPayload = Schema.Struct({
 export const ThreadActivityAppendedPayload = Schema.Struct({
   threadId: ThreadId,
   activity: OrchestrationThreadActivity,
+});
+
+export const ThreadCompactRequestedPayload = Schema.Struct({
+  threadId: ThreadId,
+  compactionId: TrimmedNonEmptyString,
+  trigger: ThreadCompactionTrigger,
+  failedMessageId: Schema.optional(MessageId),
+  createdAt: IsoDateTime,
+});
+
+export const ThreadCompactedPayload = Schema.Struct({
+  threadId: ThreadId,
+  compactionId: TrimmedNonEmptyString,
+  outcome: ThreadCompactionOutcome,
+  detail: Schema.optional(TrimmedNonEmptyString),
+  createdAt: IsoDateTime,
 });
 
 export const OrchestrationEventMetadata = Schema.Struct({
@@ -1461,6 +1550,16 @@ export const OrchestrationEvent = Schema.Union([
     ...EventBaseFields,
     type: Schema.Literal("thread.activity-appended"),
     payload: ThreadActivityAppendedPayload,
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("thread.compact-requested"),
+    payload: ThreadCompactRequestedPayload,
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("thread.compacted"),
+    payload: ThreadCompactedPayload,
   }),
 ]);
 export type OrchestrationEvent = typeof OrchestrationEvent.Type;
