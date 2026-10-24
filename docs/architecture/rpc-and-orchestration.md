@@ -753,6 +753,45 @@ and drops its result, so moving to another file, or to another context count,
 keeps no multi-megabyte result behind. The default patch keeps today's
 family, so Changes and Compare's **All lines** share it.
 
+### Compare view
+
+The Diff panel's Compare view (`apps/web/src/components/diffs/DiffCompareView.tsx`,
+with its pure model in `apps/web/src/lib/diffCompareModel.ts`) works from the
+patch the panel already loaded:
+
+- **Rows** (path, status, +/− counts) are derived once per parsed patch;
+  filtering never re-parses it, and the name filter is deferred.
+- **Version plan.** For the working tree it reads `blob { prevObjectId }` and
+  `worktree { path, newObjectId }`; for a branch or a turn, two blobs. Added,
+  deleted, pure-rename, mode-only, binary and submodule files read nothing.
+  Abbreviated object IDs fall back to the hunks: a turn patch from a server
+  that reports `truncated` is a stored row, any other is an older server.
+- **Hydration.** Both texts fill Git's hunks with pierre's
+  `hydratePartialDiff("clone", …)`, so the patch Changes renders stays partial.
+  Every added and deleted line is then checked against the full files,
+  ignoring a trailing `\r`; a textconv driver or a filter that rewrote the
+  diff falls back to the hunks with a note. The file's metadata is kept while
+  its object IDs and hunk ranges stay the same, so a refresh of the patch
+  hydrates it again only when the file changed.
+- **`changed`.** A working file that moved past the patch revalidates the
+  patch once. Only a read of the new object ID that is `changed` again shows
+  "This file is changing." with **Refresh**, so a file an agent keeps writing
+  never loops.
+- **Line filter.** **All lines** renders the hydrated default patch with
+  `expandUnchanged`. **Changes only** requests the patch again with
+  `contextLines`, renders that file hydrated with its gaps collapsed, and keeps
+  the default patch's file for placing comments, whose positions index its
+  hunks. The count commits 300 ms after typing stops. A result without
+  `contextLines` disables the field with its reason.
+- **Navigation.** `diff.nextChange` and `diff.previousChange` (F7 and
+  Shift+F7, `when: "diffFocus"`) are resolved by a `keydown` handler on the
+  Compare root with `diffFocus` set, and scroll to each block of changes by
+  line target.
+- **Persistence.** `diffViewMode`, `diffRenderMode`, `diffCompareLines` and
+  `diffCompareContextLines` are `ClientSettings`. The selected file is
+  persisted per thread in `bibcode:diff-panel-state:v1`; the filters are kept
+  in memory only.
+
 ## Pull Requests contract boundary
 
 `packages/contracts/src/pullRequests.ts` defines the repository-scoped Pull
