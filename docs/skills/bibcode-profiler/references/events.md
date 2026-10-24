@@ -285,8 +285,8 @@ only, today. It never carries message or error text.
 ### device.lifecycle
 
 One per device preview transition, Android emulator or iOS simulator, from
-`apps/server/src/device/mod.rs`. It never names the AVD or simulator, their
-paths, or anything on the screen.
+`apps/server/src/device/mod.rs`. It never names the thread, the AVD or
+simulator, their paths, or anything on the screen.
 
 - `platform`: `android` or `ios`;
 - `phase`: `start` (the emulator is being spawned or the simulator booted),
@@ -294,7 +294,11 @@ paths, or anything on the screen.
 - `durationMs`: time since the device was opened;
 - `failureKind`: for `fail`, `exited`, `bootTimeout`, `spawn`,
   `unresponsive`, or `busy` (the simulator was found already running outside
-  BiBCode when the launch began); otherwise `null`.
+  BiBCode when the launch began); otherwise `null`;
+- `running`: how many devices of the environment are live (not stopped or
+  failed; a stopping one counts) after this transition, at most four. Read a
+  memory or CPU finding against it: each live emulator holds its guest's RAM
+  and cores.
 
 A device that ends on its own after `ready` also raises a
 [`subprocess.crash`](findings.md#subprocesscrash): an emulator exit is
