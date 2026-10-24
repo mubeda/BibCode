@@ -356,7 +356,7 @@ describe("Mermaid diagrams in chat Markdown", () => {
       const preserveReadingPosition = vi.fn((_element: HTMLElement, commit: () => void) =>
         commit(),
       );
-      const anchor = { preserveReadingPosition };
+      const anchor = { preserveReadingPosition, holdReadingPosition: vi.fn(() => null) };
       const container = document.createElement("div");
       document.body.append(container);
       const root = createRoot(container);
@@ -376,6 +376,59 @@ describe("Mermaid diagrams in chat Markdown", () => {
       await act(async () => viewToggle(container)!.click());
       expect(preserveReadingPosition).toHaveBeenCalledTimes(2);
       expect(hasDiagram(container)).toBe(false);
+    });
+
+    it("holds the reading line while new text replaces a drawn diagram's source", async () => {
+      /** What the block body shows: the drawn diagram's kind, or its source. */
+      const showing = (body: HTMLElement) =>
+        body.querySelector(".chat-markdown-mermaid svg")?.getAttribute("aria-roledescription") ??
+        "source";
+      const held: { before: string; after: string | null }[] = [];
+      const anchor = {
+        preserveReadingPosition: vi.fn((_element: HTMLElement, commit: () => void) => commit()),
+        holdReadingPosition: vi.fn((body: HTMLElement) => {
+          const hold = { before: showing(body), after: null as string | null };
+          held.push(hold);
+          return () => {
+            hold.after = showing(body);
+          };
+        }),
+      };
+      const roots = [0, 1].map(() => {
+        const container = document.createElement("div");
+        document.body.append(container);
+        const root = createRoot(container);
+        mounted.push({ container, root, render: async () => undefined });
+        return { container, root };
+      });
+      const show = (index: number, text: string) =>
+        act(async () =>
+          roots[index]!.root.render(
+            <ReadingAnchorContext value={anchor}>
+              <ChatMarkdown text={text} cwd={undefined} />
+            </ReadingAnchorContext>,
+          ),
+        );
+      await show(0, fence(FLOWCHART));
+      await show(1, fence(SEQUENCE));
+      await waitFor(
+        () => hasDiagram(roots[0]!.container) && hasDiagram(roots[1]!.container),
+        "both blocks never drew",
+      );
+      expect(anchor.holdReadingPosition).not.toHaveBeenCalled();
+
+      // A replacement already drawn elsewhere shows in the same commit, under the anchor.
+      await show(0, fence(SEQUENCE));
+      expect(held).toEqual([{ before: "flowchart", after: "sequence" }]);
+
+      // One not yet drawn shows its source in that commit, also under the anchor, and its draw
+      // then goes through the anchor's own commit.
+      const drawsBefore = anchor.preserveReadingPosition.mock.calls.length;
+      await show(0, fence("graph LR\n  Replace --> Again"));
+      expect(held.at(-1)).toEqual({ before: "sequence", after: "source" });
+      await waitFor(() => hasDiagram(roots[0]!.container), "the replacement never drew");
+      expect(anchor.preserveReadingPosition).toHaveBeenCalledTimes(drawsBefore + 1);
+      expect(anchor.holdReadingPosition).toHaveBeenCalledTimes(2);
     });
   });
 
