@@ -852,9 +852,12 @@ async fn assistant_completion_updates_only_matching_streaming_assistant_rows() {
     engine.shutdown().await;
 }
 
+/// `(id, turn, text, streaming, createdAt, updatedAt)` of a reasoning row.
+type ReasoningRow<'a> = (&'a str, Option<&'a str>, &'a str, bool, &'a str, &'a str);
+
 fn reasoning_rows(
     rows: &[bibcode_server::persistence::ProjectionThreadReasoning],
-) -> Vec<(&str, Option<&str>, &str, bool, &str, &str)> {
+) -> Vec<ReasoningRow<'_>> {
     rows.iter()
         .map(|row| {
             (
