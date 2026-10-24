@@ -1196,6 +1196,24 @@ any-motion tracking (`?1003`), neither is pointer motion without a pressed
 button. xterm's link detection still sees that motion, so links stay
 clickable. A click or keystroke clears the selection and reporting resumes.
 
+### Terminal spawn environment
+
+A PTY child inherits the server's environment, then `build_pty_command_from_launch`
+in `apps/server/src/terminal/pty.rs` adjusts it. Unless the launch env opts out,
+it removes `NO_COLOR` and sets `FORCE_COLOR=3` and `COLORTERM=truecolor`; it
+sets `TERM=xterm-256color` when the launch env has no `TERM`. It removes the
+multiplexer variables a server started inside tmux, screen or Zellij would pass
+on (`TMUX`, `TMUX_PANE`, `STY`, `WINDOW`, `ZELLIJ`, `ZELLIJ_SESSION_NAME`,
+`ZELLIJ_PANE_ID`), so the shell does not nest in or address that unrelated
+pane. The launch env is applied next, so an explicit value for one of those
+names still reaches the child. Then, unless `fish_features` already names
+`query-term` or `no-query-term`, `no-query-term` is appended to it,
+comma-joined with existing flags: fish 4.1 and later can otherwise wait at
+startup for a device-attributes reply that no renderer can give before a client
+attaches. This turns off fish features that rely on those replies. On Windows these names match
+case-insensitively and an existing key keeps its casing. AppImage isolation
+runs last.
+
 ### Terminal attachment fidelity
 
 Servers advertise `terminalSizeOwnership` (decoded as false for older servers).
