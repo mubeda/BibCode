@@ -2,7 +2,6 @@
 import * as NodePath from "node:path";
 
 import { refreshDesktopUiDocument } from "../support/document-navigation.ts";
-import { installDesktopUiMotionGuard } from "../support/motion-guard.ts";
 import { desktopUiFixture } from "../support/test-project.ts";
 import {
   ensureMainSidebarOpen,
@@ -28,7 +27,6 @@ const visibleComposerFormSelector = `${visibleSurfaceSelector} [data-chat-compos
 const LAYOUT_SLACK_PX = 2;
 /** Every reasoning id the timeline has shown, so each turn's new thought can be told apart. */
 const seenThoughtIds = new Set<string>();
-let firstTurnThoughtId: string | null = null;
 
 const thoughtHeaderSelector = (id: string) =>
   `${visibleSurfaceSelector} [data-reasoning-id="${id}"] > button`;
@@ -45,8 +43,11 @@ async function waitForComposerDisplayed(): Promise<void> {
 }
 
 async function ensureFixtureProjectImported(): Promise<void> {
-  const appOrigin = await browser.execute(() => window.location.origin);
-  await browser.url(`${appOrigin}/#/`);
+  // A same-document hash change: a WebDriver navigation can replace the document, and a
+  // script sent while it loads can be lost.
+  await browser.execute(() => {
+    window.location.hash = "#/";
+  });
   await ensureMainSidebarOpen();
   const projectSelector = `//button[@data-sidebar="menu-button"][.//span[normalize-space()="${desktopUiFixture.projectName}"]]`;
   const hasVisibleProject = async () => {
@@ -219,99 +220,115 @@ async function waitForAnswer(line: string): Promise<void> {
   });
 }
 
+/** Anchored mode, right after a send: the thought streams and the turn's end stays in view. */
+async function streamThoughtInAnchoredTurn(): Promise<string> {
+  const thoughtId = await sendAndAwaitNewThought(
+    `Explain the parser ${desktopUiFixture.reasoningTurnMarker}`,
+  );
+  expect(await thoughtHeaderText(thoughtId)).toMatch(/^Thinking - Fixture thinking step 1/);
+  await browser.saveScreenshot(
+    NodePath.join(preparedArtifactDirectory, "reasoning-thinking-row-streaming.png"),
+  );
+  const answerEnd = desktopUiFixture.reasoningAnswerLastLine("Explain the parser");
+  await waitForAnswer(answerEnd);
+  await expectEndVisible(answerEnd, "Anchored new turn");
+  return thoughtId;
+}
+
+/** The finished thought folds under Worked for and shows once the fold opens. */
+async function openFoldedThought(thoughtId: string): Promise<void> {
+  const fold = browser.$(`${visibleSurfaceSelector} [data-timeline-row-kind="turn-fold"] button`);
+  await fold.waitForDisplayed({ timeoutMsg: "The finished turn did not fold." });
+  expect(await browser.$(thoughtHeaderSelector(thoughtId)).isExisting()).toBe(false);
+  await fold.click();
+  const previousSteps = browser.$(
+    `//*[@data-center-surface-host and @data-visible="true"]//button[contains(normalize-space(), "previous step")]`,
+  );
+  await previousSteps.waitForDisplayed({
+    timeoutMsg: "The opened fold did not offer the thought as a previous step.",
+  });
+  await previousSteps.click();
+  // The finished thought previews its whole first sentence.
+  expect(
+    (await thoughtHeaderText(thoughtId)).startsWith(
+      `Thought - ${desktopUiFixture.reasoningThoughtStart}`,
+    ),
+  ).toBe(true);
+  await browser.saveScreenshot(
+    NodePath.join(preparedArtifactDirectory, "reasoning-thought-row-in-fold.png"),
+  );
+}
+
+/** Expanded away from the end, the thought keeps its header in place. */
+async function expandThoughtAwayFromEnd(thoughtId: string): Promise<void> {
+  // A scroll the timeline does not see as the reader's own, as a wheel it misses would be:
+  // the toggle must still keep the reader's place rather than reveal the turn's end.
+  await browser.execute((selector: string) => {
+    document.querySelector<HTMLElement>(selector)?.scrollIntoView({ block: "center" });
+  }, thoughtHeaderSelector(thoughtId));
+  await browser.executeAsync((done: () => void) => {
+    requestAnimationFrame(() => requestAnimationFrame(() => done()));
+  });
+  const headerTop = () =>
+    browser.execute(
+      (selector: string) => document.querySelector(selector)?.getBoundingClientRect().top ?? null,
+      thoughtHeaderSelector(thoughtId),
+    );
+  const before = await headerTop();
+  expect(before).not.toBeNull();
+  await toggleThought(thoughtId);
+  expect(await browser.$(thoughtHeaderSelector(thoughtId)).getAttribute("aria-expanded")).toBe(
+    "true",
+  );
+  // A late correction, such as a pass that reveals the end, lands within a few frames.
+  await browser.pause(300);
+  const after = await headerTop();
+  expect(Math.abs((after ?? Number.NaN) - (before ?? 0))).toBeLessThanOrEqual(LAYOUT_SLACK_PX);
+  await browser.saveScreenshot(
+    NodePath.join(preparedArtifactDirectory, "reasoning-thought-expanded.png"),
+  );
+  await toggleThought(thoughtId);
+}
+
+/** The newest thought, still streaming just above the working row, expands at the end. */
+async function expandStreamingThoughtAtEnd(): Promise<void> {
+  const thoughtId = await sendAndAwaitNewThought(
+    `Think it over ${desktopUiFixture.slowReasoningTurnMarker}`,
+  );
+  await expectEndVisible(null, "Before the toggle");
+  await toggleThought(thoughtId);
+  expect(await browser.$(thoughtHeaderSelector(thoughtId)).getAttribute("aria-expanded")).toBe(
+    "true",
+  );
+  await expectEndVisible(null, "Expanded at the end");
+  await waitForAnswer(desktopUiFixture.reasoningAnswerLastLine("Think it over", true));
+}
+
+/** Reopening the thread drops the send's anchor: the list follows its end while the turn runs. */
+async function followThoughtInReopenedThread(): Promise<void> {
+  await sendAndAwaitNewThought(`Keep going ${desktopUiFixture.slowReasoningTurnMarker}`);
+  await refreshDesktopUiDocument();
+  await waitForComposerDisplayed();
+  await expectEndVisible(null, "Following the end while thinking");
+  const answerEnd = desktopUiFixture.reasoningAnswerLastLine("Keep going", true);
+  await waitForAnswer(answerEnd);
+  await expectEndVisible(answerEnd, "Following the end");
+}
+
+// One test, as in the other packaged specs: the harness resets the connection catalog and
+// reloads the document before each test, so setup in a `before` hook meets a stale catalog
+// and its state would not survive into the next test.
 describe("Chat reasoning rows", () => {
-  before(async () => {
-    await installDesktopUiMotionGuard();
+  it("streams, folds, expands and follows Thinking rows in each scroll mode", async () => {
     await setDesktopUiWindowSize(1280, 760);
     await ensureFixtureProjectImported();
     await openPrimaryWorkspace();
     await openClaudePanel();
-  });
 
-  it("streams a Thinking row right after a send and keeps the anchored turn's end visible", async () => {
-    const thoughtId = await sendAndAwaitNewThought(
-      `Explain the parser ${desktopUiFixture.reasoningTurnMarker}`,
-    );
-    firstTurnThoughtId = thoughtId;
-    expect(await thoughtHeaderText(thoughtId)).toMatch(/^Thinking - Fixture thinking step 1/);
-    await browser.saveScreenshot(
-      NodePath.join(preparedArtifactDirectory, "reasoning-thinking-row-streaming.png"),
-    );
-    const answerEnd = desktopUiFixture.reasoningAnswerLastLine("Explain the parser");
-    await waitForAnswer(answerEnd);
-    await expectEndVisible(answerEnd, "Anchored new turn");
-  });
-
-  it("folds the finished thought under Worked for and shows it when the fold opens", async () => {
-    const thoughtId = firstTurnThoughtId!;
-    const fold = browser.$(`${visibleSurfaceSelector} [data-timeline-row-kind="turn-fold"] button`);
-    await fold.waitForDisplayed({ timeoutMsg: "The finished turn did not fold." });
-    expect(await browser.$(thoughtHeaderSelector(thoughtId)).isExisting()).toBe(false);
-    await fold.click();
-    const previousSteps = browser.$(
-      `//*[@data-center-surface-host and @data-visible="true"]//button[contains(normalize-space(), "previous step")]`,
-    );
-    await previousSteps.waitForDisplayed({
-      timeoutMsg: "The opened fold did not offer the thought as a previous step.",
-    });
-    await previousSteps.click();
-    // The finished thought previews its whole first sentence.
-    expect(
-      (await thoughtHeaderText(thoughtId)).startsWith(
-        `Thought - ${desktopUiFixture.reasoningThoughtStart}`,
-      ),
-    ).toBe(true);
-    await browser.saveScreenshot(
-      NodePath.join(preparedArtifactDirectory, "reasoning-thought-row-in-fold.png"),
-    );
-  });
-
-  it("keeps the thought's header in place when it is expanded away from the end", async () => {
-    const thoughtId = firstTurnThoughtId!;
-    await browser.execute((selector: string) => {
-      document.querySelector<HTMLElement>(selector)?.scrollIntoView({ block: "center" });
-    }, thoughtHeaderSelector(thoughtId));
-    const headerTop = () =>
-      browser.execute(
-        (selector: string) => document.querySelector(selector)?.getBoundingClientRect().top ?? null,
-        thoughtHeaderSelector(thoughtId),
-      );
-    const before = await headerTop();
-    expect(before).not.toBeNull();
-    await toggleThought(thoughtId);
-    expect(await browser.$(thoughtHeaderSelector(thoughtId)).getAttribute("aria-expanded")).toBe(
-      "true",
-    );
-    const after = await headerTop();
-    expect(Math.abs((after ?? Number.NaN) - (before ?? 0))).toBeLessThanOrEqual(LAYOUT_SLACK_PX);
-    await browser.saveScreenshot(
-      NodePath.join(preparedArtifactDirectory, "reasoning-thought-expanded.png"),
-    );
-    await toggleThought(thoughtId);
-  });
-
-  it("keeps the end visible when a streaming thought is expanded at the end", async () => {
-    // The newest thought, still streaming, sits just above the working row at the end.
-    const thoughtId = await sendAndAwaitNewThought(
-      `Think it over ${desktopUiFixture.slowReasoningTurnMarker}`,
-    );
-    await expectEndVisible(null, "Before the toggle");
-    await toggleThought(thoughtId);
-    expect(await browser.$(thoughtHeaderSelector(thoughtId)).getAttribute("aria-expanded")).toBe(
-      "true",
-    );
-    await expectEndVisible(null, "Expanded at the end");
-    await waitForAnswer(desktopUiFixture.reasoningAnswerLastLine("Think it over", true));
-  });
-
-  it("keeps the end visible while a thought streams into a thread reopened at its end", async () => {
-    await sendAndAwaitNewThought(`Keep going ${desktopUiFixture.slowReasoningTurnMarker}`);
-    // Reopening the thread drops the send's anchor: the list follows its end while the turn runs.
-    await refreshDesktopUiDocument();
-    await waitForComposerDisplayed();
-    await expectEndVisible(null, "Following the end while thinking");
-    const answerEnd = desktopUiFixture.reasoningAnswerLastLine("Keep going", true);
-    await waitForAnswer(answerEnd);
-    await expectEndVisible(answerEnd, "Following the end");
+    const thoughtId = await streamThoughtInAnchoredTurn();
+    await openFoldedThought(thoughtId);
+    await expandThoughtAwayFromEnd(thoughtId);
+    await expandStreamingThoughtAtEnd();
+    await followThoughtInReopenedThread();
   });
 });
