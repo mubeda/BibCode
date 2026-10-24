@@ -157,6 +157,48 @@ describe("FileEditingSession disk reconciliation", () => {
     expect(session.cacheKey).not.toBe(cacheKey);
   });
 
+  it("waits for an IME composition to end before showing a clean file as deleted", () => {
+    const { session } = createSession();
+    const editor = session.editor as unknown as InstanceType<typeof pierre.Editor>;
+    const cacheKey = session.cacheKey;
+    session.setComposing(true);
+
+    // Pierre commits composed text only at compositionend: dropping the editor now loses it.
+    expect(check(session, { _tag: "missing" })).toBe("settled");
+    expect(session.cacheKey).toBe(cacheKey);
+    expect(editor.cleanUp).not.toHaveBeenCalled();
+    expect(session.getSnapshot()).toMatchObject({ conflict: null, deletedOnDisk: false });
+
+    // The composition ends with its text committed: the deletion is now a conflict.
+    session.setComposing(false);
+    session.changeOutsideEditor("composed\n");
+    check(session, { _tag: "missing" });
+    expect(session.getSnapshot()).toMatchObject({
+      conflict: { reason: "deleted", diskKnown: true },
+      deletedOnDisk: false,
+    });
+    expect(session.unsavedContents).toBe("composed\n");
+  });
+
+  it("does not read the file again for a conflict whose disk version it already shows", () => {
+    const { session } = createSession();
+    session.changeOutsideEditor("mine\n");
+    check(session, { _tag: "present", version: "v2" }, { version: "v2", contents: "agent\n" });
+    const conflict = session.getSnapshot().conflict;
+
+    expect(check(session, { _tag: "present", version: "v2" })).toBe("settled");
+    expect(session.getSnapshot().conflict).toBe(conflict);
+
+    // Edits that come to match the disk text settle the conflict without a read.
+    session.changeOutsideEditor("agent\n");
+    expect(check(session, { _tag: "present", version: "v2" })).toBe("settled");
+    expect(session.getSnapshot()).toMatchObject({ conflict: null, save: { phase: "clean" } });
+
+    // A newer disk version is read as before.
+    session.changeOutsideEditor("mine again\n");
+    expect(check(session, { _tag: "present", version: "v3" })).toBe("read");
+  });
+
   it("adopts a disk version whose text already matches the document", async () => {
     vi.useFakeTimers();
     const { session, persist } = createSession();
