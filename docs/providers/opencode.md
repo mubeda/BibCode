@@ -120,3 +120,12 @@ with `opencode --server … --session …`. OpenCode 2 has no `--model` flag, so
 an unobserved OpenCode 2 terminal runs `opencode --standalone` (its own private
 server) with the selected model in its configuration; OpenCode 1 runs
 `opencode --model …`.
+
+OpenCode 1 activity reads the routes the
+[server documentation](https://opencode.ai/docs/server/) describes:
+`GET /session/:id/children`, `GET /session/status`, `GET /session/:id/message`,
+`POST /session/:id/abort`, and `GET /event`. That page does not cover the
+OpenCode 2 `/api/*` routes. OpenCode 2 activity reads
+`GET /api/session?parentID=…`, `GET /api/session/active`, and
+`GET /api/session/{id}/message`, and is verified against responses captured
+from an OpenCode 2.0.29 server.

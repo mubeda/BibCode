@@ -315,6 +315,34 @@ only when help advertises both exact switches:
 If either switch is unavailable or the bounded probe fails, Claude still runs in
 its normal stream-JSON mode without structured hook activity.
 
+`--help` stays the gate even though the
+[CLI reference](https://code.claude.com/docs/en/cli-reference) warns that it
+does not list every flag. Claude Code
+[reports an invalid flag before the run starts](https://code.claude.com/docs/en/headless),
+so launching with a switch the executable lacks would break every Claude chat,
+while a probe that misses a switch only turns Activity off. Version numbers
+cannot replace the probe: the CLI reference and
+[environment variables](https://code.claude.com/docs/en/env-vars) document
+`--forward-subagent-text` (and `CLAUDE_CODE_FORWARD_SUBAGENT_TEXT`) from
+v2.1.211, and forwarding at every nesting depth from v2.1.219, but
+`--include-hook-events` has no documented minimum and no environment variable,
+and the `system/init` `capabilities` list names neither. `--version` cannot
+test a switch either, because it answers even after an unknown flag. If a later
+`--help` stops listing a switch, Claude chats keep working without structured
+hook activity.
+
+Activity creates Claude actors only from `SubagentStart` and `SubagentStop`
+hooks for Agent and legacy Task invocations. The
+[Agent SDK](https://code.claude.com/docs/en/agent-sdk/typescript) task messages
+(`task_started`, `task_updated`, `task_notification`, and, from v2.1.203,
+`background_tasks_changed`) feed the turn follow-up tracking described above,
+which skips tasks marked `ambient`, and the targeted Stop correlation below for
+agent tasks. No task message creates an Activity record, so background Bash
+commands and
+Monitor watches (`task_type: "local_bash"`) never appear under **Background
+tasks**, Claude claims no background-work capability, and Activity reads
+neither `run_id` nor `parent_task_id` (Agent SDK v0.3.292).
+
 A launch waits up to two seconds for the probe. The probe itself may run for up
 to five seconds, so a slow first `--help` still records its answer for the next
 launch. BiBCode caches only a probe in which both commands answered, keyed by the
