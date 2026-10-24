@@ -344,12 +344,15 @@ cargo test -p bibcode-server --test repositories -j 2
 cargo test -p bibcode-server migrations -j 2
 cargo test -p bibcode-server --lib thread_compaction -j 2
 cargo test -p bibcode-server --lib compaction -j 2
+cargo test -p bibcode-server --lib provider_turn_failure -j 2
 ```
 
 Context-limit recovery, the guard and **Compact conversation** share these
 seams (`thread_compaction_tests.rs` drives the engine and delivery worker, the
 `provider_runtime` compaction tests drive the effect with the fake driver, and
-`provider::claude` covers the tagged `/compact` turn and failure facts). The
+`provider::claude` covers the tagged `/compact` turn and failure facts; the
+Profiler's `provider.compaction` and `provider.turn-failed` records are checked
+through a test-only per-thread capture in `provider_turns.rs`). The
 failure cannot be produced on demand with auto-compaction on, so live
 validation is manual: with `DISABLE_AUTO_COMPACT=1` on a Claude instance, a
 context-limit stop shows today's error and no recovery; **Compact

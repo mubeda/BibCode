@@ -109,8 +109,9 @@ conversation was compacted." A copy that fails at the limit again, a failed or
 stopped compaction, or Claude's auto-compaction turned off
 (`autoCompactEnabled: false` or `DISABLE_AUTO_COMPACT`, which turn
 `isAutoCompactEnabled` off; `DISABLE_COMPACT` is expected to as well, which no
-recorded response confirms yet) ends at the error above, with the manual
-action. See
+recorded response confirms yet, so BiBCode also reads either variable from the
+provider instance's environment as auto-compaction off) ends at the error
+above, with the manual action. See
 [Context-limit recovery](../architecture/rpc-and-orchestration.md#context-limit-recovery).
 
 Before sending a message, BiBCode also compacts first when the latest reading
@@ -129,10 +130,12 @@ row; the turn awaits its input, so a successful `result` Claude reports first
 after a resume is ignored, and only the `local_command: "compact"` result ends
 it. The compaction succeeded only when that turn completed with a completed
 **Conversation compaction** step; "Not enough messages to compact." is a
-failure. The action is disabled while the thread is working or a compaction is
-unsettled. Against an older server, without `supportsCompaction`, it sends
-`/compact` as an ordinary message instead. Typing `/compact` in the composer
-still sends it as a message.
+failure, and the error then keeps its context-limit class, so **Compact
+conversation** stays to try again. The action is disabled while the thread is
+working or a compaction is unsettled. Against an older server, without
+`supportsCompaction`, it sends `/compact` as an ordinary message instead
+(Claude only; other providers are not offered the action). Typing `/compact` in
+the composer still sends it as a message.
 
 Other failed turns prefer, in order: the result's `errors`, the text of
 Claude's synthetic error message (an `authentication_failed`,
