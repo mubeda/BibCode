@@ -170,43 +170,116 @@ function commonEnds(before: string, after: string): { prefix: number; suffix: nu
   return { prefix, suffix };
 }
 
-/** The position of `offset` within the lines of `units` that start at `firstLine`. */
-function positionInLines(units: readonly LineUnit[], firstLine: number, offset: number): Position {
-  let line = firstLine;
-  let remaining = offset;
-  for (;;) {
-    const unit = units[line]!;
-    if (remaining <= unit.text.length || unit.eol === "") {
-      return { line, character: Math.min(remaining, unit.text.length) };
-    }
-    remaining -= unit.text.length + unit.eol.length;
-    line += 1;
-  }
+/** An edit in offsets of the text being replaced. */
+interface OffsetEdit {
+  readonly start: number;
+  readonly end: number;
+  readonly text: string;
 }
 
-/**
- * Replaces `before[oldStart, oldEnd)` with `after`'s lines, trimmed to the characters that differ.
- * Text around the edit, and any caret in it, stays where it is.
- */
-function blockEdit(
+/** Where each line of `units` starts; the extra last entry is the text's length. */
+function lineStartOffsets(units: readonly LineUnit[]): number[] {
+  const starts = [0];
+  for (const unit of units)
+    starts.push(starts[starts.length - 1]! + unit.text.length + unit.eol.length);
+  return starts;
+}
+
+/** The position of `offset`; edits never start or end inside a line break. */
+function positionAt(
   units: readonly LineUnit[],
-  oldStart: number,
-  oldEnd: number,
-  replacement: string,
-): TextEdit | null {
-  let original = "";
-  for (let line = oldStart; line < oldEnd; line += 1) {
-    original += units[line]!.text + units[line]!.eol;
+  starts: readonly number[],
+  offset: number,
+): Position {
+  let low = 0;
+  let high = units.length - 1;
+  while (low < high) {
+    const middle = (low + high + 1) >> 1;
+    if (starts[middle]! <= offset) low = middle;
+    else high = middle - 1;
   }
+  return { line: low, character: Math.min(offset - starts[low]!, units[low]!.text.length) };
+}
+
+/** Rewrites one line, trimmed to the characters that differ, so a caret elsewhere on it stays. */
+function lineEdit(original: string, start: number, replacement: string): OffsetEdit | null {
   if (original === replacement) return null;
   const { prefix, suffix } = commonEnds(original, replacement);
   return {
-    range: {
-      start: positionInLines(units, oldStart, prefix),
-      end: positionInLines(units, oldStart, original.length - suffix),
-    },
-    newText: replacement.slice(prefix, replacement.length - suffix),
+    start: start + prefix,
+    end: start + original.length - suffix,
+    text: replacement.slice(prefix, replacement.length - suffix),
   };
+}
+
+/** How many characters a line edit removes and inserts. */
+function lineEditCost(original: string, replacement: string): number {
+  if (original === replacement) return 0;
+  const { prefix, suffix } = commonEnds(original, replacement);
+  return original.length + replacement.length - 2 * (prefix + suffix);
+}
+
+function sum(values: readonly string[], from: number, to: number): number {
+  let total = 0;
+  for (let index = from; index < to; index += 1) total += values[index]!.length;
+  return total;
+}
+
+/**
+ * The edits for one hunk. When it has more lines on one side, the extra lines are inserted or
+ * removed as one block, and the other lines pair up from the hunk's start and end: the split
+ * between the two is the one that changes the fewest characters. So a line the disk changed
+ * keeps a caret in place even when lines were inserted or removed next to it.
+ */
+function hunkEdits(
+  oldLines: readonly string[],
+  newLines: readonly string[],
+  start: number,
+): OffsetEdit[] {
+  const oldCount = oldLines.length;
+  const newCount = newLines.length;
+  const paired = Math.min(oldCount, newCount);
+  const front = Array.from({ length: paired }, (_, index) =>
+    lineEditCost(oldLines[index]!, newLines[index]!),
+  );
+  const back = Array.from({ length: paired }, (_, index) =>
+    lineEditCost(oldLines[oldCount - 1 - index]!, newLines[newCount - 1 - index]!),
+  );
+  const extra = Math.abs(oldCount - newCount);
+  const extraLines = oldCount > newCount ? oldLines : newLines;
+  let frontCost = 0;
+  let backCost = back.reduce((total, cost) => total + cost, 0);
+  let best = { split: 0, cost: backCost + sum(extraLines, 0, extra) };
+  for (let split = 1; split <= paired; split += 1) {
+    frontCost += front[split - 1]!;
+    backCost -= back[paired - split]!;
+    const cost = frontCost + backCost + sum(extraLines, split, split + extra);
+    if (cost < best.cost) best = { split, cost };
+  }
+
+  const edits: OffsetEdit[] = [];
+  let offset = start;
+  const pair = (oldIndex: number, newIndex: number) => {
+    const edit = lineEdit(oldLines[oldIndex]!, offset, newLines[newIndex]!);
+    if (edit !== null) edits.push(edit);
+    offset += oldLines[oldIndex]!.length;
+  };
+  for (let index = 0; index < best.split; index += 1) pair(index, index);
+  if (oldCount > newCount) {
+    const removed = sum(oldLines, best.split, best.split + extra);
+    if (removed > 0) edits.push({ start: offset, end: offset + removed, text: "" });
+    offset += removed;
+  } else if (extra > 0) {
+    edits.push({
+      start: offset,
+      end: offset,
+      text: newLines.slice(best.split, best.split + extra).join(""),
+    });
+  }
+  for (let index = best.split; index < paired; index += 1) {
+    pair(index + (oldCount > newCount ? extra : 0), index + (newCount > oldCount ? extra : 0));
+  }
+  return edits;
 }
 
 /**
@@ -219,30 +292,34 @@ export function diskReloadEdits(current: string, disk: string): TextEdit[] {
   const before = splitLineUnits(current);
   const after = splitLineUnits(disk);
   const joined = (units: readonly LineUnit[]) => units.map((unit) => unit.text + unit.eol);
+  const beforeLines = joined(before);
   const afterLines = joined(after);
-  const edits: TextEdit[] = [];
-  for (const hunk of diffLineHunks(joined(before), afterLines)) {
-    const oldCount = hunk.oldEnd - hunk.oldStart;
-    const newCount = hunk.newEnd - hunk.newStart;
-    if (oldCount === newCount) {
-      for (let index = 0; index < oldCount; index += 1) {
-        const edit = blockEdit(
-          before,
-          hunk.oldStart + index,
-          hunk.oldStart + index + 1,
-          afterLines[hunk.newStart + index]!,
-        );
-        if (edit !== null) edits.push(edit);
+  const starts = lineStartOffsets(before);
+  const edits: OffsetEdit[] = [];
+  for (const hunk of diffLineHunks(beforeLines, afterLines)) {
+    for (const edit of hunkEdits(
+      beforeLines.slice(hunk.oldStart, hunk.oldEnd),
+      afterLines.slice(hunk.newStart, hunk.newEnd),
+      starts[hunk.oldStart]!,
+    )) {
+      // Touching edits become one, so two insertions never share a position Pierre must order.
+      const previous = edits[edits.length - 1];
+      if (previous !== undefined && previous.end === edit.start) {
+        edits[edits.length - 1] = {
+          start: previous.start,
+          end: edit.end,
+          text: previous.text + edit.text,
+        };
+      } else {
+        edits.push(edit);
       }
-      continue;
     }
-    const edit = blockEdit(
-      before,
-      hunk.oldStart,
-      hunk.oldEnd,
-      afterLines.slice(hunk.newStart, hunk.newEnd).join(""),
-    );
-    if (edit !== null) edits.push(edit);
   }
-  return edits;
+  return edits.map((edit) => ({
+    range: {
+      start: positionAt(before, starts, edit.start),
+      end: positionAt(before, starts, edit.end),
+    },
+    newText: edit.text,
+  }));
 }

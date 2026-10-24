@@ -271,6 +271,21 @@ describe("Pierre stable edit integration", () => {
       expect(persist).not.toHaveBeenCalled();
     });
 
+    it("keeps a caret on a changed line in place when the reload also inserts a line", async () => {
+      const before = "foo = 1;\nbar = 2;\n";
+      const { session } = createSession(before);
+      const editor = await renderSession(session, before);
+      caretAt(editor, 1, 1);
+
+      reconcile(session, "v2", "foo = 10;\nnew line\nbar = 20;\n");
+
+      expect(editor.getText()).toBe("foo = 10;\nnew line\nbar = 20;\n");
+      // Still between "b" and "ar", now one line down.
+      expect(editor.getState().selections?.[0]?.start).toEqual({ line: 2, character: 1 });
+      session.undo();
+      expect(editor.getText()).toBe(before);
+    });
+
     it("never changes an edited editor, and Reload from disk then Undo gives back only the edits", async () => {
       const { session, persist } = createSession("abc");
       const editor = await renderSession(session, "abc");
