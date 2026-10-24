@@ -480,7 +480,8 @@ whatever find opened stay as they are, and reopening find restores the last
 search. Find searches the copy of the thread the app holds: while the
 connection is restoring, the status adds **may be out of date**, and while a
 thread is still loading it says **Loading thread…**. One chat's find is open at
-a time; opening it in a chat panel closes the host chat's. Outside a chat, Mod+F
+a time; opening it in a chat panel closes the host chat's. The palette opens it
+in the chat you were using, or the chat on screen. Outside a chat, Mod+F
 keeps its usual meaning. To use another key, bind the `chat.find` command (see
 [Keybindings](./keybindings.md)).
 
