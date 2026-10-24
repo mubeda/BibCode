@@ -47,10 +47,16 @@ const h = vi.hoisted(() => {
       state.settings = { ...state.settings, ...patch };
     }),
     diffPreviewRefresh: vi.fn(),
+    contextPreviewRefresh: vi.fn(),
+    contextCheckpointRefresh: vi.fn(),
     contextPreviewArgs: [] as unknown[],
     commentDraft: null as unknown,
     contextCheckpointTargets: [] as unknown[],
-    contextCheckpointDiff: { data: null as unknown, error: null as unknown, isPending: false },
+    contextCheckpointDiff: {
+      data: null as unknown,
+      error: null as unknown,
+      isPending: false,
+    } as { data: unknown; error: unknown; isPending: boolean; refresh?: () => void },
     stateIndex: 0,
     stateSeeds: new Map<number, unknown>(),
     captured: {} as Record<string, Record<string, unknown>>,
@@ -126,7 +132,12 @@ vi.mock("../state/query", () => ({
       data: key ? (h.queryDataByKey.get(key) ?? null) : null,
       error: queryState?.error ?? null,
       isPending: queryState?.isPending ?? false,
-      refresh: key === "review.diffPreview" ? h.diffPreviewRefresh : () => undefined,
+      refresh:
+        key === "review.diffPreview"
+          ? h.diffPreviewRefresh
+          : key === "review.contextDiffPreview"
+            ? h.contextPreviewRefresh
+            : () => undefined,
       revalidate: key === "review.diffPreview" ? h.diffPreviewRefresh : () => undefined,
       requiresRetry: false,
     };
@@ -477,6 +488,8 @@ beforeEach(() => {
   h.commentDraft = null;
   h.contextPreviewArgs.length = 0;
   h.contextCheckpointTargets.length = 0;
+  h.contextPreviewRefresh.mockClear();
+  h.contextCheckpointRefresh.mockClear();
   h.contextCheckpointDiff = { data: null, error: null, isPending: false };
   h.resolvedTheme = "dark";
   h.serverConfig = { availableEditors: ["vscode"] };
@@ -677,6 +690,43 @@ describe("DiffPanel: Changes and Compare", () => {
     });
   });
 
+  it("hands Compare a failed context patch's error and a retry", () => {
+    h.settings = {
+      ...h.settings,
+      diffViewMode: "compare",
+      diffCompareLines: "changes",
+      diffCompareContextLines: 7,
+    };
+    h.queryStateByKey.set("review.contextDiffPreview", {
+      error: "The connection dropped before the result arrived.",
+      isPending: false,
+    });
+    render();
+    const lineFilter = capturedLast("diffCompareView")["lineFilter"] as Record<string, unknown>;
+    expect(lineFilter).toMatchObject({
+      contextFiles: null,
+      contextError: "The connection dropped before the result arrived.",
+    });
+    (lineFilter["onRetryContext"] as () => void)();
+    expect(h.contextPreviewRefresh).toHaveBeenCalledTimes(1);
+
+    h.queryStateByKey.delete("review.contextDiffPreview");
+    h.turnDiffSummaries = [summary(turnIdA, 2, "2026-01-01T00:00:00.000Z")];
+    h.diffSelection = { kind: "turn", turnId: turnIdA, filePath: null, revealRequestId: 0 };
+    h.checkpointDiff = { data: { diff: "CP", truncated: false }, error: null, isPending: false };
+    h.contextCheckpointDiff = {
+      data: null,
+      error: "Git couldn't compare these checkpoints (exit 128).",
+      isPending: false,
+      refresh: h.contextCheckpointRefresh,
+    };
+    render();
+    const turnFilter = capturedLast("diffCompareView")["lineFilter"] as Record<string, unknown>;
+    expect(turnFilter["contextError"]).toBe("Git couldn't compare these checkpoints (exit 128).");
+    (turnFilter["onRetryContext"] as () => void)();
+    expect(h.contextCheckpointRefresh).toHaveBeenCalledTimes(1);
+  });
+
   it("says a stored turn patch, not the server, is why its context cannot change", () => {
     h.settings = { ...h.settings, diffViewMode: "compare", diffCompareLines: "changes" };
     h.turnDiffSummaries = [summary(turnIdA, 2, "2026-01-01T00:00:00.000Z")];
@@ -716,6 +766,16 @@ describe("DiffPanel: Changes and Compare", () => {
     h.checkpointDiff = { data: { diff: "CP" }, error: null, isPending: false };
     render();
     expect(capturedLast("diffCompareView")["liveTurnPatches"], "an older server").toBe(false);
+  });
+
+  it("says a truncated turn patch is incomplete, even with no file under the cap", () => {
+    h.renderablePatch = null;
+    h.turnDiffSummaries = [summary(turnIdA, 2, "2026-01-01T00:00:00.000Z")];
+    h.diffSelection = { kind: "turn", turnId: turnIdA, filePath: null, revealRequestId: 0 };
+    h.checkpointDiff = { data: { diff: "", truncated: true }, error: null, isPending: false };
+    const markup = render();
+    expect(markup).toContain("This diff was truncated because it exceeded the preview limit.");
+    expect(markup).not.toContain("No net changes");
   });
 
   it("shows a turn error's message rather than an empty selection", () => {
