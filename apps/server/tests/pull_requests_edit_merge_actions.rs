@@ -431,6 +431,31 @@ async fn pull_requests_gitlab_state_and_branch_exact_commands() {
     );
 }
 
+/// #156: GitLab answers a refused cancellation with HTTP 201 and `"status": "error"` in
+/// the body (merge requests API, "Cancel Merge When Pipeline Succeeds"), so a success
+/// exit is not proof that auto-merge was turned off.
+#[tokio::test]
+async fn pull_requests_gitlab_refused_auto_merge_cancellation_is_an_error() {
+    let mut f = Fixture::new(true);
+    f.response(
+        json!({"message":"Can't cancel the automatic merge","status":"error","http_status":406}),
+    );
+    let error = f
+        .run(json!({"action":"disableAutoMerge"}))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "host_rejected");
+    assert_eq!(
+        error.message,
+        "GitLab did not cancel auto-merge. Refresh to see whether it is still on."
+    );
+    assert_eq!(
+        error.host_detail.as_deref(),
+        Some("Can't cancel the automatic merge")
+    );
+    assert!(!error.retryable);
+}
+
 #[tokio::test]
 async fn pull_requests_gitlab_merge_plain_pins_sha_and_method_flags() {
     for method in ["merge", "squash", "rebase"] {

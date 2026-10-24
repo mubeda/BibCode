@@ -77,6 +77,22 @@ pub mod reasons {
     pub const GH_UNKNOWN: &str = "GitHub is still computing mergeability; refresh in a moment";
     pub const GL_UNKNOWN: &str = "GitLab is still computing mergeability; refresh in a moment";
     pub const STATUS_BLOCKED: &str = "GitLab reports {status}";
+    pub const GL_PIPELINE_MISSING: &str = "A pipeline must run and succeed before merging";
+    pub const GL_PIPELINE_MANUAL: &str = "The pipeline is waiting for a manual job";
+    pub const GL_PIPELINE_SKIPPED: &str =
+        "The pipeline was skipped, but it must succeed before merging";
+    pub const GL_PIPELINE_CANCELED: &str = "The pipeline was canceled";
+    pub const GL_COMMITS: &str = "The source branch must exist and contain commits";
+    pub const GL_DEPENDENCIES: &str = "Merge request dependencies must be merged first";
+    pub const GL_MERGE_TIME: &str = "The scheduled merge time has not been reached";
+    pub const GL_STATUS_CHECKS: &str = "External status checks must pass";
+    pub const GL_JIRA: &str = "The title or description must reference a Jira issue";
+    pub const GL_LOCKED_PATHS: &str = "Paths locked by other users must be unlocked";
+    pub const GL_LOCKED_LFS: &str = "LFS files locked by other users must be unlocked";
+    pub const GL_TITLE_REGEX: &str = "The title must match the project's required pattern";
+    pub const GL_POLICIES: &str = "All policy rules must be satisfied";
+    pub const GL_POLICY_PIPELINES: &str =
+        "Security policies require every pipeline for the latest commit to succeed";
     pub const MERGE_BLOCKED: &str = "Merging is blocked: {reason}";
     pub const APPROVALS: &str = "{approved} of {required} required approvals";
     pub const GH_APPROVALS_NEEDED: &str = "{count} approving review{plural} required.";
@@ -575,31 +591,51 @@ fn readiness(i: &PermissionInputs) -> MergeReadiness {
                 (ReadinessStatus::ReviewRequired, summary)
             }
             "requested_changes" => (ReadinessStatus::ChangesRequested, CHANGES_REQUESTED.into()),
-            "ci_must_pass" | "ci_still_running"
-                if matches!(gl.pipeline_status.as_deref(), Some("failed" | "canceled")) =>
-            {
-                (ReadinessStatus::ChecksFailing, CHECKS_FAILING.into())
-            }
-            "ci_must_pass" | "ci_still_running" => {
-                (ReadinessStatus::ChecksPending, CHECKS_PENDING.into())
-            }
-            "conflict" => (ReadinessStatus::Conflicts, CONFLICTS.into()),
+            // "Pipelines must succeed" needs a successful pipeline to exist, so only a
+            // pipeline that is still on its way reads as pending (#156).
+            "ci_must_pass" | "ci_still_running" => match gl.pipeline_status.as_deref() {
+                Some("failed") => (ReadinessStatus::ChecksFailing, CHECKS_FAILING.into()),
+                Some("canceled" | "canceling") => {
+                    (ReadinessStatus::ChecksFailing, GL_PIPELINE_CANCELED.into())
+                }
+                Some("manual") => (ReadinessStatus::Blocked, GL_PIPELINE_MANUAL.into()),
+                Some("skipped") => (ReadinessStatus::Blocked, GL_PIPELINE_SKIPPED.into()),
+                // No visible pipeline: none exists, or this account cannot see it.
+                None if gl.detailed_merge_status == "ci_must_pass" => {
+                    (ReadinessStatus::Blocked, GL_PIPELINE_MISSING.into())
+                }
+                _ => (ReadinessStatus::ChecksPending, CHECKS_PENDING.into()),
+            },
+            // `broken_status` is the GitLab 16 name for a potential conflict.
+            "conflict" | "broken_status" => (ReadinessStatus::Conflicts, CONFLICTS.into()),
             "need_rebase" => (
                 ReadinessStatus::Behind,
                 BEHIND.replace("{base}", &i.base_branch),
             ),
             "draft_status" => (ReadinessStatus::Draft, DRAFT.into()),
-            "discussions_not_resolved" => (ReadinessStatus::Blocked, DISCUSSIONS.into()),
-            "blocked_status"
-            | "policies_denied"
-            | "external_status_checks"
-            | "jira_association_missing"
-            | "broken_status" => (
-                ReadinessStatus::Blocked,
-                STATUS_BLOCKED.replace("{status}", &gl.detailed_merge_status),
-            ),
             "not_open" => (ReadinessStatus::Closed, CLOSED.into()),
-            _ => (ReadinessStatus::Unknown, GL_UNKNOWN.into()),
+            "unchecked" | "checking" | "preparing" | "approvals_syncing" => {
+                (ReadinessStatus::Unknown, GL_UNKNOWN.into())
+            }
+            // The REST values, with the GitLab 16 names older hosts may still send.
+            status => {
+                let reason = match status {
+                    "discussions_not_resolved" => DISCUSSIONS,
+                    "commits_status" => GL_COMMITS,
+                    "merge_request_blocked" | "blocked_status" => GL_DEPENDENCIES,
+                    "merge_time" => GL_MERGE_TIME,
+                    "status_checks_must_pass" | "external_status_checks" => GL_STATUS_CHECKS,
+                    "jira_association_missing" => GL_JIRA,
+                    "locked_paths" => GL_LOCKED_PATHS,
+                    "locked_lfs_files" => GL_LOCKED_LFS,
+                    "title_regex" => GL_TITLE_REGEX,
+                    "security_policy_violations" | "policies_denied" => GL_POLICIES,
+                    "security_policy_pipeline_check" => GL_POLICY_PIPELINES,
+                    // A value newer than this build: name it rather than call it transient.
+                    _ => STATUS_BLOCKED,
+                };
+                (ReadinessStatus::Blocked, reason.replace("{status}", status))
+            }
         }
     } else {
         (ReadinessStatus::Unknown, HOST_DATA.into())
@@ -1183,53 +1219,215 @@ pub(crate) mod tests {
         assert_eq!(compute(&i).1.status, ReadinessStatus::ChangesRequested);
     }
     #[test]
+    /// #156: every REST `detailed_merge_status` value (GitLab's merge requests API,
+    /// "Merge status"), plus the names older hosts returned, gets copy that says what
+    /// blocks the merge. Only a transient state reads "still computing".
     fn gitlab_every_detailed_status_has_readiness_and_reason() {
-        for (status, expected) in [
-            ("mergeable", ReadinessStatus::Mergeable),
-            ("not_approved", ReadinessStatus::ReviewRequired),
-            ("requested_changes", ReadinessStatus::ChangesRequested),
-            ("ci_must_pass", ReadinessStatus::ChecksPending),
-            ("ci_still_running", ReadinessStatus::ChecksPending),
-            ("conflict", ReadinessStatus::Conflicts),
-            ("need_rebase", ReadinessStatus::Behind),
-            ("draft_status", ReadinessStatus::Draft),
-            ("discussions_not_resolved", ReadinessStatus::Blocked),
-            ("blocked_status", ReadinessStatus::Blocked),
-            ("policies_denied", ReadinessStatus::Blocked),
-            ("external_status_checks", ReadinessStatus::Blocked),
-            ("jira_association_missing", ReadinessStatus::Blocked),
-            ("broken_status", ReadinessStatus::Blocked),
-            ("checking", ReadinessStatus::Unknown),
-            ("unchecked", ReadinessStatus::Unknown),
-            ("preparing", ReadinessStatus::Unknown),
-            ("future_status", ReadinessStatus::Unknown),
-            ("not_open", ReadinessStatus::Closed),
+        use ReadinessStatus::*;
+        const TRANSIENT: &str = "GitLab is still computing mergeability; refresh in a moment";
+        for (status, expected, summary) in [
+            ("mergeable", Mergeable, "Ready to merge"),
+            ("not_approved", ReviewRequired, "1 approval required."),
+            (
+                "requested_changes",
+                ChangesRequested,
+                "Changes have been requested",
+            ),
+            ("ci_must_pass", ChecksPending, "Checks are still pending"),
+            (
+                "ci_still_running",
+                ChecksPending,
+                "Checks are still pending",
+            ),
+            (
+                "conflict",
+                Conflicts,
+                "Resolve conflicts locally before merging",
+            ),
+            ("need_rebase", Behind, "Branch is behind main"),
+            (
+                "draft_status",
+                Draft,
+                "Mark this draft ready for review before merging",
+            ),
+            (
+                "discussions_not_resolved",
+                Blocked,
+                "Unresolved threads must be resolved",
+            ),
+            (
+                "commits_status",
+                Blocked,
+                "The source branch must exist and contain commits",
+            ),
+            (
+                "merge_request_blocked",
+                Blocked,
+                "Merge request dependencies must be merged first",
+            ),
+            (
+                "merge_time",
+                Blocked,
+                "The scheduled merge time has not been reached",
+            ),
+            (
+                "status_checks_must_pass",
+                Blocked,
+                "External status checks must pass",
+            ),
+            (
+                "jira_association_missing",
+                Blocked,
+                "The title or description must reference a Jira issue",
+            ),
+            (
+                "locked_paths",
+                Blocked,
+                "Paths locked by other users must be unlocked",
+            ),
+            (
+                "locked_lfs_files",
+                Blocked,
+                "LFS files locked by other users must be unlocked",
+            ),
+            (
+                "title_regex",
+                Blocked,
+                "The title must match the project's required pattern",
+            ),
+            (
+                "security_policy_violations",
+                Blocked,
+                "All policy rules must be satisfied",
+            ),
+            (
+                "security_policy_pipeline_check",
+                Blocked,
+                "Security policies require every pipeline for the latest commit to succeed",
+            ),
+            ("not_open", Closed, "This request is closed"),
+            ("approvals_syncing", Unknown, TRANSIENT),
+            ("checking", Unknown, TRANSIENT),
+            ("unchecked", Unknown, TRANSIENT),
+            ("preparing", Unknown, TRANSIENT),
+            // Names GitLab 16 returned; older hosts may still send them.
+            (
+                "blocked_status",
+                Blocked,
+                "Merge request dependencies must be merged first",
+            ),
+            (
+                "external_status_checks",
+                Blocked,
+                "External status checks must pass",
+            ),
+            (
+                "policies_denied",
+                Blocked,
+                "All policy rules must be satisfied",
+            ),
+            (
+                "broken_status",
+                Conflicts,
+                "Resolve conflicts locally before merging",
+            ),
+            // A value this build does not know yet is named, not called transient.
+            ("future_status", Blocked, "GitLab reports future_status"),
         ] {
             let mut i = gitlab_inputs();
             i.gl.as_mut().unwrap().detailed_merge_status = status.into();
             let (p, r) = compute(&i);
-            assert_eq!(r.status, expected, "{status}");
-            assert!(!r.summary.is_empty());
+            assert_eq!(
+                (r.status, r.summary.as_str()),
+                (expected, summary),
+                "{status}"
+            );
             assert_permission(&p.merge.permission, status == "mergeable");
-            if [
-                "blocked_status",
-                "policies_denied",
-                "external_status_checks",
-                "jira_association_missing",
-                "broken_status",
-            ]
-            .contains(&status)
-            {
-                assert!(p.merge.permission.reason.unwrap().contains(status));
-            }
         }
     }
+    /// #156: "Pipelines must succeed" needs a successful pipeline to exist, so a missing,
+    /// manual, skipped or canceled pipeline is not "still pending".
     #[test]
-    fn gitlab_failed_pipeline_is_checks_failing() {
-        let mut i = gitlab_inputs();
-        i.gl.as_mut().unwrap().detailed_merge_status = "ci_must_pass".into();
-        i.gl.as_mut().unwrap().pipeline_status = Some("failed".into());
-        assert_eq!(compute(&i).1.status, ReadinessStatus::ChecksFailing);
+    fn gitlab_ci_must_pass_names_the_pipeline_state() {
+        use ReadinessStatus::*;
+        for (merge_status, pipeline, expected, summary) in [
+            (
+                "ci_must_pass",
+                None,
+                Blocked,
+                "A pipeline must run and succeed before merging",
+            ),
+            (
+                "ci_must_pass",
+                Some("manual"),
+                Blocked,
+                "The pipeline is waiting for a manual job",
+            ),
+            (
+                "ci_must_pass",
+                Some("skipped"),
+                Blocked,
+                "The pipeline was skipped, but it must succeed before merging",
+            ),
+            (
+                "ci_must_pass",
+                Some("failed"),
+                ChecksFailing,
+                "Checks are failing",
+            ),
+            (
+                "ci_must_pass",
+                Some("canceled"),
+                ChecksFailing,
+                "The pipeline was canceled",
+            ),
+            (
+                "ci_must_pass",
+                Some("canceling"),
+                ChecksFailing,
+                "The pipeline was canceled",
+            ),
+            (
+                "ci_must_pass",
+                Some("running"),
+                ChecksPending,
+                "Checks are still pending",
+            ),
+            (
+                "ci_must_pass",
+                Some("waiting_for_resource"),
+                ChecksPending,
+                "Checks are still pending",
+            ),
+            // GitLab says a pipeline is running even when this account cannot see it.
+            (
+                "ci_still_running",
+                None,
+                ChecksPending,
+                "Checks are still pending",
+            ),
+            (
+                "ci_still_running",
+                Some("failed"),
+                ChecksFailing,
+                "Checks are failing",
+            ),
+        ] {
+            let mut i = gitlab_inputs();
+            let gl = i.gl.as_mut().unwrap();
+            gl.detailed_merge_status = merge_status.into();
+            gl.pipeline_status = pipeline.map(Into::into);
+            let (p, r) = compute(&i);
+            assert_eq!(
+                (r.status, r.summary.as_str()),
+                (expected, summary),
+                "{merge_status} with {pipeline:?}"
+            );
+            assert_eq!(
+                p.merge.permission.reason.as_deref(),
+                Some(format!("Merging is blocked: {summary}").as_str())
+            );
+        }
     }
     #[test]
     fn github_readiness_details_include_counts_and_base_branch() {

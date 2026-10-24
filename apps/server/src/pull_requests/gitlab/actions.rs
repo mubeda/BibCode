@@ -139,14 +139,30 @@ impl GitLabHost {
                 });
             }
             DisableAutoMerge { .. } => {
-                self.mutate_api(
-                    scope,
-                    "POST",
-                    &format!("{path}/cancel_merge_when_pipeline_succeeds"),
-                    None,
-                    c,
-                )
-                .await?;
+                let endpoint = format!("{path}/cancel_merge_when_pipeline_succeeds");
+                let output = self
+                    .runner
+                    .glab(
+                        scope,
+                        &["api", "--method", "POST", &endpoint],
+                        Budget::Mutation,
+                        None,
+                        c,
+                    )
+                    .await
+                    .map_err(|f| from_process_error(OP, "glab", &f.error, &f.stderr))?;
+                // A refusal is HTTP 201 with `"status": "error"` in the body (#156).
+                let body: Value = serde_json::from_str(&output.stdout).unwrap_or_default();
+                if body["status"] == "error" {
+                    let mut error = PullRequestsOperationError::new(OP, "host_rejected");
+                    error.message =
+                        "GitLab did not cancel auto-merge. Refresh to see whether it is still on."
+                            .into();
+                    error.host_detail = body["message"]
+                        .as_str()
+                        .map(|message| message.chars().take(240).collect());
+                    return Err(error);
+                }
                 return Ok(ActionResult::Done);
             }
             SetDraft { draft, .. } => {
