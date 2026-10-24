@@ -5,6 +5,7 @@ import {
   computeMessageDurationStart,
   deriveMessagesTimelineRows,
   isWorkEntryInUnsettledTurn,
+  locateTimelineEntry,
   normalizeCompactToolLabel,
   resolveAssistantMessageCopyState,
   resolveTimelineIsAtEnd,
@@ -1449,6 +1450,174 @@ describe("verbose chat rows", () => {
     expect(isWorkEntryInUnsettledTurn(entry, "turn-1" as never)).toBe(true);
     expect(isWorkEntryInUnsettledTurn(entry, "turn-2" as never)).toBe(false);
     expect(isWorkEntryInUnsettledTurn({ ...entry, turnId: null }, null)).toBe(false);
+  });
+});
+
+describe("locateTimelineEntry", () => {
+  const at = (second: number) => `2026-01-01T00:00:${String(second).padStart(2, "0")}Z`;
+  const user = (id: string, second: number) => ({
+    id: `${id}-entry`,
+    kind: "message" as const,
+    createdAt: at(second),
+    message: {
+      id: id as never,
+      role: "user" as const,
+      text: "Build it",
+      turnId: null,
+      createdAt: at(second),
+      updatedAt: at(second),
+      streaming: false,
+    },
+  });
+  const assistant = (id: string, text: string, second: number, turnId = "turn-1") => ({
+    id: `${id}-entry`,
+    kind: "message" as const,
+    createdAt: at(second),
+    message: {
+      id: id as never,
+      role: "assistant" as const,
+      text,
+      turnId: turnId as never,
+      createdAt: at(second),
+      updatedAt: at(second),
+      streaming: false,
+    },
+  });
+  const work = (
+    id: string,
+    second: number,
+    options: { turnId?: string | null; inProgress?: boolean } = {},
+  ) => ({
+    id: `${id}-entry`,
+    kind: "work" as const,
+    createdAt: at(second),
+    entry: {
+      id,
+      createdAt: at(second),
+      turnId: (options.turnId === undefined ? "turn-1" : options.turnId) as never,
+      label: `Run ${id}`,
+      command: `echo ${id}`,
+      tone: "tool" as const,
+      ...(options.inProgress ? { toolLifecycleStatus: "inProgress" as const } : {}),
+    },
+  });
+  const base = {
+    isWorking: false,
+    activeTurnStartedAt: null,
+    turnDiffSummaryByAssistantMessageId: new Map(),
+    revertTurnCountByUserMessageId: new Map(),
+  };
+  // A settled turn: commentary, a run of three tool calls, then the answer.
+  const turnEntries = [
+    user("user", 0),
+    assistant("commentary", "Looking around first.", 1),
+    work("work-1", 2),
+    work("work-2", 3),
+    work("work-3", 4),
+    assistant("answer", "Done", 5),
+  ];
+
+  it("reports an entry the timeline cannot show as absent", () => {
+    expect(locateTimelineEntry("missing-entry", { ...base, timelineEntries: turnEntries })).toEqual(
+      { kind: "absent" },
+    );
+    const neutral = [work("busy", 1, { turnId: null, inProgress: true })];
+    expect(locateTimelineEntry("busy-entry", { ...base, timelineEntries: neutral })).toEqual({
+      kind: "absent",
+    });
+  });
+
+  it("opens nothing for an entry that is already visible", () => {
+    expect(locateTimelineEntry("answer-entry", { ...base, timelineEntries: turnEntries })).toEqual({
+      kind: "found",
+      rowId: "answer-entry",
+    });
+  });
+
+  it("opens the fold and the group that unfolding creates, and names the final row", () => {
+    // Folded, the turn shows no work rows at all: its group exists only once the fold opens.
+    const folded = deriveMessagesTimelineRows({ ...base, timelineEntries: turnEntries });
+    expect(folded.some((row) => row.kind === "work-toggle")).toBe(false);
+
+    const location = locateTimelineEntry("work-1-entry", { ...base, timelineEntries: turnEntries });
+    expect(location).toEqual({
+      kind: "found",
+      rowId: "work-1",
+      openTurnId: "turn-1",
+      openGroupId: "work-group:work-1-entry",
+    });
+
+    // Opening what the plan names produces that row.
+    const opened = deriveMessagesTimelineRows({
+      ...base,
+      timelineEntries: turnEntries,
+      turnFoldChoices: new Map([["turn-1" as never, true]]),
+      workGroupChoices: new Map([["work-group:work-1-entry", true]]),
+    });
+    expect(opened.some((row) => row.id === "work-1")).toBe(true);
+    // The group's newest entry needs only the fold.
+    expect(locateTimelineEntry("work-3-entry", { ...base, timelineEntries: turnEntries })).toEqual({
+      kind: "found",
+      rowId: "work-3",
+      openTurnId: "turn-1",
+    });
+  });
+
+  it("names a group by the run it starts once an earlier turn's fold breaks it", () => {
+    // The unturned tool call stays a row of its own; turn-1 starts a new run when it opens.
+    const entries = [
+      user("user-0", 0),
+      work("solo", 1, { turnId: null }),
+      user("user-1", 2),
+      assistant("commentary", "Checking.", 3),
+      work("work-a", 4),
+      work("work-b", 5),
+      assistant("answer", "Done", 6),
+    ];
+    expect(locateTimelineEntry("work-a-entry", { ...base, timelineEntries: entries })).toEqual({
+      kind: "found",
+      rowId: "work-a",
+      openTurnId: "turn-1",
+      openGroupId: "work-group:work-a-entry",
+    });
+  });
+
+  it("returns the group's row when a small group starts with a neutral entry", () => {
+    const entries = [
+      work("busy", 1, { turnId: null, inProgress: true }),
+      work("done", 2, { turnId: null }),
+    ];
+    const rows = deriveMessagesTimelineRows({ ...base, timelineEntries: entries });
+    expect(rows.map((row) => row.id)).toEqual(["busy-entry"]);
+    expect(locateTimelineEntry("done-entry", { ...base, timelineEntries: entries })).toEqual({
+      kind: "found",
+      rowId: "busy-entry",
+    });
+  });
+
+  it("opens nothing when Verbose chat already keeps turns and groups open", () => {
+    expect(
+      locateTimelineEntry("work-1-entry", {
+        ...base,
+        timelineEntries: turnEntries,
+        verboseChat: true,
+      }),
+    ).toEqual({ kind: "found", rowId: "work-1" });
+  });
+
+  it("finds a queued message by its row", () => {
+    const queued = { ...user("queued", 9).message, id: "queued" as never };
+    const input = {
+      ...base,
+      timelineEntries: turnEntries,
+      queuedMessages: [queued],
+      queuedStatuses: [{ _tag: "Queued" } as never],
+    };
+    expect(locateTimelineEntry("queued-message:queued", input)).toEqual({
+      kind: "found",
+      rowId: "queued-message:queued",
+    });
+    expect(locateTimelineEntry("queued-message:other", input)).toEqual({ kind: "absent" });
   });
 });
 
