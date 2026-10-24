@@ -7,18 +7,11 @@ export function RightPanelSheet(props: {
   children: ReactNode;
   open: boolean;
   onClose: () => void;
-  consumeEscapeClose?: () => boolean;
 }) {
   return (
     <Sheet
       open={props.open}
-      onOpenChange={(open, eventDetails) => {
-        const childConsumesEscape =
-          eventDetails.reason === "escape-key" && props.consumeEscapeClose?.() === true;
-        if (!open && childConsumesEscape) {
-          eventDetails.cancel();
-          return;
-        }
+      onOpenChange={(open) => {
         if (!open) {
           props.onClose();
         }

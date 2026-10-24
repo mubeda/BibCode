@@ -50,6 +50,24 @@ describe("ClientSettings Pull Requests", () => {
   });
 });
 
+describe("ClientSettings Activity button", () => {
+  it("keeps the Activity button visible by default, also for settings stored without the key", () => {
+    expect(decodeClientSettings({}).activityDockAlwaysVisible).toBe(true);
+    expect(DEFAULT_CLIENT_SETTINGS.activityDockAlwaysVisible).toBe(true);
+    expect(decodeClientSettings({ wordWrap: false }).activityDockAlwaysVisible).toBe(true);
+    expect(
+      decodeClientSettings({ activityDockAlwaysVisible: false }).activityDockAlwaysVisible,
+    ).toBe(false);
+  });
+
+  it("patches the preference without resetting an omitted value", () => {
+    expect(decodeClientSettingsPatch({ activityDockAlwaysVisible: false })).toMatchObject({
+      activityDockAlwaysVisible: false,
+    });
+    expect(decodeClientSettingsPatch({})).not.toHaveProperty("activityDockAlwaysVisible");
+  });
+});
+
 describe("ClientSettings repository sort order", () => {
   it("sorts repositories by name by default and keeps an explicit choice", () => {
     expect(decodeClientSettings({}).sidebarRepositorySortOrder).toBe("name");

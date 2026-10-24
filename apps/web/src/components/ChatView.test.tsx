@@ -118,7 +118,6 @@ const h = vi.hoisted(() => {
     activityStateTargets: [] as unknown[],
     activityAtomTargets: [] as Array<{ kind: string; target: unknown }>,
     atomRefreshCalls: [] as string[],
-    scopedProjectKeyCalls: [] as unknown[],
     activityDockRenderProps: [] as unknown[],
     activityPanelRenderProps: [] as unknown[],
     environmentSettingsById: new Map<string, Record<string, unknown>>(),
@@ -413,17 +412,6 @@ vi.mock("@effect/atom-react", async (importOriginal) => {
     useAtomRefresh: (atom: unknown) => () => {
       const key = (atom as { key?: string } | null | undefined)?.key;
       if (typeof key === "string") h.atomRefreshCalls.push(key);
-    },
-  };
-});
-
-vi.mock("@bibcode/client-runtime/environment", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("@bibcode/client-runtime/environment")>();
-  return {
-    ...actual,
-    scopedProjectKey: (ref: unknown) => {
-      h.scopedProjectKeyCalls.push(ref);
-      return actual.scopedProjectKey(ref as Parameters<typeof actual.scopedProjectKey>[0]);
     },
   };
 });
@@ -724,7 +712,6 @@ import { useRightPanelStore } from "../rightPanelStore";
 import { HOST_SURFACE_ID, useCenterPanelStore } from "../centerPanelStore";
 import { useUiStateStore } from "../uiStateStore";
 import { useDiffPanelStore } from "../diffPanelStore";
-import { useActivityDockStore } from "../activityDockStore";
 import { newDraftId } from "../lib/utils";
 import type { ProviderInstanceEntry } from "../providerInstances";
 import type { ChatComposerHandle } from "./chat/ChatComposer";
@@ -947,7 +934,6 @@ const resettableStores: ReadonlyArray<{ store: ResettableStore; pristine: object
   useCenterPanelStore,
   useUiStateStore,
   useDiffPanelStore,
-  useActivityDockStore,
 ].map((store) => ({
   store: store as unknown as ResettableStore,
   pristine: { ...(store as unknown as ResettableStore).getInitialState() },
@@ -1018,7 +1004,6 @@ beforeEach(() => {
   h.activityStateTargets = [];
   h.activityAtomTargets = [];
   h.atomRefreshCalls = [];
-  h.scopedProjectKeyCalls = [];
   h.activityDockRenderProps = [];
   h.activityPanelRenderProps = [];
   h.environmentSettingsById.clear();
@@ -1284,16 +1269,11 @@ describe("ChatView", () => {
     };
 
     const openSubagents = async (container: HTMLDivElement): Promise<void> => {
-      const expand = container.querySelector<HTMLButtonElement>(
-        'button[aria-label^="Expand activity summary"]',
+      const pill = container.querySelector<HTMLButtonElement>(
+        'button[aria-label^="Open Activity: Subagents"]',
       );
-      expect(expand).not.toBeNull();
-      await click(expand!);
-      const subagents = container.querySelector<HTMLButtonElement>(
-        '[data-activity-section="subagents"]',
-      );
-      expect(subagents).not.toBeNull();
-      await click(subagents!);
+      expect(pill).not.toBeNull();
+      await click(pill!);
       await vi.waitFor(() => {
         expect(container.querySelector("[data-activity-panel]")).not.toBeNull();
       });
@@ -2253,18 +2233,37 @@ describe("ChatView", () => {
       seedServerThread(makeThread());
       seedGitStatus(true);
       seedActivityState(environmentId, snapshot.scope, snapshot);
-      useActivityDockStore.getState().setExpanded(`${environmentId}:${projectId}`, true);
-      publishSeededStoreState(useActivityDockStore);
 
       const markup = renderServerRoute();
 
-      expect(markup).not.toContain('aria-label="Activity data stale"');
-      expect(markup.match(/data-activity-section-status="stale"/g)).toHaveLength(1);
+      expect(markup.match(/data-activity-status="stale"/g)).toHaveLength(1);
       expect(markup).toContain(
-        'aria-label="Open Background tasks: 1 active, 0 done. Status: stale"',
+        'aria-label="Open Activity: Subagents 1 active, 0 done; Background tasks 1 active, 0 done. Status: stale"',
       );
-      expect(markup).toContain('aria-label="Open Subagents: 1 active, 0 done"');
-      expect(markup).not.toContain('aria-label="Open Subagents: 1 active, 0 done. Status: stale"');
+    });
+
+    it("shows the idle Activity button before any record unless the setting is off", () => {
+      const snapshot = activitySnapshot({ _tag: "thread", threadId }, [], {
+        counts: {
+          subagents: { active: 0, done: 0 },
+          backgroundTasks: { active: 0, done: 0 },
+        },
+      });
+      seedEnvironment(makeEnvironmentPresentation());
+      seedProject(makeProject());
+      seedServerThread(makeThread());
+      seedGitStatus(true);
+      seedActivityState(environmentId, snapshot.scope, snapshot);
+
+      const markup = renderServerRoute();
+      expect(markup).toContain('data-testid="activity-dock"');
+      expect(markup).toContain('data-activity-idle="true"');
+      expect((h.activityDockRenderProps.at(-1) as { alwaysVisible: boolean }).alwaysVisible).toBe(
+        true,
+      );
+
+      h.settings = { ...h.settings, activityDockAlwaysVisible: false };
+      expect(renderServerRoute()).not.toContain('data-testid="activity-dock"');
     });
 
     it("retains a failed snapshot and retries the source state atom", async () => {
@@ -2712,45 +2711,6 @@ describe("ChatView", () => {
       }
     });
 
-    it("consumes the first sheet Escape by collapsing the project dock, then releases close", async () => {
-      const child = actor("actor-sheet-escape", "Sheet escape reviewer");
-      const snapshot = activitySnapshot({ _tag: "thread", threadId }, [child]);
-      seedEnvironment(makeEnvironmentPresentation());
-      seedProject(makeProject());
-      seedServerThread(makeThread());
-      seedGitStatus(true);
-      seedActivityState(environmentId, snapshot.scope, snapshot);
-      seedActivityQueries(environmentId, snapshot, [child]);
-      h.compactDesktop = true;
-      h.compactActivityDock = true;
-      useRightPanelStore.getState().openActivity(threadRef, "subagents", { _tag: "thread" });
-      useActivityDockStore.getState().setExpanded(`${environmentId}:${projectId}`, true);
-      publishSeededStoreState(useRightPanelStore);
-      publishSeededStoreState(useActivityDockStore);
-
-      const { container, root } = await mountActivityRoute();
-      try {
-        expect(container.querySelector('[data-mock="right-panel-sheet"]')).not.toBeNull();
-        expect(
-          (
-            h.activityDockRenderProps.at(-1) as {
-              readonly avoidRightPanelSheet: boolean;
-            }
-          ).avoidRightPanelSheet,
-        ).toBe(true);
-        const sheet = capturedProps<{ consumeEscapeClose: () => boolean }>("rightPanelSheet");
-
-        expect(sheet.consumeEscapeClose()).toBe(true);
-        expect(
-          useActivityDockStore.getState().expandedByProject[`${environmentId}:${projectId}`],
-        ).toBe(false);
-        expect(sheet.consumeEscapeClose()).toBe(false);
-      } finally {
-        await act(async () => root.unmount());
-        container.remove();
-      }
-    });
-
     it("retains stale activity through reconnect and uses the existing compact sheet with Back", async () => {
       const child = actor("actor-compact", "Compact reviewer");
       const snapshot = activitySnapshot({ _tag: "thread", threadId }, [child]);
@@ -2769,7 +2729,7 @@ describe("ChatView", () => {
 
       const { container, root } = await mountActivityRoute();
       try {
-        expect(container.querySelector('[aria-label="Activity data stale"]')).not.toBeNull();
+        expect(container.querySelector('[data-activity-status="stale"]')).not.toBeNull();
         await openSubagents(container);
         expect(container.querySelector('[data-mock="right-panel-sheet"]')).not.toBeNull();
         expect(capturedProps<{ mode: string }>("rightPanelTabs").mode).toBe("sheet");
@@ -2853,7 +2813,6 @@ describe("ChatView", () => {
         expect(h.activityStateTargets).toHaveLength(stateTargetCount);
         expect(h.activityDockRenderProps.at(-1)).toBe(dockProps);
         expect(h.activityPanelRenderProps.at(-1)).toBe(panelProps);
-        expect(h.scopedProjectKeyCalls).toContainEqual(scopeProjectRef(environmentId, projectId));
         expect(
           capturedProps<{ activeThread: Thread }>("chatComposer").activeThread.messages,
         ).toHaveLength(1);
@@ -3570,12 +3529,9 @@ describe("ChatView", () => {
       expect(markup).toContain('data-mock="right-panel-tabs"');
       expect(markup).toContain("data-activity-panel");
       expect(
-        capturedProps<{ surface: { terminalId: string }; projectId: ProjectId }>(
-          "centerTerminalPanel",
-        ),
+        capturedProps<{ surface: { terminalId: string } }>("centerTerminalPanel"),
       ).toMatchObject({
         surface: { terminalId: activeCenterTerminalId },
-        projectId,
       });
       // Every activity read targets the persisted terminal, never the active
       // center pane. How many reads there are is not the behaviour: the panel

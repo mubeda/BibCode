@@ -1,4 +1,4 @@
-import type { ProjectId, ResolvedKeybindingsConfig, ScopedThreadRef } from "@bibcode/contracts";
+import type { ResolvedKeybindingsConfig, ScopedThreadRef } from "@bibcode/contracts";
 import { resolveTerminalSessionLabel } from "@bibcode/shared/terminalLabels";
 import { useMemo } from "react";
 
@@ -11,7 +11,6 @@ import ThreadTerminalPanel from "./ThreadTerminalPanel";
 interface CenterTerminalPanelProps {
   /** The HOST thread ref — center terminals reuse the host thread's attach layer. */
   threadRef: ScopedThreadRef;
-  projectId: ProjectId;
   surface: Extract<CenterSurface, { kind: "terminal" }>;
   launchContext: {
     readonly cwd: string;
@@ -41,7 +40,6 @@ const noop = () => undefined;
  */
 export function CenterTerminalPanel({
   threadRef,
-  projectId,
   surface,
   launchContext,
   keybindings,
@@ -75,7 +73,6 @@ export function CenterTerminalPanel({
       owner="center-panel"
       threadRef={threadRef}
       threadId={threadRef.threadId}
-      projectId={projectId}
       cwd={launchContext.cwd}
       worktreePath={launchContext.worktreePath}
       runtimeEnv={launchContext.runtimeEnv}

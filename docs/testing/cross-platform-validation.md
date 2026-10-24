@@ -2677,7 +2677,11 @@ sizes. Cover relevant:
   may show an application error or require reload. Surviving expanded folders
   and selections stay usable, and sibling rows still open normally;
 - Activity subagents and background tasks, including elapsed time and keyboard
-  navigation;
+  navigation. One click or **Enter** on the **Activity** button opens the panel
+  on the section with an error or running work and, with the panel open, keeps
+  it open. With **Settings → Agents → Always show Activity** on, a new chat on a
+  provider that reports activity shows the muted **Activity** button before its
+  first subagent; with it off, the button waits for a record;
 - with **Settings → General → Theme** on **System**, switch the operating system
   between light and dark while the app shows the home screen and again while it
   shows a thread: the window follows each switch without a reload; with

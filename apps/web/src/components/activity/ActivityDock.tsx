@@ -4,22 +4,15 @@ import {
   type ActivitySection,
   type ActivitySnapshot,
 } from "@bibcode/contracts";
-import {
-  BotIcon,
-  ChevronDownIcon,
-  Clock3Icon,
-  ListTodoIcon,
-  RefreshCwIcon,
-  TriangleAlertIcon,
-} from "lucide-react";
+import { BotIcon, RefreshCwIcon, TriangleAlertIcon } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 
 import { PROVIDER_ICON_BY_PROVIDER } from "~/components/chat/providerIconUtils";
 import { Button } from "~/components/ui/button";
-import { usePrefersReducedMotion } from "~/hooks/useMediaQuery";
+import { Tooltip, TooltipPopup, TooltipTrigger } from "~/components/ui/tooltip";
 import { cn } from "~/lib/utils";
 import { ACTIVITY_DOCK_SHEET_INSET_CLASS_NAME } from "~/rightPanelLayout";
-import { activityElapsedLabel, selectActivityDockVisibility } from "./activityPresentation";
+import { compareActivityTimestamps, selectActivityDockVisibility } from "./activityPresentation";
 
 const LIVE_ANNOUNCEMENT_WINDOW_MS = 500;
 
@@ -39,10 +32,6 @@ function countLabel(count: number, singular: string, plural = `${singular}s`): s
   return `${count} ${count === 1 ? singular : plural}`;
 }
 
-function compareText(left: string, right: string): number {
-  return left < right ? -1 : left > right ? 1 : 0;
-}
-
 function resolveProviderIcon(provider: string) {
   if (!Object.hasOwn(PROVIDER_ICON_BY_PROVIDER, provider)) {
     return BotIcon;
@@ -56,17 +45,8 @@ function renderProviderIcon(provider: string, className: string) {
   return <ProviderIcon className={className} />;
 }
 
-function isActiveStatus(status: ActivityLifecycle): boolean {
-  return (
-    status === "starting" || status === "running" || status === "waiting" || status === "unknown"
-  );
-}
-
 interface ActivityDockRecord {
-  readonly id: string;
-  readonly name: string;
-  readonly status: ActivityLifecycle;
-  readonly startedAt: string;
+  readonly updatedAt: string;
 }
 
 interface ActivityDockViewModel {
@@ -76,7 +56,6 @@ interface ActivityDockViewModel {
   readonly counts: ActivitySnapshot["counts"];
   readonly actors: ReadonlyArray<ActivityDockRecord>;
   readonly workItems: ReadonlyArray<ActivityDockRecord>;
-  readonly updatedAt: string;
   readonly visibility: ReturnType<typeof selectActivityDockVisibility>;
 }
 
@@ -128,12 +107,7 @@ function normalizeRecord(value: unknown): ActivityDockRecord | null {
   ) {
     return null;
   }
-  return {
-    id: value.id,
-    name: value.name,
-    status: value.status,
-    startedAt: value.startedAt,
-  };
+  return { updatedAt: typeof value.updatedAt === "string" ? value.updatedAt : value.startedAt };
 }
 
 function normalizeRecords(values: ReadonlyArray<unknown>): ReadonlyArray<ActivityDockRecord> {
@@ -148,7 +122,10 @@ function normalizeRecords(values: ReadonlyArray<unknown>): ReadonlyArray<Activit
   return records;
 }
 
-function normalizeActivityDockSnapshot(snapshot: unknown): ActivityDockViewModel | null {
+function normalizeActivityDockSnapshot(
+  snapshot: unknown,
+  alwaysVisible: boolean,
+): ActivityDockViewModel | null {
   if (!isObject(snapshot)) {
     return null;
   }
@@ -183,7 +160,7 @@ function normalizeActivityDockSnapshot(snapshot: unknown): ActivityDockViewModel
     sections: normalizedSections,
     counts: normalizedCounts,
   } as unknown as ActivitySnapshot;
-  const visibility = selectActivityDockVisibility(visibilitySnapshot);
+  const visibility = selectActivityDockVisibility(visibilitySnapshot, { alwaysVisible });
 
   return {
     provider:
@@ -200,18 +177,17 @@ function normalizeActivityDockSnapshot(snapshot: unknown): ActivityDockViewModel
     counts: normalizedCounts,
     actors: visibility.showSubagents ? normalizeRecords(actors) : [],
     workItems: visibility.showBackgroundTasks ? normalizeRecords(workItems) : [],
-    updatedAt: typeof snapshot.updatedAt === "string" ? snapshot.updatedAt : "",
     visibility,
   };
 }
 
-type DegradedSectionState = "stale" | "error";
+type DegradedState = "stale" | "error";
 
-function degradedSectionState(state: string): DegradedSectionState | null {
+function degradedSectionState(state: string): DegradedState | null {
   return state === "stale" || state === "error" ? state : null;
 }
 
-function SectionStatus({ state }: { readonly state: DegradedSectionState | null }) {
+function DegradedStatus({ state }: { readonly state: DegradedState | null }) {
   if (state === null) {
     return null;
   }
@@ -220,23 +196,70 @@ function SectionStatus({ state }: { readonly state: DegradedSectionState | null 
     <span
       aria-hidden="true"
       className="flex size-4 shrink-0 items-center justify-center text-muted-foreground"
-      data-activity-section-status={state}
-      title={state === "error" ? "Error" : "Stale"}
+      data-activity-status={state}
     >
       <Icon className="size-3.5" />
     </span>
   );
 }
 
-function firstActiveRecord(
+interface SectionSummary {
+  readonly active: number;
+  readonly done: number;
+  readonly state: DegradedState | null;
+  readonly latest: string | null;
+}
+
+function latestUpdate(records: ReadonlyArray<ActivityDockRecord>): string | null {
+  let latest: string | null = null;
+  for (const record of records) {
+    if (latest === null || compareActivityTimestamps(record.updatedAt, latest) > 0) {
+      latest = record.updatedAt;
+    }
+  }
+  return latest;
+}
+
+function summarizeSection(
+  shown: boolean,
+  counts: ActivitySnapshot["counts"]["subagents"],
+  health: ActivitySnapshot["sections"]["subagents"],
   records: ReadonlyArray<ActivityDockRecord>,
-): ActivityDockRecord | undefined {
-  return records
-    .filter((record) => isActiveStatus(record.status))
-    .sort(
-      (left, right) =>
-        compareText(left.startedAt, right.startedAt) || compareText(left.id, right.id),
-    )[0];
+): SectionSummary {
+  return shown
+    ? {
+        active: counts.active,
+        done: counts.done,
+        state: degradedSectionState(health.state),
+        latest: latestUpdate(records),
+      }
+    : { active: 0, done: 0, state: null, latest: null };
+}
+
+/**
+ * The section a click opens: the failing one, else the one with running work
+ * (Subagents first), else the one whose latest record is newest.
+ */
+function sectionToOpen(
+  visibility: ActivityDockViewModel["visibility"],
+  subagents: SectionSummary,
+  backgroundTasks: SectionSummary,
+): ActivitySection {
+  if (subagents.state === "error" || backgroundTasks.state === "error") {
+    return subagents.state === "error" ? "subagents" : "backgroundTasks";
+  }
+  if (subagents.active > 0 || backgroundTasks.active > 0) {
+    return subagents.active > 0 ? "subagents" : "backgroundTasks";
+  }
+  if (subagents.latest !== null && backgroundTasks.latest !== null) {
+    return compareActivityTimestamps(backgroundTasks.latest, subagents.latest) > 0
+      ? "backgroundTasks"
+      : "subagents";
+  }
+  if (backgroundTasks.latest !== null) {
+    return "backgroundTasks";
+  }
+  return visibility.showSubagents ? "subagents" : "backgroundTasks";
 }
 
 function ActivityLiveAnnouncement({ announcement }: { readonly announcement: string }) {
@@ -261,122 +284,78 @@ function ActivityLiveAnnouncement({ announcement }: { readonly announcement: str
 
 export interface ActivityDockProps {
   readonly snapshot: ActivitySnapshot;
-  readonly expanded: boolean;
   readonly compact: boolean;
+  /** Show the button before any record exists, for sections the provider reports. */
+  readonly alwaysVisible?: boolean;
   readonly avoidRightPanelSheet?: boolean;
-  readonly onExpandedChange: (expanded: boolean) => void;
   readonly onOpenSection: (section: ActivitySection) => void;
-  readonly now?: string;
 }
 
 export function ActivityDock({
   snapshot,
-  expanded,
   compact,
+  alwaysVisible = false,
   avoidRightPanelSheet = false,
-  onExpandedChange,
   onOpenSection,
-  now,
 }: ActivityDockProps) {
-  const prefersReducedMotion = usePrefersReducedMotion();
-  const viewModel = normalizeActivityDockSnapshot(snapshot);
+  const viewModel = normalizeActivityDockSnapshot(snapshot, alwaysVisible);
   if (viewModel === null || !viewModel.visibility.visible) {
     return null;
   }
   const visibility = viewModel.visibility;
-
-  const subagentActive = visibility.showSubagents ? viewModel.counts.subagents.active : 0;
-  const subagentDone = visibility.showSubagents ? viewModel.counts.subagents.done : 0;
-  const backgroundActive = visibility.showBackgroundTasks
-    ? viewModel.counts.backgroundTasks.active
-    : 0;
-  const backgroundDone = visibility.showBackgroundTasks ? viewModel.counts.backgroundTasks.done : 0;
-  const active = addCounts(subagentActive, backgroundActive);
-  const done = addCounts(subagentDone, backgroundDone);
+  const subagents = summarizeSection(
+    visibility.showSubagents,
+    viewModel.counts.subagents,
+    viewModel.sections.subagents,
+    viewModel.actors,
+  );
+  const backgroundTasks = summarizeSection(
+    visibility.showBackgroundTasks,
+    viewModel.counts.backgroundTasks,
+    viewModel.sections.backgroundTasks,
+    viewModel.workItems,
+  );
+  const active = addCounts(subagents.active, backgroundTasks.active);
+  const done = addCounts(subagents.done, backgroundTasks.done);
   const dataIsStale =
     viewModel.observationState === "reconnecting" || viewModel.observationState === "stale";
-  const subagentSectionState = visibility.showSubagents
-    ? degradedSectionState(viewModel.sections.subagents.state)
-    : null;
-  const backgroundSectionState = visibility.showBackgroundTasks
-    ? degradedSectionState(viewModel.sections.backgroundTasks.state)
-    : null;
-  const openSection = (section: ActivitySection) => {
-    onExpandedChange(false);
-    onOpenSection(section);
-  };
+  // Errors win over stale, whether one section or the whole observation degraded.
+  const status: DegradedState | null =
+    viewModel.observationState === "error" ||
+    subagents.state === "error" ||
+    backgroundTasks.state === "error"
+      ? "error"
+      : dataIsStale || subagents.state === "stale" || backgroundTasks.state === "stale"
+        ? "stale"
+        : null;
   const accessibleCounts = [
     ...(visibility.showSubagents
-      ? [countLabel(subagentActive, "active subagent"), countLabel(subagentDone, "done subagent")]
+      ? [
+          countLabel(subagents.active, "active subagent"),
+          countLabel(subagents.done, "done subagent"),
+        ]
       : []),
     ...(visibility.showBackgroundTasks
       ? [
-          countLabel(backgroundActive, "active background task"),
-          countLabel(backgroundDone, "done background task"),
+          countLabel(backgroundTasks.active, "active background task"),
+          countLabel(backgroundTasks.done, "done background task"),
         ]
       : []),
   ].join(", ");
   const liveAnnouncement = `Activity update: ${accessibleCounts}${
     dataIsStale ? ". Activity data stale" : ""
-  }${subagentSectionState === null ? "" : `. Subagents ${subagentSectionState}`}${
-    backgroundSectionState === null ? "" : `. Background tasks ${backgroundSectionState}`
+  }${subagents.state === null ? "" : `. Subagents ${subagents.state}`}${
+    backgroundTasks.state === null ? "" : `. Background tasks ${backgroundTasks.state}`
   }`;
-  const elapsedNow = now ?? viewModel.updatedAt;
-  const activeSubagent = firstActiveRecord(viewModel.actors);
-  const activeBackgroundTask = firstActiveRecord(viewModel.workItems);
-  const providerGlyph = (
-    <span
-      aria-hidden="true"
-      className="flex size-5 shrink-0 items-center justify-center rounded-full border border-border bg-muted"
-      data-activity-provider-glyph={viewModel.provider}
-    >
-      {renderProviderIcon(viewModel.provider, "size-3")}
-    </span>
-  );
-
-  const toggleContent = expanded ? (
-    <>
-      {providerGlyph}
-      <span className="truncate">Activity</span>
-      <ChevronDownIcon aria-hidden="true" className="ml-auto size-4" />
-    </>
-  ) : (
-    <>
-      {providerGlyph}
-      {compact ? (
-        <>
-          <span
-            aria-hidden="true"
-            className="whitespace-nowrap text-xs tabular-nums"
-            data-activity-count="active"
-          >
-            Active {active}
-          </span>
-          <span
-            aria-hidden="true"
-            className="text-base leading-none font-bold text-foreground"
-            data-activity-count-separator="true"
-          >
-            ·
-          </span>
-          <span
-            aria-hidden="true"
-            className="whitespace-nowrap text-xs text-muted-foreground tabular-nums"
-            data-activity-count="done"
-          >
-            Done {done}
-          </span>
-        </>
-      ) : (
-        <>
-          <span className="whitespace-nowrap text-xs tabular-nums">Active {active}</span>
-          <span className="whitespace-nowrap text-xs text-muted-foreground tabular-nums">
-            Done {done}
-          </span>
-        </>
-      )}
-    </>
-  );
+  const breakdown = `${[
+    ...(visibility.showSubagents
+      ? [`Subagents ${subagents.active} active, ${subagents.done} done`]
+      : []),
+    ...(visibility.showBackgroundTasks
+      ? [`Background tasks ${backgroundTasks.active} active, ${backgroundTasks.done} done`]
+      : []),
+  ].join("; ")}${status === null ? "" : `. Status: ${status}`}`;
+  const idle = active === 0 && done === 0;
 
   return (
     <div
@@ -386,125 +365,65 @@ export function ActivityDock({
       )}
       data-testid="activity-dock"
     >
-      <div
-        aria-label={dataIsStale ? "Activity data stale" : undefined}
-        className={cn(
-          "pointer-events-auto max-w-72 rounded-lg border border-border bg-popover text-popover-foreground shadow-md",
-          !prefersReducedMotion && "transition-[width,opacity] duration-150",
-          expanded ? "w-72" : "w-fit",
-        )}
-        data-activity-motion={prefersReducedMotion ? "reduced" : "normal"}
-        onKeyDown={(event) => {
-          if (expanded && event.key === "Escape") {
-            event.preventDefault();
-            event.stopPropagation();
-            onExpandedChange(false);
-          }
-        }}
-        role="group"
-      >
-        <Button
-          aria-expanded={expanded}
-          aria-label={`${expanded ? "Collapse" : "Expand"} activity summary: ${accessibleCounts}`}
-          className="h-9 min-h-9 w-full min-w-9 gap-2 px-2"
-          onClick={() => onExpandedChange(!expanded)}
-          size="sm"
-          variant="ghost"
-        >
-          {toggleContent}
-        </Button>
-        {expanded ? (
-          <div className="border-t border-panel-separator p-1">
-            {visibility.showSubagents ? (
+      <div className="pointer-events-auto w-fit max-w-72 rounded-lg border border-border bg-popover text-popover-foreground shadow-md">
+        <Tooltip>
+          <TooltipTrigger
+            render={
               <Button
-                aria-label={`Open Subagents: ${subagentActive} active, ${subagentDone} done${
-                  subagentSectionState === null ? "" : `. Status: ${subagentSectionState}`
-                }`}
-                className="w-full justify-start px-2 py-1.5 text-left"
-                data-activity-section="subagents"
-                onClick={() => openSection("subagents")}
-                size="content"
+                aria-label={`Open Activity: ${breakdown}`}
+                className="h-9 min-h-9 w-full min-w-9 gap-2 px-2"
+                onClick={() => onOpenSection(sectionToOpen(visibility, subagents, backgroundTasks))}
+                size="sm"
                 variant="ghost"
               >
-                <BotIcon aria-hidden="true" className="size-4" />
-                <SectionStatus state={subagentSectionState} />
                 <span
-                  className="flex min-w-0 flex-1 flex-col"
-                  data-activity-section-copy="subagents"
+                  aria-hidden="true"
+                  className="flex size-5 shrink-0 items-center justify-center rounded-full border border-border bg-muted"
+                  data-activity-provider-glyph={viewModel.provider}
                 >
+                  {renderProviderIcon(viewModel.provider, "size-3")}
+                </span>
+                <DegradedStatus state={status} />
+                {idle ? (
                   <span
-                    className="flex min-w-0 items-center gap-2"
-                    data-activity-section-primary="subagents"
+                    aria-hidden="true"
+                    className="whitespace-nowrap text-xs text-muted-foreground"
+                    data-activity-idle="true"
                   >
-                    <span className="min-w-0 flex-1 truncate">Subagents</span>
-                    <span className="shrink-0 whitespace-nowrap text-xs tabular-nums">
-                      Active {subagentActive}
-                    </span>
-                    <span className="shrink-0 whitespace-nowrap text-xs text-muted-foreground tabular-nums">
-                      Done {subagentDone}
-                    </span>
+                    Activity
                   </span>
-                  {activeSubagent === undefined ? null : (
+                ) : (
+                  <>
                     <span
                       aria-hidden="true"
-                      className="mt-0.5 flex items-center text-xs text-muted-foreground tabular-nums"
-                      data-activity-section-metadata="subagents"
+                      className="whitespace-nowrap text-xs tabular-nums"
+                      data-activity-count="active"
                     >
-                      <Clock3Icon className="mr-1 size-3 shrink-0" />
-                      <span className="truncate">
-                        {activityElapsedLabel(activeSubagent.startedAt, elapsedNow)}
+                      Active {active}
+                    </span>
+                    {compact ? (
+                      <span
+                        aria-hidden="true"
+                        className="text-base leading-none font-bold text-foreground"
+                        data-activity-count-separator="true"
+                      >
+                        ·
                       </span>
-                    </span>
-                  )}
-                </span>
-              </Button>
-            ) : null}
-            {visibility.showBackgroundTasks ? (
-              <Button
-                aria-label={`Open Background tasks: ${backgroundActive} active, ${backgroundDone} done${
-                  backgroundSectionState === null ? "" : `. Status: ${backgroundSectionState}`
-                }`}
-                className="w-full justify-start px-2 py-1.5 text-left"
-                data-activity-section="backgroundTasks"
-                onClick={() => openSection("backgroundTasks")}
-                size="content"
-                variant="ghost"
-              >
-                <ListTodoIcon aria-hidden="true" className="size-4" />
-                <SectionStatus state={backgroundSectionState} />
-                <span
-                  className="flex min-w-0 flex-1 flex-col"
-                  data-activity-section-copy="backgroundTasks"
-                >
-                  <span
-                    className="flex min-w-0 items-center gap-2"
-                    data-activity-section-primary="backgroundTasks"
-                  >
-                    <span className="min-w-0 flex-1 truncate">Background tasks</span>
-                    <span className="shrink-0 whitespace-nowrap text-xs tabular-nums">
-                      Active {backgroundActive}
-                    </span>
-                    <span className="shrink-0 whitespace-nowrap text-xs text-muted-foreground tabular-nums">
-                      Done {backgroundDone}
-                    </span>
-                  </span>
-                  {activeBackgroundTask === undefined ? null : (
+                    ) : null}
                     <span
                       aria-hidden="true"
-                      className="mt-0.5 flex items-center text-xs text-muted-foreground tabular-nums"
-                      data-activity-section-metadata="backgroundTasks"
+                      className="whitespace-nowrap text-xs text-muted-foreground tabular-nums"
+                      data-activity-count="done"
                     >
-                      <Clock3Icon className="mr-1 size-3 shrink-0" />
-                      <span className="truncate">
-                        {activityElapsedLabel(activeBackgroundTask.startedAt, elapsedNow)}
-                      </span>
+                      Done {done}
                     </span>
-                  )}
-                </span>
+                  </>
+                )}
               </Button>
-            ) : null}
-          </div>
-        ) : null}
+            }
+          />
+          <TooltipPopup side="bottom">{breakdown}</TooltipPopup>
+        </Tooltip>
         <ActivityLiveAnnouncement announcement={liveAnnouncement} />
       </div>
     </div>

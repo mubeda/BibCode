@@ -117,6 +117,7 @@ export const TerminalThemePreference = TerminalThemePreferenceValue.pipe(
 );
 
 export const ClientSettingsSchema = Schema.Struct({
+  activityDockAlwaysVisible: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
   autoOpenPlanSidebar: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   browserLinkTarget: BrowserLinkTarget.pipe(
     Schema.catchDecoding(() => Effect.succeedSome(DEFAULT_BROWSER_LINK_TARGET)),
@@ -694,6 +695,7 @@ export const ServerSettingsPatch = Schema.Struct({
 export type ServerSettingsPatch = typeof ServerSettingsPatch.Type;
 
 export const ClientSettingsPatch = Schema.Struct({
+  activityDockAlwaysVisible: Schema.optionalKey(Schema.Boolean),
   autoOpenPlanSidebar: Schema.optionalKey(Schema.Boolean),
   browserLinkTarget: Schema.optionalKey(BrowserLinkTarget),
   confirmThreadArchive: Schema.optionalKey(Schema.Boolean),
