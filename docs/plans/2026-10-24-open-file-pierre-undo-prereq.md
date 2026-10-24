@@ -152,8 +152,9 @@ decision, not a prerequisite.
 
 ## Decision
 
-**A**, as a pnpm patch, `patches/@pierre__diffs@1.3.6.patch`, with the same
-change offered upstream.
+**A**, as a pnpm patch, `patches/@pierre__diffs@1.3.6.patch`. The product owner
+declined an upstream PR on 2026-10-24, so the patch stays local; re-check it on
+every Pierre upgrade and drop it once a release exposes the boundary.
 
 BiBCode calls it in exactly one place: the #180 reload, as
 `editor.applyEdits(edits, true, true)`, behind a named helper in
@@ -165,10 +166,8 @@ caret.
 
 - **Does Pierre expose an undo boundary?** Not publicly in any release up to
   1.6.1. `TextDocument` has one, and `Editor.applyEdits` drops it.
-- **Upstream change or patch?** A patch now. The same parameter is proposed
-  upstream in parallel; posting it needs the product owner's approval. #180's
-  implementation depends on the patch. It does not depend on the upstream
-  change.
+- **Upstream change or patch?** A local patch. No upstream PR is opened (declined
+  2026-10-24). #180 depends only on the patch.
 
 ## Patch outline
 
