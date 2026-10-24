@@ -169,6 +169,10 @@ vi.mock("../../state/environments", () => ({
   usePrimaryEnvironment: () => h.primaryEnvironment,
 }));
 
+vi.mock("./ProviderUpdateAllSection", () => ({
+  ProviderUpdateAllSection: () => <div data-provider-update-all-section="" />,
+}));
+
 vi.mock("../../state/entities", () => ({
   useProjects: () => h.projects,
   useServerConfigs: () => h.serverConfigs,
@@ -1448,6 +1452,10 @@ describe("ProviderSettingsPanel", () => {
     const markup = render(<ProviderSettingsPanel />);
     expect(markup).toContain("Providers");
     expect(markup).toContain("Checked");
+    expect(markup.indexOf("data-provider-update-all-section")).toBeLessThan(
+      markup.indexOf('data-section-title="Providers"'),
+    );
+    expect(markup).toContain("data-provider-update-all-section");
     expect(h.sections.find((section) => section.title === "Providers")?.contentVariant).toBe(
       "stack",
     );

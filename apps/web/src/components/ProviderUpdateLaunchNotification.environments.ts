@@ -2,8 +2,13 @@ import type { ConnectionCatalogEntry } from "@bibcode/client-runtime/connection"
 import type { ServerConfig } from "@bibcode/contracts";
 import { useMemo } from "react";
 
-import { useEnvironments, usePrimaryEnvironmentId } from "~/state/environments";
+import {
+  type EnvironmentPresentation,
+  useEnvironments,
+  usePrimaryEnvironmentId,
+} from "~/state/environments";
 import { isDesktopLocalConnectionTarget } from "~/connection/desktopLocal";
+import type { ProviderUpdateEnvironmentInput } from "./ProviderUpdateAll.logic";
 import {
   buildLocalEnvironmentUpdateGroups,
   deriveEnvironmentDisplayLabel,
@@ -20,6 +25,22 @@ import {
  */
 function isLocalConnectionTarget(target: ConnectionCatalogEntry["target"]): boolean {
   return target._tag === "PrimaryConnectionTarget" || isDesktopLocalConnectionTarget(target);
+}
+
+/**
+ * Secondaries carry a meaningful label straight from their source (e.g. "WSL
+ * (Ubuntu)" or an SSH host). The primary's catalog label can be the account
+ * name, so it falls back to its platform OS and reads "Windows"/"Linux".
+ */
+function environmentUpdateLabel(environment: EnvironmentPresentation, isPrimary: boolean): string {
+  return isPrimary
+    ? deriveEnvironmentDisplayLabel({
+        isWsl: false,
+        wslDistro: null,
+        platformOs: environment.serverConfig?.environment.platform.os,
+        fallbackLabel: environment.label,
+      })
+    : environment.label;
 }
 
 function normalizeConnectionState(phase: string | undefined): EnvironmentUpdateConnectionState {
@@ -67,17 +88,7 @@ export function useLocalEnvironmentUpdateGroups(): {
 
       inputs.push({
         environmentId: environment.environmentId,
-        // Secondaries carry a meaningful label straight from the platform source
-        // (e.g. "WSL (Ubuntu)"). The primary's catalog label can be the account
-        // name, so fall back to its platform OS so the row reads "Windows"/"Linux".
-        label: isPrimary
-          ? deriveEnvironmentDisplayLabel({
-              isWsl: false,
-              wslDistro: null,
-              platformOs: serverConfig?.environment.platform.os,
-              fallbackLabel: environment.label,
-            })
-          : environment.label,
+        label: environmentUpdateLabel(environment, isPrimary),
         isPrimary,
         // The primary is the backend serving this renderer, so it is ready
         // whenever its providers are available; secondaries report their live
@@ -94,4 +105,34 @@ export function useLocalEnvironmentUpdateGroups(): {
 
     return buildLocalEnvironmentUpdateGroups(inputs);
   }, [environments, primaryEnvironmentId]);
+}
+
+/**
+ * Every environment, primary first, with its connection and last provider
+ * snapshot: the input of the "Update all" plan, which includes SSH, relay, and
+ * direct environments as well as the local ones.
+ */
+export function useProviderUpdateEnvironments(): ReadonlyArray<ProviderUpdateEnvironmentInput> {
+  const { environments } = useEnvironments();
+  const primaryEnvironmentId = usePrimaryEnvironmentId();
+
+  return useMemo(
+    () =>
+      environments
+        .map((environment) => {
+          const isPrimary = environment.environmentId === primaryEnvironmentId;
+          return {
+            isPrimary,
+            input: {
+              environmentId: environment.environmentId,
+              label: environmentUpdateLabel(environment, isPrimary),
+              connected: environment.connection.phase === "connected",
+              providers: environment.serverConfig?.providers ?? [],
+            },
+          };
+        })
+        .toSorted((left, right) => Number(right.isPrimary) - Number(left.isPrimary))
+        .map(({ input }) => input),
+    [environments, primaryEnvironmentId],
+  );
 }
