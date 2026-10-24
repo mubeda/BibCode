@@ -240,6 +240,13 @@ vi.mock("./diffs/AnnotatableCodeView", () => ({
   },
 }));
 
+vi.mock("./diffs/DiffCompareView", () => ({
+  DiffCompareView: (props: Record<string, unknown>) => {
+    h.capture("diffCompareView", props);
+    return <div data-mock="diff-compare-view" />;
+  },
+}));
+
 vi.mock("./ui/toggle-group", () => ({
   ToggleGroup: (props: Record<string, unknown> & { children?: ReactNode }) => {
     h.capture("toggleGroup", props);
@@ -505,6 +512,78 @@ describe("DiffPanel: empty states", () => {
 });
 
 // ── Files patch (main path) ──────────────────────────────────────────
+describe("DiffPanel: Changes and Compare", () => {
+  it("opens in Changes and saves a switch to Compare", () => {
+    const markup = render();
+    expect(markup).toContain('data-mock="annotatable-code-view"');
+    expect(markup).not.toContain('data-mock="diff-compare-view"');
+    const modes = capturedAll("toggleGroup").find((props) => props["aria-label"] === "Diff view")!;
+    expect(modes["value"]).toEqual(["changes"]);
+    (modes["onValueChange"] as (value: string[]) => void)(["compare"]);
+    expect(h.updateClientSettings).toHaveBeenCalledWith({ diffViewMode: "compare" });
+  });
+
+  it("shows Compare with the panel's scope and files, and hides Stacked/Split", () => {
+    h.settings = { ...h.settings, diffViewMode: "compare" };
+    const markup = render();
+    expect(markup).toContain('data-mock="diff-compare-view"');
+    expect(markup).not.toContain('data-mock="annotatable-code-view"');
+    const compare = capturedLast("diffCompareView");
+    expect(compare["scope"]).toBe("branch");
+    expect(compare["cwd"]).toBe("/wt");
+    expect(compare["legacyTurnPatch"]).toBe(false);
+    expect((compare["files"] as Array<{ path: string }>).map((file) => file.path)).toEqual([
+      "src/a.ts",
+      "src/b.ts",
+    ]);
+    expect(
+      capturedAll("toggle").some((props) => props["aria-label"] === "Stacked diff view"),
+      "Stacked/Split belongs to Changes",
+    ).toBe(false);
+
+    (compare["onRevalidatePatch"] as () => void)();
+    expect(h.diffPreviewRefresh).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the scope and base ref across a switch, since both live in the panel store", () => {
+    h.diffSelection = { kind: "branch", baseRef: "origin/main" };
+    render();
+    h.settings = { ...h.settings, diffViewMode: "compare" };
+    render();
+    expect(h.storeApi.selectGitScope).not.toHaveBeenCalled();
+    expect(h.storeApi.selectBranchBaseRef).not.toHaveBeenCalled();
+    expect(capturedLast("diffCompareView")["scope"]).toBe("branch");
+  });
+
+  it("marks a turn patch from this server that has short IDs as a stored one", () => {
+    h.settings = { ...h.settings, diffViewMode: "compare" };
+    h.turnDiffSummaries = [summary(turnIdA, 2, "2026-01-01T00:00:00.000Z")];
+    h.diffSelection = { kind: "turn", turnId: turnIdA, filePath: null, revealRequestId: 0 };
+    h.checkpointDiff = { data: { diff: "CP", truncated: false }, error: null, isPending: false };
+    render();
+    expect(capturedLast("diffCompareView")).toMatchObject({ scope: "turn", legacyTurnPatch: true });
+
+    h.checkpointDiff = { data: { diff: "CP" }, error: null, isPending: false };
+    render();
+    expect(capturedLast("diffCompareView")["legacyTurnPatch"], "an older server").toBe(false);
+  });
+
+  it("shows a turn error's message rather than an empty selection", () => {
+    h.settings = { ...h.settings, diffViewMode: "compare" };
+    h.renderablePatch = null;
+    h.turnDiffSummaries = [summary(turnIdA, 4, "2026-01-01T00:00:00.000Z")];
+    h.diffSelection = { kind: "turn", turnId: turnIdA, filePath: null, revealRequestId: 0 };
+    h.checkpointDiff = {
+      data: undefined,
+      error: "The checkpoint for turn 4 is no longer in the repository.",
+      isPending: false,
+    };
+    const markup = render();
+    expect(markup).toContain("The checkpoint for turn 4 is no longer in the repository.");
+    expect(markup).not.toContain("No net changes");
+  });
+});
+
 describe("DiffPanel: files patch", () => {
   it("renders the annotatable code view for a files patch", () => {
     const markup = render();
