@@ -325,11 +325,25 @@ impl DiffToolLauncher {
                 Vec::new(),
             ));
         }
-        let cwd = PathBuf::from(&input.cwd);
+        // Git prints a patch's paths from the repository's top, also for a project in a
+        // subdirectory of it, so Git runs there and the paths mean the same files.
+        let top = run_git(
+            Path::new(&input.cwd),
+            "Review.openDiffTool.top",
+            &["rev-parse", "--show-toplevel"],
+            false,
+            &CancellationToken::new(),
+        )
+        .await?;
+        let top = top.trim();
+        if top.is_empty() {
+            return Err(invalid("This folder is not in a Git repository."));
+        }
+        let cwd = PathBuf::from(top);
         let revisions = self.revisions(&cwd, &input.scope).await?;
         let args =
             difftool_args(&cwd, &input.tool_id, &input.target, &revisions).map_err(invalid)?;
-        let mut command = vec!["git".to_owned(), "-C".to_owned(), input.cwd.clone()];
+        let mut command = vec!["git".to_owned(), "-C".to_owned(), top.to_owned()];
         command.extend(args.iter().cloned());
         let Some(slot) = RunningSlot::reserve(&self.state) else {
             return Err(failure(
@@ -391,17 +405,27 @@ impl DiffToolLauncher {
             Some(Err(ProcessRegistrationError::Capacity)) | None => {}
         }
 
-        match tokio::time::timeout(LAUNCH_WINDOW, child.wait()).await {
+        // The reaper owns the process from here, so a request dropped during the launch window
+        // frees the slot, the registration and the log only when the tool exits.
+        let (window, exited) = tokio::sync::oneshot::channel();
+        let launcher = self.clone();
+        let running = RunningLaunch {
+            launch,
+            child,
+            pid,
+            started,
+            tool_id: input.tool_id.clone(),
+            log,
+            slot,
+            window,
+        };
+        self.state
+            .reapers
+            .spawn(async move { launcher.reap(running).await });
+        match tokio::time::timeout(LAUNCH_WINDOW, exited).await {
             // Some launchers hand the files to a running app and return at once.
-            Ok(Ok(status)) if status.success() => {
-                self.finish(launch, pid, started, &status, log);
-                drop(slot);
-                Ok(())
-            }
-            Ok(Ok(status)) => {
-                let detail = log.tail();
-                self.finish(launch, pid, started, &status, log);
-                drop(slot);
+            Ok(Ok(WindowExit::Exited { status, .. })) if status.success() => Ok(()),
+            Ok(Ok(WindowExit::Exited { status, detail })) => {
                 let code = status
                     .code()
                     .map_or_else(|| "a signal".to_owned(), |code| format!("exit {code}"));
@@ -416,31 +440,13 @@ impl DiffToolLauncher {
                     command,
                 ))
             }
-            Ok(Err(error)) => {
-                lock(&self.state.registrations).remove(&launch);
-                Err(failure(
-                    ReviewDiffToolFailureReason::LaunchFailed,
-                    format!("Couldn't follow git difftool: {error}"),
-                    command,
-                ))
-            }
-            // Still running: the app is open. A reaper waits for it.
-            Err(_) => {
-                let launcher = self.clone();
-                let running = RunningLaunch {
-                    launch,
-                    child,
-                    pid,
-                    started,
-                    tool_id: input.tool_id.clone(),
-                    log,
-                    slot,
-                };
-                self.state
-                    .reapers
-                    .spawn(async move { launcher.reap(running).await });
-                Ok(())
-            }
+            Ok(Ok(WindowExit::WaitFailed(error))) => Err(failure(
+                ReviewDiffToolFailureReason::LaunchFailed,
+                format!("Couldn't follow git difftool: {error}"),
+                command,
+            )),
+            // Still running, or shutdown began and left it running: the app is open.
+            Ok(Err(_)) | Err(_) => Ok(()),
         }
     }
 
@@ -453,33 +459,42 @@ impl DiffToolLauncher {
             tool_id,
             log,
             slot,
+            window,
         } = running;
         tokio::select! {
             status = child.wait() => {
-                match status {
+                // Freed before the launch hears of the exit, so it never sees a stale count.
+                drop(slot);
+                let exit = match status {
                     Ok(status) => {
-                        if !status.success() {
-                            tracing::warn!(
-                                tool = %tool_id,
-                                exit_code = ?status.code(),
-                                "diff app exited with a failure"
-                            );
-                        }
+                        let detail = if status.success() { String::new() } else { log.tail() };
                         self.finish(launch, pid, started, &status, log);
+                        WindowExit::Exited { status, detail }
                     }
                     Err(error) => {
                         tracing::warn!(tool = %tool_id, %error, "could not wait for a diff app");
                         lock(&self.state.registrations).remove(&launch);
+                        WindowExit::WaitFailed(error)
                     }
+                };
+                // A launch still in its window reports the exit; a later failure is only logged.
+                if let Err(WindowExit::Exited { status, .. }) = window.send(exit)
+                    && !status.success()
+                {
+                    tracing::warn!(
+                        tool = %tool_id,
+                        exit_code = ?status.code(),
+                        "diff app exited with a failure"
+                    );
                 }
             }
             // Shutdown: leave the app running, its registration a survivor, and its log in the
             // temporary directory, where Git's own temporary files also stay until it exits.
             () = self.state.shutdown.cancelled() => {
                 log.keep();
+                drop(slot);
             }
         }
-        drop(slot);
     }
 
     /// Reports the exit and lets the launch go: its registration and its log.
@@ -593,7 +608,7 @@ impl DiffToolBackend for DiffToolLauncher {
     }
 }
 
-/// A launched tool still running after the launch window, handed to its reaper.
+/// A launched tool, handed to its reaper as soon as it starts.
 struct RunningLaunch {
     launch: u64,
     child: Child,
@@ -602,6 +617,14 @@ struct RunningLaunch {
     tool_id: String,
     log: LaunchLog,
     slot: RunningSlot,
+    /// Tells a launch still in its window how the tool ended.
+    window: tokio::sync::oneshot::Sender<WindowExit>,
+}
+
+/// How a launched tool ended, for a launch still waiting in its window.
+enum WindowExit {
+    Exited { status: ExitStatus, detail: String },
+    WaitFailed(std::io::Error),
 }
 
 /// One of the at most 16 running launches; dropping it frees the slot.
@@ -1233,6 +1256,32 @@ ps -o pgid= -p $$ | tr -d ' ' >> "$dir/pgids"
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn a_launch_dropped_in_its_window_keeps_its_slot_until_the_tool_exits() {
+        let exits = exits::CapturedExits::start();
+        let repository = Repository::new();
+        repository.write("tracked.txt", "after\n");
+        let tool = FakeTool::install(&repository, "exec sleep 30");
+        let registry = ProcessAttributionRegistry::new();
+        let launcher = DiffToolLauncher::new(registry.clone());
+        let input = repository.open(file("tracked.txt", None), ReviewDiffToolScope::WorkingTree);
+
+        // The client goes away while the launch waits to see the tool fail.
+        tokio::select! {
+            result = launcher.open(&input) => panic!("the launch window ended first: {result:?}"),
+            () = wait_until("the tool started", || !tool.pgids().is_empty()) => {}
+        }
+        assert_eq!(launcher.running(), 1, "the running tool keeps its slot");
+        assert_eq!(registry.registered_sources().len(), 1);
+
+        tool.kill_all();
+        wait_until("the reaper saw the exit", || launcher.running() == 0).await;
+        let findings = exits.take();
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(registry.registered_sources().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn a_failing_tool_reports_gits_message_and_exit_code() {
         let exits = exits::CapturedExits::start();
         let repository = Repository::new();
@@ -1260,7 +1309,12 @@ ps -o pgid= -p $$ | tr -d ' ' >> "$dir/pgids"
         );
         assert_eq!(
             failure.command[..4],
-            ["git", "-C", repository.cwd().as_str(), "difftool"]
+            [
+                "git",
+                "-C",
+                repository.git(&["rev-parse", "--show-toplevel"]).as_str(),
+                "difftool"
+            ]
         );
         assert!(failure.command.contains(&"--tool=fake".to_owned()));
 
@@ -1275,6 +1329,31 @@ ps -o pgid= -p $$ | tr -d ' ' >> "$dir/pgids"
         assert!(failure.message.ends_with("(exit 3)"), "{}", failure.message);
         assert_eq!(launcher.running(), 0);
         assert!(exits.take().is_empty(), "an exit code is not a crash");
+    }
+
+    /// Git prints a patch's paths from the repository's top, also for a project in a
+    /// subdirectory of it, and the launch must name the same file.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_project_in_a_subdirectory_opens_the_patchs_repository_path() {
+        let repository = Repository::new();
+        std::fs::create_dir(repository.path().join("sub")).expect("subdirectory");
+        repository.write("sub/inner.txt", "inner before\n");
+        repository.git(&["add", "sub/inner.txt"]);
+        repository.git(&["commit", "--quiet", "-m", "inner"]);
+        repository.write("sub/inner.txt", "inner after\n");
+        let tool = FakeTool::install(&repository, "exit 0");
+        let mut input = repository.open(
+            file("sub/inner.txt", None),
+            ReviewDiffToolScope::WorkingTree,
+        );
+        input.cwd = repository.path().join("sub").to_string_lossy().into_owned();
+
+        launcher().open(&input).await.expect("opened");
+        assert_eq!(
+            tool.take_calls(),
+            "sub/inner.txt\ninner before\n--\ninner after\n==\n"
+        );
     }
 
     #[cfg(unix)]
