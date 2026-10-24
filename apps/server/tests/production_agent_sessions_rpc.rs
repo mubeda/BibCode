@@ -1255,3 +1255,78 @@ async fn no_panel_outlives_its_host() {
     );
     history.shutdown().await;
 }
+
+/// Two clients continue one session from two threads of the same folder at once, both before
+/// either panel exists. One creates the panel of its thread; the other is told where it is.
+#[tokio::test]
+async fn concurrent_opens_of_one_session_report_the_panel_that_won() {
+    let loaded = StepGate::new();
+    let mut history = History::start(Gates {
+        loaded: Some(loaded.clone()),
+        ..Gates::default()
+    })
+    .await;
+    let (home, root) = (history.claude_home.clone(), history.root.clone());
+    write_terminal_session(
+        &home,
+        &root,
+        ROOT_ID,
+        "Root work",
+        1,
+        Duration::from_secs(60),
+    );
+    history
+        .dispatch(json!({
+            "type":"thread.create","commandId":"create-other-root-host","threadId":"other-root-host",
+            "projectId":"project","title":"other-root-host",
+            "modelSelection":{"instanceId":"codex","model":"gpt-5.4"},
+            "runtimeMode":"full-access","createdAt":"2026-10-01T00:00:00.000Z"
+        }))
+        .await;
+    let mut other_client = connect_async(format!("ws://{}/ws", history.handle.local_addr()))
+        .await
+        .unwrap()
+        .0;
+    send(
+        &mut history.socket,
+        "1",
+        "agentSessions.openInPanel",
+        json!({"commandId":"first-client","hostThreadId":"root-host","sessionId":ROOT_ID,"mode":"resume"}),
+    )
+    .await;
+    timeout(RESPONSE_DEADLINE, loaded.wait_until_reached())
+        .await
+        .expect("the first client read the transcript");
+    send(
+        &mut other_client,
+        "1",
+        "agentSessions.openInPanel",
+        json!({"commandId":"second-client","hostThreadId":"other-root-host","sessionId":ROOT_ID,"mode":"resume"}),
+    )
+    .await;
+    timeout(RESPONSE_DEADLINE, loaded.wait_until_reached())
+        .await
+        .expect("the second client read the transcript");
+
+    let import_thread = format!("import:claudeAgent:{ROOT_ID}");
+    loaded.release();
+    assert_eq!(
+        opened(exit_of(&mut history.socket, "1").await),
+        json!({"threadId":import_thread,"hostThreadId":"root-host","outcome":"created"})
+    );
+    loaded.release();
+    assert_eq!(
+        opened(exit_of(&mut other_client, "1").await),
+        json!({"threadId":import_thread,"hostThreadId":"root-host","outcome":"existing"})
+    );
+    let panel = history
+        .engine
+        .repositories()
+        .get_thread(import_thread)
+        .await
+        .unwrap()
+        .expect("panel thread");
+    assert_eq!(panel.host_thread_id.as_deref(), Some("root-host"));
+    assert_eq!(panel.runtime_mode, "auto-accept-edits");
+    history.shutdown().await;
+}

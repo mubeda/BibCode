@@ -827,26 +827,9 @@ async fn import_session(
         .await
         .map_err(unreadable)?;
     if let Some(thread) = &existing {
-        if thread.deleted_at.is_some() {
-            return Err(match request.target {
-                ImportTarget::Sidebar => {
-                    "This session was imported before and its thread was deleted."
-                }
-                ImportTarget::Panel(PanelTarget { fork_id: None, .. }) => SESSION_CHAT_DELETED,
-                ImportTarget::Panel(_) => COPY_CHAT_DELETED,
-            }
-            .to_owned());
-        }
-        if thread.project_id != request.project.project_id {
-            return Err("This session was already imported into another project.".to_owned());
-        }
+        refuse_existing(request, thread)?;
     }
-    if repositories
-        .get_command_receipt(history_command_id.clone())
-        .await
-        .map_err(unreadable)?
-        .is_some_and(|receipt| receipt.status == "accepted")
-    {
+    if history_committed(services, &history_command_id).await? {
         return Ok(ImportOutcome::Existing {
             host_thread_id: existing.as_ref().and_then(panel_host),
         });
@@ -998,6 +981,21 @@ async fn import_session(
             if host_folder(&host, &project) != panel.folder {
                 return Err(FOLDER_CHANGED.to_owned());
             }
+            // Another open of this session created its thread after the read above, under this
+            // lock. Its create would replay as accepted, so report that thread and its own host.
+            if let Some(thread) = repositories
+                .get_thread(thread_id.to_owned())
+                .await
+                .map_err(unreadable)?
+            {
+                refuse_existing(request, &thread)?;
+                if !history_committed(services, &history_command_id).await? {
+                    finish(thread.runtime_mode.clone(), session).await?;
+                }
+                return Ok(ImportOutcome::Existing {
+                    host_thread_id: panel_host(&thread),
+                });
+            }
             let title = if panel.fork_id.is_some() {
                 format!("{} (copy)", session.title)
             } else {
@@ -1033,6 +1031,33 @@ async fn import_session(
         })
         .await
         .unwrap_or_else(|| Err("The import was cancelled.".to_owned()))
+}
+
+/// Refuses an import whose thread was deleted or belongs to another project.
+fn refuse_existing(request: &ImportRequest<'_>, thread: &ProjectionThread) -> Result<(), String> {
+    if thread.deleted_at.is_some() {
+        return Err(match request.target {
+            ImportTarget::Sidebar => "This session was imported before and its thread was deleted.",
+            ImportTarget::Panel(PanelTarget { fork_id: None, .. }) => SESSION_CHAT_DELETED,
+            ImportTarget::Panel(_) => COPY_CHAT_DELETED,
+        }
+        .to_owned());
+    }
+    if thread.project_id != request.project.project_id {
+        return Err("This session was already imported into another project.".to_owned());
+    }
+    Ok(())
+}
+
+/// Whether the import's history command was accepted, which marks the import complete.
+async fn history_committed(services: &Services, history_command_id: &str) -> Result<bool, String> {
+    services
+        .orchestration
+        .repositories()
+        .get_command_receipt(history_command_id.to_owned())
+        .await
+        .map(|receipt| receipt.is_some_and(|receipt| receipt.status == "accepted"))
+        .map_err(|_| "BiBCode could not read its threads. Try again.".to_owned())
 }
 
 /// The thread row for `thread_id` unless it was deleted.

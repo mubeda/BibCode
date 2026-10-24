@@ -126,7 +126,9 @@ first, until 200 rows or the budget runs out (`truncated`):
 Liveness reads `<config dir>/sessions/*.json` once (at most 256 files of
 64 KiB, fields `sessionId`, `pid` and `entrypoint`): a file naming the session
 whose process runs makes it `live`; BiBCode's own `sdk-rust` entries are
-skipped. Only a complete read makes the rest `closed`; a missing or unreadable
+skipped. A process the process table leaves out because this user may not
+inspect it (a root process, or another user's under a restricted `/proc`)
+still runs when a signal-zero check finds it, so it is `live` too. Only a complete read makes the rest `closed`; a missing or unreadable
 directory, more than 256 files, or one file that is unreadable, unparsable or
 oversized leaves every session not found live `unknown`. Claude Code keeps
 the directory once it created it (observed on macOS with 2.1.310), so a
@@ -160,7 +162,9 @@ cancelled, which a closed menu does.
    session is open in a terminal. Choose Continue in a copy."). This read takes
    no lock.
 5. Under the project mutation lock it re-reads the host and requires the folder
-   from step 1 ("This thread's folder changed. Try again."), then dispatches
+   from step 1 ("This thread's folder changed. Try again."). A thread with the
+   ID that another open created meanwhile returns `existing` with that
+   thread's own host, finishing its import if needed. Otherwise it dispatches
    `thread.create` as `<threadId>:create` with `kind: panel`, the host's ID,
    branch, worktree and runtime mode, interaction mode `default`, the import's
    model selection, and the session's title (`<title> (copy)` for a copy). The
