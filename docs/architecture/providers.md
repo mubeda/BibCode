@@ -846,8 +846,9 @@ exits with a failure before its first `system/init` fails the message with
 "Claude Code couldn't continue this session here. It may still be running in a
 terminal or in the background. Choose Continue in a copy in History." and the
 event pump writes `"resumeRefused": true` into the runtime row's payload, which
-History reports so it offers a copy. The next launch writes the row anew, so a
-later successful start clears it. The cause is not classified, because
+History reports so it offers a copy. The ended session stays registered, and
+its later row writes (idle suspension, shutdown) keep the mark. The next launch
+writes the row anew, so a later successful start clears it. The cause is not classified, because
 Claude's message is not a contract. Native threads and copies, which History
 never lists, keep the usual early-exit error.
 

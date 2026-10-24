@@ -838,6 +838,9 @@ struct SessionEntry {
     /// The session is a new provider conversation for a thread whose earlier one was lost, so
     /// the next turn sent to it carries the thread's earlier messages.
     pending_context_handoff: Arc<AtomicBool>,
+    /// The event pump recorded that the provider refused to resume this session, so every later
+    /// write of its runtime row keeps `resumeRefused` until another launch replaces the entry.
+    resume_refusal_recorded: Arc<AtomicBool>,
     terminal_sender: mpsc::UnboundedSender<SupervisorMessage>,
     activity_dispatch_sender: mpsc::Sender<ActivityDispatchEnvelope>,
     activity_dispatch_capacity: usize,
@@ -7398,6 +7401,7 @@ async fn launch_session(
         }
     }
     let pending_context_handoff = Arc::new(AtomicBool::new(context_handoff));
+    let resume_refusal_recorded = Arc::new(AtomicBool::new(false));
     persist_runtime(
         &engine.repositories(),
         &request,
@@ -7427,6 +7431,7 @@ async fn launch_session(
         started.resume_cursor.clone(),
         started.runtime_payload.clone(),
         pending_context_handoff.clone(),
+        resume_refusal_recorded.clone(),
         activity.clone(),
         activity_lifecycle.clone(),
         activity_capable,
@@ -7469,6 +7474,7 @@ async fn launch_session(
             pending_stream_settlement: None,
             idle_generation,
             pending_context_handoff,
+            resume_refusal_recorded,
             terminal_sender,
             activity_dispatch_sender,
             activity_dispatch_capacity,
@@ -8369,6 +8375,7 @@ fn spawn_event_pump(
     resume_cursor: Option<Value>,
     runtime_payload: Option<Value>,
     pending_context_handoff: Arc<AtomicBool>,
+    resume_refusal_recorded: Arc<AtomicBool>,
     activity: ActivityProjection,
     activity_lifecycle: SharedActivityLifecycle,
     activity_capable: bool,
@@ -8762,6 +8769,8 @@ fn spawn_event_pump(
         }
         // History offers a copy of an imported session whose resume Claude refused.
         if unexpected && driver.resume_refused() {
+            // The session stays registered; later writes of its row keep the mark.
+            resume_refusal_recorded.store(true, Ordering::Release);
             let payload =
                 runtime_payload_with_resume_refused(runtime_payload_with_context_handoff(
                     runtime_payload.clone(),
@@ -9585,10 +9594,15 @@ fn saved_context_handoff(payload: Option<&Value>) -> bool {
 }
 
 fn entry_runtime_payload(entry: &SessionEntry) -> Option<Value> {
-    runtime_payload_with_context_handoff(
+    let payload = runtime_payload_with_context_handoff(
         entry.runtime_payload.clone(),
         entry.pending_context_handoff.load(Ordering::Acquire),
-    )
+    );
+    if entry.resume_refusal_recorded.load(Ordering::Acquire) {
+        runtime_payload_with_resume_refused(payload)
+    } else {
+        payload
+    }
 }
 
 async fn persist_runtime(
@@ -19093,6 +19107,7 @@ done
                 Some(json!({"sessionId":"session"})),
                 Some(json!({"transport":"stream-json"})),
                 Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
                 activity,
                 Arc::new(StdMutex::new(super::ProviderActivityLifecycleState::new(
                     crate::activity::ActivityCapabilities::default(),
@@ -19135,6 +19150,64 @@ done
                 }));
             }
         }
+    }
+
+    /// The session stays registered after its stream ends, and a shutdown writes its runtime row
+    /// again: the refusal must survive that, so History keeps offering a copy.
+    #[tokio::test]
+    async fn a_refused_resume_survives_a_shutdown_before_the_next_launch() {
+        let engine = supervisor_engine().await;
+        let activity = super::ActivityProjection::new(ActivityRepository::new(
+            engine.repositories().database().clone(),
+        ));
+        let state = Arc::new(StdMutex::new(SupervisorDriverState {
+            resume_refused: true,
+            ..SupervisorDriverState::default()
+        }));
+        let (events_tx, events_rx) = mpsc::channel(1);
+        let supervisor = super::ProviderRuntimeSupervisor::start(
+            engine.clone(),
+            Arc::new(SupervisorFactory {
+                state,
+                events: StdMutex::new(Some(events_rx)),
+            }),
+            activity,
+            super::SupervisorOptions::default(),
+        );
+        let temp = TempDir::new().expect("launch directory");
+        let mut launch = native_launch(&temp, "claudeAgent");
+        launch.thread_id = "t1".to_owned();
+        supervisor.launch(launch).await.expect("launch runtime");
+        drop(events_tx);
+        let refused = |runtime: Option<ProviderSessionRuntime>| {
+            runtime
+                .and_then(|runtime| runtime.runtime_payload)
+                .is_some_and(|payload| payload.get("resumeRefused") == Some(&json!(true)))
+        };
+        timeout(Duration::from_secs(5), async {
+            while !refused(
+                engine
+                    .repositories()
+                    .get_provider_session_runtime("t1".to_owned())
+                    .await
+                    .expect("runtime read"),
+            ) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the event pump records the refusal");
+
+        supervisor.shutdown().await.expect("shutdown");
+        let runtime = engine
+            .repositories()
+            .get_provider_session_runtime("t1".to_owned())
+            .await
+            .expect("runtime read")
+            .expect("runtime row");
+        assert_eq!(runtime.status, "suspended");
+        assert!(refused(Some(runtime)), "the shutdown kept the refusal");
+        engine.shutdown().await;
     }
 
     #[tokio::test]
@@ -20767,6 +20840,7 @@ done
             None,
             None,
             Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
             activity,
             Arc::new(StdMutex::new(super::ProviderActivityLifecycleState::new(
                 crate::activity::ActivityCapabilities::default(),
@@ -20905,6 +20979,7 @@ done
             launch,
             None,
             None,
+            Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
             activity.clone(),
             activity_lifecycle,
@@ -21164,6 +21239,7 @@ done
             None,
             None,
             Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
             activity.clone(),
             activity_lifecycle,
             true,
@@ -21359,6 +21435,7 @@ done
             launch,
             None,
             None,
+            Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
             activity.clone(),
             activity_lifecycle,
