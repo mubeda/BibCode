@@ -1319,7 +1319,8 @@ the one with an error, else the one with running work (Subagents first), else
 the one with the most recent record. With the panel already open, the button
 brings it to the front on that section and never closes it. A stale or error
 icon on the button means a section, or the whole observation, is degraded;
-errors win over stale. The button's accessible name and tooltip give the counts
+errors win over stale. A section that fails before its first record still marks
+the button, and a click opens it on that error. The button's accessible name and tooltip give the counts
 for each section. Each Subagents row in the panel shows one provider icon for
 its actor, and the same Activity presentation is used in the inline right panel
 and its responsive sheet.

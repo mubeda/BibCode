@@ -361,6 +361,42 @@ describe("ActivityDock", () => {
     },
   );
 
+  it.each([
+    ["off", false],
+    ["on", true],
+  ] as const)(
+    "marks and opens a failing section that has no records yet, with always visible %s",
+    async (_setting, alwaysVisible) => {
+      const onOpenSection = vi.fn();
+      // Codex rejected its background-terminal list before any record arrived.
+      const failedBeforeRecords = snapshot({
+        capabilities: {
+          actors: true,
+          attributedActivity: true,
+          backgroundWork: false,
+          historyRecovery: "full",
+          terminalObservation: false,
+          targetedActorCancellation: false,
+        },
+        sections: sections("live", "error"),
+        counts: counts({ active: 1, done: 1 }, { active: 0, done: 0 }),
+      });
+      const container = await mount(
+        <ActivityDock
+          {...props({ alwaysVisible, onOpenSection, snapshot: failedBeforeRecords })}
+        />,
+      );
+      const button = pill(container);
+
+      expect(button.querySelector('[data-activity-status="error"]')).not.toBeNull();
+      expect(button.getAttribute("aria-label")).toBe(
+        "Open Activity: Subagents 1 active, 1 done. Status: error",
+      );
+      await act(async () => button.click());
+      expect(onOpenSection).toHaveBeenCalledWith("backgroundTasks");
+    },
+  );
+
   it("shows no marker while every section is live", async () => {
     const container = await mount(<ActivityDock {...props()} />);
     expect(container.querySelector("[data-activity-status]")).toBeNull();

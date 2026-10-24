@@ -220,20 +220,26 @@ function latestUpdate(records: ReadonlyArray<ActivityDockRecord>): string | null
   return latest;
 }
 
+/**
+ * Counts and recency come only from a shown section. Health does not: a section
+ * that failed before its first record is hidden but still marks the pill and
+ * wins navigation, so its error stays one click away.
+ */
 function summarizeSection(
   shown: boolean,
   counts: ActivitySnapshot["counts"]["subagents"],
   health: ActivitySnapshot["sections"]["subagents"],
   records: ReadonlyArray<ActivityDockRecord>,
 ): SectionSummary {
+  const state = degradedSectionState(health.state);
   return shown
     ? {
         active: counts.active,
         done: counts.done,
-        state: degradedSectionState(health.state),
+        state,
         latest: latestUpdate(records),
       }
-    : { active: 0, done: 0, state: null, latest: null };
+    : { active: 0, done: 0, state, latest: null };
 }
 
 /**
