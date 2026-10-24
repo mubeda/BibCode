@@ -201,8 +201,11 @@ const composerItemMatchesTrigger = (
   return item.type === "file-reference" || item.type === "agent-reference";
 };
 
-/** A trigger the user closed with Escape: it stays closed while that token is typed on. */
-type DismissedComposerTrigger = Pick<ComposerTrigger, "kind" | "rangeStart">;
+/**
+ * A trigger the user closed with Escape, with its query as last seen: it stays closed while that
+ * token is typed on or corrected, and opens again once an edit replaces the token.
+ */
+type DismissedComposerTrigger = Pick<ComposerTrigger, "kind" | "rangeStart" | "query">;
 
 const isDismissedComposerTrigger = (
   trigger: ComposerTrigger | null,
@@ -211,7 +214,11 @@ const isDismissedComposerTrigger = (
   trigger !== null &&
   dismissed !== null &&
   trigger.kind === dismissed.kind &&
-  trigger.rangeStart === dismissed.rangeStart;
+  trigger.rangeStart === dismissed.rangeStart &&
+  // Typing on or deleting back keeps one query a prefix of the other; pasting over the token
+  // does not. Typing over a selected token first leaves the bare trigger, which starts over.
+  (trigger.query.startsWith(dismissed.query) || dismissed.query.startsWith(trigger.query)) &&
+  !(trigger.query.length === 0 && dismissed.query.length > 0);
 
 const syncTerminalContextsByIds = (
   contexts: ReadonlyArray<TerminalContextDraft>,
@@ -1086,12 +1093,17 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   // ------------------------------------------------------------------
   // Derived: composer trigger / menu
   // ------------------------------------------------------------------
-  // A new trigger, or the same one gone, ends an Escape dismissal.
-  if (
-    dismissedComposerTrigger !== null &&
-    !isDismissedComposerTrigger(composerTrigger, dismissedComposerTrigger)
-  ) {
-    setDismissedComposerTrigger(null);
+  // A new trigger, the same one gone, or its token replaced ends an Escape dismissal; while the
+  // token is typed on, the dismissal follows its query.
+  if (dismissedComposerTrigger !== null) {
+    if (
+      composerTrigger === null ||
+      !isDismissedComposerTrigger(composerTrigger, dismissedComposerTrigger)
+    ) {
+      setDismissedComposerTrigger(null);
+    } else if (composerTrigger.query !== dismissedComposerTrigger.query) {
+      setDismissedComposerTrigger({ ...dismissedComposerTrigger, query: composerTrigger.query });
+    }
   }
   const menuTrigger = isDismissedComposerTrigger(composerTrigger, dismissedComposerTrigger)
     ? null
@@ -1909,7 +1921,11 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       // Escape closes the menu for this token, for a `/usr/bin` that is not a command; with no
       // menu it is left to the page.
       if (!menuIsActive || trigger === null) return false;
-      const dismissed = { kind: trigger.kind, rangeStart: trigger.rangeStart };
+      const dismissed = {
+        kind: trigger.kind,
+        rangeStart: trigger.rangeStart,
+        query: trigger.query,
+      };
       dismissedComposerTriggerRef.current = dismissed;
       setDismissedComposerTrigger(dismissed);
       return true;

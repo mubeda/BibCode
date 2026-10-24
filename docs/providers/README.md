@@ -33,7 +33,9 @@ precedence apply; disabled or non-invocable native skills are not suggestions.
 Like `@` for files and agents, `$` and `/` open the menu at the start of any
 word, mid-prompt too, while BiBCode's own `:` actions open it only at the start
 of a line. Escape closes the menu for that word, and a space ends the word, so
-an absolute path such as `/usr/bin` stays plain text. A command or skill picked
+an absolute path such as `/usr/bin` stays plain text. The menu stays closed
+while the word is typed on or corrected, and opens again once the word is
+replaced or cut back to its bare trigger. A command or skill picked
 mid-prompt is inserted as text; whether the agent runs it as a command is up to
 the provider, which may treat only a message that starts with `/` as one.
 

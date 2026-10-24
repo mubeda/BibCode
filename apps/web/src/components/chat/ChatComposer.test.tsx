@@ -2295,6 +2295,7 @@ describe("ChatComposer command keys", () => {
     expect(setStateValues(STATE.dismissedTrigger)).toContainEqual({
       kind: "provider-slash",
       rangeStart: 4,
+      query: "usr",
     });
     // Before the menu re-renders closed, Enter already sends instead of picking an item.
     expect(onKey("Enter", keyEvent())).toBe(true);
@@ -2303,9 +2304,17 @@ describe("ChatComposer command keys", () => {
 
   it("keeps a dismissed menu closed for that token and leaves Escape to the page", () => {
     seedPrompt("run /usr/bin");
-    h.stateSeeds.set(STATE.dismissedTrigger, { kind: "provider-slash", rangeStart: 4 });
+    h.stateSeeds.set(STATE.dismissedTrigger, {
+      kind: "provider-slash",
+      rangeStart: 4,
+      query: "usr",
+    });
     renderComposer();
     expect(filterCaptures("ComposerCommandMenu")).toHaveLength(0);
+    // Typing on is the same token; its query is followed so a later replacement shows.
+    expect(setStateValues(STATE.dismissedTrigger)).toEqual([
+      { kind: "provider-slash", rangeStart: 4, query: "usr/bin" },
+    ]);
     setEditorSnapshot("run /usr/bin", 12);
     const onKey = editorProps()["onCommandKeyDown"] as CommandKey;
 
@@ -2315,11 +2324,58 @@ describe("ChatComposer command keys", () => {
 
   it("opens the menu again for a new slash token after a dismissal", () => {
     seedPrompt("run /usr then /rev");
-    h.stateSeeds.set(STATE.dismissedTrigger, { kind: "provider-slash", rangeStart: 4 });
+    h.stateSeeds.set(STATE.dismissedTrigger, {
+      kind: "provider-slash",
+      rangeStart: 4,
+      query: "usr",
+    });
     renderComposer();
 
     expect(setStateValues(STATE.dismissedTrigger)).toContain(null);
     expect(filterCaptures("ComposerCommandMenu")).toHaveLength(1);
+  });
+
+  it("keeps the menu closed for a path typed after Escape on a bare slash", () => {
+    seedPrompt("/usr");
+    h.stateSeeds.set(STATE.dismissedTrigger, { kind: "provider-slash", rangeStart: 0, query: "" });
+    renderComposer();
+
+    expect(filterCaptures("ComposerCommandMenu")).toHaveLength(0);
+    expect(setStateValues(STATE.dismissedTrigger)).toEqual([
+      { kind: "provider-slash", rangeStart: 0, query: "usr" },
+    ]);
+  });
+
+  it("opens the menu again when the dismissed token is replaced at the same place (#152)", () => {
+    // `/usr` dismissed, then selected and pasted over with `/rev`.
+    seedPrompt("/rev");
+    h.stateSeeds.set(STATE.dismissedTrigger, {
+      kind: "provider-slash",
+      rangeStart: 0,
+      query: "usr",
+    });
+    renderComposer();
+
+    expect(setStateValues(STATE.dismissedTrigger)).toContain(null);
+    expect(filterCaptures("ComposerCommandMenu")).toHaveLength(1);
+  });
+
+  it("starts over when the dismissed token is cut back to its slash (#152)", () => {
+    // `/usr` dismissed, then selected and typed over: the first key leaves a bare `/`.
+    seedPrompt("/");
+    h.stateSeeds.set(STATE.dismissedTrigger, {
+      kind: "provider-slash",
+      rangeStart: 0,
+      query: "usr",
+    });
+    renderComposer();
+    setEditorSnapshot("/", 1);
+    const onKey = editorProps()["onCommandKeyDown"] as CommandKey;
+
+    expect(setStateValues(STATE.dismissedTrigger)).toContain(null);
+    expect(filterCaptures("ComposerCommandMenu")).toHaveLength(1);
+    // Before the menu re-renders open, Escape closes it again rather than leaving it to the page.
+    expect(onKey("Escape", keyEvent())).toBe(true);
   });
 
   it("leaves Escape to the page when no menu is open", () => {
