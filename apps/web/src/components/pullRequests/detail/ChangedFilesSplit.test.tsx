@@ -131,6 +131,31 @@ describe("ChangedFilesSplit", () => {
     expect(navWidth()).toBe("600px");
   });
 
+  it("gives the page its cursor and text selection back when unmounted mid-drag", async () => {
+    await render();
+    await pointer("pointerdown", 100);
+    await pointer("pointermove", 180);
+    expect(document.body.style.userSelect).toBe("none");
+
+    await act(async () => root.render(<p>elsewhere</p>));
+
+    expect(document.body.style.cursor).toBe("");
+    expect(document.body.style.userSelect).toBe("");
+    expect(stored()).toBeNull();
+  });
+
+  it("drops a drag whose pointer capture is lost", async () => {
+    localStorage.setItem(STORAGE_KEY, "300");
+    await render();
+    await pointer("pointerdown", 100);
+    await pointer("pointermove", 180);
+
+    await pointer("lostpointercapture", 180);
+
+    expect([navWidth(), stored()]).toEqual(["300px", "300"]);
+    expect(document.body.style.userSelect).toBe("");
+  });
+
   it("nudges, jumps, and resets the width from the keyboard and double-click", async () => {
     await render();
 
