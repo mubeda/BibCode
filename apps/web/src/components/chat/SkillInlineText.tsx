@@ -1,47 +1,34 @@
 import { Children, cloneElement, isValidElement, type ReactNode } from "react";
-import type { ServerProviderSkill } from "@bibcode/contracts";
 
-import { formatProviderSkillDisplayName } from "../../providerSkillPresentation";
 import {
   CHAT_INLINE_CHIP_CLASS_NAME,
   CHAT_INLINE_CHIP_LABEL_CLASS_NAME,
   COMPOSER_INLINE_CHIP_ICON_CLASS_NAME,
   SKILL_CHIP_ICON_SVG,
 } from "../composerInlineChip";
+import { skillChipLabel, splitSkillTokens, type InlineSkill } from "../chatMarkdownPipeline";
 import { cn } from "~/lib/utils";
 
-const SKILL_TOKEN_REGEX = /(^|\s)\$([a-zA-Z][a-zA-Z0-9:_-]*)(?=\s|$)/g;
-
-type InlineSkill = Pick<ServerProviderSkill, "name" | "displayName">;
-
 export function SkillInlineText(props: { text: string; skills: ReadonlyArray<InlineSkill> }) {
-  const nodes: ReactNode[] = [];
-  let cursor = 0;
-
-  for (const match of props.text.matchAll(SKILL_TOKEN_REGEX)) {
-    const prefix = match[1] ?? "";
-    const name = match[2] ?? "";
-    const start = (match.index ?? 0) + prefix.length;
-    const rawText = `$${name}`;
-    const skill = props.skills.find((candidate) => candidate.name === name);
-    if (!skill) {
-      continue;
-    }
-
-    if (start > cursor) {
-      nodes.push(props.text.slice(cursor, start));
-    }
-    nodes.push(<SkillChip key={`${start}:${name}`} skill={skill} rawText={rawText} />);
-    cursor = start + rawText.length;
-  }
-
-  if (cursor === 0) {
+  const segments = splitSkillTokens(props.text, props.skills);
+  if (segments.length === 1 && segments[0]?.kind === "text") {
     return <>{props.text}</>;
   }
-  if (cursor < props.text.length) {
-    nodes.push(props.text.slice(cursor));
-  }
-  return <>{nodes}</>;
+  return (
+    <>
+      {segments.map((segment) =>
+        segment.kind === "text" ? (
+          segment.text
+        ) : (
+          <SkillChip
+            key={`${segment.start}:${segment.skill.name}`}
+            skill={segment.skill}
+            rawText={segment.rawText}
+          />
+        ),
+      )}
+    </>
+  );
 }
 
 export function renderSkillInlineMarkdownChildren(
@@ -81,11 +68,10 @@ function SkillChip(props: { skill: InlineSkill; rawText: string }) {
         <span
           aria-hidden="true"
           className={COMPOSER_INLINE_CHIP_ICON_CLASS_NAME}
+          data-find-ignore=""
           dangerouslySetInnerHTML={{ __html: SKILL_CHIP_ICON_SVG }}
         />
-        <span className={CHAT_INLINE_CHIP_LABEL_CLASS_NAME}>
-          {formatProviderSkillDisplayName(props.skill)}
-        </span>
+        <span className={CHAT_INLINE_CHIP_LABEL_CLASS_NAME}>{skillChipLabel(props.skill)}</span>
       </span>
     </span>
   );

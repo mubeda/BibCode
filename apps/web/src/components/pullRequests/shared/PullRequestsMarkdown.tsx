@@ -12,7 +12,7 @@ import rehypeSanitize from "rehype-sanitize";
 import rehypeRaw from "rehype-raw";
 import remarkGfm from "remark-gfm";
 import { readLocalApi } from "../../../localApi";
-import { CHAT_MARKDOWN_SANITIZE_SCHEMA } from "../../ChatMarkdown";
+import { CHAT_MARKDOWN_SANITIZE_SCHEMA } from "../../chatMarkdownPipeline";
 const MarkdownBaseUrl = createContext<string | undefined>(undefined);
 const InsideMarkdownLink = createContext(false);
 
