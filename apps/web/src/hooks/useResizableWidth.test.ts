@@ -183,6 +183,7 @@ const baseOptions: UseResizableWidthOptions = {
 function renderHook(overrides: Partial<UseResizableWidthOptions> = {}): {
   readonly width: number;
   readonly handlers: ResizableWidthHandlers;
+  readonly commitWidth: (width: number) => void;
 } {
   hooks.beginRender();
   return useResizableWidth({ ...baseOptions, ...overrides });
@@ -368,5 +369,77 @@ describe("useResizableWidth pointer handling", () => {
 
     expect(() => callback(0)).not.toThrow();
     expect(renderHook().width).toBe(320);
+  });
+});
+
+describe("useResizableWidth committed and painted width", () => {
+  it("paints a stored width the ceiling clamps again when the ceiling grows", () => {
+    storage.stored = 500;
+
+    expect(renderHook({ maxWidth: 300 }).width).toBe(300);
+    expect(renderHook({ maxWidth: 600 }).width).toBe(500);
+    expect(storage.writes).toEqual([]);
+  });
+
+  it("keeps the committed width when a drag under a lowered ceiling is cancelled", () => {
+    const frames = installAnimationFrames();
+    storage.stored = 500;
+    const first = renderHook({ maxWidth: 300 });
+    const target = beginDrag(first.handlers);
+    first.handlers.onPointerMove(pointerEvent(target.element, { clientX: 50 }));
+    frames.run([...frames.callbacks.keys()][0]!);
+    expect(renderHook({ maxWidth: 300 }).width).toBe(250);
+
+    first.handlers.onPointerCancel(pointerEvent(target.element));
+
+    expect(storage.writes).toEqual([]);
+    expect(renderHook({ maxWidth: 600 }).width).toBe(500);
+  });
+
+  it("commits nothing for a press that does not move", () => {
+    storage.stored = 500;
+    const first = renderHook({ maxWidth: 300 });
+    const target = beginDrag(first.handlers);
+
+    first.handlers.onPointerUp(pointerEvent(target.element));
+
+    expect(storage.writes).toEqual([]);
+    expect(renderHook({ maxWidth: 600 }).width).toBe(500);
+  });
+
+  it("commits nothing for a press that jitters by a pixel or two", () => {
+    storage.stored = 500;
+    const first = renderHook({ maxWidth: 300 });
+    const target = beginDrag(first.handlers);
+    first.handlers.onPointerMove(pointerEvent(target.element, { clientX: 98 }));
+
+    first.handlers.onPointerUp(pointerEvent(target.element, { clientX: 98 }));
+
+    expect(storage.writes).toEqual([]);
+    expect(renderHook({ maxWidth: 600 }).width).toBe(500);
+  });
+
+  it("drags from the painted width and commits where the drag ends", () => {
+    storage.stored = 500;
+    const first = renderHook({ maxWidth: 300 });
+    const target = beginDrag(first.handlers);
+    first.handlers.onPointerMove(pointerEvent(target.element, { clientX: 60 }));
+
+    first.handlers.onPointerUp(pointerEvent(target.element, { clientX: 60 }));
+
+    expect(storage.writes).toMatchObject([{ key: "panel-width", value: 260 }]);
+    expect(renderHook({ maxWidth: 600 }).width).toBe(260);
+  });
+
+  it("commits a width clamped to the current bounds", () => {
+    renderHook({ maxWidth: 400 }).commitWidth(900);
+
+    expect(storage.writes).toMatchObject([{ key: "panel-width", value: 400 }]);
+    expect(renderHook({ maxWidth: 600 }).width).toBe(400);
+
+    renderHook().commitWidth(100);
+
+    expect(storage.writes.at(-1)).toMatchObject({ value: 200 });
+    expect(renderHook().width).toBe(200);
   });
 });

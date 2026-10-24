@@ -149,9 +149,11 @@ describe("PullRequestsFiles", () => {
   });
   it("lays out the changed-files tree by the detail's width, not the window's", async () => {
     await render();
-    const tree = container.querySelector('nav[aria-label="Changed files"]')!;
-    expect(tree.className).toContain("@3xl/pull-request:w-64");
+    const tree = container.querySelector<HTMLElement>('nav[aria-label="Changed files"]')!;
+    expect(tree.className).toContain("@3xl/pull-request:w-(--changed-files-nav-width)");
+    expect(tree.style.width).toBe("");
     expect(tree.className).toContain("@3xl/pull-request:border-r");
+    expect(tree.nextElementSibling!.getAttribute("aria-label")).toBe("Resize changed files");
     expect(tree.className).not.toMatch(/(^|\s)md:/);
     expect(tree.parentElement!.className).toContain("@3xl/pull-request:flex-row");
     expect(tree.parentElement!.className).not.toMatch(/(^|\s)md:/);

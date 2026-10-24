@@ -2427,7 +2427,11 @@ never count a sandbox-denied listener test as passed or skipped.
     in Files, including renamed files. Scroll far enough to exercise list and
     diff virtualization. Viewed must survive tab changes and reload. Test the
     whitespace toggle, binary/unavailable/too-large rows, long-line plain text,
-    and the explicit Show diff anyway gate using controlled fixtures.
+    and the explicit Show diff anyway gate using controlled fixtures. With the
+    file list beside the diffs, drag its divider, then use its arrow, Home and
+    End keys and double-click it: the list must follow live and keep its width
+    after reload. Narrowing the window must shrink the list without lowering
+    the width it returns to; the stacked narrow layout must offer no divider.
 12. Exercise the merge readiness states with host data or declared fixtures,
     including merged author/time, closed, reviews required and conflicts.
     Every denied action

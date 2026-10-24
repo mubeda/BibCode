@@ -2633,7 +2633,12 @@ See [RPC and orchestration](./rpc-and-orchestration.md) and
   whole view; on the full page it is the URL hash, in the panel component
   state. The detail view and the Changes tab's file tree switch layout at the
   `@3xl/pull-request` container breakpoint (the detail view's own width), not
-  the window's. A request opens in the panel from the Source Control create
+  the window's. From that breakpoint the tree is a resizable left column
+  (`ChangedFilesSplit` over `useResizableWidth`) whose width persists under
+  `bibcode:changed-files-nav-width`. Its paint is clamped to the detail's live
+  width, leaving room for the diffs, without rewriting the stored preference;
+  only a drag that moves, a divider key, or the double-click reset commits.
+  A request opens in the panel from the Source Control create
   dialog's **Done** and the panel's **Open MR in panel** items, and from the
   full page's **Open beside a thread…**; the first two are gated by
   `canOpenPullRequestInPanel` (Pull Requests setting on, not Bitbucket or Azure

@@ -4,6 +4,8 @@ import { type PointerEvent as ReactPointerEvent, useCallback, useRef, useState }
 import { getLocalStorageItem, setLocalStorageItem } from "./useLocalStorage";
 
 const WidthSchema = Schema.Finite;
+/** Pointer jitter up to this distance is a press, not a drag. */
+const DRAG_THRESHOLD_PX = 2;
 
 export interface UseResizableWidthOptions {
   /** localStorage key the persisted width is stored under. */
@@ -28,16 +30,21 @@ export interface ResizableWidthHandlers {
 
 /**
  * Width state for a side-anchored panel resized via a drag handle on the
- * specified edge. Width is read from localStorage on mount and persisted on
- * drag-end (not on every rAF tick — would otherwise be ~60 writes/sec).
+ * specified edge.
  *
- * The hook updates an internal `width` state during drag (so the panel
- * follows the cursor live) and only commits to localStorage when the user
- * lifts the pointer.
+ * The committed width is the user's preference: read from localStorage on
+ * mount and changed only by a drag that moves or by `commitWidth`. The
+ * returned `width` is what to paint: the live drag width or the committed
+ * one, clamped to the current bounds. A `maxWidth` that shrinks with the
+ * window clamps the paint without touching the preference, so the preference
+ * comes back when there is room again. A drag commits once at drag-end (not
+ * on every rAF tick — would otherwise be ~60 writes/sec).
  */
 export function useResizableWidth(options: UseResizableWidthOptions): {
   readonly width: number;
   readonly handlers: ResizableWidthHandlers;
+  /** Clamps `width` to the current bounds, persists it, and paints it. */
+  readonly commitWidth: (width: number) => void;
 } {
   const { storageKey, defaultWidth, minWidth, maxWidth, edge } = options;
 
@@ -50,18 +57,18 @@ export function useResizableWidth(options: UseResizableWidthOptions): {
   );
 
   // No cross-tab subscription: panel width is per-window state.
-  const [width, setWidth] = useState<number>(() => {
+  const [committedWidth, setCommittedWidth] = useState<number>(() => {
     if (typeof window === "undefined") return defaultWidth;
     try {
-      const stored = getLocalStorageItem(storageKey, WidthSchema);
-      return clamp(stored ?? defaultWidth);
+      return getLocalStorageItem(storageKey, WidthSchema) ?? defaultWidth;
     } catch (error) {
       console.error("Could not read persisted panel width.", error);
       return defaultWidth;
     }
   });
+  const [dragWidth, setDragWidth] = useState<number | null>(null);
 
-  const clampedWidth = clamp(width);
+  const paintedWidth = clamp(dragWidth ?? committedWidth);
 
   const dragStateRef = useRef<{
     pointerId: number;
@@ -106,13 +113,13 @@ export function useResizableWidth(options: UseResizableWidthOptions): {
       dragStateRef.current = {
         pointerId: event.pointerId,
         startX: event.clientX,
-        startWidth: clampedWidth,
-        pending: clampedWidth,
+        startWidth: paintedWidth,
+        pending: paintedWidth,
         rafId: null,
         target,
       };
     },
-    [clampedWidth],
+    [paintedWidth],
   );
 
   const onPointerMove = useCallback(
@@ -127,10 +134,23 @@ export function useResizableWidth(options: UseResizableWidthOptions): {
         const active = dragStateRef.current;
         if (!active) return;
         active.rafId = null;
-        setWidth(active.pending);
+        setDragWidth(active.pending);
       });
     },
     [clamp, edge],
+  );
+
+  const commitWidth = useCallback(
+    (value: number) => {
+      const next = clamp(value);
+      try {
+        setLocalStorageItem(storageKey, next, WidthSchema);
+      } catch (error) {
+        console.error("Could not persist panel width.", error);
+      }
+      setCommittedWidth(next);
+    },
+    [clamp, storageKey],
   );
 
   const onPointerUp = useCallback(
@@ -139,30 +159,27 @@ export function useResizableWidth(options: UseResizableWidthOptions): {
       if (!state || state.pointerId !== event.pointerId) return;
       const finalWidth = clamp(state.pending);
       releasePointer(event.pointerId);
-      // Commit once at drag-end to avoid 60Hz localStorage writes.
-      try {
-        setLocalStorageItem(storageKey, finalWidth, WidthSchema);
-      } catch (error) {
-        console.error("Could not persist panel width.", error);
-      }
-      setWidth(finalWidth);
+      setDragWidth(null);
+      // A press that barely moved keeps a preference the clamped paint hides.
+      if (Math.abs(finalWidth - state.startWidth) > DRAG_THRESHOLD_PX) commitWidth(finalWidth);
     },
-    [clamp, releasePointer, storageKey],
+    [clamp, commitWidth, releasePointer],
   );
 
   const onPointerCancel = useCallback(
     (event: ReactPointerEvent<HTMLElement>) => {
       const state = dragStateRef.current;
       if (!state || state.pointerId !== event.pointerId) return;
-      // Don't persist a cancelled drag; revert to the start width.
+      // Don't persist a cancelled drag; paint the committed width again.
       releasePointer(event.pointerId);
-      setWidth(state.startWidth);
+      setDragWidth(null);
     },
     [releasePointer],
   );
 
   return {
-    width: clampedWidth,
+    width: paintedWidth,
     handlers: { onPointerDown, onPointerMove, onPointerUp, onPointerCancel },
+    commitWidth,
   };
 }
