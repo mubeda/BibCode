@@ -1,5 +1,9 @@
 //! The `device_*` MCP tools: list, open, screenshot, and close Android emulators and iOS
 //! simulators on this server. They exist only while `enableDevicePreviews` is on.
+//!
+//! Each call acts for the agent's root thread (`PreviewScope::owner_thread_id`: a chat panel's
+//! host, else the thread). Its devices are those the catalog says that thread started; it may
+//! look at any device, but it cannot attach to or stop a device another thread started.
 
 use std::time::Duration;
 
@@ -25,6 +29,7 @@ const SCREENSHOT_MAX_WIDTH: u32 = 1080;
 /// issued only by `provider_runtime` when it launches a thread's provider, so holding the
 /// credential is the operate grant, exactly as for the `preview_*` tools. If MCP credentials
 /// are ever issued to lower-privileged principals, both tool families need a scope check.
+/// The refusals of another thread's device keep tasks apart; they are not access control.
 #[derive(Clone)]
 pub struct DeviceTools {
     manager: DeviceManager,
@@ -64,31 +69,74 @@ impl DeviceTools {
         tracing::debug!(
             environment_id = %scope.environment_id,
             thread_id = %scope.thread_id,
+            owner_thread_id = %scope.owner_thread_id,
             operation,
             "device MCP tool call"
         );
         if !self.enabled() {
             return failure(&DeviceOpError::Disabled);
         }
+        let owner = scope.owner_thread_id.as_str();
         let result = match operation {
-            "list" => Ok(self.list().await),
-            "open" => self.open(&arguments, &cancellation).await,
-            "screenshot" => self.screenshot(&arguments).await,
-            "close" => self.close(&arguments).await,
+            "list" => Ok(self.list(owner).await),
+            "open" => self.open(owner, &arguments, &cancellation).await,
+            "screenshot" => self.screenshot(owner, &arguments).await,
+            "close" => self.close(owner, &arguments).await,
             _ => return tool_failure("McpUnknownToolError", "Unknown tool."),
         };
         result.unwrap_or_else(|error| failure(&error))
     }
 
-    async fn list(&self) -> Value {
+    /// The catalog, each device marked `thisThread` when `owner` started it.
+    async fn list(&self, owner: &str) -> Value {
         self.manager.refresh_now().await;
-        let catalog =
+        let mut catalog =
             serde_json::to_value(&*self.manager.catalog().borrow()).unwrap_or_else(|_| json!({}));
+        if let Some(devices) = catalog.get_mut("devices").and_then(Value::as_array_mut) {
+            for device in devices {
+                let mine = device.get("threadId").and_then(Value::as_str) == Some(owner);
+                if let Some(device) = device.as_object_mut() {
+                    device.insert("thisThread".to_owned(), Value::Bool(mine));
+                }
+            }
+        }
         success(catalog)
+    }
+
+    /// The catalog entry of `device_id`.
+    fn snapshot(&self, device_id: &str) -> Option<DeviceSnapshot> {
+        self.manager
+            .catalog()
+            .borrow()
+            .devices
+            .iter()
+            .find(|device| device.device_id == device_id)
+            .cloned()
+    }
+
+    /// The image's display name, else its id.
+    fn display_name(&self, device: &DeviceSnapshot) -> String {
+        self.manager
+            .catalog()
+            .borrow()
+            .platforms
+            .iter()
+            .find(|listed| listed.platform == device.platform)
+            .and_then(|listed| {
+                listed
+                    .images
+                    .iter()
+                    .find(|image| image.id == device.image_id)
+            })
+            .map_or_else(
+                || device.image_id.clone(),
+                |image| image.display_name.clone(),
+            )
     }
 
     async fn open(
         &self,
+        owner: &str,
         arguments: &Value,
         cancellation: &CancellationToken,
     ) -> Result<Value, DeviceOpError> {
@@ -114,7 +162,20 @@ impl DeviceTools {
             Some(id) => id.to_owned(),
             None => self.only_image(platform).await?,
         };
-        let device_id = self.manager.open(platform, &image_id, None).await?;
+        let device_id = self.manager.open(platform, &image_id, Some(owner)).await?;
+        // An image that already ran returned its device, which starts nothing: one another
+        // thread started is refused. One without an owner, from an older client, is shared.
+        if let Some(device) = self.snapshot(&device_id)
+            && device
+                .thread_id
+                .as_deref()
+                .is_some_and(|started| started != owner)
+        {
+            return Err(DeviceOpError::InUseByAnotherThread {
+                name: self.display_name(&device),
+                image_id: device.image_id,
+            });
+        }
         let ready = tokio::select! {
             ready = self.manager.wait_ready(&device_id, self.boot_timeout) => ready,
             () = cancellation.cancelled() => {
@@ -190,8 +251,8 @@ impl DeviceTools {
         }
     }
 
-    async fn screenshot(&self, arguments: &Value) -> Result<Value, DeviceOpError> {
-        let device_id = self.device_id(arguments)?;
+    async fn screenshot(&self, owner: &str, arguments: &Value) -> Result<Value, DeviceOpError> {
+        let device_id = self.device_id(owner, arguments)?;
         let image = self.manager.png(&device_id, SCREENSHOT_MAX_WIDTH).await?;
         Ok(snapshot_tool_result(json!({
             "deviceId": device_id,
@@ -205,12 +266,23 @@ impl DeviceTools {
         })))
     }
 
-    async fn close(&self, arguments: &Value) -> Result<Value, DeviceOpError> {
+    async fn close(&self, owner: &str, arguments: &Value) -> Result<Value, DeviceOpError> {
         let Some(device_id) = string_argument(arguments, "deviceId")? else {
             return Err(DeviceOpError::InvalidInput(
-                "deviceId is required. Call device_list to see the running device.".into(),
+                "deviceId is required. Call device_list to see the running devices.".into(),
             ));
         };
+        if let Some(device) = self.snapshot(device_id)
+            && device
+                .thread_id
+                .as_deref()
+                .is_some_and(|started| started != owner)
+        {
+            return Err(DeviceOpError::StartedByAnotherThread {
+                name: self.display_name(&device),
+                image_id: device.image_id,
+            });
+        }
         let platform = self.platform_of(device_id);
         self.manager.close(device_id).await?;
         Ok(success(
@@ -228,8 +300,9 @@ impl DeviceTools {
             .map(|device| device.platform)
     }
 
-    /// The `deviceId` argument, or the only device that is not stopped.
-    fn device_id(&self, arguments: &Value) -> Result<String, DeviceOpError> {
+    /// The `deviceId` argument, else `owner`'s only device that is not stopped, else the only
+    /// such device; with several, an input error that lists them.
+    fn device_id(&self, owner: &str, arguments: &Value) -> Result<String, DeviceOpError> {
         if let Some(id) = string_argument(arguments, "deviceId")? {
             return Ok(id.to_owned());
         }
@@ -244,9 +317,21 @@ impl DeviceTools {
                 )
             })
             .collect();
-        match live.as_slice() {
-            [device] => Ok(device.device_id.clone()),
-            _ => Err(DeviceOpError::NotFound),
+        let mine: Vec<&DeviceSnapshot> = live
+            .iter()
+            .copied()
+            .filter(|device| device.thread_id.as_deref() == Some(owner))
+            .collect();
+        match (mine.as_slice(), live.as_slice()) {
+            ([device], _) | ([], [device]) => Ok(device.device_id.clone()),
+            (_, []) => Err(DeviceOpError::NotFound),
+            _ => Err(DeviceOpError::InvalidInput(format!(
+                "Several devices are running. Pass deviceId as one of: {}.",
+                live.iter()
+                    .map(|device| device.device_id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))),
         }
     }
 }
@@ -301,7 +386,7 @@ pub(super) fn device_tool_descriptors() -> Vec<Value> {
             "device_list",
             "List devices",
             format!(
-                "List the {kinds}: per platform, whether it can run devices and the images it can start, and the running devices."
+                "List the {kinds}: per platform, whether it can run devices and the images it can start, and the devices, each with thisThread saying whether your thread started it."
             ),
             json!({"type": "object", "properties": {}, "additionalProperties": false}),
             true,
@@ -310,7 +395,7 @@ pub(super) fn device_tool_descriptors() -> Vec<Value> {
             "device_open",
             "Start a device",
             format!(
-                "Start one of the {kinds} and wait until it has booted. One device runs per platform. platform defaults to android. Omit imageId when the platform has exactly one image; device_list shows the ids."
+                "Start one of the {kinds} and wait until it has booted. Up to four devices run at once on this server, one per image; opening an image your thread already runs returns that device, and one another thread runs is refused. platform defaults to android. Omit imageId when the platform has exactly one image; device_list shows the ids."
             ),
             json!({
                 "type": "object",
@@ -329,7 +414,7 @@ pub(super) fn device_tool_descriptors() -> Vec<Value> {
             "device_screenshot",
             "Screenshot a device",
             format!(
-                "Take a screenshot of a running device, one of the {kinds}: a PNG at most 1080 px wide, or a full-size JPEG for a view-only iOS simulator. Omit deviceId when one device is running."
+                "Take a screenshot of a running device, one of the {kinds}: a PNG at most 1080 px wide, or a full-size JPEG for a view-only iOS simulator. Omit deviceId to take your thread's device when it runs one, or the only running device."
             ),
             json!({
                 "type": "object",
@@ -341,7 +426,9 @@ pub(super) fn device_tool_descriptors() -> Vec<Value> {
         tool(
             "device_close",
             "Stop a device",
-            format!("Stop a running device, one of the {kinds}."),
+            format!(
+                "Stop a running device, one of the {kinds}. A device another thread started is refused; ask the user to stop it."
+            ),
             json!({
                 "type": "object",
                 "properties": {"deviceId": {"type": "string"}},

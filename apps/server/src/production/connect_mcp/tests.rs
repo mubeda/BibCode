@@ -1048,19 +1048,19 @@ async fn mcp_transport_enforces_auth_capacity_expiry_and_session_ownership() {
 
     let first = harness
         .service
-        .issue_mcp_credential("one", "provider")
+        .issue_mcp_credential("one", "one", "provider")
         .await
         .unwrap();
     let second = harness
         .service
-        .issue_mcp_credential("two", "provider")
+        .issue_mcp_credential("two", "two", "provider")
         .await
         .unwrap();
     assert_eq!(
         error(
             harness
                 .service
-                .issue_mcp_credential("three", "provider")
+                .issue_mcp_credential("three", "three", "provider")
                 .await
         )
         .status,
@@ -1068,7 +1068,7 @@ async fn mcp_transport_enforces_auth_capacity_expiry_and_session_ownership() {
     );
     let replacement = harness
         .service
-        .issue_mcp_credential("one", "replacement")
+        .issue_mcp_credential("one", "one", "replacement")
         .await
         .unwrap();
     assert_eq!(
@@ -1190,7 +1190,7 @@ async fn mcp_json_rpc_and_preview_tools_preserve_wire_results() {
     let harness = harness(4, 4).await;
     let issued = harness
         .service
-        .issue_mcp_credential("thread", "provider")
+        .issue_mcp_credential("thread", "thread", "provider")
         .await
         .unwrap();
     let auth = authorization(&issued);
@@ -1381,12 +1381,38 @@ async fn mcp_json_rpc_and_preview_tools_preserve_wire_results() {
     assert_eq!(call.3, None);
 }
 
+/// A chat panel's provider gets a credential for its own thread whose tools act for its host.
+#[tokio::test]
+async fn a_credential_carries_the_thread_and_its_owner() {
+    let harness = harness(4, 4).await;
+    let issued = harness
+        .service
+        .issue_mcp_credential("panel", "host", "provider")
+        .await
+        .unwrap();
+    assert_eq!(issued.thread_id, "panel");
+    let headers = initialize(&harness.service, &issued).await;
+    let response = rpc(
+        &harness.service,
+        headers,
+        json!({"id":1,"method":"tools/call","params":{"name":"preview_status"}}),
+    )
+    .await;
+    assert_eq!(response["result"]["isError"], false, "{response}");
+    let calls = harness.controls.preview_calls.lock().await;
+    let scope = &calls.last().expect("the preview tool ran").0;
+    assert_eq!(
+        (scope.thread_id.as_str(), scope.owner_thread_id.as_str()),
+        ("panel", "host")
+    );
+}
+
 #[tokio::test]
 async fn revocation_and_pruning_remove_credentials_and_sessions_together() {
     let harness = harness(4, 4).await;
     let issued = harness
         .service
-        .issue_mcp_credential("thread", "provider")
+        .issue_mcp_credential("thread", "thread", "provider")
         .await
         .unwrap();
     let headers = initialize(&harness.service, &issued).await;
@@ -1411,7 +1437,7 @@ async fn revocation_and_pruning_remove_credentials_and_sessions_together() {
 
     let issued = harness
         .service
-        .issue_mcp_credential("other", "provider")
+        .issue_mcp_credential("other", "other", "provider")
         .await
         .unwrap();
     harness.service.revoke_all_mcp_credentials().await;
@@ -1437,6 +1463,7 @@ async fn revocation_and_pruning_remove_credentials_and_sessions_together() {
             scope: PreviewScope {
                 environment_id: "env".into(),
                 thread_id: "thread".into(),
+                owner_thread_id: "thread".into(),
                 provider_session_id: "provider".into(),
                 provider_instance_id: "instance".into(),
             },
@@ -1790,12 +1817,20 @@ async fn owned_credential_scope_inputs_issue_and_replace_thread_credentials() {
     let harness = harness(2, 2).await;
     let first = harness
         .service
-        .issue_mcp_credential("thread-owned".to_string(), "provider-owned".to_string())
+        .issue_mcp_credential(
+            "thread-owned".to_string(),
+            "thread-owned".to_string(),
+            "provider-owned".to_string(),
+        )
         .await
         .expect("owned credential inputs should issue");
     let replacement = harness
         .service
-        .issue_mcp_credential("thread-owned".to_string(), "provider-next".to_string())
+        .issue_mcp_credential(
+            "thread-owned".to_string(),
+            "thread-owned".to_string(),
+            "provider-next".to_string(),
+        )
         .await
         .expect("same thread credential should replace");
 
@@ -2110,6 +2145,7 @@ mod device_tools {
         PreviewScope {
             environment_id: "environment".into(),
             thread_id: "thread".into(),
+            owner_thread_id: "thread".into(),
             provider_session_id: "provider-session".into(),
             provider_instance_id: "provider-instance".into(),
         }
@@ -2230,6 +2266,213 @@ mod device_tools {
             after["structuredContent"]["error"]["_tag"],
             "DeviceNotFoundError"
         );
+    }
+
+    /// An agent of `owner`'s own thread.
+    fn scope_for(owner: &str) -> PreviewScope {
+        PreviewScope {
+            thread_id: owner.into(),
+            owner_thread_id: owner.into(),
+            ..scope()
+        }
+    }
+
+    /// `owner` opens `image` through the tools and gets its device id.
+    async fn open_as(fixture: &DeviceToolsFixture, owner: &str, image: &str) -> String {
+        let result = fixture
+            .tools
+            .call(
+                &scope_for(owner),
+                "open",
+                json!({"imageId": image}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(result["isError"], false, "{result}");
+        result["structuredContent"]["deviceId"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    #[tokio::test]
+    async fn device_list_marks_the_devices_the_callers_thread_started() {
+        let fixture = DeviceToolsFixture::ready_sdk(&["Pixel", "Tablet"]).await;
+        let pixel = open_as(&fixture, "t1", "Pixel").await;
+        let tablet = open_as(&fixture, "t2", "Tablet").await;
+        let result = fixture
+            .tools
+            .call(
+                &scope_for("t1"),
+                "list",
+                json!({}),
+                CancellationToken::new(),
+            )
+            .await;
+        let devices = result["structuredContent"]["devices"].as_array().unwrap();
+        let mark = |id: &str| {
+            devices
+                .iter()
+                .find(|device| device["deviceId"] == id)
+                .unwrap()["thisThread"]
+                .clone()
+        };
+        assert_eq!((mark(&pixel), mark(&tablet)), (json!(true), json!(false)));
+        fixture.fixture.manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn device_screenshot_without_an_id_takes_the_callers_device() {
+        let fixture = DeviceToolsFixture::ready_sdk(&["Pixel", "Tablet"]).await;
+        let pixel = open_as(&fixture, "t1", "Pixel").await;
+        let tablet = open_as(&fixture, "t2", "Tablet").await;
+        for (owner, expected) in [("t1", &pixel), ("t2", &tablet)] {
+            let result = fixture
+                .tools
+                .call(
+                    &scope_for(owner),
+                    "screenshot",
+                    json!({}),
+                    CancellationToken::new(),
+                )
+                .await;
+            assert_eq!(result["isError"], false, "{result}");
+            assert_eq!(result["structuredContent"]["deviceId"], expected.as_str());
+        }
+        // A thread with no device of its own, with two running, is told which there are.
+        let neither = fixture
+            .tools
+            .call(
+                &scope_for("t3"),
+                "screenshot",
+                json!({}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(
+            neither["structuredContent"]["error"]["_tag"],
+            "DeviceInputError"
+        );
+        assert!(
+            text(&neither).contains(&pixel) && text(&neither).contains(&tablet),
+            "{neither}"
+        );
+        fixture.fixture.manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn another_threads_device_is_neither_attached_nor_stopped() {
+        let fixture = DeviceToolsFixture::ready_sdk(&["Pixel"]).await;
+        let pixel = open_as(&fixture, "t1", "Pixel").await;
+        let open = fixture
+            .tools
+            .call(
+                &scope_for("t2"),
+                "open",
+                json!({"imageId": "Pixel"}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(
+            open["structuredContent"]["error"]["_tag"],
+            "DeviceBusyError"
+        );
+        assert_eq!(
+            text(&open),
+            "Pixel is in use by another thread. Start a different image, or look at it with device_screenshot."
+        );
+        let close = fixture
+            .tools
+            .call(
+                &scope_for("t2"),
+                "close",
+                json!({"deviceId": pixel}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(
+            close["structuredContent"]["error"]["_tag"],
+            "DeviceBusyError"
+        );
+        assert_eq!(
+            text(&close),
+            "Pixel was started by another thread. Ask the user to stop it."
+        );
+        // It may look at it.
+        let screenshot = fixture
+            .tools
+            .call(
+                &scope_for("t2"),
+                "screenshot",
+                json!({"deviceId": pixel}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(screenshot["isError"], false, "{screenshot}");
+        // The owner's own open of the image returns its device.
+        assert_eq!(open_as(&fixture, "t1", "Pixel").await, pixel);
+        assert_eq!(fixture.fixture.sdk.launched_pids().len(), 1);
+        let closed = fixture
+            .tools
+            .call(
+                &scope_for("t1"),
+                "close",
+                json!({"deviceId": pixel}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(closed["isError"], false, "{closed}");
+        fixture.fixture.manager.shutdown().await;
+    }
+
+    /// A chat panel's agent works for its host: it shares the device the host's Device pane
+    /// started.
+    #[tokio::test]
+    async fn a_chat_panels_agent_uses_its_hosts_device() {
+        use crate::device::catalog::{DeviceState, Platform};
+        let fixture = DeviceToolsFixture::ready_sdk(&["Pixel"]).await;
+        let host = fixture
+            .fixture
+            .manager
+            .open(Platform::Android, "Pixel", Some("host"))
+            .await
+            .unwrap();
+        fixture.fixture.wait_state(&host, DeviceState::Ready).await;
+        let panel = PreviewScope {
+            thread_id: "panel".into(),
+            owner_thread_id: "host".into(),
+            ..scope()
+        };
+        let open = fixture
+            .tools
+            .call(
+                &panel,
+                "open",
+                json!({"imageId": "Pixel"}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(
+            open["structuredContent"]["deviceId"],
+            host.as_str(),
+            "{open}"
+        );
+        let screenshot = fixture
+            .tools
+            .call(&panel, "screenshot", json!({}), CancellationToken::new())
+            .await;
+        assert_eq!(screenshot["structuredContent"]["deviceId"], host.as_str());
+        let closed = fixture
+            .tools
+            .call(
+                &panel,
+                "close",
+                json!({"deviceId": host}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(closed["structuredContent"]["closed"], true, "{closed}");
+        fixture.fixture.manager.shutdown().await;
     }
 
     #[tokio::test]

@@ -41,6 +41,8 @@ struct CallbackState {
     rewind_keys: Mutex<Vec<String>>,
     stopped: Mutex<Vec<String>>,
     terminals: Mutex<Vec<String>>,
+    /// Threads whose devices the deletion cleanup stopped.
+    devices: Mutex<Vec<String>>,
     refreshed: Mutex<Vec<PathBuf>>,
     refresh_error: Mutex<Option<String>>,
     setup_scripts: Mutex<Vec<SetupScriptLaunch>>,
@@ -1329,6 +1331,12 @@ async fn thread_deletion_attempts_provider_and_terminal_cleanup_independently() 
         fn refresh_workspace<'a>(&'a self, _: &'a Path) -> BoxEffectFuture<'a, ()> {
             Box::pin(async { Ok(()) })
         }
+        fn close_devices<'a>(&'a self, thread_id: &'a str) -> BoxEffectFuture<'a, ()> {
+            Box::pin(async move {
+                self.0.devices.lock().unwrap().push(thread_id.to_owned());
+                Ok(())
+            })
+        }
     }
 
     let workspace = tempfile::tempdir().unwrap();
@@ -1364,9 +1372,11 @@ async fn thread_deletion_attempts_provider_and_terminal_cleanup_independently() 
         }),
     )
     .await;
-    wait_until(|| !callbacks.0.terminals.lock().unwrap().is_empty()).await;
+    wait_until(|| !callbacks.0.devices.lock().unwrap().is_empty()).await;
     assert_eq!(callbacks.0.stopped.lock().unwrap().as_slice(), &["t1"]);
     assert_eq!(callbacks.0.terminals.lock().unwrap().as_slice(), &["t1"]);
+    // Devices go last, after the provider, terminals, and previews.
+    assert_eq!(callbacks.0.devices.lock().unwrap().as_slice(), &["t1"]);
 
     effects.shutdown().await;
     engine.shutdown().await;

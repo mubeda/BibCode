@@ -1029,6 +1029,7 @@ async fn the_driver_speaks_v2_to_an_opencode_2_server_url() {
             mcp: None,
             codex_home: None,
             open_url: None,
+            host_thread_id: None,
         })
         .await
         .unwrap_or_else(|error| panic!("driver: {error}"));

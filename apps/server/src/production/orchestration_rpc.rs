@@ -4678,6 +4678,7 @@ mod tests {
                     mcp: None,
                     codex_home: None,
                     open_url: None,
+                    host_thread_id: None,
                 })
                 .await
                 .expect("provider launches");
@@ -4802,6 +4803,7 @@ mod tests {
                 mcp: None,
                 codex_home: None,
                 open_url: None,
+                host_thread_id: None,
             })
             .await
             .expect("provider launches");
