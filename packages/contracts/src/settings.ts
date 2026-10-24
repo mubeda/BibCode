@@ -5,6 +5,7 @@ import * as SchemaTransformation from "effect/SchemaTransformation";
 import { DiffContextLines, TrimmedNonEmptyString, TrimmedString } from "./baseSchemas.ts";
 import { DEFAULT_GIT_TEXT_GENERATION_MODEL, ProviderOptionSelections } from "./model.ts";
 import { ModelSelection } from "./orchestration.ts";
+import { ReviewDiffToolId } from "./review.ts";
 import {
   ProviderDriverKind,
   ProviderInstanceConfig,
@@ -155,6 +156,11 @@ export const ClientSettingsSchema = Schema.Struct({
   diffRenderMode: DiffRenderMode.pipe(
     Schema.catchDecoding(() => Effect.succeedSome(DEFAULT_DIFF_RENDER_MODE)),
     Schema.withDecodingDefault(Effect.succeed(DEFAULT_DIFF_RENDER_MODE)),
+  ),
+  /** The diff app last chosen in **Open with**; the default after the one Git is set to use. */
+  diffToolLastChoice: Schema.NullOr(ReviewDiffToolId).pipe(
+    Schema.catchDecoding(() => Effect.succeedSome(null)),
+    Schema.withDecodingDefault(Effect.succeed(null)),
   ),
   diffViewMode: DiffViewMode.pipe(
     Schema.catchDecoding(() => Effect.succeedSome(DEFAULT_DIFF_VIEW_MODE)),
@@ -734,6 +740,7 @@ export const ClientSettingsPatch = Schema.Struct({
   diffCompareContextLines: Schema.optionalKey(DiffContextLines),
   diffCompareLines: Schema.optionalKey(DiffCompareLines),
   diffRenderMode: Schema.optionalKey(DiffRenderMode),
+  diffToolLastChoice: Schema.optionalKey(Schema.NullOr(ReviewDiffToolId)),
   diffViewMode: Schema.optionalKey(DiffViewMode),
   favorites: Schema.optionalKey(
     Schema.Array(

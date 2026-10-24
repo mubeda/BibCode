@@ -167,6 +167,16 @@ describe("DiffCompareView", () => {
   const options = () => [...container.querySelectorAll<HTMLElement>('[role="option"]')];
   const listbox = () => container.querySelector<HTMLElement>('[role="listbox"]')!;
 
+  it("puts the selected file's actions in the pane header", async () => {
+    const files = parse(modified("src/a.ts", OLD_A, NEW_A), modified("src/b.ts", OLD_B, NEW_B));
+    useDiffPanelStore.getState().selectCompareFile(threadRef, "src/b.ts");
+    await render(files, {
+      renderFileActions: (row) => <button type="button">Open {row.path} with</button>,
+    });
+    expect(container.textContent).toContain("Open src/b.ts with");
+    expect(container.textContent).not.toContain("Open src/a.ts with");
+  });
+
   it("reads the selected file's versions and fills Git's hunks with them", async () => {
     const files = parse(modified("src/a.ts", OLD_A, NEW_A), modified("src/b.ts", OLD_B, NEW_B));
     await render(files);

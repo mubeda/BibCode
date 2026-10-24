@@ -357,6 +357,21 @@ describe("ClientSettings Diff panel", () => {
     expect(() => decodeClientSettingsPatch({ diffCompareContextLines: 100 })).toThrow();
     expect(() => decodeClientSettingsPatch({ diffRenderMode: "unified" })).toThrow();
   });
+
+  it("remembers the last diff app chosen, and forgets a malformed one", () => {
+    expect(decodeClientSettings({}).diffToolLastChoice).toBeNull();
+    expect(decodeClientSettings({ diffToolLastChoice: "bc4" }).diffToolLastChoice).toBe("bc4");
+    for (const diffToolLastChoice of ["--extcmd=sh", "", 3]) {
+      expect(decodeClientSettings({ diffToolLastChoice, wordWrap: false })).toMatchObject({
+        diffToolLastChoice: null,
+        wordWrap: false,
+      });
+    }
+    expect(decodeClientSettingsPatch({ diffToolLastChoice: "meld" })).toMatchObject({
+      diffToolLastChoice: "meld",
+    });
+    expect(() => decodeClientSettingsPatch({ diffToolLastChoice: "-x" })).toThrow();
+  });
 });
 
 describe("ClientSettings word wrap", () => {

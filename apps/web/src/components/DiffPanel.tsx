@@ -5,7 +5,7 @@ import {
   squashAtomCommandFailure,
 } from "@bibcode/client-runtime/state/runtime";
 import { safeErrorLogAttributes } from "@bibcode/client-runtime/errors";
-import type { ScopedThreadRef, TurnId } from "@bibcode/contracts";
+import type { ReviewDiffToolScope, ScopedThreadRef, TurnId } from "@bibcode/contracts";
 import {
   ArrowRightIcon,
   CheckIcon,
@@ -44,6 +44,9 @@ import { formatShortTimestamp } from "../timestampFormat";
 import { DiffPanelLoadingState, DiffPanelShell, type DiffPanelMode } from "./DiffPanelShell";
 import { AnnotatableCodeView, type AnnotatableCodeViewHandle } from "./diffs/AnnotatableCodeView";
 import { DiffCompareView } from "./diffs/DiffCompareView";
+import { DiffOpenWithMenu, DiffToolLaunchAlert } from "./diffs/DiffOpenWithMenu";
+import { isUntrackedFile, type DiffToolLaunchFailure } from "../lib/diffOpenWith";
+import type { DiffFileRow } from "../lib/diffCompareModel";
 import { useCommentDraftStore } from "./diffs/useCommentDraftStore";
 import { ToggleGroup, Toggle } from "./ui/toggle-group";
 import { Switch } from "./ui/switch";
@@ -214,6 +217,8 @@ export default function DiffPanel({
     scopeKey: null,
     fileKeys: EMPTY_COLLAPSED_DIFF_FILE_KEYS,
   }));
+  // A diff app that did not open, shown under the toolbar until dismissed.
+  const [diffToolFailure, setDiffToolFailure] = useState<DiffToolLaunchFailure | null>(null);
   const codeViewRef = useRef<AnnotatableCodeViewHandle>(null);
 
   const routeThreadRef = useParams({
@@ -487,6 +492,18 @@ export default function DiffPanel({
     : selectedGitScope === "unstaged"
       ? "working-tree"
       : "branch";
+  // What Open with compares; the server turns it into revisions. A turn without a checkpoint
+  // count has nothing to compare.
+  const diffToolScope = useMemo((): ReviewDiffToolScope | null => {
+    if (selectedTurn === undefined) {
+      return selectedGitScope === "unstaged"
+        ? { _tag: "working-tree" }
+        : { _tag: "branch", baseRef: selectedBaseRef };
+    }
+    return activeThreadId !== null && selectedCheckpointRange !== null
+      ? { _tag: "turn", threadId: activeThreadId, ...selectedCheckpointRange }
+      : null;
+  }, [activeThreadId, selectedBaseRef, selectedCheckpointRange, selectedGitScope, selectedTurn]);
   // A server that computes turn patches live reports `truncated` on every one, live or stored;
   // an older one never does. Short IDs with the key present therefore mean a stored patch.
   const liveTurnPatches =
@@ -576,6 +593,25 @@ export default function DiffPanel({
       }),
     );
   }, [renderablePatch]);
+  const diffToolEnvironmentId = activeThread?.environmentId ?? null;
+  const renderCompareFileActions = useCallback(
+    (row: DiffFileRow) =>
+      diffToolEnvironmentId !== null && activeCwd && diffToolScope !== null ? (
+        <DiffOpenWithMenu
+          cwd={activeCwd}
+          environmentId={diffToolEnvironmentId}
+          scope={diffToolScope}
+          target={{
+            kind: "file",
+            path: row.path,
+            previousPath: row.previousPath,
+            untracked: isUntrackedFile(row.fileDiff, compareScope),
+          }}
+          onLaunchFailure={setDiffToolFailure}
+        />
+      ) : null,
+    [activeCwd, compareScope, diffToolEnvironmentId, diffToolScope],
+  );
   const codeViewFiles = useMemo(
     () =>
       renderableFiles.map((fileDiff) => {
@@ -919,6 +955,20 @@ export default function DiffPanel({
             {diffIgnoreWhitespace ? "Show whitespace changes" : "Hide whitespace changes"}
           </TooltipPopup>
         </Tooltip>
+        {/* Compare opens one file from its pane header, with every file one item below. */}
+        {diffViewMode === "changes" &&
+        diffToolEnvironmentId !== null &&
+        activeCwd &&
+        diffToolScope !== null &&
+        renderableFiles.length > 0 ? (
+          <DiffOpenWithMenu
+            cwd={activeCwd}
+            environmentId={diffToolEnvironmentId}
+            scope={diffToolScope}
+            target={{ kind: "all", count: renderableFiles.length }}
+            onLaunchFailure={setDiffToolFailure}
+          />
+        ) : null}
       </div>
     </>
   );
@@ -947,6 +997,12 @@ export default function DiffPanel({
       ) : (
         <>
           <div className="diff-panel-viewport flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+            {diffToolFailure ? (
+              <DiffToolLaunchAlert
+                failure={diffToolFailure}
+                onDismiss={() => setDiffToolFailure(null)}
+              />
+            ) : null}
             {isSelectedPatchTruncated && (
               <p className="shrink-0 border-b border-border/70 bg-muted/40 px-3 py-1.5 text-xs text-muted-foreground">
                 This diff was truncated because it exceeded the preview limit. The changes shown are
@@ -997,6 +1053,7 @@ export default function DiffPanel({
                   }
                 }
                 onRevalidatePatch={revalidateSelectedPatch}
+                renderFileActions={renderCompareFileActions}
               />
             ) : renderablePatch.kind === "files" ? (
               <div
