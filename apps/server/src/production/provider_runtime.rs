@@ -9141,13 +9141,14 @@ impl ReasoningCoalescer {
         if entry.full {
             return;
         }
-        let appended = if entry.length + delta.len() <= REASONING_ENTRY_MAX_BYTES {
+        // Streamed text keeps room for the mark, so a cut always shows and never overshoots the
+        // bound, however close to it the text already is.
+        let text_room = REASONING_ENTRY_MAX_BYTES - REASONING_TRUNCATION_MARK.len();
+        let appended = if entry.length + delta.len() <= text_room {
             delta.to_owned()
         } else {
-            let room = REASONING_ENTRY_MAX_BYTES
-                .saturating_sub(entry.length)
-                .saturating_sub(REASONING_TRUNCATION_MARK.len());
             entry.full = true;
+            let room = text_room.saturating_sub(entry.length);
             format!(
                 "{}{REASONING_TRUNCATION_MARK}",
                 &delta[..delta.floor_char_boundary(room)]
@@ -20918,6 +20919,34 @@ done
         }
     }
 
+    /// Text that already fills the bound to within the ellipsis's width still ends with the
+    /// mark, and the mark never takes the entry past the bound.
+    #[tokio::test]
+    async fn an_entry_at_its_bound_never_overshoots_it() {
+        let mut coalescer = super::ReasoningCoalescer::default();
+        let delta = |text: String| {
+            reasoning_test_event(
+                "content.delta",
+                "turn-1",
+                Some("msg-1:0"),
+                json!({"streamKind":"reasoning_text","delta":text}),
+            )
+        };
+        coalescer.observe_delta(&delta("x".repeat(super::REASONING_ENTRY_MAX_BYTES - 1)));
+        coalescer.observe_delta(&delta("more".to_owned()));
+        coalescer.observe_delta(&delta("and more".to_owned()));
+        let written = coalescer
+            .take_all()
+            .into_iter()
+            .map(|command| match command {
+                super::OrchestrationCommand::ThreadReasoningDelta { delta, .. } => delta,
+                other => panic!("unexpected {}", other.command_type()),
+            })
+            .collect::<String>();
+        assert_eq!(written.len(), super::REASONING_ENTRY_MAX_BYTES);
+        assert!(written.ends_with('…'), "the cut shows");
+    }
+
     /// Codex: the runtime's blank line joins streamed parts, and the completed summary is
     /// authoritative: it replaces a stream that lost parts, and creates an entry that
     /// streamed none. A repeated completion changes nothing.
@@ -21077,6 +21106,73 @@ done
                 .is_empty()
         );
         engine.shutdown().await;
+    }
+
+    /// No reasoning text reaches a log or trace, including the warning a failed write logs:
+    /// the pump, the projection and the settlement log counts and ids only (#173).
+    #[tokio::test(start_paused = true)]
+    async fn reasoning_text_never_reaches_logs_or_traces() {
+        const SENTINEL: &str = "reasoning-sentinel-7f3a";
+        #[derive(Clone, Default)]
+        struct Captured(Arc<StdMutex<Vec<u8>>>);
+        impl io::Write for Captured {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0
+                    .lock()
+                    .expect("captured log")
+                    .extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let log = Captured::default();
+        let _logging = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::TRACE)
+                .with_writer({
+                    let log = log.clone();
+                    move || log.clone()
+                })
+                .finish(),
+        );
+        let pump = ReasoningPump::start().await;
+        pump.delta(
+            "turn-1",
+            Some("msg-1:0"),
+            &format!("Thinking about {SENTINEL}"),
+        )
+        .await;
+        pump.complete("turn-1", Some("msg-1:0"), None).await;
+        pump.complete(
+            "turn-1",
+            Some("summary"),
+            Some(&format!("Summary of {SENTINEL}")),
+        )
+        .await;
+        pump.writes_once(|writes| writes.len() >= 3).await;
+        assert!(
+            reasoning_rows(&pump.engine)
+                .await
+                .iter()
+                .all(|(_, text, _)| text.contains(SENTINEL)),
+            "the sentinel went through the pump"
+        );
+        // A write that fails logs a warning; it must not carry the text it could not write.
+        pump.delta("turn-1", Some("lost"), &format!("Lost {SENTINEL}"))
+            .await;
+        pump.drain().await;
+        pump.engine.shutdown().await;
+        pump.finish().await;
+
+        let text = String::from_utf8(log.0.lock().expect("captured log").clone()).expect("UTF-8");
+        assert!(
+            text.contains("failed to project provider reasoning"),
+            "the failed write was logged: {text}"
+        );
+        assert!(!text.contains(SENTINEL), "{text}");
     }
 
     /// A row left streaming by a session that is gone, with no runtime row for its thread,
@@ -24835,6 +24931,27 @@ done
                 .await
                 .unwrap();
             assert_eq!(session().await.status, "running");
+            // The turn is thinking when Stop arrives (#173).
+            engine
+                .dispatch(OrchestrationCommand::ThreadReasoningDelta {
+                    command_id: "interrupted-thought".to_owned(),
+                    thread_id: "t1".to_owned(),
+                    reasoning_id: "reasoning:t1:item:interrupted".to_owned(),
+                    delta: "Weighing the stop".to_owned(),
+                    turn_id: Some("unit-turn".to_owned()),
+                    created_at: "2026-07-16T00:00:01.500Z".to_owned(),
+                })
+                .await
+                .unwrap();
+            let thought_streams = || async {
+                engine
+                    .repositories()
+                    .list_reasoning_by_thread("t1".to_owned())
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|row| row.is_streaming)
+            };
 
             tokio::time::pause();
             let clock = keep_idle_clock_paused();
@@ -24933,6 +25050,27 @@ done
             };
             drop(clock);
             tokio::time::resume();
+            // The interrupted turn's thought settles, whether the provider's own completion or
+            // the deadline ends it; a turn that keeps running keeps thinking. The provider's
+            // completion settles it in the pump, after the session already reads ready.
+            if matches!(
+                response,
+                InterruptResponse::StaleTurn | InterruptResponse::ExternallyOwned
+            ) {
+                assert!(
+                    thought_streams().await,
+                    "{response:?}: the turn still thinks"
+                );
+            } else {
+                let started = Instant::now();
+                while thought_streams().await {
+                    assert!(
+                        started.elapsed() < Duration::from_secs(5),
+                        "{response:?}: the interrupted turn's thought settles"
+                    );
+                    tokio::task::yield_now().await;
+                }
+            }
 
             if matches!(
                 response,
