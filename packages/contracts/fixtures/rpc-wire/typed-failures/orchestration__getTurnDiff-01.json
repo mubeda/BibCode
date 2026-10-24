@@ -7,9 +7,12 @@
       {
         "_tag": "Fail",
         "error": {
-          "_tag": "EnvironmentAuthorizationError",
-          "message": "__proto__",
-          "requiredScope": "relay:read"
+          "_tag": "WorkspaceUnavailableError",
+          "reason": "workspace-unavailable",
+          "message": "\u0000",
+          "threadId": "2:dH'",
+          "path": "q'G",
+          "availability": "verification-unavailable"
         }
       }
     ]

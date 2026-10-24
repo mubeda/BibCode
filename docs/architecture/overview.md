@@ -1790,7 +1790,9 @@ it.
   uses the start instant the exit path recorded, so a late report cannot move
   it. Once BiBCode has received a termination
   signal, nothing that dies with it is. A SIGKILL BiBCode did not send is
-  labelled likely OOM.
+  labelled likely OOM. The Diff panel's review and turn patches report their
+  `git` child the same way; the runner's own kill, at the patch cap or after a
+  failed read, is a requested stop.
 - **Webview.** On desktop, the end of the main window's web content process (on
   Windows, any WebView2 process failure) is a `crash.webview` finding.
   - Linux hooks WebKitGTK `web-process-terminated` (except `TerminatedByApi`).

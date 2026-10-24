@@ -655,6 +655,67 @@ explicit refresh or an unresolvable pinned tip resets the pages. Repositories
 over the cap fall back to `--all` paging with `degradedToAllPaging: true`, and
 the History view warns that new commits may shift the list.
 
+## Diff Compare and Open with
+
+The Diff panel reads three kinds of patch: the working tree and the branch
+range from `review.getDiffPreview`, and a turn or the whole thread from
+`orchestration.getTurnDiff` and `orchestration.getFullThreadDiff`.
+
+### Review and turn patches
+
+- **Arguments.** Every patch runs
+  `git diff --no-ext-diff --patch --minimal --full-index` with the shared
+  prefix settings above. `--full-index` prints whole object IDs on each
+  `index` line, so a client can name either side of a file by its blob ID.
+  `ignoreWhitespace` adds `--ignore-all-space`. An optional `contextLines`
+  (an integer from 0 to 99, checked on the server) adds `-U<N>`, formatted from
+  the integer. Without it Git's own context applies (3, or `diff.context`).
+  Each result echoes the count it applied as `contextLines` on the source or
+  the turn patch; an older server ignores the request and omits it.
+- **Bounds.** Each patch is capped at 4,375,000 bytes and cut at a file
+  boundary; `truncated` says later files were dropped. The runner reads at most
+  the cap plus one probe byte and then stops Git.
+- **Base ref.** A `baseRef` that starts with `-` is refused with
+  `InvalidRequest` before Git starts, so a value such as `--output=<file>` never
+  reaches Git as an option. `git check-ref-format --branch` forbids that form
+  for branch names, so no real branch is refused.
+- **Git exits.** The runner reports its child's exit to the Profiler as a
+  `git` command watched for signals. Its own kill, at the cap or after a failed
+  capture, is a requested stop and is never a `subprocess.crash`. A request
+  dropped by cancellation kills Git through `kill_on_drop` and reports nothing.
+- **Review sources on failure.** `getDiffPreview` still returns an empty
+  source when Git fails (for example, a base ref that does not exist).
+
+### Turn patches
+
+Turn and full-thread patches are computed live from the checkpoint refs at
+`refs/bibcode/checkpoints/<thread>/turn/<n>`. A request works in this order:
+
+1. It acquires the thread's workspace admission, which resolves the thread's
+   worktree or its project's root. The lease is held until Git exits. A
+   workspace that is being removed, or is gone, returns
+   `WorkspaceUnavailableError` before Git starts.
+2. It resolves both checkpoint refs with `rev-parse --verify --quiet`.
+3. When both resolve, it runs the patch arguments above on
+   `<from-ref>^{commit} <to-ref>^{commit}`. Workspace loss while Git runs
+   drops the read, which kills Git, and returns `WorkspaceUnavailableError`.
+4. When either ref is missing, it serves a stored `checkpoint_diff_blobs` row
+   for the exact range, if there is one. Nothing at this version writes those
+   rows; the fallback serves older data. A stored row has short object IDs,
+   ignores the whitespace and context options, omits `contextLines`, and
+   reports `truncated: false`.
+5. Otherwise it returns the method's error (`OrchestrationGetTurnDiffError` or
+   `OrchestrationGetFullThreadDiffError`) with "The checkpoint for turn <n> is
+   no longer in the repository."
+6. A non-zero Git exit that the runner did not cause returns the same error
+   type with "Git couldn't compare these checkpoints (exit <code>).", never an
+   empty patch.
+
+Turn ranges must be non-negative and ordered, and the revisions are built on
+the server from the thread ID and the turn counts; the client sends no ref
+names. An older server serves only stored rows, which a turn captured by it
+never had, and never returns `WorkspaceUnavailableError` for these methods.
+
 ## Pull Requests contract boundary
 
 `packages/contracts/src/pullRequests.ts` defines the repository-scoped Pull
