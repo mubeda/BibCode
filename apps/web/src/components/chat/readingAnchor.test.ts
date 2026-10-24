@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vite-plus/test";
 
-import { preserveTimelineReadingPosition } from "./readingAnchor";
+import { holdTimelineReadingPosition, preserveTimelineReadingPosition } from "./readingAnchor";
 
 interface Box {
   top: number;
@@ -51,7 +51,7 @@ function setup({
     preserveReadingPosition: (target: HTMLElement, commit: () => void) =>
       preserveTimelineReadingPosition(timeline, target, commit),
   };
-  return { anchor, target, scrollToOffset, elementBox };
+  return { anchor, timeline, target, scrollToOffset, elementBox };
 }
 
 describe("timeline reading anchor", () => {
@@ -124,6 +124,24 @@ describe("timeline reading anchor", () => {
       elementBox.bottom = -40;
     });
     expect(scrollToOffset).toHaveBeenCalledWith({ offset: 960, animated: false });
+  });
+
+  it("holds the line across a commit made elsewhere, such as new text from props", () => {
+    const { timeline, target, scrollToOffset, elementBox } = setup({
+      elementBox: { top: -200, bottom: 0 },
+      rowBox: { top: -400, bottom: 500 },
+    });
+    const restore = holdTimelineReadingPosition(timeline, target);
+    expect(restore).not.toBeNull();
+    elementBox.bottom = -80;
+    restore!();
+    expect(scrollToOffset).toHaveBeenCalledWith({ offset: 920, animated: false });
+
+    const { timeline: inView, target: visible } = setup({
+      elementBox: { top: 300, bottom: 400 },
+      rowBox: { top: 50, bottom: 800 },
+    });
+    expect(holdTimelineReadingPosition(inView, visible)).toBeNull();
   });
 
   it("commits without measuring outside a timeline row", () => {

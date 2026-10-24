@@ -1,9 +1,19 @@
 import { CodeIcon } from "lucide-react";
-import { use, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import {
+  Component,
+  use,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+  type RefObject,
+} from "react";
 
 import { LRUCache } from "../../lib/lruCache";
 import { codeFenceFor } from "../../markdown-clipboard";
-import { ReadingAnchorContext } from "../chat/readingAnchor";
+import { ReadingAnchorContext, type ReadingAnchor } from "../chat/readingAnchor";
 import { Button } from "../ui/button";
 import { RetryButton } from "../ui/retry-button";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
@@ -229,6 +239,44 @@ function DiagramViewToggle({
   );
 }
 
+interface DiagramBodyProps {
+  readonly anchor: ReadingAnchor | null;
+  readonly source: string;
+  readonly bodyRef: RefObject<HTMLDivElement | null>;
+  readonly children: ReactNode;
+}
+
+/**
+ * The block's body. New text that replaces the source (a reply's final text, a snapshot)
+ * changes the body's height in a commit React makes, not one the block can wrap, so the body
+ * measures itself before that commit and lets the reading anchor scroll by the change after
+ * it. Draws and Show source commit through the anchor themselves.
+ */
+class DiagramBody extends Component<DiagramBodyProps> {
+  override getSnapshotBeforeUpdate(previous: Readonly<DiagramBodyProps>): (() => void) | null {
+    const { anchor, bodyRef, source } = this.props;
+    const body = bodyRef.current;
+    if (previous.source === source || !anchor || !body) return null;
+    return anchor.holdReadingPosition(body);
+  }
+
+  override componentDidUpdate(
+    _previous: Readonly<DiagramBodyProps>,
+    _state: unknown,
+    restore: (() => void) | null,
+  ): void {
+    restore?.();
+  }
+
+  override render() {
+    return (
+      <div ref={this.props.bodyRef} className="chat-markdown-mermaid-body">
+        {this.props.children}
+      </div>
+    );
+  }
+}
+
 export interface MarkdownMermaidBlockProps {
   /** The fence body with `\n` line endings. */
   readonly source: string;
@@ -375,7 +423,7 @@ export function MarkdownMermaidBlock({
         </>
       }
     >
-      <div ref={bodyRef} className="chat-markdown-mermaid-body">
+      <DiagramBody anchor={readingAnchor} source={source} bodyRef={bodyRef}>
         {showDiagram ? (
           <div
             className="chat-markdown-mermaid"
@@ -402,7 +450,7 @@ export function MarkdownMermaidBlock({
             {children}
           </>
         )}
-      </div>
+      </DiagramBody>
     </MarkdownCodeBlock>
   );
 }

@@ -2809,7 +2809,10 @@ renderer never sees partial source:
   inside the first visible row, above the viewport's top edge, the block
   commits its swap through the timeline's reading anchor
   (`chat/readingAnchor.ts`), which commits with `flushSync` and scrolls by the
-  height change. Only within `maintainScrollAtEnd`'s threshold of the end (a
+  height change. New text that replaces a block's source (a reply's final
+  text, a snapshot) arrives in a commit React makes, so the block's body
+  measures itself in `getSnapshotBeforeUpdate` and the anchor scrolls by the
+  change in `componentDidUpdate`. Only within `maintainScrollAtEnd`'s threshold of the end (a
   tenth of the viewport, narrower than LegendList's `isNearEnd`) does the list
   hold the newest line itself, so only there does the anchor stand aside. The
   file view and the Plan sidebar rely on browser scroll anchoring, which

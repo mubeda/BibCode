@@ -14,6 +14,13 @@ export interface ReadingAnchor {
    * height change when `element` starts above the line the user reads.
    */
   readonly preserveReadingPosition: (element: HTMLElement, commit: () => void) => void;
+  /**
+   * The same for a commit React makes from new props, such as a reply's final text replacing
+   * a block's source: records where `element` ends before that commit and returns the step
+   * that scrolls by its change once the commit is in the DOM, or null when the element does
+   * not start above the line the user reads.
+   */
+  readonly holdReadingPosition: (element: HTMLElement) => (() => void) | null;
 }
 
 export const ReadingAnchorContext = createContext<ReadingAnchor | null>(null);
@@ -32,30 +39,28 @@ interface ReadingAnchorList {
   readonly scrollToOffset: (params: { offset: number; animated?: boolean }) => unknown;
 }
 
+export interface ReadingAnchorTimeline {
+  readonly list: ReadingAnchorList | null;
+  readonly viewport: HTMLElement | null;
+  /** The sent-row anchor holds the list, so following the end does not hold the line. */
+  readonly anchoringEndSpace: boolean;
+}
+
 /**
- * The timeline's reading anchor. LegendList keeps the first visible row's top in place when a
- * row changes size, which holds the reading line for rows wholly above the viewport. Inside the
- * first visible row, content below a growing element still moves, so a swap there is committed
- * synchronously and the list scrolls by the element's change, as a work-group toggle does.
- * While the list is close enough to its end for `maintainScrollAtEnd` to act, that already
- * holds the newest line.
+ * The timeline's hold on the reading line across one height change of `element`. LegendList
+ * keeps the first visible row's top in place when a row changes size, which holds the reading
+ * line for rows wholly above the viewport. Inside the first visible row, content below a
+ * growing element still moves, so the list scrolls by the element's change, as a work-group
+ * toggle does. While the list is close enough to its end for `maintainScrollAtEnd` to act,
+ * that already holds the newest line.
  */
-export function preserveTimelineReadingPosition(
-  timeline: {
-    readonly list: ReadingAnchorList | null;
-    readonly viewport: HTMLElement | null;
-    /** The sent-row anchor holds the list, so following the end does not hold the line. */
-    readonly anchoringEndSpace: boolean;
-  },
+export function holdTimelineReadingPosition(
+  timeline: ReadingAnchorTimeline,
   element: HTMLElement,
-  commit: () => void,
-): void {
+): (() => void) | null {
   const { list, viewport } = timeline;
   const row = element.closest<HTMLElement>("[data-timeline-root]");
-  if (!list || !viewport || !row) {
-    commit();
-    return;
-  }
+  if (!list || !viewport || !row) return null;
   const before = element.getBoundingClientRect();
   const rowBox = row.getBoundingClientRect();
   const followingEnd =
@@ -67,14 +72,30 @@ export function preserveTimelineReadingPosition(
     viewportTop: viewport.getBoundingClientRect().top,
     followingEnd,
   });
-  if (!aboveReadingLine) {
+  if (!aboveReadingLine) return null;
+  return () => {
+    const delta = element.getBoundingClientRect().bottom - before.bottom;
+    const scroll = list.getState?.()?.scroll;
+    if (Math.abs(delta) >= 0.5 && typeof scroll === "number") {
+      list.scrollToOffset({ offset: scroll + delta, animated: false });
+    }
+  };
+}
+
+/**
+ * Commits a swap that changes `element`'s height under the timeline's hold on the reading
+ * line: synchronously, so the change can be measured, when the element is above that line.
+ */
+export function preserveTimelineReadingPosition(
+  timeline: ReadingAnchorTimeline,
+  element: HTMLElement,
+  commit: () => void,
+): void {
+  const restore = holdTimelineReadingPosition(timeline, element);
+  if (!restore) {
     commit();
     return;
   }
   flushSync(commit);
-  const delta = element.getBoundingClientRect().bottom - before.bottom;
-  const scroll = list.getState?.()?.scroll;
-  if (Math.abs(delta) >= 0.5 && typeof scroll === "number") {
-    list.scrollToOffset({ offset: scroll + delta, animated: false });
-  }
+  restore();
 }

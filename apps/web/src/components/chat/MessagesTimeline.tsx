@@ -69,6 +69,7 @@ import { Button } from "../ui/button";
 import { buildExpandedImagePreview, ExpandedImagePreview } from "./ExpandedImagePreview";
 import { ProposedPlanCard } from "./ProposedPlanCard";
 import {
+  holdTimelineReadingPosition,
   preserveTimelineReadingPosition,
   ReadingAnchorContext,
   type ReadingAnchor,
@@ -642,7 +643,15 @@ function useTimelineReadingAnchor(
       ),
     [listRef],
   );
-  return useMemo(() => ({ preserveReadingPosition }), [preserveReadingPosition]);
+  const holdReadingPosition = useCallback(
+    (element: HTMLElement) =>
+      holdTimelineReadingPosition({ list: listRef.current, ...latest.current }, element),
+    [listRef],
+  );
+  return useMemo(
+    () => ({ preserveReadingPosition, holdReadingPosition }),
+    [holdReadingPosition, preserveReadingPosition],
+  );
 }
 
 /**
