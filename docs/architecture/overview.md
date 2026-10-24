@@ -1196,6 +1196,24 @@ any-motion tracking (`?1003`), neither is pointer motion without a pressed
 button. xterm's link detection still sees that motion, so links stay
 clickable. A click or keystroke clears the selection and reporting resumes.
 
+### Terminal spawn environment
+
+A PTY child inherits the server's environment, then `build_pty_command_from_launch`
+in `apps/server/src/terminal/pty.rs` adjusts it. Unless the launch env opts out,
+it removes `NO_COLOR` and sets `FORCE_COLOR=3` and `COLORTERM=truecolor`; it
+sets `TERM=xterm-256color` when the launch env has no `TERM`. It removes the
+multiplexer variables a server started inside tmux, screen or Zellij would pass
+on (`TMUX`, `TMUX_PANE`, `STY`, `WINDOW`, `ZELLIJ`, `ZELLIJ_SESSION_NAME`,
+`ZELLIJ_PANE_ID`), so the shell does not nest in or address that unrelated
+pane. The launch env is applied next, so an explicit value for one of those
+names still reaches the child. Then, unless `fish_features` already names
+`query-term` or `no-query-term`, `no-query-term` is appended to it,
+comma-joined with existing flags: fish 4.1 and later can otherwise wait at
+startup for a device-attributes reply that no renderer can give before a client
+attaches. This turns off fish features that rely on those replies. On Windows these names match
+case-insensitively and an existing key keeps its casing. AppImage isolation
+runs last.
+
 ### Terminal attachment fidelity
 
 Servers advertise `terminalSizeOwnership` (decoded as false for older servers).
@@ -1322,6 +1340,19 @@ when the snapshot says the server color responder is active; otherwise the owner
 lets xterm answer. `CSI ? 996 n` stays swallowed (xterm does not implement it).
 The PTY reader keeps its synchronous answers and original transcript bytes.
 Input is never filtered by reply shape.
+
+When the replayed session has exited, the renderer writes a mode reset to
+xterm after the history, never to the PTY or into stored history. RIS precedes
+the history, so the renderer scans the history for the screen it ends on and
+leaves an alternate screen the way it was entered (`?47`, `?1047` or `?1049`),
+saving the cursor first. A main-screen history gets no alternate-screen toggle,
+which would restore a stale saved cursor. The reset then turns off application
+cursor keys and keypad, every mouse protocol and encoding, focus reports and
+bracketed paste, shows the cursor, and pops Kitty keyboard flags and
+modifyOtherKeys (xterm 6 ignores those two). A history with no ESC is written
+unchanged, and a running session's replay keeps the modes its program enabled.
+The status comes from the transcript runtime's metadata, which a snapshot
+updates before it fans out the reset.
 
 Without `terminalSizeOwnership`, clients retain local fit-and-resize behavior
 and live replies, with conditional server-color-query suppression. Every replay

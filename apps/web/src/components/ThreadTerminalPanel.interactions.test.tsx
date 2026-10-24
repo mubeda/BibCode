@@ -1724,6 +1724,27 @@ describe("TerminalViewport mounted lifecycle", () => {
     expect(attached.terminal.rows).toBeUndefined();
   });
 
+  it("resets input modes after replaying an exited shell, not a running one", async () => {
+    const view = await mountViewport();
+    const history = "\x1b[?1000h\x1b[?1004h\x1b[?2004h$ exit\r\n";
+    const writesAfter = async (status: TerminalSessionSnapshot["status"]) => {
+      const terminal = view.fakeTerminal!;
+      const start = terminal.writes.length;
+      await act(async () =>
+        view.runtime.ingest({ type: "snapshot", snapshot: terminalSnapshot(history, status) }),
+      );
+      // Empty writes are output-sink barriers.
+      return terminal.writes.slice(start).filter((data) => data.length > 0);
+    };
+
+    expect(await writesAfter("running")).toEqual(["\u001bc", history]);
+    const exited = await writesAfter("exited");
+    expect(exited.slice(0, 2)).toEqual(["\u001bc", history]);
+    expect(exited).toHaveLength(3);
+    expect(exited[2]).toContain("1000");
+    expect(exited[2]).toContain("2004");
+  });
+
   it("mirrors the broadcast size, ignores layout changes, and offers an explicit fit claim", async () => {
     testState.serverConfig!.environment.capabilities = { terminalSizeOwnership: true };
     vi.spyOn(document, "hasFocus").mockReturnValue(false);
