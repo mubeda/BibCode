@@ -237,9 +237,16 @@ interface Revalidation {
   readonly request: number;
   /** The working file's read when the request was made; a different one is the read again. */
   readonly readBefore: unknown;
+  /** The working file was read again since the request: its query was pending. */
+  readonly sawPending: boolean;
 }
 
-const NO_REVALIDATION: Revalidation = { forOid: null, request: 0, readBefore: null };
+const NO_REVALIDATION: Revalidation = {
+  forOid: null,
+  request: 0,
+  readBefore: null,
+  sawPending: false,
+};
 
 function DiffComparePane({
   environmentId,
@@ -294,12 +301,17 @@ function DiffComparePane({
       forOid,
       request: revalidation.request + 1,
       readBefore: newVersion.data,
+      sawPending: false,
     });
   if (changedOid !== null && revalidation.forOid === null) requestRevalidation(changedOid);
+  // The read again shows as pending, or as a new result; an equal result may keep its reference.
+  if (revalidation.request > 0 && newVersion.isPending && !revalidation.sawPending) {
+    setRevalidation({ ...revalidation, sawPending: true });
+  }
   const readAgain =
     revalidation.request > 0 &&
-    newVersion.data !== revalidation.readBefore &&
-    !newVersion.isPending;
+    !newVersion.isPending &&
+    (revalidation.sawPending || newVersion.data !== revalidation.readBefore);
   const stillChanging =
     changedOid !== null &&
     revalidation.forOid !== null &&

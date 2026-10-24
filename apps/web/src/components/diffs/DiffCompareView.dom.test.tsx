@@ -10,6 +10,7 @@ const h = vi.hoisted(() => ({
   versions: new Map<string, ReviewReadFileVersionResult>(),
   requested: [] as string[],
   revalidated: [] as string[],
+  pending: new Set<string>(),
   codeView: [] as Array<Record<string, unknown>>,
   scrollTo: vi.fn(),
 }));
@@ -35,7 +36,7 @@ vi.mock("~/state/query", () => ({
     return {
       data: atom ? (h.versions.get(atom.key) ?? null) : null,
       error: null,
-      isPending: atom !== null && !h.versions.has(atom.key),
+      isPending: atom !== null && (!h.versions.has(atom.key) || h.pending.has(atom.key)),
       revalidate: () => {
         if (atom) h.revalidated.push(atom.key);
       },
@@ -128,6 +129,7 @@ describe("DiffCompareView", () => {
     h.versions.clear();
     h.requested.length = 0;
     h.revalidated.length = 0;
+    h.pending.clear();
     h.codeView.length = 0;
     h.scrollTo.mockClear();
     onRevalidatePatch.mockClear();
@@ -534,8 +536,12 @@ describe("DiffCompareView", () => {
     expect(h.revalidated).toEqual([worktreeKey("src/a.ts", NEW_A)]);
     expect(container.textContent).toContain("Loading full file…");
 
-    // That read finds it changing still: the pane says so instead of loading forever.
-    h.versions.set(worktreeKey("src/a.ts", NEW_A), changed());
+    // That read finds it changing still: the pane says so instead of loading forever, even
+    // when the second result equals the first.
+    h.pending.add(worktreeKey("src/a.ts", NEW_A));
+    await render(patch);
+    expect(container.textContent).toContain("Loading full file…");
+    h.pending.clear();
     await render(patch);
     expect(container.textContent).toContain("This file is changing.");
     expect(container.textContent).not.toContain("Loading full file…");
