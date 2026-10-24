@@ -107,6 +107,30 @@ describe("ChangedFilesSplit", () => {
     expect(stored()).toBe("336");
   });
 
+  it("stores a drag that the minimum stops a pixel or two from where it started", async () => {
+    localStorage.setItem(STORAGE_KEY, "226");
+    await render();
+
+    await pointer("pointerdown", 100);
+    await pointer("pointermove", 0);
+    await pointer("pointerup", 0);
+
+    expect([navWidth(), stored()]).toEqual(["224px", "224"]);
+  });
+
+  it("keeps the stored width when the detail narrows during a press that does not move", async () => {
+    localStorage.setItem(STORAGE_KEY, "600");
+    await render();
+
+    await pointer("pointerdown", 100);
+    await act(async () => resize!(700));
+    await pointer("pointerup", 100);
+
+    expect([navWidth(), stored()]).toEqual(["316px", "600"]);
+    await act(async () => resize!(1400));
+    expect(navWidth()).toBe("600px");
+  });
+
   it("nudges, jumps, and resets the width from the keyboard and double-click", async () => {
     await render();
 

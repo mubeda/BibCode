@@ -4,7 +4,7 @@ import { type PointerEvent as ReactPointerEvent, useCallback, useRef, useState }
 import { getLocalStorageItem, setLocalStorageItem } from "./useLocalStorage";
 
 const WidthSchema = Schema.Finite;
-/** Pointer jitter up to this distance is a press, not a drag. */
+/** Pointer travel up to this distance is a press, not a drag. */
 const DRAG_THRESHOLD_PX = 2;
 
 export interface UseResizableWidthOptions {
@@ -33,7 +33,9 @@ export interface ResizableWidthHandlers {
  * specified edge.
  *
  * The committed width is the user's preference: read from localStorage on
- * mount and changed only by a drag that moves or by `commitWidth`. The
+ * mount and changed only by a drag whose pointer travels further than
+ * `DRAG_THRESHOLD_PX` or by `commitWidth`. Travel, not the clamped width,
+ * decides: a drag that a bound stops short still commits. The
  * returned `width` is what to paint: the live drag width or the committed
  * one, clamped to the current bounds. A `maxWidth` that shrinks with the
  * window clamps the paint without touching the preference, so the preference
@@ -75,6 +77,8 @@ export function useResizableWidth(options: UseResizableWidthOptions): {
     startX: number;
     startWidth: number;
     pending: number;
+    /** Whether the pointer has travelled past the press threshold. */
+    moved: boolean;
     rafId: number | null;
     target: HTMLElement;
   } | null>(null);
@@ -115,6 +119,7 @@ export function useResizableWidth(options: UseResizableWidthOptions): {
         startX: event.clientX,
         startWidth: paintedWidth,
         pending: paintedWidth,
+        moved: false,
         rafId: null,
         target,
       };
@@ -127,8 +132,9 @@ export function useResizableWidth(options: UseResizableWidthOptions): {
       const state = dragStateRef.current;
       if (!state || state.pointerId !== event.pointerId) return;
       event.preventDefault();
-      const delta = edge === "left" ? state.startX - event.clientX : event.clientX - state.startX;
-      state.pending = clamp(state.startWidth + delta);
+      const travel = event.clientX - state.startX;
+      if (Math.abs(travel) > DRAG_THRESHOLD_PX) state.moved = true;
+      state.pending = clamp(state.startWidth + (edge === "left" ? -travel : travel));
       if (state.rafId !== null) return;
       state.rafId = requestAnimationFrame(() => {
         const active = dragStateRef.current;
@@ -157,13 +163,13 @@ export function useResizableWidth(options: UseResizableWidthOptions): {
     (event: ReactPointerEvent<HTMLElement>) => {
       const state = dragStateRef.current;
       if (!state || state.pointerId !== event.pointerId) return;
-      const finalWidth = clamp(state.pending);
       releasePointer(event.pointerId);
       setDragWidth(null);
-      // A press that barely moved keeps a preference the clamped paint hides.
-      if (Math.abs(finalWidth - state.startWidth) > DRAG_THRESHOLD_PX) commitWidth(finalWidth);
+      // A press keeps a preference the clamped paint hides, even if the
+      // ceiling moved under it; a drag commits where it ended.
+      if (state.moved) commitWidth(state.pending);
     },
-    [clamp, commitWidth, releasePointer],
+    [commitWidth, releasePointer],
   );
 
   const onPointerCancel = useCallback(

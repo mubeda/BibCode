@@ -419,6 +419,31 @@ describe("useResizableWidth committed and painted width", () => {
     expect(renderHook({ maxWidth: 600 }).width).toBe(500);
   });
 
+  it("commits a drag that a bound stops within a pixel or two of its start", () => {
+    storage.stored = 202;
+    const first = renderHook();
+    const target = beginDrag(first.handlers);
+    first.handlers.onPointerMove(pointerEvent(target.element, { clientX: 0 }));
+
+    first.handlers.onPointerUp(pointerEvent(target.element, { clientX: 0 }));
+
+    expect(storage.writes).toMatchObject([{ key: "panel-width", value: 200 }]);
+    expect(renderHook().width).toBe(200);
+  });
+
+  it("commits nothing for a press held still while the ceiling shrinks", () => {
+    storage.stored = 600;
+    const first = renderHook({ maxWidth: 600 });
+    const target = beginDrag(first.handlers);
+    const narrowed = renderHook({ maxWidth: 400 });
+    expect(narrowed.width).toBe(400);
+
+    narrowed.handlers.onPointerUp(pointerEvent(target.element));
+
+    expect(storage.writes).toEqual([]);
+    expect(renderHook({ maxWidth: 600 }).width).toBe(600);
+  });
+
   it("drags from the painted width and commits where the drag ends", () => {
     storage.stored = 500;
     const first = renderHook({ maxWidth: 300 });
