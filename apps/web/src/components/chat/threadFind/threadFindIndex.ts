@@ -290,6 +290,8 @@ export class ThreadFindIndex {
   readonly #scheduler: FindScheduler;
   /** By context key, then by text, so a key never copies the text. */
   readonly #cache = new Map<string, Map<string, CachedProjection>>();
+  /** Projections a worker has not answered yet, keyed like the cache. */
+  readonly #inFlight = new Map<string, Map<string, Promise<FindSegment[]>>>();
   #scanGeneration = 0;
 
   constructor(options: { projector?: FindProjector; scheduler?: FindScheduler } = {}) {
@@ -309,6 +311,23 @@ export class ThreadFindIndex {
       this.#cache.set(key, byText);
     }
     byText.set(source.text, { segments, usedByScan: this.#scanGeneration });
+  }
+
+  /** Remembers a pending projection until it settles, so a later scan awaits it, not a copy. */
+  #trackInFlight(key: string, text: string, projected: Promise<FindSegment[]>): void {
+    let byText = this.#inFlight.get(key);
+    if (!byText) {
+      byText = new Map();
+      this.#inFlight.set(key, byText);
+    }
+    byText.set(text, projected);
+    const settle = () => {
+      const current = this.#inFlight.get(key);
+      if (current?.get(text) !== projected) return;
+      current.delete(text);
+      if (current.size === 0) this.#inFlight.delete(key);
+    };
+    projected.then(settle, settle);
   }
 
   /** The cached projection of an entry, or null when one of its sources is not projected yet. */
@@ -332,10 +351,18 @@ export class ThreadFindIndex {
         segments.push(...cached.segments);
         continue;
       }
-      const projected = this.#projector.project(source, context);
-      const resolved = projected instanceof Promise ? await projected : projected;
+      const key = sourceContextKey(source, context);
+      const inFlight = this.#inFlight.get(key)?.get(source.text);
+      const projected = inFlight ?? this.#projector.project(source, context);
+      let resolved: FindSegment[];
+      if (projected instanceof Promise) {
+        if (!inFlight) this.#trackInFlight(key, source.text, projected);
+        resolved = await projected;
+      } else {
+        resolved = projected;
+      }
       // Kept even when the scan that asked was superseded: the next one reuses it.
-      this.#store(source, context, resolved);
+      if (!this.#cached(source, context)) this.#store(source, context, resolved);
       segments.push(...resolved);
     }
     return segments;
@@ -401,6 +428,7 @@ export class ThreadFindIndex {
 
   dispose(): void {
     this.#cache.clear();
+    this.#inFlight.clear();
     this.#projector.dispose?.();
   }
 }

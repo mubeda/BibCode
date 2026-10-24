@@ -214,6 +214,44 @@ describe("ThreadFindIndex", () => {
     expect(index.cachedSourceCount).toBe(2);
   });
 
+  it("shares a projection still in flight with the scan that supersedes its own", async () => {
+    const pending: Array<() => void> = [];
+    const project = vi.fn(
+      (source: Parameters<typeof projectFindSource>[0], context: typeof CONTEXT) =>
+        new Promise<ReturnType<typeof projectFindSource>>((resolve) => {
+          pending.push(() => resolve(projectFindSource(source, context)));
+        }),
+    );
+    const index = new ThreadFindIndex({ projector: { project }, scheduler: NO_SCHEDULER_COST });
+    const entries = deriveFindEntries({
+      timelineEntries: [message("a", "assistant", "a large reply", 0)],
+      skills: [],
+    });
+    const first = { aborted: false };
+    const superseded = index.scan({
+      entries,
+      context: CONTEXT,
+      query: "large",
+      startIndex: 0,
+      signal: first,
+    });
+    // Typing on supersedes the scan while its worker request is queued.
+    first.aborted = true;
+    const latest = index.scan({
+      entries,
+      context: CONTEXT,
+      query: "large r",
+      startIndex: 0,
+      signal: { aborted: false },
+    });
+    expect(project).toHaveBeenCalledTimes(1);
+
+    for (const resolve of pending.splice(0)) resolve();
+    expect(await superseded).toBeNull();
+    expect((await latest)?.total).toBe(1);
+    expect(project).toHaveBeenCalledTimes(1);
+  });
+
   it("yields between entries after a slice's budget, and finishes an oversized entry in one", async () => {
     let clock = 0;
     const yields: number[] = [];
