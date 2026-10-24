@@ -2349,6 +2349,8 @@ produce no entry.
   write early. The first write keeps the time the first delta was buffered, so a
   thought sorts before the tool call that followed it. An entry stops at 32 KiB,
   cut at a UTF-8 boundary and ending with `…`; completion text is cut the same way.
+  Text that fits is kept whole: a window's write holds back the bytes the `…`
+  would need until a later delta shows whether the entry is cut.
 - **Persistence:** `thread.reasoning.delta` and `thread.reasoning.complete` become
   `thread.reasoning-sent` events, projected by the message projector into
   `projection_thread_reasoning` (migration 55) by the assistant-message rule: a
