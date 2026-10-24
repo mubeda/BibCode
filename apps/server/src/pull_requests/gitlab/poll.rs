@@ -107,6 +107,9 @@ struct Entry {
 
 #[derive(Clone, Copy)]
 struct Backoff {
+    /// When the latest 429 took a step: a tick that started earlier proves
+    /// nothing about the limit.
+    set_at: Instant,
     until: Instant,
     step: usize,
 }
@@ -174,19 +177,28 @@ impl Registry {
     /// Takes the host's next ladder step and returns its delay.
     fn back_off(&self, host: &str) -> Duration {
         let mut backoff = lock(&self.backoff);
+        let now = Instant::now();
         let entry = backoff.entry(host.to_owned()).or_insert(Backoff {
-            until: Instant::now(),
+            set_at: now,
+            until: now,
             step: 0,
         });
         let delay = BACKOFF_STEPS[entry.step.min(BACKOFF_STEPS.len() - 1)];
-        entry.until = Instant::now() + delay;
+        entry.set_at = now;
+        entry.until = now + delay;
         entry.step = (entry.step + 1).min(BACKOFF_STEPS.len() - 1);
         delay
     }
 
-    /// A successful tick clears the host's ladder; true when it was set.
-    fn recovered(&self, host: &str) -> bool {
-        lock(&self.backoff).remove(host).is_some()
+    /// A successful tick that started at `started` clears the host's ladder;
+    /// true when it was set. A tick of another poller that was already in
+    /// flight when a 429 arrived leaves the deadline and the step alone.
+    fn recovered(&self, host: &str, started: Instant) -> bool {
+        let mut backoff = lock(&self.backoff);
+        match backoff.get(host) {
+            Some(entry) if entry.set_at <= started => backoff.remove(host).is_some(),
+            _ => false,
+        }
     }
 }
 
@@ -1313,6 +1325,7 @@ pub(crate) async fn run_subscriber(
             return shared.outcome();
         }
         let generation = snapshot_store::next_generation();
+        let started = Instant::now();
         #[cfg(all(test, unix))]
         let ticking = test_progress::Ticking::enter();
         let report = run_tick(&inputs, generation).await;
@@ -1353,7 +1366,7 @@ pub(crate) async fn run_subscriber(
                 }
             }
             None => {
-                let was_backing_off = registry.recovered(&host_key);
+                let was_backing_off = registry.recovered(&host_key, started);
                 if state.failing || was_backing_off {
                     state.failing = false;
                     tracing::debug!("GitLab poller ticks recovered");
@@ -2687,6 +2700,32 @@ esac
         }
         tick(&mut subs, 60).await;
         assert_eq!(lists(&b.s), 1, "the ended poller reads nothing more");
+    }
+
+    /// Two pollers of one host with ticks in flight at once: one gets a 429,
+    /// then the other's tick, which started before it, succeeds. That success
+    /// proves nothing about the limit, so the host keeps its deadline and its
+    /// ladder step; only a tick that started after the 429 clears them.
+    #[tokio::test(start_paused = true)]
+    async fn gitlab_poller_a_success_that_started_before_another_pollers_429_keeps_the_backoff() {
+        let registry = Registry::default();
+        let host = "gitlab.com";
+        let in_flight = Instant::now();
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(registry.back_off(host), Duration::from_secs(60));
+        let deadline = registry.backoff_until(host);
+        assert!(!registry.recovered(host, in_flight));
+        assert_eq!(registry.backoff_until(host), deadline, "the deadline stays");
+        tokio::time::advance(Duration::from_secs(60)).await;
+        assert_eq!(
+            registry.back_off(host),
+            Duration::from_secs(120),
+            "the ladder step stays"
+        );
+        tokio::time::advance(Duration::from_secs(120)).await;
+        assert!(registry.recovered(host, Instant::now()));
+        assert_eq!(registry.backoff_until(host), None);
+        assert_eq!(registry.back_off(host), Duration::from_secs(60));
     }
 
     /// A sign-in failure on the totals read, which follows a good list read,
