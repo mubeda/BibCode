@@ -68,6 +68,11 @@ import {
 import { Button } from "../ui/button";
 import { buildExpandedImagePreview, ExpandedImagePreview } from "./ExpandedImagePreview";
 import { ProposedPlanCard } from "./ProposedPlanCard";
+import {
+  preserveTimelineReadingPosition,
+  ReadingAnchorContext,
+  type ReadingAnchor,
+} from "./readingAnchor";
 import { ChangedFilesTree } from "./ChangedFilesTree";
 import { DiffStatLabel, hasNonZeroStat } from "./DiffStatLabel";
 import { MessageCopyButton } from "./MessageCopyButton";
@@ -361,6 +366,11 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       ? { ...config, onReady: handleAnchorReady, onSizeChanged: handleAnchorSizeChanged }
       : undefined;
   }, [anchorMessageId, handleAnchorReady, handleAnchorSizeChanged, rows]);
+  const readingAnchor = useTimelineReadingAnchor(
+    listRef,
+    timelineViewportElement,
+    anchoredEndSpace !== undefined,
+  );
 
   const handleScroll = useCallback(() => {
     const state = listRef.current?.getState?.();
@@ -512,38 +522,42 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       <AttachmentUploadCtx value={attachmentUploadState}>
         <TimelineRowActivityCtx value={activityState}>
           <div ref={setTimelineViewportElement} className="relative h-full min-h-0">
-            <LegendList<MessagesTimelineRow>
-              ref={listRef}
-              data={rows}
-              keyExtractor={keyExtractor}
-              getItemType={getItemType}
-              renderItem={renderItem}
-              estimatedItemSize={90}
-              initialScrollAtEnd
-              recycleItems={false}
-              {...(anchoredEndSpace ? { anchoredEndSpace } : {})}
-              contentInsetEndAdjustment={contentInsetEndAdjustment}
-              maintainScrollAtEnd={
-                anchoredEndSpace
-                  ? false
-                  : {
-                      animated: false,
-                      on: {
-                        dataChange: true,
-                        itemLayout: true,
-                        layout: true,
-                      },
-                    }
-              }
-              maintainVisibleContentPosition={{
-                data: true,
-                size: false,
-              }}
-              onScroll={handleScroll}
-              className="scrollbar-gutter-both h-full min-h-0 overflow-x-hidden overscroll-y-contain px-3 [overflow-anchor:none] sm:px-5"
-              ListHeaderComponent={TIMELINE_LIST_HEADER}
-              ListFooterComponent={TIMELINE_LIST_FOOTER}
-            />
+            <ReadingAnchorContext value={readingAnchor}>
+              <LegendList<MessagesTimelineRow>
+                ref={listRef}
+                data={rows}
+                keyExtractor={keyExtractor}
+                getItemType={getItemType}
+                renderItem={renderItem}
+                estimatedItemSize={90}
+                initialScrollAtEnd
+                recycleItems={false}
+                {...(anchoredEndSpace ? { anchoredEndSpace } : {})}
+                contentInsetEndAdjustment={contentInsetEndAdjustment}
+                maintainScrollAtEnd={
+                  anchoredEndSpace
+                    ? false
+                    : {
+                        animated: false,
+                        on: {
+                          dataChange: true,
+                          itemLayout: true,
+                          layout: true,
+                        },
+                      }
+                }
+                // A row that changes size above the first visible one, such as a Mermaid
+                // diagram replacing its source, keeps the line the user reads in place.
+                maintainVisibleContentPosition={{
+                  data: true,
+                  size: true,
+                }}
+                onScroll={handleScroll}
+                className="scrollbar-gutter-both h-full min-h-0 overflow-x-hidden overscroll-y-contain px-3 [overflow-anchor:none] sm:px-5"
+                ListHeaderComponent={TIMELINE_LIST_HEADER}
+                ListFooterComponent={TIMELINE_LIST_FOOTER}
+              />
+            </ReadingAnchorContext>
             <TimelineMinimap
               items={minimapItems}
               bottomInset={contentInsetEndAdjustment}
@@ -603,6 +617,32 @@ function useFoldPreviousTurnOnNewTurn(
       return next;
     });
   }, [latestTurn, setExpandedTurnIds]);
+}
+
+/**
+ * The reading anchor Mermaid diagrams commit their swaps through, created once for the life of
+ * the timeline. It reads the viewport and the end-space state from a ref; kept out of
+ * `MessagesTimeline`'s scope for the reason `useFoldPreviousTurnOnNewTurn` gives.
+ */
+function useTimelineReadingAnchor(
+  listRef: React.RefObject<LegendListRef | null>,
+  viewport: HTMLDivElement | null,
+  anchoringEndSpace: boolean,
+): ReadingAnchor {
+  const latest = useRef({ viewport, anchoringEndSpace });
+  useLayoutEffect(() => {
+    latest.current = { viewport, anchoringEndSpace };
+  }, [anchoringEndSpace, viewport]);
+  const preserveReadingPosition = useCallback(
+    (element: HTMLElement, commit: () => void) =>
+      preserveTimelineReadingPosition(
+        { list: listRef.current, ...latest.current },
+        element,
+        commit,
+      ),
+    [listRef],
+  );
+  return useMemo(() => ({ preserveReadingPosition }), [preserveReadingPosition]);
 }
 
 /**
