@@ -329,6 +329,7 @@ function makeProps(
     scheduleComposerFocus: vi.fn(),
     setThreadError: vi.fn(),
     onExpandImage: vi.fn(),
+    onPageTimeline: vi.fn(),
   };
 }
 

@@ -23,6 +23,7 @@ import {
   KEY_ARROW_LEFT_COMMAND,
   KEY_ARROW_RIGHT_COMMAND,
   KEY_ARROW_UP_COMMAND,
+  KEY_DOWN_COMMAND,
   KEY_ENTER_COMMAND,
   KEY_TAB_COMMAND,
   COMMAND_PRIORITY_HIGH,
@@ -1083,27 +1084,90 @@ interface ComposerPromptEditorProps {
     cursorAdjacentToMention: boolean,
     terminalContextIds: string[],
   ) => void;
-  onCommandKeyDown?: (
-    key: "ArrowDown" | "ArrowUp" | "Enter" | "Tab",
-    event: KeyboardEvent,
-  ) => boolean;
+  onCommandKeyDown?: (key: ComposerCommandKey, event: KeyboardEvent) => boolean;
   onPaste: React.ClipboardEventHandler<HTMLElement>;
   editorRef: React.RefObject<ComposerPromptEditorHandle | null>;
 }
 
+/** Keys the composer may claim before the editor handles them. */
+export type ComposerCommandKey = "ArrowDown" | "ArrowUp" | "Enter" | "Tab" | "PageUp" | "PageDown";
+
+/**
+ * Whether a page key still has work in the draft, so the editor keeps it: a range is selected,
+ * or the caret has another line of the draft in the key's direction. A line break makes one, and
+ * so does a long paragraph that wraps.
+ */
+function $pageKeyMovesWithinDraft(
+  rootElement: HTMLElement | null,
+  key: "PageUp" | "PageDown",
+): boolean {
+  const selection = $getSelection();
+  if (!$isRangeSelection(selection) || !selection.isCollapsed()) {
+    return true;
+  }
+  const text = $getRoot().getTextContent();
+  const caret = getExpandedAbsoluteOffsetForPoint(
+    selection.anchor.getNode(),
+    selection.anchor.offset,
+  );
+  const draftInKeyDirection = key === "PageUp" ? text.slice(0, caret) : text.slice(caret);
+  if (draftInKeyDirection.includes("\n")) {
+    return true;
+  }
+  return (
+    rootElement !== null && draftWrapsPastCaret(rootElement, key === "PageUp" ? "above" : "below")
+  );
+}
+
+/**
+ * Whether the laid-out draft has a wrapped line above or below the browser's caret. Measures the
+ * caret together with the text between it and that end of the draft: lines there besides the
+ * caret's own mean the key can still move it. Without a caret in the editor, nothing is laid out
+ * to measure.
+ */
+function draftWrapsPastCaret(rootElement: HTMLElement, side: "above" | "below"): boolean {
+  const domSelection = rootElement.ownerDocument.getSelection();
+  if (!domSelection || domSelection.rangeCount === 0) {
+    return false;
+  }
+  const caret = domSelection.getRangeAt(0);
+  if (!rootElement.contains(caret.startContainer)) {
+    return false;
+  }
+  const span = rootElement.ownerDocument.createRange();
+  span.selectNodeContents(rootElement);
+  if (side === "above") {
+    span.setEnd(caret.startContainer, caret.startOffset);
+  } else {
+    span.setStart(caret.endContainer, caret.endOffset);
+  }
+  return !boxesShareOneLine([
+    ...Array.from(caret.getClientRects()),
+    ...Array.from(span.getClientRects()),
+  ]);
+}
+
+/**
+ * Boxes on one line overlap vertically; a box wholly above or below the first box's middle sits
+ * on another line. Empty boxes, such as a caret the browser cannot place, carry no line.
+ */
+function boxesShareOneLine(boxes: ReadonlyArray<Pick<DOMRect, "top" | "bottom">>): boolean {
+  const lineBoxes = boxes.filter((box) => box.bottom > box.top);
+  const first = lineBoxes[0];
+  if (!first) {
+    return true;
+  }
+  const middle = (first.top + first.bottom) / 2;
+  return lineBoxes.every((box) => box.top < middle && box.bottom > middle);
+}
+
 function ComposerCommandKeyPlugin(props: {
-  onCommandKeyDown?: (
-    key: "ArrowDown" | "ArrowUp" | "Enter" | "Tab",
-    event: KeyboardEvent,
-  ) => boolean;
+  onCommandKeyDown?: (key: ComposerCommandKey, event: KeyboardEvent) => boolean;
 }) {
   const [editor] = useLexicalComposerContext();
 
   useEffect(() => {
-    const handleCommand = (
-      key: "ArrowDown" | "ArrowUp" | "Enter" | "Tab",
-      event: KeyboardEvent | null,
-    ): boolean => {
+    const handleCommand = (key: ComposerCommandKey, event: KeyboardEvent | null): boolean => {
       if (!props.onCommandKeyDown || !event) {
         return false;
       }
@@ -1141,12 +1205,24 @@ function ComposerCommandKeyPlugin(props: {
       (event) => handleCommand("Tab", event),
       COMMAND_PRIORITY_HIGH,
     );
+    // Lexical has no page-key commands; its generic keydown carries them. A page key is offered
+    // only once the draft has no use for it.
+    const unregisterPageKeys = editor.registerCommand(
+      KEY_DOWN_COMMAND,
+      (event) =>
+        (event.key === "PageUp" || event.key === "PageDown") &&
+        !$pageKeyMovesWithinDraft(editor.getRootElement(), event.key)
+          ? handleCommand(event.key, event)
+          : false,
+      COMMAND_PRIORITY_HIGH,
+    );
 
     return () => {
       unregisterArrowDown();
       unregisterArrowUp();
       unregisterEnter();
       unregisterTab();
+      unregisterPageKeys();
     };
   }, [editor, props]);
 

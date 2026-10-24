@@ -4,12 +4,14 @@ import {
   computeStableMessagesTimelineRows,
   computeMessageDurationStart,
   deriveMessagesTimelineRows,
+  isWorkEntryInUnsettledTurn,
   normalizeCompactToolLabel,
   resolveAssistantMessageCopyState,
   resolveTimelineIsAtEnd,
   resolveTimelineMinimapHasPersistentGutter,
   resolveTimelineMinimapHeightStyle,
   resolveTimelineMinimapIndexFromPointer,
+  resolveTimelineMinimapStepTargets,
   resolveTimelineMinimapTopPercent,
   type MessagesTimelineRow,
 } from "./MessagesTimeline.logic";
@@ -61,6 +63,41 @@ describe("timeline minimap geometry", () => {
         pointerY: 58,
       }),
     ).toBe(2);
+  });
+
+  it("steps to the turn before and after the reading position", () => {
+    // Turns start 12, 500 and 1000px down; a jump lands a turn 24px below the viewport top.
+    const itemTops = [12, 500, 1000];
+    const targets = (scrollTop: number, tops: ReadonlyArray<number | null> = itemTops) =>
+      resolveTimelineMinimapStepTargets({ itemTops: tops, scrollTop, maxScrollTop: 1500 });
+
+    // The start of the thread has nothing before it.
+    expect(targets(0)).toEqual({ previous: null, next: 1 });
+    // Having jumped to the middle turn.
+    expect(targets(476)).toEqual({ previous: 0, next: 2 });
+    // Partway through the middle turn, Previous returns to its start.
+    expect(targets(700)).toEqual({ previous: 1, next: 2 });
+    // At the end, the last turn cannot scroll to the top, so nothing is after it.
+    expect(targets(1500, [12, 500, 1000, 1700])).toEqual({ previous: 2, next: null });
+    // A turn whose row has no measured position is skipped.
+    expect(targets(0, [null, 500])).toEqual({ previous: null, next: 1 });
+  });
+
+  it("measures each step from where the list's jump lands, below its header", () => {
+    // Row positions exclude the list header, while a jump to a row scrolls past it too: with a
+    // 16px header, jumping to the turn at 500 lands at 492, not 476.
+    const targets = (scrollTop: number) =>
+      resolveTimelineMinimapStepTargets({
+        itemTops: [12, 500, 1000],
+        scrollTop,
+        maxScrollTop: 1500,
+        listStartOffset: 16,
+      });
+
+    // Having jumped to the middle turn, Previous goes on to the first turn.
+    expect(targets(492)).toEqual({ previous: 0, next: 2 });
+    // Having jumped to the first turn, nothing is before it.
+    expect(targets(4)).toEqual({ previous: null, next: 1 });
   });
 
   it("requires a finite viewport with enough side gutter", () => {
@@ -371,7 +408,7 @@ describe("deriveMessagesTimelineRows", () => {
           },
         },
       ],
-      expandedTurnIds: new Set(["turn-1" as never]),
+      turnFoldChoices: new Map([["turn-1" as never, true]]),
       isWorking: false,
       activeTurnStartedAt: null,
       turnDiffSummaryByAssistantMessageId: new Map(),
@@ -586,7 +623,7 @@ describe("deriveMessagesTimelineRows", () => {
 
     const expandedRows = deriveMessagesTimelineRows({
       timelineEntries,
-      expandedTurnIds: new Set(["turn-1" as never]),
+      turnFoldChoices: new Map([["turn-1" as never, true]]),
       isWorking: false,
       activeTurnStartedAt: null,
       turnDiffSummaryByAssistantMessageId: new Map(),
@@ -951,7 +988,7 @@ describe("deriveMessagesTimelineRows", () => {
           },
         },
       ],
-      expandedTurnIds: new Set(["turn-1" as never]),
+      turnFoldChoices: new Map([["turn-1" as never, true]]),
       isWorking: false,
       activeTurnStartedAt: null,
       turnDiffSummaryByAssistantMessageId: new Map(),
@@ -1055,7 +1092,7 @@ describe("deriveMessagesTimelineRows", () => {
     const collapsedRows = deriveMessagesTimelineRows(baseInput);
     const expandedRows = deriveMessagesTimelineRows({
       ...baseInput,
-      expandedWorkGroupIds: new Set(["work-group:work-entry-1"]),
+      workGroupChoices: new Map([["work-group:work-entry-1", true]]),
     });
 
     expect(collapsedRows.map((row) => row.id)).toEqual(["work-3", "work-toggle:work-entry-1"]);
@@ -1252,6 +1289,166 @@ describe("deriveMessagesTimelineRows", () => {
     expect(rows.find((row) => row.kind === "turn-fold")).toMatchObject({
       label: "Worked for 1.0s",
     });
+  });
+});
+
+describe("verbose chat rows", () => {
+  const verboseUserEntry = {
+    id: "user-entry",
+    kind: "message" as const,
+    createdAt: "2026-01-01T00:00:00Z",
+    message: {
+      id: "user-1" as never,
+      role: "user" as const,
+      text: "Build it",
+      turnId: null,
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-01T00:00:00Z",
+      streaming: false,
+    },
+  };
+  const verboseWorkEntry = (id: string, second: number) => ({
+    id: `${id}-entry`,
+    kind: "work" as const,
+    createdAt: `2026-01-01T00:00:0${second}Z`,
+    entry: {
+      id,
+      createdAt: `2026-01-01T00:00:0${second}Z`,
+      turnId: "turn-1" as never,
+      label: `Run ${id}`,
+      command: `echo ${id}`,
+      tone: "tool" as const,
+    },
+  });
+  const verboseAssistantEntry = (id: string, text: string, second: number) => ({
+    id: `${id}-entry`,
+    kind: "message" as const,
+    createdAt: `2026-01-01T00:00:0${second}Z`,
+    message: {
+      id: id as never,
+      role: "assistant" as const,
+      text,
+      turnId: "turn-1" as never,
+      createdAt: `2026-01-01T00:00:0${second}Z`,
+      updatedAt: `2026-01-01T00:00:0${second}Z`,
+      streaming: false,
+    },
+  });
+  const verboseTimelineEntries = [
+    verboseUserEntry,
+    verboseAssistantEntry("commentary", "Looking around first.", 1),
+    verboseWorkEntry("work-1", 2),
+    verboseWorkEntry("work-2", 3),
+    verboseWorkEntry("work-3", 4),
+    verboseAssistantEntry("answer", "Done", 5),
+  ];
+  const deriveVerboseRows = (
+    input: Partial<Parameters<typeof deriveMessagesTimelineRows>[0]> = {},
+  ) =>
+    deriveMessagesTimelineRows({
+      timelineEntries: verboseTimelineEntries,
+      isWorking: false,
+      activeTurnStartedAt: null,
+      turnDiffSummaryByAssistantMessageId: new Map(),
+      revertTurnCountByUserMessageId: new Map(),
+      ...input,
+    });
+
+  it("opens a settled turn and its work group, keeping their rows to fold them", () => {
+    const rows = deriveVerboseRows({ verboseChat: true });
+
+    expect(rows.map((row) => row.id)).toEqual([
+      "user-entry",
+      "turn-fold:turn-1",
+      "commentary-entry",
+      "work-1",
+      "work-2",
+      "work-3",
+      "work-toggle:work-1-entry",
+      "answer-entry",
+    ]);
+    expect(rows.find((row) => row.kind === "turn-fold")).toMatchObject({ expanded: true });
+    expect(rows.find((row) => row.kind === "work-toggle")).toMatchObject({
+      expanded: true,
+      hiddenCount: 2,
+    });
+    expect(rows.find((row) => row.id === "answer-entry")).toMatchObject({
+      showAssistantMeta: true,
+    });
+  });
+
+  it("folds a settled turn the user folded with the setting on", () => {
+    const rows = deriveVerboseRows({
+      verboseChat: true,
+      turnFoldChoices: new Map([["turn-1" as never, false]]),
+    });
+
+    expect(rows.map((row) => row.id)).toEqual(["user-entry", "turn-fold:turn-1", "answer-entry"]);
+    expect(rows.find((row) => row.kind === "turn-fold")).toMatchObject({ expanded: false });
+  });
+
+  it("folds the same settled turn while the setting is off", () => {
+    expect(deriveVerboseRows({ verboseChat: false }).map((row) => row.id)).toEqual([
+      "user-entry",
+      "turn-fold:turn-1",
+      "answer-entry",
+    ]);
+    expect(deriveVerboseRows({ verboseChat: false })).toEqual(deriveVerboseRows());
+  });
+
+  it("opens a settled work group and folds it again on the user's choice", () => {
+    // Outside any turn, so no turn fold hides the group.
+    const timelineEntries = [
+      verboseWorkEntry("work-1", 2),
+      verboseWorkEntry("work-2", 3),
+      verboseWorkEntry("work-3", 4),
+    ].map((timelineEntry) => ({
+      ...timelineEntry,
+      entry: { ...timelineEntry.entry, turnId: null },
+    }));
+    const opened = deriveVerboseRows({ verboseChat: true, timelineEntries });
+    const folded = deriveVerboseRows({
+      verboseChat: true,
+      timelineEntries,
+      workGroupChoices: new Map([["work-group:work-1-entry", false]]),
+    });
+
+    expect(opened.map((row) => row.id)).toEqual([
+      "work-1",
+      "work-2",
+      "work-3",
+      "work-toggle:work-1-entry",
+    ]);
+    expect(opened.at(-1)).toMatchObject({ kind: "work-toggle", expanded: true });
+    expect(folded.map((row) => row.id)).toEqual(["work-3", "work-toggle:work-1-entry"]);
+    expect(folded.at(-1)).toMatchObject({ kind: "work-toggle", expanded: false });
+  });
+
+  it("derives a running turn's rows the same with the setting on and off", () => {
+    const running = {
+      runningTurnId: "turn-1" as never,
+      latestTurn: {
+        turnId: "turn-1" as never,
+        state: "running" as const,
+        startedAt: "2026-01-01T00:00:00Z",
+        completedAt: null,
+      },
+      isWorking: true,
+      activeTurnStartedAt: "2026-01-01T00:00:00Z",
+    };
+    const verboseRows = deriveVerboseRows({ ...running, verboseChat: true });
+
+    expect(verboseRows).toEqual(deriveVerboseRows({ ...running, verboseChat: false }));
+    expect(verboseRows.some((row) => row.kind === "work-toggle")).toBe(true);
+  });
+
+  it("starts work entries expanded only outside the unsettled turn", () => {
+    const entry = verboseWorkEntry("work-1", 2).entry;
+
+    expect(isWorkEntryInUnsettledTurn(entry, null)).toBe(false);
+    expect(isWorkEntryInUnsettledTurn(entry, "turn-1" as never)).toBe(true);
+    expect(isWorkEntryInUnsettledTurn(entry, "turn-2" as never)).toBe(false);
+    expect(isWorkEntryInUnsettledTurn({ ...entry, turnId: null }, null)).toBe(false);
   });
 });
 
@@ -1863,7 +2060,7 @@ describe("queued timeline rows", () => {
       ...base,
       isWorking: false,
       timelineEntries,
-      expandedTurnIds: new Set([turnId]),
+      turnFoldChoices: new Map([[turnId, true]]),
     });
     expect(expanded.map((row) => row.id)).toEqual([
       "user",

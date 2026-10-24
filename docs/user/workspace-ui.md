@@ -420,6 +420,40 @@ idle center terminal when possible and otherwise open a new center terminal.
 The retired bottom terminal drawer and its bottom-toolbar toggle no longer
 exist.
 
+### Reading the timeline
+
+A finished turn folds its commentary and tool calls behind a **Worked for**
+row, leaving its answer visible; click the row to open the turn. A run of tool
+calls shows its newest call with a **+N previous tool calls** row, and a tool
+call opens to its command, output, and changed files when clicked. Hover or
+focus a tool call or a **Worked for** row to see its time.
+
+**Settings → General → Verbose chat** (off by default) opens finished turns:
+each **Worked for** row starts open, each run of tool calls shows every call
+above a **Show fewer tool calls** row, and each tool call starts open to its
+output. One click on a **Worked for** row folds that turn again, and one click
+on **Show fewer tool calls** or a tool call collapses it. The turn still running
+looks the same either way until it finishes. A turn you fold stays folded when
+the next turn starts; each choice holds until you switch threads or reload. The
+setting applies to open threads at once and is stored on this device.
+
+With a mouse or trackpad, a thread with two or more of your messages shows a
+minimap at the timeline's left edge, one mark per message. Hover it to preview
+a turn and click to jump there. **Previous turn** and **Next turn** above and
+below it step to the nearest turn start above or below where you are reading;
+partway through a turn, **Previous turn** returns to that turn's start. At the
+start or end of the thread the button in that direction is dimmed and does
+nothing.
+
+PageUp and PageDown in the composer scroll the timeline by about a screen, so
+you can read back without leaving the draft. While the key can still move the
+caret to another line of a multi-line draft, it moves the caret instead:
+PageUp scrolls once the caret is on the first line, PageDown once it is on the
+last. A long paragraph's wrapped lines count as lines. With text selected, or
+with Shift, Alt, Ctrl, or Cmd held, the keys keep their usual meaning.
+These keys and the minimap jump instead of scrolling smoothly when the system
+asks for reduced motion.
+
 ### Uploading chat attachments
 
 When the server supports staged attachments and a message's total encoded

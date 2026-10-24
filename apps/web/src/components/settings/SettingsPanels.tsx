@@ -445,6 +445,7 @@ export function useGeneralSettingsRestore(onRestored?: () => void) {
       ...(settings.enableAssistantStreaming !== DEFAULT_UNIFIED_SETTINGS.enableAssistantStreaming
         ? ["Assistant output"]
         : []),
+      ...(settings.verboseChat !== DEFAULT_UNIFIED_SETTINGS.verboseChat ? ["Verbose chat"] : []),
       ...(settings.enableProviderUpdateChecks !==
       DEFAULT_UNIFIED_SETTINGS.enableProviderUpdateChecks
         ? ["Provider update checks"]
@@ -485,6 +486,7 @@ export function useGeneralSettingsRestore(onRestored?: () => void) {
       settings.enableAssistantStreaming,
       settings.enableProviderUpdateChecks,
       settings.timestampFormat,
+      settings.verboseChat,
       settings.wordWrap,
       linkTargetShown,
       theme,
@@ -508,6 +510,7 @@ export function useGeneralSettingsRestore(onRestored?: () => void) {
       wordWrap: DEFAULT_UNIFIED_SETTINGS.wordWrap,
       diffIgnoreWhitespace: DEFAULT_UNIFIED_SETTINGS.diffIgnoreWhitespace,
       enableAssistantStreaming: DEFAULT_UNIFIED_SETTINGS.enableAssistantStreaming,
+      verboseChat: DEFAULT_UNIFIED_SETTINGS.verboseChat,
       enableProviderUpdateChecks: DEFAULT_UNIFIED_SETTINGS.enableProviderUpdateChecks,
       autoOpenPlanSidebar: DEFAULT_UNIFIED_SETTINGS.autoOpenPlanSidebar,
       defaultThreadEnvMode: DEFAULT_UNIFIED_SETTINGS.defaultThreadEnvMode,
@@ -726,6 +729,30 @@ export function GeneralSettingsPanel() {
                 updateSettings({ enableAssistantStreaming: Boolean(checked) })
               }
               aria-label="Stream assistant messages"
+            />
+          }
+        />
+
+        <SettingsRow
+          title="Verbose chat"
+          description="Show every tool call and its output. Finished turns start open."
+          resetAction={
+            settings.verboseChat !== DEFAULT_UNIFIED_SETTINGS.verboseChat ? (
+              <SettingResetButton
+                label="verbose chat"
+                onClick={() =>
+                  updateSettings({
+                    verboseChat: DEFAULT_UNIFIED_SETTINGS.verboseChat,
+                  })
+                }
+              />
+            ) : null
+          }
+          control={
+            <Switch
+              checked={settings.verboseChat}
+              onCheckedChange={(checked) => updateSettings({ verboseChat: Boolean(checked) })}
+              aria-label="Show every tool call and its output"
             />
           }
         />

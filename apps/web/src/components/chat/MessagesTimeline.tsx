@@ -27,7 +27,7 @@ import {
   type ReactNode,
 } from "react";
 import { flushSync } from "react-dom";
-import { LegendList, type LegendListRef } from "@legendapp/list/react";
+import { LegendList, type LegendListMetrics, type LegendListRef } from "@legendapp/list/react";
 import { FileDiff } from "@pierre/diffs/react";
 import {
   deriveTimelineEntries,
@@ -49,6 +49,7 @@ import {
   CheckIcon,
   ChevronDownIcon,
   ChevronRightIcon,
+  ChevronUpIcon,
   CircleAlertIcon,
   EyeIcon,
   FileIcon,
@@ -75,18 +76,24 @@ import { TurnDeliveryNotice } from "./TurnDeliveryNotice";
 import {
   computeStableMessagesTimelineRows,
   deriveMessagesTimelineRows,
+  deriveUnsettledTurnId,
+  isWorkEntryInUnsettledTurn,
   normalizeCompactToolLabel,
   resolveAssistantMessageCopyState,
   resolveTimelineIsAtEnd,
   resolveTimelineMinimapHasPersistentGutter,
   resolveTimelineMinimapHeightStyle,
   resolveTimelineMinimapIndexFromPointer,
+  resolveTimelineMinimapStepTargets,
   resolveTimelineMinimapTopPercent,
   type StableMessagesTimelineRowsState,
   type MessagesTimelineRow,
+  TIMELINE_MINIMAP_JUMP_OFFSET,
   TIMELINE_MINIMAP_MIN_ITEMS,
   type TimelineLatestTurn,
+  type TimelineMinimapStep,
 } from "./MessagesTimeline.logic";
+import { timelineScrollAnimates } from "./timelineScrollAnchoring";
 import { TerminalContextInlineChip } from "./TerminalContextInlineChip";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import {
@@ -130,6 +137,9 @@ import {
 
 interface TimelineRowSharedState {
   timestampFormat: TimestampFormat;
+  verboseChat: boolean;
+  /** Each tool row's expand/collapse choice, kept for when LegendList remounts the row. */
+  workEntryExpandedChoices: Map<string, boolean>;
   routeThreadKey: string;
   threadRef: ScopedThreadRef | null;
   markdownCwd: string | undefined;
@@ -151,14 +161,16 @@ interface TimelineRowSharedState {
   queuedMessageErrors: Readonly<Record<string, string>>;
   onImageExpand: (preview: ExpandedImagePreview) => void;
   onOpenTurnDiff: (turnId: TurnId, filePath?: string) => void;
-  onToggleTurnFold: (turnId: TurnId) => void;
-  onToggleWorkGroup: (groupId: string, anchorElement?: HTMLElement) => void;
+  /** `expanded` is what the row shows now; the toggle flips it. */
+  onToggleTurnFold: (turnId: TurnId, expanded: boolean) => void;
+  onToggleWorkGroup: (groupId: string, expanded: boolean, anchorElement?: HTMLElement) => void;
 }
 
 interface TimelineRowActivityState {
   isWorking: boolean;
   isRevertingCheckpoint: boolean;
   activeTurnInProgress: boolean;
+  unsettledTurnId: TurnId | null;
 }
 
 const TimelineRowCtx = createContext<TimelineRowSharedState>(null!);
@@ -170,6 +182,7 @@ const AttachmentUploadCtx = createContext<{
 const TIMELINE_LIST_HEADER = <div className="h-3 sm:h-4" />;
 const TIMELINE_LIST_FOOTER = <div className="h-3 sm:h-4" />;
 const EMPTY_TIMELINE_SKILLS: ReadonlyArray<Pick<ServerProviderSkill, "name" | "displayName">> = [];
+const NO_MINIMAP_STEP_TARGETS: TimelineMinimapStepTargets = { previous: null, next: null };
 
 // ---------------------------------------------------------------------------
 // Props (public API)
@@ -207,6 +220,7 @@ interface MessagesTimelineProps {
   markdownCwd: string | undefined;
   resolvedTheme: "light" | "dark";
   timestampFormat: TimestampFormat;
+  verboseChat: boolean;
   workspaceRoot: string | undefined;
   skills?: ReadonlyArray<Pick<ServerProviderSkill, "name" | "displayName">>;
   anchorMessageId: MessageId | null;
@@ -253,6 +267,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   markdownCwd,
   resolvedTheme,
   timestampFormat,
+  verboseChat,
   workspaceRoot,
   skills = EMPTY_TIMELINE_SKILLS,
   anchorMessageId,
@@ -262,35 +277,25 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   onIsAtEndChange,
   onManualNavigation,
 }: MessagesTimelineProps) {
-  const [expandedTurnIds, setExpandedTurnIds] = useState<ReadonlySet<TurnId>>(new Set());
-  const [expandedWorkGroupIds, setExpandedWorkGroupIds] = useState<ReadonlySet<string>>(new Set());
+  const [turnFoldChoices, setTurnFoldChoices] = useState<ReadonlyMap<TurnId, boolean>>(
+    () => new Map(),
+  );
+  const [workGroupChoices, setWorkGroupChoices] = useState<ReadonlyMap<string, boolean>>(
+    () => new Map(),
+  );
   const [minimapStripMap] = useState(() => new Map<string, HTMLSpanElement>());
+  const [workEntryExpandedChoices] = useState(() => new Map<string, boolean>());
 
-  const onToggleTurnFold = useCallback((turnId: TurnId) => {
-    setExpandedTurnIds((existing) => {
-      const next = new Set(existing);
-      if (next.has(turnId)) {
-        next.delete(turnId);
-      } else {
-        next.add(turnId);
-      }
-      return next;
-    });
+  // A toggle flips what the row shows, which Verbose chat opens by default.
+  const onToggleTurnFold = useCallback((turnId: TurnId, expanded: boolean) => {
+    setTurnFoldChoices((existing) => new Map(existing).set(turnId, !expanded));
   }, []);
   const onToggleWorkGroup = useCallback(
-    (groupId: string, anchorElement?: HTMLElement) => {
+    (groupId: string, expanded: boolean, anchorElement?: HTMLElement) => {
       const anchorBottomBeforeToggle = anchorElement?.getBoundingClientRect().bottom ?? null;
 
       flushSync(() => {
-        setExpandedWorkGroupIds((existing) => {
-          const next = new Set(existing);
-          if (next.has(groupId)) {
-            next.delete(groupId);
-          } else {
-            next.add(groupId);
-          }
-          return next;
-        });
+        setWorkGroupChoices((existing) => new Map(existing).set(groupId, !expanded));
       });
 
       if (anchorBottomBeforeToggle === null || !anchorElement) {
@@ -311,7 +316,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
     [listRef],
   );
 
-  useFoldPreviousTurnOnNewTurn(latestTurn, setExpandedTurnIds);
+  useFoldPreviousTurnOnNewTurn(latestTurn, setTurnFoldChoices);
 
   const rawRows = useMemo(
     () =>
@@ -321,8 +326,9 @@ export const MessagesTimeline = memo(function MessagesTimeline({
         queuedStatuses,
         latestTurn,
         runningTurnId,
-        expandedTurnIds,
-        expandedWorkGroupIds,
+        turnFoldChoices,
+        workGroupChoices,
+        verboseChat,
         isWorking,
         activeTurnStartedAt,
         turnDiffSummaryByAssistantMessageId,
@@ -334,8 +340,9 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       queuedStatuses,
       latestTurn,
       runningTurnId,
-      expandedTurnIds,
-      expandedWorkGroupIds,
+      turnFoldChoices,
+      workGroupChoices,
+      verboseChat,
       isWorking,
       activeTurnStartedAt,
       turnDiffSummaryByAssistantMessageId,
@@ -348,6 +355,8 @@ export const MessagesTimeline = memo(function MessagesTimeline({
     null,
   );
   const [minimapHasPersistentGutter, setMinimapHasPersistentGutter] = useState(false);
+  const [minimapStepTargets, setMinimapStepTargets] = useState(NO_MINIMAP_STEP_TARGETS);
+  const { listHeaderSize, onListMetricsChange } = useListHeaderSize();
   const { handleAnchorReady, handleAnchorSizeChanged } = useStableAnchorCallbacks(
     anchorMessageId,
     onAnchorReady,
@@ -374,14 +383,16 @@ export const MessagesTimeline = memo(function MessagesTimeline({
 
     const scrollTop = state.scroll ?? 0;
     const scrollBottom = scrollTop + (state.scrollLength ?? 0);
+    const itemTops: Array<number | null> = [];
 
     for (const item of minimapItems) {
+      const rowTop = resolveTimelineRowTop(state, item.rowIndex);
+      itemTops.push(rowTop);
       const strip = minimapStripMap.get(item.id);
       if (!strip) {
         continue;
       }
 
-      const rowTop = resolveTimelineRowTop(state, item.rowIndex);
       const rowHeight = resolveTimelineRowHeight(state, item.rowIndex);
       const inView =
         rowTop !== null &&
@@ -390,7 +401,23 @@ export const MessagesTimeline = memo(function MessagesTimeline({
 
       strip.dataset.inView = inView ? "true" : "false";
     }
-  }, [listRef, minimapItems, minimapStripMap, onIsAtEndChange]);
+
+    // Changes only when the reading position crosses a turn, so scrolling within one renders nothing.
+    const nextStepTargets = resolveTimelineMinimapStepTargets({
+      itemTops,
+      scrollTop,
+      maxScrollTop: Math.max(
+        0,
+        (state.contentLength ?? Number.POSITIVE_INFINITY) - (state.scrollLength ?? 0),
+      ),
+      listStartOffset: listHeaderSize,
+    });
+    setMinimapStepTargets((current) =>
+      current.previous === nextStepTargets.previous && current.next === nextStepTargets.next
+        ? current
+        : nextStepTargets,
+    );
+  }, [listHeaderSize, listRef, minimapItems, minimapStripMap, onIsAtEndChange]);
 
   useEffect(() => {
     const frame = requestAnimationFrame(handleScroll);
@@ -424,6 +451,8 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   const sharedState = useMemo<TimelineRowSharedState>(
     () => ({
       timestampFormat,
+      verboseChat,
+      workEntryExpandedChoices,
       routeThreadKey,
       threadRef: parseScopedThreadKey(routeThreadKey),
       markdownCwd,
@@ -448,6 +477,8 @@ export const MessagesTimeline = memo(function MessagesTimeline({
     }),
     [
       timestampFormat,
+      verboseChat,
+      workEntryExpandedChoices,
       routeThreadKey,
       markdownCwd,
       resolvedTheme,
@@ -470,13 +501,15 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       onToggleWorkGroup,
     ],
   );
+  const unsettledTurnId = deriveUnsettledTurnId(latestTurn, runningTurnId);
   const activityState = useMemo<TimelineRowActivityState>(
     () => ({
       isWorking,
       isRevertingCheckpoint,
       activeTurnInProgress,
+      unsettledTurnId,
     }),
-    [activeTurnInProgress, isRevertingCheckpoint, isWorking],
+    [activeTurnInProgress, isRevertingCheckpoint, isWorking, unsettledTurnId],
   );
 
   // Stable renderItem — no closure deps. Row components read shared state
@@ -540,6 +573,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
                 size: false,
               }}
               onScroll={handleScroll}
+              onMetricsChange={onListMetricsChange}
               className="scrollbar-gutter-both h-full min-h-0 overflow-x-hidden overscroll-y-contain px-3 [overflow-anchor:none] sm:px-5"
               ListHeaderComponent={TIMELINE_LIST_HEADER}
               ListFooterComponent={TIMELINE_LIST_FOOTER}
@@ -548,13 +582,14 @@ export const MessagesTimeline = memo(function MessagesTimeline({
               items={minimapItems}
               bottomInset={contentInsetEndAdjustment}
               hasPersistentGutter={minimapHasPersistentGutter}
+              stepTargets={minimapStepTargets}
               stripMap={minimapStripMap}
               onSelect={(item) => {
                 onManualNavigation();
                 void listRef.current?.scrollToIndex({
                   index: item.rowIndex,
-                  animated: true,
-                  viewOffset: 24,
+                  animated: timelineScrollAnimates(),
+                  viewOffset: TIMELINE_MINIMAP_JUMP_OFFSET,
                 });
               }}
             />
@@ -567,7 +602,9 @@ export const MessagesTimeline = memo(function MessagesTimeline({
 
 /**
  * An in-session interrupt leaves its turn expanded so the user keeps their place; the next
- * turn (or a reload, since this is local state) folds it.
+ * turn (or a reload, since this is local state) drops that and any other open choice on the
+ * previous turn, so it folds unless Verbose chat keeps it open. A turn the user folded stays
+ * folded.
  *
  * Kept out of `MessagesTimeline`'s own scope on purpose: every closure a component creates
  * shares one scope, so a memoized callback recreated on a different change than another
@@ -575,7 +612,9 @@ export const MessagesTimeline = memo(function MessagesTimeline({
  */
 function useFoldPreviousTurnOnNewTurn(
   latestTurn: TimelineLatestTurn | null,
-  setExpandedTurnIds: (update: (existing: ReadonlySet<TurnId>) => ReadonlySet<TurnId>) => void,
+  setTurnFoldChoices: (
+    update: (existing: ReadonlyMap<TurnId, boolean>) => ReadonlyMap<TurnId, boolean>,
+  ) => void,
 ) {
   const previousLatestTurnRef = useRef(latestTurn);
   useEffect(() => {
@@ -586,23 +625,33 @@ function useFoldPreviousTurnOnNewTurn(
     }
     if (latestTurn.turnId === previous.turnId) {
       if (previous.state === "running" && latestTurn.state === "interrupted") {
-        setExpandedTurnIds((existing) => {
-          const next = new Set(existing);
-          next.add(latestTurn.turnId);
-          return next;
-        });
+        setTurnFoldChoices((existing) => new Map(existing).set(latestTurn.turnId, true));
       }
       return;
     }
-    setExpandedTurnIds((existing) => {
-      if (!existing.has(previous.turnId)) {
+    setTurnFoldChoices((existing) => {
+      if (existing.get(previous.turnId) !== true) {
         return existing;
       }
-      const next = new Set(existing);
+      const next = new Map(existing);
       next.delete(previous.turnId);
       return next;
     });
-  }, [latestTurn, setExpandedTurnIds]);
+  }, [latestTurn, setTurnFoldChoices]);
+}
+
+/**
+ * The list header's measured height. Row positions start below it, but a jump to a row scrolls
+ * past it as well. Kept out of `MessagesTimeline`'s scope for the reason given on
+ * `useFoldPreviousTurnOnNewTurn`.
+ */
+function useListHeaderSize() {
+  const [listHeaderSize, setListHeaderSize] = useState(0);
+  const onListMetricsChange = useCallback(
+    (metrics: LegendListMetrics) => setListHeaderSize(metrics.headerSize),
+    [],
+  );
+  return { listHeaderSize, onListMetricsChange };
 }
 
 /**
@@ -649,6 +698,8 @@ interface TimelineMinimapItem {
   readonly userText: string | null;
   readonly assistantText: string | null;
 }
+
+type TimelineMinimapStepTargets = Record<TimelineMinimapStep, number | null>;
 
 interface TimelinePositionState {
   readonly contentLength?: number;
@@ -744,12 +795,14 @@ function TimelineMinimap({
   bottomInset,
   hasPersistentGutter,
   items,
+  stepTargets,
   stripMap,
   onSelect,
 }: {
   bottomInset: number;
   hasPersistentGutter: boolean;
   items: ReadonlyArray<TimelineMinimapItem>;
+  stepTargets: TimelineMinimapStepTargets;
   stripMap: Map<string, HTMLSpanElement>;
   onSelect: (item: TimelineMinimapItem) => void;
 }) {
@@ -820,10 +873,18 @@ function TimelineMinimap({
       data-persistent-gutter={hasPersistentGutter ? "true" : "false"}
       style={{ bottom: safeBottomInset }}
     >
-      <div className="relative h-full w-full select-none">
+      <div
+        className="absolute top-1/2 left-3 w-10 -translate-y-1/2 select-none"
+        style={{ height: resolveTimelineMinimapHeightStyle(items.length) }}
+      >
+        <TimelineMinimapStepButton
+          step="previous"
+          item={items[stepTargets.previous ?? -1] ?? null}
+          onSelect={onSelect}
+        />
         <button
           aria-label={`Jump to message: ${activeItem?.userText ?? "User message"}`}
-          className="pointer-events-auto absolute top-1/2 left-3 w-10 -translate-y-1/2 cursor-pointer bg-transparent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/70"
+          className="pointer-events-auto absolute inset-0 cursor-pointer bg-transparent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/70"
           onBlur={() => setActiveIndex(null)}
           onClick={(event) => {
             const nextIndex = resolveActiveIndexFromPointer(event);
@@ -859,7 +920,6 @@ function TimelineMinimap({
           onMouseDown={(event) => {
             event.preventDefault();
           }}
-          style={{ height: resolveTimelineMinimapHeightStyle(items.length) }}
           type="button"
         >
           <div className="absolute top-0 left-3 h-full w-px bg-border/15" />
@@ -920,8 +980,55 @@ function TimelineMinimap({
             </span>
           ) : null}
         </button>
+        <TimelineMinimapStepButton
+          step="next"
+          item={items[stepTargets.next ?? -1] ?? null}
+          onSelect={onSelect}
+        />
       </div>
     </div>
+  );
+}
+
+/**
+ * Steps to the turn before or after the reading position. With nowhere to go it stays focusable
+ * but inert (`aria-disabled`), so pressing it at the start or end of a thread keeps focus here.
+ */
+function TimelineMinimapStepButton({
+  step,
+  item,
+  onSelect,
+}: {
+  step: TimelineMinimapStep;
+  item: TimelineMinimapItem | null;
+  onSelect: (item: TimelineMinimapItem) => void;
+}) {
+  const label = step === "previous" ? "Previous turn" : "Next turn";
+  const Icon = step === "previous" ? ChevronUpIcon : ChevronDownIcon;
+  return (
+    <Tooltip>
+      <TooltipTrigger
+        render={
+          <Button
+            type="button"
+            size="icon-xs"
+            variant="ghost"
+            aria-label={label}
+            aria-disabled={item === null}
+            className={cn(
+              "pointer-events-auto absolute left-0 aria-disabled:cursor-default aria-disabled:opacity-40 aria-disabled:hover:bg-transparent",
+              step === "previous" ? "bottom-full mb-1" : "top-full mt-1",
+            )}
+            onClick={() => {
+              if (item) onSelect(item);
+            }}
+          />
+        }
+      >
+        <Icon />
+      </TooltipTrigger>
+      <TooltipPopup side="right">{label}</TooltipPopup>
+    </Tooltip>
   );
 }
 
@@ -1188,18 +1295,45 @@ function TurnFoldTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "turn-
   const Icon = row.expanded ? ChevronDownIcon : ChevronRightIcon;
 
   return (
-    <div className="border-b border-border/60 pb-2 pt-1">
+    <div className="group/timeline-row flex items-center border-b border-border/60 pb-2 pt-1">
       <button
         type="button"
         aria-expanded={row.expanded}
         data-scroll-anchor-ignore
-        onClick={() => ctx.onToggleTurnFold(row.turnId)}
+        onClick={() => ctx.onToggleTurnFold(row.turnId, row.expanded)}
         className="flex cursor-pointer select-none items-center gap-1 rounded-md px-1 text-xs text-muted-foreground tabular-nums transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/70"
       >
         <span>{row.label}</span>
         <Icon className="size-3.5" />
       </button>
+      <TimelineRowTime createdAt={row.createdAt} className="ms-auto pe-1" />
     </div>
+  );
+}
+
+/**
+ * A tool or fold row's time, shown while the row is hovered or focused, as a message's time is.
+ * Hidden, it takes no room, so a tool row's preview keeps its full width.
+ */
+function TimelineRowTime({ createdAt, className }: { createdAt: string; className: string }) {
+  const { timestampFormat } = use(TimelineRowCtx);
+  return (
+    <Tooltip>
+      <TooltipTrigger
+        render={
+          <span
+            data-timeline-row-time
+            className={cn(
+              "hidden shrink-0 text-muted-foreground text-xs tabular-nums group-focus-within/timeline-row:inline group-hover/timeline-row:inline",
+              className,
+            )}
+          />
+        }
+      >
+        {formatShortTimestamp(createdAt, timestampFormat)}
+      </TooltipTrigger>
+      <TooltipPopup>{formatChatTimestampTooltip(createdAt, timestampFormat)}</TooltipPopup>
+    </Tooltip>
   );
 }
 
@@ -1431,7 +1565,7 @@ function WorkGroupToggleTimelineRow({
       onClick={(event) => {
         const anchorElement =
           event.currentTarget.closest<HTMLElement>("[data-timeline-row-id]") ?? event.currentTarget;
-        ctx.onToggleWorkGroup(row.groupId, anchorElement);
+        ctx.onToggleWorkGroup(row.groupId, row.expanded, anchorElement);
       }}
     >
       <span className="flex size-5 shrink-0 items-center justify-center text-muted-foreground">
@@ -2172,8 +2306,19 @@ const SimpleWorkEntryRow = memo(function SimpleWorkEntryRow(props: {
   workspaceRoot: string | undefined;
 }) {
   const { workEntry, workspaceRoot } = props;
+  const { verboseChat, workEntryExpandedChoices } = use(TimelineRowCtx);
   const activity = use(TimelineRowActivityCtx);
-  const [expanded, setExpanded] = useState(false);
+  // The user's choice wins; until they make one, Verbose chat opens rows outside a running turn.
+  const [expandedChoice, setExpandedChoice] = useState(
+    () => workEntryExpandedChoices.get(workEntry.id) ?? null,
+  );
+  const expanded =
+    expandedChoice ??
+    (verboseChat && !isWorkEntryInUnsettledTurn(workEntry, activity.unsettledTurnId));
+  const toggleExpanded = () => {
+    workEntryExpandedChoices.set(workEntry.id, !expanded);
+    setExpandedChoice(!expanded);
+  };
   const iconConfig = workToneIcon(workEntry.tone);
   const entryIconName = workEntryIconName(workEntry);
   const heading = toolWorkEntryHeading(workEntry);
@@ -2212,11 +2357,12 @@ const SimpleWorkEntryRow = memo(function SimpleWorkEntryRow(props: {
         role: "button" as const,
         tabIndex: 0 as const,
         "aria-label": displayText,
-        onClick: () => setExpanded((v) => !v),
+        "aria-expanded": expanded,
+        onClick: toggleExpanded,
         onKeyDown: (e: KeyboardEvent<HTMLDivElement>) => {
           if (e.key === "Enter" || e.key === " ") {
             e.preventDefault();
-            setExpanded((v) => !v);
+            toggleExpanded();
           }
         },
       }
@@ -2225,7 +2371,7 @@ const SimpleWorkEntryRow = memo(function SimpleWorkEntryRow(props: {
   return (
     <div
       className={cn(
-        "flex flex-col rounded-md px-0.5 py-0.5 transition-colors",
+        "group/timeline-row flex flex-col rounded-md px-0.5 py-0.5 transition-colors",
         canExpand &&
           "cursor-pointer hover:bg-accent/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/70",
       )}
@@ -2248,6 +2394,7 @@ const SimpleWorkEntryRow = memo(function SimpleWorkEntryRow(props: {
             </p>
           </div>
           <div className="flex shrink-0 items-center gap-px text-muted-foreground">
+            <TimelineRowTime createdAt={workEntry.createdAt} className="me-1" />
             <span
               className="flex size-4 shrink-0 items-center justify-center"
               aria-hidden={!canExpand}
