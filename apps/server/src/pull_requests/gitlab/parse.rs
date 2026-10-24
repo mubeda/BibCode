@@ -632,6 +632,7 @@ pub(super) fn action_detail(
                 .iter()
                 .map(|a| actor(a, op).map(|actor| actor.login))
                 .collect::<Result<_, _>>()?,
+            host_version: context.version(),
         },
         inputs,
     })

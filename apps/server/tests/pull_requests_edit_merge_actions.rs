@@ -456,6 +456,56 @@ async fn pull_requests_gitlab_refused_auto_merge_cancellation_is_an_error() {
     assert!(!error.retryable);
 }
 
+/// #156: GitLab 19.5 added `cancel_auto_merge`, which refuses with a real HTTP 409, and
+/// deprecated `cancel_merge_when_pipeline_succeeds`. The host version read with the
+/// context picks the endpoint, and a refusal on either fails the action the same way.
+#[tokio::test]
+async fn pull_requests_gitlab_auto_merge_cancellation_endpoint_follows_the_host_version() {
+    for (version, endpoint, response) in [
+        (
+            "19.4.0",
+            "cancel_merge_when_pipeline_succeeds",
+            json!({"status":"success"}),
+        ),
+        (
+            "19.5.0",
+            "cancel_auto_merge",
+            json!({"iid":14,"merge_when_pipeline_succeeds":false}),
+        ),
+    ] {
+        let mut f = Fixture::new(true);
+        f.auto_merge_precheck(version);
+        f.response(response);
+        f.rpc(json!({"action":"disableAutoMerge"}))
+            .await
+            .unwrap_or_else(|error| panic!("{version}: {error}"));
+        assert_eq!(
+            f.args(12)[..4],
+            [
+                "api",
+                "--method",
+                "POST",
+                &format!("projects/team%2Frepo/merge_requests/14/{endpoint}"),
+            ],
+            "{version}"
+        );
+    }
+
+    let mut f = Fixture::new(true);
+    f.auto_merge_precheck("19.5.0");
+    f.failure("glab: Can't cancel the automatic merge (HTTP 409)");
+    let error = f
+        .rpc(json!({"action":"disableAutoMerge"}))
+        .await
+        .unwrap_err();
+    assert_eq!(error["code"], "host_rejected", "{error}");
+    assert_eq!(
+        error["message"],
+        "GitLab did not cancel auto-merge. Refresh to see whether it is still on.",
+        "{error}"
+    );
+}
+
 #[tokio::test]
 async fn pull_requests_gitlab_merge_plain_pins_sha_and_method_flags() {
     for method in ["merge", "squash", "rebase"] {
@@ -1067,6 +1117,15 @@ impl Fixture {
 }
 
 impl Fixture {
+    /// A GitLab merge request set to auto-merge, read from a host at `version`.
+    fn auto_merge_precheck(&mut self, version: &str) {
+        self.gitlab_precheck(true);
+        self.change_response(6, |v| v["version"] = json!(version));
+        self.change_response(7, |v| {
+            v["user"]["can_merge"] = json!(true);
+            v["merge_when_pipeline_succeeds"] = json!(true);
+        });
+    }
     fn merge_precheck(&mut self) {
         if self.scope.provider == PullRequestsProvider::Gitlab {
             self.gitlab_precheck(true);
