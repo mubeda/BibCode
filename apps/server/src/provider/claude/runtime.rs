@@ -1615,7 +1615,18 @@ pub struct ClaudeProviderRuntime {
     /// Whether Claude is compacting the conversation. Claude replays a message only after a
     /// compaction it runs first, so acknowledgement deadlines do not run meanwhile.
     compacting: watch::Sender<bool>,
+    /// The session ID BiBCode assigned a copy, which its first `system/init` must report.
+    expected_session_id: Option<String>,
+    /// A `system/init` arrived: Claude took up the conversation.
+    saw_init: bool,
+    /// Why nothing more of this process is shown: a copy came up under another session ID.
+    halted: Option<&'static str>,
 }
+
+/// A copy whose first `system/init` names a session ID BiBCode did not assign: Claude would
+/// continue it where no BiBCode thread owns it, so its turn fails before any of it is shown.
+pub(crate) const CLAUDE_COPY_UNDER_ANOTHER_ID: &str =
+    "Claude Code continued the copy under another session ID. Update Claude Code, then send again.";
 
 impl ClaudeProviderRuntime {
     pub fn new(thread_id: String, session_id: String) -> Self {
@@ -1658,6 +1669,62 @@ impl ClaudeProviderRuntime {
             last_assistant_error: None,
             compaction_item_id: None,
             compacting: watch::channel(false).0,
+            expected_session_id: None,
+            saw_init: false,
+            halted: None,
+        }
+    }
+
+    /// A copy's launch: its first `system/init` must report `session_id`, or the process is
+    /// stopped before any of its turn is shown.
+    pub(crate) fn expect_session_id(&mut self, session_id: String) {
+        self.expected_session_id = Some(session_id);
+    }
+
+    pub(crate) fn saw_init(&self) -> bool {
+        self.saw_init
+    }
+
+    pub(crate) fn halted(&self) -> Option<&'static str> {
+        self.halted
+    }
+
+    /// Stops showing this process: the turn fails (or, before Claude replayed its message, the
+    /// delivery does), and the session ends so the driver stops it.
+    fn halt_for_foreign_session_id(&mut self) -> ClaudeRuntimeOutput {
+        tracing::warn!(
+            thread_id = %self.thread_id,
+            "Claude Code reported a session ID BiBCode did not assign to a copy; stopping it"
+        );
+        self.halted = Some(CLAUDE_COPY_UNDER_ANOTHER_ID);
+        let turn_open = self.turn_open && self.turn_input_awaiting_replay.is_none();
+        self.stop_turn_input();
+        self.delivery_acknowledgement_cancellation.cancel();
+        self.turn_open = false;
+        let mut events = Vec::new();
+        if turn_open {
+            events.push(self.event(
+                "turn.completed",
+                self.current_turn_id.clone(),
+                None,
+                None,
+                json!({
+                    "state": "failed",
+                    "errorMessage": CLAUDE_COPY_UNDER_ANOTHER_ID,
+                    "errorClass": "provider_error",
+                }),
+            ));
+        }
+        events.push(self.event(
+            "session.exited",
+            None,
+            None,
+            None,
+            json!({ "reason": "copy_session_id_mismatch" }),
+        ));
+        ClaudeRuntimeOutput {
+            events,
+            ..ClaudeRuntimeOutput::default()
         }
     }
 
@@ -1846,6 +1913,20 @@ impl ClaudeProviderRuntime {
         emitted_at_ms: u64,
         authenticated_hook: bool,
     ) -> ClaudeRuntimeOutput {
+        if self.halted.is_some() {
+            return ClaudeRuntimeOutput::default();
+        }
+        if !authenticated_hook
+            && value.get("type").and_then(Value::as_str) == Some("system")
+            && value.get("subtype").and_then(Value::as_str) == Some("init")
+        {
+            self.saw_init = true;
+            if let Some(expected) = self.expected_session_id.take()
+                && value.get("session_id").and_then(Value::as_str) != Some(expected.as_str())
+            {
+                return self.halt_for_foreign_session_id();
+            }
+        }
         let token_usage = self.token_usage.observe_stream_value(value);
         let background_tasks = (!authenticated_hook)
             .then(|| self.background_tasks.observe(value, self.turn_open))
