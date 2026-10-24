@@ -340,6 +340,109 @@ export const PullRequestsReactionSummary = Schema.Array(
 );
 export type PullRequestsReactionSummary = typeof PullRequestsReactionSummary.Type;
 
+export const PullRequestsChecks = Schema.Struct({
+  groups: Schema.Array(
+    Schema.Struct({
+      name: TrimmedNonEmptyStringSchema,
+      checks: Schema.Array(
+        Schema.Struct({
+          name: TrimmedNonEmptyStringSchema,
+          state: Schema.Literals([
+            "pending",
+            "success",
+            "failure",
+            "cancelled",
+            "skipped",
+            "neutral",
+          ]),
+          url: Schema.NullOr(Schema.String),
+          startedAt: Schema.NullOr(Schema.String),
+          completedAt: Schema.NullOr(Schema.String),
+          durationSeconds: Schema.NullOr(Schema.Number),
+        }),
+      ),
+    }),
+  ),
+  summary: Schema.Literals(["pending", "success", "failure", "neutral", "none"]),
+  pipelineUrl: Schema.NullOr(Schema.String),
+  /** The read's snapshot generation: of two copies, the higher revision is newer. */
+  revision: Schema.optional(Schema.Number),
+  /** A stage listed more jobs than the read returned (GitLab: 100 per stage). */
+  truncated: Schema.optional(Schema.Boolean),
+});
+export type PullRequestsChecks = typeof PullRequestsChecks.Type;
+
+/** GitLab's pipeline statuses, folded to what the merge box and stage strip show. */
+export const PullRequestsPipelineStatus = Schema.Literals([
+  "created",
+  "queued",
+  "running",
+  "waiting",
+  "manual",
+  "scheduled",
+  "canceling",
+  "success",
+  "failed",
+  "canceled",
+  "skipped",
+  "unknown",
+]);
+export type PullRequestsPipelineStatus = typeof PullRequestsPipelineStatus.Type;
+
+export const PullRequestsPipelineStage = Schema.Struct({
+  name: Schema.String,
+  status: PullRequestsPipelineStatus,
+  /** GitLab's detailed status is "passed with warnings" (an allowed failure). */
+  warnings: Schema.Boolean,
+});
+export type PullRequestsPipelineStage = typeof PullRequestsPipelineStage.Type;
+
+export const PullRequestsPipelineKind = Schema.Literals([
+  "merge_request",
+  "merged_results",
+  "merge_train",
+  "branch",
+  "other",
+]);
+export type PullRequestsPipelineKind = typeof PullRequestsPipelineKind.Type;
+
+/**
+ * The gating pipeline: `none` when the host reports no pipeline, `hidden` when
+ * the account cannot view pipelines, otherwise its header and stages.
+ */
+export const PullRequestsPipeline = Schema.Union([
+  Schema.TaggedStruct("none", {}),
+  Schema.TaggedStruct("hidden", {}),
+  Schema.TaggedStruct("present", {
+    id: Schema.Number,
+    status: PullRequestsPipelineStatus,
+    warnings: Schema.Boolean,
+    kind: PullRequestsPipelineKind,
+    ref: Schema.String,
+    sha: Schema.String,
+    /** Whether the pipeline ran for the request's latest commit; null when unknown. */
+    isForHead: Schema.NullOr(Schema.Boolean),
+    url: Schema.NullOr(Schema.String),
+    updatedAt: Schema.String,
+    startedAt: Schema.NullOr(Schema.String),
+    finishedAt: Schema.NullOr(Schema.String),
+    durationSeconds: Schema.NullOr(Schema.Number),
+    /** Null when the stages could not be read. */
+    stages: Schema.NullOr(Schema.Array(PullRequestsPipelineStage)),
+  }),
+]);
+export type PullRequestsPipeline = typeof PullRequestsPipeline.Type;
+
+/** One self-consistent pipeline observation; the highest `revision` is the newest. */
+export const PullRequestsPipelineCopy = Schema.Struct({
+  /** The snapshot generation the read took before its first host call. */
+  revision: Schema.Number,
+  pipeline: PullRequestsPipeline,
+  /** The job groups, when the read had them. */
+  checks: Schema.NullOr(PullRequestsChecks),
+});
+export type PullRequestsPipelineCopy = typeof PullRequestsPipelineCopy.Type;
+
 export const PullRequestsDetail = Schema.Struct({
   number: Schema.Number,
   title: TrimmedNonEmptyStringSchema,
@@ -394,6 +497,8 @@ export const PullRequestsDetail = Schema.Struct({
     checks: Schema.NullOr(Schema.Number),
     files: Schema.Number,
   }),
+  /** The gating pipeline as this read saw it (GitLab, newer servers); its `checks` is null. */
+  pipeline: Schema.optional(PullRequestsPipelineCopy),
 });
 export type PullRequestsDetail = typeof PullRequestsDetail.Type;
 
@@ -488,34 +593,6 @@ export const PullRequestsCommits = Schema.Struct({
 });
 export type PullRequestsCommits = typeof PullRequestsCommits.Type;
 
-export const PullRequestsChecks = Schema.Struct({
-  groups: Schema.Array(
-    Schema.Struct({
-      name: TrimmedNonEmptyStringSchema,
-      checks: Schema.Array(
-        Schema.Struct({
-          name: TrimmedNonEmptyStringSchema,
-          state: Schema.Literals([
-            "pending",
-            "success",
-            "failure",
-            "cancelled",
-            "skipped",
-            "neutral",
-          ]),
-          url: Schema.NullOr(Schema.String),
-          startedAt: Schema.NullOr(Schema.String),
-          completedAt: Schema.NullOr(Schema.String),
-          durationSeconds: Schema.NullOr(Schema.Number),
-        }),
-      ),
-    }),
-  ),
-  summary: Schema.Literals(["pending", "success", "failure", "neutral", "none"]),
-  pipelineUrl: Schema.NullOr(Schema.String),
-});
-export type PullRequestsChecks = typeof PullRequestsChecks.Type;
-
 export const PullRequestsFile = Schema.Struct({
   path: TrimmedNonEmptyStringSchema,
   previousPath: Schema.NullOr(Schema.String),
@@ -575,10 +652,17 @@ export const PullRequestsSnapshotTab = Schema.Struct({
 });
 export type PullRequestsSnapshotTab = typeof PullRequestsSnapshotTab.Type;
 
+const PullRequestsSnapshotPipeline = Schema.Struct({
+  payload: PullRequestsPipelineCopy,
+  observedAt: Schema.Number,
+});
+
 export const PullRequestsSnapshot = Schema.Struct({
   list: Schema.NullOr(PullRequestsSnapshotList),
   detail: Schema.NullOr(PullRequestsSnapshotDetail),
   tab: Schema.NullOr(PullRequestsSnapshotTab),
+  /** The poller's stored pipeline copy for the number (GitLab); absent from older servers. */
+  pipeline: Schema.optional(Schema.NullOr(PullRequestsSnapshotPipeline)),
 });
 export type PullRequestsSnapshot = typeof PullRequestsSnapshot.Type;
 
@@ -589,6 +673,8 @@ export const PullRequestsChanged = Schema.Struct({
   commits: Schema.Boolean,
   checks: Schema.Boolean,
   files: Schema.Boolean,
+  /** The stored pipeline copy changed: answer with `readSnapshot`. Absent from older servers. */
+  pipeline: Schema.optional(Schema.Boolean),
 });
 export type PullRequestsChanged = typeof PullRequestsChanged.Type;
 

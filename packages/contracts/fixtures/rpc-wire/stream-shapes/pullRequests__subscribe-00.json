@@ -6,7 +6,7 @@
       "list": false,
       "detail": false,
       "timeline": false,
-      "commits": false,
+      "commits": true,
       "checks": true,
       "files": true
     }
