@@ -2636,6 +2636,7 @@ sizes. Cover relevant:
   [read-only list/detail/files smoke](#pull-requests-web-shell-validation) with
   route, selected tab and real patch evidence;
 - thread creation, switching, persistence, and streaming;
+- the Diff panel's [Compare view](#diff-compare-scenario);
 - the [durable message queue](#durable-message-queue): FIFO cards, native steer,
   Cancel restoration, reload and restart persistence, promotion, Stop drain,
   holds, and unsupported-provider explanations;
@@ -2963,6 +2964,36 @@ commands receive `BIBCODE_OPEN_URL_AUTH` (from a Codex tool call,
 the value); whether Codex's `workspace-write` sandbox makes `"$BROWSER"` print
 the address instead of opening it; a session older than 8 hours falls back to
 printing.
+
+### Diff Compare scenario
+
+Run this in the packaged application against a disposable repository that has
+committed files, a working-tree edit, an untracked file, a deleted file, a
+rename, a binary file and a branch with commits ahead of its base. Let one
+agent turn edit two files so the thread has a turn with checkpoints.
+
+1. Open the Diff panel. **Changes** is selected and matches the stacked view.
+   Choose **Split**, then **Compare**.
+2. For **Working tree**, **Branch changes** and the turn, select files from the
+   list with the pointer and with Up and Down. Each changed file shows its
+   previous and current versions side by side, aligned and scrolling together,
+   and the changed lines appear before the full file finishes loading. The
+   turn shows its changes, never "No net changes".
+3. Confirm the explained states: the added and deleted files show their one
+   side, the rename, the binary file and a mode-only change each show their
+   message, and the untracked file shows as added.
+4. Filter by name and by status. The count reads "N of M files", a filter with
+   no match offers **Clear filters**, and **Esc** in the name field clears it.
+5. Choose **Changes only**, type `7` in **Context lines**, and confirm one
+   patch request follows after typing stops. Use **Next change**,
+   **Previous change**, F7 and Shift+F7, and confirm both ends say "No more
+   changes."
+6. Edit the selected working-tree file outside BiBCode and confirm Compare
+   picks up the new version.
+7. Quit and relaunch the app. Compare, Split, **Changes only** and 7 context
+   lines are all restored, and the selected file is reselected.
+
+Record screenshots at the normal and minimum window sizes, in light and dark.
 
 ## Profiler crash smoke
 
