@@ -42,6 +42,29 @@ describe("PullRequestsChecks", () => {
       ),
     ).toContain(text);
   });
+  it("says when a stage had more jobs than shown and keeps the pipeline link", () => {
+    const container = document.createElement("div");
+    container.innerHTML = renderToStaticMarkup(
+      <PullRequestsChecks
+        checks={{
+          groups: [],
+          summary: "success",
+          pipelineUrl: "https://example.com/pipeline/1",
+          truncated: true,
+        }}
+        context={gitlabContext}
+        pipeline={{ _tag: "hidden" }}
+      />,
+    );
+    expect(container.textContent).toContain(
+      "Showing the first 100 jobs of a stage. Open the pipeline for the rest.",
+    );
+    expect(container.querySelector("a")?.getAttribute("href")).toBe(
+      "https://example.com/pipeline/1",
+    );
+    expect(container.textContent).toContain("You can't view pipelines in this project.");
+    expect(container.textContent).not.toContain("Open pipeline");
+  });
   it("renders collapsible groups, summary, all states, duration and pipeline/check links", async () => {
     (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
     const container = document.createElement("div");

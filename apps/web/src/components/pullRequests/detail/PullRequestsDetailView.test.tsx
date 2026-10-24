@@ -496,6 +496,104 @@ describe("PullRequestsDetailView", () => {
     await act(async () => setVisibility("visible"));
     expect(h.subscribed.has("subscribe")).toBe(true);
   });
+  const changed = {
+    list: false,
+    detail: false,
+    timeline: false,
+    commits: false,
+    checks: true,
+    files: false,
+  };
+  it("answers a pipeline change from the stored row and never re-reads the jobs for it", async () => {
+    await render("checks", 14, null, gitlabContext);
+    h.revalidated.length = 0;
+    h.data.subscribe = { ...changed, pipeline: true };
+    await render("checks", 14, null, gitlabContext);
+    expect(h.revalidated).toEqual(["readSnapshot"]);
+    // `checks` alone (an older server, or no row written) keeps today's answer.
+    h.revalidated.length = 0;
+    h.data.subscribe = { ...changed };
+    await render("checks", 14, null, gitlabContext);
+    expect(h.revalidated).toEqual(["getChecks"]);
+  });
+  const pipelineCopy = (revision: number, status: "running" | "success" | "failed") => ({
+    revision,
+    pipeline: {
+      _tag: "present" as const,
+      id: 4821,
+      status,
+      warnings: false,
+      kind: "merge_request" as const,
+      ref: "refs/merge-requests/14/head",
+      sha: "abc1234def",
+      isForHead: true,
+      url: null,
+      updatedAt: "2026-10-24T10:00:00Z",
+      startedAt: null,
+      finishedAt: null,
+      durationSeconds: null,
+      stages: [{ name: "test", status, warnings: false }],
+    },
+    checks: null,
+  });
+  it("shows the newest pipeline copy in the merge box whichever source answered last", async () => {
+    h.data.get = { ...detail, pipeline: pipelineCopy(10, "running") };
+    h.data.readSnapshot = {
+      list: null,
+      detail: null,
+      tab: null,
+      pipeline: { payload: pipelineCopy(12, "success"), observedAt: 5 },
+    };
+    await render("conversation", 14, null, gitlabContext);
+    const mergeBox = () => container.querySelector('[aria-label="Merge status"]')!.textContent;
+    expect(mergeBox()).toContain("Merge request pipeline #4821 passed");
+    expect(mergeBox()).not.toContain("#4821 running");
+    // A live read that started after the row was stored outranks it.
+    h.data.get = { ...detail, pipeline: pipelineCopy(13, "failed") };
+    await render("conversation", 14, null, gitlabContext);
+    expect(mergeBox()).toContain("#4821 failed");
+  });
+  it("keeps the newer jobs on the Pipelines tab, live or stored", async () => {
+    const checks = (revision: number, state: "pending" | "success") => ({
+      groups: [
+        {
+          name: "test",
+          checks: [
+            {
+              name: "unit",
+              state,
+              url: null,
+              startedAt: null,
+              completedAt: null,
+              durationSeconds: null,
+            },
+          ],
+        },
+      ],
+      summary: state,
+      pipelineUrl: null,
+      revision,
+    });
+    // An older live getChecks answered after a newer poller row: running stays.
+    h.data.getChecks = checks(10, "pending");
+    h.data.readSnapshot = {
+      list: null,
+      detail: null,
+      tab: null,
+      pipeline: {
+        payload: { ...pipelineCopy(12, "running"), checks: checks(12, "success") },
+        observedAt: 5,
+      },
+    };
+    await render("checks", 14, null, gitlabContext);
+    expect(container.querySelector('[aria-label="success"]')).not.toBeNull();
+    expect(container.querySelector('[aria-label="pending"]')).toBeNull();
+    expect(container.textContent).toContain("Merge request pipeline #4821 running");
+    expect(container.textContent).not.toContain("Open pipeline");
+    h.data.getChecks = checks(13, "pending");
+    await render("checks", 14, null, gitlabContext);
+    expect(container.querySelector('[aria-label="pending"]')).not.toBeNull();
+  });
   it("offers a direct path back to the request list", async () => {
     await render();
     const back = [...container.querySelectorAll("button")].find(
