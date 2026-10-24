@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vite-plus/test";
 import { render } from "pele/lazy";
 
 import { MERMAID_CORPUS } from "../../test/mermaidCorpus";
+import { MERMAID_SANITIZER_PROBES } from "../../test/mermaidSanitizerProbes";
 import {
   isSafeCssValue,
   sanitizeDiagramSvg,
@@ -193,6 +194,12 @@ describe("diagram SVG sanitizer", () => {
       vi.unstubAllGlobals();
     }
     expect(sanitizeDiagramSvg(svg("<script>alert(1)</script>"))).not.toContain("script");
+  });
+
+  it.each(MERMAID_SANITIZER_PROBES)("leaves the $name probe nothing to load", ({ svg: probe }) => {
+    const clean = sanitizeDiagramSvg(probe);
+    expect(clean).not.toContain("mermaid-probe");
+    expect(parse(clean).querySelector("svg")).not.toBeNull();
   });
 
   it("draws no link, image or remote URL from hostile Mermaid source", async () => {

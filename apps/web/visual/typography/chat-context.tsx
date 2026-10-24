@@ -129,7 +129,11 @@ export const chatFixtures: readonly Fixture[] = [
   {
     id: "chat-markdown",
     title: "Markdown file chips, footnotes and code title",
-    modules: ["components/ChatMarkdown.tsx", "index.css"],
+    modules: [
+      "components/ChatMarkdown.tsx",
+      "components/markdown/MarkdownCodeBlock.tsx",
+      "index.css",
+    ],
     owners: ["ChatMarkdown", "MarkdownFileLink", "MarkdownCodeBlockTitleContent"],
     anchors: [
       "typography-link.ts",
