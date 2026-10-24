@@ -44,6 +44,7 @@ import { formatShortTimestamp } from "../timestampFormat";
 import { DiffPanelLoadingState, DiffPanelShell, type DiffPanelMode } from "./DiffPanelShell";
 import { AnnotatableCodeView, type AnnotatableCodeViewHandle } from "./diffs/AnnotatableCodeView";
 import { DiffCompareView } from "./diffs/DiffCompareView";
+import { useCommentDraftStore } from "./diffs/useCommentDraftStore";
 import { ToggleGroup, Toggle } from "./ui/toggle-group";
 import { Switch } from "./ui/switch";
 import {
@@ -313,6 +314,7 @@ export default function DiffPanel({
         ? "Latest turn"
         : `Turn ${selectedCheckpointTurnCount ?? "?"}`;
   const reviewSectionId = selectedTurn ? `turn:${selectedTurn.turnId}` : selectedGitScope;
+  const commentDraftStore = useCommentDraftStore(activeThreadRef, reviewSectionId);
   const collapseScopeKey = activeThreadRef
     ? `${activeThreadRef.environmentId}:${activeThreadRef.threadId}:${reviewSectionId}`
     : null;
@@ -1010,6 +1012,7 @@ export default function DiffPanel({
                 }}
               >
                 <AnnotatableCodeView
+                  {...(commentDraftStore ? { draftStore: commentDraftStore } : {})}
                   viewerRef={codeViewRef}
                   key={collapseScopeKey ?? reviewSectionId}
                   className="diff-render-surface h-full min-h-0 overflow-auto"

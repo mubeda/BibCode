@@ -59,6 +59,7 @@ import {
   type AnnotatableCodeViewProps,
 } from "./AnnotatableCodeView";
 import { DiffFileList } from "./DiffFileList";
+import { useCommentDraftStore } from "./useCommentDraftStore";
 
 export interface DiffCompareViewProps {
   readonly environmentId: EnvironmentId;
@@ -209,8 +210,10 @@ function DiffComparePane({
   lineFilter,
   keybindings,
   paneRef,
+  threadRef,
 }: DiffComparePaneProps) {
   const plan = planCompareFile(row, scope, { liveTurnPatches });
+  const commentDraftStore = useCommentDraftStore(threadRef, sectionId);
   const versionTarget = (version: "old" | "new") =>
     plan.kind === "versions"
       ? reviewEnvironment.fileVersion({
@@ -386,6 +389,7 @@ function DiffComparePane({
           ) : null}
           <div className="min-h-0 flex-1" data-text-surface="card">
             <AnnotatableCodeView
+              {...(commentDraftStore ? { draftStore: commentDraftStore } : {})}
               className="diff-render-surface h-full min-h-0 overflow-auto"
               composerDraftTarget={composerDraftTarget}
               files={files}

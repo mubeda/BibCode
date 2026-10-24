@@ -155,6 +155,36 @@ describe("diffPanelStore", () => {
     expect(useDiffPanelStore.getState()).toBe(before);
   });
 
+  it("keeps one unsent comment per section, in memory, and clears its text with it", () => {
+    const store = useDiffPanelStore.getState();
+    const draft = {
+      id: "draft-1",
+      filePath: "src/app.ts",
+      range: { start: 3, end: 3, side: "additions" as const },
+      rangeLabel: "+3",
+    };
+    store.setCommentDraft(THREAD_REF, "unstaged", draft);
+    store.setCommentDraftText("draft-1", "half-written");
+    const state = useDiffPanelStore.getState();
+    expect(state.commentDraftBySectionKey).toEqual({ "environment-1:thread-1:unstaged": draft });
+    expect(state.commentDraftTextById).toEqual({ "draft-1": "half-written" });
+    const persisted = useDiffPanelStore.persist.getOptions().partialize?.(state) as Record<
+      string,
+      unknown
+    >;
+    expect(persisted).not.toHaveProperty("commentDraftBySectionKey");
+    expect(persisted).not.toHaveProperty("commentDraftTextById");
+
+    useDiffPanelStore.getState().setCommentDraft(THREAD_REF, "unstaged", null);
+    expect(useDiffPanelStore.getState()).toMatchObject({
+      commentDraftBySectionKey: {},
+      commentDraftTextById: {},
+    });
+    const cleared = useDiffPanelStore.getState();
+    useDiffPanelStore.getState().setCommentDraft(THREAD_REF, "unstaged", null);
+    expect(useDiffPanelStore.getState()).toBe(cleared);
+  });
+
   it("remembers Compare's file per thread, and its filters only in memory", () => {
     const store = useDiffPanelStore.getState();
     expect(selectThreadCompareFile(store.compareFileByThreadKey, THREAD_REF)).toBeNull();
