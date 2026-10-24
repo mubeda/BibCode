@@ -692,7 +692,8 @@ provider says the old one is gone:
   and the event stream's connection are bounded too.
 - Claude passes `--resume` only when the transcript
   `<config dir>/projects/<project>/<sessionId>.jsonl` exists, and otherwise
-  launches with a fresh `--session-id`. The config directory resolves as for
+  launches with a fresh `--session-id`. A copy's cursor forks first; see
+  [the launch rule](#claude-launch-rule). The config directory resolves as for
   [imported sessions](#imported-cli-sessions); `<project>` is the launch cwd (and
   its resolved real path) with every character other than an ASCII letter or digit
   replaced by `-`, one per UTF-16 unit, as Claude Code names it
@@ -765,8 +766,10 @@ next turn resumes it. Homes resolve as the launch would:
   `<home>/sessions/YYYY/MM/DD/rollout-*.jsonl`.
 
 Parsing and skip rules follow the upstream reference scanner: Claude records
-marked `isSidechain`, `isMeta` or `isCompactSummary` are skipped, `aiTitle`
-names the thread, and only UUID session IDs (resumable with `--resume`) are
+marked `isSidechain`, `isMeta` or `isCompactSummary` are skipped, the last
+`custom-title` record's `customTitle` (a `/rename` name, or the title Claude
+generated) names the thread, then the last `aiTitle` of older versions, then
+the first prompt line, and only UUID session IDs (resumable with `--resume`) are
 offered; Codex takes its ID from `session_meta`, its model from `turn_context`,
 and keeps one copy of a prompt written both as a `user_message` event and a
 response item. Discovery stats at most 20,000 files per source, a session's
@@ -783,6 +786,70 @@ Claude `{"transport": "stream-json"}`. The thread's model is the transcript's
 model when the instance offers it (Claude's dated IDs match their undated
 catalog slug; Codex reports a model it accepts), else the project's default for
 that instance, the driver's session default, or the built-in default.
+
+History continues a Claude Code terminal session in a chat panel of the thread
+([terminal sessions in History](./rpc-and-orchestration.md#terminal-sessions-in-history)).
+Its panel's row is the same, except that it takes the host's runtime mode,
+never broader, and that a copy's cursor is
+`{"sessionId": <forkId>, "forkedFrom": <source>}` under an ID the server
+assigned. The owner query reads `$.sessionId`, so a copy belongs to its panel
+and the source stays the terminal's. An older server reading a copy's row
+finds no transcript for its ID and starts a new conversation with a handoff:
+degraded, not corrupt.
+
+### Claude launch rule
+
+`ClaudeDriver::spawn` decides how a cursor launches by which transcript
+exists, trying these in order (`exists` is "unknown" when BiBCode cannot
+check):
+
+- **Fork** when the cursor has `forkedFrom`, the copy's own transcript is not
+  known to exist, and the source's is not known to be missing:
+  `--resume <source> --fork-session --session-id <forkId>`. `start` reports
+  the requested cursor, `forkedFrom` included, so a crash before Claude
+  writes the copy forks again instead of starting empty.
+- **Resume** when the cursor's own transcript exists, or cannot be checked and
+  the cursor is not a copy's: `--resume <id>`. Every launch after a copy's
+  first turn takes this path.
+- **New** otherwise: a fresh `--session-id`, which `launch_session` records as
+  a lost resume that owes the context handoff.
+
+Because a fork starts under the ID that was requested, `launch_session` records
+no lost resume and sends no handoff.
+
+**Version gate.** A fork needs Claude Code to take the assigned ID: version
+2.0.73 or later, and `--help` listing `--fork-session`. The activity probe
+reports both as `ClaudeActivitySupport::fork_session_id` from the two commands
+it already runs, and `probe_finished` tells its answer from the defaults a
+launch takes while it runs. Without that answer a fork launch fails with
+"BiBCode is still checking the Claude Code version. Send again." (retried like
+any launch failure); with a "no" it fails once with "Continue in a copy needs
+Claude Code 2.0.73 or later. Update it in Settings → Providers, then send
+again." Neither starts Claude, so the requested cursor stays and the next send
+forks. History applies the same minimum through `copySupported` before a panel
+exists; the launch gate covers a binary changed since.
+
+**Session ID check.** Claude reports the session ID in the first turn's
+`system/init`, after the message is written; its `initialize` response names
+none (checked with 2.1.310). In a fork the Claude runtime compares that ID with
+the assigned one before it forwards anything of the turn. On a mismatch it
+shows nothing more of the process (replays included), fails the message or
+turn with "Claude Code continued the copy under another session ID. Update
+Claude Code, then send again.", ends the session so the driver stops the
+process (a requested exit, not a crash), keeps the copy's cursor, and logs a
+warning without content. The next send forks the unchanged source again; the
+stray transcript Claude wrote stays on disk.
+
+**Refused resume.** A `--resume` of an imported session's own ID
+(`import:<instance>:<sessionId>`) whose transcript exists and whose process
+exits with a failure before its first `system/init` fails the message with
+"Claude Code couldn't continue this session here. It may still be running in a
+terminal or in the background. Choose Continue in a copy in History." and the
+event pump writes `"resumeRefused": true` into the runtime row's payload, which
+History reports so it offers a copy. The next launch writes the row anew, so a
+later successful start clears it. The cause is not classified, because
+Claude's message is not a contract. Native threads and copies, which History
+never lists, keep the usual early-exit error.
 
 ## Provider usage and local credential ownership
 
