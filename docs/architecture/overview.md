@@ -2809,10 +2809,12 @@ renderer never sees partial source:
   inside the first visible row, above the viewport's top edge, the block
   commits its swap through the timeline's reading anchor
   (`chat/readingAnchor.ts`), which commits with `flushSync` and scrolls by the
-  height change. While the list follows its end, `maintainScrollAtEnd` holds
-  the newest line. The file view and the Plan sidebar rely on browser scroll
-  anchoring, which WebKit before Safari 27 (which may include WebKitGTK) lacks,
-  so there a diagram drawing above the reading position shifts it once.
+  height change. Only within `maintainScrollAtEnd`'s threshold of the end (a
+  tenth of the viewport, narrower than LegendList's `isNearEnd`) does the list
+  hold the newest line itself, so only there does the anchor stand aside. The
+  file view and the Plan sidebar rely on browser scroll anchoring, which
+  WebKit before Safari 27 (which may include WebKitGTK) lacks, so there a
+  diagram drawing above the reading position shifts it once.
 
 **SVG trust boundary.** Diagram sources are untrusted: agent output, pasted
 text, plans and workspace Markdown files. The SVG Pele draws from them reaches

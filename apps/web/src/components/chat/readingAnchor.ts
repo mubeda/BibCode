@@ -1,7 +1,6 @@
 import { createContext } from "react";
 import { flushSync } from "react-dom";
 
-import { resolveTimelineIsAtEnd, type TimelineEndState } from "./MessagesTimeline.logic";
 import { isAboveReadingLine } from "./timelineScrollAnchoring";
 
 /**
@@ -20,7 +19,16 @@ export interface ReadingAnchor {
 export const ReadingAnchorContext = createContext<ReadingAnchor | null>(null);
 
 interface ReadingAnchorList {
-  readonly getState?: () => (TimelineEndState & { readonly scroll?: number }) | undefined;
+  readonly getState?: () =>
+    | {
+        readonly scroll?: number;
+        /**
+         * The list is within `maintainScrollAtEnd`'s threshold, where it scrolls back to its
+         * end after a size change. Its wider `isNearEnd` threshold holds nothing.
+         */
+        readonly isWithinMaintainScrollAtEndThreshold?: boolean;
+      }
+    | undefined;
   readonly scrollToOffset: (params: { offset: number; animated?: boolean }) => unknown;
 }
 
@@ -29,7 +37,8 @@ interface ReadingAnchorList {
  * row changes size, which holds the reading line for rows wholly above the viewport. Inside the
  * first visible row, content below a growing element still moves, so a swap there is committed
  * synchronously and the list scrolls by the element's change, as a work-group toggle does.
- * While the list follows its end, `maintainScrollAtEnd` already holds the newest line.
+ * While the list is close enough to its end for `maintainScrollAtEnd` to act, that already
+ * holds the newest line.
  */
 export function preserveTimelineReadingPosition(
   timeline: {
@@ -50,7 +59,7 @@ export function preserveTimelineReadingPosition(
   const before = element.getBoundingClientRect();
   const rowBox = row.getBoundingClientRect();
   const followingEnd =
-    !timeline.anchoringEndSpace && resolveTimelineIsAtEnd(list.getState?.()) === true;
+    !timeline.anchoringEndSpace && list.getState?.()?.isWithinMaintainScrollAtEndThreshold === true;
   const aboveReadingLine = isAboveReadingLine({
     elementTop: before.top,
     rowTop: rowBox.top,
