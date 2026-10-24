@@ -13,6 +13,8 @@ import {
 } from "./device.ts";
 
 const decodeCatalog = Schema.decodeUnknownSync(DeviceCatalog);
+const encodeSnapshot = Schema.encodeSync(DeviceSnapshot);
+const decodeSnapshot = Schema.decodeUnknownSync(DeviceSnapshot);
 const isCatalog = Schema.is(DeviceCatalog);
 const decodeImage = Schema.decodeUnknownSync(DeviceImage);
 const isImage = Schema.is(DeviceImage);
@@ -105,6 +107,28 @@ describe("device preview contracts", () => {
     expect(isSnapshot({ ...device, platform: "windows" })).toBe(false);
   });
 
+  it("labels a device with the thread that started it, when one did", () => {
+    const device = {
+      deviceId: "d-1",
+      platform: "android",
+      imageId: "Pixel_8",
+      state: "stopped",
+      orientation: "portrait",
+      canRotate: true,
+    };
+    // A server without owners, or a device an older client started, has no threadId.
+    expect(decodeSnapshot(device)).toEqual(device);
+    const owned = { ...device, threadId: "thread-1" };
+    const decoded = decodeSnapshot(owned);
+    expect(decoded).toEqual(owned);
+    // What the server serializes round-trips unchanged.
+    expect(encodeSnapshot(decoded)).toEqual(owned);
+    // A blank owner does not decode, and a padded one would decode changed, so the server
+    // trims the owner and refuses a blank one before it publishes either.
+    expect(() => decodeSnapshot({ ...device, threadId: " " })).toThrow();
+    expect(decodeSnapshot({ ...device, threadId: " thread-1 " }).threadId).toBe("thread-1");
+  });
+
   it("rejects the Android-only catalog shape", () => {
     expect(
       isCatalog({
@@ -128,6 +152,12 @@ describe("device preview contracts", () => {
     });
     expect(isOpen({ imageId: "A1B2" })).toBe(false);
     expect(isOpen({ avdName: "Pixel_8" })).toBe(false);
+  });
+
+  it("opens an image for the thread it is for", () => {
+    const open = { platform: "android", imageId: "Pixel_8", threadId: "thread-1" };
+    expect(decodeOpen(open)).toEqual(open);
+    expect(() => decodeOpen({ platform: "android", imageId: "Pixel_8", threadId: " " })).toThrow();
   });
 
   it("bounds input batches and text", () => {
