@@ -251,6 +251,9 @@ struct NumberState {
     no_jobs: Option<u64>,
     /// The REST and GraphQL reads named different pipelines last time.
     race: bool,
+    /// A pipeline whose last read ran but stored no copy (it failed, named
+    /// another pipeline, or its write failed): read again until one lands.
+    retry: Option<u64>,
     previous: Option<ProbeFingerprint>,
     raised: Raised,
 }
@@ -376,6 +379,7 @@ impl Shared {
                     seen: s.previous.as_ref().map(|p| p.pipeline_id),
                     older: s.older,
                     no_jobs: s.no_jobs,
+                    retry: s.retry,
                 })
             })
             .collect()
@@ -425,6 +429,16 @@ impl Shared {
         if s.no_jobs.is_some() && s.no_jobs != header_id {
             s.no_jobs = None;
         }
+        // A read that ran is settled only by a matching answer that was
+        // written; a failure, a race or a failed write reads again.
+        let landed = write.is_some()
+            && matches!((header_id, graph), (Some(id), GraphUse::Read(read))
+                if read.as_ref().is_none_or(|graph| graph.id == id));
+        match graph {
+            GraphUse::NotRead => {}
+            _ if landed => s.retry = None,
+            _ => s.retry = header_id,
+        }
         let mut flagged = false;
         if let GraphUse::Read(read) = graph {
             match (header_id, read) {
@@ -467,7 +481,10 @@ impl Shared {
         });
         let settled = previous.is_some_and(|p| p.pipeline_status != next.pipeline_status)
             && matches!(&probe.header, Pipeline::Present(p) if is_settled(p.status));
-        let condition = transient || pushed || settled || s.race || older_known;
+        // A pending retry keeps the episode going (still at most six ticks);
+        // after it, the idle probe keeps retrying every 20 s.
+        let retrying = header_id.is_some() && s.retry == header_id;
+        let condition = transient || pushed || settled || s.race || older_known || retrying;
         if !plan.eligible || !open || active || !condition {
             s.fast_left = 0;
         } else if fingerprint_changed || flagged {
@@ -541,13 +558,16 @@ struct Plan {
     seen: Option<Option<u64>>,
     older: Option<u64>,
     no_jobs: Option<u64>,
+    retry: Option<u64>,
 }
 
 impl Plan {
     /// Active numbers read the pipeline. The tick that first sees a pipeline
     /// leave the active set reads it once more for the final stages, and a
     /// new pipeline id is read once, so the strip never shows another
-    /// pipeline's stages. The mount's own `get` covers the first probe.
+    /// pipeline's stages. A read that stored nothing is retried, since the
+    /// probe row already holds the header it saw. The mount's own `get`
+    /// covers the first probe.
     fn reads_pipeline(&self, probe: &Probe) -> bool {
         let Pipeline::Present(p) = &probe.header else {
             return false;
@@ -556,7 +576,10 @@ impl Plan {
             && is_active(p.status)
             && self.older != Some(p.id);
         let new_id = self.seen.is_some_and(|seen| seen != Some(p.id));
-        self.eligible && self.no_jobs != Some(p.id) && (active || self.was_active || new_id)
+        let retry = self.retry == Some(p.id);
+        self.eligible
+            && self.no_jobs != Some(p.id)
+            && (active || self.was_active || new_id || retry)
     }
 }
 
@@ -2247,6 +2270,55 @@ esac
                 .unwrap()
                 .iter()
                 .all(|stage| stage.status == PipelineStatus::Success)
+        );
+        c.cancel();
+        drive(&mut subs).await;
+    }
+
+    /// The final pipeline read fails on the tick that sees the pipeline
+    /// finish. The probe row already holds the new status, so nothing else
+    /// would rewrite the pipeline row: the read is retried until one lands.
+    #[tokio::test(start_paused = true)]
+    async fn gitlab_poller_failed_final_pipeline_read_is_retried_until_it_writes() {
+        let b = bench().await;
+        running(&b.s, 3941, 50);
+        let log = Log::default();
+        let emit = emitter(&log);
+        let c = CancellationToken::new();
+        let mut subs = [b.subscriber(Some(3941), Some(SubscribeTab::Conversation), &emit, &c)];
+        drive(&mut subs).await;
+        tick(&mut subs, 10).await;
+        assert_eq!(graph_reads(&b.s, 3941), 1);
+        write_mr(&b.s, 3941, |v| {
+            head_pipeline(v, 50, "success");
+            v["detailed_merge_status"] = json!("mergeable");
+        });
+        write_graph(&b.s, 3941, 50, &[("build", "success"), ("test", "success")]);
+        fs::write(b.s.path("graph-error-3941"), "HTTP 502").unwrap();
+        tick(&mut subs, 10).await;
+        assert_eq!(graph_reads(&b.s, 3941), 2, "the final read ran and failed");
+        let row = b.row(&mut subs, PIPELINE_KIND, "3941").await.unwrap();
+        let Pipeline::Present(pipeline) = stored_copy(&row).pipeline else {
+            panic!("a present pipeline");
+        };
+        assert_eq!(pipeline.status, PipelineStatus::Running, "nothing written");
+        tick(&mut subs, 10).await;
+        assert_eq!(graph_reads(&b.s, 3941), 3, "a failed read is retried");
+        fs::remove_file(b.s.path("graph-error-3941")).unwrap();
+        tick(&mut subs, 10).await;
+        assert_eq!(graph_reads(&b.s, 3941), 4);
+        let row = b.row(&mut subs, PIPELINE_KIND, "3941").await.unwrap();
+        let Pipeline::Present(pipeline) = stored_copy(&row).pipeline else {
+            panic!("a present pipeline");
+        };
+        assert_eq!(pipeline.status, PipelineStatus::Success);
+        for _ in 0..4 {
+            tick(&mut subs, 10).await;
+        }
+        assert_eq!(
+            graph_reads(&b.s, 3941),
+            4,
+            "once a read lands, a finished pipeline is not read again"
         );
         c.cancel();
         drive(&mut subs).await;
