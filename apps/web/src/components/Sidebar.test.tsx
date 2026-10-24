@@ -157,11 +157,31 @@ staticDescribe("Sidebar global event helpers", () => {
   });
 
   it("lets the project header button grow only for an environment card", () => {
-    const base = { showsSandboxBadge: false, isManualProjectSorting: false };
+    const base = {
+      showsSandboxBadge: false,
+      isManualProjectSorting: false,
+      actionCount: 4 as const,
+    };
     expect(projectHeaderButtonClassName({ ...base, isEnvironmentCard: true })).toContain("h-auto");
     expect(projectHeaderButtonClassName({ ...base, isEnvironmentCard: false })).not.toContain(
       "h-auto",
     );
+  });
+
+  it("reserves header room for the always-visible actions and the sandbox badge", () => {
+    const base = { isManualProjectSorting: false, isEnvironmentCard: false };
+    expect(
+      projectHeaderButtonClassName({ ...base, showsSandboxBadge: false, actionCount: 4 }),
+    ).toContain("pr-27");
+    expect(
+      projectHeaderButtonClassName({ ...base, showsSandboxBadge: false, actionCount: 3 }),
+    ).toContain("pr-21");
+    expect(
+      projectHeaderButtonClassName({ ...base, showsSandboxBadge: true, actionCount: 4 }),
+    ).toContain("pr-33");
+    expect(
+      projectHeaderButtonClassName({ ...base, showsSandboxBadge: true, actionCount: 3 }),
+    ).toContain("pr-27");
   });
 
   it("handles traversal and numbered jump shortcuts across every guard", () => {
@@ -3567,6 +3587,14 @@ staticDescribe("new thread entry points", () => {
     expect(firstClick.preventDefault).toHaveBeenCalled();
     expect(secondClick.stopPropagation).toHaveBeenCalled();
   });
+  it("shows a project row's actions without hover", () => {
+    baseScenario();
+    const markup = render(<Sidebar />);
+    const strip = /<div[^>]*data-testid="project-actions-strip"[^>]*>/.exec(markup)?.[0];
+    expect(strip).toBeDefined();
+    expect(strip).not.toContain("opacity-0");
+  });
+
   it("hides the Pull Requests button when disabled in settings", () => {
     baseScenario();
     render(<Sidebar />);
@@ -3689,6 +3717,15 @@ staticDescribe("grouped and remote projects", () => {
       to: "/project/$environmentId/$projectId/pull-requests",
       params: { environmentId: ENV_REMOTE, projectId: ProjectId.make("project-a-remote") },
     });
+  });
+
+  it("shows the repository row's actions without hover", () => {
+    groupedScenario();
+    h.uiStore.setState({ sidebarView: "repositories" });
+    const markup = render(<Sidebar />);
+    const strip = /<div[^>]*data-testid="repository-group-actions-strip"[^>]*>/.exec(markup)?.[0];
+    expect(strip).toBeDefined();
+    expect(strip).not.toContain("opacity-0");
   });
 
   it("hides the repository row's Pull Requests button when disabled in settings", () => {

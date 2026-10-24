@@ -30,7 +30,7 @@ export const SidebarRepositoryGroup = memo(function SidebarRepositoryGroup({
         aria-label={`Repository ${group.title}`}
         data-testid={`repository-group-${group.key}`}
       >
-        <div className="group/repository-header flex items-center gap-0.5">
+        <div className="flex items-center gap-0.5">
           <button
             type="button"
             aria-expanded={expanded}
@@ -52,7 +52,10 @@ export const SidebarRepositoryGroup = memo(function SidebarRepositoryGroup({
             <span className="shrink-0 text-xs text-muted-foreground">{environmentCountLabel}</span>
           </button>
           {actions ? (
-            <div className="pointer-events-none flex shrink-0 items-center opacity-0 transition-opacity duration-150 group-focus-within/repository-header:pointer-events-auto group-focus-within/repository-header:opacity-100 group-hover/repository-header:pointer-events-auto group-hover/repository-header:opacity-100 max-sm:pointer-events-auto max-sm:opacity-100">
+            <div
+              data-testid="repository-group-actions-strip"
+              className="flex shrink-0 items-center"
+            >
               {actions}
             </div>
           ) : null}

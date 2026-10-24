@@ -224,8 +224,8 @@ has been added and opened.
 Clicking a project header selects it and toggles its thread list; the header
 stays highlighted as the selected node until you open a thread, and it is also
 highlighted while that project's Git Manager or Pull Requests route is open.
-Hovering or focusing a header shows **⋯** (project actions), **+** (New
-worktree), **Git Manager** and, when enabled, **Pull Requests**. In the
+Every header always shows **⋯** (project actions), **+** (New worktree),
+**Git Manager** and, when enabled, **Pull Requests**. In the
 Repositories view **Pull Requests** sits on the repository row instead, since
 pull requests belong to the repository, not to one environment's checkout.
 
@@ -809,10 +809,10 @@ Manager subscription.
 
 ## Pull Requests
 
-Hover a project header and choose **Pull Requests**, immediately after Git
+Choose **Pull Requests** on a project header, immediately after Git
 Manager, to browse the hosted repository for one checkout. Grouped projects
 use the same environment/member picker as other project actions. In the
-Repositories view, hover the repository row instead: with one environment it
+Repositories view, use the repository row's button instead: with one environment it
 opens directly, with several it asks which environment to read from. The project
 header stays highlighted on the list and detail routes, including after reload.
 
