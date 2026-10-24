@@ -803,8 +803,15 @@ sent with the next event. The client answers `list` and `pipeline` with
 `readSnapshot`, keeping whichever list copy has the newer `observedAt` (a live
 first page counts as observed at the newest stored copy already seen) and
 whichever pipeline copy has the higher `revision` (the generation each read
-took before its first host call); it answers the other names with the unary
-reads, and `checks` without `pipeline` with `getChecks`. A 429 from any poller
+took before its first host call). It also keeps the newest pipeline copy it
+has shown for the merge request, so a tab switch, which re-keys the snapshot
+read, or a failed snapshot read never moves the merge box or the Pipelines tab
+back. It answers the other names with the unary reads, and `checks` without
+`pipeline` with `getChecks`. A number past the three-number pipeline read cap
+gets `pipeline` rows with the header only (`checks: null`); on the Pipelines
+tab such a row, arriving after a `pipeline` name, is answered with one
+`getChecks` per row revision, so the job list follows the header. A row that
+carries jobs never re-reads them. A 429 from any poller
 read, totals included, backs off every poller of the host (60, 120, then
 300 s) across hand-offs and re-keyed subscriptions; a `not_authenticated` or
 `forbidden` read ends the poller, deletes the host's rows, and ends every

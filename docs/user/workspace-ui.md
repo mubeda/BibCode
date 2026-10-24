@@ -967,6 +967,9 @@ a pipeline that finishes while shown is announced to screen readers once. The
 Pipelines tab shows the same summary above its jobs, grouped by stage in
 GitLab's order with trigger jobs linking their downstream pipeline; when a stage
 has more than 100 jobs it says so and links the pipeline for the rest.
+Beyond three merge requests watched at once, the others' pipeline status
+updates every 20 seconds, and their Pipelines tab reloads its jobs whenever
+that status changes.
 The normal confirmation title is “Merge pull request” on GitHub and “Merge
 merge request” on GitLab. Request-specific recovery messages and accessibility
 labels use the same host vocabulary; the module remains **Pull Requests**.
