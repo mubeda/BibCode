@@ -172,14 +172,19 @@ function DiffComparePane({
     if (revalidation.request > 0) revalidatePatch();
   }, [revalidation.request]);
 
+  // A refreshed patch parses into new objects even when this file did not change. Keep the
+  // metadata while its versions and hunks stay the same, so the file hydrates once per version
+  // pair and the view does not redraw.
+  const identity = compareFileIdentity(row);
+  const [pinned, setPinned] = useState({ identity, fileDiff: row.fileDiff });
+  if (pinned.identity !== identity) setPinned({ identity, fileDiff: row.fileDiff });
+  const baseFile = pinned.identity === identity ? pinned.fileDiff : row.fileDiff;
   const hydration = useMemo(
     () =>
-      versions.kind === "ready"
-        ? hydrateCompareFile(row.fileDiff, versions.old, versions.new)
-        : null,
-    [row.fileDiff, versions],
+      versions.kind === "ready" ? hydrateCompareFile(baseFile, versions.old, versions.new) : null,
+    [baseFile, versions],
   );
-  const shownFile = hydration?.kind === "hydrated" ? hydration.fileDiff : row.fileDiff;
+  const shownFile = hydration?.kind === "hydrated" ? hydration.fileDiff : baseFile;
 
   let note: string | null = null;
   if (plan.kind === "patch") {
@@ -196,9 +201,10 @@ function DiffComparePane({
     plan.kind === "versions" &&
     versionError === null &&
     (versions.kind === "loading" || (changed && !stillChanging));
+  // Keyed by path, which a refreshed patch keeps; the patch's own key changes with any file.
   const files = useMemo(
-    () => [{ fileDiff: shownFile, filePath: row.path, fileKey: row.key, collapsed: false }],
-    [row.key, row.path, shownFile],
+    () => [{ fileDiff: shownFile, filePath: row.path, fileKey: row.path, collapsed: false }],
+    [row.path, shownFile],
   );
 
   return (
@@ -256,6 +262,18 @@ function DiffComparePane({
       )}
     </>
   );
+}
+
+/** The file's content identity: its path, object IDs and hunk ranges. */
+function compareFileIdentity(row: DiffFileRow): string {
+  const { fileDiff } = row;
+  const hunks = fileDiff.hunks
+    .map(
+      (hunk) =>
+        `${hunk.deletionStart},${hunk.deletionCount},${hunk.additionStart},${hunk.additionCount}`,
+    )
+    .join(";");
+  return [row.path, fileDiff.prevObjectId ?? "", fileDiff.newObjectId ?? "", hunks].join("\0");
 }
 
 function CompareMessage({ children }: { readonly children: React.ReactNode }) {

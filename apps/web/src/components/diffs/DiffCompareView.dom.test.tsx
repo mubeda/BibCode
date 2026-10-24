@@ -184,6 +184,41 @@ describe("DiffCompareView", () => {
     expect(options()[0]!.getAttribute("aria-selected")).toBe("true");
   });
 
+  it("brings the row End selects into a long list's window", async () => {
+    // The list measures a 280px viewport: ten rows plus overscan, not two hundred.
+    const height = vi
+      .spyOn(HTMLElement.prototype, "getBoundingClientRect")
+      .mockReturnValue({
+        height: 280,
+        width: 240,
+        top: 0,
+        left: 0,
+        bottom: 280,
+        right: 240,
+      } as DOMRect);
+    const clientHeight = vi
+      .spyOn(HTMLElement.prototype, "clientHeight", "get")
+      .mockReturnValue(280);
+    try {
+      const files = parse(
+        ...Array.from({ length: 200 }, (_, index) =>
+          modified(`src/file-${String(index).padStart(3, "0")}.ts`, OLD_A, NEW_A),
+        ),
+      );
+      await render(files);
+      expect(options().at(-1)?.title).not.toBe("src/file-199.ts");
+      await act(async () => {
+        listbox().dispatchEvent(new KeyboardEvent("keydown", { key: "End", bubbles: true }));
+      });
+      expect(options().at(-1)?.title).toBe("src/file-199.ts");
+      expect(options().at(-1)?.getAttribute("aria-selected")).toBe("true");
+      expect(listbox().getAttribute("aria-activedescendant")).toBe(options().at(-1)!.id);
+    } finally {
+      height.mockRestore();
+      clientHeight.mockRestore();
+    }
+  });
+
   it("asks for the patch once when the working file moved past it, then says it is changing", async () => {
     const first = parse(modified("src/a.ts", OLD_A, NEW_A));
     h.versions.set(blobKey(OLD_A), { _tag: "text", contents: lines(), byteLength: 1 });
