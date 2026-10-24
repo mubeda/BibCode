@@ -1,3 +1,7 @@
+// @effect-diagnostics nodeBuiltinImport:off
+import * as NodeFS from "node:fs";
+import * as NodePath from "node:path";
+
 import { describe, expect, it } from "@effect/vitest";
 import * as Schema from "effect/Schema";
 import {
@@ -13,6 +17,7 @@ import {
 } from "./device.ts";
 
 const decodeCatalog = Schema.decodeUnknownSync(DeviceCatalog);
+const encodeCatalog = Schema.encodeSync(DeviceCatalog);
 const encodeSnapshot = Schema.encodeSync(DeviceSnapshot);
 const decodeSnapshot = Schema.decodeUnknownSync(DeviceSnapshot);
 const isCatalog = Schema.is(DeviceCatalog);
@@ -126,7 +131,29 @@ describe("device preview contracts", () => {
     // A blank owner does not decode, and a padded one would decode changed, so the server
     // trims the owner and refuses a blank one before it publishes either.
     expect(() => decodeSnapshot({ ...device, threadId: " " })).toThrow();
+    // ECMAScript trimming takes U+FEFF, which Rust's `str::trim` keeps.
+    expect(() => decodeSnapshot({ ...device, threadId: "﻿" })).toThrow();
     expect(decodeSnapshot({ ...device, threadId: " thread-1 " }).threadId).toBe("thread-1");
+  });
+
+  it("round-trips the catalog the server publishes, owners included, unchanged", () => {
+    // Written by the server test `the_owned_catalog_fixture_matches_the_wire`: a device
+    // opened for " t1 " (published trimmed), an unowned one, and a stopped one that keeps
+    // its owner.
+    const published: unknown = JSON.parse(
+      NodeFS.readFileSync(
+        NodePath.resolve(import.meta.dirname, "../fixtures/device/catalog.json"),
+        "utf8",
+      ),
+    );
+    const decoded = decodeCatalog(published);
+    expect(decoded).toEqual(published);
+    expect(encodeCatalog(decoded)).toEqual(published);
+    expect(decoded.devices.map((device) => [device.state, device.threadId])).toEqual([
+      ["ready", "t1"],
+      ["ready", undefined],
+      ["stopped", "t2"],
+    ]);
   });
 
   it("rejects the Android-only catalog shape", () => {
