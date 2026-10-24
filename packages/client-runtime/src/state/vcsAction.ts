@@ -310,6 +310,14 @@ export function consumeVcsActionProgress<E, R>(
         }
         return input.onProgress(normalized);
       }),
+      // The terminal event is a stream item ahead of the RPC exit, so the server has
+      // decided the outcome once it arrives. A transport failure after it, such as a
+      // socket closing before the exit, must not replace Git's reason or a finished
+      // result (#174). Interruption is not a failure and still propagates.
+      Effect.catchIf(
+        () => terminalEvent !== null,
+        () => Effect.void,
+      ),
       Effect.flatMap(() => {
         if (terminalEvent?.kind === "action_finished") {
           return Effect.succeed(terminalEvent.result);
