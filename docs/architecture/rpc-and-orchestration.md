@@ -2600,9 +2600,12 @@ protection.
     whole file, streamed, so a save can still be guarded against exactly that
     state.
 
-  Failures use `ProjectReadFileError`. The client polls this method for the one
-  file it shows, every 2 s while the window is visible, and at once on window
-  focus, on visibility, when a turn ends, and after a refused save. Each poll
+  Failures use `ProjectReadFileError`. A path that is not a regular file, such
+  as a directory or a named pipe put in its place, fails with `path_not_file`
+  before it is opened, because opening a pipe with no writer blocks. The client
+  polls this method for the one file it shows, every 2 s while the window is
+  visible, and at once on window focus, on visibility, on a new connection
+  generation, when a turn ends, and after a refused save. Each poll
   costs one bounded read and hash on the server, where the workspace lives, so
   WSL and SSH workspaces are covered by the same path.
 
@@ -2622,13 +2625,20 @@ protection.
 
 The check and the write run under a lock keyed by the canonical target path,
 which `projects.writeFile` also takes, so two BiBCode clients cannot both pass
-the check. A writer outside BiBCode can still land in the milliseconds between
+the check. The key ignores case: an existing path canonicalizes to its on-disk
+spelling, but a missing one keeps the caller's, and on a case-insensitive
+volume two spellings of a file being recreated name one file. On a
+case-sensitive volume, writes to names that differ only in case merely wait for
+each other. A writer outside BiBCode can still land in the milliseconds between
 the check and the write; closing that window would need locking that other
 tools do not honour.
 
 Client reconciliation is described in the
 [approved design](../plans/2026-10-23-open-file-disk-changes-design.md): the
-editing session keeps the disk base apart from the document, fences poll
+editing session takes its disk base, and with it the capability, from a server
+read or a guarded save's committed version, never from an optimistic draft
+such as a ticked Markdown task that is not saved yet; it keeps that base apart
+from the document, fences poll
 results by a generation bumped on every save, reloads a clean document as one
 Pierre undo step (`Editor.applyEdits(edits, true, true)`, a dependency patch on
 `@pierre/diffs` 1.3.6), and blocks every write while a conflict stands. Neither
