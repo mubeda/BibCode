@@ -4334,6 +4334,27 @@ mod tests {
         }
     }
 
+    /// #148: a command's events name the command; its output stays off them.
+    #[test]
+    fn command_item_events_carry_the_command_and_not_its_output() {
+        let params = json!({
+            "turnId": "turn-1",
+            "item": {
+                "type": "commandExecution",
+                "command": "cat build.log",
+                "aggregatedOutput": "private-command-output"
+            }
+        });
+        for completed in [false, true] {
+            let (_, payload) = command_item_event_payload(&params, completed).expect("command");
+            assert_eq!(payload["detail"], "cat build.log");
+            assert!(
+                !payload.to_string().contains("private-command-output"),
+                "{payload}"
+            );
+        }
+    }
+
     async fn drain_runtime_events(runtime: &CodexSessionRuntime) -> Vec<RuntimeEvent> {
         let mut receiver = runtime.inner.events_rx.lock().await;
         let mut events = Vec::new();
