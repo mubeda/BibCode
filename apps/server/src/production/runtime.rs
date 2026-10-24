@@ -68,7 +68,7 @@ use crate::{
         orchestration_rpc::register_orchestration_rpc_with_delivery_and_availability,
         provider_runtime::{
             NativeProviderDriverFactory, ProviderRuntimeSupervisor, SupervisorOptions,
-            prepare_thread_rewind, reconcile_abandoned_provider_sessions,
+            drive_thread_compaction, prepare_thread_rewind, reconcile_abandoned_provider_sessions,
             rewind_thread_conversation,
         },
         pull_requests_rpc::{PullRequestsRpcServices, register_pull_requests_rpc},
@@ -942,6 +942,38 @@ impl OrchestrationEffectCallbacks for RuntimeEffectCallbacks {
                 .map_err(workspace_admission_detail)?;
             prepare_thread_rewind(&self.provider, &self.engine, &self.settings_root, thread_id)
                 .await
+        })
+    }
+
+    fn compact_provider<'a>(
+        &'a self,
+        compaction_id: &'a str,
+        cancellation: &'a tokio_util::sync::CancellationToken,
+    ) -> BoxEffectFuture<'a, ()> {
+        Box::pin(async move {
+            let Some(thread_id) = self
+                .engine
+                .thread_compaction(compaction_id)
+                .await
+                .map_err(|error| error.to_string())?
+                .map(|row| row.thread_id)
+            else {
+                return Ok(());
+            };
+            // Held while the compaction may reopen the provider, as a delivery holds it.
+            let _admission = self
+                .admission
+                .acquire_thread(&thread_id, std::iter::empty())
+                .await
+                .map_err(workspace_admission_detail)?;
+            drive_thread_compaction(
+                &self.provider,
+                &self.engine,
+                &self.settings_root,
+                compaction_id,
+                cancellation,
+            )
+            .await
         })
     }
 

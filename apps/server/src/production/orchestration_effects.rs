@@ -90,6 +90,17 @@ pub trait OrchestrationEffectCallbacks: Send + Sync {
 
     fn stop_provider<'a>(&'a self, thread_id: &'a str) -> BoxEffectFuture<'a, ()>;
 
+    /// Drives a requested conversation compaction to its settlement (see
+    /// `provider_runtime::drive_thread_compaction`). Runs with the thread's turns reserved;
+    /// `cancellation` abandons it at shutdown, and the next startup settles its row.
+    fn compact_provider<'a>(
+        &'a self,
+        _compaction_id: &'a str,
+        _cancellation: &'a CancellationToken,
+    ) -> BoxEffectFuture<'a, ()> {
+        Box::pin(async { Err("provider compaction is unavailable".to_owned()) })
+    }
+
     fn close_terminals<'a>(&'a self, thread_id: &'a str) -> BoxEffectFuture<'a, ()>;
 
     fn refresh_workspace<'a>(&'a self, cwd: &'a Path) -> BoxEffectFuture<'a, ()>;
@@ -428,6 +439,9 @@ pub struct OrchestrationEffects {
     /// Identity reconciles run off the sequential worker so a slow `git` read never delays turn
     /// baselines; shutdown cancels and drains them.
     identity_tasks: TaskTracker,
+    /// Conversation compactions, which can run for minutes, also run off the worker; shutdown
+    /// abandons them and the next startup settles their rows.
+    compaction_tasks: TaskTracker,
     producer: tokio::sync::Mutex<Option<JoinHandle<()>>>,
     worker: tokio::sync::Mutex<Option<JoinHandle<()>>>,
 }
@@ -460,10 +474,12 @@ impl OrchestrationEffects {
             repository.clone(),
             cancellation.child_token(),
         ));
+        let compaction_tasks = TaskTracker::new();
         let worker = tokio::spawn(run_worker(
             engine.clone(),
             repository,
             identity_tasks.clone(),
+            compaction_tasks.clone(),
             callbacks,
             receiver,
             cancellation.clone(),
@@ -479,6 +495,7 @@ impl OrchestrationEffects {
         Ok(Self {
             cancellation,
             identity_tasks,
+            compaction_tasks,
             producer: tokio::sync::Mutex::new(Some(producer)),
             worker: tokio::sync::Mutex::new(Some(worker)),
         })
@@ -494,6 +511,8 @@ impl OrchestrationEffects {
         }
         self.identity_tasks.close();
         self.identity_tasks.wait().await;
+        self.compaction_tasks.close();
+        self.compaction_tasks.wait().await;
     }
 }
 
@@ -611,6 +630,7 @@ fn is_reactor_event(event: &OrchestrationEvent) -> bool {
             | "thread.message-sent"
             | "thread.turn-diff-completed"
             | "thread.checkpoint-revert-requested"
+            | "thread.compact-requested"
             | "thread.deleted"
             | "project.created"
             | "project.meta-updated"
@@ -622,11 +642,48 @@ struct EffectContext {
     engine: OrchestrationEngine,
     repository: Arc<GitRepository>,
     identity_tasks: TaskTracker,
+    compaction_tasks: TaskTracker,
     callbacks: Arc<dyn OrchestrationEffectCallbacks>,
     cancellation: CancellationToken,
 }
 
 impl EffectContext {
+    /// Runs a requested compaction off the worker, with the thread's turns reserved so delivery
+    /// and revert wait for it, then releases the thread and wakes delivery.
+    fn compact(&self, event: &OrchestrationEvent) {
+        let (Some(thread_id), Some(compaction_id)) = (
+            event_thread_id(event).map(str::to_owned),
+            event
+                .event
+                .payload
+                .get("compactionId")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        ) else {
+            return;
+        };
+        let (engine, callbacks, cancellation) = (
+            self.engine.clone(),
+            self.callbacks.clone(),
+            self.cancellation.clone(),
+        );
+        self.compaction_tasks.spawn(async move {
+            let reservation = tokio::select! {
+                reservation = engine.reserve_thread_turns(&thread_id) => reservation,
+                () = cancellation.cancelled() => return,
+            };
+            let result = callbacks
+                .compact_provider(&compaction_id, &cancellation)
+                .await;
+            drop(reservation);
+            engine.wake_turn_delivery();
+            if let Err(detail) = result {
+                tracing::warn!(%thread_id, %detail, "conversation compaction could not run");
+                settle_unrun_compaction(&engine, &thread_id, &compaction_id, &detail).await;
+            }
+        });
+    }
+
     async fn handle(&self, event: &OrchestrationEvent) {
         let result = process_event(
             &self.engine,
@@ -669,6 +726,39 @@ impl EffectContext {
             append_failure_activity(&self.engine, event, &error.to_string()).await;
         }
     }
+}
+
+/// A compaction the callbacks could not run settles `failed`, so its thread is not held.
+async fn settle_unrun_compaction(
+    engine: &OrchestrationEngine,
+    thread_id: &str,
+    compaction_id: &str,
+    detail: &str,
+) {
+    let still_unsettled = engine
+        .thread_compaction(compaction_id)
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|row| row.is_unsettled());
+    if !still_unsettled {
+        return;
+    }
+    let settled = engine
+        .dispatch(OrchestrationCommand::ThreadCompactionSettle {
+            command_id: format!("server:compaction-settle:{compaction_id}"),
+            thread_id: thread_id.to_owned(),
+            compaction_id: compaction_id.to_owned(),
+            outcome: "failed".to_owned(),
+            detail: Some(crate::diagnostics::redact_sensitive_text(detail)),
+            restarted: false,
+            created_at: now_iso(),
+        })
+        .await;
+    if let Err(error) = settled {
+        tracing::warn!(thread_id, %error, "an unrun conversation compaction could not be settled");
+    }
+    engine.wake_turn_delivery();
 }
 
 fn event_thread_id(event: &OrchestrationEvent) -> Option<&str> {
@@ -789,6 +879,9 @@ impl ParkedThreads {
             done,
         }) = order
         else {
+            if event.event.event_type == "thread.compact-requested" {
+                return context.compact(&event);
+            }
             return context.handle(&event).await;
         };
         self.queues.insert(thread_id.clone(), VecDeque::new());
@@ -854,6 +947,7 @@ async fn run_worker(
     engine: OrchestrationEngine,
     repository: Arc<GitRepository>,
     identity_tasks: TaskTracker,
+    compaction_tasks: TaskTracker,
     callbacks: Arc<dyn OrchestrationEffectCallbacks>,
     mut receiver: mpsc::Receiver<OrchestrationEvent>,
     cancellation: CancellationToken,
@@ -862,6 +956,7 @@ async fn run_worker(
         engine,
         repository,
         identity_tasks,
+        compaction_tasks,
         callbacks,
         cancellation,
     };

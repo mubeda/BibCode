@@ -647,14 +647,24 @@ async fn dispatch_reserved_turn_command(
         ..
     } = &mut command
     {
-        if *queued == Some(true) {
+        // While a compaction is unsettled the thread counts as running, and a start sent without
+        // `queued` (an older client, or one that has not seen the compaction yet) is queued too,
+        // so nothing is admitted ahead of the copy a recovery sends.
+        let compacting = dispatch
+            .unsettled_thread_compaction(thread_id)
+            .await
+            .map_err(|error| orchestration_error("OrchestrationDispatchCommandError", error))?
+            .is_some();
+        if *queued == Some(true) || compacting {
             let session = dispatch
                 .repositories()
                 .get_thread_session(thread_id.clone())
                 .await
                 .map_err(|error| orchestration_error("OrchestrationDispatchCommandError", error))?;
-            let resolved = session
-                .is_some_and(|session| matches!(session.status.as_str(), "running" | "starting"));
+            let resolved = compacting
+                || session.is_some_and(|session| {
+                    matches!(session.status.as_str(), "running" | "starting")
+                });
             *queued = Some(resolved);
             if resolved {
                 delivery_state = crate::orchestration::TurnDeliveryState::Queued;
@@ -1408,6 +1418,9 @@ fn thread_detail(thread: &ProjectionThread, rows: &ThreadDetailRows<'_>) -> Valu
                         }
                         message["delivery"] = delivery;
                     }
+                    if let Some(resend_of) = &row.resend_of_message_id {
+                        message["resendOf"] = json!(resend_of);
+                    }
                     message
                 })
                 .collect(),
@@ -1771,6 +1784,23 @@ fn thread_shell(
     thread_shell_with_records(thread, latest_turn, session, preview)
 }
 
+/// The thread's unsettled compaction on the wire: its trigger, state and the message a recovery
+/// sends again.
+fn thread_compaction_value(thread: &ProjectionThread) -> Option<Value> {
+    let compaction = thread.compaction.as_ref()?;
+    let mut value = json!({
+        "trigger": compaction.get("trigger")?,
+        "state": compaction.get("state")?,
+    });
+    if let Some(failed_message_id) = compaction
+        .get("failedMessageId")
+        .filter(|value| value.is_string())
+    {
+        value["failedMessageId"] = failed_message_id.clone();
+    }
+    Some(value)
+}
+
 fn thread_shell_with_records(
     thread: &ProjectionThread,
     latest_turn: Option<&crate::persistence::ProjectionTurn>,
@@ -1826,6 +1856,9 @@ fn thread_shell_with_records(
             json!({ "state": state, "detail": thread.unresolved_delivery_detail })
         }),
     });
+    if let Some(compaction) = thread_compaction_value(thread) {
+        shell["compaction"] = compaction;
+    }
     if let Some(host_thread_id) = &thread.host_thread_id {
         shell["hostThreadId"] = json!(host_thread_id);
     }
@@ -2110,6 +2143,7 @@ mod tests {
                 unresolved_delivery_detail: None,
                 deleted_at: None,
                 host_thread_id: None,
+                compaction: None,
             }],
             messages: vec![
                 ProjectionThreadMessage {
@@ -2127,6 +2161,7 @@ mod tests {
                     delivery_reason: None,
                     delivery_mode: None,
                     delivery_held: None,
+                    resend_of_message_id: None,
                     created_at: "2026-07-11T00:00:00.000Z".to_owned(),
                     updated_at: "2026-07-11T00:00:00.000Z".to_owned(),
                 },
@@ -2145,6 +2180,7 @@ mod tests {
                     delivery_reason: None,
                     delivery_mode: None,
                     delivery_held: None,
+                    resend_of_message_id: None,
                     created_at: "2026-07-11T00:00:00.001Z".to_owned(),
                     updated_at: "2026-07-11T00:00:00.001Z".to_owned(),
                 },
@@ -2163,6 +2199,7 @@ mod tests {
                     delivery_reason: None,
                     delivery_mode: None,
                     delivery_held: None,
+                    resend_of_message_id: None,
                     created_at: "2026-07-11T00:00:00.002Z".to_owned(),
                     updated_at: "2026-07-11T00:00:00.002Z".to_owned(),
                 },
@@ -2181,6 +2218,7 @@ mod tests {
                     delivery_reason: None,
                     delivery_mode: None,
                     delivery_held: None,
+                    resend_of_message_id: None,
                     created_at: "2026-07-11T00:00:00.003Z".to_owned(),
                     updated_at: "2026-07-11T00:00:00.003Z".to_owned(),
                 },
@@ -2199,6 +2237,7 @@ mod tests {
                     delivery_reason: None,
                     delivery_mode: None,
                     delivery_held: None,
+                    resend_of_message_id: None,
                     created_at: "2026-07-11T00:00:00.004Z".to_owned(),
                     updated_at: "2026-07-11T00:00:00.004Z".to_owned(),
                 },
@@ -2217,6 +2256,7 @@ mod tests {
                     delivery_reason: None,
                     delivery_mode: None,
                     delivery_held: None,
+                    resend_of_message_id: None,
                     created_at: "2026-07-11T00:00:00.005Z".to_owned(),
                     updated_at: "2026-07-11T00:00:00.005Z".to_owned(),
                 },
@@ -2330,6 +2370,7 @@ mod tests {
             delivery_reason: None,
             delivery_mode: None,
             delivery_held: None,
+            resend_of_message_id: None,
             created_at: created_at.to_owned(),
             updated_at: created_at.to_owned(),
         }

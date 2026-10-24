@@ -684,6 +684,7 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration::new(52, "ProjectRepositoryIdentity", migration_052),
     Migration::new(53, "PullRequestSnapshots", migration_053),
     Migration::new(54, "ProjectionThreadHostThread", migration_054),
+    Migration::new(55, "ThreadCompactions", migration_055),
 ];
 
 impl Migration {
@@ -2572,6 +2573,54 @@ fn migration_054(transaction: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
+fn migration_055(transaction: &Transaction<'_>) -> Result<()> {
+    // The durable record of each conversation compaction: the source of truth for an unsettled
+    // one, which holds the thread's deliveries, as the outbox is for the queue. A failed message
+    // is recovered at most once, and a guarded delivery compacted at most once.
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS thread_compactions (
+          compaction_id TEXT PRIMARY KEY NOT NULL,
+          thread_id TEXT NOT NULL,
+          trigger TEXT NOT NULL,
+          state TEXT NOT NULL,
+          stop_requested INTEGER NOT NULL DEFAULT 0,
+          provider_instance_id TEXT NOT NULL,
+          provider_kind TEXT NOT NULL,
+          conversation_id TEXT,
+          turn_id TEXT,
+          failed_message_id TEXT UNIQUE,
+          guarded_delivery_command_id TEXT UNIQUE,
+          resend_message_id TEXT,
+          detail TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_thread_compactions_thread_state
+          ON thread_compactions(thread_id, state);
+        "#,
+    )?;
+    // Guarded like 054: a trusted-ledger restore may not carry these rebuildable projections.
+    if table_exists(transaction, "projection_thread_messages")?
+        && !table_has_column(
+            transaction,
+            "projection_thread_messages",
+            "resend_of_message_id",
+        )?
+    {
+        transaction.execute_batch(
+            "ALTER TABLE projection_thread_messages ADD COLUMN resend_of_message_id TEXT;",
+        )?;
+    }
+    if table_exists(transaction, "projection_threads")?
+        && !table_has_column(transaction, "projection_threads", "compaction_json")?
+    {
+        transaction
+            .execute_batch("ALTER TABLE projection_threads ADD COLUMN compaction_json TEXT;")?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -2722,7 +2771,7 @@ mod tests {
             [],
         )?;
 
-        let applied = run_migrations(&mut connection, None)?;
+        let applied = run_migrations(&mut connection, Some(54))?;
 
         assert_eq!(
             applied
@@ -2737,6 +2786,49 @@ mod tests {
             |row| row.get::<_, Option<String>>(0),
         )?;
         assert_eq!(value, None);
+        Ok(())
+    }
+
+    #[test]
+    fn thread_compactions_migration_adds_the_table_and_nullable_projection_columns()
+    -> rusqlite::Result<()> {
+        let mut connection = rusqlite::Connection::open_in_memory()?;
+        run_migrations(&mut connection, Some(54))?;
+        connection.execute(
+            "INSERT INTO projection_thread_messages (message_id, thread_id, role, text, is_streaming, created_at, updated_at) VALUES ('m', 't', 'user', 'kept', 0, '2026-10-24T00:00:00Z', '2026-10-24T00:00:00Z')",
+            [],
+        )?;
+
+        let applied = run_migrations(&mut connection, None)?;
+
+        assert_eq!(applied.first().map(|migration| migration.id), Some(55));
+        let resend_of = connection.query_row(
+            "SELECT resend_of_message_id FROM projection_thread_messages WHERE message_id = 'm'",
+            [],
+            |row| row.get::<_, Option<String>>(0),
+        )?;
+        assert_eq!(resend_of, None);
+        let compaction_column = connection.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('projection_threads') WHERE name = 'compaction_json'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        assert_eq!(compaction_column, 1);
+        connection.execute(
+            "INSERT INTO thread_compactions (compaction_id, thread_id, trigger, state, provider_instance_id, provider_kind, failed_message_id, created_at, updated_at) VALUES ('c1', 't', 'contextRecovery', 'requested', 'claude', 'claudeAgent', 'm', 'now', 'now')",
+            [],
+        )?;
+        let duplicate = connection.execute(
+            "INSERT INTO thread_compactions (compaction_id, thread_id, trigger, state, provider_instance_id, provider_kind, failed_message_id, created_at, updated_at) VALUES ('c2', 't', 'contextRecovery', 'requested', 'claude', 'claudeAgent', 'm', 'now', 'now')",
+            [],
+        );
+        assert!(duplicate.is_err(), "a failed message is recovered once");
+        let stop_requested = connection.query_row(
+            "SELECT stop_requested FROM thread_compactions WHERE compaction_id = 'c1'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        assert_eq!(stop_requested, 0);
         Ok(())
     }
 
@@ -3398,7 +3490,7 @@ mod tests {
             .map(|migration| migration.id)
             .collect::<Vec<_>>();
 
-        assert_eq!(ids, (1..=54).collect::<Vec<_>>());
+        assert_eq!(ids, (1..=55).collect::<Vec<_>>());
         assert_eq!(MIGRATIONS[0].name, "OrchestrationEvents");
         assert_eq!(MIGRATIONS[33].name, "ActivityProjection");
         assert_eq!(MIGRATIONS[34].name, "ActivityJournalEventKeyNamespace");
@@ -3453,6 +3545,7 @@ mod tests {
                 (52, "ProjectRepositoryIdentity"),
                 (53, "PullRequestSnapshots"),
                 (54, "ProjectionThreadHostThread"),
+                (55, "ThreadCompactions"),
             ],
         );
         assert_eq!(
@@ -3549,11 +3642,12 @@ mod tests {
         assert_eq!(first[15].id, 16);
 
         let second = run_migrations(&mut connection, None)?;
-        assert_eq!(second.len(), 38);
+        assert_eq!(second.len(), 39);
         assert_eq!(second[0].id, 17);
         assert_eq!(second[35].id, 52);
         assert_eq!(second[36].id, 53);
         assert_eq!(second[37].id, 54);
+        assert_eq!(second[38].id, 55);
 
         let third = run_migrations(&mut connection, None)?;
         assert!(third.is_empty());
@@ -3565,7 +3659,7 @@ mod tests {
             [],
             |row| row.get::<_, u32>(0),
         )?;
-        assert_eq!(application_table_count, 29);
+        assert_eq!(application_table_count, 30);
         assert_delivery_schema(&connection)?;
 
         Ok(())
@@ -3660,7 +3754,9 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54]
+            [
+                40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55
+            ]
         );
         let policy = connection.query_row(
             "SELECT worktree_discovery_json FROM projection_projects WHERE project_id = 'project-1'",
@@ -3697,7 +3793,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54]
+            [41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55]
         );
         let pin = connection.query_row(
             "SELECT worktree_repository_key FROM projection_projects WHERE project_id = 'project-legacy'",
@@ -3725,7 +3821,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54]
+            [42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55]
         );
         let pin = connection.query_row(
             "SELECT repository_key FROM project_worktree_repository_pins WHERE project_id = 'project-pinned'",
@@ -3865,7 +3961,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [48, 49, 50, 51, 52, 53, 54]
+            [48, 49, 50, 51, 52, 53, 54, 55]
         );
         assert_eq!(
             connection.query_row(
@@ -3894,7 +3990,7 @@ mod tests {
         )?;
 
         let applied = run_migrations(&mut connection, None)?;
-        assert_eq!(applied.len(), 21);
+        assert_eq!(applied.len(), 22);
         assert_eq!(applied[0].id, 34);
         assert_eq!(applied[1].id, 35);
         assert_eq!(applied[2].id, 36);
@@ -3916,6 +4012,7 @@ mod tests {
         assert_eq!(applied[18].id, 52);
         assert_eq!(applied[19].id, 53);
         assert_eq!(applied[20].id, 54);
+        assert_eq!(applied[21].id, 55);
         let value = connection.query_row("SELECT value FROM legacy_user_data", [], |row| {
             row.get::<_, String>(0)
         })?;

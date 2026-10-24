@@ -36,6 +36,17 @@ use crate::{
     git::{canonical_worktree_path_key, host_path_platform, normalize_worktree_path_key},
 };
 
+mod compaction;
+
+pub use compaction::{
+    CompactionTurnOutcome, CompactionWait, CompactionWaiters, ContextLimitFacts,
+    ThreadCompactionRow, guard_command_id, resend_command_id, resend_message_id,
+    resume_cursor_conversation_id,
+};
+pub(crate) use compaction::{
+    GUARD_WAITING_DETAIL, compaction_row_on, saved_conversation_on, unsettled_compaction_on,
+};
+
 const TURN_UPSERT_SQL: &str = "INSERT INTO projection_turns (thread_id, turn_id, pending_message_id, source_proposed_plan_thread_id, source_proposed_plan_id, assistant_message_id, state, requested_at, started_at, completed_at, checkpoint_turn_count, checkpoint_ref, checkpoint_status, checkpoint_files_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (thread_id, turn_id) DO UPDATE SET pending_message_id=excluded.pending_message_id, source_proposed_plan_thread_id=excluded.source_proposed_plan_thread_id, source_proposed_plan_id=excluded.source_proposed_plan_id, assistant_message_id=excluded.assistant_message_id, state=excluded.state, requested_at=excluded.requested_at, started_at=excluded.started_at, completed_at=excluded.completed_at, checkpoint_turn_count=excluded.checkpoint_turn_count, checkpoint_ref=excluded.checkpoint_ref, checkpoint_status=excluded.checkpoint_status, checkpoint_files_json=excluded.checkpoint_files_json";
 const DEFAULT_WORKTREE_DISCOVERY_JSON: &str =
     r#"{"visibility":"hidden","initialPromptDismissedAt":null,"baselinePaths":[]}"#;
@@ -662,6 +673,21 @@ pub enum OrchestrationCommand {
         #[serde(rename = "threadId")]
         thread_id: String,
         session: SessionInput,
+        /// The compaction a running update's turn belongs to: that turn gets a row of its own
+        /// and neither binds nor deletes a waiting message's marker.
+        #[serde(
+            rename = "compactionId",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        compaction_id: Option<String>,
+        /// A failed turn's context-limit facts, which decide an automatic recovery.
+        #[serde(
+            rename = "contextLimit",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        context_limit: Option<ContextLimitFacts>,
         #[serde(rename = "createdAt")]
         created_at: String,
     },
@@ -742,6 +768,41 @@ pub enum OrchestrationCommand {
         thread_id: String,
         #[serde(rename = "turnCount")]
         turn_count: i64,
+        #[serde(rename = "createdAt")]
+        created_at: String,
+    },
+    /// Compacts the conversation the thread's next message would continue. The delivery worker's
+    /// guard dispatches it with `guardedDeliveryCommandId`, which a client cannot set.
+    #[serde(rename = "thread.compact")]
+    ThreadCompact {
+        #[serde(rename = "commandId")]
+        command_id: String,
+        #[serde(rename = "threadId")]
+        thread_id: String,
+        #[serde(
+            rename = "guardedDeliveryCommandId",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        guarded_delivery_command_id: Option<String>,
+        #[serde(rename = "createdAt")]
+        created_at: String,
+    },
+    /// Settles a conversation compaction once its outcome is known.
+    #[serde(rename = "thread.compaction.settle")]
+    ThreadCompactionSettle {
+        #[serde(rename = "commandId")]
+        command_id: String,
+        #[serde(rename = "threadId")]
+        thread_id: String,
+        #[serde(rename = "compactionId")]
+        compaction_id: String,
+        outcome: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+        /// BiBCode restarted before the compaction settled.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        restarted: bool,
         #[serde(rename = "createdAt")]
         created_at: String,
     },
@@ -1857,6 +1918,7 @@ pub struct OrchestrationEngine {
     command_admission: CommandAdmissionFence,
     workspace_ownership: WorkspaceOwnershipFence,
     thread_turns: ThreadTurnFence,
+    compaction_waiters: CompactionWaiters,
     #[cfg(test)]
     test_hooks: TestHooks,
 }
@@ -1897,6 +1959,7 @@ impl OrchestrationEngine {
             command_admission: CommandAdmissionFence::default(),
             workspace_ownership: WorkspaceOwnershipFence::default(),
             thread_turns: ThreadTurnFence::default(),
+            compaction_waiters: CompactionWaiters::default(),
             #[cfg(test)]
             test_hooks: options.test_hooks,
         })
@@ -2546,6 +2609,11 @@ impl OrchestrationEngine {
     /// Whether a revert or turn delivery of the thread runs now.
     pub(crate) fn thread_turns_reserved(&self, thread_id: &str) -> bool {
         self.thread_turns.is_reserved(thread_id)
+    }
+
+    /// Where the event pump reports a compaction's tagged turn to the compaction effect.
+    pub fn compaction_waiters(&self) -> &CompactionWaiters {
+        &self.compaction_waiters
     }
 
     pub(crate) fn wake_turn_delivery(&self) {
@@ -4510,17 +4578,92 @@ async fn plan_command(
             command_id,
             thread_id,
             session,
+            compaction_id,
             created_at,
-        } => simple_thread_event(
-            model,
-            command,
-            "thread.session-set",
+            ..
+        } => {
+            let mut payload = json!({"threadId":thread_id,"session":session});
+            insert_optional(
+                &mut payload,
+                "compactionId",
+                compaction_id.as_ref().map(|id| json!(id)),
+            );
+            simple_thread_event(
+                model,
+                command,
+                "thread.session-set",
+                command_id,
+                thread_id,
+                created_at,
+                metadata,
+                payload,
+            )
+        }
+        OrchestrationCommand::ThreadCompact {
             command_id,
             thread_id,
+            guarded_delivery_command_id,
             created_at,
-            metadata,
-            json!({"threadId":thread_id,"session":session}),
-        ),
+        } => {
+            require_thread(model, command, thread_id)?;
+            let trigger = if guarded_delivery_command_id.is_some() {
+                "guard"
+            } else {
+                "manual"
+            };
+            if guarded_delivery_command_id.is_none() {
+                check_manual_compaction(repositories, command, thread_id).await?;
+            }
+            simple_thread_event(
+                model,
+                command,
+                "thread.compact-requested",
+                command_id,
+                thread_id,
+                created_at,
+                metadata,
+                json!({
+                    "threadId": thread_id,
+                    "compactionId": format!("compaction:{}", Uuid::new_v4()),
+                    "trigger": trigger,
+                    "createdAt": created_at,
+                }),
+            )
+        }
+        OrchestrationCommand::ThreadCompactionSettle {
+            command_id,
+            thread_id,
+            compaction_id,
+            outcome,
+            detail,
+            created_at,
+            ..
+        } => {
+            if !matches!(outcome.as_str(), "completed" | "failed" | "interrupted") {
+                return invariant(command, format!("Unknown compaction outcome '{outcome}'."));
+            }
+            let mut payload = json!({
+                "threadId": thread_id,
+                "compactionId": compaction_id,
+                "outcome": outcome,
+                "createdAt": created_at,
+            });
+            insert_optional(
+                &mut payload,
+                "detail",
+                detail.as_ref().map(|value| json!(value)),
+            );
+            simple_thread_event(
+                model,
+                command,
+                "thread.compacted",
+                command_id,
+                thread_id,
+                created_at,
+                metadata,
+                payload,
+            )
+        }
         OrchestrationCommand::ThreadMessageAssistantDelta {
             command_id,
             thread_id,
@@ -4807,6 +4950,71 @@ fn require_thread<'a>(
     Ok(thread)
 }
 
+/// Refuses a manual compaction the thread cannot run now: while a turn runs or starts, while a
+/// compaction is unsettled, for a provider that cannot compact, or with no saved conversation of
+/// the instance the next message would use. The persist transaction checks the same again.
+async fn check_manual_compaction(
+    repositories: &Repositories,
+    command: &OrchestrationCommand,
+    thread_id: &str,
+) -> Result<(), OrchestrationError> {
+    let thread_id = thread_id.to_owned();
+    let refusal = repositories
+        .database()
+        .call(move |connection| manual_compaction_refusal_on(connection, &thread_id))
+        .await
+        .map_err(wrap_persistence)?;
+    match refusal {
+        Some(detail) => invariant(command, detail),
+        None => Ok(()),
+    }
+}
+
+/// Why a manual compaction of the thread is refused now, if it is.
+fn manual_compaction_refusal_on(
+    connection: &rusqlite::Connection,
+    thread_id: &str,
+) -> Result<Option<String>, PersistenceError> {
+    let busy = connection
+        .query_row(
+            "SELECT status FROM projection_thread_sessions WHERE thread_id = ?",
+            [thread_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .is_some_and(|status| matches!(status.as_str(), "running" | "starting"));
+    if busy {
+        return Ok(Some(
+            "Wait for the current turn to finish, then compact the conversation.".to_owned(),
+        ));
+    }
+    if unsettled_compaction_on(connection, thread_id)?.is_some() {
+        return Ok(Some(
+            "The conversation is already being compacted.".to_owned(),
+        ));
+    }
+    let instance_id = connection
+        .query_row(
+            "SELECT json_extract(model_selection_json, '$.instanceId') FROM projection_threads WHERE thread_id = ?",
+            [thread_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten()
+        .unwrap_or_else(|| "codex".to_owned());
+    let Some(target) = saved_conversation_on(connection, thread_id, &instance_id)? else {
+        return Ok(Some(
+            "There's no saved conversation for this thread to compact.".to_owned(),
+        ));
+    };
+    if !crate::provider::supports_compaction(&target.provider_kind) {
+        return Ok(Some(
+            "This provider can't compact the conversation.".to_owned(),
+        ));
+    }
+    Ok(None)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn simple_thread_event(
     model: &CommandModel,
@@ -4960,10 +5168,28 @@ async fn persist_command(
         }
         _ => None,
     };
+    let compaction_step = CompactionStep::of(command);
     let committed = repositories
         .database()
         .call(move |connection| {
             let transaction = connection.transaction()?;
+            let mut hold = hold;
+            let mut copy_receipts = Vec::new();
+            if let Some(step) = compaction_step {
+                let applied = apply_compaction_step_tx(
+                    &transaction,
+                    step,
+                    &command_id,
+                    &mut event_list,
+                    &mut copy_receipts,
+                )?;
+                match applied {
+                    CompactionStepOutcome::Stale => return Ok(None),
+                    // The failure is being recovered: the queued messages follow the copy.
+                    CompactionStepOutcome::RecoveryBegun => hold = None,
+                    CompactionStepOutcome::Applied => {}
+                }
+            }
             if let Some((thread_id, message_id, automatic, created_at)) = promotion {
                 // Recheck inside the event transaction: another owner may have cancelled,
                 // promoted, interrupted, or started a turn since command planning.
@@ -5029,6 +5255,31 @@ async fn persist_command(
                 }
                 committed.push_back(saved);
             }
+            // A copy admitted by a settlement gets the receipt admission gives a turn start, in
+            // the order its events were committed, so the queue head and attachment checks see it.
+            for (copy_command_id, thread_id) in copy_receipts {
+                if let Some(saved) = committed
+                    .iter()
+                    .filter(|event| {
+                        event.event.command_id.as_deref() == Some(copy_command_id.as_str())
+                    })
+                    .max_by_key(|event| event.sequence)
+                {
+                    upsert_command_receipt_tx(
+                        &transaction,
+                        CommandReceipt {
+                            command_id: copy_command_id,
+                            aggregate_kind: "thread".to_owned(),
+                            aggregate_id: thread_id,
+                            accepted_at: saved.event.occurred_at.clone(),
+                            result_sequence: saved.sequence,
+                            status: "accepted".to_owned(),
+                            error: None,
+                            payload_digest: None,
+                        },
+                    )?;
+                }
+            }
             let accepted_at = event_list
                 .last()
                 .map(|event| event.occurred_at.clone())
@@ -5086,6 +5337,381 @@ async fn persist_command(
         .map_err(wrap_persistence)?
         .ok_or_else(|| OrchestrationError::Invariant { command_type: command.command_type().to_owned(), detail: "Queued delivery changed before promotion or steering.".to_owned() })?;
     Ok(committed)
+}
+
+/// The compaction work a command does inside its persist transaction.
+enum CompactionStep {
+    /// `thread.compact`: records the requested compaction.
+    Request {
+        thread_id: String,
+        guarded_delivery_command_id: Option<String>,
+        created_at: String,
+    },
+    /// `thread.compaction.settle`.
+    Settle {
+        thread_id: String,
+        compaction_id: String,
+        outcome: String,
+        detail: Option<String>,
+        restarted: bool,
+        created_at: String,
+    },
+    /// Stop: a requested compaction is interrupted before anything is sent; a running one is
+    /// asked to stop and settles `interrupted` when its turn or session ends.
+    Interrupt {
+        thread_id: String,
+        created_at: String,
+    },
+    /// A turn failed at the context limit: recover it automatically when eligible.
+    ContextLimit {
+        thread_id: String,
+        facts: ContextLimitFacts,
+        last_error: Option<String>,
+        created_at: String,
+    },
+}
+
+enum CompactionStepOutcome {
+    Applied,
+    RecoveryBegun,
+    /// The compaction changed since planning; nothing is recorded.
+    Stale,
+}
+
+impl CompactionStep {
+    fn of(command: &OrchestrationCommand) -> Option<Self> {
+        match command {
+            OrchestrationCommand::ThreadCompact {
+                thread_id,
+                guarded_delivery_command_id,
+                created_at,
+                ..
+            } => Some(Self::Request {
+                thread_id: thread_id.clone(),
+                guarded_delivery_command_id: guarded_delivery_command_id.clone(),
+                created_at: created_at.clone(),
+            }),
+            OrchestrationCommand::ThreadCompactionSettle {
+                thread_id,
+                compaction_id,
+                outcome,
+                detail,
+                restarted,
+                created_at,
+                ..
+            } => Some(Self::Settle {
+                thread_id: thread_id.clone(),
+                compaction_id: compaction_id.clone(),
+                outcome: outcome.clone(),
+                detail: detail.clone(),
+                restarted: *restarted,
+                created_at: created_at.clone(),
+            }),
+            OrchestrationCommand::ThreadTurnInterrupt {
+                thread_id,
+                created_at,
+                ..
+            } => Some(Self::Interrupt {
+                thread_id: thread_id.clone(),
+                created_at: created_at.clone(),
+            }),
+            OrchestrationCommand::ThreadSessionSet {
+                thread_id,
+                session,
+                context_limit: Some(facts),
+                compaction_id: None,
+                created_at,
+                ..
+            } if session.status == "error"
+                && session.last_error_class.as_deref() == Some("context_limit") =>
+            {
+                Some(Self::ContextLimit {
+                    thread_id: thread_id.clone(),
+                    facts: facts.clone(),
+                    last_error: session.last_error.clone(),
+                    created_at: created_at.clone(),
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
+/// The instance the thread's next message would use: its model selection's.
+fn thread_instance_on(
+    transaction: &Transaction<'_>,
+    thread_id: &str,
+) -> Result<String, PersistenceError> {
+    Ok(transaction
+        .query_row(
+            "SELECT json_extract(model_selection_json, '$.instanceId') FROM projection_threads WHERE thread_id = ?",
+            [thread_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten()
+        .unwrap_or_else(|| "codex".to_owned()))
+}
+
+fn apply_compaction_step_tx(
+    transaction: &Transaction<'_>,
+    step: CompactionStep,
+    command_id: &str,
+    event_list: &mut Vec<NewOrchestrationEvent>,
+    copy_receipts: &mut Vec<(String, String)>,
+) -> Result<CompactionStepOutcome, PersistenceError> {
+    match step {
+        CompactionStep::Request {
+            thread_id,
+            guarded_delivery_command_id,
+            created_at,
+        } => request_compaction_tx(
+            transaction,
+            &thread_id,
+            guarded_delivery_command_id.as_deref(),
+            &created_at,
+            command_id,
+            event_list,
+        ),
+        CompactionStep::Settle {
+            thread_id,
+            compaction_id,
+            outcome,
+            detail,
+            restarted,
+            created_at,
+        } => {
+            let Some(row) = compaction_row_on(transaction, &compaction_id)?
+                .filter(|row| row.thread_id == thread_id && row.is_unsettled())
+            else {
+                return Ok(CompactionStepOutcome::Stale);
+            };
+            // The settlement records its own `thread.compacted`, with the final outcome.
+            event_list.clear();
+            let mut context = compaction::SettlementContext {
+                occurred_at: &created_at,
+                command_id,
+                events: event_list,
+            };
+            let Some(settled) = compaction::settle_compaction_tx(
+                transaction,
+                &row,
+                &outcome,
+                detail.as_deref(),
+                restarted,
+                &mut context,
+            )?
+            else {
+                return Ok(CompactionStepOutcome::Stale);
+            };
+            if let Some(copy_command_id) = settled.copy_command_id {
+                copy_receipts.push((copy_command_id, thread_id));
+            }
+            Ok(CompactionStepOutcome::Applied)
+        }
+        CompactionStep::Interrupt {
+            thread_id,
+            created_at,
+        } => {
+            let Some(row) = unsettled_compaction_on(transaction, &thread_id)? else {
+                return Ok(CompactionStepOutcome::Applied);
+            };
+            if row.state == "requested" {
+                // Nothing was sent yet: the effect's conditional start now fails.
+                let mut context = compaction::SettlementContext {
+                    occurred_at: &created_at,
+                    command_id,
+                    events: event_list,
+                };
+                compaction::settle_compaction_tx(
+                    transaction,
+                    &ThreadCompactionRow {
+                        stop_requested: true,
+                        ..row
+                    },
+                    "interrupted",
+                    None,
+                    false,
+                    &mut context,
+                )?;
+            } else {
+                transaction.execute(
+                    "UPDATE thread_compactions SET stop_requested = 1, updated_at = ? WHERE compaction_id = ?",
+                    params![created_at, row.compaction_id],
+                )?;
+            }
+            Ok(CompactionStepOutcome::Applied)
+        }
+        CompactionStep::ContextLimit {
+            thread_id,
+            facts,
+            last_error,
+            created_at,
+        } => match compaction::context_limit_recovery_tx(transaction, &thread_id, &facts)? {
+            compaction::ContextLimitRecovery::Begin {
+                failed_message_id,
+                target,
+            } => {
+                let compaction_id = format!("compaction:{}", Uuid::new_v4());
+                compaction::insert_compaction_tx(
+                    transaction,
+                    &compaction::NewCompaction {
+                        compaction_id: &compaction_id,
+                        thread_id: &thread_id,
+                        trigger: "contextRecovery",
+                        target: &target,
+                        failed_message_id: Some(&failed_message_id),
+                        guarded_delivery_command_id: None,
+                        detail: last_error.as_deref(),
+                        created_at: &created_at,
+                    },
+                )?;
+                if let Some(session) = event_list
+                    .first_mut()
+                    .and_then(|event| event.payload.get_mut("session"))
+                {
+                    session["lastError"] = json!(compaction::RECOVERY_LAST_ERROR);
+                }
+                event_list.push(make_event(
+                    "thread.compact-requested",
+                    "thread",
+                    &thread_id,
+                    &created_at,
+                    command_id,
+                    json!({}),
+                    json!({
+                        "threadId": thread_id,
+                        "compactionId": compaction_id,
+                        "trigger": "contextRecovery",
+                        "failedMessageId": failed_message_id,
+                        "createdAt": created_at,
+                    }),
+                ));
+                Ok(CompactionStepOutcome::RecoveryBegun)
+            }
+            compaction::ContextLimitRecovery::AlreadyCompacted => {
+                if let Some(session) = event_list
+                    .first_mut()
+                    .and_then(|event| event.payload.get_mut("session"))
+                {
+                    let text = match last_error.as_deref().map(str::trim) {
+                        Some(error) if !error.is_empty() => {
+                            format!("{error} {}", compaction::ALREADY_COMPACTED_SUFFIX)
+                        }
+                        _ => compaction::ALREADY_COMPACTED_SUFFIX.to_owned(),
+                    };
+                    session["lastError"] = json!(text);
+                }
+                Ok(CompactionStepOutcome::Applied)
+            }
+            compaction::ContextLimitRecovery::Recovering => {
+                if let Some(session) = event_list
+                    .first_mut()
+                    .and_then(|event| event.payload.get_mut("session"))
+                {
+                    session["lastError"] = json!(compaction::RECOVERY_LAST_ERROR);
+                }
+                Ok(CompactionStepOutcome::RecoveryBegun)
+            }
+            compaction::ContextLimitRecovery::None => Ok(CompactionStepOutcome::Applied),
+        },
+    }
+}
+
+/// Records a requested manual or guard compaction with the conversation it compacts.
+fn request_compaction_tx(
+    transaction: &Transaction<'_>,
+    thread_id: &str,
+    guarded_delivery_command_id: Option<&str>,
+    created_at: &str,
+    command_id: &str,
+    event_list: &mut Vec<NewOrchestrationEvent>,
+) -> Result<CompactionStepOutcome, PersistenceError> {
+    if unsettled_compaction_on(transaction, thread_id)?.is_some() {
+        return Ok(CompactionStepOutcome::Stale);
+    }
+    let Some(compaction_id) = event_list
+        .first()
+        .and_then(|event| event.payload.get("compactionId"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    else {
+        return Ok(CompactionStepOutcome::Stale);
+    };
+    let target = if let Some(delivery_command_id) = guarded_delivery_command_id {
+        let delivery = transaction
+            .query_row(
+                "SELECT provider_instance_id, provider_kind FROM provider_turn_outbox WHERE command_id = ? AND thread_id = ? AND state = 'pending' AND mode = 'start'
+                   AND NOT EXISTS(SELECT 1 FROM thread_compactions WHERE guarded_delivery_command_id = provider_turn_outbox.command_id)",
+                params![delivery_command_id, thread_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let Some((instance_id, provider_kind)) = delivery else {
+            return Ok(CompactionStepOutcome::Stale);
+        };
+        let Some(target) = saved_conversation_on(transaction, thread_id, &instance_id)?
+            .filter(|target| target.provider_kind == provider_kind)
+        else {
+            return Ok(CompactionStepOutcome::Stale);
+        };
+        target
+    } else {
+        if manual_compaction_refusal_on(transaction, thread_id)?.is_some() {
+            return Ok(CompactionStepOutcome::Stale);
+        }
+        let instance_id = thread_instance_on(transaction, thread_id)?;
+        let Some(target) = saved_conversation_on(transaction, thread_id, &instance_id)? else {
+            return Ok(CompactionStepOutcome::Stale);
+        };
+        target
+    };
+    compaction::insert_compaction_tx(
+        transaction,
+        &compaction::NewCompaction {
+            compaction_id: &compaction_id,
+            thread_id,
+            trigger: if guarded_delivery_command_id.is_some() {
+                "guard"
+            } else {
+                "manual"
+            },
+            target: &target,
+            failed_message_id: None,
+            guarded_delivery_command_id,
+            detail: None,
+            created_at,
+        },
+    )?;
+    if let Some(delivery_command_id) = guarded_delivery_command_id {
+        let row = transaction
+            .query_row(
+                "UPDATE provider_turn_outbox SET last_error = ?, updated_at = ? WHERE command_id = ? AND state = 'pending' RETURNING message_id, provider_kind, provider_instance_id, held",
+                params![GUARD_WAITING_DETAIL, created_at, delivery_command_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, bool>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some((message_id, provider, provider_instance_id, held)) = row {
+            event_list.push(make_event(
+                "thread.turn-delivery-updated",
+                "thread",
+                thread_id,
+                created_at,
+                command_id,
+                json!({"deliveryCommandId": delivery_command_id}),
+                json!({"threadId": thread_id, "messageId": message_id, "state": "pending", "provider": provider, "mode": "start", "held": held, "detail": GUARD_WAITING_DETAIL, "updatedAt": created_at,
+                    "delivery": delivery_value("pending", &provider, &provider_instance_id, "start", held, Some(GUARD_WAITING_DETAIL))}),
+            ));
+        }
+    }
+    Ok(CompactionStepOutcome::Applied)
 }
 
 async fn persist_rejected_command(
@@ -5859,6 +6485,40 @@ fn apply_threads_projector_tx(
             }
             "thread.session-set" => {
                 transaction.execute("UPDATE projection_threads SET latest_turn_id = ?, updated_at = ? WHERE thread_id = ?", params![optional_string(payload.pointer("/session/activeTurnId")), event.event.occurred_at, required_str(payload,"threadId")?])?;
+                // The compaction's own turn started.
+                if let Some(compaction_id) = payload.get("compactionId").and_then(Value::as_str)
+                    && payload.pointer("/session/status").and_then(Value::as_str) == Some("running")
+                {
+                    transaction.execute(
+                        "UPDATE projection_threads SET compaction_json = json_set(compaction_json, '$.state', 'running') WHERE thread_id = ? AND json_extract(compaction_json, '$.compactionId') = ?",
+                        params![required_str(payload, "threadId")?, compaction_id],
+                    )?;
+                }
+            }
+            "thread.compact-requested" => {
+                let mut compaction = json!({
+                    "compactionId": required_str(payload, "compactionId")?,
+                    "trigger": required_str(payload, "trigger")?,
+                    "state": "requested",
+                });
+                insert_optional(
+                    &mut compaction,
+                    "failedMessageId",
+                    payload
+                        .get("failedMessageId")
+                        .cloned()
+                        .filter(|id| !id.is_null()),
+                );
+                transaction.execute(
+                    "UPDATE projection_threads SET compaction_json = ?, updated_at = ? WHERE thread_id = ?",
+                    params![json_string(&compaction)?, event.event.occurred_at, required_str(payload, "threadId")?],
+                )?;
+            }
+            "thread.compacted" => {
+                transaction.execute(
+                    "UPDATE projection_threads SET compaction_json = NULL, updated_at = ? WHERE thread_id = ? AND json_extract(compaction_json, '$.compactionId') = ?",
+                    params![event.event.occurred_at, required_str(payload, "threadId")?, required_str(payload, "compactionId")?],
+                )?;
             }
             "thread.turn-diff-completed" => {
                 transaction.execute("UPDATE projection_threads SET latest_turn_id = ?, updated_at = ? WHERE thread_id = ?", params![required_str(payload,"turnId")?, event.event.occurred_at, required_str(payload,"threadId")?])?;
@@ -5955,13 +6615,14 @@ fn apply_messages_projector_tx(
         return Ok(());
     }
     transaction.execute(
-        "INSERT INTO projection_thread_messages (message_id, thread_id, turn_id, role, text, attachments_json, is_streaming, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
+        "INSERT INTO projection_thread_messages (message_id, thread_id, turn_id, role, text, attachments_json, is_streaming, created_at, updated_at, resend_of_message_id) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT (message_id) DO UPDATE SET \
            thread_id = excluded.thread_id, turn_id = excluded.turn_id, role = excluded.role, \
            text = CASE WHEN excluded.is_streaming = 1 THEN projection_thread_messages.text || excluded.text WHEN excluded.text = '' THEN projection_thread_messages.text ELSE excluded.text END, \
            attachments_json = COALESCE(excluded.attachments_json, projection_thread_messages.attachments_json), \
-           is_streaming = excluded.is_streaming, updated_at = excluded.updated_at",
+           is_streaming = excluded.is_streaming, updated_at = excluded.updated_at, \
+           resend_of_message_id = COALESCE(excluded.resend_of_message_id, projection_thread_messages.resend_of_message_id)",
         params![
             required_str(payload, "messageId")?,
             required_str(payload, "threadId")?,
@@ -5972,6 +6633,7 @@ fn apply_messages_projector_tx(
             payload.get("streaming").and_then(Value::as_bool).unwrap_or(false),
             required_str(payload, "createdAt")?,
             required_str(payload, "updatedAt")?,
+            optional_string(payload.get("resendOf")),
         ],
     )?;
     Ok(())
@@ -6201,7 +6863,40 @@ fn apply_turns_projector_tx(
             let thread_id = required_str(payload, "threadId")?;
             let status = required_str(session, "status")?;
             let updated_at = required_str(session, "updatedAt")?;
-            if status == "running" {
+            // A compaction's own turn: a row of its own that neither binds nor deletes the
+            // marker of a message waiting behind it, which keeps it for its own turn.
+            let compaction_turn = payload
+                .get("compactionId")
+                .and_then(Value::as_str)
+                .is_some();
+            if status == "running"
+                && compaction_turn
+                && let Some(turn_id) = optional_string(session.get("activeTurnId"))
+            {
+                transaction.execute("UPDATE projection_turns SET state = 'completed', completed_at = ? WHERE thread_id = ? AND turn_id IS NOT NULL AND turn_id <> ? AND state = 'running'", params![updated_at, thread_id, turn_id])?;
+                let updated = transaction.execute("UPDATE projection_turns SET state = 'running', started_at = COALESCE(started_at, ?) WHERE thread_id = ? AND turn_id = ?", params![updated_at, thread_id, turn_id])?;
+                if updated == 0 {
+                    transaction.execute(
+                        TURN_UPSERT_SQL,
+                        params![
+                            thread_id,
+                            turn_id,
+                            Option::<String>::None,
+                            Option::<String>::None,
+                            Option::<String>::None,
+                            Option::<String>::None,
+                            "running",
+                            updated_at,
+                            Some(updated_at.clone()),
+                            Option::<String>::None,
+                            Option::<i64>::None,
+                            Option::<String>::None,
+                            Option::<String>::None,
+                            "[]"
+                        ],
+                    )?;
+                }
+            } else if status == "running" {
                 if let Some(turn_id) = optional_string(session.get("activeTurnId")) {
                     transaction.execute("UPDATE projection_turns SET state = 'completed', completed_at = ? WHERE thread_id = ? AND turn_id IS NOT NULL AND turn_id <> ? AND state = 'running'", params![updated_at, thread_id, turn_id])?;
                     let existing_turn = transaction
@@ -6834,6 +7529,8 @@ impl OrchestrationCommand {
             Self::ThreadTurnDiffComplete { .. } => "thread.turn.diff.complete",
             Self::ThreadActivityAppend { .. } => "thread.activity.append",
             Self::ThreadRevertComplete { .. } => "thread.revert.complete",
+            Self::ThreadCompact { .. } => "thread.compact",
+            Self::ThreadCompactionSettle { .. } => "thread.compaction.settle",
         }
     }
 
@@ -6869,7 +7566,9 @@ impl OrchestrationCommand {
             | Self::ThreadProposedPlanUpsert { command_id, .. }
             | Self::ThreadTurnDiffComplete { command_id, .. }
             | Self::ThreadActivityAppend { command_id, .. }
-            | Self::ThreadRevertComplete { command_id, .. } => command_id,
+            | Self::ThreadRevertComplete { command_id, .. }
+            | Self::ThreadCompact { command_id, .. }
+            | Self::ThreadCompactionSettle { command_id, .. } => command_id,
         }
     }
 
@@ -6905,7 +7604,9 @@ impl OrchestrationCommand {
             | Self::ThreadProposedPlanUpsert { created_at, .. }
             | Self::ThreadTurnDiffComplete { created_at, .. }
             | Self::ThreadActivityAppend { created_at, .. }
-            | Self::ThreadRevertComplete { created_at, .. } => Some(created_at),
+            | Self::ThreadRevertComplete { created_at, .. }
+            | Self::ThreadCompact { created_at, .. }
+            | Self::ThreadCompactionSettle { created_at, .. } => Some(created_at),
         }
     }
 
@@ -6941,7 +7642,9 @@ impl OrchestrationCommand {
             | Self::ThreadProposedPlanUpsert { thread_id, .. }
             | Self::ThreadTurnDiffComplete { thread_id, .. }
             | Self::ThreadActivityAppend { thread_id, .. }
-            | Self::ThreadRevertComplete { thread_id, .. } => ("thread", thread_id),
+            | Self::ThreadRevertComplete { thread_id, .. }
+            | Self::ThreadCompact { thread_id, .. }
+            | Self::ThreadCompactionSettle { thread_id, .. } => ("thread", thread_id),
         }
     }
 
@@ -6954,6 +7657,19 @@ impl OrchestrationCommand {
                 | Self::WorktreeDetachResolved { .. }
                 | Self::WorktreeBranchReconcileResolved { .. }
                 | Self::ThreadHistoryImport { .. }
+                | Self::ThreadCompactionSettle { .. }
+        ) || matches!(
+            self,
+            Self::ThreadCompact {
+                guarded_delivery_command_id: Some(_),
+                ..
+            } | Self::ThreadSessionSet {
+                compaction_id: Some(_),
+                ..
+            } | Self::ThreadSessionSet {
+                context_limit: Some(_),
+                ..
+            }
         )
     }
 }
