@@ -1267,6 +1267,35 @@ describe("DevicePanel with iOS simulators", () => {
     expect(h.calls.filter((call) => call.command === "input")).toHaveLength(1);
   });
 
+  it("works for a thread's root, so a device its host started is its own", async () => {
+    // A thread whose root is another thread, as a chat panel's is its host.
+    const panelRef = scopeThreadRef(ENVIRONMENT_ID, ThreadId.make("thread-panel"));
+    useRightPanelStore.getState().open(panelRef, "device");
+    withCatalog(catalog({ images: [PIXEL, TABLET], devices: [snapshot({ deviceId: "host" })] }));
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    mounted.push({ root, container });
+    await act(async () => {
+      root.render(<DevicePanel threadRef={panelRef} rootThreadId={THREAD_ID} />);
+    });
+    expect(h.screens.at(-1)).toMatchObject({ deviceId: "host" });
+    expect(container.querySelector("[data-device-owner]")).toBeNull();
+    expect(option(container, /^Pixel 8/).textContent).toBe("Pixel 8 — Running here");
+    await click(option(container, "Tablet"));
+    await click(button(container, "Start"));
+    expect(h.calls.at(-1)).toEqual({
+      command: "open",
+      input: {
+        environmentId: ENVIRONMENT_ID,
+        input: { platform: "android", imageId: "Tablet", threadId: THREAD_ID },
+      },
+    });
+    // The pick is the thread's own, not its root's.
+    expect(storedPick(panelRef)).toEqual({ platform: "android", imageId: "Tablet" });
+    expect(storedPick(THREAD_REF)).toBeNull();
+  });
+
   it("shows each thread's own device when switching threads (#170)", async () => {
     const platforms = [platform("android", "ready", "Ready.", [PIXEL, TABLET])];
     withCatalog(
@@ -1747,7 +1776,6 @@ describe("device selection helpers", () => {
       platform: "ios",
       imageId: "UDID-1",
     });
-    // A device the thread's chat panel started is the host's, so it counts for the host.
     // 3. Else its newest ended device, so its failure stays in view.
     const ended = catalog({
       platforms,
