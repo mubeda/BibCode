@@ -133,6 +133,121 @@ export type TimelineLatestTurn = Pick<
   "turnId" | "state" | "startedAt" | "completedAt"
 >;
 
+/**
+ * An entry's own open or closed choices, by key: its tool row, its long body, its plan, and
+ * each `<details>` block in its Markdown. A key with no choice keeps the default.
+ */
+export type EntryDisclosure = ReadonlyMap<string, boolean>;
+
+export const TOOL_ROW_DISCLOSURE_KEY = "tool";
+export const MESSAGE_BODY_DISCLOSURE_KEY = "body";
+export const PROPOSED_PLAN_DISCLOSURE_KEY = "plan";
+
+export function detailsDisclosureKey(scope: string, ordinal: number): string {
+  return `details:${scope}:${ordinal}`;
+}
+
+const NO_DETAILS_OPEN: ReadonlyMap<number, boolean> = new Map();
+const detailsOpenByDisclosure = new WeakMap<
+  EntryDisclosure,
+  Map<string, ReadonlyMap<number, boolean>>
+>();
+
+/**
+ * The open state of one Markdown part's `<details>` blocks, by ordinal. The same disclosure
+ * and scope always give the same map, so a memoized `ChatMarkdown` keeps its props.
+ */
+export function detailsOpenForScope(
+  disclosure: EntryDisclosure | undefined,
+  scope: string,
+): ReadonlyMap<number, boolean> {
+  if (!disclosure) return NO_DETAILS_OPEN;
+  let byScope = detailsOpenByDisclosure.get(disclosure);
+  if (!byScope) {
+    byScope = new Map();
+    detailsOpenByDisclosure.set(disclosure, byScope);
+  }
+  const cached = byScope.get(scope);
+  if (cached) return cached;
+  const prefix = `details:${scope}:`;
+  const open = new Map<number, boolean>();
+  for (const [key, value] of disclosure) {
+    if (!key.startsWith(prefix)) continue;
+    const ordinal = Number(key.slice(prefix.length));
+    if (Number.isSafeInteger(ordinal)) open.set(ordinal, value);
+  }
+  const result = open.size > 0 ? open : NO_DETAILS_OPEN;
+  byScope.set(scope, result);
+  return result;
+}
+
+/**
+ * Every open or closed choice in one timeline: turn folds, long work groups, and each entry's
+ * own disclosures. One owner holds them, so a find reveal and the reader's own toggle write the
+ * same state, and a row keeps its choice when the list unmounts and remounts it.
+ */
+export interface TimelineDisclosures {
+  readonly turns: ReadonlyMap<TurnId, boolean>;
+  readonly groups: ReadonlyMap<string, boolean>;
+  readonly entries: ReadonlyMap<string, EntryDisclosure>;
+}
+
+export const EMPTY_TIMELINE_DISCLOSURES: TimelineDisclosures = {
+  turns: new Map(),
+  groups: new Map(),
+  entries: new Map(),
+};
+
+export interface TimelineDisclosureChange {
+  readonly turns?: ReadonlyArray<readonly [TurnId, boolean]>;
+  readonly groups?: ReadonlyArray<readonly [string, boolean]>;
+  /** `[entryId, key, open]`. */
+  readonly entries?: ReadonlyArray<readonly [string, string, boolean]>;
+}
+
+function withChoices<K>(
+  current: ReadonlyMap<K, boolean>,
+  choices: ReadonlyArray<readonly [K, boolean]> | undefined,
+): ReadonlyMap<K, boolean> {
+  if (!choices || choices.every(([key, value]) => current.get(key) === value)) return current;
+  const next = new Map(current);
+  for (const [key, value] of choices) next.set(key, value);
+  return next;
+}
+
+/**
+ * Applies a change, keeping every map it does not touch, so only the rows whose disclosures
+ * changed get new row objects. Returns `current` when nothing changes.
+ */
+export function applyTimelineDisclosureChange(
+  current: TimelineDisclosures,
+  change: TimelineDisclosureChange,
+): TimelineDisclosures {
+  const turns = withChoices(current.turns, change.turns);
+  const groups = withChoices(current.groups, change.groups);
+  let entries = current.entries;
+  if (change.entries && change.entries.length > 0) {
+    const byEntry = new Map<string, Array<readonly [string, boolean]>>();
+    for (const [entryId, key, open] of change.entries) {
+      const list = byEntry.get(entryId) ?? [];
+      list.push([key, open]);
+      byEntry.set(entryId, list);
+    }
+    let nextEntries: Map<string, EntryDisclosure> | null = null;
+    for (const [entryId, choices] of byEntry) {
+      const existing = current.entries.get(entryId) ?? new Map<string, boolean>();
+      const updated = withChoices(existing, choices);
+      if (updated === existing && current.entries.has(entryId)) continue;
+      nextEntries ??= new Map(current.entries);
+      nextEntries.set(entryId, updated);
+    }
+    if (nextEntries) entries = nextEntries;
+  }
+  return turns === current.turns && groups === current.groups && entries === current.entries
+    ? current
+    : { turns, groups, entries };
+}
+
 export type MessagesTimelineRow =
   | {
       kind: "queued-message";
@@ -141,12 +256,15 @@ export type MessagesTimelineRow =
       message: ChatMessage;
       isHead: boolean;
       status: QueuedCardStatus;
+      disclosure: EntryDisclosure | undefined;
     }
   | {
       kind: "work";
       id: string;
       createdAt: string;
       groupedEntries: WorkLogEntry[];
+      /** Whether the row's tool call shows its command and output. */
+      expanded: boolean;
     }
   | {
       kind: "work-toggle";
@@ -176,12 +294,14 @@ export type MessagesTimelineRow =
       assistantCopyStreaming: boolean;
       assistantTurnDiffSummary?: TurnDiffSummary | undefined;
       revertTurnCount?: number | undefined;
+      disclosure: EntryDisclosure | undefined;
     }
   | {
       kind: "proposed-plan";
       id: string;
       createdAt: string;
       proposedPlan: ProposedPlan;
+      disclosure: EntryDisclosure | undefined;
     }
   | {
       kind: "working";
@@ -223,6 +343,25 @@ export function computeMessageDurationStart(
 
 export function normalizeCompactToolLabel(value: string): string {
   return value.replace(/\s+(?:complete|completed)\s*$/i, "").trim();
+}
+
+function workEntryRawCommand(
+  workEntry: Pick<WorkLogEntry, "command" | "rawCommand">,
+): string | null {
+  const rawCommand = workEntry.rawCommand?.trim();
+  if (!rawCommand || !workEntry.command) {
+    return null;
+  }
+  return rawCommand === workEntry.command.trim() ? null : rawCommand;
+}
+
+/** The command a tool row shows when expanded: the raw command when it differs. */
+export function toolCallDisplayedCommand(
+  workEntry: Pick<WorkLogEntry, "command" | "rawCommand">,
+): string | null {
+  const raw = workEntryRawCommand(workEntry);
+  if (raw) return raw;
+  return workEntry.command?.trim() || null;
 }
 
 export function resolveAssistantMessageCopyState({
@@ -713,6 +852,8 @@ export function deriveMessagesTimelineRows(
     activeTurnStartedAt: string | null;
     turnDiffSummaryByAssistantMessageId: ReadonlyMap<MessageId, TurnDiffSummary>;
     revertTurnCountByUserMessageId: ReadonlyMap<MessageId, number>;
+    /** Each entry's own disclosure choices, by entry id (a tool row's work entry id). */
+    entryDisclosures?: ReadonlyMap<string, EntryDisclosure>;
   },
 ): MessagesTimelineRow[] {
   const { timelineEntries, unsettledTurnId, turnFolds } = deriveTimelineLayout(input);
@@ -724,6 +865,12 @@ export function deriveMessagesTimelineRows(
   const { answerMessageIds, foldsByAnchorEntryId } = turnFolds;
   const isTurnExpanded = (turnId: TurnId) => isTurnFoldExpanded(input, turnId);
   const collapsedEntryIds = collectCollapsedEntryIds(turnFolds, isTurnExpanded);
+  const disclosureOf = (entryId: string) => input.entryDisclosures?.get(entryId);
+  // The user's choice wins; until they make one, Verbose chat opens tool rows outside the
+  // running turn.
+  const isToolRowExpanded = (entry: WorkLogEntry) =>
+    disclosureOf(entry.id)?.get(TOOL_ROW_DISCLOSURE_KEY) ??
+    (input.verboseChat === true && !isWorkEntryInUnsettledTurn(entry, unsettledTurnId));
 
   for (let index = 0; index < timelineEntries.length; index += 1) {
     const timelineEntry = timelineEntries[index];
@@ -764,6 +911,7 @@ export function deriveMessagesTimelineRows(
             id: timelineEntry.id,
             createdAt: timelineEntry.createdAt,
             groupedEntries: visibleGroupedEntries,
+            expanded: visibleGroupedEntries.some(isToolRowExpanded),
           });
         } else {
           const groupId = workGroupId(timelineEntry.id);
@@ -783,6 +931,7 @@ export function deriveMessagesTimelineRows(
               id: workEntry.id,
               createdAt: workEntry.createdAt,
               groupedEntries: [workEntry],
+              expanded: isToolRowExpanded(workEntry),
             });
           }
 
@@ -807,6 +956,7 @@ export function deriveMessagesTimelineRows(
         id: timelineEntry.id,
         createdAt: timelineEntry.createdAt,
         proposedPlan: timelineEntry.proposedPlan,
+        disclosure: disclosureOf(timelineEntry.id),
       });
       continue;
     }
@@ -845,6 +995,7 @@ export function deriveMessagesTimelineRows(
         timelineEntry.message.role === "user"
           ? input.revertTurnCountByUserMessageId.get(timelineEntry.message.id)
           : undefined,
+      disclosure: disclosureOf(timelineEntry.id),
     });
   }
 
@@ -870,13 +1021,15 @@ export function deriveMessagesTimelineRows(
   for (const [index, message] of (input.queuedMessages ?? []).entries()) {
     const status = input.queuedStatuses?.[index];
     if (!status) continue;
+    const rowId = queuedMessageRowId(message.id);
     nextRows.push({
       kind: "queued-message",
-      id: queuedMessageRowId(message.id),
+      id: rowId,
       createdAt: message.createdAt,
       message,
       isHead: index === 0,
       status,
+      disclosure: disclosureOf(rowId),
     });
   }
   return nextRows;
@@ -910,7 +1063,10 @@ function isRowUnchanged(a: MessagesTimelineRow, b: MessagesTimelineRow): boolean
     case "queued-message": {
       const bq = b as typeof a;
       return (
-        a.message === bq.message && a.isHead === bq.isHead && Equal.equals(a.status, bq.status)
+        a.message === bq.message &&
+        a.isHead === bq.isHead &&
+        Equal.equals(a.status, bq.status) &&
+        a.disclosure === bq.disclosure
       );
     }
     case "working": {
@@ -923,11 +1079,15 @@ function isRowUnchanged(a: MessagesTimelineRow, b: MessagesTimelineRow): boolean
       return a.createdAt === bf.createdAt && a.label === bf.label && a.expanded === bf.expanded;
     }
 
-    case "proposed-plan":
-      return a.proposedPlan === (b as typeof a).proposedPlan;
+    case "proposed-plan": {
+      const bp = b as typeof a;
+      return a.proposedPlan === bp.proposedPlan && a.disclosure === bp.disclosure;
+    }
 
-    case "work":
-      return Equal.equals(a.groupedEntries, (b as typeof a).groupedEntries);
+    case "work": {
+      const bw = b as typeof a;
+      return a.expanded === bw.expanded && Equal.equals(a.groupedEntries, bw.groupedEntries);
+    }
 
     case "work-toggle": {
       const bw = b as typeof a;
@@ -949,7 +1109,8 @@ function isRowUnchanged(a: MessagesTimelineRow, b: MessagesTimelineRow): boolean
         a.showAssistantCopyButton === bm.showAssistantCopyButton &&
         a.assistantCopyStreaming === bm.assistantCopyStreaming &&
         a.assistantTurnDiffSummary === bm.assistantTurnDiffSummary &&
-        a.revertTurnCount === bm.revertTurnCount
+        a.revertTurnCount === bm.revertTurnCount &&
+        a.disclosure === bm.disclosure
       );
     }
   }

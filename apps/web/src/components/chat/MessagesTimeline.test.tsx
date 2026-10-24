@@ -2496,3 +2496,99 @@ it("renders the queue through the shared user body renderer exactly once after w
     markup.indexOf('data-timeline-row-kind="queued-message"'),
   );
 });
+
+describe("MessagesTimeline disclosure owner", () => {
+  async function remount(
+    container: HTMLElement,
+    entries: MessagesTimelineProps["timelineEntries"],
+  ): Promise<void> {
+    const MessagesTimeline = await loadMessagesTimeline();
+    const mounted = mountedTrees.find((tree) => tree.container === container)!;
+    const render = (timelineEntries: MessagesTimelineProps["timelineEntries"]) =>
+      act(async () =>
+        mounted.root.render(
+          <MessagesTimeline {...buildProps()} timelineEntries={timelineEntries} />,
+        ),
+      );
+    // LegendList unmounts a row that leaves its render window, and mounts it again on return.
+    await render([]);
+    await render(entries);
+  }
+
+  it("keeps a long message open after its row remounts", async () => {
+    const entries = [buildUserTimelineEntry(buildLongUserMessageText())];
+    const container = await mountTimeline({ timelineEntries: entries });
+    const showFull = () =>
+      Array.from(container.querySelectorAll<HTMLButtonElement>("button")).find((button) =>
+        /Show (full message|less)/.test(button.textContent ?? ""),
+      );
+    await click(showFull()!);
+    expect(showFull()?.textContent).toBe("Show less");
+
+    await remount(container, entries);
+
+    expect(showFull()?.textContent).toBe("Show less");
+    expect(
+      container
+        .querySelector("[data-user-message-body]")
+        ?.getAttribute("data-user-message-collapsed"),
+    ).toBe("false");
+  });
+
+  it("keeps a details block the reader opened after its row remounts", async () => {
+    const entries = [
+      buildAssistantTimelineEntry({
+        id: "entry-details",
+        messageId: "message-details",
+        text: "<details>\n<summary>More</summary>\n\nHidden body\n\n</details>",
+      }),
+    ];
+    const container = await mountTimeline({ timelineEntries: entries });
+    const isOpen = () =>
+      container.querySelector<HTMLElement>("[data-markdown-details]")?.dataset.markdownDetailsOpen;
+    await click(container.querySelector<HTMLElement>("[data-markdown-details-summary]")!);
+    expect(isOpen()).toBe("true");
+
+    await remount(container, entries);
+
+    expect(isOpen()).toBe("true");
+  });
+
+  it("marks each searchable text as a find scope", async () => {
+    const container = await mountTimeline({
+      verboseChat: true,
+      timelineEntries: [
+        buildUserTimelineEntry("Run the build"),
+        buildAssistantTimelineEntry({
+          id: "entry-answer",
+          messageId: "message-answer",
+          text: "Built **fine**.",
+        }),
+        buildAssistantTimelineEntry({
+          id: "entry-empty",
+          messageId: "message-empty",
+          text: "",
+          createdAt: "2026-03-17T19:12:34.000Z",
+        }),
+        buildWorkTimelineEntry("entry-tool", {
+          command: "npm run build",
+          detail: "build output",
+        }),
+      ],
+    });
+    const scopeIn = (rowId: string) =>
+      [...container.querySelectorAll(`[data-timeline-row-id="${rowId}"] [data-find-scope]`)].map(
+        (element) => [element.getAttribute("data-find-scope"), element.textContent],
+      );
+
+    expect(scopeIn("entry-1")).toEqual([["md:0", "Run the build"]]);
+    expect(scopeIn("entry-answer")).toEqual([["md:0", "Built fine."]]);
+    // The placeholder for an empty reply is not searchable.
+    expect(scopeIn("entry-empty")).toEqual([]);
+    // Only the command, not its output, is the tool row's scope.
+    expect(scopeIn("entry-tool")).toEqual([["command", "npm run build"]]);
+    expect(container.querySelector('[data-timeline-row-id="entry-tool"] pre')?.textContent).toBe(
+      "npm run build\n\nbuild output",
+    );
+  });
+});
