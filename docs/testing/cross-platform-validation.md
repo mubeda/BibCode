@@ -2716,8 +2716,9 @@ sizes. Cover relevant:
   selected one is distinct in light and dark; on an engine without
   `CSS.highlights` the selected row is outlined instead; open find in a chat
   panel while the host chat's is open and confirm the host's closes; choose
-  **Find in thread** in the command palette and type at once into the bar;
-  press Esc and confirm focus returns to the composer and the timeline does not
+  **Find in thread** in the command palette and type at once into the bar; with
+  a chat panel active over the host chat in the same tab group, choose it again
+  and confirm the bar opens in the panel chat; press Esc and confirm focus returns to the composer and the timeline does not
   move; confirm Mod+F in the right-panel file editor still opens its own search;
   disconnect the server and confirm the status adds **may be out of date**; on
   Windows, confirm Ctrl+F, F3, and Ctrl+G open no native WebView2 find bar;
