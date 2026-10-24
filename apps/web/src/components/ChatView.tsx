@@ -6992,7 +6992,9 @@ function ChatViewContent(props: ChatViewProps) {
                     ) : null}
                     {/* Messages — LegendList handles virtualization and scrolling internally */}
                     <MessagesTimeline
-                      key={activeThread.id}
+                      // Scoped, so the same thread id in another environment starts over,
+                      // find state included.
+                      key={routeThreadKey}
                       isWorking={isWorking}
                       activeTurnInProgress={isWorking || !latestTurnSettled}
                       activeTurnStartedAt={activeWorkStartedAt}
