@@ -60,6 +60,7 @@ packageExtensionsChecksum: sha256-B7gVjj04yuWO70MDa3LR6DCgtOz8EM0rWLyqGc05fVs=
 
 patchedDependencies:
   '@effect/vitest@4.0.2': 510a9764a03c38f3d2ec356c2868cfdea4d340565c4157d7a2d18c86cfa8109e
+  '@pierre/diffs@1.3.6': 510d2b163c685521df009466242f7216dd3adf83c4a3a036bcf8c4d010b996db
   '@pierre/trees@1.0.0-beta.6': 75562d12ce44a072f41e3043b97c1c1df24b1777c06065cb0d9f85ca37183c69
   '@wdio/tauri-plugin@1.2.0': 2547396d2661c317237f202ae58f2bef480d23831ea594bbdbf7608518160fe1
   effect@4.0.2: 55f987759413183fb661bd20b8ca555d1b5cefa1dc907b33be7d14bdd2bf96f2
@@ -184,7 +185,7 @@ importers:
         version: 0.50.0(react-dom@19.2.8(react@19.2.8))(react@19.2.8)(typescript@7.0.2)(yjs@13.6.33)
       '@pierre/diffs':
         specifier: 'catalog:'
-        version: 1.3.6(@shikijs/themes@4.5.0)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
+        version: 1.3.6(patch_hash=510d2b163c685521df009466242f7216dd3adf83c4a3a036bcf8c4d010b996db)(@shikijs/themes@4.5.0)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
       '@pierre/trees':
         specifier: 1.0.0-beta.6
         version: 1.0.0-beta.6(patch_hash=75562d12ce44a072f41e3043b97c1c1df24b1777c06065cb0d9f85ca37183c69)(@pierre/theme@2.0.0)(@shikijs/themes@4.5.0)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)(shiki@4.5.0)
@@ -9449,7 +9450,7 @@ snapshots:
 
   '@oxlint/plugins@1.79.0': {}
 
-  '@pierre/diffs@1.3.6(@shikijs/themes@4.5.0)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)':
+  '@pierre/diffs@1.3.6(patch_hash=510d2b163c685521df009466242f7216dd3adf83c4a3a036bcf8c4d010b996db)(@shikijs/themes@4.5.0)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)':
     dependencies:
       '@pierre/theme': 2.0.0
       '@pierre/theming': 1.0.1(@pierre/theme@2.0.0)(@shikijs/themes@4.5.0)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)(shiki@4.5.0)

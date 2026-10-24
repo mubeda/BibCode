@@ -2688,6 +2688,25 @@ sizes. Cover relevant:
   visible **Refreshing…** state and repeated-request coalescing; on Windows,
   cover a WSL-hosted workspace as well as a native one, because
   directory-timestamp fidelity differs across that boundary;
+- Files open-file disk changes, with a file open in the right-panel editor and
+  edited from outside BiBCode (another editor, a shell `printf … > file`, or an
+  agent turn): a tab with no unsaved edits shows the new text within a few
+  seconds, keeps a caret placed on an unchanged part of a changed line, and
+  Undo brings the old text back as unsaved; a tab with unsaved edits keeps them
+  and shows **Changed on disk.** with **Reload from disk** and **Overwrite
+  disk**, Save disabled with its reason, and no write from Ctrl/Cmd+S, a tab
+  switch, or closing and reopening the tab; **Overwrite disk** writes the edits
+  and **Reload from disk** takes the disk text (asking first in the rendered
+  Markdown view); delete the open file and verify **Deleted on disk.**; make
+  an unsaved edit, change the file outside BiBCode, and at once switch to
+  another right-panel tab: whether the poll or that switch's save runs first,
+  the disk keeps the outside change and the file's tab shows the amber dot;
+  with unsaved edits, grow the file past 1 MB from outside, then reopen its tab
+  after 30 s or reconnect the environment: the edits and **Overwrite disk** stay
+  and the 1 MB preview does not replace them; change the file while the
+  environment is disconnected and verify the tab reconciles as soon as it
+  reconnects. On Windows, repeat the clean-tab reload with a WSL-hosted
+  workspace on a Windows path, where read latency sets the poll's cost;
 - Files path-kind changes: replace a file with a directory containing nested
   entries while the tree is open, then select a descendant and replace its
   directory with a file. Exercise automatic refresh and **Refresh**; neither

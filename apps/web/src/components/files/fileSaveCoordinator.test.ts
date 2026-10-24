@@ -623,4 +623,98 @@ describe("FileSaveCoordinator", () => {
     expect(persist).toHaveBeenCalledOnce();
     expect(persist).toHaveBeenCalledWith("unsaved");
   });
+
+  describe("disk reconciliation", () => {
+    const createCoordinator = () => {
+      const persist = vi
+        .fn<(contents: string) => Promise<AtomCommandResult<void, never>>>()
+        .mockResolvedValue(AsyncResult.success(undefined));
+      const onPendingChange = vi.fn();
+      const onConfirmed = vi.fn();
+      const coordinator = new FileSaveCoordinator({
+        debounceMs: 500,
+        persist,
+        onPendingChange,
+        onConfirmed,
+      });
+      return { coordinator, persist, onPendingChange, onConfirmed };
+    };
+
+    it("adopts disk contents as saved without writing them", async () => {
+      vi.useFakeTimers();
+      const { coordinator, persist, onPendingChange, onConfirmed } = createCoordinator();
+
+      coordinator.change("typed");
+      coordinator.adopt("from disk");
+
+      expect(coordinator.getLatestContents()).toBe("from disk");
+      expect(coordinator.hasPendingWork()).toBe(false);
+      expect(coordinator.getSnapshot()).toMatchObject({ phase: "clean", canSave: false });
+      expect(onPendingChange).toHaveBeenLastCalledWith(false);
+      await expect(coordinator.flush()).resolves.toBe("unchanged");
+      await vi.runAllTimersAsync();
+      expect(persist).not.toHaveBeenCalled();
+      expect(onConfirmed).not.toHaveBeenCalled();
+    });
+
+    it("blocks every write path while a conflict holds it", async () => {
+      vi.useFakeTimers();
+      const { coordinator, persist } = createCoordinator();
+
+      coordinator.change("unsaved");
+      coordinator.holdForConflict();
+
+      expect(coordinator.getSnapshot().canSave).toBe(false);
+      await vi.runAllTimersAsync();
+      await expect(coordinator.flush()).resolves.toBe("failed");
+      await expect(coordinator.settle()).resolves.toBe("failed");
+      coordinator.pauseSaving();
+      coordinator.resumeSaving();
+      coordinator.setAutosaveEnabled(false);
+      coordinator.setAutosaveEnabled(true);
+      coordinator.change("more typing");
+      await vi.runAllTimersAsync();
+      coordinator.dispose();
+      await vi.runAllTimersAsync();
+      expect(persist).not.toHaveBeenCalled();
+    });
+
+    it("settles a clean held coordinator as unchanged", async () => {
+      const { coordinator } = createCoordinator();
+      coordinator.holdForConflict();
+      await expect(coordinator.settle()).resolves.toBe("unchanged");
+    });
+
+    it("resumes autosave once the conflict is released", async () => {
+      vi.useFakeTimers();
+      const { coordinator, persist } = createCoordinator();
+
+      coordinator.change("unsaved");
+      coordinator.holdForConflict();
+      await vi.runAllTimersAsync();
+      coordinator.releaseConflict();
+      expect(coordinator.getSnapshot().canSave).toBe(true);
+      await vi.runAllTimersAsync();
+
+      expect(persist).toHaveBeenCalledOnce();
+      expect(persist).toHaveBeenCalledWith("unsaved");
+    });
+
+    it("does not reschedule edits made during a save that ends in a conflict", async () => {
+      vi.useFakeTimers();
+      const { coordinator, persist } = createCoordinator();
+      const save = deferred();
+      persist.mockReturnValueOnce(save.promise);
+
+      coordinator.change("first");
+      await vi.advanceTimersByTimeAsync(500);
+      expect(persist).toHaveBeenCalledOnce();
+      coordinator.change("typed while saving");
+      coordinator.holdForConflict();
+      save.resolve(AsyncResult.failure(Cause.fail(undefined as never)));
+      await vi.runAllTimersAsync();
+
+      expect(persist).toHaveBeenCalledOnce();
+    });
+  });
 });

@@ -147,6 +147,33 @@ describe("FileEditorToolbar", () => {
     expect(container.textContent).not.toContain("Saved");
   });
 
+  it("disables Save with the conflict's reason and does not offer a retry", () => {
+    const onSave = vi.fn();
+    act(() => {
+      root.render(
+        <FileEditorToolbar
+          savePhase="failed"
+          confirmedRevision={0}
+          canSave
+          canUndo={false}
+          canRedo={false}
+          cleanStatus={null}
+          saveBlockedReason="Changed on disk. Choose Reload from disk or Overwrite disk."
+          onSave={onSave}
+          onUndo={vi.fn()}
+          onRedo={vi.fn()}
+        />,
+      );
+    });
+
+    const save = container.querySelector<HTMLButtonElement>('button[aria-label="Save file"]')!;
+    expect(save.disabled).toBe(true);
+    save.click();
+    expect(onSave).not.toHaveBeenCalled();
+    expect(container.textContent).toContain("Unsaved changes");
+    expect(container.textContent).not.toContain("Save failed");
+  });
+
   it("still clears Saved when another file with a lower revision opens during it", () => {
     vi.useFakeTimers();
     const render = (confirmedRevision: number) => {

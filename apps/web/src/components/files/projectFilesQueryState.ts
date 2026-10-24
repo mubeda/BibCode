@@ -47,11 +47,17 @@ export function getProjectFileQueryAtom(
   });
 }
 
+/**
+ * Shows `contents` for the file before the server confirms it. Pass the `version` a guarded save
+ * committed: a session created from this data guards its saves with it, and one without a
+ * version would save unguarded.
+ */
 export function setProjectFileQueryData(
   environmentId: EnvironmentId,
   cwd: string,
   relativePath: string,
   contents: string,
+  version?: string,
 ): void {
   appAtomRegistry.set(optimisticFileAtom(environmentId, cwd, relativePath), {
     confirmedAgainst: undefined,
@@ -60,6 +66,7 @@ export function setProjectFileQueryData(
       contents,
       byteLength: new TextEncoder().encode(contents).byteLength,
       truncated: false,
+      ...(version === undefined ? {} : { version }),
     },
   });
 }
@@ -108,6 +115,26 @@ export function resolveProjectFileQueryData(
 ): ProjectReadFileResult | null {
   if (relativePath === null) return data;
   return appAtomRegistry.get(optimisticFileAtom(environmentId, cwd, relativePath))?.data ?? data;
+}
+
+/**
+ * Reads the file from disk again through its query, so both the source and rendered views show
+ * what the read returned. Any optimistic overlay is cleared first: the views prefer it over the
+ * query, so a lingering one would hide the new read. Null when the read fails.
+ */
+export async function rereadProjectFile(
+  environmentId: EnvironmentId,
+  cwd: string,
+  relativePath: string,
+): Promise<ProjectReadFileResult | null> {
+  clearProjectFileQueryData(environmentId, cwd, relativePath);
+  const queryAtom = getProjectFileQueryAtom(environmentId, cwd, relativePath);
+  appAtomRegistry.refresh(queryAtom);
+  const result = await executeAtomQuery(appAtomRegistry, queryAtom, {
+    reportDefect: false,
+    reportFailure: false,
+  });
+  return result._tag === "Success" ? result.value : null;
 }
 
 export function clearProjectFileQueryData(
@@ -208,11 +235,20 @@ export function useFileTreeEntries(
   return query;
 }
 
+export interface ProjectFileQueryState extends ProjectQueryState<ProjectReadFileResult> {
+  /**
+   * What the disk held at the last read, or at the last save that reported its version: a session
+   * takes its base and its version capability from this, never from `data`. An optimistic draft
+   * without a version (a ticked task not yet saved) shows in `data` but says nothing about disk.
+   */
+  readonly disk: ProjectReadFileResult | null;
+}
+
 export function useProjectFileQuery(
   environmentId: EnvironmentId,
   cwd: string,
   relativePath: string | null,
-): ProjectQueryState<ProjectReadFileResult> {
+): ProjectFileQueryState {
   const atom = getProjectFileQueryAtom(environmentId, cwd, relativePath);
   const result = useAtomValue(atom);
   const refreshAtom = useAtomRefresh(atom);
@@ -225,6 +261,7 @@ export function useProjectFileQuery(
 
   return {
     data: optimisticFile?.data ?? data,
+    disk: optimisticFile?.data.version === undefined ? data : optimisticFile.data,
     error: errorMessage(result),
     isPending: result.waiting,
     refresh,

@@ -144,13 +144,45 @@ export const ProjectReadFileInput = Schema.Struct({
 });
 export type ProjectReadFileInput = typeof ProjectReadFileInput.Type;
 
+/** Lowercase hex SHA-256 of a file's bytes on disk. */
+const ProjectFileVersionHash = TrimmedNonEmptyString;
+
 export const ProjectReadFileResult = Schema.Struct({
   relativePath: TrimmedNonEmptyString,
   contents: Schema.String,
   byteLength: NonNegativeInt,
   truncated: Schema.Boolean,
+  /**
+   * Hash of the exact bytes returned. Absent from a server that predates guarded saves; a client
+   * then has no `projects.getFileVersion` or `projects.writeFileIfUnchanged` to use either.
+   */
+  version: Schema.optional(ProjectFileVersionHash),
 });
 export type ProjectReadFileResult = typeof ProjectReadFileResult.Type;
+
+export const ProjectGetFileVersionInput = Schema.Struct({
+  cwd: TrimmedNonEmptyString,
+  relativePath: TrimmedNonEmptyString.check(Schema.isMaxLength(PROJECT_READ_FILE_PATH_MAX_LENGTH)),
+});
+export type ProjectGetFileVersionInput = typeof ProjectGetFileVersionInput.Type;
+
+/** Why a file that exists can no longer be opened in the editor. */
+export const ProjectFileUnreadableFailure = Schema.Literals(["binary_file", "file_too_large"]);
+export type ProjectFileUnreadableFailure = typeof ProjectFileUnreadableFailure.Type;
+
+/**
+ * What is on disk at a path now. A `present` file's version matches the one `projects.readFile`
+ * returns for it; an `unreadable` one is hashed whole, so a save can be guarded against it.
+ */
+export const ProjectFileVersion = Schema.Union([
+  Schema.TaggedStruct("present", { version: ProjectFileVersionHash }),
+  Schema.TaggedStruct("missing", {}),
+  Schema.TaggedStruct("unreadable", {
+    failure: ProjectFileUnreadableFailure,
+    version: ProjectFileVersionHash,
+  }),
+]);
+export type ProjectFileVersion = typeof ProjectFileVersion.Type;
 
 export const ProjectFileFailure = Schema.Literals([
   "workspace_path_outside_root",
@@ -160,6 +192,8 @@ export const ProjectFileFailure = Schema.Literals([
   "entry_already_exists",
   "path_not_found",
   "operation_failed",
+  "file_changed_on_disk",
+  "file_missing_on_disk",
 ]);
 export type ProjectFileFailure = typeof ProjectFileFailure.Type;
 
@@ -226,6 +260,26 @@ export const ProjectWriteFileResult = Schema.Struct({
   relativePath: TrimmedNonEmptyString,
 });
 export type ProjectWriteFileResult = typeof ProjectWriteFileResult.Type;
+
+/** The disk state a guarded write's contents were based on. */
+export const ProjectWritePrecondition = Schema.Union([
+  Schema.TaggedStruct("version", { version: ProjectFileVersionHash }),
+  Schema.TaggedStruct("missing", {}),
+]);
+export type ProjectWritePrecondition = typeof ProjectWritePrecondition.Type;
+
+export const ProjectWriteFileIfUnchangedInput = Schema.Struct({
+  ...ProjectWriteFileInput.fields,
+  precondition: ProjectWritePrecondition,
+});
+export type ProjectWriteFileIfUnchangedInput = typeof ProjectWriteFileIfUnchangedInput.Type;
+
+export const ProjectWriteFileIfUnchangedResult = Schema.Struct({
+  relativePath: TrimmedNonEmptyString,
+  /** Hash of the bytes written: the new base for the next guarded write. */
+  version: ProjectFileVersionHash,
+});
+export type ProjectWriteFileIfUnchangedResult = typeof ProjectWriteFileIfUnchangedResult.Type;
 
 export class ProjectWriteFileError extends Schema.TaggedError<ProjectWriteFileError>()(
   "ProjectWriteFileError",

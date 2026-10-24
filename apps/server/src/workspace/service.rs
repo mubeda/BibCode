@@ -1,18 +1,23 @@
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io::Read;
-use std::path::Path;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 #[cfg(test)]
 use std::{future::Future, pin::Pin};
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use sha2::{Digest as _, Sha256};
+use tokio::sync::{Mutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
+
+use crate::crypto::{lowercase_hex, sha256_hex};
 
 use super::entries::{self, BrowseResult};
 use super::paths::{canonical_existing_within, resolve_relative, safe_mutation_target};
 use super::{EntryKind, WorkspaceError};
 
 const READ_LIMIT_BYTES: usize = 1024 * 1024;
+const VERSION_SCAN_CHUNK_BYTES: usize = 64 * 1024;
 const DUPLICATE_LIMIT: usize = 1000;
 const DEFAULT_MAX_CONCURRENT_OPERATIONS: usize = 32;
 
@@ -23,6 +28,11 @@ pub(crate) type WorkspaceWriteHookFuture<'a> =
 #[cfg(test)]
 pub(crate) trait WorkspaceWriteHook: Send + Sync {
     fn after_write<'a>(&'a self, target: &'a Path) -> WorkspaceWriteHookFuture<'a>;
+
+    /// Runs after a guarded write's precondition held and before it writes.
+    fn after_precondition_check<'a>(&'a self, _target: &'a Path) -> WorkspaceWriteHookFuture<'a> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -32,12 +42,155 @@ pub struct ReadFileResult {
     pub contents: String,
     pub byte_length: usize,
     pub truncated: bool,
+    /// Lowercase hex SHA-256 of the exact bytes returned, before lossy UTF-8 decoding.
+    pub version: String,
+}
+
+/// Why a file that exists can no longer be opened in the editor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnreadableFileFailure {
+    BinaryFile,
+    FileTooLarge,
+}
+
+/// What is on disk at a path now, as `projects.getFileVersion` reports it.
+///
+/// A file within the read limit has the version `read_file` returns for it. An unreadable one is
+/// hashed whole, so a save can still be guarded against exactly the state the user was shown.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "_tag", rename_all = "camelCase")]
+pub enum FileVersion {
+    Present {
+        version: String,
+    },
+    Missing,
+    Unreadable {
+        failure: UnreadableFileFailure,
+        version: String,
+    },
+}
+
+/// The disk state a guarded write was based on.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(tag = "_tag", rename_all = "camelCase")]
+pub enum WritePrecondition {
+    /// The file must exist and its whole content must hash to `version`.
+    Version { version: String },
+    /// Nothing may exist at the path.
+    Missing,
 }
 
 pub struct WriteFileOutcome {
     pub(crate) relative_path: String,
     pub(crate) path_set_changed: bool,
     pub(crate) index_classification_may_have_changed: bool,
+    /// Lowercase hex SHA-256 of the bytes written.
+    pub(crate) version: String,
+}
+
+/// A file's whole content as hashed in place, or its absence.
+enum ScannedFile {
+    Missing,
+    Present {
+        version: String,
+        byte_length: u64,
+        binary: bool,
+    },
+}
+
+/// Hashes a file's whole content in chunks, without holding it in memory.
+///
+/// `binary` matches `read_file`'s test: a NUL byte within the first read-limit bytes.
+fn scan_file_blocking(path: &Path) -> Result<ScannedFile, WorkspaceError> {
+    // Stat before opening, as `read_file` does: opening a named pipe with no writer for reading
+    // blocks, so a pipe put in place of the file would stall every check and guarded save.
+    match std::fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => {
+            return Err(WorkspaceError::NotFile {
+                path: path.to_path_buf(),
+            });
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ScannedFile::Missing);
+        }
+        Err(error) => return Err(WorkspaceError::operation("stat", path, error)),
+    }
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ScannedFile::Missing);
+        }
+        Err(error) => return Err(WorkspaceError::operation("open", path, error)),
+    };
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; VERSION_SCAN_CHUNK_BYTES];
+    let mut byte_length = 0_u64;
+    let mut binary = false;
+    loop {
+        let read = match file.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(WorkspaceError::operation("read", path, error)),
+        };
+        let chunk = &buffer[..read];
+        if !binary && byte_length < READ_LIMIT_BYTES as u64 {
+            let within_limit = (READ_LIMIT_BYTES as u64 - byte_length).min(read as u64) as usize;
+            binary = chunk[..within_limit].contains(&0);
+        }
+        hasher.update(chunk);
+        byte_length += read as u64;
+    }
+    Ok(ScannedFile::Present {
+        version: lowercase_hex(&hasher.finalize()),
+        byte_length,
+        binary,
+    })
+}
+
+async fn scan_file(path: PathBuf) -> Result<ScannedFile, WorkspaceError> {
+    let path_for_error = path.clone();
+    tokio::task::spawn_blocking(move || scan_file_blocking(&path))
+        .await
+        .map_err(|error| {
+            WorkspaceError::operation("read", path_for_error, std::io::Error::other(error))
+        })?
+}
+
+/// One lock per canonical file path, so a guarded write's check and write are atomic against
+/// every other write BiBCode makes to that file. Entries are dropped once nobody holds them.
+///
+/// Keys ignore case. An existing path canonicalizes to its on-disk spelling, but a missing one
+/// keeps the caller's, and on a case-insensitive volume (the default on Windows and macOS) two
+/// spellings name one file. Folding costs nothing on a case-sensitive volume beyond making
+/// writes to names that differ only in case wait for each other.
+#[derive(Clone, Default)]
+struct PathLocks {
+    locks: Arc<StdMutex<HashMap<String, Weak<Mutex<()>>>>>,
+}
+
+impl PathLocks {
+    async fn lock(&self, path: &Path) -> OwnedMutexGuard<()> {
+        let key = path.to_string_lossy().to_lowercase();
+        let lock = {
+            let mut locks = self
+                .locks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            match locks.get(&key).and_then(Weak::upgrade) {
+                Some(lock) => lock,
+                None => {
+                    let lock = Arc::new(Mutex::new(()));
+                    locks.insert(key, Arc::downgrade(&lock));
+                    lock
+                }
+            }
+        };
+        lock.lock_owned().await
+    }
 }
 
 fn write_may_change_index_classification(logical_path: &str, effective_target: &Path) -> bool {
@@ -55,6 +208,7 @@ fn write_may_change_index_classification(logical_path: &str, effective_target: &
 #[derive(Clone)]
 pub struct WorkspaceService {
     permits: Arc<Semaphore>,
+    path_locks: PathLocks,
     #[cfg(test)]
     write_hook: Option<Arc<dyn WorkspaceWriteHook>>,
 }
@@ -69,6 +223,7 @@ impl WorkspaceService {
     pub fn new(max_concurrent_operations: usize) -> Self {
         Self {
             permits: Arc::new(Semaphore::new(max_concurrent_operations.max(1))),
+            path_locks: PathLocks::default(),
             #[cfg(test)]
             write_hook: None,
         }
@@ -124,9 +279,47 @@ impl WorkspaceService {
         }
         Ok(ReadFileResult {
             relative_path: normalized_relative,
+            version: sha256_hex(&bytes),
             contents: String::from_utf8_lossy(&bytes).into_owned(),
             byte_length,
             truncated: byte_length > READ_LIMIT_BYTES,
+        })
+    }
+
+    /// Reports what is on disk at the path now without returning its contents.
+    pub async fn file_version(
+        &self,
+        root: &Path,
+        relative_path: &str,
+    ) -> Result<FileVersion, WorkspaceError> {
+        let _permit = self.permit().await?;
+        let (target, _) = resolve_relative(root, relative_path)?;
+        let canonical_target = match canonical_existing_within(root, &target).await {
+            Ok((_, canonical_target)) => canonical_target,
+            Err(WorkspaceError::Operation { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                return Ok(FileVersion::Missing);
+            }
+            Err(error) => return Err(error),
+        };
+        Ok(match scan_file(canonical_target).await? {
+            ScannedFile::Missing => FileVersion::Missing,
+            ScannedFile::Present {
+                version, binary, ..
+            } if binary => FileVersion::Unreadable {
+                failure: UnreadableFileFailure::BinaryFile,
+                version,
+            },
+            ScannedFile::Present {
+                version,
+                byte_length,
+                ..
+            } if byte_length > READ_LIMIT_BYTES as u64 => FileVersion::Unreadable {
+                failure: UnreadableFileFailure::FileTooLarge,
+                version,
+            },
+            ScannedFile::Present { version, .. } => FileVersion::Present { version },
         })
     }
 
@@ -139,6 +332,55 @@ impl WorkspaceService {
         let _permit = self.permit().await?;
         let (target, normalized) = resolve_relative(root, relative_path)?;
         let target = safe_mutation_target(root, &target).await?;
+        let _path_lock = self.path_locks.lock(&target).await;
+        self.write_target(target, normalized, contents).await
+    }
+
+    /// Writes only when the file on disk is still the state the caller's contents were based on.
+    ///
+    /// The check and the write hold the path's lock, so two BiBCode clients cannot both pass the
+    /// check. A writer outside BiBCode can still land between them; closing that window would need
+    /// locking other tools do not honour.
+    pub async fn write_file_if_unchanged(
+        &self,
+        root: &Path,
+        relative_path: &str,
+        contents: &str,
+        precondition: &WritePrecondition,
+    ) -> Result<WriteFileOutcome, WorkspaceError> {
+        let _permit = self.permit().await?;
+        let (target, normalized) = resolve_relative(root, relative_path)?;
+        let target = safe_mutation_target(root, &target).await?;
+        let _path_lock = self.path_locks.lock(&target).await;
+        match (precondition, scan_file(target.clone()).await?) {
+            (WritePrecondition::Version { .. }, ScannedFile::Missing) => {
+                return Err(WorkspaceError::FileMissingOnDisk { path: target });
+            }
+            (
+                WritePrecondition::Version { version: expected },
+                ScannedFile::Present { version, .. },
+            ) if version != *expected => {
+                return Err(WorkspaceError::FileChangedOnDisk { path: target });
+            }
+            (WritePrecondition::Missing, ScannedFile::Present { .. }) => {
+                return Err(WorkspaceError::FileChangedOnDisk { path: target });
+            }
+            _ => {}
+        }
+        #[cfg(test)]
+        if let Some(hook) = &self.write_hook {
+            hook.after_precondition_check(&target).await?;
+        }
+        self.write_target(target, normalized, contents).await
+    }
+
+    /// Writes in place, creating missing parents, preserving today's symlink-target behaviour.
+    async fn write_target(
+        &self,
+        target: PathBuf,
+        normalized: String,
+        contents: &str,
+    ) -> Result<WriteFileOutcome, WorkspaceError> {
         let target_existed = tokio::fs::try_exists(&target)
             .await
             .map_err(|error| WorkspaceError::operation("exists", &target, error))?;
@@ -167,6 +409,7 @@ impl WorkspaceService {
             ),
             relative_path: normalized,
             path_set_changed: !target_existed || !parent_existed,
+            version: sha256_hex(contents.as_bytes()),
         })
     }
 
@@ -346,6 +589,154 @@ impl WorkspaceService {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// Pauses every guarded write after its precondition held, until the test releases it.
+    struct HoldAfterPreconditionCheck {
+        entered: tokio::sync::mpsc::UnboundedSender<()>,
+        release: Arc<Semaphore>,
+    }
+
+    impl WorkspaceWriteHook for HoldAfterPreconditionCheck {
+        fn after_write<'a>(&'a self, _target: &'a Path) -> WorkspaceWriteHookFuture<'a> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn after_precondition_check<'a>(
+            &'a self,
+            _target: &'a Path,
+        ) -> WorkspaceWriteHookFuture<'a> {
+            Box::pin(async move {
+                let _ = self.entered.send(());
+                self.release
+                    .acquire()
+                    .await
+                    .expect("release gate open")
+                    .forget();
+                Ok(())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn guarded_write_holds_the_path_lock_from_its_check_to_its_write() {
+        let root = TempDir::new().unwrap();
+        std::fs::write(root.path().join("shared.txt"), "base\n").unwrap();
+        let (entered, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let release = Arc::new(Semaphore::new(0));
+        let service = WorkspaceService::default().with_write_hook_for_test(Arc::new(
+            HoldAfterPreconditionCheck {
+                entered,
+                release: release.clone(),
+            },
+        ));
+        let base = WritePrecondition::Version {
+            version: sha256_hex(b"base\n"),
+        };
+        let guarded_write = |contents: &'static str| {
+            let service = service.clone();
+            let root = root.path().to_path_buf();
+            let base = base.clone();
+            tokio::spawn(async move {
+                service
+                    .write_file_if_unchanged(&root, "shared.txt", contents, &base)
+                    .await
+                    .map(|outcome| outcome.version)
+            })
+        };
+
+        let first = guarded_write("first\n");
+        entered_rx
+            .recv()
+            .await
+            .expect("first write passed its check");
+        let second = guarded_write("second\n");
+        let plain = {
+            let service = service.clone();
+            let root = root.path().to_path_buf();
+            tokio::spawn(async move { service.write_file(&root, "shared.txt", "plain\n").await })
+        };
+        // Without the lock the second write passes the same check while the first is paused.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), entered_rx.recv())
+                .await
+                .is_err(),
+            "a second guarded write passed its check while the first held the path"
+        );
+        assert!(
+            !plain.is_finished(),
+            "a plain write landed between check and write"
+        );
+
+        release.add_permits(1);
+        assert_eq!(first.await.unwrap().unwrap(), sha256_hex(b"first\n"));
+        let second = second.await.unwrap();
+        plain.await.unwrap().unwrap();
+        // Whichever of the two waiters ran next, the second guarded write never saw "base".
+        assert!(matches!(
+            second,
+            Err(WorkspaceError::FileChangedOnDisk { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn guarded_writes_to_spellings_of_one_missing_file_share_its_lock() {
+        // Only an existing path canonicalizes to its on-disk spelling; a missing one keeps the
+        // caller's. On a case-insensitive volume both names below are one file, so the second
+        // write must not pass its absence check while the first is between check and write.
+        let root = TempDir::new().unwrap();
+        let (entered, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let release = Arc::new(Semaphore::new(0));
+        let service = WorkspaceService::default().with_write_hook_for_test(Arc::new(
+            HoldAfterPreconditionCheck {
+                entered,
+                release: release.clone(),
+            },
+        ));
+        let recreate = |relative_path: &'static str| {
+            let service = service.clone();
+            let root = root.path().to_path_buf();
+            tokio::spawn(async move {
+                service
+                    .write_file_if_unchanged(
+                        &root,
+                        relative_path,
+                        relative_path,
+                        &WritePrecondition::Missing,
+                    )
+                    .await
+                    .map(|outcome| outcome.version)
+            })
+        };
+
+        let first = recreate("docs/Notes.txt");
+        entered_rx
+            .recv()
+            .await
+            .expect("first write passed its check");
+        let second = recreate("docs/notes.txt");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), entered_rx.recv())
+                .await
+                .is_err(),
+            "a second spelling of the missing file passed its check while the first held it"
+        );
+
+        release.add_permits(2);
+        first.await.unwrap().unwrap();
+        let second = second.await.unwrap();
+        if root.path().join("docs/notes.txt").exists()
+            && std::fs::read(root.path().join("docs/notes.txt")).unwrap() == b"docs/Notes.txt"
+        {
+            // Case-insensitive: the second write found the first one's file and was refused.
+            assert!(matches!(
+                second,
+                Err(WorkspaceError::FileChangedOnDisk { .. })
+            ));
+        } else {
+            // Case-sensitive: two distinct files, both created.
+            second.unwrap();
+        }
+    }
 
     #[test]
     fn write_classification_controls_include_logical_and_effective_paths_case_insensitively() {

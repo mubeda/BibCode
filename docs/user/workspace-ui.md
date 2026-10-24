@@ -1599,6 +1599,29 @@ The Files surface is a full file manager for the active workspace:
   ticking a task there changes that text, so the edits are kept. Once they are
   saved, it shows the file as last read from disk, so a task toggle also keeps
   changes made to the file outside BiBCode.
+- An open file follows changes made on disk, for example by an agent. While the
+  file is shown and the window is visible, BiBCode checks it every two seconds,
+  and at once when the window regains focus, the connection comes back, or a
+  turn ends.
+  - A file without unsaved edits reloads in place. The caret and comments stay
+    where they were, and Undo brings the previous text back as an unsaved edit.
+  - A file with unsaved edits keeps them and shows **Changed on disk.** (or
+    **Deleted on disk.**) under the toolbar. Choose **Reload from disk** to take
+    the disk's version, or **Overwrite disk** to save yours over it. In the
+    source view, Undo after **Reload from disk** brings your edits back. The
+    rendered Markdown view, and a file deleted on disk, ask first, because no
+    Undo can restore the edits there.
+  - Nothing is saved while the bar shows: Save is disabled with its reason, and
+    Ctrl/Cmd+S, switching tabs, and closing the tab do not write. A closed tab
+    keeps its edits, and reopening the file shows them with the bar. A file tab
+    with a conflict shows an amber dot, even in the background.
+  - Every save is checked against the version it was based on, so a save never
+    writes over a change it has not seen, including one from another BiBCode
+    window or a file in a background tab. If the check fails, the bar appears.
+  - A file without unsaved edits that is deleted on disk shows **Deleted on
+    disk.** and reopens if the file comes back. A file that becomes binary, or
+    grows past 1 MB, can only be overwritten; the text you were editing stays
+    on screen until you choose.
 
 ## Current limitations
 
@@ -1613,6 +1636,16 @@ The Files surface is a full file manager for the active workspace:
   entry point and the keyboard-operable controls within the panel.
 - Outside changes are detected by a periodic check, so the tree updates within
   seconds rather than instantly. Use Refresh when you want it immediately.
+- Only the file being shown is checked for changes on disk, so a background
+  file tab learns of a change at its next save, which the server then refuses.
+  There is no side-by-side comparison in the conflict bar yet, and a file
+  renamed outside BiBCode shows as deleted at its old path.
+- Saves are checked and written as one step against other BiBCode windows, but
+  another program can still write the file in the moment between the check and
+  the write. Closing the project while a file shows the conflict bar drops its
+  unsaved edits, as it does for a file whose save failed.
+- Connected to a server that does not report file versions, the editor saves as
+  before: it neither reloads changes made on disk nor refuses a save over them.
 - Changes to an arbitrary custom Git `core.excludesFile` require **Refresh**;
   automatic classification-control provenance is not yet cached.
 - File mutations validate the workspace-relative target before the later

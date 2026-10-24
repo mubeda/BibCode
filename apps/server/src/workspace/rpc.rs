@@ -25,16 +25,19 @@ use super::paths::{self, normalize_root};
 use super::search::emit_index_phase;
 #[cfg(test)]
 use super::search::{WorkspaceIndexPhase, WorkspaceIndexPhaseSink};
+use super::service::WritePrecondition;
 use super::watcher::{WatchScope, WatchScopeFuture, WatchSubscription, WorkspaceWatcher};
 use super::{EntryKind, SearchLimits, WorkspaceError, WorkspaceSearchIndex, WorkspaceService};
 
 const PROJECT_ENTRIES_MAX_LIMIT: usize = 200;
 
-pub const TASK_SIX_RPC_METHODS: [&str; 13] = [
+pub const TASK_SIX_RPC_METHODS: [&str; 15] = [
     "projects.searchEntries",
     "projects.listEntries",
     "projects.readFile",
+    "projects.getFileVersion",
     "projects.writeFile",
+    "projects.writeFileIfUnchanged",
     "projects.createEntry",
     "projects.renameEntry",
     "projects.deleteEntry",
@@ -349,52 +352,29 @@ impl WorkspaceRpc {
                         )
                     })
             }
+            "projects.getFileVersion" => {
+                let input: PathInput = decode(payload)?;
+                let _admission = self.acquire_path(&input.cwd).await?;
+                self.service
+                    .file_version(Path::new(&input.cwd), &input.relative_path)
+                    .await
+                    .and_then(encode)
+                    .map_err(|error| {
+                        error.to_project_wire(
+                            "ProjectReadFileError",
+                            &input.cwd,
+                            &input.relative_path,
+                        )
+                    })
+            }
             "projects.writeFile" => {
                 let input: WriteInput = decode(payload)?;
-                let admission = self.acquire_path(&input.cwd).await?;
-                let finalization = Self::begin_mutation(admission.as_ref())?;
-                let rpc = self.clone();
-                let cwd = input.cwd.clone();
-                let cancellation_error = WorkspaceError::Cancelled.to_project_wire(
-                    "ProjectWriteFileError",
-                    &input.cwd,
-                    &input.relative_path,
-                );
-                let operation = async move {
-                    let result = rpc
-                        .service
-                        .write_file(Path::new(&input.cwd), &input.relative_path, &input.contents)
-                        .await;
-                    match result {
-                        Ok(outcome) => {
-                            if outcome.path_set_changed
-                                || outcome.index_classification_may_have_changed
-                            {
-                                rpc.invalidate_index(&input.cwd).await;
-                            }
-                            Ok(json!({ "relativePath": outcome.relative_path }))
-                        }
-                        Err(error) => {
-                            rpc.invalidate_index(&input.cwd).await;
-                            Err(error.to_project_wire(
-                                "ProjectWriteFileError",
-                                &input.cwd,
-                                &input.relative_path,
-                            ))
-                        }
-                    }
-                };
-                self.run_workspace_mutation(
-                    WorkspaceMutationOwnership {
-                        _finalization: finalization,
-                        _admission: admission,
-                    },
-                    cwd,
-                    cancellation,
-                    cancellation_error,
-                    operation,
-                )
-                .await
+                self.handle_write_file(input, None, cancellation).await
+            }
+            "projects.writeFileIfUnchanged" => {
+                let input: WriteIfUnchangedInput = decode(payload)?;
+                self.handle_write_file(input.write, Some(input.precondition), cancellation)
+                    .await
             }
             "projects.createEntry" => {
                 let input: CreateInput = decode(payload)?;
@@ -1277,6 +1257,75 @@ impl WorkspaceRpc {
         encode(issued).map_err(|error| defect(&error.to_string()))
     }
 
+    /// Runs a plain write, or a guarded one when `precondition` is set, as a workspace mutation.
+    async fn handle_write_file(
+        &self,
+        input: WriteInput,
+        precondition: Option<WritePrecondition>,
+        cancellation: CancellationToken,
+    ) -> Result<Value, Value> {
+        let admission = self.acquire_path(&input.cwd).await?;
+        let finalization = Self::begin_mutation(admission.as_ref())?;
+        let rpc = self.clone();
+        let cwd = input.cwd.clone();
+        let cancellation_error = WorkspaceError::Cancelled.to_project_wire(
+            "ProjectWriteFileError",
+            &input.cwd,
+            &input.relative_path,
+        );
+        let operation = async move {
+            let root = Path::new(&input.cwd);
+            let result = match &precondition {
+                None => {
+                    rpc.service
+                        .write_file(root, &input.relative_path, &input.contents)
+                        .await
+                }
+                Some(precondition) => {
+                    rpc.service
+                        .write_file_if_unchanged(
+                            root,
+                            &input.relative_path,
+                            &input.contents,
+                            precondition,
+                        )
+                        .await
+                }
+            };
+            match result {
+                Ok(outcome) => {
+                    if outcome.path_set_changed || outcome.index_classification_may_have_changed {
+                        rpc.invalidate_index(&input.cwd).await;
+                    }
+                    Ok(if precondition.is_some() {
+                        json!({ "relativePath": outcome.relative_path, "version": outcome.version })
+                    } else {
+                        json!({ "relativePath": outcome.relative_path })
+                    })
+                }
+                Err(error) => {
+                    rpc.invalidate_index(&input.cwd).await;
+                    Err(error.to_project_wire(
+                        "ProjectWriteFileError",
+                        &input.cwd,
+                        &input.relative_path,
+                    ))
+                }
+            }
+        };
+        self.run_workspace_mutation(
+            WorkspaceMutationOwnership {
+                _finalization: finalization,
+                _admission: admission,
+            },
+            cwd,
+            cancellation,
+            cancellation_error,
+            operation,
+        )
+        .await
+    }
+
     async fn run_workspace_mutation<Operation>(
         &self,
         ownership: WorkspaceMutationOwnership,
@@ -1595,6 +1644,14 @@ struct WriteInput {
     cwd: String,
     relative_path: String,
     contents: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WriteIfUnchangedInput {
+    #[serde(flatten)]
+    write: WriteInput,
+    precondition: WritePrecondition,
 }
 
 #[derive(Deserialize)]
