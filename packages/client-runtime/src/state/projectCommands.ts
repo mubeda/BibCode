@@ -55,6 +55,16 @@ export function createProjectEnvironmentAtoms<R, E>(
     key: ({ environmentId, input }: { environmentId: string; input: { projectId: string } }) =>
       JSON.stringify([environmentId, input.projectId]),
   };
+  const fileWriteConcurrency = {
+    mode: "serial" as const,
+    key: ({
+      environmentId,
+      input,
+    }: {
+      environmentId: string;
+      input: { cwd: string; relativePath: string };
+    }) => JSON.stringify([environmentId, input.cwd, input.relativePath]),
+  };
   return {
     searchEntries: createEnvironmentRpcQueryAtomFamily(runtime, {
       label: "environment-data:projects:search-entries",
@@ -118,11 +128,22 @@ export function createProjectEnvironmentAtoms<R, E>(
       label: "environment-data:projects:write-file",
       tag: WS_METHODS.projectsWriteFile,
       scheduler: fileScheduler,
-      concurrency: {
-        mode: "serial",
-        key: ({ environmentId, input }) =>
-          JSON.stringify([environmentId, input.cwd, input.relativePath]),
-      },
+      concurrency: fileWriteConcurrency,
+    }),
+    /**
+     * Writes only when the file on disk is still the version the contents were based on. Shares
+     * `writeFile`'s per-path lane, so a guarded and a plain write to one file never overlap.
+     */
+    writeFileIfUnchanged: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:projects:write-file-if-unchanged",
+      tag: WS_METHODS.projectsWriteFileIfUnchanged,
+      scheduler: fileScheduler,
+      concurrency: fileWriteConcurrency,
+    }),
+    /** The hash of what is on disk at a path now, without its contents. */
+    getFileVersion: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:projects:get-file-version",
+      tag: WS_METHODS.projectsGetFileVersion,
     }),
     createEntry: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:projects:create-entry",

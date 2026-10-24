@@ -3,9 +3,12 @@
 import { registerCustomCSSVariableTheme } from "@pierre/diffs";
 import { Editor, type EditorOptions } from "@pierre/diffs/edit";
 import { EditProvider, File, useCreateEditor } from "@pierre/diffs/react";
+import { AsyncResult } from "effect/reactivity";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
+
+import { FileEditingSession } from "./fileEditingSession";
 
 const editorOptions: EditorOptions<unknown> = { persistState: true };
 const testTheme = "task-7-editor-integration";
@@ -197,6 +200,103 @@ describe("Pierre stable edit integration", () => {
       expect(editor.getText()).toBe("originalab\n");
       editor.undo();
       expect(editor.getText()).toBe("original\n");
+    });
+  });
+
+  describe("open-file disk reload through FileEditingSession", () => {
+    const createSession = (contents: string) => {
+      const persist = vi.fn(async (_path: string, saved: string) =>
+        AsyncResult.success({ relativePath: "src/session.ts", version: `saved:${saved}` }),
+      );
+      const session = new FileEditingSession<unknown>({
+        cwd: "/repo",
+        relativePath: "src/session.ts",
+        debounceMs: 500,
+        base: { version: "v1", contents },
+        persist,
+        onPendingChange: vi.fn(),
+        onConfirmed: vi.fn(),
+      });
+      return { session, persist };
+    };
+
+    const renderSession = async (session: FileEditingSession<unknown>, contents: string) => {
+      await act(async () => {
+        root.render(
+          <EditProvider createEditor={() => session.editor}>
+            <File
+              edit
+              file={{ name: session.relativePath, contents, cacheKey: session.cacheKey }}
+              options={{ theme: testTheme }}
+            />
+          </EditProvider>,
+        );
+      });
+      const editor = session.editor;
+      if (editor.getFile() === undefined) throw new Error("the session editor did not attach");
+      return editor;
+    };
+
+    const caretAt = (editor: Editor<unknown>, line: number, character: number) => {
+      editor.setSelections([
+        { start: { line, character }, end: { line, character }, direction: "none" },
+      ]);
+    };
+
+    const reconcile = (session: FileEditingSession<unknown>, version: string, contents: string) => {
+      const token = session.beginDiskCheck();
+      if (token === null) throw new Error("no disk check may run");
+      expect(session.reconcileVersion(token, { _tag: "present", version })).toBe("read");
+      session.reconcileRead(token, { version, contents });
+    };
+
+    it("reloads a clean editor in place, and Undo restores the old text as unsaved", async () => {
+      const before = "one\ntwo words\nthree\n";
+      const { session, persist } = createSession(before);
+      const editor = await renderSession(session, before);
+      caretAt(editor, 1, 2);
+
+      reconcile(session, "v2", "one\ntwo changed words\nthree\n");
+
+      expect(editor.getText()).toBe("one\ntwo changed words\nthree\n");
+      // The caret sat on the changed line, before the change: it stays where it was.
+      expect(editor.getState().selections?.[0]?.start).toEqual({ line: 1, character: 2 });
+      expect(session.getSnapshot()).toMatchObject({ save: { phase: "clean" }, conflict: null });
+      expect(session.unsavedContents).toBeNull();
+
+      session.undo();
+      expect(editor.getText()).toBe(before);
+      expect(session.getSnapshot().save.phase).toBe("pending");
+      expect(session.unsavedContents).toBe(before);
+      expect(persist).not.toHaveBeenCalled();
+    });
+
+    it("never changes an edited editor, and Reload from disk then Undo gives back only the edits", async () => {
+      const { session, persist } = createSession("abc");
+      const editor = await renderSession(session, "abc");
+      caretAt(editor, 0, 3);
+      // The user deletes "c" with Backspace.
+      editor.applyEdits([
+        {
+          range: { start: { line: 0, character: 2 }, end: { line: 0, character: 3 } },
+          newText: "",
+        },
+      ]);
+
+      reconcile(session, "v2", "");
+      expect(editor.getText()).toBe("ab");
+      expect(session.getSnapshot().conflict).toMatchObject({ reason: "changed", diskKnown: true });
+      await expect(session.flush()).resolves.toBe("failed");
+
+      session.reloadFromDisk();
+      expect(editor.getText()).toBe("");
+      expect(session.getSnapshot()).toMatchObject({ save: { phase: "clean" }, conflict: null });
+
+      // One Undo removes the reload alone; the user's own delete of "c" stays.
+      session.undo();
+      expect(editor.getText()).toBe("ab");
+      expect(session.unsavedContents).toBe("ab");
+      expect(persist).not.toHaveBeenCalled();
     });
   });
 });

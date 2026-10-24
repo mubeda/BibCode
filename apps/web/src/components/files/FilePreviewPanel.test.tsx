@@ -122,6 +122,7 @@ const testState = vi.hoisted(() => {
         contents: string;
         byteLength: number;
         truncated: boolean;
+        version?: string;
       } | null;
       error: string | null;
       isPending: boolean;
@@ -136,6 +137,7 @@ const testState = vi.hoisted(() => {
     removeReviewComment: vi.fn(),
     setProjectFileQueryData: vi.fn(),
     confirmProjectFileQueryData: vi.fn(),
+    clearProjectFileQueryData: vi.fn(),
     getOptimisticProjectFileQueryData: vi.fn<() => { contents: string } | null>(),
     installFileEditorDismissal: vi.fn<(input: unknown) => () => void>(),
     toastAdd: vi.fn(),
@@ -306,6 +308,8 @@ vi.mock("@pierre/diffs/edit", () => ({
     readonly undo = vi.fn();
     readonly redo = vi.fn();
     readonly cleanUp = vi.fn();
+    // Never attached in these static renders: a disk reload takes the detached path.
+    readonly getFile = () => undefined;
     constructor(options: {
       onAttach?: () => void;
       onChange: (file: { contents: string }, annotations?: unknown) => void;
@@ -517,6 +521,11 @@ vi.mock("./fileSaveCoordinator", () => ({
       return () => this.listeners.delete(listener);
     };
     readonly getSnapshot = () => testState.sessionSnapshot.save;
+    readonly holdForConflict = vi.fn();
+    readonly releaseConflict = vi.fn();
+    readonly adopt = vi.fn();
+    readonly discardPendingSave = vi.fn();
+    readonly isSavingPaused = () => false;
     constructor(options: {
       debounceMs: number;
       persist: (contents: string) => Promise<unknown>;
@@ -529,16 +538,31 @@ vi.mock("./fileSaveCoordinator", () => ({
   },
 }));
 
+vi.mock("./FileDiskConflictBar", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./FileDiskConflictBar")>();
+  return {
+    ...actual,
+    FileDiskConflictBar: (props: Record<string, unknown>) => {
+      ui.record("FileDiskConflictBar", props);
+      return <div data-file-disk-conflict-bar />;
+    },
+  };
+});
+
 vi.mock("./projectFilesQueryState", () => ({
   useProjectFileQuery: () => testState.fileQuery,
   setProjectFileQueryData: (...args: Array<unknown>) => testState.setProjectFileQueryData(...args),
   confirmProjectFileQueryData: (...args: Array<unknown>) =>
     testState.confirmProjectFileQueryData(...args),
   getOptimisticProjectFileQueryData: () => testState.getOptimisticProjectFileQueryData(),
+  clearProjectFileQueryData: (...args: Array<unknown>) =>
+    testState.clearProjectFileQueryData(...args),
+  rereadProjectFile: vi.fn(async () => null),
 }));
 
 import { resolveDiffThemeName } from "~/lib/diffRendering";
 
+import type { FileEditingSession } from "./fileEditingSession";
 import FilePreviewPanel from "./FilePreviewPanel";
 
 const environmentId = EnvironmentId.make("environment-1");
@@ -566,13 +590,17 @@ function baseProps(overrides: Partial<PanelProps> = {}): PanelProps {
   };
 }
 
-function setFileData(contents: string, options: { truncated?: boolean; byteLength?: number } = {}) {
+function setFileData(
+  contents: string,
+  options: { truncated?: boolean; byteLength?: number; version?: string } = {},
+) {
   testState.fileQuery = {
     data: {
       relativePath: "src/app.ts",
       contents,
       byteLength: options.byteLength ?? contents.length,
       truncated: options.truncated ?? false,
+      ...(options.version === undefined ? {} : { version: options.version }),
     },
     error: null,
     isPending: false,
@@ -1355,11 +1383,13 @@ describe("editable file surface", () => {
     });
 
     coordinator.options.onConfirmed("persisted");
+    // A file read from a server without versions saves unguarded and confirms no version.
     expect(testState.setProjectFileQueryData).toHaveBeenCalledWith(
       environmentId,
       "/workspace/demo",
       "src/app.ts",
       "persisted",
+      undefined,
     );
     expect(testState.confirmProjectFileQueryData).toHaveBeenCalledWith(
       environmentId,
@@ -1576,6 +1606,87 @@ describe("editable file surface", () => {
     });
     renderEditable(baseProps({ revealRequestId: 5 }));
     expect(ui.find("File").selectedLines).toBeNull();
+  });
+});
+
+describe("disk changes", () => {
+  type DiskSession = FileEditingSession<unknown>;
+
+  function reconcile(
+    disk: Parameters<DiskSession["reconcileVersion"]>[1],
+    read?: { version: string; contents: string },
+  ) {
+    const session = testState.session as unknown as DiskSession;
+    const token = session.beginDiskCheck();
+    if (token === null) throw new Error("no disk check may run");
+    if (session.reconcileVersion(token, disk) === "read" && read) {
+      session.reconcileRead(token, read);
+    }
+  }
+
+  it("shows the conflict bar under the toolbar and disables Save with its reason", () => {
+    setFileData("old\n", { version: "v1" });
+    testState.pendingWork = true;
+    renderPanel(baseProps());
+
+    reconcile({ _tag: "present", version: "v2" }, { version: "v2", contents: "agent\n" });
+    const markup = renderPanel(baseProps());
+
+    const bar = ui.find("FileDiskConflictBar");
+    expect(bar.conflict).toEqual({ reason: "changed", diskKnown: true, unreadable: null });
+    // The source view can undo a reload, so it does not ask first.
+    expect(bar.confirmReload).toBe(false);
+    expect(ui.find("FileEditorToolbar").saveBlockedReason).toBe(
+      "Changed on disk. Choose Reload from disk or Overwrite disk.",
+    );
+    expect(markup.indexOf("data-file-editor-toolbar")).toBeLessThan(
+      markup.indexOf("data-file-disk-conflict-bar"),
+    );
+    expect(ui.filter("File", (props) => props.edit === true)).toHaveLength(1);
+
+    // Reload from disk drops a lingering overlay so the views show the disk text.
+    (bar.onReload as () => void)();
+    expect(testState.clearProjectFileQueryData).toHaveBeenCalledWith(
+      environmentId,
+      "/workspace/demo",
+      "src/app.ts",
+    );
+    renderPanel(baseProps());
+    expect(ui.filter("FileDiskConflictBar")).toHaveLength(0);
+  });
+
+  it("asks before reloading in the rendered Markdown view, which has no undo", () => {
+    setFileData("- [ ] task\n", { version: "v1" });
+    testState.pendingWork = true;
+    renderPanel(baseProps({ relativePath: "README.md" }));
+
+    reconcile({ _tag: "present", version: "v2" }, { version: "v2", contents: "- [x] task\n" });
+    renderPanel(baseProps({ relativePath: "README.md" }));
+
+    expect(ui.find("FileDiskConflictBar").confirmReload).toBe(true);
+  });
+
+  it("shows a clean file deleted on disk as deleted instead of its stale text", () => {
+    setFileData("old\n", { version: "v1" });
+    renderPanel(baseProps());
+
+    reconcile({ _tag: "missing" });
+    const markup = renderPanel(baseProps());
+
+    expect(markup).toContain("Deleted on disk.");
+    expect(ui.filter("File")).toHaveLength(0);
+    expect(ui.filter("FileDiskConflictBar")).toHaveLength(0);
+  });
+
+  it("reports conflicts for the tab strip", () => {
+    const onConflictChange = vi.fn();
+    setFileData("old\n", { version: "v1" });
+    testState.pendingWork = true;
+    renderPanel(baseProps({ onConflictChange }));
+
+    reconcile({ _tag: "present", version: "v2" }, { version: "v2", contents: "agent\n" });
+
+    expect(onConflictChange).toHaveBeenCalledWith("src/app.ts", true);
   });
 });
 

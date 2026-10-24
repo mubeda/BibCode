@@ -39,6 +39,8 @@ export class FileSaveCoordinator<A = unknown, E = unknown> {
   private lastChangeAt = 0;
   private inFlight: Promise<boolean> | null = null;
   private savingPaused = false;
+  /** Set while a newer disk state the user has not resolved stands; no write may run. */
+  private conflictHeld = false;
   private autosaveEnabled = true;
   private queuedImmediateFlush: QueuedImmediateFlush | null = null;
   private disposed = false;
@@ -64,9 +66,53 @@ export class FileSaveCoordinator<A = unknown, E = unknown> {
     this.lastChangeAt = Date.now();
     this.options.onPendingChange(true);
     this.publish(this.inFlight === null ? "pending" : "saving");
-    if (this.autosaveEnabled && !this.savingPaused) {
+    if (this.autosaveEnabled && !this.writesBlocked()) {
       this.schedule(this.options.debounceMs);
     }
+  }
+
+  /**
+   * Take `contents` as what the file already holds, without writing it: the
+   * document now matches the disk, so nothing is left to save.
+   */
+  adopt(contents: string): void {
+    if (this.disposed) return;
+    this.clearTimer();
+    this.settleQueuedImmediateFlush("unchanged");
+    this.latestContents = contents;
+    this.changed = true;
+    this.latestRevision += 1;
+    this.persistedRevision = this.latestRevision;
+    this.options.onPendingChange(false);
+    this.publish(this.inFlight === null ? "clean" : "saving");
+  }
+
+  /** Refuse every write (debounce, flush, settle, resume, dispose) until released. */
+  holdForConflict(): void {
+    if (this.conflictHeld) return;
+    this.conflictHeld = true;
+    this.clearTimer();
+    this.settleQueuedImmediateFlush("failed");
+    this.publish(this.snapshot.phase);
+  }
+
+  releaseConflict(): void {
+    if (!this.conflictHeld) return;
+    this.conflictHeld = false;
+    this.publish(this.snapshot.phase);
+    if (
+      this.autosaveEnabled &&
+      !this.writesBlocked() &&
+      this.inFlight === null &&
+      this.latestRevision !== this.persistedRevision
+    ) {
+      this.schedule(this.options.debounceMs);
+    }
+  }
+
+  /** True while path mutations pause saving; disk checks wait for them too. */
+  isSavingPaused(): boolean {
+    return this.savingPaused;
   }
 
   dispose(): void {
@@ -77,9 +123,13 @@ export class FileSaveCoordinator<A = unknown, E = unknown> {
     // Only unsaved edits get a farewell write. An unconditional write here
     // resurrects the old path when the surface unmounts because the file was
     // just renamed or deleted out from under it.
-    if (!this.savingPaused && this.latestRevision > this.persistedRevision) {
+    if (!this.writesBlocked() && this.latestRevision > this.persistedRevision) {
       void this.persistLatest();
     }
+  }
+
+  private writesBlocked(): boolean {
+    return this.savingPaused || this.conflictHeld;
   }
 
   /** The contents of the latest change, saved, unsaved, or discarded; null before the first. */
@@ -101,7 +151,7 @@ export class FileSaveCoordinator<A = unknown, E = unknown> {
       return;
     }
     if (
-      !this.savingPaused &&
+      !this.writesBlocked() &&
       this.inFlight === null &&
       this.latestRevision !== this.persistedRevision
     ) {
@@ -122,7 +172,9 @@ export class FileSaveCoordinator<A = unknown, E = unknown> {
     const queuedFlush = this.queuedImmediateFlush;
     this.queuedImmediateFlush = null;
     this.publish(this.inFlight === null ? this.snapshot.phase : "saving");
-    if (
+    if (this.conflictHeld) {
+      queuedFlush?.resolve("failed");
+    } else if (
       queuedFlush !== null &&
       this.autosaveEnabled &&
       this.latestRevision !== this.persistedRevision
@@ -154,6 +206,11 @@ export class FileSaveCoordinator<A = unknown, E = unknown> {
    * (and its reschedule) settles the remaining edits on its own.
    */
   flush(): Promise<FileSaveFlushResult> {
+    if (this.conflictHeld) {
+      return Promise.resolve(
+        this.latestRevision === this.persistedRevision ? "unchanged" : "failed",
+      );
+    }
     if (this.savingPaused) {
       if (this.autosaveEnabled && this.latestRevision !== this.persistedRevision) {
         return this.queueImmediateFlush();
@@ -167,7 +224,7 @@ export class FileSaveCoordinator<A = unknown, E = unknown> {
   }
 
   async settle(): Promise<FileSaveSettleResult> {
-    if (this.savingPaused) {
+    if (this.writesBlocked()) {
       return this.latestRevision === this.persistedRevision ? "unchanged" : "failed";
     }
     const hadUnsavedChanges = this.latestRevision !== this.persistedRevision;
@@ -223,7 +280,7 @@ export class FileSaveCoordinator<A = unknown, E = unknown> {
 
   private persistLatest(): Promise<boolean> {
     if (
-      this.savingPaused ||
+      this.writesBlocked() ||
       this.inFlight !== null ||
       this.latestRevision === this.persistedRevision
     ) {
@@ -253,7 +310,8 @@ export class FileSaveCoordinator<A = unknown, E = unknown> {
     }
     const succeeded = result._tag === "Success";
     if (succeeded) {
-      this.persistedRevision = revision;
+      // A disk version adopted while this write was in flight is newer; keep it.
+      this.persistedRevision = Math.max(this.persistedRevision, revision);
       this.options.onConfirmed(contents);
     }
 
@@ -268,16 +326,22 @@ export class FileSaveCoordinator<A = unknown, E = unknown> {
       return succeeded;
     }
 
+    // A disk version adopted while this write was in flight left nothing to save.
+    if (this.latestRevision === this.persistedRevision) {
+      this.publish("clean");
+      return succeeded;
+    }
+
     this.publish("pending");
 
     const remainingDebounce = Math.max(
       0,
       this.options.debounceMs - (Date.now() - this.lastChangeAt),
     );
-    if (this.disposed) {
+    if (this.disposed && !this.writesBlocked()) {
       return this.persistRevision(this.latestContents, this.latestRevision);
     }
-    if (this.autosaveEnabled && !this.savingPaused) {
+    if (this.autosaveEnabled && !this.writesBlocked()) {
       this.schedule(remainingDebounce);
     }
     return succeeded;
@@ -289,7 +353,7 @@ export class FileSaveCoordinator<A = unknown, E = unknown> {
       canSave:
         this.latestRevision !== this.persistedRevision &&
         this.inFlight === null &&
-        !this.savingPaused,
+        !this.writesBlocked(),
       confirmedRevision: this.persistedRevision,
     };
     if (
