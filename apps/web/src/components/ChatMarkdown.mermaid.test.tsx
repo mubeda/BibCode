@@ -208,11 +208,18 @@ describe("Mermaid diagrams in chat Markdown", () => {
       ).not.toBeNull();
     });
 
-    it("refuses a source over 50,000 characters without loading the renderer", async () => {
-      const view = await mount(fence(`graph TD\n  A --> B\n${"%".repeat(50_001)}`));
+    it("refuses a source over 25,000 characters without loading the renderer", async () => {
+      const view = await mount(fence(`graph TD\n  A --> B\n${"%".repeat(24_990)}`));
       await settle();
-      expect(errorText(view.container)).toBe("Too large to draw: over 50,000 characters.");
+      expect(errorText(view.container)).toBe("Too large to draw: over 25,000 characters.");
       expect(rendererLoads).toBe(0);
+    });
+
+    it("draws a source at the character limit", async () => {
+      const source = `graph TD\n  A --> B\n%%${"x".repeat(25_000 - 21)}`;
+      expect(source).toHaveLength(25_000);
+      const view = await mount(fence(source));
+      await waitFor(() => hasDiagram(view.container), "the source at the limit never drew");
     });
 
     it("offers Retry when the renderer fails to load, and Retry draws", async () => {

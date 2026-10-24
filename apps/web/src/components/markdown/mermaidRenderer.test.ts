@@ -2,10 +2,10 @@
 import { PeleError } from "pele/lazy";
 import { describe, expect, it } from "vite-plus/test";
 
+import { MERMAID_EDGE_LIMIT } from "./mermaidFence";
 import {
   describeMermaidProblem,
   loadMermaidDiagramType,
-  MERMAID_EDGE_LIMIT,
   mermaidRenderOptions,
   renderMermaidDiagram,
 } from "./mermaidRenderer";
@@ -40,7 +40,7 @@ describe("Mermaid renderer", () => {
       links: false,
       images: false,
       responsive: true,
-      limit: 50_000,
+      limit: 25_000,
       maxEdges: MERMAID_EDGE_LIMIT,
       outputLimit: 1_000_000,
       idPrefix: "p",
