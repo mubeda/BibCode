@@ -405,6 +405,16 @@ terminal session. Inside a terminal, `Shift+Enter` sends a soft newline (ESC CR)
 so Codex and Claude Code prompts insert a line break instead of submitting;
 plain `Enter` still submits.
 
+Terminals do not inherit tmux, screen, or Zellij session variables from the
+environment BiBCode was started in, so a shell started there does not treat
+itself as running inside that multiplexer. fish starts with `no-query-term`
+added to `fish_features`, so it does not pause at startup waiting for a
+terminal reply. fish features that need those replies stay off, and because
+the variable is exported, flags you set with `set -U fish_features` are hidden.
+To keep your flags, or to turn the queries back on with `query-term`, set
+`fish_features` in the environment that starts BiBCode (a shell export only
+applies when BiBCode is launched from that shell).
+
 Project script actions run in a visible center terminal. They reuse the focused
 idle center terminal when possible and otherwise open a new center terminal.
 The retired bottom terminal drawer and its bottom-toolbar toggle no longer
