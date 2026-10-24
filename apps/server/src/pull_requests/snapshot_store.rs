@@ -267,6 +267,43 @@ mod tests {
         );
     }
 
+    /// A successful action forgets every row of its number, the poller's
+    /// `pipeline` row included, and leaves other numbers alone.
+    #[test]
+    fn pull_request_snapshots_delete_number_removes_the_pipeline_row() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        crate::persistence::run_migrations(&mut connection, None).unwrap();
+        let store = SnapshotStore::new(&connection);
+        let row = |kind: &str, key: &str| Snapshot {
+            host: "gitlab.com".into(),
+            project: "team/repo".into(),
+            kind: kind.into(),
+            key: key.into(),
+            fingerprint: "fp".into(),
+            payload: b"{}".to_vec(),
+            observed_at_ms: 1,
+            generation: next_generation(),
+        };
+        for kind in ["pipeline", "probe", "detail"] {
+            assert!(store.put(row(kind, "7")).unwrap());
+        }
+        assert!(store.put(row("pipeline", "8")).unwrap());
+        store.delete_number("gitlab.com", "team/repo", 7).unwrap();
+        for kind in ["pipeline", "probe", "detail"] {
+            assert_eq!(
+                store.get("gitlab.com", "team/repo", kind, "7").unwrap(),
+                None,
+                "{kind}"
+            );
+        }
+        assert!(
+            store
+                .get("gitlab.com", "team/repo", "pipeline", "8")
+                .unwrap()
+                .is_some()
+        );
+    }
+
     #[test]
     fn pull_request_snapshots_host_fence_blocks_writes_that_started_before_it() {
         let fences = HostFences::default();
