@@ -240,7 +240,7 @@ async fn open_url_route_rejects_bad_tokens_and_cookies() {
     let preview = PreviewManager::new();
     let app = router(Arc::clone(&connect), preview);
     let mcp = connect
-        .issue_mcp_credential("thread-1", "codex-1")
+        .issue_mcp_credential("thread-1", "thread-1", "codex-1")
         .await
         .unwrap();
     let mcp_token = mcp.authorization_header.strip_prefix("Bearer ").unwrap();
@@ -307,7 +307,7 @@ async fn mcp_credential_survives_open_url_issue() {
     let temp = TempDir::new().unwrap();
     let connect = setup_service(&temp).await;
     let mcp = connect
-        .issue_mcp_credential("thread-1", "codex-1")
+        .issue_mcp_credential("thread-1", "thread-1", "codex-1")
         .await
         .unwrap();
     let first = connect.issue_open_url_credential("thread-1").await.unwrap();

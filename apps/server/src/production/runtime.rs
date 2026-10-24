@@ -579,6 +579,7 @@ impl ProductionRuntime {
                 workspace: workspace_for_effects,
                 preview: preview.clone(),
                 preview_gateway: preview_gateway.clone(),
+                devices: device_manager.clone(),
             }),
             EffectsOptions::default(),
         )
@@ -881,6 +882,7 @@ struct RuntimeEffectCallbacks {
     workspace: WorkspaceRpc,
     preview: PreviewManager,
     preview_gateway: PreviewGateway,
+    devices: crate::device::DeviceManager,
 }
 
 impl OrchestrationEffectCallbacks for RuntimeEffectCallbacks {
@@ -989,6 +991,12 @@ impl OrchestrationEffectCallbacks for RuntimeEffectCallbacks {
                 .await
                 .map_err(|error| error.to_string())
         })
+    }
+
+    fn close_devices<'a>(&'a self, thread_id: &'a str) -> BoxEffectFuture<'a, ()> {
+        // Returns at once: a 10 s emulator stop never holds up the deletion.
+        self.devices.stop_thread(thread_id);
+        Box::pin(async { Ok(()) })
     }
 
     fn setup_script_is_running<'a>(
@@ -2831,6 +2839,7 @@ mod tests {
             workspace: WorkspaceRpc::new(WorkspaceService::default()),
             preview: runtime.preview.clone(),
             preview_gateway: runtime.preview_gateway.clone(),
+            devices: runtime.device_manager.clone(),
         };
         let canonical_callback_workspace =
             std::fs::canonicalize(&callback_workspace).expect("callback workspace canonical path");
@@ -2885,6 +2894,10 @@ mod tests {
             .close_terminals("runtime-thread")
             .await
             .expect("setup terminal should close");
+        callbacks
+            .close_devices("runtime-thread")
+            .await
+            .expect("a deleted thread's devices stop without waiting");
 
         let asset_context = ProjectionAssetContext {
             repositories: runtime.orchestration.repositories(),

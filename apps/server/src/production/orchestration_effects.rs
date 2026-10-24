@@ -99,6 +99,12 @@ pub trait OrchestrationEffectCallbacks: Send + Sync {
         Box::pin(async { Ok(()) })
     }
 
+    /// Starts stopping the device previews the thread started, without waiting for them, and
+    /// refuses the thread as a device owner from now on.
+    fn close_devices<'a>(&'a self, _thread_id: &'a str) -> BoxEffectFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
     fn setup_script_is_running<'a>(
         &'a self,
         _thread_id: &'a str,
@@ -1414,6 +1420,9 @@ async fn cleanup_deleted_thread(
     }
     if let Err(error) = callbacks.close_previews(thread_id).await {
         tracing::debug!(thread_id, %error, "thread deletion cleanup skipped preview close");
+    }
+    if let Err(error) = callbacks.close_devices(thread_id).await {
+        tracing::debug!(thread_id, %error, "thread deletion cleanup skipped device close");
     }
 }
 

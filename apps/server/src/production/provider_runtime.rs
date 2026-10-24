@@ -166,6 +166,9 @@ pub struct ProviderLaunchRequest {
     /// Merged into the child environment at spawn. Kept out of `environment`, which the
     /// durable delivery route fingerprints.
     pub open_url: Option<OpenUrlSession>,
+    /// The chat panel's host thread, from the thread row; its MCP credential is scoped to the
+    /// host, so the panel's agent and the host share devices. `None` for any other thread.
+    pub host_thread_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1206,8 +1209,16 @@ impl ProviderRuntimeSupervisor {
                 .provider_instance_id
                 .clone()
                 .unwrap_or_else(|| request.provider.clone());
+            let owner_thread_id = request
+                .host_thread_id
+                .clone()
+                .unwrap_or_else(|| request.thread_id.clone());
             let issued = connect
-                .issue_mcp_credential(request.thread_id.clone(), provider_instance_id)
+                .issue_mcp_credential(
+                    request.thread_id.clone(),
+                    owner_thread_id,
+                    provider_instance_id,
+                )
                 .await
                 .map_err(|error| ProviderRuntimeError::Provider {
                     provider: request.provider.clone(),
@@ -4997,6 +5008,7 @@ async fn build_launch_request(
         mcp: None,
         codex_home,
         open_url: None,
+        host_thread_id: thread.host_thread_id.clone(),
     })
 }
 
@@ -16819,6 +16831,7 @@ mod tests {
             mcp: None,
             codex_home: None,
             open_url: None,
+            host_thread_id: None,
         }
     }
 
@@ -16957,6 +16970,44 @@ mod tests {
                 super::ClaudeProbeLaunchPolicy::Direct
             )
         ));
+    }
+
+    /// A chat panel's launch names its host, which its MCP credential is scoped to; any other
+    /// thread's names none.
+    #[tokio::test]
+    async fn a_chat_panels_launch_names_its_host_thread() {
+        let engine = supervisor_engine().await;
+        engine
+            .dispatch(
+                serde_json::from_value(json!({"type":"thread.create","commandId":"panel","threadId":"panel","projectId":"p1","title":"Panel — Codex","kind":"panel","hostThreadId":"t1","modelSelection":{"instanceId":"codex","model":"gpt-5"},"runtimeMode":"full-access","interactionMode":"default","branch":null,"worktreePath":null,"createdAt":"2026-07-16T00:00:00Z"}))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let settings = TempDir::new().expect("provider settings directory");
+        for (thread_id, host) in [("panel", Some("t1")), ("t1", None)] {
+            let command = serde_json::from_value(json!({
+                "type":"thread.turn.start",
+                "commandId":format!("launch-{thread_id}"),
+                "threadId":thread_id,
+                "message":{"messageId":format!("message-{thread_id}"),"role":"user","text":"launch","attachments":[]},
+                "modelSelection":{"instanceId":"codex","model":"gpt-5.6","options":[]},
+                "runtimeMode":"full-access",
+                "interactionMode":"default",
+                "createdAt":"2026-07-16T00:00:00Z"
+            }))
+            .expect("turn command");
+            let request = super::launch_request_for_command(
+                &engine,
+                &settings.path().to_path_buf(),
+                &command,
+                None,
+            )
+            .await
+            .expect("launch request");
+            assert_eq!(request.host_thread_id.as_deref(), host, "{thread_id}");
+        }
+        engine.shutdown().await;
     }
 
     #[tokio::test]
