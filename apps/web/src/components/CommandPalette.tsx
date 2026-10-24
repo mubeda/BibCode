@@ -237,6 +237,11 @@ function OpenCommandPaletteDialog(props: {
   const [viewStack, setViewStack] = useState<CommandPaletteView[]>([]);
   // The executed item's focus target, read by `finalFocus` as the palette closes.
   const finalFocusTargetRef = useRef<(() => void) | null>(null);
+  // Read on the palette's first render, before it takes focus: the chat it was opened from,
+  // which may be a panel chat while the host chat sits in a hidden tab.
+  const [openerElement] = useState<Element | null>(() =>
+    typeof document === "undefined" ? null : document.activeElement,
+  );
   const currentView = viewStack.at(-1) ?? null;
   const paletteMode = getCommandPaletteMode({ currentView, isBrowsing: false });
   const projectTitleById = useMemo(
@@ -444,11 +449,11 @@ function OpenCommandPaletteDialog(props: {
       icon: <SearchIcon className={ITEM_ICON_CLASS} />,
       ...(findShortcutLabel ? { shortcutLabel: findShortcutLabel } : {}),
       run: async () => {
-        openThreadFindForTarget(null);
+        openThreadFindForTarget(openerElement);
       },
       // Typing right after choosing the action goes into the find bar.
       finalFocus: () => {
-        focusThreadFindInput(null);
+        focusThreadFindInput(openerElement);
       },
     });
   }

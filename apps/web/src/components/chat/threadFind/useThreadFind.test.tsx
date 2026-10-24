@@ -772,6 +772,36 @@ describe("useThreadFind", () => {
     expect(registry.has(FIND_HIGHLIGHT_NAME)).toBe(true);
   });
 
+  it("opens find in the visible chat when the host chat sits in a hidden tab", async () => {
+    const host = await mountTimeline({
+      latestTurn: null,
+      timelineEntries: [message("a", "user", "host text", 0)],
+    });
+    const panel = await mountTimeline({
+      latestTurn: null,
+      isHostFindSurface: false,
+      routeThreadKey: "environment-local:thread-2",
+      timelineEntries: [message("b", "user", "panel text", 0)],
+    });
+    // The center workspace keeps an inactive tab mounted but hidden.
+    for (const [mountedTimeline, visible] of [
+      [host, "false"],
+      [panel, "true"],
+    ] as const) {
+      const surfaceHost = document.createElement("div");
+      surfaceHost.setAttribute("data-center-surface-host", "");
+      surfaceHost.setAttribute("data-visible", visible);
+      document.body.append(surfaceHost);
+      surfaceHost.append(mountedTimeline.container);
+    }
+
+    await act(async () => {
+      openThreadFindForTarget(null);
+    });
+    await settle(() => findInput(panel.container) !== null);
+    expect(findInput(host.container)).toBeNull();
+  });
+
   it("reports the thread's load state and closes when it is deleted", async () => {
     h.loadState = { status: "empty", error: null, hasData: false };
     const { render } = await mountTimeline({ latestTurn: null, timelineEntries: [] });

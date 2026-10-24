@@ -146,19 +146,28 @@ interface ThreadFindSurface {
 
 const surfaces = new Set<ThreadFindSurface>();
 
+/** The center workspace keeps a chat in an inactive tab mounted, under a hidden surface host. */
+function isHiddenSurface(surface: ThreadFindSurface): boolean {
+  return surface.root.closest('[data-center-surface-host][data-visible="false"]') !== null;
+}
+
 function surfaceFor(target: EventTarget | null): ThreadFindSurface | null {
   if (target instanceof Node) {
     for (const surface of surfaces) {
       if (surface.root.contains(target)) return surface;
     }
   }
+  // Otherwise the host chat when it shows, else a chat that shows.
+  let visible: ThreadFindSurface | null = null;
   for (const surface of surfaces) {
+    if (isHiddenSurface(surface)) continue;
     if (surface.isHost) return surface;
+    visible ??= surface;
   }
-  return null;
+  return visible;
 }
 
-/** Opens find in the chat surface that holds `target`, or the host chat. */
+/** Opens find in the chat surface that holds `target`, or the visible host chat. */
 export function openThreadFindForTarget(target: EventTarget | null): boolean {
   const surface = surfaceFor(target);
   if (!surface) return false;
@@ -166,7 +175,7 @@ export function openThreadFindForTarget(target: EventTarget | null): boolean {
   return true;
 }
 
-/** Focuses the find input of the surface that holds `target`, or the host chat's. */
+/** Focuses the find input of the surface that holds `target`, or the visible host chat's. */
 export function focusThreadFindInput(target: EventTarget | null): boolean {
   const surface = surfaceFor(target);
   if (!surface) return false;
