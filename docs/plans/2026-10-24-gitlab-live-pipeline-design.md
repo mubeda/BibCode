@@ -962,3 +962,11 @@ Codex reviewed the first draft. Each finding was checked against the code at
 | #   | Question                                                                                                                                      | Decision                                                                                                                                                                                                                                                                                                                          |
 | --- | --------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | A   | A watched number past the 3-number cap gets header-only `pipeline` rows (`checks: null`), so its Pipelines job list did not follow the header | Decided by the product owner on 2026-10-24. On the Pipelines tab of that number only, a header-only row delivered after `changed.pipeline` makes the client re-read `getChecks` once per row revision. A row that carries jobs (an eligible number) never re-reads them, and a repeated event for the same revision reads nothing |
+
+The same review found four implementation defects against this design, now
+fixed: a failed final pipeline read left the row on its old status (the read
+is now retried until a copy is written); a tick of another poller that was in
+flight when a 429 arrived cleared the host's backoff (only a tick that started
+after the step clears it); a sign-in failure on the totals read was swallowed
+(it now ends the poller); and a tab switch could show an older pipeline copy
+(the client keeps the newest copy shown for the merge request).
