@@ -19,24 +19,50 @@ interface DomTextPiece {
   readonly start: number;
 }
 
+/** The attribute on a `<details>` block's content that holds the block's ordinal. */
+const DETAILS_CONTENT_ATTRIBUTE = "data-markdown-details-content";
+
 /** One block of displayed text in the DOM, with the text nodes that hold it. */
 export interface DomFindSegment {
   readonly folded: string;
   readonly pieces: ReadonlyArray<DomTextPiece>;
+  /** The ordinals of the `<details>` blocks whose content holds this text, outermost first. */
+  readonly details: ReadonlyArray<number>;
 }
 
 interface DomWalk {
   readonly segments: DomFindSegment[];
   text: string;
   pieces: DomTextPiece[];
+  details: ReadonlyArray<number>;
+  textDetails: ReadonlyArray<number>;
 }
 
 function flushDomSegment(walk: DomWalk): void {
   if (walk.text.trim().length > 0) {
-    walk.segments.push({ folded: foldFindText(walk.text), pieces: walk.pieces });
+    walk.segments.push({
+      folded: foldFindText(walk.text),
+      pieces: walk.pieces,
+      details: walk.textDetails,
+    });
   }
   walk.text = "";
   walk.pieces = [];
+}
+
+function appendDomText(walk: DomWalk, text: string, piece: DomTextPiece | null): void {
+  if (walk.text.length === 0) {
+    walk.textDetails = walk.details;
+  }
+  if (piece) walk.pieces.push(piece);
+  walk.text += text;
+}
+
+function detailsOrdinalOf(element: Element): number | null {
+  const value = element.getAttribute(DETAILS_CONTENT_ATTRIBUTE);
+  if (value === null || value.length === 0) return null;
+  const ordinal = Number(value);
+  return Number.isSafeInteger(ordinal) ? ordinal : null;
 }
 
 function nextTextValue(node: Node): string | null {
@@ -49,8 +75,7 @@ function walkDomChildren(walk: DomWalk, parent: Node): void {
     if (child.nodeType === 3) {
       const node = child as Text;
       if (node.data.length === 0) continue;
-      walk.pieces.push({ node, start: walk.text.length });
-      walk.text += node.data;
+      appendDomText(walk, node.data, { node, start: walk.text.length });
       continue;
     }
     if (child.nodeType !== 1) continue;
@@ -68,20 +93,24 @@ function walkDomChildren(walk: DomWalk, parent: Node): void {
     }
     if (tag === "br") {
       if (!breakIsFollowedByNewline(nextTextValue(element))) {
-        walk.text += "\n";
+        appendDomText(walk, "\n", null);
       }
       continue;
     }
     const block = FIND_BLOCK_TAGS.has(tag);
     if (block) flushDomSegment(walk);
+    const ordinal = detailsOrdinalOf(element);
+    const outerDetails = walk.details;
+    if (ordinal !== null) walk.details = [...outerDetails, ordinal];
     walkDomChildren(walk, element);
+    walk.details = outerDetails;
     if (block) flushDomSegment(walk);
   }
 }
 
 /** The text of one find scope, as segments. */
 export function collectScopeSegments(scope: Element): DomFindSegment[] {
-  const walk: DomWalk = { segments: [], text: "", pieces: [] };
+  const walk: DomWalk = { segments: [], text: "", pieces: [], details: [], textDetails: [] };
   walkDomChildren(walk, scope);
   flushDomSegment(walk);
   return walk.segments;
@@ -122,12 +151,15 @@ export function rangeForSegmentOffsets(
   return range;
 }
 
+/** One occurrence of a query in the DOM. */
+export interface DomFindOccurrence {
+  readonly segment: DomFindSegment;
+  readonly start: number;
+}
+
 /** Every occurrence of the folded query in a scope, in reading order. */
-export function findScopeOccurrences(
-  scope: Element,
-  query: string,
-): Array<{ readonly segment: DomFindSegment; readonly start: number }> {
-  const occurrences: Array<{ readonly segment: DomFindSegment; readonly start: number }> = [];
+export function findScopeOccurrences(scope: Element, query: string): DomFindOccurrence[] {
+  const occurrences: DomFindOccurrence[] = [];
   if (query.length === 0) return occurrences;
   for (const segment of collectScopeSegments(scope)) {
     let index = segment.folded.indexOf(query);

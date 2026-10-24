@@ -3,6 +3,11 @@ export function proposedPlanTitle(planMarkdown: string): string | null {
   return heading && heading.length > 0 ? heading : null;
 }
 
+/** A long plan renders a shorter preview behind "Expand plan". */
+export function proposedPlanCanCollapse(planMarkdown: string): boolean {
+  return planMarkdown.length > 900 || planMarkdown.split("\n").length > 20;
+}
+
 export function stripDisplayedPlanMarkdown(planMarkdown: string): string {
   const lines = planMarkdown.trimEnd().split(/\r?\n/);
   const sourceLines = lines[0] && /^\s{0,3}#{1,6}\s+/.test(lines[0]) ? lines.slice(1) : [...lines];
