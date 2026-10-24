@@ -775,6 +775,7 @@ describe("DiffPanel: Changes and Compare", () => {
     h.checkpointDiff = { data: { diff: "", truncated: true }, error: null, isPending: false };
     const markup = render();
     expect(markup).toContain("This diff was truncated because it exceeded the preview limit.");
+    expect(markup).toContain("These changes are too large to preview.");
     expect(markup).not.toContain("No net changes");
   });
 

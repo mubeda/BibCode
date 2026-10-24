@@ -1051,7 +1051,9 @@ export default function DiffPanel({
                   <p>
                     {hasNoNetChanges
                       ? "No net changes in this selection."
-                      : "No patch available for this selection."}
+                      : isSelectedPatchTruncated
+                        ? "These changes are too large to preview."
+                        : "No patch available for this selection."}
                   </p>
                 </div>
               )
