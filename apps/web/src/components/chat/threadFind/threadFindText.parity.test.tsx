@@ -107,6 +107,8 @@ const CORPUS: ReadonlyArray<{ readonly name: string; readonly text: string }> = 
       "",
       "</details>",
       "",
+      "<details open>raw<br>break inside</details>",
+      "",
       "After details.",
     ].join("\n"),
   },
