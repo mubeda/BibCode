@@ -24,7 +24,8 @@
             "worktreeCatalogRefreshReason": true,
             "vcsStatusSummary": true,
             "activityProtocolVersion": 2,
-            "deviceCatalogRefresh": true
+            "deviceCatalogRefresh": true,
+            "cliSessionHistory": true
           }
         }
       }

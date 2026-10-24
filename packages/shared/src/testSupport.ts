@@ -34,6 +34,7 @@ export function makeTestExecutionEnvironmentCapabilities(
     profiler: false,
     devicePreviews: false,
     deviceCatalogRefresh: false,
+    cliSessionHistory: false,
     previewTunnels: false,
     ...overrides,
   };

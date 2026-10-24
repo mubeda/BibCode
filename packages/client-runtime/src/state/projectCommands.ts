@@ -144,6 +144,22 @@ export function createProjectEnvironmentAtoms<R, E>(
       scheduler: projectScheduler,
       concurrency: projectConcurrency,
     }),
+    /**
+     * Lists the Claude Code terminal sessions run in a thread's folder, for
+     * History. Only on servers that advertise `cliSessionHistory`.
+     */
+    listThreadAgentSessions: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:projects:list-thread-agent-sessions",
+      tag: WS_METHODS.agentSessionsListForThread,
+    }),
+    /**
+     * Continues a terminal session (or a copy of it) in a chat panel of the
+     * host thread. A retry with the same command ID reaches the same panel.
+     */
+    openAgentSessionInPanel: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:commands:project:open-agent-session-in-panel",
+      tag: WS_METHODS.agentSessionsOpenInPanel,
+    }),
     createDownloadUrl: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:projects:create-download-url",
       tag: WS_METHODS.projectsCreateDownloadUrl,

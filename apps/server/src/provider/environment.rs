@@ -46,8 +46,40 @@ const CLAUDE_PROJECT_DIRECTORY_NAME_MAX: usize = 200;
 /// digit replaced by `-`, one per UTF-16 unit as Claude's JavaScript does. `None` for a name
 /// Claude would shorten.
 pub(crate) fn claude_project_directory_name(cwd: &Path) -> Option<String> {
-    let name = cwd
-        .to_string_lossy()
+    let name = encoded_claude_project_name(cwd);
+    (name.len() <= CLAUDE_PROJECT_DIRECTORY_NAME_MAX).then_some(name)
+}
+
+/// The directory names under `<config dir>/projects` that can hold the transcripts of `cwd`: the
+/// exact name, or, for one Claude shortens, every name that starts with its first 200
+/// characters, which Claude keeps before the hash it appends.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ClaudeProjectDirectoryName {
+    Exact(String),
+    Prefix(String),
+}
+
+impl ClaudeProjectDirectoryName {
+    pub(crate) fn of(cwd: &Path) -> Self {
+        let mut name = encoded_claude_project_name(cwd);
+        if name.len() <= CLAUDE_PROJECT_DIRECTORY_NAME_MAX {
+            return Self::Exact(name);
+        }
+        // Every character of the encoding is ASCII, so this cut is a character boundary.
+        name.truncate(CLAUDE_PROJECT_DIRECTORY_NAME_MAX);
+        Self::Prefix(name)
+    }
+
+    pub(crate) fn matches(&self, directory_name: &str) -> bool {
+        match self {
+            Self::Exact(name) => directory_name == name,
+            Self::Prefix(prefix) => directory_name.starts_with(prefix.as_str()),
+        }
+    }
+}
+
+fn encoded_claude_project_name(cwd: &Path) -> String {
+    cwd.to_string_lossy()
         .chars()
         .flat_map(|character| {
             let replaced = if character.is_ascii_alphanumeric() {
@@ -57,8 +89,7 @@ pub(crate) fn claude_project_directory_name(cwd: &Path) -> Option<String> {
             };
             std::iter::repeat_n(replaced, character.len_utf16())
         })
-        .collect::<String>();
-    (name.len() <= CLAUDE_PROJECT_DIRECTORY_NAME_MAX).then_some(name)
+        .collect()
 }
 
 /// Whether Claude Code can resume `session_id` in `cwd`, which needs its transcript
@@ -106,7 +137,9 @@ mod tests {
     use std::time::Duration;
     use std::{ffi::OsString, path::Path};
 
-    use super::{claude_project_directory_name, claude_session_transcript_exists};
+    use super::{
+        ClaudeProjectDirectoryName, claude_project_directory_name, claude_session_transcript_exists,
+    };
 
     #[test]
     fn claude_project_directories_replace_every_non_alphanumeric_character() {
@@ -131,6 +164,26 @@ mod tests {
         }
         let long = format!("/{}", "a".repeat(200));
         assert_eq!(claude_project_directory_name(Path::new(&long)), None);
+    }
+
+    #[test]
+    fn a_shortened_project_directory_matches_by_its_first_200_characters() {
+        let short = ClaudeProjectDirectoryName::of(Path::new("/repo/wt"));
+        assert_eq!(
+            short,
+            ClaudeProjectDirectoryName::Exact("-repo-wt".to_owned())
+        );
+        assert!(short.matches("-repo-wt"));
+        assert!(!short.matches("-repo-wt-sub"));
+        let long = format!("/{}", "a".repeat(250));
+        let shortened = ClaudeProjectDirectoryName::of(Path::new(&long));
+        let prefix = format!("-{}", "a".repeat(199));
+        assert_eq!(
+            shortened,
+            ClaudeProjectDirectoryName::Prefix(prefix.clone())
+        );
+        assert!(shortened.matches(&format!("{prefix}-1a2b3c")));
+        assert!(!shortened.matches(&prefix[..199]));
     }
 
     #[test]

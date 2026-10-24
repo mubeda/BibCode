@@ -19,7 +19,10 @@ use serde_json::Value;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio_util::sync::CancellationToken;
 
-use crate::orchestration::engine::MAX_IMPORTED_THREAD_MESSAGES;
+use crate::{
+    orchestration::engine::MAX_IMPORTED_THREAD_MESSAGES,
+    provider::environment::ClaudeProjectDirectoryName,
+};
 
 /// Sessions whose transcript changed longer ago than this are not offered.
 pub(crate) const RECENT_WINDOW: Duration = Duration::from_secs(30 * 24 * 60 * 60);
@@ -78,6 +81,8 @@ pub(crate) struct ParsedSession {
     pub(crate) session_id: String,
     pub(crate) title: String,
     pub(crate) model: Option<String>,
+    /// The first `entrypoint` a Claude transcript records; see [`is_terminal_entrypoint`].
+    pub(crate) entrypoint: Option<String>,
     /// Visible messages in the whole transcript.
     pub(crate) message_count: usize,
     /// The first user message and the last messages, at most [`MAX_IMPORTED_THREAD_MESSAGES`].
@@ -189,11 +194,14 @@ pub(crate) fn scan(
     result
 }
 
-/// Re-reads one session for import, requiring that it still records `workspace_root`.
+/// Re-reads one session for import, requiring that it still records `folder`. A Claude
+/// transcript is looked up in the folder's own project directories first, so unrelated projects
+/// cannot exhaust the discovery budget before it is reached; one stored under another directory
+/// name is still found by the walk the Import dialog's scan uses.
 pub(crate) fn load(
     source: &SessionSource,
     session_id: &str,
-    workspace_root: &Path,
+    folder: &SessionFolder,
     now: SystemTime,
 ) -> Result<ParsedSession, LoadFailure> {
     if !is_resumable(source.provider, session_id) {
@@ -202,24 +210,32 @@ pub(crate) fn load(
     let since = now
         .checked_sub(RECENT_WINDOW)
         .unwrap_or(SystemTime::UNIX_EPOCH);
+    let in_folder = match source.provider {
+        AgentSessionProvider::ClaudeAgent => folder_directories(&source.home, folder)
+            .into_iter()
+            .find_map(|directory| {
+                recent_file(directory.join(format!("{session_id}.jsonl")), since)
+            }),
+        AgentSessionProvider::Codex => None,
+    };
     let codex_suffix = format!("-{session_id}.jsonl");
-    let file = discover(source, since)
-        .0
-        .into_iter()
-        .find(|file| {
-            let name = file.path.file_name().and_then(|name| name.to_str());
-            match source.provider {
-                AgentSessionProvider::ClaudeAgent => {
-                    file.path.file_stem().and_then(|stem| stem.to_str()) == Some(session_id)
+    let file = in_folder
+        .or_else(|| {
+            discover(source, since).0.into_iter().find(|file| {
+                let name = file.path.file_name().and_then(|name| name.to_str());
+                match source.provider {
+                    AgentSessionProvider::ClaudeAgent => {
+                        file.path.file_stem().and_then(|stem| stem.to_str()) == Some(session_id)
+                    }
+                    AgentSessionProvider::Codex => {
+                        name.is_some_and(|name| name.ends_with(&codex_suffix))
+                    }
                 }
-                AgentSessionProvider::Codex => {
-                    name.is_some_and(|name| name.ends_with(&codex_suffix))
-                }
-            }
+            })
         })
         .ok_or(LoadFailure::NotFound)?;
     let cwd = read_cwd(&file.path).ok_or(LoadFailure::DifferentDirectory)?;
-    if !DirectoryMatcher::new(workspace_root).matches(&cwd) {
+    if !DirectoryMatcher::new(folder.canonical()).matches(&cwd) {
         return Err(LoadFailure::DifferentDirectory);
     }
     let session = read_session(source.provider, &file, None).ok_or(LoadFailure::Unreadable)?;
@@ -252,6 +268,736 @@ pub(crate) fn is_resumable(provider: AgentSessionProvider, session_id: &str) -> 
     }
 }
 
+/// A folder sessions are matched against: its canonical path, which a recorded cwd must resolve
+/// to, and the spellings Claude may have named its project directory after.
+#[derive(Clone, Debug)]
+pub(crate) struct SessionFolder {
+    canonical: PathBuf,
+    spellings: Vec<PathBuf>,
+}
+
+impl SessionFolder {
+    pub(crate) fn new(path: &Path) -> Self {
+        let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let mut spellings = vec![path.to_path_buf()];
+        if canonical != path {
+            spellings.push(canonical.clone());
+        }
+        Self {
+            canonical,
+            spellings,
+        }
+    }
+
+    pub(crate) fn canonical(&self) -> &Path {
+        &self.canonical
+    }
+}
+
+/// The directories under `<home>/projects` named after `folder`, found by reading entry names
+/// only: Claude keeps a folder's transcripts in its encoded directory.
+fn folder_directories(home: &Path, folder: &SessionFolder) -> Vec<PathBuf> {
+    let mut names = folder
+        .spellings
+        .iter()
+        .map(|spelling| ClaudeProjectDirectoryName::of(spelling))
+        .collect::<Vec<_>>();
+    names.dedup();
+    let Ok(entries) = std::fs::read_dir(home.join("projects")) else {
+        return Vec::new();
+    };
+    let mut directories = entries
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| names.iter().any(|candidate| candidate.matches(name)))
+        })
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    directories.sort();
+    directories
+}
+
+/// A session History offers: one started in a terminal (`cli`), or by a Claude Code old enough
+/// to record no entrypoint. `-p` and Agent SDK sessions (`sdk-*`, BiBCode's own `sdk-rust`
+/// among them), the Desktop app's (`claude-desktop`) and any other are left out.
+pub(crate) fn is_terminal_entrypoint(entrypoint: Option<&str>) -> bool {
+    matches!(entrypoint, None | Some("cli"))
+}
+
+/// The most transcripts one History listing opens, the bytes it reads across every head, tail
+/// and title read, and the share of those bytes the title walk may spend.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ListingBudget {
+    pub(crate) opens: usize,
+    pub(crate) bytes: u64,
+    pub(crate) walk_bytes: u64,
+}
+
+impl Default for ListingBudget {
+    fn default() -> Self {
+        Self {
+            opens: 1_000,
+            bytes: 64 * 1024 * 1024,
+            walk_bytes: 16 * 1024 * 1024,
+        }
+    }
+}
+
+/// The end of a transcript read for its latest title and branch.
+const TAIL_BYTES: u64 = 64 * 1024;
+/// The step of the walk back from the tail toward the head for a buried title.
+const WALK_CHUNK_BYTES: u64 = 256 * 1024;
+/// A longer line holding a title marker is message text, not a title record.
+const MAX_TITLE_LINE_BYTES: usize = 64 * 1024;
+const UNTITLED_SESSION: &str = "Untitled session";
+
+/// Whether a session's terminal still has it open, as far as `<config dir>/sessions/` tells.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Liveness {
+    Closed,
+    Live,
+    Unknown,
+}
+
+impl Liveness {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Closed => "closed",
+            Self::Live => "live",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct HistorySession {
+    pub(crate) session_id: String,
+    pub(crate) title: String,
+    pub(crate) branch: Option<String>,
+    pub(crate) last_active_at: String,
+    pub(crate) liveness: Liveness,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct HistoryListing {
+    /// Newest first.
+    pub(crate) sessions: Vec<HistorySession>,
+    /// More sessions may exist than were listed: the candidate limit or the budget ran out.
+    pub(crate) truncated: bool,
+    /// Transcripts opened and bytes read, which the budget bounds.
+    pub(crate) opened: usize,
+    pub(crate) bytes_read: u64,
+    /// `sessions/` could not be read completely, so sessions not found live read `unknown`.
+    pub(crate) liveness_incomplete: bool,
+}
+
+/// The terminal sessions run in `folder` whose transcripts changed since `now - RECENT_WINDOW`,
+/// newest first, leaving out the `owned` session IDs. Only the folder's own project directories
+/// are listed, and each transcript is read at its head and its last [`TAIL_BYTES`], with a
+/// bounded walk for a title buried between them, all under one `budget`. A cancelled listing
+/// returns nothing.
+pub(crate) fn list_terminal_sessions(
+    home: &Path,
+    folder: &SessionFolder,
+    now: SystemTime,
+    owned: &HashSet<String>,
+    budget: ListingBudget,
+    cancellation: &CancellationToken,
+) -> HistoryListing {
+    let since = now
+        .checked_sub(RECENT_WINDOW)
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    let mut listing = HistoryListing::default();
+    if cancellation.is_cancelled() {
+        return listing;
+    }
+    let mut files = Vec::new();
+    let mut stats = MAX_FILES_PER_SOURCE;
+    'directories: for directory in folder_directories(home, folder) {
+        for path in sorted_entries(&directory) {
+            if path
+                .extension()
+                .is_none_or(|extension| extension != "jsonl")
+            {
+                continue;
+            }
+            if stats == 0 {
+                listing.truncated = true;
+                break 'directories;
+            }
+            stats -= 1;
+            files.extend(recent_file(path, since));
+        }
+    }
+    files.sort_by_key(|file| std::cmp::Reverse(file.modified));
+    let mut reads = BudgetedReads::new(budget);
+    let mut directories = DirectoryMatcher::new(folder.canonical());
+    let mut seen = HashSet::new();
+    let mut found = Vec::new();
+    for file in files {
+        if cancellation.is_cancelled() {
+            return HistoryListing::default();
+        }
+        if found.len() == MAX_CANDIDATES {
+            listing.truncated = true;
+            break;
+        }
+        // Rejected by name, so they cost the `stat` above and nothing more.
+        let Some(session_id) = file.path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        if !is_resumable(AgentSessionProvider::ClaudeAgent, session_id)
+            || owned.contains(session_id)
+            || !seen.insert(session_id.to_owned())
+        {
+            continue;
+        }
+        if !reads.can_open() {
+            listing.truncated = true;
+            break;
+        }
+        match read_terminal_metadata(&file, &mut directories, &mut reads, cancellation) {
+            MetadataRead::Listed { title, branch } => found.push(HistorySession {
+                session_id: session_id.to_owned(),
+                title,
+                branch,
+                last_active_at: iso(file.modified),
+                liveness: Liveness::Unknown,
+            }),
+            MetadataRead::Excluded => {}
+            MetadataRead::OutOfBudget => {
+                listing.truncated = true;
+                break;
+            }
+            MetadataRead::Cancelled => return HistoryListing::default(),
+        }
+    }
+    listing.opened = reads.opened;
+    listing.bytes_read = reads.bytes_read;
+    if !found.is_empty() {
+        let live = read_live_sessions(home);
+        listing.liveness_incomplete = !live.complete;
+        for session in &mut found {
+            session.liveness = live.liveness(&session.session_id);
+        }
+    }
+    listing.sessions = found;
+    listing
+}
+
+/// The opens and bytes a listing has left.
+struct BudgetedReads {
+    opens_left: usize,
+    bytes_left: u64,
+    walk_left: u64,
+    opened: usize,
+    bytes_read: u64,
+}
+
+impl BudgetedReads {
+    fn new(budget: ListingBudget) -> Self {
+        Self {
+            opens_left: budget.opens,
+            bytes_left: budget.bytes,
+            walk_left: budget.walk_bytes.min(budget.bytes),
+            opened: 0,
+            bytes_read: 0,
+        }
+    }
+
+    fn can_open(&self) -> bool {
+        self.opens_left > 0 && self.bytes_left > 0
+    }
+
+    fn open(&mut self, path: &Path) -> Option<File> {
+        self.opens_left = self.opens_left.checked_sub(1)?;
+        self.opened += 1;
+        File::open(path).ok()
+    }
+
+    fn charge(&mut self, bytes: u64) {
+        self.bytes_left = self.bytes_left.saturating_sub(bytes);
+        self.bytes_read += bytes;
+    }
+
+    /// Reads `length` bytes at `offset`, or fewer at the end of the file; `None` when the budget
+    /// cannot cover the read or the file cannot be read.
+    fn read_at(&mut self, file: &mut File, offset: u64, length: u64) -> Option<Vec<u8>> {
+        use std::io::{Seek, SeekFrom};
+        if length > self.bytes_left {
+            return None;
+        }
+        file.seek(SeekFrom::Start(offset)).ok()?;
+        let mut bytes = Vec::with_capacity(usize::try_from(length).unwrap_or(0));
+        let read = file.take(length).read_to_end(&mut bytes);
+        self.charge(bytes.len() as u64);
+        read.ok().map(|_| bytes)
+    }
+}
+
+/// Counts what a reader pulled from its file, which is what a listing's budget is charged.
+struct CountingReader<R> {
+    inner: R,
+    count: std::rc::Rc<std::cell::Cell<u64>>,
+}
+
+impl<R: Read> Read for CountingReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(buffer)?;
+        self.count.set(self.count.get() + read as u64);
+        Ok(read)
+    }
+}
+
+enum MetadataRead {
+    Listed {
+        title: String,
+        branch: Option<String>,
+    },
+    Excluded,
+    OutOfBudget,
+    Cancelled,
+}
+
+/// Titles and branch seen in one window of a transcript, the latest of each.
+#[derive(Default)]
+struct TranscriptMarks {
+    custom_title: Option<String>,
+    ai_title: Option<String>,
+    branch: Option<String>,
+}
+
+impl TranscriptMarks {
+    fn observe(&mut self, record: &Record) {
+        if let Some(name) = custom_title_of(record) {
+            self.custom_title = Some(name.to_owned());
+        }
+        if let Some(title) = trimmed(record.ai_title.as_deref()) {
+            self.ai_title = Some(title.to_owned());
+        }
+        if let Some(branch) = trimmed(record.git_branch.as_deref()) {
+            self.branch = Some(branch.to_owned());
+        }
+    }
+
+    fn has_title(&self) -> bool {
+        self.custom_title.is_some() || self.ai_title.is_some()
+    }
+}
+
+/// The head read of [`list_terminal_sessions`]: the first cwd, which must be the folder, and the
+/// first entrypoint, which must be a terminal's, then the first visible prompt. Stops at the
+/// first record that excludes the session.
+struct Head {
+    marks: TranscriptMarks,
+    prompt_title: Option<String>,
+    /// Where the next unread line starts: the walk covers the bytes from here to the tail.
+    end: u64,
+}
+
+fn read_terminal_metadata(
+    file: &SessionFile,
+    directories: &mut DirectoryMatcher<'_>,
+    reads: &mut BudgetedReads,
+    cancellation: &CancellationToken,
+) -> MetadataRead {
+    let Some(mut handle) = reads.open(&file.path) else {
+        return MetadataRead::Excluded;
+    };
+    let head = match read_head(&handle, directories, reads, cancellation) {
+        Ok(head) => head,
+        Err(outcome) => return outcome,
+    };
+    let Some(tail) = read_tail(&mut handle, file.size, head.end, reads) else {
+        return MetadataRead::OutOfBudget;
+    };
+    let mut walked = TranscriptMarks::default();
+    if !tail.marks.has_title() {
+        walked = walk_for_title(&mut handle, head.end, tail.start, reads, cancellation);
+        if cancellation.is_cancelled() {
+            return MetadataRead::Cancelled;
+        }
+    }
+    let title = [&tail.marks, &walked, &head.marks]
+        .iter()
+        .find_map(|marks| marks.custom_title.clone())
+        .or_else(|| {
+            [&tail.marks, &walked, &head.marks]
+                .iter()
+                .find_map(|marks| marks.ai_title.clone())
+        })
+        .or(head.prompt_title)
+        .unwrap_or_else(|| UNTITLED_SESSION.to_owned());
+    MetadataRead::Listed {
+        title,
+        branch: tail.marks.branch.or(head.marks.branch),
+    }
+}
+
+fn read_head(
+    handle: &File,
+    directories: &mut DirectoryMatcher<'_>,
+    reads: &mut BudgetedReads,
+    cancellation: &CancellationToken,
+) -> Result<Head, MetadataRead> {
+    let limit = CWD_PREFIX_BYTES.min(reads.bytes_left);
+    let count = std::rc::Rc::new(std::cell::Cell::new(0));
+    let mut records = RecordReader::new(CountingReader {
+        inner: handle.take(limit),
+        count: count.clone(),
+    })
+    .with_cancellation(cancellation);
+    let mut marks = TranscriptMarks::default();
+    let mut cwd_matched = false;
+    let mut entrypoint_seen = false;
+    let mut first_prompt = None;
+    let mut decided = false;
+    for record in records.by_ref().take(CWD_PREFIX_RECORDS) {
+        let Some(record) = record else { continue };
+        marks.observe(&record);
+        if !cwd_matched && let Some(cwd) = record_cwd(&record) {
+            if !directories.matches(cwd) {
+                reads.charge(count.get());
+                return Err(MetadataRead::Excluded);
+            }
+            cwd_matched = true;
+        }
+        if !entrypoint_seen && let Some(entrypoint) = trimmed(record.entrypoint.as_deref()) {
+            if !is_terminal_entrypoint(Some(entrypoint)) {
+                reads.charge(count.get());
+                return Err(MetadataRead::Excluded);
+            }
+            entrypoint_seen = true;
+        }
+        if first_prompt.is_none() {
+            first_prompt = visible_prompt(&record).as_deref().and_then(prompt_title);
+        }
+        if cwd_matched && first_prompt.is_some() {
+            decided = true;
+            break;
+        }
+    }
+    reads.charge(count.get());
+    if cancellation.is_cancelled() {
+        return Err(MetadataRead::Cancelled);
+    }
+    if records.failed {
+        return Err(MetadataRead::Excluded);
+    }
+    let window_full = count.get() >= limit || records.lines >= CWD_PREFIX_RECORDS;
+    if !decided && window_full && limit < CWD_PREFIX_BYTES {
+        // The budget, not the head's own bound, cut the read short.
+        return Err(MetadataRead::OutOfBudget);
+    }
+    // No cwd in the head (as for the Import dialog), or a transcript that ends without a prompt:
+    // nothing here to continue.
+    if !cwd_matched || (first_prompt.is_none() && !window_full) {
+        return Err(MetadataRead::Excluded);
+    }
+    Ok(Head {
+        marks,
+        prompt_title: first_prompt,
+        end: records.position,
+    })
+}
+
+struct Tail {
+    marks: TranscriptMarks,
+    /// Where the tail's first whole line starts.
+    start: u64,
+}
+
+/// The last [`TAIL_BYTES`] after `head_end`, its first partial line dropped. `None` when the
+/// budget cannot cover the read.
+fn read_tail(
+    handle: &mut File,
+    size: u64,
+    head_end: u64,
+    reads: &mut BudgetedReads,
+) -> Option<Tail> {
+    if size <= head_end {
+        return Some(Tail {
+            marks: TranscriptMarks::default(),
+            start: size,
+        });
+    }
+    let from = size.saturating_sub(TAIL_BYTES).max(head_end);
+    // From the byte before, so a tail that starts on a line boundary keeps its first line.
+    let read_from = if from > head_end { from - 1 } else { from };
+    let bytes = reads.read_at(handle, read_from, size - read_from)?;
+    let skip = if read_from < from {
+        bytes
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(bytes.len(), |index| index + 1)
+    } else {
+        0
+    };
+    let mut marks = TranscriptMarks::default();
+    for record in RecordReader::new(&bytes[skip..]).flatten() {
+        marks.observe(&record);
+    }
+    Some(Tail {
+        marks,
+        start: read_from + skip as u64,
+    })
+}
+
+/// Walks back from `end` toward `start` in [`WALK_CHUNK_BYTES`] steps for the last
+/// `custom-title` (or, failing that, the last `aiTitle`), parsing only the lines whose raw bytes
+/// name one. Stops when the walk's share of the budget is spent; the row then keeps its head
+/// title or first prompt.
+fn walk_for_title(
+    handle: &mut File,
+    start: u64,
+    end: u64,
+    reads: &mut BudgetedReads,
+    cancellation: &CancellationToken,
+) -> TranscriptMarks {
+    let mut marks = TranscriptMarks::default();
+    // The end of the line that starts before the chunk read last, which the next read completes;
+    // dropped once it outgrows a title record.
+    let mut carry: Vec<u8> = Vec::new();
+    let mut carry_oversized = false;
+    let mut chunk_end = end;
+    while chunk_end > start && !cancellation.is_cancelled() {
+        let chunk_start = chunk_end.saturating_sub(WALK_CHUNK_BYTES).max(start);
+        let length = chunk_end - chunk_start;
+        if length > reads.walk_left {
+            break;
+        }
+        let Some(mut bytes) = reads.read_at(handle, chunk_start, length) else {
+            break;
+        };
+        reads.walk_left -= length;
+        chunk_end = chunk_start;
+        bytes.extend_from_slice(&carry);
+        // `start` is a line boundary; elsewhere the bytes before the first newline belong to a
+        // line that starts in an earlier chunk.
+        let whole_from = if chunk_start == start {
+            0
+        } else if let Some(index) = bytes.iter().position(|byte| *byte == b'\n') {
+            index + 1
+        } else {
+            if !carry_oversized && bytes.len() <= MAX_TITLE_LINE_BYTES {
+                carry = bytes;
+            } else {
+                carry = Vec::new();
+                carry_oversized = true;
+            }
+            continue;
+        };
+        let mut lines = bytes[whole_from..]
+            .split(|byte| *byte == b'\n')
+            .collect::<Vec<_>>();
+        if carry_oversized {
+            // The last line continues into the carry that outgrew a title record.
+            lines.pop();
+        }
+        for line in lines.iter().rev() {
+            if let Some(found) = title_line(line) {
+                if found.custom_title.is_some() {
+                    marks.custom_title = found.custom_title;
+                    return marks;
+                }
+                if marks.ai_title.is_none() {
+                    marks.ai_title = found.ai_title;
+                }
+            }
+        }
+        let partial = whole_from.saturating_sub(1);
+        carry_oversized = partial > MAX_TITLE_LINE_BYTES;
+        carry = if carry_oversized {
+            Vec::new()
+        } else {
+            bytes[..partial].to_vec()
+        };
+    }
+    marks
+}
+
+/// The title a raw line records, parsed only when its bytes name one.
+fn title_line(line: &[u8]) -> Option<TranscriptMarks> {
+    if line.len() > MAX_TITLE_LINE_BYTES
+        || !(contains(line, b"custom-title") || contains(line, b"aiTitle"))
+    {
+        return None;
+    }
+    let record = serde_json::from_slice::<Record>(line).ok()?;
+    let mut marks = TranscriptMarks::default();
+    marks.observe(&record);
+    marks.branch = None;
+    marks.has_title().then_some(marks)
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+fn record_cwd(record: &Record) -> Option<&str> {
+    [
+        record.cwd.as_deref(),
+        record
+            .payload
+            .as_ref()
+            .and_then(|payload| payload.cwd.as_deref()),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::trim)
+    .find(|cwd| !cwd.is_empty())
+}
+
+/// A Claude user prompt as the import shows it: not a subagent's, meta or compaction record.
+fn visible_prompt(record: &Record) -> Option<String> {
+    if record.kind.as_deref() != Some("user")
+        || record.is_sidechain == Some(true)
+        || record.is_meta == Some(true)
+        || record.is_compact_summary == Some(true)
+    {
+        return None;
+    }
+    let text = extract_text(
+        record
+            .message
+            .as_ref()
+            .and_then(|message| message.content.as_ref()),
+    );
+    (!text.is_empty()).then_some(text)
+}
+
+/// Sessions `<home>/sessions/` names whose process is alive, and whether that directory was
+/// read completely.
+#[derive(Debug, Default)]
+struct LiveSessions {
+    live: HashSet<String>,
+    complete: bool,
+}
+
+impl LiveSessions {
+    fn liveness(&self, session_id: &str) -> Liveness {
+        if self.live.contains(session_id) {
+            Liveness::Live
+        } else if self.complete {
+            Liveness::Closed
+        } else {
+            Liveness::Unknown
+        }
+    }
+}
+
+/// One session's liveness, read as [`list_terminal_sessions`] reads it, for a resume to check it
+/// again.
+pub(crate) fn session_liveness(home: &Path, session_id: &str) -> Liveness {
+    read_live_sessions(home).liveness(session_id)
+}
+
+const MAX_LIVE_SESSION_FILES: usize = 256;
+const MAX_LIVE_SESSION_FILE_BYTES: u64 = 64 * 1024;
+
+#[derive(Deserialize)]
+struct LiveSessionEntry {
+    #[serde(rename = "sessionId")]
+    session_id: String,
+    pid: u32,
+    entrypoint: Option<String>,
+}
+
+/// Reads Claude's running-session files once: a `<pid>.json` naming a session whose process is
+/// alive makes it live. The fields are undocumented, so anything short of a complete read
+/// (no directory, which Claude keeps once it has created it; an unreadable directory; more than
+/// [`MAX_LIVE_SESSION_FILES`] files; one file unreadable, unparsable or over
+/// [`MAX_LIVE_SESSION_FILE_BYTES`]) leaves every session not found live unknown. A reused PID
+/// reads as live, which only forces a copy.
+fn read_live_sessions(home: &Path) -> LiveSessions {
+    let mut live = LiveSessions::default();
+    let entries = match std::fs::read_dir(home.join("sessions")) {
+        Ok(entries) => entries,
+        // A Claude Code that writes no running-session files.
+        Err(error) if error.kind() == ErrorKind::NotFound => return live,
+        Err(_) => {
+            tracing::warn!(
+                "Claude's running-session directory could not be read; History offers a copy of \
+                 every session"
+            );
+            return live;
+        }
+    };
+    let mut complete = true;
+    let mut paths = Vec::new();
+    for entry in entries {
+        match entry {
+            Ok(entry) => {
+                let path = entry.path();
+                if path
+                    .extension()
+                    .is_some_and(|extension| extension == "json")
+                {
+                    paths.push(path);
+                }
+            }
+            Err(_) => complete = false,
+        }
+    }
+    let listed = paths.len();
+    if listed > MAX_LIVE_SESSION_FILES {
+        complete = false;
+        paths.sort();
+        paths.truncate(MAX_LIVE_SESSION_FILES);
+    }
+    let mut claimed = Vec::new();
+    for path in paths {
+        let file = match File::open(&path) {
+            Ok(file) => file,
+            // Its session exited between the listing and the read.
+            Err(error) if error.kind() == ErrorKind::NotFound => continue,
+            Err(_) => {
+                complete = false;
+                continue;
+            }
+        };
+        let mut bytes = Vec::new();
+        if file
+            .take(MAX_LIVE_SESSION_FILE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .is_err()
+            || bytes.len() as u64 > MAX_LIVE_SESSION_FILE_BYTES
+        {
+            complete = false;
+            continue;
+        }
+        let Ok(entry) = serde_json::from_slice::<LiveSessionEntry>(&bytes) else {
+            complete = false;
+            continue;
+        };
+        // BiBCode's own Claude processes.
+        if entry.entrypoint.as_deref() == Some("sdk-rust") {
+            continue;
+        }
+        claimed.push(entry);
+    }
+    let running = crate::process::running_processes(claimed.iter().map(|entry| entry.pid));
+    live.live = claimed
+        .into_iter()
+        .filter(|entry| running.contains(&entry.pid))
+        .map(|entry| entry.session_id)
+        .collect();
+    live.complete = complete;
+    if !complete {
+        tracing::warn!(
+            files = listed,
+            "Claude's running-session files could not be read completely; History offers a copy \
+             of sessions it cannot place"
+        );
+    }
+    live
+}
+
 struct SessionFile {
     path: PathBuf,
     modified: SystemTime,
@@ -269,19 +1015,7 @@ fn discover(source: &SessionSource, since: SystemTime) -> (Vec<SessionFile>, boo
             return;
         }
         budget -= 1;
-        let Ok(metadata) = std::fs::metadata(&path) else {
-            return;
-        };
-        let Ok(modified) = metadata.modified() else {
-            return;
-        };
-        if metadata.is_file() && modified >= since {
-            files.push(SessionFile {
-                path,
-                modified,
-                size: metadata.len(),
-            });
-        }
+        files.extend(recent_file(path, since));
     };
     match source.provider {
         AgentSessionProvider::ClaudeAgent => {
@@ -319,6 +1053,17 @@ fn discover(source: &SessionSource, since: SystemTime) -> (Vec<SessionFile>, boo
     }
     files.sort_by_key(|file| std::cmp::Reverse(file.modified));
     (files, truncated)
+}
+
+/// `path` when it is a file changed since `since`, after one `stat`.
+fn recent_file(path: PathBuf, since: SystemTime) -> Option<SessionFile> {
+    let metadata = std::fs::metadata(&path).ok()?;
+    let modified = metadata.modified().ok()?;
+    (metadata.is_file() && modified >= since).then_some(SessionFile {
+        path,
+        modified,
+        size: metadata.len(),
+    })
 }
 
 fn sorted_entries(directory: &Path) -> Vec<PathBuf> {
@@ -368,20 +1113,7 @@ fn read_cwd(path: &Path) -> Option<String> {
     records
         .take(CWD_PREFIX_RECORDS)
         .flatten()
-        .find_map(|record| {
-            [
-                record.cwd.as_deref(),
-                record
-                    .payload
-                    .as_ref()
-                    .and_then(|payload| payload.cwd.as_deref()),
-            ]
-            .into_iter()
-            .flatten()
-            .map(str::trim)
-            .find(|cwd| !cwd.is_empty())
-            .map(str::to_owned)
-        })
+        .find_map(|record| record_cwd(&record).map(str::to_owned))
 }
 
 fn read_session(
@@ -458,6 +1190,13 @@ struct Record {
     session_id: Option<String>,
     #[serde(rename = "aiTitle")]
     ai_title: Option<String>,
+    /// On `custom-title` records: the `/rename` name, or the title Claude generated.
+    #[serde(rename = "customTitle")]
+    custom_title: Option<String>,
+    /// How the session was started (`cli`, `claude-desktop`, `sdk-*`); undocumented.
+    entrypoint: Option<String>,
+    #[serde(rename = "gitBranch")]
+    git_branch: Option<String>,
     #[serde(rename = "isSidechain")]
     is_sidechain: Option<bool>,
     #[serde(rename = "isMeta")]
@@ -624,6 +1363,8 @@ fn build_session(
     };
     let mut has_codex_session_id = false;
     let mut title: Option<String> = None;
+    let mut custom_title: Option<String> = None;
+    let mut entrypoint: Option<String> = None;
     let mut model: Option<String> = None;
     let mut messages: VecDeque<RetainedMessage> = VecDeque::new();
     let mut first_user: Option<(usize, SessionMessage)> = None;
@@ -660,6 +1401,9 @@ fn build_session(
     for (index, record) in records.enumerate() {
         let Some(record) = record else { continue };
         if provider == AgentSessionProvider::ClaudeAgent {
+            if entrypoint.is_none() {
+                entrypoint = trimmed(record.entrypoint.as_deref()).map(str::to_owned);
+            }
             if record.is_sidechain == Some(true)
                 || record.is_meta == Some(true)
                 || record.is_compact_summary == Some(true)
@@ -671,6 +1415,9 @@ fn build_session(
             }
             if let Some(ai_title) = trimmed(record.ai_title.as_deref()) {
                 title = Some(ai_title.to_owned());
+            }
+            if let Some(name) = custom_title_of(&record) {
+                custom_title = Some(name.to_owned());
             }
             let message_model = record
                 .message
@@ -806,23 +1553,33 @@ fn build_session(
         retained.drain(..keep_from);
         retained.insert(0, first_message.clone());
     }
-    let derived_title = first_message
-        .text
-        .trim()
+    Some(ParsedSession {
+        session_id,
+        title: custom_title
+            .or(title)
+            .or_else(|| prompt_title(&first_message.text))
+            .unwrap_or_else(|| FALLBACK_TITLE.to_owned()),
+        model,
+        entrypoint,
+        message_count,
+        messages: retained,
+    })
+}
+
+/// The first line of a prompt, at most [`MAX_TITLE_CHARS`] characters.
+fn prompt_title(text: &str) -> Option<String> {
+    text.trim()
         .split('\n')
         .next()
         .map(|line| line.chars().take(MAX_TITLE_CHARS).collect::<String>())
         .map(|line| line.trim().to_owned())
-        .filter(|line| !line.is_empty());
-    Some(ParsedSession {
-        session_id,
-        title: title
-            .or(derived_title)
-            .unwrap_or_else(|| FALLBACK_TITLE.to_owned()),
-        model,
-        message_count,
-        messages: retained,
-    })
+        .filter(|line| !line.is_empty())
+}
+
+fn custom_title_of(record: &Record) -> Option<&str> {
+    (record.kind.as_deref() == Some("custom-title"))
+        .then(|| trimmed(record.custom_title.as_deref()))
+        .flatten()
 }
 
 fn has_matching_event_in_turn(messages: &VecDeque<RetainedMessage>, text: &str) -> bool {
@@ -869,6 +1626,8 @@ struct RecordReader<R> {
     reader: BufReader<R>,
     buffer: Vec<u8>,
     lines: usize,
+    /// Bytes of the lines returned so far, newlines included: where the next line starts.
+    position: u64,
     failed: bool,
     cancellation: Option<CancellationToken>,
 }
@@ -879,6 +1638,7 @@ impl<R: Read> RecordReader<R> {
             reader: BufReader::with_capacity(64 * 1024, reader),
             buffer: Vec::new(),
             lines: 0,
+            position: 0,
             failed: false,
             cancellation: None,
         }
@@ -934,7 +1694,9 @@ impl<R: Read> Iterator for RecordReader<R> {
                     self.buffer.extend_from_slice(&available[..end]);
                 }
             }
-            self.reader.consume(newline.map_or(end, |index| index + 1));
+            let consumed = newline.map_or(end, |index| index + 1);
+            self.position += consumed as u64;
+            self.reader.consume(consumed);
             if newline.is_some() {
                 break;
             }
