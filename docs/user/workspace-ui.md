@@ -1339,11 +1339,25 @@ typing `café au lait` quickly can lose more than the `é`. A paste of more than
 100 characters sends nothing either, and the panel asks you to paste it in parts.
 
 A disabled control says why when you point at it. **Stop** shuts the device
-down. One device runs per platform: an Android emulator and an iOS simulator
-can run side by side, but to start another device of the same platform, stop
-the running one first. A device that fails shows **Failed:** with the reason,
-for example a boot that did not finish within 180 s, or a simulator shut down
-outside BiBCode. BiBCode only shuts down simulators it started.
+down. A device that fails shows **Failed:** with the reason, for example a boot
+that did not finish within 180 s, or a simulator shut down outside BiBCode, and
+a stopped one says so; **Start** starts it again. BiBCode only shuts down
+simulators it started.
+
+**One device per task.** Up to four devices run at once on a server, of either
+platform, and each image runs once. Each thread's Device panel remembers the
+device you picked or started there: switch threads and each one shows its own
+device, or its last attempt and why it ended, without picking it again. A
+thread with nothing picked shows the device its agent started. Running devices
+stay in the list with whose they are, such as "Pixel 8 — Running here" or
+"Pixel 8 — Running in Fix login"; pick one to look at it and use it. Another
+thread's device says "Started in Fix login." under the toolbar, and stopping it
+asks first, because that task loses its device and a new boot takes minutes.
+With four devices running, **Start** says so; a start the server refuses lists
+**Stop** for each running device. Deleting a thread stops the devices it
+started; archiving it does not. A chat panel's devices are its host thread's.
+A second desktop window or browser tab on another thread shows a second device
+at the same time.
 
 **View only.** An iOS simulator opens view only when BiBCode cannot use this
 Xcode's simulator interfaces: an Xcode release that changed them ("Xcode
@@ -1366,8 +1380,12 @@ screen** starts it again.
 
 **Agents.** While device previews are on, coding agents on that environment can
 use the `device_list`, `device_open`, `device_screenshot`, and `device_close`
-tools on the same devices you see. They disappear from an agent's tool list
-once the setting is off.
+tools on the same devices you see. An agent's devices are its thread's (a chat
+panel's agent counts as its host): `device_list` marks them, a screenshot
+without a device id takes the agent's own device, opening an image its thread
+already runs returns that device, and it cannot start an image or stop a device
+another thread is using. The tools disappear from an agent's tool list once
+the setting is off.
 
 ### Activity and targeted Stop
 
@@ -1567,10 +1585,16 @@ The Files surface is a full file manager for the active workspace:
 
 ## Current limitations
 
-- Device previews run one Android emulator and one iOS simulator at a time per
-  environment, and iOS simulators only on macOS servers. iOS takes a single
-  touch, and BiBCode cannot install apps or create simulators. Two people
-  watching the same device both control it.
+- Device previews run at most four devices at once per environment, one per
+  image, and iOS simulators only on macOS servers. BiBCode does not check that
+  the host has the memory for four: one that does not fails at boot with the
+  emulator's reason. One panel shows one device at a time; open a second window
+  or tab on another thread to watch two. iOS takes a single touch, and BiBCode
+  cannot install apps or create simulators. Two people watching the same device
+  both control it. A device stays with the thread that started it, even when
+  another thread uses it. The panel keeps the four most recent stopped or failed
+  devices of the environment, so with several threads an older attempt's reason
+  can drop out.
 
 - Staged-row diff viewing in the right-panel Source Control surface does not yet
   use a true `git diff --cached` source. Git Manager diffs are a separate path.

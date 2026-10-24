@@ -3046,20 +3046,31 @@ the typed `DeviceRpcError` union in `packages/contracts/src/device.ts`.
 
 | Method                     | Kind   | Scope                   | Payload and result                                                                                        |
 | -------------------------- | ------ | ----------------------- | --------------------------------------------------------------------------------------------------------- |
-| `device.subscribeCatalog`  | stream | `orchestration:read`    | The current catalog (per platform: availability and images; devices), then every change.                  |
+| `device.subscribeCatalog`  | stream | `orchestration:read`    | The current catalog (per platform: availability and images; devices in open order), then every change.    |
 | `device.refreshCatalog`    | unary  | `orchestration:read`    | `{}`; reruns every platform's discovery past its 30 s cache. Changes arrive on `device.subscribeCatalog`. |
-| `device.open`              | unary  | `orchestration:operate` | `{ platform, imageId }` → `{ deviceId }` at `starting`; boot progress arrives in the catalog.             |
+| `device.open`              | unary  | `orchestration:operate` | `{ platform, imageId, threadId? }` → `{ deviceId }` at `starting`, or the image's running device's id.    |
 | `device.close`             | unary  | `orchestration:operate` | `{ deviceId }`; returns once the device has ended (up to the 10 s stop timeout).                          |
 | `device.input`             | unary  | `orchestration:operate` | `{ deviceId, events }`: 1 to 64 touch, key, or text events. The client keeps one batch in flight.         |
 | `device.rotate`            | unary  | `orchestration:operate` | `{ deviceId, orientation }` → `{ orientation }` the device ended in; the catalog shows what it reports.   |
 | `device.subscribeFrames`   | stream | `orchestration:read`    | `{ deviceId }` → JPEG frames `{ seq, width, height, orientation, jpegBase64 }`, conflated to the latest.  |
 | `device.createMediaTicket` | unary  | `orchestration:read`    | `{ deviceId }` → `{ ticket, expiresAtMs }` for one H.264 media socket on this connection's channel.       |
 
-`device.refreshCatalog`, `device.close`, `device.input`, and `device.rotate` are
-in the profiler's `is_long_running` list, because they wait on discovery or the
-emulator: `emulator -list-avds` and `simctl` (with the Xcode probes on macOS), a
-stop (up to 10 s), a stalled input stream (up to 5 s), and reading back a
-rotation (about 2.5 s on Android, 1.2 s on iOS).
+`device.open`, `device.refreshCatalog`, `device.close`, `device.input`, and
+`device.rotate` are in the profiler's `is_long_running` list, because they wait
+on discovery or the emulator: `emulator -list-avds` and `simctl` (with the Xcode
+probes on macOS), `check_available`'s `simctl list` (up to 15 s), a stop (up to
+10 s), a stalled input stream (up to 5 s), and reading back a rotation (about
+2.5 s on Android, 1.2 s on iOS).
+
+`device.open`'s optional `threadId` names the root thread the device is for (a
+chat panel's host, else the thread). The server trims it, refuses a blank one
+with `DeviceInputError`, publishes it as the snapshot's `threadId`, and refuses
+a recently deleted thread with `DeviceNotFoundError`. Boot progress arrives in
+the catalog. An image whose device is starting, booting, or ready returns that
+device and keeps its owner; a stopping one fails with `DeviceNotReadyError`;
+a fifth live device fails with `DeviceLimitError`. Older servers ignore
+`threadId` and run one device per platform; older clients strip the snapshot's
+`threadId`, so neither needs a capability.
 
 `device.refreshCatalog` is newer than the other device methods, so servers that
 have it also advertise the `deviceCatalogRefresh` capability (decoded `false`
