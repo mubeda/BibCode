@@ -23,6 +23,7 @@ import {
   KEY_ARROW_LEFT_COMMAND,
   KEY_ARROW_RIGHT_COMMAND,
   KEY_ARROW_UP_COMMAND,
+  KEY_DOWN_COMMAND,
   KEY_ENTER_COMMAND,
   KEY_TAB_COMMAND,
   COMMAND_PRIORITY_HIGH,
@@ -1083,27 +1084,21 @@ interface ComposerPromptEditorProps {
     cursorAdjacentToMention: boolean,
     terminalContextIds: string[],
   ) => void;
-  onCommandKeyDown?: (
-    key: "ArrowDown" | "ArrowUp" | "Enter" | "Tab",
-    event: KeyboardEvent,
-  ) => boolean;
+  onCommandKeyDown?: (key: ComposerCommandKey, event: KeyboardEvent) => boolean;
   onPaste: React.ClipboardEventHandler<HTMLElement>;
   editorRef: React.RefObject<ComposerPromptEditorHandle | null>;
 }
 
+/** Keys the composer may claim before the editor handles them. */
+export type ComposerCommandKey = "ArrowDown" | "ArrowUp" | "Enter" | "Tab" | "PageUp" | "PageDown";
+
 function ComposerCommandKeyPlugin(props: {
-  onCommandKeyDown?: (
-    key: "ArrowDown" | "ArrowUp" | "Enter" | "Tab",
-    event: KeyboardEvent,
-  ) => boolean;
+  onCommandKeyDown?: (key: ComposerCommandKey, event: KeyboardEvent) => boolean;
 }) {
   const [editor] = useLexicalComposerContext();
 
   useEffect(() => {
-    const handleCommand = (
-      key: "ArrowDown" | "ArrowUp" | "Enter" | "Tab",
-      event: KeyboardEvent | null,
-    ): boolean => {
+    const handleCommand = (key: ComposerCommandKey, event: KeyboardEvent | null): boolean => {
       if (!props.onCommandKeyDown || !event) {
         return false;
       }
@@ -1141,12 +1136,22 @@ function ComposerCommandKeyPlugin(props: {
       (event) => handleCommand("Tab", event),
       COMMAND_PRIORITY_HIGH,
     );
+    // Lexical has no page-key commands; its generic keydown carries them.
+    const unregisterPageKeys = editor.registerCommand(
+      KEY_DOWN_COMMAND,
+      (event) =>
+        event.key === "PageUp" || event.key === "PageDown"
+          ? handleCommand(event.key, event)
+          : false,
+      COMMAND_PRIORITY_HIGH,
+    );
 
     return () => {
       unregisterArrowDown();
       unregisterArrowUp();
       unregisterEnter();
       unregisterTab();
+      unregisterPageKeys();
     };
   }, [editor, props]);
 

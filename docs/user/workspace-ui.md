@@ -425,6 +425,22 @@ finishes. Clicking a tool call collapses it, and that choice holds until you
 switch threads or reload. The setting applies to open threads at once and is
 stored on this device.
 
+With a mouse or trackpad, a thread with two or more of your messages shows a
+minimap at the timeline's left edge, one mark per message. Hover it to preview
+a turn and click to jump there. **Previous turn** and **Next turn** above and
+below it step to the nearest turn start above or below where you are reading;
+partway through a turn, **Previous turn** returns to that turn's start. At the
+start or end of the thread the button in that direction is dimmed and does
+nothing.
+
+PageUp and PageDown in the composer scroll the timeline by about a screen, so
+you can read back without leaving the draft. While the key can still move the
+caret to another line of a multi-line draft, it moves the caret instead:
+PageUp scrolls once the caret is on the first line, PageDown once it is on the
+last. With Shift, Alt, Ctrl, or Cmd held, the keys keep their usual meaning.
+These keys and the minimap jump instead of scrolling smoothly when the system
+asks for reduced motion.
+
 ### Uploading chat attachments
 
 When the server supports staged attachments and a message's total encoded

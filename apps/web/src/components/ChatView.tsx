@@ -131,7 +131,12 @@ import {
   isLatestTurnSettled,
 } from "../session-logic";
 import { type LegendListRef } from "@legendapp/list/react";
-import { getAnchoredTurnMetrics, type TimelineScrollMode } from "./chat/timelineScrollAnchoring";
+import {
+  getAnchoredTurnMetrics,
+  getTimelinePageScrollOffset,
+  timelineScrollAnimates,
+  type TimelineScrollMode,
+} from "./chat/timelineScrollAnchoring";
 import {
   buildPendingUserInputAnswers,
   derivePendingUserInputProgress,
@@ -4034,6 +4039,28 @@ function ChatViewContent(props: ChatViewProps) {
     setScrollPillThreadId(null);
     void legendListRef.current?.scrollToEnd?.({ animated });
   }, []);
+  const pageTimeline = useCallback(
+    (key: "PageUp" | "PageDown", repeat: boolean) => {
+      const list = legendListRef.current;
+      const state = list?.getState();
+      if (!list || !state) {
+        return;
+      }
+      const offset = getTimelinePageScrollOffset({
+        state,
+        composerOverlayHeight,
+        direction: key === "PageUp" ? -1 : 1,
+      });
+      // Already at that end: nothing moves, and following the live end must not stop.
+      if (Math.abs(offset - state.scroll) < 1) {
+        return;
+      }
+      cancelTimelineLiveFollowForUserNavigation();
+      // A held key repeats faster than a glide finishes, so repeats jump.
+      void list.scrollToOffset({ offset, animated: !repeat && timelineScrollAnimates() });
+    },
+    [cancelTimelineLiveFollowForUserNavigation, composerOverlayHeight],
+  );
   // The timeline remounts per thread (it is keyed by thread id), so bind to
   // each thread's scroll node; without a thread there is no timeline.
   useEffect(() => {
@@ -7114,6 +7141,7 @@ function ChatViewContent(props: ChatViewProps) {
                             scheduleComposerFocus={scheduleComposerFocus}
                             setThreadError={setThreadError}
                             onExpandImage={onExpandTimelineImage}
+                            onPageTimeline={pageTimeline}
                           />
                         </div>
                       </div>

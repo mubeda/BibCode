@@ -55,6 +55,36 @@ export function resolveTimelineMinimapIndexFromPointer(input: {
   return Math.max(0, Math.min(input.itemCount - 1, Math.round(progress * (input.itemCount - 1))));
 }
 
+/** How far below the viewport top a minimap jump lands a turn's first row. */
+export const TIMELINE_MINIMAP_JUMP_OFFSET = 24;
+
+export type TimelineMinimapStep = "previous" | "next";
+
+/**
+ * The nearest turns whose jump would scroll up or down from `scrollTop`; null where none would
+ * move. Partway through a turn, the previous step returns to that turn's start.
+ */
+export function resolveTimelineMinimapStepTargets(input: {
+  readonly itemTops: ReadonlyArray<number | null>;
+  readonly scrollTop: number;
+  readonly maxScrollTop: number;
+}): Record<TimelineMinimapStep, number | null> {
+  let previous: number | null = null;
+  let next: number | null = null;
+  for (const [index, top] of input.itemTops.entries()) {
+    if (top === null) {
+      continue;
+    }
+    const jumpTop = Math.min(input.maxScrollTop, Math.max(0, top - TIMELINE_MINIMAP_JUMP_OFFSET));
+    if (jumpTop < input.scrollTop - 1) {
+      previous = index;
+    } else if (jumpTop > input.scrollTop + 1 && next === null) {
+      next = index;
+    }
+  }
+  return { previous, next };
+}
+
 export function resolveTimelineMinimapHasPersistentGutter(viewportWidth: number): boolean {
   if (!Number.isFinite(viewportWidth) || viewportWidth <= 0) {
     return false;

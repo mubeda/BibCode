@@ -16,6 +16,7 @@ import {
   KEY_ARROW_RIGHT_COMMAND,
   KEY_ARROW_UP_COMMAND,
   KEY_BACKSPACE_COMMAND,
+  KEY_DOWN_COMMAND,
   KEY_ENTER_COMMAND,
   KEY_TAB_COMMAND,
   type ElementNode,
@@ -31,7 +32,11 @@ import {
   INLINE_TERMINAL_CONTEXT_PLACEHOLDER,
   type TerminalContextDraft,
 } from "../lib/terminalContext";
-import { type ComposerPromptEditorHandle, ComposerPromptEditor } from "./ComposerPromptEditor";
+import {
+  type ComposerCommandKey,
+  type ComposerPromptEditorHandle,
+  ComposerPromptEditor,
+} from "./ComposerPromptEditor";
 
 // ---------------------------------------------------------------------------
 // Harness: renderToStaticMarkup never runs effects or imperative handles, so
@@ -233,10 +238,7 @@ interface RenderOptions {
   disabled?: boolean;
   placeholder?: string;
   className?: string;
-  onCommandKeyDown?: (
-    key: "ArrowDown" | "ArrowUp" | "Enter" | "Tab",
-    event: KeyboardEvent,
-  ) => boolean;
+  onCommandKeyDown?: (key: ComposerCommandKey, event: KeyboardEvent) => boolean;
 }
 
 function renderEditor(options: RenderOptions = {}) {
@@ -1350,6 +1352,25 @@ describe("ComposerCommandKeyPlugin", () => {
     const up = keyEvent();
     editor.dispatchCommand(KEY_ARROW_UP_COMMAND, up);
     expect(onCommandKeyDown).toHaveBeenCalledWith("ArrowUp", up);
+  });
+
+  it("delegates PageUp and PageDown and leaves other keys to the editor", () => {
+    const onCommandKeyDown = vi.fn((key: ComposerCommandKey) => key === "PageDown");
+    const { editor } = renderEditor({ value: "hello", onCommandKeyDown });
+
+    // Unclaimed, the key keeps its default: the editor moves the caret.
+    const pageUp = Object.assign(keyEvent(), { key: "PageUp" });
+    editor.dispatchCommand(KEY_DOWN_COMMAND, pageUp);
+    expect(onCommandKeyDown).toHaveBeenCalledWith("PageUp", pageUp);
+    expect(pageUp.preventDefault).not.toHaveBeenCalled();
+
+    const pageDown = Object.assign(keyEvent(), { key: "PageDown" });
+    expect(editor.dispatchCommand(KEY_DOWN_COMMAND, pageDown)).toBe(true);
+    expect(pageDown.preventDefault).toHaveBeenCalled();
+
+    onCommandKeyDown.mockClear();
+    editor.dispatchCommand(KEY_DOWN_COMMAND, Object.assign(keyEvent(), { key: "Home" }));
+    expect(onCommandKeyDown).not.toHaveBeenCalled();
   });
 
   it("swallows Enter during IME composition without delegating", () => {

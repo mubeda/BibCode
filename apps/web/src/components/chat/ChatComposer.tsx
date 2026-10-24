@@ -67,7 +67,11 @@ import {
   shouldUseCompactComposerPrimaryActions,
   shouldUseCompactComposerFooter,
 } from "../composerFooterLayout";
-import { type ComposerPromptEditorHandle, ComposerPromptEditor } from "../ComposerPromptEditor";
+import {
+  type ComposerCommandKey,
+  type ComposerPromptEditorHandle,
+  ComposerPromptEditor,
+} from "../ComposerPromptEditor";
 import { ProviderModelPicker } from "./ProviderModelPicker";
 import { ComposerCommandMenu } from "./ComposerCommandMenu";
 import { buildComposerCommandItems, type ComposerCommandItem } from "./composerCommandItems";
@@ -632,6 +636,8 @@ export interface ChatComposerProps {
   scheduleComposerFocus: () => void;
   setThreadError: (threadId: ThreadId | null, error: string | null) => void;
   onExpandImage: (preview: ExpandedImagePreview) => void;
+  /** Scrolls the timeline a page; `repeat` is true while the key is held. */
+  onPageTimeline: (key: "PageUp" | "PageDown", repeat: boolean) => void;
 }
 
 // --------------------------------------------------------------------------
@@ -710,6 +716,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     scheduleComposerFocus,
     setThreadError,
     onExpandImage,
+    onPageTimeline,
   } = props;
   const isProviderBindingConflicted = providerBindingConflictReason !== null;
   const terminalOpen = useThreadHasTerminalSurface(routeThreadRef);
@@ -1864,10 +1871,17 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   // ------------------------------------------------------------------
   // Callbacks: command key
   // ------------------------------------------------------------------
-  const onComposerCommandKey = (
-    key: "ArrowDown" | "ArrowUp" | "Enter" | "Tab",
-    event: KeyboardEvent,
-  ) => {
+  const onComposerCommandKey = (key: ComposerCommandKey, event: KeyboardEvent) => {
+    if (key === "PageUp" || key === "PageDown") {
+      if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return false;
+      // While the key can still move the caret to another line of the draft, it belongs to the editor.
+      const { value, expandedCursor } = readComposerSnapshot();
+      const draftInKeyDirection =
+        key === "PageUp" ? value.slice(0, expandedCursor) : value.slice(expandedCursor);
+      if (draftInKeyDirection.includes("\n")) return false;
+      onPageTimeline(key, event.repeat);
+      return true;
+    }
     if (isSteerQueuedMessageShortcut(event, keybindings, { context: { editableFocus: true } })) {
       event.preventDefault();
       if (!isProviderBindingConflicted) onSteerQueuedMessage?.();

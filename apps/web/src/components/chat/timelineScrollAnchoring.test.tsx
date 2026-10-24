@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vite-plus/test";
-import { getAnchoredTurnMetrics, getRowBottom } from "./timelineScrollAnchoring";
+import {
+  getAnchoredTurnMetrics,
+  getRowBottom,
+  getTimelinePageScrollOffset,
+} from "./timelineScrollAnchoring";
 
 function buildState({
   positions,
@@ -20,6 +24,24 @@ function buildState({
     sizeAtIndex: (index: number) => sizes[index],
   };
 }
+
+describe("timeline page scrolling", () => {
+  // 1000px list, 200px of it under the composer: 800px visible, so a page is 700px.
+  const page = (scroll: number, direction: -1 | 1) =>
+    getTimelinePageScrollOffset({
+      state: { scroll, scrollLength: 1000, contentLength: 5000 },
+      composerOverlayHeight: 200,
+      direction,
+    });
+
+  it("moves about one visible page and stops at either end", () => {
+    expect(page(2000, 1)).toBe(2700);
+    expect(page(2000, -1)).toBe(1300);
+    expect(page(300, -1)).toBe(0);
+    expect(page(3800, 1)).toBe(4000);
+    expect(page(4000, 1)).toBe(4000);
+  });
+});
 
 describe("timeline scroll anchoring", () => {
   it("measures row bottoms from LegendList row position and size", () => {

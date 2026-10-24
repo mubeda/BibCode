@@ -1,5 +1,36 @@
 export type TimelineScrollMode = "following-end" | "anchoring-new-turn" | "free-scrolling";
 
+/** Programmatic timeline scrolls jump instead of gliding when the user asks for reduced motion. */
+export function timelineScrollAnimates(): boolean {
+  return (
+    typeof window === "undefined" ||
+    !window.matchMedia?.("(prefers-reduced-motion: reduce)").matches
+  );
+}
+
+/** A page step as a browser takes one: 87.5% of what is visible, so the reader keeps context. */
+const TIMELINE_PAGE_STEP_FRACTION = 0.875;
+
+/** Where PageUp (-1) or PageDown (1) scrolls the timeline, within the list's scroll range. */
+export function getTimelinePageScrollOffset({
+  state,
+  composerOverlayHeight,
+  direction,
+}: {
+  readonly state: {
+    readonly scroll: number;
+    readonly scrollLength: number;
+    readonly contentLength: number;
+  };
+  readonly composerOverlayHeight: number;
+  readonly direction: -1 | 1;
+}): number {
+  const visibleHeight = Math.max(0, state.scrollLength - composerOverlayHeight);
+  const maxScroll = Math.max(0, state.contentLength - state.scrollLength);
+  const offset = state.scroll + direction * visibleHeight * TIMELINE_PAGE_STEP_FRACTION;
+  return Math.min(maxScroll, Math.max(0, offset));
+}
+
 export interface TimelineListMeasurementState {
   readonly data: readonly unknown[];
   readonly scroll: number;
