@@ -39,6 +39,37 @@ function applyEdits(contents: string, edits: readonly TextEdit[]): string {
   return result + contents.slice(cursor);
 }
 
+/**
+ * Where a caret at `position` ends up once Pierre applies `edits`: an offset inside a replaced
+ * range moves to the end of its replacement, one at or after an edit's end shifts with it
+ * (`remapOffsetThroughEdits`, `@pierre/diffs` `dist/editor/selection.js`).
+ */
+function caretAfter(contents: string, edits: readonly TextEdit[], position: Position): Position {
+  const resolved = edits
+    .map((edit) => ({
+      start: offsetAt(contents, edit.range.start),
+      end: offsetAt(contents, edit.range.end),
+      text: edit.newText,
+    }))
+    .toSorted((left, right) => left.start - right.start || left.end - right.end);
+  const offset = offsetAt(contents, position);
+  let delta = 0;
+  let mapped: number | null = null;
+  for (const edit of resolved) {
+    if (offset < edit.start) break;
+    if (offset >= edit.end) {
+      delta += edit.text.length - (edit.end - edit.start);
+    } else {
+      mapped = edit.start + delta + edit.text.length;
+      break;
+    }
+  }
+  const after = applyEdits(contents, edits);
+  const target = mapped ?? offset + delta;
+  const lines = after.slice(0, target).split(/\r\n|\r|\n/);
+  return { line: lines.length - 1, character: lines[lines.length - 1]!.length };
+}
+
 describe("diskReloadEdits", () => {
   it.each([
     ["identical", "same\ntext\n", "same\ntext\n"],
@@ -56,6 +87,18 @@ describe("diskReloadEdits", () => {
     ["CR only", "one\rtwo", "one\rtoo"],
     ["a surrogate pair edited", "x😀y\n", "x😃y\n"],
     ["mixed hunks", "1\n2\n3\n4\n5\n6\n7\n", "1\n2 changed\n3\n4\n5\nnew\n6\n"],
+    [
+      "a line inserted between two changed lines",
+      "foo = 1;\nbar = 2;\n",
+      "foo = 10;\nnew line\nbar = 20;\n",
+    ],
+    [
+      "a line removed between two changed lines",
+      "foo = 10;\nold line\nbar = 20;\n",
+      "foo = 1;\nbar = 2;\n",
+    ],
+    ["a changed last line gains a line", "a", "a2\nb"],
+    ["a changed first line loses the last", "a\nb", "a2"],
   ])("rewrites to the disk text: %s", (_name, current, disk) => {
     expect(applyEdits(current, diskReloadEdits(current, disk))).toBe(disk);
   });
@@ -89,8 +132,40 @@ describe("diskReloadEdits", () => {
     ]);
   });
 
+  it.each([
+    [
+      "a line inserted between two changed lines",
+      "foo = 1;\nbar = 2;\n",
+      "foo = 10;\nnew line\nbar = 20;\n",
+      { line: 1, character: 1 },
+      { line: 2, character: 1 },
+    ],
+    [
+      "a line removed between two changed lines",
+      "foo = 10;\nold line\nbar = 20;\n",
+      "foo = 1;\nbar = 2;\n",
+      { line: 2, character: 1 },
+      { line: 1, character: 1 },
+    ],
+    [
+      "lines inserted above a changed line",
+      "head\nvalue = 1;\n",
+      "head changed\none\ntwo\nvalue = 2;\n",
+      { line: 1, character: 3 },
+      { line: 3, character: 3 },
+    ],
+  ])(
+    "keeps a caret on a changed line in place when lines are also inserted or removed: %s",
+    (_name, current, disk, caret, expected) => {
+      const edits = diskReloadEdits(current, disk);
+      expect(applyEdits(current, edits)).toBe(disk);
+      expect(caretAfter(current, edits, caret)).toEqual(expected);
+    },
+  );
+
   it("edits two changed lines separately rather than replacing the lines between them", () => {
     const edits = diskReloadEdits("a1\nkeep\nkeep\nb1\n", "a2\nkeep\nkeep\nb2\nadded\n");
-    expect(edits.map((edit) => edit.range.start.line)).toEqual([0, 3]);
+    // Line 3 is rewritten in place and the added line is inserted after it, not merged into it.
+    expect(edits.map((edit) => edit.range.start.line)).toEqual([0, 3, 4]);
   });
 });
