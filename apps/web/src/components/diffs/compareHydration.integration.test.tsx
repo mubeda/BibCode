@@ -114,9 +114,9 @@ describe("Compare hydration in pierre", () => {
       }
 
       const partialOnly = await render(patch(context), true);
-    expect(partialOnly.has("20"), "a patch alone has no lines between its hunks").toBe(false);
+      expect(partialOnly.has("20"), "a patch alone has no lines between its hunks").toBe(false);
 
-    const changes = await render(hydration.fileDiff, false);
+      const changes = await render(hydration.fileDiff, false);
       expect(changes.has("10")).toBe(true);
       expect(changes.has("30")).toBe(true);
       expect(changes.has("20"), "the gap between the hunks stays collapsed").toBe(false);
