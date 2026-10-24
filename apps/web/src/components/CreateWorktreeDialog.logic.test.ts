@@ -251,6 +251,14 @@ describe("detectSmartMode", () => {
   it("falls back to search when nothing matches", () => {
     expect(detectSmartMode("brand-new-thing", refs)).toBe("search");
   });
+
+  it("reads text that exactly names a branch as that branch, even a number (#151)", () => {
+    const numbered: RefLike[] = [{ name: "2026" }, { name: "main" }];
+    expect(detectSmartMode("2026", numbered)).toBe("branch");
+    // No ref is named `#2026`, so the GitHub form still reads as GitHub.
+    expect(detectSmartMode("#2026", numbered)).toBe("github");
+    expect(detectSmartMode("2027", numbered)).toBe("github");
+  });
 });
 
 describe("resolveWorktreeCreateInput", () => {
@@ -463,6 +471,27 @@ describe("resolveWorktreeCreateInput", () => {
       refName: "main",
       newRefName: "pr-7",
       baseRefName: "main",
+    });
+  });
+
+  it("smart mode creates from a selected branch the field names, even a number (#151)", () => {
+    // A picked branch named 2026 fills the field with 2026, which also parses as GitHub #2026.
+    const result = resolveWorktreeCreateInput({
+      ...base,
+      mode: "smart",
+      nameText: "investigation",
+      sourceText: "2026",
+      githubItem: { number: 2026, kind: "unknown" },
+      selectedBranchRefName: "2026",
+      selectedBranchRef: { name: "2026" },
+    });
+    expect(result).toEqual({
+      kind: "new-branch",
+      title: "investigation",
+      branchName: "investigation",
+      refName: "2026",
+      newRefName: "investigation",
+      baseRefName: "2026",
     });
   });
 
