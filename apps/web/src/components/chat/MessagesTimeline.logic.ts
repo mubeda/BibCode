@@ -501,7 +501,8 @@ function deriveTurnFolds(input: {
   return { foldsByAnchorEntryId, answerMessageIds };
 }
 
-export function deriveMessagesTimelineRows(input: {
+/** What decides which turns, work groups and entries a timeline shows. */
+export interface TimelineDisclosureInput {
   timelineEntries: ReadonlyArray<TimelineEntry>;
   queuedMessages?: ReadonlyArray<ChatMessage>;
   queuedStatuses?: ReadonlyArray<QueuedCardStatus>;
@@ -516,19 +517,19 @@ export function deriveMessagesTimelineRows(input: {
    * rows so one click folds them. The turn still running is the same either way.
    */
   verboseChat?: boolean;
-  isWorking: boolean;
-  activeTurnStartedAt: string | null;
-  turnDiffSummaryByAssistantMessageId: ReadonlyMap<MessageId, TurnDiffSummary>;
-  revertTurnCountByUserMessageId: ReadonlyMap<MessageId, number>;
-}): MessagesTimelineRow[] {
+}
+
+interface TimelineLayout {
+  /** The entries in row order, without the queued messages that render last. */
+  readonly timelineEntries: ReadonlyArray<TimelineEntry>;
+  readonly unsettledTurnId: TurnId | null;
+  readonly turnFolds: TurnFolds;
+}
+
+function deriveTimelineLayout(input: TimelineDisclosureInput): TimelineLayout {
   const timelineEntries = input.timelineEntries.filter(
     (entry) => entry.kind !== "message" || !isQueuedTimelineMessage(entry.message),
   );
-  const nextRows: MessagesTimelineRow[] = [];
-  const durationStartByMessageId = computeMessageDurationStart(
-    timelineEntries.flatMap((entry) => (entry.kind === "message" ? [entry.message] : [])),
-  );
-  const terminalAssistantMessageIds = deriveTerminalAssistantMessageIds(timelineEntries);
   const unsettledTurnId = deriveUnsettledTurnId(
     input.latestTurn ?? null,
     input.runningTurnId ?? null,
@@ -538,18 +539,191 @@ export function deriveMessagesTimelineRows(input: {
     latestTurn: input.latestTurn ?? null,
     unsettledTurnId,
   });
-  const { answerMessageIds, foldsByAnchorEntryId } = turnFolds;
-  // Running turns never fold, so the setting opens only settled turns.
-  const isTurnExpanded = (turnId: TurnId) =>
-    input.turnFoldChoices?.get(turnId) ?? input.verboseChat === true;
+  return { timelineEntries, unsettledTurnId, turnFolds };
+}
+
+/** Whether a settled turn shows its folded entries. Running turns never fold. */
+function isTurnFoldExpanded(input: TimelineDisclosureInput, turnId: TurnId): boolean {
+  return input.turnFoldChoices?.get(turnId) ?? input.verboseChat === true;
+}
+
+/** The entries that folded turns hide. */
+function collectCollapsedEntryIds(
+  turnFolds: TurnFolds,
+  isTurnExpanded: (turnId: TurnId) => boolean,
+): Set<string> {
   const collapsedEntryIds = new Set<string>();
-  for (const fold of foldsByAnchorEntryId.values()) {
+  for (const fold of turnFolds.foldsByAnchorEntryId.values()) {
     if (!isTurnExpanded(fold.turnId)) {
       for (const entryId of fold.hiddenEntryIds) {
         collapsedEntryIds.add(entryId);
       }
     }
   }
+  return collapsedEntryIds;
+}
+
+/**
+ * The run of work entries that starts at `startIndex`: it ends at the first entry that is not
+ * work, that a fold hides, or that anchors a fold. `end` is the index after the run.
+ */
+function collectWorkRun(
+  timelineEntries: ReadonlyArray<TimelineEntry>,
+  startIndex: number,
+  collapsedEntryIds: ReadonlySet<string>,
+  foldsByAnchorEntryId: ReadonlyMap<string, TurnFold>,
+): { readonly groupedEntries: WorkLogEntry[]; readonly end: number } {
+  const first = timelineEntries[startIndex];
+  const groupedEntries: WorkLogEntry[] = first?.kind === "work" ? [first.entry] : [];
+  let cursor = startIndex + 1;
+  while (cursor < timelineEntries.length) {
+    const nextEntry = timelineEntries[cursor];
+    if (
+      !nextEntry ||
+      nextEntry.kind !== "work" ||
+      collapsedEntryIds.has(nextEntry.id) ||
+      foldsByAnchorEntryId.has(nextEntry.id)
+    ) {
+      break;
+    }
+    groupedEntries.push(nextEntry.entry);
+    cursor += 1;
+  }
+  return { groupedEntries, end: cursor };
+}
+
+function workGroupId(anchorEntryId: string): string {
+  return `work-group:${anchorEntryId}`;
+}
+
+function isWorkGroupExpanded(
+  input: TimelineDisclosureInput,
+  groupId: string,
+  visibleEntries: ReadonlyArray<WorkLogEntry>,
+  unsettledTurnId: TurnId | null,
+): boolean {
+  return (
+    input.workGroupChoices?.get(groupId) ??
+    (input.verboseChat === true &&
+      !visibleEntries.some((entry) => isWorkEntryInUnsettledTurn(entry, unsettledTurnId)))
+  );
+}
+
+/** Where an entry renders, and what must open first for its row to exist. */
+export type TimelineEntryLocation =
+  | { readonly kind: "absent" }
+  | {
+      readonly kind: "found";
+      readonly rowId: string;
+      readonly openTurnId?: TurnId;
+      readonly openGroupId?: string;
+    };
+
+const QUEUED_MESSAGE_ROW_PREFIX = "queued-message:";
+
+export function queuedMessageRowId(messageId: string): string {
+  return `${QUEUED_MESSAGE_ROW_PREFIX}${messageId}`;
+}
+
+/**
+ * The reveal plan for one entry, computed the way `deriveMessagesTimelineRows` builds rows. A
+ * work group's id and hidden part depend on which turns are folded, so the group is found under
+ * the turns the plan opens: the plan names the group and row that exist after the fold opens.
+ */
+export function locateTimelineEntry(
+  entryId: string,
+  input: TimelineDisclosureInput,
+): TimelineEntryLocation {
+  if (entryId.startsWith(QUEUED_MESSAGE_ROW_PREFIX)) {
+    const messageId = entryId.slice(QUEUED_MESSAGE_ROW_PREFIX.length);
+    const index = (input.queuedMessages ?? []).findIndex((message) => message.id === messageId);
+    return index >= 0 && input.queuedStatuses?.[index]
+      ? { kind: "found", rowId: entryId }
+      : { kind: "absent" };
+  }
+
+  const { timelineEntries, unsettledTurnId, turnFolds } = deriveTimelineLayout(input);
+  const targetIndex = timelineEntries.findIndex((entry) => entry.id === entryId);
+  const target = timelineEntries[targetIndex];
+  if (!target) {
+    return { kind: "absent" };
+  }
+
+  let openTurnId: TurnId | undefined;
+  for (const fold of turnFolds.foldsByAnchorEntryId.values()) {
+    if (fold.hiddenEntryIds.has(entryId) && !isTurnFoldExpanded(input, fold.turnId)) {
+      openTurnId = fold.turnId;
+    }
+  }
+  const collapsedEntryIds = collectCollapsedEntryIds(
+    turnFolds,
+    (turnId) => turnId === openTurnId || isTurnFoldExpanded(input, turnId),
+  );
+  const turnPart = openTurnId === undefined ? {} : { openTurnId };
+
+  if (target.kind !== "work") {
+    return { kind: "found", rowId: target.id, ...turnPart };
+  }
+  if (workEntryIndicatesToolNeutralStatus(target.entry)) {
+    return { kind: "absent" };
+  }
+
+  for (let index = 0; index < timelineEntries.length; index += 1) {
+    const timelineEntry = timelineEntries[index];
+    if (
+      !timelineEntry ||
+      collapsedEntryIds.has(timelineEntry.id) ||
+      timelineEntry.kind !== "work"
+    ) {
+      continue;
+    }
+    const run = collectWorkRun(
+      timelineEntries,
+      index,
+      collapsedEntryIds,
+      turnFolds.foldsByAnchorEntryId,
+    );
+    if (targetIndex >= index && targetIndex < run.end) {
+      const visibleEntries = run.groupedEntries.filter(
+        (entry) => !workEntryIndicatesToolNeutralStatus(entry),
+      );
+      if (visibleEntries.length <= MAX_VISIBLE_WORK_LOG_ENTRIES) {
+        return { kind: "found", rowId: timelineEntry.id, ...turnPart };
+      }
+      const groupId = workGroupId(timelineEntry.id);
+      const hiddenEntries = visibleEntries.slice(0, -MAX_VISIBLE_WORK_LOG_ENTRIES);
+      const needsGroup =
+        hiddenEntries.includes(target.entry) &&
+        !isWorkGroupExpanded(input, groupId, visibleEntries, unsettledTurnId);
+      return {
+        kind: "found",
+        rowId: target.entry.id,
+        ...turnPart,
+        ...(needsGroup ? { openGroupId: groupId } : {}),
+      };
+    }
+    index = run.end - 1;
+  }
+  return { kind: "absent" };
+}
+
+export function deriveMessagesTimelineRows(
+  input: TimelineDisclosureInput & {
+    isWorking: boolean;
+    activeTurnStartedAt: string | null;
+    turnDiffSummaryByAssistantMessageId: ReadonlyMap<MessageId, TurnDiffSummary>;
+    revertTurnCountByUserMessageId: ReadonlyMap<MessageId, number>;
+  },
+): MessagesTimelineRow[] {
+  const { timelineEntries, unsettledTurnId, turnFolds } = deriveTimelineLayout(input);
+  const nextRows: MessagesTimelineRow[] = [];
+  const durationStartByMessageId = computeMessageDurationStart(
+    timelineEntries.flatMap((entry) => (entry.kind === "message" ? [entry.message] : [])),
+  );
+  const terminalAssistantMessageIds = deriveTerminalAssistantMessageIds(timelineEntries);
+  const { answerMessageIds, foldsByAnchorEntryId } = turnFolds;
+  const isTurnExpanded = (turnId: TurnId) => isTurnFoldExpanded(input, turnId);
+  const collapsedEntryIds = collectCollapsedEntryIds(turnFolds, isTurnExpanded);
 
   for (let index = 0; index < timelineEntries.length; index += 1) {
     const timelineEntry = timelineEntries[index];
@@ -574,21 +748,12 @@ export function deriveMessagesTimelineRows(input: {
     }
 
     if (timelineEntry.kind === "work") {
-      const groupedEntries = [timelineEntry.entry];
-      let cursor = index + 1;
-      while (cursor < timelineEntries.length) {
-        const nextEntry = timelineEntries[cursor];
-        if (
-          !nextEntry ||
-          nextEntry.kind !== "work" ||
-          collapsedEntryIds.has(nextEntry.id) ||
-          foldsByAnchorEntryId.has(nextEntry.id)
-        ) {
-          break;
-        }
-        groupedEntries.push(nextEntry.entry);
-        cursor += 1;
-      }
+      const { groupedEntries, end: cursor } = collectWorkRun(
+        timelineEntries,
+        index,
+        collapsedEntryIds,
+        foldsByAnchorEntryId,
+      );
       const visibleGroupedEntries = groupedEntries.filter(
         (entry) => !workEntryIndicatesToolNeutralStatus(entry),
       );
@@ -601,13 +766,13 @@ export function deriveMessagesTimelineRows(input: {
             groupedEntries: visibleGroupedEntries,
           });
         } else {
-          const groupId = `work-group:${timelineEntry.id}`;
-          const expanded =
-            input.workGroupChoices?.get(groupId) ??
-            (input.verboseChat === true &&
-              !visibleGroupedEntries.some((entry) =>
-                isWorkEntryInUnsettledTurn(entry, unsettledTurnId),
-              ));
+          const groupId = workGroupId(timelineEntry.id);
+          const expanded = isWorkGroupExpanded(
+            input,
+            groupId,
+            visibleGroupedEntries,
+            unsettledTurnId,
+          );
           const hiddenEntries = visibleGroupedEntries.slice(0, -MAX_VISIBLE_WORK_LOG_ENTRIES);
           const visibleEntries = visibleGroupedEntries.slice(-MAX_VISIBLE_WORK_LOG_ENTRIES);
           const renderedEntries = expanded ? [...hiddenEntries, ...visibleEntries] : visibleEntries;
@@ -707,7 +872,7 @@ export function deriveMessagesTimelineRows(input: {
     if (!status) continue;
     nextRows.push({
       kind: "queued-message",
-      id: `queued-message:${message.id}`,
+      id: queuedMessageRowId(message.id),
       createdAt: message.createdAt,
       message,
       isHead: index === 0,
