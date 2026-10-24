@@ -55,6 +55,7 @@ import { ScrollArea } from "./ui/scroll-area";
 import { Menu, MenuItem, MenuPopup, MenuTrigger } from "./ui/menu";
 import { stackedThreadToast, toastManager } from "./ui/toast";
 import { useOpenInPreferredEditor } from "../editorPreferences";
+import { scheduleRender } from "./markdown/renderQueue";
 import { resolveDiffThemeName, type DiffThemeName } from "../lib/diffRendering";
 import { fnv1a32 } from "../lib/diffRendering";
 import { createIncrementalHighlightedDocument } from "../lib/incrementalHighlighting";
@@ -731,52 +732,6 @@ function highlightWith(
   }
 }
 
-interface HighlightJob {
-  readonly run: () => string;
-  readonly done: (html: string) => void;
-}
-
-/** Waiting blocks, the most recently mounted last. */
-const highlightQueue: HighlightJob[] = [];
-let highlightPumpScheduled = false;
-
-/**
- * Highlights one waiting block per task, the most recently mounted first, so a block the user
- * scrolled to is highlighted before the ones scrolled past and input runs between blocks
- * (#103). Returns a cancel that drops the job if it has not run.
- */
-function scheduleHighlight(run: () => string, done: (html: string) => void): () => void {
-  const job: HighlightJob = { run, done };
-  highlightQueue.push(job);
-  if (!highlightPumpScheduled) {
-    highlightPumpScheduled = true;
-    setTimeout(pumpHighlights, 0);
-  }
-  let cancelled = false;
-  return () => {
-    if (cancelled) return;
-    cancelled = true;
-    const index = highlightQueue.indexOf(job);
-    if (index >= 0) highlightQueue.splice(index, 1);
-  };
-}
-
-function pumpHighlights(): void {
-  const job = highlightQueue.pop();
-  if (job) {
-    try {
-      job.done(job.run());
-    } catch {
-      // The plain block stays.
-    }
-  }
-  if (highlightQueue.length > 0) {
-    setTimeout(pumpHighlights, 0);
-  } else {
-    highlightPumpScheduled = false;
-  }
-}
-
 interface DeferredShikiCodeBlockProps {
   code: string;
   language: string;
@@ -806,7 +761,7 @@ function DeferredShikiCodeBlock({
     getHighlighterPromise(language).then(
       (highlighter) => {
         if (!active) return;
-        cancel = scheduleHighlight(
+        cancel = scheduleRender(
           () => highlightWith(highlighter, code, language, themeName),
           (html) => {
             highlightedCodeCache.set(cacheKey, html, estimateHighlightedSize(html, code));
