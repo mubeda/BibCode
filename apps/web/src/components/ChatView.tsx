@@ -136,6 +136,7 @@ import { type LegendListRef } from "@legendapp/list/react";
 import {
   getAnchoredTurnMetrics,
   getTimelinePageScrollOffset,
+  pointerPressStopsLiveFollow,
   rowToggleNeedsEndReveal,
   timelineScrollAnimates,
   type TimelineScrollMode,
@@ -4094,13 +4095,19 @@ function ChatViewContent(props: ChatViewProps) {
       scrollNode.addEventListener("touchmove", handleManualNavigation, {
         passive: true,
       });
-      scrollNode.addEventListener("pointerdown", handleManualNavigation, {
+      // A press on a row's control is a click, not a scroll, so following goes on (#173).
+      const handlePointerDown = (event: PointerEvent) => {
+        if (pointerPressStopsLiveFollow(event.target)) {
+          handleManualNavigation();
+        }
+      };
+      scrollNode.addEventListener("pointerdown", handlePointerDown, {
         passive: true,
       });
       removeListeners = () => {
         scrollNode.removeEventListener("wheel", handleManualNavigation);
         scrollNode.removeEventListener("touchmove", handleManualNavigation);
-        scrollNode.removeEventListener("pointerdown", handleManualNavigation);
+        scrollNode.removeEventListener("pointerdown", handlePointerDown);
       };
     });
 
