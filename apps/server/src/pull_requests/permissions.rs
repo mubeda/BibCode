@@ -527,6 +527,30 @@ fn version_reason(
     })
 }
 
+/// Which "Pipelines must succeed" reason the head pipeline's status selects.
+/// Readiness words each bucket differently, so the poller re-reads `detail`
+/// when a pipeline change moves between buckets (`gitlab/refresh.rs`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CiMustPassBucket {
+    Missing,
+    Failed,
+    Canceled,
+    Manual,
+    Skipped,
+    Running,
+}
+
+pub(crate) fn ci_must_pass_bucket(pipeline_status: Option<&str>) -> CiMustPassBucket {
+    match pipeline_status {
+        Some("failed") => CiMustPassBucket::Failed,
+        Some("canceled" | "canceling") => CiMustPassBucket::Canceled,
+        Some("manual") => CiMustPassBucket::Manual,
+        Some("skipped") => CiMustPassBucket::Skipped,
+        None => CiMustPassBucket::Missing,
+        Some(_) => CiMustPassBucket::Running,
+    }
+}
+
 fn readiness(i: &PermissionInputs) -> MergeReadiness {
     let mut details = Vec::new();
     if let Some(a) = &i.required_approvals {
@@ -593,19 +617,29 @@ fn readiness(i: &PermissionInputs) -> MergeReadiness {
             "requested_changes" => (ReadinessStatus::ChangesRequested, CHANGES_REQUESTED.into()),
             // "Pipelines must succeed" needs a successful pipeline to exist, so only a
             // pipeline that is still on its way reads as pending (#156).
-            "ci_must_pass" | "ci_still_running" => match gl.pipeline_status.as_deref() {
-                Some("failed") => (ReadinessStatus::ChecksFailing, CHECKS_FAILING.into()),
-                Some("canceled" | "canceling") => {
-                    (ReadinessStatus::ChecksFailing, GL_PIPELINE_CANCELED.into())
+            "ci_must_pass" | "ci_still_running" => {
+                match ci_must_pass_bucket(gl.pipeline_status.as_deref()) {
+                    CiMustPassBucket::Failed => {
+                        (ReadinessStatus::ChecksFailing, CHECKS_FAILING.into())
+                    }
+                    CiMustPassBucket::Canceled => {
+                        (ReadinessStatus::ChecksFailing, GL_PIPELINE_CANCELED.into())
+                    }
+                    CiMustPassBucket::Manual => {
+                        (ReadinessStatus::Blocked, GL_PIPELINE_MANUAL.into())
+                    }
+                    CiMustPassBucket::Skipped => {
+                        (ReadinessStatus::Blocked, GL_PIPELINE_SKIPPED.into())
+                    }
+                    // No visible pipeline: none exists, or this account cannot see it.
+                    CiMustPassBucket::Missing if gl.detailed_merge_status == "ci_must_pass" => {
+                        (ReadinessStatus::Blocked, GL_PIPELINE_MISSING.into())
+                    }
+                    CiMustPassBucket::Missing | CiMustPassBucket::Running => {
+                        (ReadinessStatus::ChecksPending, CHECKS_PENDING.into())
+                    }
                 }
-                Some("manual") => (ReadinessStatus::Blocked, GL_PIPELINE_MANUAL.into()),
-                Some("skipped") => (ReadinessStatus::Blocked, GL_PIPELINE_SKIPPED.into()),
-                // No visible pipeline: none exists, or this account cannot see it.
-                None if gl.detailed_merge_status == "ci_must_pass" => {
-                    (ReadinessStatus::Blocked, GL_PIPELINE_MISSING.into())
-                }
-                _ => (ReadinessStatus::ChecksPending, CHECKS_PENDING.into()),
-            },
+            }
             // `broken_status` is the GitLab 16 name for a potential conflict.
             "conflict" | "broken_status" => (ReadinessStatus::Conflicts, CONFLICTS.into()),
             "need_rebase" => (

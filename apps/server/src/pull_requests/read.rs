@@ -134,5 +134,7 @@ pub(super) fn grouped_checks(
         groups,
         summary,
         pipeline_url,
+        revision: None,
+        truncated: false,
     }
 }
