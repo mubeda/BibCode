@@ -79,7 +79,9 @@ pub struct ThreadCompactionRow {
     pub failed_message_id: Option<String>,
     pub guarded_delivery_command_id: Option<String>,
     pub resend_message_id: Option<String>,
-    /// A recovery keeps the failure's own message here, which an interrupted recovery restores.
+    /// A recovery keeps the failure's own message here, which an interrupted recovery restores; a
+    /// manual compaction keeps the context-limit error it was asked for from, if any. Once
+    /// settled, a failure's detail.
     pub detail: Option<String>,
     pub created_at: String,
     pub updated_at: String,
@@ -576,12 +578,21 @@ pub(crate) fn settle_compaction_tx(
         }
         ("manual", "failed") => {
             if let Some(detail) = detail {
+                // A compaction of a context-limit error that fails leaves the conversation as
+                // full as before: the error keeps its class, so the Compact action stays. The row
+                // kept that error's message when it was requested; the compaction's own turn has
+                // cleared the session's since.
+                let class = if row.detail.is_some() {
+                    "context_limit"
+                } else {
+                    "provider_error"
+                };
                 context.set_session_error(
                     transaction,
                     &row.thread_id,
                     Some("error"),
                     detail,
-                    "provider_error",
+                    class,
                 )?;
             }
         }

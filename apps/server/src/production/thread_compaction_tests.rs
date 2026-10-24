@@ -632,11 +632,16 @@ async fn stop_during_the_compaction_wins_even_if_it_completes() {
 async fn an_unsettled_compaction_holds_claims_and_promotion() {
     let engine = engine().await;
     session(&engine, "ready", "ready", None).await;
+    // Admitted just before the compaction was asked for, so it is a pending start.
+    enqueue(&engine, "pending", false).await;
     engine.dispatch(command(json!({"type":"thread.compact", "commandId":"compact", "threadId":"t", "createdAt":TIME}))).await.unwrap();
     let manual = only_compaction(&engine).await;
     assert_eq!(manual.trigger, "manual");
     assert_eq!(manual.conversation_id.as_deref(), Some(CONVERSATION));
-    enqueue(&engine, "pending", false).await;
+    assert_eq!(
+        row(&engine, "pending").await.state,
+        TurnDeliveryState::Pending
+    );
     assert!(
         engine
             .repositories()
@@ -999,5 +1004,151 @@ async fn restart_settles_every_unsettled_compaction_as_interrupted() {
         "the original error returns"
     );
     assert_eq!(session.last_error_class.as_deref(), Some("context_limit"));
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_start_admitted_while_a_compaction_is_unsettled_is_queued_whatever_it_asked() {
+    let engine = engine().await;
+    session(&engine, "ready", "ready", None).await;
+    engine.dispatch(command(json!({"type":"thread.compact", "commandId":"compact", "threadId":"t", "createdAt":TIME}))).await.unwrap();
+    // The RPC checked for a compaction before this one began, so it asks for a pending start;
+    // the admission transaction still queues it, with no marker the compaction turn could take.
+    enqueue(&engine, "late", false).await;
+    let late = row(&engine, "late").await;
+    assert_eq!(late.state, TurnDeliveryState::Queued);
+    assert_eq!(late.payload["queued"], true);
+    assert_eq!(
+        count(
+            &engine,
+            "SELECT COUNT(*) FROM projection_turns WHERE pending_message_id = 'late'"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        count(&engine, "SELECT COUNT(*) FROM orchestration_events WHERE event_type = 'thread.turn-start-requested' AND json_extract(payload_json, '$.messageId') = 'late'").await,
+        0
+    );
+    assert_eq!(
+        count(&engine, "SELECT COUNT(*) FROM projection_thread_messages WHERE message_id = 'late' AND delivery_state = 'queued'").await,
+        1
+    );
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn send_now_waits_for_an_unsettled_compaction() {
+    let engine = engine().await;
+    session(&engine, "running", "running", Some("turn-1")).await;
+    enqueue(&engine, "queued", true).await;
+    session(&engine, "error", "error", None).await;
+    sql(&engine, "INSERT INTO thread_compactions (compaction_id, thread_id, trigger, state, provider_instance_id, provider_kind, created_at, updated_at) VALUES ('recovery', 't', 'contextRecovery', 'requested', 'claudeAgent', 'claudeAgent', '2026-10-24T00:00:00Z', '2026-10-24T00:00:00Z')").await;
+    let send_now = |id: &str| {
+        command(
+            json!({"type":"thread.turn.promote", "commandId":id, "threadId":"t", "messageId":"queued", "createdAt":TIME}),
+        )
+    };
+    assert!(
+        engine.dispatch(send_now("send-now")).await.is_err(),
+        "Send now cannot put a message ahead of the copy"
+    );
+    assert_eq!(
+        row(&engine, "queued").await.state,
+        TurnDeliveryState::Queued
+    );
+    settle(
+        &engine,
+        "recovery",
+        "failed",
+        Some("Claude couldn't compact the conversation."),
+    )
+    .await;
+    engine.dispatch(send_now("send-now-after")).await.unwrap();
+    assert_eq!(
+        row(&engine, "queued").await.state,
+        TurnDeliveryState::Pending
+    );
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_untagged_turn_during_a_compaction_keeps_the_guarded_marker() {
+    let engine = engine().await;
+    enqueue(&engine, "guarded", false).await;
+    sql(&engine, "INSERT INTO thread_compactions (compaction_id, thread_id, trigger, state, provider_instance_id, provider_kind, guarded_delivery_command_id, created_at, updated_at) VALUES ('guard', 't', 'guard', 'running', 'claudeAgent', 'claudeAgent', 'guarded', '2026-10-24T00:00:00Z', '2026-10-24T00:00:00Z')").await;
+    let markers = "SELECT COUNT(*) FROM projection_turns WHERE thread_id = 't' AND turn_id IS NULL AND pending_message_id = 'guarded'";
+    // A turn the provider starts on its own (a background follow-up) while the compaction is
+    // unsettled, reported twice: neither update binds or deletes the waiting marker.
+    session(&engine, "running", "follow-up-running", Some("follow-up")).await;
+    session(
+        &engine,
+        "running",
+        "follow-up-running-again",
+        Some("follow-up"),
+    )
+    .await;
+    assert_eq!(count(&engine, markers).await, 1);
+    assert_eq!(
+        count(&engine, "SELECT COUNT(*) FROM projection_turns WHERE turn_id = 'follow-up' AND pending_message_id IS NULL").await,
+        1
+    );
+    session(&engine, "ready", "follow-up-ready", None).await;
+    settle(&engine, "guard", "completed", None).await;
+    session(&engine, "running", "guarded-running", Some("guarded-turn")).await;
+    assert_eq!(count(&engine, markers).await, 0);
+    assert_eq!(
+        count(&engine, "SELECT COUNT(*) FROM projection_turns WHERE turn_id = 'guarded-turn' AND pending_message_id = 'guarded'").await,
+        1
+    );
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_failed_manual_compaction_keeps_the_compact_action_of_a_context_limit_error() {
+    let engine = engine().await;
+    session(&engine, "running", "running", Some("turn-1")).await;
+    engine.dispatch(command(json!({"type":"thread.session.set", "commandId":"limit", "threadId":"t", "session":{"threadId":"t", "status":"error", "providerName":CLAUDE, "providerInstanceId":CLAUDE, "activeTurnId":null, "lastError":FAILURE, "lastErrorClass":"context_limit", "updatedAt":TIME}, "createdAt":TIME}))).await.unwrap();
+    engine.dispatch(command(json!({"type":"thread.compact", "commandId":"compact", "threadId":"t", "createdAt":TIME}))).await.unwrap();
+    let manual = only_compaction(&engine).await;
+    // The compaction's own turn runs and ends ("Not enough messages to compact."), which
+    // clears the session's error before the compaction settles.
+    engine.dispatch(command(json!({"type":"thread.session.set", "commandId":"compaction-running", "threadId":"t", "session":{"threadId":"t", "status":"running", "providerName":CLAUDE, "providerInstanceId":CLAUDE, "activeTurnId":"compaction-turn", "lastError":null, "updatedAt":TIME}, "compactionId":manual.compaction_id, "createdAt":TIME}))).await.unwrap();
+    session(&engine, "ready", "compaction-ready", None).await;
+    settle(
+        &engine,
+        &manual.compaction_id,
+        "failed",
+        Some("Claude couldn't compact the conversation."),
+    )
+    .await;
+    let failed = the_session(&engine).await;
+    assert_eq!(
+        failed.last_error.as_deref(),
+        Some("Claude couldn't compact the conversation.")
+    );
+    assert_eq!(
+        failed.last_error_class.as_deref(),
+        Some("context_limit"),
+        "the Compact action stays, so the user can try again"
+    );
+    engine.shutdown().await;
+
+    // A compaction asked for outside a context-limit error fails as a provider error.
+    let engine = self::engine().await;
+    session(&engine, "ready", "ready", None).await;
+    engine.dispatch(command(json!({"type":"thread.compact", "commandId":"compact", "threadId":"t", "createdAt":TIME}))).await.unwrap();
+    let manual = only_compaction(&engine).await;
+    settle(
+        &engine,
+        &manual.compaction_id,
+        "failed",
+        Some("Claude couldn't compact the conversation."),
+    )
+    .await;
+    assert_eq!(
+        the_session(&engine).await.last_error_class.as_deref(),
+        Some("provider_error")
+    );
     engine.shutdown().await;
 }
