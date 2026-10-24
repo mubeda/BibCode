@@ -2978,7 +2978,8 @@ printing.
 
 Run this in the packaged application against a disposable repository that has
 committed files, a working-tree edit, an untracked file, a deleted file, a
-rename, a binary file and a branch with commits ahead of its base. Let one
+rename, a modified, an added and a deleted binary file, and a branch with
+commits ahead of its base. Let one
 agent turn edit two files so the thread has a turn with checkpoints.
 
 1. Open the Diff panel. **Changes** is selected and matches the stacked view.
@@ -2989,8 +2990,10 @@ agent turn edit two files so the thread has a turn with checkpoints.
    and the changed lines appear before the full file finishes loading. The
    turn shows its changes, never "No net changes".
 3. Confirm the explained states: the added and deleted files show their one
-   side, the rename, the binary file and a mode-only change each show their
-   message, and the untracked file shows as added.
+   side, the rename, each binary file (modified, added and deleted) and a
+   mode-only change each show their message, and the untracked file shows as
+   added. Edit the untracked file without changing its line count: Compare
+   shows the new text.
 4. Filter by name and by status. The count reads "N of M files", a filter with
    no match offers **Clear filters**, and **Esc** in the name field clears it.
 5. Choose **Changes only**, type `7` in **Context lines**, and confirm one
@@ -3013,6 +3016,8 @@ agent turn edit two files so the thread has a turn with checkpoints.
    - set `difftool.broken.cmd` to `exit 3` and choose it: the alert shows Git's
      message and **Copy command**, whose command reproduces the failure in a
      terminal;
+   - add a project whose folder is a subdirectory of its repository, edit a
+     file in it, and confirm Compare shows it in full and Open with opens it;
    - with a diff app still open, quit the desktop app, and separately stop a
      standalone server from its terminal with Ctrl+C: the diff app stays
      open.
