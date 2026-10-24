@@ -1,10 +1,17 @@
-import { SearchIcon, XIcon } from "lucide-react";
-import { useId, useRef, type KeyboardEvent } from "react";
+import {
+  ChevronDownIcon,
+  ChevronLeftIcon,
+  ChevronRightIcon,
+  SearchIcon,
+  XIcon,
+} from "lucide-react";
+import { useId, useMemo, useRef, useState, type KeyboardEvent } from "react";
 
 import {
   DIFF_FILE_STATUS_LABELS,
   DIFF_FILE_STATUS_LETTERS,
   EMPTY_DIFF_FILE_FILTERS,
+  filterDiffFileRows,
   formatFileCount,
   hasActiveDiffFileFilters,
   type DiffFileFilters,
@@ -14,6 +21,15 @@ import {
 import { cn } from "~/lib/utils";
 
 import { Button } from "../ui/button";
+import {
+  Combobox,
+  ComboboxEmpty,
+  ComboboxInput,
+  ComboboxItem,
+  ComboboxList,
+  ComboboxPopup,
+  ComboboxTrigger,
+} from "../ui/combobox";
 import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../ui/select";
 import { WindowedList, type WindowedListHandle } from "../WindowedList";
 
@@ -272,6 +288,112 @@ function DiffFileListRow({
           ) : null}
         </span>
       ) : null}
+    </div>
+  );
+}
+
+/** The picker lists at most this many matches; the search narrows a longer list. */
+const PICKER_LIMIT = 200;
+
+export interface DiffFilePickerProps {
+  readonly rows: ReadonlyArray<DiffFileRow>;
+  readonly selectedKey: string | null;
+  readonly onSelect: (row: DiffFileRow) => void;
+}
+
+/**
+ * Compare's file list in a narrow panel: a searchable picker above the diff, between Previous
+ * file and Next file.
+ */
+export function DiffFilePicker({ rows, selectedKey, onSelect }: DiffFilePickerProps) {
+  const [query, setQuery] = useState("");
+  const rowsByKey = useMemo(() => new Map(rows.map((row) => [row.key, row])), [rows]);
+  const matches = useMemo(
+    () => filterDiffFileRows(rows, { status: "all", query }).slice(0, PICKER_LIMIT),
+    [query, rows],
+  );
+  const index = selectedKey === null ? -1 : rows.findIndex((row) => row.key === selectedKey);
+  const selected = index < 0 ? null : rows[index]!;
+  const step = (direction: 1 | -1) => {
+    const row = rows[index + direction];
+    if (row) onSelect(row);
+  };
+  return (
+    <div className="flex shrink-0 items-center gap-1 border-b border-border px-2 py-1">
+      <Button
+        aria-label="Previous file"
+        disabled={index <= 0}
+        size="icon-xs"
+        variant="ghost"
+        onClick={() => step(-1)}
+      >
+        <ChevronLeftIcon aria-hidden="true" className="size-3.5" />
+      </Button>
+      <Combobox
+        filteredItems={matches.map((row) => row.key)}
+        items={rows.map((row) => row.key)}
+        value={selectedKey}
+        onOpenChange={(open) => {
+          if (!open) setQuery("");
+        }}
+        onValueChange={(key) => {
+          const row = key ? rowsByKey.get(key) : undefined;
+          if (row) onSelect(row);
+        }}
+      >
+        <ComboboxTrigger
+          aria-label={selected ? `File: ${selected.path}` : "Choose a file"}
+          className="inline-flex min-w-0 flex-1 items-center gap-1 rounded-md px-2 py-1 text-left text-xs font-medium outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          <span className="min-w-0 flex-1 truncate">{selected?.path ?? "Choose a file"}</span>
+          {rows.length > 0 ? (
+            <span className="shrink-0 text-muted-foreground tabular-nums">
+              {index + 1}/{rows.length}
+            </span>
+          ) : null}
+          <ChevronDownIcon aria-hidden="true" className="size-3.5 shrink-0 text-muted-foreground" />
+        </ComboboxTrigger>
+        <ComboboxPopup
+          align="start"
+          className="w-80 min-w-0 max-w-[calc(100vw-1rem)] overflow-hidden"
+        >
+          <div className="px-3 pt-2.5 pb-1.5">
+            <ComboboxInput
+              inputClassName="text-xs"
+              placeholder="Find a file"
+              showTrigger={false}
+              size="sm"
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+            />
+          </div>
+          <ComboboxEmpty>No files match.</ComboboxEmpty>
+          <ComboboxList className="max-h-72">
+            {matches.map((row) => (
+              <ComboboxItem key={row.key} value={row.key}>
+                <span className="flex min-w-0 items-center gap-2 text-xs">
+                  <span
+                    aria-hidden="true"
+                    className={cn("w-3 shrink-0 font-mono font-medium", STATUS_TONE[row.status])}
+                  >
+                    {DIFF_FILE_STATUS_LETTERS[row.status]}
+                  </span>
+                  <span className="min-w-0 truncate">{row.path}</span>
+                </span>
+              </ComboboxItem>
+            ))}
+          </ComboboxList>
+        </ComboboxPopup>
+      </Combobox>
+      <Button
+        aria-label="Next file"
+        disabled={index < 0 || index >= rows.length - 1}
+        size="icon-xs"
+        variant="ghost"
+        onClick={() => step(1)}
+      >
+        <ChevronRightIcon aria-hidden="true" className="size-3.5" />
+      </Button>
     </div>
   );
 }

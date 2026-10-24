@@ -352,6 +352,40 @@ describe("DiffCompareView", () => {
     expect(store.readDraftText("draft-1")).toBe("half-written");
   });
 
+  it("turns the list into a file picker with previous and next file in a narrow panel", async () => {
+    class NarrowResizeObserver {
+      constructor(private readonly callback: ResizeObserverCallback) {}
+      observe() {
+        this.callback(
+          [{ contentRect: { width: 500 } } as ResizeObserverEntry],
+          this as unknown as ResizeObserver,
+        );
+      }
+      disconnect() {}
+      unobserve() {}
+    }
+    vi.stubGlobal("ResizeObserver", NarrowResizeObserver);
+    try {
+      const files = parse(modified("src/a.ts", OLD_A, NEW_A), modified("src/b.ts", OLD_B, NEW_B));
+      await render(files);
+      expect(listbox(), "no second, squeezed column").toBeNull();
+      const trigger = container.querySelector<HTMLElement>('[aria-label="File: src/a.ts"]');
+      expect(trigger?.textContent).toContain("1/2");
+      const button = (label: string) =>
+        container.querySelector<HTMLButtonElement>(`button[aria-label="${label}"]`)!;
+      expect(button("Previous file").disabled).toBe(true);
+      await act(async () => button("Next file").click());
+      expect(useDiffPanelStore.getState().compareFileByThreadKey).toEqual({
+        "environment-1:thread-1": "src/b.ts",
+      });
+      expect(container.querySelector('[aria-label="File: src/b.ts"]')).not.toBeNull();
+      expect(button("Next file").disabled).toBe(true);
+      expect(container.querySelector('input[aria-label="Filter files"]')).not.toBeNull();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("reads two blobs for branch and turn scopes", async () => {
     await render(parse(modified("src/a.ts", OLD_A, NEW_A)), { scope: "branch" });
     expect(h.requested).toContain(blobKey(OLD_A));

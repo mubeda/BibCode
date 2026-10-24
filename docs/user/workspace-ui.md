@@ -973,7 +973,9 @@ two of them, the panel says so instead of showing no changes.
   together. The full files load after the changed lines, which show at once.
   - The list filters by name (**Esc** clears it) and by status, and says
     "N of M files" while a filter is on. Up, Down, Home, End, Page Up and Page
-    Down move the selection.
+    Down move the selection. In a panel narrower than 640 px, the list becomes
+    a searchable file picker above the diff, between **Previous file** and
+    **Next file**.
   - **All lines** shows the whole file. **Changes only** shows the changes with
     **Context lines** around them (3 by default, up to 99); collapsed regions
     still expand.
