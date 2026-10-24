@@ -3443,6 +3443,55 @@ mod workspace_loss_tests {
         f.shutdown().await;
     }
 
+    /// A delivery the provider accepted without naming its turn (a Codex `/compact`, whose turn
+    /// Codex reports after answering) keeps the turn the provider already reported running, so
+    /// Stop can still settle it.
+    #[tokio::test]
+    async fn acceptance_without_a_turn_keeps_the_turn_the_provider_already_started() {
+        let gate = Arc::new(PublicationTestGate::default());
+        let f = Fixture::with_hook(
+            true,
+            AcceptedPublicationTestHook {
+                before_publication: Some(gate.clone()),
+                ..AcceptedPublicationTestHook::default()
+            },
+        )
+        .await;
+        f.driver.unknown_turn_id.store(true, Ordering::SeqCst);
+        let delivery = f
+            .supervisor
+            .deliver_turn(turn("compact", false), "compact-key".into())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
+            .await
+            .unwrap();
+        let mut events = f.engine.subscribe_events();
+        enqueue(&f, [core_event("turn.started", "provider-turn", json!({}))]);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let event = events.recv().await.unwrap();
+                if event.event.event_type == "thread.session-set"
+                    && event.event.payload.pointer("/session/activeTurnId")
+                        == Some(&json!("provider-turn"))
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        gate.release.notify_one();
+        let outcome = tokio::time::timeout(Duration::from_secs(5), delivery.completion())
+            .await
+            .unwrap();
+        let session = f.session().await;
+        f.shutdown().await;
+        assert_eq!(outcome, ProviderDeliveryOutcome::Accepted { turn_id: None });
+        assert_eq!(session.status, "running");
+        assert_eq!(session.active_turn_id.as_deref(), Some("provider-turn"));
+    }
+
     #[tokio::test]
     async fn wrong_publication_generation_leaves_current_state_unchanged() {
         let gate = Arc::new(PublicationTestGate::default());
@@ -6876,6 +6925,28 @@ async fn publish_running_session(
         );
         return Ok(());
     }
+    // An acceptance that names no turn (a Codex compaction, whose turn Codex reports after it
+    // answers) keeps the turn the provider already reported, so Stop can still settle that turn.
+    let turn_id = match turn_id {
+        Some(turn_id) => Some(turn_id),
+        None => match engine
+            .repositories()
+            .get_thread_session(entry.launch.thread_id.clone())
+            .await
+        {
+            Ok(session) => session
+                .filter(|session| session.status == "running")
+                .and_then(|session| session.active_turn_id),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    thread_id = %entry.launch.thread_id,
+                    "the running turn could not be read before marking an accepted delivery running"
+                );
+                None
+            }
+        },
+    };
     let runtime = persist_entry(&engine.repositories(), entry, "running").await;
     if best_effort {
         if let Err(error) = runtime {
@@ -10935,6 +11006,13 @@ impl CodexDriver {
     }
 }
 
+/// `/compact` on its own asks Codex to compact the thread (`thread/compact/start`) instead of
+/// sending the text to the model. Codex takes no instructions for a compaction, so `/compact`
+/// with text or attachments is an ordinary message.
+fn is_codex_compaction(text: &str, attachments: &[Value]) -> bool {
+    attachments.is_empty() && parse_provider_command(text) == Some(("compact", ""))
+}
+
 impl ProviderDriver for CodexDriver {
     fn start(&self) -> BoxRuntimeFuture<'_, Result<StartedSession, ProviderRuntimeError>> {
         Box::pin(async move {
@@ -10966,6 +11044,13 @@ impl ProviderDriver for CodexDriver {
         interaction_mode: String,
     ) -> BoxRuntimeFuture<'_, Result<Option<String>, ProviderRuntimeError>> {
         Box::pin(async move {
+            if is_codex_compaction(&text, &attachments) {
+                return self
+                    .runtime
+                    .compact_thread()
+                    .await
+                    .map_err(provider_error("codex"));
+            }
             let (text, attachments) = self.prepare_turn_input(text, attachments).await?;
             self.runtime
                 .send_turn(Some(text), attachments, Some(interaction_mode), None)
@@ -10982,6 +11067,30 @@ impl ProviderDriver for CodexDriver {
         delivery_key: String,
     ) -> BoxRuntimeFuture<'_, ProviderDeliveryOutcome> {
         Box::pin(async move {
+            if is_codex_compaction(&text, &attachments) {
+                // A compaction carries no user message, so `reconcile` cannot find it: one whose
+                // answer was lost is sent again.
+                return match self.runtime.compact_thread().await {
+                    Ok(turn_id) => ProviderDeliveryOutcome::Accepted { turn_id },
+                    Err(crate::provider::codex::runtime::RuntimeError::MissingProviderThreadId) => {
+                        ProviderDeliveryOutcome::DefinitelyNotSent {
+                            detail: self.session_not_ready_detail(),
+                        }
+                    }
+                    Err(crate::provider::codex::runtime::RuntimeError::Protocol(
+                        crate::provider::codex::protocol::ProtocolError::RemoteRequest {
+                            method,
+                            message,
+                            ..
+                        },
+                    )) if method == "thread/compact/start" => {
+                        ProviderDeliveryOutcome::Rejected { detail: message }
+                    }
+                    Err(error) => ProviderDeliveryOutcome::Ambiguous {
+                        detail: self.runtime_error_detail(error),
+                    },
+                };
+            }
             let (text, attachments) = match self.prepare_turn_input(text, attachments).await {
                 Ok(input) => input,
                 Err(error) => {
@@ -11022,6 +11131,14 @@ impl ProviderDriver for CodexDriver {
         delivery_key: String,
     ) -> BoxRuntimeFuture<'_, ProviderDeliveryOutcome> {
         Box::pin(async move {
+            // Codex compacts in a turn of its own, so the compaction waits for this one to end.
+            if is_codex_compaction(&text, &attachments) {
+                return ProviderDeliveryOutcome::Rejected {
+                    detail:
+                        "Codex compacts between turns, so this waits until the current turn ends."
+                            .to_owned(),
+                };
+            }
             let (text, attachments) = match self.prepare_turn_input(text, attachments).await {
                 Ok(input) => input,
                 Err(error) => {
@@ -17735,6 +17852,9 @@ lines.on("line", (line) => {
     case "thread/goal/set":
       result = { goal: { status: "active" } };
       break;
+    case "thread/compact/start":
+      result = {};
+      break;
     case "turn/start":
       result = { turn: { id: "native-codex-turn" } };
       break;
@@ -20798,6 +20918,7 @@ while IFS= read -r line; do
     *'"method":"thread/start"'*) response_marker=$BIBCODE_TEST_CODEX_THREAD_RESPONSE_READY_MARKER; [ -z "$response_marker" ] || : > "$response_marker"; printf '{"id":%s,"result":{"cwd":"/tmp","model":"gpt-5","thread":{"id":"native-codex-thread"}}}\n' "$id" ;;
     *'"method":"mcpServerStatus/list"'*) printf '{"id":%s,"result":{"data":[],"nextCursor":null}}\n' "$id" ;;
     *'"method":"thread/goal/set"'*) printf '{"id":%s,"result":{"goal":{"status":"active"}}}\n' "$id" ;;
+    *'"method":"thread/compact/start"'*) printf '{"id":%s,"result":{}}\n' "$id" ;;
     *'"method":"turn/start"'*) printf '{"id":%s,"result":{"turn":{"id":"native-codex-turn"}}}\n' "$id" ;;
     *'"method":"turn/interrupt"'*) printf '{"id":%s,"result":{}}\n' "$id" ;;
     *'"method":"shutdown"'*)
@@ -26833,6 +26954,49 @@ done
                 .await
                 .expect("Codex goal should send")
                 .is_some()
+        );
+        // `/compact` asks Codex to compact the thread; Codex reports the compaction's own turn,
+        // so the turn still running from `hello` is not the compaction's. A request the fixture
+        // never answers would wait forever, so the send is bounded too.
+        let compaction_turn = match deadline
+            .observe(codex.send("/compact".to_owned(), Vec::new(), "default".to_owned()))
+            .await
+        {
+            Ok(sent) => sent.expect("Codex compaction should start"),
+            Err(error) => {
+                provider_fixture_deadline_failure(
+                    codex.as_ref(),
+                    "native Codex /compact send",
+                    error,
+                )
+                .await
+            }
+        };
+        assert_eq!(compaction_turn, None);
+        let compaction = match captured_request(deadline, &capture_path, |request| {
+            request["method"] == "thread/compact/start"
+        })
+        .await
+        {
+            Ok(request) => request,
+            Err(error) => {
+                provider_fixture_deadline_failure(
+                    codex.as_ref(),
+                    "native Codex thread/compact/start capture",
+                    error,
+                )
+                .await
+            }
+        };
+        assert_eq!(
+            compaction["params"],
+            json!({ "threadId": "native-codex-thread" })
+        );
+        assert!(
+            !std::fs::read_to_string(&capture_path)
+                .unwrap_or_default()
+                .contains(r#""text":"/compact""#),
+            "/compact must not reach the model as text"
         );
         codex.interrupt(None).await.expect("Codex should interrupt");
         codex

@@ -1387,6 +1387,27 @@ impl CodexSessionRuntime {
         Ok(())
     }
 
+    /// Asks Codex to compact the thread's conversation. Codex answers `{}` at once and reports the
+    /// compaction as a turn (`turn/started`, a `contextCompaction` item, `turn/completed`); the
+    /// turn's id is returned when Codex started it before answering. A turn that was already
+    /// active is not the compaction's.
+    pub async fn compact_thread(&self) -> Result<Option<String>, RuntimeError> {
+        let provider_thread_id = self.provider_thread_id().await?;
+        let active_before = self.inner.session.lock().await.active_turn_id.clone();
+        self.inner
+            .connection
+            .lock()
+            .await
+            .clone()
+            .request(
+                "thread/compact/start",
+                json!({ "threadId": provider_thread_id }),
+            )
+            .await?;
+        let active_after = self.inner.session.lock().await.active_turn_id.clone();
+        Ok(active_after.filter(|turn_id| active_before.as_ref() != Some(turn_id)))
+    }
+
     pub async fn interrupt_turn(&self, turn_id: Option<String>) -> Result<(), RuntimeError> {
         let provider_thread_id = self.provider_thread_id().await?;
         let active_turn_id = if let Some(turn_id) = turn_id {
@@ -2688,8 +2709,43 @@ impl CodexSessionRuntime {
                 )
                 .await;
             }
+            // An upstream failure. One Codex does not retry also ends the turn, which
+            // `turn/completed` reports.
+            "error" => {
+                if params.get("willRetry").and_then(Value::as_bool) == Some(true)
+                    && let Some(error) = params.get("error")
+                {
+                    let failure = classify_codex_error(error);
+                    self.emit(
+                        "runtime.warning",
+                        params
+                            .get("turnId")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                        None,
+                        json!({
+                            "message": format!(
+                                "Codex is retrying after an upstream error: {}",
+                                failure.message
+                            ),
+                            "class": failure.class,
+                        }),
+                    )
+                    .await;
+                }
+            }
             "item/started" => {
-                if let Some((turn_id, payload)) = command_item_event_payload(&params, false) {
+                if let Some((turn_id, item_id)) = context_compaction_item(&params) {
+                    self.emit_with_item_id(
+                        "item.started",
+                        Some(turn_id),
+                        Some(item_id),
+                        None,
+                        context_compaction_payload("inProgress"),
+                    )
+                    .await;
+                } else if let Some((turn_id, payload)) = command_item_event_payload(&params, false)
+                {
                     self.emit("item.started", Some(turn_id), None, payload)
                         .await;
                 }
@@ -2712,6 +2768,15 @@ impl CodexSessionRuntime {
                         Some(item_id),
                         None,
                         json!({}),
+                    )
+                    .await;
+                } else if let Some((turn_id, item_id)) = context_compaction_item(&params) {
+                    self.emit_with_item_id(
+                        "item.completed",
+                        Some(turn_id),
+                        Some(item_id),
+                        None,
+                        context_compaction_payload("completed"),
                     )
                     .await;
                 } else if let Some((turn_id, payload)) = command_item_event_payload(&params, true) {
@@ -3696,9 +3761,11 @@ fn describe_codex_error_variant(variant: &str) -> Option<(&'static str, &'static
             "validation_error",
             "The active turn cannot accept new input until it finishes.",
         ),
+        // The thread offers to compact the conversation for this class.
         "contextWindowExceeded" => (
-            "provider_error",
-            "The conversation exceeded the model's context window.",
+            "context_limit",
+            "Codex's context window is full. Compact the conversation, then send your message \
+             again.",
         ),
         "sessionBudgetExceeded" => ("provider_error", "The session's budget was exhausted."),
         "usageLimitExceeded" => (
@@ -3772,14 +3839,20 @@ pub(crate) fn classify_codex_error(error: &Value) -> CodexFailure {
     let (class, fallback) = info
         .and_then(describe_codex_error_variant)
         .unwrap_or(("provider_error", CODEX_UNCLASSIFIED_FAILURE));
-    let mut message = error
+    let reported = error
         .get("message")
         .and_then(Value::as_str)
         .or_else(|| error.as_str())
         .map(str::trim)
-        .filter(|message| !message.is_empty())
-        .unwrap_or(fallback)
-        .to_owned();
+        .filter(|message| !message.is_empty());
+    // A context limit leads with what to do, then keeps what Codex said.
+    let mut message = match reported {
+        Some(reported) if class == "context_limit" => {
+            format!("{fallback} Codex reported: {reported}")
+        }
+        Some(reported) => reported.to_owned(),
+        None => fallback.to_owned(),
+    };
     if let Some(info) = info
         && !message.contains(info)
     {
@@ -3800,6 +3873,30 @@ fn request_type(kind: PendingRequestKind) -> &'static str {
         PendingRequestKind::FileChangeApproval => "file_change_approval",
         PendingRequestKind::UserInput => "tool_user_input",
     }
+}
+
+/// The turn and item ids of a `contextCompaction` item notification: Codex compacting the
+/// conversation, automatically or for `thread/compact/start`.
+fn context_compaction_item(params: &Value) -> Option<(String, String)> {
+    if params.pointer("/item/type").and_then(Value::as_str) != Some("contextCompaction") {
+        return None;
+    }
+    let turn_id = params.get("turnId").and_then(Value::as_str)?.to_owned();
+    let item_id = params
+        .pointer("/item/id")
+        .and_then(Value::as_str)
+        .filter(|item_id| !item_id.is_empty())?
+        .to_owned();
+    Some((turn_id, item_id))
+}
+
+/// A compaction as the Conversation compaction step Claude's and OpenCode's compactions show.
+fn context_compaction_payload(status: &str) -> Value {
+    json!({
+        "itemType": "context_compaction",
+        "status": status,
+        "title": "Conversation compaction",
+    })
 }
 
 fn command_item_event_payload(params: &Value, completed: bool) -> Option<(String, Value)> {
@@ -4687,6 +4784,199 @@ mod tests {
                 failure.message
             );
         }
+    }
+
+    /// The compaction and retry shapes generated from codex-cli 0.164.0.
+    fn compaction_schema() -> Value {
+        serde_json::from_str(include_str!(
+            "../../../tests/fixtures/codex/codex-compaction-schema.json"
+        ))
+        .expect("codex compaction schema fixture")
+    }
+
+    /// A runtime whose root thread is `provider-thread`, without Activity, so a notification
+    /// naming that thread is the root's.
+    fn root_thread_runtime() -> (CodexSessionRuntime, DuplexStream, DuplexStream) {
+        let (connection, incoming, peer_stdout, peer_stdin, _peer_stderr) =
+            runtime_test_connection();
+        let runtime = CodexSessionRuntime::new_with_agent_activity_enabled(
+            reconciliation_test_options(),
+            connection,
+            incoming,
+            false,
+        );
+        (runtime, peer_stdout, peer_stdin)
+    }
+
+    #[tokio::test]
+    async fn a_retried_codex_error_is_a_warning_and_a_final_one_waits_for_its_turn() {
+        let schema = compaction_schema();
+        assert_eq!(
+            schema["ErrorNotification"]["required"],
+            json!(["error", "threadId", "turnId", "willRetry"])
+        );
+        let method = schema["errorNotificationMethod"]
+            .as_str()
+            .expect("error method");
+        let (runtime, _stdout, _stdin) = root_thread_runtime();
+        runtime.inner.session.lock().await.resume_cursor = Some("provider-thread".to_owned());
+        let error = json!({
+            "message": "stream disconnected before completion",
+            "codexErrorInfo": { "responseStreamDisconnected": { "httpStatusCode": 502 } },
+            "additionalDetails": null
+        });
+        for (thread_id, will_retry) in [
+            ("provider-thread", true),
+            ("provider-thread", false),
+            ("child-thread", true),
+        ] {
+            runtime
+                .handle_notification(
+                    method.to_owned(),
+                    json!({
+                        "error": error,
+                        "threadId": thread_id,
+                        "turnId": "turn-1",
+                        "willRetry": will_retry
+                    }),
+                    1_000,
+                )
+                .await;
+        }
+
+        let events = drain_runtime_events(&runtime).await;
+        let warnings = events
+            .iter()
+            .filter(|event| event.event_type == "runtime.warning")
+            .collect::<Vec<_>>();
+        assert_eq!(warnings.len(), 1, "{events:?}");
+        assert_eq!(warnings[0].turn_id.as_deref(), Some("turn-1"));
+        assert_eq!(
+            warnings[0].payload,
+            json!({
+                "message": "Codex is retrying after an upstream error: stream disconnected before completion (responseStreamDisconnected) (HTTP 502)",
+                "class": "provider_error"
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_context_compaction_items_show_as_a_conversation_compaction() {
+        let schema = compaction_schema();
+        let item_type = schema
+            .pointer("/ContextCompactionThreadItem/properties/type/enum/0")
+            .expect("contextCompaction type")
+            .clone();
+        let (runtime, _stdout, _stdin) = root_thread_runtime();
+        runtime.inner.session.lock().await.resume_cursor = Some("provider-thread".to_owned());
+        for method in ["item/started", "item/completed"] {
+            runtime
+                .handle_notification(
+                    method.to_owned(),
+                    json!({
+                        "item": { "type": item_type, "id": "compaction-item" },
+                        "threadId": "provider-thread",
+                        "turnId": "turn-1",
+                        "startedAtMs": 1,
+                        "completedAtMs": 2
+                    }),
+                    1_000,
+                )
+                .await;
+        }
+
+        let events = drain_runtime_events(&runtime).await;
+        let shown = events
+            .iter()
+            .map(|event| {
+                (
+                    event.event_type.as_str(),
+                    event.turn_id.as_deref(),
+                    event.item_id.as_deref(),
+                    event.payload.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            shown,
+            [
+                (
+                    "item.started",
+                    Some("turn-1"),
+                    Some("compaction-item"),
+                    json!({
+                        "itemType": "context_compaction",
+                        "status": "inProgress",
+                        "title": "Conversation compaction"
+                    })
+                ),
+                (
+                    "item.completed",
+                    Some("turn-1"),
+                    Some("compaction-item"),
+                    json!({
+                        "itemType": "context_compaction",
+                        "status": "completed",
+                        "title": "Conversation compaction"
+                    })
+                ),
+            ]
+        );
+    }
+
+    /// A conversation that no longer fits fails with the class that offers Compact
+    /// conversation, says what to do, and keeps what Codex said.
+    #[test]
+    fn a_codex_context_window_failure_is_an_actionable_context_limit() {
+        let reported = classify_codex_error(&json!({
+            "message": "Codex ran out of room in the model's context window.",
+            "codexErrorInfo": "contextWindowExceeded",
+        }));
+        assert_eq!(reported.class, "context_limit");
+        assert_eq!(
+            reported.message,
+            "Codex's context window is full. Compact the conversation, then send your message again. Codex reported: Codex ran out of room in the model's context window. (contextWindowExceeded)"
+        );
+        let silent = classify_codex_error(&json!({
+            "message": "",
+            "codexErrorInfo": "contextWindowExceeded",
+        }));
+        assert_eq!(silent.class, "context_limit");
+        assert_eq!(
+            silent.message,
+            "Codex's context window is full. Compact the conversation, then send your message again. (contextWindowExceeded)"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_thread_asks_codex_to_compact_the_root_thread() {
+        let schema = compaction_schema();
+        assert_eq!(
+            schema["ThreadCompactStartParams"]["required"],
+            json!(["threadId"])
+        );
+        let (runtime, peer_stdout, peer_stdin) = root_thread_runtime();
+        runtime.inner.session.lock().await.resume_cursor = Some("provider-thread".to_owned());
+        let peer = tokio::spawn(async move {
+            let mut reader = BufReader::new(peer_stdin);
+            let mut writer = peer_stdout;
+            let request = read_runtime_test_json(&mut reader).await;
+            write_runtime_test_json(&mut writer, json!({ "id": request["id"], "result": {} }))
+                .await;
+            request
+        });
+
+        // A request that never reaches the peer, or an answer that never arrives, fails here.
+        let compacted = timeout(Duration::from_secs(5), runtime.compact_thread())
+            .await
+            .expect("compact_thread answers");
+        assert_eq!(compacted.unwrap(), None);
+        let request = timeout(Duration::from_secs(5), peer)
+            .await
+            .expect("the peer reads the request")
+            .unwrap();
+        assert_eq!(request["method"], "thread/compact/start");
+        assert_eq!(request["params"], json!({ "threadId": "provider-thread" }));
     }
 
     #[tokio::test]

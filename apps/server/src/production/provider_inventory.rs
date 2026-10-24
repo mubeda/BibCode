@@ -925,11 +925,18 @@ fn codex_skill_inventory(skills: &[codex::CodexProviderSkill]) -> Vec<Value> {
 
 fn built_in_slash_commands(driver: &str) -> Vec<Value> {
     match driver {
-        "codex" => vec![slash_command(
-            "goal",
-            "Set a completion condition and keep working until it is met",
-            Some("<condition>"),
-        )],
+        "codex" => vec![
+            slash_command(
+                "goal",
+                "Set a completion condition and keep working until it is met",
+                Some("<condition>"),
+            ),
+            slash_command(
+                "compact",
+                "Compact the conversation to free up context",
+                None,
+            ),
+        ],
         "claudeAgent" => vec![
             slash_command(
                 "goal",
@@ -3308,6 +3315,7 @@ mod tests {
     #[test]
     fn built_in_capabilities_include_provider_specific_goal_and_loop_commands() {
         let codex = built_in_slash_commands("codex");
+        assert!(codex.iter().any(|command| command["name"] == "compact"));
         let claude = built_in_slash_commands("claudeAgent");
         let cursor = built_in_slash_commands("cursor");
         let grok = built_in_slash_commands("grok");
