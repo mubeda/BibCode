@@ -177,7 +177,9 @@ cancelled, which a closed menu does.
    as import does.
 
 Closing the menu does not cancel an open in flight; two clients resuming one
-session reach the same thread, and the later one gets `existing`.
+session reach the same thread, and the later one gets `existing`. The client
+keeps an open's command ID until the server answers it or refuses it, so a
+retry after a dropped connection reaches the copy the first attempt made.
 
 ## Session establishment
 

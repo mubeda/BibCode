@@ -1,4 +1,10 @@
-import { EnvironmentId, ProjectId, ProviderInstanceId, ThreadId } from "@bibcode/contracts";
+import {
+  AgentSessionsError,
+  EnvironmentId,
+  ProjectId,
+  ProviderInstanceId,
+  ThreadId,
+} from "@bibcode/contracts";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 const h = vi.hoisted(() => ({
@@ -24,6 +30,7 @@ const h = vi.hoisted(() => ({
   openChatPanel: vi.fn(),
   openInPanel: vi.fn(),
   openInPanelResult: { _tag: "Success", value: undefined } as unknown,
+  newCommandId: vi.fn(),
 }));
 
 vi.mock("react", () => ({
@@ -64,7 +71,7 @@ vi.mock("~/state/projects", () => ({
 }));
 
 vi.mock("~/lib/utils", () => ({
-  newCommandId: () => "command-panel-create",
+  newCommandId: () => h.newCommandId(),
   newThreadId: () => "new-panel-thread",
 }));
 
@@ -114,6 +121,7 @@ beforeEach(() => {
   h.unarchiveThread.mockImplementation(() => Promise.resolve(h.unarchiveResult));
   h.openInPanelResult = { _tag: "Success", value: undefined };
   h.openInPanel.mockImplementation(() => Promise.resolve(h.openInPanelResult));
+  h.newCommandId.mockImplementation(() => "command-panel-create");
   h.interruptTurn.mockImplementation(() =>
     Promise.resolve({ _tag: "Failure", cause: new Error("no running turn") }),
   );
@@ -520,6 +528,60 @@ describe("center panel actions", () => {
       description: "This session is open in a terminal. Choose Continue in a copy.",
     });
     expect(h.openChatPanel).not.toHaveBeenCalled();
+  });
+
+  it("retries an open whose outcome is unknown under its command, so one copy is made", async () => {
+    const actions = useCenterPanelActions({ onCloseTerminal });
+    let next = 0;
+    h.newCommandId.mockImplementation(() => `command-${++next}`);
+    const open = () =>
+      actions.openSessionPanel(hostRef, { sessionId: "session-5", mode: "fork", title: "Copy" });
+
+    // The connection dropped before the answer, by interruption or by a transport failure.
+    h.openInPanelResult = { _tag: "Failure", interrupted: true };
+    await open();
+    h.openInPanelResult = { _tag: "Failure", cause: new Error("The connection closed.") };
+    await open();
+    h.openInPanelResult = {
+      _tag: "Success",
+      value: {
+        threadId: ThreadId.make("copy:claudeAgent:fork-1"),
+        hostThreadId: hostRef.threadId,
+        outcome: "existing",
+      },
+    };
+    await open();
+    // Settled: the next Continue in a copy is another copy.
+    await open();
+    expect(
+      h.openInPanel.mock.calls.map(([call]) => (call as { input: { commandId: string } }).input),
+    ).toEqual(
+      ["command-1", "command-1", "command-1", "command-2"].map((commandId) => ({
+        commandId,
+        hostThreadId: hostRef.threadId,
+        sessionId: "session-5",
+        mode: "fork",
+      })),
+    );
+  });
+
+  it("sends a new command after the server refuses an open", async () => {
+    const actions = useCenterPanelActions({ onCloseTerminal });
+    let next = 0;
+    h.newCommandId.mockImplementation(() => `command-${++next}`);
+    h.openInPanelResult = {
+      _tag: "Failure",
+      cause: new AgentSessionsError({ message: "This copy's chat was deleted." }),
+    };
+    const open = () =>
+      actions.openSessionPanel(hostRef, { sessionId: "session-6", mode: "fork", title: "Copy" });
+    await open();
+    await open();
+    expect(
+      h.openInPanel.mock.calls.map(
+        ([call]) => (call as { input: { commandId: string } }).input.commandId,
+      ),
+    ).toEqual(["command-1", "command-2"]);
   });
 
   it("activates a live panel thread and reopens a closed one", async () => {
