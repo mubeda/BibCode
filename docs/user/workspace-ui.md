@@ -952,6 +952,25 @@ locked paths or a policy rule. Under **Pipelines must succeed** it says whether
 the pipeline is still running, failed, was canceled, was skipped, is waiting for
 a manual job, or has not run at all. Only GitLab's short-lived checking states
 read “GitLab is still computing mergeability; refresh in a moment”.
+
+On GitLab, the merge box also shows the gating pipeline under its title, for
+example “Merge request pipeline **#4821** running · abc1234 on feature/login”,
+with the number linking to the pipeline and a strip of its stages, each with an
+icon whose shape gives its status (passed, passed with warnings, failed,
+running, queued, manual, scheduled, canceled, skipped). The commit shows only
+for merge request and branch pipelines; a merged-results or merge train
+pipeline runs on a merge commit GitLab made. **Older commit** marks a pipeline
+that ran before the latest push. An account that cannot view the project's
+pipelines sees “You can't view pipelines in this project.” instead. While the
+merge request is open on Conversation or Pipelines in a visible window and the
+pipeline runs, its stages update within about 10 seconds without a refresh, and
+a pipeline that finishes while shown is announced to screen readers once. The
+Pipelines tab shows the same summary above its jobs, grouped by stage in
+GitLab's order with trigger jobs linking their downstream pipeline; when a stage
+has more than 100 jobs it says so and links the pipeline for the rest.
+Beyond three merge requests watched at once, the others' pipeline status
+updates every 20 seconds, and their Pipelines tab reloads its jobs whenever
+that status changes.
 The normal confirmation title is “Merge pull request” on GitHub and “Merge
 merge request” on GitLab. Request-specific recovery messages and accessibility
 labels use the same host vocabulary; the module remains **Pull Requests**.

@@ -11,6 +11,7 @@ import type {
   PullRequestsContext,
   PullRequestsDetail,
   PullRequestsFiles as PullRequestsFilesData,
+  PullRequestsPipelineCopy,
   PullRequestsTimeline,
   ScopedProjectRef,
 } from "@bibcode/contracts";
@@ -22,6 +23,7 @@ import {
   useEffect,
   useEffectEvent,
   useMemo,
+  useRef,
   useState,
 } from "react";
 import { PullRequestsActionProvider } from "../usePullRequestsAction";
@@ -40,7 +42,7 @@ import {
   selectListSort,
   selectListTab,
 } from "../list/pullRequestsList.logic";
-import { newerObservedAt } from "./snapshotDisplay.logic";
+import { keepNewestCopy, newerObservedAt, type KeptCopy } from "./snapshotDisplay.logic";
 import { PullRequestsQueryState } from "./PullRequestsQueryState";
 import { PullRequestsHeader } from "./PullRequestsHeader";
 import { PullRequestsConversation } from "./PullRequestsConversation";
@@ -162,6 +164,10 @@ export function PullRequestsDetailView({
     [snapshotTarget],
   );
   const snapshotQuery = useEnvironmentQuery(snapshotAtom);
+  // A `pipeline` change waiting for the stored row it names, and the newest
+  // pipeline row revision seen for this request.
+  const pipelineChangePending = useRef(false);
+  const seenPipelineRevision = useRef<{ key: unknown; revision: number } | null>(null);
   const visible = useDocumentVisible();
   const subscribeAtom = useMemo(
     () => (isGitlab && visible ? pullRequestsEnvironment.subscribe(snapshotTarget) : null),
@@ -213,13 +219,39 @@ export function PullRequestsDetailView({
           ? timelineQuery.revalidate
           : refreshTimelineAtom)();
       if (changed.commits) (tab === "commits" ? commitsQuery.revalidate : refreshCommitsAtom)();
-      if (changed.checks) (tab === "checks" ? checksQuery.revalidate : refreshChecksAtom)();
+      // The poller's pipeline row already holds the new header, stages and jobs:
+      // paint it from storage instead of reading the jobs from the host again.
+      // A row with the header only is answered once it arrives (below).
+      if (changed.pipeline) {
+        pipelineChangePending.current = true;
+        snapshotQuery.revalidate();
+      } else if (changed.checks) (tab === "checks" ? checksQuery.revalidate : refreshChecksAtom)();
       if (changed.files) (tab === "files" ? filesQuery.revalidate : refreshFilesAtom)();
     },
   );
   useEffect(() => {
     if (subscribeQuery.data) applySubscribedChange(subscribeQuery.data);
   }, [subscribeQuery.data]);
+  // A number past the poller's three-number pipeline read cap gets rows with
+  // the header only (`checks: null`). After a `pipeline` change, the Pipelines
+  // tab re-reads the jobs once for each such row's revision, so the job list
+  // follows the header. Rows that carry jobs are shown as they are.
+  const storedPipeline = snapshotQuery.data?.pipeline?.payload ?? null;
+  const rereadJobsForHeaderOnlyRow = useEffectEvent((row: PullRequestsPipelineCopy | null) => {
+    if (row === null) return;
+    const seen = seenPipelineRevision.current;
+    if (seen !== null && seen.key === request && row.revision <= seen.revision) return;
+    seenPipelineRevision.current = { key: request, revision: row.revision };
+    if (!pipelineChangePending.current) return;
+    pipelineChangePending.current = false;
+    if (tab !== "checks" || row.checks !== null) return;
+    if ((checksQuery.data?.revision ?? -1) >= row.revision) return;
+    checksQuery.revalidate();
+  });
+  // Declared after the change handler, so an event's flag is set first.
+  useEffect(() => {
+    rereadJobsForHeaderOnlyRow(storedPipeline);
+  }, [storedPipeline]);
   const detailSucceeded =
     detailQuery.data !== null && detailQuery.error === null && !detailQuery.isPending;
   // Action controls (merge, review, side column, header) act only on this live
@@ -244,11 +276,32 @@ export function PullRequestsDetailView({
     (tab === "commits" && paintedActivePayload
       ? (paintedActivePayload as PullRequestsCommitsData)
       : null);
-  const displayedChecks =
-    checksQuery.data ??
-    (tab === "checks" && paintedActivePayload
-      ? (paintedActivePayload as PullRequestsChecksData)
-      : null);
+  // One pipeline copy is shown: the highest revision across the live detail,
+  // its stored copy and the poller's row, so the screen never moves back
+  // whichever answers last. Without revisions (an older server) the live
+  // value wins, as before.
+  // The newest copy shown so far is kept per request too: a tab switch re-keys
+  // the snapshot read, and until it answers (or when it fails) the poller's
+  // row is missing from the candidates.
+  const [keptPipeline, setKeptPipeline] = useState<KeptCopy<PullRequestsPipelineCopy> | null>(null);
+  const pipelineChoice = keepNewestCopy(keptPipeline, request, [
+    detailQuery.data?.pipeline,
+    paintedDetail?.payload.pipeline,
+    storedPipeline,
+  ]);
+  if (pipelineChoice.kept !== keptPipeline) setKeptPipeline(pipelineChoice.kept);
+  const shownPipeline = pipelineChoice.shown;
+  const [keptChecks, setKeptChecks] = useState<KeptCopy<PullRequestsChecksData> | null>(null);
+  const checksChoice =
+    tab === "checks"
+      ? keepNewestCopy(keptChecks, request, [
+          checksQuery.data,
+          paintedActivePayload ? (paintedActivePayload as PullRequestsChecksData) : null,
+          storedPipeline?.checks,
+        ])
+      : null;
+  if (checksChoice !== null && checksChoice.kept !== keptChecks) setKeptChecks(checksChoice.kept);
+  const displayedChecks = checksChoice?.shown ?? null;
   const displayedFiles =
     filesQuery.data ??
     (tab === "files" && paintedActivePayload
@@ -377,11 +430,18 @@ export function PullRequestsDetailView({
                           timeline={displayedTimeline}
                           detailsRefreshing={detailQuery.isPending}
                           liveDetail={liveDetail}
+                          pipeline={shownPipeline}
                         />
                       ) : tab === "commits" && displayedCommits ? (
                         <PullRequestsCommits commits={displayedCommits} />
                       ) : tab === "checks" && displayedChecks ? (
-                        <PullRequestsChecks checks={displayedChecks} context={context} />
+                        <PullRequestsChecks
+                          checks={displayedChecks}
+                          context={context}
+                          pipeline={shownPipeline?.pipeline ?? null}
+                          branch={detail.headBranch}
+                          settled={liveDetail !== null}
+                        />
                       ) : tab === "files" && displayedFiles ? (
                         <Suspense
                           fallback={

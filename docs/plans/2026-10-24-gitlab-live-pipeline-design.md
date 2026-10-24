@@ -525,7 +525,11 @@ tab.
   stays for the list view.
 - `PullRequestsDetailView.tsx`: on `changed.pipeline`, call
   `snapshotQuery.revalidate()` and ignore `changed.checks` in the same event.
-  `checks` alone keeps today's answer. The merge box pipeline is
+  `checks` alone keeps today's answer. A number past the 3-number cap gets
+  header-only `pipeline` rows (`checks: null`): on the Pipelines tab, such a
+  row arriving after `changed.pipeline` is answered with one `getChecks` per
+  row revision, so the job list follows the header (Review, decision A). A
+  row that carries jobs never re-reads them. The merge box pipeline is
   `newestCopy([liveDetail?.pipeline, snapshot.detail?.payload.pipeline, snapshot.pipeline?.payload])`.
   The Pipelines tab uses `newestCopy` over the live `getChecks` value, the
   `checks` tab row and the `pipeline` row's `checks`, replacing "live always
@@ -952,3 +956,17 @@ Codex reviewed the first draft. Each finding was checked against the code at
 | 10  | GraphQL reads take `Budget::Mutation`, not `Budget::Read`                                               | Accepted. Confirmed at `host.rs:260-286`. `glab_api_with_body` takes a budget from `budget_for(operation)`                                                                                                                                                                                                                                                                                                 |
 | 11  | `readSnapshot` is not local and short                                                                   | Accepted. Confirmed at `context.rs:360-370`. The claim is corrected and the `git` spawn is counted in the local cost. It stays out of `is_long_running`, because on the polled path only that spawn runs, and listing it would hide a slow database read                                                                                                                                                   |
 | —   | Simpler alternative: one revisioned payload, totals reuse, detail only on metadata or readiness changes | Adopted, except that readiness copy stays in the server's `detail` (defect 2) rather than moving to the probe, so that the five-way copy is not duplicated in the client. That is what the decision 2 exception keeps correct                                                                                                                                                                              |
+
+### Decisions after the implementation review
+
+| #   | Question                                                                                                                                      | Decision                                                                                                                                                                                                                                                                                                                          |
+| --- | --------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A   | A watched number past the 3-number cap gets header-only `pipeline` rows (`checks: null`), so its Pipelines job list did not follow the header | Decided by the product owner on 2026-10-24. On the Pipelines tab of that number only, a header-only row delivered after `changed.pipeline` makes the client re-read `getChecks` once per row revision. A row that carries jobs (an eligible number) never re-reads them, and a repeated event for the same revision reads nothing |
+
+The same review found four implementation defects against this design, now
+fixed: a failed final pipeline read left the row on its old status (the read
+is now retried until a copy is written); a tick of another poller that was in
+flight when a 429 arrived cleared the host's backoff (only a tick that started
+after the step clears it); a sign-in failure on the totals read was swallowed
+(it now ends the poller); and a tab switch could show an older pipeline copy
+(the client keeps the newest copy shown for the merge request).

@@ -284,8 +284,13 @@ performing a production install.
   `BIBCODE_GITLAB_HARNESS_REPORT` (`/tmp/bibcode-gitlab-mr-load.json` when unset).
   It also runs the ignored
   `gitlab_subscribed_merge_request_polling_records_host_requests` scenario,
-  which waits through several real 20 s poll ticks and prints
-  `HARNESS_SUBSCRIBE_JSON`; the default `cargo test` suite skips it.
+  which waits through real poll ticks (about four minutes) and prints
+  `HARNESS_SUBSCRIBE_JSON`; the default `cargo test` suite skips it. Its active
+  phase answers events the way the detail view does and reports the host
+  requests an hour for one actively watched merge request (about 900 at exact
+  10 s ticks), the `glab` and `git` spawns, and that no stage, job or status
+  tick ran the detail join; its delivery phase checks two list keys on one
+  number and that three of four numbers are active.
 - `bash scripts/test-linux-git-compatibility.sh TEST_BINARY [IMAGE ...]`: run the
   compiled Linux Git-runner regression in disposable Debian, Ubuntu, Fedora,
   and Arch containers. Build the executable on the Ubuntu 22.04 glibc baseline;

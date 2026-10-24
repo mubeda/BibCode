@@ -776,17 +776,52 @@ detail route also opens `pullRequests.subscribe` only while the document is
 visible, and keeps the client's 20 s mounted-query refresh timer
 paused from the subscription's first, all-false event until the subscription
 ends. Successful unary `list` (first page), `get`, `getTimeline`, `getCommits`,
-`getChecks`, and `getFiles` reads store those display copies. One server poller
-per list key runs the list read and one merge-request probe `GET` 20 s after
-each tick, stores the list page and the probe fingerprint, and emits the names
-of the query families that changed; it never runs the detail, timeline,
-commits, checks, or files reads. The client answers `list` with
-`readSnapshot`, keeping whichever copy has the newer `observedAt` (a live first
-page counts as observed at the newest stored copy already seen), and answers
-the other names with the unary reads. Every subscriber of a list key receives
-its list events, but only the open number of the subscriber driving the poller
-is probed, so a second window open on another number of the same list key
-gets list events only. Hiding the document or leaving the route drops the
+`getChecks`, and `getFiles` reads store those display copies. One cooperative
+server poller per list key runs inside the `subscribe` calls that share it (no
+spawned task). It reads the list page every 20 s and probes every subscribed
+merge request (`GET merge_requests/:iid`). A number with a subscriber on
+Conversation or Pipelines whose head pipeline is `created`, queued, waiting,
+`running` or `canceling` is active: it is probed, and its pipeline read
+through one GraphQL `headPipeline` query (stages and up to 100 jobs each),
+every 10 s, dropping to 20 s after 30 minutes without a stage change. A number
+that may settle soon (a transient merge status, a push, a pipeline that just
+finished, or REST and GraphQL naming different pipelines) is probed every 10 s
+for at most six ticks. A pipeline read that fails, or stores no copy, is
+retried on each later probe of the number until one is written, so the row
+never keeps a status the probe has moved past. At most three numbers per list
+key are active or fast;
+the rest are probed every 20 s. The first tick waits 10 s when a subscriber is
+on Conversation or Pipelines, otherwise 20 s. While polling, the repository's
+tab totals are reused until the first page changes or the copy is 5 minutes
+old. The poller stores the list page, the probe fingerprint, and one
+`pipeline` row (the header, the stages and, when read, the job groups) and
+names what changed; it never runs the detail, timeline, commits, checks, or
+files reads. A `head_pipeline` id or status change names `checks`, and
+`detail` only when it moves the pipeline between the "Pipelines must succeed"
+reasons with the merge status unchanged; merge request metadata, merge status
+and auto-merge changes name `detail`; a new `pipeline` row names `pipeline`.
+Names travel as per-name revisions in the probe row, and each subscriber emits
+what it has not been sent yet, so every subscriber of a number gets every
+change whichever poller saw it first, and a name the stream could not take is
+sent with the next event. The client answers `list` and `pipeline` with
+`readSnapshot`, keeping whichever list copy has the newer `observedAt` (a live
+first page counts as observed at the newest stored copy already seen) and
+whichever pipeline copy has the higher `revision` (the generation each read
+took before its first host call). It also keeps the newest pipeline copy it
+has shown for the merge request, so a tab switch, which re-keys the snapshot
+read, or a failed snapshot read never moves the merge box or the Pipelines tab
+back. It answers the other names with the unary reads, and `checks` without
+`pipeline` with `getChecks`. A number past the three-number pipeline read cap
+gets `pipeline` rows with the header only (`checks: null`); on the Pipelines
+tab such a row, arriving after a `pipeline` name, is answered with one
+`getChecks` per row revision, so the job list follows the header. A row that
+carries jobs never re-reads them. A 429 from any poller
+read, totals included, backs off every poller of the host (60, 120, then
+300 s) across hand-offs and re-keyed subscriptions; a `not_authenticated` or
+`forbidden` read ends the poller, deletes the host's rows, and ends every
+subscription with that error. Every display write is fenced on the database
+worker by the host's last logout, so a read that started earlier cannot write
+its rows back. Hiding the document or leaving the route drops the
 subscription, resumes the client timer, and stops the shared poller when no
 subscriber remains. The route still prefetches `get` plus `getTimeline` for a
 row hovered 150 ms, at most two per environment, and an open within 5 s of that

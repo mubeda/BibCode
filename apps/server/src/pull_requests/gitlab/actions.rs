@@ -109,7 +109,7 @@ impl GitLabHost {
                             "sha":head_sha,"squash":*method==MergeMethod::Squash,
                             "should_remove_source_branch":delete_branch,"auto_merge":auto,"merge_when_pipeline_succeeds":auto,
                             "merge_commit_message":message,"squash_commit_message":message,
-                        }), c).await.map_err(|f| from_process_error(OP, "glab", &f.error, &f.stderr))?;
+                        }), Budget::Mutation, c).await.map_err(|f| from_process_error(OP, "glab", &f.error, &f.stderr))?;
                         let value: Value = serde_json::from_str(&output.stdout).map_err(|_| parse::invalid(OP))?;
                         if !value.is_object() { return Err(parse::invalid(OP)); }
                         value.get("merge_commit_sha").filter(|sha| !sha.is_null())
@@ -321,7 +321,7 @@ impl GitLabHost {
     ) -> Result<(), PullRequestsOperationError> {
         let result = if let Some(body) = body {
             self.runner
-                .glab_api_with_body(scope, method, path, &body, c)
+                .glab_api_with_body(scope, method, path, &body, Budget::Mutation, c)
                 .await
         } else {
             self.runner
@@ -819,6 +819,7 @@ impl crate::source_control::GitLabCreateTransport for RevertCreateTransport {
                     "POST",
                     &format!("{}/merge_requests", project_path(&self.scope)),
                     &body,
+                    Budget::Mutation,
                     c,
                 )
                 .await
