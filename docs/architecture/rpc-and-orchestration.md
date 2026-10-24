@@ -785,7 +785,10 @@ through one GraphQL `headPipeline` query (stages and up to 100 jobs each),
 every 10 s, dropping to 20 s after 30 minutes without a stage change. A number
 that may settle soon (a transient merge status, a push, a pipeline that just
 finished, or REST and GraphQL naming different pipelines) is probed every 10 s
-for at most six ticks. At most three numbers per list key are active or fast;
+for at most six ticks. A pipeline read that fails, or stores no copy, is
+retried on each later probe of the number until one is written, so the row
+never keeps a status the probe has moved past. At most three numbers per list
+key are active or fast;
 the rest are probed every 20 s. The first tick waits 10 s when a subscriber is
 on Conversation or Pipelines, otherwise 20 s. While polling, the repository's
 tab totals are reused until the first page changes or the copy is 5 minutes
