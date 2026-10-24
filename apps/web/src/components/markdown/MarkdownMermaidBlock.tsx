@@ -298,8 +298,15 @@ export function MarkdownMermaidBlock({
     const attemptKey = diagramKey(fonts.key, source);
     const cached = diagramCache.get(attemptKey);
     if (cached) {
-      commitSwap(() => setShown({ source, entry: cached }));
-      return;
+      // A job for this source finished between this render and its effect. The swap commits
+      // synchronously, which React allows only outside its own effect flush.
+      let current = true;
+      queueMicrotask(() => {
+        if (current) commitSwap(() => setShown({ source, entry: cached }));
+      });
+      return () => {
+        current = false;
+      };
     }
     let cancelled = false;
     let unsubscribe = (): void => undefined;

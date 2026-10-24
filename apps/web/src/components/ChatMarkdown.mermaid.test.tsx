@@ -9,6 +9,7 @@ import { __setClientSettingsForTests } from "../hooks/useSettings";
 import { writeThemePreference } from "../hooks/useTheme";
 import { buildCollapsedProposedPlanPreviewMarkdown } from "../proposedPlan";
 import ChatMarkdown from "./ChatMarkdown";
+import { ReadingAnchorContext } from "./chat/readingAnchor";
 import {
   __resetMermaidDiagramsForTests,
   __setMermaidRendererLoaderForTests,
@@ -95,6 +96,13 @@ async function settle(tasks = 3): Promise<void> {
   for (let task = 0; task < tasks; task += 1) {
     await act(async () => new Promise((resolve) => setTimeout(resolve, 0)));
   }
+}
+
+/** Runs pending promise callbacks without letting any task, such as a queue run, start. */
+async function flushMicrotasks(): Promise<void> {
+  await act(async () => {
+    for (let tick = 0; tick < 30; tick += 1) await Promise.resolve();
+  });
 }
 
 async function waitFor(condition: () => boolean, message: string): Promise<void> {
@@ -334,9 +342,114 @@ describe("Mermaid diagrams in chat Markdown", () => {
       expect(hasDiagram(view.container)).toBe(false);
       expect(rendererLoads).toBe(0);
     });
+
+    it("commits each swap through the reading anchor it renders under", async () => {
+      const preserveReadingPosition = vi.fn((_element: HTMLElement, commit: () => void) =>
+        commit(),
+      );
+      const anchor = { preserveReadingPosition };
+      const container = document.createElement("div");
+      document.body.append(container);
+      const root = createRoot(container);
+      mounted.push({ container, root, render: async () => undefined });
+      await act(async () =>
+        root.render(
+          <ReadingAnchorContext value={anchor}>
+            <ChatMarkdown text={fence(FLOWCHART)} cwd={undefined} />
+          </ReadingAnchorContext>,
+        ),
+      );
+      await waitFor(() => hasDiagram(container), "the diagram never drew");
+      expect(preserveReadingPosition).toHaveBeenCalledOnce();
+      const body = preserveReadingPosition.mock.calls[0]![0];
+      expect(body.classList.contains("chat-markdown-mermaid-body")).toBe(true);
+
+      await act(async () => viewToggle(container)!.click());
+      expect(preserveReadingPosition).toHaveBeenCalledTimes(2);
+      expect(hasDiagram(container)).toBe(false);
+    });
+  });
+
+  describe("problems", () => {
+    it("says when a diagram type is not supported", async () => {
+      const view = await mount(fence("notADiagram\n  A --> B"));
+      await waitFor(() => errorText(view.container) !== null, "no error was shown");
+      expect(errorText(view.container)).toBe("Diagram type not supported.");
+    });
+
+    it("shows an unexpected render failure and logs only its class", async () => {
+      __setMermaidRendererLoaderForTests(async () => {
+        const renderer = await countingRenderer();
+        return {
+          ...renderer,
+          renderMermaidDiagram: (source) => {
+            throw new TypeError(`could not draw ${source}`);
+          },
+        };
+      });
+      const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+      const view = await mount(fence(FLOWCHART));
+      await waitFor(() => errorText(view.container) !== null, "no error was shown");
+
+      expect(errorText(view.container)).toBe("Couldn't draw this diagram.");
+      expect(consoleError).toHaveBeenCalledWith("[chat-markdown] action failed", {
+        operation: "render-diagram",
+        code: "TypeError",
+      });
+      // Pele's messages can quote the source, which never reaches a log.
+      expect(JSON.stringify(consoleError.mock.calls)).not.toContain("Write --> Draw");
+    });
   });
 
   describe("lifecycle", () => {
+    it("cancels a queued render when its only block unmounts", async () => {
+      const typeLoaded = deferred<void>();
+      let typeRequested = false;
+      __setMermaidRendererLoaderForTests(async () => {
+        const renderer = await countingRenderer();
+        return {
+          ...renderer,
+          loadMermaidDiagramType: async (source) => {
+            typeRequested = true;
+            await renderer.loadMermaidDiagramType(source);
+            await typeLoaded.promise;
+          },
+        };
+      });
+      const view = await mount(fence(SEQUENCE));
+      await waitFor(() => typeRequested, "the diagram type was never requested");
+      // Let a queue run left by an earlier test finish, so this job schedules its own.
+      await settle(2);
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      try {
+        const timersBefore = vi.getTimerCount();
+        typeLoaded.resolve();
+        await flushMicrotasks();
+        // The render job is queued and has not run; its only block leaves.
+        expect(vi.getTimerCount()).toBeGreaterThan(timersBefore);
+        expect(renderedSources).toEqual([]);
+        await unmount(view);
+        vi.runAllTimers();
+        expect(renderedSources).toEqual([]);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("shows a diagram already drawn for a replacement source at once", async () => {
+      const first = await mount(fence(FLOWCHART));
+      const second = await mount(fence(SEQUENCE));
+      await waitFor(
+        () => hasDiagram(first.container) && hasDiagram(second.container),
+        "both blocks never drew",
+      );
+      await first.render(fence(SEQUENCE));
+      expect(
+        diagrams(first.container)[0]?.querySelector("svg")?.getAttribute("aria-roledescription"),
+      ).toBe("sequence");
+      expect(renderedSources.toSorted()).toEqual([FLOWCHART, SEQUENCE].toSorted());
+    });
+
     it("draws only the new source when the text is replaced during the module load", async () => {
       const load = deferred<MermaidRenderer>();
       __setMermaidRendererLoaderForTests(() => load.promise);
@@ -382,18 +495,39 @@ describe("Mermaid diagrams in chat Markdown", () => {
     });
 
     it("still draws a block whose partner on the same pending job unmounted", async () => {
-      const load = deferred<MermaidRenderer>();
-      __setMermaidRendererLoaderForTests(() => load.promise);
+      const typeLoaded = deferred<void>();
+      let typeRequests = 0;
+      __setMermaidRendererLoaderForTests(async () => {
+        const renderer = await countingRenderer();
+        return {
+          ...renderer,
+          loadMermaidDiagramType: async (source) => {
+            typeRequests += 1;
+            await renderer.loadMermaidDiagramType(source);
+            await typeLoaded.promise;
+          },
+        };
+      });
       const leaving = await mount(fence(FLOWCHART));
       const staying = await mount(fence(FLOWCHART));
-      load.resolve(await countingRenderer());
-      // Both join the job; one leaves before the queue runs it.
-      await act(async () => {
-        await Promise.resolve();
-        await Promise.resolve();
-        await Promise.resolve();
-      });
-      await unmount(leaving);
+      await waitFor(() => typeRequests === 2, "both blocks never requested the diagram type");
+      // Let a queue run left by an earlier test finish, so this job schedules its own.
+      await settle(2);
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      try {
+        const timersBefore = vi.getTimerCount();
+        typeLoaded.resolve();
+        await flushMicrotasks();
+        // Both blocks joined the one queued job; one leaves before the queue runs it.
+        expect(vi.getTimerCount()).toBeGreaterThan(timersBefore);
+        expect(renderedSources).toEqual([]);
+        await unmount(leaving);
+        await act(async () => {
+          vi.runAllTimers();
+        });
+      } finally {
+        vi.useRealTimers();
+      }
       await waitFor(() => hasDiagram(staying.container), "the remaining block never drew");
       expect(renderedSources).toEqual([FLOWCHART]);
     });
