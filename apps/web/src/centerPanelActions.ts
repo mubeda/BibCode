@@ -21,6 +21,7 @@ import {
 import type {
   AgentSessionOpenInPanelResult,
   AgentSessionOpenMode,
+  CommandId,
   EnvironmentId,
   ModelSelection,
   ProjectId,
@@ -59,6 +60,20 @@ export interface OpenSessionPanelInput {
   /** The session's title, which its tab shows. */
   readonly title: string;
 }
+
+/**
+ * The command of each History open whose outcome is not known, by environment, host, session and
+ * mode. A retry after a dropped connection sends the same command, so the server answers with
+ * the thread the first attempt made (a copy's session ID derives from the command) instead of
+ * making another copy. A success or the server's own refusal settles the open.
+ */
+const unsettledSessionOpens = new Map<string, CommandId>();
+
+/** A failure the server decided, as opposed to a request that may not have reached it. */
+const isServerRefusal = (error: unknown): boolean =>
+  typeof error === "object" &&
+  error !== null &&
+  (error as { readonly _tag?: unknown })._tag === "AgentSessionsError";
 
 export interface PanelThreadOpener {
   reopenChatPanel: (
@@ -239,10 +254,18 @@ export function useCenterPanelActions({
       hostRef: ScopedThreadRef,
       input: OpenSessionPanelInput,
     ): Promise<AgentSessionOpenInPanelResult | null> => {
+      const openKey = JSON.stringify([
+        hostRef.environmentId,
+        hostRef.threadId,
+        input.sessionId,
+        input.mode,
+      ]);
+      const commandId = unsettledSessionOpens.get(openKey) ?? newCommandId();
+      unsettledSessionOpens.set(openKey, commandId);
       const result = await openInPanel({
         environmentId: hostRef.environmentId,
         input: {
-          commandId: newCommandId(),
+          commandId,
           hostThreadId: hostRef.threadId,
           sessionId: input.sessionId,
           mode: input.mode,
@@ -251,6 +274,9 @@ export function useCenterPanelActions({
       if (result._tag === "Failure") {
         if (!isAtomCommandInterrupted(result)) {
           const error = squashAtomCommandFailure(result);
+          if (isServerRefusal(error)) {
+            unsettledSessionOpens.delete(openKey);
+          }
           toastManager.add(
             stackedThreadToast({
               type: "error",
@@ -261,6 +287,7 @@ export function useCenterPanelActions({
         }
         return null;
       }
+      unsettledSessionOpens.delete(openKey);
       const opened = result.value;
       if (opened.hostThreadId === hostRef.threadId) {
         if (opened.outcome === "created") {
