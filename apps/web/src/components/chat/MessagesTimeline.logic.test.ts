@@ -11,6 +11,7 @@ import {
   resolveTimelineMinimapHasPersistentGutter,
   resolveTimelineMinimapHeightStyle,
   resolveTimelineMinimapIndexFromPointer,
+  resolveTimelineMinimapStepTargets,
   resolveTimelineMinimapTopPercent,
   type MessagesTimelineRow,
 } from "./MessagesTimeline.logic";
@@ -62,6 +63,24 @@ describe("timeline minimap geometry", () => {
         pointerY: 58,
       }),
     ).toBe(2);
+  });
+
+  it("steps to the turn before and after the reading position", () => {
+    // Turns start 12, 500 and 1000px down; a jump lands a turn 24px below the viewport top.
+    const itemTops = [12, 500, 1000];
+    const targets = (scrollTop: number, tops: ReadonlyArray<number | null> = itemTops) =>
+      resolveTimelineMinimapStepTargets({ itemTops: tops, scrollTop, maxScrollTop: 1500 });
+
+    // The start of the thread has nothing before it.
+    expect(targets(0)).toEqual({ previous: null, next: 1 });
+    // Having jumped to the middle turn.
+    expect(targets(476)).toEqual({ previous: 0, next: 2 });
+    // Partway through the middle turn, Previous returns to its start.
+    expect(targets(700)).toEqual({ previous: 1, next: 2 });
+    // At the end, the last turn cannot scroll to the top, so nothing is after it.
+    expect(targets(1500, [12, 500, 1000, 1700])).toEqual({ previous: 2, next: null });
+    // A turn whose row has no measured position is skipped.
+    expect(targets(0, [null, 500])).toEqual({ previous: null, next: 1 });
   });
 
   it("requires a finite viewport with enough side gutter", () => {

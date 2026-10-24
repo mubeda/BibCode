@@ -49,6 +49,7 @@ import {
   CheckIcon,
   ChevronDownIcon,
   ChevronRightIcon,
+  ChevronUpIcon,
   CircleAlertIcon,
   EyeIcon,
   FileIcon,
@@ -83,12 +84,16 @@ import {
   resolveTimelineMinimapHasPersistentGutter,
   resolveTimelineMinimapHeightStyle,
   resolveTimelineMinimapIndexFromPointer,
+  resolveTimelineMinimapStepTargets,
   resolveTimelineMinimapTopPercent,
   type StableMessagesTimelineRowsState,
   type MessagesTimelineRow,
+  TIMELINE_MINIMAP_JUMP_OFFSET,
   TIMELINE_MINIMAP_MIN_ITEMS,
   type TimelineLatestTurn,
+  type TimelineMinimapStep,
 } from "./MessagesTimeline.logic";
+import { timelineScrollAnimates } from "./timelineScrollAnchoring";
 import { TerminalContextInlineChip } from "./TerminalContextInlineChip";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import {
@@ -176,6 +181,7 @@ const AttachmentUploadCtx = createContext<{
 const TIMELINE_LIST_HEADER = <div className="h-3 sm:h-4" />;
 const TIMELINE_LIST_FOOTER = <div className="h-3 sm:h-4" />;
 const EMPTY_TIMELINE_SKILLS: ReadonlyArray<Pick<ServerProviderSkill, "name" | "displayName">> = [];
+const NO_MINIMAP_STEP_TARGETS: TimelineMinimapStepTargets = { previous: null, next: null };
 
 // ---------------------------------------------------------------------------
 // Props (public API)
@@ -359,6 +365,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
     null,
   );
   const [minimapHasPersistentGutter, setMinimapHasPersistentGutter] = useState(false);
+  const [minimapStepTargets, setMinimapStepTargets] = useState(NO_MINIMAP_STEP_TARGETS);
   const { handleAnchorReady, handleAnchorSizeChanged } = useStableAnchorCallbacks(
     anchorMessageId,
     onAnchorReady,
@@ -385,14 +392,16 @@ export const MessagesTimeline = memo(function MessagesTimeline({
 
     const scrollTop = state.scroll ?? 0;
     const scrollBottom = scrollTop + (state.scrollLength ?? 0);
+    const itemTops: Array<number | null> = [];
 
     for (const item of minimapItems) {
+      const rowTop = resolveTimelineRowTop(state, item.rowIndex);
+      itemTops.push(rowTop);
       const strip = minimapStripMap.get(item.id);
       if (!strip) {
         continue;
       }
 
-      const rowTop = resolveTimelineRowTop(state, item.rowIndex);
       const rowHeight = resolveTimelineRowHeight(state, item.rowIndex);
       const inView =
         rowTop !== null &&
@@ -401,6 +410,21 @@ export const MessagesTimeline = memo(function MessagesTimeline({
 
       strip.dataset.inView = inView ? "true" : "false";
     }
+
+    // Changes only when the reading position crosses a turn, so scrolling within one renders nothing.
+    const nextStepTargets = resolveTimelineMinimapStepTargets({
+      itemTops,
+      scrollTop,
+      maxScrollTop: Math.max(
+        0,
+        (state.contentLength ?? Number.POSITIVE_INFINITY) - (state.scrollLength ?? 0),
+      ),
+    });
+    setMinimapStepTargets((current) =>
+      current.previous === nextStepTargets.previous && current.next === nextStepTargets.next
+        ? current
+        : nextStepTargets,
+    );
   }, [listRef, minimapItems, minimapStripMap, onIsAtEndChange]);
 
   useEffect(() => {
@@ -565,13 +589,14 @@ export const MessagesTimeline = memo(function MessagesTimeline({
               items={minimapItems}
               bottomInset={contentInsetEndAdjustment}
               hasPersistentGutter={minimapHasPersistentGutter}
+              stepTargets={minimapStepTargets}
               stripMap={minimapStripMap}
               onSelect={(item) => {
                 onManualNavigation();
                 void listRef.current?.scrollToIndex({
                   index: item.rowIndex,
-                  animated: true,
-                  viewOffset: 24,
+                  animated: timelineScrollAnimates(),
+                  viewOffset: TIMELINE_MINIMAP_JUMP_OFFSET,
                 });
               }}
             />
@@ -667,6 +692,8 @@ interface TimelineMinimapItem {
   readonly assistantText: string | null;
 }
 
+type TimelineMinimapStepTargets = Record<TimelineMinimapStep, number | null>;
+
 interface TimelinePositionState {
   readonly contentLength?: number;
   readonly scroll?: number;
@@ -761,12 +788,14 @@ function TimelineMinimap({
   bottomInset,
   hasPersistentGutter,
   items,
+  stepTargets,
   stripMap,
   onSelect,
 }: {
   bottomInset: number;
   hasPersistentGutter: boolean;
   items: ReadonlyArray<TimelineMinimapItem>;
+  stepTargets: TimelineMinimapStepTargets;
   stripMap: Map<string, HTMLSpanElement>;
   onSelect: (item: TimelineMinimapItem) => void;
 }) {
@@ -837,10 +866,18 @@ function TimelineMinimap({
       data-persistent-gutter={hasPersistentGutter ? "true" : "false"}
       style={{ bottom: safeBottomInset }}
     >
-      <div className="relative h-full w-full select-none">
+      <div
+        className="absolute top-1/2 left-3 w-10 -translate-y-1/2 select-none"
+        style={{ height: resolveTimelineMinimapHeightStyle(items.length) }}
+      >
+        <TimelineMinimapStepButton
+          step="previous"
+          item={items[stepTargets.previous ?? -1] ?? null}
+          onSelect={onSelect}
+        />
         <button
           aria-label={`Jump to message: ${activeItem?.userText ?? "User message"}`}
-          className="pointer-events-auto absolute top-1/2 left-3 w-10 -translate-y-1/2 cursor-pointer bg-transparent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/70"
+          className="pointer-events-auto absolute inset-0 cursor-pointer bg-transparent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/70"
           onBlur={() => setActiveIndex(null)}
           onClick={(event) => {
             const nextIndex = resolveActiveIndexFromPointer(event);
@@ -876,7 +913,6 @@ function TimelineMinimap({
           onMouseDown={(event) => {
             event.preventDefault();
           }}
-          style={{ height: resolveTimelineMinimapHeightStyle(items.length) }}
           type="button"
         >
           <div className="absolute top-0 left-3 h-full w-px bg-border/15" />
@@ -937,8 +973,55 @@ function TimelineMinimap({
             </span>
           ) : null}
         </button>
+        <TimelineMinimapStepButton
+          step="next"
+          item={items[stepTargets.next ?? -1] ?? null}
+          onSelect={onSelect}
+        />
       </div>
     </div>
+  );
+}
+
+/**
+ * Steps to the turn before or after the reading position. With nowhere to go it stays focusable
+ * but inert (`aria-disabled`), so pressing it at the start or end of a thread keeps focus here.
+ */
+function TimelineMinimapStepButton({
+  step,
+  item,
+  onSelect,
+}: {
+  step: TimelineMinimapStep;
+  item: TimelineMinimapItem | null;
+  onSelect: (item: TimelineMinimapItem) => void;
+}) {
+  const label = step === "previous" ? "Previous turn" : "Next turn";
+  const Icon = step === "previous" ? ChevronUpIcon : ChevronDownIcon;
+  return (
+    <Tooltip>
+      <TooltipTrigger
+        render={
+          <Button
+            type="button"
+            size="icon-xs"
+            variant="ghost"
+            aria-label={label}
+            aria-disabled={item === null}
+            className={cn(
+              "pointer-events-auto absolute left-0 aria-disabled:cursor-default aria-disabled:opacity-40 aria-disabled:hover:bg-transparent",
+              step === "previous" ? "bottom-full mb-1" : "top-full mt-1",
+            )}
+            onClick={() => {
+              if (item) onSelect(item);
+            }}
+          />
+        }
+      >
+        <Icon />
+      </TooltipTrigger>
+      <TooltipPopup side="right">{label}</TooltipPopup>
+    </Tooltip>
   );
 }
 
