@@ -2705,6 +2705,24 @@ sizes. Cover relevant:
   the status bar shows the **Profiler** segment; its tooltip lists the
   recording environments, clicking it opens Diagnostics on the first of them,
   and it disappears once every profiler is off;
+- Find in thread on macOS (WKWebView), Linux (WebKitGTK AppImage), and Windows
+  (WebView2), in a long thread with folded turns: find a word that appears only
+  in a folded turn, a tool command inside a collapsed run of tool calls, a file
+  link's chip label, a long user message past **Show full message**, a long plan
+  past its preview, and a closed details block; step with Enter, Shift+Enter,
+  Mod+G, and F3, and confirm each step opens what hid the match and scrolls to
+  it; confirm the matches paint (the `::highlight()` rules read their colors
+  from `var()` tokens, so a missing paint is an engine gap to report) and the
+  selected one is distinct in light and dark; on an engine without
+  `CSS.highlights` the selected row is outlined instead; open find in a chat
+  panel while the host chat's is open and confirm the host's closes; choose
+  **Find in thread** in the command palette and type at once into the bar;
+  press Esc and confirm focus returns to the composer and the timeline does not
+  move; confirm Mod+F in the right-panel file editor still opens its own search;
+  disconnect the server and confirm the status adds **may be out of date**; on
+  Windows, confirm Ctrl+F, F3, and Ctrl+G open no native WebView2 find bar;
+  with the Profiler on, search a long thread and confirm no new `client.stall`
+  or `client.interaction` finding;
 - responsive menus, overlays, narrow panels, and focus states; and
 - loaded interaction without stale ownership, duplicate events, or runaway
   process growth.
