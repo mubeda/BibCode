@@ -633,14 +633,23 @@ function legacyExpansionKeys(project: SidebarProjectSnapshot): string[] {
 
 // An environment card has a two-line header, taller than the fixed `sm` button
 // height; `h-auto` lets it grow while normal project rows keep their height.
+// The action strip is always visible, so the title stops short of it: 24px per icon and 2px gaps,
+// plus 22px for the sandbox badge that sits in front of the icons.
+const PROJECT_HEADER_ACTION_PADDING = {
+  3: { plain: "pr-21", badge: "pr-27" },
+  4: { plain: "pr-27", badge: "pr-33" },
+} as const;
+
 export function projectHeaderButtonClassName(input: {
   readonly showsSandboxBadge: boolean;
   readonly isManualProjectSorting: boolean;
   readonly isEnvironmentCard: boolean;
+  readonly actionCount: 3 | 4;
 }): string {
+  const padding = PROJECT_HEADER_ACTION_PADDING[input.actionCount];
   return cn(
     "gap-2 px-2 py-1.5 text-left hover:bg-accent group-hover/project-header:bg-accent group-hover/project-header:text-sidebar-accent-foreground",
-    input.showsSandboxBadge ? "pr-20" : "pr-14",
+    input.showsSandboxBadge ? padding.badge : padding.plain,
     input.isManualProjectSorting ? "cursor-grab active:cursor-grabbing" : "cursor-pointer",
     input.isEnvironmentCard && "h-auto",
   );
@@ -3338,6 +3347,8 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
     ],
   );
 
+  // In the Repositories view the repository row owns Pull Requests.
+  const showsPullRequestsAction = pullRequestsEnabled && !environmentCard;
   const showsSandboxBadge =
     !environmentCard &&
     project.environmentPresence === "remote-only" &&
@@ -3363,6 +3374,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
             showsSandboxBadge,
             isManualProjectSorting,
             isEnvironmentCard: environmentCard !== null,
+            actionCount: showsPullRequestsAction ? 4 : 3,
           })}
           {...(isManualProjectSorting && dragHandleProps ? dragHandleProps.attributes : {})}
           {...(isManualProjectSorting && dragHandleProps ? dragHandleProps.listeners : {})}
@@ -3409,26 +3421,29 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
         {/* The container badge tells WSL projects apart inside Local, which
             mixes this device and WSL. A saved server's scope shows only that
             server's projects, so a cloud there said nothing and is gone. The
-            badge crossfades with the hover strip. An environment card already
+            badge sits in front of the action icons. An environment card already
             names its environment, so it shows no badge. */}
-        {showsSandboxBadge ? (
-          <Tooltip>
-            <TooltipTrigger
-              render={
-                <span
-                  aria-label="Local sandbox project"
-                  className="pointer-events-none absolute top-1 right-1.5 inline-flex size-5 items-center justify-center rounded-md text-muted-foreground/60 transition-opacity duration-150 max-sm:right-14 group-hover/project-header:opacity-0 group-focus-within/project-header:opacity-0 max-sm:group-hover/project-header:opacity-100 max-sm:group-focus-within/project-header:opacity-100"
-                />
-              }
-            >
-              <ContainerIcon className="size-3" />
-            </TooltipTrigger>
-            <TooltipPopup side="top">
-              {`Local sandbox: ${project.remoteEnvironmentLabels.join(", ")}`}
-            </TooltipPopup>
-          </Tooltip>
-        ) : null}
-        <div className="pointer-events-none absolute top-[calc(50%+1px)] right-0.5 flex -translate-y-1/2 items-center gap-0.5 opacity-0 transition-opacity duration-150 max-sm:pointer-events-auto max-sm:opacity-100 group-hover/project-header:pointer-events-auto group-hover/project-header:opacity-100 group-focus-within/project-header:pointer-events-auto group-focus-within/project-header:opacity-100">
+        <div
+          data-testid="project-actions-strip"
+          className="absolute top-[calc(50%+1px)] right-0.5 flex -translate-y-1/2 items-center gap-0.5"
+        >
+          {showsSandboxBadge ? (
+            <Tooltip>
+              <TooltipTrigger
+                render={
+                  <span
+                    aria-label="Local sandbox project"
+                    className="pointer-events-none inline-flex size-5 items-center justify-center rounded-md text-muted-foreground/60"
+                  />
+                }
+              >
+                <ContainerIcon className="size-3" />
+              </TooltipTrigger>
+              <TooltipPopup side="top">
+                {`Local sandbox: ${project.remoteEnvironmentLabels.join(", ")}`}
+              </TooltipPopup>
+            </Tooltip>
+          ) : null}
           <Tooltip>
             <TooltipTrigger
               render={
@@ -3478,8 +3493,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
             </TooltipTrigger>
             <TooltipPopup side="top">Git Manager</TooltipPopup>
           </Tooltip>
-          {/* In the Repositories view the repository row owns Pull Requests. */}
-          {pullRequestsEnabled && !environmentCard ? (
+          {showsPullRequestsAction ? (
             <Tooltip>
               <TooltipTrigger
                 render={
