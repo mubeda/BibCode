@@ -199,6 +199,7 @@ const fixtureEnvironmentDescriptor = {
     worktreeCatalog: true,
     worktreeCatalogRefreshReason: true,
     vcsStatusSummary: true,
+    deviceCatalogRefresh: true,
     activityProtocolVersion: 2,
   },
 } as const;

@@ -1250,6 +1250,8 @@ down there first. The list is read when the panel opens and kept for 30
 seconds; after creating a device in Android Studio or Xcode, choose **Refresh
 devices** (the circular-arrows button beside the list, or the button under the
 message when no device can start yet) to see it without restarting BiBCode.
+A server running an older BiBCode has no **Refresh devices**; close and reopen
+the panel after 30 seconds instead.
 
 **Use it.** Pick a device and choose **Start**. The state pill moves through
 **Starting…** and **Booting…** to **Ready**; a first boot can take a few

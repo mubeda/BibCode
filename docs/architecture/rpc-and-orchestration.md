@@ -3061,6 +3061,12 @@ emulator: `emulator -list-avds` and `simctl` (with the Xcode probes on macOS), a
 stop (up to 10 s), a stalled input stream (up to 5 s), and reading back a
 rotation (about 2.5 s on Android, 1.2 s on iOS).
 
+`device.refreshCatalog` is newer than the other device methods, so servers that
+have it also advertise the `deviceCatalogRefresh` capability (decoded `false`
+when absent). Clients call it only when that capability is on: an older server
+answers an unknown method with a connection-level defect that fails every
+request in flight and silences the config stream.
+
 H.264 video does not travel over RPC. The ticket from
 `device.createMediaTicket` opens `/api/device-media` or
 `/api/device-media-e2ee`, as described in

@@ -1970,7 +1970,10 @@ simulators, at most one running device per platform per environment, and shows
 them in a right-panel `device` surface. Everything is off until the environment's
 `enableDevicePreviews` setting (default `false`, toggled per environment at
 **Settings → Mobile emulators**) is on; servers that support it advertise the
-`devicePreviews` capability, and older servers get no device RPC. While the
+`devicePreviews` capability, and older servers get no device RPC. A client
+calls `device.refreshCatalog` (**Refresh devices**) only on a server that also
+advertises `deviceCatalogRefresh`: an older one answers the unknown method with
+a defect that fails the whole RPC session. While the
 setting is off, every `device.*` method fails with
 `DevicePreviewsDisabledError` (a stream fails at subscribe), media sockets close
 with `disabled`, and turning it off stops every running device.

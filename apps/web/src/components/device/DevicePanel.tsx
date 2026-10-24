@@ -212,7 +212,13 @@ export function DevicePanel({ environmentId }: { readonly environmentId: Environ
     );
   }
   // Keyed so switching to a thread on another environment starts from a clean pane.
-  return <DeviceSession key={environmentId} environmentId={environmentId} />;
+  return (
+    <DeviceSession
+      key={environmentId}
+      environmentId={environmentId}
+      canRefresh={availability.catalogRefresh}
+    />
+  );
 }
 
 function isDisabledFailure(cause: Cause.Cause<unknown>): boolean {
@@ -298,7 +304,14 @@ function UnavailablePlatforms({
   );
 }
 
-function DeviceSession({ environmentId }: { readonly environmentId: EnvironmentId }) {
+function DeviceSession({
+  environmentId,
+  canRefresh,
+}: {
+  readonly environmentId: EnvironmentId;
+  /** The server has `device.refreshCatalog`; an older one shows no Refresh devices. */
+  readonly canRefresh: boolean;
+}) {
   const catalogQuery = useEnvironmentQuery(deviceEnvironment.catalog({ environmentId, input: {} }));
   const { data: catalog, emission, revalidate } = catalogQuery;
   // The server ends the catalog with "off" while previews are off. A cached stream that ended
@@ -598,7 +611,7 @@ function DeviceSession({ environmentId }: { readonly environmentId: EnvironmentI
         platforms={catalog.platforms}
         error={actionError?.message ?? null}
         action={
-          catalog.platforms.length === 0 ? null : (
+          catalog.platforms.length === 0 || !canRefresh ? null : (
             <Button
               size="xs"
               variant="outline"
@@ -679,7 +692,7 @@ function DeviceSession({ environmentId }: { readonly environmentId: EnvironmentI
         rotating={device !== null && rotatingDeviceIds.has(device.deviceId)}
         refreshing={refreshing}
         onSelectImage={selectImage}
-        onRefresh={() => void refreshDevices()}
+        onRefresh={canRefresh ? () => void refreshDevices() : null}
         onStart={() => void start()}
         onStop={() => {
           if (device !== null) void stop(device.deviceId);
@@ -779,7 +792,9 @@ function DeviceSession({ environmentId }: { readonly environmentId: EnvironmentI
               {selectedImage !== null
                 ? "Pick a device and press Start."
                 : androidOnly
-                  ? "Create a virtual device in Android Studio's Device Manager, then choose Refresh devices."
+                  ? canRefresh
+                    ? "Create a virtual device in Android Studio's Device Manager, then choose Refresh devices."
+                    : "Create a virtual device in Android Studio's Device Manager, then come back."
                   : "No device can start on this server yet."}
             </PanelMessage>
           )

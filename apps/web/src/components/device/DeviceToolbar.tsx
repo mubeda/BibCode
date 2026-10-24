@@ -177,8 +177,11 @@ export function DeviceToolbar({
   /** The device list is being read again. */
   readonly refreshing: boolean;
   readonly onSelectImage: (platform: DevicePlatform, imageId: string) => void;
-  /** Reads the device list again, for a device created since it was read. */
-  readonly onRefresh: () => void;
+  /**
+   * Reads the device list again, for a device created since it was read; null on a server
+   * without `device.refreshCatalog`, which then shows no button.
+   */
+  readonly onRefresh: (() => void) | null;
   readonly onStart: () => void;
   readonly onStop: () => void;
   readonly onRotate: (direction: RotateDirection) => void;
@@ -244,16 +247,18 @@ export function DeviceToolbar({
         </SelectPopup>
       </Select>
       {/* Stays focusable while it looks; the pane ignores presses meanwhile. */}
-      <Button
-        size="icon-xs"
-        variant="ghost"
-        aria-label="Refresh devices"
-        title="Look for new devices"
-        aria-busy={refreshing || undefined}
-        onClick={onRefresh}
-      >
-        <RefreshCwIcon className={cn(refreshing && "animate-spin")} />
-      </Button>
+      {onRefresh === null ? null : (
+        <Button
+          size="icon-xs"
+          variant="ghost"
+          aria-label="Refresh devices"
+          title="Look for new devices"
+          aria-busy={refreshing || undefined}
+          onClick={onRefresh}
+        >
+          <RefreshCwIcon className={cn(refreshing && "animate-spin")} />
+        </Button>
+      )}
       <ToolbarButton
         label="Start"
         disabledReason={startDisabledReason}
