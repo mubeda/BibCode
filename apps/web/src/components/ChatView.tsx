@@ -4229,10 +4229,14 @@ function ChatViewContent(props: ChatViewProps) {
   // `timelineEntries`, so the follow effect below never sees it (#173). One pass reveals the
   // end again once the row re-measured; the other modes keep their own place.
   const onReasoningRowToggle = useCallback(() => {
+    // The toggle has not rendered yet, so this is where the turn's end sat before it.
+    const before = legendListRef.current
+      ? getActiveTimelineTurnMetrics(legendListRef.current)
+      : null;
     if (
       !rowToggleNeedsEndReveal({
         mode: timelineScrollModeRef.current,
-        wasAtEnd: isAtEndRef.current,
+        scrollDeltaToRevealEnd: before?.scrollDeltaToRevealEnd ?? null,
       }) ||
       liveFollowUserScrollGenerationRef.current !== anchorUserScrollGenerationRef.current
     ) {
