@@ -63,19 +63,27 @@ export type TimelineMinimapStep = "previous" | "next";
 /**
  * The nearest turns whose jump would scroll up or down from `scrollTop`; null where none would
  * move. Partway through a turn, the previous step returns to that turn's start.
+ *
+ * `itemTops` are the list's row positions, which start below its header (`listStartOffset`);
+ * a jump to a row scrolls past that header too, so each jump lands that much further down.
  */
 export function resolveTimelineMinimapStepTargets(input: {
   readonly itemTops: ReadonlyArray<number | null>;
   readonly scrollTop: number;
   readonly maxScrollTop: number;
+  readonly listStartOffset?: number;
 }): Record<TimelineMinimapStep, number | null> {
+  const listStartOffset = input.listStartOffset ?? 0;
   let previous: number | null = null;
   let next: number | null = null;
   for (const [index, top] of input.itemTops.entries()) {
     if (top === null) {
       continue;
     }
-    const jumpTop = Math.min(input.maxScrollTop, Math.max(0, top - TIMELINE_MINIMAP_JUMP_OFFSET));
+    const jumpTop = Math.min(
+      input.maxScrollTop,
+      Math.max(0, top + listStartOffset - TIMELINE_MINIMAP_JUMP_OFFSET),
+    );
     if (jumpTop < input.scrollTop - 1) {
       previous = index;
     } else if (jumpTop > input.scrollTop + 1 && next === null) {

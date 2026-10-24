@@ -1969,6 +1969,62 @@ describe("MessagesTimeline minimap", () => {
     expect(scrollToIndex).toHaveBeenCalledTimes(2);
   });
 
+  it("keeps stepping back through turns below the list header", async () => {
+    const rowTops = [12, 100, 500, 1000];
+    const headerSize = 16;
+    const state = {
+      scroll: 1500,
+      scrollLength: 400,
+      contentLength: 1900,
+      positionAtIndex: (index: number) => rowTops[index] ?? Number.NaN,
+      sizeAtIndex: () => 40,
+    };
+    // LegendList lands a row `viewOffset` below the viewport top, counting its header.
+    const scrollToIndex = vi.fn(
+      ({ index, viewOffset }: { index: number; viewOffset: number }) =>
+        (state.scroll = (rowTops[index] ?? 0) - viewOffset + headerSize),
+    );
+    const listRef = {
+      current: { getState: () => state, scrollToIndex },
+    } as unknown as React.RefObject<LegendListRef | null>;
+    const userEntry = (id: string, text: string) => {
+      const entry = buildUserTimelineEntry(text);
+      return { ...entry, id, message: { ...entry.message, id: MessageId.make(id) } };
+    };
+    const container = await mountTimeline({
+      listRef,
+      timelineEntries: [
+        userEntry("user-1", "First question"),
+        buildAssistantTimelineEntry({
+          id: "assistant-1",
+          messageId: "assistant-1",
+          text: "First answer",
+        }),
+        userEntry("user-2", "Second question"),
+        userEntry("user-3", "Third question"),
+      ],
+    });
+    const onMetricsChange = h.legendListProps?.onMetricsChange as
+      | ((metrics: { headerSize: number; footerSize: number }) => void)
+      | undefined;
+    await act(async () => onMetricsChange?.({ headerSize, footerSize: 16 }));
+    const scrollList = () =>
+      act(async () => (h.legendListProps?.onScroll as (() => void) | undefined)?.());
+    const previous = container.querySelector<HTMLButtonElement>(
+      'button[aria-label="Previous turn"]',
+    );
+
+    for (const expectedIndex of [3, 2, 0]) {
+      await scrollList();
+      await click(previous!);
+      expect(scrollToIndex).toHaveBeenLastCalledWith(
+        expect.objectContaining({ index: expectedIndex }),
+      );
+    }
+    await scrollList();
+    expect(previous?.getAttribute("aria-disabled")).toBe("true");
+  });
+
   it("does not render the minimap below the item threshold", async () => {
     const markup = await renderTimeline({
       timelineEntries: [buildUserTimelineEntry("Only question")],
