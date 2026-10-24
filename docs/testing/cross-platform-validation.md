@@ -2440,6 +2440,9 @@ never count a sandbox-denied listener test as passed or skipped.
     Sign out of `glab` while watching: the subscription must end, the request's
     stored copies must go, and the view must show the sign-in error on its next
     read. Hide the window: polling must stop until it is shown again.
+    With four running merge requests open on Pipelines in separate windows
+    (one list filter), the fourth's job list must follow its pipeline status
+    within about 20 s of a status change.
 11. Verify real GitHub split patches and GitLab synthetic-header patches render
     in Files, including renamed files. Scroll far enough to exercise list and
     diff virtualization. Viewed must survive tab changes and reload. Test the

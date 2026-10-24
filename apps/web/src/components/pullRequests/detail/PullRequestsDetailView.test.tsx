@@ -524,9 +524,28 @@ describe("PullRequestsDetailView", () => {
     pipelineUrl: null,
     revision,
   });
-  it("answers a pipeline change from the stored row and never re-reads the jobs for it", async () => {
+  it("answers a pipeline change from the stored row and never re-reads the jobs a row carries", async () => {
+    h.data.readSnapshot = {
+      list: null,
+      detail: null,
+      tab: null,
+      pipeline: {
+        payload: { ...pipelineCopy(12, "running"), checks: jobs(12, "pending") },
+        observedAt: 5,
+      },
+    };
     await render("checks", 14, null, gitlabContext);
     h.revalidated.length = 0;
+    // A number the poller reads the pipeline of: its new row carries the jobs.
+    h.data.readSnapshot = {
+      list: null,
+      detail: null,
+      tab: null,
+      pipeline: {
+        payload: { ...pipelineCopy(14, "running"), checks: jobs(14, "success") },
+        observedAt: 6,
+      },
+    };
     h.data.subscribe = { ...changed, pipeline: true };
     await render("checks", 14, null, gitlabContext);
     expect(h.revalidated).toEqual(["readSnapshot"]);
@@ -535,6 +554,36 @@ describe("PullRequestsDetailView", () => {
     h.data.subscribe = { ...changed };
     await render("checks", 14, null, gitlabContext);
     expect(h.revalidated).toEqual(["getChecks"]);
+  });
+  it("re-reads the jobs once per revision for a header-only row on the Pipelines tab", async () => {
+    // A number past the poller's three-number cap: its row holds the header only.
+    const headerOnly = (revision: number, observedAt: number) => ({
+      list: null,
+      detail: null,
+      tab: null,
+      pipeline: { payload: pipelineCopy(revision, "success"), observedAt },
+    });
+    h.data.readSnapshot = headerOnly(12, 5);
+    await render("checks", 14, null, gitlabContext);
+    h.revalidated.length = 0;
+    // Painting a header-only row without a change event reads nothing.
+    await render("checks", 14, null, gitlabContext);
+    expect(h.revalidated).toEqual([]);
+    h.data.readSnapshot = headerOnly(14, 6);
+    h.data.subscribe = { ...changed, pipeline: true };
+    await render("checks", 14, null, gitlabContext);
+    expect(h.revalidated).toEqual(["readSnapshot", "getChecks"]);
+    // A repeated event for the same row reads nothing more from the host.
+    h.revalidated.length = 0;
+    h.data.subscribe = { ...changed, pipeline: true };
+    await render("checks", 14, null, gitlabContext);
+    expect(h.revalidated).toEqual(["readSnapshot"]);
+    // Off the Pipelines tab, a header-only row re-reads no jobs.
+    h.revalidated.length = 0;
+    h.data.readSnapshot = headerOnly(16, 7);
+    h.data.subscribe = { ...changed, pipeline: true };
+    await render("conversation", 14, null, gitlabContext);
+    expect(h.revalidated).not.toContain("getChecks");
   });
   it("keeps the newest pipeline and jobs across a tab switch whose snapshot has not answered", async () => {
     h.data.get = { ...detail, pipeline: pipelineCopy(10, "running") };
