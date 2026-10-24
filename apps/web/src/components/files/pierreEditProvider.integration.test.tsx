@@ -123,4 +123,80 @@ describe("Pierre stable edit integration", () => {
       cleanUp.mockRestore();
     }
   });
+
+  describe("undo boundary (patched Editor.applyEdits)", () => {
+    const renderEditor = async (options: EditorOptions<unknown>): Promise<Editor<unknown>> => {
+      let created: Editor<unknown> | null = null;
+      const createEditor = () => {
+        created ??= new Editor({ ...editorOptions, ...options });
+        return created;
+      };
+      await act(async () => {
+        root.render(
+          <EditProvider createEditor={createEditor}>
+            <EditableFile show />
+          </EditProvider>,
+        );
+      });
+      if (created === null) throw new Error("EditProvider did not create an editor");
+      const editor: Editor<unknown> = created;
+      editor.setSelections([
+        {
+          start: { line: 0, character: 8 },
+          end: { line: 0, character: 8 },
+          direction: "none",
+        },
+      ]);
+      return editor;
+    };
+
+    const insertAt = (character: number, newText: string) => [
+      {
+        range: {
+          start: { line: 0, character },
+          end: { line: 0, character },
+        },
+        newText,
+      },
+    ];
+
+    it("keeps a boundary edit out of the typing before it", async () => {
+      const onChange = vi.fn();
+      const editor = await renderEditor({ onChange });
+
+      editor.applyEdits(insertAt(8, "a"));
+      onChange.mockClear();
+      editor.applyEdits(insertAt(9, "b"), true, true);
+      // onChange runs synchronously inside the boundary call, before it returns.
+      expect(onChange).toHaveBeenCalledOnce();
+
+      expect(editor.getText()).toBe("originalab\n");
+      editor.undo();
+      expect(editor.getText()).toBe("originala\n");
+    });
+
+    it("keeps typing after a boundary edit out of it", async () => {
+      const editor = await renderEditor({});
+
+      editor.applyEdits(insertAt(8, "a"), true, true);
+      editor.applyEdits(insertAt(9, "b"));
+
+      expect(editor.getText()).toBe("originalab\n");
+      editor.undo();
+      expect(editor.getText()).toBe("originala\n");
+      editor.undo();
+      expect(editor.getText()).toBe("original\n");
+    });
+
+    it("still merges adjacent edits without the boundary", async () => {
+      const editor = await renderEditor({});
+
+      editor.applyEdits(insertAt(8, "a"));
+      editor.applyEdits(insertAt(9, "b"));
+
+      expect(editor.getText()).toBe("originalab\n");
+      editor.undo();
+      expect(editor.getText()).toBe("original\n");
+    });
+  });
 });
