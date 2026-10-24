@@ -37,6 +37,14 @@ applicable ancestor skills are included; unrelated sibling projects are excluded
 Project definitions take precedence over user definitions with the same name.
 Use `/` to open the skill menu. Capabilities can vary with the installed Cursor CLI.
 
+The [CLI ACP documentation](https://cursor.com/docs/cli/acp) defines the
+`cursor/ask_question`, `cursor/create_plan`, `cursor/update_todos`,
+`cursor/task`, and `cursor/generate_image` extensions. BiBCode handles the
+first three. `cursor/task` (sent when a subagent task completes) and
+`cursor/generate_image` are not handled yet, so Cursor subagents and generated
+images do not appear in the chat or in Activity, and Cursor claims no Activity
+capability.
+
 ## Updates and version advisories
 
 BiBCode recognizes an update source only when the resolved executable and its
