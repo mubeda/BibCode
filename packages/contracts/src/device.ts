@@ -1,5 +1,7 @@
 import * as Schema from "effect/Schema";
 
+import { ThreadId } from "./baseSchemas.ts";
+
 /** The platform a device image runs. */
 export const DevicePlatform = Schema.Literals(["android", "ios"]);
 export type DevicePlatform = typeof DevicePlatform.Type;
@@ -60,7 +62,9 @@ export type DevicePlatformCatalog = typeof DevicePlatformCatalog.Type;
 
 /**
  * `width` and `height` are the display size in the current orientation. `canRotate` is whether
- * the running device turns.
+ * the running device turns. `threadId` is the root thread that started the device (a chat
+ * panel's host, else the thread), kept once it ends; absent for a device started without one,
+ * or by a server without owners. It is a label, not a permission.
  */
 export const DeviceSnapshot = Schema.Struct({
   deviceId: Schema.String,
@@ -72,10 +76,14 @@ export const DeviceSnapshot = Schema.Struct({
   height: Schema.optionalKey(Schema.Number),
   orientation: DeviceOrientation,
   canRotate: Schema.Boolean,
+  threadId: Schema.optionalKey(ThreadId),
 });
 export type DeviceSnapshot = typeof DeviceSnapshot.Type;
 
-/** One entry per platform the server runs, in its order, and every device it knows. */
+/**
+ * One entry per platform the server runs, in its order, and every device it knows, in the order
+ * they were opened: up to four live devices, one per image, and the four newest ended ones.
+ */
 export const DeviceCatalog = Schema.Struct({
   platforms: Schema.Array(DevicePlatformCatalog),
   devices: Schema.Array(DeviceSnapshot),
@@ -121,7 +129,15 @@ export const DeviceInputEvent = Schema.Union([
 ]);
 export type DeviceInputEvent = typeof DeviceInputEvent.Type;
 
-export const DeviceOpenInput = Schema.Struct({ platform: DevicePlatform, imageId: Schema.String });
+/**
+ * `threadId` is the root thread the device is for (a chat panel's host, else the thread). An
+ * image that already runs returns its device and keeps its owner. Older servers ignore it.
+ */
+export const DeviceOpenInput = Schema.Struct({
+  platform: DevicePlatform,
+  imageId: Schema.String,
+  threadId: Schema.optionalKey(ThreadId),
+});
 export type DeviceOpenInput = typeof DeviceOpenInput.Type;
 export const DeviceOpenResult = Schema.Struct({ deviceId: Schema.String });
 export type DeviceOpenResult = typeof DeviceOpenResult.Type;
@@ -166,7 +182,11 @@ export class DeviceSdkUnavailableError extends Schema.TaggedError<DeviceSdkUnava
   { kind: DeviceAvailabilityKind, message: Schema.String },
 ) {}
 
-/** The platform already runs a device; `running` is that device's display name. */
+/**
+ * The server runs as many devices as it allows. `running` is the display name of the first live
+ * device on the requested platform in catalog order, else the first live device; an older
+ * server allows one per platform and names that one.
+ */
 export class DeviceLimitError extends Schema.TaggedError<DeviceLimitError>()("DeviceLimitError", {
   running: Schema.String,
   message: Schema.String,
