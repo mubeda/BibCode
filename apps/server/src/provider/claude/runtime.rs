@@ -28,6 +28,7 @@ use crate::activity::{
     ActivityObservationState, ProviderActivityControlUpdate, ProviderActivityMutation,
     ProviderActivityNativeTarget,
 };
+use crate::json_size::encoded_json_len;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -2839,7 +2840,7 @@ impl ClaudeProviderRuntime {
         let tool = self.in_flight_tools.get_mut(tool_use_id)?;
         let result = json!({
             "tool_use_id": tool_use_id,
-            "content": content,
+            "content": bounded_tool_result_content(content),
         });
         tool.result = Some(result.clone());
         Some((
@@ -3023,6 +3024,42 @@ impl ClaudeProviderRuntime {
             json!({ "servers": servers }),
         ))
     }
+}
+
+/// The largest tool-result content, as JSON, that its `item.updated` and `item.completed` events
+/// keep whole, and the most bytes of text a preview of a larger one keeps: 16 KiB, the bound of an
+/// activity's detail. A thread replays these events, so a command that printed megabytes would
+/// otherwise send all of them on every replay (#148).
+const TOOL_RESULT_PREVIEW_BYTES: usize = 16 * 1024;
+const TOOL_RESULT_TRUNCATED_NOTE: &str = "\n\n[Tool result truncated by BiBCode]";
+
+/// `content` itself when its JSON fits [`TOOL_RESULT_PREVIEW_BYTES`]. A larger result becomes a
+/// preview: its text (the string, or the array's text blocks one per line) cut to that many bytes,
+/// then [`TOOL_RESULT_TRUNCATED_NOTE`]. Images and other blocks of such a result are left out.
+fn bounded_tool_result_content(content: Value) -> Value {
+    if encoded_json_len(&content).is_ok_and(|length| length <= TOOL_RESULT_PREVIEW_BYTES) {
+        return content;
+    }
+    let blocks = match &content {
+        Value::Array(blocks) => blocks.as_slice(),
+        other => std::slice::from_ref(other),
+    };
+    let mut preview = String::new();
+    for text in blocks
+        .iter()
+        .filter_map(|block| block.as_str().or_else(|| block.get("text")?.as_str()))
+    {
+        if preview.len() >= TOOL_RESULT_PREVIEW_BYTES {
+            break;
+        }
+        if !preview.is_empty() {
+            preview.push('\n');
+        }
+        let room = TOOL_RESULT_PREVIEW_BYTES - preview.len();
+        preview.push_str(&text[..text.floor_char_boundary(room)]);
+    }
+    preview.push_str(TOOL_RESULT_TRUNCATED_NOTE);
+    Value::String(preview)
 }
 
 const MAX_MCP_SERVERS: usize = 256;
@@ -6747,5 +6784,109 @@ mod targeted_task_correlation_tests {
                 .retired_agent_by_task
                 .is_empty()
         );
+    }
+}
+
+#[cfg(test)]
+mod tool_result_tests {
+    use super::*;
+
+    /// The events a Bash call emits when Claude reports `content` as its result.
+    fn tool_result_events(content: Value) -> Vec<CanonicalEvent> {
+        let mut runtime = ClaudeProviderRuntime::new("thread".to_owned(), "session".to_owned());
+        runtime.start_turn(TurnInput {
+            turn_id: "turn".to_owned(),
+            input: "run it".to_owned(),
+        });
+        let stream = |event: Value| {
+            json!({
+                "type": "stream_event", "session_id": "session", "uuid": "stream",
+                "parent_tool_use_id": null, "event": event,
+            })
+        };
+        runtime.handle_raw_value(
+            &stream(json!({
+                "type": "content_block_start", "index": 1,
+                "content_block": {
+                    "type": "tool_use", "id": "tool-1", "name": "Bash",
+                    "input": {"command": "cat build.log"}
+                }
+            })),
+            1_000,
+        );
+        runtime.handle_raw_value(
+            &stream(json!({"type": "content_block_stop", "index": 1})),
+            1_000,
+        );
+        let output = runtime.handle_raw_value(
+            &json!({
+                "type": "user", "session_id": "session", "uuid": "result",
+                "parent_tool_use_id": null,
+                "message": {"role": "user", "content": [{
+                    "type": "tool_result", "tool_use_id": "tool-1", "content": content
+                }]}
+            }),
+            1_000,
+        );
+        let types = output
+            .events
+            .iter()
+            .map(|event| event.event_type.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(types, ["item.updated", "item.completed"]);
+        output.events
+    }
+
+    /// The tool result's content on each of its events.
+    fn stored_contents(events: &[CanonicalEvent]) -> [&Value; 2] {
+        [
+            &events[0].payload["data"]["content"],
+            &events[1].payload["data"]["result"]["content"],
+        ]
+    }
+
+    #[test]
+    fn a_multi_megabyte_tool_result_is_stored_as_a_bounded_preview() {
+        // Two-byte characters after an 11-byte line: the cap falls inside one of them.
+        let stdout = format!("first line\n{}TAIL-SENTINEL", "é".repeat(2 * 1024 * 1024));
+        let events = tool_result_events(json!(stdout));
+        for event in &events {
+            let encoded = serde_json::to_string(&event.payload).expect("encoded payload");
+            assert!(
+                encoded.len() <= TOOL_RESULT_PREVIEW_BYTES + 1024,
+                "{} payload is {} bytes",
+                event.event_type,
+                encoded.len()
+            );
+            assert!(!encoded.contains("TAIL-SENTINEL"));
+        }
+        for content in stored_contents(&events) {
+            let preview = content.as_str().expect("a text preview");
+            assert!(preview.starts_with("first line\néé"), "{preview:.40}");
+            assert!(preview.ends_with(TOOL_RESULT_TRUNCATED_NOTE));
+            assert_eq!(
+                preview.len(),
+                TOOL_RESULT_PREVIEW_BYTES - 1 + TOOL_RESULT_TRUNCATED_NOTE.len()
+            );
+        }
+    }
+
+    #[test]
+    fn a_result_within_the_cap_is_kept_whole_and_one_over_it_keeps_only_its_text() {
+        let small = json!([
+            {"type": "text", "text": "ok"},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}}
+        ]);
+        let events = tool_result_events(small.clone());
+        assert_eq!(stored_contents(&events), [&small, &small]);
+
+        let screenshot = json!([
+            {"type": "text", "text": "before"},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "A".repeat(2 * 1024 * 1024)}},
+            {"type": "text", "text": "after"}
+        ]);
+        let events = tool_result_events(screenshot);
+        let preview = json!(format!("before\nafter{TOOL_RESULT_TRUNCATED_NOTE}"));
+        assert_eq!(stored_contents(&events), [&preview, &preview]);
     }
 }
