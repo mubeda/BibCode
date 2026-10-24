@@ -35,11 +35,13 @@ const WORKSPACE_METHODS: &[&str] = &[
     "projects.createUploadUrl",
     "projects.deleteEntry",
     "projects.duplicateEntry",
+    "projects.getFileVersion",
     "projects.listEntries",
     "projects.readFile",
     "projects.renameEntry",
     "projects.searchEntries",
     "projects.writeFile",
+    "projects.writeFileIfUnchanged",
     "review.getDiffPreview",
 ];
 const PREVIEW_METHODS: &[&str] = &[

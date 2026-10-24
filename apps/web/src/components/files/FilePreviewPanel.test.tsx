@@ -100,6 +100,7 @@ const testState = vi.hoisted(() => {
       changeOutsideEditor: ReturnType<typeof vi.fn>;
     },
     editingSessions: null as unknown as {
+      get: ReturnType<typeof vi.fn>;
       getOrCreate: ReturnType<typeof vi.fn>;
       beginPathMutation: ReturnType<typeof vi.fn>;
       reset: () => void;
@@ -107,21 +108,35 @@ const testState = vi.hoisted(() => {
     sessionCreations: [] as string[],
     commands: {
       writeFile: { label: "writeFile" },
+      writeFileIfUnchanged: { label: "writeFileIfUnchanged" },
+      getFileVersion: { label: "getFileVersion" },
       openPreview: { label: "openPreview" },
       createAssetUrl: { label: "createAssetUrl" },
     },
     writeFile: vi.fn<(input: unknown) => Promise<unknown>>(),
+    writeFileIfUnchanged: vi.fn<(input: unknown) => Promise<unknown>>(),
+    getFileVersion: vi.fn<(input: unknown) => Promise<unknown>>(),
+    rereadProjectFile: vi.fn<(...args: Array<unknown>) => Promise<unknown>>(),
+    connection: null as null | { phase: string; generation: number },
     openPreview: vi.fn<(input: unknown) => Promise<unknown>>(),
     createAssetUrl: vi.fn<(input: unknown) => Promise<unknown>>(),
     openFileInPreview: vi.fn<(input: unknown) => Promise<{ _tag: string }>>(),
     isBrowserPreviewFile: vi.fn<(path: string) => boolean>(),
     isPreviewSupported: false,
-    fileQuery: { data: null, error: null, isPending: false, refresh: vi.fn() } as {
+    fileQuery: { data: null, disk: null, error: null, isPending: false, refresh: vi.fn() } as {
       data: {
         relativePath: string;
         contents: string;
         byteLength: number;
         truncated: boolean;
+        version?: string;
+      } | null;
+      disk: {
+        relativePath: string;
+        contents: string;
+        byteLength: number;
+        truncated: boolean;
+        version?: string;
       } | null;
       error: string | null;
       isPending: boolean;
@@ -136,6 +151,7 @@ const testState = vi.hoisted(() => {
     removeReviewComment: vi.fn(),
     setProjectFileQueryData: vi.fn(),
     confirmProjectFileQueryData: vi.fn(),
+    clearProjectFileQueryData: vi.fn(),
     getOptimisticProjectFileQueryData: vi.fn<() => { contents: string } | null>(),
     installFileEditorDismissal: vi.fn<(input: unknown) => () => void>(),
     toastAdd: vi.fn(),
@@ -170,6 +186,7 @@ const testState = vi.hoisted(() => {
   };
   const sessions = new Map<string, NonNullable<typeof state.session>>();
   state.editingSessions = {
+    get: vi.fn((relativePath: string) => sessions.get(relativePath)),
     getOrCreate: vi.fn((relativePath: string, create: () => any) => {
       const existing = sessions.get(relativePath);
       if (existing) {
@@ -306,6 +323,8 @@ vi.mock("@pierre/diffs/edit", () => ({
     readonly undo = vi.fn();
     readonly redo = vi.fn();
     readonly cleanUp = vi.fn();
+    // Never attached in these static renders: a disk reload takes the detached path.
+    readonly getFile = () => undefined;
     constructor(options: {
       onAttach?: () => void;
       onChange: (file: { contents: string }, annotations?: unknown) => void;
@@ -445,6 +464,7 @@ vi.mock("~/state/assets", () => ({
 vi.mock("~/state/environments", () => ({
   usePrimaryEnvironmentId: () => testState.primaryEnvironmentId,
   useEnvironmentHttpBaseUrl: () => testState.environmentHttpBaseUrl,
+  useEnvironmentConnectionState: () => ({ data: testState.connection }),
 }));
 
 vi.mock("~/state/preview", () => ({
@@ -452,12 +472,22 @@ vi.mock("~/state/preview", () => ({
 }));
 
 vi.mock("~/state/projects", () => ({
-  projectEnvironment: { writeFile: testState.commands.writeFile },
+  projectEnvironment: {
+    writeFile: testState.commands.writeFile,
+    writeFileIfUnchanged: testState.commands.writeFileIfUnchanged,
+    getFileVersion: testState.commands.getFileVersion,
+  },
 }));
 
 vi.mock("~/state/use-atom-command", () => ({
   useAtomCommand: (command: unknown) =>
-    command === testState.commands.writeFile ? testState.writeFile : testState.openPreview,
+    command === testState.commands.writeFile
+      ? testState.writeFile
+      : command === testState.commands.writeFileIfUnchanged
+        ? testState.writeFileIfUnchanged
+        : command === testState.commands.getFileVersion
+          ? testState.getFileVersion
+          : testState.openPreview,
 }));
 
 vi.mock("~/state/use-atom-query-runner", () => ({
@@ -517,6 +547,11 @@ vi.mock("./fileSaveCoordinator", () => ({
       return () => this.listeners.delete(listener);
     };
     readonly getSnapshot = () => testState.sessionSnapshot.save;
+    readonly holdForConflict = vi.fn();
+    readonly releaseConflict = vi.fn();
+    readonly adopt = vi.fn();
+    readonly discardPendingSave = vi.fn();
+    readonly isSavingPaused = () => false;
     constructor(options: {
       debounceMs: number;
       persist: (contents: string) => Promise<unknown>;
@@ -529,16 +564,31 @@ vi.mock("./fileSaveCoordinator", () => ({
   },
 }));
 
+vi.mock("./FileDiskConflictBar", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./FileDiskConflictBar")>();
+  return {
+    ...actual,
+    FileDiskConflictBar: (props: Record<string, unknown>) => {
+      ui.record("FileDiskConflictBar", props);
+      return <div data-file-disk-conflict-bar />;
+    },
+  };
+});
+
 vi.mock("./projectFilesQueryState", () => ({
   useProjectFileQuery: () => testState.fileQuery,
   setProjectFileQueryData: (...args: Array<unknown>) => testState.setProjectFileQueryData(...args),
   confirmProjectFileQueryData: (...args: Array<unknown>) =>
     testState.confirmProjectFileQueryData(...args),
   getOptimisticProjectFileQueryData: () => testState.getOptimisticProjectFileQueryData(),
+  clearProjectFileQueryData: (...args: Array<unknown>) =>
+    testState.clearProjectFileQueryData(...args),
+  rereadProjectFile: (...args: Array<unknown>) => testState.rereadProjectFile(...args),
 }));
 
 import { resolveDiffThemeName } from "~/lib/diffRendering";
 
+import type { FileEditingSession } from "./fileEditingSession";
 import FilePreviewPanel from "./FilePreviewPanel";
 
 const environmentId = EnvironmentId.make("environment-1");
@@ -566,14 +616,26 @@ function baseProps(overrides: Partial<PanelProps> = {}): PanelProps {
   };
 }
 
-function setFileData(contents: string, options: { truncated?: boolean; byteLength?: number } = {}) {
+function setFileData(
+  contents: string,
+  options: {
+    truncated?: boolean;
+    byteLength?: number;
+    version?: string;
+    /** What the server read, when an optimistic draft is shown instead of it. */
+    disk?: NonNullable<typeof testState.fileQuery.disk> | null;
+  } = {},
+) {
+  const data = {
+    relativePath: "src/app.ts",
+    contents,
+    byteLength: options.byteLength ?? contents.length,
+    truncated: options.truncated ?? false,
+    ...(options.version === undefined ? {} : { version: options.version }),
+  };
   testState.fileQuery = {
-    data: {
-      relativePath: "src/app.ts",
-      contents,
-      byteLength: options.byteLength ?? contents.length,
-      truncated: options.truncated ?? false,
-    },
+    data,
+    disk: options.disk === undefined ? data : options.disk,
     error: null,
     isPending: false,
     refresh: vi.fn(),
@@ -657,7 +719,11 @@ beforeEach(() => {
   testState.openFileInPreview.mockReset().mockResolvedValue({ _tag: "Success" });
   testState.isBrowserPreviewFile.mockReset().mockReturnValue(false);
   testState.isPreviewSupported = false;
-  testState.fileQuery = { data: null, error: null, isPending: true, refresh: vi.fn() };
+  testState.fileQuery = { data: null, disk: null, error: null, isPending: true, refresh: vi.fn() };
+  testState.writeFileIfUnchanged.mockReset().mockResolvedValue({ _tag: "Success" });
+  testState.getFileVersion.mockReset().mockResolvedValue({ _tag: "Failure" });
+  testState.rereadProjectFile.mockReset().mockResolvedValue(null);
+  testState.connection = null;
   testState.getLocalStorageItem.mockReset().mockReturnValue(null);
   testState.setLocalStorageItem.mockReset();
   testState.primaryEnvironmentId = null;
@@ -676,6 +742,7 @@ beforeEach(() => {
     canRedo: false,
   };
   testState.editingSessions.reset();
+  testState.editingSessions.get.mockClear();
   testState.editingSessions.getOrCreate.mockClear();
   testState.editingSessions.beginPathMutation.mockClear();
   testState.coordinators.length = 0;
@@ -750,6 +817,7 @@ describe("panel layout states", () => {
       if (state === "error") {
         testState.fileQuery = {
           data: null,
+          disk: null,
           error: "unavailable",
           isPending: false,
           refresh: vi.fn(),
@@ -769,6 +837,7 @@ describe("panel layout states", () => {
   it("shows the error message when reading failed", () => {
     testState.fileQuery = {
       data: null,
+      disk: null,
       error: "File is too large to preview.",
       isPending: false,
       refresh: vi.fn(),
@@ -1355,11 +1424,13 @@ describe("editable file surface", () => {
     });
 
     coordinator.options.onConfirmed("persisted");
+    // A file read from a server without versions saves unguarded and confirms no version.
     expect(testState.setProjectFileQueryData).toHaveBeenCalledWith(
       environmentId,
       "/workspace/demo",
       "src/app.ts",
       "persisted",
+      undefined,
     );
     expect(testState.confirmProjectFileQueryData).toHaveBeenCalledWith(
       environmentId,
@@ -1576,6 +1647,282 @@ describe("editable file surface", () => {
     });
     renderEditable(baseProps({ revealRequestId: 5 }));
     expect(ui.find("File").selectedLines).toBeNull();
+  });
+});
+
+describe("disk changes", () => {
+  type DiskSession = FileEditingSession<unknown>;
+
+  function reconcile(
+    disk: Parameters<DiskSession["reconcileVersion"]>[1],
+    read?: { version: string; contents: string },
+  ) {
+    const session = testState.session as unknown as DiskSession;
+    const token = session.beginDiskCheck();
+    if (token === null) throw new Error("no disk check may run");
+    if (session.reconcileVersion(token, disk) === "read" && read) {
+      session.reconcileRead(token, read);
+    }
+  }
+
+  it("shows the conflict bar under the toolbar and disables Save with its reason", () => {
+    setFileData("old\n", { version: "v1" });
+    testState.pendingWork = true;
+    renderPanel(baseProps());
+
+    reconcile({ _tag: "present", version: "v2" }, { version: "v2", contents: "agent\n" });
+    const markup = renderPanel(baseProps());
+
+    const bar = ui.find("FileDiskConflictBar");
+    expect(bar.conflict).toEqual({ reason: "changed", diskKnown: true, unreadable: null });
+    // The source view can undo a reload, so it does not ask first.
+    expect(bar.confirmReload).toBe(false);
+    expect(ui.find("FileEditorToolbar").saveBlockedReason).toBe(
+      "Changed on disk. Choose Reload from disk or Overwrite disk.",
+    );
+    expect(markup.indexOf("data-file-editor-toolbar")).toBeLessThan(
+      markup.indexOf("data-file-disk-conflict-bar"),
+    );
+    expect(ui.filter("File", (props) => props.edit === true)).toHaveLength(1);
+
+    // Reload from disk drops a lingering overlay so the views show the disk text.
+    (bar.onReload as () => void)();
+    expect(testState.clearProjectFileQueryData).toHaveBeenCalledWith(
+      environmentId,
+      "/workspace/demo",
+      "src/app.ts",
+    );
+    renderPanel(baseProps());
+    expect(ui.filter("FileDiskConflictBar")).toHaveLength(0);
+  });
+
+  it("asks before reloading in the rendered Markdown view, which has no undo", () => {
+    setFileData("- [ ] task\n", { version: "v1" });
+    testState.pendingWork = true;
+    renderPanel(baseProps({ relativePath: "README.md" }));
+
+    reconcile({ _tag: "present", version: "v2" }, { version: "v2", contents: "- [x] task\n" });
+    renderPanel(baseProps({ relativePath: "README.md" }));
+
+    expect(ui.find("FileDiskConflictBar").confirmReload).toBe(true);
+  });
+
+  it("shows a clean file deleted on disk as deleted instead of its stale text", () => {
+    setFileData("old\n", { version: "v1" });
+    renderPanel(baseProps());
+
+    reconcile({ _tag: "missing" });
+    const markup = renderPanel(baseProps());
+
+    expect(markup).toContain("Deleted on disk.");
+    expect(ui.filter("File")).toHaveLength(0);
+    expect(ui.filter("FileDiskConflictBar")).toHaveLength(0);
+  });
+
+  it("reports conflicts for the tab strip", () => {
+    const onConflictChange = vi.fn();
+    setFileData("old\n", { version: "v1" });
+    testState.pendingWork = true;
+    renderPanel(baseProps({ onConflictChange }));
+
+    reconcile({ _tag: "present", version: "v2" }, { version: "v2", contents: "agent\n" });
+
+    expect(onConflictChange).toHaveBeenCalledWith("src/app.ts", true);
+  });
+
+  it("guards saves with the server read while a ticked task's draft without a version shows", async () => {
+    const read = {
+      relativePath: "src/app.ts",
+      contents: "- [ ] task\n",
+      byteLength: 11,
+      truncated: false,
+      version: "v1",
+    };
+    setFileData("- [x] task\n", { disk: read });
+    renderPanel(baseProps());
+
+    const session = testState.session as unknown as DiskSession;
+    expect(session.watchesDisk).toBe(true);
+    await testState.coordinators[testState.coordinators.length - 1]!.options.persist(
+      "- [x] task\n",
+    );
+    expect(testState.writeFileIfUnchanged).toHaveBeenCalledWith({
+      environmentId,
+      input: {
+        cwd: "/workspace/demo",
+        relativePath: "src/app.ts",
+        contents: "- [x] task\n",
+        precondition: { _tag: "version", version: "v1" },
+      },
+    });
+    expect(testState.writeFile).not.toHaveBeenCalled();
+  });
+
+  it("waits for a server read before starting a session under a draft", () => {
+    setFileData("- [x] task\n", { disk: null });
+    renderPanel(baseProps());
+
+    expect(testState.editingSessions.getOrCreate).not.toHaveBeenCalled();
+  });
+
+  it("keeps a conflicted session's text and Overwrite disk when the file grows past 1 MB", () => {
+    setFileData("old\n", { version: "v1" });
+    renderPanel(baseProps());
+    reconcile({ _tag: "unreadable", failure: "file_too_large", version: "v-large" });
+
+    // A later re-read of the query (a reconnect, a remount once stale) holds only the first 1 MB.
+    setFileData("partial", { truncated: true, byteLength: 2_000_000, version: "v-partial" });
+    const markup = renderPanel(baseProps());
+
+    expect(ui.find("FileDiskConflictBar").conflict).toEqual({
+      reason: "unreadable",
+      diskKnown: true,
+      unreadable: "file_too_large",
+    });
+    const editable = ui.filter("File", (props) => props.edit === true);
+    expect(editable).toHaveLength(1);
+    // The document the user was shown, never the truncated read an overwrite would then save.
+    expect((editable[0]!.file as { contents: string }).contents).toBe("old\n");
+    expect(markup).not.toContain("Preview limited");
+    expect(ui.find("FileEditorToolbar").cleanStatus).not.toBe("Editing unavailable");
+  });
+
+  it("still shows a truncated preview for a session the server does not version", () => {
+    setFileData("old\n");
+    renderPanel(baseProps());
+
+    setFileData("partial", { truncated: true, byteLength: 2_000_000 });
+    const markup = renderPanel(baseProps());
+
+    expect(markup).toContain("Preview limited");
+    expect(ui.filter("File", (props) => props.edit === true)).toHaveLength(0);
+  });
+});
+
+describe("disk watching wiring", () => {
+  type DiskSession = FileEditingSession<unknown>;
+
+  function reconcile(disk: Parameters<DiskSession["reconcileVersion"]>[1]) {
+    const session = testState.session as unknown as DiskSession;
+    const token = session.beginDiskCheck();
+    if (token === null) throw new Error("no disk check may run");
+    session.reconcileVersion(token, disk);
+  }
+
+  /** The visible window the watcher listens to; the unit environment has none. */
+  function stubVisibleWindow() {
+    const fakeDocument = {
+      visibilityState: "visible",
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    };
+    const fakeWindow = { addEventListener: vi.fn(), removeEventListener: vi.fn() };
+    vi.stubGlobal("document", fakeDocument);
+    vi.stubGlobal("window", fakeWindow);
+    return { fakeDocument, fakeWindow };
+  }
+
+  function fakeSurface() {
+    const listeners = new Map<string, (event: unknown) => void>();
+    return {
+      element: {
+        addEventListener: (type: string, handler: (event: unknown) => void) => {
+          listeners.set(type, handler);
+        },
+        removeEventListener: (type: string) => {
+          listeners.delete(type);
+        },
+      },
+      listeners,
+    };
+  }
+
+  it("polls the shown file's version and reads it back when the disk changed", async () => {
+    const onConflictChange = vi.fn();
+    setFileData("old\n", { version: "v1" });
+    testState.pendingWork = true;
+    renderPanel(baseProps({ onConflictChange }));
+    testState.getFileVersion.mockResolvedValue({
+      _tag: "Success",
+      value: { _tag: "present", version: "v2" },
+    });
+    testState.rereadProjectFile.mockResolvedValue({
+      relativePath: "src/app.ts",
+      contents: "agent\n",
+      byteLength: 6,
+      truncated: false,
+      version: "v2",
+    });
+    const { fakeDocument, fakeWindow } = stubVisibleWindow();
+
+    const cleanups = harness.runEffects();
+
+    await vi.waitFor(() => expect(onConflictChange).toHaveBeenCalledWith("src/app.ts", true));
+    expect(testState.getFileVersion).toHaveBeenCalledWith({
+      environmentId,
+      input: { cwd: "/workspace/demo", relativePath: "src/app.ts" },
+    });
+    expect(testState.rereadProjectFile).toHaveBeenCalledWith(
+      environmentId,
+      "/workspace/demo",
+      "src/app.ts",
+    );
+    expect(fakeWindow.addEventListener).toHaveBeenCalledWith("focus", expect.any(Function));
+    for (const cleanup of cleanups) cleanup();
+    expect(fakeDocument.removeEventListener).toHaveBeenCalledWith(
+      "visibilitychange",
+      expect.any(Function),
+    );
+  });
+
+  it("does not watch a file the server does not version", () => {
+    setFileData("old\n");
+    renderPanel(baseProps());
+    stubVisibleWindow();
+
+    const cleanups = harness.runEffects();
+
+    expect(testState.getFileVersion).not.toHaveBeenCalled();
+    for (const cleanup of cleanups) cleanup();
+  });
+
+  it("checks the disk again once the environment reconnects", () => {
+    setFileData("old\n", { version: "v1" });
+    testState.connection = { phase: "backoff", generation: 1 };
+    renderPanel(baseProps());
+    const session = testState.session as unknown as DiskSession;
+    const requested = vi.fn();
+    session.subscribeDiskCheckRequests(requested);
+    stubVisibleWindow();
+
+    let cleanups = harness.runEffects();
+    expect(requested).not.toHaveBeenCalled();
+    for (const cleanup of cleanups) cleanup();
+
+    testState.connection = { phase: "connected", generation: 2 };
+    renderPanel(baseProps());
+    cleanups = harness.runEffects();
+    expect(requested).toHaveBeenCalledOnce();
+    for (const cleanup of cleanups) cleanup();
+  });
+
+  it("holds a clean file's deletion until the editor's IME composition ends", () => {
+    setFileData("old\n", { version: "v1" });
+    renderPanel(baseProps());
+    const session = testState.session as unknown as DiskSession;
+    const surface = fakeSurface();
+    harness.refs[1]!.current = surface.element;
+    stubVisibleWindow();
+    const cleanups = harness.runEffects();
+
+    surface.listeners.get("compositionstart")!({});
+    reconcile({ _tag: "missing" });
+    expect(session.getSnapshot().deletedOnDisk).toBe(false);
+
+    surface.listeners.get("compositionend")!({});
+    reconcile({ _tag: "missing" });
+    expect(session.getSnapshot().deletedOnDisk).toBe(true);
+    for (const cleanup of cleanups) cleanup();
   });
 });
 

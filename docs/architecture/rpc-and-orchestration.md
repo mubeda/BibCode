@@ -431,7 +431,8 @@ option-shaped; GitHub receives `--remote=<name>`, and the final Git command
 pushes and sets upstream for exactly that selected remote with option
 termination, regardless of an older branch upstream.
 
-`projects.writeFile` uses the same guard. After admission it continues through
+`projects.writeFile` and `projects.writeFileIfUnchanged` use the same guard.
+After admission each continues through
 the terminal filesystem result and then settles the status guard. A successful
 content-only write to an existing ordinary file retains the workspace entry
 index; creating a path or writing a built-in Git classification control
@@ -2533,7 +2534,8 @@ something invalidates it:
 
 - `projects.createEntry`, `projects.renameEntry`, `projects.deleteEntry`, and
   `projects.duplicateEntry` drop the cached index after a successful mutation;
-- `projects.writeFile` drops it when the write creates a file or parent, or when
+- `projects.writeFile` and `projects.writeFileIfUnchanged` drop it when the
+  write creates a file or parent, or when
   either the logical path or safely resolved effective target contains a
   case-insensitive `.gitignore` or `.git` component. An ordinary existing-file
   content save keeps the index while still notifying VCS status. Arbitrary
@@ -2585,6 +2587,75 @@ external changes and a content change to a configured custom
 `core.excludesFile`. The flag changes cache admission only. It does not widen
 the path boundary, bypass the workspace-availability guard, or otherwise change
 what the caller may read.
+
+## Open-file versions and guarded saves
+
+An open file's editor never saves over a change it has not seen. Three pieces
+ship together, and a client uses the last two only when the server's
+`projects.readFile` result carried a `version`. An older server returns none,
+and the editor then saves with `projects.writeFile` as before, without claiming
+protection.
+
+- **Version.** `projects.readFile` returns `version`: the lowercase hex SHA-256
+  of the exact bytes it returned, before lossy UTF-8 decoding. Content, not
+  mtime, is the truth, because mtime is coarse on some filesystems and can
+  repeat within a second.
+- **`projects.getFileVersion({ cwd, relativePath })`** reports what is on disk
+  now without its contents:
+  - `{ _tag: "present", version }` for an editable file, whose version matches
+    the one `projects.readFile` returns for it;
+  - `{ _tag: "missing" }` when nothing exists at the path, including a missing
+    parent;
+  - `{ _tag: "unreadable", failure, version }` for a file that became binary
+    (`binary_file`, a NUL byte in the first 1 MB, as `readFile` decides) or
+    larger than the 1 MB read limit (`file_too_large`). Its version hashes the
+    whole file, streamed, so a save can still be guarded against exactly that
+    state.
+
+  Failures use `ProjectReadFileError`. A path that is not a regular file, such
+  as a directory or a named pipe put in its place, fails with `path_not_file`
+  before it is opened, because opening a pipe with no writer blocks. The client
+  polls this method for the one file it shows, every 2 s while the window is
+  visible, and at once on window focus, on visibility, on a new connection
+  generation, when a turn ends, and after a refused save. Each poll
+  costs one bounded read and hash on the server, where the workspace lives, so
+  WSL and SSH workspaces are covered by the same path.
+
+- **`projects.writeFileIfUnchanged`** takes `projects.writeFile`'s input plus a
+  required `precondition`: `{ _tag: "version", version }` or
+  `{ _tag: "missing" }`. It is a separate method rather than an optional field
+  on `projects.writeFile`, because an older server's `WriteInput` ignores
+  unknown fields and would write anyway. It hashes the current file whole and refuses with a
+  `ProjectWriteFileError` whose `failure` is `file_changed_on_disk` (the file
+  differs from the version, or exists when `missing` was required) or
+  `file_missing_on_disk` (a save based on an existing file finds none). A
+  refusal leaves the file untouched. Success returns
+  `{ relativePath, version }`, the hash of the bytes written, which is the
+  client's next base. The write
+  stays in place and creates missing parents, preserving `projects.writeFile`'s
+  symlink-target behaviour.
+
+The check and the write run under a lock keyed by the canonical target path,
+which `projects.writeFile` also takes, so two BiBCode clients cannot both pass
+the check. The key ignores case: an existing path canonicalizes to its on-disk
+spelling, but a missing one keeps the caller's, and on a case-insensitive
+volume two spellings of a file being recreated name one file. On a
+case-sensitive volume, writes to names that differ only in case merely wait for
+each other. A writer outside BiBCode can still land in the milliseconds between
+the check and the write; closing that window would need locking that other
+tools do not honour.
+
+Client reconciliation is described in the
+[approved design](../plans/2026-10-23-open-file-disk-changes-design.md): the
+editing session takes its disk base, and with it the capability, from a server
+read or a guarded save's committed version, never from an optimistic draft
+such as a ticked Markdown task that is not saved yet; it keeps that base apart
+from the document, fences poll
+results by a generation bumped on every save, reloads a clean document as one
+Pierre undo step (`Editor.applyEdits(edits, true, true)`, a dependency patch on
+`@pierre/diffs` 1.3.6), and blocks every write while a conflict stands. Neither
+method waits on anything outside the server, so neither is
+`is_long_running` in the profiler's latency classifier.
 
 Moving an entry is a rename. The file tree's drag-and-drop move sends
 `projects.renameEntry` with the source and destination as workspace-relative

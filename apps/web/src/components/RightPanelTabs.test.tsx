@@ -408,6 +408,24 @@ describe("RightPanelTabs mounted interactions", () => {
     expect(document.querySelector('[aria-label="Close Diff"] span')).not.toBeNull();
   });
 
+  it("marks a file tab whose edits conflict with the disk, even in the background", async () => {
+    await mount(
+      <RightPanelTabs
+        {...tabsProps({
+          activeSurfaceId: previewSurface.id,
+          conflictSurfaceIds: new Set([fileSurface.id]),
+        })}
+      />,
+    );
+
+    const close = document.querySelector('[aria-label="Close main.ts"]');
+    expect(close?.querySelector("[data-file-disk-conflict]")).not.toBeNull();
+    expect(document.body.textContent).toContain("(changed on disk)");
+    expect(
+      document.querySelector('[aria-label="Close Project docs"] [data-file-disk-conflict]'),
+    ).toBeNull();
+  });
+
   it("titles pull request tabs by the host's number format with the request icon", async () => {
     await mount(
       <RightPanelTabs

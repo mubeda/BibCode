@@ -351,6 +351,14 @@ fn every_public_mutation_boundary_is_classified_centrally() {
         rpc_mutability("projects.writeFile"),
         RpcMutability::Mutation
     );
+    assert_eq!(
+        rpc_mutability("projects.writeFileIfUnchanged"),
+        RpcMutability::Mutation
+    );
+    assert_eq!(
+        rpc_mutability("projects.getFileVersion"),
+        RpcMutability::Read
+    );
     assert_eq!(rpc_mutability("terminal.write"), RpcMutability::Mutation);
     assert_eq!(
         rpc_mutability("activity.cancelSubtree"),

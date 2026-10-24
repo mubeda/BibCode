@@ -197,6 +197,34 @@ describe("project file query hooks", () => {
     });
   });
 
+  it("takes the disk state from the server read, not from a draft without a version", () => {
+    const serverData = {
+      relativePath: "README.md",
+      contents: "- [ ] task\n",
+      byteLength: 11,
+      truncated: false,
+      version: "v1",
+    };
+    const toggled = { ...serverData, contents: "- [x] task\n", version: undefined };
+    harness.atomValues.set(fileKey, AsyncResult.success(serverData));
+    harness.atomValues.set(optimisticKey, { data: toggled });
+
+    // The draft is shown, but only a read (or a guarded save) can say what the disk holds.
+    expect(useProjectFileQuery(environmentId, "/repo", "README.md")).toMatchObject({
+      data: toggled,
+      disk: serverData,
+    });
+
+    // A guarded save's draft carries the version it committed: that is the disk state.
+    const committed = { ...toggled, version: "v2" };
+    harness.atomValues.set(optimisticKey, { data: committed });
+    expect(useProjectFileQuery(environmentId, "/repo", "README.md").disk).toBe(committed);
+
+    harness.atomValues.set(fileKey, AsyncResult.initial(true));
+    harness.atomValues.set(optimisticKey, { data: toggled });
+    expect(useProjectFileQuery(environmentId, "/repo", "README.md").disk).toBeNull();
+  });
+
   it("falls back to server data and ignores optimistic state for a missing path", () => {
     const data = {
       relativePath: "",

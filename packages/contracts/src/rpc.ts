@@ -204,6 +204,8 @@ import {
   ProjectDuplicateEntryInput,
   ProjectDuplicateEntryResult,
   ProjectEntriesChangedEvent,
+  ProjectFileVersion,
+  ProjectGetFileVersionInput,
   ProjectListEntriesError,
   ProjectListEntriesInput,
   ProjectListEntriesResult,
@@ -218,6 +220,8 @@ import {
   ProjectSearchEntriesResult,
   ProjectSubscribeEntriesInput,
   ProjectWriteFileError,
+  ProjectWriteFileIfUnchangedInput,
+  ProjectWriteFileIfUnchangedResult,
   ProjectWriteFileInput,
   ProjectWriteFileResult,
 } from "./project.ts";
@@ -446,8 +450,10 @@ export const WS_METHODS = {
   projectsListEntries: "projects.listEntries",
   projectsSubscribeEntries: "subscribeProjectEntries",
   projectsReadFile: "projects.readFile",
+  projectsGetFileVersion: "projects.getFileVersion",
   projectsSearchEntries: "projects.searchEntries",
   projectsWriteFile: "projects.writeFile",
+  projectsWriteFileIfUnchanged: "projects.writeFileIfUnchanged",
   projectsCreateEntry: "projects.createEntry",
   projectsRenameEntry: "projects.renameEntry",
   projectsDeleteEntry: "projects.deleteEntry",
@@ -894,9 +900,35 @@ export const WsProjectsReadFileRpc = Rpc.make(WS_METHODS.projectsReadFile, {
   ]),
 });
 
+export const WsProjectsGetFileVersionRpc = Rpc.make(WS_METHODS.projectsGetFileVersion, {
+  payload: ProjectGetFileVersionInput,
+  success: ProjectFileVersion,
+  error: Schema.Union([
+    ProjectReadFileError,
+    WorkspaceUnavailableError,
+    WorkspaceIdentityError,
+    EnvironmentRpcError,
+  ]),
+});
+
 export const WsProjectsWriteFileRpc = Rpc.make(WS_METHODS.projectsWriteFile, {
   payload: ProjectWriteFileInput,
   success: ProjectWriteFileResult,
+  error: Schema.Union([
+    ProjectWriteFileError,
+    WorkspaceUnavailableError,
+    WorkspaceIdentityError,
+    EnvironmentRpcError,
+  ]),
+});
+
+/**
+ * Writes only when the file on disk is still the state the contents were based on; otherwise it
+ * fails with `file_changed_on_disk` or `file_missing_on_disk` and leaves the file untouched.
+ */
+export const WsProjectsWriteFileIfUnchangedRpc = Rpc.make(WS_METHODS.projectsWriteFileIfUnchanged, {
+  payload: ProjectWriteFileIfUnchangedInput,
+  success: ProjectWriteFileIfUnchangedResult,
   error: Schema.Union([
     ProjectWriteFileError,
     WorkspaceUnavailableError,
@@ -1903,8 +1935,10 @@ export const WsRpcGroup = RpcGroup.make(
   WsProjectsListEntriesRpc,
   WsProjectsSubscribeEntriesRpc,
   WsProjectsReadFileRpc,
+  WsProjectsGetFileVersionRpc,
   WsProjectsSearchEntriesRpc,
   WsProjectsWriteFileRpc,
+  WsProjectsWriteFileIfUnchangedRpc,
   WsProjectsCreateEntryRpc,
   WsProjectsRenameEntryRpc,
   WsProjectsDeleteEntryRpc,

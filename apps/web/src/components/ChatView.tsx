@@ -394,6 +394,25 @@ const PullRequestPanelSurface = lazy(() =>
   })),
 );
 const EMPTY_PENDING_FILE_SURFACE_IDS: ReadonlySet<string> = new Set();
+
+/** Adds or removes one file surface id in a project's set, keeping identities when unchanged. */
+function setProjectFileSurfaceFlag(
+  currentByProject: ReadonlyMap<string, ReadonlySet<string>>,
+  projectKey: string,
+  relativePath: string,
+  flagged: boolean,
+): ReadonlyMap<string, ReadonlySet<string>> {
+  const current = currentByProject.get(projectKey) ?? EMPTY_PENDING_FILE_SURFACE_IDS;
+  const surfaceId = `file:${relativePath}`;
+  if (current.has(surfaceId) === flagged) return currentByProject;
+  const next = new Set(current);
+  if (flagged) next.add(surfaceId);
+  else next.delete(surfaceId);
+  const nextByProject = new Map(currentByProject);
+  if (next.size === 0) nextByProject.delete(projectKey);
+  else nextByProject.set(projectKey, next);
+  return nextByProject;
+}
 const TYPE_TO_FOCUS_EDITABLE_SELECTOR = [
   "input",
   "textarea",
@@ -2194,21 +2213,30 @@ function ChatViewContent(props: ChatViewProps) {
   const handleFilePendingChange = useCallback(
     (relativePath: string, pending: boolean) => {
       if (!activeProjectKey) return;
-      setPendingFileSurfaceIdsByProject((currentByProject) => {
-        const current = currentByProject.get(activeProjectKey) ?? EMPTY_PENDING_FILE_SURFACE_IDS;
-        const surfaceId = `file:${relativePath}`;
-        if (current.has(surfaceId) === pending) return currentByProject;
-        const next = new Set(current);
-        if (pending) next.add(surfaceId);
-        else next.delete(surfaceId);
-        const nextByProject = new Map(currentByProject);
-        if (next.size === 0) nextByProject.delete(activeProjectKey);
-        else nextByProject.set(activeProjectKey, next);
-        return nextByProject;
-      });
+      setPendingFileSurfaceIdsByProject((currentByProject) =>
+        setProjectFileSurfaceFlag(currentByProject, activeProjectKey, relativePath, pending),
+      );
     },
     [activeProjectKey],
   );
+  // File tabs whose edits conflict with a newer state on disk, marked even in the background.
+  const [conflictFileSurfaceIdsByProject, setConflictFileSurfaceIdsByProject] = useState<
+    ReadonlyMap<string, ReadonlySet<string>>
+  >(() => new Map());
+  const conflictFileSurfaceIds = activeProjectKey
+    ? (conflictFileSurfaceIdsByProject.get(activeProjectKey) ?? EMPTY_PENDING_FILE_SURFACE_IDS)
+    : EMPTY_PENDING_FILE_SURFACE_IDS;
+  const handleFileConflictChange = useCallback(
+    (relativePath: string, conflicted: boolean) => {
+      if (!activeProjectKey) return;
+      setConflictFileSurfaceIdsByProject((currentByProject) =>
+        setProjectFileSurfaceFlag(currentByProject, activeProjectKey, relativePath, conflicted),
+      );
+    },
+    [activeProjectKey],
+  );
+  // A settled turn often edited files: check the shown file's disk version at once.
+  const fileDiskCheckSignal = latestTurnSettled ? (activeLatestTurn?.turnId ?? null) : null;
   const configuredPreviewUrls = useMemo(
     () => getConfiguredPreviewUrls(activeProject?.scripts),
     [activeProject?.scripts],
@@ -6877,8 +6905,10 @@ function ChatViewContent(props: ChatViewProps) {
           revealRequestId={activeFileSurface?.revealRequestId ?? 0}
           onOpenFile={openFileSurface}
           onPendingChange={handleFilePendingChange}
+          onConflictChange={handleFileConflictChange}
           editingSessions={fileEditingSessions}
           workspaceUnavailable={workspaceUnavailable}
+          diskCheckSignal={fileDiskCheckSignal}
         />
       </Suspense>
     ) : null
@@ -7220,6 +7250,7 @@ function ChatViewContent(props: ChatViewProps) {
           surfaces={renderedRightPanelSurfaces}
           activeSurfaceId={activeRightPanelSurface?.id ?? null}
           pendingSurfaceIds={pendingFileSurfaceIds}
+          conflictSurfaceIds={conflictFileSurfaceIds}
           previewSessions={activePreviewState.sessions}
           previewDesktopByTabId={activePreviewState.desktopByTabId}
           terminalLabelsById={activeTerminalLabelsById}
@@ -7252,6 +7283,7 @@ function ChatViewContent(props: ChatViewProps) {
             surfaces={renderedRightPanelSurfaces}
             activeSurfaceId={activeRightPanelSurface?.id ?? null}
             pendingSurfaceIds={pendingFileSurfaceIds}
+            conflictSurfaceIds={conflictFileSurfaceIds}
             previewSessions={activePreviewState.sessions}
             previewDesktopByTabId={activePreviewState.desktopByTabId}
             terminalLabelsById={activeTerminalLabelsById}
