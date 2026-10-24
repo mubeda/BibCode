@@ -2413,6 +2413,119 @@ mod tests {
         assert!(!watched.polling());
     }
 
+    /// The catalog's entry for `device_id` now.
+    fn shown(
+        manager: &crate::device::DeviceManager,
+        device_id: &str,
+    ) -> crate::device::catalog::DeviceSnapshot {
+        manager
+            .catalog()
+            .borrow()
+            .devices
+            .iter()
+            .find(|device| device.device_id == device_id)
+            .cloned()
+            .expect("device in catalog")
+    }
+
+    /// Lets a held listing deliver `udid` as `seen`, the state it had when the listing
+    /// began, and then puts `udid` back as it now is, before the next listing.
+    async fn deliver_held_listing(sim: &FakeXcrun, udid: &str, seen: &str, now: &str) {
+        sim.set_state(udid, seen);
+        sim.release_listing().await;
+        // The poll applies the listing as soon as `simctl` exits.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        sim.set_state(udid, now);
+        // Longer than the manager's exit check, so an outside reason would have shown.
+        tokio::time::sleep(super::STATE_POLL_INTERVAL - std::time::Duration::from_millis(500))
+            .await;
+    }
+
+    /// Two running simulators; the second keeps the shared poll, and its held listing, alive
+    /// while the first stops.
+    async fn two_ready_simulators(
+        sim: &FakeXcrun,
+    ) -> (
+        crate::device::DeviceManager,
+        tokio::sync::watch::Sender<bool>,
+        String,
+        String,
+    ) {
+        let (manager, enabled) = ios_manager(sim);
+        let first = manager.open(Platform::Ios, "UDID-1", None).await.unwrap();
+        let second = manager.open(Platform::Ios, "UDID-2", None).await.unwrap();
+        wait_state(&manager, &first, DeviceState::Ready).await;
+        wait_state(&manager, &second, DeviceState::Ready).await;
+        (manager, enabled, first, second)
+    }
+
+    fn two_simulators() -> FakeXcrun {
+        FakeXcrun::new()
+            .device("UDID-1", "iPhone 17 Pro", "iOS 27.0")
+            .device("UDID-2", "iPhone 17", "iOS 27.0")
+            .write()
+    }
+
+    /// Through the real poll: a listing that began while B was still shut down is delivered
+    /// once B runs. B was not registered when it began, so it stays running.
+    #[tokio::test]
+    async fn a_held_listing_begun_before_a_simulator_booted_leaves_it_running() {
+        let sim = two_simulators();
+        let (manager, _enabled) = ios_manager(&sim);
+        let a = manager.open(Platform::Ios, "UDID-1", None).await.unwrap();
+        wait_state(&manager, &a, DeviceState::Ready).await;
+        sim.hold_next_listing();
+        sim.listing_held().await;
+        let b = manager.open(Platform::Ios, "UDID-2", None).await.unwrap();
+        wait_state(&manager, &b, DeviceState::Ready).await;
+        deliver_held_listing(&sim, "UDID-2", "Shutdown", "Booted").await;
+        let b = shown(&manager, &b);
+        assert_eq!((b.state, b.failure), (DeviceState::Ready, None));
+        assert_eq!(shown(&manager, &a).state, DeviceState::Ready);
+        manager.shutdown().await;
+    }
+
+    /// Through the real poll: a listing in flight while A stops is delivered after A's stop
+    /// unregistered it and shut it down, so A ends stopped with no outside reason.
+    #[tokio::test]
+    async fn a_held_listing_delivered_after_a_stop_gives_it_no_outside_reason() {
+        let sim = two_simulators();
+        let (manager, _enabled, a, b) = two_ready_simulators(&sim).await;
+        sim.hold_next_listing();
+        sim.listing_held().await;
+        manager.close(&a).await.unwrap();
+        wait_state(&manager, &a, DeviceState::Stopped).await;
+        deliver_held_listing(&sim, "UDID-1", "Shutdown", "Shutdown").await;
+        let a = shown(&manager, &a);
+        assert_eq!((a.state, a.failure), (DeviceState::Stopped, None));
+        assert_eq!(shown(&manager, &b).state, DeviceState::Ready);
+        manager.shutdown().await;
+    }
+
+    /// Through the real poll: a listing that began before A was stopped and opened again,
+    /// and saw A shut down in between, is delivered to the new A's registration, a new
+    /// generation, which it leaves running.
+    #[tokio::test]
+    async fn a_held_listing_from_before_a_reopen_leaves_the_new_simulator_running() {
+        let sim = two_simulators();
+        let (manager, _enabled, a, b) = two_ready_simulators(&sim).await;
+        sim.hold_next_listing();
+        sim.listing_held().await;
+        manager.close(&a).await.unwrap();
+        wait_state(&manager, &a, DeviceState::Stopped).await;
+        let reopened = manager.open(Platform::Ios, "UDID-1", None).await.unwrap();
+        assert_ne!(reopened, a);
+        wait_state(&manager, &reopened, DeviceState::Ready).await;
+        deliver_held_listing(&sim, "UDID-1", "Shutdown", "Booted").await;
+        let reopened = shown(&manager, &reopened);
+        assert_eq!(
+            (reopened.state, reopened.failure),
+            (DeviceState::Ready, None)
+        );
+        assert_eq!(shown(&manager, &b).state, DeviceState::Ready);
+        manager.shutdown().await;
+    }
+
     /// `simctl list` calls so far; the state poll lists every simulator at once.
     fn listings(sim: &FakeXcrun) -> usize {
         sim.calls()
