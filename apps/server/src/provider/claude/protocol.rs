@@ -42,6 +42,9 @@ pub struct StreamMessageStart {
     pub id: String,
 }
 
+/// A streamed content block. Thinking, redacted thinking and text blocks keep no payload: their
+/// content arrives as deltas, and a redacted block's data is never shown. A block type Claude
+/// adds later decodes as `Other` instead of dropping the whole frame.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
@@ -51,14 +54,29 @@ pub enum ContentBlock {
         #[serde(default)]
         input: Value,
     },
+    Thinking {},
+    RedactedThinking {},
+    Text {},
+    #[serde(other)]
+    Other,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlockDelta {
-    ThinkingDelta { thinking: String },
-    TextDelta { text: String },
-    InputJsonDelta { partial_json: String },
+    ThinkingDelta {
+        thinking: String,
+    },
+    TextDelta {
+        text: String,
+    },
+    InputJsonDelta {
+        partial_json: String,
+    },
+    /// Ends a thinking block's content; its signature is never used.
+    SignatureDelta {},
+    #[serde(other)]
+    Other,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -113,6 +131,10 @@ pub enum AssistantContent {
     Text {
         text: String,
     },
+    /// Thinking, redacted thinking, and any block type Claude adds later. The streamed deltas
+    /// already carried the thinking, so the complete frame keeps none of it.
+    #[serde(other)]
+    Other,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

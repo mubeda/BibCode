@@ -215,6 +215,9 @@ struct RuntimeInner {
     explicit_close: Mutex<bool>,
     /// The provider thread's `historyMode`; only a `paginated` thread can be rewound.
     history_mode: Mutex<Option<String>>,
+    /// The last `summaryIndex` streamed per reasoning item, until the item completes: a new
+    /// part starts after a blank line, the separator its completed summary uses.
+    reasoning_summary_parts: Mutex<HashMap<String, u64>>,
     activity: Mutex<RuntimeActivityState>,
     mcp_status: McpStatusHandle,
     mcp_opening: Mutex<Option<McpOpenReservation>>,
@@ -781,6 +784,7 @@ impl CodexSessionRuntime {
             reconciliation_cancellation: reconciliation_cancellation.clone(),
             explicit_close: Mutex::new(false),
             history_mode: Mutex::new(None),
+            reasoning_summary_parts: Mutex::new(HashMap::new()),
             mcp_status: mcp_status.clone(),
             mcp_opening: Mutex::new(Some(mcp_opening)),
             mcp_status_actor_task: StdMutex::new(None),
@@ -2688,6 +2692,46 @@ impl CodexSessionRuntime {
                 )
                 .await;
             }
+            // Reasoning summaries become chat reasoning (#173). Raw reasoning
+            // (`item/reasoning/textDelta`, an item's `content`) is never projected.
+            "item/reasoning/summaryTextDelta" => {
+                let item_id = params
+                    .get("itemId")
+                    .and_then(Value::as_str)
+                    .filter(|item_id| !item_id.is_empty())
+                    .map(str::to_owned);
+                let summary_index = params
+                    .get("summaryIndex")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let mut delta = params
+                    .get("delta")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                if let Some(item_id) = &item_id {
+                    let mut parts = self.inner.reasoning_summary_parts.lock().await;
+                    let previous = parts.insert(item_id.clone(), summary_index);
+                    if previous.is_some_and(|previous| summary_index > previous) {
+                        delta.insert_str(0, "\n\n");
+                    }
+                }
+                self.emit_with_item_id(
+                    "content.delta",
+                    params
+                        .get("turnId")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    item_id,
+                    None,
+                    json!({
+                        "streamKind": "reasoning_summary_text",
+                        "summaryIndex": summary_index,
+                        "delta": delta,
+                    }),
+                )
+                .await;
+            }
             "item/started" => {
                 if let Some((turn_id, payload)) = command_item_event_payload(&params, false) {
                     self.emit("item.started", Some(turn_id), None, payload)
@@ -2712,6 +2756,41 @@ impl CodexSessionRuntime {
                         Some(item_id),
                         None,
                         json!({}),
+                    )
+                    .await;
+                } else if params.pointer("/item/type").and_then(Value::as_str) == Some("reasoning")
+                {
+                    let item_id = params
+                        .pointer("/item/id")
+                        .and_then(Value::as_str)
+                        .filter(|item_id| !item_id.is_empty())
+                        .map(str::to_owned);
+                    if let Some(item_id) = &item_id {
+                        self.inner
+                            .reasoning_summary_parts
+                            .lock()
+                            .await
+                            .remove(item_id);
+                    }
+                    // The completed summary is authoritative over what streamed.
+                    let mut payload = json!({ "itemType": "reasoning" });
+                    if let Some(text) = params
+                        .pointer("/item/summary")
+                        .and_then(Value::as_array)
+                        .map(|parts| codex_reasoning_summary_text(parts))
+                        .filter(|text| !text.is_empty())
+                    {
+                        payload["text"] = json!(text);
+                    }
+                    self.emit_with_item_id(
+                        "item.completed",
+                        params
+                            .get("turnId")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                        item_id,
+                        None,
+                        payload,
                     )
                     .await;
                 } else if let Some((turn_id, payload)) = command_item_event_payload(&params, true) {
@@ -3800,6 +3879,19 @@ fn request_type(kind: PendingRequestKind) -> &'static str {
         PendingRequestKind::FileChangeApproval => "file_change_approval",
         PendingRequestKind::UserInput => "tool_user_input",
     }
+}
+
+/// A reasoning item's summary parts joined by blank lines, the separator its streamed parts use.
+fn codex_reasoning_summary_text(parts: &[Value]) -> String {
+    parts
+        .iter()
+        .filter_map(|part| {
+            part.as_str()
+                .or_else(|| part.get("text").and_then(Value::as_str))
+        })
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 fn command_item_event_payload(params: &Value, completed: bool) -> Option<(String, Value)> {

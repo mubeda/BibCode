@@ -1587,6 +1587,9 @@ pub struct ClaudeProviderRuntime {
     turn_input_cancellation: CancellationToken,
     delivery_acknowledgement_cancellation: CancellationToken,
     active_assistant_item_id: Option<String>,
+    /// Root thinking blocks still open, by the root message that holds them and their index. A
+    /// subagent's blocks share the root's indexes, so the message identity tells them apart.
+    open_reasoning_blocks: BTreeSet<(Option<String>, u64)>,
     pending_approvals: BTreeMap<String, PendingApproval>,
     pending_user_inputs: BTreeMap<String, PendingUserInput>,
     in_flight_tools: BTreeMap<String, InFlightTool>,
@@ -1641,6 +1644,7 @@ impl ClaudeProviderRuntime {
             turn_input_cancellation: CancellationToken::new(),
             delivery_acknowledgement_cancellation: CancellationToken::new(),
             active_assistant_item_id: None,
+            open_reasoning_blocks: BTreeSet::new(),
             pending_approvals: BTreeMap::new(),
             pending_user_inputs: BTreeMap::new(),
             in_flight_tools: BTreeMap::new(),
@@ -1748,6 +1752,7 @@ impl ClaudeProviderRuntime {
         self.turn_input_cancellation = CancellationToken::new();
         self.token_usage.start_turn();
         self.active_assistant_item_id = None;
+        self.open_reasoning_blocks.clear();
         // Scoped to the turn: a retry observed two turns ago must not be
         // reported as the cause of this one's failure.
         self.last_api_error = None;
@@ -2603,19 +2608,47 @@ impl ClaudeProviderRuntime {
                     }),
                 )]
             }
+            // Reasoning belongs to the root conversation only: a subagent frame never starts,
+            // extends or completes an entry. Omitted display streams one empty delta per block,
+            // which says nothing, so it emits nothing.
+            StreamEvent::ContentBlockStart {
+                index,
+                content_block: ContentBlock::Thinking {},
+            } => {
+                if parent_tool_use_id.is_none() {
+                    self.open_reasoning_blocks
+                        .insert((self.active_assistant_item_id.clone(), index));
+                }
+                Vec::new()
+            }
+            StreamEvent::ContentBlockStart {
+                content_block:
+                    ContentBlock::RedactedThinking {} | ContentBlock::Text {} | ContentBlock::Other,
+                ..
+            } => Vec::new(),
             StreamEvent::ContentBlockDelta {
-                index: _,
+                index,
                 delta: ContentBlockDelta::ThinkingDelta { thinking },
-            } => vec![self.event(
-                "content.delta",
-                self.current_turn_id.clone(),
-                None,
-                None,
-                json!({
-                    "streamKind": "reasoning_text",
-                    "delta": thinking,
-                }),
-            )],
+            } => {
+                if parent_tool_use_id.is_some() || thinking.is_empty() {
+                    return Vec::new();
+                }
+                vec![self.item_event(
+                    "content.delta",
+                    self.current_turn_id.clone(),
+                    None,
+                    None,
+                    json!({
+                        "streamKind": "reasoning_text",
+                        "delta": thinking,
+                    }),
+                    self.reasoning_item_id(index),
+                )]
+            }
+            StreamEvent::ContentBlockDelta {
+                delta: ContentBlockDelta::SignatureDelta {} | ContentBlockDelta::Other,
+                ..
+            } => Vec::new(),
             StreamEvent::ContentBlockDelta {
                 index: _,
                 delta: ContentBlockDelta::TextDelta { text },
@@ -2645,6 +2678,20 @@ impl ClaudeProviderRuntime {
                 Vec::new()
             }
             StreamEvent::ContentBlockStop { index } => {
+                if parent_tool_use_id.is_none()
+                    && self
+                        .open_reasoning_blocks
+                        .remove(&(self.active_assistant_item_id.clone(), index))
+                {
+                    return vec![self.item_event(
+                        "item.completed",
+                        self.current_turn_id.clone(),
+                        None,
+                        None,
+                        json!({ "itemType": "reasoning" }),
+                        self.reasoning_item_id(index),
+                    )];
+                }
                 let Some(tool) = self.find_streaming_tool_mut(parent_tool_use_id.as_deref(), index)
                 else {
                     return Vec::new();
@@ -2848,6 +2895,13 @@ impl ClaudeProviderRuntime {
             result,
             tool.stopped && !tool.completed,
         ))
+    }
+
+    /// The provider item of the root thinking block at `index`: one reasoning entry per block.
+    fn reasoning_item_id(&self, index: u64) -> Option<String> {
+        self.active_assistant_item_id
+            .as_ref()
+            .map(|message_id| format!("{message_id}:{index}"))
     }
 
     /// The tool block still streaming at `index` on the stream of `parent_tool_use_id`.
@@ -3187,7 +3241,10 @@ fn claude_message_route(message: &ClaudeMessage) -> ClaudeMessageRoute {
                 StreamEvent::MessageStart { .. }
                 | StreamEvent::ContentBlockDelta {
                     delta:
-                        ContentBlockDelta::ThinkingDelta { .. } | ContentBlockDelta::TextDelta { .. },
+                        ContentBlockDelta::ThinkingDelta { .. }
+                        | ContentBlockDelta::TextDelta { .. }
+                        | ContentBlockDelta::SignatureDelta {}
+                        | ContentBlockDelta::Other,
                     ..
                 } => ClaudeMessageRoute::SuppressedChildText,
             }
