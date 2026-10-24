@@ -105,6 +105,12 @@ describe("execution environment contracts", () => {
     expect(decodeTerminalCapabilities({}).vcsCloneReattach).toBe(false);
     expect(decodeTerminalCapabilities({ vcsCloneReattach: true }).vcsCloneReattach).toBe(true);
   });
+  it("defaults device catalog refresh off for older servers and preserves advertised support", () => {
+    expect(decodeTerminalCapabilities({}).deviceCatalogRefresh).toBe(false);
+    expect(decodeTerminalCapabilities({ deviceCatalogRefresh: true }).deviceCatalogRefresh).toBe(
+      true,
+    );
+  });
   it("pins the remote protocol window constants", () => {
     expect(REMOTE_PROTOCOL_VERSION).toBe(1);
     expect(MIN_COMPATIBLE_REMOTE_PROTOCOL).toBe(1);

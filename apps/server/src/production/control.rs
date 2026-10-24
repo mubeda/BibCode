@@ -2605,6 +2605,7 @@ fn environment_descriptor(config: &ServerConfig, activity_protocol_registered: b
             "attachmentStaging": true,
             "profiler": true,
             "devicePreviews": true,
+            "deviceCatalogRefresh": true,
             "previewTunnels": true,
         },
     })
@@ -6651,6 +6652,8 @@ mod tests {
         assert_eq!(descriptor["capabilities"]["profiler"], true);
         // Clients show the Device previews setting and pane only on servers that advertise it.
         assert_eq!(descriptor["capabilities"]["devicePreviews"], true);
+        // A client offers Refresh devices only when the server has `device.refreshCatalog` (#169).
+        assert_eq!(descriptor["capabilities"]["deviceCatalogRefresh"], true);
     }
 
     #[test]

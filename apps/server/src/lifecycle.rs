@@ -71,6 +71,7 @@ fn connect_environment_descriptor(config: &ServerConfig) -> serde_json::Value {
             "attachmentStaging": true,
             "profiler": true,
             "devicePreviews": true,
+            "deviceCatalogRefresh": true,
             "previewTunnels": true,
         },
     })
@@ -1203,6 +1204,8 @@ mod tests {
         assert_eq!(descriptor["capabilities"]["attachmentStaging"], true);
         assert_eq!(descriptor["capabilities"]["profiler"], true);
         assert_eq!(descriptor["capabilities"]["devicePreviews"], true);
+        // A client offers Refresh devices only when the server has `device.refreshCatalog` (#169).
+        assert_eq!(descriptor["capabilities"]["deviceCatalogRefresh"], true);
         assert_eq!(
             descriptor["remoteUpdateSupport"],
             serde_json::json!({
