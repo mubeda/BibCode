@@ -1435,6 +1435,62 @@ impl Repositories {
         .await
     }
 
+    /// A thread's reasoning entries in the order its timeline shows them.
+    pub async fn list_reasoning_by_thread(
+        &self,
+        thread_id: String,
+    ) -> Result<Vec<ProjectionThreadReasoning>> {
+        self.database
+            .call(move |connection| {
+                collect(
+                    connection,
+                    &format!("{REASONING_SELECT} WHERE thread_id = ? ORDER BY created_at ASC, reasoning_id ASC"),
+                    [thread_id],
+                    decode_reasoning,
+                )
+            })
+            .await
+    }
+
+    /// Every reasoning entry still streaming, on any thread: what the settlement sweeps close.
+    pub async fn list_streaming_reasoning(&self) -> Result<Vec<ProjectionThreadReasoning>> {
+        self.database
+            .call(move |connection| {
+                collect(
+                    connection,
+                    &format!("{REASONING_SELECT} WHERE is_streaming = 1 ORDER BY thread_id ASC, created_at ASC, reasoning_id ASC"),
+                    [],
+                    decode_reasoning,
+                )
+            })
+            .await
+    }
+
+    /// The reasoning entries of one thread still streaming.
+    pub async fn list_streaming_reasoning_by_thread(
+        &self,
+        thread_id: String,
+    ) -> Result<Vec<ProjectionThreadReasoning>> {
+        self.database
+            .call(move |connection| {
+                collect(
+                    connection,
+                    &format!("{REASONING_SELECT} WHERE thread_id = ? AND is_streaming = 1 ORDER BY created_at ASC, reasoning_id ASC"),
+                    [thread_id],
+                    decode_reasoning,
+                )
+            })
+            .await
+    }
+
+    pub async fn delete_reasoning_by_thread(&self, thread_id: String) -> Result<()> {
+        self.delete(
+            "DELETE FROM projection_thread_reasoning WHERE thread_id = ?",
+            thread_id,
+        )
+        .await
+    }
+
     pub async fn replace_pending_turn_start(&self, row: ProjectionPendingTurnStart) -> Result<()> {
         self.database.call(move |connection| { let transaction = connection.transaction()?; transaction.execute("DELETE FROM projection_turns WHERE thread_id = ? AND turn_id IS NULL AND state = 'pending' AND checkpoint_turn_count IS NULL", [&row.thread_id])?; transaction.execute("INSERT INTO projection_turns (thread_id, turn_id, pending_message_id, source_proposed_plan_thread_id, source_proposed_plan_id, assistant_message_id, state, requested_at, started_at, completed_at, checkpoint_turn_count, checkpoint_ref, checkpoint_status, checkpoint_files_json) VALUES (?, NULL, ?, ?, ?, NULL, 'pending', ?, NULL, NULL, NULL, NULL, NULL, '[]')", params![row.thread_id,row.message_id,row.source_proposed_plan_thread_id,row.source_proposed_plan_id,row.requested_at])?; transaction.commit()?; Ok(()) }).await
     }
@@ -2428,6 +2484,34 @@ pub struct ProjectionThreadProposedPlan {
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
 }
+/// One block of provider reasoning (a Claude thinking block, a Codex reasoning item). Its text
+/// is provider output and never leaves the projection through logs or traces.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ProjectionThreadReasoning {
+    pub reasoning_id: String,
+    pub thread_id: String,
+    pub turn_id: Option<String>,
+    pub text: String,
+    pub is_streaming: bool,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
+}
+
+impl std::fmt::Debug for ProjectionThreadReasoning {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProjectionThreadReasoning")
+            .field("reasoning_id", &self.reasoning_id)
+            .field("thread_id", &self.thread_id)
+            .field("turn_id", &self.turn_id)
+            .field("text_len", &self.text.len())
+            .field("is_streaming", &self.is_streaming)
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .finish()
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProjectionTurn {
     pub thread_id: String,
@@ -3093,6 +3177,19 @@ fn decode_proposed_plan(row: &Row<'_>) -> rusqlite::Result<ProjectionThreadPropo
         implementation_thread_id: row.get(5)?,
         created_at: row.get(6)?,
         updated_at: row.get(7)?,
+    })
+}
+const REASONING_SELECT: &str = "SELECT reasoning_id, thread_id, turn_id, text, is_streaming, created_at, updated_at FROM projection_thread_reasoning";
+
+fn decode_reasoning(row: &Row<'_>) -> rusqlite::Result<ProjectionThreadReasoning> {
+    Ok(ProjectionThreadReasoning {
+        reasoning_id: row.get(0)?,
+        thread_id: row.get(1)?,
+        turn_id: row.get(2)?,
+        text: row.get(3)?,
+        is_streaming: row.get(4)?,
+        created_at: row.get(5)?,
+        updated_at: row.get(6)?,
     })
 }
 fn decode_turn(row: &Row<'_>) -> rusqlite::Result<ProjectionTurn> {
