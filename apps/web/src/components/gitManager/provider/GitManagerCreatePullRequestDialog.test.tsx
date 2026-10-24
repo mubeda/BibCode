@@ -697,6 +697,37 @@ describe("GitManagerCreatePullRequestDialog", () => {
     });
   });
 
+  it("names a failed commit in a combined action instead of the request (#174)", async () => {
+    h.status = status({ hasWorkingTreeChanges: true });
+    h.currentSourceRemote = false;
+    await renderDialog(vi.fn(), vi.fn(), null, {
+      commitInput: { commitMessage: "Reviewed commit", commitStagedIndexAsIs: true },
+    });
+    await chooseTarget("release/next");
+    h.script = [
+      {
+        outcome: "failure",
+        message: "Source control action 'commit_push_pr' failed during commit.",
+        events: [
+          { ...base, kind: "action_started", phases: ["commit", "push", "pr"] },
+          { ...base, kind: "phase_started", phase: "commit", label: "Committing" },
+          {
+            ...base,
+            kind: "action_failed",
+            phase: "commit",
+            message: "fatal: pre-commit hook rejected the commit",
+          },
+        ],
+      },
+    ];
+    await act(async () => button("Commit, publish and create pull request").click());
+
+    expect(text("create-pr-status")).toBe(
+      "Commit failed: fatal: pre-commit hook rejected the commit",
+    );
+    expect(button("Retry").disabled).toBe(false);
+  });
+
   it("keeps the review content in one padded panel with a separate publish callout", async () => {
     await renderDialog();
 

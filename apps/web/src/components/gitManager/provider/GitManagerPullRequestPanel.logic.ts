@@ -421,12 +421,17 @@ export function presentCreatePullRequestProgress(
       };
     case "failed":
       return {
+        // Commit & Create runs the branch and commit steps first; name the one that failed.
         status:
-          state.phase === "push"
-            ? `Publishing ${review.head ?? "the branch"} failed: ${state.message}`
-            : state.branchPublished
-              ? `${review.head ?? "The branch"} was published, but creating the ${noun} failed: ${state.message}`
-              : `Creating the ${noun} failed: ${state.message}`,
+          state.phase === "branch"
+            ? `Creating the branch failed: ${state.message}`
+            : state.phase === "commit"
+              ? `Commit failed: ${state.message}`
+              : state.phase === "push"
+                ? `Publishing ${review.head ?? "the branch"} failed: ${state.message}`
+                : state.branchPublished
+                  ? `${review.head ?? "The branch"} was published, but creating the ${noun} failed: ${state.message}`
+                  : `Creating the ${noun} failed: ${state.message}`,
         tone: "error",
         primaryLabel: "Retry",
         busy: false,

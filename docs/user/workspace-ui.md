@@ -1410,7 +1410,8 @@ The Source Control panel is Orca-parity for the shipped local Git workflow:
 - A failed commit or push names the step that failed, such as **Push failed**
   or **Commit failed**, and shows Git's own reason beneath it, for example a
   rejected push or a failing hook. The chat-header Git actions control shows
-  the same failure.
+  the same failure, and the create pull or merge request dialog names a failed
+  branch, commit or publish step the same way instead of blaming the request.
 - **Merge into current branch…** in the dropdown opens the merge dialog for the
   checked-out branch with local and remote sources. **Fetch** refreshes the
   selected remote branch's remote, or every remote for a local source, before
