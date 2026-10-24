@@ -10,7 +10,6 @@ import {
   type ActivitySnapshot,
   ActivityScopeId,
   EnvironmentId,
-  ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
   ThreadId,
@@ -668,7 +667,6 @@ import { openFileInPreview } from "~/browser/openFileInPreview";
 const ENVIRONMENT_ID = EnvironmentId.make("terminal-interactions");
 const THREAD_ID = ThreadId.make("thread-interactions");
 const THREAD_REF = scopeThreadRef(ENVIRONMENT_ID, THREAD_ID);
-const PROJECT_ID = ProjectId.make("project-terminal-interactions");
 const EMPTY_KEYBINDINGS: ResolvedKeybindingsConfig = [];
 
 type ViewportProps = Parameters<typeof TerminalViewport>[0];
@@ -743,7 +741,6 @@ function viewportProps(overrides: Partial<ViewportProps> = {}): ViewportProps {
   return {
     threadRef: THREAD_REF,
     threadId: THREAD_ID,
-    projectId: PROJECT_ID,
     terminalId: "term-1",
     terminalLabel: "Terminal 1",
     cwd: "/repo",
@@ -762,7 +759,6 @@ function panelProps(overrides: Partial<PanelProps> = {}): PanelProps {
     owner: "right-panel",
     threadRef: THREAD_REF,
     threadId: THREAD_ID,
-    projectId: PROJECT_ID,
     cwd: "/repo",
     terminalIds: ["term-1"],
     activeTerminalId: "term-1",
@@ -1556,7 +1552,7 @@ describe("TerminalViewport provider activity mount", () => {
     );
     await act(async () => mounted.root.render(<TerminalViewport {...props} />));
     expect(mounted.container.querySelector('[data-testid="activity-dock"]')).not.toBeNull();
-    expect(mounted.container.querySelector('[aria-label="Activity data stale"]')).not.toBeNull();
+    expect(mounted.container.querySelector('[data-activity-status="stale"]')).not.toBeNull();
   });
 
   it("removes only the disabled environment host without remounting either terminal", async () => {

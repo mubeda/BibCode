@@ -181,6 +181,75 @@ describe("selectActivityDockVisibility", () => {
       showSubagents: false,
       showBackgroundTasks: false,
     });
+    expect(selectActivityDockVisibility(snapshot(), { alwaysVisible: false })).toEqual({
+      visible: false,
+      showSubagents: false,
+      showBackgroundTasks: false,
+    });
+  });
+
+  it("shows supported sections before any record when always visible", () => {
+    expect(selectActivityDockVisibility(snapshot(), { alwaysVisible: true })).toEqual({
+      visible: true,
+      showSubagents: true,
+      showBackgroundTasks: true,
+    });
+    expect(
+      selectActivityDockVisibility(
+        snapshot({ backgroundWork: false, backgroundTasksState: "unsupported" }),
+        { alwaysVisible: true },
+      ),
+    ).toEqual({
+      visible: true,
+      showSubagents: true,
+      showBackgroundTasks: false,
+    });
+  });
+
+  it("still hides unsupported or unclaimed sections without records when always visible", () => {
+    expect(
+      selectActivityDockVisibility(
+        snapshot({
+          actors: false,
+          backgroundWork: false,
+          subagentsState: "unsupported",
+          backgroundTasksState: "unsupported",
+        }),
+        { alwaysVisible: true },
+      ),
+    ).toEqual({
+      visible: false,
+      showSubagents: false,
+      showBackgroundTasks: false,
+    });
+    expect(
+      selectActivityDockVisibility(
+        snapshot({ actors: false, backgroundWork: false, subagentsState: "stale" }),
+        { alwaysVisible: true },
+      ),
+    ).toEqual({
+      visible: false,
+      showSubagents: false,
+      showBackgroundTasks: false,
+    });
+  });
+
+  it("keeps the record rule for sections with records when always visible", () => {
+    expect(
+      selectActivityDockVisibility(
+        snapshot({
+          actors: false,
+          backgroundWork: true,
+          subagentsState: "error",
+          subagentsDone: 1,
+        }),
+        { alwaysVisible: true },
+      ),
+    ).toEqual({
+      visible: true,
+      showSubagents: true,
+      showBackgroundTasks: true,
+    });
   });
 });
 

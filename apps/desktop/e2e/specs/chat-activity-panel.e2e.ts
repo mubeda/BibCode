@@ -191,18 +191,6 @@ async function openMaterializedFixtureChat(): Promise<{
     );
   }
   await expect(browser.$('[data-testid="activity-dock"]')).toBeDisplayed();
-  const expandedSummary = browser.$(
-    `button[aria-label="${desktopActivityAccessibleNames.expandedSummary}"]`,
-  );
-  if (await expandedSummary.isExisting()) {
-    await focusDesktopUiElement(
-      `button[aria-label="${desktopActivityAccessibleNames.expandedSummary}"]`,
-    );
-    await sendFocusedKeyboardKey("Escape");
-    await browser
-      .$(`button[aria-label="${desktopActivityAccessibleNames.collapsedSummary}"]`)
-      .waitForExist();
-  }
   return materialized;
 }
 
@@ -317,9 +305,7 @@ async function assertActivityPresentation(width: 960 | 980 | 981 | 1_199 | 1_200
       const dock = [
         ...document.querySelectorAll<HTMLElement>('[data-testid="activity-dock"]'),
       ].find((candidate) => candidate.closest("[data-provider-terminal-activity-host]") === null);
-      const summary = dock?.querySelector<HTMLButtonElement>(
-        'button[aria-label^="Expand activity summary"]',
-      );
+      const summary = dock?.querySelector<HTMLButtonElement>('button[aria-label^="Open Activity"]');
       if (!dock || !summary) throw new Error("The chat activity summary is missing.");
       return {
         activeCounts: [...summary.querySelectorAll('[data-activity-count="active"]')].map(
@@ -329,31 +315,19 @@ async function assertActivityPresentation(width: 960 | 980 | 981 | 1_199 | 1_200
           (element) => element.textContent?.trim() ?? "",
         ),
         glyphCount: summary.querySelectorAll("[data-activity-provider-glyph]").length,
-        text: summary.textContent ?? "",
+        separatorCount: summary.querySelectorAll("[data-activity-count-separator]").length,
       };
     });
+  // The compact layout separates the counts with a dot; the wide one does not.
+  const expectedSeparators = width < 1_200 ? 1 : 0;
   await browser.waitUntil(
-    async () => {
-      const candidate = await readPresentation();
-      return width < 1_200
-        ? candidate.activeCounts.length === 1
-        : candidate.activeCounts.length === 0;
-    },
+    async () => (await readPresentation()).separatorCount === expectedSeparators,
     { timeoutMsg: `Activity dock presentation did not settle at ${width}px.` },
   );
   const presentation = await readPresentation();
   expect(presentation.glyphCount).toBe(1);
-  if (width < 1_200) {
-    expect(presentation.activeCounts).toEqual(["Active 2"]);
-    expect(presentation.doneCounts).toEqual(["Done 0"]);
-    expect(presentation.text).toContain("Active 2");
-    expect(presentation.text).toContain("Done 0");
-  } else {
-    expect(presentation.activeCounts).toEqual([]);
-    expect(presentation.doneCounts).toEqual([]);
-    expect(presentation.text).toContain("Active 2");
-    expect(presentation.text).toContain("Done 0");
-  }
+  expect(presentation.activeCounts).toEqual(["Active 2"]);
+  expect(presentation.doneCounts).toEqual(["Done 0"]);
 }
 
 async function openCodexProviderTerminal(): Promise<string> {
@@ -497,27 +471,6 @@ async function expectMissing(selector: string): Promise<void> {
   expect(await element.isExisting()).toBe(false);
 }
 
-async function readPersistedProjectDockExpanded(projectId: string): Promise<{
-  readonly expanded: boolean;
-  readonly projectKey: string;
-}> {
-  return browser.execute((id: string) => {
-    const projectKey = `primary:${id}`;
-    const encoded = window.localStorage.getItem("bibcode:activity-dock-state:v1");
-    const persisted = encoded
-      ? (JSON.parse(encoded) as {
-          readonly state?: {
-            readonly expandedByProject?: Readonly<Record<string, boolean>>;
-          };
-        })
-      : null;
-    return {
-      expanded: persisted?.state?.expandedByProject?.[projectKey] === true,
-      projectKey,
-    };
-  }, projectId);
-}
-
 async function tabTo(
   matches: (element: DesktopUiFocusedElement) => boolean,
   direction: "forward" | "backward" = "forward",
@@ -536,11 +489,11 @@ async function tabToDockSummary(): Promise<void> {
   const startingFocus = await focusDesktopUiElement('button[aria-label="Toggle right panel"]');
   expect(startingFocus.ariaLabel).toBe("Toggle right panel");
   const arrived = await tabTo(
-    (element) => element.ariaLabel === desktopActivityAccessibleNames.collapsedSummary,
+    (element) => element.ariaLabel === desktopActivityAccessibleNames.dock,
   );
   expect(arrived).toEqual(
     expect.objectContaining({
-      ariaLabel: desktopActivityAccessibleNames.collapsedSummary,
+      ariaLabel: desktopActivityAccessibleNames.dock,
       tagName: "BUTTON",
     }),
   );
@@ -555,7 +508,7 @@ async function openSubagentsWithKeyboard(): Promise<{
 }> {
   await tabToDockSummary();
   const enter = await sendFocusedKeyboardKey("Enter");
-  expect(enter.before.ariaLabel).toBe(desktopActivityAccessibleNames.collapsedSummary);
+  expect(enter.before.ariaLabel).toBe(desktopActivityAccessibleNames.dock);
   const enterEvidence = enter.transport === "webdriver" ? enter.driver : enter.synthetic;
   expect(enterEvidence).toEqual(
     expect.objectContaining({
@@ -572,20 +525,9 @@ async function openSubagentsWithKeyboard(): Promise<{
       keyup: 0,
     });
   }
-  await browser
-    .$(`button[aria-label="${desktopActivityAccessibleNames.expandedSummary}"]`)
-    .waitForExist();
-  const subagents = await sendFocusedKeyboardKey("Tab");
-  expect(subagents.after).toEqual(
-    expect.objectContaining({
-      activitySection: "subagents",
-      ariaLabel: desktopActivityAccessibleNames.subagents,
-      tagName: "BUTTON",
-    }),
-  );
-  const open = await sendFocusedKeyboardKey("Enter");
-  expect(open.before.activitySection).toBe("subagents");
+  // One press opens the panel on Subagents, the section with running work.
   await browser.$("[data-activity-panel]").waitForExist();
+  await browser.$('section[aria-label="Subagents"]').waitForExist();
   return {
     enterEvidence: {
       click: enterEvidence!.click,
@@ -977,17 +919,11 @@ describe("packaged responsive activity experience", () => {
     await expect(browser.$("[data-activity-panel]")).toBeDisplayed();
     await expect(browser.$('section[aria-label="Subagents"]')).toBeDisplayed();
 
-    await focusDesktopUiElement(
-      `button[aria-label="${desktopActivityAccessibleNames.collapsedSummary}"]`,
-    );
+    // A second press with the panel already open keeps it open on the same section.
+    await focusDesktopUiElement(`button[aria-label="${desktopActivityAccessibleNames.dock}"]`);
     await sendFocusedKeyboardKey("Enter");
-    await browser
-      .$(`button[aria-label="${desktopActivityAccessibleNames.expandedSummary}"]`)
-      .waitForExist();
-    expect(await readPersistedProjectDockExpanded(materialized.projectId)).toEqual({
-      expanded: true,
-      projectKey: `primary:${materialized.projectId}`,
-    });
+    await expect(browser.$("[data-activity-panel]")).toBeDisplayed();
+    await expect(browser.$('section[aria-label="Subagents"]')).toBeDisplayed();
     await setDesktopUiWindowSize(960, 720);
     await expect(browser.$('[role="dialog"] [data-activity-panel]')).toBeDisplayed();
     expect(
@@ -997,16 +933,6 @@ describe("packaged responsive activity experience", () => {
         tagName: "BUTTON",
       }),
     );
-    const collapse = await sendFocusedKeyboardKey("Escape");
-    expect(collapse.before.tagName).toBe("BUTTON");
-    await expect(browser.$('[role="dialog"] [data-activity-panel]')).toBeDisplayed();
-    await browser
-      .$(`button[aria-label="${desktopActivityAccessibleNames.collapsedSummary}"]`)
-      .waitForExist();
-    expect(await readPersistedProjectDockExpanded(materialized.projectId)).toEqual({
-      expanded: false,
-      projectKey: `primary:${materialized.projectId}`,
-    });
     expect(
       await browser.execute(() => document.activeElement?.closest('[role="dialog"]') !== null),
     ).toBe(true);

@@ -95,12 +95,19 @@ type GenericRightPanelKind = Exclude<
 
 interface RightPanelStoreState {
   byThreadKey: Record<string, ThreadRightPanelState>;
+  /**
+   * Threads whose Activity panel should take focus and scroll to the top of its
+   * section: set by every `openActivity`, cleared by the panel once it has
+   * done so. Never persisted, so a reload or a tab switch steals no focus.
+   */
+  activityFocusRequests: Record<string, true>;
   open: (ref: ScopedThreadRef, kind: GenericRightPanelKind) => void;
   openActivity: (
     ref: ScopedThreadRef,
     section: ActivityRightPanelSurface["section"],
     scope?: ActivityRightPanelSurface["scope"],
   ) => void;
+  acknowledgeActivityFocus: (ref: ScopedThreadRef) => void;
   navigateActivity: (
     ref: ScopedThreadRef,
     route: Pick<ActivityRightPanelSurface, "section" | "selectedRecordKind" | "selectedRecordId">,
@@ -463,6 +470,7 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
   persist(
     (set) => ({
       byThreadKey: {},
+      activityFocusRequests: {},
       open: (ref, kind) =>
         set((state) => ({
           byThreadKey: updateThread(state.byThreadKey, scopedThreadKey(ref), (current) => {
@@ -475,6 +483,7 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
         })),
       openActivity: (ref, section, scope = DEFAULT_ACTIVITY_SCOPE) =>
         set((state) => ({
+          activityFocusRequests: { ...state.activityFocusRequests, [scopedThreadKey(ref)]: true },
           byThreadKey: updateThread(state.byThreadKey, scopedThreadKey(ref), (current) => {
             const normalizedSection = normalizeActivitySection(section);
             const normalizedScope = normalizeActivityScope(scope);
@@ -502,6 +511,13 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
             };
           }),
         })),
+      acknowledgeActivityFocus: (ref) =>
+        set((state) => {
+          const threadKey = scopedThreadKey(ref);
+          if (!(threadKey in state.activityFocusRequests)) return state;
+          const { [threadKey]: _handled, ...rest } = state.activityFocusRequests;
+          return { activityFocusRequests: rest };
+        }),
       navigateActivity: (ref, route) =>
         set((state) => ({
           byThreadKey: updateThread(state.byThreadKey, scopedThreadKey(ref), (current) => {
@@ -934,7 +950,8 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
           const threadKey = scopedThreadKey(ref);
           if (!(threadKey in state.byThreadKey)) return state;
           const { [threadKey]: _removed, ...rest } = state.byThreadKey;
-          return { byThreadKey: rest };
+          const { [threadKey]: _request, ...activityFocusRequests } = state.activityFocusRequests;
+          return { byThreadKey: rest, activityFocusRequests };
         }),
     }),
     {
@@ -953,6 +970,13 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
     },
   ),
 );
+
+export function selectActivityFocusRequested(
+  state: Pick<RightPanelStoreState, "activityFocusRequests">,
+  ref: ScopedThreadRef | null | undefined,
+): boolean {
+  return ref ? state.activityFocusRequests[scopedThreadKey(ref)] === true : false;
+}
 
 export function selectThreadRightPanelState(
   byThreadKey: Record<string, ThreadRightPanelState>,

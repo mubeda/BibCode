@@ -5,6 +5,7 @@ import { createJSONStorage } from "zustand/middleware";
 
 import {
   migratePersistedRightPanelState,
+  selectActivityFocusRequested,
   selectActiveRightPanel,
   selectActiveRightPanelSurface,
   selectThreadRightPanelState,
@@ -16,7 +17,7 @@ const refB = scopeThreadRef("env-1" as EnvironmentId, ThreadId.make("thread-B"))
 const refAOtherEnvironment = scopeThreadRef("env-2" as EnvironmentId, ThreadId.make("thread-A"));
 
 beforeEach(() => {
-  useRightPanelStore.setState({ byThreadKey: {} });
+  useRightPanelStore.setState({ byThreadKey: {}, activityFocusRequests: {} });
 });
 
 describe("rightPanelStore", () => {
@@ -159,6 +160,76 @@ describe("rightPanelStore", () => {
           selectedRecordId: null,
         },
       ],
+    });
+  });
+
+  it("brings an open Activity panel to the front on the requested section without closing it", () => {
+    useRightPanelStore.getState().openActivity(refA, "subagents");
+    useRightPanelStore.getState().open(refA, "sourceControl");
+    expect(
+      selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA),
+    ).toMatchObject({ isOpen: true, activeSurfaceId: "sourceControl" });
+
+    useRightPanelStore.getState().openActivity(refA, "backgroundTasks");
+
+    const state = selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA);
+    expect(state.isOpen).toBe(true);
+    expect(state.activeSurfaceId).toBe("activity");
+    expect(state.surfaces.filter((surface) => surface.kind === "activity")).toHaveLength(1);
+    expect(
+      selectActiveRightPanelSurface(useRightPanelStore.getState().byThreadKey, refA),
+    ).toMatchObject({ section: "backgroundTasks" });
+  });
+
+  it("keeps the open record when the Activity button reopens the same section", () => {
+    useRightPanelStore.getState().openActivity(refA, "subagents");
+    useRightPanelStore.getState().navigateActivity(refA, {
+      section: "subagents",
+      selectedRecordKind: "actor",
+      selectedRecordId: "actor-1",
+    });
+
+    useRightPanelStore.getState().openActivity(refA, "subagents");
+
+    expect(
+      selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA).isOpen,
+    ).toBe(true);
+    expect(
+      selectActiveRightPanelSurface(useRightPanelStore.getState().byThreadKey, refA),
+    ).toMatchObject({
+      section: "subagents",
+      selectedRecordKind: "actor",
+      selectedRecordId: "actor-1",
+    });
+  });
+
+  it("asks the Activity panel to take focus on every open until the panel handles it", () => {
+    const focusRequested = (ref: typeof refA) =>
+      selectActivityFocusRequested(useRightPanelStore.getState(), ref);
+    useRightPanelStore.getState().openActivity(refA, "subagents");
+    expect(focusRequested(refA)).toBe(true);
+    expect(focusRequested(refB)).toBe(false);
+
+    useRightPanelStore.getState().acknowledgeActivityFocus(refA);
+    expect(focusRequested(refA)).toBe(false);
+
+    // Reopening the same section with a record open asks again.
+    useRightPanelStore.getState().navigateActivity(refA, {
+      section: "subagents",
+      selectedRecordKind: "actor",
+      selectedRecordId: "actor-1",
+    });
+    expect(focusRequested(refA)).toBe(false);
+    useRightPanelStore.getState().openActivity(refA, "subagents");
+    expect(focusRequested(refA)).toBe(true);
+  });
+
+  it("never persists a pending Activity focus request", () => {
+    useRightPanelStore.getState().openActivity(refA, "subagents");
+    const partialize = useRightPanelStore.persist.getOptions().partialize;
+
+    expect(partialize?.(useRightPanelStore.getState())).toEqual({
+      byThreadKey: useRightPanelStore.getState().byThreadKey,
     });
   });
 

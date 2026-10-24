@@ -169,6 +169,10 @@ vi.mock("../../state/environments", () => ({
   usePrimaryEnvironment: () => h.primaryEnvironment,
 }));
 
+vi.mock("./ProviderUpdateAllSection", () => ({
+  ProviderUpdateAllSection: () => <div data-provider-update-all-section="" />,
+}));
+
 vi.mock("../../state/entities", () => ({
   useProjects: () => h.projects,
   useServerConfigs: () => h.serverConfigs,
@@ -973,6 +977,47 @@ describe("AgentsSettingsPanel", () => {
     });
   });
 
+  it("shows Always show Activity right after Chat agent activity, on by default", () => {
+    const markup = render(<AgentsSettingsPanel />);
+
+    expect(markup.indexOf("Chat agent activity")).toBeLessThan(
+      markup.indexOf("Always show Activity"),
+    );
+    expect(markup.indexOf("Always show Activity")).toBeLessThan(
+      markup.indexOf("AI Terminal agent activity"),
+    );
+    expect(markup).toContain(
+      "Keep the Activity button above the chat even before any subagent or background task runs.",
+    );
+    expect(markup).not.toContain("Turn on Chat agent activity to show it.");
+    const toggle = control("switch", "Always show Activity");
+    expect(toggle.props.checked).toBe(true);
+    expect(toggle.props.disabled).toBe(false);
+    expect(findControls("button", "Reset Activity button visibility to default")).toHaveLength(0);
+
+    invoke(toggle, "onCheckedChange", false);
+    expect(h.updateSettings).toHaveBeenCalledWith({ activityDockAlwaysVisible: false });
+  });
+
+  it("resets Always show Activity to its default", () => {
+    h.settings = { ...DEFAULT_UNIFIED_SETTINGS, activityDockAlwaysVisible: false };
+    render(<AgentsSettingsPanel />);
+
+    expect(control("switch", "Always show Activity").props.checked).toBe(false);
+    invoke(control("button", "Reset Activity button visibility to default"), "onClick");
+    expect(h.updateSettings).toHaveBeenCalledWith({
+      activityDockAlwaysVisible: DEFAULT_UNIFIED_SETTINGS.activityDockAlwaysVisible,
+    });
+  });
+
+  it("disables Always show Activity with the reason while Chat agent activity is off", () => {
+    h.settings = { ...DEFAULT_UNIFIED_SETTINGS, enableChatAgentActivity: false };
+    const markup = render(<AgentsSettingsPanel />);
+
+    expect(control("switch", "Always show Activity").props.disabled).toBe(true);
+    expect(markup).toContain("Turn on Chat agent activity to show it.");
+  });
+
   it("lists selectable default agents before the text generation model and saves a selection", () => {
     h.serverProviders = [
       makeServerProvider({ instanceId: "codex", driver: CODEX_DRIVER }),
@@ -1417,6 +1462,10 @@ describe("ProviderSettingsPanel", () => {
     const markup = render(<ProviderSettingsPanel />);
     expect(markup).toContain("Providers");
     expect(markup).toContain("Checked");
+    expect(markup.indexOf("data-provider-update-all-section")).toBeLessThan(
+      markup.indexOf('data-section-title="Providers"'),
+    );
+    expect(markup).toContain("data-provider-update-all-section");
     expect(h.sections.find((section) => section.title === "Providers")?.contentVariant).toBe(
       "stack",
     );

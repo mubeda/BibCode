@@ -163,13 +163,29 @@ events for live activity and feature-detects optional reconciliation methods suc
 as descendant-thread, history, and background-terminal discovery. Unsupported
 methods degrade the affected activity view instead of inventing data.
 
+Chats and observed provider terminals both initialize the App Server with
+`capabilities.experimentalApi: true`. `thread/backgroundTerminals/list` is
+experimental in the
+[App Server protocol](https://github.com/openai/codex/blob/main/codex-rs/app-server-protocol/src/protocol/common.rs),
+as are `thread/backgroundTerminals/terminate`, `thread/backgroundTerminals/clean`,
+and `thread/items/read`; see the
+[App Server README](https://github.com/openai/codex/blob/main/codex-rs/app-server/README.md).
+The `subAgentActivity` item was experimental-only in Codex 0.163 and is part of
+the stable schema (`codex app-server generate-json-schema`) from 0.164.0.
+Without the experimental API, background-terminal discovery is the part that
+degrades.
+BiBCode lists background terminals but never terminates or cleans them, so
+Activity offers no Stop for a Codex background terminal.
+
 BiBCode accepts validated `subAgentActivity` items as bounded child-discovery
 hints and direct-reads those child thread IDs: thread metadata from
 `thread/read` without turns, then the newest 20 turns from
 `thread/turns/list`. This remains effective when an
 App Server version, including Codex 0.146, omits spawned children from
 `thread/list`; listing remains enabled as a complementary discovery source for
-versions that expose it. Malformed or out-of-scope hints are ignored. When read
+versions that expose it. That omission was last measured on 0.146; later
+releases, whose `thread/list` filters by source and working directory, have not
+been re-measured. Malformed or out-of-scope hints are ignored. When read
 and list methods are incompatible, recovery capabilities downgrade truthfully
 without disabling ordinary chat. Only a missing-method answer counts as
 incompatible: a large or undecodable reply to any reconciliation method is a

@@ -2681,7 +2681,23 @@ sizes. Cover relevant:
   may show an application error or require reload. Surviving expanded folders
   and selections stay usable, and sibling rows still open normally;
 - Activity subagents and background tasks, including elapsed time and keyboard
-  navigation;
+  navigation. One click or **Enter** on the **Activity** button opens the panel
+  on the section with an error or running work and, with the panel open, keeps
+  it open and moves focus to the section's tab; the **Background tasks** tab
+  reaches the other section. With **Settings → Agents → Always show Activity** on, a new chat on a
+  provider that reports activity shows the muted **Activity** button before its
+  first subagent; with it off, the button waits for a record;
+- with an outdated provider on the primary and on a connected remote
+  environment, **Settings → Providers → Update all…** lists both environments
+  and their providers, and names a disconnected environment and a manual-update
+  provider as skipped. Cancel runs nothing. Confirm, leave Settings while an
+  update runs, and return: each environment shows its own result until
+  **Clear**, and neither this app nor its primary server restarts. With only a
+  disconnected environment outdated, the skip reason shows without opening the
+  dialog. With a remote desktop host that reports a server update, the same
+  confirmation lists its server version and running work; after confirming, the
+  host restarts only once its providers show **Updated**, its Remote Servers
+  row shows the same progress, and a manual host is listed as skipped;
 - with **Settings → General → Theme** on **System**, switch the operating system
   between light and dark while the app shows the home screen and again while it
   shows a thread: the window follows each switch without a reload; with
