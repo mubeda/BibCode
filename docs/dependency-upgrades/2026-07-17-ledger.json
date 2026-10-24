@@ -63,10 +63,10 @@
       "verificationDate": "2026-09-04",
       "status": "partial",
       "ledgerClosure": {
-        "rows": 247,
+        "rows": 254,
         "statuses": {
           "green": 132,
-          "current": 68,
+          "current": 75,
           "blocked": 42,
           "removed": 5
         }
