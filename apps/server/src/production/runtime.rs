@@ -116,6 +116,8 @@ pub struct ProductionRuntime {
     pub preview: PreviewManager,
     preview_gateway: PreviewGateway,
     device_manager: crate::device::DeviceManager,
+    /// Diff apps opened through `git difftool`, which outlive BiBCode.
+    diff_tool_launcher: crate::production::diff_tool::DiffToolLauncher,
     preview_tunnels: PreviewTunnels,
     asset_access: AssetAccess,
     transfer_access: TransferAccess,
@@ -270,6 +272,8 @@ impl ProductionRuntime {
         device_backends.push(Arc::new(crate::device::ios::IosBackend::new(
             crate::device::ios::IosBackendConfig::from_process(process_attribution.clone()),
         )));
+        let diff_tool_launcher =
+            crate::production::diff_tool::DiffToolLauncher::new(process_attribution.clone());
         let device_manager =
             crate::device::DeviceManager::start(crate::device::DeviceManagerConfig {
                 backends: device_backends,
@@ -498,7 +502,10 @@ impl ProductionRuntime {
                 asset_context_resolver: Some(Arc::new(ProjectionAssetContext {
                     repositories: repositories.clone(),
                 })),
-                review_service: Some(ReviewService::new(Arc::new(GitReviewBackend))),
+                review_service: Some(
+                    ReviewService::new(Arc::new(GitReviewBackend))
+                        .with_diff_tools(Arc::new(diff_tool_launcher.clone())),
+                ),
                 mutation_observer: Some(Arc::new(git_vcs.clone())),
             },
         )
@@ -665,6 +672,7 @@ impl ProductionRuntime {
             preview,
             preview_gateway,
             device_manager,
+            diff_tool_launcher,
             preview_tunnels,
             asset_access,
             transfer_access,
@@ -821,6 +829,9 @@ impl ProductionRuntime {
         self.preview_gateway.shutdown().await;
         // Stops emulators gracefully before ownership teardown, which would only kill them.
         self.device_manager.shutdown().await;
+        // Before ownership is frozen: no launch after this point, and the open diff apps are
+        // still registered as survivors, so neither cleanup ends them.
+        self.diff_tool_launcher.shutdown().await;
         self.preview_tunnels.shutdown();
         let process_ownership = self.terminal_services.freeze_process_ownership().await;
         self.managed_endpoint.shutdown().await;
@@ -4629,5 +4640,205 @@ mod tests {
         }))
         .expect("input decodes");
         assert_eq!(input.version, worktree("a.txt", "f".repeat(40)));
+    }
+
+    /// Whether `pid` runs: a zombie still answers `kill(pid, 0)`, so this asks `ps` for its state.
+    #[cfg(unix)]
+    fn process_is_running(pid: i32) -> bool {
+        let output = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .expect("ps starts");
+        let state = String::from_utf8_lossy(&output.stdout);
+        let state = state.trim();
+        !state.is_empty() && !state.starts_with('Z')
+    }
+
+    #[cfg(unix)]
+    fn read_pid(path: &Path) -> Option<i32> {
+        std::fs::read_to_string(path).ok()?.trim().parse().ok()
+    }
+
+    /// Opens a diff app through the runtime's `review.openDiffTool` beside an ordinary registered
+    /// helper, quiesces the runtime, and checks that the app and its child still run, the
+    /// helper does not, and a later launch is refused.
+    #[cfg(unix)]
+    async fn quiesce_leaves_open_diff_apps_running(process_tree_cleanup: ProcessTreeCleanup) {
+        use crate::review::{
+            DiffToolBackend, ReviewDiffToolFailureReason, ReviewDiffToolScope,
+            ReviewDiffToolTarget, ReviewOpenDiffToolInput,
+        };
+
+        let state = TempDir::new().expect("state");
+        let config = ServerConfig::new(state.path())
+            .with_bind("127.0.0.1", 0)
+            .with_unsafe_no_auth();
+        hermetic_providers::write_hermetic_settings(&config.state_dir(), json!({}));
+        let database = Database::open_in_memory().await.expect("database");
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("migrations");
+        let runtime = ProductionRuntime::start_with_process_tree_cleanup(
+            &config,
+            database,
+            AuthService::new(&config, vec![7_u8; 32]),
+            vec![9_u8; 32],
+            Arc::new(crate::diagnostics::NotApplicableUiProcessObserver),
+            process_tree_cleanup,
+            None,
+        )
+        .await
+        .expect("runtime");
+
+        let repository = state.path().join("repository");
+        std::fs::create_dir(&repository).expect("repository");
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repository)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .expect("git starts");
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "--quiet", "-b", "main"]);
+        git(&["config", "user.email", "test@bibcode.local"]);
+        git(&["config", "user.name", "BiBCode Test"]);
+        std::fs::write(repository.join("tracked.txt"), "before\n").expect("file");
+        git(&["add", "."]);
+        git(&["commit", "--quiet", "-m", "base"]);
+        std::fs::write(repository.join("tracked.txt"), "after\n").expect("change");
+        // The diff app: a child it waits for, as a GUI app under `git difftool` is.
+        let tool = state.path().join("tool");
+        std::fs::create_dir(&tool).expect("tool directory");
+        std::fs::write(
+            tool.join("tool.sh"),
+            "#!/bin/sh\ndir=$(dirname \"$0\")\nsleep 30 &\necho $! > \"$dir/child\"\nps -o pgid= -p $$ | tr -d ' ' > \"$dir/pgid\"\nwait\n",
+        )
+        .expect("tool script");
+        git(&[
+            "config",
+            "difftool.fake.cmd",
+            &format!(
+                "sh '{}' \"$LOCAL\" \"$REMOTE\"",
+                tool.join("tool.sh").display()
+            ),
+        ]);
+        let cwd = repository.to_string_lossy().into_owned();
+
+        let mut helper = Command::new("sleep")
+            .arg("30")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("helper starts");
+        let _helper_registration = runtime
+            .terminal_services
+            .terminal_manager_for_test()
+            .process_attribution_registry()
+            .register_identity(
+                crate::diagnostics::NativeProcessSampler::process_identity(
+                    helper.id().expect("helper pid"),
+                )
+                .expect("helper identity"),
+                crate::diagnostics::ProcessRegistrationMetadata {
+                    scope: crate::diagnostics::AttributionScope::External,
+                    kind: crate::diagnostics::AttributionKind::Helper,
+                    label: "helper".to_owned(),
+                    source: crate::diagnostics::RegistrationSource::Helper,
+                    driver: None,
+                    survives_shutdown: false,
+                },
+            )
+            .expect("helper registered");
+
+        let opened = runtime
+            .workspace
+            .handle(
+                "review.openDiffTool",
+                json!({
+                    "cwd": cwd,
+                    "toolId": "fake",
+                    "target": { "_tag": "file", "path": "tracked.txt" },
+                    "scope": { "_tag": "working-tree" },
+                }),
+            )
+            .await
+            .expect("the diff app opens");
+        assert_eq!(opened, json!({ "_tag": "opened" }));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let (difftool, child) = loop {
+            if let (Some(pgid), Some(child)) =
+                (read_pid(&tool.join("pgid")), read_pid(&tool.join("child")))
+            {
+                break (pgid, child);
+            }
+            assert!(std::time::Instant::now() < deadline, "the tool started");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+
+        runtime.quiesce_for_update().await.expect("quiesced");
+
+        // Shutdown cleanup signals a process through an identity-bound handle (a pidfd on Linux).
+        // Other Unix systems have none, so cleanup there ends nothing and only the survivors'
+        // half of this test applies.
+        let helper_ended = !cfg!(target_os = "linux")
+            || timeout(std::time::Duration::from_secs(10), helper.wait())
+                .await
+                .is_ok();
+        let difftool_runs = process_is_running(difftool);
+        let child_runs = process_is_running(child);
+        let refused = runtime
+            .diff_tool_launcher
+            .open_diff_tool(&ReviewOpenDiffToolInput {
+                cwd,
+                tool_id: "fake".to_owned(),
+                target: ReviewDiffToolTarget::All,
+                scope: ReviewDiffToolScope::WorkingTree,
+            })
+            .await;
+        // SAFETY: the ID is the tool's process group, which `git difftool` leads.
+        unsafe { libc::kill(-difftool, libc::SIGKILL) };
+
+        assert!(helper_ended, "an ordinary registered helper is cleaned up");
+        assert!(difftool_runs, "git difftool survives the shutdown");
+        assert!(
+            child_runs,
+            "the diff app under git difftool survives the shutdown"
+        );
+        assert!(
+            matches!(
+                refused,
+                Err(ReviewError::DiffTool(ref failure))
+                    if failure.reason == ReviewDiffToolFailureReason::ShuttingDown
+            ),
+            "{refused:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn quiesce_in_an_embedded_host_leaves_open_diff_apps_running() {
+        quiesce_leaves_open_diff_apps_running(ProcessTreeCleanup::EmbeddedHost).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn quiesce_in_a_standalone_server_leaves_open_diff_apps_running() {
+        // A standalone server kills every descendant of its process, so this runs alone.
+        let Some(isolated) = crate::test_support::reexec::in_own_process(
+            "production::runtime::tests::quiesce_in_a_standalone_server_leaves_open_diff_apps_running",
+        ) else {
+            return;
+        };
+        quiesce_leaves_open_diff_apps_running(ProcessTreeCleanup::StandaloneServer).await;
+        isolated.complete();
     }
 }

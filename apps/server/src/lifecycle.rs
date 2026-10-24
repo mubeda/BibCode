@@ -72,6 +72,7 @@ fn connect_environment_descriptor(config: &ServerConfig) -> serde_json::Value {
             "profiler": true,
             "devicePreviews": true,
             "previewTunnels": true,
+            "reviewDiffTools": true,
         },
     })
 }
@@ -1200,6 +1201,7 @@ mod tests {
         assert_eq!(descriptor["capabilities"]["terminalImagePaste"], true);
         assert_eq!(descriptor["capabilities"]["pullRequestCreateOptions"], true);
         assert_eq!(descriptor["capabilities"]["vcsCloneReattach"], true);
+        assert_eq!(descriptor["capabilities"]["reviewDiffTools"], true);
         assert_eq!(descriptor["capabilities"]["attachmentStaging"], true);
         assert_eq!(descriptor["capabilities"]["profiler"], true);
         assert_eq!(descriptor["capabilities"]["devicePreviews"], true);

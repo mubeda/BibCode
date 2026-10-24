@@ -30,6 +30,16 @@ pub struct ProcessRegistrationMetadata {
     /// A provider process's driver (`codex`, `claudeAgent`), which names its profiler kind
     /// `provider:<driver>`.
     pub driver: Option<String>,
+    /// A process BiBCode starts for the user that must outlive BiBCode, such as a diff app
+    /// holding unsaved edits. Shutdown cleanup kills neither it nor its descendants.
+    pub survives_shutdown: bool,
+}
+
+/// The processes shutdown owns, and those it must leave running.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct FrozenProcessOwnership {
+    pub(crate) roots: Vec<ProcessIdentity>,
+    pub(crate) survivors: Vec<ProcessIdentity>,
 }
 
 #[derive(Clone, Debug)]
@@ -141,19 +151,31 @@ impl ProcessAttributionRegistry {
         })
     }
 
+    /// Closes registration for shutdown and returns the process roots it owns. Registrations
+    /// that survive shutdown are not roots.
+    #[cfg(test)]
     pub(crate) fn freeze_and_snapshot_identities(&self) -> Vec<ProcessIdentity> {
+        self.freeze_and_snapshot_ownership().roots
+    }
+
+    /// Closes registration for shutdown and splits the registered processes into the roots
+    /// shutdown cleans up and the survivors it leaves running.
+    pub(crate) fn freeze_and_snapshot_ownership(&self) -> FrozenProcessOwnership {
         let mut state = lock_state(&self.inner);
         state.accepting_registrations = false;
-        state
+        let mut ownership = FrozenProcessOwnership::default();
+        for entry in state
             .registration_order
             .iter()
-            .filter_map(|registration_id| {
-                state
-                    .entries
-                    .get(registration_id)
-                    .map(|entry| entry.identity)
-            })
-            .collect()
+            .filter_map(|registration_id| state.entries.get(registration_id))
+        {
+            if entry.metadata.survives_shutdown {
+                ownership.survivors.push(entry.identity);
+            } else {
+                ownership.roots.push(entry.identity);
+            }
+        }
+        ownership
     }
 
     /// Every registered process and its source. Unlike `bind_and_snapshot` it leaves the
@@ -363,6 +385,7 @@ mod tests {
             label: label.to_owned(),
             source: RegistrationSource::Provider,
             driver: None,
+            survives_shutdown: false,
         }
     }
 
@@ -445,6 +468,34 @@ mod tests {
         );
         drop(registration);
         assert!(registry.freeze_and_snapshot_identities().is_empty());
+    }
+
+    #[test]
+    fn a_surviving_registration_is_no_shutdown_root() {
+        let registry = ProcessAttributionRegistry::new();
+        let _owned = register(&registry, 42, 100, "external/provider");
+        let _survivor = registry
+            .register_identity(
+                identity(43, 101),
+                ProcessRegistrationMetadata {
+                    survives_shutdown: true,
+                    ..metadata("diff app")
+                },
+            )
+            .expect("survivor registration");
+
+        assert_eq!(
+            registry.freeze_and_snapshot_ownership(),
+            FrozenProcessOwnership {
+                roots: vec![identity(42, 100)],
+                survivors: vec![identity(43, 101)],
+            }
+        );
+        assert_eq!(
+            registry.freeze_and_snapshot_identities(),
+            [identity(42, 100)],
+            "the roots shutdown kills leave the survivor out"
+        );
     }
 
     #[test]

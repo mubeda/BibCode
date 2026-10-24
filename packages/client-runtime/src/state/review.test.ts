@@ -2,6 +2,7 @@ import {
   EnvironmentId,
   WS_METHODS,
   type ReviewDiffPreviewInput,
+  type ReviewListDiffToolsInput,
   type ReviewReadFileVersionInput,
 } from "@bibcode/contracts";
 import { describe, expect, it } from "@effect/vitest";
@@ -57,6 +58,8 @@ const makeHarness = Effect.fn("TestReview.makeHarness")(function* (keys: Readonl
           contents: "contents\n",
           byteLength: 9,
         }),
+      [WS_METHODS.reviewListDiffTools]: (input: ReviewListDiffToolsInput) =>
+        gated(`tools:${input.cwd}`, { tools: [], defaultToolId: null, defaultSource: null }),
       [WS_METHODS.reviewGetDiffPreview]: (input: ReviewDiffPreviewInput) =>
         gated(`context:${input.contextLines ?? "default"}`, {
           cwd: input.cwd,
@@ -170,6 +173,30 @@ describe("review query lifetimes", () => {
         // Real time (a live test), past the idle check that drops a family set to keep nothing.
         yield* Effect.sleep("20 millis");
         expect(h.registry.getNodes().get(preview)).toBeDefined();
+      } finally {
+        h.registry.dispose();
+      }
+    }),
+  );
+
+  it.live("menus for one cwd share one tool list and reuse it after they close", () =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness(["tools:/repo"]);
+      try {
+        const tools = () =>
+          h.atoms.diffTools({ environmentId: ENVIRONMENT_ID, input: { cwd: "/repo" } });
+        const releaseFirst = h.registry.mount(tools());
+        const releaseSecond = h.registry.mount(tools());
+        yield* Deferred.succeed(h.gates.get("tools:/repo")!, undefined);
+        yield* Effect.promise(() =>
+          vi.waitFor(() => expect(AsyncResult.isSuccess(h.registry.get(tools()))).toBe(true)),
+        );
+        releaseFirst();
+        releaseSecond();
+        yield* Effect.sleep("20 millis");
+        h.registry.mount(tools());
+        expect(AsyncResult.isSuccess(h.registry.get(tools()))).toBe(true);
+        expect(h.started).toEqual(["tools:/repo"]);
       } finally {
         h.registry.dispose();
       }

@@ -190,8 +190,9 @@ impl ServerTerminalServices {
     }
 
     pub(crate) async fn freeze_process_ownership(&self) -> RuntimeProcessOwnership {
-        let roots = self.process_attribution.freeze_and_snapshot_identities();
-        match self
+        let frozen = self.process_attribution.freeze_and_snapshot_ownership();
+        let (roots, survivors) = (frozen.roots, frozen.survivors);
+        let ownership = match self
             .process_sampler
             .capture_runtime_process_ownership(roots.clone())
             .await
@@ -209,10 +210,12 @@ impl ServerTerminalServices {
                 );
                 RuntimeProcessOwnership::roots_only(roots)
             }
-        }
+        };
+        ownership.with_survivors(survivors)
     }
 
     pub(crate) async fn shutdown_with_process_ownership(&self, ownership: RuntimeProcessOwnership) {
+        let survivors = ownership.survivors().to_vec();
         self.workspace_watch.cancel();
         self.terminal.shutdown().await;
         match self
@@ -245,7 +248,13 @@ impl ServerTerminalServices {
                 tracing::warn!(%error, "failed to inspect remaining runtime-owned processes during shutdown");
             }
         }
-        match cleanup_server_descendants(self.process_tree_cleanup, &self.process_sampler).await {
+        match cleanup_server_descendants(
+            self.process_tree_cleanup,
+            &self.process_sampler,
+            &survivors,
+        )
+        .await
+        {
             Ok(Some(report)) if report.failure_count > 0 => {
                 tracing::warn!(
                     attempted = report.attempted,
@@ -450,13 +459,16 @@ impl ServerTerminalServices {
     }
 }
 
+/// A standalone server kills every descendant of its own pid, except the processes that
+/// survive shutdown and what they started.
 async fn cleanup_server_descendants(
     process_tree_cleanup: ProcessTreeCleanup,
     process_sampler: &NativeProcessSampler,
+    survivors: &[crate::diagnostics::ProcessIdentity],
 ) -> Result<Option<crate::process::ProcessCleanupReport>, crate::diagnostics::SignalError> {
     match process_tree_cleanup {
         ProcessTreeCleanup::StandaloneServer => process_sampler
-            .cleanup_descendants(std::process::id())
+            .cleanup_descendants(std::process::id(), survivors)
             .await
             .map(Some),
         ProcessTreeCleanup::EmbeddedHost => Ok(None),
@@ -2257,6 +2269,7 @@ mod tests {
         let cleanup = cleanup_server_descendants(
             ProcessTreeCleanup::EmbeddedHost,
             &NativeProcessSampler::default(),
+            &[],
         )
         .await
         .expect("embedded cleanup policy is evaluated");

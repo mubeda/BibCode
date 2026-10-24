@@ -9,7 +9,8 @@ use std::time::{Duration, Instant};
 use crate::assets::{AssetAccess, AssetError, AssetIssueRequest, AssetResource};
 use crate::git::StatusMutationGuard;
 use crate::review::{
-    ReviewDiffPreviewInput, ReviewError, ReviewReadFileVersionInput, ReviewService,
+    ReviewDiffPreviewInput, ReviewError, ReviewListDiffToolsInput, ReviewOpenDiffToolInput,
+    ReviewReadFileVersionInput, ReviewService,
 };
 use crate::transfer::archive::ArchiveLimits;
 use crate::transfer::{self, TransferAccess, TransferError};
@@ -32,7 +33,7 @@ use super::{EntryKind, SearchLimits, WorkspaceError, WorkspaceSearchIndex, Works
 
 const PROJECT_ENTRIES_MAX_LIMIT: usize = 200;
 
-pub const TASK_SIX_RPC_METHODS: [&str; 14] = [
+pub const TASK_SIX_RPC_METHODS: [&str; 16] = [
     "projects.searchEntries",
     "projects.listEntries",
     "projects.readFile",
@@ -47,6 +48,8 @@ pub const TASK_SIX_RPC_METHODS: [&str; 14] = [
     "assets.createUrl",
     "review.getDiffPreview",
     "review.readFileVersion",
+    "review.listDiffTools",
+    "review.openDiffTool",
 ];
 
 type AssetContextFuture<'a> =
@@ -643,6 +646,26 @@ impl WorkspaceRpc {
                     .await
                     .map_err(review_wire_error)?;
                 encode(result).map_err(|error| defect(&error.to_string()))
+            }
+            "review.listDiffTools" => {
+                let input: ReviewListDiffToolsInput = decode(payload)?;
+                let _admission = self.acquire_path(&input.cwd).await?;
+                let review_service = self.review_service("review.listDiffTools")?;
+                let result = review_service
+                    .list_diff_tools(input, &cancellation)
+                    .await
+                    .map_err(review_wire_error)?;
+                encode(result).map_err(|error| defect(&error.to_string()))
+            }
+            "review.openDiffTool" => {
+                let input: ReviewOpenDiffToolInput = decode(payload)?;
+                let _admission = self.acquire_path(&input.cwd).await?;
+                let review_service = self.review_service("review.openDiffTool")?;
+                review_service
+                    .open_diff_tool(input)
+                    .await
+                    .map_err(review_wire_error)?;
+                Ok(json!({ "_tag": "opened" }))
             }
             _ => Err(json!({
                 "_tag": "Defect",
@@ -1346,6 +1369,13 @@ impl WorkspaceRpc {
         .await
     }
 
+    fn review_service(&self, method: &str) -> Result<&ReviewService, Value> {
+        self.dependencies
+            .review_service
+            .as_ref()
+            .ok_or_else(|| defect(&format!("{method} is not configured")))
+    }
+
     async fn handle_review_get_diff_preview(
         &self,
         input: ReviewDiffPreviewInput,
@@ -1587,6 +1617,12 @@ fn review_wire_error(error: ReviewError) -> Value {
         ReviewError::InvalidRequest(message) => json!({
             "_tag": "InvalidRequest",
             "message": message,
+        }),
+        ReviewError::DiffTool(failure) => json!({
+            "_tag": "ReviewDiffToolError",
+            "reason": failure.reason,
+            "message": failure.message,
+            "command": failure.command,
         }),
         error @ ReviewError::Backend(_) => json!({
             "_tag": "Defect",

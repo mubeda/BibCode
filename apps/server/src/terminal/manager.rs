@@ -2319,6 +2319,7 @@ impl TerminalManager {
                     label: label.clone(),
                     source: RegistrationSource::Terminal,
                     driver: None,
+                    survives_shutdown: false,
                 },
             ) {
                 Ok(registration) => Some(registration),
@@ -8807,6 +8808,7 @@ mod tests {
                             label: "capacity fixture".to_owned(),
                             source: RegistrationSource::Provider,
                             driver: None,
+                            survives_shutdown: false,
                         },
                     )
                     .expect("fill registry")

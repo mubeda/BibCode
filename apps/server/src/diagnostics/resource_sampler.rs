@@ -818,6 +818,7 @@ mod tests {
                     label: "external/provider/codex".to_owned(),
                     source: RegistrationSource::Provider,
                     driver: None,
+                    survives_shutdown: false,
                 },
             )
             .expect("registration should fit");
@@ -1025,6 +1026,7 @@ mod tests {
                     label: "Codex".to_owned(),
                     source: RegistrationSource::Provider,
                     driver: None,
+                    survives_shutdown: false,
                 },
             )
             .expect("external registration");
@@ -1101,6 +1103,7 @@ mod tests {
                     label: "Codex".to_owned(),
                     source: RegistrationSource::Provider,
                     driver: None,
+                    survives_shutdown: false,
                 },
             )
             .expect("stale registration");
@@ -1136,6 +1139,7 @@ mod tests {
                     label: "Codex".to_owned(),
                     source: RegistrationSource::Provider,
                     driver: None,
+                    survives_shutdown: false,
                 },
             )
             .expect("reparented registration");
@@ -1194,6 +1198,7 @@ mod tests {
                     label: "Codex".to_owned(),
                     source: RegistrationSource::Provider,
                     driver: None,
+                    survives_shutdown: false,
                 },
             )
             .expect("external registration");

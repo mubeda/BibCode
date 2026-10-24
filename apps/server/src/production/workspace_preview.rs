@@ -41,6 +41,8 @@ const WORKSPACE_METHODS: &[&str] = &[
     "projects.searchEntries",
     "projects.writeFile",
     "review.getDiffPreview",
+    "review.listDiffTools",
+    "review.openDiffTool",
     "review.readFileVersion",
 ];
 const PREVIEW_METHODS: &[&str] = &[
