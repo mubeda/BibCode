@@ -413,7 +413,10 @@ describe("packaged Mermaid diagrams", () => {
     await saveEvidence("mermaid-timeline-row-above");
   });
 
-  it("draws an evicted diagram again on remount and settles at the end", async () => {
+  it("draws an evicted diagram again on remount and settles at the end", async function () {
+    // The draws alone may wait 240 s in an occluded webview, then the remount up to 60 s more,
+    // past the suite's 120 s default.
+    this.timeout(420_000);
     await setDesktopUiWindowSize(1_400, 900);
     await openFixtureWorkspace();
     await sendPrompt(mermaidFixturePrompts.many);
