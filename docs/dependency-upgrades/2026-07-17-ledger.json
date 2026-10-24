@@ -308,8 +308,8 @@
     }
   },
   "inventorySummary": {
-    "javascriptDirect": 86,
-    "javascriptLedger": 88,
+    "javascriptDirect": 87,
+    "javascriptLedger": 89,
     "rustRegistry": 138,
     "rustPath": 3,
     "rustGit": 1,
@@ -942,6 +942,18 @@
       "platforms": ["linux", "macos", "windows"],
       "status": "current",
       "notes": "Declared for streamed code-block highlighting; the lockfile already resolved this version through react-markdown."
+    },
+    {
+      "key": "js:apps/web:jsdom",
+      "name": "jsdom",
+      "current": "30.1.2",
+      "target": "30.1.2",
+      "channel": "stable",
+      "source": "https://www.npmjs.com/package/jsdom",
+      "cohort": "stable-javascript-tooling",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "current",
+      "notes": "Development-only DOM for the Mermaid diagram sanitizer tests (#171): DOMPurify does not run under happy-dom, whose NodeIterator stops once its reference node is removed. Newly chosen exact pin, the newest release at least 14 days old on 2026-10-24; 30.1.3 (2026-10-15) had not cleared the 14-day rule."
     },
     {
       "key": "js:apps/web:lexical",
