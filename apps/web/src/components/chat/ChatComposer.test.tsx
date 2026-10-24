@@ -1223,6 +1223,24 @@ describe("ChatComposer rendering", () => {
     expect(picker["disabled"]).toBe(true);
   });
 
+  it("puts the History slot first in the footer's right group", () => {
+    const { markup } = renderComposer({ historyMenu: <span data-history-menu="true" /> });
+    expect(markup).toContain('data-history-menu="true"');
+    expect(markup.indexOf('data-history-menu="true"')).toBeLessThan(
+      markup.indexOf('aria-label="Attach files"'),
+    );
+  });
+
+  it("leaves History out of the approval footer", () => {
+    const { markup } = renderComposer({
+      historyMenu: <span data-history-menu="true" />,
+      activePendingApproval: pendingApproval,
+      pendingApprovals: [pendingApproval],
+    });
+    expect(markup).toContain('data-mock="ComposerPendingApprovalActions"');
+    expect(markup).not.toContain("data-history-menu");
+  });
+
   it("falls back to the generic approval placeholder without a detail", () => {
     const { detail: _detail, ...approvalWithoutDetail } = pendingApproval;
     renderComposer({

@@ -5,6 +5,7 @@ import {
   type ActivityRecordKind,
   type ActivityScopeRef,
   type ActivitySection,
+  type AgentSessionOpenMode,
   type ApprovalRequestId,
   DEFAULT_MODEL,
   defaultInstanceIdForDriver,
@@ -264,7 +265,7 @@ import {
   projectDraftFallbackKeys,
   selectProjectGroupingSettings,
 } from "../logicalProject";
-import { buildDraftThreadRouteParams } from "../threadRoutes";
+import { buildDraftThreadRouteParams, buildThreadRouteParams } from "../threadRoutes";
 import {
   type ComposerAttachment,
   type DraftThreadEnvMode,
@@ -303,6 +304,8 @@ import { useProject, useThread, useThreadProposedPlans } from "../state/entities
 import { environmentShell } from "../state/shell";
 import { environmentActivity } from "../state/activity";
 import { ChatComposer, type ChatComposerHandle } from "./chat/ChatComposer";
+import { ComposerHistoryMenu, type ImportedSessionThread } from "./chat/ComposerHistoryMenu";
+import { historyUnavailableReason } from "./chat/ComposerHistoryMenu.logic";
 import { ExpandedImageDialog } from "./chat/ExpandedImageDialog";
 import { PullRequestThreadDialog } from "./PullRequestThreadDialog";
 import { MessagesTimeline } from "./chat/MessagesTimeline";
@@ -4470,6 +4473,104 @@ function ChatViewContent(props: ChatViewProps) {
     },
     [activeThreadRef, reopenCenterChatPanel],
   );
+  // History acts for the host thread, also from a chat panel's composer.
+  const historyHostThreadId = isPanel
+    ? (activeThread?.hostThreadId ?? null)
+    : isServerThread
+      ? (activeThread?.id ?? null)
+      : null;
+  const historyEnvironmentId = activeThread?.environmentId ?? environmentId;
+  const historyHostRef = useMemo(
+    () =>
+      historyHostThreadId === null
+        ? null
+        : scopeThreadRef(historyEnvironmentId, historyHostThreadId),
+    [historyEnvironmentId, historyHostThreadId],
+  );
+  const openCenterPanelThread = centerPanelActions.openPanelThread;
+  const openCenterSessionPanel = centerPanelActions.openSessionPanel;
+  const reopenHistoryChat = useCallback(
+    (threadId: ThreadId, label: string) => {
+      if (!historyHostRef) return;
+      void reopenCenterChatPanel(historyHostRef, threadId, label);
+    },
+    [historyHostRef, reopenCenterChatPanel],
+  );
+  // A session's thread opens where it lives: a panel of this host, another host's panel (which
+  // that host's view activates), or a sidebar thread.
+  const showSessionThread = useCallback(
+    async (thread: ImportedSessionThread, title: string) => {
+      if (!historyHostRef) return;
+      if (thread.hostThreadId === null) {
+        await navigate({
+          to: "/$environmentId/$threadId",
+          params: buildThreadRouteParams(
+            scopeThreadRef(historyHostRef.environmentId, thread.threadId),
+          ),
+        });
+        return;
+      }
+      const hostRef = scopeThreadRef(historyHostRef.environmentId, thread.hostThreadId);
+      await openCenterPanelThread(hostRef, thread.threadId, title, thread.archived);
+      if (thread.hostThreadId !== historyHostRef.threadId) {
+        await navigate({
+          to: "/$environmentId/$threadId",
+          params: buildThreadRouteParams(hostRef),
+        });
+      }
+    },
+    [historyHostRef, navigate, openCenterPanelThread],
+  );
+  const openHistorySessionThread = useCallback(
+    (thread: ImportedSessionThread, title: string) => {
+      void showSessionThread(thread, title);
+    },
+    [showSessionThread],
+  );
+  const continueTerminalSession = useCallback(
+    async (sessionId: string, mode: AgentSessionOpenMode, title: string) => {
+      if (!historyHostRef) return false;
+      const opened = await openCenterSessionPanel(historyHostRef, { sessionId, mode, title });
+      if (opened === null) return false;
+      if (opened.hostThreadId !== historyHostRef.threadId) {
+        await showSessionThread(
+          { threadId: opened.threadId, hostThreadId: opened.hostThreadId },
+          title,
+        );
+      }
+      return true;
+    },
+    [historyHostRef, openCenterSessionPanel, showSessionThread],
+  );
+  const historyUnavailable = historyUnavailableReason({
+    started: historyHostRef !== null,
+    unavailableEnvironmentLabel: activeEnvironmentUnavailableState?.label ?? null,
+    workspaceUnavailable,
+  });
+  const historyEnvironmentLabel = activeEnvironment?.label ?? "the server";
+  // A slot element, so the memoized composer footer keeps stable props.
+  const historyMenu = useMemo(
+    () => (
+      <ComposerHistoryMenu
+        environmentId={historyEnvironmentId}
+        hostThreadId={historyHostRef?.threadId ?? null}
+        unavailableReason={historyUnavailable}
+        environmentLabel={historyEnvironmentLabel}
+        onReopenChat={reopenHistoryChat}
+        onOpenImported={openHistorySessionThread}
+        onContinueSession={continueTerminalSession}
+      />
+    ),
+    [
+      continueTerminalSession,
+      historyEnvironmentId,
+      historyEnvironmentLabel,
+      historyHostRef,
+      historyUnavailable,
+      openHistorySessionThread,
+      reopenHistoryChat,
+    ],
+  );
   const openCenterTerminal = useCallback(
     async (
       placement: CenterTerminalPlacement,
@@ -7142,6 +7243,7 @@ function ChatViewContent(props: ChatViewProps) {
                             setThreadError={setThreadError}
                             onExpandImage={onExpandTimelineImage}
                             onPageTimeline={pageTimeline}
+                            historyMenu={historyMenu}
                           />
                         </div>
                       </div>
