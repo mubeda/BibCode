@@ -234,7 +234,11 @@ import { getConfiguredPreviewUrls } from "./preview/previewEmptyStateLogic";
 import { RightPanelTabs } from "./RightPanelTabs";
 import { useDevicePreviewsAvailability } from "./device/deviceAvailability";
 import { DiffWorkerPoolProvider } from "./DiffWorkerPoolProvider";
-import { resolveShortcutCommand, shortcutLabelForCommand } from "../keybindings";
+import {
+  resolveShortcutCommand,
+  shortcutLabelForCommand,
+  shouldOpenChatFind,
+} from "../keybindings";
 import PlanSidebar from "./PlanSidebar";
 import ThreadTerminalPanel, {
   enqueueTerminalInput,
@@ -314,6 +318,7 @@ import { ChatPanelOpeningState, NoActiveThreadState } from "./NoActiveThreadStat
 import { resolveEffectiveEnvMode } from "./BranchToolbar.logic";
 import { ProviderStatusBanner } from "./chat/ProviderStatusBanner";
 import { ThreadErrorBanner, type ThreadErrorAction } from "./chat/ThreadErrorBanner";
+import { openThreadFindForTarget } from "./chat/threadFind/useThreadFind";
 import { ComposerBannerStack, type ComposerBannerStackItem } from "./chat/ComposerBannerStack";
 import {
   buildExpiredTerminalContextToastCopy,
@@ -344,6 +349,7 @@ import {
   threadErrorAttribution,
   threadErrorCompactAction,
   COMPACT_CONVERSATION_COMMAND,
+  isChatSurfaceFocus,
   waitForStartedServerThread,
 } from "./ChatView.logic";
 import { useLocalStorage } from "~/hooks/useLocalStorage";
@@ -1704,6 +1710,8 @@ function ChatViewContent(props: ChatViewProps) {
   );
   const legendListRef = useRef<LegendListRef | null>(null);
   const [composerOverlayElement, setComposerOverlayElement] = useState<HTMLDivElement | null>(null);
+  // The chat column, so Mod+F inside it opens this chat's find rather than the host's.
+  const [chatSurfaceElement, setChatSurfaceElement] = useState<HTMLDivElement | null>(null);
   const [composerOverlayHeight, setComposerOverlayHeight] = useState(0);
   const isAtEndRef = useRef(true);
   const attachmentPreviewHandoffByMessageIdRef = useRef<Record<string, string[]>>({});
@@ -4827,6 +4835,7 @@ function ChatViewContent(props: ChatViewProps) {
         terminalFocus: terminalFocusOwner !== null,
         terminalOpen: hasTerminalSurface,
         modelPickerOpen: composerRef.current?.isModelPickerOpen() ?? false,
+        chatFocus: isChatSurfaceFocus(event.target, document.activeElement, document.body),
       };
 
       if (
@@ -4844,6 +4853,14 @@ function ChatViewContent(props: ChatViewProps) {
       const command = resolveShortcutCommand(event, keybindings, {
         context: shortcutContext,
       });
+      // A rule naming chat.find, or the built-in Mod+F inside a chat when no rule claims it.
+      // Find opens in the chat surface that holds the target, or the host chat.
+      if (shouldOpenChatFind(command, event, keybindings, shortcutContext)) {
+        event.preventDefault();
+        event.stopPropagation();
+        openThreadFindForTarget(event.target);
+        return;
+      }
       if (!command) return;
 
       if (command === "terminal.newCenter") {
@@ -6955,7 +6972,11 @@ function ChatViewContent(props: ChatViewProps) {
               />
               <div className="flex min-h-0 min-w-0 flex-1">
                 {/* Chat column */}
-                <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
+                <div
+                  ref={setChatSurfaceElement}
+                  className="relative flex min-h-0 min-w-0 flex-1 flex-col"
+                  data-chat-surface=""
+                >
                   {/* Messages Wrapper */}
                   <div className="relative flex min-h-0 flex-1 flex-col">
                     {activityStateTarget !== null &&
@@ -7016,6 +7037,10 @@ function ChatViewContent(props: ChatViewProps) {
                       contentInsetEndAdjustment={composerOverlayHeight}
                       onIsAtEndChange={onIsAtEndChange}
                       onManualNavigation={cancelTimelineLiveFollowForUserNavigation}
+                      findThreadRef={routeKind === "server" ? routeThreadRef : null}
+                      findSurfaceRoot={chatSurfaceElement}
+                      isHostFindSurface={!isPanel}
+                      onFindFocusComposer={focusComposer}
                     />
 
                     {/* scroll to end pill — shown when user has scrolled away from the live edge */}

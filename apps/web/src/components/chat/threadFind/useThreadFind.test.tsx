@@ -470,6 +470,51 @@ describe("useThreadFind", () => {
     expect(container.textContent).toContain("Collapse plan");
   });
 
+  it("opens only the closed details block that holds the active match", async () => {
+    const reply = [
+      "<details>",
+      "<summary>First</summary>",
+      "",
+      "the word in block zero",
+      "",
+      "</details>",
+      "",
+      "<details>",
+      "<summary>Second</summary>",
+      "",
+      "the word in block one",
+      "",
+      "</details>",
+    ].join("\n");
+    const { container } = await mountTimeline({
+      latestTurn: null,
+      timelineEntries: [message("reply", "assistant", reply, 0)],
+    });
+    const blocks = () =>
+      [...container.querySelectorAll<HTMLElement>("[data-markdown-details]")].map(
+        (block) => block.dataset.markdownDetailsOpen,
+      );
+    expect(blocks()).toEqual(["false", "false"]);
+
+    const input = await openFind();
+    await type(input, "block one");
+    await settle(() => activeRange() !== null);
+
+    // Only the second block opens, and the range is in its text.
+    expect(blocks()).toEqual(["false", "true"]);
+    expect(activeRange()?.toString()).toBe("block one");
+    expect(
+      activeRange()
+        ?.startContainer.parentElement?.closest("[data-markdown-details-content]")
+        ?.getAttribute("data-markdown-details-content"),
+    ).toBe("1");
+
+    // A query that matches in both blocks starts at the first; stepping opens the second.
+    await type(input, "the word");
+    await settle(() => blocks()[0] === "true");
+    expect(statusText()).toContain("1/2");
+  });
+
   it("opens a row again that the reader collapsed", async () => {
     const { container } = await mountTimeline({
       latestTurn: null,
