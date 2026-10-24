@@ -22,6 +22,23 @@ export function rowToggleNeedsEndReveal(input: {
   );
 }
 
+/** Controls whose press is a click, not the reader taking over the timeline's scroll. */
+const TIMELINE_CONTROL_SELECTOR =
+  'button, a[href], input, textarea, select, summary, [role="button"]';
+
+/**
+ * Whether a pointer press inside the timeline stops live following. A press on a control, such
+ * as a Thinking row's toggle (#173), a tool row or a copy button, is a click: the turn keeps
+ * following its end, so a toggle at the end can reveal it again. A press anywhere else, such as
+ * on the scrollbar or to start selecting text, is the reader taking over.
+ */
+export function pointerPressStopsLiveFollow(target: EventTarget | null): boolean {
+  const element = target as Partial<Pick<Element, "closest">> | null;
+  return (
+    typeof element?.closest !== "function" || element.closest(TIMELINE_CONTROL_SELECTOR) === null
+  );
+}
+
 /** Programmatic timeline scrolls jump instead of gliding when the user asks for reduced motion. */
 export function timelineScrollAnimates(): boolean {
   return (
