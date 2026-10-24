@@ -9102,8 +9102,8 @@ struct OpenReasoning {
     /// The time the entry's first delta was buffered: its first row's `createdAt`, so the
     /// thought sorts before the tool call that followed it, however late it is written.
     first_buffered_at: Option<String>,
-    /// Bytes written and buffered so far.
-    length: usize,
+    /// Bytes written so far.
+    written: usize,
     full: bool,
 }
 
@@ -9135,31 +9135,40 @@ impl ReasoningCoalescer {
                 buffer: String::new(),
                 window_started: None,
                 first_buffered_at: None,
-                length: 0,
+                written: 0,
                 full: false,
             });
         if entry.full {
             return;
         }
-        // Streamed text keeps room for the mark, so a cut always shows and never overshoots the
-        // bound, however close to it the text already is.
-        let text_room = REASONING_ENTRY_MAX_BYTES - REASONING_TRUNCATION_MARK.len();
-        let appended = if entry.length + delta.len() <= text_room {
-            delta.to_owned()
+        if entry.written + entry.buffer.len() + delta.len() <= REASONING_ENTRY_MAX_BYTES {
+            entry.buffer.push_str(delta);
         } else {
+            // The cut keeps room for the mark, so it always shows and never overshoots the
+            // bound. A window's write never passes that room (see `flush_entry`), so the mark
+            // still fits after text already written.
             entry.full = true;
-            let room = text_room.saturating_sub(entry.length);
-            format!(
-                "{}{REASONING_TRUNCATION_MARK}",
-                &delta[..delta.floor_char_boundary(room)]
-            )
-        };
-        if entry.buffer.is_empty() {
+            let text_room = REASONING_ENTRY_MAX_BYTES - REASONING_TRUNCATION_MARK.len();
+            if let Some(room) = text_room.checked_sub(entry.written) {
+                if room <= entry.buffer.len() {
+                    entry
+                        .buffer
+                        .truncate(entry.buffer.floor_char_boundary(room));
+                } else {
+                    let rest = room - entry.buffer.len();
+                    entry
+                        .buffer
+                        .push_str(&delta[..delta.floor_char_boundary(rest)]);
+                }
+                entry.buffer.push_str(REASONING_TRUNCATION_MARK);
+            }
+            // Otherwise a final write already released text past the room, after which the
+            // entry went on streaming: the bound still holds, without the mark.
+        }
+        if entry.window_started.is_none() && !entry.buffer.is_empty() {
             entry.window_started = Some(Instant::now());
         }
         entry.first_buffered_at.get_or_insert_with(now);
-        entry.length += appended.len();
-        entry.buffer.push_str(&appended);
     }
 
     /// The end of the earliest open window, if any entry has buffered text.
@@ -9171,18 +9180,39 @@ impl ReasoningCoalescer {
             .map(|started| started + REASONING_FLUSH_WINDOW)
     }
 
-    fn flush_entry(reasoning_id: &str, entry: &mut OpenReasoning) -> Option<OrchestrationCommand> {
+    /// The entry's buffered text as one write. A window's write (`last` false) holds back what
+    /// passes the bound less the mark's width, until a later delta shows whether the entry is
+    /// cut; the entry's last write releases it, so text that fits is never cut.
+    fn flush_entry(
+        reasoning_id: &str,
+        entry: &mut OpenReasoning,
+        last: bool,
+    ) -> Option<OrchestrationCommand> {
         if entry.buffer.is_empty() {
             return None;
         }
         entry.window_started = None;
+        let end = if last || entry.full {
+            entry.buffer.len()
+        } else {
+            let text_room = REASONING_ENTRY_MAX_BYTES - REASONING_TRUNCATION_MARK.len();
+            entry
+                .buffer
+                .floor_char_boundary(text_room.saturating_sub(entry.written))
+        };
+        if end == 0 {
+            return None;
+        }
+        let held_back = entry.buffer.split_off(end);
+        let delta = std::mem::replace(&mut entry.buffer, held_back);
+        entry.written += delta.len();
         // The first row keeps the time the entry began; later rows carry their own time.
         let created_at = entry.first_buffered_at.take().unwrap_or_else(now);
         Some(OrchestrationCommand::ThreadReasoningDelta {
             command_id: format!("provider:{}", Uuid::new_v4()),
             thread_id: entry.thread_id.clone(),
             reasoning_id: reasoning_id.to_owned(),
-            delta: std::mem::take(&mut entry.buffer),
+            delta,
             turn_id: entry.turn_id.clone(),
             created_at,
         })
@@ -9197,7 +9227,7 @@ impl ReasoningCoalescer {
                     .window_started
                     .is_some_and(|started| started + REASONING_FLUSH_WINDOW <= now)
             })
-            .filter_map(|(id, entry)| Self::flush_entry(id, entry))
+            .filter_map(|(id, entry)| Self::flush_entry(id, entry, false))
             .collect()
     }
 
@@ -9206,7 +9236,7 @@ impl ReasoningCoalescer {
         self.entries
             .iter_mut()
             .filter(|(_, entry)| entry.turn_id.as_deref() == turn_id)
-            .filter_map(|(id, entry)| Self::flush_entry(id, entry))
+            .filter_map(|(id, entry)| Self::flush_entry(id, entry, true))
             .collect()
     }
 
@@ -9214,7 +9244,7 @@ impl ReasoningCoalescer {
     fn take_all(&mut self) -> Vec<OrchestrationCommand> {
         self.entries
             .iter_mut()
-            .filter_map(|(id, entry)| Self::flush_entry(id, entry))
+            .filter_map(|(id, entry)| Self::flush_entry(id, entry, true))
             .collect()
     }
 
@@ -9233,7 +9263,7 @@ impl ReasoningCoalescer {
         let mut commands = Vec::new();
         let turn_id = match opened {
             Some(mut entry) => {
-                commands.extend(Self::flush_entry(&reasoning_id, &mut entry));
+                commands.extend(Self::flush_entry(&reasoning_id, &mut entry, true));
                 entry.turn_id
             }
             None if text.is_some() => event.turn_id.clone(),
@@ -20943,6 +20973,68 @@ done
                 other => panic!("unexpected {}", other.command_type()),
             })
             .collect::<String>();
+        assert_eq!(written.len(), super::REASONING_ENTRY_MAX_BYTES);
+        assert!(written.ends_with('…'), "the cut shows");
+    }
+
+    fn written_reasoning_text(commands: Vec<super::OrchestrationCommand>) -> String {
+        commands
+            .into_iter()
+            .filter_map(|command| match command {
+                super::OrchestrationCommand::ThreadReasoningDelta { delta, .. } => Some(delta),
+                super::OrchestrationCommand::ThreadReasoningComplete { text: None, .. } => None,
+                other => panic!("unexpected {}", other.command_type()),
+            })
+            .collect()
+    }
+
+    /// Text that fits the bound is kept whole, even when it ends within the ellipsis's width
+    /// of it, and whether the pump ends or the entry completes. A window's write holds back the
+    /// last few bytes until the entry is known to fit, so a later cut can still show.
+    #[tokio::test]
+    async fn an_entry_that_fits_its_bound_is_never_cut() {
+        let delta = |text: String| {
+            reasoning_test_event(
+                "content.delta",
+                "turn-1",
+                Some("msg-1:0"),
+                json!({"streamKind":"reasoning_text","delta":text}),
+            )
+        };
+        let completion = reasoning_test_event(
+            "item.completed",
+            "turn-1",
+            Some("msg-1:0"),
+            json!({"itemType":"reasoning"}),
+        );
+        let full = "x".repeat(super::REASONING_ENTRY_MAX_BYTES);
+        let window_ended = || tokio::time::Instant::now() + super::REASONING_FLUSH_WINDOW;
+
+        let mut coalescer = super::ReasoningCoalescer::default();
+        coalescer.observe_delta(&delta(full.clone()));
+        let written = written_reasoning_text(coalescer.take_all());
+        assert!(
+            written == full,
+            "the pump's end kept {} bytes",
+            written.len()
+        );
+
+        let mut coalescer = super::ReasoningCoalescer::default();
+        coalescer.observe_delta(&delta(full.clone()));
+        let mut written = written_reasoning_text(coalescer.take_due(window_ended()));
+        written.push_str(&written_reasoning_text(coalescer.complete(&completion)));
+        assert!(
+            written == full,
+            "a window's write and the completion kept {} bytes",
+            written.len()
+        );
+
+        // A window wrote all it could; the next delta overflows and the cut still shows.
+        let mut coalescer = super::ReasoningCoalescer::default();
+        coalescer.observe_delta(&delta("x".repeat(super::REASONING_ENTRY_MAX_BYTES - 1)));
+        let mut written = written_reasoning_text(coalescer.take_due(window_ended()));
+        coalescer.observe_delta(&delta("more".to_owned()));
+        written.push_str(&written_reasoning_text(coalescer.take_all()));
         assert_eq!(written.len(), super::REASONING_ENTRY_MAX_BYTES);
         assert!(written.ends_with('…'), "the cut shows");
     }
