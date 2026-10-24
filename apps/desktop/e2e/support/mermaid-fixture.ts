@@ -15,20 +15,34 @@ function filler(label: string, count: number): string {
 
 /** Prompts the fixture Codex provider answers with diagram replies instead of its fixed text. */
 export const mermaidFixturePrompts = {
+  short: "reply with deterministic short mermaid",
   rows: "reply with deterministic mermaid rows",
   long: "reply with deterministic long text",
   many: "reply with deterministic mermaid evictions",
+  manyAgain: "reply with deterministic second mermaid evictions",
+  streamed: "reply with deterministic streamed mermaid",
+  streamedPlain: "reply with deterministic streamed plain code",
 } as const;
 
 /** A diagram source with only labels the packaged checks look for. */
 export const mermaidFixtureDiagram = "flowchart LR\n  write[Fixture write] --> draw[Fixture draw]";
 
+/** A diagram in a reply shorter than the timeline, so its sent row stays anchored at the top. */
+export const mermaidFixtureShortDiagram =
+  "flowchart LR\n  sent[Sent row] --> kept[Kept at the top]";
+
 /**
- * The fixture provider's replies. `rows` holds a diagram with text below it in the same row;
- * `long` is a following row of plain text; `many` holds 101 distinct diagrams, more than the
- * diagram cache keeps, so the first is drawn again when it mounts again.
+ * The fixture provider's replies. `short` fits below its sent row; `rows` holds a diagram
+ * with text below it in the same row; `long` is a following row of plain text; `many` holds
+ * 101 distinct diagrams, more than the diagram cache keeps, so the first is drawn again when
+ * it mounts again; `manyAgain` holds 101 others, which evict every earlier diagram.
  */
 export const mermaidFixtureReplies: Readonly<Record<string, string>> = {
+  [mermaidFixturePrompts.short]: [
+    "Short diagram reply.",
+    fence(mermaidFixtureShortDiagram),
+    "After the short diagram.",
+  ].join("\n\n"),
   [mermaidFixturePrompts.rows]: [
     "Diagram reply intro.",
     fence(mermaidFixtureDiagram),
@@ -41,7 +55,42 @@ export const mermaidFixtureReplies: Readonly<Record<string, string>> = {
     ),
     "Last line after the diagrams.",
   ].join("\n\n"),
+  [mermaidFixturePrompts.manyAgain]: [
+    ...Array.from({ length: 101 }, (_, index) =>
+      fence(`flowchart LR\n  a${String(index)}[Again ${String(index)}] --> b${String(index)}`),
+    ),
+    "Last line after the second diagrams.",
+  ].join("\n\n"),
 };
+
+/** The streamed reply's last line, which the timeline follows while the reply streams. */
+export const mermaidFixtureStreamedLastLine = "Last streamed line.";
+
+/**
+ * Replies the fixture provider streams one delta per chunk. `streamed` is taller than the
+ * timeline before its diagram, so the list follows its end when the diagram's closing fence
+ * arrives and the diagram draws, with more text still to come after it.
+ */
+export const mermaidFixtureStreamedReplies: Readonly<Record<string, readonly string[]>> = {
+  [mermaidFixturePrompts.streamed]: streamedReply("mermaid"),
+  [mermaidFixturePrompts.streamedPlain]: streamedReply("text"),
+};
+
+/**
+ * `streamedPlain` streams the same reply with the diagram's source in a plain code block, the
+ * baseline for how closely the timeline follows a streaming end without a diagram drawing.
+ */
+function streamedReply(language: "mermaid" | "text"): readonly string[] {
+  return [
+    `Streamed reply intro.\n\n${filler("Streamed before", 30)}\n\n`,
+    `\`\`\`${language}\nflowchart LR\n  streamed[Streamed draw] --> done[Streamed done]\n\`\`\`\n\n`,
+    ...Array.from(
+      { length: 6 },
+      (_, index) => `Streamed after paragraph ${String(index + 1)} keeps the end in view.\n\n`,
+    ),
+    mermaidFixtureStreamedLastLine,
+  ];
+}
 
 /** Workspace Markdown files the Files rendered view opens. */
 export const mermaidFixtureFiles = {
