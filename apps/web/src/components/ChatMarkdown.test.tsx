@@ -1,4 +1,5 @@
 import { renderToStaticMarkup } from "react-dom/server";
+import { getSharedHighlighter } from "@pierre/diffs";
 import { DEFAULT_CLIENT_SETTINGS } from "@bibcode/contracts/settings";
 import { act, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
@@ -6,6 +7,7 @@ import { Window } from "happy-dom";
 import { afterEach, beforeEach, describe, expect, it } from "vite-plus/test";
 import { vi } from "vite-plus/test";
 import { __setClientSettingsForTests } from "../hooks/useSettings";
+import { writeThemePreference } from "../hooks/useTheme";
 
 vi.mock("./ui/menu", () => ({
   Menu: ({ children }: { children?: ReactNode }) => <>{children}</>,
@@ -899,6 +901,179 @@ describe("ChatMarkdown", () => {
         },
         failure,
       );
+    });
+  });
+
+  describe("streaming replies", () => {
+    const STREAMED_LANGUAGES = ["ts", "py", "js", "sh"] as const;
+
+    function streamingRoot() {
+      const container = document.createElement("div");
+      document.body.append(container);
+      const root = createRoot(container);
+      mountedTrees.push({ container, root });
+      return {
+        container,
+        root,
+        render: async (text: string, isStreaming = true) => {
+          const ChatMarkdown = ChatMarkdownComponent!;
+          await act(async () =>
+            root.render(<ChatMarkdown text={text} cwd={undefined} isStreaming={isStreaming} />),
+          );
+        },
+      };
+    }
+
+    /** Loads each grammar once, so no streamed block waits on a grammar mid-test. */
+    async function warmStreamingGrammars() {
+      for (const language of STREAMED_LANGUAGES) {
+        const warm = streamingRoot();
+        await warm.render(`\`\`\`${language}\nwarm\n`);
+        for (let attempt = 0; !warm.container.querySelector(".chat-markdown-shiki"); attempt++) {
+          if (attempt > 100) throw new Error(`the ${language} grammar never loaded`);
+          await act(async () => new Promise((resolve) => setTimeout(resolve, 20)));
+        }
+      }
+    }
+
+    async function sharedHighlighter() {
+      return getSharedHighlighter({
+        themes: ["pierre-dark", "pierre-light"],
+        langs: ["ts"],
+        preferredHighlighter: "shiki-js",
+      });
+    }
+
+    it("keeps completed code lines and block controls mounted while the reply grows", async () => {
+      await warmStreamingGrammars();
+      const stream = streamingRoot();
+      await stream.render("Intro\n\n```ts\nconst completed = 1;\nconst cur");
+      const firstLine = stream.container.querySelector(".chat-markdown-shiki .line");
+      expect(firstLine?.textContent).toBe("const completed = 1;");
+      await click(
+        stream.container.querySelector<HTMLElement>(
+          ".chat-markdown-codeblock button[aria-pressed]",
+        )!,
+      );
+      const wrapState = () =>
+        stream.container.querySelector(".chat-markdown-codeblock")?.getAttribute("data-wrap");
+      const toggled = wrapState();
+
+      await stream.render(
+        "Intro\n\n```ts\nconst completed = 1;\nconst current = 2;\n```\n\nAfter **bold**",
+      );
+
+      expect(stream.container.querySelector(".chat-markdown-shiki .line")).toBe(firstLine);
+      expect(firstLine?.isConnected).toBe(true);
+      expect(wrapState()).toBe(toggled);
+    });
+
+    it("keeps a details block the user opened while the reply grows, and follows an edited open attribute", async () => {
+      const details = (open: string, body: string) =>
+        `<details${open}>\n<summary>More</summary>\n\n${body}\n\n</details>`;
+      const isOpen = (container: HTMLElement) =>
+        container.querySelector<HTMLElement>("[data-markdown-details]")?.dataset
+          .markdownDetailsOpen;
+      const stream = streamingRoot();
+      await stream.render(details("", "Body"));
+      await click(stream.container.querySelector<HTMLElement>("[data-markdown-details-summary]")!);
+      await stream.render(details("", "Body and more"));
+      expect(isOpen(stream.container)).toBe("true");
+
+      // An edit to the authored attribute, as in the rendered view of a Markdown file.
+      const edited = streamingRoot();
+      await edited.render(details("", "Body"), false);
+      await edited.render(details(" open", "Body"), false);
+      expect(isOpen(edited.container)).toBe("true");
+      await edited.render(details("", "Body"), false);
+      expect(isOpen(edited.container)).toBe("false");
+    });
+
+    it("does not highlight completed lines again on a delta or when the reply finishes", async () => {
+      await warmStreamingGrammars();
+      const stream = streamingRoot();
+      const text = "```ts\nconst completed = 1;\nconst cur";
+      await stream.render(text);
+      const firstLine = stream.container.querySelector(".chat-markdown-shiki .line");
+      const highlighter = await sharedHighlighter();
+      const toHast = vi.spyOn(highlighter, "codeToHast");
+      const toHtml = vi.spyOn(highlighter, "codeToHtml");
+      const highlightedCompletedLine = () =>
+        [...toHast.mock.calls, ...toHtml.mock.calls].some(([code]) =>
+          code.includes("const completed"),
+        );
+
+      await stream.render(`${text}rent = 2;`);
+      expect(highlightedCompletedLine()).toBe(false);
+      const finished = `${text}rent = 2;\n\`\`\``;
+      await stream.render(finished, false);
+      await act(async () => new Promise((resolve) => setTimeout(resolve, 50)));
+
+      expect(highlightedCompletedLine()).toBe(false);
+      // The finished block stays highlighted in place, without dropping back to plain text.
+      expect(stream.container.querySelector(".chat-markdown-shiki .line")).toBe(firstLine);
+      // A remount, such as scrolling back to the row, shows the finished highlight at once.
+      const remount = streamingRoot();
+      const ChatMarkdown = ChatMarkdownComponent!;
+      act(() => remount.root.render(<ChatMarkdown text={finished} cwd={undefined} />));
+      expect(remount.container.innerHTML).toContain("chat-markdown-shiki");
+    });
+
+    it("renders each streamed prefix as a fresh render of it, across a theme switch", async () => {
+      await warmStreamingGrammars();
+      const text = [
+        "Intro with a [link](https://example.com) and `code`.",
+        "",
+        "```ts",
+        "const a = 1;",
+        "const b = 2;",
+        "```",
+        "",
+        "~~~py",
+        "x = 1",
+        "~~~",
+        "",
+        "> ```js",
+        "> quoted();",
+        "> ```",
+        "",
+        "- [ ] task",
+        "  ```sh",
+        "  echo hi",
+        "  ```",
+        "",
+        "Done.",
+      ].join("\n");
+      // Compares the DOM, not its serialization: an element updated in place lists an attribute
+      // React added later after the others. Tooltip ids come from useId, which differs per root.
+      const markup = (container: HTMLElement) => {
+        const copy = container.cloneNode(true) as HTMLElement;
+        for (const element of copy.querySelectorAll("*")) {
+          const attributes = [...element.attributes]
+            .filter((attribute) => !attribute.value.startsWith("base-ui-"))
+            .map((attribute) => [attribute.name, attribute.value] as const)
+            .toSorted(([a], [b]) => a.localeCompare(b));
+          while (element.attributes[0]) element.removeAttribute(element.attributes[0].name);
+          for (const [name, value] of attributes) element.setAttribute(name, value);
+        }
+        return copy.innerHTML;
+      };
+      const stream = streamingRoot();
+      let switched = false;
+      for (let end = 5; ; end += 5) {
+        const slice = text.slice(0, Math.min(end, text.length));
+        if (!switched && end >= text.length / 2) {
+          writeThemePreference("dark");
+          switched = true;
+        }
+        await stream.render(slice);
+        const fresh = streamingRoot();
+        await fresh.render(slice);
+        expect(markup(stream.container), `prefix ${slice.length}`).toBe(markup(fresh.container));
+        if (end >= text.length) break;
+      }
+      expect(stream.container.innerHTML).toContain("pierre-dark");
+      expect(stream.container.innerHTML).not.toContain("pierre-light");
     });
   });
 });
