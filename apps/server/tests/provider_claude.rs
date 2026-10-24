@@ -4211,6 +4211,38 @@ fn claude_runtime_opens_no_follow_up_for_one_answered_before_the_message_replay(
     assert_eq!(kinds, vec![("turn.completed", Some("message"))]);
 }
 
+/// The result ignored before a replay is not always the task's answer. A session can resume
+/// with both: the finished task's notification, then the result of the turn that was already
+/// running. That result must not retire the notification, or the answer never gets a turn and
+/// the idle deadline the user's own result arms can suspend Claude while it is still answering.
+#[test]
+fn claude_runtime_keeps_a_follow_up_when_an_unrelated_result_arrives_before_the_replay() {
+    let mut runtime = ClaudeProviderRuntime::new("thread-1".to_owned(), "session-root".to_owned());
+    runtime.start_turn(TurnInput {
+        turn_id: "message".to_owned(),
+        input: "next step".to_owned(),
+    });
+    runtime.await_turn_input(7);
+    runtime.handle_raw_value(&claude_task_notification_turn(), 1_000);
+    let earlier = runtime.handle_raw_value(&claude_result_frame(None), 2_000);
+    assert!(
+        earlier.events.is_empty(),
+        "the earlier turn's result does not end the new one: {:?}",
+        earlier.events
+    );
+
+    runtime.stop_awaiting_turn_input(7);
+    let closed = runtime.handle_raw_value(&claude_result_frame(None), 3_000);
+    let kinds = closed
+        .events
+        .iter()
+        .map(|event| (event.event_type.as_str(), event.turn_id.as_deref()))
+        .collect::<Vec<_>>();
+    assert_eq!(kinds.len(), 2, "{kinds:?}");
+    assert_eq!(kinds[0], ("turn.completed", Some("message")));
+    assert_eq!(kinds[1].0, "turn.started", "{kinds:?}");
+}
+
 /// Two tasks finish during one turn: each answer opens as the turn before it ends. An interrupted
 /// turn opens none, since the user stopped Claude.
 #[test]

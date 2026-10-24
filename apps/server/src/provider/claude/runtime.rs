@@ -1579,9 +1579,10 @@ pub struct ClaudeProviderRuntime {
     /// open: it can replay the task notification just before that turn's `result` (#165). Each
     /// opens when the turn before it ends, so idle suspension waits for its own `result`.
     follow_ups_after_turn: usize,
-    /// Task notifications replayed while a delivered write still awaits its replay. A result
-    /// ignored in that window answered one of them; the rest follow the turn once the write is
-    /// replayed or acknowledged, as a `/compact` is from its `result` alone.
+    /// Task notifications replayed while a delivered write still awaits its replay. A
+    /// `result` whose `origin.kind` is `task-notification`, ignored in that window, answered
+    /// one of them. Any other ignored result did not. The rest follow the turn once the write
+    /// is replayed or acknowledged, as a `/compact` is from its `result` alone.
     follow_ups_awaiting_replay: usize,
     turn_input_cancellation: CancellationToken,
     delivery_acknowledgement_cancellation: CancellationToken,
@@ -1816,13 +1817,25 @@ impl ClaudeProviderRuntime {
     }
 
     pub fn handle_message(&mut self, message: ClaudeMessage) -> Vec<CanonicalEvent> {
+        self.dispatch_message(message, false)
+    }
+
+    /// `result_answers_follow_up` is set from the raw frame's `origin.kind`. `handle_message`
+    /// does not have that field: a decoded `ResultMessage` drops it.
+    fn dispatch_message(
+        &mut self,
+        message: ClaudeMessage,
+        result_answers_follow_up: bool,
+    ) -> Vec<CanonicalEvent> {
         match message {
             ClaudeMessage::StreamEvent(message) => {
                 self.handle_stream_event(message.parent_tool_use_id, message.event)
             }
             ClaudeMessage::User(message) => self.handle_user_message(message.message.content),
             ClaudeMessage::Assistant(message) => self.handle_assistant_message(message),
-            ClaudeMessage::Result(message) => self.handle_result_message(message),
+            ClaudeMessage::Result(message) => {
+                self.handle_result_message(message, result_answers_follow_up)
+            }
         }
     }
 
@@ -1871,10 +1884,10 @@ impl ClaudeProviderRuntime {
     /// Claude answers a finished background task with a turn it starts itself. BiBCode did not
     /// deliver it, so it gets a turn of its own: the thread reads running and the turn's output and
     /// `result` belong to it. Not while a delivered message awaits its replay: on resume Claude
-    /// can run that turn before it reads the message, and its `result` is ignored instead; a
-    /// notification no ignored result answered follows the turn once the write is replayed or
-    /// acknowledged. A replay that arrives while another turn is still open starts its turn when
-    /// that one ends.
+    /// can run that turn before it reads the message, and its `result` is ignored instead. That
+    /// result answers one queued notification only when its `origin.kind` is `task-notification`;
+    /// the rest follow the turn once the write is replayed or acknowledged. A replay that arrives
+    /// while another turn is still open starts its turn when that one ends.
     fn start_provider_turn(&mut self, value: &Value) -> Vec<CanonicalEvent> {
         let follow_up = value.get("type").and_then(Value::as_str) == Some("user")
             && value.pointer("/origin/kind").and_then(Value::as_str) == Some("task-notification")
@@ -2066,10 +2079,18 @@ impl ClaudeProviderRuntime {
                 ..ClaudeRuntimeOutput::default()
             };
         };
+        // Only the answer's own result retires a notification queued while a write awaits its
+        // replay. Another result in that window (the turn Claude was already finishing) must
+        // not, or the answer never gets a turn and idle suspension can stop it mid-reply.
+        let result_answers_follow_up = value.get("type").and_then(Value::as_str) == Some("result")
+            && value.pointer("/origin/kind").and_then(Value::as_str) == Some("task-notification");
         let events = match claude_message_route(&message) {
-            ClaudeMessageRoute::Root => self.handle_message(message),
+            ClaudeMessageRoute::Root => self.dispatch_message(message, result_answers_follow_up),
             ClaudeMessageRoute::ForwardedTaskLifecycle { parent_tool_use_id } => {
-                correlate_forwarded_task_events(self.handle_message(message), &parent_tool_use_id)
+                correlate_forwarded_task_events(
+                    self.dispatch_message(message, result_answers_follow_up),
+                    &parent_tool_use_id,
+                )
             }
             ClaudeMessageRoute::SuppressedChildText => Vec::new(),
         };
@@ -2717,13 +2738,20 @@ impl ClaudeProviderRuntime {
         events
     }
 
-    fn handle_result_message(&mut self, message: ResultMessage) -> Vec<CanonicalEvent> {
+    fn handle_result_message(
+        &mut self,
+        message: ResultMessage,
+        answers_follow_up: bool,
+    ) -> Vec<CanonicalEvent> {
         // Seen right after a suspended session resumes: Claude reports a result before it
         // replays the new message. Ending the new turn there leaves its work running while
         // the thread reads ready. An error still ends it; Claude can fail before reading.
         if self.turn_input_awaiting_replay.is_some() && !message.is_error {
-            // It answered a task notification replayed in the same window.
-            self.follow_ups_awaiting_replay = self.follow_ups_awaiting_replay.saturating_sub(1);
+            // The task's own result answered one notification replayed in this window. The
+            // result of the turn that was already running did not.
+            if answers_follow_up {
+                self.follow_ups_awaiting_replay = self.follow_ups_awaiting_replay.saturating_sub(1);
+            }
             tracing::info!(
                 thread_id = %self.thread_id,
                 "ignored a Claude result that arrived before the turn's input was read"
