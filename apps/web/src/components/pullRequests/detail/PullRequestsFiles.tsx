@@ -23,6 +23,7 @@ import { useClientSettings } from "../../../hooks/useSettings";
 import { usePullRequestsStore } from "../../../pullRequestsStore";
 import { DiffWorkerPoolProvider } from "../../DiffWorkerPoolProvider";
 import { PullRequestsExternalLink } from "../shared/PullRequestsMarkdown";
+import { ChangedFilesSplit } from "./ChangedFilesSplit";
 import { fileTree, type FileTreeRow } from "./pullRequestsDetail.logic";
 import { PullRequestsReviewFile } from "../review/PullRequestsReviewFile";
 import { usePullRequestsFileAnchor, usePullRequestsNavigation } from "./pullRequestsNavigation";
@@ -374,11 +375,8 @@ export const PullRequestsFiles = memo(function PullRequestsFiles({
         {files.files.length === 0 ? (
           <p className="p-4 text-sm text-muted-foreground">No files changed</p>
         ) : (
-          <div className="flex min-h-0 flex-1 flex-col @3xl/pull-request:flex-row">
-            <nav
-              aria-label="Changed files"
-              className="flex h-48 shrink-0 flex-col border-b border-border @3xl/pull-request:h-auto @3xl/pull-request:w-64 @3xl/pull-request:border-r @3xl/pull-request:border-b-0"
-            >
+          <ChangedFilesSplit
+            tree={
               <LegendList
                 data={rows}
                 keyExtractor={rowKey}
@@ -389,29 +387,31 @@ export const PullRequestsFiles = memo(function PullRequestsFiles({
                 getFixedItemSize={treeRowSize}
                 className="min-h-0 flex-1"
               />
-            </nav>
-            <Suspense
-              fallback={
-                <p role="status" className="p-4 text-sm">
-                  Preparing diffs…
-                </p>
-              }
-            >
-              <DiffWorkerPoolProvider>
-                <LegendList
-                  ref={list}
-                  data={files.files}
-                  keyExtractor={fileKey}
-                  renderItem={renderFile}
-                  extraData={renderFile}
-                  recycleItems={false}
-                  estimatedItemSize={300}
-                  initialScrollIndex={anchorPath === null ? 0 : (indices.get(anchorPath) ?? 0)}
-                  className="min-h-0 min-w-0 flex-1"
-                />
-              </DiffWorkerPoolProvider>
-            </Suspense>
-          </div>
+            }
+            files={
+              <Suspense
+                fallback={
+                  <p role="status" className="p-4 text-sm">
+                    Preparing diffs…
+                  </p>
+                }
+              >
+                <DiffWorkerPoolProvider>
+                  <LegendList
+                    ref={list}
+                    data={files.files}
+                    keyExtractor={fileKey}
+                    renderItem={renderFile}
+                    extraData={renderFile}
+                    recycleItems={false}
+                    estimatedItemSize={300}
+                    initialScrollIndex={anchorPath === null ? 0 : (indices.get(anchorPath) ?? 0)}
+                    className="min-h-0 min-w-0 flex-1"
+                  />
+                </DiffWorkerPoolProvider>
+              </Suspense>
+            }
+          />
         )}
       </section>
     </PullRequestsSuggestionSelectionContext>
