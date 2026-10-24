@@ -5,7 +5,7 @@ import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 
 import { desktopActivityFixture, desktopActivityMarkerFileName } from "./activity-events.ts";
-import { mermaidFixtureReplies } from "./mermaid-fixture.ts";
+import { mermaidFixtureReplies, mermaidFixtureStreamedReplies } from "./mermaid-fixture.ts";
 
 const FIXTURE_PROJECT_NAME = "BiBCode UI Fixture";
 const STREAMED_RESPONSE = "BiBCode deterministic streamed fixture response.";
@@ -117,6 +117,7 @@ if (process.argv.includes("--help")) {
 const send = (message) => process.stdout.write(JSON.stringify(message) + "\n");
 const streamResponse = ${JSON.stringify(STREAMED_RESPONSE)};
 const promptReplies = ${JSON.stringify(mermaidFixtureReplies)};
+const streamedReplies = ${JSON.stringify(mermaidFixtureStreamedReplies)};
 const activity = ${JSON.stringify(desktopActivityFixture)};
 const activityStartedAt = Math.floor(Date.now() / 1000);
 const activityObservedAt = () => Math.max(activityStartedAt, Math.floor(Date.now() / 1000));
@@ -334,12 +335,15 @@ if (!Number.isSafeInteger(slowTurnTimeoutMs) || slowTurnTimeoutMs <= 0) {
 let activeTurnId = null;
 let slowTurnTimer;
 let slowTurnPoll;
+// A streamed reply sends its next chunk on this timer; it ends with the turn.
+let streamedReplyTimer;
 const clearSlowTurn = () => {
   clearTimeout(slowTurnTimer);
   clearInterval(slowTurnPoll);
 };
 const completeTurn = (status = "completed") => {
   clearSlowTurn();
+  clearInterval(streamedReplyTimer);
   const turnId = activeTurnId;
   activeTurnId = null;
   if (turnId === null) return;
@@ -456,12 +460,22 @@ reader.on("line", (line) => {
         threadId: "bibcode-ui-provider-thread",
         turn: { id: turnId }
       } });
-      send({ method: "item/agentMessage/delta", params: {
+      const sendDelta = (delta) => send({ method: "item/agentMessage/delta", params: {
         threadId: "bibcode-ui-provider-thread",
         turnId,
         itemId: "bibcode-ui-message-" + turnId,
-        delta: Object.hasOwn(promptReplies, prompt) ? promptReplies[prompt] : streamResponse
+        delta
       } });
+      if (Object.hasOwn(streamedReplies, prompt)) {
+        const chunks = [...streamedReplies[prompt]];
+        sendDelta(chunks.shift());
+        streamedReplyTimer = setInterval(() => {
+          sendDelta(chunks.shift());
+          if (chunks.length === 0) completeTurn();
+        }, 300);
+        break;
+      }
+      sendDelta(Object.hasOwn(promptReplies, prompt) ? promptReplies[prompt] : streamResponse);
       if (prompt.includes("[[slow]]")) {
         slowTurnTimer = setTimeout(completeTurn, slowTurnTimeoutMs);
         slowTurnPoll = setInterval(() => {
