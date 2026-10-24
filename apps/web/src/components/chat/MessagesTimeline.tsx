@@ -4,12 +4,14 @@ import { deliveryProviderLabel, waitsBehind, type QueuedCardStatus } from "../Ch
 import {
   type EnvironmentId,
   type MessageId,
+  type OrchestrationReasoning,
   type ProviderInstanceId,
   type ScopedThreadRef,
   type ServerProviderSkill,
   type TurnId,
 } from "@bibcode/contracts";
 import { parseScopedThreadKey } from "@bibcode/client-runtime/environment";
+import { reasoningLabel, reasoningPreview } from "@bibcode/client-runtime/state/reasoning";
 import { resolveChatListAnchoredEndSpace } from "@bibcode/shared/chatList";
 import {
   createContext,
@@ -46,6 +48,7 @@ import {
 import ChatMarkdown from "../ChatMarkdown";
 import {
   BotIcon,
+  BrainIcon,
   CheckIcon,
   ChevronDownIcon,
   ChevronRightIcon,
@@ -164,6 +167,8 @@ interface TimelineRowSharedState {
   /** `expanded` is what the row shows now; the toggle flips it. */
   onToggleTurnFold: (turnId: TurnId, expanded: boolean) => void;
   onToggleWorkGroup: (groupId: string, expanded: boolean, anchorElement?: HTMLElement) => void;
+  /** A Thinking row was expanded or collapsed: the owner keeps the end in view if it was. */
+  onReasoningRowToggle: () => void;
 }
 
 interface TimelineRowActivityState {
@@ -229,6 +234,7 @@ interface MessagesTimelineProps {
   contentInsetEndAdjustment: number;
   onIsAtEndChange: (isAtEnd: boolean) => void;
   onManualNavigation: () => void;
+  onReasoningRowToggle: () => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -276,6 +282,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   contentInsetEndAdjustment,
   onIsAtEndChange,
   onManualNavigation,
+  onReasoningRowToggle,
 }: MessagesTimelineProps) {
   const [turnFoldChoices, setTurnFoldChoices] = useState<ReadonlyMap<TurnId, boolean>>(
     () => new Map(),
@@ -474,6 +481,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       onOpenTurnDiff,
       onToggleTurnFold,
       onToggleWorkGroup,
+      onReasoningRowToggle,
     }),
     [
       timestampFormat,
@@ -499,6 +507,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       onOpenTurnDiff,
       onToggleTurnFold,
       onToggleWorkGroup,
+      onReasoningRowToggle,
     ],
   );
   const unsettledTurnId = deriveUnsettledTurnId(latestTurn, runningTurnId);
@@ -1445,14 +1454,20 @@ function WorkingIndicatorIcon() {
 function WorkingTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "working" }> }) {
   return (
     <div className="py-0.5 pl-1.5">
-      <div className="flex items-center gap-2 pt-1 text-xs text-muted-foreground tabular-nums">
+      <div className="flex min-w-0 items-center gap-2 pt-1 text-xs text-muted-foreground tabular-nums">
         <WorkingIndicatorIcon />
-        <span>
+        {/* The timer never truncates; the thought takes what is left of the one line. */}
+        <span className="shrink-0">
           {row.answerDelivered
             ? "Answer delivered — waiting for the provider to close the turn "
             : "Waiting for "}
           <WorkingTimer createdAt={row.createdAt} />
         </span>
+        {row.latestThought !== null ? (
+          <span className="min-w-0 truncate" data-working-latest-thought="">
+            {`· ${row.latestThought}`}
+          </span>
+        ) : null}
       </div>
     </div>
   );
@@ -1521,11 +1536,17 @@ const WorkGroupSection = memo(function WorkGroupSection({
     () => groupedEntries.filter((entry) => !workEntryIndicatesToolNeutralStatus(entry)),
     [groupedEntries],
   );
-  const onlyToolEntries = nonEmptyEntries.every((entry) => workLogEntryIsToolLike(entry));
+  // A thought reads as a step beside tool calls, not as a log entry that needs a heading.
+  const onlyToolEntries = nonEmptyEntries.every(
+    (entry) => workLogEntryIsToolLike(entry) || entry.tone === "reasoning",
+  );
+  const [singularNoun, pluralNoun] = nonEmptyEntries.some((entry) => entry.tone === "reasoning")
+    ? ["step", "steps"]
+    : ["tool call", "tool calls"];
   const groupLabel = onlyToolEntries
     ? nonEmptyEntries.length === 1
-      ? "1 tool call"
-      : `${nonEmptyEntries.length} tool calls`
+      ? `1 ${singularNoun}`
+      : `${nonEmptyEntries.length} ${pluralNoun}`
     : "Work Log";
 
   if (nonEmptyEntries.length === 0) return null;
@@ -1536,13 +1557,21 @@ const WorkGroupSection = memo(function WorkGroupSection({
         <p className="px-0.5 pb-0.5 font-medium text-xs text-muted-foreground">{groupLabel}</p>
       )}
       <div className="space-y-px">
-        {nonEmptyEntries.map((workEntry) => (
-          <SimpleWorkEntryRow
-            key={workEntry.id}
-            workEntry={workEntry}
-            workspaceRoot={workspaceRoot}
-          />
-        ))}
+        {nonEmptyEntries.map((workEntry) =>
+          workEntry.reasoning !== undefined ? (
+            <ReasoningWorkEntryRow
+              key={workEntry.id}
+              workEntry={workEntry}
+              reasoning={workEntry.reasoning}
+            />
+          ) : (
+            <SimpleWorkEntryRow
+              key={workEntry.id}
+              workEntry={workEntry}
+              workspaceRoot={workspaceRoot}
+            />
+          ),
+        )}
       </div>
     </section>
   );
@@ -1554,8 +1583,16 @@ function WorkGroupToggleTimelineRow({
   row: Extract<TimelineRow, { kind: "work-toggle" }>;
 }) {
   const ctx = use(TimelineRowCtx);
-  const singularNoun = row.onlyToolEntries ? "tool call" : "log entry";
-  const pluralNoun = row.onlyToolEntries ? "tool calls" : "log entries";
+  const singularNoun = row.hidesReasoning
+    ? "step"
+    : row.onlyToolEntries
+      ? "tool call"
+      : "log entry";
+  const pluralNoun = row.hidesReasoning
+    ? "steps"
+    : row.onlyToolEntries
+      ? "tool calls"
+      : "log entries";
 
   return (
     <button
@@ -2467,3 +2504,111 @@ const SimpleWorkEntryRow = memo(function SimpleWorkEntryRow(props: {
     </div>
   );
 });
+
+/** Within this distance of its end, an expanded live trace keeps following its newest text. */
+const REASONING_TRACE_FOLLOW_SLACK_PX = 4;
+
+/**
+ * A provider's thought (#173). Collapsed, one line reads "Thought - <what it is about>", or
+ * "Thinking - …" while it streams; the whole line is the toggle, opened by Verbose chat as
+ * tool rows are. Expanded, it shows the full trace.
+ */
+const ReasoningWorkEntryRow = memo(function ReasoningWorkEntryRow(props: {
+  workEntry: TimelineWorkEntry;
+  reasoning: OrchestrationReasoning;
+}) {
+  const { workEntry, reasoning } = props;
+  const { verboseChat, workEntryExpandedChoices, onReasoningRowToggle } = use(TimelineRowCtx);
+  const activity = use(TimelineRowActivityCtx);
+  // The user's choice wins, as on tool rows; until then Verbose chat opens settled thoughts.
+  const [expandedChoice, setExpandedChoice] = useState(
+    () => workEntryExpandedChoices.get(workEntry.id) ?? null,
+  );
+  const expanded =
+    expandedChoice ??
+    (verboseChat && !isWorkEntryInUnsettledTurn(workEntry, activity.unsettledTurnId));
+  const toggleExpanded = () => {
+    workEntryExpandedChoices.set(workEntry.id, !expanded);
+    setExpandedChoice(!expanded);
+    onReasoningRowToggle();
+  };
+  const preview = reasoningPreview(reasoning);
+
+  return (
+    <div className="flex flex-col" data-reasoning-id={reasoning.id}>
+      <button
+        type="button"
+        aria-expanded={expanded}
+        className="flex w-full min-w-0 cursor-pointer items-center gap-1.5 rounded-md px-0.5 py-0.5 text-left text-xs leading-5 text-muted-foreground transition-colors hover:bg-accent/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/70"
+        onClick={toggleExpanded}
+      >
+        <span className="flex size-5 shrink-0 items-center justify-center">
+          <BrainIcon className="block size-3.5 shrink-0 stroke-[1.8] opacity-80" aria-hidden />
+        </span>
+        <span className="min-w-0 flex-1 truncate">
+          <span className="font-medium">{reasoningLabel(reasoning)}</span>
+          {preview !== null ? ` - ${preview}` : null}
+        </span>
+        <span className="flex size-4 shrink-0 items-center justify-center" aria-hidden>
+          <ChevronDownIcon
+            className={cn(
+              "size-3 shrink-0 opacity-70 transition-transform duration-200",
+              expanded && "rotate-180",
+            )}
+          />
+        </span>
+      </button>
+      {expanded ? <ReasoningTrace text={reasoning.text} streaming={reasoning.streaming} /> : null}
+    </div>
+  );
+});
+
+/**
+ * The full trace, rendered as the assistant's Markdown is. While it streams it follows its
+ * newest text, until the reader scrolls up; scrolling back to within a few pixels of the end
+ * resumes following.
+ */
+function ReasoningTrace({ text, streaming }: { text: string; streaming: boolean }) {
+  const ctx = use(TimelineRowCtx);
+  const scrollerRef = useRef<HTMLDivElement>(null);
+  const followingRef = useRef(true);
+  useLayoutEffect(() => {
+    // Layout is read only while the trace streams.
+    if (!streaming || !followingRef.current) {
+      return;
+    }
+    const scroller = scrollerRef.current;
+    if (scroller) {
+      scroller.scrollTop = scroller.scrollHeight;
+    }
+  }, [streaming, text]);
+  const onScroll = () => {
+    const scroller = scrollerRef.current;
+    if (scroller) {
+      followingRef.current =
+        scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight <=
+        REASONING_TRACE_FOLLOW_SLACK_PX;
+    }
+  };
+
+  return (
+    <div className="mt-1 ms-7 border-s border-border/45 ps-3 pt-0.5">
+      <div
+        ref={scrollerRef}
+        className="max-h-64 overflow-auto"
+        data-reasoning-trace=""
+        onScroll={onScroll}
+      >
+        <div data-text-surface="background" className="text-muted-foreground select-text">
+          <ChatMarkdown
+            text={text}
+            cwd={ctx.markdownCwd}
+            threadRef={ctx.threadRef ?? undefined}
+            isStreaming={streaming}
+            skills={ctx.skills}
+          />
+        </div>
+      </div>
+    </div>
+  );
+}

@@ -1,5 +1,11 @@
-import { ProviderDriverKind } from "@bibcode/contracts";
+import { ProviderDriverKind, type OrchestrationReasoning } from "@bibcode/contracts";
 import { describe, expect, it } from "vite-plus/test";
+import {
+  deriveReasoningWorkEntries,
+  deriveTimelineEntries,
+  type WorkLogEntry,
+} from "../../session-logic";
+import { type ChatMessage } from "../../types";
 import {
   computeStableMessagesTimelineRows,
   computeMessageDurationStart,
@@ -14,6 +20,7 @@ import {
   resolveTimelineMinimapStepTargets,
   resolveTimelineMinimapTopPercent,
   type MessagesTimelineRow,
+  type TimelineLatestTurn,
 } from "./MessagesTimeline.logic";
 
 describe("timeline minimap geometry", () => {
@@ -1675,6 +1682,7 @@ describe("computeStableMessagesTimelineRows", () => {
       id: "working-indicator-row",
       createdAt: "2026-08-20T12:00:00.000Z",
       answerDelivered: false,
+      latestThought: null,
     };
     const stable = computeStableMessagesTimelineRows([before], {
       byId: new Map(),
@@ -1698,6 +1706,7 @@ describe("computeStableMessagesTimelineRows", () => {
       id: "working",
       createdAt: null,
       answerDelivered: false,
+      latestThought: null,
     };
     const plan = { steps: [] } as never;
     const proposed: MessagesTimelineRow = {
@@ -1735,6 +1744,7 @@ describe("computeStableMessagesTimelineRows", () => {
       hiddenCount: 2,
       expanded: false,
       onlyToolEntries: true,
+      hidesReasoning: false,
     };
     const initial = computeStableMessagesTimelineRows([toggle], {
       byId: new Map(),
@@ -1744,8 +1754,19 @@ describe("computeStableMessagesTimelineRows", () => {
       computeStableMessagesTimelineRows([{ ...toggle, onlyToolEntries: false }], initial),
     ).not.toBe(initial);
     expect(
+      computeStableMessagesTimelineRows([{ ...toggle, hidesReasoning: true }], initial),
+    ).not.toBe(initial);
+    expect(
       computeStableMessagesTimelineRows(
-        [{ kind: "working", id: "shared", createdAt, answerDelivered: false }],
+        [
+          {
+            kind: "working",
+            id: "shared",
+            createdAt,
+            answerDelivered: false,
+            latestThought: null,
+          },
+        ],
         initial,
       ),
     ).not.toBe(initial);
@@ -2069,5 +2090,190 @@ describe("queued timeline rows", () => {
       "steer",
       "answer",
     ]);
+  });
+});
+
+describe("reasoning rows", () => {
+  const TURN = "turn-1" as never;
+  const thought = (
+    text: string,
+    options: { streaming?: boolean; createdAt?: string } = {},
+  ): OrchestrationReasoning => ({
+    id: "reasoning:t1:item:msg-1:0",
+    turnId: TURN,
+    text,
+    streaming: options.streaming ?? false,
+    createdAt: options.createdAt ?? "2026-01-01T00:00:02Z",
+    updatedAt: options.createdAt ?? "2026-01-01T00:00:02Z",
+  });
+  const tool = (id: string, createdAt: string): WorkLogEntry => ({
+    id,
+    createdAt,
+    turnId: TURN,
+    label: "Ran command",
+    command: `echo ${id}`,
+    tone: "tool",
+    toolLifecycleStatus: "completed",
+  });
+  const message = (
+    id: string,
+    role: "user" | "assistant",
+    text: string,
+    createdAt: string,
+  ): ChatMessage => ({
+    id: id as never,
+    role,
+    text,
+    turnId: role === "assistant" ? TURN : null,
+    createdAt,
+    updatedAt: createdAt,
+    streaming: false,
+  });
+  const settledTurn: TimelineLatestTurn = {
+    turnId: TURN,
+    state: "completed",
+    startedAt: "2026-01-01T00:00:00Z",
+    completedAt: "2026-01-01T00:00:30Z",
+  };
+  const runningTurn: TimelineLatestTurn = { ...settledTurn, state: "running", completedAt: null };
+  const rowsFor = (input: {
+    messages?: ChatMessage[];
+    reasoning?: OrchestrationReasoning[];
+    tools?: WorkLogEntry[];
+    latestTurn?: TimelineLatestTurn;
+    isWorking?: boolean;
+    expandTurn?: boolean;
+  }) =>
+    deriveMessagesTimelineRows({
+      timelineEntries: deriveTimelineEntries(
+        input.messages ?? [],
+        [],
+        [...(input.tools ?? []), ...deriveReasoningWorkEntries(input.reasoning ?? [])],
+      ),
+      latestTurn: input.latestTurn ?? settledTurn,
+      ...(input.expandTurn ? { turnFoldChoices: new Map([[TURN, true]]) } : {}),
+      isWorking: input.isWorking ?? false,
+      activeTurnStartedAt: "2026-01-01T00:00:00Z",
+      turnDiffSummaryByAssistantMessageId: new Map(),
+      revertTurnCountByUserMessageId: new Map(),
+    });
+  const workingRow = (rows: MessagesTimelineRow[]) =>
+    rows.find(
+      (row): row is Extract<MessagesTimelineRow, { kind: "working" }> => row.kind === "working",
+    );
+
+  it("keeps a streaming thought's row id while its text grows", () => {
+    const before = rowsFor({
+      reasoning: [thought("Weighing", { streaming: true })],
+      latestTurn: runningTurn,
+    });
+    const after = rowsFor({
+      reasoning: [thought("Weighing the options", { streaming: true })],
+      latestTurn: runningTurn,
+    });
+    expect(before.map((row) => row.id)).toEqual(["reasoning:t1:item:msg-1:0"]);
+    expect(after.map((row) => row.id)).toEqual(["reasoning:t1:item:msg-1:0"]);
+    const stable = computeStableMessagesTimelineRows(before, { byId: new Map(), result: [] });
+    expect(computeStableMessagesTimelineRows(after, stable).result[0]).toBe(after[0]);
+  });
+
+  it("folds a settled turn's thoughts under Worked for and never picks one as the answer", () => {
+    const input = {
+      messages: [
+        message("user-1", "user", "Fix it", "2026-01-01T00:00:00Z"),
+        message("answer", "assistant", "Fixed.", "2026-01-01T00:00:20Z"),
+      ],
+      reasoning: [thought("A long thought about the fix. ".repeat(20))],
+      tools: [tool("tool-1", "2026-01-01T00:00:05Z")],
+    };
+    expect(rowsFor(input).map((row) => row.id)).toEqual(["user-1", "turn-fold:turn-1", "answer"]);
+    // Opening the fold shows the work, the thought one step behind the newest tool call.
+    const expanded = rowsFor({ ...input, expandTurn: true });
+    expect(expanded.map((row) => row.id)).toEqual([
+      "user-1",
+      "turn-fold:turn-1",
+      "tool-1",
+      "work-toggle:reasoning:t1:item:msg-1:0",
+      "answer",
+    ]);
+    expect(expanded.find((row) => row.kind === "work-toggle")).toMatchObject({
+      hiddenCount: 1,
+      hidesReasoning: true,
+    });
+  });
+
+  it("gives a turn of tools and thoughts alone no empty answer row", () => {
+    const rows = rowsFor({
+      messages: [message("user-1", "user", "Look around", "2026-01-01T00:00:00Z")],
+      reasoning: [thought("Looking.")],
+      tools: [tool("tool-1", "2026-01-01T00:00:05Z")],
+    });
+    expect(rows.filter((row) => row.kind === "message").map((row) => row.id)).toEqual(["user-1"]);
+    expect(rows.some((row) => row.kind === "turn-fold")).toBe(true);
+  });
+
+  it("keeps a turn unfolded while one of its thoughts streams", () => {
+    const rows = rowsFor({
+      messages: [
+        message("user-1", "user", "Fix it", "2026-01-01T00:00:00Z"),
+        message("answer", "assistant", "Fixed.", "2026-01-01T00:00:20Z"),
+      ],
+      reasoning: [
+        thought("Still thinking", { streaming: true, createdAt: "2026-01-01T00:00:25Z" }),
+      ],
+    });
+    expect(rows.some((row) => row.kind === "turn-fold")).toBe(false);
+  });
+
+  it("keeps thoughts through the neutral filter and counts hidden ones as steps", () => {
+    const rows = rowsFor({
+      reasoning: [thought("First, a thought.", { createdAt: "2026-01-01T00:00:01Z" })],
+      tools: [
+        tool("tool-1", "2026-01-01T00:00:05Z"),
+        { ...tool("in-progress", "2026-01-01T00:00:06Z"), toolLifecycleStatus: "inProgress" },
+        tool("tool-2", "2026-01-01T00:00:07Z"),
+      ],
+      latestTurn: runningTurn,
+    });
+    expect(rows.find((row) => row.kind === "work-toggle")).toMatchObject({
+      hiddenCount: 2,
+      hidesReasoning: true,
+    });
+    const toolsOnly = rowsFor({
+      tools: [tool("tool-1", "2026-01-01T00:00:05Z"), tool("tool-2", "2026-01-01T00:00:07Z")],
+      latestTurn: runningTurn,
+    });
+    expect(toolsOnly.find((row) => row.kind === "work-toggle")).toMatchObject({
+      hidesReasoning: false,
+    });
+  });
+
+  it("shows the running turn's newest thought on the working row", () => {
+    const reasoning = [
+      thought("**Planning the fix**\n\nRead the parser first.", {
+        createdAt: "2026-01-01T00:00:01Z",
+      }),
+    ];
+    const tools = [tool("tool-1", "2026-01-01T00:00:05Z")];
+    expect(
+      workingRow(rowsFor({ reasoning, tools, latestTurn: runningTurn, isWorking: true }))
+        ?.latestThought,
+    ).toBe("Planning the fix");
+    // The newest visible work row already shows the thought.
+    expect(
+      workingRow(rowsFor({ reasoning, latestTurn: runningTurn, isWorking: true }))?.latestThought,
+    ).toBeNull();
+    // Once the answer is delivered the thought is no longer the news.
+    expect(
+      workingRow(
+        rowsFor({
+          reasoning,
+          tools,
+          messages: [message("answer", "assistant", "Done.", "2026-01-01T00:00:09Z")],
+          latestTurn: runningTurn,
+          isWorking: true,
+        }),
+      )?.latestThought,
+    ).toBeNull();
   });
 });
