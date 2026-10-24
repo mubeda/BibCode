@@ -173,6 +173,7 @@ import {
 import {
   selectActiveRightPanel,
   selectActiveRightPanelSurface,
+  selectActivityFocusRequested,
   selectThreadRightPanelState,
   type ActivityRightPanelSurface,
   type RightPanelSurface,
@@ -782,6 +783,13 @@ const ActivityPanelBinding = memo(function ActivityPanelBinding({
     ) => useRightPanelStore.getState().navigateActivity(threadRef, route),
     [threadRef],
   );
+  const focusRequested = useRightPanelStore((state) =>
+    selectActivityFocusRequested(state, threadRef),
+  );
+  const onFocusRequestHandled = useCallback(
+    () => useRightPanelStore.getState().acknowledgeActivityFocus(threadRef),
+    [threadRef],
+  );
   const loadMoreActiveRoster = activeRoster.loadMore;
   const loadMoreDoneRoster = doneRoster.loadMore;
   const onLoadMoreRoster = useCallback(
@@ -931,6 +939,8 @@ const ActivityPanelBinding = memo(function ActivityPanelBinding({
       onLoadMoreRoster={onLoadMoreRoster}
       onLoadMoreDetail={detailQuery.loadMore}
       onRefreshSnapshot={refreshSnapshot}
+      focusRequested={focusRequested}
+      onFocusRequestHandled={onFocusRequestHandled}
       cancellationError={cancellationError}
       {...(cancellationTarget === null ? {} : { onCancelActor, onRetryCancellation })}
     />
