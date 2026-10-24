@@ -2573,8 +2573,8 @@ function ReasoningTrace({ text, streaming }: { text: string; streaming: boolean 
   const scrollerRef = useRef<HTMLDivElement>(null);
   const followingRef = useRef(true);
   useLayoutEffect(() => {
-    // Layout is read only while the trace streams.
-    if (!streaming || !followingRef.current) {
+    // Layout is read only while the trace streams, each time its text grows.
+    if (!streaming || text.length === 0 || !followingRef.current) {
       return;
     }
     const scroller = scrollerRef.current;

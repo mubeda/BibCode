@@ -1503,6 +1503,10 @@ it("decodes staged image and file inputs and refuses two byte sources", () => {
   }
 });
 
+const decodeReasoningThread = Schema.decodeUnknownSync(OrchestrationThread);
+const decodeReasoningEvent = Schema.decodeUnknownSync(OrchestrationEvent);
+const decodeReasoningCommand = Schema.decodeUnknownSync(OrchestrationCommand);
+
 describe("reasoning contracts", () => {
   const thread = {
     id: "thread-1",
@@ -1524,7 +1528,7 @@ describe("reasoning contracts", () => {
   };
 
   it("decodes a thread from an older server without reasoning to none", () => {
-    expect(Schema.decodeUnknownSync(OrchestrationThread)(thread).reasoning).toEqual([]);
+    expect(decodeReasoningThread(thread).reasoning).toEqual([]);
   });
 
   it("decodes reasoning entries, their event and their internal commands", () => {
@@ -1536,10 +1540,8 @@ describe("reasoning contracts", () => {
       createdAt: "2026-10-24T00:00:01.000Z",
       updatedAt: "2026-10-24T00:00:02.000Z",
     };
-    expect(
-      Schema.decodeUnknownSync(OrchestrationThread)({ ...thread, reasoning: [entry] }).reasoning,
-    ).toEqual([entry]);
-    const sent = Schema.decodeUnknownSync(OrchestrationEvent)({
+    expect(decodeReasoningThread({ ...thread, reasoning: [entry] }).reasoning).toEqual([entry]);
+    const sent = decodeReasoningEvent({
       sequence: 1,
       eventId: "event-1",
       aggregateKind: "thread",
@@ -1579,7 +1581,7 @@ describe("reasoning contracts", () => {
         createdAt: entry.updatedAt,
       },
     ]) {
-      expect(Schema.decodeUnknownSync(OrchestrationCommand)(command).type).toBe(command.type);
+      expect(decodeReasoningCommand(command).type).toBe(command.type);
     }
   });
 });
