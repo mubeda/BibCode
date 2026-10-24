@@ -4,6 +4,12 @@ export interface SourcePosition {
   readonly end: { readonly offset?: number | undefined };
 }
 
+/**
+ * The longest diagram source drawn, mermaid.js's own `maxTextSize` default. A longer source
+ * shows an error before any renderer code loads.
+ */
+export const MERMAID_SOURCE_LIMIT = 50_000;
+
 const LINE_ENDING = /\r\n|\r|\n/g;
 const FENCE_OPENING = /^(?:`{3,}|~{3,})/;
 const ENDS_WITH_LINE_ENDING = /[\r\n]$/;
