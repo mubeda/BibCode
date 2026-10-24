@@ -60,6 +60,10 @@ BiBCode also generates these numbered defaults:
 - While the model picker is open, the same keys run `modelPicker.jump.1` through
   `modelPicker.jump.9`.
 
+Some keys are fixed and cannot be rebound here. In the composer, PageUp and
+PageDown scroll the chat timeline once the caret cannot move to another line
+of the draft (see [Workspace UI](./workspace-ui.md#reading-the-timeline)).
+
 The native server validates overrides in
 [`apps/server/src/production/keybindings.rs`](../../apps/server/src/production/keybindings.rs)
 and exposes the resolved file path and configuration issues through

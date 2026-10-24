@@ -55,6 +55,44 @@ export function resolveTimelineMinimapIndexFromPointer(input: {
   return Math.max(0, Math.min(input.itemCount - 1, Math.round(progress * (input.itemCount - 1))));
 }
 
+/** How far below the viewport top a minimap jump lands a turn's first row. */
+export const TIMELINE_MINIMAP_JUMP_OFFSET = 24;
+
+export type TimelineMinimapStep = "previous" | "next";
+
+/**
+ * The nearest turns whose jump would scroll up or down from `scrollTop`; null where none would
+ * move. Partway through a turn, the previous step returns to that turn's start.
+ *
+ * `itemTops` are the list's row positions, which start below its header (`listStartOffset`);
+ * a jump to a row scrolls past that header too, so each jump lands that much further down.
+ */
+export function resolveTimelineMinimapStepTargets(input: {
+  readonly itemTops: ReadonlyArray<number | null>;
+  readonly scrollTop: number;
+  readonly maxScrollTop: number;
+  readonly listStartOffset?: number;
+}): Record<TimelineMinimapStep, number | null> {
+  const listStartOffset = input.listStartOffset ?? 0;
+  let previous: number | null = null;
+  let next: number | null = null;
+  for (const [index, top] of input.itemTops.entries()) {
+    if (top === null) {
+      continue;
+    }
+    const jumpTop = Math.min(
+      input.maxScrollTop,
+      Math.max(0, top + listStartOffset - TIMELINE_MINIMAP_JUMP_OFFSET),
+    );
+    if (jumpTop < input.scrollTop - 1) {
+      previous = index;
+    } else if (jumpTop > input.scrollTop + 1 && next === null) {
+      next = index;
+    }
+  }
+  return { previous, next };
+}
+
 export function resolveTimelineMinimapHasPersistentGutter(viewportWidth: number): boolean {
   if (!Number.isFinite(viewportWidth) || viewportWidth <= 0) {
     return false;
@@ -268,7 +306,7 @@ function isSubstantiveAssistantText(text: string): boolean {
  * user sends a message, the previous turn is still the "active" one until the
  * server creates the new turn, and folding must not flicker through that window.
  */
-function deriveUnsettledTurnId(
+export function deriveUnsettledTurnId(
   latestTurn: TimelineLatestTurn | null,
   runningTurnId: TurnId | null,
 ): TurnId | null {
@@ -280,6 +318,14 @@ function deriveUnsettledTurnId(
   }
   const isSettled = latestTurn.completedAt !== null && latestTurn.state !== "running";
   return isSettled ? null : latestTurn.turnId;
+}
+
+/** The turn still running, which Verbose chat leaves as it is with the setting off. */
+export function isWorkEntryInUnsettledTurn(
+  entry: Pick<WorkLogEntry, "turnId">,
+  unsettledTurnId: TurnId | null,
+): boolean {
+  return unsettledTurnId !== null && entry.turnId === unsettledTurnId;
 }
 
 /**
@@ -461,8 +507,15 @@ export function deriveMessagesTimelineRows(input: {
   queuedStatuses?: ReadonlyArray<QueuedCardStatus>;
   latestTurn?: TimelineLatestTurn | null;
   runningTurnId?: TurnId | null;
-  expandedTurnIds?: ReadonlySet<TurnId>;
-  expandedWorkGroupIds?: ReadonlySet<string>;
+  /** Turns the user opened (true) or folded (false); the rest follow `verboseChat`. */
+  turnFoldChoices?: ReadonlyMap<TurnId, boolean>;
+  /** Long work groups the user opened or folded; the rest follow `verboseChat`. */
+  workGroupChoices?: ReadonlyMap<string, boolean>;
+  /**
+   * Settled turns and their long work groups start open, still behind their fold and toggle
+   * rows so one click folds them. The turn still running is the same either way.
+   */
+  verboseChat?: boolean;
   isWorking: boolean;
   activeTurnStartedAt: string | null;
   turnDiffSummaryByAssistantMessageId: ReadonlyMap<MessageId, TurnDiffSummary>;
@@ -480,14 +533,18 @@ export function deriveMessagesTimelineRows(input: {
     input.latestTurn ?? null,
     input.runningTurnId ?? null,
   );
-  const { foldsByAnchorEntryId, answerMessageIds } = deriveTurnFolds({
+  const turnFolds = deriveTurnFolds({
     timelineEntries,
     latestTurn: input.latestTurn ?? null,
     unsettledTurnId,
   });
+  const { answerMessageIds, foldsByAnchorEntryId } = turnFolds;
+  // Running turns never fold, so the setting opens only settled turns.
+  const isTurnExpanded = (turnId: TurnId) =>
+    input.turnFoldChoices?.get(turnId) ?? input.verboseChat === true;
   const collapsedEntryIds = new Set<string>();
   for (const fold of foldsByAnchorEntryId.values()) {
-    if (!input.expandedTurnIds?.has(fold.turnId)) {
+    if (!isTurnExpanded(fold.turnId)) {
       for (const entryId of fold.hiddenEntryIds) {
         collapsedEntryIds.add(entryId);
       }
@@ -508,7 +565,7 @@ export function deriveMessagesTimelineRows(input: {
         createdAt: turnFold.createdAt,
         turnId: turnFold.turnId,
         label: turnFold.label,
-        expanded: input.expandedTurnIds?.has(turnFold.turnId) ?? false,
+        expanded: isTurnExpanded(turnFold.turnId),
       });
     }
 
@@ -545,7 +602,12 @@ export function deriveMessagesTimelineRows(input: {
           });
         } else {
           const groupId = `work-group:${timelineEntry.id}`;
-          const expanded = input.expandedWorkGroupIds?.has(groupId) ?? false;
+          const expanded =
+            input.workGroupChoices?.get(groupId) ??
+            (input.verboseChat === true &&
+              !visibleGroupedEntries.some((entry) =>
+                isWorkEntryInUnsettledTurn(entry, unsettledTurnId),
+              ));
           const hiddenEntries = visibleGroupedEntries.slice(0, -MAX_VISIBLE_WORK_LOG_ENTRIES);
           const visibleEntries = visibleGroupedEntries.slice(-MAX_VISIBLE_WORK_LOG_ENTRIES);
           const renderedEntries = expanded ? [...hiddenEntries, ...visibleEntries] : visibleEntries;

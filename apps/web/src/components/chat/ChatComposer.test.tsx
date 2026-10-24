@@ -365,6 +365,7 @@ import {
   INLINE_TERMINAL_CONTEXT_PLACEHOLDER,
   type TerminalContextDraft,
 } from "../../lib/terminalContext";
+import type { ComposerCommandKey } from "../ComposerPromptEditor";
 import type { ElementContextDraft } from "../../lib/elementContext";
 import type { ReviewCommentContext } from "../../reviewCommentContext";
 import type { PendingApproval, PendingUserInput } from "../../session-logic";
@@ -785,6 +786,7 @@ function makeSpies() {
     scheduleComposerFocus: vi.fn(),
     setThreadError: vi.fn(),
     onExpandImage: vi.fn(),
+    onPageTimeline: vi.fn(),
   };
 }
 
@@ -867,6 +869,7 @@ function renderComposer(overrides: Partial<ChatComposerProps> = {}): RenderResul
     scheduleComposerFocus: spies.scheduleComposerFocus,
     setThreadError: spies.setThreadError,
     onExpandImage: spies.onExpandImage,
+    onPageTimeline: spies.onPageTimeline,
     ...overrides,
   };
   h.stateIndex = 0;
@@ -901,10 +904,12 @@ type PromptChange = (
   terminalContextIds: string[],
 ) => void;
 
-type CommandKey = (key: "ArrowDown" | "ArrowUp" | "Enter" | "Tab", event: KeyboardEvent) => boolean;
+type CommandKey = (key: ComposerCommandKey, event: KeyboardEvent) => boolean;
 
-function keyEvent(overrides: Partial<{ shiftKey: boolean }> = {}): KeyboardEvent {
-  return { shiftKey: false, ...overrides } as unknown as KeyboardEvent;
+function keyEvent(
+  overrides: Partial<{ shiftKey: boolean; altKey: boolean; repeat: boolean }> = {},
+): KeyboardEvent {
+  return { shiftKey: false, repeat: false, ...overrides } as unknown as KeyboardEvent;
 }
 
 function setEditorSnapshot(value: string, cursor: number, terminalContextIds: string[] = []): void {
@@ -2167,6 +2172,29 @@ describe("ChatComposer menu selection", () => {
 // ---------------------------------------------------------------------------
 
 describe("ChatComposer command keys", () => {
+  // The editor offers a page key only once the draft has no use for it (ComposerPromptEditor).
+  it("pages the timeline with an offered page key", () => {
+    const { spies } = renderComposer();
+    const onKey = editorProps()["onCommandKeyDown"] as CommandKey;
+
+    expect(onKey("PageUp", keyEvent())).toBe(true);
+    expect(onKey("PageDown", keyEvent({ repeat: true }))).toBe(true);
+    expect(spies.onPageTimeline.mock.calls).toEqual([
+      ["PageUp", false],
+      ["PageDown", true],
+    ]);
+  });
+
+  it("leaves a page key with a modifier to the editor and the browser", () => {
+    const { spies } = renderComposer();
+    const onKey = editorProps()["onCommandKeyDown"] as CommandKey;
+
+    // Shift extends the selection.
+    expect(onKey("PageUp", keyEvent({ shiftKey: true }))).toBe(false);
+    expect(onKey("PageDown", keyEvent({ altKey: true }))).toBe(false);
+    expect(spies.onPageTimeline).not.toHaveBeenCalled();
+  });
+
   it("toggles interaction mode on Shift+Tab", () => {
     const { spies } = renderComposer();
     const onKey = editorProps()["onCommandKeyDown"] as CommandKey;

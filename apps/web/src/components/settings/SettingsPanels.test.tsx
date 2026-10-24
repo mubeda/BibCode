@@ -584,6 +584,7 @@ function changedSettings(): UnifiedSettings {
     diffIgnoreWhitespace: !DEFAULT_UNIFIED_SETTINGS.diffIgnoreWhitespace,
     autoOpenPlanSidebar: !DEFAULT_UNIFIED_SETTINGS.autoOpenPlanSidebar,
     enableAssistantStreaming: !DEFAULT_UNIFIED_SETTINGS.enableAssistantStreaming,
+    verboseChat: !DEFAULT_UNIFIED_SETTINGS.verboseChat,
     enableProviderUpdateChecks: !DEFAULT_UNIFIED_SETTINGS.enableProviderUpdateChecks,
     automaticGitFetchInterval: Duration.sum(
       DEFAULT_UNIFIED_SETTINGS.automaticGitFetchInterval,
@@ -822,6 +823,11 @@ describe("GeneralSettingsPanel", () => {
     invoke(control("switch", "Stream assistant messages"), "onCheckedChange", true);
     expect(h.updateSettings).toHaveBeenCalledWith({ enableAssistantStreaming: true });
 
+    expect(markup).toContain("Verbose chat");
+    expect(markup).toContain("Show every tool call and its output. Finished turns start open.");
+    invoke(control("switch", "Show every tool call and its output"), "onCheckedChange", true);
+    expect(h.updateSettings).toHaveBeenCalledWith({ verboseChat: true });
+
     invoke(control("switch", "Check provider versions"), "onCheckedChange", false);
     expect(h.updateSettings).toHaveBeenCalledWith({ enableProviderUpdateChecks: false });
 
@@ -894,6 +900,8 @@ describe("GeneralSettingsPanel", () => {
     invoke(control("button", "Reset word wrapping to default"), "onClick");
     invoke(control("button", "Reset diff whitespace changes to default"), "onClick");
     invoke(control("button", "Reset assistant output to default"), "onClick");
+    invoke(control("button", "Reset verbose chat to default"), "onClick");
+    expect(h.updateSettings).toHaveBeenCalledWith({ verboseChat: false });
     invoke(control("button", "Reset provider update checks to default"), "onClick");
     invoke(control("button", "Reset auto-open task panel to default"), "onClick");
     invoke(control("button", "Reset new threads to default"), "onClick");
@@ -901,7 +909,7 @@ describe("GeneralSettingsPanel", () => {
     invoke(control("button", "Reset add project base directory to default"), "onClick");
     invoke(control("button", "Reset archive confirmation to default"), "onClick");
     invoke(control("button", "Reset delete confirmation to default"), "onClick");
-    expect(h.updateSettings).toHaveBeenCalledTimes(11);
+    expect(h.updateSettings).toHaveBeenCalledTimes(12);
 
     invoke(
       control("switch", "Start new worktrees from origin by default"),
@@ -1252,6 +1260,7 @@ describe("useGeneralSettingsRestore", () => {
       "Word wrap",
       "Diff whitespace changes",
       "Assistant output",
+      "Verbose chat",
       "Provider update checks",
       "Auto-open task panel",
       "New thread mode",
@@ -1303,7 +1312,7 @@ describe("useGeneralSettingsRestore", () => {
     expect(confirmSpy).toHaveBeenCalledWith(
       [
         "Restore General defaults?",
-        "This will reset: Theme, Time format, Word wrap, Diff whitespace changes, Assistant output, Provider update checks, Auto-open task panel, New thread mode, New worktrees start from origin, Workspace, Add project base directory, Archive confirmation, Delete confirmation.",
+        "This will reset: Theme, Time format, Word wrap, Diff whitespace changes, Assistant output, Verbose chat, Provider update checks, Auto-open task panel, New thread mode, New worktrees start from origin, Workspace, Add project base directory, Archive confirmation, Delete confirmation.",
       ].join("\n"),
     );
     expect(h.setTheme).toHaveBeenCalledWith("system");
@@ -1313,6 +1322,7 @@ describe("useGeneralSettingsRestore", () => {
       wordWrap: DEFAULT_UNIFIED_SETTINGS.wordWrap,
       diffIgnoreWhitespace: DEFAULT_UNIFIED_SETTINGS.diffIgnoreWhitespace,
       enableAssistantStreaming: DEFAULT_UNIFIED_SETTINGS.enableAssistantStreaming,
+      verboseChat: DEFAULT_UNIFIED_SETTINGS.verboseChat,
       enableProviderUpdateChecks: DEFAULT_UNIFIED_SETTINGS.enableProviderUpdateChecks,
       autoOpenPlanSidebar: DEFAULT_UNIFIED_SETTINGS.autoOpenPlanSidebar,
       defaultThreadEnvMode: DEFAULT_UNIFIED_SETTINGS.defaultThreadEnvMode,

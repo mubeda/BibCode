@@ -8,6 +8,7 @@ import {
 } from "@bibcode/contracts";
 import { act, createRef, type ComponentProps, type ReactNode, type Ref } from "react";
 import type { WorkLogEntry } from "../../session-logic";
+import { formatShortTimestamp } from "../../timestampFormat";
 import { renderToStaticMarkup } from "react-dom/server";
 import { createRoot, type Root } from "react-dom/client";
 import { Window } from "happy-dom";
@@ -231,6 +232,7 @@ function buildProps() {
     markdownCwd: undefined,
     resolvedTheme: "light" as const,
     timestampFormat: "locale" as const,
+    verboseChat: false,
     workspaceRoot: undefined,
     anchorMessageId: null,
     onAnchorReady: () => {},
@@ -1222,6 +1224,239 @@ describe("MessagesTimeline work groups", () => {
   );
 });
 
+describe("MessagesTimeline verbose chat", () => {
+  const settledTurn = {
+    turnId: TURN_ID,
+    state: "completed" as const,
+    startedAt: MESSAGE_CREATED_AT,
+    completedAt: LATER_CREATED_AT,
+  };
+  const turnEntries = () => [
+    buildUserTimelineEntry("Do the work."),
+    buildWorkTimelineEntry("entry-work", {
+      turnId: TURN_ID,
+      label: "Read file",
+      command: "cat notes.txt",
+    }),
+    buildAssistantTimelineEntry({
+      id: "entry-terminal",
+      messageId: "message-terminal",
+      text: "All done now.",
+      turnId: TURN_ID,
+    }),
+  ];
+  const workRow = (container: HTMLElement) =>
+    container.querySelector<HTMLElement>('div[role="button"][aria-label^="Read file"]');
+  const foldButton = (container: HTMLElement) =>
+    container.querySelector<HTMLButtonElement>('[data-timeline-row-kind="turn-fold"] button');
+
+  it("starts a settled tool row expanded and collapses it on click", async () => {
+    const container = await mountTimeline({
+      verboseChat: true,
+      latestTurn: settledTurn,
+      timelineEntries: turnEntries(),
+    });
+
+    expect(foldButton(container)?.getAttribute("aria-expanded")).toBe("true");
+    expect(workRow(container)?.getAttribute("aria-expanded")).toBe("true");
+    expect(workRow(container)?.querySelector("pre")?.textContent).toContain("cat notes.txt");
+
+    await click(workRow(container)!);
+
+    expect(workRow(container)?.getAttribute("aria-expanded")).toBe("false");
+    expect(workRow(container)?.querySelector("pre")).toBeNull();
+  });
+
+  it("keeps a collapsed tool row collapsed after it remounts", async () => {
+    const MessagesTimeline = await loadMessagesTimeline();
+    const entries = turnEntries();
+    const container = await mountTimeline({
+      verboseChat: true,
+      latestTurn: settledTurn,
+      timelineEntries: entries,
+    });
+    await click(workRow(container)!);
+    const mounted = mountedTrees.at(-1)!;
+    const renderEntries = (timelineEntries: typeof entries) =>
+      act(async () =>
+        mounted.root.render(
+          <MessagesTimeline
+            {...buildProps()}
+            verboseChat
+            latestTurn={settledTurn}
+            timelineEntries={timelineEntries}
+          />,
+        ),
+      );
+
+    // LegendList unmounts a row that leaves its render window.
+    await renderEntries(entries.filter((entry) => entry.kind !== "work"));
+    expect(workRow(container)).toBeNull();
+    await renderEntries(entries);
+
+    expect(workRow(container)?.getAttribute("aria-expanded")).toBe("false");
+  });
+
+  it("applies the setting to an open timeline and keeps following the end", async () => {
+    const MessagesTimeline = await loadMessagesTimeline();
+    const container = await mountTimeline({
+      latestTurn: settledTurn,
+      timelineEntries: turnEntries(),
+    });
+    expect(container.textContent).toContain("Worked for 5.0s");
+    expect(workRow(container)).toBeNull();
+
+    const mounted = mountedTrees.at(-1)!;
+    await act(async () =>
+      mounted.root.render(
+        <MessagesTimeline
+          {...buildProps()}
+          verboseChat
+          latestTurn={settledTurn}
+          timelineEntries={turnEntries()}
+        />,
+      ),
+    );
+
+    expect(foldButton(container)?.getAttribute("aria-expanded")).toBe("true");
+    expect(workRow(container)?.querySelector("pre")?.textContent).toContain("cat notes.txt");
+    expect(h.legendListProps?.["maintainScrollAtEnd"]).toMatchObject({
+      on: { dataChange: true, itemLayout: true },
+    });
+  });
+
+  it("folds a finished turn with one click and opens it with another", async () => {
+    const container = await mountTimeline({
+      verboseChat: true,
+      latestTurn: settledTurn,
+      timelineEntries: turnEntries(),
+    });
+    expect(foldButton(container)?.textContent).toContain("Worked for 5.0s");
+
+    await click(foldButton(container)!);
+    expect(foldButton(container)?.getAttribute("aria-expanded")).toBe("false");
+    expect(workRow(container)).toBeNull();
+    expect(container.textContent).toContain("All done now.");
+
+    await click(foldButton(container)!);
+    expect(foldButton(container)?.getAttribute("aria-expanded")).toBe("true");
+    expect(workRow(container)).not.toBeNull();
+  });
+
+  it("opens a run of tool calls and folds it to the newest with one click", async () => {
+    const container = await mountTimeline({
+      verboseChat: true,
+      timelineEntries: [
+        buildWorkTimelineEntry("work-1", { label: "First", command: "echo one" }),
+        buildWorkTimelineEntry("work-2", { label: "Second", command: "echo two" }),
+        buildWorkTimelineEntry("work-3", { label: "Third", command: "echo three" }),
+      ],
+    });
+    const toggle = container.querySelector<HTMLButtonElement>(
+      '[data-timeline-row-kind="work-toggle"] button',
+    );
+    expect(toggle?.getAttribute("aria-expanded")).toBe("true");
+    expect(toggle?.textContent).toBe("Show fewer tool calls");
+    expect(container.textContent).toContain("echo one");
+
+    await click(toggle!);
+    expect(toggle?.textContent).toBe("+2 previous tool calls");
+    expect(container.textContent).not.toContain("echo one");
+    expect(container.textContent).toContain("echo three");
+  });
+
+  it("keeps a turn the user folded folded when the next turn starts", async () => {
+    const MessagesTimeline = await loadMessagesTimeline();
+    const entries = turnEntries();
+    const container = await mountTimeline({
+      verboseChat: true,
+      latestTurn: settledTurn,
+      timelineEntries: entries,
+    });
+    await click(foldButton(container)!);
+    const mounted = mountedTrees.at(-1)!;
+
+    await act(async () =>
+      mounted.root.render(
+        <MessagesTimeline
+          {...buildProps()}
+          verboseChat
+          latestTurn={{
+            turnId: TurnId.make("turn-next"),
+            state: "running",
+            startedAt: LATER_CREATED_AT,
+            completedAt: null,
+          }}
+          timelineEntries={entries}
+        />,
+      ),
+    );
+
+    expect(foldButton(container)?.getAttribute("aria-expanded")).toBe("false");
+  });
+
+  it("folds a turn the user opened when the next turn starts, with the setting off", async () => {
+    const MessagesTimeline = await loadMessagesTimeline();
+    const entries = turnEntries();
+    const container = await mountTimeline({ latestTurn: settledTurn, timelineEntries: entries });
+    await click(foldButton(container)!);
+    expect(foldButton(container)?.getAttribute("aria-expanded")).toBe("true");
+    const mounted = mountedTrees.at(-1)!;
+
+    await act(async () =>
+      mounted.root.render(
+        <MessagesTimeline
+          {...buildProps()}
+          latestTurn={{
+            turnId: TurnId.make("turn-next"),
+            state: "running",
+            startedAt: LATER_CREATED_AT,
+            completedAt: null,
+          }}
+          timelineEntries={entries}
+        />,
+      ),
+    );
+
+    expect(foldButton(container)?.getAttribute("aria-expanded")).toBe("false");
+  });
+
+  it("leaves the running turn's tool rows collapsed", async () => {
+    const container = await mountTimeline({
+      verboseChat: true,
+      isWorking: true,
+      activeTurnInProgress: true,
+      runningTurnId: TURN_ID,
+      latestTurn: { ...settledTurn, state: "running", completedAt: null },
+      timelineEntries: turnEntries(),
+    });
+
+    expect(workRow(container)?.getAttribute("aria-expanded")).toBe("false");
+    expect(workRow(container)?.querySelector("pre")).toBeNull();
+  });
+
+  it("reveals the time on tool rows and on the Worked-for row", async () => {
+    const time = formatShortTimestamp(MESSAGE_CREATED_AT, "24-hour");
+    const folded = await mountTimeline({
+      timestampFormat: "24-hour",
+      latestTurn: settledTurn,
+      timelineEntries: turnEntries(),
+    });
+    const verbose = await mountTimeline({
+      timestampFormat: "24-hour",
+      verboseChat: true,
+      latestTurn: settledTurn,
+      timelineEntries: turnEntries(),
+    });
+
+    expect(
+      folded.querySelector('[data-timeline-row-kind="turn-fold"] [data-timeline-row-time]')
+        ?.textContent,
+    ).toBe(time);
+    expect(workRow(verbose)?.querySelector("[data-timeline-row-time]")?.textContent).toBe(time);
+  });
+});
+
 describe("MessagesTimeline work entry rows", () => {
   async function renderWorkEntry(entry: Parameters<typeof buildWorkTimelineEntry>[1]) {
     return renderTimeline({ timelineEntries: [buildWorkTimelineEntry("work-1", entry)] });
@@ -1773,6 +2008,119 @@ describe("MessagesTimeline minimap", () => {
     await act(async () => onSizeChanged(300));
     expect(onAnchorSizeChanged).toHaveBeenLastCalledWith(second.message.id, 300);
     expect(container).toBeDefined();
+  });
+
+  it("steps to the previous and next turn, jumping when motion is reduced", async () => {
+    const onManualNavigation = vi.fn();
+    const scrollToIndex = vi.fn();
+    const rowTops = [12, 100, 500, 1000];
+    const state = {
+      scroll: 476,
+      scrollLength: 400,
+      contentLength: 1900,
+      positionAtIndex: (index: number) => rowTops[index] ?? Number.NaN,
+      sizeAtIndex: () => 40,
+    };
+    const listRef = {
+      current: { getState: () => state, scrollToIndex },
+    } as unknown as React.RefObject<LegendListRef | null>;
+    const userEntry = (id: string, text: string) => {
+      const entry = buildUserTimelineEntry(text);
+      return { ...entry, id, message: { ...entry.message, id: MessageId.make(id) } };
+    };
+    const container = await mountTimeline({
+      listRef,
+      onManualNavigation,
+      timelineEntries: [
+        userEntry("user-1", "First question"),
+        buildAssistantTimelineEntry({
+          id: "assistant-1",
+          messageId: "assistant-1",
+          text: "First answer",
+        }),
+        userEntry("user-2", "Second question"),
+        userEntry("user-3", "Third question"),
+      ],
+    });
+    const scrollList = () =>
+      act(async () => (h.legendListProps?.onScroll as (() => void) | undefined)?.());
+    const previous = container.querySelector<HTMLButtonElement>(
+      'button[aria-label="Previous turn"]',
+    );
+    const next = container.querySelector<HTMLButtonElement>('button[aria-label="Next turn"]');
+    await scrollList();
+    expect(previous?.getAttribute("aria-disabled")).toBe("false");
+    expect(next?.getAttribute("aria-disabled")).toBe("false");
+
+    await click(next!);
+    expect(scrollToIndex).toHaveBeenLastCalledWith({ index: 3, animated: true, viewOffset: 24 });
+
+    vi.spyOn(window, "matchMedia").mockReturnValue({ matches: true } as MediaQueryList);
+    await click(previous!);
+    expect(scrollToIndex).toHaveBeenLastCalledWith({ index: 0, animated: false, viewOffset: 24 });
+    expect(onManualNavigation).toHaveBeenCalledTimes(2);
+
+    state.scroll = 0;
+    await scrollList();
+    expect(previous?.getAttribute("aria-disabled")).toBe("true");
+    await click(previous!);
+    expect(scrollToIndex).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps stepping back through turns below the list header", async () => {
+    const rowTops = [12, 100, 500, 1000];
+    const headerSize = 16;
+    const state = {
+      scroll: 1500,
+      scrollLength: 400,
+      contentLength: 1900,
+      positionAtIndex: (index: number) => rowTops[index] ?? Number.NaN,
+      sizeAtIndex: () => 40,
+    };
+    // LegendList lands a row `viewOffset` below the viewport top, counting its header.
+    const scrollToIndex = vi.fn(
+      ({ index, viewOffset }: { index: number; viewOffset: number }) =>
+        (state.scroll = (rowTops[index] ?? 0) - viewOffset + headerSize),
+    );
+    const listRef = {
+      current: { getState: () => state, scrollToIndex },
+    } as unknown as React.RefObject<LegendListRef | null>;
+    const userEntry = (id: string, text: string) => {
+      const entry = buildUserTimelineEntry(text);
+      return { ...entry, id, message: { ...entry.message, id: MessageId.make(id) } };
+    };
+    const container = await mountTimeline({
+      listRef,
+      timelineEntries: [
+        userEntry("user-1", "First question"),
+        buildAssistantTimelineEntry({
+          id: "assistant-1",
+          messageId: "assistant-1",
+          text: "First answer",
+        }),
+        userEntry("user-2", "Second question"),
+        userEntry("user-3", "Third question"),
+      ],
+    });
+    const onMetricsChange = h.legendListProps?.onMetricsChange as
+      | ((metrics: { headerSize: number; footerSize: number }) => void)
+      | undefined;
+    await act(async () => onMetricsChange?.({ headerSize, footerSize: 16 }));
+    const scrollList = () =>
+      act(async () => (h.legendListProps?.onScroll as (() => void) | undefined)?.());
+    const previous = container.querySelector<HTMLButtonElement>(
+      'button[aria-label="Previous turn"]',
+    );
+
+    for (const expectedIndex of [3, 2, 0]) {
+      await scrollList();
+      await click(previous!);
+      expect(scrollToIndex).toHaveBeenLastCalledWith(
+        expect.objectContaining({ index: expectedIndex }),
+      );
+    }
+    await scrollList();
+    expect(previous?.getAttribute("aria-disabled")).toBe("true");
   });
 
   it("does not render the minimap below the item threshold", async () => {

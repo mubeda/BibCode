@@ -5192,6 +5192,33 @@ describe("ChatView handlers (captured from mocked children)", () => {
     expect(timeline["resolvingTurnDeliveryMessageId"]).toBeNull();
   });
 
+  it("pages the timeline from the composer and stays put at the end", () => {
+    seedConnectedServerThread();
+    renderServerRoute();
+    const scrollToOffset = vi.fn();
+    const state = { scroll: 2000, scrollLength: 1000, contentLength: 5000 };
+    const timeline = capturedProps<Record<string, unknown>>("messagesTimeline");
+    (timeline["listRef"] as { current: unknown }).current = {
+      getState: () => state,
+      scrollToOffset,
+    };
+    const composer = capturedProps<Record<string, unknown>>("chatComposer");
+    const onPageTimeline = composer["onPageTimeline"] as (
+      key: "PageUp" | "PageDown",
+      repeat: boolean,
+    ) => void;
+
+    onPageTimeline("PageDown", false);
+    expect(scrollToOffset).toHaveBeenLastCalledWith({ offset: 2875, animated: true });
+    // A held key repeats; each repeat jumps so the scroll keeps up.
+    onPageTimeline("PageUp", true);
+    expect(scrollToOffset).toHaveBeenLastCalledWith({ offset: 1125, animated: false });
+
+    state.scroll = 4000;
+    onPageTimeline("PageDown", false);
+    expect(scrollToOffset).toHaveBeenCalledTimes(2);
+  });
+
   it("onInterrupt targets the running turn of the active session", async () => {
     const runningTurnId = TurnId.make("turn-running");
     seedConnectedServerThread(
