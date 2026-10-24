@@ -342,7 +342,21 @@ cargo test -p bibcode-server --test production_provider_runtime provider_session
 cargo test -p bibcode-server codex::runtime -j 2
 cargo test -p bibcode-server --test repositories -j 2
 cargo test -p bibcode-server migrations -j 2
+cargo test -p bibcode-server --lib thread_compaction -j 2
+cargo test -p bibcode-server --lib compaction -j 2
 ```
+
+Context-limit recovery, the guard and **Compact conversation** share these
+seams (`thread_compaction_tests.rs` drives the engine and delivery worker, the
+`provider_runtime` compaction tests drive the effect with the fake driver, and
+`provider::claude` covers the tagged `/compact` turn and failure facts). The
+failure cannot be produced on demand with auto-compaction on, so live
+validation is manual: with `DISABLE_AUTO_COMPACT=1` on a Claude instance, a
+context-limit stop shows today's error and no recovery; **Compact
+conversation** compacts through `thread.compact` and shows the step; a thread
+over the guard threshold shows "Waiting for the conversation to be compacted."
+then the compaction, then the answer; Stop during that compaction leaves the
+message failed with Retry.
 
 Deliver a queued message at completion and let its turn run past the idle timeout;
 the session must stay live until one idle timeout after that turn completes.

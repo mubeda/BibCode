@@ -1588,8 +1588,12 @@ it.
   `worktree.removal-failed` cites `worktree.removal`;
   `git.stacked-action-failed` cites `git.stacked-action`; `client.stall` and
   `client.interaction` cite `client.batch`; `crash.panic` cites `panic`; and
-  `provider.turn-failed` (a failed Claude turn, by provider, terminal reason and
-  error class, never its text) cites its own event. An event dropped by a full
+  `provider.turn-failed` (a failed turn of any provider, recorded once where
+  the failed turn is projected, by provider, provider reason in snake case and
+  error class, never its text) cites its own event; and
+  `provider.compaction-failed` (a compaction BiBCode asked for that failed, by
+  provider, trigger and reason) cites its `provider.compaction` event, which
+  every settled compaction writes without any message or summary text. An event dropped by a full
   channel is never cited.
 - `server.getProfilerStatus` returns the 20 newest findings without evidence;
   the CLI and MCP readers return the evidence too.

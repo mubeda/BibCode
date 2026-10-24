@@ -273,13 +273,27 @@ occurrence.
 
 - **Severity:** `warn` for `context_limit` (the conversation filled the
   provider's context window), `info` for every other class.
-- **Raised when:** a provider turn ends as failed (not interrupted). Claude
-  turns only, today. A high `count` on a `context_limit` finding means threads
-  keep stopping at the context limit instead of compacting.
+- **Raised when:** a provider turn of any provider ends as failed (not
+  interrupted). A high `count` on a `context_limit` finding means threads keep
+  stopping at the context limit instead of compacting; BiBCode recovers an
+  eligible one automatically, and a
+  [`provider.compaction`](events.md#providercompaction) event with trigger
+  `context_recovery` follows it.
 - **Fingerprint:** `provider`, `terminalReason` and `errorClass`.
 - **Evidence:** `provider`, `terminalReason`, `errorClass`, and `eventIds`
   naming the [`provider.turn-failed`](events.md#providerturn-failed) event. No
   message, prompt or error text is recorded.
+
+## provider.compaction-failed
+
+- **Severity:** `warn`.
+- **Raised when:** a conversation compaction BiBCode asked for (manual,
+  automatic recovery or the guard) settles `failed`. An interrupted compaction
+  raises none.
+- **Fingerprint:** `provider`, `trigger` and `reason`.
+- **Evidence:** the [`provider.compaction`](events.md#providercompaction)
+  event's fields and its `eventIds`. No message, summary or error text is
+  recorded.
 
 ## Memory and CPU
 

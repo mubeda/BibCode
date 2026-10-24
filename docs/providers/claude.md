@@ -92,11 +92,47 @@ When a conversation no longer fits, Claude ends the turn with a context-limit
 · automatic compaction failed: <cause>`). BiBCode fails that turn with the
 `context_limit` error class and the message "Claude's context window is full.
 Compact the conversation, then send your message again.", followed by Claude's
-text. The thread's error, titled "Claude ran out of context", offers **Compact
-conversation**, which sends `/compact` to the same session as an ordinary
-message; it is disabled while the thread is working, which includes a
-compaction already running. Send your message again once the compaction
-finishes. BiBCode does not compact or resend on its own.
+text. The failure also reports two facts that BiBCode reads from Claude's raw
+output, never from that message: `beforeOutput` (Claude refused the turn's
+input before any assistant text, tool call or compaction) and
+`compactable: false` for `rapid_refill_breaker`, for `automatic compaction
+failed:` (Claude's documented "`/compact` fails on the same error until you
+do"), and for the single-exchange form, where compacting cannot help.
+
+When the failed turn did nothing first, compaction can help, and Claude's own
+auto-compact switch is on (its latest context-usage reading of this
+conversation says `isAutoCompactEnabled`), BiBCode recovers on its own, once:
+the error reads "The context window is full. Compacting the conversation, then
+sending your message again.", BiBCode compacts the conversation, and once that
+succeeds it sends a copy of the message, labelled "Sent again after the
+conversation was compacted." A copy that fails at the limit again, a failed or
+stopped compaction, or Claude's auto-compaction turned off
+(`autoCompactEnabled: false` or `DISABLE_AUTO_COMPACT`, which turn
+`isAutoCompactEnabled` off; `DISABLE_COMPACT` is expected to as well, which no
+recorded response confirms yet) ends at the error above, with the manual
+action. See
+[Context-limit recovery](../architecture/rpc-and-orchestration.md#context-limit-recovery).
+
+Before sending a message, BiBCode also compacts first when the latest reading
+of the conversation is within 5% of the window of Claude's own compaction point
+(`autoCompactThreshold`), so one large message cannot cross both points at once,
+as in #160. To leave Claude more headroom instead, set
+`CLAUDE_CODE_AUTO_COMPACT_WINDOW` (or `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`) in the
+provider instance's environment variables; BiBCode passes no auto-compact
+window of its own, so the user's and an administrator's settings stand.
+
+The thread's error, titled "Claude ran out of context", offers **Compact
+conversation**. It dispatches `thread.compact`: BiBCode writes `/compact` on
+stdin and opens a turn of its own for it, tagged with the compaction id. The
+write is registered for acknowledgement like a delivery's, without an outbox
+row; the turn awaits its input, so a successful `result` Claude reports first
+after a resume is ignored, and only the `local_command: "compact"` result ends
+it. The compaction succeeded only when that turn completed with a completed
+**Conversation compaction** step; "Not enough messages to compact." is a
+failure. The action is disabled while the thread is working or a compaction is
+unsettled. Against an older server, without `supportsCompaction`, it sends
+`/compact` as an ordinary message instead. Typing `/compact` in the composer
+still sends it as a message.
 
 Other failed turns prefer, in order: the result's `errors`, the text of
 Claude's synthetic error message (an `authentication_failed`,

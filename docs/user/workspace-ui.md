@@ -539,6 +539,36 @@ becomes available once the running turn and any pending approval or question are
 done. Cancelling remains available while the message is queued; it is disabled
 while steering is being acknowledged.
 
+### When the context window is full
+
+When a conversation no longer fits the provider's context window, the thread's
+error (for Claude, **Claude ran out of context**) offers **Compact
+conversation**, on any provider that can compact it (Claude and Codex). It is
+disabled with **Compacting the conversation…** while a compaction runs, and the
+timeline shows a **Conversation compaction** step.
+
+If the provider refused your message before doing anything and its own
+auto-compaction is on, BiBCode recovers on its own: the error reads **The
+context window is full. Compacting the conversation, then sending your message
+again.**, without the button, and the failed message shows **Sends again after
+the conversation is compacted.** Once the compaction succeeds, a copy of your
+message is sent, labelled **Sent again after the conversation was compacted.**,
+and any messages you queued meanwhile follow it. Don't send it again by hand.
+If the compaction fails, or you stop it, nothing is sent: the error names what
+happened, the original stays in the thread, and **Compact conversation**
+returns. If the copy fails at the limit again, the error says the conversation
+was already compacted once.
+
+When a Claude conversation is close to where Claude compacts on its own,
+BiBCode compacts it before sending your next message. The message shows
+**Waiting for the conversation to be compacted.** and is sent once the
+compaction ends. **Stop** during that compaction leaves the message unsent with
+**Not sent: you stopped the conversation compaction. Retry sends it.**; Retry
+sends it without compacting again. While any compaction runs, what you send is
+queued and Stop is offered. Turning Claude's auto-compaction off
+(`autoCompactEnabled: false` or `DISABLE_AUTO_COMPACT`) turns both automatic
+behaviours off and keeps **Compact conversation**.
+
 If an earlier message has a failed or uncertain delivery, the first queued card
 shows **Waiting for an earlier message**. **Steer** and **Send now** are disabled
 with **Retry or dismiss the earlier message first**, or **Dismiss the earlier
