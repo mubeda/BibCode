@@ -58,7 +58,8 @@ use crate::diagnostics::ProcessAttributionRegistry;
 
 /// How long `simctl boot` and `bootstatus` may take together.
 const DEFAULT_BOOT_TIMEOUT: Duration = Duration::from_secs(180);
-/// How often a booted simulator's state is checked for a shutdown nobody here asked for.
+/// How often the running simulators' states are checked, by one `simctl list` for all of
+/// them, for a shutdown nobody here asked for.
 const STATE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// How often the view-only screen is captured; one `simctl` screenshot takes about this long.
 const SCREENSHOT_INTERVAL: Duration = Duration::from_millis(500);
@@ -139,14 +140,18 @@ pub(crate) struct IosBackend {
     mode: Mutex<LaunchMode>,
     /// UDIDs BiBCode booted and has not shut down; only those are never `in_use_elsewhere`.
     booted: Arc<Booted>,
+    /// The running simulators and the one state poll that watches them all.
+    watched: Arc<Watched>,
     #[cfg(test)]
     hid_for_tests: Option<HidFactory>,
 }
 
 impl IosBackend {
     pub(crate) fn new(config: IosBackendConfig) -> Self {
+        let runner = Arc::new(config.runner);
         Self {
-            runner: Arc::new(config.runner),
+            watched: Watched::new(runner.clone()),
+            runner,
             boot_timeout: config.boot_timeout,
             xcode: XcodeCache::default(),
             guard: Arc::new(config.guard),
@@ -265,6 +270,7 @@ impl IosBackend {
                 launch,
             },
             process,
+            &self.watched,
         )))
     }
 
@@ -502,6 +508,162 @@ struct Ownership {
     launch: u64,
 }
 
+/// Where the shared poll records why a simulator ended without BiBCode asking.
+type ExitSlot = Arc<Mutex<Option<String>>>;
+
+/// The running simulators, by UDID, and the one state poll that watches them while any runs:
+/// several simulators cost one `simctl list` per interval, as one does.
+struct Watched {
+    runner: Arc<SimctlRunner>,
+    state: Mutex<WatchedState>,
+}
+
+#[derive(Default)]
+struct WatchedState {
+    next_generation: u64,
+    simulators: HashMap<String, Watch>,
+    /// The poll while any simulator is registered.
+    poll: Option<(CancellationToken, tokio::task::JoinHandle<()>)>,
+}
+
+/// One registration: a simulator stopped and opened again registers anew, under a new
+/// generation, so a listing taken for the old one never touches it.
+struct Watch {
+    generation: u64,
+    exit: ExitSlot,
+}
+
+impl Watched {
+    fn new(runner: Arc<SimctlRunner>) -> Arc<Self> {
+        Arc::new(Self {
+            runner,
+            state: Mutex::default(),
+        })
+    }
+
+    /// Watches `udid`, which now runs, and starts the poll if none runs; returns the
+    /// registration's generation, which [`unregister`](Self::unregister) takes.
+    fn register(self: &Arc<Self>, udid: &str, exit: ExitSlot) -> u64 {
+        let mut state = lock(&self.state);
+        let generation = state.next_generation;
+        state.next_generation += 1;
+        state
+            .simulators
+            .insert(udid.to_owned(), Watch { generation, exit });
+        if state.poll.is_none() {
+            let cancel = CancellationToken::new();
+            let task = tokio::spawn(poll_states(
+                Arc::downgrade(self),
+                self.runner.clone(),
+                cancel.clone(),
+            ));
+            state.poll = Some((cancel, task));
+        }
+        generation
+    }
+
+    /// Stops watching `udid` while `generation` is its registration. It takes the lock a
+    /// listing is applied under, so once this returns no listing marks the simulator. The
+    /// last one cancels the poll and waits for it, as each stop joined its own poll before.
+    async fn unregister(&self, udid: &str, generation: u64) {
+        let poll = {
+            let mut state = lock(&self.state);
+            if state
+                .simulators
+                .get(udid)
+                .is_some_and(|watch| watch.generation == generation)
+            {
+                state.simulators.remove(udid);
+            }
+            if state.simulators.is_empty() {
+                state.poll.take()
+            } else {
+                None
+            }
+        };
+        if let Some((cancel, task)) = poll {
+            cancel.cancel();
+            let _ = task.await;
+        }
+    }
+
+    /// The registrations a listing that starts now applies to.
+    fn copy(&self) -> Vec<(String, u64)> {
+        lock(&self.state)
+            .simulators
+            .iter()
+            .map(|(udid, watch)| (udid.clone(), watch.generation))
+            .collect()
+    }
+
+    /// Applies a listing to the registrations copied when it began that are still registered
+    /// under the same generation: one not listed was deleted outside BiBCode, one listed but
+    /// not `Booted` was shut down outside it. Each simulator's first reason is kept.
+    fn apply(&self, copied: &[(String, u64)], devices: &[SimDevice]) {
+        let state = lock(&self.state);
+        for (udid, generation) in copied {
+            let Some(watch) = state
+                .simulators
+                .get(udid)
+                .filter(|watch| watch.generation == *generation)
+            else {
+                continue;
+            };
+            let reason = match devices.iter().find(|device| device.udid == *udid) {
+                Some(device) if device.state == SimState::Booted => continue,
+                Some(_) => EXTERNAL_SHUTDOWN,
+                None => EXTERNAL_DELETE,
+            };
+            let mut exit = lock(&watch.exit);
+            if exit.is_none() {
+                *exit = Some(reason.to_owned());
+            }
+        }
+    }
+
+    /// Whether the poll runs, for the tests.
+    #[cfg(test)]
+    fn polling(&self) -> bool {
+        lock(&self.state).poll.is_some()
+    }
+}
+
+/// Lists the simulators every [`STATE_POLL_INTERVAL`] while any is registered, until
+/// cancelled or the backend is gone; a failed listing is retried at the next tick.
+async fn poll_states(
+    watched: std::sync::Weak<Watched>,
+    runner: Arc<SimctlRunner>,
+    cancel: CancellationToken,
+) {
+    loop {
+        tokio::select! {
+            () = cancel.cancelled() => return,
+            () = tokio::time::sleep(STATE_POLL_INTERVAL) => {}
+        }
+        let Some(copied) = watched.upgrade().map(|watched| watched.copy()) else {
+            return;
+        };
+        if copied.is_empty() {
+            continue;
+        }
+        let listed = tokio::select! {
+            () = cancel.cancelled() => return,
+            listed = runner.list() => listed,
+        };
+        let devices = match listed {
+            Ok(devices) => devices,
+            Err(error) => {
+                tracing::debug!(%error, "could not poll the simulators' state");
+                continue;
+            }
+        };
+        let Some(watched) = watched.upgrade() else {
+            return;
+        };
+        watched.apply(&copied, &devices);
+    }
+}
+
 /// The keys and buttons the guest may hold down. It covers the keys a batch synthesizes
 /// (Shift around a capital, Cmd+V for a paste) as well as device keys, which may stay down
 /// between batches.
@@ -560,14 +722,14 @@ struct Shared {
     runner: Arc<SimctlRunner>,
     /// Its entry in the backend's booted set, which only this launch's stop removes.
     ownership: Ownership,
-    /// Why the simulator ended without BiBCode asking; set by the state poll.
-    exit: Mutex<Option<String>>,
-    /// Cancels the state poll.
-    poll: CancellationToken,
+    /// Why the simulator ended without BiBCode asking; set by the shared state poll.
+    exit: ExitSlot,
+    /// The shared state poll and this simulator's registration in it.
+    watched: Arc<Watched>,
+    generation: u64,
     /// Cancelled by a stop, right after the input connections are released, to cut short a
     /// `pbcopy` still running: its child is killed instead of waited for.
     input_stop: CancellationToken,
-    poll_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     process: Mutex<Option<SimulatorProcess>>,
     /// Set by whichever stop runs first.
     stopping: AtomicBool,
@@ -582,7 +744,12 @@ impl RunningSimulator {
         runner: Arc<SimctlRunner>,
         ownership: Ownership,
         process: Option<SimulatorProcess>,
+        watched: &Arc<Watched>,
     ) -> Self {
+        // Watched from now on, once it runs, so a shutdown before it booted is never taken
+        // for one outside BiBCode.
+        let exit = ExitSlot::default();
+        let generation = watched.register(&udid, exit.clone());
         let shared = Arc::new(Shared {
             udid,
             native,
@@ -596,52 +763,14 @@ impl RunningSimulator {
             input_tasks: TaskTracker::new(),
             runner,
             ownership,
-            exit: Mutex::new(None),
-            poll: CancellationToken::new(),
+            exit,
+            watched: watched.clone(),
+            generation,
             input_stop: CancellationToken::new(),
-            poll_task: Mutex::new(None),
             process: Mutex::new(process),
             stopping: AtomicBool::new(false),
         });
-        let task = tokio::spawn(watch_state(Arc::downgrade(&shared), shared.poll.clone()));
-        *lock(&shared.poll_task) = Some(task);
         Self { shared }
-    }
-}
-
-/// Polls `simctl list` until cancelled; a simulator that leaves `Booted` is recorded as an
-/// exit nobody here asked for.
-async fn watch_state(shared: std::sync::Weak<Shared>, cancel: CancellationToken) {
-    loop {
-        tokio::select! {
-            () = cancel.cancelled() => return,
-            () = tokio::time::sleep(STATE_POLL_INTERVAL) => {}
-        }
-        let Some(shared) = shared.upgrade() else {
-            return;
-        };
-        let listed = tokio::select! {
-            () = cancel.cancelled() => return,
-            listed = shared.runner.list() => listed,
-        };
-        let devices = match listed {
-            Ok(devices) => devices,
-            Err(error) => {
-                tracing::debug!(%error, "could not poll the simulator's state");
-                continue;
-            }
-        };
-        let reason = match devices.iter().find(|device| device.udid == shared.udid) {
-            Some(device) if device.state == SimState::Booted => continue,
-            Some(_) => EXTERNAL_SHUTDOWN,
-            None => EXTERNAL_DELETE,
-        };
-        // A stop that started meanwhile asked for this.
-        if cancel.is_cancelled() {
-            return;
-        }
-        *lock(&shared.exit) = Some(reason.to_owned());
-        return;
     }
 }
 
@@ -667,12 +796,8 @@ impl Shared {
         lock(&self.held).take();
         lock(&self.owed_lift).take();
         *lock(&self.presses) = Presses::default();
-        // The poll ends first, so this shutdown is never taken for an external one.
-        self.poll.cancel();
-        let task = lock(&self.poll_task).take();
-        if let Some(task) = task {
-            let _ = task.await;
-        }
+        // Unwatched first, so this shutdown is never taken for an external one.
+        self.watched.unregister(&self.udid, self.generation).await;
         // The screen's callbacks go before the simulator does.
         if let Display::Live(screen) = &self.display {
             let screen = screen.clone();
@@ -2183,6 +2308,152 @@ mod tests {
             Err(DeviceOpError::Busy { .. })
         ));
         assert!(sim.calls().iter().all(|c| !c.starts_with("boot")));
+    }
+
+    fn listed(udid: &str, state: super::SimState) -> super::SimDevice {
+        super::SimDevice {
+            udid: udid.to_owned(),
+            name: "iPhone 17".to_owned(),
+            runtime: "iOS 27.0".to_owned(),
+            state,
+        }
+    }
+
+    fn watched() -> std::sync::Arc<super::Watched> {
+        super::Watched::new(std::sync::Arc::new(FakeXcrun::new().write().runner()))
+    }
+
+    /// A listing taken while B was still shut down, before it booted and registered, is
+    /// delivered once B runs: B was not in the listing's copy, so it stays running.
+    #[tokio::test]
+    async fn a_listing_begun_before_a_simulator_registered_leaves_it_running() {
+        let watched = watched();
+        let a = super::ExitSlot::default();
+        let a_generation = watched.register("A", a.clone());
+        let copied = watched.copy();
+        let b = super::ExitSlot::default();
+        let b_generation = watched.register("B", b.clone());
+        watched.apply(
+            &copied,
+            &[
+                listed("A", super::SimState::Booted),
+                listed("B", super::SimState::Shutdown),
+            ],
+        );
+        assert_eq!(*b.lock().unwrap(), None);
+        assert_eq!(*a.lock().unwrap(), None);
+        // The next listing copies B and sees its outside shutdown.
+        watched.apply(
+            &watched.copy(),
+            &[
+                listed("A", super::SimState::Booted),
+                listed("B", super::SimState::Shutdown),
+            ],
+        );
+        assert_eq!(b.lock().unwrap().as_deref(), Some(super::EXTERNAL_SHUTDOWN));
+        watched.unregister("A", a_generation).await;
+        assert!(watched.polling(), "B still runs");
+        watched.unregister("B", b_generation).await;
+        assert!(!watched.polling(), "the last stop joins the poll");
+    }
+
+    /// A listing still in flight while A's stop shuts it down is delivered after the stop
+    /// unregistered A, so A ends stopped, with no outside reason.
+    #[tokio::test]
+    async fn a_listing_in_flight_during_a_stop_gives_no_outside_reason() {
+        let watched = watched();
+        let a = super::ExitSlot::default();
+        let generation = watched.register("A", a.clone());
+        let copied = watched.copy();
+        watched.unregister("A", generation).await;
+        watched.apply(&copied, &[listed("A", super::SimState::Shutdown)]);
+        assert_eq!(*a.lock().unwrap(), None);
+        assert!(!watched.polling());
+    }
+
+    /// A listing begun before A was stopped and opened again is delivered to the new A's
+    /// registration, a new generation, which it does not touch; one A was deleted is.
+    #[tokio::test]
+    async fn a_listing_for_an_earlier_open_of_a_simulator_does_not_touch_the_new_one() {
+        let watched = watched();
+        let old = super::ExitSlot::default();
+        let old_generation = watched.register("A", old.clone());
+        let copied = watched.copy();
+        watched.unregister("A", old_generation).await;
+        let new = super::ExitSlot::default();
+        let new_generation = watched.register("A", new.clone());
+        watched.apply(&copied, &[]);
+        assert_eq!(*new.lock().unwrap(), None);
+        assert_eq!(*old.lock().unwrap(), None);
+        // An old stop finishing late leaves the new registration alone.
+        watched.unregister("A", old_generation).await;
+        watched.apply(&watched.copy(), &[]);
+        assert_eq!(new.lock().unwrap().as_deref(), Some(super::EXTERNAL_DELETE));
+        // The first reason is kept.
+        watched.apply(&watched.copy(), &[listed("A", super::SimState::Shutdown)]);
+        assert_eq!(new.lock().unwrap().as_deref(), Some(super::EXTERNAL_DELETE));
+        watched.unregister("A", new_generation).await;
+        assert!(!watched.polling());
+    }
+
+    /// `simctl list` calls so far; the state poll lists every simulator at once.
+    fn listings(sim: &FakeXcrun) -> usize {
+        sim.calls()
+            .iter()
+            .filter(|call| call.starts_with("list"))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn running_simulators_share_one_state_poll() {
+        let sim = FakeXcrun::new()
+            .device("UDID-1", "iPhone 17 Pro", "iOS 27.0")
+            .device("UDID-2", "iPhone 17", "iOS 27.0")
+            .write();
+        let (manager, _enabled) = ios_manager(&sim);
+        let first = manager.open(Platform::Ios, "UDID-1", None).await.unwrap();
+        let second = manager.open(Platform::Ios, "UDID-2", None).await.unwrap();
+        wait_state(&manager, &first, DeviceState::Ready).await;
+        wait_state(&manager, &second, DeviceState::Ready).await;
+        let before = listings(&sim);
+        tokio::time::sleep(super::STATE_POLL_INTERVAL * 3 + std::time::Duration::from_millis(500))
+            .await;
+        let polled = listings(&sim) - before;
+        assert!(
+            (2..=4).contains(&polled),
+            "one listing per interval for both simulators, not one each: {polled}"
+        );
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn an_outside_shutdown_fails_only_that_simulator_and_no_poll_outlives_the_stops() {
+        let sim = FakeXcrun::new()
+            .device("UDID-1", "iPhone 17 Pro", "iOS 27.0")
+            .device("UDID-2", "iPhone 17", "iOS 27.0")
+            .write();
+        let (manager, _enabled) = ios_manager(&sim);
+        let first = manager.open(Platform::Ios, "UDID-1", None).await.unwrap();
+        let second = manager.open(Platform::Ios, "UDID-2", None).await.unwrap();
+        wait_state(&manager, &first, DeviceState::Ready).await;
+        wait_state(&manager, &second, DeviceState::Ready).await;
+        sim.set_state("UDID-1", "Shutdown");
+        let failed = wait_state(&manager, &first, DeviceState::Failed).await;
+        assert_eq!(failed.failure.as_deref(), Some(super::EXTERNAL_SHUTDOWN));
+        // Another listing later, the other simulator still runs.
+        tokio::time::sleep(super::STATE_POLL_INTERVAL + std::time::Duration::from_millis(500))
+            .await;
+        assert_eq!(
+            wait_state(&manager, &second, DeviceState::Ready)
+                .await
+                .state,
+            DeviceState::Ready
+        );
+        manager.shutdown().await;
+        let after = listings(&sim);
+        tokio::time::sleep(super::STATE_POLL_INTERVAL + std::time::Duration::from_millis(500))
+            .await;
+        assert_eq!(listings(&sim), after, "no poll runs after shutdown");
     }
 
     /// A simulator BiBCode booted is not "running outside BiBCode": opening it again returns
