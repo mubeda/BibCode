@@ -158,6 +158,40 @@ describe("PullRequestsFiles", () => {
     expect(tree.parentElement!.className).toContain("@3xl/pull-request:flex-row");
     expect(tree.parentElement!.className).not.toMatch(/(^|\s)md:/);
   });
+  it("keeps selection, Viewed and scroll-to-file working after the file list is resized", async () => {
+    h.hash = "file=docs%2Fread%20me%23%C3%A9.md";
+    await render();
+    const row = (path: string) => container.querySelector(`[data-file-path="${path}"]`)!;
+    const divider = container.querySelector('[aria-label="Resize changed files"]')!;
+    const listsBefore = h.lists.length;
+
+    await act(async () =>
+      divider.dispatchEvent(new KeyboardEvent("keydown", { key: "End", bubbles: true })),
+    );
+
+    expect(
+      container
+        .querySelector<HTMLElement>('nav[aria-label="Changed files"]')!
+        .style.getPropertyValue("--changed-files-nav-width"),
+    ).toBe("720px");
+    // The resize re-renders only the split, never the tree or diff list.
+    expect(h.lists).toHaveLength(listsBefore);
+    expect(row("docs/read me#é.md").getAttribute("aria-current")).toBe("true");
+    h.scroll.mockClear();
+    await act(async () =>
+      row("src/a.ts").dispatchEvent(new MouseEvent("click", { bubbles: true })),
+    );
+    expect(h.scroll).toHaveBeenCalledWith({ index: 0, animated: false, viewPosition: 0 });
+    expect(h.navigate).toHaveBeenCalledWith(
+      expect.objectContaining({ hash: "file=src%2Fa.ts", replace: true }),
+    );
+    await act(async () =>
+      container.querySelector<HTMLInputElement>('input[aria-label="Viewed src/a.ts"]')!.click(),
+    );
+    expect(usePullRequestsStore.getState().selectViewState(projectRef).viewedFiles[14]).toEqual([
+      "src/a.ts",
+    ]);
+  });
   it("selects and scrolls the file encoded in the route hash", async () => {
     h.hash = "file=docs%2Fread%20me%23%C3%A9.md";
     await render();
