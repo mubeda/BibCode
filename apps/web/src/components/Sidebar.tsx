@@ -3478,7 +3478,8 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
             </TooltipTrigger>
             <TooltipPopup side="top">Git Manager</TooltipPopup>
           </Tooltip>
-          {pullRequestsEnabled ? (
+          {/* In the Repositories view the repository row owns Pull Requests. */}
+          {pullRequestsEnabled && !environmentCard ? (
             <Tooltip>
               <TooltipTrigger
                 render={
@@ -3669,6 +3670,52 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
         </DialogPopup>
       </Dialog>
     </>
+  );
+});
+
+/** Pull Requests for a repository: one environment opens directly, several ask which. */
+const SidebarRepositoryPullRequestsButton = memo(function SidebarRepositoryPullRequestsButton({
+  group,
+}: {
+  readonly group: RepositoryGroup;
+}) {
+  const pullRequestsEnabled = usePrimarySettings((settings) => settings.pullRequestsEnabled);
+  const navigate = useNavigate();
+  const { isMobile, setOpenMobile } = useSidebar();
+  const handleClick = useCallback(
+    (event: React.MouseEvent<HTMLButtonElement>) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const members = group.cards.flatMap((card) => card.memberProjects);
+      void chooseProjectMember(members, { x: event.clientX, y: event.clientY }).then((member) => {
+        if (!member) return;
+        if (isMobile) setOpenMobile(false);
+        void navigate({
+          to: "/project/$environmentId/$projectId/pull-requests",
+          params: { environmentId: member.environmentId, projectId: member.id },
+        });
+      });
+    },
+    [group.cards, isMobile, navigate, setOpenMobile],
+  );
+  if (!pullRequestsEnabled) return null;
+  return (
+    <Tooltip>
+      <TooltipTrigger
+        render={
+          <button
+            type="button"
+            aria-label={`Pull Requests for ${group.title}`}
+            data-testid="repository-pull-requests-button"
+            className={SIDEBAR_ICON_ACTION_BUTTON_CLASS}
+            onClick={handleClick}
+          />
+        }
+      >
+        <GitPullRequestIcon aria-hidden="true" className="size-3.5" />
+      </TooltipTrigger>
+      <TooltipPopup side="top">Pull Requests</TooltipPopup>
+    </Tooltip>
   );
 });
 
@@ -4330,6 +4377,7 @@ const SidebarProjectsContent = memo(function SidebarProjectsContent(
                 key={group.key}
                 group={group}
                 expanded={repositoryGroupExpandedById[group.key] !== false}
+                actions={<SidebarRepositoryPullRequestsButton group={group} />}
               >
                 {group.cards.map((project) => (
                   <SidebarProjectListRow
