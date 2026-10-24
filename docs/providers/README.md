@@ -23,6 +23,21 @@ probes the configured executable and reports installation, authentication, and
 model discovery independently; a driver being supported does not guarantee
 that its local CLI is installed or ready.
 
+## Updating providers on every environment
+
+When a provider is outdated on any environment, **Settings → Providers** shows
+**Provider updates → Update all…**. The confirmation lists each connected
+environment, including SSH, relay, and direct ones, with the providers it will
+update, and names what it skips: providers that need a manual update or are
+already updating, and environments that are not connected. Cancel runs nothing.
+After you confirm, at most two environments update at a time, each one's
+providers in turn, and one environment's failure never stops another. The
+per-environment result (**Queued**, **Updating…**, **Updated**, still outdated,
+failed with the server's message, or skipped) stays in Settings until you choose
+**Clear**, also when you leave the page. This action updates providers only; it
+never restarts a server or the desktop app. Update a remote server itself from
+**Settings → Connections**.
+
 ## Skills in chat
 
 The chat menu combines the selected provider's user skills with skills from the

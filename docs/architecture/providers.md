@@ -967,6 +967,19 @@ clients keep their previous `checkedAt` until a content change or a
 user-triggered refresh publishes, or until they reconnect and receive a fresh
 snapshot.
 
+Clients start updates only through `server.updateProvider` on the environment
+that owns the provider. The primary toast and the desktop-local rows update
+their own targets. **Settings → Providers → Update all…** is client
+orchestration over the same method (`apps/web/src/components/ProviderUpdateAll.logic.ts`):
+it plans every connected environment, sends each one-click candidate with that
+environment's id, driver, and instance id, and runs at most two environments at
+a time through `fanOutRemoteUpdateChecks`. Calls within one environment still
+share its serial config scheduler. The per-environment summary lives in a
+keep-alive atom (`apps/web/src/state/providerUpdateAll.ts`), so it survives
+navigation, and the RPCs continue after the page unmounts. The action never
+calls `updater.install`, so it cannot restart a host while one of its provider
+updates is in flight.
+
 An update reservation is bound to the complete maintenance target and settings
 generation. After acquiring the per-command lock, the server rereads settings,
 re-resolves the target and action, and rejects a queued update if its binary,

@@ -2682,6 +2682,12 @@ sizes. Cover relevant:
   it open. With **Settings → Agents → Always show Activity** on, a new chat on a
   provider that reports activity shows the muted **Activity** button before its
   first subagent; with it off, the button waits for a record;
+- with an outdated provider on the primary and on a connected remote
+  environment, **Settings → Providers → Update all…** lists both environments
+  and their providers, and names a disconnected environment and a manual-update
+  provider as skipped. Cancel runs nothing. Confirm, leave Settings while an
+  update runs, and return: each environment shows its own result until
+  **Clear**, and no server restarts;
 - with **Settings → General → Theme** on **System**, switch the operating system
   between light and dark while the app shows the home screen and again while it
   shows a thread: the window follows each switch without a reload; with
