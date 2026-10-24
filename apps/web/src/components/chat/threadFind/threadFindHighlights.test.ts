@@ -6,6 +6,7 @@ import {
   collectScopeSegments,
   FIND_ACTIVE_HIGHLIGHT_NAME,
   FIND_HIGHLIGHT_NAME,
+  FindRowRangeCache,
   locateTargetRange,
   paintFindHighlights,
   releaseFindHighlights,
@@ -23,6 +24,7 @@ function element(html: string): HTMLElement {
 afterEach(() => {
   document.body.replaceChildren();
   setFindHighlightSupportForTests(undefined);
+  vi.restoreAllMocks();
 });
 
 describe("collectScopeSegments", () => {
@@ -84,6 +86,47 @@ describe("ranges", () => {
     const inBlock = locateTargetRange(row, { scope: "md:0", details: [2], index: 0 }, query);
     expect(inBlock?.startContainer.textContent).toBe("alpha again");
     expect(locateTargetRange(row, { scope: "md:1", details: [], index: 0 }, query)).toBeNull();
+  });
+
+  it("builds no more ranges than the limit asks for", () => {
+    const row = element(`<div data-find-scope="md:0"><p>${"a ".repeat(50)}</p></div>`);
+    const createRange = vi.spyOn(document, "createRange");
+    expect(collectRowRanges(row, "a", 5)).toHaveLength(5);
+    expect(createRange).toHaveBeenCalledTimes(5);
+  });
+});
+
+describe("FindRowRangeCache", () => {
+  function timelineRow(id: string, text: string): { wrapper: HTMLElement; row: Element } {
+    // The list wraps each row; the wrapper is what unmounts.
+    const wrapper = element(
+      `<div data-timeline-row-id="${id}"><div data-find-scope="md:0"><p>${text}</p></div></div>`,
+    );
+    return { wrapper, row: wrapper.firstElementChild! };
+  }
+
+  it("collects a row once, and again only when a larger limit needs more", () => {
+    const { row } = timelineRow("a", "x x x x");
+    const cache = new FindRowRangeCache();
+    const createRange = vi.spyOn(document, "createRange");
+    expect(cache.ranges(row, "x", 2)).toHaveLength(2);
+    expect(cache.ranges(row, "x", 2)).toHaveLength(2);
+    expect(createRange).toHaveBeenCalledTimes(2);
+    expect(cache.ranges(row, "x", 10)).toHaveLength(4);
+    // Complete now: a larger limit has nothing more to collect.
+    expect(cache.ranges(row, "x", 20)).toHaveLength(4);
+    expect(createRange).toHaveBeenCalledTimes(6);
+  });
+
+  it("drops rows that are no longer mounted, even when a wrapper was removed", () => {
+    const first = timelineRow("a", "x");
+    const second = timelineRow("b", "x");
+    const cache = new FindRowRangeCache();
+    cache.ranges(first.row, "x", 10);
+    cache.ranges(second.row, "x", 10);
+    first.wrapper.remove();
+    cache.retainOnly(new Set([second.row]));
+    expect(cache.size).toBe(1);
   });
 });
 

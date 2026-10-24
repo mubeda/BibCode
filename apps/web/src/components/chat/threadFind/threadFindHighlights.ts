@@ -175,9 +175,14 @@ function sameDetailsPath(a: ReadonlyArray<number>, b: ReadonlyArray<number>): bo
   return a.length === b.length && a.every((ordinal, index) => ordinal === b[index]);
 }
 
-/** Every occurrence in one row's scopes, as ranges in reading order. */
-export function collectRowRanges(row: Element, query: string): Range[] {
+/** The first `limit` occurrences in one row's scopes, as ranges in reading order. */
+export function collectRowRanges(
+  row: Element,
+  query: string,
+  limit: number = Number.POSITIVE_INFINITY,
+): Range[] {
   const ranges: Range[] = [];
+  if (limit <= 0) return ranges;
   for (const scope of row.querySelectorAll(`[${FIND_SCOPE_ATTRIBUTE}]`)) {
     for (const occurrence of findScopeOccurrences(scope, query)) {
       const range = rangeForSegmentOffsets(
@@ -185,10 +190,52 @@ export function collectRowRanges(row: Element, query: string): Range[] {
         occurrence.start,
         occurrence.start + query.length,
       );
-      if (range) ranges.push(range);
+      if (!range) continue;
+      ranges.push(range);
+      if (ranges.length >= limit) return ranges;
     }
   }
   return ranges;
+}
+
+/**
+ * The ranges of mounted rows for one query: each row is collected once while its text holds,
+ * and never past the limit a paint asks for. Clear it when the query changes.
+ */
+export class FindRowRangeCache {
+  readonly #rows = new Map<Element, { readonly ranges: Range[]; readonly complete: boolean }>();
+
+  /** Up to `limit` of the row's ranges, in reading order. */
+  ranges(row: Element, query: string, limit: number): ReadonlyArray<Range> {
+    const cached = this.#rows.get(row);
+    if (cached && (cached.complete || cached.ranges.length >= limit)) return cached.ranges;
+    const ranges = collectRowRanges(row, query, limit);
+    this.#rows.set(row, { ranges, complete: ranges.length < limit });
+    return ranges;
+  }
+
+  /** Forgets a row whose text changed. */
+  invalidate(row: Element): void {
+    this.#rows.delete(row);
+  }
+
+  /**
+   * Keeps only these rows. The list unmounts a row's wrapper, not the row, so pruning against
+   * what is mounted is what releases a detached row and its text nodes.
+   */
+  retainOnly(rows: ReadonlySet<Element>): void {
+    for (const row of this.#rows.keys()) {
+      if (!rows.has(row)) this.#rows.delete(row);
+    }
+  }
+
+  clear(): void {
+    this.#rows.clear();
+  }
+
+  get size(): number {
+    return this.#rows.size;
+  }
 }
 
 /**

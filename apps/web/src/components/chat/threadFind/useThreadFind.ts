@@ -25,8 +25,8 @@ import {
 import {
   claimFindHighlights,
   clearFindHighlights,
-  collectRowRanges,
   FIND_ACTIVE_ROW_ATTRIBUTE,
+  FindRowRangeCache,
   locateTargetRange,
   MAX_PAINTED_FIND_RANGES,
   ownsFindHighlights,
@@ -214,7 +214,7 @@ class ThreadFindSession {
   #recountTimer: ReturnType<typeof setTimeout> | null = null;
   #pendingScroll: PendingScroll | null = null;
   #composing = false;
-  #rowRanges = new Map<Element, Range[]>();
+  readonly #rowRanges = new FindRowRangeCache();
   #observer: MutationObserver | null = null;
   #paintFrame: number | null = null;
   #markedRow: Element | null = null;
@@ -811,10 +811,8 @@ class ThreadFindSession {
         const element =
           record.target instanceof Element ? record.target : record.target.parentElement;
         const row = element?.closest("[data-timeline-row-id]");
-        if (row) this.#rowRanges.delete(row);
-        for (const removed of record.removedNodes) {
-          if (removed instanceof Element) this.#rowRanges.delete(removed);
-        }
+        // Removed rows, and rows inside a removed wrapper, are pruned by the paint.
+        if (row) this.#rowRanges.invalidate(row);
       }
       this.#schedulePaint();
     });
@@ -852,14 +850,13 @@ class ThreadFindSession {
             .toSorted((a, b) => a.distance - b.distance)
             .map(({ row }) => row)
         : rows;
+    this.#rowRanges.retainOnly(new Set(rows));
     const inactive: Range[] = [];
     for (const row of ordered) {
-      let ranges = this.#rowRanges.get(row);
-      if (!ranges) {
-        ranges = collectRowRanges(row, folded);
-        this.#rowRanges.set(row, ranges);
-      }
-      for (const range of ranges) {
+      if (inactive.length >= MAX_PAINTED_FIND_RANGES) break;
+      // One more than the budget left, since one of them may be the active match.
+      const limit = MAX_PAINTED_FIND_RANGES - inactive.length + 1;
+      for (const range of this.#rowRanges.ranges(row, folded, limit)) {
         if (inactive.length >= MAX_PAINTED_FIND_RANGES) break;
         if (
           active &&
