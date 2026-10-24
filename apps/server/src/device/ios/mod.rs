@@ -268,9 +268,11 @@ impl IosBackend {
             Ownership {
                 booted: self.booted.clone(),
                 launch,
+                // Watched from now on, once it runs, so a shutdown before it booted is never
+                // taken for one outside BiBCode.
+                watch: Registration::new(&self.watched, udid),
             },
             process,
-            &self.watched,
         )))
     }
 
@@ -506,10 +508,32 @@ impl Booted {
 struct Ownership {
     booted: Arc<Booted>,
     launch: u64,
+    /// Its registration in the shared state poll, which only this launch's stop removes.
+    watch: Registration,
 }
 
 /// Where the shared poll records why a simulator ended without BiBCode asking.
 type ExitSlot = Arc<Mutex<Option<String>>>;
+
+/// A running simulator's registration in the shared state poll, and where it records an
+/// exit nobody here asked for.
+struct Registration {
+    watched: Arc<Watched>,
+    generation: u64,
+    exit: ExitSlot,
+}
+
+impl Registration {
+    fn new(watched: &Arc<Watched>, udid: &str) -> Self {
+        let exit = ExitSlot::default();
+        let generation = watched.register(udid, exit.clone());
+        Self {
+            watched: watched.clone(),
+            generation,
+            exit,
+        }
+    }
+}
 
 /// The running simulators, by UDID, and the one state poll that watches them while any runs:
 /// several simulators cost one `simctl list` per interval, as one does.
@@ -720,13 +744,11 @@ struct Shared {
     /// stop waits for them.
     input_tasks: TaskTracker,
     runner: Arc<SimctlRunner>,
-    /// Its entry in the backend's booted set, which only this launch's stop removes.
+    /// Its entry in the backend's booted set and its state-poll registration, which only this
+    /// launch's stop removes.
     ownership: Ownership,
     /// Why the simulator ended without BiBCode asking; set by the shared state poll.
     exit: ExitSlot,
-    /// The shared state poll and this simulator's registration in it.
-    watched: Arc<Watched>,
-    generation: u64,
     /// Cancelled by a stop, right after the input connections are released, to cut short a
     /// `pbcopy` still running: its child is killed instead of waited for.
     input_stop: CancellationToken,
@@ -744,12 +766,8 @@ impl RunningSimulator {
         runner: Arc<SimctlRunner>,
         ownership: Ownership,
         process: Option<SimulatorProcess>,
-        watched: &Arc<Watched>,
     ) -> Self {
-        // Watched from now on, once it runs, so a shutdown before it booted is never taken
-        // for one outside BiBCode.
-        let exit = ExitSlot::default();
-        let generation = watched.register(&udid, exit.clone());
+        let exit = ownership.watch.exit.clone();
         let shared = Arc::new(Shared {
             udid,
             native,
@@ -764,8 +782,6 @@ impl RunningSimulator {
             runner,
             ownership,
             exit,
-            watched: watched.clone(),
-            generation,
             input_stop: CancellationToken::new(),
             process: Mutex::new(process),
             stopping: AtomicBool::new(false),
@@ -797,7 +813,8 @@ impl Shared {
         lock(&self.owed_lift).take();
         *lock(&self.presses) = Presses::default();
         // Unwatched first, so this shutdown is never taken for an external one.
-        self.watched.unregister(&self.udid, self.generation).await;
+        let watch = &self.ownership.watch;
+        watch.watched.unregister(&self.udid, watch.generation).await;
         // The screen's callbacks go before the simulator does.
         if let Display::Live(screen) = &self.display {
             let screen = screen.clone();
