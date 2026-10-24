@@ -2046,6 +2046,7 @@ describe("computeStableMessagesTimelineRows", () => {
       id: "fold",
       createdAt: "2026-01-01T00:00:00Z",
       turnId: "turn" as never,
+      anchorEntryId: "entry",
       label: "Worked for 1s",
       expanded: false,
     };
@@ -2063,6 +2064,9 @@ describe("computeStableMessagesTimelineRows", () => {
     expect(computeStableMessagesTimelineRows([{ ...fold, expanded: true }], initial)).not.toBe(
       initial,
     );
+    expect(
+      computeStableMessagesTimelineRows([{ ...fold, anchorEntryId: "other" }], initial),
+    ).not.toBe(initial);
   });
 
   it("returns the previous result when row order and content are unchanged", () => {
