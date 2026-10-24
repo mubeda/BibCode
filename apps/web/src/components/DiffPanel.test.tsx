@@ -263,6 +263,17 @@ vi.mock("./diffs/useCommentDraftStore", () => ({
   }),
 }));
 
+vi.mock("./diffs/DiffOpenWithMenu", () => ({
+  DiffOpenWithMenu: (props: Record<string, unknown>) => {
+    h.capture("diffOpenWithMenu", props);
+    return <div data-mock="diff-open-with-menu" />;
+  },
+  DiffToolLaunchAlert: (props: Record<string, unknown>) => {
+    h.capture("diffToolLaunchAlert", props);
+    return <div data-mock="diff-tool-launch-alert" />;
+  },
+}));
+
 vi.mock("./diffs/DiffCompareView", () => ({
   DiffCompareView: (props: Record<string, unknown>) => {
     h.capture("diffCompareView", props);
@@ -720,6 +731,86 @@ describe("DiffPanel: Changes and Compare", () => {
     const markup = render();
     expect(markup).toContain("The checkpoint for turn 4 is no longer in the repository.");
     expect(markup).not.toContain("No net changes");
+  });
+});
+
+describe("DiffPanel: Open with", () => {
+  it("opens every file of the scope from the Changes toolbar", () => {
+    render();
+    expect(capturedLast("diffOpenWithMenu")).toMatchObject({
+      environmentId,
+      cwd: "/wt",
+      target: { kind: "all", count: 2 },
+      scope: { _tag: "branch", baseRef: null },
+    });
+
+    h.diffSelection = { kind: "branch", baseRef: "origin/main" };
+    render();
+    expect(capturedLast("diffOpenWithMenu")["scope"]).toEqual({
+      _tag: "branch",
+      baseRef: "origin/main",
+    });
+
+    h.queryDataByKey.set("review.diffPreview", {
+      cwd: "/repo",
+      sources: [{ kind: "working-tree", diff: "PATCH_TEXT", headRef: null, baseRef: "HEAD" }],
+    });
+    h.diffSelection = { kind: "unstaged" };
+    render();
+    expect(capturedLast("diffOpenWithMenu")["scope"]).toEqual({ _tag: "working-tree" });
+  });
+
+  it("compares a turn's two checkpoints, named by the thread and its turn counts", () => {
+    h.turnDiffSummaries = [summary(turnIdA, 3, "2026-01-01T00:00:00.000Z")];
+    h.diffSelection = { kind: "turn", turnId: turnIdA, filePath: null, revealRequestId: 0 };
+    h.checkpointDiff = { data: { diff: "CP", truncated: false }, error: null, isPending: false };
+    render();
+    expect(capturedLast("diffOpenWithMenu")["scope"]).toEqual({
+      _tag: "turn",
+      threadId,
+      fromTurnCount: 2,
+      toTurnCount: 3,
+    });
+  });
+
+  it("moves into Compare's pane header for the selected file", () => {
+    h.settings = { ...h.settings, diffViewMode: "compare" };
+    render();
+    expect(capturedAll("diffOpenWithMenu"), "the toolbar has no second menu").toEqual([]);
+    const renderFileActions = capturedLast("diffCompareView")["renderFileActions"] as (
+      row: unknown,
+    ) => ReactElement<Record<string, unknown>>;
+    const menu = renderFileActions({
+      path: "new.ts",
+      previousPath: "old.ts",
+      fileDiff: { type: "rename-changed", newObjectId: "a".repeat(40) },
+    });
+    expect(menu.props).toMatchObject({
+      cwd: "/wt",
+      target: { kind: "file", path: "new.ts", previousPath: "old.ts", untracked: false },
+      scope: { _tag: "branch", baseRef: null },
+    });
+
+    h.queryDataByKey.set("review.diffPreview", {
+      cwd: "/repo",
+      sources: [{ kind: "working-tree", diff: "PATCH_TEXT", headRef: null, baseRef: "HEAD" }],
+    });
+    h.diffSelection = { kind: "unstaged" };
+    render();
+    const untracked = (
+      capturedLast("diffCompareView")["renderFileActions"] as typeof renderFileActions
+    )({ path: "new.ts", previousPath: null, fileDiff: { type: "new" } });
+    expect(untracked.props["target"]).toMatchObject({ untracked: true });
+  });
+
+  it("shows a failed launch under the toolbar", () => {
+    const markup = render();
+    expect(markup).not.toContain('data-mock="diff-tool-launch-alert"');
+    const failure = { title: "Couldn't open Meld.", detail: "exit 128", command: ["git"] };
+    // The launch failure is the panel's fifth piece of state.
+    h.stateSeeds.set(4, failure);
+    expect(render()).toContain('data-mock="diff-tool-launch-alert"');
+    expect(capturedLast("diffToolLaunchAlert")["failure"]).toEqual(failure);
   });
 });
 

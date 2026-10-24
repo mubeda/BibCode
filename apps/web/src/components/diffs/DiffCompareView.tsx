@@ -82,6 +82,8 @@ export interface DiffCompareViewProps {
   /** Asks for the patch again, as the panel's refresh does. */
   readonly onRevalidatePatch: () => void;
   readonly lineFilter: CompareLineFilter;
+  /** Actions on the selected file, at the end of its pane header, such as **Open with**. */
+  readonly renderFileActions?: (row: DiffFileRow) => ReactNode;
 }
 
 /** **All lines** or **Changes only**, with the context count the second one asks Git for. */
@@ -248,6 +250,7 @@ function DiffComparePane({
   keybindings,
   paneRef,
   threadRef,
+  renderFileActions,
 }: DiffComparePaneProps) {
   const plan = planCompareFile(row, scope, { liveTurnPatches });
   const commentDraftStore = useCommentDraftStore(threadRef, sectionId);
@@ -400,6 +403,7 @@ function DiffComparePane({
             </ChangeNavigationButton>
           </>
         )}
+        {renderFileActions?.(row)}
       </div>
       {plan.kind === "notice" ? null : <CompareLineControls lineFilter={lineFilter} />}
       {plan.kind === "notice" ? (
