@@ -32,6 +32,9 @@ const h = vi.hoisted(() => ({
   pending: false,
   failures: new Map<object, unknown>(),
   snapshot: null as PipelinesSnapshot | null,
+  // What the latest attempt's stored copy holds, for an earlier attempt's page.
+  latestSnapshot: null as PipelinesSnapshot | null,
+  navigate: vi.fn(),
   nextSnapshot: null as PipelinesSnapshot | null,
   changed: null as PipelinesChanged | null,
   streamFailed: false,
@@ -55,7 +58,11 @@ vi.mock("../../../state/query", () => ({
   useEnvironmentQuery: (atom: { kind: string } | null) => {
     const [, publish] = useReducer((value: number) => value + 1, 0);
     if (atom !== null && (atom.kind === "readSnapshot" || atom.kind === "subscribe")) {
-      const value = atom.kind === "readSnapshot" ? h.snapshot : h.changed;
+      const latest =
+        (atom as { input?: { attempt?: number | null } }).input?.attempt === null &&
+        h.latestSnapshot !== null;
+      const value =
+        atom.kind === "readSnapshot" ? (latest ? h.latestSnapshot : h.snapshot) : h.changed;
       const read = () => {
         h.snapshotReads(atom.kind);
         if (atom.kind === "readSnapshot" && h.nextSnapshot) h.snapshot = h.nextSnapshot;
@@ -113,6 +120,7 @@ vi.mock("../../../state/query", () => ({
   },
 }));
 vi.mock("@tanstack/react-router", () => ({
+  useNavigate: () => h.navigate,
   Link: ({
     to,
     params,
@@ -245,6 +253,8 @@ beforeEach(() => {
   h.pending = false;
   h.failures.clear();
   h.snapshot = null;
+  h.latestSnapshot = null;
+  h.navigate.mockClear();
   h.nextSnapshot = null;
   h.changed = null;
   h.streamFailed = false;
@@ -310,6 +320,42 @@ describe("PipelinesDetailView header", () => {
     const retry = button("Retry");
     expect(retry.disabled).toBe(true);
     expect(retry.title).toBe(SERVER_TOO_OLD);
+  });
+});
+
+describe("PipelinesDetailView attempts (GitHub)", () => {
+  function attemptTrigger() {
+    return container.querySelector('[aria-label="Attempt"]');
+  }
+
+  it("offers no Attempt select for a run GitHub has not re-run, nor on GitLab", async () => {
+    h.detail = pipelineDetail({ pipeline: { attempt: 1 } });
+    await render({ provider: "github" });
+    expect(attemptTrigger()).toBeNull();
+    h.detail = pipelineDetail({ pipeline: { attempt: 3 } });
+    await render({ provider: "gitlab" });
+    expect(attemptTrigger()).toBeNull();
+  });
+
+  it("shows the latest of a re-run run's attempts on its page", async () => {
+    h.detail = pipelineDetail({ pipeline: { attempt: 3 } });
+    await render({ provider: "github" });
+    expect(attemptTrigger()?.textContent).toContain("Attempt 3 (latest)");
+    // The latest page needs no second stored read.
+    expect(h.readSnapshot).toHaveBeenCalledTimes(1);
+  });
+
+  it("names an earlier attempt, learning the latest from its stored copy with no host read", async () => {
+    h.detail = pipelineDetail({ pipeline: { attempt: 1, status: "failed" } });
+    h.latestSnapshot = stored(pipelineDetail({ pipeline: { attempt: 3, status: "success" } }));
+    await render({ provider: "github", attempt: 1 });
+    expect(attemptTrigger()?.textContent).toContain("Attempt 1");
+    expect(container.textContent).toContain("Failed");
+    const latestRead = h.readSnapshot.mock.calls.find(
+      ([args]) => (args.input as { attempt: number | null }).attempt === null,
+    );
+    expect(latestRead).toBeDefined();
+    expect(h.get.mock.calls.every(([args]) => args.input.attempt === 1)).toBe(true);
   });
 });
 

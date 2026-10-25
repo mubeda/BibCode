@@ -374,6 +374,23 @@ describe("JobLog", () => {
     ).toBe("Open on GitLab");
   });
 
+  it("says when the host keeps a running log, linking its page and reading nothing", async () => {
+    await render({
+      source: {
+        _tag: "unavailable",
+        reason: "live_on_host",
+        url: "https://github.com/acme/repo/actions/runs/1/job/998",
+      },
+    });
+    expect(container.querySelector('[role="status"]')?.textContent).toContain(
+      "shows live logs on its site.",
+    );
+    expect(
+      container.querySelector('a[href="https://github.com/acme/repo/actions/runs/1/job/998"]'),
+    ).not.toBeNull();
+    expect(h.reads).toHaveLength(0);
+  });
+
   it("explains a job without a log", async () => {
     await render({ answers: [{ _tag: "unavailable", reason: "no_output", url: null }] });
     expect(container.textContent).toContain("This job didn't produce a log.");

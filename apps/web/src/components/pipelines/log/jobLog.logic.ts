@@ -17,6 +17,16 @@ export function logScrolledToEnd(event: {
   );
 }
 
+/**
+ * The first line stamped at or after `at` (ms since the epoch), or -1. A GitHub step's
+ * output starts at its start time, so this finds a step in its job's log.
+ */
+export function lineAtTime(timestamps: Float64Array, at: number): number {
+  for (let index = 0; index < timestamps.length; index += 1)
+    if (timestamps[index]! >= at) return index;
+  return -1;
+}
+
 export interface JobLogStatusCopy {
   readonly message: string;
   readonly tone: "info" | "error";

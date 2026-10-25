@@ -7,7 +7,7 @@ import type {
 } from "@bibcode/contracts";
 import { Link } from "@tanstack/react-router";
 import { GitBranchIcon, GitPullRequestIcon, TagIcon } from "lucide-react";
-import { memo } from "react";
+import { memo, type ReactNode } from "react";
 import { formatRelativeTimeLabel } from "../../../timestampFormat";
 import { PullRequestsActor } from "../../pullRequests/shared/PullRequestsActor";
 import { RepositoryModuleExternalLink } from "../../repositoryModule/RepositoryModuleExternalLink";
@@ -71,15 +71,18 @@ export const PipelineDetailHeader = memo(function PipelineDetailHeader({
   provider,
   projectRef,
   mutationsDisabledReason,
+  children,
 }: {
   detail: PipelinesDetail;
   provider: PullRequestsProviderKind;
   projectRef: ScopedProjectRef;
   mutationsDisabledReason: string | null;
+  /** Controls the page adds beside the actions, such as GitHub's Attempt select. */
+  children?: ReactNode;
 }) {
   const { pipeline, commit } = detail;
   const status = pipelineStatusText(pipeline.status, pipeline.warnings, pipeline.reason);
-  const actions = pipelineRowActions(pipeline, mutationsDisabledReason);
+  const actions = pipelineRowActions(pipeline, mutationsDisabledReason, provider);
   const jobs = pipelineJobCount(detail);
   const hostName = HOST_NAMES[provider];
   const name = provider === "gitlab" ? `Pipeline ${pipeline.label}` : pipeline.label;
@@ -111,6 +114,7 @@ export const PipelineDetailHeader = memo(function PipelineDetailHeader({
           </p>
         </div>
         <div className="flex shrink-0 flex-wrap items-center gap-2">
+          {children}
           {actions.retry ? (
             <PermissionButton variant="outline" size="sm" permission={actions.retry}>
               Retry

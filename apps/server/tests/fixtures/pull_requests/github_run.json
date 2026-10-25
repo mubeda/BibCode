@@ -1,0 +1,31 @@
+{
+  "id": 9001,
+  "name": "CI",
+  "run_number": 312,
+  "display_title": "Fix the flaky login test",
+  "status": "completed",
+  "conclusion": "failure",
+  "head_branch": "feature/login",
+  "head_sha": "abc1234def",
+  "event": "push",
+  "run_attempt": 2,
+  "workflow_id": 77,
+  "created_at": "2026-10-24T10:00:00Z",
+  "run_started_at": "2026-10-24T10:01:00Z",
+  "updated_at": "2026-10-24T10:05:12Z",
+  "pull_requests": [],
+  "actor": {
+    "login": "bob",
+    "type": "User"
+  },
+  "triggering_actor": {
+    "login": "ana",
+    "type": "User"
+  },
+  "html_url": "https://github.com/team/repo/actions/runs/9001",
+  "jobs_url": "https://api.github.com/repos/team/repo/actions/runs/9001/jobs",
+  "head_commit": {
+    "id": "abc1234def",
+    "message": "Fix the flaky login test\n\nThe login test raced the session cookie."
+  }
+}

@@ -8,6 +8,7 @@ import {
   pipelineJobActions,
   relatedStages,
   shownJob,
+  stepDurationSeconds,
 } from "./pipelineJob.logic";
 import {
   parsePipelineRouteId,
@@ -81,6 +82,20 @@ describe("job page logic", () => {
     expect(shownJob(pipelineDetail([]), null, 998)).toBeNull();
   });
 
+  it("takes a newer job read's status, keeping the pipeline's permissions", () => {
+    const running = pipelineJob({ status: "running", terminal: false });
+    const detail = pipelineDetail([running], { revision: 10 });
+    const finished = pipelineJob({
+      permissions: { retry: "unknown", cancel: "unknown", play: "unknown" },
+    });
+    const newer = pipelineJobDetail({ revision: 11, job: finished });
+    expect(shownJob(detail, newer, 998)).toEqual({
+      ...finished,
+      permissions: running.permissions,
+    });
+    expect(shownJob(detail, pipelineJobDetail({ revision: 10, job: finished }), 998)).toBe(running);
+  });
+
   it("lists every stage's jobs for the related jobs panel", () => {
     const detail = pipelineDetail([
       pipelineJob({ id: 1, stage: "build", name: "compile" }),
@@ -134,5 +149,18 @@ describe("job page logic", () => {
     expect(formatBytes(12_400_000)).toBe("12.4 MB");
     expect(elapsedSeconds("2026-10-25T10:00:00Z", Date.parse("2026-10-25T10:01:30Z"))).toBe(90);
     expect(elapsedSeconds(null, 0)).toBeNull();
+  });
+
+  it("times a finished step, and not one still running", () => {
+    const step = {
+      number: 2,
+      name: "Run tests",
+      status: "success" as const,
+      startedAt: "2026-10-25T10:01:07Z",
+      completedAt: "2026-10-25T10:02:33Z",
+    };
+    expect(stepDurationSeconds(step)).toBe(86);
+    expect(stepDurationSeconds({ ...step, completedAt: null })).toBeNull();
+    expect(stepDurationSeconds({ ...step, startedAt: "not a time" })).toBeNull();
   });
 });

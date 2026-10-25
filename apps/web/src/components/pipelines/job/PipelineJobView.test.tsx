@@ -15,6 +15,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { DEFAULT_PIPELINES_FILTERS } from "../../../pipelinesStore";
 import { gitlabContext } from "../../pullRequests/detail/testFixtures";
+import { context as githubContext } from "../../pullRequests/testFixtures";
 import {
   RepositoryModule,
   type RepositoryModuleValue,
@@ -148,14 +149,14 @@ const runningRow = { ...pipelineDetail().pipeline, status: "running" as const, t
 let container: HTMLDivElement;
 let root: Root;
 
-function moduleValue(): RepositoryModuleValue {
+function moduleValue(provider: "gitlab" | "github" = "gitlab"): RepositoryModuleValue {
   return {
     state: {
       availability: { kind: "ready" },
       project: null,
       cwd: scope.cwd,
       scope,
-      context: gitlabContext,
+      context: provider === "github" ? githubContext : gitlabContext,
       contextQuery: {} as never,
       storedContext: false,
       worktreeOptions: [],
@@ -227,8 +228,8 @@ async function advance(ms: number) {
 
 /** Reads made by opening the page; the budget counts what follows them. */
 let opened = { get: 0, getJob: 0 };
-async function render() {
-  const value = moduleValue();
+async function render(provider: "gitlab" | "github" = "gitlab") {
+  const value = moduleValue(provider);
   await act(async () =>
     root.render(
       <RepositoryModule.Provider value={value}>
@@ -282,6 +283,106 @@ afterEach(async () => {
   await act(async () => root.unmount());
   container.remove();
   vi.useRealTimers();
+});
+
+describe("PipelineJobView on GitHub", () => {
+  const steps = [
+    {
+      number: 1,
+      name: "Set up job",
+      status: "success" as const,
+      startedAt: "2026-10-25T10:01:00Z",
+      completedAt: "2026-10-25T10:01:02Z",
+    },
+    {
+      number: 2,
+      name: "Run tests",
+      status: "running" as const,
+      startedAt: "2026-10-25T10:01:02Z",
+      completedAt: null,
+    },
+  ];
+  const githubJob = (overrides: Parameters<typeof pipelineJob>[0] = {}) =>
+    pipelineJob({
+      stage: "",
+      url: "https://github.com/owner/repo/actions/runs/4821/job/998",
+      ...overrides,
+    });
+
+  it("shows a running job's steps where the log will be, re-reading the job every 10 s and the run every 30 s", async () => {
+    const job = githubJob({ status: "running", terminal: false, finishedAt: null });
+    h.detail = pipelineDetail([job], { pipeline: runningRow });
+    h.job = pipelineJobDetail({ job, attempt: 2, steps });
+    await render("github");
+    expect(container.textContent).toContain("GitHub shows live logs on its site.");
+    const log = container.querySelector('[aria-label="Job details"]')!.nextElementSibling!;
+    expect(log.textContent).toContain("Run tests");
+    expect(h.logReads).toEqual([]);
+    expect(h.reads.subscribe).toBe(0);
+    await advance(HOUR);
+    expect(h.logReads).toEqual([]);
+    expect(since("getJob")).toBe(360);
+    // A one-page run: the run and its jobs page every 30 s, 240 reads an hour.
+    expect(since("get")).toBe(120);
+  }, 90_000);
+
+  it("says a queued job has not started, reading no log", async () => {
+    const job = githubJob({ status: "queued", terminal: false, startedAt: null, finishedAt: null });
+    h.detail = pipelineDetail([job], { pipeline: runningRow });
+    h.job = pipelineJobDetail({ job, attempt: 1, steps: [] });
+    await render("github");
+    expect(container.textContent).toContain("This job hasn't started yet.");
+    expect(container.textContent).not.toContain("shows live logs");
+    expect(h.logReads).toEqual([]);
+  });
+
+  it("reads a finished job's log once, under the job's attempt, and lets its steps find themselves in it", async () => {
+    const job = githubJob();
+    // The run still runs other jobs; this finished one needs no more reads.
+    h.detail = pipelineDetail([job], {
+      pipeline: runningRow,
+      artifacts: [
+        {
+          name: "coverage",
+          sizeBytes: 20_480,
+          expiresAt: "2027-01-22T10:00:00Z",
+          expired: false,
+          url: "https://github.com/owner/repo/actions/runs/4821",
+        },
+      ],
+    });
+    h.job = pipelineJobDetail({
+      job,
+      attempt: 2,
+      artifacts: [],
+      steps: steps.map((step) => ({
+        ...step,
+        status: "success" as const,
+        completedAt: "2026-10-25T10:02:00Z",
+      })),
+    });
+    h.logAnswers = [
+      logChunk(
+        "2026-10-25T10:01:00.0000000Z ##[group]Set up job\n2026-10-25T10:01:03.0000000Z npm test\n",
+        0,
+        true,
+      ),
+    ];
+    await render("github");
+    expect(h.logReads).toEqual([
+      { cwd: "/repo", jobId: 998, attempt: 2, from: { _tag: "tail" }, refresh: "user" },
+    ]);
+    await until(() =>
+      expect(
+        container.querySelector('button[aria-label="Run tests: passed. Show in the log"]'),
+      ).not.toBeNull(),
+    );
+    const details = container.querySelector('[aria-label="Job details"]')!;
+    expect(details.textContent).toContain("coverage");
+    await advance(HOUR);
+    expect(h.logReads).toHaveLength(1);
+    expect(since("get") + since("getJob")).toBe(0);
+  });
 });
 
 describe("PipelineJobView", () => {

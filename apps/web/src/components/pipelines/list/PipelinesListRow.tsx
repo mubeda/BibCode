@@ -114,7 +114,7 @@ export const PipelinesListRow = memo(function PipelinesListRow({
   const createdTitle = age === null ? undefined : new Date(row.createdAt).toLocaleString();
   const duration =
     row.durationSeconds === null ? null : formatPipelineDuration(row.durationSeconds);
-  const actions = pipelineRowActions(row, mutationsDisabledReason);
+  const actions = pipelineRowActions(row, mutationsDisabledReason, provider);
   const hostName = HOST_NAMES[provider];
   return (
     <div

@@ -348,6 +348,26 @@ describe("PipelinesListView", () => {
     expect(onFiltersChange).toHaveBeenCalledWith(DEFAULT_PIPELINES_FILTERS);
   });
 
+  it("offers GitHub's Workflow filter from its first page, and GitLab none", async () => {
+    h.first = { ...pipelinesPage([pipelineRow]), workflows: [{ id: 77, name: "CI" }] };
+    await render({ provider: "github", filters: { ...DEFAULT_PIPELINES_FILTERS, workflowId: 77 } });
+    const trigger = container.querySelector('[aria-label="Workflow"]');
+    expect(trigger?.textContent).toContain("CI");
+    await render({ provider: "gitlab" });
+    expect(container.querySelector('[aria-label="Workflow"]')).toBeNull();
+  });
+
+  it("says a GitHub repository has no workflows, and clears a workflow filter", async () => {
+    h.first = { ...pipelinesPage([]), workflows: [] };
+    await render({ provider: "github" });
+    expect(container.textContent).toContain("This repository has no workflows.");
+    h.first = { ...pipelinesPage([]), workflows: [{ id: 77, name: "CI" }] };
+    await render({ provider: "github", filters: { ...DEFAULT_PIPELINES_FILTERS, workflowId: 77 } });
+    expect(container.textContent).toContain("No runs of CI");
+    await act(async () => button("Clear filter").click());
+    expect(onFiltersChange).toHaveBeenCalledWith(DEFAULT_PIPELINES_FILTERS);
+  });
+
   it("says when GitHub stopped a filtered list at 1,000 runs", async () => {
     h.first = { ...pipelinesPage([pipelineRow]), total: { count: 1_000, capped: true } };
     await render({ provider: "github" });

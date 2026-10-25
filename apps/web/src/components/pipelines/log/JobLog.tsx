@@ -582,7 +582,9 @@ function Status() {
   } = useJobLog();
   const waitSeconds = useRateLimitCountdown(reader.error, retry);
   const copy = jobLogStatusCopy({ source, reader, hostName });
-  if (layout === null && (reader.phase === "opening" || reader.phase === "catching_up"))
+  // A log the page will not read (erased, or kept by the host) never loads.
+  const reads = source._tag !== "unavailable";
+  if (reads && layout === null && (reader.phase === "opening" || reader.phase === "catching_up"))
     return (
       <div role="status" className="space-y-1.5 p-4">
         <span className="sr-only">Loading the log…</span>
@@ -592,7 +594,9 @@ function Status() {
       </div>
     );
   if (copy === null) return null;
-  const link = copy.link ? (reader.unavailable?.url ?? rawLogUrl) : null;
+  const link = copy.link
+    ? ((reads ? null : source.url) ?? reader.unavailable?.url ?? rawLogUrl)
+    : null;
   return (
     <div
       role={copy.tone === "error" ? "alert" : "status"}

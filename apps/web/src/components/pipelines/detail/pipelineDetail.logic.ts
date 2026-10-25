@@ -133,6 +133,35 @@ export function pipelineFingerprint(detail: Pick<PipelinesDetail, "pipeline" | "
   return parts.join(",");
 }
 
+export interface PipelineAttemptOptions {
+  /** `latest`, or the shown earlier attempt's number. */
+  readonly value: string;
+  readonly items: readonly { readonly value: string; readonly label: string }[];
+}
+
+/**
+ * A GitHub run's Attempt choices, or `null` for a run with one attempt. `shown` is the
+ * route's earlier attempt (`null` on the latest); `latest` is the latest attempt's
+ * number when known. An earlier attempt's own read cannot say how many followed, so
+ * without it the choices are "Latest attempt" and the attempts up to the shown one.
+ */
+export function pipelineAttemptOptions(
+  shown: number | null,
+  latest: number | null,
+): PipelineAttemptOptions | null {
+  const newest = latest !== null && latest > (shown ?? 0) ? latest : null;
+  if (shown === null && (newest === null || newest <= 1)) return null;
+  const items: { value: string; label: string }[] = [
+    {
+      value: "latest",
+      label: newest === null ? "Latest attempt" : `Attempt ${newest} (latest)`,
+    },
+  ];
+  for (let attempt = newest === null ? shown! : newest - 1; attempt >= 1; attempt -= 1)
+    items.push({ value: String(attempt), label: `Attempt ${attempt}` });
+  return { value: shown === null ? "latest" : String(shown), items };
+}
+
 /** The host's page for a pipeline, for when no read has returned its own link. */
 export function pipelineHostUrl(
   context: { readonly provider: PullRequestsProviderKind; readonly webUrl: string },

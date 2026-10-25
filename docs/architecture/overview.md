@@ -2731,7 +2731,12 @@ See [RPC and orchestration](./rpc-and-orchestration.md) and
   most three catch-up reads, a 5 s visible-only follow, one final read on the
   terminal transition, Load earlier up to 16 MiB). Its colors come from the
   terminal's 16-color palette in `components/terminalTheme.ts`, shared with
-  the live terminal. See
+  the live terminal. GitHub's reads live in `pull_requests/github/runs.rs`,
+  behind the same `PipelineHost` trait: one row per workflow run, one "Jobs"
+  stage, artifacts linking to the run's page, and `live_logs() == false`, so a
+  running job's log answers `live_on_host` and the job page shows its steps
+  instead; GitHub views refresh on the visible timer at the cadences in the
+  contract, with no server poller. See
   [Pipelines contract boundary](./rpc-and-orchestration.md#pipelines-contract-boundary).
 - The right panel (`rightPanelStore`) can show one request per tab, with no new
   server contract. `pullRequest` surfaces (`pullRequest:<number>`, with the

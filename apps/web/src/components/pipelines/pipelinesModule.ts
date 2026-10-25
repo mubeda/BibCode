@@ -26,15 +26,8 @@ export const pipelinesModule: RepositoryModuleDescriptor = {
   disabledMessage: PIPELINES_DISABLED_IN_SETTINGS_MESSAGE,
   unsupportedMessage: "Update this environment's server to use Pipelines.",
   mutationsUnsupportedMessage: PIPELINES_MUTATIONS_UNSUPPORTED_MESSAGE,
-  // GitHub workflow runs arrive in a later release; the host's own page has them.
-  providerGap: (context) =>
-    context.provider === "github"
-      ? {
-          message: "Pipelines for GitHub are coming.",
-          url: `${context.webUrl.replace(/\/+$/, "")}/actions`,
-          linkLabel: "Open on GitHub",
-        }
-      : null,
+  // GitLab pipelines and GitHub workflow runs are both read.
+  providerGap: () => null,
 };
 
 /** The first page for the filters the route shows; it needs no context field. */

@@ -15,6 +15,7 @@ import { pipelinesEnvironment } from "../../../state/pipelines";
 import { useAtomCommand } from "../../../state/use-atom-command";
 import { useDocumentVisible } from "../../pullRequests/useDocumentVisible";
 import { lineAtOffset, type JobLogLayout, type LogSpans, type LogStyle } from "./jobLog.parse";
+import { lineAtTime } from "./jobLog.logic";
 import { createJobLogEngine, type JobLogEngine } from "./jobLogEngine";
 import {
   INITIAL_JOB_LOG_READER_STATE,
@@ -99,6 +100,8 @@ export interface JobLogValue {
     readonly requestSpans: (index: number) => void;
     readonly focusSearch: () => void;
     readonly focusLog: () => void;
+    /** Scrolls to the first line stamped at or after `at` (ms), opening its section. */
+    readonly revealTime: (at: number) => void;
   };
   readonly meta: {
     readonly source: JobLogSource;
@@ -303,6 +306,31 @@ export function useJobLogController({
     scrollToRaw(target);
   }, [layout, scrollToRaw]);
 
+  const revealLine = useCallback(
+    (raw: number) => {
+      const engine = engineRef.current;
+      if (layoutRef.current?.rows.includes(raw) ?? false) scrollToRaw(raw);
+      else if (engine !== null) {
+        // A line inside a folded section opens it first.
+        scrollTargetRef.current = raw;
+        void engine.reveal(raw).then((nextLayout) => {
+          layoutRef.current = nextLayout;
+          setLayout(nextLayout);
+        });
+      }
+    },
+    [scrollToRaw],
+  );
+  const revealTime = useCallback(
+    (at: number) => {
+      const current = layoutRef.current;
+      if (current === null) return;
+      const raw = lineAtTime(current.timestamps, at);
+      if (raw !== -1) revealLine(raw);
+    },
+    [revealLine],
+  );
+
   const goToMatch = useCallback(
     (active: number) => {
       const { matches } = search;
@@ -311,18 +339,9 @@ export function useJobLogController({
       const wrapped = (active + matches.length) % matches.length;
       const raw = matches[wrapped]!;
       setSearch({ ...search, active: wrapped });
-      const engine = engineRef.current;
-      if (layoutRef.current?.rows.includes(raw) ?? false) scrollToRaw(raw);
-      else if (engine !== null) {
-        // A match inside a folded section opens it first.
-        scrollTargetRef.current = raw;
-        void engine.reveal(raw).then((nextLayout) => {
-          layoutRef.current = nextLayout;
-          setLayout(nextLayout);
-        });
-      }
+      revealLine(raw);
     },
-    [scrollToRaw, search],
+    [revealLine, search],
   );
   const activeMatch = search.active;
   const next = useCallback(() => goToMatch(activeMatch + 1), [activeMatch, goToMatch]);
@@ -475,6 +494,7 @@ export function useJobLogController({
         requestSpans,
         focusSearch,
         focusLog,
+        revealTime,
       },
       meta: {
         source,
@@ -508,6 +528,7 @@ export function useJobLogController({
       readerState,
       requestSpans,
       retry,
+      revealTime,
       scrollToBottom,
       scrollToTop,
       search,

@@ -2,6 +2,7 @@ mod actions;
 mod files;
 mod graphql;
 mod parse;
+mod runs;
 mod timeline;
 
 use std::sync::Arc;

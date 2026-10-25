@@ -240,6 +240,7 @@ impl PipelineHost for FakeHost {
                     count: 42,
                     capped: false,
                 }),
+                workflows: None,
             })
         })
     }
@@ -1184,6 +1185,144 @@ esac"#,
             .await
             .expect_err("GitHub routes do not poll");
         assert_eq!(refused.code, "unavailable");
+    }
+
+    /// GitHub's reads through `gh api`: the list keeps its Workflow choices on
+    /// a timer page that skips them, its rows paint from storage, a finished
+    /// job's log downloads whole, and a running job's log is GitHub's to show.
+    #[tokio::test]
+    async fn github_reads_store_their_rows_keep_workflows_and_leave_a_running_log_to_github() {
+        let s = TestSandbox::new("pipelines-github-runs");
+        std::fs::write(
+            s.path("runs.json"),
+            include_str!("../../../tests/fixtures/pull_requests/github_runs.json"),
+        )
+        .unwrap();
+        let job: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/pull_requests/github_job.json"
+        ))
+        .unwrap();
+        std::fs::write(s.path("job.json"), job.to_string()).unwrap();
+        let mut running = job;
+        running["id"] = serde_json::json!(600);
+        running["status"] = serde_json::json!("in_progress");
+        running["conclusion"] = serde_json::Value::Null;
+        std::fs::write(s.path("running-job.json"), running.to_string()).unwrap();
+        let gh = s.executable_script(
+            "gh",
+            r#"case "$1 $2" in
+  '--version ') echo 'gh version 2.97.0' ;;
+  'auth status') echo '{"hosts":{"github.com":[{"state":"success","active":true,"host":"github.com","login":"viewer"}]}}' ;;
+  'api -i') printf '%s\n' "$7" >> calls
+    case "$7" in
+      */actions/workflows\?*) printf 'HTTP/2 200 OK\r\n\r\n{"total_count":1,"workflows":[{"id":77,"name":"CI"}]}' ;;
+      */actions/runs\?*) printf 'HTTP/2 200 OK\r\n\r\n'; cat runs.json ;;
+      */actions/jobs/502) printf 'HTTP/2 200 OK\r\n\r\n'; cat job.json ;;
+      */actions/jobs/600) printf 'HTTP/2 200 OK\r\n\r\n'; cat running-job.json ;;
+      *) exit 64 ;;
+    esac ;;
+  'api -H') printf '%s\n' "$6" >> calls; printf 'log line\n' ;;
+  *) exit 64 ;;
+esac"#,
+            "",
+        );
+        let git = s.executable_script("git", "printf '%s' 'git@github.com:team/repo.git'", "");
+        let database = new_database().await;
+        let context_host = Arc::new(GitHubContextHost);
+        let runner =
+            HostCommandRunner::new(s.path("state")).with_commands(&gh, "missing-glab", &git);
+        let github = Arc::new(crate::pull_requests::github::GitHubHost::new(Arc::new(
+            runner.clone(),
+        )));
+        let prs = PullRequestsService {
+            github: context_host.clone(),
+            gitlab: context_host,
+            database: Some(database.clone()),
+            ..PullRequestsService::with_runner(runner)
+        };
+        let service = PipelinesService::with_hosts(prs.clone(), FakeHost::gitlab(), github);
+        prs.context(s.root(), ContextRead::Open, &c())
+            .await
+            .unwrap();
+        let cwd = s.root().to_string_lossy().into_owned();
+        let calls = || {
+            std::fs::read_to_string(s.path("calls"))
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        let mut list = ListInput {
+            cwd: cwd.clone(),
+            scope: ListScope::All,
+            git_ref: None,
+            workflow_id: None,
+            cursor: None,
+            refresh: Refresh::User,
+        };
+        let opened = service.list(list.clone(), &c()).await.unwrap();
+        let workflows = Some(vec![model::Workflow {
+            id: 77,
+            name: "CI".into(),
+        }]);
+        assert_eq!(opened.workflows, workflows);
+        assert_eq!(opened.rows[0].label, "CI #312");
+        list.refresh = Refresh::Timer;
+        let timer = service.list(list.clone(), &c()).await.unwrap();
+        assert_eq!(timer.workflows, workflows, "a timer page keeps the filter");
+        assert_eq!(
+            calls()
+                .iter()
+                .filter(|call| call.contains("/actions/workflows?"))
+                .count(),
+            1,
+            "workflows are read with the count only"
+        );
+        let snapshot = service
+            .read_snapshot(
+                SubscribeInput {
+                    list,
+                    pipeline_id: None,
+                    attempt: None,
+                    job_id: None,
+                },
+                &c(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(snapshot.list.map(|row| row.payload), Some(timer));
+
+        let log = |job_id| JobLogInput {
+            cwd: cwd.clone(),
+            job_id,
+            attempt: Some(2),
+            from: LogFrom::Tail,
+            refresh: Refresh::User,
+        };
+        match service.job_log(log(502), &c()).await.unwrap() {
+            JobLog::Chunk(chunk) => {
+                assert_eq!(chunk.text, "log line\n");
+                assert!(chunk.complete);
+                assert_eq!(chunk.first_line, Some(0));
+            }
+            other => panic!("expected the finished log, got {other:?}"),
+        }
+        assert_eq!(
+            service.job_log(log(600), &c()).await.unwrap(),
+            JobLog::Unavailable(LogUnavailableAnswer {
+                reason: LogUnavailable::LiveOnHost,
+                url: Some("https://github.com/team/repo/actions/runs/9001/job/600".into()),
+            })
+        );
+        let logs: Vec<_> = calls()
+            .into_iter()
+            .filter(|call| call.ends_with("/logs"))
+            .collect();
+        assert_eq!(
+            logs,
+            ["repos/team/repo/actions/jobs/502/logs"],
+            "a running job's log is never downloaded"
+        );
     }
 
     /// A GitHub host whose context read answers with no CLI call.
