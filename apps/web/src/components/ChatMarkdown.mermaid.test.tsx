@@ -10,6 +10,12 @@ import { writeThemePreference } from "../hooks/useTheme";
 import { buildCollapsedProposedPlanPreviewMarkdown } from "../proposedPlan";
 import ChatMarkdown from "./ChatMarkdown";
 import { ReadingAnchorContext } from "./chat/readingAnchor";
+import { findScopeOccurrences } from "./chat/threadFind/threadFindHighlights";
+import {
+  locateFindOccurrences,
+  prepareFindQuery,
+  projectFindSource,
+} from "./chat/threadFind/threadFindText";
 import {
   __resetMermaidDiagramsForTests,
   __setMermaidRendererLoaderForTests,
@@ -26,7 +32,10 @@ const COLLIDING = ['flowchart TD\n A["76ab3ce7"]\n', 'flowchart TD\n A["2bb1fad8
 interface MountedMarkdown {
   readonly container: HTMLDivElement;
   readonly root: Root;
-  render(text: string, options?: { isStreaming?: boolean; className?: string }): Promise<void>;
+  render(
+    text: string,
+    options?: { isStreaming?: boolean; className?: string; findScope?: string },
+  ): Promise<void>;
 }
 
 const mounted: MountedMarkdown[] = [];
@@ -60,7 +69,10 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
-async function mount(text?: string, options?: { isStreaming?: boolean }): Promise<MountedMarkdown> {
+async function mount(
+  text?: string,
+  options?: { isStreaming?: boolean; findScope?: string },
+): Promise<MountedMarkdown> {
   const container = document.createElement("div");
   document.body.append(container);
   const root = createRoot(container);
@@ -75,6 +87,7 @@ async function mount(text?: string, options?: { isStreaming?: boolean }): Promis
             cwd={undefined}
             isStreaming={renderOptions.isStreaming ?? false}
             {...(renderOptions.className ? { className: renderOptions.className } : {})}
+            {...(renderOptions.findScope ? { findScope: renderOptions.findScope } : {})}
           />,
         ),
       );
@@ -168,6 +181,33 @@ afterEach(async () => {
 });
 
 describe("Mermaid diagrams in chat Markdown", () => {
+  describe("find in thread", () => {
+    it("searches the text around a diagram, and neither the diagram nor its source", async () => {
+      const text = `Write the plan.\n\n${fence(FLOWCHART)}\n\nThen Draw it.`;
+      const view = await mount(text, { findScope: "md:0" });
+      const counts = (query: string) => {
+        const folded = prepareFindQuery(query)!;
+        const segments = projectFindSource(
+          { kind: "markdown", scope: "md:0", text, lineBreaks: false, skills: [] },
+          { cwd: undefined },
+        );
+        const scope = view.container.querySelector("[data-find-scope]")!;
+        return {
+          projected: locateFindOccurrences(segments, folded).length,
+          rendered: findScopeOccurrences(scope, folded).length,
+        };
+      };
+      // Before the diagram draws, its source shows but is not searched.
+      expect(counts("write")).toEqual({ projected: 1, rendered: 1 });
+      expect(counts("draw")).toEqual({ projected: 1, rendered: 1 });
+
+      await waitFor(() => hasDiagram(view.container), "the fence never drew");
+      expect(counts("write")).toEqual({ projected: 1, rendered: 1 });
+      expect(counts("draw")).toEqual({ projected: 1, rendered: 1 });
+      expect(counts("graph")).toEqual({ projected: 0, rendered: 0 });
+    });
+  });
+
   describe("drawing", () => {
     it("draws nothing, and loads no renderer, until the fence closes", async () => {
       const stream = await mount(`Intro\n\n\`\`\`mermaid\n${FLOWCHART}\n`, { isStreaming: true });
