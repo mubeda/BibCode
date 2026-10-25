@@ -227,10 +227,15 @@ export function PipelinesDetailView({
     readonly request: typeof request;
     readonly code: PipelinesRefusal;
   } | null>(null);
+  // Each event is a new object: a refusal is taken from the event that carries it.
+  const [seenChange, setSeenChange] = useState<typeof subscribeQuery.data>(null);
+  if (subscribeQuery.data !== seenChange) {
+    setSeenChange(subscribeQuery.data);
+    if (subscribeQuery.data?.refused) setRefusal({ request, code: subscribeQuery.data.refused });
+  }
   const refused = refusal !== null && refusal.request === request ? refusal.code : null;
   const applySubscribedChange = useEffectEvent(
     (changed: NonNullable<typeof subscribeQuery.data>) => {
-      if (changed.refused) setRefusal({ request, code: changed.refused });
       // The poller already stored the new detail: paint it, never read the host again.
       if (changed.pipeline) snapshotQuery.revalidate();
     },
