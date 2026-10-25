@@ -1164,6 +1164,32 @@ esac"#,
             .await
             .unwrap();
         assert_eq!(b.fake.calls("trace 998 whole"), 1);
+        // Following past the kept end says live updates paused instead of
+        // answering empty windows.
+        let follow = b
+            .service
+            .job_log(
+                b.log_input(
+                    LogFrom::Offset {
+                        offset: first.next_offset,
+                    },
+                    Refresh::Follow,
+                ),
+                &c(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                follow,
+                JobLog::Unavailable(LogUnavailableAnswer {
+                    reason: LogUnavailable::TooLargeLive,
+                    ..
+                })
+            ),
+            "{follow:?}"
+        );
+        assert_eq!(b.fake.calls("trace 998 whole"), 1);
         // The job finishes with its last lines; the job page reads it once.
         let mut finished = running;
         finished.extend_from_slice(b"Job succeeded\n");

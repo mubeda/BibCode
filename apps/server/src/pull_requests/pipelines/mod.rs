@@ -567,6 +567,21 @@ fn log_unavailable(reason: LogUnavailable, facts: &JobFacts) -> JobLog {
 
 /// A ranged read's answer. `full` says the read filled its window, so more
 /// text may follow.
+/// A window of a downloaded log. Following a running copy kept past 2 MiB
+/// answers `too_large_live`: live updates pause until the job finishes.
+fn downloaded_answer(log: &FullLog, from: LogFrom, facts: &JobFacts) -> JobLog {
+    if !log.complete
+        && log.bytes.len() >= log::LIVE_REDOWNLOAD_MAX
+        && matches!(from, LogFrom::Offset { offset } if offset >= log.end())
+    {
+        return JobLog::Unavailable(LogUnavailableAnswer {
+            reason: LogUnavailable::TooLargeLive,
+            url: facts.raw_log_url.clone(),
+        });
+    }
+    JobLog::Chunk(log.window(from))
+}
+
 fn ranged_chunk(
     start: u64,
     bytes: &[u8],
@@ -1096,7 +1111,7 @@ impl PipelinesService {
             logs.forget_unfinished(key);
         }
         if let Some(log) = logs.cached(key) {
-            return Ok(JobLog::Chunk(log.window(input.from)));
+            return Ok(downloaded_answer(&log, input.from, &facts));
         }
         // GitHub serves a job's log once it completes; until then its own
         // page shows the live log.
@@ -1143,7 +1158,7 @@ impl PipelinesService {
         {
             self.probe_ranges(admitted, key, c).await;
         }
-        Ok(JobLog::Chunk(log.window(input.from)))
+        Ok(downloaded_answer(&log, input.from, &facts))
     }
 
     /// One `byte_offset=1&byte_limit=1` read proves whether the host honors
