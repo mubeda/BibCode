@@ -2713,7 +2713,11 @@ tag, one merge request pipeline) and a GitHub repository.
    account (jobs hidden) the header stays and the page says the jobs are
    hidden. A pipeline id the account cannot read says "You can't view this
    pipeline." and one that does not exist "This pipeline no longer exists.",
-   neither signing out; `/pipelines/abc` returns to the list.
+   neither signing out; `/pipelines/abc` returns to the list. With a running
+   pipeline's page and one of its job pages open, remove the account from the
+   project (or delete the pipeline): within about 10 s both pages replace the
+   pipeline and job with that copy, with no further `glab` read for them, and
+   Refresh reads the host again.
 
 ### Pipelines job page validation
 
@@ -2752,7 +2756,9 @@ running job, a manual job, an erased job and a job with artifacts.
    `getJobLog` reads; two windows on one job read GitLab's trace at most once
    per 4 s. When the job finishes, one final read loads the rest and reads
    stop. A running log over 2 MB keeps its head with the "This running log is
-   over 2 MB" copy and **Open on GitLab** until the job finishes.
+   over 2 MB" copy and **Open on GitLab** until the job finishes. On a host
+   without range support, a running log over 2 MB shows its downloaded copy
+   until the job finishes; then one more whole download shows its final lines.
 7. The details show duration or elapsed, finished, queued, runner, source,
    tags, artifacts with **Download** and **Browse**, commit, pipeline, and the
    stage's other jobs as links to their pages; on a narrow panel they sit

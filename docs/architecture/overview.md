@@ -2683,13 +2683,15 @@ See [RPC and orchestration](./rpc-and-orchestration.md) and
   (`pipelines/poll.rs`) inside the `pipelines.subscribe` calls: the first page
   every 20 s, each subscribed pipeline that is not terminal every 10 s (at most
   three, 20 s after 30 quiet minutes), never `count`, jobs or logs; a pipeline
-  it cannot read is named once and left. Job logs never reach the database:
+  it cannot read is named once with `refused`, which its views show in place
+  of their copy, and left. Job logs never reach the database:
   GitLab logs are read in 512,000-byte ranges once a one-byte probe proves the
   host honors `byte_offset`, and otherwise downloaded whole (90 s, the last
   16 MiB kept by `OutputPolicy::Tail`) into `LogCache`, server memory keyed by
-  host, account login, project and job (64 MiB, 10 idle minutes, cleared on
-  rescan and sign-out, served only within 30 s of a job read by the same
-  account). `readSnapshot` serves both providers. `pipelines.runAction`
+  host, account login, project and job (64 MiB, 10 idle minutes swept on every
+  pipelines read, cleared on rescan and sign-out, served only within 30 s of a
+  job read by the same account, and read again once a job whose large running
+  copy it holds is terminal). `readSnapshot` serves both providers. `pipelines.runAction`
   retries, cancels or plays one pipeline or job: admitted like a read (a
   backed-off host gets no POST), single flight per target and action, a GitHub
   `forbidden` remembered in `PipelinesState` per account and action kind until

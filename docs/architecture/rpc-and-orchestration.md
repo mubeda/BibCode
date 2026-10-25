@@ -1433,8 +1433,11 @@ or a lagged receiver catches up on the next event and a joining subscriber is
 not sent the rows it painted. It never reads `count`, jobs or logs; a pipeline
 whose stored row is already terminal is not read, and one seen terminal is
 read once more and then left. A `forbidden` or `not_found` on one pipeline
-deletes its rows, names it once and stops reading it; a refused list or a lost
-sign-in ends the key's subscriptions.
+deletes its rows, names it once with `refused` (`forbidden` or `not_found`;
+absent on every other event and from older servers), so its pipeline and job
+views replace the copy on screen with the refusal without a host read, and
+stops reading it; a subscriber that joins later is told too. A refused list
+or a lost sign-in ends the key's subscriptions.
 
 Logs are byte windows whose offsets always fall on character starts. On a
 GitLab host a one-byte `byte_offset=1&byte_limit=1` probe, sent after the
@@ -1446,7 +1449,13 @@ that still fills its window at or past 2,048,000 bytes answers
 `unavailable: too_large_live`. Followers of one running log share its last
 tail for 4 s. A whole download keeps the last 16 MiB (`truncatedHead`) in
 server memory (`LogCache`) and serves 1 MiB windows from the end, with
-absolute `firstLine` when nothing was dropped. A trace 404 is told apart by a
+absolute `firstLine` when nothing was dropped. A running log of 2 MiB or more
+is not downloaded again until its job is terminal, when the unfinished copy is
+dropped and the finished log read. Every pipelines read sweeps the cache:
+logs idle for 10 minutes and tails past their 4 s are released whichever job
+the read is for. The module runs no background task, so a server that serves
+no pipelines read keeps its last logs until the next one, a rescan or a
+sign-out. A trace 404 is told apart by a
 job read: `not_started` for a job that is not terminal, `erased`, `no_output`,
 or `not_found` only when the job itself is missing.
 
