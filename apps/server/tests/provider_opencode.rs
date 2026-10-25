@@ -2691,6 +2691,7 @@ async fn opencode_runtime_surfaces_session_errors_and_removes_the_unanswered_pro
             "stopReason": "error",
             "errorMessage": "Model not found: openai/gpt-5",
             "errorClass": "provider_error",
+            "providerReason": "UnknownError",
         })
     );
     // The removal runs off the event stream, so it may land just after the completion.
