@@ -932,7 +932,9 @@ Choose **Pull Requests** on a project header, immediately after Git
 Manager, to browse the hosted repository for one checkout. Grouped projects
 use the same environment/member picker as other project actions. In the
 Repositories view, use the repository row's button instead: with one environment it
-opens directly, with several it asks which environment to read from. The project
+opens directly, with several it asks which environment to read from. An
+environment that is not connected is listed as "Not connected" and cannot be
+picked; when only one is connected, it opens directly. The project
 header stays highlighted on the list and detail routes, including after reload.
 
 ### Availability and setup

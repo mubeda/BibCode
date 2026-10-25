@@ -575,20 +575,35 @@ function formatProjectMemberActionLabel(
 async function chooseProjectMember(
   members: readonly SidebarProjectGroupMember[],
   position: { readonly x: number; readonly y: number },
+  isAvailable: (member: SidebarProjectGroupMember) => boolean = () => true,
 ): Promise<SidebarProjectGroupMember | null> {
   if (members.length <= 1) {
     return members[0] ?? null;
+  }
+  const available = members.filter(isAvailable);
+  // A single connected environment is the only one that can answer.
+  if (available.length === 1) {
+    return available[0] ?? null;
   }
   const api = readLocalApi();
   if (!api) {
     return null;
   }
+  const unavailable = members.filter((member) => !available.includes(member));
   const clickedResult = await settlePromise(() =>
     api.contextMenu.show(
-      members.map((member) => ({
-        id: member.physicalProjectKey,
-        label: formatProjectMemberActionLabel(member, members.length),
-      })),
+      [
+        ...available.map((member) => ({
+          id: member.physicalProjectKey,
+          label: formatProjectMemberActionLabel(member, members.length),
+        })),
+        ...unavailable.map((member) => ({
+          id: member.physicalProjectKey,
+          label: formatProjectMemberActionLabel(member, members.length),
+          disabled: true,
+          description: "Not connected",
+        })),
+      ],
       position,
     ),
   );
@@ -3760,7 +3775,11 @@ type RepositoryModuleRoute =
  * Opens a repository module for a repository row: one environment opens directly, several ask
  * which. Closes the mobile sidebar first, as the project header's actions do.
  */
-function useOpenRepositoryModule(group: RepositoryGroup, to: RepositoryModuleRoute) {
+function useOpenRepositoryModule(
+  group: RepositoryGroup,
+  environments: ReadonlyMap<EnvironmentId, EnvironmentCardIdentity>,
+  to: RepositoryModuleRoute,
+) {
   const navigate = useNavigate();
   const { isMobile, setOpenMobile } = useSidebar();
   return useCallback(
@@ -3768,7 +3787,13 @@ function useOpenRepositoryModule(group: RepositoryGroup, to: RepositoryModuleRou
       event.preventDefault();
       event.stopPropagation();
       const members = group.cards.flatMap((card) => card.memberProjects);
-      void chooseProjectMember(members, { x: event.clientX, y: event.clientY }).then((member) => {
+      const isAvailable = (member: SidebarProjectGroupMember) =>
+        environments.get(member.environmentId)?.available ?? true;
+      void chooseProjectMember(
+        members,
+        { x: event.clientX, y: event.clientY },
+        isAvailable,
+      ).then((member) => {
         if (!member) return;
         if (isMobile) setOpenMobile(false);
         void navigate({
@@ -3777,19 +3802,22 @@ function useOpenRepositoryModule(group: RepositoryGroup, to: RepositoryModuleRou
         });
       });
     },
-    [group.cards, isMobile, navigate, setOpenMobile, to],
+    [environments, group.cards, isMobile, navigate, setOpenMobile, to],
   );
 }
 
 /** Pull Requests for a repository row. */
 const SidebarRepositoryPullRequestsButton = memo(function SidebarRepositoryPullRequestsButton({
   group,
+  environments,
 }: {
   readonly group: RepositoryGroup;
+  readonly environments: ReadonlyMap<EnvironmentId, EnvironmentCardIdentity>;
 }) {
   const pullRequestsEnabled = usePrimarySettings((settings) => settings.pullRequestsEnabled);
   const handleClick = useOpenRepositoryModule(
     group,
+    environments,
     "/project/$environmentId/$projectId/pull-requests",
   );
   if (!pullRequestsEnabled) return null;
@@ -3816,12 +3844,15 @@ const SidebarRepositoryPullRequestsButton = memo(function SidebarRepositoryPullR
 /** Pipelines for a repository row. */
 const SidebarRepositoryPipelinesButton = memo(function SidebarRepositoryPipelinesButton({
   group,
+  environments,
 }: {
   readonly group: RepositoryGroup;
+  readonly environments: ReadonlyMap<EnvironmentId, EnvironmentCardIdentity>;
 }) {
   const pipelinesEnabled = usePrimarySettings((settings) => settings.pipelinesEnabled);
   const handleClick = useOpenRepositoryModule(
     group,
+    environments,
     "/project/$environmentId/$projectId/pipelines",
   );
   if (!pipelinesEnabled) return null;
@@ -4505,8 +4536,14 @@ const SidebarProjectsContent = memo(function SidebarProjectsContent(
                 expanded={repositoryGroupExpandedById[group.key] !== false}
                 actions={
                   <>
-                    <SidebarRepositoryPullRequestsButton group={group} />
-                    <SidebarRepositoryPipelinesButton group={group} />
+                    <SidebarRepositoryPullRequestsButton
+                      group={group}
+                      environments={environmentCardIdentities}
+                    />
+                    <SidebarRepositoryPipelinesButton
+                      group={group}
+                      environments={environmentCardIdentities}
+                    />
                   </>
                 }
               >
