@@ -50,10 +50,18 @@ interface StreamSample {
   readonly fenceShown: boolean;
   /** Its last line is shown. */
   readonly finished: boolean;
+  /** How many of its paragraphs after the code block are shown. */
+  readonly afterParagraphs: number;
   /** Its last line is shown inside the list's visible area. */
   readonly lastLineInView: boolean;
   /** How far the list is scrolled from its end. */
   readonly endGap: number | null;
+  /**
+   * How far the timeline's lowest paragraph or code block, the reply's end, lies below the
+   * list's usable bottom (its visible bottom or the composer's top, whichever is higher); zero
+   * or less when the end is revealed.
+   */
+  readonly endBelow: number | null;
   readonly diagramDrawn: boolean;
 }
 
@@ -714,10 +722,7 @@ describe("packaged Mermaid diagrams", () => {
         ),
       { timeoutMsg: "The 101 fixture diagrams never drew.", timeout: 240_000, interval: 1_000 },
     );
-    // The remount runs first, while only the reply's last diagram is evicted. Open item (#171
-    // merge gate): when a cold draw above has also evicted another of the 101, the reopened
-    // chat settled about one diagram height (21 px) short of its end in two of three runs,
-    // which matches a diagram growing at the end without the list following it.
+    // The remount runs first, while only the reply's last diagram is evicted.
     // Sample on a timer while the chat is left and reopened (an in-page navigation keeps the
     // diagram cache): the last line's position and whether the evicted diagram is drawn. The
     // queue draws the most recently mounted block first, so the reply's last diagram was the
@@ -831,8 +836,7 @@ describe("packaged Mermaid diagrams", () => {
         (window as unknown as { __bibcodeMermaidFrameSamples?: EndSample[] })
           .__bibcodeMermaidFrameSamples ?? [],
     );
-    // The per-sample traces are evidence for the open gate item below; they hold no message
-    // text.
+    // The per-sample traces hold no message text.
     NodeFS.writeFileSync(
       NodePath.join(preparedArtifactDirectory, "mermaid-timeline-evicted-remount.json"),
       JSON.stringify(
@@ -845,15 +849,31 @@ describe("packaged Mermaid diagrams", () => {
       ),
     );
     // The reopened chat settles at its end, with the reply's last line in view, and stays
-    // there for the last second of samples. Open item (#171 merge gate): when the evicted
-    // diagram redraws before the list's first scroll to the end, the end can converge in steps
-    // (about one diagram height each) for a few frames after it first shows; a reply whose
-    // diagrams all stay cached lands straight at the end.
+    // there for the last second of samples.
     const final = samples.at(-1)!;
     expect(final.visible).toBe(true);
     expect(final.endGap).toBeLessThanOrEqual(1);
     const lastSecond = samples.filter((entry) => entry.at >= final.at - 1_000);
     expect(lastSecond.every((entry) => Math.abs(entry.bottom! - final.bottom!) <= 1)).toBe(true);
+    // From the first painted frame of the reopened chat on, every frame shows the last line
+    // where it rests: the evicted diagram keeps its drawn height while it draws again, so the
+    // end does not step as it redraws.
+    const leftFrame = frameSamples.findIndex((entry) => entry.bottom === null);
+    const reopenedFrame = frameSamples.findIndex(
+      (entry, index) => leftFrame >= 0 && index > leftFrame && entry.shown,
+    );
+    expect(reopenedFrame).toBeGreaterThan(leftFrame);
+    const unsettledFrames = frameSamples
+      .slice(reopenedFrame)
+      .filter(
+        (entry) =>
+          !entry.visible ||
+          entry.bottom === null ||
+          Math.abs(entry.bottom - final.bottom!) > 1 ||
+          entry.endGap === null ||
+          entry.endGap > 1,
+      );
+    expect(unsettledFrames).toEqual([]);
     await saveEvidence("mermaid-timeline-evicted-remount");
 
     // A cold first draw above the line being read. The rows reply's diagram was evicted by
@@ -955,19 +975,32 @@ describe("packaged Mermaid diagrams", () => {
     expect(plain.some((entry) => entry.diagramDrawn)).toBe(false);
     const drew = diagram.findIndex((entry) => entry.diagramDrawn);
     const firstStreamed = diagram.findIndex((entry) => entry.streaming);
-    // The diagram drew while the reply streamed, after its first text was shown.
+    // The diagram drew while the reply streamed, after its first text was shown, and its
+    // source showed at the end first, so the draw changed the height at the end.
     expect(firstStreamed).toBeGreaterThanOrEqual(0);
     expect(drew).toBeGreaterThan(firstStreamed);
+    expect(diagram.slice(0, drew).some((entry) => entry.fenceShown)).toBe(true);
     expect(diagram.slice(drew).some((entry) => !entry.finished)).toBe(true);
     // The list keeps following the end: it ends resting where the plain reply rests, with the
-    // last streamed line in view. Open item (#171 merge gate): the diagram's own growth when
-    // it draws at the end is not followed, so the list rests that much (about 21 px) further
-    // from the end than the plain reply until the next delta lands; a diagram that ended a
-    // reply would leave it there. The trace artifact records both replies' gaps.
+    // last streamed line in view. The trace artifact records both replies' gaps.
     expect(diagram.some((entry) => entry.fenceShown)).toBe(true);
     expect(plain.some((entry) => entry.fenceShown)).toBe(true);
     expect(Math.abs(diagram.at(-1)!.endGap! - plain.at(-1)!.endGap!)).toBeLessThanOrEqual(1);
     expect(diagram.at(-1)!.lastLineInView).toBe(true);
+    // The diagram's own growth is followed too: after each delivery from the one the diagram
+    // drew in, before the next one lands, the reply's end is revealed as far as the plain
+    // reply's is.
+    const plainRests = restingEnds(plain);
+    const diagramRests = restingEnds(diagram);
+    const drewAfter = diagram[drew]!.afterParagraphs;
+    const endsHidden = [...diagramRests]
+      .filter(([delivered]) => delivered >= drewAfter)
+      .filter(([delivered, below]) => {
+        const plainBelow = plainRests.get(delivered);
+        return plainBelow === undefined || below > Math.max(plainBelow, 0) + 1;
+      });
+    expect(diagramRests.has(drewAfter)).toBe(true);
+    expect(endsHidden).toEqual([]);
     await saveEvidence("mermaid-timeline-streaming-follow");
   });
 });
@@ -1000,7 +1033,12 @@ async function streamAndSampleEnd(prompt: string): Promise<StreamSample[]> {
         [...document.querySelectorAll(`${surface} .chat-markdown-mermaid svg`)].filter((svg) =>
           svg.textContent?.includes("Streamed draw"),
         ).length;
+      const afterParagraphs = () =>
+        [...document.querySelectorAll<HTMLElement>(`${surface} .chat-markdown p`)].filter(
+          (element) => element.textContent?.startsWith("Streamed after paragraph"),
+        ).length;
       const introsBefore = count("Streamed reply intro.");
+      const afterParagraphsBefore = afterParagraphs();
       const lastLinesBefore = count(lastLine);
       const fencesBefore = fences();
       const drawnBefore = drawn();
@@ -1017,6 +1055,7 @@ async function streamAndSampleEnd(prompt: string): Promise<StreamSample[]> {
           streaming: count("Streamed reply intro.") > introsBefore,
           fenceShown: fences() > fencesBefore,
           finished: count(lastLine) > lastLinesBefore,
+          afterParagraphs: afterParagraphs() - afterParagraphsBefore,
           lastLineInView: (() => {
             const line = [...document.querySelectorAll<HTMLElement>(`${surface} .chat-markdown p`)]
               .findLast((element) => element.textContent === lastLine)
@@ -1027,6 +1066,21 @@ async function streamAndSampleEnd(prompt: string): Promise<StreamSample[]> {
           endGap: scroller
             ? Math.round(scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop)
             : null,
+          endBelow: (() => {
+            // The reply ends with the lowest of its paragraphs and code blocks.
+            const blocks = [
+              ...document.querySelectorAll<HTMLElement>(
+                `${surface} .chat-markdown p, ${surface} .chat-markdown-codeblock`,
+              ),
+            ];
+            const area = scroller?.getBoundingClientRect();
+            if (blocks.length === 0 || !area) return null;
+            const end = Math.max(...blocks.map((block) => block.getBoundingClientRect().bottom));
+            const composerTop = document
+              .querySelector(`${surface} [data-chat-composer-form="true"]`)
+              ?.getBoundingClientRect().top;
+            return Math.round(end - Math.min(area.bottom, composerTop ?? area.bottom));
+          })(),
           diagramDrawn: drawn() > drawnBefore,
         };
       };
@@ -1069,6 +1123,20 @@ async function streamAndSampleEnd(prompt: string): Promise<StreamSample[]> {
   });
 }
 
+/**
+ * Where the reply's end rests after each delivery once its code block shows: how far it ends
+ * below the usable bottom in the last frame before the next delivery, by how many paragraphs
+ * after the block were shown then (the last line counts as one more).
+ */
+function restingEnds(samples: readonly StreamSample[]): Map<number, number> {
+  const rests = new Map<number, number>();
+  for (const entry of samples) {
+    if (!entry.fenceShown || entry.endBelow === null) continue;
+    rests.set(entry.afterParagraphs + (entry.finished ? 1 : 0), entry.endBelow);
+  }
+  return rests;
+}
+
 /** The samples where something changed, for a trace artifact that holds no message text. */
 function streamChanges(samples: readonly StreamSample[]): StreamSample[] {
   return samples.filter(
@@ -1077,7 +1145,9 @@ function streamChanges(samples: readonly StreamSample[]): StreamSample[] {
       entry.streaming !== all[index - 1]!.streaming ||
       entry.fenceShown !== all[index - 1]!.fenceShown ||
       entry.finished !== all[index - 1]!.finished ||
+      entry.afterParagraphs !== all[index - 1]!.afterParagraphs ||
       entry.endGap !== all[index - 1]!.endGap ||
+      entry.endBelow !== all[index - 1]!.endBelow ||
       entry.diagramDrawn !== all[index - 1]!.diagramDrawn,
   );
 }

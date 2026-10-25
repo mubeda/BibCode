@@ -2778,25 +2778,22 @@ message leaves that message at the sent-row offset; and selecting an earlier
 message with the minimap keyboard lands it at the minimap's offset past that
 diagram and keeps it there (`mermaid-timeline-minimap-landing.json`). After a
 reply with 101 diagrams, reopening the chat draws the evicted diagram (the
-reply's last, which the queue drew first) again through the queue, and the
-reopened chat settles at its end with the reply's last line in view and still.
-The scenario keeps a per-sample trace of the last line, on a timer and after
-each painted frame, as `mermaid-timeline-evicted-remount.json`. A second reply
-of 101 diagrams then evicts every earlier one; scrolling up remounts the rows
-reply, whose diagram shows its source and draws again above the message being
-read, which stays within 1 px on every painted frame
+reply's last, which the queue drew first) again through the queue, holding its
+source at the diagram's drawn height meanwhile, and every painted frame of the
+reopened chat shows the reply's last line at its end, within 1 px of where it
+rests. The scenario keeps a per-sample trace of the last line, on a timer and
+after each painted frame, as `mermaid-timeline-evicted-remount.json`. A second
+reply of 101 diagrams then evicts every earlier one; scrolling up remounts the
+rows reply, whose diagram shows its source and draws again above the message
+being read, which stays within 1 px on every painted frame
 (`mermaid-timeline-cold-draw.json`). Last, the fixture provider streams the
 same reply twice, one delta every 300 ms, first with the diagram's source in a
-plain code block and then as a diagram that draws at the end while more text
-streams: both end resting at the same distance from the end with the last line
-in view (`mermaid-timeline-streaming-follow.json` holds both replies' gaps).
-Open items of the diagram merge gate, which the traces record but the
-scenario does not assert: when the evicted diagram redraws before the list's
-first scroll to the end, the end converges in steps for a few painted frames
-after it first shows; a diagram that draws at the end grows without the list
-following it, so the list rests about one diagram-height change further from
-the end until the next delta lands, and a reopened chat with two evicted
-diagrams near its end can settle that far short of it. The reading-line
+plain code block and then as a sequence diagram, the scenario's only one, whose
+chunk loads after its source shows, so it replaces the source at the end while
+more text streams. After each delivery from the diagram's draw on, the reply's
+end rests no lower below the composer than the plain reply's, and both end
+with the last line in view (`mermaid-timeline-streaming-follow.json` holds both
+replies' gaps and end positions). The reading-line
 checks sample painted frames, so the scenario fails early in a webview that
 paints none.
 Its other page scripts wait on timers rather than animation frames, which stop

@@ -78,12 +78,14 @@ export const mermaidFixtureStreamedReplies: Readonly<Record<string, readonly str
 
 /**
  * `streamedPlain` streams the same reply with the diagram's source in a plain code block, the
- * baseline for how closely the timeline follows a streaming end without a diagram drawing.
+ * baseline for how closely the timeline follows a streaming end without a diagram drawing. The
+ * diagram is the only sequence diagram the packaged scenario draws, so its renderer chunk loads
+ * after its source shows, and the diagram replaces the source at the end in a later frame.
  */
 function streamedReply(language: "mermaid" | "text"): readonly string[] {
   return [
     `Streamed reply intro.\n\n${filler("Streamed before", 30)}\n\n`,
-    `\`\`\`${language}\nflowchart LR\n  streamed[Streamed draw] --> done[Streamed done]\n\`\`\`\n\n`,
+    `\`\`\`${language}\nsequenceDiagram\n  participant streamed as Streamed draw\n  participant done as Streamed done\n  streamed->>done: Streamed reply\n  done-->>streamed: Streamed answer\n\`\`\`\n\n`,
     ...Array.from(
       { length: 6 },
       (_, index) => `Streamed after paragraph ${String(index + 1)} keeps the end in view.\n\n`,
