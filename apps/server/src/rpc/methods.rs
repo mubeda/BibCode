@@ -105,6 +105,7 @@ pub const ACTIVE_RPC_METHODS: &[RpcMethodSpec] = &[
     read_unary("pipelines.getJobLog"),
     read_unary("pipelines.list"),
     read_unary("pipelines.readSnapshot"),
+    mutation_unary("pipelines.runAction"),
     read_stream("pipelines.subscribe"),
     mutation_unary("preview.claimOpenRequest"),
     mutation_unary("preview.close"),
@@ -276,12 +277,7 @@ mod tests {
             assert!(ACTIVE_RPC_METHODS.contains(&read_unary(name)), "{name}");
         }
         assert!(ACTIVE_RPC_METHODS.contains(&read_stream("pipelines.subscribe")));
-        assert!(
-            !ACTIVE_RPC_METHODS
-                .iter()
-                .any(|method| method.name == "pipelines.runAction"),
-            "the mutation is not served yet"
-        );
+        assert!(ACTIVE_RPC_METHODS.contains(&mutation_unary("pipelines.runAction")));
     }
 
     #[test]

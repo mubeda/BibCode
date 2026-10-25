@@ -42,6 +42,7 @@ const h = vi.hoisted(() => ({
   snapshotReads: vi.fn(),
   subscribe: vi.fn((args: { input: unknown }) => ({ kind: "subscribe", ...args })),
   requestTimerRead: vi.fn(),
+  actions: vi.fn(),
   reads: vi.fn(),
   // Reads in flight; `settle` answers them in a later turn, as the atom runtime does.
   inflight: [] as (() => void)[],
@@ -53,6 +54,13 @@ vi.mock("../../../state/pipelines", () => ({
     readSnapshot: vi.fn((args: { input: unknown }) => ({ kind: "readSnapshot", ...args })),
     subscribe: h.subscribe,
     requestTimerRead: h.requestTimerRead,
+    runAction: { label: "environment-data:pipelines:run-action" },
+  },
+}));
+vi.mock("../../../state/use-atom-command", () => ({
+  useAtomCommand: () => async (value: unknown) => {
+    h.actions(value);
+    return { _tag: "Success", value: { pipelineId: 4821, jobId: null } };
   },
 }));
 vi.mock("../../../state/vcs", () => ({
@@ -391,6 +399,21 @@ describe("PipelinesListView", () => {
     expect(other.disabled).toBe(true);
     expect(other.title).toBe(SERVER_TOO_OLD);
     expect(container.querySelector('[aria-label="Cancel pipeline #4821"]')).toBeNull();
+  });
+
+  it("retries a row's pipeline and reads the first page again", async () => {
+    const base = moduleValue(gitlabContext);
+    await render({ value: { ...base, meta: { ...base.meta, mutationsDisabledReason: null } } });
+    h.reads.mockClear();
+    const retry = container.querySelector<HTMLButtonElement>(
+      '[aria-label="Retry pipeline #4821"]',
+    )!;
+    await act(async () => retry.click());
+    expect(h.actions).toHaveBeenCalledExactlyOnceWith({
+      environmentId: "env",
+      input: { cwd: "/repo", target: { _tag: "pipeline", id: 4821 }, action: "retry" },
+    });
+    expect(h.reads).toHaveBeenCalledWith(null);
   });
 
   it("shows a first page read alongside the context without reading it again", async () => {

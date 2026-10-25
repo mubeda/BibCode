@@ -6709,14 +6709,13 @@ mod tests {
             "pullRequestsReads",
             "pullRequestsMutations",
             "pipelinesReads",
+            "pipelinesMutations",
         ] {
             assert_eq!(
                 descriptor["capabilities"][capability], true,
                 "Git Manager capability {capability} was not advertised"
             );
         }
-        // `pipelines.runAction` is not registered yet, so its flag stays off.
-        assert_eq!(descriptor["capabilities"]["pipelinesMutations"], false);
         // Clients send the profiler RPCs only to servers that advertise them.
         assert_eq!(descriptor["capabilities"]["profiler"], true);
         // Clients show the Device previews setting and pane only on servers that advertise it.

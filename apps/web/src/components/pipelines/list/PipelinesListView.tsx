@@ -36,6 +36,7 @@ import { Skeleton } from "../../ui/skeleton";
 import { Tabs, TabsList, TabsTab } from "../../ui/tabs";
 import { useRateLimitCountdown } from "../shared/useRateLimitCountdown";
 import { PipelinesBranchFilter } from "./PipelinesBranchFilter";
+import { PipelineActions } from "../actions/PipelineActions";
 import { PIPELINES_ROW_HEIGHT, PipelinesListRow } from "./PipelinesListRow";
 import { PipelinesWorkflowFilter } from "./PipelinesWorkflowFilter";
 import {
@@ -158,6 +159,7 @@ function PipelinesPages({
     }
     setCursors((previous) => [...previous, nextCursor]);
   };
+  const repositoryPermission = context.repositoryPermission;
   const renderRow = useCallback(
     ({ item }: { item: PipelinesRow }) => (
       <PipelinesListRow
@@ -166,102 +168,123 @@ function PipelinesPages({
         scope={scope}
         projectRef={projectRef}
         mutationsDisabledReason={mutationsDisabledReason}
+        repositoryPermission={repositoryPermission}
       />
     ),
-    [context.provider, mutationsDisabledReason, projectRef, scope],
+    [context.provider, mutationsDisabledReason, projectRef, repositoryPermission, scope],
   );
+  // An action changes its row: the first page, and the page it sits on, are read again.
+  const revalidateFirstPage = firstQuery.revalidate;
+  const revalidatePage = nextQuery.revalidate;
+  const onActionSettled = useCallback(() => {
+    revalidateFirstPage();
+    if (cursor !== null) revalidatePage();
+  }, [cursor, revalidateFirstPage, revalidatePage]);
   const total = firstQuery.data?.total ?? null;
   const loaded = query.data !== null && !query.isPending;
   return (
-    <div className="@container flex min-h-0 flex-1 flex-col">
-      {message !== null ? (
-        <div role="alert" className="space-y-2 border-b border-border p-4 text-sm">
-          <p>{message}</p>
-          {waitSeconds !== null ? (
-            <p className="text-xs text-muted-foreground tabular-nums">
-              Trying again in {waitSeconds} s.
-            </p>
-          ) : error?.hostDetail ? (
-            <p className="text-xs text-muted-foreground">{error.hostDetail}</p>
-          ) : null}
-          <div className="flex gap-2">
-            <PermissionButton
-              size="sm"
-              variant="outline"
-              onClick={query.refresh}
-              permission={
-                waitSeconds !== null
-                  ? {
-                      allowed: false,
-                      reason: "The host asked BiBCode to wait before reading again.",
-                    }
-                  : { allowed: !query.isPending, reason: query.isPending ? "Loading…" : null }
-              }
-            >
-              Retry
-            </PermissionButton>
+    <PipelineActions.Provider
+      scope={scope}
+      provider={context.provider}
+      revision={firstQuery.data?.revision ?? null}
+      onSettled={onActionSettled}
+    >
+      <div className="@container flex min-h-0 flex-1 flex-col">
+        {message !== null ? (
+          <div role="alert" className="space-y-2 border-b border-border p-4 text-sm">
+            <p>{message}</p>
+            {waitSeconds !== null ? (
+              <p className="text-xs text-muted-foreground tabular-nums">
+                Trying again in {waitSeconds} s.
+              </p>
+            ) : error?.hostDetail ? (
+              <p className="text-xs text-muted-foreground">{error.hostDetail}</p>
+            ) : null}
+            <div className="flex gap-2">
+              <PermissionButton
+                size="sm"
+                variant="outline"
+                onClick={query.refresh}
+                permission={
+                  waitSeconds !== null
+                    ? {
+                        allowed: false,
+                        reason: "The host asked BiBCode to wait before reading again.",
+                      }
+                    : { allowed: !query.isPending, reason: query.isPending ? "Loading…" : null }
+                }
+              >
+                Retry
+              </PermissionButton>
+              {hasFilter ? (
+                <Button size="sm" variant="outline" onClick={onClearFilters}>
+                  Clear filter
+                </Button>
+              ) : null}
+            </div>
+          </div>
+        ) : null}
+        {rows.length > 0 ? (
+          <LegendList<PipelinesRow>
+            ref={scrollRef}
+            className="min-h-0 flex-1 overflow-x-hidden"
+            role="list"
+            aria-label="Pipelines"
+            data={rows}
+            estimatedItemSize={PIPELINES_ROW_HEIGHT}
+            getFixedItemSize={getRowSize}
+            keyExtractor={rowKey}
+            initialScrollOffset={savedScrollTop}
+            renderItem={renderRow}
+            onScroll={(event) => {
+              scrollTopRef.current = event.nativeEvent.contentOffset.y;
+            }}
+          />
+        ) : null}
+        {query.isPending && rows.length === 0 ? (
+          <div role="status" className="space-y-2 p-4">
+            <span className="sr-only">Loading pipelines…</span>
+            <Skeleton className="h-14 w-full" />
+            <Skeleton className="h-14 w-full" />
+            <Skeleton className="h-14 w-full" />
+          </div>
+        ) : null}
+        {rows.length === 0 && loaded && message === null ? (
+          <div className="space-y-3 p-6 text-sm text-muted-foreground">
+            <p>{emptyCopy}</p>
             {hasFilter ? (
               <Button size="sm" variant="outline" onClick={onClearFilters}>
                 Clear filter
               </Button>
             ) : null}
           </div>
-        </div>
-      ) : null}
-      {rows.length > 0 ? (
-        <LegendList<PipelinesRow>
-          ref={scrollRef}
-          className="min-h-0 flex-1 overflow-x-hidden"
-          role="list"
-          aria-label="Pipelines"
-          data={rows}
-          estimatedItemSize={PIPELINES_ROW_HEIGHT}
-          getFixedItemSize={getRowSize}
-          keyExtractor={rowKey}
-          initialScrollOffset={savedScrollTop}
-          renderItem={renderRow}
-          onScroll={(event) => {
-            scrollTopRef.current = event.nativeEvent.contentOffset.y;
-          }}
-        />
-      ) : null}
-      {query.isPending && rows.length === 0 ? (
-        <div role="status" className="space-y-2 p-4">
-          <span className="sr-only">Loading pipelines…</span>
-          <Skeleton className="h-14 w-full" />
-          <Skeleton className="h-14 w-full" />
-          <Skeleton className="h-14 w-full" />
-        </div>
-      ) : null}
-      {rows.length === 0 && loaded && message === null ? (
-        <div className="space-y-3 p-6 text-sm text-muted-foreground">
-          <p>{emptyCopy}</p>
-          {hasFilter ? (
-            <Button size="sm" variant="outline" onClick={onClearFilters}>
-              Clear filter
-            </Button>
-          ) : null}
-        </div>
-      ) : null}
-      {nextCursor !== null && !cursors.includes(nextCursor) && message === null ? (
-        <div className="border-t border-border p-3">
-          <PermissionButton
-            size="sm"
-            variant="outline"
-            permission={{ allowed: !query.isPending, reason: query.isPending ? "Loading…" : null }}
-            onClick={loadMore}
-          >
-            Load more
-          </PermissionButton>
-        </div>
-      ) : null}
-      {/* GitHub stops a filtered list at 1,000 runs; GitLab pages to the end. */}
-      {context.provider === "github" && nextCursor === null && rows.length > 0 && total?.capped ? (
-        <p className="border-t border-border p-3 text-xs text-muted-foreground">
-          GitHub returns at most 1,000 filtered runs.
-        </p>
-      ) : null}
-    </div>
+        ) : null}
+        {nextCursor !== null && !cursors.includes(nextCursor) && message === null ? (
+          <div className="border-t border-border p-3">
+            <PermissionButton
+              size="sm"
+              variant="outline"
+              permission={{
+                allowed: !query.isPending,
+                reason: query.isPending ? "Loading…" : null,
+              }}
+              onClick={loadMore}
+            >
+              Load more
+            </PermissionButton>
+          </div>
+        ) : null}
+        {/* GitHub stops a filtered list at 1,000 runs; GitLab pages to the end. */}
+        {context.provider === "github" &&
+        nextCursor === null &&
+        rows.length > 0 &&
+        total?.capped ? (
+          <p className="border-t border-border p-3 text-xs text-muted-foreground">
+            GitHub returns at most 1,000 filtered runs.
+          </p>
+        ) : null}
+      </div>
+    </PipelineActions.Provider>
   );
 }
 

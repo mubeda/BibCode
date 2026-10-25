@@ -28,7 +28,6 @@ describe("Pipelines environment atoms", () => {
       ),
     );
     const atoms = createPipelinesEnvironmentAtoms(runtime);
-    // No `runAction` until the server advertises `pipelinesMutations`.
     expect(Object.keys(atoms).sort()).toEqual([
       "get",
       "getJob",
@@ -36,6 +35,7 @@ describe("Pipelines environment atoms", () => {
       "list",
       "readSnapshot",
       "requestTimerRead",
+      "runAction",
       "subscribe",
     ]);
     const environmentId = EnvironmentId.make("env-1");
@@ -56,6 +56,16 @@ describe("Pipelines environment atoms", () => {
     expect(Atom.isAtom(getJobLog)).toBe(false);
     expect(getJobLog.label).toBe("environment-data:pipelines:get-job-log");
     expect(typeof getJobLog.run).toBe("function");
+  });
+
+  it("runs an action as a one-shot command on the shared VCS scheduler", () => {
+    const runtime = Atom.runtime(
+      Layer.effect(EnvironmentRegistry, Effect.die("No RPC should execute in this test.")),
+    );
+    const { runAction } = createPipelinesEnvironmentAtoms(runtime);
+    expect(Atom.isAtom(runAction)).toBe(false);
+    expect(runAction.label).toBe("environment-data:pipelines:run-action");
+    expect(typeof runAction.run).toBe("function");
   });
 
   it.effect("sends one marked execution as a timer read, for that environment and input only", () =>

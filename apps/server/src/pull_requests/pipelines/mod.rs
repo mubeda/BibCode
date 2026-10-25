@@ -13,9 +13,9 @@ pub mod model;
 pub(crate) mod poll;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Weak},
     time::Duration,
 };
 
@@ -26,9 +26,10 @@ use tokio_util::sync::CancellationToken;
 use self::{
     log::{FullLog, JobFacts, LogKey, RANGE_WINDOW, RangeSupport, SharedTail},
     model::{
-        Changed, Detail, GetInput, JobDetail, JobInput, JobLog, JobLogInput, ListInput, ListPage,
-        LogChunk, LogFrom, LogUnavailable, LogUnavailableAnswer, Refresh, Row, Snapshot, Stored,
-        SubscribeInput, Total, Workflow,
+        ActionKind, ActionResult, ActionTarget, Changed, Detail, GetInput, Job, JobDetail,
+        JobInput, JobLog, JobLogInput, ListInput, ListPage, LogChunk, LogFrom, LogUnavailable,
+        LogUnavailableAnswer, Permission, PermissionKind, Refresh, Row, RunActionInput, Snapshot,
+        Stored, SubscribeInput, Total, Workflow,
     },
 };
 use super::{
@@ -44,6 +45,9 @@ use crate::persistence::Database;
 pub(crate) const LIST_KIND: &str = "pipelines_list";
 pub(crate) const DETAIL_KIND: &str = "pipelines_detail";
 pub(crate) const JOB_KIND: &str = "pipelines_job";
+/// The one Pipelines mutation. A settled action keeps its answer past its
+/// budget, as `pullRequests.runAction` does (`interrupted_result`).
+pub(crate) const ACTION_OP: &str = "pipelines.runAction";
 /// A list's `count` is reused this long, except on a user read of a first page.
 const COUNT_REUSE: Duration = Duration::from_secs(5 * 60);
 
@@ -92,6 +96,14 @@ pub(crate) fn read_failure(
 
 fn unavailable<'a, T: 'a>(operation: &'static str) -> HostFuture<'a, T> {
     Box::pin(async move { Err(PullRequestsOperationError::new(operation, "unavailable")) })
+}
+
+/// An action this provider does not offer on this target, refused before
+/// any host call.
+pub(crate) fn unsupported_action(message: &str) -> PullRequestsOperationError {
+    let mut error = PullRequestsOperationError::new(ACTION_OP, "unavailable");
+    error.message = message.into();
+    error
 }
 
 /// One provider's pipelines reads. Object safe, with every read answering
@@ -156,12 +168,30 @@ pub(crate) trait PipelineHost: Send + Sync {
     ) -> HostFuture<'a, TraceRead> {
         unavailable("pipelines.getJobLog")
     }
+
+    /// Retry, retry failed jobs, cancel or play one pipeline or job.
+    fn run_action<'a>(
+        &'a self,
+        _scope: &'a HostScope,
+        _context: &'a HostContext,
+        _target: ActionTarget,
+        _action: ActionKind,
+        _c: &'a CancellationToken,
+    ) -> HostFuture<'a, ActionResult> {
+        unavailable(ACTION_OP)
+    }
 }
 
 /// A list's count, per lowercased host, project and list key.
 type CountKey = (String, String, String);
 /// A repository's workflows, per lowercased host and project.
 type WorkflowsKey = (String, String);
+/// A host's refusal of an action kind, per lowercased host, account login and
+/// project.
+type RefusalKey = (String, String, String, PermissionKind);
+/// One action in flight, per lowercased host, project, target and action.
+type ActionKey = (String, String, ActionTarget, ActionKind);
+type ActionFlight = tokio::sync::OnceCell<Result<ActionResult, PullRequestsOperationError>>;
 
 /// Server memory the pipelines reads share across service clones: the log
 /// cache, the GitLab pollers, the reused list counts and GitHub workflows.
@@ -173,6 +203,12 @@ pub(crate) struct PipelinesState {
     /// GitHub's Workflow filter choices, read with a count and reused by the
     /// reads that skip it, so a timer page keeps the filter.
     workflows: Mutex<HashMap<WorkflowsKey, Vec<Workflow>>>,
+    /// Action kinds GitHub refused this account, until the next rescan: every
+    /// view of the repository shows them `denied`.
+    refusals: Mutex<HashSet<RefusalKey>>,
+    /// Actions in flight: a second identical request shares the first's
+    /// answer, so a double click sends one request.
+    actions: Mutex<HashMap<ActionKey, Weak<ActionFlight>>>,
 }
 
 impl PipelinesState {
@@ -184,6 +220,10 @@ impl PipelinesState {
             .unwrap_or_else(|p| p.into_inner())
             .clear();
         self.workflows
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
+        self.refusals
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clear();
@@ -201,6 +241,41 @@ impl PipelinesState {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .retain(|key, _| key.0 != host);
+        self.refusals
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|key| key.0 != host);
+    }
+
+    fn refuse(&self, key: RefusalKey) {
+        self.refusals
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(key);
+    }
+
+    /// The action kinds refused to `login` on this host and project.
+    fn refused(&self, host: &str, login: &str, project: &str) -> Refused {
+        let refusals = self.refusals.lock().unwrap_or_else(|p| p.into_inner());
+        let mut refused = Refused::default();
+        for (key_host, key_login, key_project, kind) in refusals.iter() {
+            if key_host == host && key_login == login && key_project == project {
+                refused.0.insert(*kind);
+            }
+        }
+        refused
+    }
+
+    /// The flight for this action: the one in progress, or a new one.
+    fn action_flight(&self, key: ActionKey) -> Arc<ActionFlight> {
+        let mut actions = self.actions.lock().unwrap_or_else(|p| p.into_inner());
+        actions.retain(|_, flight| flight.strong_count() > 0);
+        if let Some(flight) = actions.get(&key).and_then(Weak::upgrade) {
+            return flight;
+        }
+        let flight = Arc::new(ActionFlight::new());
+        actions.insert(key, Arc::downgrade(&flight));
+        flight
     }
 
     /// The workflows a read returned, remembered; or the last ones remembered.
@@ -228,6 +303,87 @@ impl PipelinesState {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .insert(key, (Instant::now(), total));
+    }
+}
+
+/// The action kinds a host refused one account. Reads show them `denied`
+/// whatever the host's own answer, which never changes what is stored.
+#[derive(Default)]
+struct Refused(HashSet<PermissionKind>);
+
+impl Refused {
+    fn deny(&self, kind: PermissionKind, permission: &mut Permission) {
+        if self.0.contains(&kind) {
+            *permission = Permission::Denied;
+        }
+    }
+
+    fn row(&self, row: &mut Row) {
+        if let Some(permissions) = &mut row.permissions {
+            self.deny(PermissionKind::Retry, &mut permissions.retry);
+            self.deny(PermissionKind::Cancel, &mut permissions.cancel);
+        }
+    }
+
+    fn job(&self, job: &mut Job) {
+        self.deny(PermissionKind::Retry, &mut job.permissions.retry);
+        self.deny(PermissionKind::Cancel, &mut job.permissions.cancel);
+        self.deny(PermissionKind::Play, &mut job.permissions.play);
+    }
+
+    fn list(&self, page: &mut ListPage) {
+        if self.0.is_empty() {
+            return;
+        }
+        page.rows.iter_mut().for_each(|row| self.row(row));
+    }
+
+    fn detail(&self, detail: &mut Detail) {
+        if self.0.is_empty() {
+            return;
+        }
+        self.row(&mut detail.pipeline);
+        for stage in detail.stages.iter_mut().flatten() {
+            for group in &mut stage.groups {
+                group.jobs.iter_mut().for_each(|job| self.job(job));
+            }
+        }
+    }
+
+    fn job_detail(&self, job: &mut JobDetail) {
+        self.job(&mut job.job);
+    }
+}
+
+fn host_name(provider: PullRequestsProvider) -> &'static str {
+    match provider {
+        PullRequestsProvider::Github => "GitHub",
+        PullRequestsProvider::Gitlab => "GitLab",
+    }
+}
+
+/// What a host's refusal of an action says at its button.
+fn refusal_message(
+    provider: PullRequestsProvider,
+    target: ActionTarget,
+    action: ActionKind,
+) -> String {
+    match provider {
+        PullRequestsProvider::Github => "GitHub refused: this sign-in can't run Actions for this \
+            repository. A fine-grained token needs Actions write."
+            .into(),
+        PullRequestsProvider::Gitlab => {
+            let verb = match action {
+                ActionKind::Retry | ActionKind::RetryFailed => "retry",
+                ActionKind::Cancel => "cancel",
+                ActionKind::Play => "run",
+            };
+            let noun = match target {
+                ActionTarget::Pipeline { .. } => "pipeline",
+                ActionTarget::Job { .. } => "job",
+            };
+            format!("GitLab refused: this account can't {verb} this {noun}.")
+        }
     }
 }
 
@@ -349,6 +505,14 @@ struct Admitted {
 }
 
 impl Admitted {
+    fn refused(&self, state: &PipelinesState) -> Refused {
+        state.refused(
+            &self.scope.host.to_ascii_lowercase(),
+            &self.context.account.login,
+            &self.scope.repository,
+        )
+    }
+
     fn log_key(&self, job: u64, attempt: Option<u64>) -> LogKey {
         LogKey {
             host: self.scope.host.to_ascii_lowercase(),
@@ -728,7 +892,7 @@ impl PipelinesService {
                     ),
                     read.workflows,
                 );
-                let page = ListPage {
+                let mut page = ListPage {
                     revision: generation,
                     rows: read.rows,
                     next_cursor: read.next_cursor,
@@ -747,6 +911,7 @@ impl PipelinesService {
                     )
                     .await;
                 }
+                admitted.refused(self.state()).list(&mut page);
                 Ok(page)
             },
         )
@@ -787,6 +952,7 @@ impl PipelinesService {
                     generation,
                 )
                 .await;
+                admitted.refused(self.state()).detail(&mut detail);
                 Ok(detail)
             },
         )
@@ -825,6 +991,7 @@ impl PipelinesService {
                     generation,
                 )
                 .await;
+                admitted.refused(self.state()).job_detail(&mut job);
                 Ok(job)
             },
         )
@@ -1165,6 +1332,7 @@ impl PipelinesService {
             };
             let host = pending.scope.host.to_ascii_lowercase();
             let project = pending.scope.repository.clone();
+            let (refusal_host, refusal_project) = (host.clone(), project.clone());
             let list_key = input.list.snapshot_key();
             let detail = input.pipeline_id.map(|id| detail_key(id, input.attempt));
             let job = input.job_id.map(|id| id.to_string());
@@ -1204,13 +1372,168 @@ impl PipelinesService {
                     observed_at: row.observed_at_ms.max(0) as u64,
                 })
             }
-            Ok(Snapshot {
+            let mut snapshot = Snapshot {
                 list: paint(list, &login),
                 detail: paint(detail, &login),
                 job: paint(job, &login),
-            })
+            };
+            let refused = self
+                .state()
+                .refused(&refusal_host, &login, &refusal_project);
+            if let Some(list) = &mut snapshot.list {
+                refused.list(&mut list.payload);
+            }
+            if let Some(detail) = &mut snapshot.detail {
+                refused.detail(&mut detail.payload);
+            }
+            if let Some(job) = &mut snapshot.job {
+                refused.job_detail(&mut job.payload);
+            }
+            Ok(snapshot)
         })
         .await
+    }
+
+    /// Retries, cancels or plays one pipeline or job. It is admitted as a read
+    /// is (a backed-off host gets no call), refused at once when GitHub
+    /// already refused this account the action kind, and single flight per
+    /// target and action. A GitHub refusal is remembered until the next
+    /// rescan; no refusal discredits the shared context or rows.
+    pub async fn run_action(
+        &self,
+        input: RunActionInput,
+        c: &CancellationToken,
+    ) -> Result<ActionResult, PullRequestsOperationError> {
+        let operation = ACTION_OP;
+        let cwd = input.cwd.clone();
+        bounded_read(operation, Duration::from_secs(60), c, |c| async move {
+            let admitted = match self.admit(operation, Path::new(&cwd), &c).await {
+                Ok(admitted) => admitted,
+                Err(Failure::Held(error)) => return Err(error),
+                Err(Failure::Host(error)) => {
+                    tracing::warn!(operation, code = error.code, "pipelines action failed");
+                    return Err(error);
+                }
+            };
+            let host = admitted.scope.host.to_ascii_lowercase();
+            let project = admitted.scope.repository.clone();
+            let kind = input.action.permission();
+            if admitted.refused(self.state()).0.contains(&kind) {
+                let mut error = PullRequestsOperationError::new(operation, "forbidden");
+                error.message =
+                    refusal_message(admitted.scope.provider, input.target, input.action);
+                return Err(error);
+            }
+            let flight = self
+                .state()
+                .action_flight((host, project, input.target, input.action));
+            flight
+                .get_or_init(|| self.send_action(&admitted, &input, &c))
+                .await
+                .clone()
+        })
+        .await
+    }
+
+    /// The one host call of an action and what its answer means for the
+    /// shared state; every caller of the same flight receives its result.
+    async fn send_action(
+        &self,
+        admitted: &Admitted,
+        input: &RunActionInput,
+        c: &CancellationToken,
+    ) -> Result<ActionResult, PullRequestsOperationError> {
+        let operation = ACTION_OP;
+        let started = Instant::now();
+        let result = admitted
+            .host
+            .run_action(
+                &admitted.scope,
+                &admitted.context,
+                input.target,
+                input.action,
+                c,
+            )
+            .await;
+        let host = admitted.scope.host.to_ascii_lowercase();
+        let provider = admitted.scope.provider;
+        let mut error = match result {
+            Ok(result) => {
+                self.backoff().recovered(&admitted.scope.host, started);
+                // A retried or played pipeline runs again: a poller that had
+                // left it as terminal reads it again.
+                let pipeline = match input.target {
+                    ActionTarget::Pipeline { id } => Some(id),
+                    ActionTarget::Job { .. } => result.pipeline_id,
+                };
+                if let Some(pipeline) = pipeline {
+                    self.state()
+                        .pollers
+                        .rearm(&host, &admitted.scope.repository, pipeline);
+                }
+                return Ok(result);
+            }
+            Err(error) => error,
+        };
+        error.operation = operation.into();
+        tracing::warn!(operation, code = error.code, "pipelines action failed");
+        match error.code {
+            "rate_limited" => {
+                let delay = self.backoff().back_off(
+                    &admitted.scope.host,
+                    error
+                        .retry_after_seconds
+                        .map(|seconds| Duration::from_secs(seconds.into())),
+                );
+                let seconds = super::error::retry_seconds(delay);
+                error.retry_after_seconds = Some(seconds);
+                error.message = match (provider, input.target, input.action) {
+                    (PullRequestsProvider::Gitlab, ActionTarget::Job { .. }, ActionKind::Retry) => {
+                        format!(
+                            "GitLab allows a job three retries a minute. Try again in {seconds} s."
+                        )
+                    }
+                    _ => format!(
+                        "{}'s rate limit was reached. Try again in {seconds} s.",
+                        host_name(provider)
+                    ),
+                };
+            }
+            "not_authenticated" => {
+                self.service
+                    .invalidate_failed_context(&error, Some(&admitted.scope.host))
+                    .await;
+            }
+            // About this action, not the login. GitHub's permission is only
+            // a hint (`unknown` from repository write), so its refusal is
+            // remembered and shown at the button by every view of the
+            // repository. GitLab reports its permissions on every read, and
+            // also answers 403 for a job or pipeline whose state moved on, so
+            // the page's re-read shows its answer instead.
+            "forbidden" => {
+                if provider == PullRequestsProvider::Github {
+                    self.state().refuse((
+                        host,
+                        admitted.context.account.login.clone(),
+                        admitted.scope.repository.clone(),
+                        input.action.permission(),
+                    ));
+                }
+                error.message = refusal_message(provider, input.target, input.action);
+            }
+            "not_found" => {
+                let (resource, message) = match input.target {
+                    ActionTarget::Pipeline { id } => {
+                        (Resource::Pipeline(id), "This pipeline no longer exists.")
+                    }
+                    ActionTarget::Job { id } => (Resource::Job(id), "This job no longer exists."),
+                };
+                self.delete_resource(&admitted.scope, &resource).await;
+                error.message = message.into();
+            }
+            _ => {}
+        }
+        Err(error)
     }
 
     /// GitLab only: joins the cooperative poller of the list key. `emit`

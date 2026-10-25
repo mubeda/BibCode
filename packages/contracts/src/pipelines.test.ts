@@ -2,6 +2,7 @@ import * as Schema from "effect/Schema";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
+  PipelinesActionResult,
   PipelinesChanged,
   PipelinesDetail,
   PipelinesJobDetail,
@@ -9,6 +10,7 @@ import {
   PipelinesJobLogInput,
   PipelinesListInput,
   PipelinesListPage,
+  PipelinesRunActionInput,
   PipelinesSnapshot,
   PipelinesSubscribeInput,
 } from "./pipelines.ts";
@@ -23,6 +25,8 @@ const decodeJobLogInput = Schema.decodeUnknownSync(PipelinesJobLogInput);
 const decodeSubscribeInput = Schema.decodeUnknownSync(PipelinesSubscribeInput);
 const decodeSnapshot = Schema.decodeUnknownSync(PipelinesSnapshot);
 const decodeChanged = Schema.decodeUnknownSync(PipelinesChanged);
+const decodeRunActionInput = Schema.decodeUnknownSync(PipelinesRunActionInput);
+const decodeActionResult = Schema.decodeUnknownSync(PipelinesActionResult);
 
 const row = {
   id: 4821,
@@ -174,7 +178,37 @@ describe("Pipelines contracts", () => {
     expect(decodeChanged({ list: false, pipeline: true }).pipeline).toBe(true);
   });
 
-  it("registers the six reads in the WebSocket group and no mutation yet", () => {
+  it("decodes an action on a pipeline or a job, and its result", () => {
+    expect(
+      decodeRunActionInput({
+        cwd: "/repo",
+        target: { _tag: "job", id: 998 },
+        action: "play",
+      }).target,
+    ).toEqual({ _tag: "job", id: 998 });
+    for (const action of ["retry", "retry_failed", "cancel"]) {
+      expect(
+        decodeRunActionInput({ cwd: "/repo", target: { _tag: "pipeline", id: 4821 }, action })
+          .action,
+      ).toBe(action);
+    }
+    expect(() =>
+      decodeRunActionInput({ cwd: "/repo", target: { _tag: "stage", id: 1 }, action: "retry" }),
+    ).toThrow();
+    expect(() =>
+      decodeRunActionInput({ cwd: "/repo", target: { _tag: "job", id: 0 }, action: "retry" }),
+    ).toThrow();
+    expect(() =>
+      decodeRunActionInput({ cwd: "/repo", target: { _tag: "job", id: 9 }, action: "erase" }),
+    ).toThrow();
+    expect(decodeActionResult({ pipelineId: 4821, jobId: 1001 })).toEqual({
+      pipelineId: 4821,
+      jobId: 1001,
+    });
+    expect(decodeActionResult({ pipelineId: null, jobId: null }).jobId).toBeNull();
+  });
+
+  it("registers the six reads and the one action in the WebSocket group", () => {
     const methods = [
       WS_METHODS.pipelinesList,
       WS_METHODS.pipelinesGet,
@@ -182,6 +216,7 @@ describe("Pipelines contracts", () => {
       WS_METHODS.pipelinesGetJobLog,
       WS_METHODS.pipelinesReadSnapshot,
       WS_METHODS.pipelinesSubscribe,
+      WS_METHODS.pipelinesRunAction,
     ];
     const registered = [...WsRpcGroup.requests.keys()].filter((tag) =>
       tag.startsWith("pipelines."),

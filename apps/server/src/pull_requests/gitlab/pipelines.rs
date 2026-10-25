@@ -10,16 +10,16 @@ use super::{GitLabHost, encoded, parse, project_path};
 use crate::pull_requests::{
     backoff,
     error::PullRequestsOperationError,
-    host::{Budget, HostContext, HostFuture, HostScope},
+    host::{Budget, HostContext, HostFuture, HostScope, ProcessFailure},
     model::{Actor, PipelineStage, PipelineStatus},
     pipelines::{
-        ListRead, PipelineHost, TraceRead,
+        ACTION_OP, ListRead, PipelineHost, TraceRead,
         model::{
-            Artifact, Badge, Commit, Detail, DetailStage, Job, JobDetail, JobGroup, JobKind,
-            JobPermissions, ListInput, ListScope, Permission, PipelineRef, Reason, RefKind, Row,
-            RowPermissions, Runner, Total, is_terminal,
+            ActionKind, ActionResult, ActionTarget, Artifact, Badge, Commit, Detail, DetailStage,
+            Job, JobDetail, JobGroup, JobKind, JobPermissions, ListInput, ListScope, Permission,
+            PipelineRef, Reason, RefKind, Row, RowPermissions, Runner, Total, is_terminal,
         },
-        read_failure,
+        read_failure, unsupported_action,
     },
 };
 
@@ -631,6 +631,78 @@ impl GitLabHost {
     }
 }
 
+/// The REST endpoint of an action. GitLab's pipeline Retry retries its failed
+/// jobs, so "retry failed jobs" is the same call; a pipeline is never played.
+pub(crate) fn action_path(
+    scope: &HostScope,
+    target: ActionTarget,
+    action: ActionKind,
+) -> Result<String, PullRequestsOperationError> {
+    let base = project_path(scope);
+    let (kind, id) = match target {
+        ActionTarget::Pipeline { id } => ("pipelines", id),
+        ActionTarget::Job { id } => ("jobs", id),
+    };
+    let verb = match (target, action) {
+        (_, ActionKind::Retry) | (ActionTarget::Pipeline { .. }, ActionKind::RetryFailed) => {
+            "retry"
+        }
+        (_, ActionKind::Cancel) => "cancel",
+        (ActionTarget::Job { .. }, ActionKind::Play) => "play",
+        (ActionTarget::Job { .. }, ActionKind::RetryFailed) => {
+            return Err(unsupported_action("GitLab retries a job with Retry."));
+        }
+        (ActionTarget::Pipeline { .. }, ActionKind::Play) => {
+            return Err(unsupported_action("GitLab runs manual jobs one at a time."));
+        }
+    };
+    Ok(format!("{base}/{kind}/{id}/{verb}"))
+}
+
+/// GitLab answers an action with the pipeline, or with the job: a retried
+/// job is a new one, whose id the client opens.
+pub(crate) fn parse_action(
+    value: &Value,
+    target: ActionTarget,
+) -> Result<ActionResult, PullRequestsOperationError> {
+    let id = value["id"]
+        .as_u64()
+        .filter(|id| *id > 0)
+        .ok_or_else(|| invalid(ACTION_OP))?;
+    Ok(match target {
+        ActionTarget::Pipeline { .. } => ActionResult {
+            pipeline_id: Some(id),
+            job_id: None,
+        },
+        ActionTarget::Job { .. } => ActionResult {
+            pipeline_id: value["pipeline"]["id"].as_u64().filter(|id| *id > 0),
+            job_id: Some(id),
+        },
+    })
+}
+
+/// GitLab answers 403 both for a refused account and for a job whose state
+/// moved on ("Job is not retryable", "not playable"): the latter is about the
+/// job, so its copy says to refresh instead of claiming a missing permission.
+fn action_failure(failure: &ProcessFailure) -> PullRequestsOperationError {
+    let stderr = failure.stderr.to_lowercase();
+    let state = if stderr.contains("not retryable") {
+        Some("This job can't be retried now. Refresh to see its status.")
+    } else if stderr.contains("not playable") {
+        Some("This job can't be run now. Refresh to see its status.")
+    } else {
+        None
+    };
+    match state {
+        Some(message) => {
+            let mut error = PullRequestsOperationError::new(ACTION_OP, "host_rejected");
+            error.message = message.into();
+            error
+        }
+        None => read_failure(ACTION_OP, "glab", failure),
+    }
+}
+
 fn list_scope(scope: ListScope) -> Value {
     match scope {
         ListScope::All => Value::Null,
@@ -774,6 +846,31 @@ impl PipelineHost for GitLabHost {
                 bytes,
                 dropped: output.dropped_bytes as u64,
             })
+        })
+    }
+
+    /// `POST pipelines/:id/retry|cancel` or `jobs/:id/retry|cancel|play`,
+    /// with `-i` so a 429 keeps GitLab's own pause.
+    fn run_action<'a>(
+        &'a self,
+        scope: &'a HostScope,
+        _context: &'a HostContext,
+        target: ActionTarget,
+        action: ActionKind,
+        c: &'a CancellationToken,
+    ) -> HostFuture<'a, ActionResult> {
+        Box::pin(async move {
+            let path = action_path(scope, target, action)?;
+            let started = std::time::Instant::now();
+            let output = self
+                .runner
+                .glab_api_raw(scope, &path, Some(&json!({})), true, Budget::Read, c)
+                .await;
+            super::trace_gitlab_read(ACTION_OP, "action", started);
+            let output = output.map_err(|failure| action_failure(&failure))?;
+            let (_, body) = backoff::split_response(&output.stdout);
+            let value: Value = serde_json::from_slice(body).map_err(|_| invalid(ACTION_OP))?;
+            parse_action(&value, target)
         })
     }
 }
@@ -1093,6 +1190,59 @@ mod process_tests {
     use crate::{pull_requests::host::HostCommandRunner, test_support::TestSandbox};
     use std::sync::Arc;
 
+    #[test]
+    fn gitlab_pipeline_actions_map_to_their_endpoints_and_return_the_new_job() {
+        let scope = HostScope {
+            cwd: std::path::PathBuf::from("checkout"),
+            host: "gitlab.example".into(),
+            repository: "team/repo".into(),
+            provider: crate::pull_requests::model::PullRequestsProvider::Gitlab,
+        };
+        let pipeline = ActionTarget::Pipeline { id: 4821 };
+        let job = ActionTarget::Job { id: 998 };
+        for (target, action, path) in [
+            (pipeline, ActionKind::Retry, "pipelines/4821/retry"),
+            (pipeline, ActionKind::RetryFailed, "pipelines/4821/retry"),
+            (pipeline, ActionKind::Cancel, "pipelines/4821/cancel"),
+            (job, ActionKind::Retry, "jobs/998/retry"),
+            (job, ActionKind::Cancel, "jobs/998/cancel"),
+            (job, ActionKind::Play, "jobs/998/play"),
+        ] {
+            assert_eq!(
+                action_path(&scope, target, action).unwrap(),
+                format!("projects/team%2Frepo/{path}"),
+                "{target:?} {action:?}"
+            );
+        }
+        for (target, action) in [(pipeline, ActionKind::Play), (job, ActionKind::RetryFailed)] {
+            assert_eq!(
+                action_path(&scope, target, action).unwrap_err().code,
+                "unavailable"
+            );
+        }
+        // A retried job is a new one in the same pipeline.
+        assert_eq!(
+            parse_action(&json!({"id": 1001, "pipeline": {"id": 4821}}), job).unwrap(),
+            ActionResult {
+                pipeline_id: Some(4821),
+                job_id: Some(1001)
+            }
+        );
+        assert_eq!(
+            parse_action(&json!({"id": 4821, "status": "pending"}), pipeline).unwrap(),
+            ActionResult {
+                pipeline_id: Some(4821),
+                job_id: None
+            }
+        );
+        assert_eq!(
+            parse_action(&json!({"message": "x"}), job)
+                .unwrap_err()
+                .code,
+            "invalid_response"
+        );
+    }
+
     fn scope(s: &TestSandbox) -> HostScope {
         HostScope {
             cwd: s.root().into(),
@@ -1253,6 +1403,88 @@ esac"#,
         assert_eq!(
             calls[1],
             "api projects/team%2Frepo/jobs/998/trace --hostname gitlab.example"
+        );
+    }
+
+    #[tokio::test]
+    async fn gitlab_actions_post_with_headers_and_a_429_keeps_gitlabs_pause() {
+        let s = TestSandbox::new("pipelines-action");
+        let glab = s.executable_script(
+            "glab",
+            r#"printf '%s\n' "$*" >> calls
+case "$*" in
+  *jobs/998/retry*) printf 'HTTP/2 201 Created\r\n\r\n{"id":1001,"pipeline":{"id":4821}}' ;;
+  *jobs/999/retry*) printf 'HTTP/2 403 Forbidden\r\n\r\n{"message":"403 Forbidden - Job is not retryable"}'
+     echo 'glab: 403 Forbidden - Job is not retryable (HTTP 403)' >&2; exit 1 ;;
+  *) printf 'HTTP/2 429 Too Many Requests\r\nRetry-After: 60\r\n\r\n{}'
+     echo 'glab: 429 Too Many Requests (HTTP 429)' >&2; exit 1 ;;
+esac"#,
+            "",
+        );
+        let host = GitLabHost::new(Arc::new(
+            HostCommandRunner::new(s.path("state")).with_commands("missing-gh", &glab, "git"),
+        ));
+        let c = CancellationToken::new();
+        let retried = host
+            .run_action(
+                &scope(&s),
+                &test_context(),
+                ActionTarget::Job { id: 998 },
+                ActionKind::Retry,
+                &c,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            retried,
+            ActionResult {
+                pipeline_id: Some(4821),
+                job_id: Some(1001)
+            }
+        );
+        let error = host
+            .run_action(
+                &scope(&s),
+                &test_context(),
+                ActionTarget::Pipeline { id: 4821 },
+                ActionKind::Cancel,
+                &c,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (error.code, error.retry_after_seconds),
+            ("rate_limited", Some(60))
+        );
+        let calls = std::fs::read_to_string(s.path("calls")).unwrap();
+        let calls: Vec<_> = calls.lines().collect();
+        assert!(
+            calls[0].starts_with("api -i --method POST projects/team%2Frepo/jobs/998/retry "),
+            "{}",
+            calls[0]
+        );
+        assert!(
+            calls[0].ends_with("--hostname gitlab.example"),
+            "{}",
+            calls[0]
+        );
+        assert!(calls[1].contains("projects/team%2Frepo/pipelines/4821/cancel"));
+
+        // A job already retried is about its state, not the account.
+        let moved_on = host
+            .run_action(
+                &scope(&s),
+                &test_context(),
+                ActionTarget::Job { id: 999 },
+                ActionKind::Retry,
+                &c,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(moved_on.code, "host_rejected");
+        assert_eq!(
+            moved_on.message,
+            "This job can't be retried now. Refresh to see its status."
         );
     }
 }

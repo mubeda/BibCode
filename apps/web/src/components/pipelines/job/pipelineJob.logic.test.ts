@@ -135,6 +135,28 @@ describe("job page logic", () => {
     ).toEqual({ allowed: false, reason: "You don't have permission to retry this job." });
   });
 
+  it("offers a GitHub job Retry alone, and names GitHub's refusal of it", () => {
+    const running = pipelineJob({
+      status: "running",
+      terminal: false,
+      permissions: { retry: "unknown", cancel: "denied", play: "denied" },
+    });
+    expect(pipelineJobActions(running, null, "github", "write")).toEqual({
+      retry: null,
+      cancel: null,
+      play: null,
+    });
+    const refused = pipelineJob({
+      permissions: { retry: "denied", cancel: "denied", play: "denied" },
+    });
+    expect(pipelineJobActions(refused, null, "github", "admin").retry?.reason).toBe(
+      "GitHub refused: this sign-in can't run Actions for this repository. A fine-grained token needs Actions write.",
+    );
+    expect(pipelineJobActions(refused, null, "github", "read").retry?.reason).toBe(
+      "You need write access to this repository to re-run jobs.",
+    );
+  });
+
   it("builds GitLab's artifact pages on the job's web URL", () => {
     expect(gitlabArtifactLinks("https://gitlab.com/acme/repo/-/jobs/998/")).toEqual({
       download: "https://gitlab.com/acme/repo/-/jobs/998/artifacts/download",

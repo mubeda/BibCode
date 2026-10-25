@@ -4,7 +4,7 @@ import { ChevronRightIcon, CircleStopIcon, PlayIcon, RotateCcwIcon } from "lucid
 import { memo, useState, type ReactNode } from "react";
 import { cn } from "../../../lib/utils";
 import { RepositoryModuleExternalLink } from "../../repositoryModule/RepositoryModuleExternalLink";
-import { PermissionButton } from "../../ui/permission-button";
+import { PipelineActions } from "../actions/PipelineActions";
 import { PipelineStatusIcon } from "../shared/PipelineStatusIcon";
 import { formatPipelineDuration, pipelineStatusText } from "../shared/pipelineStatus.logic";
 import { usePipelineLinks } from "./PipelineLinks";
@@ -63,14 +63,14 @@ const JobRow = memo(function JobRow({
         </RepositoryModuleExternalLink>
       ) : null}
       {action !== null && ActionIcon !== null ? (
-        <PermissionButton
+        <PipelineActions.Button
           variant="ghost"
           size="icon-sm"
           aria-label={action.label}
+          request={{ target: { _tag: "job", id: job.id }, action: action.kind }}
           permission={action.permission}
-        >
-          <ActionIcon aria-hidden="true" />
-        </PermissionButton>
+          icon={<ActionIcon aria-hidden="true" />}
+        />
       ) : null}
     </li>
   );

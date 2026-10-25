@@ -52,6 +52,7 @@ import {
   PullRequestsSubscribeInput,
 } from "./pullRequests.ts";
 import {
+  PipelinesActionResult,
   PipelinesChanged,
   PipelinesDetail,
   PipelinesGetInput,
@@ -61,6 +62,7 @@ import {
   PipelinesJobLogInput,
   PipelinesListInput,
   PipelinesListPage,
+  PipelinesRunActionInput,
   PipelinesSnapshot,
   PipelinesSubscribeInput,
 } from "./pipelines.ts";
@@ -553,6 +555,7 @@ export const WS_METHODS = {
   pipelinesGetJobLog: "pipelines.getJobLog",
   pipelinesReadSnapshot: "pipelines.readSnapshot",
   pipelinesSubscribe: "pipelines.subscribe",
+  pipelinesRunAction: "pipelines.runAction",
 
   // Git workflow methods
   gitRunStackedAction: "git.runStackedAction",
@@ -1561,6 +1564,13 @@ export const WsPipelinesSubscribeRpc = Rpc.make(WS_METHODS.pipelinesSubscribe, {
   stream: true,
 });
 
+/** Retry, cancel or play a pipeline or job; served when `pipelinesMutations` is advertised. */
+export const WsPipelinesRunActionRpc = Rpc.make(WS_METHODS.pipelinesRunAction, {
+  payload: PipelinesRunActionInput,
+  success: PipelinesActionResult,
+  error: PullRequestsOperationError,
+});
+
 /**
  * Ephemeral live diff preview for compact/mobile surfaces.
  * Not the persisted BiBCode Review model. Future review sessions should use
@@ -2092,6 +2102,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsPipelinesGetJobLogRpc,
   WsPipelinesReadSnapshotRpc,
   WsPipelinesSubscribeRpc,
+  WsPipelinesRunActionRpc,
   WsReviewGetDiffPreviewRpc,
   WsTerminalOpenRpc,
   WsTerminalAttachRpc,

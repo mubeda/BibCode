@@ -9,8 +9,9 @@ use std::{
 
 use super::{
     model::{
-        Commit, Detail, DetailStage, Job, JobDetail, JobGroup, JobKind, JobPermissions, ListInput,
-        ListScope, Permission, PipelineRef, RefKind, Refresh, Row,
+        ActionKind, ActionResult, ActionTarget, Commit, Detail, DetailStage, Job, JobDetail,
+        JobGroup, JobKind, JobPermissions, ListInput, ListScope, Permission, PipelineRef, RefKind,
+        Refresh, Row, RowPermissions,
     },
     *,
 };
@@ -167,6 +168,8 @@ pub(super) struct FakeHost {
     pub details: Mutex<HashMap<u64, Answer<Detail>>>,
     pub jobs: Mutex<HashMap<u64, Answer<JobDetail>>>,
     pub trace: Mutex<FakeTrace>,
+    /// What an action answers; GitLab's job retry by default.
+    pub action: Mutex<Option<Answer<ActionResult>>>,
     /// Held reads wait here until notified.
     pub hold: Mutex<Option<Arc<tokio::sync::Notify>>>,
     pub ranged: bool,
@@ -309,6 +312,44 @@ impl PipelineHost for FakeHost {
             Ok(TraceRead { bytes, dropped: 0 })
         })
     }
+
+    fn run_action<'a>(
+        &'a self,
+        _scope: &'a HostScope,
+        _context: &'a HostContext,
+        target: ActionTarget,
+        action: ActionKind,
+        c: &'a CancellationToken,
+    ) -> HostFuture<'a, ActionResult> {
+        Box::pin(async move {
+            self.record(format!("action {target:?} {action:?}"));
+            self.held(c).await?;
+            lock(&self.action)
+                .clone()
+                .unwrap_or(Answer::Ok(ActionResult {
+                    pipeline_id: Some(4821),
+                    job_id: Some(1001),
+                }))
+                .get(ACTION_OP)
+        })
+    }
+}
+
+/// A pipeline whose actions the host neither granted nor refused (GitHub write).
+#[cfg(unix)]
+pub(super) fn unknown_permissions(mut detail: Detail) -> Detail {
+    detail.pipeline.permissions = Some(RowPermissions {
+        retry: Permission::Unknown,
+        cancel: Permission::Unknown,
+    });
+    for stage in detail.stages.iter_mut().flatten() {
+        for group in &mut stage.groups {
+            for job in &mut group.jobs {
+                job.permissions.retry = Permission::Unknown;
+            }
+        }
+    }
+    detail
 }
 
 #[cfg(unix)]
@@ -338,6 +379,8 @@ mod service {
     /// reads (and logs every call), `git` names the remote. The pipelines
     /// reads themselves go to `fake`.
     struct Bench {
+        /// The host the checkout's remote names.
+        host: &'static str,
         s: TestSandbox,
         database: Database,
         prs: PullRequestsService,
@@ -382,6 +425,43 @@ esac"#,
         let fake = FakeHost::gitlab();
         let service = PipelinesService::with_hosts(prs.clone(), fake.clone(), fake.clone());
         Bench {
+            host: HOST,
+            s,
+            database,
+            prs,
+            service,
+            fake,
+        }
+    }
+
+    /// A GitHub checkout: `gh` answers the sign-in, the context is
+    /// `GitHubContextHost`'s, and the pipelines reads and actions go to `fake`.
+    async fn github_bench(name: &str) -> Bench {
+        let s = TestSandbox::new(name);
+        let gh = s.executable_script(
+            "gh",
+            r#"case "$1 $2" in
+  '--version ') echo 'gh version 2.97.0' ;;
+  'auth status') echo '{"hosts":{"github.com":[{"state":"success","active":true,"host":"github.com","login":"viewer"}]}}' ;;
+  *) exit 64 ;;
+esac"#,
+            "",
+        );
+        let git = s.executable_script("git", "printf '%s' 'git@github.com:team/repo.git'", "");
+        let database = new_database().await;
+        let context_host = Arc::new(GitHubContextHost);
+        let prs = PullRequestsService {
+            github: context_host.clone(),
+            gitlab: context_host,
+            database: Some(database.clone()),
+            ..PullRequestsService::with_runner(
+                HostCommandRunner::new(s.path("state")).with_commands(&gh, "missing-glab", &git),
+            )
+        };
+        let fake = FakeHost::gitlab();
+        let service = PipelinesService::with_hosts(prs.clone(), fake.clone(), fake.clone());
+        Bench {
+            host: "github.com",
             s,
             database,
             prs,
@@ -443,9 +523,10 @@ esac"#,
 
         async fn row(&self, kind: &'static str, key: &str) -> Option<StoredSnapshot> {
             let key = key.to_owned();
+            let host = self.host;
             self.database
                 .call(move |connection| {
-                    Ok(SnapshotStore::new(connection).get(HOST, "team/repo", kind, &key)?)
+                    Ok(SnapshotStore::new(connection).get(host, "team/repo", kind, &key)?)
                 })
                 .await
                 .unwrap()
@@ -453,10 +534,11 @@ esac"#,
 
         async fn put(&self, kind: &'static str, key: &str, payload: Vec<u8>) {
             let key = key.to_owned();
+            let host = self.host;
             self.database
                 .call(move |connection| {
                     Ok(SnapshotStore::new(connection).put(StoredSnapshot {
-                        host: HOST.into(),
+                        host: host.into(),
                         project: "team/repo".into(),
                         kind: kind.into(),
                         key,
@@ -1120,6 +1202,206 @@ esac"#,
             .await
             .unwrap_err();
         assert_eq!(error.code, "not_found", "only a 404 on the job itself");
+    }
+
+    fn action_input(b: &Bench, target: ActionTarget, action: ActionKind) -> RunActionInput {
+        RunActionInput {
+            cwd: b.cwd(),
+            target,
+            action,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_double_click_sends_one_action_and_both_receive_the_new_job() {
+        let b = bench("pipelines-action-once").await;
+        let hold = Arc::new(tokio::sync::Notify::new());
+        *lock(&b.fake.hold) = Some(hold.clone());
+        let input = action_input(&b, ActionTarget::Job { id: 998 }, ActionKind::Retry);
+        let token = c();
+        let first = b.service.run_action(input.clone(), &token);
+        let second = b.service.run_action(input.clone(), &token);
+        let release = async {
+            // Both clicks reach the flight before the host answers.
+            while b.fake.calls("action") == 0 {
+                tokio::task::yield_now().await;
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            for _ in 0..50 {
+                tokio::task::yield_now().await;
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            hold.notify_waiters();
+        };
+        let (first, second, ()) = tokio::join!(first, second, release);
+        let expected = ActionResult {
+            pipeline_id: Some(4821),
+            job_id: Some(1001),
+        };
+        assert_eq!(first.unwrap(), expected);
+        assert_eq!(second.unwrap(), expected);
+        assert_eq!(b.fake.calls("action"), 1, "one request for a double click");
+        *lock(&b.fake.hold) = None;
+        // A later click is a new action.
+        b.service.run_action(input, &c()).await.unwrap();
+        assert_eq!(b.fake.calls("action"), 2);
+    }
+
+    #[tokio::test]
+    async fn an_action_during_host_backoff_is_refused_with_no_host_call_and_a_429_backs_off() {
+        let b = bench("pipelines-action-held").await;
+        let input = action_input(&b, ActionTarget::Job { id: 998 }, ActionKind::Retry);
+        *lock(&b.fake.action) = Some(Answer::Err("rate_limited", Some(60)));
+        let error = b.service.run_action(input.clone(), &c()).await.unwrap_err();
+        assert_eq!(error.code, "rate_limited");
+        assert_eq!(error.operation, "pipelines.runAction");
+        assert_eq!(
+            error.message,
+            "GitLab allows a job three retries a minute. Try again in 60 s."
+        );
+        assert!(b.prs.pollers.host_backoff().remaining(HOST).is_some());
+        let error = b.service.run_action(input, &c()).await.unwrap_err();
+        assert_eq!(error.code, "rate_limited");
+        assert_eq!(b.fake.calls("action"), 1, "a paused host gets no POST");
+    }
+
+    #[tokio::test]
+    async fn a_github_refusal_is_remembered_until_rescan_and_keeps_the_context_and_rows() {
+        let b = github_bench("pipelines-action-refused").await;
+        b.open().await;
+        b.put("detail", "3941", b"{}".to_vec()).await;
+        lock(&b.fake.details).insert(
+            4821,
+            Answer::Ok(unknown_permissions(detail(
+                4821,
+                PipelineStatus::Failed,
+                &[(998, PipelineStatus::Failed)],
+            ))),
+        );
+        b.service.get(b.get_input(4821), &c()).await.unwrap();
+        *lock(&b.fake.action) = Some(Answer::Err("forbidden", None));
+        let input = action_input(&b, ActionTarget::Pipeline { id: 4821 }, ActionKind::Retry);
+        let error = b.service.run_action(input.clone(), &c()).await.unwrap_err();
+        assert_eq!(error.code, "forbidden");
+        assert_eq!(
+            error.message,
+            "GitHub refused: this sign-in can't run Actions for this repository. A \
+             fine-grained token needs Actions write."
+        );
+        // A refused action is not a lost sign-in.
+        assert!(b.row(CONTEXT_KIND, "").await.is_some());
+        assert!(b.row("detail", "3941").await.is_some());
+        assert!(b.row(DETAIL_KIND, "4821").await.is_some());
+
+        // Remembered: the next click is refused with no host call, and every
+        // read and stored copy of the repository shows the action denied.
+        let again = b.service.run_action(input, &c()).await.unwrap_err();
+        assert_eq!(again.code, "forbidden");
+        assert_eq!(b.fake.calls("action"), 1);
+        let shown = b.service.get(b.get_input(4821), &c()).await.unwrap();
+        let permissions = shown.pipeline.permissions.clone().unwrap();
+        assert_eq!(
+            (permissions.retry, permissions.cancel),
+            (Permission::Denied, Permission::Unknown)
+        );
+        assert_eq!(
+            shown.jobs().next().unwrap().permissions.retry,
+            Permission::Denied
+        );
+        let painted = b
+            .service
+            .read_snapshot(b.snapshot_input(Some(4821), None), &c())
+            .await
+            .unwrap()
+            .detail
+            .unwrap()
+            .payload;
+        assert_eq!(
+            painted.pipeline.permissions.unwrap().retry,
+            Permission::Denied
+        );
+        // The stored copy keeps the host's own answer.
+        let stored: Detail =
+            decode_row(&b.row(DETAIL_KIND, "4821").await.unwrap().payload, "viewer").unwrap();
+        assert_eq!(
+            stored.pipeline.permissions.unwrap().retry,
+            Permission::Unknown
+        );
+
+        let _ = b.prs.context(b.s.root(), ContextRead::Rescan, &c()).await;
+        let shown = b.service.get(b.get_input(4821), &c()).await.unwrap();
+        assert_eq!(
+            shown.pipeline.permissions.unwrap().retry,
+            Permission::Unknown,
+            "a rescan forgets the refusal"
+        );
+    }
+
+    /// GitLab reports its permissions on every read, and answers 403 for a
+    /// job whose state moved on too: its refusal is shown, not remembered.
+    #[tokio::test]
+    async fn a_gitlab_refusal_is_shown_and_not_remembered() {
+        let b = bench("pipelines-action-gitlab-refused").await;
+        b.open().await;
+        lock(&b.fake.details).insert(
+            4821,
+            Answer::Ok(unknown_permissions(detail(
+                4821,
+                PipelineStatus::Failed,
+                &[(998, PipelineStatus::Failed)],
+            ))),
+        );
+        *lock(&b.fake.action) = Some(Answer::Err("forbidden", None));
+        let input = action_input(&b, ActionTarget::Pipeline { id: 4821 }, ActionKind::Retry);
+        let error = b.service.run_action(input.clone(), &c()).await.unwrap_err();
+        assert_eq!(
+            error.message,
+            "GitLab refused: this account can't retry this pipeline."
+        );
+        assert!(b.row(CONTEXT_KIND, "").await.is_some());
+        b.service.run_action(input, &c()).await.unwrap_err();
+        assert_eq!(
+            b.fake.calls("action"),
+            2,
+            "the next click asks GitLab again"
+        );
+        let shown = b.service.get(b.get_input(4821), &c()).await.unwrap();
+        assert_eq!(
+            shown.pipeline.permissions.unwrap().retry,
+            Permission::Unknown
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_target_says_so_and_drops_only_its_rows() {
+        let b = bench("pipelines-action-missing").await;
+        b.put(JOB_KIND, "998", b"{}".to_vec()).await;
+        b.put(DETAIL_KIND, "4821", b"{}".to_vec()).await;
+        *lock(&b.fake.action) = Some(Answer::Err("not_found", None));
+        let error = b
+            .service
+            .run_action(
+                action_input(&b, ActionTarget::Job { id: 998 }, ActionKind::Play),
+                &c(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.message, "This job no longer exists.");
+        assert!(b.row(JOB_KIND, "998").await.is_none());
+        assert!(b.row(DETAIL_KIND, "4821").await.is_some());
+    }
+
+    #[test]
+    fn a_github_refusal_names_actions_write() {
+        assert_eq!(
+            refusal_message(
+                PullRequestsProvider::Github,
+                ActionTarget::Pipeline { id: 1 },
+                ActionKind::Cancel,
+            ),
+            "GitHub refused: this sign-in can't run Actions for this repository. A \
+             fine-grained token needs Actions write."
+        );
     }
 
     #[tokio::test]
@@ -1968,6 +2250,37 @@ mod poller {
         drive(&mut subs).await;
         tick(&mut subs, 20).await;
         assert!(lock(&b.host.calls).is_empty());
+        c.cancel();
+        drive(&mut subs).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pipelines_poller_reads_a_left_terminal_pipeline_again_once_an_action_rearms_it() {
+        let b = bench().await;
+        b.set(4821, PipelineStatus::Failed);
+        let inputs = b.inputs();
+        let emit = |_| true;
+        let c = CancellationToken::new();
+        let mut subs = [b.subscriber(&inputs, Some(4821), &emit, &c)];
+        drive(&mut subs).await;
+        tick(&mut subs, 10).await;
+        tick(&mut subs, 10).await;
+        tick(&mut subs, 20).await;
+        assert_eq!(
+            b.host.calls("detail 4821"),
+            2,
+            "terminal: read once more, then left"
+        );
+
+        // A retry made it run again.
+        b.running(4821);
+        b.registry.rearm("gitlab.example", "team/repo", 4821);
+        // The same id in another project is another pipeline.
+        b.registry.rearm("gitlab.example", "team/other", 4821);
+        tick(&mut subs, 20).await;
+        assert_eq!(b.host.calls("detail 4821"), 3);
+        tick(&mut subs, 10).await;
+        assert_eq!(b.host.calls("detail 4821"), 4, "every 10 s while running");
         c.cancel();
         drive(&mut subs).await;
     }

@@ -5,7 +5,7 @@ import {
   type PipelinesDetail,
   type PullRequestsProviderKind,
 } from "@bibcode/contracts";
-import { Link } from "@tanstack/react-router";
+import { Link, useNavigate } from "@tanstack/react-router";
 import * as Schema from "effect/Schema";
 import {
   useCallback,
@@ -30,6 +30,9 @@ import { keepNewestCopy, type KeptCopy } from "../../repositoryModule/snapshotDi
 import { useVisibleModuleRefresh } from "../../repositoryModule/useVisibleModuleRefresh";
 import { PermissionButton } from "../../ui/permission-button";
 import { Skeleton } from "../../ui/skeleton";
+import { PipelineActions, type PipelineActionOutcome } from "../actions/PipelineActions";
+import { pipelineActionDestination } from "../actions/pipelineActions.logic";
+import { pipelineJobLink } from "../job/pipelineJobRoute";
 import { buildPipelinesListInput } from "../list/pipelinesList.logic";
 import { pipelineStatusText } from "../shared/pipelineStatus.logic";
 import { useFinishedAnnouncement } from "../shared/useFinishedAnnouncement";
@@ -272,6 +275,48 @@ export function PipelinesDetailView({
   const refresh = detailQuery.refresh;
   useImperativeHandle(ref, () => ({ refresh }), [refresh]);
 
+  // A GitLab job retry opens the new job; a GitHub re-run of an earlier attempt opens
+  // the run's latest. Anything else re-reads this page.
+  const navigate = useNavigate();
+  const { environmentId: routeEnvironmentId, projectId } = projectRef;
+  const onActionSettled = useCallback(
+    ({ request, result }: PipelineActionOutcome) => {
+      const destination =
+        result === null
+          ? null
+          : pipelineActionDestination({
+              provider,
+              request,
+              result,
+              shown: { pipelineId, attempt, jobId: null },
+            });
+      if (destination?.kind === "job") {
+        void navigate(
+          pipelineJobLink({
+            environmentId: routeEnvironmentId,
+            projectId,
+            pipelineId: destination.pipelineId,
+            jobId: destination.jobId,
+          }),
+        );
+        return;
+      }
+      if (destination?.kind === "pipeline") {
+        void navigate({
+          to: "/project/$environmentId/$projectId/pipelines/$pipelineId",
+          params: {
+            environmentId: routeEnvironmentId,
+            projectId,
+            pipelineId: String(destination.pipelineId),
+          },
+        });
+        return;
+      }
+      revalidateDetail();
+    },
+    [attempt, navigate, pipelineId, projectId, provider, revalidateDetail, routeEnvironmentId],
+  );
+
   const statusText =
     detail === null
       ? ""
@@ -357,53 +402,63 @@ export function PipelinesDetailView({
     [provider, shown],
   );
   return (
-    <div
-      className="@container/pipeline flex min-h-0 min-w-0 flex-1 flex-col overflow-y-auto"
-      data-text-surface="background"
+    <PipelineActions.Provider
+      scope={scope}
+      provider={provider}
+      revision={shown?.revision ?? null}
+      onSettled={onActionSettled}
     >
-      <div className="px-4 pt-2">
-        <BackToPipelines projectRef={projectRef} />
-      </div>
-      {alert}
-      {shown !== null ? (
-        <>
-          <PipelineDetailHeader
-            detail={shown}
-            provider={provider}
-            projectRef={projectRef}
-            mutationsDisabledReason={mutationsDisabledReason}
-          >
-            {attemptOptions ? (
-              <PipelineAttemptSelect
-                options={attemptOptions}
-                projectRef={projectRef}
-                pipelineId={pipelineId}
-              />
-            ) : null}
-          </PipelineDetailHeader>
-          <div className="space-y-4 p-4">
-            <TruncationNotice detail={shown} provider={provider} />
-            {columns === null ? (
-              <p className="text-sm text-muted-foreground">You can't view this pipeline's jobs.</p>
-            ) : (
-              <PipelineStageColumns
-                stages={columns}
-                mutationsDisabledReason={mutationsDisabledReason}
-              />
-            )}
-            <PipelineArtifacts detail={shown} />
-          </div>
-        </>
-      ) : message === null ? (
-        <div role="status" className="space-y-3 p-4">
-          <span className="sr-only">Loading pipeline…</span>
-          <Skeleton className="h-16 w-full" />
-          <Skeleton className="h-40 w-full" />
+      <div
+        className="@container/pipeline flex min-h-0 min-w-0 flex-1 flex-col overflow-y-auto"
+        data-text-surface="background"
+      >
+        <div className="px-4 pt-2">
+          <BackToPipelines projectRef={projectRef} />
         </div>
-      ) : null}
-      <p aria-live="polite" className="sr-only">
-        {announcement}
-      </p>
-    </div>
+        {alert}
+        {shown !== null ? (
+          <>
+            <PipelineDetailHeader
+              detail={shown}
+              provider={provider}
+              projectRef={projectRef}
+              mutationsDisabledReason={mutationsDisabledReason}
+              repositoryPermission={context.repositoryPermission}
+            >
+              {attemptOptions ? (
+                <PipelineAttemptSelect
+                  options={attemptOptions}
+                  projectRef={projectRef}
+                  pipelineId={pipelineId}
+                />
+              ) : null}
+            </PipelineDetailHeader>
+            <div className="space-y-4 p-4">
+              <TruncationNotice detail={shown} provider={provider} />
+              {columns === null ? (
+                <p className="text-sm text-muted-foreground">
+                  You can't view this pipeline's jobs.
+                </p>
+              ) : (
+                <PipelineStageColumns
+                  stages={columns}
+                  mutationsDisabledReason={mutationsDisabledReason}
+                />
+              )}
+              <PipelineArtifacts detail={shown} />
+            </div>
+          </>
+        ) : message === null ? (
+          <div role="status" className="space-y-3 p-4">
+            <span className="sr-only">Loading pipeline…</span>
+            <Skeleton className="h-16 w-full" />
+            <Skeleton className="h-40 w-full" />
+          </div>
+        ) : null}
+        <p aria-live="polite" className="sr-only">
+          {announcement}
+        </p>
+      </div>
+    </PipelineActions.Provider>
   );
 }

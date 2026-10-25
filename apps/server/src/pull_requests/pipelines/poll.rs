@@ -103,6 +103,30 @@ impl Registry {
         }
     }
 
+    /// An action made this pipeline run again: every poller of the project
+    /// that watches it reads it on its next tick, even one that had left it
+    /// as terminal.
+    pub(crate) fn rearm(&self, host: &str, project: &str, pipeline: u64) {
+        let entries = lock(&self.entries);
+        for (key, entry) in entries.iter() {
+            if key.0 != host || key.1 != project {
+                continue;
+            }
+            let watchers = lock(&entry.shared.watchers);
+            if !watchers.iter().any(|w| w.pipeline == pipeline) {
+                continue;
+            }
+            let mut state = lock(&entry.shared.state);
+            let watched = state.pipelines.entry(pipeline).or_default();
+            // Its stored row may still say terminal: it is not checked again.
+            *watched = PipelineState {
+                checked: true,
+                revision: watched.revision,
+                ..PipelineState::default()
+            };
+        }
+    }
+
     fn release(&self, lease: &Lease<'_>) -> Option<Arc<Shared>> {
         let mut entries = lock(&self.entries);
         if let Some(pipeline) = lease.pipeline {

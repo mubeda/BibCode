@@ -2689,8 +2689,16 @@ See [RPC and orchestration](./rpc-and-orchestration.md) and
   16 MiB kept by `OutputPolicy::Tail`) into `LogCache`, server memory keyed by
   host, account login, project and job (64 MiB, 10 idle minutes, cleared on
   rescan and sign-out, served only within 30 s of a job read by the same
-  account). GitHub reads answer `unavailable` until the workflow runs reader
-  ships; `readSnapshot` serves both providers. In the web app both modules sit
+  account). `readSnapshot` serves both providers. `pipelines.runAction`
+  retries, cancels or plays one pipeline or job: admitted like a read (a
+  backed-off host gets no POST), single flight per target and action, a GitHub
+  `forbidden` remembered in `PipelinesState` per account and action kind until
+  the next rescan (reads then show that permission `denied`, stored rows keep
+  the host's answer), and a successful action re-arms every GitLab poller
+  watching the pipeline. The views run it through `PipelineActions`
+  (`components/pipelines/actions/`), which re-reads the page after every
+  answer and opens a retried GitLab job's new job or a GitHub run's latest
+  attempt. In the web app both modules sit
   on one shell, `components/repositoryModule/` (`RepositoryModule` with
   `useRepositoryModuleShell`): it alone resolves the module's setting, the
   environment connection, the server capability, the checkout (one per
