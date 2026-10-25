@@ -33,7 +33,7 @@ use tokio_util::sync::CancellationToken;
 use super::{
     DETAIL_KIND, LIST_KIND, PipelineHost, decode_row, detail_fingerprint, detail_key,
     list_fingerprint,
-    model::{Changed, Detail, ListInput, ListPage},
+    model::{Changed, Detail, ListInput, ListPage, Refusal},
     store_row,
 };
 use crate::{
@@ -178,6 +178,8 @@ struct PipelineState {
     checked: bool,
     /// The generation of its last stored row or refusal, cumulative.
     revision: i64,
+    /// Why its last read was refused; its views are told with its name.
+    refused: Option<Refusal>,
 }
 
 #[derive(Default)]
@@ -315,7 +317,10 @@ impl Shared {
                 .map(|w| {
                     (
                         w.pipeline,
-                        state.pipelines.get(&w.pipeline).map_or(0, |p| p.revision),
+                        state
+                            .pipelines
+                            .get(&w.pipeline)
+                            .map_or((0, None), |p| (p.revision, p.refused)),
                     )
                 })
                 .collect(),
@@ -328,7 +333,8 @@ impl Shared {
 #[derive(Clone)]
 struct Tick {
     list: i64,
-    pipelines: Vec<(u64, i64)>,
+    /// Each watched pipeline: its revision and, once refused, why.
+    pipelines: Vec<(u64, (i64, Option<Refusal>))>,
 }
 
 /// What one subscriber has been sent.
@@ -340,15 +346,21 @@ struct Delivery {
 
 impl Delivery {
     fn forward(&mut self, tick: &Tick, emit: &(dyn Fn(Changed) -> bool + Send + Sync)) {
-        let revision = self.pipeline.and_then(|id| {
+        let watched = self.pipeline.and_then(|id| {
             tick.pipelines
                 .iter()
                 .find(|(pipeline, _)| *pipeline == id)
-                .map(|(_, revision)| *revision)
+                .map(|(_, watched)| *watched)
         });
+        let revision = watched.map(|(revision, _)| revision);
+        let pipeline = revision.is_some_and(|revision| revision > self.pipeline_revision);
         let changed = Changed {
             list: tick.list > self.list,
-            pipeline: revision.is_some_and(|revision| revision > self.pipeline_revision),
+            pipeline,
+            // Its row is gone: the view learns why from the name itself.
+            refused: watched
+                .and_then(|(_, refused)| refused)
+                .filter(|_| pipeline),
         };
         if !changed.any() {
             return;
@@ -367,7 +379,7 @@ impl Delivery {
 enum Class {
     RateLimited(Option<Duration>),
     SignedOut,
-    Refused,
+    Refused(Refusal),
     Other,
 }
 
@@ -379,7 +391,8 @@ fn classify(error: &PullRequestsOperationError) -> Class {
                 .map(|seconds| Duration::from_secs(seconds.into())),
         ),
         "not_authenticated" => Class::SignedOut,
-        "forbidden" | "not_found" => Class::Refused,
+        "forbidden" => Class::Refused(Refusal::Forbidden),
+        "not_found" => Class::Refused(Refusal::NotFound),
         _ => Class::Other,
     }
 }
@@ -578,7 +591,7 @@ impl PollInputs<'_> {
                         failure,
                     };
                 }
-                Class::SignedOut | Class::Refused => {
+                Class::SignedOut | Class::Refused(_) => {
                     return TickReport {
                         end: TickEnd::Ended(error),
                         failure,
@@ -646,11 +659,12 @@ impl PollInputs<'_> {
                         }
                     }
                     Class::SignedOut => end = TickEnd::Ended(error),
-                    Class::Refused => {
+                    Class::Refused(refusal) => {
                         self.refuse_pipeline(id).await;
                         let mut state = lock(&shared.state);
                         let pipeline = state.pipelines.entry(id).or_default();
                         pipeline.done = true;
+                        pipeline.refused = Some(refusal);
                         pipeline.revision = generation;
                     }
                     Class::Other => {

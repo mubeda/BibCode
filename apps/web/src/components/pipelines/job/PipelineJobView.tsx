@@ -3,6 +3,7 @@ import {
   PullRequestsOperationError,
   type PipelinesDetail,
   type PipelinesJobDetail,
+  type PipelinesRefusal,
   type PullRequestsProviderKind,
 } from "@bibcode/contracts";
 import { Link, useNavigate } from "@tanstack/react-router";
@@ -147,8 +148,16 @@ export function PipelineJobView({
   );
   // Any success on the stream stands the pipeline timer down until it fails or waits.
   const paused = isGitlab && subscribeQuery.emission._tag === "Success";
+  // The poller's read of this job's pipeline was refused and its stored row dropped:
+  // the refusal replaces the job on screen until a Refresh reads the host again.
+  const [refusal, setRefusal] = useState<{
+    readonly target: typeof getTarget;
+    readonly code: PipelinesRefusal;
+  } | null>(null);
+  const refused = refusal !== null && refusal.target === getTarget ? refusal.code : null;
   const applySubscribedChange = useEffectEvent(
     (changed: NonNullable<typeof subscribeQuery.data>) => {
+      if (changed.refused) setRefusal({ target: getTarget, code: changed.refused });
       // The poller stored the new pipeline row: paint it, with no host read.
       if (changed.pipeline) snapshotQuery.revalidate();
     },
@@ -165,14 +174,14 @@ export function PipelineJobView({
     snapshotQuery.data?.detail?.payload,
   ]);
   if (detailChoice.kept !== keptDetail) setKeptDetail(detailChoice.kept);
-  const detail = detailChoice.shown;
+  const detail = refused === null ? detailChoice.shown : null;
   const [keptJob, setKeptJob] = useState<KeptCopy<PipelinesJobDetail> | null>(null);
   const jobChoice = keepNewestCopy(keptJob, jobId, [
     jobQuery.data,
     snapshotQuery.data?.job?.payload,
   ]);
   if (jobChoice.kept !== keptJob) setKeptJob(jobChoice.kept);
-  const jobDetail = jobChoice.shown;
+  const jobDetail = refused === null ? jobChoice.shown : null;
   const job = shownJob(detail, jobDetail, jobId);
   const stage = findPipelineJob(detail, jobId)?.stage ?? job?.stage ?? null;
   const pipeline = detail?.pipeline ?? null;
@@ -231,6 +240,7 @@ export function PipelineJobView({
       refreshContext?.();
   }, [detailError, jobError, refreshContext]);
   const refreshAll = useCallback(() => {
+    setRefusal(null);
     jobQuery.refresh();
     detailQuery.refresh();
   }, [detailQuery, jobQuery]);
@@ -350,7 +360,23 @@ export function PipelineJobView({
     job?.startedAt && Number.isFinite(Date.parse(job.startedAt))
       ? formatRelativeTimeLabel(job.startedAt)
       : null;
-  const blockingError = job === null ? jobError : null;
+  const refusedError = useMemo(
+    () =>
+      refused === null
+        ? null
+        : new PullRequestsOperationError({
+            operation: "pipelines.subscribe",
+            code: refused,
+            message:
+              refused === "forbidden"
+                ? "You can't view this pipeline."
+                : "This pipeline no longer exists.",
+            hostDetail: null,
+            retryable: false,
+          }),
+    [refused],
+  );
+  const blockingError = refusedError ?? (job === null ? jobError : null);
 
   return (
     <PipelineActions.Provider

@@ -466,6 +466,28 @@ describe("PipelineJobView", () => {
     await until(() => expect(container.textContent).toContain("done"));
   });
 
+  it("replaces the job with the poller's refusal of its pipeline, reading nothing more", async () => {
+    h.logAnswer = (input) => (input.from._tag === "tail" ? logChunk("start\n", 0, false) : null);
+    await render();
+    expect(container.textContent).toContain(running.name);
+    const reads = { ...h.reads };
+    const logReads = h.logReads.length;
+    // Access was revoked while the page was open: the poller dropped the stored row.
+    h.nextSnapshot = { list: null, detail: null, job: null };
+    h.changed = { list: false, pipeline: true, refused: "forbidden" };
+    await rerenderAll();
+    await flush();
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain(
+      "You can't view this job.",
+    );
+    expect(container.querySelector("h1")).toBeNull();
+    expect(container.textContent).not.toContain("Cancel");
+    await advance(HOUR);
+    expect(h.reads.get).toBe(reads.get);
+    expect(h.reads.getJob).toBe(reads.getJob);
+    expect(h.logReads).toHaveLength(logReads);
+  });
+
   it("opens a running log with at most four reads and pauses a too-large one until it finishes", async () => {
     h.logAnswers = [
       fullWindow(0),

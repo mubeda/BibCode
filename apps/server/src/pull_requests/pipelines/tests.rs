@@ -1982,6 +1982,7 @@ mod poller {
         let changed = Changed {
             list: true,
             pipeline: false,
+            refused: None,
         };
         assert_eq!(ticks(&log1), [changed]);
         assert_eq!(ticks(&log2), [changed]);
@@ -2145,7 +2146,8 @@ mod poller {
             ticks(&log),
             [Changed {
                 list: true,
-                pipeline: false
+                pipeline: false,
+                refused: None,
             }],
             "re-sent with the next tick"
         );
@@ -2261,13 +2263,45 @@ mod poller {
             b.host.calls("list") >= 3,
             "the rest of the key keeps polling"
         );
-        assert_eq!(
-            ticks(&log).iter().filter(|c| c.pipeline).count(),
-            1,
-            "named once"
+        let named: Vec<Changed> = ticks(&log).into_iter().filter(|c| c.pipeline).collect();
+        assert_eq!(named.len(), 1, "named once");
+        // Its stored row is gone: the event says why, so the view can say so.
+        assert_eq!(named[0].refused, Some(model::Refusal::Forbidden));
+        assert!(
+            ticks(&log)
+                .iter()
+                .all(|c| c.pipeline || c.refused.is_none()),
+            "only the pipeline name carries it"
         );
         assert!(subs[0].result.is_none(), "the subscriber stays");
         c.cancel();
+        drive(&mut subs).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pipelines_poller_a_window_that_joins_after_a_refusal_is_told_it_too() {
+        let b = bench().await;
+        lock(&b.host.details).insert(4821, Answer::Err("not_found", None));
+        let inputs = b.inputs();
+        let (first_log, late_log) = (Log::default(), Log::default());
+        let (first_emit, late_emit) = (emitter(&first_log), emitter(&late_log));
+        let (c1, c2) = (CancellationToken::new(), CancellationToken::new());
+        let mut first = [b.subscriber(&inputs, Some(4821), &first_emit, &c1)];
+        drive(&mut first).await;
+        tick(&mut first, 10).await;
+        let [first] = first;
+        let mut subs = [first, b.subscriber(&inputs, Some(4821), &late_emit, &c2)];
+        drive(&mut subs).await;
+        tick(&mut subs, 20).await;
+        assert_eq!(b.host.calls("detail 4821"), 1, "never read again");
+        assert!(
+            ticks(&late_log)
+                .iter()
+                .any(|c| c.pipeline && c.refused == Some(model::Refusal::NotFound)),
+            "the late window learns the pipeline is gone"
+        );
+        c1.cancel();
+        c2.cancel();
         drive(&mut subs).await;
     }
 
@@ -2407,6 +2441,7 @@ mod poller {
             [Changed {
                 list: true,
                 pipeline: true,
+                refused: None,
             }]
         );
         c.cancel();
