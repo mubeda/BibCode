@@ -1186,7 +1186,7 @@ fn interrupted_result<T>(
 ) -> Result<T, PullRequestsOperationError> {
     // A mutation may already have posted comments. Preserve its settled result
     // after cleanup instead of replacing that receipt with an ambiguous timeout.
-    if operation == action::OP || operation == checkout::OP {
+    if operation == action::OP || operation == checkout::OP || operation == pipelines::ACTION_OP {
         result
     } else {
         Err(PullRequestsOperationError::new(operation, "timeout"))

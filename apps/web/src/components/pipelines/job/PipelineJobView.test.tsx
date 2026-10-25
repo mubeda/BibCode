@@ -39,6 +39,7 @@ const h = vi.hoisted(() => ({
   logAnswers: [] as PipelinesJobLog[],
   logAnswer: null as ((input: PipelinesJobLogInput) => PipelinesJobLog | null) | null,
   navigate: vi.fn(),
+  actions: [] as unknown[],
   pending: new Set<string>(),
   inflight: [] as (() => void)[],
 }));
@@ -52,6 +53,7 @@ vi.mock("../../../state/pipelines", () => {
       subscribe: atom("subscribe"),
       requestTimerRead: h.timerReads,
       getJobLog: { label: "environment-data:pipelines:get-job-log" },
+      runAction: { label: "environment-data:pipelines:run-action" },
     },
   };
 });
@@ -105,11 +107,16 @@ vi.mock("../../../state/query", () => ({
   },
 }));
 vi.mock("../../../state/use-atom-command", () => ({
-  useAtomCommand: () => async (value: { input: PipelinesJobLogInput }) => {
-    h.logReads.push(value.input);
-    const next = h.logAnswer?.(value.input) ?? h.logAnswers.shift() ?? null;
-    return next === null ? new Promise(() => {}) : AsyncResult.success(next);
-  },
+  useAtomCommand:
+    (command: { label: string }) => async (value: { input: PipelinesJobLogInput }) => {
+      if (command.label === "environment-data:pipelines:run-action") {
+        h.actions.push(value.input);
+        return AsyncResult.success({ pipelineId: 4821, jobId: 1001 });
+      }
+      h.logReads.push(value.input);
+      const next = h.logAnswer?.(value.input) ?? h.logAnswers.shift() ?? null;
+      return next === null ? new Promise(() => {}) : AsyncResult.success(next);
+    },
 }));
 vi.mock("../log/jobLogEngine", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../log/jobLogEngine")>();
@@ -538,5 +545,68 @@ describe("PipelineJobView", () => {
       [...details.querySelectorAll("a")].map((link) => link.textContent).filter(Boolean),
     ).toEqual(expect.arrayContaining(["rspec3m 0s", "rubocop3m 0s"]));
     expect(details.textContent).not.toContain("Timeout");
+  });
+});
+
+/** A server that serves `pipelines.runAction`. */
+function readyModuleValue(provider: "gitlab" | "github"): RepositoryModuleValue {
+  const base = moduleValue(provider);
+  return { ...base, meta: { ...base.meta, mutationsDisabledReason: null } };
+}
+
+describe("PipelineJobView actions", () => {
+  async function renderReady(provider: "gitlab" | "github") {
+    const value = readyModuleValue(provider);
+    await act(async () =>
+      root.render(
+        <RepositoryModule.Provider value={value}>
+          <PipelineJobView
+            filters={DEFAULT_PIPELINES_FILTERS}
+            pipelineId={4821}
+            jobId={998}
+            at={null}
+          />
+        </RepositoryModule.Provider>,
+      ),
+    );
+    await flush();
+  }
+  const labels = () =>
+    [...container.querySelectorAll("button")].map((button) => button.textContent ?? "");
+
+  it("opens the new job after a GitLab job retry", async () => {
+    const failed = pipelineJob();
+    h.detail = pipelineDetail([failed]);
+    h.job = pipelineJobDetail({ job: failed });
+    h.actions = [];
+    h.navigate.mockClear();
+    await renderReady("gitlab");
+    const retry = [...container.querySelectorAll("button")].find(
+      (button) => button.textContent === "Retry",
+    )!;
+    await act(async () => retry.click());
+    await flush();
+    expect(h.actions).toEqual([
+      { cwd: "/repo", target: { _tag: "job", id: 998 }, action: "retry" },
+    ]);
+    expect(h.navigate).toHaveBeenCalledWith({
+      to: "/project/$environmentId/$projectId/pipelines/$pipelineId/jobs/$jobId",
+      params: { environmentId: "env", projectId: "p", pipelineId: "4821", jobId: "1001" },
+      search: {},
+    });
+  });
+
+  it("offers a running GitHub job no Cancel, since GitHub cancels whole runs", async () => {
+    const job = pipelineJob({
+      status: "running",
+      terminal: false,
+      finishedAt: null,
+      permissions: { retry: "unknown", cancel: "denied", play: "denied" },
+    });
+    h.detail = pipelineDetail([job], { pipeline: runningRow });
+    h.job = pipelineJobDetail({ job, attempt: 1 });
+    await renderReady("github");
+    expect(labels()).not.toContain("Cancel");
+    expect(labels()).not.toContain("Retry");
   });
 });

@@ -4,8 +4,14 @@ import type {
   PipelinesJobDetail,
   PipelinesJobPermissions,
   PipelinesSubscribeInput,
+  PullRequestsProviderKind,
 } from "@bibcode/contracts";
 import type { PipelinesFilters } from "../../../pipelinesStore";
+import {
+  GITHUB_ACTIONS_REFUSED,
+  githubRefused,
+  type RepositoryPermission,
+} from "../actions/pipelineActions.logic";
 import { buildPipelinesListInput, listSnapshotInput } from "../list/pipelinesList.logic";
 
 /**
@@ -98,9 +104,11 @@ function jobPermission(
   action: keyof PipelinesJobPermissions,
   permissions: PipelinesJobPermissions,
   mutationsDisabledReason: string | null,
+  refused: string | null,
 ): JobActionPermission {
   // The host's refusal comes first: no server update lets a refused account act.
-  if (permissions[action] === "denied") return { allowed: false, reason: DENIED[action] };
+  if (permissions[action] === "denied")
+    return { allowed: false, reason: refused ?? DENIED[action] };
   if (mutationsDisabledReason !== null) return { allowed: false, reason: mutationsDisabledReason };
   return { allowed: true, reason: null };
 }
@@ -108,27 +116,40 @@ function jobPermission(
 /**
  * The job's Retry, Cancel and Play, each `null` when it does not apply: Retry for a
  * finished job that did not pass, Cancel for one that can still run, Play for a manual
- * job. A disabled action says why.
+ * job. GitHub re-runs a job but cancels only whole runs and has no manual jobs, so a
+ * GitHub job offers Retry alone, and its denial says whether the role or GitHub
+ * refused. A disabled action says why.
  */
 export function pipelineJobActions(
   job: Pick<PipelinesJob, "status" | "terminal" | "permissions" | "kind">,
   mutationsDisabledReason: string | null,
+  provider: PullRequestsProviderKind = "gitlab",
+  repositoryPermission: RepositoryPermission | null = null,
 ): {
   readonly retry: JobActionPermission | null;
   readonly cancel: JobActionPermission | null;
   readonly play: JobActionPermission | null;
 } {
   const manual = job.status === "manual";
+  const github = provider === "github";
+  const refused = !github
+    ? null
+    : githubRefused(repositoryPermission)
+      ? GITHUB_ACTIONS_REFUSED
+      : "You need write access to this repository to re-run jobs.";
   return {
     retry:
       job.terminal && !manual && job.status !== "success" && job.kind === "build"
-        ? jobPermission("retry", job.permissions, mutationsDisabledReason)
+        ? jobPermission("retry", job.permissions, mutationsDisabledReason, refused)
         : null,
     cancel:
-      !job.terminal && !manual
-        ? jobPermission("cancel", job.permissions, mutationsDisabledReason)
+      !github && !job.terminal && !manual
+        ? jobPermission("cancel", job.permissions, mutationsDisabledReason, null)
         : null,
-    play: manual ? jobPermission("play", job.permissions, mutationsDisabledReason) : null,
+    play:
+      !github && manual
+        ? jobPermission("play", job.permissions, mutationsDisabledReason, null)
+        : null,
   };
 }
 

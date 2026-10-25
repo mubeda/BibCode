@@ -123,6 +123,22 @@ describe("pipelineRowActions", () => {
       reason: "The host didn't say whether you can retry pipelines.",
     });
   });
+
+  it("names GitHub's refusal when the role could act, and the role otherwise", () => {
+    const denied = {
+      ...pipelineRow,
+      permissions: { retry: "denied" as const, cancel: "unknown" as const },
+    };
+    expect(pipelineRowActions(denied, null, "github", "write").retry).toEqual({
+      allowed: false,
+      reason:
+        "GitHub refused: this sign-in can't run Actions for this repository. A fine-grained token needs Actions write.",
+    });
+    expect(pipelineRowActions(denied, null, "github", "read").retry).toEqual({
+      allowed: false,
+      reason: "You need write access to this repository to re-run workflows.",
+    });
+  });
 });
 
 describe("GitHub list filters and copy", () => {

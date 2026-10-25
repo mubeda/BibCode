@@ -105,6 +105,7 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         | "gitManager.unstagePartial"
         | "pullRequests.runAction"
         | "pullRequests.checkout"
+        | "pipelines.runAction"
         | "activity.cancelSubtree"
         | "activity.retrySubtreeCancellation"
         | "device.close"
@@ -355,6 +356,7 @@ mod tests {
         for method in [
             "pullRequests.runAction",
             "pullRequests.checkout",
+            "pipelines.runAction",
             "gitManager.commit",
             "gitManager.discard",
             "gitManager.discardPartial",

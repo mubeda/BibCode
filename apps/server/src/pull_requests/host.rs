@@ -337,9 +337,39 @@ impl HostCommandRunner {
         budget: Budget,
         c: &CancellationToken,
     ) -> Result<RawOutput, ProcessFailure> {
+        self.gh_api_request(scope, None, path, include_headers, budget, c)
+            .await
+    }
+
+    /// `gh api --method POST` with no body, as `gh_api_raw` otherwise, with
+    /// the headers kept (`-i`) so a refusal keeps its rate-limit pause.
+    /// GitHub's re-run and cancel endpoints answer 201 or 202 with no body.
+    pub(super) async fn gh_api_post_raw(
+        &self,
+        scope: &HostScope,
+        path: &str,
+        budget: Budget,
+        c: &CancellationToken,
+    ) -> Result<RawOutput, ProcessFailure> {
+        self.gh_api_request(scope, Some("POST"), path, true, budget, c)
+            .await
+    }
+
+    async fn gh_api_request(
+        &self,
+        scope: &HostScope,
+        method: Option<&str>,
+        path: &str,
+        include_headers: bool,
+        budget: Budget,
+        c: &CancellationToken,
+    ) -> Result<RawOutput, ProcessFailure> {
         let mut args: Vec<OsString> = vec!["api".into()];
         if include_headers {
             args.push("-i".into());
+        }
+        if let Some(method) = method {
+            args.extend(["--method".into(), method.into()]);
         }
         args.extend([
             "-H".into(),

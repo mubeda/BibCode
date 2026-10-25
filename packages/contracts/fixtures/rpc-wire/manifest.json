@@ -206,6 +206,10 @@
       "mode": "unary"
     },
     {
+      "name": "pipelines.runAction",
+      "mode": "unary"
+    },
+    {
       "name": "pipelines.subscribe",
       "mode": "stream"
     },
@@ -844,6 +848,7 @@
     "typed-failures/pipelines__getJobLog-00.json",
     "typed-failures/pipelines__list-00.json",
     "typed-failures/pipelines__readSnapshot-00.json",
+    "typed-failures/pipelines__runAction-00.json",
     "typed-failures/preview__claimOpenRequest-00.json",
     "typed-failures/preview__claimOpenRequest-01.json",
     "typed-failures/preview__close-00.json",
@@ -1221,6 +1226,7 @@
     "typed-failures/pipelines__getJobLog-00.json": "a9f9612ff52967e25c6ab05867568fc228532b54dd4edfb3492dcdb9ebdef575",
     "typed-failures/pipelines__list-00.json": "a9f9612ff52967e25c6ab05867568fc228532b54dd4edfb3492dcdb9ebdef575",
     "typed-failures/pipelines__readSnapshot-00.json": "a9f9612ff52967e25c6ab05867568fc228532b54dd4edfb3492dcdb9ebdef575",
+    "typed-failures/pipelines__runAction-00.json": "a9f9612ff52967e25c6ab05867568fc228532b54dd4edfb3492dcdb9ebdef575",
     "stream-shapes/pipelines__subscribe-00.json": "fd21213d62641a57673de7f3f146deae11dac97978ec3e5798e2809ebf5b5aaf",
     "typed-failures/preview__claimOpenRequest-00.json": "950333bb892eba89420d696b2674275ebe5de296311ca5d2045b4963fc596274",
     "typed-failures/preview__claimOpenRequest-01.json": "dfe153df675ebc5cf07b6a2d483bfe18346fa23e4bbcd24940828aa1cc404308",
@@ -1753,6 +1759,7 @@
     "typed-failures/pipelines__getJobLog-00.json",
     "typed-failures/pipelines__list-00.json",
     "typed-failures/pipelines__readSnapshot-00.json",
+    "typed-failures/pipelines__runAction-00.json",
     "typed-failures/previewAutomation__focusHost-00.json",
     "typed-failures/previewAutomation__focusHost-01.json",
     "typed-failures/previewAutomation__respond-00.json",

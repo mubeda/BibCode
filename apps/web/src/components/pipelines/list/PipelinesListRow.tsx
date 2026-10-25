@@ -22,7 +22,8 @@ import { PullRequestsActor } from "../../pullRequests/shared/PullRequestsActor";
 import { Badge } from "../../ui/badge";
 import { Button } from "../../ui/button";
 import { Menu, MenuItem, MenuPopup, MenuTrigger } from "../../ui/menu";
-import { PermissionButton } from "../../ui/permission-button";
+import { PipelineActions } from "../actions/PipelineActions";
+import type { RepositoryPermission } from "../actions/pipelineActions.logic";
 import { PipelineStatusIcon } from "../shared/PipelineStatusIcon";
 import {
   formatPipelineDuration,
@@ -86,6 +87,8 @@ export interface PipelinesListRowProps {
   readonly scope: { readonly environmentId: EnvironmentId; readonly cwd: string };
   readonly projectRef: ScopedProjectRef;
   readonly mutationsDisabledReason: string | null;
+  /** The signed-in role, which tells GitHub's refusal of an action from a missing role. */
+  readonly repositoryPermission: RepositoryPermission | null;
 }
 
 /**
@@ -99,6 +102,7 @@ export const PipelinesListRow = memo(function PipelinesListRow({
   scope,
   projectRef,
   mutationsDisabledReason,
+  repositoryPermission,
 }: PipelinesListRowProps) {
   const hoverPrefetch = usePipelineHoverPrefetch({
     environmentId: scope.environmentId,
@@ -106,7 +110,8 @@ export const PipelinesListRow = memo(function PipelinesListRow({
     pipelineId: row.id,
   });
   const openLink = useOpenPrLink();
-  const status = pipelineStatusText(row.status, row.warnings, row.reason);
+  const shownStatus = PipelineActions.useShownStatus(row);
+  const status = pipelineStatusText(shownStatus, row.warnings, row.reason);
   const title = row.title ?? row.ref.name;
   const age = Number.isFinite(Date.parse(row.createdAt))
     ? formatRelativeTimeLabel(row.createdAt)
@@ -114,7 +119,8 @@ export const PipelinesListRow = memo(function PipelinesListRow({
   const createdTitle = age === null ? undefined : new Date(row.createdAt).toLocaleString();
   const duration =
     row.durationSeconds === null ? null : formatPipelineDuration(row.durationSeconds);
-  const actions = pipelineRowActions(row, mutationsDisabledReason, provider);
+  const actions = pipelineRowActions(row, mutationsDisabledReason, provider, repositoryPermission);
+  const target = { _tag: "pipeline", id: row.id } as const;
   const hostName = HOST_NAMES[provider];
   return (
     <div
@@ -126,11 +132,11 @@ export const PipelinesListRow = memo(function PipelinesListRow({
       {...hoverPrefetch}
     >
       <div className="flex w-6 shrink-0 justify-center @min-[720px]:hidden">
-        <PipelineStatusIcon status={row.status} warnings={row.warnings} />
+        <PipelineStatusIcon status={shownStatus} warnings={row.warnings} />
       </div>
       <div className="hidden w-36 shrink-0 flex-col gap-0.5 @min-[720px]:flex">
         <span className="flex items-center gap-1.5 text-sm">
-          <PipelineStatusIcon status={row.status} warnings={row.warnings} />
+          <PipelineStatusIcon status={shownStatus} warnings={row.warnings} />
           <span className="truncate">{status}</span>
         </span>
         <span className="flex gap-1 text-xs text-muted-foreground tabular-nums">
@@ -175,26 +181,27 @@ export const PipelinesListRow = memo(function PipelinesListRow({
       </div>
       <div className="relative z-10 flex shrink-0 items-center gap-1">
         {actions.retry ? (
-          <PermissionButton
+          <PipelineActions.Button
             variant="ghost"
             size="icon-sm"
             aria-label={`Retry pipeline ${row.label}`}
+            request={{ target, action: "retry" }}
             permission={actions.retry}
-          >
-            <RotateCcwIcon aria-hidden="true" />
-          </PermissionButton>
+            icon={<RotateCcwIcon aria-hidden="true" />}
+          />
         ) : null}
         {actions.cancel ? (
-          <PermissionButton
+          <PipelineActions.Button
             variant="ghost"
             size="icon-sm"
             aria-label={`Cancel pipeline ${row.label}`}
+            request={{ target, action: "cancel" }}
             permission={actions.cancel}
-          >
-            <CircleStopIcon aria-hidden="true" />
-          </PermissionButton>
+            from={row.status}
+            icon={<CircleStopIcon aria-hidden="true" />}
+          />
         ) : null}
-        {row.url ? (
+        {row.url || (actions.retry && provider === "github") ? (
           <Menu>
             <MenuTrigger
               render={
@@ -208,7 +215,19 @@ export const PipelinesListRow = memo(function PipelinesListRow({
               <EllipsisIcon aria-hidden="true" />
             </MenuTrigger>
             <MenuPopup align="end">
-              <MenuItem onClick={(event) => openLink(event, row.url!)}>Open on {hostName}</MenuItem>
+              {actions.retry && provider === "github" ? (
+                <PipelineActions.Item
+                  request={{ target, action: "retry_failed" }}
+                  permission={actions.retry}
+                >
+                  Retry failed jobs
+                </PipelineActions.Item>
+              ) : null}
+              {row.url ? (
+                <MenuItem onClick={(event) => openLink(event, row.url!)}>
+                  Open on {hostName}
+                </MenuItem>
+              ) : null}
             </MenuPopup>
           </Menu>
         ) : null}

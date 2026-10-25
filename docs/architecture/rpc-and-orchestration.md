@@ -1381,18 +1381,20 @@ answers. Route identifiers are the host's global ids (GitLab pipeline and job
 context read stays `pullRequests.getContext`, so both modules share one
 provider context, sign-in state and unavailable copy.
 
-| Method                   | Required scope       | Responsibility                                                                   |
-| ------------------------ | -------------------- | -------------------------------------------------------------------------------- |
-| `pipelines.list`         | `orchestration:read` | Page the project's pipelines for a scope (`all`, `running`, `finished`) and ref. |
-| `pipelines.get`          | `orchestration:read` | Read one pipeline's header, stages, groups and jobs.                             |
-| `pipelines.getJob`       | `orchestration:read` | Read one job: runner, tags, artifacts, log size, erasure.                        |
-| `pipelines.getJobLog`    | `orchestration:read` | Read a window of a job log by byte offset (`tail`, `offset`, `before`).          |
-| `pipelines.readSnapshot` | `orchestration:read` | Return the stored list, pipeline and job rows with no host call.                 |
-| `pipelines.subscribe`    | `orchestration:read` | Stream (GitLab): name what the cooperative poller stored.                        |
+| Method                   | Required scope          | Responsibility                                                                   |
+| ------------------------ | ----------------------- | -------------------------------------------------------------------------------- |
+| `pipelines.list`         | `orchestration:read`    | Page the project's pipelines for a scope (`all`, `running`, `finished`) and ref. |
+| `pipelines.get`          | `orchestration:read`    | Read one pipeline's header, stages, groups and jobs.                             |
+| `pipelines.getJob`       | `orchestration:read`    | Read one job: runner, tags, artifacts, log size, erasure.                        |
+| `pipelines.getJobLog`    | `orchestration:read`    | Read a window of a job log by byte offset (`tail`, `offset`, `before`).          |
+| `pipelines.readSnapshot` | `orchestration:read`    | Return the stored list, pipeline and job rows with no host call.                 |
+| `pipelines.subscribe`    | `orchestration:read`    | Stream (GitLab): name what the cooperative poller stored.                        |
+| `pipelines.runAction`    | `orchestration:operate` | Retry, retry the failed jobs of, cancel, or play one pipeline or job.            |
 
 `capabilities.pipelinesReads` is advertised only by a server that registers all
-six reads; `pipelinesMutations` (`pipelines.runAction`) stays false until that
-method is registered. Both decode as false from older servers. Every read
+six reads, and `pipelinesMutations` only by one that registers
+`pipelines.runAction`; a test ties each flag to its registered methods. Both
+decode as false from older servers. Every read
 carries the checkout's `cwd` and a `refresh` kind (`user`, `follow` for log
 catch-up, `timer`); ids are positive and range-checked to a JavaScript
 `Number` before any read.
@@ -1535,6 +1537,50 @@ is visible and only while the job itself runs. A job read newer by
 keeps its permissions). Once the job is terminal the log is read once under
 the job's own `attempt` (from `getJob`, which the page waits for), and a step
 jumps to the first log line stamped at or after its start.
+
+`pipelines.runAction` takes `{ cwd, target, action }`: a `pipeline` or `job`
+target by its host id and one of `retry`, `retry_failed`, `cancel` or `play`.
+GitLab posts `pipelines/:id/retry|cancel` (its pipeline retry already retries
+the failed jobs, so `retry_failed` is the same call) or `jobs/:id/retry|cancel|play`
+and answers with the host's ids: a retried job is a new one, so `jobId` names
+it. GitHub posts `actions/runs/:id/rerun|rerun-failed-jobs|cancel` or
+`actions/jobs/:id/rerun` and answers `{ pipelineId: <run>, jobId: null }` (a
+job re-run, `{ null, null }`), since its re-run is the run's next attempt; a
+GitHub job is never canceled or played alone, and neither host plays a
+pipeline. An unsupported pair answers `unavailable` before any host call. The
+action is admitted as a read is, so a backed-off host gets no POST, and it is
+single flight per (host, project, target, action): a second identical request
+while one is in flight shares its answer. A settled action keeps its answer
+past its 60 s budget. A `forbidden` keeps the shared context and every stored
+row. On GitHub, whose permission is only `unknown` from repository write, it
+is remembered in server memory per (host, account login, project, action
+kind: retry, cancel, play) until the next rescan or sign-out: the next
+request of that kind answers `forbidden` with no host call, and every `list`,
+`get`, `getJob` and `readSnapshot` answer shows that permission `denied`
+while the stored rows keep the host's own answer. GitLab reports its
+permissions on every read and also answers 403 for a job whose state moved
+on, so its refusal is shown, not remembered, and "Job is not retryable" or
+"not playable" is `host_rejected` with copy to refresh. A GitHub 409 or a 403
+for a run that is still running is `host_rejected` with its copy; a 429 backs
+off the host's ladder as a read's does; `not_found` deletes the
+target's rows; `not_authenticated` invalidates the shared context. A
+successful action on a pipeline, or on a job whose pipeline GitLab named,
+makes every GitLab poller of the project that watches it read it again, even
+one it had left as terminal.
+
+The views run actions through `PipelineActions` (`components/pipelines/actions/`),
+a provider per list, pipeline and job page over the `runAction` command on the
+shared VCS scheduler. A button spins from the click until the page's next copy
+lands (its `revision` grows) or 15 s pass, and a second click on the same
+action sends nothing. Every answer re-reads the page (`list` first page and
+the page the row is on, `get`, or `getJob` and `get`), so a remembered refusal
+shows at the button; a failure is also a toast with the server's copy. A
+GitLab job retry opens the new job's page; a GitHub re-run from an earlier
+attempt or from a job page opens the run's latest attempt. A GitHub cancel
+(202) shows `canceling` until the run's own status moves on. On GitHub a
+`denied` permission with repository write or higher is GitHub's refusal and
+says so ("GitHub refused: … A fine-grained token needs Actions write.");
+below write it names the missing role.
 
 ## Worktree catalog flow
 

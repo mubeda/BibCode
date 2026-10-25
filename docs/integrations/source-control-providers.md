@@ -321,6 +321,17 @@ completes, through `gh api` without `-i` so the kept tail is all log text;
 `gh` follows GitHub's redirect to the pre-signed download on the server, and
 no API or pre-signed URL reaches the client.
 
+Pipelines actions (`pipelines.runAction`) are one POST each, sent only when
+the host is not backed off and at most once for a double click. A 429 backs
+off the host as a read's does. A refusal (`forbidden`) never clears the
+shared context or rows. On GitHub, where repository write is only a hint, the
+server remembers it per account and action kind until the next rescan, so
+every view shows that action disabled; GitLab's 403 can also mean the job's
+state moved on ("Job is not retryable"), and its reads report permissions, so
+GitLab refusals are not remembered. GitHub
+answers a re-run with no body; GitLab answers with the pipeline or job, and a
+retried GitLab job is a new job.
+
 | Operation family                  | GitHub commands                                                                                                                                                                                                                          | GitLab commands                                                                                                                                                                                                         |
 | --------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Context and vocabulary            | `gh auth status`, `gh api user`, repository/branch/label/milestone/collaborator REST and GraphQL reads                                                                                                                                   | `glab auth status`, `glab api user`, project/version/member/branch/label/milestone reads                                                                                                                                |
@@ -333,6 +344,7 @@ no API or pre-signed URL reaches the client.
 | Checkout / worktree fetch         | `gh pr checkout` in the target; `git fetch origin refs/pull/<n>/head:<branch>`                                                                                                                                                           | `glab mr checkout` in the target; `git fetch origin refs/merge-requests/<n>/head:<branch>`                                                                                                                              |
 | Pipelines list and pipeline       | `gh api -i repos/:o/:r/actions/runs` (or `actions/workflows/:id/runs`; 20 per page, `branch`, `status`); `actions/workflows` with the count; `actions/runs/:id` (or `attempts/:n`) with `jobs` pages of 100 (at most 10) and `artifacts` | `glab api -i graphql` with `project.pipelines` (15 per page, stage strip, optional `count`) and `project.pipeline(id:)` (stages, groups, up to 100 jobs per group); a baseline document on hosts that lack newer fields |
 | Pipelines job and log             | `gh api -i repos/:o/:r/actions/jobs/:id` (steps, labels, runner); `gh api …/actions/jobs/:id/logs` whole once the job completes (90 s, last 16 MiB kept)                                                                                 | `glab api -i projects/:id/jobs/:job_id`; `glab api -i …/jobs/:job_id/trace?byte_offset=N&byte_limit=512000` once a one-byte probe proves ranges, otherwise `glab api …/trace` whole (90 s, last 16 MiB kept)            |
+| Pipelines actions                 | `gh api -i --method POST repos/:o/:r/actions/runs/:id/rerun`, `…/rerun-failed-jobs`, `…/cancel`, `…/actions/jobs/:id/rerun` (no body; 201 or 202)                                                                                        | `glab api -i --method POST projects/:id/pipelines/:id/retry`, `…/cancel`, `projects/:id/jobs/:id/retry`, `…/cancel`, `…/play` (an empty JSON body through the private file)                                             |
 
 Bodies, descriptions, review summaries and merge messages never enter argv.
 GitHub reads body data from stdin; GitLab API writes use a private temporary

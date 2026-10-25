@@ -11,6 +11,11 @@ import {
   sanitizePipelinesFilters,
   type PipelinesFilters,
 } from "../../../pipelinesStore";
+import {
+  GITHUB_ACTIONS_REFUSED,
+  githubRefused,
+  type RepositoryPermission,
+} from "../actions/pipelineActions.logic";
 
 /** The list route's search parameters; each is left out at its default. */
 export interface PipelinesRouteSearch {
@@ -173,10 +178,17 @@ function actionPermission(
   permissions: PipelinesRow["permissions"],
   mutationsDisabledReason: string | null,
   provider: PullRequestsProviderKind,
+  repositoryPermission: RepositoryPermission | null,
 ): PipelineActionPermission {
   // The host's own answer comes first: no server update lets a refused account act.
   if (permissions?.[action] === "denied")
-    return { allowed: false, reason: DENIED[provider][action] };
+    return {
+      allowed: false,
+      reason:
+        provider === "github" && githubRefused(repositoryPermission)
+          ? GITHUB_ACTIONS_REFUSED
+          : DENIED[provider][action],
+    };
   if (mutationsDisabledReason !== null) return { allowed: false, reason: mutationsDisabledReason };
   if (permissions === null)
     return { allowed: false, reason: `The host didn't say whether you can ${action} pipelines.` };
@@ -186,23 +198,28 @@ function actionPermission(
 /**
  * The row's Retry and Cancel, each `null` when it does not apply: Retry for a finished
  * pipeline that did not pass, Cancel for one that can still run. A disabled action
- * says why.
+ * says why. On GitHub a denial with repository write or higher is GitHub's own
+ * refusal of an earlier action, which the server remembers until a rescan.
  */
 export function pipelineRowActions(
   row: Pick<PipelinesRow, "status" | "terminal" | "permissions">,
   mutationsDisabledReason: string | null,
   provider: PullRequestsProviderKind = "gitlab",
+  repositoryPermission: RepositoryPermission | null = null,
 ): {
   readonly retry: PipelineActionPermission | null;
   readonly cancel: PipelineActionPermission | null;
 } {
+  const permission = (action: "retry" | "cancel") =>
+    actionPermission(
+      action,
+      row.permissions,
+      mutationsDisabledReason,
+      provider,
+      repositoryPermission,
+    );
   return {
-    retry:
-      row.terminal && row.status !== "success"
-        ? actionPermission("retry", row.permissions, mutationsDisabledReason, provider)
-        : null,
-    cancel: row.terminal
-      ? null
-      : actionPermission("cancel", row.permissions, mutationsDisabledReason, provider),
+    retry: row.terminal && row.status !== "success" ? permission("retry") : null,
+    cancel: row.terminal ? null : permission("cancel"),
   };
 }

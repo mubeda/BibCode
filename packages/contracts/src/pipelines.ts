@@ -338,6 +338,34 @@ export const PipelinesSnapshot = Schema.Struct({
 });
 export type PipelinesSnapshot = typeof PipelinesSnapshot.Type;
 
+/** What an action acts on: a pipeline (a GitHub workflow run) or one job. */
+export const PipelinesActionTarget = Schema.Union([
+  Schema.TaggedStruct("pipeline", { id: PipelineId }),
+  Schema.TaggedStruct("job", { id: PipelineId }),
+]);
+export type PipelinesActionTarget = typeof PipelinesActionTarget.Type;
+
+/** `retry_failed` re-runs a GitHub run's failed jobs; `play` runs a manual GitLab job. */
+export const PipelinesAction = Schema.Literals(["retry", "retry_failed", "cancel", "play"]);
+export type PipelinesAction = typeof PipelinesAction.Type;
+
+export const PipelinesRunActionInput = Schema.Struct({
+  cwd: TrimmedNonEmptyStringSchema,
+  target: PipelinesActionTarget,
+  action: PipelinesAction,
+});
+export type PipelinesRunActionInput = typeof PipelinesRunActionInput.Type;
+
+/**
+ * Where the result lives. GitLab answers with the pipeline, or with the job (a retried
+ * job is a new one, so `jobId` is its id); a GitHub re-run is the run's next attempt.
+ */
+export const PipelinesActionResult = Schema.Struct({
+  pipelineId: Schema.NullOr(Schema.Number),
+  jobId: Schema.NullOr(Schema.Number),
+});
+export type PipelinesActionResult = typeof PipelinesActionResult.Type;
+
 /** Which stored copies changed: answer with `readSnapshot`. The first event is all false. */
 export const PipelinesChanged = Schema.Struct({
   list: Schema.Boolean,

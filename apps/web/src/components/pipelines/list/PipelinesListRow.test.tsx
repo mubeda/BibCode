@@ -14,7 +14,13 @@ const h = vi.hoisted(() => ({
   settled: false,
   get: vi.fn((args: unknown) => ({ kind: "get", args })),
 }));
-vi.mock("../../../state/pipelines", () => ({ pipelinesEnvironment: { get: h.get } }));
+vi.mock("../../../state/pipelines", () => ({
+  pipelinesEnvironment: {
+    get: h.get,
+    runAction: { label: "environment-data:pipelines:run-action" },
+  },
+}));
+vi.mock("../../../state/use-atom-command", () => ({ useAtomCommand: () => vi.fn() }));
 vi.mock("../../pullRequests/shared/usePullRequestsQuery", () => ({
   usePullRequestsQuery: (atom: { kind: string } | null) => ({
     data: h.settled && atom ? { kind: atom.kind } : null,
@@ -48,6 +54,7 @@ vi.mock("@tanstack/react-router", () => ({
   ),
 }));
 
+import { PipelineActions } from "../actions/PipelineActions";
 import { PipelinesListRow } from "./PipelinesListRow";
 
 const scope = { environmentId: EnvironmentId.make("env"), cwd: "/repo" };
@@ -58,7 +65,7 @@ let node: HTMLDivElement;
 function renderRows(ids: readonly number[]) {
   act(() =>
     root.render(
-      <>
+      <PipelineActions.Provider scope={scope} provider="gitlab" revision={1} onSettled={vi.fn()}>
         {ids.map((id) => (
           <PipelinesListRow
             key={id}
@@ -67,9 +74,10 @@ function renderRows(ids: readonly number[]) {
             scope={scope}
             projectRef={projectRef}
             mutationsDisabledReason={null}
+            repositoryPermission="write"
           />
         ))}
-      </>,
+      </PipelineActions.Provider>,
     ),
   );
 }

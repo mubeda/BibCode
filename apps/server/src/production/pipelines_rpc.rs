@@ -14,7 +14,10 @@ use crate::{
         error::PullRequestsOperationError,
         pipelines::{
             PipelinesService,
-            model::{self, GetInput, JobInput, JobLogInput, ListInput, LogFrom, SubscribeInput},
+            model::{
+                self, GetInput, JobInput, JobLogInput, ListInput, LogFrom, RunActionInput,
+                SubscribeInput,
+            },
         },
     },
     rpc::{RpcRegistry, RpcRequest, RpcResult, RpcStreamChunk},
@@ -30,6 +33,7 @@ pub const PIPELINES_UNARY_METHODS: &[&str] = &[
     "pipelines.getJob",
     "pipelines.getJobLog",
     "pipelines.readSnapshot",
+    "pipelines.runAction",
 ];
 
 pub const PIPELINES_STREAM_METHODS: &[&str] = &["pipelines.subscribe"];
@@ -128,6 +132,21 @@ impl PipelinesRpcServices {
         }
     }
 
+    async fn handle_mutation_unary(
+        &self,
+        request: RpcRequest,
+        cancellation: CancellationToken,
+    ) -> RpcResult {
+        let operation = request.tag.as_str();
+        let input: RunActionInput = decode(request.payload, operation)?;
+        validate_cwd(&input.cwd, operation)?;
+        validate_id(input.target.id(), operation)?;
+        encode(
+            self.service.run_action(input, &cancellation).await,
+            operation,
+        )
+    }
+
     fn handle_subscribe(
         &self,
         request: RpcRequest,
@@ -215,10 +234,17 @@ fn encode<T: Serialize>(
 pub fn register_pipelines_rpc(registry: &mut RpcRegistry, services: PipelinesRpcServices) {
     for method in PIPELINES_UNARY_METHODS {
         let services = services.clone();
-        registry.register_unary(*method, move |request, cancellation| {
-            let services = services.clone();
-            async move { services.handle_read_unary(request, cancellation).await }
-        });
+        if PIPELINES_MUTATIONS_METHODS.contains(method) {
+            registry.register_unary(*method, move |request, cancellation| {
+                let services = services.clone();
+                async move { services.handle_mutation_unary(request, cancellation).await }
+            });
+        } else {
+            registry.register_unary(*method, move |request, cancellation| {
+                let services = services.clone();
+                async move { services.handle_read_unary(request, cancellation).await }
+            });
+        }
     }
     for method in PIPELINES_STREAM_METHODS {
         let services = services.clone();
@@ -273,7 +299,7 @@ mod tests {
         assert!(registry.validate_complete().is_err());
         register_pipelines_rpc(&mut registry, services());
         registry.validate_complete().unwrap();
-        assert_eq!(PIPELINES_UNARY_METHODS.len(), 5);
+        assert_eq!(PIPELINES_UNARY_METHODS.len(), 6);
         assert_eq!(PIPELINES_STREAM_METHODS.len(), 1);
         for method in PIPELINES_UNARY_METHODS {
             assert!(
@@ -288,13 +314,12 @@ mod tests {
         }));
     }
 
-    /// `pipelinesReads` names the six reads, all registered here;
-    /// `pipelinesMutations` names `runAction`, which this server does not
-    /// register yet, so it is not advertised.
+    /// `pipelinesReads` names the six reads and `pipelinesMutations` names
+    /// `runAction`, all registered here.
     #[test]
     fn each_advertised_pipelines_flag_names_only_registered_methods() {
         assert!(pipelines_reads_registered());
-        assert!(!pipelines_mutations_registered());
+        assert!(pipelines_mutations_registered());
         // Every registered method is one a flag promises.
         for method in PIPELINES_UNARY_METHODS
             .iter()
@@ -360,11 +385,30 @@ mod tests {
                 "pipelines.list",
                 json!({"cwd":"/repo","scope":"later","ref":null,"workflowId":null,"cursor":null,"refresh":"user"}),
             ),
+            (
+                "pipelines.runAction",
+                json!({"cwd":"/repo","target":{"_tag":"job","id":0},"action":"retry"}),
+            ),
+            (
+                "pipelines.runAction",
+                json!({"cwd":"/repo","target":{"_tag":"pipeline","id":4821},"action":"delete"}),
+            ),
+            (
+                "pipelines.runAction",
+                json!({"cwd":" ","target":{"_tag":"pipeline","id":4821},"action":"retry"}),
+            ),
         ] {
-            let error = services
-                .handle_read_unary(request(method, payload), CancellationToken::new())
-                .await
-                .unwrap_err();
+            let request = request(method, payload);
+            let error = if method == "pipelines.runAction" {
+                services
+                    .handle_mutation_unary(request, CancellationToken::new())
+                    .await
+            } else {
+                services
+                    .handle_read_unary(request, CancellationToken::new())
+                    .await
+            }
+            .unwrap_err();
             assert_eq!(error["code"], "host_rejected", "{method}");
             assert_eq!(error["message"], "The Pipelines request is invalid.");
             assert!(!error.to_string().contains("secret-id"));

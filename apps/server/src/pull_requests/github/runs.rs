@@ -14,16 +14,16 @@ use super::GitHubHost;
 use crate::pull_requests::{
     backoff,
     error::PullRequestsOperationError,
-    host::{Budget, HostContext, HostFuture, HostScope},
+    host::{Budget, HostContext, HostFuture, HostScope, ProcessFailure},
     model::{Actor, PipelineStatus, RepositoryPermission},
     pipelines::{
-        ListRead, PipelineHost, TraceRead,
+        ACTION_OP, ListRead, PipelineHost, TraceRead,
         model::{
-            Artifact, Badge, Commit, Detail, DetailStage, Job, JobDetail, JobGroup, JobKind,
-            JobPermissions, ListInput, ListScope, Permission, PipelineRef, Reason, RefKind, Row,
-            RowPermissions, Runner, Step, Total, Workflow,
+            ActionKind, ActionResult, ActionTarget, Artifact, Badge, Commit, Detail, DetailStage,
+            Job, JobDetail, JobGroup, JobKind, JobPermissions, ListInput, ListScope, Permission,
+            PipelineRef, Reason, RefKind, Row, RowPermissions, Runner, Step, Total, Workflow,
         },
-        read_failure,
+        read_failure, unsupported_action,
     },
 };
 
@@ -550,6 +550,61 @@ fn jobs_path(scope: &HostScope, run: u64, attempt: Option<u64>, page: u64) -> St
     }
 }
 
+/// The REST endpoint of an action. GitHub re-runs and cancels a workflow run,
+/// and re-runs one job (as the run's next attempt); a job is never canceled
+/// or played on its own.
+pub(crate) fn action_path(
+    scope: &HostScope,
+    target: ActionTarget,
+    action: ActionKind,
+) -> Result<String, PullRequestsOperationError> {
+    let repository = &scope.repository;
+    match (target, action) {
+        (ActionTarget::Pipeline { id }, ActionKind::Retry) => {
+            Ok(format!("repos/{repository}/actions/runs/{id}/rerun"))
+        }
+        (ActionTarget::Pipeline { id }, ActionKind::RetryFailed) => Ok(format!(
+            "repos/{repository}/actions/runs/{id}/rerun-failed-jobs"
+        )),
+        (ActionTarget::Pipeline { id }, ActionKind::Cancel) => {
+            Ok(format!("repos/{repository}/actions/runs/{id}/cancel"))
+        }
+        (ActionTarget::Job { id }, ActionKind::Retry) => {
+            Ok(format!("repos/{repository}/actions/jobs/{id}/rerun"))
+        }
+        (ActionTarget::Pipeline { .. }, ActionKind::Play) => Err(unsupported_action(
+            "GitHub has no manual jobs to run. Start a workflow on GitHub.",
+        )),
+        (ActionTarget::Job { .. }, _) => Err(unsupported_action(
+            "GitHub cancels a whole workflow run, not one job.",
+        )),
+    }
+}
+
+/// A GitHub refusal that is about the run's state, not the sign-in: a 409
+/// (the run already finished), or a 403 for a run that is still running.
+fn action_failure(failure: &ProcessFailure, action: ActionKind) -> PullRequestsOperationError {
+    let stderr = failure.stderr.to_lowercase();
+    let state = if stderr.contains("http 409") {
+        Some(match action {
+            ActionKind::Cancel => "This workflow run already finished.",
+            _ => "GitHub can't re-run this workflow run now. Refresh to see its status.",
+        })
+    } else if stderr.contains("already running") {
+        Some("This workflow run is already running.")
+    } else {
+        None
+    };
+    match state {
+        Some(message) => {
+            let mut error = PullRequestsOperationError::new(ACTION_OP, "host_rejected");
+            error.message = message.into();
+            error
+        }
+        None => read_failure(ACTION_OP, "gh", failure),
+    }
+}
+
 impl GitHubHost {
     /// A REST read with `-i`, so a refusal keeps its rate-limit headers.
     async fn runs_api(
@@ -721,6 +776,33 @@ impl PipelineHost for GitHubHost {
             Ok(TraceRead {
                 bytes: output.stdout,
                 dropped: output.dropped_bytes as u64,
+            })
+        })
+    }
+
+    /// `POST actions/runs/:id/rerun|rerun-failed-jobs|cancel` or
+    /// `actions/jobs/:id/rerun`. GitHub answers 201 or 202 with no body: a
+    /// re-run is the run's next attempt, which its latest page shows.
+    fn run_action<'a>(
+        &'a self,
+        scope: &'a HostScope,
+        _context: &'a HostContext,
+        target: ActionTarget,
+        action: ActionKind,
+        c: &'a CancellationToken,
+    ) -> HostFuture<'a, ActionResult> {
+        Box::pin(async move {
+            let path = action_path(scope, target, action)?;
+            self.runner
+                .gh_api_post_raw(scope, &path, Budget::Read, c)
+                .await
+                .map_err(|failure| action_failure(&failure, action))?;
+            Ok(ActionResult {
+                pipeline_id: match target {
+                    ActionTarget::Pipeline { id } => Some(id),
+                    ActionTarget::Job { .. } => None,
+                },
+                job_id: None,
             })
         })
     }
@@ -1471,5 +1553,87 @@ esac"#,
             .err()
             .expect("expired");
         assert_eq!(expired.code, "expired");
+    }
+
+    #[test]
+    fn github_actions_map_to_their_endpoints_and_a_job_is_only_re_run() {
+        let s = TestSandbox::new("github-action-paths");
+        let run = ActionTarget::Pipeline { id: 9001 };
+        let job = ActionTarget::Job { id: 502 };
+        for (target, action, path) in [
+            (run, ActionKind::Retry, "runs/9001/rerun"),
+            (run, ActionKind::RetryFailed, "runs/9001/rerun-failed-jobs"),
+            (run, ActionKind::Cancel, "runs/9001/cancel"),
+            (job, ActionKind::Retry, "jobs/502/rerun"),
+        ] {
+            assert_eq!(
+                action_path(&scope(&s), target, action).unwrap(),
+                format!("repos/team/repo/actions/{path}")
+            );
+        }
+        for (target, action) in [
+            (run, ActionKind::Play),
+            (job, ActionKind::Cancel),
+            (job, ActionKind::Play),
+            (job, ActionKind::RetryFailed),
+        ] {
+            assert_eq!(
+                action_path(&scope(&s), target, action).unwrap_err().code,
+                "unavailable",
+                "{target:?} {action:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn github_actions_post_and_a_409_or_403_come_back_with_their_copy() {
+        let s = TestSandbox::new("github-runs-action");
+        let host = host(
+            &s,
+            r#"printf '%s\n' "$*" >> calls
+case "$*" in
+  *runs/9001/rerun*) printf 'HTTP/2.0 201 Created\r\n\r\n' ;;
+  *runs/9002/cancel*) printf 'HTTP/2.0 409 Conflict\r\n\r\n{"message":"Cannot cancel a workflow run that is completed."}'
+     echo 'gh: Cannot cancel a workflow run that is completed. (HTTP 409)' >&2; exit 1 ;;
+  *) printf 'HTTP/2.0 403 Forbidden\r\nx-ratelimit-remaining: 4999\r\n\r\n{"message":"Resource not accessible by personal access token"}'
+     echo 'gh: Resource not accessible by personal access token (HTTP 403)' >&2; exit 1 ;;
+esac"#,
+        );
+        let c = CancellationToken::new();
+        let context = test_context();
+        let run = |id| ActionTarget::Pipeline { id };
+        assert_eq!(
+            host.run_action(&scope(&s), &context, run(9001), ActionKind::Retry, &c)
+                .await
+                .unwrap(),
+            ActionResult {
+                pipeline_id: Some(9001),
+                job_id: None
+            }
+        );
+        let finished = host
+            .run_action(&scope(&s), &context, run(9002), ActionKind::Cancel, &c)
+            .await
+            .unwrap_err();
+        assert_eq!(finished.code, "host_rejected");
+        assert_eq!(finished.message, "This workflow run already finished.");
+        let refused = host
+            .run_action(
+                &scope(&s),
+                &context,
+                ActionTarget::Job { id: 502 },
+                ActionKind::Retry,
+                &c,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code, "forbidden");
+        let calls = std::fs::read_to_string(s.path("calls")).unwrap();
+        assert_eq!(
+            calls.lines().next(),
+            Some(
+                "api -i --method POST -H X-GitHub-Api-Version: 2022-11-28 --hostname github.com repos/team/repo/actions/runs/9001/rerun"
+            )
+        );
     }
 }

@@ -19,6 +19,7 @@ import {
   createEnvironmentRpcSubscriptionAtomFamily,
   environmentRpcKey,
 } from "./runtime.ts";
+import { vcsCommandConcurrency, vcsCommandScheduler } from "./vcsCommandScheduler.ts";
 
 /**
  * A read's `refresh` kind without a second cache entry. Views key their atoms with
@@ -104,6 +105,14 @@ export function createPipelinesEnvironmentAtoms<R, E>(
       label: "environment-data:pipelines:subscribe",
       tag: WS_METHODS.pipelinesSubscribe,
       idleTtlMs: 0,
+    }),
+    // Retry, cancel and play queue with the other source control writes, as
+    // `pullRequests.runAction` does; the views re-read what changed.
+    runAction: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:pipelines:run-action",
+      tag: WS_METHODS.pipelinesRunAction,
+      scheduler: vcsCommandScheduler,
+      concurrency: vcsCommandConcurrency,
     }),
   };
 }

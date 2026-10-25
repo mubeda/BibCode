@@ -38,6 +38,8 @@ import { useVisibleModuleRefresh } from "../../repositoryModule/useVisibleModule
 import { Button } from "../../ui/button";
 import { PermissionButton } from "../../ui/permission-button";
 import { Skeleton } from "../../ui/skeleton";
+import { PipelineActions, type PipelineActionOutcome } from "../actions/PipelineActions";
+import { pipelineActionDestination } from "../actions/pipelineActions.logic";
 import { JobLog, type JobLogSource } from "../log/JobLog";
 import { PipelineStatusIcon } from "../shared/PipelineStatusIcon";
 import { pipelineStatusText } from "../shared/pipelineStatus.logic";
@@ -51,7 +53,7 @@ import {
   pipelineJobActions,
   shownJob,
 } from "./pipelineJob.logic";
-import { PIPELINE_JOB_ROUTE } from "./pipelineJobRoute";
+import { PIPELINE_JOB_ROUTE, pipelineJobLink } from "./pipelineJobRoute";
 
 const HOST_NAMES: Record<PullRequestsProviderKind, string> = { github: "GitHub", gitlab: "GitLab" };
 /** A running pipeline is re-read this often while its stream is down (GitLab's poller cadence). */
@@ -291,7 +293,58 @@ export function PipelineJobView({
     [jobId, navigate, pipelineId, projectId, routeEnvironmentId],
   );
 
-  const actions = job ? pipelineJobActions(job, mutationsDisabledReason) : null;
+  const actions = job
+    ? pipelineJobActions(
+        job,
+        mutationsDisabledReason,
+        context.provider,
+        context.repositoryPermission,
+      )
+    : null;
+  // A GitLab job retry opens the new job; a GitHub re-run is the run's next attempt,
+  // whose page opens. Anything else re-reads the job and its pipeline.
+  const revalidateBoth = useCallback(() => {
+    revalidateJob();
+    revalidateDetail();
+  }, [revalidateDetail, revalidateJob]);
+  const onActionSettled = useCallback(
+    ({ request, result }: PipelineActionOutcome) => {
+      const destination =
+        result === null
+          ? null
+          : pipelineActionDestination({
+              provider: context.provider,
+              request,
+              result,
+              shown: { pipelineId, attempt: null, jobId },
+            });
+      if (destination?.kind === "job") {
+        void navigate(
+          pipelineJobLink({
+            environmentId: routeEnvironmentId,
+            projectId,
+            pipelineId: destination.pipelineId,
+            jobId: destination.jobId,
+          }),
+        );
+        return;
+      }
+      if (destination?.kind === "pipeline") {
+        void navigate({
+          to: "/project/$environmentId/$projectId/pipelines/$pipelineId",
+          params: {
+            environmentId: routeEnvironmentId,
+            projectId,
+            pipelineId: String(destination.pipelineId),
+          },
+        });
+        return;
+      }
+      revalidateBoth();
+    },
+    [context.provider, jobId, navigate, pipelineId, projectId, revalidateBoth, routeEnvironmentId],
+  );
+  const jobTargetRef = { _tag: "job", id: jobId } as const;
   const backedOff = waitSeconds !== null;
   const startedLabel =
     job?.startedAt && Number.isFinite(Date.parse(job.startedAt))
@@ -300,156 +353,181 @@ export function PipelineJobView({
   const blockingError = job === null ? jobError : null;
 
   return (
-    <section aria-label="Job" className="flex h-full min-h-0 min-w-0 flex-1 flex-col bg-background">
-      <RepositoryModule.Header>
-        <RepositoryModule.Identity />
-        <RepositoryModule.WorktreeSelect />
-        <PermissionButton
-          variant="outline"
-          size="sm"
-          onClick={refreshAll}
-          permission={
-            backedOff
-              ? { allowed: false, reason: "The host asked BiBCode to wait before reading again." }
-              : { allowed: true, reason: null }
-          }
-        >
-          <RefreshCwIcon aria-hidden="true" />
-          Refresh
-        </PermissionButton>
-        {job?.url ? (
-          <RepositoryModuleExternalLink href={job.url} className="text-xs">
-            Open on {hostName}
-          </RepositoryModuleExternalLink>
-        ) : null}
-      </RepositoryModule.Header>
-      <div className="border-b border-border px-4 py-3">
-        <nav
-          aria-label="Breadcrumb"
-          className="mb-1 flex items-center gap-1 text-xs text-muted-foreground"
-        >
-          <Link
-            to="/project/$environmentId/$projectId/pipelines"
-            params={{ environmentId: routeEnvironmentId, projectId }}
-            className="underline-offset-4 hover:text-foreground hover:underline"
+    <PipelineActions.Provider
+      scope={scope}
+      provider={context.provider}
+      revision={detail?.revision ?? null}
+      onSettled={onActionSettled}
+    >
+      <section
+        aria-label="Job"
+        className="flex h-full min-h-0 min-w-0 flex-1 flex-col bg-background"
+      >
+        <RepositoryModule.Header>
+          <RepositoryModule.Identity />
+          <RepositoryModule.WorktreeSelect />
+          <PermissionButton
+            variant="outline"
+            size="sm"
+            onClick={refreshAll}
+            permission={
+              backedOff
+                ? { allowed: false, reason: "The host asked BiBCode to wait before reading again." }
+                : { allowed: true, reason: null }
+            }
           >
-            Pipelines
-          </Link>
-          <ChevronRightIcon aria-hidden="true" className="size-3" />
-          {pipeline?.url ? (
-            <RepositoryModuleExternalLink
-              href={pipeline.url}
-              className="no-underline hover:underline"
-            >
-              {pipeline.label}
+            <RefreshCwIcon aria-hidden="true" />
+            Refresh
+          </PermissionButton>
+          {job?.url ? (
+            <RepositoryModuleExternalLink href={job.url} className="text-xs">
+              Open on {hostName}
             </RepositoryModuleExternalLink>
-          ) : (
-            <span className="tabular-nums">{pipeline?.label ?? `#${pipelineId}`}</span>
-          )}
-        </nav>
-        {job === null ? (
-          blockingError === null ? (
-            <div role="status" className="space-y-2">
-              <span className="sr-only">Loading the job…</span>
-              <Skeleton className="h-6 w-56" />
-              <Skeleton className="h-4 w-80" />
-            </div>
-          ) : null
-        ) : (
-          <div className="flex flex-wrap items-start gap-3">
-            <div className="min-w-0 flex-1 space-y-0.5">
-              <h1 className="flex min-w-0 items-center gap-2 text-base font-semibold">
-                <PipelineStatusIcon status={job.status} warnings={job.warnings} />
-                <span className="truncate">{job.name}</span>
-                <span className="shrink-0 text-sm font-normal text-muted-foreground">
-                  {statusText}
-                </span>
-              </h1>
-              <p className="text-xs text-muted-foreground">
-                Job #{job.id}
-                {stage ? ` · stage ${stage}` : ""}
-                {startedLabel ? ` · started ${startedLabel}` : ""}
-              </p>
-            </div>
-            {actions ? (
-              <div className="flex shrink-0 items-center gap-1">
-                {actions.retry ? (
-                  <PermissionButton size="sm" variant="outline" permission={actions.retry}>
-                    <RotateCcwIcon aria-hidden="true" />
-                    Retry
-                  </PermissionButton>
-                ) : null}
-                {actions.cancel ? (
-                  <PermissionButton size="sm" variant="outline" permission={actions.cancel}>
-                    <CircleStopIcon aria-hidden="true" />
-                    Cancel
-                  </PermissionButton>
-                ) : null}
-                {actions.play ? (
-                  <PermissionButton size="sm" variant="outline" permission={actions.play}>
-                    <PlayIcon aria-hidden="true" />
-                    Run
-                  </PermissionButton>
-                ) : null}
-              </div>
-            ) : null}
-          </div>
-        )}
-        <p aria-live="polite" className="sr-only">
-          {announcement}
-        </p>
-      </div>
-      {blockingError !== null ? (
-        <JobReadError
-          error={blockingError}
-          hostName={hostName}
-          url={snapshotQuery.data?.job?.payload.job.url ?? null}
-          waitSeconds={waitSeconds}
-          onRetry={refreshAll}
-          back={
+          ) : null}
+        </RepositoryModule.Header>
+        <div className="border-b border-border px-4 py-3">
+          <nav
+            aria-label="Breadcrumb"
+            className="mb-1 flex items-center gap-1 text-xs text-muted-foreground"
+          >
             <Link
               to="/project/$environmentId/$projectId/pipelines"
               params={{ environmentId: routeEnvironmentId, projectId }}
-              className="text-xs underline underline-offset-4"
+              className="underline-offset-4 hover:text-foreground hover:underline"
             >
-              Back to pipelines
+              Pipelines
             </Link>
-          }
-        />
-      ) : source === null || job === null ? null : (
-        <JobLog.Provider
-          source={source}
-          scope={scope}
-          initialOffset={at}
-          rawLogUrl={jobDetail?.rawLogUrl ?? null}
-          hostName={hostName}
-          onLineLink={onLineLink}
-        >
-          <div className="@container flex min-h-0 flex-1">
-            <JobBody
-              details={
-                <PipelineJobDetails
-                  job={job}
-                  jobDetail={jobDetail}
-                  detail={detail}
-                  detailError={detailError?.message ?? detailQuery.error}
-                  provider={context.provider}
-                >
-                  {sourceKind === "on_host" ? null : <PipelineJobSteps steps={steps} />}
-                </PipelineJobDetails>
-              }
-              inPlaceOfLog={
-                sourceKind === "on_host" && steps.length > 0 ? (
-                  <div className="overflow-auto p-4 text-xs" data-text-surface="background">
-                    <PipelineJobSteps steps={steps} />
-                  </div>
-                ) : null
-              }
-            />
-          </div>
-        </JobLog.Provider>
-      )}
-    </section>
+            <ChevronRightIcon aria-hidden="true" className="size-3" />
+            {pipeline?.url ? (
+              <RepositoryModuleExternalLink
+                href={pipeline.url}
+                className="no-underline hover:underline"
+              >
+                {pipeline.label}
+              </RepositoryModuleExternalLink>
+            ) : (
+              <span className="tabular-nums">{pipeline?.label ?? `#${pipelineId}`}</span>
+            )}
+          </nav>
+          {job === null ? (
+            blockingError === null ? (
+              <div role="status" className="space-y-2">
+                <span className="sr-only">Loading the job…</span>
+                <Skeleton className="h-6 w-56" />
+                <Skeleton className="h-4 w-80" />
+              </div>
+            ) : null
+          ) : (
+            <div className="flex flex-wrap items-start gap-3">
+              <div className="min-w-0 flex-1 space-y-0.5">
+                <h1 className="flex min-w-0 items-center gap-2 text-base font-semibold">
+                  <PipelineStatusIcon status={job.status} warnings={job.warnings} />
+                  <span className="truncate">{job.name}</span>
+                  <span className="shrink-0 text-sm font-normal text-muted-foreground">
+                    {statusText}
+                  </span>
+                </h1>
+                <p className="text-xs text-muted-foreground">
+                  Job #{job.id}
+                  {stage ? ` · stage ${stage}` : ""}
+                  {startedLabel ? ` · started ${startedLabel}` : ""}
+                </p>
+              </div>
+              {actions ? (
+                <div className="flex shrink-0 items-center gap-1">
+                  {actions.retry ? (
+                    <PipelineActions.Button
+                      size="sm"
+                      variant="outline"
+                      request={{ target: jobTargetRef, action: "retry" }}
+                      permission={actions.retry}
+                      icon={<RotateCcwIcon aria-hidden="true" />}
+                    >
+                      Retry
+                    </PipelineActions.Button>
+                  ) : null}
+                  {actions.cancel ? (
+                    <PipelineActions.Button
+                      size="sm"
+                      variant="outline"
+                      request={{ target: jobTargetRef, action: "cancel" }}
+                      permission={actions.cancel}
+                      icon={<CircleStopIcon aria-hidden="true" />}
+                    >
+                      Cancel
+                    </PipelineActions.Button>
+                  ) : null}
+                  {actions.play ? (
+                    <PipelineActions.Button
+                      size="sm"
+                      variant="outline"
+                      request={{ target: jobTargetRef, action: "play" }}
+                      permission={actions.play}
+                      icon={<PlayIcon aria-hidden="true" />}
+                    >
+                      Run
+                    </PipelineActions.Button>
+                  ) : null}
+                </div>
+              ) : null}
+            </div>
+          )}
+          <p aria-live="polite" className="sr-only">
+            {announcement}
+          </p>
+        </div>
+        {blockingError !== null ? (
+          <JobReadError
+            error={blockingError}
+            hostName={hostName}
+            url={snapshotQuery.data?.job?.payload.job.url ?? null}
+            waitSeconds={waitSeconds}
+            onRetry={refreshAll}
+            back={
+              <Link
+                to="/project/$environmentId/$projectId/pipelines"
+                params={{ environmentId: routeEnvironmentId, projectId }}
+                className="text-xs underline underline-offset-4"
+              >
+                Back to pipelines
+              </Link>
+            }
+          />
+        ) : source === null || job === null ? null : (
+          <JobLog.Provider
+            source={source}
+            scope={scope}
+            initialOffset={at}
+            rawLogUrl={jobDetail?.rawLogUrl ?? null}
+            hostName={hostName}
+            onLineLink={onLineLink}
+          >
+            <div className="@container flex min-h-0 flex-1">
+              <JobBody
+                details={
+                  <PipelineJobDetails
+                    job={job}
+                    jobDetail={jobDetail}
+                    detail={detail}
+                    detailError={detailError?.message ?? detailQuery.error}
+                    provider={context.provider}
+                  >
+                    {sourceKind === "on_host" ? null : <PipelineJobSteps steps={steps} />}
+                  </PipelineJobDetails>
+                }
+                inPlaceOfLog={
+                  sourceKind === "on_host" && steps.length > 0 ? (
+                    <div className="overflow-auto p-4 text-xs" data-text-surface="background">
+                      <PipelineJobSteps steps={steps} />
+                    </div>
+                  ) : null
+                }
+              />
+            </div>
+          </JobLog.Provider>
+        )}
+      </section>
+    </PipelineActions.Provider>
   );
 }
 

@@ -138,6 +138,7 @@ pub fn is_long_running(method: &str) -> bool {
             | "pipelines.get"
             | "pipelines.getJob"
             | "pipelines.getJobLog"
+            | "pipelines.runAction"
             | "updater.check"
             | "updater.install"
             | "server.updateProvider"
@@ -937,6 +938,7 @@ mod tests {
             "pipelines.getJobLog",
             "pipelines.readSnapshot",
             "pipelines.subscribe",
+            "pipelines.runAction",
         ] {
             assert!(is_background(method), "{method}");
         }
@@ -1165,13 +1167,14 @@ mod tests {
         // git command timeout. A slow one is a slowness worth reporting.
         assert!(!is_long_running("worktree.adopt"));
         assert!(!is_long_running("gitManager.previewMerge"));
-        // Every host-bound Pipelines read waits on `glab` or `gh`; the
-        // snapshot read and the stream do not.
+        // Every host-bound Pipelines read and the action wait on `glab` or
+        // `gh`; the snapshot read and the stream do not.
         for method in [
             "pipelines.list",
             "pipelines.get",
             "pipelines.getJob",
             "pipelines.getJobLog",
+            "pipelines.runAction",
         ] {
             assert!(is_long_running(method), "{method}");
         }

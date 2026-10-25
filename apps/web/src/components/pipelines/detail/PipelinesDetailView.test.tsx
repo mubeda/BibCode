@@ -42,6 +42,8 @@ const h = vi.hoisted(() => ({
   readSnapshot: vi.fn((args: { input: unknown }) => ({ kind: "readSnapshot", ...args })),
   subscribe: vi.fn((args: { input: unknown }) => ({ kind: "subscribe", ...args })),
   requestTimerRead: vi.fn(),
+  actions: vi.fn(),
+  actionResult: { pipelineId: 4821, jobId: null } as { pipelineId: number; jobId: number | null },
   reads: vi.fn(),
   snapshotReads: vi.fn(),
   inflight: [] as (() => void)[],
@@ -52,6 +54,13 @@ vi.mock("../../../state/pipelines", () => ({
     readSnapshot: h.readSnapshot,
     subscribe: h.subscribe,
     requestTimerRead: h.requestTimerRead,
+    runAction: { label: "environment-data:pipelines:run-action" },
+  },
+}));
+vi.mock("../../../state/use-atom-command", () => ({
+  useAtomCommand: () => async (value: unknown) => {
+    h.actions(value);
+    return { _tag: "Success", value: h.actionResult };
   },
 }));
 vi.mock("../../../state/query", () => ({
@@ -158,6 +167,7 @@ const refreshContext = vi.fn();
 
 function moduleValue(
   repositoryContext: typeof gitlabContext | typeof githubContext,
+  mutationsDisabledReason: string | null = SERVER_TOO_OLD,
 ): RepositoryModuleValue {
   return {
     state: {
@@ -173,7 +183,7 @@ function moduleValue(
       freshPageKey: null,
     },
     actions: { rescan: vi.fn(), recover: vi.fn(), setCwd: vi.fn(), consumeFreshPage: vi.fn() },
-    meta: { module: pipelinesModule, projectRef, mutationsDisabledReason: SERVER_TOO_OLD },
+    meta: { module: pipelinesModule, projectRef, mutationsDisabledReason },
   };
 }
 
@@ -187,6 +197,8 @@ async function render(
     provider?: "gitlab" | "github";
     attempt?: number | null;
     wrap?: (node: ReactNode) => ReactNode;
+    /** The server serves `pipelines.runAction`. */
+    actions?: boolean;
   } = {},
 ) {
   const view = (
@@ -197,7 +209,10 @@ async function render(
       onBackoffChange={vi.fn()}
     />
   );
-  const value = moduleValue(options.provider === "github" ? githubContext : gitlabContext);
+  const value = moduleValue(
+    options.provider === "github" ? githubContext : gitlabContext,
+    options.actions ? null : SERVER_TOO_OLD,
+  );
   await act(async () =>
     root.render(
       <PullRequestsContextRefresh value={refreshContext}>
@@ -255,6 +270,8 @@ beforeEach(() => {
   h.snapshot = null;
   h.latestSnapshot = null;
   h.navigate.mockClear();
+  h.actions.mockClear();
+  h.actionResult = { pipelineId: 4821, jobId: null };
   h.nextSnapshot = null;
   h.changed = null;
   h.streamFailed = false;
@@ -320,6 +337,64 @@ describe("PipelinesDetailView header", () => {
     const retry = button("Retry");
     expect(retry.disabled).toBe(true);
     expect(retry.title).toBe(SERVER_TOO_OLD);
+  });
+});
+
+describe("PipelinesDetailView actions", () => {
+  it("retries the pipeline and reads it again", async () => {
+    await render({ actions: true });
+    const before = h.reads.mock.calls.length;
+    await act(async () => button("Retry").click());
+    await settle();
+    expect(h.actions).toHaveBeenCalledExactlyOnceWith({
+      environmentId: "env",
+      input: { cwd: "/repo", target: { _tag: "pipeline", id: 4821 }, action: "retry" },
+    });
+    expect(h.reads.mock.calls.length).toBeGreaterThan(before);
+    expect(h.navigate).not.toHaveBeenCalled();
+  });
+
+  it("opens a retried GitLab job's new job page", async () => {
+    h.actionResult = { pipelineId: 4821, jobId: 1001 };
+    await render({ actions: true });
+    await act(async () => button("Retry rspec").click());
+    expect(h.actions).toHaveBeenCalledWith({
+      environmentId: "env",
+      input: { cwd: "/repo", target: { _tag: "job", id: 998 }, action: "retry" },
+    });
+    expect(h.navigate).toHaveBeenCalledWith({
+      to: "/project/$environmentId/$projectId/pipelines/$pipelineId/jobs/$jobId",
+      params: { environmentId: "env", projectId: "p", pipelineId: "4821", jobId: "1001" },
+      search: {},
+    });
+  });
+
+  it("opens a GitHub run's latest attempt after re-running its failed jobs from an earlier one", async () => {
+    h.detail = pipelineDetail({
+      pipeline: { attempt: 1, permissions: { retry: "unknown", cancel: "unknown" } },
+    });
+    h.actionResult = { pipelineId: 4821, jobId: null };
+    await render({ provider: "github", attempt: 1, actions: true });
+    await act(async () => button("Retry failed jobs").click());
+    expect(h.actions).toHaveBeenCalledWith({
+      environmentId: "env",
+      input: { cwd: "/repo", target: { _tag: "pipeline", id: 4821 }, action: "retry_failed" },
+    });
+    expect(h.navigate).toHaveBeenCalledWith({
+      to: "/project/$environmentId/$projectId/pipelines/$pipelineId",
+      params: { environmentId: "env", projectId: "p", pipelineId: "4821" },
+    });
+  });
+
+  it("names GitHub's refusal at Retry once the server remembers it", async () => {
+    h.detail = pipelineDetail({
+      pipeline: { permissions: { retry: "denied", cancel: "unknown" } },
+    });
+    await render({ provider: "github", actions: true });
+    expect(button("Retry").disabled).toBe(true);
+    expect(button("Retry").title).toBe(
+      "GitHub refused: this sign-in can't run Actions for this repository. A fine-grained token needs Actions write.",
+    );
   });
 });
 

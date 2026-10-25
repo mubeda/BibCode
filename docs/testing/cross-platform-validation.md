@@ -699,9 +699,10 @@ For GitLab poller, pipeline or snapshot changes, also run the ignored polling
 harness with `bash scripts/measure-gitlab-merge-request-load.sh` and record its
 `HARNESS_SUBSCRIBE_JSON` (requests an hour, spawns, delivery) in the report.
 
-For Pipelines server reads (`pipelines.*`: the GitLab and GitHub list,
-pipeline, job and log reads, `LogCache`, the range probe, the pipelines poller,
-the shared 429 ladder, or their snapshot rows), run from the repository root:
+For Pipelines server reads and actions (`pipelines.*`: the GitLab and GitHub
+list, pipeline, job and log reads, `pipelines.runAction` and its remembered
+refusals, `LogCache`, the range probe, the pipelines poller, the shared 429
+ladder, or their snapshot rows), run from the repository root:
 
 ```sh
 cargo test -p bibcode-server --lib pull_requests::pipelines -j 2
@@ -711,6 +712,7 @@ cargo test -p bibcode-server --lib pull_requests::backoff -j 2
 cargo test -p bibcode-server --lib pull_requests::gitlab::poll -j 2
 cargo test -p bibcode-server --lib pull_requests::tripwires -j 2
 cargo test -p bibcode-server --lib production::pipelines_rpc -j 2
+cargo test -p bibcode-server --lib -j 2 -- rpc::methods auth::scope diagnostics::profiler::latency
 cargo test -p bibcode-server --test rpc_wire -j 2
 vp test run packages/contracts/src/pipelines.test.ts packages/contracts/src/environment.test.ts packages/contracts/src/settings.test.ts
 ```
@@ -2657,9 +2659,14 @@ tag, one merge request pipeline) and a GitHub repository.
    hiding the window stops reading. Make the host answer 429 (or block it
    with a proxy): the list counts down, Refresh and Retry are disabled with
    their reason, and one read follows the deadline.
-6. Retry and Cancel show only where they apply and are disabled with "Update
-   the server to retry and cancel pipelines."; a Guest or Reporter account sees
-   its own refusal. The row menu's Open on GitLab opens the host's page.
+6. Retry and Cancel show only where they apply; against a server without
+   `pipelinesMutations` they are disabled with "Update the server to retry and
+   cancel pipelines.", and a Guest or Reporter account sees its own refusal.
+   Retry a failed pipeline from its row: the button spins until the row shows
+   it running again, with no confirmation; double-click it and the server
+   trace shows one `glab api --method POST …/retry`. Cancel a running one: the
+   row turns canceled. Retry a job another window already retried: the
+   message says to refresh, and Retry is not disabled for the project. The row menu's Open on GitLab opens the host's page.
 7. Open a GitHub repository with two workflows: the list shows one row per
    workflow run ("CI #312"), its PR or branch, badges from the event
    (scheduled, merge request, manual run, retried), and no stage strip.
@@ -2672,7 +2679,12 @@ tag, one merge request pipeline) and a GitHub repository.
    **Jobs** column, the run's artifacts below it (each opens the run's page on
    GitHub), and, for a re-run run, the **Attempt** select; attempt 1 of a run
    that failed then passed says "Failed". A cancelled run reads "Canceled", a
-   fork PR waiting for approval "Waiting for approval".
+   fork PR waiting for approval "Waiting for approval". Re-run a failed run
+   from attempt 1's page with **Retry failed jobs**: the page opens the run's
+   latest attempt. Cancel a running run: it shows **Canceling** until GitHub
+   reports it canceled. With a fine-grained token without Actions write, Retry
+   says "GitHub refused: …" in a message and stays disabled with that reason in
+   every window, with no sign-out, until a rescan.
 8. Choose a row (anywhere but its buttons): the pipeline page opens in
    BiBCode, and the project header stays highlighted after reload. Hover a row
    first, then open it within 5 s: no second `pipelines.get` read. The header
@@ -2702,8 +2714,11 @@ running job, a manual job, an erased job and a job with artifacts.
 1. Open a job from its URL
    (`/project/<env>/<project>/pipelines/<pipeline>/jobs/<job>`): the header
    shows status, name, `Job #<id> · stage <stage> · started …`, **Open on
-   GitLab** and the disabled Retry, Cancel or Run with "Update the server to
-   retry and cancel pipelines."; the project header stays highlighted.
+   GitLab** and Retry, Cancel or Run where they apply (disabled with "Update
+   the server to retry and cancel pipelines." against a server without
+   `pipelinesMutations`); the project header stays highlighted. Retry the
+   failed job: the new job's page opens. Run the manual job and cancel the
+   running one: each page follows the job's new status.
    Reopen it: the stored job paints before any `glab` spawn. A non-numeric
    pipeline or job id returns to the list.
 2. The finished log opens at its end with GitLab's colors in both themes,
@@ -2738,7 +2753,8 @@ running job, a manual job, an erased job and a job with artifacts.
    `actions/jobs/<id>/logs` read. When the job finishes, its log loads once,
    its details list the steps and the run's artifacts, and choosing a step
    scrolls to where its output starts. A log past GitHub's retention says
-   "This log has expired."
+   "This log has expired." A GitHub job offers Retry (when it finished without
+   passing) and no Cancel or Run; Retry opens the run's latest attempt.
 
 ### Remote-hosted Git Manager run
 

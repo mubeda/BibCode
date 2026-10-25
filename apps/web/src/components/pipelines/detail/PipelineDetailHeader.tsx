@@ -11,7 +11,8 @@ import { memo, type ReactNode } from "react";
 import { formatRelativeTimeLabel } from "../../../timestampFormat";
 import { PullRequestsActor } from "../../pullRequests/shared/PullRequestsActor";
 import { RepositoryModuleExternalLink } from "../../repositoryModule/RepositoryModuleExternalLink";
-import { PermissionButton } from "../../ui/permission-button";
+import { PipelineActions } from "../actions/PipelineActions";
+import type { RepositoryPermission } from "../actions/pipelineActions.logic";
 import { pipelineRowActions } from "../list/pipelinesList.logic";
 import { PipelineStatusIcon } from "../shared/PipelineStatusIcon";
 import { formatPipelineDuration, pipelineStatusText } from "../shared/pipelineStatus.logic";
@@ -71,18 +72,28 @@ export const PipelineDetailHeader = memo(function PipelineDetailHeader({
   provider,
   projectRef,
   mutationsDisabledReason,
+  repositoryPermission,
   children,
 }: {
   detail: PipelinesDetail;
   provider: PullRequestsProviderKind;
   projectRef: ScopedProjectRef;
   mutationsDisabledReason: string | null;
+  /** The signed-in role, which tells GitHub's refusal of an action from a missing role. */
+  repositoryPermission: RepositoryPermission | null;
   /** Controls the page adds beside the actions, such as GitHub's Attempt select. */
   children?: ReactNode;
 }) {
   const { pipeline, commit } = detail;
-  const status = pipelineStatusText(pipeline.status, pipeline.warnings, pipeline.reason);
-  const actions = pipelineRowActions(pipeline, mutationsDisabledReason, provider);
+  const shownStatus = PipelineActions.useShownStatus(pipeline);
+  const status = pipelineStatusText(shownStatus, pipeline.warnings, pipeline.reason);
+  const actions = pipelineRowActions(
+    pipeline,
+    mutationsDisabledReason,
+    provider,
+    repositoryPermission,
+  );
+  const target = { _tag: "pipeline", id: pipeline.id } as const;
   const jobs = pipelineJobCount(detail);
   const hostName = HOST_NAMES[provider];
   const name = provider === "gitlab" ? `Pipeline ${pipeline.label}` : pipeline.label;
@@ -91,7 +102,7 @@ export const PipelineDetailHeader = memo(function PipelineDetailHeader({
       <div className="flex flex-wrap items-start gap-3">
         <div className="min-w-0 flex-1 space-y-1">
           <p className="flex items-center gap-1.5 text-sm font-medium">
-            <PipelineStatusIcon status={pipeline.status} warnings={pipeline.warnings} />
+            <PipelineStatusIcon status={shownStatus} warnings={pipeline.warnings} />
             {status}
           </p>
           <h2 className="text-base font-semibold text-balance break-words">
@@ -116,19 +127,35 @@ export const PipelineDetailHeader = memo(function PipelineDetailHeader({
         <div className="flex shrink-0 flex-wrap items-center gap-2">
           {children}
           {actions.retry ? (
-            <PermissionButton variant="outline" size="sm" permission={actions.retry}>
+            <PipelineActions.Button
+              variant="outline"
+              size="sm"
+              request={{ target, action: "retry" }}
+              permission={actions.retry}
+            >
               Retry
-            </PermissionButton>
+            </PipelineActions.Button>
           ) : null}
           {actions.retry && provider === "github" ? (
-            <PermissionButton variant="outline" size="sm" permission={actions.retry}>
+            <PipelineActions.Button
+              variant="outline"
+              size="sm"
+              request={{ target, action: "retry_failed" }}
+              permission={actions.retry}
+            >
               Retry failed jobs
-            </PermissionButton>
+            </PipelineActions.Button>
           ) : null}
           {actions.cancel ? (
-            <PermissionButton variant="outline" size="sm" permission={actions.cancel}>
+            <PipelineActions.Button
+              variant="outline"
+              size="sm"
+              request={{ target, action: "cancel" }}
+              permission={actions.cancel}
+              from={pipeline.status}
+            >
               Cancel
-            </PermissionButton>
+            </PipelineActions.Button>
           ) : null}
           {pipeline.url ? (
             <RepositoryModuleExternalLink href={pipeline.url} className="text-xs">

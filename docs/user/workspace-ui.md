@@ -1122,17 +1122,20 @@ its first page every 20 seconds while one of its runs is still running, and
 not at all once every shown run has finished. **Refresh** reloads the
 first page. When GitLab asks BiBCode to slow down, the list keeps what it
 shows, counts down to the host's retry time with Refresh disabled, and then
-reads again. Retry and Cancel appear on rows they apply to; until the server
-offers pipeline actions they stay disabled and say why, and a row your
-account cannot retry says that instead.
+reads again. **Retry** appears on a finished pipeline that did not pass and
+**Cancel** on one that is still running; on GitHub the row's menu also has
+**Retry failed jobs**. A row your account cannot act on says why, and an older
+server says to update it.
 
 A pipeline's page (`/pipelines/<id>`) also opens on the last stored copy,
 then the host's. Its header shows the status (for example **Failed**,
 **Passed with warnings** or **Waiting for approval**), the title, "Pipeline
 #4821 created 2h ago by Ana Rossi · finished 1h ago", the commit (its short
 id opens it on the host), the branch or tag (a merge request opens its page in
-BiBCode), the job count, the duration and the queued time, with Retry, Cancel
-and **Open on GitLab**. Below it the stages sit side by side in GitLab's order
+BiBCode), the job count, the duration and the queued time, with Retry, Cancel,
+**Retry failed jobs** (GitHub) and **Open on GitLab**. Each job row has one
+action where it applies: **Run** for a manual job, **Cancel** for one still
+running, **Retry** for a finished one. Below it the stages sit side by side in GitLab's order
 on a wide panel, scrolling sideways, and stacked on a narrow one. Each stage
 shows its status, name and job count; each job its status, name and
 duration. A parallel group such as `rspec 3` is one row that expands to its
@@ -1168,8 +1171,22 @@ queued, the runner, the pipeline source, the runner tags, the job's artifacts
 (size, expiry, and **Download** and **Browse** links to GitLab's pages), the
 commit, the pipeline and the stage's other jobs: pick a stage to see its jobs
 and choose one to open its page. Timeout is not shown; neither host's API
-returns it. Retry, Cancel and Run (for a manual job) appear where they apply
-and stay disabled with their reason until the server offers job actions.
+returns it. Retry, Cancel and Run (for a manual job) appear where they apply.
+A GitHub job offers only Retry: GitHub re-runs one job, as the run's next
+attempt, but cancels only whole runs.
+
+Actions run at once, without a confirmation: a retry only adds work and a
+canceled pipeline can be retried. The button spins until the page shows the
+result. Retrying a GitLab job opens the new job's page; re-running a GitHub
+run from an earlier attempt, or a job from its page, opens the run's latest
+attempt; a GitHub run being canceled shows **Canceling** until GitHub stops it.
+When the host refuses, a message says why. On GitHub, where repository write
+access does not prove you can run Actions, the button then stays disabled in
+every window until you rescan, with "GitHub refused: this sign-in can't run
+Actions for this repository. A fine-grained token needs Actions write." On
+GitLab the page reads the pipeline again and shows what GitLab now allows. A
+refusal never signs you out. When the host asks BiBCode to
+slow down, or a run has already finished, the message says so.
 
 The log keeps the job's colors in the terminal's palette for the current
 theme, numbers its lines, and folds GitLab's collapsible sections (the header

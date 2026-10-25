@@ -423,6 +423,67 @@ impl Changed {
     }
 }
 
+/// What an action acts on: a pipeline (a GitHub workflow run) or one job.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(tag = "_tag", rename_all = "lowercase")]
+pub enum ActionTarget {
+    Pipeline { id: u64 },
+    Job { id: u64 },
+}
+
+impl ActionTarget {
+    pub(crate) fn id(self) -> u64 {
+        match self {
+            Self::Pipeline { id } | Self::Job { id } => id,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionKind {
+    Retry,
+    RetryFailed,
+    Cancel,
+    Play,
+}
+
+impl ActionKind {
+    /// The permission an action needs, which a refusal turns `denied`.
+    pub(crate) fn permission(self) -> PermissionKind {
+        match self {
+            Self::Retry | Self::RetryFailed => PermissionKind::Retry,
+            Self::Cancel => PermissionKind::Cancel,
+            Self::Play => PermissionKind::Play,
+        }
+    }
+}
+
+/// The permission fields of rows and jobs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum PermissionKind {
+    Retry,
+    Cancel,
+    Play,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RunActionInput {
+    pub cwd: String,
+    pub target: ActionTarget,
+    pub action: ActionKind,
+}
+
+/// Where the action's result lives: GitLab returns the pipeline, or the job
+/// (a retried job is a new one); a GitHub re-run is the run's next attempt.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ActionResult {
+    pub pipeline_id: Option<u64>,
+    pub job_id: Option<u64>,
+}
+
 /// The terminal set both providers share for GitLab-shaped statuses: nothing
 /// more will run. `manual` and `scheduled` wait for a person or a timer.
 pub(crate) fn is_terminal(status: PipelineStatus) -> bool {
@@ -480,6 +541,32 @@ mod tests {
             }))
             .unwrap(),
             json!({"_tag":"unavailable","reason":"too_large_live","url":null})
+        );
+    }
+
+    #[test]
+    fn pipelines_action_inputs_and_results_round_trip_the_contract_shape() {
+        let input: RunActionInput = serde_json::from_value(json!({"cwd":"/repo",
+            "target":{"_tag":"job","id":998},"action":"retry_failed"}))
+        .unwrap();
+        assert_eq!(input.target, ActionTarget::Job { id: 998 });
+        assert_eq!(input.action, ActionKind::RetryFailed);
+        assert_eq!(
+            serde_json::to_value(ActionTarget::Pipeline { id: 4821 }).unwrap(),
+            json!({"_tag":"pipeline","id":4821})
+        );
+        assert!(
+            serde_json::from_value::<RunActionInput>(json!({"cwd":"/repo",
+                "target":{"_tag":"stage","id":1},"action":"retry"}))
+            .is_err()
+        );
+        assert_eq!(
+            serde_json::to_value(ActionResult {
+                pipeline_id: Some(4821),
+                job_id: None
+            })
+            .unwrap(),
+            json!({"pipelineId":4821,"jobId":null})
         );
     }
 
