@@ -146,3 +146,31 @@ export function getAnchoredTurnMetrics({
     scrollDeltaToRevealEnd,
   };
 }
+
+export interface ReadingLineGeometry {
+  /** The changing element's top edge, in viewport coordinates like the others. */
+  readonly elementTop: number;
+  /** The top and bottom edges of the timeline row that holds the element. */
+  readonly rowTop: number;
+  readonly rowBottom: number;
+  /** The top edge of the list's visible area. */
+  readonly viewportTop: number;
+  /** The list follows its end, where it already holds the newest line in place. */
+  readonly followingEnd: boolean;
+}
+
+/**
+ * Whether a height change of the element would move the line the user reads, so the timeline
+ * must scroll by the change: the element starts above the visible top inside the first visible
+ * row. The list keeps that row's top in place, so content below the element in the same row
+ * would move. A row wholly above the viewport is left to the list, which keeps the first
+ * visible row in place when one above it changes size; an element in view moves only content
+ * below it.
+ */
+export function isAboveReadingLine(geometry: ReadingLineGeometry): boolean {
+  if (geometry.followingEnd) return false;
+  if (geometry.rowBottom <= geometry.viewportTop || geometry.rowTop > geometry.viewportTop) {
+    return false;
+  }
+  return geometry.elementTop < geometry.viewportTop;
+}

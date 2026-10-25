@@ -63,10 +63,10 @@
       "verificationDate": "2026-09-04",
       "status": "partial",
       "ledgerClosure": {
-        "rows": 247,
+        "rows": 254,
         "statuses": {
           "green": 132,
-          "current": 68,
+          "current": 75,
           "blocked": 42,
           "removed": 5
         }
@@ -884,6 +884,18 @@
       "status": "current"
     },
     {
+      "key": "js:apps/web:dompurify",
+      "name": "dompurify",
+      "current": "3.4.16",
+      "target": "3.4.16",
+      "channel": "stable",
+      "source": "https://www.npmjs.com/package/dompurify",
+      "cohort": "react-ui",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "current",
+      "notes": "Newly chosen exact pin for the Mermaid diagram SVG sanitizer (#171): the newest release at least 14 days old on 2026-10-24; 3.4.17 (2026-10-12) had not cleared the 14-day rule."
+    },
+    {
       "key": "js:apps/web:fake-indexeddb",
       "name": "fake-indexeddb",
       "current": "6.2.5",
@@ -944,6 +956,18 @@
       "notes": "Declared for streamed code-block highlighting; the lockfile already resolved this version through react-markdown."
     },
     {
+      "key": "js:apps/web:jsdom",
+      "name": "jsdom",
+      "current": "30.1.2",
+      "target": "30.1.2",
+      "channel": "stable",
+      "source": "https://www.npmjs.com/package/jsdom",
+      "cohort": "stable-javascript-tooling",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "current",
+      "notes": "Development-only DOM for the Mermaid diagram sanitizer tests (#171): DOMPurify does not run under happy-dom, whose NodeIterator stops once its reference node is removed. Newly chosen exact pin, the newest release at least 14 days old on 2026-10-24; 30.1.3 (2026-10-15) had not cleared the 14-day rule."
+    },
+    {
       "key": "js:apps/web:lexical",
       "name": "lexical",
       "current": "^0.50.0",
@@ -976,6 +1000,18 @@
       "cohort": "stable-javascript-tooling",
       "platforms": ["linux", "macos", "windows"],
       "status": "green"
+    },
+    {
+      "key": "js:apps/web:pele",
+      "name": "pele",
+      "current": "1.3.0",
+      "target": "1.3.0",
+      "channel": "stable",
+      "source": "https://www.npmjs.com/package/pele",
+      "cohort": "react-ui",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "current",
+      "notes": "Newly chosen exact pin for Mermaid diagrams in chat Markdown (#171): the newest release at least 14 days old on 2026-10-24; 1.4.0 (2026-10-14) and later had not cleared the 14-day rule. Minor releases have broken APIs, so upgrades re-run the sanitizer corpus and no-eval guard tests."
     },
     {
       "key": "js:apps/web:react",

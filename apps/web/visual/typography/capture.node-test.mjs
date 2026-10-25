@@ -219,3 +219,65 @@ NodeTest.test(
     }
   },
 );
+
+NodeTest.test("a request for a hostile diagram probe path refuses the capture", async () => {
+  const root = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "bibcode-typography-probe-"));
+  try {
+    await NodeFSP.writeFile(NodePath.join(root, "index.html"), "<p>Owned gallery build</p>");
+    const gallery = await serveGallery(root);
+    let theme = "light";
+    const browser = {
+      setWindowSize: async () => undefined,
+      setTimeout: async () => undefined,
+      url: async (next) => {
+        theme = new URL(next).searchParams.get("theme");
+        // What a diagram that escaped the sanitizer would do: load a same-origin URL.
+        await fetch(`${gallery.url}/mermaid-probe/a`);
+      },
+      waitUntil: async (predicate) => NodeAssert.equal(await predicate(), true),
+      executeAsync: async () => true,
+      execute: async (fn, argument) => {
+        if (argument) return true;
+        if (String(fn).includes("JSON.parse"))
+          return [
+            {
+              id: "badge",
+              modules: ["components/ui/badge.tsx"],
+              owners: ["Badge"],
+              anchors: ["Small unread badge"],
+            },
+          ];
+        if (String(fn).includes("viewport"))
+          return {
+            fixture: "badge",
+            status: "mounted",
+            dark: theme === "dark",
+            viewport: { width: 1440, height: 1200, devicePixelRatio: 1 },
+            fonts: { dmSans: true, jetbrains: true },
+          };
+        return true;
+      },
+      saveScreenshot: async (path) => {
+        const bytes = Buffer.from("owned fake capture transport");
+        await NodeFSP.writeFile(path, bytes);
+        return bytes;
+      },
+      deleteSession: async () => undefined,
+    };
+    const output = NodePath.join(root, "output");
+    await NodeAssert.rejects(
+      captureFixtures({ browser, gallery, output, source: "a".repeat(40), engine: "fake" }),
+      /refused 1 states/,
+    );
+    const manifest = JSON.parse(
+      await NodeFSP.readFile(NodePath.join(output, "manifest.json"), "utf8"),
+    );
+    NodeAssert.equal(manifest.complete, false);
+    NodeAssert.equal(manifest.failures.length, 1);
+    NodeAssert.equal(manifest.failures[0].status, "mermaid-probe-request");
+    NodeAssert.ok(manifest.failures[0].paths.length > 0);
+    NodeAssert.ok(manifest.failures[0].paths.every((path) => path === "/mermaid-probe/a"));
+  } finally {
+    await NodeFSP.rm(root, { recursive: true, force: true });
+  }
+});

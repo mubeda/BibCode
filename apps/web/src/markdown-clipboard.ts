@@ -18,6 +18,13 @@ const SANITIZED_HTML_SELECTOR = [
   ...SKIPPED_CLASS_NAMES.map((className) => `.${className}`),
 ].join(", ");
 
+/**
+ * Marks rendered content that copies as a whole, such as a drawn Mermaid diagram: any
+ * selection touching it copies its `data-markdown-copy` source, even one that lies wholly
+ * inside it, whose cloned contents would otherwise hold only the selected text.
+ */
+const ATOMIC_ATTRIBUTE = "data-markdown-atomic";
+
 export interface MarkdownClipboardPayload {
   text: string;
   html: string;
@@ -47,7 +54,8 @@ function wrapInlineCode(code: string): string {
   return `${fence}${pad}${code}${pad}${fence}`;
 }
 
-function codeFenceFor(code: string): string {
+/** A backtick fence longer than every backtick run in `code`, and at least three long. */
+export function codeFenceFor(code: string): string {
   const longestRun = [...(code.match(/`{3,}/g) ?? [])].reduce(
     (max, run) => Math.max(max, run.length),
     0,
@@ -184,7 +192,9 @@ function serializeNode(node: Node): string {
     return serializeDetails(element);
   }
   const markdownCopy = element.getAttribute("data-markdown-copy");
-  if (markdownCopy !== null) return markdownCopy;
+  if (markdownCopy !== null) {
+    return element.hasAttribute(ATOMIC_ATTRIBUTE) ? `${markdownCopy}\n\n` : markdownCopy;
+  }
   if (isSkippedElement(element)) return "";
 
   const headingLevel = /^H([1-6])$/.exec(element.tagName)?.[1];
@@ -275,7 +285,51 @@ export function serializeTableElementToCsv(table: Element): string {
   return lines.join("\n");
 }
 
+function escapeHtml(text: string): string {
+  return text.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+}
+
+/** An atomic element's HTML flavor: its fenced source as an escaped code block. */
+function atomicCodeBlockHtml(markdownCopy: string): string {
+  const fenced = /^(`{3,}|~{3,})([^\n]*)\n([\s\S]*)\n\1$/.exec(markdownCopy.trim());
+  const language = fenced?.[2]?.trim() ?? "";
+  const code = fenced?.[3] ?? markdownCopy;
+  const className = language
+    ? ` class="language-${escapeHtml(language).replaceAll('"', "&quot;")}"`
+    : "";
+  return `<pre><code${className}>${escapeHtml(code)}</code></pre>`;
+}
+
+/** The atomic element `node` lies in, if any. */
+function atomicElementContaining(node: Node | null | undefined): Element | null {
+  for (let current = node ?? null; current; current = current.parentNode) {
+    if (
+      current.nodeType === Node.ELEMENT_NODE &&
+      (current as Element).hasAttribute(ATOMIC_ATTRIBUTE)
+    ) {
+      return current as Element;
+    }
+  }
+  return null;
+}
+
+/** The atomic elements under `root`, outermost only. */
+function atomicElementsIn(root: Node): Element[] {
+  const found: Element[] = [];
+  for (const child of root.childNodes) {
+    if (child.nodeType !== Node.ELEMENT_NODE) continue;
+    if ((child as Element).hasAttribute(ATOMIC_ATTRIBUTE)) found.push(child as Element);
+    else found.push(...atomicElementsIn(child));
+  }
+  return found;
+}
+
 function sanitizedHtmlFrom(container: Element): string {
+  for (const atomic of atomicElementsIn(container)) {
+    const template = document.createElement("template");
+    template.innerHTML = atomicCodeBlockHtml(atomic.getAttribute("data-markdown-copy") ?? "");
+    atomic.replaceWith(template.content);
+  }
   for (const node of container.querySelectorAll(SANITIZED_HTML_SELECTOR)) {
     if (
       node.classList.contains("chat-markdown-file-link") ||
@@ -299,6 +353,13 @@ export function chatMarkdownClipboardPayload(
   for (let index = 0; index < selection.rangeCount; index += 1) {
     const range = selection.getRangeAt(index);
     if (range.collapsed) continue;
+    const atomic = atomicElementContaining(range.commonAncestorContainer);
+    const atomicCopy = atomic?.getAttribute("data-markdown-copy");
+    if (atomicCopy) {
+      texts.push(atomicCopy.trim());
+      htmls.push(`<meta charset="utf-8">${atomicCodeBlockHtml(atomicCopy)}`);
+      continue;
+    }
     const container = document.createElement("div");
     container.appendChild(range.cloneContents());
     const text = serializeRenderedMarkdownFragment(container);
