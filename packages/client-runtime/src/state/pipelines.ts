@@ -14,6 +14,7 @@ import { EnvironmentSupervisor } from "../connection/supervisor.ts";
 import { request } from "../rpc/client.ts";
 import {
   createEnvironmentQueryAtomFamily,
+  createEnvironmentRpcCommand,
   createEnvironmentRpcQueryAtomFamily,
   createEnvironmentRpcSubscriptionAtomFamily,
   environmentRpcKey,
@@ -83,12 +84,12 @@ export function createPipelinesEnvironmentAtoms<R, E>(
     }),
     /** The next `list`, `get` or `getJob` read of this exact input is sent as `timer`. */
     requestTimerRead: timerReads.request,
-    // The log view's worker owns the chunks; a cached copy would double a large log.
-    getJobLog: createEnvironmentRpcQueryAtomFamily(runtime, {
+    // A one-shot read per window: the log view's worker owns the chunks, so no atom
+    // keeps a second copy of a large log, and every window (tail, follow, earlier
+    // text) is its own input.
+    getJobLog: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:pipelines:get-job-log",
       tag: WS_METHODS.pipelinesGetJobLog,
-      staleTimeMs: 0,
-      idleTtlMs: 0,
     }),
     // A stored payload is a point-in-time copy; every call re-reads it, so the
     // caller's own `shownCopy` / `keepNewestCopy` decides whether to paint it.

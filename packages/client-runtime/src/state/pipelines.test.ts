@@ -48,6 +48,16 @@ describe("Pipelines environment atoms", () => {
     expect(atoms.list({ environmentId, input: listInput })).toBe(list);
   });
 
+  it("reads a log window as a one-shot command, so no atom keeps a copy of the text", () => {
+    const runtime = Atom.runtime(
+      Layer.effect(EnvironmentRegistry, Effect.die("No RPC should execute in this test.")),
+    );
+    const { getJobLog } = createPipelinesEnvironmentAtoms(runtime);
+    expect(Atom.isAtom(getJobLog)).toBe(false);
+    expect(getJobLog.label).toBe("environment-data:pipelines:get-job-log");
+    expect(typeof getJobLog.run).toBe("function");
+  });
+
   it.effect("sends one marked execution as a timer read, for that environment and input only", () =>
     Effect.gen(function* () {
       const marker = createTimerReadMarker();
