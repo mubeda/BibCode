@@ -39,6 +39,7 @@ export const remainingThread: Thread = {
   archivedAt: null,
   deletedAt: null,
   messages: [],
+  reasoning: [],
   proposedPlans: [],
   activities: [],
   session: null,

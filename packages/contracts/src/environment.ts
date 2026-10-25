@@ -84,6 +84,8 @@ export const ExecutionEnvironmentCapabilities = Schema.Struct({
   cliSessionHistory: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   /** `preview.tunnelOpen`, `preview.tunnelWrite` and `preview.tunnelClose` (#69). */
   previewTunnels: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  /** `review.listDiffTools` and `review.openDiffTool`: the Diff panel's **Open with**. */
+  reviewDiffTools: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
 });
 export type ExecutionEnvironmentCapabilities = typeof ExecutionEnvironmentCapabilities.Type;
 

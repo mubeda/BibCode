@@ -240,6 +240,7 @@ function buildProps() {
     contentInsetEndAdjustment: 0,
     onIsAtEndChange: () => {},
     onManualNavigation: () => {},
+    onReasoningRowToggle: () => {},
   };
 }
 
@@ -464,7 +465,9 @@ describe("MessagesTimeline", () => {
     expect(markup).not.toContain('data-maintain-scroll-at-end="enabled"');
     expect(markup).toContain('data-maintain-visible-content-position="object"');
     expect(markup).toContain('data-maintain-visible-content-position-data="true"');
-    expect(markup).toContain('data-maintain-visible-content-position-size="false"');
+    // A row above the first visible one that changes size, such as a diagram replacing its
+    // source, keeps the reading line in place (#171).
+    expect(markup).toContain('data-maintain-visible-content-position-size="true"');
     expect(onAnchorReady).toHaveBeenCalledOnce();
     expect(onAnchorReady).toHaveBeenCalledWith(secondEntry.message.id, 1);
     expect(onAnchorSizeChanged).toHaveBeenCalledWith(secondEntry.message.id, 240);
@@ -2590,5 +2593,183 @@ describe("MessagesTimeline disclosure owner", () => {
     expect(container.querySelector('[data-timeline-row-id="entry-tool"] pre')?.textContent).toBe(
       "npm run build\n\nbuild output",
     );
+  });
+});
+
+describe("MessagesTimeline thinking rows", () => {
+  const REASONING_ID = "reasoning:thread-1:item:msg-1:0";
+  function buildReasoningTimelineEntry(
+    text: string,
+    options: {
+      streaming?: boolean;
+      turnId?: ReturnType<typeof TurnId.make> | null;
+      createdAt?: string;
+    } = {},
+  ) {
+    const createdAt = options.createdAt ?? MESSAGE_CREATED_AT;
+    const reasoning = {
+      id: REASONING_ID,
+      turnId: options.turnId === undefined ? null : options.turnId,
+      text,
+      streaming: options.streaming ?? false,
+      createdAt,
+      updatedAt: createdAt,
+    };
+    return {
+      id: REASONING_ID,
+      kind: "work" as const,
+      createdAt,
+      entry: {
+        id: REASONING_ID,
+        createdAt,
+        turnId: reasoning.turnId,
+        label: reasoning.streaming ? "Thinking" : "Thought",
+        tone: "reasoning" as const,
+        reasoning,
+      },
+    };
+  }
+  const header = (container: HTMLElement) =>
+    container.querySelector<HTMLButtonElement>(`[data-reasoning-id="${REASONING_ID}"] button`);
+  const trace = (container: HTMLElement) =>
+    container.querySelector<HTMLElement>("[data-reasoning-trace]");
+
+  it("starts collapsed as one line and toggles the trace from its whole header", async () => {
+    const onReasoningRowToggle = vi.fn();
+    const container = await mountTimeline({
+      onReasoningRowToggle,
+      timelineEntries: [
+        buildReasoningTimelineEntry("## Checking the `parser`\n\nIt reads one token too many."),
+      ],
+    });
+
+    const button = header(container);
+    expect(button?.tagName).toBe("BUTTON");
+    expect(button?.getAttribute("type")).toBe("button");
+    expect(button?.textContent).toBe("Thought - Checking the parser");
+    expect(button?.getAttribute("aria-expanded")).toBe("false");
+    expect(button?.classList.contains("text-xs")).toBe(true);
+    expect(button?.classList.contains("text-muted-foreground")).toBe(true);
+    expect(button?.querySelector(".truncate")).not.toBeNull();
+    expect(trace(container)).toBeNull();
+
+    await click(button!);
+    expect(header(container)?.getAttribute("aria-expanded")).toBe("true");
+    expect(trace(container)?.textContent).toContain("It reads one token too many.");
+    expect(trace(container)?.querySelector('[data-text-surface="background"]')).not.toBeNull();
+
+    // A native button: Enter and Space activate it, as a click does.
+    header(container)!.focus();
+    expect(document.activeElement).toBe(header(container));
+    await click(header(container)!);
+    expect(header(container)?.getAttribute("aria-expanded")).toBe("false");
+    expect(trace(container)).toBeNull();
+    expect(onReasoningRowToggle).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps a thought the reader opened after its row remounts", async () => {
+    const MessagesTimeline = await loadMessagesTimeline();
+    const entries = [buildReasoningTimelineEntry("Weighing the parser fix.")];
+    const container = await mountTimeline({ timelineEntries: entries });
+    await click(header(container)!);
+    expect(header(container)?.getAttribute("aria-expanded")).toBe("true");
+
+    // LegendList unmounts a row that leaves its render window, and mounts it again on return.
+    const mounted = mountedTrees.find((tree) => tree.container === container)!;
+    const render = (timelineEntries: MessagesTimelineProps["timelineEntries"]) =>
+      act(async () =>
+        mounted.root.render(
+          <MessagesTimeline {...buildProps()} timelineEntries={timelineEntries} />,
+        ),
+      );
+    await render([]);
+    await render(entries);
+
+    expect(header(container)?.getAttribute("aria-expanded")).toBe("true");
+    expect(trace(container)?.textContent).toContain("Weighing the parser fix.");
+  });
+
+  it("labels a streaming thought Thinking", async () => {
+    const container = await mountTimeline({
+      timelineEntries: [buildReasoningTimelineEntry("Reading the ledger", { streaming: true })],
+    });
+    expect(header(container)?.textContent).toBe("Thinking - Reading the ledger");
+  });
+
+  it("shows a folded turn's thought once Worked for is expanded", async () => {
+    const container = await mountTimeline({
+      latestTurn: {
+        turnId: TURN_ID,
+        state: "completed",
+        startedAt: MESSAGE_CREATED_AT,
+        completedAt: LATER_CREATED_AT,
+      },
+      timelineEntries: [
+        buildUserTimelineEntry("Fix it."),
+        buildReasoningTimelineEntry("Weighing the fix.", {
+          turnId: TURN_ID,
+          createdAt: "2026-03-17T19:12:30.000Z",
+        }),
+        buildAssistantTimelineEntry({
+          id: "entry-answer",
+          messageId: "message-answer",
+          text: "Fixed.",
+          turnId: TURN_ID,
+        }),
+      ],
+    });
+    const fold = container.querySelector<HTMLButtonElement>(
+      '[data-timeline-row-kind="turn-fold"] button',
+    );
+    expect(header(container)).toBeNull();
+    expect(container.textContent).toContain("Fixed.");
+    expect(container.textContent).not.toContain("(empty response)");
+
+    await click(fold!);
+    expect(header(container)?.textContent).toBe("Thought - Weighing the fix.");
+  });
+
+  it("follows a live trace's newest text until the reader scrolls up, then resumes at the end", async () => {
+    const MessagesTimeline = await loadMessagesTimeline();
+    const entriesWith = (text: string) => [buildReasoningTimelineEntry(text, { streaming: true })];
+    const container = await mountTimeline({ timelineEntries: entriesWith("First") });
+    await click(header(container)!);
+    const scroller = trace(container)!;
+    let contentHeight = 600;
+    let scrollTop = 0;
+    Object.defineProperty(scroller, "scrollHeight", { get: () => contentHeight });
+    Object.defineProperty(scroller, "clientHeight", { get: () => 256 });
+    Object.defineProperty(scroller, "scrollTop", {
+      get: () => scrollTop,
+      set: (value: number) => {
+        scrollTop = value;
+      },
+    });
+    const mounted = mountedTrees.at(-1)!;
+    const stream = (text: string, height: number) => {
+      contentHeight = height;
+      return act(async () =>
+        mounted.root.render(
+          <MessagesTimeline {...buildProps()} timelineEntries={entriesWith(text)} />,
+        ),
+      );
+    };
+    const scrollTo = (top: number) =>
+      act(async () => {
+        scrollTop = top;
+        scroller.dispatchEvent(new Event("scroll"));
+      });
+
+    await stream("First, then more", 1_000);
+    expect(scrollTop).toBe(1_000);
+
+    await scrollTo(200);
+    await stream("First, then more, and more", 1_500);
+    expect(scrollTop).toBe(200);
+
+    // Back within a few pixels of the end: following resumes.
+    await scrollTo(1_500 - 256 - 3);
+    await stream("First, then more, and more, and the end", 2_000);
+    expect(scrollTop).toBe(2_000);
   });
 });

@@ -272,21 +272,49 @@ which cites it.
 ### provider.turn-failed
 
 Written with every [`provider.turn-failed`](findings.md#providerturn-failed)
-finding, which cites it: a provider turn that ended as failed. Claude turns
-only, today. It never carries message or error text.
+finding, which cites it: a provider turn that ended as failed, from any
+provider, recorded once where BiBCode projects the failed turn. It never
+carries message or error text.
 
-- `provider`: the provider driver, such as `claude`;
+- `provider`: the provider driver, such as `claude`, `codex` or `opencode`;
 - `terminalReason`: the provider's own name for why the run ended (Claude's
-  `terminal_reason`, such as `blocking_limit`), `other` when that is not a
-  plain snake_case or kebab-case name, or `null` when the provider gave none;
+  `terminal_reason`, such as `blocking_limit`; Codex's error variant; OpenCode's
+  error name). A camelCase or PascalCase name is rewritten in snake case first,
+  a run of capitals as one word (`contextWindowExceeded` reads
+  `context_window_exceeded`, `APIError` reads `api_error`), so distinct
+  variants stay distinct. It is `other` when the value is not a plain name, or
+  `null` when the provider gave none;
 - `errorClass`: the turn's `RuntimeErrorClass`, such as `context_limit` or
   `provider_error`.
+
+### provider.compaction
+
+One per conversation compaction BiBCode asked for, when it settles, however it
+settles: also one a Stop settled before anything was sent, and one that could
+not run at all (see
+[Context-limit recovery](../../../architecture/rpc-and-orchestration.md#context-limit-recovery)).
+A failed one is also a
+[`provider.compaction-failed`](findings.md#providercompaction-failed) finding,
+which cites it. It never carries message, summary or error text.
+
+- `provider`: the provider driver, such as `claude` or `codex`;
+- `trigger`: `manual` (**Compact conversation**), `context_recovery` (a
+  context-limit failure recovered automatically) or `guard` (compacted before a
+  message near the provider's compaction point);
+- `outcome`: `completed`, `failed` or `interrupted`;
+- `reason`: `null` for a completed compaction, otherwise `not_started` (never
+  sent), `no_compaction` (the turn ended without a completed compaction, such
+  as Claude's "Not enough messages to compact."), `turn_failed`,
+  `unconfirmed` (the outcome could not be confirmed, including a restart),
+  `identity_changed` (the thread's provider or conversation changed first) or
+  `stopped`;
+- `durationMs`: from the start of the effect to the settlement.
 
 ### device.lifecycle
 
 One per device preview transition, Android emulator or iOS simulator, from
-`apps/server/src/device/mod.rs`. It never names the AVD or simulator, their
-paths, or anything on the screen.
+`apps/server/src/device/mod.rs`. It never names the thread, the AVD or
+simulator, their paths, or anything on the screen.
 
 - `platform`: `android` or `ios`;
 - `phase`: `start` (the emulator is being spawned or the simulator booted),
@@ -294,7 +322,11 @@ paths, or anything on the screen.
 - `durationMs`: time since the device was opened;
 - `failureKind`: for `fail`, `exited`, `bootTimeout`, `spawn`,
   `unresponsive`, or `busy` (the simulator was found already running outside
-  BiBCode when the launch began); otherwise `null`.
+  BiBCode when the launch began); otherwise `null`;
+- `running`: how many devices of the environment are live (not stopped or
+  failed; a stopping one counts) after this transition, at most four. Read a
+  memory or CPU finding against it: each live emulator holds its guest's RAM
+  and cores.
 
 A device that ends on its own after `ready` also raises a
 [`subprocess.crash`](findings.md#subprocesscrash): an emulator exit is

@@ -35,6 +35,7 @@
           },
           "projectId": "p1",
           "proposedPlans": [],
+          "reasoning": [],
           "runtimeMode": "full-access",
           "session": null,
           "title": "Thread",

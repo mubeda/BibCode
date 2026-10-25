@@ -8,7 +8,10 @@ use std::time::{Duration, Instant};
 
 use crate::assets::{AssetAccess, AssetError, AssetIssueRequest, AssetResource};
 use crate::git::StatusMutationGuard;
-use crate::review::{ReviewDiffPreviewInput, ReviewError, ReviewService};
+use crate::review::{
+    ReviewDiffPreviewInput, ReviewError, ReviewListDiffToolsInput, ReviewOpenDiffToolInput,
+    ReviewReadFileVersionInput, ReviewService,
+};
 use crate::transfer::archive::ArchiveLimits;
 use crate::transfer::{self, TransferAccess, TransferError};
 use crate::worktree_catalog::{
@@ -31,7 +34,7 @@ use super::{EntryKind, SearchLimits, WorkspaceError, WorkspaceSearchIndex, Works
 
 const PROJECT_ENTRIES_MAX_LIMIT: usize = 200;
 
-pub const TASK_SIX_RPC_METHODS: [&str; 15] = [
+pub const TASK_SIX_RPC_METHODS: [&str; 18] = [
     "projects.searchEntries",
     "projects.listEntries",
     "projects.readFile",
@@ -47,6 +50,9 @@ pub const TASK_SIX_RPC_METHODS: [&str; 15] = [
     "filesystem.browse",
     "assets.createUrl",
     "review.getDiffPreview",
+    "review.readFileVersion",
+    "review.listDiffTools",
+    "review.openDiffTool",
 ];
 
 type AssetContextFuture<'a> =
@@ -601,6 +607,45 @@ impl WorkspaceRpc {
                 let input: ReviewDiffPreviewInput = decode(payload)?;
                 let _admission = self.acquire_path(&input.cwd).await?;
                 self.handle_review_get_diff_preview(input).await
+            }
+            "review.readFileVersion" => {
+                let input: ReviewReadFileVersionInput = decode(payload)?;
+                let _admission = self.acquire_path(&input.cwd).await?;
+                // Reads share the workspace's operation permits with file reads and writes.
+                let _permit =
+                    self.service.permit().await.map_err(
+                        |error| json!({ "_tag": "Defect", "message": error.to_string() }),
+                    )?;
+                let review_service = self
+                    .dependencies
+                    .review_service
+                    .as_ref()
+                    .ok_or_else(|| defect("review.readFileVersion is not configured"))?;
+                let result = review_service
+                    .read_file_version(input, &cancellation)
+                    .await
+                    .map_err(review_wire_error)?;
+                encode(result).map_err(|error| defect(&error.to_string()))
+            }
+            "review.listDiffTools" => {
+                let input: ReviewListDiffToolsInput = decode(payload)?;
+                let _admission = self.acquire_path(&input.cwd).await?;
+                let review_service = self.review_service("review.listDiffTools")?;
+                let result = review_service
+                    .list_diff_tools(input, &cancellation)
+                    .await
+                    .map_err(review_wire_error)?;
+                encode(result).map_err(|error| defect(&error.to_string()))
+            }
+            "review.openDiffTool" => {
+                let input: ReviewOpenDiffToolInput = decode(payload)?;
+                let _admission = self.acquire_path(&input.cwd).await?;
+                let review_service = self.review_service("review.openDiffTool")?;
+                review_service
+                    .open_diff_tool(input)
+                    .await
+                    .map_err(review_wire_error)?;
+                Ok(json!({ "_tag": "opened" }))
             }
             _ => Err(json!({
                 "_tag": "Defect",
@@ -1373,6 +1418,13 @@ impl WorkspaceRpc {
         .await
     }
 
+    fn review_service(&self, method: &str) -> Result<&ReviewService, Value> {
+        self.dependencies
+            .review_service
+            .as_ref()
+            .ok_or_else(|| defect(&format!("{method} is not configured")))
+    }
+
     async fn handle_review_get_diff_preview(
         &self,
         input: ReviewDiffPreviewInput,
@@ -1610,10 +1662,22 @@ fn transfer_error_wire(cwd: &str, relative_path: &str, error: &TransferError) ->
 }
 
 fn review_wire_error(error: ReviewError) -> Value {
-    json!({
-        "_tag": "Defect",
-        "message": error.to_string(),
-    })
+    match error {
+        ReviewError::InvalidRequest(message) => json!({
+            "_tag": "InvalidRequest",
+            "message": message,
+        }),
+        ReviewError::DiffTool(failure) => json!({
+            "_tag": "ReviewDiffToolError",
+            "reason": failure.reason,
+            "message": failure.message,
+            "command": failure.command,
+        }),
+        error @ ReviewError::Backend(_) => json!({
+            "_tag": "Defect",
+            "message": error.to_string(),
+        }),
+    }
 }
 
 fn defect(message: &str) -> Value {
@@ -3473,6 +3537,10 @@ mod tests {
         assert_eq!(
             review_wire_error(ReviewError::Backend("failed".to_owned()))["_tag"],
             "Defect"
+        );
+        assert_eq!(
+            review_wire_error(ReviewError::InvalidRequest("refused".to_owned())),
+            json!({ "_tag": "InvalidRequest", "message": "refused" })
         );
         assert_eq!(defect("failed")["message"], "failed");
     }

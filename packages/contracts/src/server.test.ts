@@ -104,6 +104,17 @@ describe("ServerProvider", () => {
     ).toThrow();
   });
 
+  it("keeps older snapshots compatible with the optional compaction capability", () => {
+    expect(decodeServerProvider(baseProviderSnapshot).supportsCompaction).toBeUndefined();
+    expect(
+      decodeServerProvider({ ...baseProviderSnapshot, supportsCompaction: true })
+        .supportsCompaction,
+    ).toBe(true);
+    expect(() =>
+      decodeServerProvider({ ...baseProviderSnapshot, supportsCompaction: "true" }),
+    ).toThrow();
+  });
+
   it("defaults capability arrays when decoding provider snapshots", () => {
     const parsed = decodeServerProvider({
       instanceId: "codex",

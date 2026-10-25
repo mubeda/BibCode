@@ -3,6 +3,9 @@ import {
   getAnchoredTurnMetrics,
   getRowBottom,
   getTimelinePageScrollOffset,
+  isAboveReadingLine,
+  rowToggleNeedsEndReveal,
+  type TimelineScrollMode,
 } from "./timelineScrollAnchoring";
 
 function buildState({
@@ -156,5 +159,50 @@ describe("timeline scroll anchoring", () => {
 
     expect(withoutComposer?.overflowsUsableViewport).toBe(false);
     expect(withComposer?.overflowsUsableViewport).toBe(true);
+  });
+});
+
+describe("rowToggleNeedsEndReveal", () => {
+  it("asks for one reveal pass only for a toggle at the end of an anchored turn", () => {
+    const toggle = (mode: TimelineScrollMode, scrollDeltaToRevealEnd: number | null) =>
+      rowToggleNeedsEndReveal({ mode, scrollDeltaToRevealEnd });
+    expect(toggle("anchoring-new-turn", 0)).toBe(true);
+    expect(toggle("anchoring-new-turn", 1)).toBe(true);
+    // Scrolled up from the turn's end, by a scroll the timeline may not have seen: the reader
+    // keeps their place.
+    expect(toggle("anchoring-new-turn", 1_014)).toBe(false);
+    expect(toggle("anchoring-new-turn", null)).toBe(false);
+    // Following the end keeps it in view by itself; a reader scrolled away keeps their place.
+    expect(toggle("following-end", 0)).toBe(false);
+    expect(toggle("free-scrolling", 0)).toBe(false);
+    expect(toggle("free-scrolling", 400)).toBe(false);
+  });
+});
+
+describe("reading line", () => {
+  const base = { rowTop: -300, rowBottom: 400, viewportTop: 0, followingEnd: false };
+
+  it("is below an element that starts above the visible top inside the first visible row", () => {
+    expect(isAboveReadingLine({ ...base, elementTop: -120 })).toBe(true);
+    expect(isAboveReadingLine({ ...base, rowTop: 0, elementTop: -1 })).toBe(true);
+  });
+
+  it("leaves a row wholly above the viewport to the list's own anchoring", () => {
+    expect(isAboveReadingLine({ ...base, rowTop: -900, rowBottom: -200, elementTop: -500 })).toBe(
+      false,
+    );
+    expect(isAboveReadingLine({ ...base, rowTop: -900, rowBottom: 0, elementTop: -500 })).toBe(
+      false,
+    );
+  });
+
+  it("ignores an element in view and rows below the first visible one", () => {
+    expect(isAboveReadingLine({ ...base, elementTop: 10 })).toBe(false);
+    expect(isAboveReadingLine({ ...base, elementTop: 0 })).toBe(false);
+    expect(isAboveReadingLine({ ...base, rowTop: 40, rowBottom: 500, elementTop: 80 })).toBe(false);
+  });
+
+  it("ignores everything while the list follows its end", () => {
+    expect(isAboveReadingLine({ ...base, elementTop: -120, followingEnd: true })).toBe(false);
   });
 });

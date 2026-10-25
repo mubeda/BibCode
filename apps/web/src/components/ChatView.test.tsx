@@ -67,6 +67,8 @@ const h = vi.hoisted(() => {
   return {
     openThreadFindTargets: [] as Array<EventTarget | null>,
     captured: {} as Record<string, unknown>,
+    /** The list the mocked timeline hands ChatView through `listRef`, as LegendList does. */
+    timelineList: null as unknown,
     atomValuesByKey: new Map<string, unknown>(),
     commandCalls: [] as Array<{ key: string; input: unknown }>,
     commandHandlers: new Map<string, (input: unknown) => Promise<unknown>>(),
@@ -176,6 +178,7 @@ vi.mock("../state/threads", () => ({
     respondToApproval: { key: "thread.respondToApproval" },
     respondToUserInput: { key: "thread.respondToUserInput" },
     revertCheckpoint: { key: "thread.revertCheckpoint" },
+    compact: { key: "thread.compact" },
   },
 }));
 
@@ -462,6 +465,9 @@ vi.mock("./chat/MessagesTimeline", () => ({
     h.captured["messagesTimeline"] = props;
     // A new instance is a new find session: its query and selection start over.
     useState(() => ++h.messagesTimelineInstanceCount);
+    if (h.timelineList !== null) {
+      (props["listRef"] as { current: unknown }).current = h.timelineList;
+    }
     return (
       <div
         data-mock="messages-timeline"
@@ -783,6 +789,7 @@ function makeThread(overrides: Partial<Thread> = {}): Thread {
     interactionMode: "default",
     session: null,
     messages: [],
+    reasoning: [],
     proposedPlans: [],
     activities: [],
     checkpoints: [],
@@ -964,6 +971,7 @@ beforeEach(() => {
   attachmentAdmissionOwner.dispose();
   h.openThreadFindTargets.length = 0;
   h.captured = {};
+  h.timelineList = null;
   h.atomValuesByKey.clear();
   h.atomValuesByKey.set("atom:keybindings", []);
   h.atomValuesByKey.set("atom:editors", []);
@@ -5222,6 +5230,96 @@ describe("ChatView handlers (captured from mocked children)", () => {
     onPageTimeline("PageDown", false);
     expect(scrollToOffset).toHaveBeenCalledTimes(2);
   });
+
+  // #173: a press that toggles a Thinking row at the end of the turn just sent is a click,
+  // not a scroll, so the turn's end comes back into view. A press on the list itself, such as
+  // its scrollbar, is still the reader taking over.
+  it.each([
+    { pressed: "a Thinking row's toggle", onControl: true, revealsEnd: true },
+    { pressed: "the list itself", onControl: false, revealsEnd: false },
+  ])(
+    "a pointer press on $pressed before a toggle at an anchored turn's end",
+    async ({ onControl, revealsEnd }) => {
+      vi.unstubAllGlobals();
+      Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+      seedConnectedServerThread();
+      const scrollNode = document.createElement("div");
+      const toggle = document.createElement("button");
+      toggle.setAttribute("aria-expanded", "false");
+      scrollNode.append(toggle);
+      document.body.append(scrollNode);
+      const geometry = { lastRowHeight: 100 };
+      const scrollToOffset = vi.fn();
+      h.timelineList = {
+        getScrollableNode: () => scrollNode,
+        getState: () => ({
+          scroll: 0,
+          scrollLength: 800,
+          contentLength: 100 + geometry.lastRowHeight,
+          data: [{}, {}],
+          positionAtIndex: (index: number) => index * 100,
+          sizeAtIndex: (index: number) => (index === 1 ? geometry.lastRowHeight : 100),
+        }),
+        scrollToOffset,
+        scrollToIndex: vi.fn(),
+        scrollToEnd: vi.fn(),
+      };
+      const nextFrames = (count: number) =>
+        act(
+          () =>
+            new Promise<void>((resolve) => {
+              const step = (left: number) =>
+                left === 0 ? resolve() : requestAnimationFrame(() => step(left - 1));
+              step(count);
+            }),
+        );
+      const container = document.createElement("div");
+      document.body.append(container);
+      const root = createRoot(container);
+      try {
+        await act(async () =>
+          root.render(
+            <ChatView environmentId={environmentId} threadId={threadId} routeKind="server" />,
+          ),
+        );
+        // The list's press listeners attach one frame after the thread mounts.
+        await nextFrames(2);
+        const composer = capturedProps<Record<string, unknown>>("chatComposer");
+        (composer["composerRef"] as RefObject<ChatComposerHandle | null>).current =
+          composerHandle();
+        (composer["promptRef"] as RefObject<string>).current = "think it through";
+        await act(async () => (composer["onSend"] as () => Promise<void>)());
+        const sent = commandCallsFor("thread.startTurn")[0]!.input as {
+          input: { message: { messageId: MessageId } };
+        };
+        const timeline = capturedProps<Record<string, unknown>>("messagesTimeline");
+        await act(async () =>
+          (timeline["onAnchorReady"] as (id: MessageId, index: number) => void)(
+            sent.input.message.messageId,
+            0,
+          ),
+        );
+        scrollToOffset.mockClear();
+
+        (onControl ? toggle : scrollNode).dispatchEvent(
+          new PointerEvent("pointerdown", { bubbles: true }),
+        );
+        // The turn ends in view; the toggle then opens a trace that pushes its end below.
+        (timeline["onReasoningRowToggle"] as () => void)();
+        geometry.lastRowHeight = 3000;
+        await nextFrames(3);
+
+        const reveals = scrollToOffset.mock.calls.filter(
+          ([target]) => (target as { offset: number }).offset > 2000,
+        );
+        expect(reveals.length).toBe(revealsEnd ? 1 : 0);
+      } finally {
+        await act(async () => root.unmount());
+        container.remove();
+        scrollNode.remove();
+      }
+    },
+  );
 
   it("onInterrupt targets the running turn of the active session", async () => {
     const runningTurnId = TurnId.make("turn-running");

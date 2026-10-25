@@ -320,6 +320,7 @@ impl ManagedEndpointRuntime {
                 label: "managed endpoint tunnel".to_owned(),
                 source: RegistrationSource::Helper,
                 driver: None,
+                survives_shutdown: false,
             },
         ) {
             Ok(registration) => registration,
@@ -781,6 +782,7 @@ mod tests {
                             label: "capacity fixture".to_owned(),
                             source: RegistrationSource::Helper,
                             driver: None,
+                            survives_shutdown: false,
                         },
                     )
                     .expect("fill process registry")

@@ -3,6 +3,8 @@ import { EnvironmentId, ThreadId, TurnId } from "@bibcode/contracts";
 import { beforeEach, describe, expect, it } from "vite-plus/test";
 
 import {
+  selectThreadCompareFile,
+  selectThreadCompareFilters,
   selectThreadDiffPanelRefreshRequest,
   selectThreadDiffPanelSelection,
   useDiffPanelStore,
@@ -16,6 +18,8 @@ describe("diffPanelStore", () => {
       byThreadKey: {},
       branchBaseRefByThreadKey: {},
       gitRefreshRequestByThreadKey: {},
+      compareFileByThreadKey: {},
+      compareFiltersByThreadKey: {},
     }),
   );
 
@@ -149,5 +153,69 @@ describe("diffPanelStore", () => {
     const before = useDiffPanelStore.getState();
     useDiffPanelStore.getState().removeThread(THREAD_REF);
     expect(useDiffPanelStore.getState()).toBe(before);
+  });
+
+  it("keeps one unsent comment per section, in memory, and clears its text with it", () => {
+    const store = useDiffPanelStore.getState();
+    const draft = {
+      id: "draft-1",
+      filePath: "src/app.ts",
+      range: { start: 3, end: 3, side: "additions" as const },
+      rangeLabel: "+3",
+    };
+    store.setCommentDraft(THREAD_REF, "unstaged", draft);
+    store.setCommentDraftText("draft-1", "half-written");
+    const state = useDiffPanelStore.getState();
+    expect(state.commentDraftBySectionKey).toEqual({ "environment-1:thread-1:unstaged": draft });
+    expect(state.commentDraftTextById).toEqual({ "draft-1": "half-written" });
+    const persisted = useDiffPanelStore.persist.getOptions().partialize?.(state) as Record<
+      string,
+      unknown
+    >;
+    expect(persisted).not.toHaveProperty("commentDraftBySectionKey");
+    expect(persisted).not.toHaveProperty("commentDraftTextById");
+
+    useDiffPanelStore.getState().setCommentDraft(THREAD_REF, "unstaged", null);
+    expect(useDiffPanelStore.getState()).toMatchObject({
+      commentDraftBySectionKey: {},
+      commentDraftTextById: {},
+    });
+    const cleared = useDiffPanelStore.getState();
+    useDiffPanelStore.getState().setCommentDraft(THREAD_REF, "unstaged", null);
+    expect(useDiffPanelStore.getState()).toBe(cleared);
+  });
+
+  it("remembers Compare's file per thread, and its filters only in memory", () => {
+    const store = useDiffPanelStore.getState();
+    expect(selectThreadCompareFile(store.compareFileByThreadKey, THREAD_REF)).toBeNull();
+    expect(selectThreadCompareFilters(store.compareFiltersByThreadKey, THREAD_REF)).toEqual({
+      status: "all",
+      query: "",
+    });
+    store.selectCompareFile(THREAD_REF, "src/app.ts");
+    store.setCompareFilters(THREAD_REF, { status: "added", query: "app" });
+
+    const state = useDiffPanelStore.getState();
+    expect(selectThreadCompareFile(state.compareFileByThreadKey, THREAD_REF)).toBe("src/app.ts");
+    expect(selectThreadCompareFilters(state.compareFiltersByThreadKey, THREAD_REF)).toEqual({
+      status: "added",
+      query: "app",
+    });
+    const persisted = useDiffPanelStore.persist.getOptions().partialize?.(state) as Record<
+      string,
+      unknown
+    >;
+    expect(persisted).toHaveProperty("compareFileByThreadKey", {
+      ["environment-1:thread-1"]: "src/app.ts",
+    });
+    expect(persisted, "a reload never opens Compare with files hidden").not.toHaveProperty(
+      "compareFiltersByThreadKey",
+    );
+
+    useDiffPanelStore.getState().removeThread(THREAD_REF);
+    expect(useDiffPanelStore.getState()).toMatchObject({
+      compareFileByThreadKey: {},
+      compareFiltersByThreadKey: {},
+    });
   });
 });

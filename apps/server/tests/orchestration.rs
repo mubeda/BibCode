@@ -852,6 +852,181 @@ async fn assistant_completion_updates_only_matching_streaming_assistant_rows() {
     engine.shutdown().await;
 }
 
+/// `(id, turn, text, streaming, createdAt, updatedAt)` of a reasoning row.
+type ReasoningRow<'a> = (&'a str, Option<&'a str>, &'a str, bool, &'a str, &'a str);
+
+fn reasoning_rows(
+    rows: &[bibcode_server::persistence::ProjectionThreadReasoning],
+) -> Vec<ReasoningRow<'_>> {
+    rows.iter()
+        .map(|row| {
+            (
+                row.reasoning_id.as_str(),
+                row.turn_id.as_deref(),
+                row.text.as_str(),
+                row.is_streaming,
+                row.created_at.as_str(),
+                row.updated_at.as_str(),
+            )
+        })
+        .collect()
+}
+
+/// #173: reasoning is its own entity. Deltas append, a completion with text replaces the text
+/// and creates a missing entry, a completion without text only settles a streaming entry, and
+/// none of it becomes an assistant message. Replay, revert and purge treat it like messages.
+#[tokio::test]
+async fn reasoning_entries_stream_settle_replay_revert_and_purge() {
+    const LATER: &str = "2026-07-10T10:00:01.000Z";
+    const LATEST: &str = "2026-07-10T10:00:02.000Z";
+    let repositories = migrated_repositories().await;
+    let engine =
+        OrchestrationEngine::start(repositories.database().clone(), EngineOptions::default())
+            .await
+            .expect("engine starts");
+    let dispatch = |value: Value| {
+        let engine = engine.clone();
+        async move { engine.dispatch(decode(value)).await.expect("command") }
+    };
+    for command in [
+        json!({"type":"project.create","commandId":"r-project","projectId":"p1","title":"Project","workspaceRoot":"C:/repo","createdAt":CREATED_AT}),
+        json!({"type":"thread.create","commandId":"r-thread","threadId":"t1","projectId":"p1","title":"Thread","modelSelection":{"instanceId":"codex","model":"gpt-5"},"runtimeMode":"full-access","createdAt":CREATED_AT}),
+        json!({"type":"thread.reasoning.delta","commandId":"r-delta-1","threadId":"t1","reasoningId":"reasoning:t1:item:a","delta":"Weighing ","turnId":"turn-1","createdAt":CREATED_AT}),
+        json!({"type":"thread.reasoning.delta","commandId":"r-delta-2","threadId":"t1","reasoningId":"reasoning:t1:item:a","delta":"options","turnId":"turn-1","createdAt":LATER}),
+    ] {
+        dispatch(command).await;
+    }
+    let streamed = repositories
+        .list_reasoning_by_thread("t1".to_owned())
+        .await
+        .unwrap();
+    assert_eq!(
+        reasoning_rows(&streamed),
+        [(
+            "reasoning:t1:item:a",
+            Some("turn-1"),
+            "Weighing options",
+            true,
+            CREATED_AT,
+            LATER
+        )]
+    );
+    let events_before = engine.read_events(0).await.unwrap().len();
+    // Without text and without a streaming entry, a completion writes nothing.
+    dispatch(json!({"type":"thread.reasoning.complete","commandId":"r-unknown","threadId":"t1","reasoningId":"reasoning:t1:item:unknown","turnId":"turn-1","createdAt":LATER})).await;
+    assert_eq!(engine.read_events(0).await.unwrap().len(), events_before);
+    // Without text, it settles and keeps what streamed; a repeat finds nothing to settle.
+    dispatch(json!({"type":"thread.reasoning.complete","commandId":"r-settle","threadId":"t1","reasoningId":"reasoning:t1:item:a","turnId":"turn-1","createdAt":LATEST})).await;
+    dispatch(json!({"type":"thread.reasoning.complete","commandId":"r-settle-again","threadId":"t1","reasoningId":"reasoning:t1:item:a","turnId":"turn-1","createdAt":LATEST})).await;
+    assert_eq!(
+        engine.read_events(0).await.unwrap().len(),
+        events_before + 1
+    );
+    // With text, a summary that streamed nothing is created, and a repeat changes nothing else.
+    for command_id in ["r-summary", "r-summary-again"] {
+        dispatch(json!({"type":"thread.reasoning.complete","commandId":command_id,"threadId":"t1","reasoningId":"reasoning:t1:item:b","text":"**Plan**\n\nRead the file","turnId":"turn-1","createdAt":LATEST})).await;
+    }
+    let settled = repositories
+        .list_reasoning_by_thread("t1".to_owned())
+        .await
+        .unwrap();
+    let expected = [
+        (
+            "reasoning:t1:item:a",
+            Some("turn-1"),
+            "Weighing options",
+            false,
+            CREATED_AT,
+            LATEST,
+        ),
+        (
+            "reasoning:t1:item:b",
+            Some("turn-1"),
+            "**Plan**\n\nRead the file",
+            false,
+            LATEST,
+            LATEST,
+        ),
+    ];
+    assert_eq!(reasoning_rows(&settled), expected);
+    let snapshot = load_snapshot(&engine.repositories()).await.unwrap();
+    assert!(snapshot.messages.is_empty(), "reasoning is never a message");
+    assert_eq!(reasoning_rows(&snapshot.reasoning), expected);
+    engine.shutdown().await;
+
+    // Rebuilding the message projection rebuilds reasoning from its events.
+    repositories
+        .database()
+        .call(|connection| {
+            connection.execute("DELETE FROM projection_thread_messages", [])?;
+            connection.execute("DELETE FROM projection_thread_reasoning", [])?;
+            connection.execute(
+                "UPDATE projection_state SET last_applied_sequence = 0 WHERE projector = 'projection.thread-messages'",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let engine =
+        OrchestrationEngine::start(repositories.database().clone(), EngineOptions::default())
+            .await
+            .expect("engine restarts");
+    let replayed = repositories
+        .list_reasoning_by_thread("t1".to_owned())
+        .await
+        .unwrap();
+    assert_eq!(reasoning_rows(&replayed), expected);
+
+    // Reverting the turn removes its reasoning, as it removes its messages.
+    for command in [
+        json!({"type":"thread.reasoning.delta","commandId":"r-turn-0","threadId":"t1","reasoningId":"reasoning:t1:turn:turn-0","delta":"Kept","turnId":"turn-0","createdAt":CREATED_AT}),
+        json!({"type":"thread.turn.diff.complete","commandId":"r-diff-0","threadId":"t1","turnId":"turn-0","completedAt":CREATED_AT,"checkpointRef":"ref-0","status":"ready","files":[],"checkpointTurnCount":1,"createdAt":CREATED_AT}),
+        json!({"type":"thread.turn.diff.complete","commandId":"r-diff-1","threadId":"t1","turnId":"turn-1","completedAt":LATEST,"checkpointRef":"ref-1","status":"ready","files":[],"checkpointTurnCount":2,"createdAt":LATEST}),
+        json!({"type":"thread.revert.complete","commandId":"r-revert","threadId":"t1","turnCount":1,"createdAt":LATEST}),
+    ] {
+        engine.dispatch(decode(command)).await.expect("command");
+    }
+    let reverted = repositories
+        .list_reasoning_by_thread("t1".to_owned())
+        .await
+        .unwrap();
+    assert_eq!(
+        reasoning_rows(&reverted),
+        [(
+            "reasoning:t1:turn:turn-0",
+            Some("turn-0"),
+            "Kept",
+            true,
+            CREATED_AT,
+            CREATED_AT
+        )]
+    );
+    assert_eq!(
+        repositories
+            .list_streaming_reasoning()
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.reasoning_id.as_str())
+            .collect::<Vec<_>>(),
+        ["reasoning:t1:turn:turn-0"]
+    );
+
+    repositories
+        .delete_reasoning_by_thread("t1".to_owned())
+        .await
+        .unwrap();
+    assert!(
+        repositories
+            .list_reasoning_by_thread("t1".to_owned())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    engine.shutdown().await;
+}
+
 #[tokio::test]
 async fn zero_row_completion_does_not_rewind_the_turn_assistant_message() {
     let repositories = migrated_repositories().await;

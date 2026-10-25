@@ -7,6 +7,8 @@
   { "key": "mod+n", "command": "terminal.new", "when": "terminalFocus" },
   { "key": "mod+w", "command": "terminal.close", "when": "terminalFocus" },
   { "key": "mod+d", "command": "diff.toggle", "when": "!terminalFocus" },
+  { "key": "f7", "command": "diff.nextChange", "when": "diffFocus" },
+  { "key": "shift+f7", "command": "diff.previousChange", "when": "diffFocus" },
   { "key": "mod+shift+j", "command": "preview.toggle" },
   { "key": "mod+r", "command": "preview.refresh", "when": "previewFocus" },
   { "key": "mod+l", "command": "preview.focusUrl", "when": "previewFocus" },

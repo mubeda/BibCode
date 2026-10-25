@@ -341,6 +341,10 @@ export const ThreadTokenUsageSnapshot = Schema.Struct({
   compactsAutomatically: Schema.optional(Schema.Boolean),
   /** The context size at which the provider compacts automatically, when it reports one. */
   autoCompactTokens: Schema.optional(PositiveInt),
+  /** The provider instance the reading came from; set by the server on the activity. */
+  providerInstanceId: Schema.optional(TrimmedNonEmptyStringSchema),
+  /** The provider conversation the reading came from; set by the server on the activity. */
+  conversationId: Schema.optional(TrimmedNonEmptyStringSchema),
 });
 export type ThreadTokenUsageSnapshot = typeof ThreadTokenUsageSnapshot.Type;
 
@@ -377,6 +381,8 @@ export type ThreadRealtimeClosedPayload = typeof ThreadRealtimeClosedPayload.Typ
 const TurnStartedPayload = Schema.Struct({
   model: Schema.optional(TrimmedNonEmptyStringSchema),
   effort: Schema.optional(TrimmedNonEmptyStringSchema),
+  /** The conversation compaction this turn runs, when BiBCode asked for one. */
+  compactionId: Schema.optional(TrimmedNonEmptyStringSchema),
 });
 export type TurnStartedPayload = typeof TurnStartedPayload.Type;
 
@@ -389,6 +395,14 @@ const TurnCompletedPayload = Schema.Struct({
   errorMessage: Schema.optional(TrimmedNonEmptyStringSchema),
   /** Which side reported the failure. See `RuntimeErrorClass`. */
   errorClass: Schema.optional(RuntimeErrorClass),
+  /** The provider's own name for why a failed turn ended, such as Claude's `terminal_reason`. */
+  providerReason: Schema.optional(TrimmedNonEmptyStringSchema),
+  /** A `context_limit` failure: the provider refused the input before any output. */
+  beforeOutput: Schema.optional(Schema.Boolean),
+  /** A `context_limit` failure: `false` when the provider said compacting cannot help. */
+  compactable: Schema.optional(Schema.Boolean),
+  /** The conversation compaction this turn ran, when BiBCode asked for one. */
+  compactionId: Schema.optional(TrimmedNonEmptyStringSchema),
 });
 export type TurnCompletedPayload = typeof TurnCompletedPayload.Type;
 

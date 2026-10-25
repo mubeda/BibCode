@@ -456,6 +456,20 @@ idle center terminal when possible and otherwise open a new center terminal.
 The retired bottom terminal drawer and its bottom-toolbar toggle no longer
 exist.
 
+A ` ```mermaid ` block in a chat message, a plan, or a Markdown file's rendered
+view draws as a diagram once its closing fence has arrived; while a reply is
+still writing it, the block shows its source. The diagram stays in the code
+block's card: **Copy** copies its source, and **Show source** switches between
+the diagram and its highlighted source (line wrap is offered with the source).
+Selecting text inside a diagram and copying it copies the whole fenced source.
+Diagrams follow the light or dark theme; colors set in the diagram with `style`
+or `classDef` are kept, while Mermaid theme directives are not applied. An
+invalid diagram keeps its source and says what is wrong, with the line; a
+diagram over 25,000 characters or 500 edges says it is too large to draw; and
+if the diagram renderer cannot be loaded, **Retry** tries again. Diagrams do
+not open links or load images. A diagram that draws above the line you are
+reading in the chat does not move that line.
+
 ### Reading the timeline
 
 A finished turn folds its commentary and tool calls behind a **Worked for**
@@ -464,11 +478,23 @@ calls shows its newest call with a **+N previous tool calls** row, and a tool
 call opens to its command, output, and changed files when clicked. Hover or
 focus a tool call or a **Worked for** row to see its time.
 
+The provider's reasoning (Claude's thinking, Codex's reasoning summaries) shows
+as one collapsed line among the tool calls, in the order it happened:
+**Thought - <what it is about>**, or **Thinking - …** while the provider is still
+thinking. Click the line, or focus it and press Enter or Space, to read the whole
+thought; while it streams, the open thought follows its newest text until you
+scroll up in it. A finished turn's thoughts fold under **Worked for** with its
+tool calls, and a hidden run that includes a thought reads **+N previous steps**.
+A thought is never shown as the turn's answer. Providers that send no thinking
+text (Claude models from Opus 4.7 on, when the Claude CLI cannot ask for
+summaries) show no thought rows.
+
 **Settings → General → Verbose chat** (off by default) opens finished turns:
 each **Worked for** row starts open, each run of tool calls shows every call
 above a **Show fewer tool calls** row, and each tool call starts open to its
-output. One click on a **Worked for** row folds that turn again, and one click
-on **Show fewer tool calls** or a tool call collapses it. The turn still running
+output. Thoughts open the same way tool calls do. One click on a **Worked for**
+row folds that turn again, and one click on **Show fewer tool calls** or a tool
+call collapses it. The turn still running
 looks the same either way until it finishes. A turn you fold stays folded when
 the next turn starts; each choice, like an opened tool call, long message, plan,
 or details block, holds while you scroll and until you switch threads or reload.
@@ -600,6 +626,36 @@ becomes available once the running turn and any pending approval or question are
 done. Cancelling remains available while the message is queued; it is disabled
 while steering is being acknowledged.
 
+### When the context window is full
+
+When a conversation no longer fits the provider's context window, the thread's
+error (for Claude, **Claude ran out of context**) offers **Compact
+conversation**, on any provider that can compact it (Claude and Codex). It is
+disabled with **Compacting the conversation…** while a compaction runs, and the
+timeline shows a **Conversation compaction** step.
+
+If the provider refused your message before doing anything and its own
+auto-compaction is on, BiBCode recovers on its own: the error reads **The
+context window is full. Compacting the conversation, then sending your message
+again.**, without the button, and the failed message shows **Sends again after
+the conversation is compacted.** Once the compaction succeeds, a copy of your
+message is sent, labelled **Sent again after the conversation was compacted.**,
+and any messages you queued meanwhile follow it. Don't send it again by hand.
+If the compaction fails, or you stop it, nothing is sent: the error names what
+happened, the original stays in the thread, and **Compact conversation**
+returns. If the copy fails at the limit again, the error says the conversation
+was already compacted once.
+
+When a Claude conversation is close to where Claude compacts on its own,
+BiBCode compacts it before sending your next message. The message shows
+**Waiting for the conversation to be compacted.** and is sent once the
+compaction ends. **Stop** during that compaction leaves the message unsent with
+**Not sent: you stopped the conversation compaction. Retry sends it.**; Retry
+sends it without compacting again. While any compaction runs, what you send is
+queued and Stop is offered. Turning Claude's auto-compaction off
+(`autoCompactEnabled: false` or `DISABLE_AUTO_COMPACT`) turns both automatic
+behaviours off and keeps **Compact conversation**.
+
 If an earlier message has a failed or uncertain delivery, the first queued card
 shows **Waiting for an earlier message**. **Steer** and **Send now** are disabled
 with **Retry or dismiss the earlier message first**, or **Dismiss the earlier
@@ -666,8 +722,12 @@ level title in the menu are red; lower levels remain neutral.
 
 While a provider turn is active, the timeline shows a reversed paint-and-fade
 dotted square followed by `Waiting for` and a whole-second elapsed timer, such
-as `Waiting for 3s`. The timer is anchored to the persisted user-message time
-after reload and never moves backward when the provider start time arrives.
+as `Waiting for 3s`. While the provider thinks, the same line adds its latest
+thought after the timer, as in `Waiting for 12s · Planning the migration`,
+truncated to one line; it is left out when the thought is already the newest row
+above, and once the answer has arrived. The timer is anchored to the persisted
+user-message time after reload and never moves backward when the provider start
+time arrives.
 The animation uses the current theme's muted foreground and becomes static when
 reduced motion is requested. A later `pending` delivery blocked behind an
 unresolved failed or uncertain delivery shows the
@@ -1092,7 +1152,8 @@ Plan surfaces can also appear when the active provider/session supplies them.
   (see [Previewing the server's dev servers](#previewing-the-servers-dev-servers));
   a browser tab served over HTTPS has no Browser surface.
 - **Terminal** starts a shell in the active workspace.
-- **Diff** reviews branch or worktree changes.
+- **Diff** reviews the working tree, branch changes, or a turn's changes (see
+  [Diff](#diff)).
 - **Activity** shows structured provider activity when available.
 - **Plan** displays the active agent plan when available.
 - **Device** shows an Android emulator or, on a macOS server, an iOS simulator
@@ -1101,6 +1162,63 @@ Plan surfaces can also appear when the active provider/session supplies them.
 - **Pull request** shows one pull or merge request beside the thread (see
   [Pull and merge requests in the panel](#pull-and-merge-requests-in-the-panel)).
   It has no entry in the `+` menu; it opens from the places listed there.
+
+### Diff
+
+The scope menu chooses what the Diff panel compares: **Working tree** (against
+`HEAD`), **Branch changes** (against a base branch you can change), **Latest
+turn**, or any **Turn**. A turn's changes come from the checkpoints BiBCode
+saves before and after it. When a checkpoint is gone, or Git can't compare
+two of them, the panel says so instead of showing no changes.
+
+**Changes | Compare** chooses how to read them:
+
+- **Changes** stacks every changed file. **Stacked** and **Split** lay out each
+  file's hunks.
+- **Compare** lists the changed files on the left and shows the selected
+  file's previous and current versions side by side, aligned and scrolling
+  together. The full files load after the changed lines, which show at once.
+  - The list filters by name (**Esc** clears it) and by status, and says
+    "N of M files" while a filter is on. Up, Down, Home, End, Page Up and Page
+    Down move the selection. In a panel narrower than 640 px, the list becomes
+    a searchable file picker above the diff, between **Previous file** and
+    **Next file**.
+  - **All lines** shows the whole file. **Changes only** shows the changes with
+    **Context lines** around them (3 by default, up to 99); collapsed regions
+    still expand. If the changes with that count fail to load, Compare says so
+    with **Retry**.
+  - **Previous change** and **Next change** step through the blocks of
+    changes; **F7** and **Shift+F7** do the same while Compare has focus.
+  - A file that Compare cannot show in full says why: added and deleted files
+    show their one side, and a pure rename, a file mode change, a binary file
+    and a submodule each get a short explanation. A file over 4.4 MB, a
+    version no longer in the repository, a patch from an older server and a
+    turn patch saved before checkpoints kept full files show the changed lines
+    with the reason. A working file that keeps changing says "This file is
+    changing." with **Refresh**.
+
+**Open with** opens the changes in a diff app such as Beyond Compare, Meld,
+KDiff3, WinMerge or FileMerge, through `git difftool`. In Changes, the
+toolbar's **Open with** opens every file of the scope. In Compare, the one
+beside the file opens that file, and **All files in** opens every file. The
+menu lists the apps Git finds on the computer, including your own
+`difftool.<tool>.cmd`, with the default marked: the one `git config
+diff.guitool` or `diff.tool` names, then the last one you chose, then the
+first listed. A failed launch shows Git's message with **Copy command**, so
+you can run it yourself. The app stays open when BiBCode quits, so unsaved
+edits in it are kept.
+
+- It works for threads on this computer only. For another environment the menu
+  says where the thread runs.
+- Untracked files can't open on their own; stage one to compare it.
+- With no app found, the menu says to install one or set
+  `git config diff.tool`.
+- In a browser, the app opens on the computer running the server.
+
+The view, the layout, the line filter and the context count are remembered
+across restarts, and Compare remembers the selected file for each thread. Its
+filters reset when the page reloads, so it never opens with files hidden.
+Switching between Changes and Compare keeps the scope and the base ref.
 
 ### Pull and merge requests in the panel
 
@@ -1431,11 +1549,25 @@ typing `café au lait` quickly can lose more than the `é`. A paste of more than
 100 characters sends nothing either, and the panel asks you to paste it in parts.
 
 A disabled control says why when you point at it. **Stop** shuts the device
-down. One device runs per platform: an Android emulator and an iOS simulator
-can run side by side, but to start another device of the same platform, stop
-the running one first. A device that fails shows **Failed:** with the reason,
-for example a boot that did not finish within 180 s, or a simulator shut down
-outside BiBCode. BiBCode only shuts down simulators it started.
+down. A device that fails shows **Failed:** with the reason, for example a boot
+that did not finish within 180 s, or a simulator shut down outside BiBCode, and
+a stopped one says so; **Start** starts it again. BiBCode only shuts down
+simulators it started.
+
+**One device per task.** Up to four devices run at once on a server, of either
+platform, and each image runs once. Each thread's Device panel remembers the
+device you picked or started there: switch threads and each one shows its own
+device, or its last attempt and why it ended, without picking it again. A
+thread with nothing picked shows the device its agent started. Running devices
+stay in the list with whose they are, such as "Pixel 8 — Running here" or
+"Pixel 8 — Running in Fix login"; pick one to look at it and use it. Another
+thread's device says "Started in Fix login." under the toolbar, and stopping it
+asks first, because that task loses its device and a new boot takes minutes.
+With four devices running, **Start** says so; a start the server refuses lists
+**Stop** for each running device. Deleting a thread stops the devices it
+started; archiving it does not. A chat panel's devices are its host thread's.
+A second desktop window or browser tab on another thread shows a second device
+at the same time.
 
 **View only.** An iOS simulator opens view only when BiBCode cannot use this
 Xcode's simulator interfaces: an Xcode release that changed them ("Xcode
@@ -1458,8 +1590,12 @@ screen** starts it again.
 
 **Agents.** While device previews are on, coding agents on that environment can
 use the `device_list`, `device_open`, `device_screenshot`, and `device_close`
-tools on the same devices you see. They disappear from an agent's tool list
-once the setting is off.
+tools on the same devices you see. An agent's devices are its thread's (a chat
+panel's agent counts as its host): `device_list` marks them, a screenshot
+without a device id takes the agent's own device, opening an image its thread
+already runs returns that device, and it cannot start an image or stop a device
+another thread is using. The tools disappear from an agent's tool list once
+the setting is off.
 
 ### Activity and targeted Stop
 
@@ -1707,13 +1843,28 @@ The Files surface is a full file manager for the active workspace:
 
 ## Current limitations
 
+- In Compare, a line comment can start only on a line that is part of Git's
+  default hunks, the same lines Changes shows.
+- **Open with** is not available for remote environments, and it opens the
+  current versions in Git, not the exact patch the panel loaded. A diff app
+  that returns at once may find Git's temporary copy already gone. On Windows,
+  a diff app still open in a worktree keeps that worktree from being removed,
+  and a job that forbids breakaway closes the app with BiBCode.
+
 - Find in thread searches messages, plans, and tool commands. Tool output,
   changed-file lists, attachments, terminal-context chips, review-comment cards,
-  reasoning rows, and rendered diagrams are not searched.
-- Device previews run one Android emulator and one iOS simulator at a time per
-  environment, and iOS simulators only on macOS servers. iOS takes a single
-  touch, and BiBCode cannot install apps or create simulators. Two people
-  watching the same device both control it.
+  reasoning rows, and Mermaid diagrams, including the source a diagram shows
+  before it draws, are not searched.
+- Device previews run at most four devices at once per environment, one per
+  image, and iOS simulators only on macOS servers. BiBCode does not check that
+  the host has the memory for four: one that does not fails at boot with the
+  emulator's reason. One panel shows one device at a time; open a second window
+  or tab on another thread to watch two. iOS takes a single touch, and BiBCode
+  cannot install apps or create simulators. Two people watching the same device
+  both control it. A device stays with the thread that started it, even when
+  another thread uses it. The panel keeps the four most recent stopped or failed
+  devices of the environment, so with several threads an older attempt's reason
+  can drop out.
 
 - Staged-row diff viewing in the right-panel Source Control surface does not yet
   use a true `git diff --cached` source. Git Manager diffs are a separate path.

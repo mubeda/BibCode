@@ -11,6 +11,7 @@
 import { scopedThreadKey } from "@bibcode/client-runtime/environment";
 import {
   ACTIVITY_ID_MAX_LENGTH,
+  type DevicePlatform,
   type ScopedThreadRef,
   SourceControlProviderKind,
 } from "@bibcode/contracts";
@@ -45,6 +46,21 @@ export type ActivityRightPanelSurface = {
   selectedRecordId: string | null;
 };
 
+/**
+ * The image a thread's Device pane last picked or started: an AVD name or a simulator UDID, which
+ * outlive server restarts. Never a device id, which is per open.
+ */
+export interface DeviceSurfaceImage {
+  readonly platform: DevicePlatform;
+  readonly imageId: string;
+}
+
+export type DeviceRightPanelSurface = {
+  id: "device";
+  kind: "device";
+  image?: DeviceSurfaceImage;
+};
+
 export type PullRequestRightPanelSurface = {
   id: `pullRequest:${number}`;
   kind: "pullRequest";
@@ -75,7 +91,7 @@ export type RightPanelSurface =
       revealRequestId: number;
     }
   | { id: "plan"; kind: "plan" }
-  | { id: "device"; kind: "device" }
+  | DeviceRightPanelSurface
   | ActivityRightPanelSurface
   | PullRequestRightPanelSurface;
 
@@ -120,6 +136,8 @@ interface RightPanelStoreState {
     tab?: PullRequestsDetailTab,
   ) => void;
   setPullRequestTab: (ref: ScopedThreadRef, number: number, tab: PullRequestsDetailTab) => void;
+  /** Remembers the image the thread's Device pane shows; a thread without one keeps nothing. */
+  setDeviceImage: (ref: ScopedThreadRef, image: DeviceSurfaceImage) => void;
   openTerminal: (ref: ScopedThreadRef, terminalId: string) => void;
   splitTerminal: (
     ref: ScopedThreadRef,
@@ -243,6 +261,22 @@ function normalizeActivitySurface(
   };
 }
 
+function normalizeDeviceImage(value: unknown): DeviceSurfaceImage | null {
+  if (!isRecord(value)) return null;
+  const { platform, imageId } = value;
+  if ((platform !== "android" && platform !== "ios") || !isNonEmptyString(imageId)) return null;
+  return { platform, imageId };
+}
+
+function normalizeDeviceSurface(value: Record<string, unknown>): DeviceRightPanelSurface | null {
+  if (value.id !== "device") return null;
+  // A malformed pick is dropped, not the surface: the pane falls back to its own choice.
+  const image = normalizeDeviceImage(value.image);
+  return image === null
+    ? { id: "device", kind: "device" }
+    : { id: "device", kind: "device", image };
+}
+
 const browserSurface = (tabId: string | null): RightPanelSurface =>
   tabId
     ? { id: `browser:${tabId}`, kind: "preview", resourceId: tabId }
@@ -347,7 +381,7 @@ function normalizePersistedSurface(value: unknown): RightPanelSurface | null {
     case "plan":
       return value.id === "plan" ? { id: "plan", kind: "plan" } : null;
     case "device":
-      return value.id === "device" ? { id: "device", kind: "device" } : null;
+      return normalizeDeviceSurface(value);
     case "preview": {
       if (value.id === "browser:new" && value.resourceId === null) {
         return { id: "browser:new", kind: "preview", resourceId: null };
@@ -601,6 +635,30 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
               surfaces: current.surfaces.map((surface) =>
                 surface.id === id && surface.kind === "pullRequest" ? { ...surface, tab } : surface,
               ),
+            };
+          }),
+        })),
+      setDeviceImage: (ref, image) =>
+        set((state) => ({
+          byThreadKey: updateThread(state.byThreadKey, scopedThreadKey(ref), (current) => {
+            const surface = current.surfaces.find(
+              (entry): entry is DeviceRightPanelSurface => entry.kind === "device",
+            );
+            if (
+              surface === undefined ||
+              (surface.image?.platform === image.platform &&
+                surface.image.imageId === image.imageId)
+            ) {
+              return current;
+            }
+            const next: DeviceRightPanelSurface = {
+              id: "device",
+              kind: "device",
+              image: { platform: image.platform, imageId: image.imageId },
+            };
+            return {
+              ...current,
+              surfaces: current.surfaces.map((entry) => (entry.kind === "device" ? next : entry)),
             };
           }),
         })),
@@ -993,6 +1051,18 @@ export function selectActiveRightPanel(
   const state = selectThreadRightPanelState(byThreadKey, ref);
   if (!state.isOpen) return null;
   return state.surfaces.find((surface) => surface.id === state.activeSurfaceId)?.kind ?? null;
+}
+
+/** The image the thread's Device pane remembers, if it has a device surface with one. */
+export function selectDeviceSurfaceImage(
+  byThreadKey: Record<string, ThreadRightPanelState>,
+  ref: ScopedThreadRef | null | undefined,
+): DeviceSurfaceImage | null {
+  const state = selectThreadRightPanelState(byThreadKey, ref);
+  return (
+    state.surfaces.find((surface): surface is DeviceRightPanelSurface => surface.kind === "device")
+      ?.image ?? null
+  );
 }
 
 export function selectActiveRightPanelSurface(

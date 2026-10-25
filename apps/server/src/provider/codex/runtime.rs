@@ -215,6 +215,11 @@ struct RuntimeInner {
     explicit_close: Mutex<bool>,
     /// The provider thread's `historyMode`; only a `paginated` thread can be rewound.
     history_mode: Mutex<Option<String>>,
+    /// The last `summaryIndex` streamed per reasoning item, until the item completes: a new
+    /// part starts after a blank line, the separator its completed summary uses.
+    reasoning_summary_parts: Mutex<HashMap<String, u64>>,
+    /// The compaction BiBCode asked for, which tags the turn Codex starts for it.
+    compaction: StdMutex<CodexCompactionTag>,
     activity: Mutex<RuntimeActivityState>,
     mcp_status: McpStatusHandle,
     mcp_opening: Mutex<Option<McpOpenReservation>>,
@@ -781,6 +786,8 @@ impl CodexSessionRuntime {
             reconciliation_cancellation: reconciliation_cancellation.clone(),
             explicit_close: Mutex::new(false),
             history_mode: Mutex::new(None),
+            reasoning_summary_parts: Mutex::new(HashMap::new()),
+            compaction: StdMutex::new(CodexCompactionTag::default()),
             mcp_status: mcp_status.clone(),
             mcp_opening: Mutex::new(Some(mcp_opening)),
             mcp_status_actor_task: StdMutex::new(None),
@@ -1391,6 +1398,21 @@ impl CodexSessionRuntime {
     /// compaction as a turn (`turn/started`, a `contextCompaction` item, `turn/completed`); the
     /// turn's id is returned when Codex started it before answering. A turn that was already
     /// active is not the compaction's.
+    /// Asks Codex to compact the thread for BiBCode's compaction `compaction_id`: the root turn
+    /// Codex starts next is that compaction's, and its `turn.started` and `turn.completed` carry
+    /// the id. A request Codex refuses leaves no tag behind.
+    pub async fn compact_thread_tagged(
+        &self,
+        compaction_id: String,
+    ) -> Result<Option<String>, RuntimeError> {
+        self.inner.compaction_tag().pending = Some(compaction_id);
+        let result = self.compact_thread().await;
+        if result.is_err() {
+            self.inner.compaction_tag().pending = None;
+        }
+        result
+    }
+
     pub async fn compact_thread(&self) -> Result<Option<String>, RuntimeError> {
         let provider_thread_id = self.provider_thread_id().await?;
         let active_before = self.inner.session.lock().await.active_turn_id.clone();
@@ -2623,7 +2645,11 @@ impl CodexSessionRuntime {
                     session.status = "running".to_owned();
                     session.active_turn_id = Some(turn_id.clone());
                     drop(session);
-                    self.emit("turn.started", Some(turn_id), None, json!({}))
+                    let mut payload = json!({});
+                    if let Some(compaction_id) = self.inner.tag_compaction_turn(&turn_id) {
+                        payload["compactionId"] = json!(compaction_id);
+                    }
+                    self.emit("turn.started", Some(turn_id), None, payload)
                         .await;
                 }
             }
@@ -2680,6 +2706,15 @@ impl CodexSessionRuntime {
                     let classified = classify_codex_error(&error);
                     payload["errorMessage"] = json!(classified.message);
                     payload["errorClass"] = json!(classified.class);
+                    if let Some(variant) = codex_error_variant(&error) {
+                        payload["providerReason"] = json!(variant);
+                    }
+                }
+                if let Some(compaction_id) = turn_id
+                    .as_deref()
+                    .and_then(|turn_id| self.inner.end_compaction_turn(turn_id))
+                {
+                    payload["compactionId"] = json!(compaction_id);
                 }
                 self.emit("turn.completed", turn_id, None, payload).await;
             }
@@ -2734,6 +2769,46 @@ impl CodexSessionRuntime {
                     .await;
                 }
             }
+            // Reasoning summaries become chat reasoning (#173). Raw reasoning
+            // (`item/reasoning/textDelta`, an item's `content`) is never projected.
+            "item/reasoning/summaryTextDelta" => {
+                let item_id = params
+                    .get("itemId")
+                    .and_then(Value::as_str)
+                    .filter(|item_id| !item_id.is_empty())
+                    .map(str::to_owned);
+                let summary_index = params
+                    .get("summaryIndex")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let mut delta = params
+                    .get("delta")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                if let Some(item_id) = &item_id {
+                    let mut parts = self.inner.reasoning_summary_parts.lock().await;
+                    let previous = parts.insert(item_id.clone(), summary_index);
+                    if previous.is_some_and(|previous| summary_index > previous) {
+                        delta.insert_str(0, "\n\n");
+                    }
+                }
+                self.emit_with_item_id(
+                    "content.delta",
+                    params
+                        .get("turnId")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    item_id,
+                    None,
+                    json!({
+                        "streamKind": "reasoning_summary_text",
+                        "summaryIndex": summary_index,
+                        "delta": delta,
+                    }),
+                )
+                .await;
+            }
             "item/started" => {
                 if let Some((turn_id, item_id)) = context_compaction_item(&params) {
                     self.emit_with_item_id(
@@ -2777,6 +2852,41 @@ impl CodexSessionRuntime {
                         Some(item_id),
                         None,
                         context_compaction_payload("completed"),
+                    )
+                    .await;
+                } else if params.pointer("/item/type").and_then(Value::as_str) == Some("reasoning")
+                {
+                    let item_id = params
+                        .pointer("/item/id")
+                        .and_then(Value::as_str)
+                        .filter(|item_id| !item_id.is_empty())
+                        .map(str::to_owned);
+                    if let Some(item_id) = &item_id {
+                        self.inner
+                            .reasoning_summary_parts
+                            .lock()
+                            .await
+                            .remove(item_id);
+                    }
+                    // The completed summary is authoritative over what streamed.
+                    let mut payload = json!({ "itemType": "reasoning" });
+                    if let Some(text) = params
+                        .pointer("/item/summary")
+                        .and_then(Value::as_array)
+                        .map(|parts| codex_reasoning_summary_text(parts))
+                        .filter(|text| !text.is_empty())
+                    {
+                        payload["text"] = json!(text);
+                    }
+                    self.emit_with_item_id(
+                        "item.completed",
+                        params
+                            .get("turnId")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                        item_id,
+                        None,
+                        payload,
                     )
                     .await;
                 } else if let Some((turn_id, payload)) = command_item_event_payload(&params, true) {
@@ -3134,7 +3244,39 @@ impl CodexSessionRuntime {
     }
 }
 
+/// Which root turn runs the compaction BiBCode asked for.
+#[derive(Debug, Default)]
+struct CodexCompactionTag {
+    /// Asked for; the next root turn Codex starts is its turn.
+    pending: Option<String>,
+    /// The compaction's turn, with its compaction id, until it completes.
+    turn: Option<(String, String)>,
+}
+
 impl RuntimeInner {
+    fn compaction_tag(&self) -> std::sync::MutexGuard<'_, CodexCompactionTag> {
+        self.compaction
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The compaction id a starting root turn runs, if BiBCode asked for one.
+    fn tag_compaction_turn(&self, turn_id: &str) -> Option<String> {
+        let mut tag = self.compaction_tag();
+        let compaction_id = tag.pending.take()?;
+        tag.turn = Some((turn_id.to_owned(), compaction_id.clone()));
+        Some(compaction_id)
+    }
+
+    /// The compaction id of a completing turn, if it was a compaction's.
+    fn end_compaction_turn(&self, turn_id: &str) -> Option<String> {
+        let mut tag = self.compaction_tag();
+        if tag.turn.as_ref().is_some_and(|(turn, _)| turn == turn_id) {
+            return tag.turn.take().map(|(_, compaction_id)| compaction_id);
+        }
+        None
+    }
+
     async fn options_resume_cursor_set(&self, resume_cursor: Option<String>) {
         let mut session = self.session.lock().await;
         session.resume_cursor = resume_cursor;
@@ -3825,6 +3967,16 @@ fn describe_codex_error_variant(variant: &str) -> Option<(&'static str, &'static
 /// whose upstream HTTP status, when known, sits inside the variant object.
 /// A variant newer than the supported schema keeps the generic text but still
 /// names itself in the message.
+/// The `codexErrorInfo` variant of a failure, such as `contextWindowExceeded`: the Profiler's
+/// provider reason.
+fn codex_error_variant(error: &Value) -> Option<String> {
+    match error.get("codexErrorInfo")? {
+        Value::String(variant) => Some(variant.clone()),
+        Value::Object(tagged) if tagged.len() == 1 => tagged.keys().next().cloned(),
+        _ => None,
+    }
+}
+
 pub(crate) fn classify_codex_error(error: &Value) -> CodexFailure {
     let (info, detail) = match error.get("codexErrorInfo") {
         Some(Value::String(variant)) => (Some(variant.as_str()), None),
@@ -3897,6 +4049,19 @@ fn context_compaction_payload(status: &str) -> Value {
         "status": status,
         "title": "Conversation compaction",
     })
+}
+
+/// A reasoning item's summary parts joined by blank lines, the separator its streamed parts use.
+fn codex_reasoning_summary_text(parts: &[Value]) -> String {
+    parts
+        .iter()
+        .filter_map(|part| {
+            part.as_str()
+                .or_else(|| part.get("text").and_then(Value::as_str))
+        })
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 fn command_item_event_payload(params: &Value, completed: bool) -> Option<(String, Value)> {
@@ -4707,6 +4872,11 @@ mod tests {
                 completion.payload["errorClass"], expected_class,
                 "{expected_name}"
             );
+            // The variant is the Profiler's provider reason.
+            assert_eq!(
+                completion.payload["providerReason"], expected_name,
+                "{expected_name}"
+            );
             let message = completion.payload["errorMessage"]
                 .as_str()
                 .expect("error message");
@@ -4967,6 +5137,48 @@ mod tests {
             silent.message,
             "Codex's context window is full. Compact the conversation, then send your message again. (contextWindowExceeded)"
         );
+    }
+
+    /// The root turn Codex starts after BiBCode asked it to compact is that compaction's turn:
+    /// its `turn.started` and `turn.completed` carry the compaction id, and no later turn does.
+    #[tokio::test]
+    async fn the_turn_codex_starts_for_a_compaction_is_tagged_with_its_id() {
+        let (runtime, _peer_stdout, _peer_stdin) = root_thread_runtime();
+        runtime.inner.compaction_tag().pending = Some("compaction:1".to_owned());
+        for (method, turn, status) in [
+            ("turn/started", "compaction-turn", None),
+            ("turn/completed", "compaction-turn", Some("completed")),
+            ("turn/started", "next-turn", None),
+            ("turn/completed", "next-turn", Some("completed")),
+        ] {
+            let mut turn_value = json!({ "id": turn });
+            if let Some(status) = status {
+                turn_value["status"] = json!(status);
+            }
+            runtime
+                .handle_notification(method.to_owned(), json!({ "turn": turn_value }), 1_000)
+                .await;
+        }
+        let events = drain_runtime_events(&runtime).await;
+        let tagged = |kind: &str, turn: &str| {
+            events
+                .iter()
+                .find(|event| event.event_type == kind && event.turn_id.as_deref() == Some(turn))
+                .unwrap_or_else(|| panic!("{kind} for {turn}"))
+                .payload
+                .get("compactionId")
+                .cloned()
+        };
+        assert_eq!(
+            tagged("turn.started", "compaction-turn"),
+            Some(json!("compaction:1"))
+        );
+        assert_eq!(
+            tagged("turn.completed", "compaction-turn"),
+            Some(json!("compaction:1"))
+        );
+        assert_eq!(tagged("turn.started", "next-turn"), None);
+        assert_eq!(tagged("turn.completed", "next-turn"), None);
     }
 
     #[tokio::test]

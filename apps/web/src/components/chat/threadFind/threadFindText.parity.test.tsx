@@ -130,6 +130,25 @@ const CORPUS: ReadonlyArray<{ readonly name: string; readonly text: string }> = 
     ].join("\n"),
   },
   {
+    // A drawn diagram and the source it shows until then are not searched; a fence that is not
+    // closed renders as plain code and is.
+    name: "mermaid diagrams",
+    text: [
+      "Before the diagram.",
+      "",
+      "```mermaid",
+      "graph TD",
+      "  Alpha --> Beta",
+      "```",
+      "",
+      "Between diagrams with Alpha.",
+      "",
+      "```mermaid",
+      "sequenceDiagram",
+      "  Gamma->>Alpha: hello",
+    ].join("\n"),
+  },
+  {
     name: "chat-style input",
     text: "first line\nsecond line with $review\n\nnew paragraph $deploy\n  indented",
   },

@@ -163,6 +163,10 @@ pub fn is_long_running(method: &str) -> bool {
             | "device.close"
             | "device.input"
             | "device.rotate"
+            // `--tool-help` probes about 30 tools (1.7 s measured), and a launch waits up to
+            // 1 s on an external program.
+            | "review.listDiffTools"
+            | "review.openDiffTool"
     )
 }
 
@@ -1134,6 +1138,8 @@ mod tests {
             "device.input",
             "device.rotate",
             "server.getProviderCapabilities",
+            "review.listDiffTools",
+            "review.openDiffTool",
         ] {
             book.observe(method, "success", 1_500.0, 0.0, None);
         }
@@ -1152,6 +1158,8 @@ mod tests {
         // git command timeout. A slow one is a slowness worth reporting.
         assert!(!is_long_running("worktree.adopt"));
         assert!(!is_long_running("gitManager.previewMerge"));
+        // A local, bounded read: a slow one is worth reporting.
+        assert!(!is_long_running("review.readFileVersion"));
     }
 
     #[test]

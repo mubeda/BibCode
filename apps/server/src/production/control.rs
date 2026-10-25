@@ -2570,6 +2570,41 @@ fn current_directory(config: &ServerConfig) -> String {
 }
 
 fn environment_descriptor(config: &ServerConfig, activity_protocol_registered: bool) -> Value {
+    // Built apart from the descriptor: one literal holding both exceeds `json!`'s recursion limit.
+    let capabilities = json!({
+        "repositoryIdentity": true,
+        "worktreeCatalog": true,
+        "worktreeCatalogRefreshReason": true,
+        "vcsStatusSummary": true,
+        "gitManagerReads": true,
+        "gitManagerCommitOperations": true,
+        "gitManagerBranchSyncOperations": true,
+        "gitManagerStashMergeOperations": true,
+        "gitManagerMergeIntoOperations": true,
+        "gitManagerPartialStaging": true,
+        "gitManagerRewriteOperations": true,
+        "gitManagerTagOperations": true,
+        "gitManagerLiveSignal": true,
+        "gitManagerPullRequests": true,
+        "gitPullRequestBranchSelection": true,
+        "pullRequestsReads": true,
+        "pullRequestsMutations": true,
+        "activityProtocolVersion": activity_protocol_registered.then_some(2),
+        "remoteUpdateControl": true,
+        "remoteUpdateProgress": true,
+        "terminalOrderedInput": true,
+        "terminalSizeOwnership": true,
+        "terminalImagePaste": true,
+        "pullRequestCreateOptions": true,
+        "vcsCloneReattach": true,
+        "attachmentStaging": true,
+        "profiler": true,
+        "devicePreviews": true,
+        "deviceCatalogRefresh": true,
+        "cliSessionHistory": true,
+        "previewTunnels": true,
+        "reviewDiffTools": true,
+    });
     json!({
         "environmentId": config.environment_id,
         "label": config.environment_label,
@@ -2583,39 +2618,7 @@ fn environment_descriptor(config: &ServerConfig, activity_protocol_registered: b
         "remoteUpdateSupport": config.remote_update_support,
         "remoteProtocolVersion": crate::http::REMOTE_PROTOCOL_VERSION,
         "minCompatibleRemoteProtocol": crate::http::MIN_COMPATIBLE_REMOTE_PROTOCOL,
-        "capabilities": {
-            "repositoryIdentity": true,
-            "worktreeCatalog": true,
-            "worktreeCatalogRefreshReason": true,
-            "vcsStatusSummary": true,
-            "gitManagerReads": true,
-            "gitManagerCommitOperations": true,
-            "gitManagerBranchSyncOperations": true,
-            "gitManagerStashMergeOperations": true,
-            "gitManagerMergeIntoOperations": true,
-            "gitManagerPartialStaging": true,
-            "gitManagerRewriteOperations": true,
-            "gitManagerTagOperations": true,
-            "gitManagerLiveSignal": true,
-            "gitManagerPullRequests": true,
-            "gitPullRequestBranchSelection": true,
-            "pullRequestsReads": true,
-            "pullRequestsMutations": true,
-            "activityProtocolVersion": activity_protocol_registered.then_some(2),
-            "remoteUpdateControl": true,
-            "remoteUpdateProgress": true,
-            "terminalOrderedInput": true,
-            "terminalSizeOwnership": true,
-            "terminalImagePaste": true,
-            "pullRequestCreateOptions": true,
-            "vcsCloneReattach": true,
-            "attachmentStaging": true,
-            "profiler": true,
-            "devicePreviews": true,
-            "deviceCatalogRefresh": true,
-            "cliSessionHistory": true,
-            "previewTunnels": true,
-        },
+        "capabilities": capabilities,
     })
 }
 
@@ -6732,6 +6735,7 @@ mod tests {
         assert_eq!(descriptor["capabilities"]["terminalImagePaste"], true);
         assert_eq!(descriptor["capabilities"]["pullRequestCreateOptions"], true);
         assert_eq!(descriptor["capabilities"]["vcsCloneReattach"], true);
+        assert_eq!(descriptor["capabilities"]["reviewDiffTools"], true);
         assert_eq!(descriptor["capabilities"]["attachmentStaging"], true);
         assert_eq!(
             descriptor["remoteUpdateSupport"],

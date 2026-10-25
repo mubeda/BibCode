@@ -934,6 +934,17 @@ runtime's provider, terminal, helper, or tunnel children. PID reuse is excluded 
 identity checks, registry entries leave with their process owners, and shutdown
 is idempotent without awaiting while the registry lock is held.
 
+A registration marked `survives_shutdown` is never a root. The Diff panel's
+**Open with** marks each `git difftool` it starts this way, because the diff
+app above it may hold unsaved edits to the user's files. Freezing ownership
+returns these survivors separately, and a standalone server's final sweep of
+its own descendants spares each survivor and everything under it, matched by
+creation time. The launcher stops taking launches before the freeze and keeps
+its registrations, so an app still open is a survivor when ownership is
+captured. Every other registration (providers, terminals, the desktop UI and
+helpers) is a root as before. See
+[Open with](./rpc-and-orchestration.md#open-with).
+
 Preparation is single-flight and returns a lease-bound identifier. Commit and
 cancel must present that identifier. Commit sends its HTTP response before the
 backend exits cleanly; cancellation, preparation failure, and lease expiry also
@@ -1492,9 +1503,11 @@ are listed in the
   before building a report.
   The device manager (`apps/server/src/device/`) likewise emits
   `device.lifecycle` (`start`, `ready`, `fail`, `stop`, with `platform`
-  `android` or `ios`, and a `failureKind` that includes `busy` for a simulator
-  found running outside BiBCode as its launch began) only while the profiler
-  is on. It reports an emulator that exits on its own as `subprocess.crash`
+  `android` or `ios`, a `failureKind` that includes `busy` for a simulator
+  found running outside BiBCode as its launch began, and `running`, the count
+  of live devices after the transition, so a memory or CPU finding can be read
+  against it) only while the profiler is on. It never names a thread, image, or
+  device. It reports an emulator that exits on its own as `subprocess.crash`
   labelled `android-emulator`, and a simulator shut down or deleted outside
   BiBCode as one labelled `ios-simulator`. A simulator has no exit status, so
   that report always says `exit 1`, with the `launchd_sim` pid, or pid `0` when
@@ -1588,8 +1601,12 @@ it.
   `worktree.removal-failed` cites `worktree.removal`;
   `git.stacked-action-failed` cites `git.stacked-action`; `client.stall` and
   `client.interaction` cite `client.batch`; `crash.panic` cites `panic`; and
-  `provider.turn-failed` (a failed Claude turn, by provider, terminal reason and
-  error class, never its text) cites its own event. An event dropped by a full
+  `provider.turn-failed` (a failed turn of any provider, recorded once where
+  the failed turn is projected, by provider, provider reason in snake case and
+  error class, never its text) cites its own event; and
+  `provider.compaction-failed` (a compaction BiBCode asked for that failed, by
+  provider, trigger and reason) cites its `provider.compaction` event, which
+  every settled compaction writes without any message or summary text. An event dropped by a full
   channel is never cited.
 - `server.getProfilerStatus` returns the 20 newest findings without evidence;
   the CLI and MCP readers return the evidence too.
@@ -1821,7 +1838,12 @@ it.
   uses the start instant the exit path recorded, so a late report cannot move
   it. Once BiBCode has received a termination
   signal, nothing that dies with it is. A SIGKILL BiBCode did not send is
-  labelled likely OOM.
+  labelled likely OOM. The Diff panel's review and turn patches report their
+  `git` child the same way; the runner's own kill, at the patch cap or after a
+  failed read, is a requested stop. A diff app opened through **Open with**
+  runs under a `git difftool` whose reaper reports it as the label
+  `git-difftool`, counting signals only; an exit code, which a diff tool may
+  use to mean "differences found", is logged and never a finding.
 - **Webview.** On desktop, the end of the main window's web content process (on
   Windows, any WebView2 process failure) is a `crash.webview` finding.
   - Linux hooks WebKitGTK `web-process-terminated` (except `TerminatedByApi`).
@@ -1997,8 +2019,8 @@ bounded memory, and works while the server is stopped.
 ## Device previews
 
 `apps/server/src/device/` runs Android emulators and, on a macOS server, iOS
-simulators, at most one running device per platform per environment, and shows
-them in a right-panel `device` surface. Everything is off until the environment's
+simulators, up to four live devices per environment in any mix of platforms and
+one per image, and shows them in each thread's right-panel `device` surface. Everything is off until the environment's
 `enableDevicePreviews` setting (default `false`, toggled per environment at
 **Settings → Mobile emulators**) is on; servers that support it advertise the
 `devicePreviews` capability, and older servers get no device RPC. A client
@@ -2031,7 +2053,8 @@ Each failure becomes the `availability` of the catalog's Android entry
 actionable message. The catalog lists one entry per platform, each with its
 own `availability` and `images` (`{ id, displayName, inUseElsewhere? }`), and
 every device as
-`{ deviceId, platform, imageId, state, orientation, canRotate }`. A discovery
+`{ deviceId, platform, imageId, state, orientation, canRotate, threadId? }`, in
+the order they were opened. A discovery
 result serves for 30 s; `device.refreshCatalog` (the panel's **Refresh
 devices**) and the MCP `device_list` tool always rerun it. Display
 names are unique within a platform: where two images would share one, as two
@@ -2040,13 +2063,55 @@ gets `·` and a tag, the AVD's name or the last four characters of the
 simulator's UDID (the whole UDID if those also match).
 
 **Lifecycle.** `DeviceManager` owns the catalog (`device.subscribeCatalog`) and
-allows one running device per platform; a second `device.open` on that
-platform fails with `DeviceLimitError` naming the running device's display
-name, and an image already running outside BiBCode fails with
+admits `MAX_RUNNING_DEVICES` (four) live devices per environment: a slot counts
+until it has `stopped` or `failed`, so a `stopping` device still holds its
+place, and a fifth `device.open` fails with `DeviceLimitError`. Its `running`
+names the first live device on the requested platform in catalog order (else
+the first live device), the device an older client's limit banner stops. An
+image runs once: opening an image whose device is `starting`, `booting`, or
+`ready` returns that device's id, starts nothing, and keeps its owner; opening
+a `stopping` image fails with `DeviceNotReadyError` until it has stopped.
+Admission runs unlocked first and again under the table lock, and the unlocked
+attach comes before the backend's `check_available`, so iOS never calls a
+simulator BiBCode booted busy; when two opens of one simulator race and the
+second's check answers `Busy`, the open looks under the lock for the first's
+device and returns it. An image already running outside BiBCode fails with
 `DeviceBusyError`. A device moves `starting → booting → ready →
 stopping → stopped`, or to `failed` with a reason (`exited`, `bootTimeout`,
-`spawn`, `unresponsive`, or `busy`). The four most recent ended devices stay
-in the catalog so their reason stays visible.
+`spawn`, `unresponsive`, or `busy`). The catalog lists devices in open order,
+and the four most recent ended devices of the environment stay in it so their
+reason stays visible.
+
+**Owners.** `device.open` takes an optional `threadId`, the root thread the
+device is for: a chat panel's host, else the thread. The server trims it and
+refuses a blank one with `DeviceInputError`, so every published owner decodes
+as a `ThreadId`, and the snapshot keeps it after the device ends. The owner is
+an unverified label from a client that can already open and close every device,
+not a permission: it drives the pane's selection, the thread-deletion stop, and
+the agent refusals below. Thread deletion runs the `close_devices` effect after
+the previews close, which calls `DeviceManager::stop_thread`: under the table
+lock it records the thread among the last 256 deletions and starts the stop of
+every live device it owns, then returns without waiting for the reap. `open`
+refuses an owner on that list with `DeviceNotFoundError`, before discovery and
+again under the insertion lock, so a deletion that lands while an open waits on
+discovery or `check_available` starts nothing. Archiving stops nothing. The
+manager never reads the read model and persists nothing: devices, owners, and
+the deletion list end with the server.
+
+**The Device pane.** `ChatView` renders `DevicePanel` for the active thread and
+passes its root thread (chat panels render only Activity, so their devices are
+their host's), and the pane's session is keyed by thread. The thread's device
+surface stores the image the pane last picked or started
+(`{ id: "device", kind: "device", image?: { platform, imageId } }`, an image id
+rather than a per-open device id); closing the tab discards it. Selection is a
+pure function of the catalog, that pick, and the root id: the pick while the
+catalog lists the image, else the image of the thread's oldest live device,
+else of its newest ended one, else the first image nobody runs. The shown device
+is the selected image's live device, else its newest ended attempt. The picker
+says whose device runs each image (`Running here`, `Running in <thread>`, or
+`Running`), another thread's device carries a `Started in <thread>.` line,
+Start is disabled at four live devices, and stopping another thread's device
+asks first.
 
 - The emulator starts with `-avd <name>`, `-no-window`, `-no-audio`,
   `-no-boot-anim`, `-port <even console port 5554–5682>`,
@@ -2054,6 +2119,11 @@ in the catalog so their reason stays visible.
   `-gpu swiftshader_indirect` on a Linux server with neither `DISPLAY` nor
   `WAYLAND_DISPLAY`. The AVD name is one argument and never meets a shell. It
   is a registered helper (`android-emulator`) in its own process group or Job.
+  The ports are probed before the emulator binds them; the backend reserves the
+  console and adb pair and a picked gRPC port of every launch until its device
+  ends, its launch fails, or it is cancelled, so two emulators starting at once
+  never pick the same pair. A program outside the server can still take a
+  probed port first, and that device fails with the emulator's reason.
 - BiBCode never sets `ANDROID_EMULATOR_HOME`, because that also redirects AVD
   lookup. It reads the gRPC port and token from the emulator's discovery file,
   searching `emulator::default_discovery_dirs` in order: the OS runtime
@@ -2325,12 +2395,18 @@ The device is `booting` from the boot until the screen is attached, then
 `ready`. BiBCode shuts down only simulators it booted (`IosBackend::booted`):
 a failed `simctl boot` leaves the simulator alone, since it may be someone
 else's, and a simulator that was shut down outside BiBCode is not shut down
-again, since someone may have booted it since. A stop releases input, detaches
-the screen, unregisters `launchd_sim`, and runs `simctl shutdown`. The
-simulator's state is polled every 2 s; one shut down or deleted outside
+again, since someone may have booted it since. A stop releases input,
+unregisters the simulator from the state poll, detaches the screen,
+unregisters `launchd_sim`, and runs `simctl shutdown`. One backend task polls
+every running simulator with a single `simctl list` every 2 s while any runs:
+it copies the registered (UDID, generation) pairs before listing and applies
+the listing under the registry lock only to pairs still registered under the
+same generation, so a simulator that registered later, stopped meanwhile, or
+was stopped and opened again is never marked. One shut down or deleted outside
 BiBCode fails the device with `Shutdown outside BiBCode` or
 `Deleted outside BiBCode` and raises `subprocess.crash` (see
-[Profiler](#profiler)). Simulators left booted by a server that crashed are
+[Profiler](#profiler)). The last unregister cancels and joins the task, so no
+poll outlives `DeviceManager::shutdown`. Simulators left booted by a server that crashed are
 not reaped: the next start lists them as running outside BiBCode.
 
 **Live screen.** After boot, the backend attaches to the simulator's main
@@ -2442,11 +2518,21 @@ groups:
   spending one of those retries; a screen that has not shown a frame yet still
   falls back after 5 s.
 
-**Agents.** Coding agents reach the same device through four MCP tools on the
-provider MCP endpoint: `device_list`, `device_open` (takes `platform`, which
-defaults to `android`, and `imageId`; waits up to 180 s for `ready`),
-`device_screenshot` (a PNG at most 1080 px wide; a view-only simulator's is
-its full-size `simctl` JPEG), and `device_close`.
+**Agents.** Coding agents reach the same devices through four MCP tools on the
+provider MCP endpoint, acting for their root thread: `issue_mcp_credential`
+stores it as `PreviewScope.owner_thread_id`, the thread row's `host_thread_id`
+for a chat panel (carried on `ProviderLaunchRequest`), else the thread, so a
+chat panel's agent and its host's Device pane share devices. `device_list`
+marks each device `thisThread`; `device_open` (takes `platform`, which defaults
+to `android`, and `imageId`; waits up to 180 s for `ready`) records the owner,
+returns the owner's running image or an unowned one, and refuses an image
+another thread runs with `DeviceBusyError`; `device_screenshot` (a PNG at most
+1080 px wide; a view-only simulator's is its full-size `simctl` JPEG) without
+`deviceId` takes the caller's only live device, else the only live device, else
+fails listing them; and `device_close` refuses another thread's device with
+`DeviceBusyError`, while a device without an owner, from an older client, can
+be closed by any agent. These refusals keep tasks apart; they are not access
+control.
 They are listed and callable only while `DeviceManager::enabled()` is true;
 with the setting off the tools disappear from `tools/list` and a call fails
 with `DevicePreviewsDisabledError`. There is no per-call scope check, by
@@ -2455,7 +2541,7 @@ when it launches a thread's provider, so holding it is the operate grant, as
 for the `preview_*` tools. If MCP credentials are ever issued to
 lower-privileged principals, both tool families need a real scope check.
 `DeviceTools::call` receives the calling thread's `PreviewScope` and logs its
-environment and thread ids with the operation at `debug`, never the
+environment, thread, and owner ids with the operation at `debug`, never the
 arguments.
 
 **Ownership and shutdown.** `ProductionRuntime` calls
@@ -2782,8 +2868,9 @@ entry's text, never the query. Its render cost depends on whether the message
 is streaming:
 
 - **Finished messages.** A code block whose highlight is not cached renders as
-  a plain block at once. A queue then highlights one block per task, newest
-  first, and drops blocks that unmounted. Highlighted HTML is kept in an LRU
+  a plain block at once. A queue (`components/markdown/renderQueue.ts`, shared
+  with Mermaid diagrams) then highlights one block per task, newest first, and
+  drops blocks that unmounted. Highlighted HTML is kept in an LRU
   cache (500 entries, 50 MB) keyed by the code's hash, length, language and
   theme, so a remounted row, such as one scrolled back into view, shows its
   highlight at once.
@@ -2798,13 +2885,108 @@ is streaming:
   unchanged. `chat/HighlightedCodeLines.tsx` renders one memoized element per
   line, so completed lines keep their DOM. A block that streamed keeps this
   renderer when the reply finishes and stores its HTML in the cache.
-- **Stable components.** The Markdown components read the values that change
-  with every delta (the text, whether it streams, file-link metadata) from a
-  context rather than closing over them, so they keep their identity while a
-  reply streams. React then updates rendered blocks in place, and their state,
-  such as a block's line-wrap toggle or an open details block, survives the
-  next delta. A details block whose `open` attribute is edited starts over
-  from it. A theme change rebuilds the components and highlights again.
+- **Stable components.** The Markdown components are defined once, at module
+  scope, and read every value that can change (the text, whether it streams,
+  the theme, file-link metadata, the environment, thread, skills and
+  handlers) from one context rather than closing over them, so they keep
+  their identity for the life of the page. React then updates rendered blocks
+  in place, and their state, such as a block's line-wrap toggle or an open
+  details block, survives the next delta and a theme switch. A details block
+  whose `open` attribute is edited starts over from it. A theme switch
+  highlights code blocks again in the new theme.
 
 The streamed result equals a full parse and a full highlight of the same text.
 The unit tests compare every streamed prefix with one.
+
+#### Mermaid diagrams
+
+A fenced block whose language is exactly `mermaid` draws as a diagram in every
+`ChatMarkdown` surface (messages, the Plan sidebar, Proposed Plan cards and the
+rendered Markdown file view) once its own closing fence has arrived, so the
+renderer never sees partial source:
+
+- **Gate.** `components/markdown/mermaidFence.ts` reads what the parser decided
+  rather than parsing CommonMark again. The block's source slice must start
+  with a fence run, end at a closing run, and hold exactly one line more than
+  its opening line and body. A fence ended by its container or by the end of
+  the text, raw-HTML `language-mermaid`, an empty body, and a fence a Proposed
+  Plan preview cut open stay ordinary code blocks. While a reply streams, a
+  closing run counts only once a line ending follows it. The gate gives every
+  fence the same answer under the incremental parser, whose reused nodes keep
+  absolute positions.
+- **Drawing.** `components/markdown/MarkdownMermaidBlock.tsx` shows the
+  highlighted source until the diagram is ready, then the diagram in the same
+  code-block card, with **Show source**. On a cache miss it loads, in order,
+  one shared import of `components/markdown/mermaidRenderer.ts`, Pele's chunk
+  for the diagram type (`pele/lazy`; the full Pele bundle is never imported)
+  and the page fonts, checking for cancellation after each, then runs one job
+  in the render queue: Pele's `render()` and the sanitizer, in the same task.
+  Nothing Mermaid-related loads before the first closed fence. A source over
+  25,000 characters shows an error without loading anything; Pele also refuses
+  more than 500 edges or 1,000,000 characters of output. Diagrams keep their
+  authored direction (`autoDirection: false`, no `maxWidth`), so the output
+  depends only on the source and the fonts, and narrow panes scale the SVG
+  down. Mermaid theme directives are not applied: Pele colors shapes through
+  `--pele-*` variables that `.chat-markdown-mermaid` maps onto the app's
+  tokens, so a theme switch recolors a diagram without drawing it again.
+- **Cache and concurrency.** Drawn diagrams and diagram errors live in a
+  module LRU (100 entries, 16 MB) keyed by the font key and the full source,
+  never a hash, and pending jobs are keyed the same way, so a block joins only
+  a job for its exact source. A remount, a theme switch or a second surface
+  draws from the cache in the same commit. A source replaced during a load
+  (a reply's final text, a snapshot), and an unmount, cancel the attempt; a job
+  is cancelled only when its last waiting block leaves, and a result shows only
+  in a block that still holds its source. A failed renderer import is cleared
+  so **Retry** can try again.
+- **Copy.** The diagram host carries `data-markdown-copy` (the fenced source)
+  and `data-markdown-atomic`, so `markdown-clipboard.ts` copies a selection
+  inside or across a diagram as its source, and the HTML flavor as an escaped
+  code block.
+- **Reading position.** A diagram replacing its source, or **Show source**,
+  changes the block's height. In the timeline, a row wholly above the first
+  visible row is held by LegendList's `maintainVisibleContentPosition.size`;
+  inside the first visible row, above the viewport's top edge, the block
+  commits its swap through the timeline's reading anchor
+  (`chat/readingAnchor.ts`), which commits with `flushSync` and scrolls by the
+  height change. New text that replaces a block's source (a reply's final
+  text, a snapshot) arrives in a commit React makes, so the block's body
+  measures itself in `getSnapshotBeforeUpdate` and the anchor scrolls by the
+  change in `componentDidUpdate`. Only within `maintainScrollAtEnd`'s threshold of the end (a
+  tenth of the viewport, narrower than LegendList's `isNearEnd`) does the list
+  hold the newest line itself, so only there does the anchor stand aside. The
+  file view and the Plan sidebar rely on browser scroll anchoring, which
+  WebKit before Safari 27 (which may include WebKitGTK) lacks, so there a
+  diagram drawing above the reading position shifts it once.
+
+**SVG trust boundary.** Diagram sources are untrusted: agent output, pasted
+text, plans and workspace Markdown files. The SVG Pele draws from them reaches
+the DOM through `dangerouslySetInnerHTML`, outside the `rehype-sanitize` pass,
+so `components/markdown/mermaidSanitizer.ts` is the boundary, and it holds
+without relying on Pele's own filtering (Pele runs with links and images off
+and no icon or math hooks). It is a dedicated DOMPurify instance with
+allowlists at three levels:
+
+- elements: the shape, text, title and gradient elements Pele emits, so no
+  `a`, `image`, `style`, `foreignObject`, `use` or animation element;
+- attributes: geometry, presentation and ARIA attributes, so no `href`, `src`,
+  event handler, `filter`, `mask`, `clip-path`, `marker-*` or `cursor`;
+- CSS, which DOMPurify does not parse: `style` keeps only the properties Pele
+  writes (and its `--_x` custom properties), with values that call only `var`,
+  `rgb`, `rgba`, `hsl` or `hsla` and hold no backslash, comment, at-rule,
+  brace or semicolon; `fill` and `stroke` may instead be a same-document
+  `url(#id)`. A blocklist would miss `image-set("/x" 1x)` and the escaped
+  `u\72l(`. Both production CSPs allow same-origin image loads without a
+  violation event, so these value rules, not the CSP, carry the resource
+  boundary; the CSP (`script-src 'self'`, no `'unsafe-eval'`) is the last
+  layer for script.
+
+Classes other than Pele's own `pele` and `pele-*` are dropped so app CSS cannot
+reach diagram nodes, and the host sets `contain: content` so nothing paints
+over app UI. If DOMPurify reports itself unsupported, which would return its
+input unchanged, the sanitizer throws and the block shows "Couldn't draw this
+diagram." A corpus covering every diagram type Pele draws must sanitize with
+nothing removed, so a Pele upgrade that emits new markup fails a test instead
+of losing output or widening the boundary; a guard test keeps `eval` and the
+`Function` constructor out of the installed Pele and DOMPurify builds. Diagram
+source and Pele's messages, which can quote it, are never logged: a failure
+logs only `{ operation, code }`.

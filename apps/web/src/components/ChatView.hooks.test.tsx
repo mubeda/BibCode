@@ -206,6 +206,7 @@ vi.mock("../state/threads", () => ({
     respondToApproval: { key: "thread.respondToApproval" },
     respondToUserInput: { key: "thread.respondToUserInput" },
     revertCheckpoint: { key: "thread.revertCheckpoint" },
+    compact: { key: "thread.compact" },
   },
 }));
 
@@ -766,6 +767,7 @@ function makeThread(overrides: Partial<Thread> = {}): Thread {
     interactionMode: "default",
     session: null,
     messages: [],
+    reasoning: [],
     proposedPlans: [],
     activities: [],
     checkpoints: [],
@@ -792,6 +794,7 @@ function makeActionablePlanThread(suffix: string): Thread {
       completedAt: later,
       assistantMessageId: null,
     },
+    reasoning: [],
     proposedPlans: [
       {
         id: OrchestrationProposedPlanId.make(`plan-${suffix}`),
@@ -4963,6 +4966,7 @@ describe("ChatView send flows", () => {
           completedAt: later,
           assistantMessageId: null,
         },
+        reasoning: [],
         proposedPlans: [
           {
             id: OrchestrationProposedPlanId.make("plan-1"),
@@ -5006,6 +5010,7 @@ describe("ChatView send flows", () => {
           completedAt: later,
           assistantMessageId: null,
         },
+        reasoning: [],
         proposedPlans: [
           {
             id: OrchestrationProposedPlanId.make("plan-1"),
@@ -5051,6 +5056,7 @@ describe("ChatView send flows", () => {
           completedAt: later,
           assistantMessageId: null,
         },
+        reasoning: [],
         proposedPlans: [
           {
             id: OrchestrationProposedPlanId.make("plan-1"),

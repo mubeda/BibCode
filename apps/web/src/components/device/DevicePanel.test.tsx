@@ -8,7 +8,8 @@ import type {
   DevicePlatformCatalog,
   DeviceSnapshot,
 } from "@bibcode/contracts";
-import { EnvironmentId } from "@bibcode/contracts";
+import { scopeThreadRef } from "@bibcode/client-runtime/environment";
+import { EnvironmentId, ThreadId } from "@bibcode/contracts";
 import * as Cause from "effect/Cause";
 import { act, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
@@ -37,6 +38,28 @@ const h = vi.hoisted(() => ({
   screenProps: null as AnyProps | null,
   catalogListeners: new Set<() => void>(),
   selectValueChange: null as unknown,
+  /** Thread titles this client knows, by thread id. */
+  threadTitles: {} as Record<string, string>,
+}));
+
+vi.mock("../../state/entities", () => ({
+  useThreadShell: (ref: { threadId: string } | null) => {
+    const title = ref === null ? undefined : h.threadTitles[ref.threadId];
+    return title === undefined ? null : { title };
+  },
+}));
+
+// Rendered in place, so a test reads the confirmation like the rest of the pane.
+vi.mock("../ui/alert-dialog", () => ({
+  AlertDialog: (props: AnyProps) =>
+    props.open === false ? null : <div data-alert-dialog>{props.children as ReactNode}</div>,
+  AlertDialogPopup: (props: AnyProps) => (
+    <div role="alertdialog">{props.children as ReactNode}</div>
+  ),
+  AlertDialogHeader: (props: AnyProps) => <div>{props.children as ReactNode}</div>,
+  AlertDialogFooter: (props: AnyProps) => <div>{props.children as ReactNode}</div>,
+  AlertDialogTitle: (props: AnyProps) => <h2>{props.children as ReactNode}</h2>,
+  AlertDialogDescription: (props: AnyProps) => <p>{props.children as ReactNode}</p>,
 }));
 
 vi.mock("./deviceAvailability", () => ({
@@ -137,9 +160,15 @@ vi.mock("../ui/select", () => ({
   ),
 }));
 
+import { selectDeviceSurfaceImage, useRightPanelStore } from "../../rightPanelStore";
 import { DevicePanel, rotatedOrientation, selectedImageOf, selectShownDevice } from "./DevicePanel";
 
 const ENVIRONMENT_ID = EnvironmentId.make("environment-work");
+/** The thread whose pane is rendered, and its root: devices it starts are labelled with it. */
+const THREAD_ID = ThreadId.make("thread-work");
+const THREAD_REF = scopeThreadRef(ENVIRONMENT_ID, THREAD_ID);
+const OTHER_THREAD_ID = ThreadId.make("thread-other");
+const OTHER_THREAD_REF = scopeThreadRef(ENVIRONMENT_ID, OTHER_THREAD_ID);
 const PIXEL: DeviceImage = { id: "Pixel_8", displayName: "Pixel 8" };
 const TABLET: DeviceImage = { id: "Tablet", displayName: "Tablet" };
 
@@ -191,6 +220,7 @@ function readyIosDevice(
   });
 }
 
+/** A device this pane's thread started, unless `overrides` says whose it is. */
 function snapshot(overrides: Partial<DeviceSnapshot> = {}): DeviceSnapshot {
   return {
     deviceId: "d-1",
@@ -201,8 +231,15 @@ function snapshot(overrides: Partial<DeviceSnapshot> = {}): DeviceSnapshot {
     width: 1080,
     height: 2400,
     canRotate: true,
+    threadId: THREAD_ID,
     ...overrides,
   };
+}
+
+/** A device without an owner: started by an older client, or listed by an older server. */
+function unowned(device: DeviceSnapshot): DeviceSnapshot {
+  const { threadId: _threadId, ...rest } = device;
+  return rest;
 }
 
 function withCatalog(value: DeviceCatalog | null) {
@@ -220,15 +257,27 @@ function withCatalog(value: DeviceCatalog | null) {
 const mounted: Array<{ root: Root; container: HTMLDivElement }> = [];
 
 async function render(): Promise<HTMLDivElement> {
+  return (await renderThread(THREAD_REF)).container;
+}
+
+/** Renders the pane of `ref`'s thread; `show` switches the same pane to another thread. */
+async function renderThread(ref: typeof THREAD_REF) {
   const container = document.createElement("div");
   document.body.append(container);
   const root = createRoot(container);
   mounted.push({ root, container });
-  await act(async () => {
-    root.render(<DevicePanel environmentId={ENVIRONMENT_ID} />);
-  });
-  return container;
+  const show = async (shown: typeof THREAD_REF) => {
+    await act(async () => {
+      root.render(<DevicePanel threadRef={shown} rootThreadId={shown.threadId} />);
+    });
+  };
+  await show(ref);
+  return { container, show };
 }
+
+/** The image the thread's device surface remembers. */
+const storedPick = (ref: typeof THREAD_REF) =>
+  selectDeviceSurfaceImage(useRightPanelStore.getState().byThreadKey, ref);
 
 function button(container: HTMLElement, text: string): HTMLButtonElement {
   const found = [...container.querySelectorAll("button")].find(
@@ -286,6 +335,11 @@ beforeEach(() => {
   h.navigations.length = 0;
   h.screens.length = 0;
   h.screenProps = null;
+  h.threadTitles = { [OTHER_THREAD_ID]: "Fix login" };
+  // The pane renders only while its thread's device surface is open.
+  useRightPanelStore.setState({ byThreadKey: {} });
+  useRightPanelStore.getState().open(THREAD_REF, "device");
+  useRightPanelStore.getState().open(OTHER_THREAD_REF, "device");
   withCatalog(catalog());
 });
 
@@ -330,7 +384,7 @@ describe("DevicePanel", () => {
         command: "open",
         input: {
           environmentId: ENVIRONMENT_ID,
-          input: { platform: "android", imageId: "Pixel_8" },
+          input: { platform: "android", imageId: "Pixel_8", threadId: THREAD_ID },
         },
       },
     ]);
@@ -359,7 +413,7 @@ describe("DevicePanel", () => {
       "Available once the device has booted",
     );
     expect(button(container, "Start").closest("[title]")?.getAttribute("title")).toBe(
-      "Stop the running device to start another",
+      "The device is starting",
     );
     expect(h.screens).toEqual([]);
   });
@@ -385,31 +439,112 @@ describe("DevicePanel", () => {
     expect(button(container, "Start").disabled).toBe(false);
   });
 
-  it("names the running device on a device limit and offers to stop it", async () => {
+  it("offers to stop each running device when a start is refused at the limit", async () => {
+    const message =
+      "Four devices are already running, the most this server runs at once. Stop one to start another.";
     withCatalog(catalog({ images: [PIXEL, TABLET] }));
-    // `running` is the display name, not the image id.
     h.results.open = {
       _tag: "Failure",
-      error: { _tag: "DeviceLimitError", running: "Pixel 8", message: "busy" },
+      error: { _tag: "DeviceLimitError", running: "Pixel 8", message },
     };
     const container = await render();
     await click(button(container, "Start"));
-    // Another client started Pixel_8 meanwhile; the catalog shows it.
+    // Other clients started devices meanwhile; the catalog shows them, whatever the error named.
     await act(async () => {
       withCatalog(
         catalog({
           images: [PIXEL, TABLET],
-          devices: [snapshot({ deviceId: "d-9", state: "ready" })],
+          devices: [
+            snapshot({ deviceId: "d-9", threadId: OTHER_THREAD_ID }),
+            unowned(snapshot({ deviceId: "d-10", imageId: "Tablet", state: "booting" })),
+          ],
         }),
       );
     });
-    expect(container.querySelector("[role='alert']")?.textContent).toContain(
-      "Pixel 8 is already running. Stop it before starting another device.",
-    );
+    expect(container.querySelector("[role='alert']")?.textContent).toContain(message);
+    expect(button(container, "Stop Tablet")).toBeTruthy();
+    // Another thread's device asks first.
     await click(button(container, "Stop Pixel 8"));
+    expect(h.calls.filter((call) => call.command === "close")).toEqual([]);
+    expect(container.querySelector("[role='alertdialog']")?.textContent).toContain(
+      "Stop Pixel 8?It was started in Fix login.",
+    );
+    await click(button(container, "Stop device"));
     expect(h.calls.at(-1)).toEqual({
       command: "close",
       input: { environmentId: ENVIRONMENT_ID, input: { deviceId: "d-9" } },
+    });
+    expect(container.querySelector("[role='alertdialog']")).toBeNull();
+  });
+
+  it("lists four Stop buttons at the limit, from the catalog", async () => {
+    const images = ["A", "B", "C", "D", "E"].map((id) => image(id, `Phone ${id}`));
+    const running = ["A", "B", "C", "D"].map((id) =>
+      snapshot({ deviceId: `d-${id}`, imageId: id, threadId: OTHER_THREAD_ID }),
+    );
+    withCatalog(catalog({ images, devices: running }));
+    h.results.open = {
+      _tag: "Failure",
+      error: { _tag: "DeviceLimitError", running: "Phone A", message: "Four devices." },
+    };
+    const container = await render();
+    // Nothing of this thread runs, so the first free image is selected, and Start says why it
+    // waits.
+    expect(container.querySelector("[data-select]")?.getAttribute("data-value")).toBe("android:E");
+    expect(reasonOf(button(container, "Start"))).toBe(
+      "Four devices are running. Stop one to start another.",
+    );
+    // With three running, a start is refused anyway (an older server's one per platform, or a
+    // start that raced); by then four run, and the banner lists each from the catalog.
+    await act(async () => withCatalog(catalog({ images, devices: running.slice(0, 3) })));
+    await click(button(container, "Start"));
+    await act(async () => withCatalog(catalog({ images, devices: running })));
+    const stops = [...container.querySelectorAll("[role='alert'] button")]
+      .map((candidate) => candidate.textContent)
+      .filter((text) => text?.startsWith("Stop "));
+    expect(stops).toEqual(["Stop Phone A", "Stop Phone B", "Stop Phone C", "Stop Phone D"]);
+  });
+
+  it("asks before stopping another thread's device, and not before this thread's", async () => {
+    withCatalog(
+      catalog({
+        images: [PIXEL, TABLET],
+        devices: [
+          snapshot({ deviceId: "mine" }),
+          snapshot({ deviceId: "theirs", imageId: "Tablet", threadId: OTHER_THREAD_ID }),
+        ],
+      }),
+    );
+    const container = await render();
+    await click(button(container, "Stop"));
+    expect(h.calls.at(-1)).toEqual({
+      command: "close",
+      input: { environmentId: ENVIRONMENT_ID, input: { deviceId: "mine" } },
+    });
+    await click(option(container, /^Tablet/));
+    await click(button(container, "Stop"));
+    expect(container.querySelector("[role='alertdialog']")?.textContent).toContain(
+      "It was started in Fix login.",
+    );
+    await click(button(container, "Cancel"));
+    expect(container.querySelector("[role='alertdialog']")).toBeNull();
+    expect(h.calls.filter((call) => call.command === "close")).toHaveLength(1);
+    // A thread this client does not know is named generically.
+    h.threadTitles = {};
+    await click(button(container, "Stop"));
+    expect(container.querySelector("[role='alertdialog']")?.textContent).toContain(
+      "It was started in another thread.",
+    );
+  });
+
+  it("stops a device nobody owns without asking", async () => {
+    withCatalog(catalog({ devices: [unowned(snapshot({ deviceId: "old" }))] }));
+    const container = await render();
+    await click(option(container, /^Pixel 8/));
+    await click(button(container, "Stop"));
+    expect(h.calls.at(-1)).toEqual({
+      command: "close",
+      input: { environmentId: ENVIRONMENT_ID, input: { deviceId: "old" } },
     });
   });
 
@@ -595,10 +730,10 @@ describe("DevicePanel", () => {
     await click(button(container, "Rotate left"));
     expect(rotateCalls()).toHaveLength(1);
     // The other device is not turning, so its buttons are free.
-    await click(option(container, "iPhone 17 Pro · iOS 27.0"));
+    await click(option(container, /^iPhone 17 Pro · iOS 27\.0/));
     expect(button(container, "Rotate left").disabled).toBe(false);
     // Back on the one that is still turning, the hold is still there.
-    await click(option(container, "Pixel 8"));
+    await click(option(container, /^Pixel 8/));
     expect(button(container, "Rotate left").disabled).toBe(true);
     expect(reasonOf(button(container, "Rotate left"))).toBe("Rotating…");
     await click(button(container, "Rotate right"));
@@ -689,7 +824,7 @@ describe("DevicePanel", () => {
     );
     const container = await render();
     await click(button(container, "Rotate left"));
-    await click(option(container, "iPhone 17 Pro · iOS 27.0"));
+    await click(option(container, /^iPhone 17 Pro · iOS 27\.0/));
     await click(button(container, "Rotate left"));
     const devices = rotateCalls().map(
       (call) => (call.input as { input: { deviceId: string } }).input.deviceId,
@@ -853,7 +988,7 @@ describe("DevicePanel with iOS simulators", () => {
     expect(android.textContent).toContain("Install the Android SDK on the server.");
     // The reason is text under the heading, not an unavailable option.
     expect(android.querySelector("[role='option']")).toBeNull();
-    const iphone = option(container, "iPhone 17 Pro · iOS 27.0");
+    const iphone = option(container, /^iPhone 17 Pro · iOS 27\.0/);
     expect(iphone.getAttribute("aria-disabled")).toBeNull();
     expect(group(container, "iOS").contains(iphone)).toBe(true);
     // The ready platform's image is picked, and Start opens it.
@@ -895,7 +1030,9 @@ describe("DevicePanel with iOS simulators", () => {
       "Live input needs someone logged in on this Mac. Simulators open as screenshots.";
     withCatalog(catalog({ platforms: [platform("ios", "viewOnlyHeadless", message, [IPHONE])] }));
     const container = await render();
-    expect(option(container, "iPhone 17 Pro · iOS 27.0").getAttribute("aria-disabled")).toBeNull();
+    expect(
+      option(container, /^iPhone 17 Pro · iOS 27\.0/).getAttribute("aria-disabled"),
+    ).toBeNull();
     expect(group(container, "iOS").textContent).toContain(message);
     expect(button(container, "Start").disabled).toBe(false);
   });
@@ -994,7 +1131,10 @@ describe("DevicePanel with iOS simulators", () => {
     expect(h.calls).toEqual([
       {
         command: "open",
-        input: { environmentId: ENVIRONMENT_ID, input: { platform: "ios", imageId: "UDID-1" } },
+        input: {
+          environmentId: ENVIRONMENT_ID,
+          input: { platform: "ios", imageId: "UDID-1", threadId: THREAD_ID },
+        },
       },
     ]);
   });
@@ -1025,7 +1165,10 @@ describe("DevicePanel with iOS simulators", () => {
     await click(button(container, "Start"));
     expect(h.calls.at(-1)).toEqual({
       command: "open",
-      input: { environmentId: ENVIRONMENT_ID, input: { platform: "ios", imageId: "Twin" } },
+      input: {
+        environmentId: ENVIRONMENT_ID,
+        input: { platform: "ios", imageId: "Twin", threadId: THREAD_ID },
+      },
     });
   });
 
@@ -1044,7 +1187,7 @@ describe("DevicePanel with iOS simulators", () => {
     );
     const container = await render();
     expect(h.screens.at(-1)).toMatchObject({ deviceId: "a-1" });
-    await click(option(container, "iPhone 17 Pro · iOS 27.0"));
+    await click(option(container, /^iPhone 17 Pro · iOS 27\.0/));
     expect(h.screens.at(-1)).toMatchObject({ deviceId: "i-1" });
     await click(button(container, "Stop"));
     expect(h.calls.at(-1)).toEqual({
@@ -1053,51 +1196,237 @@ describe("DevicePanel with iOS simulators", () => {
     });
   });
 
-  it("offers to show the device already running on the picked image's platform", async () => {
+  it("starts a second image on a platform while its first device runs", async () => {
     withCatalog(catalog({ images: [PIXEL, TABLET], devices: [snapshot({ deviceId: "a-1" })] }));
     const container = await render();
+    expect(option(container, /^Pixel 8/).textContent).toBe("Pixel 8 — Running here");
     await click(option(container, "Tablet"));
-    expect(container.textContent).toContain("Pixel 8 is running.");
-    expect(reasonOf(button(container, "Start"))).toBe("Stop the running device to start another");
-    await click(button(container, "Show Pixel 8"));
-    expect(h.screens.at(-1)).toMatchObject({ deviceId: "a-1" });
+    // The pick wins: the idle image shows, ready to Start, and the picker still lists Pixel 8.
+    expect(container.querySelector("[data-device-screen]")).toBeNull();
+    expect(button(container, "Start").disabled).toBe(false);
+    expect(option(container, /^Pixel 8/).textContent).toBe("Pixel 8 — Running here");
+    await click(button(container, "Start"));
+    expect(h.calls.at(-1)).toEqual({
+      command: "open",
+      input: {
+        environmentId: ENVIRONMENT_ID,
+        input: { platform: "android", imageId: "Tablet", threadId: THREAD_ID },
+      },
+    });
   });
 
-  it("stops the running device of the limit's platform, whatever its name", async () => {
+  it("says whose device runs each running image in the picker", async () => {
+    const shown = catalog({
+      images: [PIXEL, TABLET, image("Fold", "Fold"), image("Wear", "Wear", true)],
+      devices: [
+        snapshot({ deviceId: "a-1" }),
+        snapshot({ deviceId: "a-2", imageId: "Tablet", threadId: OTHER_THREAD_ID }),
+        unowned(snapshot({ deviceId: "a-3", imageId: "Fold" })),
+      ],
+    });
+    withCatalog(shown);
+    const container = await render();
+    const labels = [...container.querySelectorAll("[role='option']")].map(
+      (entry) => entry.textContent,
+    );
+    expect(labels).toEqual([
+      "Pixel 8 — Running here",
+      "Tablet — Running in Fix login",
+      "Fold — Running",
+      "Wear — Running outside BiBCode",
+    ]);
+  });
+
+  it("does not name a thread this client does not know in the picker", async () => {
+    h.threadTitles = {};
     withCatalog(
       catalog({
-        platforms: [
-          platform("android", "ready", "Ready.", [PIXEL]),
-          platform("ios", "ready", "Ready.", [IPHONE, image("UDID-2", "iPhone Air")]),
+        images: [PIXEL, TABLET],
+        devices: [snapshot({ deviceId: "a-2", imageId: "Tablet", threadId: OTHER_THREAD_ID })],
+      }),
+    );
+    const container = await render();
+    expect(option(container, /^Tablet/).textContent).toBe("Tablet — Running");
+  });
+
+  it("shows another thread's device with whose it is, and input still works", async () => {
+    withCatalog(
+      catalog({ devices: [snapshot({ deviceId: "theirs", threadId: OTHER_THREAD_ID })] }),
+    );
+    const container = await render();
+    // Nothing of this thread runs and nothing is free: the pane says so and the picker shows it.
+    expect(container.textContent).toContain("Every device is running. Pick one to show it.");
+    expect(reasonOf(button(container, "Start"))).toBe("Pick a device first");
+    await click(option(container, /^Pixel 8/));
+    expect(h.screens.at(-1)).toMatchObject({ deviceId: "theirs" });
+    expect(container.querySelector("[data-device-owner]")?.textContent).toBe(
+      "Started in Fix login.",
+    );
+    await click(button(container, "Home"));
+    await flushInput();
+    expect(h.calls.filter((call) => call.command === "input")).toHaveLength(1);
+  });
+
+  it("works for a thread's root, so a device its host started is its own", async () => {
+    // A thread whose root is another thread, as a chat panel's is its host.
+    const panelRef = scopeThreadRef(ENVIRONMENT_ID, ThreadId.make("thread-panel"));
+    useRightPanelStore.getState().open(panelRef, "device");
+    withCatalog(catalog({ images: [PIXEL, TABLET], devices: [snapshot({ deviceId: "host" })] }));
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    mounted.push({ root, container });
+    await act(async () => {
+      root.render(<DevicePanel threadRef={panelRef} rootThreadId={THREAD_ID} />);
+    });
+    expect(h.screens.at(-1)).toMatchObject({ deviceId: "host" });
+    expect(container.querySelector("[data-device-owner]")).toBeNull();
+    expect(option(container, /^Pixel 8/).textContent).toBe("Pixel 8 — Running here");
+    await click(option(container, "Tablet"));
+    await click(button(container, "Start"));
+    expect(h.calls.at(-1)).toEqual({
+      command: "open",
+      input: {
+        environmentId: ENVIRONMENT_ID,
+        input: { platform: "android", imageId: "Tablet", threadId: THREAD_ID },
+      },
+    });
+    // The pick is the thread's own, not its root's.
+    expect(storedPick(panelRef)).toEqual({ platform: "android", imageId: "Tablet" });
+    expect(storedPick(THREAD_REF)).toBeNull();
+  });
+
+  it("shows each thread's own device when switching threads (#170)", async () => {
+    const platforms = [platform("android", "ready", "Ready.", [PIXEL, TABLET])];
+    withCatalog(
+      catalog({
+        platforms,
+        devices: [
+          snapshot({ deviceId: "mine" }),
+          snapshot({ deviceId: "theirs", imageId: "Tablet", threadId: OTHER_THREAD_ID }),
         ],
       }),
     );
-    h.results.open = {
-      _tag: "Failure",
-      error: { _tag: "DeviceLimitError", running: "iPhone 17 Pro (renamed)", message: "busy" },
+    const { container, show } = await renderThread(THREAD_REF);
+    expect(h.screens.at(-1)).toMatchObject({ deviceId: "mine" });
+    expect(container.querySelector("[data-device-owner]")).toBeNull();
+    await show(OTHER_THREAD_REF);
+    expect(h.screens.at(-1)).toMatchObject({ deviceId: "theirs" });
+    expect(container.querySelector("[data-select]")?.getAttribute("data-value")).toBe(
+      "android:Tablet",
+    );
+    await show(THREAD_REF);
+    expect(h.screens.at(-1)).toMatchObject({ deviceId: "mine" });
+  });
+
+  it("keeps each thread's pick and failed attempt across a remount", async () => {
+    const platforms = [platform("android", "ready", "Ready.", [PIXEL, TABLET])];
+    withCatalog(
+      catalog({
+        platforms,
+        devices: [
+          snapshot({ deviceId: "failed", state: "failed", failure: "exited: 1" }),
+          snapshot({ deviceId: "theirs", imageId: "Tablet", threadId: OTHER_THREAD_ID }),
+        ],
+      }),
+    );
+    const unmountLast = async () => {
+      const entry = mounted.pop()!;
+      await act(async () => entry.root.unmount());
+      entry.container.remove();
     };
+    const first = await renderThread(THREAD_REF);
+    // No pick: this thread's newest ended attempt stays in view with its reason.
+    expect(first.container.querySelector("[role='status']")?.textContent).toBe("Failed: exited: 1");
+    await unmountLast();
+    const second = await renderThread(THREAD_REF);
+    expect(second.container.querySelector("[role='status']")?.textContent).toBe(
+      "Failed: exited: 1",
+    );
+    await click(option(second.container, /^Tablet/));
+    expect(storedPick(THREAD_REF)).toEqual({ platform: "android", imageId: "Tablet" });
+    expect(storedPick(OTHER_THREAD_REF)).toBeNull();
+    await unmountLast();
+    const third = await renderThread(THREAD_REF);
+    expect(third.container.querySelector("[data-select]")?.getAttribute("data-value")).toBe(
+      "android:Tablet",
+    );
+  });
+
+  it("brings a pick back once discovery lists its image again", async () => {
+    useRightPanelStore
+      .getState()
+      .setDeviceImage(THREAD_REF, { platform: "android", imageId: "Tablet" });
+    withCatalog(catalog({ images: [PIXEL] }));
     const container = await render();
-    await click(option(container, "iPhone Air"));
-    await click(button(container, "Start"));
-    await act(async () => {
+    expect(container.querySelector("[data-select]")?.getAttribute("data-value")).toBe(
+      "android:Pixel_8",
+    );
+    await act(async () => withCatalog(catalog({ images: [PIXEL, TABLET] })));
+    expect(container.querySelector("[data-select]")?.getAttribute("data-value")).toBe(
+      "android:Tablet",
+    );
+  });
+
+  it("shows a device stopped by another thread's deletion as stopped, ready to Start", async () => {
+    useRightPanelStore
+      .getState()
+      .setDeviceImage(THREAD_REF, { platform: "android", imageId: "Pixel_8" });
+    withCatalog(
+      catalog({ devices: [snapshot({ deviceId: "theirs", threadId: OTHER_THREAD_ID })] }),
+    );
+    const container = await render();
+    expect(h.screens.at(-1)).toMatchObject({ deviceId: "theirs" });
+    await act(async () =>
       withCatalog(
         catalog({
-          platforms: [
-            platform("android", "ready", "Ready.", [PIXEL]),
-            platform("ios", "ready", "Ready.", [IPHONE, image("UDID-2", "iPhone Air")]),
-          ],
-          devices: [
-            snapshot({ deviceId: "a-1" }),
-            snapshot({ deviceId: "i-9", platform: "ios", imageId: "UDID-1" }),
-          ],
+          devices: [snapshot({ deviceId: "theirs", threadId: OTHER_THREAD_ID, state: "stopped" })],
         }),
-      );
-    });
-    await click(button(container, "Stop iPhone 17 Pro (renamed)"));
-    expect(h.calls.at(-1)).toEqual({
-      command: "close",
-      input: { environmentId: ENVIRONMENT_ID, input: { deviceId: "i-9" } },
-    });
+      ),
+    );
+    expect(container.textContent).toContain("Pixel 8 stopped.");
+    expect(container.textContent).toContain("Press Start to start it.");
+    expect(container.querySelector("[data-device-owner]")?.textContent).toBe(
+      "Started in Fix login.",
+    );
+    expect(button(container, "Start").disabled).toBe(false);
+  });
+
+  it("says a stopped device of this thread starts again", async () => {
+    withCatalog(catalog({ devices: [snapshot({ state: "stopped" })] }));
+    const container = await render();
+    expect(container.textContent).toContain("Pixel 8 stopped.");
+    expect(container.textContent).toContain("Press Start to start it again.");
+  });
+
+  it("waits with Start while the selected image stops", async () => {
+    withCatalog(catalog({ devices: [snapshot({ state: "stopping" })] }));
+    const container = await render();
+    expect(reasonOf(button(container, "Start"))).toBe("The device is stopping");
+  });
+
+  it("shows the device an agent started in an unpicked thread, and keeps its failure", async () => {
+    withCatalog(catalog({ images: [PIXEL, TABLET] }));
+    const container = await render();
+    expect(container.querySelector("[data-select]")?.getAttribute("data-value")).toBe(
+      "android:Pixel_8",
+    );
+    await act(async () =>
+      withCatalog(catalog({ images: [PIXEL, TABLET], devices: [snapshot({ imageId: "Tablet" })] })),
+    );
+    expect(h.screens.at(-1)).toMatchObject({ imageId: "Tablet" });
+    await act(async () =>
+      withCatalog(
+        catalog({
+          images: [PIXEL, TABLET],
+          devices: [snapshot({ imageId: "Tablet", state: "failed", failure: "exited: 3" })],
+        }),
+      ),
+    );
+    expect(container.querySelector("[data-select]")?.getAttribute("data-value")).toBe(
+      "android:Tablet",
+    );
+    expect(container.querySelector("[role='status']")?.textContent).toBe("Failed: exited: 3");
   });
 
   it("names a starting or stopping simulator by its display name, not its UDID", async () => {
@@ -1156,11 +1485,11 @@ describe("DevicePanel with iOS simulators", () => {
         });
       withCatalog(both("ready"));
       const container = await render();
-      await click(option(container, "iPhone 17 Pro · iOS 27.0"));
+      await click(option(container, /^iPhone 17 Pro · iOS 27\.0/));
       await click(button(container, "Paste"));
       // The simulator stops and the user switches to the Android device meanwhile.
       await act(async () => withCatalog(both("stopped")));
-      await click(option(container, "Pixel 8"));
+      await click(option(container, /^Pixel 8/));
       await act(async () => resolveText("héllo"));
       await flushInput();
       expect(h.calls.filter((call) => call.command === "input")).toEqual([]);
@@ -1177,7 +1506,7 @@ describe("DevicePanel with iOS simulators", () => {
     withCatalog(catalog({ platforms, devices: [snapshot({ deviceId: "a-1" })] }));
     h.results.open = { _tag: "Success", value: { deviceId: "i-new" } };
     const container = await render();
-    await click(option(container, "iPhone 17 Pro · iOS 27.0"));
+    await click(option(container, /^iPhone 17 Pro · iOS 27\.0/));
     await click(button(container, "Start"));
     // The next catalog does not list the new simulator yet.
     await act(async () =>
@@ -1370,7 +1699,7 @@ describe("DevicePanel with iOS simulators", () => {
       await act(async () => onInput({ type: "text", text: "é" }));
       await flushInput();
       expect(shown()).toBe(refusal);
-      await click(option(container, "iPhone 17 Pro · iOS 27.0"));
+      await click(option(container, /^iPhone 17 Pro · iOS 27\.0/));
       expect(h.screens.at(-1)).toMatchObject({ deviceId: "i-1" });
       expect(shown()).toBeNull();
     } finally {
@@ -1415,43 +1744,70 @@ describe("device selection helpers", () => {
     expect(rotatedOrientation("portrait", "right")).toBe("reverseLandscape");
   });
 
-  it("shows the selected image's running device, else its followed failed one", () => {
+  it("shows the selected image's running device, else its newest ended one", () => {
     const pixel = { platform: "android", imageId: "Pixel_8" } as const;
     const failed = snapshot({ deviceId: "a", state: "failed" });
     const stopped = snapshot({ deviceId: "b", state: "stopped" });
     const booting = snapshot({ deviceId: "c", state: "booting" });
-    expect(selectShownDevice(catalog({ devices: [failed, booting] }), pixel, "a")).toBe(booting);
-    expect(selectShownDevice(catalog({ devices: [failed, stopped] }), pixel, "a")).toBe(failed);
-    expect(selectShownDevice(catalog({ devices: [failed, stopped] }), pixel, "b")).toBeNull();
-    expect(selectShownDevice(catalog({ devices: [failed] }), pixel, null)).toBeNull();
+    expect(selectShownDevice(catalog({ devices: [failed, booting] }), pixel)).toBe(booting);
+    // The catalog is in open order: a stop newer than a failure hides it, and the other way.
+    expect(selectShownDevice(catalog({ devices: [failed, stopped] }), pixel)).toBe(stopped);
+    expect(selectShownDevice(catalog({ devices: [stopped, failed] }), pixel)).toBe(failed);
     const other = { platform: "ios", imageId: "Pixel_8" } as const;
-    expect(selectShownDevice(catalog({ devices: [booting] }), other, null)).toBeNull();
+    expect(selectShownDevice(catalog({ devices: [booting] }), other)).toBeNull();
+    expect(selectShownDevice(catalog({ devices: [] }), pixel)).toBeNull();
   });
 
-  it("selects the pick, else the followed or a running device, else the first free image", () => {
+  it("selects the pick, else this thread's running, else its ended device, else a free image", () => {
     const platforms = [
       platform("android", "ready", "Ready.", [PIXEL, TABLET]),
       platform("ios", "ready", "Ready.", [image("UDID-0", "Busy", true), IPHONE]),
     ];
-    const android = snapshot({ deviceId: "a-1", imageId: "Tablet" });
-    const ios = snapshot({ deviceId: "i-1", platform: "ios", imageId: "UDID-1" });
-    const both = catalog({ platforms, devices: [android, ios] });
-    expect(selectedImageOf(both, { platform: "android", imageId: "Pixel_8" }, null)).toEqual({
+    const tablet = snapshot({ deviceId: "a-1", imageId: "Tablet" });
+    const iphone = snapshot({ deviceId: "i-1", platform: "ios", imageId: "UDID-1" });
+    const both = catalog({ platforms, devices: [iphone, tablet] });
+    // 1. The pick, running or not.
+    expect(selectedImageOf(both, { platform: "android", imageId: "Pixel_8" }, THREAD_ID)).toEqual({
       platform: "android",
       imageId: "Pixel_8",
     });
-    // A pick that left the catalog falls back.
-    expect(selectedImageOf(both, { platform: "ios", imageId: "Gone" }, "i-1")).toEqual({
+    // 2. A pick that left the catalog falls back to this thread's oldest running device.
+    expect(selectedImageOf(both, { platform: "ios", imageId: "Gone" }, THREAD_ID)).toEqual({
       platform: "ios",
       imageId: "UDID-1",
     });
-    expect(selectedImageOf(both, null, null)).toEqual({ platform: "android", imageId: "Tablet" });
+    // 3. Else its newest ended device, so its failure stays in view.
+    const ended = catalog({
+      platforms,
+      devices: [
+        snapshot({ deviceId: "e-1", state: "failed" }),
+        snapshot({ deviceId: "e-2", imageId: "Tablet", state: "failed" }),
+      ],
+    });
+    expect(selectedImageOf(ended, null, THREAD_ID)).toEqual({
+      platform: "android",
+      imageId: "Tablet",
+    });
+    // 4. Else the first image nobody runs: another thread's or an unowned device is skipped,
+    // as on an older server whose catalog names no owner.
+    const others = catalog({
+      platforms,
+      devices: [
+        snapshot({ deviceId: "o-1", threadId: OTHER_THREAD_ID }),
+        unowned(snapshot({ deviceId: "o-2", imageId: "Tablet" })),
+      ],
+    });
+    expect(selectedImageOf(others, null, THREAD_ID)).toEqual({
+      platform: "ios",
+      imageId: "UDID-1",
+    });
+    // 5. Else nothing.
     const idle = catalog({
       platforms: [
         platform("android", "sdkMissing", "No SDK.", []),
-        platform("ios", "ready", "Ready.", [image("UDID-0", "Busy", true), IPHONE]),
+        platform("ios", "ready", "Ready.", [image("UDID-0", "Busy", true)]),
       ],
     });
-    expect(selectedImageOf(idle, null, null)).toEqual({ platform: "ios", imageId: "UDID-1" });
+    expect(selectedImageOf(idle, null, THREAD_ID)).toBeNull();
   });
 });

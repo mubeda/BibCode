@@ -5,10 +5,31 @@ import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 
 import { desktopActivityFixture, desktopActivityMarkerFileName } from "./activity-events.ts";
+import { mermaidFixtureReplies, mermaidFixtureStreamedReplies } from "./mermaid-fixture.ts";
 
 const FIXTURE_PROJECT_NAME = "BiBCode UI Fixture";
 const STREAMED_RESPONSE = "BiBCode deterministic streamed fixture response.";
 const SLOW_TURN_RELEASE_FILE_NAME = ".bibcode-e2e-slow-turn-release";
+/**
+ * A Claude prompt with one of these markers streams a thought, a tool call and an answer long
+ * enough to overflow the timeline (#173); the slow one thinks for about ten seconds.
+ */
+const REASONING_TURN_MARKER = "[[reasoning]]";
+const SLOW_REASONING_TURN_MARKER = "[[reasoning:slow]]";
+const REASONING_TURN_STEPS = Array.from(
+  { length: 16 },
+  (_, step) => `Fixture thinking step ${step + 1} weighs the parser. `,
+);
+/**
+ * The slow thought's steps run on, so its expanded trace fills its scroller while it streams
+ * and grows an anchored turn past the visible timeline.
+ */
+const SLOW_REASONING_STEP_TAIL =
+  "It traces how each rule reads its tokens, where a failed match backs off, and which branch takes over next. ";
+const REASONING_ANSWER_LINES = 24;
+/** An answer line names its prompt without the marker, so each turn's answer is its own. */
+const reasoningAnswerLine = (variant: string, line: number, label: string) =>
+  `Fixture ${variant} answer line ${line} (${label}).`;
 
 const nativeActionLogFixtureSource = String.raw`
 import fs from "node:fs";
@@ -115,6 +136,8 @@ if (process.argv.includes("--help")) {
 
 const send = (message) => process.stdout.write(JSON.stringify(message) + "\n");
 const streamResponse = ${JSON.stringify(STREAMED_RESPONSE)};
+const promptReplies = ${JSON.stringify(mermaidFixtureReplies)};
+const streamedReplies = ${JSON.stringify(mermaidFixtureStreamedReplies)};
 const activity = ${JSON.stringify(desktopActivityFixture)};
 const activityStartedAt = Math.floor(Date.now() / 1000);
 const activityObservedAt = () => Math.max(activityStartedAt, Math.floor(Date.now() / 1000));
@@ -332,12 +355,15 @@ if (!Number.isSafeInteger(slowTurnTimeoutMs) || slowTurnTimeoutMs <= 0) {
 let activeTurnId = null;
 let slowTurnTimer;
 let slowTurnPoll;
+// A streamed reply sends its next chunk on this timer; it ends with the turn.
+let streamedReplyTimer;
 const clearSlowTurn = () => {
   clearTimeout(slowTurnTimer);
   clearInterval(slowTurnPoll);
 };
 const completeTurn = (status = "completed") => {
   clearSlowTurn();
+  clearInterval(streamedReplyTimer);
   const turnId = activeTurnId;
   activeTurnId = null;
   if (turnId === null) return;
@@ -454,12 +480,22 @@ reader.on("line", (line) => {
         threadId: "bibcode-ui-provider-thread",
         turn: { id: turnId }
       } });
-      send({ method: "item/agentMessage/delta", params: {
+      const sendDelta = (delta) => send({ method: "item/agentMessage/delta", params: {
         threadId: "bibcode-ui-provider-thread",
         turnId,
         itemId: "bibcode-ui-message-" + turnId,
-        delta: streamResponse
+        delta
       } });
+      if (Object.hasOwn(streamedReplies, prompt)) {
+        const chunks = [...streamedReplies[prompt]];
+        sendDelta(chunks.shift());
+        streamedReplyTimer = setInterval(() => {
+          sendDelta(chunks.shift());
+          if (chunks.length === 0) completeTurn();
+        }, 300);
+        break;
+      }
+      sendDelta(Object.hasOwn(promptReplies, prompt) ? promptReplies[prompt] : streamResponse);
       if (prompt.includes("[[slow]]")) {
         slowTurnTimer = setTimeout(completeTurn, slowTurnTimeoutMs);
         slowTurnPoll = setInterval(() => {
@@ -526,6 +562,7 @@ export function appendProviderInput(provider, prompt, kind = "start", turnId) {
 `.trimStart();
 
 const claudeFixtureSource = String.raw`
+import { randomUUID } from "node:crypto";
 import readline from "node:readline";
 import { appendProviderInput, promptTextFromParts } from "./provider-input-log-fixture.mjs";
 
@@ -544,7 +581,98 @@ if (process.argv.includes("auth") && process.argv.includes("status")) {
 
 const send = (message) => process.stdout.write(JSON.stringify(message) + "\n");
 const streamResponse = ${JSON.stringify(STREAMED_RESPONSE)};
+const reasoningSteps = ${JSON.stringify(REASONING_TURN_STEPS)};
+const slowReasoningStepTail = ${JSON.stringify(SLOW_REASONING_STEP_TAIL)};
 const reader = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// A thinking block streamed over about two seconds (ten when slow), a tool call, then a long
+// answer: the frames Claude sends with summarized thinking.
+async function streamReasoningTurn(sessionId, slow, prompt) {
+  const stepDelayMs = slow ? 650 : 130;
+  const variant = slow ? "slow reasoning" : "reasoning";
+  const label = prompt.replace(/\[\[[^\]]*\]\]/g, "").trim();
+  const reasoningAnswer = Array.from(
+    { length: ${REASONING_ANSWER_LINES} },
+    (_, line) => "Fixture " + variant + " answer line " + (line + 1) + " (" + label + ")."
+  ).join("\n\n");
+  const event = (uuid, streamEvent) => send({
+    type: "stream_event",
+    session_id: sessionId,
+    uuid,
+    parent_tool_use_id: null,
+    event: streamEvent
+  });
+  // Claude message ids are unique, so each turn's thinking block is its own entry.
+  event("reasoning-message", {
+    type: "message_start",
+    message: { id: "bibcode-ui-reasoning-" + randomUUID() }
+  });
+  event("reasoning-start", {
+    type: "content_block_start",
+    index: 0,
+    content_block: { type: "thinking", thinking: "", signature: "" }
+  });
+  for (const [step, thinking] of reasoningSteps.entries()) {
+    await delay(stepDelayMs);
+    event("reasoning-delta-" + step, {
+      type: "content_block_delta",
+      index: 0,
+      delta: {
+        type: "thinking_delta",
+        thinking: slow ? thinking + slowReasoningStepTail : thinking
+      }
+    });
+  }
+  event("reasoning-signature", {
+    type: "content_block_delta",
+    index: 0,
+    delta: { type: "signature_delta", signature: "Zml4dHVyZQ==" }
+  });
+  event("reasoning-stop", { type: "content_block_stop", index: 0 });
+  event("reasoning-tool-start", {
+    type: "content_block_start",
+    index: 1,
+    content_block: {
+      type: "tool_use",
+      id: "bibcode-ui-reasoning-tool",
+      name: "Read",
+      input: { file_path: "README.md" }
+    }
+  });
+  event("reasoning-tool-stop", { type: "content_block_stop", index: 1 });
+  send({
+    type: "user",
+    session_id: sessionId,
+    uuid: "reasoning-tool-result",
+    parent_tool_use_id: null,
+    message: {
+      role: "user",
+      content: [{ type: "tool_result", tool_use_id: "bibcode-ui-reasoning-tool", content: "Fixture README" }]
+    }
+  });
+  await delay(130);
+  event("reasoning-text-start", {
+    type: "content_block_start",
+    index: 2,
+    content_block: { type: "text", text: "" }
+  });
+  event("reasoning-text", {
+    type: "content_block_delta",
+    index: 2,
+    delta: { type: "text_delta", text: reasoningAnswer }
+  });
+  event("reasoning-text-stop", { type: "content_block_stop", index: 2 });
+  send({
+    type: "result",
+    subtype: "success",
+    is_error: false,
+    errors: [],
+    stop_reason: "end_turn",
+    session_id: sessionId,
+    uuid: "bibcode-ui-claude-reasoning-result"
+  });
+}
 
 reader.on("line", (line) => {
   const message = JSON.parse(line);
@@ -610,8 +738,14 @@ reader.on("line", (line) => {
     return;
   }
   const sessionId = message.session_id ?? "bibcode-ui-claude-session";
-  appendProviderInput("claudeAgent", promptTextFromParts(message.message?.content));
+  const prompt = promptTextFromParts(message.message?.content);
+  appendProviderInput("claudeAgent", prompt);
   send(message);
+  const slowReasoning = prompt.includes(${JSON.stringify(SLOW_REASONING_TURN_MARKER)});
+  if (slowReasoning || prompt.includes(${JSON.stringify(REASONING_TURN_MARKER)})) {
+    void streamReasoningTurn(sessionId, slowReasoning, prompt);
+    return;
+  }
   send({
     type: "stream_event",
     session_id: sessionId,
@@ -1286,4 +1420,10 @@ export function deferDesktopUiTestContextCleanupUntilExit(
 export const desktopUiFixture = {
   projectName: FIXTURE_PROJECT_NAME,
   streamedResponse: STREAMED_RESPONSE,
+  reasoningTurnMarker: REASONING_TURN_MARKER,
+  slowReasoningTurnMarker: SLOW_REASONING_TURN_MARKER,
+  reasoningThoughtStart: "Fixture thinking step 1 weighs the parser.",
+  /** The last line of the answer to a reasoning prompt whose text, markers aside, is `label`. */
+  reasoningAnswerLastLine: (label: string, slow = false) =>
+    reasoningAnswerLine(slow ? "slow reasoning" : "reasoning", REASONING_ANSWER_LINES, label),
 } as const;
