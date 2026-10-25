@@ -1966,6 +1966,9 @@ fn snapshot_owned_message(
     {
         result["supportsContextWindowUsage"] = json!(true);
     }
+    if crate::provider::supports_compaction(&definition.driver) {
+        result["supportsCompaction"] = json!(true);
+    }
     result
 }
 
@@ -2488,6 +2491,7 @@ mod tests {
                 let commands = snapshot["slashCommands"].as_array().expect("commands");
                 assert!(commands.iter().any(|command| command["name"] == "compact"));
                 assert_eq!(snapshot["supportsContextWindowUsage"], true);
+                assert!(snapshot.get("supportsCompaction").is_none());
             } else if version == "2 without catalogs" {
                 assert_eq!(snapshot["installed"], true);
                 assert_eq!(snapshot["status"], "ready");
@@ -2495,6 +2499,7 @@ mod tests {
                 assert_eq!(snapshot["supportsContextWindowUsage"], true);
             } else {
                 assert!(snapshot.get("supportsContextWindowUsage").is_none());
+                assert!(snapshot.get("supportsCompaction").is_none());
                 assert_eq!(snapshot["status"], "error");
                 assert_eq!(
                     snapshot["message"],
@@ -2881,6 +2886,11 @@ mod tests {
         assert!(cursor.get("supportsContextWindowUsage").is_none());
         assert!(grok.get("supportsContextWindowUsage").is_none());
         assert!(opencode.get("supportsContextWindowUsage").is_none());
+        assert_eq!(codex["supportsCompaction"], true);
+        assert_eq!(claude["supportsCompaction"], true);
+        assert!(cursor.get("supportsCompaction").is_none());
+        assert!(grok.get("supportsCompaction").is_none());
+        assert!(opencode.get("supportsCompaction").is_none());
     }
 
     #[test]

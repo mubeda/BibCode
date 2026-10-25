@@ -22,6 +22,7 @@ import {
   type ThreadId,
   type TurnId,
   type KeybindingCommand,
+  type OrchestrationReasoning,
   OrchestrationThreadActivity,
   ProviderInteractionMode,
   ProviderDriverKind,
@@ -39,6 +40,7 @@ import {
   findBlockingDelivery,
   waitsBehind,
   shouldEnqueueOnSend,
+  composerPhaseWhileCompacting,
   isQueuedTimelineMessage,
 } from "./ChatView.logic";
 import { queuedMessageCache } from "./chat/queuedMessageCache";
@@ -125,6 +127,7 @@ import {
   deriveActivePlanState,
   findSidebarProposedPlan,
   findLatestProposedPlan,
+  deriveReasoningWorkEntries,
   deriveWorkLogEntries,
   hasActionableProposedPlan,
   isLatestTurnSettled,
@@ -133,6 +136,8 @@ import { type LegendListRef } from "@legendapp/list/react";
 import {
   getAnchoredTurnMetrics,
   getTimelinePageScrollOffset,
+  pointerPressStopsLiveFollow,
+  rowToggleNeedsEndReveal,
   timelineScrollAnimates,
   type TimelineScrollMode,
 } from "./chat/timelineScrollAnchoring";
@@ -385,6 +390,7 @@ import { ProjectFilesPreloader } from "./files/ProjectFilesPreloader";
 const ATTACHMENT_ONLY_BOOTSTRAP_PROMPT =
   "[User attached one or more files without additional text. Respond using the conversation context and the attachments.]";
 const EMPTY_ACTIVITIES: OrchestrationThreadActivity[] = [];
+const EMPTY_REASONING: ReadonlyArray<OrchestrationReasoning> = [];
 const EMPTY_PROVIDERS: ServerProvider[] = [];
 const EMPTY_PROVIDER_SKILLS: ServerProvider["skills"] = [];
 const EMPTY_PENDING_USER_INPUT_ANSWERS: Record<string, PendingUserInputDraftAnswer> = {};
@@ -1551,6 +1557,7 @@ function ChatViewContent(props: ChatViewProps) {
   const revertThreadCheckpoint = useAtomCommand(threadEnvironment.revertCheckpoint, {
     reportFailure: false,
   });
+  const compactThread = useAtomCommand(threadEnvironment.compact, { reportFailure: false });
   const openPreview = useAtomCommand(previewEnvironment.open, { reportFailure: false });
   const closePreview = useAtomCommand(previewEnvironment.close, "preview close");
   const { environments } = useEnvironments();
@@ -2640,7 +2647,15 @@ function ChatViewContent(props: ChatViewProps) {
     lockedProvider ?? providerBinding.driver ?? unlockedSelectedProvider;
   const phase = derivePhase(activeThread?.session ?? null);
   const threadActivities = activeThread?.activities ?? EMPTY_ACTIVITIES;
-  const workLogEntries = useMemo(() => deriveWorkLogEntries(threadActivities), [threadActivities]);
+  const threadReasoning = activeThread?.reasoning ?? EMPTY_REASONING;
+  // Thoughts sort among tool calls by the time each began (#173).
+  const workLogEntries = useMemo(
+    () => [
+      ...deriveWorkLogEntries(threadActivities),
+      ...deriveReasoningWorkEntries(threadReasoning),
+    ],
+    [threadActivities, threadReasoning],
+  );
   const pendingApprovals = useMemo(
     () => derivePendingApprovals(threadActivities),
     [threadActivities],
@@ -2750,6 +2765,10 @@ function ChatViewContent(props: ChatViewProps) {
     [blockingId, blockingCreatedAt, blockingOffersRetry],
   );
   const supportsTurnSteer = providerBinding.status?.supportsTurnSteer === true;
+  const supportsCompaction = providerBinding.status?.supportsCompaction === true;
+  const compaction = activeThread?.compaction;
+  const compactionFailedMessageId = compaction?.failedMessageId ?? null;
+  const composerPhase = composerPhaseWhileCompacting(phase, compaction !== undefined);
   const hasPendingApproval = activePendingApproval !== null;
   const hasPendingUserInput = activePendingUserInput !== null;
   const queueSessionStatus = activeThread?.session?.status ?? null;
@@ -4094,13 +4113,19 @@ function ChatViewContent(props: ChatViewProps) {
       scrollNode.addEventListener("touchmove", handleManualNavigation, {
         passive: true,
       });
-      scrollNode.addEventListener("pointerdown", handleManualNavigation, {
+      // A press on a row's control is a click, not a scroll, so following goes on (#173).
+      const handlePointerDown = (event: PointerEvent) => {
+        if (pointerPressStopsLiveFollow(event.target)) {
+          handleManualNavigation();
+        }
+      };
+      scrollNode.addEventListener("pointerdown", handlePointerDown, {
         passive: true,
       });
       removeListeners = () => {
         scrollNode.removeEventListener("wheel", handleManualNavigation);
         scrollNode.removeEventListener("touchmove", handleManualNavigation);
-        scrollNode.removeEventListener("pointerdown", handleManualNavigation);
+        scrollNode.removeEventListener("pointerdown", handlePointerDown);
       };
     });
 
@@ -4224,6 +4249,38 @@ function ChatViewContent(props: ChatViewProps) {
       showScrollDebouncer.current.maybeExecute(scrollPillThreadIdRef.current);
     }
   }, []);
+
+  // A Thinking row toggled at the end of an anchored turn changes layout but not
+  // `timelineEntries`, so the follow effect below never sees it (#173). One pass reveals the
+  // end again once the row re-measured; the other modes keep their own place.
+  const onReasoningRowToggle = useCallback(() => {
+    // The toggle has not rendered yet, so this is where the turn's end sat before it.
+    const before = legendListRef.current
+      ? getActiveTimelineTurnMetrics(legendListRef.current)
+      : null;
+    if (
+      !rowToggleNeedsEndReveal({
+        mode: timelineScrollModeRef.current,
+        scrollDeltaToRevealEnd: before?.scrollDeltaToRevealEnd ?? null,
+      }) ||
+      liveFollowUserScrollGenerationRef.current !== anchorUserScrollGenerationRef.current
+    ) {
+      return;
+    }
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        const list = legendListRef.current;
+        const metrics = list ? getActiveTimelineTurnMetrics(list) : null;
+        if (!list || !metrics || metrics.scrollDeltaToRevealEnd <= 1) {
+          return;
+        }
+        void list.scrollToOffset({
+          offset: list.getState().scroll + metrics.scrollDeltaToRevealEnd,
+          animated: false,
+        });
+      });
+    });
+  }, [getActiveTimelineTurnMetrics]);
 
   // Follows the end after new timeline entries render; an empty timeline has nothing to follow.
   useEffect(() => {
@@ -5400,6 +5457,7 @@ function ChatViewContent(props: ChatViewProps) {
       phase,
       sessionStatus: activeThread?.session?.status ?? null,
       hasPendingDelivery: canCancelPendingSend,
+      compacting: compaction !== undefined,
     });
     if (
       !activeThread ||
@@ -6106,7 +6164,12 @@ function ChatViewContent(props: ChatViewProps) {
         if (message.delivery?.state === "queued") await onCancelQueuedMessage(message.id);
       }
 
-      if (phase !== "running" && cancellableDeliveryThreadId && cancellableDeliveryMessageId) {
+      if (
+        compaction === undefined &&
+        phase !== "running" &&
+        cancellableDeliveryThreadId &&
+        cancellableDeliveryMessageId
+      ) {
         const result = await resolveTurnDelivery({
           environmentId,
           input: {
@@ -6494,11 +6557,29 @@ function ChatViewContent(props: ChatViewProps) {
     ],
   );
 
-  // The context-limit error's recovery: sends the provider's compaction command to the same
-  // session as an ordinary message, so it is delivered, queued and confirmed like any other.
-  // It never resends the failed message; the user does that once the compaction finishes.
+  // The context-limit error's recovery. A provider the server can compact gets `thread.compact`,
+  // which compacts the conversation the next message continues and shows its step. Otherwise
+  // (an older server, or a provider without the capability) it sends the provider's compaction
+  // command to the same session as an ordinary message, delivered, queued and confirmed like any
+  // other. Neither resends the failed message; the user does that once the compaction finishes.
   const onCompactConversation = useCallback(async () => {
     if (!activeThread || !isServerThread || isSendBusy || isConnecting || sendInFlightRef.current) {
+      return;
+    }
+    if (supportsCompaction) {
+      const threadIdForCompaction = activeThread.id;
+      setThreadError(threadIdForCompaction, null);
+      const result = await compactThread({
+        environmentId,
+        input: { threadId: threadIdForCompaction },
+      });
+      if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
+        const error = squashAtomCommandFailure(result);
+        setThreadError(
+          threadIdForCompaction,
+          error instanceof Error ? error.message : "BiBCode could not compact the conversation.",
+        );
+      }
       return;
     }
     const sendCtx = composerRef.current?.getSendContext();
@@ -6562,6 +6643,7 @@ function ChatViewContent(props: ChatViewProps) {
   }, [
     activeThread,
     beginLocalDispatch,
+    compactThread,
     composerRef,
     environmentId,
     interactionMode,
@@ -6572,6 +6654,7 @@ function ChatViewContent(props: ChatViewProps) {
     runtimeMode,
     setThreadError,
     startThreadTurn,
+    supportsCompaction,
   ]);
   const threadErrorCompact =
     threadError === null || !isServerThread
@@ -6580,6 +6663,9 @@ function ChatViewContent(props: ChatViewProps) {
           isBiBCodeAction: localServerError !== null,
           errorClass: serverThread?.session?.lastErrorClass ?? null,
           busy: phase === "running" || isSendBusy || isConnecting,
+          providerDriver: providerBinding.driver,
+          supportsCompaction: providerBinding.status?.supportsCompaction,
+          compaction: serverThread?.compaction,
         });
   // `threadErrorCompact` is a fresh object each render; its presence and reason are the inputs.
   const offersCompact = threadErrorCompact !== null;
@@ -6969,7 +7055,11 @@ function ChatViewContent(props: ChatViewProps) {
       </Suspense>
     ) : activeRightPanelSurface?.kind === "device" ? (
       <Suspense fallback={null}>
-        <DevicePanel environmentId={activeThreadRef.environmentId} />
+        {/* A chat panel's devices are its host's, so the pane works for the root thread. */}
+        <DevicePanel
+          threadRef={activeThreadRef}
+          rootThreadId={activeThread?.hostThreadId ?? activeThreadRef.threadId}
+        />
       </Suspense>
     ) : activeRightPanelSurface?.kind === "pullRequest" ? (
       <Suspense fallback={null}>
@@ -7132,6 +7222,7 @@ function ChatViewContent(props: ChatViewProps) {
                       onResolveTurnDelivery={onResolveTurnDelivery}
                       resolvingTurnDeliveryMessageId={resolvingTurnDeliveryMessageId}
                       blockingDelivery={blockingDelivery}
+                      compactionFailedMessageId={compactionFailedMessageId}
                       instanceLabels={instanceLabels}
                       isRevertingCheckpoint={isRevertingCheckpoint}
                       onImageExpand={onExpandTimelineImage}
@@ -7151,6 +7242,7 @@ function ChatViewContent(props: ChatViewProps) {
                       findSurfaceRoot={chatSurfaceElement}
                       isHostFindSurface={!isPanel}
                       onFindFocusComposer={focusComposer}
+                      onReasoningRowToggle={onReasoningRowToggle}
                     />
 
                     {/* scroll to end pill — shown when user has scrolled away from the live edge */}
@@ -7203,7 +7295,7 @@ function ChatViewContent(props: ChatViewProps) {
                             activeThread={activeThread}
                             isServerThread={isServerThread}
                             isLocalDraftThread={isLocalDraftThread}
-                            phase={phase}
+                            phase={composerPhase}
                             isConnecting={isConnecting}
                             isSendBusy={
                               isSendBusy || hasActiveAttachmentUpload || applicationSendBusy

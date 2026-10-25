@@ -4,12 +4,14 @@ import { deliveryProviderLabel, waitsBehind, type QueuedCardStatus } from "../Ch
 import {
   type EnvironmentId,
   type MessageId,
+  type OrchestrationReasoning,
   type ProviderInstanceId,
   type ScopedThreadRef,
   type ServerProviderSkill,
   type TurnId,
 } from "@bibcode/contracts";
 import { parseScopedThreadKey } from "@bibcode/client-runtime/environment";
+import { reasoningLabel, reasoningPreview } from "@bibcode/client-runtime/state/reasoning";
 import { resolveChatListAnchoredEndSpace } from "@bibcode/shared/chatList";
 import {
   createContext,
@@ -46,6 +48,7 @@ import {
 import ChatMarkdown from "../ChatMarkdown";
 import {
   BotIcon,
+  BrainIcon,
   CheckIcon,
   ChevronDownIcon,
   ChevronRightIcon,
@@ -69,6 +72,12 @@ import {
 import { Button } from "../ui/button";
 import { buildExpandedImagePreview, ExpandedImagePreview } from "./ExpandedImagePreview";
 import { ProposedPlanCard } from "./ProposedPlanCard";
+import {
+  holdTimelineReadingPosition,
+  preserveTimelineReadingPosition,
+  ReadingAnchorContext,
+  type ReadingAnchor,
+} from "./readingAnchor";
 import { ChangedFilesTree } from "./ChangedFilesTree";
 import { DiffStatLabel, hasNonZeroStat } from "./DiffStatLabel";
 import { MessageCopyButton } from "./MessageCopyButton";
@@ -164,6 +173,8 @@ interface TimelineRowSharedState {
   blockingDelivery:
     | (Pick<TimelineMessage, "id" | "createdAt"> & { readonly offersRetry: boolean })
     | null;
+  /** The failed message a context-limit recovery sends again once the compaction succeeds. */
+  compactionFailedMessageId: MessageId | null;
   instanceLabels: ReadonlyMap<ProviderInstanceId, string>;
   onSteerQueuedMessage: (messageId: MessageId) => void;
   onSendNowQueuedMessage: (messageId: MessageId) => void;
@@ -177,6 +188,8 @@ interface TimelineRowSharedState {
   onToggleWorkGroup: (groupId: string, expanded: boolean, anchorElement?: HTMLElement) => void;
   /** Sets one of an entry's own disclosures: its tool row, long body, plan or a details block. */
   onSetEntryDisclosure: (entryId: string, key: string, open: boolean) => void;
+  /** A Thinking row was expanded or collapsed: the owner keeps the end in view if it was. */
+  onReasoningRowToggle: () => void;
 }
 
 interface TimelineRowActivityState {
@@ -221,6 +234,7 @@ interface MessagesTimelineProps {
   onResolveTurnDelivery: (messageId: MessageId, action: TurnDeliveryResolutionAction) => void;
   resolvingTurnDeliveryMessageId: MessageId | null;
   blockingDelivery: TimelineRowSharedState["blockingDelivery"];
+  compactionFailedMessageId?: MessageId | null;
   instanceLabels: ReadonlyMap<ProviderInstanceId, string>;
   onSteerQueuedMessage: (messageId: MessageId) => void;
   onSendNowQueuedMessage: (messageId: MessageId) => void;
@@ -249,6 +263,7 @@ interface MessagesTimelineProps {
   isHostFindSurface?: boolean;
   /** Closing find returns focus to the composer. */
   onFindFocusComposer?: () => void;
+  onReasoningRowToggle: () => void;
 }
 
 const NO_FIND_FOCUS = () => {};
@@ -277,6 +292,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   onResolveTurnDelivery,
   resolvingTurnDeliveryMessageId,
   blockingDelivery,
+  compactionFailedMessageId = null,
   instanceLabels,
   onSteerQueuedMessage,
   onSendNowQueuedMessage,
@@ -302,6 +318,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   findSurfaceRoot = null,
   isHostFindSurface = false,
   onFindFocusComposer = NO_FIND_FOCUS,
+  onReasoningRowToggle,
 }: MessagesTimelineProps) {
   const [disclosures, setDisclosures] = useState<TimelineDisclosures>(EMPTY_TIMELINE_DISCLOSURES);
   const [minimapStripMap] = useState(() => new Map<string, HTMLSpanElement>());
@@ -399,6 +416,11 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       ? { ...config, onReady: handleAnchorReady, onSizeChanged: handleAnchorSizeChanged }
       : undefined;
   }, [anchorMessageId, handleAnchorReady, handleAnchorSizeChanged, rows]);
+  const readingAnchor = useTimelineReadingAnchor(
+    listRef,
+    timelineViewportElement,
+    anchoredEndSpace !== undefined,
+  );
 
   const handleScroll = useCallback(() => {
     const state = listRef.current?.getState?.();
@@ -491,6 +513,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       onResolveTurnDelivery,
       resolvingTurnDeliveryMessageId,
       blockingDelivery,
+      compactionFailedMessageId,
       instanceLabels,
       onSteerQueuedMessage,
       onSendNowQueuedMessage,
@@ -502,6 +525,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       onToggleTurnFold,
       onToggleWorkGroup,
       onSetEntryDisclosure,
+      onReasoningRowToggle,
     }),
     [
       timestampFormat,
@@ -515,6 +539,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       onResolveTurnDelivery,
       resolvingTurnDeliveryMessageId,
       blockingDelivery,
+      compactionFailedMessageId,
       instanceLabels,
       onSteerQueuedMessage,
       onSendNowQueuedMessage,
@@ -526,6 +551,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       onToggleTurnFold,
       onToggleWorkGroup,
       onSetEntryDisclosure,
+      onReasoningRowToggle,
     ],
   );
   const unsettledTurnId = deriveUnsettledTurnId(latestTurn, runningTurnId);
@@ -611,39 +637,43 @@ export const MessagesTimeline = memo(function MessagesTimeline({
         <TimelineRowCtx value={sharedState}>
           <AttachmentUploadCtx value={attachmentUploadState}>
             <TimelineRowActivityCtx value={activityState}>
-              <LegendList<MessagesTimelineRow>
-                ref={listRef}
-                data={rows}
-                keyExtractor={keyExtractor}
-                getItemType={getItemType}
-                renderItem={renderItem}
-                estimatedItemSize={90}
-                initialScrollAtEnd
-                recycleItems={false}
-                {...(anchoredEndSpace ? { anchoredEndSpace } : {})}
-                contentInsetEndAdjustment={contentInsetEndAdjustment}
-                maintainScrollAtEnd={
-                  anchoredEndSpace
-                    ? false
-                    : {
-                        animated: false,
-                        on: {
-                          dataChange: true,
-                          itemLayout: true,
-                          layout: true,
-                        },
-                      }
-                }
-                maintainVisibleContentPosition={{
-                  data: true,
-                  size: false,
-                }}
-                onScroll={handleScroll}
-                onMetricsChange={onListMetricsChange}
-                className="scrollbar-gutter-both h-full min-h-0 overflow-x-hidden overscroll-y-contain px-3 [overflow-anchor:none] sm:px-5"
-                ListHeaderComponent={TIMELINE_LIST_HEADER}
-                ListFooterComponent={TIMELINE_LIST_FOOTER}
-              />
+              <ReadingAnchorContext value={readingAnchor}>
+                <LegendList<MessagesTimelineRow>
+                  ref={listRef}
+                  data={rows}
+                  keyExtractor={keyExtractor}
+                  getItemType={getItemType}
+                  renderItem={renderItem}
+                  estimatedItemSize={90}
+                  initialScrollAtEnd
+                  recycleItems={false}
+                  {...(anchoredEndSpace ? { anchoredEndSpace } : {})}
+                  contentInsetEndAdjustment={contentInsetEndAdjustment}
+                  maintainScrollAtEnd={
+                    anchoredEndSpace
+                      ? false
+                      : {
+                          animated: false,
+                          on: {
+                            dataChange: true,
+                            itemLayout: true,
+                            layout: true,
+                          },
+                        }
+                  }
+                  // A row that changes size above the first visible one, such as a Mermaid
+                  // diagram replacing its source, keeps the line the user reads in place.
+                  maintainVisibleContentPosition={{
+                    data: true,
+                    size: true,
+                  }}
+                  onScroll={handleScroll}
+                  onMetricsChange={onListMetricsChange}
+                  className="scrollbar-gutter-both h-full min-h-0 overflow-x-hidden overscroll-y-contain px-3 [overflow-anchor:none] sm:px-5"
+                  ListHeaderComponent={TIMELINE_LIST_HEADER}
+                  ListFooterComponent={TIMELINE_LIST_FOOTER}
+                />
+              </ReadingAnchorContext>
               <TimelineMinimap
                 items={minimapItems}
                 bottomInset={contentInsetEndAdjustment}
@@ -720,6 +750,40 @@ function useListHeaderSize() {
     [],
   );
   return { listHeaderSize, onListMetricsChange };
+}
+
+/**
+ * The reading anchor Mermaid diagrams commit their swaps through, created once for the life of
+ * the timeline. It reads the viewport and the end-space state from a ref; kept out of
+ * `MessagesTimeline`'s scope for the reason `useFoldPreviousTurnOnNewTurn` gives.
+ */
+function useTimelineReadingAnchor(
+  listRef: React.RefObject<LegendListRef | null>,
+  viewport: HTMLDivElement | null,
+  anchoringEndSpace: boolean,
+): ReadingAnchor {
+  const latest = useRef({ viewport, anchoringEndSpace });
+  useLayoutEffect(() => {
+    latest.current = { viewport, anchoringEndSpace };
+  }, [anchoringEndSpace, viewport]);
+  const preserveReadingPosition = useCallback(
+    (element: HTMLElement, commit: () => void) =>
+      preserveTimelineReadingPosition(
+        { list: listRef.current, ...latest.current },
+        element,
+        commit,
+      ),
+    [listRef],
+  );
+  const holdReadingPosition = useCallback(
+    (element: HTMLElement) =>
+      holdTimelineReadingPosition({ list: listRef.current, ...latest.current }, element),
+    [listRef],
+  );
+  return useMemo(
+    () => ({ preserveReadingPosition, holdReadingPosition }),
+    [holdReadingPosition, preserveReadingPosition],
+  );
 }
 
 /**
@@ -1299,6 +1363,13 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
               ? ctx.blockingDelivery
               : null
           }
+          recovery={
+            row.message.id === ctx.compactionFailedMessageId
+              ? "resending"
+              : row.message.resendOf !== undefined
+                ? "resent"
+                : null
+          }
           disabled={ctx.resolvingTurnDeliveryMessageId === row.message.id}
           onRetry={() => ctx.onResolveTurnDelivery(row.message.id, "retry")}
           onDismiss={() => ctx.onResolveTurnDelivery(row.message.id, "dismiss")}
@@ -1523,14 +1594,20 @@ function WorkingIndicatorIcon() {
 function WorkingTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "working" }> }) {
   return (
     <div className="py-0.5 pl-1.5">
-      <div className="flex items-center gap-2 pt-1 text-xs text-muted-foreground tabular-nums">
+      <div className="flex min-w-0 items-center gap-2 pt-1 text-xs text-muted-foreground tabular-nums">
         <WorkingIndicatorIcon />
-        <span>
+        {/* The timer never truncates; the thought takes what is left of the one line. */}
+        <span className="shrink-0">
           {row.answerDelivered
             ? "Answer delivered — waiting for the provider to close the turn "
             : "Waiting for "}
           <WorkingTimer createdAt={row.createdAt} />
         </span>
+        {row.latestThought !== null ? (
+          <span className="min-w-0 truncate" data-working-latest-thought="">
+            {`· ${row.latestThought}`}
+          </span>
+        ) : null}
       </div>
     </div>
   );
@@ -1601,11 +1678,17 @@ const WorkGroupSection = memo(function WorkGroupSection({
     () => groupedEntries.filter((entry) => !workEntryIndicatesToolNeutralStatus(entry)),
     [groupedEntries],
   );
-  const onlyToolEntries = nonEmptyEntries.every((entry) => workLogEntryIsToolLike(entry));
+  // A thought reads as a step beside tool calls, not as a log entry that needs a heading.
+  const onlyToolEntries = nonEmptyEntries.every(
+    (entry) => workLogEntryIsToolLike(entry) || entry.tone === "reasoning",
+  );
+  const [singularNoun, pluralNoun] = nonEmptyEntries.some((entry) => entry.tone === "reasoning")
+    ? ["step", "steps"]
+    : ["tool call", "tool calls"];
   const groupLabel = onlyToolEntries
     ? nonEmptyEntries.length === 1
-      ? "1 tool call"
-      : `${nonEmptyEntries.length} tool calls`
+      ? `1 ${singularNoun}`
+      : `${nonEmptyEntries.length} ${pluralNoun}`
     : "Work Log";
 
   if (nonEmptyEntries.length === 0) return null;
@@ -1616,14 +1699,23 @@ const WorkGroupSection = memo(function WorkGroupSection({
         <p className="px-0.5 pb-0.5 font-medium text-xs text-muted-foreground">{groupLabel}</p>
       )}
       <div className="space-y-px">
-        {nonEmptyEntries.map((workEntry) => (
-          <SimpleWorkEntryRow
-            key={workEntry.id}
-            workEntry={workEntry}
-            workspaceRoot={workspaceRoot}
-            expanded={expanded}
-          />
-        ))}
+        {nonEmptyEntries.map((workEntry) =>
+          workEntry.reasoning !== undefined ? (
+            <ReasoningWorkEntryRow
+              key={workEntry.id}
+              workEntry={workEntry}
+              reasoning={workEntry.reasoning}
+              expanded={expanded}
+            />
+          ) : (
+            <SimpleWorkEntryRow
+              key={workEntry.id}
+              workEntry={workEntry}
+              workspaceRoot={workspaceRoot}
+              expanded={expanded}
+            />
+          ),
+        )}
       </div>
     </section>
   );
@@ -1635,8 +1727,16 @@ function WorkGroupToggleTimelineRow({
   row: Extract<TimelineRow, { kind: "work-toggle" }>;
 }) {
   const ctx = use(TimelineRowCtx);
-  const singularNoun = row.onlyToolEntries ? "tool call" : "log entry";
-  const pluralNoun = row.onlyToolEntries ? "tool calls" : "log entries";
+  const singularNoun = row.hidesReasoning
+    ? "step"
+    : row.onlyToolEntries
+      ? "tool call"
+      : "log entry";
+  const pluralNoun = row.hidesReasoning
+    ? "steps"
+    : row.onlyToolEntries
+      ? "tool calls"
+      : "log entries";
 
   return (
     <button
@@ -2504,3 +2604,104 @@ const SimpleWorkEntryRow = memo(function SimpleWorkEntryRow(props: {
     </div>
   );
 });
+
+/** Within this distance of its end, an expanded live trace keeps following its newest text. */
+const REASONING_TRACE_FOLLOW_SLACK_PX = 4;
+
+/**
+ * A provider's thought (#173). Collapsed, one line reads "Thought - <what it is about>", or
+ * "Thinking - …" while it streams; the whole line is the toggle, opened by Verbose chat as
+ * tool rows are. Expanded, it shows the full trace. Its disclosure is the tool row's, so the
+ * user's choice wins and, until then, Verbose chat opens settled thoughts.
+ */
+const ReasoningWorkEntryRow = memo(function ReasoningWorkEntryRow(props: {
+  workEntry: TimelineWorkEntry;
+  reasoning: OrchestrationReasoning;
+  expanded: boolean;
+}) {
+  const { workEntry, reasoning, expanded } = props;
+  const { onSetEntryDisclosure, onReasoningRowToggle } = use(TimelineRowCtx);
+  const toggleExpanded = () => {
+    onSetEntryDisclosure(workEntry.id, TOOL_ROW_DISCLOSURE_KEY, !expanded);
+    onReasoningRowToggle();
+  };
+  const preview = reasoningPreview(reasoning);
+
+  return (
+    <div className="flex flex-col" data-reasoning-id={reasoning.id}>
+      <button
+        type="button"
+        aria-expanded={expanded}
+        className="flex w-full min-w-0 cursor-pointer items-center gap-1.5 rounded-md px-0.5 py-0.5 text-left text-xs leading-5 text-muted-foreground transition-colors hover:bg-accent/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/70"
+        onClick={toggleExpanded}
+      >
+        <span className="flex size-5 shrink-0 items-center justify-center">
+          <BrainIcon className="block size-3.5 shrink-0 stroke-[1.8] opacity-80" aria-hidden />
+        </span>
+        <span className="min-w-0 flex-1 truncate">
+          <span className="font-medium">{reasoningLabel(reasoning)}</span>
+          {preview !== null ? ` - ${preview}` : null}
+        </span>
+        <span className="flex size-4 shrink-0 items-center justify-center" aria-hidden>
+          <ChevronDownIcon
+            className={cn(
+              "size-3 shrink-0 opacity-70 transition-transform duration-200",
+              expanded && "rotate-180",
+            )}
+          />
+        </span>
+      </button>
+      {expanded ? <ReasoningTrace text={reasoning.text} streaming={reasoning.streaming} /> : null}
+    </div>
+  );
+});
+
+/**
+ * The full trace, rendered as the assistant's Markdown is. While it streams it follows its
+ * newest text, until the reader scrolls up; scrolling back to within a few pixels of the end
+ * resumes following.
+ */
+function ReasoningTrace({ text, streaming }: { text: string; streaming: boolean }) {
+  const ctx = use(TimelineRowCtx);
+  const scrollerRef = useRef<HTMLDivElement>(null);
+  const followingRef = useRef(true);
+  useLayoutEffect(() => {
+    // Layout is read only while the trace streams, each time its text grows.
+    if (!streaming || text.length === 0 || !followingRef.current) {
+      return;
+    }
+    const scroller = scrollerRef.current;
+    if (scroller) {
+      scroller.scrollTop = scroller.scrollHeight;
+    }
+  }, [streaming, text]);
+  const onScroll = () => {
+    const scroller = scrollerRef.current;
+    if (scroller) {
+      followingRef.current =
+        scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight <=
+        REASONING_TRACE_FOLLOW_SLACK_PX;
+    }
+  };
+
+  return (
+    <div className="mt-1 ms-7 border-s border-border/45 ps-3 pt-0.5">
+      <div
+        ref={scrollerRef}
+        className="max-h-64 overflow-auto"
+        data-reasoning-trace=""
+        onScroll={onScroll}
+      >
+        <div data-text-surface="background" className="text-muted-foreground select-text">
+          <ChatMarkdown
+            text={text}
+            cwd={ctx.markdownCwd}
+            threadRef={ctx.threadRef ?? undefined}
+            isStreaming={streaming}
+            skills={ctx.skills}
+          />
+        </div>
+      </div>
+    </div>
+  );
+}

@@ -13,6 +13,7 @@ pub mod data_root;
 pub mod device;
 pub mod diagnostic_bundle;
 pub mod diagnostics;
+mod ecmascript;
 mod environment_identity;
 pub mod git;
 #[cfg(feature = "hermetic-test-guard")]

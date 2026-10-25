@@ -90,12 +90,29 @@ pub trait OrchestrationEffectCallbacks: Send + Sync {
 
     fn stop_provider<'a>(&'a self, thread_id: &'a str) -> BoxEffectFuture<'a, ()>;
 
+    /// Drives a requested conversation compaction to its settlement (see
+    /// `provider_runtime::drive_thread_compaction`). Runs with the thread's turns reserved;
+    /// `cancellation` abandons it at shutdown, and the next startup settles its row.
+    fn compact_provider<'a>(
+        &'a self,
+        _compaction_id: &'a str,
+        _cancellation: &'a CancellationToken,
+    ) -> BoxEffectFuture<'a, ()> {
+        Box::pin(async { Err("provider compaction is unavailable".to_owned()) })
+    }
+
     fn close_terminals<'a>(&'a self, thread_id: &'a str) -> BoxEffectFuture<'a, ()>;
 
     fn refresh_workspace<'a>(&'a self, cwd: &'a Path) -> BoxEffectFuture<'a, ()>;
 
     /// Closes the thread's preview tabs and gateway targets.
     fn close_previews<'a>(&'a self, _thread_id: &'a str) -> BoxEffectFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Starts stopping the device previews the thread started, without waiting for them, and
+    /// refuses the thread as a device owner from now on.
+    fn close_devices<'a>(&'a self, _thread_id: &'a str) -> BoxEffectFuture<'a, ()> {
         Box::pin(async { Ok(()) })
     }
 
@@ -428,6 +445,9 @@ pub struct OrchestrationEffects {
     /// Identity reconciles run off the sequential worker so a slow `git` read never delays turn
     /// baselines; shutdown cancels and drains them.
     identity_tasks: TaskTracker,
+    /// Conversation compactions, which can run for minutes, also run off the worker; shutdown
+    /// abandons them and the next startup settles their rows.
+    compaction_tasks: TaskTracker,
     producer: tokio::sync::Mutex<Option<JoinHandle<()>>>,
     worker: tokio::sync::Mutex<Option<JoinHandle<()>>>,
 }
@@ -460,10 +480,12 @@ impl OrchestrationEffects {
             repository.clone(),
             cancellation.child_token(),
         ));
+        let compaction_tasks = TaskTracker::new();
         let worker = tokio::spawn(run_worker(
             engine.clone(),
             repository,
             identity_tasks.clone(),
+            compaction_tasks.clone(),
             callbacks,
             receiver,
             cancellation.clone(),
@@ -479,6 +501,7 @@ impl OrchestrationEffects {
         Ok(Self {
             cancellation,
             identity_tasks,
+            compaction_tasks,
             producer: tokio::sync::Mutex::new(Some(producer)),
             worker: tokio::sync::Mutex::new(Some(worker)),
         })
@@ -494,6 +517,8 @@ impl OrchestrationEffects {
         }
         self.identity_tasks.close();
         self.identity_tasks.wait().await;
+        self.compaction_tasks.close();
+        self.compaction_tasks.wait().await;
     }
 }
 
@@ -611,6 +636,7 @@ fn is_reactor_event(event: &OrchestrationEvent) -> bool {
             | "thread.message-sent"
             | "thread.turn-diff-completed"
             | "thread.checkpoint-revert-requested"
+            | "thread.compact-requested"
             | "thread.deleted"
             | "project.created"
             | "project.meta-updated"
@@ -622,11 +648,48 @@ struct EffectContext {
     engine: OrchestrationEngine,
     repository: Arc<GitRepository>,
     identity_tasks: TaskTracker,
+    compaction_tasks: TaskTracker,
     callbacks: Arc<dyn OrchestrationEffectCallbacks>,
     cancellation: CancellationToken,
 }
 
 impl EffectContext {
+    /// Runs a requested compaction off the worker, with the thread's turns reserved so delivery
+    /// and revert wait for it, then releases the thread and wakes delivery.
+    fn compact(&self, event: &OrchestrationEvent) {
+        let (Some(thread_id), Some(compaction_id)) = (
+            event_thread_id(event).map(str::to_owned),
+            event
+                .event
+                .payload
+                .get("compactionId")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        ) else {
+            return;
+        };
+        let (engine, callbacks, cancellation) = (
+            self.engine.clone(),
+            self.callbacks.clone(),
+            self.cancellation.clone(),
+        );
+        self.compaction_tasks.spawn(async move {
+            let reservation = tokio::select! {
+                reservation = engine.reserve_thread_turns(&thread_id) => reservation,
+                () = cancellation.cancelled() => return,
+            };
+            let result = callbacks
+                .compact_provider(&compaction_id, &cancellation)
+                .await;
+            drop(reservation);
+            engine.wake_turn_delivery();
+            if let Err(detail) = result {
+                tracing::warn!(%thread_id, %detail, "conversation compaction could not run");
+                settle_unrun_compaction(&engine, &thread_id, &compaction_id, &detail).await;
+            }
+        });
+    }
+
     async fn handle(&self, event: &OrchestrationEvent) {
         let result = process_event(
             &self.engine,
@@ -669,6 +732,51 @@ impl EffectContext {
             append_failure_activity(&self.engine, event, &error.to_string()).await;
         }
     }
+}
+
+/// A compaction the callbacks could not run settles `failed`, so its thread is not held.
+async fn settle_unrun_compaction(
+    engine: &OrchestrationEngine,
+    thread_id: &str,
+    compaction_id: &str,
+    detail: &str,
+) {
+    let Some(row) = engine
+        .thread_compaction(compaction_id)
+        .await
+        .ok()
+        .flatten()
+        .filter(crate::orchestration::engine::ThreadCompactionRow::is_unsettled)
+    else {
+        return;
+    };
+    let started = std::time::Instant::now();
+    let settled = engine
+        .dispatch(OrchestrationCommand::ThreadCompactionSettle {
+            command_id: format!("server:compaction-settle:{compaction_id}"),
+            thread_id: thread_id.to_owned(),
+            compaction_id: compaction_id.to_owned(),
+            outcome: "failed".to_owned(),
+            detail: Some(crate::diagnostics::redact_sensitive_text(detail)),
+            restarted: false,
+            created_at: now_iso(),
+        })
+        .await;
+    match settled {
+        Ok(_) => {
+            super::provider_runtime::record_settled_compaction(
+                engine,
+                &row,
+                Some("not_started"),
+                started,
+            )
+            .await;
+        }
+        Err(error) => {
+            tracing::warn!(thread_id, %error, "an unrun conversation compaction could not be settled");
+        }
+    }
+    engine.wake_turn_delivery();
 }
 
 fn event_thread_id(event: &OrchestrationEvent) -> Option<&str> {
@@ -789,6 +897,9 @@ impl ParkedThreads {
             done,
         }) = order
         else {
+            if event.event.event_type == "thread.compact-requested" {
+                return context.compact(&event);
+            }
             return context.handle(&event).await;
         };
         self.queues.insert(thread_id.clone(), VecDeque::new());
@@ -854,6 +965,7 @@ async fn run_worker(
     engine: OrchestrationEngine,
     repository: Arc<GitRepository>,
     identity_tasks: TaskTracker,
+    compaction_tasks: TaskTracker,
     callbacks: Arc<dyn OrchestrationEffectCallbacks>,
     mut receiver: mpsc::Receiver<OrchestrationEvent>,
     cancellation: CancellationToken,
@@ -862,6 +974,7 @@ async fn run_worker(
         engine,
         repository,
         identity_tasks,
+        compaction_tasks,
         callbacks,
         cancellation,
     };
@@ -1415,6 +1528,9 @@ async fn cleanup_deleted_thread(
     if let Err(error) = callbacks.close_previews(thread_id).await {
         tracing::debug!(thread_id, %error, "thread deletion cleanup skipped preview close");
     }
+    if let Err(error) = callbacks.close_devices(thread_id).await {
+        tracing::debug!(thread_id, %error, "thread deletion cleanup skipped device close");
+    }
 }
 
 async fn append_failure_activity(
@@ -1607,6 +1723,27 @@ async fn has_ref(
             "--quiet",
             &format!("{reference}^{{commit}}"),
         ],
+        &[],
+        true,
+        cancellation,
+    )
+    .await?
+    .exit_code
+        == 0)
+}
+
+/// Whether `reference` names any object in the repository at `cwd`. Unlike [`has_ref`] it does
+/// not peel the object, so a ref that points at something other than a commit still counts as
+/// present and the caller's `^{commit}` reports the mismatch.
+pub(crate) async fn ref_exists(
+    cwd: &Path,
+    reference: &str,
+    cancellation: &CancellationToken,
+) -> Result<bool, OrchestrationEffectsError> {
+    Ok(run_git(
+        cwd,
+        Path::new("git"),
+        &["rev-parse", "--verify", "--quiet", reference],
         &[],
         true,
         cancellation,
@@ -1851,6 +1988,41 @@ mod tests {
         OrchestrationEngine::start(database, EngineOptions::default())
             .await
             .expect("engine")
+    }
+
+    #[tokio::test]
+    async fn a_compaction_that_could_not_run_is_settled_and_recorded() {
+        const AT: &str = "2026-10-24T00:00:00Z";
+        let engine = empty_event_log().await;
+        for value in [
+            json!({"type":"project.create","commandId":"project","projectId":"p","title":"P","workspaceRoot":"C:/repo","createdAt":AT}),
+            json!({"type":"thread.create","commandId":"thread","threadId":"t","projectId":"p","title":"T","modelSelection":{"instanceId":"claudeAgent","model":"claude-opus"},"runtimeMode":"full-access","createdAt":AT}),
+        ] {
+            engine
+                .dispatch(serde_json::from_value(value).unwrap())
+                .await
+                .unwrap();
+        }
+        engine
+            .repositories()
+            .database()
+            .call(|connection| {
+                connection.execute("INSERT INTO thread_compactions (compaction_id, thread_id, trigger, state, provider_instance_id, provider_kind, created_at, updated_at) VALUES ('c', 't', 'manual', 'requested', 'claudeAgent', 'claudeAgent', '2026-10-24T00:00:00Z', '2026-10-24T00:00:00Z')", [])?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        crate::diagnostics::profiler::provider_turns::take_recorded();
+        settle_unrun_compaction(&engine, "t", "c", "The workspace is unavailable.").await;
+        let row = engine.thread_compaction("c").await.unwrap().unwrap();
+        assert_eq!(row.state, "failed");
+        let recorded = crate::diagnostics::profiler::provider_turns::take_recorded();
+        assert_eq!(recorded.len(), 1, "{recorded:?}");
+        assert_eq!(recorded[0].0, "provider.compaction");
+        assert_eq!(recorded[0].1["outcome"], "failed");
+        assert_eq!(recorded[0].1["reason"], "not_started");
+        assert_eq!(recorded[0].1["provider"], "claude");
+        engine.shutdown().await;
     }
 
     #[tokio::test]

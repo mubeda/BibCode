@@ -751,6 +751,226 @@ explicit refresh or an unresolvable pinned tip resets the pages. Repositories
 over the cap fall back to `--all` paging with `degradedToAllPaging: true`, and
 the History view warns that new commits may shift the list.
 
+## Diff Compare and Open with
+
+The Diff panel reads three kinds of patch: the working tree and the branch
+range from `review.getDiffPreview`, and a turn or the whole thread from
+`orchestration.getTurnDiff` and `orchestration.getFullThreadDiff`.
+
+### Review and turn patches
+
+- **Arguments.** Every patch runs
+  `git diff --no-ext-diff --patch --minimal --full-index` with the shared
+  prefix settings above. `--full-index` prints whole object IDs on each
+  `index` line, so a client can name either side of a file by its blob ID.
+  `ignoreWhitespace` adds `--ignore-all-space`. An optional `contextLines`
+  (an integer from 0 to 99, checked on the server) adds `-U<N>`, formatted from
+  the integer. Without it Git's own context applies (3, or `diff.context`).
+  Each result echoes the count it applied as `contextLines` on the source or
+  the turn patch; an older server ignores the request and omits it.
+- **Bounds.** Each patch is capped at 4,375,000 bytes and cut at a file
+  boundary; `truncated` says later files were dropped. The runner reads at most
+  the cap plus one probe byte and then stops Git.
+- **Base ref.** A `baseRef` that starts with `-` is refused with
+  `InvalidRequest` before Git starts, so a value such as `--output=<file>` never
+  reaches Git as an option. `git check-ref-format --branch` forbids that form
+  for branch names, so no real branch is refused.
+- **Git exits.** The runner reports its child's exit to the Profiler as a
+  `git` command watched for signals. Its own kill, at the cap or after a failed
+  capture, is a requested stop and is never a `subprocess.crash`. A request
+  dropped by cancellation kills Git through `kill_on_drop` and reports nothing.
+- **Review sources on failure.** `getDiffPreview` still returns an empty
+  source when Git fails (for example, a base ref that does not exist).
+
+### Turn patches
+
+Turn and full-thread patches are computed live from the checkpoint refs at
+`refs/bibcode/checkpoints/<thread>/turn/<n>`. A request works in this order:
+
+1. It acquires the thread's workspace admission, which resolves the thread's
+   worktree or its project's root. The lease is held until Git exits. A
+   workspace that is being removed, or is gone, returns
+   `WorkspaceUnavailableError` before Git starts.
+2. It resolves both checkpoint refs with `rev-parse --verify --quiet`.
+3. When both resolve, it runs the patch arguments above on
+   `<from-ref>^{commit} <to-ref>^{commit}`. Workspace loss while Git runs
+   drops the read, which kills Git, and returns `WorkspaceUnavailableError`.
+4. When either ref is missing, it serves a stored `checkpoint_diff_blobs` row
+   for the exact range, if there is one. Nothing at this version writes those
+   rows; the fallback serves older data. A stored row has short object IDs,
+   ignores the whitespace and context options, omits `contextLines`, and
+   reports `truncated: false`.
+5. Otherwise it returns the method's error (`OrchestrationGetTurnDiffError` or
+   `OrchestrationGetFullThreadDiffError`) with "The checkpoint for turn <n> is
+   no longer in the repository."
+6. A non-zero Git exit that the runner did not cause returns the same error
+   type with "Git couldn't compare these checkpoints (exit <code>).", never an
+   empty patch.
+
+Turn ranges must be non-negative and ordered, and the revisions are built on
+the server from the thread ID and the turn counts; the client sends no ref
+names. An older server serves only stored rows, which a turn captured by it
+never had, and never returns `WorkspaceUnavailableError` for these methods.
+
+### Full-file reads
+
+`review.readFileVersion` (`read_unary`, `review:write`) returns one side of a
+changed file, named by the content it must have rather than by a revision:
+
+- **`blob { oid }`** reads the object with one `git cat-file --batch`, with the
+  read environment plus `GIT_NO_LAZY_FETCH=1`, so a partial clone never
+  fetches from the network. The ID must be 40 or 64 lowercase hex digits,
+  which is neither an option nor a path. A deleted file, a rename's old side
+  and a branch or checkpoint file absent from the checkout are all read this
+  way, without touching the working tree. No filter or text conversion
+  applies.
+- **`worktree { path, expectedOid }`** reads the working-tree file once and
+  hashes its bytes with `git hash-object --stdin --path=<path>`, which applies
+  that path's clean filters and end-of-line rules as `git diff` did when it
+  printed the ID. A different ID returns `changed`. The path is named from the
+  top of `cwd`'s repository (`git rev-parse --show-toplevel`), as the patch
+  names it, so a project rooted in a repository subdirectory reads its files
+  too. It goes through the workspace's `resolve_relative` and
+  `canonical_existing_within` against that top: an absolute path, `..` or a
+  symlink that leaves the repository is refused, a symlink, directory or
+  submodule is `not-a-file`, and a path that no longer exists is `missing`.
+  The read reaches no further than the blob reads, which already cover the
+  whole repository, and returns text only for bytes that hash to the ID the
+  client names.
+- **Results.** `text { contents, byteLength }` is lossy UTF-8, as the patch
+  is. `unavailable { reason, byteLength }` says why there is none: `missing`,
+  `binary` (a NUL byte), `too-large` (over the 4,375,000-byte patch cap, with
+  the size from `cat-file --batch-check`), `not-a-file` or `changed`.
+- **Bounds.** The method is dispatched in `WorkspaceRpc` behind the same
+  `acquire_path` admission as `getDiffPreview`, and shares the workspace's 32
+  operation permits. Each Git step has a 30 s timeout and the request's
+  cancellation.
+
+The client keeps version reads and patches with a `contextLines` in their own
+query families with `idleTtlMs: 0`. Releasing one interrupts a read in flight
+and drops its result, so moving to another file, or to another context count,
+keeps no multi-megabyte result behind. The default patch keeps today's
+family, so Changes and Compare's **All lines** share it.
+
+### Compare view
+
+The Diff panel's Compare view (`apps/web/src/components/diffs/DiffCompareView.tsx`,
+with its pure model in `apps/web/src/lib/diffCompareModel.ts`) works from the
+patch the panel already loaded:
+
+- **Rows** (path, status, +/− counts) are derived once per parsed patch;
+  filtering never re-parses it, and the name filter is deferred.
+- **Version plan.** For the working tree it reads `blob { prevObjectId }` and
+  `worktree { path, newObjectId }`; for a branch or a turn, two blobs. Added,
+  deleted, pure-rename, mode-only, binary and submodule files read nothing.
+  Abbreviated object IDs fall back to the hunks: a turn patch from a server
+  that reports `truncated` is a stored row, any other is an older server.
+- **Hydration.** Both texts fill Git's hunks with pierre's
+  `hydratePartialDiff("clone", …)`, so the patch Changes renders stays partial.
+  Every added and deleted line is then checked against the full files,
+  ignoring a trailing `\r`; a textconv driver or a filter that rewrote the
+  diff falls back to the hunks with a note. The file's metadata is kept while
+  its object IDs and hunk ranges stay the same, so a refresh of the patch
+  hydrates it again only when the file changed.
+- **`changed`.** A working file that moved past the patch revalidates the
+  patch and reads the file again, once. Only a read after that request that is
+  `changed` again, of a new object ID or of the same one when the refreshed
+  patch names the same content, shows "This file is changing." with
+  **Refresh**, so a file an agent keeps writing never loops and a file never
+  loads forever. Metadata is kept across refreshes only for a file with both
+  full object IDs: a file shown from its hunks alone, such as an untracked
+  one, takes each new patch as it is.
+- **Line filter.** **All lines** renders the hydrated default patch with
+  `expandUnchanged`. **Changes only** requests the patch again with
+  `contextLines`, renders that file hydrated with its gaps collapsed, and keeps
+  the default patch's file for placing comments, whose positions index its
+  hunks. The count commits 300 ms after typing stops. A result without
+  `contextLines` disables the field with its reason. A failed request shows
+  its error with **Retry**, an explicit refresh of that query, never the
+  default patch under the chosen count.
+- **Truncation.** A truncated patch, review or turn, shows the truncation
+  banner, and an empty truncated patch never reads as "No net changes".
+- **Navigation.** `diff.nextChange` and `diff.previousChange` (F7 and
+  Shift+F7, `when: "diffFocus"`) are resolved by a `keydown` handler on the
+  Compare root with `diffFocus` set, and scroll to each block of changes by
+  line target.
+- **Persistence.** `diffViewMode`, `diffRenderMode`, `diffCompareLines` and
+  `diffCompareContextLines` are `ClientSettings`. The selected file is
+  persisted per thread in `bibcode:diff-panel-state:v1`; the filters are kept
+  in memory only.
+
+### Open with
+
+**Open with** hands a file, or every file of the scope, to a diff app through
+`git difftool` on the server's computer
+(`apps/server/src/production/diff_tool.rs`). Git owns each tool's arguments,
+its temporary pre-image files and the user's `difftool.<tool>.cmd`.
+
+- **`review.listDiffTools`** (`read_unary`, `review:write`, long-running) runs
+  `git difftool --tool-help` with `LC_ALL=C` and an empty `LANGUAGE`, so the
+  headings are stable, and a 30 s timeout. It keeps the first section only:
+  built-ins marked "(requires a graphical session)" and the `user-defined:`
+  entries, once each. The default is the first of `diff.guitool`,
+  `merge.guitool`, `diff.tool` and `merge.tool` whose value is listed, which is
+  Git's own `--gui` order, and `defaultSource` names the key. When Git
+  succeeds but nothing parses, the configured `diff.guitool` or `diff.tool` is
+  still offered. There is no server cache; the client keeps the list for ten
+  minutes per environment and `cwd` and asks for it when the pointer reaches
+  the button.
+- **`review.openDiffTool`** (`mutation_unary`, `orchestration:operate`, like
+  `shell.openInEditor`, long-running) builds
+  `git -C <top> difftool -y --trust-exit-code [--dir-diff] --tool=<id> [-M]
+  <revs> -- [paths]`, where `<top>` is `cwd`'s repository top
+  (`rev-parse --show-toplevel`), because the patch names paths from there,
+  also for a project in a subdirectory. `--trust-exit-code` makes Git return the tool's
+  failure. The revisions come from the scope: `HEAD` for the working tree;
+  for a branch, the base (or the repository's default ref) resolved with
+  `rev-parse --verify --quiet --end-of-options <base>^{commit}`, then
+  `<base-oid>...HEAD`; for a turn, both checkpoint refs `^{commit}`, built
+  from the thread ID and turn counts. A rename passes both paths with `-M`.
+  Paths are checked lexically by `resolve_relative` and never against the
+  disk, so a deleted file, a rename's old path and a file only a base or a
+  checkpoint holds are valid; they follow `--` with `GIT_LITERAL_PATHSPECS=1`.
+  The tool ID matches `[A-Za-z0-9][A-Za-z0-9._-]*` and is passed only as the
+  value of `--tool=`. The environment adds `GIT_TERMINAL_PROMPT=0`, and the
+  AppImage environment is isolated.
+- **Launch.** Stdin and stdout are null and stderr goes to a log in the
+  temporary directory. The child has no kill-on-drop and starts in its own
+  process group, so a terminal's Ctrl+C to a standalone server does not reach
+  it; on Windows it uses `CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP |
+  CREATE_BREAKAWAY_FROM_JOB` and retries without breakaway when the job
+  forbids it. The server waits up to 1 s: an exit 0 or a process still running
+  returns `opened`, and a non-zero exit returns `ReviewDiffToolError` with
+  reason `launch-failed`, the last 2 KiB of stderr with the exit code, and the
+  command for **Copy command**. At most 16 launches run at once
+  (`too-many-open`), and a launch after shutdown began is `shutting-down`. The
+  child goes to its reaper as soon as it starts, and the launch only listens
+  for an exit within the window, so a request dropped during the window
+  (a client that disconnects) leaves the slot, the registration, the log and
+  the exit report with the reaper. The reaper waits for the exit, reports it,
+  logs a failure after the window with the tool ID and exit code only, deletes
+  the log and drops the registration.
+- **Surviving shutdown.** A diff app holds the user's edits: the working-tree
+  side is the real file, and with `--dir-diff` Git copies an edited temporary
+  file back only when the tool exits. So the launcher registers each
+  `git difftool` with `register_identity` (`External`/`Helper`, label
+  `diff app`) and `survives_shutdown`. `freeze_and_snapshot_ownership`
+  leaves survivors out of the roots that ownership cleanup kills, and a
+  standalone server's cleanup of its own descendants spares each survivor and
+  its descendants, matched by start time so a reused PID is not spared. In
+  `quiesce_for_update` the launcher's `shutdown()` runs before ownership is
+  frozen: it stops accepting launches and cancels the reapers without
+  signalling their children, and keeps their registrations. A Windows job
+  that forbids breakaway still ends the app with BiBCode.
+- **Client.** The menu is enabled for the primary environment only, the gate
+  the header's **Open in** picker uses, and for a server with the
+  `reviewDiffTools` capability. A remote thread, an older server, an untracked
+  file and an empty list each show their reason in the menu. The default is
+  the server's `defaultToolId`, then `diffToolLastChoice` in `ClientSettings`,
+  then the first tool; VS Code is left out of folder comparisons. A remote
+  environment's diff app would need a `DesktopBridge` command that downloads
+  both versions, which is out of scope.
+
 ## Pull Requests contract boundary
 
 `packages/contracts/src/pullRequests.ts` defines the repository-scoped Pull
@@ -2229,8 +2449,10 @@ remove the addressed message when `withdrawn` is true. Missing messages are
 not recreated by these updates.
 
 The web composer requests queued admission while a turn is running, the
-session is starting, or an earlier non-queued start delivery remains pending or
-sending. It decides this before the local dispatch/busy guard and creates no
+session is starting, an earlier non-queued start delivery remains pending or
+sending, or the snapshot's `compaction` is set (see
+[Context-limit recovery](#context-limit-recovery)), and it offers Stop while a
+compaction is unsettled. It decides this before the local dispatch/busy guard and creates no
 new local dispatch or optimistic message for the enqueue. The request-in-flight,
 provider-conflict, workspace, and environment guards still apply.
 Cards derive from the thread snapshot in its durable FIFO order, after the
@@ -2252,7 +2474,14 @@ menu selection, or Shift+Enter newline handling.
 Queue admission and delivery are owned by the Rust server. Admission resolves
 `queued: true` against the projected session: running or starting retains the
 flag and persists a queued outbox row; other states rewrite it to false and use
-normal pending delivery. The original request digest still owns command replay.
+normal pending delivery. While a compaction of the thread is unsettled,
+admission treats the thread as running and queues every start, also one sent
+without `queued` (an older client), so nothing is admitted ahead of the copy a
+recovery sends. The engine checks this again on its sequential worker, in the
+admission's own command, because a recovery can begin between the RPC's check
+and admission: a start admitted then becomes queued (outbox row, message and
+stored payload) with no turn-start event or pending marker. The original
+request digest still owns command replay.
 Admission stores the model selection even when the request omitted it, together
 with the turn's modes and provider route. Queued admission records the user
 message and complete delivery metadata without a turn-start event, pending turn,
@@ -2298,8 +2527,10 @@ clients rendering queue cards preserve it instead of sorting their timestamps.
 
 Automatic promotion requires an unheld head, a ready session, no pending/sending
 delivery, no running projected turn, no pending approval or user-input
-request, and no [checkpoint revert](#checkpoint-revert) of the thread in
-flight; the delivery worker also claims nothing for such a thread. The gate reads approvals and the latest durable user-input activity
+request, no [checkpoint revert](#checkpoint-revert) of the thread in
+flight, and no unsettled `thread_compactions` row (`requested`, `running` or
+`unresolved`, checked in SQL); the delivery worker also claims nothing for such
+a thread. The gate reads approvals and the latest durable user-input activity
 for each request, rather than the thread summary's input counter. A running
 turn placeholder continues to block the next promotion after provider acceptance
 releases the worker slot, until the provider's running and ready cycle settles
@@ -2320,7 +2551,10 @@ tab closed; unarchiving it resumes both. A delivery claimed before the panel
 closed is refused at the provider supervisor before any driver I/O and returns
 to pending, and accepting `thread.archive` for a panel interrupts its provider
 session on the server, so closing a panel stops its work without relying on the
-client's view of the session. Explicit Send now remains available under its client gate.
+client's view of the session. Explicit Send now remains available under its client gate,
+except while a compaction of the thread is unsettled: promotion of any kind is
+refused then, because a promoted start would sit ahead of a recovery's copy
+with a marker of its own.
 
 Pending start deliveries from older clients also wait while the session is
 running or starting; the SQLite claim repeats this check so a stale worker read
@@ -2444,8 +2678,11 @@ when acceptance was lost; Claude sending rows become uncertain.
 
 Provider assistant text preserves a native runtime `itemId` when the provider
 exposes one. The server converts it to a thread-namespaced orchestration
-message ID before persistence. Providers whose protocol does not expose a
-message identity use one deterministic assistant message per thread turn.
+message ID before persistence. Assistant text whose provider event carries no
+message identity uses one deterministic assistant message per thread turn.
+Provider reasoning never takes this path: it is its own entity (see
+[Provider reasoning](#provider-reasoning)), so a reasoning delta without an item
+id cannot become a second assistant message of the turn.
 
 Terminal turn projection completes every existing streaming assistant message
 for that thread and turn and never creates an empty assistant message. The
@@ -2469,6 +2706,47 @@ end, the durable error runtime retains thread-scoped recovery ownership: the
 next startup settles the exact stored message and turn identities without
 rewriting the original provider or session error.
 
+### Provider reasoning
+
+Claude thinking and Codex reasoning summaries reach the chat as reasoning
+entries, never as assistant text. Provider adapters emit `content.delta` with
+`streamKind` `reasoning_text` (Claude) or `reasoning_summary_text` (Codex) and
+an `item.completed` with `itemType: "reasoning"`; Codex's completion carries the
+whole summary, joined by blank lines, which is authoritative over what streamed.
+Raw Codex reasoning and Claude's redacted, omitted (empty) or subagent thinking
+produce no entry.
+
+- **Identity:** `reasoning:{thread}:item:{itemId}`, or
+  `reasoning:{thread}:turn:{turn}` when the event has no item. Claude's item is
+  `{messageId}:{blockIndex}`, one entry per thinking block.
+- **Coalescing:** the provider event pump buffers each entry and writes it at most
+  once per 250 ms window (`thread.reasoning.delta`), so an entry whose deltas
+  span D writes at most D / 250 ms + 1 streaming rows instead of one per delta.
+  Only the entry's own completion, its turn's `turn.completed` and the pump's end
+  write early. The first write keeps the time the first delta was buffered, so a
+  thought sorts before the tool call that followed it. An entry stops at 32 KiB,
+  cut at a UTF-8 boundary and ending with `…`; completion text is cut the same way.
+  Text that fits is kept whole: a window's write holds back the bytes the `…`
+  would need until a later delta shows whether the entry is cut.
+- **Persistence:** `thread.reasoning.delta` and `thread.reasoning.complete` become
+  `thread.reasoning-sent` events, projected by the message projector into
+  `projection_thread_reasoning` (migration 55) by the assistant-message rule: a
+  streaming write appends, a completion with text replaces the text and creates
+  a missing entry, and a completion without text only settles a streaming entry.
+  A text-less completion with no streaming entry appends no event. A revert drops
+  the reasoning of reverted turns, and a message-projection rebuild rebuilds it.
+- **Settlement:** a turn's completion and its interrupt deadline settle that
+  turn's streaming entries. When a session ends, every entry still streaming on
+  its thread settles, whatever its turn: at the pump's end of stream, after
+  `detach_session` reaps an aborted pump (`stop_session`, idle suspension,
+  shutdown), and once at startup over the reasoning table itself, before any
+  session starts.
+- **Wire:** the `orchestration.subscribeThread` snapshot carries a `reasoning`
+  array and patches diff it like any other array; clients that do not know the
+  field drop it, and a thread from an older server decodes to `[]`. Reasoning
+  never enters messages, the context handoff, the turn's assistant pointer or
+  checkpoints, and its text reaches no log, trace or profiler record.
+
 ### Context-window usage flow
 
 Provider-native usage data is normalized in the server runtime as canonical
@@ -2483,6 +2761,112 @@ valid context-window activity for each turn, so a newer valid reading replaces
 the prior valid reading for that turn. A malformed row cannot evict a valid row,
 and reverting a turn removes only that turn's projected usage; neither behavior
 creates a separate usage cache.
+
+### Context-limit recovery
+
+One server path compacts a conversation for three triggers: **Compact
+conversation** (`thread.compact`, `trigger: manual`), automatic recovery of a
+context-limit failure (`contextRecovery`), and the guard before a delivery
+(`guard`). The table `thread_compactions` is the source of truth for an
+unsettled compaction, as the outbox is for the queue: each row records the
+provider instance, kind and conversation it compacts (the resume cursor's
+session or thread id), its state (`requested`, `running` and `unresolved` are
+unsettled; then `completed`, `failed` or `interrupted`), `stop_requested`, the
+tagged turn, and for recovery the failed message (unique) or for the guard the
+guarded delivery (unique). Events `thread.compact-requested` and
+`thread.compacted` project the snapshot's `compaction` field
+(`{ trigger, state, failedMessageId? }`) while one is unsettled; a thread has at
+most one. A compaction is not a delivery: it has no outbox row and no user
+message, so it never becomes "Delivery uncertain".
+
+**Effect.** `thread.compact-requested` wakes the orchestration effects, which
+run the compaction off the sequential worker with the thread's turns reserved,
+like a checkpoint revert. The effect reopens a suspended session (recovery and
+the guard with the delivery's frozen launch, a manual compaction with the
+thread's saved runtime; never a new conversation), moves the row from
+`requested` to `running` with a conditional update so a Stop that came first
+wins, checks that the live session has the recorded instance and conversation
+(otherwise it settles `failed`, "The thread's provider or conversation changed,
+so it wasn't compacted."), and calls the driver's `compact` (see
+[Providers](./providers.md#conversation-compaction)). `NotStarted` settles
+`failed`; `Unknown` marks the row `unresolved`, with no retry. A request the
+driver has not answered within 60 seconds (or whose session ends meanwhile)
+counts as `Unknown`, so a provider that never answers cannot hold the thread.
+The event pump reports the tagged turn's start and end to the effect; once the
+turn is known, a Stop asked for before it existed interrupts it. Every bound
+counts from the request. The bound is 15 minutes: then the effect interrupts
+the turn and, if that is not confirmed within 30 seconds, stops the session it
+captured (`stop_session_if_current`); an `Unknown` request whose turn does not
+start within 60 seconds is ended the same way, and settles `failed` with
+"BiBCode couldn't confirm whether the conversation was compacted." Settlement
+(`thread.compaction.settle`, internal) runs in one transaction and wakes
+delivery.
+
+While a compaction is unsettled, a pending start's marker (a guarded message
+that waits, unsent, behind it) is neither bound nor deleted by an untagged
+running session update either, such as a turn the provider starts on its own:
+no turn can be that message's until the claim takes it.
+
+**Recovery.** A failed `turn.completed` passes its context-limit facts on the
+internal `thread.session.set` as `contextLimit`. In that transaction the engine
+starts a recovery only when every rule holds: the class is `context_limit`,
+`beforeOutput` is true and `compactable` is not false; the turn was started by
+a delivered start of a user message that is not itself a copy, has no
+recovery row and no failed or stopped guard; the provider supports compaction;
+the latest context-window reading tagged with the failed delivery's instance
+and conversation says `compactsAutomatically: true` (an untagged reading never
+matches, and a reading of a Claude instance whose environment sets
+`DISABLE_AUTO_COMPACT` or `DISABLE_COMPACT` is tagged `false`); and nothing else of the thread is unsettled, pending or sending
+(a steer written during the failing turn is input the provider reads next), and
+the thread is neither deleted nor an archived panel. An eligible failure
+projects the session `error` with `lastErrorClass: context_limit` and the text
+"The context window is full. Compacting the conversation, then sending your
+message again.", does **not** hold the queue (its rows follow the message that
+is sent again), and inserts a `requested` row. Otherwise nothing changes from
+an ordinary failure, and a copy that fails at the limit again says the
+conversation was already compacted once.
+
+On `completed` (with no Stop requested) the settlement admits a copy of the
+failed message as a pending start: command id
+`server:context-resend:<failedMessageId>`, message id `resend:<failedMessageId>`,
+the original's stored payload, frozen route and conversation, its attachment
+references recorded under the copy's command, a new delivery key, and
+`resendOf` on the message (`projection_thread_messages.resend_of_message_id`).
+Its own `thread.turn-start-requested` stamps it after the compaction turn, and
+it is the thread's only pending start, so it is delivered first and queued
+rows follow it. On `failed` the session reads `error` with
+`lastErrorClass: context_limit` and the compaction's failure, and the queue is
+held. On `interrupted` (Stop, before or during the compaction, even if it then
+completed) no copy is sent, `lastError` returns to the context-limit text so
+the manual action returns, and the queue is held.
+
+**Guard.** Before claiming a pending start, the delivery worker reads the
+latest context-window reading of the delivery's frozen instance and the
+conversation it will continue. When the provider reports `autoCompactTokens`
+and `compactsAutomatically: true` and `usedTokens >= autoCompactTokens - 0.05 *
+maxTokens`, it dispatches `thread.compact` with the delivery's command id
+(command id `server:context-guard:<deliveryCommandId>`, one per delivery), sets
+the delivery's detail to "Waiting for the conversation to be compacted.", and
+skips the claim. It skips a thread whose last completed compaction no ordinary
+turn has followed, because that reading predates it. `completed` or `failed`
+delivers the message; a failed guard makes it ineligible for recovery.
+`interrupted` moves it from `pending` to `failed` (a server-only transition)
+with "Not sent: you stopped the conversation compaction. Retry sends it.";
+Retry sends it without compacting again. Providers that do not report where
+they compact are not guarded.
+
+**Stop.** `thread.turn.interrupt` is admitted without a running turn. In its
+transaction a `requested` row settles `interrupted` (nothing was sent); a
+`running` or `unresolved` row gets `stop_requested`, the runtime interrupts its
+turn, and the row settles `interrupted` when that turn or its session ends.
+
+**Restart.** Startup reconciliation, which treats every provider session as
+ended when BiBCode stopped, settles every unsettled row `interrupted` before
+delivery starts: a recovery sends no copy and holds the queue, leaving the
+original's error and the manual action; a guard fails its message with
+"BiBCode restarted before the conversation was compacted. Retry sends it."
+Shutdown abandons a running compaction like a revert waiter; it stops with the
+orchestration effects, before the Profiler's teardown.
 
 ### Checkpoint revert
 
@@ -3262,20 +3646,31 @@ the typed `DeviceRpcError` union in `packages/contracts/src/device.ts`.
 
 | Method                     | Kind   | Scope                   | Payload and result                                                                                        |
 | -------------------------- | ------ | ----------------------- | --------------------------------------------------------------------------------------------------------- |
-| `device.subscribeCatalog`  | stream | `orchestration:read`    | The current catalog (per platform: availability and images; devices), then every change.                  |
+| `device.subscribeCatalog`  | stream | `orchestration:read`    | The current catalog (per platform: availability and images; devices in open order), then every change.    |
 | `device.refreshCatalog`    | unary  | `orchestration:read`    | `{}`; reruns every platform's discovery past its 30 s cache. Changes arrive on `device.subscribeCatalog`. |
-| `device.open`              | unary  | `orchestration:operate` | `{ platform, imageId }` → `{ deviceId }` at `starting`; boot progress arrives in the catalog.             |
+| `device.open`              | unary  | `orchestration:operate` | `{ platform, imageId, threadId? }` → `{ deviceId }` at `starting`, or the image's running device's id.    |
 | `device.close`             | unary  | `orchestration:operate` | `{ deviceId }`; returns once the device has ended (up to the 10 s stop timeout).                          |
 | `device.input`             | unary  | `orchestration:operate` | `{ deviceId, events }`: 1 to 64 touch, key, or text events. The client keeps one batch in flight.         |
 | `device.rotate`            | unary  | `orchestration:operate` | `{ deviceId, orientation }` → `{ orientation }` the device ended in; the catalog shows what it reports.   |
 | `device.subscribeFrames`   | stream | `orchestration:read`    | `{ deviceId }` → JPEG frames `{ seq, width, height, orientation, jpegBase64 }`, conflated to the latest.  |
 | `device.createMediaTicket` | unary  | `orchestration:read`    | `{ deviceId }` → `{ ticket, expiresAtMs }` for one H.264 media socket on this connection's channel.       |
 
-`device.refreshCatalog`, `device.close`, `device.input`, and `device.rotate` are
-in the profiler's `is_long_running` list, because they wait on discovery or the
-emulator: `emulator -list-avds` and `simctl` (with the Xcode probes on macOS), a
-stop (up to 10 s), a stalled input stream (up to 5 s), and reading back a
-rotation (about 2.5 s on Android, 1.2 s on iOS).
+`device.open`, `device.refreshCatalog`, `device.close`, `device.input`, and
+`device.rotate` are in the profiler's `is_long_running` list, because they wait
+on discovery or the emulator: `emulator -list-avds` and `simctl` (with the Xcode
+probes on macOS), `check_available`'s `simctl list` (up to 15 s), a stop (up to
+10 s), a stalled input stream (up to 5 s), and reading back a rotation (about
+2.5 s on Android, 1.2 s on iOS).
+
+`device.open`'s optional `threadId` names the root thread the device is for (a
+chat panel's host, else the thread). The server trims it, refuses a blank one
+with `DeviceInputError`, publishes it as the snapshot's `threadId`, and refuses
+a recently deleted thread with `DeviceNotFoundError`. Boot progress arrives in
+the catalog. An image whose device is starting, booting, or ready returns that
+device and keeps its owner; a stopping one fails with `DeviceNotReadyError`;
+a fifth live device fails with `DeviceLimitError`. Older servers ignore
+`threadId` and run one device per platform; older clients strip the snapshot's
+`threadId`, so neither needs a capability.
 
 `device.refreshCatalog` is newer than the other device methods, so servers that
 have it also advertise the `deviceCatalogRefresh` capability (decoded `false`

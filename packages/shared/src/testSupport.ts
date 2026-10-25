@@ -36,6 +36,7 @@ export function makeTestExecutionEnvironmentCapabilities(
     deviceCatalogRefresh: false,
     cliSessionHistory: false,
     previewTunnels: false,
+    reviewDiffTools: false,
     ...overrides,
   };
 }

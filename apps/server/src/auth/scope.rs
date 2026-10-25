@@ -143,6 +143,8 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         | "updater.check"
         | "updater.install"
         | "shell.openInEditor"
+        // Starts a program on the server's computer, as opening an editor does.
+        | "review.openDiffTool"
         | "sourceControl.cloneRepository"
         | "sourceControl.publishRepository"
         | "vcs.cancelClone"
@@ -175,7 +177,9 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         | "terminal.writeInput"
         | "subscribeTerminalEvents"
         | "subscribeTerminalMetadata" => Some(SCOPE_TERMINAL_OPERATE),
-        "review.getDiffPreview" => Some(SCOPE_REVIEW_WRITE),
+        "review.getDiffPreview" | "review.listDiffTools" | "review.readFileVersion" => {
+            Some(SCOPE_REVIEW_WRITE)
+        }
         "cloud.getRelayClientStatus" | "cloud.installRelayClient" => Some(SCOPE_RELAY_WRITE),
         "subscribeAuthAccess" => Some(SCOPE_ACCESS_READ),
         // Two-tier policy: a pending-pairing session confirms its OWN
@@ -257,6 +261,17 @@ mod tests {
         assert_eq!(
             required_scope("subscribeAuthAccess"),
             Some(SCOPE_ACCESS_READ)
+        );
+        for method in [
+            "review.getDiffPreview",
+            "review.listDiffTools",
+            "review.readFileVersion",
+        ] {
+            assert_eq!(required_scope(method), Some(SCOPE_REVIEW_WRITE), "{method}");
+        }
+        assert_eq!(
+            required_scope("review.openDiffTool"),
+            Some(SCOPE_ORCHESTRATION_OPERATE)
         );
         assert_eq!(
             required_scope("auth.confirmPairing"),

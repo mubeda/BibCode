@@ -44,7 +44,16 @@ cargo test -p bibcode-server --lib diagnostics::native::tests:: -j 2
 cargo test -p bibcode-server --lib diagnostics::resource_sampler::tests:: -j 2
 cargo test -p bibcode-server --lib diagnostics::monitor::tests:: -j 2
 cargo test -p bibcode-server --lib production::server_terminal::tests::embedded_host_cleanup_preserves_unmanaged_host_descendants -j 2 -- --exact
+cargo test -p bibcode-server --lib diagnostics::registry::tests::a_surviving_registration_is_no_shutdown_root -j 2 -- --exact
+cargo test -p bibcode-server --lib production::runtime::tests::quiesce_in_ -j 2
 ```
+
+A registration marked `survives_shutdown` (a diff app opened through
+**Open with**) must never be a shutdown root, and a standalone server's
+descendant sweep must spare it and its descendants while still ending an
+ordinary registered helper. The quiesce tests check both on Linux, where
+cleanup signals through a pidfd; on macOS cleanup ends nothing, so only the
+survivors' half applies there.
 
 Construction must leave the native process table empty. The first diagnostics
 read starts the background sampler; its first sample must discover the current
@@ -342,7 +351,24 @@ cargo test -p bibcode-server --test production_provider_runtime provider_session
 cargo test -p bibcode-server codex::runtime -j 2
 cargo test -p bibcode-server --test repositories -j 2
 cargo test -p bibcode-server migrations -j 2
+cargo test -p bibcode-server --lib thread_compaction -j 2
+cargo test -p bibcode-server --lib compaction -j 2
+cargo test -p bibcode-server --lib provider_turn_failure -j 2
 ```
+
+Context-limit recovery, the guard and **Compact conversation** share these
+seams (`thread_compaction_tests.rs` drives the engine and delivery worker, the
+`provider_runtime` compaction tests drive the effect with the fake driver, and
+`provider::claude` covers the tagged `/compact` turn and failure facts; the
+Profiler's `provider.compaction` and `provider.turn-failed` records are checked
+through a test-only per-thread capture in `provider_turns.rs`). The
+failure cannot be produced on demand with auto-compaction on, so live
+validation is manual: with `DISABLE_AUTO_COMPACT=1` on a Claude instance, a
+context-limit stop shows today's error and no recovery; **Compact
+conversation** compacts through `thread.compact` and shows the step; a thread
+over the guard threshold shows "Waiting for the conversation to be compacted."
+then the compaction, then the answer; Stop during that compaction leaves the
+message failed with Retry.
 
 Deliver a queued message at completion and let its turn run past the idle timeout;
 the session must stay live until one idle timeout after that turn completes.
@@ -654,6 +680,50 @@ If the environment cannot launch the server, packaged app, listener, or provider
 subprocess fixture, record that evidence as unavailable with its exact blocker
 and assign the missing run to a capable host. Never infer a packaged or native
 provider pass from static checks or unit tests.
+
+### Provider reasoning rows
+
+Claude thinking and Codex reasoning summaries are chat reasoning entries
+([Provider reasoning](../architecture/rpc-and-orchestration.md#provider-reasoning)).
+For a change to provider reasoning, its persistence, or the Thinking rows, run
+the server seams (the coalescer and settlement tests drive the real event pump
+on a paused clock), then the client and renderer seams:
+
+```sh
+cargo test -p bibcode-server --lib reasoning
+cargo test -p bibcode-server --test provider_claude --test provider_codex --test orchestration --test production_provider_runtime
+vp test run packages/contracts/src/orchestration.test.ts packages/client-runtime/src/state/reasoning.test.ts packages/client-runtime/src/state/threadReducer.test.ts packages/client-runtime/src/state/threadStreamParity.test.ts
+cd apps/web && vp test run --project unit src/components/chat/MessagesTimeline.logic.test.ts src/components/chat/MessagesTimeline.test.tsx src/components/chat/timelineScrollAnchoring.test.tsx
+```
+
+Component tests replace the virtualized list with a mock, so they cannot show
+scrolling. The packaged `chat-reasoning-rows.e2e.ts` runs on the real list: a
+Claude prompt containing `[[reasoning]]` makes the fixture stream a thinking
+block over about two seconds, a tool call and an answer long enough to overflow
+(`[[reasoning:slow]]` thinks for about ten seconds). The spec checks the
+anchored turn's end while it streams, the fold and its **+N previous steps** row,
+expanding a finished thought away from the end and a streaming thought at the
+end, and the end while a thought streams into a thread reopened at its end. It
+presses each Thinking header as a pointer does, with a `pointerdown` before the
+click, and after a long prompt the expanded slow thought grows the anchored
+turn past the visible timeline while the spec checks that its end stays in view. Each
+turn's thought has its own row id and each answer names its prompt, so the spec
+tells the turns apart. Check the fixture frames, then run the
+spec alone with `BIBCODE_E2E_SPEC=./specs/chat-reasoning-rows.e2e.ts`:
+
+```sh
+node scripts/run-local-vp.mjs test run apps/desktop/e2e/support/provider-shims.test.ts
+vp run test:ui:desktop:build
+vp run test:ui:desktop
+```
+
+A live check needs a real Claude CLI and model and a real Codex session. Record
+whether the Claude probe line reports `thinking_display`, that Thought rows sit
+in order around tool calls and fold with the turn, that the working row shows
+the latest thought, and that the number of `thread.reasoning-sent` events in
+SQLite stays near one per 250 ms of thinking rather than one per delta. Put a
+sentinel phrase in a prompt that the model will think about and confirm it is
+absent from `server.log`, the provider operational log and the profiler JSONL.
 
 ### Selecting other focused coverage
 
@@ -2700,6 +2770,16 @@ sizes. Cover relevant:
   [read-only list/detail/files smoke](#pull-requests-web-shell-validation) with
   route, selected tab and real patch evidence;
 - thread creation, switching, persistence, and streaming;
+- the Diff panel's [Compare view](#diff-compare-scenario);
+- Mermaid diagrams in light and dark: a ` ```mermaid ` block in a streamed
+  reply shows its source until its closing fence arrives and then draws in
+  the code-block card with **Show source** and **Copy**; an invalid diagram
+  keeps its source under a line-numbered error; a drawn diagram recolors on a
+  theme switch without flashing its source; a selection copied from inside a
+  diagram pastes as its fenced source; the clipped Proposed Plan preview keeps
+  a fence it cut open as source; and a diagram drawing above the line being
+  read in the chat leaves that line in place (the maintained Mermaid scenario
+  below automates the rendered-file and timeline checks);
 - the [durable message queue](#durable-message-queue): FIFO cards, native steer,
   Cancel restoration, reload and restart persistence, promotion, Stop drain,
   holds, and unsupported-provider explanations;
@@ -2869,6 +2949,53 @@ by the native platform page, set
 `vp run test:ui:desktop` invocation. Retain its named `pierre-*.png` screenshots
 with the other bounded UI artifacts; do not put fixture state or screenshots in
 the repository.
+
+The maintained Mermaid scenario (`apps/desktop/e2e/specs/mermaid-diagrams.e2e.ts`)
+runs under the packaged app's production CSP and is part of the default suite.
+It writes valid, invalid and hostile diagram files into the fixture project and
+opens each in the Files rendered view: the valid diagram draws and recolors on
+a theme switch without its SVG being replaced, the invalid one shows its
+line-numbered error, and the hostile one leaves no `a`, `image`,
+`foreignObject`, `style`, `use` or `script` under `.chat-markdown-mermaid`, no
+`/mermaid-probe/` entry in `performance.getEntriesByType("resource")` (a
+same-origin load raises no CSP event) and no `securitypolicyviolation` event.
+The fixture Codex provider then answers its diagram prompts in the timeline: a
+**Show source** swap on a diagram inside the first visible row above the top
+edge, and on one in a row wholly above the viewport, moves a reading-anchor
+paragraph by at most 1 px; a short reply's diagram drawing under its sent
+message leaves that message at the sent-row offset; and selecting an earlier
+message with the minimap keyboard lands it at the minimap's offset past that
+diagram and keeps it there (`mermaid-timeline-minimap-landing.json`). After a
+reply with 101 diagrams, reopening the chat draws the evicted diagram (the
+reply's last, which the queue drew first) again through the queue, and the
+reopened chat settles at its end with the reply's last line in view and still.
+The scenario keeps a per-sample trace of the last line, on a timer and after
+each painted frame, as `mermaid-timeline-evicted-remount.json`. A second reply
+of 101 diagrams then evicts every earlier one; scrolling up remounts the rows
+reply, whose diagram shows its source and draws again above the message being
+read, which stays within 1 px on every painted frame
+(`mermaid-timeline-cold-draw.json`). Last, the fixture provider streams the
+same reply twice, one delta every 300 ms, first with the diagram's source in a
+plain code block and then as a diagram that draws at the end while more text
+streams: both end resting at the same distance from the end with the last line
+in view (`mermaid-timeline-streaming-follow.json` holds both replies' gaps).
+Open items of the diagram merge gate, which the traces record but the
+scenario does not assert: when the evicted diagram redraws before the list's
+first scroll to the end, the end converges in steps for a few painted frames
+after it first shows; a diagram that draws at the end grows without the list
+following it, so the list rests about one diagram-height change further from
+the end until the next delta lands, and a reopened chat with two evicted
+diagrams near its end can settle that far short of it. The reading-line
+checks sample painted frames, so the scenario fails early in a webview that
+paints none.
+Its other page scripts wait on timers rather than animation frames, which stop
+in an occluded macOS webview; such a webview also throttles timers, so drawing
+the 101 diagrams can take minutes there. Rerun it alone with
+`BIBCODE_E2E_SPEC=./specs/mermaid-diagrams.e2e.ts`, and retain its
+`mermaid-*.png` screenshots with the other UI artifacts. In browser mode, check
+the same fixture files served by a release `bibcode` server in Chromium and
+Safari: the console shows no CSP violation and the server log no
+`/mermaid-probe/` request.
 
 At final packaged shutdown, inspect the raw worker and server logs. Provider and
 terminal owners, operational logs, orchestration, and the SQLite worker must all
@@ -3082,6 +3209,56 @@ the value); whether Codex's `workspace-write` sandbox makes `"$BROWSER"` print
 the address instead of opening it; a session older than 8 hours falls back to
 printing.
 
+### Diff Compare scenario
+
+Run this in the packaged application against a disposable repository that has
+committed files, a working-tree edit, an untracked file, a deleted file, a
+rename, a modified, an added and a deleted binary file, and a branch with
+commits ahead of its base. Let one
+agent turn edit two files so the thread has a turn with checkpoints.
+
+1. Open the Diff panel. **Changes** is selected and matches the stacked view.
+   Choose **Split**, then **Compare**.
+2. For **Working tree**, **Branch changes** and the turn, select files from the
+   list with the pointer and with Up and Down. Each changed file shows its
+   previous and current versions side by side, aligned and scrolling together,
+   and the changed lines appear before the full file finishes loading. The
+   turn shows its changes, never "No net changes".
+3. Confirm the explained states: the added and deleted files show their one
+   side, the rename, each binary file (modified, added and deleted) and a
+   mode-only change each show their message, and the untracked file shows as
+   added. Edit the untracked file without changing its line count: Compare
+   shows the new text.
+4. Filter by name and by status. The count reads "N of M files", a filter with
+   no match offers **Clear filters**, and **Esc** in the name field clears it.
+5. Choose **Changes only**, type `7` in **Context lines**, and confirm one
+   patch request follows after typing stops. Use **Next change**,
+   **Previous change**, F7 and Shift+F7, and confirm both ends say "No more
+   changes."
+6. Edit the selected working-tree file outside BiBCode and confirm Compare
+   picks up the new version.
+7. Quit and relaunch the app. Compare, Split, **Changes only** and 7 context
+   lines are all restored, and the selected file is reselected.
+8. **Open with**, with the platform's diff apps installed (Beyond Compare and
+   FileMerge on macOS, Meld and KDiff3 on Linux, WinMerge on Windows):
+   - the menu lists them with the default marked, and `git config
+     diff.guitool <tool>` moves the default to that tool;
+   - in Compare, open the selected file, the deleted file and the rename in
+     each scope, and **All files in** for the turn; the app shows the right
+     two versions. In Changes, the toolbar's menu opens every file;
+   - the untracked file's menu says to stage it, and a thread in an SSH
+     environment says where it runs;
+   - set `difftool.broken.cmd` to `exit 3` and choose it: the alert shows Git's
+     message and **Copy command**, whose command reproduces the failure in a
+     terminal;
+   - add a project whose folder is a subdirectory of its repository, edit a
+     file in it, and confirm Compare shows it in full and Open with opens it;
+   - with a diff app still open, quit the desktop app, and separately stop a
+     standalone server from its terminal with Ctrl+C: the diff app stays
+     open.
+
+Record screenshots at the normal and minimum window sizes, in light and dark.
+
 ## Profiler crash smoke
 
 Run this on every native platform when a change touches the
@@ -3182,8 +3359,10 @@ for the other
 ```sh
 cargo test -p bibcode-server --lib device:: -j 2
 cargo test -p bibcode-server --lib connect_mcp -j 2
+cargo test -p bibcode-server --lib a_chat_panels_launch_names_its_host_thread -j 2
 cargo test -p bibcode-server --test device_rpc --test device_media_socket --test e2ee_ws --test production_connect_mcp -j 2
-vp test run packages/contracts/src/device.test.ts packages/client-runtime/src/device apps/web/src/components/device apps/web/src/components/settings/DevicePreviewsSection.test.tsx
+cargo test -p bibcode-server --test production_orchestration_effects thread_deletion -j 2
+vp test run packages/contracts/src/device.test.ts packages/client-runtime/src/device apps/web/src/components/device apps/web/src/components/settings/DevicePreviewsSection.test.tsx apps/web/src/rightPanelStore.test.ts
 ```
 
 The fakes stand in for `emulator`, `adb`, the emulator gRPC service, and
@@ -3195,7 +3374,9 @@ Run the
 their client change. Everything below needs a real Android SDK.
 
 **Host.** Use a server host with the Android SDK (`emulator` and
-`platform-tools`), at least one AVD, and hardware acceleration: KVM on Linux
+`platform-tools`), at least two AVDs (five images for the limit in step 9:
+five AVDs, or on a macOS host AVDs and `Shutdown` simulators that make
+five), and hardware acceleration: KVM on Linux
 (`emulator -accel-check` succeeds), the Hypervisor framework on macOS, or
 WHPX/AEHD on Windows. Record the SDK path, `emulator -version`, `adb version`,
 the AVD's name, API level, and ABI, and the platform page's acceleration
@@ -3322,27 +3503,51 @@ Record each client's OS, app or browser version, and profile type.
    device, the fifth video socket is refused with `limit`; that window retries
    three times within a few seconds and then shows still images. Close one of
    the other four and reopen the fifth window's Device panel: it shows video.
-9. **Agents.** In a thread on the environment, ask the agent to list devices,
-   take a screenshot, and close the device. `device_screenshot` returns a PNG
-   no wider than 1080 px. Turn the setting off: the agent's next `device_*`
-   call fails with the "Device previews are off" error.
-10. **Stop and cleanup.** **Stop** the device. Within 10 s the pill shows
+9. **Several devices.** Open two threads on two worktrees of one project, each
+   with its own Device panel. Start a different AVD in each. Switching threads
+   shows each thread's own device without picking it again; the picker lists
+   the other one as "— Running in <thread title>", and picking it shows it with
+   "Started in <thread title>." under the toolbar. Typing in one device reaches
+   only it. Open a second desktop window on the other thread: both windows show
+   video at once. Stop the other thread's device from the first thread: the
+   panel asks first, and **Cancel** leaves it running. Start AVDs until four
+   devices run (any mix with iOS on a macOS host), then pick the fifth image:
+   **Start** is disabled with "Four devices are running. Stop one to start
+   another."
+   Delete the second thread: its emulator is reaped (the platform page's process
+   check) while the first thread's keeps running, and the first thread's panel,
+   if it showed the deleted thread's device, shows it stopped with **Start**
+   enabled. Record the host's free memory and CPU load with four devices
+   running in the execution report.
+10. **Agents.** In a thread on the environment, ask the agent to list devices,
+    take a screenshot, and close the device. `device_screenshot` returns a PNG
+    no wider than 1080 px. With two threads' agents each opening a different
+    AVD, each `device_screenshot` without a `deviceId` returns its own
+    thread's device, `device_list` marks it `thisThread`, and one agent's
+    `device_close` of the other's device is refused with "… was started by
+    another thread. Ask the user to stop it." In a chat panel of a thread whose
+    Device panel started a device, the panel's agent takes a screenshot of that
+    device without a `deviceId` and closes it. Turn the setting off: the
+    agent's next `device_*` call fails with the "Device previews are off"
+    error.
+11. **Stop and cleanup.** **Stop** the device. Within 10 s the pill shows
     **Stopped**, the platform page's process check finds no `emulator` or
     `qemu-system` process, its discovery file is gone, and
     `adb forward --list` is empty (BiBCode leaves a stopping device's
     scrcpy forward to adb, which drops it with the device, so this checks
-    that adb does). Start the device again, then turn the
-    setting off: the confirmation names the running device, and after it
-    the same checks pass and the panel shows how to turn previews on. Start
-    it once more and stop the server (or quit the desktop that hosts it):
-    the same checks pass after shutdown.
-11. **Crash.** Start a device and kill the `emulator` process
+    that adb does). Start two devices, then turn the
+    setting off: the confirmation names the running devices, and after it
+    the same checks pass for each and the panel shows how to turn previews on.
+    Start them once more and stop the server (or quit the desktop that hosts
+    it): the same checks pass after shutdown.
+12. **Crash.** Start a device and kill the `emulator` process
     (or its `qemu-system` child) from a shell. Within a few seconds the pill
     shows **Failed:** with the reason, and with the profiler on
     `profiler findings --kind subprocess.crash --json` lists a finding
     labelled `android-emulator`. Record
     `profiler events --kind device.lifecycle --json` across the run: `start`,
-    `ready`, `stop`, and `fail` with `failureKind` `exited`.
+    `ready`, `stop`, and `fail` with `failureKind` `exited`, each with
+    `running`, the count of live devices after it.
 
 Record the results in the execution report's device previews section and mark
 each native verification item confirmed or corrected. A correction is a code
@@ -3387,6 +3592,11 @@ BiBCode or Simulator: they find it busy. They fail at once with "Xcode's first
 launch is pending" when `xcodebuild -checkFirstLaunchStatus` exits non-zero,
 as after an Xcode update whose CoreSimulator is not installed yet; open Xcode
 once or run `sudo xcodebuild -runFirstLaunch`, then run them again.
+
+The opt-in tests boot one simulator. Several simulators in one server
+process, and the one state poll that watches them, are first proven by the
+packaged-app procedure's two-simulator step; the fake-runner tests in
+`device::ios` cover the poll's stale-result rules.
 
 Then run the packaged-app procedure in
 [macOS iOS Simulator previews](./macos-desktop.md#ios-simulator-previews).

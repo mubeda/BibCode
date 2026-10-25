@@ -75,6 +75,10 @@
       "types": "./src/state/pullRequests.ts",
       "default": "./src/state/pullRequests.ts"
     },
+    "./state/reasoning": {
+      "types": "./src/state/reasoning.ts",
+      "default": "./src/state/reasoning.ts"
+    },
     "./state/models": {
       "types": "./src/state/models.ts",
       "default": "./src/state/models.ts"

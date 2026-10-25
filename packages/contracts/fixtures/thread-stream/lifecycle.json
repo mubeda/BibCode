@@ -1,6 +1,6 @@
 {
   "final": {
-    "snapshotSequence": 21,
+    "snapshotSequence": 25,
     "thread": {
       "activities": [
         {
@@ -22,7 +22,7 @@
           "payload": {
             "step": 2
           },
-          "sequence": 13,
+          "sequence": 17,
           "summary": "working",
           "tone": "info",
           "turnId": "turn-1"
@@ -114,6 +114,24 @@
           "updatedAt": "2026-07-10T10:01:10.000Z"
         }
       ],
+      "reasoning": [
+        {
+          "createdAt": "2026-07-10T10:01:16.000Z",
+          "id": "reasoning:t1:item:r1",
+          "streaming": false,
+          "text": "Weighing options",
+          "turnId": "turn-1",
+          "updatedAt": "2026-07-10T10:01:18.000Z"
+        },
+        {
+          "createdAt": "2026-07-10T10:01:19.000Z",
+          "id": "reasoning:t1:item:r2",
+          "streaming": false,
+          "text": "**Plan**\n\nRead the file",
+          "turnId": "turn-1",
+          "updatedAt": "2026-07-10T10:01:19.000Z"
+        }
+      ],
       "runtimeMode": "approval-required",
       "session": {
         "activeTurnId": null,
@@ -156,6 +174,7 @@
       },
       "projectId": "p1",
       "proposedPlans": [],
+      "reasoning": [],
       "runtimeMode": "full-access",
       "session": null,
       "title": "Thread",
@@ -298,6 +317,110 @@
       "kind": "patch",
       "patch": {
         "arrays": {
+          "reasoning": {
+            "changes": [
+              [
+                0,
+                {
+                  "createdAt": "2026-07-10T10:01:16.000Z",
+                  "id": "reasoning:t1:item:r1",
+                  "streaming": true,
+                  "text": "Weighing ",
+                  "turnId": "turn-1",
+                  "updatedAt": "2026-07-10T10:01:16.000Z"
+                }
+              ]
+            ],
+            "length": 1
+          }
+        },
+        "set": {},
+        "unset": []
+      },
+      "snapshotSequence": 11
+    },
+    {
+      "kind": "patch",
+      "patch": {
+        "arrays": {
+          "reasoning": {
+            "changes": [
+              [
+                0,
+                {
+                  "createdAt": "2026-07-10T10:01:16.000Z",
+                  "id": "reasoning:t1:item:r1",
+                  "streaming": true,
+                  "text": "Weighing options",
+                  "turnId": "turn-1",
+                  "updatedAt": "2026-07-10T10:01:17.000Z"
+                }
+              ]
+            ],
+            "length": 1
+          }
+        },
+        "set": {},
+        "unset": []
+      },
+      "snapshotSequence": 12
+    },
+    {
+      "kind": "patch",
+      "patch": {
+        "arrays": {
+          "reasoning": {
+            "changes": [
+              [
+                0,
+                {
+                  "createdAt": "2026-07-10T10:01:16.000Z",
+                  "id": "reasoning:t1:item:r1",
+                  "streaming": false,
+                  "text": "Weighing options",
+                  "turnId": "turn-1",
+                  "updatedAt": "2026-07-10T10:01:18.000Z"
+                }
+              ]
+            ],
+            "length": 1
+          }
+        },
+        "set": {},
+        "unset": []
+      },
+      "snapshotSequence": 13
+    },
+    {
+      "kind": "patch",
+      "patch": {
+        "arrays": {
+          "reasoning": {
+            "changes": [
+              [
+                1,
+                {
+                  "createdAt": "2026-07-10T10:01:19.000Z",
+                  "id": "reasoning:t1:item:r2",
+                  "streaming": false,
+                  "text": "**Plan**\n\nRead the file",
+                  "turnId": "turn-1",
+                  "updatedAt": "2026-07-10T10:01:19.000Z"
+                }
+              ]
+            ],
+            "length": 2
+          }
+        },
+        "set": {},
+        "unset": []
+      },
+      "snapshotSequence": 14
+    },
+    {
+      "kind": "patch",
+      "patch": {
+        "arrays": {
           "messages": {
             "changes": [
               [
@@ -343,7 +466,7 @@
         },
         "unset": []
       },
-      "snapshotSequence": 11
+      "snapshotSequence": 15
     },
     {
       "kind": "patch",
@@ -371,7 +494,7 @@
         "set": {},
         "unset": []
       },
-      "snapshotSequence": 12
+      "snapshotSequence": 16
     },
     {
       "kind": "patch",
@@ -388,7 +511,7 @@
                   "payload": {
                     "step": 2
                   },
-                  "sequence": 13,
+                  "sequence": 17,
                   "summary": "working",
                   "tone": "info",
                   "turnId": "turn-1"
@@ -401,7 +524,7 @@
         "set": {},
         "unset": []
       },
-      "snapshotSequence": 13
+      "snapshotSequence": 17
     },
     {
       "kind": "patch",
@@ -429,7 +552,7 @@
         "set": {},
         "unset": []
       },
-      "snapshotSequence": 14
+      "snapshotSequence": 18
     },
     {
       "kind": "patch",
@@ -458,7 +581,7 @@
         },
         "unset": []
       },
-      "snapshotSequence": 15
+      "snapshotSequence": 19
     },
     {
       "kind": "patch",
@@ -502,7 +625,7 @@
         },
         "unset": []
       },
-      "snapshotSequence": 16
+      "snapshotSequence": 20
     },
     {
       "kind": "patch",
@@ -545,7 +668,7 @@
         },
         "unset": []
       },
-      "snapshotSequence": 17
+      "snapshotSequence": 21
     },
     {
       "kind": "patch",
@@ -601,7 +724,7 @@
         },
         "unset": []
       },
-      "snapshotSequence": 18
+      "snapshotSequence": 22
     },
     {
       "kind": "patch",
@@ -612,7 +735,7 @@
         },
         "unset": []
       },
-      "snapshotSequence": 19
+      "snapshotSequence": 23
     },
     {
       "kind": "patch",
@@ -623,7 +746,7 @@
         },
         "unset": []
       },
-      "snapshotSequence": 20
+      "snapshotSequence": 24
     }
   ]
 }

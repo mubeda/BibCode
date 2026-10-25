@@ -1587,6 +1587,9 @@ pub struct ClaudeProviderRuntime {
     turn_input_cancellation: CancellationToken,
     delivery_acknowledgement_cancellation: CancellationToken,
     active_assistant_item_id: Option<String>,
+    /// Root thinking blocks still open, by the root message that holds them and their index. A
+    /// subagent's blocks share the root's indexes, so the message identity tells them apart.
+    open_reasoning_blocks: BTreeSet<(Option<String>, u64)>,
     pending_approvals: BTreeMap<String, PendingApproval>,
     pending_user_inputs: BTreeMap<String, PendingUserInput>,
     in_flight_tools: BTreeMap<String, InFlightTool>,
@@ -1621,6 +1624,15 @@ pub struct ClaudeProviderRuntime {
     saw_init: bool,
     /// Why nothing more of this process is shown: a copy came up under another session ID.
     halted: Option<&'static str>,
+    /// The compaction BiBCode asked for that the open turn runs; its `turn.started` and
+    /// `turn.completed` carry the id.
+    turn_compaction_id: Option<String>,
+    /// The compaction turn's `turn.started`, emitted ahead of the next frame Claude sends, so it
+    /// precedes everything Claude reports for the compaction.
+    pending_turn_started: Option<CanonicalEvent>,
+    /// The open turn produced assistant text, a tool call or a compaction. A context-limit
+    /// failure before any is one compacting can fix by sending the message again.
+    turn_produced_output: bool,
 }
 
 /// A copy whose first `system/init` names a session ID BiBCode did not assign: Claude would
@@ -1652,6 +1664,7 @@ impl ClaudeProviderRuntime {
             turn_input_cancellation: CancellationToken::new(),
             delivery_acknowledgement_cancellation: CancellationToken::new(),
             active_assistant_item_id: None,
+            open_reasoning_blocks: BTreeSet::new(),
             pending_approvals: BTreeMap::new(),
             pending_user_inputs: BTreeMap::new(),
             in_flight_tools: BTreeMap::new(),
@@ -1672,6 +1685,9 @@ impl ClaudeProviderRuntime {
             expected_session_id: None,
             saw_init: false,
             halted: None,
+            turn_compaction_id: None,
+            pending_turn_started: None,
+            turn_produced_output: false,
         }
     }
 
@@ -1815,6 +1831,7 @@ impl ClaudeProviderRuntime {
         self.turn_input_cancellation = CancellationToken::new();
         self.token_usage.start_turn();
         self.active_assistant_item_id = None;
+        self.open_reasoning_blocks.clear();
         // Scoped to the turn: a retry observed two turns ago must not be
         // reported as the cause of this one's failure.
         self.last_api_error = None;
@@ -1822,6 +1839,9 @@ impl ClaudeProviderRuntime {
         self.current_turn_id = Some(input.turn_id.clone());
         self.turn_open = true;
         self.turn_input_awaiting_replay = None;
+        self.turn_compaction_id = None;
+        self.pending_turn_started = None;
+        self.turn_produced_output = false;
         vec![self.event(
             "turn.started",
             Some(input.turn_id),
@@ -1829,6 +1849,31 @@ impl ClaudeProviderRuntime {
             None,
             json!({ "input": input.input }),
         )]
+    }
+
+    /// Opens the turn that runs the compaction BiBCode asked for with `/compact`. Its
+    /// `turn.started`, tagged with `compaction_id`, is emitted ahead of the next frame.
+    pub(crate) fn begin_compaction_turn(&mut self, turn_id: String, compaction_id: String) {
+        let mut events = self.start_turn(TurnInput {
+            turn_id,
+            input: "/compact".to_owned(),
+        });
+        let mut started = events.pop();
+        if let Some(started) = started.as_mut() {
+            started.payload["compactionId"] = json!(compaction_id);
+        }
+        self.turn_compaction_id = Some(compaction_id);
+        self.pending_turn_started = started;
+    }
+
+    /// The compaction's `/compact` was never written: its turn closes unseen, unless its
+    /// `turn.started` already went out with an earlier frame.
+    pub(crate) fn abandon_compaction_turn(&mut self) {
+        if self.pending_turn_started.take().is_some() {
+            self.stop_turn_input();
+            self.turn_open = false;
+            self.turn_compaction_id = None;
+        }
     }
 
     pub(crate) fn turn_steer_cancellation(
@@ -1936,9 +1981,18 @@ impl ClaudeProviderRuntime {
         } else {
             self.start_provider_turn(value)
         };
+        let pending_turn_started = self.pending_turn_started.take();
         let turn_id = self.current_turn_id.clone();
         let mut output = self.handle_non_usage_raw_value(value, emitted_at_ms, authenticated_hook);
         output.background_tasks = background_tasks;
+        if self.turn_open
+            && output
+                .events
+                .iter()
+                .any(|event| turn_output_event(&event.event_type) && event.turn_id == turn_id)
+        {
+            self.turn_produced_output = true;
+        }
         if !provider_turn.is_empty() {
             output.events.splice(0..0, provider_turn);
         }
@@ -1946,6 +2000,9 @@ impl ClaudeProviderRuntime {
             output
                 .events
                 .insert(0, self.token_usage_event(turn_id, usage));
+        }
+        if let Some(started) = pending_turn_started {
+            output.events.insert(0, started);
         }
         output
     }
@@ -2684,19 +2741,47 @@ impl ClaudeProviderRuntime {
                     }),
                 )]
             }
+            // Reasoning belongs to the root conversation only: a subagent frame never starts,
+            // extends or completes an entry. Omitted display streams one empty delta per block,
+            // which says nothing, so it emits nothing.
+            StreamEvent::ContentBlockStart {
+                index,
+                content_block: ContentBlock::Thinking {},
+            } => {
+                if parent_tool_use_id.is_none() {
+                    self.open_reasoning_blocks
+                        .insert((self.active_assistant_item_id.clone(), index));
+                }
+                Vec::new()
+            }
+            StreamEvent::ContentBlockStart {
+                content_block:
+                    ContentBlock::RedactedThinking {} | ContentBlock::Text {} | ContentBlock::Other,
+                ..
+            } => Vec::new(),
             StreamEvent::ContentBlockDelta {
-                index: _,
+                index,
                 delta: ContentBlockDelta::ThinkingDelta { thinking },
-            } => vec![self.event(
-                "content.delta",
-                self.current_turn_id.clone(),
-                None,
-                None,
-                json!({
-                    "streamKind": "reasoning_text",
-                    "delta": thinking,
-                }),
-            )],
+            } => {
+                if parent_tool_use_id.is_some() || thinking.is_empty() {
+                    return Vec::new();
+                }
+                vec![self.item_event(
+                    "content.delta",
+                    self.current_turn_id.clone(),
+                    None,
+                    None,
+                    json!({
+                        "streamKind": "reasoning_text",
+                        "delta": thinking,
+                    }),
+                    self.reasoning_item_id(index),
+                )]
+            }
+            StreamEvent::ContentBlockDelta {
+                delta: ContentBlockDelta::SignatureDelta {} | ContentBlockDelta::Other,
+                ..
+            } => Vec::new(),
             StreamEvent::ContentBlockDelta {
                 index: _,
                 delta: ContentBlockDelta::TextDelta { text },
@@ -2726,6 +2811,20 @@ impl ClaudeProviderRuntime {
                 Vec::new()
             }
             StreamEvent::ContentBlockStop { index } => {
+                if parent_tool_use_id.is_none()
+                    && self
+                        .open_reasoning_blocks
+                        .remove(&(self.active_assistant_item_id.clone(), index))
+                {
+                    return vec![self.item_event(
+                        "item.completed",
+                        self.current_turn_id.clone(),
+                        None,
+                        None,
+                        json!({ "itemType": "reasoning" }),
+                        self.reasoning_item_id(index),
+                    )];
+                }
                 let Some(tool) = self.find_streaming_tool_mut(parent_tool_use_id.as_deref(), index)
                 else {
                     return Vec::new();
@@ -2838,13 +2937,22 @@ impl ClaudeProviderRuntime {
                 self.last_assistant_error.as_ref(),
                 self.last_api_error.as_deref(),
             );
-            crate::diagnostics::profiler::provider_turns::record_turn_failure(
-                "claude",
-                message.terminal_reason.as_deref(),
-                failure.error_class,
-            );
             payload["errorMessage"] = json!(failure.message);
             payload["errorClass"] = json!(failure.error_class);
+            if let Some(reason) = message
+                .terminal_reason
+                .as_deref()
+                .map(str::trim)
+                .filter(|reason| !reason.is_empty())
+            {
+                payload["providerReason"] = json!(reason);
+            }
+            if failure.error_class == super::failure::CONTEXT_LIMIT_ERROR_CLASS {
+                payload["beforeOutput"] = json!(!self.turn_produced_output);
+                if let Some(compactable) = failure.compactable {
+                    payload["compactable"] = json!(compactable);
+                }
+            }
         } else if interrupted {
             // An interrupted turn carries a description but is not a failure, so it is
             // deliberately left unclassified rather than labelled `unknown`.
@@ -2855,6 +2963,9 @@ impl ClaudeProviderRuntime {
                 }
             });
             payload["errorMessage"] = json!(error_message);
+        }
+        if let Some(compaction_id) = self.turn_compaction_id.take() {
+            payload["compactionId"] = json!(compaction_id);
         }
         events.push(self.event(
             "turn.completed",
@@ -2929,6 +3040,13 @@ impl ClaudeProviderRuntime {
             result,
             tool.stopped && !tool.completed,
         ))
+    }
+
+    /// The provider item of the root thinking block at `index`: one reasoning entry per block.
+    fn reasoning_item_id(&self, index: u64) -> Option<String> {
+        self.active_assistant_item_id
+            .as_ref()
+            .map(|message_id| format!("{message_id}:{index}"))
     }
 
     /// The tool block still streaming at `index` on the stream of `parent_tool_use_id`.
@@ -3268,7 +3386,10 @@ fn claude_message_route(message: &ClaudeMessage) -> ClaudeMessageRoute {
                 StreamEvent::MessageStart { .. }
                 | StreamEvent::ContentBlockDelta {
                     delta:
-                        ContentBlockDelta::ThinkingDelta { .. } | ContentBlockDelta::TextDelta { .. },
+                        ContentBlockDelta::ThinkingDelta { .. }
+                        | ContentBlockDelta::TextDelta { .. }
+                        | ContentBlockDelta::SignatureDelta {}
+                        | ContentBlockDelta::Other,
                     ..
                 } => ClaudeMessageRoute::SuppressedChildText,
             }
@@ -3727,6 +3848,20 @@ fn take_streamed_input(tool: &mut InFlightTool) -> bool {
     tool.input =
         serde_json::from_str::<Value>(&streamed).unwrap_or_else(|_| json!({ "raw": streamed }));
     true
+}
+
+/// An event that shows the turn produced output: assistant text or reasoning, a tool call, or a
+/// compaction.
+fn turn_output_event(event_type: &str) -> bool {
+    matches!(
+        event_type,
+        "content.delta"
+            | "item.started"
+            | "item.updated"
+            | "item.completed"
+            | "turn.proposed.completed"
+            | "turn.plan.updated"
+    )
 }
 
 fn is_interrupted_result(message: &ResultMessage) -> bool {
@@ -6971,3 +7106,7 @@ mod tool_result_tests {
         assert_eq!(stored_contents(&events), [&preview, &preview]);
     }
 }
+
+#[cfg(test)]
+#[path = "compaction_turn_tests.rs"]
+mod compaction_turn_tests;

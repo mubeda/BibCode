@@ -6,8 +6,9 @@
  * walking the sanitized tree, so raw HTML, sanitizing and plugins need no mirrored rules. Only
  * the custom components are mirrored here: file links show their chip label, `$skill` tokens
  * under a paragraph or list item show the skill's name, an external link with plain text shows
- * that text, and images and placeholders show nothing. A parity test renders `ChatMarkdown` and
- * compares its DOM counts with these.
+ * that text, and images and placeholders show nothing. A closed Mermaid fence, which the renderer
+ * draws as a diagram, shows nothing either: find does not search diagrams. A parity test renders
+ * `ChatMarkdown` and compares its DOM counts with these.
  */
 import type { Element, Root as HastRoot } from "hast";
 import type { Root as MdastRoot } from "mdast";
@@ -27,6 +28,7 @@ import {
   type InlineSkill,
   type MarkdownFileLinks,
 } from "../../chatMarkdownPipeline";
+import { fenceBody, isClosedMermaidFence } from "../../markdown/mermaidFence";
 
 /** The most UTF-16 units a query holds; the find input truncates beyond it. */
 export const MAX_FIND_QUERY_LENGTH = 256;
@@ -223,6 +225,8 @@ function chatMarkdownProcessor(lineBreaks: boolean): ChatMarkdownProcessor {
 }
 
 interface ProjectionWalk {
+  /** The Markdown source, which positions in the tree index. */
+  readonly text: string;
   readonly scope: string;
   readonly skills: ReadonlyArray<InlineSkill>;
   readonly fileLinks: MarkdownFileLinks;
@@ -331,8 +335,28 @@ function walkLink(walk: ProjectionWalk, element: Element, context: WalkContext):
   walkChildren(walk, element, context);
 }
 
+/**
+ * Whether the renderer draws this `<pre>` as a Mermaid diagram: a fenced `mermaid` block closed
+ * by its own fence, decided as `ChatMarkdown` decides it for settled text.
+ */
+function isMermaidDiagramFence(walk: ProjectionWalk, element: Element): boolean {
+  const code = element.children.find(
+    (child): child is Element => child.type === "element" && child.tagName === "code",
+  );
+  const className = code?.properties["className"];
+  if (!code || !Array.isArray(className) || !className.includes("language-mermaid")) {
+    return false;
+  }
+  const source = code.children.map((child) => (child.type === "text" ? child.value : "")).join("");
+  return isClosedMermaidFence(walk.text, element.position, fenceBody(source), false);
+}
+
 function walkElement(walk: ProjectionWalk, element: Element, context: WalkContext): void {
   const tag = element.tagName;
+  if (tag === "pre" && isMermaidDiagramFence(walk, element)) {
+    flush(walk);
+    return;
+  }
   switch (tag) {
     case "img":
     case "input":
@@ -372,6 +396,7 @@ function projectMarkdown(
   const processor = chatMarkdownProcessor(source.lineBreaks);
   const tree = processor.runSync(processor.parse(source.text), source.text);
   const walk: ProjectionWalk = {
+    text: source.text,
     scope: source.scope,
     skills: source.skills,
     fileLinks: buildMarkdownFileLinks(source.text, context.cwd),

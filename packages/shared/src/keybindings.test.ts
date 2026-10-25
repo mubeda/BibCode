@@ -295,6 +295,19 @@ describe("DEFAULT_KEYBINDINGS", () => {
     });
   });
 
+  it("moves between Compare's changes with F7 and Shift+F7 while the Diff panel has focus", () => {
+    expect(DEFAULT_KEYBINDINGS).toContainEqual({
+      key: "f7",
+      command: "diff.nextChange",
+      when: "diffFocus",
+    });
+    expect(DEFAULT_KEYBINDINGS).toContainEqual({
+      key: "shift+f7",
+      command: "diff.previousChange",
+      when: "diffFocus",
+    });
+  });
+
   it("opens a new center terminal from mod+j", () => {
     expect(DEFAULT_KEYBINDINGS).toContainEqual({
       key: "mod+j",

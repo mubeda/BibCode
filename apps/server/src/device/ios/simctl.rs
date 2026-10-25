@@ -419,6 +419,7 @@ impl SimctlRunner {
                     label: SIMULATOR_LABEL.to_owned(),
                     source: RegistrationSource::Helper,
                     driver: None,
+                    survives_shutdown: false,
                 },
             )
             .inspect_err(|error| {

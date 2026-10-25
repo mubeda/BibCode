@@ -153,6 +153,10 @@ pub struct DeviceSnapshot {
     pub orientation: Orientation,
     /// Whether the device turns; reported by the running device once `Ready`.
     pub can_rotate: bool,
+    /// The root thread that started the device (a chat panel's host, else the thread), as
+    /// `device.open` named it, trimmed; kept once the device ends. A label, not a permission.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]

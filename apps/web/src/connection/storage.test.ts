@@ -344,6 +344,7 @@ function orchestrationThread(): OrchestrationThread {
     archivedAt: null,
     deletedAt: null,
     messages: [],
+    reasoning: [],
     proposedPlans: [],
     activities: [],
     checkpoints: [],

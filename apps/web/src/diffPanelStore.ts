@@ -3,7 +3,12 @@ import type { ScopedThreadRef, TurnId } from "@bibcode/contracts";
 import { create } from "zustand";
 import { createJSONStorage, persist } from "zustand/middleware";
 
+// Type-only: the store loads with the app shell, and the Compare model pulls in the diff renderer.
+import type { LiftedCommentDraft } from "./components/diffs/AnnotatableCodeView";
+import type { DiffFileFilters } from "./lib/diffCompareModel";
 import { resolveStorage } from "./lib/storage";
+
+const EMPTY_DIFF_FILE_FILTERS: DiffFileFilters = { status: "all", query: "" };
 
 export type DiffPanelSelection =
   | { kind: "branch"; baseRef: string | null }
@@ -16,6 +21,25 @@ interface DiffPanelStoreState {
   byThreadKey: Record<string, DiffPanelSelection>;
   branchBaseRefByThreadKey: Record<string, string | null>;
   gitRefreshRequestByThreadKey: Record<string, number>;
+  /** Compare's selected file, by path. Persisted, so a reload reopens the same file. */
+  compareFileByThreadKey: Record<string, string>;
+  /** Compare's list filters. Memory-only, so a reload never opens Compare with files hidden. */
+  compareFiltersByThreadKey: Record<string, DiffFileFilters>;
+  /**
+   * The unsent line comment of each review section, by `threadKey:sectionId`. Memory-only, like
+   * a draft in any open field, and kept here so switching Changes and Compare keeps it.
+   */
+  commentDraftBySectionKey: Record<string, LiftedCommentDraft>;
+  /** Each draft's text. Nothing subscribes to it: a field reads it once when it mounts. */
+  commentDraftTextById: Record<string, string>;
+  setCommentDraft: (
+    ref: ScopedThreadRef,
+    sectionId: string,
+    draft: LiftedCommentDraft | null,
+  ) => void;
+  setCommentDraftText: (id: string, text: string) => void;
+  selectCompareFile: (ref: ScopedThreadRef, path: string) => void;
+  setCompareFilters: (ref: ScopedThreadRef, filters: DiffFileFilters) => void;
   selectGitScope: (ref: ScopedThreadRef, scope: "branch" | "unstaged") => void;
   selectBranchBaseRef: (ref: ScopedThreadRef, baseRef: string | null) => void;
   selectTurn: (ref: ScopedThreadRef, turnId: TurnId, filePath?: string) => void;
@@ -34,6 +58,45 @@ export const useDiffPanelStore = create<DiffPanelStoreState>()(
       byThreadKey: {},
       branchBaseRefByThreadKey: {},
       gitRefreshRequestByThreadKey: {},
+      compareFileByThreadKey: {},
+      compareFiltersByThreadKey: {},
+      commentDraftBySectionKey: {},
+      commentDraftTextById: {},
+      setCommentDraft: (ref, sectionId, draft) =>
+        set((state) => {
+          const sectionKey = commentDraftSectionKey(ref, sectionId);
+          const previous = state.commentDraftBySectionKey[sectionKey];
+          if (draft === null) {
+            if (!previous) return state;
+            const { [sectionKey]: _removed, ...commentDraftBySectionKey } =
+              state.commentDraftBySectionKey;
+            const { [previous.id]: _removedText, ...commentDraftTextById } =
+              state.commentDraftTextById;
+            return { commentDraftBySectionKey, commentDraftTextById };
+          }
+          return {
+            commentDraftBySectionKey: { ...state.commentDraftBySectionKey, [sectionKey]: draft },
+          };
+        }),
+      setCommentDraftText: (id, text) =>
+        set((state) => ({
+          commentDraftTextById: { ...state.commentDraftTextById, [id]: text },
+        })),
+      selectCompareFile: (ref, path) =>
+        set((state) => {
+          const threadKey = scopedThreadKey(ref);
+          if (state.compareFileByThreadKey[threadKey] === path) return state;
+          return {
+            compareFileByThreadKey: { ...state.compareFileByThreadKey, [threadKey]: path },
+          };
+        }),
+      setCompareFilters: (ref, filters) =>
+        set((state) => ({
+          compareFiltersByThreadKey: {
+            ...state.compareFiltersByThreadKey,
+            [scopedThreadKey(ref)]: filters,
+          },
+        })),
       selectGitScope: (ref, scope) =>
         set((state) => {
           const threadKey = scopedThreadKey(ref);
@@ -115,10 +178,14 @@ export const useDiffPanelStore = create<DiffPanelStoreState>()(
         set((state) => {
           const threadKey = scopedThreadKey(ref);
           const refreshRequests = state.gitRefreshRequestByThreadKey ?? {};
+          const compareFiles = state.compareFileByThreadKey ?? {};
+          const compareFilters = state.compareFiltersByThreadKey ?? {};
           if (
             !(threadKey in state.byThreadKey) &&
             !(threadKey in state.branchBaseRefByThreadKey) &&
-            !(threadKey in refreshRequests)
+            !(threadKey in refreshRequests) &&
+            !(threadKey in compareFiles) &&
+            !(threadKey in compareFilters)
           ) {
             return state;
           }
@@ -127,7 +194,16 @@ export const useDiffPanelStore = create<DiffPanelStoreState>()(
             state.branchBaseRefByThreadKey;
           const { [threadKey]: _removedRefreshRequest, ...gitRefreshRequestByThreadKey } =
             refreshRequests;
-          return { byThreadKey, branchBaseRefByThreadKey, gitRefreshRequestByThreadKey };
+          const { [threadKey]: _removedCompareFile, ...compareFileByThreadKey } = compareFiles;
+          const { [threadKey]: _removedCompareFilters, ...compareFiltersByThreadKey } =
+            compareFilters;
+          return {
+            byThreadKey,
+            branchBaseRefByThreadKey,
+            gitRefreshRequestByThreadKey,
+            compareFileByThreadKey,
+            compareFiltersByThreadKey,
+          };
         }),
     }),
     {
@@ -139,6 +215,7 @@ export const useDiffPanelStore = create<DiffPanelStoreState>()(
       partialize: (state) => ({
         byThreadKey: state.byThreadKey,
         branchBaseRefByThreadKey: state.branchBaseRefByThreadKey,
+        compareFileByThreadKey: state.compareFileByThreadKey,
       }),
     },
   ),
@@ -158,4 +235,24 @@ export function selectThreadDiffPanelRefreshRequest(
 ): number {
   if (!ref) return 0;
   return refreshRequestByThreadKey?.[scopedThreadKey(ref)] ?? 0;
+}
+
+export function selectThreadCompareFile(
+  compareFileByThreadKey: Record<string, string> | undefined,
+  ref: ScopedThreadRef | null | undefined,
+): string | null {
+  if (!ref) return null;
+  return compareFileByThreadKey?.[scopedThreadKey(ref)] ?? null;
+}
+
+export function selectThreadCompareFilters(
+  compareFiltersByThreadKey: Record<string, DiffFileFilters> | undefined,
+  ref: ScopedThreadRef | null | undefined,
+): DiffFileFilters {
+  if (!ref) return EMPTY_DIFF_FILE_FILTERS;
+  return compareFiltersByThreadKey?.[scopedThreadKey(ref)] ?? EMPTY_DIFF_FILE_FILTERS;
+}
+
+export function commentDraftSectionKey(ref: ScopedThreadRef, sectionId: string): string {
+  return `${scopedThreadKey(ref)}:${sectionId}`;
 }

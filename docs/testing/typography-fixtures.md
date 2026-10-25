@@ -24,6 +24,12 @@ interactions and saves unmodified light/dark PNGs with a manifest. The manifest
 records the source commit, module hashes, named owners, observed text, theme,
 fonts, viewport and image hash. A failed witness is not an accepted capture.
 
+The `mermaid-sanitizer-probe` fixture inserts hostile diagram SVG through the
+diagram sanitizer; every resource it names is a same-origin `/mermaid-probe/`
+path. The gallery listener records any request for such a path, and the
+capture then records a `mermaid-probe-request` failure and refuses the run, so
+a sanitizer that let a resource through fails in each real engine.
+
 The startup gate first captures the real Badge in both themes under a short
 external process deadline. It uses the runner's installed Chrome and matching
 driver, with bounded page/script waits and an early bootstrap record. This

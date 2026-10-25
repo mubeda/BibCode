@@ -23,6 +23,10 @@ use crate::{
 struct DeviceOpenInput {
     platform: Platform,
     image_id: String,
+    /// The root thread the device is for (a chat panel's host, else the thread). Optional, so
+    /// older clients' opens are unowned; the manager trims it and refuses a blank one.
+    #[serde(default)]
+    thread_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -140,7 +144,7 @@ pub fn register_device_rpc(registry: &mut RpcRegistry, devices: DeviceManager) {
         |devices, payload| async move {
             let input: DeviceOpenInput = decode(payload)?;
             let device_id = devices
-                .open(input.platform, &input.image_id)
+                .open(input.platform, &input.image_id, input.thread_id.as_deref())
                 .await
                 .map_err(rpc_error)?;
             Ok(json!({ "deviceId": device_id }))
@@ -428,6 +432,9 @@ mod tests {
             .await;
         assert_eq!(device["devices"][0]["deviceId"], id.as_str());
         assert_eq!(device["devices"][0]["orientation"], "portrait");
+        // Without `threadId` the device has no owner.
+        assert!(device["devices"][0].get("threadId").is_none(), "{device}");
+        // An image that runs already returns its device.
         assert_eq!(
             harness
                 .call(
@@ -435,8 +442,8 @@ mod tests {
                     json!({ "platform": "android", "imageId": "Pixel" })
                 )
                 .await
-                .unwrap_err()["_tag"],
-            "DeviceLimitError"
+                .expect("the running image")["deviceId"],
+            id.as_str()
         );
         // The Android-only payload is gone: it no longer decodes.
         assert_eq!(
@@ -454,6 +461,39 @@ mod tests {
         harness
             .chunk_until(&catalog, |value| value["devices"][0]["state"] == "stopped")
             .await;
+        harness.stop().await;
+        fixture.manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn device_open_labels_the_device_with_its_thread_trimmed() {
+        let fixture = ManagerFixture::ready(&["Pixel", "Tablet"]).await;
+        let mut harness = Harness::start(fixture.manager.clone()).await;
+        let catalog = harness.request("device.subscribeCatalog", json!({})).await;
+        let opened = harness
+            .call(
+                "device.open",
+                json!({ "platform": "android", "imageId": "Pixel", "threadId": " thread-1 " }),
+            )
+            .await
+            .expect("device opens");
+        let device = harness
+            .chunk_until(&catalog, |value| {
+                value["devices"][0]["deviceId"] == opened["deviceId"]
+            })
+            .await;
+        assert_eq!(device["devices"][0]["threadId"], "thread-1");
+        let blank = harness
+            .call(
+                "device.open",
+                json!({ "platform": "android", "imageId": "Tablet", "threadId": " " }),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            blank,
+            json!({ "_tag": "DeviceInputError", "message": "threadId must name a thread." })
+        );
         harness.stop().await;
         fixture.manager.shutdown().await;
     }
