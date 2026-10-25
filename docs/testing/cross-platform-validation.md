@@ -2828,7 +2828,7 @@ running job, a manual job, an erased job and a job with artifacts.
    stop. A running log over 2 MB keeps its head with the "This running log is
    over 2 MB" copy and **Open on GitLab** until the job finishes. On a host
    without range support, a running log over 2 MB shows its downloaded copy
-   until the job finishes; then one more whole download shows its final lines.
+   with the same "over 2 MB" copy until the job finishes; then one more whole download shows its final lines.
 7. The details show duration or elapsed, finished, queued, runner, source,
    tags, artifacts with **Download** and **Browse**, commit, pipeline, and the
    stage's other jobs as links to their pages; on a narrow panel they sit

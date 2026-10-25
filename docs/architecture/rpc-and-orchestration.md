@@ -1671,7 +1671,9 @@ tail for 4 s. A whole download keeps the last 16 MiB (`truncatedHead`) in
 server memory (`LogCache`) and serves 1 MiB windows from the end, with
 absolute `firstLine` when nothing was dropped. A running log of 2 MiB or more
 is not downloaded again until its job is terminal, when the unfinished copy is
-dropped and the finished log read. Every pipelines read sweeps the cache:
+dropped and the finished log read; meanwhile a follow read past its end
+answers `unavailable: too_large_live`, so the page keeps the copy and stops
+following. Every pipelines read sweeps the cache:
 logs idle for 10 minutes and tails past their 4 s are released whichever job
 the read is for. The module runs no background task, so a server that serves
 no pipelines read keeps its last logs until the next one, a rescan or a
