@@ -146,10 +146,16 @@ async function thoughtHeaderText(id: string): Promise<string> {
   return (await header.getText()).trim();
 }
 
-/** Clicks a Thinking header through the DOM, then waits for the list to re-measure it. */
+/**
+ * Presses a Thinking header as a pointer does, so the press reaches the timeline's listeners
+ * before the click, then waits for the list to re-measure it.
+ */
 async function toggleThought(id: string): Promise<void> {
   const clicked = await browser.execute((selector: string) => {
     const header = document.querySelector<HTMLButtonElement>(selector);
+    const press = { bubbles: true, cancelable: true, isPrimary: true, pointerType: "mouse" };
+    header?.dispatchEvent(new PointerEvent("pointerdown", press));
+    header?.dispatchEvent(new PointerEvent("pointerup", press));
     header?.click();
     return header !== null;
   }, thoughtHeaderSelector(id));
@@ -290,18 +296,49 @@ async function expandThoughtAwayFromEnd(thoughtId: string): Promise<void> {
   await toggleThought(thoughtId);
 }
 
-/** The newest thought, still streaming just above the working row, expands at the end. */
+/** A prompt long enough to fold its message, so the turn overflows once the trace opens. */
+const LONG_PROMPT_LABEL = `Think it over. ${"Weigh every rule of the parser against the fixture. ".repeat(14).trim()}`;
+
+/**
+ * The newest thought, still streaming just above the working row, expands at the end. The
+ * expanded trace then grows the anchored turn past the visible timeline, and the turn's end
+ * stays in view while the thought streams on.
+ */
 async function expandStreamingThoughtAtEnd(): Promise<void> {
   const thoughtId = await sendAndAwaitNewThought(
-    `Think it over ${desktopUiFixture.slowReasoningTurnMarker}`,
+    `${LONG_PROMPT_LABEL} ${desktopUiFixture.slowReasoningTurnMarker}`,
   );
   await expectEndVisible(null, "Before the toggle");
+  const headerTop = () =>
+    browser.execute(
+      (selector: string) => document.querySelector(selector)?.getBoundingClientRect().top ?? null,
+      thoughtHeaderSelector(thoughtId),
+    );
+  const traceLength = () =>
+    browser.execute(
+      (selector: string) => document.querySelector(selector)?.textContent?.length ?? 0,
+      `${visibleSurfaceSelector} [data-reasoning-id="${thoughtId}"]`,
+    );
+  const headerTopBefore = await headerTop();
   await toggleThought(thoughtId);
   expect(await browser.$(thoughtHeaderSelector(thoughtId)).getAttribute("aria-expanded")).toBe(
     "true",
   );
   await expectEndVisible(null, "Expanded at the end");
-  await waitForAnswer(desktopUiFixture.reasoningAnswerLastLine("Think it over", true));
+  for (let check = 1; check <= 3; check += 1) {
+    const streamed = await traceLength();
+    await browser.waitUntil(async () => (await traceLength()) > streamed, {
+      timeoutMsg: "The expanded thought stopped streaming before the turn's end was checked.",
+    });
+    await expectEndVisible(null, `Expanded at the end while thinking (${check})`);
+  }
+  // The turn outgrew the visible timeline: the list scrolled to keep its end in view.
+  const headerTopAfter = await headerTop();
+  expect((headerTopBefore ?? 0) - (headerTopAfter ?? 0)).toBeGreaterThan(LAYOUT_SLACK_PX);
+  await browser.saveScreenshot(
+    NodePath.join(preparedArtifactDirectory, "reasoning-thinking-row-expanded-at-end.png"),
+  );
+  await waitForAnswer(desktopUiFixture.reasoningAnswerLastLine(LONG_PROMPT_LABEL, true));
 }
 
 /** Reopening the thread drops the send's anchor: the list follows its end while the turn runs. */
