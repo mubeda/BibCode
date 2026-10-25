@@ -154,10 +154,16 @@ export function PipelineJobView({
     readonly target: typeof getTarget;
     readonly code: PipelinesRefusal;
   } | null>(null);
+  // Each event is a new object: a refusal is taken from the event that carries it.
+  const [seenChange, setSeenChange] = useState<typeof subscribeQuery.data>(null);
+  if (subscribeQuery.data !== seenChange) {
+    setSeenChange(subscribeQuery.data);
+    if (subscribeQuery.data?.refused)
+      setRefusal({ target: getTarget, code: subscribeQuery.data.refused });
+  }
   const refused = refusal !== null && refusal.target === getTarget ? refusal.code : null;
   const applySubscribedChange = useEffectEvent(
     (changed: NonNullable<typeof subscribeQuery.data>) => {
-      if (changed.refused) setRefusal({ target: getTarget, code: changed.refused });
       // The poller stored the new pipeline row: paint it, with no host read.
       if (changed.pipeline) snapshotQuery.revalidate();
     },
