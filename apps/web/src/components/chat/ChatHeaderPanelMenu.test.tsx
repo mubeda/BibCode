@@ -25,7 +25,8 @@ vi.mock("~/providerInstances", () => ({
   applyProviderInstanceSettings: (entries: unknown) => entries,
   deriveProviderInstanceEntries: () => [],
 }));
-vi.mock("./ChatHeaderPanelMenu.logic", () => ({
+vi.mock("./ChatHeaderPanelMenu.logic", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./ChatHeaderPanelMenu.logic")>()),
   buildPanelMenuModel: () => harness.items,
 }));
 vi.mock("./providerTerminalActions", () => ({

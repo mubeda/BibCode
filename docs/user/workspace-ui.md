@@ -347,10 +347,13 @@ recently active imported thread and reports how many sessions were imported or
 skipped and why.
 
 A session imported earlier shows **Already imported** with **Open**; importing
-it again does nothing. Conversations started in BiBCode, sessions run in a
-subfolder, and sessions run in another worktree are not listed. Only the
+it again does nothing, and **Open** on a session continued from History shows
+its host thread with that chat panel active. Conversations started in BiBCode,
+sessions run in a subfolder, and sessions run in a worktree are not listed:
+sessions run in a worktree are in that worktree thread's History. Only the
 default Claude Code and Codex providers are scanned, and a provider turned off
-in settings is skipped.
+in settings is skipped. Titles are the name you gave a Claude Code session
+with `/rename` (or the one Claude generated), else its first prompt.
 
 ## Center Panel
 
@@ -386,6 +389,31 @@ behind a stopped turn then offer **Send now**), and a
 the host thread deletes its chat panels, open or closed. A new chat panel's tab shows
 **Opening chat…** until the server confirms the panel thread; if creation fails,
 the tab closes and a **Failed to open chat panel** toast gives the reason.
+
+The composer's **History** button (left of **Attach files**) brings back
+earlier work for the thread, in a chat panel's composer too, where it acts for
+the host thread:
+
+- **This thread** lists the same closed chat panels as **Reopen closed chat**;
+  choosing one reopens it as the active tab.
+- **Claude Code terminal** lists the Claude Code sessions run in a terminal in
+  this thread's folder (its worktree, or the project root) in the last 30 days,
+  newest first, with their branch. **Continue** opens a session as a chat
+  panel of this thread, in its branch, worktree and permission mode, and your
+  next message continues the same conversation. When the session may still be
+  open in a terminal, when its earlier chat was deleted, or when Claude Code
+  refused to continue it here, the row offers **Continue in a copy** instead,
+  which leaves the terminal's conversation untouched. A session you already
+  continued shows **Open**. The row shows **Opening…** until its panel opens;
+  if it can't, a **Couldn't open the session** toast gives the reason and the
+  list reloads. See [Claude](../providers/claude.md#terminal-sessions-in-history).
+
+History lists only sessions run on the thread's own server: for a remote
+environment, its empty state says so. A server too old to list them asks to be
+updated. The button is disabled, with the reason in its tooltip, until the
+thread has started, while its environment is not connected, while its
+workspace is unavailable, and for a connection that can only view threads. The
+approval footer shows no History button.
 
 Tabs persist across reloads. The host chat remains mounted while another center
 tab is active, so its transcript, scroll state, and composer state are preserved.

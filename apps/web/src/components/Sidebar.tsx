@@ -361,7 +361,9 @@ import {
   ImportCliSessionsDialog,
   type ImportCliSessionsSummary,
   type ImportCliSessionsTarget,
+  type ImportedPanel,
 } from "./ImportCliSessionsDialog";
+import { usePanelThreadOpener } from "../centerPanelActions";
 import { SidebarProjectAvailability } from "./sidebar/SidebarProjectAvailability";
 import { readCurrentEnvironmentPresentationPolicy } from "../connection/currentEnvironmentPresentation";
 import { environmentConnectionActions } from "../connection/environmentPresentationPolicy";
@@ -2856,12 +2858,20 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
     if (!open) setImportSessionsTarget(null);
   }, []);
 
+  const { openPanelThread } = usePanelThreadOpener();
   const openImportedThread = useCallback(
-    (target: ImportCliSessionsTarget, threadId: ThreadId) => {
+    (target: ImportCliSessionsTarget, threadId: ThreadId, panel?: ImportedPanel) => {
       setImportSessionsTarget(null);
-      navigateToThread(scopeThreadRef(target.environmentId, threadId));
+      if (panel === undefined) {
+        navigateToThread(scopeThreadRef(target.environmentId, threadId));
+        return;
+      }
+      // A session continued from History is a chat panel: show its host with the panel active.
+      const hostRef = scopeThreadRef(target.environmentId, panel.hostThreadId);
+      void openPanelThread(hostRef, threadId, panel.title);
+      navigateToThread(hostRef);
     },
-    [navigateToThread],
+    [navigateToThread, openPanelThread],
   );
 
   const handleSessionsImported = useCallback(

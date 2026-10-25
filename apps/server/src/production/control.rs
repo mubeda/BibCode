@@ -2613,6 +2613,7 @@ fn environment_descriptor(config: &ServerConfig, activity_protocol_registered: b
             "profiler": true,
             "devicePreviews": true,
             "deviceCatalogRefresh": true,
+            "cliSessionHistory": true,
             "previewTunnels": true,
         },
     })
@@ -6711,6 +6712,9 @@ mod tests {
         assert_eq!(descriptor["capabilities"]["devicePreviews"], true);
         // A client offers Refresh devices only when the server has `device.refreshCatalog` (#169).
         assert_eq!(descriptor["capabilities"]["deviceCatalogRefresh"], true);
+        // A client lists terminal sessions in History only on servers that have
+        // `agentSessions.listForThread` and `agentSessions.openInPanel` (#141).
+        assert_eq!(descriptor["capabilities"]["cliSessionHistory"], true);
     }
 
     #[test]

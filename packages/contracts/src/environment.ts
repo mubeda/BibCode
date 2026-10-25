@@ -80,6 +80,8 @@ export const ExecutionEnvironmentCapabilities = Schema.Struct({
   devicePreviews: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   /** `device.refreshCatalog` reruns device discovery past its cache (#169). */
   deviceCatalogRefresh: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  /** `agentSessions.listForThread` and `agentSessions.openInPanel`: History's terminal sessions (#141). */
+  cliSessionHistory: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   /** `preview.tunnelOpen`, `preview.tunnelWrite` and `preview.tunnelClose` (#69). */
   previewTunnels: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
 });

@@ -56,8 +56,12 @@ import { ExternalLauncherError, LaunchEditorInput } from "./editor.ts";
 import {
   AgentSessionImportInput,
   AgentSessionImportResult,
+  AgentSessionOpenInPanelInput,
+  AgentSessionOpenInPanelResult,
   AgentSessionScanInput,
   AgentSessionScanResult,
+  AgentSessionThreadListInput,
+  AgentSessionThreadListResult,
   AgentSessionsError,
 } from "./agentSessions.ts";
 import {
@@ -462,6 +466,8 @@ export const WS_METHODS = {
   // CLI session import methods
   agentSessionsScan: "agentSessions.scan",
   agentSessionsImport: "agentSessions.import",
+  agentSessionsListForThread: "agentSessions.listForThread",
+  agentSessionsOpenInPanel: "agentSessions.openInPanel",
 
   // Shell methods
   shellOpenInEditor: "shell.openInEditor",
@@ -649,6 +655,20 @@ export const WsAgentSessionsScanRpc = Rpc.make(WS_METHODS.agentSessionsScan, {
 export const WsAgentSessionsImportRpc = Rpc.make(WS_METHODS.agentSessionsImport, {
   payload: AgentSessionImportInput,
   success: AgentSessionImportResult,
+  error: Schema.Union([AgentSessionsError, EnvironmentRpcError]),
+});
+
+/** Only on servers that advertise `cliSessionHistory`. */
+export const WsAgentSessionsListForThreadRpc = Rpc.make(WS_METHODS.agentSessionsListForThread, {
+  payload: AgentSessionThreadListInput,
+  success: AgentSessionThreadListResult,
+  error: Schema.Union([AgentSessionsError, EnvironmentRpcError]),
+});
+
+/** Only on servers that advertise `cliSessionHistory`. */
+export const WsAgentSessionsOpenInPanelRpc = Rpc.make(WS_METHODS.agentSessionsOpenInPanel, {
+  payload: AgentSessionOpenInPanelInput,
+  success: AgentSessionOpenInPanelResult,
   error: Schema.Union([AgentSessionsError, EnvironmentRpcError]),
 });
 
@@ -1905,6 +1925,8 @@ export const WsRpcGroup = RpcGroup.make(
   WsAuthConfirmPairingRpc,
   WsAgentSessionsScanRpc,
   WsAgentSessionsImportRpc,
+  WsAgentSessionsListForThreadRpc,
+  WsAgentSessionsOpenInPanelRpc,
   WsServerGetConfigRpc,
   WsServerGetProviderCapabilitiesRpc,
   WsServerRefreshProvidersRpc,

@@ -14836,6 +14836,8 @@ fn claude_launch_arguments_preserve_controls_and_gate_activity_flags() {
             include_hook_events: true,
             forward_subagent_text: true,
             transcript_recovery: false,
+            fork_session_id: false,
+            probe_finished: true,
         },
     );
     for required in [
@@ -14963,6 +14965,8 @@ async fn claude_activity_probe_is_cached_by_executable_identity() {
             include_hook_events: true,
             forward_subagent_text: true,
             transcript_recovery: false,
+            fork_session_id: false,
+            probe_finished: true,
         }
     );
     assert_eq!(second, first);
@@ -15004,6 +15008,8 @@ async fn claude_activity_probe_singleflights_concurrent_misses() {
                 include_hook_events: true,
                 forward_subagent_text: true,
                 transcript_recovery: false,
+                fork_session_id: false,
+                probe_finished: true,
             }
         );
     }
@@ -15120,6 +15126,8 @@ async fn claude_activity_probe_test_contexts_isolate_concurrent_cache_mutation()
                 include_hook_events: true,
                 forward_subagent_text: true,
                 transcript_recovery: false,
+                fork_session_id: false,
+                probe_finished: true,
             }
         );
     }
@@ -15173,6 +15181,8 @@ async fn claude_activity_probe_retries_transient_failures_without_poisoning_cach
             include_hook_events: true,
             forward_subagent_text: true,
             transcript_recovery: false,
+            fork_session_id: false,
+            probe_finished: true,
         }
     );
     assert_eq!(
@@ -15317,6 +15327,8 @@ async fn assert_claude_probe_recovers_after_one_bad_help(case: &str, first_help:
             include_hook_events: true,
             forward_subagent_text: true,
             transcript_recovery: false,
+            fork_session_id: false,
+            probe_finished: true,
         },
         "{case}: a later launch of the same working Claude gets the activity flags"
     );
@@ -15349,7 +15361,13 @@ async fn claude_activity_probe_invalidates_on_executable_metadata_and_version_ch
         .probe(executable.to_string_lossy().as_ref())
         .await;
 
-    assert_eq!(changed, ClaudeActivitySupport::default());
+    assert_eq!(
+        changed,
+        ClaudeActivitySupport {
+            probe_finished: true,
+            ..ClaudeActivitySupport::default()
+        }
+    );
     assert_eq!(
         std::fs::read_to_string(count_path).expect("probe count"),
         "xxxx",

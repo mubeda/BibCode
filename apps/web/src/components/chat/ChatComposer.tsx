@@ -30,6 +30,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type ReactNode,
 } from "react";
 import {
   clampCollapsedComposerCursor,
@@ -442,9 +443,12 @@ const ComposerFooterPrimaryActions = memo(function ComposerFooterPrimaryActions(
   onPreviousPendingQuestion: () => void;
   onInterrupt: () => void;
   onImplementPlanInNewThread: () => void;
+  /** The History menu, first in the group; a slot so the memoized footer keeps stable props. */
+  historyMenu?: ReactNode;
 }) {
   return (
     <>
+      {props.historyMenu}
       <Tooltip>
         <TooltipTrigger
           render={
@@ -657,6 +661,11 @@ export interface ChatComposerProps {
   onExpandImage: (preview: ExpandedImagePreview) => void;
   /** Scrolls the timeline a page; `repeat` is true while the key is held. */
   onPageTimeline: (key: "PageUp" | "PageDown", repeat: boolean) => void;
+  /**
+   * The History menu for the footer's right group, memoized by the host so the footer's props
+   * stay stable. The approval footer leaves it out.
+   */
+  historyMenu?: ReactNode;
 }
 
 // --------------------------------------------------------------------------
@@ -736,6 +745,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     setThreadError,
     onExpandImage,
     onPageTimeline,
+    historyMenu,
   } = props;
   const isProviderBindingConflicted = providerBindingConflictReason !== null;
   const terminalOpen = useThreadHasTerminalSurface(routeThreadRef);
@@ -2893,6 +2903,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                   onPreviousPendingQuestion={onPreviousActivePendingUserInputQuestion}
                   onInterrupt={handleInterruptPrimaryAction}
                   onImplementPlanInNewThread={handleImplementPlanInNewThreadPrimaryAction}
+                  historyMenu={historyMenu}
                 />
               </div>
             </div>
