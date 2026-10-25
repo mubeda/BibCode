@@ -10,6 +10,7 @@ describe("pipelineStatusText", () => {
     expect(pipelineStatusText("failed", false)).toBe("Failed");
     expect(pipelineStatusText("success", false)).toBe("Passed");
     expect(pipelineStatusText("success", true)).toBe("Passed with warnings");
+    expect(pipelineStatusText("failed", true)).toBe("Failed, allowed to fail");
   });
 
   it("lets a reason name the outcome instead of the status word", () => {

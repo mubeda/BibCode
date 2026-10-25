@@ -24,10 +24,34 @@ vi.mock("../../pullRequests/shared/usePullRequestsQuery", () => ({
   }),
 }));
 vi.mock("../../../lib/openPullRequestLink", () => ({ useOpenPrLink: () => vi.fn() }));
+vi.mock("@tanstack/react-router", () => ({
+  Link: ({
+    to,
+    params,
+    children,
+    className,
+  }: {
+    to: string;
+    params: Record<string, string>;
+    children: React.ReactNode;
+    className?: string;
+  }) => (
+    <a
+      className={className}
+      href={Object.entries(params).reduce(
+        (path, [name, value]) => path.replace(`$${name}`, value),
+        to,
+      )}
+    >
+      {children}
+    </a>
+  ),
+}));
 
 import { PipelinesListRow } from "./PipelinesListRow";
 
 const scope = { environmentId: EnvironmentId.make("env"), cwd: "/repo" };
+const projectRef = { environmentId: "env", projectId: "p" } as never;
 let root: Root;
 let node: HTMLDivElement;
 
@@ -41,6 +65,7 @@ function renderRows(ids: readonly number[]) {
             row={{ ...pipelineRow, id, label: `#${id}` }}
             provider="gitlab"
             scope={scope}
+            projectRef={projectRef}
             mutationsDisabledReason={null}
           />
         ))}
@@ -67,6 +92,24 @@ afterEach(() => {
   act(() => root.unmount());
   node.remove();
   vi.useRealTimers();
+});
+
+describe("PipelinesListRow navigation", () => {
+  it("opens the pipeline in BiBCode from anywhere on the row, with actions as their own stops", () => {
+    renderRows([4821]);
+    const row = node.querySelector('[role="listitem"]')!;
+    const title = [...row.querySelectorAll("a")].find(
+      (anchor) => anchor.textContent === "Fix connection recovery",
+    )!;
+    expect(title.getAttribute("href")).toBe("/project/env/p/pipelines/4821");
+    // The title's hit area covers the row; the actions sit above it.
+    expect(row.className).toContain("relative");
+    expect(title.className).toContain("after:absolute");
+    expect(title.className).toContain("after:inset-0");
+    const retry = row.querySelector('[aria-label="Retry pipeline #4821"]')!;
+    expect(retry.closest(".relative.z-10")).not.toBeNull();
+    expect(row.querySelector('[aria-label="More actions for pipeline #4821"]')).not.toBeNull();
+  });
 });
 
 describe("PipelinesListRow hover prefetch", () => {

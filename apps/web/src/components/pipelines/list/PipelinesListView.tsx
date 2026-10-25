@@ -159,10 +159,11 @@ function PipelinesPages({
         row={item}
         provider={context.provider}
         scope={scope}
+        projectRef={projectRef}
         mutationsDisabledReason={mutationsDisabledReason}
       />
     ),
-    [context.provider, mutationsDisabledReason, scope],
+    [context.provider, mutationsDisabledReason, projectRef, scope],
   );
   const total = firstQuery.data?.total ?? null;
   const loaded = query.data !== null && !query.isPending;
