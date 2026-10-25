@@ -270,7 +270,12 @@ class DiagramBody extends Component<DiagramBodyProps> {
 
   override render() {
     return (
-      <div ref={this.props.bodyRef} className="chat-markdown-mermaid-body">
+      <div
+        ref={this.props.bodyRef}
+        className="chat-markdown-mermaid-body"
+        // Find in thread does not search a diagram, drawn or not; its projection skips the fence.
+        data-find-ignore=""
+      >
         {this.props.children}
       </div>
     );

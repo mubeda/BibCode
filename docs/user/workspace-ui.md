@@ -1853,7 +1853,8 @@ The Files surface is a full file manager for the active workspace:
 
 - Find in thread searches messages, plans, and tool commands. Tool output,
   changed-file lists, attachments, terminal-context chips, review-comment cards,
-  reasoning rows, and rendered diagrams are not searched.
+  reasoning rows, and Mermaid diagrams, including the source a diagram shows
+  before it draws, are not searched.
 - Device previews run at most four devices at once per environment, one per
   image, and iOS simulators only on macOS servers. BiBCode does not check that
   the host has the memory for four: one that does not fails at boot with the
