@@ -143,6 +143,10 @@ impl PairingIssuer {
 pub struct PreviewScope {
     pub environment_id: String,
     pub thread_id: String,
+    /// The root thread the agent works for: a chat panel's host, else `thread_id`. Device
+    /// tools compare it with a device's owner, so a panel's agent and its host's Device pane
+    /// share their devices.
+    pub owner_thread_id: String,
     pub provider_session_id: String,
     pub provider_instance_id: String,
 }
@@ -409,9 +413,12 @@ impl ConnectMcpService {
             .map_err(ConnectMcpError::into_http)
     }
 
+    /// A credential for `thread_id`'s provider, scoped to `owner_thread_id`, the thread's root
+    /// (a chat panel's host, else the thread). It replaces the thread's earlier credential.
     pub async fn issue_mcp_credential(
         &self,
         thread_id: impl Into<String>,
+        owner_thread_id: impl Into<String>,
         provider_instance_id: impl Into<String>,
     ) -> Result<McpIssuedCredential, ConnectMcpError> {
         let now = (self.config.now_epoch_seconds)();
@@ -427,6 +434,7 @@ impl ConnectMcpService {
         let scope = PreviewScope {
             environment_id: self.config.environment_id.clone(),
             thread_id: thread_id.clone(),
+            owner_thread_id: owner_thread_id.into(),
             provider_session_id: provider_session_id.clone(),
             provider_instance_id: provider_instance_id.clone(),
         };

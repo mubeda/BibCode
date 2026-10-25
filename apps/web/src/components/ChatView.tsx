@@ -7055,7 +7055,11 @@ function ChatViewContent(props: ChatViewProps) {
       </Suspense>
     ) : activeRightPanelSurface?.kind === "device" ? (
       <Suspense fallback={null}>
-        <DevicePanel environmentId={activeThreadRef.environmentId} />
+        {/* A chat panel's devices are its host's, so the pane works for the root thread. */}
+        <DevicePanel
+          threadRef={activeThreadRef}
+          rootThreadId={activeThread?.hostThreadId ?? activeThreadRef.threadId}
+        />
       </Suspense>
     ) : activeRightPanelSurface?.kind === "pullRequest" ? (
       <Suspense fallback={null}>

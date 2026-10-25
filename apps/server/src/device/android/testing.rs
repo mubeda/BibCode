@@ -1147,7 +1147,7 @@ impl ManagerFixture {
         let fixture = Self::ready(&["Pixel"]).await;
         let id = fixture
             .manager
-            .open(crate::device::catalog::Platform::Android, "Pixel")
+            .open(crate::device::catalog::Platform::Android, "Pixel", None)
             .await
             .expect("open Pixel");
         fixture

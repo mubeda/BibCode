@@ -3,6 +3,7 @@ import type {
   DevicePlatform,
   DevicePlatformCatalog,
   DeviceSnapshot,
+  EnvironmentId,
 } from "@bibcode/contracts";
 import {
   ChevronLeftIcon,
@@ -43,6 +44,7 @@ import {
   STILL_IMAGES_LABEL,
   type StillImages,
 } from "./deviceMessages";
+import { type DeviceOwner, DeviceRunningSuffix } from "./deviceOwner";
 
 export type RotateDirection = "left" | "right";
 
@@ -53,7 +55,7 @@ export interface DeviceImageSelection {
 }
 
 /** The picker's string value for an image. A platform name never contains `:`. */
-const pickerValue = (platform: DevicePlatform, id: string) => `${platform}:${id}`;
+export const pickerValue = (platform: DevicePlatform, id: string) => `${platform}:${id}`;
 
 /** A control that is either usable or says why not, in its tooltip and to screen readers. */
 function ToolbarButton({
@@ -107,8 +109,19 @@ const PILL_TONES: Readonly<Record<DeviceSnapshot["state"], string>> = {
   failed: "bg-destructive/12 text-destructive",
 };
 
-/** The picker's entries for one platform: its images, then why it cannot run (or runs view only). */
-function PlatformGroup({ listed }: { readonly listed: DevicePlatformCatalog }) {
+/**
+ * The picker's entries for one platform: its images, each running one with whose device it is,
+ * then why the platform cannot run (or runs view only).
+ */
+function PlatformGroup({
+  listed,
+  environmentId,
+  runningImages,
+}: {
+  readonly listed: DevicePlatformCatalog;
+  readonly environmentId: EnvironmentId;
+  readonly runningImages: ReadonlyMap<string, DeviceOwner>;
+}) {
   const { platform, availability, images } = listed;
   const opens = availability.kind === "ready" || isViewOnlyAvailability(availability.kind);
   return (
@@ -117,6 +130,7 @@ function PlatformGroup({ listed }: { readonly listed: DevicePlatformCatalog }) {
       {opens
         ? images.map((image) => {
             const value = pickerValue(platform, image.id);
+            const owner = runningImages.get(value);
             return (
               <SelectItem
                 hideIndicator
@@ -124,9 +138,12 @@ function PlatformGroup({ listed }: { readonly listed: DevicePlatformCatalog }) {
                 value={value}
                 disabled={image.inUseElsewhere === true}
               >
-                {image.inUseElsewhere === true
-                  ? `${image.displayName}${IN_USE_ELSEWHERE_SUFFIX}`
-                  : image.displayName}
+                {image.displayName}
+                {image.inUseElsewhere === true ? (
+                  IN_USE_ELSEWHERE_SUFFIX
+                ) : owner === undefined ? null : (
+                  <DeviceRunningSuffix environmentId={environmentId} owner={owner} />
+                )}
               </SelectItem>
             );
           })
@@ -142,7 +159,9 @@ function PlatformGroup({ listed }: { readonly listed: DevicePlatformCatalog }) {
 }
 
 export function DeviceToolbar({
+  environmentId,
   platforms,
+  runningImages,
   selectedImage,
   selectedName,
   device,
@@ -160,8 +179,11 @@ export function DeviceToolbar({
   onPaste,
   stillImages = null,
 }: {
+  readonly environmentId: EnvironmentId;
   /** The catalog's platforms, each a group in the picker. */
   readonly platforms: ReadonlyArray<DevicePlatformCatalog>;
+  /** Whose device runs each running image, by picker value. */
+  readonly runningImages: ReadonlyMap<string, DeviceOwner>;
   readonly selectedImage: DeviceImageSelection | null;
   /** The selected image's display name. */
   readonly selectedName: string | null;
@@ -242,7 +264,12 @@ export function DeviceToolbar({
         </SelectTrigger>
         <SelectPopup align="start" alignItemWithTrigger={false}>
           {platforms.map((listed) => (
-            <PlatformGroup key={listed.platform} listed={listed} />
+            <PlatformGroup
+              key={listed.platform}
+              listed={listed}
+              environmentId={environmentId}
+              runningImages={runningImages}
+            />
           ))}
         </SelectPopup>
       </Select>

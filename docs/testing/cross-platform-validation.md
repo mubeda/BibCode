@@ -3243,8 +3243,10 @@ for the other
 ```sh
 cargo test -p bibcode-server --lib device:: -j 2
 cargo test -p bibcode-server --lib connect_mcp -j 2
+cargo test -p bibcode-server --lib a_chat_panels_launch_names_its_host_thread -j 2
 cargo test -p bibcode-server --test device_rpc --test device_media_socket --test e2ee_ws --test production_connect_mcp -j 2
-vp test run packages/contracts/src/device.test.ts packages/client-runtime/src/device apps/web/src/components/device apps/web/src/components/settings/DevicePreviewsSection.test.tsx
+cargo test -p bibcode-server --test production_orchestration_effects thread_deletion -j 2
+vp test run packages/contracts/src/device.test.ts packages/client-runtime/src/device apps/web/src/components/device apps/web/src/components/settings/DevicePreviewsSection.test.tsx apps/web/src/rightPanelStore.test.ts
 ```
 
 The fakes stand in for `emulator`, `adb`, the emulator gRPC service, and
@@ -3256,7 +3258,9 @@ Run the
 their client change. Everything below needs a real Android SDK.
 
 **Host.** Use a server host with the Android SDK (`emulator` and
-`platform-tools`), at least one AVD, and hardware acceleration: KVM on Linux
+`platform-tools`), at least two AVDs (five images for the limit in step 9:
+five AVDs, or on a macOS host AVDs and `Shutdown` simulators that make
+five), and hardware acceleration: KVM on Linux
 (`emulator -accel-check` succeeds), the Hypervisor framework on macOS, or
 WHPX/AEHD on Windows. Record the SDK path, `emulator -version`, `adb version`,
 the AVD's name, API level, and ABI, and the platform page's acceleration
@@ -3383,27 +3387,51 @@ Record each client's OS, app or browser version, and profile type.
    device, the fifth video socket is refused with `limit`; that window retries
    three times within a few seconds and then shows still images. Close one of
    the other four and reopen the fifth window's Device panel: it shows video.
-9. **Agents.** In a thread on the environment, ask the agent to list devices,
-   take a screenshot, and close the device. `device_screenshot` returns a PNG
-   no wider than 1080 px. Turn the setting off: the agent's next `device_*`
-   call fails with the "Device previews are off" error.
-10. **Stop and cleanup.** **Stop** the device. Within 10 s the pill shows
+9. **Several devices.** Open two threads on two worktrees of one project, each
+   with its own Device panel. Start a different AVD in each. Switching threads
+   shows each thread's own device without picking it again; the picker lists
+   the other one as "— Running in <thread title>", and picking it shows it with
+   "Started in <thread title>." under the toolbar. Typing in one device reaches
+   only it. Open a second desktop window on the other thread: both windows show
+   video at once. Stop the other thread's device from the first thread: the
+   panel asks first, and **Cancel** leaves it running. Start AVDs until four
+   devices run (any mix with iOS on a macOS host), then pick the fifth image:
+   **Start** is disabled with "Four devices are running. Stop one to start
+   another."
+   Delete the second thread: its emulator is reaped (the platform page's process
+   check) while the first thread's keeps running, and the first thread's panel,
+   if it showed the deleted thread's device, shows it stopped with **Start**
+   enabled. Record the host's free memory and CPU load with four devices
+   running in the execution report.
+10. **Agents.** In a thread on the environment, ask the agent to list devices,
+    take a screenshot, and close the device. `device_screenshot` returns a PNG
+    no wider than 1080 px. With two threads' agents each opening a different
+    AVD, each `device_screenshot` without a `deviceId` returns its own
+    thread's device, `device_list` marks it `thisThread`, and one agent's
+    `device_close` of the other's device is refused with "… was started by
+    another thread. Ask the user to stop it." In a chat panel of a thread whose
+    Device panel started a device, the panel's agent takes a screenshot of that
+    device without a `deviceId` and closes it. Turn the setting off: the
+    agent's next `device_*` call fails with the "Device previews are off"
+    error.
+11. **Stop and cleanup.** **Stop** the device. Within 10 s the pill shows
     **Stopped**, the platform page's process check finds no `emulator` or
     `qemu-system` process, its discovery file is gone, and
     `adb forward --list` is empty (BiBCode leaves a stopping device's
     scrcpy forward to adb, which drops it with the device, so this checks
-    that adb does). Start the device again, then turn the
-    setting off: the confirmation names the running device, and after it
-    the same checks pass and the panel shows how to turn previews on. Start
-    it once more and stop the server (or quit the desktop that hosts it):
-    the same checks pass after shutdown.
-11. **Crash.** Start a device and kill the `emulator` process
+    that adb does). Start two devices, then turn the
+    setting off: the confirmation names the running devices, and after it
+    the same checks pass for each and the panel shows how to turn previews on.
+    Start them once more and stop the server (or quit the desktop that hosts
+    it): the same checks pass after shutdown.
+12. **Crash.** Start a device and kill the `emulator` process
     (or its `qemu-system` child) from a shell. Within a few seconds the pill
     shows **Failed:** with the reason, and with the profiler on
     `profiler findings --kind subprocess.crash --json` lists a finding
     labelled `android-emulator`. Record
     `profiler events --kind device.lifecycle --json` across the run: `start`,
-    `ready`, `stop`, and `fail` with `failureKind` `exited`.
+    `ready`, `stop`, and `fail` with `failureKind` `exited`, each with
+    `running`, the count of live devices after it.
 
 Record the results in the execution report's device previews section and mark
 each native verification item confirmed or corrected. A correction is a code
@@ -3448,6 +3476,11 @@ BiBCode or Simulator: they find it busy. They fail at once with "Xcode's first
 launch is pending" when `xcodebuild -checkFirstLaunchStatus` exits non-zero,
 as after an Xcode update whose CoreSimulator is not installed yet; open Xcode
 once or run `sudo xcodebuild -runFirstLaunch`, then run them again.
+
+The opt-in tests boot one simulator. Several simulators in one server
+process, and the one state poll that watches them, are first proven by the
+packaged-app procedure's two-simulator step; the fake-runner tests in
+`device::ios` cover the poll's stale-result rules.
 
 Then run the packaged-app procedure in
 [macOS iOS Simulator previews](./macos-desktop.md#ios-simulator-previews).

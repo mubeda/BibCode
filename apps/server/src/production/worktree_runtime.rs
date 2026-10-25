@@ -1756,6 +1756,7 @@ mod tests {
                 mcp: None,
                 codex_home: None,
                 open_url: None,
+                host_thread_id: None,
             })
             .await
             .expect("provider launches");
@@ -4114,6 +4115,7 @@ pub(super) mod removal_test_support {
             mcp: None,
             codex_home: None,
             open_url: None,
+            host_thread_id: None,
         }
     }
 

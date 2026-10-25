@@ -732,6 +732,7 @@ fn crash_launch(provider: &str, state: &Path) -> ProviderLaunchRequest {
             )
         }),
         open_url: None,
+        host_thread_id: None,
     }
 }
 
