@@ -636,5 +636,43 @@ describe("Mermaid diagrams in chat Markdown", () => {
       await waitFor(() => hasDiagram(container), "the evicted diagram never drew again");
       expect(renderedSources.filter((source) => source === FLOWCHART)).toHaveLength(2);
     });
+
+    it("keeps an evicted diagram's drawn height while it draws again", async () => {
+      // jsdom lays nothing out: a body showing a diagram measures 123 px tall.
+      vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (
+        this: HTMLElement,
+      ) {
+        const drawn =
+          this.classList.contains("chat-markdown-mermaid-body") &&
+          this.querySelector(".chat-markdown-mermaid") !== null;
+        return DOMRect.fromRect({ width: 400, height: drawn ? 123 : 0 });
+      });
+      const body = (container: HTMLElement) =>
+        container.querySelector<HTMLElement>(".chat-markdown-mermaid-body")!;
+      const first = await mount(fence(FLOWCHART));
+      await waitFor(() => hasDiagram(first.container), "the first diagram never drew");
+      expect(body(first.container).style.height).toBe("");
+      await unmount(first);
+
+      const others = Array.from({ length: 100 }, (_, index) =>
+        fence(`graph LR\n  N${index} --> M`),
+      );
+      const many = await mount(others.join("\n\n"));
+      await waitFor(() => diagrams(many.container).length === 100, "the other diagrams never drew");
+      await unmount(many);
+
+      // The remount shows the source, held at the diagram's height, until the queue draws it.
+      const remounted = await mount(fence(FLOWCHART));
+      expect(hasDiagram(remounted.container)).toBe(false);
+      expect(body(remounted.container).style.height).toBe("123px");
+      await waitFor(() => hasDiagram(remounted.container), "the evicted diagram never drew again");
+      expect(body(remounted.container).style.height).toBe("");
+      expect(renderedSources.filter((source) => source === FLOWCHART)).toHaveLength(2);
+
+      // A source that never drew reserves nothing.
+      const fresh = await mount(fence(SEQUENCE));
+      expect(hasDiagram(fresh.container)).toBe(false);
+      expect(body(fresh.container).style.height).toBe("");
+    });
   });
 });
