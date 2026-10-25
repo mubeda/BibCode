@@ -1129,7 +1129,7 @@
     "typed-failures/device__refreshCatalog-01.json": "f21e4233466694c02754d2a3c0317c089f31f6634947c5fcc16d02c4997c35cf",
     "typed-failures/device__rotate-00.json": "cb72d09f21daecbf9fe73f32bd9873a53972d49260aff65533807d27a6f53f02",
     "typed-failures/device__rotate-01.json": "f21e4233466694c02754d2a3c0317c089f31f6634947c5fcc16d02c4997c35cf",
-    "stream-shapes/device__subscribeCatalog-00.json": "676f097ee8099e909e6e9f44f6133c48486327731f6660a693b1857f435730d2",
+    "stream-shapes/device__subscribeCatalog-00.json": "ccfe55e4b41e335227add6484e18f3eccf7401518d73f8186752160cd3bc93bf",
     "stream-shapes/device__subscribeFrames-00.json": "9a992cd2715c2efb417543cc4389cc4ff2abd4adfcad7acadd0b08b85505a8dc",
     "typed-failures/filesystem__browse-00.json": "ce0fb93b3a3ef3d9bbcc0bd19cdf8bcd3223f072891f68b0b711fc68b07fe90a",
     "typed-failures/filesystem__browse-01.json": "2ce5c89ac988f67153377ac2cfbabd6af7c67391e8d2c36af2304e1d7cd7caa2",

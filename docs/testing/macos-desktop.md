@@ -554,8 +554,8 @@ values:
 
 ## iOS Simulator previews
 
-Run this on a Mac with Xcode set up and at least one `Shutdown` iPhone
-simulator, after the shared
+Run this on a Mac with Xcode set up and at least two `Shutdown` iPhone
+simulators (step 9 runs two at once), after the shared
 [iOS simulator previews](./cross-platform-validation.md#ios-simulator-previews)
 focused and opt-in tests:
 
@@ -618,12 +618,25 @@ pgrep -fl <udid>                          # no process BiBCode started
 8. **Setting off.** Start the simulator again, wait for **Ready**, and turn
    the setting off: the confirmation names the simulator, and after it the
    checks pass.
-9. **Quit.** Start it once more, wait for **Ready**, and quit the app with
-   ⌘Q: after it exits the checks pass.
-10. **Profiler.** Run
+9. **Two simulators.** In two threads on two worktrees, start a different
+   simulator in each (and, on a host with an AVD, an emulator in a third). Two
+   live simulators in one server process have no earlier evidence: record for
+   each whether it shows video, takes touches and keys (typing in one reaches
+   only it), and rotates, and whether a second desktop window on the other
+   thread shows both at once. Switching threads shows each thread's own
+   simulator. Run `xcrun simctl shutdown <udid>` on one: only that one shows
+   **Failed: Shutdown outside BiBCode**, and the other keeps running. While
+   both run, `sudo fs_usage -w -f exec | grep simctl` shows one `simctl list`
+   about every 2 s for both, not one each. Delete one thread: its simulator shuts down and
+   the other keeps running. If a second simulator cannot run live, record the
+   failure; the release then needs the design's fallback (iOS keeps one live
+   simulator) before it ships.
+10. **Quit.** Start them once more, wait for **Ready**, and quit the app with
+    ⌘Q: after it exits the checks pass for each.
+11. **Profiler.** Run
     `profiler events --kind device.lifecycle --json`: each start has
-    `platform` `ios` and the phases `start`, `ready`, `stop`, with no
-    simulator name or UDID. Optionally start the device and run
+    `platform` `ios` and the phases `start`, `ready`, `stop`, with `running`
+    and no thread, simulator name, or UDID. Optionally start the device and run
     `xcrun simctl shutdown <udid>` from a shell: the pill shows **Failed:
     Shutdown outside BiBCode** within about 3 s, and
     `profiler findings --kind subprocess.crash --json` lists one labelled

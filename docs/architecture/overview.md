@@ -1492,9 +1492,11 @@ are listed in the
   before building a report.
   The device manager (`apps/server/src/device/`) likewise emits
   `device.lifecycle` (`start`, `ready`, `fail`, `stop`, with `platform`
-  `android` or `ios`, and a `failureKind` that includes `busy` for a simulator
-  found running outside BiBCode as its launch began) only while the profiler
-  is on. It reports an emulator that exits on its own as `subprocess.crash`
+  `android` or `ios`, a `failureKind` that includes `busy` for a simulator
+  found running outside BiBCode as its launch began, and `running`, the count
+  of live devices after the transition, so a memory or CPU finding can be read
+  against it) only while the profiler is on. It never names a thread, image, or
+  device. It reports an emulator that exits on its own as `subprocess.crash`
   labelled `android-emulator`, and a simulator shut down or deleted outside
   BiBCode as one labelled `ios-simulator`. A simulator has no exit status, so
   that report always says `exit 1`, with the `launchd_sim` pid, or pid `0` when
@@ -2001,8 +2003,8 @@ bounded memory, and works while the server is stopped.
 ## Device previews
 
 `apps/server/src/device/` runs Android emulators and, on a macOS server, iOS
-simulators, at most one running device per platform per environment, and shows
-them in a right-panel `device` surface. Everything is off until the environment's
+simulators, up to four live devices per environment in any mix of platforms and
+one per image, and shows them in each thread's right-panel `device` surface. Everything is off until the environment's
 `enableDevicePreviews` setting (default `false`, toggled per environment at
 **Settings → Mobile emulators**) is on; servers that support it advertise the
 `devicePreviews` capability, and older servers get no device RPC. A client
@@ -2035,7 +2037,8 @@ Each failure becomes the `availability` of the catalog's Android entry
 actionable message. The catalog lists one entry per platform, each with its
 own `availability` and `images` (`{ id, displayName, inUseElsewhere? }`), and
 every device as
-`{ deviceId, platform, imageId, state, orientation, canRotate }`. A discovery
+`{ deviceId, platform, imageId, state, orientation, canRotate, threadId? }`, in
+the order they were opened. A discovery
 result serves for 30 s; `device.refreshCatalog` (the panel's **Refresh
 devices**) and the MCP `device_list` tool always rerun it. Display
 names are unique within a platform: where two images would share one, as two
@@ -2044,13 +2047,55 @@ gets `·` and a tag, the AVD's name or the last four characters of the
 simulator's UDID (the whole UDID if those also match).
 
 **Lifecycle.** `DeviceManager` owns the catalog (`device.subscribeCatalog`) and
-allows one running device per platform; a second `device.open` on that
-platform fails with `DeviceLimitError` naming the running device's display
-name, and an image already running outside BiBCode fails with
+admits `MAX_RUNNING_DEVICES` (four) live devices per environment: a slot counts
+until it has `stopped` or `failed`, so a `stopping` device still holds its
+place, and a fifth `device.open` fails with `DeviceLimitError`. Its `running`
+names the first live device on the requested platform in catalog order (else
+the first live device), the device an older client's limit banner stops. An
+image runs once: opening an image whose device is `starting`, `booting`, or
+`ready` returns that device's id, starts nothing, and keeps its owner; opening
+a `stopping` image fails with `DeviceNotReadyError` until it has stopped.
+Admission runs unlocked first and again under the table lock, and the unlocked
+attach comes before the backend's `check_available`, so iOS never calls a
+simulator BiBCode booted busy; when two opens of one simulator race and the
+second's check answers `Busy`, the open looks under the lock for the first's
+device and returns it. An image already running outside BiBCode fails with
 `DeviceBusyError`. A device moves `starting → booting → ready →
 stopping → stopped`, or to `failed` with a reason (`exited`, `bootTimeout`,
-`spawn`, `unresponsive`, or `busy`). The four most recent ended devices stay
-in the catalog so their reason stays visible.
+`spawn`, `unresponsive`, or `busy`). The catalog lists devices in open order,
+and the four most recent ended devices of the environment stay in it so their
+reason stays visible.
+
+**Owners.** `device.open` takes an optional `threadId`, the root thread the
+device is for: a chat panel's host, else the thread. The server trims it and
+refuses a blank one with `DeviceInputError`, so every published owner decodes
+as a `ThreadId`, and the snapshot keeps it after the device ends. The owner is
+an unverified label from a client that can already open and close every device,
+not a permission: it drives the pane's selection, the thread-deletion stop, and
+the agent refusals below. Thread deletion runs the `close_devices` effect after
+the previews close, which calls `DeviceManager::stop_thread`: under the table
+lock it records the thread among the last 256 deletions and starts the stop of
+every live device it owns, then returns without waiting for the reap. `open`
+refuses an owner on that list with `DeviceNotFoundError`, before discovery and
+again under the insertion lock, so a deletion that lands while an open waits on
+discovery or `check_available` starts nothing. Archiving stops nothing. The
+manager never reads the read model and persists nothing: devices, owners, and
+the deletion list end with the server.
+
+**The Device pane.** `ChatView` renders `DevicePanel` for the active thread and
+passes its root thread (chat panels render only Activity, so their devices are
+their host's), and the pane's session is keyed by thread. The thread's device
+surface stores the image the pane last picked or started
+(`{ id: "device", kind: "device", image?: { platform, imageId } }`, an image id
+rather than a per-open device id); closing the tab discards it. Selection is a
+pure function of the catalog, that pick, and the root id: the pick while the
+catalog lists the image, else the image of the thread's oldest live device,
+else of its newest ended one, else the first image nobody runs. The shown device
+is the selected image's live device, else its newest ended attempt. The picker
+says whose device runs each image (`Running here`, `Running in <thread>`, or
+`Running`), another thread's device carries a `Started in <thread>.` line,
+Start is disabled at four live devices, and stopping another thread's device
+asks first.
 
 - The emulator starts with `-avd <name>`, `-no-window`, `-no-audio`,
   `-no-boot-anim`, `-port <even console port 5554–5682>`,
@@ -2058,6 +2103,11 @@ in the catalog so their reason stays visible.
   `-gpu swiftshader_indirect` on a Linux server with neither `DISPLAY` nor
   `WAYLAND_DISPLAY`. The AVD name is one argument and never meets a shell. It
   is a registered helper (`android-emulator`) in its own process group or Job.
+  The ports are probed before the emulator binds them; the backend reserves the
+  console and adb pair and a picked gRPC port of every launch until its device
+  ends, its launch fails, or it is cancelled, so two emulators starting at once
+  never pick the same pair. A program outside the server can still take a
+  probed port first, and that device fails with the emulator's reason.
 - BiBCode never sets `ANDROID_EMULATOR_HOME`, because that also redirects AVD
   lookup. It reads the gRPC port and token from the emulator's discovery file,
   searching `emulator::default_discovery_dirs` in order: the OS runtime
@@ -2329,12 +2379,18 @@ The device is `booting` from the boot until the screen is attached, then
 `ready`. BiBCode shuts down only simulators it booted (`IosBackend::booted`):
 a failed `simctl boot` leaves the simulator alone, since it may be someone
 else's, and a simulator that was shut down outside BiBCode is not shut down
-again, since someone may have booted it since. A stop releases input, detaches
-the screen, unregisters `launchd_sim`, and runs `simctl shutdown`. The
-simulator's state is polled every 2 s; one shut down or deleted outside
+again, since someone may have booted it since. A stop releases input,
+unregisters the simulator from the state poll, detaches the screen,
+unregisters `launchd_sim`, and runs `simctl shutdown`. One backend task polls
+every running simulator with a single `simctl list` every 2 s while any runs:
+it copies the registered (UDID, generation) pairs before listing and applies
+the listing under the registry lock only to pairs still registered under the
+same generation, so a simulator that registered later, stopped meanwhile, or
+was stopped and opened again is never marked. One shut down or deleted outside
 BiBCode fails the device with `Shutdown outside BiBCode` or
 `Deleted outside BiBCode` and raises `subprocess.crash` (see
-[Profiler](#profiler)). Simulators left booted by a server that crashed are
+[Profiler](#profiler)). The last unregister cancels and joins the task, so no
+poll outlives `DeviceManager::shutdown`. Simulators left booted by a server that crashed are
 not reaped: the next start lists them as running outside BiBCode.
 
 **Live screen.** After boot, the backend attaches to the simulator's main
@@ -2446,11 +2502,21 @@ groups:
   spending one of those retries; a screen that has not shown a frame yet still
   falls back after 5 s.
 
-**Agents.** Coding agents reach the same device through four MCP tools on the
-provider MCP endpoint: `device_list`, `device_open` (takes `platform`, which
-defaults to `android`, and `imageId`; waits up to 180 s for `ready`),
-`device_screenshot` (a PNG at most 1080 px wide; a view-only simulator's is
-its full-size `simctl` JPEG), and `device_close`.
+**Agents.** Coding agents reach the same devices through four MCP tools on the
+provider MCP endpoint, acting for their root thread: `issue_mcp_credential`
+stores it as `PreviewScope.owner_thread_id`, the thread row's `host_thread_id`
+for a chat panel (carried on `ProviderLaunchRequest`), else the thread, so a
+chat panel's agent and its host's Device pane share devices. `device_list`
+marks each device `thisThread`; `device_open` (takes `platform`, which defaults
+to `android`, and `imageId`; waits up to 180 s for `ready`) records the owner,
+returns the owner's running image or an unowned one, and refuses an image
+another thread runs with `DeviceBusyError`; `device_screenshot` (a PNG at most
+1080 px wide; a view-only simulator's is its full-size `simctl` JPEG) without
+`deviceId` takes the caller's only live device, else the only live device, else
+fails listing them; and `device_close` refuses another thread's device with
+`DeviceBusyError`, while a device without an owner, from an older client, can
+be closed by any agent. These refusals keep tasks apart; they are not access
+control.
 They are listed and callable only while `DeviceManager::enabled()` is true;
 with the setting off the tools disappear from `tools/list` and a call fails
 with `DevicePreviewsDisabledError`. There is no per-call scope check, by
@@ -2459,7 +2525,7 @@ when it launches a thread's provider, so holding it is the operate grant, as
 for the `preview_*` tools. If MCP credentials are ever issued to
 lower-privileged principals, both tool families need a real scope check.
 `DeviceTools::call` receives the calling thread's `PreviewScope` and logs its
-environment and thread ids with the operation at `debug`, never the
+environment, thread, and owner ids with the operation at `debug`, never the
 arguments.
 
 **Ownership and shutdown.** `ProductionRuntime` calls

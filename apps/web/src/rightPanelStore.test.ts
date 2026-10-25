@@ -1613,6 +1613,77 @@ describe("rightPanelStore device surface", () => {
     expect(hydrated).toEqual(persisted.byThreadKey);
   });
 
+  it("remembers each thread's picked image on its device surface (#170)", async () => {
+    const store = useRightPanelStore.getState();
+    store.open(refA, "device");
+    store.open(refB, "device");
+    store.setDeviceImage(refA, { platform: "ios", imageId: "UDID-1" });
+    const surfaceOf = (ref: typeof refA) =>
+      selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, ref).surfaces[0];
+    expect(surfaceOf(refA)).toEqual({
+      id: "device",
+      kind: "device",
+      image: { platform: "ios", imageId: "UDID-1" },
+    });
+    expect(surfaceOf(refB)).toEqual({ id: "device", kind: "device" });
+    // The same pick again leaves the state as it was.
+    const before = useRightPanelStore.getState().byThreadKey;
+    store.setDeviceImage(refA, { platform: "ios", imageId: "UDID-1" });
+    expect(useRightPanelStore.getState().byThreadKey).toBe(before);
+
+    const persisted = { byThreadKey: useRightPanelStore.getState().byThreadKey };
+    useRightPanelStore.setState({ byThreadKey: {} });
+    const { byThreadKey: hydrated } = await hydrate({ state: persisted, version: 10 });
+    expect(hydrated).toEqual(persisted.byThreadKey);
+  });
+
+  it("keeps no pick for a thread without a device surface, and drops it with the tab", () => {
+    const store = useRightPanelStore.getState();
+    store.setDeviceImage(refA, { platform: "android", imageId: "Pixel_8" });
+    expect(useRightPanelStore.getState().byThreadKey).toEqual({});
+    store.open(refA, "device");
+    store.setDeviceImage(refA, { platform: "android", imageId: "Pixel_8" });
+    store.closeSurface(refA, "device");
+    store.open(refA, "device");
+    expect(
+      selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA).surfaces,
+    ).toEqual([{ id: "device", kind: "device" }]);
+  });
+
+  it("keeps a well-formed picked image and drops a malformed one", () => {
+    const sanitized = (image: unknown) =>
+      migratePersistedRightPanelState({
+        byThreadKey: {
+          "env-1:thread-A": {
+            isOpen: true,
+            activeSurfaceId: "device",
+            surfaces: [{ id: "device", kind: "device", image }],
+          },
+        },
+      }).byThreadKey["env-1:thread-A"]!.surfaces[0];
+    expect(sanitized({ platform: "android", imageId: "Pixel_8" })).toEqual({
+      id: "device",
+      kind: "device",
+      image: { platform: "android", imageId: "Pixel_8" },
+    });
+    for (const image of [
+      { platform: "windows", imageId: "Pixel_8" },
+      { platform: "ios", imageId: "" },
+      { platform: "ios" },
+      { platform: "ios", imageId: "UDID-1", deviceId: "d-1" },
+      "android:Pixel_8",
+      null,
+    ]) {
+      const surface = sanitized(image);
+      expect(surface).toEqual(
+        // Extra fields are dropped, not the pick; anything else loses the pick only.
+        typeof image === "object" && image !== null && "deviceId" in image
+          ? { id: "device", kind: "device", image: { platform: "ios", imageId: "UDID-1" } }
+          : { id: "device", kind: "device" },
+      );
+    }
+  });
+
   it("drops unknown kinds and a device surface with the wrong id", () => {
     expect(
       migratePersistedRightPanelState({
