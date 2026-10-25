@@ -1369,6 +1369,80 @@ remain available. GitLab version gates close when the version cannot be read;
 the wire context exposes a null version, and internal context retains the
 reason for permission computation. No host data or CLI stderr is logged.
 
+## Pipelines contract boundary
+
+`packages/contracts/src/pipelines.ts` defines a project's CI pipelines: list
+rows, a pipeline's stages, groups and jobs, a job, and byte windows of a job
+log. It reuses `PullRequestsPipelineStatus`, `PullRequestsPipelineStage`,
+`PullRequestsActor` and `PullRequestsOperationError`, whose optional
+`retryAfterSeconds` carries the host's backoff deadline on `rate_limited`
+answers. Route identifiers are the host's global ids (GitLab pipeline and job
+`id`, GitHub run and job `id`); `iid` and `run_number` are display only. The
+context read stays `pullRequests.getContext`, so both modules share one
+provider context, sign-in state and unavailable copy.
+
+| Method                   | Required scope       | Responsibility                                                                   |
+| ------------------------ | -------------------- | -------------------------------------------------------------------------------- |
+| `pipelines.list`         | `orchestration:read` | Page the project's pipelines for a scope (`all`, `running`, `finished`) and ref. |
+| `pipelines.get`          | `orchestration:read` | Read one pipeline's header, stages, groups and jobs.                             |
+| `pipelines.getJob`       | `orchestration:read` | Read one job: runner, tags, artifacts, log size, erasure.                        |
+| `pipelines.getJobLog`    | `orchestration:read` | Read a window of a job log by byte offset (`tail`, `offset`, `before`).          |
+| `pipelines.readSnapshot` | `orchestration:read` | Return the stored list, pipeline and job rows with no host call.                 |
+| `pipelines.subscribe`    | `orchestration:read` | Stream (GitLab): name what the cooperative poller stored.                        |
+
+`capabilities.pipelinesReads` is advertised only by a server that registers all
+six reads; `pipelinesMutations` (`pipelines.runAction`) stays false until that
+method is registered. Both decode as false from older servers. Every read
+carries the checkout's `cwd` and a `refresh` kind (`user`, `follow` for log
+catch-up, `timer`); ids are positive and range-checked to a JavaScript
+`Number` before any read.
+
+Every list page, pipeline and job answer carries `revision`, the generation
+stamp taken before its host read, equal to its stored row's generation, so
+the clients' `shownCopy` and `keepNewestCopy` pick between live, stored and
+polled copies unchanged. Successful unary reads store the display rows
+(`pipelines_list` for first pages only, `pipelines_detail` up to 1 MiB,
+`pipelines_job`) with the account login that read them; `readSnapshot` paints
+a row only for the login of the host's stored context row, on both providers.
+Log text is never stored. Every read checks the host-wide backoff deadline
+first and answers `rate_limited` without a host call while it is ahead; a 429
+backs off every merge request and pipelines reader of the host for the later
+of the ladder step (60, 120, 300 s) and the provider's `Retry-After` or reset
+header, capped at one hour. A list's `count` (at most 1,000) is read on a
+first page's `user` read, and otherwise reused for 5 minutes.
+`not_authenticated` invalidates the shared context and deletes the host's
+rows; a `forbidden` or `not_found` is about the resource that refused and
+deletes only its rows (that list key, pipeline or job), leaving the Pull
+Requests context and snapshots in place.
+
+`pipelines.subscribe` runs only for GitLab and only with a database; GitHub
+answers `unavailable`. Its first event is all false. One cooperative poller
+per (host, project, list key) runs inside the subscribe calls that share it: it
+reads the first page every 20 s and each subscribed pipeline that is not
+terminal every 10 s (at most three per key in join order; 20 s after 30
+minutes without a change), stores the rows that changed, and names them
+(`list`, `pipeline`) as cumulative revisions per subscriber, so a full stream
+or a lagged receiver catches up on the next event and a joining subscriber is
+not sent the rows it painted. It never reads `count`, jobs or logs; a pipeline
+whose stored row is already terminal is not read, and one seen terminal is
+read once more and then left. A `forbidden` or `not_found` on one pipeline
+deletes its rows, names it once and stops reading it; a refused list or a lost
+sign-in ends the key's subscriptions.
+
+Logs are byte windows whose offsets always fall on character starts. On a
+GitLab host a one-byte `byte_offset=1&byte_limit=1` probe, sent after the
+first whole download of at least two bytes, proves whether ranges are
+honored; until it answers, logs are downloaded whole. A proved host reads
+512,000-byte windows: a finished log opens on its last window (from the
+archived trace's size), a running one from the start, and a `follow` read
+that still fills its window at or past 2,048,000 bytes answers
+`unavailable: too_large_live`. Followers of one running log share its last
+tail for 4 s. A whole download keeps the last 16 MiB (`truncatedHead`) in
+server memory (`LogCache`) and serves 1 MiB windows from the end, with
+absolute `firstLine` when nothing was dropped. A trace 404 is told apart by a
+job read: `not_started` for a job that is not terminal, `erased`, `no_output`,
+or `not_found` only when the job itself is missing.
+
 ## Worktree catalog flow
 
 The catalog protocol is server-resolved and capability gated:

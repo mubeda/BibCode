@@ -100,6 +100,12 @@ pub const ACTIVE_RPC_METHODS: &[RpcMethodSpec] = &[
     read_unary("orchestration.replayEvents"),
     read_stream("orchestration.subscribeShell"),
     read_stream("orchestration.subscribeThread"),
+    read_unary("pipelines.get"),
+    read_unary("pipelines.getJob"),
+    read_unary("pipelines.getJobLog"),
+    read_unary("pipelines.list"),
+    read_unary("pipelines.readSnapshot"),
+    read_stream("pipelines.subscribe"),
     mutation_unary("preview.claimOpenRequest"),
     mutation_unary("preview.close"),
     mutation_unary("preview.gatewayOpen"),
@@ -256,6 +262,26 @@ mod tests {
         for name in ["pullRequests.runAction", "pullRequests.checkout"] {
             assert!(ACTIVE_RPC_METHODS.contains(&mutation_unary(name)), "{name}");
         }
+    }
+
+    #[test]
+    fn pipelines_reads_are_registered_with_their_modes() {
+        for name in [
+            "pipelines.list",
+            "pipelines.get",
+            "pipelines.getJob",
+            "pipelines.getJobLog",
+            "pipelines.readSnapshot",
+        ] {
+            assert!(ACTIVE_RPC_METHODS.contains(&read_unary(name)), "{name}");
+        }
+        assert!(ACTIVE_RPC_METHODS.contains(&read_stream("pipelines.subscribe")));
+        assert!(
+            !ACTIVE_RPC_METHODS
+                .iter()
+                .any(|method| method.name == "pipelines.runAction"),
+            "the mutation is not served yet"
+        );
     }
 
     #[test]

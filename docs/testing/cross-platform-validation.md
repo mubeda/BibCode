@@ -699,6 +699,25 @@ For GitLab poller, pipeline or snapshot changes, also run the ignored polling
 harness with `bash scripts/measure-gitlab-merge-request-load.sh` and record its
 `HARNESS_SUBSCRIBE_JSON` (requests an hour, spawns, delivery) in the report.
 
+For Pipelines server reads (`pipelines.*`: the GitLab list, pipeline, job and
+log reads, `LogCache`, the range probe, the pipelines poller, the shared 429
+ladder, or their snapshot rows), run from the repository root:
+
+```sh
+cargo test -p bibcode-server --lib pull_requests::pipelines -j 2
+cargo test -p bibcode-server --lib pull_requests::gitlab::pipelines -j 2
+cargo test -p bibcode-server --lib pull_requests::backoff -j 2
+cargo test -p bibcode-server --lib pull_requests::gitlab::poll -j 2
+cargo test -p bibcode-server --lib pull_requests::tripwires -j 2
+cargo test -p bibcode-server --lib production::pipelines_rpc -j 2
+cargo test -p bibcode-server --test rpc_wire -j 2
+vp test run packages/contracts/src/pipelines.test.ts packages/contracts/src/environment.test.ts packages/contracts/src/settings.test.ts
+```
+
+The service tests resolve a checkout through fake `git` and `glab` scripts and
+run on Unix only; the poller tests use an in-memory provider and run on every
+platform.
+
 For provider detection of self-hosted hosts (the recorded host observation,
 remote parsing, status classification, and the create action's provider check
 before anything is published), also run:

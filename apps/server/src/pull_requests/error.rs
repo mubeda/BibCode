@@ -33,6 +33,15 @@ pub struct PullRequestsOperationError {
     pub message: String,
     pub host_detail: Option<String>,
     pub retryable: bool,
+    /// How long the host asked reads to pause (the backoff deadline), on
+    /// `rate_limited` answers only. Older clients ignore it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_after_seconds: Option<u32>,
+}
+
+/// Whole seconds for `retry_after_seconds`; pauses are capped at an hour.
+pub fn retry_seconds(delay: std::time::Duration) -> u32 {
+    u32::try_from(delay.as_secs()).unwrap_or(u32::MAX)
 }
 
 impl PullRequestsOperationError {
@@ -63,6 +72,7 @@ impl PullRequestsOperationError {
             message: message.into(),
             host_detail: None,
             retryable: matches!(code, "timeout" | "rate_limited" | "host_unreachable"),
+            retry_after_seconds: None,
         }
     }
 }

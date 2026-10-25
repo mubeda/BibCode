@@ -8,11 +8,12 @@
         "_tag": "Fail",
         "error": {
           "_tag": "PullRequestsOperationError",
-          "operation": "#^",
-          "code": "\"pQFR\\$b2q",
-          "message": "=",
-          "hostDetail": "zu.}",
-          "retryable": false
+          "operation": "^~DQ\"pQFR\\",
+          "code": "toString",
+          "message": "�",
+          "hostDetail": null,
+          "retryable": false,
+          "retryAfterSeconds": 5
         }
       }
     ]

@@ -8,11 +8,12 @@
         "_tag": "Fail",
         "error": {
           "_tag": "PullRequestsOperationError",
-          "operation": "W",
-          "code": "?jG{&GXt:_",
-          "message": "34",
-          "hostDetail": "",
-          "retryable": true
+          "operation": "toString",
+          "code": "%?jG{",
+          "message": "-1",
+          "hostDetail": null,
+          "retryable": true,
+          "retryAfterSeconds": 57
         }
       }
     ]

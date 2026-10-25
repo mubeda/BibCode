@@ -94,6 +94,16 @@ describe("execution environment contracts", () => {
       gitPullRequestBranchSelection: true,
     });
   });
+  it("defaults Pipelines capabilities off for older servers and preserves advertised support", () => {
+    expect(decodeTerminalCapabilities({})).toMatchObject({
+      pipelinesReads: false,
+      pipelinesMutations: false,
+    });
+    expect(decodeTerminalCapabilities({ pipelinesReads: true })).toMatchObject({
+      pipelinesReads: true,
+      pipelinesMutations: false,
+    });
+  });
   it("defaults the profiler capability off for older servers and preserves advertised support", () => {
     expect(decodeTerminalCapabilities({}).profiler).toBe(false);
     expect(decodeTerminalCapabilities({ profiler: true }).profiler).toBe(true);

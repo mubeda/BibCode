@@ -2,6 +2,7 @@ mod actions;
 mod files;
 mod graphql;
 mod parse;
+pub(super) mod pipelines;
 pub(super) mod poll;
 pub(crate) mod refresh;
 mod review_positions;
@@ -59,6 +60,9 @@ pub struct GitLabHost {
     contexts: super::cache::ContextCache<(String, String), HostContext>,
     /// Repository-wide tab totals, reused across filter changes and pages.
     totals: super::cache::ContextCache<(String, String), ListCounts>,
+    /// Lowercased hosts whose GraphQL lacks a newer pipeline field, for the
+    /// process lifetime: their pipelines reads use the baseline documents.
+    pipelines_baseline: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl GitLabHost {
@@ -67,7 +71,17 @@ impl GitLabHost {
             runner,
             contexts: Default::default(),
             totals: Default::default(),
+            pipelines_baseline: Default::default(),
         }
+    }
+
+    /// The last good context read for the scope, at any age, without a host
+    /// call: the pipelines poller stamps its rows with its login and builds
+    /// links on its web URL.
+    pub(in crate::pull_requests) fn known_context(&self, scope: &HostScope) -> Option<HostContext> {
+        self.contexts
+            .get_any_age(&scope.context_key())
+            .map(|(_, context)| context)
     }
 
     async fn viewer(

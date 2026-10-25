@@ -94,6 +94,77 @@ pub fn reviewer_rereview(project: &str, iid: u64, user_id: u64) -> String {
     )
 }
 
+/// The fields a pipelines list row and a pipeline header read.
+const PIPELINE_HEADER_FIELDS: &str = "id iid name ref sha status detailedStatus { name } source latest \
+yamlErrors failureReason createdAt startedAt finishedAt duration queuedDuration path \
+user { name username } commit { shortId title webPath } mergeRequest { iid title webPath } \
+retryable cancelable userPermissions { updatePipeline cancelPipeline }";
+
+/// Newer fields some GitLab versions lack: a "Field doesn't exist" answer
+/// retries once with the baseline document, which leaves them out.
+const PIPELINE_OPTIONAL_FIELDS: &str = "mergeRequestEventType type stuck refPath";
+
+/// One pipelines page, fifteen rows as GitLab's own page, each with its stage
+/// strip. `count` is selected only on a first page that needs it. A new
+/// document, never merged into the merge request ones.
+pub fn pipelines_list_query(baseline: bool) -> String {
+    let optional = if baseline {
+        ""
+    } else {
+        PIPELINE_OPTIONAL_FIELDS
+    };
+    format!(
+        "query PipelinesGitLabList($projectPath:ID!, $first:Int!, $after:String, \
+$scope:PipelineScopeEnum, $ref:String, $withCount:Boolean!) {{
+  project(fullPath:$projectPath) {{
+    pipelines(first:$first, after:$after, scope:$scope, ref:$ref) {{
+      pageInfo {{ hasNextPage endCursor }}
+      count(limit:1000) @include(if:$withCount)
+      nodes {{
+        {PIPELINE_HEADER_FIELDS} {optional}
+        stages {{ nodes {{ name status detailedStatus {{ name }} }} }}
+      }}
+    }}
+  }}
+}}"
+    )
+}
+
+/// One pipeline by its global id: the header, then stages, groups and up to
+/// 100 jobs per group.
+pub fn pipeline_detail_query(baseline: bool) -> String {
+    let optional = if baseline {
+        ""
+    } else {
+        PIPELINE_OPTIONAL_FIELDS
+    };
+    format!(
+        "query PipelinesGitLabDetail($projectPath:ID!, $id:CiPipelineID!) {{
+  project(fullPath:$projectPath) {{
+    pipeline(id:$id) {{
+      {PIPELINE_HEADER_FIELDS} {optional}
+      totalJobs usesNeeds
+      stages {{ nodes {{
+        name status detailedStatus {{ name }}
+        groups {{ nodes {{
+          name size detailedStatus {{ name }}
+          jobs(first:100) {{
+            pageInfo {{ hasNextPage }}
+            nodes {{
+              id name kind status detailedStatus {{ name }} allowFailure
+              startedAt finishedAt duration queuedDuration webPath
+              retryable cancelable playable manualJob
+              downstreamPipeline {{ id path detailedStatus {{ name }} }}
+            }}
+          }}
+        }} }}
+      }} }}
+    }}
+  }}
+}}"
+    )
+}
+
 pub fn override_requested_changes(project: &str, iid: u64) -> String {
     format!(
         "mutation PullRequestsOverrideRequestedChanges {{ mergeRequestUpdate(input: {{ projectPath: {}, iid: {}, overrideRequestedChanges: true }}) {{ errors }} }}",

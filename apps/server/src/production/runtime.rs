@@ -66,6 +66,7 @@ use crate::{
             ProviderRewind, SetupScriptLaunch, process_compatible_path,
         },
         orchestration_rpc::register_orchestration_rpc_with_delivery_and_availability,
+        pipelines_rpc::{PipelinesRpcServices, register_pipelines_rpc},
         provider_runtime::{
             NativeProviderDriverFactory, ProviderRuntimeSupervisor, SupervisorOptions,
             prepare_thread_rewind, reconcile_abandoned_provider_sessions,
@@ -635,6 +636,12 @@ impl ProductionRuntime {
             WorktreeCatalogRpcServices::new(worktree_catalog.clone(), orchestration.clone())
                 .with_status_broadcaster(status_broadcaster.clone())
                 .with_removal_quiescer(Arc::new(worktree_runtime.clone()));
+        // One service: the Pipelines reads share its contexts, sign-in
+        // state, backoff, fences and snapshot table.
+        register_pipelines_rpc(
+            &mut registry,
+            PipelinesRpcServices::new(pull_requests.service.pipelines()),
+        );
         register_pull_requests_rpc(
             &mut registry,
             pull_requests.with_worktrees(worktree_catalog_rpc.clone()),

@@ -1,6 +1,6 @@
 import * as Schema from "effect/Schema";
 
-import { TrimmedNonEmptyString } from "./baseSchemas.ts";
+import { NonNegativeInt, TrimmedNonEmptyString } from "./baseSchemas.ts";
 import { GitManagerBlockedReason } from "./gitManager.ts";
 import { SourceControlProviderKind } from "./sourceControl.ts";
 
@@ -889,5 +889,7 @@ export class PullRequestsOperationError extends Schema.TaggedError<PullRequestsO
     message: TrimmedNonEmptyStringSchema,
     hostDetail: Schema.NullOr(Schema.String),
     retryable: Schema.Boolean,
+    /** The host's backoff deadline in seconds, on `rate_limited` answers. Absent from older servers. */
+    retryAfterSeconds: Schema.optional(NonNegativeInt),
   },
 ) {}
