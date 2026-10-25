@@ -143,6 +143,7 @@
       "type": "content.delta",
       "threadId": "provider-thread-1",
       "turnId": "turn-1",
+      "itemId": "msg-thread-1:0",
       "payload": {
         "streamKind": "reasoning_text",
         "delta": "Let"

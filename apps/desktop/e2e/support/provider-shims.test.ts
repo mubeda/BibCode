@@ -581,6 +581,54 @@ describe("generated provider shims", () => {
     ]);
   });
 
+  it("streams a Claude thinking block, a tool call and an answer for a reasoning prompt", () => {
+    const fixture = prepareProviderFixture();
+    const responses = exchangeJsonLines(
+      fixture,
+      "claudeAgent",
+      ["--print", "--input-format", "stream-json", "--output-format", "stream-json"],
+      [
+        {
+          type: "user",
+          session_id: "claude-fixture",
+          message: { content: [{ type: "text", text: "Think it through [[reasoning]]" }] },
+        },
+      ],
+    );
+    interface StreamEventFrame {
+      readonly type?: string;
+      readonly content_block?: { readonly type?: string };
+      readonly delta?: { readonly type?: string; readonly text?: string };
+    }
+    const streamEvents = responses
+      .filter((response) => response.type === "stream_event")
+      .map((response) => response.event as StreamEventFrame);
+    const blockTypes = streamEvents
+      .filter((event) => event.type === "content_block_start")
+      .map((event) => event.content_block?.type);
+    expect(blockTypes).toEqual(["thinking", "tool_use", "text"]);
+    const deltaTypes = new Set(
+      streamEvents
+        .filter((event) => event.type === "content_block_delta")
+        .map((event) => event.delta?.type),
+    );
+    expect([...deltaTypes].toSorted()).toEqual(["signature_delta", "text_delta", "thinking_delta"]);
+    // Each answer names its prompt, so a later turn's answer is told apart from this one.
+    const answer = streamEvents
+      .flatMap((event) => (event.delta?.type === "text_delta" ? [event.delta.text ?? ""] : []))
+      .join("");
+    expect(answer).toContain("Fixture reasoning answer line 24 (Think it through).");
+    expect(responses).toContainEqual(
+      expect.objectContaining({
+        type: "user",
+        message: expect.objectContaining({
+          content: [expect.objectContaining({ type: "tool_result" })],
+        }),
+      }),
+    );
+    expect(responses.at(-1)).toMatchObject({ type: "result", subtype: "success" });
+  });
+
   it("speaks Cursor ACP session and prompt protocols", () => {
     const fixture = prepareProviderFixture();
     const responses = exchangeJsonLines(

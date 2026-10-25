@@ -324,6 +324,7 @@ function buildProps(overrides: Partial<MessagesTimelineProps>): MessagesTimeline
     contentInsetEndAdjustment: 0,
     onIsAtEndChange: () => {},
     onManualNavigation: () => {},
+    onReasoningRowToggle: () => {},
     isHostFindSurface: true,
     ...overrides,
   };

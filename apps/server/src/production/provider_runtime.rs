@@ -814,6 +814,8 @@ type SessionPublicationFence = Arc<Mutex<SessionPublicationState>>;
 struct SessionEntry {
     launch: ProviderLaunchRequest,
     driver: Arc<dyn ProviderDriver>,
+    /// Settles what the session leaves streaming once its pump is reaped, whoever detaches it.
+    engine: OrchestrationEngine,
     configuration_healthy: bool,
     resume_cursor: Option<Value>,
     runtime_payload: Option<Value>,
@@ -2380,6 +2382,26 @@ pub async fn reconcile_abandoned_provider_sessions(
     const RESTART_ERROR: &str =
         "Provider session ended when BiBCode stopped. Review delivery status before continuing.";
     let repositories = engine.repositories();
+    // No session is live yet, so every reasoning row still streaming is orphaned. This reads
+    // the reasoning table itself: a stopped session's runtime row, which the loop below visits,
+    // is already gone.
+    match repositories.list_streaming_reasoning().await {
+        Ok(rows) => {
+            if let Err(error) = settle_streaming_reasoning_rows(
+                engine,
+                rows,
+                &format!("provider-restart-reconcile:{}", Uuid::new_v4()),
+                &now(),
+            )
+            .await
+            {
+                tracing::warn!(%error, "reasoning remained streaming after startup reconciliation");
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%error, "failed to read streaming reasoning for startup reconciliation");
+        }
+    }
     let runtimes = repositories
         .list_provider_session_runtimes()
         .await
@@ -4266,6 +4288,54 @@ mod workspace_loss_tests {
         .unwrap();
         // This read is behind the terminal engine command, after the complete core batch.
         engine.read_events(0).await.unwrap();
+    }
+
+    /// #173: stopping a session aborts its pump, which cannot settle its own reasoning; the
+    /// stop does, so no thought is left reading "Thinking" on a thread without a session.
+    #[tokio::test]
+    async fn stopping_a_session_settles_the_reasoning_it_left_streaming() {
+        let f = Fixture::new(false).await;
+        let (activity, mut sessions) = direct_session(&f).await;
+        enqueue(
+            &f,
+            [ProviderEvent {
+                item_id: Some("thought-1".into()),
+                ..core_event(
+                    "content.delta",
+                    "turn-1",
+                    json!({"streamKind":"reasoning_text","delta":"Half a thought"}),
+                )
+            }],
+        );
+        let repositories = f.engine.repositories();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while repositories
+                .list_streaming_reasoning_by_thread("t1".into())
+                .await
+                .unwrap()
+                .is_empty()
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the thought is written while it streams");
+
+        stop_session(&repositories, &activity, &mut sessions, "t1")
+            .await
+            .unwrap();
+
+        let rows = repositories
+            .list_reasoning_by_thread("t1".into())
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.text.as_str(), row.is_streaming))
+                .collect::<Vec<_>>(),
+            [("Half a thought", false)]
+        );
+        f.shutdown().await;
     }
 
     #[tokio::test]
@@ -7523,6 +7593,7 @@ async fn launch_session(
         SessionEntry {
             launch: request,
             driver,
+            engine: engine.clone(),
             configuration_healthy: true,
             resume_cursor: started.resume_cursor,
             runtime_payload: started.runtime_payload,
@@ -8479,10 +8550,19 @@ fn spawn_event_pump(
             settled_tx
         };
         let mut last_exit_reason: Option<String> = None;
+        let mut reasoning = ReasoningCoalescer::default();
         let settled_tx = loop {
+            let reasoning_due = reasoning.next_deadline();
             tokio::select! {
                 biased;
                 () = cancellation.cancelled() => return,
+                // Before the next event, so a busy stream cannot hold a thought back.
+                () = async { tokio::time::sleep_until(reasoning_due.expect("guarded")).await }, if reasoning_due.is_some() => {
+                    let due = reasoning.take_due(Instant::now());
+                    if !dispatch_reasoning_commands(&engine, &publication, &cancellation, &launch.thread_id, due).await {
+                        return;
+                    }
+                }
                 event = driver.next_event() => {
                     let Some(mut event) = event else {
                         break begin_settlement();
@@ -8676,6 +8756,30 @@ fn spawn_event_pump(
                     if event.event_type == ACTIVITY_ONLY_PROVIDER_EVENT_TYPE {
                         continue;
                     }
+                    // Reasoning is coalesced here and never becomes a message or an activity
+                    // (#173). Only its own completion, its turn's completion and the pump's end
+                    // write an entry early; other events never do.
+                    if is_reasoning_delta(&event) {
+                        if event.thread_id == launch.thread_id {
+                            reasoning.observe_delta(&event);
+                        }
+                        continue;
+                    }
+                    if is_reasoning_completion(&event) {
+                        if event.thread_id == launch.thread_id {
+                            let commands = reasoning.complete(&event);
+                            if !dispatch_reasoning_commands(&engine, &publication, &cancellation, &launch.thread_id, commands).await {
+                                return;
+                            }
+                        }
+                        continue;
+                    }
+                    if event.event_type == "turn.completed" {
+                        let commands = reasoning.take_turn(event.turn_id.as_deref());
+                        if !dispatch_reasoning_commands(&engine, &publication, &cancellation, &launch.thread_id, commands).await {
+                            return;
+                        }
+                    }
                     // Start the fence after activity-control acknowledgements, before the
                     // final event becomes visible, so projection cannot deadlock on the supervisor.
                     let session_settlement = session_exited.then(&begin_settlement);
@@ -8771,6 +8875,10 @@ fn spawn_event_pump(
         // The provider ended its stream by itself: BiBCode did not stop the session.
         let unexpected = !core_publication.closed && !cancellation.is_cancelled();
         if unexpected {
+            // What the provider thought before it ended is kept: the final flush goes first,
+            // under the fence this section already holds.
+            dispatch_reasoning_commands_unfenced(&engine, &launch.thread_id, reasoning.take_all())
+                .await;
             const STREAM_END_ERROR: &str = "Provider event stream ended unexpectedly.";
             let stream_end_message = last_exit_reason.as_deref().map_or_else(
                 || STREAM_END_ERROR.to_owned(),
@@ -8837,6 +8945,9 @@ fn spawn_event_pump(
                     );
                 }
             }
+            // With or without a running turn: late reasoning on a settled turn streams too,
+            // and nothing will complete it once this session is gone.
+            settle_session_reasoning(&engine, &launch.thread_id, "provider-stream-end").await;
         }
         // History offers a copy of an imported session whose resume Claude refused.
         if unexpected && driver.resume_refused() {
@@ -9022,6 +9133,17 @@ async fn retire_unsettled_interrupt(
     {
         tracing::warn!(%error, thread_id, "assistant messages remained streaming after the interrupt deadline");
     }
+    if let Err(error) = settle_streaming_reasoning(
+        engine,
+        thread_id,
+        ReasoningSettlement::Turn(Some(turn_id)),
+        &format!("provider-interrupt-deadline:{}", Uuid::new_v4()),
+        &now(),
+    )
+    .await
+    {
+        tracing::warn!(%error, thread_id, "reasoning remained streaming after the interrupt deadline");
+    }
     engine.wake_turn_delivery();
     retired
 }
@@ -9035,6 +9157,353 @@ async fn provider_thread_was_deleted(repositories: &Repositories, thread_id: &st
         .is_some_and(|thread| thread.deleted_at.is_some())
 }
 
+/// How long the pump gathers one reasoning entry's deltas before writing them (#173). The
+/// thread stream already sends a client at most 10 updates a second, so a thought still shows
+/// live, and a block whose deltas span D writes at most D / 250 ms + 1 streaming rows.
+const REASONING_FLUSH_WINDOW: Duration = Duration::from_millis(250);
+/// The most text one reasoning entry keeps; longer text ends with an ellipsis.
+const REASONING_ENTRY_MAX_BYTES: usize = 32 * 1024;
+const REASONING_TRUNCATION_MARK: &str = "…";
+
+/// Provider reasoning: Claude thinking deltas and Codex reasoning summary deltas, and their
+/// items' completions. Raw Codex reasoning (`reasoning_text_delta`) never reaches here.
+fn is_reasoning_delta(event: &ProviderEvent) -> bool {
+    event.event_type == "content.delta"
+        && matches!(
+            event.payload.get("streamKind").and_then(Value::as_str),
+            Some("reasoning_text" | "reasoning_summary_text")
+        )
+}
+
+fn is_reasoning_completion(event: &ProviderEvent) -> bool {
+    event.event_type == "item.completed"
+        && event.payload.get("itemType").and_then(Value::as_str) == Some("reasoning")
+}
+
+/// One reasoning entry per provider item, or per turn when the provider names no item.
+fn reasoning_id(event: &ProviderEvent) -> String {
+    valid_provider_item_id(event.item_id.as_deref())
+        .map(|item_id| format!("reasoning:{}:item:{item_id}", event.thread_id))
+        .or_else(|| {
+            event
+                .turn_id
+                .as_ref()
+                .map(|turn_id| format!("reasoning:{}:turn:{turn_id}", event.thread_id))
+        })
+        .unwrap_or_else(|| format!("reasoning:{}", event.thread_id))
+}
+
+/// `text` cut to `REASONING_ENTRY_MAX_BYTES` at a UTF-8 boundary, ending with an ellipsis
+/// when anything was cut.
+fn bounded_reasoning_text(text: &str) -> String {
+    if text.len() <= REASONING_ENTRY_MAX_BYTES {
+        return text.to_owned();
+    }
+    let end = text.floor_char_boundary(REASONING_ENTRY_MAX_BYTES - REASONING_TRUNCATION_MARK.len());
+    format!("{}{REASONING_TRUNCATION_MARK}", &text[..end])
+}
+
+struct OpenReasoning {
+    thread_id: String,
+    turn_id: Option<String>,
+    buffer: String,
+    /// When the current buffer's first byte arrived; its window ends 250 ms later.
+    window_started: Option<Instant>,
+    /// The time the entry's first delta was buffered: its first row's `createdAt`, so the
+    /// thought sorts before the tool call that followed it, however late it is written.
+    first_buffered_at: Option<String>,
+    /// Bytes written so far.
+    written: usize,
+    full: bool,
+}
+
+/// Buffers reasoning deltas per entry in the event pump and turns them into at most one
+/// streaming row per entry per window. It lives and ends with the pump, which runs one event
+/// at a time, so it needs no lock. It holds counts and ids only beside the buffered text, and
+/// logs nothing.
+#[derive(Default)]
+struct ReasoningCoalescer {
+    entries: HashMap<String, OpenReasoning>,
+}
+
+impl ReasoningCoalescer {
+    fn observe_delta(&mut self, event: &ProviderEvent) {
+        let delta = event
+            .payload
+            .get("delta")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if delta.is_empty() {
+            return;
+        }
+        let entry = self
+            .entries
+            .entry(reasoning_id(event))
+            .or_insert_with(|| OpenReasoning {
+                thread_id: event.thread_id.clone(),
+                turn_id: event.turn_id.clone(),
+                buffer: String::new(),
+                window_started: None,
+                first_buffered_at: None,
+                written: 0,
+                full: false,
+            });
+        if entry.full {
+            return;
+        }
+        if entry.written + entry.buffer.len() + delta.len() <= REASONING_ENTRY_MAX_BYTES {
+            entry.buffer.push_str(delta);
+        } else {
+            // The cut keeps room for the mark, so it always shows and never overshoots the
+            // bound. A window's write never passes that room (see `flush_entry`), so the mark
+            // still fits after text already written.
+            entry.full = true;
+            let text_room = REASONING_ENTRY_MAX_BYTES - REASONING_TRUNCATION_MARK.len();
+            if let Some(room) = text_room.checked_sub(entry.written) {
+                if room <= entry.buffer.len() {
+                    entry
+                        .buffer
+                        .truncate(entry.buffer.floor_char_boundary(room));
+                } else {
+                    let rest = room - entry.buffer.len();
+                    entry
+                        .buffer
+                        .push_str(&delta[..delta.floor_char_boundary(rest)]);
+                }
+                entry.buffer.push_str(REASONING_TRUNCATION_MARK);
+            }
+            // Otherwise a final write already released text past the room, after which the
+            // entry went on streaming: the bound still holds, without the mark.
+        }
+        if entry.window_started.is_none() && !entry.buffer.is_empty() {
+            entry.window_started = Some(Instant::now());
+        }
+        entry.first_buffered_at.get_or_insert_with(now);
+    }
+
+    /// The end of the earliest open window, if any entry has buffered text.
+    fn next_deadline(&self) -> Option<Instant> {
+        self.entries
+            .values()
+            .filter_map(|entry| entry.window_started)
+            .min()
+            .map(|started| started + REASONING_FLUSH_WINDOW)
+    }
+
+    /// The entry's buffered text as one write. A window's write (`last` false) holds back what
+    /// passes the bound less the mark's width, until a later delta shows whether the entry is
+    /// cut; the entry's last write releases it, so text that fits is never cut.
+    fn flush_entry(
+        reasoning_id: &str,
+        entry: &mut OpenReasoning,
+        last: bool,
+    ) -> Option<OrchestrationCommand> {
+        if entry.buffer.is_empty() {
+            return None;
+        }
+        entry.window_started = None;
+        let end = if last || entry.full {
+            entry.buffer.len()
+        } else {
+            let text_room = REASONING_ENTRY_MAX_BYTES - REASONING_TRUNCATION_MARK.len();
+            entry
+                .buffer
+                .floor_char_boundary(text_room.saturating_sub(entry.written))
+        };
+        if end == 0 {
+            return None;
+        }
+        let held_back = entry.buffer.split_off(end);
+        let delta = std::mem::replace(&mut entry.buffer, held_back);
+        entry.written += delta.len();
+        // The first row keeps the time the entry began; later rows carry their own time.
+        let created_at = entry.first_buffered_at.take().unwrap_or_else(now);
+        Some(OrchestrationCommand::ThreadReasoningDelta {
+            command_id: format!("provider:{}", Uuid::new_v4()),
+            thread_id: entry.thread_id.clone(),
+            reasoning_id: reasoning_id.to_owned(),
+            delta,
+            turn_id: entry.turn_id.clone(),
+            created_at,
+        })
+    }
+
+    /// The writes of every entry whose window has ended.
+    fn take_due(&mut self, now: Instant) -> Vec<OrchestrationCommand> {
+        self.entries
+            .iter_mut()
+            .filter(|(_, entry)| {
+                entry
+                    .window_started
+                    .is_some_and(|started| started + REASONING_FLUSH_WINDOW <= now)
+            })
+            .filter_map(|(id, entry)| Self::flush_entry(id, entry, false))
+            .collect()
+    }
+
+    /// The writes of the turn's entries, before its completion settles them.
+    fn take_turn(&mut self, turn_id: Option<&str>) -> Vec<OrchestrationCommand> {
+        self.entries
+            .iter_mut()
+            .filter(|(_, entry)| entry.turn_id.as_deref() == turn_id)
+            .filter_map(|(id, entry)| Self::flush_entry(id, entry, true))
+            .collect()
+    }
+
+    /// The writes of every open entry, when the pump ends.
+    fn take_all(&mut self) -> Vec<OrchestrationCommand> {
+        self.entries
+            .iter_mut()
+            .filter_map(|(id, entry)| Self::flush_entry(id, entry, true))
+            .collect()
+    }
+
+    /// An entry's completion: its last buffered text, then its settlement. It settles an entry
+    /// this pump opened, and creates one from a completion that carries text (a Codex summary
+    /// that streamed nothing); a completion without either writes nothing.
+    fn complete(&mut self, event: &ProviderEvent) -> Vec<OrchestrationCommand> {
+        let reasoning_id = reasoning_id(event);
+        let text = event
+            .payload
+            .get("text")
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+            .map(bounded_reasoning_text);
+        let opened = self.entries.remove(&reasoning_id);
+        let mut commands = Vec::new();
+        let turn_id = match opened {
+            Some(mut entry) => {
+                commands.extend(Self::flush_entry(&reasoning_id, &mut entry, true));
+                entry.turn_id
+            }
+            None if text.is_some() => event.turn_id.clone(),
+            None => return commands,
+        };
+        commands.push(OrchestrationCommand::ThreadReasoningComplete {
+            command_id: format!("provider:{}", Uuid::new_v4()),
+            thread_id: event.thread_id.clone(),
+            reasoning_id,
+            text,
+            turn_id,
+            created_at: now(),
+        });
+        commands
+    }
+}
+
+/// Dispatches reasoning writes under the session's publication fence, like every other pump
+/// write. `false` when the session is closing and the pump must stop.
+async fn dispatch_reasoning_commands(
+    engine: &OrchestrationEngine,
+    publication: &SessionPublicationFence,
+    cancellation: &CancellationToken,
+    thread_id: &str,
+    commands: Vec<OrchestrationCommand>,
+) -> bool {
+    if commands.is_empty() {
+        return true;
+    }
+    let core_publication = publication.lock().await;
+    if core_publication.closed || cancellation.is_cancelled() {
+        return false;
+    }
+    dispatch_reasoning_commands_unfenced(engine, thread_id, commands).await;
+    drop(core_publication);
+    true
+}
+
+/// For a caller that already holds the publication fence. Failures are logged by count and
+/// thread only: the commands carry reasoning text.
+async fn dispatch_reasoning_commands_unfenced(
+    engine: &OrchestrationEngine,
+    thread_id: &str,
+    commands: Vec<OrchestrationCommand>,
+) {
+    let mut failed = 0_usize;
+    for command in commands {
+        if engine.dispatch(command).await.is_err() {
+            failed += 1;
+        }
+    }
+    if failed > 0 {
+        tracing::warn!(thread_id, failed, "failed to project provider reasoning");
+    }
+}
+
+/// Which streaming reasoning rows a settlement closes.
+#[derive(Clone, Copy)]
+enum ReasoningSettlement<'a> {
+    /// A turn's rows, when the turn completes or its interrupt deadline passes.
+    Turn(Option<&'a str>),
+    /// Every row on the thread, whatever its turn, when its session ends: a streaming row on a
+    /// thread without a live session can never be completed.
+    Session,
+}
+
+async fn settle_streaming_reasoning(
+    engine: &OrchestrationEngine,
+    thread_id: &str,
+    scope: ReasoningSettlement<'_>,
+    command_id: &str,
+    created_at: &str,
+) -> Result<(), ProviderRuntimeError> {
+    let rows = engine
+        .repositories()
+        .list_streaming_reasoning_by_thread(thread_id.to_owned())
+        .await
+        .map_err(|error| ProviderRuntimeError::Persistence(error.to_string()))?
+        .into_iter()
+        .filter(|row| match scope {
+            ReasoningSettlement::Turn(turn_id) => row.turn_id.as_deref() == turn_id,
+            ReasoningSettlement::Session => true,
+        })
+        .collect();
+    settle_streaming_reasoning_rows(engine, rows, command_id, created_at).await
+}
+
+async fn settle_streaming_reasoning_rows(
+    engine: &OrchestrationEngine,
+    rows: Vec<crate::persistence::ProjectionThreadReasoning>,
+    command_id: &str,
+    created_at: &str,
+) -> Result<(), ProviderRuntimeError> {
+    let mut first_error = None;
+    for (index, row) in rows.into_iter().filter(|row| row.is_streaming).enumerate() {
+        let completion = OrchestrationCommand::ThreadReasoningComplete {
+            command_id: format!("{command_id}:reasoning-complete:{index}"),
+            thread_id: row.thread_id,
+            reasoning_id: row.reasoning_id,
+            text: None,
+            turn_id: row.turn_id,
+            created_at: created_at.to_owned(),
+        };
+        if let Err(error) = engine.dispatch(completion).await
+            && first_error.is_none()
+        {
+            first_error = Some(error.to_string());
+        }
+    }
+    match first_error {
+        Some(detail) => Err(ProviderRuntimeError::Orchestration(detail)),
+        None => Ok(()),
+    }
+}
+
+/// The session scope of reasoning settlement, for a session that just ended.
+async fn settle_session_reasoning(engine: &OrchestrationEngine, thread_id: &str, origin: &str) {
+    if let Err(error) = settle_streaming_reasoning(
+        engine,
+        thread_id,
+        ReasoningSettlement::Session,
+        &format!("{origin}:{}", Uuid::new_v4()),
+        &now(),
+    )
+    .await
+    {
+        tracing::warn!(%error, thread_id, "reasoning remained streaming after its session ended");
+    }
+}
+
 async fn project_provider_event(
     engine: &OrchestrationEngine,
     launch: &ProviderLaunchRequest,
@@ -9043,6 +9512,11 @@ async fn project_provider_event(
     event: ProviderEvent,
     #[cfg(test)] after_terminal_session: Option<&Arc<PublicationTestGate>>,
 ) -> Result<(), ProviderRuntimeError> {
+    // The pump coalesces reasoning; it is never assistant text or an activity, whatever path
+    // reaches this projection.
+    if is_reasoning_delta(&event) || is_reasoning_completion(&event) {
+        return Ok(());
+    }
     let created_at = now();
     let command_id = format!("provider:{}", Uuid::new_v4());
     // An ask OpenCode lists again on resume (`recovered`, with OpenCode's unique request id) is
@@ -9128,6 +9602,22 @@ async fn project_provider_event(
                 thread_id = %event.thread_id,
                 turn_id = ?event.turn_id,
                 "one or more assistant messages remained unsettled after terminal projection"
+            );
+        }
+        if let Err(error) = settle_streaming_reasoning(
+            engine,
+            &event.thread_id,
+            ReasoningSettlement::Turn(event.turn_id.as_deref()),
+            &command_id,
+            &created_at,
+        )
+        .await
+        {
+            tracing::warn!(
+                %error,
+                thread_id = %event.thread_id,
+                turn_id = ?event.turn_id,
+                "reasoning remained streaming after terminal projection"
             );
         }
     }
@@ -10244,6 +10734,13 @@ async fn detach_session(
     entry.activity_control.write().await.take();
     cancel_and_reap_activity_tasks(&mut entry).await;
     close_publication_and_reap_event_task(&mut entry).await;
+    // An aborted pump cannot settle its own reasoning; nothing completes it after this.
+    settle_session_reasoning(
+        &entry.engine,
+        &entry.launch.thread_id,
+        "provider-session-detach",
+    )
+    .await;
     synchronize_activity_lifecycle(activity, &entry.launch.thread_id, &entry.activity_lifecycle)
         .await;
     compensate_cancelled_activity(
@@ -13740,7 +14237,14 @@ pub struct ClaudeActivitySupport {
     /// A probe answered. False for the defaults a launch takes while the probe still runs, after
     /// it failed, or when the executable cannot be resolved; a copy then waits for an answer.
     pub probe_finished: bool,
+    /// The CLI accepts `--thinking-display summarized` (#173). From Claude Opus 4.7 on, the
+    /// API omits thinking text unless asked; without the flag those models send none.
+    pub thinking_display: bool,
 }
+
+/// A value `--thinking-display` rejects: a CLI that knows the flag lists its allowed values,
+/// and one that does not ignores it under `--version` and exits 0.
+const CLAUDE_THINKING_DISPLAY_PROBE_VALUE: &str = "bibcode-probe";
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct ClaudeProbeCacheKey {
@@ -14044,6 +14548,7 @@ fn log_claude_probe_outcome(
                 outcome = if supported { "supported" } else { "unsupported" },
                 include_hook_events = probe.support.include_hook_events,
                 forward_subagent_text = probe.support.forward_subagent_text,
+                thinking_display = probe.support.thinking_display,
                 "Claude activity probe finished"
             );
         }
@@ -14129,6 +14634,8 @@ async fn probe_claude_activity_support_uncached(
         crate::provider::claude::model::semantic_version(&version),
         super::agent_sessions_rpc::COPY_MINIMUM_CLAUDE_VERSION,
     ) && has_exact_flag("--fork-session");
+    let thinking_display =
+        probe_claude_thinking_display(executable, deadline, launch_policy).await?;
     Ok(ClaudeProbeResult {
         version,
         support: ClaudeActivitySupport {
@@ -14137,8 +14644,36 @@ async fn probe_claude_activity_support_uncached(
             transcript_recovery: false,
             fork_session_id,
             probe_finished: true,
+            thinking_display,
         },
     })
+}
+
+/// Whether the CLI accepts `--thinking-display summarized`. `--help` does not list the flag, and
+/// a CLI ignores an option it does not know when `--version` is present, so an exit code alone
+/// cannot tell. An invalid value can: only a CLI that knows the flag rejects it, and it names
+/// the values it allows. A timeout or failed spawn is an error, so it is not cached.
+async fn probe_claude_thinking_display(
+    executable: &Path,
+    deadline: Instant,
+    launch_policy: ClaudeProbeLaunchPolicy,
+) -> Result<bool, String> {
+    let output = run_claude_probe(
+        executable,
+        &[
+            "--thinking-display",
+            CLAUDE_THINKING_DISPLAY_PROBE_VALUE,
+            "--version",
+        ],
+        deadline,
+        launch_policy,
+    )
+    .await?;
+    Ok(!output.success
+        && output
+            .text
+            .split(|character: char| !character.is_ascii_alphanumeric())
+            .any(|token| token == "summarized"))
 }
 
 /// The command's output, or why it gave none: `<argument> timed out` or another reason.
@@ -14148,8 +14683,33 @@ async fn run_claude_probe_command(
     deadline: Instant,
     launch_policy: ClaudeProbeLaunchPolicy,
 ) -> Result<String, String> {
+    let output = run_claude_probe(executable, &[argument], deadline, launch_policy).await?;
+    if !output.success {
+        return Err(format!("{argument} exited with {}", output.status));
+    }
+    if output.text.is_empty() {
+        return Err(format!("{argument} printed nothing"));
+    }
+    Ok(output.text)
+}
+
+struct ClaudeProbeOutput {
+    success: bool,
+    status: String,
+    text: String,
+}
+
+/// Runs one supervised probe command and returns its exit status with its trimmed output.
+/// Only a timeout or a failed spawn is an error.
+async fn run_claude_probe(
+    executable: &Path,
+    arguments: &[&str],
+    deadline: Instant,
+    launch_policy: ClaudeProbeLaunchPolicy,
+) -> Result<ClaudeProbeOutput, String> {
     const CLEANUP_RESERVE: Duration = Duration::from_millis(400);
-    let launch = prepare_claude_probe_launch(executable, argument, launch_policy)
+    let argument = arguments.join(" ");
+    let launch = prepare_claude_probe_launch(executable, arguments, launch_policy)
         .ok_or_else(|| format!("{argument} could not be prepared"))?;
     let mut command = tokio::process::Command::new(launch.program);
     command
@@ -14180,38 +14740,37 @@ async fn run_claude_probe_command(
         Err(SupervisedRunError::Timeout) => return Err(format!("{argument} timed out")),
         Err(error) => return Err(format!("{argument} failed: {error:?}")),
     };
-    if !output.status.success() {
-        return Err(format!("{argument} exited with {}", output.status));
-    }
     let mut text = String::from_utf8_lossy(&output.stdout.bytes).into_owned();
     if !output.stderr.bytes.is_empty() {
         text.push('\n');
         text.push_str(&String::from_utf8_lossy(&output.stderr.bytes));
     }
-    let text = text.trim().to_owned();
-    if text.is_empty() {
-        return Err(format!("{argument} printed nothing"));
-    }
-    Ok(text)
+    Ok(ClaudeProbeOutput {
+        success: output.status.success(),
+        status: output.status.to_string(),
+        text: text.trim().to_owned(),
+    })
 }
 
 fn prepare_claude_probe_launch(
     executable: &Path,
-    argument: &str,
+    arguments: &[&str],
     launch_policy: ClaudeProbeLaunchPolicy,
 ) -> Option<PreparedLaunch> {
     #[cfg(unix)]
     if matches!(launch_policy, ClaudeProbeLaunchPolicy::PosixShellFixture)
         && executable.extension() == Some(OsStr::new("sh"))
     {
+        let mut args = vec![executable.as_os_str().to_owned()];
+        args.extend(arguments.iter().map(OsString::from));
         return Some(PreparedLaunch {
             program: PathBuf::from("/bin/sh"),
-            args: vec![executable.as_os_str().to_owned(), OsString::from(argument)],
+            args,
             raw_windows_args: None,
         });
     }
     let _ = launch_policy;
-    prepare_provider_launch(executable, [argument]).ok()
+    prepare_provider_launch(executable, arguments.iter().copied()).ok()
 }
 
 /// How a Claude process takes up its conversation.
@@ -14303,6 +14862,11 @@ fn build_claude_launch_arguments(
     }
     if support.forward_subagent_text {
         args.push("--forward-subagent-text".to_owned());
+    }
+    // Thinking text for the Thought rows (#173). Output never depends on this: any non-empty
+    // thinking delta is reasoning, and older models summarize without the flag.
+    if support.thinking_display {
+        args.extend(["--thinking-display".to_owned(), "summarized".to_owned()]);
     }
     args.extend([
         "--verbose".to_owned(),
@@ -20901,6 +21465,750 @@ done
         );
     }
 
+    /// The real event pump over a scripted driver, on a paused clock that only
+    /// `tokio::time::advance` moves, for the reasoning coalescer (#173).
+    struct ReasoningPump {
+        engine: super::OrchestrationEngine,
+        events: Option<mpsc::Sender<super::ProviderEvent>>,
+        pump: tokio::task::JoinHandle<()>,
+        _clock: tokio_util::task::AbortOnDropHandle<()>,
+        _terminal: mpsc::UnboundedReceiver<super::SupervisorMessage>,
+        _temp: TempDir,
+    }
+
+    impl ReasoningPump {
+        async fn start() -> Self {
+            let clock = keep_idle_clock_paused();
+            let engine = supervisor_engine().await;
+            let activity = super::ActivityProjection::new(ActivityRepository::new(
+                engine.repositories().database().clone(),
+            ));
+            let (event_sender, event_receiver) = mpsc::channel(1_024);
+            let temp = TempDir::new().expect("launch directory");
+            let mut launch = native_launch(&temp, "claude");
+            launch.thread_id = "t1".to_owned();
+            let driver: Arc<dyn ProviderDriver> = Arc::new(SupervisorDriver {
+                state: Arc::new(StdMutex::new(SupervisorDriverState::default())),
+                events: tokio::sync::Mutex::new(event_receiver),
+            });
+            let (activity_dispatch_sender, _activity_dispatch_receiver) = mpsc::channel(1);
+            let (terminal_sender, terminal_receiver) = mpsc::unbounded_channel();
+            let pump = super::spawn_event_pump(
+                engine.clone(),
+                driver,
+                launch,
+                None,
+                None,
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+                activity,
+                Arc::new(StdMutex::new(super::ProviderActivityLifecycleState::new(
+                    crate::activity::ActivityCapabilities::default(),
+                ))),
+                false,
+                Arc::new(RwLock::new(None)),
+                activity_dispatch_sender,
+                "reasoning-pump-stream-ended".to_owned(),
+                tokio_util::sync::CancellationToken::new(),
+                Arc::new(tokio::sync::Mutex::new(
+                    super::SessionPublicationState::default(),
+                )),
+                None,
+                Arc::new(AtomicU64::new(0)),
+                terminal_sender,
+                Duration::from_secs(3_600),
+                None,
+            );
+            Self {
+                engine,
+                events: Some(event_sender),
+                pump,
+                _clock: clock,
+                _terminal: terminal_receiver,
+                _temp: temp,
+            }
+        }
+
+        async fn send(&self, event: super::ProviderEvent) {
+            self.events
+                .as_ref()
+                .expect("open stream")
+                .send(event)
+                .await
+                .expect("pump reads events");
+        }
+
+        async fn delta(&self, turn: &str, item: Option<&str>, delta: &str) {
+            self.send(reasoning_test_event(
+                "content.delta",
+                turn,
+                item,
+                json!({"streamKind":"reasoning_text","delta":delta}),
+            ))
+            .await;
+        }
+
+        async fn complete(&self, turn: &str, item: Option<&str>, text: Option<&str>) {
+            let mut payload = json!({"itemType":"reasoning"});
+            if let Some(text) = text {
+                payload["text"] = json!(text);
+            }
+            self.send(reasoning_test_event("item.completed", turn, item, payload))
+                .await;
+        }
+
+        /// Lets the pump read what was sent, without moving the clock.
+        async fn drain(&self) {
+            let events = self.events.as_ref().expect("open stream");
+            while events.capacity() < events.max_capacity() {
+                tokio::task::yield_now().await;
+            }
+            self.engine.read_events(0).await.expect("events");
+        }
+
+        /// The reasoning writes once `done` holds for them, without moving the clock.
+        async fn writes_once(
+            &self,
+            done: impl Fn(&[(String, bool, String)]) -> bool,
+        ) -> Vec<(String, bool, String)> {
+            for _ in 0..10_000 {
+                tokio::task::yield_now().await;
+                let writes = reasoning_writes(&self.engine).await;
+                if done(&writes) {
+                    return writes;
+                }
+            }
+            panic!(
+                "the pump never wrote the expected reasoning: {:?}",
+                reasoning_writes(&self.engine).await
+            );
+        }
+
+        /// Ends the stream and waits for the pump's final flush and session settlement.
+        async fn finish(mut self) -> super::OrchestrationEngine {
+            drop(self.events.take());
+            (&mut self.pump).await.expect("pump task");
+            self.engine.clone()
+        }
+    }
+
+    fn reasoning_test_event(
+        event_type: &str,
+        turn: &str,
+        item: Option<&str>,
+        payload: Value,
+    ) -> super::ProviderEvent {
+        super::ProviderEvent {
+            native_event_id: None,
+            event_type: event_type.to_owned(),
+            thread_id: "t1".to_owned(),
+            turn_id: Some(turn.to_owned()),
+            item_id: item.map(str::to_owned),
+            request_id: None,
+            payload,
+            activity: Vec::new(),
+            activity_controls: Default::default(),
+        }
+    }
+
+    /// `(reasoningId, streaming, text)` of each `thread.reasoning-sent` event, in order.
+    async fn reasoning_writes(engine: &super::OrchestrationEngine) -> Vec<(String, bool, String)> {
+        engine
+            .read_events(0)
+            .await
+            .expect("events")
+            .into_iter()
+            .filter(|event| event.event.event_type == "thread.reasoning-sent")
+            .map(|event| {
+                let payload = &event.event.payload;
+                (
+                    payload["reasoningId"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned(),
+                    payload["streaming"].as_bool().unwrap_or_default(),
+                    payload["text"].as_str().unwrap_or_default().to_owned(),
+                )
+            })
+            .collect()
+    }
+
+    async fn reasoning_rows(engine: &super::OrchestrationEngine) -> Vec<(String, String, bool)> {
+        engine
+            .repositories()
+            .list_reasoning_by_thread("t1".to_owned())
+            .await
+            .expect("reasoning rows")
+            .into_iter()
+            .map(|row| (row.reasoning_id, row.text, row.is_streaming))
+            .collect()
+    }
+
+    fn streaming_writes(writes: &[(String, bool, String)], id: &str) -> usize {
+        writes
+            .iter()
+            .filter(|(reasoning_id, streaming, _)| reasoning_id == id && *streaming)
+            .count()
+    }
+
+    const THOUGHT_ID: &str = "reasoning:t1:item:msg-1:0";
+
+    #[tokio::test(start_paused = true)]
+    async fn reasoning_streamed_for_a_second_writes_at_most_one_row_per_window() {
+        let pump = ReasoningPump::start().await;
+        let mut expected = String::new();
+        for index in 0..100 {
+            let delta = format!("chunk-{index:03}");
+            assert_eq!(delta.len(), 9);
+            let delta = format!("{delta} ");
+            expected.push_str(&delta);
+            pump.delta("turn-1", Some("msg-1:0"), &delta).await;
+            pump.drain().await;
+            tokio::time::advance(Duration::from_millis(10)).await;
+        }
+        let engine = pump.finish().await;
+        let writes = reasoning_writes(&engine).await;
+        let streamed = streaming_writes(&writes, THOUGHT_ID);
+        assert!(
+            (1..=5).contains(&streamed),
+            "100 deltas over 1 s wrote {streamed} streaming rows"
+        );
+        assert_eq!(
+            reasoning_rows(&engine).await,
+            [(THOUGHT_ID.to_owned(), expected, false)],
+            "the rows concatenate every delta, and the stream's end settles the entry"
+        );
+        assert!(
+            engine
+                .repositories()
+                .list_messages_by_thread("t1".to_owned())
+                .await
+                .unwrap()
+                .is_empty(),
+            "reasoning is never an assistant message"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_burst_of_large_deltas_inside_one_window_is_one_row() {
+        let pump = ReasoningPump::start().await;
+        let chunk = "x".repeat(4 * 1024);
+        for _ in 0..4 {
+            pump.delta("turn-1", Some("msg-1:0"), &chunk).await;
+            pump.drain().await;
+            tokio::time::advance(Duration::from_millis(25)).await;
+        }
+        tokio::time::advance(Duration::from_millis(300)).await;
+        let writes = pump.writes_once(|writes| !writes.is_empty()).await;
+        assert_eq!(
+            writes,
+            [(THOUGHT_ID.to_owned(), true, chunk.repeat(4))],
+            "one window, one row"
+        );
+        pump.finish().await;
+    }
+
+    /// Tool starts, token usage and another entry's deltas never flush an entry early. The
+    /// thought still sorts before the tool call that followed it, by the time it began.
+    #[tokio::test(start_paused = true)]
+    async fn interleaved_events_neither_flush_reasoning_nor_reorder_it() {
+        let pump = ReasoningPump::start().await;
+        pump.delta("turn-1", Some("msg-1:0"), "First thought, ")
+            .await;
+        pump.drain().await;
+        for index in 0..10 {
+            pump.send(reasoning_test_event(
+                "item.started",
+                "turn-1",
+                None,
+                json!({"itemType":"command_execution","title":"Ran command","detail":format!("tool-{index}")}),
+            ))
+            .await;
+            pump.send(reasoning_test_event(
+                "thread.token-usage.updated",
+                "turn-1",
+                None,
+                json!({"usage":{"usedTokens":index}}),
+            ))
+            .await;
+            pump.delta("turn-1", Some("msg-2:0"), "other ").await;
+            pump.delta("turn-1", Some("msg-1:0"), "more ").await;
+            pump.drain().await;
+            tokio::time::advance(Duration::from_millis(20)).await;
+        }
+        pump.complete("turn-1", Some("msg-1:0"), None).await;
+        let writes = pump
+            .writes_once(|writes| {
+                writes
+                    .iter()
+                    .any(|(id, streaming, _)| id == THOUGHT_ID && !streaming)
+            })
+            .await;
+        // 200 ms of deltas: one window each, whatever else arrived.
+        assert_eq!(streaming_writes(&writes, THOUGHT_ID), 1, "{writes:?}");
+        assert!(streaming_writes(&writes, "reasoning:t1:item:msg-2:0") <= 1);
+        let thought = pump
+            .engine
+            .repositories()
+            .list_reasoning_by_thread("t1".to_owned())
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.reasoning_id == THOUGHT_ID)
+            .expect("the thought");
+        assert_eq!(
+            thought.text,
+            format!("First thought, {}", "more ".repeat(10))
+        );
+        let first_tool = pump
+            .engine
+            .repositories()
+            .list_activities_by_thread("t1".to_owned())
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|activity| activity.payload["detail"] == "tool-0")
+            .expect("the first tool call");
+        let parse = |at: &str| {
+            time::OffsetDateTime::parse(at, &time::format_description::well_known::Rfc3339)
+                .expect("an RFC 3339 time")
+        };
+        assert!(
+            parse(&thought.created_at) < parse(&first_tool.created_at),
+            "the thought began before the tool call: {} vs {}",
+            thought.created_at,
+            first_tool.created_at
+        );
+        pump.finish().await;
+    }
+
+    /// An entry's own completion, and its turn's completion, write its buffer before they
+    /// settle it; a completion that streamed nothing and carries no text writes nothing.
+    #[tokio::test(start_paused = true)]
+    async fn completions_flush_before_they_settle_and_an_empty_one_writes_nothing() {
+        let pump = ReasoningPump::start().await;
+        pump.delta("turn-1", Some("msg-1:0"), "Settled by its block")
+            .await;
+        pump.complete("turn-1", Some("msg-1:0"), None).await;
+        pump.complete("turn-1", Some("never-streamed"), None).await;
+        pump.delta("turn-1", Some("msg-2:0"), "Settled by its turn")
+            .await;
+        pump.send(reasoning_test_event(
+            "turn.completed",
+            "turn-1",
+            None,
+            json!({"state":"completed"}),
+        ))
+        .await;
+        let writes = pump.writes_once(|writes| writes.len() >= 4).await;
+        assert_eq!(
+            writes,
+            [
+                (
+                    THOUGHT_ID.to_owned(),
+                    true,
+                    "Settled by its block".to_owned()
+                ),
+                (THOUGHT_ID.to_owned(), false, String::new()),
+                (
+                    "reasoning:t1:item:msg-2:0".to_owned(),
+                    true,
+                    "Settled by its turn".to_owned()
+                ),
+                ("reasoning:t1:item:msg-2:0".to_owned(), false, String::new()),
+            ]
+        );
+        assert!(
+            pump.engine
+                .repositories()
+                .list_activities_by_thread("t1".to_owned())
+                .await
+                .unwrap()
+                .iter()
+                .all(|activity| activity.payload.get("itemType") != Some(&json!("reasoning"))),
+            "a reasoning completion is never an activity"
+        );
+        pump.finish().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reasoning_entries_stop_growing_at_their_bound() {
+        let pump = ReasoningPump::start().await;
+        // A multi-byte character straddles the bound, so the cut must find a boundary.
+        let chunk = "é".repeat(1_000);
+        for _ in 0..40 {
+            pump.delta("turn-1", Some("msg-1:0"), &chunk).await;
+        }
+        let long_summary = "ü".repeat(super::REASONING_ENTRY_MAX_BYTES);
+        pump.complete("turn-1", Some("summary-1"), Some(&long_summary))
+            .await;
+        let engine = pump.finish().await;
+        for (id, text, _) in reasoning_rows(&engine).await {
+            assert!(
+                text.len() <= super::REASONING_ENTRY_MAX_BYTES,
+                "{id} holds {} bytes",
+                text.len()
+            );
+            assert!(text.ends_with('…'), "{id} shows that it was cut");
+        }
+    }
+
+    /// Text that already fills the bound to within the ellipsis's width still ends with the
+    /// mark, and the mark never takes the entry past the bound.
+    #[tokio::test]
+    async fn an_entry_at_its_bound_never_overshoots_it() {
+        let mut coalescer = super::ReasoningCoalescer::default();
+        let delta = |text: String| {
+            reasoning_test_event(
+                "content.delta",
+                "turn-1",
+                Some("msg-1:0"),
+                json!({"streamKind":"reasoning_text","delta":text}),
+            )
+        };
+        coalescer.observe_delta(&delta("x".repeat(super::REASONING_ENTRY_MAX_BYTES - 1)));
+        coalescer.observe_delta(&delta("more".to_owned()));
+        coalescer.observe_delta(&delta("and more".to_owned()));
+        let written = coalescer
+            .take_all()
+            .into_iter()
+            .map(|command| match command {
+                super::OrchestrationCommand::ThreadReasoningDelta { delta, .. } => delta,
+                other => panic!("unexpected {}", other.command_type()),
+            })
+            .collect::<String>();
+        assert_eq!(written.len(), super::REASONING_ENTRY_MAX_BYTES);
+        assert!(written.ends_with('…'), "the cut shows");
+    }
+
+    fn written_reasoning_text(commands: Vec<super::OrchestrationCommand>) -> String {
+        commands
+            .into_iter()
+            .filter_map(|command| match command {
+                super::OrchestrationCommand::ThreadReasoningDelta { delta, .. } => Some(delta),
+                super::OrchestrationCommand::ThreadReasoningComplete { text: None, .. } => None,
+                other => panic!("unexpected {}", other.command_type()),
+            })
+            .collect()
+    }
+
+    /// Text that fits the bound is kept whole, even when it ends within the ellipsis's width
+    /// of it, and whether the pump ends or the entry completes. A window's write holds back the
+    /// last few bytes until the entry is known to fit, so a later cut can still show.
+    #[tokio::test]
+    async fn an_entry_that_fits_its_bound_is_never_cut() {
+        let delta = |text: String| {
+            reasoning_test_event(
+                "content.delta",
+                "turn-1",
+                Some("msg-1:0"),
+                json!({"streamKind":"reasoning_text","delta":text}),
+            )
+        };
+        let completion = reasoning_test_event(
+            "item.completed",
+            "turn-1",
+            Some("msg-1:0"),
+            json!({"itemType":"reasoning"}),
+        );
+        let full = "x".repeat(super::REASONING_ENTRY_MAX_BYTES);
+        let window_ended = || tokio::time::Instant::now() + super::REASONING_FLUSH_WINDOW;
+
+        let mut coalescer = super::ReasoningCoalescer::default();
+        coalescer.observe_delta(&delta(full.clone()));
+        let written = written_reasoning_text(coalescer.take_all());
+        assert!(
+            written == full,
+            "the pump's end kept {} bytes",
+            written.len()
+        );
+
+        let mut coalescer = super::ReasoningCoalescer::default();
+        coalescer.observe_delta(&delta(full.clone()));
+        let mut written = written_reasoning_text(coalescer.take_due(window_ended()));
+        written.push_str(&written_reasoning_text(coalescer.complete(&completion)));
+        assert!(
+            written == full,
+            "a window's write and the completion kept {} bytes",
+            written.len()
+        );
+
+        // A window wrote all it could; the next delta overflows and the cut still shows.
+        let mut coalescer = super::ReasoningCoalescer::default();
+        coalescer.observe_delta(&delta("x".repeat(super::REASONING_ENTRY_MAX_BYTES - 1)));
+        let mut written = written_reasoning_text(coalescer.take_due(window_ended()));
+        coalescer.observe_delta(&delta("more".to_owned()));
+        written.push_str(&written_reasoning_text(coalescer.take_all()));
+        assert_eq!(written.len(), super::REASONING_ENTRY_MAX_BYTES);
+        assert!(written.ends_with('…'), "the cut shows");
+    }
+
+    /// Codex: the runtime's blank line joins streamed parts, and the completed summary is
+    /// authoritative: it replaces a stream that lost parts, and creates an entry that
+    /// streamed none. A repeated completion changes nothing.
+    #[tokio::test(start_paused = true)]
+    async fn codex_summaries_end_as_the_completed_summary() {
+        let pump = ReasoningPump::start().await;
+        let summary = |item: &str, index: u64, delta: &str| {
+            reasoning_test_event(
+                "content.delta",
+                "turn-1",
+                Some(item),
+                json!({"streamKind":"reasoning_summary_text","summaryIndex":index,"delta":delta}),
+            )
+        };
+        pump.send(summary("r1", 0, "A")).await;
+        pump.send(summary("r1", 1, "\n\nB")).await;
+        pump.complete("turn-1", Some("r1"), Some("A\n\nB")).await;
+        pump.send(summary("r2", 0, "A")).await;
+        pump.complete("turn-1", Some("r2"), Some("A\n\nB")).await;
+        pump.complete("turn-1", Some("r3"), Some("Only the summary"))
+            .await;
+        pump.complete("turn-1", Some("r3"), Some("Only the summary"))
+            .await;
+        let engine = pump.finish().await;
+        assert_eq!(
+            reasoning_rows(&engine).await,
+            [
+                (
+                    "reasoning:t1:item:r1".to_owned(),
+                    "A\n\nB".to_owned(),
+                    false
+                ),
+                (
+                    "reasoning:t1:item:r2".to_owned(),
+                    "A\n\nB".to_owned(),
+                    false
+                ),
+                (
+                    "reasoning:t1:item:r3".to_owned(),
+                    "Only the summary".to_owned(),
+                    false
+                ),
+            ]
+        );
+    }
+
+    /// Late reasoning on a turn that already completed streams into its own entry; with no
+    /// turn left running, the stream's end still settles it.
+    #[tokio::test(start_paused = true)]
+    async fn late_reasoning_after_its_turn_settles_when_the_stream_ends() {
+        let pump = ReasoningPump::start().await;
+        pump.send(reasoning_test_event(
+            "turn.completed",
+            "turn-1",
+            None,
+            json!({"state":"completed"}),
+        ))
+        .await;
+        pump.delta("turn-1", Some("late-1"), "A late thought").await;
+        pump.drain().await;
+        tokio::time::advance(Duration::from_millis(300)).await;
+        pump.writes_once(|writes| !writes.is_empty()).await;
+        assert_eq!(
+            reasoning_rows(&pump.engine).await,
+            [(
+                "reasoning:t1:item:late-1".to_owned(),
+                "A late thought".to_owned(),
+                true
+            )]
+        );
+        let engine = pump.finish().await;
+        assert_eq!(
+            reasoning_rows(&engine).await,
+            [(
+                "reasoning:t1:item:late-1".to_owned(),
+                "A late thought".to_owned(),
+                false
+            )]
+        );
+    }
+
+    /// Replays a Claude trace fixture's frames through the Claude runtime into the real pump.
+    async fn claude_fixture_through_pump(fixture: &str) -> super::OrchestrationEngine {
+        let fixture: Value = serde_json::from_str(fixture).expect("fixture JSON");
+        let pump = ReasoningPump::start().await;
+        let mut runtime = crate::provider::claude::runtime::ClaudeProviderRuntime::new(
+            "t1".to_owned(),
+            fixture["startup"]["sessionId"]
+                .as_str()
+                .expect("session")
+                .to_owned(),
+        );
+        let mut events = runtime.start_turn(crate::provider::claude::runtime::TurnInput {
+            turn_id: "turn-1".to_owned(),
+            input: "fix the bug".to_owned(),
+        });
+        for frame in fixture["messages"].as_array().expect("frames") {
+            events.extend(runtime.handle_raw_value(frame, 1_000).events);
+        }
+        for event in events {
+            pump.send(super::claude_provider_event(event, None, Vec::new()))
+                .await;
+        }
+        pump.finish().await
+    }
+
+    /// #173: Claude thinking is one reasoning entry and never a second assistant message, so
+    /// the context handoff never replays it as `[assistant]` text.
+    #[tokio::test(start_paused = true)]
+    async fn claude_thinking_is_reasoning_and_stays_out_of_messages_and_the_handoff() {
+        let engine = claude_fixture_through_pump(include_str!(
+            "../../tests/fixtures/claude-provider/trace-thinking-then-text.json"
+        ))
+        .await;
+        assert_eq!(
+            reasoning_rows(&engine).await,
+            [(
+                "reasoning:t1:item:msg-thinking-1:0".to_owned(),
+                "**Weighing the fix**\n\nThe test fails first. Then the code.".to_owned(),
+                false
+            )]
+        );
+        let messages = engine
+            .repositories()
+            .list_messages_by_thread("t1".to_owned())
+            .await
+            .unwrap();
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| (message.role.as_str(), message.text.as_str()))
+                .collect::<Vec<_>>(),
+            [("assistant", "Fixed.")]
+        );
+        let handoff =
+            super::compose_thread_context_handoff(&messages, "none", "next").expect("a handoff");
+        assert!(handoff.contains("[assistant] Fixed."));
+        assert!(!handoff.contains("Weighing"), "{handoff}");
+        engine.shutdown().await;
+    }
+
+    /// Omitted display: no reasoning entry, no reasoning write, and no empty assistant message.
+    #[tokio::test(start_paused = true)]
+    async fn omitted_claude_thinking_writes_nothing() {
+        let engine = claude_fixture_through_pump(include_str!(
+            "../../tests/fixtures/claude-provider/trace-thinking-omitted.json"
+        ))
+        .await;
+        assert!(reasoning_rows(&engine).await.is_empty());
+        assert!(reasoning_writes(&engine).await.is_empty());
+        assert!(
+            engine
+                .repositories()
+                .list_messages_by_thread("t1".to_owned())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        engine.shutdown().await;
+    }
+
+    /// No reasoning text reaches a log or trace, including the warning a failed write logs:
+    /// the pump, the projection and the settlement log counts and ids only (#173).
+    #[tokio::test(start_paused = true)]
+    async fn reasoning_text_never_reaches_logs_or_traces() {
+        const SENTINEL: &str = "reasoning-sentinel-7f3a";
+        #[derive(Clone, Default)]
+        struct Captured(Arc<StdMutex<Vec<u8>>>);
+        impl io::Write for Captured {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0
+                    .lock()
+                    .expect("captured log")
+                    .extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let log = Captured::default();
+        let _logging = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::TRACE)
+                .with_writer({
+                    let log = log.clone();
+                    move || log.clone()
+                })
+                .finish(),
+        );
+        let pump = ReasoningPump::start().await;
+        pump.delta(
+            "turn-1",
+            Some("msg-1:0"),
+            &format!("Thinking about {SENTINEL}"),
+        )
+        .await;
+        pump.complete("turn-1", Some("msg-1:0"), None).await;
+        pump.complete(
+            "turn-1",
+            Some("summary"),
+            Some(&format!("Summary of {SENTINEL}")),
+        )
+        .await;
+        pump.writes_once(|writes| writes.len() >= 3).await;
+        assert!(
+            reasoning_rows(&pump.engine)
+                .await
+                .iter()
+                .all(|(_, text, _)| text.contains(SENTINEL)),
+            "the sentinel went through the pump"
+        );
+        // A write that fails logs a warning; it must not carry the text it could not write.
+        pump.delta("turn-1", Some("lost"), &format!("Lost {SENTINEL}"))
+            .await;
+        pump.drain().await;
+        pump.engine.shutdown().await;
+        pump.finish().await;
+
+        let text = String::from_utf8(log.0.lock().expect("captured log").clone()).expect("UTF-8");
+        assert!(
+            text.contains("failed to project provider reasoning"),
+            "the failed write was logged: {text}"
+        );
+        assert!(!text.contains(SENTINEL), "{text}");
+    }
+
+    /// A row left streaming by a session that is gone, with no runtime row for its thread,
+    /// settles when the server starts.
+    #[tokio::test]
+    async fn startup_reconciliation_settles_reasoning_left_streaming() {
+        let engine = supervisor_engine().await;
+        engine
+            .dispatch(super::OrchestrationCommand::ThreadReasoningDelta {
+                command_id: "orphaned-thought".to_owned(),
+                thread_id: "t1".to_owned(),
+                reasoning_id: "reasoning:t1:item:orphan".to_owned(),
+                delta: "Cut off".to_owned(),
+                turn_id: Some("turn-1".to_owned()),
+                created_at: "2026-07-16T00:00:01Z".to_owned(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            engine
+                .repositories()
+                .list_provider_session_runtimes()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        super::reconcile_abandoned_provider_sessions(&engine)
+            .await
+            .unwrap();
+        assert_eq!(
+            reasoning_rows(&engine).await,
+            [(
+                "reasoning:t1:item:orphan".to_owned(),
+                "Cut off".to_owned(),
+                false
+            )]
+        );
+        engine.shutdown().await;
+    }
+
     /// How BiBCode stopped a session whose provider process died.
     #[cfg(unix)]
     #[derive(Clone, Copy, Debug)]
@@ -24624,6 +25932,27 @@ done
                 .await
                 .unwrap();
             assert_eq!(session().await.status, "running");
+            // The turn is thinking when Stop arrives (#173).
+            engine
+                .dispatch(OrchestrationCommand::ThreadReasoningDelta {
+                    command_id: "interrupted-thought".to_owned(),
+                    thread_id: "t1".to_owned(),
+                    reasoning_id: "reasoning:t1:item:interrupted".to_owned(),
+                    delta: "Weighing the stop".to_owned(),
+                    turn_id: Some("unit-turn".to_owned()),
+                    created_at: "2026-07-16T00:00:01.500Z".to_owned(),
+                })
+                .await
+                .unwrap();
+            let thought_streams = || async {
+                engine
+                    .repositories()
+                    .list_reasoning_by_thread("t1".to_owned())
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|row| row.is_streaming)
+            };
 
             tokio::time::pause();
             let clock = keep_idle_clock_paused();
@@ -24722,6 +26051,27 @@ done
             };
             drop(clock);
             tokio::time::resume();
+            // The interrupted turn's thought settles, whether the provider's own completion or
+            // the deadline ends it; a turn that keeps running keeps thinking. The provider's
+            // completion settles it in the pump, after the session already reads ready.
+            if matches!(
+                response,
+                InterruptResponse::StaleTurn | InterruptResponse::ExternallyOwned
+            ) {
+                assert!(
+                    thought_streams().await,
+                    "{response:?}: the turn still thinks"
+                );
+            } else {
+                let started = Instant::now();
+                while thought_streams().await {
+                    assert!(
+                        started.elapsed() < Duration::from_secs(5),
+                        "{response:?}: the interrupted turn's thought settles"
+                    );
+                    tokio::task::yield_now().await;
+                }
+            }
 
             if matches!(
                 response,

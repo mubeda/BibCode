@@ -85,7 +85,7 @@ impl ClaudeAssistantError {
             .iter()
             .filter_map(|content| match content {
                 AssistantContent::Text { text } => Some(text.trim()),
-                AssistantContent::ToolUse { .. } => None,
+                AssistantContent::ToolUse { .. } | AssistantContent::Other => None,
             })
             .find(|text| !text.is_empty())
             .map(str::to_owned);

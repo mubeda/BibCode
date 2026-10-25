@@ -26,6 +26,7 @@ import {
   ProjectMetaUpdatedPayload,
   OrchestrationProposedPlan,
   OrchestrationSession,
+  OrchestrationThread,
   ProjectCreateCommand,
   ThreadMetaUpdatedPayload,
   ThreadTurnStartCommand,
@@ -1500,4 +1501,87 @@ it("decodes staged image and file inputs and refuses two byte sources", () => {
     ).toBe(true);
     expect(isUploadChatAttachment({ ...staged, uploadId: null })).toBe(false);
   }
+});
+
+const decodeReasoningThread = Schema.decodeUnknownSync(OrchestrationThread);
+const decodeReasoningEvent = Schema.decodeUnknownSync(OrchestrationEvent);
+const decodeReasoningCommand = Schema.decodeUnknownSync(OrchestrationCommand);
+
+describe("reasoning contracts", () => {
+  const thread = {
+    id: "thread-1",
+    projectId: "project-1",
+    title: "Thread",
+    modelSelection: { instanceId: "codex", model: "gpt-5" },
+    runtimeMode: "full-access",
+    interactionMode: "default",
+    branch: null,
+    worktreePath: null,
+    latestTurn: null,
+    createdAt: "2026-10-24T00:00:00.000Z",
+    updatedAt: "2026-10-24T00:00:00.000Z",
+    deletedAt: null,
+    messages: [],
+    activities: [],
+    checkpoints: [],
+    session: null,
+  };
+
+  it("decodes a thread from an older server without reasoning to none", () => {
+    expect(decodeReasoningThread(thread).reasoning).toEqual([]);
+  });
+
+  it("decodes reasoning entries, their event and their internal commands", () => {
+    const entry = {
+      id: "reasoning:thread-1:item:a",
+      turnId: "turn-1",
+      text: "Weighing options",
+      streaming: true,
+      createdAt: "2026-10-24T00:00:01.000Z",
+      updatedAt: "2026-10-24T00:00:02.000Z",
+    };
+    expect(decodeReasoningThread({ ...thread, reasoning: [entry] }).reasoning).toEqual([entry]);
+    const sent = decodeReasoningEvent({
+      sequence: 1,
+      eventId: "event-1",
+      aggregateKind: "thread",
+      aggregateId: "thread-1",
+      occurredAt: entry.updatedAt,
+      commandId: null,
+      causationEventId: null,
+      correlationId: null,
+      metadata: {},
+      type: "thread.reasoning-sent",
+      payload: {
+        threadId: "thread-1",
+        reasoningId: entry.id,
+        text: "options",
+        turnId: "turn-1",
+        streaming: true,
+        createdAt: entry.createdAt,
+        updatedAt: entry.updatedAt,
+      },
+    });
+    expect(sent.type).toBe("thread.reasoning-sent");
+    for (const command of [
+      {
+        type: "thread.reasoning.delta",
+        commandId: "command-1",
+        threadId: "thread-1",
+        reasoningId: entry.id,
+        delta: "options",
+        turnId: "turn-1",
+        createdAt: entry.createdAt,
+      },
+      {
+        type: "thread.reasoning.complete",
+        commandId: "command-2",
+        threadId: "thread-1",
+        reasoningId: entry.id,
+        createdAt: entry.updatedAt,
+      },
+    ]) {
+      expect(decodeReasoningCommand(command).type).toBe(command.type);
+    }
+  });
 });

@@ -561,7 +561,10 @@ include provider-native cancellation targets or provider payload bodies.
 Raw hidden reasoning is never activity commentary. Codex can publish the
 provider's completed reasoning **summary**, but not its raw reasoning content.
 Claude thinking deltas and recovered thinking blocks, and OpenCode reasoning
-parts, are excluded from activity entries. Provider coverage is in
+parts, are excluded from activity entries. The chat shows the same root
+reasoning, Claude thinking and Codex summaries, as its own reasoning entries
+([Provider reasoning](./rpc-and-orchestration.md#provider-reasoning)); a
+reasoning `item.completed` never becomes a thread activity either. Provider coverage is in
 [`apps/server/tests/provider_codex.rs`](../../apps/server/tests/provider_codex.rs),
 [`apps/server/tests/provider_claude.rs`](../../apps/server/tests/provider_claude.rs),
 and [`apps/server/tests/provider_opencode.rs`](../../apps/server/tests/provider_opencode.rs).

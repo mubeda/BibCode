@@ -2331,6 +2331,162 @@ fn fixture_tool_input_fragments_report_the_complete_input_once() {
     assert_trace_eq(&events, &fixture.expected_events);
 }
 
+/// Replays a trace fixture through both the typed and the raw-frame entry points, which must
+/// agree, and returns the fixture with the events.
+fn replay_trace_both_ways(name: &str, input: &str) -> (TraceFixture, Vec<CanonicalEvent>) {
+    let fixture: TraceFixture = load_fixture(name);
+    let mut typed = ClaudeProviderRuntime::new(
+        fixture.thread_id.clone(),
+        fixture.startup.session_id.clone(),
+    );
+    let mut typed_events = typed.start_session(fixture.startup.runtime_mode, None);
+    typed_events.extend(typed.start_turn(TurnInput {
+        turn_id: fixture.turn_id.clone(),
+        input: input.to_owned(),
+    }));
+    for message in &fixture.messages {
+        typed_events.extend(typed.handle_message(message.clone()));
+    }
+    let mut raw = ClaudeProviderRuntime::new(
+        fixture.thread_id.clone(),
+        fixture.startup.session_id.clone(),
+    );
+    let mut raw_events = raw.start_session(fixture.startup.runtime_mode, None);
+    raw_events.extend(raw.start_turn(TurnInput {
+        turn_id: fixture.turn_id.clone(),
+        input: input.to_owned(),
+    }));
+    let raw_fixture: Value = load_fixture(name);
+    for value in raw_fixture["messages"].as_array().expect("messages") {
+        raw_events.extend(raw.handle_raw_value(value, 1_000).events);
+    }
+    assert_eq!(
+        raw_events
+            .iter()
+            .map(CanonicalEventTrace::from)
+            .collect::<Vec<_>>(),
+        typed_events
+            .iter()
+            .map(CanonicalEventTrace::from)
+            .collect::<Vec<_>>(),
+        "raw frames decode as the typed messages do"
+    );
+    (fixture, typed_events)
+}
+
+/// #173: a thinking block is one reasoning item keyed by its message and index. Its deltas are
+/// reasoning, never assistant text, and its stop completes it; redacted thinking, the signature,
+/// a text block's start and a thinking-only assistant frame decode and add nothing.
+#[test]
+fn fixture_thinking_then_text_is_one_reasoning_item_and_one_reply() {
+    let (fixture, events) = replay_trace_both_ways("trace-thinking-then-text.json", "fix the bug");
+    assert_trace_eq(&events, &fixture.expected_events);
+}
+
+/// Omitted display (the default from Claude Opus 4.7 on) streams one empty delta and a
+/// signature per thinking block: no reasoning text, so no reasoning delta and no assistant text.
+#[test]
+fn fixture_omitted_thinking_streams_no_reasoning_text() {
+    let (fixture, events) = replay_trace_both_ways("trace-thinking-omitted.json", "fix the bug");
+    assert_trace_eq(&events, &fixture.expected_events);
+    assert!(
+        events
+            .iter()
+            .all(|event| event.event_type != "content.delta"),
+        "an omitted block streams no text of any kind"
+    );
+}
+
+#[test]
+fn thinking_redacted_and_signature_frames_decode() {
+    for frame in [
+        json!({"type":"stream_event","session_id":"s","uuid":"u1","parent_tool_use_id":null,"event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}}),
+        json!({"type":"stream_event","session_id":"s","uuid":"u2","parent_tool_use_id":null,"event":{"type":"content_block_start","index":0,"content_block":{"type":"redacted_thinking","data":"ZW5j"}}}),
+        json!({"type":"stream_event","session_id":"s","uuid":"u3","parent_tool_use_id":null,"event":{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"c2ln"}}}),
+        json!({"type":"stream_event","session_id":"s","uuid":"u4","parent_tool_use_id":null,"event":{"type":"content_block_start","index":0,"content_block":{"type":"server_tool_use_from_the_future"}}}),
+        json!({"type":"stream_event","session_id":"s","uuid":"u5","parent_tool_use_id":null,"event":{"type":"content_block_delta","index":0,"delta":{"type":"citations_delta"}}}),
+        json!({"type":"assistant","session_id":"s","uuid":"u6","parent_tool_use_id":null,"message":{"id":"m","content":[{"type":"thinking","thinking":"private","signature":"c2ln"},{"type":"redacted_thinking","data":"ZW5j"}]}}),
+    ] {
+        serde_json::from_value::<ClaudeMessage>(frame.clone())
+            .unwrap_or_else(|error| panic!("{frame} decodes: {error}"));
+    }
+}
+
+/// A subagent's blocks share the root's indexes. A child thinking start and stop at the root
+/// block's index must neither complete nor split the root block.
+#[test]
+fn subagent_thinking_frames_never_touch_the_root_reasoning_item() {
+    let mut runtime = ClaudeProviderRuntime::new("thread-1".to_owned(), "session-root".to_owned());
+    runtime.start_session(RuntimeMode::FullAccess, None);
+    runtime.start_turn(TurnInput {
+        turn_id: "turn-1".to_owned(),
+        input: "delegate".to_owned(),
+    });
+    let frame = |uuid: &str, parent: Value, event: Value| json!({"type":"stream_event","session_id":"session-root","uuid":uuid,"parent_tool_use_id":parent,"event":event});
+    let mut events = Vec::new();
+    for value in [
+        frame(
+            "root-start",
+            Value::Null,
+            json!({"type":"message_start","message":{"id":"msg-root"}}),
+        ),
+        frame(
+            "root-thinking-start",
+            Value::Null,
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}),
+        ),
+        frame(
+            "root-thinking-1",
+            Value::Null,
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Root one"}}),
+        ),
+        frame(
+            "child-thinking-start",
+            json!("task-parent"),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}),
+        ),
+        frame(
+            "child-thinking-stop",
+            json!("task-parent"),
+            json!({"type":"content_block_stop","index":0}),
+        ),
+        frame(
+            "root-thinking-2",
+            Value::Null,
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":", root two"}}),
+        ),
+        frame(
+            "root-thinking-stop",
+            Value::Null,
+            json!({"type":"content_block_stop","index":0}),
+        ),
+    ] {
+        events.extend(runtime.handle_raw_value(&value, 1_000).events);
+    }
+    let reasoning = events
+        .iter()
+        .filter(|event| {
+            event.payload.get("streamKind") == Some(&json!("reasoning_text"))
+                || event.payload.get("itemType") == Some(&json!("reasoning"))
+        })
+        .map(|event| {
+            (
+                event.event_type.as_str(),
+                event.item_id.as_deref(),
+                event.payload.get("delta").and_then(Value::as_str),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        reasoning,
+        [
+            ("content.delta", Some("msg-root:0"), Some("Root one")),
+            ("content.delta", Some("msg-root:0"), Some(", root two")),
+            ("item.completed", Some("msg-root:0"), None),
+        ]
+    );
+}
+
 #[test]
 fn todo_write_streams_emit_plan_updates() {
     let fixture: TraceFixture = load_fixture("trace-todo-plan.json");
