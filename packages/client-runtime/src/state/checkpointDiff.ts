@@ -22,4 +22,6 @@ export interface CheckpointDiffTarget {
   readonly toTurnCount: number | null;
   readonly ignoreWhitespace: boolean;
   readonly cacheScope?: string | null;
+  /** `-U<N>`: read through the context families, which keep nothing once released. */
+  readonly contextLines?: number | null;
 }

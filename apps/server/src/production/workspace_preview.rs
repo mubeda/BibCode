@@ -43,6 +43,9 @@ const WORKSPACE_METHODS: &[&str] = &[
     "projects.writeFile",
     "projects.writeFileIfUnchanged",
     "review.getDiffPreview",
+    "review.listDiffTools",
+    "review.openDiffTool",
+    "review.readFileVersion",
 ];
 const PREVIEW_METHODS: &[&str] = &[
     "preview.claimOpenRequest",

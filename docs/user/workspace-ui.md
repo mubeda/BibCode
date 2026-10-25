@@ -1138,7 +1138,8 @@ Plan surfaces can also appear when the active provider/session supplies them.
   (see [Previewing the server's dev servers](#previewing-the-servers-dev-servers));
   a browser tab served over HTTPS has no Browser surface.
 - **Terminal** starts a shell in the active workspace.
-- **Diff** reviews branch or worktree changes.
+- **Diff** reviews the working tree, branch changes, or a turn's changes (see
+  [Diff](#diff)).
 - **Activity** shows structured provider activity when available.
 - **Plan** displays the active agent plan when available.
 - **Device** shows an Android emulator or, on a macOS server, an iOS simulator
@@ -1147,6 +1148,63 @@ Plan surfaces can also appear when the active provider/session supplies them.
 - **Pull request** shows one pull or merge request beside the thread (see
   [Pull and merge requests in the panel](#pull-and-merge-requests-in-the-panel)).
   It has no entry in the `+` menu; it opens from the places listed there.
+
+### Diff
+
+The scope menu chooses what the Diff panel compares: **Working tree** (against
+`HEAD`), **Branch changes** (against a base branch you can change), **Latest
+turn**, or any **Turn**. A turn's changes come from the checkpoints BiBCode
+saves before and after it. When a checkpoint is gone, or Git can't compare
+two of them, the panel says so instead of showing no changes.
+
+**Changes | Compare** chooses how to read them:
+
+- **Changes** stacks every changed file. **Stacked** and **Split** lay out each
+  file's hunks.
+- **Compare** lists the changed files on the left and shows the selected
+  file's previous and current versions side by side, aligned and scrolling
+  together. The full files load after the changed lines, which show at once.
+  - The list filters by name (**Esc** clears it) and by status, and says
+    "N of M files" while a filter is on. Up, Down, Home, End, Page Up and Page
+    Down move the selection. In a panel narrower than 640 px, the list becomes
+    a searchable file picker above the diff, between **Previous file** and
+    **Next file**.
+  - **All lines** shows the whole file. **Changes only** shows the changes with
+    **Context lines** around them (3 by default, up to 99); collapsed regions
+    still expand. If the changes with that count fail to load, Compare says so
+    with **Retry**.
+  - **Previous change** and **Next change** step through the blocks of
+    changes; **F7** and **Shift+F7** do the same while Compare has focus.
+  - A file that Compare cannot show in full says why: added and deleted files
+    show their one side, and a pure rename, a file mode change, a binary file
+    and a submodule each get a short explanation. A file over 4.4 MB, a
+    version no longer in the repository, a patch from an older server and a
+    turn patch saved before checkpoints kept full files show the changed lines
+    with the reason. A working file that keeps changing says "This file is
+    changing." with **Refresh**.
+
+**Open with** opens the changes in a diff app such as Beyond Compare, Meld,
+KDiff3, WinMerge or FileMerge, through `git difftool`. In Changes, the
+toolbar's **Open with** opens every file of the scope. In Compare, the one
+beside the file opens that file, and **All files in** opens every file. The
+menu lists the apps Git finds on the computer, including your own
+`difftool.<tool>.cmd`, with the default marked: the one `git config
+diff.guitool` or `diff.tool` names, then the last one you chose, then the
+first listed. A failed launch shows Git's message with **Copy command**, so
+you can run it yourself. The app stays open when BiBCode quits, so unsaved
+edits in it are kept.
+
+- It works for threads on this computer only. For another environment the menu
+  says where the thread runs.
+- Untracked files can't open on their own; stage one to compare it.
+- With no app found, the menu says to install one or set
+  `git config diff.tool`.
+- In a browser, the app opens on the computer running the server.
+
+The view, the layout, the line filter and the context count are remembered
+across restarts, and Compare remembers the selected file for each thread. Its
+filters reset when the page reloads, so it never opens with files hidden.
+Switching between Changes and Compare keeps the scope and the base ref.
 
 ### Pull and merge requests in the panel
 
@@ -1770,6 +1828,14 @@ The Files surface is a full file manager for the active workspace:
     on screen until you choose.
 
 ## Current limitations
+
+- In Compare, a line comment can start only on a line that is part of Git's
+  default hunks, the same lines Changes shows.
+- **Open with** is not available for remote environments, and it opens the
+  current versions in Git, not the exact patch the panel loaded. A diff app
+  that returns at once may find Git's temporary copy already gone. On Windows,
+  a diff app still open in a worktree keeps that worktree from being removed,
+  and a job that forbids breakaway closes the app with BiBCode.
 
 - Find in thread searches messages, plans, and tool commands. Tool output,
   changed-file lists, attachments, terminal-context chips, review-comment cards,

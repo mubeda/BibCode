@@ -35,6 +35,8 @@ The fixed defaults are:
   { "key": "mod+n", "command": "terminal.new", "when": "terminalFocus" },
   { "key": "mod+w", "command": "terminal.close", "when": "terminalFocus" },
   { "key": "mod+d", "command": "diff.toggle", "when": "!terminalFocus" },
+  { "key": "f7", "command": "diff.nextChange", "when": "diffFocus" },
+  { "key": "shift+f7", "command": "diff.previousChange", "when": "diffFocus" },
   { "key": "mod+shift+j", "command": "preview.toggle" },
   { "key": "mod+r", "command": "preview.refresh", "when": "previewFocus" },
   { "key": "mod+l", "command": "preview.focusUrl", "when": "previewFocus" },
@@ -105,6 +107,10 @@ surface them.
 - `terminal.close`: close/kill the focused center or right-panel terminal
 - `rightPanel.toggle`: open/close the right tool panel
 - `diff.toggle`: open/close the thread diff view
+- `diff.nextChange` / `diff.previousChange`: in the Diff panel's Compare view,
+  scroll the selected file to the next or previous block of changes; default
+  to `f7` and `shift+f7` with `when: "diffFocus"`. At the last or first change
+  they do nothing, and the matching buttons say "No more changes."
 - `preview.toggle`: open/close the in-app browser preview when the active host exposes preview support
 - `preview.refresh`: reload the active preview tab (in focused preview context by default)
 - `preview.focusUrl`: focus the URL input of the preview panel (in focused preview context by default)
@@ -165,6 +171,7 @@ Currently available context keys:
 - `modelPickerOpen`
 - `editableFocus`
 - `chatFocus`
+- `diffFocus`
 
 Supported operators:
 
@@ -186,6 +193,8 @@ or nowhere. No default rule uses it; it is there for `chat.find` rules such as
 `{ "key": "mod+shift+f", "command": "chat.find", "when": "chatFocus" }`.
 
 `terminalFocus` is true when either a center or right-panel terminal owns focus.
+`diffFocus` is true while focus is in the Diff panel's Compare view: its file
+list or its diff.
 `terminalOpen` is true when the active thread has at least one terminal surface
 in the center or right panel. The retired bottom terminal drawer is not part of
 either context.

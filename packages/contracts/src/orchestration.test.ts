@@ -874,6 +874,58 @@ it.effect("rejects turn diff input when fromTurnCount > toTurnCount", () =>
   }),
 );
 
+it.effect("turn diff inputs carry a context count from 0 to 99", () =>
+  Effect.gen(function* () {
+    const turn = yield* decodeTurnDiffInput({
+      threadId: "thread-1",
+      fromTurnCount: 1,
+      toTurnCount: 2,
+      contextLines: 0,
+    });
+    assert.strictEqual(turn.contextLines, 0);
+    const full = yield* decodeFullThreadDiffInput({
+      threadId: "thread-1",
+      toTurnCount: 2,
+      contextLines: 99,
+    });
+    assert.strictEqual(full.contextLines, 99);
+    for (const contextLines of [-1, 100, 2.5]) {
+      const result = yield* Effect.exit(
+        decodeTurnDiffInput({
+          threadId: "thread-1",
+          fromTurnCount: 1,
+          toTurnCount: 2,
+          contextLines,
+        }),
+      );
+      assert.strictEqual(result._tag, "Failure", `contextLines ${contextLines}`);
+    }
+  }),
+);
+
+it.effect("thread turn diffs echo truncation and the context count, both optional", () =>
+  Effect.gen(function* () {
+    const current = yield* decodeThreadTurnDiff({
+      threadId: "thread-1",
+      fromTurnCount: 1,
+      toTurnCount: 2,
+      diff: "patch",
+      truncated: true,
+      contextLines: 7,
+    });
+    assert.strictEqual(current.truncated, true);
+    assert.strictEqual(current.contextLines, 7);
+    const older = yield* decodeThreadTurnDiff({
+      threadId: "thread-1",
+      fromTurnCount: 1,
+      toTurnCount: 2,
+      diff: "patch",
+    });
+    assert.isFalse("truncated" in older);
+    assert.isFalse("contextLines" in older);
+  }),
+);
+
 it.effect("rejects thread turn diff when fromTurnCount > toTurnCount", () =>
   Effect.gen(function* () {
     const result = yield* Effect.exit(

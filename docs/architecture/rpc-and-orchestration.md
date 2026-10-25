@@ -751,6 +751,226 @@ explicit refresh or an unresolvable pinned tip resets the pages. Repositories
 over the cap fall back to `--all` paging with `degradedToAllPaging: true`, and
 the History view warns that new commits may shift the list.
 
+## Diff Compare and Open with
+
+The Diff panel reads three kinds of patch: the working tree and the branch
+range from `review.getDiffPreview`, and a turn or the whole thread from
+`orchestration.getTurnDiff` and `orchestration.getFullThreadDiff`.
+
+### Review and turn patches
+
+- **Arguments.** Every patch runs
+  `git diff --no-ext-diff --patch --minimal --full-index` with the shared
+  prefix settings above. `--full-index` prints whole object IDs on each
+  `index` line, so a client can name either side of a file by its blob ID.
+  `ignoreWhitespace` adds `--ignore-all-space`. An optional `contextLines`
+  (an integer from 0 to 99, checked on the server) adds `-U<N>`, formatted from
+  the integer. Without it Git's own context applies (3, or `diff.context`).
+  Each result echoes the count it applied as `contextLines` on the source or
+  the turn patch; an older server ignores the request and omits it.
+- **Bounds.** Each patch is capped at 4,375,000 bytes and cut at a file
+  boundary; `truncated` says later files were dropped. The runner reads at most
+  the cap plus one probe byte and then stops Git.
+- **Base ref.** A `baseRef` that starts with `-` is refused with
+  `InvalidRequest` before Git starts, so a value such as `--output=<file>` never
+  reaches Git as an option. `git check-ref-format --branch` forbids that form
+  for branch names, so no real branch is refused.
+- **Git exits.** The runner reports its child's exit to the Profiler as a
+  `git` command watched for signals. Its own kill, at the cap or after a failed
+  capture, is a requested stop and is never a `subprocess.crash`. A request
+  dropped by cancellation kills Git through `kill_on_drop` and reports nothing.
+- **Review sources on failure.** `getDiffPreview` still returns an empty
+  source when Git fails (for example, a base ref that does not exist).
+
+### Turn patches
+
+Turn and full-thread patches are computed live from the checkpoint refs at
+`refs/bibcode/checkpoints/<thread>/turn/<n>`. A request works in this order:
+
+1. It acquires the thread's workspace admission, which resolves the thread's
+   worktree or its project's root. The lease is held until Git exits. A
+   workspace that is being removed, or is gone, returns
+   `WorkspaceUnavailableError` before Git starts.
+2. It resolves both checkpoint refs with `rev-parse --verify --quiet`.
+3. When both resolve, it runs the patch arguments above on
+   `<from-ref>^{commit} <to-ref>^{commit}`. Workspace loss while Git runs
+   drops the read, which kills Git, and returns `WorkspaceUnavailableError`.
+4. When either ref is missing, it serves a stored `checkpoint_diff_blobs` row
+   for the exact range, if there is one. Nothing at this version writes those
+   rows; the fallback serves older data. A stored row has short object IDs,
+   ignores the whitespace and context options, omits `contextLines`, and
+   reports `truncated: false`.
+5. Otherwise it returns the method's error (`OrchestrationGetTurnDiffError` or
+   `OrchestrationGetFullThreadDiffError`) with "The checkpoint for turn <n> is
+   no longer in the repository."
+6. A non-zero Git exit that the runner did not cause returns the same error
+   type with "Git couldn't compare these checkpoints (exit <code>).", never an
+   empty patch.
+
+Turn ranges must be non-negative and ordered, and the revisions are built on
+the server from the thread ID and the turn counts; the client sends no ref
+names. An older server serves only stored rows, which a turn captured by it
+never had, and never returns `WorkspaceUnavailableError` for these methods.
+
+### Full-file reads
+
+`review.readFileVersion` (`read_unary`, `review:write`) returns one side of a
+changed file, named by the content it must have rather than by a revision:
+
+- **`blob { oid }`** reads the object with one `git cat-file --batch`, with the
+  read environment plus `GIT_NO_LAZY_FETCH=1`, so a partial clone never
+  fetches from the network. The ID must be 40 or 64 lowercase hex digits,
+  which is neither an option nor a path. A deleted file, a rename's old side
+  and a branch or checkpoint file absent from the checkout are all read this
+  way, without touching the working tree. No filter or text conversion
+  applies.
+- **`worktree { path, expectedOid }`** reads the working-tree file once and
+  hashes its bytes with `git hash-object --stdin --path=<path>`, which applies
+  that path's clean filters and end-of-line rules as `git diff` did when it
+  printed the ID. A different ID returns `changed`. The path is named from the
+  top of `cwd`'s repository (`git rev-parse --show-toplevel`), as the patch
+  names it, so a project rooted in a repository subdirectory reads its files
+  too. It goes through the workspace's `resolve_relative` and
+  `canonical_existing_within` against that top: an absolute path, `..` or a
+  symlink that leaves the repository is refused, a symlink, directory or
+  submodule is `not-a-file`, and a path that no longer exists is `missing`.
+  The read reaches no further than the blob reads, which already cover the
+  whole repository, and returns text only for bytes that hash to the ID the
+  client names.
+- **Results.** `text { contents, byteLength }` is lossy UTF-8, as the patch
+  is. `unavailable { reason, byteLength }` says why there is none: `missing`,
+  `binary` (a NUL byte), `too-large` (over the 4,375,000-byte patch cap, with
+  the size from `cat-file --batch-check`), `not-a-file` or `changed`.
+- **Bounds.** The method is dispatched in `WorkspaceRpc` behind the same
+  `acquire_path` admission as `getDiffPreview`, and shares the workspace's 32
+  operation permits. Each Git step has a 30 s timeout and the request's
+  cancellation.
+
+The client keeps version reads and patches with a `contextLines` in their own
+query families with `idleTtlMs: 0`. Releasing one interrupts a read in flight
+and drops its result, so moving to another file, or to another context count,
+keeps no multi-megabyte result behind. The default patch keeps today's
+family, so Changes and Compare's **All lines** share it.
+
+### Compare view
+
+The Diff panel's Compare view (`apps/web/src/components/diffs/DiffCompareView.tsx`,
+with its pure model in `apps/web/src/lib/diffCompareModel.ts`) works from the
+patch the panel already loaded:
+
+- **Rows** (path, status, +/− counts) are derived once per parsed patch;
+  filtering never re-parses it, and the name filter is deferred.
+- **Version plan.** For the working tree it reads `blob { prevObjectId }` and
+  `worktree { path, newObjectId }`; for a branch or a turn, two blobs. Added,
+  deleted, pure-rename, mode-only, binary and submodule files read nothing.
+  Abbreviated object IDs fall back to the hunks: a turn patch from a server
+  that reports `truncated` is a stored row, any other is an older server.
+- **Hydration.** Both texts fill Git's hunks with pierre's
+  `hydratePartialDiff("clone", …)`, so the patch Changes renders stays partial.
+  Every added and deleted line is then checked against the full files,
+  ignoring a trailing `\r`; a textconv driver or a filter that rewrote the
+  diff falls back to the hunks with a note. The file's metadata is kept while
+  its object IDs and hunk ranges stay the same, so a refresh of the patch
+  hydrates it again only when the file changed.
+- **`changed`.** A working file that moved past the patch revalidates the
+  patch and reads the file again, once. Only a read after that request that is
+  `changed` again, of a new object ID or of the same one when the refreshed
+  patch names the same content, shows "This file is changing." with
+  **Refresh**, so a file an agent keeps writing never loops and a file never
+  loads forever. Metadata is kept across refreshes only for a file with both
+  full object IDs: a file shown from its hunks alone, such as an untracked
+  one, takes each new patch as it is.
+- **Line filter.** **All lines** renders the hydrated default patch with
+  `expandUnchanged`. **Changes only** requests the patch again with
+  `contextLines`, renders that file hydrated with its gaps collapsed, and keeps
+  the default patch's file for placing comments, whose positions index its
+  hunks. The count commits 300 ms after typing stops. A result without
+  `contextLines` disables the field with its reason. A failed request shows
+  its error with **Retry**, an explicit refresh of that query, never the
+  default patch under the chosen count.
+- **Truncation.** A truncated patch, review or turn, shows the truncation
+  banner, and an empty truncated patch never reads as "No net changes".
+- **Navigation.** `diff.nextChange` and `diff.previousChange` (F7 and
+  Shift+F7, `when: "diffFocus"`) are resolved by a `keydown` handler on the
+  Compare root with `diffFocus` set, and scroll to each block of changes by
+  line target.
+- **Persistence.** `diffViewMode`, `diffRenderMode`, `diffCompareLines` and
+  `diffCompareContextLines` are `ClientSettings`. The selected file is
+  persisted per thread in `bibcode:diff-panel-state:v1`; the filters are kept
+  in memory only.
+
+### Open with
+
+**Open with** hands a file, or every file of the scope, to a diff app through
+`git difftool` on the server's computer
+(`apps/server/src/production/diff_tool.rs`). Git owns each tool's arguments,
+its temporary pre-image files and the user's `difftool.<tool>.cmd`.
+
+- **`review.listDiffTools`** (`read_unary`, `review:write`, long-running) runs
+  `git difftool --tool-help` with `LC_ALL=C` and an empty `LANGUAGE`, so the
+  headings are stable, and a 30 s timeout. It keeps the first section only:
+  built-ins marked "(requires a graphical session)" and the `user-defined:`
+  entries, once each. The default is the first of `diff.guitool`,
+  `merge.guitool`, `diff.tool` and `merge.tool` whose value is listed, which is
+  Git's own `--gui` order, and `defaultSource` names the key. When Git
+  succeeds but nothing parses, the configured `diff.guitool` or `diff.tool` is
+  still offered. There is no server cache; the client keeps the list for ten
+  minutes per environment and `cwd` and asks for it when the pointer reaches
+  the button.
+- **`review.openDiffTool`** (`mutation_unary`, `orchestration:operate`, like
+  `shell.openInEditor`, long-running) builds
+  `git -C <top> difftool -y --trust-exit-code [--dir-diff] --tool=<id> [-M]
+  <revs> -- [paths]`, where `<top>` is `cwd`'s repository top
+  (`rev-parse --show-toplevel`), because the patch names paths from there,
+  also for a project in a subdirectory. `--trust-exit-code` makes Git return the tool's
+  failure. The revisions come from the scope: `HEAD` for the working tree;
+  for a branch, the base (or the repository's default ref) resolved with
+  `rev-parse --verify --quiet --end-of-options <base>^{commit}`, then
+  `<base-oid>...HEAD`; for a turn, both checkpoint refs `^{commit}`, built
+  from the thread ID and turn counts. A rename passes both paths with `-M`.
+  Paths are checked lexically by `resolve_relative` and never against the
+  disk, so a deleted file, a rename's old path and a file only a base or a
+  checkpoint holds are valid; they follow `--` with `GIT_LITERAL_PATHSPECS=1`.
+  The tool ID matches `[A-Za-z0-9][A-Za-z0-9._-]*` and is passed only as the
+  value of `--tool=`. The environment adds `GIT_TERMINAL_PROMPT=0`, and the
+  AppImage environment is isolated.
+- **Launch.** Stdin and stdout are null and stderr goes to a log in the
+  temporary directory. The child has no kill-on-drop and starts in its own
+  process group, so a terminal's Ctrl+C to a standalone server does not reach
+  it; on Windows it uses `CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP |
+  CREATE_BREAKAWAY_FROM_JOB` and retries without breakaway when the job
+  forbids it. The server waits up to 1 s: an exit 0 or a process still running
+  returns `opened`, and a non-zero exit returns `ReviewDiffToolError` with
+  reason `launch-failed`, the last 2 KiB of stderr with the exit code, and the
+  command for **Copy command**. At most 16 launches run at once
+  (`too-many-open`), and a launch after shutdown began is `shutting-down`. The
+  child goes to its reaper as soon as it starts, and the launch only listens
+  for an exit within the window, so a request dropped during the window
+  (a client that disconnects) leaves the slot, the registration, the log and
+  the exit report with the reaper. The reaper waits for the exit, reports it,
+  logs a failure after the window with the tool ID and exit code only, deletes
+  the log and drops the registration.
+- **Surviving shutdown.** A diff app holds the user's edits: the working-tree
+  side is the real file, and with `--dir-diff` Git copies an edited temporary
+  file back only when the tool exits. So the launcher registers each
+  `git difftool` with `register_identity` (`External`/`Helper`, label
+  `diff app`) and `survives_shutdown`. `freeze_and_snapshot_ownership`
+  leaves survivors out of the roots that ownership cleanup kills, and a
+  standalone server's cleanup of its own descendants spares each survivor and
+  its descendants, matched by start time so a reused PID is not spared. In
+  `quiesce_for_update` the launcher's `shutdown()` runs before ownership is
+  frozen: it stops accepting launches and cancels the reapers without
+  signalling their children, and keeps their registrations. A Windows job
+  that forbids breakaway still ends the app with BiBCode.
+- **Client.** The menu is enabled for the primary environment only, the gate
+  the header's **Open in** picker uses, and for a server with the
+  `reviewDiffTools` capability. A remote thread, an older server, an untracked
+  file and an empty list each show their reason in the menu. The default is
+  the server's `defaultToolId`, then `diffToolLastChoice` in `ClientSettings`,
+  then the first tool; VS Code is left out of folder comparisons. A remote
+  environment's diff app would need a `DesktopBridge` command that downloads
+  both versions, which is out of scope.
+
 ## Pull Requests contract boundary
 
 `packages/contracts/src/pullRequests.ts` defines the repository-scoped Pull
