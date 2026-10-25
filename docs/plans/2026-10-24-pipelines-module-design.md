@@ -1,6 +1,6 @@
 # Pipelines Module
 
-Status: Proposed 2026-10-24.
+Status: Approved 2026-10-25 with every recommended answer.
 
 Scope: a project-level Pipelines module beside Git Manager and Pull Requests.
 It lists a project's CI pipelines (GitLab pipelines, GitHub Actions workflow
