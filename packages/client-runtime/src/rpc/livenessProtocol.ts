@@ -18,7 +18,7 @@
  * waits forever for a reopen. Effect 4.0.2's `RpcClient` sends Interrupt
  * uninterruptibly after a chunk fails to decode, so that wait blocked the
  * teardown and the disconnect was never reported; `patches/effect@4.0.2.patch`
- * makes that send interruptible.
+ * makes that send interruptible (upstream: Effect-TS/effect#9897).
  *
  * It uses only public Effect exports. Re-check it against upstream on every
  * Effect upgrade, and delete it once upstream exposes a configurable pinger
