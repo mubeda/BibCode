@@ -1137,7 +1137,7 @@ impl PipelinesService {
         if !terminal && !admitted.host.live_logs() {
             return Ok(log_unavailable(LogUnavailable::LiveOnHost, &facts));
         }
-        let download = async {
+        let download = async || {
             let read = admitted
                 .host
                 .trace(&admitted.scope, key.job, key.attempt, None, c)
@@ -1149,17 +1149,25 @@ impl PipelinesService {
                 downloaded_at: Instant::now(),
             })
         };
-        let log = match logs
-            .get_or_download(
+        let fetch = async || {
+            logs.get_or_download(
                 key.clone(),
                 self.fences(),
                 generation,
                 c,
                 || PullRequestsOperationError::new("pipelines.getJobLog", "timeout"),
-                download,
+                download(),
             )
             .await
-        {
+        };
+        let mut fetched = fetch().await;
+        // A finished job's read that waited on another window's download
+        // taken while the job ran reads the finished log itself.
+        if terminal && fetched.as_ref().is_ok_and(|log| !log.complete) {
+            logs.forget_unfinished(key);
+            fetched = fetch().await;
+        }
+        let log = match fetched {
             Ok(log) => log,
             Err(error) if error.code == "not_found" => {
                 return self.missing_log(admitted, key, c).await;

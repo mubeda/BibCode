@@ -172,6 +172,8 @@ pub(super) struct FakeHost {
     pub action: Mutex<Option<Answer<ActionResult>>>,
     /// Held reads wait here until notified.
     pub hold: Mutex<Option<Arc<tokio::sync::Notify>>>,
+    /// Held trace reads wait here, after taking the log they will answer.
+    pub trace_hold: Mutex<Option<Arc<tokio::sync::Notify>>>,
     pub ranged: bool,
 }
 
@@ -297,6 +299,10 @@ impl PipelineHost for FakeHost {
             match range {
                 Some((offset, limit)) => self.record(format!("trace {job_id} {offset}+{limit}")),
                 None => self.record(format!("trace {job_id} whole")),
+            }
+            let hold = lock(&self.trace_hold).take();
+            if let Some(hold) = hold {
+                hold.notified().await;
             }
             if trace.missing {
                 return Err(failure("pipelines.getJobLog", "not_found", None));
@@ -1255,6 +1261,65 @@ esac"#,
                 .await
                 .unwrap(),
         );
+        assert!(last.complete);
+        assert!(last.text.ends_with("Job succeeded\n"));
+    }
+
+    #[tokio::test]
+    async fn a_finished_read_that_waits_on_a_running_download_reads_the_finished_log() {
+        let b = bench("pipelines-final-read-waits").await;
+        b.open().await;
+        b.prs
+            .pipelines
+            .logs
+            .set_range_support(HOST, RangeSupport::Unsupported);
+        lock(&b.fake.jobs).insert(
+            998,
+            Answer::Ok(job_detail(998, PipelineStatus::Running, None)),
+        );
+        let mut running = vec![b'a'; log::LIVE_REDOWNLOAD_MAX];
+        running.push(b'\n');
+        lock(&b.fake.trace).log = running.clone();
+        let token = c();
+        let release = Arc::new(tokio::sync::Notify::new());
+        *lock(&b.fake.trace_hold) = Some(release.clone());
+        // One window downloads the running log; the job finishes meanwhile and
+        // another window's final read waits for that download.
+        let first = b
+            .service
+            .job_log(b.log_input(LogFrom::Tail, Refresh::User), &token);
+        let last = async {
+            while b.fake.calls("trace 998 whole") == 0 {
+                tokio::task::yield_now().await;
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let mut finished = running.clone();
+            finished.extend_from_slice(b"Job succeeded\n");
+            let size = finished.len() as u64;
+            lock(&b.fake.trace).log = finished;
+            lock(&b.fake.jobs).insert(
+                998,
+                Answer::Ok(job_detail(998, PipelineStatus::Success, Some(size))),
+            );
+            let read = b
+                .service
+                .job_log(b.log_input(LogFrom::Tail, Refresh::User), &token);
+            let unblock = async {
+                while b.fake.calls("job") < 2 {
+                    tokio::task::yield_now().await;
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                for _ in 0..20 {
+                    tokio::task::yield_now().await;
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                release.notify_one();
+            };
+            tokio::join!(read, unblock).0
+        };
+        let (first, last) = tokio::join!(first, last);
+        assert!(!chunk(first.unwrap()).complete);
+        let last = chunk(last.unwrap());
         assert!(last.complete);
         assert!(last.text.ends_with("Job succeeded\n"));
     }
