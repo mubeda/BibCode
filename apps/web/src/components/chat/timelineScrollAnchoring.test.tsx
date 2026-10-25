@@ -180,7 +180,7 @@ describe("rowToggleNeedsEndReveal", () => {
 });
 
 describe("reading line", () => {
-  const base = { rowTop: -300, rowBottom: 400, viewportTop: 0, followingEnd: false };
+  const base = { rowTop: -300, rowBottom: 400, viewportTop: 0 };
 
   it("is below an element that starts above the visible top inside the first visible row", () => {
     expect(isAboveReadingLine({ ...base, elementTop: -120 })).toBe(true);
@@ -200,9 +200,5 @@ describe("reading line", () => {
     expect(isAboveReadingLine({ ...base, elementTop: 10 })).toBe(false);
     expect(isAboveReadingLine({ ...base, elementTop: 0 })).toBe(false);
     expect(isAboveReadingLine({ ...base, rowTop: 40, rowBottom: 500, elementTop: 80 })).toBe(false);
-  });
-
-  it("ignores everything while the list follows its end", () => {
-    expect(isAboveReadingLine({ ...base, elementTop: -120, followingEnd: true })).toBe(false);
   });
 });
