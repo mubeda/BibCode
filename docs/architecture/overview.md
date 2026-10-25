@@ -2705,7 +2705,16 @@ See [RPC and orchestration](./rpc-and-orchestration.md) and
   (`/project/$environmentId/$projectId/pipelines`, filters in the URL and
   remembered per project in `bibcode:pipelines-state:v1`) paints the stored
   first page, then the live one, follows the GitLab stream while the document
-  is visible, and falls back to the 20 s visible timer. See
+  is visible, and falls back to the 20 s visible timer. A row opens the
+  pipeline page (`/pipelines/$pipelineId`, `attempt` in the search for a
+  GitHub re-run), served by the same shell with `view: "detail"`: it paints
+  the stored `pipelines_detail` row, then the live `get`, keeps whichever copy
+  has the highest `revision` (`keepNewestCopy`), and subscribes with the list
+  key remembered for the project plus its `pipelineId`, so it shares that
+  list's poller. Its stage columns (`PipelineStageColumns`) are one tree whose
+  layout a container query flips, and job links come from
+  `PipelineLinksProvider`, which opens the host's job page until the job route
+  exists. See
   [Pipelines contract boundary](./rpc-and-orchestration.md#pipelines-contract-boundary).
 - The right panel (`rightPanelStore`) can show one request per tab, with no new
   server contract. `pullRequest` surfaces (`pullRequest:<number>`, with the

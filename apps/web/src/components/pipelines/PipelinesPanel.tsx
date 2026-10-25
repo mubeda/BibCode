@@ -15,6 +15,7 @@ import {
 } from "../repositoryModule/RepositoryModule";
 import { RepositoryModuleExternalLink } from "../repositoryModule/RepositoryModuleExternalLink";
 import { PermissionButton } from "../ui/permission-button";
+import { PipelinesDetailView, type PipelinesDetailViewHandle } from "./detail/PipelinesDetailView";
 import { PipelinesListView, type PipelinesListViewHandle } from "./list/PipelinesListView";
 import {
   filtersSearch,
@@ -26,15 +27,23 @@ import { pipelinesModule, usePipelinesFirstPagePrefetch } from "./pipelinesModul
 
 const HOST_NAMES = { github: "GitHub", gitlab: "GitLab" } as const;
 
+/** The pipeline a route shows; absent on the list route. */
+interface PipelineRoute {
+  readonly pipelineId: number;
+  readonly attempt: number | null;
+}
+
 function AvailablePipelines({
   filters,
   onFiltersChange,
+  pipeline,
 }: {
   filters: PipelinesFilters;
   onFiltersChange: (filters: PipelinesFilters) => void;
+  pipeline: PipelineRoute | null;
 }) {
   const { context } = useRepositoryModule();
-  const listRef = useRef<PipelinesListViewHandle>(null);
+  const viewRef = useRef<PipelinesListViewHandle | PipelinesDetailViewHandle>(null);
   const [backedOff, setBackedOff] = useState(false);
   const pipelinesUrl = `${context.webUrl.replace(/\/+$/, "")}/${
     context.provider === "github" ? "actions" : "-/pipelines"
@@ -50,7 +59,7 @@ function AvailablePipelines({
         <PermissionButton
           variant="outline"
           size="sm"
-          onClick={() => listRef.current?.refresh()}
+          onClick={() => viewRef.current?.refresh()}
           permission={
             backedOff
               ? { allowed: false, reason: "The host asked BiBCode to wait before reading again." }
@@ -60,31 +69,49 @@ function AvailablePipelines({
           <RefreshCwIcon aria-hidden="true" />
           Refresh
         </PermissionButton>
-        <RepositoryModuleExternalLink href={pipelinesUrl} className="text-xs">
-          Open on {HOST_NAMES[context.provider]}
-        </RepositoryModuleExternalLink>
+        {/* A pipeline's own header links to its host page. */}
+        {pipeline === null ? (
+          <RepositoryModuleExternalLink href={pipelinesUrl} className="text-xs">
+            Open on {HOST_NAMES[context.provider]}
+          </RepositoryModuleExternalLink>
+        ) : null}
       </RepositoryModule.Header>
-      <PipelinesListView
-        ref={listRef}
-        filters={filters}
-        onFiltersChange={onFiltersChange}
-        onBackoffChange={setBackedOff}
-      />
+      {pipeline === null ? (
+        <PipelinesListView
+          ref={viewRef}
+          filters={filters}
+          onFiltersChange={onFiltersChange}
+          onBackoffChange={setBackedOff}
+        />
+      ) : (
+        <PipelinesDetailView
+          key={`${pipeline.pipelineId}:${pipeline.attempt ?? "latest"}`}
+          ref={viewRef}
+          pipelineId={pipeline.pipelineId}
+          attempt={pipeline.attempt}
+          onBackoffChange={setBackedOff}
+        />
+      )}
     </section>
   );
 }
 
 /**
  * The Pipelines module for one project: the repository module shell with the
- * pipelines list. Filters come from the route's search when it names any, and
- * otherwise from the ones last used for the project.
+ * pipelines list, or with one pipeline on its route. List filters come from the
+ * route's search when it names any, and otherwise from the ones last used for the
+ * project; a pipeline route uses the remembered ones to join that list's poller.
  */
 export function PipelinesPanel({
   projectRef,
   search,
+  pipelineId,
+  attempt = null,
 }: {
   projectRef: ScopedProjectRef;
-  search: PipelinesRouteSearch;
+  search?: PipelinesRouteSearch;
+  pipelineId?: number;
+  attempt?: number | null;
 }) {
   const navigate = useNavigate();
   const storedFilters = usePipelinesStore(
@@ -97,9 +124,13 @@ export function PipelinesPanel({
   const shell = useRepositoryModuleShell({
     projectRef,
     module: pipelinesModule,
-    view: "list",
+    view: pipelineId === undefined ? "list" : "detail",
     firstPagePrefetch,
   });
+  const pipeline = useMemo(
+    () => (pipelineId === undefined ? null : { pipelineId, attempt }),
+    [attempt, pipelineId],
+  );
   // A copied link or Back opens on the route's filters; remember them for the project.
   useEffect(() => {
     const store = usePipelinesStore.getState();
@@ -122,7 +153,7 @@ export function PipelinesPanel({
   return (
     <RepositoryModule.Provider value={shell}>
       <RepositoryModule.Gate>
-        <AvailablePipelines filters={filters} onFiltersChange={setFilters} />
+        <AvailablePipelines filters={filters} onFiltersChange={setFilters} pipeline={pipeline} />
       </RepositoryModule.Gate>
     </RepositoryModule.Provider>
   );

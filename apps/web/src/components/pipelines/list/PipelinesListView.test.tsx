@@ -136,6 +136,11 @@ vi.mock("@legendapp/list/react", () => ({
   ),
 }));
 vi.mock("../../../lib/openPullRequestLink", () => ({ useOpenPrLink: () => vi.fn() }));
+vi.mock("@tanstack/react-router", () => ({
+  Link: ({ children, className }: { children: ReactNode; className?: string }) => (
+    <a className={className}>{children}</a>
+  ),
+}));
 
 import { PipelinesListView, type PipelinesListViewHandle } from "./PipelinesListView";
 

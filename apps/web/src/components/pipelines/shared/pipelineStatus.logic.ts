@@ -40,7 +40,10 @@ export function pipelineStatusText(
   reason: PipelinesReason = null,
 ): string {
   if (reason !== null) return REASON_LABELS[reason];
-  return status === "success" && warnings ? "Passed with warnings" : STATUS_LABELS[status];
+  if (warnings && status === "success") return "Passed with warnings";
+  // GitLab's `allow_failure`: the job failed, and the pipeline went on.
+  if (warnings && status === "failed") return "Failed, allowed to fail";
+  return STATUS_LABELS[status];
 }
 
 const BADGE_LABELS: Record<PipelinesBadge, string> = {

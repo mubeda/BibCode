@@ -52,8 +52,11 @@ export const PipelineStatusIcon = memo(function PipelineStatusIcon({
   status: PullRequestsPipelineStatus;
   warnings: boolean;
 }) {
+  // A pass with warnings, or a failure the pipeline allowed, warns rather than fails.
   const { Icon, color, spin } =
-    status === "success" && warnings ? WARNINGS_ICON : STATUS_ICONS[status];
+    (status === "success" || status === "failed") && warnings
+      ? WARNINGS_ICON
+      : STATUS_ICONS[status];
   const icon = <Icon aria-hidden="true" className={`size-4 shrink-0 ${color}`} />;
   // The wrapper spins, not the SVG, so the browser can hardware-accelerate it.
   return spin ? (
