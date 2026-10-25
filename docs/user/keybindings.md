@@ -35,8 +35,6 @@ The fixed defaults are:
   { "key": "mod+n", "command": "terminal.new", "when": "terminalFocus" },
   { "key": "mod+w", "command": "terminal.close", "when": "terminalFocus" },
   { "key": "mod+d", "command": "diff.toggle", "when": "!terminalFocus" },
-  { "key": "f7", "command": "diff.nextChange", "when": "diffFocus" },
-  { "key": "shift+f7", "command": "diff.previousChange", "when": "diffFocus" },
   { "key": "mod+shift+j", "command": "preview.toggle" },
   { "key": "mod+r", "command": "preview.refresh", "when": "previewFocus" },
   { "key": "mod+l", "command": "preview.focusUrl", "when": "previewFocus" },
@@ -108,8 +106,10 @@ surface them.
 - `rightPanel.toggle`: open/close the right tool panel
 - `diff.toggle`: open/close the thread diff view
 - `diff.nextChange` / `diff.previousChange`: in the Diff panel's Compare view,
-  scroll the selected file to the next or previous block of changes; default
-  to `f7` and `shift+f7` with `when: "diffFocus"`. At the last or first change
+  scroll the selected file to the next or previous block of changes. They have
+  no default rule: Compare answers the built-in **F7** and **Shift+F7** until a
+  rule names the command, which then replaces that key. An older client cannot
+  decode a server configuration that names them, as with `chat.find`. At the last or first change
   they do nothing, and the matching buttons say "No more changes."
 - `preview.toggle`: open/close the in-app browser preview when the active host exposes preview support
 - `preview.refresh`: reload the active preview tab (in focused preview context by default)

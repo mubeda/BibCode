@@ -39,7 +39,11 @@ const CORE_WHEN_VARIABLES = [
 ] as const;
 
 /** Commands with no shipped rule that a user can still bind. */
-const BINDABLE_COMMANDS_WITHOUT_DEFAULTS: ReadonlyArray<KeybindingCommand> = ["chat.find"];
+const BINDABLE_COMMANDS_WITHOUT_DEFAULTS: ReadonlyArray<KeybindingCommand> = [
+  "chat.find",
+  "diff.nextChange",
+  "diff.previousChange",
+];
 
 const DEFAULT_WHEN_VARIABLES = new Set<string>(CORE_WHEN_VARIABLES);
 for (const binding of DEFAULT_RESOLVED_KEYBINDINGS) {
