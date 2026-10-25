@@ -536,9 +536,29 @@ Why this holds:
     scrolls by the delta with `scrollToOffset({ animated: false })`. This is
     the existing `onToggleWorkGroup` pattern. It acts only when the pure
     helper `isAboveReadingLine` in `timelineScrollAnchoring.ts` reports that
-    the element starts above the visible top inside the first visible row. It
-    does nothing while the list follows the end, where `maintainScrollAtEnd`
-    already holds the newest line.
+    the element starts above the visible top inside the first visible row.
+  - _The list is at its end_ (within `maintainScrollAtEnd`'s threshold,
+    whether `maintainScrollAtEnd` or the sent-row anchor holds the list). The
+    newest line is the one read, and a growing element pushes it down:
+    neither `maintainScrollAtEnd` nor ChatView's follow of new timeline
+    entries follows a row that grows with no new entry. The anchor commits
+    the swap with `flushSync`, measures the element's growth, and two frames
+    later, once LegendList has measured the row and laid out its content at
+    the new size, scrolls to where the list was plus the growth. A scroll
+    straight after the commit would stop at the old end, since LegendList
+    clamps to the content size it knows. The follow is skipped when the user
+    scrolled up meanwhile or another follow already got there; a shrink at
+    the end needs none, since the browser clamps the scroll. The end can show
+    the growth hidden for the one or two frames before the follow, as it does
+    while text streams.
+
+  A diagram that was drawn before keeps its drawn height while it draws
+  again. The block records the body's height after each draw in a bounded
+  map keyed like the cache (fonts and full source, 1,000 entries), which
+  outlives the cache's 100. A block whose entry was evicted shows its source
+  clipped to that height until the queue draws the diagram, so a remount
+  and its redraw change no row height. A diagram never drawn, or drawn at
+  another column width, still swaps through the mechanisms above.
 
   Outside the timeline, the context is absent and the block commits normally.
   A swap below the reading line moves only content below it, like any content
@@ -740,8 +760,10 @@ Items 1-4, 8 and 9 fail on 4e023ac5ff first; 5 lands with whichever of this and
 
 9. `timelineScrollAnchoring.test.ts`: `isAboveReadingLine` is true only for an
    element that starts above the visible top inside the first visible row. It
-   is false for a row wholly above the viewport (left to `size: true`), for an
-   element in view, and while the list follows the end.
+   is false for a row wholly above the viewport (left to `size: true`) and for
+   an element in view. `readingAnchor.test.ts`: at the end, a growth is
+   followed two frames after the swap, not before; a shrink, a list the user
+   scrolled up meanwhile and one another follow already moved are left alone.
 
 ## Verification
 
@@ -858,3 +880,29 @@ it was accepted.
    the block, but the shared promises mean one success serves later attempts.
    The sanitizer allowlist and the no-jump gate stay hard requirements, as the
    critique asked.
+
+Product-owner decision, 2026-10-25: fix both merge-gate failures of the
+packaged no-jump checks before the PR.
+
+8. **A remounted, evicted diagram moved the end, and a diagram drawing at the
+   end was not followed. Fixed.** Reopening a chat whose last diagram the
+   cache had evicted painted the last line at 466, 508, 487 and 466 px in
+   successive frames: the redraw changed the row's height while LegendList
+   was settling its first scroll to the end. A diagram that replaced its
+   source at the end of a streaming reply was not followed until the next
+   delta: with the sent-row anchor holding the list, the reply's end rested
+   17 px below the composer, where the plain reply's rested 37 px above it.
+   The design said the reading anchor does nothing while the list follows
+   the end; it now follows a growth at the end, and a redrawn diagram keeps
+   its drawn height (UI behavior). Drawing synchronously from a warm chunk was
+   rejected: it would run Pele outside the one-render-per-task queue while
+   the list mounts many rows, and would not cover a cold chunk. Sizing a
+   placeholder from the diagram's natural width and height was rejected
+   because it depends on Pele's responsive SVG attributes; the measured body
+   height does not. Routing the follow through ChatView's follow of new
+   entries was tried and rejected: that follow stays on until a wheel, touch
+   or pointer gesture opts out, so a scroll away from the end made any other
+   way was pulled back to the end (1,596 px in the packaged reading-line
+   check), and the reply's end still rested 25 px hidden. The item 8 checks
+   now assert every painted frame of the remount and where the streamed
+   reply's end rests after each delivery against its plain baseline.
