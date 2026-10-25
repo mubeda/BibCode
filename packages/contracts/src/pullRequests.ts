@@ -1,6 +1,6 @@
 import * as Schema from "effect/Schema";
 
-import { TrimmedNonEmptyString } from "./baseSchemas.ts";
+import { NonNegativeInt, TrimmedNonEmptyString } from "./baseSchemas.ts";
 import { GitManagerBlockedReason } from "./gitManager.ts";
 import { SourceControlProviderKind } from "./sourceControl.ts";
 
@@ -359,6 +359,12 @@ export const PullRequestsChecks = Schema.Struct({
           startedAt: Schema.NullOr(Schema.String),
           completedAt: Schema.NullOr(Schema.String),
           durationSeconds: Schema.NullOr(Schema.Number),
+          /**
+           * The Pipelines job route's ids, together or not at all: only for a job of this
+           * project whose job page can read it. Older servers send neither.
+           */
+          pipelineId: Schema.optional(Schema.Number),
+          jobId: Schema.optional(Schema.Number),
         }),
       ),
     }),
@@ -889,5 +895,7 @@ export class PullRequestsOperationError extends Schema.TaggedError<PullRequestsO
     message: TrimmedNonEmptyStringSchema,
     hostDetail: Schema.NullOr(Schema.String),
     retryable: Schema.Boolean,
+    /** The host's backoff deadline in seconds, on `rate_limited` answers. Absent from older servers. */
+    retryAfterSeconds: Schema.optional(NonNegativeInt),
   },
 ) {}

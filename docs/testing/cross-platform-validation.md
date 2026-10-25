@@ -769,6 +769,46 @@ For GitLab poller, pipeline or snapshot changes, also run the ignored polling
 harness with `bash scripts/measure-gitlab-merge-request-load.sh` and record its
 `HARNESS_SUBSCRIBE_JSON` (requests an hour, spawns, delivery) in the report.
 
+For Pipelines server reads and actions (`pipelines.*`: the GitLab and GitHub
+list, pipeline, job and log reads, `pipelines.runAction` and its remembered
+refusals, `LogCache`, the range probe, the pipelines poller, the shared 429
+ladder, or their snapshot rows), run from the repository root:
+
+```sh
+cargo test -p bibcode-server --lib pull_requests::pipelines -j 2
+cargo test -p bibcode-server --lib pull_requests::gitlab::pipelines -j 2
+cargo test -p bibcode-server --lib pull_requests::github::runs -j 2
+cargo test -p bibcode-server --lib pull_requests::backoff -j 2
+cargo test -p bibcode-server --lib pull_requests::gitlab::poll -j 2
+cargo test -p bibcode-server --lib pull_requests::tripwires -j 2
+cargo test -p bibcode-server --lib production::pipelines_rpc -j 2
+cargo test -p bibcode-server --lib -j 2 -- rpc::methods auth::scope diagnostics::profiler::latency
+cargo test -p bibcode-server --test rpc_wire -j 2
+vp test run packages/contracts/src/pipelines.test.ts packages/contracts/src/environment.test.ts packages/contracts/src/settings.test.ts
+```
+
+The service tests resolve a checkout through fake `git`, `glab` and `gh`
+scripts and run on Unix only, as do the GitHub reader's `process_tests`; the
+poller tests and the GitHub parse tests run on every platform.
+
+For the Pipelines web module (the list, the job page and its log parser,
+worker engine, reader and viewer), the repository module shell both modules
+share, the sidebar buttons, the Settings switch and the Pipelines client
+runtime,
+run from `apps/web` (compiler-sensitive happy-dom files) and the repository
+root:
+
+```sh
+vp test run --project unit src/pipelinesStore.test.ts src/components/pipelines src/components/repositoryModule src/components/pullRequests src/components/Sidebar.test.tsx src/components/settings/SourceControlSettings.test.tsx src/components/terminalTheme.test.ts
+vp test run packages/client-runtime/src/state/pipelines.test.ts
+vp run typecheck
+vp check
+```
+
+`PullRequestsPanel.test.tsx` is the shell's regression gate: its shell cases
+must pass unchanged. `components/pipelines/shared/MergeRequestPipelineLinks.test.tsx`
+covers the merge request tab's in-app links and their gate.
+
 For provider detection of self-hosted hosts (the recorded host observation,
 remote parsing, status classification, and the create action's provider check
 before anything is published), also run:
@@ -2553,6 +2593,15 @@ never count a sandbox-denied listener test as passed or skipped.
     With four running merge requests open on Pipelines in separate windows
     (one list filter), the fourth's job list must follow its pipeline status
     within about 20 s of a status change.
+    Against a server that advertises `pipelinesReads`, with **Pipelines** on:
+    the merge box's **View pipeline** opens that pipeline's page; on the
+    Pipelines tab a build job's name opens its job page with **Open on
+    GitLab** beside it, and a trigger job keeps its downstream link. On
+    GitHub, an Actions check's name opens its job page with **Open on
+    GitHub** beside it, and a third-party status check
+    keeps its host link. Turn **Pipelines** off, or use an older server: the
+    names link to the host and **View pipeline** is gone. The same request in
+    a thread's side panel keeps the host links.
 11. Verify real GitHub split patches and GitLab synthetic-header patches render
     in Files, including renamed files. Scroll far enough to exercise list and
     diff virtualization. Viewed must survive tab changes and reload. Test the
@@ -2658,6 +2707,140 @@ never count a sandbox-denied listener test as passed or skipped.
     `git status` in the reported path is the recovery starting point. No automatic
     retry or late navigation is permitted. An existing redirect toast must honor a
     subsequent mutation denial. Record browser/native checks separately from CLI-stub tests.
+
+### Pipelines web shell validation
+
+Use a GitLab project with recent pipelines (one running, one failed, one on a
+tag, one merge request pipeline) and a GitHub repository.
+
+1. Every project header shows **Pipelines** after **Pull Requests**, with the
+   tooltip and accessible name "Pipelines for <project>"; a long project title
+   must stop short of the five icons, with and without the sandbox badge. In
+   the Repositories view the repository row shows it after its Pull Requests
+   button and environment rows do not; with the repository in two
+   environments it asks which. On a narrow window the mobile sidebar closes on
+   choice. The project header stays highlighted on the list after reload.
+2. **Settings → Source Control → Pipelines** off hides both buttons and leaves
+   Pull Requests; an open Pipelines route says it is turned off and links to
+   Source Control. A server without `pipelinesReads` asks for an update.
+3. Open the GitLab list: rows show status, duration, age (the exact time on
+   hover), title, number, branch, tag or merge request, short commit, badges
+   and named stage icons, on wide and narrow panels. Reopen it: the last copy
+   paints before any `glab` spawn (Profiler or server trace), then the live
+   page replaces it. Switch to Pull Requests and back on the same checkout: no
+   second context read.
+4. Change the tab and the branch filter (a picked branch, then a typed name
+   with Enter): the URL carries `scope` and `ref`, Back and a copied link keep
+   them, and the sidebar button reopens the last filter. An empty tab and an
+   empty branch name their state, the latter with **Clear filter**. **Load
+   more** appends without moving loaded rows.
+5. With a pipeline running, the row must follow GitLab within about 20 s with
+   no Refresh; two windows on one list must produce the `glab` reads of one;
+   hiding the window stops reading. Make the host answer 429 (or block it
+   with a proxy): the list counts down, Refresh and Retry are disabled with
+   their reason, and one read follows the deadline.
+6. Retry and Cancel show only where they apply; against a server without
+   `pipelinesMutations` they are disabled with "Update the server to retry and
+   cancel pipelines.", and a Guest or Reporter account sees its own refusal.
+   Retry a failed pipeline from its row: the button spins until the row shows
+   it running again, with no confirmation; double-click it and the server
+   trace shows one `glab api --method POST …/retry`. Cancel a running one: the
+   row turns canceled. Retry a job another window already retried: the
+   message says to refresh, and Retry is not disabled for the project. The row menu's Open on GitLab opens the host's page.
+7. Open a GitHub repository with two workflows: the list shows one row per
+   workflow run ("CI #312"), its PR or branch, badges from the event
+   (scheduled, merge request, manual run, retried), and no stage strip.
+   **Workflow** narrows it to one workflow; a branch or state filter that
+   reaches 1,000 runs ends with "GitHub returns at most 1,000 filtered runs.".
+   While a run is running the list re-reads every 20 s, and not once every
+   shown run has finished. A repository without workflows says "This
+   repository has no workflows."; one whose Actions are off (or a token without
+   Actions read) gets the copy naming both causes. Open a matrix run: one
+   **Jobs** column, the run's artifacts below it (each opens the run's page on
+   GitHub), and, for a re-run run, the **Attempt** select; attempt 1 of a run
+   that failed then passed says "Failed". A cancelled run reads "Canceled", a
+   fork PR waiting for approval "Waiting for approval". Re-run a failed run
+   from attempt 1's page with **Retry failed jobs**: the page opens the run's
+   latest attempt. Cancel a running run: it shows **Canceling** until GitHub
+   reports it canceled. With a fine-grained token without Actions write, Retry
+   says "GitHub refused: …" in a message and stays disabled with that reason in
+   every window, with no sign-out, until a rescan.
+8. Choose a row (anywhere but its buttons): the pipeline page opens in
+   BiBCode, and the project header stays highlighted after reload. Hover a row
+   first, then open it within 5 s: no second `pipelines.get` read. The header
+   shows the status (try a passed-with-warnings and a waiting pipeline), the
+   title, "Pipeline #… created … by … · finished …", the short commit (opens
+   on GitLab), the ref (a merge request pipeline's ref opens its merge request
+   in BiBCode), the job count, duration and queued time. Compare the stages,
+   jobs and their order with GitLab's own page, on a wide panel (side by side,
+   scrolling sideways) and a narrow one (stacked); a parallel group expands, a
+   trigger job links to its downstream pipeline, an allowed failure shows a
+   warning, and each job opens its job page in BiBCode. Reopen the page: the last copy
+   paints before any `glab` spawn.
+9. With a pipeline running, its page must follow GitLab within about 10 s;
+   one window on its list and one on the pipeline must produce one poller's
+   reads; the page stops reading once the pipeline finishes. With a Guest
+   account (jobs hidden) the header stays and the page says the jobs are
+   hidden. A pipeline id the account cannot read says "You can't view this
+   pipeline." and one that does not exist "This pipeline no longer exists.",
+   neither signing out; `/pipelines/abc` returns to the list. With a running
+   pipeline's page and one of its job pages open, remove the account from the
+   project (or delete the pipeline): within about 10 s both pages replace the
+   pipeline and job with that copy, with no further `glab` read for them, and
+   Refresh reads the host again.
+
+### Pipelines job page validation
+
+Use a GitLab project with a finished failed job whose log has colors and
+collapsible sections, a job with a log over 16 MB or about 100,000 lines, a
+running job, a manual job, an erased job and a job with artifacts.
+
+1. Open a job from its URL
+   (`/project/<env>/<project>/pipelines/<pipeline>/jobs/<job>`): the header
+   shows status, name, `Job #<id> · stage <stage> · started …`, **Open on
+   GitLab** and Retry, Cancel or Run where they apply (disabled with "Update
+   the server to retry and cancel pipelines." against a server without
+   `pipelinesMutations`); the project header stays highlighted. Retry the
+   failed job: the new job's page opens. Run the manual job and cancel the
+   running one: each page follows the job's new status.
+   Reopen it: the stored job paints before any `glab` spawn. A non-numeric
+   pipeline or job id returns to the list.
+2. The finished log opens at its end with GitLab's colors in both themes,
+   line numbers matching GitLab's, sections folded where GitLab folds them,
+   section durations, and **Timestamps** only on a stamped log. Collapse all,
+   Expand all, Wrap lines, Scroll to top and Scroll to bottom work; **Raw
+   log** opens GitLab's raw log.
+3. Search a common word: "1 of N", Enter and Shift+Enter wrap, a match in a
+   folded section opens it. Mod+F focuses the search once (Find in thread does
+   not open) and Escape returns to the log.
+4. Click a line number: the address gains `?at=` and the line highlights.
+   Open the copied link in another window: it opens on that line, reading
+   only that window (one `getJobLog` in the server trace).
+5. On the large log, scroll the whole log and search a term with thousands of
+   matches: the window stays responsive (record a Performance trace; no task
+   over 50 ms). **Load earlier** adds text above until 16 MB, then says
+   earlier lines are on the host; line numbers start at the first loaded line
+   until offset 0 is loaded.
+6. On the running job, new output appears within about 5 s while at the
+   bottom; scrolling up shows **Jump to latest**; hiding the window stops the
+   `getJobLog` reads; two windows on one job read GitLab's trace at most once
+   per 4 s. When the job finishes, one final read loads the rest and reads
+   stop. A running log over 2 MB keeps its head with the "This running log is
+   over 2 MB" copy and **Open on GitLab** until the job finishes. On a host
+   without range support, a running log over 2 MB shows its downloaded copy
+   until the job finishes; then one more whole download shows its final lines.
+7. The details show duration or elapsed, finished, queued, runner, source,
+   tags, artifacts with **Download** and **Browse**, commit, pipeline, and the
+   stage's other jobs as links to their pages; on a narrow panel they sit
+   under **Details**. The erased job and a job without output say so.
+8. On GitHub, open a running job: the log area says "GitHub shows live logs on
+   its site." with **Open on GitHub** and lists the job's steps, which update
+   about every 10 s while the window is visible; the server trace shows no
+   `actions/jobs/<id>/logs` read. When the job finishes, its log loads once,
+   its details list the steps and the run's artifacts, and choosing a step
+   scrolls to where its output starts. A log past GitHub's retention says
+   "This log has expired." A GitHub job offers Retry (when it finished without
+   passing) and no Cancel or Run; Retry opens the run's latest attempt.
 
 ### Remote-hosted Git Manager run
 

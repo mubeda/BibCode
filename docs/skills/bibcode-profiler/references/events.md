@@ -124,7 +124,7 @@ tier write nothing.
 - `tier`:
   - `relative`: over `max(3 × p95, floor)` once the method has 100 samples. It is
     logged only and never raises a finding. The floor is 250 ms, or 1 s for
-    background methods (`git.*`, `vcs.*`, `worktree.*`, `pullRequests.*`,
+    background methods (`git.*`, `vcs.*`, `worktree.*`, `pullRequests.*`, `pipelines.*`,
     `server.refresh*`, `projects.searchEntries`);
   - `warn`: at least 1 s;
   - `severe`: at least 10 s;

@@ -34,6 +34,7 @@ const h = vi.hoisted(() => ({
   listRefresh: vi.fn(),
   listProps: null as Record<string, unknown> | null,
   detailProps: null as Record<string, unknown> | null,
+  detailPipelineLink: null as unknown,
   besideProps: null as Record<string, unknown> | null,
   dialogProps: null as Record<string, unknown> | null,
 }));
@@ -45,8 +46,9 @@ vi.mock("../../state/environments", () => ({
   useEnvironmentConnectionState: () => ({ data: h.connection }),
 }));
 vi.mock("../../hooks/useSettings", () => ({
-  usePrimarySettings: (select: (s: { pullRequestsEnabled: boolean }) => unknown) =>
-    select({ pullRequestsEnabled: h.enabled }),
+  usePrimarySettings: (
+    select: (s: { pullRequestsEnabled: boolean; pipelinesEnabled: boolean }) => unknown,
+  ) => select({ pullRequestsEnabled: h.enabled, pipelinesEnabled: true }),
 }));
 vi.mock("../../state/pullRequests", () => ({
   pullRequestsEnvironment: {
@@ -86,12 +88,17 @@ vi.mock("./list/PullRequestsListView", () => ({
     return <div>List content</div>;
   },
 }));
-vi.mock("./detail/PullRequestsDetailView", () => ({
-  PullRequestsDetailView: (props: Record<string, unknown>) => {
-    h.detailProps = props;
-    return <div>Detail content</div>;
-  },
-}));
+vi.mock("./detail/PullRequestsDetailView", async () => {
+  const { useMergeRequestPipelineLinks } =
+    await import("../pipelines/shared/MergeRequestPipelineLinks");
+  return {
+    PullRequestsDetailView: (props: Record<string, unknown>) => {
+      h.detailProps = props;
+      h.detailPipelineLink = useMergeRequestPipelineLinks().pipeline(4821);
+      return <div>Detail content</div>;
+    },
+  };
+});
 vi.mock("./OpenBesideThreadButton", () => ({
   OpenBesideThreadButton: (props: Record<string, unknown>) => {
     h.besideProps = props;
@@ -379,6 +386,23 @@ describe("PullRequestsPanel", () => {
     });
     expect(h.listProps).toBeNull();
     expect(usePullRequestsStore.getState().selectViewState(ref).lastNumber).toBe(14);
+  });
+  it("links the detail's pipeline views into Pipelines only where this server reads them", async () => {
+    await act(async () => root.render(<PullRequestsPanel projectRef={ref} number={14} />));
+    expect(h.detailPipelineLink).toBeNull();
+    h.config = {
+      environment: {
+        capabilities: makeTestExecutionEnvironmentCapabilities({
+          pullRequestsReads: true,
+          pipelinesReads: true,
+        }),
+      },
+    } as ServerConfig;
+    await act(async () => root.render(<PullRequestsPanel projectRef={ref} number={14} />));
+    expect(h.detailPipelineLink).toMatchObject({
+      to: "/project/$environmentId/$projectId/pipelines/$pipelineId",
+      params: { environmentId: "env", projectId: "project", pipelineId: "4821" },
+    });
   });
   it("offers to open the request beside a thread of the project", async () => {
     await act(async () =>

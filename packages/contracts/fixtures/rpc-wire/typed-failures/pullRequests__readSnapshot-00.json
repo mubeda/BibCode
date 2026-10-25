@@ -8,11 +8,12 @@
         "_tag": "Fail",
         "error": {
           "_tag": "PullRequestsOperationError",
-          "operation": "M`eCA.5.{",
-          "code": "4294967295",
-          "message": "�",
+          "operation": "`eCA.",
+          "code": "",
+          "message": "N",
           "hostDetail": null,
-          "retryable": true
+          "retryable": false,
+          "retryAfterSeconds": 5
         }
       }
     ]

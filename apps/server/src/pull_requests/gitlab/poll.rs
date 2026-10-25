@@ -48,6 +48,7 @@ use super::{
     },
 };
 use crate::pull_requests::{
+    backoff::HostBackoff,
     error::PullRequestsOperationError,
     host::HostScope,
     model::{
@@ -68,14 +69,6 @@ const FAST_TICKS: u8 = 6;
 const ACTIVE_NUMBERS: usize = 3;
 /// Probes run in the subscriber's own task, at most this many at once.
 const PROBES_AT_ONCE: usize = 3;
-/// Fixed 429 backoff ladder: 60s, then 120s, then 300s, holding at 300s for
-/// any further consecutive 429. A success resets the ladder to its first
-/// step for the next 429.
-const BACKOFF_STEPS: [Duration; 3] = [
-    Duration::from_secs(60),
-    Duration::from_secs(120),
-    Duration::from_secs(300),
-];
 /// Ticks are at least 10 s apart, so 16 is about 160 s of events: a
 /// subscriber that falls this far behind has a stuck stream. It skips the
 /// lagged ticks instead of blocking the driver and catches up from the next
@@ -105,30 +98,26 @@ struct Entry {
     ref_count: usize,
 }
 
-#[derive(Clone, Copy)]
-struct Backoff {
-    /// When the latest 429 took a step: a tick that started earlier proves
-    /// nothing about the limit.
-    set_at: Instant,
-    until: Instant,
-    step: usize,
-}
-
 /// One poller per repository and list key; `join`/`release` are serialized by
 /// the same lock so a lease can never resurrect an already-cancelled poller.
 /// The 429 backoff and the logout fence are per lowercased host, because
 /// GitLab limits are per user: every poller of the host waits, and a driver
-/// hand-off or a re-keyed subscription inherits the deadline.
+/// hand-off or a re-keyed subscription inherits the deadline. Both are shared
+/// handles: the pipelines module holds the same backoff and fences.
 #[derive(Default)]
 pub(crate) struct Registry {
     entries: Mutex<HashMap<Key, Entry>>,
-    backoff: Mutex<HashMap<String, Backoff>>,
+    backoff: Arc<HostBackoff>,
     fences: HostFences,
 }
 
 impl Registry {
     pub(crate) fn fences(&self) -> &HostFences {
         &self.fences
+    }
+
+    pub(crate) fn host_backoff(&self) -> &Arc<HostBackoff> {
+        &self.backoff
     }
 
     fn join(&self, key: Key, number: Option<u64>, watching: bool) -> Lease<'_> {
@@ -171,34 +160,18 @@ impl Registry {
     }
 
     fn backoff_until(&self, host: &str) -> Option<Instant> {
-        lock(&self.backoff).get(host).map(|backoff| backoff.until)
+        self.backoff.backoff_until(host)
     }
 
-    /// Takes the host's next ladder step and returns its delay.
+    /// Takes the host's next ladder step and returns its delay. The merge
+    /// request poller has no provider headers, so the ladder alone applies.
     fn back_off(&self, host: &str) -> Duration {
-        let mut backoff = lock(&self.backoff);
-        let now = Instant::now();
-        let entry = backoff.entry(host.to_owned()).or_insert(Backoff {
-            set_at: now,
-            until: now,
-            step: 0,
-        });
-        let delay = BACKOFF_STEPS[entry.step.min(BACKOFF_STEPS.len() - 1)];
-        entry.set_at = now;
-        entry.until = now + delay;
-        entry.step = (entry.step + 1).min(BACKOFF_STEPS.len() - 1);
-        delay
+        self.backoff.back_off(host, None)
     }
 
-    /// A successful tick that started at `started` clears the host's ladder;
-    /// true when it was set. A tick of another poller that was already in
-    /// flight when a 429 arrived leaves the deadline and the step alone.
+    /// See `HostBackoff::recovered`.
     fn recovered(&self, host: &str, started: Instant) -> bool {
-        let mut backoff = lock(&self.backoff);
-        match backoff.get(host) {
-            Some(entry) if entry.set_at <= started => backoff.remove(host).is_some(),
-            _ => false,
-        }
+        self.backoff.recovered(host, started)
     }
 }
 

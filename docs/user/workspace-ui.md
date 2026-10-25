@@ -1091,6 +1091,14 @@ a pipeline that finishes while shown is announced to screen readers once. The
 Pipelines tab shows the same summary above its jobs, grouped by stage in
 GitLab's order with trigger jobs linking their downstream pipeline; when a stage
 has more than 100 jobs it says so and links the pipeline for the rest.
+When **Pipelines** is on in Settings and the environment's server supports it,
+the summary on the full page also offers **View pipeline**, which opens the
+pipeline in the Pipelines module, and each job's name opens its job page there,
+with **Open on GitLab** beside it. A trigger job, a job of a fork's pipeline
+and every job on an older server link to GitLab as before. On GitHub, the
+Checks tab opens a GitHub Actions job's page the same way, with **Open on
+GitHub** beside it; other status checks keep their host links. In a thread's
+side panel these links stay on the host; **Open full page** first.
 Beyond three merge requests watched at once, the others' pipeline status
 updates every 20 seconds, and their Pipelines tab reloads its jobs whenever
 that status changes.
@@ -1139,6 +1147,147 @@ it. Approval and merge carry the head you reviewed. A stale-head error says
 “This pull request changed; reload and try again” and offers Refresh while
 preserving drafts. Errors include server recovery advice; partial writes report
 what landed and are never retried automatically.
+
+## Pipelines
+
+Choose **Pipelines** (the linked-nodes icon) on a project header, immediately
+after Pull Requests, to see the project's CI pipelines for one checkout.
+Grouped projects use the same environment/member picker as the other project
+actions; in the Repositories view, use the repository row's Pipelines button,
+after its Pull Requests button. The project header stays highlighted on the
+Pipelines routes, including after reload.
+
+**Settings → Source Control → Pipelines** shows or hides both buttons,
+independently of Pull Requests. Turning it off leaves an open Pipelines route
+explaining the setting with a link back to Source Control. Pipelines share the
+Pull Requests module's checkout selector, repository context, sign-in and
+recovery states: moving between the two modules on one checkout does not ask
+the host again. An older server says to update it. Both GitLab projects and GitHub
+repositories are supported: on GitHub each row is one workflow run, labeled
+like GitHub's Actions page ("CI #312").
+
+The list opens on the copy BiBCode last stored for that filter, then the
+host's current page. Each row shows the status with its duration and age
+(hover for the exact time), the title, the pipeline number, the branch, tag or
+merge request, the short commit, badges such as **latest** or **merge
+request**, who started it, and one icon per stage (each named, for example
+"test: failed"). Choose anywhere on a row to open the pipeline in BiBCode; the
+row's menu has **Open on GitLab**. **All**, **Running** and **Finished**
+filter by state, and the branch field filters by ref: pick one of the checkout's
+branches or tags, or type any name and press Enter. Filters live in the URL,
+so Back and a copied link keep them, and the last ones are remembered for the
+project. **Load more** appears when the host has another page. On GitHub a
+**Workflow** select narrows the list to one workflow's runs; a filtered GitHub
+list ends at the 1,000 runs GitHub returns and says so. A GitHub repository
+with no workflows says "This repository has no workflows."; when GitHub does
+not return the runs at all, the list says Actions may be turned off or your
+sign-in may not be allowed to read Actions.
+
+While the list is visible, a running GitLab pipeline updates within about
+20 seconds without a Refresh, through one shared server poller however many
+windows show the list; a hidden window stops reading. A GitHub list re-reads
+its first page every 20 seconds while one of its runs is still running, and
+not at all once every shown run has finished. **Refresh** reloads the
+first page. When GitLab asks BiBCode to slow down, the list keeps what it
+shows, counts down to the host's retry time with Refresh disabled, and then
+reads again. **Retry** appears on a finished pipeline that did not pass and
+**Cancel** on one that is still running; on GitHub the row's menu also has
+**Retry failed jobs**. A row your account cannot act on says why, and an older
+server says to update it.
+
+A pipeline's page (`/pipelines/<id>`) also opens on the last stored copy,
+then the host's. Its header shows the status (for example **Failed**,
+**Passed with warnings** or **Waiting for approval**), the title, "Pipeline
+#4821 created 2h ago by Ana Rossi · finished 1h ago", the commit (its short
+id opens it on the host), the branch or tag (a merge request opens its page in
+BiBCode), the job count, the duration and the queued time, with Retry, Cancel,
+**Retry failed jobs** (GitHub) and **Open on GitLab**. Each job row has one
+action where it applies: **Run** for a manual job, **Cancel** for one still
+running, **Retry** for a finished one. Below it the stages sit side by side in GitLab's order
+on a wide panel, scrolling sideways, and stacked on a narrow one. Each stage
+shows its status, name and job count; each job its status, name and
+duration. A parallel group such as `rspec 3` is one row that expands to its
+jobs, a trigger job links to its **Downstream pipeline**, and a job that
+failed but was allowed to fail shows a warning instead of a failure. Choosing
+a job opens its job page in BiBCode (below). When GitLab returns only the first 100 jobs of a
+stage, the page says so and links to the full pipeline; an account that
+cannot see the jobs keeps the header and is told so. A pipeline you cannot
+view, or one that no longer exists, says that on the page, with **Open on
+GitLab** or **Back to pipelines**, and never signs you out.
+
+On GitHub the page shows one **Jobs** column in GitHub's order, and the
+run's artifacts (name, size, expiry, or **Expired**) below it, each opening the
+run's page on GitHub, where the download is. When a run has more than 1,000
+jobs the page shows the first 1,000 and says how many there are. A re-run
+run has an **Attempt** select: each earlier attempt opens its own page
+(`?attempt=<n>`), whose header, status and jobs describe that attempt.
+
+While it is visible, a running pipeline's page updates within about 10
+seconds through the same shared poller as its project's list, without asking
+GitLab again from each window. A running GitHub run is re-read every 10
+seconds for each 100 of its jobs. Either stops once the pipeline finishes, and
+a screen reader hears the result once.
+
+### Job page and log
+
+A job page (`…/pipelines/<pipeline>/jobs/<job>`) shows one job: its status,
+name, number, stage and start time, **Open on GitLab**, and its log, with the
+job's details beside it on a wide panel or under **Details** on a narrow one.
+It opens on the job BiBCode last stored, then the host's answer. The details
+list the duration (**Elapsed** while it runs), when it finished, how long it
+queued, the runner, the pipeline source, the runner tags, the job's artifacts
+(size, expiry, and **Download** and **Browse** links to GitLab's pages), the
+commit, the pipeline and the stage's other jobs: pick a stage to see its jobs
+and choose one to open its page. Timeout is not shown; neither host's API
+returns it. Retry, Cancel and Run (for a manual job) appear where they apply.
+A GitHub job offers only Retry: GitHub re-runs one job, as the run's next
+attempt, but cancels only whole runs.
+
+Actions run at once, without a confirmation: a retry only adds work and a
+canceled pipeline can be retried. The button spins until the page shows the
+result. Retrying a GitLab job opens the new job's page; re-running a GitHub
+run from an earlier attempt, or a job from its page, opens the run's latest
+attempt; a GitHub run being canceled shows **Canceling** until GitHub stops it.
+When the host refuses, a message says why. On GitHub, where repository write
+access does not prove you can run Actions, the button then stays disabled in
+every window until you rescan, with "GitHub refused: this sign-in can't run
+Actions for this repository. A fine-grained token needs Actions write." On
+GitLab the page reads the pipeline again and shows what GitLab now allows. A
+refusal never signs you out. When the host asks BiBCode to
+slow down, or a run has already finished, the message says so.
+
+The log keeps the job's colors in the terminal's palette for the current
+theme, numbers its lines, and folds GitLab's collapsible sections (the header
+shows the section's duration; sections GitLab marks collapsed start folded).
+**Timestamps** (shown only when the runner stamps its lines) adds a time
+column, **Wrap lines** wraps long lines, **Collapse all**/**Expand all** folds
+every section, and the arrows jump to the top or the end. **Search log**
+(Mod+F while the job page is open; Escape returns to the log) finds text in
+any line, counting "3 of 17", with Enter and Shift+Enter or the arrows to step
+through matches; a match inside a folded section opens it. **Raw log** opens
+GitLab's plain log.
+
+A finished log opens at its end, where failures print. A running job's log
+follows new output about every 5 seconds while the window is visible and you
+are at the bottom; scroll up to read and **Jump to latest** returns. Opening a
+running log reads at most about 2 MB; a running log larger than that keeps
+what loaded and says GitLab shows the live end, then loads in full when the
+job finishes. **Load earlier** reads the text before what is shown (up to
+16 MB per job page). When the loaded text does not start at the beginning of
+the log, line numbers count from the first loaded line until earlier text
+loads. Click a line number to put that line in the address (`?at=`, its byte
+offset): a copied link opens on that line without reading the log before it.
+A job that has not started, has no output yet, produced no log, or had its
+log erased says so instead of showing an empty log.
+
+A GitHub job's details also list its **Steps**, each with its status and
+time, and its run's artifacts. GitHub serves a job's log only once the job
+completes: while it runs, the page shows its steps where the log will be,
+says "GitHub shows live logs on its site." with **Open on GitHub**, and
+re-reads the steps every 10 seconds while the window is visible (a queued job
+says it hasn't started yet). When the job
+finishes the log loads once; choosing a step then scrolls to where its output
+starts. A log past GitHub's retention says "This log has expired."
 
 ## Right Panel
 

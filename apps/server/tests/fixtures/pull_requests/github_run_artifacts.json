@@ -1,0 +1,21 @@
+{
+  "total_count": 2,
+  "artifacts": [
+    {
+      "id": 1,
+      "name": "coverage",
+      "size_in_bytes": 20480,
+      "expired": false,
+      "expires_at": "2027-01-22T10:00:00Z",
+      "archive_download_url": "https://api.github.com/repos/team/repo/actions/artifacts/1/zip"
+    },
+    {
+      "id": 2,
+      "name": "old-build",
+      "size_in_bytes": 1024,
+      "expired": true,
+      "expires_at": "2026-01-01T00:00:00Z",
+      "archive_download_url": "https://api.github.com/repos/team/repo/actions/artifacts/2/zip"
+    }
+  ]
+}

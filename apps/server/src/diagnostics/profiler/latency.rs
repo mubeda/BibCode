@@ -132,6 +132,13 @@ pub fn is_long_running(method: &str) -> bool {
             | "pullRequests.getContext"
             | "pullRequests.getVocabulary"
             | "pullRequests.getCreateDefaults"
+            // `pipelines.readSnapshot` (the database) and `pipelines.subscribe`
+            // (a stream) stay out, as their Pull Requests counterparts do.
+            | "pipelines.list"
+            | "pipelines.get"
+            | "pipelines.getJob"
+            | "pipelines.getJobLog"
+            | "pipelines.runAction"
             | "updater.check"
             | "updater.install"
             | "server.updateProvider"
@@ -178,6 +185,7 @@ pub fn is_background(method: &str) -> bool {
         "vcs.",
         "worktree.",
         "pullRequests.",
+        "pipelines.",
         "server.refresh",
     ]
     .iter()
@@ -928,6 +936,13 @@ mod tests {
             "pullRequests.list",
             "server.refreshProviders",
             "projects.searchEntries",
+            "pipelines.list",
+            "pipelines.get",
+            "pipelines.getJob",
+            "pipelines.getJobLog",
+            "pipelines.readSnapshot",
+            "pipelines.subscribe",
+            "pipelines.runAction",
         ] {
             assert!(is_background(method), "{method}");
         }
@@ -1160,6 +1175,19 @@ mod tests {
         assert!(!is_long_running("gitManager.previewMerge"));
         // A local, bounded read: a slow one is worth reporting.
         assert!(!is_long_running("review.readFileVersion"));
+        // Every host-bound Pipelines read and the action wait on `glab` or
+        // `gh`; the snapshot read and the stream do not.
+        for method in [
+            "pipelines.list",
+            "pipelines.get",
+            "pipelines.getJob",
+            "pipelines.getJobLog",
+            "pipelines.runAction",
+        ] {
+            assert!(is_long_running(method), "{method}");
+        }
+        assert!(!is_long_running("pipelines.readSnapshot"));
+        assert!(!is_long_running("pipelines.subscribe"));
     }
 
     #[test]

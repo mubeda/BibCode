@@ -23,7 +23,10 @@ const PROCESS_OUTPUT_READ_BUFFER_BYTES: usize = 8 * 1024;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SupervisedOverflow {
     Error,
+    /// Keeps the first `max_output_bytes`.
     Truncate,
+    /// Keeps the last `max_output_bytes`, for logs whose end matters most.
+    Tail,
 }
 
 #[derive(Debug)]
@@ -424,6 +427,8 @@ async fn collect_output(
     overflow: SupervisedOverflow,
 ) -> Result<SupervisedStreamOutput, SupervisedRunError> {
     let mut bytes = Vec::with_capacity(max_bytes.min(64 * 1024));
+    // The tail is a ring: it never holds more than `max_bytes`.
+    let mut tail = std::collections::VecDeque::new();
     let mut observed_bytes = 0usize;
     let mut buffer = vec![0u8; PROCESS_OUTPUT_READ_BUFFER_BYTES];
     loop {
@@ -435,6 +440,13 @@ async fn collect_output(
             break;
         }
         observed_bytes = observed_bytes.saturating_add(read);
+        if overflow == SupervisedOverflow::Tail {
+            let kept = &buffer[read.saturating_sub(max_bytes)..read];
+            let excess = (tail.len() + kept.len()).saturating_sub(max_bytes);
+            tail.drain(..excess);
+            tail.extend(kept);
+            continue;
+        }
         let remaining = max_bytes.saturating_sub(bytes.len());
         bytes.extend_from_slice(&buffer[..read.min(remaining)]);
         if observed_bytes > max_bytes && overflow == SupervisedOverflow::Error {
@@ -444,6 +456,9 @@ async fn collect_output(
                 observed_bytes,
             });
         }
+    }
+    if overflow == SupervisedOverflow::Tail {
+        bytes = tail.into();
     }
     Ok(SupervisedStreamOutput {
         bytes,
@@ -1622,6 +1637,30 @@ mod tests {
         assert_eq!(truncated.bytes, b"abcd");
         assert_eq!(truncated.observed_bytes, 6);
         assert!(truncated.truncated());
+    }
+
+    /// A job log keeps its end, where failures print: the tail survives reads
+    /// that cross the 8 KiB buffer, and the dropped head is counted.
+    #[tokio::test]
+    async fn output_collection_tail_keeps_the_last_bytes_across_reads() {
+        let input: Vec<u8> = (0..20_000u32).map(|i| (i % 251) as u8).collect();
+        let tail = collect_output(&input[..], "stdout", 10_000, SupervisedOverflow::Tail)
+            .await
+            .expect("tail output completes");
+        assert_eq!(tail.bytes, &input[10_000..]);
+        assert_eq!(tail.observed_bytes, 20_000);
+        assert!(tail.truncated());
+        assert_eq!(
+            tail.observed_bytes - tail.bytes.len(),
+            10_000,
+            "dropped head"
+        );
+
+        let short = collect_output(&b"abc"[..], "stdout", 10, SupervisedOverflow::Tail)
+            .await
+            .unwrap();
+        assert_eq!(short.bytes, b"abc");
+        assert!(!short.truncated());
     }
 
     #[test]

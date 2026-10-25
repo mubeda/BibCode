@@ -2571,7 +2571,7 @@ fn current_directory(config: &ServerConfig) -> String {
 
 fn environment_descriptor(config: &ServerConfig, activity_protocol_registered: bool) -> Value {
     // Built apart from the descriptor: one literal holding both exceeds `json!`'s recursion limit.
-    let capabilities = json!({
+    let mut capabilities = json!({
         "repositoryIdentity": true,
         "worktreeCatalog": true,
         "worktreeCatalogRefreshReason": true,
@@ -2605,6 +2605,11 @@ fn environment_descriptor(config: &ServerConfig, activity_protocol_registered: b
         "previewTunnels": true,
         "reviewDiffTools": true,
     });
+    // A flag is advertised only when every method it promises is registered.
+    capabilities["pipelinesReads"] =
+        json!(crate::production::pipelines_rpc::pipelines_reads_registered());
+    capabilities["pipelinesMutations"] =
+        json!(crate::production::pipelines_rpc::pipelines_mutations_registered());
     json!({
         "environmentId": config.environment_id,
         "label": config.environment_label,
@@ -6703,6 +6708,8 @@ mod tests {
             "gitPullRequestBranchSelection",
             "pullRequestsReads",
             "pullRequestsMutations",
+            "pipelinesReads",
+            "pipelinesMutations",
         ] {
             assert_eq!(
                 descriptor["capabilities"][capability], true,

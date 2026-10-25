@@ -1,0 +1,45 @@
+{
+  "id": 502,
+  "run_id": 9001,
+  "run_attempt": 2,
+  "name": "test",
+  "status": "completed",
+  "conclusion": "failure",
+  "created_at": "2026-10-24T10:01:00Z",
+  "started_at": "2026-10-24T10:01:05Z",
+  "completed_at": "2026-10-24T10:02:35Z",
+  "html_url": "https://github.com/team/repo/actions/runs/9001/job/502",
+  "labels": ["ubuntu-latest"],
+  "workflow_name": "CI",
+  "head_branch": "feature/login",
+  "runner_id": 12,
+  "runner_name": "GitHub Actions 12",
+  "runner_group_id": 1,
+  "runner_group_name": "GitHub Actions",
+  "steps": [
+    {
+      "number": 1,
+      "name": "Set up job",
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-10-24T10:01:05Z",
+      "completed_at": "2026-10-24T10:01:07Z"
+    },
+    {
+      "number": 2,
+      "name": "Run tests",
+      "status": "completed",
+      "conclusion": "failure",
+      "started_at": "2026-10-24T10:01:07Z",
+      "completed_at": "2026-10-24T10:02:33Z"
+    },
+    {
+      "number": 3,
+      "name": "Post checkout",
+      "status": "completed",
+      "conclusion": "skipped",
+      "started_at": "2026-10-24T10:02:33Z",
+      "completed_at": "2026-10-24T10:02:35Z"
+    }
+  ]
+}

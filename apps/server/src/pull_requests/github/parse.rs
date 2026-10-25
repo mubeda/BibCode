@@ -729,7 +729,28 @@ pub(super) fn commits(
     Ok(Commits { commits })
 }
 
-pub(super) fn checks(value: &Value) -> Result<Checks, PullRequestsOperationError> {
+/// The run and job ids of an Actions job page on this repository,
+/// `https://<host>/<owner>/<repo>/actions/runs/<run>/job/<job>`. The URL is
+/// parsed, never followed; any other origin, repository or shape has none.
+fn actions_job(scope: &HostScope, details_url: Option<&str>) -> (Option<u64>, Option<u64>) {
+    use crate::pull_requests::read::parse_route_id;
+    let ids = || {
+        let url = details_url?.split(['?', '#']).next()?;
+        let prefix = format!("https://{}/{}/actions/runs/", scope.host, scope.repository);
+        let rest = url
+            .get(..prefix.len())
+            .filter(|head| head.eq_ignore_ascii_case(&prefix))
+            .and_then(|_| url.get(prefix.len()..))?;
+        let (run, job) = rest.split_once("/job/")?;
+        Some((parse_route_id(run)?, parse_route_id(job)?))
+    };
+    ids().map_or((None, None), |(run, job)| (Some(run), Some(job)))
+}
+
+pub(super) fn checks(
+    value: &Value,
+    scope: &HostScope,
+) -> Result<Checks, PullRequestsOperationError> {
     use crate::{pull_requests::read, source_control::checks::aggregate_github_checks};
     let op = "pullRequests.getChecks";
     let contexts =
@@ -780,6 +801,8 @@ pub(super) fn checks(value: &Value) -> Result<Checks, PullRequestsOperationError
         let started_at = optional(meta, "startedAt");
         let completed_at = optional(meta, "completedAt");
         let duration_seconds = read::duration(started_at.as_deref(), completed_at.as_deref());
+        // A check run's `detailsUrl`; a status context's `targetUrl` names no job.
+        let (pipeline_id, job_id) = actions_job(scope, meta["detailsUrl"].as_str());
         let state = match c.state.as_str() {
             "SUCCESS" => CheckState::Success,
             "FAILURE" | "ERROR" | "TIMED_OUT" | "ACTION_REQUIRED" => CheckState::Failure,
@@ -797,6 +820,8 @@ pub(super) fn checks(value: &Value) -> Result<Checks, PullRequestsOperationError
                 started_at,
                 completed_at,
                 duration_seconds,
+                pipeline_id,
+                job_id,
             },
         )
     });
@@ -880,6 +905,77 @@ pub(super) fn action_id(value: &str) -> Result<ActionId<'_>, PullRequestsOperati
 #[cfg(test)]
 mod mapping_tests {
     use super::*;
+    use crate::pull_requests::model::PullRequestsProvider;
+    use serde_json::json;
+
+    fn scope(host: &str) -> HostScope {
+        HostScope {
+            cwd: ".".into(),
+            host: host.into(),
+            repository: "openai/codex".into(),
+            provider: PullRequestsProvider::Github,
+        }
+    }
+
+    #[test]
+    fn an_actions_job_on_this_repository_carries_its_run_and_job_ids() {
+        let run = |details: Option<&str>| {
+            let mut check = json!({"name": "build", "workflowName": "CI", "status": "COMPLETED",
+                "conclusion": "SUCCESS", "startedAt": "2026-10-24T10:00:00Z"});
+            if let Some(details) = details {
+                check["detailsUrl"] = json!(details);
+            }
+            check
+        };
+        let ids = |scope: &HostScope, details: Option<&str>| {
+            let value = json!({"statusCheckRollup": [run(details)]});
+            let check = checks(&value, scope).unwrap().groups[0].checks[0].clone();
+            (check.pipeline_id, check.job_id)
+        };
+        let github = scope("github.com");
+        for details in [
+            "https://github.com/openai/codex/actions/runs/123/job/456",
+            "https://github.com/OpenAI/Codex/actions/runs/123/job/456?pr=7",
+        ] {
+            assert_eq!(
+                ids(&github, Some(details)),
+                (Some(123), Some(456)),
+                "{details}"
+            );
+        }
+        // Another origin, scheme, repository or shape, or an id a route cannot hold.
+        for details in [
+            "https://evil.example/openai/codex/actions/runs/1/job/2",
+            "http://github.com/openai/codex/actions/runs/1/job/2",
+            "https://github.com/openai/other/actions/runs/1/job/2",
+            "https://github.com/openai/codex/actions/runs/1",
+            "https://github.com/openai/codex/actions/runs/1/job/2/extra",
+            "https://github.com/openai/codex/actions/runs/0/job/2",
+            "https://github.com/openai/codex/actions/runs/+1/job/2",
+            "https://github.com/openai/codex/actions/runs/1/job/9007199254740992",
+            "https://github.com/check/1",
+        ] {
+            assert_eq!(ids(&github, Some(details)), (None, None), "{details}");
+        }
+        assert_eq!(ids(&github, None), (None, None));
+        assert_eq!(
+            ids(
+                &scope("ghe.example"),
+                Some("https://ghe.example/openai/codex/actions/runs/5/job/6")
+            ),
+            (Some(5), Some(6)),
+            "an Enterprise host's origin is its own"
+        );
+        let status = json!({"statusCheckRollup": [{"context": "external", "state": "SUCCESS",
+            "targetUrl": "https://github.com/openai/codex/actions/runs/1/job/2"}]});
+        let check = &checks(&status, &github).unwrap().groups[0].checks[0];
+        assert_eq!(
+            (check.pipeline_id, check.job_id),
+            (None, None),
+            "a status context's target URL names no job"
+        );
+    }
+
     #[test]
     fn pull_requests_github_reviewer_states_match_contract_and_unknown_is_unreviewed() {
         for (raw, state) in [

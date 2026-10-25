@@ -51,6 +51,21 @@ import {
   PullRequestsSnapshot,
   PullRequestsSubscribeInput,
 } from "./pullRequests.ts";
+import {
+  PipelinesActionResult,
+  PipelinesChanged,
+  PipelinesDetail,
+  PipelinesGetInput,
+  PipelinesJobDetail,
+  PipelinesJobInput,
+  PipelinesJobLog,
+  PipelinesJobLogInput,
+  PipelinesListInput,
+  PipelinesListPage,
+  PipelinesRunActionInput,
+  PipelinesSnapshot,
+  PipelinesSubscribeInput,
+} from "./pipelines.ts";
 
 import { ExternalLauncherError, LaunchEditorInput } from "./editor.ts";
 import {
@@ -539,6 +554,15 @@ export const WS_METHODS = {
   pullRequestsCheckout: "pullRequests.checkout",
   pullRequestsReadSnapshot: "pullRequests.readSnapshot",
   pullRequestsSubscribe: "pullRequests.subscribe",
+
+  // Pipelines methods
+  pipelinesList: "pipelines.list",
+  pipelinesGet: "pipelines.get",
+  pipelinesGetJob: "pipelines.getJob",
+  pipelinesGetJobLog: "pipelines.getJobLog",
+  pipelinesReadSnapshot: "pipelines.readSnapshot",
+  pipelinesSubscribe: "pipelines.subscribe",
+  pipelinesRunAction: "pipelines.runAction",
 
   // Git workflow methods
   gitRunStackedAction: "git.runStackedAction",
@@ -1511,6 +1535,52 @@ export const WsPullRequestsSubscribeRpc = Rpc.make(WS_METHODS.pullRequestsSubscr
   stream: true,
 });
 
+export const WsPipelinesListRpc = Rpc.make(WS_METHODS.pipelinesList, {
+  payload: PipelinesListInput,
+  success: PipelinesListPage,
+  error: PullRequestsOperationError,
+});
+
+export const WsPipelinesGetRpc = Rpc.make(WS_METHODS.pipelinesGet, {
+  payload: PipelinesGetInput,
+  success: PipelinesDetail,
+  error: PullRequestsOperationError,
+});
+
+export const WsPipelinesGetJobRpc = Rpc.make(WS_METHODS.pipelinesGetJob, {
+  payload: PipelinesJobInput,
+  success: PipelinesJobDetail,
+  error: PullRequestsOperationError,
+});
+
+export const WsPipelinesGetJobLogRpc = Rpc.make(WS_METHODS.pipelinesGetJobLog, {
+  payload: PipelinesJobLogInput,
+  success: PipelinesJobLog,
+  error: PullRequestsOperationError,
+});
+
+/** The stored list, pipeline and job copies, read from the database with no host call. */
+export const WsPipelinesReadSnapshotRpc = Rpc.make(WS_METHODS.pipelinesReadSnapshot, {
+  payload: PipelinesSubscribeInput,
+  success: PipelinesSnapshot,
+  error: PullRequestsOperationError,
+});
+
+/** GitLab only: the cooperative poller names what changed; GitHub answers `unavailable`. */
+export const WsPipelinesSubscribeRpc = Rpc.make(WS_METHODS.pipelinesSubscribe, {
+  payload: PipelinesSubscribeInput,
+  success: PipelinesChanged,
+  error: PullRequestsOperationError,
+  stream: true,
+});
+
+/** Retry, cancel or play a pipeline or job; served when `pipelinesMutations` is advertised. */
+export const WsPipelinesRunActionRpc = Rpc.make(WS_METHODS.pipelinesRunAction, {
+  payload: PipelinesRunActionInput,
+  success: PipelinesActionResult,
+  error: PullRequestsOperationError,
+});
+
 /**
  * Ephemeral live diff preview for compact/mobile surfaces.
  * Not the persisted BiBCode Review model. Future review sessions should use
@@ -2070,6 +2140,13 @@ export const WsRpcGroup = RpcGroup.make(
   WsPullRequestsCheckoutRpc,
   WsPullRequestsReadSnapshotRpc,
   WsPullRequestsSubscribeRpc,
+  WsPipelinesListRpc,
+  WsPipelinesGetRpc,
+  WsPipelinesGetJobRpc,
+  WsPipelinesGetJobLogRpc,
+  WsPipelinesReadSnapshotRpc,
+  WsPipelinesSubscribeRpc,
+  WsPipelinesRunActionRpc,
   WsReviewGetDiffPreviewRpc,
   WsReviewReadFileVersionRpc,
   WsReviewListDiffToolsRpc,
