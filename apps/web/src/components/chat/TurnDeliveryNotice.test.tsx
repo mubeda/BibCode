@@ -18,7 +18,9 @@ function delivery(
 
 function renderNotice(
   value: TurnDelivery,
-  props: Partial<Pick<TurnDeliveryNoticeProps, "providerLabel" | "waitingBehind">> = {},
+  props: Partial<
+    Pick<TurnDeliveryNoticeProps, "providerLabel" | "waitingBehind" | "recovery">
+  > = {},
 ): string {
   return renderToStaticMarkup(
     <TurnDeliveryNotice
@@ -57,6 +59,30 @@ describe("TurnDeliveryNotice", () => {
     expect(markup).toContain("text-muted-foreground");
     expect(markup).not.toMatch(/text-destructive|text-warning|<button/u);
     expect(renderNotice(delivery("delivered", "claudeAgent", null))).toBe("");
+  });
+
+  it("says a failed message sends again once the conversation is compacted", () => {
+    const markup = renderNotice(delivery("delivered", "claudeAgent", null), {
+      recovery: "resending",
+    });
+    expect(markup).toContain("Sends again after the conversation is compacted.");
+    expect(markup).toContain("text-muted-foreground");
+    expect(markup).not.toMatch(/text-destructive|<button/u);
+  });
+
+  it("labels the copy a recovery sent once the conversation was compacted", () => {
+    const markup = renderNotice(delivery("delivered", "claudeAgent", null), {
+      recovery: "resent",
+    });
+    expect(markup).toContain("Sent again after the conversation was compacted.");
+    expect(markup).not.toMatch(/text-destructive|<button/u);
+  });
+
+  it("keeps Retry for a copy whose delivery failed", () => {
+    const markup = renderNotice(delivery("failed"), { recovery: "resent" });
+    expect(markup).toContain("Delivery failed");
+    expect(markup).toContain("Retry");
+    expect(markup).not.toContain("Sent again");
   });
 
   it.each(["pending", "sending", "failed", "uncertain", "dismissed"] as const)(

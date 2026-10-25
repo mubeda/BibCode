@@ -2640,7 +2640,6 @@ impl OpenCodeSessionRuntime {
                     .await;
                     return;
                 };
-                let message = failure.message.clone();
                 let has_assistant_message =
                     !self.inner.assistant_message_ids.lock().await.is_empty();
                 let failed_user_message = self.inner.active_user_message_id.lock().await.take();
@@ -2668,12 +2667,7 @@ impl OpenCodeSessionRuntime {
                     "turn.completed",
                     Some(failed_turn_id),
                     None,
-                    json!({
-                        "state": failure.state,
-                        "stopReason": failure.stop_reason,
-                        "errorMessage": message,
-                        "errorClass": failure.class,
-                    }),
+                    failure.completion_payload(),
                 )
                 .await;
                 self.inner.assistant_message_ids.lock().await.clear();
@@ -2905,12 +2899,7 @@ impl OpenCodeSessionRuntime {
                     };
                     let payload = match failure {
                         None => json!({ "state": "completed", "stopReason": "completed" }),
-                        Some(failure) => json!({
-                            "state": failure.state,
-                            "stopReason": failure.stop_reason,
-                            "errorMessage": failure.message,
-                            "errorClass": failure.class,
-                        }),
+                        Some(failure) => failure.completion_payload(),
                     };
                     self.emit("turn.completed", Some(completed_turn_id), None, payload)
                         .await;
@@ -5726,6 +5715,25 @@ pub(crate) struct OpenCodeFailure {
     pub(crate) stop_reason: &'static str,
     pub(crate) class: &'static str,
     pub(crate) message: String,
+    /// OpenCode's own name for the failure (`APIError`, or OpenCode 2's `provider_auth`), the
+    /// Profiler's provider reason.
+    pub(crate) reason: Option<String>,
+}
+
+impl OpenCodeFailure {
+    /// A failed turn's `turn.completed` payload.
+    pub(crate) fn completion_payload(&self) -> Value {
+        let mut payload = json!({
+            "state": self.state,
+            "stopReason": self.stop_reason,
+            "errorMessage": self.message,
+            "errorClass": self.class,
+        });
+        if let Some(reason) = &self.reason {
+            payload["providerReason"] = json!(reason);
+        }
+        payload
+    }
 }
 
 /// Classify an opencode error object, which is discriminated on `name`.
@@ -5811,6 +5819,7 @@ pub(crate) fn classify_opencode_error(error: &Value) -> OpenCodeFailure {
         stop_reason,
         class,
         message,
+        reason: name.map(str::to_owned),
     }
 }
 
@@ -5934,6 +5943,18 @@ mod error_classification_tests {
             "got {:?}",
             failure.message
         );
+    }
+
+    #[test]
+    fn a_failed_turn_names_opencodes_own_reason_for_the_profiler() {
+        let failure = classify_opencode_error(&json!({
+            "name": "APIError",
+            "data": { "message": "overloaded" }
+        }));
+        assert_eq!(failure.reason.as_deref(), Some("APIError"));
+        assert_eq!(failure.completion_payload()["providerReason"], "APIError");
+        let unnamed = classify_opencode_error(&json!("plain text"));
+        assert!(unnamed.completion_payload().get("providerReason").is_none());
     }
 
     #[test]

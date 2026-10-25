@@ -167,6 +167,8 @@ interface TimelineRowSharedState {
   blockingDelivery:
     | (Pick<TimelineMessage, "id" | "createdAt"> & { readonly offersRetry: boolean })
     | null;
+  /** The failed message a context-limit recovery sends again once the compaction succeeds. */
+  compactionFailedMessageId: MessageId | null;
   instanceLabels: ReadonlyMap<ProviderInstanceId, string>;
   onSteerQueuedMessage: (messageId: MessageId) => void;
   onSendNowQueuedMessage: (messageId: MessageId) => void;
@@ -226,6 +228,7 @@ interface MessagesTimelineProps {
   onResolveTurnDelivery: (messageId: MessageId, action: TurnDeliveryResolutionAction) => void;
   resolvingTurnDeliveryMessageId: MessageId | null;
   blockingDelivery: TimelineRowSharedState["blockingDelivery"];
+  compactionFailedMessageId?: MessageId | null;
   instanceLabels: ReadonlyMap<ProviderInstanceId, string>;
   onSteerQueuedMessage: (messageId: MessageId) => void;
   onSendNowQueuedMessage: (messageId: MessageId) => void;
@@ -283,6 +286,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   onResolveTurnDelivery,
   resolvingTurnDeliveryMessageId,
   blockingDelivery,
+  compactionFailedMessageId = null,
   instanceLabels,
   onSteerQueuedMessage,
   onSendNowQueuedMessage,
@@ -498,6 +502,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       onResolveTurnDelivery,
       resolvingTurnDeliveryMessageId,
       blockingDelivery,
+      compactionFailedMessageId,
       instanceLabels,
       onSteerQueuedMessage,
       onSendNowQueuedMessage,
@@ -523,6 +528,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       onResolveTurnDelivery,
       resolvingTurnDeliveryMessageId,
       blockingDelivery,
+      compactionFailedMessageId,
       instanceLabels,
       onSteerQueuedMessage,
       onSendNowQueuedMessage,
@@ -1307,6 +1313,13 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
             waitsBehind(row.message, ctx.blockingDelivery)
               ? ctx.blockingDelivery
               : null
+          }
+          recovery={
+            row.message.id === ctx.compactionFailedMessageId
+              ? "resending"
+              : row.message.resendOf !== undefined
+                ? "resent"
+                : null
           }
           disabled={ctx.resolvingTurnDeliveryMessageId === row.message.id}
           onRetry={() => ctx.onResolveTurnDelivery(row.message.id, "retry")}

@@ -51,6 +51,7 @@ import {
   isQueuedTimelineMessage,
   deriveQueuedCardStatus,
   shouldEnqueueOnSend,
+  composerPhaseWhileCompacting,
   getStartedThreadModelChangeBlockReason,
   hasServerAcknowledgedLocalDispatch,
   readFileAsDataUrl,
@@ -1478,29 +1479,91 @@ describe("threadErrorAttribution", () => {
   });
 
   it("offers to compact only a provider's context-limit failure", () => {
+    const claude = { providerDriver: "claudeAgent", supportsCompaction: true } as const;
     expect(
       threadErrorCompactAction({
+        ...claude,
         isBiBCodeAction: false,
         errorClass: "context_limit",
         busy: false,
       }),
-    ).toEqual({ disabledReason: null });
+    ).toEqual({ disabledReason: null, via: "command" });
     for (const errorClass of ["provider_error", "unknown", null, undefined]) {
       expect(
-        threadErrorCompactAction({ isBiBCodeAction: false, errorClass, busy: false }),
+        threadErrorCompactAction({ ...claude, isBiBCodeAction: false, errorClass, busy: false }),
       ).toBeNull();
     }
     // A failed BiBCode command shown over a context-limit session is not the provider's failure.
     expect(
-      threadErrorCompactAction({ isBiBCodeAction: true, errorClass: "context_limit", busy: false }),
+      threadErrorCompactAction({
+        ...claude,
+        isBiBCodeAction: true,
+        errorClass: "context_limit",
+        busy: false,
+      }),
     ).toBeNull();
   });
 
   it("is disabled with its reason while the thread is working, such as compacting", () => {
     expect(
-      threadErrorCompactAction({ isBiBCodeAction: false, errorClass: "context_limit", busy: true }),
-    ).toEqual({ disabledReason: "Wait for the current work to finish, then compact." });
+      threadErrorCompactAction({
+        isBiBCodeAction: false,
+        errorClass: "context_limit",
+        busy: true,
+        providerDriver: "claudeAgent",
+        supportsCompaction: true,
+      }),
+    ).toEqual({
+      disabledReason: "Wait for the current work to finish, then compact.",
+      via: "command",
+    });
     expect(COMPACT_CONVERSATION_COMMAND).toBe("/compact");
+  });
+
+  it("asks the server to compact a provider that supports it, and hides it otherwise", () => {
+    const base = { isBiBCodeAction: false, errorClass: "context_limit", busy: false } as const;
+    for (const providerDriver of ["claudeAgent", "codex"]) {
+      expect(
+        threadErrorCompactAction({ ...base, providerDriver, supportsCompaction: true }),
+      ).toEqual({ disabledReason: null, via: "command" });
+    }
+    // An older server, which does not advertise the capability, keeps `/compact` for Claude,
+    // the only provider that understood it there.
+    expect(threadErrorCompactAction({ ...base, providerDriver: "claudeAgent" })).toEqual({
+      disabledReason: null,
+      via: "message",
+    });
+    // A provider the server cannot compact is not offered an action that would do nothing.
+    expect(
+      threadErrorCompactAction({ ...base, providerDriver: "opencode", supportsCompaction: false }),
+    ).toBeNull();
+    expect(threadErrorCompactAction({ ...base, providerDriver: "opencode" })).toBeNull();
+    expect(threadErrorCompactAction({ ...base, providerDriver: null })).toBeNull();
+  });
+
+  it("is disabled while a compaction is unsettled and absent while a recovery runs", () => {
+    const base = {
+      isBiBCodeAction: false,
+      errorClass: "context_limit",
+      busy: false,
+      providerDriver: "claudeAgent",
+      supportsCompaction: true,
+    } as const;
+    for (const trigger of ["manual", "guard"] as const) {
+      expect(
+        threadErrorCompactAction({ ...base, compaction: { trigger, state: "running" } }),
+      ).toEqual({ disabledReason: "Compacting the conversation…", via: "command" });
+    }
+    expect(
+      threadErrorCompactAction({
+        ...base,
+        compaction: {
+          trigger: "contextRecovery",
+          state: "requested",
+          failedMessageId: MessageId.make("failed"),
+        },
+      }),
+    ).toBeNull();
   });
 
   it("says nothing rather than guessing when the class is absent or unknown", () => {
@@ -1720,6 +1783,14 @@ describe("queued messages", () => {
     ).toMatchObject({ canSendNow: false, sendNowDisabledReason: reason });
   });
 
+  it.each(["disconnected", "connecting", "ready", "running"] as const)(
+    "runs the composer as during a turn while a compaction is unsettled (phase %s)",
+    (phase) => {
+      expect(composerPhaseWhileCompacting(phase, true)).toBe("running");
+      expect(composerPhaseWhileCompacting(phase, false)).toBe(phase);
+    },
+  );
+
   it.each(["disconnected", "connecting", "ready"] as const)(
     "enqueues behind an unsettled initial delivery while phase is %s",
     (phase) => {
@@ -1739,6 +1810,17 @@ describe("queued messages", () => {
     ["disconnected", null, false],
   ] as const)("enqueues for phase %s / session %s", (phase, sessionStatus, expected) => {
     expect(shouldEnqueueOnSend({ phase, sessionStatus, hasPendingDelivery: false })).toBe(expected);
+  });
+
+  it("enqueues while a conversation compaction is unsettled", () => {
+    expect(
+      shouldEnqueueOnSend({
+        phase: "ready",
+        sessionStatus: "error",
+        hasPendingDelivery: false,
+        compacting: true,
+      }),
+    ).toBe(true);
   });
 });
 
