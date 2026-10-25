@@ -86,11 +86,15 @@ function refused<W, A, E>(label: string): AtomCommand<W, A, E> {
       AsyncResult.failure(Cause.die(new Error(`Component fixture forbids ${label}.`))),
   };
 }
-export const reviewEnvironment: Pick<typeof ReviewPorts.reviewEnvironment, "diffPreview"> = {
+export const reviewEnvironment: Pick<
+  typeof ReviewPorts.reviewEnvironment,
+  "diffPreview" | "openDiffTool"
+> = {
   diffPreview: Atom.family(
     (_target: Parameters<typeof ReviewPorts.reviewEnvironment.diffPreview>[0]) =>
       Atom.make(selectedDiffResult),
   ),
+  openDiffTool: refused("opening a diff app"),
 };
 export const sourceControlEnvironment: Pick<
   typeof SourceControlPorts.sourceControlEnvironment,
