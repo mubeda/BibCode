@@ -637,7 +637,10 @@ block over about two seconds, a tool call and an answer long enough to overflow
 (`[[reasoning:slow]]` thinks for about ten seconds). The spec checks the
 anchored turn's end while it streams, the fold and its **+N previous steps** row,
 expanding a finished thought away from the end and a streaming thought at the
-end, and the end while a thought streams into a thread reopened at its end. Each
+end, and the end while a thought streams into a thread reopened at its end. It
+presses each Thinking header as a pointer does, with a `pointerdown` before the
+click, and after a long prompt the expanded slow thought grows the anchored
+turn past the visible timeline while the spec checks that its end stays in view. Each
 turn's thought has its own row id and each answer names its prompt, so the spec
 tells the turns apart. Check the fixture frames, then run the
 spec alone with `BIBCODE_E2E_SPEC=./specs/chat-reasoning-rows.e2e.ts`:

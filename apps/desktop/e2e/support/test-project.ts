@@ -19,6 +19,12 @@ const REASONING_TURN_STEPS = Array.from(
   { length: 16 },
   (_, step) => `Fixture thinking step ${step + 1} weighs the parser. `,
 );
+/**
+ * The slow thought's steps run on, so its expanded trace fills its scroller while it streams
+ * and grows an anchored turn past the visible timeline.
+ */
+const SLOW_REASONING_STEP_TAIL =
+  "It traces how each rule reads its tokens, where a failed match backs off, and which branch takes over next. ";
 const REASONING_ANSWER_LINES = 24;
 /** An answer line names its prompt without the marker, so each turn's answer is its own. */
 const reasoningAnswerLine = (variant: string, line: number, label: string) =>
@@ -560,6 +566,7 @@ if (process.argv.includes("auth") && process.argv.includes("status")) {
 const send = (message) => process.stdout.write(JSON.stringify(message) + "\n");
 const streamResponse = ${JSON.stringify(STREAMED_RESPONSE)};
 const reasoningSteps = ${JSON.stringify(REASONING_TURN_STEPS)};
+const slowReasoningStepTail = ${JSON.stringify(SLOW_REASONING_STEP_TAIL)};
 const reader = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -595,7 +602,10 @@ async function streamReasoningTurn(sessionId, slow, prompt) {
     event("reasoning-delta-" + step, {
       type: "content_block_delta",
       index: 0,
-      delta: { type: "thinking_delta", thinking }
+      delta: {
+        type: "thinking_delta",
+        thinking: slow ? thinking + slowReasoningStepTail : thinking
+      }
     });
   }
   event("reasoning-signature", {
