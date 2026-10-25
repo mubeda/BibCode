@@ -127,6 +127,7 @@ export function deriveFindEntries(input: FindEntriesInput): FindEntry[] {
               text: message.text,
               lineBreaks: false,
               skills: input.skills,
+              streaming: message.streaming,
             },
           ],
           reveal: null,
@@ -258,6 +259,7 @@ function sourceContextKey(source: FindSource, context: FindProjectionContext): s
         "markdown",
         source.scope,
         source.lineBreaks ? "1" : "0",
+        source.streaming === true ? "1" : "0",
         context.cwd ?? "",
         skillsKey(source.skills),
       ].join("\u0000");

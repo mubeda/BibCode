@@ -51,6 +51,8 @@ export type FindSource =
       readonly text: string;
       readonly lineBreaks: boolean;
       readonly skills: ReadonlyArray<InlineSkill>;
+      /** A streaming reply, whose closing diagram fence counts only once a line ending follows. */
+      readonly streaming?: boolean;
     }
   | { readonly kind: "plain"; readonly scope: string; readonly text: string };
 
@@ -230,6 +232,7 @@ interface ProjectionWalk {
   readonly scope: string;
   readonly skills: ReadonlyArray<InlineSkill>;
   readonly fileLinks: MarkdownFileLinks;
+  readonly streaming: boolean;
   readonly segments: FindSegment[];
   buffer: string;
   bufferDetails: ReadonlyArray<number>;
@@ -337,7 +340,7 @@ function walkLink(walk: ProjectionWalk, element: Element, context: WalkContext):
 
 /**
  * Whether the renderer draws this `<pre>` as a Mermaid diagram: a fenced `mermaid` block closed
- * by its own fence, decided as `ChatMarkdown` decides it for settled text.
+ * by its own fence, decided as `ChatMarkdown` decides it.
  */
 function isMermaidDiagramFence(walk: ProjectionWalk, element: Element): boolean {
   const code = element.children.find(
@@ -348,7 +351,7 @@ function isMermaidDiagramFence(walk: ProjectionWalk, element: Element): boolean 
     return false;
   }
   const source = code.children.map((child) => (child.type === "text" ? child.value : "")).join("");
-  return isClosedMermaidFence(walk.text, element.position, fenceBody(source), false);
+  return isClosedMermaidFence(walk.text, element.position, fenceBody(source), walk.streaming);
 }
 
 function walkElement(walk: ProjectionWalk, element: Element, context: WalkContext): void {
@@ -400,6 +403,7 @@ function projectMarkdown(
     scope: source.scope,
     skills: source.skills,
     fileLinks: buildMarkdownFileLinks(source.text, context.cwd),
+    streaming: source.streaming === true,
     segments: [],
     buffer: "",
     bufferDetails: [],

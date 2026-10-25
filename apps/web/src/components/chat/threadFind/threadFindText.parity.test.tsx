@@ -205,7 +205,11 @@ afterEach(async () => {
   }
 });
 
-async function mount(text: string, lineBreaks: boolean): Promise<HTMLDivElement> {
+async function mount(
+  text: string,
+  lineBreaks: boolean,
+  isStreaming = false,
+): Promise<HTMLDivElement> {
   const container = document.createElement("div");
   document.body.append(container);
   const root = createRoot(container);
@@ -217,6 +221,7 @@ async function mount(text: string, lineBreaks: boolean): Promise<HTMLDivElement>
         cwd={CWD}
         skills={SKILLS}
         lineBreaks={lineBreaks}
+        isStreaming={isStreaming}
         detailsOpen={ALL_DETAILS_OPEN}
         onDetailsOpenChange={() => {}}
         findScope="md:0"
@@ -238,10 +243,15 @@ function queriesFor(container: HTMLElement): string[] {
   return [...words];
 }
 
-function parityMismatches(container: HTMLElement, text: string, lineBreaks: boolean): string[] {
+function parityMismatches(
+  container: HTMLElement,
+  text: string,
+  lineBreaks: boolean,
+  streaming = false,
+): string[] {
   const scope = container.querySelector("[data-find-scope]")!;
   const segments = projectFindSource(
-    { kind: "markdown", scope: "md:0", text, lineBreaks, skills: SKILLS },
+    { kind: "markdown", scope: "md:0", text, lineBreaks, skills: SKILLS, streaming },
     { cwd: CWD },
   );
   const mismatches: string[] = [];
@@ -271,6 +281,12 @@ describe("find projection parity with ChatMarkdown", () => {
       });
     }
   }
+
+  it("counts a streaming diagram's source while its closing fence ends the text", async () => {
+    const text = ["Intro.", "", "```mermaid", "graph TD", "  Alpha --> Beta", "```"].join("\n");
+    const container = await mount(text, false, true);
+    expect(parityMismatches(container, text, false, true)).toEqual([]);
+  });
 
   it("counts highlighted code blocks the same as plain ones", async () => {
     const text = ["```ts", "const answer = 42;", "export { answer };", "```"].join("\n");
