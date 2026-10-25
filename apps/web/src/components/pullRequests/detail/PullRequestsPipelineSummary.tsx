@@ -1,6 +1,7 @@
-import type { PullRequestsPipeline, PullRequestsPipelineStatus } from "@bibcode/contracts";
-import { memo, useState } from "react";
+import type { PullRequestsPipeline } from "@bibcode/contracts";
+import { memo } from "react";
 import { PipelineStatusIcon } from "../../pipelines/shared/PipelineStatusIcon";
+import { useFinishedAnnouncement } from "../../pipelines/shared/useFinishedAnnouncement";
 import { Badge } from "../../ui/badge";
 import { PullRequestsExternalLink } from "../shared/PullRequestsMarkdown";
 import {
@@ -12,46 +13,6 @@ import {
 } from "./pullRequestsDetail.logic";
 
 type PresentPipeline = Extract<PullRequestsPipeline, { _tag: "present" }>;
-
-interface Shown {
-  readonly id: number;
-  readonly status: PullRequestsPipelineStatus;
-  readonly settled: boolean;
-}
-
-/**
- * Announces a pipeline that finished while it was on screen, once. The first
- * copy shown, and a stored copy shown before this mount's own live read
- * answered, never announce. Tracked during render, as the detail view tracks
- * its painted copies, so no effect re-renders for it.
- */
-function useFinishedAnnouncement(pipeline: PresentPipeline | null, settled: boolean): string {
-  const [announcement, setAnnouncement] = useState("");
-  const [shown, setShown] = useState<Shown | null>(null);
-  const current: Shown | null = pipeline
-    ? { id: pipeline.id, status: pipeline.status, settled }
-    : null;
-  if (
-    shown?.id !== current?.id ||
-    shown?.status !== current?.status ||
-    shown?.settled !== current?.settled
-  ) {
-    if (
-      shown !== null &&
-      current !== null &&
-      pipeline !== null &&
-      shown.settled &&
-      shown.id === current.id &&
-      !isTerminalPipelineStatus(shown.status) &&
-      isTerminalPipelineStatus(current.status)
-    )
-      setAnnouncement(
-        pipelineFinishedAnnouncement(pipeline.id, pipeline.status, pipeline.warnings),
-      );
-    setShown(current);
-  }
-  return announcement;
-}
 
 const PipelineHeader = memo(function PipelineHeader({
   pipeline,
@@ -132,7 +93,17 @@ export const PullRequestsPipelineSummary = memo(function PullRequestsPipelineSum
   settled: boolean;
 }) {
   const present = pipeline._tag === "present" ? pipeline : null;
-  const announcement = useFinishedAnnouncement(present, settled);
+  const announcement = useFinishedAnnouncement(
+    present
+      ? {
+          id: present.id,
+          status: present.status,
+          terminal: isTerminalPipelineStatus(present.status),
+          message: pipelineFinishedAnnouncement(present.id, present.status, present.warnings),
+        }
+      : null,
+    settled,
+  );
   return (
     <>
       {present ? (

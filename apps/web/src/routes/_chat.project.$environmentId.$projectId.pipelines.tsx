@@ -1,6 +1,6 @@
 import { scopeProjectRef } from "@bibcode/client-runtime/environment";
 import type { EnvironmentId, ProjectId } from "@bibcode/contracts";
-import { createFileRoute, Outlet, useMatch, useNavigate } from "@tanstack/react-router";
+import { createFileRoute, Outlet, useChildMatches, useNavigate } from "@tanstack/react-router";
 import { useEffect, useMemo } from "react";
 
 import { PipelinesPanel } from "../components/pipelines/PipelinesPanel";
@@ -13,11 +13,8 @@ import { ChatRouteInset } from "./-ChatRouteInset";
 const MISSING_PROJECT_REDIRECT_DELAY_MS = 1_000;
 
 function PipelinesListRouteView() {
-  // A child route (a job) renders in place of the list.
-  const childMatch = useMatch({
-    from: "/_chat/project/$environmentId/$projectId/pipelines/$pipelineId/jobs/$jobId",
-    shouldThrow: false,
-  });
+  // A pipeline (or a page below it) renders in the list's place.
+  const childMatches = useChildMatches();
   const navigate = useNavigate();
   const params = Route.useParams();
   const search = Route.useSearch();
@@ -39,7 +36,7 @@ function PipelinesListRouteView() {
     return () => window.clearTimeout(timeoutId);
   }, [navigate, projectExists, shellStatus]);
 
-  if (childMatch) return <Outlet />;
+  if (childMatches.length > 0) return <Outlet />;
   if (!projectExists) return null;
   return (
     <ChatRouteInset>

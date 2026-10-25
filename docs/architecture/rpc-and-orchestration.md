@@ -1464,6 +1464,24 @@ the server's `retryAfterSeconds` as a countdown, disables Refresh and Retry
 until it ends, then reads once as a timer read. A row hovered 150 ms prefetches
 its `get`, at most two per environment and not again within 5 s.
 
+A pipeline route reads `get` with the exact input the hover prefetched
+(`attempt: null` for the latest attempt, `refresh: "user"`), so an open within
+5 s of that prefetch shows its answer without a second read. Its
+`readSnapshot` and `subscribe` input is the list key remembered for the
+project (the list's filters, first page) plus `pipelineId` and `attempt`, so
+a pipeline page and its list share one poller. The page shows the copy with
+the highest `revision` across the live `get` and the stored detail, keeping
+it per pipeline (`keepNewestCopy`), so a slower unary answer never replaces a
+newer poller row. A `pipeline` name re-reads `readSnapshot` only, never `get`.
+GitHub, and GitLab while its stream is not live, re-read `get` on the visible
+timer while the shown pipeline is not `terminal`: every 10 s on GitLab, and
+every 10 s per 100 jobs (at most ten pages) on GitHub, doubled after 30
+minutes without a status change. The read that sees the pipeline turn
+`terminal` is the last. A `forbidden` or `not_found` answer stays on the page
+("You can't view this pipeline." with the host link, "This pipeline no longer
+exists." with Back to pipelines) and never reaches the shared sign-in state;
+only `not_authenticated` asks the shell to read the context again.
+
 A job page reads `getJob` and its pipeline's `get` once on open, paints the
 stored `pipelines_job` and `pipelines_detail` rows from one `readSnapshot`,
 and on GitLab subscribes with the project's remembered list key plus

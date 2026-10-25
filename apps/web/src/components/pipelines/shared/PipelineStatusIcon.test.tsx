@@ -25,6 +25,11 @@ describe("PipelineStatusIcon", () => {
     expect(render("success", true)).not.toContain("lucide-circle-check");
   });
 
+  it("draws a failure that was allowed to fail as a warning, not a failure", () => {
+    expect(render("failed", true)).toContain("lucide-triangle-alert");
+    expect(render("failed", true)).not.toContain("lucide-circle-x");
+  });
+
   it("is decorative: the caller names the status", () => {
     expect(render("failed")).toContain('aria-hidden="true"');
   });

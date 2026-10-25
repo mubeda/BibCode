@@ -1103,9 +1103,9 @@ host's current page. Each row shows the status with its duration and age
 (hover for the exact time), the title, the pipeline number, the branch, tag or
 merge request, the short commit, badges such as **latest** or **merge
 request**, who started it, and one icon per stage (each named, for example
-"test: failed"). The title opens the pipeline on GitLab. **All**, **Running**
-and **Finished** filter by
-state, and the branch field filters by ref: pick one of the checkout's
+"test: failed"). Choose anywhere on a row to open the pipeline in BiBCode; the
+row's menu has **Open on GitLab**. **All**, **Running** and **Finished**
+filter by state, and the branch field filters by ref: pick one of the checkout's
 branches or tags, or type any name and press Enter. Filters live in the URL,
 so Back and a copied link keep them, and the last ones are remembered for the
 project. **Load more** appears when the host has another page.
@@ -1118,6 +1118,29 @@ shows, counts down to the host's retry time with Refresh disabled, and then
 reads again. Retry and Cancel appear on rows they apply to; until the server
 offers pipeline actions they stay disabled and say why, and a row your
 account cannot retry says that instead.
+
+A pipeline's page (`/pipelines/<id>`) also opens on the last stored copy,
+then the host's. Its header shows the status (for example **Failed**,
+**Passed with warnings** or **Waiting for approval**), the title, "Pipeline
+#4821 created 2h ago by Ana Rossi · finished 1h ago", the commit (its short
+id opens it on the host), the branch or tag (a merge request opens its page in
+BiBCode), the job count, the duration and the queued time, with Retry, Cancel
+and **Open on GitLab**. Below it the stages sit side by side in GitLab's order
+on a wide panel, scrolling sideways, and stacked on a narrow one. Each stage
+shows its status, name and job count; each job its status, name and
+duration. A parallel group such as `rspec 3` is one row that expands to its
+jobs, a trigger job links to its **Downstream pipeline**, and a job that
+failed but was allowed to fail shows a warning instead of a failure. Choosing
+a job opens it on GitLab. When GitLab returns only the first 100 jobs of a
+stage, the page says so and links to the full pipeline; an account that
+cannot see the jobs keeps the header and is told so. A pipeline you cannot
+view, or one that no longer exists, says that on the page, with **Open on
+GitLab** or **Back to pipelines**, and never signs you out.
+
+While it is visible, a running pipeline's page updates within about 10
+seconds through the same shared poller as its project's list, without asking
+GitLab again from each window. It stops once the pipeline finishes, and a
+screen reader hears the result once.
 
 ### Job page and log
 
