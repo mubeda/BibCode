@@ -2713,8 +2713,9 @@ See [RPC and orchestration](./rpc-and-orchestration.md) and
   key remembered for the project plus its `pipelineId`, so it shares that
   list's poller. Its stage columns (`PipelineStageColumns`) are one tree whose
   layout a container query flips, and job links come from
-  `PipelineLinksProvider`, which opens the host's job page until the job route
-  exists.
+  `PipelineLinksProvider`: the pipeline page's `pipelinePageLinks` open each
+  job's in-app job route, and a view without a provider opens the host's job
+  page.
   The job page
   (`/project/$environmentId/$projectId/pipelines/$pipelineId/jobs/$jobId`,
   `?at=` a line's byte offset; `pipelineJobLink` builds its links) paints the

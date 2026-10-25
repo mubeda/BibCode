@@ -15,6 +15,7 @@ import {
 } from "../repositoryModule/RepositoryModule";
 import { RepositoryModuleExternalLink } from "../repositoryModule/RepositoryModuleExternalLink";
 import { PermissionButton } from "../ui/permission-button";
+import { PipelineLinksProvider, pipelinePageLinks } from "./detail/PipelineLinks";
 import { PipelinesDetailView, type PipelinesDetailViewHandle } from "./detail/PipelinesDetailView";
 import { PipelinesListView, type PipelinesListViewHandle } from "./list/PipelinesListView";
 import {
@@ -42,7 +43,18 @@ function AvailablePipelines({
   onFiltersChange: (filters: PipelinesFilters) => void;
   pipeline: PipelineRoute | null;
 }) {
-  const { context } = useRepositoryModule();
+  const {
+    context,
+    meta: { projectRef },
+  } = useRepositoryModule();
+  const { environmentId, projectId } = projectRef;
+  const pipelineId = pipeline?.pipelineId ?? null;
+  // Job rows open the job page; kept stable so the memoized stages skip a re-render.
+  const links = useMemo(
+    () =>
+      pipelineId === null ? null : pipelinePageLinks({ environmentId, projectId, pipelineId }),
+    [environmentId, pipelineId, projectId],
+  );
   const viewRef = useRef<PipelinesListViewHandle | PipelinesDetailViewHandle>(null);
   const [backedOff, setBackedOff] = useState(false);
   const pipelinesUrl = `${context.webUrl.replace(/\/+$/, "")}/${
@@ -76,7 +88,7 @@ function AvailablePipelines({
           </RepositoryModuleExternalLink>
         ) : null}
       </RepositoryModule.Header>
-      {pipeline === null ? (
+      {pipeline === null || links === null ? (
         <PipelinesListView
           ref={viewRef}
           filters={filters}
@@ -84,13 +96,15 @@ function AvailablePipelines({
           onBackoffChange={setBackedOff}
         />
       ) : (
-        <PipelinesDetailView
-          key={`${pipeline.pipelineId}:${pipeline.attempt ?? "latest"}`}
-          ref={viewRef}
-          pipelineId={pipeline.pipelineId}
-          attempt={pipeline.attempt}
-          onBackoffChange={setBackedOff}
-        />
+        <PipelineLinksProvider value={links}>
+          <PipelinesDetailView
+            key={`${pipeline.pipelineId}:${pipeline.attempt ?? "latest"}`}
+            ref={viewRef}
+            pipelineId={pipeline.pipelineId}
+            attempt={pipeline.attempt}
+            onBackoffChange={setBackedOff}
+          />
+        </PipelineLinksProvider>
       )}
     </section>
   );

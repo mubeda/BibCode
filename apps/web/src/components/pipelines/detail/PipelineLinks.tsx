@@ -1,5 +1,6 @@
 import type { ToOptions } from "@tanstack/react-router";
 import { createContext, use } from "react";
+import { pipelineJobLink } from "../job/pipelineJobRoute";
 
 /**
  * Where the stage views link a job. The stage components never ask where they are
@@ -11,8 +12,17 @@ export interface PipelineLinks {
   readonly jobLink: (jobId: number) => ToOptions | null;
 }
 
-/** Until the job page ships, every job opens on the host. */
+/** Outside a pipeline page, a job opens on the host. */
 const HOST_JOB_LINKS: PipelineLinks = { jobLink: () => null };
+
+/** The pipeline page's links: each job opens its job page in BiBCode. */
+export function pipelinePageLinks(target: {
+  readonly environmentId: string;
+  readonly projectId: string;
+  readonly pipelineId: number;
+}): PipelineLinks {
+  return { jobLink: (jobId) => pipelineJobLink({ ...target, jobId }) };
+}
 
 const PipelineLinksContext = createContext<PipelineLinks>(HOST_JOB_LINKS);
 

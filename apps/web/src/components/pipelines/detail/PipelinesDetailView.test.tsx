@@ -314,7 +314,7 @@ describe("PipelinesDetailView header", () => {
 });
 
 describe("PipelinesDetailView stages", () => {
-  it("shows GitLab's stages in order, each job opening on the host until the job page ships", async () => {
+  it("shows GitLab's stages in order, each job opening on the host without a job page link", async () => {
     await render();
     const stages = [...container.querySelectorAll('[aria-label="Stages"] > li')];
     expect(stages.map((stage) => stage.querySelector("h3")?.textContent)).toEqual([

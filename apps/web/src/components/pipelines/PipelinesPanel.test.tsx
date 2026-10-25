@@ -26,6 +26,7 @@ const h = vi.hoisted(() => ({
   navigate: vi.fn(),
   listProps: null as Record<string, unknown> | null,
   detailProps: null as Record<string, unknown> | null,
+  jobLink: null as unknown,
   freshPageKey: null as string | null,
 }));
 vi.mock("../../state/entities", () => ({
@@ -75,12 +76,16 @@ vi.mock("./list/PipelinesListView", async () => {
   };
 });
 
-vi.mock("./detail/PipelinesDetailView", () => ({
-  PipelinesDetailView: (props: Record<string, unknown>) => {
-    h.detailProps = props;
-    return <div>Pipeline detail</div>;
-  },
-}));
+vi.mock("./detail/PipelinesDetailView", async () => {
+  const { usePipelineLinks } = await import("./detail/PipelineLinks");
+  return {
+    PipelinesDetailView: (props: Record<string, unknown>) => {
+      h.detailProps = props;
+      h.jobLink = usePipelineLinks().jobLink(998);
+      return <div>Pipeline detail</div>;
+    },
+  };
+});
 
 import { PipelinesPanel } from "./PipelinesPanel";
 
@@ -120,6 +125,7 @@ beforeEach(() => {
   h.navigate.mockClear();
   h.listProps = null;
   h.detailProps = null;
+  h.jobLink = null;
   h.freshPageKey = null;
 });
 afterEach(async () => {
@@ -232,5 +238,16 @@ describe("PipelinesPanel", () => {
     expect(container.textContent).not.toContain("Open on GitLab");
     // A pipeline route leaves the remembered list filters alone.
     expect(usePipelinesStore.getState().selectViewState(ref).filters.scope).toBe("running");
+  });
+
+  it("opens the pipeline's jobs on their job pages in BiBCode", async () => {
+    await act(async () =>
+      root.render(<PipelinesPanel projectRef={ref} pipelineId={4821} attempt={null} />),
+    );
+    expect(h.jobLink).toEqual({
+      to: "/project/$environmentId/$projectId/pipelines/$pipelineId/jobs/$jobId",
+      params: { environmentId: "env", projectId: "project", pipelineId: "4821", jobId: "998" },
+      search: {},
+    });
   });
 });
