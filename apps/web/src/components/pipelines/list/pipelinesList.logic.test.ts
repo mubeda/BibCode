@@ -83,10 +83,23 @@ describe("listTimerEnabled", () => {
 });
 
 describe("mergePipelineRows", () => {
-  it("keeps one row per pipeline, the first page's copy first", () => {
+  it("keeps one row per pipeline in first-seen order, the newer page's copy winning", () => {
     const fresh = { ...pipelineRow, status: "success" as const };
     const later = { ...pipelineRow, id: 4800, label: "#4800" };
-    expect(mergePipelineRows([fresh], [pipelineRow, later])).toEqual([fresh, later]);
+    // A poller refresh of the first page is newer than the later page it overlaps.
+    expect(
+      mergePipelineRows([
+        { revision: 12, rows: [fresh] },
+        { revision: 10, rows: [pipelineRow, later] },
+      ]),
+    ).toEqual([fresh, later]);
+    // New runs pushed a pipeline onto page two after page one loaded: page two's copy is newer.
+    expect(
+      mergePipelineRows([
+        { revision: 10, rows: [pipelineRow, later] },
+        { revision: 12, rows: [fresh] },
+      ]),
+    ).toEqual([fresh, later]);
   });
 });
 

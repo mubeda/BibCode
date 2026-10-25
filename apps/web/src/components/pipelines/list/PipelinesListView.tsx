@@ -45,6 +45,7 @@ import {
   listSnapshotInput,
   listTimerEnabled,
   mergePipelineRows,
+  type PipelinesLoadedPage,
 } from "./pipelinesList.logic";
 
 export interface PipelinesListViewHandle {
@@ -58,6 +59,7 @@ const SCOPES: readonly { readonly value: PipelinesListScope; readonly label: str
   { value: "finished", label: "Finished" },
 ];
 const EMPTY_ROWS: readonly PipelinesRow[] = [];
+const EMPTY_PAGES: readonly PipelinesLoadedPage[] = [];
 const getRowSize = () => PIPELINES_ROW_HEIGHT;
 const rowKey = (row: PipelinesRow) => String(row.id);
 
@@ -98,7 +100,7 @@ function PipelinesPages({
     meta: { mutationsDisabledReason },
   } = useRepositoryModule();
   const [cursors, setCursors] = useState<readonly (string | null)[]>([null]);
-  const [laterRows, setLaterRows] = useState<readonly PipelinesRow[]>(EMPTY_ROWS);
+  const [laterPages, setLaterPages] = useState<readonly PipelinesLoadedPage[]>(EMPTY_PAGES);
   const cursor = cursors.at(-1) ?? null;
   const nextAtom = useMemo(
     () =>
@@ -114,11 +116,12 @@ function PipelinesPages({
   const query = cursor === null ? firstQuery : nextQuery;
   const rows = useMemo(
     () =>
-      mergePipelineRows(
-        firstQuery.data?.rows ?? EMPTY_ROWS,
-        cursor === null ? EMPTY_ROWS : [...laterRows, ...(nextQuery.data?.rows ?? EMPTY_ROWS)],
-      ),
-    [cursor, firstQuery.data, laterRows, nextQuery.data],
+      mergePipelineRows([
+        ...(firstQuery.data ? [firstQuery.data] : EMPTY_PAGES),
+        ...(cursor === null ? EMPTY_PAGES : laterPages),
+        ...(cursor !== null && nextQuery.data ? [nextQuery.data] : EMPTY_PAGES),
+      ]),
+    [cursor, firstQuery.data, laterPages, nextQuery.data],
   );
   const savedScrollTop = usePipelinesStore((state) => state.selectViewState(projectRef).scrollTop);
   const scrollTopRef = useRef(savedScrollTop);
@@ -130,7 +133,7 @@ function PipelinesPages({
   const refreshFirstPage = firstQuery.refresh;
   const refresh = useCallback(() => {
     setCursors([null]);
-    setLaterRows(EMPTY_ROWS);
+    setLaterPages(EMPTY_PAGES);
     scrollTopRef.current = 0;
     scrollRef.current?.scrollToOffset({ offset: 0, animated: false });
     refreshFirstPage();
@@ -154,8 +157,8 @@ function PipelinesPages({
   const loadMore = () => {
     if (query.isPending || nextCursor === null || cursors.includes(nextCursor)) return;
     if (cursor !== null && nextQuery.data) {
-      const pageRows = nextQuery.data.rows;
-      setLaterRows((previous) => [...previous, ...pageRows]);
+      const page = nextQuery.data;
+      setLaterPages((previous) => [...previous, page]);
     }
     setCursors((previous) => [...previous, nextCursor]);
   };
