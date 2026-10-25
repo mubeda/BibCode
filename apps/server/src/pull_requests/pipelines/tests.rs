@@ -1222,6 +1222,44 @@ esac"#,
     }
 
     #[tokio::test]
+    async fn a_final_read_that_beats_the_job_refresh_still_reads_the_finished_log() {
+        let b = bench("pipelines-final-read-race").await;
+        b.open().await;
+        b.prs
+            .pipelines
+            .logs
+            .set_range_support(HOST, RangeSupport::Unsupported);
+        lock(&b.fake.jobs).insert(
+            998,
+            Answer::Ok(job_detail(998, PipelineStatus::Running, None)),
+        );
+        let mut running = vec![b'a'; log::LIVE_REDOWNLOAD_MAX];
+        running.push(b'\n');
+        lock(&b.fake.trace).log = running.clone();
+        b.service
+            .job_log(b.log_input(LogFrom::Tail, Refresh::User), &c())
+            .await
+            .unwrap();
+        // The job finishes; the page's final read arrives before its job read.
+        let mut finished = running;
+        finished.extend_from_slice(b"Job succeeded\n");
+        let size = finished.len() as u64;
+        lock(&b.fake.trace).log = finished;
+        lock(&b.fake.jobs).insert(
+            998,
+            Answer::Ok(job_detail(998, PipelineStatus::Success, Some(size))),
+        );
+        let last = chunk(
+            b.service
+                .job_log(b.log_input(LogFrom::Tail, Refresh::User), &c())
+                .await
+                .unwrap(),
+        );
+        assert!(last.complete);
+        assert!(last.text.ends_with("Job succeeded\n"));
+    }
+
+    #[tokio::test]
     async fn a_memory_answer_older_than_30s_reads_the_job_first_and_a_403_refuses_the_text() {
         let b = bench("pipelines-authorized").await;
         b.open().await;
