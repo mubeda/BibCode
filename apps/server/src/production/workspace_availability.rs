@@ -78,6 +78,34 @@ impl WorkspaceAdmissionController {
             .map(|admission| (admission, inherited_root_of))
             .map_err(WorkspaceAdmissionError::from)
     }
+
+    /// Admits work on `thread_id`'s persisted workspace and returns that workspace: the
+    /// thread's own worktree, or its project's root. `None` when the thread or its project is
+    /// unknown, or the controller has no repositories to resolve it from.
+    pub(crate) async fn acquire_thread_workspace(
+        &self,
+        thread_id: &str,
+    ) -> Result<(WorkspaceAdmissionLease, Option<PathBuf>), WorkspaceAdmissionError> {
+        let path = match &self.repositories {
+            Some(repositories) => persisted_workspace_path(repositories, thread_id).await?,
+            None => None,
+        };
+        self.registry
+            .acquire_admission(thread_id, path.iter().map(PathBuf::as_path))
+            .await
+            .map(|admission| (admission, path))
+            .map_err(WorkspaceAdmissionError::from)
+    }
+}
+
+/// `thread_id`'s persisted workspace path: its own worktree, or its project's root.
+pub(crate) async fn persisted_workspace_path(
+    repositories: &Repositories,
+    thread_id: &str,
+) -> Result<Option<PathBuf>, WorkspaceAdmissionError> {
+    resolve_persisted_workspace(repositories, thread_id)
+        .await
+        .map(|workspace| workspace.map(|workspace| workspace.path))
 }
 
 /// A thread's persisted workspace: its own worktree, or the root of its project.

@@ -2105,6 +2105,7 @@ impl OpenCodeHelperLauncher for SystemOpenCodeHelperLauncher {
                     label: "OpenCode server helper".to_owned(),
                     source: RegistrationSource::Helper,
                     driver: None,
+                    survives_shutdown: false,
                 },
             ) {
                 Ok(registration) => registration,

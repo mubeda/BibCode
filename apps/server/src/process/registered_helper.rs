@@ -90,6 +90,7 @@ pub(crate) async fn spawn_registered_helper(
             label: label.to_owned(),
             source: RegistrationSource::Helper,
             driver: None,
+            survives_shutdown: false,
         },
     ) {
         Ok(registration) => registration,

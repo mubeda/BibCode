@@ -160,6 +160,13 @@ import {
   ReviewDiffPreviewError,
   ReviewDiffPreviewInput,
   ReviewDiffPreviewResult,
+  ReviewDiffToolError,
+  ReviewListDiffToolsInput,
+  ReviewListDiffToolsResult,
+  ReviewOpenDiffToolInput,
+  ReviewOpenDiffToolResult,
+  ReviewReadFileVersionInput,
+  ReviewReadFileVersionResult,
 } from "./review.ts";
 import { KeybindingsConfigError } from "./keybindings.ts";
 import {
@@ -540,6 +547,9 @@ export const WS_METHODS = {
 
   // Review methods
   reviewGetDiffPreview: "review.getDiffPreview",
+  reviewReadFileVersion: "review.readFileVersion",
+  reviewListDiffTools: "review.listDiffTools",
+  reviewOpenDiffTool: "review.openDiffTool",
 
   // Activity methods
   activityGetSnapshot: "activity.getSnapshot",
@@ -1517,6 +1527,32 @@ export const WsReviewGetDiffPreviewRpc = Rpc.make(WS_METHODS.reviewGetDiffPrevie
   ]),
 });
 
+/** One side of a changed file, for the Diff panel's Compare view. */
+export const WsReviewReadFileVersionRpc = Rpc.make(WS_METHODS.reviewReadFileVersion, {
+  payload: ReviewReadFileVersionInput,
+  success: ReviewReadFileVersionResult,
+  error: Schema.Union([WorkspaceUnavailableError, WorkspaceIdentityError, EnvironmentRpcError]),
+});
+
+/** The diff apps Git finds where the server runs, for the Diff panel's **Open with**. */
+export const WsReviewListDiffToolsRpc = Rpc.make(WS_METHODS.reviewListDiffTools, {
+  payload: ReviewListDiffToolsInput,
+  success: ReviewListDiffToolsResult,
+  error: Schema.Union([WorkspaceUnavailableError, WorkspaceIdentityError, EnvironmentRpcError]),
+});
+
+/** Opens a file, or every file, in a diff app on the server's computer through `git difftool`. */
+export const WsReviewOpenDiffToolRpc = Rpc.make(WS_METHODS.reviewOpenDiffTool, {
+  payload: ReviewOpenDiffToolInput,
+  success: ReviewOpenDiffToolResult,
+  error: Schema.Union([
+    ReviewDiffToolError,
+    WorkspaceUnavailableError,
+    WorkspaceIdentityError,
+    EnvironmentRpcError,
+  ]),
+});
+
 export const WsTerminalOpenRpc = Rpc.make(WS_METHODS.terminalOpen, {
   payload: TerminalOpenInput,
   success: TerminalSessionSnapshot,
@@ -1772,7 +1808,11 @@ export const WsOrchestrationDispatchCommandRpc = Rpc.make(
 export const WsOrchestrationGetTurnDiffRpc = Rpc.make(ORCHESTRATION_WS_METHODS.getTurnDiff, {
   payload: OrchestrationGetTurnDiffInput,
   success: OrchestrationRpcSchemas.getTurnDiff.output,
-  error: Schema.Union([OrchestrationGetTurnDiffError, EnvironmentRpcError]),
+  error: Schema.Union([
+    OrchestrationGetTurnDiffError,
+    WorkspaceUnavailableError,
+    EnvironmentRpcError,
+  ]),
 });
 
 export const WsOrchestrationGetFullThreadDiffRpc = Rpc.make(
@@ -1780,7 +1820,11 @@ export const WsOrchestrationGetFullThreadDiffRpc = Rpc.make(
   {
     payload: OrchestrationGetFullThreadDiffInput,
     success: OrchestrationRpcSchemas.getFullThreadDiff.output,
-    error: Schema.Union([OrchestrationGetFullThreadDiffError, EnvironmentRpcError]),
+    error: Schema.Union([
+      OrchestrationGetFullThreadDiffError,
+      WorkspaceUnavailableError,
+      EnvironmentRpcError,
+    ]),
   },
 );
 
@@ -2027,6 +2071,9 @@ export const WsRpcGroup = RpcGroup.make(
   WsPullRequestsReadSnapshotRpc,
   WsPullRequestsSubscribeRpc,
   WsReviewGetDiffPreviewRpc,
+  WsReviewReadFileVersionRpc,
+  WsReviewListDiffToolsRpc,
+  WsReviewOpenDiffToolRpc,
   WsTerminalOpenRpc,
   WsTerminalAttachRpc,
   WsTerminalWriteRpc,

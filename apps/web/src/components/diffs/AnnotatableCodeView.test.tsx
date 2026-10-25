@@ -294,6 +294,35 @@ describe("AnnotatableCodeView", () => {
     });
   });
 
+  it("places and builds comments against the comment file when one is given", () => {
+    const commentFileDiff = { name: "src/app.ts", hunks: [] } as unknown as FileDiffMetadata;
+    harness.reviewComments.push({
+      id: "comment-1",
+      sectionId: "turn-1",
+      filePath: "src/app.ts",
+      fenceLanguage: "diff",
+      rangeLabel: "+3",
+      text: "note",
+    });
+    harness.restoreDiffReviewCommentRange.mockReturnValue({ start: 3, end: 3, side: "additions" });
+    const props = renderView({ files: [{ ...files[0]!, commentFileDiff }] });
+    expect(harness.restoreDiffReviewCommentRange).toHaveBeenCalledWith(
+      commentFileDiff,
+      expect.objectContaining({ id: "comment-1" }),
+    );
+
+    const beginComment = (props.options as Record<string, unknown>).onLineSelectionEnd as (
+      range: SelectedLineRange | null,
+      context: { item: Record<string, unknown> },
+    ) => void;
+    beginComment({ start: 4, end: 4, side: "additions" } as SelectedLineRange, {
+      item: { type: "diff", id: "file-1" },
+    });
+    expect(harness.buildDiffReviewComment).toHaveBeenCalledWith(
+      expect.objectContaining({ fileDiff: commentFileDiff }),
+    );
+  });
+
   it("appends a draft, disables selection, and submits it", () => {
     const range = {
       start: 7,
@@ -346,6 +375,59 @@ describe("AnnotatableCodeView", () => {
     );
     expect(harness.setters[0]).toHaveBeenCalledWith(null);
     expect(harness.setters[1]).toHaveBeenCalledWith(null);
+  });
+
+  it("keeps an unsent comment and its text in a draft store when one is given", () => {
+    const range = { start: 4, end: 4, side: "additions" } as SelectedLineRange;
+    const draftStore = {
+      draft: null as null | {
+        id: string;
+        filePath: string;
+        range: SelectedLineRange;
+        rangeLabel: string;
+      },
+      onDraftChange: vi.fn(),
+      readDraftText: vi.fn(() => "half-written"),
+      onDraftTextChange: vi.fn(),
+    };
+    const props = renderView({ draftStore });
+    const beginComment = (props.options as Record<string, unknown>).onLineSelectionEnd as (
+      range: SelectedLineRange | null,
+      context: { item: Record<string, unknown> },
+    ) => void;
+    beginComment(range, { item: { type: "diff", id: "file-1" } });
+    expect(draftStore.onDraftChange).toHaveBeenCalledWith({
+      id: "draft-1",
+      filePath: "src/app.ts",
+      range,
+      rangeLabel: "L4",
+    });
+    expect(harness.setters[1], "the view does not own a stored draft").not.toHaveBeenCalled();
+
+    // Another view of the same file, under another key, shows the stored draft and its text.
+    draftStore.draft = { id: "draft-1", filePath: "src/app.ts", range, rangeLabel: "L4" };
+    const remounted = renderView({
+      draftStore,
+      files: [{ ...files[0]!, fileKey: "compare:src/app.ts" }],
+    });
+    const item = (remounted.items as Array<Record<string, unknown>>)[0]!;
+    const [annotation] = item.annotations as Array<Record<string, unknown>>;
+    expect(annotation).toMatchObject({ side: "additions", lineNumber: 4 });
+    renderToStaticMarkup(
+      (remounted.renderAnnotation as (value: Record<string, unknown>) => React.ReactNode)(
+        annotation!,
+      ),
+    );
+    const field = harness.localComments.at(-1)!;
+    expect(field.initialText).toBe("half-written");
+    (field.onTextChange as (text: string) => void)("half-written, done");
+    expect(draftStore.onDraftTextChange).toHaveBeenCalledWith("draft-1", "half-written, done");
+    (field.onComment as (text: string) => void)("half-written, done");
+    expect(harness.addReviewComment).toHaveBeenCalledWith(
+      threadRef,
+      expect.objectContaining({ id: "draft-1", filePath: "src/app.ts" }),
+    );
+    expect(draftStore.onDraftChange).toHaveBeenLastCalledWith(null);
   });
 
   it("clears a cancelled draft without touching persisted comments", () => {

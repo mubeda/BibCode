@@ -34,7 +34,9 @@ use crate::{
     },
     server_settings::ProviderSettingsStore,
     transfer::staging::{UploadOwner, UploadRegistry},
-    worktree_catalog::WorkspaceAvailabilityRegistry,
+    worktree_catalog::{
+        WorkspaceAdmissionCancellation, WorkspaceAdmissionLease, WorkspaceAvailabilityRegistry,
+    },
 };
 
 use super::orchestration_effects::install_project_command_effects;
@@ -126,6 +128,7 @@ fn register_orchestration_rpc_inner(
     install_project_command_effects(&engine);
     let availability = availability
         .map(|availability| WorkspaceAdmissionController::new(availability, engine.repositories()));
+    let query_availability = availability.clone();
     let dispatch = engine.clone();
     registry.register_unary_with_context(
         "orchestration.dispatchCommand",
@@ -239,9 +242,11 @@ fn register_orchestration_rpc_inner(
         "orchestration.getFullThreadDiff",
     ] {
         let engine = engine.clone();
-        registry.register_unary(method, move |request, _| {
+        let availability = query_availability.clone();
+        registry.register_unary(method, move |request, cancellation| {
             let engine = engine.clone();
-            async move { handle_query(&engine, request).await }
+            let availability = availability.clone();
+            async move { handle_query(&engine, availability.as_ref(), request, cancellation).await }
         });
     }
 
@@ -875,22 +880,47 @@ async fn prepare_attachments(
     Ok((command, None))
 }
 
-async fn handle_query(engine: &OrchestrationEngine, request: RpcRequest) -> RpcResult {
+async fn handle_query(
+    engine: &OrchestrationEngine,
+    availability: Option<&WorkspaceAdmissionController>,
+    request: RpcRequest,
+    cancellation: CancellationToken,
+) -> RpcResult {
     match request.tag.as_str() {
         "orchestration.getArchivedShellSnapshot" => shell_snapshot(engine, true).await,
         "orchestration.getTurnDiff" => {
             let input = decode::<TurnDiffInput>(request)?;
             diff(
                 engine,
-                input.thread_id,
-                input.from_turn_count,
-                input.to_turn_count,
+                availability,
+                TurnDiffRequest {
+                    thread_id: input.thread_id,
+                    from_turn_count: input.from_turn_count,
+                    to_turn_count: input.to_turn_count,
+                    ignore_whitespace: input.ignore_whitespace.unwrap_or(false),
+                    context_lines: input.context_lines,
+                    error_tag: "OrchestrationGetTurnDiffError",
+                },
+                &cancellation,
             )
             .await
         }
         "orchestration.getFullThreadDiff" => {
             let input = decode::<FullDiffInput>(request)?;
-            diff(engine, input.thread_id, 0, input.to_turn_count).await
+            diff(
+                engine,
+                availability,
+                TurnDiffRequest {
+                    thread_id: input.thread_id,
+                    from_turn_count: 0,
+                    to_turn_count: input.to_turn_count,
+                    ignore_whitespace: input.ignore_whitespace.unwrap_or(false),
+                    context_lines: input.context_lines,
+                    error_tag: "OrchestrationGetFullThreadDiffError",
+                },
+                &cancellation,
+            )
+            .await
         }
         _ => Err(invalid_request(
             &request.tag,
@@ -899,34 +929,203 @@ async fn handle_query(engine: &OrchestrationEngine, request: RpcRequest) -> RpcR
     }
 }
 
-async fn diff(
-    engine: &OrchestrationEngine,
+/// A turn or full-thread patch request, decoded.
+struct TurnDiffRequest {
     thread_id: String,
     from_turn_count: i64,
     to_turn_count: i64,
+    ignore_whitespace: bool,
+    context_lines: Option<u8>,
+    /// The method's own error type.
+    error_tag: &'static str,
+}
+
+/// The patch between two checkpoints, computed live from their refs under the thread's
+/// workspace admission. A stored `checkpoint_diff_blobs` row for the exact range serves only
+/// when a ref is gone; nothing at this version writes those rows.
+async fn diff(
+    engine: &OrchestrationEngine,
+    availability: Option<&WorkspaceAdmissionController>,
+    request: TurnDiffRequest,
+    cancellation: &CancellationToken,
 ) -> RpcResult {
-    if from_turn_count < 0 || to_turn_count < from_turn_count {
+    if request.from_turn_count < 0 || request.to_turn_count < request.from_turn_count {
         return Err(invalid_request(
             "orchestration.diff",
             "turn counts must be non-negative and ordered",
         ));
     }
+    crate::review::validate_review_diff_options(None, request.context_lines)
+        .map_err(|error| invalid_request("orchestration.diff", error.to_string()))?;
+    let tag = request.error_tag;
+    // Held until Git exits, so a removal waits for the read or cancels it.
+    let (admission, workspace) = match availability {
+        Some(availability) => availability
+            .acquire_thread_workspace(&request.thread_id)
+            .await
+            .map(|(admission, workspace)| (Some(admission), workspace))
+            .map_err(|error| turn_diff_admission_error(tag, error))?,
+        None => (
+            None,
+            super::workspace_availability::persisted_workspace_path(
+                &engine.repositories(),
+                &request.thread_id,
+            )
+            .await
+            .map_err(|error| turn_diff_admission_error(tag, error))?,
+        ),
+    };
+    let live = match workspace {
+        Some(workspace) => {
+            let cwd = super::orchestration_effects::process_compatible_path(workspace);
+            let live = live_turn_diff(&cwd, &request, cancellation);
+            match admission
+                .as_ref()
+                .map(WorkspaceAdmissionLease::loss_cancellation)
+            {
+                Some(loss) => tokio::select! {
+                    result = live => result?,
+                    () = loss.cancelled() => {
+                        return Err(turn_diff_workspace_lost(tag, &loss));
+                    }
+                },
+                None => live.await?,
+            }
+        }
+        None => LiveTurnDiff::MissingCheckpoint(request.from_turn_count),
+    };
+    let missing_turn_count = match live {
+        LiveTurnDiff::Patch(patch) => {
+            return Ok(turn_diff_result(
+                &request,
+                &patch.diff,
+                patch.truncated,
+                request.context_lines,
+            ));
+        }
+        LiveTurnDiff::MissingCheckpoint(turn_count) => turn_count,
+    };
     let blobs = engine
         .repositories()
-        .list_checkpoint_diff_blobs_by_thread(thread_id.clone())
+        .list_checkpoint_diff_blobs_by_thread(request.thread_id.clone())
         .await
-        .map_err(|error| orchestration_error("OrchestrationGetTurnDiffError", error))?;
-    let diff = blobs
-        .into_iter()
-        .find(|blob| blob.from_turn_count == from_turn_count && blob.to_turn_count == to_turn_count)
-        .map(|blob| blob.diff)
-        .unwrap_or_default();
-    Ok(json!({
-        "threadId": thread_id,
-        "fromTurnCount": from_turn_count,
-        "toTurnCount": to_turn_count,
+        .map_err(|error| orchestration_error(tag, error))?;
+    match blobs.into_iter().find(|blob| {
+        blob.from_turn_count == request.from_turn_count
+            && blob.to_turn_count == request.to_turn_count
+    }) {
+        // A legacy row: short object IDs, and it ignores the whitespace and context options.
+        Some(blob) => Ok(turn_diff_result(&request, &blob.diff, false, None)),
+        None => Err(orchestration_error(
+            tag,
+            format!("The checkpoint for turn {missing_turn_count} is no longer in the repository."),
+        )),
+    }
+}
+
+/// What the checkpoint refs gave.
+enum LiveTurnDiff {
+    Patch(super::runtime::BoundedReviewDiff),
+    /// The turn count whose checkpoint ref is gone.
+    MissingCheckpoint(i64),
+}
+
+async fn live_turn_diff(
+    cwd: &std::path::Path,
+    request: &TurnDiffRequest,
+    cancellation: &CancellationToken,
+) -> Result<LiveTurnDiff, Value> {
+    use super::orchestration_effects::{checkpoint_ref, ref_exists};
+    use super::runtime::{ReviewDiffOptions, review_diff_args, run_review_diff};
+
+    let tag = request.error_tag;
+    let from_ref = checkpoint_ref(&request.thread_id, request.from_turn_count);
+    let to_ref = checkpoint_ref(&request.thread_id, request.to_turn_count);
+    for (reference, turn_count) in [
+        (&from_ref, request.from_turn_count),
+        (&to_ref, request.to_turn_count),
+    ] {
+        match ref_exists(cwd, reference, cancellation).await {
+            Ok(true) => {}
+            // A workspace Git cannot read has no checkpoints to compare.
+            Ok(false) | Err(_) if !cancellation.is_cancelled() => {
+                return Ok(LiveTurnDiff::MissingCheckpoint(turn_count));
+            }
+            Ok(false) | Err(_) => {
+                return Err(orchestration_error(tag, "The request was cancelled."));
+            }
+        }
+    }
+    let from = format!("{from_ref}^{{commit}}");
+    let to = format!("{to_ref}^{{commit}}");
+    let args = review_diff_args(
+        ReviewDiffOptions {
+            ignore_whitespace: request.ignore_whitespace,
+            context_lines: request.context_lines,
+        },
+        &[&from, &to],
+        true,
+    );
+    let cwd = cwd.to_string_lossy();
+    let patch = tokio::select! {
+        patch = run_review_diff(&cwd, args) => {
+            patch.map_err(|error| orchestration_error(tag, error))?
+        }
+        () = cancellation.cancelled() => {
+            return Err(orchestration_error(tag, "The request was cancelled."));
+        }
+    };
+    if !patch.succeeded && !patch.truncated {
+        return Err(orchestration_error(
+            tag,
+            match patch.exit_code {
+                Some(code) => format!("Git couldn't compare these checkpoints (exit {code})."),
+                None => "Git couldn't compare these checkpoints (it was stopped).".to_owned(),
+            },
+        ));
+    }
+    Ok(LiveTurnDiff::Patch(patch))
+}
+
+fn turn_diff_result(
+    request: &TurnDiffRequest,
+    diff: &str,
+    truncated: bool,
+    context_lines: Option<u8>,
+) -> Value {
+    let mut result = json!({
+        "threadId": request.thread_id,
+        "fromTurnCount": request.from_turn_count,
+        "toTurnCount": request.to_turn_count,
         "diff": diff,
-    }))
+        "truncated": truncated,
+    });
+    if let Some(lines) = context_lines {
+        result["contextLines"] = json!(lines);
+    }
+    result
+}
+
+/// A turn read refused before Git starts. A workspace that is being removed, or is gone,
+/// keeps its own error type; anything else is the method's.
+fn turn_diff_admission_error(tag: &str, error: WorkspaceAdmissionError) -> Value {
+    match error {
+        WorkspaceAdmissionError::Unavailable(error) => {
+            serde_json::to_value(error).expect("workspace unavailable error serializes")
+        }
+        WorkspaceAdmissionError::Identity(error) => orchestration_error(tag, error.message),
+        WorkspaceAdmissionError::Resolution(error) => orchestration_error(tag, error),
+    }
+}
+
+/// The workspace was fenced while Git ran; dropping its future stopped Git.
+fn turn_diff_workspace_lost(tag: &str, loss: &WorkspaceAdmissionCancellation) -> Value {
+    loss.unavailable().map_or_else(
+        || orchestration_error(tag, "The workspace became unavailable."),
+        |unavailable| {
+            serde_json::to_value(unavailable).expect("workspace unavailable error serializes")
+        },
+    )
 }
 
 fn shell_stream(
@@ -2061,6 +2260,11 @@ struct TurnDiffInput {
     thread_id: String,
     from_turn_count: i64,
     to_turn_count: i64,
+    #[serde(default)]
+    ignore_whitespace: Option<bool>,
+    /// `-U<N>` for the patch, from 0 to 99; omitted, Git's own default applies.
+    #[serde(default)]
+    context_lines: Option<u8>,
 }
 
 #[derive(Deserialize)]
@@ -2068,6 +2272,10 @@ struct TurnDiffInput {
 struct FullDiffInput {
     thread_id: String,
     to_turn_count: i64,
+    #[serde(default)]
+    ignore_whitespace: Option<bool>,
+    #[serde(default)]
+    context_lines: Option<u8>,
 }
 
 #[cfg(test)]
@@ -6561,34 +6769,41 @@ mod tests {
                 .contains("server.getConfig")
         );
 
+        let query = |request| handle_query(&engine, None, request, CancellationToken::new());
         assert!(
-            handle_query(&engine, request("orchestration.unknown", json!({})))
+            query(request("orchestration.unknown", json!({})))
                 .await
                 .is_err()
         );
         assert!(
-            handle_query(
-                &engine,
-                request("orchestration.getTurnDiff", json!({"threadId":"t1"})),
-            )
+            query(request(
+                "orchestration.getTurnDiff",
+                json!({"threadId":"t1"})
+            ))
             .await
             .is_err()
         );
         assert!(
-            diff(&engine, "t1".to_owned(), 2, 1).await.is_err(),
+            query(request(
+                "orchestration.getTurnDiff",
+                json!({"threadId":"t1","fromTurnCount":2,"toTurnCount":1}),
+            ))
+            .await
+            .is_err(),
             "reversed turn bounds must fail"
         );
         assert_eq!(
-            handle_query(
-                &engine,
-                request(
-                    "orchestration.getFullThreadDiff",
-                    json!({"threadId":"t1","toTurnCount":0}),
-                ),
-            )
+            query(request(
+                "orchestration.getFullThreadDiff",
+                json!({"threadId":"t1","toTurnCount":0}),
+            ))
             .await
-            .unwrap()["diff"],
-            json!("")
+            .unwrap_err(),
+            json!({
+                "_tag": "OrchestrationGetFullThreadDiffError",
+                "message": "The checkpoint for turn 0 is no longer in the repository.",
+            }),
+            "an unknown thread has no checkpoints, which is not an empty patch"
         );
 
         let cancellation = CancellationToken::new();
@@ -7560,6 +7775,436 @@ mod tests {
         );
         service.shutdown().await;
         provider.shutdown().await.unwrap();
+        engine.shutdown().await;
+    }
+}
+
+/// Turn and full-thread patches computed live from checkpoint refs (#140).
+#[cfg(test)]
+mod turn_diff_tests {
+    use std::path::Path;
+    #[cfg(unix)]
+    use std::time::Duration;
+
+    use super::*;
+    use crate::{
+        orchestration::engine::EngineOptions,
+        persistence::{CheckpointDiffBlob, Database, run_migrations},
+        production::orchestration_effects::capture_checkpoint,
+        rpc::RequestId,
+    };
+
+    const CREATED_AT: &str = "2026-10-24T00:00:00.000Z";
+
+    async fn engine() -> OrchestrationEngine {
+        let database = Database::open_in_memory().await.expect("database");
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("migrations");
+        OrchestrationEngine::start(database, EngineOptions::default())
+            .await
+            .expect("engine starts")
+    }
+
+    fn git(cwd: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .expect("git starts");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    /// A repository with a committed twenty-line file, and a project whose default thread
+    /// works in it.
+    async fn project_thread(engine: &OrchestrationEngine) -> (tempfile::TempDir, String) {
+        let directory = tempfile::tempdir().expect("repository");
+        let root = std::fs::canonicalize(directory.path()).expect("canonical repository");
+        git(&root, &["init", "--quiet"]);
+        git(&root, &["config", "user.email", "test@bibcode.local"]);
+        git(&root, &["config", "user.name", "BiBCode Test"]);
+        std::fs::write(root.join("lines.txt"), twenty_lines()).expect("lines");
+        std::fs::write(root.join("space.txt"), "a b\n").expect("spaced file");
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "--quiet", "-m", "base"]);
+        let command = serde_json::from_value::<OrchestrationCommand>(json!({
+            "type": "project.create",
+            "commandId": "project",
+            "projectId": "project",
+            "title": "Project",
+            "workspaceRoot": root.to_string_lossy(),
+            "defaultModelSelection": null,
+            "createdAt": CREATED_AT,
+        }))
+        .expect("project command");
+        engine.dispatch(command).await.expect("project created");
+        let thread_id = crate::orchestration::load_snapshot(&engine.repositories())
+            .await
+            .expect("snapshot")
+            .threads
+            .into_iter()
+            .find(|thread| thread.kind == "default")
+            .expect("default thread")
+            .thread_id;
+        (directory, thread_id)
+    }
+
+    fn twenty_lines() -> String {
+        (1..=20).map(|line| format!("line {line}\n")).collect()
+    }
+
+    /// Checkpoint 0 is the committed state; checkpoint 1 changes line 10 and only the spacing
+    /// of `space.txt`.
+    async fn two_checkpoints(root: &Path, thread_id: &str) {
+        capture_checkpoint(root, thread_id, 0)
+            .await
+            .expect("checkpoint 0");
+        std::fs::write(
+            root.join("lines.txt"),
+            twenty_lines().replace("line 10\n", "line ten\n"),
+        )
+        .expect("changed line");
+        std::fs::write(root.join("space.txt"), "a   b\n").expect("spacing change");
+        capture_checkpoint(root, thread_id, 1)
+            .await
+            .expect("checkpoint 1");
+    }
+
+    fn request(tag: &str, payload: Value) -> RpcRequest {
+        RpcRequest {
+            id: RequestId::try_from("1").unwrap(),
+            tag: tag.to_owned(),
+            payload,
+            headers: Vec::new(),
+            trace_id: None,
+            span_id: None,
+            sampled: None,
+        }
+    }
+
+    async fn turn_diff(
+        engine: &OrchestrationEngine,
+        availability: Option<&WorkspaceAdmissionController>,
+        payload: Value,
+    ) -> RpcResult {
+        handle_query(
+            engine,
+            availability,
+            request("orchestration.getTurnDiff", payload),
+            CancellationToken::new(),
+        )
+        .await
+    }
+
+    fn root_of(directory: &tempfile::TempDir) -> std::path::PathBuf {
+        std::fs::canonicalize(directory.path()).expect("canonical repository")
+    }
+
+    #[tokio::test]
+    async fn turn_patches_are_live_with_full_ids_whitespace_and_context() {
+        let engine = engine().await;
+        let (directory, thread_id) = project_thread(&engine).await;
+        let root = root_of(&directory);
+        two_checkpoints(&root, &thread_id).await;
+
+        let patch = turn_diff(
+            &engine,
+            None,
+            json!({"threadId": thread_id, "fromTurnCount": 0, "toTurnCount": 1}),
+        )
+        .await
+        .expect("turn patch");
+        let diff = patch["diff"].as_str().expect("diff text");
+        assert!(diff.contains("+line ten"), "{diff}");
+        assert!(diff.contains("space.txt"), "{diff}");
+        let index_line = diff
+            .lines()
+            .find(|line| line.starts_with("index "))
+            .expect("index line");
+        let ids = index_line["index ".len()..].split(' ').next().unwrap();
+        let (from, to) = ids.split_once("..").expect("two ids");
+        assert!(from.len() >= 40 && to.len() >= 40, "{index_line}");
+        assert_eq!(patch["truncated"], json!(false));
+        assert!(patch.get("contextLines").is_none());
+
+        let full = handle_query(
+            &engine,
+            None,
+            request(
+                "orchestration.getFullThreadDiff",
+                json!({"threadId": thread_id, "toTurnCount": 1}),
+            ),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("full-thread patch");
+        assert_eq!(full, patch);
+
+        let ignoring = turn_diff(
+            &engine,
+            None,
+            json!({
+                "threadId": thread_id, "fromTurnCount": 0, "toTurnCount": 1,
+                "ignoreWhitespace": true,
+            }),
+        )
+        .await
+        .expect("whitespace-insensitive patch");
+        assert!(!ignoring["diff"].as_str().unwrap().contains("space.txt"));
+
+        let narrow = turn_diff(
+            &engine,
+            None,
+            json!({
+                "threadId": thread_id, "fromTurnCount": 0, "toTurnCount": 1,
+                "contextLines": 0,
+            }),
+        )
+        .await
+        .expect("zero-context patch");
+        assert!(narrow["diff"].as_str().unwrap().contains("@@ -10 +10 @@"));
+        assert_eq!(narrow["contextLines"], json!(0));
+        let wide = turn_diff(
+            &engine,
+            None,
+            json!({
+                "threadId": thread_id, "fromTurnCount": 0, "toTurnCount": 1,
+                "contextLines": 7,
+            }),
+        )
+        .await
+        .expect("wide patch");
+        assert!(wide["diff"].as_str().unwrap().contains("@@ -3,15 +3,15 @@"));
+        assert_eq!(wide["contextLines"], json!(7));
+
+        for lines in [json!(100), json!(-1)] {
+            assert_eq!(
+                turn_diff(
+                    &engine,
+                    None,
+                    json!({
+                        "threadId": thread_id, "fromTurnCount": 0, "toTurnCount": 1,
+                        "contextLines": lines,
+                    }),
+                )
+                .await
+                .unwrap_err()["_tag"],
+                json!("InvalidRequest"),
+                "{lines} context lines"
+            );
+        }
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn turn_patches_report_truncation_at_the_cap() {
+        let engine = engine().await;
+        let (directory, thread_id) = project_thread(&engine).await;
+        let root = root_of(&directory);
+        two_checkpoints(&root, &thread_id).await;
+        let line = "x".repeat(99);
+        let large = (0..(super::super::runtime::MAX_REVIEW_SOURCE_DIFF_BYTES / 100 + 1))
+            .map(|_| format!("{line}\n"))
+            .collect::<String>();
+        std::fs::write(root.join("large.txt"), large).expect("large file");
+        capture_checkpoint(&root, &thread_id, 2)
+            .await
+            .expect("checkpoint 2");
+
+        let patch = turn_diff(
+            &engine,
+            None,
+            json!({"threadId": thread_id, "fromTurnCount": 1, "toTurnCount": 2}),
+        )
+        .await
+        .expect("capped patch");
+        assert_eq!(patch["truncated"], json!(true));
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn missing_checkpoints_serve_a_stored_row_or_say_the_checkpoint_is_gone() {
+        let engine = engine().await;
+        let (directory, thread_id) = project_thread(&engine).await;
+        two_checkpoints(&root_of(&directory), &thread_id).await;
+        engine
+            .repositories()
+            .upsert_checkpoint_diff_blob(CheckpointDiffBlob {
+                thread_id: thread_id.clone(),
+                from_turn_count: 3,
+                to_turn_count: 4,
+                diff: "--- a/old\n+++ b/old\n@@ -1 +1 @@\n-old\n+stored\n".to_owned(),
+                created_at: CREATED_AT.to_owned(),
+            })
+            .await
+            .expect("stored row");
+
+        let stored = turn_diff(
+            &engine,
+            None,
+            json!({
+                "threadId": thread_id, "fromTurnCount": 3, "toTurnCount": 4,
+                "contextLines": 7,
+            }),
+        )
+        .await
+        .expect("stored patch");
+        assert!(stored["diff"].as_str().unwrap().contains("+stored"));
+        assert_eq!(stored["truncated"], json!(false));
+        assert!(
+            stored.get("contextLines").is_none(),
+            "a stored row ignores the context count"
+        );
+
+        assert_eq!(
+            turn_diff(
+                &engine,
+                None,
+                json!({"threadId": thread_id, "fromTurnCount": 1, "toTurnCount": 5}),
+            )
+            .await
+            .unwrap_err(),
+            json!({
+                "_tag": "OrchestrationGetTurnDiffError",
+                "message": "The checkpoint for turn 5 is no longer in the repository.",
+            })
+        );
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_git_failure_is_an_error_not_an_empty_patch() {
+        let engine = engine().await;
+        let (directory, thread_id) = project_thread(&engine).await;
+        let root = root_of(&directory);
+        two_checkpoints(&root, &thread_id).await;
+        let blob = git(&root, &["rev-parse", "HEAD:lines.txt"]);
+        let reference = super::super::orchestration_effects::checkpoint_ref(&thread_id, 2);
+        git(&root, &["update-ref", &reference, &blob]);
+
+        assert_eq!(
+            turn_diff(
+                &engine,
+                None,
+                json!({"threadId": thread_id, "fromTurnCount": 1, "toTurnCount": 2}),
+            )
+            .await
+            .unwrap_err(),
+            json!({
+                "_tag": "OrchestrationGetTurnDiffError",
+                "message": "Git couldn't compare these checkpoints (exit 128).",
+            })
+        );
+        engine.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    fn process_is_gone(pid: i32) -> bool {
+        // SAFETY: signal 0 only checks that the process exists.
+        unsafe { libc::kill(pid, 0) != 0 }
+    }
+
+    /// Git reads its text conversion before it prints a file, so a converter that records
+    /// Git's pid and then sleeps holds Git mid-read.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn removal_cancels_a_paused_turn_read_and_refuses_the_next() {
+        let engine = engine().await;
+        let (directory, thread_id) = project_thread(&engine).await;
+        let root = root_of(&directory);
+        two_checkpoints(&root, &thread_id).await;
+        let pids = tempfile::tempdir().expect("pid directory");
+        let pid_file = pids.path().join("git.pid");
+        std::fs::write(root.join(".git/info/attributes"), "lines.txt diff=pause\n")
+            .expect("attributes");
+        git(
+            &root,
+            &[
+                "config",
+                "diff.pause.textconv",
+                &format!("echo $PPID $$ > '{}'; exec sleep 20 #", pid_file.display()),
+            ],
+        );
+        let registry = WorkspaceAvailabilityRegistry::new();
+        let availability =
+            WorkspaceAdmissionController::new(registry.clone(), engine.repositories());
+
+        let reading = tokio::spawn({
+            let engine = engine.clone();
+            let availability = availability.clone();
+            let thread_id = thread_id.clone();
+            async move {
+                turn_diff(
+                    &engine,
+                    Some(&availability),
+                    json!({"threadId": thread_id, "fromTurnCount": 0, "toTurnCount": 1}),
+                )
+                .await
+            }
+        });
+        let started = std::time::Instant::now();
+        let pids_text = loop {
+            if let Ok(text) = std::fs::read_to_string(&pid_file)
+                && text.trim().split(' ').count() == 2
+            {
+                break text;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "git never reached the text conversion"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        let mut parsed = pids_text
+            .split_whitespace()
+            .map(|pid| pid.parse::<i32>().expect("pid"));
+        let (git_pid, sleeper_pid) = (parsed.next().unwrap(), parsed.next().unwrap());
+
+        let removal = registry
+            .mark_removing(&thread_id, &root)
+            .await
+            .expect("removal begins");
+        let read = tokio::time::timeout(Duration::from_secs(10), reading)
+            .await
+            .expect("the read stops when removal begins")
+            .expect("read task joins");
+        assert_eq!(
+            read.unwrap_err()["_tag"],
+            json!("WorkspaceUnavailableError")
+        );
+        let started = std::time::Instant::now();
+        while !process_is_gone(git_pid) {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "git {git_pid} still runs"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // SAFETY: the converter's own process; it outlived Git by design of this fixture.
+        unsafe { libc::kill(sleeper_pid, libc::SIGKILL) };
+
+        std::fs::remove_file(&pid_file).expect("pid file");
+        assert_eq!(
+            turn_diff(
+                &engine,
+                Some(&availability),
+                json!({"threadId": thread_id, "fromTurnCount": 0, "toTurnCount": 1}),
+            )
+            .await
+            .unwrap_err()["_tag"],
+            json!("WorkspaceUnavailableError")
+        );
+        assert!(!pid_file.exists(), "the refused read never started Git");
+        drop(removal);
         engine.shutdown().await;
     }
 }

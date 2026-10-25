@@ -44,7 +44,16 @@ cargo test -p bibcode-server --lib diagnostics::native::tests:: -j 2
 cargo test -p bibcode-server --lib diagnostics::resource_sampler::tests:: -j 2
 cargo test -p bibcode-server --lib diagnostics::monitor::tests:: -j 2
 cargo test -p bibcode-server --lib production::server_terminal::tests::embedded_host_cleanup_preserves_unmanaged_host_descendants -j 2 -- --exact
+cargo test -p bibcode-server --lib diagnostics::registry::tests::a_surviving_registration_is_no_shutdown_root -j 2 -- --exact
+cargo test -p bibcode-server --lib production::runtime::tests::quiesce_in_ -j 2
 ```
+
+A registration marked `survives_shutdown` (a diff app opened through
+**Open with**) must never be a shutdown root, and a standalone server's
+descendant sweep must spare it and its descendants while still ending an
+ordinary registered helper. The quiesce tests check both on Linux, where
+cleanup signals through a pidfd; on macOS cleanup ends nothing, so only the
+survivors' half applies there.
 
 Construction must leave the native process table empty. The first diagnostics
 read starts the background sampler; its first sample must discover the current
@@ -2761,6 +2770,7 @@ sizes. Cover relevant:
   [read-only list/detail/files smoke](#pull-requests-web-shell-validation) with
   route, selected tab and real patch evidence;
 - thread creation, switching, persistence, and streaming;
+- the Diff panel's [Compare view](#diff-compare-scenario);
 - the [durable message queue](#durable-message-queue): FIFO cards, native steer,
   Cancel restoration, reload and restart persistence, promotion, Stop drain,
   holds, and unsupported-provider explanations;
@@ -3142,6 +3152,56 @@ commands receive `BIBCODE_OPEN_URL_AUTH` (from a Codex tool call,
 the value); whether Codex's `workspace-write` sandbox makes `"$BROWSER"` print
 the address instead of opening it; a session older than 8 hours falls back to
 printing.
+
+### Diff Compare scenario
+
+Run this in the packaged application against a disposable repository that has
+committed files, a working-tree edit, an untracked file, a deleted file, a
+rename, a modified, an added and a deleted binary file, and a branch with
+commits ahead of its base. Let one
+agent turn edit two files so the thread has a turn with checkpoints.
+
+1. Open the Diff panel. **Changes** is selected and matches the stacked view.
+   Choose **Split**, then **Compare**.
+2. For **Working tree**, **Branch changes** and the turn, select files from the
+   list with the pointer and with Up and Down. Each changed file shows its
+   previous and current versions side by side, aligned and scrolling together,
+   and the changed lines appear before the full file finishes loading. The
+   turn shows its changes, never "No net changes".
+3. Confirm the explained states: the added and deleted files show their one
+   side, the rename, each binary file (modified, added and deleted) and a
+   mode-only change each show their message, and the untracked file shows as
+   added. Edit the untracked file without changing its line count: Compare
+   shows the new text.
+4. Filter by name and by status. The count reads "N of M files", a filter with
+   no match offers **Clear filters**, and **Esc** in the name field clears it.
+5. Choose **Changes only**, type `7` in **Context lines**, and confirm one
+   patch request follows after typing stops. Use **Next change**,
+   **Previous change**, F7 and Shift+F7, and confirm both ends say "No more
+   changes."
+6. Edit the selected working-tree file outside BiBCode and confirm Compare
+   picks up the new version.
+7. Quit and relaunch the app. Compare, Split, **Changes only** and 7 context
+   lines are all restored, and the selected file is reselected.
+8. **Open with**, with the platform's diff apps installed (Beyond Compare and
+   FileMerge on macOS, Meld and KDiff3 on Linux, WinMerge on Windows):
+   - the menu lists them with the default marked, and `git config
+     diff.guitool <tool>` moves the default to that tool;
+   - in Compare, open the selected file, the deleted file and the rename in
+     each scope, and **All files in** for the turn; the app shows the right
+     two versions. In Changes, the toolbar's menu opens every file;
+   - the untracked file's menu says to stage it, and a thread in an SSH
+     environment says where it runs;
+   - set `difftool.broken.cmd` to `exit 3` and choose it: the alert shows Git's
+     message and **Copy command**, whose command reproduces the failure in a
+     terminal;
+   - add a project whose folder is a subdirectory of its repository, edit a
+     file in it, and confirm Compare shows it in full and Open with opens it;
+   - with a diff app still open, quit the desktop app, and separately stop a
+     standalone server from its terminal with Ctrl+C: the diff app stays
+     open.
+
+Record screenshots at the normal and minimum window sizes, in light and dark.
 
 ## Profiler crash smoke
 

@@ -11,6 +11,7 @@ import {
   ApprovalRequestId,
   CheckpointRef,
   CommandId,
+  DiffContextLines,
   EventId,
   IsoDateTime,
   MessageId,
@@ -1699,6 +1700,10 @@ export const ThreadTurnDiff = TurnCountRange.mapFields(
   Struct.assign({
     threadId: ThreadId,
     diff: Schema.String,
+    /** Later files were dropped at the patch cap. An older server omits it: `false`. */
+    truncated: Schema.optionalKey(Schema.Boolean),
+    /** The `contextLines` Git applied; omitted for Git's default or a stored patch. */
+    contextLines: Schema.optionalKey(DiffContextLines),
   }),
   { unsafePreserveChecks: true },
 );
@@ -1748,6 +1753,7 @@ export const OrchestrationGetTurnDiffInput = TurnCountRange.mapFields(
   Struct.assign({
     threadId: ThreadId,
     ignoreWhitespace: Schema.optionalKey(Schema.Boolean),
+    contextLines: Schema.optionalKey(DiffContextLines),
   }),
   { unsafePreserveChecks: true },
 );
@@ -1760,6 +1766,7 @@ export const OrchestrationGetFullThreadDiffInput = Schema.Struct({
   threadId: ThreadId,
   toTurnCount: NonNegativeInt,
   ignoreWhitespace: Schema.optionalKey(Schema.Boolean),
+  contextLines: Schema.optionalKey(DiffContextLines),
 });
 export type OrchestrationGetFullThreadDiffInput = typeof OrchestrationGetFullThreadDiffInput.Type;
 

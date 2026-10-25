@@ -1732,6 +1732,27 @@ async fn has_ref(
         == 0)
 }
 
+/// Whether `reference` names any object in the repository at `cwd`. Unlike [`has_ref`] it does
+/// not peel the object, so a ref that points at something other than a commit still counts as
+/// present and the caller's `^{commit}` reports the mismatch.
+pub(crate) async fn ref_exists(
+    cwd: &Path,
+    reference: &str,
+    cancellation: &CancellationToken,
+) -> Result<bool, OrchestrationEffectsError> {
+    Ok(run_git(
+        cwd,
+        Path::new("git"),
+        &["rev-parse", "--verify", "--quiet", reference],
+        &[],
+        true,
+        cancellation,
+    )
+    .await?
+    .exit_code
+        == 0)
+}
+
 /// The revision a checkpoint restores from: its ref, or `HEAD` when allowed and the ref is gone.
 async fn checkpoint_revision(
     cwd: &Path,

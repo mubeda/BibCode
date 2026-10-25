@@ -69,7 +69,13 @@ const hooks = vi.hoisted(() => {
 });
 
 interface QueryDescriptor {
-  readonly kind: "fullThreadDiff" | "listEntries" | "searchEntries" | "turnDiff";
+  readonly kind:
+    | "fullThreadContextDiff"
+    | "fullThreadDiff"
+    | "listEntries"
+    | "searchEntries"
+    | "turnContextDiff"
+    | "turnDiff";
   readonly args: {
     readonly environmentId: string;
     readonly input: Readonly<Record<string, unknown>>;
@@ -153,6 +159,9 @@ vi.mock("./orchestration", () => ({
   orchestrationEnvironment: {
     fullThreadDiff: (args: QueryDescriptor["args"]) => descriptor("fullThreadDiff", args),
     turnDiff: (args: QueryDescriptor["args"]) => descriptor("turnDiff", args),
+    fullThreadContextDiff: (args: QueryDescriptor["args"]) =>
+      descriptor("fullThreadContextDiff", args),
+    turnContextDiff: (args: QueryDescriptor["args"]) => descriptor("turnContextDiff", args),
   },
 }));
 
@@ -477,6 +486,38 @@ describe("useCheckpointDiff", () => {
         },
       },
     ]);
+  });
+
+  it("reads a context count through the families that keep nothing", () => {
+    renderHook(() =>
+      useCheckpointDiff(checkpointTarget({ fromTurnCount: 1, toTurnCount: 4, contextLines: 7 })),
+    );
+    expect(testState.queryDescriptors).toEqual([
+      null,
+      expect.objectContaining({
+        kind: "turnContextDiff",
+        args: {
+          environmentId: "environment-1",
+          input: {
+            threadId: "thread-1",
+            fromTurnCount: 1,
+            toTurnCount: 4,
+            ignoreWhitespace: true,
+            contextLines: 7,
+          },
+        },
+      }),
+    ]);
+
+    renderHook(() => useCheckpointDiff(checkpointTarget({ contextLines: 0 })));
+    expect(testState.queryDescriptors.at(-2)).toEqual(
+      expect.objectContaining({
+        kind: "fullThreadContextDiff",
+        args: expect.objectContaining({
+          input: expect.objectContaining({ contextLines: 0 }),
+        }),
+      }),
+    );
   });
 
   it.each([

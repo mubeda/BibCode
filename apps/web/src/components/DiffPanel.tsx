@@ -5,7 +5,7 @@ import {
   squashAtomCommandFailure,
 } from "@bibcode/client-runtime/state/runtime";
 import { safeErrorLogAttributes } from "@bibcode/client-runtime/errors";
-import type { ScopedThreadRef, TurnId } from "@bibcode/contracts";
+import type { ReviewDiffToolScope, ScopedThreadRef, TurnId } from "@bibcode/contracts";
 import {
   ArrowRightIcon,
   CheckIcon,
@@ -39,10 +39,15 @@ import {
 import { useTurnDiffSummaries } from "../hooks/useTurnDiffSummaries";
 import { useProject, useThread } from "../state/entities";
 import { resolveThreadRouteRef } from "../threadRoutes";
-import { useClientSettings } from "../hooks/useSettings";
+import { useClientSettings, useUpdateClientSettings } from "../hooks/useSettings";
 import { formatShortTimestamp } from "../timestampFormat";
 import { DiffPanelLoadingState, DiffPanelShell, type DiffPanelMode } from "./DiffPanelShell";
 import { AnnotatableCodeView, type AnnotatableCodeViewHandle } from "./diffs/AnnotatableCodeView";
+import { DiffCompareView } from "./diffs/DiffCompareView";
+import { DiffOpenWithMenu, DiffToolLaunchAlert } from "./diffs/DiffOpenWithMenu";
+import { isUntrackedFile, type DiffToolLaunchFailure } from "../lib/diffOpenWith";
+import type { DiffFileRow } from "../lib/diffCompareModel";
+import { useCommentDraftStore } from "./diffs/useCommentDraftStore";
 import { ToggleGroup, Toggle } from "./ui/toggle-group";
 import { Switch } from "./ui/switch";
 import {
@@ -71,7 +76,6 @@ import { vcsEnvironment } from "../state/vcs";
 import { buildBaseRefChoices, filterBaseRefChoices } from "../lib/baseRefChoices";
 import type { Thread } from "../types";
 
-type DiffRenderMode = "stacked" | "split";
 type DiffThemeType = "light" | "dark";
 const AUTOMATIC_BASE_REF = "__automatic_base_ref__";
 
@@ -197,7 +201,15 @@ export default function DiffPanel({
 }: DiffPanelProps) {
   const { resolvedTheme } = useTheme();
   const settings = useClientSettings();
-  const [diffRenderMode, setDiffRenderMode] = useState<DiffRenderMode>("stacked");
+  const updateClientSettings = useUpdateClientSettings();
+  // Remembered across reloads and restarts, unlike wrap and whitespace, which reset to their
+  // Settings defaults.
+  const diffRenderMode = settings.diffRenderMode;
+  const diffViewMode = settings.diffViewMode;
+  const compareLines = settings.diffCompareLines;
+  const compareContextLines = settings.diffCompareContextLines;
+  // Only Compare's Changes only asks for a second patch; All lines and Changes share the default.
+  const wantsContextPatch = diffViewMode === "compare" && compareLines === "changes";
   const [wordWrap, setWordWrap] = useState(settings.wordWrap);
   const [diffIgnoreWhitespace, setDiffIgnoreWhitespace] = useState(settings.diffIgnoreWhitespace);
   const [baseRefQuery, setBaseRefQuery] = useState("");
@@ -205,6 +217,8 @@ export default function DiffPanel({
     scopeKey: null,
     fileKeys: EMPTY_COLLAPSED_DIFF_FILE_KEYS,
   }));
+  // A diff app that did not open, shown under the toolbar until dismissed.
+  const [diffToolFailure, setDiffToolFailure] = useState<DiffToolLaunchFailure | null>(null);
   const codeViewRef = useRef<AnnotatableCodeViewHandle>(null);
 
   const routeThreadRef = useParams({
@@ -305,6 +319,7 @@ export default function DiffPanel({
         ? "Latest turn"
         : `Turn ${selectedCheckpointTurnCount ?? "?"}`;
   const reviewSectionId = selectedTurn ? `turn:${selectedTurn.turnId}` : selectedGitScope;
+  const commentDraftStore = useCommentDraftStore(activeThreadRef, reviewSectionId);
   const collapseScopeKey = activeThreadRef
     ? `${activeThreadRef.environmentId}:${activeThreadRef.threadId}:${reviewSectionId}`
     : null;
@@ -354,11 +369,54 @@ export default function DiffPanel({
         })
       : null,
   );
+  const contextCheckpointDiff = useCheckpointDiff(
+    {
+      environmentId: activeThread?.environmentId ?? null,
+      threadId: activeThreadId,
+      fromTurnCount: selectedCheckpointRange?.fromTurnCount ?? null,
+      toTurnCount: selectedCheckpointRange?.toTurnCount ?? null,
+      ignoreWhitespace: diffIgnoreWhitespace,
+      cacheScope: selectedTurn ? `turn:${selectedTurn.turnId}` : null,
+      contextLines: compareContextLines,
+    },
+    {
+      enabled:
+        wantsContextPatch &&
+        workspaceUnavailable === null &&
+        isGitRepo &&
+        selectedTurn !== undefined,
+    },
+  );
+  const contextDiffPreview = useEnvironmentQuery(
+    wantsContextPatch &&
+      workspaceUnavailable === null &&
+      selectedTurnId === null &&
+      activeThread &&
+      activeCwd
+      ? reviewEnvironment.contextDiffPreview({
+          environmentId: activeThread.environmentId,
+          input: {
+            cwd: activeCwd,
+            ...(selectedBaseRef ? { baseRef: selectedBaseRef } : {}),
+            ignoreWhitespace: diffIgnoreWhitespace,
+            contextLines: compareContextLines,
+          },
+        })
+      : null,
+  );
   const revalidateBranchDiffPreview = branchDiffPreview.revalidate;
+  const revalidateContextDiffPreview = contextDiffPreview.revalidate;
   useEffect(() => {
     if (workspaceUnavailable || gitRefreshRequestId === 0 || selectedTurnId !== null) return;
     revalidateBranchDiffPreview();
-  }, [revalidateBranchDiffPreview, gitRefreshRequestId, selectedTurnId, workspaceUnavailable]);
+    revalidateContextDiffPreview();
+  }, [
+    revalidateBranchDiffPreview,
+    revalidateContextDiffPreview,
+    gitRefreshRequestId,
+    selectedTurnId,
+    workspaceUnavailable,
+  ]);
   const selectedGitSource = branchDiffPreview.data?.sources.find(
     (source) => source.kind === (selectedGitScope === "unstaged" ? "working-tree" : "branch-range"),
   );
@@ -415,19 +473,135 @@ export default function DiffPanel({
   const gitDiff = selectedGitSource?.diff;
 
   const selectedPatch = selectedTurn ? activeCheckpointDiff.data?.diff : gitDiff;
-  const isSelectedPatchTruncated = !selectedTurn && selectedGitSource?.truncated === true;
+  // A current server bounds turn patches too; an older one never sets the key.
+  const isSelectedPatchTruncated = selectedTurn
+    ? activeCheckpointDiff.data?.truncated === true
+    : selectedGitSource?.truncated === true;
   const isLoadingSelectedPatch = selectedTurn
     ? activeCheckpointDiff.isPending
     : branchDiffPreview.isPending;
   const selectedPatchError = selectedTurn ? activeCheckpointDiff.error : branchDiffPreview.error;
   const hasResolvedPatch = typeof selectedPatch === "string";
-  const hasNoNetChanges = hasResolvedPatch && selectedPatch.trim().length === 0;
+  // An empty patch cut at the cap left out files that did change.
+  const hasNoNetChanges =
+    hasResolvedPatch && selectedPatch.trim().length === 0 && !isSelectedPatchTruncated;
   const renderablePatch = useMemo(
     () =>
       getRenderablePatch(selectedPatch, `diff-panel:${resolvedTheme}`, {
         compactPartialHunkOffsets: selectedTurnId === null,
       }),
     [resolvedTheme, selectedPatch, selectedTurnId],
+  );
+  const compareScope = selectedTurn
+    ? "turn"
+    : selectedGitScope === "unstaged"
+      ? "working-tree"
+      : "branch";
+  // What Open with compares; the server turns it into revisions. A turn without a checkpoint
+  // count has nothing to compare.
+  const diffToolScope = useMemo((): ReviewDiffToolScope | null => {
+    if (selectedTurn === undefined) {
+      return selectedGitScope === "unstaged"
+        ? { _tag: "working-tree" }
+        : { _tag: "branch", baseRef: selectedBaseRef };
+    }
+    return activeThreadId !== null && selectedCheckpointRange !== null
+      ? { _tag: "turn", threadId: activeThreadId, ...selectedCheckpointRange }
+      : null;
+  }, [activeThreadId, selectedBaseRef, selectedCheckpointRange, selectedGitScope, selectedTurn]);
+  // A server that computes turn patches live reports `truncated` on every one, live or stored;
+  // an older one never does. Short IDs with the key present therefore mean a stored patch.
+  const liveTurnPatches =
+    selectedTurn !== undefined &&
+    activeCheckpointDiff.data !== null &&
+    activeCheckpointDiff.data !== undefined &&
+    "truncated" in activeCheckpointDiff.data;
+  const revalidateSelectedPatch = useCallback(() => {
+    // Only the working tree has a side read from disk, so only its patch can go stale.
+    if (selectedTurnId !== null) return;
+    revalidateBranchDiffPreview();
+    revalidateContextDiffPreview();
+  }, [revalidateBranchDiffPreview, revalidateContextDiffPreview, selectedTurnId]);
+  const contextPatch = selectedTurn
+    ? contextCheckpointDiff.data
+    : contextDiffPreview.data?.sources.find(
+        (source) =>
+          source.kind === (selectedGitScope === "unstaged" ? "working-tree" : "branch-range"),
+      );
+  const contextPatchText = wantsContextPatch ? contextPatch?.diff : undefined;
+  const contextRenderablePatch = useMemo(
+    () =>
+      getRenderablePatch(contextPatchText, `diff-panel-context:${resolvedTheme}`, {
+        compactPartialHunkOffsets: selectedTurnId === null,
+      }),
+    [contextPatchText, resolvedTheme, selectedTurnId],
+  );
+  const updateCompareLines = useCallback(
+    (lines: "all" | "changes") => updateClientSettings({ diffCompareLines: lines }),
+    [updateClientSettings],
+  );
+  const updateCompareContextLines = useCallback(
+    (contextLines: number) => updateClientSettings({ diffCompareContextLines: contextLines }),
+    [updateClientSettings],
+  );
+  const contextPending = selectedTurn
+    ? contextCheckpointDiff.isPending
+    : contextDiffPreview.isPending;
+  const contextError = wantsContextPatch
+    ? selectedTurn
+      ? contextCheckpointDiff.error
+      : contextDiffPreview.error
+    : null;
+  const refreshContextCheckpointDiff = contextCheckpointDiff.refresh;
+  const refreshContextDiffPreview = contextDiffPreview.refresh;
+  // An explicit Retry, so it also clears a connection cut-off.
+  const retryContextPatch = useCallback(() => {
+    if (selectedTurnId !== null) refreshContextCheckpointDiff();
+    else refreshContextDiffPreview();
+  }, [refreshContextCheckpointDiff, refreshContextDiffPreview, selectedTurnId]);
+  const compareLineFilter = useMemo(
+    () => ({
+      lines: compareLines,
+      contextLines: compareContextLines,
+      contextFiles: contextRenderablePatch?.kind === "files" ? contextRenderablePatch.files : null,
+      contextPending: wantsContextPatch && contextPending,
+      contextError,
+      onRetryContext: retryContextPatch,
+      // A patch that ignored the count does not echo it: a stored turn patch on a current
+      // server (which reports `truncated`), or any patch from an older one.
+      contextUnavailableReason:
+        contextPatch === null || contextPatch === undefined || "contextLines" in contextPatch
+          ? null
+          : selectedTurn !== undefined && "truncated" in contextPatch
+            ? "Saved before full files were kept, so its context lines can't change."
+            : "Update the server to change context lines.",
+      onLinesChange: updateCompareLines,
+      onContextLinesChange: updateCompareContextLines,
+    }),
+    [
+      compareContextLines,
+      compareLines,
+      contextError,
+      contextPatch,
+      contextPending,
+      retryContextPatch,
+      contextRenderablePatch,
+      selectedTurn,
+      updateCompareContextLines,
+      updateCompareLines,
+      wantsContextPatch,
+    ],
+  );
+  const compareOptions = useMemo(
+    () => ({
+      lineDiffType: "none" as const,
+      overflow: wordWrap ? ("wrap" as const) : ("scroll" as const),
+      theme: resolveDiffThemeName(resolvedTheme),
+      themeType: resolvedTheme as DiffThemeType,
+      unsafeCSS: DIFF_PANEL_UNSAFE_CSS,
+      layout: { paddingTop: 0, paddingBottom: 8, gap: 0 },
+    }),
+    [resolvedTheme, wordWrap],
   );
   const renderableFiles = useMemo(() => {
     if (!renderablePatch || renderablePatch.kind !== "files") {
@@ -440,6 +614,25 @@ export default function DiffPanel({
       }),
     );
   }, [renderablePatch]);
+  const diffToolEnvironmentId = activeThread?.environmentId ?? null;
+  const renderCompareFileActions = useCallback(
+    (row: DiffFileRow) =>
+      diffToolEnvironmentId !== null && activeCwd && diffToolScope !== null ? (
+        <DiffOpenWithMenu
+          cwd={activeCwd}
+          environmentId={diffToolEnvironmentId}
+          scope={diffToolScope}
+          target={{
+            kind: "file",
+            path: row.path,
+            previousPath: row.previousPath,
+            untracked: isUntrackedFile(row.fileDiff, compareScope),
+          }}
+          onLaunchFailure={setDiffToolFailure}
+        />
+      ) : null,
+    [activeCwd, compareScope, diffToolEnvironmentId, diffToolScope],
+  );
   const codeViewFiles = useMemo(
     () =>
       renderableFiles.map((fileDiff) => {
@@ -701,24 +894,46 @@ export default function DiffPanel({
       </div>
       <div className="flex shrink-0 items-center gap-1 [-webkit-app-region:no-drag]">
         <ToggleGroup
+          aria-label="Diff view"
           className="shrink-0"
           variant="outline"
           size="xs"
-          value={[diffRenderMode]}
+          value={[diffViewMode]}
           onValueChange={(value) => {
             const next = value[0];
-            if (next === "stacked" || next === "split") {
-              setDiffRenderMode(next);
+            if ((next === "changes" || next === "compare") && next !== diffViewMode) {
+              updateClientSettings({ diffViewMode: next });
             }
           }}
         >
-          <Toggle aria-label="Stacked diff view" value="stacked">
-            <Rows3Icon className="size-3" />
+          <Toggle className="px-2 text-xs" value="changes">
+            Changes
           </Toggle>
-          <Toggle aria-label="Split diff view" value="split">
-            <Columns2Icon className="size-3" />
+          <Toggle className="px-2 text-xs" value="compare">
+            Compare
           </Toggle>
         </ToggleGroup>
+        {diffViewMode === "changes" ? (
+          <ToggleGroup
+            className="shrink-0"
+            variant="outline"
+            size="xs"
+            value={[diffRenderMode]}
+            onValueChange={(value) => {
+              const next = value[0];
+              if ((next === "stacked" || next === "split") && next !== diffRenderMode) {
+                updateClientSettings({ diffRenderMode: next });
+              }
+            }}
+          >
+            <Toggle aria-label="Stacked diff view" value="stacked">
+              <Rows3Icon className="size-3" />
+            </Toggle>
+            <Toggle aria-label="Split diff view" value="split">
+              <Columns2Icon className="size-3" />
+            </Toggle>
+          </ToggleGroup>
+        ) : null}
         <Tooltip>
           <TooltipTrigger
             render={
@@ -761,6 +976,20 @@ export default function DiffPanel({
             {diffIgnoreWhitespace ? "Show whitespace changes" : "Hide whitespace changes"}
           </TooltipPopup>
         </Tooltip>
+        {/* Compare opens one file from its pane header, with every file one item below. */}
+        {diffViewMode === "changes" &&
+        diffToolEnvironmentId !== null &&
+        activeCwd &&
+        diffToolScope !== null &&
+        renderableFiles.length > 0 ? (
+          <DiffOpenWithMenu
+            cwd={activeCwd}
+            environmentId={diffToolEnvironmentId}
+            scope={diffToolScope}
+            target={{ kind: "all", count: renderableFiles.length }}
+            onLaunchFailure={setDiffToolFailure}
+          />
+        ) : null}
       </div>
     </>
   );
@@ -789,6 +1018,12 @@ export default function DiffPanel({
       ) : (
         <>
           <div className="diff-panel-viewport flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+            {diffToolFailure ? (
+              <DiffToolLaunchAlert
+                failure={diffToolFailure}
+                onDismiss={() => setDiffToolFailure(null)}
+              />
+            ) : null}
             {isSelectedPatchTruncated && (
               <p className="shrink-0 border-b border-border/70 bg-muted/40 px-3 py-1.5 text-xs text-muted-foreground">
                 This diff was truncated because it exceeded the preview limit. The changes shown are
@@ -816,10 +1051,33 @@ export default function DiffPanel({
                   <p>
                     {hasNoNetChanges
                       ? "No net changes in this selection."
-                      : "No patch available for this selection."}
+                      : isSelectedPatchTruncated
+                        ? "These changes are too large to preview."
+                        : "No patch available for this selection."}
                   </p>
                 </div>
               )
+            ) : renderablePatch.kind === "files" && diffViewMode === "compare" && activeCwd ? (
+              <DiffCompareView
+                composerDraftTarget={composerDraftTarget}
+                cwd={activeCwd}
+                environmentId={activeThread.environmentId}
+                files={renderableFiles}
+                liveTurnPatches={liveTurnPatches}
+                lineFilter={compareLineFilter}
+                options={compareOptions}
+                scope={compareScope}
+                sectionId={reviewSectionId}
+                sectionTitle={reviewSectionTitle}
+                threadRef={
+                  activeThreadRef ?? {
+                    environmentId: activeThread.environmentId,
+                    threadId: activeThread.id,
+                  }
+                }
+                onRevalidatePatch={revalidateSelectedPatch}
+                renderFileActions={renderCompareFileActions}
+              />
             ) : renderablePatch.kind === "files" ? (
               <div
                 className="min-h-0 flex-1"
@@ -834,6 +1092,7 @@ export default function DiffPanel({
                 }}
               >
                 <AnnotatableCodeView
+                  {...(commentDraftStore ? { draftStore: commentDraftStore } : {})}
                   viewerRef={codeViewRef}
                   key={collapseScopeKey ?? reviewSectionId}
                   className="diff-render-surface h-full min-h-0 overflow-auto"
