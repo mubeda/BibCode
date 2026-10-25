@@ -456,6 +456,20 @@ idle center terminal when possible and otherwise open a new center terminal.
 The retired bottom terminal drawer and its bottom-toolbar toggle no longer
 exist.
 
+A ` ```mermaid ` block in a chat message, a plan, or a Markdown file's rendered
+view draws as a diagram once its closing fence has arrived; while a reply is
+still writing it, the block shows its source. The diagram stays in the code
+block's card: **Copy** copies its source, and **Show source** switches between
+the diagram and its highlighted source (line wrap is offered with the source).
+Selecting text inside a diagram and copying it copies the whole fenced source.
+Diagrams follow the light or dark theme; colors set in the diagram with `style`
+or `classDef` are kept, while Mermaid theme directives are not applied. An
+invalid diagram keeps its source and says what is wrong, with the line; a
+diagram over 25,000 characters or 500 edges says it is too large to draw; and
+if the diagram renderer cannot be loaded, **Retry** tries again. Diagrams do
+not open links or load images. A diagram that draws above the line you are
+reading in the chat does not move that line.
+
 ### Reading the timeline
 
 A finished turn folds its commentary and tool calls behind a **Worked for**

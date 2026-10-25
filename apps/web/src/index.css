@@ -807,6 +807,48 @@ label:has(> select#reasoning-effort) select {
   background: transparent !important;
 }
 
+/* A drawn Mermaid diagram. Pele colors shapes through its --pele-* tokens, so a theme switch
+   recolors the diagram without drawing it again. The surface steps are opaque mixes: a
+   translucent token would stack where shapes overlap. Containment keeps the SVG from painting
+   over app UI or taking styles from it. */
+.chat-markdown .chat-markdown-mermaid {
+  --pele-bg: var(--background);
+  --pele-fg: var(--foreground);
+  --pele-muted: var(--muted-foreground);
+  --pele-surface: color-mix(in srgb, var(--foreground) 5%, var(--background));
+  --pele-surface-alt: color-mix(in srgb, var(--foreground) 10%, var(--background));
+  --pele-border: color-mix(in srgb, var(--foreground) 32%, var(--background));
+  --pele-line: color-mix(in srgb, var(--foreground) 55%, var(--background));
+  --pele-accent: var(--info);
+  --pele-critical: var(--destructive);
+  --pele-error: var(--destructive);
+  --pele-radius: 0.75rem;
+  display: flex;
+  justify-content: center;
+  padding: 0.75rem;
+  overflow: hidden;
+  contain: content;
+}
+
+/* Natural size, scaled down to the column and never up. */
+.chat-markdown .chat-markdown-mermaid > svg {
+  display: block;
+  max-width: 100%;
+  height: auto;
+}
+
+.chat-markdown .chat-markdown-mermaid-error {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  border-bottom: 1px solid var(--border);
+  padding: 0.375rem 0.7rem;
+  color: var(--destructive-foreground);
+  font-size: 0.75rem;
+  line-height: 1rem;
+}
+
 /* Diagnostics-style tables: row separators only, uppercase headers, and a
    scroll-fade container for horizontal overflow. The root chat-markdown
    wrapping rules (overflow-wrap: anywhere) would let columns shrink to single

@@ -2771,6 +2771,15 @@ sizes. Cover relevant:
   route, selected tab and real patch evidence;
 - thread creation, switching, persistence, and streaming;
 - the Diff panel's [Compare view](#diff-compare-scenario);
+- Mermaid diagrams in light and dark: a ` ```mermaid ` block in a streamed
+  reply shows its source until its closing fence arrives and then draws in
+  the code-block card with **Show source** and **Copy**; an invalid diagram
+  keeps its source under a line-numbered error; a drawn diagram recolors on a
+  theme switch without flashing its source; a selection copied from inside a
+  diagram pastes as its fenced source; the clipped Proposed Plan preview keeps
+  a fence it cut open as source; and a diagram drawing above the line being
+  read in the chat leaves that line in place (the maintained Mermaid scenario
+  below automates the rendered-file and timeline checks);
 - the [durable message queue](#durable-message-queue): FIFO cards, native steer,
   Cancel restoration, reload and restart persistence, promotion, Stop drain,
   holds, and unsupported-provider explanations;
@@ -2940,6 +2949,53 @@ by the native platform page, set
 `vp run test:ui:desktop` invocation. Retain its named `pierre-*.png` screenshots
 with the other bounded UI artifacts; do not put fixture state or screenshots in
 the repository.
+
+The maintained Mermaid scenario (`apps/desktop/e2e/specs/mermaid-diagrams.e2e.ts`)
+runs under the packaged app's production CSP and is part of the default suite.
+It writes valid, invalid and hostile diagram files into the fixture project and
+opens each in the Files rendered view: the valid diagram draws and recolors on
+a theme switch without its SVG being replaced, the invalid one shows its
+line-numbered error, and the hostile one leaves no `a`, `image`,
+`foreignObject`, `style`, `use` or `script` under `.chat-markdown-mermaid`, no
+`/mermaid-probe/` entry in `performance.getEntriesByType("resource")` (a
+same-origin load raises no CSP event) and no `securitypolicyviolation` event.
+The fixture Codex provider then answers its diagram prompts in the timeline: a
+**Show source** swap on a diagram inside the first visible row above the top
+edge, and on one in a row wholly above the viewport, moves a reading-anchor
+paragraph by at most 1 px; a short reply's diagram drawing under its sent
+message leaves that message at the sent-row offset; and selecting an earlier
+message with the minimap keyboard lands it at the minimap's offset past that
+diagram and keeps it there (`mermaid-timeline-minimap-landing.json`). After a
+reply with 101 diagrams, reopening the chat draws the evicted diagram (the
+reply's last, which the queue drew first) again through the queue, and the
+reopened chat settles at its end with the reply's last line in view and still.
+The scenario keeps a per-sample trace of the last line, on a timer and after
+each painted frame, as `mermaid-timeline-evicted-remount.json`. A second reply
+of 101 diagrams then evicts every earlier one; scrolling up remounts the rows
+reply, whose diagram shows its source and draws again above the message being
+read, which stays within 1 px on every painted frame
+(`mermaid-timeline-cold-draw.json`). Last, the fixture provider streams the
+same reply twice, one delta every 300 ms, first with the diagram's source in a
+plain code block and then as a diagram that draws at the end while more text
+streams: both end resting at the same distance from the end with the last line
+in view (`mermaid-timeline-streaming-follow.json` holds both replies' gaps).
+Open items of the diagram merge gate, which the traces record but the
+scenario does not assert: when the evicted diagram redraws before the list's
+first scroll to the end, the end converges in steps for a few painted frames
+after it first shows; a diagram that draws at the end grows without the list
+following it, so the list rests about one diagram-height change further from
+the end until the next delta lands, and a reopened chat with two evicted
+diagrams near its end can settle that far short of it. The reading-line
+checks sample painted frames, so the scenario fails early in a webview that
+paints none.
+Its other page scripts wait on timers rather than animation frames, which stop
+in an occluded macOS webview; such a webview also throttles timers, so drawing
+the 101 diagrams can take minutes there. Rerun it alone with
+`BIBCODE_E2E_SPEC=./specs/mermaid-diagrams.e2e.ts`, and retain its
+`mermaid-*.png` screenshots with the other UI artifacts. In browser mode, check
+the same fixture files served by a release `bibcode` server in Chromium and
+Safari: the console shows no CSP violation and the server log no
+`/mermaid-probe/` request.
 
 At final packaged shutdown, inspect the raw worker and server logs. Provider and
 terminal owners, operational logs, orchestration, and the SQLite worker must all

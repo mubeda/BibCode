@@ -10,6 +10,11 @@ import * as NodePath from "node:path";
 
 import { afterEach, describe, expect, it } from "vite-plus/test";
 
+import {
+  mermaidFixturePrompts,
+  mermaidFixtureReplies,
+  mermaidFixtureStreamedReplies,
+} from "./mermaid-fixture.ts";
 import { readProviderInputLog } from "./provider-input-log.ts";
 import {
   archiveAndCleanupDesktopUiTestContext,
@@ -522,6 +527,67 @@ describe("generated provider shims", () => {
     expect(readProviderInputLog(fixture.context.providerInputLogPath)).toMatchObject([
       { provider: "codex", prompt: "$refactor" },
     ]);
+  });
+
+  it("answers the Mermaid fixture prompts with their diagram replies", () => {
+    const fixture = prepareProviderFixture();
+    const responses = exchangeJsonLines(
+      fixture,
+      "codex",
+      ["app-server"],
+      [
+        { id: 1, method: "initialize" },
+        {
+          id: 2,
+          method: "turn/start",
+          params: { input: [{ type: "text", text: mermaidFixturePrompts.many }] },
+        },
+      ],
+    );
+
+    expect(responses).toContainEqual(
+      expect.objectContaining({
+        method: "item/agentMessage/delta",
+        params: expect.objectContaining({
+          delta: mermaidFixtureReplies[mermaidFixturePrompts.many],
+        }),
+      }),
+    );
+    expect(mermaidFixtureReplies[mermaidFixturePrompts.many]?.match(/```mermaid/g)).toHaveLength(
+      101,
+    );
+  });
+
+  it("streams the Mermaid streaming reply one delta per chunk before completing", () => {
+    const fixture = prepareProviderFixture();
+    const responses = exchangeJsonLines(
+      fixture,
+      "codex",
+      ["app-server"],
+      [
+        { id: 1, method: "initialize" },
+        {
+          id: 2,
+          method: "turn/start",
+          params: { input: [{ type: "text", text: mermaidFixturePrompts.streamed }] },
+        },
+      ],
+    );
+
+    const chunks = mermaidFixtureStreamedReplies[mermaidFixturePrompts.streamed]!;
+    const deltas = responses
+      .filter((message) => message.method === "item/agentMessage/delta")
+      .map((message) => (message.params as { delta: string }).delta);
+    expect(deltas).toEqual(chunks);
+    // The diagram's closing fence arrives with more text still to come.
+    const closer = chunks.findIndex((chunk) => chunk.includes("\n```\n"));
+    expect(closer).toBeGreaterThan(0);
+    expect(closer).toBeLessThan(chunks.length - 2);
+    const completed = responses.findIndex((message) => message.method === "turn/completed");
+    const lastDelta = responses.findLastIndex(
+      (message) => message.method === "item/agentMessage/delta",
+    );
+    expect(completed).toBeGreaterThan(lastDelta);
   });
 
   it("speaks Claude control, skill reload, stream, and result protocols", () => {
