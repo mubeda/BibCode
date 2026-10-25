@@ -50,6 +50,25 @@ describe("ClientSettings Pull Requests", () => {
   });
 });
 
+describe("ClientSettings Pipelines", () => {
+  it("enables the module by default, apart from Pull Requests, and preserves an opt-out", () => {
+    expect(decodeClientSettings({}).pipelinesEnabled).toBe(true);
+    expect(DEFAULT_CLIENT_SETTINGS.pipelinesEnabled).toBe(true);
+    expect(decodeClientSettings({ pipelinesEnabled: false })).toMatchObject({
+      pipelinesEnabled: false,
+      pullRequestsEnabled: true,
+    });
+  });
+
+  it("patches the preference without resetting an omitted value", () => {
+    expect(decodeClientSettingsPatch({ pipelinesEnabled: false })).toMatchObject({
+      pipelinesEnabled: false,
+    });
+    expect(decodeClientSettingsPatch({})).not.toHaveProperty("pipelinesEnabled");
+    expect(() => decodeClientSettingsPatch({ pipelinesEnabled: "no" })).toThrow();
+  });
+});
+
 describe("ClientSettings Activity button", () => {
   it("keeps the Activity button visible by default, also for settings stored without the key", () => {
     expect(decodeClientSettings({}).activityDockAlwaysVisible).toBe(true);

@@ -1,0 +1,252 @@
+{
+  "data": {
+    "project": {
+      "pipeline": {
+        "id": "gid://gitlab/Ci::Pipeline/4821",
+        "iid": "312",
+        "name": null,
+        "ref": "main",
+        "refPath": "refs/heads/main",
+        "sha": "abc1234def",
+        "status": "FAILED",
+        "detailedStatus": { "name": "FAILED" },
+        "source": "push",
+        "latest": true,
+        "mergeRequestEventType": null,
+        "type": "BRANCH_PIPELINE",
+        "yamlErrors": false,
+        "failureReason": null,
+        "stuck": false,
+        "createdAt": "2026-10-24T10:00:00Z",
+        "startedAt": "2026-10-24T10:00:05Z",
+        "finishedAt": "2026-10-24T10:04:17Z",
+        "duration": 252,
+        "queuedDuration": 4.5,
+        "path": "/team/repo/-/pipelines/4821",
+        "user": { "name": "Ana Rossi", "username": "ana" },
+        "commit": {
+          "shortId": "abc1234",
+          "title": "Fix the flaky login test",
+          "webPath": "/team/repo/-/commit/abc1234def"
+        },
+        "mergeRequest": null,
+        "retryable": true,
+        "cancelable": false,
+        "userPermissions": { "updatePipeline": true, "cancelPipeline": true },
+        "totalJobs": 6,
+        "usesNeeds": true,
+        "stages": {
+          "nodes": [
+            {
+              "name": "build",
+              "status": "success",
+              "detailedStatus": { "name": "SUCCESS" },
+              "groups": {
+                "nodes": [
+                  {
+                    "name": "compile",
+                    "size": 1,
+                    "detailedStatus": { "name": "SUCCESS" },
+                    "jobs": {
+                      "pageInfo": { "hasNextPage": false },
+                      "nodes": [
+                        {
+                          "id": "gid://gitlab/Ci::Build/998",
+                          "name": "compile",
+                          "kind": "BUILD",
+                          "status": "SUCCESS",
+                          "detailedStatus": { "name": "SUCCESS" },
+                          "allowFailure": false,
+                          "startedAt": "2026-10-24T10:00:05Z",
+                          "finishedAt": "2026-10-24T10:01:05Z",
+                          "duration": 60,
+                          "queuedDuration": 1.2,
+                          "webPath": "/team/repo/-/jobs/998",
+                          "retryable": true,
+                          "cancelable": false,
+                          "playable": false,
+                          "manualJob": false,
+                          "downstreamPipeline": null
+                        }
+                      ]
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "name": "test",
+              "status": "failed",
+              "detailedStatus": { "name": "FAILED" },
+              "groups": {
+                "nodes": [
+                  {
+                    "name": "rspec",
+                    "size": 3,
+                    "detailedStatus": { "name": "FAILED" },
+                    "jobs": {
+                      "pageInfo": { "hasNextPage": true },
+                      "nodes": [
+                        {
+                          "id": "gid://gitlab/Ci::Build/999",
+                          "name": "rspec 1/3",
+                          "kind": "BUILD",
+                          "status": "FAILED",
+                          "detailedStatus": { "name": "FAILED" },
+                          "allowFailure": false,
+                          "startedAt": null,
+                          "finishedAt": null,
+                          "duration": null,
+                          "queuedDuration": null,
+                          "webPath": "/team/repo/-/jobs/999",
+                          "retryable": true,
+                          "cancelable": false,
+                          "playable": false,
+                          "manualJob": false,
+                          "downstreamPipeline": null
+                        },
+                        {
+                          "id": "gid://gitlab/Ci::Build/1000",
+                          "name": "rspec 2/3",
+                          "kind": "BUILD",
+                          "status": "SUCCESS",
+                          "detailedStatus": { "name": "SUCCESS" },
+                          "allowFailure": false,
+                          "startedAt": null,
+                          "finishedAt": null,
+                          "duration": null,
+                          "queuedDuration": null,
+                          "webPath": "/team/repo/-/jobs/1000",
+                          "retryable": true,
+                          "cancelable": false,
+                          "playable": false,
+                          "manualJob": false,
+                          "downstreamPipeline": null
+                        },
+                        {
+                          "id": "gid://gitlab/Ci::Build/1001",
+                          "name": "rspec 3/3",
+                          "kind": "BUILD",
+                          "status": "SUCCESS",
+                          "detailedStatus": { "name": "SUCCESS" },
+                          "allowFailure": false,
+                          "startedAt": null,
+                          "finishedAt": null,
+                          "duration": null,
+                          "queuedDuration": null,
+                          "webPath": "/team/repo/-/jobs/1001",
+                          "retryable": true,
+                          "cancelable": false,
+                          "playable": false,
+                          "manualJob": false,
+                          "downstreamPipeline": null
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "name": "lint",
+                    "size": 1,
+                    "detailedStatus": { "name": "FAILED" },
+                    "jobs": {
+                      "pageInfo": { "hasNextPage": false },
+                      "nodes": [
+                        {
+                          "id": "gid://gitlab/Ci::Build/1002",
+                          "name": "lint",
+                          "kind": "BUILD",
+                          "status": "FAILED",
+                          "detailedStatus": { "name": "FAILED" },
+                          "allowFailure": true,
+                          "startedAt": null,
+                          "finishedAt": null,
+                          "duration": null,
+                          "queuedDuration": null,
+                          "webPath": "/team/repo/-/jobs/1002",
+                          "retryable": true,
+                          "cancelable": false,
+                          "playable": false,
+                          "manualJob": false,
+                          "downstreamPipeline": null
+                        }
+                      ]
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "name": "deploy",
+              "status": "manual",
+              "detailedStatus": { "name": "MANUAL" },
+              "groups": {
+                "nodes": [
+                  {
+                    "name": "downstream",
+                    "size": 1,
+                    "detailedStatus": { "name": "SUCCESS" },
+                    "jobs": {
+                      "pageInfo": { "hasNextPage": false },
+                      "nodes": [
+                        {
+                          "id": "gid://gitlab/Ci::Bridge/1004",
+                          "name": "downstream",
+                          "kind": "BRIDGE",
+                          "status": "SUCCESS",
+                          "detailedStatus": { "name": "SUCCESS" },
+                          "allowFailure": false,
+                          "startedAt": null,
+                          "finishedAt": null,
+                          "duration": null,
+                          "queuedDuration": null,
+                          "webPath": null,
+                          "retryable": false,
+                          "cancelable": false,
+                          "playable": false,
+                          "manualJob": false,
+                          "downstreamPipeline": {
+                            "id": "gid://gitlab/Ci::Pipeline/5000",
+                            "path": "/team/downstream/-/pipelines/5000",
+                            "detailedStatus": { "name": "SUCCESS" }
+                          }
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "name": "production",
+                    "size": 1,
+                    "detailedStatus": { "name": "MANUAL" },
+                    "jobs": {
+                      "pageInfo": { "hasNextPage": false },
+                      "nodes": [
+                        {
+                          "id": "gid://gitlab/Ci::Build/1005",
+                          "name": "production",
+                          "kind": "BUILD",
+                          "status": "MANUAL",
+                          "detailedStatus": { "name": "MANUAL" },
+                          "allowFailure": true,
+                          "startedAt": null,
+                          "finishedAt": null,
+                          "duration": null,
+                          "queuedDuration": null,
+                          "webPath": "/team/repo/-/jobs/1005",
+                          "retryable": false,
+                          "cancelable": false,
+                          "playable": true,
+                          "manualJob": true,
+                          "downstreamPipeline": null
+                        }
+                      ]
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}

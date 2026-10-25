@@ -2748,6 +2748,99 @@ See [RPC and orchestration](./rpc-and-orchestration.md) and
   most three of them, and stores one `pipeline` display row the merge box and
   the Pipelines tab paint from. See
   [Pull Requests contract boundary](./rpc-and-orchestration.md#pull-requests-contract-boundary).
+- The Pull Requests module's `pipelines` submodule
+  (`pull_requests/pipelines/`, GitLab reads in `pull_requests/gitlab/pipelines.rs`)
+  serves a project's CI pipelines: a list, one pipeline's stages and jobs, one
+  job, and one job's log. It is built on the Pull Requests module's own state
+  rather than beside it: `PullRequestsService::pipelines()` shares its context
+  caches, sign-in state, `HostFences`, snapshot table and the host-wide 429
+  ladder (`pull_requests/backoff.rs`, `HostBackoff`, which the merge request
+  poller also uses). Every unary read stores its display row in
+  `pull_request_snapshots` as `pipelines_list` (first pages only),
+  `pipelines_detail` (capped at 1 MiB) or `pipelines_job`, wrapped with the
+  account login that read it; `pipelines.readSnapshot` paints a row only for
+  the login in the host's stored context, with no `glab` or `gh` call. Every
+  pipelines read, whatever its kind, answers `rate_limited` with no host call
+  while the host's backoff deadline is ahead, and a 429 takes the later of the
+  ladder step and the provider's `Retry-After` or reset header (capped at one
+  hour). Only `not_authenticated` invalidates the shared context and deletes
+  the host's rows; a `forbidden` or `not_found` deletes only the refused
+  resource's rows. GitLab views share one cooperative poller per list key
+  (`pipelines/poll.rs`) inside the `pipelines.subscribe` calls: the first page
+  every 20 s, each subscribed pipeline that is not terminal every 10 s (at most
+  three, 20 s after 30 quiet minutes), never `count`, jobs or logs; a pipeline
+  it cannot read is named once with `refused`, which its views show in place
+  of their copy, and left. Job logs never reach the database:
+  GitLab logs are read in 512,000-byte ranges once a one-byte probe proves the
+  host honors `byte_offset`, and otherwise downloaded whole (90 s, the last
+  16 MiB kept by `OutputPolicy::Tail`) into `LogCache`, server memory keyed by
+  host, account login, project and job (64 MiB, 10 idle minutes swept on every
+  pipelines read, cleared on rescan and sign-out, served only within 30 s of a
+  job read by the same account, and read again once a job whose large running
+  copy it holds is terminal). `readSnapshot` serves both providers. `pipelines.runAction`
+  retries, cancels or plays one pipeline or job: admitted like a read (a
+  backed-off host gets no POST), single flight per target and action, a GitHub
+  `forbidden` remembered in `PipelinesState` per account and action kind until
+  the next rescan (reads then show that permission `denied`, stored rows keep
+  the host's answer), and a successful action re-arms every GitLab poller
+  watching the pipeline. The views run it through `PipelineActions`
+  (`components/pipelines/actions/`), which re-reads the page after every
+  answer and opens a retried GitLab job's new job or a GitHub run's latest
+  attempt. In the web app both modules sit
+  on one shell, `components/repositoryModule/` (`RepositoryModule` with
+  `useRepositoryModuleShell`): it alone resolves the module's setting, the
+  environment connection, the server capability, the checkout (one per
+  project, shared through the Pull Requests store), the worktree catalog and
+  the shared `pullRequests.getContext` read, renders the unavailable,
+  waiting, signed-out and not-yet-supported-provider states, reads the list's
+  first page alongside a pending context, and remounts the module on a
+  checkout or identity change. Each module supplies a descriptor (name,
+  setting, capabilities, copy) and its first-page input; the stored-copy
+  picks (`snapshotDisplay.logic.ts`) and the visible-refresh hook
+  (`useVisibleModuleRefresh`) live there too. The Pipelines list
+  (`/project/$environmentId/$projectId/pipelines`, filters in the URL and
+  remembered per project in `bibcode:pipelines-state:v1`) paints the stored
+  first page, then the live one, follows the GitLab stream while the document
+  is visible, and falls back to the 20 s visible timer. A row opens the
+  pipeline page (`/pipelines/$pipelineId`, `attempt` in the search for a
+  GitHub re-run), served by the same shell with `view: "detail"`: it paints
+  the stored `pipelines_detail` row, then the live `get`, keeps whichever copy
+  has the highest `revision` (`keepNewestCopy`), and subscribes with the list
+  key remembered for the project plus its `pipelineId`, so it shares that
+  list's poller. Its stage columns (`PipelineStageColumns`) are one tree whose
+  layout a container query flips, and job links come from
+  `PipelineLinksProvider`: the pipeline page's `pipelinePageLinks` open each
+  job's in-app job route, and a view without a provider opens the host's job
+  page. The Pull Requests full page wraps its merge request detail in
+  `MergeRequestPipelineLinksProvider` (`components/pipelines/shared/`): while
+  the Pipelines module would open for the environment (its setting, the
+  connection and `pipelinesReads`, through `resolveRepositoryModuleAvailability`),
+  a check that carries `pipelineId` and `jobId` opens its job route and the
+  pipeline summary offers **View pipeline**. The thread side panel's detail
+  has no provider and keeps host links, because it reads the thread's own
+  checkout.
+  The job page
+  (`/project/$environmentId/$projectId/pipelines/$pipelineId/jobs/$jobId`,
+  `?at=` a line's byte offset; `pipelineJobLink` builds its links) paints the
+  stored job and pipeline rows, subscribes with the project's remembered list
+  key and its pipeline, takes the job's status from the polled pipeline row,
+  and re-reads the job once when it turns terminal. Its log
+  (`components/pipelines/log/`, the compound `JobLog`) parses in a Web Worker
+  (`jobLog.worker.ts`, falling back to 64 KiB main-thread slices between
+  frames) that keeps the decoded text, line offsets, SGR styles at each line
+  start, sections and search, and returns per-row layout arrays and the spans
+  of visible rows only; rows are virtualized with a fixed 20 px height while
+  lines do not wrap. `JobLogReader` owns the log's reads (tail or `?at=`, at
+  most three catch-up reads, a 5 s visible-only follow, one final read on the
+  terminal transition, Load earlier up to 16 MiB). Its colors come from the
+  terminal's 16-color palette in `components/terminalTheme.ts`, shared with
+  the live terminal. GitHub's reads live in `pull_requests/github/runs.rs`,
+  behind the same `PipelineHost` trait: one row per workflow run, one "Jobs"
+  stage, artifacts linking to the run's page, and `live_logs() == false`, so a
+  running job's log answers `live_on_host` and the job page shows its steps
+  instead; GitHub views refresh on the visible timer at the cadences in the
+  contract, with no server poller. See
+  [Pipelines contract boundary](./rpc-and-orchestration.md#pipelines-contract-boundary).
 - The right panel (`rightPanelStore`) can show one request per tab, with no new
   server contract. `pullRequest` surfaces (`pullRequest:<number>`, with the
   provider and the selected detail tab) host `PullRequestsDetailView` per

@@ -8,11 +8,11 @@
         "_tag": "Fail",
         "error": {
           "_tag": "PullRequestsOperationError",
-          "operation": "toString",
-          "code": "K",
-          "message": "]iM.5",
+          "operation": "KrXN",
+          "code": ".5yO2",
+          "message": "p%V^MKM|*1",
           "hostDetail": null,
-          "retryable": false
+          "retryable": true
         }
       }
     ]

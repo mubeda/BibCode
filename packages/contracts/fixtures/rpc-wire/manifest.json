@@ -186,6 +186,34 @@
       "mode": "stream"
     },
     {
+      "name": "pipelines.get",
+      "mode": "unary"
+    },
+    {
+      "name": "pipelines.getJob",
+      "mode": "unary"
+    },
+    {
+      "name": "pipelines.getJobLog",
+      "mode": "unary"
+    },
+    {
+      "name": "pipelines.list",
+      "mode": "unary"
+    },
+    {
+      "name": "pipelines.readSnapshot",
+      "mode": "unary"
+    },
+    {
+      "name": "pipelines.runAction",
+      "mode": "unary"
+    },
+    {
+      "name": "pipelines.subscribe",
+      "mode": "stream"
+    },
+    {
       "name": "preview.claimOpenRequest",
       "mode": "unary"
     },
@@ -666,8 +694,8 @@
       "mode": "unary"
     }
   ],
-  "streamMethodCount": 24,
-  "expectedTopLevelStreamShapes": 79,
+  "streamMethodCount": 25,
+  "expectedTopLevelStreamShapes": 80,
   "expectedOrchestrationEventShapes": 27,
   "streamShapeFixtures": [
     "stream-shapes/cloud__installRelayClient-00.json",
@@ -691,6 +719,7 @@
     "stream-shapes/orchestration__subscribeThread-01.json",
     "stream-shapes/orchestration__subscribeThread-02.json",
     "stream-shapes/orchestration__subscribeThread-03.json",
+    "stream-shapes/pipelines__subscribe-00.json",
     "stream-shapes/preview__tunnelOpen-00.json",
     "stream-shapes/preview__tunnelOpen-01.json",
     "stream-shapes/previewAutomation__connect-00.json",
@@ -828,6 +857,12 @@
     "typed-failures/orchestration__getTurnDiff-02.json",
     "typed-failures/orchestration__replayEvents-00.json",
     "typed-failures/orchestration__replayEvents-01.json",
+    "typed-failures/pipelines__get-00.json",
+    "typed-failures/pipelines__getJob-00.json",
+    "typed-failures/pipelines__getJobLog-00.json",
+    "typed-failures/pipelines__list-00.json",
+    "typed-failures/pipelines__readSnapshot-00.json",
+    "typed-failures/pipelines__runAction-00.json",
     "typed-failures/preview__claimOpenRequest-00.json",
     "typed-failures/preview__claimOpenRequest-01.json",
     "typed-failures/preview__close-00.json",
@@ -1212,6 +1247,13 @@
     "stream-shapes/orchestration__subscribeThread-01.json": "c3d819855b7cbf02bb1e3f121ca0828de01cf67ea95b6544c7dbe99ea73c96bb",
     "stream-shapes/orchestration__subscribeThread-02.json": "6ac4ef9b65741ebb735df71336592fa88a8984f5e0e5482e6b29a5f9bc791034",
     "stream-shapes/orchestration__subscribeThread-03.json": "5f6684e70e17189fad3e45c68204b17a6c6e81da6ce4e1747a2e82b1e3696c10",
+    "typed-failures/pipelines__get-00.json": "a9f9612ff52967e25c6ab05867568fc228532b54dd4edfb3492dcdb9ebdef575",
+    "typed-failures/pipelines__getJob-00.json": "a9f9612ff52967e25c6ab05867568fc228532b54dd4edfb3492dcdb9ebdef575",
+    "typed-failures/pipelines__getJobLog-00.json": "a9f9612ff52967e25c6ab05867568fc228532b54dd4edfb3492dcdb9ebdef575",
+    "typed-failures/pipelines__list-00.json": "a9f9612ff52967e25c6ab05867568fc228532b54dd4edfb3492dcdb9ebdef575",
+    "typed-failures/pipelines__readSnapshot-00.json": "a9f9612ff52967e25c6ab05867568fc228532b54dd4edfb3492dcdb9ebdef575",
+    "typed-failures/pipelines__runAction-00.json": "a9f9612ff52967e25c6ab05867568fc228532b54dd4edfb3492dcdb9ebdef575",
+    "stream-shapes/pipelines__subscribe-00.json": "51530f5c1770416f2c520f18f68446db627e2366b88e18c58d9da7955e919c07",
     "typed-failures/preview__claimOpenRequest-00.json": "950333bb892eba89420d696b2674275ebe5de296311ca5d2045b4963fc596274",
     "typed-failures/preview__claimOpenRequest-01.json": "dfe153df675ebc5cf07b6a2d483bfe18346fa23e4bbcd24940828aa1cc404308",
     "typed-failures/preview__close-00.json": "03f3f1e6697067f0a19fa2321737062e040fa739ad861bb62a88e4717581c46f",
@@ -1290,18 +1332,18 @@
     "typed-failures/projects__writeFileIfUnchanged-01.json": "2ce5c89ac988f67153377ac2cfbabd6af7c67391e8d2c36af2304e1d7cd7caa2",
     "typed-failures/projects__writeFileIfUnchanged-02.json": "ac9e7618ae2ed5aeb4271e4133d1ebaff18ee3d9e6341eda7735f34081ca9287",
     "typed-failures/projects__writeFileIfUnchanged-03.json": "f21e4233466694c02754d2a3c0317c089f31f6634947c5fcc16d02c4997c35cf",
-    "typed-failures/pullRequests__checkout-00.json": "098c53625585dbe11bf15d540524631f835dcd46c549ec62b9a068812bda787d",
-    "typed-failures/pullRequests__get-00.json": "098c53625585dbe11bf15d540524631f835dcd46c549ec62b9a068812bda787d",
-    "typed-failures/pullRequests__getChecks-00.json": "098c53625585dbe11bf15d540524631f835dcd46c549ec62b9a068812bda787d",
-    "typed-failures/pullRequests__getCommits-00.json": "098c53625585dbe11bf15d540524631f835dcd46c549ec62b9a068812bda787d",
-    "typed-failures/pullRequests__getContext-00.json": "098c53625585dbe11bf15d540524631f835dcd46c549ec62b9a068812bda787d",
-    "typed-failures/pullRequests__getCreateDefaults-00.json": "098c53625585dbe11bf15d540524631f835dcd46c549ec62b9a068812bda787d",
-    "typed-failures/pullRequests__getFiles-00.json": "098c53625585dbe11bf15d540524631f835dcd46c549ec62b9a068812bda787d",
-    "typed-failures/pullRequests__getTimeline-00.json": "098c53625585dbe11bf15d540524631f835dcd46c549ec62b9a068812bda787d",
-    "typed-failures/pullRequests__getVocabulary-00.json": "098c53625585dbe11bf15d540524631f835dcd46c549ec62b9a068812bda787d",
-    "typed-failures/pullRequests__list-00.json": "098c53625585dbe11bf15d540524631f835dcd46c549ec62b9a068812bda787d",
-    "typed-failures/pullRequests__readSnapshot-00.json": "098c53625585dbe11bf15d540524631f835dcd46c549ec62b9a068812bda787d",
-    "typed-failures/pullRequests__runAction-00.json": "098c53625585dbe11bf15d540524631f835dcd46c549ec62b9a068812bda787d",
+    "typed-failures/pullRequests__checkout-00.json": "a9f9612ff52967e25c6ab05867568fc228532b54dd4edfb3492dcdb9ebdef575",
+    "typed-failures/pullRequests__get-00.json": "a9f9612ff52967e25c6ab05867568fc228532b54dd4edfb3492dcdb9ebdef575",
+    "typed-failures/pullRequests__getChecks-00.json": "a9f9612ff52967e25c6ab05867568fc228532b54dd4edfb3492dcdb9ebdef575",
+    "typed-failures/pullRequests__getCommits-00.json": "a9f9612ff52967e25c6ab05867568fc228532b54dd4edfb3492dcdb9ebdef575",
+    "typed-failures/pullRequests__getContext-00.json": "a9f9612ff52967e25c6ab05867568fc228532b54dd4edfb3492dcdb9ebdef575",
+    "typed-failures/pullRequests__getCreateDefaults-00.json": "a9f9612ff52967e25c6ab05867568fc228532b54dd4edfb3492dcdb9ebdef575",
+    "typed-failures/pullRequests__getFiles-00.json": "a9f9612ff52967e25c6ab05867568fc228532b54dd4edfb3492dcdb9ebdef575",
+    "typed-failures/pullRequests__getTimeline-00.json": "a9f9612ff52967e25c6ab05867568fc228532b54dd4edfb3492dcdb9ebdef575",
+    "typed-failures/pullRequests__getVocabulary-00.json": "a9f9612ff52967e25c6ab05867568fc228532b54dd4edfb3492dcdb9ebdef575",
+    "typed-failures/pullRequests__list-00.json": "a9f9612ff52967e25c6ab05867568fc228532b54dd4edfb3492dcdb9ebdef575",
+    "typed-failures/pullRequests__readSnapshot-00.json": "a9f9612ff52967e25c6ab05867568fc228532b54dd4edfb3492dcdb9ebdef575",
+    "typed-failures/pullRequests__runAction-00.json": "a9f9612ff52967e25c6ab05867568fc228532b54dd4edfb3492dcdb9ebdef575",
     "stream-shapes/pullRequests__subscribe-00.json": "06f116c370ee3406a1edf43b0b58b5307e2b9e7cf691f6a07b1e92c10499ff18",
     "typed-failures/review__getDiffPreview-00.json": "11811c00357ffad6d4b25637578236c5c8a299618ba31396e0e5413507070f45",
     "typed-failures/review__getDiffPreview-01.json": "2ce5c89ac988f67153377ac2cfbabd6af7c67391e8d2c36af2304e1d7cd7caa2",
@@ -1388,12 +1430,12 @@
     "stream-shapes/subscribePreviewEvents-04.json": "0e8bac1a898590398b306a6611fd4676d2c1d122d5029999c62a462fdf938ea5",
     "stream-shapes/subscribePreviewEvents-05.json": "e90b7e4ce2b85d04010ece2f05878ca18fcfc97a7e00e6675717aea37f63da1c",
     "stream-shapes/subscribeProjectEntries-00.json": "fb0eccee51b5c2656e762ae9e52783c5c9a78ef4b3f7c46a9a1dcdfa609c8670",
-    "stream-shapes/subscribeServerConfig-00.json": "2d3b78052bdac22099b1351e8a9fa825e89c70d29d00c87e8234d384943a1242",
+    "stream-shapes/subscribeServerConfig-00.json": "5917da6fd49a3c6d4833f6b58240505dfb425b208c6fad3434b73ed389de25de",
     "stream-shapes/subscribeServerConfig-01.json": "cf4979d2d52440102cf23f92653caeb3570e2df19a7b5a68bcb6602e06a33120",
     "stream-shapes/subscribeServerConfig-02.json": "2005009f8a5fa67a57b693b663b2d4b015c59bfd2b098035ee8a0f54d7e69464",
     "stream-shapes/subscribeServerConfig-03.json": "44a3dddf17f52f741d1de921f509d0f7ef335b71fc24bfb5ceb34ea581aa5bd6",
-    "stream-shapes/subscribeServerLifecycle-00.json": "2d948ca6f5b0304b85b5d2e43f149ee39489fdac4d8557712405fbdb27dc3f50",
-    "stream-shapes/subscribeServerLifecycle-01.json": "35868bb0363a6b3cc5148ade9d129052c046ab4552f0544cc02e1ce57fd1001f",
+    "stream-shapes/subscribeServerLifecycle-00.json": "74286ed233a27e84a2b1ee0a0734d6ccc593537c71b9a1dc7d88e80dada25fb9",
+    "stream-shapes/subscribeServerLifecycle-01.json": "0131ed04de16e4cd9cdb277bdf6d930c3f47c792f46368b368f9a638ca5efa17",
     "stream-shapes/subscribeTerminalEvents-00.json": "a33bc3be33b80b3bade2e3e4e7f6f25f2ca7c9ba87dd3ea9a781b4f3cb5bea82",
     "stream-shapes/subscribeTerminalEvents-01.json": "c65433f5ba3ebe8e6f7017398c99dff865f351e8c3b9708f4be20b73f8bdff81",
     "stream-shapes/subscribeTerminalEvents-02.json": "e00813631aca2b627480406ffac3369f82397ae64f4044f02f16e263e248cec4",
@@ -1614,6 +1656,7 @@
     "stream-shapes/orchestration__subscribeThread-01.json",
     "stream-shapes/orchestration__subscribeThread-02.json",
     "stream-shapes/orchestration__subscribeThread-03.json",
+    "stream-shapes/pipelines__subscribe-00.json",
     "stream-shapes/previewAutomation__connect-00.json",
     "stream-shapes/previewAutomation__connect-01.json",
     "stream-shapes/preview__tunnelOpen-00.json",
@@ -1749,6 +1792,12 @@
     "typed-failures/orchestration__getTurnDiff-02.json",
     "typed-failures/orchestration__replayEvents-00.json",
     "typed-failures/orchestration__replayEvents-01.json",
+    "typed-failures/pipelines__get-00.json",
+    "typed-failures/pipelines__getJob-00.json",
+    "typed-failures/pipelines__getJobLog-00.json",
+    "typed-failures/pipelines__list-00.json",
+    "typed-failures/pipelines__readSnapshot-00.json",
+    "typed-failures/pipelines__runAction-00.json",
     "typed-failures/previewAutomation__focusHost-00.json",
     "typed-failures/previewAutomation__focusHost-01.json",
     "typed-failures/previewAutomation__respond-00.json",

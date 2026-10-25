@@ -1126,7 +1126,12 @@ took before its first host call). It also keeps the newest pipeline copy it
 has shown for the merge request, so a tab switch, which re-keys the snapshot
 read, or a failed snapshot read never moves the merge box or the Pipelines tab
 back. It answers the other names with the unary reads, and `checks` without
-`pipeline` with `getChecks`. A number past the three-number pipeline read cap
+`pipeline` with `getChecks`. A check (in `getChecks` and in the `pipeline`
+row's job groups) may carry `pipelineId` and `jobId`, together or not at all:
+the Pipelines job route's ids, set only for a job of this project whose job
+page can read it (a GitLab build job under the project's web URL, a GitHub
+Actions job page on this repository). Older servers and stored rows omit
+them, and the client then keeps the host link. A number past the three-number pipeline read cap
 gets `pipeline` rows with the header only (`checks: null`); on the Pipelines
 tab such a row, arriving after a `pipeline` name, is answered with one
 `getChecks` per row revision, so the job list follows the header. A row that
@@ -1588,6 +1593,228 @@ reads are added to list filtering. Filtered result totals remain unknown while t
 remain available. GitLab version gates close when the version cannot be read;
 the wire context exposes a null version, and internal context retains the
 reason for permission computation. No host data or CLI stderr is logged.
+
+## Pipelines contract boundary
+
+`packages/contracts/src/pipelines.ts` defines a project's CI pipelines: list
+rows, a pipeline's stages, groups and jobs, a job, and byte windows of a job
+log. It reuses `PullRequestsPipelineStatus`, `PullRequestsPipelineStage`,
+`PullRequestsActor` and `PullRequestsOperationError`, whose optional
+`retryAfterSeconds` carries the host's backoff deadline on `rate_limited`
+answers. Route identifiers are the host's global ids (GitLab pipeline and job
+`id`, GitHub run and job `id`); `iid` and `run_number` are display only. The
+context read stays `pullRequests.getContext`, so both modules share one
+provider context, sign-in state and unavailable copy.
+
+| Method                   | Required scope          | Responsibility                                                                   |
+| ------------------------ | ----------------------- | -------------------------------------------------------------------------------- |
+| `pipelines.list`         | `orchestration:read`    | Page the project's pipelines for a scope (`all`, `running`, `finished`) and ref. |
+| `pipelines.get`          | `orchestration:read`    | Read one pipeline's header, stages, groups and jobs.                             |
+| `pipelines.getJob`       | `orchestration:read`    | Read one job: runner, tags, artifacts, log size, erasure.                        |
+| `pipelines.getJobLog`    | `orchestration:read`    | Read a window of a job log by byte offset (`tail`, `offset`, `before`).          |
+| `pipelines.readSnapshot` | `orchestration:read`    | Return the stored list, pipeline and job rows with no host call.                 |
+| `pipelines.subscribe`    | `orchestration:read`    | Stream (GitLab): name what the cooperative poller stored.                        |
+| `pipelines.runAction`    | `orchestration:operate` | Retry, retry the failed jobs of, cancel, or play one pipeline or job.            |
+
+`capabilities.pipelinesReads` is advertised only by a server that registers all
+six reads, and `pipelinesMutations` only by one that registers
+`pipelines.runAction`; a test ties each flag to its registered methods. Both
+decode as false from older servers. Every read
+carries the checkout's `cwd` and a `refresh` kind (`user`, `follow` for log
+catch-up, `timer`); ids are positive and range-checked to a JavaScript
+`Number` before any read.
+
+Every list page, pipeline and job answer carries `revision`, the generation
+stamp taken before its host read, equal to its stored row's generation, so
+the clients' `shownCopy` and `keepNewestCopy` pick between live, stored and
+polled copies unchanged. Successful unary reads store the display rows
+(`pipelines_list` for first pages only, `pipelines_detail` up to 1 MiB,
+`pipelines_job`) with the account login that read them; `readSnapshot` paints
+a row only for the login of the host's stored context row, on both providers.
+Log text is never stored. Every read checks the host-wide backoff deadline
+first and answers `rate_limited` without a host call while it is ahead; a 429
+backs off every merge request and pipelines reader of the host for the later
+of the ladder step (60, 120, 300 s) and the provider's `Retry-After` or reset
+header, capped at one hour. A list's `count` (at most 1,000) is read on a
+first page's `user` read, and otherwise reused for 5 minutes.
+`not_authenticated` invalidates the shared context and deletes the host's
+rows; a `forbidden` or `not_found` is about the resource that refused and
+deletes only its rows (that list key, pipeline or job), leaving the Pull
+Requests context and snapshots in place.
+
+`pipelines.subscribe` runs only for GitLab and only with a database; GitHub
+answers `unavailable`. Its first event is all false. One cooperative poller
+per (host, project, list key) runs inside the subscribe calls that share it: it
+reads the first page every 20 s and each subscribed pipeline that is not
+terminal every 10 s (at most three per key in join order; 20 s after 30
+minutes without a change), stores the rows that changed, and names them
+(`list`, `pipeline`) as cumulative revisions per subscriber, so a full stream
+or a lagged receiver catches up on the next event and a joining subscriber is
+not sent the rows it painted. It never reads `count`, jobs or logs; a pipeline
+whose stored row is already terminal is not read, and one seen terminal is
+read once more and then left. A `forbidden` or `not_found` on one pipeline
+deletes its rows, names it once with `refused` (`forbidden` or `not_found`;
+absent on every other event and from older servers), so its pipeline and job
+views replace the copy on screen with the refusal without a host read, and
+stops reading it; a subscriber that joins later is told too. A refused list
+or a lost sign-in ends the key's subscriptions.
+
+Logs are byte windows whose offsets always fall on character starts. On a
+GitLab host a one-byte `byte_offset=1&byte_limit=1` probe, sent after the
+first whole download of at least two bytes, proves whether ranges are
+honored; until it answers, logs are downloaded whole. A proved host reads
+512,000-byte windows: a finished log opens on its last window (from the
+archived trace's size), a running one from the start, and a `follow` read
+that still fills its window at or past 2,048,000 bytes answers
+`unavailable: too_large_live`. Followers of one running log share its last
+tail for 4 s. A whole download keeps the last 16 MiB (`truncatedHead`) in
+server memory (`LogCache`) and serves 1 MiB windows from the end, with
+absolute `firstLine` when nothing was dropped. A running log of 2 MiB or more
+is not downloaded again until its job is terminal, when the unfinished copy is
+dropped and the finished log read. Every pipelines read sweeps the cache:
+logs idle for 10 minutes and tails past their 4 s are released whichever job
+the read is for. The module runs no background task, so a server that serves
+no pipelines read keeps its last logs until the next one, a rescan or a
+sign-out. A trace 404 is told apart by a
+job read: `not_started` for a job that is not terminal, `erased`, `no_output`,
+or `not_found` only when the job itself is missing.
+
+GitHub serves Actions as pipelines (`pull_requests/github/runs.rs`): one row
+per workflow run, labeled "`<workflow>` #`<run_number>`", the cursor an opaque
+page number of 20 runs. A list filtered by ref or state stops at GitHub's
+1,000 results (`total.capped`, no cursor past them); a first page's `user`
+read also returns the repository's workflows for the Workflow filter, which
+the server reuses for the reads that skip them. A 404 on the run list names
+both causes GitHub cannot tell apart (Actions turned off, or a sign-in that may
+not read Actions). Statuses map from `status` and `conclusion` with their own
+`terminal` flag, so `completed` + `action_required` is a `manual` row that no
+timer reads again, and `neutral` and `stale` are `skipped` with a `reason`.
+A pipeline reads the run (or `attempts/:n` for an earlier attempt), its jobs
+in pages of 100 (the rest concurrently, at most ten pages, `truncated` past
+1,000) and its artifacts, all in one `get`; its jobs sit in one stage, and
+artifacts link to the run's page, never to `archive_download_url`. GitHub
+permissions are `unknown` from repository write and `denied` below it; jobs
+have no cancel or play. A job's log is served only once the job completes,
+through the whole-download path (a 410 is `expired`); a running job's
+`getJobLog` answers `unavailable: live_on_host` with no download.
+
+The client (`@bibcode/client-runtime/state/pipelines`) mirrors the Pull
+Requests atoms: `list`, `get` and `getJob` are fresh for 5 s and kept 5 minutes
+after their last subscriber; `getJobLog`, `readSnapshot` and `subscribe` keep
+nothing. Views key every read with `refresh: "user"`; a visible-refresh timer
+marks the next execution of that same atom as `timer` (`requestTimerRead`),
+so a timer read reuses the list's total without a second cache entry. The
+context is the Pull Requests `getContext` family itself, so moving between the
+two modules on one checkout costs no context read within the client's 60 s.
+A list route reads its default first page alongside a pending context and
+paints the stored first page from `readSnapshot`, then the live page;
+`shownCopy` picks between them by `observedAt`, and on GitHub a stored copy
+arriving after the live page is ignored. A GitLab list subscribes with its
+list key (`pipelineId: null`) only while the document is visible; the first
+event, all false, stands the client's 20 s timer down until the stream fails
+or waits, and a `list` name re-reads `readSnapshot` only, keeping loaded later
+pages. GitHub has no stream: its timer re-reads the first page every 20 s
+only while a shown pipeline is not `terminal`. A `rate_limited` answer shows
+the server's `retryAfterSeconds` as a countdown, disables Refresh and Retry
+until it ends, then reads once as a timer read. A row hovered 150 ms prefetches
+its `get`, at most two per environment and not again within 5 s. On GitHub the
+toolbar's Workflow select comes from the first page's `workflows`, kept while
+another filter's page loads.
+
+A pipeline route reads `get` with the exact input the hover prefetched
+(`attempt: null` for the latest attempt, `refresh: "user"`), so an open within
+5 s of that prefetch shows its answer without a second read. Its
+`readSnapshot` and `subscribe` input is the list key remembered for the
+project (the list's filters, first page) plus `pipelineId` and `attempt`, so
+a pipeline page and its list share one poller. The page shows the copy with
+the highest `revision` across the live `get` and the stored detail, keeping
+it per pipeline (`keepNewestCopy`), so a slower unary answer never replaces a
+newer poller row. A `pipeline` name re-reads `readSnapshot` only, never `get`.
+GitHub, and GitLab while its stream is not live, re-read `get` on the visible
+timer while the shown pipeline is not `terminal`: every 10 s on GitLab, and
+every 10 s per 100 jobs (at most ten pages) on GitHub, doubled after 30
+minutes without a status change. The read that sees the pipeline turn
+`terminal` is the last. A `forbidden` or `not_found` answer stays on the page
+("You can't view this pipeline." with the host link, "This pipeline no longer
+exists." with Back to pipelines) and never reaches the shared sign-in state;
+only `not_authenticated` asks the shell to read the context again. On GitHub
+a run with more than one attempt shows an Attempt select: the latest page
+takes the count from its own copy, and an earlier attempt's page reads the
+latest attempt's stored row (`readSnapshot` with `attempt: null`, no host
+call) to name it, or offers "Latest attempt" without it.
+
+A job page reads `getJob` and its pipeline's `get` once on open, paints the
+stored `pipelines_job` and `pipelines_detail` rows from one `readSnapshot`,
+and on GitLab subscribes with the project's remembered list key plus
+`pipelineId` and `jobId`, so it shares the list's poller; a `pipeline` name
+re-reads `readSnapshot` only. The job's status and permissions come from the
+newest pipeline copy by `revision`; while the stream is down a running
+pipeline is re-read every 10 s on the visible timer, and `getJob` is read
+again only once, when the job turns terminal. `getJobLog` is a one-shot
+command, never an atom: the log's worker owns the text. Opening reads the
+`tail` (a line link's `offset` instead), then, while a running job's answer
+fills its window, at most three `offset` reads at `nextOffset` with
+`refresh: "follow"`; a running job is then followed with one `follow` read
+5 s after the last one settles, only while the document is visible; a
+`not_started` answer re-reads the tail on the same cadence. `too_large_live`
+keeps the loaded head and reads nothing until the job is terminal, when the
+tail is read once; a followed job that finishes gets one final read and then
+none. Load earlier reads `before` the loaded start with `refresh: "user"`
+until the view holds 16 MiB or a window brings nothing earlier.
+
+A GitHub job page has no stream. While the job runs its log source is
+`unavailable: live_on_host` (`not_started` before it starts), so it reads no
+log and shows the job's steps in the log's place; `getJob` is re-read every
+10 s for the steps, and `get` every 30 s per page of jobs, while the document
+is visible and only while the job itself runs. A job read newer by
+`revision` than the pipeline copy gives the job's status (the pipeline copy
+keeps its permissions). Once the job is terminal the log is read once under
+the job's own `attempt` (from `getJob`, which the page waits for), and a step
+jumps to the first log line stamped at or after its start.
+
+`pipelines.runAction` takes `{ cwd, target, action }`: a `pipeline` or `job`
+target by its host id and one of `retry`, `retry_failed`, `cancel` or `play`.
+GitLab posts `pipelines/:id/retry|cancel` (its pipeline retry already retries
+the failed jobs, so `retry_failed` is the same call) or `jobs/:id/retry|cancel|play`
+and answers with the host's ids: a retried job is a new one, so `jobId` names
+it. GitHub posts `actions/runs/:id/rerun|rerun-failed-jobs|cancel` or
+`actions/jobs/:id/rerun` and answers `{ pipelineId: <run>, jobId: null }` (a
+job re-run, `{ null, null }`), since its re-run is the run's next attempt; a
+GitHub job is never canceled or played alone, and neither host plays a
+pipeline. An unsupported pair answers `unavailable` before any host call. The
+action is admitted as a read is, so a backed-off host gets no POST, and it is
+single flight per (host, project, target, action): a second identical request
+while one is in flight shares its answer. A settled action keeps its answer
+past its 60 s budget. A `forbidden` keeps the shared context and every stored
+row. On GitHub, whose permission is only `unknown` from repository write, it
+is remembered in server memory per (host, account login, project, action
+kind: retry, cancel, play) until the next rescan or sign-out: the next
+request of that kind answers `forbidden` with no host call, and every `list`,
+`get`, `getJob` and `readSnapshot` answer shows that permission `denied`
+while the stored rows keep the host's own answer. GitLab reports its
+permissions on every read and also answers 403 for a job whose state moved
+on, so its refusal is shown, not remembered, and "Job is not retryable" or
+"not playable" is `host_rejected` with copy to refresh. A GitHub 409 or a 403
+for a run that is still running is `host_rejected` with its copy; a 429 backs
+off the host's ladder as a read's does; `not_found` deletes the
+target's rows; `not_authenticated` invalidates the shared context. A
+successful action on a pipeline, or on a job whose pipeline GitLab named,
+makes every GitLab poller of the project that watches it read it again, even
+one it had left as terminal.
+
+The views run actions through `PipelineActions` (`components/pipelines/actions/`),
+a provider per list, pipeline and job page over the `runAction` command on the
+shared VCS scheduler. A button spins from the click until the page's next copy
+lands (its `revision` grows) or 15 s pass, and a second click on the same
+action sends nothing. Every answer re-reads the page (`list` first page and
+the page the row is on, `get`, or `getJob` and `get`), so a remembered refusal
+shows at the button; a failure is also a toast with the server's copy. A
+GitLab job retry opens the new job's page; a GitHub re-run from an earlier
+attempt or from a job page opens the run's latest attempt. A GitHub cancel
+(202) shows `canceling` until the run's own status moves on. On GitHub a
+`denied` permission with repository write or higher is GitHub's refusal and
+says so ("GitHub refused: … A fine-grained token needs Actions write.");
+below write it names the missing role.
 
 ## Worktree catalog flow
 

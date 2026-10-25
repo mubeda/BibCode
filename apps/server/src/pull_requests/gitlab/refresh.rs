@@ -510,6 +510,8 @@ mod tests {
                             started_at: None,
                             completed_at: None,
                             duration_seconds: duration,
+                            pipeline_id: None,
+                            job_id: None,
                         }],
                     }],
                     summary: CheckSummary::Pending,

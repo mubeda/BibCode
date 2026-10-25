@@ -104,12 +104,39 @@ pub(super) fn web_origin(web_url: &str) -> Option<&str> {
 
 /// A host-relative path (`/group/project/-/jobs/1`) on the project's origin.
 /// Anything that is not a plain absolute path is dropped, not followed.
-fn host_link(origin: Option<&str>, path: &Value) -> Option<String> {
+pub(super) fn host_link(origin: Option<&str>, path: &Value) -> Option<String> {
     let path = path.as_str()?;
     if !path.starts_with('/') || path.starts_with("//") || path.contains(['\\', '\n', '\r']) {
         return None;
     }
     origin.map(|origin| format!("{origin}{path}"))
+}
+
+/// The Pipelines route ids of a job, when `url` is this project's own job page
+/// (`<project>/-/jobs/<job>`). A job of another project, such as a fork's
+/// pipeline, and a trigger job keep linking out: the job page reads this
+/// project's jobs only.
+fn project_job(
+    project_web_url: Option<&str>,
+    url: Option<&str>,
+    pipeline: Option<u64>,
+    job: Option<u64>,
+) -> (Option<u64>, Option<u64>) {
+    use crate::pull_requests::read::route_id;
+    let (Some(project), Some(url), Some(pipeline), Some(job)) = (
+        project_web_url,
+        url,
+        pipeline.and_then(route_id),
+        job.and_then(route_id),
+    ) else {
+        return (None, None);
+    };
+    let page = format!("{}/-/jobs/{job}", project.trim_end_matches('/'));
+    if url.eq_ignore_ascii_case(&page) && web_origin(project).is_some() {
+        (Some(pipeline), Some(job))
+    } else {
+        (None, None)
+    }
 }
 
 /// The REST `head_pipeline` header. The key is exposed only to an account
@@ -224,19 +251,29 @@ pub(super) fn pipeline_graph(
                 Some(PipelineStatus::Skipped | PipelineStatus::Manual) => CheckState::Skipped,
                 _ => CheckState::Pending,
             };
+            let url = host_link(origin, &job["downstreamPipeline"]["path"])
+                .or_else(|| host_link(origin, &job["webPath"]));
+            // Only a build job has a job page; a trigger job (`Ci::Bridge`) links
+            // its downstream pipeline.
+            let build = graphql_id(job, "Ci::Build", operation)
+                .ok()
+                .and_then(|id| read::parse_route_id(&id));
+            let (pipeline_id, job_id) =
+                project_job(project_web_url, url.as_deref(), Some(id), build);
             rows.push((
                 name.clone(),
                 Check {
                     name: string(job, "name", operation)?,
                     state,
-                    url: host_link(origin, &job["downstreamPipeline"]["path"])
-                        .or_else(|| host_link(origin, &job["webPath"])),
+                    url,
                     duration_seconds: job["duration"]
                         .as_f64()
                         .filter(|seconds| *seconds >= 0.0)
                         .or_else(|| read::duration(started_at.as_deref(), completed_at.as_deref())),
                     started_at,
                     completed_at,
+                    pipeline_id,
+                    job_id,
                 },
             ));
         }
@@ -1256,7 +1293,11 @@ pub(super) fn commits(v: &Value) -> Result<Commits, PullRequestsOperationError> 
     Ok(Commits { commits })
 }
 
-pub(super) fn checks(v: &Value, pipeline: &Value) -> Result<Checks, PullRequestsOperationError> {
+pub(super) fn checks(
+    v: &Value,
+    pipeline: &Value,
+    project_web_url: Option<&str>,
+) -> Result<Checks, PullRequestsOperationError> {
     use crate::pull_requests::read;
     let op = "pullRequests.getChecks";
     let values = v.as_array().ok_or_else(|| invalid(op))?;
@@ -1276,15 +1317,24 @@ pub(super) fn checks(v: &Value, pipeline: &Value) -> Result<Checks, PullRequests
                 Some("skipped" | "manual") => CheckState::Skipped,
                 _ => CheckState::Pending,
             };
+            let url = optional(v, "web_url");
+            let (pipeline_id, job_id) = project_job(
+                project_web_url,
+                url.as_deref(),
+                pipeline["id"].as_u64(),
+                v["id"].as_u64(),
+            );
             Ok((
                 optional(v, "stage").unwrap_or_else(|| "Jobs".into()),
                 Check {
                     name: string(v, "name", op)?,
                     state,
-                    url: optional(v, "web_url"),
+                    url,
                     started_at,
                     completed_at,
                     duration_seconds,
+                    pipeline_id,
+                    job_id,
                 },
             ))
         })
@@ -1725,6 +1775,111 @@ mod pipeline_tests {
         assert_eq!(
             checks.pipeline_url.as_deref(),
             Some("https://gitlab.example/team/repo/-/pipelines/4821")
+        );
+    }
+
+    #[test]
+    fn a_build_job_of_this_project_carries_its_route_ids_and_others_link_out() {
+        let built = |id: &str, path: &str| {
+            let mut job = job("unit", "SUCCESS");
+            job["id"] = json!(id);
+            job["webPath"] = json!(path);
+            job
+        };
+        let mut trigger = built("gid://gitlab/Ci::Bridge/7", "/team/repo/-/jobs/7");
+        trigger["downstreamPipeline"] = json!({"path": "/team/other/-/pipelines/77"});
+        let mut unnamed = job("unnamed", "SUCCESS");
+        unnamed["webPath"] = json!("/team/repo/-/jobs/12");
+        let value = graph_response(json!({"nodes": [
+            stage("test", "success", "SUCCESS", vec![
+                built("gid://gitlab/Ci::Build/998", "/team/repo/-/jobs/998"),
+                trigger,
+                // A fork's pipeline: the job page reads this project's jobs only.
+                built("gid://gitlab/Ci::Build/999", "/fork/repo/-/jobs/999"),
+                // The id and the link disagree.
+                built("gid://gitlab/Ci::Build/1000", "/team/repo/-/jobs/1001"),
+                unnamed,
+            ], false),
+        ]}));
+        let ids = |web_url| {
+            pipeline_graph(&value, web_url, "op")
+                .unwrap()
+                .unwrap()
+                .checks
+                .unwrap()
+                .groups[0]
+                .checks
+                .iter()
+                .map(|check| (check.pipeline_id, check.job_id))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            ids(Some(WEB_URL)),
+            [
+                (Some(4821), Some(998)),
+                (None, None),
+                (None, None),
+                (None, None),
+                (None, None),
+            ]
+        );
+        assert!(
+            ids(None).iter().all(|ids| *ids == (None, None)),
+            "without the project's web URL nothing is known to be this project's"
+        );
+    }
+
+    #[test]
+    fn the_rest_fallback_carries_route_ids_for_this_projects_jobs() {
+        let jobs = json!([
+            {"id": 31, "name": "compile", "stage": "build", "status": "success",
+             "web_url": "https://gitlab.example/team/repo/-/jobs/31"},
+            {"id": 32, "name": "fork", "stage": "build", "status": "success",
+             "web_url": "https://gitlab.example/fork/repo/-/jobs/32"},
+            {"name": "unnamed", "stage": "build", "status": "success",
+             "web_url": "https://gitlab.example/team/repo/-/jobs/33"},
+        ]);
+        let pipeline =
+            json!({"id": 9, "web_url": "https://gitlab.example/team/repo/-/pipelines/9"});
+        let ids = |pipeline: &Value, web_url| {
+            checks(&jobs, pipeline, web_url).unwrap().groups[0]
+                .checks
+                .iter()
+                .map(|check| (check.pipeline_id, check.job_id))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            ids(&pipeline, Some(WEB_URL)),
+            [(Some(9), Some(31)), (None, None), (None, None)]
+        );
+        assert!(
+            ids(&json!({}), Some(WEB_URL))
+                .iter()
+                .all(|ids| *ids == (None, None)),
+            "a job page needs its pipeline's id"
+        );
+        assert!(ids(&pipeline, None).iter().all(|ids| *ids == (None, None)));
+    }
+
+    #[test]
+    fn a_stored_check_without_route_ids_still_reads_and_writes_none() {
+        let check: Check = serde_json::from_value(json!({
+            "name": "unit", "state": "success", "url": null,
+            "startedAt": null, "completedAt": null, "durationSeconds": null,
+        }))
+        .unwrap();
+        assert_eq!((check.pipeline_id, check.job_id), (None, None));
+        let written = serde_json::to_value(&check).unwrap();
+        assert!(written.get("jobId").is_none() && written.get("pipelineId").is_none());
+        let linked = Check {
+            pipeline_id: Some(9),
+            job_id: Some(31),
+            ..check
+        };
+        assert_eq!(
+            serde_json::to_value(&linked).unwrap()["jobId"],
+            json!(31),
+            "the wire names are the contract's"
         );
     }
 

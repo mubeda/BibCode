@@ -20,6 +20,10 @@ describe("visibleRefreshDelay", () => {
   it("is due immediately once the period has elapsed", () => {
     expect(visibleRefreshDelay(true, 0, VISIBLE_REFRESH_MS)).toBe(0);
   });
+
+  it("waits a given interval from the last success", () => {
+    expect(visibleRefreshDelay(true, 1_000, 2_000, 10_000)).toBe(9_000);
+  });
 });
 
 describe("shouldRefreshOnShow", () => {

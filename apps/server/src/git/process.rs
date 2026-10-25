@@ -14,8 +14,11 @@ const TRUNCATION_MARKER: &str = "\n\n[truncated]";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OutputPolicy {
+    /// Keeps the head of an oversized stream.
     Truncate,
     Error,
+    /// Keeps the last `max_output_bytes` of an oversized stream (job logs).
+    Tail,
 }
 
 #[derive(Clone, Debug)]
@@ -49,6 +52,8 @@ pub struct ProcessBytesOutput {
     pub stderr: Vec<u8>,
     pub stdout_truncated: bool,
     pub stderr_truncated: bool,
+    /// Bytes of stdout the output policy dropped (the head, under `Tail`).
+    pub stdout_dropped_bytes: usize,
 }
 
 #[derive(Debug, Error)]
@@ -266,6 +271,7 @@ impl ProcessRunner {
         let stderr_length = output.stderr.observed_bytes;
         let stdout_truncated = output.stdout.truncated();
         let stderr_truncated = output.stderr.truncated();
+        let stdout_dropped_bytes = output.stdout.observed_bytes - output.stdout.bytes.len();
         let stdout = render_bytes(output.stdout, request.append_truncation_marker);
         let stderr = render_bytes(output.stderr, request.append_truncation_marker);
         if exit_code != 0 && !request.allow_non_zero_exit {
@@ -284,6 +290,7 @@ impl ProcessRunner {
             stderr,
             stdout_truncated,
             stderr_truncated,
+            stdout_dropped_bytes,
         })
     }
 
@@ -446,6 +453,7 @@ fn supervised_request(request: &ProcessRequest, command: Command) -> SupervisedR
         overflow: match request.output_policy {
             OutputPolicy::Truncate => SupervisedOverflow::Truncate,
             OutputPolicy::Error => SupervisedOverflow::Error,
+            OutputPolicy::Tail => SupervisedOverflow::Tail,
         },
     }
 }
@@ -677,6 +685,32 @@ mod tests {
         let (left, right) = tokio::join!(run("left"), run("right"));
         assert_eq!(left.stdout, "left");
         assert_eq!(right.stdout, "right");
+    }
+
+    /// `Tail` keeps the end of an oversized stream and says how much of its
+    /// head was dropped, instead of failing the read.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_tail_policy_keeps_the_last_bytes_and_reports_the_dropped_head() {
+        let sandbox = TestSandbox::new("git-tail-policy");
+        let script = sandbox.executable_script(
+            "long-log",
+            "i=0; while [ $i -lt 300 ]; do printf 'line %04d\\n' $i; i=$((i+1)); done",
+            "",
+        );
+        let mut request = fixture_request(&sandbox, "fixture-tail", script);
+        request.output_policy = OutputPolicy::Tail;
+        request.max_output_bytes = 100;
+        let output = ProcessRunner
+            .run_bytes(request, &CancellationToken::new())
+            .await
+            .expect("an oversized tail read completes");
+        // 300 lines of 10 bytes: the last 10 lines survive.
+        assert_eq!(output.stdout.len(), 100);
+        assert!(output.stdout.starts_with(b"line 0290\n"));
+        assert!(output.stdout.ends_with(b"line 0299\n"));
+        assert!(output.stdout_truncated);
+        assert_eq!(output.stdout_dropped_bytes, 2_900);
     }
 
     #[cfg(unix)]

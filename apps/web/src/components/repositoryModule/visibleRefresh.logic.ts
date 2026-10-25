@@ -5,9 +5,10 @@ export function visibleRefreshDelay(
   visible: boolean,
   lastSuccessAt: number | null,
   now: number,
+  intervalMs: number = VISIBLE_REFRESH_MS,
 ): number | null {
   if (!visible || lastSuccessAt === null) return null;
-  return Math.max(0, lastSuccessAt + VISIBLE_REFRESH_MS - now);
+  return Math.max(0, lastSuccessAt + intervalMs - now);
 }
 
 export function shouldRefreshOnShow(lastSuccessAt: number | null, now: number): boolean {

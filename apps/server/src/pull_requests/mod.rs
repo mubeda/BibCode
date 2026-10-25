@@ -1,6 +1,7 @@
 //! Repository-scoped hosted pull request reads and operations.
 
 mod action;
+pub(crate) mod backoff;
 mod cache;
 pub mod checkout;
 pub mod context;
@@ -10,6 +11,7 @@ pub mod gitlab;
 pub mod host;
 pub mod model;
 pub mod permissions;
+pub mod pipelines;
 mod read;
 pub(crate) mod snapshot_store;
 
@@ -64,6 +66,9 @@ pub struct PullRequestsService {
     /// logout is not stored, even for a repository with no row yet.
     pollers: Arc<gitlab::poll::Registry>,
     hosts_restored: Arc<tokio::sync::OnceCell<()>>,
+    /// The Pipelines module's server memory: its log cache, its pollers and
+    /// its reused list counts, cleared with the contexts on rescan.
+    pipelines: Arc<pipelines::PipelinesState>,
 }
 
 /// The stored context row's kind; its key is empty.
@@ -85,6 +90,7 @@ impl PullRequestsService {
         Self {
             database: self.database,
             pollers: self.pollers,
+            pipelines: self.pipelines,
             ..Self::with_runner(
                 self.runner
                     .as_ref()
@@ -106,6 +112,7 @@ impl PullRequestsService {
             database: None,
             pollers: Arc::default(),
             hosts_restored: Arc::default(),
+            pipelines: Arc::default(),
         }
     }
 
@@ -962,6 +969,9 @@ impl PullRequestsService {
         self.runner.clear_context_probes();
         self.github.invalidate_context();
         self.gitlab.invalidate_context();
+        // Downloaded logs are keyed by the account: a rescan or a sign-in
+        // change drops them with the contexts.
+        self.pipelines.forget_contexts();
     }
 
     /// Rescan uses `invalidate_contexts` directly and must leave snapshots in
@@ -994,6 +1004,7 @@ impl PullRequestsService {
         // Fence first: a read that started before this logout, the poller's
         // included, must not write its rows back once they are gone.
         self.pollers.fences().raise(&host);
+        self.pipelines.forget_host(&host);
         let _ = database
             .call(move |connection| {
                 Ok(snapshot_store::SnapshotStore::new(connection).delete_host(&host)?)
@@ -1175,7 +1186,7 @@ fn interrupted_result<T>(
 ) -> Result<T, PullRequestsOperationError> {
     // A mutation may already have posted comments. Preserve its settled result
     // after cleanup instead of replacing that receipt with an ambiguous timeout.
-    if operation == action::OP || operation == checkout::OP {
+    if operation == action::OP || operation == checkout::OP || operation == pipelines::ACTION_OP {
         result
     } else {
         Err(PullRequestsOperationError::new(operation, "timeout"))
@@ -1321,6 +1332,7 @@ mod service_tests {
             database: None,
             pollers: Arc::default(),
             hosts_restored: Arc::default(),
+            pipelines: Arc::default(),
         };
         let scope = host::HostScope {
             cwd: PathBuf::from("/repo"),
@@ -1443,6 +1455,7 @@ mod service_tests {
             database: None,
             pollers: Arc::default(),
             hosts_restored: Arc::default(),
+            pipelines: Arc::default(),
         };
         let scope = host::HostScope {
             cwd: "/checkout-a".into(),
@@ -2558,6 +2571,7 @@ esac"#,
             database: Some(database.clone()),
             pollers: Arc::default(),
             hosts_restored: Arc::default(),
+            pipelines: Arc::default(),
         };
         for (number, kind) in [
             (3941u64, "detail"),
@@ -2664,6 +2678,7 @@ esac"#,
             database: Some(database.clone()),
             pollers: Arc::default(),
             hosts_restored: Arc::default(),
+            pipelines: Arc::default(),
         };
         let detail = service
             .get(s.root(), 14, &CancellationToken::new())
@@ -2727,6 +2742,7 @@ esac"#,
             database: Some(database.clone()),
             pollers: Arc::default(),
             hosts_restored: Arc::default(),
+            pipelines: Arc::default(),
         };
         let detail = service
             .get(s.root(), 14, &CancellationToken::new())
@@ -2817,8 +2833,8 @@ esac"#,
 #[cfg(test)]
 mod tripwires {
     /// Host content that must never reach a log line, pipeline stage and job
-    /// names, refs and commit SHAs included.
-    const LOG_CONTENT_FIELDS: [&str; 11] = [
+    /// names, refs, commit SHAs and job log text included.
+    const LOG_CONTENT_FIELDS: [&str; 13] = [
         "host",
         "repository",
         "branch",
@@ -2830,6 +2846,8 @@ mod tripwires {
         "sha",
         "ref",
         "stage",
+        "name",
+        "text",
     ];
 
     fn violations(source: &str) -> Vec<&'static str> {
@@ -2873,6 +2891,13 @@ mod tripwires {
 
     const SOURCES: &[(&str, &str)] = &[
         ("mod.rs", include_str!("mod.rs")),
+        ("backoff.rs", include_str!("backoff.rs")),
+        ("pipelines/mod.rs", include_str!("pipelines/mod.rs")),
+        ("pipelines/model.rs", include_str!("pipelines/model.rs")),
+        ("pipelines/log.rs", include_str!("pipelines/log.rs")),
+        ("pipelines/poll.rs", include_str!("pipelines/poll.rs")),
+        ("pipelines/tests.rs", include_str!("pipelines/tests.rs")),
+        ("gitlab/pipelines.rs", include_str!("gitlab/pipelines.rs")),
         ("model.rs", include_str!("model.rs")),
         ("host.rs", include_str!("host.rs")),
         ("context.rs", include_str!("context.rs")),
@@ -2887,6 +2912,7 @@ mod tripwires {
             include_str!("github/detail_tests.rs"),
         ),
         ("github/timeline.rs", include_str!("github/timeline.rs")),
+        ("github/runs.rs", include_str!("github/runs.rs")),
         ("github/files.rs", include_str!("github/files.rs")),
         ("checkout.rs", include_str!("checkout.rs")),
         ("github/mod.rs", include_str!("github/mod.rs")),
@@ -2912,6 +2938,10 @@ mod tripwires {
         (
             "production/pull_requests_rpc.rs",
             include_str!("../production/pull_requests_rpc.rs"),
+        ),
+        (
+            "production/pipelines_rpc.rs",
+            include_str!("../production/pipelines_rpc.rs"),
         ),
     ];
 
@@ -2998,7 +3028,11 @@ mod tripwires {
             let found = violations(source);
             assert!(!found.contains(&"direct-http"), "{name}");
             assert!(!found.contains(&"thread-task"), "{name}");
-            if *name != "production/pull_requests_rpc.rs" {
+            // The two RPC files spawn each subscribe stream's task.
+            if !matches!(
+                *name,
+                "production/pull_requests_rpc.rs" | "production/pipelines_rpc.rs"
+            ) {
                 assert!(!found.contains(&"async-task"), "{name}");
             }
         }
@@ -3042,5 +3076,12 @@ mod tripwires {
             assert!(violations(poller).contains(&"poller"));
         }
         assert!(violations(concat!("tracing", "::info!(code, length);")).is_empty());
+        // A job's name and its log text are host content too.
+        for call in [
+            concat!("tracing", "::warn!(job_name = %job.name, \"job failed\");"),
+            concat!("tracing", "::debug!(text = %chunk.text);"),
+        ] {
+            assert!(violations(call).contains(&"log-content"), "{call}");
+        }
     }
 }
