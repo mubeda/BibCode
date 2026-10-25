@@ -320,6 +320,23 @@ impl LogCache {
         read(&mut tail).await
     }
 
+    /// A copy downloaded while the job ran is stale once the job is
+    /// terminal: its last lines are only on the host. Detaches it, as `clear`
+    /// does, so the next read downloads the finished log. A slot whose
+    /// download is in flight is left to finish.
+    pub(crate) fn forget_unfinished(&self, key: &LogKey) {
+        let mut logs = lock(&self.logs);
+        let unfinished = logs.slots.get(key).is_some_and(|slot| {
+            slot.try_lock()
+                .is_ok_and(|entry| entry.as_ref().is_some_and(|(_, log)| !log.complete))
+        });
+        if unfinished {
+            logs.slots.remove(key);
+            logs.order.retain(|kept| kept != key);
+            logs.sizes.remove(key);
+        }
+    }
+
     /// The downloaded log for `key`, while it is fresh.
     pub(crate) fn cached(&self, key: &LogKey) -> Option<FullLog> {
         let slot = lock(&self.logs).slots.get(key)?.clone();
