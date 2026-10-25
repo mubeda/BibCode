@@ -293,8 +293,8 @@ impl LogCache {
 
     /// Releases what no read may answer from any more, on every use of the
     /// cache rather than only on the same key's next read: logs idle for ten
-    /// minutes (and slots a failed download left empty), and job reads past
-    /// their 30 s. A slot in use is left alone.
+    /// minutes (and slots a failed download left empty), tails past their
+    /// 4 s, and job reads past their 30 s. A slot in use is left alone.
     pub(crate) fn sweep(&self) {
         let mut logs = lock(&self.logs);
         let expired: Vec<LogKey> = logs
@@ -317,6 +317,13 @@ impl LogCache {
             logs.order.retain(|key| !expired.contains(key));
         }
         drop(logs);
+        lock(&self.tails).retain(|_, slot| match slot.try_lock() {
+            Ok(tail) => tail
+                .as_ref()
+                .is_some_and(|tail| tail.read_at.elapsed() < TAIL_SHARE),
+            // A follower is reading or answering from it.
+            Err(_) => true,
+        });
         lock(&self.jobs).retain(|_, (at, _)| at.elapsed() < AUTHORIZATION_WINDOW);
     }
 
@@ -329,6 +336,7 @@ impl LogCache {
     }
 
     fn tail_slot(&self, key: &LogKey) -> TailSlot {
+        self.sweep();
         lock(&self.tails).entry(key.job_key()).or_default().clone()
     }
 
@@ -456,6 +464,11 @@ impl LogCache {
     #[cfg(test)]
     pub(crate) fn held_logs(&self) -> usize {
         lock(&self.logs).slots.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn held_tails(&self) -> usize {
+        lock(&self.tails).len()
     }
 
     /// Makes every recorded job read `by` older.
@@ -784,5 +797,42 @@ mod tests {
         tokio::time::advance(IDLE_TTL).await;
         cache.record_job(&key("ana", 3), facts());
         assert_eq!(cache.held_logs(), 0, "a job read releases them too");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pipelines_shared_tails_are_released_once_their_4s_have_passed() {
+        let cache = LogCache::default();
+        let c = CancellationToken::new();
+        for job in 1..=200 {
+            cache
+                .with_tail(
+                    &key("ana", job),
+                    &c,
+                    || (),
+                    async |tail: &mut Option<SharedTail>| {
+                        *tail = Some(SharedTail {
+                            offset: 0,
+                            bytes: Arc::new(vec![b'x'; 1024]),
+                            full: false,
+                            read_at: Instant::now(),
+                        });
+                        Ok::<(), ()>(())
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(cache.held_tails(), 200, "each follower window is shared");
+        tokio::time::advance(TAIL_SHARE).await;
+        cache
+            .with_tail(
+                &key("ana", 201),
+                &c,
+                || (),
+                async |_: &mut Option<SharedTail>| Ok::<(), ()>(()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cache.held_tails(), 1, "only the job just followed");
     }
 }
