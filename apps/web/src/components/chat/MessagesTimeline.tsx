@@ -367,11 +367,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       ? { ...config, onReady: handleAnchorReady, onSizeChanged: handleAnchorSizeChanged }
       : undefined;
   }, [anchorMessageId, handleAnchorReady, handleAnchorSizeChanged, rows]);
-  const readingAnchor = useTimelineReadingAnchor(
-    listRef,
-    timelineViewportElement,
-    anchoredEndSpace !== undefined,
-  );
+  const readingAnchor = useTimelineReadingAnchor(listRef, timelineViewportElement);
 
   const handleScroll = useCallback(() => {
     const state = listRef.current?.getState?.();
@@ -622,18 +618,17 @@ function useFoldPreviousTurnOnNewTurn(
 
 /**
  * The reading anchor Mermaid diagrams commit their swaps through, created once for the life of
- * the timeline. It reads the viewport and the end-space state from a ref; kept out of
- * `MessagesTimeline`'s scope for the reason `useFoldPreviousTurnOnNewTurn` gives.
+ * the timeline. It reads the viewport from a ref; kept out of `MessagesTimeline`'s scope for
+ * the reason `useFoldPreviousTurnOnNewTurn` gives.
  */
 function useTimelineReadingAnchor(
   listRef: React.RefObject<LegendListRef | null>,
   viewport: HTMLDivElement | null,
-  anchoringEndSpace: boolean,
 ): ReadingAnchor {
-  const latest = useRef({ viewport, anchoringEndSpace });
+  const latest = useRef({ viewport });
   useLayoutEffect(() => {
-    latest.current = { viewport, anchoringEndSpace };
-  }, [anchoringEndSpace, viewport]);
+    latest.current = { viewport };
+  }, [viewport]);
   const preserveReadingPosition = useCallback(
     (element: HTMLElement, commit: () => void) =>
       preserveTimelineReadingPosition(

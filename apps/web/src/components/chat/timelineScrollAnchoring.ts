@@ -85,8 +85,6 @@ export interface ReadingLineGeometry {
   readonly rowBottom: number;
   /** The top edge of the list's visible area. */
   readonly viewportTop: number;
-  /** The list follows its end, where it already holds the newest line in place. */
-  readonly followingEnd: boolean;
 }
 
 /**
@@ -98,7 +96,6 @@ export interface ReadingLineGeometry {
  * below it.
  */
 export function isAboveReadingLine(geometry: ReadingLineGeometry): boolean {
-  if (geometry.followingEnd) return false;
   if (geometry.rowBottom <= geometry.viewportTop || geometry.rowTop > geometry.viewportTop) {
     return false;
   }
