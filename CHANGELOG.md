@@ -1,5 +1,97 @@
 # Changelog
 
+## [v0.12.0] - 2026-10-26
+
+BiBCode v0.12.0 adds a Pipelines module for GitLab pipelines and GitHub Actions runs, with a page for each pipeline and each job's log. Chats gain Thinking rows for Claude and Codex reasoning, Mermaid diagrams, find in thread, a History menu for past chats and Claude Code terminal sessions, and recovery from a full context window: BiBCode compacts the conversation and sends your message again. The Diff panel gains a side-by-side Compare view and Open with for your diff app, open files reload when an agent changes them on disk, the Device panel runs up to four devices at once, and a failed Source Control action now names the step that failed, with Git's reason. This release includes the changes since v0.11.0.
+
+### Pipelines
+
+- A new Pipelines module lists a repository's GitLab pipelines or GitHub Actions runs, with filters for status, branch or tag and, on GitHub, workflow. Open it from the Pipelines button next to Git Manager and Pull Requests, or from the repository row in the Repositories view.
+- A pipeline's page shows its status, commit, branch and times, with its stages and jobs side by side on a wide panel and stacked on a narrow one. A job's page shows its log with colors, timestamps, collapsible sections and search, and a 100,000-line log stays responsive.
+- Retry, Cancel and Run work for pipelines and jobs on both hosts. A merge request's Pipelines tab and merge box open a job or its pipeline in Pipelines, with a link to the host beside it.
+- GitLab pipelines and running job logs update live. GitHub runs refresh while the page is open; a running GitHub job shows its steps, with its log on GitHub until the job finishes.
+- A pipeline you can no longer view says so instead of showing an old copy.
+- **Settings → Source Control → Pipelines** turns the module off.
+
+### Pull requests
+
+- A GitLab merge request's merge box and Pipelines tab show the pipeline it waits on as it runs: its status, commit, branch and a strip of stages. A pipeline that ran before the latest push is marked "Older commit". (#156)
+- The merge box names the real reason a GitLab merge is blocked, instead of "GitLab is still computing mergeability". Under "Pipelines must succeed" it says when no pipeline is visible, when one waits for a manual job, or when it was skipped or canceled. (#156)
+- **Disable auto-merge** on GitLab now fails when GitLab refuses it, instead of reporting success, and uses the newer endpoint on GitLab 19.5 and later. (#156)
+- The Changes tab's file list can be resized by dragging its divider or with the arrow keys, so long paths are easier to tell apart. Double-click resets it. (#153)
+
+### Sidebar
+
+- In the Repositories view, the Pull Requests and Pipelines buttons sit on the repository row instead of on each environment row inside it. With several environments, BiBCode asks which one to read from. The Environments view keeps them on each row.
+- Row action icons are always visible instead of appearing on hover. A chat row's Archive still appears on hover.
+
+### Claude
+
+- When a conversation fills the context window, BiBCode compacts it and sends your message again, so you no longer compact and resend by hand. A message that would start close to Claude's own compaction point is sent after a compaction. While a compaction runs, new messages wait in the queue and Stop is offered. (#160)
+- A large tool result, such as a command that printed megabytes, is kept as a 16 KiB preview in the chat instead of being sent to every client that opens the thread. The full result stays in Claude's own transcript. (#148)
+
+### Codex
+
+- Codex retries show as warnings while they happen, a compaction shows as a step in the turn, and `/compact` compacts the conversation. A full context window now offers **Compact conversation** and recovers the same way as Claude. (#163)
+
+### OpenCode
+
+- OpenCode 2 chats have a context meter, `/compact`, a compaction step in the turn, and a warning when OpenCode retries an upstream error. (#164)
+
+### Chat
+
+- Claude thinking and Codex reasoning summaries show as collapsed "Thought" rows among the tool calls, "Thinking" while they stream. Click one to read the full trace. The working row shows the latest thought, and Claude's thinking no longer shows as a second answer or leaves a turn reading "(empty response)". (#173)
+- Mermaid diagrams in replies, plans and rendered Markdown files are drawn once their fence is closed. **Show source** switches back to the source, Copy copies the fenced source, and drawing a diagram no longer moves the line you are reading. Links and images in diagrams are not drawn. (#171)
+- **Find in thread** (Cmd+F or Ctrl+F in a chat, or from the command palette) searches a chat's messages, plans and tool commands, including folded turns and rows scrolled out of view, and opens what hides each match. (#175)
+- **History** in the composer lists the thread's closed chats and the Claude Code sessions started in a terminal in the same folder. **Continue** picks one up in a chat panel. A session still open in a terminal is continued in a copy, so two programs never write one conversation. (#141)
+- **Settings → General → Verbose chat** keeps finished turns and tool calls open. Turns and tool groups can still be folded, and your choice stays when a row scrolls away. Tool rows show their time on hover. (#142)
+- The minimap has Previous turn and Next turn buttons, and PageUp and PageDown in the composer scroll the chat when the draft has no use for them. (#176)
+- The `/` menu opens for a `/` typed mid-prompt, not only at the start of a line. Escape closes the `/`, `@`, `$` and `:` menus for the word being typed. (#152)
+- The Activity button opens the Activity panel in one click, on the section that needs attention. **Always show Activity** (on by default) keeps the button on a chat before any activity, and the panel has Subagents and Background tasks tabs when both are running. (#143)
+- Streaming replies with code are much lighter: a 15,600-character reply took 2.3 ms per update instead of 16.9 ms, and blocks keep their state, such as line wrap, while text arrives. Ported from upstream PRs 11193, 11196 and 11198. (#172)
+
+### Diff
+
+- A **Compare** view shows one file's previous and current versions side by side in full, beside a list of the changed files with name and status filters. **Changes only** shows changed lines with the context you choose, F7 and Shift+F7 move between changes, and a narrow panel shows the files as a picker. (#140)
+- **Open with** opens a file, or the whole change, in a diff app Git knows, such as Beyond Compare, Meld or WinMerge. The app opens on the server's computer and stays open when BiBCode quits. (#140)
+- The panel remembers Stacked or Split, and an unsent comment survives switching between Changes and Compare. (#140)
+- A turn's changes show again; every turn read "No net changes". (#140)
+
+### Files
+
+- An open file that changes on disk, for example when an agent edits it, now reloads in place if you have no unsaved edits, and Undo brings back the old text. With unsaved edits, a bar offers **Reload from disk** or **Overwrite disk**, and no save writes over the newer file. Before, the next save overwrote the agent's work. (#180)
+- A file deleted on disk shows "Deleted on disk", and a background tab with a conflict shows a dot.
+
+### Git and worktrees
+
+- A failed Source Control action is titled by its step, such as "Push failed" or "Commit failed", and shows Git's reason, instead of "failed during execution". The reason stays when the connection drops right after the failure. (#174)
+- The dialog that commits, pushes and creates a pull or merge request names a failed branch or commit step, such as a rejecting pre-commit hook, instead of blaming the request. (#174)
+- In **Create Worktree**, picking a branch fills the field and closes the list, a branch whose name is a number is created from that branch, and reopening the dialog for another project clears the field. (#151)
+
+### Terminal
+
+- New terminals no longer inherit tmux, screen or Zellij variables from the server, and fish 4.1 and later no longer waits at startup for a terminal reply. (#149)
+- Reopening a terminal whose shell exited no longer leaves mouse tracking or bracketed paste on, which typed escape codes into the next shell. (#150)
+
+### Device previews
+
+- Up to four devices can run at once in an environment, in any mix of Android and iOS. Each thread shows its own device, the picker says which thread started each one, and deleting a thread stops its devices. Agents act only on their own thread's devices. (#170)
+- **Refresh devices** finds a device created in Android Studio or Xcode without restarting BiBCode. It shows only on servers that support it. (#169)
+
+### Providers
+
+- **Settings → Providers → Update all** updates outdated providers on every connected environment, then installs a remote server's update where its host offers one. Every skipped environment is listed with its reason. (#147)
+
+### Upgrade notes
+
+- This version adds store migrations 55 and 56 for Thinking rows and compaction. They are one-way: once v0.12.0 has run, an older BiBCode cannot open the store. (#160, #173)
+
+### Known limitations
+
+- OpenCode conversations do not compact automatically, and the thread error does not offer **Compact conversation** for them; type `/compact` in an OpenCode 2 chat instead.
+- GitHub pipelines refresh on a timer rather than live, and a running GitHub job's log is shown only on GitHub.
+- Find in thread does not search tool output or drawn diagrams.
+
 ## [v0.11.0] - 2026-10-23
 
 BiBCode v0.11.0 moves the desktop to Tauri 2.11.6, which closes a High-severity IPC advisory, moves the toolchain and every dependency line to current releases (Effect 4.0 stable, Vite+ 1.1, Vitest 5, Node 26.12.1, Rust 1.98.1), and fixes twelve bugs: Claude chats that stopped at a full context window or after `/compact`, Claude follow-up turns cut off by idle suspension, a webview that grew with every streamed tool input, Codex errors that were never classified, Push on a branch that tracks a differently named remote branch, dialogs that lost their input on an outside click, and memory figures on macOS that were about 3.5 times too high. This release includes the changes since v0.10.2.
