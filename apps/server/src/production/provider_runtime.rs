@@ -469,6 +469,12 @@ pub trait ProviderDriver: Send + Sync {
     fn holds_unsettled_work(&self) -> BoxRuntimeFuture<'_, bool> {
         Box::pin(std::future::ready(false))
     }
+    /// Whether the provider refused to resume the session this driver launched, which the
+    /// event pump records in the runtime row when the stream ends. Decided before `next_event`
+    /// returns `None`.
+    fn resume_refused(&self) -> bool {
+        false
+    }
 }
 
 pub trait ProviderDriverFactory: Send + Sync {
@@ -832,6 +838,9 @@ struct SessionEntry {
     /// The session is a new provider conversation for a thread whose earlier one was lost, so
     /// the next turn sent to it carries the thread's earlier messages.
     pending_context_handoff: Arc<AtomicBool>,
+    /// The event pump recorded that the provider refused to resume this session, so every later
+    /// write of its runtime row keeps `resumeRefused` until another launch replaces the entry.
+    resume_refusal_recorded: Arc<AtomicBool>,
     terminal_sender: mpsc::UnboundedSender<SupervisorMessage>,
     activity_dispatch_sender: mpsc::Sender<ActivityDispatchEnvelope>,
     activity_dispatch_capacity: usize,
@@ -7463,6 +7472,7 @@ async fn launch_session(
         }
     }
     let pending_context_handoff = Arc::new(AtomicBool::new(context_handoff));
+    let resume_refusal_recorded = Arc::new(AtomicBool::new(false));
     persist_runtime(
         &engine.repositories(),
         &request,
@@ -7492,6 +7502,7 @@ async fn launch_session(
         started.resume_cursor.clone(),
         started.runtime_payload.clone(),
         pending_context_handoff.clone(),
+        resume_refusal_recorded.clone(),
         activity.clone(),
         activity_lifecycle.clone(),
         activity_capable,
@@ -7534,6 +7545,7 @@ async fn launch_session(
             pending_stream_settlement: None,
             idle_generation,
             pending_context_handoff,
+            resume_refusal_recorded,
             terminal_sender,
             activity_dispatch_sender,
             activity_dispatch_capacity,
@@ -8434,6 +8446,7 @@ fn spawn_event_pump(
     resume_cursor: Option<Value>,
     runtime_payload: Option<Value>,
     pending_context_handoff: Arc<AtomicBool>,
+    resume_refusal_recorded: Arc<AtomicBool>,
     activity: ActivityProjection,
     activity_lifecycle: SharedActivityLifecycle,
     activity_capable: bool,
@@ -8823,6 +8836,32 @@ fn spawn_event_pump(
                         "failed to project provider stream-end failure"
                     );
                 }
+            }
+        }
+        // History offers a copy of an imported session whose resume Claude refused.
+        if unexpected && driver.resume_refused() {
+            // The session stays registered; later writes of its row keep the mark.
+            resume_refusal_recorded.store(true, Ordering::Release);
+            let payload =
+                runtime_payload_with_resume_refused(runtime_payload_with_context_handoff(
+                    runtime_payload.clone(),
+                    pending_context_handoff.load(Ordering::Acquire),
+                ));
+            if let Err(error) = persist_runtime(
+                &engine.repositories(),
+                &launch,
+                "error",
+                resume_cursor.clone(),
+                payload,
+            )
+            .await
+            {
+                tracing::warn!(
+                    %error,
+                    provider = %launch.provider,
+                    thread_id = %launch.thread_id,
+                    "failed to record a refused resume"
+                );
             }
         }
         #[cfg(test)]
@@ -9606,6 +9645,18 @@ fn runtime_payload_with_context_handoff(payload: Option<Value>, pending: bool) -
     Some(payload)
 }
 
+/// Marks the runtime of an imported session whose resume Claude refused, so History offers a
+/// copy of it. The next launch writes the row anew, which clears it.
+const RESUME_REFUSED_PAYLOAD_FIELD: &str = "resumeRefused";
+
+fn runtime_payload_with_resume_refused(payload: Option<Value>) -> Option<Value> {
+    let mut payload = payload.unwrap_or_else(|| json!({}));
+    if let Some(object) = payload.as_object_mut() {
+        object.insert(RESUME_REFUSED_PAYLOAD_FIELD.to_owned(), Value::Bool(true));
+    }
+    Some(payload)
+}
+
 fn saved_context_handoff(payload: Option<&Value>) -> bool {
     payload
         .and_then(|payload| payload.get(CONTEXT_HANDOFF_PAYLOAD_FIELD))
@@ -9614,10 +9665,15 @@ fn saved_context_handoff(payload: Option<&Value>) -> bool {
 }
 
 fn entry_runtime_payload(entry: &SessionEntry) -> Option<Value> {
-    runtime_payload_with_context_handoff(
+    let payload = runtime_payload_with_context_handoff(
         entry.runtime_payload.clone(),
         entry.pending_context_handoff.load(Ordering::Acquire),
-    )
+    );
+    if entry.resume_refusal_recorded.load(Ordering::Acquire) {
+        runtime_payload_with_resume_refused(payload)
+    } else {
+        payload
+    }
 }
 
 async fn persist_runtime(
@@ -13624,9 +13680,27 @@ struct ClaudeDriver {
     acknowledgement_timeout: Duration,
     hook_sink: Option<Arc<ClaudeHookSinkHandle>>,
     output: Arc<ClaudeOutputHandle>,
+    /// The cursor `start` reports: a copy keeps its requested one, `forkedFrom` included, until
+    /// Claude has written the copy, so a crash before then forks again.
+    started_cursor: Value,
+    /// A `--resume` of an imported session's own transcript, whose early exit means Claude
+    /// refused to resume it (see [`CLAUDE_RESUME_REFUSED`]).
+    watch_resume_refusal: bool,
+    resume_refusal: tokio::sync::OnceCell<bool>,
     /// The private `--mcp-config` file Claude reads; removed when the driver is dropped.
     _mcp_config: Option<crate::source_control::PrivateJsonBody>,
 }
+
+const CLAUDE_COPY_NEEDS_UPDATE: &str = "Continue in a copy needs Claude Code 2.0.73 or later. \
+     Update it in Settings → Providers, then send again.";
+const CLAUDE_COPY_AWAITS_PROBE: &str =
+    "BiBCode is still checking the Claude Code version. Send again.";
+/// A `--resume` Claude ends with a failure before its first `system/init`. The cause is not
+/// classified, because Claude's message is not a contract; a copy is safe whatever it is.
+const CLAUDE_RESUME_REFUSED: &str = "Claude Code couldn't continue this session here. It may \
+     still be running in a terminal or in the background. Choose Continue in a copy in History.";
+/// How long a refused resume's process may take to report its exit after its output closed.
+const CLAUDE_RESUME_REFUSAL_EXIT_WAIT: Duration = Duration::from_secs(2);
 
 struct ClaudeOutputHandle {
     cancellation: CancellationToken,
@@ -13660,6 +13734,12 @@ pub struct ClaudeActivitySupport {
     pub include_hook_events: bool,
     pub forward_subagent_text: bool,
     pub transcript_recovery: bool,
+    /// `--session-id` names the copy `--fork-session` makes: a Claude Code of 2.0.73 or later
+    /// whose `--help` lists `--fork-session`.
+    pub fork_session_id: bool,
+    /// A probe answered. False for the defaults a launch takes while the probe still runs, after
+    /// it failed, or when the executable cannot be resolved; a copy then waits for an answer.
+    pub probe_finished: bool,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -14045,12 +14125,18 @@ async fn probe_claude_activity_support_uncached(
     let help = run_claude_probe_command(executable, "--help", deadline, launch_policy).await?;
     let has_exact_flag =
         |expected: &str| help.split_ascii_whitespace().any(|token| token == expected);
+    let fork_session_id = crate::provider::claude::model::supports(
+        crate::provider::claude::model::semantic_version(&version),
+        super::agent_sessions_rpc::COPY_MINIMUM_CLAUDE_VERSION,
+    ) && has_exact_flag("--fork-session");
     Ok(ClaudeProbeResult {
         version,
         support: ClaudeActivitySupport {
             include_hook_events: has_exact_flag("--include-hook-events"),
             forward_subagent_text: has_exact_flag("--forward-subagent-text"),
             transcript_recovery: false,
+            fork_session_id,
+            probe_finished: true,
         },
     })
 }
@@ -14128,9 +14214,76 @@ fn prepare_claude_probe_launch(
     prepare_provider_launch(executable, [argument]).ok()
 }
 
+/// How a Claude process takes up its conversation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ClaudeLaunch {
+    /// A new conversation under its own ID: `--session-id <id>`.
+    New,
+    /// `--resume <id>`.
+    Resume,
+    /// A copy of `source` under the ID BiBCode assigned it:
+    /// `--resume <source> --fork-session --session-id <id>`.
+    Fork { source: String },
+}
+
+const CLAUDE_FORKED_FROM_FIELD: &str = "forkedFrom";
+
+/// The session a copy's cursor forks, when the cursor is a copy's.
+fn claude_forked_from(cursor: &Value) -> Option<&str> {
+    cursor
+        .get(CLAUDE_FORKED_FROM_FIELD)
+        .and_then(Value::as_str)
+        .filter(|source| !source.is_empty())
+}
+
+impl ClaudeLaunch {
+    /// Decided by which transcript exists, as `exists` tells (`None` when it cannot), with the
+    /// rules tried in order: a copy's cursor forks while the copy's transcript is not known to
+    /// exist and the source's is not known to be missing, so a crash before Claude writes the
+    /// copy forks again; a cursor resumes when its own transcript exists, or cannot be checked
+    /// and it is not a copy's; anything else starts a new conversation.
+    fn for_cursor(cursor: Option<&Value>, exists: impl Fn(&str) -> Option<bool>) -> Self {
+        let Some(cursor) = cursor else {
+            return Self::New;
+        };
+        let Some(session_id) = resume_string(cursor) else {
+            return Self::New;
+        };
+        let forked_from = claude_forked_from(cursor);
+        let own = exists(&session_id);
+        if let Some(source) = forked_from
+            && own != Some(true)
+            && exists(source) != Some(false)
+        {
+            return Self::Fork {
+                source: source.to_owned(),
+            };
+        }
+        if own == Some(true) || (own.is_none() && forked_from.is_none()) {
+            Self::Resume
+        } else {
+            Self::New
+        }
+    }
+
+    /// The launch a cursor asks for, without checking any transcript.
+    fn requested_by(cursor: Option<&Value>) -> Self {
+        match cursor {
+            None => Self::New,
+            Some(cursor) => match claude_forked_from(cursor) {
+                Some(source) => Self::Fork {
+                    source: source.to_owned(),
+                },
+                None => Self::Resume,
+            },
+        }
+    }
+}
+
 fn build_claude_launch_arguments(
     request: &ProviderLaunchRequest,
     session_id: &str,
+    launch: &ClaudeLaunch,
     support: ClaudeActivitySupport,
     hook_settings: Option<&Value>,
     mcp_config: Option<&Path>,
@@ -14157,10 +14310,16 @@ fn build_claude_launch_arguments(
         "--permission-mode".to_owned(),
         claude_permission_arg(mode).to_owned(),
     ]);
-    if request.resume_cursor.is_some() {
-        args.extend(["--resume".to_owned(), session_id.to_owned()]);
-    } else {
-        args.extend(["--session-id".to_owned(), session_id.to_owned()]);
+    match launch {
+        ClaudeLaunch::New => args.extend(["--session-id".to_owned(), session_id.to_owned()]),
+        ClaudeLaunch::Resume => args.extend(["--resume".to_owned(), session_id.to_owned()]),
+        ClaudeLaunch::Fork { source } => args.extend([
+            "--resume".to_owned(),
+            source.clone(),
+            "--fork-session".to_owned(),
+            "--session-id".to_owned(),
+            session_id.to_owned(),
+        ]),
     }
     if let Some(model) = request.model.as_ref() {
         args.extend(["--model".to_owned(), model.clone()]);
@@ -14298,6 +14457,7 @@ pub fn build_claude_launch_arguments_for_test(
     build_claude_launch_arguments(
         request,
         session_id,
+        &ClaudeLaunch::requested_by(request.resume_cursor.as_ref()),
         support,
         None,
         request.mcp.as_ref().map(|_| Path::new("bibcode-mcp.json")),
@@ -14314,6 +14474,7 @@ pub fn build_claude_launch_arguments_with_settings_for_test(
     build_claude_launch_arguments(
         request,
         session_id,
+        &ClaudeLaunch::requested_by(request.resume_cursor.as_ref()),
         support,
         hook_settings.as_ref(),
         request.mcp.as_ref().map(|_| Path::new("bibcode-mcp.json")),
@@ -14438,27 +14599,39 @@ impl ClaudeDriver {
         validate_claude_options(&request.provider, &request.options, supports_fast_mode)?;
         let mode = claude_mode(&request.runtime_mode, &request.interaction_mode);
         // `--resume` of a conversation without a transcript fails on every launch, so start a new
-        // one instead; when BiBCode cannot tell, Claude decides.
-        if let Some(session_id) = request.resume_cursor.as_ref().and_then(resume_string) {
-            let environment = request
-                .environment
-                .iter()
-                .map(|(name, value)| (OsString::from(name), OsString::from(value)))
-                .collect::<Vec<_>>();
-            if crate::provider::environment::claude_session_transcript_exists(
+        // one instead; when BiBCode cannot tell, Claude decides. A copy forks its source until
+        // its own transcript exists.
+        let environment = request
+            .environment
+            .iter()
+            .map(|(name, value)| (OsString::from(name), OsString::from(value)))
+            .collect::<Vec<_>>();
+        let cwd = request.cwd.clone();
+        let transcript_exists = |session_id: &str| {
+            crate::provider::environment::claude_session_transcript_exists(
                 &environment,
-                &request.cwd,
-                &session_id,
-            ) == Some(false)
-            {
-                request.resume_cursor = None;
-            }
+                &cwd,
+                session_id,
+            )
+        };
+        let launch = ClaudeLaunch::for_cursor(request.resume_cursor.as_ref(), transcript_exists);
+        if launch == ClaudeLaunch::New {
+            request.resume_cursor = None;
         }
         let session_id = request
             .resume_cursor
             .as_ref()
             .and_then(resume_string)
             .unwrap_or_else(|| Uuid::new_v4().to_string());
+        let started_cursor = match (&launch, request.resume_cursor.as_ref()) {
+            (ClaudeLaunch::Fork { .. }, Some(cursor)) => cursor.clone(),
+            _ => json!({ "sessionId": session_id }),
+        };
+        // Only an import's own session is ever offered a copy in History; native threads and
+        // copies keep the usual early-exit error.
+        let watch_resume_refusal = launch == ClaudeLaunch::Resume
+            && super::agent_sessions_rpc::is_import_of(&request.thread_id, &session_id)
+            && transcript_exists(&session_id) == Some(true);
         request
             .environment
             .entry("CLAUDE_CODE_ENTRYPOINT".to_owned())
@@ -14474,6 +14647,23 @@ impl ClaudeDriver {
             probe_launch_policy,
         )
         .await;
+        // A copy needs Claude to take the ID BiBCode assigned it. The probe's answer decides;
+        // without one the launch waits for it rather than guessing. Either refusal keeps the
+        // requested cursor, so the next send forks.
+        if matches!(launch, ClaudeLaunch::Fork { .. }) {
+            if !support.probe_finished {
+                return Err(ProviderRuntimeError::Provider {
+                    provider: request.provider.clone(),
+                    detail: CLAUDE_COPY_AWAITS_PROBE.to_owned(),
+                });
+            }
+            if !support.fork_session_id {
+                return Err(ProviderRuntimeError::IncompatibleProvider {
+                    provider: request.provider.clone(),
+                    detail: CLAUDE_COPY_NEEDS_UPDATE.to_owned(),
+                });
+            }
+        }
         let hook_sink = if support.include_hook_events && support.forward_subagent_text {
             start_claude_hook_sink().await.ok()
         } else {
@@ -14508,6 +14698,7 @@ impl ClaudeDriver {
         let args = build_claude_launch_arguments(
             &request,
             &session_id,
+            &launch,
             support,
             hook_settings.as_ref(),
             mcp_config
@@ -14535,6 +14726,9 @@ impl ClaudeDriver {
         provider_runtime.set_targeted_activity_control_supported(
             targeted_activity_provisionally_supported && activity_enabled,
         );
+        if matches!(launch, ClaudeLaunch::Fork { .. }) {
+            provider_runtime.expect_session_id(session_id.clone());
+        }
         let runtime = Arc::new(Mutex::new(provider_runtime));
         let (events_tx, events_rx) = mpsc::channel(DEFAULT_EVENT_QUEUE_CAPACITY);
         let (hook_receiver, hook_handle) = match hook_sink {
@@ -14579,8 +14773,61 @@ impl ClaudeDriver {
             acknowledgement_timeout: CLAUDE_DELIVERY_ACKNOWLEDGEMENT_TIMEOUT,
             hook_sink: hook_handle,
             output,
+            started_cursor,
+            watch_resume_refusal,
+            resume_refusal: tokio::sync::OnceCell::new(),
             _mcp_config: mcp_config,
         })
+    }
+
+    /// Why Claude stopped before taking up the conversation, when that is one of the two
+    /// launches History handles itself: a copy that came up under another session ID, or a
+    /// refused resume of an imported session. `None` for any other end, which keeps its usual
+    /// error, and while Claude's output is still open.
+    async fn launch_refusal(&self) -> Option<&'static str> {
+        if let Some(detail) = self.runtime.lock().await.halted() {
+            return Some(detail);
+        }
+        if !self.watch_resume_refusal || self.runtime.lock().await.saw_init() {
+            return None;
+        }
+        // Claude's output closes as it exits; a delivery whose write broke can return first.
+        if tokio::time::timeout(
+            CLAUDE_RESUME_REFUSAL_EXIT_WAIT,
+            self.output.cancellation.cancelled(),
+        )
+        .await
+        .is_err()
+        {
+            return None;
+        }
+        let refused = *self
+            .resume_refusal
+            .get_or_init(|| async {
+                if self.runtime.lock().await.saw_init() {
+                    return false;
+                }
+                let deadline = Instant::now() + CLAUDE_RESUME_REFUSAL_EXIT_WAIT;
+                let status = loop {
+                    if let Some((_, status)) = exited_child(&self.child) {
+                        break Some(status);
+                    }
+                    if Instant::now() >= deadline {
+                        break None;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                };
+                let refused = status.is_some_and(|status| !status.success());
+                if refused {
+                    tracing::warn!(
+                        session_id = %self.session_id,
+                        "Claude Code refused to resume an imported session; History offers a copy"
+                    );
+                }
+                refused
+            })
+            .await;
+        refused.then_some(CLAUDE_RESUME_REFUSED)
     }
 
     fn encode_json_line(&self, value: Value) -> Result<Vec<u8>, ProviderRuntimeError> {
@@ -14884,7 +15131,7 @@ impl ProviderDriver for ClaudeDriver {
             let events = self.runtime.lock().await.start_session(mode, None);
             drop(events);
             Ok(StartedSession {
-                resume_cursor: Some(json!({"sessionId":self.session_id})),
+                resume_cursor: Some(self.started_cursor.clone()),
                 runtime_payload: Some(json!({"transport":"stream-json"})),
                 activity_capabilities: if self.hook_sink.is_some() {
                     ActivityCapabilities {
@@ -14931,7 +15178,22 @@ impl ProviderDriver for ClaudeDriver {
         _: String,
         delivery_key: String,
     ) -> BoxRuntimeFuture<'_, ProviderDeliveryOutcome> {
-        Box::pin(self.deliver_user_line(text, attachments, None, delivery_key))
+        Box::pin(async move {
+            let outcome = self
+                .deliver_user_line(text, attachments, None, delivery_key)
+                .await;
+            if matches!(outcome, ProviderDeliveryOutcome::Accepted { .. }) {
+                return outcome;
+            }
+            // Claude never took up the conversation, so this message failed for that reason, and
+            // sending it again to the same launch would fail the same way.
+            match self.launch_refusal().await {
+                Some(detail) => ProviderDeliveryOutcome::Rejected {
+                    detail: detail.to_owned(),
+                },
+                None => outcome,
+            }
+        })
     }
     fn steer(
         &self,
@@ -15100,7 +15362,11 @@ impl ProviderDriver for ClaudeDriver {
             if let Some(event) = deferred_events.pop_front() {
                 return Some(event);
             }
-            let completion = self.events.lock().await.recv().await?;
+            let Some(completion) = self.events.lock().await.recv().await else {
+                // Decided before the pump sees the end, so it can record a refused resume.
+                let _ = self.launch_refusal().await;
+                return None;
+            };
             let Some(turn_id) = claude_completion_query_turn_id(&completion).map(str::to_owned)
             else {
                 return Some(completion);
@@ -15145,6 +15411,10 @@ impl ProviderDriver for ClaudeDriver {
     }
     fn exited_process(&self) -> BoxRuntimeFuture<'_, Option<(u32, std::process::ExitStatus)>> {
         Box::pin(std::future::ready(exited_child(&self.child)))
+    }
+
+    fn resume_refused(&self) -> bool {
+        self.resume_refusal.get().copied().unwrap_or(false)
     }
 
     fn shutdown(&self) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
@@ -15766,7 +16036,8 @@ async fn emit_claude_value(
     let mut late_delivery_key = None;
     let mut output = {
         let mut runtime = runtime.lock().await;
-        let replay = if authenticated_hook {
+        // A halted copy shows nothing more, its replays included.
+        let replay = if authenticated_hook || runtime.halted().is_some() {
             None
         } else if let Some(text) = claude_replayed_user_text(&value) {
             let replay = pending_acknowledgement
@@ -16312,6 +16583,7 @@ mod tests {
         unsettled_work: bool,
         /// What deliveries answer instead of sending.
         delivery_outcome: Option<super::ProviderDeliveryOutcome>,
+        resume_refused: bool,
     }
 
     struct SupervisorDriver {
@@ -16800,6 +17072,10 @@ mod tests {
             &self,
         ) -> super::BoxRuntimeFuture<'_, Option<(u32, std::process::ExitStatus)>> {
             Box::pin(std::future::ready(self.state.lock().unwrap().exited))
+        }
+
+        fn resume_refused(&self) -> bool {
+            self.state.lock().unwrap().resume_refused
         }
 
         fn shutdown(&self) -> super::BoxRuntimeFuture<'_, Result<(), super::ProviderRuntimeError>> {
@@ -17741,6 +18017,7 @@ mod tests {
         let arguments = super::build_claude_launch_arguments(
             &request,
             "claude-session",
+            &super::ClaudeLaunch::New,
             super::ClaudeActivitySupport::default(),
             None,
             None,
@@ -18545,6 +18822,512 @@ done
             }
             driver.shutdown().await.expect("Claude shutdown");
         }
+    }
+
+    /// Which transcript exists decides how a Claude cursor launches (see `ClaudeLaunch`).
+    #[test]
+    fn claude_launches_follow_which_transcript_exists() {
+        use super::ClaudeLaunch;
+        let fork = || ClaudeLaunch::Fork {
+            source: "source".to_owned(),
+        };
+        let copy = json!({"sessionId":"copy","forkedFrom":"source"});
+        let plain = json!({"sessionId":"plain"});
+        let known = |copy_exists: Option<bool>, source_exists: Option<bool>| {
+            move |session_id: &str| match session_id {
+                "copy" | "plain" => copy_exists,
+                "source" => source_exists,
+                _ => None,
+            }
+        };
+        // A copy forks until Claude has written it, also when nothing can be checked.
+        for (copy_exists, source_exists, expected) in [
+            (Some(false), Some(true), fork()),
+            (None, None, fork()),
+            (None, Some(true), fork()),
+            (Some(true), Some(true), ClaudeLaunch::Resume),
+            (Some(true), Some(false), ClaudeLaunch::Resume),
+            // Its source is gone and the copy was never written: a new conversation.
+            (Some(false), Some(false), ClaudeLaunch::New),
+            (None, Some(false), ClaudeLaunch::New),
+        ] {
+            assert_eq!(
+                ClaudeLaunch::for_cursor(Some(&copy), known(copy_exists, source_exists)),
+                expected,
+                "copy {copy_exists:?}, source {source_exists:?}"
+            );
+        }
+        for (exists, expected) in [
+            (Some(true), ClaudeLaunch::Resume),
+            (None, ClaudeLaunch::Resume),
+            (Some(false), ClaudeLaunch::New),
+        ] {
+            assert_eq!(
+                ClaudeLaunch::for_cursor(Some(&plain), known(exists, None)),
+                expected
+            );
+        }
+        assert_eq!(
+            ClaudeLaunch::for_cursor(None, |_| Some(true)),
+            ClaudeLaunch::New
+        );
+    }
+
+    #[cfg(unix)]
+    const CLAUDE_COPY_FIXTURE: &str = r#"#!/bin/sh
+case "$1" in
+  --version) printf '%s\n' '2.1.310 (Claude Code)'; exit 0;;
+  --help) printf '%s\n' '-r, --resume [value]' '--fork-session' '--session-id <uuid>'; exit 0;;
+esac
+printf '%s\n' "$@" > "$BIBCODE_TEST_ARGUMENTS"
+while IFS= read -r line; do
+  case "$line" in
+    *'"type":"user"'*)
+      printf '{"type":"system","subtype":"init","session_id":"%s"}\n' "$BIBCODE_TEST_INIT_SESSION"
+      printf '%s\n' "$line"
+      printf '%s\n' '{"type":"assistant","session_id":"copy","message":{"id":"m","role":"assistant","content":[{"type":"text","text":"copied answer"}]}}'
+      ;;
+  esac
+done
+"#;
+
+    /// A Claude launch over `cursor` in a config directory holding the transcripts named in
+    /// `transcripts`, with its recorded arguments.
+    #[cfg(unix)]
+    struct ClaudeCursorLaunch {
+        temp: TempDir,
+        request: super::ProviderLaunchRequest,
+        arguments: std::path::PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl ClaudeCursorLaunch {
+        fn new(fixture: &str, cursor: Value, transcripts: &[&str]) -> Self {
+            let temp = TempDir::new().expect("provider fixture directory");
+            let config = temp.path().join("claude-config");
+            let cwd = temp.path().join("project");
+            let project = config.join("projects").join(
+                crate::provider::environment::claude_project_directory_name(&cwd)
+                    .expect("short cwd"),
+            );
+            std::fs::create_dir_all(&cwd).expect("cwd");
+            std::fs::create_dir_all(&project).expect("claude project");
+            for transcript in transcripts {
+                std::fs::write(project.join(format!("{transcript}.jsonl")), "{}\n")
+                    .expect("transcript");
+            }
+            let arguments = temp.path().join("arguments");
+            let mut request = native_launch(&temp, "claudeAgent");
+            request.provider_label = "Work Claude".to_owned();
+            request.binary_path = executable_fixture(&temp, "claude-copy", fixture)
+                .to_string_lossy()
+                .into_owned();
+            request.cwd = cwd;
+            request.resume_cursor = Some(cursor);
+            request.environment.insert(
+                "CLAUDE_CONFIG_DIR".to_owned(),
+                config.to_string_lossy().into_owned(),
+            );
+            request.environment.insert(
+                "BIBCODE_TEST_ARGUMENTS".to_owned(),
+                arguments.to_string_lossy().into_owned(),
+            );
+            Self {
+                temp,
+                request,
+                arguments,
+            }
+        }
+
+        async fn spawn(&self) -> Result<Arc<super::ClaudeDriver>, super::ProviderRuntimeError> {
+            let factory =
+                super::NativeProviderDriverFactory::new(self.temp.path().join("attachments"));
+            super::ClaudeDriver::spawn(
+                self.request.clone(),
+                factory.attachments.clone(),
+                factory.attribution.clone(),
+                false,
+                factory.claude_probe_cache.clone(),
+                factory.claude_probe_launch_policy,
+                false,
+            )
+            .await
+            .map(Arc::new)
+        }
+
+        async fn arguments(&self) -> Vec<String> {
+            timeout(Duration::from_secs(10), async {
+                loop {
+                    if let Ok(arguments) = std::fs::read_to_string(&self.arguments)
+                        && arguments.contains("--print")
+                    {
+                        break arguments.lines().map(str::to_owned).collect();
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("Claude launch arguments")
+        }
+    }
+
+    /// A copy forks its source under the ID BiBCode assigned it, so the launch reports the
+    /// requested cursor and owes no context handoff; once Claude has written the copy it resumes
+    /// it, and a copy whose source is gone starts a new conversation that owes the handoff.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_copy_forks_its_source_until_claude_has_written_it() {
+        let copy = json!({"sessionId":"copy","forkedFrom":"source"});
+        for (transcripts, stage) in [
+            (&["source"][..], "first"),
+            (&["source", "copy"][..], "written"),
+            (&[][..], "source gone"),
+        ] {
+            let launch = ClaudeCursorLaunch::new(CLAUDE_COPY_FIXTURE, copy.clone(), transcripts);
+            let driver = launch.spawn().await.expect("Claude driver should create");
+            let started = driver.start().await.expect("Claude start");
+            let arguments = launch.arguments().await;
+            let started_id = started
+                .resume_cursor
+                .as_ref()
+                .and_then(super::resume_string);
+            match stage {
+                "first" => {
+                    assert!(
+                        arguments.windows(5).any(|window| window
+                            == [
+                                "--resume",
+                                "source",
+                                "--fork-session",
+                                "--session-id",
+                                "copy"
+                            ]),
+                        "{arguments:?}"
+                    );
+                    assert_eq!(started.resume_cursor, Some(copy.clone()));
+                }
+                "written" => {
+                    assert!(
+                        arguments
+                            .windows(2)
+                            .any(|pair| pair == ["--resume", "copy"]),
+                        "{arguments:?}"
+                    );
+                    assert!(
+                        !arguments
+                            .iter()
+                            .any(|argument| argument == "--fork-session")
+                    );
+                    assert_eq!(started_id.as_deref(), Some("copy"));
+                }
+                _ => {
+                    assert!(!arguments.iter().any(|argument| argument == "--resume"));
+                    let started_id = started_id.expect("a new conversation's id");
+                    // Another ID than the requested one is the lost resume that owes a handoff.
+                    assert_ne!(started_id, "copy");
+                    assert!(
+                        arguments
+                            .windows(2)
+                            .any(|pair| pair == ["--session-id", started_id.as_str()])
+                    );
+                }
+            }
+            driver.shutdown().await.expect("Claude shutdown");
+        }
+    }
+
+    /// A copy is launched only by a Claude Code the probe says takes its session ID; without
+    /// the probe's answer the launch waits for it. Neither starts Claude, so the requested
+    /// cursor stays for the next send.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_copy_needs_a_probed_claude_code_that_takes_its_session_id() {
+        const OLD_FIXTURE: &str = "#!/bin/sh\ncase \"$1\" in\n  --version) printf '%s\\n' '2.0.72 (Claude Code)'; exit 0;;\n  --help) printf '%s\\n' '--fork-session --session-id'; exit 0;;\nesac\nprintf '%s\\n' \"$@\" > \"$BIBCODE_TEST_ARGUMENTS\"\ncat >/dev/null\n";
+        const UNPROBED_FIXTURE: &str = "#!/bin/sh\ncase \"$1\" in\n  --version) exit 1;;\n  --help) printf '%s\\n' '--fork-session --session-id'; exit 0;;\nesac\nprintf '%s\\n' \"$@\" > \"$BIBCODE_TEST_ARGUMENTS\"\ncat >/dev/null\n";
+        let copy = json!({"sessionId":"copy","forkedFrom":"source"});
+        for (fixture, expected) in [
+            (OLD_FIXTURE, super::CLAUDE_COPY_NEEDS_UPDATE),
+            (UNPROBED_FIXTURE, super::CLAUDE_COPY_AWAITS_PROBE),
+        ] {
+            let launch = ClaudeCursorLaunch::new(fixture, copy.clone(), &["source"]);
+            let error = match launch.spawn().await {
+                Ok(_) => panic!("a copy must not launch: {expected}"),
+                Err(error) => error,
+            };
+            let detail = match &error {
+                super::ProviderRuntimeError::IncompatibleProvider { detail, .. }
+                | super::ProviderRuntimeError::Provider { detail, .. } => detail.clone(),
+                other => panic!("unexpected error {other:?}"),
+            };
+            assert_eq!(detail, expected);
+            // An old Claude fails the delivery once; an unanswered probe is retried.
+            assert_eq!(
+                matches!(
+                    super::launch_failure_outcome(&error, "Work Claude"),
+                    super::ProviderDeliveryOutcome::Rejected { .. }
+                ),
+                expected == super::CLAUDE_COPY_NEEDS_UPDATE
+            );
+            assert!(!launch.arguments.exists(), "Claude was not started");
+        }
+    }
+
+    #[cfg(unix)]
+    async fn claude_events_until_exit(driver: &super::ClaudeDriver) -> Vec<super::ProviderEvent> {
+        let mut events = Vec::new();
+        let _ = timeout(Duration::from_secs(10), async {
+            while let Some(event) = driver.next_event().await {
+                let exited = event.event_type == "session.exited";
+                events.push(event);
+                if exited {
+                    break;
+                }
+            }
+        })
+        .await;
+        events
+    }
+
+    /// A copy Claude continues under an ID BiBCode did not assign fails before any of its
+    /// output reaches the thread, ends the session (so the driver is stopped), and keeps the
+    /// copy's cursor, so the next send forks again.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_copy_under_another_session_id_fails_before_its_output_shows() {
+        let copy = json!({"sessionId":"copy","forkedFrom":"source"});
+        let mut launch = ClaudeCursorLaunch::new(CLAUDE_COPY_FIXTURE, copy.clone(), &["source"]);
+        launch.request.environment.insert(
+            "BIBCODE_TEST_INIT_SESSION".to_owned(),
+            "claude-chose-this".to_owned(),
+        );
+        let driver = launch.spawn().await.expect("Claude driver should create");
+        let started = driver.start().await.expect("Claude start");
+        assert_eq!(started.resume_cursor, Some(copy));
+        let outcome = timeout(
+            Duration::from_secs(10),
+            driver.deliver("hello".into(), vec![], "default".into(), "copy-key".into()),
+        )
+        .await
+        .expect("delivery settles");
+        assert_eq!(
+            outcome,
+            super::ProviderDeliveryOutcome::Rejected {
+                detail: crate::provider::claude::runtime::CLAUDE_COPY_UNDER_ANOTHER_ID.to_owned(),
+            }
+        );
+        let events = claude_events_until_exit(&driver).await;
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event_type == "session.exited"),
+            "the session ends: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.payload.to_string().contains("copied answer")),
+            "no output of the copy is shown: {events:?}"
+        );
+        driver.shutdown().await.expect("Claude shutdown");
+
+        // Claude reporting the assigned ID runs the copy as usual.
+        let copy = json!({"sessionId":"copy","forkedFrom":"source"});
+        let mut launch = ClaudeCursorLaunch::new(CLAUDE_COPY_FIXTURE, copy, &["source"]);
+        launch
+            .request
+            .environment
+            .insert("BIBCODE_TEST_INIT_SESSION".to_owned(), "copy".to_owned());
+        let driver = launch.spawn().await.expect("Claude driver should create");
+        driver.start().await.expect("Claude start");
+        let outcome = timeout(
+            Duration::from_secs(10),
+            driver.deliver("hello".into(), vec![], "default".into(), "copy-key".into()),
+        )
+        .await
+        .expect("delivery settles");
+        assert!(
+            matches!(outcome, super::ProviderDeliveryOutcome::Accepted { .. }),
+            "{outcome:?}"
+        );
+        driver.shutdown().await.expect("Claude shutdown");
+    }
+
+    /// A `--resume` of an imported session that Claude ends with a failure before its first
+    /// `system/init` fails its message with a pointer to Continue in a copy, and the pump
+    /// records it; the same early exit on a native thread keeps the usual error.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_refused_resume_of_an_imported_session_points_at_a_copy() {
+        const REFUSING_FIXTURE: &str = "#!/bin/sh\ncase \"$1\" in\n  --version) printf '%s\\n' '2.1.310 (Claude Code)'; exit 0;;\n  --help) printf '%s\\n' '--fork-session --session-id'; exit 0;;\nesac\nprintf '%s\\n' \"$@\" > \"$BIBCODE_TEST_ARGUMENTS\"\nprintf '%s\\n' 'Error: session is in use' >&2\nexit 1\n";
+        let session = "0f8b5c2e-4d6a-4b1c-9e3f-2a7d8c9b1e40";
+        for (thread_id, refused) in [
+            (format!("import:claudeAgent:{session}"), true),
+            ("native-test-thread".to_owned(), false),
+        ] {
+            let mut launch =
+                ClaudeCursorLaunch::new(REFUSING_FIXTURE, json!({"sessionId":session}), &[session]);
+            launch.request.thread_id = thread_id;
+            let driver = launch.spawn().await.expect("Claude driver should create");
+            driver.start().await.expect("Claude start");
+            let outcome = timeout(
+                Duration::from_secs(10),
+                driver.deliver(
+                    "continue".into(),
+                    vec![],
+                    "default".into(),
+                    "resume-key".into(),
+                ),
+            )
+            .await
+            .expect("delivery settles");
+            let _ = timeout(Duration::from_secs(10), async {
+                while driver.next_event().await.is_some() {}
+            })
+            .await;
+            let refusal = super::ProviderDeliveryOutcome::Rejected {
+                detail: super::CLAUDE_RESUME_REFUSED.to_owned(),
+            };
+            if refused {
+                assert_eq!(outcome, refusal);
+            } else {
+                assert_ne!(outcome, refusal);
+            }
+            assert_eq!(driver.resume_refused(), refused);
+            driver.shutdown().await.expect("Claude shutdown");
+        }
+    }
+
+    /// The pump records a refused resume in the runtime row, which History reads.
+    #[tokio::test]
+    async fn a_refused_resume_is_recorded_in_the_runtime_row_when_its_stream_ends() {
+        for refused in [true, false] {
+            let engine = supervisor_engine().await;
+            let activity = super::ActivityProjection::new(ActivityRepository::new(
+                engine.repositories().database().clone(),
+            ));
+            let state = Arc::new(StdMutex::new(SupervisorDriverState {
+                resume_refused: refused,
+                ..SupervisorDriverState::default()
+            }));
+            let (event_sender, event_receiver) = mpsc::channel(1);
+            drop(event_sender);
+            let temp = TempDir::new().expect("launch directory");
+            let mut launch = native_launch(&temp, "claudeAgent");
+            launch.thread_id = "t1".to_owned();
+            let driver: Arc<dyn ProviderDriver> = Arc::new(SupervisorDriver {
+                state,
+                events: tokio::sync::Mutex::new(event_receiver),
+            });
+            let (activity_dispatch_sender, _activity_dispatch_receiver) = mpsc::channel(1);
+            let (terminal_sender, _terminal_receiver) = mpsc::unbounded_channel();
+            let pump = super::spawn_event_pump(
+                engine.clone(),
+                driver,
+                launch,
+                Some(json!({"sessionId":"session"})),
+                Some(json!({"transport":"stream-json"})),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+                activity,
+                Arc::new(StdMutex::new(super::ProviderActivityLifecycleState::new(
+                    crate::activity::ActivityCapabilities::default(),
+                ))),
+                false,
+                Arc::new(RwLock::new(None)),
+                activity_dispatch_sender,
+                "refused-resume-stream-ended".to_owned(),
+                tokio_util::sync::CancellationToken::new(),
+                Arc::new(tokio::sync::Mutex::new(
+                    super::SessionPublicationState::default(),
+                )),
+                None,
+                Arc::new(AtomicU64::new(0)),
+                terminal_sender,
+                Duration::from_secs(3_600),
+                None,
+            );
+            timeout(Duration::from_secs(5), pump)
+                .await
+                .expect("pump ends")
+                .expect("pump task");
+            let runtime = engine
+                .repositories()
+                .get_provider_session_runtime("t1".to_owned())
+                .await
+                .expect("runtime read");
+            if refused {
+                let runtime = runtime.expect("runtime row");
+                assert_eq!(runtime.resume_cursor, Some(json!({"sessionId":"session"})));
+                assert_eq!(
+                    runtime.runtime_payload,
+                    Some(json!({"transport":"stream-json","resumeRefused":true}))
+                );
+            } else {
+                assert!(runtime.is_none_or(|runtime| {
+                    runtime
+                        .runtime_payload
+                        .is_none_or(|payload| payload.get("resumeRefused").is_none())
+                }));
+            }
+        }
+    }
+
+    /// The session stays registered after its stream ends, and a shutdown writes its runtime row
+    /// again: the refusal must survive that, so History keeps offering a copy.
+    #[tokio::test]
+    async fn a_refused_resume_survives_a_shutdown_before_the_next_launch() {
+        let engine = supervisor_engine().await;
+        let activity = super::ActivityProjection::new(ActivityRepository::new(
+            engine.repositories().database().clone(),
+        ));
+        let state = Arc::new(StdMutex::new(SupervisorDriverState {
+            resume_refused: true,
+            ..SupervisorDriverState::default()
+        }));
+        let (events_tx, events_rx) = mpsc::channel(1);
+        let supervisor = super::ProviderRuntimeSupervisor::start(
+            engine.clone(),
+            Arc::new(SupervisorFactory {
+                state,
+                events: StdMutex::new(Some(events_rx)),
+            }),
+            activity,
+            super::SupervisorOptions::default(),
+        );
+        let temp = TempDir::new().expect("launch directory");
+        let mut launch = native_launch(&temp, "claudeAgent");
+        launch.thread_id = "t1".to_owned();
+        supervisor.launch(launch).await.expect("launch runtime");
+        drop(events_tx);
+        let refused = |runtime: Option<ProviderSessionRuntime>| {
+            runtime
+                .and_then(|runtime| runtime.runtime_payload)
+                .is_some_and(|payload| payload.get("resumeRefused") == Some(&json!(true)))
+        };
+        timeout(Duration::from_secs(5), async {
+            while !refused(
+                engine
+                    .repositories()
+                    .get_provider_session_runtime("t1".to_owned())
+                    .await
+                    .expect("runtime read"),
+            ) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the event pump records the refusal");
+
+        supervisor.shutdown().await.expect("shutdown");
+        let runtime = engine
+            .repositories()
+            .get_provider_session_runtime("t1".to_owned())
+            .await
+            .expect("runtime read")
+            .expect("runtime row");
+        assert_eq!(runtime.status, "suspended");
+        assert!(refused(Some(runtime)), "the shutdown kept the refusal");
+        engine.shutdown().await;
     }
 
     #[tokio::test]
@@ -20177,6 +20960,7 @@ done
             None,
             None,
             Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
             activity,
             Arc::new(StdMutex::new(super::ProviderActivityLifecycleState::new(
                 crate::activity::ActivityCapabilities::default(),
@@ -20315,6 +21099,7 @@ done
             launch,
             None,
             None,
+            Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
             activity.clone(),
             activity_lifecycle,
@@ -20574,6 +21359,7 @@ done
             None,
             None,
             Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
             activity.clone(),
             activity_lifecycle,
             true,
@@ -20769,6 +21555,7 @@ done
             launch,
             None,
             None,
+            Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
             activity.clone(),
             activity_lifecycle,

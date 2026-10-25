@@ -146,6 +146,10 @@ pub fn is_long_running(method: &str) -> bool {
             // included.
             | "worktree.remove"
             | "agentSessions.import"
+            // Reads a whole transcript and waits on the project's mutation lock.
+            // `agentSessions.listForThread` stays out: its budget bounds it, so a slow one is a
+            // finding.
+            | "agentSessions.openInPanel"
             // Waits on discovery and `simctl`: `check_available` lists simulators (up to
             // 15 s), and a rediscovery runs the Xcode probes.
             | "device.open"

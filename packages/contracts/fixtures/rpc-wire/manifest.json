@@ -26,6 +26,14 @@
       "mode": "unary"
     },
     {
+      "name": "agentSessions.listForThread",
+      "mode": "unary"
+    },
+    {
+      "name": "agentSessions.openInPanel",
+      "mode": "unary"
+    },
+    {
       "name": "agentSessions.scan",
       "mode": "unary"
     },
@@ -743,6 +751,10 @@
     "typed-failures/activity__retrySubtreeCancellation-01.json",
     "typed-failures/agentSessions__import-00.json",
     "typed-failures/agentSessions__import-01.json",
+    "typed-failures/agentSessions__listForThread-00.json",
+    "typed-failures/agentSessions__listForThread-01.json",
+    "typed-failures/agentSessions__openInPanel-00.json",
+    "typed-failures/agentSessions__openInPanel-01.json",
     "typed-failures/agentSessions__scan-00.json",
     "typed-failures/agentSessions__scan-01.json",
     "typed-failures/assets__createUrl-00.json",
@@ -1090,6 +1102,10 @@
     "typed-failures/activity__retrySubtreeCancellation-01.json": "f21e4233466694c02754d2a3c0317c089f31f6634947c5fcc16d02c4997c35cf",
     "typed-failures/agentSessions__import-00.json": "71ae7610885678f7cecc95cfec9d536eba40bede0c200e6a940329d97109b8ad",
     "typed-failures/agentSessions__import-01.json": "f21e4233466694c02754d2a3c0317c089f31f6634947c5fcc16d02c4997c35cf",
+    "typed-failures/agentSessions__listForThread-00.json": "71ae7610885678f7cecc95cfec9d536eba40bede0c200e6a940329d97109b8ad",
+    "typed-failures/agentSessions__listForThread-01.json": "f21e4233466694c02754d2a3c0317c089f31f6634947c5fcc16d02c4997c35cf",
+    "typed-failures/agentSessions__openInPanel-00.json": "71ae7610885678f7cecc95cfec9d536eba40bede0c200e6a940329d97109b8ad",
+    "typed-failures/agentSessions__openInPanel-01.json": "f21e4233466694c02754d2a3c0317c089f31f6634947c5fcc16d02c4997c35cf",
     "typed-failures/agentSessions__scan-00.json": "71ae7610885678f7cecc95cfec9d536eba40bede0c200e6a940329d97109b8ad",
     "typed-failures/agentSessions__scan-01.json": "f21e4233466694c02754d2a3c0317c089f31f6634947c5fcc16d02c4997c35cf",
     "typed-failures/assets__createUrl-00.json": "7551da8df8f02c2113f91309f210577ed8cc832cfbf199420cc2a7978e8b4ff9",
@@ -1336,12 +1352,12 @@
     "stream-shapes/subscribePreviewEvents-04.json": "0e8bac1a898590398b306a6611fd4676d2c1d122d5029999c62a462fdf938ea5",
     "stream-shapes/subscribePreviewEvents-05.json": "e90b7e4ce2b85d04010ece2f05878ca18fcfc97a7e00e6675717aea37f63da1c",
     "stream-shapes/subscribeProjectEntries-00.json": "fb0eccee51b5c2656e762ae9e52783c5c9a78ef4b3f7c46a9a1dcdfa609c8670",
-    "stream-shapes/subscribeServerConfig-00.json": "440e19b05ccfd13276f92bcb034e5d11ac502437b19066b158e80c41558f99a2",
+    "stream-shapes/subscribeServerConfig-00.json": "128bd790512e4bb646326b76233e795e19c9607378ec0ed6b5ff6754c1c5d49c",
     "stream-shapes/subscribeServerConfig-01.json": "d6296702690dd2563fb2036f89061a2afb977e986cab8a6dc0a77f45b500c432",
     "stream-shapes/subscribeServerConfig-02.json": "957408443e817af1c3222b4270e35db79c0e0c2ea0ac659ad2b7a88ba9362446",
     "stream-shapes/subscribeServerConfig-03.json": "44a3dddf17f52f741d1de921f509d0f7ef335b71fc24bfb5ceb34ea581aa5bd6",
-    "stream-shapes/subscribeServerLifecycle-00.json": "8b3a0c4c4cc1a1f00b4e1ed367abe92b63de54538c9e0f0cca74f0960ffeb0ff",
-    "stream-shapes/subscribeServerLifecycle-01.json": "584831ef5b8cbf72f4df6ae739643e0fc6420fa5e99cfd46329e943ee5119ad6",
+    "stream-shapes/subscribeServerLifecycle-00.json": "fc7724daf089f4cb2f24baeec0e87e7324fbc2432d0d12a3d88bd46338e62df8",
+    "stream-shapes/subscribeServerLifecycle-01.json": "187c4bc5e302059269c0ee8568fd0e9d25f25ded13793c529f6368a49a409ce8",
     "stream-shapes/subscribeTerminalEvents-00.json": "a33bc3be33b80b3bade2e3e4e7f6f25f2ca7c9ba87dd3ea9a781b4f3cb5bea82",
     "stream-shapes/subscribeTerminalEvents-01.json": "c65433f5ba3ebe8e6f7017398c99dff865f351e8c3b9708f4be20b73f8bdff81",
     "stream-shapes/subscribeTerminalEvents-02.json": "e00813631aca2b627480406ffac3369f82397ae64f4044f02f16e263e248cec4",
@@ -1632,6 +1648,10 @@
     "typed-failures/activity__retrySubtreeCancellation-01.json",
     "typed-failures/agentSessions__import-00.json",
     "typed-failures/agentSessions__import-01.json",
+    "typed-failures/agentSessions__listForThread-00.json",
+    "typed-failures/agentSessions__listForThread-01.json",
+    "typed-failures/agentSessions__openInPanel-00.json",
+    "typed-failures/agentSessions__openInPanel-01.json",
     "typed-failures/agentSessions__scan-00.json",
     "typed-failures/agentSessions__scan-01.json",
     "typed-failures/assets__createUrl-00.json",

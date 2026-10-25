@@ -3958,6 +3958,23 @@ async fn plan_command(
                     format!("Thread '{thread_id}' already exists and cannot be created twice."),
                 );
             }
+            // A panel's host is checked here, not by its caller: a generic `thread.delete` takes
+            // no project lock, so only the engine, which decides commands one at a time, orders
+            // a panel's creation against its host's deletion and its cascade.
+            if let Some(host_id) = host_thread_id {
+                let detail = match model.threads.get(host_id) {
+                    None => Some("does not exist"),
+                    Some(host) if host.deleted_at.is_some() => Some("is deleted"),
+                    Some(host) if host.project_id != *project_id => {
+                        Some("belongs to another project")
+                    }
+                    Some(host) if host.kind == "panel" => Some("is a chat panel itself"),
+                    Some(_) => None,
+                };
+                if let Some(detail) = detail {
+                    return invariant(command, format!("Host thread '{host_id}' {detail}."));
+                }
+            }
             let mut payload = json!({"threadId":thread_id,"projectId":project_id,"title":title,"modelSelection":model_selection,"runtimeMode":runtime_mode,"interactionMode":interaction_mode,"branch":branch,"worktreePath":worktree_path,"createdAt":created_at,"updatedAt":created_at});
             insert_optional(&mut payload, "kind", kind.as_ref().map(|v| json!(v)));
             insert_optional(
@@ -8875,6 +8892,114 @@ mod tests {
             .expect("host read")
             .expect("host exists");
         assert_eq!(host.host_thread_id, None);
+    }
+
+    /// The engine orders a panel's creation against its host's deletion: a generic
+    /// `thread.delete` takes no project lock, so only the decision itself can refuse a
+    /// panel whose host is gone.
+    #[tokio::test]
+    async fn a_panel_needs_a_live_host_of_its_project_that_is_not_a_panel() {
+        let (engine, host_id) = delivery_engine(TestHooks::default()).await;
+        engine
+            .dispatch(project_create_command_at(
+                "other-project",
+                "other-project",
+                "C:/other",
+            ))
+            .await
+            .expect("other project");
+        let other_host = "foreign-thread".to_owned();
+        engine
+            .dispatch(
+                serde_json::from_value(json!({
+                    "type":"thread.create","commandId":"create-foreign","threadId":other_host,
+                    "projectId":"other-project","title":"Foreign",
+                    "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+                    "runtimeMode":"full-access","createdAt":"2026-08-01T00:00:01Z"
+                }))
+                .expect("foreign thread command"),
+            )
+            .await
+            .expect("foreign thread");
+        let panel =
+            |command_id: &str, thread_id: &str, host: &str| OrchestrationCommand::ThreadCreate {
+                command_id: command_id.to_owned(),
+                thread_id: thread_id.to_owned(),
+                project_id: "delivery-project".to_owned(),
+                title: "Panel".to_owned(),
+                kind: Some("panel".to_owned()),
+                host_thread_id: Some(host.to_owned()),
+                model_selection: json!({"instanceId":"codex","model":"gpt-5"}),
+                runtime_mode: "full-access".to_owned(),
+                interaction_mode: "default".to_owned(),
+                branch: None,
+                worktree_path: None,
+                created_at: "2026-08-01T00:00:01Z".to_owned(),
+            };
+        let refusal = |result: Result<_, OrchestrationError>| match result {
+            Err(OrchestrationError::Invariant { detail, .. }) => detail,
+            other => panic!("expected an invariant refusal, got {other:?}"),
+        };
+        engine
+            .dispatch(panel("create-panel", "panel-thread", &host_id))
+            .await
+            .expect("a panel of a live host");
+        engine
+            .dispatch(
+                serde_json::from_value(json!({
+                    "type":"thread.create","commandId":"create-side","threadId":"side-thread",
+                    "projectId":"delivery-project","title":"Side",
+                    "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+                    "runtimeMode":"full-access","createdAt":"2026-08-01T00:00:01Z"
+                }))
+                .expect("side thread command"),
+            )
+            .await
+            .expect("side thread");
+        engine
+            .dispatch(OrchestrationCommand::ThreadDelete {
+                command_id: "delete-side".to_owned(),
+                thread_id: "side-thread".to_owned(),
+            })
+            .await
+            .expect("side deleted");
+        for (command_id, host, expected) in [
+            (
+                "missing-host",
+                "no-such-thread",
+                "Host thread 'no-such-thread' does not exist.",
+            ),
+            (
+                "deleted-host",
+                "side-thread",
+                "Host thread 'side-thread' is deleted.",
+            ),
+            (
+                "foreign-host",
+                other_host.as_str(),
+                &format!("Host thread '{other_host}' belongs to another project."),
+            ),
+            (
+                "panel-host",
+                "panel-thread",
+                "Host thread 'panel-thread' is a chat panel itself.",
+            ),
+        ] {
+            let thread_id = format!("{command_id}-panel");
+            assert_eq!(
+                refusal(engine.dispatch(panel(command_id, &thread_id, host)).await),
+                expected
+            );
+            assert!(
+                engine
+                    .repositories()
+                    .get_thread(thread_id)
+                    .await
+                    .expect("thread read")
+                    .is_none(),
+                "a refused panel is not created"
+            );
+        }
     }
 
     fn delivery_turn_for_message(

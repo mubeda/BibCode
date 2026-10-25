@@ -346,6 +346,9 @@ pub struct WorktreeCatalogRpcServices {
     removal_git: Option<Arc<dyn WorktreeRemovalGit>>,
     status_broadcaster: Option<StatusBroadcaster>,
     operations: WorktreeCatalogOperationRuntime,
+    /// Holds `worktree.createPanel` after it revalidated the host, before it dispatches, for
+    /// tests.
+    panel_dispatch_gate: Option<crate::production::step_gate::StepGate>,
     #[cfg(test)]
     removal_admission_timeout: Duration,
     #[cfg(test)]
@@ -528,6 +531,7 @@ impl WorktreeCatalogRpcServices {
             removal_git,
             status_broadcaster: None,
             operations,
+            panel_dispatch_gate: None,
             #[cfg(test)]
             removal_admission_timeout: REMOVAL_ADMISSION_DRAIN_TIMEOUT,
             #[cfg(test)]
@@ -538,6 +542,16 @@ impl WorktreeCatalogRpcServices {
     #[must_use]
     pub fn with_removal_quiescer(mut self, quiescer: Arc<dyn WorktreeRemovalQuiescer>) -> Self {
         self.removal_quiescer = quiescer;
+        self
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_panel_dispatch_gate(
+        mut self,
+        gate: crate::production::step_gate::StepGate,
+    ) -> Self {
+        self.panel_dispatch_gate = Some(gate);
         self
     }
 
@@ -1460,6 +1474,11 @@ async fn create_worktree_panel(
                                     None,
                                 ))
                             })?;
+                        // A generic delete of the host can still land here; the engine refuses
+                        // the panel then.
+                        if let Some(gate) = &services.panel_dispatch_gate {
+                            gate.pass().await;
+                        }
                         let result = services
                             .orchestration
                             .dispatch_with_admission_and_command_claim_until_handoff(

@@ -1827,6 +1827,41 @@ staticDescribe("project header context menu", () => {
     await flush();
     expect(h.spies.routerNavigate).not.toHaveBeenCalled();
   });
+
+  it("opens a session continued from History as the active panel of its host", async () => {
+    baseScenario();
+    render(<Sidebar />);
+
+    const dialog = captured("ImportCliSessionsDialog").at(-1)!;
+    const target = {
+      environmentId: projectA.environmentId,
+      projectId: projectA.id,
+      workspaceRoot: projectA.workspaceRoot,
+    };
+    const onOpenThread = dialog.props.onOpenThread as (
+      target: unknown,
+      threadId: string,
+      panel?: { hostThreadId: string; title: string },
+    ) => void;
+    onOpenThread(target, "import:claudeAgent:session-one", {
+      hostThreadId: "host-thread",
+      title: "Flaky test",
+    });
+    await flush();
+
+    expect(h.spies.routerNavigate).toHaveBeenCalledWith({
+      to: "/$environmentId/$threadId",
+      params: { environmentId: projectA.environmentId, threadId: "host-thread" },
+    });
+    // Its shell is not loaded, so the panel is reopened (unarchived) into the host's tabs.
+    expect(h.state.commandCalls).toContainEqual({
+      label: "thread.unarchive",
+      input: {
+        environmentId: projectA.environmentId,
+        input: { threadId: "import:claudeAgent:session-one" },
+      },
+    });
+  });
 });
 
 staticDescribe("worktree discovery integration", () => {

@@ -616,6 +616,8 @@ impl ProductionRuntime {
             &mut registry,
             orchestration.clone(),
             config.state_dir(),
+            worktree_catalog.clone(),
+            control.published_provider_inventory(),
         );
         register_workspace_preview_rpc(&mut registry, workspace_preview);
         crate::production::device_rpc::register_device_rpc(&mut registry, device_manager.clone());

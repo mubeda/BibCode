@@ -274,6 +274,39 @@ client that opens it, so a command that printed megabytes is not sent with
 every replay; the full result stays in Claude's own session transcript. Codex
 and Cursor already leave command output off their records.
 
+## Terminal sessions in History
+
+The composer's **History** button lists the Claude Code sessions run with
+`claude` in a terminal in the thread's folder (its worktree, or the project
+root) in the last 30 days, on the server that runs BiBCode. Sessions started
+with `claude -p`, by an Agent SDK, by the Desktop app, or by BiBCode itself are
+left out, and so are sessions another BiBCode thread already runs. A row shows
+the name you gave the session with `/rename` (or the one Claude generated),
+else its first prompt, with its branch and last activity.
+
+- **Continue** opens the session as a chat panel of the thread, in the
+  thread's branch, worktree and permission mode, with up to 200 of its
+  messages. Your next message runs `claude --resume <id>` in that folder, so
+  the terminal and the panel share one conversation from then on. Don't resume
+  it in a terminal again while the panel uses it: both would write to the same
+  transcript.
+- **Continue in a copy** is offered instead whenever the session may still be
+  open in a terminal (Claude Code's running-session files say so, or BiBCode
+  can't read them completely), when an earlier chat of it was deleted, or when
+  Claude Code refused to resume it here. The panel runs
+  `claude --resume <id> --fork-session --session-id <new id>`, under an ID
+  BiBCode chose, and the terminal's conversation is left untouched. A copy
+  needs Claude Code 2.0.73 or later; on an older one the row asks you to
+  update it.
+- **Open** shows a session you already continued.
+
+If Claude Code ends a resumed session's launch with an error before it starts
+(for example, because the session is still running in the background), the
+message fails with "Claude Code couldn't continue this session here", and
+History then offers **Continue in a copy** for it. If a copy ever comes up
+under a session ID BiBCode did not choose, its message fails before any answer
+is shown, and the next message tries the copy again.
+
 ## Background work and idle suspension
 
 BiBCode suspends an idle chat session 60 seconds after its turn ends and
@@ -322,7 +355,9 @@ only when help advertises both exact switches:
 - `--forward-subagent-text`
 
 If either switch is unavailable or the bounded probe fails, Claude still runs in
-its normal stream-JSON mode without structured hook activity.
+its normal stream-JSON mode without structured hook activity. The same probe
+tells whether **Continue in a copy** can run: version 2.0.73 or later with
+`--fork-session` in its help.
 
 `--help` stays the gate even though the
 [CLI reference](https://code.claude.com/docs/en/cli-reference) warns that it
