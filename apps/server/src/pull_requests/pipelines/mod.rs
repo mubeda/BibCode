@@ -1082,16 +1082,20 @@ impl PipelinesService {
         c: &CancellationToken,
     ) -> Result<JobLog, PullRequestsOperationError> {
         let logs = &self.state().logs;
-        if let Some(log) = logs.cached(key) {
-            // A memory answer needs a job read by this account within 30 s.
-            self.facts(admitted, key, false, c).await?;
-            return Ok(JobLog::Chunk(log.window(input.from)));
-        }
+        // A memory answer needs a job read by this account within 30 s.
         let facts = self.facts(admitted, key, false, c).await?;
         if facts.erased {
             return Ok(log_unavailable(LogUnavailable::Erased, &facts));
         }
         let terminal = facts.terminal;
+        // A copy taken while the job ran (kept past 2 MiB until it finishes)
+        // misses the final lines: a finished job reads its log again.
+        if terminal {
+            logs.forget_unfinished(key);
+        }
+        if let Some(log) = logs.cached(key) {
+            return Ok(JobLog::Chunk(log.window(input.from)));
+        }
         // GitHub serves a job's log once it completes; until then its own
         // page shows the live log.
         if !terminal && !admitted.host.live_logs() {

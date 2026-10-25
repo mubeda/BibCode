@@ -1137,6 +1137,65 @@ esac"#,
     }
 
     #[tokio::test]
+    async fn a_downloaded_running_log_over_2mib_is_downloaded_again_once_the_job_finishes() {
+        let b = bench("pipelines-big-running-log").await;
+        b.open().await;
+        b.prs
+            .pipelines
+            .logs
+            .set_range_support(HOST, RangeSupport::Unsupported);
+        lock(&b.fake.jobs).insert(
+            998,
+            Answer::Ok(job_detail(998, PipelineStatus::Running, None)),
+        );
+        let mut running = vec![b'a'; log::LIVE_REDOWNLOAD_MAX];
+        running.push(b'\n');
+        lock(&b.fake.trace).log = running.clone();
+        let first = chunk(
+            b.service
+                .job_log(b.log_input(LogFrom::Tail, Refresh::User), &c())
+                .await
+                .unwrap(),
+        );
+        assert!(!first.complete);
+        // Live updates pause over 2 MiB: a running re-read answers from memory.
+        b.service
+            .job_log(b.log_input(LogFrom::Tail, Refresh::User), &c())
+            .await
+            .unwrap();
+        assert_eq!(b.fake.calls("trace 998 whole"), 1);
+        // The job finishes with its last lines; the job page reads it once.
+        let mut finished = running;
+        finished.extend_from_slice(b"Job succeeded\n");
+        let size = finished.len() as u64;
+        lock(&b.fake.trace).log = finished;
+        lock(&b.fake.jobs).insert(
+            998,
+            Answer::Ok(job_detail(998, PipelineStatus::Success, Some(size))),
+        );
+        b.service
+            .job(
+                JobInput {
+                    cwd: b.cwd(),
+                    job_id: 998,
+                    refresh: Refresh::User,
+                },
+                &c(),
+            )
+            .await
+            .unwrap();
+        let last = chunk(
+            b.service
+                .job_log(b.log_input(LogFrom::Tail, Refresh::User), &c())
+                .await
+                .unwrap(),
+        );
+        assert_eq!(b.fake.calls("trace 998 whole"), 2, "the final log is read");
+        assert!(last.complete);
+        assert!(last.text.ends_with("Job succeeded\n"));
+    }
+
+    #[tokio::test]
     async fn a_memory_answer_older_than_30s_reads_the_job_first_and_a_403_refuses_the_text() {
         let b = bench("pipelines-authorized").await;
         b.open().await;
