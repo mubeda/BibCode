@@ -1071,7 +1071,7 @@ impl Repositories {
             .fetch_add(1, Ordering::SeqCst);
         // A closed (archived) chat panel starts nothing until it is reopened.
         let result = self.database.call(move |connection| connection.query_row(
-            "UPDATE provider_turn_outbox SET state = 'sending', attempts = attempts + 1, updated_at = ? WHERE command_id = ? AND state = 'pending' AND (mode <> 'start' OR NOT EXISTS(SELECT 1 FROM projection_thread_sessions WHERE thread_id = provider_turn_outbox.thread_id AND status IN ('running', 'starting'))) AND NOT EXISTS(SELECT 1 FROM projection_threads WHERE thread_id = provider_turn_outbox.thread_id AND kind = 'panel' AND archived_at IS NOT NULL) RETURNING command_id, thread_id, message_id, provider_instance_id, provider_kind, provider_session_id, delivery_key, payload_json, state, attempts, last_error, created_at, updated_at, mode, held",
+            "UPDATE provider_turn_outbox SET state = 'sending', attempts = attempts + 1, updated_at = ? WHERE command_id = ? AND state = 'pending' AND (mode <> 'start' OR NOT EXISTS(SELECT 1 FROM projection_thread_sessions WHERE thread_id = provider_turn_outbox.thread_id AND status IN ('running', 'starting'))) AND NOT EXISTS(SELECT 1 FROM projection_threads WHERE thread_id = provider_turn_outbox.thread_id AND kind = 'panel' AND archived_at IS NOT NULL) AND NOT EXISTS(SELECT 1 FROM thread_compactions WHERE thread_id = provider_turn_outbox.thread_id AND state IN ('requested', 'running', 'unresolved')) RETURNING command_id, thread_id, message_id, provider_instance_id, provider_kind, provider_session_id, delivery_key, payload_json, state, attempts, last_error, created_at, updated_at, mode, held",
             params![updated_at, command_id], decode_provider_turn_delivery).optional().map_err(Into::into)).await;
         #[cfg(test)]
         if result.as_ref().is_ok_and(Option::is_some) {
@@ -2395,6 +2395,10 @@ pub struct ProjectionThread {
     /// Host thread of a `panel` thread, recorded by `worktree.createPanel`.
     #[serde(default)]
     pub host_thread_id: Option<String>,
+    /// The thread's unsettled conversation compaction (`compactionId`, `trigger`, `state`,
+    /// `failedMessageId`), projected from its events.
+    #[serde(default)]
+    pub compaction: Option<Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2419,6 +2423,9 @@ pub struct ProjectionThreadMessage {
     pub delivery_reason: Option<String>,
     pub delivery_mode: Option<String>,
     pub delivery_held: Option<bool>,
+    /// The failed message this server-admitted copy sends again.
+    #[serde(default)]
+    pub resend_of_message_id: Option<String>,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
 }
@@ -2683,9 +2690,9 @@ pub struct AuthSession {
 }
 
 const PROJECT_SELECT: &str = "SELECT project_id, title, workspace_root, default_model_selection_json, scripts_json, worktree_discovery_json, (SELECT repository_key FROM project_worktree_repository_pins WHERE project_id = projection_projects.project_id), created_at, updated_at, deleted_at, repository_identity_json FROM projection_projects";
-const THREAD_SELECT: &str = "SELECT thread_id, project_id, title, kind, model_selection_json, runtime_mode, interaction_mode, branch, worktree_path, latest_turn_id, created_at, updated_at, archived_at, latest_user_message_at, pending_approval_count, pending_user_input_count, has_actionable_proposed_plan, unresolved_delivery_state, unresolved_delivery_detail, deleted_at, host_thread_id FROM projection_threads";
+const THREAD_SELECT: &str = "SELECT thread_id, project_id, title, kind, model_selection_json, runtime_mode, interaction_mode, branch, worktree_path, latest_turn_id, created_at, updated_at, archived_at, latest_user_message_at, pending_approval_count, pending_user_input_count, has_actionable_proposed_plan, unresolved_delivery_state, unresolved_delivery_detail, deleted_at, host_thread_id, compaction_json FROM projection_threads";
 const PROJECT_LIST_ORDER: &str = " ORDER BY created_at ASC, project_id ASC";
-const MESSAGE_SELECT: &str = "SELECT message_id, thread_id, turn_id, role, text, attachments_json, is_streaming, delivery_state, delivery_provider, delivery_detail, created_at, updated_at, delivery_mode, delivery_held, delivery_reason, delivery_provider_instance_id FROM projection_thread_messages";
+const MESSAGE_SELECT: &str = "SELECT message_id, thread_id, turn_id, role, text, attachments_json, is_streaming, delivery_state, delivery_provider, delivery_detail, created_at, updated_at, delivery_mode, delivery_held, delivery_reason, delivery_provider_instance_id, resend_of_message_id FROM projection_thread_messages";
 const MESSAGE_LIST_ORDER: &str = " ORDER BY CASE WHEN delivery_state = 'queued' THEN (SELECT receipt.result_sequence FROM provider_turn_outbox AS queued JOIN orchestration_command_receipts AS receipt ON receipt.command_id = queued.command_id WHERE queued.message_id = projection_thread_messages.message_id) END ASC, created_at ASC, message_id ASC";
 const ACTIVITY_SELECT: &str = "SELECT activity_id, thread_id, turn_id, tone, kind, summary, payload_json, sequence, created_at FROM projection_thread_activities";
 /// Activities without a provider sequence come first: SQLite sorts NULL before any value in
@@ -2923,6 +2930,7 @@ fn decode_thread(row: &Row<'_>) -> rusqlite::Result<ProjectionThread> {
         unresolved_delivery_detail: row.get(18)?,
         deleted_at: row.get(19)?,
         host_thread_id: row.get(20)?,
+        compaction: decode_optional_json(row.get(21)?, "compaction_json")?,
     })
 }
 fn decode_message(row: &Row<'_>) -> rusqlite::Result<ProjectionThreadMessage> {
@@ -2941,6 +2949,7 @@ fn decode_message(row: &Row<'_>) -> rusqlite::Result<ProjectionThreadMessage> {
         delivery_reason: row.get(14)?,
         delivery_mode: row.get(12)?,
         delivery_held: row.get(13)?,
+        resend_of_message_id: row.get(16)?,
         created_at: row.get(10)?,
         updated_at: row.get(11)?,
     })
@@ -3053,6 +3062,10 @@ pub(crate) fn can_promote_queued_provider_turn_on(
              ))
              AND NOT EXISTS(SELECT 1 FROM provider_turn_outbox AS active
                WHERE active.thread_id = queued.thread_id AND active.state IN ('pending', 'sending'))
+             -- An unsettled compaction holds the thread, for Send now too: the copy it may admit
+             -- goes first, and a promoted start would wait behind the compaction with a marker.
+             AND NOT EXISTS(SELECT 1 FROM thread_compactions AS compaction
+               WHERE compaction.thread_id = queued.thread_id AND compaction.state IN ('requested', 'running', 'unresolved'))
              AND queued.command_id = (
                SELECT next.command_id FROM provider_turn_outbox AS next
                JOIN orchestration_command_receipts AS receipt ON receipt.command_id = next.command_id

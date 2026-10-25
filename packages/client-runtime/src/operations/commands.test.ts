@@ -22,7 +22,7 @@ import {
 import * as EnvironmentSupervisor from "../connection/supervisor.ts";
 import * as RpcSession from "../rpc/session.ts";
 import type { WsRpcProtocolClient } from "../rpc/protocol.ts";
-import { archiveThread, createProject, stopThreadSession } from "./commands.ts";
+import { archiveThread, compactThread, createProject, stopThreadSession } from "./commands.ts";
 import * as EnvironmentCommands from "./commands.ts";
 
 const TEST_CRYPTO_LAYER = Layer.succeed(
@@ -202,6 +202,28 @@ describe("environment commands", () => {
         {
           type: "thread.session.stop",
           commandId: "queued-command",
+          threadId: "thread-1",
+          createdAt: "2026-06-06T00:01:00.000Z",
+        },
+      ]);
+    }).pipe(Effect.provide(TEST_CRYPTO_LAYER)),
+  );
+
+  it.effect("dispatches a conversation compaction as thread.compact", () =>
+    Effect.gen(function* () {
+      const dispatched: ClientOrchestrationCommand[] = [];
+      const supervisor = yield* makeSupervisor(dispatched);
+
+      yield* compactThread({
+        commandId: CommandId.make("compact-command"),
+        threadId: ThreadId.make("thread-1"),
+        createdAt: "2026-06-06T00:01:00.000Z",
+      }).pipe(Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor));
+
+      expect(dispatched).toEqual([
+        {
+          type: "thread.compact",
+          commandId: "compact-command",
           threadId: "thread-1",
           createdAt: "2026-06-06T00:01:00.000Z",
         },

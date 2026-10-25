@@ -368,6 +368,47 @@ onto the thread session as `lastError` and `lastErrorClass`. `context_limit` is
 provider-reported too: the conversation no longer fits the provider's context
 window, and the thread offers to compact it.
 
+A failed `turn.completed` can also carry `providerReason`, the provider's own
+name for the failure (Claude's `terminal_reason`, Codex's `codexErrorInfo`
+variant, OpenCode's error name), which the shared failed-turn projection
+records in the Profiler as `provider.turn-failed` for every provider, once per
+turn. A `context_limit` failure may add two facts the adapter reads from the
+provider, never inferred from text by the engine: `beforeOutput: true` when
+the provider refused the turn's input before any assistant text, tool call or
+compaction, and `compactable: false` when the provider said compacting cannot
+help. The event pump passes them on its internal `thread.session.set` as
+`contextLimit`; absent facts mean no automatic recovery. Only Claude reports
+them today.
+
+### Conversation compaction
+
+`supports_compaction` in `apps/server/src/provider/mod.rs` is the driver-owned
+capability, advertised as `supportsCompaction` on the provider snapshot like
+`supportsTurnSteer`: Claude and Codex. A driver implements
+`ProviderDriver::compact(compaction_id)`, which returns
+`ProviderCompactionStart`: `Started { turn_id }` (the provider took the
+request; the outcome arrives as events), `NotStarted { detail }` (certainly
+not sent; the default) or `Unknown { detail }` (the request may have reached
+the provider). Claude writes `/compact` on stdin as an acknowledged operation
+without an outbox row (see [Claude](../providers/claude.md#compaction-and-the-context-limit));
+Codex calls `thread/compact/start` and tags the next root turn Codex starts.
+OpenCode 2 is left out until its compaction of an idle session (`delivery:
+steer`) is confirmed to run at once and its BiBCode-started server is
+confirmed to end with BiBCode, which restart reconciliation relies on; typing
+`/compact` still compacts there.
+
+Each driver reports the compaction as a turn of its own and puts the
+`compactionId` on that turn's `turn.started` and `turn.completed`. The event
+pump carries it on the running `thread.session.set`; the turns projector then
+gives the turn its own row and neither binds nor deletes a pending message's
+marker, so a message waiting behind the compaction keeps its marker for its
+own turn. The compaction succeeded only when its tagged turn completed (not
+failed or interrupted) and a `context_compaction` item in it completed;
+settlement matches the compaction id and the turn id, so a late event of one
+compaction cannot settle another. The event pump also tags each
+`context-window.updated` reading with the provider instance and conversation
+it was read from (`providerInstanceId`, `conversationId`).
+
 Decoders accept a newer, unrecognized provider class as `unknown` so a newer
 server cannot make an older client reject the entire live event or persisted
 session. Encoders remain strict and emit only the canonical values above.

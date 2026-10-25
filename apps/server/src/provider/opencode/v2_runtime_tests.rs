@@ -1011,6 +1011,7 @@ async fn provider_failures_and_interrupts_complete_the_turn_with_their_state() {
             "stopReason": "error",
             "errorMessage": "mock provider rejected the request (HTTP 400)",
             "errorClass": "provider_error",
+            "providerReason": "provider_invalid-request",
         })
     );
 

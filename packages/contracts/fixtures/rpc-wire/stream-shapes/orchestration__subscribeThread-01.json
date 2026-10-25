@@ -14,10 +14,19 @@
         "causationEventId": null,
         "correlationId": null,
         "metadata": {},
-        "type": "thread.reverted",
+        "type": "thread.session-set",
         "payload": {
-          "threadId": "",
-          "turnCount": 76
+          "threadId": "toString",
+          "session": {
+            "threadId": "0",
+            "status": "interrupted",
+            "providerName": null,
+            "providerInstanceId": "N",
+            "runtimeMode": "full-access",
+            "activeTurnId": null,
+            "lastError": "prototype",
+            "updatedAt": "0"
+          }
         }
       }
     }

@@ -1294,6 +1294,8 @@ async fn project_session(engine: &OrchestrationEngine, thread_id: &str, status: 
                 last_error_class: None,
                 updated_at: NOW.to_owned(),
             },
+            compaction_id: None,
+            context_limit: None,
             created_at: NOW.to_owned(),
         })
         .await
@@ -2577,6 +2579,7 @@ fn thread_message(
         delivery_reason: None,
         delivery_mode: None,
         delivery_held: None,
+        resend_of_message_id: None,
         created_at: created_at.to_owned(),
         updated_at: created_at.to_owned(),
     }
@@ -12531,6 +12534,8 @@ async fn restart_reconciles_abandoned_running_provider_sessions() {
                 last_error_class: None,
                 updated_at: NOW.to_owned(),
             },
+            compaction_id: None,
+            context_limit: None,
             created_at: NOW.to_owned(),
         })
         .await
@@ -12601,6 +12606,8 @@ async fn restart_reconciles_abandoned_ready_provider_sessions() {
                 last_error_class: None,
                 updated_at: NOW.to_owned(),
             },
+            compaction_id: None,
+            context_limit: None,
             created_at: NOW.to_owned(),
         })
         .await

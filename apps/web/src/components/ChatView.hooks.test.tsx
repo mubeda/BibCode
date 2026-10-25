@@ -206,6 +206,7 @@ vi.mock("../state/threads", () => ({
     respondToApproval: { key: "thread.respondToApproval" },
     respondToUserInput: { key: "thread.respondToUserInput" },
     revertCheckpoint: { key: "thread.revertCheckpoint" },
+    compact: { key: "thread.compact" },
   },
 }));
 

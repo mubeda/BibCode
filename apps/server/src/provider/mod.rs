@@ -14,6 +14,16 @@ pub(crate) fn supports_turn_steer(provider: &str) -> bool {
     matches!(provider, "codex" | "claudeAgent")
 }
 
+/// Driver-owned capability used by inventory, `thread.compact` admission and context-limit
+/// recovery: the driver's `compact` asks the provider to compact its conversation and reports
+/// the compaction as a turn of its own, tagged with the compaction id. OpenCode 2 is left out
+/// until its compaction of an idle session (`delivery: steer`) is confirmed to run at once, and
+/// a Server URL instance outlives BiBCode, which restart reconciliation assumes it does not;
+/// typing `/compact` still compacts there.
+pub(crate) fn supports_compaction(provider: &str) -> bool {
+    matches!(provider, "claude" | "claudeAgent" | "codex")
+}
+
 /// A provider slash invocation, `/name arguments`, as `(name, arguments)`. A name is ASCII
 /// letters, digits, `-`, `_`, `:` and `.`, so text such as a leading file path is not one.
 pub(crate) fn parse_provider_command(text: &str) -> Option<(&str, &str)> {
