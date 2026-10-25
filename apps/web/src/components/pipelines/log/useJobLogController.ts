@@ -20,6 +20,7 @@ import { createJobLogEngine, type JobLogEngine } from "./jobLogEngine";
 import {
   INITIAL_JOB_LOG_READER_STATE,
   JobLogReader,
+  readerCanLoadLater,
   type JobLogReaderState,
   type LogReadAnswer,
   type LogReadInput,
@@ -456,13 +457,7 @@ export function useJobLogController({
 
   const canLoadEarlier =
     readerState.range !== null && readerState.range.start > 0 && readerState.earlierLimit === null;
-  const canLoadLater =
-    readerState.range !== null &&
-    !live &&
-    !readerState.complete &&
-    !readerState.busy &&
-    !readerState.laterExhausted &&
-    readerState.phase === "done";
+  const canLoadLater = readerCanLoadLater(readerState, live);
 
   return useMemo<JobLogValue>(
     () => ({

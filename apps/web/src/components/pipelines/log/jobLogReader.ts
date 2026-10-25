@@ -31,6 +31,23 @@ export const LOG_FOLLOW_MS = 5_000;
 /** The most log text one job view keeps. */
 export const LOG_CLIENT_CAP = 16 * 1024 * 1024;
 
+/**
+ * Whether a finished log has text after the loaded window (a line link opens on a window in
+ * the middle) that the page may still hold: reads stop at `LOG_CLIENT_CAP` either way.
+ */
+export function readerCanLoadLater(state: JobLogReaderState, live: boolean): boolean {
+  const { range, complete, phase, busy, laterExhausted } = state;
+  return (
+    range !== null &&
+    range.end - range.start < LOG_CLIENT_CAP &&
+    !complete &&
+    !live &&
+    phase === "done" &&
+    !busy &&
+    !laterExhausted
+  );
+}
+
 export interface LogReadInput {
   readonly from: PipelinesLogFrom;
   readonly refresh: PipelinesRefresh;
@@ -227,10 +244,7 @@ export class JobLogReader {
    * window in the middle): the view reads it when the reader scrolls to the end.
    */
   canLoadLater(): boolean {
-    const { range, complete, phase, busy, laterExhausted } = this.state;
-    return (
-      range !== null && !complete && !this.live && phase === "done" && !busy && !laterExhausted
-    );
+    return readerCanLoadLater(this.state, this.live);
   }
 
   loadLater(): void {
@@ -360,6 +374,8 @@ export class JobLogReader {
         range,
         earlierLimit,
       });
+      // The job finished while this read was out: the rest of its log is one read away.
+      if (read.live && !this.live) this.finalRead();
       return;
     }
     const base = {
