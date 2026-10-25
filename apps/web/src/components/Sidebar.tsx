@@ -12,6 +12,7 @@ import {
   SearchIcon,
   SettingsIcon,
   TriangleAlertIcon,
+  WorkflowIcon,
 } from "lucide-react";
 import {
   prStatusIndicator,
@@ -637,16 +638,29 @@ function legacyExpansionKeys(project: SidebarProjectSnapshot): string[] {
 // height; `h-auto` lets it grow while normal project rows keep their height.
 // The action strip is always visible, so the title stops short of it: 24px per icon and 2px gaps,
 // plus 22px for the sandbox badge that sits in front of the icons.
-const PROJECT_HEADER_ACTION_PADDING = {
+export const PROJECT_HEADER_ACTION_PADDING = {
   3: { plain: "pr-21", badge: "pr-27" },
   4: { plain: "pr-27", badge: "pr-33" },
+  5: { plain: "pr-33", badge: "pr-39" },
 } as const;
+
+export type ProjectHeaderActionCount = keyof typeof PROJECT_HEADER_ACTION_PADDING;
+
+/** Project actions, New worktree and Git Manager always show; Pull Requests and Pipelines may. */
+export function projectHeaderActionCount(input: {
+  readonly showsPullRequests: boolean;
+  readonly showsPipelines: boolean;
+}): ProjectHeaderActionCount {
+  return (3 +
+    Number(input.showsPullRequests) +
+    Number(input.showsPipelines)) as ProjectHeaderActionCount;
+}
 
 export function projectHeaderButtonClassName(input: {
   readonly showsSandboxBadge: boolean;
   readonly isManualProjectSorting: boolean;
   readonly isEnvironmentCard: boolean;
-  readonly actionCount: 3 | 4;
+  readonly actionCount: ProjectHeaderActionCount;
 }): string {
   const padding = PROJECT_HEADER_ACTION_PADDING[input.actionCount];
   return cn(
@@ -1788,6 +1802,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
     environmentCard = null,
   } = props;
   const pullRequestsEnabled = usePrimarySettings((settings) => settings.pullRequestsEnabled);
+  const pipelinesEnabled = usePrimarySettings((settings) => settings.pipelinesEnabled);
   const requestWorktreeRemoval = useContext(WorktreeRemovalRequestContext);
   const threadSortOrder = useClientSettings<SidebarThreadSortOrder>(
     (settings) => settings.sidebarThreadSortOrder,
@@ -2775,6 +2790,24 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
     [openPullRequestsForProjectMember, runProjectMemberAction],
   );
 
+  const openPipelinesForProjectMember = useCallback(
+    (member: SidebarProjectGroupMember) => {
+      if (isMobile) setOpenMobile(false);
+      void navigate({
+        to: "/project/$environmentId/$projectId/pipelines",
+        params: { environmentId: member.environmentId, projectId: member.id },
+      });
+    },
+    [isMobile, navigate, setOpenMobile],
+  );
+
+  const handleOpenPipelinesClick = useCallback(
+    (event: React.MouseEvent<HTMLButtonElement>) => {
+      runProjectMemberAction(event, openPipelinesForProjectMember);
+    },
+    [openPipelinesForProjectMember, runProjectMemberAction],
+  );
+
   const attemptArchiveThread = useCallback(
     async (threadRef: ScopedThreadRef) => {
       const result = await archiveThread(threadRef);
@@ -3357,8 +3390,9 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
     ],
   );
 
-  // In the Repositories view the repository row owns Pull Requests.
+  // In the Repositories view the repository row owns Pull Requests and Pipelines.
   const showsPullRequestsAction = pullRequestsEnabled && !environmentCard;
+  const showsPipelinesAction = pipelinesEnabled && !environmentCard;
   const showsSandboxBadge =
     !environmentCard &&
     project.environmentPresence === "remote-only" &&
@@ -3384,7 +3418,10 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
             showsSandboxBadge,
             isManualProjectSorting,
             isEnvironmentCard: environmentCard !== null,
-            actionCount: showsPullRequestsAction ? 4 : 3,
+            actionCount: projectHeaderActionCount({
+              showsPullRequests: showsPullRequestsAction,
+              showsPipelines: showsPipelinesAction,
+            }),
           })}
           {...(isManualProjectSorting && dragHandleProps ? dragHandleProps.attributes : {})}
           {...(isManualProjectSorting && dragHandleProps ? dragHandleProps.listeners : {})}
@@ -3519,6 +3556,24 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
                 <GitPullRequestIcon aria-hidden="true" className="size-3.5" />
               </TooltipTrigger>
               <TooltipPopup side="top">Pull Requests</TooltipPopup>
+            </Tooltip>
+          ) : null}
+          {showsPipelinesAction ? (
+            <Tooltip>
+              <TooltipTrigger
+                render={
+                  <button
+                    type="button"
+                    aria-label={`Pipelines for ${project.displayName}`}
+                    data-testid="pipelines-button"
+                    className={SIDEBAR_ICON_ACTION_BUTTON_CLASS}
+                    onClick={handleOpenPipelinesClick}
+                  />
+                }
+              >
+                <WorkflowIcon aria-hidden="true" className="size-3.5" />
+              </TooltipTrigger>
+              <TooltipPopup side="top">Pipelines</TooltipPopup>
             </Tooltip>
           ) : null}
         </div>
@@ -3697,16 +3752,18 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
   );
 });
 
-/** Pull Requests for a repository: one environment opens directly, several ask which. */
-const SidebarRepositoryPullRequestsButton = memo(function SidebarRepositoryPullRequestsButton({
-  group,
-}: {
-  readonly group: RepositoryGroup;
-}) {
-  const pullRequestsEnabled = usePrimarySettings((settings) => settings.pullRequestsEnabled);
+type RepositoryModuleRoute =
+  | "/project/$environmentId/$projectId/pull-requests"
+  | "/project/$environmentId/$projectId/pipelines";
+
+/**
+ * Opens a repository module for a repository row: one environment opens directly, several ask
+ * which. Closes the mobile sidebar first, as the project header's actions do.
+ */
+function useOpenRepositoryModule(group: RepositoryGroup, to: RepositoryModuleRoute) {
   const navigate = useNavigate();
   const { isMobile, setOpenMobile } = useSidebar();
-  const handleClick = useCallback(
+  return useCallback(
     (event: React.MouseEvent<HTMLButtonElement>) => {
       event.preventDefault();
       event.stopPropagation();
@@ -3715,12 +3772,25 @@ const SidebarRepositoryPullRequestsButton = memo(function SidebarRepositoryPullR
         if (!member) return;
         if (isMobile) setOpenMobile(false);
         void navigate({
-          to: "/project/$environmentId/$projectId/pull-requests",
+          to,
           params: { environmentId: member.environmentId, projectId: member.id },
         });
       });
     },
-    [group.cards, isMobile, navigate, setOpenMobile],
+    [group.cards, isMobile, navigate, setOpenMobile, to],
+  );
+}
+
+/** Pull Requests for a repository row. */
+const SidebarRepositoryPullRequestsButton = memo(function SidebarRepositoryPullRequestsButton({
+  group,
+}: {
+  readonly group: RepositoryGroup;
+}) {
+  const pullRequestsEnabled = usePrimarySettings((settings) => settings.pullRequestsEnabled);
+  const handleClick = useOpenRepositoryModule(
+    group,
+    "/project/$environmentId/$projectId/pull-requests",
   );
   if (!pullRequestsEnabled) return null;
   return (
@@ -3739,6 +3809,38 @@ const SidebarRepositoryPullRequestsButton = memo(function SidebarRepositoryPullR
         <GitPullRequestIcon aria-hidden="true" className="size-3.5" />
       </TooltipTrigger>
       <TooltipPopup side="top">Pull Requests</TooltipPopup>
+    </Tooltip>
+  );
+});
+
+/** Pipelines for a repository row. */
+const SidebarRepositoryPipelinesButton = memo(function SidebarRepositoryPipelinesButton({
+  group,
+}: {
+  readonly group: RepositoryGroup;
+}) {
+  const pipelinesEnabled = usePrimarySettings((settings) => settings.pipelinesEnabled);
+  const handleClick = useOpenRepositoryModule(
+    group,
+    "/project/$environmentId/$projectId/pipelines",
+  );
+  if (!pipelinesEnabled) return null;
+  return (
+    <Tooltip>
+      <TooltipTrigger
+        render={
+          <button
+            type="button"
+            aria-label={`Pipelines for ${group.title}`}
+            data-testid="repository-pipelines-button"
+            className={SIDEBAR_ICON_ACTION_BUTTON_CLASS}
+            onClick={handleClick}
+          />
+        }
+      >
+        <WorkflowIcon aria-hidden="true" className="size-3.5" />
+      </TooltipTrigger>
+      <TooltipPopup side="top">Pipelines</TooltipPopup>
     </Tooltip>
   );
 });
@@ -4401,7 +4503,12 @@ const SidebarProjectsContent = memo(function SidebarProjectsContent(
                 key={group.key}
                 group={group}
                 expanded={repositoryGroupExpandedById[group.key] !== false}
-                actions={<SidebarRepositoryPullRequestsButton group={group} />}
+                actions={
+                  <>
+                    <SidebarRepositoryPullRequestsButton group={group} />
+                    <SidebarRepositoryPipelinesButton group={group} />
+                  </>
+                }
               >
                 {group.cards.map((project) => (
                   <SidebarProjectListRow

@@ -96,6 +96,12 @@ describe("PullRequestsChecks", () => {
       expect(container.querySelector("summary")?.textContent).toContain("build 6");
       for (const state of ["pending", "success", "failure", "cancelled", "skipped", "neutral"])
         expect(container.querySelector(`[aria-label="${state}"]`)).not.toBeNull();
+      // Jobs draw the shared pipeline status icon, as in the Pipelines module.
+      expect(
+        container.querySelector('[aria-label="pending"] .lucide-loader-circle'),
+      ).not.toBeNull();
+      expect(container.querySelector('[aria-label="cancelled"] .lucide-ban')).not.toBeNull();
+      expect(container.querySelector('[aria-label="failure"] .lucide-circle-x')).not.toBeNull();
       expect(container.textContent).toContain("1m 5s");
       expect(container.querySelector("details")?.open).toBe(true);
       await act(async () =>

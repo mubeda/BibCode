@@ -3,19 +3,22 @@ import type {
   PullRequestsChecks as Checks,
   PullRequestsContext,
   PullRequestsPipeline,
+  PullRequestsPipelineStatus,
 } from "@bibcode/contracts";
-import { CircleCheckIcon, CircleDotIcon, CircleMinusIcon, CircleXIcon } from "lucide-react";
 import { memo } from "react";
+import { PipelineStatusIcon } from "../../pipelines/shared/PipelineStatusIcon";
 import { PullRequestsExternalLink } from "../shared/PullRequestsMarkdown";
 import { checksSummaryLabel } from "./pullRequestsDetail.logic";
 import { PullRequestsPipelineSummary } from "./PullRequestsPipelineSummary";
-const STATES = {
-  pending: { Icon: CircleDotIcon, color: "text-amber-600 dark:text-amber-400" },
-  success: { Icon: CircleCheckIcon, color: "text-green-600 dark:text-green-400" },
-  failure: { Icon: CircleXIcon, color: "text-red-600 dark:text-red-400" },
-  cancelled: { Icon: CircleXIcon, color: "text-muted-foreground" },
-  skipped: { Icon: CircleMinusIcon, color: "text-muted-foreground" },
-  neutral: { Icon: CircleMinusIcon, color: "text-muted-foreground" },
+type CheckState = Checks["groups"][number]["checks"][number]["state"];
+/** A check's state drawn with the shared pipeline icon, so jobs look the same everywhere. */
+const STATES: Record<CheckState, PullRequestsPipelineStatus> = {
+  pending: "running",
+  success: "success",
+  failure: "failed",
+  cancelled: "canceled",
+  skipped: "skipped",
+  neutral: "skipped",
 };
 function duration(seconds: number) {
   const total = Math.max(0, Math.round(seconds));
@@ -29,14 +32,13 @@ const CheckGroup = memo(function CheckGroup({ group }: { group: Checks["groups"]
       </summary>
       <ul>
         {group.checks.map((check) => {
-          const state = STATES[check.state];
           return (
             <li
               key={`${check.name}:${check.url ?? check.startedAt ?? ""}`}
               className="flex items-center gap-3 border-t border-border p-3 text-sm"
             >
-              <span role="img" aria-label={check.state} title={check.state} className={state.color}>
-                <state.Icon aria-hidden="true" className="size-4" />
+              <span role="img" aria-label={check.state} title={check.state}>
+                <PipelineStatusIcon status={STATES[check.state]} warnings={false} />
               </span>
               <span className="min-w-0 flex-1 break-words">
                 {check.url ? (

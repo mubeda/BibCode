@@ -2690,7 +2690,22 @@ See [RPC and orchestration](./rpc-and-orchestration.md) and
   host, account login, project and job (64 MiB, 10 idle minutes, cleared on
   rescan and sign-out, served only within 30 s of a job read by the same
   account). GitHub reads answer `unavailable` until the workflow runs reader
-  ships; `readSnapshot` serves both providers. See
+  ships; `readSnapshot` serves both providers. In the web app both modules sit
+  on one shell, `components/repositoryModule/` (`RepositoryModule` with
+  `useRepositoryModuleShell`): it alone resolves the module's setting, the
+  environment connection, the server capability, the checkout (one per
+  project, shared through the Pull Requests store), the worktree catalog and
+  the shared `pullRequests.getContext` read, renders the unavailable,
+  waiting, signed-out and not-yet-supported-provider states, reads the list's
+  first page alongside a pending context, and remounts the module on a
+  checkout or identity change. Each module supplies a descriptor (name,
+  setting, capabilities, copy) and its first-page input; the stored-copy
+  picks (`snapshotDisplay.logic.ts`) and the visible-refresh hook
+  (`useVisibleModuleRefresh`) live there too. The Pipelines list
+  (`/project/$environmentId/$projectId/pipelines`, filters in the URL and
+  remembered per project in `bibcode:pipelines-state:v1`) paints the stored
+  first page, then the live one, follows the GitLab stream while the document
+  is visible, and falls back to the 20 s visible timer. See
   [Pipelines contract boundary](./rpc-and-orchestration.md#pipelines-contract-boundary).
 - The right panel (`rightPanelStore`) can show one request per tab, with no new
   server contract. `pullRequest` surfaces (`pullRequest:<number>`, with the

@@ -31,8 +31,8 @@ import { Skeleton } from "../../ui/skeleton";
 import { Tabs, TabsList, TabsPanel, TabsTab } from "../../ui/tabs";
 import { PullRequestsContextRefresh } from "../pullRequestsContextRefresh";
 import { usePullRequestsQuery } from "../shared/usePullRequestsQuery";
-import { useVisiblePullRequestRefresh } from "../useVisiblePullRequestRefresh";
-import { shownCopy, type ShownCopy } from "../detail/snapshotDisplay.logic";
+import { useVisibleModuleRefresh } from "../../repositoryModule/useVisibleModuleRefresh";
+import { shownCopy, type ShownCopy } from "../../repositoryModule/snapshotDisplay.logic";
 import { useDocumentVisible } from "../useDocumentVisible";
 import { PullRequestsFilters } from "./PullRequestsFilters";
 import { PullRequestsRow } from "./PullRequestsRow";
@@ -351,7 +351,7 @@ export function PullRequestsListView({
   useEffect(() => {
     if (subscribeQuery.data) applySubscribedChange(subscribeQuery.data);
   }, [subscribeQuery.data]);
-  useVisiblePullRequestRefresh({
+  useVisibleModuleRefresh({
     enabled: isGitlab,
     succeeded: firstQuery.data !== null && firstQuery.error === null && !firstQuery.isPending,
     paused,
