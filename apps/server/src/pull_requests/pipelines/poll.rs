@@ -427,6 +427,14 @@ async fn stored(
         .flatten()
 }
 
+/// A stored row a tick need not write again: the same fingerprint, read by
+/// the same account. A row another account stored never paints for this
+/// one, so it is replaced even when nothing changed on the host.
+fn unchanged(row: &snapshot_store::Snapshot, fingerprint: &str, login: &str) -> bool {
+    row.fingerprint == fingerprint
+        && decode_row::<serde::de::IgnoredAny>(&row.payload, login).is_some()
+}
+
 impl PollInputs<'_> {
     async fn tick_list(
         &self,
@@ -449,7 +457,7 @@ impl PollInputs<'_> {
         .await;
         if row
             .as_ref()
-            .is_some_and(|row| row.fingerprint == fingerprint)
+            .is_some_and(|row| unchanged(row, &fingerprint, &context.account.login))
         {
             return Ok(());
         }
@@ -497,7 +505,7 @@ impl PollInputs<'_> {
         let key = detail_key(detail.pipeline.id, None);
         let fingerprint = detail_fingerprint(detail);
         let row = stored(self.database, self.scope, DETAIL_KIND, key.clone()).await;
-        if row.is_some_and(|row| row.fingerprint == fingerprint)
+        if row.is_some_and(|row| unchanged(&row, &fingerprint, &context.account.login))
             || shared.cancellation.is_cancelled()
         {
             return false;
