@@ -3820,6 +3820,36 @@ staticDescribe("grouped and remote projects", () => {
     });
   });
 
+  it("opens the one connected environment from the repository row without asking", async () => {
+    groupedScenario();
+    h.state.environments = [
+      environmentFixture({ environmentId: ENV_MAIN, label: "Main", connectionId: "primary" }),
+      environmentFixture({
+        environmentId: ENV_REMOTE,
+        label: "Remote Box",
+        connectionId: "remote",
+        phase: "error",
+        error: "Remote host is offline.",
+      }),
+    ];
+    h.uiStore.setState({ sidebarView: "repositories" });
+    render(<Sidebar />);
+    fakeLocalApi();
+
+    invoke(
+      mustFindProps(byTestId("repository-pull-requests-button"), "repository Pull Requests button"),
+      "onClick",
+      mouseEvent(),
+    );
+    await flush();
+
+    expect(h.spies.contextMenuShow).not.toHaveBeenCalled();
+    expect(h.spies.navigate).toHaveBeenCalledWith({
+      to: "/project/$environmentId/$projectId/pull-requests",
+      params: { environmentId: ENV_MAIN, projectId: ProjectId.make("project-a") },
+    });
+  });
+
   it("shows the repository row's actions without hover", () => {
     groupedScenario();
     h.uiStore.setState({ sidebarView: "repositories" });
