@@ -176,6 +176,12 @@ describe("Pipelines contracts", () => {
       job: null,
     });
     expect(decodeChanged({ list: false, pipeline: true }).pipeline).toBe(true);
+    // A refused pipeline's name says why; an older server never sends it.
+    expect(decodeChanged({ list: false, pipeline: true, refused: "forbidden" }).refused).toBe(
+      "forbidden",
+    );
+    expect(decodeChanged({ list: false, pipeline: true }).refused).toBeUndefined();
+    expect(() => decodeChanged({ list: false, pipeline: true, refused: "gone" })).toThrow();
   });
 
   it("decodes an action on a pipeline or a job, and its result", () => {

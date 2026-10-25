@@ -3,6 +3,7 @@ import { squashAtomCommandFailure } from "@bibcode/client-runtime/state/runtime"
 import {
   PullRequestsOperationError,
   type PipelinesDetail,
+  type PipelinesRefusal,
   type PullRequestsProviderKind,
 } from "@bibcode/contracts";
 import { Link, useNavigate } from "@tanstack/react-router";
@@ -220,8 +221,16 @@ export function PipelinesDetailView({
   // Any success on the stream, even its first all-false event, stands the timer down
   // until the stream fails or waits again.
   const paused = isGitlab && subscribeQuery.emission._tag === "Success";
+  // The poller's read of this pipeline was refused and its stored row dropped: the
+  // refusal replaces the copy on screen until a Refresh reads the host again.
+  const [refusal, setRefusal] = useState<{
+    readonly request: typeof request;
+    readonly code: PipelinesRefusal;
+  } | null>(null);
+  const refused = refusal !== null && refusal.request === request ? refusal.code : null;
   const applySubscribedChange = useEffectEvent(
     (changed: NonNullable<typeof subscribeQuery.data>) => {
+      if (changed.refused) setRefusal({ request, code: changed.refused });
       // The poller already stored the new detail: paint it, never read the host again.
       if (changed.pipeline) snapshotQuery.revalidate();
     },
@@ -272,7 +281,11 @@ export function PipelinesDetailView({
   useEffect(() => {
     onBackoffChange(backedOff);
   }, [backedOff, onBackoffChange]);
-  const refresh = detailQuery.refresh;
+  const refreshDetail = detailQuery.refresh;
+  const refresh = useCallback(() => {
+    setRefusal(null);
+    refreshDetail();
+  }, [refreshDetail]);
   useImperativeHandle(ref, () => ({ refresh }), [refresh]);
 
   // A GitLab job retry opens the new job; a GitHub re-run of an earlier attempt opens
@@ -339,11 +352,13 @@ export function PipelinesDetailView({
 
   // A refused or missing pipeline is about this resource only: say so here, and keep
   // the shared sign-in state for a lost login.
-  const resourceError = error?.code === "forbidden" || error?.code === "not_found";
+  const resourceCode =
+    error?.code === "forbidden" || error?.code === "not_found" ? error.code : refused;
+  const resourceError = resourceCode !== null;
   const message =
-    error?.code === "forbidden"
+    resourceCode === "forbidden"
       ? "You can't view this pipeline."
-      : error?.code === "not_found"
+      : resourceCode === "not_found"
         ? "This pipeline no longer exists."
         : (error?.message ?? detailQuery.error);
   const hostName = HOST_NAMES[provider];
@@ -359,9 +374,9 @@ export function PipelinesDetailView({
           <p className="text-xs text-muted-foreground">{error.hostDetail}</p>
         ) : null}
         {/* A missing pipeline has nothing to retry; Back to pipelines sits above. */}
-        {error?.code === "not_found" ? null : (
+        {resourceCode === "not_found" ? null : (
           <div className="flex flex-wrap items-center gap-3">
-            {error?.code === "forbidden" ? (
+            {resourceCode === "forbidden" ? (
               <RepositoryModuleExternalLink href={pipelineHostUrl(context, pipelineId)}>
                 Open on {hostName}
               </RepositoryModuleExternalLink>

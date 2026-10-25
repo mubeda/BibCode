@@ -588,6 +588,37 @@ describe("PipelinesDetailView errors", () => {
     await render();
     expect(refreshContext).toHaveBeenCalled();
   });
+
+  it("shows the poller's refusal of a shown pipeline in place of its stale copy, with no host read", async () => {
+    await render();
+    expect(container.querySelector("header")).not.toBeNull();
+    const opened = h.reads.mock.calls.length;
+    // Access was revoked while the page was open: the poller dropped the stored row.
+    h.changed = { list: false, pipeline: true, refused: "forbidden" };
+    h.nextSnapshot = { list: null, detail: null, job: null };
+    await render();
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain(
+      "You can't view this pipeline.",
+    );
+    expect(container.querySelector("header")).toBeNull();
+    expect(container.textContent).not.toContain("Retry rspec");
+    expect(link("Open on GitLab").getAttribute("href")).toBe(
+      `${gitlabContext.webUrl}/-/pipelines/4821`,
+    );
+    expect(h.reads.mock.calls.length).toBe(opened);
+    expect(refreshContext).not.toHaveBeenCalled();
+  });
+
+  it("says a pipeline the poller found gone no longer exists", async () => {
+    await render();
+    h.changed = { list: false, pipeline: true, refused: "not_found" };
+    h.nextSnapshot = { list: null, detail: null, job: null };
+    await render();
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain(
+      "This pipeline no longer exists.",
+    );
+    expect(container.querySelector("header")).toBeNull();
+  });
 });
 
 describe("PipelinesDetailView paint", () => {

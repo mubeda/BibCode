@@ -366,9 +366,18 @@ export const PipelinesActionResult = Schema.Struct({
 });
 export type PipelinesActionResult = typeof PipelinesActionResult.Type;
 
+/** Why the poller stopped reading a pipeline: the host refused it, or it is gone. */
+export const PipelinesRefusal = Schema.Literals(["forbidden", "not_found"]);
+export type PipelinesRefusal = typeof PipelinesRefusal.Type;
+
 /** Which stored copies changed: answer with `readSnapshot`. The first event is all false. */
 export const PipelinesChanged = Schema.Struct({
   list: Schema.Boolean,
   pipeline: Schema.Boolean,
+  /**
+   * Sent with `pipeline` when the poller's read of the route's pipeline was refused:
+   * its stored row is gone, so the view shows the refusal instead of re-reading.
+   */
+  refused: Schema.optional(PipelinesRefusal),
 });
 export type PipelinesChanged = typeof PipelinesChanged.Type;

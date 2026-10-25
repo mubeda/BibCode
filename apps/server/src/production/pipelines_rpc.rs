@@ -340,11 +340,24 @@ mod tests {
         let changed = model::Changed {
             list: true,
             pipeline: false,
+            refused: None,
         };
         assert!(emit(changed));
         assert_eq!(
             receiver.recv().await.unwrap(),
             Ok(vec![json!({"list": true, "pipeline": false})])
+        );
+        // A refused pipeline's name says why, in the contract's words.
+        assert!(emit(model::Changed {
+            list: false,
+            pipeline: true,
+            refused: Some(model::Refusal::NotFound),
+        }));
+        assert_eq!(
+            receiver.recv().await.unwrap(),
+            Ok(vec![
+                json!({"list": false, "pipeline": true, "refused": "not_found"})
+            ])
         );
         for _ in 0..SUBSCRIBE_STREAM_CAPACITY {
             assert!(emit(model::Changed::default()));

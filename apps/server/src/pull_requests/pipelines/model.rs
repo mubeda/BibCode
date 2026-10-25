@@ -415,6 +415,18 @@ pub struct Snapshot {
 pub struct Changed {
     pub list: bool,
     pub pipeline: bool,
+    /// Sent with `pipeline` once the poller's read of the route's pipeline
+    /// was refused: its stored row is gone and it is not read again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refused: Option<Refusal>,
+}
+
+/// Why the poller stopped reading a pipeline.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Refusal {
+    Forbidden,
+    NotFound,
 }
 
 impl Changed {
