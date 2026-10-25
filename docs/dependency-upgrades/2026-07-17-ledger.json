@@ -63,10 +63,10 @@
       "verificationDate": "2026-09-04",
       "status": "partial",
       "ledgerClosure": {
-        "rows": 254,
+        "rows": 257,
         "statuses": {
           "green": 132,
-          "current": 75,
+          "current": 78,
           "blocked": 42,
           "removed": 5
         }
@@ -308,8 +308,8 @@
     }
   },
   "inventorySummary": {
-    "javascriptDirect": 87,
-    "javascriptLedger": 89,
+    "javascriptDirect": 90,
+    "javascriptLedger": 92,
     "rustRegistry": 138,
     "rustPath": 3,
     "rustGit": 1,
