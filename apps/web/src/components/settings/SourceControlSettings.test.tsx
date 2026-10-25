@@ -552,6 +552,18 @@ describe("Pull Requests settings", () => {
     (toggle.onCheckedChange as (checked: boolean) => void)(false);
     expect(testState.updateSettings).toHaveBeenCalledWith({ pullRequestsEnabled: false });
   });
+  it("toggles Pipelines separately, below Pull requests", () => {
+    testState.settings = { ...testState.settings, pipelinesEnabled: false };
+    const markup = render();
+    expect(markup).toContain("Show the Pipelines button on projects and repositories.");
+    expect(markup.indexOf("Enable pipelines")).toBeGreaterThan(
+      markup.indexOf("Enable pull requests"),
+    );
+    const toggle = ui.find("Switch", (p) => p["aria-label"] === "Enable pipelines");
+    expect(toggle.checked).toBe(false);
+    (toggle.onCheckedChange as (checked: boolean) => void)(true);
+    expect(testState.updateSettings).toHaveBeenCalledWith({ pipelinesEnabled: true });
+  });
   it.each(["github", "gitlab"] as const)(
     "shows each configured %s host with its authentication state",
     (kind) => {

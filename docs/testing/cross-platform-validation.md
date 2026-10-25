@@ -718,6 +718,21 @@ The service tests resolve a checkout through fake `git` and `glab` scripts and
 run on Unix only; the poller tests use an in-memory provider and run on every
 platform.
 
+For the Pipelines web module, the repository module shell both modules share,
+the sidebar buttons, the Settings switch and the Pipelines client runtime,
+run from `apps/web` (compiler-sensitive happy-dom files) and the repository
+root:
+
+```sh
+vp test run --project unit src/pipelinesStore.test.ts src/components/pipelines src/components/repositoryModule src/components/pullRequests src/components/Sidebar.test.tsx src/components/settings/SourceControlSettings.test.tsx
+vp test run packages/client-runtime/src/state/pipelines.test.ts
+vp run typecheck
+vp check
+```
+
+`PullRequestsPanel.test.tsx` is the shell's regression gate: it must pass
+unchanged.
+
 For provider detection of self-hosted hosts (the recorded host observation,
 remote parsing, status classification, and the create action's provider check
 before anything is published), also run:
@@ -2607,6 +2622,43 @@ never count a sandbox-denied listener test as passed or skipped.
     `git status` in the reported path is the recovery starting point. No automatic
     retry or late navigation is permitted. An existing redirect toast must honor a
     subsequent mutation denial. Record browser/native checks separately from CLI-stub tests.
+
+### Pipelines web shell validation
+
+Use a GitLab project with recent pipelines (one running, one failed, one on a
+tag, one merge request pipeline) and a GitHub repository.
+
+1. Every project header shows **Pipelines** after **Pull Requests**, with the
+   tooltip and accessible name "Pipelines for <project>"; a long project title
+   must stop short of the five icons, with and without the sandbox badge. In
+   the Repositories view the repository row shows it after its Pull Requests
+   button and environment rows do not; with the repository in two
+   environments it asks which. On a narrow window the mobile sidebar closes on
+   choice. The project header stays highlighted on the list after reload.
+2. **Settings → Source Control → Pipelines** off hides both buttons and leaves
+   Pull Requests; an open Pipelines route says it is turned off and links to
+   Source Control. A server without `pipelinesReads` asks for an update.
+3. Open the GitLab list: rows show status, duration, age (the exact time on
+   hover), title, number, branch, tag or merge request, short commit, badges
+   and named stage icons, on wide and narrow panels. Reopen it: the last copy
+   paints before any `glab` spawn (Profiler or server trace), then the live
+   page replaces it. Switch to Pull Requests and back on the same checkout: no
+   second context read.
+4. Change the tab and the branch filter (a picked branch, then a typed name
+   with Enter): the URL carries `scope` and `ref`, Back and a copied link keep
+   them, and the sidebar button reopens the last filter. An empty tab and an
+   empty branch name their state, the latter with **Clear filter**. **Load
+   more** appends without moving loaded rows.
+5. With a pipeline running, the row must follow GitLab within about 20 s with
+   no Refresh; two windows on one list must produce the `glab` reads of one;
+   hiding the window stops reading. Make the host answer 429 (or block it
+   with a proxy): the list counts down, Refresh and Retry are disabled with
+   their reason, and one read follows the deadline.
+6. Retry and Cancel show only where they apply and are disabled with "Update
+   the server to retry and cancel pipelines."; a Guest or Reporter account sees
+   its own refusal. Open on GitLab opens the host's page.
+7. Open a GitHub repository: the module shows "Pipelines for GitHub are
+   coming." with **Open on GitHub** (the repository's Actions page).
 
 ### Remote-hosted Git Manager run
 

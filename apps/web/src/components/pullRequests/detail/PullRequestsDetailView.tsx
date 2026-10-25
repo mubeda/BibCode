@@ -35,14 +35,18 @@ import { Button } from "../../ui/button";
 import { usePullRequestsQuery } from "../shared/usePullRequestsQuery";
 import { prefetchedWithin } from "../hoverPrefetch.logic";
 import { useDocumentVisible } from "../useDocumentVisible";
-import { useVisiblePullRequestRefresh } from "../useVisiblePullRequestRefresh";
+import { useVisibleModuleRefresh } from "../../repositoryModule/useVisibleModuleRefresh";
 import {
   buildListInput,
   selectListFilters,
   selectListSort,
   selectListTab,
 } from "../list/pullRequestsList.logic";
-import { keepNewestCopy, newerObservedAt, type KeptCopy } from "./snapshotDisplay.logic";
+import {
+  keepNewestCopy,
+  newerObservedAt,
+  type KeptCopy,
+} from "../../repositoryModule/snapshotDisplay.logic";
 import { PullRequestsQueryState } from "./PullRequestsQueryState";
 import { PullRequestsHeader } from "./PullRequestsHeader";
 import { PullRequestsConversation } from "./PullRequestsConversation";
@@ -317,13 +321,13 @@ export function PullRequestsDetailView({
     activeQuery.data !== null || displayedActiveData === null
       ? activeQuery
       : { ...activeQuery, data: displayedActiveData, isPending: false };
-  useVisiblePullRequestRefresh({
+  useVisibleModuleRefresh({
     enabled: isGitlab,
     succeeded: detailSucceeded,
     paused,
     revalidate: detailQuery.revalidate,
   });
-  useVisiblePullRequestRefresh({
+  useVisibleModuleRefresh({
     enabled: isGitlab && activeQuery.data !== null,
     succeeded: activeQuery.data !== null && activeQuery.error === null && !activeQuery.isPending,
     paused,

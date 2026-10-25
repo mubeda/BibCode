@@ -1080,6 +1080,45 @@ it. Approval and merge carry the head you reviewed. A stale-head error says
 preserving drafts. Errors include server recovery advice; partial writes report
 what landed and are never retried automatically.
 
+## Pipelines
+
+Choose **Pipelines** (the linked-nodes icon) on a project header, immediately
+after Pull Requests, to see the project's CI pipelines for one checkout.
+Grouped projects use the same environment/member picker as the other project
+actions; in the Repositories view, use the repository row's Pipelines button,
+after its Pull Requests button. The project header stays highlighted on the
+Pipelines routes, including after reload.
+
+**Settings → Source Control → Pipelines** shows or hides both buttons,
+independently of Pull Requests. Turning it off leaves an open Pipelines route
+explaining the setting with a link back to Source Control. Pipelines share the
+Pull Requests module's checkout selector, repository context, sign-in and
+recovery states: moving between the two modules on one checkout does not ask
+the host again. An older server says to update it. GitLab projects are
+supported today; a GitHub repository shows **Open on GitHub** for its Actions
+page instead.
+
+The list opens on the copy BiBCode last stored for that filter, then the
+host's current page. Each row shows the status with its duration and age
+(hover for the exact time), the title, the pipeline number, the branch, tag or
+merge request, the short commit, badges such as **latest** or **merge
+request**, who started it, and one icon per stage (each named, for example
+"test: failed"). The title opens the pipeline on GitLab. **All**, **Running**
+and **Finished** filter by
+state, and the branch field filters by ref: pick one of the checkout's
+branches or tags, or type any name and press Enter. Filters live in the URL,
+so Back and a copied link keep them, and the last ones are remembered for the
+project. **Load more** appears when the host has another page.
+
+While the list is visible, a running GitLab pipeline updates within about
+20 seconds without a Refresh, through one shared server poller however many
+windows show the list; a hidden window stops reading. **Refresh** reloads the
+first page. When GitLab asks BiBCode to slow down, the list keeps what it
+shows, counts down to the host's retry time with Refresh disabled, and then
+reads again. Retry and Cancel appear on rows they apply to; until the server
+offers pipeline actions they stay disabled and say why, and a row your
+account cannot retry says that instead.
+
 ## Right Panel
 
 The right panel hosts persistent tool surfaces for the active thread. Use its

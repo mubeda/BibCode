@@ -2,24 +2,32 @@
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
-import { useVisiblePullRequestRefresh } from "./useVisiblePullRequestRefresh";
+import { useVisibleModuleRefresh } from "./useVisibleModuleRefresh";
 
 function Probe({
   enabled,
   succeeded,
   paused = false,
+  intervalMs,
   revalidate,
 }: {
   enabled: boolean;
   succeeded: boolean;
   paused?: boolean;
+  intervalMs?: number;
   revalidate: () => void;
 }) {
-  useVisiblePullRequestRefresh({ enabled, succeeded, paused, revalidate });
+  useVisibleModuleRefresh({
+    enabled,
+    succeeded,
+    paused,
+    ...(intervalMs === undefined ? {} : { intervalMs }),
+    revalidate,
+  });
   return null;
 }
 
-describe("useVisiblePullRequestRefresh", () => {
+describe("useVisibleModuleRefresh", () => {
   let root: Root;
   let node: HTMLDivElement;
   beforeEach(() => {
@@ -87,6 +95,19 @@ describe("useVisiblePullRequestRefresh", () => {
       get: () => "visible",
     });
     act(() => document.dispatchEvent(new Event("visibilitychange")));
+    expect(revalidate).toHaveBeenCalledTimes(1);
+  });
+
+  it("waits the given interval instead of 20s", () => {
+    const revalidate = vi.fn();
+    act(() => {
+      root.render(
+        createElement(Probe, { enabled: true, succeeded: true, intervalMs: 5_000, revalidate }),
+      );
+    });
+    act(() => vi.advanceTimersByTime(4_999));
+    expect(revalidate).not.toHaveBeenCalled();
+    act(() => vi.advanceTimersByTime(1));
     expect(revalidate).toHaveBeenCalledTimes(1);
   });
 });

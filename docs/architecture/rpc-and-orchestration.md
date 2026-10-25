@@ -1443,6 +1443,27 @@ absolute `firstLine` when nothing was dropped. A trace 404 is told apart by a
 job read: `not_started` for a job that is not terminal, `erased`, `no_output`,
 or `not_found` only when the job itself is missing.
 
+The client (`@bibcode/client-runtime/state/pipelines`) mirrors the Pull
+Requests atoms: `list`, `get` and `getJob` are fresh for 5 s and kept 5 minutes
+after their last subscriber; `getJobLog`, `readSnapshot` and `subscribe` keep
+nothing. Views key every read with `refresh: "user"`; a visible-refresh timer
+marks the next execution of that same atom as `timer` (`requestTimerRead`),
+so a timer read reuses the list's total without a second cache entry. The
+context is the Pull Requests `getContext` family itself, so moving between the
+two modules on one checkout costs no context read within the client's 60 s.
+A list route reads its default first page alongside a pending context and
+paints the stored first page from `readSnapshot`, then the live page;
+`shownCopy` picks between them by `observedAt`, and on GitHub a stored copy
+arriving after the live page is ignored. A GitLab list subscribes with its
+list key (`pipelineId: null`) only while the document is visible; the first
+event, all false, stands the client's 20 s timer down until the stream fails
+or waits, and a `list` name re-reads `readSnapshot` only, keeping loaded later
+pages. GitHub has no stream: its timer re-reads the first page every 20 s
+only while a shown pipeline is not `terminal`. A `rate_limited` answer shows
+the server's `retryAfterSeconds` as a countdown, disables Refresh and Retry
+until it ends, then reads once as a timer read. A row hovered 150 ms prefetches
+its `get`, at most two per environment and not again within 5 s.
+
 ## Worktree catalog flow
 
 The catalog protocol is server-resolved and capability gated:
