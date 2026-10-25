@@ -1069,6 +1069,25 @@ impl PipelinesService {
         Ok(facts)
     }
 
+    /// The job facts a log read answers with. A user read, such as the page's
+    /// final read when the job finishes, can arrive before the job refresh, so
+    /// it does not trust a remembered running state.
+    async fn read_facts(
+        &self,
+        admitted: &Admitted,
+        key: &LogKey,
+        refresh: Refresh,
+        c: &CancellationToken,
+    ) -> Result<JobFacts, PullRequestsOperationError> {
+        let fresh = refresh == Refresh::User
+            && self
+                .state()
+                .logs
+                .recent_job(key)
+                .is_some_and(|facts| !facts.terminal);
+        self.facts(admitted, key, fresh, c).await
+    }
+
     /// GitLab answers 404 both for a missing job and for a job with no log
     /// yet: the job read tells them apart.
     async fn missing_log(
@@ -1100,7 +1119,7 @@ impl PipelinesService {
     ) -> Result<JobLog, PullRequestsOperationError> {
         let logs = &self.state().logs;
         // A memory answer needs a job read by this account within 30 s.
-        let facts = self.facts(admitted, key, false, c).await?;
+        let facts = self.read_facts(admitted, key, input.refresh, c).await?;
         if facts.erased {
             return Ok(log_unavailable(LogUnavailable::Erased, &facts));
         }
@@ -1239,7 +1258,7 @@ impl PipelinesService {
                 .await
             }
             from => {
-                let facts = self.facts(admitted, key, false, c).await?;
+                let facts = self.read_facts(admitted, key, input.refresh, c).await?;
                 if facts.erased {
                     return Ok(log_unavailable(LogUnavailable::Erased, &facts));
                 }
