@@ -136,6 +136,17 @@ describe("KeybindingsSettings.logic", () => {
     expect(options).not.toContain("customModeActive");
   });
 
+  it("offers chatFocus, which no shipped rule uses, for Find in thread rules", () => {
+    expect(buildWhenVariableOptions()).toContain("chatFocus");
+    const parsed = parseWhenExpressionDraft("chatFocus");
+    expect(parsed.ok && unknownWhenVariables(parsed.value)).toEqual([]);
+  });
+
+  it("offers chat.find, which has no shipped rule, as a bindable command", () => {
+    expect(buildKeybindingCommandOptions([])).toContain("chat.find");
+    expect(commandLabel("chat.find")).toBe("Chat: Find");
+  });
+
   it("builds command options from defaults and resolved project bindings", () => {
     const options = buildKeybindingCommandOptions([
       {

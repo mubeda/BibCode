@@ -48,6 +48,27 @@ type ActivitySurfaceScope =
   | { readonly _tag: "thread" }
   | { readonly _tag: "terminal"; readonly terminalId: string };
 
+/** Marks a chat's column (timeline, composer and find bar) for keyboard routing. */
+export const CHAT_SURFACE_ATTRIBUTE = "data-chat-surface";
+
+/**
+ * Whether a key event belongs to a chat: its target is inside a chat surface, or nothing is
+ * focused. Mod+F there opens Find in thread; elsewhere (the file editor, a terminal, a preview,
+ * Settings) it keeps its own meaning.
+ */
+export function isChatSurfaceFocus(
+  target: EventTarget | null,
+  activeElement: Element | null,
+  body: Element | null,
+): boolean {
+  if (activeElement === null || activeElement === body) return true;
+  const element = target as { closest?: (selector: string) => unknown } | null;
+  return (
+    typeof element?.closest === "function" &&
+    element.closest(`[${CHAT_SURFACE_ATTRIBUTE}]`) !== null
+  );
+}
+
 export function isAgentActivityScopeEnabled(
   scope: ActivityScopeRef,
   settings: {

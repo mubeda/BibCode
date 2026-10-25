@@ -48,6 +48,7 @@ const EXPECTED_STATIC_KEYBINDING_COMMANDS = [
   "commandPalette.toggle",
   "chat.new",
   "chat.newLocal",
+  "chat.find",
   "editor.openFavorite",
   "thread.steerQueuedMessage",
   "modelPicker.toggle",
@@ -79,6 +80,25 @@ it("anchors every static KeybindingCommand literal", () => {
     [...EXPECTED_STATIC_KEYBINDING_COMMANDS],
   );
 });
+
+it.effect("decodes a resolved list that names chat.find", () =>
+  Effect.gen(function* () {
+    const parsed = yield* decode(ResolvedKeybindingsConfig, [
+      {
+        command: "chat.find",
+        shortcut: {
+          key: "f",
+          metaKey: false,
+          ctrlKey: false,
+          shiftKey: false,
+          altKey: false,
+          modKey: true,
+        },
+      },
+    ]);
+    assert.strictEqual(parsed[0]?.command, "chat.find");
+  }),
+);
 
 it("accepts the center-terminal command", () => {
   assert.strictEqual(decodeKeybindingCommand("terminal.newCenter"), "terminal.newCenter");

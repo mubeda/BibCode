@@ -152,6 +152,8 @@ const captured = vi.hoisted(() => ({
 }));
 
 const testState = vi.hoisted(() => ({
+  openThreadFind: vi.fn(),
+  focusThreadFindInput: vi.fn(),
   navigate: vi.fn(),
   keybindings: { kind: "keybindings" } as unknown,
   shortcutCommand: null as string | null,
@@ -276,6 +278,12 @@ vi.mock("../keybindings", () => ({
     testState.shortcutCalls.push(args);
     return testState.shortcutCommand;
   },
+  chatFindShortcutLabel: () => "Mod+F label",
+}));
+
+vi.mock("./chat/threadFind/useThreadFind", () => ({
+  openThreadFindForTarget: testState.openThreadFind,
+  focusThreadFindInput: testState.focusThreadFindInput,
 }));
 
 vi.mock("./AddProjectDialog", () => ({
@@ -700,6 +708,25 @@ describe("palette shell", () => {
     expect(testState.composerHandleRef.current?.focusAtEnd).toHaveBeenCalledTimes(1);
   });
 
+  it("returns focus to the find input after Find in thread, not to the composer", async () => {
+    // The chat the palette was opened from, such as a panel chat over a hidden host tab.
+    const opener = { id: "panel-chat-composer" };
+    vi.stubGlobal("document", { activeElement: opener });
+    openPalette();
+    const popup = captured.commandPopups.at(-1) as { finalFocus?: () => boolean };
+    // The palette itself takes focus once it opens.
+    vi.stubGlobal("document", { activeElement: { id: "palette-input" } });
+    executeValue("action:find-in-thread");
+    await flushPromises();
+    expect(testState.openThreadFind).toHaveBeenCalledWith(opener);
+    expect(rerender()).not.toContain('data-testid="command-popup"');
+
+    // The popup closing runs its final focus.
+    expect(popup.finalFocus?.()).toBe(false);
+    expect(testState.focusThreadFindInput).toHaveBeenCalledWith(opener);
+    expect(testState.composerHandleRef.current?.focusAtEnd).not.toHaveBeenCalled();
+  });
+
   it("routes every add-project intent to the sole dialog owner", () => {
     render();
     const provider = captured.providers.at(-1) as { openAddProject: () => void };
@@ -775,6 +802,18 @@ describe("root actions", () => {
     expect(values).not.toContain("action:new-thread");
     expect(values).not.toContain("action:new-thread-in");
     expect(values).toContain("action:add-project");
+  });
+
+  it("lists Find in thread with its key only while a thread is open", () => {
+    openPalette();
+    expect(itemByValue("action:find-in-thread")).toMatchObject({
+      title: "Find in thread",
+      shortcutLabel: "Mod+F label",
+    });
+
+    testState.activeThread = null;
+    rerender();
+    expect(itemByValue("action:find-in-thread")).toBeUndefined();
   });
 
   it("offers the device preview only while device previews are on", async () => {

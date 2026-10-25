@@ -442,8 +442,9 @@ above a **Show fewer tool calls** row, and each tool call starts open to its
 output. One click on a **Worked for** row folds that turn again, and one click
 on **Show fewer tool calls** or a tool call collapses it. The turn still running
 looks the same either way until it finishes. A turn you fold stays folded when
-the next turn starts; each choice holds until you switch threads or reload. The
-setting applies to open threads at once and is stored on this device.
+the next turn starts; each choice, like an opened tool call, long message, plan,
+or details block, holds while you scroll and until you switch threads or reload.
+The setting applies to open threads at once and is stored on this device.
 
 With a mouse or trackpad, a thread with two or more of your messages shows a
 minimap at the timeline's left edge, one mark per message. Hover it to preview
@@ -461,6 +462,36 @@ last. A long paragraph's wrapped lines count as lines. With text selected, or
 with Shift, Alt, Ctrl, or Cmd held, the keys keep their usual meaning.
 These keys and the minimap jump instead of scrolling smoothly when the system
 asks for reduced motion.
+
+### Finding text in a chat
+
+Press **Mod+F** (Cmd+F on macOS, Ctrl+F elsewhere) in a chat, or choose **Find
+in thread** in the command palette, to open the find bar at the top right of the
+timeline. It searches the whole thread as it reads on screen: your messages,
+replies, proposed plans, and tool commands, including queued messages. Link
+text counts but not its URL, a file link counts by its chip label, and a skill
+by its name. Matching ignores case and treats any whitespace as a space; a match
+never spans two paragraphs, list items, or table cells.
+
+The bar shows the selected match and the total, such as **3/17**. **Enter** or
+**Next** goes to the next match and **Shift+Enter** or **Previous** to the one
+before, wrapping at both ends; Cmd+G or Ctrl+G and F3 do the same, and with
+Shift go back. A new search starts at the first match from the top of what you
+are reading. Going to a match opens whatever hides it (a finished turn, a run
+of tool calls, a tool call, a long message or plan, a details block) and
+scrolls to it. Matches on screen are highlighted and the selected one stands
+out; where the engine cannot highlight text, the selected match's row is
+outlined instead.
+
+**Esc** closes the bar and returns to the composer. Your reading position and
+whatever find opened stay as they are, and reopening find restores the last
+search. Find searches the copy of the thread the app holds: while the
+connection is restoring, the status adds **may be out of date**, and while a
+thread is still loading it says **Loading thread…**. One chat's find is open at
+a time; opening it in a chat panel closes the host chat's. The palette opens it
+in the chat you were using, or the chat on screen. Outside a chat, Mod+F
+keeps its usual meaning. To use another key, bind the `chat.find` command (see
+[Keybindings](./keybindings.md)).
 
 ### Uploading chat attachments
 
@@ -1648,6 +1679,9 @@ The Files surface is a full file manager for the active workspace:
 
 ## Current limitations
 
+- Find in thread searches messages, plans, and tool commands. Tool output,
+  changed-file lists, attachments, terminal-context chips, review-comment cards,
+  reasoning rows, and rendered diagrams are not searched.
 - Device previews run one Android emulator and one iOS simulator at a time per
   environment, and iOS simulators only on macOS servers. iOS takes a single
   touch, and BiBCode cannot install apps or create simulators. Two people
