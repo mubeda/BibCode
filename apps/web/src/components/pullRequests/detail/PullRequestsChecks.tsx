@@ -4,8 +4,11 @@ import type {
   PullRequestsContext,
   PullRequestsPipeline,
   PullRequestsPipelineStatus,
+  PullRequestsProviderKind,
 } from "@bibcode/contracts";
+import { Link } from "@tanstack/react-router";
 import { memo } from "react";
+import { useMergeRequestPipelineLinks } from "../../pipelines/shared/MergeRequestPipelineLinks";
 import { PipelineStatusIcon } from "../../pipelines/shared/PipelineStatusIcon";
 import { PullRequestsExternalLink } from "../shared/PullRequestsMarkdown";
 import { checksSummaryLabel } from "./pullRequestsDetail.logic";
@@ -20,11 +23,19 @@ const STATES: Record<CheckState, PullRequestsPipelineStatus> = {
   skipped: "skipped",
   neutral: "skipped",
 };
+const HOST_NAMES: Record<PullRequestsProviderKind, string> = { github: "GitHub", gitlab: "GitLab" };
 function duration(seconds: number) {
   const total = Math.max(0, Math.round(seconds));
   return total < 60 ? `${total}s` : `${Math.floor(total / 60)}m ${total % 60}s`;
 }
-const CheckGroup = memo(function CheckGroup({ group }: { group: Checks["groups"][number] }) {
+const CheckGroup = memo(function CheckGroup({
+  group,
+  hostName,
+}: {
+  group: Checks["groups"][number];
+  hostName: string;
+}) {
+  const links = useMergeRequestPipelineLinks();
   return (
     <details open className="rounded-lg border border-border">
       <summary className="cursor-pointer bg-muted/30 px-3 py-2 text-sm font-medium">
@@ -32,6 +43,8 @@ const CheckGroup = memo(function CheckGroup({ group }: { group: Checks["groups"]
       </summary>
       <ul>
         {group.checks.map((check) => {
+          // In BiBCode when the Pipelines module can open the job; on the host otherwise.
+          const jobPage = links.job(check);
           return (
             <li
               key={`${check.name}:${check.url ?? check.startedAt ?? ""}`}
@@ -41,12 +54,23 @@ const CheckGroup = memo(function CheckGroup({ group }: { group: Checks["groups"]
                 <PipelineStatusIcon status={STATES[check.state]} warnings={false} />
               </span>
               <span className="min-w-0 flex-1 break-words">
-                {check.url ? (
+                {jobPage !== null ? (
+                  <Link {...jobPage} className="text-primary underline underline-offset-4">
+                    {check.name}
+                  </Link>
+                ) : check.url ? (
                   <PullRequestsExternalLink href={check.url}>{check.name}</PullRequestsExternalLink>
                 ) : (
                   check.name
                 )}
               </span>
+              {jobPage !== null && check.url ? (
+                <span className="shrink-0 text-xs">
+                  <PullRequestsExternalLink href={check.url}>
+                    Open on {hostName}
+                  </PullRequestsExternalLink>
+                </span>
+              ) : null}
               {check.durationSeconds !== null ? (
                 <span className="text-xs text-muted-foreground">
                   {duration(check.durationSeconds)}
@@ -112,7 +136,7 @@ export const PullRequestsChecks = memo(function PullRequestsChecks({
           : checksSummaryLabel(checks)}
       </p>
       {checks.groups.map((group) => (
-        <CheckGroup key={group.name} group={group} />
+        <CheckGroup key={group.name} group={group} hostName={HOST_NAMES[context.provider]} />
       ))}
     </section>
   );

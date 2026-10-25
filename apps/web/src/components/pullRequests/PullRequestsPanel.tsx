@@ -5,6 +5,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useOpenPrLink } from "../../lib/openPullRequestLink";
 import { usePullRequestsStore, type PullRequestsDetailTab } from "../../pullRequestsStore";
 import { GitManagerCreatePullRequestDialog } from "../gitManager/provider/GitManagerCreatePullRequestDialog";
+import { MergeRequestPipelineLinksProvider } from "../pipelines/shared/MergeRequestPipelineLinks";
 import {
   RepositoryModule,
   useRepositoryModule,
@@ -123,16 +124,20 @@ function AvailablePullRequests({
         />
       ) : (
         <PullRequestsRouteNavigation projectRef={projectRef} number={number}>
-          <PullRequestsDetailView
-            key={number}
-            scope={scope}
-            projectRef={projectRef}
-            context={context}
-            number={number}
-            tab={tab}
-            mutationsDisabledReason={mutationsDisabledReason}
-            headerActions={renderDetailActions}
-          />
+          {/* The full page shares its checkout with Pipelines, so its jobs open there in-app.
+              A thread's side panel keeps the host links and its own checkout. */}
+          <MergeRequestPipelineLinksProvider projectRef={projectRef}>
+            <PullRequestsDetailView
+              key={number}
+              scope={scope}
+              projectRef={projectRef}
+              context={context}
+              number={number}
+              tab={tab}
+              mutationsDisabledReason={mutationsDisabledReason}
+              headerActions={renderDetailActions}
+            />
+          </MergeRequestPipelineLinksProvider>
         </PullRequestsRouteNavigation>
       )}
       {createOpen ? (

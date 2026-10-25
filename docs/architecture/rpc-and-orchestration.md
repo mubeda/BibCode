@@ -906,7 +906,12 @@ took before its first host call). It also keeps the newest pipeline copy it
 has shown for the merge request, so a tab switch, which re-keys the snapshot
 read, or a failed snapshot read never moves the merge box or the Pipelines tab
 back. It answers the other names with the unary reads, and `checks` without
-`pipeline` with `getChecks`. A number past the three-number pipeline read cap
+`pipeline` with `getChecks`. A check (in `getChecks` and in the `pipeline`
+row's job groups) may carry `pipelineId` and `jobId`, together or not at all:
+the Pipelines job route's ids, set only for a job of this project whose job
+page can read it (a GitLab build job under the project's web URL, a GitHub
+Actions job page on this repository). Older servers and stored rows omit
+them, and the client then keeps the host link. A number past the three-number pipeline read cap
 gets `pipeline` rows with the header only (`checks: null`); on the Pipelines
 tab such a row, arriving after a `pipeline` name, is answered with one
 `getChecks` per row revision, so the job list follows the header. A row that

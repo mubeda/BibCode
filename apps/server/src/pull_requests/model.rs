@@ -800,6 +800,12 @@ pub struct Check {
     pub started_at: Option<String>,
     pub completed_at: Option<String>,
     pub duration_seconds: Option<f64>,
+    /// The Pipelines module's route ids for this job: set only for a job of this
+    /// project that its job page can read, never parsed from another origin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipeline_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<u64>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct CheckGroup {

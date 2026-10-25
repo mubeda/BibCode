@@ -1,5 +1,7 @@
 import type { PullRequestsPipeline } from "@bibcode/contracts";
+import { Link } from "@tanstack/react-router";
 import { memo } from "react";
+import { useMergeRequestPipelineLinks } from "../../pipelines/shared/MergeRequestPipelineLinks";
 import { PipelineStatusIcon } from "../../pipelines/shared/PipelineStatusIcon";
 import { useFinishedAnnouncement } from "../../pipelines/shared/useFinishedAnnouncement";
 import { Badge } from "../../ui/badge";
@@ -23,6 +25,7 @@ const PipelineHeader = memo(function PipelineHeader({
 }) {
   const sha = pipelineShortSha(pipeline);
   const status = pipelineStatusLabel(pipeline.status, pipeline.warnings);
+  const pipelinePage = useMergeRequestPipelineLinks().pipeline(pipeline.id);
   return (
     <div className="space-y-2">
       <p className="flex flex-wrap items-center gap-x-1.5 gap-y-1 text-sm">
@@ -47,6 +50,11 @@ const PipelineHeader = memo(function PipelineHeader({
             <>on {branch}</>
           )}
         </span>
+        {pipelinePage !== null ? (
+          <Link {...pipelinePage} className="text-primary underline underline-offset-4">
+            View pipeline
+          </Link>
+        ) : null}
         {pipeline.isForHead === false ? (
           <Badge variant="warning" size="sm" title="This pipeline ran before the latest push.">
             Older commit

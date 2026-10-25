@@ -840,7 +840,7 @@ impl PullRequestHost for GitLabHost {
                     c,
                 )
                 .await?;
-            parse::checks(&jobs, pipeline)
+            parse::checks(&jobs, pipeline, base.as_deref())
         })
     }
     fn files<'a>(
