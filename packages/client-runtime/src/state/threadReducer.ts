@@ -84,6 +84,7 @@ export function applyThreadDetailEvent(
           archivedAt: null,
           deletedAt: null,
           messages: [],
+          reasoning: [],
           proposedPlans: [],
           activities: [],
           checkpoints: [],
@@ -344,6 +345,45 @@ export function applyThreadDetailEvent(
       };
     }
 
+    // ── Reasoning ───────────────────────────────────────────────────
+    // The assistant-message rule: a streaming write appends, a completion with
+    // text replaces the text, and one without text keeps it. Reasoning never
+    // moves the turn or its checkpoint, and is never a message.
+    case "thread.reasoning-sent": {
+      const existing = thread.reasoning.find((entry) => entry.id === event.payload.reasoningId);
+      if (existing === undefined && !event.payload.streaming && event.payload.text.length === 0) {
+        return { kind: "unchanged" };
+      }
+      const reasoning =
+        existing === undefined
+          ? Arr.append(thread.reasoning, {
+              id: event.payload.reasoningId,
+              turnId: event.payload.turnId,
+              text: event.payload.text,
+              streaming: event.payload.streaming,
+              createdAt: event.payload.createdAt,
+              updatedAt: event.payload.updatedAt,
+            })
+          : Arr.map(thread.reasoning, (entry) =>
+              entry.id !== event.payload.reasoningId
+                ? entry
+                : {
+                    ...entry,
+                    text: event.payload.streaming
+                      ? `${entry.text}${event.payload.text}`
+                      : event.payload.text.length > 0
+                        ? event.payload.text
+                        : entry.text,
+                    streaming: event.payload.streaming,
+                    updatedAt: event.payload.updatedAt,
+                  },
+            );
+      return {
+        kind: "updated",
+        thread: { ...thread, reasoning, updatedAt: event.occurredAt },
+      };
+    }
+
     // ── Session ─────────────────────────────────────────────────────
     case "thread.session-set": {
       // Leaving the "running" session status is the turn-end signal: settle a
@@ -497,6 +537,10 @@ export function applyThreadDetailEvent(
         thread.activities,
         Arr.filter((activity) => activity.turnId === null || retainedTurnIds.has(activity.turnId)),
       );
+      const reasoning = pipe(
+        thread.reasoning,
+        Arr.filter((entry) => entry.turnId === null || retainedTurnIds.has(entry.turnId)),
+      );
       const latestCheckpoint = checkpoints.at(-1) ?? null;
 
       return {
@@ -505,6 +549,7 @@ export function applyThreadDetailEvent(
           ...thread,
           checkpoints,
           messages,
+          reasoning,
           proposedPlans,
           activities,
           latestTurn:

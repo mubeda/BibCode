@@ -201,6 +201,7 @@ export function buildLocalDraftThread(
     worktreePath: draftThread.worktreePath,
     checkpoints: [],
     activities: [],
+    reasoning: [],
     proposedPlans: [],
   };
 }

@@ -398,6 +398,27 @@ version, and the elapsed time, or a `Claude activity probe failed` warning with
 `outcome` (`failed` or `timed out`) and the reason. A launch that stops waiting
 logs `launching Claude without activity flags`.
 
+## Thinking
+
+Claude's thinking shows in the chat as collapsed **Thought** rows, one per
+thinking block, never as assistant text (see the
+[Workspace UI](../user/workspace-ui.md#reading-the-timeline)). From Claude Opus
+4.7 on, the API omits thinking text unless a client asks for a summary; older
+models summarize by default. The same probe therefore asks whether the CLI
+accepts `--thinking-display summarized`, a switch `--help` does not list: it runs
+`claude --thinking-display bibcode-probe --version`. A CLI that knows the switch
+rejects the invalid value, exits nonzero and names `summarized` among the values
+it allows; only then is the switch passed to chat launches. A CLI without it
+ignores the option under `--version` and exits 0, and reads as unsupported. A
+timed-out or failed run is not cached, as for the other switches, and the probe
+line in `server.log` reports `thinking_display`.
+
+The switch only asks for text. What BiBCode shows never depends on the probe:
+any non-empty thinking delta becomes a thought, and an omitted block (one empty
+delta and a signature), a redacted block or a subagent's thinking adds no row.
+Summarized thinking delays the first text token of a reply a little, which is
+the cost of seeing the thoughts.
+
 Structured chat control correlation is stricter than display observation.
 BiBCode exposes a private task target only after one session and Activity
 generation proves the complete identity chain: an Agent/legacy Task tool

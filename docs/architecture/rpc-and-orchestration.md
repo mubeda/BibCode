@@ -2444,8 +2444,11 @@ when acceptance was lost; Claude sending rows become uncertain.
 
 Provider assistant text preserves a native runtime `itemId` when the provider
 exposes one. The server converts it to a thread-namespaced orchestration
-message ID before persistence. Providers whose protocol does not expose a
-message identity use one deterministic assistant message per thread turn.
+message ID before persistence. Assistant text whose provider event carries no
+message identity uses one deterministic assistant message per thread turn.
+Provider reasoning never takes this path: it is its own entity (see
+[Provider reasoning](#provider-reasoning)), so a reasoning delta without an item
+id cannot become a second assistant message of the turn.
 
 Terminal turn projection completes every existing streaming assistant message
 for that thread and turn and never creates an empty assistant message. The
@@ -2468,6 +2471,47 @@ database work. If both live settlement attempts fail after an unexpected stream
 end, the durable error runtime retains thread-scoped recovery ownership: the
 next startup settles the exact stored message and turn identities without
 rewriting the original provider or session error.
+
+### Provider reasoning
+
+Claude thinking and Codex reasoning summaries reach the chat as reasoning
+entries, never as assistant text. Provider adapters emit `content.delta` with
+`streamKind` `reasoning_text` (Claude) or `reasoning_summary_text` (Codex) and
+an `item.completed` with `itemType: "reasoning"`; Codex's completion carries the
+whole summary, joined by blank lines, which is authoritative over what streamed.
+Raw Codex reasoning and Claude's redacted, omitted (empty) or subagent thinking
+produce no entry.
+
+- **Identity:** `reasoning:{thread}:item:{itemId}`, or
+  `reasoning:{thread}:turn:{turn}` when the event has no item. Claude's item is
+  `{messageId}:{blockIndex}`, one entry per thinking block.
+- **Coalescing:** the provider event pump buffers each entry and writes it at most
+  once per 250 ms window (`thread.reasoning.delta`), so an entry whose deltas
+  span D writes at most D / 250 ms + 1 streaming rows instead of one per delta.
+  Only the entry's own completion, its turn's `turn.completed` and the pump's end
+  write early. The first write keeps the time the first delta was buffered, so a
+  thought sorts before the tool call that followed it. An entry stops at 32 KiB,
+  cut at a UTF-8 boundary and ending with `…`; completion text is cut the same way.
+  Text that fits is kept whole: a window's write holds back the bytes the `…`
+  would need until a later delta shows whether the entry is cut.
+- **Persistence:** `thread.reasoning.delta` and `thread.reasoning.complete` become
+  `thread.reasoning-sent` events, projected by the message projector into
+  `projection_thread_reasoning` (migration 55) by the assistant-message rule: a
+  streaming write appends, a completion with text replaces the text and creates
+  a missing entry, and a completion without text only settles a streaming entry.
+  A text-less completion with no streaming entry appends no event. A revert drops
+  the reasoning of reverted turns, and a message-projection rebuild rebuilds it.
+- **Settlement:** a turn's completion and its interrupt deadline settle that
+  turn's streaming entries. When a session ends, every entry still streaming on
+  its thread settles, whatever its turn: at the pump's end of stream, after
+  `detach_session` reaps an aborted pump (`stop_session`, idle suspension,
+  shutdown), and once at startup over the reasoning table itself, before any
+  session starts.
+- **Wire:** the `orchestration.subscribeThread` snapshot carries a `reasoning`
+  array and patches diff it like any other array; clients that do not know the
+  field drop it, and a thread from an older server decodes to `[]`. Reasoning
+  never enters messages, the context handoff, the turn's assistant pointer or
+  checkpoints, and its text reaches no log, trace or profiler record.
 
 ### Context-window usage flow
 

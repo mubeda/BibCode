@@ -999,8 +999,8 @@ if (streamShapeFixtures.length !== topLevelStreamShapeCount) {
 if (typedFailureFixtures.length !== 349) {
   throw new Error(`Expected 349 typed failure fixtures, found ${typedFailureFixtures.length}.`);
 }
-if (orchestrationEventShapeCount !== 24) {
-  throw new Error(`Expected 24 orchestration event shapes, found ${orchestrationEventShapeCount}.`);
+if (orchestrationEventShapeCount !== 25) {
+  throw new Error(`Expected 25 orchestration event shapes, found ${orchestrationEventShapeCount}.`);
 }
 const expectedStale = ["projects.add", "projects.list", "projects.remove"];
 if (JSON.stringify(staleMethodIdentifiers) !== JSON.stringify(expectedStale)) {

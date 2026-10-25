@@ -28,8 +28,9 @@ use crate::persistence::{
     CheckpointDiffBlob, CommandReceipt, CommitFence, Database, NewOrchestrationEvent,
     OrchestrationEvent, PersistenceError, ProjectionPendingApproval, ProjectionProject,
     ProjectionState, ProjectionThread, ProjectionThreadActivity, ProjectionThreadMessage,
-    ProjectionThreadProposedPlan, ProjectionThreadSession, ProjectionTurn, Repositories,
-    can_promote_queued_provider_turn_on, finalize_command_receipt_on, hold_queued_provider_turns,
+    ProjectionThreadProposedPlan, ProjectionThreadReasoning, ProjectionThreadSession,
+    ProjectionTurn, Repositories, can_promote_queued_provider_turn_on, finalize_command_receipt_on,
+    hold_queued_provider_turns,
 };
 use crate::{
     checkpointing,
@@ -57,6 +58,8 @@ enum ProjectionMode {
     #[default]
     Legacy,
     UpdateExistingAssistantMessage,
+    /// A reasoning completion without text: it settles a streaming entry and never creates one.
+    UpdateExistingReasoning,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -687,6 +690,39 @@ pub enum OrchestrationCommand {
         thread_id: String,
         #[serde(rename = "messageId")]
         message_id: String,
+        #[serde(rename = "turnId", default, skip_serializing_if = "Option::is_none")]
+        turn_id: Option<String>,
+        #[serde(rename = "createdAt")]
+        created_at: String,
+    },
+    /// Appends text to a reasoning entry, creating it on its first delta.
+    #[serde(rename = "thread.reasoning.delta")]
+    ThreadReasoningDelta {
+        #[serde(rename = "commandId")]
+        command_id: String,
+        #[serde(rename = "threadId")]
+        thread_id: String,
+        #[serde(rename = "reasoningId")]
+        reasoning_id: String,
+        delta: String,
+        #[serde(rename = "turnId", default, skip_serializing_if = "Option::is_none")]
+        turn_id: Option<String>,
+        #[serde(rename = "createdAt")]
+        created_at: String,
+    },
+    /// Settles a reasoning entry. With `text`, the text replaces what streamed (a Codex summary
+    /// is authoritative) and creates the entry if none streamed; without it, only a streaming
+    /// entry is settled and nothing is created.
+    #[serde(rename = "thread.reasoning.complete")]
+    ThreadReasoningComplete {
+        #[serde(rename = "commandId")]
+        command_id: String,
+        #[serde(rename = "threadId")]
+        thread_id: String,
+        #[serde(rename = "reasoningId")]
+        reasoning_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
         #[serde(rename = "turnId", default, skip_serializing_if = "Option::is_none")]
         turn_id: Option<String>,
         #[serde(rename = "createdAt")]
@@ -3083,13 +3119,16 @@ async fn process_envelope(
     }
 
     ensure_command_active(cancellation)?;
-    let projection_mode = if matches!(
-        command,
-        OrchestrationCommand::ThreadMessageAssistantComplete { .. }
-    ) {
-        ProjectionMode::UpdateExistingAssistantMessage
-    } else {
-        ProjectionMode::Legacy
+    let projection_mode = match &command {
+        OrchestrationCommand::ThreadMessageAssistantComplete { .. } => {
+            ProjectionMode::UpdateExistingAssistantMessage
+        }
+        OrchestrationCommand::ThreadReasoningComplete { text, .. }
+            if text.as_deref().is_none_or(str::is_empty) =>
+        {
+            ProjectionMode::UpdateExistingReasoning
+        }
+        _ => ProjectionMode::Legacy,
     };
     let mut planned = match plan_command(
         repositories,
@@ -4571,6 +4610,40 @@ async fn plan_command(
             metadata,
             json!({"threadId":thread_id,"messageId":message_id,"role":"assistant","text":"","turnId":turn_id,"streaming":false,"createdAt":created_at,"updatedAt":created_at}),
         ),
+        OrchestrationCommand::ThreadReasoningDelta {
+            command_id,
+            thread_id,
+            reasoning_id,
+            delta,
+            turn_id,
+            created_at,
+        } => simple_thread_event(
+            model,
+            command,
+            "thread.reasoning-sent",
+            command_id,
+            thread_id,
+            created_at,
+            metadata,
+            json!({"threadId":thread_id,"reasoningId":reasoning_id,"text":delta,"turnId":turn_id,"streaming":true,"createdAt":created_at,"updatedAt":created_at}),
+        ),
+        OrchestrationCommand::ThreadReasoningComplete {
+            command_id,
+            thread_id,
+            reasoning_id,
+            text,
+            turn_id,
+            created_at,
+        } => simple_thread_event(
+            model,
+            command,
+            "thread.reasoning-sent",
+            command_id,
+            thread_id,
+            created_at,
+            metadata,
+            json!({"threadId":thread_id,"reasoningId":reasoning_id,"text":text.as_deref().unwrap_or_default(),"turnId":turn_id,"streaming":false,"createdAt":created_at,"updatedAt":created_at}),
+        ),
         OrchestrationCommand::ThreadProposedPlanUpsert {
             command_id,
             thread_id,
@@ -5019,6 +5092,11 @@ async fn persist_command(
             for planned in &event_list {
                 if projection_mode == ProjectionMode::UpdateExistingAssistantMessage
                     && !streaming_assistant_message_exists_tx(&transaction, &planned.payload)?
+                {
+                    continue;
+                }
+                if projection_mode == ProjectionMode::UpdateExistingReasoning
+                    && !streaming_reasoning_exists_tx(&transaction, &planned.payload)?
                 {
                     continue;
                 }
@@ -5921,7 +5999,14 @@ fn apply_messages_projector_tx(
             "DELETE FROM projection_thread_messages WHERE thread_id = ? AND turn_id IN (SELECT json_extract(payload_json, '$.turnId') FROM orchestration_events WHERE event_type = 'thread.turn-diff-completed' AND stream_id = ? AND CAST(json_extract(payload_json, '$.checkpointTurnCount') AS INTEGER) > ?)",
             params![required_str(&event.event.payload, "threadId")?, required_str(&event.event.payload, "threadId")?, required_i64(&event.event.payload, "turnCount")?],
         )?;
+        transaction.execute(
+            "DELETE FROM projection_thread_reasoning WHERE thread_id = ? AND turn_id IN (SELECT json_extract(payload_json, '$.turnId') FROM orchestration_events WHERE event_type = 'thread.turn-diff-completed' AND stream_id = ? AND CAST(json_extract(payload_json, '$.checkpointTurnCount') AS INTEGER) > ?)",
+            params![required_str(&event.event.payload, "threadId")?, required_str(&event.event.payload, "threadId")?, required_i64(&event.event.payload, "turnCount")?],
+        )?;
         return Ok(());
+    }
+    if event.event.event_type == "thread.reasoning-sent" {
+        return apply_reasoning_sent_tx(transaction, &event.event.payload);
     }
     if event.event.event_type == "thread.turn-delivery-updated" {
         let payload = &event.event.payload;
@@ -5992,6 +6077,68 @@ fn apply_messages_projector_tx(
         ],
     )?;
     Ok(())
+}
+
+/// Reasoning follows the assistant-message rule: a streaming row appends, a completion with
+/// text replaces the text, and a completion without text keeps it. A completion without text
+/// only settles an existing streaming row; the planner already dropped it when there is none,
+/// so live dispatch and replay agree. `created_at` stays the first row's.
+fn apply_reasoning_sent_tx(
+    transaction: &Transaction<'_>,
+    payload: &Value,
+) -> Result<(), PersistenceError> {
+    let streaming = payload
+        .get("streaming")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let text = required_str(payload, "text")?;
+    if !streaming && text.is_empty() {
+        transaction.execute(
+            "UPDATE projection_thread_reasoning SET is_streaming = 0, updated_at = ? \
+             WHERE reasoning_id = ? AND thread_id = ? AND is_streaming = 1",
+            params![
+                required_str(payload, "updatedAt")?,
+                required_str(payload, "reasoningId")?,
+                required_str(payload, "threadId")?,
+            ],
+        )?;
+        return Ok(());
+    }
+    transaction.execute(
+        "INSERT INTO projection_thread_reasoning (reasoning_id, thread_id, turn_id, text, is_streaming, created_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT (reasoning_id) DO UPDATE SET \
+           text = CASE WHEN excluded.is_streaming = 1 THEN projection_thread_reasoning.text || excluded.text ELSE excluded.text END, \
+           is_streaming = excluded.is_streaming, updated_at = excluded.updated_at",
+        params![
+            required_str(payload, "reasoningId")?,
+            required_str(payload, "threadId")?,
+            optional_string(payload.get("turnId")),
+            text,
+            streaming,
+            required_str(payload, "createdAt")?,
+            required_str(payload, "updatedAt")?,
+        ],
+    )?;
+    Ok(())
+}
+
+fn streaming_reasoning_exists_tx(
+    transaction: &Transaction<'_>,
+    payload: &Value,
+) -> Result<bool, PersistenceError> {
+    Ok(transaction
+        .query_row(
+            "SELECT 1 FROM projection_thread_reasoning \
+             WHERE reasoning_id = ? AND thread_id = ? AND is_streaming = 1",
+            params![
+                required_str(payload, "reasoningId")?,
+                required_str(payload, "threadId")?,
+            ],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
 }
 
 fn streaming_assistant_message_exists_tx(
@@ -6847,6 +6994,8 @@ impl OrchestrationCommand {
             Self::ThreadSessionSet { .. } => "thread.session.set",
             Self::ThreadMessageAssistantDelta { .. } => "thread.message.assistant.delta",
             Self::ThreadMessageAssistantComplete { .. } => "thread.message.assistant.complete",
+            Self::ThreadReasoningDelta { .. } => "thread.reasoning.delta",
+            Self::ThreadReasoningComplete { .. } => "thread.reasoning.complete",
             Self::ThreadProposedPlanUpsert { .. } => "thread.proposed-plan.upsert",
             Self::ThreadTurnDiffComplete { .. } => "thread.turn.diff.complete",
             Self::ThreadActivityAppend { .. } => "thread.activity.append",
@@ -6883,6 +7032,8 @@ impl OrchestrationCommand {
             | Self::ThreadSessionSet { command_id, .. }
             | Self::ThreadMessageAssistantDelta { command_id, .. }
             | Self::ThreadMessageAssistantComplete { command_id, .. }
+            | Self::ThreadReasoningDelta { command_id, .. }
+            | Self::ThreadReasoningComplete { command_id, .. }
             | Self::ThreadProposedPlanUpsert { command_id, .. }
             | Self::ThreadTurnDiffComplete { command_id, .. }
             | Self::ThreadActivityAppend { command_id, .. }
@@ -6919,6 +7070,8 @@ impl OrchestrationCommand {
             | Self::ThreadSessionSet { created_at, .. }
             | Self::ThreadMessageAssistantDelta { created_at, .. }
             | Self::ThreadMessageAssistantComplete { created_at, .. }
+            | Self::ThreadReasoningDelta { created_at, .. }
+            | Self::ThreadReasoningComplete { created_at, .. }
             | Self::ThreadProposedPlanUpsert { created_at, .. }
             | Self::ThreadTurnDiffComplete { created_at, .. }
             | Self::ThreadActivityAppend { created_at, .. }
@@ -6955,6 +7108,8 @@ impl OrchestrationCommand {
             | Self::ThreadSessionSet { thread_id, .. }
             | Self::ThreadMessageAssistantDelta { thread_id, .. }
             | Self::ThreadMessageAssistantComplete { thread_id, .. }
+            | Self::ThreadReasoningDelta { thread_id, .. }
+            | Self::ThreadReasoningComplete { thread_id, .. }
             | Self::ThreadProposedPlanUpsert { thread_id, .. }
             | Self::ThreadTurnDiffComplete { thread_id, .. }
             | Self::ThreadActivityAppend { thread_id, .. }
@@ -6980,6 +7135,8 @@ pub struct Snapshot {
     pub projects: Vec<ProjectionProject>,
     pub threads: Vec<ProjectionThread>,
     pub messages: Vec<ProjectionThreadMessage>,
+    /// Read by the full and the thread loaders; a shell snapshot shows no reasoning.
+    pub reasoning: Vec<ProjectionThreadReasoning>,
     pub activities: Vec<ProjectionThreadActivity>,
     pub sessions: Vec<ProjectionThreadSession>,
     pub approvals: Vec<ProjectionPendingApproval>,
@@ -7010,6 +7167,7 @@ pub async fn load_snapshot(repositories: &Repositories) -> Result<Snapshot, Orch
         .map_err(wrap_persistence)?;
     let mut threads = Vec::new();
     let mut messages = Vec::new();
+    let mut reasoning = Vec::new();
     let mut activities = Vec::new();
     let mut sessions = Vec::new();
     let mut approvals = Vec::new();
@@ -7027,6 +7185,12 @@ pub async fn load_snapshot(repositories: &Repositories) -> Result<Snapshot, Orch
             messages.extend(
                 repositories
                     .list_messages_by_thread(thread.thread_id.clone())
+                    .await
+                    .map_err(wrap_persistence)?,
+            );
+            reasoning.extend(
+                repositories
+                    .list_reasoning_by_thread(thread.thread_id.clone())
                     .await
                     .map_err(wrap_persistence)?,
             );
@@ -7082,6 +7246,7 @@ pub async fn load_snapshot(repositories: &Repositories) -> Result<Snapshot, Orch
         projects,
         threads,
         messages,
+        reasoning,
         activities,
         sessions,
         approvals,
@@ -7112,6 +7277,7 @@ pub async fn load_shell_snapshot(
         projects: rows.projects,
         threads: rows.threads,
         messages: rows.preview_messages,
+        reasoning: Vec::new(),
         activities: rows.preview_activities,
         sessions: rows.sessions,
         approvals: Vec::new(),
@@ -7137,6 +7303,7 @@ pub async fn load_thread_snapshot(
         projects: Vec::new(),
         threads: Vec::new(),
         messages: Vec::new(),
+        reasoning: Vec::new(),
         activities: Vec::new(),
         sessions: Vec::new(),
         approvals: Vec::new(),
@@ -7169,6 +7336,10 @@ pub async fn load_thread_snapshot(
     let thread_id = thread.thread_id.clone();
     snapshot.messages = repositories
         .list_messages_by_thread(thread_id.clone())
+        .await
+        .map_err(wrap_persistence)?;
+    snapshot.reasoning = repositories
+        .list_reasoning_by_thread(thread_id.clone())
         .await
         .map_err(wrap_persistence)?;
     snapshot.activities = repositories
@@ -7219,6 +7390,12 @@ impl Snapshot {
                 (false, true) => std::cmp::Ordering::Less,
                 (false, false) => left.message_id.cmp(&right.message_id),
             }
+        });
+        self.reasoning.sort_by(|left, right| {
+            left.thread_id
+                .cmp(&right.thread_id)
+                .then_with(|| left.created_at.cmp(&right.created_at))
+                .then_with(|| left.reasoning_id.cmp(&right.reasoning_id))
         });
         self.sessions
             .sort_by(|left, right| left.thread_id.cmp(&right.thread_id));

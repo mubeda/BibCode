@@ -4,6 +4,7 @@ import {
   ApprovalRequestId,
   isToolLifecycleItemType,
   type OrchestrationLatestTurn,
+  type OrchestrationReasoning,
   type OrchestrationThreadActivity,
   type OrchestrationProposedPlanId,
   ProviderDriverKind,
@@ -12,6 +13,7 @@ import {
   type ThreadId,
   type TurnId,
 } from "@bibcode/contracts";
+import { reasoningLabel } from "@bibcode/client-runtime/state/reasoning";
 
 import type {
   ChatMessage,
@@ -52,7 +54,10 @@ export interface WorkLogEntry {
   command?: string;
   rawCommand?: string;
   changedFiles?: ReadonlyArray<string>;
-  tone: "thinking" | "tool" | "info" | "warning" | "error";
+  /** `reasoning` is a provider's thought (#173); `thinking` is a task progress line. */
+  tone: "thinking" | "reasoning" | "tool" | "info" | "warning" | "error";
+  /** The reasoning block a `reasoning` entry shows. */
+  reasoning?: OrchestrationReasoning;
   toolTitle?: string;
   toolData?: unknown;
   itemType?: ToolLifecycleItemType;
@@ -123,6 +128,10 @@ export type TimelineEntry =
     };
 
 export function workLogEntryIsToolLike(entry: WorkLogEntry): boolean {
+  // A thought has no status, so the neutral-status filter must never hide it.
+  if (entry.tone === "reasoning") {
+    return false;
+  }
   if (entry.tone === "tool" || entry.tone === "thinking" || entry.tone === "error") {
     return true;
   }
@@ -624,6 +633,29 @@ export function deriveWorkLogEntries(
     const { activityKind, collapseKey: _collapseKey, ...rest } = entry;
     return Object.assign(rest, { sourceActivityKind: activityKind });
   });
+}
+
+/**
+ * A thread's reasoning as work-log entries, which sort among tool calls by the time each
+ * thought began. An empty block (omitted or redacted thinking) has no row.
+ */
+export function deriveReasoningWorkEntries(
+  reasoning: ReadonlyArray<OrchestrationReasoning>,
+): WorkLogEntry[] {
+  return reasoning.flatMap((entry) =>
+    entry.text.trim().length === 0
+      ? []
+      : [
+          {
+            id: entry.id,
+            createdAt: entry.createdAt,
+            turnId: entry.turnId,
+            label: reasoningLabel(entry),
+            tone: "reasoning" as const,
+            reasoning: entry,
+          },
+        ],
+  );
 }
 
 function isPlanBoundaryToolActivity(activity: OrchestrationThreadActivity): boolean {
