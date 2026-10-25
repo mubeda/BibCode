@@ -1119,6 +1119,44 @@ reads again. Retry and Cancel appear on rows they apply to; until the server
 offers pipeline actions they stay disabled and say why, and a row your
 account cannot retry says that instead.
 
+### Job page and log
+
+A job page (`…/pipelines/<pipeline>/jobs/<job>`) shows one job: its status,
+name, number, stage and start time, **Open on GitLab**, and its log, with the
+job's details beside it on a wide panel or under **Details** on a narrow one.
+It opens on the job BiBCode last stored, then the host's answer. The details
+list the duration (**Elapsed** while it runs), when it finished, how long it
+queued, the runner, the pipeline source, the runner tags, the job's artifacts
+(size, expiry, and **Download** and **Browse** links to GitLab's pages), the
+commit, the pipeline and the stage's other jobs: pick a stage to see its jobs
+and choose one to open its page. Timeout is not shown; neither host's API
+returns it. Retry, Cancel and Run (for a manual job) appear where they apply
+and stay disabled with their reason until the server offers job actions.
+
+The log keeps the job's colors in the terminal's palette for the current
+theme, numbers its lines, and folds GitLab's collapsible sections (the header
+shows the section's duration; sections GitLab marks collapsed start folded).
+**Timestamps** (shown only when the runner stamps its lines) adds a time
+column, **Wrap lines** wraps long lines, **Collapse all**/**Expand all** folds
+every section, and the arrows jump to the top or the end. **Search log**
+(Mod+F while the job page is open; Escape returns to the log) finds text in
+any line, counting "3 of 17", with Enter and Shift+Enter or the arrows to step
+through matches; a match inside a folded section opens it. **Raw log** opens
+GitLab's plain log.
+
+A finished log opens at its end, where failures print. A running job's log
+follows new output about every 5 seconds while the window is visible and you
+are at the bottom; scroll up to read and **Jump to latest** returns. Opening a
+running log reads at most about 2 MB; a running log larger than that keeps
+what loaded and says GitLab shows the live end, then loads in full when the
+job finishes. **Load earlier** reads the text before what is shown (up to
+16 MB per job page). When the loaded text does not start at the beginning of
+the log, line numbers count from the first loaded line until earlier text
+loads. Click a line number to put that line in the address (`?at=`, its byte
+offset): a copied link opens on that line without reading the log before it.
+A job that has not started, has no output yet, produced no log, or had its
+log erased says so instead of showing an empty log.
+
 ## Right Panel
 
 The right panel hosts persistent tool surfaces for the active thread. Use its

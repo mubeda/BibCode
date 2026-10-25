@@ -2705,7 +2705,22 @@ See [RPC and orchestration](./rpc-and-orchestration.md) and
   (`/project/$environmentId/$projectId/pipelines`, filters in the URL and
   remembered per project in `bibcode:pipelines-state:v1`) paints the stored
   first page, then the live one, follows the GitLab stream while the document
-  is visible, and falls back to the 20 s visible timer. See
+  is visible, and falls back to the 20 s visible timer. The job page
+  (`/project/$environmentId/$projectId/pipelines/$pipelineId/jobs/$jobId`,
+  `?at=` a line's byte offset; `pipelineJobLink` builds its links) paints the
+  stored job and pipeline rows, subscribes with the project's remembered list
+  key and its pipeline, takes the job's status from the polled pipeline row,
+  and re-reads the job once when it turns terminal. Its log
+  (`components/pipelines/log/`, the compound `JobLog`) parses in a Web Worker
+  (`jobLog.worker.ts`, falling back to 64 KiB main-thread slices between
+  frames) that keeps the decoded text, line offsets, SGR styles at each line
+  start, sections and search, and returns per-row layout arrays and the spans
+  of visible rows only; rows are virtualized with a fixed 20 px height while
+  lines do not wrap. `JobLogReader` owns the log's reads (tail or `?at=`, at
+  most three catch-up reads, a 5 s visible-only follow, one final read on the
+  terminal transition, Load earlier up to 16 MiB). Its colors come from the
+  terminal's 16-color palette in `components/terminalTheme.ts`, shared with
+  the live terminal. See
   [Pipelines contract boundary](./rpc-and-orchestration.md#pipelines-contract-boundary).
 - The right panel (`rightPanelStore`) can show one request per tab, with no new
   server contract. `pullRequest` surfaces (`pullRequest:<number>`, with the

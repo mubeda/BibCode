@@ -718,13 +718,15 @@ The service tests resolve a checkout through fake `git` and `glab` scripts and
 run on Unix only; the poller tests use an in-memory provider and run on every
 platform.
 
-For the Pipelines web module, the repository module shell both modules share,
-the sidebar buttons, the Settings switch and the Pipelines client runtime,
+For the Pipelines web module (the list, the job page and its log parser,
+worker engine, reader and viewer), the repository module shell both modules
+share, the sidebar buttons, the Settings switch and the Pipelines client
+runtime,
 run from `apps/web` (compiler-sensitive happy-dom files) and the repository
 root:
 
 ```sh
-vp test run --project unit src/pipelinesStore.test.ts src/components/pipelines src/components/repositoryModule src/components/pullRequests src/components/Sidebar.test.tsx src/components/settings/SourceControlSettings.test.tsx
+vp test run --project unit src/pipelinesStore.test.ts src/components/pipelines src/components/repositoryModule src/components/pullRequests src/components/Sidebar.test.tsx src/components/settings/SourceControlSettings.test.tsx src/components/terminalTheme.test.ts
 vp test run packages/client-runtime/src/state/pipelines.test.ts
 vp run typecheck
 vp check
@@ -2659,6 +2661,46 @@ tag, one merge request pipeline) and a GitHub repository.
    its own refusal. Open on GitLab opens the host's page.
 7. Open a GitHub repository: the module shows "Pipelines for GitHub are
    coming." with **Open on GitHub** (the repository's Actions page).
+
+### Pipelines job page validation
+
+Use a GitLab project with a finished failed job whose log has colors and
+collapsible sections, a job with a log over 16 MB or about 100,000 lines, a
+running job, a manual job, an erased job and a job with artifacts.
+
+1. Open a job from its URL
+   (`/project/<env>/<project>/pipelines/<pipeline>/jobs/<job>`): the header
+   shows status, name, `Job #<id> · stage <stage> · started …`, **Open on
+   GitLab** and the disabled Retry, Cancel or Run with "Update the server to
+   retry and cancel pipelines."; the project header stays highlighted.
+   Reopen it: the stored job paints before any `glab` spawn. A non-numeric
+   pipeline or job id returns to the list.
+2. The finished log opens at its end with GitLab's colors in both themes,
+   line numbers matching GitLab's, sections folded where GitLab folds them,
+   section durations, and **Timestamps** only on a stamped log. Collapse all,
+   Expand all, Wrap lines, Scroll to top and Scroll to bottom work; **Raw
+   log** opens GitLab's raw log.
+3. Search a common word: "1 of N", Enter and Shift+Enter wrap, a match in a
+   folded section opens it. Mod+F focuses the search once (Find in thread does
+   not open) and Escape returns to the log.
+4. Click a line number: the address gains `?at=` and the line highlights.
+   Open the copied link in another window: it opens on that line, reading
+   only that window (one `getJobLog` in the server trace).
+5. On the large log, scroll the whole log and search a term with thousands of
+   matches: the window stays responsive (record a Performance trace; no task
+   over 50 ms). **Load earlier** adds text above until 16 MB, then says
+   earlier lines are on the host; line numbers start at the first loaded line
+   until offset 0 is loaded.
+6. On the running job, new output appears within about 5 s while at the
+   bottom; scrolling up shows **Jump to latest**; hiding the window stops the
+   `getJobLog` reads; two windows on one job read GitLab's trace at most once
+   per 4 s. When the job finishes, one final read loads the rest and reads
+   stop. A running log over 2 MB keeps its head with the "This running log is
+   over 2 MB" copy and **Open on GitLab** until the job finishes.
+7. The details show duration or elapsed, finished, queued, runner, source,
+   tags, artifacts with **Download** and **Browse**, commit, pipeline, and the
+   stage's other jobs as links to their pages; on a narrow panel they sit
+   under **Details**. The erased job and a job without output say so.
 
 ### Remote-hosted Git Manager run
 

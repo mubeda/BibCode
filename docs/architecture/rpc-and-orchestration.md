@@ -1464,6 +1464,25 @@ the server's `retryAfterSeconds` as a countdown, disables Refresh and Retry
 until it ends, then reads once as a timer read. A row hovered 150 ms prefetches
 its `get`, at most two per environment and not again within 5 s.
 
+A job page reads `getJob` and its pipeline's `get` once on open, paints the
+stored `pipelines_job` and `pipelines_detail` rows from one `readSnapshot`,
+and on GitLab subscribes with the project's remembered list key plus
+`pipelineId` and `jobId`, so it shares the list's poller; a `pipeline` name
+re-reads `readSnapshot` only. The job's status and permissions come from the
+newest pipeline copy by `revision`; while the stream is down a running
+pipeline is re-read every 10 s on the visible timer, and `getJob` is read
+again only once, when the job turns terminal. `getJobLog` is a one-shot
+command, never an atom: the log's worker owns the text. Opening reads the
+`tail` (a line link's `offset` instead), then, while a running job's answer
+fills its window, at most three `offset` reads at `nextOffset` with
+`refresh: "follow"`; a running job is then followed with one `follow` read
+5 s after the last one settles, only while the document is visible; a
+`not_started` answer re-reads the tail on the same cadence. `too_large_live`
+keeps the loaded head and reads nothing until the job is terminal, when the
+tail is read once; a followed job that finishes gets one final read and then
+none. Load earlier reads `before` the loaded start with `refresh: "user"`
+until the view holds 16 MiB or a window brings nothing earlier.
+
 ## Worktree catalog flow
 
 The catalog protocol is server-resolved and capability gated:

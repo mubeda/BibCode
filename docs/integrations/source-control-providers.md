@@ -294,8 +294,9 @@ the list's first page every 20 s and, for at most three subscribed pipelines
 that are not terminal, one GraphQL pipeline read every 10 s (20 s after 30
 quiet minutes). It never reads `count`, jobs or logs; any number of windows on
 one list key share its reads. A running job's log is followed by the client
-with ranged trace reads, and every follower of one job shares the last tail
-read for 4 s. Every pipelines read, poller ticks and user reads alike, waits
+with ranged trace reads, one 5 s after the last while the window is visible
+(opening one costs at most four), and every follower of one job shares the
+last tail read for 4 s. Every pipelines read, poller ticks and user reads alike, waits
 for the host's backoff deadline and answers `rate_limited` without a host call
 until it passes; a 429 takes the later of the ladder step and the provider's
 `Retry-After` or `RateLimit-Reset`/`x-ratelimit-reset` header (read through
