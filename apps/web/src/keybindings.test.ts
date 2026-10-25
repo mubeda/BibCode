@@ -1,4 +1,7 @@
-import { DEFAULT_RESOLVED_KEYBINDINGS } from "@bibcode/shared/keybindings";
+import {
+  compileResolvedKeybindingsConfig,
+  DEFAULT_RESOLVED_KEYBINDINGS,
+} from "@bibcode/shared/keybindings";
 import { assert, describe, it } from "vite-plus/test";
 
 import {
@@ -9,6 +12,8 @@ import {
 } from "@bibcode/contracts";
 import {
   chatFindShortcutLabel,
+  diffChangeCommandForEvent,
+  diffChangeShortcutLabel,
   formatShortcutLabel,
   isChatFindFallbackShortcut,
   shouldOpenChatFind,
@@ -1080,5 +1085,46 @@ describe("Find in thread shortcut", () => {
   it("labels the effective key", () => {
     assert.strictEqual(chatFindShortcutLabel(DEFAULT_RESOLVED_KEYBINDINGS, mac), "⌘F");
     assert.strictEqual(chatFindShortcutLabel(DEFAULT_RESOLVED_KEYBINDINGS, linux), "Ctrl+F");
+  });
+});
+
+describe("Compare change steps", () => {
+  const linux = "Linux";
+  const f7 = (overrides: Partial<ShortcutEventLike> = {}) => event({ key: "F7", ...overrides });
+
+  it("steps with the built-in F7 and Shift+F7 when no rule names them", () => {
+    assert.strictEqual(
+      diffChangeCommandForEvent(null, f7(), DEFAULT_RESOLVED_KEYBINDINGS, linux),
+      "diff.nextChange",
+    );
+    assert.strictEqual(
+      diffChangeCommandForEvent(null, f7({ shiftKey: true }), DEFAULT_RESOLVED_KEYBINDINGS, linux),
+      "diff.previousChange",
+    );
+    assert.strictEqual(
+      diffChangeCommandForEvent(null, f7({ altKey: true }), DEFAULT_RESOLVED_KEYBINDINGS, linux),
+      null,
+    );
+    assert.strictEqual(
+      diffChangeShortcutLabel(DEFAULT_RESOLVED_KEYBINDINGS, "diff.nextChange", linux),
+      "F7",
+    );
+  });
+
+  it("lets a rule that names a step replace its built-in key", () => {
+    const keybindings = compileResolvedKeybindingsConfig([
+      { key: "mod+]", command: "diff.nextChange", when: "diffFocus" },
+    ]);
+    assert.strictEqual(diffChangeCommandForEvent(null, f7(), keybindings, linux), null);
+    assert.strictEqual(
+      diffChangeCommandForEvent("diff.nextChange", f7(), keybindings, linux),
+      "diff.nextChange",
+    );
+    assert.strictEqual(
+      diffChangeCommandForEvent(null, f7({ shiftKey: true }), keybindings, linux),
+      "diff.previousChange",
+    );
+    // A key a rule claims for another command keeps that command.
+    assert.strictEqual(diffChangeCommandForEvent("diff.toggle", f7(), keybindings, linux), null);
   });
 });

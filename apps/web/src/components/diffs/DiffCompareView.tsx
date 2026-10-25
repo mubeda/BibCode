@@ -46,7 +46,11 @@ import {
 } from "~/lib/diffCompareModel";
 import { resolveFileDiffPath } from "~/lib/diffRendering";
 import { cn } from "~/lib/utils";
-import { resolveShortcutCommand, shortcutLabelForCommand } from "~/keybindings";
+import {
+  diffChangeCommandForEvent,
+  diffChangeShortcutLabel,
+  resolveShortcutCommand,
+} from "~/keybindings";
 import { useEnvironmentQuery } from "~/state/query";
 import { reviewEnvironment } from "~/state/review";
 import { primaryServerKeybindingsAtom } from "~/state/server";
@@ -151,10 +155,14 @@ export function DiffCompareView(props: DiffCompareViewProps) {
   const keybindings = useAtomValue(primaryServerKeybindingsAtom);
   const paneRef = useRef<ComparePaneHandle>(null);
   const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
-    const command = resolveShortcutCommand(event, keybindings, { context: DIFF_FOCUS_CONTEXT });
-    if (command !== "diff.nextChange" && command !== "diff.previousChange") return;
+    const step = diffChangeCommandForEvent(
+      resolveShortcutCommand(event, keybindings, { context: DIFF_FOCUS_CONTEXT }),
+      event,
+      keybindings,
+    );
+    if (step === null) return;
     event.preventDefault();
-    paneRef.current?.goToChange(command === "diff.nextChange" ? 1 : -1);
+    paneRef.current?.goToChange(step === "diff.nextChange" ? 1 : -1);
   };
 
   return (
@@ -382,12 +390,8 @@ function DiffComparePane({
     });
   };
   useImperativeHandle(paneRef, () => ({ goToChange }));
-  const nextLabel = shortcutLabelForCommand(keybindings, "diff.nextChange", {
-    context: DIFF_FOCUS_CONTEXT,
-  });
-  const previousLabel = shortcutLabelForCommand(keybindings, "diff.previousChange", {
-    context: DIFF_FOCUS_CONTEXT,
-  });
+  const nextLabel = diffChangeShortcutLabel(keybindings, "diff.nextChange");
+  const previousLabel = diffChangeShortcutLabel(keybindings, "diff.previousChange");
 
   // Keyed by path, which a refreshed patch keeps; the patch's own key changes with any file.
   const files = useMemo(
