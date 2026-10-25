@@ -718,6 +718,8 @@ impl PipelinesService {
             &CancellationToken,
         ) -> Result<T, PullRequestsOperationError>,
     ) -> Result<T, PullRequestsOperationError> {
+        // Idle log text goes on any pipelines read, not only its own job's.
+        self.state().logs.sweep();
         let started = Instant::now();
         let generation = snapshot_store::next_generation();
         let admitted_scope: Arc<Mutex<Option<HostScope>>> = Arc::default();
@@ -1319,6 +1321,7 @@ impl PipelinesService {
         c: &CancellationToken,
     ) -> Result<Snapshot, PullRequestsOperationError> {
         let operation = "pipelines.readSnapshot";
+        self.state().logs.sweep();
         self.service.restore_recorded_hosts().await;
         bounded_read(operation, Duration::from_secs(30), c, |c| async move {
             // A database read needs the host's identity, not a signed-in CLI.

@@ -287,7 +287,37 @@ impl LogCache {
     /// A successful job read by this account, which authorizes memory answers
     /// for the next 30 s.
     pub(crate) fn record_job(&self, key: &LogKey, facts: JobFacts) {
+        self.sweep();
         lock(&self.jobs).insert(key.job_key(), (Instant::now(), facts));
+    }
+
+    /// Releases what no read may answer from any more, on every use of the
+    /// cache rather than only on the same key's next read: logs idle for ten
+    /// minutes (and slots a failed download left empty), and job reads past
+    /// their 30 s. A slot in use is left alone.
+    pub(crate) fn sweep(&self) {
+        let mut logs = lock(&self.logs);
+        let expired: Vec<LogKey> = logs
+            .slots
+            .iter()
+            .filter(|(_, slot)| {
+                slot.try_lock().is_ok_and(|entry| {
+                    entry
+                        .as_ref()
+                        .is_none_or(|(used, _)| used.elapsed() >= IDLE_TTL)
+                })
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        if !expired.is_empty() {
+            for key in &expired {
+                logs.slots.remove(key);
+                logs.sizes.remove(key);
+            }
+            logs.order.retain(|key| !expired.contains(key));
+        }
+        drop(logs);
+        lock(&self.jobs).retain(|_, (at, _)| at.elapsed() < AUTHORIZATION_WINDOW);
     }
 
     /// The facts of a job read by this account within the authorization window.
@@ -339,6 +369,7 @@ impl LogCache {
 
     /// The downloaded log for `key`, while it is fresh.
     pub(crate) fn cached(&self, key: &LogKey) -> Option<FullLog> {
+        self.sweep();
         let slot = lock(&self.logs).slots.get(key)?.clone();
         let mut entry = slot.try_lock().ok()?;
         let (used, log) = entry.as_mut()?;
@@ -361,6 +392,7 @@ impl LogCache {
         cancelled: impl Fn() -> PullRequestsOperationError,
         download: impl Future<Output = Result<FullLog, PullRequestsOperationError>>,
     ) -> Result<FullLog, PullRequestsOperationError> {
+        self.sweep();
         let slot = {
             let mut logs = lock(&self.logs);
             if let Some(slot) = logs.slots.get(&key) {
@@ -724,5 +756,33 @@ mod tests {
         assert_eq!(tail.answer(105), Some((105, &b"f"[..])));
         tokio::time::advance(TAIL_SHARE).await;
         assert_eq!(tail.answer(102), None);
+    }
+
+    async fn download(cache: &LogCache, key: LogKey, bytes: &[u8]) {
+        let log = full(bytes, 0, true);
+        cache
+            .get_or_download(
+                key,
+                &HostFences::default(),
+                crate::pull_requests::snapshot_store::next_generation(),
+                &CancellationToken::new(),
+                || PullRequestsOperationError::new("pipelines.getJobLog", "timeout"),
+                async move { Ok(log) },
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pipelines_logs_idle_for_ten_minutes_go_on_any_later_read_not_only_their_own() {
+        let cache = LogCache::default();
+        download(&cache, key("ana", 1), b"private text").await;
+        tokio::time::advance(IDLE_TTL).await;
+        // Another job's log is read: the idle one is released with it.
+        download(&cache, key("ana", 2), b"other").await;
+        assert_eq!(cache.held_logs(), 1);
+        tokio::time::advance(IDLE_TTL).await;
+        cache.record_job(&key("ana", 3), facts());
+        assert_eq!(cache.held_logs(), 0, "a job read releases them too");
     }
 }
