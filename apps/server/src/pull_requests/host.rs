@@ -65,6 +65,8 @@ pub enum Budget {
     Large,
     Mutation,
     CheckoutWrite,
+    /// A whole job log: 90 s, and its last 16 MiB kept (`OutputPolicy::Tail`).
+    Log,
 }
 
 impl Budget {
@@ -73,15 +75,36 @@ impl Budget {
             Self::Read => Duration::from_secs(30),
             Self::Large | Self::Mutation => Duration::from_secs(60),
             Self::CheckoutWrite => crate::git::CHECKOUT_WRITE_TIMEOUT,
+            Self::Log => Duration::from_secs(90),
         }
     }
 
     fn output_limit(self) -> usize {
         match self {
             Self::Large => 8 * 1024 * 1024,
+            Self::Log => LOG_OUTPUT_LIMIT,
             Self::Read | Self::Mutation | Self::CheckoutWrite => 1024 * 1024,
         }
     }
+
+    /// A log keeps its end, where failures print; every other read fails over its cap.
+    fn output_policy(self) -> OutputPolicy {
+        match self {
+            Self::Log => OutputPolicy::Tail,
+            Self::Read | Self::Large | Self::Mutation | Self::CheckoutWrite => OutputPolicy::Error,
+        }
+    }
+}
+
+/// The most of one job log a full download keeps.
+pub const LOG_OUTPUT_LIMIT: usize = 16 * 1024 * 1024;
+
+/// A raw `glab api` answer: stdout bytes, and how many bytes of its head a
+/// `Budget::Log` read dropped.
+#[derive(Clone, Debug)]
+pub struct RawOutput {
+    pub stdout: Vec<u8>,
+    pub dropped_bytes: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -257,6 +280,51 @@ impl HostCommandRunner {
         .await
     }
 
+    /// `glab api` with the raw stdout bytes: `include_headers` adds `-i`, so
+    /// the status line and headers come before the body; a `body` is POSTed
+    /// through the private body file, as in `glab_api_with_body`.
+    pub(super) async fn glab_api_raw(
+        &self,
+        scope: &HostScope,
+        path: &str,
+        body: Option<&serde_json::Value>,
+        include_headers: bool,
+        budget: Budget,
+        c: &CancellationToken,
+    ) -> Result<RawOutput, ProcessFailure> {
+        let private_file = match body {
+            Some(body) => Some(
+                crate::source_control::PrivateJsonBody::write(
+                    &self.state_dir.join("pull-requests"),
+                    body,
+                )
+                .await
+                .map_err(body_io_error)?,
+            ),
+            None => None,
+        };
+        let mut args: Vec<OsString> = vec!["api".into()];
+        if include_headers {
+            args.push("-i".into());
+        }
+        if let Some(file) = &private_file {
+            args.extend([
+                "--method".into(),
+                "POST".into(),
+                path.into(),
+                "-H".into(),
+                "Content-Type: application/json".into(),
+                "--input".into(),
+                file.path().as_os_str().to_owned(),
+            ]);
+        } else {
+            args.push(path.into());
+        }
+        let request =
+            self.provider_request(scope, PullRequestsProvider::Gitlab, &args, budget, None);
+        self.execute_bytes(request, c).await
+    }
+
     pub async fn glab_api_with_body(
         &self,
         scope: &HostScope,
@@ -339,10 +407,46 @@ impl HostCommandRunner {
             stdin: stdin.map(<[u8]>::to_vec),
             timeout: budget.timeout(),
             max_output_bytes: budget.output_limit(),
-            output_policy: OutputPolicy::Error,
+            output_policy: budget.output_policy(),
             append_truncation_marker: false,
             allow_non_zero_exit: true,
         }
+    }
+
+    /// As `execute`, keeping stdout as bytes: a log's text is cut to a
+    /// character boundary by its reader, not decoded lossily here.
+    async fn execute_bytes(
+        &self,
+        request: ProcessRequest,
+        c: &CancellationToken,
+    ) -> Result<RawOutput, ProcessFailure> {
+        let operation = request.operation.clone();
+        let output = self
+            .runner
+            .run_bytes(request, c)
+            .await
+            .map_err(|error| ProcessFailure {
+                error,
+                stderr: String::new(),
+            })?;
+        if output.exit_code != 0 {
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            return Err(ProcessFailure {
+                error: ProcessError::NonZeroExit {
+                    operation,
+                    exit_code: output.exit_code,
+                    stdout_length: output.stdout.len(),
+                    stderr_length: output.stderr.len(),
+                    stdout: String::from_utf8_lossy(&output.stdout).into(),
+                    stderr: stderr.clone().into(),
+                },
+                stderr,
+            });
+        }
+        Ok(RawOutput {
+            stdout: output.stdout,
+            dropped_bytes: output.stdout_dropped_bytes,
+        })
     }
 
     async fn execute(

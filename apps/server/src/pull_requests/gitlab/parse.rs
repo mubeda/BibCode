@@ -104,7 +104,7 @@ pub(super) fn web_origin(web_url: &str) -> Option<&str> {
 
 /// A host-relative path (`/group/project/-/jobs/1`) on the project's origin.
 /// Anything that is not a plain absolute path is dropped, not followed.
-fn host_link(origin: Option<&str>, path: &Value) -> Option<String> {
+pub(super) fn host_link(origin: Option<&str>, path: &Value) -> Option<String> {
     let path = path.as_str()?;
     if !path.starts_with('/') || path.starts_with("//") || path.contains(['\\', '\n', '\r']) {
         return None;

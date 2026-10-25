@@ -8,9 +8,9 @@
         "_tag": "Fail",
         "error": {
           "_tag": "PullRequestsOperationError",
-          "operation": "<",
-          "code": "b~[]![#>}U",
-          "message": "",
+          "operation": "",
+          "code": "prototype",
+          "message": "-1",
           "hostDetail": null,
           "retryable": true
         }

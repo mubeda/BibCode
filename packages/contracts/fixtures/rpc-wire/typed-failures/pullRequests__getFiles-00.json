@@ -8,11 +8,12 @@
         "_tag": "Fail",
         "error": {
           "_tag": "PullRequestsOperationError",
-          "operation": "zo'",
-          "code": "toString",
-          "message": "q",
-          "hostDetail": null,
-          "retryable": false
+          "operation": "zo'-dk,gq{",
+          "code": "\u0000",
+          "message": "6",
+          "hostDetail": "0",
+          "retryable": false,
+          "retryAfterSeconds": 98
         }
       }
     ]

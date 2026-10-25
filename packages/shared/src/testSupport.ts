@@ -26,6 +26,8 @@ export function makeTestExecutionEnvironmentCapabilities(
     gitPullRequestBranchSelection: false,
     pullRequestsReads: false,
     pullRequestsMutations: false,
+    pipelinesReads: false,
+    pipelinesMutations: false,
     activityProtocolVersion: null,
     remoteUpdateControl: false,
     remoteUpdateProgress: false,

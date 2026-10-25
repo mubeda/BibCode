@@ -2570,7 +2570,7 @@ fn current_directory(config: &ServerConfig) -> String {
 }
 
 fn environment_descriptor(config: &ServerConfig, activity_protocol_registered: bool) -> Value {
-    json!({
+    let mut descriptor = json!({
         "environmentId": config.environment_id,
         "label": config.environment_label,
         "platform": { "os": platform_os(), "arch": platform_arch() },
@@ -2616,7 +2616,15 @@ fn environment_descriptor(config: &ServerConfig, activity_protocol_registered: b
             "cliSessionHistory": true,
             "previewTunnels": true,
         },
-    })
+    });
+    // A flag is advertised only when every method it promises is registered.
+    // Set apart from the literal, which is at `json!`'s recursion limit.
+    let capabilities = &mut descriptor["capabilities"];
+    capabilities["pipelinesReads"] =
+        json!(crate::production::pipelines_rpc::pipelines_reads_registered());
+    capabilities["pipelinesMutations"] =
+        json!(crate::production::pipelines_rpc::pipelines_mutations_registered());
+    descriptor
 }
 
 fn available_editors() -> Vec<&'static str> {
@@ -6700,12 +6708,15 @@ mod tests {
             "gitPullRequestBranchSelection",
             "pullRequestsReads",
             "pullRequestsMutations",
+            "pipelinesReads",
         ] {
             assert_eq!(
                 descriptor["capabilities"][capability], true,
                 "Git Manager capability {capability} was not advertised"
             );
         }
+        // `pipelines.runAction` is not registered yet, so its flag stays off.
+        assert_eq!(descriptor["capabilities"]["pipelinesMutations"], false);
         // Clients send the profiler RPCs only to servers that advertise them.
         assert_eq!(descriptor["capabilities"]["profiler"], true);
         // Clients show the Device previews setting and pane only on servers that advertise it.

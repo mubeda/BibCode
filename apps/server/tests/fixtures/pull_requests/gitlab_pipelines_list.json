@@ -1,0 +1,150 @@
+{
+  "data": {
+    "project": {
+      "pipelines": {
+        "pageInfo": { "hasNextPage": true, "endCursor": "eyJpZCI6NDgxOH0" },
+        "count": 1001,
+        "nodes": [
+          {
+            "id": "gid://gitlab/Ci::Pipeline/4821",
+            "iid": "312",
+            "name": null,
+            "ref": "main",
+            "refPath": "refs/heads/main",
+            "sha": "abc1234def",
+            "status": "FAILED",
+            "detailedStatus": { "name": "FAILED" },
+            "source": "push",
+            "latest": true,
+            "mergeRequestEventType": null,
+            "type": "BRANCH_PIPELINE",
+            "yamlErrors": false,
+            "failureReason": "The pipeline failed due to a script failure",
+            "stuck": false,
+            "createdAt": "2026-10-24T10:00:00Z",
+            "startedAt": "2026-10-24T10:00:05Z",
+            "finishedAt": "2026-10-24T10:04:17Z",
+            "duration": 252,
+            "queuedDuration": 4.5,
+            "path": "/team/repo/-/pipelines/4821",
+            "user": { "name": "Ana Rossi", "username": "ana" },
+            "commit": {
+              "shortId": "abc1234",
+              "title": "Fix the flaky login test",
+              "webPath": "/team/repo/-/commit/abc1234def"
+            },
+            "mergeRequest": null,
+            "retryable": true,
+            "cancelable": false,
+            "userPermissions": { "updatePipeline": true, "cancelPipeline": true },
+            "stages": {
+              "nodes": [
+                { "name": "build", "status": "success", "detailedStatus": { "name": "SUCCESS" } },
+                { "name": "test", "status": "failed", "detailedStatus": { "name": "FAILED" } },
+                {
+                  "name": "lint",
+                  "status": "success",
+                  "detailedStatus": { "name": "SUCCESS_WITH_WARNINGS" }
+                }
+              ]
+            }
+          },
+          {
+            "id": "gid://gitlab/Ci::Pipeline/4820",
+            "iid": "311",
+            "name": null,
+            "ref": "refs/merge-requests/3941/head",
+            "refPath": "refs/merge-requests/3941/head",
+            "sha": "def5678",
+            "status": "RUNNING",
+            "detailedStatus": { "name": "RUNNING" },
+            "source": "merge_request_event",
+            "latest": false,
+            "mergeRequestEventType": "DETACHED",
+            "type": "MERGE_REQUEST_PIPELINE",
+            "yamlErrors": false,
+            "failureReason": null,
+            "stuck": false,
+            "createdAt": "2026-10-24T09:50:00Z",
+            "startedAt": "2026-10-24T09:50:03Z",
+            "finishedAt": null,
+            "duration": null,
+            "queuedDuration": 3,
+            "path": "/team/repo/-/pipelines/4820",
+            "user": { "name": null, "username": "bo" },
+            "commit": { "shortId": "def5678", "title": "Add the retry button", "webPath": null },
+            "mergeRequest": {
+              "iid": "3941",
+              "title": "Add the retry button",
+              "webPath": "/team/repo/-/merge_requests/3941"
+            },
+            "retryable": false,
+            "cancelable": true,
+            "userPermissions": { "updatePipeline": true, "cancelPipeline": true },
+            "stages": {
+              "nodes": [
+                { "name": "build", "status": "running", "detailedStatus": { "name": "RUNNING" } }
+              ]
+            }
+          },
+          {
+            "id": "gid://gitlab/Ci::Pipeline/4819",
+            "iid": "310",
+            "name": "nightly",
+            "ref": "v1.2.0",
+            "refPath": "refs/tags/v1.2.0",
+            "sha": "0a1b2c3",
+            "status": "FAILED",
+            "detailedStatus": { "name": "FAILED" },
+            "source": "schedule",
+            "latest": false,
+            "mergeRequestEventType": null,
+            "type": "TAG_PIPELINE",
+            "yamlErrors": true,
+            "failureReason": "The pipeline failed due to a configuration error",
+            "stuck": true,
+            "createdAt": "2026-10-24T02:00:00Z",
+            "startedAt": null,
+            "finishedAt": "2026-10-24T02:00:01Z",
+            "duration": null,
+            "queuedDuration": null,
+            "path": "/team/repo/-/pipelines/4819",
+            "user": null,
+            "commit": { "shortId": "0a1b2c3", "title": "Release 1.2.0", "webPath": null },
+            "mergeRequest": null,
+            "retryable": false,
+            "cancelable": false,
+            "userPermissions": { "updatePipeline": false, "cancelPipeline": false },
+            "stages": { "nodes": [] }
+          },
+          {
+            "id": "gid://gitlab/Ci::Pipeline/4818",
+            "iid": "309",
+            "name": null,
+            "ref": "feature",
+            "sha": "9f8e7d6",
+            "status": "SUCCESS",
+            "detailedStatus": { "name": "SUCCESS" },
+            "source": "push",
+            "latest": false,
+            "yamlErrors": false,
+            "failureReason": null,
+            "createdAt": "2026-10-23T22:00:00Z",
+            "startedAt": "2026-10-23T22:00:02Z",
+            "finishedAt": "2026-10-23T22:01:02Z",
+            "duration": 60,
+            "queuedDuration": 2,
+            "path": "//evil.example/team/repo/-/pipelines/4818",
+            "user": null,
+            "commit": null,
+            "mergeRequest": null,
+            "retryable": false,
+            "cancelable": false,
+            "userPermissions": null,
+            "stages": null
+          }
+        ]
+      }
+    }
+  }
+}

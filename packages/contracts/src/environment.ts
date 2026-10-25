@@ -61,6 +61,10 @@ export const ExecutionEnvironmentCapabilities = Schema.Struct({
   ),
   pullRequestsReads: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   pullRequestsMutations: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  /** Every Pipelines read: list, get, getJob, getJobLog, readSnapshot and subscribe. */
+  pipelinesReads: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  /** `pipelines.runAction`. */
+  pipelinesMutations: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   activityProtocolVersion: Schema.NullOr(Schema.Literal(2)).pipe(
     Schema.withDecodingDefault(Effect.succeed(null)),
   ),

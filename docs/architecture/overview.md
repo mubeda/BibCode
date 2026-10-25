@@ -2662,6 +2662,36 @@ See [RPC and orchestration](./rpc-and-orchestration.md) and
   most three of them, and stores one `pipeline` display row the merge box and
   the Pipelines tab paint from. See
   [Pull Requests contract boundary](./rpc-and-orchestration.md#pull-requests-contract-boundary).
+- The Pull Requests module's `pipelines` submodule
+  (`pull_requests/pipelines/`, GitLab reads in `pull_requests/gitlab/pipelines.rs`)
+  serves a project's CI pipelines: a list, one pipeline's stages and jobs, one
+  job, and one job's log. It is built on the Pull Requests module's own state
+  rather than beside it: `PullRequestsService::pipelines()` shares its context
+  caches, sign-in state, `HostFences`, snapshot table and the host-wide 429
+  ladder (`pull_requests/backoff.rs`, `HostBackoff`, which the merge request
+  poller also uses). Every unary read stores its display row in
+  `pull_request_snapshots` as `pipelines_list` (first pages only),
+  `pipelines_detail` (capped at 1 MiB) or `pipelines_job`, wrapped with the
+  account login that read it; `pipelines.readSnapshot` paints a row only for
+  the login in the host's stored context, with no `glab` or `gh` call. Every
+  pipelines read, whatever its kind, answers `rate_limited` with no host call
+  while the host's backoff deadline is ahead, and a 429 takes the later of the
+  ladder step and the provider's `Retry-After` or reset header (capped at one
+  hour). Only `not_authenticated` invalidates the shared context and deletes
+  the host's rows; a `forbidden` or `not_found` deletes only the refused
+  resource's rows. GitLab views share one cooperative poller per list key
+  (`pipelines/poll.rs`) inside the `pipelines.subscribe` calls: the first page
+  every 20 s, each subscribed pipeline that is not terminal every 10 s (at most
+  three, 20 s after 30 quiet minutes), never `count`, jobs or logs; a pipeline
+  it cannot read is named once and left. Job logs never reach the database:
+  GitLab logs are read in 512,000-byte ranges once a one-byte probe proves the
+  host honors `byte_offset`, and otherwise downloaded whole (90 s, the last
+  16 MiB kept by `OutputPolicy::Tail`) into `LogCache`, server memory keyed by
+  host, account login, project and job (64 MiB, 10 idle minutes, cleared on
+  rescan and sign-out, served only within 30 s of a job read by the same
+  account). GitHub reads answer `unavailable` until the workflow runs reader
+  ships; `readSnapshot` serves both providers. See
+  [Pipelines contract boundary](./rpc-and-orchestration.md#pipelines-contract-boundary).
 - The right panel (`rightPanelStore`) can show one request per tab, with no new
   server contract. `pullRequest` surfaces (`pullRequest:<number>`, with the
   provider and the selected detail tab) host `PullRequestsDetailView` per

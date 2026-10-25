@@ -155,6 +155,8 @@ export const ClientSettingsSchema = Schema.Struct({
     }),
   ).pipe(Schema.withDecodingDefault(Effect.succeed({}))),
   pullRequestsEnabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
+  /** Shows the Pipelines button on projects and repositories. */
+  pipelinesEnabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
   sidebarProjectGroupingMode: SidebarProjectGroupingMode.pipe(
     Schema.withDecodingDefault(Effect.succeed(DEFAULT_SIDEBAR_PROJECT_GROUPING_MODE)),
   ),
@@ -724,6 +726,7 @@ export const ClientSettingsPatch = Schema.Struct({
     ),
   ),
   pullRequestsEnabled: Schema.optionalKey(Schema.Boolean),
+  pipelinesEnabled: Schema.optionalKey(Schema.Boolean),
   sidebarProjectGroupingMode: Schema.optionalKey(SidebarProjectGroupingMode),
   sidebarProjectGroupingOverrides: Schema.optionalKey(
     Schema.Record(TrimmedNonEmptyString, SidebarProjectGroupingMode),

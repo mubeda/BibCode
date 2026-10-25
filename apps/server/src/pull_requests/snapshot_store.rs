@@ -41,6 +41,9 @@ impl HostFences {
 
 pub(crate) const BYTE_CAP: i64 = 33_554_432;
 pub(crate) const FILES_PAYLOAD_CAP: usize = 1_048_576;
+/// A pipeline detail near 1,000 jobs would push a dozen merge request rows
+/// out of the shared `BYTE_CAP`; it paints from the live read only.
+pub(crate) const PIPELINE_DETAIL_PAYLOAD_CAP: usize = 1_048_576;
 
 static LAST_GENERATION: AtomicI64 = AtomicI64::new(0);
 
@@ -122,6 +125,11 @@ impl<'a> SnapshotStore<'a> {
     /// cap), so the caller can tell its write from one it lost.
     pub fn put(&self, snapshot: Snapshot) -> Result<bool> {
         if snapshot.kind == "files" && snapshot.payload.len() > FILES_PAYLOAD_CAP {
+            return Ok(false);
+        }
+        if snapshot.kind == "pipelines_detail"
+            && snapshot.payload.len() > PIPELINE_DETAIL_PAYLOAD_CAP
+        {
             return Ok(false);
         }
         if self
@@ -210,11 +218,31 @@ impl<'a> SnapshotStore<'a> {
             .collect()
     }
 
+    /// Every merge request row of one number. Pipelines rows are keyed by
+    /// pipeline and job ids, which a merge request number can equal: they stay.
     pub fn delete_number(&self, host: &str, project: &str, number: u64) -> Result<()> {
         self.connection.execute(
             "DELETE FROM pull_request_snapshots
-             WHERE host = ?1 AND project = ?2 AND key = ?3",
+             WHERE host = ?1 AND project = ?2 AND key = ?3 AND kind NOT LIKE 'pipelines!_%' ESCAPE '!'",
             params![host, project, number.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// One row, and with `attempts` its `<key>:<attempt>` siblings too.
+    pub fn delete_keyed(
+        &self,
+        host: &str,
+        project: &str,
+        kind: &str,
+        key: &str,
+        attempts: bool,
+    ) -> Result<()> {
+        self.connection.execute(
+            "DELETE FROM pull_request_snapshots
+             WHERE host = ?1 AND project = ?2 AND kind = ?3
+               AND (key = ?4 OR (?5 AND substr(key, 1, length(?4) + 1) = ?4 || ':'))",
+            params![host, project, kind, key, attempts],
         )?;
         Ok(())
     }
@@ -302,6 +330,67 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    /// A merge request action on number 7 leaves pipeline 7 and job 7.
+    #[test]
+    fn pull_request_snapshots_delete_number_keeps_pipelines_rows_and_delete_keyed_takes_attempts() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        crate::persistence::run_migrations(&mut connection, None).unwrap();
+        let store = SnapshotStore::new(&connection);
+        let row = |kind: &str, key: &str| Snapshot {
+            host: "gitlab.com".into(),
+            project: "team/repo".into(),
+            kind: kind.into(),
+            key: key.into(),
+            fingerprint: "fp".into(),
+            payload: b"{}".to_vec(),
+            observed_at_ms: 1,
+            generation: next_generation(),
+        };
+        for (kind, key) in [
+            ("detail", "7"),
+            ("pipelines_detail", "7"),
+            ("pipelines_job", "7"),
+            ("pipelines_detail", "7:2"),
+            ("pipelines_detail", "77"),
+        ] {
+            assert!(store.put(row(kind, key)).unwrap());
+        }
+        store.delete_number("gitlab.com", "team/repo", 7).unwrap();
+        let get = |kind: &str, key: &str| store.get("gitlab.com", "team/repo", kind, key).unwrap();
+        assert!(get("detail", "7").is_none());
+        assert!(get("pipelines_detail", "7").is_some());
+        assert!(get("pipelines_job", "7").is_some());
+        store
+            .delete_keyed("gitlab.com", "team/repo", "pipelines_detail", "7", true)
+            .unwrap();
+        assert!(get("pipelines_detail", "7").is_none());
+        assert!(get("pipelines_detail", "7:2").is_none());
+        assert!(
+            get("pipelines_detail", "77").is_some(),
+            "only its own attempts"
+        );
+        assert!(get("pipelines_job", "7").is_some(), "another kind stays");
+    }
+
+    #[test]
+    fn pull_request_snapshots_a_pipeline_detail_over_1_mib_is_not_stored() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        crate::persistence::run_migrations(&mut connection, None).unwrap();
+        let store = SnapshotStore::new(&connection);
+        let row = |size: usize| Snapshot {
+            host: "gitlab.com".into(),
+            project: "team/repo".into(),
+            kind: "pipelines_detail".into(),
+            key: "4821".into(),
+            fingerprint: "fp".into(),
+            payload: vec![b'x'; size],
+            observed_at_ms: 1,
+            generation: next_generation(),
+        };
+        assert!(!store.put(row(PIPELINE_DETAIL_PAYLOAD_CAP + 1)).unwrap());
+        assert!(store.put(row(PIPELINE_DETAIL_PAYLOAD_CAP)).unwrap());
     }
 
     #[test]
