@@ -97,18 +97,27 @@ export function listTimerEnabled(
   return provider === "gitlab" || rows.some((row) => !row.terminal);
 }
 
+/** One loaded page of the list: its rows, and the `revision` of the read that returned them. */
+export interface PipelinesLoadedPage {
+  readonly revision: number;
+  readonly rows: readonly PipelinesRow[];
+}
+
 /**
- * The first page and the later pages loaded after it, one row per pipeline. A poller
- * or timer replaces only the first page, read most recently, so its copy of a
- * pipeline wins and loaded later pages stay put.
+ * The first page and the later pages loaded after it, one row per pipeline, each where
+ * it first appears. Pages overlap when new runs push rows down between reads; the copy
+ * from the page with the newer `revision` wins, so a poller or timer refresh of the
+ * first page updates its rows and loaded later pages stay put.
  */
-export function mergePipelineRows(
-  firstPage: readonly PipelinesRow[],
-  laterPages: readonly PipelinesRow[],
-): readonly PipelinesRow[] {
-  const rows = new Map<number, PipelinesRow>();
-  for (const row of [...firstPage, ...laterPages]) if (!rows.has(row.id)) rows.set(row.id, row);
-  return [...rows.values()];
+export function mergePipelineRows(pages: readonly PipelinesLoadedPage[]): readonly PipelinesRow[] {
+  const rows = new Map<number, { readonly revision: number; readonly row: PipelinesRow }>();
+  for (const page of pages)
+    for (const row of page.rows) {
+      const seen = rows.get(row.id);
+      if (seen === undefined || page.revision > seen.revision)
+        rows.set(row.id, { revision: page.revision, row });
+    }
+  return Array.from(rows.values(), (entry) => entry.row);
 }
 
 export const EMPTY_LIST_COPY: Record<PipelinesListScope, string> = {
