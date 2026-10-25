@@ -359,6 +359,12 @@ export const PullRequestsChecks = Schema.Struct({
           startedAt: Schema.NullOr(Schema.String),
           completedAt: Schema.NullOr(Schema.String),
           durationSeconds: Schema.NullOr(Schema.Number),
+          /**
+           * The Pipelines job route's ids, together or not at all: only for a job of this
+           * project whose job page can read it. Older servers send neither.
+           */
+          pipelineId: Schema.optional(Schema.Number),
+          jobId: Schema.optional(Schema.Number),
         }),
       ),
     }),

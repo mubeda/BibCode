@@ -30,7 +30,7 @@ pub const PIPELINE_QUERY: &str = r#"query PullRequestsGitLabPipeline($projectPat
         jobs(first:100) {
           pageInfo { hasNextPage }
           nodes {
-            name status allowFailure webPath startedAt finishedAt duration
+            id name status allowFailure webPath startedAt finishedAt duration
             downstreamPipeline { path }
           }
         }
@@ -171,4 +171,16 @@ pub fn override_requested_changes(project: &str, iid: u64) -> String {
         serde_json::json!(project),
         serde_json::json!(iid.to_string())
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_pipeline_query_selects_each_jobs_global_id_for_the_job_page() {
+        let (_, jobs) = PIPELINE_QUERY.split_once("jobs(first:100)").unwrap();
+        let (_, fields) = jobs.split_once("nodes {").unwrap();
+        assert_eq!(fields.split_whitespace().next(), Some("id"));
+    }
 }

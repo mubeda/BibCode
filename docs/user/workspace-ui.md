@@ -1031,6 +1031,14 @@ a pipeline that finishes while shown is announced to screen readers once. The
 Pipelines tab shows the same summary above its jobs, grouped by stage in
 GitLab's order with trigger jobs linking their downstream pipeline; when a stage
 has more than 100 jobs it says so and links the pipeline for the rest.
+When **Pipelines** is on in Settings and the environment's server supports it,
+the summary on the full page also offers **View pipeline**, which opens the
+pipeline in the Pipelines module, and each job's name opens its job page there,
+with **Open on GitLab** beside it. A trigger job, a job of a fork's pipeline
+and every job on an older server link to GitLab as before. On GitHub, the
+Checks tab opens a GitHub Actions job's page the same way, with **Open on
+GitHub** beside it; other status checks keep their host links. In a thread's
+side panel these links stay on the host; **Open full page** first.
 Beyond three merge requests watched at once, the others' pipeline status
 updates every 20 seconds, and their Pipelines tab reloads its jobs whenever
 that status changes.

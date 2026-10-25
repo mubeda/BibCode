@@ -346,6 +346,16 @@ retried GitLab job is a new job.
 | Pipelines job and log             | `gh api -i repos/:o/:r/actions/jobs/:id` (steps, labels, runner); `gh api …/actions/jobs/:id/logs` whole once the job completes (90 s, last 16 MiB kept)                                                                                 | `glab api -i projects/:id/jobs/:job_id`; `glab api -i …/jobs/:job_id/trace?byte_offset=N&byte_limit=512000` once a one-byte probe proves ranges, otherwise `glab api …/trace` whole (90 s, last 16 MiB kept)            |
 | Pipelines actions                 | `gh api -i --method POST repos/:o/:r/actions/runs/:id/rerun`, `…/rerun-failed-jobs`, `…/cancel`, `…/actions/jobs/:id/rerun` (no body; 201 or 202)                                                                                        | `glab api -i --method POST projects/:id/pipelines/:id/retry`, `…/cancel`, `projects/:id/jobs/:id/retry`, `…/cancel`, `…/play` (an empty JSON body through the private file)                                             |
 
+A merge request's checks name their Pipelines job page without another
+read. GitLab's `headPipeline` jobs select their global `id`, and the REST
+fallback's jobs carry theirs; a build job (`Ci::Build`) whose web URL is this
+project's `<project>/-/jobs/<id>` gets the pipeline's and its own id, so a
+trigger job or a job of a fork's pipeline keeps its host link. On GitHub, a
+check run's `detailsUrl` of the shape
+`https://<host>/<owner>/<repo>/actions/runs/<run>/job/<job>` on this
+repository gives the run and job ids; the URL is parsed, never followed, and a
+status context's `targetUrl` gives none.
+
 Bodies, descriptions, review summaries and merge messages never enter argv.
 GitHub reads body data from stdin; GitLab API writes use a private temporary
 JSON file (0600 on Unix, restricted ACL on Windows), removed after success,

@@ -412,7 +412,7 @@ impl PullRequestHost for GitHubHost {
                     c,
                 )
                 .await?;
-            parse::checks(&value)
+            parse::checks(&value, scope)
         })
     }
     fn files<'a>(

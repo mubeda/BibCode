@@ -735,8 +735,9 @@ vp run typecheck
 vp check
 ```
 
-`PullRequestsPanel.test.tsx` is the shell's regression gate: it must pass
-unchanged.
+`PullRequestsPanel.test.tsx` is the shell's regression gate: its shell cases
+must pass unchanged. `components/pipelines/shared/MergeRequestPipelineLinks.test.tsx`
+covers the merge request tab's in-app links and their gate.
 
 For provider detection of self-hosted hosts (the recorded host observation,
 remote parsing, status classification, and the create action's provider check
@@ -2522,6 +2523,15 @@ never count a sandbox-denied listener test as passed or skipped.
     With four running merge requests open on Pipelines in separate windows
     (one list filter), the fourth's job list must follow its pipeline status
     within about 20 s of a status change.
+    Against a server that advertises `pipelinesReads`, with **Pipelines** on:
+    the merge box's **View pipeline** opens that pipeline's page; on the
+    Pipelines tab a build job's name opens its job page with **Open on
+    GitLab** beside it, and a trigger job keeps its downstream link. On
+    GitHub, an Actions check's name opens its job page with **Open on
+    GitHub** beside it, and a third-party status check
+    keeps its host link. Turn **Pipelines** off, or use an older server: the
+    names link to the host and **View pipeline** is gone. The same request in
+    a thread's side panel keeps the host links.
 11. Verify real GitHub split patches and GitLab synthetic-header patches render
     in Files, including renamed files. Scroll far enough to exercise list and
     diff virtualization. Viewed must survive tab changes and reload. Test the

@@ -2723,7 +2723,14 @@ See [RPC and orchestration](./rpc-and-orchestration.md) and
   layout a container query flips, and job links come from
   `PipelineLinksProvider`: the pipeline page's `pipelinePageLinks` open each
   job's in-app job route, and a view without a provider opens the host's job
-  page.
+  page. The Pull Requests full page wraps its merge request detail in
+  `MergeRequestPipelineLinksProvider` (`components/pipelines/shared/`): while
+  the Pipelines module would open for the environment (its setting, the
+  connection and `pipelinesReads`, through `resolveRepositoryModuleAvailability`),
+  a check that carries `pipelineId` and `jobId` opens its job route and the
+  pipeline summary offers **View pipeline**. The thread side panel's detail
+  has no provider and keeps host links, because it reads the thread's own
+  checkout.
   The job page
   (`/project/$environmentId/$projectId/pipelines/$pipelineId/jobs/$jobId`,
   `?at=` a line's byte offset; `pipelineJobLink` builds its links) paints the
