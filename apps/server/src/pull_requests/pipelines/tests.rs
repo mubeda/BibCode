@@ -2343,4 +2343,73 @@ mod poller {
         c.cancel();
         drive(&mut subs).await;
     }
+
+    #[tokio::test(start_paused = true)]
+    async fn pipelines_poller_replaces_unchanged_rows_stored_under_another_account() {
+        let b = bench().await;
+        // Another account stored what this one is about to read.
+        let rows = vec![row(4821, PipelineStatus::Running)];
+        let page = ListPage {
+            revision: 1,
+            rows: rows.clone(),
+            next_cursor: Some("next".into()),
+            total: None,
+            workflows: None,
+        };
+        let generation = snapshot_store::next_generation();
+        store_row(
+            &b.database,
+            &b.fences,
+            &b.scope,
+            "previous-account",
+            LIST_KIND,
+            &b.list_key,
+            list_fingerprint(&rows),
+            &page,
+            generation,
+        )
+        .await;
+        b.running(4821);
+        let stored_detail = detail(
+            4821,
+            PipelineStatus::Running,
+            &[(48210, PipelineStatus::Running)],
+        );
+        store_row(
+            &b.database,
+            &b.fences,
+            &b.scope,
+            "previous-account",
+            DETAIL_KIND,
+            "4821",
+            detail_fingerprint(&stored_detail),
+            &stored_detail,
+            generation,
+        )
+        .await;
+        let login = b.host.known_context(&b.scope).unwrap().account.login;
+        let inputs = b.inputs();
+        let log = Log::default();
+        let emit = emitter(&log);
+        let c = CancellationToken::new();
+        let mut subs = [b.subscriber(&inputs, Some(4821), &emit, &c)];
+        drive(&mut subs).await;
+        tick(&mut subs, 10).await;
+        let list = while_driving(&mut subs, b.stored(LIST_KIND, &b.list_key)).await;
+        assert!(
+            decode_row::<ListPage>(&list.unwrap().payload, &login).is_some(),
+            "the list row now paints for the signed-in account"
+        );
+        let pipeline = while_driving(&mut subs, b.stored(DETAIL_KIND, "4821")).await;
+        assert!(decode_row::<Detail>(&pipeline.unwrap().payload, &login).is_some());
+        assert_eq!(
+            ticks(&log),
+            [Changed {
+                list: true,
+                pipeline: true,
+            }]
+        );
+        c.cancel();
+        drive(&mut subs).await;
+    }
 }
