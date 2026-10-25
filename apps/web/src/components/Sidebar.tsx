@@ -3789,18 +3789,16 @@ function useOpenRepositoryModule(
       const members = group.cards.flatMap((card) => card.memberProjects);
       const isAvailable = (member: SidebarProjectGroupMember) =>
         environments.get(member.environmentId)?.available ?? true;
-      void chooseProjectMember(
-        members,
-        { x: event.clientX, y: event.clientY },
-        isAvailable,
-      ).then((member) => {
-        if (!member) return;
-        if (isMobile) setOpenMobile(false);
-        void navigate({
-          to,
-          params: { environmentId: member.environmentId, projectId: member.id },
-        });
-      });
+      void chooseProjectMember(members, { x: event.clientX, y: event.clientY }, isAvailable).then(
+        (member) => {
+          if (!member) return;
+          if (isMobile) setOpenMobile(false);
+          void navigate({
+            to,
+            params: { environmentId: member.environmentId, projectId: member.id },
+          });
+        },
+      );
     },
     [environments, group.cards, isMobile, navigate, setOpenMobile, to],
   );
