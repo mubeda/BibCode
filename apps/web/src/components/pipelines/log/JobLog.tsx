@@ -228,8 +228,10 @@ function LoadEarlier() {
   if (layout === null) return null;
   const relative = layout.firstLine === null;
   const capped = reader.earlierLimit === "cap" && (reader.range?.start ?? 0) > 0;
+  // A finished log read forward to the cap from a line link has more after it too.
+  const laterCapped = reader.earlierLimit === "cap" && !reader.complete && reader.phase === "done";
   const dropped = reader.truncatedHead && !canLoadEarlier && reader.earlierLimit === "start";
-  if (!canLoadEarlier && !capped && !dropped && !relative) return null;
+  if (!canLoadEarlier && !capped && !laterCapped && !dropped && !relative) return null;
   return (
     <div className="flex flex-wrap items-center gap-2 border-b border-border px-3 py-1.5 text-xs text-muted-foreground">
       {canLoadEarlier ? (
@@ -246,11 +248,13 @@ function LoadEarlier() {
         </PermissionButton>
       ) : null}
       {relative ? <span>Line numbers start at the first loaded line.</span> : null}
-      {capped || dropped ? (
+      {capped || laterCapped || dropped ? (
         <span>
-          {capped
-            ? "Earlier lines are on the host."
-            : "This log is over 16 MB; earlier lines are on the host."}
+          {laterCapped
+            ? "This page shows 16 MB of the log; the rest is on the host."
+            : capped
+              ? "Earlier lines are on the host."
+              : "This log is over 16 MB; earlier lines are on the host."}
           {rawLogUrl ? (
             <>
               {" "}

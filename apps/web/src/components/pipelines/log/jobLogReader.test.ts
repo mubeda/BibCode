@@ -6,6 +6,7 @@ import { createMainThreadJobLogEngine } from "./jobLogEngine";
 import {
   JobLogReader,
   LOG_CATCH_UP_READS,
+  LOG_CLIENT_CAP,
   type JobLogReaderState,
   type LogReadAnswer,
   type LogReadInput,
@@ -356,6 +357,34 @@ describe("job log reader", () => {
     });
     expect(h.state).toMatchObject({ phase: "done", complete: true });
     expect(h.reader.canLoadLater()).toBe(false);
+  });
+
+  it("stops reading later text at the page's 16 MiB cap", async () => {
+    const h = harness({ live: false, at: 600_000 });
+    // A window whose offsets already span the cap (its text is short).
+    h.queue(chunkAt("x\n", 600_000, { nextOffset: 600_000 + LOG_CLIENT_CAP }));
+    h.reader.open();
+    await h.settle();
+    expect(h.state.phase).toBe("done");
+    expect(h.reader.canLoadLater()).toBe(false);
+    h.reader.loadLater();
+    expect(h.reads).toHaveLength(1);
+  });
+
+  it("reads the rest of a log that finished while an earlier read was out", async () => {
+    const h = harness({ live: true, at: null });
+    h.queue(chunkAt("x\n".repeat(10), 100_000));
+    h.reader.open();
+    await h.settle();
+    expect(h.state.phase).toBe("following");
+    h.reader.loadEarlier();
+    h.reader.setLive(false);
+    h.answer(chunkAt("earlier\n", 99_992));
+    await h.settle();
+    expect(h.reads.at(-1)).toEqual({ from: { _tag: "offset", offset: 100_020 }, refresh: "user" });
+    h.answer(chunkAt("the end\n", 100_020, { complete: true }));
+    await h.settle();
+    expect(h.state).toMatchObject({ phase: "done", complete: true });
   });
 
   it("stops reading later text when the host has none", async () => {
