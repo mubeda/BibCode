@@ -4,6 +4,7 @@ import {
   use,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -47,6 +48,8 @@ interface PendingDiagramJob {
 
 const MAX_DIAGRAM_CACHE_ENTRIES = 100;
 const MAX_DIAGRAM_CACHE_BYTES = 16 * 1024 * 1024;
+const MAX_DRAWN_HEIGHT_ENTRIES = 1_000;
+const MAX_DRAWN_HEIGHT_BYTES = 4 * 1024 * 1024;
 const TOO_LONG: MermaidDiagramProblem = { kind: "too-large", limit: "characters" };
 
 /**
@@ -55,6 +58,12 @@ const TOO_LONG: MermaidDiagramProblem = { kind: "too-large", limit: "characters"
  * the same diagram draws in the same commit; an invalid diagram is parsed once.
  */
 const diagramCache = new LRUCache<DiagramEntry>(MAX_DIAGRAM_CACHE_ENTRIES, MAX_DIAGRAM_CACHE_BYTES);
+/**
+ * The height each diagram's body last had when drawn, by the same key, kept for ten times as
+ * many diagrams as the cache. A block whose diagram the cache evicted holds its source at that
+ * height until the diagram draws again, so the redraw changes no height in the timeline (#171).
+ */
+const drawnDiagramHeights = new LRUCache<number>(MAX_DRAWN_HEIGHT_ENTRIES, MAX_DRAWN_HEIGHT_BYTES);
 /** Queued renders by the same key, so blocks join only a job for their exact source and fonts. */
 const pendingDiagramJobs = new Map<string, PendingDiagramJob>();
 let diagramIdCounter = 0;
@@ -82,6 +91,7 @@ export function __setMermaidRendererLoaderForTests(loader?: () => Promise<Mermai
 /** Test seam: forgets every drawn diagram, pending job and the measured fonts. */
 export function __resetMermaidDiagramsForTests(): void {
   diagramCache.clear();
+  drawnDiagramHeights.clear();
   for (const job of pendingDiagramJobs.values()) job.cancel();
   pendingDiagramJobs.clear();
   diagramFonts = null;
@@ -99,6 +109,11 @@ function errorName(error: unknown): string {
 /** The cached entry for `source` with the measured fonts, if both exist. */
 function cachedDiagramEntry(source: string): DiagramEntry | null {
   return diagramFonts ? diagramCache.get(diagramKey(diagramFonts.key, source)) : null;
+}
+
+/** The height `source`'s body last had when drawn with the measured fonts, if it was drawn. */
+function drawnDiagramHeight(source: string): number | null {
+  return diagramFonts ? drawnDiagramHeights.get(diagramKey(diagramFonts.key, source)) : null;
 }
 
 /** The fonts diagrams are measured in, read from the first block that misses the cache. */
@@ -243,6 +258,8 @@ interface DiagramBodyProps {
   readonly anchor: ReadingAnchor | null;
   readonly source: string;
   readonly bodyRef: RefObject<HTMLDivElement | null>;
+  /** The height the body keeps while its diagram draws again, or null. */
+  readonly reservedHeight: number | null;
   readonly children: ReactNode;
 }
 
@@ -270,7 +287,15 @@ class DiagramBody extends Component<DiagramBodyProps> {
 
   override render() {
     return (
-      <div ref={this.props.bodyRef} className="chat-markdown-mermaid-body">
+      <div
+        ref={this.props.bodyRef}
+        className="chat-markdown-mermaid-body"
+        style={
+          this.props.reservedHeight === null
+            ? undefined
+            : { height: this.props.reservedHeight, overflow: "hidden" }
+        }
+      >
         {this.props.children}
       </div>
     );
@@ -394,6 +419,10 @@ export function MarkdownMermaidBlock({
   const problem = tooLong ? TOO_LONG : entry?.kind === "problem" ? entry.problem : null;
   const failedLoad = loadFailure?.source === source && diagram === null ? loadFailure : null;
   const showDiagram = diagram !== null && !showingSource;
+  // A diagram drawn before, whose entry the cache evicted, keeps its drawn height while it draws
+  // again. A failed load shows its source and error at their own height.
+  const reservedHeight =
+    entry === null && !tooLong && failedLoad === null ? drawnDiagramHeight(source) : null;
   // Only a drawn diagram copies as its fenced source, and the block re-renders with every
   // streamed delta of its message.
   const drawn = diagram !== null;
@@ -403,6 +432,16 @@ export function MarkdownMermaidBlock({
     () => (diagram ? { __html: diagram.diagram.svg } : null),
     [diagram],
   );
+
+  // Remember the drawn body's height, measured after the swap commits, when layout is current.
+  useLayoutEffect(() => {
+    const body = bodyRef.current;
+    if (!showDiagram || !body || !diagramFonts) return;
+    const { height } = body.getBoundingClientRect();
+    if (height <= 0) return;
+    const key = diagramKey(diagramFonts.key, source);
+    drawnDiagramHeights.set(key, height, key.length * 2 + 16);
+  }, [showDiagram, source]);
 
   return (
     <MarkdownCodeBlock
@@ -423,7 +462,12 @@ export function MarkdownMermaidBlock({
         </>
       }
     >
-      <DiagramBody anchor={readingAnchor} source={source} bodyRef={bodyRef}>
+      <DiagramBody
+        anchor={readingAnchor}
+        source={source}
+        bodyRef={bodyRef}
+        reservedHeight={reservedHeight}
+      >
         {showDiagram ? (
           <div
             className="chat-markdown-mermaid"
