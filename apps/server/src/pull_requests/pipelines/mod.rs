@@ -28,14 +28,14 @@ use self::{
     model::{
         Changed, Detail, GetInput, JobDetail, JobInput, JobLog, JobLogInput, ListInput, ListPage,
         LogChunk, LogFrom, LogUnavailable, LogUnavailableAnswer, Refresh, Row, Snapshot, Stored,
-        SubscribeInput, Total,
+        SubscribeInput, Total, Workflow,
     },
 };
 use super::{
-    CONTEXT_KIND, PullRequestsService, bounded_read,
+    CONTEXT_KIND, PullRequestsService, backoff as host_backoff, bounded_read,
     context::{self, ContextRead, DiscoveredHosts},
-    error::PullRequestsOperationError,
-    host::{HostContext, HostFuture, HostScope},
+    error::{PullRequestsOperationError, from_process_error},
+    host::{HostContext, HostFuture, HostScope, ProcessFailure},
     model::{Context, PullRequestsProvider},
     snapshot_store::{self, SnapshotStore},
 };
@@ -52,6 +52,8 @@ pub(crate) struct ListRead {
     pub rows: Vec<Row>,
     pub next_cursor: Option<String>,
     pub total: Option<Total>,
+    /// The repository's workflows for the filter (GitHub), read with the count.
+    pub workflows: Option<Vec<Workflow>>,
 }
 
 /// A trace read: its bytes, and how many bytes of a whole log's head a
@@ -59,6 +61,33 @@ pub(crate) struct ListRead {
 pub(crate) struct TraceRead {
     pub bytes: Vec<u8>,
     pub dropped: u64,
+}
+
+/// A failed `glab api` or `gh api` call: the shared classification, then the
+/// headers `-i` left on stdout. A 429, GitHub's 403 with no requests
+/// remaining, or a secondary-limit message is `rate_limited`, with the
+/// provider's own pause.
+pub(crate) fn read_failure(
+    operation: &str,
+    cli: &str,
+    failure: &ProcessFailure,
+) -> PullRequestsOperationError {
+    let mut error = from_process_error(operation, cli, &failure.error, &failure.stderr);
+    if let crate::git::ProcessError::NonZeroExit { stdout, .. } = &failure.error {
+        let (head, body) = host_backoff::split_response(stdout.as_bytes());
+        if error.code != "rate_limited" && host_backoff::is_rate_limit(&head, body, &failure.stderr)
+        {
+            let host_detail = error.host_detail.take();
+            error = PullRequestsOperationError::new(operation, "rate_limited");
+            error.host_detail = host_detail;
+        }
+        if error.code == "rate_limited" {
+            error.retry_after_seconds =
+                host_backoff::provider_delay(&head, host_backoff::now_epoch_seconds())
+                    .map(super::error::retry_seconds);
+        }
+    }
+    error
 }
 
 fn unavailable<'a, T: 'a>(operation: &'static str) -> HostFuture<'a, T> {
@@ -71,6 +100,12 @@ pub(crate) trait PipelineHost: Send + Sync {
     /// The provider reads logs by byte range (GitLab), once proved per host.
     fn ranged_logs(&self) -> bool {
         false
+    }
+
+    /// A running job's log can be read while it runs. GitHub serves a job's
+    /// log only once it completes, so a running one is `live_on_host`.
+    fn live_logs(&self) -> bool {
+        true
     }
 
     /// The last good context, with no host call, for the poller.
@@ -123,20 +158,21 @@ pub(crate) trait PipelineHost: Send + Sync {
     }
 }
 
-/// GitHub's workflow runs arrive with their own reader; until then every
-/// GitHub read answers `unavailable`, and `readSnapshot` still serves rows.
-impl PipelineHost for super::github::GitHubHost {}
-
 /// A list's count, per lowercased host, project and list key.
 type CountKey = (String, String, String);
+/// A repository's workflows, per lowercased host and project.
+type WorkflowsKey = (String, String);
 
 /// Server memory the pipelines reads share across service clones: the log
-/// cache, the GitLab pollers and the reused list counts.
+/// cache, the GitLab pollers, the reused list counts and GitHub workflows.
 #[derive(Default)]
 pub(crate) struct PipelinesState {
     pub(crate) logs: log::LogCache,
     pub(crate) pollers: poll::Registry,
     counts: Mutex<HashMap<CountKey, (Instant, Total)>>,
+    /// GitHub's Workflow filter choices, read with a count and reused by the
+    /// reads that skip it, so a timer page keeps the filter.
+    workflows: Mutex<HashMap<WorkflowsKey, Vec<Workflow>>>,
 }
 
 impl PipelinesState {
@@ -144,6 +180,10 @@ impl PipelinesState {
     pub(crate) fn forget_contexts(&self) {
         self.logs.clear();
         self.counts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
+        self.workflows
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clear();
@@ -157,6 +197,22 @@ impl PipelinesState {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .retain(|key, _| key.0 != host);
+        self.workflows
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|key, _| key.0 != host);
+    }
+
+    /// The workflows a read returned, remembered; or the last ones remembered.
+    fn workflows(&self, key: WorkflowsKey, read: Option<Vec<Workflow>>) -> Option<Vec<Workflow>> {
+        let mut workflows = self.workflows.lock().unwrap_or_else(|p| p.into_inner());
+        match read {
+            Some(read) => {
+                workflows.insert(key, read.clone());
+                Some(read)
+            }
+            None => workflows.get(&key).cloned(),
+        }
     }
 
     fn count(&self, key: &CountKey) -> Option<(Duration, Total)> {
@@ -657,19 +713,27 @@ impl PipelinesService {
                     .host
                     .list(&admitted.scope, &admitted.context, &input, with_count, c)
                     .await?;
+                // GitLab answers a count only when asked; GitHub with every page.
                 let total = match read.total {
-                    Some(total) if with_count => {
+                    Some(total) => {
                         self.state().remember_count(count_key, total.clone());
                         Some(total)
                     }
-                    _ => cached.map(|(_, total)| total),
+                    None => cached.map(|(_, total)| total),
                 };
+                let workflows = self.state().workflows(
+                    (
+                        admitted.scope.host.to_ascii_lowercase(),
+                        admitted.scope.repository.clone(),
+                    ),
+                    read.workflows,
+                );
                 let page = ListPage {
                     revision: generation,
                     rows: read.rows,
                     next_cursor: read.next_cursor,
                     total,
-                    workflows: None,
+                    workflows,
                 };
                 // Only first pages are painted from snapshots.
                 if first_page {
@@ -861,6 +925,11 @@ impl PipelinesService {
             return Ok(log_unavailable(LogUnavailable::Erased, &facts));
         }
         let terminal = facts.terminal;
+        // GitHub serves a job's log once it completes; until then its own
+        // page shows the live log.
+        if !terminal && !admitted.host.live_logs() {
+            return Ok(log_unavailable(LogUnavailable::LiveOnHost, &facts));
+        }
         let download = async {
             let read = admitted
                 .host
@@ -887,6 +956,10 @@ impl PipelinesService {
             Ok(log) => log,
             Err(error) if error.code == "not_found" => {
                 return self.missing_log(admitted, key, c).await;
+            }
+            // Past the host's retention (GitHub's 410).
+            Err(error) if error.code == "expired" => {
+                return Ok(log_unavailable(LogUnavailable::Expired, &facts));
             }
             Err(error) => return Err(error),
         };

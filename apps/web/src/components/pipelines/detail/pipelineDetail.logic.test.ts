@@ -6,6 +6,7 @@ import {
   buildPipelineGetInput,
   detailSnapshotInput,
   detailTimerIntervalMs,
+  pipelineAttemptOptions,
   pipelineFingerprint,
   pipelineHostUrl,
   pipelineJobAction,
@@ -158,5 +159,35 @@ describe("pipelineHostUrl", () => {
     expect(pipelineHostUrl({ provider: "github", webUrl: "https://github.com/o/r" }, 7)).toBe(
       "https://github.com/o/r/actions/runs/7",
     );
+  });
+});
+
+describe("pipelineAttemptOptions", () => {
+  it("offers nothing for a run GitHub has not re-run", () => {
+    expect(pipelineAttemptOptions(null, 1)).toBeNull();
+    expect(pipelineAttemptOptions(null, null)).toBeNull();
+  });
+
+  it("lists the latest attempt first, then each earlier one, on the latest page", () => {
+    expect(pipelineAttemptOptions(null, 3)).toEqual({
+      value: "latest",
+      items: [
+        { value: "latest", label: "Attempt 3 (latest)" },
+        { value: "2", label: "Attempt 2" },
+        { value: "1", label: "Attempt 1" },
+      ],
+    });
+  });
+
+  it("selects an earlier attempt, and keeps a way back when the latest is not known", () => {
+    expect(pipelineAttemptOptions(1, 3)?.value).toBe("1");
+    expect(pipelineAttemptOptions(2, null)).toEqual({
+      value: "2",
+      items: [
+        { value: "latest", label: "Latest attempt" },
+        { value: "2", label: "Attempt 2" },
+        { value: "1", label: "Attempt 1" },
+      ],
+    });
   });
 });

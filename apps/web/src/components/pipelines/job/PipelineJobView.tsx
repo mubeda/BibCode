@@ -42,7 +42,9 @@ import { JobLog, type JobLogSource } from "../log/JobLog";
 import { PipelineStatusIcon } from "../shared/PipelineStatusIcon";
 import { pipelineStatusText } from "../shared/pipelineStatus.logic";
 import { useRateLimitCountdown } from "../shared/useRateLimitCountdown";
+import { detailTimerIntervalMs } from "../detail/pipelineDetail.logic";
 import { PipelineJobDetails } from "./PipelineJobDetails";
+import { PipelineJobSteps } from "./PipelineJobSteps";
 import {
   findPipelineJob,
   jobSnapshotInput,
@@ -54,6 +56,11 @@ import { PIPELINE_JOB_ROUTE } from "./pipelineJobRoute";
 const HOST_NAMES: Record<PullRequestsProviderKind, string> = { github: "GitHub", gitlab: "GitLab" };
 /** A running pipeline is re-read this often while its stream is down (GitLab's poller cadence). */
 export const JOB_PIPELINE_TIMER_MS = 10_000;
+/** A running GitHub job is re-read this often, for its steps' progress. */
+export const GITHUB_JOB_TIMER_MS = 10_000;
+/** A GitHub job page re-reads its run three times less often than the run's own page. */
+const GITHUB_JOB_PAGE_RUN_FACTOR = 3;
+const NO_STEPS: PipelinesJobDetail["steps"] = [];
 const isOperationError = Schema.is(PullRequestsOperationError);
 
 function operationError(query: EnvironmentQueryView<unknown>) {
@@ -78,7 +85,10 @@ function useJobFinishedAnnouncement(name: string | null, status: string, termina
  * One job: its header, its log, and its details. The job's status and permissions come
  * from its pipeline's detail, which GitLab's poller keeps current while the page is
  * visible (the page subscribes with the pipeline); the job read is repeated only once,
- * when the job finishes, because its runner and artifacts change only then.
+ * when the job finishes, because its runner and artifacts change only then. GitHub has
+ * no poller and serves a job's log only once it completes: while a job runs its page
+ * re-reads the job every 10 s for its steps and the run every 30 s per page of jobs,
+ * and shows the steps where the log will be.
  */
 export function PipelineJobView({
   filters,
@@ -165,18 +175,36 @@ export function PipelineJobView({
   const stage = findPipelineJob(detail, jobId)?.stage ?? job?.stage ?? null;
   const pipeline = detail?.pipeline ?? null;
 
-  // While GitLab's stream is down, the pipeline is re-read on a timer until it finishes.
+  // The pipeline is re-read on a timer until it finishes: on GitLab only while its
+  // stream is down; on GitHub, which has no stream, at a third of its page's cadence
+  // and only while this job runs, since a finished job's page shows nothing new.
   const revalidateDetail = detailQuery.revalidate;
   const timerRead = useCallback(() => {
     pipelinesEnvironment.requestTimerRead(getTarget);
     revalidateDetail();
   }, [getTarget, revalidateDetail]);
   useVisibleModuleRefresh({
-    enabled: isGitlab && pipeline !== null && !pipeline.terminal,
+    enabled:
+      pipeline !== null && !pipeline.terminal && (isGitlab || (job !== null && !job.terminal)),
     succeeded: detailQuery.data !== null && detailQuery.error === null && !detailQuery.isPending,
     paused,
-    intervalMs: JOB_PIPELINE_TIMER_MS,
+    intervalMs:
+      isGitlab || detail === null
+        ? JOB_PIPELINE_TIMER_MS
+        : GITHUB_JOB_PAGE_RUN_FACTOR * detailTimerIntervalMs("github", detail, false),
     revalidate: timerRead,
+  });
+  // A running GitHub job's steps are its only progress BiBCode can show.
+  const revalidateJob = jobQuery.revalidate;
+  const jobTimerRead = useCallback(() => {
+    pipelinesEnvironment.requestTimerRead(jobTarget);
+    revalidateJob();
+  }, [jobTarget, revalidateJob]);
+  useVisibleModuleRefresh({
+    enabled: !isGitlab && job !== null && !job.terminal,
+    succeeded: jobQuery.data !== null && jobQuery.error === null && !jobQuery.isPending,
+    intervalMs: GITHUB_JOB_TIMER_MS,
+    revalidate: jobTimerRead,
   });
 
   // The runner, artifacts and erasure change only when the job finishes: read once then.
@@ -212,14 +240,39 @@ export function PipelineJobView({
 
   const erased = jobDetail?.erased ?? false;
   const started = job !== null && (job.startedAt !== null || job.status === "running");
-  const sourceKind = job === null ? null : erased ? "erased" : job.terminal ? "complete" : "live";
-  const source = useMemo<JobLogSource | null>(() => {
-    if (sourceKind === null) return null;
-    if (sourceKind === "erased") return { _tag: "unavailable", reason: "erased", url: null };
-    return sourceKind === "live"
-      ? { _tag: "live", jobId, attempt: null, started }
-      : { _tag: "complete", jobId, attempt: null };
-  }, [jobId, sourceKind, started]);
+  // GitHub serves a job's log once it completes; until then its own page has it.
+  const sourceKind =
+    job === null
+      ? null
+      : erased
+        ? "erased"
+        : job.terminal
+          ? "complete"
+          : isGitlab
+            ? "live"
+            : started
+              ? "on_host"
+              : "not_started";
+  // The log is keyed by the job's attempt, which GitHub's job read names: wait for it,
+  // so the log is read once.
+  const logAttempt = jobDetail?.attempt ?? null;
+  const waitsForAttempt = !isGitlab && jobDetail === null;
+  const jobUrl = job?.url ?? null;
+  const source: JobLogSource | null =
+    sourceKind === null
+      ? null
+      : sourceKind === "erased"
+        ? { _tag: "unavailable", reason: "erased", url: null }
+        : sourceKind === "on_host"
+          ? { _tag: "unavailable", reason: "live_on_host", url: jobUrl }
+          : sourceKind === "not_started"
+            ? { _tag: "unavailable", reason: "not_started", url: null }
+            : waitsForAttempt
+              ? null
+              : sourceKind === "live"
+                ? { _tag: "live", jobId, attempt: logAttempt, started }
+                : { _tag: "complete", jobId, attempt: logAttempt };
+  const steps = jobDetail?.steps ?? NO_STEPS;
   const { environmentId: routeEnvironmentId, projectId } = projectRef;
   const onLineLink = useCallback(
     (offset: number) => {
@@ -381,7 +434,16 @@ export function PipelineJobView({
                   detail={detail}
                   detailError={detailError?.message ?? detailQuery.error}
                   provider={context.provider}
-                />
+                >
+                  {sourceKind === "on_host" ? null : <PipelineJobSteps steps={steps} />}
+                </PipelineJobDetails>
+              }
+              inPlaceOfLog={
+                sourceKind === "on_host" && steps.length > 0 ? (
+                  <div className="overflow-auto p-4 text-xs" data-text-surface="background">
+                    <PipelineJobSteps steps={steps} />
+                  </div>
+                ) : null
               }
             />
           </div>
@@ -391,8 +453,11 @@ export function PipelineJobView({
   );
 }
 
-/** The log beside the details on wide panels; on narrow ones a Details disclosure above it. */
-function JobBody({ details }: { details: ReactNode }) {
+/**
+ * The log beside the details on wide panels; on narrow ones a Details disclosure above
+ * it. `inPlaceOfLog` replaces the log while the host keeps it (a running GitHub job).
+ */
+function JobBody({ details, inPlaceOfLog }: { details: ReactNode; inPlaceOfLog: ReactNode }) {
   const [open, setOpen] = useState(false);
   return (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col @min-[960px]:flex-row">
@@ -420,17 +485,26 @@ function JobBody({ details }: { details: ReactNode }) {
         {details}
       </aside>
       <div className="flex min-h-0 min-w-0 flex-1 flex-col">
-        <JobLog.Toolbar>
-          <JobLog.Search />
-          <JobLog.TimestampsToggle />
-          <JobLog.WrapToggle />
-          <JobLog.SectionsToggle />
-          <JobLog.ScrollButtons />
-          <JobLog.RawLink />
-        </JobLog.Toolbar>
-        <JobLog.LoadEarlier />
-        <JobLog.Lines />
-        <JobLog.Status />
+        {inPlaceOfLog ? (
+          <>
+            <JobLog.Status />
+            {inPlaceOfLog}
+          </>
+        ) : (
+          <>
+            <JobLog.Toolbar>
+              <JobLog.Search />
+              <JobLog.TimestampsToggle />
+              <JobLog.WrapToggle />
+              <JobLog.SectionsToggle />
+              <JobLog.ScrollButtons />
+              <JobLog.RawLink />
+            </JobLog.Toolbar>
+            <JobLog.LoadEarlier />
+            <JobLog.Lines />
+            <JobLog.Status />
+          </>
+        )}
       </div>
     </div>
   );

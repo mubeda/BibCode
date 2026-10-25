@@ -10,6 +10,8 @@ import {
   pipelineRowActions,
   shownFilters,
   validatePipelinesSearch,
+  workflowFilterItems,
+  emptyListCopy,
 } from "./pipelinesList.logic";
 
 describe("pipelines list search", () => {
@@ -119,6 +121,60 @@ describe("pipelineRowActions", () => {
     expect(pipelineRowActions({ ...pipelineRow, permissions: null }, null).retry).toEqual({
       allowed: false,
       reason: "The host didn't say whether you can retry pipelines.",
+    });
+  });
+});
+
+describe("GitHub list filters and copy", () => {
+  const workflows = [
+    { id: 77, name: "CI" },
+    { id: 78, name: "Release" },
+  ];
+
+  it("offers every workflow after All workflows, and keeps a chosen one GitHub no longer lists", () => {
+    expect(workflowFilterItems(workflows, null)).toEqual([
+      { value: "all", label: "All workflows" },
+      { value: "77", label: "CI" },
+      { value: "78", label: "Release" },
+    ]);
+    expect(workflowFilterItems(workflows, 99).at(-1)).toEqual({
+      value: "99",
+      label: "Workflow 99",
+    });
+  });
+
+  it("says a repository has no workflows only when GitHub returned none and no filter is set", () => {
+    const copy = (filters: Partial<typeof DEFAULT_PIPELINES_FILTERS>, list = workflows) =>
+      emptyListCopy({
+        provider: "github",
+        filters: { ...DEFAULT_PIPELINES_FILTERS, ...filters },
+        workflows: list,
+      });
+    expect(copy({}, [])).toBe("This repository has no workflows.");
+    expect(copy({})).toBe("No pipelines yet");
+    expect(copy({ scope: "running" }, [])).toBe("Nothing running");
+    expect(copy({ ref: "release" }, [])).toBe("No pipelines on release");
+    expect(copy({ workflowId: 78 })).toBe("No runs of Release");
+    expect(copy({ workflowId: 99 })).toBe("No runs of this workflow");
+    expect(
+      emptyListCopy({ provider: "gitlab", filters: DEFAULT_PIPELINES_FILTERS, workflows: null }),
+    ).toBe("No pipelines yet");
+  });
+
+  it("names repository write access when GitHub refuses a re-run or a cancel", () => {
+    const denied = {
+      ...pipelineRow,
+      permissions: { retry: "denied" as const, cancel: "denied" as const },
+    };
+    expect(pipelineRowActions(denied, null, "github").retry).toEqual({
+      allowed: false,
+      reason: "You need write access to this repository to re-run workflows.",
+    });
+    expect(
+      pipelineRowActions({ ...denied, status: "running", terminal: false }, null, "github").cancel,
+    ).toEqual({
+      allowed: false,
+      reason: "You need write access to this repository to cancel workflow runs.",
     });
   });
 });

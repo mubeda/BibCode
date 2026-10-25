@@ -37,9 +37,10 @@ import { Tabs, TabsList, TabsTab } from "../../ui/tabs";
 import { useRateLimitCountdown } from "../shared/useRateLimitCountdown";
 import { PipelinesBranchFilter } from "./PipelinesBranchFilter";
 import { PIPELINES_ROW_HEIGHT, PipelinesListRow } from "./PipelinesListRow";
+import { PipelinesWorkflowFilter } from "./PipelinesWorkflowFilter";
 import {
-  EMPTY_LIST_COPY,
   buildPipelinesListInput,
+  emptyListCopy,
   listSnapshotInput,
   listTimerEnabled,
   mergePipelineRows,
@@ -71,8 +72,9 @@ function PipelinesPages({
   projectRef,
   input,
   firstQuery,
-  hasRef,
-  onClearRef,
+  emptyCopy,
+  hasFilter,
+  onClearFilters,
   onTimerRetry,
   onBackoffChange,
   ref,
@@ -81,8 +83,11 @@ function PipelinesPages({
   projectRef: ScopedProjectRef;
   input: PipelinesListInput;
   firstQuery: EnvironmentQueryView<PipelinesListPage>;
-  hasRef: boolean;
-  onClearRef: () => void;
+  /** What the list says when it has no rows. */
+  emptyCopy: string;
+  /** A branch or workflow filter is set, so an empty list offers to clear it. */
+  hasFilter: boolean;
+  onClearFilters: () => void;
   onTimerRetry: () => void;
   onBackoffChange: (backedOff: boolean) => void;
   ref: Ref<PipelinesListViewHandle> | undefined;
@@ -195,8 +200,8 @@ function PipelinesPages({
             >
               Retry
             </PermissionButton>
-            {hasRef ? (
-              <Button size="sm" variant="outline" onClick={onClearRef}>
+            {hasFilter ? (
+              <Button size="sm" variant="outline" onClick={onClearFilters}>
                 Clear filter
               </Button>
             ) : null}
@@ -230,11 +235,9 @@ function PipelinesPages({
       ) : null}
       {rows.length === 0 && loaded && message === null ? (
         <div className="space-y-3 p-6 text-sm text-muted-foreground">
-          <p>
-            {hasRef && input.ref ? `No pipelines on ${input.ref}` : EMPTY_LIST_COPY[input.scope]}
-          </p>
-          {hasRef ? (
-            <Button size="sm" variant="outline" onClick={onClearRef}>
+          <p>{emptyCopy}</p>
+          {hasFilter ? (
+            <Button size="sm" variant="outline" onClick={onClearFilters}>
               Clear filter
             </Button>
           ) : null}
@@ -357,7 +360,13 @@ export function PipelinesListView({
     if (freshPageKey !== null) consumeFreshPage(freshPageKey);
   }, [consumeFreshPage, freshPageKey]);
   const total = displayedFirstPage?.total ?? null;
-  const clearRef = () => onFiltersChange({ ...filters, ref: null });
+  // GitHub's Workflow choices ride on its first page; the last ones stay while
+  // another filter's page loads.
+  const pageWorkflows = displayedFirstPage?.workflows ?? null;
+  const [workflows, setWorkflows] = useState(pageWorkflows);
+  if (pageWorkflows !== null && pageWorkflows !== workflows) setWorkflows(pageWorkflows);
+  const hasFilter = filters.ref !== null || filters.workflowId !== null;
+  const clearFilters = () => onFiltersChange({ ...filters, ref: null, workflowId: null });
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <div className="flex flex-wrap items-center gap-3 px-4 pt-3 pb-2">
@@ -385,6 +394,13 @@ export function PipelinesListView({
           value={filters.ref}
           onChange={(ref) => onFiltersChange({ ...filters, ref })}
         />
+        {context.provider === "github" && workflows !== null ? (
+          <PipelinesWorkflowFilter
+            workflows={workflows}
+            value={filters.workflowId}
+            onChange={(workflowId) => onFiltersChange({ ...filters, workflowId })}
+          />
+        ) : null}
       </div>
       <PipelinesPages
         key={JSON.stringify([environmentId, input])}
@@ -392,8 +408,9 @@ export function PipelinesListView({
         projectRef={projectRef}
         input={input}
         firstQuery={displayedFirstQuery}
-        hasRef={filters.ref !== null}
-        onClearRef={clearRef}
+        emptyCopy={emptyListCopy({ provider: context.provider, filters, workflows })}
+        hasFilter={hasFilter}
+        onClearFilters={clearFilters}
         onTimerRetry={timerRead}
         onBackoffChange={onBackoffChange}
         ref={ref}

@@ -1443,6 +1443,25 @@ absolute `firstLine` when nothing was dropped. A trace 404 is told apart by a
 job read: `not_started` for a job that is not terminal, `erased`, `no_output`,
 or `not_found` only when the job itself is missing.
 
+GitHub serves Actions as pipelines (`pull_requests/github/runs.rs`): one row
+per workflow run, labeled "`<workflow>` #`<run_number>`", the cursor an opaque
+page number of 20 runs. A list filtered by ref or state stops at GitHub's
+1,000 results (`total.capped`, no cursor past them); a first page's `user`
+read also returns the repository's workflows for the Workflow filter, which
+the server reuses for the reads that skip them. A 404 on the run list names
+both causes GitHub cannot tell apart (Actions turned off, or a sign-in that may
+not read Actions). Statuses map from `status` and `conclusion` with their own
+`terminal` flag, so `completed` + `action_required` is a `manual` row that no
+timer reads again, and `neutral` and `stale` are `skipped` with a `reason`.
+A pipeline reads the run (or `attempts/:n` for an earlier attempt), its jobs
+in pages of 100 (the rest concurrently, at most ten pages, `truncated` past
+1,000) and its artifacts, all in one `get`; its jobs sit in one stage, and
+artifacts link to the run's page, never to `archive_download_url`. GitHub
+permissions are `unknown` from repository write and `denied` below it; jobs
+have no cancel or play. A job's log is served only once the job completes,
+through the whole-download path (a 410 is `expired`); a running job's
+`getJobLog` answers `unavailable: live_on_host` with no download.
+
 The client (`@bibcode/client-runtime/state/pipelines`) mirrors the Pull
 Requests atoms: `list`, `get` and `getJob` are fresh for 5 s and kept 5 minutes
 after their last subscriber; `getJobLog`, `readSnapshot` and `subscribe` keep
@@ -1462,7 +1481,9 @@ pages. GitHub has no stream: its timer re-reads the first page every 20 s
 only while a shown pipeline is not `terminal`. A `rate_limited` answer shows
 the server's `retryAfterSeconds` as a countdown, disables Refresh and Retry
 until it ends, then reads once as a timer read. A row hovered 150 ms prefetches
-its `get`, at most two per environment and not again within 5 s.
+its `get`, at most two per environment and not again within 5 s. On GitHub the
+toolbar's Workflow select comes from the first page's `workflows`, kept while
+another filter's page loads.
 
 A pipeline route reads `get` with the exact input the hover prefetched
 (`attempt: null` for the latest attempt, `refresh: "user"`), so an open within
@@ -1480,7 +1501,11 @@ minutes without a status change. The read that sees the pipeline turn
 `terminal` is the last. A `forbidden` or `not_found` answer stays on the page
 ("You can't view this pipeline." with the host link, "This pipeline no longer
 exists." with Back to pipelines) and never reaches the shared sign-in state;
-only `not_authenticated` asks the shell to read the context again.
+only `not_authenticated` asks the shell to read the context again. On GitHub
+a run with more than one attempt shows an Attempt select: the latest page
+takes the count from its own copy, and an earlier attempt's page reads the
+latest attempt's stored row (`readSnapshot` with `attempt: null`, no host
+call) to name it, or offers "Latest attempt" without it.
 
 A job page reads `getJob` and its pipeline's `get` once on open, paints the
 stored `pipelines_job` and `pipelines_detail` rows from one `readSnapshot`,
@@ -1500,6 +1525,16 @@ keeps the loaded head and reads nothing until the job is terminal, when the
 tail is read once; a followed job that finishes gets one final read and then
 none. Load earlier reads `before` the loaded start with `refresh: "user"`
 until the view holds 16 MiB or a window brings nothing earlier.
+
+A GitHub job page has no stream. While the job runs its log source is
+`unavailable: live_on_host` (`not_started` before it starts), so it reads no
+log and shows the job's steps in the log's place; `getJob` is re-read every
+10 s for the steps, and `get` every 30 s per page of jobs, while the document
+is visible and only while the job itself runs. A job read newer by
+`revision` than the pipeline copy gives the job's status (the pipeline copy
+keeps its permissions). Once the job is terminal the log is read once under
+the job's own `attempt` (from `getJob`, which the page waits for), and a step
+jumps to the first log line stamped at or after its start.
 
 ## Worktree catalog flow
 

@@ -34,6 +34,7 @@ import { buildPipelinesListInput } from "../list/pipelinesList.logic";
 import { pipelineStatusText } from "../shared/pipelineStatus.logic";
 import { useFinishedAnnouncement } from "../shared/useFinishedAnnouncement";
 import { useRateLimitCountdown } from "../shared/useRateLimitCountdown";
+import { PipelineAttemptSelect } from "./PipelineAttemptSelect";
 import { PipelineDetailHeader } from "./PipelineDetailHeader";
 import { PipelineStageColumns } from "./PipelineStageColumns";
 import {
@@ -41,6 +42,7 @@ import {
   buildPipelineGetInput,
   detailSnapshotInput,
   detailTimerIntervalMs,
+  pipelineAttemptOptions,
   pipelineFingerprint,
   pipelineHostUrl,
   pipelineStageColumns,
@@ -193,6 +195,19 @@ export function PipelinesDetailView({
     [snapshotTarget],
   );
   const snapshotQuery = useEnvironmentQuery(snapshotAtom);
+  // An earlier attempt's read cannot say how many followed: the latest attempt's
+  // stored copy can, with no host call.
+  const latestSnapshotAtom = useMemo(
+    () =>
+      provider === "github" && attempt !== null
+        ? pipelinesEnvironment.readSnapshot({
+            environmentId,
+            input: { ...snapshotTarget.input, attempt: null },
+          })
+        : null,
+    [attempt, environmentId, provider, snapshotTarget],
+  );
+  const latestSnapshotQuery = useEnvironmentQuery(latestSnapshotAtom);
   const visible = useDocumentVisible();
   const subscribeAtom = useMemo(
     () => (isGitlab && visible ? pipelinesEnvironment.subscribe(snapshotTarget) : null),
@@ -327,6 +342,15 @@ export function PipelinesDetailView({
       </div>
     );
   const shown = resourceError ? null : detail;
+  const attemptOptions =
+    provider === "github" && shown !== null
+      ? pipelineAttemptOptions(
+          attempt,
+          attempt === null
+            ? shown.pipeline.attempt
+            : (latestSnapshotQuery.data?.detail?.payload.pipeline.attempt ?? null),
+        )
+      : null;
   // GitHub's one column is built here; keep it stable so the memoized stages skip a re-render.
   const columns = useMemo(
     () => (shown === null ? null : pipelineStageColumns(shown, provider)),
@@ -348,7 +372,15 @@ export function PipelinesDetailView({
             provider={provider}
             projectRef={projectRef}
             mutationsDisabledReason={mutationsDisabledReason}
-          />
+          >
+            {attemptOptions ? (
+              <PipelineAttemptSelect
+                options={attemptOptions}
+                projectRef={projectRef}
+                pipelineId={pipelineId}
+              />
+            ) : null}
+          </PipelineDetailHeader>
           <div className="space-y-4 p-4">
             <TruncationNotice detail={shown} provider={provider} />
             {columns === null ? (

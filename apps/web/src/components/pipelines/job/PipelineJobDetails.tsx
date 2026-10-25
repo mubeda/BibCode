@@ -189,12 +189,15 @@ export function PipelineJobDetails({
   detail,
   detailError,
   provider,
+  children,
 }: {
   job: PipelinesJob;
   jobDetail: PipelinesJobDetail | null;
   detail: PipelinesDetail | null;
   detailError: string | null;
   provider: PullRequestsProviderKind;
+  /** Sections the page adds after the facts, such as GitHub's steps. */
+  children?: ReactNode;
 }) {
   const running = !job.terminal && job.startedAt !== null;
   const now = useNow(running);
@@ -202,6 +205,8 @@ export function PipelineJobDetails({
   const duration = running ? elapsed : job.durationSeconds;
   const pipeline = detail?.pipeline ?? null;
   const commit = detail?.commit ?? null;
+  // GitHub's artifacts belong to the run, read with its detail; GitLab's to the job.
+  const artifacts = (provider === "github" ? detail?.artifacts : jobDetail?.artifacts) ?? [];
   return (
     <div className="space-y-4 p-4 text-xs">
       <dl>
@@ -267,13 +272,14 @@ export function PipelineJobDetails({
           </Row>
         ) : null}
       </dl>
-      {jobDetail && jobDetail.artifacts.length > 0 ? (
+      {children}
+      {artifacts.length > 0 ? (
         <section aria-labelledby="pipeline-job-artifacts" className="space-y-2">
           <h2 id="pipeline-job-artifacts" className="font-semibold">
             Artifacts
           </h2>
           <ul className="space-y-2">
-            {jobDetail.artifacts.map((artifact) => (
+            {artifacts.map((artifact) => (
               <ArtifactItem
                 key={artifact.name}
                 artifact={artifact}

@@ -1,6 +1,6 @@
 import { PullRequestsOperationError, type PipelinesLogUnavailableReason } from "@bibcode/contracts";
 import { describe, expect, it } from "vite-plus/test";
-import { jobLogStatusCopy, logScrolledToEnd } from "./jobLog.logic";
+import { jobLogStatusCopy, lineAtTime, logScrolledToEnd } from "./jobLog.logic";
 import { INITIAL_JOB_LOG_READER_STATE, type JobLogReaderState } from "./jobLogReader";
 import type { JobLogSource } from "./useJobLogController";
 
@@ -94,5 +94,16 @@ describe("job log copy", () => {
     expect(at(600)).toBe(true);
     expect(at(580)).toBe(true);
     expect(at(560)).toBe(false);
+  });
+});
+
+describe("lineAtTime", () => {
+  it("finds the first stamped line at or after a time, skipping unstamped lines", () => {
+    const stamps = Float64Array.from([Number.NaN, 1_000, 1_000, 2_000, Number.NaN, 3_000]);
+    expect(lineAtTime(stamps, 0)).toBe(1);
+    expect(lineAtTime(stamps, 1_500)).toBe(3);
+    expect(lineAtTime(stamps, 2_500)).toBe(5);
+    expect(lineAtTime(stamps, 3_001)).toBe(-1);
+    expect(lineAtTime(new Float64Array(0), 0)).toBe(-1);
   });
 });

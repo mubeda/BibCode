@@ -1,5 +1,6 @@
 import type {
   PipelinesListInput,
+  PipelinesListPage,
   PipelinesListScope,
   PipelinesRow,
   PipelinesSubscribeInput,
@@ -111,23 +112,71 @@ export const EMPTY_LIST_COPY: Record<PipelinesListScope, string> = {
   finished: "No finished pipelines",
 };
 
+type Workflows = NonNullable<PipelinesListPage["workflows"]>;
+
+/** The Workflow filter's choices: every run, then each workflow, keeping a chosen one. */
+export function workflowFilterItems(
+  workflows: Workflows,
+  value: number | null,
+): readonly { readonly value: string; readonly label: string }[] {
+  const items = [
+    { value: "all", label: "All workflows" },
+    ...workflows.map((workflow) => ({ value: String(workflow.id), label: workflow.name })),
+  ];
+  if (value !== null && !workflows.some((workflow) => workflow.id === value))
+    items.push({ value: String(value), label: `Workflow ${value}` });
+  return items;
+}
+
+/**
+ * What an empty list says. GitHub returning no runs and no workflows for an unfiltered
+ * list means the repository has none, not that nothing ran yet.
+ */
+export function emptyListCopy({
+  provider,
+  filters,
+  workflows,
+}: {
+  provider: PullRequestsProviderKind;
+  filters: PipelinesFilters;
+  workflows: Workflows | null;
+}): string {
+  if (filters.ref !== null) return `No pipelines on ${filters.ref}`;
+  if (filters.workflowId !== null) {
+    const workflow = workflows?.find((candidate) => candidate.id === filters.workflowId);
+    return workflow ? `No runs of ${workflow.name}` : "No runs of this workflow";
+  }
+  if (provider === "github" && filters.scope === "all" && workflows?.length === 0)
+    return "This repository has no workflows.";
+  return EMPTY_LIST_COPY[filters.scope];
+}
+
 export interface PipelineActionPermission {
   readonly allowed: boolean;
   readonly reason: string | null;
 }
 
-const DENIED: Record<"retry" | "cancel", string> = {
-  retry: "You don't have permission to retry pipelines in this project.",
-  cancel: "You don't have permission to cancel pipelines in this project.",
+// GitHub's only refusal it can read is the repository role below write.
+const DENIED: Record<PullRequestsProviderKind, Record<"retry" | "cancel", string>> = {
+  gitlab: {
+    retry: "You don't have permission to retry pipelines in this project.",
+    cancel: "You don't have permission to cancel pipelines in this project.",
+  },
+  github: {
+    retry: "You need write access to this repository to re-run workflows.",
+    cancel: "You need write access to this repository to cancel workflow runs.",
+  },
 };
 
 function actionPermission(
   action: "retry" | "cancel",
   permissions: PipelinesRow["permissions"],
   mutationsDisabledReason: string | null,
+  provider: PullRequestsProviderKind,
 ): PipelineActionPermission {
   // The host's own answer comes first: no server update lets a refused account act.
-  if (permissions?.[action] === "denied") return { allowed: false, reason: DENIED[action] };
+  if (permissions?.[action] === "denied")
+    return { allowed: false, reason: DENIED[provider][action] };
   if (mutationsDisabledReason !== null) return { allowed: false, reason: mutationsDisabledReason };
   if (permissions === null)
     return { allowed: false, reason: `The host didn't say whether you can ${action} pipelines.` };
@@ -142,6 +191,7 @@ function actionPermission(
 export function pipelineRowActions(
   row: Pick<PipelinesRow, "status" | "terminal" | "permissions">,
   mutationsDisabledReason: string | null,
+  provider: PullRequestsProviderKind = "gitlab",
 ): {
   readonly retry: PipelineActionPermission | null;
   readonly cancel: PipelineActionPermission | null;
@@ -149,10 +199,10 @@ export function pipelineRowActions(
   return {
     retry:
       row.terminal && row.status !== "success"
-        ? actionPermission("retry", row.permissions, mutationsDisabledReason)
+        ? actionPermission("retry", row.permissions, mutationsDisabledReason, provider)
         : null,
     cancel: row.terminal
       ? null
-      : actionPermission("cancel", row.permissions, mutationsDisabledReason),
+      : actionPermission("cancel", row.permissions, mutationsDisabledReason, provider),
   };
 }

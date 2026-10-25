@@ -44,14 +44,30 @@ export function findPipelineJob(
 
 /**
  * The job's status, timing and permissions: the pipeline detail's copy when it has the
- * job (polled while it runs), otherwise the job read's own.
+ * job (polled while it runs), otherwise the job read's own. A job read newer by
+ * `revision` (GitHub re-reads a running job more often than its run) gives the status
+ * and timing; the permissions stay the pipeline's, the host's answer for this account.
  */
 export function shownJob(
   detail: PipelinesDetail | null,
   jobDetail: PipelinesJobDetail | null,
   jobId: number,
 ): PipelinesJob | null {
-  return findPipelineJob(detail, jobId)?.job ?? jobDetail?.job ?? null;
+  const fromPipeline = findPipelineJob(detail, jobId)?.job ?? null;
+  if (fromPipeline === null) return jobDetail?.job ?? null;
+  if (jobDetail === null || detail === null || jobDetail.revision <= detail.revision)
+    return fromPipeline;
+  return { ...jobDetail.job, permissions: fromPipeline.permissions };
+}
+
+/** Seconds a finished step took, or `null` while it runs or without both times. */
+export function stepDurationSeconds(step: {
+  readonly startedAt: string | null;
+  readonly completedAt: string | null;
+}): number | null {
+  if (step.startedAt === null || step.completedAt === null) return null;
+  const seconds = (Date.parse(step.completedAt) - Date.parse(step.startedAt)) / 1_000;
+  return Number.isFinite(seconds) && seconds >= 0 ? seconds : null;
 }
 
 export interface RelatedStage {

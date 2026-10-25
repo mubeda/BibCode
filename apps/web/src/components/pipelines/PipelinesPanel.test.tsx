@@ -181,14 +181,14 @@ describe("PipelinesPanel", () => {
     expect(h.freshPageKey).toBe(environmentRpcKey({ environmentId: "env" as never, input }));
   });
 
-  it("shows GitHub's own page until Pipelines read GitHub", async () => {
+  it("lists a GitHub repository's workflow runs, with its Actions page beside them", async () => {
     h.context = githubContext;
     await render();
-    expect(container.textContent).toContain("Pipelines for GitHub are coming.");
+    expect(container.textContent).not.toContain("coming");
+    expect(h.listProps).not.toBeNull();
     expect(
       [...container.querySelectorAll("a")].find((a) => a.textContent === "Open on GitHub")?.href,
     ).toBe("https://github.com/owner/repo/actions");
-    expect(h.listProps).toBeNull();
   });
 
   it("writes a filter change to the URL and remembers it for the project", async () => {

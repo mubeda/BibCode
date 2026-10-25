@@ -325,6 +325,34 @@ impl HostCommandRunner {
         self.execute_bytes(request, c).await
     }
 
+    /// `gh api` GET with the raw stdout bytes, pinned to the scope's host and
+    /// to the REST API version both github.com and GitHub Enterprise Server
+    /// serve. `include_headers` adds `-i`, so a refusal keeps its rate-limit
+    /// headers; a log download goes without, so its kept tail is all log text.
+    pub(super) async fn gh_api_raw(
+        &self,
+        scope: &HostScope,
+        path: &str,
+        include_headers: bool,
+        budget: Budget,
+        c: &CancellationToken,
+    ) -> Result<RawOutput, ProcessFailure> {
+        let mut args: Vec<OsString> = vec!["api".into()];
+        if include_headers {
+            args.push("-i".into());
+        }
+        args.extend([
+            "-H".into(),
+            "X-GitHub-Api-Version: 2022-11-28".into(),
+            "--hostname".into(),
+            scope.host.clone().into(),
+            path.into(),
+        ]);
+        let request =
+            self.provider_request(scope, PullRequestsProvider::Github, &args, budget, None);
+        self.execute_bytes(request, c).await
+    }
+
     pub async fn glab_api_with_body(
         &self,
         scope: &HostScope,

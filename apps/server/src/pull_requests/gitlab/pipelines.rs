@@ -9,8 +9,8 @@ use tokio_util::sync::CancellationToken;
 use super::{GitLabHost, encoded, parse, project_path};
 use crate::pull_requests::{
     backoff,
-    error::{PullRequestsOperationError, from_process_error},
-    host::{Budget, HostContext, HostFuture, HostScope, ProcessFailure},
+    error::PullRequestsOperationError,
+    host::{Budget, HostContext, HostFuture, HostScope},
     model::{Actor, PipelineStage, PipelineStatus},
     pipelines::{
         ListRead, PipelineHost, TraceRead,
@@ -19,6 +19,7 @@ use crate::pull_requests::{
             JobPermissions, ListInput, ListScope, Permission, PipelineRef, Reason, RefKind, Row,
             RowPermissions, Runner, Total, is_terminal,
         },
+        read_failure,
     },
 };
 
@@ -30,30 +31,6 @@ const PIPELINE_GID: &str = "gid://gitlab/Ci::Pipeline/";
 
 fn invalid(operation: &str) -> PullRequestsOperationError {
     PullRequestsOperationError::new(operation, "invalid_response")
-}
-
-/// A failed `glab api` call: the shared classification, then the headers
-/// `-i` left on stdout. A 429, GitHub's 403 with no requests remaining, or a
-/// secondary-limit message is `rate_limited`, with the provider's own pause.
-pub(crate) fn read_failure(
-    operation: &str,
-    failure: &ProcessFailure,
-) -> PullRequestsOperationError {
-    let mut error = from_process_error(operation, "glab", &failure.error, &failure.stderr);
-    if let crate::git::ProcessError::NonZeroExit { stdout, .. } = &failure.error {
-        let (head, body) = backoff::split_response(stdout.as_bytes());
-        if error.code != "rate_limited" && backoff::is_rate_limit(&head, body, &failure.stderr) {
-            let host_detail = error.host_detail.take();
-            error = PullRequestsOperationError::new(operation, "rate_limited");
-            error.host_detail = host_detail;
-        }
-        if error.code == "rate_limited" {
-            error.retry_after_seconds =
-                backoff::provider_delay(&head, backoff::now_epoch_seconds())
-                    .map(crate::pull_requests::error::retry_seconds);
-        }
-    }
-    error
 }
 
 /// The status a detailed status names. GitLab spells "passed with warnings"
@@ -609,7 +586,7 @@ impl GitLabHost {
                 .glab_api_raw(scope, "graphql", Some(&input), true, budget, c)
                 .await;
             super::trace_gitlab_read(operation, "graphql", started);
-            let output = output.map_err(|failure| read_failure(operation, &failure))?;
+            let output = output.map_err(|failure| read_failure(operation, "glab", &failure))?;
             let (_, body) = backoff::split_response(&output.stdout);
             let value: Value = serde_json::from_slice(body).map_err(|_| invalid(operation))?;
             if !baseline && missing_field(&value) {
@@ -648,7 +625,7 @@ impl GitLabHost {
             .glab_api_raw(scope, path, None, true, Budget::Read, c)
             .await;
         super::trace_gitlab_read(operation, "job", started);
-        let output = output.map_err(|failure| read_failure(operation, &failure))?;
+        let output = output.map_err(|failure| read_failure(operation, "glab", &failure))?;
         let (_, body) = backoff::split_response(&output.stdout);
         serde_json::from_slice(body).map_err(|_| invalid(operation))
     }
@@ -703,6 +680,7 @@ impl PipelineHost for GitLabHost {
                 rows: list.rows,
                 next_cursor: list.next_cursor,
                 total: list.total,
+                workflows: None,
             })
         })
     }
@@ -783,7 +761,7 @@ impl PipelineHost for GitLabHost {
                 .glab_api_raw(scope, &path, None, include_headers, budget, c)
                 .await;
             super::trace_gitlab_read(operation, "trace", started);
-            let output = output.map_err(|failure| read_failure(operation, &failure))?;
+            let output = output.map_err(|failure| read_failure(operation, "glab", &failure))?;
             if c.is_cancelled() {
                 return Err(PullRequestsOperationError::new(operation, "timeout"));
             }

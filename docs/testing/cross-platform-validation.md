@@ -699,13 +699,14 @@ For GitLab poller, pipeline or snapshot changes, also run the ignored polling
 harness with `bash scripts/measure-gitlab-merge-request-load.sh` and record its
 `HARNESS_SUBSCRIBE_JSON` (requests an hour, spawns, delivery) in the report.
 
-For Pipelines server reads (`pipelines.*`: the GitLab list, pipeline, job and
-log reads, `LogCache`, the range probe, the pipelines poller, the shared 429
-ladder, or their snapshot rows), run from the repository root:
+For Pipelines server reads (`pipelines.*`: the GitLab and GitHub list,
+pipeline, job and log reads, `LogCache`, the range probe, the pipelines poller,
+the shared 429 ladder, or their snapshot rows), run from the repository root:
 
 ```sh
 cargo test -p bibcode-server --lib pull_requests::pipelines -j 2
 cargo test -p bibcode-server --lib pull_requests::gitlab::pipelines -j 2
+cargo test -p bibcode-server --lib pull_requests::github::runs -j 2
 cargo test -p bibcode-server --lib pull_requests::backoff -j 2
 cargo test -p bibcode-server --lib pull_requests::gitlab::poll -j 2
 cargo test -p bibcode-server --lib pull_requests::tripwires -j 2
@@ -714,9 +715,9 @@ cargo test -p bibcode-server --test rpc_wire -j 2
 vp test run packages/contracts/src/pipelines.test.ts packages/contracts/src/environment.test.ts packages/contracts/src/settings.test.ts
 ```
 
-The service tests resolve a checkout through fake `git` and `glab` scripts and
-run on Unix only; the poller tests use an in-memory provider and run on every
-platform.
+The service tests resolve a checkout through fake `git`, `glab` and `gh`
+scripts and run on Unix only, as do the GitHub reader's `process_tests`; the
+poller tests and the GitHub parse tests run on every platform.
 
 For the Pipelines web module (the list, the job page and its log parser,
 worker engine, reader and viewer), the repository module shell both modules
@@ -2659,8 +2660,19 @@ tag, one merge request pipeline) and a GitHub repository.
 6. Retry and Cancel show only where they apply and are disabled with "Update
    the server to retry and cancel pipelines."; a Guest or Reporter account sees
    its own refusal. The row menu's Open on GitLab opens the host's page.
-7. Open a GitHub repository: the module shows "Pipelines for GitHub are
-   coming." with **Open on GitHub** (the repository's Actions page).
+7. Open a GitHub repository with two workflows: the list shows one row per
+   workflow run ("CI #312"), its PR or branch, badges from the event
+   (scheduled, merge request, manual run, retried), and no stage strip.
+   **Workflow** narrows it to one workflow; a branch or state filter that
+   reaches 1,000 runs ends with "GitHub returns at most 1,000 filtered runs.".
+   While a run is running the list re-reads every 20 s, and not once every
+   shown run has finished. A repository without workflows says "This
+   repository has no workflows."; one whose Actions are off (or a token without
+   Actions read) gets the copy naming both causes. Open a matrix run: one
+   **Jobs** column, the run's artifacts below it (each opens the run's page on
+   GitHub), and, for a re-run run, the **Attempt** select; attempt 1 of a run
+   that failed then passed says "Failed". A cancelled run reads "Canceled", a
+   fork PR waiting for approval "Waiting for approval".
 8. Choose a row (anywhere but its buttons): the pipeline page opens in
    BiBCode, and the project header stays highlighted after reload. Hover a row
    first, then open it within 5 s: no second `pipelines.get` read. The header
@@ -2720,6 +2732,13 @@ running job, a manual job, an erased job and a job with artifacts.
    tags, artifacts with **Download** and **Browse**, commit, pipeline, and the
    stage's other jobs as links to their pages; on a narrow panel they sit
    under **Details**. The erased job and a job without output say so.
+8. On GitHub, open a running job: the log area says "GitHub shows live logs on
+   its site." with **Open on GitHub** and lists the job's steps, which update
+   about every 10 s while the window is visible; the server trace shows no
+   `actions/jobs/<id>/logs` read. When the job finishes, its log loads once,
+   its details list the steps and the run's artifacts, and choosing a step
+   scrolls to where its output starts. A log past GitHub's retention says
+   "This log has expired."
 
 ### Remote-hosted Git Manager run
 

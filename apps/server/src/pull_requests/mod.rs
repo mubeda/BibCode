@@ -2912,6 +2912,7 @@ mod tripwires {
             include_str!("github/detail_tests.rs"),
         ),
         ("github/timeline.rs", include_str!("github/timeline.rs")),
+        ("github/runs.rs", include_str!("github/runs.rs")),
         ("github/files.rs", include_str!("github/files.rs")),
         ("checkout.rs", include_str!("checkout.rs")),
         ("github/mod.rs", include_str!("github/mod.rs")),
