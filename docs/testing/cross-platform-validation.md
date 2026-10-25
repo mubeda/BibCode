@@ -2658,9 +2658,28 @@ tag, one merge request pipeline) and a GitHub repository.
    their reason, and one read follows the deadline.
 6. Retry and Cancel show only where they apply and are disabled with "Update
    the server to retry and cancel pipelines."; a Guest or Reporter account sees
-   its own refusal. Open on GitLab opens the host's page.
+   its own refusal. The row menu's Open on GitLab opens the host's page.
 7. Open a GitHub repository: the module shows "Pipelines for GitHub are
    coming." with **Open on GitHub** (the repository's Actions page).
+8. Choose a row (anywhere but its buttons): the pipeline page opens in
+   BiBCode, and the project header stays highlighted after reload. Hover a row
+   first, then open it within 5 s: no second `pipelines.get` read. The header
+   shows the status (try a passed-with-warnings and a waiting pipeline), the
+   title, "Pipeline #… created … by … · finished …", the short commit (opens
+   on GitLab), the ref (a merge request pipeline's ref opens its merge request
+   in BiBCode), the job count, duration and queued time. Compare the stages,
+   jobs and their order with GitLab's own page, on a wide panel (side by side,
+   scrolling sideways) and a narrow one (stacked); a parallel group expands, a
+   trigger job links to its downstream pipeline, an allowed failure shows a
+   warning, and each job opens on GitLab. Reopen the page: the last copy
+   paints before any `glab` spawn.
+9. With a pipeline running, its page must follow GitLab within about 10 s;
+   one window on its list and one on the pipeline must produce one poller's
+   reads; the page stops reading once the pipeline finishes. With a Guest
+   account (jobs hidden) the header stays and the page says the jobs are
+   hidden. A pipeline id the account cannot read says "You can't view this
+   pipeline." and one that does not exist "This pipeline no longer exists.",
+   neither signing out; `/pipelines/abc` returns to the list.
 
 ### Pipelines job page validation
 

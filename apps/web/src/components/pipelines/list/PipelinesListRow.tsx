@@ -4,7 +4,9 @@ import type {
   PipelinesRef,
   PipelinesRow,
   PullRequestsProviderKind,
+  ScopedProjectRef,
 } from "@bibcode/contracts";
+import { Link } from "@tanstack/react-router";
 import {
   CircleStopIcon,
   EllipsisIcon,
@@ -17,7 +19,6 @@ import { memo } from "react";
 import { useOpenPrLink } from "../../../lib/openPullRequestLink";
 import { formatRelativeTimeLabel } from "../../../timestampFormat";
 import { PullRequestsActor } from "../../pullRequests/shared/PullRequestsActor";
-import { RepositoryModuleExternalLink } from "../../repositoryModule/RepositoryModuleExternalLink";
 import { Badge } from "../../ui/badge";
 import { Button } from "../../ui/button";
 import { Menu, MenuItem, MenuPopup, MenuTrigger } from "../../ui/menu";
@@ -83,17 +84,20 @@ export interface PipelinesListRowProps {
   readonly row: PipelinesRow;
   readonly provider: PullRequestsProviderKind;
   readonly scope: { readonly environmentId: EnvironmentId; readonly cwd: string };
+  readonly projectRef: ScopedProjectRef;
   readonly mutationsDisabledReason: string | null;
 }
 
 /**
  * One pipeline. Wide panels show GitLab's columns (status, pipeline, creator, stages,
- * actions); narrow ones fold status and creator into the two text lines.
+ * actions); narrow ones fold status and creator into the two text lines. The whole
+ * row opens the pipeline page; its actions stay separate tab stops above that link.
  */
 export const PipelinesListRow = memo(function PipelinesListRow({
   row,
   provider,
   scope,
+  projectRef,
   mutationsDisabledReason,
 }: PipelinesListRowProps) {
   const hoverPrefetch = usePipelineHoverPrefetch({
@@ -117,7 +121,7 @@ export const PipelinesListRow = memo(function PipelinesListRow({
       role="listitem"
       aria-label={`${row.label} ${status}`}
       data-text-surface="background"
-      className="flex min-w-0 items-center gap-3 border-b border-border px-4"
+      className="relative flex min-w-0 items-center gap-3 border-b border-border px-4 hover:bg-accent/40"
       style={{ height: PIPELINES_ROW_HEIGHT }}
       {...hoverPrefetch}
     >
@@ -137,16 +141,15 @@ export const PipelinesListRow = memo(function PipelinesListRow({
       </div>
       <div className="min-w-0 flex-1 space-y-0.5">
         <p className="truncate text-sm font-medium">
-          {row.url ? (
-            <RepositoryModuleExternalLink
-              href={row.url}
-              className="no-underline hover:underline focus-visible:outline-2 focus-visible:outline-ring"
-            >
-              {title}
-            </RepositoryModuleExternalLink>
-          ) : (
-            title
-          )}
+          {/* The title's hit area covers the row, so the whole row opens the pipeline. */}
+          <Link
+            to="/project/$environmentId/$projectId/pipelines/$pipelineId"
+            params={{ ...projectRef, pipelineId: String(row.id) }}
+            title={title}
+            className="underline-offset-2 after:absolute after:inset-0 hover:underline focus-visible:outline-2 focus-visible:outline-ring"
+          >
+            {title}
+          </Link>
         </p>
         <div className="flex min-w-0 items-center gap-2 overflow-hidden whitespace-nowrap text-xs text-muted-foreground">
           <span className="shrink-0 font-medium text-foreground tabular-nums">{row.label}</span>
@@ -170,7 +173,7 @@ export const PipelinesListRow = memo(function PipelinesListRow({
       <div className="w-16 shrink-0 @min-[720px]:w-40">
         {row.stages && row.stages.length > 0 ? <StageStrip stages={row.stages} /> : null}
       </div>
-      <div className="flex shrink-0 items-center gap-1">
+      <div className="relative z-10 flex shrink-0 items-center gap-1">
         {actions.retry ? (
           <PermissionButton
             variant="ghost"

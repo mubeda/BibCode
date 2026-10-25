@@ -25,6 +25,7 @@ const h = vi.hoisted(() => ({
   list: vi.fn((args: unknown) => ({ kind: "pipelinesList", args })),
   navigate: vi.fn(),
   listProps: null as Record<string, unknown> | null,
+  detailProps: null as Record<string, unknown> | null,
   freshPageKey: null as string | null,
 }));
 vi.mock("../../state/entities", () => ({
@@ -74,6 +75,13 @@ vi.mock("./list/PipelinesListView", async () => {
   };
 });
 
+vi.mock("./detail/PipelinesDetailView", () => ({
+  PipelinesDetailView: (props: Record<string, unknown>) => {
+    h.detailProps = props;
+    return <div>Pipeline detail</div>;
+  },
+}));
+
 import { PipelinesPanel } from "./PipelinesPanel";
 
 const ref = { environmentId: "env", projectId: "project" } as ScopedProjectRef;
@@ -111,6 +119,7 @@ beforeEach(() => {
   h.list.mockClear();
   h.navigate.mockClear();
   h.listProps = null;
+  h.detailProps = null;
   h.freshPageKey = null;
 });
 afterEach(async () => {
@@ -199,5 +208,29 @@ describe("PipelinesPanel", () => {
     // The sidebar button opens without search: the remembered filters apply.
     await render();
     expect(h.listProps?.filters).toEqual({ ...DEFAULT_PIPELINES_FILTERS, scope: "finished" });
+  });
+
+  it("shows one pipeline on its route, without reading the list's first page", async () => {
+    usePipelinesStore
+      .getState()
+      .setFilters(ref, { ...DEFAULT_PIPELINES_FILTERS, scope: "running" });
+    h.context = null;
+    h.pending = true;
+    await act(async () =>
+      root.render(<PipelinesPanel projectRef={ref} pipelineId={4821} attempt={null} />),
+    );
+    expect(h.list).not.toHaveBeenCalled();
+    h.pending = false;
+    h.context = gitlabContext;
+    await act(async () =>
+      root.render(<PipelinesPanel projectRef={ref} pipelineId={4821} attempt={2} />),
+    );
+    expect(h.listProps).toBeNull();
+    expect(h.detailProps).toMatchObject({ pipelineId: 4821, attempt: 2 });
+    expect(container.textContent).toContain("Refresh");
+    // The pipeline's header links to its own host page; the module header does not repeat it.
+    expect(container.textContent).not.toContain("Open on GitLab");
+    // A pipeline route leaves the remembered list filters alone.
+    expect(usePipelinesStore.getState().selectViewState(ref).filters.scope).toBe("running");
   });
 });
