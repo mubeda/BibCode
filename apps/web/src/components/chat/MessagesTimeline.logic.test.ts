@@ -1,10 +1,14 @@
 import { ProviderDriverKind } from "@bibcode/contracts";
 import { describe, expect, it } from "vite-plus/test";
 import {
+  applyTimelineDisclosureChange,
   computeStableMessagesTimelineRows,
   computeMessageDurationStart,
   deriveMessagesTimelineRows,
+  detailsOpenForScope,
+  EMPTY_TIMELINE_DISCLOSURES,
   isWorkEntryInUnsettledTurn,
+  locateTimelineEntry,
   normalizeCompactToolLabel,
   resolveAssistantMessageCopyState,
   resolveTimelineIsAtEnd,
@@ -1452,6 +1456,290 @@ describe("verbose chat rows", () => {
   });
 });
 
+describe("locateTimelineEntry", () => {
+  const at = (second: number) => `2026-01-01T00:00:${String(second).padStart(2, "0")}Z`;
+  const user = (id: string, second: number) => ({
+    id: `${id}-entry`,
+    kind: "message" as const,
+    createdAt: at(second),
+    message: {
+      id: id as never,
+      role: "user" as const,
+      text: "Build it",
+      turnId: null,
+      createdAt: at(second),
+      updatedAt: at(second),
+      streaming: false,
+    },
+  });
+  const assistant = (id: string, text: string, second: number, turnId = "turn-1") => ({
+    id: `${id}-entry`,
+    kind: "message" as const,
+    createdAt: at(second),
+    message: {
+      id: id as never,
+      role: "assistant" as const,
+      text,
+      turnId: turnId as never,
+      createdAt: at(second),
+      updatedAt: at(second),
+      streaming: false,
+    },
+  });
+  const work = (
+    id: string,
+    second: number,
+    options: { turnId?: string | null; inProgress?: boolean } = {},
+  ) => ({
+    id: `${id}-entry`,
+    kind: "work" as const,
+    createdAt: at(second),
+    entry: {
+      id,
+      createdAt: at(second),
+      turnId: (options.turnId === undefined ? "turn-1" : options.turnId) as never,
+      label: `Run ${id}`,
+      command: `echo ${id}`,
+      tone: "tool" as const,
+      ...(options.inProgress ? { toolLifecycleStatus: "inProgress" as const } : {}),
+    },
+  });
+  const base = {
+    isWorking: false,
+    activeTurnStartedAt: null,
+    turnDiffSummaryByAssistantMessageId: new Map(),
+    revertTurnCountByUserMessageId: new Map(),
+  };
+  // A settled turn: commentary, a run of three tool calls, then the answer.
+  const turnEntries = [
+    user("user", 0),
+    assistant("commentary", "Looking around first.", 1),
+    work("work-1", 2),
+    work("work-2", 3),
+    work("work-3", 4),
+    assistant("answer", "Done", 5),
+  ];
+
+  it("reports an entry the timeline cannot show as absent", () => {
+    expect(locateTimelineEntry("missing-entry", { ...base, timelineEntries: turnEntries })).toEqual(
+      { kind: "absent" },
+    );
+    const neutral = [work("busy", 1, { turnId: null, inProgress: true })];
+    expect(locateTimelineEntry("busy-entry", { ...base, timelineEntries: neutral })).toEqual({
+      kind: "absent",
+    });
+  });
+
+  it("opens nothing for an entry that is already visible", () => {
+    expect(locateTimelineEntry("answer-entry", { ...base, timelineEntries: turnEntries })).toEqual({
+      kind: "found",
+      rowId: "answer-entry",
+    });
+  });
+
+  it("opens the fold and the group that unfolding creates, and names the final row", () => {
+    // Folded, the turn shows no work rows at all: its group exists only once the fold opens.
+    const folded = deriveMessagesTimelineRows({ ...base, timelineEntries: turnEntries });
+    expect(folded.some((row) => row.kind === "work-toggle")).toBe(false);
+
+    const location = locateTimelineEntry("work-1-entry", { ...base, timelineEntries: turnEntries });
+    expect(location).toEqual({
+      kind: "found",
+      rowId: "work-1",
+      openTurnId: "turn-1",
+      openGroupId: "work-group:work-1-entry",
+    });
+
+    // Opening what the plan names produces that row.
+    const opened = deriveMessagesTimelineRows({
+      ...base,
+      timelineEntries: turnEntries,
+      turnFoldChoices: new Map([["turn-1" as never, true]]),
+      workGroupChoices: new Map([["work-group:work-1-entry", true]]),
+    });
+    expect(opened.some((row) => row.id === "work-1")).toBe(true);
+    // The group's newest entry needs only the fold.
+    expect(locateTimelineEntry("work-3-entry", { ...base, timelineEntries: turnEntries })).toEqual({
+      kind: "found",
+      rowId: "work-3",
+      openTurnId: "turn-1",
+    });
+  });
+
+  it("names a group by the run it starts once an earlier turn's fold breaks it", () => {
+    // The unturned tool call stays a row of its own; turn-1 starts a new run when it opens.
+    const entries = [
+      user("user-0", 0),
+      work("solo", 1, { turnId: null }),
+      user("user-1", 2),
+      assistant("commentary", "Checking.", 3),
+      work("work-a", 4),
+      work("work-b", 5),
+      assistant("answer", "Done", 6),
+    ];
+    expect(locateTimelineEntry("work-a-entry", { ...base, timelineEntries: entries })).toEqual({
+      kind: "found",
+      rowId: "work-a",
+      openTurnId: "turn-1",
+      openGroupId: "work-group:work-a-entry",
+    });
+  });
+
+  it("returns the group's row when a small group starts with a neutral entry", () => {
+    const entries = [
+      work("busy", 1, { turnId: null, inProgress: true }),
+      work("done", 2, { turnId: null }),
+    ];
+    const rows = deriveMessagesTimelineRows({ ...base, timelineEntries: entries });
+    expect(rows.map((row) => row.id)).toEqual(["busy-entry"]);
+    expect(locateTimelineEntry("done-entry", { ...base, timelineEntries: entries })).toEqual({
+      kind: "found",
+      rowId: "busy-entry",
+    });
+  });
+
+  it("opens nothing when Verbose chat already keeps turns and groups open", () => {
+    expect(
+      locateTimelineEntry("work-1-entry", {
+        ...base,
+        timelineEntries: turnEntries,
+        verboseChat: true,
+      }),
+    ).toEqual({ kind: "found", rowId: "work-1" });
+  });
+
+  it("finds a queued message by its row", () => {
+    const queued = { ...user("queued", 9).message, id: "queued" as never };
+    const input = {
+      ...base,
+      timelineEntries: turnEntries,
+      queuedMessages: [queued],
+      queuedStatuses: [{ _tag: "Queued" } as never],
+    };
+    expect(locateTimelineEntry("queued-message:queued", input)).toEqual({
+      kind: "found",
+      rowId: "queued-message:queued",
+    });
+    expect(locateTimelineEntry("queued-message:other", input)).toEqual({ kind: "absent" });
+  });
+});
+
+describe("entry disclosure rows", () => {
+  const at = (second: number) => `2026-01-01T00:00:0${second}Z`;
+  const message = (id: string, role: "user" | "assistant", second: number) => ({
+    id: `${id}-entry`,
+    kind: "message" as const,
+    createdAt: at(second),
+    message: {
+      id: id as never,
+      role,
+      text: `${role} text`,
+      turnId: null,
+      createdAt: at(second),
+      updatedAt: at(second),
+      streaming: false,
+    },
+  });
+  const tool = {
+    id: "tool-entry",
+    kind: "work" as const,
+    createdAt: at(2),
+    entry: {
+      id: "tool",
+      createdAt: at(2),
+      turnId: null,
+      label: "Run tool",
+      command: "echo tool",
+      tone: "tool" as const,
+    },
+  };
+  const entries = [message("user", "user", 0), message("answer", "assistant", 1), tool];
+  const derive = (input: Partial<Parameters<typeof deriveMessagesTimelineRows>[0]> = {}) =>
+    deriveMessagesTimelineRows({
+      timelineEntries: entries,
+      isWorking: false,
+      activeTurnStartedAt: null,
+      turnDiffSummaryByAssistantMessageId: new Map(),
+      revertTurnCountByUserMessageId: new Map(),
+      ...input,
+    });
+  const workRow = (rows: MessagesTimelineRow[]) => rows.find((row) => row.kind === "work");
+
+  it("opens a tool row by its own choice, or by Verbose chat until it has one", () => {
+    expect(workRow(derive())).toMatchObject({ expanded: false });
+    expect(workRow(derive({ verboseChat: true }))).toMatchObject({ expanded: true });
+    const closed = new Map([["tool", new Map([["tool", false]])]]);
+    expect(workRow(derive({ verboseChat: true, entryDisclosures: closed }))).toMatchObject({
+      expanded: false,
+    });
+    const opened = new Map([["tool", new Map([["tool", true]])]]);
+    expect(workRow(derive({ entryDisclosures: opened }))).toMatchObject({ expanded: true });
+  });
+
+  it("hands each row its own disclosure and keeps rows whose disclosure did not change", () => {
+    const userDisclosure = new Map([["body", true]]);
+    const first = derive({ entryDisclosures: new Map([["user-entry", userDisclosure]]) });
+    expect(first.find((row) => row.id === "user-entry")).toMatchObject({
+      disclosure: userDisclosure,
+    });
+
+    const stable = computeStableMessagesTimelineRows(first, { byId: new Map(), result: [] });
+    const answerDisclosure = new Map([["details:md:0:0", true]]);
+    const next = computeStableMessagesTimelineRows(
+      derive({
+        entryDisclosures: new Map([
+          ["user-entry", userDisclosure],
+          ["answer-entry", answerDisclosure],
+        ]),
+      }),
+      stable,
+    );
+
+    expect(next.result[0]).toBe(stable.result[0]);
+    expect(next.result[1]).not.toBe(stable.result[1]);
+    expect(next.result[1]).toMatchObject({ disclosure: answerDisclosure });
+  });
+});
+
+describe("timeline disclosure owner", () => {
+  it("applies a change and keeps every map it does not touch", () => {
+    const opened = applyTimelineDisclosureChange(EMPTY_TIMELINE_DISCLOSURES, {
+      turns: [["turn-1" as never, true]],
+      entries: [
+        ["entry-a", "body", true],
+        ["entry-b", "details:md:0:2", true],
+      ],
+    });
+    expect(opened.turns.get("turn-1" as never)).toBe(true);
+    expect(opened.groups).toBe(EMPTY_TIMELINE_DISCLOSURES.groups);
+    expect(opened.entries.get("entry-a")?.get("body")).toBe(true);
+
+    const next = applyTimelineDisclosureChange(opened, {
+      entries: [["entry-b", "details:md:0:2", false]],
+    });
+    expect(next.turns).toBe(opened.turns);
+    // Only the entry that changed gets a new disclosure, so only its row re-renders.
+    expect(next.entries.get("entry-a")).toBe(opened.entries.get("entry-a"));
+    expect(next.entries.get("entry-b")).not.toBe(opened.entries.get("entry-b"));
+    // A change that changes nothing returns the same state.
+    expect(applyTimelineDisclosureChange(next, { turns: [["turn-1" as never, true]] })).toBe(next);
+  });
+
+  it("reads one Markdown part's details choices by ordinal, the same map each time", () => {
+    const disclosure = new Map([
+      ["details:md:0:1", true],
+      ["details:md:1:0", false],
+      ["body", true],
+    ]);
+    const forPart = detailsOpenForScope(disclosure, "md:0");
+    expect([...forPart]).toEqual([[1, true]]);
+    expect(detailsOpenForScope(disclosure, "md:0")).toBe(forPart);
+    expect([...detailsOpenForScope(disclosure, "md:1")]).toEqual([[0, false]]);
+    expect(detailsOpenForScope(undefined, "md:0").size).toBe(0);
+    expect(detailsOpenForScope(undefined, "md:0")).toBe(detailsOpenForScope(new Map(), "md:0"));
+  });
+});
+
 describe("settled turn answer visibility", () => {
   const turnId = "turn-1" as never;
   const at = (seconds: number) => new Date(Date.UTC(2026, 0, 1, 0, 0, seconds)).toISOString();
@@ -1705,6 +1993,7 @@ describe("computeStableMessagesTimelineRows", () => {
       id: "plan",
       createdAt: "2026-01-01T00:00:00Z",
       proposedPlan: plan,
+      disclosure: undefined,
     };
     const initial = computeStableMessagesTimelineRows([working, proposed], {
       byId: new Map(),
@@ -1757,6 +2046,7 @@ describe("computeStableMessagesTimelineRows", () => {
       id: "fold",
       createdAt: "2026-01-01T00:00:00Z",
       turnId: "turn" as never,
+      anchorEntryId: "entry",
       label: "Worked for 1s",
       expanded: false,
     };
@@ -1774,6 +2064,9 @@ describe("computeStableMessagesTimelineRows", () => {
     expect(computeStableMessagesTimelineRows([{ ...fold, expanded: true }], initial)).not.toBe(
       initial,
     );
+    expect(
+      computeStableMessagesTimelineRows([{ ...fold, anchorEntryId: "other" }], initial),
+    ).not.toBe(initial);
   });
 
   it("returns the previous result when row order and content are unchanged", () => {

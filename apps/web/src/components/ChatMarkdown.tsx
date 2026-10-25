@@ -38,12 +38,17 @@ import React, {
 } from "react";
 import type { Components } from "react-markdown";
 import ReactMarkdown from "react-markdown";
-import { defaultUrlTransform } from "react-markdown";
-import rehypeRaw from "rehype-raw";
-import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
-import remarkBreaks from "remark-breaks";
-import remarkGfm from "remark-gfm";
 import { renderSkillInlineMarkdownChildren } from "./chat/SkillInlineText";
+import {
+  buildMarkdownFileLinks,
+  CHAT_MARKDOWN_REHYPE_PLUGINS,
+  chatMarkdownRemarkPlugins,
+  chatMarkdownUrlTransform,
+  classifyChatMarkdownLink,
+  markdownFileLinkLabel,
+  readDetailsOrdinal,
+  type MarkdownFileLinks,
+} from "./chatMarkdownPipeline";
 import { CHAT_FILE_TAG_CHIP_CLASS_NAME, FileTagChipContent } from "./chat/FileTagChip";
 import { HighlightedCodeLines } from "./chat/HighlightedCodeLines";
 import { PierreEntryIcon } from "./chat/PierreEntryIcon";
@@ -67,11 +72,6 @@ import {
   serializeTableElementToCsv,
   serializeTableElementToMarkdown,
 } from "../markdown-clipboard";
-import {
-  normalizeMarkdownLinkDestination,
-  resolveMarkdownFileLinkMeta,
-  rewriteMarkdownFileUriHref,
-} from "../markdown-links";
 import { readLocalApi } from "../localApi";
 import { cn } from "../lib/utils";
 import { useRightPanelStore } from "../rightPanelStore";
@@ -122,6 +122,15 @@ interface ChatMarkdownProps {
   className?: string;
   /** Treat single newlines as hard breaks — chat-style user input. */
   lineBreaks?: boolean;
+  /**
+   * The open state of each `<details>` block, by its ordinal in the document, when the caller
+   * owns it. A block with no entry follows its `open` attribute. Without both this and
+   * `onDetailsOpenChange`, each block keeps its own state.
+   */
+  detailsOpen?: ReadonlyMap<number, boolean> | undefined;
+  onDetailsOpenChange?: ((ordinal: number, open: boolean) => void) | undefined;
+  /** Marks the rendered text as one Find in thread scope, named by this value. */
+  findScope?: string | undefined;
 }
 
 const EMPTY_MARKDOWN_SKILLS: ReadonlyArray<Pick<ServerProviderSkill, "name" | "displayName">> = [];
@@ -169,19 +178,6 @@ export function findTaskListMarkerOffset(markdown: string, listItemStart: number
   if (!match?.[1]) return null;
   return listItemStart + firstLine.indexOf(match[1]);
 }
-export const CHAT_MARKDOWN_SANITIZE_SCHEMA = {
-  ...defaultSchema,
-  attributes: {
-    ...defaultSchema.attributes,
-    "*": (defaultSchema.attributes?.["*"] ?? []).filter((attribute) => attribute !== "title"),
-    code: [...(defaultSchema.attributes?.code ?? []), "dataCodeMeta"],
-  },
-  protocols: {
-    ...defaultSchema.protocols,
-    href: [...(defaultSchema.protocols?.href ?? []), "file"],
-  },
-} satisfies Parameters<typeof rehypeSanitize>[0];
-
 function extractFenceLanguage(className: string | undefined): string {
   const match = className?.match(CODE_FENCE_LANGUAGE_REGEX);
   const raw = match?.[1] ?? "text";
@@ -217,34 +213,6 @@ function extractPreCodeMeta(node: unknown): string | undefined {
   const codeNode = children?.find((child) => child?.type === "element" && child.tagName === "code");
   const meta = codeNode?.properties?.dataCodeMeta ?? codeNode?.data?.meta;
   return typeof meta === "string" && meta.trim().length > 0 ? meta.trim() : undefined;
-}
-
-type MarkdownAstNode = {
-  type?: string;
-  meta?: unknown;
-  data?: {
-    hProperties?: Record<string, unknown>;
-  };
-  children?: MarkdownAstNode[];
-};
-
-function remarkPreserveCodeMeta() {
-  return (tree: MarkdownAstNode) => {
-    const visit = (node: MarkdownAstNode) => {
-      if (node.type === "code" && typeof node.meta === "string" && node.meta.trim().length > 0) {
-        node.data = {
-          ...node.data,
-          hProperties: {
-            ...node.data?.hProperties,
-            dataCodeMeta: node.meta.trim(),
-          },
-        };
-      }
-      node.children?.forEach(visit);
-    };
-
-    visit(tree);
-  };
 }
 
 export function nodeToPlainText(node: ReactNode): string {
@@ -400,7 +368,7 @@ function MarkdownTable({ children, ...props }: React.ComponentProps<"table">) {
           {children}
         </table>
       </ScrollArea>
-      <div className="chat-markdown-table-footer select-none">
+      <div className="chat-markdown-table-footer select-none" data-find-ignore="">
         <Tooltip>
           <TooltipTrigger
             render={
@@ -453,23 +421,33 @@ function MarkdownTable({ children, ...props }: React.ComponentProps<"table">) {
 function MarkdownDetails({
   children,
   open = false,
-}: Pick<React.ComponentProps<"details">, "children" | "open">) {
-  const [isOpen, setIsOpen] = useState(open);
+  ordinal,
+}: Pick<React.ComponentProps<"details">, "children" | "open"> & { ordinal: number | null }) {
+  const [localOpen, setLocalOpen] = useState(open);
+  const disclosure = use(ChatMarkdownDetailsContext);
+  const controlled = disclosure !== null && ordinal !== null;
+  const isOpen = controlled ? (disclosure.open.get(ordinal) ?? open) : localOpen;
   const childNodes = Children.toArray(children);
   const summaryIndex = childNodes.findIndex(
     (child) => isValidElement(child) && child.type === "summary",
   );
   const summaryNode = summaryIndex >= 0 ? childNodes[summaryIndex] : null;
-  const summary =
+  const summaryContent =
     isValidElement<{ children?: ReactNode }>(summaryNode) && summaryNode.props.children
       ? summaryNode.props.children
-      : "Details";
+      : null;
   const content = childNodes.filter((_, index) => index !== summaryIndex);
 
   return (
     <Collapsible
-      defaultOpen={open}
-      onOpenChange={setIsOpen}
+      open={isOpen}
+      onOpenChange={(nextOpen) => {
+        if (controlled) {
+          disclosure.onOpenChange(ordinal, nextOpen);
+        } else {
+          setLocalOpen(nextOpen);
+        }
+      }}
       className="chat-markdown-details my-2 border-y border-border/60"
       data-markdown-details=""
       data-markdown-details-open={isOpen ? "true" : "false"}
@@ -482,10 +460,14 @@ function MarkdownDetails({
           className="size-4 shrink-0 text-muted-foreground transition-transform"
           aria-hidden
         />
-        <span>{summary}</span>
+        {summaryContent ? <span>{summaryContent}</span> : <span data-find-ignore="">Details</span>}
       </CollapsibleTrigger>
       <CollapsiblePanel>
-        <div className="pb-3 ps-6 text-foreground/80" data-markdown-details-content="">
+        <div
+          className="pb-3 ps-6 text-foreground/80"
+          // Find in thread reads the ordinal to tell which block a match is in.
+          data-markdown-details-content={ordinal ?? ""}
+        >
           {content}
         </div>
       </CollapsiblePanel>
@@ -597,7 +579,7 @@ function MarkdownCodeBlock({
       data-language={language}
       data-wrap={wrapped ? "true" : "false"}
     >
-      <div className="chat-markdown-codeblock-header select-none">
+      <div className="chat-markdown-codeblock-header select-none" data-find-ignore="">
         <span className="chat-markdown-codeblock-title">
           <MarkdownCodeBlockTitleContent
             fenceTitle={fenceTitle}
@@ -891,99 +873,10 @@ interface MarkdownFileLinkProps {
   className?: string | undefined;
 }
 
-const MARKDOWN_LINK_HREF_PATTERN = /\[[^\]]*]\(([^)\s]+)(?:\s+["'][^"']*["'])?\)/g;
 const MARKDOWN_FILE_LINK_CLASS_NAME =
   "chat-markdown-file-link cursor-pointer transition-colors hover:bg-accent/70";
 
-function pathParentSegments(path: string): string[] {
-  const normalized = path.replaceAll("\\", "/");
-  const segments = normalized.split("/").filter((segment) => segment.length > 0);
-  return segments.slice(0, -1);
-}
-
-export function buildFileLinkParentSuffixByPath(
-  filePaths: ReadonlyArray<string>,
-): Map<string, string> {
-  const groups = new Map<string, Set<string>>();
-  for (const filePath of filePaths) {
-    const pathSegments = filePath
-      .replaceAll("\\", "/")
-      .split("/")
-      .filter((segment) => segment.length > 0);
-    const basename = pathSegments[pathSegments.length - 1];
-    if (!basename) continue;
-    const group = groups.get(basename) ?? new Set<string>();
-    group.add(filePath);
-    groups.set(basename, group);
-  }
-
-  const suffixByPath = new Map<string, string>();
-  for (const group of groups.values()) {
-    const uniquePaths = [...group];
-    if (uniquePaths.length < 2) continue;
-
-    const parentSegmentsByPath = new Map(
-      uniquePaths.map((filePath) => [filePath, pathParentSegments(filePath)]),
-    );
-    const minUniqueDepthByPath = new Map<string, number>();
-
-    for (const filePath of uniquePaths) {
-      const segments = parentSegmentsByPath.get(filePath) ?? [];
-      let resolvedDepth = segments.length;
-      for (let depth = 1; depth <= segments.length; depth += 1) {
-        const candidate = segments.slice(-depth).join("/");
-        const collision = uniquePaths.some((otherPath) => {
-          if (otherPath === filePath) return false;
-          const otherSegments = parentSegmentsByPath.get(otherPath) ?? [];
-          return otherSegments.slice(-depth).join("/") === candidate;
-        });
-        if (!collision) {
-          resolvedDepth = depth;
-          break;
-        }
-      }
-      minUniqueDepthByPath.set(filePath, resolvedDepth);
-    }
-
-    for (const filePath of uniquePaths) {
-      const segments = parentSegmentsByPath.get(filePath) ?? [];
-      if (segments.length === 0) continue;
-      const minUniqueDepth = minUniqueDepthByPath.get(filePath) ?? 1;
-      const suffixDepth = Math.min(segments.length, Math.max(minUniqueDepth, 2));
-      suffixByPath.set(filePath, segments.slice(-suffixDepth).join("/"));
-    }
-  }
-
-  return suffixByPath;
-}
-
-export function extractMarkdownLinkHrefs(text: string): string[] {
-  const hrefs: string[] = [];
-  for (const match of text.matchAll(MARKDOWN_LINK_HREF_PATTERN)) {
-    const href = match[1]?.trim();
-    if (!href) continue;
-    hrefs.push(href);
-  }
-  return hrefs;
-}
-
-function normalizeMarkdownLinkHrefKey(href: string): string {
-  const normalizedHref = normalizeMarkdownLinkDestination(href);
-  return rewriteMarkdownFileUriHref(normalizedHref) ?? normalizedHref;
-}
-
 const MARKDOWN_LINK_FAVICON_CLASS_NAME = "block size-full shrink-0 select-none";
-
-export function resolveExternalLinkHost(href: string | undefined): string | null {
-  if (!href) return null;
-  try {
-    const url = new URL(href);
-    if (url.protocol !== "http:" && url.protocol !== "https:") return null;
-    return url.hostname || null;
-  } catch {
-    return null;
-  }
-}
 
 export function isHttpUrl(href: string | undefined): href is string {
   return typeof href === "string" && /^https?:\/\//i.test(href);
@@ -991,7 +884,7 @@ export function isHttpUrl(href: string | undefined): href is string {
 
 const MarkdownLinkFavicon = memo(function MarkdownLinkFavicon() {
   return (
-    <span className="chat-markdown-link-favicon" aria-hidden>
+    <span className="chat-markdown-link-favicon" aria-hidden data-find-ignore="">
       <GlobeIcon className={MARKDOWN_LINK_FAVICON_CLASS_NAME} />
     </span>
   );
@@ -1010,26 +903,6 @@ function breakableExternalLinkText(text: string): ReactNode[] {
       <wbr />
     </React.Fragment>
   ));
-}
-
-function plainHastText(node: unknown): string | null {
-  if (!node || typeof node !== "object" || !("children" in node) || !Array.isArray(node.children)) {
-    return null;
-  }
-  const parts = node.children.map((child) => {
-    if (
-      child &&
-      typeof child === "object" &&
-      "type" in child &&
-      child.type === "text" &&
-      "value" in child &&
-      typeof child.value === "string"
-    ) {
-      return child.value;
-    }
-    return null;
-  });
-  return parts.every((part) => part !== null) ? parts.join("") : null;
 }
 
 const SANITIZED_FRAGMENT_PREFIX = "user-content-";
@@ -1382,8 +1255,6 @@ function areMarkdownFileLinkPropsEqual(
   );
 }
 
-type MarkdownFileLinkMeta = NonNullable<ReturnType<typeof resolveMarkdownFileLinkMeta>>;
-
 /**
  * The values that change with every streamed delta. The markdown components read them here
  * instead of closing over them, so the components keep their identity while a reply streams:
@@ -1393,16 +1264,26 @@ type MarkdownFileLinkMeta = NonNullable<ReturnType<typeof resolveMarkdownFileLin
 interface ChatMarkdownDocument {
   readonly text: string;
   readonly isStreaming: boolean;
-  readonly fileLinkMetaByHref: ReadonlyMap<string, MarkdownFileLinkMeta>;
-  readonly fileLinkParentSuffixByPath: ReadonlyMap<string, string>;
+  readonly fileLinks: MarkdownFileLinks;
 }
 
 const ChatMarkdownDocumentContext = createContext<ChatMarkdownDocument>({
   text: "",
   isStreaming: false,
-  fileLinkMetaByHref: new Map(),
-  fileLinkParentSuffixByPath: new Map(),
+  fileLinks: { metaByHref: new Map(), parentSuffixByPath: new Map() },
 });
+
+/**
+ * The owner of the `<details>` blocks' open state, when the caller keeps it (the chat timeline,
+ * so a find reveal and the reader's own toggle write the same state). Read from a context for
+ * the reason given on `ChatMarkdownDocumentContext`.
+ */
+interface ChatMarkdownDetailsDisclosure {
+  readonly open: ReadonlyMap<number, boolean>;
+  readonly onOpenChange: (ordinal: number, open: boolean) => void;
+}
+
+const ChatMarkdownDetailsContext = createContext<ChatMarkdownDetailsDisclosure | null>(null);
 
 function ChatMarkdown({
   text,
@@ -1413,6 +1294,9 @@ function ChatMarkdown({
   skills = EMPTY_MARKDOWN_SKILLS,
   className,
   lineBreaks = false,
+  detailsOpen,
+  onDetailsOpenChange,
+  findScope,
 }: ChatMarkdownProps) {
   const { resolvedTheme } = useTheme();
   const createAssetUrl = useAtomQueryRunner(assetEnvironment.createUrl, {
@@ -1429,30 +1313,17 @@ function ChatMarkdown({
     serverConfig?.availableEditors ?? NO_AVAILABLE_EDITORS,
   );
   const diffThemeName = resolveDiffThemeName(resolvedTheme);
-  const markdownFileLinkMetaByHref = useMemo(() => {
-    const metaByHref = new Map<string, MarkdownFileLinkMeta>();
-    for (const href of extractMarkdownLinkHrefs(text)) {
-      const normalizedHref = normalizeMarkdownLinkHrefKey(href);
-      if (metaByHref.has(normalizedHref)) continue;
-      const meta = resolveMarkdownFileLinkMeta(normalizedHref, cwd);
-      if (meta) {
-        metaByHref.set(normalizedHref, meta);
-      }
-    }
-    return metaByHref;
-  }, [cwd, text]);
-  const fileLinkParentSuffixByPath = useMemo(() => {
-    const filePaths = [...markdownFileLinkMetaByHref.values()].map((meta) => meta.filePath);
-    return buildFileLinkParentSuffixByPath(filePaths);
-  }, [markdownFileLinkMetaByHref]);
+  const fileLinks = useMemo(() => buildMarkdownFileLinks(text, cwd), [cwd, text]);
   const markdownDocument = useMemo<ChatMarkdownDocument>(
-    () => ({
-      text,
-      isStreaming,
-      fileLinkMetaByHref: markdownFileLinkMetaByHref,
-      fileLinkParentSuffixByPath,
-    }),
-    [fileLinkParentSuffixByPath, isStreaming, markdownFileLinkMetaByHref, text],
+    () => ({ text, isStreaming, fileLinks }),
+    [fileLinks, isStreaming, text],
+  );
+  const detailsDisclosure = useMemo<ChatMarkdownDetailsDisclosure | null>(
+    () =>
+      detailsOpen && onDetailsOpenChange
+        ? { open: detailsOpen, onOpenChange: onDetailsOpenChange }
+        : null,
+    [detailsOpen, onDetailsOpenChange],
   );
   // While a reply streams, reparse only the text after its last completed code block. A
   // finished reply takes one full parse.
@@ -1460,9 +1331,6 @@ function ChatMarkdown({
     () => (isStreaming ? createIncrementalMarkdownPlugin() : null),
     [isStreaming],
   );
-  const markdownUrlTransform = useCallback((href: string) => {
-    return rewriteMarkdownFileUriHref(href) ?? defaultUrlTransform(href);
-  }, []);
   // Re-emit highlighted content as markdown so copying out of the rendered
   // view keeps links, emphasis, lists, and code fences intact.
   const handleCopy = useCallback((event: ReactClipboardEvent<HTMLDivElement>) => {
@@ -1543,11 +1411,10 @@ function ChatMarkdown({
         );
       },
       a({ node, href, children, ...props }) {
-        const { fileLinkMetaByHref, fileLinkParentSuffixByPath } = use(ChatMarkdownDocumentContext);
-        const normalizedHref = href ? normalizeMarkdownLinkHrefKey(href) : "";
-        const fileLinkMeta = normalizedHref ? fileLinkMetaByHref.get(normalizedHref) : null;
-        if (!fileLinkMeta) {
-          const faviconHost = resolveExternalLinkHost(href);
+        const { fileLinks } = use(ChatMarkdownDocumentContext);
+        const link = classifyChatMarkdownLink(href, node, fileLinks.metaByHref);
+        if (link.kind !== "file") {
+          const faviconHost = link.kind === "external" ? link.host : null;
           const isSameDocumentLink = href?.startsWith("#") ?? false;
           const onClick = props.onClick;
           const canOpenInPreview = Boolean(threadRef) && canPreviewAnyUrlInRuntime();
@@ -1565,7 +1432,7 @@ function ChatMarkdown({
             });
             if (outcome === "unavailable") reportLinkUnavailable(href);
           };
-          const link = (
+          const anchor = (
             <a
               {...props}
               href={href}
@@ -1627,8 +1494,8 @@ function ChatMarkdown({
                 })();
               }}
             >
-              {faviconHost ? (
-                <MarkdownExternalLinkContent plainText={plainHastText(node)}>
+              {link.kind === "external" ? (
+                <MarkdownExternalLinkContent plainText={link.plainText}>
                   {children}
                 </MarkdownExternalLinkContent>
               ) : (
@@ -1637,11 +1504,11 @@ function ChatMarkdown({
             </a>
           );
           if (!faviconHost || !href) {
-            return link;
+            return anchor;
           }
           return (
             <Tooltip>
-              <TooltipTrigger render={link} />
+              <TooltipTrigger render={anchor} />
               <TooltipPopup
                 side="top"
                 className="max-w-[min(36rem,calc(100vw-2rem))] whitespace-normal leading-tight wrap-anywhere"
@@ -1652,17 +1519,7 @@ function ChatMarkdown({
           );
         }
 
-        const parentSuffix = fileLinkParentSuffixByPath.get(fileLinkMeta.filePath);
-        const labelParts = [fileLinkMeta.basename];
-        if (typeof parentSuffix === "string" && parentSuffix.length > 0) {
-          labelParts.push(parentSuffix);
-        }
-        if (fileLinkMeta.line) {
-          labelParts.push(
-            `L${fileLinkMeta.line}${fileLinkMeta.column ? `:C${fileLinkMeta.column}` : ""}`,
-          );
-        }
-
+        const fileLinkMeta = link.meta;
         return (
           <MarkdownFileLink
             href={fileLinkMeta.targetPath}
@@ -1671,8 +1528,8 @@ function ChatMarkdown({
             displayPath={fileLinkMeta.displayPath}
             workspaceRelativePath={fileLinkMeta.workspaceRelativePath}
             line={fileLinkMeta.line}
-            label={labelParts.join(" · ")}
-            copyMarkdown={`[${fileLinkMeta.basename}](${normalizedHref})`}
+            label={markdownFileLinkLabel(fileLinkMeta, fileLinks.parentSuffixByPath)}
+            copyMarkdown={`[${fileLinkMeta.basename}](${link.normalizedHref})`}
             theme={resolvedTheme}
             threadRef={threadRef}
             onOpen={openInPreferredEditor}
@@ -1690,10 +1547,14 @@ function ChatMarkdown({
       table({ node: _node, ...props }) {
         return <MarkdownTable {...props} />;
       },
-      details({ node: _node, children, open: detailsOpen }) {
+      details({ node, children, open: authoredOpen }) {
         // A toggle survives new text; an edited `open` attribute starts the block over.
         return (
-          <MarkdownDetails key={detailsOpen ? "open" : "closed"} open={detailsOpen}>
+          <MarkdownDetails
+            key={authoredOpen ? "open" : "closed"}
+            open={authoredOpen}
+            ordinal={readDetailsOrdinal(node)}
+          >
             {children}
           </MarkdownDetails>
         );
@@ -1748,22 +1609,24 @@ function ChatMarkdown({
         "chat-markdown w-full min-w-0 text-sm leading-relaxed text-foreground/80",
         className,
       )}
+      data-find-scope={findScope}
       onCopy={handleCopy}
     >
       <ChatMarkdownDocumentContext value={markdownDocument}>
-        <ReactMarkdown
-          remarkPlugins={[
-            remarkGfm,
-            ...(lineBreaks ? [remarkBreaks] : []),
-            remarkPreserveCodeMeta,
-            ...(incrementalMarkdownPlugin ? [incrementalMarkdownPlugin] : []),
-          ]}
-          rehypePlugins={[rehypeRaw, [rehypeSanitize, CHAT_MARKDOWN_SANITIZE_SCHEMA]]}
-          components={markdownComponents}
-          urlTransform={markdownUrlTransform}
-        >
-          {text}
-        </ReactMarkdown>
+        <ChatMarkdownDetailsContext value={detailsDisclosure}>
+          <ReactMarkdown
+            remarkPlugins={
+              incrementalMarkdownPlugin
+                ? [...chatMarkdownRemarkPlugins(lineBreaks), incrementalMarkdownPlugin]
+                : chatMarkdownRemarkPlugins(lineBreaks)
+            }
+            rehypePlugins={CHAT_MARKDOWN_REHYPE_PLUGINS}
+            components={markdownComponents}
+            urlTransform={chatMarkdownUrlTransform}
+          >
+            {text}
+          </ReactMarkdown>
+        </ChatMarkdownDetailsContext>
       </ChatMarkdownDocumentContext>
     </div>
   );

@@ -83,6 +83,9 @@ interface RenderOptions {
   skills?: ReadonlyArray<{ name: string; displayName: string }>;
   className?: string;
   lineBreaks?: boolean;
+  detailsOpen?: ReadonlyMap<number, boolean>;
+  onDetailsOpenChange?: (ordinal: number, open: boolean) => void;
+  findScope?: string;
 }
 
 async function renderMarkdown(text: string, options: RenderOptions = {}) {
@@ -155,8 +158,8 @@ describe("ChatMarkdown", () => {
     });
 
     it("estimates highlight memory and disambiguates duplicate file basenames", async () => {
-      const { buildFileLinkParentSuffixByPath, estimateHighlightedSize } =
-        await import("./ChatMarkdown");
+      const { estimateHighlightedSize } = await import("./ChatMarkdown");
+      const { buildFileLinkParentSuffixByPath } = await import("./chatMarkdownPipeline");
 
       expect(estimateHighlightedSize("12345", "x")).toBe(10);
       expect(estimateHighlightedSize("x", "12345")).toBe(15);
@@ -174,7 +177,8 @@ describe("ChatMarkdown", () => {
     });
 
     it("extracts markdown hrefs and rejects unsupported external hosts", async () => {
-      const { extractMarkdownLinkHrefs, resolveExternalLinkHost } = await import("./ChatMarkdown");
+      const { extractMarkdownLinkHrefs, resolveExternalLinkHost } =
+        await import("./chatMarkdownPipeline");
 
       expect(
         extractMarkdownLinkHrefs('[one](https://one.test) [two](file:///tmp/two "x")'),
@@ -812,6 +816,77 @@ describe("ChatMarkdown", () => {
       await click(container.querySelector<HTMLElement>("[data-markdown-details-summary]")!);
 
       expect(details?.dataset.markdownDetailsOpen).toBe("true");
+    });
+
+    it("follows a caller-owned open state for each details block and reports toggles", async () => {
+      const text = [
+        "<details>",
+        "<summary>First</summary>",
+        "",
+        "One",
+        "",
+        "</details>",
+        "",
+        "<details open>",
+        "<summary>Second</summary>",
+        "",
+        "Two",
+        "",
+        "</details>",
+      ].join("\n");
+      const onDetailsOpenChange = vi.fn();
+      const container = await mountMarkdown(text, {
+        detailsOpen: new Map([[1, false]]),
+        onDetailsOpenChange,
+      });
+      const blocks = () => [...container.querySelectorAll<HTMLElement>("[data-markdown-details]")];
+      // The first follows its authored attribute; the owner closed the second.
+      expect(blocks().map((block) => block.dataset.markdownDetailsOpen)).toEqual([
+        "false",
+        "false",
+      ]);
+
+      await click(container.querySelectorAll<HTMLElement>("[data-markdown-details-summary]")[0]!);
+
+      expect(onDetailsOpenChange).toHaveBeenCalledWith(0, true);
+      // Controlled: nothing opens until the owner says so.
+      expect(blocks()[0]?.dataset.markdownDetailsOpen).toBe("false");
+    });
+
+    it("marks the text as a find scope and its chrome as ignored", async () => {
+      const container = await mountMarkdown(
+        [
+          '```ts title="a.ts"',
+          "const x = 1;",
+          "```",
+          "",
+          "| a | b |",
+          "| - | - |",
+          "| 1 | 2 |",
+          "",
+          "<details>",
+          "",
+          "Body",
+          "",
+          "</details>",
+        ].join("\n"),
+        { findScope: "md:0" },
+      );
+
+      expect(container.querySelector(".chat-markdown")?.getAttribute("data-find-scope")).toBe(
+        "md:0",
+      );
+      expect(
+        container
+          .querySelector(".chat-markdown-codeblock-header")
+          ?.hasAttribute("data-find-ignore"),
+      ).toBe(true);
+      expect(
+        container.querySelector(".chat-markdown-table-footer")?.hasAttribute("data-find-ignore"),
+      ).toBe(true);
+      // The placeholder summary of a details block without one is chrome, not content.
+      const summary = container.querySelector("[data-markdown-details-summary] [data-find-ignore]");
+      expect(summary?.textContent).toBe("Details");
     });
 
     it("navigates valid fragment links and preserves modified clicks", async () => {

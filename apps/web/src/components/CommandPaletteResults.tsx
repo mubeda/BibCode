@@ -90,9 +90,11 @@ function CommandPaletteResultRow(props: {
   keybindings: ResolvedKeybindingsConfig;
   onExecuteItem: (item: CommandPaletteActionItem | CommandPaletteSubmenuItem) => void;
 }) {
-  const shortcutLabel = props.item.shortcutCommand
-    ? shortcutLabelForCommand(props.keybindings, props.item.shortcutCommand)
-    : null;
+  const shortcutLabel = props.item.shortcutLabel
+    ? props.item.shortcutLabel
+    : props.item.shortcutCommand
+      ? shortcutLabelForCommand(props.keybindings, props.item.shortcutCommand)
+      : null;
 
   return (
     <CommandItem

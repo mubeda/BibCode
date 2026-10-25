@@ -65,6 +65,7 @@ import {
 
 const h = vi.hoisted(() => {
   return {
+    openThreadFindTargets: [] as Array<EventTarget | null>,
     captured: {} as Record<string, unknown>,
     atomValuesByKey: new Map<string, unknown>(),
     commandCalls: [] as Array<{ key: string; input: unknown }>,
@@ -124,6 +125,7 @@ const h = vi.hoisted(() => {
     settingsListeners: new Set<() => void>(),
     centerHeaderDensityByGroupId: new Map<string, "expanded" | "compact">(),
     chatHeaderActionsInstanceCount: 0,
+    messagesTimelineInstanceCount: 0,
   };
 });
 
@@ -448,9 +450,18 @@ vi.mock("./chat/ChatComposer", () => ({
   },
 }));
 
+vi.mock("./chat/threadFind/useThreadFind", () => ({
+  openThreadFindForTarget: (target: EventTarget | null) => {
+    h.openThreadFindTargets.push(target);
+    return true;
+  },
+}));
+
 vi.mock("./chat/MessagesTimeline", () => ({
   MessagesTimeline: (props: Record<string, unknown>) => {
     h.captured["messagesTimeline"] = props;
+    // A new instance is a new find session: its query and selection start over.
+    useState(() => ++h.messagesTimelineInstanceCount);
     return (
       <div
         data-mock="messages-timeline"
@@ -951,6 +962,7 @@ function publishSeededStoreState(store: unknown): void {
 
 beforeEach(() => {
   attachmentAdmissionOwner.dispose();
+  h.openThreadFindTargets.length = 0;
   h.captured = {};
   h.atomValuesByKey.clear();
   h.atomValuesByKey.set("atom:keybindings", []);
@@ -1010,6 +1022,7 @@ beforeEach(() => {
   h.settingsListeners.clear();
   h.centerHeaderDensityByGroupId.clear();
   h.chatHeaderActionsInstanceCount = 0;
+  h.messagesTimelineInstanceCount = 0;
 
   for (const { store, pristine } of resettableStores) {
     store.setState({ ...pristine }, true);
@@ -6435,4 +6448,147 @@ describe("ChatView adopted workspace availability", () => {
       expect(h.commandCalls.some((call) => call.key === "thread.startTurn")).toBe(false);
     },
   );
+});
+
+describe("ChatView find in thread", () => {
+  async function mountServerRoute() {
+    vi.unstubAllGlobals();
+    Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+    Object.defineProperty(Element.prototype, "getAnimations", {
+      configurable: true,
+      value: () => [],
+    });
+    const addWindowListener = vi.spyOn(window, "addEventListener");
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    await act(async () => {
+      root.render(
+        <ChatView
+          environmentId={environmentId}
+          threadId={threadId}
+          routeKind="server"
+          reserveTitleBarControlInset
+        />,
+      );
+      await Promise.resolve();
+    });
+    const keydown = addWindowListener.mock.calls.findLast(
+      ([eventName]) => eventName === "keydown",
+    )?.[1] as EventListener;
+    return {
+      keydown,
+      cleanup: async () => {
+        await act(async () => root.unmount());
+        container.remove();
+        addWindowListener.mockRestore();
+      },
+    };
+  }
+
+  const modF = () =>
+    new KeyboardEvent("keydown", {
+      key: "f",
+      metaKey: navigator.platform.toLowerCase().includes("mac"),
+      ctrlKey: !navigator.platform.toLowerCase().includes("mac"),
+      bubbles: true,
+      cancelable: true,
+    });
+
+  it("gives the timeline its chat surface and opens find on Mod+F", async () => {
+    seedEnvironment(makeEnvironmentPresentation());
+    seedProject(makeProject());
+    seedServerThread(makeThread());
+    seedGitStatus(true);
+    const { keydown, cleanup } = await mountServerRoute();
+    try {
+      const timeline = capturedProps<Record<string, unknown>>("messagesTimeline");
+      expect((timeline["findSurfaceRoot"] as HTMLElement).hasAttribute("data-chat-surface")).toBe(
+        true,
+      );
+      expect(timeline["isHostFindSurface"]).toBe(true);
+      expect(timeline["findThreadRef"]).toEqual({ environmentId, threadId });
+
+      const event = modF();
+      await act(async () => keydown(event));
+      expect(h.openThreadFindTargets).toHaveLength(1);
+      expect(event.defaultPrevented).toBe(true);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it("starts a new timeline, and so a new find, for the same thread id in another environment", async () => {
+    seedEnvironment(makeEnvironmentPresentation());
+    seedProject(makeProject());
+    seedServerThread(makeThread());
+    seedGitStatus(true);
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    const renderIn = async (nextEnvironmentId: EnvironmentId) => {
+      await act(async () => {
+        root.render(
+          <ChatView
+            environmentId={nextEnvironmentId}
+            threadId={threadId}
+            routeKind="server"
+            reserveTitleBarControlInset
+          />,
+        );
+        await Promise.resolve();
+      });
+    };
+    vi.unstubAllGlobals();
+    Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+    Object.defineProperty(Element.prototype, "getAnimations", {
+      configurable: true,
+      value: () => [],
+    });
+    try {
+      await renderIn(environmentId);
+      expect(h.messagesTimelineInstanceCount).toBe(1);
+
+      const nextEnvironmentId = EnvironmentId.make("environment-remote");
+      seedEnvironment(makeEnvironmentPresentation({ environmentId: nextEnvironmentId }));
+      seedProject(makeProject({ environmentId: nextEnvironmentId }));
+      seedServerThread(makeThread({ environmentId: nextEnvironmentId }));
+      await renderIn(nextEnvironmentId);
+
+      expect(capturedProps<Record<string, unknown>>("messagesTimeline")["routeThreadKey"]).toBe(
+        scopedThreadKey(scopeThreadRef(nextEnvironmentId, threadId)),
+      );
+      expect(h.messagesTimelineInstanceCount).toBe(2);
+    } finally {
+      await act(async () => root.unmount());
+      container.remove();
+    }
+  });
+
+  it("leaves Mod+F to a user rule that binds it to another command", async () => {
+    seedEnvironment(makeEnvironmentPresentation());
+    seedProject(makeProject());
+    seedServerThread(makeThread());
+    seedGitStatus(true);
+    h.atomValuesByKey.set("atom:keybindings", [
+      {
+        command: "sidebar.toggle",
+        shortcut: {
+          key: "f",
+          metaKey: false,
+          ctrlKey: false,
+          shiftKey: false,
+          altKey: false,
+          modKey: true,
+        },
+      },
+    ]);
+    const { keydown, cleanup } = await mountServerRoute();
+    try {
+      await act(async () => keydown(modF()));
+      expect(h.openThreadFindTargets).toHaveLength(0);
+    } finally {
+      await cleanup();
+    }
+  });
 });
