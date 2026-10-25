@@ -1131,7 +1131,7 @@ shows its status, name and job count; each job its status, name and
 duration. A parallel group such as `rspec 3` is one row that expands to its
 jobs, a trigger job links to its **Downstream pipeline**, and a job that
 failed but was allowed to fail shows a warning instead of a failure. Choosing
-a job opens it on GitLab. When GitLab returns only the first 100 jobs of a
+a job opens its job page in BiBCode (below). When GitLab returns only the first 100 jobs of a
 stage, the page says so and links to the full pipeline; an account that
 cannot see the jobs keeps the header and is told so. A pipeline you cannot
 view, or one that no longer exists, says that on the page, with **Open on

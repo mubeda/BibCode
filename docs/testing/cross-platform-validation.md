@@ -2671,7 +2671,7 @@ tag, one merge request pipeline) and a GitHub repository.
    jobs and their order with GitLab's own page, on a wide panel (side by side,
    scrolling sideways) and a narrow one (stacked); a parallel group expands, a
    trigger job links to its downstream pipeline, an allowed failure shows a
-   warning, and each job opens on GitLab. Reopen the page: the last copy
+   warning, and each job opens its job page in BiBCode. Reopen the page: the last copy
    paints before any `glab` spawn.
 9. With a pipeline running, its page must follow GitLab within about 10 s;
    one window on its list and one on the pipeline must produce one poller's
