@@ -4395,13 +4395,18 @@ function ChatViewContent(props: ChatViewProps) {
       // clamped scroll leaves the end hidden until the next delivery, so look again once
       // layout has caught up, a few times at most, and stop if the reader takes over.
       const generation = anchorUserScrollGenerationRef.current;
+      // A later send positions its own row; a recheck for this turn must not cut into it.
+      const anchor = positionedTimelineAnchorRef.current;
       const recheck = (remaining: number) => {
         requestAnimationFrame(() => {
           requestAnimationFrame(() => {
             if (
               anchorUserScrollGenerationRef.current !== generation ||
               liveFollowUserScrollGenerationRef.current !== generation ||
-              timelineScrollModeRef.current !== "anchoring-new-turn"
+              timelineScrollModeRef.current !== "anchoring-new-turn" ||
+              pendingTimelineAnchorRef.current !== null ||
+              positionedTimelineAnchorRef.current !== anchor ||
+              (anchor !== null && settledTimelineAnchorRef.current !== anchor)
             ) {
               return;
             }
