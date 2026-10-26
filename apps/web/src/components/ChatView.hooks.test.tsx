@@ -2099,6 +2099,30 @@ describe("ChatView effects (captured and run manually)", () => {
     for (const cleanup of cleanups) cleanup();
   });
 
+  it("withdraws a landing that outlasted both caps when the reader scrolls", async () => {
+    const { list, cleanups, messageId } = await sendTallReply({ deferIndexLanding: true });
+    const onAnchorReady = capturedProps("messagesTimeline")["onAnchorReady"] as (
+      messageId: MessageId,
+      anchorIndex: number,
+    ) => void;
+    onAnchorReady(messageId, 2);
+    list.scrollNode.fire("scrollend");
+    await flushLandings();
+    runWindowTimeouts();
+    await flushLandings();
+    runWindowTimeouts();
+    await flushLandings();
+    expect(list.calls.scrollToOffset).toEqual([]);
+
+    list.scrollNode.fire("wheel");
+
+    // LegendList still holds the landing; a scroll to where the reader is supersedes it.
+    expect(list.calls.scrollToOffset).toEqual([
+      { offset: list.getState().scroll, animated: false },
+    ]);
+    for (const cleanup of cleanups) cleanup();
+  });
+
   it("follows the end again when a follow was clamped to a lagging content height", async () => {
     // The scroller has laid out only 100 px of the 216 the turn's end needs.
     const { list, cleanups, messageId } = await sendTallReply({ laggingMaxScroll: 100 });

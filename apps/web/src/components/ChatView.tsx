@@ -4233,11 +4233,13 @@ function ChatViewContent(props: ChatViewProps) {
               landTimelineAnchor(1);
               return;
             }
-            landingTimelineAnchorRef.current = null;
             settledTimelineAnchorRef.current = messageId;
             if (!landed) {
+              // LegendList may still run the landing; the marker stays so a reader who scrolls
+              // before it does withdraws it rather than being snapped back.
               return;
             }
+            landingTimelineAnchorRef.current = null;
             // Replies that arrived during the glide were not followed; follow them now rather
             // than on the next one, which a reply that has finished never sends.
             requestAnimationFrame(() => {
