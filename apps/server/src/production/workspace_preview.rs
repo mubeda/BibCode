@@ -35,12 +35,17 @@ const WORKSPACE_METHODS: &[&str] = &[
     "projects.createUploadUrl",
     "projects.deleteEntry",
     "projects.duplicateEntry",
+    "projects.getFileVersion",
     "projects.listEntries",
     "projects.readFile",
     "projects.renameEntry",
     "projects.searchEntries",
     "projects.writeFile",
+    "projects.writeFileIfUnchanged",
     "review.getDiffPreview",
+    "review.listDiffTools",
+    "review.openDiffTool",
+    "review.readFileVersion",
 ];
 const PREVIEW_METHODS: &[&str] = &[
     "preview.claimOpenRequest",

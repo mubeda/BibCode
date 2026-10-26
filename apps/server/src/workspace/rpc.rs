@@ -8,7 +8,10 @@ use std::time::{Duration, Instant};
 
 use crate::assets::{AssetAccess, AssetError, AssetIssueRequest, AssetResource};
 use crate::git::StatusMutationGuard;
-use crate::review::{ReviewDiffPreviewInput, ReviewError, ReviewService};
+use crate::review::{
+    ReviewDiffPreviewInput, ReviewError, ReviewListDiffToolsInput, ReviewOpenDiffToolInput,
+    ReviewReadFileVersionInput, ReviewService,
+};
 use crate::transfer::archive::ArchiveLimits;
 use crate::transfer::{self, TransferAccess, TransferError};
 use crate::worktree_catalog::{
@@ -25,16 +28,19 @@ use super::paths::{self, normalize_root};
 use super::search::emit_index_phase;
 #[cfg(test)]
 use super::search::{WorkspaceIndexPhase, WorkspaceIndexPhaseSink};
+use super::service::WritePrecondition;
 use super::watcher::{WatchScope, WatchScopeFuture, WatchSubscription, WorkspaceWatcher};
 use super::{EntryKind, SearchLimits, WorkspaceError, WorkspaceSearchIndex, WorkspaceService};
 
 const PROJECT_ENTRIES_MAX_LIMIT: usize = 200;
 
-pub const TASK_SIX_RPC_METHODS: [&str; 13] = [
+pub const TASK_SIX_RPC_METHODS: [&str; 18] = [
     "projects.searchEntries",
     "projects.listEntries",
     "projects.readFile",
+    "projects.getFileVersion",
     "projects.writeFile",
+    "projects.writeFileIfUnchanged",
     "projects.createEntry",
     "projects.renameEntry",
     "projects.deleteEntry",
@@ -44,6 +50,9 @@ pub const TASK_SIX_RPC_METHODS: [&str; 13] = [
     "filesystem.browse",
     "assets.createUrl",
     "review.getDiffPreview",
+    "review.readFileVersion",
+    "review.listDiffTools",
+    "review.openDiffTool",
 ];
 
 type AssetContextFuture<'a> =
@@ -349,52 +358,29 @@ impl WorkspaceRpc {
                         )
                     })
             }
+            "projects.getFileVersion" => {
+                let input: PathInput = decode(payload)?;
+                let _admission = self.acquire_path(&input.cwd).await?;
+                self.service
+                    .file_version(Path::new(&input.cwd), &input.relative_path)
+                    .await
+                    .and_then(encode)
+                    .map_err(|error| {
+                        error.to_project_wire(
+                            "ProjectReadFileError",
+                            &input.cwd,
+                            &input.relative_path,
+                        )
+                    })
+            }
             "projects.writeFile" => {
                 let input: WriteInput = decode(payload)?;
-                let admission = self.acquire_path(&input.cwd).await?;
-                let finalization = Self::begin_mutation(admission.as_ref())?;
-                let rpc = self.clone();
-                let cwd = input.cwd.clone();
-                let cancellation_error = WorkspaceError::Cancelled.to_project_wire(
-                    "ProjectWriteFileError",
-                    &input.cwd,
-                    &input.relative_path,
-                );
-                let operation = async move {
-                    let result = rpc
-                        .service
-                        .write_file(Path::new(&input.cwd), &input.relative_path, &input.contents)
-                        .await;
-                    match result {
-                        Ok(outcome) => {
-                            if outcome.path_set_changed
-                                || outcome.index_classification_may_have_changed
-                            {
-                                rpc.invalidate_index(&input.cwd).await;
-                            }
-                            Ok(json!({ "relativePath": outcome.relative_path }))
-                        }
-                        Err(error) => {
-                            rpc.invalidate_index(&input.cwd).await;
-                            Err(error.to_project_wire(
-                                "ProjectWriteFileError",
-                                &input.cwd,
-                                &input.relative_path,
-                            ))
-                        }
-                    }
-                };
-                self.run_workspace_mutation(
-                    WorkspaceMutationOwnership {
-                        _finalization: finalization,
-                        _admission: admission,
-                    },
-                    cwd,
-                    cancellation,
-                    cancellation_error,
-                    operation,
-                )
-                .await
+                self.handle_write_file(input, None, cancellation).await
+            }
+            "projects.writeFileIfUnchanged" => {
+                let input: WriteIfUnchangedInput = decode(payload)?;
+                self.handle_write_file(input.write, Some(input.precondition), cancellation)
+                    .await
             }
             "projects.createEntry" => {
                 let input: CreateInput = decode(payload)?;
@@ -621,6 +607,45 @@ impl WorkspaceRpc {
                 let input: ReviewDiffPreviewInput = decode(payload)?;
                 let _admission = self.acquire_path(&input.cwd).await?;
                 self.handle_review_get_diff_preview(input).await
+            }
+            "review.readFileVersion" => {
+                let input: ReviewReadFileVersionInput = decode(payload)?;
+                let _admission = self.acquire_path(&input.cwd).await?;
+                // Reads share the workspace's operation permits with file reads and writes.
+                let _permit =
+                    self.service.permit().await.map_err(
+                        |error| json!({ "_tag": "Defect", "message": error.to_string() }),
+                    )?;
+                let review_service = self
+                    .dependencies
+                    .review_service
+                    .as_ref()
+                    .ok_or_else(|| defect("review.readFileVersion is not configured"))?;
+                let result = review_service
+                    .read_file_version(input, &cancellation)
+                    .await
+                    .map_err(review_wire_error)?;
+                encode(result).map_err(|error| defect(&error.to_string()))
+            }
+            "review.listDiffTools" => {
+                let input: ReviewListDiffToolsInput = decode(payload)?;
+                let _admission = self.acquire_path(&input.cwd).await?;
+                let review_service = self.review_service("review.listDiffTools")?;
+                let result = review_service
+                    .list_diff_tools(input, &cancellation)
+                    .await
+                    .map_err(review_wire_error)?;
+                encode(result).map_err(|error| defect(&error.to_string()))
+            }
+            "review.openDiffTool" => {
+                let input: ReviewOpenDiffToolInput = decode(payload)?;
+                let _admission = self.acquire_path(&input.cwd).await?;
+                let review_service = self.review_service("review.openDiffTool")?;
+                review_service
+                    .open_diff_tool(input)
+                    .await
+                    .map_err(review_wire_error)?;
+                Ok(json!({ "_tag": "opened" }))
             }
             _ => Err(json!({
                 "_tag": "Defect",
@@ -1277,6 +1302,75 @@ impl WorkspaceRpc {
         encode(issued).map_err(|error| defect(&error.to_string()))
     }
 
+    /// Runs a plain write, or a guarded one when `precondition` is set, as a workspace mutation.
+    async fn handle_write_file(
+        &self,
+        input: WriteInput,
+        precondition: Option<WritePrecondition>,
+        cancellation: CancellationToken,
+    ) -> Result<Value, Value> {
+        let admission = self.acquire_path(&input.cwd).await?;
+        let finalization = Self::begin_mutation(admission.as_ref())?;
+        let rpc = self.clone();
+        let cwd = input.cwd.clone();
+        let cancellation_error = WorkspaceError::Cancelled.to_project_wire(
+            "ProjectWriteFileError",
+            &input.cwd,
+            &input.relative_path,
+        );
+        let operation = async move {
+            let root = Path::new(&input.cwd);
+            let result = match &precondition {
+                None => {
+                    rpc.service
+                        .write_file(root, &input.relative_path, &input.contents)
+                        .await
+                }
+                Some(precondition) => {
+                    rpc.service
+                        .write_file_if_unchanged(
+                            root,
+                            &input.relative_path,
+                            &input.contents,
+                            precondition,
+                        )
+                        .await
+                }
+            };
+            match result {
+                Ok(outcome) => {
+                    if outcome.path_set_changed || outcome.index_classification_may_have_changed {
+                        rpc.invalidate_index(&input.cwd).await;
+                    }
+                    Ok(if precondition.is_some() {
+                        json!({ "relativePath": outcome.relative_path, "version": outcome.version })
+                    } else {
+                        json!({ "relativePath": outcome.relative_path })
+                    })
+                }
+                Err(error) => {
+                    rpc.invalidate_index(&input.cwd).await;
+                    Err(error.to_project_wire(
+                        "ProjectWriteFileError",
+                        &input.cwd,
+                        &input.relative_path,
+                    ))
+                }
+            }
+        };
+        self.run_workspace_mutation(
+            WorkspaceMutationOwnership {
+                _finalization: finalization,
+                _admission: admission,
+            },
+            cwd,
+            cancellation,
+            cancellation_error,
+            operation,
+        )
+        .await
+    }
+
     async fn run_workspace_mutation<Operation>(
         &self,
         ownership: WorkspaceMutationOwnership,
@@ -1322,6 +1416,13 @@ impl WorkspaceRpc {
             result
         })
         .await
+    }
+
+    fn review_service(&self, method: &str) -> Result<&ReviewService, Value> {
+        self.dependencies
+            .review_service
+            .as_ref()
+            .ok_or_else(|| defect(&format!("{method} is not configured")))
     }
 
     async fn handle_review_get_diff_preview(
@@ -1561,10 +1662,22 @@ fn transfer_error_wire(cwd: &str, relative_path: &str, error: &TransferError) ->
 }
 
 fn review_wire_error(error: ReviewError) -> Value {
-    json!({
-        "_tag": "Defect",
-        "message": error.to_string(),
-    })
+    match error {
+        ReviewError::InvalidRequest(message) => json!({
+            "_tag": "InvalidRequest",
+            "message": message,
+        }),
+        ReviewError::DiffTool(failure) => json!({
+            "_tag": "ReviewDiffToolError",
+            "reason": failure.reason,
+            "message": failure.message,
+            "command": failure.command,
+        }),
+        error @ ReviewError::Backend(_) => json!({
+            "_tag": "Defect",
+            "message": error.to_string(),
+        }),
+    }
 }
 
 fn defect(message: &str) -> Value {
@@ -1595,6 +1708,14 @@ struct WriteInput {
     cwd: String,
     relative_path: String,
     contents: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WriteIfUnchangedInput {
+    #[serde(flatten)]
+    write: WriteInput,
+    precondition: WritePrecondition,
 }
 
 #[derive(Deserialize)]
@@ -3416,6 +3537,10 @@ mod tests {
         assert_eq!(
             review_wire_error(ReviewError::Backend("failed".to_owned()))["_tag"],
             "Defect"
+        );
+        assert_eq!(
+            review_wire_error(ReviewError::InvalidRequest("refused".to_owned())),
+            json!({ "_tag": "InvalidRequest", "message": "refused" })
         );
         assert_eq!(defect("failed")["message"], "failed");
     }

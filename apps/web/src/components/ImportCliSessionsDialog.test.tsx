@@ -208,6 +208,37 @@ describe("ImportCliSessionsDialog", () => {
     expect(onOpenThread).toHaveBeenCalledWith(target, "import:claudeAgent:claude-done");
   });
 
+  it("opens a session continued from History in its host, and points worktree sessions there", async () => {
+    h.commands.set("scan", async () => ({
+      _tag: "Success",
+      value: {
+        candidates: [
+          {
+            provider: "claudeAgent",
+            sessionId: "claude-panel",
+            title: "Continued from History",
+            messageCount: 3,
+            lastActiveAt: minutesAgo(30),
+            alreadyImported: true,
+            threadId: ThreadId.make("import:claudeAgent:claude-panel"),
+            hostThreadId: ThreadId.make("host-thread"),
+          },
+        ],
+        truncated: false,
+      },
+    }));
+    await renderDialog();
+    expect(container.textContent).toContain(
+      "Sessions run in a worktree are in that worktree thread's History.",
+    );
+
+    await click(button("Open"));
+    expect(onOpenThread).toHaveBeenCalledWith(target, "import:claudeAgent:claude-panel", {
+      hostThreadId: "host-thread",
+      title: "Continued from History",
+    });
+  });
+
   it("imports the selected sessions and opens the most recent one", async () => {
     h.commands.set("import", async () => ({
       _tag: "Success",

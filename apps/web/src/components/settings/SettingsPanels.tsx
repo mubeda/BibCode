@@ -92,6 +92,7 @@ import {
   isProviderUpdateActive,
   type ProviderUpdateCandidate,
 } from "../ProviderUpdateLaunchNotification.logic";
+import { ProviderUpdateAllSection } from "./ProviderUpdateAllSection";
 import { ProviderInstanceCard } from "./ProviderInstanceCard";
 import { DRIVER_OPTIONS, getDriverOption } from "./providerDriverMeta";
 import {
@@ -445,6 +446,7 @@ export function useGeneralSettingsRestore(onRestored?: () => void) {
       ...(settings.enableAssistantStreaming !== DEFAULT_UNIFIED_SETTINGS.enableAssistantStreaming
         ? ["Assistant output"]
         : []),
+      ...(settings.verboseChat !== DEFAULT_UNIFIED_SETTINGS.verboseChat ? ["Verbose chat"] : []),
       ...(settings.enableProviderUpdateChecks !==
       DEFAULT_UNIFIED_SETTINGS.enableProviderUpdateChecks
         ? ["Provider update checks"]
@@ -485,6 +487,7 @@ export function useGeneralSettingsRestore(onRestored?: () => void) {
       settings.enableAssistantStreaming,
       settings.enableProviderUpdateChecks,
       settings.timestampFormat,
+      settings.verboseChat,
       settings.wordWrap,
       linkTargetShown,
       theme,
@@ -508,6 +511,7 @@ export function useGeneralSettingsRestore(onRestored?: () => void) {
       wordWrap: DEFAULT_UNIFIED_SETTINGS.wordWrap,
       diffIgnoreWhitespace: DEFAULT_UNIFIED_SETTINGS.diffIgnoreWhitespace,
       enableAssistantStreaming: DEFAULT_UNIFIED_SETTINGS.enableAssistantStreaming,
+      verboseChat: DEFAULT_UNIFIED_SETTINGS.verboseChat,
       enableProviderUpdateChecks: DEFAULT_UNIFIED_SETTINGS.enableProviderUpdateChecks,
       autoOpenPlanSidebar: DEFAULT_UNIFIED_SETTINGS.autoOpenPlanSidebar,
       defaultThreadEnvMode: DEFAULT_UNIFIED_SETTINGS.defaultThreadEnvMode,
@@ -726,6 +730,30 @@ export function GeneralSettingsPanel() {
                 updateSettings({ enableAssistantStreaming: Boolean(checked) })
               }
               aria-label="Stream assistant messages"
+            />
+          }
+        />
+
+        <SettingsRow
+          title="Verbose chat"
+          description="Show every tool call and its output. Finished turns start open."
+          resetAction={
+            settings.verboseChat !== DEFAULT_UNIFIED_SETTINGS.verboseChat ? (
+              <SettingResetButton
+                label="verbose chat"
+                onClick={() =>
+                  updateSettings({
+                    verboseChat: DEFAULT_UNIFIED_SETTINGS.verboseChat,
+                  })
+                }
+              />
+            ) : null
+          }
+          control={
+            <Switch
+              checked={settings.verboseChat}
+              onCheckedChange={(checked) => updateSettings({ verboseChat: Boolean(checked) })}
+              aria-label="Show every tool call and its output"
             />
           }
         />
@@ -1055,6 +1083,36 @@ export function AgentsSettingsPanel() {
                 updateSettings({ enableChatAgentActivity: Boolean(checked) })
               }
               aria-label="Chat agent activity"
+            />
+          }
+        />
+        <SettingsRow
+          title="Always show Activity"
+          description="Keep the Activity button above the chat even before any subagent or background task runs."
+          status={
+            settings.enableChatAgentActivity ? null : "Turn on Chat agent activity to show it."
+          }
+          resetAction={
+            settings.activityDockAlwaysVisible !==
+            DEFAULT_UNIFIED_SETTINGS.activityDockAlwaysVisible ? (
+              <SettingResetButton
+                label="Activity button visibility"
+                onClick={() =>
+                  updateSettings({
+                    activityDockAlwaysVisible: DEFAULT_UNIFIED_SETTINGS.activityDockAlwaysVisible,
+                  })
+                }
+              />
+            ) : null
+          }
+          control={
+            <Switch
+              checked={settings.activityDockAlwaysVisible}
+              disabled={!settings.enableChatAgentActivity}
+              onCheckedChange={(checked) =>
+                updateSettings({ activityDockAlwaysVisible: Boolean(checked) })
+              }
+              aria-label="Always show Activity"
             />
           }
         />
@@ -1746,6 +1804,7 @@ function EnvironmentScopedProviderSettingsPanel({
 
   return (
     <SettingsPageContainer>
+      <ProviderUpdateAllSection />
       <SettingsSection
         title="Providers"
         contentVariant="stack"

@@ -94,6 +94,16 @@ describe("execution environment contracts", () => {
       gitPullRequestBranchSelection: true,
     });
   });
+  it("defaults Pipelines capabilities off for older servers and preserves advertised support", () => {
+    expect(decodeTerminalCapabilities({})).toMatchObject({
+      pipelinesReads: false,
+      pipelinesMutations: false,
+    });
+    expect(decodeTerminalCapabilities({ pipelinesReads: true })).toMatchObject({
+      pipelinesReads: true,
+      pipelinesMutations: false,
+    });
+  });
   it("defaults the profiler capability off for older servers and preserves advertised support", () => {
     expect(decodeTerminalCapabilities({}).profiler).toBe(false);
     expect(decodeTerminalCapabilities({ profiler: true }).profiler).toBe(true);
@@ -104,6 +114,16 @@ describe("execution environment contracts", () => {
   it("defaults clone re-attach off for older servers and preserves advertised support", () => {
     expect(decodeTerminalCapabilities({}).vcsCloneReattach).toBe(false);
     expect(decodeTerminalCapabilities({ vcsCloneReattach: true }).vcsCloneReattach).toBe(true);
+  });
+  it("defaults device catalog refresh off for older servers and preserves advertised support", () => {
+    expect(decodeTerminalCapabilities({}).deviceCatalogRefresh).toBe(false);
+    expect(decodeTerminalCapabilities({ deviceCatalogRefresh: true }).deviceCatalogRefresh).toBe(
+      true,
+    );
+  });
+  it("defaults terminal session History off for older servers and preserves advertised support", () => {
+    expect(decodeTerminalCapabilities({}).cliSessionHistory).toBe(false);
+    expect(decodeTerminalCapabilities({ cliSessionHistory: true }).cliSessionHistory).toBe(true);
   });
   it("pins the remote protocol window constants", () => {
     expect(REMOTE_PROTOCOL_VERSION).toBe(1);

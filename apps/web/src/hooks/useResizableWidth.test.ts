@@ -7,6 +7,7 @@ const hooks = vi.hoisted(() => {
   let cursor = 0;
   let stateSlots = new Map<number, unknown>();
   let refSlots = new Map<number, { current: unknown }>();
+  let cleanups = new Map<number, (() => void) | void>();
 
   return {
     beginRender(): void {
@@ -16,10 +17,22 @@ const hooks = vi.hoisted(() => {
       cursor = 0;
       stateSlots = new Map();
       refSlots = new Map();
+      cleanups = new Map();
+    },
+    /** Runs every mounted effect's cleanup, as React does on unmount. */
+    unmount(): void {
+      for (const cleanup of cleanups.values()) cleanup?.();
+      cleanups = new Map();
     },
     useCallback<T>(callback: T): T {
       cursor += 1;
       return callback;
+    },
+    // Mount-only: the hook's effects take stable dependencies.
+    useEffect(effect: () => (() => void) | void): void {
+      const index = cursor;
+      cursor += 1;
+      if (!cleanups.has(index)) cleanups.set(index, effect());
     },
     useRef<T>(initialValue: T): { current: T } {
       const index = cursor;
@@ -67,6 +80,7 @@ vi.mock("react", async (importOriginal) => {
   return {
     ...actual,
     useCallback: hooks.useCallback,
+    useEffect: hooks.useEffect,
     useRef: hooks.useRef,
     useState: hooks.useState,
   };
@@ -183,6 +197,7 @@ const baseOptions: UseResizableWidthOptions = {
 function renderHook(overrides: Partial<UseResizableWidthOptions> = {}): {
   readonly width: number;
   readonly handlers: ResizableWidthHandlers;
+  readonly commitWidth: (width: number) => void;
 } {
   hooks.beginRender();
   return useResizableWidth({ ...baseOptions, ...overrides });
@@ -330,6 +345,52 @@ describe("useResizableWidth pointer handling", () => {
     expect(renderHook().width).toBe(410);
   });
 
+  it("rolls a drag whose pointer capture is lost back without persisting", () => {
+    const frames = installAnimationFrames();
+    storage.stored = 410;
+    const first = renderHook();
+    const target = beginDrag(first.handlers);
+    first.handlers.onPointerMove(pointerEvent(target.element, { clientX: 170 }));
+    const frameId = [...frames.callbacks.keys()][0]!;
+
+    first.handlers.onLostPointerCapture(pointerEvent(target.element));
+
+    expect(frames.cancelled).toEqual([frameId]);
+    expect(document.body.style.cursor).toBe("");
+    expect(document.body.style.userSelect).toBe("");
+    expect(storage.writes).toEqual([]);
+    expect(renderHook().width).toBe(410);
+  });
+
+  it("ignores the capture loss that follows a completed drag", () => {
+    const first = renderHook();
+    const target = beginDrag(first.handlers);
+    first.handlers.onPointerMove(pointerEvent(target.element, { clientX: 180 }));
+    first.handlers.onPointerUp(pointerEvent(target.element, { clientX: 180 }));
+
+    renderHook().handlers.onLostPointerCapture(pointerEvent(target.element));
+
+    expect(storage.writes).toMatchObject([{ value: 400 }]);
+    expect(renderHook().width).toBe(400);
+  });
+
+  it("releases the page and drops the pending frame when unmounted mid-drag", () => {
+    const frames = installAnimationFrames();
+    const first = renderHook();
+    const target = beginDrag(first.handlers);
+    first.handlers.onPointerMove(pointerEvent(target.element, { clientX: 180 }));
+    const frameId = [...frames.callbacks.keys()][0]!;
+    expect(document.body.style.userSelect).toBe("none");
+
+    hooks.unmount();
+
+    expect(frames.cancelled).toEqual([frameId]);
+    expect(target.releasePointerCapture).toHaveBeenCalledWith(7);
+    expect(document.body.style.cursor).toBe("");
+    expect(document.body.style.userSelect).toBe("");
+    expect(storage.writes).toEqual([]);
+  });
+
   it("tolerates already-released and throwing pointer capture state", () => {
     const noCapture = pointerTarget({ captured: false });
     const first = renderHook();
@@ -368,5 +429,102 @@ describe("useResizableWidth pointer handling", () => {
 
     expect(() => callback(0)).not.toThrow();
     expect(renderHook().width).toBe(320);
+  });
+});
+
+describe("useResizableWidth committed and painted width", () => {
+  it("paints a stored width the ceiling clamps again when the ceiling grows", () => {
+    storage.stored = 500;
+
+    expect(renderHook({ maxWidth: 300 }).width).toBe(300);
+    expect(renderHook({ maxWidth: 600 }).width).toBe(500);
+    expect(storage.writes).toEqual([]);
+  });
+
+  it("keeps the committed width when a drag under a lowered ceiling is cancelled", () => {
+    const frames = installAnimationFrames();
+    storage.stored = 500;
+    const first = renderHook({ maxWidth: 300 });
+    const target = beginDrag(first.handlers);
+    first.handlers.onPointerMove(pointerEvent(target.element, { clientX: 50 }));
+    frames.run([...frames.callbacks.keys()][0]!);
+    expect(renderHook({ maxWidth: 300 }).width).toBe(250);
+
+    first.handlers.onPointerCancel(pointerEvent(target.element));
+
+    expect(storage.writes).toEqual([]);
+    expect(renderHook({ maxWidth: 600 }).width).toBe(500);
+  });
+
+  it("commits nothing for a press that does not move", () => {
+    storage.stored = 500;
+    const first = renderHook({ maxWidth: 300 });
+    const target = beginDrag(first.handlers);
+
+    first.handlers.onPointerUp(pointerEvent(target.element));
+
+    expect(storage.writes).toEqual([]);
+    expect(renderHook({ maxWidth: 600 }).width).toBe(500);
+  });
+
+  it("commits nothing for a press that jitters by a pixel or two", () => {
+    storage.stored = 500;
+    const first = renderHook({ maxWidth: 300 });
+    const target = beginDrag(first.handlers);
+    first.handlers.onPointerMove(pointerEvent(target.element, { clientX: 98 }));
+
+    first.handlers.onPointerUp(pointerEvent(target.element, { clientX: 98 }));
+
+    expect(storage.writes).toEqual([]);
+    expect(renderHook({ maxWidth: 600 }).width).toBe(500);
+  });
+
+  it("commits a drag that a bound stops within a pixel or two of its start", () => {
+    storage.stored = 202;
+    const first = renderHook();
+    const target = beginDrag(first.handlers);
+    first.handlers.onPointerMove(pointerEvent(target.element, { clientX: 0 }));
+
+    first.handlers.onPointerUp(pointerEvent(target.element, { clientX: 0 }));
+
+    expect(storage.writes).toMatchObject([{ key: "panel-width", value: 200 }]);
+    expect(renderHook().width).toBe(200);
+  });
+
+  it("commits nothing for a press held still while the ceiling shrinks", () => {
+    storage.stored = 600;
+    const first = renderHook({ maxWidth: 600 });
+    const target = beginDrag(first.handlers);
+    const narrowed = renderHook({ maxWidth: 400 });
+    expect(narrowed.width).toBe(400);
+
+    narrowed.handlers.onPointerUp(pointerEvent(target.element));
+
+    expect(storage.writes).toEqual([]);
+    expect(renderHook({ maxWidth: 600 }).width).toBe(600);
+  });
+
+  it("drags from the painted width and commits where the drag ends", () => {
+    storage.stored = 500;
+    const first = renderHook({ maxWidth: 300 });
+    const target = beginDrag(first.handlers);
+    first.handlers.onPointerMove(pointerEvent(target.element, { clientX: 60 }));
+
+    first.handlers.onPointerUp(pointerEvent(target.element, { clientX: 60 }));
+
+    expect(storage.writes).toMatchObject([{ key: "panel-width", value: 260 }]);
+    expect(renderHook({ maxWidth: 600 }).width).toBe(260);
+  });
+
+  it("commits a width clamped to the current bounds", () => {
+    renderHook({ maxWidth: 400 }).commitWidth(900);
+
+    expect(storage.writes).toMatchObject([{ key: "panel-width", value: 400 }]);
+    expect(renderHook({ maxWidth: 600 }).width).toBe(400);
+
+    renderHook().commitWidth(100);
+
+    expect(storage.writes.at(-1)).toMatchObject({ value: 200 });
+    expect(renderHook().width).toBe(200);
   });
 });

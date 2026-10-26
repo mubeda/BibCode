@@ -36,8 +36,9 @@ use crate::{
         ProviderTurnDelivery, TurnDeliveryMode, TurnDeliveryState, TurnDeliveryTransition,
         canonical_command_digest,
         engine::{
-            ActivityInput, OrchestrationCommand, OrchestrationEngine, ProposedPlanInput,
-            SessionInput, ThreadMessageInput,
+            ActivityInput, ContextLimitFacts, OrchestrationCommand, OrchestrationEngine,
+            ProposedPlanInput, SessionInput, ThreadCompactionRow, ThreadMessageInput,
+            resume_cursor_conversation_id,
         },
     },
     persistence::{
@@ -166,6 +167,9 @@ pub struct ProviderLaunchRequest {
     /// Merged into the child environment at spawn. Kept out of `environment`, which the
     /// durable delivery route fingerprints.
     pub open_url: Option<OpenUrlSession>,
+    /// The chat panel's host thread, from the thread row; its MCP credential is scoped to the
+    /// host, so the panel's agent and the host share devices. `None` for any other thread.
+    pub host_thread_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -308,6 +312,19 @@ pub enum ProviderDeliveryOutcome {
     },
 }
 
+/// What a driver did with a request to compact its conversation. `ProviderDeliveryOutcome` is not
+/// reused: its new-conversation, already-delivered and retry-after outcomes mean nothing here.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProviderCompactionStart {
+    /// The provider took the request; the outcome arrives as events of the turn tagged with the
+    /// compaction id, whose id is given when the driver knows it.
+    Started { turn_id: Option<String> },
+    /// Certainly not sent.
+    NotStarted { detail: String },
+    /// The request may have reached the provider.
+    Unknown { detail: String },
+}
+
 /// What an undelivered turn shows when restart recovery finds its conversation gone.
 pub(crate) const RECONCILED_CONVERSATION_LOST_DETAIL: &str = "The provider no longer has the conversation this message was sent to, so BiBCode can't tell whether it arrived. Retry sends it to a new conversation.";
 
@@ -379,6 +396,16 @@ pub trait ProviderDriver: Send + Sync {
         Box::pin(async {
             ProviderDeliveryOutcome::Rejected {
                 detail: "provider does not support steering".to_owned(),
+            }
+        })
+    }
+    /// Asks the provider to compact its conversation. The driver reports the compaction as a
+    /// turn of its own, with `compaction_id` on its `turn.started` and `turn.completed`, and a
+    /// `context_compaction` item in it. See `crate::provider::supports_compaction`.
+    fn compact(&self, _compaction_id: String) -> BoxRuntimeFuture<'_, ProviderCompactionStart> {
+        Box::pin(async {
+            ProviderCompactionStart::NotStarted {
+                detail: "provider does not support compaction".to_owned(),
             }
         })
     }
@@ -468,6 +495,12 @@ pub trait ProviderDriver: Send + Sync {
     /// not suspend such a session; it checks again at the next deadline.
     fn holds_unsettled_work(&self) -> BoxRuntimeFuture<'_, bool> {
         Box::pin(std::future::ready(false))
+    }
+    /// Whether the provider refused to resume the session this driver launched, which the
+    /// event pump records in the runtime row when the stream ends. Decided before `next_event`
+    /// returns `None`.
+    fn resume_refused(&self) -> bool {
+        false
     }
 }
 
@@ -602,6 +635,22 @@ pub struct ProviderSessionIdentity {
     driver: Arc<dyn ProviderDriver>,
 }
 
+/// The live session a compaction runs in, checked against the conversation it compacts.
+pub struct CompactionSession {
+    identity: ProviderSessionIdentity,
+    /// Cancelled once the session ends, by itself or because BiBCode ended it.
+    ended: CancellationToken,
+    provider_label: String,
+}
+
+/// The conversation a compaction must run in.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompactionTargetIdentity {
+    pub provider_instance_id: String,
+    pub provider_kind: String,
+    pub conversation_id: Option<String>,
+}
+
 enum SupervisorMessage {
     Launch {
         request: Box<ProviderLaunchRequest>,
@@ -630,6 +679,16 @@ enum SupervisorMessage {
     },
     StopSessionIfCurrent {
         identity: ProviderSessionIdentity,
+        response: oneshot::Sender<Result<(), ProviderRuntimeError>>,
+    },
+    BeginCompaction {
+        thread_id: String,
+        target: CompactionTargetIdentity,
+        response: oneshot::Sender<Result<Option<CompactionSession>, ProviderRuntimeError>>,
+    },
+    RetireCompactionSession {
+        identity: ProviderSessionIdentity,
+        turn_id: Option<String>,
         response: oneshot::Sender<Result<(), ProviderRuntimeError>>,
     },
     SuspendSessionForRemovalIfCurrent {
@@ -808,6 +867,8 @@ type SessionPublicationFence = Arc<Mutex<SessionPublicationState>>;
 struct SessionEntry {
     launch: ProviderLaunchRequest,
     driver: Arc<dyn ProviderDriver>,
+    /// Settles what the session leaves streaming once its pump is reaped, whoever detaches it.
+    engine: OrchestrationEngine,
     configuration_healthy: bool,
     resume_cursor: Option<Value>,
     runtime_payload: Option<Value>,
@@ -832,6 +893,9 @@ struct SessionEntry {
     /// The session is a new provider conversation for a thread whose earlier one was lost, so
     /// the next turn sent to it carries the thread's earlier messages.
     pending_context_handoff: Arc<AtomicBool>,
+    /// The event pump recorded that the provider refused to resume this session, so every later
+    /// write of its runtime row keeps `resumeRefused` until another launch replaces the entry.
+    resume_refusal_recorded: Arc<AtomicBool>,
     terminal_sender: mpsc::UnboundedSender<SupervisorMessage>,
     activity_dispatch_sender: mpsc::Sender<ActivityDispatchEnvelope>,
     activity_dispatch_capacity: usize,
@@ -1206,8 +1270,16 @@ impl ProviderRuntimeSupervisor {
                 .provider_instance_id
                 .clone()
                 .unwrap_or_else(|| request.provider.clone());
+            let owner_thread_id = request
+                .host_thread_id
+                .clone()
+                .unwrap_or_else(|| request.thread_id.clone());
             let issued = connect
-                .issue_mcp_credential(request.thread_id.clone(), provider_instance_id)
+                .issue_mcp_credential(
+                    request.thread_id.clone(),
+                    owner_thread_id,
+                    provider_instance_id,
+                )
                 .await
                 .map_err(|error| ProviderRuntimeError::Provider {
                     provider: request.provider.clone(),
@@ -1300,6 +1372,36 @@ impl ProviderRuntimeSupervisor {
         response_rx
             .await
             .map_err(|_| ProviderRuntimeError::ResponseDropped)?
+    }
+
+    /// The thread's live session, for a compaction of `target`, with its idle deadline reset.
+    /// `None` when the session is for another instance or conversation.
+    pub async fn begin_compaction(
+        &self,
+        thread_id: &str,
+        target: CompactionTargetIdentity,
+    ) -> Result<Option<CompactionSession>, ProviderRuntimeError> {
+        self.request(|response| SupervisorMessage::BeginCompaction {
+            thread_id: thread_id.to_owned(),
+            target,
+            response,
+        })
+        .await
+    }
+
+    /// Ends a session whose compaction BiBCode could not confirm, keeping its saved conversation
+    /// so the next message resumes it. Does nothing once the session was replaced.
+    async fn retire_compaction_session(
+        &self,
+        identity: ProviderSessionIdentity,
+        turn_id: Option<String>,
+    ) -> Result<(), ProviderRuntimeError> {
+        self.request(|response| SupervisorMessage::RetireCompactionSession {
+            identity,
+            turn_id,
+            response,
+        })
+        .await
     }
 
     pub async fn suspend_session_for_removal_if_current(
@@ -2371,6 +2473,26 @@ pub async fn reconcile_abandoned_provider_sessions(
     const RESTART_ERROR: &str =
         "Provider session ended when BiBCode stopped. Review delivery status before continuing.";
     let repositories = engine.repositories();
+    // No session is live yet, so every reasoning row still streaming is orphaned. This reads
+    // the reasoning table itself: a stopped session's runtime row, which the loop below visits,
+    // is already gone.
+    match repositories.list_streaming_reasoning().await {
+        Ok(rows) => {
+            if let Err(error) = settle_streaming_reasoning_rows(
+                engine,
+                rows,
+                &format!("provider-restart-reconcile:{}", Uuid::new_v4()),
+                &now(),
+            )
+            .await
+            {
+                tracing::warn!(%error, "reasoning remained streaming after startup reconciliation");
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%error, "failed to read streaming reasoning for startup reconciliation");
+        }
+    }
     let runtimes = repositories
         .list_provider_session_runtimes()
         .await
@@ -2477,6 +2599,8 @@ pub async fn reconcile_abandoned_provider_sessions(
             tracing::warn!(thread_id, %error, "projected provider session remains eligible for startup reconciliation retry");
         }
     }
+    // After the sessions: a recovery's settlement restores the original error over the restart's.
+    settle_abandoned_compactions(engine).await;
     Ok(())
 }
 
@@ -2581,6 +2705,8 @@ async fn reconcile_abandoned_provider_session(
                 command_id: format!("provider-restart-reconcile:{}", Uuid::new_v4()),
                 thread_id: session.thread_id.clone(),
                 session,
+                compaction_id: None,
+                context_limit: None,
                 created_at: settled_at,
             })
             .await
@@ -2607,7 +2733,7 @@ mod workspace_loss_tests {
         persistence::{Database, ProjectionThreadSession, run_migrations},
     };
     use std::sync::atomic::AtomicUsize;
-    use tokio::sync::Notify;
+    use tokio::{sync::Notify, time::timeout};
 
     const BEFORE_LOSS: &str = "2026-01-01T00:00:00Z";
     const LOSS_ERROR: &str = "Provider session stopped because its workspace became unavailable. Review delivery status before continuing.";
@@ -2633,7 +2759,16 @@ mod workspace_loss_tests {
         bounded_events: Arc<std::sync::Mutex<Option<BoundedLossEvents>>>,
         delivery_entered: Arc<Notify>,
         delivery_release: Arc<Notify>,
+        /// What `compact` answers, and the events it reports (`$id` is the compaction id).
+        compact_script: Arc<std::sync::Mutex<Option<CompactScript>>>,
+        compact_calls: Arc<std::sync::Mutex<Vec<String>>>,
+        /// `compact` reports its scripted events and then never answers, as a request the
+        /// provider took but did not reply to.
+        compact_hangs: Arc<AtomicBool>,
+        interrupts: Arc<AtomicUsize>,
     }
+
+    type CompactScript = (ProviderCompactionStart, Vec<ProviderEvent>);
 
     impl ProviderDriverFactory for LossDriver {
         fn create(
@@ -2698,7 +2833,39 @@ mod workspace_loss_tests {
             &self,
             _: Option<String>,
         ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
-            Box::pin(async { Ok(()) })
+            Box::pin(async {
+                self.interrupts.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        }
+
+        fn compact(&self, compaction_id: String) -> BoxRuntimeFuture<'_, ProviderCompactionStart> {
+            Box::pin(async move {
+                self.compact_calls
+                    .lock()
+                    .unwrap()
+                    .push(compaction_id.clone());
+                let Some((start, events)) = self.compact_script.lock().unwrap().clone() else {
+                    return ProviderCompactionStart::NotStarted {
+                        detail: "no compaction scripted".to_owned(),
+                    };
+                };
+                {
+                    let mut queue = self.event_queue.lock().unwrap();
+                    let queue = queue.entry(self.thread_id.clone()).or_default();
+                    for mut event in events {
+                        if event.payload.get("compactionId") == Some(&json!("$id")) {
+                            event.payload["compactionId"] = json!(compaction_id);
+                        }
+                        queue.push_back(event);
+                    }
+                }
+                self.events_changed.notify_one();
+                if self.compact_hangs.load(Ordering::SeqCst) {
+                    std::future::pending::<()>().await;
+                }
+                start
+            })
         }
 
         fn approve(
@@ -2934,6 +3101,532 @@ mod workspace_loss_tests {
             "runtimeMode":"full-access", "interactionMode":"default", "createdAt":BEFORE_LOSS,
         }))
         .unwrap()
+    }
+
+    /// A manual compaction of the fixture's live Codex conversation.
+    async fn request_compaction(f: &Fixture) -> String {
+        f.project("ready").await;
+        f.engine
+            .dispatch(
+                serde_json::from_value(json!({
+                    "type":"thread.compact", "commandId":"compact", "threadId":"t1",
+                    "createdAt":BEFORE_LOSS,
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        f.engine
+            .unsettled_thread_compaction("t1")
+            .await
+            .unwrap()
+            .expect("a requested compaction")
+            .compaction_id
+    }
+
+    fn script(f: &Fixture, start: ProviderCompactionStart, events: Vec<ProviderEvent>) {
+        *f.driver.compact_script.lock().unwrap() = Some((start, events));
+    }
+
+    async fn drive(f: &Fixture, compaction_id: &str) -> ThreadCompactionRow {
+        timeout(
+            Duration::from_secs(10),
+            drive_thread_compaction(
+                &f.supervisor,
+                &f.engine,
+                &f._root.path().to_path_buf(),
+                compaction_id,
+                &CancellationToken::new(),
+            ),
+        )
+        .await
+        .expect("a compaction settles within its bounds")
+        .unwrap();
+        f.engine
+            .thread_compaction(compaction_id)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    fn started_compaction() -> ProviderCompactionStart {
+        ProviderCompactionStart::Started {
+            turn_id: Some("compaction-turn".to_owned()),
+        }
+    }
+
+    fn compaction_events(item: bool, state: &str) -> Vec<ProviderEvent> {
+        let mut events = vec![core_event(
+            "turn.started",
+            "compaction-turn",
+            json!({"compactionId":"$id"}),
+        )];
+        if item {
+            events.push(core_event(
+                "item.completed",
+                "compaction-turn",
+                json!({"itemType":"context_compaction","status":"completed","title":"Conversation compaction"}),
+            ));
+        }
+        events.push(core_event(
+            "turn.completed",
+            "compaction-turn",
+            json!({"state":state, "compactionId":"$id"}),
+        ));
+        events
+    }
+
+    fn with_bounds(run: Duration, grace: Duration, turn_start: Duration) {
+        COMPACTION_TEST_BOUNDS.with(|bounds| bounds.set(Some((run, grace, turn_start))));
+    }
+
+    #[tokio::test]
+    async fn a_compaction_settles_completed_from_its_tagged_turn_and_item() {
+        let f = Fixture::new(true).await;
+        let id = request_compaction(&f).await;
+        script(
+            &f,
+            started_compaction(),
+            compaction_events(true, "completed"),
+        );
+        let row = drive(&f, &id).await;
+        assert_eq!(row.state, "completed");
+        assert_eq!(row.turn_id.as_deref(), Some("compaction-turn"));
+        assert_eq!(*f.driver.compact_calls.lock().unwrap(), vec![id.clone()]);
+        assert_eq!(f.session().await.status, "ready");
+        f.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_compaction_turn_without_a_completed_compaction_item_fails() {
+        let f = Fixture::new(true).await;
+        let id = request_compaction(&f).await;
+        script(
+            &f,
+            started_compaction(),
+            compaction_events(false, "completed"),
+        );
+        let row = drive(&f, &id).await;
+        assert_eq!(row.state, "failed");
+        let session = f.session().await;
+        assert_eq!(session.status, "error");
+        assert!(
+            session
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.ends_with("couldn't compact the conversation.")),
+            "{:?}",
+            session.last_error
+        );
+        f.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_compaction_of_another_conversation_fails_without_asking_the_provider() {
+        let f = Fixture::new(true).await;
+        let id = request_compaction(&f).await;
+        f.engine
+            .repositories()
+            .database()
+            .call(|connection| {
+                connection.execute(
+                    "UPDATE thread_compactions SET conversation_id = 'another-thread'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        script(
+            &f,
+            started_compaction(),
+            compaction_events(true, "completed"),
+        );
+        let row = drive(&f, &id).await;
+        assert_eq!(row.state, "failed");
+        assert_eq!(
+            row.detail.as_deref(),
+            Some("The thread's provider or conversation changed, so it wasn't compacted.")
+        );
+        assert!(f.driver.compact_calls.lock().unwrap().is_empty());
+        f.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn an_unknown_request_that_starts_no_turn_ends_its_session() {
+        with_bounds(
+            Duration::from_secs(5),
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+        );
+        let f = Fixture::new(true).await;
+        let id = request_compaction(&f).await;
+        script(
+            &f,
+            ProviderCompactionStart::Unknown {
+                detail: "the answer was lost".to_owned(),
+            },
+            Vec::new(),
+        );
+        let row = drive(&f, &id).await;
+        assert_eq!(row.state, "failed");
+        assert_eq!(
+            row.detail.as_deref(),
+            Some("BiBCode couldn't confirm whether the conversation was compacted.")
+        );
+        assert!(
+            f.supervisor
+                .capture_session_identity("t1")
+                .await
+                .unwrap()
+                .is_none(),
+            "the session that may hold the compaction ended"
+        );
+        // Its saved conversation stays, so the next message resumes it.
+        assert!(f.runtime().await["resume_cursor"].is_object());
+        f.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_compaction_at_its_bound_is_interrupted_then_its_session_ended() {
+        with_bounds(
+            Duration::from_millis(200),
+            Duration::from_millis(100),
+            Duration::from_secs(5),
+        );
+        let f = Fixture::new(true).await;
+        let id = request_compaction(&f).await;
+        script(
+            &f,
+            started_compaction(),
+            vec![core_event(
+                "turn.started",
+                "compaction-turn",
+                json!({"compactionId":"$id"}),
+            )],
+        );
+        let row = drive(&f, &id).await;
+        assert_eq!(row.state, "failed");
+        assert!(
+            f.supervisor
+                .capture_session_identity("t1")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let session = f.session().await;
+        assert_eq!(session.status, "error");
+        assert_eq!(
+            session.last_error.as_deref(),
+            Some("BiBCode couldn't confirm whether the conversation was compacted.")
+        );
+        assert_eq!(session.active_turn_id, None);
+        f.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn the_completion_of_an_earlier_compaction_settles_nothing() {
+        with_bounds(
+            Duration::from_millis(300),
+            Duration::from_millis(100),
+            Duration::from_secs(5),
+        );
+        let f = Fixture::new(true).await;
+        let id = request_compaction(&f).await;
+        script(
+            &f,
+            started_compaction(),
+            vec![
+                core_event(
+                    "turn.started",
+                    "compaction-turn",
+                    json!({"compactionId":"$id"}),
+                ),
+                core_event(
+                    "turn.completed",
+                    "compaction-turn",
+                    json!({"state":"completed", "compactionId":"compaction:earlier"}),
+                ),
+            ],
+        );
+        let row = drive(&f, &id).await;
+        assert_ne!(row.state, "completed");
+        f.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn stop_during_a_running_compaction_settles_it_interrupted() {
+        let f = Fixture::new(true).await;
+        let id = request_compaction(&f).await;
+        script(
+            &f,
+            started_compaction(),
+            vec![core_event(
+                "turn.started",
+                "compaction-turn",
+                json!({"compactionId":"$id"}),
+            )],
+        );
+        let driving = {
+            let (supervisor, engine, root, id) = (
+                f.supervisor.clone(),
+                f.engine.clone(),
+                f._root.path().to_path_buf(),
+                id.clone(),
+            );
+            tokio::spawn(async move {
+                drive_thread_compaction(&supervisor, &engine, &root, &id, &CancellationToken::new())
+                    .await
+            })
+        };
+        timeout(Duration::from_secs(5), async {
+            while f.session().await.active_turn_id.as_deref() != Some("compaction-turn") {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        f.engine
+            .dispatch(
+                serde_json::from_value(json!({
+                    "type":"thread.turn.interrupt", "commandId":"stop", "threadId":"t1",
+                    "createdAt":BEFORE_LOSS,
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        enqueue(
+            &f,
+            [core_event(
+                "turn.completed",
+                "compaction-turn",
+                json!({"state":"interrupted", "compactionId":id}),
+            )],
+        );
+        timeout(Duration::from_secs(5), driving)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let row = f.engine.thread_compaction(&id).await.unwrap().unwrap();
+        assert_eq!(row.state, "interrupted");
+        assert!(row.stop_requested);
+        f.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_compaction_request_the_provider_never_answers_is_still_bounded() {
+        with_bounds(
+            Duration::from_millis(300),
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+        );
+        let f = Fixture::new(true).await;
+        let id = request_compaction(&f).await;
+        // The provider starts the compaction's turn but never answers the request itself.
+        f.driver.compact_hangs.store(true, Ordering::SeqCst);
+        script(
+            &f,
+            started_compaction(),
+            vec![core_event(
+                "turn.started",
+                "compaction-turn",
+                json!({"compactionId":"$id"}),
+            )],
+        );
+        let row = drive(&f, &id).await;
+        assert_eq!(row.state, "failed");
+        assert_eq!(
+            row.detail.as_deref(),
+            Some("BiBCode couldn't confirm whether the conversation was compacted.")
+        );
+        assert_eq!(row.turn_id.as_deref(), Some("compaction-turn"));
+        assert!(
+            f.driver.interrupts.load(Ordering::SeqCst) >= 1,
+            "the bound interrupts the turn first"
+        );
+        assert!(
+            f.supervisor
+                .capture_session_identity("t1")
+                .await
+                .unwrap()
+                .is_none(),
+            "then ends the session that may hold it"
+        );
+        f.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_stop_asked_for_before_the_provider_names_the_turn_still_interrupts_it() {
+        let f = Fixture::new(true).await;
+        let id = request_compaction(&f).await;
+        // Stop reached the row while the request was on its way: nothing was running for the
+        // runtime to interrupt yet.
+        f.engine
+            .repositories()
+            .database()
+            .call(|connection| {
+                connection.execute("UPDATE thread_compactions SET stop_requested = 1", [])?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        script(
+            &f,
+            started_compaction(),
+            vec![core_event(
+                "turn.started",
+                "compaction-turn",
+                json!({"compactionId":"$id"}),
+            )],
+        );
+        let driving = {
+            let (supervisor, engine, root, id) = (
+                f.supervisor.clone(),
+                f.engine.clone(),
+                f._root.path().to_path_buf(),
+                id.clone(),
+            );
+            tokio::spawn(async move {
+                drive_thread_compaction(&supervisor, &engine, &root, &id, &CancellationToken::new())
+                    .await
+            })
+        };
+        timeout(Duration::from_secs(5), async {
+            while f.driver.interrupts.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the compaction's turn is interrupted once the provider names it");
+        crate::diagnostics::profiler::provider_turns::take_recorded();
+        enqueue(
+            &f,
+            [core_event(
+                "turn.completed",
+                "compaction-turn",
+                json!({"state":"interrupted", "compactionId":id}),
+            )],
+        );
+        timeout(Duration::from_secs(5), driving)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let row = f.engine.thread_compaction(&id).await.unwrap().unwrap();
+        assert_eq!(row.state, "interrupted");
+        f.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_claude_instance_that_disables_compaction_reads_as_not_compacting_automatically() {
+        let f = Fixture::new(false).await;
+        let mut launch = f.launch.clone();
+        launch.provider = "claudeAgent".into();
+        launch.provider_instance_id = Some("claudeAgent".into());
+        let cursor = json!({"sessionId":"claude-session"});
+        let tagged = |launch: &ProviderLaunchRequest| {
+            let mut reading = json!({"usedTokens": 961_230, "compactsAutomatically": true});
+            tag_context_window_reading(&mut reading, launch, Some(&cursor));
+            reading
+        };
+        let reading = tagged(&launch);
+        assert_eq!(reading["providerInstanceId"], "claudeAgent");
+        assert_eq!(reading["conversationId"], "claude-session");
+        assert_eq!(reading["compactsAutomatically"], true);
+        for (name, value, disabled) in [
+            ("DISABLE_COMPACT", "1", true),
+            ("DISABLE_AUTO_COMPACT", "true", true),
+            ("DISABLE_COMPACT", "0", false),
+            ("DISABLE_COMPACT", "false", false),
+            ("DISABLE_COMPACT", "", false),
+        ] {
+            let mut launch = launch.clone();
+            launch.environment.insert(name.into(), value.into());
+            assert_eq!(
+                tagged(&launch)["compactsAutomatically"],
+                !disabled,
+                "{name}={value}"
+            );
+        }
+        // The variables are Claude's: another provider's reading is left as reported.
+        let mut codex = f.launch.clone();
+        codex
+            .environment
+            .insert("DISABLE_COMPACT".into(), "1".into());
+        assert_eq!(tagged(&codex)["compactsAutomatically"], true);
+        f.shutdown().await;
+    }
+
+    /// The `provider.compaction` records made on this thread since the last call.
+    fn recorded_compactions() -> Vec<Value> {
+        crate::diagnostics::profiler::provider_turns::take_recorded()
+            .into_iter()
+            .filter(|(kind, _)| *kind == "provider.compaction")
+            .map(|(_, evidence)| evidence)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_compaction_stopped_before_its_effect_ran_is_still_recorded() {
+        let f = Fixture::new(true).await;
+        let id = request_compaction(&f).await;
+        f.engine
+            .dispatch(
+                serde_json::from_value(json!({
+                    "type":"thread.turn.interrupt", "commandId":"stop", "threadId":"t1",
+                    "createdAt":BEFORE_LOSS,
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        recorded_compactions();
+        let row = drive(&f, &id).await;
+        assert_eq!(row.state, "interrupted");
+        assert!(f.driver.compact_calls.lock().unwrap().is_empty());
+        let recorded = recorded_compactions();
+        assert_eq!(recorded.len(), 1, "{recorded:?}");
+        assert_eq!(recorded[0]["outcome"], "interrupted");
+        assert_eq!(recorded[0]["reason"], "stopped");
+        assert_eq!(recorded[0]["trigger"], "manual");
+        f.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_failed_codex_turn_records_one_provider_turn_failure() {
+        let f = Fixture::new(true).await;
+        crate::diagnostics::profiler::provider_turns::take_recorded();
+        enqueue(
+            &f,
+            [
+                core_event("turn.started", "turn-1", json!({})),
+                core_event(
+                    "turn.completed",
+                    "turn-1",
+                    json!({"state":"failed", "errorMessage":"The context window is full.",
+                        "errorClass":"provider_error", "providerReason":"contextWindowExceeded"}),
+                ),
+            ],
+        );
+        timeout(Duration::from_secs(5), async {
+            while f.session().await.status != "error" {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the failed turn is projected");
+        let failures: Vec<Value> = crate::diagnostics::profiler::provider_turns::take_recorded()
+            .into_iter()
+            .filter(|(kind, _)| *kind == "provider.turn-failed")
+            .map(|(_, evidence)| evidence)
+            .collect();
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(failures[0]["provider"], "codex");
+        assert_eq!(failures[0]["terminalReason"], "context_window_exceeded");
+        assert_eq!(failures[0]["errorClass"], "provider_error");
+        f.shutdown().await;
     }
 
     #[tokio::test]
@@ -3441,6 +4134,55 @@ mod workspace_loss_tests {
                 .is_none()
         );
         f.shutdown().await;
+    }
+
+    /// A delivery the provider accepted without naming its turn (a Codex `/compact`, whose turn
+    /// Codex reports after answering) keeps the turn the provider already reported running, so
+    /// Stop can still settle it.
+    #[tokio::test]
+    async fn acceptance_without_a_turn_keeps_the_turn_the_provider_already_started() {
+        let gate = Arc::new(PublicationTestGate::default());
+        let f = Fixture::with_hook(
+            true,
+            AcceptedPublicationTestHook {
+                before_publication: Some(gate.clone()),
+                ..AcceptedPublicationTestHook::default()
+            },
+        )
+        .await;
+        f.driver.unknown_turn_id.store(true, Ordering::SeqCst);
+        let delivery = f
+            .supervisor
+            .deliver_turn(turn("compact", false), "compact-key".into())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
+            .await
+            .unwrap();
+        let mut events = f.engine.subscribe_events();
+        enqueue(&f, [core_event("turn.started", "provider-turn", json!({}))]);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let event = events.recv().await.unwrap();
+                if event.event.event_type == "thread.session-set"
+                    && event.event.payload.pointer("/session/activeTurnId")
+                        == Some(&json!("provider-turn"))
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        gate.release.notify_one();
+        let outcome = tokio::time::timeout(Duration::from_secs(5), delivery.completion())
+            .await
+            .unwrap();
+        let session = f.session().await;
+        f.shutdown().await;
+        assert_eq!(outcome, ProviderDeliveryOutcome::Accepted { turn_id: None });
+        assert_eq!(session.status, "running");
+        assert_eq!(session.active_turn_id.as_deref(), Some("provider-turn"));
     }
 
     #[tokio::test]
@@ -4208,6 +4950,54 @@ mod workspace_loss_tests {
         .unwrap();
         // This read is behind the terminal engine command, after the complete core batch.
         engine.read_events(0).await.unwrap();
+    }
+
+    /// #173: stopping a session aborts its pump, which cannot settle its own reasoning; the
+    /// stop does, so no thought is left reading "Thinking" on a thread without a session.
+    #[tokio::test]
+    async fn stopping_a_session_settles_the_reasoning_it_left_streaming() {
+        let f = Fixture::new(false).await;
+        let (activity, mut sessions) = direct_session(&f).await;
+        enqueue(
+            &f,
+            [ProviderEvent {
+                item_id: Some("thought-1".into()),
+                ..core_event(
+                    "content.delta",
+                    "turn-1",
+                    json!({"streamKind":"reasoning_text","delta":"Half a thought"}),
+                )
+            }],
+        );
+        let repositories = f.engine.repositories();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while repositories
+                .list_streaming_reasoning_by_thread("t1".into())
+                .await
+                .unwrap()
+                .is_empty()
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the thought is written while it streams");
+
+        stop_session(&repositories, &activity, &mut sessions, "t1")
+            .await
+            .unwrap();
+
+        let rows = repositories
+            .list_reasoning_by_thread("t1".into())
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.text.as_str(), row.is_streaming))
+                .collect::<Vec<_>>(),
+            [("Half a thought", false)]
+        );
+        f.shutdown().await;
     }
 
     #[tokio::test]
@@ -4997,6 +5787,7 @@ async fn build_launch_request(
         mcp: None,
         codex_home,
         open_url: None,
+        host_thread_id: thread.host_thread_id.clone(),
     })
 }
 
@@ -5481,6 +6272,28 @@ async fn run_supervisor(
                         driver: entry.driver.clone(),
                     });
                 let _ = response.send(Ok(identity));
+            }
+            SupervisorMessage::BeginCompaction {
+                thread_id,
+                target,
+                response,
+            } => {
+                let _ = response.send(begin_session_compaction(&sessions, &thread_id, &target));
+            }
+            SupervisorMessage::RetireCompactionSession {
+                identity,
+                turn_id,
+                response,
+            } => {
+                let result = retire_compaction_session(
+                    &engine,
+                    &activity,
+                    &mut sessions,
+                    &identity,
+                    turn_id.as_deref(),
+                )
+                .await;
+                let _ = response.send(result);
             }
             SupervisorMessage::StopSessionIfCurrent { identity, response } => {
                 let is_current = sessions
@@ -6681,6 +7494,7 @@ mod context_handoff_tests {
             delivery_reason: None,
             delivery_mode: None,
             delivery_held: None,
+            resend_of_message_id: None,
             created_at: format!("2026-01-01T00:00:{id:02}Z"),
             updated_at: format!("2026-01-01T00:00:{id:02}Z"),
         }
@@ -6876,6 +7690,28 @@ async fn publish_running_session(
         );
         return Ok(());
     }
+    // An acceptance that names no turn (a Codex compaction, whose turn Codex reports after it
+    // answers) keeps the turn the provider already reported, so Stop can still settle that turn.
+    let turn_id = match turn_id {
+        Some(turn_id) => Some(turn_id),
+        None => match engine
+            .repositories()
+            .get_thread_session(entry.launch.thread_id.clone())
+            .await
+        {
+            Ok(session) => session
+                .filter(|session| session.status == "running")
+                .and_then(|session| session.active_turn_id),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    thread_id = %entry.launch.thread_id,
+                    "the running turn could not be read before marking an accepted delivery running"
+                );
+                None
+            }
+        },
+    };
     let runtime = persist_entry(&engine.repositories(), entry, "running").await;
     if best_effort {
         if let Err(error) = runtime {
@@ -7392,6 +8228,7 @@ async fn launch_session(
         }
     }
     let pending_context_handoff = Arc::new(AtomicBool::new(context_handoff));
+    let resume_refusal_recorded = Arc::new(AtomicBool::new(false));
     persist_runtime(
         &engine.repositories(),
         &request,
@@ -7421,6 +8258,7 @@ async fn launch_session(
         started.resume_cursor.clone(),
         started.runtime_payload.clone(),
         pending_context_handoff.clone(),
+        resume_refusal_recorded.clone(),
         activity.clone(),
         activity_lifecycle.clone(),
         activity_capable,
@@ -7441,6 +8279,7 @@ async fn launch_session(
         SessionEntry {
             launch: request,
             driver,
+            engine: engine.clone(),
             configuration_healthy: true,
             resume_cursor: started.resume_cursor,
             runtime_payload: started.runtime_payload,
@@ -7463,6 +8302,7 @@ async fn launch_session(
             pending_stream_settlement: None,
             idle_generation,
             pending_context_handoff,
+            resume_refusal_recorded,
             terminal_sender,
             activity_dispatch_sender,
             activity_dispatch_capacity,
@@ -7881,6 +8721,640 @@ async fn reopen_for_rewind(
         ));
     }
     Ok((label, true))
+}
+
+/// How long a compaction may run before BiBCode interrupts it. A near-1M-token compaction takes
+/// 70 to 80 seconds.
+const COMPACTION_BOUND: Duration = Duration::from_secs(15 * 60);
+/// How long an interrupted compaction may take to end before BiBCode ends its session.
+const COMPACTION_INTERRUPT_GRACE: Duration = Duration::from_secs(30);
+/// How long a compaction request may go without its turn starting.
+const COMPACTION_TURN_START_BOUND: Duration = Duration::from_secs(60);
+const COMPACTION_UNCONFIRMED_DETAIL: &str =
+    "BiBCode couldn't confirm whether the conversation was compacted.";
+const COMPACTION_IDENTITY_CHANGED_DETAIL: &str =
+    "The thread's provider or conversation changed, so it wasn't compacted.";
+
+#[cfg(test)]
+thread_local! {
+    /// Shorter compaction bounds for a test on this thread (its runtime is single-threaded).
+    static COMPACTION_TEST_BOUNDS: std::cell::Cell<Option<(Duration, Duration, Duration)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The compaction bounds: the run, the interrupt grace and the turn start.
+fn compaction_bounds() -> (Duration, Duration, Duration) {
+    #[cfg(test)]
+    if let Some(bounds) = COMPACTION_TEST_BOUNDS.with(std::cell::Cell::get) {
+        return bounds;
+    }
+    (
+        COMPACTION_BOUND,
+        COMPACTION_INTERRUPT_GRACE,
+        COMPACTION_TURN_START_BOUND,
+    )
+}
+
+/// How a compaction ended, for its settlement and the Profiler.
+struct CompactionRun {
+    outcome: &'static str,
+    /// The Profiler's reason; `None` for a completed compaction.
+    reason: Option<&'static str>,
+    detail: Option<String>,
+}
+
+impl CompactionRun {
+    fn failed(reason: &'static str, detail: String) -> Self {
+        Self {
+            outcome: "failed",
+            reason: Some(reason),
+            detail: Some(detail),
+        }
+    }
+}
+
+/// Drives one requested compaction to its settlement: reopens a suspended session (with the
+/// delivery's frozen launch for a recovery or guard, with the thread's saved runtime for a
+/// manual one), starts it unless a Stop got there first, checks the live session is the
+/// conversation the row records, asks the driver, waits for the tagged turn within its bounds,
+/// and settles the row. Abandoned at shutdown; the next startup settles it.
+pub async fn drive_thread_compaction(
+    supervisor: &ProviderRuntimeSupervisor,
+    engine: &OrchestrationEngine,
+    settings_root: &PathBuf,
+    compaction_id: &str,
+    cancellation: &CancellationToken,
+) -> Result<(), String> {
+    let Some(row) = engine
+        .thread_compaction(compaction_id)
+        .await
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(());
+    };
+    let started = std::time::Instant::now();
+    if !row.is_unsettled() {
+        // A Stop settled it before the effect read it: the effect runs once per request, so
+        // this is its only record.
+        record_settled_compaction(engine, &row, Some("stopped"), started).await;
+        return Ok(());
+    }
+    let mut wait = engine
+        .compaction_waiters()
+        .register(&row.thread_id, compaction_id);
+    let run = tokio::select! {
+        run = run_thread_compaction(supervisor, engine, settings_root, &row, &mut wait) => run,
+        () = cancellation.cancelled() => {
+            engine.compaction_waiters().forget(compaction_id);
+            return Ok(());
+        }
+    };
+    engine.compaction_waiters().forget(compaction_id);
+    let Some(run) = run else {
+        // A Stop settled it before anything was sent.
+        record_settled_compaction(engine, &row, Some("stopped"), started).await;
+        return Ok(());
+    };
+    if run.outcome == "failed" {
+        tracing::warn!(
+            thread_id = %row.thread_id,
+            provider = %row.provider_kind,
+            trigger = %row.trigger,
+            reason = run.reason.unwrap_or_default(),
+            "conversation compaction failed"
+        );
+    }
+    let settle = engine
+        .dispatch(OrchestrationCommand::ThreadCompactionSettle {
+            command_id: format!("server:compaction-settle:{compaction_id}"),
+            thread_id: row.thread_id.clone(),
+            compaction_id: compaction_id.to_owned(),
+            outcome: run.outcome.to_owned(),
+            detail: run.detail,
+            restarted: false,
+            created_at: now(),
+        })
+        .await;
+    engine.wake_turn_delivery();
+    if let Err(error) = settle {
+        tracing::warn!(thread_id = %row.thread_id, %error, "a conversation compaction could not be settled");
+    }
+    record_settled_compaction(engine, &row, run.reason, started).await;
+    Ok(())
+}
+
+/// Records how a compaction settled in the Profiler, from the row's final state: a Stop asked
+/// for during it makes it `interrupted` even if the provider completed it.
+pub(crate) async fn record_settled_compaction(
+    engine: &OrchestrationEngine,
+    row: &ThreadCompactionRow,
+    reason: Option<&str>,
+    started: std::time::Instant,
+) {
+    let outcome = engine
+        .thread_compaction(&row.compaction_id)
+        .await
+        .ok()
+        .flatten()
+        .map_or_else(|| "interrupted".to_owned(), |row| row.state);
+    let reason = match outcome.as_str() {
+        "completed" => None,
+        "interrupted" => Some(
+            reason
+                .filter(|reason| *reason == "unconfirmed")
+                .unwrap_or("stopped"),
+        ),
+        _ => reason,
+    };
+    crate::diagnostics::profiler::provider_turns::record_compaction(
+        crate::diagnostics::profiler::provider_turns::CompactionRecord {
+            provider: &row.provider_kind,
+            trigger: &row.trigger,
+            outcome: &outcome,
+            reason,
+            duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        },
+    );
+}
+
+/// Startup reconciliation: BiBCode stopped with these compactions unsettled, and the provider
+/// sessions that ran them ended with it. Each settles `interrupted` before delivery starts: a
+/// recovery sends no copy and keeps the original's error, a guard fails its message.
+async fn settle_abandoned_compactions(engine: &OrchestrationEngine) {
+    let rows = match engine.unsettled_thread_compactions().await {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::warn!(%error, "unsettled conversation compactions could not be read at startup");
+            return;
+        }
+    };
+    for row in rows {
+        let started = std::time::Instant::now();
+        let settled = engine
+            .dispatch(OrchestrationCommand::ThreadCompactionSettle {
+                command_id: format!("server:compaction-settle:{}", row.compaction_id),
+                thread_id: row.thread_id.clone(),
+                compaction_id: row.compaction_id.clone(),
+                outcome: "interrupted".to_owned(),
+                detail: None,
+                restarted: true,
+                created_at: now(),
+            })
+            .await;
+        match settled {
+            Ok(_) => record_settled_compaction(engine, &row, Some("unconfirmed"), started).await,
+            Err(error) => tracing::warn!(
+                thread_id = %row.thread_id,
+                %error,
+                "an abandoned conversation compaction could not be settled at startup"
+            ),
+        }
+    }
+}
+
+/// Reopens the thread's suspended session for a compaction, without ever starting a new
+/// conversation: there would be nothing to compact. A live session needs nothing.
+async fn reopen_for_compaction(
+    supervisor: &ProviderRuntimeSupervisor,
+    engine: &OrchestrationEngine,
+    settings_root: &PathBuf,
+    row: &ThreadCompactionRow,
+) -> Result<Option<String>, CompactionRun> {
+    let not_started = |detail: String| CompactionRun::failed("not_started", detail);
+    if supervisor
+        .capture_session_identity(&row.thread_id)
+        .await
+        .map_err(|error| not_started(delivery_detail(&error, None)))?
+        .is_some()
+    {
+        return Ok(None);
+    }
+    let delivery = match (&row.failed_message_id, &row.guarded_delivery_command_id) {
+        (Some(message_id), _) => engine
+            .repositories()
+            .get_provider_turn_delivery_for_message(row.thread_id.clone(), message_id.clone())
+            .await
+            .map_err(|error| not_started(error.to_string()))?,
+        (None, Some(command_id)) => engine
+            .repositories()
+            .get_provider_turn_delivery(command_id.clone())
+            .await
+            .map_err(|error| not_started(error.to_string()))?,
+        (None, None) => None,
+    };
+    // A recovery and the guard reopen with the delivery's frozen launch, as a delivery retry
+    // does; a manual compaction with the thread's saved runtime, as revert does.
+    let request = match &delivery {
+        Some(delivery) => {
+            let command = serde_json::from_value::<OrchestrationCommand>(delivery.payload.clone())
+                .map_err(|error| not_started(error.to_string()))?;
+            build_launch_request_for_command(engine, settings_root, &command, Some(delivery), false)
+                .await
+        }
+        None => {
+            build_launch_request(
+                engine,
+                settings_root,
+                &row.thread_id,
+                None,
+                None,
+                None,
+                false,
+            )
+            .await
+        }
+    }
+    .map_err(|error| not_started(delivery_detail(&error, None)))?;
+    let label = request.provider_label.clone();
+    if request.resume_cursor.is_none() {
+        return Err(not_started(format!(
+            "There's no saved {label} conversation for this thread to compact."
+        )));
+    }
+    if let Err(error) = supervisor
+        .launch_with_context_handoff(request, false, None, true)
+        .await
+    {
+        let reason = match error {
+            ProviderRuntimeError::FrozenConversationLost { .. } => {
+                format!("{label} no longer has this conversation.")
+            }
+            error => delivery_detail(&error, Some(&label)),
+        };
+        return Err(not_started(format!(
+            "Couldn't reopen {label} to compact the conversation. {reason}"
+        )));
+    }
+    Ok(Some(label))
+}
+
+/// Runs a started compaction to its outcome. `None` when a Stop settled it before it started.
+async fn run_thread_compaction(
+    supervisor: &ProviderRuntimeSupervisor,
+    engine: &OrchestrationEngine,
+    settings_root: &PathBuf,
+    row: &ThreadCompactionRow,
+    wait: &mut crate::orchestration::engine::CompactionWait,
+) -> Option<CompactionRun> {
+    let label = match reopen_for_compaction(supervisor, engine, settings_root, row).await {
+        Ok(label) => label,
+        Err(run) => {
+            // Never sent; a Stop that came first still wins in the settlement.
+            return Some(run);
+        }
+    };
+    match engine
+        .start_thread_compaction(&row.compaction_id, &now())
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return None,
+        Err(error) => return Some(CompactionRun::failed("not_started", error.to_string())),
+    }
+    // A turn delivered just before the request still runs: compacting under it would reorder
+    // the conversation.
+    if engine
+        .repositories()
+        .get_thread_session(row.thread_id.clone())
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|session| session_holds_a_turn(&session))
+    {
+        return Some(CompactionRun::failed(
+            "not_started",
+            "A turn was still running, so the conversation wasn't compacted.".to_owned(),
+        ));
+    }
+    let target = CompactionTargetIdentity {
+        provider_instance_id: row.provider_instance_id.clone(),
+        provider_kind: row.provider_kind.clone(),
+        conversation_id: row.conversation_id.clone(),
+    };
+    let session = match supervisor.begin_compaction(&row.thread_id, target).await {
+        Ok(Some(session)) => session,
+        Ok(None) => {
+            return Some(CompactionRun::failed(
+                "identity_changed",
+                COMPACTION_IDENTITY_CHANGED_DETAIL.to_owned(),
+            ));
+        }
+        Err(error) => {
+            return Some(CompactionRun::failed(
+                "not_started",
+                delivery_detail(&error, label.as_deref()),
+            ));
+        }
+    };
+    let label = session.provider_label.clone();
+    let couldnt_compact = format!("{label} couldn't compact the conversation.");
+    let mut turn_known = false;
+    // Every bound counts from the request. The request is bounded too: a provider that takes
+    // it but never answers (a Codex request has no deadline of its own) is treated as one whose
+    // outcome is unknown, so the thread is never held past the bounds.
+    let (_, _, start_bound) = compaction_bounds();
+    let requested_at = tokio::time::Instant::now();
+    let start = tokio::select! {
+        start = tokio::time::timeout(
+            start_bound,
+            session.identity.driver.compact(row.compaction_id.clone()),
+        ) => start.unwrap_or_else(|_| ProviderCompactionStart::Unknown {
+            detail: "the provider did not answer the compaction request".to_owned(),
+        }),
+        () = session.ended.cancelled() => ProviderCompactionStart::Unknown {
+            detail: "the session ended during the compaction request".to_owned(),
+        },
+    };
+    match start {
+        ProviderCompactionStart::Started { turn_id } => {
+            if let Some(turn_id) = turn_id {
+                turn_known = true;
+                compaction_turn_known(supervisor, engine, row, &turn_id).await;
+            }
+        }
+        ProviderCompactionStart::NotStarted { detail } => {
+            tracing::warn!(thread_id = %row.thread_id, %detail, "the provider did not start a conversation compaction");
+            return Some(CompactionRun::failed("not_started", couldnt_compact));
+        }
+        ProviderCompactionStart::Unknown { detail } => {
+            // No retry: a second compaction is not harmless.
+            tracing::warn!(thread_id = %row.thread_id, %detail, "a conversation compaction request's outcome is unknown");
+            if let Err(error) = engine
+                .mark_thread_compaction_unresolved(&row.compaction_id, &now())
+                .await
+            {
+                tracing::warn!(%error, "a compaction could not be marked unresolved");
+            }
+        }
+    }
+    Some(
+        await_compaction_turn(
+            supervisor,
+            engine,
+            row,
+            &session,
+            wait,
+            turn_known,
+            requested_at,
+        )
+        .await,
+    )
+}
+
+/// The compaction's turn is known: records it, and interrupts it when a Stop was asked for
+/// before it existed (the interrupt then found nothing running to stop).
+async fn compaction_turn_known(
+    supervisor: &ProviderRuntimeSupervisor,
+    engine: &OrchestrationEngine,
+    row: &ThreadCompactionRow,
+    turn_id: &str,
+) {
+    if let Err(error) = engine
+        .record_thread_compaction_turn(&row.compaction_id, turn_id, &now())
+        .await
+    {
+        tracing::warn!(%error, "a compaction's turn could not be recorded");
+    }
+    if engine
+        .thread_compaction(&row.compaction_id)
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|row| row.stop_requested)
+    {
+        interrupt_compaction_turn(supervisor, &row.thread_id, turn_id).await;
+    }
+}
+
+/// Waits for the compaction's tagged turn to end, interrupting it at the bound and ending its
+/// session when that is not confirmed, or when no turn starts.
+async fn await_compaction_turn(
+    supervisor: &ProviderRuntimeSupervisor,
+    engine: &OrchestrationEngine,
+    row: &ThreadCompactionRow,
+    session: &CompactionSession,
+    wait: &mut crate::orchestration::engine::CompactionWait,
+    mut turn_known: bool,
+    requested_at: tokio::time::Instant,
+) -> CompactionRun {
+    let couldnt_compact = format!(
+        "{} couldn't compact the conversation.",
+        session.provider_label
+    );
+    let (bound, grace, start_bound) = compaction_bounds();
+    let deadline = requested_at + bound;
+    let mut start_deadline = (!turn_known).then(|| requested_at + start_bound);
+    let mut grace_deadline: Option<tokio::time::Instant> = None;
+    let mut bounded = false;
+    let outcome = loop {
+        let start_sleep = async {
+            match start_deadline {
+                Some(at) => tokio::time::sleep_until(at).await,
+                None => std::future::pending().await,
+            }
+        };
+        let grace_sleep = async {
+            match grace_deadline {
+                Some(at) => tokio::time::sleep_until(at).await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            biased;
+            outcome = &mut wait.outcome => break outcome.ok(),
+            () = session.ended.cancelled() => {
+                // The turn may have ended just before its session.
+                break wait.outcome.try_recv().ok();
+            }
+            changed = wait.turn_started.changed(), if !turn_known => {
+                if changed.is_err() {
+                    continue;
+                }
+                let Some(turn_id) = wait.turn_started.borrow_and_update().clone() else {
+                    continue;
+                };
+                turn_known = true;
+                start_deadline = None;
+                // A Stop asked for before the turn started stops it now.
+                compaction_turn_known(supervisor, engine, row, &turn_id).await;
+            }
+            () = start_sleep => {
+                start_deadline = None;
+                tracing::warn!(thread_id = %row.thread_id, "a conversation compaction started no turn; ending its session");
+                retire_compaction(supervisor, session, None).await;
+            }
+            () = tokio::time::sleep_until(deadline), if !bounded => {
+                bounded = true;
+                tracing::warn!(thread_id = %row.thread_id, "a conversation compaction reached its bound; interrupting it");
+                let turn_id = wait.turn_started.borrow().clone();
+                if let Some(turn_id) = &turn_id {
+                    interrupt_compaction_turn(supervisor, &row.thread_id, turn_id).await;
+                }
+                grace_deadline = Some(tokio::time::Instant::now() + grace);
+            }
+            () = grace_sleep => {
+                grace_deadline = None;
+                tracing::warn!(thread_id = %row.thread_id, "an interrupted conversation compaction did not end; ending its session");
+                let turn_id = wait.turn_started.borrow().clone();
+                retire_compaction(supervisor, session, turn_id).await;
+            }
+        }
+    };
+    match outcome {
+        Some(turn) => match turn.turn_state.as_str() {
+            "completed" if turn.compacted => CompactionRun {
+                outcome: "completed",
+                reason: None,
+                detail: None,
+            },
+            "completed" => CompactionRun::failed("no_compaction", couldnt_compact),
+            "interrupted" if !bounded => CompactionRun {
+                outcome: "interrupted",
+                reason: Some("stopped"),
+                detail: None,
+            },
+            "interrupted" => {
+                CompactionRun::failed("unconfirmed", COMPACTION_UNCONFIRMED_DETAIL.to_owned())
+            }
+            _ => CompactionRun::failed("turn_failed", couldnt_compact),
+        },
+        None => CompactionRun::failed("unconfirmed", COMPACTION_UNCONFIRMED_DETAIL.to_owned()),
+    }
+}
+
+async fn interrupt_compaction_turn(
+    supervisor: &ProviderRuntimeSupervisor,
+    thread_id: &str,
+    turn_id: &str,
+) {
+    if let Err(error) = supervisor
+        .handle_orchestration(OrchestrationCommand::ThreadTurnInterrupt {
+            command_id: format!("server:compaction-interrupt:{}", Uuid::new_v4()),
+            thread_id: thread_id.to_owned(),
+            turn_id: Some(turn_id.to_owned()),
+            created_at: now(),
+        })
+        .await
+    {
+        tracing::warn!(thread_id, %error, "a conversation compaction could not be interrupted");
+    }
+}
+
+async fn retire_compaction(
+    supervisor: &ProviderRuntimeSupervisor,
+    session: &CompactionSession,
+    turn_id: Option<String>,
+) {
+    if let Err(error) = supervisor
+        .retire_compaction_session(session.identity.clone(), turn_id)
+        .await
+    {
+        tracing::warn!(%error, "the session of an unconfirmed compaction could not be ended");
+    }
+}
+
+/// The live session for a compaction, when it is the instance and conversation the row records.
+fn begin_session_compaction(
+    sessions: &HashMap<String, SessionEntry>,
+    thread_id: &str,
+    target: &CompactionTargetIdentity,
+) -> Result<Option<CompactionSession>, ProviderRuntimeError> {
+    let entry = sessions
+        .get(thread_id)
+        .ok_or_else(|| ProviderRuntimeError::SessionNotFound {
+            thread_id: thread_id.to_owned(),
+        })?;
+    let instance_id = entry
+        .launch
+        .provider_instance_id
+        .as_deref()
+        .unwrap_or(entry.launch.provider.as_str());
+    let conversation_id = entry
+        .resume_cursor
+        .as_ref()
+        .and_then(|cursor| resume_cursor_conversation_id(&entry.launch.provider, cursor));
+    if instance_id != target.provider_instance_id
+        || entry.launch.provider != target.provider_kind
+        || (target.conversation_id.is_some() && conversation_id != target.conversation_id)
+    {
+        return Ok(None);
+    }
+    // A compaction uses the session like a turn does: the idle deadline starts again, so the
+    // session is not suspended before the compaction's turn reads running.
+    let generation = entry.idle_generation.fetch_add(1, Ordering::Relaxed) + 1;
+    schedule_idle_suspend(
+        entry.terminal_sender.clone(),
+        thread_id.to_owned(),
+        entry.idle_generation.clone(),
+        generation,
+        entry.idle_timeout,
+        #[cfg(test)]
+        entry.idle_deadline_test_observer.clone(),
+    );
+    Ok(Some(CompactionSession {
+        identity: ProviderSessionIdentity {
+            thread_id: thread_id.to_owned(),
+            driver: entry.driver.clone(),
+        },
+        ended: entry.event_cancellation.clone(),
+        provider_label: entry.launch.provider_label.clone(),
+    }))
+}
+
+/// Ends a session whose compaction could not be confirmed, keeping its saved conversation, and
+/// stops the thread reading running for that compaction's turn.
+async fn retire_compaction_session(
+    engine: &OrchestrationEngine,
+    activity: &ActivityProjection,
+    sessions: &mut HashMap<String, SessionEntry>,
+    identity: &ProviderSessionIdentity,
+    turn_id: Option<&str>,
+) -> Result<(), ProviderRuntimeError> {
+    let thread_id = identity.thread_id.as_str();
+    let Some(launch) = sessions
+        .get(thread_id)
+        .filter(|entry| Arc::ptr_eq(&entry.driver, &identity.driver))
+        .map(|entry| entry.launch.clone())
+    else {
+        return Ok(());
+    };
+    let repositories = engine.repositories();
+    let retired = suspend_idle_session(&repositories, activity, sessions, thread_id).await;
+    let still_running = repositories
+        .get_thread_session(thread_id.to_owned())
+        .await
+        .map_err(|error| ProviderRuntimeError::Persistence(error.to_string()))?
+        .is_some_and(|session| {
+            session.status == "running"
+                && turn_id.is_none_or(|turn_id| session.active_turn_id.as_deref() == Some(turn_id))
+        });
+    if still_running {
+        dispatch_session_state(
+            engine,
+            &launch,
+            "interrupted",
+            None,
+            Some(format!(
+                "{} didn't finish compacting the conversation, so BiBCode ended its session. Your next message starts it again.",
+                launch.provider_label
+            )),
+            Some("session_stopped".to_owned()),
+        )
+        .await?;
+        if let Err(error) = settle_streaming_assistant_messages(
+            engine,
+            thread_id,
+            turn_id.map(str::to_owned),
+            &format!("provider-compaction-retired:{}", Uuid::new_v4()),
+            &now(),
+        )
+        .await
+        {
+            tracing::warn!(%error, thread_id, "assistant messages remained streaming after a compaction's session ended");
+        }
+    }
+    engine.wake_turn_delivery();
+    retired
 }
 
 async fn reconcile_model_selection(
@@ -8363,6 +9837,7 @@ fn spawn_event_pump(
     resume_cursor: Option<Value>,
     runtime_payload: Option<Value>,
     pending_context_handoff: Arc<AtomicBool>,
+    resume_refusal_recorded: Arc<AtomicBool>,
     activity: ActivityProjection,
     activity_lifecycle: SharedActivityLifecycle,
     activity_capable: bool,
@@ -8395,10 +9870,19 @@ fn spawn_event_pump(
             settled_tx
         };
         let mut last_exit_reason: Option<String> = None;
+        let mut reasoning = ReasoningCoalescer::default();
         let settled_tx = loop {
+            let reasoning_due = reasoning.next_deadline();
             tokio::select! {
                 biased;
                 () = cancellation.cancelled() => return,
+                // Before the next event, so a busy stream cannot hold a thought back.
+                () = async { tokio::time::sleep_until(reasoning_due.expect("guarded")).await }, if reasoning_due.is_some() => {
+                    let due = reasoning.take_due(Instant::now());
+                    if !dispatch_reasoning_commands(&engine, &publication, &cancellation, &launch.thread_id, due).await {
+                        return;
+                    }
+                }
                 event = driver.next_event() => {
                     let Some(mut event) = event else {
                         break begin_settlement();
@@ -8592,6 +10076,30 @@ fn spawn_event_pump(
                     if event.event_type == ACTIVITY_ONLY_PROVIDER_EVENT_TYPE {
                         continue;
                     }
+                    // Reasoning is coalesced here and never becomes a message or an activity
+                    // (#173). Only its own completion, its turn's completion and the pump's end
+                    // write an entry early; other events never do.
+                    if is_reasoning_delta(&event) {
+                        if event.thread_id == launch.thread_id {
+                            reasoning.observe_delta(&event);
+                        }
+                        continue;
+                    }
+                    if is_reasoning_completion(&event) {
+                        if event.thread_id == launch.thread_id {
+                            let commands = reasoning.complete(&event);
+                            if !dispatch_reasoning_commands(&engine, &publication, &cancellation, &launch.thread_id, commands).await {
+                                return;
+                            }
+                        }
+                        continue;
+                    }
+                    if event.event_type == "turn.completed" {
+                        let commands = reasoning.take_turn(event.turn_id.as_deref());
+                        if !dispatch_reasoning_commands(&engine, &publication, &cancellation, &launch.thread_id, commands).await {
+                            return;
+                        }
+                    }
                     // Start the fence after activity-control acknowledgements, before the
                     // final event becomes visible, so projection cannot deadlock on the supervisor.
                     let session_settlement = session_exited.then(&begin_settlement);
@@ -8687,6 +10195,10 @@ fn spawn_event_pump(
         // The provider ended its stream by itself: BiBCode did not stop the session.
         let unexpected = !core_publication.closed && !cancellation.is_cancelled();
         if unexpected {
+            // What the provider thought before it ended is kept: the final flush goes first,
+            // under the fence this section already holds.
+            dispatch_reasoning_commands_unfenced(&engine, &launch.thread_id, reasoning.take_all())
+                .await;
             const STREAM_END_ERROR: &str = "Provider event stream ended unexpectedly.";
             let stream_end_message = last_exit_reason.as_deref().map_or_else(
                 || STREAM_END_ERROR.to_owned(),
@@ -8752,6 +10264,35 @@ fn spawn_event_pump(
                         "failed to project provider stream-end failure"
                     );
                 }
+            }
+            // With or without a running turn: late reasoning on a settled turn streams too,
+            // and nothing will complete it once this session is gone.
+            settle_session_reasoning(&engine, &launch.thread_id, "provider-stream-end").await;
+        }
+        // History offers a copy of an imported session whose resume Claude refused.
+        if unexpected && driver.resume_refused() {
+            // The session stays registered; later writes of its row keep the mark.
+            resume_refusal_recorded.store(true, Ordering::Release);
+            let payload =
+                runtime_payload_with_resume_refused(runtime_payload_with_context_handoff(
+                    runtime_payload.clone(),
+                    pending_context_handoff.load(Ordering::Acquire),
+                ));
+            if let Err(error) = persist_runtime(
+                &engine.repositories(),
+                &launch,
+                "error",
+                resume_cursor.clone(),
+                payload,
+            )
+            .await
+            {
+                tracing::warn!(
+                    %error,
+                    provider = %launch.provider,
+                    thread_id = %launch.thread_id,
+                    "failed to record a refused resume"
+                );
             }
         }
         #[cfg(test)]
@@ -8912,6 +10453,17 @@ async fn retire_unsettled_interrupt(
     {
         tracing::warn!(%error, thread_id, "assistant messages remained streaming after the interrupt deadline");
     }
+    if let Err(error) = settle_streaming_reasoning(
+        engine,
+        thread_id,
+        ReasoningSettlement::Turn(Some(turn_id)),
+        &format!("provider-interrupt-deadline:{}", Uuid::new_v4()),
+        &now(),
+    )
+    .await
+    {
+        tracing::warn!(%error, thread_id, "reasoning remained streaming after the interrupt deadline");
+    }
     engine.wake_turn_delivery();
     retired
 }
@@ -8925,6 +10477,353 @@ async fn provider_thread_was_deleted(repositories: &Repositories, thread_id: &st
         .is_some_and(|thread| thread.deleted_at.is_some())
 }
 
+/// How long the pump gathers one reasoning entry's deltas before writing them (#173). The
+/// thread stream already sends a client at most 10 updates a second, so a thought still shows
+/// live, and a block whose deltas span D writes at most D / 250 ms + 1 streaming rows.
+const REASONING_FLUSH_WINDOW: Duration = Duration::from_millis(250);
+/// The most text one reasoning entry keeps; longer text ends with an ellipsis.
+const REASONING_ENTRY_MAX_BYTES: usize = 32 * 1024;
+const REASONING_TRUNCATION_MARK: &str = "…";
+
+/// Provider reasoning: Claude thinking deltas and Codex reasoning summary deltas, and their
+/// items' completions. Raw Codex reasoning (`reasoning_text_delta`) never reaches here.
+fn is_reasoning_delta(event: &ProviderEvent) -> bool {
+    event.event_type == "content.delta"
+        && matches!(
+            event.payload.get("streamKind").and_then(Value::as_str),
+            Some("reasoning_text" | "reasoning_summary_text")
+        )
+}
+
+fn is_reasoning_completion(event: &ProviderEvent) -> bool {
+    event.event_type == "item.completed"
+        && event.payload.get("itemType").and_then(Value::as_str) == Some("reasoning")
+}
+
+/// One reasoning entry per provider item, or per turn when the provider names no item.
+fn reasoning_id(event: &ProviderEvent) -> String {
+    valid_provider_item_id(event.item_id.as_deref())
+        .map(|item_id| format!("reasoning:{}:item:{item_id}", event.thread_id))
+        .or_else(|| {
+            event
+                .turn_id
+                .as_ref()
+                .map(|turn_id| format!("reasoning:{}:turn:{turn_id}", event.thread_id))
+        })
+        .unwrap_or_else(|| format!("reasoning:{}", event.thread_id))
+}
+
+/// `text` cut to `REASONING_ENTRY_MAX_BYTES` at a UTF-8 boundary, ending with an ellipsis
+/// when anything was cut.
+fn bounded_reasoning_text(text: &str) -> String {
+    if text.len() <= REASONING_ENTRY_MAX_BYTES {
+        return text.to_owned();
+    }
+    let end = text.floor_char_boundary(REASONING_ENTRY_MAX_BYTES - REASONING_TRUNCATION_MARK.len());
+    format!("{}{REASONING_TRUNCATION_MARK}", &text[..end])
+}
+
+struct OpenReasoning {
+    thread_id: String,
+    turn_id: Option<String>,
+    buffer: String,
+    /// When the current buffer's first byte arrived; its window ends 250 ms later.
+    window_started: Option<Instant>,
+    /// The time the entry's first delta was buffered: its first row's `createdAt`, so the
+    /// thought sorts before the tool call that followed it, however late it is written.
+    first_buffered_at: Option<String>,
+    /// Bytes written so far.
+    written: usize,
+    full: bool,
+}
+
+/// Buffers reasoning deltas per entry in the event pump and turns them into at most one
+/// streaming row per entry per window. It lives and ends with the pump, which runs one event
+/// at a time, so it needs no lock. It holds counts and ids only beside the buffered text, and
+/// logs nothing.
+#[derive(Default)]
+struct ReasoningCoalescer {
+    entries: HashMap<String, OpenReasoning>,
+}
+
+impl ReasoningCoalescer {
+    fn observe_delta(&mut self, event: &ProviderEvent) {
+        let delta = event
+            .payload
+            .get("delta")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if delta.is_empty() {
+            return;
+        }
+        let entry = self
+            .entries
+            .entry(reasoning_id(event))
+            .or_insert_with(|| OpenReasoning {
+                thread_id: event.thread_id.clone(),
+                turn_id: event.turn_id.clone(),
+                buffer: String::new(),
+                window_started: None,
+                first_buffered_at: None,
+                written: 0,
+                full: false,
+            });
+        if entry.full {
+            return;
+        }
+        if entry.written + entry.buffer.len() + delta.len() <= REASONING_ENTRY_MAX_BYTES {
+            entry.buffer.push_str(delta);
+        } else {
+            // The cut keeps room for the mark, so it always shows and never overshoots the
+            // bound. A window's write never passes that room (see `flush_entry`), so the mark
+            // still fits after text already written.
+            entry.full = true;
+            let text_room = REASONING_ENTRY_MAX_BYTES - REASONING_TRUNCATION_MARK.len();
+            if let Some(room) = text_room.checked_sub(entry.written) {
+                if room <= entry.buffer.len() {
+                    entry
+                        .buffer
+                        .truncate(entry.buffer.floor_char_boundary(room));
+                } else {
+                    let rest = room - entry.buffer.len();
+                    entry
+                        .buffer
+                        .push_str(&delta[..delta.floor_char_boundary(rest)]);
+                }
+                entry.buffer.push_str(REASONING_TRUNCATION_MARK);
+            }
+            // Otherwise a final write already released text past the room, after which the
+            // entry went on streaming: the bound still holds, without the mark.
+        }
+        if entry.window_started.is_none() && !entry.buffer.is_empty() {
+            entry.window_started = Some(Instant::now());
+        }
+        entry.first_buffered_at.get_or_insert_with(now);
+    }
+
+    /// The end of the earliest open window, if any entry has buffered text.
+    fn next_deadline(&self) -> Option<Instant> {
+        self.entries
+            .values()
+            .filter_map(|entry| entry.window_started)
+            .min()
+            .map(|started| started + REASONING_FLUSH_WINDOW)
+    }
+
+    /// The entry's buffered text as one write. A window's write (`last` false) holds back what
+    /// passes the bound less the mark's width, until a later delta shows whether the entry is
+    /// cut; the entry's last write releases it, so text that fits is never cut.
+    fn flush_entry(
+        reasoning_id: &str,
+        entry: &mut OpenReasoning,
+        last: bool,
+    ) -> Option<OrchestrationCommand> {
+        if entry.buffer.is_empty() {
+            return None;
+        }
+        entry.window_started = None;
+        let end = if last || entry.full {
+            entry.buffer.len()
+        } else {
+            let text_room = REASONING_ENTRY_MAX_BYTES - REASONING_TRUNCATION_MARK.len();
+            entry
+                .buffer
+                .floor_char_boundary(text_room.saturating_sub(entry.written))
+        };
+        if end == 0 {
+            return None;
+        }
+        let held_back = entry.buffer.split_off(end);
+        let delta = std::mem::replace(&mut entry.buffer, held_back);
+        entry.written += delta.len();
+        // The first row keeps the time the entry began; later rows carry their own time.
+        let created_at = entry.first_buffered_at.take().unwrap_or_else(now);
+        Some(OrchestrationCommand::ThreadReasoningDelta {
+            command_id: format!("provider:{}", Uuid::new_v4()),
+            thread_id: entry.thread_id.clone(),
+            reasoning_id: reasoning_id.to_owned(),
+            delta,
+            turn_id: entry.turn_id.clone(),
+            created_at,
+        })
+    }
+
+    /// The writes of every entry whose window has ended.
+    fn take_due(&mut self, now: Instant) -> Vec<OrchestrationCommand> {
+        self.entries
+            .iter_mut()
+            .filter(|(_, entry)| {
+                entry
+                    .window_started
+                    .is_some_and(|started| started + REASONING_FLUSH_WINDOW <= now)
+            })
+            .filter_map(|(id, entry)| Self::flush_entry(id, entry, false))
+            .collect()
+    }
+
+    /// The writes of the turn's entries, before its completion settles them.
+    fn take_turn(&mut self, turn_id: Option<&str>) -> Vec<OrchestrationCommand> {
+        self.entries
+            .iter_mut()
+            .filter(|(_, entry)| entry.turn_id.as_deref() == turn_id)
+            .filter_map(|(id, entry)| Self::flush_entry(id, entry, true))
+            .collect()
+    }
+
+    /// The writes of every open entry, when the pump ends.
+    fn take_all(&mut self) -> Vec<OrchestrationCommand> {
+        self.entries
+            .iter_mut()
+            .filter_map(|(id, entry)| Self::flush_entry(id, entry, true))
+            .collect()
+    }
+
+    /// An entry's completion: its last buffered text, then its settlement. It settles an entry
+    /// this pump opened, and creates one from a completion that carries text (a Codex summary
+    /// that streamed nothing); a completion without either writes nothing.
+    fn complete(&mut self, event: &ProviderEvent) -> Vec<OrchestrationCommand> {
+        let reasoning_id = reasoning_id(event);
+        let text = event
+            .payload
+            .get("text")
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+            .map(bounded_reasoning_text);
+        let opened = self.entries.remove(&reasoning_id);
+        let mut commands = Vec::new();
+        let turn_id = match opened {
+            Some(mut entry) => {
+                commands.extend(Self::flush_entry(&reasoning_id, &mut entry, true));
+                entry.turn_id
+            }
+            None if text.is_some() => event.turn_id.clone(),
+            None => return commands,
+        };
+        commands.push(OrchestrationCommand::ThreadReasoningComplete {
+            command_id: format!("provider:{}", Uuid::new_v4()),
+            thread_id: event.thread_id.clone(),
+            reasoning_id,
+            text,
+            turn_id,
+            created_at: now(),
+        });
+        commands
+    }
+}
+
+/// Dispatches reasoning writes under the session's publication fence, like every other pump
+/// write. `false` when the session is closing and the pump must stop.
+async fn dispatch_reasoning_commands(
+    engine: &OrchestrationEngine,
+    publication: &SessionPublicationFence,
+    cancellation: &CancellationToken,
+    thread_id: &str,
+    commands: Vec<OrchestrationCommand>,
+) -> bool {
+    if commands.is_empty() {
+        return true;
+    }
+    let core_publication = publication.lock().await;
+    if core_publication.closed || cancellation.is_cancelled() {
+        return false;
+    }
+    dispatch_reasoning_commands_unfenced(engine, thread_id, commands).await;
+    drop(core_publication);
+    true
+}
+
+/// For a caller that already holds the publication fence. Failures are logged by count and
+/// thread only: the commands carry reasoning text.
+async fn dispatch_reasoning_commands_unfenced(
+    engine: &OrchestrationEngine,
+    thread_id: &str,
+    commands: Vec<OrchestrationCommand>,
+) {
+    let mut failed = 0_usize;
+    for command in commands {
+        if engine.dispatch(command).await.is_err() {
+            failed += 1;
+        }
+    }
+    if failed > 0 {
+        tracing::warn!(thread_id, failed, "failed to project provider reasoning");
+    }
+}
+
+/// Which streaming reasoning rows a settlement closes.
+#[derive(Clone, Copy)]
+enum ReasoningSettlement<'a> {
+    /// A turn's rows, when the turn completes or its interrupt deadline passes.
+    Turn(Option<&'a str>),
+    /// Every row on the thread, whatever its turn, when its session ends: a streaming row on a
+    /// thread without a live session can never be completed.
+    Session,
+}
+
+async fn settle_streaming_reasoning(
+    engine: &OrchestrationEngine,
+    thread_id: &str,
+    scope: ReasoningSettlement<'_>,
+    command_id: &str,
+    created_at: &str,
+) -> Result<(), ProviderRuntimeError> {
+    let rows = engine
+        .repositories()
+        .list_streaming_reasoning_by_thread(thread_id.to_owned())
+        .await
+        .map_err(|error| ProviderRuntimeError::Persistence(error.to_string()))?
+        .into_iter()
+        .filter(|row| match scope {
+            ReasoningSettlement::Turn(turn_id) => row.turn_id.as_deref() == turn_id,
+            ReasoningSettlement::Session => true,
+        })
+        .collect();
+    settle_streaming_reasoning_rows(engine, rows, command_id, created_at).await
+}
+
+async fn settle_streaming_reasoning_rows(
+    engine: &OrchestrationEngine,
+    rows: Vec<crate::persistence::ProjectionThreadReasoning>,
+    command_id: &str,
+    created_at: &str,
+) -> Result<(), ProviderRuntimeError> {
+    let mut first_error = None;
+    for (index, row) in rows.into_iter().filter(|row| row.is_streaming).enumerate() {
+        let completion = OrchestrationCommand::ThreadReasoningComplete {
+            command_id: format!("{command_id}:reasoning-complete:{index}"),
+            thread_id: row.thread_id,
+            reasoning_id: row.reasoning_id,
+            text: None,
+            turn_id: row.turn_id,
+            created_at: created_at.to_owned(),
+        };
+        if let Err(error) = engine.dispatch(completion).await
+            && first_error.is_none()
+        {
+            first_error = Some(error.to_string());
+        }
+    }
+    match first_error {
+        Some(detail) => Err(ProviderRuntimeError::Orchestration(detail)),
+        None => Ok(()),
+    }
+}
+
+/// The session scope of reasoning settlement, for a session that just ended.
+async fn settle_session_reasoning(engine: &OrchestrationEngine, thread_id: &str, origin: &str) {
+    if let Err(error) = settle_streaming_reasoning(
+        engine,
+        thread_id,
+        ReasoningSettlement::Session,
+        &format!("{origin}:{}", Uuid::new_v4()),
+        &now(),
+    )
+    .await
+    {
+        tracing::warn!(%error, thread_id, "reasoning remained streaming after its session ended");
+    }
+}
+
 async fn project_provider_event(
     engine: &OrchestrationEngine,
     launch: &ProviderLaunchRequest,
@@ -8933,6 +10832,11 @@ async fn project_provider_event(
     event: ProviderEvent,
     #[cfg(test)] after_terminal_session: Option<&Arc<PublicationTestGate>>,
 ) -> Result<(), ProviderRuntimeError> {
+    // The pump coalesces reasoning; it is never assistant text or an activity, whatever path
+    // reaches this projection.
+    if is_reasoning_delta(&event) || is_reasoning_completion(&event) {
+        return Ok(());
+    }
     let created_at = now();
     let command_id = format!("provider:{}", Uuid::new_v4());
     // An ask OpenCode lists again on resume (`recovered`, with OpenCode's unique request id) is
@@ -8953,8 +10857,23 @@ async fn project_provider_event(
         return Ok(());
     }
     let assistant_message_id = assistant_message_id(&event);
+    let compaction_id = event
+        .payload
+        .get("compactionId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned);
+    if event.event_type == "turn.started"
+        && let (Some(compaction_id), Some(turn_id)) = (&compaction_id, &event.turn_id)
+    {
+        engine
+            .compaction_waiters()
+            .turn_started(&launch.thread_id, compaction_id, turn_id);
+    }
     if event.event_type == "turn.started"
         && (provider_reports_its_turns(&launch.provider)
+            || compaction_id.is_some()
             || event.payload.get("providerStarted") == Some(&Value::Bool(true)))
     {
         // A turn the provider started itself (a Codex goal continuation, Claude answering a
@@ -8977,9 +10896,26 @@ async fn project_provider_event(
                 runtime_payload.clone(),
             )
             .await?;
-            dispatch_session_state(engine, launch, "running", event.turn_id.clone(), None, None)
-                .await?;
+            dispatch_tagged_session_state(
+                engine,
+                launch,
+                "running",
+                event.turn_id.clone(),
+                (None, None),
+                compaction_id.clone(),
+                None,
+            )
+            .await?;
         }
+    }
+    if event.event_type == "item.completed"
+        && let Some(turn_id) = &event.turn_id
+        && event.payload.get("itemType").and_then(Value::as_str) == Some("context_compaction")
+        && event.payload.get("status").and_then(Value::as_str) == Some("completed")
+    {
+        engine
+            .compaction_waiters()
+            .compaction_item_completed(&launch.thread_id, turn_id);
     }
     if event.event_type == "turn.completed" {
         let state = event
@@ -8990,16 +10926,50 @@ async fn project_provider_event(
         let failed = state == "failed";
         let last_error = failed.then(|| provider_completion_error(&event.payload));
         let last_error_class = failed.then(|| provider_completion_error_class(&event.payload));
+        if let Some(class) = &last_error_class {
+            crate::diagnostics::profiler::provider_turns::record_turn_failure(
+                &launch.provider,
+                event.payload.get("providerReason").and_then(Value::as_str),
+                class,
+            );
+        }
+        // A compaction's own failure is never recovered by compacting again.
+        let context_limit = (last_error_class.as_deref() == Some("context_limit")
+            && compaction_id.is_none())
+        .then(|| event.turn_id.clone())
+        .flatten()
+        .map(|turn_id| ContextLimitFacts {
+            turn_id,
+            before_output: event.payload.get("beforeOutput").and_then(Value::as_bool),
+            compactable: event.payload.get("compactable").and_then(Value::as_bool),
+        });
         let status = if failed { "error" } else { "ready" };
         persist_runtime(
             &engine.repositories(),
             launch,
             status,
-            resume_cursor,
+            resume_cursor.clone(),
             runtime_payload,
         )
         .await?;
-        dispatch_session_state(engine, launch, status, None, last_error, last_error_class).await?;
+        dispatch_tagged_session_state(
+            engine,
+            launch,
+            status,
+            None,
+            (last_error, last_error_class),
+            None,
+            context_limit,
+        )
+        .await?;
+        if let Some(compaction_id) = &compaction_id {
+            engine.compaction_waiters().turn_completed(
+                &launch.thread_id,
+                compaction_id,
+                event.turn_id.as_deref(),
+                state,
+            );
+        }
         #[cfg(test)]
         if let Some(gate) = after_terminal_session {
             gate.pause().await;
@@ -9018,6 +10988,22 @@ async fn project_provider_event(
                 thread_id = %event.thread_id,
                 turn_id = ?event.turn_id,
                 "one or more assistant messages remained unsettled after terminal projection"
+            );
+        }
+        if let Err(error) = settle_streaming_reasoning(
+            engine,
+            &event.thread_id,
+            ReasoningSettlement::Turn(event.turn_id.as_deref()),
+            &command_id,
+            &created_at,
+        )
+        .await
+        {
+            tracing::warn!(
+                %error,
+                thread_id = %event.thread_id,
+                turn_id = ?event.turn_id,
+                "reasoning remained streaming after terminal projection"
             );
         }
     }
@@ -9089,9 +11075,10 @@ async fn project_provider_event(
             }
         }
         "thread.token-usage.updated" => {
-            let Some(payload) = context_window_activity_payload(&event.payload) else {
+            let Some(mut payload) = context_window_activity_payload(&event.payload) else {
                 return Ok(());
             };
+            tag_context_window_reading(&mut payload, launch, resume_cursor.as_ref());
             OrchestrationCommand::ThreadActivityAppend {
                 command_id,
                 thread_id: event.thread_id,
@@ -9256,6 +11243,41 @@ async fn settle_streaming_assistant_message_rows(
     match first_persistent_error {
         Some(detail) => Err(ProviderRuntimeError::Orchestration(detail)),
         None => Ok(()),
+    }
+}
+
+/// Tags a context-window reading with the instance and conversation it came from, which an
+/// automatic compaction requires to match its own. A Claude instance whose environment sets
+/// `DISABLE_AUTO_COMPACT` or `DISABLE_COMPACT` reads as not compacting automatically: Claude
+/// reports the first through `isAutoCompactEnabled`, but no recorded response confirms it does
+/// for the second, so BiBCode does not depend on it.
+fn tag_context_window_reading(
+    payload: &mut Value,
+    launch: &ProviderLaunchRequest,
+    resume_cursor: Option<&Value>,
+) {
+    let Some(object) = payload.as_object_mut() else {
+        return;
+    };
+    if let Some(instance_id) = &launch.provider_instance_id {
+        object.insert("providerInstanceId".to_owned(), json!(instance_id));
+    }
+    if let Some(conversation_id) =
+        resume_cursor.and_then(|cursor| resume_cursor_conversation_id(&launch.provider, cursor))
+    {
+        object.insert("conversationId".to_owned(), json!(conversation_id));
+    }
+    let compaction_disabled = matches!(launch.provider.as_str(), "claude" | "claudeAgent")
+        && ["DISABLE_AUTO_COMPACT", "DISABLE_COMPACT"]
+            .iter()
+            .any(|name| {
+                launch.environment.get(*name).is_some_and(|value| {
+                    let value = value.trim();
+                    !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false")
+                })
+            });
+    if compaction_disabled {
+        object.insert("compactsAutomatically".to_owned(), json!(false));
     }
 }
 
@@ -9480,6 +11502,28 @@ async fn dispatch_session_state(
     last_error: Option<String>,
     last_error_class: Option<String>,
 ) -> Result<(), ProviderRuntimeError> {
+    dispatch_tagged_session_state(
+        engine,
+        request,
+        status,
+        active_turn_id,
+        (last_error, last_error_class),
+        None,
+        None,
+    )
+    .await
+}
+
+/// A session update carrying a compaction turn's tag or a context-limit failure's facts.
+async fn dispatch_tagged_session_state(
+    engine: &OrchestrationEngine,
+    request: &ProviderLaunchRequest,
+    status: &str,
+    active_turn_id: Option<String>,
+    (last_error, last_error_class): (Option<String>, Option<String>),
+    compaction_id: Option<String>,
+    context_limit: Option<ContextLimitFacts>,
+) -> Result<(), ProviderRuntimeError> {
     let created_at = now();
     engine
         .dispatch(OrchestrationCommand::ThreadSessionSet {
@@ -9496,6 +11540,8 @@ async fn dispatch_session_state(
                 last_error_class,
                 updated_at: created_at.clone(),
             },
+            compaction_id,
+            context_limit,
             created_at,
         })
         .await
@@ -9535,6 +11581,18 @@ fn runtime_payload_with_context_handoff(payload: Option<Value>, pending: bool) -
     Some(payload)
 }
 
+/// Marks the runtime of an imported session whose resume Claude refused, so History offers a
+/// copy of it. The next launch writes the row anew, which clears it.
+const RESUME_REFUSED_PAYLOAD_FIELD: &str = "resumeRefused";
+
+fn runtime_payload_with_resume_refused(payload: Option<Value>) -> Option<Value> {
+    let mut payload = payload.unwrap_or_else(|| json!({}));
+    if let Some(object) = payload.as_object_mut() {
+        object.insert(RESUME_REFUSED_PAYLOAD_FIELD.to_owned(), Value::Bool(true));
+    }
+    Some(payload)
+}
+
 fn saved_context_handoff(payload: Option<&Value>) -> bool {
     payload
         .and_then(|payload| payload.get(CONTEXT_HANDOFF_PAYLOAD_FIELD))
@@ -9543,10 +11601,15 @@ fn saved_context_handoff(payload: Option<&Value>) -> bool {
 }
 
 fn entry_runtime_payload(entry: &SessionEntry) -> Option<Value> {
-    runtime_payload_with_context_handoff(
+    let payload = runtime_payload_with_context_handoff(
         entry.runtime_payload.clone(),
         entry.pending_context_handoff.load(Ordering::Acquire),
-    )
+    );
+    if entry.resume_refusal_recorded.load(Ordering::Acquire) {
+        runtime_payload_with_resume_refused(payload)
+    } else {
+        payload
+    }
 }
 
 async fn persist_runtime(
@@ -10117,6 +12180,13 @@ async fn detach_session(
     entry.activity_control.write().await.take();
     cancel_and_reap_activity_tasks(&mut entry).await;
     close_publication_and_reap_event_task(&mut entry).await;
+    // An aborted pump cannot settle its own reasoning; nothing completes it after this.
+    settle_session_reasoning(
+        &entry.engine,
+        &entry.launch.thread_id,
+        "provider-session-detach",
+    )
+    .await;
     synchronize_activity_lifecycle(activity, &entry.launch.thread_id, &entry.activity_lifecycle)
         .await;
     compensate_cancelled_activity(
@@ -10612,6 +12682,7 @@ where
             label: request.provider_label.clone(),
             source: RegistrationSource::Provider,
             driver: Some(request.provider.clone()),
+            survives_shutdown: false,
         },
     ) {
         Ok(registration) => Some(registration),
@@ -10935,7 +13006,40 @@ impl CodexDriver {
     }
 }
 
+/// `/compact` on its own asks Codex to compact the thread (`thread/compact/start`) instead of
+/// sending the text to the model. Codex takes no instructions for a compaction, so `/compact`
+/// with text or attachments is an ordinary message.
+fn is_codex_compaction(text: &str, attachments: &[Value]) -> bool {
+    attachments.is_empty() && parse_provider_command(text) == Some(("compact", ""))
+}
+
 impl ProviderDriver for CodexDriver {
+    /// `thread/compact/start`: Codex answers, then reports the compaction as a root turn of its
+    /// own with a `contextCompaction` item, which the runtime tags with the compaction id.
+    fn compact(&self, compaction_id: String) -> BoxRuntimeFuture<'_, ProviderCompactionStart> {
+        Box::pin(async move {
+            match self.runtime.compact_thread_tagged(compaction_id).await {
+                Ok(turn_id) => ProviderCompactionStart::Started { turn_id },
+                Err(crate::provider::codex::runtime::RuntimeError::MissingProviderThreadId) => {
+                    ProviderCompactionStart::NotStarted {
+                        detail: self.session_not_ready_detail(),
+                    }
+                }
+                Err(crate::provider::codex::runtime::RuntimeError::Protocol(
+                    crate::provider::codex::protocol::ProtocolError::RemoteRequest {
+                        method,
+                        message,
+                        ..
+                    },
+                )) if method == "thread/compact/start" => {
+                    ProviderCompactionStart::NotStarted { detail: message }
+                }
+                Err(error) => ProviderCompactionStart::Unknown {
+                    detail: self.runtime_error_detail(error),
+                },
+            }
+        })
+    }
     fn start(&self) -> BoxRuntimeFuture<'_, Result<StartedSession, ProviderRuntimeError>> {
         Box::pin(async move {
             let session = self
@@ -10966,6 +13070,13 @@ impl ProviderDriver for CodexDriver {
         interaction_mode: String,
     ) -> BoxRuntimeFuture<'_, Result<Option<String>, ProviderRuntimeError>> {
         Box::pin(async move {
+            if is_codex_compaction(&text, &attachments) {
+                return self
+                    .runtime
+                    .compact_thread()
+                    .await
+                    .map_err(provider_error("codex"));
+            }
             let (text, attachments) = self.prepare_turn_input(text, attachments).await?;
             self.runtime
                 .send_turn(Some(text), attachments, Some(interaction_mode), None)
@@ -10982,6 +13093,30 @@ impl ProviderDriver for CodexDriver {
         delivery_key: String,
     ) -> BoxRuntimeFuture<'_, ProviderDeliveryOutcome> {
         Box::pin(async move {
+            if is_codex_compaction(&text, &attachments) {
+                // A compaction carries no user message, so `reconcile` cannot find it: one whose
+                // answer was lost is sent again.
+                return match self.runtime.compact_thread().await {
+                    Ok(turn_id) => ProviderDeliveryOutcome::Accepted { turn_id },
+                    Err(crate::provider::codex::runtime::RuntimeError::MissingProviderThreadId) => {
+                        ProviderDeliveryOutcome::DefinitelyNotSent {
+                            detail: self.session_not_ready_detail(),
+                        }
+                    }
+                    Err(crate::provider::codex::runtime::RuntimeError::Protocol(
+                        crate::provider::codex::protocol::ProtocolError::RemoteRequest {
+                            method,
+                            message,
+                            ..
+                        },
+                    )) if method == "thread/compact/start" => {
+                        ProviderDeliveryOutcome::Rejected { detail: message }
+                    }
+                    Err(error) => ProviderDeliveryOutcome::Ambiguous {
+                        detail: self.runtime_error_detail(error),
+                    },
+                };
+            }
             let (text, attachments) = match self.prepare_turn_input(text, attachments).await {
                 Ok(input) => input,
                 Err(error) => {
@@ -11022,6 +13157,14 @@ impl ProviderDriver for CodexDriver {
         delivery_key: String,
     ) -> BoxRuntimeFuture<'_, ProviderDeliveryOutcome> {
         Box::pin(async move {
+            // Codex compacts in a turn of its own, so the compaction waits for this one to end.
+            if is_codex_compaction(&text, &attachments) {
+                return ProviderDeliveryOutcome::Rejected {
+                    detail:
+                        "Codex compacts between turns, so this waits until the current turn ends."
+                            .to_owned(),
+                };
+            }
             let (text, attachments) = match self.prepare_turn_input(text, attachments).await {
                 Ok(input) => input,
                 Err(error) => {
@@ -13507,9 +15650,27 @@ struct ClaudeDriver {
     acknowledgement_timeout: Duration,
     hook_sink: Option<Arc<ClaudeHookSinkHandle>>,
     output: Arc<ClaudeOutputHandle>,
+    /// The cursor `start` reports: a copy keeps its requested one, `forkedFrom` included, until
+    /// Claude has written the copy, so a crash before then forks again.
+    started_cursor: Value,
+    /// A `--resume` of an imported session's own transcript, whose early exit means Claude
+    /// refused to resume it (see [`CLAUDE_RESUME_REFUSED`]).
+    watch_resume_refusal: bool,
+    resume_refusal: tokio::sync::OnceCell<bool>,
     /// The private `--mcp-config` file Claude reads; removed when the driver is dropped.
     _mcp_config: Option<crate::source_control::PrivateJsonBody>,
 }
+
+const CLAUDE_COPY_NEEDS_UPDATE: &str = "Continue in a copy needs Claude Code 2.0.73 or later. \
+     Update it in Settings → Providers, then send again.";
+const CLAUDE_COPY_AWAITS_PROBE: &str =
+    "BiBCode is still checking the Claude Code version. Send again.";
+/// A `--resume` Claude ends with a failure before its first `system/init`. The cause is not
+/// classified, because Claude's message is not a contract; a copy is safe whatever it is.
+const CLAUDE_RESUME_REFUSED: &str = "Claude Code couldn't continue this session here. It may \
+     still be running in a terminal or in the background. Choose Continue in a copy in History.";
+/// How long a refused resume's process may take to report its exit after its output closed.
+const CLAUDE_RESUME_REFUSAL_EXIT_WAIT: Duration = Duration::from_secs(2);
 
 struct ClaudeOutputHandle {
     cancellation: CancellationToken,
@@ -13543,7 +15704,20 @@ pub struct ClaudeActivitySupport {
     pub include_hook_events: bool,
     pub forward_subagent_text: bool,
     pub transcript_recovery: bool,
+    /// `--session-id` names the copy `--fork-session` makes: a Claude Code of 2.0.73 or later
+    /// whose `--help` lists `--fork-session`.
+    pub fork_session_id: bool,
+    /// A probe answered. False for the defaults a launch takes while the probe still runs, after
+    /// it failed, or when the executable cannot be resolved; a copy then waits for an answer.
+    pub probe_finished: bool,
+    /// The CLI accepts `--thinking-display summarized` (#173). From Claude Opus 4.7 on, the
+    /// API omits thinking text unless asked; without the flag those models send none.
+    pub thinking_display: bool,
 }
+
+/// A value `--thinking-display` rejects: a CLI that knows the flag lists its allowed values,
+/// and one that does not ignores it under `--version` and exits 0.
+const CLAUDE_THINKING_DISPLAY_PROBE_VALUE: &str = "bibcode-probe";
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct ClaudeProbeCacheKey {
@@ -13847,6 +16021,7 @@ fn log_claude_probe_outcome(
                 outcome = if supported { "supported" } else { "unsupported" },
                 include_hook_events = probe.support.include_hook_events,
                 forward_subagent_text = probe.support.forward_subagent_text,
+                thinking_display = probe.support.thinking_display,
                 "Claude activity probe finished"
             );
         }
@@ -13928,14 +16103,50 @@ async fn probe_claude_activity_support_uncached(
     let help = run_claude_probe_command(executable, "--help", deadline, launch_policy).await?;
     let has_exact_flag =
         |expected: &str| help.split_ascii_whitespace().any(|token| token == expected);
+    let fork_session_id = crate::provider::claude::model::supports(
+        crate::provider::claude::model::semantic_version(&version),
+        super::agent_sessions_rpc::COPY_MINIMUM_CLAUDE_VERSION,
+    ) && has_exact_flag("--fork-session");
+    let thinking_display =
+        probe_claude_thinking_display(executable, deadline, launch_policy).await?;
     Ok(ClaudeProbeResult {
         version,
         support: ClaudeActivitySupport {
             include_hook_events: has_exact_flag("--include-hook-events"),
             forward_subagent_text: has_exact_flag("--forward-subagent-text"),
             transcript_recovery: false,
+            fork_session_id,
+            probe_finished: true,
+            thinking_display,
         },
     })
+}
+
+/// Whether the CLI accepts `--thinking-display summarized`. `--help` does not list the flag, and
+/// a CLI ignores an option it does not know when `--version` is present, so an exit code alone
+/// cannot tell. An invalid value can: only a CLI that knows the flag rejects it, and it names
+/// the values it allows. A timeout or failed spawn is an error, so it is not cached.
+async fn probe_claude_thinking_display(
+    executable: &Path,
+    deadline: Instant,
+    launch_policy: ClaudeProbeLaunchPolicy,
+) -> Result<bool, String> {
+    let output = run_claude_probe(
+        executable,
+        &[
+            "--thinking-display",
+            CLAUDE_THINKING_DISPLAY_PROBE_VALUE,
+            "--version",
+        ],
+        deadline,
+        launch_policy,
+    )
+    .await?;
+    Ok(!output.success
+        && output
+            .text
+            .split(|character: char| !character.is_ascii_alphanumeric())
+            .any(|token| token == "summarized"))
 }
 
 /// The command's output, or why it gave none: `<argument> timed out` or another reason.
@@ -13945,8 +16156,33 @@ async fn run_claude_probe_command(
     deadline: Instant,
     launch_policy: ClaudeProbeLaunchPolicy,
 ) -> Result<String, String> {
+    let output = run_claude_probe(executable, &[argument], deadline, launch_policy).await?;
+    if !output.success {
+        return Err(format!("{argument} exited with {}", output.status));
+    }
+    if output.text.is_empty() {
+        return Err(format!("{argument} printed nothing"));
+    }
+    Ok(output.text)
+}
+
+struct ClaudeProbeOutput {
+    success: bool,
+    status: String,
+    text: String,
+}
+
+/// Runs one supervised probe command and returns its exit status with its trimmed output.
+/// Only a timeout or a failed spawn is an error.
+async fn run_claude_probe(
+    executable: &Path,
+    arguments: &[&str],
+    deadline: Instant,
+    launch_policy: ClaudeProbeLaunchPolicy,
+) -> Result<ClaudeProbeOutput, String> {
     const CLEANUP_RESERVE: Duration = Duration::from_millis(400);
-    let launch = prepare_claude_probe_launch(executable, argument, launch_policy)
+    let argument = arguments.join(" ");
+    let launch = prepare_claude_probe_launch(executable, arguments, launch_policy)
         .ok_or_else(|| format!("{argument} could not be prepared"))?;
     let mut command = tokio::process::Command::new(launch.program);
     command
@@ -13977,43 +16213,109 @@ async fn run_claude_probe_command(
         Err(SupervisedRunError::Timeout) => return Err(format!("{argument} timed out")),
         Err(error) => return Err(format!("{argument} failed: {error:?}")),
     };
-    if !output.status.success() {
-        return Err(format!("{argument} exited with {}", output.status));
-    }
     let mut text = String::from_utf8_lossy(&output.stdout.bytes).into_owned();
     if !output.stderr.bytes.is_empty() {
         text.push('\n');
         text.push_str(&String::from_utf8_lossy(&output.stderr.bytes));
     }
-    let text = text.trim().to_owned();
-    if text.is_empty() {
-        return Err(format!("{argument} printed nothing"));
-    }
-    Ok(text)
+    Ok(ClaudeProbeOutput {
+        success: output.status.success(),
+        status: output.status.to_string(),
+        text: text.trim().to_owned(),
+    })
 }
 
 fn prepare_claude_probe_launch(
     executable: &Path,
-    argument: &str,
+    arguments: &[&str],
     launch_policy: ClaudeProbeLaunchPolicy,
 ) -> Option<PreparedLaunch> {
     #[cfg(unix)]
     if matches!(launch_policy, ClaudeProbeLaunchPolicy::PosixShellFixture)
         && executable.extension() == Some(OsStr::new("sh"))
     {
+        let mut args = vec![executable.as_os_str().to_owned()];
+        args.extend(arguments.iter().map(OsString::from));
         return Some(PreparedLaunch {
             program: PathBuf::from("/bin/sh"),
-            args: vec![executable.as_os_str().to_owned(), OsString::from(argument)],
+            args,
             raw_windows_args: None,
         });
     }
     let _ = launch_policy;
-    prepare_provider_launch(executable, [argument]).ok()
+    prepare_provider_launch(executable, arguments.iter().copied()).ok()
+}
+
+/// How a Claude process takes up its conversation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ClaudeLaunch {
+    /// A new conversation under its own ID: `--session-id <id>`.
+    New,
+    /// `--resume <id>`.
+    Resume,
+    /// A copy of `source` under the ID BiBCode assigned it:
+    /// `--resume <source> --fork-session --session-id <id>`.
+    Fork { source: String },
+}
+
+const CLAUDE_FORKED_FROM_FIELD: &str = "forkedFrom";
+
+/// The session a copy's cursor forks, when the cursor is a copy's.
+fn claude_forked_from(cursor: &Value) -> Option<&str> {
+    cursor
+        .get(CLAUDE_FORKED_FROM_FIELD)
+        .and_then(Value::as_str)
+        .filter(|source| !source.is_empty())
+}
+
+impl ClaudeLaunch {
+    /// Decided by which transcript exists, as `exists` tells (`None` when it cannot), with the
+    /// rules tried in order: a copy's cursor forks while the copy's transcript is not known to
+    /// exist and the source's is not known to be missing, so a crash before Claude writes the
+    /// copy forks again; a cursor resumes when its own transcript exists, or cannot be checked
+    /// and it is not a copy's; anything else starts a new conversation.
+    fn for_cursor(cursor: Option<&Value>, exists: impl Fn(&str) -> Option<bool>) -> Self {
+        let Some(cursor) = cursor else {
+            return Self::New;
+        };
+        let Some(session_id) = resume_string(cursor) else {
+            return Self::New;
+        };
+        let forked_from = claude_forked_from(cursor);
+        let own = exists(&session_id);
+        if let Some(source) = forked_from
+            && own != Some(true)
+            && exists(source) != Some(false)
+        {
+            return Self::Fork {
+                source: source.to_owned(),
+            };
+        }
+        if own == Some(true) || (own.is_none() && forked_from.is_none()) {
+            Self::Resume
+        } else {
+            Self::New
+        }
+    }
+
+    /// The launch a cursor asks for, without checking any transcript.
+    fn requested_by(cursor: Option<&Value>) -> Self {
+        match cursor {
+            None => Self::New,
+            Some(cursor) => match claude_forked_from(cursor) {
+                Some(source) => Self::Fork {
+                    source: source.to_owned(),
+                },
+                None => Self::Resume,
+            },
+        }
+    }
 }
 
 fn build_claude_launch_arguments(
     request: &ProviderLaunchRequest,
     session_id: &str,
+    launch: &ClaudeLaunch,
     support: ClaudeActivitySupport,
     hook_settings: Option<&Value>,
     mcp_config: Option<&Path>,
@@ -14034,16 +16336,27 @@ fn build_claude_launch_arguments(
     if support.forward_subagent_text {
         args.push("--forward-subagent-text".to_owned());
     }
+    // Thinking text for the Thought rows (#173). Output never depends on this: any non-empty
+    // thinking delta is reasoning, and older models summarize without the flag.
+    if support.thinking_display {
+        args.extend(["--thinking-display".to_owned(), "summarized".to_owned()]);
+    }
     args.extend([
         "--verbose".to_owned(),
         "--setting-sources=user,project,local".to_owned(),
         "--permission-mode".to_owned(),
         claude_permission_arg(mode).to_owned(),
     ]);
-    if request.resume_cursor.is_some() {
-        args.extend(["--resume".to_owned(), session_id.to_owned()]);
-    } else {
-        args.extend(["--session-id".to_owned(), session_id.to_owned()]);
+    match launch {
+        ClaudeLaunch::New => args.extend(["--session-id".to_owned(), session_id.to_owned()]),
+        ClaudeLaunch::Resume => args.extend(["--resume".to_owned(), session_id.to_owned()]),
+        ClaudeLaunch::Fork { source } => args.extend([
+            "--resume".to_owned(),
+            source.clone(),
+            "--fork-session".to_owned(),
+            "--session-id".to_owned(),
+            session_id.to_owned(),
+        ]),
     }
     if let Some(model) = request.model.as_ref() {
         args.extend(["--model".to_owned(), model.clone()]);
@@ -14181,6 +16494,7 @@ pub fn build_claude_launch_arguments_for_test(
     build_claude_launch_arguments(
         request,
         session_id,
+        &ClaudeLaunch::requested_by(request.resume_cursor.as_ref()),
         support,
         None,
         request.mcp.as_ref().map(|_| Path::new("bibcode-mcp.json")),
@@ -14197,6 +16511,7 @@ pub fn build_claude_launch_arguments_with_settings_for_test(
     build_claude_launch_arguments(
         request,
         session_id,
+        &ClaudeLaunch::requested_by(request.resume_cursor.as_ref()),
         support,
         hook_settings.as_ref(),
         request.mcp.as_ref().map(|_| Path::new("bibcode-mcp.json")),
@@ -14321,27 +16636,39 @@ impl ClaudeDriver {
         validate_claude_options(&request.provider, &request.options, supports_fast_mode)?;
         let mode = claude_mode(&request.runtime_mode, &request.interaction_mode);
         // `--resume` of a conversation without a transcript fails on every launch, so start a new
-        // one instead; when BiBCode cannot tell, Claude decides.
-        if let Some(session_id) = request.resume_cursor.as_ref().and_then(resume_string) {
-            let environment = request
-                .environment
-                .iter()
-                .map(|(name, value)| (OsString::from(name), OsString::from(value)))
-                .collect::<Vec<_>>();
-            if crate::provider::environment::claude_session_transcript_exists(
+        // one instead; when BiBCode cannot tell, Claude decides. A copy forks its source until
+        // its own transcript exists.
+        let environment = request
+            .environment
+            .iter()
+            .map(|(name, value)| (OsString::from(name), OsString::from(value)))
+            .collect::<Vec<_>>();
+        let cwd = request.cwd.clone();
+        let transcript_exists = |session_id: &str| {
+            crate::provider::environment::claude_session_transcript_exists(
                 &environment,
-                &request.cwd,
-                &session_id,
-            ) == Some(false)
-            {
-                request.resume_cursor = None;
-            }
+                &cwd,
+                session_id,
+            )
+        };
+        let launch = ClaudeLaunch::for_cursor(request.resume_cursor.as_ref(), transcript_exists);
+        if launch == ClaudeLaunch::New {
+            request.resume_cursor = None;
         }
         let session_id = request
             .resume_cursor
             .as_ref()
             .and_then(resume_string)
             .unwrap_or_else(|| Uuid::new_v4().to_string());
+        let started_cursor = match (&launch, request.resume_cursor.as_ref()) {
+            (ClaudeLaunch::Fork { .. }, Some(cursor)) => cursor.clone(),
+            _ => json!({ "sessionId": session_id }),
+        };
+        // Only an import's own session is ever offered a copy in History; native threads and
+        // copies keep the usual early-exit error.
+        let watch_resume_refusal = launch == ClaudeLaunch::Resume
+            && super::agent_sessions_rpc::is_import_of(&request.thread_id, &session_id)
+            && transcript_exists(&session_id) == Some(true);
         request
             .environment
             .entry("CLAUDE_CODE_ENTRYPOINT".to_owned())
@@ -14357,6 +16684,23 @@ impl ClaudeDriver {
             probe_launch_policy,
         )
         .await;
+        // A copy needs Claude to take the ID BiBCode assigned it. The probe's answer decides;
+        // without one the launch waits for it rather than guessing. Either refusal keeps the
+        // requested cursor, so the next send forks.
+        if matches!(launch, ClaudeLaunch::Fork { .. }) {
+            if !support.probe_finished {
+                return Err(ProviderRuntimeError::Provider {
+                    provider: request.provider.clone(),
+                    detail: CLAUDE_COPY_AWAITS_PROBE.to_owned(),
+                });
+            }
+            if !support.fork_session_id {
+                return Err(ProviderRuntimeError::IncompatibleProvider {
+                    provider: request.provider.clone(),
+                    detail: CLAUDE_COPY_NEEDS_UPDATE.to_owned(),
+                });
+            }
+        }
         let hook_sink = if support.include_hook_events && support.forward_subagent_text {
             start_claude_hook_sink().await.ok()
         } else {
@@ -14391,6 +16735,7 @@ impl ClaudeDriver {
         let args = build_claude_launch_arguments(
             &request,
             &session_id,
+            &launch,
             support,
             hook_settings.as_ref(),
             mcp_config
@@ -14418,6 +16763,9 @@ impl ClaudeDriver {
         provider_runtime.set_targeted_activity_control_supported(
             targeted_activity_provisionally_supported && activity_enabled,
         );
+        if matches!(launch, ClaudeLaunch::Fork { .. }) {
+            provider_runtime.expect_session_id(session_id.clone());
+        }
         let runtime = Arc::new(Mutex::new(provider_runtime));
         let (events_tx, events_rx) = mpsc::channel(DEFAULT_EVENT_QUEUE_CAPACITY);
         let (hook_receiver, hook_handle) = match hook_sink {
@@ -14462,8 +16810,61 @@ impl ClaudeDriver {
             acknowledgement_timeout: CLAUDE_DELIVERY_ACKNOWLEDGEMENT_TIMEOUT,
             hook_sink: hook_handle,
             output,
+            started_cursor,
+            watch_resume_refusal,
+            resume_refusal: tokio::sync::OnceCell::new(),
             _mcp_config: mcp_config,
         })
+    }
+
+    /// Why Claude stopped before taking up the conversation, when that is one of the two
+    /// launches History handles itself: a copy that came up under another session ID, or a
+    /// refused resume of an imported session. `None` for any other end, which keeps its usual
+    /// error, and while Claude's output is still open.
+    async fn launch_refusal(&self) -> Option<&'static str> {
+        if let Some(detail) = self.runtime.lock().await.halted() {
+            return Some(detail);
+        }
+        if !self.watch_resume_refusal || self.runtime.lock().await.saw_init() {
+            return None;
+        }
+        // Claude's output closes as it exits; a delivery whose write broke can return first.
+        if tokio::time::timeout(
+            CLAUDE_RESUME_REFUSAL_EXIT_WAIT,
+            self.output.cancellation.cancelled(),
+        )
+        .await
+        .is_err()
+        {
+            return None;
+        }
+        let refused = *self
+            .resume_refusal
+            .get_or_init(|| async {
+                if self.runtime.lock().await.saw_init() {
+                    return false;
+                }
+                let deadline = Instant::now() + CLAUDE_RESUME_REFUSAL_EXIT_WAIT;
+                let status = loop {
+                    if let Some((_, status)) = exited_child(&self.child) {
+                        break Some(status);
+                    }
+                    if Instant::now() >= deadline {
+                        break None;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                };
+                let refused = status.is_some_and(|status| !status.success());
+                if refused {
+                    tracing::warn!(
+                        session_id = %self.session_id,
+                        "Claude Code refused to resume an imported session; History offers a copy"
+                    );
+                }
+                refused
+            })
+            .await;
+        refused.then_some(CLAUDE_RESUME_REFUSED)
     }
 
     fn encode_json_line(&self, value: Value) -> Result<Vec<u8>, ProviderRuntimeError> {
@@ -14735,7 +17136,101 @@ impl ClaudeDriver {
             self.runtime.lock().await.stop_awaiting_turn_input(write);
         }
     }
+
+    /// Writes `/compact` and opens a turn for it tagged with the compaction id. The write is
+    /// registered for acknowledgement as a delivery's is, but with no delivery key, and the turn
+    /// awaits its input: a successful result Claude reports first (after a resume) is ignored,
+    /// and only the `local_command: "compact"` result acknowledges the write and ends the turn.
+    /// Its wait has no deadline of its own; the compaction's bound covers it.
+    async fn write_compaction(&self, compaction_id: String) -> ProviderCompactionStart {
+        let session_cancellation = self
+            .runtime
+            .lock()
+            .await
+            .delivery_acknowledgement_cancellation();
+        let content =
+            crate::provider::attachments::prompt_parts(Some(CLAUDE_COMPACT_COMMAND), Vec::new());
+        let bytes = match self.encode_json_line(json!({
+            "type":"user",
+            "session_id":self.session_id,
+            "message":{"role":"user","content":content},
+            "parent_tool_use_id":null
+        })) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                return ProviderCompactionStart::NotStarted {
+                    detail: delivery_detail(&error, Some(&self.provider_label)),
+                };
+            }
+        };
+        let not_started = |outcome: ProviderDeliveryOutcome| match outcome {
+            ProviderDeliveryOutcome::Ambiguous { detail } => {
+                ProviderCompactionStart::Unknown { detail }
+            }
+            ProviderDeliveryOutcome::DefinitelyNotSent { detail }
+            | ProviderDeliveryOutcome::Rejected { detail }
+            | ProviderDeliveryOutcome::Refused { detail }
+            | ProviderDeliveryOutcome::NotSentRetryAfter { detail, .. } => {
+                ProviderCompactionStart::NotStarted { detail }
+            }
+            ProviderDeliveryOutcome::Accepted { .. }
+            | ProviderDeliveryOutcome::AcceptedInNewConversation { .. }
+            | ProviderDeliveryOutcome::AlreadyDelivered => ProviderCompactionStart::NotStarted {
+                detail: "the compaction was not written".to_owned(),
+            },
+        };
+        let mut writer = tokio::select! {
+            biased;
+            () = self.output.cancellation.cancelled() => return not_started(self.stopped_before_sending()),
+            () = session_cancellation.cancelled() => return not_started(self.session_ended_before_sending()),
+            writer = self.writer.lock() => writer,
+        };
+        // Registered under the writer lock, in the order of the actual writes.
+        let (acknowledgement_tx, acknowledgement_rx) = oneshot::channel();
+        let registration = self.pending_acknowledgement.register_delivery(
+            CLAUDE_COMPACT_COMMAND,
+            acknowledgement_tx,
+            session_cancellation.clone(),
+            None,
+        );
+        let turn_id = Uuid::new_v4().to_string();
+        {
+            let mut runtime = self.runtime.lock().await;
+            runtime.begin_compaction_turn(turn_id.clone(), compaction_id);
+            runtime.await_turn_input(registration.id);
+        }
+        if let Err(outcome) = self
+            .write_delivery_bytes(
+                writer.as_mut(),
+                &bytes,
+                &CancellationToken::new(),
+                &session_cancellation,
+            )
+            .await
+        {
+            if matches!(outcome, ProviderDeliveryOutcome::Ambiguous { .. }) {
+                // Part of it was written: Claude may still run it, and its result ends the turn.
+                registration.expire();
+            } else {
+                let mut runtime = self.runtime.lock().await;
+                runtime.stop_awaiting_turn_input(registration.id);
+                runtime.abandon_compaction_turn();
+            }
+            return not_started(outcome);
+        }
+        drop(writer);
+        // The entry stays until the `local_command` result consumes it, so a later `/compact`
+        // cannot take this write's acknowledgement. Nothing waits on it here.
+        drop(acknowledgement_rx);
+        registration.expire();
+        ProviderCompactionStart::Started {
+            turn_id: Some(turn_id),
+        }
+    }
 }
+
+/// What BiBCode writes to have Claude compact its conversation.
+const CLAUDE_COMPACT_COMMAND: &str = "/compact";
 
 /// Ends once `timeout` has passed without Claude compacting. Claude replays a message only
 /// after a compaction it runs first (over a minute near a full 1M-token window), so the wait
@@ -14767,7 +17262,7 @@ impl ProviderDriver for ClaudeDriver {
             let events = self.runtime.lock().await.start_session(mode, None);
             drop(events);
             Ok(StartedSession {
-                resume_cursor: Some(json!({"sessionId":self.session_id})),
+                resume_cursor: Some(self.started_cursor.clone()),
                 runtime_payload: Some(json!({"transport":"stream-json"})),
                 activity_capabilities: if self.hook_sink.is_some() {
                     ActivityCapabilities {
@@ -14814,7 +17309,22 @@ impl ProviderDriver for ClaudeDriver {
         _: String,
         delivery_key: String,
     ) -> BoxRuntimeFuture<'_, ProviderDeliveryOutcome> {
-        Box::pin(self.deliver_user_line(text, attachments, None, delivery_key))
+        Box::pin(async move {
+            let outcome = self
+                .deliver_user_line(text, attachments, None, delivery_key)
+                .await;
+            if matches!(outcome, ProviderDeliveryOutcome::Accepted { .. }) {
+                return outcome;
+            }
+            // Claude never took up the conversation, so this message failed for that reason, and
+            // sending it again to the same launch would fail the same way.
+            match self.launch_refusal().await {
+                Some(detail) => ProviderDeliveryOutcome::Rejected {
+                    detail: detail.to_owned(),
+                },
+                None => outcome,
+            }
+        })
     }
     fn steer(
         &self,
@@ -14824,6 +17334,9 @@ impl ProviderDriver for ClaudeDriver {
         delivery_key: String,
     ) -> BoxRuntimeFuture<'_, ProviderDeliveryOutcome> {
         Box::pin(self.deliver_user_line(text, attachments, Some(expected_turn_id), delivery_key))
+    }
+    fn compact(&self, compaction_id: String) -> BoxRuntimeFuture<'_, ProviderCompactionStart> {
+        Box::pin(self.write_compaction(compaction_id))
     }
     fn interrupt(
         &self,
@@ -14983,7 +17496,11 @@ impl ProviderDriver for ClaudeDriver {
             if let Some(event) = deferred_events.pop_front() {
                 return Some(event);
             }
-            let completion = self.events.lock().await.recv().await?;
+            let Some(completion) = self.events.lock().await.recv().await else {
+                // Decided before the pump sees the end, so it can record a refused resume.
+                let _ = self.launch_refusal().await;
+                return None;
+            };
             let Some(turn_id) = claude_completion_query_turn_id(&completion).map(str::to_owned)
             else {
                 return Some(completion);
@@ -15028,6 +17545,10 @@ impl ProviderDriver for ClaudeDriver {
     }
     fn exited_process(&self) -> BoxRuntimeFuture<'_, Option<(u32, std::process::ExitStatus)>> {
         Box::pin(std::future::ready(exited_child(&self.child)))
+    }
+
+    fn resume_refused(&self) -> bool {
+        self.resume_refusal.get().copied().unwrap_or(false)
     }
 
     fn shutdown(&self) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
@@ -15649,7 +18170,8 @@ async fn emit_claude_value(
     let mut late_delivery_key = None;
     let mut output = {
         let mut runtime = runtime.lock().await;
-        let replay = if authenticated_hook {
+        // A halted copy shows nothing more, its replays included.
+        let replay = if authenticated_hook || runtime.halted().is_some() {
             None
         } else if let Some(text) = claude_replayed_user_text(&value) {
             let replay = pending_acknowledgement
@@ -16195,6 +18717,7 @@ mod tests {
         unsettled_work: bool,
         /// What deliveries answer instead of sending.
         delivery_outcome: Option<super::ProviderDeliveryOutcome>,
+        resume_refused: bool,
     }
 
     struct SupervisorDriver {
@@ -16685,6 +19208,10 @@ mod tests {
             Box::pin(std::future::ready(self.state.lock().unwrap().exited))
         }
 
+        fn resume_refused(&self) -> bool {
+            self.state.lock().unwrap().resume_refused
+        }
+
         fn shutdown(&self) -> super::BoxRuntimeFuture<'_, Result<(), super::ProviderRuntimeError>> {
             Box::pin(async move {
                 let (entered, release, active, max_active) = {
@@ -16819,6 +19346,7 @@ mod tests {
             mcp: None,
             codex_home: None,
             open_url: None,
+            host_thread_id: None,
         }
     }
 
@@ -16957,6 +19485,44 @@ mod tests {
                 super::ClaudeProbeLaunchPolicy::Direct
             )
         ));
+    }
+
+    /// A chat panel's launch names its host, which its MCP credential is scoped to; any other
+    /// thread's names none.
+    #[tokio::test]
+    async fn a_chat_panels_launch_names_its_host_thread() {
+        let engine = supervisor_engine().await;
+        engine
+            .dispatch(
+                serde_json::from_value(json!({"type":"thread.create","commandId":"panel","threadId":"panel","projectId":"p1","title":"Panel — Codex","kind":"panel","hostThreadId":"t1","modelSelection":{"instanceId":"codex","model":"gpt-5"},"runtimeMode":"full-access","interactionMode":"default","branch":null,"worktreePath":null,"createdAt":"2026-07-16T00:00:00Z"}))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let settings = TempDir::new().expect("provider settings directory");
+        for (thread_id, host) in [("panel", Some("t1")), ("t1", None)] {
+            let command = serde_json::from_value(json!({
+                "type":"thread.turn.start",
+                "commandId":format!("launch-{thread_id}"),
+                "threadId":thread_id,
+                "message":{"messageId":format!("message-{thread_id}"),"role":"user","text":"launch","attachments":[]},
+                "modelSelection":{"instanceId":"codex","model":"gpt-5.6","options":[]},
+                "runtimeMode":"full-access",
+                "interactionMode":"default",
+                "createdAt":"2026-07-16T00:00:00Z"
+            }))
+            .expect("turn command");
+            let request = super::launch_request_for_command(
+                &engine,
+                &settings.path().to_path_buf(),
+                &command,
+                None,
+            )
+            .await
+            .expect("launch request");
+            assert_eq!(request.host_thread_id.as_deref(), host, "{thread_id}");
+        }
+        engine.shutdown().await;
     }
 
     #[tokio::test]
@@ -17624,6 +20190,7 @@ mod tests {
         let arguments = super::build_claude_launch_arguments(
             &request,
             "claude-session",
+            &super::ClaudeLaunch::New,
             super::ClaudeActivitySupport::default(),
             None,
             None,
@@ -17734,6 +20301,9 @@ lines.on("line", (line) => {
       break;
     case "thread/goal/set":
       result = { goal: { status: "active" } };
+      break;
+    case "thread/compact/start":
+      result = {};
       break;
     case "turn/start":
       result = { turn: { id: "native-codex-turn" } };
@@ -18427,6 +20997,513 @@ done
         }
     }
 
+    /// Which transcript exists decides how a Claude cursor launches (see `ClaudeLaunch`).
+    #[test]
+    fn claude_launches_follow_which_transcript_exists() {
+        use super::ClaudeLaunch;
+        let fork = || ClaudeLaunch::Fork {
+            source: "source".to_owned(),
+        };
+        let copy = json!({"sessionId":"copy","forkedFrom":"source"});
+        let plain = json!({"sessionId":"plain"});
+        let known = |copy_exists: Option<bool>, source_exists: Option<bool>| {
+            move |session_id: &str| match session_id {
+                "copy" | "plain" => copy_exists,
+                "source" => source_exists,
+                _ => None,
+            }
+        };
+        // A copy forks until Claude has written it, also when nothing can be checked.
+        for (copy_exists, source_exists, expected) in [
+            (Some(false), Some(true), fork()),
+            (None, None, fork()),
+            (None, Some(true), fork()),
+            (Some(true), Some(true), ClaudeLaunch::Resume),
+            (Some(true), Some(false), ClaudeLaunch::Resume),
+            // Its source is gone and the copy was never written: a new conversation.
+            (Some(false), Some(false), ClaudeLaunch::New),
+            (None, Some(false), ClaudeLaunch::New),
+        ] {
+            assert_eq!(
+                ClaudeLaunch::for_cursor(Some(&copy), known(copy_exists, source_exists)),
+                expected,
+                "copy {copy_exists:?}, source {source_exists:?}"
+            );
+        }
+        for (exists, expected) in [
+            (Some(true), ClaudeLaunch::Resume),
+            (None, ClaudeLaunch::Resume),
+            (Some(false), ClaudeLaunch::New),
+        ] {
+            assert_eq!(
+                ClaudeLaunch::for_cursor(Some(&plain), known(exists, None)),
+                expected
+            );
+        }
+        assert_eq!(
+            ClaudeLaunch::for_cursor(None, |_| Some(true)),
+            ClaudeLaunch::New
+        );
+    }
+
+    #[cfg(unix)]
+    const CLAUDE_COPY_FIXTURE: &str = r#"#!/bin/sh
+case "$1" in
+  --version) printf '%s\n' '2.1.310 (Claude Code)'; exit 0;;
+  --help) printf '%s\n' '-r, --resume [value]' '--fork-session' '--session-id <uuid>'; exit 0;;
+esac
+printf '%s\n' "$@" > "$BIBCODE_TEST_ARGUMENTS"
+while IFS= read -r line; do
+  case "$line" in
+    *'"type":"user"'*)
+      printf '{"type":"system","subtype":"init","session_id":"%s"}\n' "$BIBCODE_TEST_INIT_SESSION"
+      printf '%s\n' "$line"
+      printf '%s\n' '{"type":"assistant","session_id":"copy","message":{"id":"m","role":"assistant","content":[{"type":"text","text":"copied answer"}]}}'
+      ;;
+  esac
+done
+"#;
+
+    /// A Claude launch over `cursor` in a config directory holding the transcripts named in
+    /// `transcripts`, with its recorded arguments.
+    #[cfg(unix)]
+    struct ClaudeCursorLaunch {
+        temp: TempDir,
+        request: super::ProviderLaunchRequest,
+        arguments: std::path::PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl ClaudeCursorLaunch {
+        fn new(fixture: &str, cursor: Value, transcripts: &[&str]) -> Self {
+            let temp = TempDir::new().expect("provider fixture directory");
+            let config = temp.path().join("claude-config");
+            let cwd = temp.path().join("project");
+            let project = config.join("projects").join(
+                crate::provider::environment::claude_project_directory_name(&cwd)
+                    .expect("short cwd"),
+            );
+            std::fs::create_dir_all(&cwd).expect("cwd");
+            std::fs::create_dir_all(&project).expect("claude project");
+            for transcript in transcripts {
+                std::fs::write(project.join(format!("{transcript}.jsonl")), "{}\n")
+                    .expect("transcript");
+            }
+            let arguments = temp.path().join("arguments");
+            let mut request = native_launch(&temp, "claudeAgent");
+            request.provider_label = "Work Claude".to_owned();
+            request.binary_path = executable_fixture(&temp, "claude-copy", fixture)
+                .to_string_lossy()
+                .into_owned();
+            request.cwd = cwd;
+            request.resume_cursor = Some(cursor);
+            request.environment.insert(
+                "CLAUDE_CONFIG_DIR".to_owned(),
+                config.to_string_lossy().into_owned(),
+            );
+            request.environment.insert(
+                "BIBCODE_TEST_ARGUMENTS".to_owned(),
+                arguments.to_string_lossy().into_owned(),
+            );
+            Self {
+                temp,
+                request,
+                arguments,
+            }
+        }
+
+        async fn spawn(&self) -> Result<Arc<super::ClaudeDriver>, super::ProviderRuntimeError> {
+            let factory =
+                super::NativeProviderDriverFactory::new(self.temp.path().join("attachments"));
+            super::ClaudeDriver::spawn(
+                self.request.clone(),
+                factory.attachments.clone(),
+                factory.attribution.clone(),
+                false,
+                factory.claude_probe_cache.clone(),
+                factory.claude_probe_launch_policy,
+                false,
+            )
+            .await
+            .map(Arc::new)
+        }
+
+        async fn arguments(&self) -> Vec<String> {
+            timeout(Duration::from_secs(10), async {
+                loop {
+                    if let Ok(arguments) = std::fs::read_to_string(&self.arguments)
+                        && arguments.contains("--print")
+                    {
+                        break arguments.lines().map(str::to_owned).collect();
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("Claude launch arguments")
+        }
+    }
+
+    /// A copy forks its source under the ID BiBCode assigned it, so the launch reports the
+    /// requested cursor and owes no context handoff; once Claude has written the copy it resumes
+    /// it, and a copy whose source is gone starts a new conversation that owes the handoff.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_copy_forks_its_source_until_claude_has_written_it() {
+        let copy = json!({"sessionId":"copy","forkedFrom":"source"});
+        for (transcripts, stage) in [
+            (&["source"][..], "first"),
+            (&["source", "copy"][..], "written"),
+            (&[][..], "source gone"),
+        ] {
+            let launch = ClaudeCursorLaunch::new(CLAUDE_COPY_FIXTURE, copy.clone(), transcripts);
+            let driver = launch.spawn().await.expect("Claude driver should create");
+            let started = driver.start().await.expect("Claude start");
+            let arguments = launch.arguments().await;
+            let started_id = started
+                .resume_cursor
+                .as_ref()
+                .and_then(super::resume_string);
+            match stage {
+                "first" => {
+                    assert!(
+                        arguments.windows(5).any(|window| window
+                            == [
+                                "--resume",
+                                "source",
+                                "--fork-session",
+                                "--session-id",
+                                "copy"
+                            ]),
+                        "{arguments:?}"
+                    );
+                    assert_eq!(started.resume_cursor, Some(copy.clone()));
+                }
+                "written" => {
+                    assert!(
+                        arguments
+                            .windows(2)
+                            .any(|pair| pair == ["--resume", "copy"]),
+                        "{arguments:?}"
+                    );
+                    assert!(
+                        !arguments
+                            .iter()
+                            .any(|argument| argument == "--fork-session")
+                    );
+                    assert_eq!(started_id.as_deref(), Some("copy"));
+                }
+                _ => {
+                    assert!(!arguments.iter().any(|argument| argument == "--resume"));
+                    let started_id = started_id.expect("a new conversation's id");
+                    // Another ID than the requested one is the lost resume that owes a handoff.
+                    assert_ne!(started_id, "copy");
+                    assert!(
+                        arguments
+                            .windows(2)
+                            .any(|pair| pair == ["--session-id", started_id.as_str()])
+                    );
+                }
+            }
+            driver.shutdown().await.expect("Claude shutdown");
+        }
+    }
+
+    /// A copy is launched only by a Claude Code the probe says takes its session ID; without
+    /// the probe's answer the launch waits for it. Neither starts Claude, so the requested
+    /// cursor stays for the next send.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_copy_needs_a_probed_claude_code_that_takes_its_session_id() {
+        const OLD_FIXTURE: &str = "#!/bin/sh\ncase \"$1\" in\n  --version) printf '%s\\n' '2.0.72 (Claude Code)'; exit 0;;\n  --help) printf '%s\\n' '--fork-session --session-id'; exit 0;;\nesac\nprintf '%s\\n' \"$@\" > \"$BIBCODE_TEST_ARGUMENTS\"\ncat >/dev/null\n";
+        const UNPROBED_FIXTURE: &str = "#!/bin/sh\ncase \"$1\" in\n  --version) exit 1;;\n  --help) printf '%s\\n' '--fork-session --session-id'; exit 0;;\nesac\nprintf '%s\\n' \"$@\" > \"$BIBCODE_TEST_ARGUMENTS\"\ncat >/dev/null\n";
+        let copy = json!({"sessionId":"copy","forkedFrom":"source"});
+        for (fixture, expected) in [
+            (OLD_FIXTURE, super::CLAUDE_COPY_NEEDS_UPDATE),
+            (UNPROBED_FIXTURE, super::CLAUDE_COPY_AWAITS_PROBE),
+        ] {
+            let launch = ClaudeCursorLaunch::new(fixture, copy.clone(), &["source"]);
+            let error = match launch.spawn().await {
+                Ok(_) => panic!("a copy must not launch: {expected}"),
+                Err(error) => error,
+            };
+            let detail = match &error {
+                super::ProviderRuntimeError::IncompatibleProvider { detail, .. }
+                | super::ProviderRuntimeError::Provider { detail, .. } => detail.clone(),
+                other => panic!("unexpected error {other:?}"),
+            };
+            assert_eq!(detail, expected);
+            // An old Claude fails the delivery once; an unanswered probe is retried.
+            assert_eq!(
+                matches!(
+                    super::launch_failure_outcome(&error, "Work Claude"),
+                    super::ProviderDeliveryOutcome::Rejected { .. }
+                ),
+                expected == super::CLAUDE_COPY_NEEDS_UPDATE
+            );
+            assert!(!launch.arguments.exists(), "Claude was not started");
+        }
+    }
+
+    #[cfg(unix)]
+    async fn claude_events_until_exit(driver: &super::ClaudeDriver) -> Vec<super::ProviderEvent> {
+        let mut events = Vec::new();
+        let _ = timeout(Duration::from_secs(10), async {
+            while let Some(event) = driver.next_event().await {
+                let exited = event.event_type == "session.exited";
+                events.push(event);
+                if exited {
+                    break;
+                }
+            }
+        })
+        .await;
+        events
+    }
+
+    /// A copy Claude continues under an ID BiBCode did not assign fails before any of its
+    /// output reaches the thread, ends the session (so the driver is stopped), and keeps the
+    /// copy's cursor, so the next send forks again.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_copy_under_another_session_id_fails_before_its_output_shows() {
+        let copy = json!({"sessionId":"copy","forkedFrom":"source"});
+        let mut launch = ClaudeCursorLaunch::new(CLAUDE_COPY_FIXTURE, copy.clone(), &["source"]);
+        launch.request.environment.insert(
+            "BIBCODE_TEST_INIT_SESSION".to_owned(),
+            "claude-chose-this".to_owned(),
+        );
+        let driver = launch.spawn().await.expect("Claude driver should create");
+        let started = driver.start().await.expect("Claude start");
+        assert_eq!(started.resume_cursor, Some(copy));
+        let outcome = timeout(
+            Duration::from_secs(10),
+            driver.deliver("hello".into(), vec![], "default".into(), "copy-key".into()),
+        )
+        .await
+        .expect("delivery settles");
+        assert_eq!(
+            outcome,
+            super::ProviderDeliveryOutcome::Rejected {
+                detail: crate::provider::claude::runtime::CLAUDE_COPY_UNDER_ANOTHER_ID.to_owned(),
+            }
+        );
+        let events = claude_events_until_exit(&driver).await;
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event_type == "session.exited"),
+            "the session ends: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.payload.to_string().contains("copied answer")),
+            "no output of the copy is shown: {events:?}"
+        );
+        driver.shutdown().await.expect("Claude shutdown");
+
+        // Claude reporting the assigned ID runs the copy as usual.
+        let copy = json!({"sessionId":"copy","forkedFrom":"source"});
+        let mut launch = ClaudeCursorLaunch::new(CLAUDE_COPY_FIXTURE, copy, &["source"]);
+        launch
+            .request
+            .environment
+            .insert("BIBCODE_TEST_INIT_SESSION".to_owned(), "copy".to_owned());
+        let driver = launch.spawn().await.expect("Claude driver should create");
+        driver.start().await.expect("Claude start");
+        let outcome = timeout(
+            Duration::from_secs(10),
+            driver.deliver("hello".into(), vec![], "default".into(), "copy-key".into()),
+        )
+        .await
+        .expect("delivery settles");
+        assert!(
+            matches!(outcome, super::ProviderDeliveryOutcome::Accepted { .. }),
+            "{outcome:?}"
+        );
+        driver.shutdown().await.expect("Claude shutdown");
+    }
+
+    /// A `--resume` of an imported session that Claude ends with a failure before its first
+    /// `system/init` fails its message with a pointer to Continue in a copy, and the pump
+    /// records it; the same early exit on a native thread keeps the usual error. The fixture
+    /// fails once the message arrives, so an exit before ownership admission cannot race it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_refused_resume_of_an_imported_session_points_at_a_copy() {
+        const REFUSING_FIXTURE: &str = "#!/bin/sh\ncase \"$1\" in\n  --version) printf '%s\\n' '2.1.310 (Claude Code)'; exit 0;;\n  --help) printf '%s\\n' '--fork-session --session-id'; exit 0;;\nesac\nprintf '%s\\n' \"$@\" > \"$BIBCODE_TEST_ARGUMENTS\"\nread -r _\nprintf '%s\\n' 'Error: session is in use' >&2\nexit 1\n";
+        let session = "0f8b5c2e-4d6a-4b1c-9e3f-2a7d8c9b1e40";
+        for (thread_id, refused) in [
+            (format!("import:claudeAgent:{session}"), true),
+            ("native-test-thread".to_owned(), false),
+        ] {
+            let mut launch =
+                ClaudeCursorLaunch::new(REFUSING_FIXTURE, json!({"sessionId":session}), &[session]);
+            launch.request.thread_id = thread_id;
+            let driver = launch.spawn().await.expect("Claude driver should create");
+            driver.start().await.expect("Claude start");
+            let outcome = timeout(
+                Duration::from_secs(10),
+                driver.deliver(
+                    "continue".into(),
+                    vec![],
+                    "default".into(),
+                    "resume-key".into(),
+                ),
+            )
+            .await
+            .expect("delivery settles");
+            let _ = timeout(Duration::from_secs(10), async {
+                while driver.next_event().await.is_some() {}
+            })
+            .await;
+            let refusal = super::ProviderDeliveryOutcome::Rejected {
+                detail: super::CLAUDE_RESUME_REFUSED.to_owned(),
+            };
+            if refused {
+                assert_eq!(outcome, refusal);
+            } else {
+                assert_ne!(outcome, refusal);
+            }
+            assert_eq!(driver.resume_refused(), refused);
+            driver.shutdown().await.expect("Claude shutdown");
+        }
+    }
+
+    /// The pump records a refused resume in the runtime row, which History reads.
+    #[tokio::test]
+    async fn a_refused_resume_is_recorded_in_the_runtime_row_when_its_stream_ends() {
+        for refused in [true, false] {
+            let engine = supervisor_engine().await;
+            let activity = super::ActivityProjection::new(ActivityRepository::new(
+                engine.repositories().database().clone(),
+            ));
+            let state = Arc::new(StdMutex::new(SupervisorDriverState {
+                resume_refused: refused,
+                ..SupervisorDriverState::default()
+            }));
+            let (event_sender, event_receiver) = mpsc::channel(1);
+            drop(event_sender);
+            let temp = TempDir::new().expect("launch directory");
+            let mut launch = native_launch(&temp, "claudeAgent");
+            launch.thread_id = "t1".to_owned();
+            let driver: Arc<dyn ProviderDriver> = Arc::new(SupervisorDriver {
+                state,
+                events: tokio::sync::Mutex::new(event_receiver),
+            });
+            let (activity_dispatch_sender, _activity_dispatch_receiver) = mpsc::channel(1);
+            let (terminal_sender, _terminal_receiver) = mpsc::unbounded_channel();
+            let pump = super::spawn_event_pump(
+                engine.clone(),
+                driver,
+                launch,
+                Some(json!({"sessionId":"session"})),
+                Some(json!({"transport":"stream-json"})),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+                activity,
+                Arc::new(StdMutex::new(super::ProviderActivityLifecycleState::new(
+                    crate::activity::ActivityCapabilities::default(),
+                ))),
+                false,
+                Arc::new(RwLock::new(None)),
+                activity_dispatch_sender,
+                "refused-resume-stream-ended".to_owned(),
+                tokio_util::sync::CancellationToken::new(),
+                Arc::new(tokio::sync::Mutex::new(
+                    super::SessionPublicationState::default(),
+                )),
+                None,
+                Arc::new(AtomicU64::new(0)),
+                terminal_sender,
+                Duration::from_secs(3_600),
+                None,
+            );
+            timeout(Duration::from_secs(5), pump)
+                .await
+                .expect("pump ends")
+                .expect("pump task");
+            let runtime = engine
+                .repositories()
+                .get_provider_session_runtime("t1".to_owned())
+                .await
+                .expect("runtime read");
+            if refused {
+                let runtime = runtime.expect("runtime row");
+                assert_eq!(runtime.resume_cursor, Some(json!({"sessionId":"session"})));
+                assert_eq!(
+                    runtime.runtime_payload,
+                    Some(json!({"transport":"stream-json","resumeRefused":true}))
+                );
+            } else {
+                assert!(runtime.is_none_or(|runtime| {
+                    runtime
+                        .runtime_payload
+                        .is_none_or(|payload| payload.get("resumeRefused").is_none())
+                }));
+            }
+        }
+    }
+
+    /// The session stays registered after its stream ends, and a shutdown writes its runtime row
+    /// again: the refusal must survive that, so History keeps offering a copy.
+    #[tokio::test]
+    async fn a_refused_resume_survives_a_shutdown_before_the_next_launch() {
+        let engine = supervisor_engine().await;
+        let activity = super::ActivityProjection::new(ActivityRepository::new(
+            engine.repositories().database().clone(),
+        ));
+        let state = Arc::new(StdMutex::new(SupervisorDriverState {
+            resume_refused: true,
+            ..SupervisorDriverState::default()
+        }));
+        let (events_tx, events_rx) = mpsc::channel(1);
+        let supervisor = super::ProviderRuntimeSupervisor::start(
+            engine.clone(),
+            Arc::new(SupervisorFactory {
+                state,
+                events: StdMutex::new(Some(events_rx)),
+            }),
+            activity,
+            super::SupervisorOptions::default(),
+        );
+        let temp = TempDir::new().expect("launch directory");
+        let mut launch = native_launch(&temp, "claudeAgent");
+        launch.thread_id = "t1".to_owned();
+        supervisor.launch(launch).await.expect("launch runtime");
+        drop(events_tx);
+        let refused = |runtime: Option<ProviderSessionRuntime>| {
+            runtime
+                .and_then(|runtime| runtime.runtime_payload)
+                .is_some_and(|payload| payload.get("resumeRefused") == Some(&json!(true)))
+        };
+        timeout(Duration::from_secs(5), async {
+            while !refused(
+                engine
+                    .repositories()
+                    .get_provider_session_runtime("t1".to_owned())
+                    .await
+                    .expect("runtime read"),
+            ) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the event pump records the refusal");
+
+        supervisor.shutdown().await.expect("shutdown");
+        let runtime = engine
+            .repositories()
+            .get_provider_session_runtime("t1".to_owned())
+            .await
+            .expect("runtime read")
+            .expect("runtime row");
+        assert_eq!(runtime.status, "suspended");
+        assert!(refused(Some(runtime)), "the shutdown kept the refusal");
+        engine.shutdown().await;
+    }
+
     #[tokio::test]
     async fn claude_steer_settle_or_interrupt_while_waiting_to_write_sends_nothing() {
         for interrupted in [false, true] {
@@ -18837,6 +21914,68 @@ done
         let completed = claude_fixture_output(&driver, "turn.completed").await;
         assert_eq!(completed.turn_id.as_deref(), Some(turn_id.as_str()));
         assert_eq!(completed.payload["state"], "completed");
+        driver.shutdown().await.unwrap();
+    }
+
+    // A resumed Claude reporting a stale result before it reads `/compact`, then compacting.
+    #[cfg(unix)]
+    const CLAUDE_RESUMED_COMPACTION_FIXTURE: &str = r#"#!/bin/sh
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$BIBCODE_TEST_REQUEST_CAPTURE"
+  case "$line" in
+    *'"/compact"'*)
+      printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"stop_reason":null,"session_id":"s","uuid":"before-read"}'
+      printf '%s\n' '{"type":"system","subtype":"status","status":"compacting","session_id":"s","uuid":"status-compacting"}'
+      printf '%s\n' '{"type":"system","subtype":"status","status":null,"compact_result":"success","session_id":"s","uuid":"status-done"}'
+      printf '%s\n' '{"type":"user","message":{"role":"user","content":"<local-command-stdout>Compacted </local-command-stdout>"},"session_id":"s","parent_tool_use_id":null,"uuid":"local-output","isReplay":true}'
+      printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"num_turns":0,"stop_reason":null,"terminal_reason":"completed","local_command":"compact","result":"","session_id":"s","uuid":"compact-result"}'
+      ;;
+  esac
+done
+"#;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_compact_writes_compact_in_a_turn_tagged_with_the_compaction_id() {
+        let temp = TempDir::new().unwrap();
+        let capture = temp.path().join("compact.jsonl");
+        let driver = claude_delivery_fixture(
+            &temp,
+            "claude-tagged-compaction",
+            CLAUDE_RESUMED_COMPACTION_FIXTURE,
+            &capture,
+            None,
+            None,
+        )
+        .await;
+        driver.start().await.unwrap();
+        let started = timeout(
+            Duration::from_secs(5),
+            driver.compact("compaction:1".into()),
+        )
+        .await
+        .expect("the write returns at once");
+        let super::ProviderCompactionStart::Started {
+            turn_id: Some(turn_id),
+        } = started
+        else {
+            panic!("{started:?}");
+        };
+        let turn_started = claude_fixture_output(&driver, "turn.started").await;
+        assert_eq!(turn_started.turn_id.as_deref(), Some(turn_id.as_str()));
+        assert_eq!(turn_started.payload["compactionId"], "compaction:1");
+        let compacted = claude_fixture_output(&driver, "item.completed").await;
+        assert_eq!(compacted.payload["itemType"], "context_compaction");
+        assert_eq!(compacted.payload["status"], "completed");
+        assert_eq!(compacted.turn_id.as_deref(), Some(turn_id.as_str()));
+        // The stale result before Claude read `/compact` did not end the turn: this one is the
+        // `local_command` result's.
+        let completed = claude_fixture_output(&driver, "turn.completed").await;
+        assert_eq!(completed.turn_id.as_deref(), Some(turn_id.as_str()));
+        assert_eq!(completed.payload["state"], "completed");
+        assert_eq!(completed.payload["compactionId"], "compaction:1");
+        let written = std::fs::read_to_string(&capture).unwrap();
+        assert!(written.contains("\"/compact\""), "{written}");
         driver.shutdown().await.unwrap();
     }
 
@@ -19998,6 +23137,750 @@ done
         );
     }
 
+    /// The real event pump over a scripted driver, on a paused clock that only
+    /// `tokio::time::advance` moves, for the reasoning coalescer (#173).
+    struct ReasoningPump {
+        engine: super::OrchestrationEngine,
+        events: Option<mpsc::Sender<super::ProviderEvent>>,
+        pump: tokio::task::JoinHandle<()>,
+        _clock: tokio_util::task::AbortOnDropHandle<()>,
+        _terminal: mpsc::UnboundedReceiver<super::SupervisorMessage>,
+        _temp: TempDir,
+    }
+
+    impl ReasoningPump {
+        async fn start() -> Self {
+            let clock = keep_idle_clock_paused();
+            let engine = supervisor_engine().await;
+            let activity = super::ActivityProjection::new(ActivityRepository::new(
+                engine.repositories().database().clone(),
+            ));
+            let (event_sender, event_receiver) = mpsc::channel(1_024);
+            let temp = TempDir::new().expect("launch directory");
+            let mut launch = native_launch(&temp, "claude");
+            launch.thread_id = "t1".to_owned();
+            let driver: Arc<dyn ProviderDriver> = Arc::new(SupervisorDriver {
+                state: Arc::new(StdMutex::new(SupervisorDriverState::default())),
+                events: tokio::sync::Mutex::new(event_receiver),
+            });
+            let (activity_dispatch_sender, _activity_dispatch_receiver) = mpsc::channel(1);
+            let (terminal_sender, terminal_receiver) = mpsc::unbounded_channel();
+            let pump = super::spawn_event_pump(
+                engine.clone(),
+                driver,
+                launch,
+                None,
+                None,
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+                activity,
+                Arc::new(StdMutex::new(super::ProviderActivityLifecycleState::new(
+                    crate::activity::ActivityCapabilities::default(),
+                ))),
+                false,
+                Arc::new(RwLock::new(None)),
+                activity_dispatch_sender,
+                "reasoning-pump-stream-ended".to_owned(),
+                tokio_util::sync::CancellationToken::new(),
+                Arc::new(tokio::sync::Mutex::new(
+                    super::SessionPublicationState::default(),
+                )),
+                None,
+                Arc::new(AtomicU64::new(0)),
+                terminal_sender,
+                Duration::from_secs(3_600),
+                None,
+            );
+            Self {
+                engine,
+                events: Some(event_sender),
+                pump,
+                _clock: clock,
+                _terminal: terminal_receiver,
+                _temp: temp,
+            }
+        }
+
+        async fn send(&self, event: super::ProviderEvent) {
+            self.events
+                .as_ref()
+                .expect("open stream")
+                .send(event)
+                .await
+                .expect("pump reads events");
+        }
+
+        async fn delta(&self, turn: &str, item: Option<&str>, delta: &str) {
+            self.send(reasoning_test_event(
+                "content.delta",
+                turn,
+                item,
+                json!({"streamKind":"reasoning_text","delta":delta}),
+            ))
+            .await;
+        }
+
+        async fn complete(&self, turn: &str, item: Option<&str>, text: Option<&str>) {
+            let mut payload = json!({"itemType":"reasoning"});
+            if let Some(text) = text {
+                payload["text"] = json!(text);
+            }
+            self.send(reasoning_test_event("item.completed", turn, item, payload))
+                .await;
+        }
+
+        /// Lets the pump read what was sent, without moving the clock.
+        async fn drain(&self) {
+            let events = self.events.as_ref().expect("open stream");
+            while events.capacity() < events.max_capacity() {
+                tokio::task::yield_now().await;
+            }
+            self.engine.read_events(0).await.expect("events");
+        }
+
+        /// The reasoning writes once `done` holds for them, without moving the clock.
+        async fn writes_once(
+            &self,
+            done: impl Fn(&[(String, bool, String)]) -> bool,
+        ) -> Vec<(String, bool, String)> {
+            for _ in 0..10_000 {
+                tokio::task::yield_now().await;
+                let writes = reasoning_writes(&self.engine).await;
+                if done(&writes) {
+                    return writes;
+                }
+            }
+            panic!(
+                "the pump never wrote the expected reasoning: {:?}",
+                reasoning_writes(&self.engine).await
+            );
+        }
+
+        /// Ends the stream and waits for the pump's final flush and session settlement.
+        async fn finish(mut self) -> super::OrchestrationEngine {
+            drop(self.events.take());
+            (&mut self.pump).await.expect("pump task");
+            self.engine.clone()
+        }
+    }
+
+    fn reasoning_test_event(
+        event_type: &str,
+        turn: &str,
+        item: Option<&str>,
+        payload: Value,
+    ) -> super::ProviderEvent {
+        super::ProviderEvent {
+            native_event_id: None,
+            event_type: event_type.to_owned(),
+            thread_id: "t1".to_owned(),
+            turn_id: Some(turn.to_owned()),
+            item_id: item.map(str::to_owned),
+            request_id: None,
+            payload,
+            activity: Vec::new(),
+            activity_controls: Default::default(),
+        }
+    }
+
+    /// `(reasoningId, streaming, text)` of each `thread.reasoning-sent` event, in order.
+    async fn reasoning_writes(engine: &super::OrchestrationEngine) -> Vec<(String, bool, String)> {
+        engine
+            .read_events(0)
+            .await
+            .expect("events")
+            .into_iter()
+            .filter(|event| event.event.event_type == "thread.reasoning-sent")
+            .map(|event| {
+                let payload = &event.event.payload;
+                (
+                    payload["reasoningId"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned(),
+                    payload["streaming"].as_bool().unwrap_or_default(),
+                    payload["text"].as_str().unwrap_or_default().to_owned(),
+                )
+            })
+            .collect()
+    }
+
+    async fn reasoning_rows(engine: &super::OrchestrationEngine) -> Vec<(String, String, bool)> {
+        engine
+            .repositories()
+            .list_reasoning_by_thread("t1".to_owned())
+            .await
+            .expect("reasoning rows")
+            .into_iter()
+            .map(|row| (row.reasoning_id, row.text, row.is_streaming))
+            .collect()
+    }
+
+    fn streaming_writes(writes: &[(String, bool, String)], id: &str) -> usize {
+        writes
+            .iter()
+            .filter(|(reasoning_id, streaming, _)| reasoning_id == id && *streaming)
+            .count()
+    }
+
+    const THOUGHT_ID: &str = "reasoning:t1:item:msg-1:0";
+
+    #[tokio::test(start_paused = true)]
+    async fn reasoning_streamed_for_a_second_writes_at_most_one_row_per_window() {
+        let pump = ReasoningPump::start().await;
+        let mut expected = String::new();
+        for index in 0..100 {
+            let delta = format!("chunk-{index:03}");
+            assert_eq!(delta.len(), 9);
+            let delta = format!("{delta} ");
+            expected.push_str(&delta);
+            pump.delta("turn-1", Some("msg-1:0"), &delta).await;
+            pump.drain().await;
+            tokio::time::advance(Duration::from_millis(10)).await;
+        }
+        let engine = pump.finish().await;
+        let writes = reasoning_writes(&engine).await;
+        let streamed = streaming_writes(&writes, THOUGHT_ID);
+        assert!(
+            (1..=5).contains(&streamed),
+            "100 deltas over 1 s wrote {streamed} streaming rows"
+        );
+        assert_eq!(
+            reasoning_rows(&engine).await,
+            [(THOUGHT_ID.to_owned(), expected, false)],
+            "the rows concatenate every delta, and the stream's end settles the entry"
+        );
+        assert!(
+            engine
+                .repositories()
+                .list_messages_by_thread("t1".to_owned())
+                .await
+                .unwrap()
+                .is_empty(),
+            "reasoning is never an assistant message"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_burst_of_large_deltas_inside_one_window_is_one_row() {
+        let pump = ReasoningPump::start().await;
+        let chunk = "x".repeat(4 * 1024);
+        for _ in 0..4 {
+            pump.delta("turn-1", Some("msg-1:0"), &chunk).await;
+            pump.drain().await;
+            tokio::time::advance(Duration::from_millis(25)).await;
+        }
+        tokio::time::advance(Duration::from_millis(300)).await;
+        let writes = pump.writes_once(|writes| !writes.is_empty()).await;
+        assert_eq!(
+            writes,
+            [(THOUGHT_ID.to_owned(), true, chunk.repeat(4))],
+            "one window, one row"
+        );
+        pump.finish().await;
+    }
+
+    /// Tool starts, token usage and another entry's deltas never flush an entry early. The
+    /// thought still sorts before the tool call that followed it, by the time it began.
+    #[tokio::test(start_paused = true)]
+    async fn interleaved_events_neither_flush_reasoning_nor_reorder_it() {
+        let pump = ReasoningPump::start().await;
+        pump.delta("turn-1", Some("msg-1:0"), "First thought, ")
+            .await;
+        pump.drain().await;
+        for index in 0..10 {
+            pump.send(reasoning_test_event(
+                "item.started",
+                "turn-1",
+                None,
+                json!({"itemType":"command_execution","title":"Ran command","detail":format!("tool-{index}")}),
+            ))
+            .await;
+            pump.send(reasoning_test_event(
+                "thread.token-usage.updated",
+                "turn-1",
+                None,
+                json!({"usage":{"usedTokens":index}}),
+            ))
+            .await;
+            pump.delta("turn-1", Some("msg-2:0"), "other ").await;
+            pump.delta("turn-1", Some("msg-1:0"), "more ").await;
+            pump.drain().await;
+            tokio::time::advance(Duration::from_millis(20)).await;
+        }
+        pump.complete("turn-1", Some("msg-1:0"), None).await;
+        let writes = pump
+            .writes_once(|writes| {
+                writes
+                    .iter()
+                    .any(|(id, streaming, _)| id == THOUGHT_ID && !streaming)
+            })
+            .await;
+        // 200 ms of deltas: one window each, whatever else arrived.
+        assert_eq!(streaming_writes(&writes, THOUGHT_ID), 1, "{writes:?}");
+        assert!(streaming_writes(&writes, "reasoning:t1:item:msg-2:0") <= 1);
+        let thought = pump
+            .engine
+            .repositories()
+            .list_reasoning_by_thread("t1".to_owned())
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.reasoning_id == THOUGHT_ID)
+            .expect("the thought");
+        assert_eq!(
+            thought.text,
+            format!("First thought, {}", "more ".repeat(10))
+        );
+        let first_tool = pump
+            .engine
+            .repositories()
+            .list_activities_by_thread("t1".to_owned())
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|activity| activity.payload["detail"] == "tool-0")
+            .expect("the first tool call");
+        let parse = |at: &str| {
+            time::OffsetDateTime::parse(at, &time::format_description::well_known::Rfc3339)
+                .expect("an RFC 3339 time")
+        };
+        assert!(
+            parse(&thought.created_at) < parse(&first_tool.created_at),
+            "the thought began before the tool call: {} vs {}",
+            thought.created_at,
+            first_tool.created_at
+        );
+        pump.finish().await;
+    }
+
+    /// An entry's own completion, and its turn's completion, write its buffer before they
+    /// settle it; a completion that streamed nothing and carries no text writes nothing.
+    #[tokio::test(start_paused = true)]
+    async fn completions_flush_before_they_settle_and_an_empty_one_writes_nothing() {
+        let pump = ReasoningPump::start().await;
+        pump.delta("turn-1", Some("msg-1:0"), "Settled by its block")
+            .await;
+        pump.complete("turn-1", Some("msg-1:0"), None).await;
+        pump.complete("turn-1", Some("never-streamed"), None).await;
+        pump.delta("turn-1", Some("msg-2:0"), "Settled by its turn")
+            .await;
+        pump.send(reasoning_test_event(
+            "turn.completed",
+            "turn-1",
+            None,
+            json!({"state":"completed"}),
+        ))
+        .await;
+        let writes = pump.writes_once(|writes| writes.len() >= 4).await;
+        assert_eq!(
+            writes,
+            [
+                (
+                    THOUGHT_ID.to_owned(),
+                    true,
+                    "Settled by its block".to_owned()
+                ),
+                (THOUGHT_ID.to_owned(), false, String::new()),
+                (
+                    "reasoning:t1:item:msg-2:0".to_owned(),
+                    true,
+                    "Settled by its turn".to_owned()
+                ),
+                ("reasoning:t1:item:msg-2:0".to_owned(), false, String::new()),
+            ]
+        );
+        assert!(
+            pump.engine
+                .repositories()
+                .list_activities_by_thread("t1".to_owned())
+                .await
+                .unwrap()
+                .iter()
+                .all(|activity| activity.payload.get("itemType") != Some(&json!("reasoning"))),
+            "a reasoning completion is never an activity"
+        );
+        pump.finish().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reasoning_entries_stop_growing_at_their_bound() {
+        let pump = ReasoningPump::start().await;
+        // A multi-byte character straddles the bound, so the cut must find a boundary.
+        let chunk = "é".repeat(1_000);
+        for _ in 0..40 {
+            pump.delta("turn-1", Some("msg-1:0"), &chunk).await;
+        }
+        let long_summary = "ü".repeat(super::REASONING_ENTRY_MAX_BYTES);
+        pump.complete("turn-1", Some("summary-1"), Some(&long_summary))
+            .await;
+        let engine = pump.finish().await;
+        for (id, text, _) in reasoning_rows(&engine).await {
+            assert!(
+                text.len() <= super::REASONING_ENTRY_MAX_BYTES,
+                "{id} holds {} bytes",
+                text.len()
+            );
+            assert!(text.ends_with('…'), "{id} shows that it was cut");
+        }
+    }
+
+    /// Text that already fills the bound to within the ellipsis's width still ends with the
+    /// mark, and the mark never takes the entry past the bound.
+    #[tokio::test]
+    async fn an_entry_at_its_bound_never_overshoots_it() {
+        let mut coalescer = super::ReasoningCoalescer::default();
+        let delta = |text: String| {
+            reasoning_test_event(
+                "content.delta",
+                "turn-1",
+                Some("msg-1:0"),
+                json!({"streamKind":"reasoning_text","delta":text}),
+            )
+        };
+        coalescer.observe_delta(&delta("x".repeat(super::REASONING_ENTRY_MAX_BYTES - 1)));
+        coalescer.observe_delta(&delta("more".to_owned()));
+        coalescer.observe_delta(&delta("and more".to_owned()));
+        let written = coalescer
+            .take_all()
+            .into_iter()
+            .map(|command| match command {
+                super::OrchestrationCommand::ThreadReasoningDelta { delta, .. } => delta,
+                other => panic!("unexpected {}", other.command_type()),
+            })
+            .collect::<String>();
+        assert_eq!(written.len(), super::REASONING_ENTRY_MAX_BYTES);
+        assert!(written.ends_with('…'), "the cut shows");
+    }
+
+    fn written_reasoning_text(commands: Vec<super::OrchestrationCommand>) -> String {
+        commands
+            .into_iter()
+            .filter_map(|command| match command {
+                super::OrchestrationCommand::ThreadReasoningDelta { delta, .. } => Some(delta),
+                super::OrchestrationCommand::ThreadReasoningComplete { text: None, .. } => None,
+                other => panic!("unexpected {}", other.command_type()),
+            })
+            .collect()
+    }
+
+    /// Text that fits the bound is kept whole, even when it ends within the ellipsis's width
+    /// of it, and whether the pump ends or the entry completes. A window's write holds back the
+    /// last few bytes until the entry is known to fit, so a later cut can still show.
+    #[tokio::test]
+    async fn an_entry_that_fits_its_bound_is_never_cut() {
+        let delta = |text: String| {
+            reasoning_test_event(
+                "content.delta",
+                "turn-1",
+                Some("msg-1:0"),
+                json!({"streamKind":"reasoning_text","delta":text}),
+            )
+        };
+        let completion = reasoning_test_event(
+            "item.completed",
+            "turn-1",
+            Some("msg-1:0"),
+            json!({"itemType":"reasoning"}),
+        );
+        let full = "x".repeat(super::REASONING_ENTRY_MAX_BYTES);
+        let window_ended = || tokio::time::Instant::now() + super::REASONING_FLUSH_WINDOW;
+
+        let mut coalescer = super::ReasoningCoalescer::default();
+        coalescer.observe_delta(&delta(full.clone()));
+        let written = written_reasoning_text(coalescer.take_all());
+        assert!(
+            written == full,
+            "the pump's end kept {} bytes",
+            written.len()
+        );
+
+        let mut coalescer = super::ReasoningCoalescer::default();
+        coalescer.observe_delta(&delta(full.clone()));
+        let mut written = written_reasoning_text(coalescer.take_due(window_ended()));
+        written.push_str(&written_reasoning_text(coalescer.complete(&completion)));
+        assert!(
+            written == full,
+            "a window's write and the completion kept {} bytes",
+            written.len()
+        );
+
+        // A window wrote all it could; the next delta overflows and the cut still shows.
+        let mut coalescer = super::ReasoningCoalescer::default();
+        coalescer.observe_delta(&delta("x".repeat(super::REASONING_ENTRY_MAX_BYTES - 1)));
+        let mut written = written_reasoning_text(coalescer.take_due(window_ended()));
+        coalescer.observe_delta(&delta("more".to_owned()));
+        written.push_str(&written_reasoning_text(coalescer.take_all()));
+        assert_eq!(written.len(), super::REASONING_ENTRY_MAX_BYTES);
+        assert!(written.ends_with('…'), "the cut shows");
+    }
+
+    /// Codex: the runtime's blank line joins streamed parts, and the completed summary is
+    /// authoritative: it replaces a stream that lost parts, and creates an entry that
+    /// streamed none. A repeated completion changes nothing.
+    #[tokio::test(start_paused = true)]
+    async fn codex_summaries_end_as_the_completed_summary() {
+        let pump = ReasoningPump::start().await;
+        let summary = |item: &str, index: u64, delta: &str| {
+            reasoning_test_event(
+                "content.delta",
+                "turn-1",
+                Some(item),
+                json!({"streamKind":"reasoning_summary_text","summaryIndex":index,"delta":delta}),
+            )
+        };
+        pump.send(summary("r1", 0, "A")).await;
+        pump.send(summary("r1", 1, "\n\nB")).await;
+        pump.complete("turn-1", Some("r1"), Some("A\n\nB")).await;
+        pump.send(summary("r2", 0, "A")).await;
+        pump.complete("turn-1", Some("r2"), Some("A\n\nB")).await;
+        pump.complete("turn-1", Some("r3"), Some("Only the summary"))
+            .await;
+        pump.complete("turn-1", Some("r3"), Some("Only the summary"))
+            .await;
+        let engine = pump.finish().await;
+        assert_eq!(
+            reasoning_rows(&engine).await,
+            [
+                (
+                    "reasoning:t1:item:r1".to_owned(),
+                    "A\n\nB".to_owned(),
+                    false
+                ),
+                (
+                    "reasoning:t1:item:r2".to_owned(),
+                    "A\n\nB".to_owned(),
+                    false
+                ),
+                (
+                    "reasoning:t1:item:r3".to_owned(),
+                    "Only the summary".to_owned(),
+                    false
+                ),
+            ]
+        );
+    }
+
+    /// Late reasoning on a turn that already completed streams into its own entry; with no
+    /// turn left running, the stream's end still settles it.
+    #[tokio::test(start_paused = true)]
+    async fn late_reasoning_after_its_turn_settles_when_the_stream_ends() {
+        let pump = ReasoningPump::start().await;
+        pump.send(reasoning_test_event(
+            "turn.completed",
+            "turn-1",
+            None,
+            json!({"state":"completed"}),
+        ))
+        .await;
+        pump.delta("turn-1", Some("late-1"), "A late thought").await;
+        pump.drain().await;
+        tokio::time::advance(Duration::from_millis(300)).await;
+        pump.writes_once(|writes| !writes.is_empty()).await;
+        assert_eq!(
+            reasoning_rows(&pump.engine).await,
+            [(
+                "reasoning:t1:item:late-1".to_owned(),
+                "A late thought".to_owned(),
+                true
+            )]
+        );
+        let engine = pump.finish().await;
+        assert_eq!(
+            reasoning_rows(&engine).await,
+            [(
+                "reasoning:t1:item:late-1".to_owned(),
+                "A late thought".to_owned(),
+                false
+            )]
+        );
+    }
+
+    /// Replays a Claude trace fixture's frames through the Claude runtime into the real pump.
+    async fn claude_fixture_through_pump(fixture: &str) -> super::OrchestrationEngine {
+        let fixture: Value = serde_json::from_str(fixture).expect("fixture JSON");
+        let pump = ReasoningPump::start().await;
+        let mut runtime = crate::provider::claude::runtime::ClaudeProviderRuntime::new(
+            "t1".to_owned(),
+            fixture["startup"]["sessionId"]
+                .as_str()
+                .expect("session")
+                .to_owned(),
+        );
+        let mut events = runtime.start_turn(crate::provider::claude::runtime::TurnInput {
+            turn_id: "turn-1".to_owned(),
+            input: "fix the bug".to_owned(),
+        });
+        for frame in fixture["messages"].as_array().expect("frames") {
+            events.extend(runtime.handle_raw_value(frame, 1_000).events);
+        }
+        for event in events {
+            pump.send(super::claude_provider_event(event, None, Vec::new()))
+                .await;
+        }
+        pump.finish().await
+    }
+
+    /// #173: Claude thinking is one reasoning entry and never a second assistant message, so
+    /// the context handoff never replays it as `[assistant]` text.
+    #[tokio::test(start_paused = true)]
+    async fn claude_thinking_is_reasoning_and_stays_out_of_messages_and_the_handoff() {
+        let engine = claude_fixture_through_pump(include_str!(
+            "../../tests/fixtures/claude-provider/trace-thinking-then-text.json"
+        ))
+        .await;
+        assert_eq!(
+            reasoning_rows(&engine).await,
+            [(
+                "reasoning:t1:item:msg-thinking-1:0".to_owned(),
+                "**Weighing the fix**\n\nThe test fails first. Then the code.".to_owned(),
+                false
+            )]
+        );
+        let messages = engine
+            .repositories()
+            .list_messages_by_thread("t1".to_owned())
+            .await
+            .unwrap();
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| (message.role.as_str(), message.text.as_str()))
+                .collect::<Vec<_>>(),
+            [("assistant", "Fixed.")]
+        );
+        let handoff =
+            super::compose_thread_context_handoff(&messages, "none", "next").expect("a handoff");
+        assert!(handoff.contains("[assistant] Fixed."));
+        assert!(!handoff.contains("Weighing"), "{handoff}");
+        engine.shutdown().await;
+    }
+
+    /// Omitted display: no reasoning entry, no reasoning write, and no empty assistant message.
+    #[tokio::test(start_paused = true)]
+    async fn omitted_claude_thinking_writes_nothing() {
+        let engine = claude_fixture_through_pump(include_str!(
+            "../../tests/fixtures/claude-provider/trace-thinking-omitted.json"
+        ))
+        .await;
+        assert!(reasoning_rows(&engine).await.is_empty());
+        assert!(reasoning_writes(&engine).await.is_empty());
+        assert!(
+            engine
+                .repositories()
+                .list_messages_by_thread("t1".to_owned())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        engine.shutdown().await;
+    }
+
+    /// No reasoning text reaches a log or trace, including the warning a failed write logs:
+    /// the pump, the projection and the settlement log counts and ids only (#173).
+    #[tokio::test(start_paused = true)]
+    async fn reasoning_text_never_reaches_logs_or_traces() {
+        const SENTINEL: &str = "reasoning-sentinel-7f3a";
+        #[derive(Clone, Default)]
+        struct Captured(Arc<StdMutex<Vec<u8>>>);
+        impl io::Write for Captured {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0
+                    .lock()
+                    .expect("captured log")
+                    .extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let log = Captured::default();
+        let _logging = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::TRACE)
+                .with_writer({
+                    let log = log.clone();
+                    move || log.clone()
+                })
+                .finish(),
+        );
+        let pump = ReasoningPump::start().await;
+        pump.delta(
+            "turn-1",
+            Some("msg-1:0"),
+            &format!("Thinking about {SENTINEL}"),
+        )
+        .await;
+        pump.complete("turn-1", Some("msg-1:0"), None).await;
+        pump.complete(
+            "turn-1",
+            Some("summary"),
+            Some(&format!("Summary of {SENTINEL}")),
+        )
+        .await;
+        pump.writes_once(|writes| writes.len() >= 3).await;
+        assert!(
+            reasoning_rows(&pump.engine)
+                .await
+                .iter()
+                .all(|(_, text, _)| text.contains(SENTINEL)),
+            "the sentinel went through the pump"
+        );
+        // A write that fails logs a warning; it must not carry the text it could not write.
+        pump.delta("turn-1", Some("lost"), &format!("Lost {SENTINEL}"))
+            .await;
+        pump.drain().await;
+        pump.engine.shutdown().await;
+        pump.finish().await;
+
+        let text = String::from_utf8(log.0.lock().expect("captured log").clone()).expect("UTF-8");
+        assert!(
+            text.contains("failed to project provider reasoning"),
+            "the failed write was logged: {text}"
+        );
+        assert!(!text.contains(SENTINEL), "{text}");
+    }
+
+    /// A row left streaming by a session that is gone, with no runtime row for its thread,
+    /// settles when the server starts.
+    #[tokio::test]
+    async fn startup_reconciliation_settles_reasoning_left_streaming() {
+        let engine = supervisor_engine().await;
+        engine
+            .dispatch(super::OrchestrationCommand::ThreadReasoningDelta {
+                command_id: "orphaned-thought".to_owned(),
+                thread_id: "t1".to_owned(),
+                reasoning_id: "reasoning:t1:item:orphan".to_owned(),
+                delta: "Cut off".to_owned(),
+                turn_id: Some("turn-1".to_owned()),
+                created_at: "2026-07-16T00:00:01Z".to_owned(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            engine
+                .repositories()
+                .list_provider_session_runtimes()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        super::reconcile_abandoned_provider_sessions(&engine)
+            .await
+            .unwrap();
+        assert_eq!(
+            reasoning_rows(&engine).await,
+            [(
+                "reasoning:t1:item:orphan".to_owned(),
+                "Cut off".to_owned(),
+                false
+            )]
+        );
+        engine.shutdown().await;
+    }
+
     /// How BiBCode stopped a session whose provider process died.
     #[cfg(unix)]
     #[derive(Clone, Copy, Debug)]
@@ -20056,6 +23939,7 @@ done
             launch,
             None,
             None,
+            Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
             activity,
             Arc::new(StdMutex::new(super::ProviderActivityLifecycleState::new(
@@ -20195,6 +24079,7 @@ done
             launch,
             None,
             None,
+            Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
             activity.clone(),
             activity_lifecycle,
@@ -20454,6 +24339,7 @@ done
             None,
             None,
             Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
             activity.clone(),
             activity_lifecycle,
             true,
@@ -20650,6 +24536,7 @@ done
             None,
             None,
             Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
             activity.clone(),
             activity_lifecycle,
             true,
@@ -20798,6 +24685,7 @@ while IFS= read -r line; do
     *'"method":"thread/start"'*) response_marker=$BIBCODE_TEST_CODEX_THREAD_RESPONSE_READY_MARKER; [ -z "$response_marker" ] || : > "$response_marker"; printf '{"id":%s,"result":{"cwd":"/tmp","model":"gpt-5","thread":{"id":"native-codex-thread"}}}\n' "$id" ;;
     *'"method":"mcpServerStatus/list"'*) printf '{"id":%s,"result":{"data":[],"nextCursor":null}}\n' "$id" ;;
     *'"method":"thread/goal/set"'*) printf '{"id":%s,"result":{"goal":{"status":"active"}}}\n' "$id" ;;
+    *'"method":"thread/compact/start"'*) printf '{"id":%s,"result":{}}\n' "$id" ;;
     *'"method":"turn/start"'*) printf '{"id":%s,"result":{"turn":{"id":"native-codex-turn"}}}\n' "$id" ;;
     *'"method":"turn/interrupt"'*) printf '{"id":%s,"result":{}}\n' "$id" ;;
     *'"method":"shutdown"'*)
@@ -23716,6 +27604,27 @@ done
                 .await
                 .unwrap();
             assert_eq!(session().await.status, "running");
+            // The turn is thinking when Stop arrives (#173).
+            engine
+                .dispatch(OrchestrationCommand::ThreadReasoningDelta {
+                    command_id: "interrupted-thought".to_owned(),
+                    thread_id: "t1".to_owned(),
+                    reasoning_id: "reasoning:t1:item:interrupted".to_owned(),
+                    delta: "Weighing the stop".to_owned(),
+                    turn_id: Some("unit-turn".to_owned()),
+                    created_at: "2026-07-16T00:00:01.500Z".to_owned(),
+                })
+                .await
+                .unwrap();
+            let thought_streams = || async {
+                engine
+                    .repositories()
+                    .list_reasoning_by_thread("t1".to_owned())
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|row| row.is_streaming)
+            };
 
             tokio::time::pause();
             let clock = keep_idle_clock_paused();
@@ -23814,6 +27723,27 @@ done
             };
             drop(clock);
             tokio::time::resume();
+            // The interrupted turn's thought settles, whether the provider's own completion or
+            // the deadline ends it; a turn that keeps running keeps thinking. The provider's
+            // completion settles it in the pump, after the session already reads ready.
+            if matches!(
+                response,
+                InterruptResponse::StaleTurn | InterruptResponse::ExternallyOwned
+            ) {
+                assert!(
+                    thought_streams().await,
+                    "{response:?}: the turn still thinks"
+                );
+            } else {
+                let started = Instant::now();
+                while thought_streams().await {
+                    assert!(
+                        started.elapsed() < Duration::from_secs(5),
+                        "{response:?}: the interrupted turn's thought settles"
+                    );
+                    tokio::task::yield_now().await;
+                }
+            }
 
             if matches!(
                 response,
@@ -26036,6 +29966,7 @@ done
                             label: "capacity fixture".to_owned(),
                             source: crate::diagnostics::RegistrationSource::Provider,
                             driver: None,
+                            survives_shutdown: false,
                         },
                     )
                     .expect("fill registry")
@@ -26833,6 +30764,49 @@ done
                 .await
                 .expect("Codex goal should send")
                 .is_some()
+        );
+        // `/compact` asks Codex to compact the thread; Codex reports the compaction's own turn,
+        // so the turn still running from `hello` is not the compaction's. A request the fixture
+        // never answers would wait forever, so the send is bounded too.
+        let compaction_turn = match deadline
+            .observe(codex.send("/compact".to_owned(), Vec::new(), "default".to_owned()))
+            .await
+        {
+            Ok(sent) => sent.expect("Codex compaction should start"),
+            Err(error) => {
+                provider_fixture_deadline_failure(
+                    codex.as_ref(),
+                    "native Codex /compact send",
+                    error,
+                )
+                .await
+            }
+        };
+        assert_eq!(compaction_turn, None);
+        let compaction = match captured_request(deadline, &capture_path, |request| {
+            request["method"] == "thread/compact/start"
+        })
+        .await
+        {
+            Ok(request) => request,
+            Err(error) => {
+                provider_fixture_deadline_failure(
+                    codex.as_ref(),
+                    "native Codex thread/compact/start capture",
+                    error,
+                )
+                .await
+            }
+        };
+        assert_eq!(
+            compaction["params"],
+            json!({ "threadId": "native-codex-thread" })
+        );
+        assert!(
+            !std::fs::read_to_string(&capture_path)
+                .unwrap_or_default()
+                .contains(r#""text":"/compact""#),
+            "/compact must not reach the model as text"
         );
         codex.interrupt(None).await.expect("Codex should interrupt");
         codex
@@ -27784,10 +31758,11 @@ done
         let mut launch = native_launch(&temp, "codex");
         launch.thread_id = "t1".to_owned();
 
+        // The reading is tagged with the instance and conversation it came from.
         super::project_provider_event(
             &engine,
             &launch,
-            None,
+            Some(json!({ "threadId": "codex-thread" })),
             None,
             super::ProviderEvent {
                 native_event_id: None,
@@ -27851,7 +31826,9 @@ done
                 "toolUses": 4,
                 "durationMs": 900,
                 "compactsAutomatically": true,
-                "autoCompactTokens": 245_000
+                "autoCompactTokens": 245_000,
+                "providerInstanceId": "codex",
+                "conversationId": "codex-thread"
             })
         );
 
@@ -28383,11 +32360,13 @@ printf '2.1.0 (Claude Code)\n'
     #[cfg(windows)]
     #[test]
     fn windows_launch_program_wraps_shell_scripts_without_profiles() {
-        let launch = super::prepare_provider_launch(
+        // The wrapping alone: the hermetic guard refuses a bare name on PATH.
+        let launch = crate::process::wrap_launch_program(
+            crate::process::Platform::Windows,
             std::path::Path::new("provider.ps1"),
-            ["--flag", "&literal"],
         )
-        .unwrap();
+        .unwrap()
+        .prepare(["--flag", "&literal"]);
         assert_eq!(launch.program, std::path::PathBuf::from("powershell.exe"));
         assert_eq!(
             launch.args,
@@ -28405,11 +32384,12 @@ printf '2.1.0 (Claude Code)\n'
             .map(std::ffi::OsString::from)
         );
 
-        let launch = super::prepare_provider_launch(
+        let launch = crate::process::wrap_launch_program(
+            crate::process::Platform::Windows,
             std::path::Path::new("provider.cmd"),
-            ["--flag", "&literal"],
         )
-        .unwrap();
+        .unwrap()
+        .prepare(["--flag", "&literal"]);
         assert_eq!(launch.program, std::path::PathBuf::from("provider.cmd"));
         assert_eq!(
             launch.args,

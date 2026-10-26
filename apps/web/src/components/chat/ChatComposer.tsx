@@ -30,6 +30,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type ReactNode,
 } from "react";
 import {
   clampCollapsedComposerCursor,
@@ -67,7 +68,11 @@ import {
   shouldUseCompactComposerPrimaryActions,
   shouldUseCompactComposerFooter,
 } from "../composerFooterLayout";
-import { type ComposerPromptEditorHandle, ComposerPromptEditor } from "../ComposerPromptEditor";
+import {
+  type ComposerCommandKey,
+  type ComposerPromptEditorHandle,
+  ComposerPromptEditor,
+} from "../ComposerPromptEditor";
 import { ProviderModelPicker } from "./ProviderModelPicker";
 import { ComposerCommandMenu } from "./ComposerCommandMenu";
 import { buildComposerCommandItems, type ComposerCommandItem } from "./composerCommandItems";
@@ -196,6 +201,25 @@ const composerItemMatchesTrigger = (
   }
   return item.type === "file-reference" || item.type === "agent-reference";
 };
+
+/**
+ * A trigger the user closed with Escape, with its query as last seen: it stays closed while that
+ * token is typed on or corrected, and opens again once an edit replaces the token.
+ */
+type DismissedComposerTrigger = Pick<ComposerTrigger, "kind" | "rangeStart" | "query">;
+
+const isDismissedComposerTrigger = (
+  trigger: ComposerTrigger | null,
+  dismissed: DismissedComposerTrigger | null,
+): boolean =>
+  trigger !== null &&
+  dismissed !== null &&
+  trigger.kind === dismissed.kind &&
+  trigger.rangeStart === dismissed.rangeStart &&
+  // Typing on or deleting back keeps one query a prefix of the other; pasting over the token
+  // does not. Typing over a selected token first leaves the bare trigger, which starts over.
+  (trigger.query.startsWith(dismissed.query) || dismissed.query.startsWith(trigger.query)) &&
+  !(trigger.query.length === 0 && dismissed.query.length > 0);
 
 const syncTerminalContextsByIds = (
   contexts: ReadonlyArray<TerminalContextDraft>,
@@ -419,9 +443,12 @@ const ComposerFooterPrimaryActions = memo(function ComposerFooterPrimaryActions(
   onPreviousPendingQuestion: () => void;
   onInterrupt: () => void;
   onImplementPlanInNewThread: () => void;
+  /** The History menu, first in the group; a slot so the memoized footer keeps stable props. */
+  historyMenu?: ReactNode;
 }) {
   return (
     <>
+      {props.historyMenu}
       <Tooltip>
         <TooltipTrigger
           render={
@@ -632,6 +659,13 @@ export interface ChatComposerProps {
   scheduleComposerFocus: () => void;
   setThreadError: (threadId: ThreadId | null, error: string | null) => void;
   onExpandImage: (preview: ExpandedImagePreview) => void;
+  /** Scrolls the timeline a page; `repeat` is true while the key is held. */
+  onPageTimeline: (key: "PageUp" | "PageDown", repeat: boolean) => void;
+  /**
+   * The History menu for the footer's right group, memoized by the host so the footer's props
+   * stay stable. The approval footer leaves it out.
+   */
+  historyMenu?: ReactNode;
 }
 
 // --------------------------------------------------------------------------
@@ -710,6 +744,8 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     scheduleComposerFocus,
     setThreadError,
     onExpandImage,
+    onPageTimeline,
+    historyMenu,
   } = props;
   const isProviderBindingConflicted = providerBindingConflictReason !== null;
   const terminalOpen = useThreadHasTerminalSurface(routeThreadRef);
@@ -990,6 +1026,8 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   const [isComposerPrimaryActionsCompact, setIsComposerPrimaryActionsCompact] = useState(false);
   const [isComposerModelPickerOpen, setIsComposerModelPickerOpen] = useState(false);
   const [isComposerFocused, setIsComposerFocused] = useState(false);
+  const [dismissedComposerTrigger, setDismissedComposerTrigger] =
+    useState<DismissedComposerTrigger | null>(null);
   const isMobileViewport = useMediaQuery("max-sm");
   const isComposerCollapsedMobile = isMobileViewport && !isComposerFocused;
 
@@ -1006,6 +1044,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   const composerSurfaceRef = useRef<HTMLDivElement>(null);
   const composerSelectLockRef = useRef(false);
   const composerMenuOpenRef = useRef(false);
+  const dismissedComposerTriggerRef = useRef<DismissedComposerTrigger | null>(null);
   const composerMenuItemsRef = useRef<ReadonlyArray<ComposerCommandItem>>([]);
   const activeComposerMenuItemRef = useRef<ComposerCommandItem | null>(null);
   const composerBlurFrameRef = useRef<number | null>(null);
@@ -1029,6 +1068,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       collapseExpandedComposerCursor(prompt, prompt.length, composerInlineTokenContext),
     );
     setComposerTrigger(detectComposerTrigger(prompt, prompt.length, composerCapabilities.trigger));
+    setDismissedComposerTrigger(null);
     setIsDragOverComposer(false);
   }
   // Drag depth counts per thread/draft, so a switch mid-drag starts again from zero.
@@ -1066,9 +1106,23 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   // ------------------------------------------------------------------
   // Derived: composer trigger / menu
   // ------------------------------------------------------------------
-  const composerTriggerKind = composerTrigger?.kind ?? null;
-  const pathTriggerQuery =
-    composerTrigger?.kind === "provider-reference" ? composerTrigger.query : "";
+  // A new trigger, the same one gone, or its token replaced ends an Escape dismissal; while the
+  // token is typed on, the dismissal follows its query.
+  if (dismissedComposerTrigger !== null) {
+    if (
+      composerTrigger === null ||
+      !isDismissedComposerTrigger(composerTrigger, dismissedComposerTrigger)
+    ) {
+      setDismissedComposerTrigger(null);
+    } else if (composerTrigger.query !== dismissedComposerTrigger.query) {
+      setDismissedComposerTrigger({ ...dismissedComposerTrigger, query: composerTrigger.query });
+    }
+  }
+  const menuTrigger = isDismissedComposerTrigger(composerTrigger, dismissedComposerTrigger)
+    ? null
+    : composerTrigger;
+  const composerTriggerKind = menuTrigger?.kind ?? null;
+  const pathTriggerQuery = menuTrigger?.kind === "provider-reference" ? menuTrigger.query : "";
   const isPathTrigger = composerTriggerKind === "provider-reference";
   const workspaceEntries = useComposerPathSearch({
     environmentId,
@@ -1079,22 +1133,22 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   const composerMenuResult = useMemo(
     () =>
       buildComposerCommandItems({
-        trigger: composerTrigger,
+        trigger: menuTrigger,
         providerInstanceId: selectedInstanceId,
         capabilities: composerCapabilities,
         pathSearch: workspaceEntries,
       }),
-    [composerCapabilities, composerTrigger, selectedInstanceId, workspaceEntries],
+    [composerCapabilities, menuTrigger, selectedInstanceId, workspaceEntries],
   );
   const composerMenuItems = composerMenuResult.items;
 
-  const composerMenuOpen = Boolean(composerTrigger);
+  const composerMenuOpen = Boolean(menuTrigger);
   const { revalidateIfStale: revalidateProviderCapabilitiesIfStale } = providerCapabilities;
   useEffect(() => {
     if (composerMenuOpen) revalidateProviderCapabilitiesIfStale();
   }, [composerMenuOpen, revalidateProviderCapabilitiesIfStale]);
-  const composerMenuSearchKey = composerTrigger
-    ? `${composerTrigger.kind}:${composerTrigger.query.trim().toLowerCase()}`
+  const composerMenuSearchKey = menuTrigger
+    ? `${menuTrigger.kind}:${menuTrigger.query.trim().toLowerCase()}`
     : null;
   const activeComposerMenuItem = useMemo(() => {
     const activeItemId = resolveComposerMenuActiveItemId({
@@ -1115,9 +1169,10 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
 
   useLayoutEffect(() => {
     composerMenuOpenRef.current = composerMenuOpen;
+    dismissedComposerTriggerRef.current = dismissedComposerTrigger;
     composerMenuItemsRef.current = composerMenuItems;
     activeComposerMenuItemRef.current = activeComposerMenuItem;
-  }, [activeComposerMenuItem, composerMenuItems, composerMenuOpen]);
+  }, [activeComposerMenuItem, composerMenuItems, composerMenuOpen, dismissedComposerTrigger]);
 
   const nonPersistedComposerAttachmentIdSet = useMemo(
     () => new Set(nonPersistedComposerAttachmentIds),
@@ -1864,13 +1919,34 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   // ------------------------------------------------------------------
   // Callbacks: command key
   // ------------------------------------------------------------------
-  const onComposerCommandKey = (
-    key: "ArrowDown" | "ArrowUp" | "Enter" | "Tab",
-    event: KeyboardEvent,
-  ) => {
+  const onComposerCommandKey = (key: ComposerCommandKey, event: KeyboardEvent) => {
+    if (key === "PageUp" || key === "PageDown") {
+      // The editor offers a page key only once the draft has no use for it.
+      if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return false;
+      onPageTimeline(key, event.repeat);
+      return true;
+    }
     if (isSteerQueuedMessageShortcut(event, keybindings, { context: { editableFocus: true } })) {
       event.preventDefault();
       if (!isProviderBindingConflicted) onSteerQueuedMessage?.();
+      return true;
+    }
+    const { trigger } = resolveActiveComposerTrigger();
+    // A dismissed menu stays closed, so Enter sends and Tab moves on, also before it re-renders.
+    const menuIsActive =
+      !isDismissedComposerTrigger(trigger, dismissedComposerTriggerRef.current) &&
+      (composerMenuOpenRef.current || trigger !== null);
+    if (key === "Escape") {
+      // Escape closes the menu for this token, for a `/usr/bin` that is not a command; with no
+      // menu it is left to the page.
+      if (!menuIsActive || trigger === null) return false;
+      const dismissed = {
+        kind: trigger.kind,
+        rangeStart: trigger.rangeStart,
+        query: trigger.query,
+      };
+      dismissedComposerTriggerRef.current = dismissed;
+      setDismissedComposerTrigger(dismissed);
       return true;
     }
     if (isProviderBindingConflicted) return true;
@@ -1878,8 +1954,6 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       toggleInteractionMode();
       return true;
     }
-    const { trigger } = resolveActiveComposerTrigger();
-    const menuIsActive = composerMenuOpenRef.current || trigger !== null;
     if (menuIsActive) {
       const currentItems = composerMenuItemsRef.current;
       const selectedItem = activeComposerMenuItemRef.current ?? currentItems[0];
@@ -2829,6 +2903,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                   onPreviousPendingQuestion={onPreviousActivePendingUserInputQuestion}
                   onInterrupt={handleInterruptPrimaryAction}
                   onImplementPlanInNewThread={handleImplementPlanInNewThreadPrimaryAction}
+                  historyMenu={historyMenu}
                 />
               </div>
             </div>

@@ -1,9 +1,11 @@
+import { VcsActionRemoteFailureError } from "@bibcode/client-runtime/state/vcs";
 import type {
   GitRunStackedActionResult,
   GitStackedAction,
   VcsStatusResult,
 } from "@bibcode/contracts";
 import { isTemporaryWorktreeBranch } from "@bibcode/shared/git";
+import * as Schema from "effect/Schema";
 import {
   DEFAULT_CHANGE_REQUEST_TERMINOLOGY,
   getChangeRequestTerminology,
@@ -318,6 +320,26 @@ export function resolveQuickAction(
     kind: "show_hint",
     hint: "Branch is up to date. No action needed.",
   };
+}
+
+const isRemoteFailure = Schema.is(VcsActionRemoteFailureError);
+
+/**
+ * The failure toast's heading names the step that failed when the server reports it
+ * (#174); the error's message carries the reason. The request step runs in the create
+ * dialog, which presents its own failure.
+ */
+export function stackedActionFailureTitle(error: unknown): string {
+  switch (isRemoteFailure(error) ? error.phase : null) {
+    case "branch":
+      return "Creating the branch failed";
+    case "commit":
+      return "Commit failed";
+    case "push":
+      return "Push failed";
+    default:
+      return "Action failed";
+  }
 }
 
 export function requiresDefaultBranchConfirmation(

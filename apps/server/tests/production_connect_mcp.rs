@@ -401,7 +401,7 @@ async fn mcp_requires_provider_credential_and_terminates_bounded_sessions() {
     let temp = TempDir::new().unwrap();
     let (service, calls) = setup_service(&temp).await;
     let issued = service
-        .issue_mcp_credential("thread-1", "codex-1")
+        .issue_mcp_credential("thread-1", "thread-1", "codex-1")
         .await
         .unwrap();
 
@@ -509,7 +509,7 @@ async fn cancellation_stops_preview_tool_invocation() {
     let temp = TempDir::new().unwrap();
     let (service, calls) = setup_service(&temp).await;
     let issued = service
-        .issue_mcp_credential("thread", "provider")
+        .issue_mcp_credential("thread", "thread", "provider")
         .await
         .unwrap();
     let mut headers = HeaderMap::new();
@@ -584,7 +584,7 @@ async fn http_route_adapters_and_provider_revocation_are_ready_for_central_wirin
     );
 
     let first = service
-        .issue_mcp_credential("thread-1", "provider-1")
+        .issue_mcp_credential("thread-1", "thread-1", "provider-1")
         .await
         .unwrap();
     service
@@ -608,7 +608,7 @@ async fn http_route_adapters_and_provider_revocation_are_ready_for_central_wirin
     };
     assert_eq!(revoked.status(), StatusCode::UNAUTHORIZED);
     let second = service
-        .issue_mcp_credential("thread-2", "provider-2")
+        .issue_mcp_credential("thread-2", "thread-2", "provider-2")
         .await
         .unwrap();
     assert_ne!(first.authorization_header, second.authorization_header);
@@ -717,7 +717,7 @@ async fn malformed_connect_and_mcp_requests_preserve_transport_errors() {
     }
 
     let issued = service
-        .issue_mcp_credential("thread", "provider")
+        .issue_mcp_credential("thread", "thread", "provider")
         .await
         .unwrap();
     let mut headers = HeaderMap::new();

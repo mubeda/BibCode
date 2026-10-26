@@ -1,0 +1,31 @@
+{
+  "total_count": 2,
+  "jobs": [
+    {
+      "id": 501,
+      "run_id": 9001,
+      "run_attempt": 2,
+      "name": "build (ubuntu-latest)",
+      "status": "completed",
+      "conclusion": "success",
+      "created_at": "2026-10-24T10:01:00Z",
+      "started_at": "2026-10-24T10:01:02Z",
+      "completed_at": "2026-10-24T10:01:40Z",
+      "html_url": "https://github.com/team/repo/actions/runs/9001/job/501",
+      "labels": ["ubuntu-latest"]
+    },
+    {
+      "id": 502,
+      "run_id": 9001,
+      "run_attempt": 2,
+      "name": "test",
+      "status": "completed",
+      "conclusion": "failure",
+      "created_at": "2026-10-24T10:01:00Z",
+      "started_at": "2026-10-24T10:01:05Z",
+      "completed_at": "2026-10-24T10:02:35Z",
+      "html_url": "https://github.com/team/repo/actions/runs/9001/job/502",
+      "labels": ["ubuntu-latest"]
+    }
+  ]
+}

@@ -3,6 +3,7 @@ import { chatFixtures } from "./chat";
 import { settingsFixtures } from "./settings";
 import { chatFixtures as chatContextFixtures } from "./chat-context";
 import { gitFixtures } from "./git";
+import { mermaidFixtures } from "./mermaid";
 import { remainingContextFixtures } from "./remaining-context";
 
 export const typographyFixtures = [
@@ -10,6 +11,7 @@ export const typographyFixtures = [
   ...chatFixtures,
   ...settingsFixtures,
   ...chatContextFixtures,
+  ...mermaidFixtures,
   ...gitFixtures,
   ...remainingContextFixtures,
 ];

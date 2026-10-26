@@ -139,7 +139,10 @@ impl IosHarness {
         );
         let shutdown = ShutdownOnDrop(udid.clone());
         let started = Instant::now();
-        let device_id = manager.open(Platform::Ios, &udid).await.expect("open");
+        let device_id = manager
+            .open(Platform::Ios, &udid, None)
+            .await
+            .expect("open");
         let ready = match manager
             .wait_ready(&device_id, Duration::from_secs(240))
             .await

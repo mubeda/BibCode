@@ -61,6 +61,10 @@ export const ExecutionEnvironmentCapabilities = Schema.Struct({
   ),
   pullRequestsReads: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   pullRequestsMutations: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  /** Every Pipelines read: list, get, getJob, getJobLog, readSnapshot and subscribe. */
+  pipelinesReads: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  /** `pipelines.runAction`. */
+  pipelinesMutations: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   activityProtocolVersion: Schema.NullOr(Schema.Literal(2)).pipe(
     Schema.withDecodingDefault(Effect.succeed(null)),
   ),
@@ -78,8 +82,14 @@ export const ExecutionEnvironmentCapabilities = Schema.Struct({
   profiler: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   /** `device.*` methods, the device media socket, and `enableDevicePreviews`. */
   devicePreviews: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  /** `device.refreshCatalog` reruns device discovery past its cache (#169). */
+  deviceCatalogRefresh: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  /** `agentSessions.listForThread` and `agentSessions.openInPanel`: History's terminal sessions (#141). */
+  cliSessionHistory: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   /** `preview.tunnelOpen`, `preview.tunnelWrite` and `preview.tunnelClose` (#69). */
   previewTunnels: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  /** `review.listDiffTools` and `review.openDiffTool`: the Diff panel's **Open with**. */
+  reviewDiffTools: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
 });
 export type ExecutionEnvironmentCapabilities = typeof ExecutionEnvironmentCapabilities.Type;
 

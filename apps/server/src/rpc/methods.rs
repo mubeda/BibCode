@@ -60,6 +60,8 @@ pub const ACTIVE_RPC_METHODS: &[RpcMethodSpec] = &[
     read_unary("activity.listRoster"),
     mutation_unary("activity.retrySubtreeCancellation"),
     mutation_unary("agentSessions.import"),
+    read_unary("agentSessions.listForThread"),
+    mutation_unary("agentSessions.openInPanel"),
     read_unary("agentSessions.scan"),
     read_unary("assets.createUrl"),
     mutation_unary("auth.confirmPairing"),
@@ -69,6 +71,7 @@ pub const ACTIVE_RPC_METHODS: &[RpcMethodSpec] = &[
     read_unary("device.createMediaTicket"),
     mutation_unary("device.input"),
     mutation_unary("device.open"),
+    read_unary("device.refreshCatalog"),
     mutation_unary("device.rotate"),
     read_stream("device.subscribeCatalog"),
     read_stream("device.subscribeFrames"),
@@ -97,6 +100,13 @@ pub const ACTIVE_RPC_METHODS: &[RpcMethodSpec] = &[
     read_unary("orchestration.replayEvents"),
     read_stream("orchestration.subscribeShell"),
     read_stream("orchestration.subscribeThread"),
+    read_unary("pipelines.get"),
+    read_unary("pipelines.getJob"),
+    read_unary("pipelines.getJobLog"),
+    read_unary("pipelines.list"),
+    read_unary("pipelines.readSnapshot"),
+    mutation_unary("pipelines.runAction"),
+    read_stream("pipelines.subscribe"),
     mutation_unary("preview.claimOpenRequest"),
     mutation_unary("preview.close"),
     mutation_unary("preview.gatewayOpen"),
@@ -122,11 +132,13 @@ pub const ACTIVE_RPC_METHODS: &[RpcMethodSpec] = &[
     mutation_unary("projects.createUploadUrl"),
     mutation_unary("projects.deleteEntry"),
     mutation_unary("projects.duplicateEntry"),
+    read_unary("projects.getFileVersion"),
     read_unary("projects.listEntries"),
     read_unary("projects.readFile"),
     mutation_unary("projects.renameEntry"),
     read_unary("projects.searchEntries"),
     mutation_unary("projects.writeFile"),
+    mutation_unary("projects.writeFileIfUnchanged"),
     mutation_unary("pullRequests.checkout"),
     read_unary("pullRequests.get"),
     read_unary("pullRequests.getChecks"),
@@ -141,6 +153,9 @@ pub const ACTIVE_RPC_METHODS: &[RpcMethodSpec] = &[
     mutation_unary("pullRequests.runAction"),
     read_stream("pullRequests.subscribe"),
     read_unary("review.getDiffPreview"),
+    read_unary("review.listDiffTools"),
+    mutation_unary("review.openDiffTool"),
+    read_unary("review.readFileVersion"),
     mutation_unary("server.consumeCodexRateLimitReset"),
     read_unary("server.discoverSourceControl"),
     read_unary("server.getConfig"),
@@ -254,6 +269,21 @@ mod tests {
     }
 
     #[test]
+    fn pipelines_reads_are_registered_with_their_modes() {
+        for name in [
+            "pipelines.list",
+            "pipelines.get",
+            "pipelines.getJob",
+            "pipelines.getJobLog",
+            "pipelines.readSnapshot",
+        ] {
+            assert!(ACTIVE_RPC_METHODS.contains(&read_unary(name)), "{name}");
+        }
+        assert!(ACTIVE_RPC_METHODS.contains(&read_stream("pipelines.subscribe")));
+        assert!(ACTIVE_RPC_METHODS.contains(&mutation_unary("pipelines.runAction")));
+    }
+
+    #[test]
     fn device_methods_have_their_modes() {
         for name in ["device.subscribeCatalog", "device.subscribeFrames"] {
             assert!(ACTIVE_RPC_METHODS.contains(&read_stream(name)), "{name}");
@@ -266,7 +296,9 @@ mod tests {
         ] {
             assert!(ACTIVE_RPC_METHODS.contains(&mutation_unary(name)), "{name}");
         }
-        assert!(ACTIVE_RPC_METHODS.contains(&read_unary("device.createMediaTicket")));
+        for name in ["device.createMediaTicket", "device.refreshCatalog"] {
+            assert!(ACTIVE_RPC_METHODS.contains(&read_unary(name)), "{name}");
+        }
     }
 
     #[test]

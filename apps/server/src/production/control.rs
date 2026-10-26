@@ -83,6 +83,13 @@ fn merge_provider_snapshot(
             next[field] = value.clone();
         }
     }
+    // A probe that read the instance's version tells whether its chats report context usage (an
+    // OpenCode 2 CLI). One that read none (a Server URL's quick probe) keeps the last answer.
+    if next.get("version").and_then(Value::as_str).is_none()
+        && let Some(value) = current.get("supportsContextWindowUsage")
+    {
+        next["supportsContextWindowUsage"] = value.clone();
+    }
     next
 }
 
@@ -2563,6 +2570,46 @@ fn current_directory(config: &ServerConfig) -> String {
 }
 
 fn environment_descriptor(config: &ServerConfig, activity_protocol_registered: bool) -> Value {
+    // Built apart from the descriptor: one literal holding both exceeds `json!`'s recursion limit.
+    let mut capabilities = json!({
+        "repositoryIdentity": true,
+        "worktreeCatalog": true,
+        "worktreeCatalogRefreshReason": true,
+        "vcsStatusSummary": true,
+        "gitManagerReads": true,
+        "gitManagerCommitOperations": true,
+        "gitManagerBranchSyncOperations": true,
+        "gitManagerStashMergeOperations": true,
+        "gitManagerMergeIntoOperations": true,
+        "gitManagerPartialStaging": true,
+        "gitManagerRewriteOperations": true,
+        "gitManagerTagOperations": true,
+        "gitManagerLiveSignal": true,
+        "gitManagerPullRequests": true,
+        "gitPullRequestBranchSelection": true,
+        "pullRequestsReads": true,
+        "pullRequestsMutations": true,
+        "activityProtocolVersion": activity_protocol_registered.then_some(2),
+        "remoteUpdateControl": true,
+        "remoteUpdateProgress": true,
+        "terminalOrderedInput": true,
+        "terminalSizeOwnership": true,
+        "terminalImagePaste": true,
+        "pullRequestCreateOptions": true,
+        "vcsCloneReattach": true,
+        "attachmentStaging": true,
+        "profiler": true,
+        "devicePreviews": true,
+        "deviceCatalogRefresh": true,
+        "cliSessionHistory": true,
+        "previewTunnels": true,
+        "reviewDiffTools": true,
+    });
+    // A flag is advertised only when every method it promises is registered.
+    capabilities["pipelinesReads"] =
+        json!(crate::production::pipelines_rpc::pipelines_reads_registered());
+    capabilities["pipelinesMutations"] =
+        json!(crate::production::pipelines_rpc::pipelines_mutations_registered());
     json!({
         "environmentId": config.environment_id,
         "label": config.environment_label,
@@ -2576,37 +2623,7 @@ fn environment_descriptor(config: &ServerConfig, activity_protocol_registered: b
         "remoteUpdateSupport": config.remote_update_support,
         "remoteProtocolVersion": crate::http::REMOTE_PROTOCOL_VERSION,
         "minCompatibleRemoteProtocol": crate::http::MIN_COMPATIBLE_REMOTE_PROTOCOL,
-        "capabilities": {
-            "repositoryIdentity": true,
-            "worktreeCatalog": true,
-            "worktreeCatalogRefreshReason": true,
-            "vcsStatusSummary": true,
-            "gitManagerReads": true,
-            "gitManagerCommitOperations": true,
-            "gitManagerBranchSyncOperations": true,
-            "gitManagerStashMergeOperations": true,
-            "gitManagerMergeIntoOperations": true,
-            "gitManagerPartialStaging": true,
-            "gitManagerRewriteOperations": true,
-            "gitManagerTagOperations": true,
-            "gitManagerLiveSignal": true,
-            "gitManagerPullRequests": true,
-            "gitPullRequestBranchSelection": true,
-            "pullRequestsReads": true,
-            "pullRequestsMutations": true,
-            "activityProtocolVersion": activity_protocol_registered.then_some(2),
-            "remoteUpdateControl": true,
-            "remoteUpdateProgress": true,
-            "terminalOrderedInput": true,
-            "terminalSizeOwnership": true,
-            "terminalImagePaste": true,
-            "pullRequestCreateOptions": true,
-            "vcsCloneReattach": true,
-            "attachmentStaging": true,
-            "profiler": true,
-            "devicePreviews": true,
-            "previewTunnels": true,
-        },
+        "capabilities": capabilities,
     })
 }
 
@@ -5485,7 +5502,8 @@ mod tests {
             "models": [{ "slug": "gpt-rich" }],
             "slashCommands": [{ "name": "goal" }],
             "skills": [{ "name": "review" }],
-            "agents": [{ "name": "builder" }]
+            "agents": [{ "name": "builder" }],
+            "supportsContextWindowUsage": true
         });
         let quick = provider_inventory::ProviderProbeResult {
             snapshot: json!({
@@ -5513,6 +5531,55 @@ mod tests {
             assert_eq!(merged["models"], current["models"]);
             assert_eq!(merged["skills"], current["skills"]);
             assert_eq!(merged["agents"], current["agents"]);
+            // A probe that read no version cannot tell an OpenCode 2 instance.
+            assert_eq!(merged["supportsContextWindowUsage"], true);
+        }
+    }
+
+    /// A probe that read the instance's version tells whether its chats report context usage
+    /// (an OpenCode CLI's version does), even when its catalogs could not be read, so a CLI
+    /// downgraded to OpenCode 1 stops advertising it. One that read no version (a Server URL's
+    /// quick probe) keeps the last answer.
+    #[test]
+    fn only_a_probe_that_read_no_version_keeps_the_context_usage_capability() {
+        let current = json!({
+            "instanceId": "opencode",
+            "driver": "opencode",
+            "status": "ready",
+            "version": "opencode v2.0.29",
+            "supportsContextWindowUsage": true
+        });
+        for (version, rich_metadata) in [
+            (
+                json!("opencode v1.19.4"),
+                provider_inventory::RichMetadataOutcome::NotRequested,
+            ),
+            (
+                json!("opencode v1.19.4"),
+                provider_inventory::RichMetadataOutcome::Failed,
+            ),
+            (
+                Value::Null,
+                provider_inventory::RichMetadataOutcome::NotRequested,
+            ),
+        ] {
+            let read_version = !version.is_null();
+            let refreshed = provider_inventory::ProviderProbeResult {
+                snapshot: json!({
+                    "instanceId": "opencode",
+                    "driver": "opencode",
+                    "status": "ready",
+                    "version": version,
+                }),
+                rich_metadata,
+                models_authoritative: false,
+            };
+            let merged = merge_provider_snapshot(Some(&current), refreshed);
+            assert_eq!(
+                merged.get("supportsContextWindowUsage").cloned(),
+                (!read_version).then_some(json!(true)),
+                "{rich_metadata:?}, version read: {read_version}"
+            );
         }
     }
 
@@ -6641,6 +6708,8 @@ mod tests {
             "gitPullRequestBranchSelection",
             "pullRequestsReads",
             "pullRequestsMutations",
+            "pipelinesReads",
+            "pipelinesMutations",
         ] {
             assert_eq!(
                 descriptor["capabilities"][capability], true,
@@ -6651,6 +6720,11 @@ mod tests {
         assert_eq!(descriptor["capabilities"]["profiler"], true);
         // Clients show the Device previews setting and pane only on servers that advertise it.
         assert_eq!(descriptor["capabilities"]["devicePreviews"], true);
+        // A client offers Refresh devices only when the server has `device.refreshCatalog` (#169).
+        assert_eq!(descriptor["capabilities"]["deviceCatalogRefresh"], true);
+        // A client lists terminal sessions in History only on servers that have
+        // `agentSessions.listForThread` and `agentSessions.openInPanel` (#141).
+        assert_eq!(descriptor["capabilities"]["cliSessionHistory"], true);
     }
 
     #[test]
@@ -6668,6 +6742,7 @@ mod tests {
         assert_eq!(descriptor["capabilities"]["terminalImagePaste"], true);
         assert_eq!(descriptor["capabilities"]["pullRequestCreateOptions"], true);
         assert_eq!(descriptor["capabilities"]["vcsCloneReattach"], true);
+        assert_eq!(descriptor["capabilities"]["reviewDiffTools"], true);
         assert_eq!(descriptor["capabilities"]["attachmentStaging"], true);
         assert_eq!(
             descriptor["remoteUpdateSupport"],

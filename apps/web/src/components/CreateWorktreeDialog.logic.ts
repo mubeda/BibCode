@@ -159,9 +159,10 @@ export function buildSmartRows(input: {
 }
 
 /**
- * Auto-detects the effective mode for Smart-tab input: a GitHub pattern
- * wins first, an exact/prefix ref match resolves to "branch", otherwise
- * it's treated as a plain name.
+ * Auto-detects the effective mode for Smart-tab input: text that exactly
+ * names a ref is that branch (a picked row fills the field with its name, and
+ * a branch may be named `2026`), then a GitHub pattern wins, then a ref
+ * prefix match resolves to "branch", otherwise it's treated as a plain name.
  */
 export function detectSmartMode(
   query: string,
@@ -169,9 +170,8 @@ export function detectSmartMode(
 ): "github" | "branch" | "search" {
   const trimmed = query.trim();
   if (trimmed.length === 0) return "search";
+  if (findExactRefMatch(refs, trimmed)) return "branch";
   if (parseGitHubWorkItem(trimmed)) return "github";
-  const exact = findExactRefMatch(refs, trimmed);
-  if (exact) return "branch";
   const lower = trimmed.toLowerCase();
   const hasPrefixMatch = refs.some((ref) => ref.name.toLowerCase().startsWith(lower));
   return hasPrefixMatch ? "branch" : "search";
@@ -276,6 +276,11 @@ export function resolveWorktreeCreateInput(input: {
   }
 
   if (input.mode === "smart") {
+    // A selected branch the field names exactly is that branch, even when its name is a
+    // number that also reads as a GitHub item.
+    if (input.selectedBranchRefName && input.sourceText?.trim() === input.selectedBranchRefName) {
+      return selectedBranch();
+    }
     if (input.githubItem) {
       return namedBranch.length > 0 ? newBranch(namedBranch) : null;
     }

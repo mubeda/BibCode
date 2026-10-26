@@ -5,12 +5,15 @@ import {
   ProjectCreateEntryError,
   ProjectDeleteEntryError,
   ProjectDuplicateEntryError,
+  ProjectFileVersion,
   ProjectListEntriesInput,
   ProjectListEntriesError,
   ProjectReadFileError,
+  ProjectReadFileResult,
   ProjectRenameEntryError,
   ProjectSearchEntriesError,
   ProjectWriteFileError,
+  ProjectWriteFileIfUnchangedInput,
 } from "./project.ts";
 
 const withDecodedMessage = <T extends object>(props: T, message: unknown): T =>
@@ -23,6 +26,58 @@ const decodeDeleteError = Schema.decodeUnknownSync(ProjectDeleteEntryError);
 const decodeDuplicateError = Schema.decodeUnknownSync(ProjectDuplicateEntryError);
 const decodeSearchError = Schema.decodeUnknownSync(ProjectSearchEntriesError);
 const decodeWriteError = Schema.decodeUnknownSync(ProjectWriteFileError);
+const decodeReadResult = Schema.decodeUnknownSync(ProjectReadFileResult);
+const decodeFileVersion = Schema.decodeUnknownSync(ProjectFileVersion);
+const decodeGuardedWrite = Schema.decodeUnknownSync(ProjectWriteFileIfUnchangedInput);
+
+describe("open-file disk versions", () => {
+  const read = { relativePath: "a.ts", contents: "a", byteLength: 1, truncated: false };
+
+  it("decodes a read result from a server without versions, and one with", () => {
+    expect(decodeReadResult(read)).not.toHaveProperty("version");
+    expect(decodeReadResult({ ...read, version: "ab12" })).toEqual({ ...read, version: "ab12" });
+  });
+
+  it("decodes each disk state", () => {
+    expect(decodeFileVersion({ _tag: "present", version: "ab12" })).toEqual({
+      _tag: "present",
+      version: "ab12",
+    });
+    expect(decodeFileVersion({ _tag: "missing" })).toEqual({ _tag: "missing" });
+    expect(
+      decodeFileVersion({ _tag: "unreadable", failure: "file_too_large", version: "ab12" }),
+    ).toEqual({ _tag: "unreadable", failure: "file_too_large", version: "ab12" });
+    expect(() =>
+      decodeFileVersion({ _tag: "unreadable", failure: "x", version: "ab12" }),
+    ).toThrow();
+  });
+
+  it("requires a guarded write to name the disk state it was based on", () => {
+    const write = { cwd: "/workspace", relativePath: "a.ts", contents: "b" };
+    expect(() => decodeGuardedWrite(write)).toThrow();
+    expect(decodeGuardedWrite({ ...write, precondition: { _tag: "missing" } })).toEqual({
+      ...write,
+      precondition: { _tag: "missing" },
+    });
+    expect(
+      decodeGuardedWrite({ ...write, precondition: { _tag: "version", version: "ab12" } }),
+    ).toEqual({ ...write, precondition: { _tag: "version", version: "ab12" } });
+  });
+
+  it("carries the two refusal failures on a write error", () => {
+    for (const failure of ["file_changed_on_disk", "file_missing_on_disk"] as const) {
+      expect(
+        decodeWriteError({
+          _tag: "ProjectWriteFileError",
+          cwd: "/workspace",
+          relativePath: "a.ts",
+          failure,
+          message: "refused",
+        }).failure,
+      ).toBe(failure);
+    }
+  });
+});
 
 describe("project RPC inputs", () => {
   it("accepts an omitted list limit and positive limits through 200", () => {

@@ -361,6 +361,8 @@ mod tests {
         assert_eq!(target_directory("C:\\repo\\a.ts:3"), "C:\\repo");
     }
 
+    // The macOS bundle candidates are `/`-spelled Unix paths.
+    #[cfg(unix)]
     #[test]
     fn resolves_zed_through_the_macos_bundle_cli_under_home_or_applications() {
         let temp = tempfile::tempdir().unwrap();
@@ -382,6 +384,8 @@ mod tests {
         );
     }
 
+    // The macOS bundle candidates are `/`-spelled Unix paths.
+    #[cfg(unix)]
     #[test]
     fn absolute_bundle_candidate_uses_the_fixture_root_and_disappears_when_removed() {
         let temp = tempfile::tempdir().unwrap();

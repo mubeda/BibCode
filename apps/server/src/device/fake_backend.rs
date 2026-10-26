@@ -10,7 +10,7 @@ use std::{
 };
 
 use futures_util::{future::BoxFuture, stream::BoxStream};
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
 use super::{
@@ -32,10 +32,59 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// The native size every fake device reports.
 pub(crate) const FAKE_SIZE: (u32, u32) = (1170, 2532);
 
+/// A call the test holds: `reached` fires once the call waits, and the call goes on once
+/// `release` fires or is dropped.
+pub(crate) struct Held {
+    pub reached: oneshot::Receiver<()>,
+    pub release: oneshot::Sender<()>,
+}
+
+impl Held {
+    /// Waits until the call is held.
+    pub(crate) async fn reached(&mut self) {
+        tokio::time::timeout(Duration::from_secs(20), &mut self.reached)
+            .await
+            .expect("the held call is reached")
+            .expect("the hold is still set");
+    }
+
+    pub(crate) fn release(self) {
+        let _ = self.release.send(());
+    }
+}
+
+/// The next call of one kind waits here, once.
+#[derive(Default)]
+struct Hold(Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>);
+
+impl Hold {
+    fn set(&self) -> Held {
+        let (reached, reached_rx) = oneshot::channel();
+        let (release, go) = oneshot::channel();
+        *lock(&self.0) = Some((reached, go));
+        Held {
+            reached: reached_rx,
+            release,
+        }
+    }
+
+    /// The hold for the call starting now, if one is set; await it with [`wait`].
+    fn take(&self) -> Option<(oneshot::Sender<()>, oneshot::Receiver<()>)> {
+        lock(&self.0).take()
+    }
+}
+
+async fn wait(hold: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>) {
+    if let Some((reached, go)) = hold {
+        let _ = reached.send(());
+        let _ = go.await;
+    }
+}
+
 /// One platform's scripted images, launches, and counters.
 pub(crate) struct FakeBackend {
     platform: Platform,
-    images: Vec<String>,
+    images: Mutex<Vec<String>>,
     /// Images `check_available` refuses.
     busy: Mutex<HashSet<String>>,
     /// Images whose launch fails late with `LaunchFailure::Busy`.
@@ -53,6 +102,11 @@ pub(crate) struct FakeBackend {
     boot_orientation: Mutex<Orientation>,
     /// Set by `without_video`: why launched devices have no video.
     no_video: Mutex<Option<String>>,
+    discover_hold: Hold,
+    check_hold: Hold,
+    launch_hold: Hold,
+    /// Shared with the running devices, whose `stop` takes it.
+    stop_hold: Arc<Hold>,
 }
 
 struct FakeDeviceState {
@@ -63,7 +117,7 @@ impl FakeBackend {
     pub(crate) fn new(platform: Platform, images: &[&str]) -> Arc<Self> {
         Arc::new(Self {
             platform,
-            images: images.iter().map(|image| (*image).to_owned()).collect(),
+            images: Mutex::new(images.iter().map(|image| (*image).to_owned()).collect()),
             busy: Mutex::default(),
             busy_on_launch: Mutex::default(),
             never_boots: AtomicBool::new(false),
@@ -75,7 +129,42 @@ impl FakeBackend {
             orientation: Mutex::new(None),
             boot_orientation: Mutex::new(Orientation::Portrait),
             no_video: Mutex::new(None),
+            discover_hold: Hold::default(),
+            check_hold: Hold::default(),
+            launch_hold: Hold::default(),
+            stop_hold: Arc::default(),
         })
+    }
+
+    /// The next discovery lists `image` too, as if it was created since the last one.
+    pub(crate) fn add_image(&self, image: &str) {
+        lock(&self.images).push(image.to_owned());
+    }
+
+    /// The next `discover` waits until released.
+    pub(crate) fn hold_next_discover(&self) -> Held {
+        self.discover_hold.set()
+    }
+
+    /// The next `check_available` waits until released, then answers as the fake is then.
+    pub(crate) fn hold_next_check(&self) -> Held {
+        self.check_hold.set()
+    }
+
+    /// The next launch waits until released, before it reports `Booting`: its device stays
+    /// `Starting` meanwhile.
+    pub(crate) fn hold_next_launch(&self) -> Held {
+        self.launch_hold.set()
+    }
+
+    /// The next running device to stop waits until released: it stays `Stopping` meanwhile.
+    pub(crate) fn hold_next_stop(&self) -> Held {
+        self.stop_hold.set()
+    }
+
+    /// No longer in use outside BiBCode.
+    pub(crate) fn not_busy(&self, image: &str) {
+        lock(&self.busy).remove(image);
     }
 
     /// Launched devices report orientation on their own, starting in portrait; returns the
@@ -159,7 +248,9 @@ impl DeviceBackend for FakeBackend {
     fn discover(&self) -> BoxFuture<'_, PlatformDiscovery> {
         Box::pin(async move {
             self.discover_calls.fetch_add(1, Ordering::SeqCst);
-            let availability = if self.images.is_empty() {
+            wait(self.discover_hold.take()).await;
+            let images = lock(&self.images).clone();
+            let availability = if images.is_empty() {
                 Availability {
                     kind: AvailabilityKind::NoAvds,
                     message: "No fake devices exist.".to_owned(),
@@ -172,8 +263,7 @@ impl DeviceBackend for FakeBackend {
             };
             PlatformDiscovery {
                 availability,
-                images: self
-                    .images
+                images: images
                     .iter()
                     .map(|id| Image {
                         id: id.clone(),
@@ -191,6 +281,7 @@ impl DeviceBackend for FakeBackend {
     ) -> BoxFuture<'a, Result<(), LaunchFailure>> {
         Box::pin(async move {
             self.check_calls.fetch_add(1, Ordering::SeqCst);
+            wait(self.check_hold.take()).await;
             if lock(&self.busy).contains(image_id) {
                 Err(LaunchFailure::Busy)
             } else {
@@ -213,6 +304,11 @@ impl DeviceBackend for FakeBackend {
             if lock(&self.busy_on_launch).contains(image_id) {
                 return Err(LaunchFailure::Busy);
             }
+            let hold = self.launch_hold.take();
+            tokio::select! {
+                () = wait(hold) => {}
+                () = cancel.cancelled() => return Err(LaunchFailure::Cancelled),
+            }
             on_phase(DeviceState::Booting);
             if self.never_boots.load(Ordering::SeqCst) {
                 cancel.cancelled().await;
@@ -228,6 +324,7 @@ impl DeviceBackend for FakeBackend {
                 can_rotate: self.can_rotate.load(Ordering::SeqCst),
                 stops: self.stops.clone(),
                 stopped: AtomicBool::new(false),
+                stop_hold: self.stop_hold.clone(),
             }) as Box<dyn RunningDevice>)
         })
     }
@@ -241,6 +338,7 @@ struct FakeRunning {
     can_rotate: bool,
     stops: Arc<AtomicUsize>,
     stopped: AtomicBool,
+    stop_hold: Arc<Hold>,
 }
 
 impl FakeRunning {
@@ -325,7 +423,8 @@ impl RunningDevice for FakeRunning {
 
     fn stop(self: Box<Self>) -> BoxFuture<'static, ()> {
         self.record_stop();
-        Box::pin(async {})
+        let hold = self.stop_hold.take();
+        Box::pin(wait(hold))
     }
 
     fn stop_shared(&self) -> BoxFuture<'_, ()> {

@@ -9,10 +9,12 @@ import {
   buildProposedPlanMarkdownFilename,
   downloadPlanAsTextFile,
   normalizePlanMarkdownForExport,
+  proposedPlanCanCollapse,
   proposedPlanTitle,
   stripDisplayedPlanMarkdown,
 } from "../../proposedPlan";
 import ChatMarkdown from "../ChatMarkdown";
+import { PLAN_BODY_FIND_SCOPE, PLAN_TITLE_FIND_SCOPE } from "./threadFind/threadFindScopes";
 import { EllipsisIcon } from "lucide-react";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
@@ -39,14 +41,32 @@ export const ProposedPlanCard = memo(function ProposedPlanCard({
   threadRef,
   cwd,
   workspaceRoot,
+  expanded: controlledExpanded,
+  onExpandedChange,
+  detailsOpen,
+  onDetailsOpenChange,
 }: {
   planMarkdown: string;
   environmentId: EnvironmentId;
   threadRef?: ScopedThreadRef | undefined;
   cwd: string | undefined;
   workspaceRoot: string | undefined;
+  /** Whether a long plan shows in full, when the caller owns that state. */
+  expanded?: boolean | undefined;
+  onExpandedChange?: ((expanded: boolean) => void) | undefined;
+  /** The plan body's `<details>` blocks, when the caller owns their state (see `ChatMarkdown`). */
+  detailsOpen?: ReadonlyMap<number, boolean> | undefined;
+  onDetailsOpenChange?: ((ordinal: number, open: boolean) => void) | undefined;
 }) {
-  const [expanded, setExpanded] = useState(false);
+  const [localExpanded, setLocalExpanded] = useState(false);
+  const expanded = controlledExpanded ?? localExpanded;
+  const toggleExpanded = () => {
+    if (onExpandedChange) {
+      onExpandedChange(!expanded);
+    } else {
+      setLocalExpanded((value) => !value);
+    }
+  };
   const [isSaveDialogOpen, setIsSaveDialogOpen] = useState(false);
   const [savePath, setSavePath] = useState("");
   const [isSavingToWorkspace, setIsSavingToWorkspace] = useState(false);
@@ -66,9 +86,9 @@ export const ProposedPlanCard = memo(function ProposedPlanCard({
     },
   });
   const savePathInputId = useId();
-  const title = proposedPlanTitle(planMarkdown) ?? "Proposed plan";
-  const lineCount = planMarkdown.split("\n").length;
-  const canCollapse = planMarkdown.length > 900 || lineCount > 20;
+  const authoredTitle = proposedPlanTitle(planMarkdown);
+  const title = authoredTitle ?? "Proposed plan";
+  const canCollapse = proposedPlanCanCollapse(planMarkdown);
   const displayedPlanMarkdown = stripDisplayedPlanMarkdown(planMarkdown);
   const collapsedPreview = canCollapse
     ? buildCollapsedProposedPlanPreviewMarkdown(planMarkdown, { maxLines: 10 })
@@ -150,7 +170,13 @@ export const ProposedPlanCard = memo(function ProposedPlanCard({
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex min-w-0 items-center gap-2">
           <Badge variant="secondary">Plan</Badge>
-          <p className="truncate text-sm font-medium text-foreground">{title}</p>
+          <p
+            className="truncate text-sm font-medium text-foreground"
+            // The fallback title is chrome; an authored one is the plan's text.
+            data-find-scope={authoredTitle ? PLAN_TITLE_FIND_SCOPE : undefined}
+          >
+            {title}
+          </p>
         </div>
         <Menu>
           <MenuTrigger
@@ -177,6 +203,8 @@ export const ProposedPlanCard = memo(function ProposedPlanCard({
               cwd={cwd}
               threadRef={threadRef}
               isStreaming={false}
+              detailsOpen={detailsOpen}
+              onDetailsOpenChange={onDetailsOpenChange}
             />
           ) : (
             <ChatMarkdown
@@ -184,6 +212,9 @@ export const ProposedPlanCard = memo(function ProposedPlanCard({
               cwd={cwd}
               threadRef={threadRef}
               isStreaming={false}
+              detailsOpen={detailsOpen}
+              onDetailsOpenChange={onDetailsOpenChange}
+              findScope={PLAN_BODY_FIND_SCOPE}
             />
           )}
           {canCollapse && !expanded ? (
@@ -192,12 +223,7 @@ export const ProposedPlanCard = memo(function ProposedPlanCard({
         </div>
         {canCollapse ? (
           <div className="mt-4 flex justify-center">
-            <Button
-              size="sm"
-              variant="outline"
-              data-scroll-anchor-ignore
-              onClick={() => setExpanded((value) => !value)}
-            >
+            <Button size="sm" variant="outline" data-scroll-anchor-ignore onClick={toggleExpanded}>
               {expanded ? "Collapse plan" : "Expand plan"}
             </Button>
           </div>

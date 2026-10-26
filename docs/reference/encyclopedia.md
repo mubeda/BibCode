@@ -116,7 +116,9 @@ duplicate, copy path, add folder as project, external editor, preview, and
 explicit Ctrl/Cmd+S saves. Each directory is one expandable row, entries move by
 dragging them onto a folder row or the tree root, and Refresh rescans the
 workspace on the server so externally created files appear. Expansion state
-survives refreshes and mutations.
+survives refreshes and mutations. An open file reloads changes made on disk, and
+a save over a change it has not seen is refused and shows a conflict bar
+(**Reload from disk** / **Overwrite disk**).
 
 ### Custom Action
 

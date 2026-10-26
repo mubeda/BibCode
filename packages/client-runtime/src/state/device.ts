@@ -34,6 +34,11 @@ export function createDeviceEnvironmentAtoms<R, E>(
       // capturing when the last subscriber goes, so the stream ends with its view.
       idleTtlMs: 0,
     }),
+    refreshCatalog: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:device:refreshCatalog",
+      tag: WS_METHODS.deviceRefreshCatalog,
+      scheduler: lifecycleScheduler,
+    }),
     open: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:device:open",
       tag: WS_METHODS.deviceOpen,

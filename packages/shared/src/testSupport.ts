@@ -26,6 +26,8 @@ export function makeTestExecutionEnvironmentCapabilities(
     gitPullRequestBranchSelection: false,
     pullRequestsReads: false,
     pullRequestsMutations: false,
+    pipelinesReads: false,
+    pipelinesMutations: false,
     activityProtocolVersion: null,
     remoteUpdateControl: false,
     remoteUpdateProgress: false,
@@ -33,7 +35,10 @@ export function makeTestExecutionEnvironmentCapabilities(
     attachmentStaging: false,
     profiler: false,
     devicePreviews: false,
+    deviceCatalogRefresh: false,
+    cliSessionHistory: false,
     previewTunnels: false,
+    reviewDiffTools: false,
     ...overrides,
   };
 }

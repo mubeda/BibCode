@@ -2,6 +2,7 @@ mod actions;
 mod files;
 mod graphql;
 mod parse;
+pub(super) mod pipelines;
 pub(super) mod poll;
 pub(crate) mod refresh;
 mod review_positions;
@@ -59,6 +60,9 @@ pub struct GitLabHost {
     contexts: super::cache::ContextCache<(String, String), HostContext>,
     /// Repository-wide tab totals, reused across filter changes and pages.
     totals: super::cache::ContextCache<(String, String), ListCounts>,
+    /// Lowercased hosts whose GraphQL lacks a newer pipeline field, for the
+    /// process lifetime: their pipelines reads use the baseline documents.
+    pipelines_baseline: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl GitLabHost {
@@ -67,7 +71,17 @@ impl GitLabHost {
             runner,
             contexts: Default::default(),
             totals: Default::default(),
+            pipelines_baseline: Default::default(),
         }
+    }
+
+    /// The last good context read for the scope, at any age, without a host
+    /// call: the pipelines poller stamps its rows with its login and builds
+    /// links on its web URL.
+    pub(in crate::pull_requests) fn known_context(&self, scope: &HostScope) -> Option<HostContext> {
+        self.contexts
+            .get_any_age(&scope.context_key())
+            .map(|(_, context)| context)
     }
 
     async fn viewer(
@@ -93,23 +107,7 @@ impl GitLabHost {
         let started = std::time::Instant::now();
         let output = self
             .runner
-            .glab(
-                scope,
-                &["api", path],
-                if matches!(
-                    operation,
-                    "pullRequests.getContext"
-                        | "pullRequests.getVocabulary"
-                        | "pullRequests.getCreateDefaults"
-                        | "pullRequests.subscribe"
-                ) {
-                    Budget::Read
-                } else {
-                    Budget::Mutation
-                },
-                None,
-                c,
-            )
+            .glab(scope, &["api", path], budget_for(operation), None, c)
             .await;
         trace_gitlab_read(operation, call_label(path), started);
         let output = output.map_err(|failure| {
@@ -148,7 +146,7 @@ impl GitLabHost {
         let started = std::time::Instant::now();
         let output = self
             .runner
-            .glab_api_with_body(scope, "POST", "graphql", &input, c)
+            .glab_api_with_body(scope, "POST", "graphql", &input, budget_for(operation), c)
             .await;
         trace_gitlab_read(operation, "graphql", started);
         let output = output.map_err(|failure| {
@@ -191,21 +189,48 @@ impl GitLabHost {
         Ok((Value::Array(awards), true))
     }
 
+    /// The project web URL of the last context read, at any age: pipeline and
+    /// job links are built on its origin, never taken from response text.
+    fn link_base(&self, scope: &HostScope) -> Option<String> {
+        self.contexts
+            .get_any_age(&scope.context_key())
+            .map(|(_, context)| context.web_url)
+    }
+
     /// One lightweight `GET merge_requests/:iid`, read for the poller's change
-    /// detection only. It never calls `detail`.
-    pub(super) async fn probe(
+    /// detection and pipeline header. It never calls `detail`.
+    pub(in crate::pull_requests::gitlab) async fn probe(
         &self,
         scope: &HostScope,
         number: u64,
         c: &CancellationToken,
-    ) -> Result<refresh::ProbeFingerprint, PullRequestsOperationError> {
+    ) -> Result<parse::Probe, PullRequestsOperationError> {
         let operation = "pullRequests.subscribe";
         let path = format!("{}/merge_requests/{number}", project_path(scope));
         let value = self.api(scope, &path, operation, c).await?;
-        parse::probe_fingerprint(&value, operation)
+        parse::probe(&value, self.link_base(scope).as_deref(), operation)
     }
 
-    async fn counts(&self, scope: &HostScope, c: &CancellationToken) -> Option<ListCounts> {
+    /// The poller's GraphQL pipeline read: stages and up to 100 jobs each.
+    pub(in crate::pull_requests::gitlab) async fn pipeline_graph(
+        &self,
+        scope: &HostScope,
+        number: u64,
+        c: &CancellationToken,
+    ) -> Result<Option<parse::PipelineGraph>, PullRequestsOperationError> {
+        let operation = "pullRequests.subscribe";
+        let value = self
+            .graphql(scope, number, graphql::PIPELINE_QUERY, operation, c)
+            .await?;
+        parse::pipeline_graph(&value, self.link_base(scope).as_deref(), operation)
+    }
+
+    async fn counts(
+        &self,
+        scope: &HostScope,
+        c: &CancellationToken,
+    ) -> Result<ListCounts, PullRequestsOperationError> {
+        let operation = "pullRequests.list";
         let total = |state: &'static str| async move {
             let path = format!(
                 "{}/merge_requests?state={state}&per_page=1",
@@ -216,18 +241,233 @@ impl GitLabHost {
                 .runner
                 .glab(scope, &["api", "-i", &path], Budget::Read, None, c)
                 .await;
-            trace_gitlab_read("pullRequests.list", "count", started);
-            let output = output.ok()?;
-            parse::total(&output.stdout)
+            trace_gitlab_read(operation, "count", started);
+            let output = output.map_err(|failure| {
+                from_process_error(operation, "glab", &failure.error, &failure.stderr)
+            })?;
+            parse::total(&output.stdout).ok_or_else(|| parse::invalid(operation))
         };
         // Independent host round trips: read the three totals together.
         let (open, closed, merged) =
             tokio::join!(total("opened"), total("closed"), total("merged"));
-        Some(ListCounts {
+        // A 429 or a sign-in failure on any of them reaches the caller, so
+        // the poller backs off or ends instead of keeping old totals.
+        let errors = [&open, &closed, &merged];
+        for codes in [
+            &["rate_limited"][..],
+            &["not_authenticated", "forbidden"][..],
+        ] {
+            if let Some(Err(error)) = errors
+                .iter()
+                .find(|result| matches!(result, Err(error) if codes.contains(&error.code)))
+            {
+                return Err(error.clone());
+            }
+        }
+        Ok(ListCounts {
             open: Some(open?),
             closed: Some(closed?),
             merged: Some(merged?),
         })
+    }
+
+    /// The poller's list read. Its tab totals are reused past the unary reads'
+    /// 30 s bound: they reload only when the first page changed, the copy is
+    /// at least 5 minutes old, or there is none. A 429 on a totals read fails
+    /// the read, so the poller's backoff sees it.
+    pub(in crate::pull_requests::gitlab) async fn poll_list(
+        &self,
+        scope: &HostScope,
+        query: &ListQuery,
+        page_changed: impl FnOnce(&[ListRow]) -> bool,
+        c: &CancellationToken,
+    ) -> Result<(ListPage, bool), PullRequestsOperationError> {
+        let (rows, page, has_next) = self.list_rows(scope, query, c).await?;
+        let changed = page_changed(&rows);
+        let cached = self.totals.get_any_age(&scope.context_key());
+        let counts = match &cached {
+            Some((age, counts)) if !changed && *age < POLL_TOTALS_REUSE => Some(counts.clone()),
+            _ => {
+                self.totals.remove(&scope.context_key());
+                match self
+                    .totals
+                    .get_or_load(
+                        scope.context_key(),
+                        c,
+                        || PullRequestsOperationError::new("pullRequests.list", "timeout"),
+                        self.counts(scope, c),
+                    )
+                    .await
+                {
+                    Ok(counts) => Some(counts),
+                    // A 429 backs the poller off, and a sign-in failure ends
+                    // it; only another failure keeps the last good totals.
+                    Err(error)
+                        if matches!(
+                            error.code,
+                            "rate_limited" | "timeout" | "not_authenticated" | "forbidden"
+                        ) =>
+                    {
+                        return Err(error);
+                    }
+                    Err(_) => cached.as_ref().map(|(_, counts)| counts.clone()),
+                }
+            }
+        };
+        // Reloaded totals that moved rewrite the stored page; a first load
+        // after start compares nothing and leaves that to the rows.
+        let counts_changed = matches!(
+            (&cached, &counts),
+            (Some((_, before)), Some(after)) if before != after
+        );
+        Ok((
+            list_page(query, rows, page, has_next, counts),
+            changed || counts_changed,
+        ))
+    }
+
+    /// One `glab mr list` page of 30 for `query`.
+    async fn list_rows(
+        &self,
+        scope: &HostScope,
+        query: &ListQuery,
+        c: &CancellationToken,
+    ) -> Result<(Vec<ListRow>, u64, bool), PullRequestsOperationError> {
+        let operation = "pullRequests.list";
+        let (args, page) = list_args(query)?;
+        let started = std::time::Instant::now();
+        let output = self
+            .runner
+            .glab(scope, &args, Budget::Mutation, None, c)
+            .await;
+        trace_gitlab_read(operation, "list", started);
+        let output = output.map_err(|failure| {
+            from_process_error(operation, "glab", &failure.error, &failure.stderr)
+        })?;
+        let value: Value =
+            serde_json::from_str(&output.stdout).map_err(|_| parse::invalid(operation))?;
+        let values = value.as_array().ok_or_else(|| parse::invalid(operation))?;
+        let rows = values
+            .iter()
+            .take(30)
+            .map(parse::row)
+            .collect::<Result<Vec<_>, _>>()?;
+        if c.is_cancelled() {
+            return Err(PullRequestsOperationError::new(operation, "timeout"));
+        }
+        Ok((rows, page, values.len() >= 30))
+    }
+}
+
+/// How long the poller reuses the repository's tab totals while the first
+/// page stays unchanged.
+const POLL_TOTALS_REUSE: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+fn list_args(query: &ListQuery) -> Result<(Vec<String>, u64), PullRequestsOperationError> {
+    let operation = "pullRequests.list";
+    if query.review_status.is_some() {
+        let mut error = PullRequestsOperationError::new(operation, "unavailable");
+        error.message = "Review status filters are unavailable in this server build. Clear the review status filter to view merge requests.".into();
+        return Err(error);
+    }
+    let page = query
+        .cursor
+        .as_deref()
+        .map_or(Ok(1), str::parse::<u64>)
+        .ok()
+        .filter(|page| *page > 0 && *page < u64::MAX)
+        .ok_or_else(|| {
+            let mut error = PullRequestsOperationError::new(operation, "host_rejected");
+            error.message = "The merge request page cursor is invalid. Refresh the list.".into();
+            error
+        })?;
+    let order = match query.sort {
+        ListSort::Newest | ListSort::Oldest => "created_at",
+        ListSort::RecentlyUpdated => "updated_at",
+        ListSort::MostCommented => "popularity",
+    };
+    let sort = if query.sort == ListSort::Oldest {
+        "asc"
+    } else {
+        "desc"
+    };
+    let mut args: Vec<String> = [
+        "mr",
+        "list",
+        "-F",
+        "json",
+        "--per-page",
+        "30",
+        "--page",
+        &page.to_string(),
+        "--order",
+        order,
+        "--sort",
+        sort,
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+    match query.state {
+        // glab defaults to open; 1.114.0 has no --state flag.
+        ListState::Open => {}
+        ListState::Closed => args.push("--closed".into()),
+        ListState::Merged => args.push("--merged".into()),
+        ListState::All => args.push("--all".into()),
+    }
+    for (flag, value) in [
+        ("--author", &query.author),
+        ("--assignee", &query.assignee),
+        ("--reviewer", &query.reviewer),
+        ("--milestone", &query.milestone),
+        ("--target-branch", &query.target_branch),
+        ("--search", &query.search),
+    ] {
+        if let Some(value) = value {
+            args.extend([flag.into(), value.clone()]);
+        }
+    }
+    for label in &query.labels {
+        args.extend(["--label".into(), label.clone()]);
+    }
+    if let Some(draft) = query.draft {
+        args.push(
+            if draft == DraftFilter::Only {
+                "--draft"
+            } else {
+                "--not-draft"
+            }
+            .into(),
+        );
+    }
+    Ok((args, page))
+}
+
+fn list_page(
+    query: &ListQuery,
+    rows: Vec<ListRow>,
+    page: u64,
+    has_next: bool,
+    counts: Option<ListCounts>,
+) -> ListPage {
+    let total_count =
+        counts
+            .as_ref()
+            .filter(|_| !query.has_filters())
+            .and_then(|counts| match query.state {
+                ListState::Open => counts.open,
+                ListState::Closed => counts.closed,
+                ListState::Merged => counts.merged,
+                ListState::All => counts
+                    .open?
+                    .checked_add(counts.closed?)?
+                    .checked_add(counts.merged?),
+            });
+    ListPage {
+        rows,
+        next_cursor: has_next.then(|| (page + 1).to_string()),
+        total_count,
+        counts,
     }
 }
 
@@ -364,83 +604,8 @@ impl PullRequestHost for GitLabHost {
         c: &'a CancellationToken,
     ) -> HostFuture<'a, ListPage> {
         Box::pin(async move {
-            let operation = "pullRequests.list";
-            if query.review_status.is_some() {
-                let mut error = PullRequestsOperationError::new(operation, "unavailable");
-                error.message = "Review status filters are unavailable in this server build. Clear the review status filter to view merge requests.".into();
-                return Err(error);
-            }
-            let page = query
-                .cursor
-                .as_deref()
-                .map_or(Ok(1), str::parse::<u64>)
-                .ok()
-                .filter(|page| *page > 0 && *page < u64::MAX)
-                .ok_or_else(|| {
-                    let mut error = PullRequestsOperationError::new(operation, "host_rejected");
-                    error.message =
-                        "The merge request page cursor is invalid. Refresh the list.".into();
-                    error
-                })?;
-            let order = match query.sort {
-                ListSort::Newest | ListSort::Oldest => "created_at",
-                ListSort::RecentlyUpdated => "updated_at",
-                ListSort::MostCommented => "popularity",
-            };
-            let sort = if query.sort == ListSort::Oldest {
-                "asc"
-            } else {
-                "desc"
-            };
-            let mut args: Vec<String> = [
-                "mr",
-                "list",
-                "-F",
-                "json",
-                "--per-page",
-                "30",
-                "--page",
-                &page.to_string(),
-                "--order",
-                order,
-                "--sort",
-                sort,
-            ]
-            .into_iter()
-            .map(str::to_owned)
-            .collect();
-            match query.state {
-                // glab defaults to open; 1.114.0 has no --state flag.
-                ListState::Open => {}
-                ListState::Closed => args.push("--closed".into()),
-                ListState::Merged => args.push("--merged".into()),
-                ListState::All => args.push("--all".into()),
-            }
-            for (flag, value) in [
-                ("--author", &query.author),
-                ("--assignee", &query.assignee),
-                ("--reviewer", &query.reviewer),
-                ("--milestone", &query.milestone),
-                ("--target-branch", &query.target_branch),
-                ("--search", &query.search),
-            ] {
-                if let Some(value) = value {
-                    args.extend([flag.into(), value.clone()]);
-                }
-            }
-            for label in &query.labels {
-                args.extend(["--label".into(), label.clone()]);
-            }
-            if let Some(draft) = query.draft {
-                args.push(
-                    if draft == DraftFilter::Only {
-                        "--draft"
-                    } else {
-                        "--not-draft"
-                    }
-                    .into(),
-                );
-            }
+            // Validate before any host read starts.
+            list_args(query)?;
             // The tab totals do not depend on the page or its filters: reuse the bounded
             // copy (30 s, successful answers only) unless this is an explicit Refresh.
             if query.refresh_totals {
@@ -449,49 +614,14 @@ impl PullRequestHost for GitLabHost {
             let totals = async {
                 self.totals
                     .get_or_load(scope.context_key(), c, || (), async {
-                        self.counts(scope, c).await.ok_or(())
+                        self.counts(scope, c).await.map_err(|_| ())
                     })
                     .await
                     .ok()
             };
-            let started = std::time::Instant::now();
-            let (output, counts) = tokio::join!(
-                self.runner.glab(scope, &args, Budget::Mutation, None, c),
-                totals,
-            );
-            trace_gitlab_read(operation, "list", started);
-            let output = output.map_err(|failure| {
-                from_process_error(operation, "glab", &failure.error, &failure.stderr)
-            })?;
-            let value: Value =
-                serde_json::from_str(&output.stdout).map_err(|_| parse::invalid(operation))?;
-            let values = value.as_array().ok_or_else(|| parse::invalid(operation))?;
-            let rows = values
-                .iter()
-                .take(30)
-                .map(parse::row)
-                .collect::<Result<Vec<_>, _>>()?;
-            if c.is_cancelled() {
-                return Err(PullRequestsOperationError::new(operation, "timeout"));
-            }
-            let total_count = counts
-                .as_ref()
-                .filter(|_| !query.has_filters())
-                .and_then(|counts| match query.state {
-                    ListState::Open => counts.open,
-                    ListState::Closed => counts.closed,
-                    ListState::Merged => counts.merged,
-                    ListState::All => counts
-                        .open?
-                        .checked_add(counts.closed?)?
-                        .checked_add(counts.merged?),
-                });
-            Ok(ListPage {
-                rows,
-                next_cursor: (values.len() >= 30).then(|| (page + 1).to_string()),
-                total_count,
-                counts,
-            })
+            let (rows, counts) = tokio::join!(self.list_rows(scope, query, c), totals);
+            let (rows, page, has_next) = rows?;
+            Ok(list_page(query, rows, page, has_next, counts))
         })
     }
 
@@ -509,7 +639,7 @@ impl PullRequestHost for GitLabHost {
             let reviewers_path = format!("{path}/reviewers");
             let approval_state_path = format!("{path}/approval_state");
             let issues_path = format!("{path}/closes_issues?per_page=100");
-            let (request, approvals, reviewers, approval_state, awards, issues, metadata) = tokio::join!(
+            let (request, approvals, reviewers, approval_state, awards, issues, metadata, stages) = tokio::join!(
                 self.api(scope, &path, operation, c),
                 self.api(scope, &approvals_path, operation, c),
                 self.api(scope, &reviewers_path, operation, c),
@@ -517,6 +647,7 @@ impl PullRequestHost for GitLabHost {
                 self.awards(scope, &path, operation, c),
                 self.api(scope, &issues_path, operation, c),
                 self.graphql(scope, number, graphql::DETAIL_METADATA_QUERY, operation, c),
+                self.graphql(scope, number, graphql::PIPELINE_STAGES_QUERY, operation, c),
             );
             let mut request = request?;
             if !request.is_object() {
@@ -544,7 +675,13 @@ impl PullRequestHost for GitLabHost {
             }
             let issues = issues?;
             let metadata = metadata?;
-            parse::detail(
+            // The stage strip degrades on its own: only cancellation fails the read.
+            let graph = match stages {
+                Ok(value) => parse::pipeline_graph(&value, Some(&context.web_url), operation).ok(),
+                Err(error) if error.code == "timeout" => return Err(error),
+                Err(_) => None,
+            };
+            let mut raw = parse::detail(
                 parse::DetailResponses {
                     request: &request,
                     approvals: &approvals,
@@ -556,7 +693,22 @@ impl PullRequestHost for GitLabHost {
                 },
                 context,
                 self.capabilities(context.version().as_ref()),
-            )
+            )?;
+            let rest = parse::pipeline_header(&request, Some(&context.web_url));
+            let pipeline = parse::unary_pipeline(
+                &rest,
+                match &graph {
+                    Some(graph) => parse::GraphRead::Read(graph.as_ref()),
+                    None => parse::GraphRead::Missing,
+                },
+            );
+            // The service stamps the revision with the read's generation.
+            raw.detail_without_permissions.pipeline = Some(PipelineCopy {
+                revision: 0,
+                pipeline,
+                checks: None,
+            });
+            Ok(raw)
         })
     }
 
@@ -638,6 +790,23 @@ impl PullRequestHost for GitLabHost {
     ) -> HostFuture<'a, Checks> {
         Box::pin(async move {
             let op = "pullRequests.getChecks";
+            // The gating (diff-head) pipeline's jobs in GitLab's stage order, trigger
+            // jobs included; the REST read of the newest pipeline is the fallback.
+            let base = self.link_base(scope);
+            match self
+                .graphql(scope, number, graphql::PIPELINE_QUERY, op, c)
+                .await
+                .and_then(|value| parse::pipeline_graph(&value, base.as_deref(), op))
+            {
+                Ok(Some(parse::PipelineGraph {
+                    checks: Some(checks),
+                    ..
+                })) => return Ok(checks),
+                Err(error) if matches!(error.code, "timeout" | "not_authenticated") => {
+                    return Err(error);
+                }
+                _ => {}
+            }
             let pipelines = self
                 .api(
                     scope,
@@ -655,6 +824,8 @@ impl PullRequestHost for GitLabHost {
                     groups: vec![],
                     summary: CheckSummary::None,
                     pipeline_url: None,
+                    revision: None,
+                    truncated: false,
                 });
             };
             let project = pipeline["project_id"]
@@ -669,7 +840,7 @@ impl PullRequestHost for GitLabHost {
                     c,
                 )
                 .await?;
-            parse::checks(&jobs, pipeline)
+            parse::checks(&jobs, pipeline, base.as_deref())
         })
     }
     fn files<'a>(
@@ -744,9 +915,27 @@ fn trace_gitlab_read(operation: &str, call: &str, started: std::time::Instant) {
     }
 }
 
+/// Reads that run beside a list or open, or on the poller's ticks, take the
+/// 30 s read budget; every other operation keeps the 60 s mutation budget.
+fn budget_for(operation: &str) -> Budget {
+    if matches!(
+        operation,
+        "pullRequests.getContext"
+            | "pullRequests.getVocabulary"
+            | "pullRequests.getCreateDefaults"
+            | "pullRequests.subscribe"
+    ) {
+        Budget::Read
+    } else {
+        Budget::Mutation
+    }
+}
+
 fn call_label(path: &str) -> &'static str {
     let path = path.split('?').next().unwrap_or(path);
-    if path.contains("/notes/") {
+    if path.contains("/pipelines") {
+        "pipeline"
+    } else if path.contains("/notes/") {
         "note"
     } else if path.ends_with("/approvals") {
         "approvals"
@@ -812,6 +1001,79 @@ mod tests {
         assert_eq!(call_label("projects/team%2Frepo"), "other");
         assert_eq!(call_label("user"), "user");
         assert_eq!(call_label("version"), "version");
+    }
+
+    #[test]
+    fn pull_requests_gitlab_reads_labelled_subscribe_take_the_30s_read_budget() {
+        use std::time::Duration;
+        for operation in [
+            "pullRequests.subscribe",
+            "pullRequests.getContext",
+            "pullRequests.getVocabulary",
+            "pullRequests.getCreateDefaults",
+        ] {
+            assert_eq!(
+                budget_for(operation).timeout(),
+                Duration::from_secs(30),
+                "{operation}"
+            );
+        }
+        for operation in [
+            "pullRequests.get",
+            "pullRequests.getChecks",
+            "pullRequests.runAction",
+        ] {
+            assert_eq!(
+                budget_for(operation).timeout(),
+                Duration::from_secs(60),
+                "{operation}"
+            );
+        }
+        assert_eq!(
+            call_label("projects/team%2Frepo/merge_requests/42/pipelines?per_page=1"),
+            "pipeline"
+        );
+        assert_eq!(call_label("projects/2/pipelines/9/jobs"), "pipeline");
+    }
+
+    /// The poller's GraphQL pipeline read goes through the body-file path,
+    /// and still stops when its subscriber leaves.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pull_requests_gitlab_poller_pipeline_read_stops_on_cancellation() {
+        use crate::test_support::TestSandbox;
+        use tokio_util::sync::CancellationToken;
+        let s = TestSandbox::new("pr-gitlab-pipeline-cancel");
+        let script = s.executable_script(
+            "glab",
+            "printf '%s\\n' \"$*\" >> calls\nsleep 20\necho '{}'",
+            "",
+        );
+        let host = GitLabHost::new(Arc::new(
+            HostCommandRunner::new(s.path("state")).with_commands(&script, &script, &script),
+        ));
+        let scope = HostScope {
+            cwd: s.root().into(),
+            ..scope()
+        };
+        let c = CancellationToken::new();
+        let started = std::time::Instant::now();
+        let read = host.pipeline_graph(&scope, 42, &c);
+        // Cancel once the read is out on the host, as a leaving subscriber would.
+        let cancel = async {
+            while !s.path("calls").exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            c.cancel();
+        };
+        let (result, ()) = tokio::join!(read, cancel);
+        assert_eq!(result.unwrap_err().code, "timeout");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert!(
+            std::fs::read_to_string(s.path("calls"))
+                .unwrap()
+                .starts_with("api --method POST graphql")
+        );
     }
 
     #[test]

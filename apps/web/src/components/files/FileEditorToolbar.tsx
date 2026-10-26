@@ -21,6 +21,11 @@ export interface FileEditorToolbarProps {
   readonly canUndo: boolean;
   readonly canRedo: boolean;
   readonly cleanStatus: string | null;
+  /**
+   * Why no save may run now (the file changed on disk under these edits). Save is disabled with
+   * this reason, and a refused save does not offer the generic retry.
+   */
+  readonly saveBlockedReason?: string | null;
   readonly markdownView?: FileEditorMarkdownView | undefined;
   readonly onSave: () => void;
   readonly onUndo: () => void;
@@ -76,6 +81,7 @@ export function FileEditorToolbar({
   canUndo,
   canRedo,
   cleanStatus,
+  saveBlockedReason = null,
   markdownView,
   onSave,
   onUndo,
@@ -103,24 +109,26 @@ export function FileEditorToolbar({
   }, [savedRevision]);
   const showSaved = savedRevision !== null;
 
+  const saveFailed = savePhase === "failed" && saveBlockedReason === null;
   const status =
-    savePhase === "pending"
+    savePhase === "pending" || (savePhase === "failed" && !saveFailed)
       ? "Unsaved changes"
       : savePhase === "saving"
         ? "Saving…"
-        : savePhase === "failed"
+        : saveFailed
           ? "Save failed — retry"
           : showSaved
             ? "Saved"
             : cleanStatus;
-  const statusClassName =
-    savePhase === "failed" ? "ml-2 text-xs text-destructive" : "ml-2 text-xs text-muted-foreground";
-  const saveActionClassName =
-    savePhase === "failed"
-      ? "text-destructive hover:text-destructive"
-      : canSave
-        ? "text-foreground hover:text-foreground"
-        : "text-muted-foreground hover:text-muted-foreground";
+  const statusClassName = saveFailed
+    ? "ml-2 text-xs text-destructive"
+    : "ml-2 text-xs text-muted-foreground";
+  const saveEnabled = canSave && saveBlockedReason === null;
+  const saveActionClassName = saveFailed
+    ? "text-destructive hover:text-destructive"
+    : saveEnabled
+      ? "text-foreground hover:text-foreground"
+      : "text-muted-foreground hover:text-muted-foreground";
 
   return (
     <div
@@ -129,9 +137,9 @@ export function FileEditorToolbar({
     >
       <ToolbarAction
         className={saveActionClassName}
-        disabled={!canSave}
+        disabled={!saveEnabled}
         label="Save file"
-        tooltip="Save file (Ctrl/Cmd+S)"
+        tooltip={saveBlockedReason ?? "Save file (Ctrl/Cmd+S)"}
         onClick={onSave}
       >
         {savePhase === "saving" ? (

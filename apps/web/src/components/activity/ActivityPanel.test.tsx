@@ -763,6 +763,120 @@ describe("ActivityPanel roster", () => {
     expect(onRefreshSnapshot).not.toHaveBeenCalled();
   });
 
+  it("switches between the provider's sections from tabs at the top of the panel", async () => {
+    const onNavigate = vi.fn();
+    const container = await mount(<ActivityPanel {...props({ onNavigate })} />);
+    const tabs = [...container.querySelectorAll<HTMLElement>('[role="tab"]')];
+
+    expect(container.querySelector('[role="tablist"]')?.getAttribute("aria-label")).toBe(
+      "Activity sections",
+    );
+    expect(tabs.map((tab) => tab.textContent)).toEqual(["Subagents", "Background tasks"]);
+    expect(tabs[0]?.getAttribute("aria-selected")).toBe("true");
+
+    await act(async () => tabs[1]?.click());
+
+    expect(onNavigate).toHaveBeenCalledWith({
+      section: "backgroundTasks",
+      selectedRecordKind: null,
+      selectedRecordId: null,
+    });
+  });
+
+  it("names a degraded section on its tab", async () => {
+    const container = await mount(
+      <ActivityPanel
+        {...props({
+          snapshot: snapshot({
+            sections: {
+              subagents: { state: "live", message: null, retryable: false },
+              backgroundTasks: { state: "error", message: null, retryable: false },
+            },
+          }),
+        })}
+      />,
+    );
+    const background = [...container.querySelectorAll<HTMLElement>('[role="tab"]')][1];
+
+    expect(background?.textContent).toBe("Background tasks (error)");
+    expect(background?.querySelector('[data-activity-tab-status="error"]')).not.toBeNull();
+  });
+
+  it("takes focus on its section tab and scrolls to the top when the Activity button asks", async () => {
+    const onFocusRequestHandled = vi.fn();
+    const container = await mount(
+      <ActivityPanel {...props({ focusRequested: false, onFocusRequestHandled })} />,
+    );
+    const viewport = container.querySelector<HTMLElement>('[data-slot="scroll-area-viewport"]')!;
+    viewport.scrollTop = 120;
+    expect(onFocusRequestHandled).not.toHaveBeenCalled();
+
+    await rerender(
+      container,
+      <ActivityPanel {...props({ focusRequested: true, onFocusRequestHandled })} />,
+    );
+
+    expect(document.activeElement?.getAttribute("role")).toBe("tab");
+    expect(document.activeElement?.textContent).toBe("Subagents");
+    expect(viewport.scrollTop).toBe(0);
+    expect(onFocusRequestHandled).toHaveBeenCalledTimes(1);
+  });
+
+  it("focuses the panel itself when there is a single section to show", async () => {
+    const onlySubagents = snapshot({
+      sections: {
+        subagents: { state: "live", message: null, retryable: false },
+        backgroundTasks: { state: "unsupported", message: null, retryable: false },
+      },
+    });
+    const container = await mount(
+      <ActivityPanel
+        {...props({
+          snapshot: onlySubagents,
+          focusRequested: true,
+          onFocusRequestHandled: vi.fn(),
+        })}
+      />,
+    );
+
+    expect(document.activeElement).toBe(container.querySelector("[data-activity-panel]"));
+    expect(document.activeElement?.getAttribute("aria-label")).toBe("Activity");
+  });
+
+  it("offers no tabs when the provider reports only one section", async () => {
+    const onlySubagents = snapshot({
+      sections: {
+        subagents: { state: "live", message: null, retryable: false },
+        backgroundTasks: { state: "unsupported", message: null, retryable: false },
+      },
+    });
+    const container = await mount(<ActivityPanel {...props({ snapshot: onlySubagents })} />);
+
+    expect(container.querySelector('[role="tablist"]')).toBeNull();
+  });
+
+  it("keeps a way out of an unsupported section the route still points at", async () => {
+    const onNavigate = vi.fn();
+    const onlyBackground = snapshot({
+      sections: {
+        subagents: { state: "unsupported", message: null, retryable: false },
+        backgroundTasks: { state: "live", message: null, retryable: false },
+      },
+    });
+    const container = await mount(
+      <ActivityPanel {...props({ onNavigate, snapshot: onlyBackground })} />,
+    );
+    const tabs = [...container.querySelectorAll<HTMLElement>('[role="tab"]')];
+
+    expect(tabs.map((tab) => tab.textContent)).toEqual(["Subagents", "Background tasks"]);
+    await act(async () => tabs[1]?.click());
+    expect(onNavigate).toHaveBeenCalledWith({
+      section: "backgroundTasks",
+      selectedRecordKind: null,
+      selectedRecordId: null,
+    });
+  });
+
   it("distinguishes unsupported sections from observed empty sections", async () => {
     const unsupported = await mount(
       <ActivityPanel

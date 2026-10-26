@@ -10,6 +10,11 @@ import * as NodePath from "node:path";
 
 import { afterEach, describe, expect, it } from "vite-plus/test";
 
+import {
+  mermaidFixturePrompts,
+  mermaidFixtureReplies,
+  mermaidFixtureStreamedReplies,
+} from "./mermaid-fixture.ts";
 import { readProviderInputLog } from "./provider-input-log.ts";
 import {
   archiveAndCleanupDesktopUiTestContext,
@@ -524,6 +529,67 @@ describe("generated provider shims", () => {
     ]);
   });
 
+  it("answers the Mermaid fixture prompts with their diagram replies", () => {
+    const fixture = prepareProviderFixture();
+    const responses = exchangeJsonLines(
+      fixture,
+      "codex",
+      ["app-server"],
+      [
+        { id: 1, method: "initialize" },
+        {
+          id: 2,
+          method: "turn/start",
+          params: { input: [{ type: "text", text: mermaidFixturePrompts.many }] },
+        },
+      ],
+    );
+
+    expect(responses).toContainEqual(
+      expect.objectContaining({
+        method: "item/agentMessage/delta",
+        params: expect.objectContaining({
+          delta: mermaidFixtureReplies[mermaidFixturePrompts.many],
+        }),
+      }),
+    );
+    expect(mermaidFixtureReplies[mermaidFixturePrompts.many]?.match(/```mermaid/g)).toHaveLength(
+      101,
+    );
+  });
+
+  it("streams the Mermaid streaming reply one delta per chunk before completing", () => {
+    const fixture = prepareProviderFixture();
+    const responses = exchangeJsonLines(
+      fixture,
+      "codex",
+      ["app-server"],
+      [
+        { id: 1, method: "initialize" },
+        {
+          id: 2,
+          method: "turn/start",
+          params: { input: [{ type: "text", text: mermaidFixturePrompts.streamed }] },
+        },
+      ],
+    );
+
+    const chunks = mermaidFixtureStreamedReplies[mermaidFixturePrompts.streamed]!;
+    const deltas = responses
+      .filter((message) => message.method === "item/agentMessage/delta")
+      .map((message) => (message.params as { delta: string }).delta);
+    expect(deltas).toEqual(chunks);
+    // The diagram's closing fence arrives with more text still to come.
+    const closer = chunks.findIndex((chunk) => chunk.includes("\n```\n"));
+    expect(closer).toBeGreaterThan(0);
+    expect(closer).toBeLessThan(chunks.length - 2);
+    const completed = responses.findIndex((message) => message.method === "turn/completed");
+    const lastDelta = responses.findLastIndex(
+      (message) => message.method === "item/agentMessage/delta",
+    );
+    expect(completed).toBeGreaterThan(lastDelta);
+  });
+
   it("speaks Claude control, skill reload, stream, and result protocols", () => {
     const fixture = prepareProviderFixture();
     const responses = exchangeJsonLines(
@@ -579,6 +645,54 @@ describe("generated provider shims", () => {
     expect(readProviderInputLog(fixture.context.providerInputLogPath)).toMatchObject([
       { provider: "claudeAgent", prompt: "/compact" },
     ]);
+  });
+
+  it("streams a Claude thinking block, a tool call and an answer for a reasoning prompt", () => {
+    const fixture = prepareProviderFixture();
+    const responses = exchangeJsonLines(
+      fixture,
+      "claudeAgent",
+      ["--print", "--input-format", "stream-json", "--output-format", "stream-json"],
+      [
+        {
+          type: "user",
+          session_id: "claude-fixture",
+          message: { content: [{ type: "text", text: "Think it through [[reasoning]]" }] },
+        },
+      ],
+    );
+    interface StreamEventFrame {
+      readonly type?: string;
+      readonly content_block?: { readonly type?: string };
+      readonly delta?: { readonly type?: string; readonly text?: string };
+    }
+    const streamEvents = responses
+      .filter((response) => response.type === "stream_event")
+      .map((response) => response.event as StreamEventFrame);
+    const blockTypes = streamEvents
+      .filter((event) => event.type === "content_block_start")
+      .map((event) => event.content_block?.type);
+    expect(blockTypes).toEqual(["thinking", "tool_use", "text"]);
+    const deltaTypes = new Set(
+      streamEvents
+        .filter((event) => event.type === "content_block_delta")
+        .map((event) => event.delta?.type),
+    );
+    expect([...deltaTypes].toSorted()).toEqual(["signature_delta", "text_delta", "thinking_delta"]);
+    // Each answer names its prompt, so a later turn's answer is told apart from this one.
+    const answer = streamEvents
+      .flatMap((event) => (event.delta?.type === "text_delta" ? [event.delta.text ?? ""] : []))
+      .join("");
+    expect(answer).toContain("Fixture reasoning answer line 24 (Think it through).");
+    expect(responses).toContainEqual(
+      expect.objectContaining({
+        type: "user",
+        message: expect.objectContaining({
+          content: [expect.objectContaining({ type: "tool_result" })],
+        }),
+      }),
+    );
+    expect(responses.at(-1)).toMatchObject({ type: "result", subtype: "success" });
   });
 
   it("speaks Cursor ACP session and prompt protocols", () => {

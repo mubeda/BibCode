@@ -12,11 +12,16 @@ Cursor, and OpenCode are enabled by default; Grok is disabled. Explicitly saved
 values, including `enabled: false`, are preserved.
 
 `supportsContextWindowUsage` is provider-inventory metadata, not a UI guess or
-a property of an individual usage event. Codex and Claude are the only initial
-providers that advertise this capability; an absent capability means that the
-client must show the feature as unavailable even if stale activity exists for a
-thread. The capability does not change ordinary provider execution or activity
-support.
+a property of an individual usage event. Codex and Claude always advertise this
+capability. OpenCode advertises it when its chats run on version 2: the local
+CLI's version, which every probe reads, or, with a Server URL, that server's
+API, which only a full probe reads (the local CLI says nothing about the
+server). A probe that reads no version, such as a Server URL's quick probe,
+keeps the last answer. A full probe that cannot reach the server falls back to
+the local CLI, so the capability stays absent until a later full probe reaches
+the server again. An absent capability means that the client must show the
+feature as unavailable even if stale activity exists for a thread. The
+capability does not change ordinary provider execution or activity support.
 
 `supportsMcpStatus` follows the same inventory-owned rule. Codex and Claude
 advertise it because their adapters publish canonical `mcp.status.updated`
@@ -363,6 +368,47 @@ onto the thread session as `lastError` and `lastErrorClass`. `context_limit` is
 provider-reported too: the conversation no longer fits the provider's context
 window, and the thread offers to compact it.
 
+A failed `turn.completed` can also carry `providerReason`, the provider's own
+name for the failure (Claude's `terminal_reason`, Codex's `codexErrorInfo`
+variant, OpenCode's error name), which the shared failed-turn projection
+records in the Profiler as `provider.turn-failed` for every provider, once per
+turn. A `context_limit` failure may add two facts the adapter reads from the
+provider, never inferred from text by the engine: `beforeOutput: true` when
+the provider refused the turn's input before any assistant text, tool call or
+compaction, and `compactable: false` when the provider said compacting cannot
+help. The event pump passes them on its internal `thread.session.set` as
+`contextLimit`; absent facts mean no automatic recovery. Only Claude reports
+them today.
+
+### Conversation compaction
+
+`supports_compaction` in `apps/server/src/provider/mod.rs` is the driver-owned
+capability, advertised as `supportsCompaction` on the provider snapshot like
+`supportsTurnSteer`: Claude and Codex. A driver implements
+`ProviderDriver::compact(compaction_id)`, which returns
+`ProviderCompactionStart`: `Started { turn_id }` (the provider took the
+request; the outcome arrives as events), `NotStarted { detail }` (certainly
+not sent; the default) or `Unknown { detail }` (the request may have reached
+the provider). Claude writes `/compact` on stdin as an acknowledged operation
+without an outbox row (see [Claude](../providers/claude.md#compaction-and-the-context-limit));
+Codex calls `thread/compact/start` and tags the next root turn Codex starts.
+OpenCode 2 is left out until its compaction of an idle session (`delivery:
+steer`) is confirmed to run at once and its BiBCode-started server is
+confirmed to end with BiBCode, which restart reconciliation relies on; typing
+`/compact` still compacts there.
+
+Each driver reports the compaction as a turn of its own and puts the
+`compactionId` on that turn's `turn.started` and `turn.completed`. The event
+pump carries it on the running `thread.session.set`; the turns projector then
+gives the turn its own row and neither binds nor deletes a pending message's
+marker, so a message waiting behind the compaction keeps its marker for its
+own turn. The compaction succeeded only when its tagged turn completed (not
+failed or interrupted) and a `context_compaction` item in it completed;
+settlement matches the compaction id and the turn id, so a late event of one
+compaction cannot settle another. The event pump also tags each
+`context-window.updated` reading with the provider instance and conversation
+it was read from (`providerInstanceId`, `conversationId`).
+
 Decoders accept a newer, unrecognized provider class as `unknown` so a newer
 server cannot make an older client reject the entire live event or persisted
 session. Encoders remain strict and emit only the canonical values above.
@@ -412,9 +458,11 @@ There is no timeout that releases an admitted writer before completion.
 Suppression, write failure or actor shutdown does not reinterpret provider
 `Accepted` as not sent and never redelivers the input. Publication acknowledgement
 precedes `DeliveryComplete`, so deferred configuration and explicit stop cannot
-overtake it. Steer acceptance never publishes running state. Actor persistence
-awaits and core drain can delay lifecycle controls; unrelated pumps retain
-independent fences.
+overtake it. An acceptance that names no turn (a Codex `/compact`, whose turn
+Codex reports after answering) keeps the active turn the pump already
+projected instead of clearing it, so Stop can still settle that turn. Steer
+acceptance never publishes running state. Actor persistence awaits and core
+drain can delay lifecycle controls; unrelated pumps retain independent fences.
 
 When a provider reports a fatal `session.exited` or its event stream ends, the
 supervisor preserves that event and any already-projected turn failure, and
@@ -692,7 +740,8 @@ provider says the old one is gone:
   and the event stream's connection are bounded too.
 - Claude passes `--resume` only when the transcript
   `<config dir>/projects/<project>/<sessionId>.jsonl` exists, and otherwise
-  launches with a fresh `--session-id`. The config directory resolves as for
+  launches with a fresh `--session-id`. A copy's cursor forks first; see
+  [the launch rule](#claude-launch-rule). The config directory resolves as for
   [imported sessions](#imported-cli-sessions); `<project>` is the launch cwd (and
   its resolved real path) with every character other than an ASCII letter or digit
   replaced by `-`, one per UTF-16 unit, as Claude Code names it
@@ -765,8 +814,10 @@ next turn resumes it. Homes resolve as the launch would:
   `<home>/sessions/YYYY/MM/DD/rollout-*.jsonl`.
 
 Parsing and skip rules follow the upstream reference scanner: Claude records
-marked `isSidechain`, `isMeta` or `isCompactSummary` are skipped, `aiTitle`
-names the thread, and only UUID session IDs (resumable with `--resume`) are
+marked `isSidechain`, `isMeta` or `isCompactSummary` are skipped, the last
+`custom-title` record's `customTitle` (a `/rename` name, or the title Claude
+generated) names the thread, then the last `aiTitle` of older versions, then
+the first prompt line, and only UUID session IDs (resumable with `--resume`) are
 offered; Codex takes its ID from `session_meta`, its model from `turn_context`,
 and keeps one copy of a prompt written both as a `user_message` event and a
 response item. Discovery stats at most 20,000 files per source, a session's
@@ -783,6 +834,71 @@ Claude `{"transport": "stream-json"}`. The thread's model is the transcript's
 model when the instance offers it (Claude's dated IDs match their undated
 catalog slug; Codex reports a model it accepts), else the project's default for
 that instance, the driver's session default, or the built-in default.
+
+History continues a Claude Code terminal session in a chat panel of the thread
+([terminal sessions in History](./rpc-and-orchestration.md#terminal-sessions-in-history)).
+Its panel's row is the same, except that it takes the host's runtime mode,
+never broader, and that a copy's cursor is
+`{"sessionId": <forkId>, "forkedFrom": <source>}` under an ID the server
+assigned. The owner query reads `$.sessionId`, so a copy belongs to its panel
+and the source stays the terminal's. An older server reading a copy's row
+finds no transcript for its ID and starts a new conversation with a handoff:
+degraded, not corrupt.
+
+### Claude launch rule
+
+`ClaudeDriver::spawn` decides how a cursor launches by which transcript
+exists, trying these in order (`exists` is "unknown" when BiBCode cannot
+check):
+
+- **Fork** when the cursor has `forkedFrom`, the copy's own transcript is not
+  known to exist, and the source's is not known to be missing:
+  `--resume <source> --fork-session --session-id <forkId>`. `start` reports
+  the requested cursor, `forkedFrom` included, so a crash before Claude
+  writes the copy forks again instead of starting empty.
+- **Resume** when the cursor's own transcript exists, or cannot be checked and
+  the cursor is not a copy's: `--resume <id>`. Every launch after a copy's
+  first turn takes this path.
+- **New** otherwise: a fresh `--session-id`, which `launch_session` records as
+  a lost resume that owes the context handoff.
+
+Because a fork starts under the ID that was requested, `launch_session` records
+no lost resume and sends no handoff.
+
+**Version gate.** A fork needs Claude Code to take the assigned ID: version
+2.0.73 or later, and `--help` listing `--fork-session`. The activity probe
+reports both as `ClaudeActivitySupport::fork_session_id` from the two commands
+it already runs, and `probe_finished` tells its answer from the defaults a
+launch takes while it runs. Without that answer a fork launch fails with
+"BiBCode is still checking the Claude Code version. Send again." (retried like
+any launch failure); with a "no" it fails once with "Continue in a copy needs
+Claude Code 2.0.73 or later. Update it in Settings → Providers, then send
+again." Neither starts Claude, so the requested cursor stays and the next send
+forks. History applies the same minimum through `copySupported` before a panel
+exists; the launch gate covers a binary changed since.
+
+**Session ID check.** Claude reports the session ID in the first turn's
+`system/init`, after the message is written; its `initialize` response names
+none (checked with 2.1.310). In a fork the Claude runtime compares that ID with
+the assigned one before it forwards anything of the turn. On a mismatch it
+shows nothing more of the process (replays included), fails the message or
+turn with "Claude Code continued the copy under another session ID. Update
+Claude Code, then send again.", ends the session so the driver stops the
+process (a requested exit, not a crash), keeps the copy's cursor, and logs a
+warning without content. The next send forks the unchanged source again; the
+stray transcript Claude wrote stays on disk.
+
+**Refused resume.** A `--resume` of an imported session's own ID
+(`import:<instance>:<sessionId>`) whose transcript exists and whose process
+exits with a failure before its first `system/init` fails the message with
+"Claude Code couldn't continue this session here. It may still be running in a
+terminal or in the background. Choose Continue in a copy in History." and the
+event pump writes `"resumeRefused": true` into the runtime row's payload, which
+History reports so it offers a copy. The ended session stays registered, and
+its later row writes (idle suspension, shutdown) keep the mark. The next launch
+writes the row anew, so a later successful start clears it. The cause is not classified, because
+Claude's message is not a contract. Native threads and copies, which History
+never lists, keep the usual early-exit error.
 
 ## Provider usage and local credential ownership
 
@@ -966,6 +1082,27 @@ the merged provider array changed, ignoring each provider's `checkedAt` and
 clients keep their previous `checkedAt` until a content change or a
 user-triggered refresh publishes, or until they reconnect and receive a fresh
 snapshot.
+
+Clients start updates only through `server.updateProvider` on the environment
+that owns the provider. The primary toast and the desktop-local rows update
+their own targets. **Settings → Providers → Update all…** is client
+orchestration over the same method (`apps/web/src/components/ProviderUpdateAll.logic.ts`):
+it plans every connected environment, sends each one-click candidate with that
+environment's id, driver, and instance id, and runs at most two environments at
+a time through `fanOutRemoteUpdateChecks`. Calls within one environment still
+share its serial config scheduler. The per-environment summary lives in a
+keep-alive atom (`apps/web/src/state/providerUpdateAll.ts`), so it survives
+navigation, and the RPCs continue after the page unmounts. The same
+confirmation can include a connected remote environment's server install
+([remote](remote.md) describes it). The run starts that install only after the
+environment's provider calls have all settled as updated; a failed, unchanged,
+or unconfirmed provider update skips it, so the action never restarts a host
+while one of its provider updates is in flight. Every phase has an expiry: an
+environment's provider calls get six minutes each, the server's five-minute
+command timeout plus its queue, and a server install gets the remote-update
+coordinator's budgets plus two minutes. A call that has not settled by then,
+such as one on a socket that died without a close event, is reported as
+unconfirmed, so the run always reaches a final state and a new one can start.
 
 An update reservation is bound to the complete maintenance target and settings
 generation. After acquiring the per-command lock, the server rereads settings,

@@ -28,3 +28,10 @@ Applications should import the narrowest relevant subpath. There is no broad
 `state` export: use domain paths such as `state/shell`, `state/threads`,
 `state/terminal`, or `state/vcs`. Subpath indices and explicitly exported domain
 files are public API boundaries; all other files remain implementation details.
+
+`state/reasoning` is the shared presentation of provider reasoning (Claude
+thinking and Codex reasoning summaries, a thread's `reasoning` entries): the
+row label ("Thinking" while it streams, "Thought" after), the plain-text preview
+of a collapsed row, and the one-line latest thought a working row shows. They are
+pure functions of an `OrchestrationReasoning`, so every client renders the two
+providers' reasoning the same way.

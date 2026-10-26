@@ -51,13 +51,32 @@ import {
   PullRequestsSnapshot,
   PullRequestsSubscribeInput,
 } from "./pullRequests.ts";
+import {
+  PipelinesActionResult,
+  PipelinesChanged,
+  PipelinesDetail,
+  PipelinesGetInput,
+  PipelinesJobDetail,
+  PipelinesJobInput,
+  PipelinesJobLog,
+  PipelinesJobLogInput,
+  PipelinesListInput,
+  PipelinesListPage,
+  PipelinesRunActionInput,
+  PipelinesSnapshot,
+  PipelinesSubscribeInput,
+} from "./pipelines.ts";
 
 import { ExternalLauncherError, LaunchEditorInput } from "./editor.ts";
 import {
   AgentSessionImportInput,
   AgentSessionImportResult,
+  AgentSessionOpenInPanelInput,
+  AgentSessionOpenInPanelResult,
   AgentSessionScanInput,
   AgentSessionScanResult,
+  AgentSessionThreadListInput,
+  AgentSessionThreadListResult,
   AgentSessionsError,
 } from "./agentSessions.ts";
 import {
@@ -156,6 +175,13 @@ import {
   ReviewDiffPreviewError,
   ReviewDiffPreviewInput,
   ReviewDiffPreviewResult,
+  ReviewDiffToolError,
+  ReviewListDiffToolsInput,
+  ReviewListDiffToolsResult,
+  ReviewOpenDiffToolInput,
+  ReviewOpenDiffToolResult,
+  ReviewReadFileVersionInput,
+  ReviewReadFileVersionResult,
 } from "./review.ts";
 import { KeybindingsConfigError } from "./keybindings.ts";
 import {
@@ -204,6 +230,8 @@ import {
   ProjectDuplicateEntryInput,
   ProjectDuplicateEntryResult,
   ProjectEntriesChangedEvent,
+  ProjectFileVersion,
+  ProjectGetFileVersionInput,
   ProjectListEntriesError,
   ProjectListEntriesInput,
   ProjectListEntriesResult,
@@ -218,6 +246,8 @@ import {
   ProjectSearchEntriesResult,
   ProjectSubscribeEntriesInput,
   ProjectWriteFileError,
+  ProjectWriteFileIfUnchangedInput,
+  ProjectWriteFileIfUnchangedResult,
   ProjectWriteFileInput,
   ProjectWriteFileResult,
 } from "./project.ts";
@@ -446,8 +476,10 @@ export const WS_METHODS = {
   projectsListEntries: "projects.listEntries",
   projectsSubscribeEntries: "subscribeProjectEntries",
   projectsReadFile: "projects.readFile",
+  projectsGetFileVersion: "projects.getFileVersion",
   projectsSearchEntries: "projects.searchEntries",
   projectsWriteFile: "projects.writeFile",
+  projectsWriteFileIfUnchanged: "projects.writeFileIfUnchanged",
   projectsCreateEntry: "projects.createEntry",
   projectsRenameEntry: "projects.renameEntry",
   projectsDeleteEntry: "projects.deleteEntry",
@@ -456,6 +488,8 @@ export const WS_METHODS = {
   // CLI session import methods
   agentSessionsScan: "agentSessions.scan",
   agentSessionsImport: "agentSessions.import",
+  agentSessionsListForThread: "agentSessions.listForThread",
+  agentSessionsOpenInPanel: "agentSessions.openInPanel",
 
   // Shell methods
   shellOpenInEditor: "shell.openInEditor",
@@ -521,6 +555,15 @@ export const WS_METHODS = {
   pullRequestsReadSnapshot: "pullRequests.readSnapshot",
   pullRequestsSubscribe: "pullRequests.subscribe",
 
+  // Pipelines methods
+  pipelinesList: "pipelines.list",
+  pipelinesGet: "pipelines.get",
+  pipelinesGetJob: "pipelines.getJob",
+  pipelinesGetJobLog: "pipelines.getJobLog",
+  pipelinesReadSnapshot: "pipelines.readSnapshot",
+  pipelinesSubscribe: "pipelines.subscribe",
+  pipelinesRunAction: "pipelines.runAction",
+
   // Git workflow methods
   gitRunStackedAction: "git.runStackedAction",
   gitResolvePullRequest: "git.resolvePullRequest",
@@ -528,6 +571,9 @@ export const WS_METHODS = {
 
   // Review methods
   reviewGetDiffPreview: "review.getDiffPreview",
+  reviewReadFileVersion: "review.readFileVersion",
+  reviewListDiffTools: "review.listDiffTools",
+  reviewOpenDiffTool: "review.openDiffTool",
 
   // Activity methods
   activityGetSnapshot: "activity.getSnapshot",
@@ -568,6 +614,7 @@ export const WS_METHODS = {
 
   // Device preview methods
   deviceSubscribeCatalog: "device.subscribeCatalog",
+  deviceRefreshCatalog: "device.refreshCatalog",
   deviceOpen: "device.open",
   deviceClose: "device.close",
   deviceInput: "device.input",
@@ -642,6 +689,20 @@ export const WsAgentSessionsScanRpc = Rpc.make(WS_METHODS.agentSessionsScan, {
 export const WsAgentSessionsImportRpc = Rpc.make(WS_METHODS.agentSessionsImport, {
   payload: AgentSessionImportInput,
   success: AgentSessionImportResult,
+  error: Schema.Union([AgentSessionsError, EnvironmentRpcError]),
+});
+
+/** Only on servers that advertise `cliSessionHistory`. */
+export const WsAgentSessionsListForThreadRpc = Rpc.make(WS_METHODS.agentSessionsListForThread, {
+  payload: AgentSessionThreadListInput,
+  success: AgentSessionThreadListResult,
+  error: Schema.Union([AgentSessionsError, EnvironmentRpcError]),
+});
+
+/** Only on servers that advertise `cliSessionHistory`. */
+export const WsAgentSessionsOpenInPanelRpc = Rpc.make(WS_METHODS.agentSessionsOpenInPanel, {
+  payload: AgentSessionOpenInPanelInput,
+  success: AgentSessionOpenInPanelResult,
   error: Schema.Union([AgentSessionsError, EnvironmentRpcError]),
 });
 
@@ -893,9 +954,35 @@ export const WsProjectsReadFileRpc = Rpc.make(WS_METHODS.projectsReadFile, {
   ]),
 });
 
+export const WsProjectsGetFileVersionRpc = Rpc.make(WS_METHODS.projectsGetFileVersion, {
+  payload: ProjectGetFileVersionInput,
+  success: ProjectFileVersion,
+  error: Schema.Union([
+    ProjectReadFileError,
+    WorkspaceUnavailableError,
+    WorkspaceIdentityError,
+    EnvironmentRpcError,
+  ]),
+});
+
 export const WsProjectsWriteFileRpc = Rpc.make(WS_METHODS.projectsWriteFile, {
   payload: ProjectWriteFileInput,
   success: ProjectWriteFileResult,
+  error: Schema.Union([
+    ProjectWriteFileError,
+    WorkspaceUnavailableError,
+    WorkspaceIdentityError,
+    EnvironmentRpcError,
+  ]),
+});
+
+/**
+ * Writes only when the file on disk is still the state the contents were based on; otherwise it
+ * fails with `file_changed_on_disk` or `file_missing_on_disk` and leaves the file untouched.
+ */
+export const WsProjectsWriteFileIfUnchangedRpc = Rpc.make(WS_METHODS.projectsWriteFileIfUnchanged, {
+  payload: ProjectWriteFileIfUnchangedInput,
+  success: ProjectWriteFileIfUnchangedResult,
   error: Schema.Union([
     ProjectWriteFileError,
     WorkspaceUnavailableError,
@@ -1448,6 +1535,52 @@ export const WsPullRequestsSubscribeRpc = Rpc.make(WS_METHODS.pullRequestsSubscr
   stream: true,
 });
 
+export const WsPipelinesListRpc = Rpc.make(WS_METHODS.pipelinesList, {
+  payload: PipelinesListInput,
+  success: PipelinesListPage,
+  error: PullRequestsOperationError,
+});
+
+export const WsPipelinesGetRpc = Rpc.make(WS_METHODS.pipelinesGet, {
+  payload: PipelinesGetInput,
+  success: PipelinesDetail,
+  error: PullRequestsOperationError,
+});
+
+export const WsPipelinesGetJobRpc = Rpc.make(WS_METHODS.pipelinesGetJob, {
+  payload: PipelinesJobInput,
+  success: PipelinesJobDetail,
+  error: PullRequestsOperationError,
+});
+
+export const WsPipelinesGetJobLogRpc = Rpc.make(WS_METHODS.pipelinesGetJobLog, {
+  payload: PipelinesJobLogInput,
+  success: PipelinesJobLog,
+  error: PullRequestsOperationError,
+});
+
+/** The stored list, pipeline and job copies, read from the database with no host call. */
+export const WsPipelinesReadSnapshotRpc = Rpc.make(WS_METHODS.pipelinesReadSnapshot, {
+  payload: PipelinesSubscribeInput,
+  success: PipelinesSnapshot,
+  error: PullRequestsOperationError,
+});
+
+/** GitLab only: the cooperative poller names what changed; GitHub answers `unavailable`. */
+export const WsPipelinesSubscribeRpc = Rpc.make(WS_METHODS.pipelinesSubscribe, {
+  payload: PipelinesSubscribeInput,
+  success: PipelinesChanged,
+  error: PullRequestsOperationError,
+  stream: true,
+});
+
+/** Retry, cancel or play a pipeline or job; served when `pipelinesMutations` is advertised. */
+export const WsPipelinesRunActionRpc = Rpc.make(WS_METHODS.pipelinesRunAction, {
+  payload: PipelinesRunActionInput,
+  success: PipelinesActionResult,
+  error: PullRequestsOperationError,
+});
+
 /**
  * Ephemeral live diff preview for compact/mobile surfaces.
  * Not the persisted BiBCode Review model. Future review sessions should use
@@ -1458,6 +1591,32 @@ export const WsReviewGetDiffPreviewRpc = Rpc.make(WS_METHODS.reviewGetDiffPrevie
   success: ReviewDiffPreviewResult,
   error: Schema.Union([
     ReviewDiffPreviewError,
+    WorkspaceUnavailableError,
+    WorkspaceIdentityError,
+    EnvironmentRpcError,
+  ]),
+});
+
+/** One side of a changed file, for the Diff panel's Compare view. */
+export const WsReviewReadFileVersionRpc = Rpc.make(WS_METHODS.reviewReadFileVersion, {
+  payload: ReviewReadFileVersionInput,
+  success: ReviewReadFileVersionResult,
+  error: Schema.Union([WorkspaceUnavailableError, WorkspaceIdentityError, EnvironmentRpcError]),
+});
+
+/** The diff apps Git finds where the server runs, for the Diff panel's **Open with**. */
+export const WsReviewListDiffToolsRpc = Rpc.make(WS_METHODS.reviewListDiffTools, {
+  payload: ReviewListDiffToolsInput,
+  success: ReviewListDiffToolsResult,
+  error: Schema.Union([WorkspaceUnavailableError, WorkspaceIdentityError, EnvironmentRpcError]),
+});
+
+/** Opens a file, or every file, in a diff app on the server's computer through `git difftool`. */
+export const WsReviewOpenDiffToolRpc = Rpc.make(WS_METHODS.reviewOpenDiffTool, {
+  payload: ReviewOpenDiffToolInput,
+  success: ReviewOpenDiffToolResult,
+  error: Schema.Union([
+    ReviewDiffToolError,
     WorkspaceUnavailableError,
     WorkspaceIdentityError,
     EnvironmentRpcError,
@@ -1609,6 +1768,12 @@ export const WsDeviceSubscribeCatalogRpc = Rpc.make(WS_METHODS.deviceSubscribeCa
   stream: true,
 });
 
+/** Reruns device discovery now, past its 30 s cache; changes arrive on the catalog stream. */
+export const WsDeviceRefreshCatalogRpc = Rpc.make(WS_METHODS.deviceRefreshCatalog, {
+  payload: Schema.Struct({}),
+  error: DeviceRpcFailure,
+});
+
 export const WsDeviceOpenRpc = Rpc.make(WS_METHODS.deviceOpen, {
   payload: DeviceOpenInput,
   success: DeviceOpenResult,
@@ -1713,7 +1878,11 @@ export const WsOrchestrationDispatchCommandRpc = Rpc.make(
 export const WsOrchestrationGetTurnDiffRpc = Rpc.make(ORCHESTRATION_WS_METHODS.getTurnDiff, {
   payload: OrchestrationGetTurnDiffInput,
   success: OrchestrationRpcSchemas.getTurnDiff.output,
-  error: Schema.Union([OrchestrationGetTurnDiffError, EnvironmentRpcError]),
+  error: Schema.Union([
+    OrchestrationGetTurnDiffError,
+    WorkspaceUnavailableError,
+    EnvironmentRpcError,
+  ]),
 });
 
 export const WsOrchestrationGetFullThreadDiffRpc = Rpc.make(
@@ -1721,7 +1890,11 @@ export const WsOrchestrationGetFullThreadDiffRpc = Rpc.make(
   {
     payload: OrchestrationGetFullThreadDiffInput,
     success: OrchestrationRpcSchemas.getFullThreadDiff.output,
-    error: Schema.Union([OrchestrationGetFullThreadDiffError, EnvironmentRpcError]),
+    error: Schema.Union([
+      OrchestrationGetFullThreadDiffError,
+      WorkspaceUnavailableError,
+      EnvironmentRpcError,
+    ]),
   },
 );
 
@@ -1866,6 +2039,8 @@ export const WsRpcGroup = RpcGroup.make(
   WsAuthConfirmPairingRpc,
   WsAgentSessionsScanRpc,
   WsAgentSessionsImportRpc,
+  WsAgentSessionsListForThreadRpc,
+  WsAgentSessionsOpenInPanelRpc,
   WsServerGetConfigRpc,
   WsServerGetProviderCapabilitiesRpc,
   WsServerRefreshProvidersRpc,
@@ -1896,8 +2071,10 @@ export const WsRpcGroup = RpcGroup.make(
   WsProjectsListEntriesRpc,
   WsProjectsSubscribeEntriesRpc,
   WsProjectsReadFileRpc,
+  WsProjectsGetFileVersionRpc,
   WsProjectsSearchEntriesRpc,
   WsProjectsWriteFileRpc,
+  WsProjectsWriteFileIfUnchangedRpc,
   WsProjectsCreateEntryRpc,
   WsProjectsRenameEntryRpc,
   WsProjectsDeleteEntryRpc,
@@ -1963,7 +2140,17 @@ export const WsRpcGroup = RpcGroup.make(
   WsPullRequestsCheckoutRpc,
   WsPullRequestsReadSnapshotRpc,
   WsPullRequestsSubscribeRpc,
+  WsPipelinesListRpc,
+  WsPipelinesGetRpc,
+  WsPipelinesGetJobRpc,
+  WsPipelinesGetJobLogRpc,
+  WsPipelinesReadSnapshotRpc,
+  WsPipelinesSubscribeRpc,
+  WsPipelinesRunActionRpc,
   WsReviewGetDiffPreviewRpc,
+  WsReviewReadFileVersionRpc,
+  WsReviewListDiffToolsRpc,
+  WsReviewOpenDiffToolRpc,
   WsTerminalOpenRpc,
   WsTerminalAttachRpc,
   WsTerminalWriteRpc,
@@ -1993,6 +2180,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsPreviewAutomationRespondRpc,
   WsPreviewAutomationFocusHostRpc,
   WsDeviceSubscribeCatalogRpc,
+  WsDeviceRefreshCatalogRpc,
   WsDeviceOpenRpc,
   WsDeviceCloseRpc,
   WsDeviceInputRpc,

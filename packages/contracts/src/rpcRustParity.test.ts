@@ -432,6 +432,8 @@ describe("Rust RPC fixture parity", () => {
         { name: "subscribeWorktreeCatalog", mode: "stream" },
         { name: "vcs.refreshWorktreeCatalog", mode: "unary" },
         { name: "worktree.updateDiscoveryPolicy", mode: "unary" },
+        { name: "projects.getFileVersion", mode: "unary" },
+        { name: "projects.writeFileIfUnchanged", mode: "unary" },
       ]),
     );
     expect(manifest.streamMethodCount).toBe(methods.filter(({ mode }) => mode === "stream").length);

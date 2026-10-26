@@ -2,6 +2,7 @@ mod actions;
 mod files;
 mod graphql;
 mod parse;
+mod runs;
 mod timeline;
 
 use std::sync::Arc;
@@ -411,7 +412,7 @@ impl PullRequestHost for GitHubHost {
                     c,
                 )
                 .await?;
-            parse::checks(&value)
+            parse::checks(&value, scope)
         })
     }
     fn files<'a>(

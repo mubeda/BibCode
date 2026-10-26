@@ -2,6 +2,8 @@ import { describe, expect, it } from "vite-plus/test";
 import {
   mergeTerminalSpawnEnv,
   resolveTerminalThemeMode,
+  TERMINAL_ANSI_COLOR_NAMES,
+  terminalAnsiColors,
   terminalExtendedAnsiPalette,
   retainTerminalLaunchTheme,
   terminalOscColorEnv,
@@ -196,5 +198,17 @@ describe("terminal theme launch values", () => {
     ).toBe(true);
     expect(usesPersistentWindowsConsoleTheme({ executable: "claude", args: [] })).toBe(false);
     expect(usesPersistentWindowsConsoleTheme(undefined)).toBe(false);
+  });
+
+  it("shares the 16 named ANSI colors per theme, so the job log matches the terminal", () => {
+    for (const mode of ["light", "dark"] as const) {
+      const colors = terminalAnsiColors(mode);
+      expect(Object.keys(colors)).toEqual([...TERMINAL_ANSI_COLOR_NAMES]);
+      expect(Object.values(colors).every((value) => /^rgb\(\d+, \d+, \d+\)$/.test(value))).toBe(
+        true,
+      );
+    }
+    expect(terminalAnsiColors("dark").red).toBe("rgb(255, 122, 142)");
+    expect(terminalAnsiColors("light").red).toBe("rgb(191, 70, 87)");
   });
 });

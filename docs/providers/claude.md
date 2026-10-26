@@ -92,11 +92,50 @@ When a conversation no longer fits, Claude ends the turn with a context-limit
 · automatic compaction failed: <cause>`). BiBCode fails that turn with the
 `context_limit` error class and the message "Claude's context window is full.
 Compact the conversation, then send your message again.", followed by Claude's
-text. The thread's error, titled "Claude ran out of context", offers **Compact
-conversation**, which sends `/compact` to the same session as an ordinary
-message; it is disabled while the thread is working, which includes a
-compaction already running. Send your message again once the compaction
-finishes. BiBCode does not compact or resend on its own.
+text. The failure also reports two facts that BiBCode reads from Claude's raw
+output, never from that message: `beforeOutput` (Claude refused the turn's
+input before any assistant text, tool call or compaction) and
+`compactable: false` for `rapid_refill_breaker`, for `automatic compaction
+failed:` (Claude's documented "`/compact` fails on the same error until you
+do"), and for the single-exchange form, where compacting cannot help.
+
+When the failed turn did nothing first, compaction can help, and Claude's own
+auto-compact switch is on (its latest context-usage reading of this
+conversation says `isAutoCompactEnabled`), BiBCode recovers on its own, once:
+the error reads "The context window is full. Compacting the conversation, then
+sending your message again.", BiBCode compacts the conversation, and once that
+succeeds it sends a copy of the message, labelled "Sent again after the
+conversation was compacted." A copy that fails at the limit again, a failed or
+stopped compaction, or Claude's auto-compaction turned off
+(`autoCompactEnabled: false` or `DISABLE_AUTO_COMPACT`, which turn
+`isAutoCompactEnabled` off; `DISABLE_COMPACT` is expected to as well, which no
+recorded response confirms yet, so BiBCode also reads either variable from the
+provider instance's environment as auto-compaction off) ends at the error
+above, with the manual action. See
+[Context-limit recovery](../architecture/rpc-and-orchestration.md#context-limit-recovery).
+
+Before sending a message, BiBCode also compacts first when the latest reading
+of the conversation is within 5% of the window of Claude's own compaction point
+(`autoCompactThreshold`), so one large message cannot cross both points at once,
+as in #160. To leave Claude more headroom instead, set
+`CLAUDE_CODE_AUTO_COMPACT_WINDOW` (or `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`) in the
+provider instance's environment variables; BiBCode passes no auto-compact
+window of its own, so the user's and an administrator's settings stand.
+
+The thread's error, titled "Claude ran out of context", offers **Compact
+conversation**. It dispatches `thread.compact`: BiBCode writes `/compact` on
+stdin and opens a turn of its own for it, tagged with the compaction id. The
+write is registered for acknowledgement like a delivery's, without an outbox
+row; the turn awaits its input, so a successful `result` Claude reports first
+after a resume is ignored, and only the `local_command: "compact"` result ends
+it. The compaction succeeded only when that turn completed with a completed
+**Conversation compaction** step; "Not enough messages to compact." is a
+failure, and the error then keeps its context-limit class, so **Compact
+conversation** stays to try again. The action is disabled while the thread is
+working or a compaction is unsettled. Against an older server, without
+`supportsCompaction`, it sends `/compact` as an ordinary message instead
+(Claude only; other providers are not offered the action). Typing `/compact` in
+the composer still sends it as a message.
 
 Other failed turns prefer, in order: the result's `errors`, the text of
 Claude's synthetic error message (an `authentication_failed`,
@@ -265,6 +304,48 @@ update with the tool's input, not one per fragment, and the tool's completion
 carries the same complete input. Versions before 0.11.0 recorded an update for
 every fragment; threads keep those activities and still load them.
 
+The tool's result, such as a command's output or a file it read, is recorded
+on the same update and completion. A result whose JSON is larger than 16 KiB is
+recorded as a preview: the first 16 KiB of its text, followed by
+`[Tool result truncated by BiBCode]`. Images and other parts of such a result
+that are not text are left out. A thread's records are replayed to every
+client that opens it, so a command that printed megabytes is not sent with
+every replay; the full result stays in Claude's own session transcript. Codex
+and Cursor already leave command output off their records.
+
+## Terminal sessions in History
+
+The composer's **History** button lists the Claude Code sessions run with
+`claude` in a terminal in the thread's folder (its worktree, or the project
+root) in the last 30 days, on the server that runs BiBCode. Sessions started
+with `claude -p`, by an Agent SDK, by the Desktop app, or by BiBCode itself are
+left out, and so are sessions another BiBCode thread already runs. A row shows
+the name you gave the session with `/rename` (or the one Claude generated),
+else its first prompt, with its branch and last activity.
+
+- **Continue** opens the session as a chat panel of the thread, in the
+  thread's branch, worktree and permission mode, with up to 200 of its
+  messages. Your next message runs `claude --resume <id>` in that folder, so
+  the terminal and the panel share one conversation from then on. Don't resume
+  it in a terminal again while the panel uses it: both would write to the same
+  transcript.
+- **Continue in a copy** is offered instead whenever the session may still be
+  open in a terminal (Claude Code's running-session files say so, or BiBCode
+  can't read them completely), when an earlier chat of it was deleted, or when
+  Claude Code refused to resume it here. The panel runs
+  `claude --resume <id> --fork-session --session-id <new id>`, under an ID
+  BiBCode chose, and the terminal's conversation is left untouched. A copy
+  needs Claude Code 2.0.73 or later; on an older one the row asks you to
+  update it.
+- **Open** shows a session you already continued.
+
+If Claude Code ends a resumed session's launch with an error before it starts
+(for example, because the session is still running in the background), the
+message fails with "Claude Code couldn't continue this session here", and
+History then offers **Continue in a copy** for it. If a copy ever comes up
+under a session ID BiBCode did not choose, its message fails before any answer
+is shown, and the next message tries the copy again.
+
 ## Background work and idle suspension
 
 BiBCode suspends an idle chat session 60 seconds after its turn ends and
@@ -313,7 +394,37 @@ only when help advertises both exact switches:
 - `--forward-subagent-text`
 
 If either switch is unavailable or the bounded probe fails, Claude still runs in
-its normal stream-JSON mode without structured hook activity.
+its normal stream-JSON mode without structured hook activity. The same probe
+tells whether **Continue in a copy** can run: version 2.0.73 or later with
+`--fork-session` in its help.
+
+`--help` stays the gate even though the
+[CLI reference](https://code.claude.com/docs/en/cli-reference) warns that it
+does not list every flag. Claude Code
+[reports an invalid flag before the run starts](https://code.claude.com/docs/en/headless),
+so launching with a switch the executable lacks would break every Claude chat,
+while a probe that misses a switch only turns Activity off. Version numbers
+cannot replace the probe: the CLI reference and
+[environment variables](https://code.claude.com/docs/en/env-vars) document
+`--forward-subagent-text` (and `CLAUDE_CODE_FORWARD_SUBAGENT_TEXT`) from
+v2.1.211, and forwarding at every nesting depth from v2.1.219, but
+`--include-hook-events` has no documented minimum and no environment variable,
+and the `system/init` `capabilities` list names neither. `--version` cannot
+test a switch either, because it answers even after an unknown flag. If a later
+`--help` stops listing a switch, Claude chats keep working without structured
+hook activity.
+
+Activity creates Claude actors only from `SubagentStart` and `SubagentStop`
+hooks for Agent and legacy Task invocations. The
+[Agent SDK](https://code.claude.com/docs/en/agent-sdk/typescript) task messages
+(`task_started`, `task_updated`, `task_notification`, and, from v2.1.203,
+`background_tasks_changed`) feed the turn follow-up tracking described above,
+which skips tasks marked `ambient`, and the targeted Stop correlation below for
+agent tasks. No task message creates an Activity record, so background Bash
+commands and
+Monitor watches (`task_type: "local_bash"`) never appear under **Background
+tasks**, Claude claims no background-work capability, and Activity reads
+neither `run_id` nor `parent_task_id` (Agent SDK v0.3.292).
 
 A launch waits up to two seconds for the probe. The probe itself may run for up
 to five seconds, so a slow first `--help` still records its answer for the next
@@ -325,6 +436,27 @@ activity probe finished` with `outcome` (`supported` or `unsupported`), the
 version, and the elapsed time, or a `Claude activity probe failed` warning with
 `outcome` (`failed` or `timed out`) and the reason. A launch that stops waiting
 logs `launching Claude without activity flags`.
+
+## Thinking
+
+Claude's thinking shows in the chat as collapsed **Thought** rows, one per
+thinking block, never as assistant text (see the
+[Workspace UI](../user/workspace-ui.md#reading-the-timeline)). From Claude Opus
+4.7 on, the API omits thinking text unless a client asks for a summary; older
+models summarize by default. The same probe therefore asks whether the CLI
+accepts `--thinking-display summarized`, a switch `--help` does not list: it runs
+`claude --thinking-display bibcode-probe --version`. A CLI that knows the switch
+rejects the invalid value, exits nonzero and names `summarized` among the values
+it allows; only then is the switch passed to chat launches. A CLI without it
+ignores the option under `--version` and exits 0, and reads as unsupported. A
+timed-out or failed run is not cached, as for the other switches, and the probe
+line in `server.log` reports `thinking_display`.
+
+The switch only asks for text. What BiBCode shows never depends on the probe:
+any non-empty thinking delta becomes a thought, and an omitted block (one empty
+delta and a signature), a redacted block or a subagent's thinking adds no row.
+Summarized thinking delays the first text token of a reply a little, which is
+the cost of seeing the thoughts.
 
 Structured chat control correlation is stricter than display observation.
 BiBCode exposes a private task target only after one session and Activity

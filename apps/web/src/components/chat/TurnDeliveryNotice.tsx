@@ -7,24 +7,42 @@ export interface TurnDeliveryNoticeProps {
   readonly delivery: TurnDelivery;
   readonly providerLabel: string;
   readonly waitingBehind?: { readonly offersRetry: boolean } | null;
+  /**
+   * How the message relates to a context-limit recovery: `resending` is the failed message the
+   * server sends again once the conversation is compacted, `resent` is that copy.
+   */
+  readonly recovery?: "resending" | "resent" | null;
   readonly onRetry: () => void;
   readonly onDismiss: () => void;
   readonly disabled: boolean;
+}
+
+function MutedNotice({ children }: { readonly children: string }) {
+  return (
+    <p role="status" className="w-full max-w-[80%] wrap-break-word text-xs text-muted-foreground">
+      {children}
+    </p>
+  );
 }
 
 export function TurnDeliveryNotice({
   delivery,
   providerLabel,
   waitingBehind,
+  recovery,
   onRetry,
   onDismiss,
   disabled,
 }: TurnDeliveryNoticeProps) {
+  if (delivery.state === "delivered" && recovery === "resending") {
+    return <MutedNotice>Sends again after the conversation is compacted.</MutedNotice>;
+  }
+  if (delivery.state === "delivered" && recovery === "resent") {
+    return <MutedNotice>Sent again after the conversation was compacted.</MutedNotice>;
+  }
   if (delivery.state === "delivered" && delivery.reason === "startedNewConversation") {
     return (
-      <p role="status" className="w-full max-w-[80%] wrap-break-word text-xs text-muted-foreground">
-        Sent in a new conversation with a summary of earlier messages.
-      </p>
+      <MutedNotice>Sent in a new conversation with a summary of earlier messages.</MutedNotice>
     );
   }
   if (delivery.state === "pending" && waitingBehind) {

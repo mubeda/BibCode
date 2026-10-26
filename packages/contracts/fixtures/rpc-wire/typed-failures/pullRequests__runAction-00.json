@@ -8,11 +8,11 @@
         "_tag": "Fail",
         "error": {
           "_tag": "PullRequestsOperationError",
-          "operation": "�",
-          "code": "v+\"QRQ 9]g",
+          "operation": "]v+\"",
+          "code": "9]gD-",
           "message": "",
-          "hostDetail": "-1",
-          "retryable": true
+          "hostDetail": "",
+          "retryable": false
         }
       }
     ]

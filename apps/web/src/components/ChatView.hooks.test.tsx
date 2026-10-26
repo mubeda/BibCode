@@ -206,6 +206,7 @@ vi.mock("../state/threads", () => ({
     respondToApproval: { key: "thread.respondToApproval" },
     respondToUserInput: { key: "thread.respondToUserInput" },
     revertCheckpoint: { key: "thread.revertCheckpoint" },
+    compact: { key: "thread.compact" },
   },
 }));
 
@@ -380,6 +381,8 @@ vi.mock("../keybindings", () => ({
   resolveShortcutCommand: (event: { key?: string }) =>
     typeof event.key === "string" ? (h.shortcutCommandByKey.get(event.key) ?? null) : null,
   shortcutLabelForCommand: () => h.shortcutLabel,
+  // Find in thread opens only for a resolved chat.find here; its fallback has its own tests.
+  shouldOpenChatFind: (command: string | null) => command === "chat.find",
 }));
 
 vi.mock("../commandPaletteContext", () => ({
@@ -764,6 +767,7 @@ function makeThread(overrides: Partial<Thread> = {}): Thread {
     interactionMode: "default",
     session: null,
     messages: [],
+    reasoning: [],
     proposedPlans: [],
     activities: [],
     checkpoints: [],
@@ -790,6 +794,7 @@ function makeActionablePlanThread(suffix: string): Thread {
       completedAt: later,
       assistantMessageId: null,
     },
+    reasoning: [],
     proposedPlans: [
       {
         id: OrchestrationProposedPlanId.make(`plan-${suffix}`),
@@ -4961,6 +4966,7 @@ describe("ChatView send flows", () => {
           completedAt: later,
           assistantMessageId: null,
         },
+        reasoning: [],
         proposedPlans: [
           {
             id: OrchestrationProposedPlanId.make("plan-1"),
@@ -5004,6 +5010,7 @@ describe("ChatView send flows", () => {
           completedAt: later,
           assistantMessageId: null,
         },
+        reasoning: [],
         proposedPlans: [
           {
             id: OrchestrationProposedPlanId.make("plan-1"),
@@ -5049,6 +5056,7 @@ describe("ChatView send flows", () => {
           completedAt: later,
           assistantMessageId: null,
         },
+        reasoning: [],
         proposedPlans: [
           {
             id: OrchestrationProposedPlanId.make("plan-1"),

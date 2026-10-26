@@ -1,0 +1,21 @@
+{
+  "_tag": "Exit",
+  "requestId": "900719925474099312345",
+  "exit": {
+    "_tag": "Failure",
+    "cause": [
+      {
+        "_tag": "Fail",
+        "error": {
+          "_tag": "PullRequestsOperationError",
+          "operation": "4294967295",
+          "code": "prototype",
+          "message": "UfX9) f$",
+          "hostDetail": null,
+          "retryable": false,
+          "retryAfterSeconds": 98
+        }
+      }
+    ]
+  }
+}

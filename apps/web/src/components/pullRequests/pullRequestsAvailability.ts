@@ -1,71 +1,41 @@
 import type { SupervisorConnectionState } from "@bibcode/client-runtime/connection";
 import type { ServerConfig, SourceControlProviderKind } from "@bibcode/contracts";
+import {
+  resolveRepositoryModuleAvailability,
+  resolveRepositoryModuleMutationsDisabledReason,
+  type RepositoryModuleAvailability,
+} from "../repositoryModule/repositoryModuleAvailability";
 
-export type PullRequestsAvailability =
-  | { readonly kind: "ready" }
-  | { readonly kind: "disabled_in_settings" }
-  | { readonly kind: "pending"; readonly reason: string }
-  | { readonly kind: "disconnected"; readonly reason: string }
-  | { readonly kind: "unsupported"; readonly missingCapability: "pullRequestsReads" };
+export type PullRequestsAvailability = RepositoryModuleAvailability<"pullRequestsReads">;
 
-function disconnectedReason(connectionState: SupervisorConnectionState): string {
-  switch (connectionState.phase) {
-    case "available":
-      return "This environment is disconnected.";
-    case "offline":
-      return "This environment is offline.";
-    case "backoff":
-      return connectionState.lastFailure?.message ?? "This environment is reconnecting.";
-    case "blocked":
-      return connectionState.lastFailure?.message ?? "This environment connection is blocked.";
-    case "connecting":
-    case "connected":
-      return "This environment is unavailable.";
-  }
-}
+export const PULL_REQUESTS_DISABLED_IN_SETTINGS_MESSAGE =
+  "Pull requests are turned off in Settings → Source Control.";
+
+/** What the Pull Requests module needs from the server, shared by every host of its views. */
+export const PULL_REQUESTS_CAPABILITIES = {
+  label: "Pull Requests",
+  readsCapability: "pullRequestsReads",
+  mutationsCapability: "pullRequestsMutations",
+  mutationsUnsupportedMessage: "This environment does not support Pull Requests actions.",
+} as const;
 
 export function resolvePullRequestsAvailability(
   connectionState: SupervisorConnectionState | null,
   serverConfig: ServerConfig | null,
   pullRequestsEnabled: boolean,
 ): PullRequestsAvailability {
-  if (!pullRequestsEnabled) return { kind: "disabled_in_settings" };
-  if (connectionState === null) {
-    return { kind: "pending", reason: "Waiting for the environment connection state." };
-  }
-  if (!connectionState.desired || connectionState.phase === "available") {
-    return { kind: "disconnected", reason: "This environment is disconnected." };
-  }
-  if (connectionState.phase === "connecting") {
-    return {
-      kind: "pending",
-      reason:
-        connectionState.stage === "synchronizing"
-          ? "This environment is synchronizing."
-          : "This environment is connecting.",
-    };
-  }
-  if (connectionState.phase !== "connected") {
-    return { kind: "disconnected", reason: disconnectedReason(connectionState) };
-  }
-  if (serverConfig === null) {
-    return { kind: "pending", reason: "Waiting for Pull Requests capabilities." };
-  }
-  if (serverConfig.environment.capabilities.pullRequestsReads !== true) {
-    return { kind: "unsupported", missingCapability: "pullRequestsReads" };
-  }
-  return { kind: "ready" };
+  return resolveRepositoryModuleAvailability(
+    PULL_REQUESTS_CAPABILITIES,
+    connectionState,
+    serverConfig,
+    pullRequestsEnabled,
+  );
 }
-
-export const PULL_REQUESTS_DISABLED_IN_SETTINGS_MESSAGE =
-  "Pull requests are turned off in Settings → Source Control.";
 
 export function resolvePullRequestsMutationsDisabledReason(
   serverConfig: ServerConfig | null,
 ): string | null {
-  return serverConfig?.environment.capabilities.pullRequestsMutations === true
-    ? null
-    : "This environment does not support Pull Requests actions.";
+  return resolveRepositoryModuleMutationsDisabledReason(PULL_REQUESTS_CAPABILITIES, serverConfig);
 }
 
 /**

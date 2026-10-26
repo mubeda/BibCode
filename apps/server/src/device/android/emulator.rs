@@ -1,10 +1,12 @@
 //! Emulator process lifecycle: spawn, gRPC discovery, boot wait, and stop.
 
 use std::{
+    collections::HashSet,
     ffi::OsString,
     net::{Ipv4Addr, TcpListener},
     path::{Path, PathBuf},
     process::ExitStatus,
+    sync::{Arc, Mutex, PoisonError},
     time::Duration,
 };
 
@@ -53,9 +55,49 @@ const ADB_MAX_OUTPUT_BYTES: usize = 4 * 1024;
 const SIZE_ATTEMPTS: u32 = 10;
 const SIZE_RETRY_DELAY: Duration = Duration::from_millis(500);
 
+/// How many OS-assigned ports a launch tries before giving up on a gRPC port no other
+/// launch of this server holds.
+const GRPC_PORT_ATTEMPTS: u32 = 16;
+
 pub(crate) struct EmulatorPorts {
     pub console: u16,
     pub grpc: u16,
+}
+
+/// The ports this backend handed to emulators that are launching or running, so two launches
+/// at once never pick the same pair; shared by every launch of one backend. Programs outside
+/// this server can still take a probed port first (see [`pick_ports`]).
+#[derive(Clone, Default)]
+pub(crate) struct PortReservations(Arc<Mutex<HashSet<u16>>>);
+
+impl PortReservations {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashSet<u16>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The ports held now, for the unix launcher tests.
+    #[cfg(all(test, unix))]
+    pub(crate) fn held(&self) -> Vec<u16> {
+        let mut held: Vec<u16> = self.lock().iter().copied().collect();
+        held.sort_unstable();
+        held
+    }
+}
+
+/// One launch's claim on its ports, given back when it drops: when its device ends, its
+/// launch fails, or it is cancelled.
+pub(crate) struct ReservedPorts {
+    ports: Vec<u16>,
+    reservations: PortReservations,
+}
+
+impl Drop for ReservedPorts {
+    fn drop(&mut self) {
+        let mut held = self.reservations.lock();
+        for port in &self.ports {
+            held.remove(port);
+        }
+    }
 }
 
 /// The emulator's arguments; the AVD name stays one argument and never meets a shell.
@@ -187,6 +229,8 @@ pub(crate) struct RunningEmulator {
     pub stderr: StderrTail,
     /// The task reading the stderr pipe into [`stderr`](Self::stderr).
     pub stderr_drain: Option<JoinHandle<()>>,
+    /// Held until [`stop`] has reaped the emulator.
+    pub ports: ReservedPorts,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -214,6 +258,8 @@ pub(crate) struct EmulatorLauncher {
     pub boot_timeout: Duration,
     /// A fixed gRPC port; `None` picks a free one. Tests pin the fake controller's port.
     pub grpc_port: Option<u16>,
+    /// The backend's ports in use, which `pick_ports` skips.
+    pub ports: PortReservations,
 }
 
 /// Why waiting for a boot ended without a running emulator.
@@ -236,6 +282,7 @@ impl EmulatorLauncher {
             software_gpu,
             boot_timeout: BOOT_TIMEOUT,
             grpc_port: None,
+            ports: PortReservations::default(),
         }
     }
 
@@ -247,7 +294,9 @@ impl EmulatorLauncher {
         on_phase: impl Fn(DeviceState) + Send,
         cancel: &CancellationToken,
     ) -> Result<RunningEmulator, LaunchError> {
-        let ports = pick_ports(self.grpc_port).map_err(LaunchError::Spawn)?;
+        // Dropped with the launch on every failure, and with the emulator once it stops.
+        let (ports, reserved) =
+            pick_ports(self.grpc_port, &self.ports).map_err(LaunchError::Spawn)?;
         let mut command = CommandWrap::with_new(&self.sdk.emulator, |command| {
             command
                 .args(spawn_args(avd, &ports, self.software_gpu))
@@ -314,6 +363,7 @@ impl EmulatorLauncher {
                     discovery_file: discovery_file.expect("a booted emulator was discovered"),
                     stderr,
                     stderr_drain: drain,
+                    ports: reserved,
                 });
             }
             Err(Some(BootFailure::Exited(status))) => {
@@ -434,6 +484,7 @@ pub(crate) async fn stop(running: RunningEmulator) -> Option<String> {
         discovery_file,
         stderr,
         stderr_drain,
+        ports,
         ..
     } = running;
     // Read before the stop is noted: only an exit that came first is unrequested.
@@ -451,6 +502,8 @@ pub(crate) async fn stop(running: RunningEmulator) -> Option<String> {
     let pid = helper.pid;
     helper.terminate().await;
     remove_discovery_file(&discovery_file);
+    // The emulator is gone, so a new launch may take its ports.
+    drop(ports);
     let status = unrequested?;
     // The pipe ends once the whole process group is gone, which `terminate` waited for.
     if let Some(drain) = stderr_drain {
@@ -466,27 +519,57 @@ pub(crate) async fn stop(running: RunningEmulator) -> Option<String> {
     tail
 }
 
-/// The first even console port whose adb neighbour is also free on loopback, and `grpc`
-/// or else an OS-assigned gRPC port.
+/// The first even console port whose adb neighbour is also free on loopback and that no
+/// other launch of this backend holds, and `grpc` or else an OS-assigned gRPC port no other
+/// launch holds. The picked ports are reserved until the returned claim drops; a fixed `grpc`
+/// is used as given.
 ///
 /// The ports are probed and released before the emulator binds them (time of check to
-/// time of use): another server on this host, or an emulator started at the same moment,
-/// can take one first. The emulator then exits, the device fails with that reason, and a
-/// new start probes again; there is no automatic retry.
-fn pick_ports(grpc: Option<u16>) -> Result<EmulatorPorts, String> {
+/// time of use): another program on this host, such as another server or an emulator the user
+/// started, can take one first. The emulator then exits, the device fails with that reason,
+/// and a new start probes again; there is no automatic retry.
+fn pick_ports(
+    grpc: Option<u16>,
+    reservations: &PortReservations,
+) -> Result<(EmulatorPorts, ReservedPorts), String> {
     let free = |port: u16| TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok();
+    // Held across the probes, so a concurrent launch waits and then skips these ports.
+    let mut held = reservations.lock();
     let console = CONSOLE_PORTS
         .step_by(2)
-        .find(|port| free(*port) && free(port + 1))
+        .find(|port| {
+            !held.contains(port) && !held.contains(&(port + 1)) && free(*port) && free(port + 1)
+        })
         .ok_or_else(|| "every emulator console port is in use".to_owned())?;
+    let mut ports = vec![console, console + 1];
     let grpc = match grpc {
         Some(port) => port,
-        None => TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-            .and_then(|listener| listener.local_addr())
-            .map_err(|error| format!("no free gRPC port: {error}"))?
-            .port(),
+        None => {
+            let mut picked = None;
+            for _ in 0..GRPC_PORT_ATTEMPTS {
+                let port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                    .and_then(|listener| listener.local_addr())
+                    .map_err(|error| format!("no free gRPC port: {error}"))?
+                    .port();
+                if !held.contains(&port) && !ports.contains(&port) {
+                    picked = Some(port);
+                    break;
+                }
+            }
+            let port = picked.ok_or_else(|| "no free gRPC port".to_owned())?;
+            ports.push(port);
+            port
+        }
     };
-    Ok(EmulatorPorts { console, grpc })
+    held.extend(ports.iter().copied());
+    drop(held);
+    Ok((
+        EmulatorPorts { console, grpc },
+        ReservedPorts {
+            ports,
+            reservations: reservations.clone(),
+        },
+    ))
 }
 
 /// The natural panel size and the orientation booted in, from the first screenshot
@@ -701,6 +784,59 @@ mod tests {
         );
         assert!(!process_alive(pid));
         assert!(!discovery_file.exists());
+    }
+
+    /// Two launches at once of one backend get different console ports (each also takes the
+    /// adb port after it), which come free again once both emulators stop.
+    #[tokio::test]
+    async fn concurrent_launches_get_different_ports_until_they_stop() {
+        let controller = FakeController::spawn().await;
+        let sdk = FakeSdk::new()
+            .avds(&["Pixel", "Tablet"])
+            .launch_stub(LaunchStub::Runs {
+                grpc_port: controller.port,
+                token: "test-token",
+            })
+            .boot_completed_after(2)
+            .write();
+        let reservations = PortReservations::default();
+        let mut first = sdk.launcher();
+        first.ports = reservations.clone();
+        let mut second = sdk.launcher();
+        second.ports = reservations.clone();
+        let cancel = CancellationToken::new();
+        let (pixel, tablet) = tokio::join!(
+            first.launch("Pixel", |_| {}, &cancel),
+            second.launch("Tablet", |_| {}, &cancel),
+        );
+        let (pixel, tablet) = (pixel.unwrap(), tablet.unwrap());
+        assert_ne!(pixel.serial, tablet.serial);
+        // Two console and adb pairs; the fixed gRPC port of the fake controller is not taken.
+        assert_eq!(reservations.held().len(), 4, "{:?}", reservations.held());
+        controller.exit_on_shutdown(pixel.helper.pid);
+        controller.exit_on_shutdown(tablet.helper.pid);
+        stop(pixel).await;
+        assert_eq!(reservations.held().len(), 2);
+        stop(tablet).await;
+        assert!(reservations.held().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failed_launch_gives_its_ports_back() {
+        let sdk = FakeSdk::new()
+            .avds(&["Pixel"])
+            .launch_stub(LaunchStub::ExitsWith(1, "PANIC: Missing emulator engine"))
+            .write();
+        let mut launcher = sdk.launcher();
+        let reservations = PortReservations::default();
+        launcher.ports = reservations.clone();
+        assert!(matches!(
+            launcher
+                .launch("Pixel", |_| {}, &CancellationToken::new())
+                .await,
+            Err(LaunchError::Exited(_))
+        ));
+        assert!(reservations.held().is_empty());
     }
 
     /// An AVD restored from a Quick Boot snapshot saved turned boots with its first

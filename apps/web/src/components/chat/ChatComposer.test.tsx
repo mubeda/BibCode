@@ -365,6 +365,7 @@ import {
   INLINE_TERMINAL_CONTEXT_PLACEHOLDER,
   type TerminalContextDraft,
 } from "../../lib/terminalContext";
+import type { ComposerCommandKey } from "../ComposerPromptEditor";
 import type { ElementContextDraft } from "../../lib/elementContext";
 import type { ReviewCommentContext } from "../../reviewCommentContext";
 import type { PendingApproval, PendingUserInput } from "../../session-logic";
@@ -386,6 +387,7 @@ const STATE = {
   primaryActionsCompact: 6,
   modelPickerOpen: 7,
   focused: 8,
+  dismissedTrigger: 9,
 } as const;
 
 // ---------------------------------------------------------------------------
@@ -608,6 +610,7 @@ function makeThread(overrides: Partial<Thread> = {}): Thread {
     interactionMode: "default",
     session: null,
     messages: [],
+    reasoning: [],
     proposedPlans: [],
     activities: [],
     checkpoints: [],
@@ -785,6 +788,7 @@ function makeSpies() {
     scheduleComposerFocus: vi.fn(),
     setThreadError: vi.fn(),
     onExpandImage: vi.fn(),
+    onPageTimeline: vi.fn(),
   };
 }
 
@@ -867,6 +871,7 @@ function renderComposer(overrides: Partial<ChatComposerProps> = {}): RenderResul
     scheduleComposerFocus: spies.scheduleComposerFocus,
     setThreadError: spies.setThreadError,
     onExpandImage: spies.onExpandImage,
+    onPageTimeline: spies.onPageTimeline,
     ...overrides,
   };
   h.stateIndex = 0;
@@ -901,10 +906,12 @@ type PromptChange = (
   terminalContextIds: string[],
 ) => void;
 
-type CommandKey = (key: "ArrowDown" | "ArrowUp" | "Enter" | "Tab", event: KeyboardEvent) => boolean;
+type CommandKey = (key: ComposerCommandKey, event: KeyboardEvent) => boolean;
 
-function keyEvent(overrides: Partial<{ shiftKey: boolean }> = {}): KeyboardEvent {
-  return { shiftKey: false, ...overrides } as unknown as KeyboardEvent;
+function keyEvent(
+  overrides: Partial<{ shiftKey: boolean; altKey: boolean; repeat: boolean }> = {},
+): KeyboardEvent {
+  return { shiftKey: false, repeat: false, ...overrides } as unknown as KeyboardEvent;
 }
 
 function setEditorSnapshot(value: string, cursor: number, terminalContextIds: string[] = []): void {
@@ -1215,6 +1222,24 @@ describe("ChatComposer rendering", () => {
     ).props;
     expect(picker["hidden"]).toBe(true);
     expect(picker["disabled"]).toBe(true);
+  });
+
+  it("puts the History slot first in the footer's right group", () => {
+    const { markup } = renderComposer({ historyMenu: <span data-history-menu="true" /> });
+    expect(markup).toContain('data-history-menu="true"');
+    expect(markup.indexOf('data-history-menu="true"')).toBeLessThan(
+      markup.indexOf('aria-label="Attach files"'),
+    );
+  });
+
+  it("leaves History out of the approval footer", () => {
+    const { markup } = renderComposer({
+      historyMenu: <span data-history-menu="true" />,
+      activePendingApproval: pendingApproval,
+      pendingApprovals: [pendingApproval],
+    });
+    expect(markup).toContain('data-mock="ComposerPendingApprovalActions"');
+    expect(markup).not.toContain("data-history-menu");
   });
 
   it("falls back to the generic approval placeholder without a detail", () => {
@@ -2088,6 +2113,14 @@ describe("ChatComposer menu selection", () => {
     expect(draftOf(threadRef)?.prompt).toBe("/review ");
   });
 
+  it("completes a slash command typed mid-prompt in place (#152)", () => {
+    const { onSelect, items } = renderCommandMenu("review this diff, then run /rev");
+
+    onSelect(items.find((item) => item["id"] === "provider-command:codex:review")!);
+
+    expect(draftOf(threadRef)?.prompt).toBe("review this diff, then run /review ");
+  });
+
   it("inserts skill references with a trailing space", () => {
     seedPrompt("$ref");
     renderComposer();
@@ -2167,6 +2200,29 @@ describe("ChatComposer menu selection", () => {
 // ---------------------------------------------------------------------------
 
 describe("ChatComposer command keys", () => {
+  // The editor offers a page key only once the draft has no use for it (ComposerPromptEditor).
+  it("pages the timeline with an offered page key", () => {
+    const { spies } = renderComposer();
+    const onKey = editorProps()["onCommandKeyDown"] as CommandKey;
+
+    expect(onKey("PageUp", keyEvent())).toBe(true);
+    expect(onKey("PageDown", keyEvent({ repeat: true }))).toBe(true);
+    expect(spies.onPageTimeline.mock.calls).toEqual([
+      ["PageUp", false],
+      ["PageDown", true],
+    ]);
+  });
+
+  it("leaves a page key with a modifier to the editor and the browser", () => {
+    const { spies } = renderComposer();
+    const onKey = editorProps()["onCommandKeyDown"] as CommandKey;
+
+    // Shift extends the selection.
+    expect(onKey("PageUp", keyEvent({ shiftKey: true }))).toBe(false);
+    expect(onKey("PageDown", keyEvent({ altKey: true }))).toBe(false);
+    expect(spies.onPageTimeline).not.toHaveBeenCalled();
+  });
+
   it("toggles interaction mode on Shift+Tab", () => {
     const { spies } = renderComposer();
     const onKey = editorProps()["onCommandKeyDown"] as CommandKey;
@@ -2271,6 +2327,110 @@ describe("ChatComposer command keys", () => {
       }
     },
   );
+
+  it("closes a slash menu with Escape, so Enter then sends (#152)", () => {
+    seedPrompt("run /usr");
+    const { spies } = renderComposer();
+    expect(filterCaptures("ComposerCommandMenu")).toHaveLength(1);
+    setEditorSnapshot("run /usr", 8);
+    const onKey = editorProps()["onCommandKeyDown"] as CommandKey;
+
+    expect(onKey("Escape", keyEvent())).toBe(true);
+    expect(setStateValues(STATE.dismissedTrigger)).toContainEqual({
+      kind: "provider-slash",
+      rangeStart: 4,
+      query: "usr",
+    });
+    // Before the menu re-renders closed, Enter already sends instead of picking an item.
+    expect(onKey("Enter", keyEvent())).toBe(true);
+    expect(spies.onSend).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps a dismissed menu closed for that token and leaves Escape to the page", () => {
+    seedPrompt("run /usr/bin");
+    h.stateSeeds.set(STATE.dismissedTrigger, {
+      kind: "provider-slash",
+      rangeStart: 4,
+      query: "usr",
+    });
+    renderComposer();
+    expect(filterCaptures("ComposerCommandMenu")).toHaveLength(0);
+    // Typing on is the same token; its query is followed so a later replacement shows.
+    expect(setStateValues(STATE.dismissedTrigger)).toEqual([
+      { kind: "provider-slash", rangeStart: 4, query: "usr/bin" },
+    ]);
+    setEditorSnapshot("run /usr/bin", 12);
+    const onKey = editorProps()["onCommandKeyDown"] as CommandKey;
+
+    expect(onKey("Escape", keyEvent())).toBe(false);
+    expect(onKey("ArrowDown", keyEvent())).toBe(false);
+  });
+
+  it("opens the menu again for a new slash token after a dismissal", () => {
+    seedPrompt("run /usr then /rev");
+    h.stateSeeds.set(STATE.dismissedTrigger, {
+      kind: "provider-slash",
+      rangeStart: 4,
+      query: "usr",
+    });
+    renderComposer();
+
+    expect(setStateValues(STATE.dismissedTrigger)).toContain(null);
+    expect(filterCaptures("ComposerCommandMenu")).toHaveLength(1);
+  });
+
+  it("keeps the menu closed for a path typed after Escape on a bare slash", () => {
+    seedPrompt("/usr");
+    h.stateSeeds.set(STATE.dismissedTrigger, { kind: "provider-slash", rangeStart: 0, query: "" });
+    renderComposer();
+
+    expect(filterCaptures("ComposerCommandMenu")).toHaveLength(0);
+    expect(setStateValues(STATE.dismissedTrigger)).toEqual([
+      { kind: "provider-slash", rangeStart: 0, query: "usr" },
+    ]);
+  });
+
+  it("opens the menu again when the dismissed token is replaced at the same place (#152)", () => {
+    // `/usr` dismissed, then selected and pasted over with `/rev`.
+    seedPrompt("/rev");
+    h.stateSeeds.set(STATE.dismissedTrigger, {
+      kind: "provider-slash",
+      rangeStart: 0,
+      query: "usr",
+    });
+    renderComposer();
+
+    expect(setStateValues(STATE.dismissedTrigger)).toContain(null);
+    expect(filterCaptures("ComposerCommandMenu")).toHaveLength(1);
+  });
+
+  it("starts over when the dismissed token is cut back to its slash (#152)", () => {
+    // `/usr` dismissed, then selected and typed over: the first key leaves a bare `/`.
+    seedPrompt("/");
+    h.stateSeeds.set(STATE.dismissedTrigger, {
+      kind: "provider-slash",
+      rangeStart: 0,
+      query: "usr",
+    });
+    renderComposer();
+    setEditorSnapshot("/", 1);
+    const onKey = editorProps()["onCommandKeyDown"] as CommandKey;
+
+    expect(setStateValues(STATE.dismissedTrigger)).toContain(null);
+    expect(filterCaptures("ComposerCommandMenu")).toHaveLength(1);
+    // Before the menu re-renders open, Escape closes it again rather than leaving it to the page.
+    expect(onKey("Escape", keyEvent())).toBe(true);
+  });
+
+  it("leaves Escape to the page when no menu is open", () => {
+    seedPrompt("send me");
+    renderComposer();
+    setEditorSnapshot("send me", 7);
+    const onKey = editorProps()["onCommandKeyDown"] as CommandKey;
+
+    expect(onKey("Escape", keyEvent())).toBe(false);
+    expect(setStateValues(STATE.dismissedTrigger)).toHaveLength(0);
+  });
 
   it("submits on Enter without an active menu", () => {
     seedPrompt("send me");

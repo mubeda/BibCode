@@ -10,6 +10,8 @@
  * the tab and unarchives the thread. Archived panel threads are hidden from
  * Settings → Archived and are deleted with their host thread. Terminal panels
  * just register a surface — the terminal is attach-created lazily by the view.
+ * History continues a Claude Code terminal session in a panel the server
+ * creates (`agentSessions.openInPanel`), whose tab becomes active once it does.
  */
 import { scopeThreadRef } from "@bibcode/client-runtime/environment";
 import {
@@ -17,6 +19,9 @@ import {
   squashAtomCommandFailure,
 } from "@bibcode/client-runtime/state/runtime";
 import type {
+  AgentSessionOpenInPanelResult,
+  AgentSessionOpenMode,
+  CommandId,
   EnvironmentId,
   ModelSelection,
   ProjectId,
@@ -30,6 +35,7 @@ import { stackedThreadToast, toastManager } from "~/components/ui/toast";
 import { useCenterPanelStore, type CenterSurface } from "~/centerPanelStore";
 import { newCommandId, newThreadId } from "~/lib/utils";
 import { readThreadShell } from "~/state/entities";
+import { projectEnvironment } from "~/state/projects";
 import { threadEnvironment } from "~/state/threads";
 import { useAtomCommand } from "~/state/use-atom-command";
 import { worktreeEnvironment } from "~/state/worktrees";
@@ -47,13 +53,57 @@ export interface CreateChatPanelInput {
   readonly providerLabel: string;
 }
 
-export interface CenterPanelActions {
-  createChatPanel: (input: CreateChatPanelInput) => Promise<ThreadId | null>;
+/** A Claude Code terminal session History continues in a chat panel. */
+export interface OpenSessionPanelInput {
+  readonly sessionId: string;
+  readonly mode: AgentSessionOpenMode;
+  /** The session's title, which its tab shows. */
+  readonly title: string;
+}
+
+/**
+ * The command of each History open whose outcome is not known, by environment, host, session and
+ * mode. A retry after a dropped connection sends the same command, so the server answers with
+ * the thread the first attempt made (a copy's session ID derives from the command) instead of
+ * making another copy. A success or the server's own refusal settles the open.
+ */
+const unsettledSessionOpens = new Map<string, CommandId>();
+
+/** A failure the server decided, as opposed to a request that may not have reached it. */
+const isServerRefusal = (error: unknown): boolean =>
+  typeof error === "object" &&
+  error !== null &&
+  (error as { readonly _tag?: unknown })._tag === "AgentSessionsError";
+
+export interface PanelThreadOpener {
   reopenChatPanel: (
     hostRef: ScopedThreadRef,
     threadId: ThreadId,
     providerLabel: string,
   ) => Promise<void>;
+  /**
+   * Makes a panel thread of `hostRef` the active tab: reopens it when it was closed, else
+   * activates its tab. `archived` says which, when known; otherwise the thread's shell does.
+   */
+  openPanelThread: (
+    hostRef: ScopedThreadRef,
+    threadId: ThreadId,
+    label: string,
+    archived?: boolean,
+  ) => Promise<void>;
+}
+
+export interface CenterPanelActions extends PanelThreadOpener {
+  createChatPanel: (input: CreateChatPanelInput) => Promise<ThreadId | null>;
+  /**
+   * Continues a terminal session in a chat panel of `hostRef`, which becomes the active tab when
+   * the panel is `hostRef`'s. Resolves where the session landed, or `null` once a failure was
+   * shown. Closing the History menu does not stop it.
+   */
+  openSessionPanel: (
+    hostRef: ScopedThreadRef,
+    input: OpenSessionPanelInput,
+  ) => Promise<AgentSessionOpenInPanelResult | null>;
   activateSurface: (hostRef: ScopedThreadRef, groupId: string, surfaceId: string) => void;
   closeSurface: (hostRef: ScopedThreadRef, groupId: string, surface: CenterSurface) => void;
   closeOtherSurfaces: (hostRef: ScopedThreadRef, groupId: string, surface: CenterSurface) => void;
@@ -68,13 +118,67 @@ export interface CenterPanelActionsOptions {
   ) => void;
 }
 
+/** Reopening and activating panel threads, for the chat view and the Import dialog. */
+export function usePanelThreadOpener(): PanelThreadOpener {
+  const unarchiveThread = useAtomCommand(threadEnvironment.unarchive, { reportFailure: false });
+
+  const reopenChatPanel = useCallback(
+    async (hostRef: ScopedThreadRef, threadId: ThreadId, providerLabel: string): Promise<void> => {
+      const environmentId = hostRef.environmentId;
+      useCenterPanelStore.getState().reserveChatPanel(hostRef, threadId, providerLabel);
+      const result = await unarchiveThread({ environmentId, input: { threadId } });
+      if (result._tag === "Success" || isAtomCommandInterrupted(result)) return;
+      const panelRef = scopeThreadRef(environmentId, threadId);
+      // Another client reopened it first: the tab is valid and adoption already tracks it.
+      if (readThreadShell(panelRef)?.archivedAt === null) {
+        useCenterPanelStore.getState().releaseChatPanelReservation(panelRef);
+        return;
+      }
+      useCenterPanelStore.getState().removeThread(panelRef);
+      const error = squashAtomCommandFailure(result);
+      toastManager.add(
+        stackedThreadToast({
+          type: "error",
+          title: "Failed to reopen chat panel",
+          description: error instanceof Error ? error.message : "An error occurred.",
+        }),
+      );
+    },
+    [unarchiveThread],
+  );
+
+  const openPanelThread = useCallback(
+    async (
+      hostRef: ScopedThreadRef,
+      threadId: ThreadId,
+      label: string,
+      archived?: boolean,
+    ): Promise<void> => {
+      const closed =
+        archived ??
+        readThreadShell(scopeThreadRef(hostRef.environmentId, threadId))?.archivedAt !== null;
+      if (closed) {
+        await reopenChatPanel(hostRef, threadId, label);
+        return;
+      }
+      useCenterPanelStore.getState().openChatPanel(hostRef, threadId, label);
+    },
+    [reopenChatPanel],
+  );
+
+  return { reopenChatPanel, openPanelThread };
+}
+
 export function useCenterPanelActions({
   onCloseTerminal,
 }: CenterPanelActionsOptions): CenterPanelActions {
   const createPanel = useAtomCommand(worktreeEnvironment.createPanel, { reportFailure: false });
   const archiveThread = useAtomCommand(threadEnvironment.archive, { reportFailure: false });
-  const unarchiveThread = useAtomCommand(threadEnvironment.unarchive, { reportFailure: false });
   const interruptTurn = useAtomCommand(threadEnvironment.interruptTurn, { reportFailure: false });
+  const openInPanel = useAtomCommand(projectEnvironment.openAgentSessionInPanel, {
+    reportFailure: false,
+  });
+  const { reopenChatPanel, openPanelThread } = usePanelThreadOpener();
 
   const archivePanelThread = useCallback(
     async (environmentId: EnvironmentId, threadId: ThreadId) => {
@@ -145,29 +249,56 @@ export function useCenterPanelActions({
     [createPanel],
   );
 
-  const reopenChatPanel = useCallback(
-    async (hostRef: ScopedThreadRef, threadId: ThreadId, providerLabel: string): Promise<void> => {
-      const environmentId = hostRef.environmentId;
-      useCenterPanelStore.getState().reserveChatPanel(hostRef, threadId, providerLabel);
-      const result = await unarchiveThread({ environmentId, input: { threadId } });
-      if (result._tag === "Success" || isAtomCommandInterrupted(result)) return;
-      const panelRef = scopeThreadRef(environmentId, threadId);
-      // Another client reopened it first: the tab is valid and adoption already tracks it.
-      if (readThreadShell(panelRef)?.archivedAt === null) {
-        useCenterPanelStore.getState().releaseChatPanelReservation(panelRef);
-        return;
+  const openSessionPanel = useCallback(
+    async (
+      hostRef: ScopedThreadRef,
+      input: OpenSessionPanelInput,
+    ): Promise<AgentSessionOpenInPanelResult | null> => {
+      const openKey = JSON.stringify([
+        hostRef.environmentId,
+        hostRef.threadId,
+        input.sessionId,
+        input.mode,
+      ]);
+      const commandId = unsettledSessionOpens.get(openKey) ?? newCommandId();
+      unsettledSessionOpens.set(openKey, commandId);
+      const result = await openInPanel({
+        environmentId: hostRef.environmentId,
+        input: {
+          commandId,
+          hostThreadId: hostRef.threadId,
+          sessionId: input.sessionId,
+          mode: input.mode,
+        },
+      });
+      if (result._tag === "Failure") {
+        if (!isAtomCommandInterrupted(result)) {
+          const error = squashAtomCommandFailure(result);
+          if (isServerRefusal(error)) {
+            unsettledSessionOpens.delete(openKey);
+          }
+          toastManager.add(
+            stackedThreadToast({
+              type: "error",
+              title: "Couldn't open the session",
+              description: error instanceof Error ? error.message : "An error occurred.",
+            }),
+          );
+        }
+        return null;
       }
-      useCenterPanelStore.getState().removeThread(panelRef);
-      const error = squashAtomCommandFailure(result);
-      toastManager.add(
-        stackedThreadToast({
-          type: "error",
-          title: "Failed to reopen chat panel",
-          description: error instanceof Error ? error.message : "An error occurred.",
-        }),
-      );
+      unsettledSessionOpens.delete(openKey);
+      const opened = result.value;
+      if (opened.hostThreadId === hostRef.threadId) {
+        if (opened.outcome === "created") {
+          useCenterPanelStore.getState().openChatPanel(hostRef, opened.threadId, input.title);
+        } else {
+          await openPanelThread(hostRef, opened.threadId, input.title);
+        }
+      }
+      return opened;
     },
-    [unarchiveThread],
+    [openInPanel, openPanelThread],
   );
 
   const cleanupRemoved = useCallback(
@@ -234,6 +365,8 @@ export function useCenterPanelActions({
   return {
     createChatPanel,
     reopenChatPanel,
+    openPanelThread,
+    openSessionPanel,
     activateSurface,
     closeSurface,
     closeOtherSurfaces,

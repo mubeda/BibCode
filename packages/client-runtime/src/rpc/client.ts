@@ -64,6 +64,7 @@ export type EnvironmentSubscriptionRpcTag =
   | typeof WS_METHODS.subscribeGitManagerSignal
   | typeof WS_METHODS.subscribeWorktreeCatalog
   | typeof WS_METHODS.pullRequestsSubscribe
+  | typeof WS_METHODS.pipelinesSubscribe
   | typeof WS_METHODS.previewAutomationConnect
   | typeof WS_METHODS.subscribeVcsStatus
   | typeof WS_METHODS.subscribeVcsStatusSummary

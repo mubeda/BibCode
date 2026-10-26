@@ -65,7 +65,10 @@ import {
 
 const h = vi.hoisted(() => {
   return {
+    openThreadFindTargets: [] as Array<EventTarget | null>,
     captured: {} as Record<string, unknown>,
+    /** The list the mocked timeline hands ChatView through `listRef`, as LegendList does. */
+    timelineList: null as unknown,
     atomValuesByKey: new Map<string, unknown>(),
     commandCalls: [] as Array<{ key: string; input: unknown }>,
     commandHandlers: new Map<string, (input: unknown) => Promise<unknown>>(),
@@ -118,13 +121,13 @@ const h = vi.hoisted(() => {
     activityStateTargets: [] as unknown[],
     activityAtomTargets: [] as Array<{ kind: string; target: unknown }>,
     atomRefreshCalls: [] as string[],
-    scopedProjectKeyCalls: [] as unknown[],
     activityDockRenderProps: [] as unknown[],
     activityPanelRenderProps: [] as unknown[],
     environmentSettingsById: new Map<string, Record<string, unknown>>(),
     settingsListeners: new Set<() => void>(),
     centerHeaderDensityByGroupId: new Map<string, "expanded" | "compact">(),
     chatHeaderActionsInstanceCount: 0,
+    messagesTimelineInstanceCount: 0,
   };
 });
 
@@ -175,6 +178,7 @@ vi.mock("../state/threads", () => ({
     respondToApproval: { key: "thread.respondToApproval" },
     respondToUserInput: { key: "thread.respondToUserInput" },
     revertCheckpoint: { key: "thread.revertCheckpoint" },
+    compact: { key: "thread.compact" },
   },
 }));
 
@@ -417,17 +421,6 @@ vi.mock("@effect/atom-react", async (importOriginal) => {
   };
 });
 
-vi.mock("@bibcode/client-runtime/environment", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("@bibcode/client-runtime/environment")>();
-  return {
-    ...actual,
-    scopedProjectKey: (ref: unknown) => {
-      h.scopedProjectKeyCalls.push(ref);
-      return actual.scopedProjectKey(ref as Parameters<typeof actual.scopedProjectKey>[0]);
-    },
-  };
-});
-
 vi.mock("@tanstack/react-router", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@tanstack/react-router")>();
   return {
@@ -460,9 +453,21 @@ vi.mock("./chat/ChatComposer", () => ({
   },
 }));
 
+vi.mock("./chat/threadFind/useThreadFind", () => ({
+  openThreadFindForTarget: (target: EventTarget | null) => {
+    h.openThreadFindTargets.push(target);
+    return true;
+  },
+}));
+
 vi.mock("./chat/MessagesTimeline", () => ({
   MessagesTimeline: (props: Record<string, unknown>) => {
     h.captured["messagesTimeline"] = props;
+    // A new instance is a new find session: its query and selection start over.
+    useState(() => ++h.messagesTimelineInstanceCount);
+    if (h.timelineList !== null) {
+      (props["listRef"] as { current: unknown }).current = h.timelineList;
+    }
     return (
       <div
         data-mock="messages-timeline"
@@ -724,7 +729,6 @@ import { useRightPanelStore } from "../rightPanelStore";
 import { HOST_SURFACE_ID, useCenterPanelStore } from "../centerPanelStore";
 import { useUiStateStore } from "../uiStateStore";
 import { useDiffPanelStore } from "../diffPanelStore";
-import { useActivityDockStore } from "../activityDockStore";
 import { newDraftId } from "../lib/utils";
 import type { ProviderInstanceEntry } from "../providerInstances";
 import type { ChatComposerHandle } from "./chat/ChatComposer";
@@ -785,6 +789,7 @@ function makeThread(overrides: Partial<Thread> = {}): Thread {
     interactionMode: "default",
     session: null,
     messages: [],
+    reasoning: [],
     proposedPlans: [],
     activities: [],
     checkpoints: [],
@@ -947,7 +952,6 @@ const resettableStores: ReadonlyArray<{ store: ResettableStore; pristine: object
   useCenterPanelStore,
   useUiStateStore,
   useDiffPanelStore,
-  useActivityDockStore,
 ].map((store) => ({
   store: store as unknown as ResettableStore,
   pristine: { ...(store as unknown as ResettableStore).getInitialState() },
@@ -965,7 +969,9 @@ function publishSeededStoreState(store: unknown): void {
 
 beforeEach(() => {
   attachmentAdmissionOwner.dispose();
+  h.openThreadFindTargets.length = 0;
   h.captured = {};
+  h.timelineList = null;
   h.atomValuesByKey.clear();
   h.atomValuesByKey.set("atom:keybindings", []);
   h.atomValuesByKey.set("atom:editors", []);
@@ -1018,13 +1024,13 @@ beforeEach(() => {
   h.activityStateTargets = [];
   h.activityAtomTargets = [];
   h.atomRefreshCalls = [];
-  h.scopedProjectKeyCalls = [];
   h.activityDockRenderProps = [];
   h.activityPanelRenderProps = [];
   h.environmentSettingsById.clear();
   h.settingsListeners.clear();
   h.centerHeaderDensityByGroupId.clear();
   h.chatHeaderActionsInstanceCount = 0;
+  h.messagesTimelineInstanceCount = 0;
 
   for (const { store, pristine } of resettableStores) {
     store.setState({ ...pristine }, true);
@@ -1284,16 +1290,11 @@ describe("ChatView", () => {
     };
 
     const openSubagents = async (container: HTMLDivElement): Promise<void> => {
-      const expand = container.querySelector<HTMLButtonElement>(
-        'button[aria-label^="Expand activity summary"]',
+      const pill = container.querySelector<HTMLButtonElement>(
+        'button[aria-label^="Open Activity: Subagents"]',
       );
-      expect(expand).not.toBeNull();
-      await click(expand!);
-      const subagents = container.querySelector<HTMLButtonElement>(
-        '[data-activity-section="subagents"]',
-      );
-      expect(subagents).not.toBeNull();
-      await click(subagents!);
+      expect(pill).not.toBeNull();
+      await click(pill!);
       await vi.waitFor(() => {
         expect(container.querySelector("[data-activity-panel]")).not.toBeNull();
       });
@@ -2253,18 +2254,37 @@ describe("ChatView", () => {
       seedServerThread(makeThread());
       seedGitStatus(true);
       seedActivityState(environmentId, snapshot.scope, snapshot);
-      useActivityDockStore.getState().setExpanded(`${environmentId}:${projectId}`, true);
-      publishSeededStoreState(useActivityDockStore);
 
       const markup = renderServerRoute();
 
-      expect(markup).not.toContain('aria-label="Activity data stale"');
-      expect(markup.match(/data-activity-section-status="stale"/g)).toHaveLength(1);
+      expect(markup.match(/data-activity-status="stale"/g)).toHaveLength(1);
       expect(markup).toContain(
-        'aria-label="Open Background tasks: 1 active, 0 done. Status: stale"',
+        'aria-label="Open Activity: Subagents 1 active, 0 done; Background tasks 1 active, 0 done. Status: stale"',
       );
-      expect(markup).toContain('aria-label="Open Subagents: 1 active, 0 done"');
-      expect(markup).not.toContain('aria-label="Open Subagents: 1 active, 0 done. Status: stale"');
+    });
+
+    it("shows the idle Activity button before any record unless the setting is off", () => {
+      const snapshot = activitySnapshot({ _tag: "thread", threadId }, [], {
+        counts: {
+          subagents: { active: 0, done: 0 },
+          backgroundTasks: { active: 0, done: 0 },
+        },
+      });
+      seedEnvironment(makeEnvironmentPresentation());
+      seedProject(makeProject());
+      seedServerThread(makeThread());
+      seedGitStatus(true);
+      seedActivityState(environmentId, snapshot.scope, snapshot);
+
+      const markup = renderServerRoute();
+      expect(markup).toContain('data-testid="activity-dock"');
+      expect(markup).toContain('data-activity-idle="true"');
+      expect((h.activityDockRenderProps.at(-1) as { alwaysVisible: boolean }).alwaysVisible).toBe(
+        true,
+      );
+
+      h.settings = { ...h.settings, activityDockAlwaysVisible: false };
+      expect(renderServerRoute()).not.toContain('data-testid="activity-dock"');
     });
 
     it("retains a failed snapshot and retries the source state atom", async () => {
@@ -2712,45 +2732,6 @@ describe("ChatView", () => {
       }
     });
 
-    it("consumes the first sheet Escape by collapsing the project dock, then releases close", async () => {
-      const child = actor("actor-sheet-escape", "Sheet escape reviewer");
-      const snapshot = activitySnapshot({ _tag: "thread", threadId }, [child]);
-      seedEnvironment(makeEnvironmentPresentation());
-      seedProject(makeProject());
-      seedServerThread(makeThread());
-      seedGitStatus(true);
-      seedActivityState(environmentId, snapshot.scope, snapshot);
-      seedActivityQueries(environmentId, snapshot, [child]);
-      h.compactDesktop = true;
-      h.compactActivityDock = true;
-      useRightPanelStore.getState().openActivity(threadRef, "subagents", { _tag: "thread" });
-      useActivityDockStore.getState().setExpanded(`${environmentId}:${projectId}`, true);
-      publishSeededStoreState(useRightPanelStore);
-      publishSeededStoreState(useActivityDockStore);
-
-      const { container, root } = await mountActivityRoute();
-      try {
-        expect(container.querySelector('[data-mock="right-panel-sheet"]')).not.toBeNull();
-        expect(
-          (
-            h.activityDockRenderProps.at(-1) as {
-              readonly avoidRightPanelSheet: boolean;
-            }
-          ).avoidRightPanelSheet,
-        ).toBe(true);
-        const sheet = capturedProps<{ consumeEscapeClose: () => boolean }>("rightPanelSheet");
-
-        expect(sheet.consumeEscapeClose()).toBe(true);
-        expect(
-          useActivityDockStore.getState().expandedByProject[`${environmentId}:${projectId}`],
-        ).toBe(false);
-        expect(sheet.consumeEscapeClose()).toBe(false);
-      } finally {
-        await act(async () => root.unmount());
-        container.remove();
-      }
-    });
-
     it("retains stale activity through reconnect and uses the existing compact sheet with Back", async () => {
       const child = actor("actor-compact", "Compact reviewer");
       const snapshot = activitySnapshot({ _tag: "thread", threadId }, [child]);
@@ -2769,7 +2750,7 @@ describe("ChatView", () => {
 
       const { container, root } = await mountActivityRoute();
       try {
-        expect(container.querySelector('[aria-label="Activity data stale"]')).not.toBeNull();
+        expect(container.querySelector('[data-activity-status="stale"]')).not.toBeNull();
         await openSubagents(container);
         expect(container.querySelector('[data-mock="right-panel-sheet"]')).not.toBeNull();
         expect(capturedProps<{ mode: string }>("rightPanelTabs").mode).toBe("sheet");
@@ -2853,7 +2834,6 @@ describe("ChatView", () => {
         expect(h.activityStateTargets).toHaveLength(stateTargetCount);
         expect(h.activityDockRenderProps.at(-1)).toBe(dockProps);
         expect(h.activityPanelRenderProps.at(-1)).toBe(panelProps);
-        expect(h.scopedProjectKeyCalls).toContainEqual(scopeProjectRef(environmentId, projectId));
         expect(
           capturedProps<{ activeThread: Thread }>("chatComposer").activeThread.messages,
         ).toHaveLength(1);
@@ -3234,6 +3214,41 @@ describe("ChatView", () => {
       }
     });
 
+    it("brings an open Activity panel back into focus at the top of its section", async () => {
+      const panelThreadId = ThreadId.make("thread-panel-refocus");
+      const panelThreadRef = scopeThreadRef(environmentId, panelThreadId);
+      const child = actor("actor-refocus", "Refocus reviewer");
+      const snapshot = activitySnapshot({ _tag: "thread", threadId: panelThreadId }, [child]);
+      seedEnvironment(makeEnvironmentPresentation());
+      seedProject(makeProject());
+      seedServerThread(makeThread({ id: panelThreadId, title: "Refocus thread" }));
+      seedGitStatus(true);
+      seedActivityState(environmentId, snapshot.scope, snapshot);
+      seedActivityQueries(environmentId, snapshot, [child]);
+
+      const { container, root } = await mountActivityPanel(panelThreadRef);
+      try {
+        await openSubagents(container);
+        const panel = container.querySelector<HTMLElement>("[data-activity-panel]")!;
+        await vi.waitFor(() => expect(panel.contains(document.activeElement)).toBe(true));
+        const pill = container.querySelector<HTMLButtonElement>(
+          'button[aria-label^="Open Activity: Subagents"]',
+        )!;
+        pill.focus();
+        const viewport = panel.querySelector<HTMLElement>('[data-slot="scroll-area-viewport"]')!;
+        viewport.scrollTop = 200;
+
+        await click(pill);
+
+        await vi.waitFor(() => expect(panel.contains(document.activeElement)).toBe(true));
+        expect(viewport.scrollTop).toBe(0);
+        expect(container.querySelector("[data-activity-panel]")).toBe(panel);
+      } finally {
+        await act(async () => root.unmount());
+        container.remove();
+      }
+    });
+
     it("opens a panel chat activity inspector in the compact sheet", async () => {
       const child = actor("actor-panel-compact", "Compact panel reviewer");
       const snapshot = activitySnapshot({ _tag: "thread", threadId }, [child]);
@@ -3570,12 +3585,9 @@ describe("ChatView", () => {
       expect(markup).toContain('data-mock="right-panel-tabs"');
       expect(markup).toContain("data-activity-panel");
       expect(
-        capturedProps<{ surface: { terminalId: string }; projectId: ProjectId }>(
-          "centerTerminalPanel",
-        ),
+        capturedProps<{ surface: { terminalId: string } }>("centerTerminalPanel"),
       ).toMatchObject({
         surface: { terminalId: activeCenterTerminalId },
-        projectId,
       });
       // Every activity read targets the persisted terminal, never the active
       // center pane. How many reads there are is not the behaviour: the panel
@@ -5192,6 +5204,123 @@ describe("ChatView handlers (captured from mocked children)", () => {
     expect(timeline["resolvingTurnDeliveryMessageId"]).toBeNull();
   });
 
+  it("pages the timeline from the composer and stays put at the end", () => {
+    seedConnectedServerThread();
+    renderServerRoute();
+    const scrollToOffset = vi.fn();
+    const state = { scroll: 2000, scrollLength: 1000, contentLength: 5000 };
+    const timeline = capturedProps<Record<string, unknown>>("messagesTimeline");
+    (timeline["listRef"] as { current: unknown }).current = {
+      getState: () => state,
+      scrollToOffset,
+    };
+    const composer = capturedProps<Record<string, unknown>>("chatComposer");
+    const onPageTimeline = composer["onPageTimeline"] as (
+      key: "PageUp" | "PageDown",
+      repeat: boolean,
+    ) => void;
+
+    onPageTimeline("PageDown", false);
+    expect(scrollToOffset).toHaveBeenLastCalledWith({ offset: 2875, animated: true });
+    // A held key repeats; each repeat jumps so the scroll keeps up.
+    onPageTimeline("PageUp", true);
+    expect(scrollToOffset).toHaveBeenLastCalledWith({ offset: 1125, animated: false });
+
+    state.scroll = 4000;
+    onPageTimeline("PageDown", false);
+    expect(scrollToOffset).toHaveBeenCalledTimes(2);
+  });
+
+  // #173: a press that toggles a Thinking row at the end of the turn just sent is a click,
+  // not a scroll, so the turn's end comes back into view. A press on the list itself, such as
+  // its scrollbar, is still the reader taking over.
+  it.each([
+    { pressed: "a Thinking row's toggle", onControl: true, revealsEnd: true },
+    { pressed: "the list itself", onControl: false, revealsEnd: false },
+  ])(
+    "a pointer press on $pressed before a toggle at an anchored turn's end",
+    async ({ onControl, revealsEnd }) => {
+      vi.unstubAllGlobals();
+      Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+      seedConnectedServerThread();
+      const scrollNode = document.createElement("div");
+      const toggle = document.createElement("button");
+      toggle.setAttribute("aria-expanded", "false");
+      scrollNode.append(toggle);
+      document.body.append(scrollNode);
+      const geometry = { lastRowHeight: 100 };
+      const scrollToOffset = vi.fn();
+      h.timelineList = {
+        getScrollableNode: () => scrollNode,
+        getState: () => ({
+          scroll: 0,
+          scrollLength: 800,
+          contentLength: 100 + geometry.lastRowHeight,
+          data: [{}, {}],
+          positionAtIndex: (index: number) => index * 100,
+          sizeAtIndex: (index: number) => (index === 1 ? geometry.lastRowHeight : 100),
+        }),
+        scrollToOffset,
+        scrollToIndex: vi.fn(),
+        scrollToEnd: vi.fn(),
+      };
+      const nextFrames = (count: number) =>
+        act(
+          () =>
+            new Promise<void>((resolve) => {
+              const step = (left: number) =>
+                left === 0 ? resolve() : requestAnimationFrame(() => step(left - 1));
+              step(count);
+            }),
+        );
+      const container = document.createElement("div");
+      document.body.append(container);
+      const root = createRoot(container);
+      try {
+        await act(async () =>
+          root.render(
+            <ChatView environmentId={environmentId} threadId={threadId} routeKind="server" />,
+          ),
+        );
+        // The list's press listeners attach one frame after the thread mounts.
+        await nextFrames(2);
+        const composer = capturedProps<Record<string, unknown>>("chatComposer");
+        (composer["composerRef"] as RefObject<ChatComposerHandle | null>).current =
+          composerHandle();
+        (composer["promptRef"] as RefObject<string>).current = "think it through";
+        await act(async () => (composer["onSend"] as () => Promise<void>)());
+        const sent = commandCallsFor("thread.startTurn")[0]!.input as {
+          input: { message: { messageId: MessageId } };
+        };
+        const timeline = capturedProps<Record<string, unknown>>("messagesTimeline");
+        await act(async () =>
+          (timeline["onAnchorReady"] as (id: MessageId, index: number) => void)(
+            sent.input.message.messageId,
+            0,
+          ),
+        );
+        scrollToOffset.mockClear();
+
+        (onControl ? toggle : scrollNode).dispatchEvent(
+          new PointerEvent("pointerdown", { bubbles: true }),
+        );
+        // The turn ends in view; the toggle then opens a trace that pushes its end below.
+        (timeline["onReasoningRowToggle"] as () => void)();
+        geometry.lastRowHeight = 3000;
+        await nextFrames(3);
+
+        const reveals = scrollToOffset.mock.calls.filter(
+          ([target]) => (target as { offset: number }).offset > 2000,
+        );
+        expect(reveals.length).toBe(revealsEnd ? 1 : 0);
+      } finally {
+        await act(async () => root.unmount());
+        container.remove();
+        scrollNode.remove();
+      }
+    },
+  );
+
   it("onInterrupt targets the running turn of the active session", async () => {
     const runningTurnId = TurnId.make("turn-running");
     seedConnectedServerThread(
@@ -6417,4 +6546,147 @@ describe("ChatView adopted workspace availability", () => {
       expect(h.commandCalls.some((call) => call.key === "thread.startTurn")).toBe(false);
     },
   );
+});
+
+describe("ChatView find in thread", () => {
+  async function mountServerRoute() {
+    vi.unstubAllGlobals();
+    Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+    Object.defineProperty(Element.prototype, "getAnimations", {
+      configurable: true,
+      value: () => [],
+    });
+    const addWindowListener = vi.spyOn(window, "addEventListener");
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    await act(async () => {
+      root.render(
+        <ChatView
+          environmentId={environmentId}
+          threadId={threadId}
+          routeKind="server"
+          reserveTitleBarControlInset
+        />,
+      );
+      await Promise.resolve();
+    });
+    const keydown = addWindowListener.mock.calls.findLast(
+      ([eventName]) => eventName === "keydown",
+    )?.[1] as EventListener;
+    return {
+      keydown,
+      cleanup: async () => {
+        await act(async () => root.unmount());
+        container.remove();
+        addWindowListener.mockRestore();
+      },
+    };
+  }
+
+  const modF = () =>
+    new KeyboardEvent("keydown", {
+      key: "f",
+      metaKey: navigator.platform.toLowerCase().includes("mac"),
+      ctrlKey: !navigator.platform.toLowerCase().includes("mac"),
+      bubbles: true,
+      cancelable: true,
+    });
+
+  it("gives the timeline its chat surface and opens find on Mod+F", async () => {
+    seedEnvironment(makeEnvironmentPresentation());
+    seedProject(makeProject());
+    seedServerThread(makeThread());
+    seedGitStatus(true);
+    const { keydown, cleanup } = await mountServerRoute();
+    try {
+      const timeline = capturedProps<Record<string, unknown>>("messagesTimeline");
+      expect((timeline["findSurfaceRoot"] as HTMLElement).hasAttribute("data-chat-surface")).toBe(
+        true,
+      );
+      expect(timeline["isHostFindSurface"]).toBe(true);
+      expect(timeline["findThreadRef"]).toEqual({ environmentId, threadId });
+
+      const event = modF();
+      await act(async () => keydown(event));
+      expect(h.openThreadFindTargets).toHaveLength(1);
+      expect(event.defaultPrevented).toBe(true);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it("starts a new timeline, and so a new find, for the same thread id in another environment", async () => {
+    seedEnvironment(makeEnvironmentPresentation());
+    seedProject(makeProject());
+    seedServerThread(makeThread());
+    seedGitStatus(true);
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    const renderIn = async (nextEnvironmentId: EnvironmentId) => {
+      await act(async () => {
+        root.render(
+          <ChatView
+            environmentId={nextEnvironmentId}
+            threadId={threadId}
+            routeKind="server"
+            reserveTitleBarControlInset
+          />,
+        );
+        await Promise.resolve();
+      });
+    };
+    vi.unstubAllGlobals();
+    Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+    Object.defineProperty(Element.prototype, "getAnimations", {
+      configurable: true,
+      value: () => [],
+    });
+    try {
+      await renderIn(environmentId);
+      expect(h.messagesTimelineInstanceCount).toBe(1);
+
+      const nextEnvironmentId = EnvironmentId.make("environment-remote");
+      seedEnvironment(makeEnvironmentPresentation({ environmentId: nextEnvironmentId }));
+      seedProject(makeProject({ environmentId: nextEnvironmentId }));
+      seedServerThread(makeThread({ environmentId: nextEnvironmentId }));
+      await renderIn(nextEnvironmentId);
+
+      expect(capturedProps<Record<string, unknown>>("messagesTimeline")["routeThreadKey"]).toBe(
+        scopedThreadKey(scopeThreadRef(nextEnvironmentId, threadId)),
+      );
+      expect(h.messagesTimelineInstanceCount).toBe(2);
+    } finally {
+      await act(async () => root.unmount());
+      container.remove();
+    }
+  });
+
+  it("leaves Mod+F to a user rule that binds it to another command", async () => {
+    seedEnvironment(makeEnvironmentPresentation());
+    seedProject(makeProject());
+    seedServerThread(makeThread());
+    seedGitStatus(true);
+    h.atomValuesByKey.set("atom:keybindings", [
+      {
+        command: "sidebar.toggle",
+        shortcut: {
+          key: "f",
+          metaKey: false,
+          ctrlKey: false,
+          shiftKey: false,
+          altKey: false,
+          modKey: true,
+        },
+      },
+    ]);
+    const { keydown, cleanup } = await mountServerRoute();
+    try {
+      await act(async () => keydown(modF()));
+      expect(h.openThreadFindTargets).toHaveLength(0);
+    } finally {
+      await cleanup();
+    }
+  });
 });

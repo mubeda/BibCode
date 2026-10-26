@@ -44,6 +44,8 @@ interface RightPanelTabsProps {
   surfaces: readonly RightPanelSurface[];
   activeSurfaceId: string | null;
   pendingSurfaceIds: ReadonlySet<string>;
+  /** File tabs whose unsaved edits conflict with a newer state on disk. */
+  conflictSurfaceIds?: ReadonlySet<string>;
   previewSessions: Readonly<Record<string, PreviewSessionSnapshot>>;
   previewDesktopByTabId: Readonly<Record<string, DesktopPreviewOverlay>>;
   terminalLabelsById: ReadonlyMap<string, string>;
@@ -416,7 +418,8 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
           <div className="flex h-full w-max min-w-full items-center gap-1">
             {props.surfaces.map((surface) => {
               const active = surface.id === props.activeSurfaceId;
-              const pending = props.pendingSurfaceIds.has(surface.id);
+              const conflicted = props.conflictSurfaceIds?.has(surface.id) ?? false;
+              const pending = conflicted || props.pendingSurfaceIds.has(surface.id);
               const title = surfaceTitle(
                 surface,
                 props.previewSessions,
@@ -431,6 +434,7 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
                 >
                   <SurfaceIcon surface={surface} theme={resolvedTheme} />
                   <span className="truncate">{title}</span>
+                  {conflicted ? <span className="sr-only">(changed on disk)</span> : null}
                 </button>
               );
               return (
@@ -452,7 +456,9 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
                   ) : (
                     <Tooltip>
                       <TooltipTrigger render={tabButton} />
-                      <TooltipPopup>{title}</TooltipPopup>
+                      <TooltipPopup>
+                        {conflicted ? `${title} — changed on disk` : title}
+                      </TooltipPopup>
                     </Tooltip>
                   )}
                   <button
@@ -467,7 +473,11 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
                     {pending ? (
                       <>
                         <span
-                          className="size-2 rounded-full bg-current group-hover:hidden"
+                          className={cn(
+                            "size-2 rounded-full group-hover:hidden",
+                            conflicted ? "bg-amber-500" : "bg-current",
+                          )}
+                          data-file-disk-conflict={conflicted ? "" : undefined}
                           aria-hidden
                         />
                         <X className="hidden size-3 group-hover:block" />

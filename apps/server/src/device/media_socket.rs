@@ -721,7 +721,7 @@ mod tests {
                     .await;
             let device_id = fixture
                 .manager
-                .open(crate::device::catalog::Platform::Android, "Pixel")
+                .open(crate::device::catalog::Platform::Android, "Pixel", None)
                 .await
                 .expect("open Pixel");
             fixture.wait_state(&device_id, DeviceState::Ready).await;
