@@ -5,7 +5,13 @@ import type {
   ScopedThreadRef,
 } from "@bibcode/contracts";
 import { VirtualizedFile, type SelectedLineRange } from "@pierre/diffs";
-import { EditProvider, File, type FileOptions, Virtualizer } from "@pierre/diffs/react";
+import {
+  EditProvider,
+  File,
+  type FileOptions,
+  Virtualizer,
+  useWorkerPool,
+} from "@pierre/diffs/react";
 import {
   isAtomCommandInterrupted,
   squashAtomCommandFailure,
@@ -16,6 +22,7 @@ import {
   type RefObject,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -429,6 +436,24 @@ function useFileSaveShortcut(
   }, [containerRef, session]);
 }
 
+/**
+ * Drops the worker pool's highlighted lines for a session's `cacheKey` when its editable surface
+ * goes away. Pierre caches those lines by `cacheKey` alone, and a highlight still in the worker
+ * when the first edit lands is stored after the edit cleared the entry. The next surface for the
+ * session would paint those pre-edit lines over the edited document, whose text and undo history
+ * are intact. The cleanup runs before Pierre detaches the File, which cancels its pending
+ * highlights, so no older text can be stored under the key afterwards.
+ */
+function useWorkerHighlightRelease(cacheKey: string): void {
+  const workerPool = useWorkerPool();
+  useLayoutEffect(() => {
+    if (!workerPool) return;
+    return () => {
+      workerPool.evictFileFromCache(cacheKey);
+    };
+  }, [cacheKey, workerPool]);
+}
+
 function EditableFileSurface({
   session,
   composerDraftTarget,
@@ -454,6 +479,7 @@ function EditableFileSurface({
   const surfaceRef = useRef<HTMLDivElement>(null);
   const selectionFrameRef = useRef<number | null>(null);
   useFileSaveShortcut(surfaceRef, session);
+  useWorkerHighlightRelease(session.cacheKey);
   useEffect(() => {
     const surface = surfaceRef.current;
     if (!surface) return;
