@@ -350,6 +350,7 @@ vi.mock("@pierre/diffs/react", () => ({
     ui.record("File", props);
     return <div data-file={(props.file as { name: string }).name} />;
   },
+  useWorkerPool: () => undefined,
 }));
 
 vi.mock("@bibcode/client-runtime/state/runtime", () => ({
