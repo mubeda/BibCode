@@ -352,6 +352,10 @@ node scripts/run-msvc.mjs cargo clean -p bibcode-server -p bibcode-desktop -p bi
 node scripts/run-msvc.mjs cargo clippy --workspace --all-targets -- -D warnings
 ```
 
+Install the workspace dependencies (`vp install`) before the broad test
+command: `rpc_wire` starts the TypeScript Effect client with `node`, which
+fails without them.
+
 Run the `--all-targets` check first. Unix-only test helpers and imports must sit
 behind the same `cfg(unix)` as their consumers; an unused import in a Windows
 test target fails the whole `bibcode-server` test build under `-D warnings` and

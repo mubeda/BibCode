@@ -2198,6 +2198,8 @@ esac"#,
         assert!(matches!(next, Context::Unavailable { .. }), "{next:?}");
     }
 
+    // The fake `glab` and `git` are shell scripts.
+    #[cfg(unix)]
     #[tokio::test]
     async fn gitlab_poller_read_snapshot_with_a_populated_row_performs_zero_glab_calls() {
         let s = crate::test_support::TestSandbox::new("pr-read-snapshot");
@@ -2527,6 +2529,8 @@ esac"#,
         child.complete();
     }
 
+    // The fake `glab` and `git` are shell scripts.
+    #[cfg(unix)]
     #[tokio::test]
     async fn gitlab_poller_run_action_success_deletes_the_acted_numbers_rows_and_leaves_others() {
         let s = crate::test_support::TestSandbox::new("pr-run-action-snapshots");
@@ -2698,6 +2702,8 @@ esac"#,
         assert_eq!(refused.code, "unavailable");
     }
 
+    // The fake `glab` and `git` are shell scripts.
+    #[cfg(unix)]
     #[tokio::test]
     async fn gitlab_unary_get_stores_the_detail_snapshot_read_snapshot_paints() {
         let s = crate::test_support::TestSandbox::new("pr-get-stores-snapshot");

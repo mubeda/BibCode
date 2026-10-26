@@ -621,10 +621,7 @@ mod tests {
             .args(args)
             .current_dir(cwd)
             .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env(
-                "GIT_CONFIG_GLOBAL",
-                if cfg!(windows) { "NUL" } else { "/dev/null" },
-            )
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_AUTHOR_NAME", "Git Manager Test")
             .env("GIT_AUTHOR_EMAIL", "git-manager@example.test")
             .env("GIT_COMMITTER_NAME", "Git Manager Test")

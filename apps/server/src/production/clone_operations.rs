@@ -845,6 +845,8 @@ mod tests {
     }
 
     fn file_url(path: &Path) -> String {
+        // A canonical Windows path is `\\?\C:\…`, which no `file://` URL spells.
+        let path = crate::production::host_paths::process_compatible_path(path.to_path_buf());
         let normalized = path.to_string_lossy().replace('\\', "/");
         format!("file:///{}", normalized.trim_start_matches('/'))
     }
@@ -1365,7 +1367,11 @@ mod tests {
         );
         let detail = failure["detail"].as_str().expect("detail");
         assert!(detail.contains("could not be removed"), "{detail}");
-        assert!(detail.contains(&*destination.to_string_lossy()), "{detail}");
+        // The message spells the folder as the client shows it: no `\\?\`, `/` separators.
+        let shown = crate::production::host_paths::process_compatible_path(destination.clone())
+            .to_string_lossy()
+            .replace('\\', "/");
+        assert!(detail.contains(&shown), "{detail}");
         assert!(
             destination.is_dir(),
             "a folder the clone did not create is never removed"
