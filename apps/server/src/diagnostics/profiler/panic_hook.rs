@@ -85,8 +85,12 @@ fn record(info: &std::panic::PanicHookInfo<'_>) {
     let site = info
         .location()
         .map(|location| format!("{}:{}", location.file(), location.line()));
-    // A dependency's location is a path under the builder's home directory.
-    let location = site.as_deref().map(redact_path);
+    // A dependency's location is a path under the builder's home directory, redacted in its own
+    // spelling; then `/` everywhere, so a Windows build's site reads and keys the same.
+    let location = site
+        .as_deref()
+        .map(|site| redact_path(site).replace('\\', "/"));
+    let site = site.map(|site| site.replace('\\', "/"));
     let offsets = own_offsets(&frames);
     let event_id = handle.sender.send(ProfilerEvent {
         kind: "panic",
