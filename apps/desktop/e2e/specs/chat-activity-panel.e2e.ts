@@ -72,9 +72,6 @@ interface SurfacePresentation {
 interface RuntimeMotionPresentation {
   readonly activeTransitionProperties: ReadonlyArray<string>;
   readonly countActiveTransitionProperties: ReadonlyArray<string>;
-  readonly runtimeMode: string | undefined;
-  readonly transitionDuration: string;
-  readonly transitionProperty: string;
 }
 
 interface ProviderTerminalGeometry {
@@ -804,7 +801,6 @@ async function readRuntimeMotionPresentation(): Promise<RuntimeMotionPresentatio
     };
     const card = document.querySelector<HTMLElement>('[data-testid="activity-dock"] > div');
     if (!card) throw new Error("Activity card is missing for runtime motion inspection.");
-    const computed = getComputedStyle(card);
     return {
       activeTransitionProperties: activeTransitionProperties(card),
       countActiveTransitionProperties: [
@@ -812,13 +808,12 @@ async function readRuntimeMotionPresentation(): Promise<RuntimeMotionPresentatio
           '[data-testid="activity-dock"] [data-activity-count], [data-testid="activity-dock"] .tabular-nums',
         ),
       ].flatMap(activeTransitionProperties),
-      runtimeMode: card.dataset.activityMotion,
-      transitionDuration: computed.transitionDuration,
-      transitionProperty: computed.transitionProperty,
     };
   });
 }
 
+// The pill has no expand step to animate since #143: it and its counts stay still under either
+// motion preference.
 async function assertRuntimeMotionState(reduced: boolean): Promise<void> {
   await setRuntimeMotionPreference(reduced);
   let presentation: RuntimeMotionPresentation | null = null;
@@ -826,28 +821,17 @@ async function assertRuntimeMotionState(reduced: boolean): Promise<void> {
     async () => {
       presentation = await readRuntimeMotionPresentation();
       return (
-        presentation.runtimeMode === (reduced ? "reduced" : "normal") &&
-        (reduced
-          ? presentation.activeTransitionProperties.length === 0
-          : presentation.activeTransitionProperties.includes("width") &&
-            presentation.activeTransitionProperties.includes("opacity")) &&
+        presentation.activeTransitionProperties.length === 0 &&
         presentation.countActiveTransitionProperties.length === 0
       );
     },
     {
-      timeoutMsg: `Activity motion did not render the ${reduced ? "reduced" : "normal"} computed transition state.`,
+      timeoutMsg: `Activity animated under the ${reduced ? "reduced" : "normal"} motion preference.`,
     },
   );
   expect(presentation).not.toBeNull();
-  expect(presentation!.runtimeMode).toBe(reduced ? "reduced" : "normal");
+  expect(presentation!.activeTransitionProperties).toEqual([]);
   expect(presentation!.countActiveTransitionProperties).toEqual([]);
-  if (reduced) {
-    expect(presentation!.activeTransitionProperties).toEqual([]);
-  } else {
-    expect(presentation!.transitionProperty).toContain("width");
-    expect(presentation!.transitionProperty).toContain("opacity");
-    expect(presentation!.transitionDuration).not.toBe("0s");
-  }
 }
 
 async function assertRuntimeMotionContract(): Promise<void> {
@@ -1001,7 +985,7 @@ describe("packaged responsive activity experience", () => {
       expect.objectContaining({ tagName: "TEXTAREA" }),
     );
     const updatedSummary = browser.$(
-      'button[aria-label*="1 active subagent"][aria-label*="0 done subagents"][aria-label*="0 active background tasks"][aria-label*="1 done background task"]',
+      'button[aria-label^="Open Activity: Subagents 1 active, 0 done; Background tasks 0 active, 1 done"]',
     );
     await updatedSummary.waitForExist({
       timeoutMsg: "The provider follow-up did not materially update activity counts.",
@@ -1059,7 +1043,7 @@ describe("packaged responsive activity experience", () => {
       async () =>
         browser.execute((announcement: string) => {
           const summary = document.querySelector<HTMLButtonElement>(
-            'button[aria-label*="2 active subagents"][aria-label*="0 done subagents"]',
+            'button[aria-label^="Open Activity: Subagents 2 active, 0 done"]',
           );
           const liveRegion = document.querySelector<HTMLElement>(
             '[data-testid="activity-dock"] [role="status"][aria-live="polite"]',
