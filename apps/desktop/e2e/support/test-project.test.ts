@@ -738,7 +738,7 @@ describe("packaged provider composer fixture", () => {
   it("exports the real normalized inline capability profiles", () => {
     expect(composerProviderProfiles).toEqual({
       codex: {
-        commands: ["goal"],
+        commands: ["compact", "goal"],
         slashSkills: [],
         dollarSkills: ["refactor"],
         mentionableAgents: [],

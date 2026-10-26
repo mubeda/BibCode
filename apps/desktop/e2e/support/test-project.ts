@@ -46,7 +46,7 @@ fs.appendFileSync(path, JSON.stringify({
 
 export const composerProviderProfiles = {
   codex: {
-    commands: ["goal"],
+    commands: ["compact", "goal"],
     slashSkills: [],
     dollarSkills: ["refactor"],
     mentionableAgents: [],
