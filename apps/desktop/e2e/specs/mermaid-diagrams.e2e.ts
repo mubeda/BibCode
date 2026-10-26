@@ -637,7 +637,7 @@ describe("packaged Mermaid diagrams", () => {
     const minimapLabel = () =>
       browser.execute((surface: string) => {
         const button = document.querySelector<HTMLButtonElement>(
-          `${surface} [data-testid="timeline-minimap"] button`,
+          `${surface} [data-testid="timeline-minimap"] button[aria-label^="Jump to message"]`,
         );
         if (!button || button.getBoundingClientRect().height === 0) {
           throw new Error("The timeline minimap is not shown.");
@@ -648,7 +648,7 @@ describe("packaged Mermaid diagrams", () => {
       browser.execute(
         (surface: string, pressed: string | null) => {
           const button = document.querySelector<HTMLButtonElement>(
-            `${surface} [data-testid="timeline-minimap"] button`,
+            `${surface} [data-testid="timeline-minimap"] button[aria-label^="Jump to message"]`,
           )!;
           if (pressed === null) button.focus();
           else button.dispatchEvent(new KeyboardEvent("keydown", { key: pressed, bubbles: true }));
@@ -949,7 +949,9 @@ describe("packaged Mermaid diagrams", () => {
     expect(coldDraw.painted[appeared]!.diagramDrawn).toBe(false);
     expect(drew).toBeGreaterThan(appeared);
     const readingLine = coldDraw.painted[appeared]!.target!;
-    expect(coldDraw.painted[drew]!.diagramRowBottom!).toBeLessThanOrEqual(readingLine);
+    // The diagram's row ends where the read row begins. A display scaled 200% lays the two out
+    // a fraction of a pixel apart, so the row counts as above within the same 1 px as below.
+    expect(coldDraw.painted[drew]!.diagramRowBottom!).toBeLessThanOrEqual(readingLine + 1);
     expect(
       coldDraw.painted
         .slice(appeared)
@@ -989,15 +991,16 @@ describe("packaged Mermaid diagrams", () => {
     expect(diagram.at(-1)!.lastLineInView).toBe(true);
     // The diagram's own growth is followed too: after each delivery from the one the diagram
     // drew in, before the next one lands, the reply's end is revealed as far as the plain
-    // reply's is.
+    // reply's is. A slow webview can paint no frame between two of the plain reply's
+    // deliveries; there the end must simply be revealed.
     const plainRests = restingEnds(plain);
     const diagramRests = restingEnds(diagram);
     const drewAfter = diagram[drew]!.afterParagraphs;
     const endsHidden = [...diagramRests]
       .filter(([delivered]) => delivered >= drewAfter)
       .filter(([delivered, below]) => {
-        const plainBelow = plainRests.get(delivered);
-        return plainBelow === undefined || below > Math.max(plainBelow, 0) + 1;
+        const plainBelow = plainRests.get(delivered) ?? 0;
+        return below > Math.max(plainBelow, 0) + 1;
       });
     expect(diagramRests.has(drewAfter)).toBe(true);
     expect(endsHidden).toEqual([]);

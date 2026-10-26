@@ -3163,7 +3163,8 @@ same reply twice, one delta every 300 ms, first with the diagram's source in a
 plain code block and then as a sequence diagram, the scenario's only one, whose
 chunk loads after its source shows, so it replaces the source at the end while
 more text streams. After each delivery from the diagram's draw on, the reply's
-end rests no lower below the composer than the plain reply's, and both end
+end rests no lower below the composer than the plain reply's (or, after a
+delivery the plain reply painted no frame for, is revealed), and both end
 with the last line in view (`mermaid-timeline-streaming-follow.json` holds both
 replies' gaps and end positions). The reading-line
 checks sample painted frames, so the scenario fails early in a webview that
