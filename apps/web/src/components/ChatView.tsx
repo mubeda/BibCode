@@ -3989,7 +3989,15 @@ function ChatViewContent(props: ChatViewProps) {
     readonly userScrollGeneration: number;
   } | null>(null);
   const anchorScrollRestoreFrameRef = useRef<number | null>(null);
+  const followTimelineLiveEndRef = useRef<() => void>(() => undefined);
+  // The sent row the reader scrolled away from. LegendList reports it ready again whenever the
+  // streamed tail changes size, and positioning it then would take the reader's place away.
+  const releasedTimelineAnchorRef = useRef<MessageId | null>(null);
   const cancelTimelineLiveFollowForUserNavigation = useCallback(() => {
+    releasedTimelineAnchorRef.current =
+      positionedTimelineAnchorRef.current ??
+      pendingTimelineAnchorRef.current ??
+      releasedTimelineAnchorRef.current;
     anchorUserScrollGenerationRef.current += 1;
     timelineScrollModeRef.current = "free-scrolling";
     liveFollowUserScrollGenerationRef.current = null;
@@ -4144,6 +4152,11 @@ function ChatViewContent(props: ChatViewProps) {
       return;
     }
     positionedTimelineAnchorRef.current = messageId;
+    if (releasedTimelineAnchorRef.current === messageId) {
+      // Nothing moves; the anchor only keeps holding the reader's place as the tail changes.
+      settledTimelineAnchorRef.current = messageId;
+      return;
+    }
     settledTimelineAnchorRef.current = null;
     const positionAnchor = (remainingAttempts: number) => {
       requestAnimationFrame(() => {
@@ -4169,9 +4182,36 @@ function ChatViewContent(props: ChatViewProps) {
           if (positionedTimelineAnchorRef.current !== messageId) {
             return;
           }
-          const scrollOffset = list.getState().scroll;
-          void list.scrollToOffset({ offset: scrollOffset, animated: false });
-          settledTimelineAnchorRef.current = messageId;
+          // Land the sent row exactly. The timer can fire while a long glide is still under
+          // way (a webview glides a long distance for over a second, a slow one longer), and
+          // pinning the offset reached so far would stop it short of the row.
+          const landing = list.scrollToIndex({
+            index: activeTimelineAnchorIndexRef.current ?? anchorIndex,
+            animated: false,
+            viewPosition: 0,
+            viewOffset: CHAT_LIST_ANCHOR_OFFSET,
+          });
+          // LegendList can defer the landing while rows measure. Following before it lands
+          // would supersede it, so the anchor settles once it has; the timer bounds the wait.
+          let landed = false;
+          const settle = () => {
+            if (landed) {
+              return;
+            }
+            landed = true;
+            window.clearTimeout(landingTimer);
+            if (positionedTimelineAnchorRef.current !== messageId) {
+              return;
+            }
+            settledTimelineAnchorRef.current = messageId;
+            // Replies that arrived during the glide were not followed; follow them now rather
+            // than on the next one, which a reply that has finished never sends.
+            requestAnimationFrame(() => {
+              requestAnimationFrame(() => followTimelineLiveEndRef.current());
+            });
+          };
+          const landingTimer = window.setTimeout(settle, 1_000);
+          void Promise.resolve(landing).then(settle, settle);
         };
         const fallbackTimer = window.setTimeout(finishAnimatedPositioning, 750);
         scrollNode.addEventListener("scrollend", finishAnimatedPositioning, { once: true });
@@ -4282,6 +4322,53 @@ function ChatViewContent(props: ChatViewProps) {
     });
   }, [getActiveTimelineTurnMetrics]);
 
+  // One pass of live following: reveals an anchored turn's end, or keeps the end in view. It
+  // waits while a sent row is still being positioned, which then runs it once it lands.
+  const followTimelineLiveEnd = useCallback(() => {
+    if (liveFollowUserScrollGenerationRef.current !== anchorUserScrollGenerationRef.current) {
+      return;
+    }
+    if (pendingTimelineAnchorRef.current !== null) {
+      return;
+    }
+    if (
+      positionedTimelineAnchorRef.current !== null &&
+      settledTimelineAnchorRef.current !== positionedTimelineAnchorRef.current
+    ) {
+      return;
+    }
+    const list = legendListRef.current;
+    if (!list) {
+      return;
+    }
+
+    if (timelineScrollModeRef.current === "anchoring-new-turn") {
+      const metrics = getActiveTimelineTurnMetrics(list);
+      if (!metrics) {
+        return;
+      }
+      if (metrics.scrollDeltaToRevealEnd <= 1) {
+        return;
+      }
+
+      const nextOffset = list.getState().scroll + metrics.scrollDeltaToRevealEnd;
+      void list.scrollToOffset({ offset: nextOffset, animated: false });
+      return;
+    }
+
+    if (timelineScrollModeRef.current !== "following-end") {
+      return;
+    }
+    if (!timelineRealContentOverflowsViewport(list)) {
+      return;
+    }
+
+    void list.scrollToEnd?.({ animated: false });
+  }, [getActiveTimelineTurnMetrics, timelineRealContentOverflowsViewport]);
+  useLayoutEffect(() => {
+    followTimelineLiveEndRef.current = followTimelineLiveEnd;
+  }, [followTimelineLiveEnd]);
+
   // Follows the end after new timeline entries render; an empty timeline has nothing to follow.
   useEffect(() => {
     if (!activeThread?.id || timelineEntries.length === 0) {
@@ -4293,47 +4380,7 @@ function ChatViewContent(props: ChatViewProps) {
 
     let secondFrame: number | null = null;
     const frame = requestAnimationFrame(() => {
-      secondFrame = requestAnimationFrame(() => {
-        if (liveFollowUserScrollGenerationRef.current !== anchorUserScrollGenerationRef.current) {
-          return;
-        }
-        if (pendingTimelineAnchorRef.current !== null) {
-          return;
-        }
-        if (
-          positionedTimelineAnchorRef.current !== null &&
-          settledTimelineAnchorRef.current !== positionedTimelineAnchorRef.current
-        ) {
-          return;
-        }
-        const list = legendListRef.current;
-        if (!list) {
-          return;
-        }
-
-        if (timelineScrollModeRef.current === "anchoring-new-turn") {
-          const metrics = getActiveTimelineTurnMetrics(list);
-          if (!metrics) {
-            return;
-          }
-          if (metrics.scrollDeltaToRevealEnd <= 1) {
-            return;
-          }
-
-          const nextOffset = list.getState().scroll + metrics.scrollDeltaToRevealEnd;
-          void list.scrollToOffset({ offset: nextOffset, animated: false });
-          return;
-        }
-
-        if (timelineScrollModeRef.current !== "following-end") {
-          return;
-        }
-        if (!timelineRealContentOverflowsViewport(list)) {
-          return;
-        }
-
-        void list.scrollToEnd?.({ animated: false });
-      });
+      secondFrame = requestAnimationFrame(followTimelineLiveEnd);
     });
 
     return () => {
@@ -4342,12 +4389,7 @@ function ChatViewContent(props: ChatViewProps) {
         cancelAnimationFrame(secondFrame);
       }
     };
-  }, [
-    activeThread?.id,
-    timelineEntries,
-    getActiveTimelineTurnMetrics,
-    timelineRealContentOverflowsViewport,
-  ]);
+  }, [activeThread?.id, timelineEntries, followTimelineLiveEnd]);
 
   // Per-thread view state resets while rendering the newly active thread.
   const [viewStateThreadId, setViewStateThreadId] = useState(activeThreadId);
