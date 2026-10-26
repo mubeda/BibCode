@@ -3288,7 +3288,10 @@ something invalidates it:
   that the path set under `cwd` changed outside the application. The sweep stats
   the directories the last scan saw rather than walking the tree, because
   adding, renaming, or removing an entry moves its parent directory's mtime
-  while an in-place content edit does not. The index keeps that directory set
+  while an in-place content edit does not. An mtime moves only when the clock
+  ticks (15.6 ms on Windows, 2 s on FAT), so a directory whose mtime is under
+  two seconds old, past or future, also has its entry names read on that sweep
+  and the next, and an entry added or renamed within the same tick still shows. The index keeps that directory set
   apart from its entry list, because past the entry limit the list keeps files
   and drops directories, and a sweep that took its directories from the list
   went blind to every nested change. Every listed directory is swept. A
