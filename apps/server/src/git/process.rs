@@ -458,6 +458,16 @@ fn supervised_request(request: &ProcessRequest, command: Command) -> SupervisedR
     }
 }
 
+/// Windows answers a missing working directory with `ERROR_DIRECTORY` ("not a directory"); it is
+/// the same missing folder that Unix reports as not found.
+fn missing_cwd_as_not_found(source: std::io::Error, cwd: &std::path::Path) -> std::io::Error {
+    if source.kind() == std::io::ErrorKind::NotADirectory && !cwd.exists() {
+        std::io::Error::new(std::io::ErrorKind::NotFound, source)
+    } else {
+        source
+    }
+}
+
 fn map_supervised_error(
     error: SupervisedRunError,
     request: &ProcessRequest,
@@ -468,7 +478,7 @@ fn map_supervised_error(
         SupervisedRunError::Spawn(source) => ProcessError::Spawn {
             operation,
             command,
-            source,
+            source: missing_cwd_as_not_found(source, &request.cwd),
         },
         SupervisedRunError::Pipe { stream } => ProcessError::Pipe { operation, stream },
         SupervisedRunError::Stdin(source) => ProcessError::Stdin { operation, source },
@@ -561,6 +571,23 @@ mod tests {
             source: std::io::Error::from_raw_os_error(2),
         };
         assert!(error.safe_facts().message("glab").contains("OS error 2"));
+    }
+
+    #[test]
+    fn a_missing_working_folder_is_not_found_even_where_windows_says_not_a_directory() {
+        let missing =
+            std::env::temp_dir().join(format!("bibcode-missing-{}", uuid::Uuid::new_v4()));
+        let windows = std::io::Error::new(std::io::ErrorKind::NotADirectory, "directory name");
+        assert_eq!(
+            super::missing_cwd_as_not_found(windows, &missing).kind(),
+            std::io::ErrorKind::NotFound
+        );
+        let file_cwd = std::env::temp_dir();
+        let not_dir = std::io::Error::new(std::io::ErrorKind::NotADirectory, "a file");
+        assert_eq!(
+            super::missing_cwd_as_not_found(not_dir, &file_cwd).kind(),
+            std::io::ErrorKind::NotADirectory
+        );
     }
 
     #[test]
