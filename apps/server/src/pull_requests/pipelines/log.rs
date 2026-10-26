@@ -248,6 +248,15 @@ pub(crate) struct LogCache {
     ranges: Mutex<HashMap<String, RangeSupport>>,
 }
 
+/// Whether a fresh cached copy may answer `get_or_download`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LogReuse {
+    /// A running read may answer from a copy that is still growing.
+    Fresh,
+    /// A finished job. An unfinished copy stops before the job's last lines.
+    Complete,
+}
+
 impl LogCache {
     /// Rescan and sign-in changes: every account's logs and job reads go.
     /// Range support is a fact about the host and stays.
@@ -391,6 +400,9 @@ impl LogCache {
     /// One download per key at a time: a second caller waits for the first
     /// and takes its answer. A download that started before a logout
     /// (`generation` at or below the host's fence) is answered but not kept.
+    /// `reuse` says whether a fresh unfinished copy may answer; a finished
+    /// job's read must not, because that copy is missing the job's last lines.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn get_or_download(
         &self,
         key: LogKey,
@@ -398,6 +410,7 @@ impl LogCache {
         generation: i64,
         cancellation: &CancellationToken,
         cancelled: impl Fn() -> PullRequestsOperationError,
+        reuse: LogReuse,
         download: impl Future<Output = Result<FullLog, PullRequestsOperationError>>,
     ) -> Result<FullLog, PullRequestsOperationError> {
         self.sweep();
@@ -427,6 +440,7 @@ impl LogCache {
         if let Some((used, log)) = entry.as_mut()
             && used.elapsed() < IDLE_TTL
             && log.fresh()
+            && (reuse == LogReuse::Fresh || log.complete)
         {
             *used = Instant::now();
             return Ok(log.clone());
@@ -469,6 +483,31 @@ impl LogCache {
     #[cfg(test)]
     pub(crate) fn held_tails(&self) -> usize {
         lock(&self.tails).len()
+    }
+
+    /// Holds the downloaded log for `job`, if one is cached, until `hold`
+    /// finishes. `locked` fires once the slot is held. Test code uses this
+    /// to keep `forget_unfinished` from removing a running copy.
+    #[cfg(test)]
+    pub(crate) async fn hold_job_log_for_test(
+        &self,
+        job: u64,
+        locked: &tokio::sync::Notify,
+        hold: impl Future<Output = ()>,
+    ) {
+        let slot = {
+            let logs = lock(&self.logs);
+            logs.slots
+                .iter()
+                .find(|(key, _)| key.job == job)
+                .map(|(_, slot)| slot.clone())
+        };
+        let Some(slot) = slot else {
+            panic!("no cached log for job {job}");
+        };
+        let _guard = slot.lock().await;
+        locked.notify_one();
+        hold.await;
     }
 
     /// Makes every recorded job read `by` older.
@@ -592,6 +631,7 @@ mod tests {
             generation,
             &c,
             || PullRequestsOperationError::new("pipelines.getJobLog", "timeout"),
+            LogReuse::Fresh,
             async {
                 downloads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 started.notify_one();
@@ -609,6 +649,7 @@ mod tests {
                     generation,
                     &c,
                     || PullRequestsOperationError::new("pipelines.getJobLog", "timeout"),
+                    LogReuse::Fresh,
                     async {
                         downloads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         Ok(full(b"other", 0, true))
@@ -628,6 +669,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pipelines_a_finished_read_replaces_a_cached_unfinished_log() {
+        let cache = LogCache::default();
+        let fences = HostFences::default();
+        let c = CancellationToken::new();
+        let generation = crate::pull_requests::snapshot_store::next_generation();
+        cache
+            .get_or_download(
+                key("ana", 1),
+                &fences,
+                generation,
+                &c,
+                || PullRequestsOperationError::new("pipelines.getJobLog", "timeout"),
+                LogReuse::Fresh,
+                async { Ok(full(b"running\n", 0, false)) },
+            )
+            .await
+            .unwrap();
+        let downloads = std::sync::atomic::AtomicUsize::new(0);
+        let log = cache
+            .get_or_download(
+                key("ana", 1),
+                &fences,
+                generation,
+                &c,
+                || PullRequestsOperationError::new("pipelines.getJobLog", "timeout"),
+                LogReuse::Complete,
+                async {
+                    downloads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(full(b"running\nJob succeeded\n", 0, true))
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(downloads.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(log.complete);
+        assert!(log.bytes.ends_with(b"Job succeeded\n"));
+        let again = cache
+            .get_or_download(
+                key("ana", 1),
+                &fences,
+                generation,
+                &c,
+                || PullRequestsOperationError::new("pipelines.getJobLog", "timeout"),
+                LogReuse::Complete,
+                async {
+                    downloads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(full(b"other", 0, true))
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(downloads.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(again.bytes.as_slice(), b"running\nJob succeeded\n");
+    }
+
+    #[tokio::test]
     async fn pipelines_a_cleared_slot_is_not_repopulated_by_an_inflight_download() {
         let cache = LogCache::default();
         let fences = HostFences::default();
@@ -641,6 +738,7 @@ mod tests {
             generation,
             &c,
             || PullRequestsOperationError::new("pipelines.getJobLog", "timeout"),
+            LogReuse::Fresh,
             async {
                 started.notify_one();
                 release.notified().await;
@@ -667,6 +765,7 @@ mod tests {
                 generation,
                 &c,
                 || PullRequestsOperationError::new("pipelines.getJobLog", "timeout"),
+                LogReuse::Fresh,
                 async { Ok(full(b"log", 0, true)) },
             )
             .await
@@ -689,6 +788,7 @@ mod tests {
                     crate::pull_requests::snapshot_store::next_generation(),
                     &c,
                     || PullRequestsOperationError::new("pipelines.getJobLog", "timeout"),
+                    LogReuse::Fresh,
                     async move { Ok(full(&bytes, 0, true)) },
                 )
                 .await
@@ -707,6 +807,7 @@ mod tests {
                 crate::pull_requests::snapshot_store::next_generation(),
                 &c,
                 || PullRequestsOperationError::new("pipelines.getJobLog", "timeout"),
+                LogReuse::Fresh,
                 async { Ok(full(b"log", 0, true)) },
             )
             .await
@@ -722,6 +823,7 @@ mod tests {
                 crate::pull_requests::snapshot_store::next_generation(),
                 &c,
                 || PullRequestsOperationError::new("pipelines.getJobLog", "timeout"),
+                LogReuse::Fresh,
                 async { Ok(full(b"log", 0, true)) },
             )
             .await
@@ -780,6 +882,7 @@ mod tests {
                 crate::pull_requests::snapshot_store::next_generation(),
                 &CancellationToken::new(),
                 || PullRequestsOperationError::new("pipelines.getJobLog", "timeout"),
+                LogReuse::Fresh,
                 async move { Ok(log) },
             )
             .await

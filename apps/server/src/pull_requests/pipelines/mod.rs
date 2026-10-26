@@ -24,7 +24,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use self::{
-    log::{FullLog, JobFacts, LogKey, RANGE_WINDOW, RangeSupport, SharedTail},
+    log::{FullLog, JobFacts, LogKey, LogReuse, RANGE_WINDOW, RangeSupport, SharedTail},
     model::{
         ActionKind, ActionResult, ActionTarget, Changed, Detail, GetInput, Job, JobDetail,
         JobInput, JobLog, JobLogInput, ListInput, ListPage, LogChunk, LogFrom, LogUnavailable,
@@ -1129,7 +1129,11 @@ impl PipelinesService {
         if terminal {
             logs.forget_unfinished(key);
         }
-        if let Some(log) = logs.cached(key) {
+        // An unfinished copy that landed after `forget_unfinished` (its
+        // download still held the slot) is missing the job's last lines.
+        if let Some(log) = logs.cached(key)
+            && (log.complete || !terminal)
+        {
             return Ok(downloaded_answer(&log, input.from, &facts));
         }
         // GitHub serves a job's log once it completes; until then its own
@@ -1149,6 +1153,14 @@ impl PipelinesService {
                 downloaded_at: Instant::now(),
             })
         };
+        // A finished read must not take a copy downloaded while the job ran,
+        // even when that copy is still "fresh" and another caller holds it
+        // until this read is already waiting.
+        let reuse = if terminal {
+            LogReuse::Complete
+        } else {
+            LogReuse::Fresh
+        };
         let fetch = async || {
             logs.get_or_download(
                 key.clone(),
@@ -1156,6 +1168,7 @@ impl PipelinesService {
                 generation,
                 c,
                 || PullRequestsOperationError::new("pipelines.getJobLog", "timeout"),
+                reuse,
                 download(),
             )
             .await
@@ -1338,6 +1351,11 @@ impl PipelinesService {
             downloaded_at: Instant::now(),
         };
         let kept = log.clone();
+        let reuse = if terminal {
+            LogReuse::Complete
+        } else {
+            LogReuse::Fresh
+        };
         let log = logs
             .get_or_download(
                 key.clone(),
@@ -1345,6 +1363,7 @@ impl PipelinesService {
                 snapshot_store::next_generation(),
                 c,
                 || PullRequestsOperationError::new("pipelines.getJobLog", "timeout"),
+                reuse,
                 async move { Ok(kept) },
             )
             .await
