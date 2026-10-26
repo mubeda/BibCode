@@ -238,6 +238,7 @@ function makeThread(): Thread {
     interactionMode: "default",
     session: null,
     messages: [],
+    reasoning: [],
     proposedPlans: [],
     activities: [],
     checkpoints: [],
@@ -329,6 +330,7 @@ function makeProps(
     scheduleComposerFocus: vi.fn(),
     setThreadError: vi.fn(),
     onExpandImage: vi.fn(),
+    onPageTimeline: vi.fn(),
   };
 }
 

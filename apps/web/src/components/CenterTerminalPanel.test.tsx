@@ -1,4 +1,4 @@
-import { EnvironmentId, ProjectId, ThreadId } from "@bibcode/contracts";
+import { EnvironmentId, ThreadId } from "@bibcode/contracts";
 import { renderToStaticMarkup } from "react-dom/server";
 import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
@@ -9,7 +9,6 @@ const h = vi.hoisted(() => ({
 vi.mock("~/state/entities", () => ({
   useThread: () => ({
     environmentId: EnvironmentId.make("environment-1"),
-    projectId: ProjectId.make("project-1"),
     worktreePath: "/repo/.bibcode/worktrees/feature",
   }),
   useProject: () => ({ workspaceRoot: "/repo" }),
@@ -69,7 +68,6 @@ describe("CenterTerminalPanel", () => {
           environmentId: EnvironmentId.make("environment-1"),
           threadId: ThreadId.make("thread-1"),
         }}
-        projectId={ProjectId.make("project-1")}
         surface={surface}
         launchContext={{
           cwd: "/repo/.bibcode/worktrees/feature",
@@ -86,7 +84,6 @@ describe("CenterTerminalPanel", () => {
 
     expect(h.panelProps).toMatchObject({
       owner: "center-panel",
-      projectId: ProjectId.make("project-1"),
       cwd: "/repo/.bibcode/worktrees/feature",
       worktreePath: "/repo/.bibcode/worktrees/feature",
       terminalIds: ["term-1"],
@@ -113,7 +110,6 @@ describe("CenterTerminalPanel", () => {
           environmentId: EnvironmentId.make("environment-1"),
           threadId: ThreadId.make("thread-1"),
         }}
-        projectId={ProjectId.make("project-1")}
         surface={{
           id: "terminal:term-1",
           kind: "terminal",

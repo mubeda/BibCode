@@ -5,6 +5,7 @@ import {
   type ActivityRecordKind,
   type ActivityScopeRef,
   type ActivitySection,
+  type AgentSessionOpenMode,
   type ApprovalRequestId,
   DEFAULT_MODEL,
   defaultInstanceIdForDriver,
@@ -21,6 +22,7 @@ import {
   type ThreadId,
   type TurnId,
   type KeybindingCommand,
+  type OrchestrationReasoning,
   OrchestrationThreadActivity,
   ProviderInteractionMode,
   ProviderDriverKind,
@@ -38,6 +40,7 @@ import {
   findBlockingDelivery,
   waitsBehind,
   shouldEnqueueOnSend,
+  composerPhaseWhileCompacting,
   isQueuedTimelineMessage,
 } from "./ChatView.logic";
 import { queuedMessageCache } from "./chat/queuedMessageCache";
@@ -64,7 +67,6 @@ import {
   isConnectionUnavailable,
 } from "@bibcode/client-runtime/connection";
 import {
-  scopedProjectKey,
   scopedThreadKey,
   scopeProjectRef,
   scopeThreadRef,
@@ -115,7 +117,6 @@ import {
 import { isDesktopHost } from "../env";
 import { readLocalApi } from "../localApi";
 import { useDiffPanelStore } from "../diffPanelStore";
-import { selectActivityDockExpanded, useActivityDockStore } from "../activityDockStore";
 import { parseStandaloneComposerBiBCodeAction } from "../composer-logic";
 import {
   derivePendingApprovals,
@@ -126,12 +127,20 @@ import {
   deriveActivePlanState,
   findSidebarProposedPlan,
   findLatestProposedPlan,
+  deriveReasoningWorkEntries,
   deriveWorkLogEntries,
   hasActionableProposedPlan,
   isLatestTurnSettled,
 } from "../session-logic";
 import { type LegendListRef } from "@legendapp/list/react";
-import { getAnchoredTurnMetrics, type TimelineScrollMode } from "./chat/timelineScrollAnchoring";
+import {
+  getAnchoredTurnMetrics,
+  getTimelinePageScrollOffset,
+  pointerPressStopsLiveFollow,
+  rowToggleNeedsEndReveal,
+  timelineScrollAnimates,
+  type TimelineScrollMode,
+} from "./chat/timelineScrollAnchoring";
 import {
   buildPendingUserInputAnswers,
   derivePendingUserInputProgress,
@@ -175,6 +184,7 @@ import {
 import {
   selectActiveRightPanel,
   selectActiveRightPanelSurface,
+  selectActivityFocusRequested,
   selectThreadRightPanelState,
   type ActivityRightPanelSurface,
   type RightPanelSurface,
@@ -229,7 +239,11 @@ import { getConfiguredPreviewUrls } from "./preview/previewEmptyStateLogic";
 import { RightPanelTabs } from "./RightPanelTabs";
 import { useDevicePreviewsAvailability } from "./device/deviceAvailability";
 import { DiffWorkerPoolProvider } from "./DiffWorkerPoolProvider";
-import { resolveShortcutCommand, shortcutLabelForCommand } from "../keybindings";
+import {
+  resolveShortcutCommand,
+  shortcutLabelForCommand,
+  shouldOpenChatFind,
+} from "../keybindings";
 import PlanSidebar from "./PlanSidebar";
 import ThreadTerminalPanel, {
   enqueueTerminalInput,
@@ -259,7 +273,7 @@ import {
   projectDraftFallbackKeys,
   selectProjectGroupingSettings,
 } from "../logicalProject";
-import { buildDraftThreadRouteParams } from "../threadRoutes";
+import { buildDraftThreadRouteParams, buildThreadRouteParams } from "../threadRoutes";
 import {
   type ComposerAttachment,
   type DraftThreadEnvMode,
@@ -298,6 +312,8 @@ import { useProject, useThread, useThreadProposedPlans } from "../state/entities
 import { environmentShell } from "../state/shell";
 import { environmentActivity } from "../state/activity";
 import { ChatComposer, type ChatComposerHandle } from "./chat/ChatComposer";
+import { ComposerHistoryMenu, type ImportedSessionThread } from "./chat/ComposerHistoryMenu";
+import { historyUnavailableReason } from "./chat/ComposerHistoryMenu.logic";
 import { ExpandedImageDialog } from "./chat/ExpandedImageDialog";
 import { PullRequestThreadDialog } from "./PullRequestThreadDialog";
 import { MessagesTimeline } from "./chat/MessagesTimeline";
@@ -309,6 +325,7 @@ import { ChatPanelOpeningState, NoActiveThreadState } from "./NoActiveThreadStat
 import { resolveEffectiveEnvMode } from "./BranchToolbar.logic";
 import { ProviderStatusBanner } from "./chat/ProviderStatusBanner";
 import { ThreadErrorBanner, type ThreadErrorAction } from "./chat/ThreadErrorBanner";
+import { openThreadFindForTarget } from "./chat/threadFind/useThreadFind";
 import { ComposerBannerStack, type ComposerBannerStackItem } from "./chat/ComposerBannerStack";
 import {
   buildExpiredTerminalContextToastCopy,
@@ -339,6 +356,7 @@ import {
   threadErrorAttribution,
   threadErrorCompactAction,
   COMPACT_CONVERSATION_COMMAND,
+  isChatSurfaceFocus,
   waitForStartedServerThread,
 } from "./ChatView.logic";
 import { useLocalStorage } from "~/hooks/useLocalStorage";
@@ -372,6 +390,7 @@ import { ProjectFilesPreloader } from "./files/ProjectFilesPreloader";
 const ATTACHMENT_ONLY_BOOTSTRAP_PROMPT =
   "[User attached one or more files without additional text. Respond using the conversation context and the attachments.]";
 const EMPTY_ACTIVITIES: OrchestrationThreadActivity[] = [];
+const EMPTY_REASONING: ReadonlyArray<OrchestrationReasoning> = [];
 const EMPTY_PROVIDERS: ServerProvider[] = [];
 const EMPTY_PROVIDER_SKILLS: ServerProvider["skills"] = [];
 const EMPTY_PENDING_USER_INPUT_ANSWERS: Record<string, PendingUserInputDraftAnswer> = {};
@@ -390,6 +409,25 @@ const PullRequestPanelSurface = lazy(() =>
   })),
 );
 const EMPTY_PENDING_FILE_SURFACE_IDS: ReadonlySet<string> = new Set();
+
+/** Adds or removes one file surface id in a project's set, keeping identities when unchanged. */
+function setProjectFileSurfaceFlag(
+  currentByProject: ReadonlyMap<string, ReadonlySet<string>>,
+  projectKey: string,
+  relativePath: string,
+  flagged: boolean,
+): ReadonlyMap<string, ReadonlySet<string>> {
+  const current = currentByProject.get(projectKey) ?? EMPTY_PENDING_FILE_SURFACE_IDS;
+  const surfaceId = `file:${relativePath}`;
+  if (current.has(surfaceId) === flagged) return currentByProject;
+  const next = new Set(current);
+  if (flagged) next.add(surfaceId);
+  else next.delete(surfaceId);
+  const nextByProject = new Map(currentByProject);
+  if (next.size === 0) nextByProject.delete(projectKey);
+  else nextByProject.set(projectKey, next);
+  return nextByProject;
+}
 const TYPE_TO_FOCUS_EDITABLE_SELECTOR = [
   "input",
   "textarea",
@@ -540,32 +578,20 @@ interface ActivityStateTarget {
 const ActivityDockBinding = memo(function ActivityDockBinding({
   target,
   threadRef,
-  projectId,
   compact,
+  alwaysVisible,
   avoidRightPanelSheet,
 }: {
   readonly target: ActivityStateTarget;
   readonly threadRef: ScopedThreadRef;
-  readonly projectId: ProjectId;
   readonly compact: boolean;
+  readonly alwaysVisible: boolean;
   readonly avoidRightPanelSheet: boolean;
 }) {
   const stateValueAtom = useMemo(() => environmentActivity.stateValueAtom(target), [target]);
   const activityState =
     useAtomValue(stateValueAtom) ?? (EMPTY_ENVIRONMENT_ACTIVITY_STATE as EnvironmentActivityState);
   const snapshot = useMemo(() => activitySnapshotForState(activityState), [activityState]);
-  const projectKey = useMemo(
-    () => scopedProjectKey(scopeProjectRef(target.environmentId, projectId)),
-    [projectId, target.environmentId],
-  );
-  const expanded = useActivityDockStore((state) =>
-    selectActivityDockExpanded(state.expandedByProject, projectKey),
-  );
-  const setExpanded = useActivityDockStore((state) => state.setExpanded);
-  const onExpandedChange = useCallback(
-    (nextExpanded: boolean) => setExpanded(projectKey, nextExpanded),
-    [projectKey, setExpanded],
-  );
   const onOpenSection = useCallback(
     (section: ActivitySection) =>
       useRightPanelStore.getState().openActivity(threadRef, section, target.input),
@@ -578,10 +604,9 @@ const ActivityDockBinding = memo(function ActivityDockBinding({
   return (
     <ActivityDock
       snapshot={snapshot}
-      expanded={expanded}
       compact={compact}
+      alwaysVisible={alwaysVisible}
       avoidRightPanelSheet={avoidRightPanelSheet}
-      onExpandedChange={onExpandedChange}
       onOpenSection={onOpenSection}
     />
   );
@@ -797,6 +822,13 @@ const ActivityPanelBinding = memo(function ActivityPanelBinding({
     ) => useRightPanelStore.getState().navigateActivity(threadRef, route),
     [threadRef],
   );
+  const focusRequested = useRightPanelStore((state) =>
+    selectActivityFocusRequested(state, threadRef),
+  );
+  const onFocusRequestHandled = useCallback(
+    () => useRightPanelStore.getState().acknowledgeActivityFocus(threadRef),
+    [threadRef],
+  );
   const loadMoreActiveRoster = activeRoster.loadMore;
   const loadMoreDoneRoster = doneRoster.loadMore;
   const onLoadMoreRoster = useCallback(
@@ -946,6 +978,8 @@ const ActivityPanelBinding = memo(function ActivityPanelBinding({
       onLoadMoreRoster={onLoadMoreRoster}
       onLoadMoreDetail={detailQuery.loadMore}
       onRefreshSnapshot={refreshSnapshot}
+      focusRequested={focusRequested}
+      onFocusRequestHandled={onFocusRequestHandled}
       cancellationError={cancellationError}
       {...(cancellationTarget === null ? {} : { onCancelActor, onRetryCancellation })}
     />
@@ -1288,7 +1322,6 @@ const PersistentThreadTerminalPanel = memo(function PersistentThreadTerminalPane
       owner="right-panel"
       threadRef={threadRef}
       threadId={threadRef.threadId}
-      projectId={project.id}
       cwd={cwd}
       worktreePath={worktreePath}
       runtimeEnv={runtimeEnv}
@@ -1328,7 +1361,6 @@ interface LiveCenterPanelWorkspaceProps {
   readonly terminalLabelsById: ReadonlyMap<string, string>;
   readonly renderFocusedActions: CenterPanelWorkspaceProps["renderFocusedActions"];
   readonly hostChatSurfaceBody: ReactNode;
-  readonly hostThread: Thread;
   readonly hostThreadRef: ScopedThreadRef;
   readonly centerTerminalLaunchContext: {
     readonly cwd: string;
@@ -1357,7 +1389,6 @@ const LiveCenterPanelWorkspace = memo(function LiveCenterPanelWorkspace({
   terminalLabelsById,
   renderFocusedActions,
   hostChatSurfaceBody,
-  hostThread,
   hostThreadRef,
   centerTerminalLaunchContext,
   keybindings,
@@ -1391,7 +1422,6 @@ const LiveCenterPanelWorkspace = memo(function LiveCenterPanelWorkspace({
           return (
             <CenterTerminalPanel
               threadRef={hostThreadRef}
-              projectId={hostThread.projectId}
               surface={surface}
               launchContext={centerTerminalLaunchContext}
               keybindings={keybindings}
@@ -1407,7 +1437,6 @@ const LiveCenterPanelWorkspace = memo(function LiveCenterPanelWorkspace({
     [
       centerTerminalLaunchContext,
       hostChatSurfaceBody,
-      hostThread.projectId,
       hostThreadRef,
       keybindings,
       onAddTerminalContext,
@@ -1528,6 +1557,7 @@ function ChatViewContent(props: ChatViewProps) {
   const revertThreadCheckpoint = useAtomCommand(threadEnvironment.revertCheckpoint, {
     reportFailure: false,
   });
+  const compactThread = useAtomCommand(threadEnvironment.compact, { reportFailure: false });
   const openPreview = useAtomCommand(previewEnvironment.open, { reportFailure: false });
   const closePreview = useAtomCommand(previewEnvironment.close, "preview close");
   const { environments } = useEnvironments();
@@ -1700,6 +1730,8 @@ function ChatViewContent(props: ChatViewProps) {
   const legendListRef = useRef<LegendListRef | null>(null);
   const [composerOverlayElement, setComposerOverlayElement] = useState<HTMLDivElement | null>(null);
   const [composerOverlayHeight, setComposerOverlayHeight] = useState(0);
+  // The chat column, so Mod+F inside it opens this chat's find rather than the host's.
+  const [chatSurfaceElement, setChatSurfaceElement] = useState<HTMLDivElement | null>(null);
   const isAtEndRef = useRef(true);
   const attachmentPreviewHandoffByMessageIdRef = useRef<Record<string, string[]>>({});
   const attachmentPreviewPromotionInFlightByMessageIdRef = useRef<Record<string, true>>({});
@@ -2144,23 +2176,6 @@ function ChatViewContent(props: ChatViewProps) {
     workspaceUnavailableRef.current = workspaceUnavailable;
   }, [workspaceUnavailable]);
   const readWorkspaceUnavailable = useCallback(() => workspaceUnavailableRef.current, []);
-  const consumeActivityDockEscapeClose = useCallback(() => {
-    if (!activeThread) {
-      return false;
-    }
-    const projectKey = scopedProjectKey(
-      scopeProjectRef(activeThread.environmentId, activeThread.projectId),
-    );
-    const state = useActivityDockStore.getState();
-    if (!selectActivityDockExpanded(state.expandedByProject, projectKey)) {
-      return false;
-    }
-    state.setExpanded(projectKey, false);
-    return !selectActivityDockExpanded(
-      useActivityDockStore.getState().expandedByProject,
-      projectKey,
-    );
-  }, [activeThread]);
   const activeEnvironmentShell = useEnvironmentQuery(
     activeThread ? environmentShell.stateAtom(activeThread.environmentId) : null,
   );
@@ -2216,21 +2231,30 @@ function ChatViewContent(props: ChatViewProps) {
   const handleFilePendingChange = useCallback(
     (relativePath: string, pending: boolean) => {
       if (!activeProjectKey) return;
-      setPendingFileSurfaceIdsByProject((currentByProject) => {
-        const current = currentByProject.get(activeProjectKey) ?? EMPTY_PENDING_FILE_SURFACE_IDS;
-        const surfaceId = `file:${relativePath}`;
-        if (current.has(surfaceId) === pending) return currentByProject;
-        const next = new Set(current);
-        if (pending) next.add(surfaceId);
-        else next.delete(surfaceId);
-        const nextByProject = new Map(currentByProject);
-        if (next.size === 0) nextByProject.delete(activeProjectKey);
-        else nextByProject.set(activeProjectKey, next);
-        return nextByProject;
-      });
+      setPendingFileSurfaceIdsByProject((currentByProject) =>
+        setProjectFileSurfaceFlag(currentByProject, activeProjectKey, relativePath, pending),
+      );
     },
     [activeProjectKey],
   );
+  // File tabs whose edits conflict with a newer state on disk, marked even in the background.
+  const [conflictFileSurfaceIdsByProject, setConflictFileSurfaceIdsByProject] = useState<
+    ReadonlyMap<string, ReadonlySet<string>>
+  >(() => new Map());
+  const conflictFileSurfaceIds = activeProjectKey
+    ? (conflictFileSurfaceIdsByProject.get(activeProjectKey) ?? EMPTY_PENDING_FILE_SURFACE_IDS)
+    : EMPTY_PENDING_FILE_SURFACE_IDS;
+  const handleFileConflictChange = useCallback(
+    (relativePath: string, conflicted: boolean) => {
+      if (!activeProjectKey) return;
+      setConflictFileSurfaceIdsByProject((currentByProject) =>
+        setProjectFileSurfaceFlag(currentByProject, activeProjectKey, relativePath, conflicted),
+      );
+    },
+    [activeProjectKey],
+  );
+  // A settled turn often edited files: check the shown file's disk version at once.
+  const fileDiskCheckSignal = latestTurnSettled ? (activeLatestTurn?.turnId ?? null) : null;
   const configuredPreviewUrls = useMemo(
     () => getConfiguredPreviewUrls(activeProject?.scripts),
     [activeProject?.scripts],
@@ -2623,7 +2647,15 @@ function ChatViewContent(props: ChatViewProps) {
     lockedProvider ?? providerBinding.driver ?? unlockedSelectedProvider;
   const phase = derivePhase(activeThread?.session ?? null);
   const threadActivities = activeThread?.activities ?? EMPTY_ACTIVITIES;
-  const workLogEntries = useMemo(() => deriveWorkLogEntries(threadActivities), [threadActivities]);
+  const threadReasoning = activeThread?.reasoning ?? EMPTY_REASONING;
+  // Thoughts sort among tool calls by the time each began (#173).
+  const workLogEntries = useMemo(
+    () => [
+      ...deriveWorkLogEntries(threadActivities),
+      ...deriveReasoningWorkEntries(threadReasoning),
+    ],
+    [threadActivities, threadReasoning],
+  );
   const pendingApprovals = useMemo(
     () => derivePendingApprovals(threadActivities),
     [threadActivities],
@@ -2733,6 +2765,10 @@ function ChatViewContent(props: ChatViewProps) {
     [blockingId, blockingCreatedAt, blockingOffersRetry],
   );
   const supportsTurnSteer = providerBinding.status?.supportsTurnSteer === true;
+  const supportsCompaction = providerBinding.status?.supportsCompaction === true;
+  const compaction = activeThread?.compaction;
+  const compactionFailedMessageId = compaction?.failedMessageId ?? null;
+  const composerPhase = composerPhaseWhileCompacting(phase, compaction !== undefined);
   const hasPendingApproval = activePendingApproval !== null;
   const hasPendingUserInput = activePendingUserInput !== null;
   const queueSessionStatus = activeThread?.session?.status ?? null;
@@ -4034,6 +4070,28 @@ function ChatViewContent(props: ChatViewProps) {
     setScrollPillThreadId(null);
     void legendListRef.current?.scrollToEnd?.({ animated });
   }, []);
+  const pageTimeline = useCallback(
+    (key: "PageUp" | "PageDown", repeat: boolean) => {
+      const list = legendListRef.current;
+      const state = list?.getState();
+      if (!list || !state) {
+        return;
+      }
+      const offset = getTimelinePageScrollOffset({
+        state,
+        composerOverlayHeight,
+        direction: key === "PageUp" ? -1 : 1,
+      });
+      // Already at that end: nothing moves, and following the live end must not stop.
+      if (Math.abs(offset - state.scroll) < 1) {
+        return;
+      }
+      cancelTimelineLiveFollowForUserNavigation();
+      // A held key repeats faster than a glide finishes, so repeats jump.
+      void list.scrollToOffset({ offset, animated: !repeat && timelineScrollAnimates() });
+    },
+    [cancelTimelineLiveFollowForUserNavigation, composerOverlayHeight],
+  );
   // The timeline remounts per thread (it is keyed by thread id), so bind to
   // each thread's scroll node; without a thread there is no timeline.
   useEffect(() => {
@@ -4055,13 +4113,19 @@ function ChatViewContent(props: ChatViewProps) {
       scrollNode.addEventListener("touchmove", handleManualNavigation, {
         passive: true,
       });
-      scrollNode.addEventListener("pointerdown", handleManualNavigation, {
+      // A press on a row's control is a click, not a scroll, so following goes on (#173).
+      const handlePointerDown = (event: PointerEvent) => {
+        if (pointerPressStopsLiveFollow(event.target)) {
+          handleManualNavigation();
+        }
+      };
+      scrollNode.addEventListener("pointerdown", handlePointerDown, {
         passive: true,
       });
       removeListeners = () => {
         scrollNode.removeEventListener("wheel", handleManualNavigation);
         scrollNode.removeEventListener("touchmove", handleManualNavigation);
-        scrollNode.removeEventListener("pointerdown", handleManualNavigation);
+        scrollNode.removeEventListener("pointerdown", handlePointerDown);
       };
     });
 
@@ -4185,6 +4249,38 @@ function ChatViewContent(props: ChatViewProps) {
       showScrollDebouncer.current.maybeExecute(scrollPillThreadIdRef.current);
     }
   }, []);
+
+  // A Thinking row toggled at the end of an anchored turn changes layout but not
+  // `timelineEntries`, so the follow effect below never sees it (#173). One pass reveals the
+  // end again once the row re-measured; the other modes keep their own place.
+  const onReasoningRowToggle = useCallback(() => {
+    // The toggle has not rendered yet, so this is where the turn's end sat before it.
+    const before = legendListRef.current
+      ? getActiveTimelineTurnMetrics(legendListRef.current)
+      : null;
+    if (
+      !rowToggleNeedsEndReveal({
+        mode: timelineScrollModeRef.current,
+        scrollDeltaToRevealEnd: before?.scrollDeltaToRevealEnd ?? null,
+      }) ||
+      liveFollowUserScrollGenerationRef.current !== anchorUserScrollGenerationRef.current
+    ) {
+      return;
+    }
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        const list = legendListRef.current;
+        const metrics = list ? getActiveTimelineTurnMetrics(list) : null;
+        if (!list || !metrics || metrics.scrollDeltaToRevealEnd <= 1) {
+          return;
+        }
+        void list.scrollToOffset({
+          offset: list.getState().scroll + metrics.scrollDeltaToRevealEnd,
+          animated: false,
+        });
+      });
+    });
+  }, [getActiveTimelineTurnMetrics]);
 
   // Follows the end after new timeline entries render; an empty timeline has nothing to follow.
   useEffect(() => {
@@ -4442,6 +4538,104 @@ function ChatViewContent(props: ChatViewProps) {
       void reopenCenterChatPanel(activeThreadRef, threadId, providerLabel);
     },
     [activeThreadRef, reopenCenterChatPanel],
+  );
+  // History acts for the host thread, also from a chat panel's composer.
+  const historyHostThreadId = isPanel
+    ? (activeThread?.hostThreadId ?? null)
+    : isServerThread
+      ? (activeThread?.id ?? null)
+      : null;
+  const historyEnvironmentId = activeThread?.environmentId ?? environmentId;
+  const historyHostRef = useMemo(
+    () =>
+      historyHostThreadId === null
+        ? null
+        : scopeThreadRef(historyEnvironmentId, historyHostThreadId),
+    [historyEnvironmentId, historyHostThreadId],
+  );
+  const openCenterPanelThread = centerPanelActions.openPanelThread;
+  const openCenterSessionPanel = centerPanelActions.openSessionPanel;
+  const reopenHistoryChat = useCallback(
+    (threadId: ThreadId, label: string) => {
+      if (!historyHostRef) return;
+      void reopenCenterChatPanel(historyHostRef, threadId, label);
+    },
+    [historyHostRef, reopenCenterChatPanel],
+  );
+  // A session's thread opens where it lives: a panel of this host, another host's panel (which
+  // that host's view activates), or a sidebar thread.
+  const showSessionThread = useCallback(
+    async (thread: ImportedSessionThread, title: string) => {
+      if (!historyHostRef) return;
+      if (thread.hostThreadId === null) {
+        await navigate({
+          to: "/$environmentId/$threadId",
+          params: buildThreadRouteParams(
+            scopeThreadRef(historyHostRef.environmentId, thread.threadId),
+          ),
+        });
+        return;
+      }
+      const hostRef = scopeThreadRef(historyHostRef.environmentId, thread.hostThreadId);
+      await openCenterPanelThread(hostRef, thread.threadId, title, thread.archived);
+      if (thread.hostThreadId !== historyHostRef.threadId) {
+        await navigate({
+          to: "/$environmentId/$threadId",
+          params: buildThreadRouteParams(hostRef),
+        });
+      }
+    },
+    [historyHostRef, navigate, openCenterPanelThread],
+  );
+  const openHistorySessionThread = useCallback(
+    (thread: ImportedSessionThread, title: string) => {
+      void showSessionThread(thread, title);
+    },
+    [showSessionThread],
+  );
+  const continueTerminalSession = useCallback(
+    async (sessionId: string, mode: AgentSessionOpenMode, title: string) => {
+      if (!historyHostRef) return false;
+      const opened = await openCenterSessionPanel(historyHostRef, { sessionId, mode, title });
+      if (opened === null) return false;
+      if (opened.hostThreadId !== historyHostRef.threadId) {
+        await showSessionThread(
+          { threadId: opened.threadId, hostThreadId: opened.hostThreadId },
+          title,
+        );
+      }
+      return true;
+    },
+    [historyHostRef, openCenterSessionPanel, showSessionThread],
+  );
+  const historyUnavailable = historyUnavailableReason({
+    started: historyHostRef !== null,
+    unavailableEnvironmentLabel: activeEnvironmentUnavailableState?.label ?? null,
+    workspaceUnavailable,
+  });
+  const historyEnvironmentLabel = activeEnvironment?.label ?? "the server";
+  // A slot element, so the memoized composer footer keeps stable props.
+  const historyMenu = useMemo(
+    () => (
+      <ComposerHistoryMenu
+        environmentId={historyEnvironmentId}
+        hostThreadId={historyHostRef?.threadId ?? null}
+        unavailableReason={historyUnavailable}
+        environmentLabel={historyEnvironmentLabel}
+        onReopenChat={reopenHistoryChat}
+        onOpenImported={openHistorySessionThread}
+        onContinueSession={continueTerminalSession}
+      />
+    ),
+    [
+      continueTerminalSession,
+      historyEnvironmentId,
+      historyEnvironmentLabel,
+      historyHostRef,
+      historyUnavailable,
+      openHistorySessionThread,
+      reopenHistoryChat,
+    ],
   );
   const openCenterTerminal = useCallback(
     async (
@@ -4800,6 +4994,7 @@ function ChatViewContent(props: ChatViewProps) {
         terminalFocus: terminalFocusOwner !== null,
         terminalOpen: hasTerminalSurface,
         modelPickerOpen: composerRef.current?.isModelPickerOpen() ?? false,
+        chatFocus: isChatSurfaceFocus(event.target, document.activeElement, document.body),
       };
 
       if (
@@ -4817,6 +5012,14 @@ function ChatViewContent(props: ChatViewProps) {
       const command = resolveShortcutCommand(event, keybindings, {
         context: shortcutContext,
       });
+      // A rule naming chat.find, or the built-in Mod+F inside a chat when no rule claims it.
+      // Find opens in the chat surface that holds the target, or the host chat.
+      if (shouldOpenChatFind(command, event, keybindings, shortcutContext)) {
+        event.preventDefault();
+        event.stopPropagation();
+        openThreadFindForTarget(event.target);
+        return;
+      }
       if (!command) return;
 
       if (command === "terminal.newCenter") {
@@ -5254,6 +5457,7 @@ function ChatViewContent(props: ChatViewProps) {
       phase,
       sessionStatus: activeThread?.session?.status ?? null,
       hasPendingDelivery: canCancelPendingSend,
+      compacting: compaction !== undefined,
     });
     if (
       !activeThread ||
@@ -5960,7 +6164,12 @@ function ChatViewContent(props: ChatViewProps) {
         if (message.delivery?.state === "queued") await onCancelQueuedMessage(message.id);
       }
 
-      if (phase !== "running" && cancellableDeliveryThreadId && cancellableDeliveryMessageId) {
+      if (
+        compaction === undefined &&
+        phase !== "running" &&
+        cancellableDeliveryThreadId &&
+        cancellableDeliveryMessageId
+      ) {
         const result = await resolveTurnDelivery({
           environmentId,
           input: {
@@ -6348,11 +6557,29 @@ function ChatViewContent(props: ChatViewProps) {
     ],
   );
 
-  // The context-limit error's recovery: sends the provider's compaction command to the same
-  // session as an ordinary message, so it is delivered, queued and confirmed like any other.
-  // It never resends the failed message; the user does that once the compaction finishes.
+  // The context-limit error's recovery. A provider the server can compact gets `thread.compact`,
+  // which compacts the conversation the next message continues and shows its step. Otherwise
+  // (an older server, or a provider without the capability) it sends the provider's compaction
+  // command to the same session as an ordinary message, delivered, queued and confirmed like any
+  // other. Neither resends the failed message; the user does that once the compaction finishes.
   const onCompactConversation = useCallback(async () => {
     if (!activeThread || !isServerThread || isSendBusy || isConnecting || sendInFlightRef.current) {
+      return;
+    }
+    if (supportsCompaction) {
+      const threadIdForCompaction = activeThread.id;
+      setThreadError(threadIdForCompaction, null);
+      const result = await compactThread({
+        environmentId,
+        input: { threadId: threadIdForCompaction },
+      });
+      if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
+        const error = squashAtomCommandFailure(result);
+        setThreadError(
+          threadIdForCompaction,
+          error instanceof Error ? error.message : "BiBCode could not compact the conversation.",
+        );
+      }
       return;
     }
     const sendCtx = composerRef.current?.getSendContext();
@@ -6416,6 +6643,7 @@ function ChatViewContent(props: ChatViewProps) {
   }, [
     activeThread,
     beginLocalDispatch,
+    compactThread,
     composerRef,
     environmentId,
     interactionMode,
@@ -6426,6 +6654,7 @@ function ChatViewContent(props: ChatViewProps) {
     runtimeMode,
     setThreadError,
     startThreadTurn,
+    supportsCompaction,
   ]);
   const threadErrorCompact =
     threadError === null || !isServerThread
@@ -6434,6 +6663,9 @@ function ChatViewContent(props: ChatViewProps) {
           isBiBCodeAction: localServerError !== null,
           errorClass: serverThread?.session?.lastErrorClass ?? null,
           busy: phase === "running" || isSendBusy || isConnecting,
+          providerDriver: providerBinding.driver,
+          supportsCompaction: providerBinding.status?.supportsCompaction,
+          compaction: serverThread?.compaction,
         });
   // `threadErrorCompact` is a fresh object each render; its presence and reason are the inputs.
   const offersCompact = threadErrorCompact !== null;
@@ -6823,7 +7055,11 @@ function ChatViewContent(props: ChatViewProps) {
       </Suspense>
     ) : activeRightPanelSurface?.kind === "device" ? (
       <Suspense fallback={null}>
-        <DevicePanel environmentId={activeThreadRef.environmentId} />
+        {/* A chat panel's devices are its host's, so the pane works for the root thread. */}
+        <DevicePanel
+          threadRef={activeThreadRef}
+          rootThreadId={activeThread?.hostThreadId ?? activeThreadRef.threadId}
+        />
       </Suspense>
     ) : activeRightPanelSurface?.kind === "pullRequest" ? (
       <Suspense fallback={null}>
@@ -6877,8 +7113,10 @@ function ChatViewContent(props: ChatViewProps) {
           revealRequestId={activeFileSurface?.revealRequestId ?? 0}
           onOpenFile={openFileSurface}
           onPendingChange={handleFilePendingChange}
+          onConflictChange={handleFileConflictChange}
           editingSessions={fileEditingSessions}
           workspaceUnavailable={workspaceUnavailable}
+          diskCheckSignal={fileDiskCheckSignal}
         />
       </Suspense>
     ) : null
@@ -6928,7 +7166,11 @@ function ChatViewContent(props: ChatViewProps) {
               />
               <div className="flex min-h-0 min-w-0 flex-1">
                 {/* Chat column */}
-                <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
+                <div
+                  ref={setChatSurfaceElement}
+                  className="relative flex min-h-0 min-w-0 flex-1 flex-col"
+                  data-chat-surface=""
+                >
                   {/* Messages Wrapper */}
                   <div className="relative flex min-h-0 flex-1 flex-col">
                     {activityStateTarget !== null &&
@@ -6937,14 +7179,20 @@ function ChatViewContent(props: ChatViewProps) {
                       <ActivityDockBinding
                         target={activityStateTarget}
                         threadRef={activeThreadRef}
-                        projectId={activeThread.projectId}
                         compact={shouldUseCompactActivityDock}
+                        // The setting covers the chat's own activity; a terminal scope keeps the record rule.
+                        alwaysVisible={
+                          settings.activityDockAlwaysVisible &&
+                          activityStateTarget.input._tag === "thread"
+                        }
                         avoidRightPanelSheet={shouldUsePlanSidebarSheet && effectiveRightPanelOpen}
                       />
                     ) : null}
                     {/* Messages — LegendList handles virtualization and scrolling internally */}
                     <MessagesTimeline
-                      key={activeThread.id}
+                      // Scoped, so the same thread id in another environment starts over,
+                      // find state included.
+                      key={routeThreadKey}
                       isWorking={isWorking}
                       activeTurnInProgress={isWorking || !latestTurnSettled}
                       activeTurnStartedAt={activeWorkStartedAt}
@@ -6974,12 +7222,14 @@ function ChatViewContent(props: ChatViewProps) {
                       onResolveTurnDelivery={onResolveTurnDelivery}
                       resolvingTurnDeliveryMessageId={resolvingTurnDeliveryMessageId}
                       blockingDelivery={blockingDelivery}
+                      compactionFailedMessageId={compactionFailedMessageId}
                       instanceLabels={instanceLabels}
                       isRevertingCheckpoint={isRevertingCheckpoint}
                       onImageExpand={onExpandTimelineImage}
                       markdownCwd={gitCwd ?? undefined}
                       resolvedTheme={resolvedTheme}
                       timestampFormat={timestampFormat}
+                      verboseChat={settings.verboseChat}
                       workspaceRoot={activeWorkspaceRoot}
                       skills={activeProviderStatus?.skills ?? EMPTY_PROVIDER_SKILLS}
                       anchorMessageId={timelineAnchorMessageId}
@@ -6988,6 +7238,11 @@ function ChatViewContent(props: ChatViewProps) {
                       contentInsetEndAdjustment={composerOverlayHeight}
                       onIsAtEndChange={onIsAtEndChange}
                       onManualNavigation={cancelTimelineLiveFollowForUserNavigation}
+                      findThreadRef={routeKind === "server" ? routeThreadRef : null}
+                      findSurfaceRoot={chatSurfaceElement}
+                      isHostFindSurface={!isPanel}
+                      onFindFocusComposer={focusComposer}
+                      onReasoningRowToggle={onReasoningRowToggle}
                     />
 
                     {/* scroll to end pill — shown when user has scrolled away from the live edge */}
@@ -7040,7 +7295,7 @@ function ChatViewContent(props: ChatViewProps) {
                             activeThread={activeThread}
                             isServerThread={isServerThread}
                             isLocalDraftThread={isLocalDraftThread}
-                            phase={phase}
+                            phase={composerPhase}
                             isConnecting={isConnecting}
                             isSendBusy={
                               isSendBusy || hasActiveAttachmentUpload || applicationSendBusy
@@ -7113,6 +7368,8 @@ function ChatViewContent(props: ChatViewProps) {
                             scheduleComposerFocus={scheduleComposerFocus}
                             setThreadError={setThreadError}
                             onExpandImage={onExpandTimelineImage}
+                            onPageTimeline={pageTimeline}
+                            historyMenu={historyMenu}
                           />
                         </div>
                       </div>
@@ -7184,7 +7441,6 @@ function ChatViewContent(props: ChatViewProps) {
                 />
               )}
               hostChatSurfaceBody={hostChatSurfaceBody}
-              hostThread={activeThread}
               hostThreadRef={activeThreadRef}
               centerTerminalLaunchContext={centerTerminalLaunchContext}
               keybindings={keybindings}
@@ -7215,6 +7471,7 @@ function ChatViewContent(props: ChatViewProps) {
           surfaces={renderedRightPanelSurfaces}
           activeSurfaceId={activeRightPanelSurface?.id ?? null}
           pendingSurfaceIds={pendingFileSurfaceIds}
+          conflictSurfaceIds={conflictFileSurfaceIds}
           previewSessions={activePreviewState.sessions}
           previewDesktopByTabId={activePreviewState.desktopByTabId}
           terminalLabelsById={activeTerminalLabelsById}
@@ -7239,11 +7496,7 @@ function ChatViewContent(props: ChatViewProps) {
         </RightPanelTabs>
       ) : null}
       {effectiveRightPanelOpen && shouldUsePlanSidebarSheet && activeThreadRef ? (
-        <RightPanelSheet
-          open
-          onClose={planSidebarOpen ? closePlanSidebar : closePreviewPanel}
-          consumeEscapeClose={consumeActivityDockEscapeClose}
-        >
+        <RightPanelSheet open onClose={planSidebarOpen ? closePlanSidebar : closePreviewPanel}>
           <RightPanelTabs
             mode="sheet"
             {...(!isPanel ? { layoutControls: panelToggleControls } : {})}
@@ -7251,6 +7504,7 @@ function ChatViewContent(props: ChatViewProps) {
             surfaces={renderedRightPanelSurfaces}
             activeSurfaceId={activeRightPanelSurface?.id ?? null}
             pendingSurfaceIds={pendingFileSurfaceIds}
+            conflictSurfaceIds={conflictFileSurfaceIds}
             previewSessions={activePreviewState.sessions}
             previewDesktopByTabId={activePreviewState.desktopByTabId}
             terminalLabelsById={activeTerminalLabelsById}

@@ -44,7 +44,16 @@ cargo test -p bibcode-server --lib diagnostics::native::tests:: -j 2
 cargo test -p bibcode-server --lib diagnostics::resource_sampler::tests:: -j 2
 cargo test -p bibcode-server --lib diagnostics::monitor::tests:: -j 2
 cargo test -p bibcode-server --lib production::server_terminal::tests::embedded_host_cleanup_preserves_unmanaged_host_descendants -j 2 -- --exact
+cargo test -p bibcode-server --lib diagnostics::registry::tests::a_surviving_registration_is_no_shutdown_root -j 2 -- --exact
+cargo test -p bibcode-server --lib production::runtime::tests::quiesce_in_ -j 2
 ```
+
+A registration marked `survives_shutdown` (a diff app opened through
+**Open with**) must never be a shutdown root, and a standalone server's
+descendant sweep must spare it and its descendants while still ending an
+ordinary registered helper. The quiesce tests check both on Linux, where
+cleanup signals through a pidfd; on macOS cleanup ends nothing, so only the
+survivors' half applies there.
 
 Construction must leave the native process table empty. The first diagnostics
 read starts the background sampler; its first sample must discover the current
@@ -122,6 +131,19 @@ doc comments of `live_opencode_2_round_trip`, `live_opencode_2_local_inventory`
 and `live_opencode_2_terminal_observation` list the environment they need; the
 server's default model must be a scripted local endpoint so no provider credits
 are spent.
+
+Compaction and retries apply to Codex and OpenCode 2. Send `/compact` and
+confirm a **Conversation compaction** step in the work log, no `/compact` text
+reaching the model, and the next message continuing the conversation. On
+OpenCode 2, also confirm the context meter shows usage against the model's
+window after the first reply. A Codex turn that fails with
+`contextWindowExceeded` offers **Compact conversation**. The focused checks are
+`cargo test -p bibcode-server --lib -j 2 -- codex::runtime opencode::v2` and
+`native_process_adapters_cover_live_codex_claude_cursor_and_grok_commands`.
+Their compaction and retry frames come from Codex's generated app-server
+schema and OpenCode 2.1.4's event schema, not from live captures, so record a
+live compaction on each provider in the execution report when one is
+available.
 
 ## Revision and worktree preflight
 
@@ -329,7 +351,24 @@ cargo test -p bibcode-server --test production_provider_runtime provider_session
 cargo test -p bibcode-server codex::runtime -j 2
 cargo test -p bibcode-server --test repositories -j 2
 cargo test -p bibcode-server migrations -j 2
+cargo test -p bibcode-server --lib thread_compaction -j 2
+cargo test -p bibcode-server --lib compaction -j 2
+cargo test -p bibcode-server --lib provider_turn_failure -j 2
 ```
+
+Context-limit recovery, the guard and **Compact conversation** share these
+seams (`thread_compaction_tests.rs` drives the engine and delivery worker, the
+`provider_runtime` compaction tests drive the effect with the fake driver, and
+`provider::claude` covers the tagged `/compact` turn and failure facts; the
+Profiler's `provider.compaction` and `provider.turn-failed` records are checked
+through a test-only per-thread capture in `provider_turns.rs`). The
+failure cannot be produced on demand with auto-compaction on, so live
+validation is manual: with `DISABLE_AUTO_COMPACT=1` on a Claude instance, a
+context-limit stop shows today's error and no recovery; **Compact
+conversation** compacts through `thread.compact` and shows the step; a thread
+over the guard threshold shows "Waiting for the conversation to be compacted."
+then the compaction, then the answer; Stop during that compaction leaves the
+message failed with Retry.
 
 Deliver a queued message at completion and let its turn run past the idle timeout;
 the session must stay live until one idle timeout after that turn completes.
@@ -370,6 +409,33 @@ Send a message in a chat panel whose provider takes several seconds to start,
 then close the panel's tab before the client shows it running: no turn may start
 or keep running in the workspace, and **Reopen closed chat** must deliver the
 message once.
+
+Composer **History** (needs Claude Code 2.0.73 or later on the server host):
+
+- With no Claude Code session running, check whether `<Claude config
+  dir>/sessions/` still exists and record the platform's answer; a missing
+  directory reads every session as "Can't tell whether it's open". Then run a
+  BiBCode Claude panel and record whether its process writes an entry there
+  and with which `entrypoint` (`sdk-rust` is expected and skipped).
+- Run `claude` in a worktree, send a prompt, `/rename` it, and exit. In that
+  worktree thread, **History** must list it under **Claude Code terminal** with
+  the new name and branch, and **This thread** must list the same closed chats
+  as **Reopen closed chat**. **Continue**, send a message, then run
+  `claude --resume <id>` in a terminal there: the BiBCode turn must be in its
+  conversation, and the panel must run in the thread's permission mode.
+- With `claude` still open in the terminal, the row must read **Open in a
+  terminal · Continue in a copy**. Continue the copy and send: the terminal's
+  conversation must have no BiBCode turn, and History must list the source but
+  not the copy.
+- On a remote environment, the empty state must add "Only sessions run on
+  <label> appear here."; against a server without the `cliSessionHistory`
+  capability, the section must ask to update it while **This thread** still
+  works. With a read-only primary connection, the button must be disabled with
+  "This connection can only view threads."
+- Measure `agentSessions.listForThread` (its `rpc.timing` or the profiler's
+  trace) on a folder with 200 terminal sessions and on one with 1,000 Desktop
+  sessions and 5 terminal sessions; record both durations. Over 1 s on either
+  means the listing budget needs lowering.
 
 Verify enqueue without a turn-start event or working projection, oldest-first
 promotion once per settle, explicit Send now clearing only its row's hold,
@@ -615,6 +681,50 @@ subprocess fixture, record that evidence as unavailable with its exact blocker
 and assign the missing run to a capable host. Never infer a packaged or native
 provider pass from static checks or unit tests.
 
+### Provider reasoning rows
+
+Claude thinking and Codex reasoning summaries are chat reasoning entries
+([Provider reasoning](../architecture/rpc-and-orchestration.md#provider-reasoning)).
+For a change to provider reasoning, its persistence, or the Thinking rows, run
+the server seams (the coalescer and settlement tests drive the real event pump
+on a paused clock), then the client and renderer seams:
+
+```sh
+cargo test -p bibcode-server --lib reasoning
+cargo test -p bibcode-server --test provider_claude --test provider_codex --test orchestration --test production_provider_runtime
+vp test run packages/contracts/src/orchestration.test.ts packages/client-runtime/src/state/reasoning.test.ts packages/client-runtime/src/state/threadReducer.test.ts packages/client-runtime/src/state/threadStreamParity.test.ts
+cd apps/web && vp test run --project unit src/components/chat/MessagesTimeline.logic.test.ts src/components/chat/MessagesTimeline.test.tsx src/components/chat/timelineScrollAnchoring.test.tsx
+```
+
+Component tests replace the virtualized list with a mock, so they cannot show
+scrolling. The packaged `chat-reasoning-rows.e2e.ts` runs on the real list: a
+Claude prompt containing `[[reasoning]]` makes the fixture stream a thinking
+block over about two seconds, a tool call and an answer long enough to overflow
+(`[[reasoning:slow]]` thinks for about ten seconds). The spec checks the
+anchored turn's end while it streams, the fold and its **+N previous steps** row,
+expanding a finished thought away from the end and a streaming thought at the
+end, and the end while a thought streams into a thread reopened at its end. It
+presses each Thinking header as a pointer does, with a `pointerdown` before the
+click, and after a long prompt the expanded slow thought grows the anchored
+turn past the visible timeline while the spec checks that its end stays in view. Each
+turn's thought has its own row id and each answer names its prompt, so the spec
+tells the turns apart. Check the fixture frames, then run the
+spec alone with `BIBCODE_E2E_SPEC=./specs/chat-reasoning-rows.e2e.ts`:
+
+```sh
+node scripts/run-local-vp.mjs test run apps/desktop/e2e/support/provider-shims.test.ts
+vp run test:ui:desktop:build
+vp run test:ui:desktop
+```
+
+A live check needs a real Claude CLI and model and a real Codex session. Record
+whether the Claude probe line reports `thinking_display`, that Thought rows sit
+in order around tool calls and fold with the turn, that the working row shows
+the latest thought, and that the number of `thread.reasoning-sent` events in
+SQLite stays near one per 250 ms of thinking rather than one per delta. Put a
+sentinel phrase in a prompt that the model will think about and confirm it is
+absent from `server.log`, the provider operational log and the profiler JSONL.
+
 ### Selecting other focused coverage
 
 For the Pull Requests web shell/detail/review, settings, and auth-host display,
@@ -650,9 +760,54 @@ cargo test -p bibcode-server --test pull_requests_detail_reads -j 2
 cargo test -p bibcode-server --test pull_requests_review_actions -j 2
 cargo test -p bibcode-server --test pull_requests_edit_merge_actions -j 2
 cargo test -p bibcode-server --test pull_requests_checkout -j 2
+cargo test -p bibcode-server --test pull_requests_gitlab_load_harness -j 2
 cargo test -p bibcode-server --test rpc_wire -j 2
 cargo test -p bibcode-server registers_every -j 2
 ```
+
+For GitLab poller, pipeline or snapshot changes, also run the ignored polling
+harness with `bash scripts/measure-gitlab-merge-request-load.sh` and record its
+`HARNESS_SUBSCRIBE_JSON` (requests an hour, spawns, delivery) in the report.
+
+For Pipelines server reads and actions (`pipelines.*`: the GitLab and GitHub
+list, pipeline, job and log reads, `pipelines.runAction` and its remembered
+refusals, `LogCache`, the range probe, the pipelines poller, the shared 429
+ladder, or their snapshot rows), run from the repository root:
+
+```sh
+cargo test -p bibcode-server --lib pull_requests::pipelines -j 2
+cargo test -p bibcode-server --lib pull_requests::gitlab::pipelines -j 2
+cargo test -p bibcode-server --lib pull_requests::github::runs -j 2
+cargo test -p bibcode-server --lib pull_requests::backoff -j 2
+cargo test -p bibcode-server --lib pull_requests::gitlab::poll -j 2
+cargo test -p bibcode-server --lib pull_requests::tripwires -j 2
+cargo test -p bibcode-server --lib production::pipelines_rpc -j 2
+cargo test -p bibcode-server --lib -j 2 -- rpc::methods auth::scope diagnostics::profiler::latency
+cargo test -p bibcode-server --test rpc_wire -j 2
+vp test run packages/contracts/src/pipelines.test.ts packages/contracts/src/environment.test.ts packages/contracts/src/settings.test.ts
+```
+
+The service tests resolve a checkout through fake `git`, `glab` and `gh`
+scripts and run on Unix only, as do the GitHub reader's `process_tests`; the
+poller tests and the GitHub parse tests run on every platform.
+
+For the Pipelines web module (the list, the job page and its log parser,
+worker engine, reader and viewer), the repository module shell both modules
+share, the sidebar buttons, the Settings switch and the Pipelines client
+runtime,
+run from `apps/web` (compiler-sensitive happy-dom files) and the repository
+root:
+
+```sh
+vp test run --project unit src/pipelinesStore.test.ts src/components/pipelines src/components/repositoryModule src/components/pullRequests src/components/Sidebar.test.tsx src/components/settings/SourceControlSettings.test.tsx src/components/terminalTheme.test.ts
+vp test run packages/client-runtime/src/state/pipelines.test.ts
+vp run typecheck
+vp check
+```
+
+`PullRequestsPanel.test.tsx` is the shell's regression gate: its shell cases
+must pass unchanged. `components/pipelines/shared/MergeRequestPipelineLinks.test.tsx`
+covers the merge request tab's in-app links and their gate.
 
 For provider detection of self-hosted hosts (the recorded host observation,
 remote parsing, status classification, and the create action's provider check
@@ -2423,11 +2578,39 @@ never count a sandbox-denied listener test as passed or skipped.
     state. Refresh reloads detail plus the active tab (including timeline in
     Files); reopening a cached tab refreshes it before displaying its previous result. Exercise an expired
     authentication response and verify context recovery and Retry.
+    Live pipeline (GitLab, a project with **Pipelines must succeed** and a
+    pipeline with several stages, one manual job and one allowed failure): with
+    the request open on Conversation, the merge box must name the pipeline kind,
+    linked number, status, commit and branch, and its stage strip must advance
+    within about 10 s of GitLab with no Refresh; the Pipelines tab must show the
+    same pipeline and the same stages. Push a commit: **Older commit** may show
+    until the new pipeline appears, within about 10 s of GitLab creating it.
+    Rerun a finished pipeline on the same commit: **Older commit** must never
+    show. A Guest account must see “You can't view pipelines in this project.”
+    Sign out of `glab` while watching: the subscription must end, the request's
+    stored copies must go, and the view must show the sign-in error on its next
+    read. Hide the window: polling must stop until it is shown again.
+    With four running merge requests open on Pipelines in separate windows
+    (one list filter), the fourth's job list must follow its pipeline status
+    within about 20 s of a status change.
+    Against a server that advertises `pipelinesReads`, with **Pipelines** on:
+    the merge box's **View pipeline** opens that pipeline's page; on the
+    Pipelines tab a build job's name opens its job page with **Open on
+    GitLab** beside it, and a trigger job keeps its downstream link. On
+    GitHub, an Actions check's name opens its job page with **Open on
+    GitHub** beside it, and a third-party status check
+    keeps its host link. Turn **Pipelines** off, or use an older server: the
+    names link to the host and **View pipeline** is gone. The same request in
+    a thread's side panel keeps the host links.
 11. Verify real GitHub split patches and GitLab synthetic-header patches render
     in Files, including renamed files. Scroll far enough to exercise list and
     diff virtualization. Viewed must survive tab changes and reload. Test the
     whitespace toggle, binary/unavailable/too-large rows, long-line plain text,
-    and the explicit Show diff anyway gate using controlled fixtures.
+    and the explicit Show diff anyway gate using controlled fixtures. With the
+    file list beside the diffs, drag its divider, then use its arrow, Home and
+    End keys and double-click it: the list must follow live and keep its width
+    after reload. Narrowing the window must shrink the list without lowering
+    the width it returns to; the stacked narrow layout must offer no divider.
 12. Exercise the merge readiness states with host data or declared fixtures,
     including merged author/time, closed, reviews required and conflicts.
     Every denied action
@@ -2524,6 +2707,140 @@ never count a sandbox-denied listener test as passed or skipped.
     `git status` in the reported path is the recovery starting point. No automatic
     retry or late navigation is permitted. An existing redirect toast must honor a
     subsequent mutation denial. Record browser/native checks separately from CLI-stub tests.
+
+### Pipelines web shell validation
+
+Use a GitLab project with recent pipelines (one running, one failed, one on a
+tag, one merge request pipeline) and a GitHub repository.
+
+1. Every project header shows **Pipelines** after **Pull Requests**, with the
+   tooltip and accessible name "Pipelines for <project>"; a long project title
+   must stop short of the five icons, with and without the sandbox badge. In
+   the Repositories view the repository row shows it after its Pull Requests
+   button and environment rows do not; with the repository in two
+   environments it asks which. On a narrow window the mobile sidebar closes on
+   choice. The project header stays highlighted on the list after reload.
+2. **Settings → Source Control → Pipelines** off hides both buttons and leaves
+   Pull Requests; an open Pipelines route says it is turned off and links to
+   Source Control. A server without `pipelinesReads` asks for an update.
+3. Open the GitLab list: rows show status, duration, age (the exact time on
+   hover), title, number, branch, tag or merge request, short commit, badges
+   and named stage icons, on wide and narrow panels. Reopen it: the last copy
+   paints before any `glab` spawn (Profiler or server trace), then the live
+   page replaces it. Switch to Pull Requests and back on the same checkout: no
+   second context read.
+4. Change the tab and the branch filter (a picked branch, then a typed name
+   with Enter): the URL carries `scope` and `ref`, Back and a copied link keep
+   them, and the sidebar button reopens the last filter. An empty tab and an
+   empty branch name their state, the latter with **Clear filter**. **Load
+   more** appends without moving loaded rows.
+5. With a pipeline running, the row must follow GitLab within about 20 s with
+   no Refresh; two windows on one list must produce the `glab` reads of one;
+   hiding the window stops reading. Make the host answer 429 (or block it
+   with a proxy): the list counts down, Refresh and Retry are disabled with
+   their reason, and one read follows the deadline.
+6. Retry and Cancel show only where they apply; against a server without
+   `pipelinesMutations` they are disabled with "Update the server to retry and
+   cancel pipelines.", and a Guest or Reporter account sees its own refusal.
+   Retry a failed pipeline from its row: the button spins until the row shows
+   it running again, with no confirmation; double-click it and the server
+   trace shows one `glab api --method POST …/retry`. Cancel a running one: the
+   row turns canceled. Retry a job another window already retried: the
+   message says to refresh, and Retry is not disabled for the project. The row menu's Open on GitLab opens the host's page.
+7. Open a GitHub repository with two workflows: the list shows one row per
+   workflow run ("CI #312"), its PR or branch, badges from the event
+   (scheduled, merge request, manual run, retried), and no stage strip.
+   **Workflow** narrows it to one workflow; a branch or state filter that
+   reaches 1,000 runs ends with "GitHub returns at most 1,000 filtered runs.".
+   While a run is running the list re-reads every 20 s, and not once every
+   shown run has finished. A repository without workflows says "This
+   repository has no workflows."; one whose Actions are off (or a token without
+   Actions read) gets the copy naming both causes. Open a matrix run: one
+   **Jobs** column, the run's artifacts below it (each opens the run's page on
+   GitHub), and, for a re-run run, the **Attempt** select; attempt 1 of a run
+   that failed then passed says "Failed". A cancelled run reads "Canceled", a
+   fork PR waiting for approval "Waiting for approval". Re-run a failed run
+   from attempt 1's page with **Retry failed jobs**: the page opens the run's
+   latest attempt. Cancel a running run: it shows **Canceling** until GitHub
+   reports it canceled. With a fine-grained token without Actions write, Retry
+   says "GitHub refused: …" in a message and stays disabled with that reason in
+   every window, with no sign-out, until a rescan.
+8. Choose a row (anywhere but its buttons): the pipeline page opens in
+   BiBCode, and the project header stays highlighted after reload. Hover a row
+   first, then open it within 5 s: no second `pipelines.get` read. The header
+   shows the status (try a passed-with-warnings and a waiting pipeline), the
+   title, "Pipeline #… created … by … · finished …", the short commit (opens
+   on GitLab), the ref (a merge request pipeline's ref opens its merge request
+   in BiBCode), the job count, duration and queued time. Compare the stages,
+   jobs and their order with GitLab's own page, on a wide panel (side by side,
+   scrolling sideways) and a narrow one (stacked); a parallel group expands, a
+   trigger job links to its downstream pipeline, an allowed failure shows a
+   warning, and each job opens its job page in BiBCode. Reopen the page: the last copy
+   paints before any `glab` spawn.
+9. With a pipeline running, its page must follow GitLab within about 10 s;
+   one window on its list and one on the pipeline must produce one poller's
+   reads; the page stops reading once the pipeline finishes. With a Guest
+   account (jobs hidden) the header stays and the page says the jobs are
+   hidden. A pipeline id the account cannot read says "You can't view this
+   pipeline." and one that does not exist "This pipeline no longer exists.",
+   neither signing out; `/pipelines/abc` returns to the list. With a running
+   pipeline's page and one of its job pages open, remove the account from the
+   project (or delete the pipeline): within about 10 s both pages replace the
+   pipeline and job with that copy, with no further `glab` read for them, and
+   Refresh reads the host again.
+
+### Pipelines job page validation
+
+Use a GitLab project with a finished failed job whose log has colors and
+collapsible sections, a job with a log over 16 MB or about 100,000 lines, a
+running job, a manual job, an erased job and a job with artifacts.
+
+1. Open a job from its URL
+   (`/project/<env>/<project>/pipelines/<pipeline>/jobs/<job>`): the header
+   shows status, name, `Job #<id> · stage <stage> · started …`, **Open on
+   GitLab** and Retry, Cancel or Run where they apply (disabled with "Update
+   the server to retry and cancel pipelines." against a server without
+   `pipelinesMutations`); the project header stays highlighted. Retry the
+   failed job: the new job's page opens. Run the manual job and cancel the
+   running one: each page follows the job's new status.
+   Reopen it: the stored job paints before any `glab` spawn. A non-numeric
+   pipeline or job id returns to the list.
+2. The finished log opens at its end with GitLab's colors in both themes,
+   line numbers matching GitLab's, sections folded where GitLab folds them,
+   section durations, and **Timestamps** only on a stamped log. Collapse all,
+   Expand all, Wrap lines, Scroll to top and Scroll to bottom work; **Raw
+   log** opens GitLab's raw log.
+3. Search a common word: "1 of N", Enter and Shift+Enter wrap, a match in a
+   folded section opens it. Mod+F focuses the search once (Find in thread does
+   not open) and Escape returns to the log.
+4. Click a line number: the address gains `?at=` and the line highlights.
+   Open the copied link in another window: it opens on that line, reading
+   only that window (one `getJobLog` in the server trace).
+5. On the large log, scroll the whole log and search a term with thousands of
+   matches: the window stays responsive (record a Performance trace; no task
+   over 50 ms). **Load earlier** adds text above until 16 MB, then says
+   earlier lines are on the host; line numbers start at the first loaded line
+   until offset 0 is loaded.
+6. On the running job, new output appears within about 5 s while at the
+   bottom; scrolling up shows **Jump to latest**; hiding the window stops the
+   `getJobLog` reads; two windows on one job read GitLab's trace at most once
+   per 4 s. When the job finishes, one final read loads the rest and reads
+   stop. A running log over 2 MB keeps its head with the "This running log is
+   over 2 MB" copy and **Open on GitLab** until the job finishes. On a host
+   without range support, a running log over 2 MB shows its downloaded copy
+   with the same "over 2 MB" copy until the job finishes; then one more whole download shows its final lines.
+7. The details show duration or elapsed, finished, queued, runner, source,
+   tags, artifacts with **Download** and **Browse**, commit, pipeline, and the
+   stage's other jobs as links to their pages; on a narrow panel they sit
+   under **Details**. The erased job and a job without output say so.
+8. On GitHub, open a running job: the log area says "GitHub shows live logs on
+   its site." with **Open on GitHub** and lists the job's steps, which update
+   about every 10 s while the window is visible; the server trace shows no
+   `actions/jobs/<id>/logs` read. When the job finishes, its log loads once,
+   its details list the steps and the run's artifacts, and choosing a step
+   scrolls to where its output starts. A log past GitHub's retention says
+   "This log has expired." A GitHub job offers Retry (when it finished without
+   passing) and no Cancel or Run; Retry opens the run's latest attempt.
 
 ### Remote-hosted Git Manager run
 
@@ -2636,6 +2953,16 @@ sizes. Cover relevant:
   [read-only list/detail/files smoke](#pull-requests-web-shell-validation) with
   route, selected tab and real patch evidence;
 - thread creation, switching, persistence, and streaming;
+- the Diff panel's [Compare view](#diff-compare-scenario);
+- Mermaid diagrams in light and dark: a ` ```mermaid ` block in a streamed
+  reply shows its source until its closing fence arrives and then draws in
+  the code-block card with **Show source** and **Copy**; an invalid diagram
+  keeps its source under a line-numbered error; a drawn diagram recolors on a
+  theme switch without flashing its source; a selection copied from inside a
+  diagram pastes as its fenced source; the clipped Proposed Plan preview keeps
+  a fence it cut open as source; and a diagram drawing above the line being
+  read in the chat leaves that line in place (the maintained Mermaid scenario
+  below automates the rendered-file and timeline checks);
 - the [durable message queue](#durable-message-queue): FIFO cards, native steer,
   Cancel restoration, reload and restart persistence, promotion, Stop drain,
   holds, and unsupported-provider explanations;
@@ -2671,13 +2998,48 @@ sizes. Cover relevant:
   visible **Refreshing…** state and repeated-request coalescing; on Windows,
   cover a WSL-hosted workspace as well as a native one, because
   directory-timestamp fidelity differs across that boundary;
+- Files open-file disk changes, with a file open in the right-panel editor and
+  edited from outside BiBCode (another editor, a shell `printf … > file`, or an
+  agent turn): a tab with no unsaved edits shows the new text within a few
+  seconds, keeps a caret placed on an unchanged part of a changed line, and
+  Undo brings the old text back as unsaved; a tab with unsaved edits keeps them
+  and shows **Changed on disk.** with **Reload from disk** and **Overwrite
+  disk**, Save disabled with its reason, and no write from Ctrl/Cmd+S, a tab
+  switch, or closing and reopening the tab; **Overwrite disk** writes the edits
+  and **Reload from disk** takes the disk text (asking first in the rendered
+  Markdown view); delete the open file and verify **Deleted on disk.**; make
+  an unsaved edit, change the file outside BiBCode, and at once switch to
+  another right-panel tab: whether the poll or that switch's save runs first,
+  the disk keeps the outside change and the file's tab shows the amber dot;
+  with unsaved edits, grow the file past 1 MB from outside, then reopen its tab
+  after 30 s or reconnect the environment: the edits and **Overwrite disk** stay
+  and the 1 MB preview does not replace them; change the file while the
+  environment is disconnected and verify the tab reconciles as soon as it
+  reconnects. On Windows, repeat the clean-tab reload with a WSL-hosted
+  workspace on a Windows path, where read latency sets the poll's cost;
 - Files path-kind changes: replace a file with a directory containing nested
   entries while the tree is open, then select a descendant and replace its
   directory with a file. Exercise automatic refresh and **Refresh**; neither
   may show an application error or require reload. Surviving expanded folders
   and selections stay usable, and sibling rows still open normally;
 - Activity subagents and background tasks, including elapsed time and keyboard
-  navigation;
+  navigation. One click or **Enter** on the **Activity** button opens the panel
+  on the section with an error or running work and, with the panel open, keeps
+  it open and moves focus to the section's tab; the **Background tasks** tab
+  reaches the other section. With **Settings → Agents → Always show Activity** on, a new chat on a
+  provider that reports activity shows the muted **Activity** button before its
+  first subagent; with it off, the button waits for a record;
+- with an outdated provider on the primary and on a connected remote
+  environment, **Settings → Providers → Update all…** lists both environments
+  and their providers, and names a disconnected environment and a manual-update
+  provider as skipped. Cancel runs nothing. Confirm, leave Settings while an
+  update runs, and return: each environment shows its own result until
+  **Clear**, and neither this app nor its primary server restarts. With only a
+  disconnected environment outdated, the skip reason shows without opening the
+  dialog. With a remote desktop host that reports a server update, the same
+  confirmation lists its server version and running work; after confirming, the
+  host restarts only once its providers show **Updated**, its Remote Servers
+  row shows the same progress, and a manual host is listed as skipped;
 - with **Settings → General → Theme** on **System**, switch the operating system
   between light and dark while the app shows the home screen and again while it
   shows a thread: the window follows each switch without a reload; with
@@ -2701,6 +3063,25 @@ sizes. Cover relevant:
   the status bar shows the **Profiler** segment; its tooltip lists the
   recording environments, clicking it opens Diagnostics on the first of them,
   and it disappears once every profiler is off;
+- Find in thread on macOS (WKWebView), Linux (WebKitGTK AppImage), and Windows
+  (WebView2), in a long thread with folded turns: find a word that appears only
+  in a folded turn, a tool command inside a collapsed run of tool calls, a file
+  link's chip label, a long user message past **Show full message**, a long plan
+  past its preview, and a closed details block; step with Enter, Shift+Enter,
+  Mod+G, and F3, and confirm each step opens what hid the match and scrolls to
+  it; confirm the matches paint (the `::highlight()` rules read their colors
+  from `var()` tokens, so a missing paint is an engine gap to report) and the
+  selected one is distinct in light and dark; on an engine without
+  `CSS.highlights` the selected row is outlined instead; open find in a chat
+  panel while the host chat's is open and confirm the host's closes; choose
+  **Find in thread** in the command palette and type at once into the bar; with
+  a chat panel active over the host chat in the same tab group, choose it again
+  and confirm the bar opens in the panel chat; press Esc and confirm focus returns to the composer and the timeline does not
+  move; confirm Mod+F in the right-panel file editor still opens its own search;
+  disconnect the server and confirm the status adds **may be out of date**; on
+  Windows, confirm Ctrl+F, F3, and Ctrl+G open no native WebView2 find bar;
+  with the Profiler on, search a long thread and confirm no new `client.stall`
+  or `client.interaction` finding;
 - responsive menus, overlays, narrow panels, and focus states; and
 - loaded interaction without stale ownership, duplicate events, or runaway
   process growth.
@@ -2751,6 +3132,50 @@ by the native platform page, set
 `vp run test:ui:desktop` invocation. Retain its named `pierre-*.png` screenshots
 with the other bounded UI artifacts; do not put fixture state or screenshots in
 the repository.
+
+The maintained Mermaid scenario (`apps/desktop/e2e/specs/mermaid-diagrams.e2e.ts`)
+runs under the packaged app's production CSP and is part of the default suite.
+It writes valid, invalid and hostile diagram files into the fixture project and
+opens each in the Files rendered view: the valid diagram draws and recolors on
+a theme switch without its SVG being replaced, the invalid one shows its
+line-numbered error, and the hostile one leaves no `a`, `image`,
+`foreignObject`, `style`, `use` or `script` under `.chat-markdown-mermaid`, no
+`/mermaid-probe/` entry in `performance.getEntriesByType("resource")` (a
+same-origin load raises no CSP event) and no `securitypolicyviolation` event.
+The fixture Codex provider then answers its diagram prompts in the timeline: a
+**Show source** swap on a diagram inside the first visible row above the top
+edge, and on one in a row wholly above the viewport, moves a reading-anchor
+paragraph by at most 1 px; a short reply's diagram drawing under its sent
+message leaves that message at the sent-row offset; and selecting an earlier
+message with the minimap keyboard lands it at the minimap's offset past that
+diagram and keeps it there (`mermaid-timeline-minimap-landing.json`). After a
+reply with 101 diagrams, reopening the chat draws the evicted diagram (the
+reply's last, which the queue drew first) again through the queue, holding its
+source at the diagram's drawn height meanwhile, and every painted frame of the
+reopened chat shows the reply's last line at its end, within 1 px of where it
+rests. The scenario keeps a per-sample trace of the last line, on a timer and
+after each painted frame, as `mermaid-timeline-evicted-remount.json`. A second
+reply of 101 diagrams then evicts every earlier one; scrolling up remounts the
+rows reply, whose diagram shows its source and draws again above the message
+being read, which stays within 1 px on every painted frame
+(`mermaid-timeline-cold-draw.json`). Last, the fixture provider streams the
+same reply twice, one delta every 300 ms, first with the diagram's source in a
+plain code block and then as a sequence diagram, the scenario's only one, whose
+chunk loads after its source shows, so it replaces the source at the end while
+more text streams. After each delivery from the diagram's draw on, the reply's
+end rests no lower below the composer than the plain reply's, and both end
+with the last line in view (`mermaid-timeline-streaming-follow.json` holds both
+replies' gaps and end positions). The reading-line
+checks sample painted frames, so the scenario fails early in a webview that
+paints none.
+Its other page scripts wait on timers rather than animation frames, which stop
+in an occluded macOS webview; such a webview also throttles timers, so drawing
+the 101 diagrams can take minutes there. Rerun it alone with
+`BIBCODE_E2E_SPEC=./specs/mermaid-diagrams.e2e.ts`, and retain its
+`mermaid-*.png` screenshots with the other UI artifacts. In browser mode, check
+the same fixture files served by a release `bibcode` server in Chromium and
+Safari: the console shows no CSP violation and the server log no
+`/mermaid-probe/` request.
 
 At final packaged shutdown, inspect the raw worker and server logs. Provider and
 terminal owners, operational logs, orchestration, and the SQLite worker must all
@@ -2964,6 +3389,56 @@ the value); whether Codex's `workspace-write` sandbox makes `"$BROWSER"` print
 the address instead of opening it; a session older than 8 hours falls back to
 printing.
 
+### Diff Compare scenario
+
+Run this in the packaged application against a disposable repository that has
+committed files, a working-tree edit, an untracked file, a deleted file, a
+rename, a modified, an added and a deleted binary file, and a branch with
+commits ahead of its base. Let one
+agent turn edit two files so the thread has a turn with checkpoints.
+
+1. Open the Diff panel. **Changes** is selected and matches the stacked view.
+   Choose **Split**, then **Compare**.
+2. For **Working tree**, **Branch changes** and the turn, select files from the
+   list with the pointer and with Up and Down. Each changed file shows its
+   previous and current versions side by side, aligned and scrolling together,
+   and the changed lines appear before the full file finishes loading. The
+   turn shows its changes, never "No net changes".
+3. Confirm the explained states: the added and deleted files show their one
+   side, the rename, each binary file (modified, added and deleted) and a
+   mode-only change each show their message, and the untracked file shows as
+   added. Edit the untracked file without changing its line count: Compare
+   shows the new text.
+4. Filter by name and by status. The count reads "N of M files", a filter with
+   no match offers **Clear filters**, and **Esc** in the name field clears it.
+5. Choose **Changes only**, type `7` in **Context lines**, and confirm one
+   patch request follows after typing stops. Use **Next change**,
+   **Previous change**, F7 and Shift+F7, and confirm both ends say "No more
+   changes."
+6. Edit the selected working-tree file outside BiBCode and confirm Compare
+   picks up the new version.
+7. Quit and relaunch the app. Compare, Split, **Changes only** and 7 context
+   lines are all restored, and the selected file is reselected.
+8. **Open with**, with the platform's diff apps installed (Beyond Compare and
+   FileMerge on macOS, Meld and KDiff3 on Linux, WinMerge on Windows):
+   - the menu lists them with the default marked, and `git config
+     diff.guitool <tool>` moves the default to that tool;
+   - in Compare, open the selected file, the deleted file and the rename in
+     each scope, and **All files in** for the turn; the app shows the right
+     two versions. In Changes, the toolbar's menu opens every file;
+   - the untracked file's menu says to stage it, and a thread in an SSH
+     environment says where it runs;
+   - set `difftool.broken.cmd` to `exit 3` and choose it: the alert shows Git's
+     message and **Copy command**, whose command reproduces the failure in a
+     terminal;
+   - add a project whose folder is a subdirectory of its repository, edit a
+     file in it, and confirm Compare shows it in full and Open with opens it;
+   - with a diff app still open, quit the desktop app, and separately stop a
+     standalone server from its terminal with Ctrl+C: the diff app stays
+     open.
+
+Record screenshots at the normal and minimum window sizes, in light and dark.
+
 ## Profiler crash smoke
 
 Run this on every native platform when a change touches the
@@ -3064,8 +3539,10 @@ for the other
 ```sh
 cargo test -p bibcode-server --lib device:: -j 2
 cargo test -p bibcode-server --lib connect_mcp -j 2
+cargo test -p bibcode-server --lib a_chat_panels_launch_names_its_host_thread -j 2
 cargo test -p bibcode-server --test device_rpc --test device_media_socket --test e2ee_ws --test production_connect_mcp -j 2
-vp test run packages/contracts/src/device.test.ts packages/client-runtime/src/device apps/web/src/components/device apps/web/src/components/settings/DevicePreviewsSection.test.tsx
+cargo test -p bibcode-server --test production_orchestration_effects thread_deletion -j 2
+vp test run packages/contracts/src/device.test.ts packages/client-runtime/src/device apps/web/src/components/device apps/web/src/components/settings/DevicePreviewsSection.test.tsx apps/web/src/rightPanelStore.test.ts
 ```
 
 The fakes stand in for `emulator`, `adb`, the emulator gRPC service, and
@@ -3077,7 +3554,9 @@ Run the
 their client change. Everything below needs a real Android SDK.
 
 **Host.** Use a server host with the Android SDK (`emulator` and
-`platform-tools`), at least one AVD, and hardware acceleration: KVM on Linux
+`platform-tools`), at least two AVDs (five images for the limit in step 9:
+five AVDs, or on a macOS host AVDs and `Shutdown` simulators that make
+five), and hardware acceleration: KVM on Linux
 (`emulator -accel-check` succeeds), the Hypervisor framework on macOS, or
 WHPX/AEHD on Windows. Record the SDK path, `emulator -version`, `adb version`,
 the AVD's name, API level, and ABI, and the platform page's acceleration
@@ -3101,7 +3580,13 @@ Record each client's OS, app or browser version, and profile type.
 2. **Availability.** Open the Device panel: it lists the AVDs. On a host
    without the SDK, without platform-tools, without AVDs, or without
    acceleration (one at a time, where you can arrange it), the panel names
-   the problem and the fix. Record each message.
+   the problem and the fix. Record each message. With the panel open, create
+   an AVD in Android Studio's Device Manager (on a host with none, the first
+   one), then choose **Refresh devices**, by keyboard as well as by pointer:
+   the new AVD is listed without reopening the panel or restarting BiBCode.
+   Against a server older than the client, the panel shows no **Refresh
+   devices** and every other device action still works; record that too where
+   an older server is available.
 3. **Start and discovery (native item 1).** Choose an AVD and **Start**. The
    pill moves through **Starting…** and **Booting…** to **Ready** within
    180 s. Record the boot time. While it runs, list `pid_*.ini` in each
@@ -3198,27 +3683,51 @@ Record each client's OS, app or browser version, and profile type.
    device, the fifth video socket is refused with `limit`; that window retries
    three times within a few seconds and then shows still images. Close one of
    the other four and reopen the fifth window's Device panel: it shows video.
-9. **Agents.** In a thread on the environment, ask the agent to list devices,
-   take a screenshot, and close the device. `device_screenshot` returns a PNG
-   no wider than 1080 px. Turn the setting off: the agent's next `device_*`
-   call fails with the "Device previews are off" error.
-10. **Stop and cleanup.** **Stop** the device. Within 10 s the pill shows
+9. **Several devices.** Open two threads on two worktrees of one project, each
+   with its own Device panel. Start a different AVD in each. Switching threads
+   shows each thread's own device without picking it again; the picker lists
+   the other one as "— Running in <thread title>", and picking it shows it with
+   "Started in <thread title>." under the toolbar. Typing in one device reaches
+   only it. Open a second desktop window on the other thread: both windows show
+   video at once. Stop the other thread's device from the first thread: the
+   panel asks first, and **Cancel** leaves it running. Start AVDs until four
+   devices run (any mix with iOS on a macOS host), then pick the fifth image:
+   **Start** is disabled with "Four devices are running. Stop one to start
+   another."
+   Delete the second thread: its emulator is reaped (the platform page's process
+   check) while the first thread's keeps running, and the first thread's panel,
+   if it showed the deleted thread's device, shows it stopped with **Start**
+   enabled. Record the host's free memory and CPU load with four devices
+   running in the execution report.
+10. **Agents.** In a thread on the environment, ask the agent to list devices,
+    take a screenshot, and close the device. `device_screenshot` returns a PNG
+    no wider than 1080 px. With two threads' agents each opening a different
+    AVD, each `device_screenshot` without a `deviceId` returns its own
+    thread's device, `device_list` marks it `thisThread`, and one agent's
+    `device_close` of the other's device is refused with "… was started by
+    another thread. Ask the user to stop it." In a chat panel of a thread whose
+    Device panel started a device, the panel's agent takes a screenshot of that
+    device without a `deviceId` and closes it. Turn the setting off: the
+    agent's next `device_*` call fails with the "Device previews are off"
+    error.
+11. **Stop and cleanup.** **Stop** the device. Within 10 s the pill shows
     **Stopped**, the platform page's process check finds no `emulator` or
     `qemu-system` process, its discovery file is gone, and
     `adb forward --list` is empty (BiBCode leaves a stopping device's
     scrcpy forward to adb, which drops it with the device, so this checks
-    that adb does). Start the device again, then turn the
-    setting off: the confirmation names the running device, and after it
-    the same checks pass and the panel shows how to turn previews on. Start
-    it once more and stop the server (or quit the desktop that hosts it):
-    the same checks pass after shutdown.
-11. **Crash.** Start a device and kill the `emulator` process
+    that adb does). Start two devices, then turn the
+    setting off: the confirmation names the running devices, and after it
+    the same checks pass for each and the panel shows how to turn previews on.
+    Start them once more and stop the server (or quit the desktop that hosts
+    it): the same checks pass after shutdown.
+12. **Crash.** Start a device and kill the `emulator` process
     (or its `qemu-system` child) from a shell. Within a few seconds the pill
     shows **Failed:** with the reason, and with the profiler on
     `profiler findings --kind subprocess.crash --json` lists a finding
     labelled `android-emulator`. Record
     `profiler events --kind device.lifecycle --json` across the run: `start`,
-    `ready`, `stop`, and `fail` with `failureKind` `exited`.
+    `ready`, `stop`, and `fail` with `failureKind` `exited`, each with
+    `running`, the count of live devices after it.
 
 Record the results in the execution report's device previews section and mark
 each native verification item confirmed or corrected. A correction is a code
@@ -3263,6 +3772,11 @@ BiBCode or Simulator: they find it busy. They fail at once with "Xcode's first
 launch is pending" when `xcodebuild -checkFirstLaunchStatus` exits non-zero,
 as after an Xcode update whose CoreSimulator is not installed yet; open Xcode
 once or run `sudo xcodebuild -runFirstLaunch`, then run them again.
+
+The opt-in tests boot one simulator. Several simulators in one server
+process, and the one state poll that watches them, are first proven by the
+packaged-app procedure's two-simulator step; the fake-runner tests in
+`device::ios` cover the poll's stale-result rules.
 
 Then run the packaged-app procedure in
 [macOS iOS Simulator previews](./macos-desktop.md#ios-simulator-previews).

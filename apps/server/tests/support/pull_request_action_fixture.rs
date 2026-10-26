@@ -58,7 +58,10 @@ case "$1 $2" in
   'api projects/team%2Frepo/merge_requests/'*) role=merge-request ;;
   'api repos/team/repo') role=repository ;;
   'api graphql') role=graphql ;;
-  'api --method') if [ "$4" = graphql ]; then role=graphql; else role=; fi ;;
+  'api --method') if [ "$4" = graphql ]; then
+      # The pipeline stages query runs beside the metadata query in one wave.
+      if grep -q PullRequestsGitLabPipeline "$8" 2>/dev/null; then role=pipeline-graphql; else role=graphql; fi
+    else role=; fi ;;
   *) role= ;;
 esac
 if [ -n "$role" ] && [ -f "role-$role" ]; then

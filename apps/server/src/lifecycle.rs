@@ -71,7 +71,10 @@ fn connect_environment_descriptor(config: &ServerConfig) -> serde_json::Value {
             "attachmentStaging": true,
             "profiler": true,
             "devicePreviews": true,
+            "deviceCatalogRefresh": true,
+            "cliSessionHistory": true,
             "previewTunnels": true,
+            "reviewDiffTools": true,
         },
     })
 }
@@ -1200,9 +1203,15 @@ mod tests {
         assert_eq!(descriptor["capabilities"]["terminalImagePaste"], true);
         assert_eq!(descriptor["capabilities"]["pullRequestCreateOptions"], true);
         assert_eq!(descriptor["capabilities"]["vcsCloneReattach"], true);
+        assert_eq!(descriptor["capabilities"]["reviewDiffTools"], true);
         assert_eq!(descriptor["capabilities"]["attachmentStaging"], true);
         assert_eq!(descriptor["capabilities"]["profiler"], true);
         assert_eq!(descriptor["capabilities"]["devicePreviews"], true);
+        // A client offers Refresh devices only when the server has `device.refreshCatalog` (#169).
+        assert_eq!(descriptor["capabilities"]["deviceCatalogRefresh"], true);
+        // A client lists terminal sessions in History only on servers that have
+        // `agentSessions.listForThread` and `agentSessions.openInPanel` (#141).
+        assert_eq!(descriptor["capabilities"]["cliSessionHistory"], true);
         assert_eq!(
             descriptor["remoteUpdateSupport"],
             serde_json::json!({

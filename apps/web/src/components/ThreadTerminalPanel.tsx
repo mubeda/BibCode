@@ -28,7 +28,6 @@ import {
   type TerminalSize,
   type TerminalResizeInput,
   type ThreadId,
-  type ProjectId,
 } from "@bibcode/contracts";
 import { getTerminalLabel } from "@bibcode/shared/terminalLabels";
 import * as Schema from "effect/Schema";
@@ -113,6 +112,7 @@ import {
   mergeTerminalSpawnEnv,
   resolveTerminalThemeMode,
   retainTerminalLaunchTheme,
+  terminalAnsiColors,
   terminalExtendedAnsiPalette,
   usesPersistentWindowsConsoleTheme,
   type TerminalLaunchThemeState,
@@ -680,22 +680,7 @@ function terminalThemeFromApp(
       scrollbarSliderBackground: "rgba(255, 255, 255, 0.1)",
       scrollbarSliderHoverBackground: "rgba(255, 255, 255, 0.18)",
       scrollbarSliderActiveBackground: "rgba(255, 255, 255, 0.22)",
-      black: "rgb(24, 30, 38)",
-      red: "rgb(255, 122, 142)",
-      green: "rgb(134, 231, 149)",
-      yellow: "rgb(244, 205, 114)",
-      blue: "rgb(137, 190, 255)",
-      magenta: "rgb(208, 176, 255)",
-      cyan: "rgb(124, 232, 237)",
-      white: "rgb(210, 218, 230)",
-      brightBlack: "rgb(110, 120, 136)",
-      brightRed: "rgb(255, 168, 180)",
-      brightGreen: "rgb(176, 245, 186)",
-      brightYellow: "rgb(255, 224, 149)",
-      brightBlue: "rgb(174, 210, 255)",
-      brightMagenta: "rgb(229, 203, 255)",
-      brightCyan: "rgb(167, 244, 247)",
-      brightWhite: "rgb(244, 247, 252)",
+      ...terminalAnsiColors("dark"),
     };
   }
 
@@ -708,22 +693,7 @@ function terminalThemeFromApp(
     scrollbarSliderBackground: "rgba(0, 0, 0, 0.15)",
     scrollbarSliderHoverBackground: "rgba(0, 0, 0, 0.25)",
     scrollbarSliderActiveBackground: "rgba(0, 0, 0, 0.3)",
-    black: "rgb(44, 53, 66)",
-    red: "rgb(191, 70, 87)",
-    green: "rgb(60, 126, 86)",
-    yellow: "rgb(146, 112, 35)",
-    blue: "rgb(72, 102, 163)",
-    magenta: "rgb(132, 86, 149)",
-    cyan: "rgb(53, 127, 141)",
-    white: "rgb(210, 215, 223)",
-    brightBlack: "rgb(112, 123, 140)",
-    brightRed: "rgb(212, 95, 112)",
-    brightGreen: "rgb(85, 148, 111)",
-    brightYellow: "rgb(173, 133, 45)",
-    brightBlue: "rgb(91, 124, 194)",
-    brightMagenta: "rgb(153, 107, 172)",
-    brightCyan: "rgb(70, 149, 164)",
-    brightWhite: "rgb(236, 240, 246)",
+    ...terminalAnsiColors("light"),
   };
 }
 
@@ -790,7 +760,6 @@ export function resolveTerminalSelectionActionPosition(options: {
 interface TerminalViewportProps {
   threadRef: ScopedThreadRef;
   threadId: ThreadId;
-  projectId: ProjectId;
   terminalId: string;
   terminalLabel: string;
   cwd: string;
@@ -830,7 +799,6 @@ interface CodexThemeRestartError {
 export function TerminalViewport({
   threadRef,
   threadId,
-  projectId,
   terminalId,
   terminalLabel,
   cwd,
@@ -879,7 +847,7 @@ export function TerminalViewport({
   const rendererRef = useRef<{
     readonly sizeClaim: string;
     dismissSizeNotice(): void;
-    render(signal: TerminalRenderSignal, claimOnAttach: boolean): void;
+    render(signal: TerminalRenderSignal, claimOnAttach: boolean, exited: boolean): void;
     size(trigger: TerminalSizeTrigger): void;
   } | null>(null);
   const [inputError, setInputError] = useState<string | null>(null);
@@ -1519,7 +1487,7 @@ export function TerminalViewport({
       else if (size?.sizeClaim === sizeClaim) handleSizeTrigger("layout");
       else updateSizeNotice();
     };
-    const render = (signal: TerminalRenderSignal, claimOnAttach: boolean) => {
+    const render = (signal: TerminalRenderSignal, claimOnAttach: boolean, exited: boolean) => {
       if (disposed) return;
       if (signal.type === "delta") {
         outputSink.push(signal.data);
@@ -1554,6 +1522,7 @@ export function TerminalViewport({
         sizeOwnership &&
           signal.firstAttachmentGrant === true &&
           signal.size?.sizeClaim === sizeClaim,
+        exited,
       );
       terminal.clearSelection();
     };
@@ -2074,10 +2043,11 @@ export function TerminalViewport({
       return;
     let generation: number | null = null;
     const attachment = transcriptRuntime.attachRenderer((signal) => {
-      const nextGeneration = transcriptRuntime.metadata().generation;
-      const claimOnAttach = signal.type === "reset" && generation !== nextGeneration;
-      generation = nextGeneration;
-      renderer.render(signal, claimOnAttach);
+      const metadata = transcriptRuntime.metadata();
+      const claimOnAttach = signal.type === "reset" && generation !== metadata.generation;
+      generation = metadata.generation;
+      // A reset is published after its snapshot's status, so this is the replayed session's.
+      renderer.render(signal, claimOnAttach, metadata.status === "exited");
     }, renderer.sizeClaim);
     return () => attachment.detach();
   }, [shouldRender, transcriptRuntime, rendererEpoch]);
@@ -2433,7 +2403,6 @@ export function TerminalViewport({
         >
           <ProviderTerminalActivityDock
             threadRef={threadRef}
-            projectId={projectId}
             terminalId={terminalId}
             activity={command.activity}
             visible={shouldRender}
@@ -2530,7 +2499,6 @@ interface ThreadTerminalPanelProps {
   readonly owner: TerminalPanelOwner;
   threadRef: ScopedThreadRef;
   threadId: ThreadId;
-  projectId: ProjectId;
   cwd: string;
   worktreePath?: string | null;
   runtimeEnv?: Record<string, string>;
@@ -2609,7 +2577,6 @@ export default function ThreadTerminalPanel({
   owner,
   threadRef,
   threadId,
-  projectId,
   cwd,
   worktreePath,
   runtimeEnv,
@@ -2926,7 +2893,6 @@ export default function ThreadTerminalPanel({
                         <TerminalViewport
                           threadRef={threadRef}
                           threadId={threadId}
-                          projectId={projectId}
                           terminalId={terminalId}
                           terminalLabel={terminalLabelById.get(terminalId) ?? "Terminal"}
                           cwd={terminalLaunchLocation.cwd}
@@ -2959,7 +2925,6 @@ export default function ThreadTerminalPanel({
                   key={resolvedActiveTerminalId}
                   threadRef={threadRef}
                   threadId={threadId}
-                  projectId={projectId}
                   terminalId={resolvedActiveTerminalId}
                   terminalLabel={terminalLabelById.get(resolvedActiveTerminalId) ?? "Terminal"}
                   cwd={activeTerminalLaunchLocation.cwd}

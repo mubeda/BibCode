@@ -1,4 +1,5 @@
-//! Server-hosted device previews, one running device per platform; see
+//! Server-hosted device previews: up to four live devices per environment, of either platform,
+//! one per image, each labelled with the thread that started it; see
 //! docs/architecture/overview.md#device-previews.
 pub(crate) mod android;
 pub(crate) mod backend;
@@ -21,7 +22,7 @@ pub(crate) mod stderr_tail;
 pub mod video;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     sync::{Arc, Mutex, MutexGuard, PoisonError, Weak},
     time::{Duration, Instant},
 };
@@ -46,6 +47,13 @@ const DISCOVERY_TTL: Duration = Duration::from_secs(30);
 const EXIT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// Stopped and failed devices the catalog keeps, newest first, so their reason stays visible.
 const RETAINED_ENDED_DEVICES: usize = 4;
+/// The most devices one environment runs at once, of either platform. A `stopping` device
+/// counts until it has stopped.
+pub(crate) const MAX_RUNNING_DEVICES: usize = 4;
+const _: () = assert!(MAX_RUNNING_DEVICES == 4, "the limit's messages say four");
+/// How many thread deletions the manager remembers, so an open for a deleted thread is
+/// refused; the oldest is dropped first.
+const RECENT_DELETIONS: usize = 256;
 /// How long a stop waits for in-flight calls to let go of a device before stopping it anyway.
 const STOP_RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
 const STOP_RELEASE_POLL: Duration = Duration::from_millis(50);
@@ -67,10 +75,25 @@ pub enum DeviceOpError {
     Disabled,
     #[error("{}", .0.message)]
     Sdk(Availability),
-    #[error("{running} is already running. Stop it before starting another device.")]
+    /// `running` names the first live device on the requested platform in catalog order,
+    /// else the first live device: the one an older client's **Stop** button stops.
+    #[error(
+        "Four devices are already running, the most this server runs at once. Stop one to start another."
+    )]
     Limit { running: String },
     #[error("This device is no longer running. Start it again from the device list.")]
     NotFound,
+    /// The thread that would own the device was deleted.
+    #[error("This thread was deleted, so its device was not started.")]
+    OwnerDeleted,
+    /// An agent's `device_open` of an image whose device another thread started.
+    #[error(
+        "{name} is in use by another thread. Start a different image, or look at it with device_screenshot."
+    )]
+    InUseByAnotherThread { image_id: String, name: String },
+    /// An agent's `device_close` of a device another thread started.
+    #[error("{name} was started by another thread. Ask the user to stop it.")]
+    StartedByAnotherThread { image_id: String, name: String },
     #[error("{}", not_ready_message(*.0))]
     NotReady(DeviceState),
     #[error("{}", unknown_image_message(*platform, image_id))]
@@ -125,9 +148,10 @@ fn not_ready_message(state: DeviceState) -> &'static str {
             "The device is still starting. Wait until it is ready, then try again."
         }
         DeviceState::Ready => "The device is not ready yet. Try again in a moment.",
-        DeviceState::Stopping | DeviceState::Stopped => {
-            "The device has stopped. Start it again from the device list."
+        DeviceState::Stopping => {
+            "This device is still stopping. Start it again once it has stopped."
         }
+        DeviceState::Stopped => "The device has stopped. Start it again from the device list.",
         DeviceState::Failed => {
             "The device failed. Check its reason in the device list, then start it again."
         }
@@ -153,12 +177,14 @@ impl DeviceOpError {
                 "running": running,
                 "message": message,
             }),
-            Self::Busy { image_id } => serde_json::json!({
+            Self::Busy { image_id }
+            | Self::InUseByAnotherThread { image_id, .. }
+            | Self::StartedByAnotherThread { image_id, .. } => serde_json::json!({
                 "_tag": "DeviceBusyError",
                 "imageId": image_id,
                 "message": message,
             }),
-            Self::NotFound | Self::UnknownImage { .. } => serde_json::json!({
+            Self::NotFound | Self::UnknownImage { .. } | Self::OwnerDeleted => serde_json::json!({
                 "_tag": "DeviceNotFoundError",
                 "message": message,
             }),
@@ -195,8 +221,9 @@ pub(crate) struct DeviceManagerConfig {
 /// input, and media tasks clone it for one call at a time.
 type SharedDevice = Arc<Box<dyn RunningDevice>>;
 
-/// Owns every device of this environment and the catalog that describes them: at most one
-/// running device per platform, stopped when the setting turns off and on shutdown.
+/// Owns every device of this environment and the catalog that describes them: at most
+/// [`MAX_RUNNING_DEVICES`] live devices, one per image, stopped when the setting turns off, when
+/// the thread that started them is deleted, and on shutdown.
 #[derive(Clone)]
 pub struct DeviceManager {
     inner: Arc<Inner>,
@@ -211,6 +238,9 @@ struct Inner {
     tasks: TaskTracker,
     /// Outstanding media-socket tickets.
     tickets: TicketBook,
+    /// Tests only: device ids counting down from this, so id order is the reverse of open order.
+    #[cfg(test)]
+    descending_ids: Mutex<Option<u32>>,
 }
 
 /// A backend and its own discovery cache, so a slow listing on one platform never holds up
@@ -224,6 +254,17 @@ struct PlatformBackend {
 struct DeviceTable {
     slots: HashMap<String, Slot>,
     next_seq: u64,
+    /// The last [`RECENT_DELETIONS`] deleted threads, oldest first. Only the `thread.deleted`
+    /// effect adds to it ([`DeviceManager::stop_thread`]); `open` refuses them as owners.
+    deleted_threads: VecDeque<String>,
+}
+
+/// What `open` does with an image, by the image's slots.
+enum Admission {
+    /// The image already has a device starting, booting, or ready: its id.
+    Attach(String),
+    /// The image has no live device and a place is free.
+    Start,
 }
 
 struct Slot {
@@ -237,7 +278,8 @@ struct Slot {
     started: Instant,
     /// The image's name as the device list shows it, for the limit error.
     display_name: String,
-    /// Open order, which decides which ended devices the catalog keeps.
+    /// Open order: the catalog lists devices in it, and it decides which ended devices the
+    /// catalog keeps.
     seq: u64,
     /// The JPEG frame producer while anyone subscribes.
     frames: Option<Arc<FrameHub>>,
@@ -300,6 +342,8 @@ impl DeviceManager {
             shutdown: CancellationToken::new(),
             tasks: TaskTracker::new(),
             tickets: TicketBook::default(),
+            #[cfg(test)]
+            descending_ids: Mutex::new(None),
         });
         inner.tasks.spawn(Inner::follow_setting(
             Arc::downgrade(&inner),
@@ -324,11 +368,22 @@ impl DeviceManager {
         self.inner.discover_all(true).await;
     }
 
-    /// Starts `image_id` on `platform` and returns its device id at `Starting`; boot progress
-    /// is published in the catalog.
-    pub async fn open(&self, platform: Platform, image_id: &str) -> Result<String, DeviceOpError> {
+    /// Starts `image_id` on `platform` for `owner` (a root thread id, trimmed; blank is refused)
+    /// and returns its device id at `Starting`; boot progress is published in the catalog. An
+    /// image that already has a device starting, booting, or ready returns that device's id and
+    /// starts nothing, keeping its owner.
+    pub async fn open(
+        &self,
+        platform: Platform,
+        image_id: &str,
+        owner: Option<&str>,
+    ) -> Result<String, DeviceOpError> {
         if !self.inner.accepting() {
             return Err(DeviceOpError::Disabled);
+        }
+        let owner = normalize_owner(owner)?;
+        if self.inner.table().owner_deleted(owner.as_deref()) {
+            return Err(DeviceOpError::OwnerDeleted);
         }
         let unknown = || DeviceOpError::UnknownImage {
             platform,
@@ -346,18 +401,29 @@ impl DeviceManager {
         let Some(display_name) = found.display_name(image_id) else {
             return Err(unknown());
         };
-        // Cheap and unlocked, so a doomed open never runs the backend's check; the check
+        // Cheap and unlocked, so a doomed open never runs the backend's check, and an image
+        // BiBCode already runs is attached before the check could call it busy; the admission
         // under the lock below stays authoritative.
-        let running = self.inner.table().running_on(platform);
-        if let Some(running) = running {
-            return Err(DeviceOpError::Limit { running });
+        let admission = self.inner.table().admit(platform, image_id);
+        if let Admission::Attach(device_id) = admission? {
+            return Ok(device_id);
         }
         match entry.backend.check_available(image_id).await {
             Ok(()) => {}
             Err(LaunchFailure::Busy) => {
-                return Err(DeviceOpError::Busy {
-                    image_id: image_id.to_owned(),
-                });
+                // A concurrent open of this image may have started it meanwhile, which the
+                // check sees as busy; no slot is reserved before the check, so look again.
+                let table = self.inner.table();
+                if table.owner_deleted(owner.as_deref()) {
+                    return Err(DeviceOpError::OwnerDeleted);
+                }
+                return match table.admit(platform, image_id) {
+                    Ok(Admission::Attach(device_id)) => Ok(device_id),
+                    Err(stopping @ DeviceOpError::NotReady(_)) => Err(stopping),
+                    _ => Err(DeviceOpError::Busy {
+                        image_id: image_id.to_owned(),
+                    }),
+                };
             }
             Err(error) => {
                 tracing::warn!(?error, "device availability check failed");
@@ -369,7 +435,7 @@ impl DeviceManager {
         }
         let backend = entry.backend.clone();
         let started = Instant::now();
-        let device_id = uuid::Uuid::new_v4().to_string();
+        let device_id = self.inner.new_device_id();
         let cancel = CancellationToken::new();
         {
             let mut table = self.inner.table();
@@ -378,8 +444,13 @@ impl DeviceManager {
             if !self.inner.accepting() {
                 return Err(DeviceOpError::Disabled);
             }
-            if let Some(running) = table.running_on(platform) {
-                return Err(DeviceOpError::Limit { running });
+            // And under the lock `stop_thread` takes, so a deletion that landed while this open
+            // waited on discovery or the check starts nothing.
+            if table.owner_deleted(owner.as_deref()) {
+                return Err(DeviceOpError::OwnerDeleted);
+            }
+            if let Admission::Attach(device_id) = table.admit(platform, image_id)? {
+                return Ok(device_id);
             }
             let seq = table.next_seq;
             table.next_seq += 1;
@@ -397,6 +468,7 @@ impl DeviceManager {
                         orientation: Orientation::Portrait,
                         // Until the running device says otherwise.
                         can_rotate: true,
+                        thread_id: owner,
                     },
                     running: None,
                     cancel: cancel.clone(),
@@ -410,7 +482,8 @@ impl DeviceManager {
             );
             self.inner.publish(&mut table);
         }
-        record_lifecycle(platform, "start", started, None);
+        self.inner
+            .record_lifecycle(platform, "start", started, None);
         self.inner.tasks.spawn(self.inner.clone().launch(
             device_id.clone(),
             backend,
@@ -457,6 +530,41 @@ impl DeviceManager {
     /// this future never leaves the device half-stopped.
     pub async fn close(&self, device_id: &str) -> Result<(), DeviceOpError> {
         self.inner.close(device_id).await
+    }
+
+    /// For a deleted thread: refuses it as an owner from now on, and starts stopping every
+    /// device it started that is still starting, booting, or ready. Returns without waiting
+    /// for the stops, which run on the manager's tasks and log as any stop does.
+    pub fn stop_thread(&self, thread_id: &str) {
+        let mut table = self.inner.table();
+        table.record_deletion(thread_id);
+        let owned: Vec<String> = table
+            .slots
+            .iter()
+            .filter(|(_, slot)| {
+                slot.snapshot.thread_id.as_deref() == Some(thread_id) && stoppable(&slot.snapshot)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        if owned.is_empty() {
+            return;
+        }
+        for id in &owned {
+            if let Some(slot) = table.slots.get_mut(id) {
+                self.inner.begin_stop(id, slot);
+            }
+        }
+        self.inner.publish(&mut table);
+    }
+
+    /// Tests only: later device ids count down, so id order is the reverse of open order.
+    #[cfg(test)]
+    pub(crate) fn issue_descending_ids(&self) {
+        *self
+            .inner
+            .descending_ids
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(10_000);
     }
 
     /// A PNG of a `Ready` device's screen, at most `max_width` wide in its current
@@ -544,19 +652,111 @@ impl Discovery {
     }
 }
 
+/// Whether a device can still be stopped: it is starting, booting, or ready.
+fn stoppable(device: &DeviceSnapshot) -> bool {
+    matches!(
+        device.state,
+        DeviceState::Starting | DeviceState::Booting | DeviceState::Ready
+    )
+}
+
+/// A device owner as `device.open` names it, trimmed as the client's `ThreadId` decode trims
+/// (ECMAScript whitespace, not `str::trim`'s), so every published owner decodes unchanged;
+/// blank is refused.
+fn normalize_owner(owner: Option<&str>) -> Result<Option<String>, DeviceOpError> {
+    match owner.map(crate::ecmascript::trim) {
+        None => Ok(None),
+        Some("") => Err(DeviceOpError::InvalidInput(
+            "threadId must name a thread.".to_owned(),
+        )),
+        Some(owner) => Ok(Some(owner.to_owned())),
+    }
+}
+
 impl DeviceTable {
-    /// The display name of `platform`'s device that has not ended, if any.
-    fn running_on(&self, platform: Platform) -> Option<String> {
+    /// Devices that have not ended, a `stopping` one included, in open order.
+    fn live(&self) -> Vec<&Slot> {
+        let mut live: Vec<&Slot> = self
+            .slots
+            .values()
+            .filter(|slot| !ended(slot.snapshot.state))
+            .collect();
+        live.sort_unstable_by_key(|slot| slot.seq);
+        live
+    }
+
+    fn live_count(&self) -> usize {
         self.slots
             .values()
-            .find(|slot| slot.snapshot.platform == platform && !ended(slot.snapshot.state))
+            .filter(|slot| !ended(slot.snapshot.state))
+            .count()
+    }
+
+    /// One device per image and at most [`MAX_RUNNING_DEVICES`]: an image's live device is
+    /// attached, a stopping one refuses the open until it has stopped, and otherwise a new
+    /// device starts while a place is free.
+    fn admit(&self, platform: Platform, image_id: &str) -> Result<Admission, DeviceOpError> {
+        let live = self.live();
+        if let Some(slot) = live
+            .iter()
+            .find(|slot| slot.snapshot.platform == platform && slot.snapshot.image_id == image_id)
+        {
+            return match slot.snapshot.state {
+                DeviceState::Stopping => Err(DeviceOpError::NotReady(DeviceState::Stopping)),
+                _ => Ok(Admission::Attach(slot.snapshot.device_id.clone())),
+            };
+        }
+        if live.len() < MAX_RUNNING_DEVICES {
+            return Ok(Admission::Start);
+        }
+        // The first live device on the platform in catalog order, which an older client's
+        // limit banner stops, else the oldest live device.
+        let running = live
+            .iter()
+            .find(|slot| slot.snapshot.platform == platform)
+            .or(live.first())
             .map(|slot| slot.display_name.clone())
+            .unwrap_or_default();
+        Err(DeviceOpError::Limit { running })
+    }
+
+    fn owner_deleted(&self, owner: Option<&str>) -> bool {
+        owner.is_some_and(|owner| self.deleted_threads.iter().any(|deleted| deleted == owner))
+    }
+
+    fn record_deletion(&mut self, thread_id: &str) {
+        if self
+            .deleted_threads
+            .iter()
+            .any(|deleted| deleted == thread_id)
+        {
+            return;
+        }
+        if self.deleted_threads.len() >= RECENT_DELETIONS {
+            self.deleted_threads.pop_front();
+        }
+        self.deleted_threads.push_back(thread_id.to_owned());
     }
 }
 
 impl Inner {
     fn table(&self) -> MutexGuard<'_, DeviceTable> {
         self.devices.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// A per-open id; it outlives nothing, so clients remember images, never device ids.
+    fn new_device_id(&self) -> String {
+        #[cfg(test)]
+        if let Some(next) = self
+            .descending_ids
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_mut()
+        {
+            *next -= 1;
+            return format!("device-{next:05}");
+        }
+        uuid::Uuid::new_v4().to_string()
     }
 
     /// A `Ready` device, for one call, and the orientation the catalog shows for it.
@@ -608,7 +808,8 @@ impl Inner {
         *self.enabled.borrow() && !self.shutdown.is_cancelled()
     }
 
-    /// Publishes the devices, sorted by id, after dropping all but the newest ended ones.
+    /// Publishes the devices in open order, oldest first, after dropping all but the newest
+    /// ended ones.
     fn publish(&self, table: &mut DeviceTable) {
         let mut ended_slots: Vec<(u64, String)> = table
             .slots
@@ -620,12 +821,12 @@ impl Inner {
         for (_, id) in ended_slots.into_iter().skip(RETAINED_ENDED_DEVICES) {
             table.slots.remove(&id);
         }
-        let mut devices: Vec<DeviceSnapshot> = table
-            .slots
-            .values()
+        let mut slots: Vec<&Slot> = table.slots.values().collect();
+        slots.sort_unstable_by_key(|slot| slot.seq);
+        let devices: Vec<DeviceSnapshot> = slots
+            .into_iter()
             .map(|slot| slot.snapshot.clone())
             .collect();
-        devices.sort_unstable_by(|left, right| left.device_id.cmp(&right.device_id));
         self.catalog.send_if_modified(|catalog| {
             let changed = catalog.devices != devices;
             if changed {
@@ -758,7 +959,7 @@ impl Inner {
                 };
                 match unwanted {
                     None => {
-                        record_lifecycle(platform, "ready", started, None);
+                        self.record_lifecycle(platform, "ready", started, None);
                         if let Some(changes) = orientation_changes {
                             self.tasks.spawn(self.clone().follow_orientation(
                                 device_id.clone(),
@@ -774,7 +975,7 @@ impl Inner {
                     Some(running) => {
                         running.stop().await;
                         self.finish(&device_id, DeviceState::Stopped, None);
-                        record_lifecycle(platform, "stop", started, None);
+                        self.record_lifecycle(platform, "stop", started, None);
                     }
                 }
                 return;
@@ -784,12 +985,12 @@ impl Inner {
         // The backend already stopped what it started.
         if matches!(error, LaunchFailure::Cancelled) || cancel.is_cancelled() {
             self.finish(&device_id, DeviceState::Stopped, None);
-            record_lifecycle(platform, "stop", started, None);
+            self.record_lifecycle(platform, "stop", started, None);
             return;
         }
         let (failure_kind, failure) = launch_failure(&error);
         self.finish(&device_id, DeviceState::Failed, Some(failure));
-        record_lifecycle(platform, "fail", started, Some(failure_kind));
+        self.record_lifecycle(platform, "fail", started, Some(failure_kind));
     }
 
     /// Shows each orientation a running device reports, with its display size in it, until
@@ -846,7 +1047,7 @@ impl Inner {
             };
             // Before `stop`, which marks the exit as requested.
             running.report_unrequested_exit(&reason);
-            record_lifecycle(platform, "fail", started, Some("exited"));
+            self.record_lifecycle(platform, "fail", started, Some("exited"));
             stop_device(running).await;
             // A close of the Failed device waits for this.
             reaped.cancel();
@@ -870,36 +1071,42 @@ impl Inner {
                 .slots
                 .get_mut(device_id)
                 .ok_or(DeviceOpError::NotFound)?;
-            if matches!(
-                slot.snapshot.state,
-                DeviceState::Starting | DeviceState::Booting | DeviceState::Ready
-            ) {
-                // The streams end before the token, so the media hub sees why it stops.
-                slot.end_streams();
-                slot.snapshot.state = DeviceState::Stopping;
-                slot.cancel.cancel();
-                // `None` while it boots: the launch stops it and finishes the slot.
-                if let Some(running) = slot.running.take() {
-                    let started = slot.started;
-                    let platform = slot.snapshot.platform;
-                    let this = self.clone();
-                    let id = device_id.to_owned();
-                    self.tasks.spawn(async move {
-                        stop_device(running).await;
-                        this.finish(&id, DeviceState::Stopped, None);
-                        record_lifecycle(platform, "stop", started, None);
-                    });
-                }
-                let reaped = slot.reaped.clone();
+            // Stopping, or ended while the exit watcher may still reap the process, only waits.
+            let stops = stoppable(&slot.snapshot);
+            let reaped = self.begin_stop(device_id, slot);
+            if stops {
                 self.publish(&mut table);
-                reaped
-            } else {
-                // Stopping, or ended while the exit watcher may still reap the process.
-                slot.reaped.clone()
             }
+            reaped
         };
         reaped.cancelled().await;
         Ok(())
+    }
+
+    /// Starts stopping a device that is starting, booting, or ready, under the table lock: its
+    /// streams end, it shows `Stopping` (the caller publishes), its launch is cancelled, and a
+    /// running device is stopped on `tasks`. Returns the token cancelled once it has ended and
+    /// its process is gone.
+    fn begin_stop(self: &Arc<Self>, device_id: &str, slot: &mut Slot) -> CancellationToken {
+        if stoppable(&slot.snapshot) {
+            // The streams end before the token, so the media hub sees why it stops.
+            slot.end_streams();
+            slot.snapshot.state = DeviceState::Stopping;
+            slot.cancel.cancel();
+            // `None` while it boots: the launch stops it and finishes the slot.
+            if let Some(running) = slot.running.take() {
+                let started = slot.started;
+                let platform = slot.snapshot.platform;
+                let this = self.clone();
+                let id = device_id.to_owned();
+                self.tasks.spawn(async move {
+                    stop_device(running).await;
+                    this.finish(&id, DeviceState::Stopped, None);
+                    this.record_lifecycle(platform, "stop", started, None);
+                });
+            }
+        }
+        slot.reaped.clone()
     }
 
     async fn close_all(self: &Arc<Self>) {
@@ -994,27 +1201,33 @@ fn launch_failure(error: &LaunchFailure) -> (&'static str, String) {
     }
 }
 
-/// A `device.lifecycle` profiler event; it names the platform, never the image or its paths.
-fn record_lifecycle(
-    platform: Platform,
-    phase: &'static str,
-    started: Instant,
-    failure_kind: Option<&'static str>,
-) {
-    let payload = || {
-        serde_json::json!({
-            "platform": platform,
-            "phase": phase,
-            "durationMs": u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-            "failureKind": failure_kind,
-        })
-    };
-    #[cfg(test)]
-    lifecycle_capture::record(payload);
-    if !crate::diagnostics::profiler::is_enabled() {
-        return;
+impl Inner {
+    /// A `device.lifecycle` profiler event, recorded after the transition is published, with
+    /// `running`, the count of live devices then. It names the platform, never the thread, the
+    /// image, or its paths. Never called under the table lock, which it takes.
+    fn record_lifecycle(
+        &self,
+        platform: Platform,
+        phase: &'static str,
+        started: Instant,
+        failure_kind: Option<&'static str>,
+    ) {
+        let payload = || {
+            serde_json::json!({
+                "platform": platform,
+                "phase": phase,
+                "durationMs": u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                "failureKind": failure_kind,
+                "running": self.table().live_count(),
+            })
+        };
+        #[cfg(test)]
+        lifecycle_capture::record(payload);
+        if !crate::diagnostics::profiler::is_enabled() {
+            return;
+        }
+        crate::diagnostics::profiler::emit("device.lifecycle", payload());
     }
-    crate::diagnostics::profiler::emit("device.lifecycle", payload());
 }
 
 /// Tests only: the `device.lifecycle` payloads recorded on this thread, whether or not the
@@ -1066,29 +1279,35 @@ mod tests {
     };
 
     #[tokio::test]
-    async fn open_publishes_states_and_enforces_one_device() {
+    async fn open_publishes_states_and_a_second_image_on_the_platform_opens() {
         let fixture = ManagerFixture::ready(&["Pixel", "Tablet"]).await;
         let id = fixture
             .manager
-            .open(Platform::Android, "Pixel")
+            .open(Platform::Android, "Pixel", None)
             .await
             .unwrap();
         let ready = fixture.wait_state(&id, DeviceState::Ready).await;
         assert_eq!((ready.width, ready.height), (Some(1080), Some(2400)));
-        assert!(matches!(
-            fixture.manager.open(Platform::Android, "Tablet").await,
-            Err(DeviceOpError::Limit { running }) if running == "Pixel"
-        ));
-        fixture.manager.close(&id).await.unwrap();
-        fixture.wait_state(&id, DeviceState::Stopped).await;
-        assert!(
-            fixture
-                .manager
-                .open(Platform::Android, "Tablet")
-                .await
-                .is_ok()
+        let tablet = fixture
+            .manager
+            .open(Platform::Android, "Tablet", None)
+            .await
+            .expect("a second image on one platform opens");
+        assert_ne!(tablet, id);
+        fixture.wait_state(&tablet, DeviceState::Ready).await;
+        assert_eq!(
+            fixture.wait_state(&id, DeviceState::Ready).await.state,
+            DeviceState::Ready
         );
         fixture.manager.shutdown().await;
+        assert_eq!(fixture.sdk.launched_pids().len(), 2);
+        assert!(
+            fixture
+                .sdk
+                .launched_pids()
+                .iter()
+                .all(|pid| !process_alive(*pid))
+        );
     }
 
     #[tokio::test]
@@ -1096,7 +1315,7 @@ mod tests {
         let fixture = ManagerFixture::ready(&["Pixel"]).await;
         let id = fixture
             .manager
-            .open(Platform::Android, "Pixel")
+            .open(Platform::Android, "Pixel", None)
             .await
             .unwrap();
         fixture.wait_state(&id, DeviceState::Ready).await;
@@ -1105,7 +1324,7 @@ mod tests {
         fixture.wait_state(&id, DeviceState::Stopped).await;
         assert!(!process_alive(pid));
         assert!(matches!(
-            fixture.manager.open(Platform::Android, "Pixel").await,
+            fixture.manager.open(Platform::Android, "Pixel", None).await,
             Err(DeviceOpError::Disabled)
         ));
     }
@@ -1115,7 +1334,7 @@ mod tests {
         let fixture = ManagerFixture::ready(&["Pixel"]).await;
         let id = fixture
             .manager
-            .open(Platform::Android, "Pixel")
+            .open(Platform::Android, "Pixel", None)
             .await
             .unwrap();
         fixture.wait_state(&id, DeviceState::Ready).await;
@@ -1146,7 +1365,7 @@ mod tests {
         assert!(
             fixture
                 .manager
-                .open(Platform::Android, "Pixel")
+                .open(Platform::Android, "Pixel", None)
                 .await
                 .is_ok()
         );
@@ -1158,7 +1377,7 @@ mod tests {
         let fixture = ManagerFixture::ready(&["Pixel"]).await;
         let id = fixture
             .manager
-            .open(Platform::Android, "Pixel")
+            .open(Platform::Android, "Pixel", None)
             .await
             .unwrap();
         fixture.wait_state(&id, DeviceState::Ready).await;
@@ -1166,7 +1385,7 @@ mod tests {
         fixture.manager.shutdown().await;
         assert!(!process_alive(pid));
         assert!(matches!(
-            fixture.manager.open(Platform::Android, "Pixel").await,
+            fixture.manager.open(Platform::Android, "Pixel", None).await,
             Err(DeviceOpError::Disabled)
         ));
     }
@@ -1175,7 +1394,7 @@ mod tests {
     async fn unknown_avd_is_rejected_before_spawning() {
         let fixture = ManagerFixture::ready(&["Pixel"]).await;
         assert!(matches!(
-            fixture.manager.open(Platform::Android, "Nope").await,
+            fixture.manager.open(Platform::Android, "Nope", None).await,
             Err(DeviceOpError::UnknownImage {
                 platform: Platform::Android,
                 ..
@@ -1206,7 +1425,7 @@ mod tests {
         let fixture = ManagerFixture::with_sdk(|sdk| sdk.avds(&["Pixel"]).never_boots()).await;
         let id = fixture
             .manager
-            .open(Platform::Android, "Pixel")
+            .open(Platform::Android, "Pixel", None)
             .await
             .unwrap();
         fixture.wait_state(&id, DeviceState::Booting).await;
@@ -1219,7 +1438,7 @@ mod tests {
         assert!(
             fixture
                 .manager
-                .open(Platform::Android, "Pixel")
+                .open(Platform::Android, "Pixel", None)
                 .await
                 .is_ok()
         );
@@ -1232,7 +1451,7 @@ mod tests {
         let fixture = ManagerFixture::ready(&["Pixel"]).await;
         let id = fixture
             .manager
-            .open(Platform::Android, "Pixel")
+            .open(Platform::Android, "Pixel", None)
             .await
             .unwrap();
         fixture.wait_state(&id, DeviceState::Ready).await;
@@ -1248,7 +1467,7 @@ mod tests {
         crate::device::android::testing::wait_until(|| !process_alive(pid)).await;
         let next = fixture
             .manager
-            .open(Platform::Android, "Pixel")
+            .open(Platform::Android, "Pixel", None)
             .await
             .unwrap();
         fixture.wait_state(&next, DeviceState::Ready).await;
@@ -1262,7 +1481,7 @@ mod tests {
         let fixture = ManagerFixture::ready(&["Pixel"]).await;
         let id = fixture
             .manager
-            .open(Platform::Android, "Pixel")
+            .open(Platform::Android, "Pixel", None)
             .await
             .unwrap();
         fixture.wait_state(&id, DeviceState::Ready).await;
@@ -1291,7 +1510,7 @@ mod tests {
         .await;
         let id = fixture
             .manager
-            .open(Platform::Android, "Pixel")
+            .open(Platform::Android, "Pixel", None)
             .await
             .unwrap();
         let started = Instant::now();
@@ -1318,7 +1537,7 @@ mod tests {
         let fixture = ManagerFixture::ready(&["Pixel"]).await;
         let id = fixture
             .manager
-            .open(Platform::Android, "Pixel")
+            .open(Platform::Android, "Pixel", None)
             .await
             .unwrap();
         assert!(matches!(
@@ -1401,7 +1620,7 @@ mod tests {
             serde_json::json!({
                 "_tag": "DeviceLimitError",
                 "running": "Pixel",
-                "message": "Pixel is already running. Stop it before starting another device.",
+                "message": "Four devices are already running, the most this server runs at once. Stop one to start another.",
             })
         );
         let sdk = DeviceOpError::Sdk(Availability {
@@ -1487,27 +1706,491 @@ mod platform_tests {
     };
     use crate::device::catalog::Platform;
 
+    /// The image ids of the catalog's devices, in catalog order.
+    fn listed(manager: &DeviceManager) -> Vec<String> {
+        manager
+            .catalog()
+            .borrow()
+            .devices
+            .iter()
+            .map(|device| device.image_id.clone())
+            .collect()
+    }
+
+    fn snapshot_of(manager: &DeviceManager, device_id: &str) -> DeviceSnapshot {
+        manager
+            .catalog()
+            .borrow()
+            .devices
+            .iter()
+            .find(|device| device.device_id == device_id)
+            .cloned()
+            .expect("device in catalog")
+    }
+
     #[tokio::test]
-    async fn one_device_per_platform_runs_side_by_side() {
+    async fn devices_of_both_platforms_and_several_per_platform_run_side_by_side() {
         let android = FakeBackend::new(Platform::Android, &["Pixel"]);
         let ios = FakeBackend::new(Platform::Ios, &["UDID-1", "UDID-2"]);
         let (manager, _enabled) = fake_manager(vec![android.clone(), ios.clone()]);
-        let a = manager.open(Platform::Android, "Pixel").await.unwrap();
-        let i = manager.open(Platform::Ios, "UDID-1").await.unwrap();
+        let a = manager
+            .open(Platform::Android, "Pixel", None)
+            .await
+            .unwrap();
+        let i = manager.open(Platform::Ios, "UDID-1", None).await.unwrap();
+        let j = manager.open(Platform::Ios, "UDID-2", None).await.unwrap();
         wait_state(&manager, &a, DeviceState::Ready).await;
         let ios_ready = wait_state(&manager, &i, DeviceState::Ready).await;
         assert_eq!(
             (ios_ready.platform, ios_ready.image_id.as_str()),
             (Platform::Ios, "UDID-1")
         );
+        assert_eq!(
+            wait_state(&manager, &j, DeviceState::Ready).await.image_id,
+            "UDID-2"
+        );
+        assert_eq!(ios.check_calls(), 2);
+        manager.shutdown().await;
+        assert_eq!((android.stops(), ios.stops()), (1, 2));
+    }
+
+    #[tokio::test]
+    async fn four_devices_run_at_once_and_a_stopping_one_counts() {
+        let android = FakeBackend::new(Platform::Android, &["A", "B", "C", "D", "E"]);
+        let (manager, _enabled) = fake_manager(vec![android.clone()]);
+        let mut ids = Vec::new();
+        for image in ["A", "B", "C", "D"] {
+            let id = manager.open(Platform::Android, image, None).await.unwrap();
+            wait_state(&manager, &id, DeviceState::Ready).await;
+            ids.push(id);
+        }
+        let refused = manager.open(Platform::Android, "E", None).await;
+        assert!(
+            matches!(refused, Err(DeviceOpError::Limit { ref running }) if running == "iPhone A"),
+            "{refused:?}"
+        );
+        // The doomed open never reached the backend's availability check.
+        assert_eq!(android.check_calls(), 4);
+        let held = android.hold_next_stop();
+        {
+            use futures_util::FutureExt as _;
+            assert!(manager.close(&ids[0]).now_or_never().is_none());
+        }
+        wait_state(&manager, &ids[0], DeviceState::Stopping).await;
         assert!(matches!(
-            manager.open(Platform::Ios, "UDID-2").await,
+            manager.open(Platform::Android, "E", None).await,
+            Err(DeviceOpError::Limit { .. })
+        ));
+        held.release();
+        wait_state(&manager, &ids[0], DeviceState::Stopped).await;
+        let fifth = manager.open(Platform::Android, "E", None).await.unwrap();
+        wait_state(&manager, &fifth, DeviceState::Ready).await;
+        assert_eq!(android.launches(), 5);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn the_catalog_lists_devices_in_open_order_and_the_limit_names_the_oldest() {
+        let android = FakeBackend::new(Platform::Android, &["Pixel", "Tablet", "Fold"]);
+        let ios = FakeBackend::new(Platform::Ios, &["UDID-1", "UDID-2", "UDID-3"]);
+        let (manager, _enabled) = fake_manager(vec![android, ios]);
+        // Ids count down, so sorting by id would list the newest first.
+        manager.issue_descending_ids();
+        let first = manager
+            .open(Platform::Android, "Pixel", None)
+            .await
+            .unwrap();
+        for (platform, image) in [
+            (Platform::Ios, "UDID-1"),
+            (Platform::Android, "Tablet"),
+            (Platform::Ios, "UDID-2"),
+        ] {
+            manager.open(platform, image, None).await.unwrap();
+        }
+        let ids: Vec<String> = manager
+            .catalog()
+            .borrow()
+            .devices
+            .iter()
+            .map(|device| device.device_id.clone())
+            .collect();
+        assert!(ids.windows(2).all(|pair| pair[0] > pair[1]), "{ids:?}");
+        assert_eq!(listed(&manager), ["Pixel", "UDID-1", "Tablet", "UDID-2"]);
+        // The first live device of the platform asked for, which an older client stops.
+        assert!(matches!(
+            manager.open(Platform::Ios, "UDID-3", None).await,
             Err(DeviceOpError::Limit { running }) if running == "iPhone UDID-1"
         ));
-        // The doomed open never reached the backend's availability check.
-        assert_eq!(ios.check_calls(), 1);
+        assert!(matches!(
+            manager.open(Platform::Android, "Fold", None).await,
+            Err(DeviceOpError::Limit { running }) if running == "iPhone Pixel"
+        ));
+        manager.close(&first).await.unwrap();
+        // The ended device keeps its place in open order.
+        assert_eq!(listed(&manager), ["Pixel", "UDID-1", "Tablet", "UDID-2"]);
         manager.shutdown().await;
-        assert_eq!((android.stops(), ios.stops()), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn opening_a_live_image_returns_its_device_and_keeps_its_owner() {
+        // Starting: the launch is held before it reports booting.
+        let android = FakeBackend::new(Platform::Android, &["Pixel"]);
+        let (manager, _enabled) = fake_manager(vec![android.clone()]);
+        let held = android.hold_next_launch();
+        let id = manager
+            .open(Platform::Android, "Pixel", Some("t1"))
+            .await
+            .unwrap();
+        assert_eq!(snapshot_of(&manager, &id).state, DeviceState::Starting);
+        let again = manager.open(Platform::Android, "Pixel", Some("t2")).await;
+        assert_eq!(again.as_deref(), Ok(id.as_str()));
+        held.release();
+        // Ready.
+        wait_state(&manager, &id, DeviceState::Ready).await;
+        let again = manager.open(Platform::Android, "Pixel", None).await;
+        assert_eq!(again.as_deref(), Ok(id.as_str()));
+        assert_eq!(android.launches(), 1);
+        assert_eq!(snapshot_of(&manager, &id).thread_id.as_deref(), Some("t1"));
+        manager.shutdown().await;
+
+        // Booting.
+        let ios = FakeBackend::new(Platform::Ios, &["UDID-1"]);
+        ios.never_boots();
+        let (manager, _enabled) = fake_manager(vec![ios.clone()]);
+        let id = manager
+            .open(Platform::Ios, "UDID-1", Some("t1"))
+            .await
+            .unwrap();
+        wait_state(&manager, &id, DeviceState::Booting).await;
+        let again = manager.open(Platform::Ios, "UDID-1", Some("t2")).await;
+        assert_eq!(again.as_deref(), Ok(id.as_str()));
+        assert_eq!((ios.launches(), ios.check_calls()), (1, 1));
+        assert_eq!(manager.catalog().borrow().devices.len(), 1);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn opening_a_stopping_image_is_refused_until_it_has_stopped() {
+        let android = FakeBackend::new(Platform::Android, &["Pixel"]);
+        let (manager, _enabled) = fake_manager(vec![android.clone()]);
+        let id = manager
+            .open(Platform::Android, "Pixel", None)
+            .await
+            .unwrap();
+        wait_state(&manager, &id, DeviceState::Ready).await;
+        let held = android.hold_next_stop();
+        {
+            use futures_util::FutureExt as _;
+            assert!(manager.close(&id).now_or_never().is_none());
+        }
+        wait_state(&manager, &id, DeviceState::Stopping).await;
+        let refused = manager
+            .open(Platform::Android, "Pixel", None)
+            .await
+            .unwrap_err();
+        assert_eq!(refused, DeviceOpError::NotReady(DeviceState::Stopping));
+        assert_eq!(
+            refused.to_rpc_error()["message"],
+            "This device is still stopping. Start it again once it has stopped."
+        );
+        assert_eq!(android.launches(), 1);
+        held.release();
+        wait_state(&manager, &id, DeviceState::Stopped).await;
+        let next = manager
+            .open(Platform::Android, "Pixel", None)
+            .await
+            .unwrap();
+        assert_ne!(next, id);
+        wait_state(&manager, &next, DeviceState::Ready).await;
+        assert_eq!(android.launches(), 2);
+        manager.shutdown().await;
+    }
+
+    /// Two opens of one simulator race: the second waits in the availability check while the
+    /// first starts the image, so the check then sees it booted and calls it busy.
+    #[tokio::test]
+    async fn opens_of_one_image_racing_through_a_busy_check_share_its_device() {
+        let ios = FakeBackend::new(Platform::Ios, &["UDID-1"]);
+        let (manager, _enabled) = fake_manager(vec![ios.clone()]);
+        let mut held = ios.hold_next_check();
+        let second = tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.open(Platform::Ios, "UDID-1", Some("t2")).await }
+        });
+        held.reached().await;
+        let first = manager
+            .open(Platform::Ios, "UDID-1", Some("t1"))
+            .await
+            .unwrap();
+        ios.busy("UDID-1");
+        held.release();
+        assert_eq!(second.await.unwrap().as_deref(), Ok(first.as_str()));
+        assert_eq!(ios.launches(), 1);
+        assert_eq!(
+            snapshot_of(&manager, &first).thread_id.as_deref(),
+            Some("t1")
+        );
+        ios.not_busy("UDID-1");
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn an_owner_is_published_trimmed_and_a_blank_one_is_refused() {
+        let android = FakeBackend::new(Platform::Android, &["Pixel", "Tablet"]);
+        let (manager, _enabled) = fake_manager(vec![android.clone()]);
+        let owned = manager
+            .open(Platform::Android, "Pixel", Some(" t1 "))
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshot_of(&manager, &owned).thread_id.as_deref(),
+            Some("t1")
+        );
+        let catalog = serde_json::to_value(&*manager.catalog().borrow()).unwrap();
+        assert_eq!(catalog["devices"][0]["threadId"], "t1");
+        let blank = manager
+            .open(Platform::Android, "Tablet", Some("  "))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            blank.to_rpc_error(),
+            serde_json::json!({
+                "_tag": "DeviceInputError",
+                "message": "threadId must name a thread.",
+            })
+        );
+        // The client's `ThreadId` trims as ECMAScript does, which takes U+FEFF and leaves
+        // U+0085, unlike `str::trim`: a BOM-only owner would publish an id the client
+        // cannot decode, failing the whole catalog.
+        let bom = manager
+            .open(Platform::Android, "Tablet", Some("\u{feff}"))
+            .await
+            .unwrap_err();
+        assert_eq!(bom.to_rpc_error()["_tag"], "DeviceInputError");
+        let unowned = manager
+            .open(Platform::Android, "Tablet", None)
+            .await
+            .unwrap();
+        let catalog = serde_json::to_value(&*manager.catalog().borrow()).unwrap();
+        let entry = catalog["devices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|device| device["deviceId"] == unowned.as_str())
+            .unwrap()
+            .clone();
+        assert!(entry.get("threadId").is_none(), "{entry}");
+        wait_state(&manager, &owned, DeviceState::Ready).await;
+        wait_state(&manager, &unowned, DeviceState::Ready).await;
+        assert_eq!(android.launches(), 2);
+        manager.shutdown().await;
+    }
+
+    /// The catalog the server publishes with owned, unowned, and ended devices, which the
+    /// TypeScript contract decodes and encodes back unchanged (`device.test.ts`).
+    /// Regenerate with `BIBCODE_UPDATE_DEVICE_FIXTURE=1`.
+    #[tokio::test]
+    async fn the_owned_catalog_fixture_matches_the_wire() {
+        let android = FakeBackend::new(Platform::Android, &["Pixel", "Tablet", "Fold"]);
+        let (manager, _enabled) = fake_manager(vec![android]);
+        manager.issue_descending_ids();
+        let owned = manager
+            .open(Platform::Android, "Pixel", Some(" t1 "))
+            .await
+            .unwrap();
+        let unowned = manager
+            .open(Platform::Android, "Tablet", None)
+            .await
+            .unwrap();
+        let ended = manager
+            .open(Platform::Android, "Fold", Some("t2"))
+            .await
+            .unwrap();
+        wait_state(&manager, &owned, DeviceState::Ready).await;
+        wait_state(&manager, &unowned, DeviceState::Ready).await;
+        wait_state(&manager, &ended, DeviceState::Ready).await;
+        manager.close(&ended).await.unwrap();
+        wait_state(&manager, &ended, DeviceState::Stopped).await;
+        let catalog = serde_json::to_value(&*manager.catalog().borrow()).unwrap();
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../packages/contracts/fixtures/device/catalog.json");
+        if std::env::var_os("BIBCODE_UPDATE_DEVICE_FIXTURE").is_some() {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(
+                &path,
+                serde_json::to_string_pretty(&catalog).unwrap() + "\n",
+            )
+            .unwrap();
+        }
+        let committed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("committed fixture"))
+                .expect("fixture JSON");
+        assert_eq!(catalog, committed, "regenerate the device catalog fixture");
+        manager.shutdown().await;
+    }
+
+    /// An owner is published as the client's `ThreadId` decode would leave it, so it
+    /// round-trips unchanged: ECMAScript whitespace, U+FEFF included, is trimmed, and
+    /// U+0085, which ECMAScript keeps, stays.
+    #[test]
+    fn an_owner_is_trimmed_as_the_clients_thread_id_is() {
+        assert_eq!(
+            super::normalize_owner(Some("\u{feff}\u{3000} t1\t\u{feff}")).unwrap(),
+            Some("t1".to_owned())
+        );
+        assert_eq!(
+            super::normalize_owner(Some("t1\u{85}")).unwrap(),
+            Some("t1\u{85}".to_owned())
+        );
+        assert!(super::normalize_owner(Some("\u{feff} \u{2028}")).is_err());
+        assert_eq!(super::normalize_owner(None).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn stop_thread_stops_only_its_live_devices_and_does_not_wait() {
+        let android = FakeBackend::new(Platform::Android, &["Pixel", "Tablet"]);
+        let (manager, _enabled) = fake_manager(vec![android.clone()]);
+        let mine = manager
+            .open(Platform::Android, "Pixel", Some("t1"))
+            .await
+            .unwrap();
+        let theirs = manager
+            .open(Platform::Android, "Tablet", Some("t2"))
+            .await
+            .unwrap();
+        wait_state(&manager, &mine, DeviceState::Ready).await;
+        wait_state(&manager, &theirs, DeviceState::Ready).await;
+        let held = android.hold_next_stop();
+        manager.stop_thread("t1");
+        // Returned while the stop is still held.
+        assert_eq!(snapshot_of(&manager, &mine).state, DeviceState::Stopping);
+        assert_eq!(snapshot_of(&manager, &theirs).state, DeviceState::Ready);
+        held.release();
+        let stopped = wait_state(&manager, &mine, DeviceState::Stopped).await;
+        assert_eq!(stopped.thread_id.as_deref(), Some("t1"));
+        assert_eq!(snapshot_of(&manager, &theirs).state, DeviceState::Ready);
+        assert_eq!(android.stops(), 1);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_deleted_threads_booting_device_ends_stopped() {
+        let ios = FakeBackend::new(Platform::Ios, &["UDID-1"]);
+        ios.never_boots();
+        let (manager, _enabled) = fake_manager(vec![ios]);
+        let id = manager
+            .open(Platform::Ios, "UDID-1", Some("t1"))
+            .await
+            .unwrap();
+        wait_state(&manager, &id, DeviceState::Booting).await;
+        manager.stop_thread("t1");
+        wait_state(&manager, &id, DeviceState::Stopped).await;
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_deletion_while_an_open_waits_on_discovery_refuses_it() {
+        let android = FakeBackend::new(Platform::Android, &["Pixel"]);
+        let (manager, _enabled) = fake_manager(vec![android.clone()]);
+        manager.refresh().await;
+        // Not in the cached discovery, so the open discovers again.
+        android.add_image("Tablet");
+        let mut held = android.hold_next_discover();
+        let open = tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.open(Platform::Android, "Tablet", Some("t1")).await }
+        });
+        held.reached().await;
+        manager.stop_thread("t1");
+        held.release();
+        assert_eq!(open.await.unwrap(), Err(DeviceOpError::OwnerDeleted));
+        assert!(manager.catalog().borrow().devices.is_empty());
+        assert_eq!(android.launches(), 0);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_deletion_while_an_open_waits_on_the_check_refuses_it() {
+        let ios = FakeBackend::new(Platform::Ios, &["UDID-1"]);
+        let (manager, _enabled) = fake_manager(vec![ios.clone()]);
+        let mut held = ios.hold_next_check();
+        let open = tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.open(Platform::Ios, "UDID-1", Some("t1")).await }
+        });
+        held.reached().await;
+        manager.stop_thread("t1");
+        held.release();
+        assert_eq!(open.await.unwrap(), Err(DeviceOpError::OwnerDeleted));
+        assert!(manager.catalog().borrow().devices.is_empty());
+        assert_eq!(ios.launches(), 0);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn an_open_for_a_recently_deleted_thread_is_refused() {
+        let android = FakeBackend::new(Platform::Android, &["Pixel"]);
+        let (manager, _enabled) = fake_manager(vec![android.clone()]);
+        manager.stop_thread("t1");
+        let refused = manager
+            .open(Platform::Android, "Pixel", Some("t1"))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            refused.to_rpc_error(),
+            serde_json::json!({
+                "_tag": "DeviceNotFoundError",
+                "message": "This thread was deleted, so its device was not started.",
+            })
+        );
+        assert_eq!(android.launches(), 0);
+        // The oldest of more than 256 deletions is forgotten.
+        for index in 0..RECENT_DELETIONS {
+            manager.stop_thread(&format!("later-{index}"));
+        }
+        let id = manager
+            .open(Platform::Android, "Pixel", Some("t1"))
+            .await
+            .unwrap();
+        wait_state(&manager, &id, DeviceState::Ready).await;
+        assert!(matches!(
+            manager
+                .open(Platform::Android, "Pixel", Some("later-0"))
+                .await,
+            Err(DeviceOpError::OwnerDeleted)
+        ));
+        manager.shutdown().await;
+    }
+
+    #[test]
+    fn thread_refusals_map_to_existing_contract_tags() {
+        let busy = |error: DeviceOpError| error.to_rpc_error();
+        assert_eq!(
+            busy(DeviceOpError::InUseByAnotherThread {
+                image_id: "Pixel_8".into(),
+                name: "Pixel 8".into(),
+            }),
+            serde_json::json!({
+                "_tag": "DeviceBusyError",
+                "imageId": "Pixel_8",
+                "message": "Pixel 8 is in use by another thread. Start a different image, or look at it with device_screenshot.",
+            })
+        );
+        assert_eq!(
+            busy(DeviceOpError::StartedByAnotherThread {
+                image_id: "Pixel_8".into(),
+                name: "Pixel 8".into(),
+            }),
+            serde_json::json!({
+                "_tag": "DeviceBusyError",
+                "imageId": "Pixel_8",
+                "message": "Pixel 8 was started by another thread. Ask the user to stop it.",
+            })
+        );
+        assert_eq!(
+            DeviceOpError::NotReady(DeviceState::Stopped).to_string(),
+            "The device has stopped. Start it again from the device list."
+        );
     }
 
     #[tokio::test]
@@ -1516,12 +2199,14 @@ mod platform_tests {
         let capture = lifecycle_capture::start();
         let ios = FakeBackend::new(Platform::Ios, &["UDID-1"]);
         let (manager, _enabled) = fake_manager(vec![ios]);
-        let id = manager.open(Platform::Ios, "UDID-1").await.unwrap();
+        let id = manager.open(Platform::Ios, "UDID-1", None).await.unwrap();
         wait_state(&manager, &id, DeviceState::Ready).await;
         manager.close(&id).await.unwrap();
         let events = capture.events();
         let phases: Vec<_> = events.iter().map(|e| e["phase"].clone()).collect();
         assert_eq!(phases, ["start", "ready", "stop"]);
+        let running: Vec<_> = events.iter().map(|e| e["running"].clone()).collect();
+        assert_eq!(running, [1, 1, 0], "live devices after each transition");
         assert!(events.iter().all(|e| e["platform"] == "ios"), "{events:?}");
         assert!(
             events
@@ -1538,7 +2223,7 @@ mod platform_tests {
         ios.busy("UDID-1");
         let (manager, _enabled) = fake_manager(vec![ios.clone()]);
         assert!(matches!(
-            manager.open(Platform::Ios, "UDID-1").await,
+            manager.open(Platform::Ios, "UDID-1", None).await,
             Err(DeviceOpError::Busy { image_id }) if image_id == "UDID-1"
         ));
         assert!(manager.catalog().borrow().devices.is_empty());
@@ -1550,7 +2235,7 @@ mod platform_tests {
         let ios = FakeBackend::new(Platform::Ios, &["UDID-1"]);
         ios.busy_on_launch("UDID-1");
         let (manager, _enabled) = fake_manager(vec![ios.clone()]);
-        let id = manager.open(Platform::Ios, "UDID-1").await.unwrap();
+        let id = manager.open(Platform::Ios, "UDID-1", None).await.unwrap();
         let failed = wait_state(&manager, &id, DeviceState::Failed).await;
         assert_eq!(failed.failure.as_deref(), Some("in use outside BiBCode"));
         assert_eq!(ios.stops(), 0);
@@ -1562,8 +2247,11 @@ mod platform_tests {
         let android = FakeBackend::new(Platform::Android, &["Pixel"]);
         let ios = FakeBackend::new(Platform::Ios, &["UDID-1"]);
         let (manager, _enabled) = fake_manager(vec![android.clone(), ios.clone()]);
-        let a = manager.open(Platform::Android, "Pixel").await.unwrap();
-        let i = manager.open(Platform::Ios, "UDID-1").await.unwrap();
+        let a = manager
+            .open(Platform::Android, "Pixel", None)
+            .await
+            .unwrap();
+        let i = manager.open(Platform::Ios, "UDID-1", None).await.unwrap();
         wait_state(&manager, &i, DeviceState::Ready).await;
         ios.exit_running(0, "Shutdown outside BiBCode");
         let failed = wait_state(&manager, &i, DeviceState::Failed).await;
@@ -1639,7 +2327,7 @@ mod platform_tests {
         ios.without_rotation();
         ios.never_boots();
         let (manager, _enabled) = fake_manager(vec![ios.clone()]);
-        let id = manager.open(Platform::Ios, "UDID-1").await.unwrap();
+        let id = manager.open(Platform::Ios, "UDID-1", None).await.unwrap();
         let booting = wait_state(&manager, &id, DeviceState::Booting).await;
         assert!(booting.can_rotate);
         manager.close(&id).await.unwrap();
@@ -1647,7 +2335,7 @@ mod platform_tests {
         let ios = FakeBackend::new(Platform::Ios, &["UDID-1"]);
         ios.without_rotation();
         let (manager, _enabled) = fake_manager(vec![ios]);
-        let id = manager.open(Platform::Ios, "UDID-1").await.unwrap();
+        let id = manager.open(Platform::Ios, "UDID-1", None).await.unwrap();
         let ready = wait_state(&manager, &id, DeviceState::Ready).await;
         assert!(!ready.can_rotate);
         assert_eq!(
@@ -1662,11 +2350,11 @@ mod platform_tests {
         let android = FakeBackend::new(Platform::Android, &["Pixel"]);
         let (manager, _enabled) = fake_manager(vec![android.clone()]);
         assert!(matches!(
-            manager.open(Platform::Android, "Nope").await,
+            manager.open(Platform::Android, "Nope", None).await,
             Err(DeviceOpError::UnknownImage { platform: Platform::Android, ref image_id }) if image_id == "Nope"
         ));
         assert!(matches!(
-            manager.open(Platform::Ios, "UDID-1").await,
+            manager.open(Platform::Ios, "UDID-1", None).await,
             Err(DeviceOpError::UnknownImage {
                 platform: Platform::Ios,
                 ..
@@ -1681,14 +2369,14 @@ mod platform_tests {
         let ios = FakeBackend::new(Platform::Ios, &["UDID-1"]);
         ios.never_boots();
         let (manager, _enabled) = fake_manager(vec![ios.clone()]);
-        let id = manager.open(Platform::Ios, "UDID-1").await.unwrap();
+        let id = manager.open(Platform::Ios, "UDID-1", None).await.unwrap();
         wait_state(&manager, &id, DeviceState::Booting).await;
         manager.close(&id).await.unwrap();
         assert_eq!(
             manager.catalog().borrow().devices[0].state,
             DeviceState::Stopped
         );
-        assert!(manager.open(Platform::Ios, "UDID-1").await.is_ok());
+        assert!(manager.open(Platform::Ios, "UDID-1", None).await.is_ok());
         manager.shutdown().await;
     }
 
@@ -1697,8 +2385,11 @@ mod platform_tests {
         let android = FakeBackend::new(Platform::Android, &["Pixel"]);
         let ios = FakeBackend::new(Platform::Ios, &["UDID-1"]);
         let (manager, enabled) = fake_manager(vec![android.clone(), ios.clone()]);
-        let a = manager.open(Platform::Android, "Pixel").await.unwrap();
-        let i = manager.open(Platform::Ios, "UDID-1").await.unwrap();
+        let a = manager
+            .open(Platform::Android, "Pixel", None)
+            .await
+            .unwrap();
+        let i = manager.open(Platform::Ios, "UDID-1", None).await.unwrap();
         wait_state(&manager, &a, DeviceState::Ready).await;
         wait_state(&manager, &i, DeviceState::Ready).await;
         enabled.send(false).unwrap();
@@ -1706,7 +2397,7 @@ mod platform_tests {
         wait_state(&manager, &i, DeviceState::Stopped).await;
         assert_eq!((android.stops(), ios.stops()), (1, 1));
         assert!(matches!(
-            manager.open(Platform::Ios, "UDID-1").await,
+            manager.open(Platform::Ios, "UDID-1", None).await,
             Err(DeviceOpError::Disabled)
         ));
     }
@@ -1716,7 +2407,7 @@ mod platform_tests {
         use futures_util::FutureExt as _;
         let ios = FakeBackend::new(Platform::Ios, &["UDID-1"]);
         let (manager, _enabled) = fake_manager(vec![ios.clone()]);
-        let id = manager.open(Platform::Ios, "UDID-1").await.unwrap();
+        let id = manager.open(Platform::Ios, "UDID-1", None).await.unwrap();
         wait_state(&manager, &id, DeviceState::Ready).await;
         assert!(manager.close(&id).now_or_never().is_none());
         wait_state(&manager, &id, DeviceState::Stopped).await;
@@ -1757,7 +2448,7 @@ mod platform_tests {
         let ios = FakeBackend::new(Platform::Ios, &["UDID-1"]);
         let turn = ios.reports_orientation();
         let (manager, _enabled) = fake_manager(vec![ios]);
-        let id = manager.open(Platform::Ios, "UDID-1").await.unwrap();
+        let id = manager.open(Platform::Ios, "UDID-1", None).await.unwrap();
         wait_state(&manager, &id, DeviceState::Ready).await;
         turn.send_replace(Orientation::Landscape);
         let mut catalog = manager.catalog();
@@ -1791,7 +2482,10 @@ mod platform_tests {
         let android = FakeBackend::new(Platform::Android, &["Pixel"]);
         android.boot_orientation(Orientation::Landscape);
         let (manager, _enabled) = fake_manager(vec![android]);
-        let id = manager.open(Platform::Android, "Pixel").await.unwrap();
+        let id = manager
+            .open(Platform::Android, "Pixel", None)
+            .await
+            .unwrap();
         let ready = wait_state(&manager, &id, DeviceState::Ready).await;
         let (width, height) = crate::device::fake_backend::FAKE_SIZE;
         assert_eq!(
@@ -1806,7 +2500,7 @@ mod platform_tests {
         let ios = FakeBackend::new(Platform::Ios, &["UDID-1"]);
         ios.without_video("Video is off: this simulator runs view-only.");
         let (manager, _enabled) = fake_manager(vec![ios]);
-        let id = manager.open(Platform::Ios, "UDID-1").await.unwrap();
+        let id = manager.open(Platform::Ios, "UDID-1", None).await.unwrap();
         wait_state(&manager, &id, DeviceState::Ready).await;
         let refused = manager
             .create_media_ticket(&id, "session", media::MediaChannel::Plain)

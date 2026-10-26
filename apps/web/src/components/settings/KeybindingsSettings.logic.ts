@@ -29,7 +29,21 @@ export interface KeybindingRow {
 export type WhenVariableOption = string;
 export type KeybindingCommandOption = KeybindingCommand;
 
-const CORE_WHEN_VARIABLES = ["terminalFocus", "terminalOpen", "true", "false"] as const;
+// `chatFocus` has no shipped rule to seed it; Find in thread's rules use it.
+const CORE_WHEN_VARIABLES = [
+  "terminalFocus",
+  "terminalOpen",
+  "chatFocus",
+  "true",
+  "false",
+] as const;
+
+/** Commands with no shipped rule that a user can still bind. */
+const BINDABLE_COMMANDS_WITHOUT_DEFAULTS: ReadonlyArray<KeybindingCommand> = [
+  "chat.find",
+  "diff.nextChange",
+  "diff.previousChange",
+];
 
 const DEFAULT_WHEN_VARIABLES = new Set<string>(CORE_WHEN_VARIABLES);
 for (const binding of DEFAULT_RESOLVED_KEYBINDINGS) {
@@ -255,7 +269,7 @@ export function buildWhenVariableOptions(): ReadonlyArray<WhenVariableOption> {
 export function buildKeybindingCommandOptions(
   keybindings: ResolvedKeybindingsConfig,
 ): ReadonlyArray<KeybindingCommandOption> {
-  const commands = new Set<KeybindingCommand>();
+  const commands = new Set<KeybindingCommand>(BINDABLE_COMMANDS_WITHOUT_DEFAULTS);
   for (const binding of DEFAULT_RESOLVED_KEYBINDINGS) {
     commands.add(binding.command);
   }

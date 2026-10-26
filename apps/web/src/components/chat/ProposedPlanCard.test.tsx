@@ -39,7 +39,9 @@ vi.mock("@bibcode/client-runtime/state/runtime", () => ({
   isAtomCommandInterrupted: () => harness.interrupted,
   squashAtomCommandFailure: harness.squashFailure,
 }));
-vi.mock("../../proposedPlan", () => ({
+vi.mock("../../proposedPlan", async (importOriginal) => ({
+  proposedPlanCanCollapse: (await importOriginal<typeof import("../../proposedPlan")>())
+    .proposedPlanCanCollapse,
   buildCollapsedProposedPlanPreviewMarkdown: () => harness.collapsedPreview,
   buildProposedPlanMarkdownFilename: () => "plan.md",
   downloadPlanAsTextFile: harness.download,

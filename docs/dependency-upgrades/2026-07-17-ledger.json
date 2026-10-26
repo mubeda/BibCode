@@ -63,10 +63,10 @@
       "verificationDate": "2026-09-04",
       "status": "partial",
       "ledgerClosure": {
-        "rows": 247,
+        "rows": 257,
         "statuses": {
           "green": 132,
-          "current": 68,
+          "current": 78,
           "blocked": 42,
           "removed": 5
         }
@@ -308,8 +308,8 @@
     }
   },
   "inventorySummary": {
-    "javascriptDirect": 80,
-    "javascriptLedger": 82,
+    "javascriptDirect": 90,
+    "javascriptLedger": 92,
     "rustRegistry": 138,
     "rustPath": 3,
     "rustGit": 1,
@@ -770,6 +770,30 @@
       "status": "current"
     },
     {
+      "key": "js:apps/web:@types/hast",
+      "name": "@types/hast",
+      "current": "^3.0.5",
+      "target": "^3.0.5",
+      "channel": "stable",
+      "source": "https://www.npmjs.com/package/@types/hast",
+      "cohort": "javascript-current",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "current",
+      "notes": "Declared for the Find in thread projection's syntax tree types; the lockfile already resolved this version through react-markdown."
+    },
+    {
+      "key": "js:apps/web:@types/mdast",
+      "name": "@types/mdast",
+      "current": "^4.0.4",
+      "target": "^4.0.4",
+      "channel": "stable",
+      "source": "https://www.npmjs.com/package/@types/mdast",
+      "cohort": "javascript-current",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "current",
+      "notes": "Declared for the incremental streaming Markdown parser types; the lockfile already resolved this version through react-markdown."
+    },
+    {
       "key": "js:apps/web:@types/react",
       "name": "@types/react",
       "current": "~19.2.18",
@@ -860,6 +884,18 @@
       "status": "current"
     },
     {
+      "key": "js:apps/web:dompurify",
+      "name": "dompurify",
+      "current": "3.4.16",
+      "target": "3.4.16",
+      "channel": "stable",
+      "source": "https://www.npmjs.com/package/dompurify",
+      "cohort": "react-ui",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "current",
+      "notes": "Newly chosen exact pin for the Mermaid diagram SVG sanitizer (#171): the newest release at least 14 days old on 2026-10-24; 3.4.17 (2026-10-12) had not cleared the 14-day rule."
+    },
+    {
       "key": "js:apps/web:fake-indexeddb",
       "name": "fake-indexeddb",
       "current": "6.2.5",
@@ -896,6 +932,42 @@
       "notes": "Compatible in-range lockfile refresh for v0.11.0 (pnpm 24-hour release-age gate; the 14-day rule applies only to newly chosen declared targets)."
     },
     {
+      "key": "js:apps/web:hast-util-to-html",
+      "name": "hast-util-to-html",
+      "current": "^9.0.5",
+      "target": "^9.0.5",
+      "channel": "stable",
+      "source": "https://www.npmjs.com/package/hast-util-to-html",
+      "cohort": "javascript-current",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "current",
+      "notes": "Declared for streamed code-block highlighting; the lockfile already resolved this version through Shiki."
+    },
+    {
+      "key": "js:apps/web:hast-util-to-jsx-runtime",
+      "name": "hast-util-to-jsx-runtime",
+      "current": "^2.3.6",
+      "target": "^2.3.6",
+      "channel": "stable",
+      "source": "https://www.npmjs.com/package/hast-util-to-jsx-runtime",
+      "cohort": "javascript-current",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "current",
+      "notes": "Declared for streamed code-block highlighting; the lockfile already resolved this version through react-markdown."
+    },
+    {
+      "key": "js:apps/web:jsdom",
+      "name": "jsdom",
+      "current": "30.1.2",
+      "target": "30.1.2",
+      "channel": "stable",
+      "source": "https://www.npmjs.com/package/jsdom",
+      "cohort": "stable-javascript-tooling",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "current",
+      "notes": "Development-only DOM for the Mermaid diagram sanitizer tests (#171): DOMPurify does not run under happy-dom, whose NodeIterator stops once its reference node is removed. Newly chosen exact pin, the newest release at least 14 days old on 2026-10-24; 30.1.3 (2026-10-15) had not cleared the 14-day rule."
+    },
+    {
       "key": "js:apps/web:lexical",
       "name": "lexical",
       "current": "^0.50.0",
@@ -928,6 +1000,18 @@
       "cohort": "stable-javascript-tooling",
       "platforms": ["linux", "macos", "windows"],
       "status": "green"
+    },
+    {
+      "key": "js:apps/web:pele",
+      "name": "pele",
+      "current": "1.3.0",
+      "target": "1.3.0",
+      "channel": "stable",
+      "source": "https://www.npmjs.com/package/pele",
+      "cohort": "react-ui",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "current",
+      "notes": "Newly chosen exact pin for Mermaid diagrams in chat Markdown (#171): the newest release at least 14 days old on 2026-10-24; 1.4.0 (2026-10-14) and later had not cleared the 14-day rule. Minor releases have broken APIs, so upgrades re-run the sanitizer corpus and no-eval guard tests."
     },
     {
       "key": "js:apps/web:react",
@@ -1007,6 +1091,30 @@
       "status": "current"
     },
     {
+      "key": "js:apps/web:remark-parse",
+      "name": "remark-parse",
+      "current": "^11.0.0",
+      "target": "^11.0.0",
+      "channel": "stable",
+      "source": "https://www.npmjs.com/package/remark-parse",
+      "cohort": "javascript-current",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "current",
+      "notes": "Declared so Find in thread runs the chat Markdown pipeline as react-markdown does; the lockfile already resolved this version through react-markdown."
+    },
+    {
+      "key": "js:apps/web:remark-rehype",
+      "name": "remark-rehype",
+      "current": "^11.1.2",
+      "target": "^11.1.2",
+      "channel": "stable",
+      "source": "https://www.npmjs.com/package/remark-rehype",
+      "cohort": "javascript-current",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "current",
+      "notes": "Declared so Find in thread runs the chat Markdown pipeline as react-markdown does; the lockfile already resolved this version through react-markdown."
+    },
+    {
       "key": "js:apps/web:tailwind-merge",
       "name": "tailwind-merge",
       "current": "^3.4.0",
@@ -1027,6 +1135,18 @@
       "cohort": "react-ui",
       "platforms": ["linux", "macos", "windows"],
       "status": "green"
+    },
+    {
+      "key": "js:apps/web:unified",
+      "name": "unified",
+      "current": "^11.0.5",
+      "target": "^11.0.5",
+      "channel": "stable",
+      "source": "https://www.npmjs.com/package/unified",
+      "cohort": "javascript-current",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "current",
+      "notes": "A runtime dependency since Find in thread runs the chat Markdown pipeline; also typed by the incremental streaming Markdown parser plugin. The lockfile already resolved this version through react-markdown."
     },
     {
       "key": "js:apps/web:zustand",
@@ -1225,7 +1345,8 @@
       "source": "https://www.npmjs.com/package/@pierre/diffs",
       "cohort": "pierre",
       "platforms": ["linux", "macos", "windows"],
-      "status": "green"
+      "status": "green",
+      "notes": "Retain the Editor.applyEdits undo-boundary patch (patches/@pierre__diffs@1.3.6.patch) while no release lets a programmatic edit be its own undo step (none through 1.6.1). The open-file reload depends on it so that Undo after a reload restores the old text without also undoing the user's last typing. Remove it when BiBCode is on a release whose Editor.applyEdits accepts the boundary and the open-file reload undo tests pass without the patch."
     },
     {
       "key": "js:catalog:@tauri-apps/api",
@@ -1272,7 +1393,7 @@
       "cohort": "effect",
       "platforms": ["linux", "macos", "windows"],
       "status": "green",
-      "notes": "Effect 4 stable (4.0.0 replaced the beta/RC series). 4.0.2 (2026-10-07) is the newest release satisfying the 14-day age rule for the v0.11.0 upgrade; all Effect packages share this exact version. Migration: effect/unstable/* paths dropped the unstable segment, Schema.toArbitrary became the native effect/Arbitrary runner, and parseOptions annotations no longer affect parsing. patches/effect@4.0.2.patch makes the Interrupt that RpcClient sends after a chunk fails to decode interruptible: 4.0.2 sends it uninterruptibly, and when the socket had already closed it waited for a reopen the client protocol never makes, so the session never reported its disconnect and never reconnected. Drop the patch once upstream makes that send interruptible."
+      "notes": "Effect 4 stable (4.0.0 replaced the beta/RC series). 4.0.2 (2026-10-07) is the newest release satisfying the 14-day age rule for the v0.11.0 upgrade; all Effect packages share this exact version. Migration: effect/unstable/* paths dropped the unstable segment, Schema.toArbitrary became the native effect/Arbitrary runner, and parseOptions annotations no longer affect parsing. patches/effect@4.0.2.patch makes the Interrupt that RpcClient sends after a chunk fails to decode interruptible: 4.0.2 sends it uninterruptibly, and when the socket had already closed it waited for a reopen the client protocol never makes, so the session never reported its disconnect and never reconnected. Drop the patch once upstream makes that send interruptible (Effect-TS/effect#9897)."
     },
     {
       "key": "js:catalog:jose",

@@ -352,6 +352,10 @@ node scripts/run-msvc.mjs cargo clean -p bibcode-server -p bibcode-desktop -p bi
 node scripts/run-msvc.mjs cargo clippy --workspace --all-targets -- -D warnings
 ```
 
+Install the workspace dependencies (`vp install`) before the broad test
+command: `rpc_wire` starts the TypeScript Effect client with `node`, which
+fails without them.
+
 Run the `--all-targets` check first. Unix-only test helpers and imports must sit
 behind the same `cfg(unix)` as their consumers; an unused import in a Windows
 test target fails the whole `bibcode-server` test build under `-D warnings` and
@@ -524,6 +528,12 @@ request, and render a real text patch on Files changed/Changes with `tab=files`
 retained after reload. Record unavailable fixture/host states separately from
 that pass. The packaged Pierre spec's sibling checks route entry only; the
 shared procedure owns authenticated list/detail/files evidence.
+
+Include the shared [Diff Compare scenario](./cross-platform-validation.md#diff-compare-scenario):
+Changes and Compare, the explained file states, the filters, Changes only with
+7 context lines, F7 and Shift+F7, the quit-and-relaunch check that the view,
+Split, the line filter and the count are restored, and **Open with** in
+WinMerge, including an app that stays open when BiBCode quits.
 
 Include the shared [slow-link liveness scenario](./cross-platform-validation.md#slow-link-liveness-scenario)
 when a browser client and a development or standalone server are available on

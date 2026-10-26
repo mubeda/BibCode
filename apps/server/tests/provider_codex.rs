@@ -10774,6 +10774,168 @@ async fn next_codex_event_matching(
     }
 }
 
+/// #173: root reasoning summaries reach the chat. Each streamed part after the first starts
+/// after a blank line; the completion carries the whole summary, joined the same way, which
+/// is authoritative over what streamed. Raw reasoning never leaves the runtime.
+#[tokio::test]
+async fn reasoning_summaries_stream_as_reasoning_items_and_complete_with_the_summary() {
+    let (connection, incoming, mut peer) = scripted_peer();
+    let runtime = CodexSessionRuntime::new(
+        CodexSessionOptions {
+            version: "0.1.1".to_owned(),
+            thread_id: "fixture-thread".to_owned(),
+            cwd: "/tmp/project".to_owned(),
+            runtime_mode: CodexRuntimeMode::FullAccess,
+            model: Some("gpt-5.3-codex".to_owned()),
+            service_tier: None,
+            effort: None,
+            resume_cursor: None,
+        },
+        connection,
+        incoming,
+    );
+    peer.expect_request("initialize", fixture("initialize-params.json"))
+        .respond(json!({ "userAgent": "mock-codex-app-server" }));
+    peer.expect_notification("initialized");
+    peer.expect_request(
+        "thread/start",
+        json!({
+            "cwd": "/tmp/project",
+            "approvalPolicy": "never",
+            "sandbox": "danger-full-access",
+            "model": "gpt-5.3-codex",
+            "serviceTier": null,
+        }),
+    )
+    .respond(json!({
+        "cwd": "/tmp/project",
+        "model": "gpt-5.3-codex",
+        "thread": { "id": "provider-thread-1" }
+    }));
+    let summary_delta = |item: &str, index: u64, delta: &str| {
+        json!({
+            "method": "item/reasoning/summaryTextDelta",
+            "params": {
+                "threadId": "provider-thread-1",
+                "turnId": "fixture-turn",
+                "itemId": item,
+                "summaryIndex": index,
+                "delta": delta,
+            }
+        })
+    };
+    let completed = |item: &str, summary: Value| {
+        json!({
+            "method": "item/completed",
+            "params": {
+                "threadId": "provider-thread-1",
+                "turnId": "fixture-turn",
+                "item": {
+                    "id": item,
+                    "type": "reasoning",
+                    "summary": summary,
+                    "content": ["raw chain of thought"],
+                }
+            }
+        })
+    };
+    peer.expect_request("turn/start", fixture("turn-start-text.json"))
+        .respond(json!({ "turn": { "id": "fixture-turn" } }))
+        .emit_notification(json!({
+            "method": "turn/started",
+            "params": { "threadId": "provider-thread-1", "turn": { "id": "fixture-turn" } }
+        }))
+        .emit_notification(summary_delta("r1", 0, "A"))
+        .emit_notification(summary_delta("r1", 1, "B"))
+        .emit_notification(completed("r1", json!(["A", "B"])))
+        .emit_notification(summary_delta("r2", 0, "A"))
+        .emit_notification(completed("r2", json!(["A", "B"])))
+        .emit_notification(completed("r3", json!(["Only the summary"])))
+        .emit_notification(json!({
+            "method": "item/reasoning/textDelta",
+            "params": {
+                "threadId": "provider-thread-1",
+                "turnId": "fixture-turn",
+                "itemId": "r4",
+                "contentIndex": 0,
+                "delta": "raw chain of thought",
+            }
+        }))
+        .emit_notification(completed("r4", json!([])))
+        .emit_notification(json!({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "provider-thread-1",
+                "turn": { "id": "fixture-turn", "status": "completed" }
+            }
+        }));
+    let peer_task = tokio::spawn(peer.run());
+    runtime.start().await.expect("runtime starts");
+    runtime.collect_events(3).await;
+    runtime.set_agent_activity_enabled(false).await;
+    runtime
+        .send_turn(Some("Small text turn".to_owned()), vec![], None, None)
+        .await
+        .expect("turn starts");
+    let events = runtime.collect_events(9).await;
+    let observed = events
+        .iter()
+        .map(|event| {
+            (
+                event.event_type.as_str(),
+                event.item_id.as_deref(),
+                event.payload.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        observed,
+        vec![
+            ("turn.started", None, json!({})),
+            (
+                "content.delta",
+                Some("r1"),
+                json!({"streamKind":"reasoning_summary_text","summaryIndex":0,"delta":"A"}),
+            ),
+            (
+                "content.delta",
+                Some("r1"),
+                json!({"streamKind":"reasoning_summary_text","summaryIndex":1,"delta":"\n\nB"}),
+            ),
+            (
+                "item.completed",
+                Some("r1"),
+                json!({"itemType":"reasoning","text":"A\n\nB"}),
+            ),
+            (
+                "content.delta",
+                Some("r2"),
+                json!({"streamKind":"reasoning_summary_text","summaryIndex":0,"delta":"A"}),
+            ),
+            (
+                "item.completed",
+                Some("r2"),
+                json!({"itemType":"reasoning","text":"A\n\nB"}),
+            ),
+            (
+                "item.completed",
+                Some("r3"),
+                json!({"itemType":"reasoning","text":"Only the summary"}),
+            ),
+            (
+                "item.completed",
+                Some("r4"),
+                json!({"itemType":"reasoning"})
+            ),
+            ("turn.completed", None, json!({"state":"completed"})),
+        ],
+        "{observed:?}"
+    );
+    let encoded = format!("{events:?}");
+    assert!(!encoded.contains("raw chain of thought"));
+    peer_task.await.expect("peer task");
+}
+
 fn fixture(name: &str) -> Value {
     serde_json::from_str(
         &std::fs::read_to_string(fixture_directory().join(name)).expect("fixture file"),

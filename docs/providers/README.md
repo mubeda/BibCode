@@ -23,6 +23,31 @@ probes the configured executable and reports installation, authentication, and
 model discovery independently; a driver being supported does not guarantee
 that its local CLI is installed or ready.
 
+## Updating providers on every environment
+
+When a provider is outdated on any environment, or a connected remote server
+has an update available, **Settings → Providers** shows **Provider updates →
+Update all…**. The one confirmation lists each connected environment, including
+SSH, relay, and direct ones, with the providers it will update and, for a remote
+server with an update available, the server version, what restarting it stops,
+and how many agents are running there. It names what it skips: providers that
+need a manual update or are already updating, servers that must be updated
+manually, and environments that are not connected. When nothing can update in
+one click, the same reasons show under the action without opening it. Cancel
+runs nothing.
+
+After you confirm, at most two environments update at a time, each one's
+providers in turn, and one environment's failure never stops another. A remote
+server restarts only after its own providers have updated; if one of them
+failed or could not be confirmed, that server is skipped and stays as it was.
+This action never restarts this desktop app or the server this window is
+connected to. The result for each environment's providers and its server
+(**Queued**, **Updating…**, **Updated**, still outdated, failed with the
+server's message, or skipped) stays in Settings until you choose **Clear**, also
+when you leave the page. A step that gets no answer, for example over a
+connection that dropped silently, ends as unconfirmed instead of waiting
+forever. A server's progress also shows in **Settings → Connections**.
+
 ## Skills in chat
 
 The chat menu combines the selected provider's user skills with skills from the
@@ -30,6 +55,14 @@ active repository or worktree. User skills outside the repository remain
 available even when the repository has no skills. Use `$` for Codex and `/` for
 Claude, Cursor, and OpenCode. Each provider's native visibility and name
 precedence apply; disabled or non-invocable native skills are not suggestions.
+Like `@` for files and agents, `$` and `/` open the menu at the start of any
+word, mid-prompt too, while BiBCode's own `:` actions open it only at the start
+of a line. Escape closes the menu for that word, and a space ends the word, so
+an absolute path such as `/usr/bin` stays plain text. The menu stays closed
+while the word is typed on or corrected, and opens again once the word is
+replaced or cut back to its bare trigger. A command or skill picked
+mid-prompt is inserted as text; whether the agent runs it as a command is up to
+the provider, which may treat only a message that starts with `/` as one.
 
 Discovery uses that provider instance's configured home and environment on the
 machine running the server. Changing projects, provider settings, or refreshing

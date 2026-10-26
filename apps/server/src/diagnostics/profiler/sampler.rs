@@ -973,6 +973,7 @@ mod tests {
             label: "Codex".into(),
             source: RegistrationSource::Provider,
             driver: driver.map(Into::into),
+            survives_shutdown: false,
         };
         let identity = |pid| ProcessIdentity { pid, started_at: 1 };
         let _codex = registry

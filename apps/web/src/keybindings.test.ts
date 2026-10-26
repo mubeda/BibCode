@@ -1,4 +1,7 @@
-import { DEFAULT_RESOLVED_KEYBINDINGS } from "@bibcode/shared/keybindings";
+import {
+  compileResolvedKeybindingsConfig,
+  DEFAULT_RESOLVED_KEYBINDINGS,
+} from "@bibcode/shared/keybindings";
 import { assert, describe, it } from "vite-plus/test";
 
 import {
@@ -8,7 +11,12 @@ import {
   type ResolvedKeybindingsConfig,
 } from "@bibcode/contracts";
 import {
+  chatFindShortcutLabel,
+  diffChangeCommandForEvent,
+  diffChangeShortcutLabel,
   formatShortcutLabel,
+  isChatFindFallbackShortcut,
+  shouldOpenChatFind,
   isChatNewShortcut,
   isSteerQueuedMessageShortcut,
   isChatNewLocalShortcut,
@@ -1004,4 +1012,119 @@ describe("queued message steering shortcut", () => {
       );
     },
   );
+});
+
+describe("Find in thread shortcut", () => {
+  const mac = "MacIntel";
+  const linux = "Linux";
+  const modF = (platform: string, overrides: Partial<ShortcutEventLike> = {}) =>
+    event({
+      key: "f",
+      metaKey: platform === mac,
+      ctrlKey: platform !== mac,
+      ...overrides,
+    });
+  const chatFocus = { chatFocus: true };
+
+  it("opens find with the built-in Mod+F inside a chat surface", () => {
+    for (const platform of [mac, linux]) {
+      assert.strictEqual(
+        shouldOpenChatFind(null, modF(platform), DEFAULT_RESOLVED_KEYBINDINGS, chatFocus, platform),
+        true,
+      );
+    }
+    // Outside the chat (the file editor, a terminal, a preview) Mod+F keeps its own meaning.
+    assert.strictEqual(
+      shouldOpenChatFind(null, modF(mac), DEFAULT_RESOLVED_KEYBINDINGS, { chatFocus: false }, mac),
+      false,
+    );
+  });
+
+  it("takes Mod+F with no other modifier only", () => {
+    for (const extra of [{ shiftKey: true }, { altKey: true }, { ctrlKey: true }]) {
+      assert.strictEqual(
+        shouldOpenChatFind(null, modF(mac, extra), DEFAULT_RESOLVED_KEYBINDINGS, chatFocus, mac),
+        false,
+      );
+    }
+    assert.strictEqual(isChatFindFallbackShortcut(modF(linux, { key: "F" }), linux), true);
+    assert.strictEqual(isChatFindFallbackShortcut(event({ key: "f" }), linux), false);
+  });
+
+  it("lets a user rule on Mod+F for another command win", () => {
+    const keybindings: ResolvedKeybindingsConfig = [
+      ...DEFAULT_RESOLVED_KEYBINDINGS,
+      { shortcut: modShortcut("f"), command: "sidebar.toggle" },
+    ];
+    const command = resolveShortcutCommand(modF(mac), keybindings, { platform: mac });
+    assert.strictEqual(command, "sidebar.toggle");
+    assert.strictEqual(shouldOpenChatFind(command, modF(mac), keybindings, chatFocus, mac), false);
+  });
+
+  it("replaces the built-in key with a rule that binds chat.find elsewhere", () => {
+    const keybindings: ResolvedKeybindingsConfig = [
+      ...DEFAULT_RESOLVED_KEYBINDINGS,
+      {
+        shortcut: modShortcut("f", { shiftKey: true }),
+        command: "chat.find",
+        whenAst: whenIdentifier("chatFocus"),
+      },
+    ];
+    const bound = modF(mac, { shiftKey: true });
+    const command = resolveShortcutCommand(bound, keybindings, {
+      platform: mac,
+      context: chatFocus,
+    });
+    assert.strictEqual(command, "chat.find");
+    assert.strictEqual(shouldOpenChatFind(command, bound, keybindings, chatFocus, mac), true);
+    // The plain Mod+F fallback is off once a rule names chat.find.
+    assert.strictEqual(shouldOpenChatFind(null, modF(mac), keybindings, chatFocus, mac), false);
+    assert.strictEqual(chatFindShortcutLabel(keybindings, mac), "⇧⌘F");
+  });
+
+  it("labels the effective key", () => {
+    assert.strictEqual(chatFindShortcutLabel(DEFAULT_RESOLVED_KEYBINDINGS, mac), "⌘F");
+    assert.strictEqual(chatFindShortcutLabel(DEFAULT_RESOLVED_KEYBINDINGS, linux), "Ctrl+F");
+  });
+});
+
+describe("Compare change steps", () => {
+  const linux = "Linux";
+  const f7 = (overrides: Partial<ShortcutEventLike> = {}) => event({ key: "F7", ...overrides });
+
+  it("steps with the built-in F7 and Shift+F7 when no rule names them", () => {
+    assert.strictEqual(
+      diffChangeCommandForEvent(null, f7(), DEFAULT_RESOLVED_KEYBINDINGS, linux),
+      "diff.nextChange",
+    );
+    assert.strictEqual(
+      diffChangeCommandForEvent(null, f7({ shiftKey: true }), DEFAULT_RESOLVED_KEYBINDINGS, linux),
+      "diff.previousChange",
+    );
+    assert.strictEqual(
+      diffChangeCommandForEvent(null, f7({ altKey: true }), DEFAULT_RESOLVED_KEYBINDINGS, linux),
+      null,
+    );
+    assert.strictEqual(
+      diffChangeShortcutLabel(DEFAULT_RESOLVED_KEYBINDINGS, "diff.nextChange", linux),
+      "F7",
+    );
+  });
+
+  it("lets a rule that names a step replace its built-in key", () => {
+    const keybindings = compileResolvedKeybindingsConfig([
+      { key: "mod+]", command: "diff.nextChange", when: "diffFocus" },
+    ]);
+    assert.strictEqual(diffChangeCommandForEvent(null, f7(), keybindings, linux), null);
+    assert.strictEqual(
+      diffChangeCommandForEvent("diff.nextChange", f7(), keybindings, linux),
+      "diff.nextChange",
+    );
+    assert.strictEqual(
+      diffChangeCommandForEvent(null, f7({ shiftKey: true }), keybindings, linux),
+      "diff.previousChange",
+    );
+    // A key a rule claims for another command keeps that command.
+    assert.strictEqual(diffChangeCommandForEvent("diff.toggle", f7(), keybindings, linux), null);
+  });
 });

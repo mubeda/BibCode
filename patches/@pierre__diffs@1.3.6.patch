@@ -1,0 +1,38 @@
+diff --git a/dist/editor/editor.d.ts b/dist/editor/editor.d.ts
+index af9e2ad32ee689737adb94e782cf8006f1ba70f4..a6df6215104cd14fae53fd362d8c0b7c110ed7b5 100644
+--- a/dist/editor/editor.d.ts
++++ b/dist/editor/editor.d.ts
+@@ -80,8 +80,11 @@ declare class Editor<LAnnotation> implements DiffsEditor<LAnnotation> {
+    * @param updateHistory Whether to record caller selection snapshots for
+    * exact undo/redo restoration. Defaults to true. When false, live selections
+    * are remapped during replay and the text edit still joins the undo timeline.
++   * @param undoBoundary When true, and updateHistory is true, this edit is its
++   * own undo step and never merges with the entry before or after it.
++   * BiBCode patch: adds the undoBoundary parameter.
+    */
+-  applyEdits(edits: TextEdit[], updateHistory?: boolean): void;
++  applyEdits(edits: TextEdit[], updateHistory?: boolean, undoBoundary?: boolean): void;
+   /** Whether there is an edit to undo. */
+   get canUndo(): boolean;
+   /** Whether there is an undone edit to redo. */
+diff --git a/dist/editor/editor.js b/dist/editor/editor.js
+index 0cd91b0d5bdbaebc469b32306bf5be0d2722241b..62852a94a0d17cedfa87922cc67093ea2b9489e2 100644
+--- a/dist/editor/editor.js
++++ b/dist/editor/editor.js
+@@ -173,14 +173,14 @@ var Editor = class {
+ 	* exact undo/redo restoration. Defaults to true. When false, live selections
+ 	* are remapped during replay and the text edit still joins the undo timeline.
+ 	*/
+-	applyEdits(edits, updateHistory = true) {
++	applyEdits(edits, updateHistory = true, undoBoundary = false) { // BiBCode patch: forward undoBoundary
+ 		const textDocument = this.#textDocument;
+ 		if (textDocument == null) throw new Error("Editor is not attached");
+ 		const wasFocused = this.#contentHasFocus;
+ 		const selectionsBefore = this.#selections;
+ 		const selectionOffsetsBefore = selectionsBefore?.map((selection) => [textDocument.offsetAt(selection.start), textDocument.offsetAt(selection.end)]);
+ 		const resolvedEditOffsets = selectionsBefore === void 0 ? void 0 : textDocument.resolveEdits(edits).sort((a, b) => a.start - b.start);
+-		const change = textDocument.applyEdits(edits, updateHistory, selectionsBefore);
++		const change = textDocument.applyEdits(edits, updateHistory, selectionsBefore, void 0, undoBoundary);
+ 		if (change === void 0) return;
+ 		let nextSelections;
+ 		if (selectionsBefore !== void 0 && selectionOffsetsBefore !== void 0 && resolvedEditOffsets !== void 0) {

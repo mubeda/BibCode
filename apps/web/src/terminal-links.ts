@@ -1,4 +1,5 @@
-import { isMacPlatform } from "./lib/utils";
+// The find projection worker imports this module, so it keeps to dependency-free imports.
+import { isMacPlatform } from "./lib/platform";
 
 export type TerminalLinkKind = "url" | "path";
 

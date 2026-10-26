@@ -85,7 +85,7 @@ impl ClaudeAssistantError {
             .iter()
             .filter_map(|content| match content {
                 AssistantContent::Text { text } => Some(text.trim()),
-                AssistantContent::ToolUse { .. } => None,
+                AssistantContent::ToolUse { .. } | AssistantContent::Other => None,
             })
             .find(|text| !text.is_empty())
             .map(str::to_owned);
@@ -117,11 +117,18 @@ const CONTEXT_LIMIT_MESSAGE: &str =
 /// `Prompt is too long · automatic compaction failed: <cause>` form.
 const PROMPT_TOO_LONG: &str = "Prompt is too long";
 
+/// Claude's text when its own compaction failed: "`/compact` fails on the same error until you
+/// do" (Claude Code's error reference, "Prompt is too long").
+const AUTOMATIC_COMPACTION_FAILED: &str = "automatic compaction failed";
+
 /// The description and class of a failed turn.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ClaudeTurnFailure {
     pub(crate) message: String,
     pub(crate) error_class: &'static str,
+    /// `Some(false)` for a context-limit stop Claude says compacting cannot fix. Read from
+    /// Claude's own reason and text, never from `message`.
+    pub(crate) compactable: Option<bool>,
 }
 
 /// Describe a failed (not interrupted) turn from everything Claude reported about it, most
@@ -145,23 +152,27 @@ pub(crate) fn describe_failed_turn(
         return ClaudeTurnFailure {
             message: error.to_owned(),
             error_class,
+            compactable: None,
         };
     }
     if let Some(text) = assistant_error.and_then(|error| error.text.as_deref()) {
         return ClaudeTurnFailure {
             message: sentence(text),
             error_class,
+            compactable: None,
         };
     }
     if let Some(api_error) = api_error {
         return ClaudeTurnFailure {
             message: sentence(api_error),
             error_class,
+            compactable: None,
         };
     }
     ClaudeTurnFailure {
         message: named_failure("Claude turn failed", result),
         error_class,
+        compactable: None,
     }
 }
 
@@ -209,7 +220,23 @@ fn context_limit_failure(
     ClaudeTurnFailure {
         message,
         error_class: CONTEXT_LIMIT_ERROR_CLASS,
+        compactable: (!compacting_can_help(result, claude_text)).then_some(false),
     }
+}
+
+/// Whether compacting the conversation can fix this context-limit stop. Not after Claude's own
+/// compaction failed, not for a single exchange (which Claude cannot compact), and not for
+/// `rapid_refill_breaker`, which by its name and Claude's grouping stops a context refilling
+/// straight after a compaction (undocumented, so this is inferred and conservative).
+fn compacting_can_help(result: &ResultMessage, claude_text: Option<&str>) -> bool {
+    let breaker = result.terminal_reason.as_deref().map(str::trim) == Some("rapid_refill_breaker");
+    let said_it_cannot = claude_text.is_some_and(|text| {
+        let text = text.to_ascii_lowercase();
+        text.contains(AUTOMATIC_COMPACTION_FAILED)
+            || text.contains("single exchange")
+            || text.contains("single-exchange")
+    });
+    !breaker && !said_it_cannot
 }
 
 /// `"<reason> (<terminal_reason or subtype>[, HTTP <status>])."`
@@ -411,6 +438,98 @@ mod tests {
             message.ends_with("automatic compaction failed: the summary request timed out."),
             "{message:?}"
         );
+    }
+
+    #[test]
+    fn a_context_limit_stop_says_whether_compacting_can_help() {
+        // A bare `Prompt is too long` leaves it to the engine: compacting may help.
+        let mut runtime = runtime_with_turn();
+        let payload = completion(&mut runtime, &blocking_limit_frames("Prompt is too long"));
+        assert!(payload.get("compactable").is_none(), "{payload}");
+        assert_eq!(payload["providerReason"], "blocking_limit");
+        for (reason, text) in [
+            ("rapid_refill_breaker", "Prompt is too long"),
+            (
+                "blocking_limit",
+                "Prompt is too long · automatic compaction failed: the summary request timed out",
+            ),
+            (
+                "blocking_limit",
+                "Prompt is too long · this conversation is a single exchange",
+            ),
+            (
+                "blocking_limit",
+                "A single-exchange conversation cannot be compacted",
+            ),
+        ] {
+            let mut runtime = runtime_with_turn();
+            let [assistant, mut result] = blocking_limit_frames(text);
+            result["terminal_reason"] = json!(reason);
+            let payload = completion(&mut runtime, &[assistant, result]);
+            assert_eq!(payload["errorClass"], "context_limit", "{text}");
+            assert_eq!(payload["compactable"], false, "{reason}: {text}");
+        }
+    }
+
+    #[test]
+    fn compactable_is_read_from_claudes_text_not_the_shown_message() {
+        let failure = describe_failed_turn(
+            &result(json!({ "terminal_reason": "blocking_limit" })),
+            None,
+            None,
+        );
+        assert_eq!(failure.error_class, CONTEXT_LIMIT_ERROR_CLASS);
+        // BiBCode's own message mentions compacting; only Claude's text decides.
+        assert!(failure.message.contains("Compact the conversation"));
+        assert_eq!(failure.compactable, None);
+    }
+
+    #[test]
+    fn a_turn_that_fails_at_its_first_request_failed_before_output() {
+        let mut runtime = runtime_with_turn();
+        let payload = completion(&mut runtime, &blocking_limit_frames("Prompt is too long"));
+        assert_eq!(payload["beforeOutput"], true);
+    }
+
+    #[test]
+    fn a_turn_that_streamed_text_or_called_a_tool_first_did_not_fail_before_output() {
+        let text = json!({
+            "type": "stream_event", "session_id": "session", "uuid": "delta",
+            "parent_tool_use_id": null,
+            "event": {"type": "content_block_delta", "index": 0,
+                "delta": {"type": "text_delta", "text": "Looking"}}
+        });
+        let tool = json!({
+            "type": "stream_event", "session_id": "session", "uuid": "tool",
+            "parent_tool_use_id": null,
+            "event": {"type": "content_block_start", "index": 0,
+                "content_block": {"type": "tool_use", "id": "tool-1", "name": "Bash", "input": {}}}
+        });
+        for first in [text, tool] {
+            let mut runtime = runtime_with_turn();
+            let [assistant, result] = blocking_limit_frames("Prompt is too long");
+            let payload = completion(&mut runtime, &[first.clone(), assistant, result]);
+            assert_eq!(payload["errorClass"], "context_limit");
+            assert_eq!(payload["beforeOutput"], false, "{first}");
+        }
+        // The next turn starts without output again.
+        let mut runtime = runtime_with_turn();
+        let [assistant, result] = blocking_limit_frames("Prompt is too long");
+        runtime.handle_raw_value(
+            &json!({
+                "type": "stream_event", "session_id": "session", "uuid": "delta",
+                "parent_tool_use_id": null,
+                "event": {"type": "content_block_delta", "index": 0,
+                    "delta": {"type": "text_delta", "text": "Looking"}}
+            }),
+            1_000,
+        );
+        runtime.start_turn(crate::provider::claude::TurnInput {
+            turn_id: "turn-2".to_owned(),
+            input: "again".to_owned(),
+        });
+        let payload = completion(&mut runtime, &[assistant, result]);
+        assert_eq!(payload["beforeOutput"], true);
     }
 
     #[test]

@@ -43,7 +43,12 @@ the server conservatively requires Owner access. Unsupported operations show
 the host's reason. GitHub rejects auto-merge combined with bypass; GitLab
 requires both permissions when both choices are selected. For GitLab merge
 message writes, the API payload sends both `auto_merge` (renamed in 17.11) and
-`merge_when_pipeline_succeeds` for older hosts.
+`merge_when_pipeline_succeeds` for older hosts. **Disable auto-merge** posts to
+`cancel_auto_merge` on GitLab 19.5+, which refuses with HTTP 403 or 409. Older
+hosts, and hosts whose version cannot be read, use the deprecated
+`cancel_merge_when_pipeline_succeeds`, which answers a refusal with HTTP 201 and
+`"status": "error"`, so the server reads its body. A refusal on either endpoint
+fails the action.
 
 “Clone from URL” is a generic Git clone. It does not require BiBCode to identify
 the hosting provider, but the URL's normal SSH or HTTPS credentials must work on
@@ -249,14 +254,16 @@ Requests is on in Settings), and only closes the dialog everywhere else.
 ### Pull Requests command inventory
 
 Successful CLI discovery/auth probes and GitLab host contexts have a request-driven
-30-second cache (at most 32 entries per cache, no polling). The origin is still
+30-second cache (at most 32 entries per cache; the cache itself never refreshes
+on a timer). The origin is still
 read each time. Opening the module and switching checkout reuse cached answers;
 **Rescan** and authentication recovery send `rescan` on `pullRequests.getContext`,
 which bypasses them. Authentication/repository-access failures invalidate them.
 GitLab's repository-wide tab totals are reused for 30 seconds across filter
 changes and pages; an explicit list **Refresh** (`refreshTotals`), a successful
 action (including a request created from the Git Manager or chat), Rescan or
-expiry reads them again. Once the host is identified, the login recheck runs
+expiry reads them again. The GitLab poller reuses them for up to 5 minutes
+while its first page is unchanged. Once the host is identified, the login recheck runs
 alongside the context or list read; a failed login takes precedence and the
 provider read is cancelled and awaited before its result is discarded. Both
 paths recheck that the checkout still exists before accepting a host response.
@@ -267,20 +274,87 @@ UI-only precheck reads. Timeline and reaction paths reuse a viewer already
 available in context.
 
 All module host access uses the server's supervised `HostCommandRunner` and
-only `gh`, `glab`, or `git`. No browser HTTP request, avatar lookup, or module
-background polling contacts the provider. The shared worktree catalog owns
+only `gh`, `glab`, or `git`. No browser HTTP request or avatar lookup contacts
+the provider. The one recurring host traffic is GitLab's subscription poller,
+which runs cooperatively inside `pullRequests.subscribe` (no spawned task) and
+only while a GitLab list or merge request is on screen in a visible window: the
+list page every 20 s, a `GET merge_requests/:iid` probe per subscribed number,
+and, for at most three numbers whose pipeline is running on the Conversation or
+Pipelines tab, the probe plus one GraphQL `headPipeline` read every 10 s (see
+[the Pull Requests contract boundary](../architecture/rpc-and-orchestration.md#pull-requests-contract-boundary)).
+A 429 backs off every poller of the host for 60, 120, then 300 s; a sign-in
+failure ends it. GitHub routes never poll. The shared worktree catalog owns
 managed-worktree creation after the module fetches the requested head.
 
-| Operation family                  | GitHub commands                                                                                                                               | GitLab commands                                                                                                                                                                   |
-| --------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Context and vocabulary            | `gh auth status`, `gh api user`, repository/branch/label/milestone/collaborator REST and GraphQL reads                                        | `glab auth status`, `glab api user`, project/version/member/branch/label/milestone reads                                                                                          |
-| List and detail                   | `gh api graphql`; filtered lists use `gh pr list --search`; `gh pr view` plus bounded GraphQL metadata                                        | `glab mr list -F json` (open default, `--closed`, `--merged`, `--all`); `glab api` project/MR/approval/reviewer reads                                                             |
-| Timeline, commits, checks, files  | Bounded GraphQL timeline/thread/comment connections; `gh pr view` commits/check rollup/files; `gh pr diff --patch`                            | Bounded GraphQL discussions with notes/awards/positions and REST resource events; REST commits, pipeline jobs, diffs and versions                                                 |
-| Comments, reviews, reactions      | `gh pr comment --body-file -`; REST review/comment/reply/reaction writes; GraphQL resolve/minimize; REST dismiss; `gh pr edit --add-reviewer` | REST notes/discussions/awards/suggestions; `glab mr approve --sha`, `glab mr revoke`; GraphQL request/remove changes and re-request review                                        |
-| Metadata, state and branch update | `gh pr edit`, `lock`, `unlock`, `ready [--undo]`, `close`, `reopen`, `update-branch [--rebase]`                                               | REST MR updates; `glab mr update --ready/--draft`, `close`, `reopen`, `rebase [--skip-ci]`                                                                                        |
-| Merge and cancel auto-merge       | `gh pr merge` with an allowed method, `--match-head-commit`, optional `--auto` or `--admin`, and `--disable-auto`                             | `glab mr merge --sha -y` without message edits, or REST MR merge with pinned SHA and private subject/body; GraphQL requested-change override when allowed; REST cancel auto-merge |
-| Revert / delete                   | `gh pr revert`; no delete command                                                                                                             | REST target branch creation, merge-commit revert and MR creation; `glab mr delete`                                                                                                |
-| Checkout / worktree fetch         | `gh pr checkout` in the target; `git fetch origin refs/pull/<n>/head:<branch>`                                                                | `glab mr checkout` in the target; `git fetch origin refs/merge-requests/<n>/head:<branch>`                                                                                        |
+The Pipelines reads (`pipelines.*`) use the same runner and share the Pull
+Requests context, sign-in state and 429 ladder. On GitLab their recurring
+traffic is the pipelines poller, which runs cooperatively inside
+`pipelines.subscribe` while a Pipelines view is on screen in a visible window:
+the list's first page every 20 s and, for at most three subscribed pipelines
+that are not terminal, one GraphQL pipeline read every 10 s (20 s after 30
+quiet minutes). It never reads `count`, jobs or logs; any number of windows on
+one list key share its reads. A pipeline page joins its project list's poller
+key with its pipeline id, so its changes repaint from stored rows with no
+`glab` call; only while that stream is down does the page re-read the
+pipeline itself, every 10 s (20 s after 30 unchanged minutes), and never once
+it is terminal. A running job's log is followed by the client
+with ranged trace reads, one 5 s after the last while the window is visible
+(opening one costs at most four), and every follower of one job shares the last tail
+read for 4 s. Every pipelines read, poller ticks and user reads alike, waits
+for the host's backoff deadline and answers `rate_limited` without a host call
+until it passes; a 429 takes the later of the ladder step and the provider's
+`Retry-After` or `RateLimit-Reset`/`x-ratelimit-reset` header (read through
+`glab api -i`; without the header the ladder alone applies), capped at one
+hour, and holds the merge request poller back too.
+
+GitHub Pipelines reads are REST through `gh api -i`, pinned with `--hostname`
+and `X-GitHub-Api-Version: 2022-11-28`; a 403 with `x-ratelimit-remaining: 0`
+or GitHub's secondary-limit message is a rate limit, held until
+`x-ratelimit-reset`. There is still no GitHub server polling: a GitHub list
+re-reads its first page on the client's 20 s visible timer while a shown run is
+not terminal; a pipeline page re-reads the run and its jobs pages every 10 s
+per 100 jobs (at most ten pages, doubled after 30 unchanged minutes); a running
+job's page re-reads the job (its steps) every 10 s and the run every 30 s per
+page. Each stops once what it follows is terminal, and every read honors the
+host's backoff deadline. A GitHub job's log is downloaded only once the job
+completes, through `gh api` without `-i` so the kept tail is all log text;
+`gh` follows GitHub's redirect to the pre-signed download on the server, and
+no API or pre-signed URL reaches the client.
+
+Pipelines actions (`pipelines.runAction`) are one POST each, sent only when
+the host is not backed off and at most once for a double click. A 429 backs
+off the host as a read's does. A refusal (`forbidden`) never clears the
+shared context or rows. On GitHub, where repository write is only a hint, the
+server remembers it per account and action kind until the next rescan, so
+every view shows that action disabled; GitLab's 403 can also mean the job's
+state moved on ("Job is not retryable"), and its reads report permissions, so
+GitLab refusals are not remembered. GitHub
+answers a re-run with no body; GitLab answers with the pipeline or job, and a
+retried GitLab job is a new job.
+
+| Operation family                  | GitHub commands                                                                                                                                                                                                                          | GitLab commands                                                                                                                                                                                                         |
+| --------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Context and vocabulary            | `gh auth status`, `gh api user`, repository/branch/label/milestone/collaborator REST and GraphQL reads                                                                                                                                   | `glab auth status`, `glab api user`, project/version/member/branch/label/milestone reads                                                                                                                                |
+| List and detail                   | `gh api graphql`; filtered lists use `gh pr list --search`; `gh pr view` plus bounded GraphQL metadata                                                                                                                                   | `glab mr list -F json` (open default, `--closed`, `--merged`, `--all`); `glab api` project/MR/approval/reviewer reads; GraphQL `headPipeline` stages                                                                    |
+| Timeline, commits, checks, files  | Bounded GraphQL timeline/thread/comment connections; `gh pr view` commits/check rollup/files; `gh pr diff --patch`                                                                                                                       | Bounded GraphQL discussions with notes/awards/positions and REST resource events; REST commits, diffs and versions; GraphQL `headPipeline` stages and jobs, REST pipeline jobs as the fallback                          |
+| Comments, reviews, reactions      | `gh pr comment --body-file -`; REST review/comment/reply/reaction writes; GraphQL resolve/minimize; REST dismiss; `gh pr edit --add-reviewer`                                                                                            | REST notes/discussions/awards/suggestions; `glab mr approve --sha`, `glab mr revoke`; GraphQL request/remove changes and re-request review                                                                              |
+| Metadata, state and branch update | `gh pr edit`, `lock`, `unlock`, `ready [--undo]`, `close`, `reopen`, `update-branch [--rebase]`                                                                                                                                          | REST MR updates; `glab mr update --ready/--draft`, `close`, `reopen`, `rebase [--skip-ci]`                                                                                                                              |
+| Merge and cancel auto-merge       | `gh pr merge` with an allowed method, `--match-head-commit`, optional `--auto` or `--admin`, and `--disable-auto`                                                                                                                        | `glab mr merge --sha -y` without message edits, or REST MR merge with pinned SHA and private subject/body; GraphQL requested-change override when allowed; REST cancel auto-merge                                       |
+| Revert / delete                   | `gh pr revert`; no delete command                                                                                                                                                                                                        | REST target branch creation, merge-commit revert and MR creation; `glab mr delete`                                                                                                                                      |
+| Checkout / worktree fetch         | `gh pr checkout` in the target; `git fetch origin refs/pull/<n>/head:<branch>`                                                                                                                                                           | `glab mr checkout` in the target; `git fetch origin refs/merge-requests/<n>/head:<branch>`                                                                                                                              |
+| Pipelines list and pipeline       | `gh api -i repos/:o/:r/actions/runs` (or `actions/workflows/:id/runs`; 20 per page, `branch`, `status`); `actions/workflows` with the count; `actions/runs/:id` (or `attempts/:n`) with `jobs` pages of 100 (at most 10) and `artifacts` | `glab api -i graphql` with `project.pipelines` (15 per page, stage strip, optional `count`) and `project.pipeline(id:)` (stages, groups, up to 100 jobs per group); a baseline document on hosts that lack newer fields |
+| Pipelines job and log             | `gh api -i repos/:o/:r/actions/jobs/:id` (steps, labels, runner); `gh api …/actions/jobs/:id/logs` whole once the job completes (90 s, last 16 MiB kept)                                                                                 | `glab api -i projects/:id/jobs/:job_id`; `glab api -i …/jobs/:job_id/trace?byte_offset=N&byte_limit=512000` once a one-byte probe proves ranges, otherwise `glab api …/trace` whole (90 s, last 16 MiB kept)            |
+| Pipelines actions                 | `gh api -i --method POST repos/:o/:r/actions/runs/:id/rerun`, `…/rerun-failed-jobs`, `…/cancel`, `…/actions/jobs/:id/rerun` (no body; 201 or 202)                                                                                        | `glab api -i --method POST projects/:id/pipelines/:id/retry`, `…/cancel`, `projects/:id/jobs/:id/retry`, `…/cancel`, `…/play` (an empty JSON body through the private file)                                             |
+
+A merge request's checks name their Pipelines job page without another
+read. GitLab's `headPipeline` jobs select their global `id`, and the REST
+fallback's jobs carry theirs; a build job (`Ci::Build`) whose web URL is this
+project's `<project>/-/jobs/<id>` gets the pipeline's and its own id, so a
+trigger job or a job of a fork's pipeline keeps its host link. On GitHub, a
+check run's `detailsUrl` of the shape
+`https://<host>/<owner>/<repo>/actions/runs/<run>/job/<job>` on this
+repository gives the run and job ids; the URL is parsed, never followed, and a
+status context's `targetUrl` gives none.
 
 Bodies, descriptions, review summaries and merge messages never enter argv.
 GitHub reads body data from stdin; GitLab API writes use a private temporary

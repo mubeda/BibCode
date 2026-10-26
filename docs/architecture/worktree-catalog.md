@@ -267,7 +267,15 @@ The same authority boundary covers every worktree-bearing owner mutation:
   its existing safe numeric-suffix policy; Pull Requests checkout first applies the
   PR-specific naming policy described above.
 - `worktree.createPanel` accepts a host thread and derives project, kind,
-  branch, and path from that persisted host.
+  branch, and path from that persisted host. History's
+  `agentSessions.openInPanel` creates its panels the same way, under the same
+  project mutation lock. Because a generic `thread.delete` of the host takes
+  no project lock, the engine itself enforces the panel invariant when it
+  decides `thread.create`: a `hostThreadId` must name an existing, undeleted
+  thread of the same project that is not a panel itself. The engine decides
+  one command at a time, so a host deleted first refuses the panel, and a
+  panel created first is deleted by the host's cascade. No panel outlives its
+  host.
 - `worktree.retarget` accepts an opaque worktree key and expected generation;
   it revalidates catalog membership and ownership before changing a workspace.
 - `worktree.adopt`, `worktree.updateDiscoveryPolicy`,

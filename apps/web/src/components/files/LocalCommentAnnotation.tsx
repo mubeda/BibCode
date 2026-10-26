@@ -11,6 +11,9 @@ interface LocalCommentAnnotationProps {
   onCancel: () => void;
   onComment: (text: string) => void;
   onDelete: () => void;
+  /** The unsent text to start from, when the draft is kept outside this field. */
+  initialText?: string;
+  onTextChange?: (text: string) => void;
 }
 
 export function LocalCommentAnnotation({
@@ -20,8 +23,10 @@ export function LocalCommentAnnotation({
   onCancel,
   onComment,
   onDelete,
+  initialText,
+  onTextChange,
 }: LocalCommentAnnotationProps) {
-  const [text, setText] = useState("");
+  const [text, setText] = useState(() => initialText ?? "");
 
   if (kind === "comment") {
     return (
@@ -65,7 +70,10 @@ export function LocalCommentAnnotation({
         value={text}
         placeholder="Request change"
         aria-label={`Comment on lines ${rangeLabel}`}
-        onChange={(event) => setText(event.target.value)}
+        onChange={(event) => {
+          setText(event.target.value);
+          onTextChange?.(event.target.value);
+        }}
         onKeyDown={(event) => {
           if (event.key === "Escape") {
             event.preventDefault();

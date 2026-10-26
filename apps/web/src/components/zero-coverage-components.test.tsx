@@ -651,49 +651,23 @@ describe("layout and navigation surfaces", () => {
     expect(onClose).toHaveBeenCalledOnce();
   });
 
-  it("collapses an expanded child on first Escape and closes on second Escape", async () => {
+  it("closes on the first Escape, since no child holds a collapse state", async () => {
     const onClose = vi.fn();
-    const order: string[] = [];
-    let expanded = true;
-    const consumeEscapeClose = vi.fn(() => {
-      if (!expanded) return false;
-      expanded = false;
-      order.push("collapse");
-      return true;
-    });
-    onClose.mockImplementation(() => order.push("close"));
     await mount(
-      <RightPanelSheet open onClose={onClose} consumeEscapeClose={consumeEscapeClose}>
-        <button aria-expanded="true">Expanded child</button>
+      <RightPanelSheet open onClose={onClose}>
+        Panel content
       </RightPanelSheet>,
     );
-    const event = new KeyboardEvent("keydown", { key: "Escape", bubbles: true });
-    Object.defineProperty(event, "target", { value: document.body });
-    const firstCancel = vi.fn(() => order.push("cancel"));
+    const cancel = vi.fn();
 
     h.sheetOnOpenChange?.(false, {
-      cancel: firstCancel,
-      event,
+      cancel,
+      event: new KeyboardEvent("keydown", { key: "Escape", bubbles: true }),
       reason: "escape-key",
     });
 
-    expect(consumeEscapeClose).toHaveBeenCalledOnce();
-    expect(expanded).toBe(false);
-    expect(firstCancel).toHaveBeenCalledOnce();
-    expect(onClose).not.toHaveBeenCalled();
-    expect(order).toEqual(["collapse", "cancel"]);
-
-    const secondCancel = vi.fn();
-    h.sheetOnOpenChange?.(false, {
-      cancel: secondCancel,
-      event,
-      reason: "escape-key",
-    });
-
-    expect(consumeEscapeClose).toHaveBeenCalledTimes(2);
-    expect(secondCancel).not.toHaveBeenCalled();
+    expect(cancel).not.toHaveBeenCalled();
     expect(onClose).toHaveBeenCalledOnce();
-    expect(order).toEqual(["collapse", "cancel", "close"]);
   });
 
   it("renders settings sections/rows and resets values", async () => {

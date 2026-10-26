@@ -134,6 +134,7 @@ export function CreateWorktreeDialog({
 }: CreateWorktreeDialogProps) {
   const navigate = useNavigate();
   const nameInputRef = useRef<HTMLInputElement>(null);
+  const sourceInputRef = useRef<HTMLInputElement>(null);
 
   const projects = useProjects();
   const serverConfigs = useServerConfigs();
@@ -155,6 +156,8 @@ export function CreateWorktreeDialog({
   const [formError, setFormError] = useState<string | null>(null);
   const agentSelectionTouchedRef = useRef(false);
   const previousOpenRef = useRef(false);
+  // The project whose branches the Create From text names, set where the user types or picks it.
+  const sourceProjectRef = useRef<ScopedProjectRef | null>(null);
   const refsEnabledRef = useRef(false);
 
   const selectProjectTarget = useCallback((nextProjectRef: ScopedProjectRef | null) => {
@@ -197,13 +200,14 @@ export function CreateWorktreeDialog({
   const handleSourceTextChange = useCallback(
     (value: string) => {
       setSourceText(value);
+      sourceProjectRef.current = projectRef;
       clearBranchSelection();
       if (mode === "github" || mode === "smart") {
         const item = parseGitHubWorkItem(value);
         if (item) applySuggestedName(githubWorkItemBranchName(item));
       }
     },
-    [applySuggestedName, clearBranchSelection, mode],
+    [applySuggestedName, clearBranchSelection, mode, projectRef],
   );
 
   const handleBranchSelect = useCallback(
@@ -213,6 +217,19 @@ export function CreateWorktreeDialog({
       setReuseSelectedBranch(canReuseBranch(ref) && automaticNameApplied);
     },
     [applySuggestedName, selectBranchRef],
+  );
+
+  // A picked row fills the field with its name, so the exact-match path hides the list and the
+  // field shows the choice, as a combo box does; editing the field clears it again.
+  const handleBranchRowPick = useCallback(
+    (ref: RefLike) => {
+      setSourceText(ref.name);
+      sourceProjectRef.current = projectRef;
+      handleBranchSelect(ref);
+      // The picked row goes away with the list, so focus stays on the field.
+      sourceInputRef.current?.focus();
+    },
+    [handleBranchSelect, projectRef],
   );
 
   const handleProjectChange = useCallback(
@@ -234,6 +251,14 @@ export function CreateWorktreeDialog({
       agentSelectionTouchedRef.current = false;
       setReuseSelectedBranch(false);
       setName(forgetAutomaticName);
+      // Opening for a project other than the one whose branches the source names clears it, as
+      // changing Project does; the dialog may have last shown another project than it opened for.
+      if (
+        defaultProjectRef !== null &&
+        !sameProjectRef(sourceProjectRef.current, defaultProjectRef)
+      ) {
+        setSourceText("");
+      }
     }
     const firstProject = projects[0];
     const firstProjectRef = firstProject
@@ -324,10 +349,8 @@ export function CreateWorktreeDialog({
 
   const smartRows: SmartRow[] = useMemo(
     () =>
-      mode === "smart"
-        ? buildSmartRows({ query: sourceText, refs }).filter(
-            (row) => row.kind !== "branch" || row.refName !== exactBranchRef?.name,
-          )
+      mode === "smart" && exactBranchRef === null
+        ? buildSmartRows({ query: sourceText, refs })
         : [],
     [exactBranchRef, mode, sourceText, refs],
   );
@@ -597,6 +620,7 @@ export function CreateWorktreeDialog({
             </div>
 
             <Input
+              ref={sourceInputRef}
               aria-label="Create From"
               placeholder={
                 mode === "github"
@@ -624,7 +648,7 @@ export function CreateWorktreeDialog({
                     onClick={() => {
                       if (row.kind === "branch") {
                         const ref = refs.find((candidate) => candidate.name === row.refName);
-                        if (ref) handleBranchSelect(ref);
+                        if (ref) handleBranchRowPick(ref);
                       }
                     }}
                   >
@@ -657,7 +681,7 @@ export function CreateWorktreeDialog({
                       "hover:bg-accent flex w-full items-center px-3 py-1.5 text-left text-sm",
                       ref.name === selectedBranchRefName && "bg-accent",
                     )}
-                    onClick={() => handleBranchSelect(ref)}
+                    onClick={() => handleBranchRowPick(ref)}
                   >
                     {ref.name}
                   </button>

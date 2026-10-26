@@ -26,6 +26,7 @@ import {
   ProjectMetaUpdatedPayload,
   OrchestrationProposedPlan,
   OrchestrationSession,
+  OrchestrationThread,
   ProjectCreateCommand,
   ThreadMetaUpdatedPayload,
   ThreadTurnStartCommand,
@@ -86,6 +87,19 @@ const decodeLegacyTurnDelivery = Schema.decodeUnknownSync(
   }),
 );
 
+/** A message as a client that predates `resendOf` decodes it. */
+const decodeOlderMessage = Schema.decodeUnknownSync(
+  Schema.Struct({
+    id: Schema.String,
+    role: Schema.String,
+    text: Schema.String,
+    turnId: Schema.NullOr(Schema.String),
+    streaming: Schema.Boolean,
+    createdAt: Schema.String,
+    updatedAt: Schema.String,
+  }),
+);
+
 describe("delivery failure reasons", () => {
   const delivery = { state: "failed", provider: "codex" };
 
@@ -126,6 +140,130 @@ describe("delivery failure reasons", () => {
       updatedAt: "2026-09-26T00:00:00Z",
     });
     expect(payload.delivery).toEqual({ ...delivery, reason: "modelSelectionRefused" });
+  });
+});
+
+describe("conversation compaction contracts", () => {
+  const message = {
+    id: "resend:message-1",
+    role: "user",
+    text: "continue",
+    turnId: null,
+    streaming: false,
+    createdAt: "2026-10-24T00:00:00Z",
+    updatedAt: "2026-10-24T00:00:00Z",
+  };
+
+  it("keeps the failed message a copy sends again", () => {
+    expect(decodeOrchestrationMessageSync({ ...message, resendOf: "message-1" }).resendOf).toBe(
+      "message-1",
+    );
+  });
+
+  it("lets an older client decode a copy as an ordinary message", () => {
+    const decoded = decodeOlderMessage({ ...message, resendOf: "message-1" });
+    expect(decoded.text).toBe("continue");
+    expect(Object.hasOwn(decoded, "resendOf")).toBe(false);
+  });
+
+  it("dispatches thread.compact as a client command", () => {
+    const command = {
+      type: "thread.compact",
+      commandId: "compact-1",
+      threadId: "thread-1",
+      createdAt: "2026-10-24T00:00:00Z",
+    };
+    expect(decodeClientOrchestrationCommandSync(command)).toEqual(command);
+  });
+
+  it("keeps the settlement and session tags internal", () => {
+    expect(() =>
+      decodeClientOrchestrationCommandSync({
+        type: "thread.compaction.settle",
+        commandId: "settle-1",
+        threadId: "thread-1",
+        compactionId: "compaction:1",
+        outcome: "completed",
+        createdAt: "2026-10-24T00:00:00Z",
+      }),
+    ).toThrow();
+    expect(
+      decodeOrchestrationCommandSync({
+        type: "thread.compaction.settle",
+        commandId: "settle-1",
+        threadId: "thread-1",
+        compactionId: "compaction:1",
+        outcome: "completed",
+        createdAt: "2026-10-24T00:00:00Z",
+      }),
+    ).toMatchObject({ outcome: "completed" });
+  });
+
+  it("round-trips the requested and settled events", () => {
+    const base = {
+      sequence: 1,
+      eventId: "event-1",
+      aggregateKind: "thread",
+      aggregateId: "thread-1",
+      occurredAt: "2026-10-24T00:00:00Z",
+      commandId: "command-1",
+      causationEventId: null,
+      correlationId: "command-1",
+      metadata: {},
+    };
+    for (const event of [
+      {
+        ...base,
+        type: "thread.compact-requested",
+        payload: {
+          threadId: "thread-1",
+          compactionId: "compaction:1",
+          trigger: "contextRecovery",
+          failedMessageId: "message-1",
+          createdAt: "2026-10-24T00:00:00Z",
+        },
+      },
+      {
+        ...base,
+        type: "thread.compacted",
+        payload: {
+          threadId: "thread-1",
+          compactionId: "compaction:1",
+          outcome: "failed",
+          detail: "Claude couldn't compact the conversation.",
+          createdAt: "2026-10-24T00:00:00Z",
+        },
+      },
+    ]) {
+      expect(encodeOrchestrationEventSync(decodeOrchestrationEventSync(event))).toEqual(event);
+    }
+  });
+
+  it("shows an unsettled compaction on the thread shell and omits it from older servers", () => {
+    const shell = {
+      id: "thread-1",
+      projectId: "project-1",
+      title: "Thread",
+      modelSelection: { instanceId: "claudeAgent", model: "claude-opus" },
+      runtimeMode: "full-access",
+      branch: null,
+      worktreePath: null,
+      latestTurn: null,
+      createdAt: "2026-10-24T00:00:00Z",
+      updatedAt: "2026-10-24T00:00:00Z",
+      session: null,
+      latestUserMessageAt: null,
+      hasPendingApprovals: false,
+      hasPendingUserInput: false,
+      hasActionableProposedPlan: false,
+    };
+    expect(decodeShell(shell).compaction).toBeUndefined();
+    expect(
+      decodeShell({
+        ...shell,
+        compaction: { trigger: "contextRecovery", state: "running", failedMessageId: "message-1" },
+      }).compaction,
+    ).toEqual({ trigger: "contextRecovery", state: "running", failedMessageId: "message-1" });
   });
 });
 
@@ -733,6 +871,58 @@ it.effect("rejects turn diff input when fromTurnCount > toTurnCount", () =>
       }),
     );
     assert.strictEqual(result._tag, "Failure");
+  }),
+);
+
+it.effect("turn diff inputs carry a context count from 0 to 99", () =>
+  Effect.gen(function* () {
+    const turn = yield* decodeTurnDiffInput({
+      threadId: "thread-1",
+      fromTurnCount: 1,
+      toTurnCount: 2,
+      contextLines: 0,
+    });
+    assert.strictEqual(turn.contextLines, 0);
+    const full = yield* decodeFullThreadDiffInput({
+      threadId: "thread-1",
+      toTurnCount: 2,
+      contextLines: 99,
+    });
+    assert.strictEqual(full.contextLines, 99);
+    for (const contextLines of [-1, 100, 2.5]) {
+      const result = yield* Effect.exit(
+        decodeTurnDiffInput({
+          threadId: "thread-1",
+          fromTurnCount: 1,
+          toTurnCount: 2,
+          contextLines,
+        }),
+      );
+      assert.strictEqual(result._tag, "Failure", `contextLines ${contextLines}`);
+    }
+  }),
+);
+
+it.effect("thread turn diffs echo truncation and the context count, both optional", () =>
+  Effect.gen(function* () {
+    const current = yield* decodeThreadTurnDiff({
+      threadId: "thread-1",
+      fromTurnCount: 1,
+      toTurnCount: 2,
+      diff: "patch",
+      truncated: true,
+      contextLines: 7,
+    });
+    assert.strictEqual(current.truncated, true);
+    assert.strictEqual(current.contextLines, 7);
+    const older = yield* decodeThreadTurnDiff({
+      threadId: "thread-1",
+      fromTurnCount: 1,
+      toTurnCount: 2,
+      diff: "patch",
+    });
+    assert.isFalse("truncated" in older);
+    assert.isFalse("contextLines" in older);
   }),
 );
 
@@ -1500,4 +1690,87 @@ it("decodes staged image and file inputs and refuses two byte sources", () => {
     ).toBe(true);
     expect(isUploadChatAttachment({ ...staged, uploadId: null })).toBe(false);
   }
+});
+
+const decodeReasoningThread = Schema.decodeUnknownSync(OrchestrationThread);
+const decodeReasoningEvent = Schema.decodeUnknownSync(OrchestrationEvent);
+const decodeReasoningCommand = Schema.decodeUnknownSync(OrchestrationCommand);
+
+describe("reasoning contracts", () => {
+  const thread = {
+    id: "thread-1",
+    projectId: "project-1",
+    title: "Thread",
+    modelSelection: { instanceId: "codex", model: "gpt-5" },
+    runtimeMode: "full-access",
+    interactionMode: "default",
+    branch: null,
+    worktreePath: null,
+    latestTurn: null,
+    createdAt: "2026-10-24T00:00:00.000Z",
+    updatedAt: "2026-10-24T00:00:00.000Z",
+    deletedAt: null,
+    messages: [],
+    activities: [],
+    checkpoints: [],
+    session: null,
+  };
+
+  it("decodes a thread from an older server without reasoning to none", () => {
+    expect(decodeReasoningThread(thread).reasoning).toEqual([]);
+  });
+
+  it("decodes reasoning entries, their event and their internal commands", () => {
+    const entry = {
+      id: "reasoning:thread-1:item:a",
+      turnId: "turn-1",
+      text: "Weighing options",
+      streaming: true,
+      createdAt: "2026-10-24T00:00:01.000Z",
+      updatedAt: "2026-10-24T00:00:02.000Z",
+    };
+    expect(decodeReasoningThread({ ...thread, reasoning: [entry] }).reasoning).toEqual([entry]);
+    const sent = decodeReasoningEvent({
+      sequence: 1,
+      eventId: "event-1",
+      aggregateKind: "thread",
+      aggregateId: "thread-1",
+      occurredAt: entry.updatedAt,
+      commandId: null,
+      causationEventId: null,
+      correlationId: null,
+      metadata: {},
+      type: "thread.reasoning-sent",
+      payload: {
+        threadId: "thread-1",
+        reasoningId: entry.id,
+        text: "options",
+        turnId: "turn-1",
+        streaming: true,
+        createdAt: entry.createdAt,
+        updatedAt: entry.updatedAt,
+      },
+    });
+    expect(sent.type).toBe("thread.reasoning-sent");
+    for (const command of [
+      {
+        type: "thread.reasoning.delta",
+        commandId: "command-1",
+        threadId: "thread-1",
+        reasoningId: entry.id,
+        delta: "options",
+        turnId: "turn-1",
+        createdAt: entry.createdAt,
+      },
+      {
+        type: "thread.reasoning.complete",
+        commandId: "command-2",
+        threadId: "thread-1",
+        reasoningId: entry.id,
+        createdAt: entry.updatedAt,
+      },
+    ]) {
+      expect(decodeReasoningCommand(command).type).toBe(command.type);
+    }
+  });
 });

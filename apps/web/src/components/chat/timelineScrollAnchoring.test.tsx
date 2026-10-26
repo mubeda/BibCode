@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vite-plus/test";
-import { getAnchoredTurnMetrics, getRowBottom } from "./timelineScrollAnchoring";
+import {
+  getAnchoredTurnMetrics,
+  getRowBottom,
+  getTimelinePageScrollOffset,
+  isAboveReadingLine,
+  rowToggleNeedsEndReveal,
+  type TimelineScrollMode,
+} from "./timelineScrollAnchoring";
 
 function buildState({
   positions,
@@ -20,6 +27,24 @@ function buildState({
     sizeAtIndex: (index: number) => sizes[index],
   };
 }
+
+describe("timeline page scrolling", () => {
+  // 1000px list, 200px of it under the composer: 800px visible, so a page is 700px.
+  const page = (scroll: number, direction: -1 | 1) =>
+    getTimelinePageScrollOffset({
+      state: { scroll, scrollLength: 1000, contentLength: 5000 },
+      composerOverlayHeight: 200,
+      direction,
+    });
+
+  it("moves about one visible page and stops at either end", () => {
+    expect(page(2000, 1)).toBe(2700);
+    expect(page(2000, -1)).toBe(1300);
+    expect(page(300, -1)).toBe(0);
+    expect(page(3800, 1)).toBe(4000);
+    expect(page(4000, 1)).toBe(4000);
+  });
+});
 
 describe("timeline scroll anchoring", () => {
   it("measures row bottoms from LegendList row position and size", () => {
@@ -134,5 +159,46 @@ describe("timeline scroll anchoring", () => {
 
     expect(withoutComposer?.overflowsUsableViewport).toBe(false);
     expect(withComposer?.overflowsUsableViewport).toBe(true);
+  });
+});
+
+describe("rowToggleNeedsEndReveal", () => {
+  it("asks for one reveal pass only for a toggle at the end of an anchored turn", () => {
+    const toggle = (mode: TimelineScrollMode, scrollDeltaToRevealEnd: number | null) =>
+      rowToggleNeedsEndReveal({ mode, scrollDeltaToRevealEnd });
+    expect(toggle("anchoring-new-turn", 0)).toBe(true);
+    expect(toggle("anchoring-new-turn", 1)).toBe(true);
+    // Scrolled up from the turn's end, by a scroll the timeline may not have seen: the reader
+    // keeps their place.
+    expect(toggle("anchoring-new-turn", 1_014)).toBe(false);
+    expect(toggle("anchoring-new-turn", null)).toBe(false);
+    // Following the end keeps it in view by itself; a reader scrolled away keeps their place.
+    expect(toggle("following-end", 0)).toBe(false);
+    expect(toggle("free-scrolling", 0)).toBe(false);
+    expect(toggle("free-scrolling", 400)).toBe(false);
+  });
+});
+
+describe("reading line", () => {
+  const base = { rowTop: -300, rowBottom: 400, viewportTop: 0 };
+
+  it("is below an element that starts above the visible top inside the first visible row", () => {
+    expect(isAboveReadingLine({ ...base, elementTop: -120 })).toBe(true);
+    expect(isAboveReadingLine({ ...base, rowTop: 0, elementTop: -1 })).toBe(true);
+  });
+
+  it("leaves a row wholly above the viewport to the list's own anchoring", () => {
+    expect(isAboveReadingLine({ ...base, rowTop: -900, rowBottom: -200, elementTop: -500 })).toBe(
+      false,
+    );
+    expect(isAboveReadingLine({ ...base, rowTop: -900, rowBottom: 0, elementTop: -500 })).toBe(
+      false,
+    );
+  });
+
+  it("ignores an element in view and rows below the first visible one", () => {
+    expect(isAboveReadingLine({ ...base, elementTop: 10 })).toBe(false);
+    expect(isAboveReadingLine({ ...base, elementTop: 0 })).toBe(false);
+    expect(isAboveReadingLine({ ...base, rowTop: 40, rowBottom: 500, elementTop: 80 })).toBe(false);
   });
 });

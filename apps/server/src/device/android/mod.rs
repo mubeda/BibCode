@@ -19,7 +19,7 @@ use tokio::time::Instant;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 use self::{
-    emulator::{EmulatorLauncher, LaunchError, RunningEmulator},
+    emulator::{EmulatorLauncher, LaunchError, PortReservations, RunningEmulator},
     grpc::{
         EmulatorClient,
         proto::{self, image_format::ImgFormat},
@@ -66,6 +66,9 @@ pub(crate) struct AndroidBackend {
     rotation: RotationTiming,
     /// The SDK the last discovery found; launches use it.
     sdk: Mutex<Option<AndroidSdk>>,
+    /// Console and gRPC ports of every launch until its device ends, so several emulators can
+    /// start at once.
+    ports: PortReservations,
 }
 
 impl AndroidBackend {
@@ -80,6 +83,7 @@ impl AndroidBackend {
             grpc_port: config.grpc_port,
             rotation: RotationTiming::default(),
             sdk: Mutex::new(None),
+            ports: PortReservations::default(),
         }
     }
 
@@ -138,6 +142,7 @@ impl DeviceBackend for AndroidBackend {
                 self.software_gpu,
             );
             launcher.grpc_port = self.grpc_port;
+            launcher.ports = self.ports.clone();
             match launcher.launch(image_id, on_phase, cancel).await {
                 Ok(running) => Ok(Box::new(RunningAndroid::new(
                     running,
@@ -588,7 +593,7 @@ mod tests {
         let mut catalog = fixture.manager.catalog();
         let id = fixture
             .manager
-            .open(Platform::Android, "Pixel")
+            .open(Platform::Android, "Pixel", None)
             .await
             .expect("open Pixel");
         let first_ready = tokio::time::timeout(Duration::from_secs(20), async {
@@ -661,7 +666,7 @@ mod tests {
             ManagerFixture::with_sdk(|sdk| sdk.avds(&["Pixel"]).adb_forwards_to(source.port)).await;
         let id = fixture
             .manager
-            .open(Platform::Android, "Pixel")
+            .open(Platform::Android, "Pixel", None)
             .await
             .expect("open Pixel");
         let ready = fixture.wait_state(&id, DeviceState::Ready).await;

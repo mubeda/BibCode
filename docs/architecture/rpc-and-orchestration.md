@@ -52,7 +52,10 @@ project's workspace root after canonicalization, whose file changed in the last
 carries title, last activity and visible message count. `alreadyImported` is set
 once thread `import:<instanceId>:<sessionId>` was deleted or its history command
 was accepted, and `threadId` names that thread while it is live; an import
-interrupted before its history committed stays selectable. Sessions another
+interrupted before its history committed stays selectable. `hostThreadId` is
+set when that thread is a chat panel (a session continued from History), so the
+dialog's **Open** shows the host with the panel active. Sessions run in a
+worktree are not matched here; they belong to the worktree thread's History. Sessions another
 BiBCode thread already runs (a `provider_turn_outbox.provider_session_id` or a
 `provider_session_runtime` cursor owned by a thread other than their import)
 are left out, because BiBCode's own conversations write into the same homes;
@@ -85,6 +88,98 @@ partial failure replays the committed steps; an accepted history command marks
 the session imported. A deleted import keeps its thread ID and is skipped
 rather than recreated. `thread.history.import` is rejected by public
 `orchestration.dispatchCommand` like every other server-internal command.
+
+### Terminal sessions in History
+
+`agentSessions.listForThread { threadId }` and
+`agentSessions.openInPanel { commandId, hostThreadId, sessionId, mode }` serve
+the composer's **History** menu. Both require `orchestration:operate`, fail
+with `AgentSessionsError { message }` (fixed texts, never transcript content),
+and exist only on servers that advertise the `cliSessionHistory` capability
+(decoded `false` when absent); a client shows an older server's thread only
+its closed chats. They read only the built-in `claudeAgent` instance's config
+directory; when that instance is off they fail with "Claude Code is turned off
+on the server. Turn it on in Settings → Providers."
+
+**List.** The server resolves the folder from the thread row: the thread, or
+its host when it is a chat panel; the host's worktree, else the project's
+workspace root. The client names no path. Listing reads the entry names of
+`<config dir>/projects/` and keeps the directories that encode the folder or
+its canonical path (a name Claude shortened past 200 characters matches by its
+first 200), then stats only their `*.jsonl` files within the 30-day window.
+One request opens at most 1,000 transcripts and reads at most 64 MiB; a file
+whose stem is not a resumable UUID, is owned by another BiBCode thread, or was
+seen already is rejected by name without being opened. Per transcript, newest
+first, until 200 rows or the budget runs out (`truncated`):
+
+- a head read takes the first cwd, which must match the folder, and the first
+  `entrypoint`, which must be `cli` or absent; it stops at the first record
+  that excludes the session (`sdk-*`, including BiBCode's own `sdk-rust`,
+  `claude-desktop`, or any other) or at the first visible prompt;
+- a tail read of the last 64 KiB takes the last `customTitle`, `aiTitle` and
+  `gitBranch`; when it holds no title, a backward walk in 256 KiB steps
+  searches the raw bytes for a buried `custom-title` or `aiTitle`, parsing only
+  the matching line, within 16 MiB of the budget;
+- the title is the last custom title, then the AI title, then the first prompt
+  line (100 characters), then "Untitled session".
+
+Liveness reads `<config dir>/sessions/*.json` once (at most 256 files of
+64 KiB, fields `sessionId`, `pid` and `entrypoint`): a file naming the session
+whose process runs makes it `live`; BiBCode's own `sdk-rust` entries are
+skipped. A process the process table leaves out because this user may not
+inspect it (a root process, or another user's under a restricted `/proc`)
+still runs when a signal-zero check finds it, so it is `live` too. Only a complete read makes the rest `closed`; a missing or unreadable
+directory, more than 256 files, or one file that is unreadable, unparsable or
+oversized leaves every session not found live `unknown`. Claude Code keeps
+the directory once it created it (observed on macOS with 2.1.310), so a
+missing one means a version that writes none. Each row also reports
+`importedThread { threadId, hostThreadId, archived, resumeRefused }` for an
+import whose history committed, or `importDeleted`. `copySupported` is whether
+the published provider inventory's Claude version is 2.0.73 or later. The read
+runs off the async runtime and stops between files and records once the RPC is
+cancelled, which a closed menu does.
+
+**Open** creates a chat panel of the host and returns
+`{ threadId, hostThreadId, outcome: created | existing }`:
+
+1. It reads the host (live, not a panel) and resolves the folder as listing
+   does. A copy (`mode: fork`) is refused unless `copySupported`.
+2. The thread ID is `import:claudeAgent:<sessionId>` to resume, or
+   `copy:claudeAgent:<forkId>` for a copy, where `forkId` is a UUID v4 taken
+   from a SHA-256 of a fixed domain string, the command ID and the session ID:
+   a retry with the same command ID reaches the same copy, every other command
+   makes a new one. Because a copy's thread is not an import of `forkId`, the
+   owner filter leaves the copy out of History and the Import dialog once its
+   transcript exists beside the source's.
+3. A thread with that ID whose history committed returns `existing` with its
+   own host (`null` for a sidebar thread); one in another project is refused;
+   a deleted resume thread is refused ("This session's chat was deleted. Choose
+   Continue in a copy."); an interrupted import finishes and keeps its own kind
+   and host.
+4. It reloads the transcript through the folder's directories (walking every
+   project only when they do not hold it), keeps only a terminal session, and
+   for a resume checks liveness again: `live` or `unknown` is refused ("This
+   session is open in a terminal. Choose Continue in a copy."). This read takes
+   no lock.
+5. Under the project mutation lock it re-reads the host and requires the folder
+   from step 1 ("This thread's folder changed. Try again."). A thread with the
+   ID that another open created meanwhile returns `existing` with that
+   thread's own host, finishing its import if needed. Otherwise it dispatches
+   `thread.create` as `<threadId>:create` with `kind: panel`, the host's ID,
+   branch, worktree and runtime mode, interaction mode `default`, the import's
+   model selection, and the session's title (`<title> (copy)` for a copy). The
+   engine refuses a panel whose host was deleted meanwhile ("The thread was
+   deleted.", see the
+   [worktree catalog](./worktree-catalog.md#discovery-policy-and-adoption)).
+6. It inserts the suspended runtime row in the host's runtime mode with cursor
+   `{"sessionId": id}`, or `{"sessionId": forkId, "forkedFrom": sessionId}`
+   for a copy, and dispatches `thread.history.import` as `<threadId>:history`,
+   as import does.
+
+Closing the menu does not cancel an open in flight; two clients resuming one
+session reach the same thread, and the later one gets `existing`. The client
+keeps an open's command ID until the server answers it or refuses it, so a
+retry after a dropped connection reaches the copy the first attempt made.
 
 ## Session establishment
 
@@ -431,7 +526,8 @@ option-shaped; GitHub receives `--remote=<name>`, and the final Git command
 pushes and sets upstream for exactly that selected remote with option
 termination, regardless of an older branch upstream.
 
-`projects.writeFile` uses the same guard. After admission it continues through
+`projects.writeFile` and `projects.writeFileIfUnchanged` use the same guard.
+After admission each continues through
 the terminal filesystem result and then settles the status guard. A successful
 content-only write to an existing ordinary file retains the workspace entry
 index; creating a path or writing a built-in Git classification control
@@ -655,6 +751,226 @@ explicit refresh or an unresolvable pinned tip resets the pages. Repositories
 over the cap fall back to `--all` paging with `degradedToAllPaging: true`, and
 the History view warns that new commits may shift the list.
 
+## Diff Compare and Open with
+
+The Diff panel reads three kinds of patch: the working tree and the branch
+range from `review.getDiffPreview`, and a turn or the whole thread from
+`orchestration.getTurnDiff` and `orchestration.getFullThreadDiff`.
+
+### Review and turn patches
+
+- **Arguments.** Every patch runs
+  `git diff --no-ext-diff --patch --minimal --full-index` with the shared
+  prefix settings above. `--full-index` prints whole object IDs on each
+  `index` line, so a client can name either side of a file by its blob ID.
+  `ignoreWhitespace` adds `--ignore-all-space`. An optional `contextLines`
+  (an integer from 0 to 99, checked on the server) adds `-U<N>`, formatted from
+  the integer. Without it Git's own context applies (3, or `diff.context`).
+  Each result echoes the count it applied as `contextLines` on the source or
+  the turn patch; an older server ignores the request and omits it.
+- **Bounds.** Each patch is capped at 4,375,000 bytes and cut at a file
+  boundary; `truncated` says later files were dropped. The runner reads at most
+  the cap plus one probe byte and then stops Git.
+- **Base ref.** A `baseRef` that starts with `-` is refused with
+  `InvalidRequest` before Git starts, so a value such as `--output=<file>` never
+  reaches Git as an option. `git check-ref-format --branch` forbids that form
+  for branch names, so no real branch is refused.
+- **Git exits.** The runner reports its child's exit to the Profiler as a
+  `git` command watched for signals. Its own kill, at the cap or after a failed
+  capture, is a requested stop and is never a `subprocess.crash`. A request
+  dropped by cancellation kills Git through `kill_on_drop` and reports nothing.
+- **Review sources on failure.** `getDiffPreview` still returns an empty
+  source when Git fails (for example, a base ref that does not exist).
+
+### Turn patches
+
+Turn and full-thread patches are computed live from the checkpoint refs at
+`refs/bibcode/checkpoints/<thread>/turn/<n>`. A request works in this order:
+
+1. It acquires the thread's workspace admission, which resolves the thread's
+   worktree or its project's root. The lease is held until Git exits. A
+   workspace that is being removed, or is gone, returns
+   `WorkspaceUnavailableError` before Git starts.
+2. It resolves both checkpoint refs with `rev-parse --verify --quiet`.
+3. When both resolve, it runs the patch arguments above on
+   `<from-ref>^{commit} <to-ref>^{commit}`. Workspace loss while Git runs
+   drops the read, which kills Git, and returns `WorkspaceUnavailableError`.
+4. When either ref is missing, it serves a stored `checkpoint_diff_blobs` row
+   for the exact range, if there is one. Nothing at this version writes those
+   rows; the fallback serves older data. A stored row has short object IDs,
+   ignores the whitespace and context options, omits `contextLines`, and
+   reports `truncated: false`.
+5. Otherwise it returns the method's error (`OrchestrationGetTurnDiffError` or
+   `OrchestrationGetFullThreadDiffError`) with "The checkpoint for turn <n> is
+   no longer in the repository."
+6. A non-zero Git exit that the runner did not cause returns the same error
+   type with "Git couldn't compare these checkpoints (exit <code>).", never an
+   empty patch.
+
+Turn ranges must be non-negative and ordered, and the revisions are built on
+the server from the thread ID and the turn counts; the client sends no ref
+names. An older server serves only stored rows, which a turn captured by it
+never had, and never returns `WorkspaceUnavailableError` for these methods.
+
+### Full-file reads
+
+`review.readFileVersion` (`read_unary`, `review:write`) returns one side of a
+changed file, named by the content it must have rather than by a revision:
+
+- **`blob { oid }`** reads the object with one `git cat-file --batch`, with the
+  read environment plus `GIT_NO_LAZY_FETCH=1`, so a partial clone never
+  fetches from the network. The ID must be 40 or 64 lowercase hex digits,
+  which is neither an option nor a path. A deleted file, a rename's old side
+  and a branch or checkpoint file absent from the checkout are all read this
+  way, without touching the working tree. No filter or text conversion
+  applies.
+- **`worktree { path, expectedOid }`** reads the working-tree file once and
+  hashes its bytes with `git hash-object --stdin --path=<path>`, which applies
+  that path's clean filters and end-of-line rules as `git diff` did when it
+  printed the ID. A different ID returns `changed`. The path is named from the
+  top of `cwd`'s repository (`git rev-parse --show-toplevel`), as the patch
+  names it, so a project rooted in a repository subdirectory reads its files
+  too. It goes through the workspace's `resolve_relative` and
+  `canonical_existing_within` against that top: an absolute path, `..` or a
+  symlink that leaves the repository is refused, a symlink, directory or
+  submodule is `not-a-file`, and a path that no longer exists is `missing`.
+  The read reaches no further than the blob reads, which already cover the
+  whole repository, and returns text only for bytes that hash to the ID the
+  client names.
+- **Results.** `text { contents, byteLength }` is lossy UTF-8, as the patch
+  is. `unavailable { reason, byteLength }` says why there is none: `missing`,
+  `binary` (a NUL byte), `too-large` (over the 4,375,000-byte patch cap, with
+  the size from `cat-file --batch-check`), `not-a-file` or `changed`.
+- **Bounds.** The method is dispatched in `WorkspaceRpc` behind the same
+  `acquire_path` admission as `getDiffPreview`, and shares the workspace's 32
+  operation permits. Each Git step has a 30 s timeout and the request's
+  cancellation.
+
+The client keeps version reads and patches with a `contextLines` in their own
+query families with `idleTtlMs: 0`. Releasing one interrupts a read in flight
+and drops its result, so moving to another file, or to another context count,
+keeps no multi-megabyte result behind. The default patch keeps today's
+family, so Changes and Compare's **All lines** share it.
+
+### Compare view
+
+The Diff panel's Compare view (`apps/web/src/components/diffs/DiffCompareView.tsx`,
+with its pure model in `apps/web/src/lib/diffCompareModel.ts`) works from the
+patch the panel already loaded:
+
+- **Rows** (path, status, +/− counts) are derived once per parsed patch;
+  filtering never re-parses it, and the name filter is deferred.
+- **Version plan.** For the working tree it reads `blob { prevObjectId }` and
+  `worktree { path, newObjectId }`; for a branch or a turn, two blobs. Added,
+  deleted, pure-rename, mode-only, binary and submodule files read nothing.
+  Abbreviated object IDs fall back to the hunks: a turn patch from a server
+  that reports `truncated` is a stored row, any other is an older server.
+- **Hydration.** Both texts fill Git's hunks with pierre's
+  `hydratePartialDiff("clone", …)`, so the patch Changes renders stays partial.
+  Every added and deleted line is then checked against the full files,
+  ignoring a trailing `\r`; a textconv driver or a filter that rewrote the
+  diff falls back to the hunks with a note. The file's metadata is kept while
+  its object IDs and hunk ranges stay the same, so a refresh of the patch
+  hydrates it again only when the file changed.
+- **`changed`.** A working file that moved past the patch revalidates the
+  patch and reads the file again, once. Only a read after that request that is
+  `changed` again, of a new object ID or of the same one when the refreshed
+  patch names the same content, shows "This file is changing." with
+  **Refresh**, so a file an agent keeps writing never loops and a file never
+  loads forever. Metadata is kept across refreshes only for a file with both
+  full object IDs: a file shown from its hunks alone, such as an untracked
+  one, takes each new patch as it is.
+- **Line filter.** **All lines** renders the hydrated default patch with
+  `expandUnchanged`. **Changes only** requests the patch again with
+  `contextLines`, renders that file hydrated with its gaps collapsed, and keeps
+  the default patch's file for placing comments, whose positions index its
+  hunks. The count commits 300 ms after typing stops. A result without
+  `contextLines` disables the field with its reason. A failed request shows
+  its error with **Retry**, an explicit refresh of that query, never the
+  default patch under the chosen count.
+- **Truncation.** A truncated patch, review or turn, shows the truncation
+  banner, and an empty truncated patch never reads as "No net changes".
+- **Navigation.** `diff.nextChange` and `diff.previousChange` (F7 and
+  Shift+F7, `when: "diffFocus"`) are resolved by a `keydown` handler on the
+  Compare root with `diffFocus` set, and scroll to each block of changes by
+  line target.
+- **Persistence.** `diffViewMode`, `diffRenderMode`, `diffCompareLines` and
+  `diffCompareContextLines` are `ClientSettings`. The selected file is
+  persisted per thread in `bibcode:diff-panel-state:v1`; the filters are kept
+  in memory only.
+
+### Open with
+
+**Open with** hands a file, or every file of the scope, to a diff app through
+`git difftool` on the server's computer
+(`apps/server/src/production/diff_tool.rs`). Git owns each tool's arguments,
+its temporary pre-image files and the user's `difftool.<tool>.cmd`.
+
+- **`review.listDiffTools`** (`read_unary`, `review:write`, long-running) runs
+  `git difftool --tool-help` with `LC_ALL=C` and an empty `LANGUAGE`, so the
+  headings are stable, and a 30 s timeout. It keeps the first section only:
+  built-ins marked "(requires a graphical session)" and the `user-defined:`
+  entries, once each. The default is the first of `diff.guitool`,
+  `merge.guitool`, `diff.tool` and `merge.tool` whose value is listed, which is
+  Git's own `--gui` order, and `defaultSource` names the key. When Git
+  succeeds but nothing parses, the configured `diff.guitool` or `diff.tool` is
+  still offered. There is no server cache; the client keeps the list for ten
+  minutes per environment and `cwd` and asks for it when the pointer reaches
+  the button.
+- **`review.openDiffTool`** (`mutation_unary`, `orchestration:operate`, like
+  `shell.openInEditor`, long-running) builds
+  `git -C <top> difftool -y --trust-exit-code [--dir-diff] --tool=<id> [-M]
+  <revs> -- [paths]`, where `<top>` is `cwd`'s repository top
+  (`rev-parse --show-toplevel`), because the patch names paths from there,
+  also for a project in a subdirectory. `--trust-exit-code` makes Git return the tool's
+  failure. The revisions come from the scope: `HEAD` for the working tree;
+  for a branch, the base (or the repository's default ref) resolved with
+  `rev-parse --verify --quiet --end-of-options <base>^{commit}`, then
+  `<base-oid>...HEAD`; for a turn, both checkpoint refs `^{commit}`, built
+  from the thread ID and turn counts. A rename passes both paths with `-M`.
+  Paths are checked lexically by `resolve_relative` and never against the
+  disk, so a deleted file, a rename's old path and a file only a base or a
+  checkpoint holds are valid; they follow `--` with `GIT_LITERAL_PATHSPECS=1`.
+  The tool ID matches `[A-Za-z0-9][A-Za-z0-9._-]*` and is passed only as the
+  value of `--tool=`. The environment adds `GIT_TERMINAL_PROMPT=0`, and the
+  AppImage environment is isolated.
+- **Launch.** Stdin and stdout are null and stderr goes to a log in the
+  temporary directory. The child has no kill-on-drop and starts in its own
+  process group, so a terminal's Ctrl+C to a standalone server does not reach
+  it; on Windows it uses `CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP |
+  CREATE_BREAKAWAY_FROM_JOB` and retries without breakaway when the job
+  forbids it. The server waits up to 1 s: an exit 0 or a process still running
+  returns `opened`, and a non-zero exit returns `ReviewDiffToolError` with
+  reason `launch-failed`, the last 2 KiB of stderr with the exit code, and the
+  command for **Copy command**. At most 16 launches run at once
+  (`too-many-open`), and a launch after shutdown began is `shutting-down`. The
+  child goes to its reaper as soon as it starts, and the launch only listens
+  for an exit within the window, so a request dropped during the window
+  (a client that disconnects) leaves the slot, the registration, the log and
+  the exit report with the reaper. The reaper waits for the exit, reports it,
+  logs a failure after the window with the tool ID and exit code only, deletes
+  the log and drops the registration.
+- **Surviving shutdown.** A diff app holds the user's edits: the working-tree
+  side is the real file, and with `--dir-diff` Git copies an edited temporary
+  file back only when the tool exits. So the launcher registers each
+  `git difftool` with `register_identity` (`External`/`Helper`, label
+  `diff app`) and `survives_shutdown`. `freeze_and_snapshot_ownership`
+  leaves survivors out of the roots that ownership cleanup kills, and a
+  standalone server's cleanup of its own descendants spares each survivor and
+  its descendants, matched by start time so a reused PID is not spared. In
+  `quiesce_for_update` the launcher's `shutdown()` runs before ownership is
+  frozen: it stops accepting launches and cancels the reapers without
+  signalling their children, and keeps their registrations. A Windows job
+  that forbids breakaway still ends the app with BiBCode.
+- **Client.** The menu is enabled for the primary environment only, the gate
+  the header's **Open in** picker uses, and for a server with the
+  `reviewDiffTools` capability. A remote thread, an older server, an untracked
+  file and an empty list each show their reason in the menu. The default is
+  the server's `defaultToolId`, then `diffToolLastChoice` in `ClientSettings`,
+  then the first tool; VS Code is left out of folder comparisons. A remote
+  environment's diff app would need a `DesktopBridge` command that downloads
+  both versions, which is out of scope.
+
 ## Pull Requests contract boundary
 
 `packages/contracts/src/pullRequests.ts` defines the repository-scoped Pull
@@ -685,9 +1001,21 @@ while `push.default` is unset or `simple` (Git's default spelled out) and no
 push remote (`remote.pushDefault`, `branch.<name>.pushRemote`) or push refspec
 (`remote.<name>.push`, which outranks `push.default`) is configured. The branch then tracks
 `<remote>/<branch>`, so ahead/behind counts against what was pushed. The
-upstream it started from is never written, and nothing is forced. An
-`action_failed` event's `message` carries Git's own error, which the Source
-Control toasts show; the settled client error keeps only the action and phase.
+upstream it started from is never written, and nothing is forced.
+
+An `action_failed` event names the step that failed in `phase` (`branch`,
+`commit`, `push` or `pr`), or `null` when the request was refused before any
+step ran (#174). Its `message` is the failure's wire `detail`, which carries
+Git's or the host CLI's own reason. The server redacts that output with
+`redact_sensitive_text` when it builds the detail, so the client is a
+pass-through: `VcsActionRemoteFailureError` keeps the message and uses it as
+its user-facing text, falling back to the action and phase only when the
+message is empty. The Source Control toasts title the failure by step ("Push
+failed", "Commit failed") and show that message beneath it. The terminal
+`action_finished` or `action_failed` item arrives ahead of the RPC exit, so
+`consumeVcsActionProgress` settles from it: a transport failure after it, such
+as a socket closing before the exit, does not replace the server's result or
+reason.
 
 ### Pull Requests flow
 
@@ -763,17 +1091,57 @@ detail route also opens `pullRequests.subscribe` only while the document is
 visible, and keeps the client's 20 s mounted-query refresh timer
 paused from the subscription's first, all-false event until the subscription
 ends. Successful unary `list` (first page), `get`, `getTimeline`, `getCommits`,
-`getChecks`, and `getFiles` reads store those display copies. One server poller
-per list key runs the list read and one merge-request probe `GET` 20 s after
-each tick, stores the list page and the probe fingerprint, and emits the names
-of the query families that changed; it never runs the detail, timeline,
-commits, checks, or files reads. The client answers `list` with
-`readSnapshot`, keeping whichever copy has the newer `observedAt` (a live first
-page counts as observed at the newest stored copy already seen), and answers
-the other names with the unary reads. Every subscriber of a list key receives
-its list events, but only the open number of the subscriber driving the poller
-is probed, so a second window open on another number of the same list key
-gets list events only. Hiding the document or leaving the route drops the
+`getChecks`, and `getFiles` reads store those display copies. One cooperative
+server poller per list key runs inside the `subscribe` calls that share it (no
+spawned task). It reads the list page every 20 s and probes every subscribed
+merge request (`GET merge_requests/:iid`). A number with a subscriber on
+Conversation or Pipelines whose head pipeline is `created`, queued, waiting,
+`running` or `canceling` is active: it is probed, and its pipeline read
+through one GraphQL `headPipeline` query (stages and up to 100 jobs each),
+every 10 s, dropping to 20 s after 30 minutes without a stage change. A number
+that may settle soon (a transient merge status, a push, a pipeline that just
+finished, or REST and GraphQL naming different pipelines) is probed every 10 s
+for at most six ticks. A pipeline read that fails, or stores no copy, is
+retried on each later probe of the number until one is written, so the row
+never keeps a status the probe has moved past. At most three numbers per list
+key are active or fast;
+the rest are probed every 20 s. The first tick waits 10 s when a subscriber is
+on Conversation or Pipelines, otherwise 20 s. While polling, the repository's
+tab totals are reused until the first page changes or the copy is 5 minutes
+old. The poller stores the list page, the probe fingerprint, and one
+`pipeline` row (the header, the stages and, when read, the job groups) and
+names what changed; it never runs the detail, timeline, commits, checks, or
+files reads. A `head_pipeline` id or status change names `checks`, and
+`detail` only when it moves the pipeline between the "Pipelines must succeed"
+reasons with the merge status unchanged; merge request metadata, merge status
+and auto-merge changes name `detail`; a new `pipeline` row names `pipeline`.
+Names travel as per-name revisions in the probe row, and each subscriber emits
+what it has not been sent yet, so every subscriber of a number gets every
+change whichever poller saw it first, and a name the stream could not take is
+sent with the next event. The client answers `list` and `pipeline` with
+`readSnapshot`, keeping whichever list copy has the newer `observedAt` (a live
+first page counts as observed at the newest stored copy already seen) and
+whichever pipeline copy has the higher `revision` (the generation each read
+took before its first host call). It also keeps the newest pipeline copy it
+has shown for the merge request, so a tab switch, which re-keys the snapshot
+read, or a failed snapshot read never moves the merge box or the Pipelines tab
+back. It answers the other names with the unary reads, and `checks` without
+`pipeline` with `getChecks`. A check (in `getChecks` and in the `pipeline`
+row's job groups) may carry `pipelineId` and `jobId`, together or not at all:
+the Pipelines job route's ids, set only for a job of this project whose job
+page can read it (a GitLab build job under the project's web URL, a GitHub
+Actions job page on this repository). Older servers and stored rows omit
+them, and the client then keeps the host link. A number past the three-number pipeline read cap
+gets `pipeline` rows with the header only (`checks: null`); on the Pipelines
+tab such a row, arriving after a `pipeline` name, is answered with one
+`getChecks` per row revision, so the job list follows the header. A row that
+carries jobs never re-reads them. A 429 from any poller
+read, totals included, backs off every poller of the host (60, 120, then
+300 s) across hand-offs and re-keyed subscriptions; a `not_authenticated` or
+`forbidden` read ends the poller, deletes the host's rows, and ends every
+subscription with that error. Every display write is fenced on the database
+worker by the host's last logout, so a read that started earlier cannot write
+its rows back. Hiding the document or leaving the route drops the
 subscription, resumes the client timer, and stops the shared poller when no
 subscriber remains. The route still prefetches `get` plus `getTimeline` for a
 row hovered 150 ms, at most two per environment, and an open within 5 s of that
@@ -1225,6 +1593,230 @@ reads are added to list filtering. Filtered result totals remain unknown while t
 remain available. GitLab version gates close when the version cannot be read;
 the wire context exposes a null version, and internal context retains the
 reason for permission computation. No host data or CLI stderr is logged.
+
+## Pipelines contract boundary
+
+`packages/contracts/src/pipelines.ts` defines a project's CI pipelines: list
+rows, a pipeline's stages, groups and jobs, a job, and byte windows of a job
+log. It reuses `PullRequestsPipelineStatus`, `PullRequestsPipelineStage`,
+`PullRequestsActor` and `PullRequestsOperationError`, whose optional
+`retryAfterSeconds` carries the host's backoff deadline on `rate_limited`
+answers. Route identifiers are the host's global ids (GitLab pipeline and job
+`id`, GitHub run and job `id`); `iid` and `run_number` are display only. The
+context read stays `pullRequests.getContext`, so both modules share one
+provider context, sign-in state and unavailable copy.
+
+| Method                   | Required scope          | Responsibility                                                                   |
+| ------------------------ | ----------------------- | -------------------------------------------------------------------------------- |
+| `pipelines.list`         | `orchestration:read`    | Page the project's pipelines for a scope (`all`, `running`, `finished`) and ref. |
+| `pipelines.get`          | `orchestration:read`    | Read one pipeline's header, stages, groups and jobs.                             |
+| `pipelines.getJob`       | `orchestration:read`    | Read one job: runner, tags, artifacts, log size, erasure.                        |
+| `pipelines.getJobLog`    | `orchestration:read`    | Read a window of a job log by byte offset (`tail`, `offset`, `before`).          |
+| `pipelines.readSnapshot` | `orchestration:read`    | Return the stored list, pipeline and job rows with no host call.                 |
+| `pipelines.subscribe`    | `orchestration:read`    | Stream (GitLab): name what the cooperative poller stored.                        |
+| `pipelines.runAction`    | `orchestration:operate` | Retry, retry the failed jobs of, cancel, or play one pipeline or job.            |
+
+`capabilities.pipelinesReads` is advertised only by a server that registers all
+six reads, and `pipelinesMutations` only by one that registers
+`pipelines.runAction`; a test ties each flag to its registered methods. Both
+decode as false from older servers. Every read
+carries the checkout's `cwd` and a `refresh` kind (`user`, `follow` for log
+catch-up, `timer`); ids are positive and range-checked to a JavaScript
+`Number` before any read.
+
+Every list page, pipeline and job answer carries `revision`, the generation
+stamp taken before its host read, equal to its stored row's generation, so
+the clients' `shownCopy` and `keepNewestCopy` pick between live, stored and
+polled copies unchanged. Successful unary reads store the display rows
+(`pipelines_list` for first pages only, `pipelines_detail` up to 1 MiB,
+`pipelines_job`) with the account login that read them; `readSnapshot` paints
+a row only for the login of the host's stored context row, on both providers.
+Log text is never stored. Every read checks the host-wide backoff deadline
+first and answers `rate_limited` without a host call while it is ahead; a 429
+backs off every merge request and pipelines reader of the host for the later
+of the ladder step (60, 120, 300 s) and the provider's `Retry-After` or reset
+header, capped at one hour. A list's `count` (at most 1,000) is read on a
+first page's `user` read, and otherwise reused for 5 minutes.
+`not_authenticated` invalidates the shared context and deletes the host's
+rows; a `forbidden` or `not_found` is about the resource that refused and
+deletes only its rows (that list key, pipeline or job), leaving the Pull
+Requests context and snapshots in place.
+
+`pipelines.subscribe` runs only for GitLab and only with a database; GitHub
+answers `unavailable`. Its first event is all false. One cooperative poller
+per (host, project, list key) runs inside the subscribe calls that share it: it
+reads the first page every 20 s and each subscribed pipeline that is not
+terminal every 10 s (at most three per key in join order; 20 s after 30
+minutes without a change), stores the rows that changed, and names them
+(`list`, `pipeline`) as cumulative revisions per subscriber, so a full stream
+or a lagged receiver catches up on the next event and a joining subscriber is
+not sent the rows it painted. It never reads `count`, jobs or logs; a pipeline
+whose stored row is already terminal is not read, and one seen terminal is
+read once more and then left. A `forbidden` or `not_found` on one pipeline
+deletes its rows, names it once with `refused` (`forbidden` or `not_found`;
+absent on every other event and from older servers), so its pipeline and job
+views replace the copy on screen with the refusal without a host read, and
+stops reading it; a subscriber that joins later is told too. A refused list
+or a lost sign-in ends the key's subscriptions.
+
+Logs are byte windows whose offsets always fall on character starts. On a
+GitLab host a one-byte `byte_offset=1&byte_limit=1` probe, sent after the
+first whole download of at least two bytes, proves whether ranges are
+honored; until it answers, logs are downloaded whole. A proved host reads
+512,000-byte windows: a finished log opens on its last window (from the
+archived trace's size), a running one from the start, and a `follow` read
+that still fills its window at or past 2,048,000 bytes answers
+`unavailable: too_large_live`. Followers of one running log share its last
+tail for 4 s. A whole download keeps the last 16 MiB (`truncatedHead`) in
+server memory (`LogCache`) and serves 1 MiB windows from the end, with
+absolute `firstLine` when nothing was dropped. A running log of 2 MiB or more
+is not downloaded again until its job is terminal, when the unfinished copy is
+dropped and the finished log read; meanwhile a follow read past its end
+answers `unavailable: too_large_live`, so the page keeps the copy and stops
+following. Every pipelines read sweeps the cache:
+logs idle for 10 minutes and tails past their 4 s are released whichever job
+the read is for. The module runs no background task, so a server that serves
+no pipelines read keeps its last logs until the next one, a rescan or a
+sign-out. A trace 404 is told apart by a
+job read: `not_started` for a job that is not terminal, `erased`, `no_output`,
+or `not_found` only when the job itself is missing.
+
+GitHub serves Actions as pipelines (`pull_requests/github/runs.rs`): one row
+per workflow run, labeled "`<workflow>` #`<run_number>`", the cursor an opaque
+page number of 20 runs. A list filtered by ref or state stops at GitHub's
+1,000 results (`total.capped`, no cursor past them); a first page's `user`
+read also returns the repository's workflows for the Workflow filter, which
+the server reuses for the reads that skip them. A 404 on the run list names
+both causes GitHub cannot tell apart (Actions turned off, or a sign-in that may
+not read Actions). Statuses map from `status` and `conclusion` with their own
+`terminal` flag, so `completed` + `action_required` is a `manual` row that no
+timer reads again, and `neutral` and `stale` are `skipped` with a `reason`.
+A pipeline reads the run (or `attempts/:n` for an earlier attempt), its jobs
+in pages of 100 (the rest concurrently, at most ten pages, `truncated` past
+1,000) and its artifacts, all in one `get`; its jobs sit in one stage, and
+artifacts link to the run's page, never to `archive_download_url`. GitHub
+permissions are `unknown` from repository write and `denied` below it; jobs
+have no cancel or play. A job's log is served only once the job completes,
+through the whole-download path (a 410 is `expired`); a running job's
+`getJobLog` answers `unavailable: live_on_host` with no download.
+
+The client (`@bibcode/client-runtime/state/pipelines`) mirrors the Pull
+Requests atoms: `list`, `get` and `getJob` are fresh for 5 s and kept 5 minutes
+after their last subscriber; `getJobLog`, `readSnapshot` and `subscribe` keep
+nothing. Views key every read with `refresh: "user"`; a visible-refresh timer
+marks the next execution of that same atom as `timer` (`requestTimerRead`),
+so a timer read reuses the list's total without a second cache entry. The
+context is the Pull Requests `getContext` family itself, so moving between the
+two modules on one checkout costs no context read within the client's 60 s.
+A list route reads its default first page alongside a pending context and
+paints the stored first page from `readSnapshot`, then the live page;
+`shownCopy` picks between them by `observedAt`, and on GitHub a stored copy
+arriving after the live page is ignored. A GitLab list subscribes with its
+list key (`pipelineId: null`) only while the document is visible; the first
+event, all false, stands the client's 20 s timer down until the stream fails
+or waits, and a `list` name re-reads `readSnapshot` only, keeping loaded later
+pages. GitHub has no stream: its timer re-reads the first page every 20 s
+only while a shown pipeline is not `terminal`. A `rate_limited` answer shows
+the server's `retryAfterSeconds` as a countdown, disables Refresh and Retry
+until it ends, then reads once as a timer read. A row hovered 150 ms prefetches
+its `get`, at most two per environment and not again within 5 s. On GitHub the
+toolbar's Workflow select comes from the first page's `workflows`, kept while
+another filter's page loads.
+
+A pipeline route reads `get` with the exact input the hover prefetched
+(`attempt: null` for the latest attempt, `refresh: "user"`), so an open within
+5 s of that prefetch shows its answer without a second read. Its
+`readSnapshot` and `subscribe` input is the list key remembered for the
+project (the list's filters, first page) plus `pipelineId` and `attempt`, so
+a pipeline page and its list share one poller. The page shows the copy with
+the highest `revision` across the live `get` and the stored detail, keeping
+it per pipeline (`keepNewestCopy`), so a slower unary answer never replaces a
+newer poller row. A `pipeline` name re-reads `readSnapshot` only, never `get`.
+GitHub, and GitLab while its stream is not live, re-read `get` on the visible
+timer while the shown pipeline is not `terminal`: every 10 s on GitLab, and
+every 10 s per 100 jobs (at most ten pages) on GitHub, doubled after 30
+minutes without a status change. The read that sees the pipeline turn
+`terminal` is the last. A `forbidden` or `not_found` answer stays on the page
+("You can't view this pipeline." with the host link, "This pipeline no longer
+exists." with Back to pipelines) and never reaches the shared sign-in state;
+only `not_authenticated` asks the shell to read the context again. On GitHub
+a run with more than one attempt shows an Attempt select: the latest page
+takes the count from its own copy, and an earlier attempt's page reads the
+latest attempt's stored row (`readSnapshot` with `attempt: null`, no host
+call) to name it, or offers "Latest attempt" without it.
+
+A job page reads `getJob` and its pipeline's `get` once on open, paints the
+stored `pipelines_job` and `pipelines_detail` rows from one `readSnapshot`,
+and on GitLab subscribes with the project's remembered list key plus
+`pipelineId` and `jobId`, so it shares the list's poller; a `pipeline` name
+re-reads `readSnapshot` only. The job's status and permissions come from the
+newest pipeline copy by `revision`; while the stream is down a running
+pipeline is re-read every 10 s on the visible timer, and `getJob` is read
+again only once, when the job turns terminal. `getJobLog` is a one-shot
+command, never an atom: the log's worker owns the text. Opening reads the
+`tail` (a line link's `offset` instead), then, while a running job's answer
+fills its window, at most three `offset` reads at `nextOffset` with
+`refresh: "follow"`; a running job is then followed with one `follow` read
+5 s after the last one settles, only while the document is visible; a
+`not_started` answer re-reads the tail on the same cadence. `too_large_live`
+keeps the loaded head and reads nothing until the job is terminal, when the
+tail is read once; a followed job that finishes gets one final read and then
+none. Load earlier reads `before` the loaded start with `refresh: "user"`
+until the view holds 16 MiB or a window brings nothing earlier.
+
+A GitHub job page has no stream. While the job runs its log source is
+`unavailable: live_on_host` (`not_started` before it starts), so it reads no
+log and shows the job's steps in the log's place; `getJob` is re-read every
+10 s for the steps, and `get` every 30 s per page of jobs, while the document
+is visible and only while the job itself runs. A job read newer by
+`revision` than the pipeline copy gives the job's status (the pipeline copy
+keeps its permissions). Once the job is terminal the log is read once under
+the job's own `attempt` (from `getJob`, which the page waits for), and a step
+jumps to the first log line stamped at or after its start.
+
+`pipelines.runAction` takes `{ cwd, target, action }`: a `pipeline` or `job`
+target by its host id and one of `retry`, `retry_failed`, `cancel` or `play`.
+GitLab posts `pipelines/:id/retry|cancel` (its pipeline retry already retries
+the failed jobs, so `retry_failed` is the same call) or `jobs/:id/retry|cancel|play`
+and answers with the host's ids: a retried job is a new one, so `jobId` names
+it. GitHub posts `actions/runs/:id/rerun|rerun-failed-jobs|cancel` or
+`actions/jobs/:id/rerun` and answers `{ pipelineId: <run>, jobId: null }` (a
+job re-run, `{ null, null }`), since its re-run is the run's next attempt; a
+GitHub job is never canceled or played alone, and neither host plays a
+pipeline. An unsupported pair answers `unavailable` before any host call. The
+action is admitted as a read is, so a backed-off host gets no POST, and it is
+single flight per (host, project, target, action): a second identical request
+while one is in flight shares its answer. A settled action keeps its answer
+past its 60 s budget. A `forbidden` keeps the shared context and every stored
+row. On GitHub, whose permission is only `unknown` from repository write, it
+is remembered in server memory per (host, account login, project, action
+kind: retry, cancel, play) until the next rescan or sign-out: the next
+request of that kind answers `forbidden` with no host call, and every `list`,
+`get`, `getJob` and `readSnapshot` answer shows that permission `denied`
+while the stored rows keep the host's own answer. GitLab reports its
+permissions on every read and also answers 403 for a job whose state moved
+on, so its refusal is shown, not remembered, and "Job is not retryable" or
+"not playable" is `host_rejected` with copy to refresh. A GitHub 409 or a 403
+for a run that is still running is `host_rejected` with its copy; a 429 backs
+off the host's ladder as a read's does; `not_found` deletes the
+target's rows; `not_authenticated` invalidates the shared context. A
+successful action on a pipeline, or on a job whose pipeline GitLab named,
+makes every GitLab poller of the project that watches it read it again, even
+one it had left as terminal.
+
+The views run actions through `PipelineActions` (`components/pipelines/actions/`),
+a provider per list, pipeline and job page over the `runAction` command on the
+shared VCS scheduler. A button spins from the click until the page's next copy
+lands (its `revision` grows) or 15 s pass, and a second click on the same
+action sends nothing. Every answer re-reads the page (`list` first page and
+the page the row is on, `get`, or `getJob` and `get`), so a remembered refusal
+shows at the button; a failure is also a toast with the server's copy. A
+GitLab job retry opens the new job's page; a GitHub re-run from an earlier
+attempt or from a job page opens the run's latest attempt. A GitHub cancel
+(202) shows `canceling` until the run's own status moves on. On GitHub a
+`denied` permission with repository write or higher is GitHub's refusal and
+says so ("GitHub refused: … A fine-grained token needs Actions write.");
+below write it names the missing role.
 
 ## Worktree catalog flow
 
@@ -2086,8 +2678,10 @@ remove the addressed message when `withdrawn` is true. Missing messages are
 not recreated by these updates.
 
 The web composer requests queued admission while a turn is running, the
-session is starting, or an earlier non-queued start delivery remains pending or
-sending. It decides this before the local dispatch/busy guard and creates no
+session is starting, an earlier non-queued start delivery remains pending or
+sending, or the snapshot's `compaction` is set (see
+[Context-limit recovery](#context-limit-recovery)), and it offers Stop while a
+compaction is unsettled. It decides this before the local dispatch/busy guard and creates no
 new local dispatch or optimistic message for the enqueue. The request-in-flight,
 provider-conflict, workspace, and environment guards still apply.
 Cards derive from the thread snapshot in its durable FIFO order, after the
@@ -2109,7 +2703,14 @@ menu selection, or Shift+Enter newline handling.
 Queue admission and delivery are owned by the Rust server. Admission resolves
 `queued: true` against the projected session: running or starting retains the
 flag and persists a queued outbox row; other states rewrite it to false and use
-normal pending delivery. The original request digest still owns command replay.
+normal pending delivery. While a compaction of the thread is unsettled,
+admission treats the thread as running and queues every start, also one sent
+without `queued` (an older client), so nothing is admitted ahead of the copy a
+recovery sends. The engine checks this again on its sequential worker, in the
+admission's own command, because a recovery can begin between the RPC's check
+and admission: a start admitted then becomes queued (outbox row, message and
+stored payload) with no turn-start event or pending marker. The original
+request digest still owns command replay.
 Admission stores the model selection even when the request omitted it, together
 with the turn's modes and provider route. Queued admission records the user
 message and complete delivery metadata without a turn-start event, pending turn,
@@ -2155,8 +2756,10 @@ clients rendering queue cards preserve it instead of sorting their timestamps.
 
 Automatic promotion requires an unheld head, a ready session, no pending/sending
 delivery, no running projected turn, no pending approval or user-input
-request, and no [checkpoint revert](#checkpoint-revert) of the thread in
-flight; the delivery worker also claims nothing for such a thread. The gate reads approvals and the latest durable user-input activity
+request, no [checkpoint revert](#checkpoint-revert) of the thread in
+flight, and no unsettled `thread_compactions` row (`requested`, `running` or
+`unresolved`, checked in SQL); the delivery worker also claims nothing for such
+a thread. The gate reads approvals and the latest durable user-input activity
 for each request, rather than the thread summary's input counter. A running
 turn placeholder continues to block the next promotion after provider acceptance
 releases the worker slot, until the provider's running and ready cycle settles
@@ -2177,7 +2780,10 @@ tab closed; unarchiving it resumes both. A delivery claimed before the panel
 closed is refused at the provider supervisor before any driver I/O and returns
 to pending, and accepting `thread.archive` for a panel interrupts its provider
 session on the server, so closing a panel stops its work without relying on the
-client's view of the session. Explicit Send now remains available under its client gate.
+client's view of the session. Explicit Send now remains available under its client gate,
+except while a compaction of the thread is unsettled: promotion of any kind is
+refused then, because a promoted start would sit ahead of a recovery's copy
+with a marker of its own.
 
 Pending start deliveries from older clients also wait while the session is
 running or starting; the SQLite claim repeats this check so a stale worker read
@@ -2301,8 +2907,11 @@ when acceptance was lost; Claude sending rows become uncertain.
 
 Provider assistant text preserves a native runtime `itemId` when the provider
 exposes one. The server converts it to a thread-namespaced orchestration
-message ID before persistence. Providers whose protocol does not expose a
-message identity use one deterministic assistant message per thread turn.
+message ID before persistence. Assistant text whose provider event carries no
+message identity uses one deterministic assistant message per thread turn.
+Provider reasoning never takes this path: it is its own entity (see
+[Provider reasoning](#provider-reasoning)), so a reasoning delta without an item
+id cannot become a second assistant message of the turn.
 
 Terminal turn projection completes every existing streaming assistant message
 for that thread and turn and never creates an empty assistant message. The
@@ -2326,6 +2935,47 @@ end, the durable error runtime retains thread-scoped recovery ownership: the
 next startup settles the exact stored message and turn identities without
 rewriting the original provider or session error.
 
+### Provider reasoning
+
+Claude thinking and Codex reasoning summaries reach the chat as reasoning
+entries, never as assistant text. Provider adapters emit `content.delta` with
+`streamKind` `reasoning_text` (Claude) or `reasoning_summary_text` (Codex) and
+an `item.completed` with `itemType: "reasoning"`; Codex's completion carries the
+whole summary, joined by blank lines, which is authoritative over what streamed.
+Raw Codex reasoning and Claude's redacted, omitted (empty) or subagent thinking
+produce no entry.
+
+- **Identity:** `reasoning:{thread}:item:{itemId}`, or
+  `reasoning:{thread}:turn:{turn}` when the event has no item. Claude's item is
+  `{messageId}:{blockIndex}`, one entry per thinking block.
+- **Coalescing:** the provider event pump buffers each entry and writes it at most
+  once per 250 ms window (`thread.reasoning.delta`), so an entry whose deltas
+  span D writes at most D / 250 ms + 1 streaming rows instead of one per delta.
+  Only the entry's own completion, its turn's `turn.completed` and the pump's end
+  write early. The first write keeps the time the first delta was buffered, so a
+  thought sorts before the tool call that followed it. An entry stops at 32 KiB,
+  cut at a UTF-8 boundary and ending with `…`; completion text is cut the same way.
+  Text that fits is kept whole: a window's write holds back the bytes the `…`
+  would need until a later delta shows whether the entry is cut.
+- **Persistence:** `thread.reasoning.delta` and `thread.reasoning.complete` become
+  `thread.reasoning-sent` events, projected by the message projector into
+  `projection_thread_reasoning` (migration 55) by the assistant-message rule: a
+  streaming write appends, a completion with text replaces the text and creates
+  a missing entry, and a completion without text only settles a streaming entry.
+  A text-less completion with no streaming entry appends no event. A revert drops
+  the reasoning of reverted turns, and a message-projection rebuild rebuilds it.
+- **Settlement:** a turn's completion and its interrupt deadline settle that
+  turn's streaming entries. When a session ends, every entry still streaming on
+  its thread settles, whatever its turn: at the pump's end of stream, after
+  `detach_session` reaps an aborted pump (`stop_session`, idle suspension,
+  shutdown), and once at startup over the reasoning table itself, before any
+  session starts.
+- **Wire:** the `orchestration.subscribeThread` snapshot carries a `reasoning`
+  array and patches diff it like any other array; clients that do not know the
+  field drop it, and a thread from an older server decodes to `[]`. Reasoning
+  never enters messages, the context handoff, the turn's assistant pointer or
+  checkpoints, and its text reaches no log, trace or profiler record.
+
 ### Context-window usage flow
 
 Provider-native usage data is normalized in the server runtime as canonical
@@ -2340,6 +2990,112 @@ valid context-window activity for each turn, so a newer valid reading replaces
 the prior valid reading for that turn. A malformed row cannot evict a valid row,
 and reverting a turn removes only that turn's projected usage; neither behavior
 creates a separate usage cache.
+
+### Context-limit recovery
+
+One server path compacts a conversation for three triggers: **Compact
+conversation** (`thread.compact`, `trigger: manual`), automatic recovery of a
+context-limit failure (`contextRecovery`), and the guard before a delivery
+(`guard`). The table `thread_compactions` is the source of truth for an
+unsettled compaction, as the outbox is for the queue: each row records the
+provider instance, kind and conversation it compacts (the resume cursor's
+session or thread id), its state (`requested`, `running` and `unresolved` are
+unsettled; then `completed`, `failed` or `interrupted`), `stop_requested`, the
+tagged turn, and for recovery the failed message (unique) or for the guard the
+guarded delivery (unique). Events `thread.compact-requested` and
+`thread.compacted` project the snapshot's `compaction` field
+(`{ trigger, state, failedMessageId? }`) while one is unsettled; a thread has at
+most one. A compaction is not a delivery: it has no outbox row and no user
+message, so it never becomes "Delivery uncertain".
+
+**Effect.** `thread.compact-requested` wakes the orchestration effects, which
+run the compaction off the sequential worker with the thread's turns reserved,
+like a checkpoint revert. The effect reopens a suspended session (recovery and
+the guard with the delivery's frozen launch, a manual compaction with the
+thread's saved runtime; never a new conversation), moves the row from
+`requested` to `running` with a conditional update so a Stop that came first
+wins, checks that the live session has the recorded instance and conversation
+(otherwise it settles `failed`, "The thread's provider or conversation changed,
+so it wasn't compacted."), and calls the driver's `compact` (see
+[Providers](./providers.md#conversation-compaction)). `NotStarted` settles
+`failed`; `Unknown` marks the row `unresolved`, with no retry. A request the
+driver has not answered within 60 seconds (or whose session ends meanwhile)
+counts as `Unknown`, so a provider that never answers cannot hold the thread.
+The event pump reports the tagged turn's start and end to the effect; once the
+turn is known, a Stop asked for before it existed interrupts it. Every bound
+counts from the request. The bound is 15 minutes: then the effect interrupts
+the turn and, if that is not confirmed within 30 seconds, stops the session it
+captured (`stop_session_if_current`); an `Unknown` request whose turn does not
+start within 60 seconds is ended the same way, and settles `failed` with
+"BiBCode couldn't confirm whether the conversation was compacted." Settlement
+(`thread.compaction.settle`, internal) runs in one transaction and wakes
+delivery.
+
+While a compaction is unsettled, a pending start's marker (a guarded message
+that waits, unsent, behind it) is neither bound nor deleted by an untagged
+running session update either, such as a turn the provider starts on its own:
+no turn can be that message's until the claim takes it.
+
+**Recovery.** A failed `turn.completed` passes its context-limit facts on the
+internal `thread.session.set` as `contextLimit`. In that transaction the engine
+starts a recovery only when every rule holds: the class is `context_limit`,
+`beforeOutput` is true and `compactable` is not false; the turn was started by
+a delivered start of a user message that is not itself a copy, has no
+recovery row and no failed or stopped guard; the provider supports compaction;
+the latest context-window reading tagged with the failed delivery's instance
+and conversation says `compactsAutomatically: true` (an untagged reading never
+matches, and a reading of a Claude instance whose environment sets
+`DISABLE_AUTO_COMPACT` or `DISABLE_COMPACT` is tagged `false`); and nothing else of the thread is unsettled, pending or sending
+(a steer written during the failing turn is input the provider reads next), and
+the thread is neither deleted nor an archived panel. An eligible failure
+projects the session `error` with `lastErrorClass: context_limit` and the text
+"The context window is full. Compacting the conversation, then sending your
+message again.", does **not** hold the queue (its rows follow the message that
+is sent again), and inserts a `requested` row. Otherwise nothing changes from
+an ordinary failure, and a copy that fails at the limit again says the
+conversation was already compacted once.
+
+On `completed` (with no Stop requested) the settlement admits a copy of the
+failed message as a pending start: command id
+`server:context-resend:<failedMessageId>`, message id `resend:<failedMessageId>`,
+the original's stored payload, frozen route and conversation, its attachment
+references recorded under the copy's command, a new delivery key, and
+`resendOf` on the message (`projection_thread_messages.resend_of_message_id`).
+Its own `thread.turn-start-requested` stamps it after the compaction turn, and
+it is the thread's only pending start, so it is delivered first and queued
+rows follow it. On `failed` the session reads `error` with
+`lastErrorClass: context_limit` and the compaction's failure, and the queue is
+held. On `interrupted` (Stop, before or during the compaction, even if it then
+completed) no copy is sent, `lastError` returns to the context-limit text so
+the manual action returns, and the queue is held.
+
+**Guard.** Before claiming a pending start, the delivery worker reads the
+latest context-window reading of the delivery's frozen instance and the
+conversation it will continue. When the provider reports `autoCompactTokens`
+and `compactsAutomatically: true` and `usedTokens >= autoCompactTokens - 0.05 *
+maxTokens`, it dispatches `thread.compact` with the delivery's command id
+(command id `server:context-guard:<deliveryCommandId>`, one per delivery), sets
+the delivery's detail to "Waiting for the conversation to be compacted.", and
+skips the claim. It skips a thread whose last completed compaction no ordinary
+turn has followed, because that reading predates it. `completed` or `failed`
+delivers the message; a failed guard makes it ineligible for recovery.
+`interrupted` moves it from `pending` to `failed` (a server-only transition)
+with "Not sent: you stopped the conversation compaction. Retry sends it.";
+Retry sends it without compacting again. Providers that do not report where
+they compact are not guarded.
+
+**Stop.** `thread.turn.interrupt` is admitted without a running turn. In its
+transaction a `requested` row settles `interrupted` (nothing was sent); a
+`running` or `unresolved` row gets `stop_requested`, the runtime interrupts its
+turn, and the row settles `interrupted` when that turn or its session ends.
+
+**Restart.** Startup reconciliation, which treats every provider session as
+ended when BiBCode stopped, settles every unsettled row `interrupted` before
+delivery starts: a recovery sends no copy and holds the queue, leaving the
+original's error and the manual action; a guard fails its message with
+"BiBCode restarted before the conversation was compacted. Retry sends it."
+Shutdown abandons a running compaction like a revert waiter; it stops with the
+orchestration effects, before the Profiler's teardown.
 
 ### Checkpoint revert
 
@@ -2521,7 +3277,8 @@ something invalidates it:
 
 - `projects.createEntry`, `projects.renameEntry`, `projects.deleteEntry`, and
   `projects.duplicateEntry` drop the cached index after a successful mutation;
-- `projects.writeFile` drops it when the write creates a file or parent, or when
+- `projects.writeFile` and `projects.writeFileIfUnchanged` drop it when the
+  write creates a file or parent, or when
   either the logical path or safely resolved effective target contains a
   case-insensitive `.gitignore` or `.git` component. An ordinary existing-file
   content save keeps the index while still notifying VCS status. Arbitrary
@@ -2531,7 +3288,10 @@ something invalidates it:
   that the path set under `cwd` changed outside the application. The sweep stats
   the directories the last scan saw rather than walking the tree, because
   adding, renaming, or removing an entry moves its parent directory's mtime
-  while an in-place content edit does not. The index keeps that directory set
+  while an in-place content edit does not. An mtime moves only when the clock
+  ticks (15.6 ms on Windows, 2 s on FAT), so a directory whose mtime is under
+  two seconds old, past or future, also has its entry names read on that sweep
+  and the next, and an entry added or renamed within the same tick still shows. The index keeps that directory set
   apart from its entry list, because past the entry limit the list keeps files
   and drops directories, and a sweep that took its directories from the list
   went blind to every nested change. Every listed directory is swept. A
@@ -2573,6 +3333,75 @@ external changes and a content change to a configured custom
 `core.excludesFile`. The flag changes cache admission only. It does not widen
 the path boundary, bypass the workspace-availability guard, or otherwise change
 what the caller may read.
+
+## Open-file versions and guarded saves
+
+An open file's editor never saves over a change it has not seen. Three pieces
+ship together, and a client uses the last two only when the server's
+`projects.readFile` result carried a `version`. An older server returns none,
+and the editor then saves with `projects.writeFile` as before, without claiming
+protection.
+
+- **Version.** `projects.readFile` returns `version`: the lowercase hex SHA-256
+  of the exact bytes it returned, before lossy UTF-8 decoding. Content, not
+  mtime, is the truth, because mtime is coarse on some filesystems and can
+  repeat within a second.
+- **`projects.getFileVersion({ cwd, relativePath })`** reports what is on disk
+  now without its contents:
+  - `{ _tag: "present", version }` for an editable file, whose version matches
+    the one `projects.readFile` returns for it;
+  - `{ _tag: "missing" }` when nothing exists at the path, including a missing
+    parent;
+  - `{ _tag: "unreadable", failure, version }` for a file that became binary
+    (`binary_file`, a NUL byte in the first 1 MB, as `readFile` decides) or
+    larger than the 1 MB read limit (`file_too_large`). Its version hashes the
+    whole file, streamed, so a save can still be guarded against exactly that
+    state.
+
+  Failures use `ProjectReadFileError`. A path that is not a regular file, such
+  as a directory or a named pipe put in its place, fails with `path_not_file`
+  before it is opened, because opening a pipe with no writer blocks. The client
+  polls this method for the one file it shows, every 2 s while the window is
+  visible, and at once on window focus, on visibility, on a new connection
+  generation, when a turn ends, and after a refused save. Each poll
+  costs one bounded read and hash on the server, where the workspace lives, so
+  WSL and SSH workspaces are covered by the same path.
+
+- **`projects.writeFileIfUnchanged`** takes `projects.writeFile`'s input plus a
+  required `precondition`: `{ _tag: "version", version }` or
+  `{ _tag: "missing" }`. It is a separate method rather than an optional field
+  on `projects.writeFile`, because an older server's `WriteInput` ignores
+  unknown fields and would write anyway. It hashes the current file whole and refuses with a
+  `ProjectWriteFileError` whose `failure` is `file_changed_on_disk` (the file
+  differs from the version, or exists when `missing` was required) or
+  `file_missing_on_disk` (a save based on an existing file finds none). A
+  refusal leaves the file untouched. Success returns
+  `{ relativePath, version }`, the hash of the bytes written, which is the
+  client's next base. The write
+  stays in place and creates missing parents, preserving `projects.writeFile`'s
+  symlink-target behaviour.
+
+The check and the write run under a lock keyed by the canonical target path,
+which `projects.writeFile` also takes, so two BiBCode clients cannot both pass
+the check. The key ignores case: an existing path canonicalizes to its on-disk
+spelling, but a missing one keeps the caller's, and on a case-insensitive
+volume two spellings of a file being recreated name one file. On a
+case-sensitive volume, writes to names that differ only in case merely wait for
+each other. A writer outside BiBCode can still land in the milliseconds between
+the check and the write; closing that window would need locking that other
+tools do not honour.
+
+Client reconciliation is described in the
+[approved design](../plans/2026-10-23-open-file-disk-changes-design.md): the
+editing session takes its disk base, and with it the capability, from a server
+read or a guarded save's committed version, never from an optimistic draft
+such as a ticked Markdown task that is not saved yet; it keeps that base apart
+from the document, fences poll
+results by a generation bumped on every save, reloads a clean document as one
+Pierre undo step (`Editor.applyEdits(edits, true, true)`, a dependency patch on
+`@pierre/diffs` 1.3.6), and blocks every write while a conflict stands. Neither
+method waits on anything outside the server, so neither is
+`is_long_running` in the profiler's latency classifier.
 
 Moving an entry is a rename. The file tree's drag-and-drop move sends
 `projects.renameEntry` with the source and destination as workspace-relative
@@ -2939,8 +3768,11 @@ the monotonic clock, each holding 100 log-scale buckets that grow by a factor of
   `server.updateProvider`, `server.refreshProviders`, and
   `server.refreshProviderUsage`; `worktree.createManaged` and `worktree.remove`
   (which deletes the whole tree, dependencies and build output included); and
-  `agentSessions.import`. They still emit `rpc.timing`, but never raise
-  `rpc.slow` or count toward saturation.
+  `agentSessions.import` and `agentSessions.openInPanel` (a whole transcript
+  read and a wait on the project mutation lock). `agentSessions.listForThread`
+  stays out: its per-request budget bounds it, so a slow listing is a finding.
+  They still emit `rpc.timing`, but never raise `rpc.slow` or count toward
+  saturation.
 - **Hangs.** Each 5 s tick checks the unary requests still in flight. One past
   its budget, 10 s or 300 s for a long-running method, raises one `rpc.hang`
   finding (error) before it finishes. Streams are log-only and never hang-checked,
@@ -3038,26 +3870,45 @@ disconnected clients are remembered. The fields are in the
 
 ## Device previews flow
 
-[Device previews](./overview.md#device-previews) add seven methods, registered
+[Device previews](./overview.md#device-previews) add eight methods, registered
 in `production/device_rpc.rs` through the session wrappers. Each first checks
 `DeviceManager::enabled()` and fails with `DevicePreviewsDisabledError` while
 `enableDevicePreviews` is off; a stream fails at subscribe. Other failures are
 the typed `DeviceRpcError` union in `packages/contracts/src/device.ts`.
 
-| Method                     | Kind   | Scope                   | Payload and result                                                                                       |
-| -------------------------- | ------ | ----------------------- | -------------------------------------------------------------------------------------------------------- |
-| `device.subscribeCatalog`  | stream | `orchestration:read`    | The current catalog (per platform: availability and images; devices), then every change.                 |
-| `device.open`              | unary  | `orchestration:operate` | `{ platform, imageId }` → `{ deviceId }` at `starting`; boot progress arrives in the catalog.            |
-| `device.close`             | unary  | `orchestration:operate` | `{ deviceId }`; returns once the device has ended (up to the 10 s stop timeout).                         |
-| `device.input`             | unary  | `orchestration:operate` | `{ deviceId, events }`: 1 to 64 touch, key, or text events. The client keeps one batch in flight.        |
-| `device.rotate`            | unary  | `orchestration:operate` | `{ deviceId, orientation }` → `{ orientation }` the device ended in; the catalog shows what it reports.  |
-| `device.subscribeFrames`   | stream | `orchestration:read`    | `{ deviceId }` → JPEG frames `{ seq, width, height, orientation, jpegBase64 }`, conflated to the latest. |
-| `device.createMediaTicket` | unary  | `orchestration:read`    | `{ deviceId }` → `{ ticket, expiresAtMs }` for one H.264 media socket on this connection's channel.      |
+| Method                     | Kind   | Scope                   | Payload and result                                                                                        |
+| -------------------------- | ------ | ----------------------- | --------------------------------------------------------------------------------------------------------- |
+| `device.subscribeCatalog`  | stream | `orchestration:read`    | The current catalog (per platform: availability and images; devices in open order), then every change.    |
+| `device.refreshCatalog`    | unary  | `orchestration:read`    | `{}`; reruns every platform's discovery past its 30 s cache. Changes arrive on `device.subscribeCatalog`. |
+| `device.open`              | unary  | `orchestration:operate` | `{ platform, imageId, threadId? }` → `{ deviceId }` at `starting`, or the image's running device's id.    |
+| `device.close`             | unary  | `orchestration:operate` | `{ deviceId }`; returns once the device has ended (up to the 10 s stop timeout).                          |
+| `device.input`             | unary  | `orchestration:operate` | `{ deviceId, events }`: 1 to 64 touch, key, or text events. The client keeps one batch in flight.         |
+| `device.rotate`            | unary  | `orchestration:operate` | `{ deviceId, orientation }` → `{ orientation }` the device ended in; the catalog shows what it reports.   |
+| `device.subscribeFrames`   | stream | `orchestration:read`    | `{ deviceId }` → JPEG frames `{ seq, width, height, orientation, jpegBase64 }`, conflated to the latest.  |
+| `device.createMediaTicket` | unary  | `orchestration:read`    | `{ deviceId }` → `{ ticket, expiresAtMs }` for one H.264 media socket on this connection's channel.       |
 
-`device.close`, `device.input`, and `device.rotate` are in the profiler's
-`is_long_running` list, because they wait on the emulator: a stop (up to 10 s),
-a stalled input stream (up to 5 s), and reading back a rotation (about 2.5 s
-on Android, 1.2 s on iOS).
+`device.open`, `device.refreshCatalog`, `device.close`, `device.input`, and
+`device.rotate` are in the profiler's `is_long_running` list, because they wait
+on discovery or the emulator: `emulator -list-avds` and `simctl` (with the Xcode
+probes on macOS), `check_available`'s `simctl list` (up to 15 s), a stop (up to
+10 s), a stalled input stream (up to 5 s), and reading back a rotation (about
+2.5 s on Android, 1.2 s on iOS).
+
+`device.open`'s optional `threadId` names the root thread the device is for (a
+chat panel's host, else the thread). The server trims it, refuses a blank one
+with `DeviceInputError`, publishes it as the snapshot's `threadId`, and refuses
+a recently deleted thread with `DeviceNotFoundError`. Boot progress arrives in
+the catalog. An image whose device is starting, booting, or ready returns that
+device and keeps its owner; a stopping one fails with `DeviceNotReadyError`;
+a fifth live device fails with `DeviceLimitError`. Older servers ignore
+`threadId` and run one device per platform; older clients strip the snapshot's
+`threadId`, so neither needs a capability.
+
+`device.refreshCatalog` is newer than the other device methods, so servers that
+have it also advertise the `deviceCatalogRefresh` capability (decoded `false`
+when absent). Clients call it only when that capability is on: an older server
+answers an unknown method with a connection-level defect that fails every
+request in flight and silences the config stream.
 
 H.264 video does not travel over RPC. The ticket from
 `device.createMediaTicket` opens `/api/device-media` or

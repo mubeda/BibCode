@@ -379,6 +379,56 @@ describe("useUpdateClientSettings", () => {
   });
 });
 
+describe("Diff panel preferences across a restart", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("restores the view, layout, line filter and context count from browser storage", async () => {
+    const store = new Map<string, string>();
+    const localStorage = {
+      getItem: (key: string) => store.get(key) ?? null,
+      setItem: (key: string, value: string) => void store.set(key, value),
+      removeItem: (key: string) => void store.delete(key),
+      clear: () => store.clear(),
+      key: (index: number) => [...store.keys()][index] ?? null,
+      get length() {
+        return store.size;
+      },
+    } as Storage;
+    vi.stubGlobal("window", { localStorage });
+    vi.stubGlobal("localStorage", localStorage);
+    const { readBrowserClientSettings, writeBrowserClientSettings } =
+      await import("../clientPersistenceStorage");
+    h.getClientSettings = vi.fn(() => Promise.resolve(readBrowserClientSettings()));
+    h.setClientSettings = vi.fn((settings) => {
+      writeBrowserClientSettings(settings as never);
+      return Promise.resolve();
+    });
+
+    useUpdateClientSettings()({
+      diffViewMode: "compare",
+      diffRenderMode: "split",
+      diffCompareLines: "changes",
+      diffCompareContextLines: 7,
+    });
+    expect(store.size).toBe(1);
+
+    // A restart: the in-memory snapshot is gone and settings hydrate from storage.
+    __resetClientSettingsPersistenceForTests();
+    expect(getClientSettings()).toBe(DEFAULT_CLIENT_SETTINGS);
+    useClientSettings();
+    await flush();
+
+    expect(getClientSettings()).toMatchObject({
+      diffViewMode: "compare",
+      diffRenderMode: "split",
+      diffCompareLines: "changes",
+      diffCompareContextLines: 7,
+    });
+  });
+});
+
 describe("useUpdateEnvironmentSettings routing", () => {
   it("routes server keys to the RPC command and client keys to local persistence", () => {
     const update = useUpdateEnvironmentSettings(environmentId);

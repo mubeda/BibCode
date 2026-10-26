@@ -6,6 +6,7 @@ import { PullRequestsConversationComment } from "../review/PullRequestsCommentBo
 import type {
   PullRequestsContext,
   PullRequestsDetail,
+  PullRequestsPipelineCopy,
   PullRequestsTimeline,
   ScopedProjectRef,
 } from "@bibcode/contracts";
@@ -36,6 +37,8 @@ export interface PullRequestsConversationProps {
    * adopted the split keep acting as before.
    */
   liveDetail?: PullRequestsDetail | null;
+  /** The newest pipeline copy for the merge box; omitted, the detail's own. */
+  pipeline?: PullRequestsPipelineCopy | null;
 }
 const timelineKey = (item: PullRequestsTimeline["items"][number]) => item.id;
 export const PullRequestsConversation = memo(function PullRequestsConversation({
@@ -46,6 +49,7 @@ export const PullRequestsConversation = memo(function PullRequestsConversation({
   timeline,
   detailsRefreshing = false,
   liveDetail = detail,
+  pipeline = detail.pipeline ?? null,
 }: PullRequestsConversationProps) {
   const { run, pending } = usePullRequestsActions();
   const items = useMemo(() => groupTimeline(timeline.items), [timeline.items]);
@@ -147,6 +151,7 @@ export const PullRequestsConversation = memo(function PullRequestsConversation({
               live={liveDetail}
               context={context}
               projectRef={projectRef}
+              pipeline={pipeline}
             />
           </div>
         }

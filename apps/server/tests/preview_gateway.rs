@@ -1180,8 +1180,16 @@ async fn shutdown_cancels_listener() {
     gateway.running.shutdown.cancel();
 
     let port = gateway.running.gateway_port;
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+    // Windows answers a closed port only after retrying for about two seconds, so a connect
+    // that a live listener would take at once is bounded on its own.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while tokio::time::timeout(
+            Duration::from_millis(500),
+            TcpStream::connect(("127.0.0.1", port)),
+        )
+        .await
+        .is_ok_and(|connected| connected.is_ok())
+        {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })

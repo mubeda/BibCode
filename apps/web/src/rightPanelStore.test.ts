@@ -5,6 +5,7 @@ import { createJSONStorage } from "zustand/middleware";
 
 import {
   migratePersistedRightPanelState,
+  selectActivityFocusRequested,
   selectActiveRightPanel,
   selectActiveRightPanelSurface,
   selectThreadRightPanelState,
@@ -16,7 +17,7 @@ const refB = scopeThreadRef("env-1" as EnvironmentId, ThreadId.make("thread-B"))
 const refAOtherEnvironment = scopeThreadRef("env-2" as EnvironmentId, ThreadId.make("thread-A"));
 
 beforeEach(() => {
-  useRightPanelStore.setState({ byThreadKey: {} });
+  useRightPanelStore.setState({ byThreadKey: {}, activityFocusRequests: {} });
 });
 
 describe("rightPanelStore", () => {
@@ -159,6 +160,76 @@ describe("rightPanelStore", () => {
           selectedRecordId: null,
         },
       ],
+    });
+  });
+
+  it("brings an open Activity panel to the front on the requested section without closing it", () => {
+    useRightPanelStore.getState().openActivity(refA, "subagents");
+    useRightPanelStore.getState().open(refA, "sourceControl");
+    expect(
+      selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA),
+    ).toMatchObject({ isOpen: true, activeSurfaceId: "sourceControl" });
+
+    useRightPanelStore.getState().openActivity(refA, "backgroundTasks");
+
+    const state = selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA);
+    expect(state.isOpen).toBe(true);
+    expect(state.activeSurfaceId).toBe("activity");
+    expect(state.surfaces.filter((surface) => surface.kind === "activity")).toHaveLength(1);
+    expect(
+      selectActiveRightPanelSurface(useRightPanelStore.getState().byThreadKey, refA),
+    ).toMatchObject({ section: "backgroundTasks" });
+  });
+
+  it("keeps the open record when the Activity button reopens the same section", () => {
+    useRightPanelStore.getState().openActivity(refA, "subagents");
+    useRightPanelStore.getState().navigateActivity(refA, {
+      section: "subagents",
+      selectedRecordKind: "actor",
+      selectedRecordId: "actor-1",
+    });
+
+    useRightPanelStore.getState().openActivity(refA, "subagents");
+
+    expect(
+      selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA).isOpen,
+    ).toBe(true);
+    expect(
+      selectActiveRightPanelSurface(useRightPanelStore.getState().byThreadKey, refA),
+    ).toMatchObject({
+      section: "subagents",
+      selectedRecordKind: "actor",
+      selectedRecordId: "actor-1",
+    });
+  });
+
+  it("asks the Activity panel to take focus on every open until the panel handles it", () => {
+    const focusRequested = (ref: typeof refA) =>
+      selectActivityFocusRequested(useRightPanelStore.getState(), ref);
+    useRightPanelStore.getState().openActivity(refA, "subagents");
+    expect(focusRequested(refA)).toBe(true);
+    expect(focusRequested(refB)).toBe(false);
+
+    useRightPanelStore.getState().acknowledgeActivityFocus(refA);
+    expect(focusRequested(refA)).toBe(false);
+
+    // Reopening the same section with a record open asks again.
+    useRightPanelStore.getState().navigateActivity(refA, {
+      section: "subagents",
+      selectedRecordKind: "actor",
+      selectedRecordId: "actor-1",
+    });
+    expect(focusRequested(refA)).toBe(false);
+    useRightPanelStore.getState().openActivity(refA, "subagents");
+    expect(focusRequested(refA)).toBe(true);
+  });
+
+  it("never persists a pending Activity focus request", () => {
+    useRightPanelStore.getState().openActivity(refA, "subagents");
+    const partialize = useRightPanelStore.persist.getOptions().partialize;
+
+    expect(partialize?.(useRightPanelStore.getState())).toEqual({
+      byThreadKey: useRightPanelStore.getState().byThreadKey,
     });
   });
 
@@ -1540,6 +1611,77 @@ describe("rightPanelStore device surface", () => {
     useRightPanelStore.setState({ byThreadKey: {} });
     const { byThreadKey: hydrated } = await hydrate({ state: persisted, version: 10 });
     expect(hydrated).toEqual(persisted.byThreadKey);
+  });
+
+  it("remembers each thread's picked image on its device surface (#170)", async () => {
+    const store = useRightPanelStore.getState();
+    store.open(refA, "device");
+    store.open(refB, "device");
+    store.setDeviceImage(refA, { platform: "ios", imageId: "UDID-1" });
+    const surfaceOf = (ref: typeof refA) =>
+      selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, ref).surfaces[0];
+    expect(surfaceOf(refA)).toEqual({
+      id: "device",
+      kind: "device",
+      image: { platform: "ios", imageId: "UDID-1" },
+    });
+    expect(surfaceOf(refB)).toEqual({ id: "device", kind: "device" });
+    // The same pick again leaves the state as it was.
+    const before = useRightPanelStore.getState().byThreadKey;
+    store.setDeviceImage(refA, { platform: "ios", imageId: "UDID-1" });
+    expect(useRightPanelStore.getState().byThreadKey).toBe(before);
+
+    const persisted = { byThreadKey: useRightPanelStore.getState().byThreadKey };
+    useRightPanelStore.setState({ byThreadKey: {} });
+    const { byThreadKey: hydrated } = await hydrate({ state: persisted, version: 10 });
+    expect(hydrated).toEqual(persisted.byThreadKey);
+  });
+
+  it("keeps no pick for a thread without a device surface, and drops it with the tab", () => {
+    const store = useRightPanelStore.getState();
+    store.setDeviceImage(refA, { platform: "android", imageId: "Pixel_8" });
+    expect(useRightPanelStore.getState().byThreadKey).toEqual({});
+    store.open(refA, "device");
+    store.setDeviceImage(refA, { platform: "android", imageId: "Pixel_8" });
+    store.closeSurface(refA, "device");
+    store.open(refA, "device");
+    expect(
+      selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA).surfaces,
+    ).toEqual([{ id: "device", kind: "device" }]);
+  });
+
+  it("keeps a well-formed picked image and drops a malformed one", () => {
+    const sanitized = (image: unknown) =>
+      migratePersistedRightPanelState({
+        byThreadKey: {
+          "env-1:thread-A": {
+            isOpen: true,
+            activeSurfaceId: "device",
+            surfaces: [{ id: "device", kind: "device", image }],
+          },
+        },
+      }).byThreadKey["env-1:thread-A"]!.surfaces[0];
+    expect(sanitized({ platform: "android", imageId: "Pixel_8" })).toEqual({
+      id: "device",
+      kind: "device",
+      image: { platform: "android", imageId: "Pixel_8" },
+    });
+    for (const image of [
+      { platform: "windows", imageId: "Pixel_8" },
+      { platform: "ios", imageId: "" },
+      { platform: "ios" },
+      { platform: "ios", imageId: "UDID-1", deviceId: "d-1" },
+      "android:Pixel_8",
+      null,
+    ]) {
+      const surface = sanitized(image);
+      expect(surface).toEqual(
+        // Extra fields are dropped, not the pick; anything else loses the pick only.
+        typeof image === "object" && image !== null && "deviceId" in image
+          ? { id: "device", kind: "device", image: { platform: "ios", imageId: "UDID-1" } }
+          : { id: "device", kind: "device" },
+      );
+    }
   });
 
   it("drops unknown kinds and a device surface with the wrong id", () => {

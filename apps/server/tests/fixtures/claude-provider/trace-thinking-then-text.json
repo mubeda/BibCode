@@ -1,0 +1,267 @@
+{
+  "threadId": "provider-thread-1",
+  "turnId": "turn-1",
+  "startup": {
+    "sessionId": "sdk-session-thinking",
+    "runtimeMode": "full-access"
+  },
+  "messages": [
+    {
+      "type": "stream_event",
+      "session_id": "sdk-session-thinking",
+      "uuid": "stream-message-start",
+      "parent_tool_use_id": null,
+      "event": {
+        "type": "message_start",
+        "message": {
+          "id": "msg-thinking-1"
+        }
+      }
+    },
+    {
+      "type": "stream_event",
+      "session_id": "sdk-session-thinking",
+      "uuid": "stream-thinking-start",
+      "parent_tool_use_id": null,
+      "event": {
+        "type": "content_block_start",
+        "index": 0,
+        "content_block": {
+          "type": "thinking",
+          "thinking": "",
+          "signature": ""
+        }
+      }
+    },
+    {
+      "type": "stream_event",
+      "session_id": "sdk-session-thinking",
+      "uuid": "stream-thinking-delta-1",
+      "parent_tool_use_id": null,
+      "event": {
+        "type": "content_block_delta",
+        "index": 0,
+        "delta": {
+          "type": "thinking_delta",
+          "thinking": "**Weighing the fix**\n\nThe test fails first."
+        }
+      }
+    },
+    {
+      "type": "stream_event",
+      "session_id": "sdk-session-thinking",
+      "uuid": "stream-thinking-delta-2",
+      "parent_tool_use_id": null,
+      "event": {
+        "type": "content_block_delta",
+        "index": 0,
+        "delta": {
+          "type": "thinking_delta",
+          "thinking": " Then the code."
+        }
+      }
+    },
+    {
+      "type": "stream_event",
+      "session_id": "sdk-session-thinking",
+      "uuid": "stream-thinking-signature",
+      "parent_tool_use_id": null,
+      "event": {
+        "type": "content_block_delta",
+        "index": 0,
+        "delta": {
+          "type": "signature_delta",
+          "signature": "c2lnbmF0dXJl"
+        }
+      }
+    },
+    {
+      "type": "stream_event",
+      "session_id": "sdk-session-thinking",
+      "uuid": "stream-thinking-stop",
+      "parent_tool_use_id": null,
+      "event": {
+        "type": "content_block_stop",
+        "index": 0
+      }
+    },
+    {
+      "type": "assistant",
+      "session_id": "sdk-session-thinking",
+      "uuid": "assistant-thinking-frame",
+      "parent_tool_use_id": null,
+      "message": {
+        "id": "msg-thinking-1",
+        "content": [
+          {
+            "type": "thinking",
+            "thinking": "**Weighing the fix**\n\nThe test fails first. Then the code.",
+            "signature": "c2lnbmF0dXJl"
+          }
+        ]
+      }
+    },
+    {
+      "type": "stream_event",
+      "session_id": "sdk-session-thinking",
+      "uuid": "stream-redacted-start",
+      "parent_tool_use_id": null,
+      "event": {
+        "type": "content_block_start",
+        "index": 1,
+        "content_block": {
+          "type": "redacted_thinking",
+          "data": "ZW5jcnlwdGVk"
+        }
+      }
+    },
+    {
+      "type": "stream_event",
+      "session_id": "sdk-session-thinking",
+      "uuid": "stream-redacted-stop",
+      "parent_tool_use_id": null,
+      "event": {
+        "type": "content_block_stop",
+        "index": 1
+      }
+    },
+    {
+      "type": "stream_event",
+      "session_id": "sdk-session-thinking",
+      "uuid": "stream-text-start",
+      "parent_tool_use_id": null,
+      "event": {
+        "type": "content_block_start",
+        "index": 2,
+        "content_block": {
+          "type": "text",
+          "text": ""
+        }
+      }
+    },
+    {
+      "type": "stream_event",
+      "session_id": "sdk-session-thinking",
+      "uuid": "stream-text-delta",
+      "parent_tool_use_id": null,
+      "event": {
+        "type": "content_block_delta",
+        "index": 2,
+        "delta": {
+          "type": "text_delta",
+          "text": "Fixed."
+        }
+      }
+    },
+    {
+      "type": "stream_event",
+      "session_id": "sdk-session-thinking",
+      "uuid": "stream-text-stop",
+      "parent_tool_use_id": null,
+      "event": {
+        "type": "content_block_stop",
+        "index": 2
+      }
+    },
+    {
+      "type": "result",
+      "subtype": "success",
+      "is_error": false,
+      "errors": [],
+      "stop_reason": "end_turn",
+      "session_id": "sdk-session-thinking",
+      "uuid": "result-thinking"
+    }
+  ],
+  "expectedEvents": [
+    {
+      "type": "session.started",
+      "threadId": "provider-thread-1",
+      "payload": {
+        "message": "Claude session started.",
+        "resume": {
+          "sessionId": "sdk-session-thinking"
+        }
+      }
+    },
+    {
+      "type": "session.configured",
+      "threadId": "provider-thread-1",
+      "payload": {
+        "permissionMode": "bypassPermissions",
+        "cwd": null
+      }
+    },
+    {
+      "type": "session.state.changed",
+      "threadId": "provider-thread-1",
+      "payload": {
+        "state": "ready"
+      }
+    },
+    {
+      "type": "turn.started",
+      "threadId": "provider-thread-1",
+      "turnId": "turn-1",
+      "payload": {
+        "input": "fix the bug"
+      }
+    },
+    {
+      "type": "thread.started",
+      "threadId": "provider-thread-1",
+      "turnId": "turn-1",
+      "payload": {
+        "providerThreadId": "msg-thinking-1"
+      }
+    },
+    {
+      "type": "content.delta",
+      "threadId": "provider-thread-1",
+      "turnId": "turn-1",
+      "itemId": "msg-thinking-1:0",
+      "payload": {
+        "streamKind": "reasoning_text",
+        "delta": "**Weighing the fix**\n\nThe test fails first."
+      }
+    },
+    {
+      "type": "content.delta",
+      "threadId": "provider-thread-1",
+      "turnId": "turn-1",
+      "itemId": "msg-thinking-1:0",
+      "payload": {
+        "streamKind": "reasoning_text",
+        "delta": " Then the code."
+      }
+    },
+    {
+      "type": "item.completed",
+      "threadId": "provider-thread-1",
+      "turnId": "turn-1",
+      "itemId": "msg-thinking-1:0",
+      "payload": {
+        "itemType": "reasoning"
+      }
+    },
+    {
+      "type": "content.delta",
+      "threadId": "provider-thread-1",
+      "turnId": "turn-1",
+      "itemId": "msg-thinking-1",
+      "payload": {
+        "streamKind": "assistant_text",
+        "delta": "Fixed."
+      }
+    },
+    {
+      "type": "turn.completed",
+      "threadId": "provider-thread-1",
+      "turnId": "turn-1",
+      "payload": {
+        "state": "completed",
+        "stopReason": "end_turn"
+      }
+    }
+  ]
+}

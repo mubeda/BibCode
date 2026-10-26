@@ -49,6 +49,7 @@ import {
   resolveLiveThreadBranchUpdate,
   resolveQuickAction,
   resolveThreadBranchUpdate,
+  stackedActionFailureTitle,
 } from "./GitActionsControl.logic";
 import { AnimatedHeight } from "./AnimatedHeight";
 import {
@@ -1395,9 +1396,6 @@ export default function GitActionsControl({
         });
       }
 
-      // The settled failure names only the action and phase; the server's own report
-      // carries what Git said, which the error toast shows instead (#157).
-      const remoteFailure: { message: string | null } = { message: null };
       const applyProgressEvent = (event: GitActionProgressEvent) => {
         const progress = activeGitActionProgressRef.current;
         if (!progress) {
@@ -1448,7 +1446,6 @@ export default function GitActionsControl({
           case "action_failed":
             // Let the settled mutation publish the error toast to avoid a
             // transient intermediate state before the final failure message.
-            remoteFailure.message = event.message;
             return;
         }
 
@@ -1476,10 +1473,8 @@ export default function GitActionsControl({
           resolvedProgressToastId,
           stackedThreadToast({
             type: "error",
-            title: "Action failed",
-            description:
-              remoteFailure.message ??
-              (error instanceof Error ? error.message : "An error occurred."),
+            title: stackedActionFailureTitle(error),
+            description: error instanceof Error ? error.message : "An error occurred.",
             ...(scopedToastData !== undefined ? { data: scopedToastData } : {}),
           }),
         );

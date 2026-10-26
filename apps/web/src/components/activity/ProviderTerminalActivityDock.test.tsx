@@ -6,7 +6,6 @@ import {
   type ActivityActorSummary,
   type ActivitySnapshot,
   EnvironmentId,
-  ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
   ThreadId,
@@ -36,15 +35,12 @@ vi.mock("~/state/activity", () => ({
   },
 }));
 
-import { scopedProjectKey, scopeProjectRef } from "@bibcode/client-runtime/environment";
-import { useActivityDockStore } from "~/activityDockStore";
 import { selectThreadRightPanelState, useRightPanelStore } from "~/rightPanelStore";
 import { ProviderTerminalActivityDock } from "./ProviderTerminalActivityDock";
 
 const environmentId = EnvironmentId.make("provider-terminal-dock");
 const threadId = ThreadId.make("thread-provider-terminal-dock");
 const threadRef = scopeThreadRef(environmentId, threadId);
-const projectId = ProjectId.make("project-provider-terminal-dock");
 const activity: ProviderTerminalActivityLaunch = {
   driverKind: ProviderDriverKind.make("codex"),
   providerInstanceId: ProviderInstanceId.make("codex-default"),
@@ -125,7 +121,6 @@ function dock(overrides: Partial<Parameters<typeof ProviderTerminalActivityDock>
   return (
     <ProviderTerminalActivityDock
       threadRef={threadRef}
-      projectId={projectId}
       terminalId="terminal-codex"
       activity={activity}
       visible
@@ -157,7 +152,6 @@ describe("ProviderTerminalActivityDock", () => {
     ).IS_REACT_ACT_ENVIRONMENT = true;
     state.activityStateTargets = [];
     state.activityState = activityState(null, "empty");
-    useActivityDockStore.setState({ expandedByProject: {} });
     useRightPanelStore.setState({ byThreadKey: {} });
   });
 
@@ -235,7 +229,10 @@ describe("ProviderTerminalActivityDock", () => {
     const markup = renderToStaticMarkup(dock());
 
     expect(markup).toContain('data-testid="activity-dock"');
-    expect(markup).toContain('aria-label="Activity data stale"');
+    expect(markup).toContain('data-activity-status="stale"');
+    expect(markup).toContain(
+      'aria-label="Open Activity: Subagents 1 active, 0 done. Status: stale"',
+    );
   });
 
   it("does not mount an activity state reader, dock, or announcement for a hidden terminal pane", () => {
@@ -261,17 +258,32 @@ describe("ProviderTerminalActivityDock", () => {
     expect(state.activityStateTargets).toHaveLength(1);
   });
 
-  it("opens the exact persisted terminal scope when a section is clicked", async () => {
-    state.activityState = activityState(snapshot("terminal-codex"));
-    const projectKey = scopedProjectKey(scopeProjectRef(environmentId, projectId));
-    useActivityDockStore.getState().setExpanded(projectKey, true);
-    const tree = await mount(dock());
-    const section = tree.container.querySelector<HTMLButtonElement>(
-      '[data-activity-section="subagents"]',
+  it("keeps a terminal without records hidden, since always-visible applies to chats", () => {
+    state.activityState = activityState(
+      snapshot("terminal-codex", {
+        counts: {
+          subagents: { active: 0, done: 0 },
+          backgroundTasks: { active: 0, done: 0 },
+        },
+        actors: [],
+      }),
     );
-    expect(section).not.toBeNull();
 
-    await act(async () => section!.click());
+    const markup = renderToStaticMarkup(dock());
+
+    expect(markup).not.toContain('data-testid="activity-dock"');
+  });
+
+  it("opens the exact persisted terminal scope in one click on the pill", async () => {
+    state.activityState = activityState(snapshot("terminal-codex"));
+    const tree = await mount(dock());
+    const buttons = tree.container.querySelectorAll<HTMLButtonElement>("button");
+    expect(buttons).toHaveLength(1);
+    expect(buttons[0]!.getAttribute("aria-label")).toBe(
+      "Open Activity: Subagents 1 active, 0 done",
+    );
+
+    await act(async () => buttons[0]!.click());
 
     const panel = selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, threadRef);
     expect(panel.isOpen).toBe(true);

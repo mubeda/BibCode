@@ -1,3 +1,4 @@
+import { scopedThreadKey } from "@bibcode/client-runtime/environment";
 import type {
   DeviceCatalog,
   DeviceImage,
@@ -8,6 +9,8 @@ import type {
   DevicePlatformCatalog,
   DeviceSnapshot,
   EnvironmentId,
+  ScopedThreadRef,
+  ThreadId,
 } from "@bibcode/contracts";
 import {
   type AtomCommandResult,
@@ -16,12 +19,22 @@ import {
 } from "@bibcode/client-runtime/state/runtime";
 import { useNavigate } from "@tanstack/react-router";
 import * as Cause from "effect/Cause";
-import { SmartphoneIcon, TriangleAlertIcon } from "lucide-react";
+import { RefreshCwIcon, SmartphoneIcon, TriangleAlertIcon } from "lucide-react";
 import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
+import { cn } from "../../lib/utils";
+import { selectDeviceSurfaceImage, useRightPanelStore } from "../../rightPanelStore";
 import { deviceEnvironment } from "../../state/device";
 import { useEnvironmentQuery } from "../../state/query";
 import { useAtomCommand } from "../../state/use-atom-command";
+import {
+  AlertDialog,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogPopup,
+  AlertDialogTitle,
+} from "../ui/alert-dialog";
 import { Button } from "../ui/button";
 import { RetryButton } from "../ui/retry-button";
 import { useDevicePreviewsAvailability } from "./deviceAvailability";
@@ -37,13 +50,30 @@ import {
   type DeviceErrorView,
   describeDeviceError,
   deviceStateLabel,
+  EVERY_DEVICE_RUNNING_MESSAGE,
   IOS_PASTE_NOTE,
   isViewOnlyAvailability,
+  MAX_RUNNING_DEVICES,
   rotateKeptNote,
+  STOPPED_RESTART_HINT,
+  STOPPED_START_HINT,
   type StillImages,
+  stopConfirmTitle,
+  stoppedTitle,
 } from "./deviceMessages";
+import {
+  type DeviceOwner,
+  deviceOwnerOf,
+  DeviceStartedIn,
+  DeviceStopConfirmDescription,
+} from "./deviceOwner";
 import { DeviceScreen } from "./DeviceScreen";
-import { type DeviceImageSelection, DeviceToolbar, type RotateDirection } from "./DeviceToolbar";
+import {
+  type DeviceImageSelection,
+  DeviceToolbar,
+  pickerValue,
+  type RotateDirection,
+} from "./DeviceToolbar";
 
 /** Turning the device left goes portrait → landscape → reverse portrait → reverse landscape. */
 const ORIENTATIONS_LEFT: ReadonlyArray<DeviceOrientation> = [
@@ -67,8 +97,25 @@ const ROTATE_NOTE_MS = 5_000;
 /** How long a refused input's message stays up after the latest refusal. */
 const INPUT_ERROR_MS = 5_000;
 
+/** A device that has not ended; a `stopping` one still counts against the server's limit. */
 const isRunning = (device: DeviceSnapshot) =>
   device.state !== "stopped" && device.state !== "failed";
+
+/** A device a Stop can still stop. */
+const isStoppable = (device: DeviceSnapshot) =>
+  device.state === "starting" || device.state === "booting" || device.state === "ready";
+
+/** The last device that matches, so the newest: the catalog lists devices in open order. */
+function newestOf(
+  devices: ReadonlyArray<DeviceSnapshot>,
+  matches: (device: DeviceSnapshot) => boolean,
+): DeviceSnapshot | undefined {
+  for (let index = devices.length - 1; index >= 0; index -= 1) {
+    const device = devices[index]!;
+    if (matches(device)) return device;
+  }
+  return undefined;
+}
 
 /** Whether a platform's images open: it is ready, or runs them view only. */
 const opensImages = (listed: DevicePlatformCatalog) =>
@@ -104,51 +151,54 @@ export function imageDisplayName(
 }
 
 /**
- * The image the picker shows: the user's pick while the catalog lists it, else the device this
- * pane started while it runs, else any running device, else the one this pane started (so its
- * failure stays visible), else the first image that can start. The catalog sorts devices by
- * id, not age, so the device this pane started is the only sign of which is newest.
+ * The image the pane shows for the thread whose root is `rootThreadId` (a chat panel's host,
+ * else the thread): its stored pick while the catalog lists the image, running or not; else the
+ * image of its oldest running device; else of its newest ended one, so an agent's failed start
+ * stays in view; else the first image nobody runs; else none. The pick is the user's intent, so
+ * it wins, and a fallback never replaces it: a pick missing while discovery runs comes back.
  */
 export function selectedImageOf(
   catalog: DeviceCatalog | null,
   picked: DeviceImageSelection | null,
-  followedDeviceId: string | null,
+  rootThreadId: ThreadId,
 ): DeviceImageSelection | null {
   if (catalog === null) return null;
   if (picked !== null && findImage(catalog, picked.platform, picked.imageId) !== undefined) {
     return picked;
   }
-  const followed = catalog.devices.find((device) => device.deviceId === followedDeviceId);
-  if (followed !== undefined && isRunning(followed)) return selectionOf(followed);
-  const running = catalog.devices.find(isRunning);
+  const mine = (device: DeviceSnapshot) => device.threadId === rootThreadId;
+  const running = catalog.devices.find((device) => mine(device) && isRunning(device));
   if (running !== undefined) return selectionOf(running);
-  if (followed !== undefined && followed.state === "failed") return selectionOf(followed);
+  const ended = newestOf(catalog.devices, (device) => mine(device) && !isRunning(device));
+  if (ended !== undefined) return selectionOf(ended);
   for (const listed of catalog.platforms) {
     if (!opensImages(listed)) continue;
-    const free = listed.images.find((image) => image.inUseElsewhere !== true);
+    const free = listed.images.find(
+      (image) =>
+        image.inUseElsewhere !== true &&
+        !catalog.devices.some(
+          (device) =>
+            isRunning(device) &&
+            isSelected(device, { platform: listed.platform, imageId: image.id }),
+        ),
+    );
     if (free !== undefined) return { platform: listed.platform, imageId: free.id };
   }
   return null;
 }
 
 /**
- * The device the pane shows: the selected image's running device (one per platform at most),
- * else the one this pane started on it, if that failed, so its reason stays visible.
+ * The device the pane shows: the selected image's running device (one per image at most), else
+ * its newest ended one, stopped or failed, so its last state and reason stay visible.
  */
 export function selectShownDevice(
   catalog: DeviceCatalog | null,
   selected: DeviceImageSelection | null,
-  followedDeviceId: string | null,
 ): DeviceSnapshot | null {
   if (catalog === null || selected === null) return null;
   return (
     catalog.devices.find((device) => isRunning(device) && isSelected(device, selected)) ??
-    catalog.devices.find(
-      (device) =>
-        device.deviceId === followedDeviceId &&
-        device.state === "failed" &&
-        isSelected(device, selected),
-    ) ??
+    newestOf(catalog.devices, (device) => !isRunning(device) && isSelected(device, selected)) ??
     null
   );
 }
@@ -194,8 +244,19 @@ function OpenSettingsButton({ environmentId }: { readonly environmentId: Environ
   );
 }
 
-/** The right-panel device pane for one environment's running device. */
-export function DevicePanel({ environmentId }: { readonly environmentId: EnvironmentId }) {
+/**
+ * The right-panel device pane of one thread: the environment's devices, with the thread's own
+ * shown by default. `rootThreadId` is the thread's root (a chat panel's host, else the thread),
+ * which owns the devices it starts.
+ */
+export function DevicePanel({
+  threadRef,
+  rootThreadId,
+}: {
+  readonly threadRef: ScopedThreadRef;
+  readonly rootThreadId: ThreadId;
+}) {
+  const { environmentId } = threadRef;
   const availability = useDevicePreviewsAvailability(environmentId);
   if (!availability.known) {
     return <PanelMessage>Connecting to the server…</PanelMessage>;
@@ -210,8 +271,15 @@ export function DevicePanel({ environmentId }: { readonly environmentId: Environ
       </PanelMessage>
     );
   }
-  // Keyed so switching to a thread on another environment starts from a clean pane.
-  return <DeviceSession key={environmentId} environmentId={environmentId} />;
+  // Keyed by thread, so notes, errors, and the input queue never cross threads.
+  return (
+    <DeviceSession
+      key={scopedThreadKey(threadRef)}
+      threadRef={threadRef}
+      rootThreadId={rootThreadId}
+      canRefresh={availability.catalogRefresh}
+    />
+  );
 }
 
 function isDisabledFailure(cause: Cause.Cause<unknown>): boolean {
@@ -227,11 +295,6 @@ interface InputLane {
   readonly deviceId: string;
   readonly queue: DeviceInputQueue;
   alive: boolean;
-}
-
-/** A failed device action, with the platform a failed start was for. */
-interface PaneError extends DeviceErrorView {
-  readonly platform: DevicePlatform | null;
 }
 
 /** Whether the pane has had the iOS paste note out for a device, and whether it still shows. */
@@ -264,8 +327,12 @@ interface InputErrorNote {
 /** Each platform's reason it cannot run devices, under its own heading. */
 function UnavailablePlatforms({
   platforms,
+  action,
+  error,
 }: {
   readonly platforms: ReadonlyArray<DevicePlatformCatalog>;
+  readonly action: ReactNode;
+  readonly error: string | null;
 }) {
   return (
     <div className="flex min-h-0 flex-1 items-center justify-center p-6">
@@ -282,12 +349,72 @@ function UnavailablePlatforms({
             <p className="text-xs text-muted-foreground">{listed.availability.message}</p>
           </div>
         ))}
+        {action}
+        {error === null ? null : (
+          <p role="alert" className="text-xs text-destructive">
+            {error}
+          </p>
+        )}
       </div>
     </div>
   );
 }
 
-function DeviceSession({ environmentId }: { readonly environmentId: EnvironmentId }) {
+/** Asks before stopping a device another thread started: it ends that task's session. */
+function StopOtherThreadsDevice({
+  environmentId,
+  device,
+  name,
+  onStop,
+  onCancel,
+}: {
+  readonly environmentId: EnvironmentId;
+  readonly device: DeviceSnapshot & { readonly threadId: ThreadId };
+  readonly name: string;
+  readonly onStop: () => void;
+  readonly onCancel: () => void;
+}) {
+  return (
+    <AlertDialog
+      open
+      onOpenChange={(open) => {
+        if (!open) onCancel();
+      }}
+    >
+      <AlertDialogPopup data-text-surface="popover">
+        <AlertDialogHeader>
+          <AlertDialogTitle>{stopConfirmTitle(name)}</AlertDialogTitle>
+          <AlertDialogDescription>
+            <DeviceStopConfirmDescription
+              environmentId={environmentId}
+              threadId={device.threadId}
+            />
+          </AlertDialogDescription>
+        </AlertDialogHeader>
+        <AlertDialogFooter>
+          <Button variant="outline" onClick={onCancel}>
+            Cancel
+          </Button>
+          <Button variant="destructive" onClick={onStop}>
+            Stop device
+          </Button>
+        </AlertDialogFooter>
+      </AlertDialogPopup>
+    </AlertDialog>
+  );
+}
+
+function DeviceSession({
+  threadRef,
+  rootThreadId,
+  canRefresh,
+}: {
+  readonly threadRef: ScopedThreadRef;
+  readonly rootThreadId: ThreadId;
+  /** The server has `device.refreshCatalog`; an older one shows no Refresh devices. */
+  readonly canRefresh: boolean;
+}) {
+  const { environmentId } = threadRef;
   const catalogQuery = useEnvironmentQuery(deviceEnvironment.catalog({ environmentId, input: {} }));
   const { data: catalog, emission, revalidate } = catalogQuery;
   // The server ends the catalog with "off" while previews are off. A cached stream that ended
@@ -300,15 +427,22 @@ function DeviceSession({ environmentId }: { readonly environmentId: EnvironmentI
     revalidate();
   }, [disabledFailure, revalidate]);
 
+  const runRefresh = useAtomCommand(deviceEnvironment.refreshCatalog, { reportFailure: false });
   const runOpen = useAtomCommand(deviceEnvironment.open, { reportFailure: false });
   const runClose = useAtomCommand(deviceEnvironment.close, { reportFailure: false });
   const runRotate = useAtomCommand(deviceEnvironment.rotate, { reportFailure: false });
   const runInput = useAtomCommand(deviceEnvironment.input, { reportFailure: false });
 
-  const [followedDeviceId, setFollowedDeviceId] = useState<string | null>(null);
-  const [pickedImage, setPickedImage] = useState<DeviceImageSelection | null>(null);
+  // The thread's pick lives on its device surface, so it survives a remount and a reload.
+  const pickedImage = useRightPanelStore((state) =>
+    selectDeviceSurfaceImage(state.byThreadKey, threadRef),
+  );
   const [startPending, setStartPending] = useState(false);
-  const [actionError, setActionError] = useState<PaneError | null>(null);
+  const [confirmStop, setConfirmStop] = useState<
+    (DeviceSnapshot & { readonly threadId: ThreadId }) | null
+  >(null);
+  const [refreshing, setRefreshing] = useState(false);
+  const [actionError, setActionError] = useState<DeviceErrorView | null>(null);
   const [inputError, setInputError] = useState<InputErrorNote | null>(null);
   const [stillImages, setStillImages] = useState<StillImages | null>(null);
   const [pasteNote, setPasteNote] = useState<PasteNote | null>(null);
@@ -338,30 +472,43 @@ function DeviceSession({ environmentId }: { readonly environmentId: EnvironmentI
 
   // Memoized so the compiler treats them as settled values for the callbacks that use them.
   const selectedImage = useMemo(
-    () => selectedImageOf(catalog, pickedImage, followedDeviceId),
-    [catalog, pickedImage, followedDeviceId],
+    () => selectedImageOf(catalog, pickedImage, rootThreadId),
+    [catalog, pickedImage, rootThreadId],
   );
-  const device = useMemo(
-    () => selectShownDevice(catalog, selectedImage, followedDeviceId),
-    [catalog, selectedImage, followedDeviceId],
+  const device = useMemo(() => selectShownDevice(catalog, selectedImage), [catalog, selectedImage]);
+  // Whose device runs each running image, for the picker.
+  const runningImages = useMemo(() => {
+    const owners = new Map<string, DeviceOwner>();
+    for (const candidate of catalog?.devices ?? []) {
+      if (isRunning(candidate)) {
+        owners.set(
+          pickerValue(candidate.platform, candidate.imageId),
+          deviceOwnerOf(candidate, rootThreadId),
+        );
+      }
+    }
+    return owners;
+  }, [catalog, rootThreadId]);
+  // Read at the moment of a pick, so the pane never re-renders for the store's other threads.
+  const rememberImage = useCallback(
+    (image: DeviceImageSelection) => {
+      useRightPanelStore.getState().setDeviceImage(threadRef, image);
+    },
+    [threadRef],
   );
-  const selectImage = useCallback((platform: DevicePlatform, imageId: string) => {
-    setPickedImage({ platform, imageId });
-  }, []);
+  const selectImage = useCallback(
+    (platform: DevicePlatform, imageId: string) => {
+      rememberImage({ platform, imageId });
+    },
+    [rememberImage],
+  );
 
   const reportFailure = useCallback(
-    (
-      result: AtomCommandResult<unknown, unknown>,
-      fallback: string,
-      platform: DevicePlatform | null = null,
-    ) => {
+    (result: AtomCommandResult<unknown, unknown>, fallback: string) => {
       if (result._tag !== "Failure" || !mountedRef.current || isAtomCommandInterrupted(result)) {
         return;
       }
-      setActionError({
-        ...describeDeviceError(squashAtomCommandFailure(result), fallback),
-        platform,
-      });
+      setActionError(describeDeviceError(squashAtomCommandFailure(result), fallback));
     },
     [],
   );
@@ -473,27 +620,47 @@ function DeviceSession({ environmentId }: { readonly environmentId: EnvironmentI
     else queue?.releaseAll();
   }, []);
 
+  // Discovery is cached for 30 s, so a device created meanwhile shows only once this reads it
+  // again; the catalog stream then carries the change.
+  const refreshDevices = async () => {
+    if (refreshing) return;
+    setRefreshing(true);
+    setActionError(null);
+    const result = await runRefresh({ environmentId, input: {} });
+    if (!mountedRef.current) return;
+    setRefreshing(false);
+    reportFailure(result, "Could not look for devices. Try again.");
+  };
   const start = async () => {
     if (selectedImage === null) return;
     const { platform, imageId } = selectedImage;
+    // Remembered first: until the catalog lists the new device, and after leaving the thread
+    // meanwhile, the pane comes back to this image.
+    rememberImage(selectedImage);
     setStartPending(true);
     setActionError(null);
-    const result = await runOpen({ environmentId, input: { platform, imageId } });
+    const result = await runOpen({
+      environmentId,
+      input: { platform, imageId, threadId: rootThreadId },
+    });
     if (!mountedRef.current) return;
     setStartPending(false);
-    if (result._tag === "Success") {
-      // The pick stays on the started image: until the catalog lists the new device, the
-      // fallbacks would select another platform's device or the first image.
-      setFollowedDeviceId(result.value.deviceId);
-      setPickedImage({ platform, imageId });
-      return;
-    }
-    reportFailure(result, "Could not start the device. Try again.", platform);
+    if (result._tag === "Failure") reportFailure(result, "Could not start the device. Try again.");
   };
   const stop = async (deviceId: string) => {
     setActionError(null);
     const result = await runClose({ environmentId, input: { deviceId } });
     if (result._tag === "Failure") reportFailure(result, "Could not stop the device. Try again.");
+  };
+  // Stopping another thread's device ends that task's session, and a boot takes minutes, so it
+  // asks first; this thread's device, or one nobody owns, stops at once.
+  const requestStop = (target: DeviceSnapshot) => {
+    const { threadId } = target;
+    if (threadId !== undefined && threadId !== rootThreadId) {
+      setConfirmStop({ ...target, threadId });
+      return;
+    }
+    void stop(target.deviceId);
   };
   const rotate = async (direction: RotateDirection) => {
     if (device === null || !device.canRotate) return;
@@ -569,7 +736,25 @@ function DeviceSession({ environmentId }: { readonly environmentId: EnvironmentI
 
   // With no platform able to open a device and nothing running, each platform says why.
   if (!catalog.platforms.some(opensImages) && !catalog.devices.some(isRunning)) {
-    return <UnavailablePlatforms platforms={catalog.platforms} />;
+    return (
+      <UnavailablePlatforms
+        platforms={catalog.platforms}
+        error={actionError?.message ?? null}
+        action={
+          catalog.platforms.length === 0 || !canRefresh ? null : (
+            <Button
+              size="xs"
+              variant="outline"
+              aria-busy={refreshing || undefined}
+              onClick={() => void refreshDevices()}
+            >
+              <RefreshCwIcon className={cn(refreshing && "animate-spin")} />
+              Refresh devices
+            </Button>
+          )
+        }
+      />
+    );
   }
 
   const shownAvailability =
@@ -583,47 +768,46 @@ function DeviceSession({ environmentId }: { readonly environmentId: EnvironmentI
       : null;
   const shownName =
     device === null ? null : imageDisplayName(catalog, device.platform, device.imageId);
-  // One device runs per platform; another image on that platform waits for it to stop.
-  const platformDevice =
-    selectedImage === null
-      ? null
-      : (catalog.devices.find(
-          (candidate) => isRunning(candidate) && candidate.platform === selectedImage.platform,
-        ) ?? null);
+  const nameOf = (candidate: DeviceSnapshot) =>
+    imageDisplayName(catalog, candidate.platform, candidate.imageId);
+  const runningCount = catalog.devices.filter(isRunning).length;
   const androidOnly = catalog.platforms.every((listed) => listed.platform === "android");
+  // Nothing is selected although images are listed: every one of them runs.
+  const everyImageRunning =
+    selectedImage === null &&
+    catalog.platforms.some(
+      (listed) =>
+        opensImages(listed) && listed.images.some((entry) => entry.inUseElsewhere !== true),
+    );
   const startDisabledReason =
     selectedImage === null
-      ? androidOnly
-        ? DEVICE_DISABLED_REASONS.noAvd
-        : DEVICE_DISABLED_REASONS.noImage
+      ? everyImageRunning
+        ? DEVICE_DISABLED_REASONS.pickFirst
+        : androidOnly
+          ? DEVICE_DISABLED_REASONS.noAvd
+          : DEVICE_DISABLED_REASONS.noImage
       : startPending
         ? DEVICE_DISABLED_REASONS.starting
-        : platformDevice === null
-          ? null
-          : platformDevice.state === "stopping"
-            ? DEVICE_DISABLED_REASONS.stopping
-            : DEVICE_DISABLED_REASONS.running;
-  const otherDevice = device === null ? platformDevice : null;
-  const otherName =
-    otherDevice === null
-      ? null
-      : imageDisplayName(catalog, otherDevice.platform, otherDevice.imageId);
-
-  // A device limit names the running device by display name, which may not match the catalog;
-  // the device to stop is the one running on the platform the start was for.
-  const runningName = actionError?.runningName ?? null;
-  const limitPlatform = actionError?.platform ?? null;
-  const limitDevice =
-    runningName === null || limitPlatform === null
-      ? null
-      : (catalog.devices.find(
-          (candidate) => isRunning(candidate) && candidate.platform === limitPlatform,
-        ) ?? null);
+        : device?.state === "stopping"
+          ? DEVICE_DISABLED_REASONS.stopping
+          : device?.state === "ready"
+            ? DEVICE_DISABLED_REASONS.alreadyRunning
+            : device !== null && isRunning(device)
+              ? DEVICE_DISABLED_REASONS.starting
+              : runningCount >= MAX_RUNNING_DEVICES
+                ? DEVICE_DISABLED_REASONS.limit
+                : null;
+  // Another thread's device, live or ended, says whose it is.
+  const shownOwner = device === null ? null : deviceOwnerOf(device, rootThreadId);
+  // A refused start offers to stop each device that can stop, read from the catalog.
+  const limitDevices = actionError?.limit === true ? catalog.devices.filter(isStoppable) : [];
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <DeviceToolbar
+        environmentId={environmentId}
         platforms={catalog.platforms}
+        runningImages={runningImages}
         selectedImage={selectedImage}
         selectedName={
           selectedImage === null
@@ -635,16 +819,26 @@ function DeviceSession({ environmentId }: { readonly environmentId: EnvironmentI
         pickerLocked={startPending}
         viewOnly={inputDisabledReason !== null}
         rotating={device !== null && rotatingDeviceIds.has(device.deviceId)}
+        refreshing={refreshing}
         onSelectImage={selectImage}
+        onRefresh={canRefresh ? () => void refreshDevices() : null}
         onStart={() => void start()}
         onStop={() => {
-          if (device !== null) void stop(device.deviceId);
+          if (device !== null) requestStop(device);
         }}
         onRotate={(direction) => void rotate(direction)}
         onKey={pressKey}
         onPaste={() => void pasteClipboard()}
         stillImages={device?.state === "ready" ? stillImages : null}
       />
+      {shownOwner?.kind !== "thread" ? null : (
+        <div
+          data-device-owner
+          className="border-b border-border/60 px-3 py-1.5 text-xs text-muted-foreground"
+        >
+          <DeviceStartedIn environmentId={environmentId} threadId={shownOwner.threadId} />
+        </div>
+      )}
       {actionError === null ? null : (
         <div
           role="alert"
@@ -652,11 +846,16 @@ function DeviceSession({ environmentId }: { readonly environmentId: EnvironmentI
         >
           <TriangleAlertIcon aria-hidden className="size-3.5 shrink-0" />
           <span className="min-w-0 flex-1">{actionError.message}</span>
-          {limitDevice === null ? null : (
-            <Button size="xs" variant="outline" onClick={() => void stop(limitDevice.deviceId)}>
-              Stop {runningName}
+          {limitDevices.map((candidate) => (
+            <Button
+              key={candidate.deviceId}
+              size="xs"
+              variant="outline"
+              onClick={() => requestStop(candidate)}
+            >
+              Stop {nameOf(candidate)}
             </Button>
-          )}
+          ))}
           {actionError.disabled ? <OpenSettingsButton environmentId={environmentId} /> : null}
           <Button size="xs" variant="ghost" onClick={() => setActionError(null)}>
             Dismiss
@@ -716,32 +915,24 @@ function DeviceSession({ environmentId }: { readonly environmentId: EnvironmentI
             onStillImages={setStillImages}
           />
         ) : device === null ? (
-          otherDevice !== null && otherName !== null ? (
-            <PanelMessage
-              action={
-                <Button
-                  size="xs"
-                  variant="outline"
-                  onClick={() => setPickedImage(selectionOf(otherDevice))}
-                >
-                  Show {otherName}
-                </Button>
-              }
-            >
-              {otherName} is running. Stop it to start another device.
-            </PanelMessage>
-          ) : (
-            <PanelMessage>
-              {selectedImage !== null
-                ? "Pick a device and press Start."
+          <PanelMessage>
+            {selectedImage !== null
+              ? "Pick a device and press Start."
+              : everyImageRunning
+                ? EVERY_DEVICE_RUNNING_MESSAGE
                 : androidOnly
-                  ? "Create a virtual device in Android Studio's Device Manager, then come back."
+                  ? canRefresh
+                    ? "Create a virtual device in Android Studio's Device Manager, then choose Refresh devices."
+                    : "Create a virtual device in Android Studio's Device Manager, then come back."
                   : "No device can start on this server yet."}
-            </PanelMessage>
-          )
+          </PanelMessage>
         ) : device.state === "failed" ? (
           <PanelMessage title={deviceStateLabel(device)}>
             Press Start to try again, or pick another device.
+          </PanelMessage>
+        ) : device.state === "stopped" ? (
+          <PanelMessage title={stoppedTitle(shownName ?? device.imageId)}>
+            {shownOwner?.kind === "thread" ? STOPPED_START_HINT : STOPPED_RESTART_HINT}
           </PanelMessage>
         ) : device.state === "stopping" ? (
           <PanelMessage>Stopping {shownName}…</PanelMessage>
@@ -749,6 +940,18 @@ function DeviceSession({ environmentId }: { readonly environmentId: EnvironmentI
           <PanelMessage>Starting {shownName}. The first boot can take a few minutes.</PanelMessage>
         )}
       </div>
+      {confirmStop === null ? null : (
+        <StopOtherThreadsDevice
+          environmentId={environmentId}
+          device={confirmStop}
+          name={nameOf(confirmStop)}
+          onCancel={() => setConfirmStop(null)}
+          onStop={() => {
+            setConfirmStop(null);
+            void stop(confirmStop.deviceId);
+          }}
+        />
+      )}
     </div>
   );
 }

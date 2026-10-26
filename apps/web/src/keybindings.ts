@@ -32,6 +32,8 @@ export interface ShortcutMatchContext {
   terminalOpen: boolean;
   previewFocus: boolean;
   previewOpen: boolean;
+  /** Focus is in a chat surface (its timeline, composer or find bar), or nowhere. */
+  chatFocus: boolean;
   [key: string]: boolean;
 }
 
@@ -123,6 +125,7 @@ function resolveContext(options: ShortcutMatchOptions | undefined): ShortcutMatc
     terminalOpen: false,
     previewFocus: false,
     previewOpen: false,
+    chatFocus: false,
     ...options?.context,
   };
 }
@@ -266,6 +269,132 @@ export function shortcutLabelForCommand(
   const platform = resolvePlatform(resolvedOptions);
   const shortcut = findEffectiveShortcutForCommand(keybindings, command, resolvedOptions);
   return shortcut ? formatShortcutLabel(shortcut, platform) : null;
+}
+
+/**
+ * Find in thread's built-in key. It is not a shipped rule: an older client cannot decode a
+ * command it does not know, and users who saved a keybinding never receive new defaults.
+ */
+const CHAT_FIND_FALLBACK_SHORTCUT: KeybindingShortcut = {
+  key: "f",
+  metaKey: false,
+  ctrlKey: false,
+  shiftKey: false,
+  altKey: false,
+  modKey: true,
+};
+
+/** Mod+F with no other modifier. */
+export function isChatFindFallbackShortcut(
+  event: ShortcutEventLike,
+  platform = navigator.platform,
+): boolean {
+  return matchesShortcut(event, CHAT_FIND_FALLBACK_SHORTCUT, platform);
+}
+
+function keybindingsNameChatFind(keybindings: ResolvedKeybindingsConfig): boolean {
+  return keybindings.some((binding) => binding.command === "chat.find");
+}
+
+/**
+ * Whether a keydown opens Find in thread: a rule that resolves to `chat.find`, or the built-in
+ * Mod+F inside a chat surface when no rule claimed the key and none names `chat.find`.
+ */
+export function shouldOpenChatFind(
+  command: KeybindingCommand | null,
+  event: ShortcutEventLike,
+  keybindings: ResolvedKeybindingsConfig,
+  context: Pick<ShortcutMatchContext, "chatFocus">,
+  platform = navigator.platform,
+): boolean {
+  if (command === "chat.find") return true;
+  if (command !== null) return false;
+  return (
+    context.chatFocus &&
+    !keybindingsNameChatFind(keybindings) &&
+    isChatFindFallbackShortcut(event, platform)
+  );
+}
+
+/** The key that opens Find in thread: a rule's, or the built-in Mod+F. */
+export function chatFindShortcutLabel(
+  keybindings: ResolvedKeybindingsConfig,
+  platform = navigator.platform,
+): string | null {
+  if (keybindingsNameChatFind(keybindings)) {
+    return shortcutLabelForCommand(keybindings, "chat.find", {
+      platform,
+      context: { chatFocus: true },
+    });
+  }
+  return formatShortcutLabel(CHAT_FIND_FALLBACK_SHORTCUT, platform);
+}
+
+type DiffChangeCommand = "diff.nextChange" | "diff.previousChange";
+
+/**
+ * Built-in F7 and Shift+F7 for Compare's change steps, for the same reason as Mod+F: a shipped
+ * default naming these commands would stop an older client from decoding the server's rules.
+ */
+const DIFF_CHANGE_FALLBACK_SHORTCUTS: Record<DiffChangeCommand, KeybindingShortcut> = {
+  "diff.nextChange": {
+    key: "f7",
+    metaKey: false,
+    ctrlKey: false,
+    shiftKey: false,
+    altKey: false,
+    modKey: false,
+  },
+  "diff.previousChange": {
+    key: "f7",
+    metaKey: false,
+    ctrlKey: false,
+    shiftKey: true,
+    altKey: false,
+    modKey: false,
+  },
+};
+
+function keybindingsName(keybindings: ResolvedKeybindingsConfig, command: KeybindingCommand) {
+  return keybindings.some((binding) => binding.command === command);
+}
+
+/**
+ * The Compare change step a keydown asks for: a rule's step, or the built-in key of a step no
+ * rule names, when no rule claimed the key for another command.
+ */
+export function diffChangeCommandForEvent(
+  command: KeybindingCommand | null,
+  event: ShortcutEventLike,
+  keybindings: ResolvedKeybindingsConfig,
+  platform = navigator.platform,
+): DiffChangeCommand | null {
+  if (command === "diff.nextChange" || command === "diff.previousChange") return command;
+  if (command !== null) return null;
+  for (const step of ["diff.nextChange", "diff.previousChange"] as const) {
+    if (
+      !keybindingsName(keybindings, step) &&
+      matchesShortcut(event, DIFF_CHANGE_FALLBACK_SHORTCUTS[step], platform)
+    ) {
+      return step;
+    }
+  }
+  return null;
+}
+
+/** The key for a Compare change step: a rule's, or the built-in F7 or Shift+F7. */
+export function diffChangeShortcutLabel(
+  keybindings: ResolvedKeybindingsConfig,
+  command: DiffChangeCommand,
+  platform = navigator.platform,
+): string | null {
+  if (keybindingsName(keybindings, command)) {
+    return shortcutLabelForCommand(keybindings, command, {
+      platform,
+      context: { diffFocus: true },
+    });
+  }
+  return formatShortcutLabel(DIFF_CHANGE_FALLBACK_SHORTCUTS[command], platform);
 }
 
 export function threadJumpCommandForIndex(index: number): ThreadJumpKeybindingCommand | null {

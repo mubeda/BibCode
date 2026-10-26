@@ -1,6 +1,6 @@
 import { environmentRpcKey } from "@bibcode/client-runtime/state/runtime";
 import type { EnvironmentId } from "@bibcode/contracts";
-import { FRESH_MS } from "./visibleRefresh.logic";
+import { FRESH_MS } from "../repositoryModule/visibleRefresh.logic";
 
 export const HOVER_PREFETCH_MS = 150;
 export const MAX_HOVER_PREFETCHES = 2;
@@ -30,7 +30,7 @@ export function prefetchGate(environmentId: string) {
   return gate;
 }
 
-export type PrefetchedRead = "get" | "getTimeline";
+export type PrefetchedRead = "get" | "getTimeline" | "pipelines.get";
 
 const prefetchedAt = new Map<string, number>();
 

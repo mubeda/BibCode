@@ -50,6 +50,43 @@ describe("ClientSettings Pull Requests", () => {
   });
 });
 
+describe("ClientSettings Pipelines", () => {
+  it("enables the module by default, apart from Pull Requests, and preserves an opt-out", () => {
+    expect(decodeClientSettings({}).pipelinesEnabled).toBe(true);
+    expect(DEFAULT_CLIENT_SETTINGS.pipelinesEnabled).toBe(true);
+    expect(decodeClientSettings({ pipelinesEnabled: false })).toMatchObject({
+      pipelinesEnabled: false,
+      pullRequestsEnabled: true,
+    });
+  });
+
+  it("patches the preference without resetting an omitted value", () => {
+    expect(decodeClientSettingsPatch({ pipelinesEnabled: false })).toMatchObject({
+      pipelinesEnabled: false,
+    });
+    expect(decodeClientSettingsPatch({})).not.toHaveProperty("pipelinesEnabled");
+    expect(() => decodeClientSettingsPatch({ pipelinesEnabled: "no" })).toThrow();
+  });
+});
+
+describe("ClientSettings Activity button", () => {
+  it("keeps the Activity button visible by default, also for settings stored without the key", () => {
+    expect(decodeClientSettings({}).activityDockAlwaysVisible).toBe(true);
+    expect(DEFAULT_CLIENT_SETTINGS.activityDockAlwaysVisible).toBe(true);
+    expect(decodeClientSettings({ wordWrap: false }).activityDockAlwaysVisible).toBe(true);
+    expect(
+      decodeClientSettings({ activityDockAlwaysVisible: false }).activityDockAlwaysVisible,
+    ).toBe(false);
+  });
+
+  it("patches the preference without resetting an omitted value", () => {
+    expect(decodeClientSettingsPatch({ activityDockAlwaysVisible: false })).toMatchObject({
+      activityDockAlwaysVisible: false,
+    });
+    expect(decodeClientSettingsPatch({})).not.toHaveProperty("activityDockAlwaysVisible");
+  });
+});
+
 describe("ClientSettings repository sort order", () => {
   it("sorts repositories by name by default and keeps an explicit choice", () => {
     expect(decodeClientSettings({}).sidebarRepositorySortOrder).toBe("name");
@@ -301,6 +338,79 @@ describe("ClientSettings terminal theme", () => {
   });
 });
 
+describe("ClientSettings Diff panel", () => {
+  it("defaults to Changes, Stacked, All lines and three context lines", () => {
+    expect(decodeClientSettings({})).toMatchObject({
+      diffViewMode: "changes",
+      diffRenderMode: "stacked",
+      diffCompareLines: "all",
+      diffCompareContextLines: 3,
+    });
+    expect(DEFAULT_CLIENT_SETTINGS.diffViewMode).toBe("changes");
+  });
+
+  it("keeps explicit choices and recovers malformed or out-of-range values", () => {
+    expect(
+      decodeClientSettings({
+        diffViewMode: "compare",
+        diffRenderMode: "split",
+        diffCompareLines: "changes",
+        diffCompareContextLines: 7,
+      }),
+    ).toMatchObject({
+      diffViewMode: "compare",
+      diffRenderMode: "split",
+      diffCompareLines: "changes",
+      diffCompareContextLines: 7,
+    });
+    for (const diffCompareContextLines of [-1, 100, 2.5, "7"]) {
+      expect(decodeClientSettings({ diffCompareContextLines, wordWrap: false })).toMatchObject({
+        diffCompareContextLines: 3,
+        wordWrap: false,
+      });
+    }
+    expect(
+      decodeClientSettings({
+        diffViewMode: "review",
+        diffRenderMode: "over-under",
+        diffCompareLines: "same",
+      }),
+    ).toMatchObject({
+      diffViewMode: "changes",
+      diffRenderMode: "stacked",
+      diffCompareLines: "all",
+    });
+  });
+
+  it("patches each preference on its own", () => {
+    const contextOnly = decodeClientSettingsPatch({ diffCompareContextLines: 0 });
+    expect(contextOnly).toMatchObject({ diffCompareContextLines: 0 });
+    expect(contextOnly).not.toHaveProperty("diffViewMode");
+    expect(contextOnly).not.toHaveProperty("diffRenderMode");
+    expect(contextOnly).not.toHaveProperty("diffCompareLines");
+    expect(decodeClientSettingsPatch({ diffViewMode: "compare" })).toMatchObject({
+      diffViewMode: "compare",
+    });
+    expect(() => decodeClientSettingsPatch({ diffCompareContextLines: 100 })).toThrow();
+    expect(() => decodeClientSettingsPatch({ diffRenderMode: "unified" })).toThrow();
+  });
+
+  it("remembers the last diff app chosen, and forgets a malformed one", () => {
+    expect(decodeClientSettings({}).diffToolLastChoice).toBeNull();
+    expect(decodeClientSettings({ diffToolLastChoice: "bc4" }).diffToolLastChoice).toBe("bc4");
+    for (const diffToolLastChoice of ["--extcmd=sh", "", 3]) {
+      expect(decodeClientSettings({ diffToolLastChoice, wordWrap: false })).toMatchObject({
+        diffToolLastChoice: null,
+        wordWrap: false,
+      });
+    }
+    expect(decodeClientSettingsPatch({ diffToolLastChoice: "meld" })).toMatchObject({
+      diffToolLastChoice: "meld",
+    });
+    expect(() => decodeClientSettingsPatch({ diffToolLastChoice: "-x" })).toThrow();
+  });
+});
+
 describe("ClientSettings word wrap", () => {
   it("defaults word wrap on", () => {
     expect(decodeClientSettings({}).wordWrap).toBe(true);
@@ -315,6 +425,19 @@ describe("ClientSettings word wrap", () => {
     expect(decoded.wordWrap).toBe(true);
     expect(decoded).not.toHaveProperty("chatWordWrap");
     expect(decoded).not.toHaveProperty("diffWordWrap");
+  });
+});
+
+describe("ClientSettings verbose chat", () => {
+  it("defaults verbose chat off, including stored settings written before the key", () => {
+    expect(decodeClientSettings({}).verboseChat).toBe(false);
+    expect(decodeClientSettings({ wordWrap: false }).verboseChat).toBe(false);
+    expect(DEFAULT_UNIFIED_SETTINGS.verboseChat).toBe(false);
+  });
+
+  it("decodes a stored choice and a patch", () => {
+    expect(decodeClientSettings({ verboseChat: true }).verboseChat).toBe(true);
+    expect(decodeClientSettingsPatch({ verboseChat: true }).verboseChat).toBe(true);
   });
 });
 

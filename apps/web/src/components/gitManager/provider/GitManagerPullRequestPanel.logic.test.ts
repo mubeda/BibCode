@@ -490,6 +490,29 @@ describe("create pull request progress", () => {
     );
   });
 
+  it("names a branch or commit failure in a combined commit and create (#174)", () => {
+    const commitFailed = run([
+      { ...base, kind: "action_started", phases: ["branch", "commit", "push", "pr"] },
+      { ...base, kind: "phase_started", phase: "branch", label: "Creating branch" },
+      { ...base, kind: "phase_started", phase: "commit", label: "Committing" },
+      { ...base, kind: "action_failed", phase: "commit", message: "pre-commit hook failed" },
+    ]);
+    expect(presentCreatePullRequestProgress(commitFailed, review)).toMatchObject({
+      status: "Commit failed: pre-commit hook failed",
+      tone: "error",
+      primaryLabel: "Retry",
+    });
+
+    const branchFailed = run([
+      { ...base, kind: "action_started", phases: ["branch", "commit", "push", "pr"] },
+      { ...base, kind: "phase_started", phase: "branch", label: "Creating branch" },
+      { ...base, kind: "action_failed", phase: "branch", message: "branch already exists" },
+    ]);
+    expect(presentCreatePullRequestProgress(branchFailed, review).status).toBe(
+      "Creating the branch failed: branch already exists",
+    );
+  });
+
   it("reports an existing pull request without creating another", () => {
     const existing = run([
       { ...base, kind: "action_started", phases: ["push", "pr"] },

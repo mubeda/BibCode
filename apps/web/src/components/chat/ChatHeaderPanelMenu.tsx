@@ -18,6 +18,7 @@ import {
   MenuTrigger,
 } from "../ui/menu";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
+import { selectClosedChatPanels } from "./ChatHeaderPanelMenu.logic";
 import { ProviderInstanceIcon } from "./ProviderInstanceIcon";
 import { buildProviderAgentActions } from "./providerAgentActions";
 import type { ProviderTerminalAction } from "./providerTerminalActions";
@@ -40,8 +41,7 @@ interface ChatHeaderPanelMenuProps {
   readonly unavailableReason?: string | null;
 }
 
-const PANEL_UNAVAILABLE_REASON = "Available once this thread has started.";
-const MAX_CLOSED_CHATS = 10;
+export const PANEL_UNAVAILABLE_REASON = "Available once this thread has started.";
 
 function DisabledReasonTooltip(props: { reason: string; trigger: ReactElement }) {
   return (
@@ -50,6 +50,26 @@ function DisabledReasonTooltip(props: { reason: string; trigger: ReactElement })
       <TooltipPopup side="top">{props.reason}</TooltipPopup>
     </Tooltip>
   );
+}
+
+/**
+ * The host's closed chat panels, read from its environment's archived threads. Call it from
+ * inside a menu popup, so archived threads are read only while the menu is open.
+ */
+export function useClosedChatPanels(environmentId: EnvironmentId, hostThreadId: ThreadId) {
+  const environmentIds = useMemo(() => [environmentId], [environmentId]);
+  const { snapshots, isLoading, error, refresh } = useArchivedThreadSnapshots(environmentIds);
+  const threads = snapshots[0]?.snapshot.threads;
+  const closedChats = useMemo(
+    () => selectClosedChatPanels(threads ?? [], hostThreadId),
+    [hostThreadId, threads],
+  );
+  return { closedChats, isLoading, error, refresh };
+}
+
+/** The label a closed chat's tab and row show. */
+export function closedChatLabel(title: string): string {
+  return panelProviderLabel(title) ?? title;
 }
 
 /**
@@ -62,18 +82,10 @@ function ReopenClosedChatMenu(props: {
   disabledReason: string | null;
   onReopen: (threadId: ThreadId, providerLabel: string) => void;
 }) {
-  const environmentIds = useMemo(() => [props.environmentId], [props.environmentId]);
-  const { snapshots, isLoading, error, refresh } = useArchivedThreadSnapshots(environmentIds);
-  const closedChats = (snapshots[0]?.snapshot.threads ?? [])
-    .flatMap((thread) =>
-      thread.kind === "panel" &&
-      thread.hostThreadId === props.hostThreadId &&
-      thread.archivedAt !== null
-        ? [{ ...thread, archivedAt: thread.archivedAt }]
-        : [],
-    )
-    .toSorted((left, right) => right.archivedAt.localeCompare(left.archivedAt))
-    .slice(0, MAX_CLOSED_CHATS);
+  const { closedChats, isLoading, error, refresh } = useClosedChatPanels(
+    props.environmentId,
+    props.hostThreadId,
+  );
   const available = props.disabledReason === null && closedChats.length > 0;
   if (props.disabledReason === null && closedChats.length === 0 && error !== null) {
     // An empty list here would hide closed chats that exist; offer a retry instead.
@@ -115,7 +127,7 @@ function ReopenClosedChatMenu(props: {
       {available ? (
         <MenuSubPopup className="min-w-52">
           {closedChats.map((thread) => {
-            const label = panelProviderLabel(thread.title) ?? thread.title;
+            const label = closedChatLabel(thread.title);
             return (
               <MenuItem key={thread.id} onClick={() => props.onReopen(thread.id, label)}>
                 <span className="truncate">{label}</span>

@@ -116,6 +116,49 @@ workspace meter can therefore explain that Codex compacts context automatically
 when needed, while still showing the current active usage and maximum
 independently.
 
+## Compaction and retries
+
+Codex compacts the conversation on its own as the context fills. To compact on
+demand, send `/compact` (it is in the `/` menu): BiBCode asks Codex for
+`thread/compact/start` on the thread instead of sending the text to the model.
+Codex runs the compaction as a turn of its own, and the work log shows it as a
+**Conversation compaction** step while it runs, whether Codex or you started it.
+Codex takes no instructions for a compaction, so `/compact` followed by text is
+sent as an ordinary message. A `/compact` steered into a running turn is
+refused and waits in the queue until that turn ends.
+
+A turn that fails because the conversation no longer fits the model's context
+window (`codexErrorInfo: contextWindowExceeded`) says that Codex ran out of
+context and offers **Compact conversation**, which sends `/compact`. BiBCode
+never resends the failed message itself.
+
+While Codex retries an upstream failure (an `error` notification with
+`willRetry: true`), the work log shows a warning such as "Codex is retrying
+after an upstream error: …". A failure Codex does not retry ends the turn as
+before.
+
+A compaction carries no user message, so restart recovery cannot find it in
+the thread: if BiBCode stops between Codex accepting `/compact` and BiBCode
+recording that, the compaction is sent again after the restart.
+
+These shapes come from the schema that `codex app-server generate-json-schema`
+writes for the supported Codex version (0.164.0); the excerpts BiBCode's tests
+read are in `apps/server/tests/fixtures/codex`.
+
+## Reasoning summaries
+
+The root thread's reasoning summaries show in the chat as collapsed **Thought**
+rows, one per reasoning item (see the
+[Workspace UI](../user/workspace-ui.md#reading-the-timeline)). Each
+`item/reasoning/summaryTextDelta` streams into its item's row, and a part after
+the first starts after a blank line. The item's `item/completed` carries the
+whole `summary[]`, joined the same way, and replaces what streamed, so a stream
+that lost or cut parts still ends with the complete summary; a summary that
+streamed nothing is shown from its completion. Raw reasoning
+(`item/reasoning/textDelta`, an item's `content[]`) is never shown or stored.
+BiBCode sends no `summary` setting, so Codex's own `model_reasoning_summary`
+applies. The Subagents surface keeps its own **Reasoning summary** entries.
+
 ## Steering a running turn
 
 While Codex is working, Enter adds a queued message. **Steer** on the first
@@ -163,13 +206,29 @@ events for live activity and feature-detects optional reconciliation methods suc
 as descendant-thread, history, and background-terminal discovery. Unsupported
 methods degrade the affected activity view instead of inventing data.
 
+Chats and observed provider terminals both initialize the App Server with
+`capabilities.experimentalApi: true`. `thread/backgroundTerminals/list` is
+experimental in the
+[App Server protocol](https://github.com/openai/codex/blob/main/codex-rs/app-server-protocol/src/protocol/common.rs),
+as are `thread/backgroundTerminals/terminate`, `thread/backgroundTerminals/clean`,
+and `thread/items/read`; see the
+[App Server README](https://github.com/openai/codex/blob/main/codex-rs/app-server/README.md).
+The `subAgentActivity` item was experimental-only in Codex 0.163 and is part of
+the stable schema (`codex app-server generate-json-schema`) from 0.164.0.
+Without the experimental API, background-terminal discovery is the part that
+degrades.
+BiBCode lists background terminals but never terminates or cleans them, so
+Activity offers no Stop for a Codex background terminal.
+
 BiBCode accepts validated `subAgentActivity` items as bounded child-discovery
 hints and direct-reads those child thread IDs: thread metadata from
 `thread/read` without turns, then the newest 20 turns from
 `thread/turns/list`. This remains effective when an
 App Server version, including Codex 0.146, omits spawned children from
 `thread/list`; listing remains enabled as a complementary discovery source for
-versions that expose it. Malformed or out-of-scope hints are ignored. When read
+versions that expose it. That omission was last measured on 0.146; later
+releases, whose `thread/list` filters by source and working directory, have not
+been re-measured. Malformed or out-of-scope hints are ignored. When read
 and list methods are incompatible, recovery capabilities downgrade truthfully
 without disabling ordinary chat. Only a missing-method answer counts as
 incompatible: a large or undecodable reply to any reconciliation method is a

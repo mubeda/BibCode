@@ -157,8 +157,14 @@ elsewhere it stays visible but disabled, with a note explaining that a new
 branch will be created from it through the server's safe suffixed-branch flow.
 If the branch list fails to load, the dialog says so and a typed name still
 creates a new branch. Edited names are preserved. Typing an exact local
-or remote branch selects that ref without repeating the same value as a result
-row below the input. If the chosen remote branch becomes local before submit,
+or remote branch selects that ref and hides the result rows below the input.
+Picking a row fills the field with that branch, which closes the list the same
+way; editing the field clears the choice and brings the rows back. In Smart, a
+field that exactly names a branch is that branch even when the name is a number
+such as `2026`; type `#2026` for the GitHub item instead. The field is
+the choice, so it survives reopening the dialog for the same project and
+switching between Smart and Branch; opening the dialog for another project
+clears it. If the chosen remote branch becomes local before submit,
 the server reuses it when free and still suffixes it when another worktree owns
 it.
 
@@ -218,8 +224,10 @@ has been added and opened.
 Clicking a project header selects it and toggles its thread list; the header
 stays highlighted as the selected node until you open a thread, and it is also
 highlighted while that project's Git Manager or Pull Requests route is open.
-Hovering or focusing a header shows **⋯** (project actions), **+** (New
-worktree), **Git Manager** and, when enabled, **Pull Requests**.
+Every header always shows **⋯** (project actions), **+** (New worktree),
+**Git Manager** and, when enabled, **Pull Requests**. In the
+Repositories view **Pull Requests** sits on the repository row instead, since
+pull requests belong to the repository, not to one environment's checkout.
 
 Menus separate their groups:
 
@@ -339,10 +347,13 @@ recently active imported thread and reports how many sessions were imported or
 skipped and why.
 
 A session imported earlier shows **Already imported** with **Open**; importing
-it again does nothing. Conversations started in BiBCode, sessions run in a
-subfolder, and sessions run in another worktree are not listed. Only the
+it again does nothing, and **Open** on a session continued from History shows
+its host thread with that chat panel active. Conversations started in BiBCode,
+sessions run in a subfolder, and sessions run in a worktree are not listed:
+sessions run in a worktree are in that worktree thread's History. Only the
 default Claude Code and Codex providers are scanned, and a provider turned off
-in settings is skipped.
+in settings is skipped. Titles are the name you gave a Claude Code session
+with `/rename` (or the one Claude generated), else its first prompt.
 
 ## Center Panel
 
@@ -379,6 +390,31 @@ the host thread deletes its chat panels, open or closed. A new chat panel's tab 
 **Opening chat…** until the server confirms the panel thread; if creation fails,
 the tab closes and a **Failed to open chat panel** toast gives the reason.
 
+The composer's **History** button (left of **Attach files**) brings back
+earlier work for the thread, in a chat panel's composer too, where it acts for
+the host thread:
+
+- **This thread** lists the same closed chat panels as **Reopen closed chat**;
+  choosing one reopens it as the active tab.
+- **Claude Code terminal** lists the Claude Code sessions run in a terminal in
+  this thread's folder (its worktree, or the project root) in the last 30 days,
+  newest first, with their branch. **Continue** opens a session as a chat
+  panel of this thread, in its branch, worktree and permission mode, and your
+  next message continues the same conversation. When the session may still be
+  open in a terminal, when its earlier chat was deleted, or when Claude Code
+  refused to continue it here, the row offers **Continue in a copy** instead,
+  which leaves the terminal's conversation untouched. A session you already
+  continued shows **Open**. The row shows **Opening…** until its panel opens;
+  if it can't, a **Couldn't open the session** toast gives the reason and the
+  list reloads. See [Claude](../providers/claude.md#terminal-sessions-in-history).
+
+History lists only sessions run on the thread's own server: for a remote
+environment, its empty state says so. A server too old to list them asks to be
+updated. The button is disabled, with the reason in its tooltip, until the
+thread has started, while its environment is not connected, while its
+workspace is unavailable, and for a connection that can only view threads. The
+approval footer shows no History button.
+
 Tabs persist across reloads. The host chat remains mounted while another center
 tab is active, so its transcript, scroll state, and composer state are preserved.
 
@@ -405,10 +441,111 @@ terminal session. Inside a terminal, `Shift+Enter` sends a soft newline (ESC CR)
 so Codex and Claude Code prompts insert a line break instead of submitting;
 plain `Enter` still submits.
 
+Terminals do not inherit tmux, screen, or Zellij session variables from the
+environment BiBCode was started in, so a shell started there does not treat
+itself as running inside that multiplexer. fish starts with `no-query-term`
+added to `fish_features`, so it does not pause at startup waiting for a
+terminal reply. fish features that need those replies stay off, and because
+the variable is exported, flags you set with `set -U fish_features` are hidden.
+To keep your flags, or to turn the queries back on with `query-term`, set
+`fish_features` in the environment that starts BiBCode (a shell export only
+applies when BiBCode is launched from that shell).
+
 Project script actions run in a visible center terminal. They reuse the focused
 idle center terminal when possible and otherwise open a new center terminal.
 The retired bottom terminal drawer and its bottom-toolbar toggle no longer
 exist.
+
+A ` ```mermaid ` block in a chat message, a plan, or a Markdown file's rendered
+view draws as a diagram once its closing fence has arrived; while a reply is
+still writing it, the block shows its source. The diagram stays in the code
+block's card: **Copy** copies its source, and **Show source** switches between
+the diagram and its highlighted source (line wrap is offered with the source).
+Selecting text inside a diagram and copying it copies the whole fenced source.
+Diagrams follow the light or dark theme; colors set in the diagram with `style`
+or `classDef` are kept, while Mermaid theme directives are not applied. An
+invalid diagram keeps its source and says what is wrong, with the line; a
+diagram over 25,000 characters or 500 edges says it is too large to draw; and
+if the diagram renderer cannot be loaded, **Retry** tries again. Diagrams do
+not open links or load images. A diagram that draws above the line you are
+reading in the chat does not move that line.
+
+### Reading the timeline
+
+A finished turn folds its commentary and tool calls behind a **Worked for**
+row, leaving its answer visible; click the row to open the turn. A run of tool
+calls shows its newest call with a **+N previous tool calls** row, and a tool
+call opens to its command, output, and changed files when clicked. Hover or
+focus a tool call or a **Worked for** row to see its time.
+
+The provider's reasoning (Claude's thinking, Codex's reasoning summaries) shows
+as one collapsed line among the tool calls, in the order it happened:
+**Thought - <what it is about>**, or **Thinking - …** while the provider is still
+thinking. Click the line, or focus it and press Enter or Space, to read the whole
+thought; while it streams, the open thought follows its newest text until you
+scroll up in it. A finished turn's thoughts fold under **Worked for** with its
+tool calls, and a hidden run that includes a thought reads **+N previous steps**.
+A thought is never shown as the turn's answer. Providers that send no thinking
+text (Claude models from Opus 4.7 on, when the Claude CLI cannot ask for
+summaries) show no thought rows.
+
+**Settings → General → Verbose chat** (off by default) opens finished turns:
+each **Worked for** row starts open, each run of tool calls shows every call
+above a **Show fewer tool calls** row, and each tool call starts open to its
+output. Thoughts open the same way tool calls do. One click on a **Worked for**
+row folds that turn again, and one click on **Show fewer tool calls** or a tool
+call collapses it. The turn still running
+looks the same either way until it finishes. A turn you fold stays folded when
+the next turn starts; each choice, like an opened tool call, long message, plan,
+or details block, holds while you scroll and until you switch threads or reload.
+The setting applies to open threads at once and is stored on this device.
+
+With a mouse or trackpad, a thread with two or more of your messages shows a
+minimap at the timeline's left edge, one mark per message. Hover it to preview
+a turn and click to jump there. **Previous turn** and **Next turn** above and
+below it step to the nearest turn start above or below where you are reading;
+partway through a turn, **Previous turn** returns to that turn's start. At the
+start or end of the thread the button in that direction is dimmed and does
+nothing.
+
+PageUp and PageDown in the composer scroll the timeline by about a screen, so
+you can read back without leaving the draft. While the key can still move the
+caret to another line of a multi-line draft, it moves the caret instead:
+PageUp scrolls once the caret is on the first line, PageDown once it is on the
+last. A long paragraph's wrapped lines count as lines. With text selected, or
+with Shift, Alt, Ctrl, or Cmd held, the keys keep their usual meaning.
+These keys and the minimap jump instead of scrolling smoothly when the system
+asks for reduced motion.
+
+### Finding text in a chat
+
+Press **Mod+F** (Cmd+F on macOS, Ctrl+F elsewhere) in a chat, or choose **Find
+in thread** in the command palette, to open the find bar at the top right of the
+timeline. It searches the whole thread as it reads on screen: your messages,
+replies, proposed plans, and tool commands, including queued messages. Link
+text counts but not its URL, a file link counts by its chip label, and a skill
+by its name. Matching ignores case and treats any whitespace as a space; a match
+never spans two paragraphs, list items, or table cells.
+
+The bar shows the selected match and the total, such as **3/17**. **Enter** or
+**Next** goes to the next match and **Shift+Enter** or **Previous** to the one
+before, wrapping at both ends; Cmd+G or Ctrl+G and F3 do the same, and with
+Shift go back. A new search starts at the first match from the top of what you
+are reading. Going to a match opens whatever hides it (a finished turn, a run
+of tool calls, a tool call, a long message or plan, a details block) and
+scrolls to it. Matches on screen are highlighted and the selected one stands
+out; where the engine cannot highlight text, the selected match's row is
+outlined instead.
+
+**Esc** closes the bar and returns to the composer. Your reading position and
+whatever find opened stay as they are, and reopening find restores the last
+search. Find searches the copy of the thread the app holds: while the
+connection is restoring, the status adds **may be out of date**, and while a
+thread is still loading it says **Loading thread…**. One chat's find is open at
+a time; opening it in a chat panel closes the host chat's. The palette opens it
+in the chat you were using, or the chat on screen. Outside a chat, Mod+F
+keeps its usual meaning. To use another key, bind the `chat.find` command (see
+[Keybindings](./keybindings.md)).
 
 ### Uploading chat attachments
 
@@ -489,6 +626,36 @@ becomes available once the running turn and any pending approval or question are
 done. Cancelling remains available while the message is queued; it is disabled
 while steering is being acknowledged.
 
+### When the context window is full
+
+When a conversation no longer fits the provider's context window, the thread's
+error (for Claude, **Claude ran out of context**) offers **Compact
+conversation**, on any provider that can compact it (Claude and Codex). It is
+disabled with **Compacting the conversation…** while a compaction runs, and the
+timeline shows a **Conversation compaction** step.
+
+If the provider refused your message before doing anything and its own
+auto-compaction is on, BiBCode recovers on its own: the error reads **The
+context window is full. Compacting the conversation, then sending your message
+again.**, without the button, and the failed message shows **Sends again after
+the conversation is compacted.** Once the compaction succeeds, a copy of your
+message is sent, labelled **Sent again after the conversation was compacted.**,
+and any messages you queued meanwhile follow it. Don't send it again by hand.
+If the compaction fails, or you stop it, nothing is sent: the error names what
+happened, the original stays in the thread, and **Compact conversation**
+returns. If the copy fails at the limit again, the error says the conversation
+was already compacted once.
+
+When a Claude conversation is close to where Claude compacts on its own,
+BiBCode compacts it before sending your next message. The message shows
+**Waiting for the conversation to be compacted.** and is sent once the
+compaction ends. **Stop** during that compaction leaves the message unsent with
+**Not sent: you stopped the conversation compaction. Retry sends it.**; Retry
+sends it without compacting again. While any compaction runs, what you send is
+queued and Stop is offered. Turning Claude's auto-compaction off
+(`autoCompactEnabled: false` or `DISABLE_AUTO_COMPACT`) turns both automatic
+behaviours off and keeps **Compact conversation**.
+
 If an earlier message has a failed or uncertain delivery, the first queued card
 shows **Waiting for an earlier message**. **Steer** and **Send now** are disabled
 with **Retry or dismiss the earlier message first**, or **Dismiss the earlier
@@ -529,7 +696,8 @@ capability gated by the selected provider instance:
 | Claude           | Supported          | Supported              |
 | Cursor           | Disabled           | Disabled               |
 | Grok             | Disabled           | Disabled               |
-| OpenCode         | Disabled           | Disabled               |
+| OpenCode 2       | Disabled           | Supported              |
+| OpenCode 1       | Disabled           | Disabled               |
 | Other or unknown | Disabled           | Disabled               |
 
 Disabled providers still show the corresponding control with an unavailable
@@ -554,8 +722,12 @@ level title in the menu are red; lower levels remain neutral.
 
 While a provider turn is active, the timeline shows a reversed paint-and-fade
 dotted square followed by `Waiting for` and a whole-second elapsed timer, such
-as `Waiting for 3s`. The timer is anchored to the persisted user-message time
-after reload and never moves backward when the provider start time arrives.
+as `Waiting for 3s`. While the provider thinks, the same line adds its latest
+thought after the timer, as in `Waiting for 12s · Planning the migration`,
+truncated to one line; it is left out when the thought is already the newest row
+above, and once the answer has arrived. The timer is anchored to the persisted
+user-message time after reload and never moves backward when the provider start
+time arrives.
 The animation uses the current theme's muted foreground and becomes static when
 reduced motion is requested. A later `pending` delivery blocked behind an
 unresolved failed or uncertain delivery shows the
@@ -756,9 +928,13 @@ Manager subscription.
 
 ## Pull Requests
 
-Hover a project header and choose **Pull Requests**, immediately after Git
+Choose **Pull Requests** on a project header, immediately after Git
 Manager, to browse the hosted repository for one checkout. Grouped projects
-use the same environment/member picker as other project actions. The project
+use the same environment/member picker as other project actions. In the
+Repositories view, use the repository row's button instead: with one environment it
+opens directly, with several it asks which environment to read from. An
+environment that is not connected is listed as "Not connected" and cannot be
+picked; when only one is connected, it opens directly. The project
 header stays highlighted on the list and detail routes, including after reload.
 
 ### Availability and setup
@@ -811,6 +987,11 @@ labelled browser links without loading avatars or image URLs. File diffs load
 near the viewport,
 with **Viewed** saved per request, a local **Ignore whitespace** toggle, and
 host links for unavailable or oversized content and a Binary file fallback.
+When the detail is wide enough to show the file list beside the diffs, drag the
+divider between them, or focus it and use the arrow keys, Home and End, to
+resize the list. The width is remembered in this browser; a narrower window
+shrinks the list only until there is room again, and double-clicking the
+divider restores the default.
 
 ### Checkout for local verification
 
@@ -885,8 +1066,44 @@ its project method as text. Edit the merge subject/body, choose branch deletion
 and optional auto-merge, then inspect the confirmation's method and target before
 merging. A read-only viewer sees the server reason without a method picker.
 **Auto-merge enabled** means merging has been scheduled, not completed; use
-**Disable auto-merge** to cancel it. GitHub disables bypass while auto-merge is
-selected, and the server rejects the auto-merge/bypass combination on GitHub.
+**Disable auto-merge** to cancel it. If GitLab refuses the cancellation, the
+action reports an error with GitLab's reason instead of succeeding. GitHub
+disables bypass while auto-merge is selected, and the server rejects the
+auto-merge/bypass combination on GitHub.
+
+When GitLab blocks a merge, the merge box names the reason GitLab reports, such
+as missing approvals, unresolved threads, a blocking merge request dependency,
+locked paths or a policy rule. Under **Pipelines must succeed** it says whether
+the pipeline is still running, failed, was canceled, was skipped, is waiting for
+a manual job, or has not run at all. Only GitLab's short-lived checking states
+read “GitLab is still computing mergeability; refresh in a moment”.
+
+On GitLab, the merge box also shows the gating pipeline under its title, for
+example “Merge request pipeline **#4821** running · abc1234 on feature/login”,
+with the number linking to the pipeline and a strip of its stages, each with an
+icon whose shape gives its status (passed, passed with warnings, failed,
+running, queued, manual, scheduled, canceled, skipped). The commit shows only
+for merge request and branch pipelines; a merged-results or merge train
+pipeline runs on a merge commit GitLab made. **Older commit** marks a pipeline
+that ran before the latest push. An account that cannot view the project's
+pipelines sees “You can't view pipelines in this project.” instead. While the
+merge request is open on Conversation or Pipelines in a visible window and the
+pipeline runs, its stages update within about 10 seconds without a refresh, and
+a pipeline that finishes while shown is announced to screen readers once. The
+Pipelines tab shows the same summary above its jobs, grouped by stage in
+GitLab's order with trigger jobs linking their downstream pipeline; when a stage
+has more than 100 jobs it says so and links the pipeline for the rest.
+When **Pipelines** is on in Settings and the environment's server supports it,
+the summary on the full page also offers **View pipeline**, which opens the
+pipeline in the Pipelines module, and each job's name opens its job page there,
+with **Open on GitLab** beside it. A trigger job, a job of a fork's pipeline
+and every job on an older server link to GitLab as before. On GitHub, the
+Checks tab opens a GitHub Actions job's page the same way, with **Open on
+GitHub** beside it; other status checks keep their host links. In a thread's
+side panel these links stay on the host; **Open full page** first.
+Beyond three merge requests watched at once, the others' pipeline status
+updates every 20 seconds, and their Pipelines tab reloads its jobs whenever
+that status changes.
 The normal confirmation title is “Merge pull request” on GitHub and “Merge
 merge request” on GitLab. Request-specific recovery messages and accessibility
 labels use the same host vocabulary; the module remains **Pull Requests**.
@@ -933,6 +1150,147 @@ it. Approval and merge carry the head you reviewed. A stale-head error says
 preserving drafts. Errors include server recovery advice; partial writes report
 what landed and are never retried automatically.
 
+## Pipelines
+
+Choose **Pipelines** (the linked-nodes icon) on a project header, immediately
+after Pull Requests, to see the project's CI pipelines for one checkout.
+Grouped projects use the same environment/member picker as the other project
+actions; in the Repositories view, use the repository row's Pipelines button,
+after its Pull Requests button. The project header stays highlighted on the
+Pipelines routes, including after reload.
+
+**Settings → Source Control → Pipelines** shows or hides both buttons,
+independently of Pull Requests. Turning it off leaves an open Pipelines route
+explaining the setting with a link back to Source Control. Pipelines share the
+Pull Requests module's checkout selector, repository context, sign-in and
+recovery states: moving between the two modules on one checkout does not ask
+the host again. An older server says to update it. Both GitLab projects and GitHub
+repositories are supported: on GitHub each row is one workflow run, labeled
+like GitHub's Actions page ("CI #312").
+
+The list opens on the copy BiBCode last stored for that filter, then the
+host's current page. Each row shows the status with its duration and age
+(hover for the exact time), the title, the pipeline number, the branch, tag or
+merge request, the short commit, badges such as **latest** or **merge
+request**, who started it, and one icon per stage (each named, for example
+"test: failed"). Choose anywhere on a row to open the pipeline in BiBCode; the
+row's menu has **Open on GitLab**. **All**, **Running** and **Finished**
+filter by state, and the branch field filters by ref: pick one of the checkout's
+branches or tags, or type any name and press Enter. Filters live in the URL,
+so Back and a copied link keep them, and the last ones are remembered for the
+project. **Load more** appears when the host has another page. On GitHub a
+**Workflow** select narrows the list to one workflow's runs; a filtered GitHub
+list ends at the 1,000 runs GitHub returns and says so. A GitHub repository
+with no workflows says "This repository has no workflows."; when GitHub does
+not return the runs at all, the list says Actions may be turned off or your
+sign-in may not be allowed to read Actions.
+
+While the list is visible, a running GitLab pipeline updates within about
+20 seconds without a Refresh, through one shared server poller however many
+windows show the list; a hidden window stops reading. A GitHub list re-reads
+its first page every 20 seconds while one of its runs is still running, and
+not at all once every shown run has finished. **Refresh** reloads the
+first page. When GitLab asks BiBCode to slow down, the list keeps what it
+shows, counts down to the host's retry time with Refresh disabled, and then
+reads again. **Retry** appears on a finished pipeline that did not pass and
+**Cancel** on one that is still running; on GitHub the row's menu also has
+**Retry failed jobs**. A row your account cannot act on says why, and an older
+server says to update it.
+
+A pipeline's page (`/pipelines/<id>`) also opens on the last stored copy,
+then the host's. Its header shows the status (for example **Failed**,
+**Passed with warnings** or **Waiting for approval**), the title, "Pipeline
+#4821 created 2h ago by Ana Rossi · finished 1h ago", the commit (its short
+id opens it on the host), the branch or tag (a merge request opens its page in
+BiBCode), the job count, the duration and the queued time, with Retry, Cancel,
+**Retry failed jobs** (GitHub) and **Open on GitLab**. Each job row has one
+action where it applies: **Run** for a manual job, **Cancel** for one still
+running, **Retry** for a finished one. Below it the stages sit side by side in GitLab's order
+on a wide panel, scrolling sideways, and stacked on a narrow one. Each stage
+shows its status, name and job count; each job its status, name and
+duration. A parallel group such as `rspec 3` is one row that expands to its
+jobs, a trigger job links to its **Downstream pipeline**, and a job that
+failed but was allowed to fail shows a warning instead of a failure. Choosing
+a job opens its job page in BiBCode (below). When GitLab returns only the first 100 jobs of a
+stage, the page says so and links to the full pipeline; an account that
+cannot see the jobs keeps the header and is told so. A pipeline you cannot
+view, or one that no longer exists, says that on the page, with **Open on
+GitLab** or **Back to pipelines**, and never signs you out.
+
+On GitHub the page shows one **Jobs** column in GitHub's order, and the
+run's artifacts (name, size, expiry, or **Expired**) below it, each opening the
+run's page on GitHub, where the download is. When a run has more than 1,000
+jobs the page shows the first 1,000 and says how many there are. A re-run
+run has an **Attempt** select: each earlier attempt opens its own page
+(`?attempt=<n>`), whose header, status and jobs describe that attempt.
+
+While it is visible, a running pipeline's page updates within about 10
+seconds through the same shared poller as its project's list, without asking
+GitLab again from each window. A running GitHub run is re-read every 10
+seconds for each 100 of its jobs. Either stops once the pipeline finishes, and
+a screen reader hears the result once.
+
+### Job page and log
+
+A job page (`…/pipelines/<pipeline>/jobs/<job>`) shows one job: its status,
+name, number, stage and start time, **Open on GitLab**, and its log, with the
+job's details beside it on a wide panel or under **Details** on a narrow one.
+It opens on the job BiBCode last stored, then the host's answer. The details
+list the duration (**Elapsed** while it runs), when it finished, how long it
+queued, the runner, the pipeline source, the runner tags, the job's artifacts
+(size, expiry, and **Download** and **Browse** links to GitLab's pages), the
+commit, the pipeline and the stage's other jobs: pick a stage to see its jobs
+and choose one to open its page. Timeout is not shown; neither host's API
+returns it. Retry, Cancel and Run (for a manual job) appear where they apply.
+A GitHub job offers only Retry: GitHub re-runs one job, as the run's next
+attempt, but cancels only whole runs.
+
+Actions run at once, without a confirmation: a retry only adds work and a
+canceled pipeline can be retried. The button spins until the page shows the
+result. Retrying a GitLab job opens the new job's page; re-running a GitHub
+run from an earlier attempt, or a job from its page, opens the run's latest
+attempt; a GitHub run being canceled shows **Canceling** until GitHub stops it.
+When the host refuses, a message says why. On GitHub, where repository write
+access does not prove you can run Actions, the button then stays disabled in
+every window until you rescan, with "GitHub refused: this sign-in can't run
+Actions for this repository. A fine-grained token needs Actions write." On
+GitLab the page reads the pipeline again and shows what GitLab now allows. A
+refusal never signs you out. When the host asks BiBCode to
+slow down, or a run has already finished, the message says so.
+
+The log keeps the job's colors in the terminal's palette for the current
+theme, numbers its lines, and folds GitLab's collapsible sections (the header
+shows the section's duration; sections GitLab marks collapsed start folded).
+**Timestamps** (shown only when the runner stamps its lines) adds a time
+column, **Wrap lines** wraps long lines, **Collapse all**/**Expand all** folds
+every section, and the arrows jump to the top or the end. **Search log**
+(Mod+F while the job page is open; Escape returns to the log) finds text in
+any line, counting "3 of 17", with Enter and Shift+Enter or the arrows to step
+through matches; a match inside a folded section opens it. **Raw log** opens
+GitLab's plain log.
+
+A finished log opens at its end, where failures print. A running job's log
+follows new output about every 5 seconds while the window is visible and you
+are at the bottom; scroll up to read and **Jump to latest** returns. Opening a
+running log reads at most about 2 MB; a running log larger than that keeps
+what loaded and says GitLab shows the live end, then loads in full when the
+job finishes. **Load earlier** reads the text before what is shown (up to
+16 MB per job page). When the loaded text does not start at the beginning of
+the log, line numbers count from the first loaded line until earlier text
+loads. Click a line number to put that line in the address (`?at=`, its byte
+offset): a copied link opens on that line without reading the log before it.
+A job that has not started, has no output yet, produced no log, or had its
+log erased says so instead of showing an empty log.
+
+A GitHub job's details also list its **Steps**, each with its status and
+time, and its run's artifacts. GitHub serves a job's log only once the job
+completes: while it runs, the page shows its steps where the log will be,
+says "GitHub shows live logs on its site." with **Open on GitHub**, and
+re-reads the steps every 10 seconds while the window is visible (a queued job
+says it hasn't started yet). When the job
+finishes the log loads once; choosing a step then scrolls to where its output
+starts. A log past GitHub's retention says "This log has expired."
+
 ## Right Panel
 
 The right panel hosts persistent tool surfaces for the active thread. Use its
@@ -945,7 +1303,8 @@ Plan surfaces can also appear when the active provider/session supplies them.
   (see [Previewing the server's dev servers](#previewing-the-servers-dev-servers));
   a browser tab served over HTTPS has no Browser surface.
 - **Terminal** starts a shell in the active workspace.
-- **Diff** reviews branch or worktree changes.
+- **Diff** reviews the working tree, branch changes, or a turn's changes (see
+  [Diff](#diff)).
 - **Activity** shows structured provider activity when available.
 - **Plan** displays the active agent plan when available.
 - **Device** shows an Android emulator or, on a macOS server, an iOS simulator
@@ -954,6 +1313,63 @@ Plan surfaces can also appear when the active provider/session supplies them.
 - **Pull request** shows one pull or merge request beside the thread (see
   [Pull and merge requests in the panel](#pull-and-merge-requests-in-the-panel)).
   It has no entry in the `+` menu; it opens from the places listed there.
+
+### Diff
+
+The scope menu chooses what the Diff panel compares: **Working tree** (against
+`HEAD`), **Branch changes** (against a base branch you can change), **Latest
+turn**, or any **Turn**. A turn's changes come from the checkpoints BiBCode
+saves before and after it. When a checkpoint is gone, or Git can't compare
+two of them, the panel says so instead of showing no changes.
+
+**Changes | Compare** chooses how to read them:
+
+- **Changes** stacks every changed file. **Stacked** and **Split** lay out each
+  file's hunks.
+- **Compare** lists the changed files on the left and shows the selected
+  file's previous and current versions side by side, aligned and scrolling
+  together. The full files load after the changed lines, which show at once.
+  - The list filters by name (**Esc** clears it) and by status, and says
+    "N of M files" while a filter is on. Up, Down, Home, End, Page Up and Page
+    Down move the selection. In a panel narrower than 640 px, the list becomes
+    a searchable file picker above the diff, between **Previous file** and
+    **Next file**.
+  - **All lines** shows the whole file. **Changes only** shows the changes with
+    **Context lines** around them (3 by default, up to 99); collapsed regions
+    still expand. If the changes with that count fail to load, Compare says so
+    with **Retry**.
+  - **Previous change** and **Next change** step through the blocks of
+    changes; **F7** and **Shift+F7** do the same while Compare has focus.
+  - A file that Compare cannot show in full says why: added and deleted files
+    show their one side, and a pure rename, a file mode change, a binary file
+    and a submodule each get a short explanation. A file over 4.4 MB, a
+    version no longer in the repository, a patch from an older server and a
+    turn patch saved before checkpoints kept full files show the changed lines
+    with the reason. A working file that keeps changing says "This file is
+    changing." with **Refresh**.
+
+**Open with** opens the changes in a diff app such as Beyond Compare, Meld,
+KDiff3, WinMerge or FileMerge, through `git difftool`. In Changes, the
+toolbar's **Open with** opens every file of the scope. In Compare, the one
+beside the file opens that file, and **All files in** opens every file. The
+menu lists the apps Git finds on the computer, including your own
+`difftool.<tool>.cmd`, with the default marked: the one `git config
+diff.guitool` or `diff.tool` names, then the last one you chose, then the
+first listed. A failed launch shows Git's message with **Copy command**, so
+you can run it yourself. The app stays open when BiBCode quits, so unsaved
+edits in it are kept.
+
+- It works for threads on this computer only. For another environment the menu
+  says where the thread runs.
+- Untracked files can't open on their own; stage one to compare it.
+- With no app found, the menu says to install one or set
+  `git config diff.tool`.
+- In a browser, the app opens on the computer running the server.
+
+The view, the layout, the line filter and the context count are remembered
+across restarts, and Compare remembers the selected file for each thread. Its
+filters reset when the page reloads, so it never opens with files hidden.
+Switching between Changes and Compare keeps the scope and the base ref.
 
 ### Pull and merge requests in the panel
 
@@ -1240,7 +1656,12 @@ says why (for example Android SDK not found, no virtual devices, Xcode not
 found, or no simulators) and what to do; the other platform still works. A
 simulator already running outside BiBCode, for example in Xcode's Simulator
 app, is listed as "— Running outside BiBCode" and cannot be picked: shut it
-down there first.
+down there first. The list is read when the panel opens and kept for 30
+seconds; after creating a device in Android Studio or Xcode, choose **Refresh
+devices** (the circular-arrows button beside the list, or the button under the
+message when no device can start yet) to see it without restarting BiBCode.
+A server running an older BiBCode has no **Refresh devices**; close and reopen
+the panel after 30 seconds instead.
 
 **Use it.** Pick a device and choose **Start**. The state pill moves through
 **Starting…** and **Booting…** to **Ready**; a first boot can take a few
@@ -1279,11 +1700,25 @@ typing `café au lait` quickly can lose more than the `é`. A paste of more than
 100 characters sends nothing either, and the panel asks you to paste it in parts.
 
 A disabled control says why when you point at it. **Stop** shuts the device
-down. One device runs per platform: an Android emulator and an iOS simulator
-can run side by side, but to start another device of the same platform, stop
-the running one first. A device that fails shows **Failed:** with the reason,
-for example a boot that did not finish within 180 s, or a simulator shut down
-outside BiBCode. BiBCode only shuts down simulators it started.
+down. A device that fails shows **Failed:** with the reason, for example a boot
+that did not finish within 180 s, or a simulator shut down outside BiBCode, and
+a stopped one says so; **Start** starts it again. BiBCode only shuts down
+simulators it started.
+
+**One device per task.** Up to four devices run at once on a server, of either
+platform, and each image runs once. Each thread's Device panel remembers the
+device you picked or started there: switch threads and each one shows its own
+device, or its last attempt and why it ended, without picking it again. A
+thread with nothing picked shows the device its agent started. Running devices
+stay in the list with whose they are, such as "Pixel 8 — Running here" or
+"Pixel 8 — Running in Fix login"; pick one to look at it and use it. Another
+thread's device says "Started in Fix login." under the toolbar, and stopping it
+asks first, because that task loses its device and a new boot takes minutes.
+With four devices running, **Start** says so; a start the server refuses lists
+**Stop** for each running device. Deleting a thread stops the devices it
+started; archiving it does not. A chat panel's devices are its host thread's.
+A second desktop window or browser tab on another thread shows a second device
+at the same time.
 
 **View only.** An iOS simulator opens view only when BiBCode cannot use this
 Xcode's simulator interfaces: an Xcode release that changed them ("Xcode
@@ -1306,17 +1741,41 @@ screen** starts it again.
 
 **Agents.** While device previews are on, coding agents on that environment can
 use the `device_list`, `device_open`, `device_screenshot`, and `device_close`
-tools on the same devices you see. They disappear from an agent's tool list
-once the setting is off.
+tools on the same devices you see. An agent's devices are its thread's (a chat
+panel's agent counts as its host): `device_list` marks them, a screenshot
+without a device id takes the agent's own device, opening an image its thread
+already runs returns that device, and it cannot start an image or stop a device
+another thread is using. The tools disappear from an agent's tool list once
+the setting is off.
 
 ### Activity and targeted Stop
 
 Activity combines provider-attributed observation with capability-gated
-control. The dock shows one provider icon for the active scope; each Subagents
-row shows one provider icon for its actor. Active and Done counts are the only
-multiplicity signal: they are primary row content, while elapsed time is
-secondary metadata aligned beneath the section title. The same Activity
-presentation is used in the inline right panel and its responsive sheet.
+control. The **Activity** button above the chat shows the provider icon for the
+active scope and the combined **Active** and **Done** counts. One click, or
+**Enter** or **Space**, opens the Activity panel on the section that needs you:
+the one with an error, else the one with running work (Subagents first), else
+the one with the most recent record. With the panel already open, the button
+brings it to the front on that section, moves focus into it, scrolls to the top
+of the section, and never closes it; an open record stays open. When the
+provider reports both sections, **Subagents** and **Background tasks** tabs at
+the top of the panel switch between them, and a tab marks a stale or failing
+section. A stale or error icon on the button means a section, or the whole
+observation, is degraded; errors win over stale. A section that fails before its
+first record still marks the button, and a click opens it on that error. The
+button's accessible name and tooltip give the counts for each section. Each
+Subagents row in the panel shows one provider icon for its actor, and the same
+Activity presentation is used in the inline right panel and its responsive
+sheet.
+
+**Settings → Agents → Always show Activity** (on by default) keeps the button
+above a chat whose provider reports subagents or background tasks even before
+any record exists. Until then it shows a muted **Activity** label instead of
+counts, and opens the panel's empty state. Providers that report neither get no
+button, because a permanent zero would suggest nothing runs when BiBCode cannot
+see it. With the setting off, the button appears once the chat has a record.
+The setting needs **Chat agent activity** on, and provider terminals always wait
+for their first record.
 
 Activity record details format Started, Ended, and event instants using the
 user's timestamp preference. The exact canonical RFC 3339 value remains
@@ -1398,6 +1857,11 @@ The Source Control panel is Orca-parity for the shipped local Git workflow:
   editor, ignore file name, and ignore parent folder when the corresponding host
   actions are available.
 - Commit history and AI commit-message generation are available in the panel.
+- A failed commit or push names the step that failed, such as **Push failed**
+  or **Commit failed**, and shows Git's own reason beneath it, for example a
+  rejected push or a failing hook. The chat-header Git actions control shows
+  the same failure, and the create pull or merge request dialog names a failed
+  branch, commit or publish step the same way instead of blaming the request.
 - **Merge into current branch…** in the dropdown opens the merge dialog for the
   checked-out branch with local and remote sources. **Fetch** refreshes the
   selected remote branch's remote, or every remote for a local source, before
@@ -1504,13 +1968,54 @@ The Files surface is a full file manager for the active workspace:
   ticking a task there changes that text, so the edits are kept. Once they are
   saved, it shows the file as last read from disk, so a task toggle also keeps
   changes made to the file outside BiBCode.
+- An open file follows changes made on disk, for example by an agent. While the
+  file is shown and the window is visible, BiBCode checks it every two seconds,
+  and at once when the window regains focus, the connection comes back, or a
+  turn ends.
+  - A file without unsaved edits reloads in place. The caret and comments stay
+    where they were, and Undo brings the previous text back as an unsaved edit.
+  - A file with unsaved edits keeps them and shows **Changed on disk.** (or
+    **Deleted on disk.**) under the toolbar. Choose **Reload from disk** to take
+    the disk's version, or **Overwrite disk** to save yours over it. In the
+    source view, Undo after **Reload from disk** brings your edits back. The
+    rendered Markdown view, and a file deleted on disk, ask first, because no
+    Undo can restore the edits there.
+  - Nothing is saved while the bar shows: Save is disabled with its reason, and
+    Ctrl/Cmd+S, switching tabs, and closing the tab do not write. A closed tab
+    keeps its edits, and reopening the file shows them with the bar. A file tab
+    with a conflict shows an amber dot, even in the background.
+  - Every save is checked against the version it was based on, so a save never
+    writes over a change it has not seen, including one from another BiBCode
+    window or a file in a background tab. If the check fails, the bar appears.
+  - A file without unsaved edits that is deleted on disk shows **Deleted on
+    disk.** and reopens if the file comes back. A file that becomes binary, or
+    grows past 1 MB, can only be overwritten; the text you were editing stays
+    on screen until you choose.
 
 ## Current limitations
 
-- Device previews run one Android emulator and one iOS simulator at a time per
-  environment, and iOS simulators only on macOS servers. iOS takes a single
-  touch, and BiBCode cannot install apps or create simulators. Two people
-  watching the same device both control it.
+- In Compare, a line comment can start only on a line that is part of Git's
+  default hunks, the same lines Changes shows.
+- **Open with** is not available for remote environments, and it opens the
+  current versions in Git, not the exact patch the panel loaded. A diff app
+  that returns at once may find Git's temporary copy already gone. On Windows,
+  a diff app still open in a worktree keeps that worktree from being removed,
+  and a job that forbids breakaway closes the app with BiBCode.
+
+- Find in thread searches messages, plans, and tool commands. Tool output,
+  changed-file lists, attachments, terminal-context chips, review-comment cards,
+  reasoning rows, and Mermaid diagrams, including the source a diagram shows
+  before it draws, are not searched.
+- Device previews run at most four devices at once per environment, one per
+  image, and iOS simulators only on macOS servers. BiBCode does not check that
+  the host has the memory for four: one that does not fails at boot with the
+  emulator's reason. One panel shows one device at a time; open a second window
+  or tab on another thread to watch two. iOS takes a single touch, and BiBCode
+  cannot install apps or create simulators. Two people watching the same device
+  both control it. A device stays with the thread that started it, even when
+  another thread uses it. The panel keeps the four most recent stopped or failed
+  devices of the environment, so with several threads an older attempt's reason
+  can drop out.
 
 - Staged-row diff viewing in the right-panel Source Control surface does not yet
   use a true `git diff --cached` source. Git Manager diffs are a separate path.
@@ -1518,6 +2023,16 @@ The Files surface is a full file manager for the active workspace:
   entry point and the keyboard-operable controls within the panel.
 - Outside changes are detected by a periodic check, so the tree updates within
   seconds rather than instantly. Use Refresh when you want it immediately.
+- Only the file being shown is checked for changes on disk, so a background
+  file tab learns of a change at its next save, which the server then refuses.
+  There is no side-by-side comparison in the conflict bar yet, and a file
+  renamed outside BiBCode shows as deleted at its old path.
+- Saves are checked and written as one step against other BiBCode windows, but
+  another program can still write the file in the moment between the check and
+  the write. Closing the project while a file shows the conflict bar drops its
+  unsaved edits, as it does for a file whose save failed.
+- Connected to a server that does not report file versions, the editor saves as
+  before: it neither reloads changes made on disk nor refuses a save over them.
 - Changes to an arbitrary custom Git `core.excludesFile` require **Refresh**;
   automatic classification-control provenance is not yet cached.
 - File mutations validate the workspace-relative target before the later

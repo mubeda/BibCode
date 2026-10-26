@@ -168,6 +168,8 @@ pub enum OpenCodeRuntimeError {
 /// How long the lookup before a delivery's send may take; a stalled one would hold the thread's
 /// delivery, so it ends as not sent and the delivery is retried.
 const DELIVERY_LOOKUP_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bounds the model-catalog read a prompt makes once for the context meter's maximum.
+const CONTEXT_WINDOW_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
 /// A resume's read of the pending asks (or the session tree) that failed is tried again, off
 /// the event pump, after a backoff that doubles from the first delay up to the longest, for at
 /// most `RESUME_READ_ATTEMPTS` reads once the event stream is connected.
@@ -424,6 +426,11 @@ struct V2State {
     synced_agent: bool,
     /// The runtime mode whose permission rules the session has.
     synced_runtime_mode: Option<String>,
+    /// Each model's context window (provider id, model id), read from `GET /api/model`.
+    context_windows: HashMap<(String, String), u64>,
+    /// The models a read of the catalog answered for: every model it listed, then each selected
+    /// model it did not list. `None` until a read succeeds.
+    context_windows_answered: Option<HashSet<(String, String)>>,
     /// A resumed session checks for a running execution once its event stream is connected, so
     /// the execution's end cannot slip between the check and the subscription.
     adopt_on_connect: bool,
@@ -1473,7 +1480,8 @@ impl OpenCodeSessionRuntime {
                 "command name cannot be empty".to_owned(),
             ));
         }
-        // An OpenCode 2 command carries no message id, so its lookup finds nothing.
+        // An OpenCode 2 command carries no message id, so its lookup finds nothing (a compaction
+        // or a slash skill does).
         if let Some(turn_id) = self.ensure_not_delivered(message_id).await? {
             return Ok(turn_id);
         }
@@ -1487,9 +1495,17 @@ impl OpenCodeSessionRuntime {
             self.v2_sync_selection(&session_id)
                 .await
                 .map_err(not_sent)?;
+            // `/compact` is OpenCode 2's compaction, which takes no instructions. Its request
+            // takes a message id (a compaction is a session message), so it is looked up exactly.
             // OpenCode 2 skills are not commands: a slash skill is a prompt that attaches the
             // skill (and, unlike a command, takes a message id, so it is looked up exactly).
-            let (route, body) = if self.v2_is_skill(command).await? {
+            let (route, body) = if command == "compact" && arguments.trim().is_empty() {
+                let mut body = json!({ "delivery": "steer" });
+                if let Some(message_id) = message_id {
+                    body["id"] = json!(v2::message_id(message_id));
+                }
+                ("compact", body)
+            } else if self.v2_is_skill(command).await? {
                 let mut body = v2::prompt_body(
                     Some(arguments.trim()),
                     &[],
@@ -1511,7 +1527,7 @@ impl OpenCodeSessionRuntime {
                     .await
                     .map_err(turn_transport_error)?;
                 if !response.status().is_success() {
-                    return Err(turn_status_error(&response, "command"));
+                    return Err(turn_status_error(&response, route));
                 }
                 Ok(())
             }
@@ -2624,7 +2640,6 @@ impl OpenCodeSessionRuntime {
                     .await;
                     return;
                 };
-                let message = failure.message.clone();
                 let has_assistant_message =
                     !self.inner.assistant_message_ids.lock().await.is_empty();
                 let failed_user_message = self.inner.active_user_message_id.lock().await.take();
@@ -2652,12 +2667,7 @@ impl OpenCodeSessionRuntime {
                     "turn.completed",
                     Some(failed_turn_id),
                     None,
-                    json!({
-                        "state": failure.state,
-                        "stopReason": failure.stop_reason,
-                        "errorMessage": message,
-                        "errorClass": failure.class,
-                    }),
+                    failure.completion_payload(),
                 )
                 .await;
                 self.inner.assistant_message_ids.lock().await.clear();
@@ -2889,12 +2899,7 @@ impl OpenCodeSessionRuntime {
                     };
                     let payload = match failure {
                         None => json!({ "state": "completed", "stopReason": "completed" }),
-                        Some(failure) => json!({
-                            "state": failure.state,
-                            "stopReason": failure.stop_reason,
-                            "errorMessage": failure.message,
-                            "errorClass": failure.class,
-                        }),
+                        Some(failure) => failure.completion_payload(),
                     };
                     self.emit("turn.completed", Some(completed_turn_id), None, payload)
                         .await;
@@ -3006,7 +3011,106 @@ impl OpenCodeSessionRuntime {
                         .await;
                     }
                 }
+                V2Output::Usage { mut usage, model } => {
+                    let max_tokens = match model {
+                        Some(model) => self
+                            .inner
+                            .v2
+                            .lock()
+                            .await
+                            .context_windows
+                            .get(&model)
+                            .copied(),
+                        None => None,
+                    };
+                    if let Some(max_tokens) = max_tokens {
+                        usage["maxTokens"] = json!(max_tokens);
+                    }
+                    self.emit(
+                        "thread.token-usage.updated",
+                        turn_id,
+                        None,
+                        json!({ "usage": usage }),
+                    )
+                    .await;
+                }
+                V2Output::Compaction {
+                    item_id,
+                    status,
+                    detail,
+                } => {
+                    let mut payload = json!({
+                        "itemType": "context_compaction",
+                        "status": status,
+                        "title": "Conversation compaction",
+                    });
+                    if let Some(detail) = detail {
+                        payload["detail"] = json!(detail);
+                    }
+                    let event_type = if status == "inProgress" {
+                        "item.started"
+                    } else {
+                        "item.completed"
+                    };
+                    self.emit_with_item_id(event_type, turn_id, Some(item_id), None, payload)
+                        .await;
+                }
+                V2Output::Retry { message, class } => {
+                    self.emit(
+                        "runtime.warning",
+                        turn_id,
+                        None,
+                        json!({ "message": message, "class": class }),
+                    )
+                    .await;
+                }
             }
+        }
+    }
+
+    /// Reads each model's context window for the context meter: once, and once more for a
+    /// selected model the last read did not list (one added to the server since). A catalog that
+    /// cannot be read is read again before the next prompt, and the meter shows usage without a
+    /// maximum meanwhile.
+    async fn v2_load_context_windows(&self, selected: Option<(String, String)>) {
+        if self
+            .inner
+            .v2
+            .lock()
+            .await
+            .context_windows_answered
+            .as_ref()
+            .is_some_and(|answered| {
+                selected
+                    .as_ref()
+                    .is_none_or(|model| answered.contains(model))
+            })
+        {
+            return;
+        }
+        let Ok(url) = self.v2_url(&["model"], true) else {
+            return;
+        };
+        let read = async {
+            let response = self.inner.client.get(url).send().await.ok()?;
+            if !response.status().is_success() {
+                return None;
+            }
+            response.json::<Value>().await.ok()
+        };
+        match tokio::time::timeout(CONTEXT_WINDOW_LOOKUP_TIMEOUT, read).await {
+            Ok(Some(models)) => {
+                let windows = v2::context_windows(&models);
+                let mut v2 = self.inner.v2.lock().await;
+                let answered = v2.context_windows_answered.get_or_insert_default();
+                answered.extend(windows.keys().cloned());
+                answered.extend(selected);
+                v2.context_windows = windows;
+            }
+            _ => tracing::debug!(
+                provider = "opencode",
+                "the OpenCode 2 model catalog could not be read for context windows"
+            ),
         }
     }
 
@@ -3014,6 +3118,7 @@ impl OpenCodeSessionRuntime {
     /// OpenCode 2 keeps them as session state rather than per prompt.
     async fn v2_sync_selection(&self, session_id: &str) -> Result<(), OpenCodeRuntimeError> {
         let model = self.inner.model.lock().await.clone();
+        let selected = model.clone();
         let variant = self.inner.selected_variant.lock().await.clone();
         let (synced_model, synced_agent, synced_runtime_mode) = {
             let v2 = self.inner.v2.lock().await;
@@ -3073,6 +3178,7 @@ impl OpenCodeSessionRuntime {
                 self.inner.v2.lock().await.synced_model = Some(desired);
             }
         }
+        self.v2_load_context_windows(selected).await;
         Ok(())
     }
 
@@ -4219,7 +4325,8 @@ impl OpenCodeSessionRuntime {
     ) -> Result<bool, OpenCodeRuntimeError> {
         match self.v2_message_type(session_id, message_id).await? {
             None => Ok(false),
-            Some(kind) if kind == "user" => Ok(true),
+            // A compaction BiBCode requested is a session message under the delivery's id.
+            Some(kind) if kind == "user" || kind == "compaction" => Ok(true),
             Some(_) => Err(OpenCodeRuntimeError::InvalidResponse(
                 "message lookup response has invalid identity or shape".to_owned(),
             )),
@@ -5608,6 +5715,25 @@ pub(crate) struct OpenCodeFailure {
     pub(crate) stop_reason: &'static str,
     pub(crate) class: &'static str,
     pub(crate) message: String,
+    /// OpenCode's own name for the failure (`APIError`, or OpenCode 2's `provider_auth`), the
+    /// Profiler's provider reason.
+    pub(crate) reason: Option<String>,
+}
+
+impl OpenCodeFailure {
+    /// A failed turn's `turn.completed` payload.
+    pub(crate) fn completion_payload(&self) -> Value {
+        let mut payload = json!({
+            "state": self.state,
+            "stopReason": self.stop_reason,
+            "errorMessage": self.message,
+            "errorClass": self.class,
+        });
+        if let Some(reason) = &self.reason {
+            payload["providerReason"] = json!(reason);
+        }
+        payload
+    }
 }
 
 /// Classify an opencode error object, which is discriminated on `name`.
@@ -5693,6 +5819,7 @@ pub(crate) fn classify_opencode_error(error: &Value) -> OpenCodeFailure {
         stop_reason,
         class,
         message,
+        reason: name.map(str::to_owned),
     }
 }
 
@@ -5816,6 +5943,18 @@ mod error_classification_tests {
             "got {:?}",
             failure.message
         );
+    }
+
+    #[test]
+    fn a_failed_turn_names_opencodes_own_reason_for_the_profiler() {
+        let failure = classify_opencode_error(&json!({
+            "name": "APIError",
+            "data": { "message": "overloaded" }
+        }));
+        assert_eq!(failure.reason.as_deref(), Some("APIError"));
+        assert_eq!(failure.completion_payload()["providerReason"], "APIError");
+        let unnamed = classify_opencode_error(&json!("plain text"));
+        assert!(unnamed.completion_payload().get("providerReason").is_none());
     }
 
     #[test]

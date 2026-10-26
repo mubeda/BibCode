@@ -42,12 +42,23 @@ export interface ImportCliSessionsSummary {
   readonly newestThreadId: ThreadId | null;
 }
 
+/** A session continued from History, whose thread is a chat panel of `hostThreadId`. */
+export interface ImportedPanel {
+  readonly hostThreadId: ThreadId;
+  readonly title: string;
+}
+
 export interface ImportCliSessionsDialogProps {
   readonly open: boolean;
   readonly target: ImportCliSessionsTarget | null;
   readonly onOpenChange: (open: boolean) => void;
   readonly onImported: (target: ImportCliSessionsTarget, summary: ImportCliSessionsSummary) => void;
-  readonly onOpenThread: (target: ImportCliSessionsTarget, threadId: ThreadId) => void;
+  /** Opens an earlier import's thread; a panel opens in its host, as its active tab. */
+  readonly onOpenThread: (
+    target: ImportCliSessionsTarget,
+    threadId: ThreadId,
+    panel?: ImportedPanel,
+  ) => void;
 }
 
 const PROVIDERS: Record<AgentSessionProvider, { readonly label: string; readonly icon: Icon }> = {
@@ -108,15 +119,15 @@ const candidateKey = (candidate: AgentSessionCandidate) =>
 
 /** An earlier import: its live thread opens; a deleted one cannot be imported again. */
 function ImportedMarker({
-  threadId,
+  candidate,
   disabled,
   onOpen,
 }: {
-  readonly threadId: ThreadId | undefined;
+  readonly candidate: AgentSessionCandidate;
   readonly disabled: boolean;
-  readonly onOpen: (threadId: ThreadId) => void;
+  readonly onOpen: (candidate: AgentSessionCandidate) => void;
 }) {
-  if (threadId === undefined) {
+  if (candidate.threadId === undefined) {
     return <span className="shrink-0 text-xs text-muted-foreground">Imported, thread deleted</span>;
   }
   return (
@@ -127,7 +138,7 @@ function ImportedMarker({
         size="xs"
         variant="outline"
         disabled={disabled}
-        onClick={() => onOpen(threadId)}
+        onClick={() => onOpen(candidate)}
       >
         Open
       </Button>
@@ -263,8 +274,16 @@ function ImportCliSessionsDialogContent({
   }, [candidates, importSessions, importable, isImporting, onImported, selected, target]);
 
   const openThread = useCallback(
-    (threadId: ThreadId) => {
-      if (target) onOpenThread(target, threadId);
+    (candidate: AgentSessionCandidate) => {
+      if (!target || candidate.threadId === undefined) return;
+      if (candidate.hostThreadId === undefined) {
+        onOpenThread(target, candidate.threadId);
+        return;
+      }
+      onOpenThread(target, candidate.threadId, {
+        hostThreadId: candidate.hostThreadId,
+        title: candidate.title,
+      });
     },
     [onOpenThread, target],
   );
@@ -286,7 +305,8 @@ function ImportCliSessionsDialogContent({
           <DialogTitle>Import CLI sessions</DialogTitle>
           <DialogDescription>
             Claude Code and Codex sessions run in {workspaceRoot} on the server. An imported thread
-            continues its CLI conversation.
+            continues its CLI conversation. Sessions run in a worktree are in that worktree thread's
+            History.
           </DialogDescription>
         </DialogHeader>
         <DialogPanel className="space-y-3">
@@ -355,7 +375,7 @@ function ImportCliSessionsDialogContent({
                       </label>
                       {candidate.alreadyImported ? (
                         <ImportedMarker
-                          threadId={candidate.threadId}
+                          candidate={candidate}
                           disabled={isImporting}
                           onOpen={openThread}
                         />

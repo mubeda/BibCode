@@ -108,6 +108,19 @@ pub(super) fn duration(started: Option<&str>, completed: Option<&str>) -> Option
     (seconds >= 0.0).then_some(seconds)
 }
 
+/// A Pipelines route id: a positive integer that fits a JavaScript `Number`.
+pub(super) fn route_id(id: u64) -> Option<u64> {
+    (1..=9_007_199_254_740_991).contains(&id).then_some(id)
+}
+
+/// A decimal id, digits only, as a route id.
+pub(super) fn parse_route_id(text: &str) -> Option<u64> {
+    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    route_id(text.parse().ok()?)
+}
+
 pub(super) fn grouped_checks(
     rows: impl IntoIterator<Item = (String, Check)>,
     pipeline_url: Option<String>,
@@ -134,5 +147,7 @@ pub(super) fn grouped_checks(
         groups,
         summary,
         pipeline_url,
+        revision: None,
+        truncated: false,
     }
 }

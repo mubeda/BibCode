@@ -81,24 +81,14 @@ export function detectComposerTrigger(
     }
   }
 
-  if (linePrefix.length > 0 && !linePrefixHasWhitespace) {
-    const triggerChar = linePrefix[0];
-    if (triggerChar === ":") {
-      return {
-        kind: "bibcode-action",
-        query: linePrefix.slice(1),
-        rangeStart: lineStart,
-        rangeEnd: cursor,
-      };
-    }
-    if (triggerChar === "/" && profile.providerSlash) {
-      return {
-        kind: "provider-slash",
-        query: linePrefix.slice(1),
-        rangeStart: lineStart,
-        rangeEnd: cursor,
-      };
-    }
+  // BiBCode actions stay a line's single token; the provider triggers below are any token.
+  if (linePrefix.length > 0 && !linePrefixHasWhitespace && linePrefix[0] === ":") {
+    return {
+      kind: "bibcode-action",
+      query: linePrefix.slice(1),
+      rangeStart: lineStart,
+      rangeEnd: cursor,
+    };
   }
 
   let tokenIdx = cursor - 1;
@@ -108,6 +98,16 @@ export function detectComposerTrigger(
   const tokenStart = tokenIdx + 1;
 
   const token = text.slice(tokenStart, cursor);
+  // Only a slash that starts a token, so `src/app` and URLs stay text. An absolute path opens
+  // the menu too; Escape or a space closes it.
+  if (token.startsWith("/") && profile.providerSlash) {
+    return {
+      kind: "provider-slash",
+      query: token.slice(1),
+      rangeStart: tokenStart,
+      rangeEnd: cursor,
+    };
+  }
   if (token.startsWith("$") && profile.providerDollarSkill) {
     return {
       kind: "provider-dollar-skill",

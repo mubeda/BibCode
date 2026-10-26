@@ -355,19 +355,17 @@ impl ConfiguredPullRequestsRpcServices {
 }
 
 /// The poller calls `emit` synchronously from inside its tick; a plain `Fn`
-/// cannot await the channel, so a dropped send under backpressure simply
-/// skips that one change notification. The client's own `readSnapshot` call
-/// stays authoritative for the stored payload.
+/// cannot await the channel, so a full stream refuses the event and `emit`
+/// answers `false`. The poller then keeps those names and sends them with the
+/// next event, so nothing is lost while the stream stays open.
 ///
 /// Extracted so a regression test can assert this forwards onto the stream
 /// directly: `pullRequests.subscribe` previously wired a no-op emit closure
 /// here, which silently dropped every poller change event.
 fn forward_changed_to_stream(
     sender: mpsc::Sender<RpcStreamChunk>,
-) -> impl Fn(model::Changed) + Send + Sync {
-    move |changed: model::Changed| {
-        let _ = sender.try_send(Ok(vec![json!(changed)]));
-    }
+) -> impl Fn(model::Changed) -> bool + Send + Sync {
+    move |changed: model::Changed| sender.try_send(Ok(vec![json!(changed)])).is_ok()
 }
 
 #[derive(Deserialize)]
@@ -531,13 +529,29 @@ mod tests {
             commits: false,
             checks: false,
             files: false,
+            pipeline: true,
         };
-        emit(changed.clone());
+        assert!(emit(changed.clone()), "an open stream accepts the event");
         let chunk = receiver
             .recv()
             .await
             .expect("the emitted change must reach the RPC stream");
         assert_eq!(chunk, Ok(vec![json!(changed)]));
+    }
+
+    #[tokio::test]
+    async fn pull_requests_subscribe_emit_reports_a_full_stream_so_the_poller_resends() {
+        let (sender, mut receiver) = mpsc::channel(SUBSCRIBE_STREAM_CAPACITY);
+        let emit = forward_changed_to_stream(sender);
+        for _ in 0..SUBSCRIBE_STREAM_CAPACITY {
+            assert!(emit(model::Changed::default()));
+        }
+        assert!(
+            !emit(model::Changed::default()),
+            "a full stream refuses the event and says so"
+        );
+        assert!(receiver.recv().await.unwrap().is_ok());
+        assert!(emit(model::Changed::default()), "room again after a read");
     }
 
     #[tokio::test]

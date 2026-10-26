@@ -109,7 +109,7 @@ impl GitLabHost {
                             "sha":head_sha,"squash":*method==MergeMethod::Squash,
                             "should_remove_source_branch":delete_branch,"auto_merge":auto,"merge_when_pipeline_succeeds":auto,
                             "merge_commit_message":message,"squash_commit_message":message,
-                        }), c).await.map_err(|f| from_process_error(OP, "glab", &f.error, &f.stderr))?;
+                        }), Budget::Mutation, c).await.map_err(|f| from_process_error(OP, "glab", &f.error, &f.stderr))?;
                         let value: Value = serde_json::from_str(&output.stdout).map_err(|_| parse::invalid(OP))?;
                         if !value.is_object() { return Err(parse::invalid(OP)); }
                         value.get("merge_commit_sha").filter(|sha| !sha.is_null())
@@ -139,14 +139,50 @@ impl GitLabHost {
                 });
             }
             DisableAutoMerge { .. } => {
-                self.mutate_api(
-                    scope,
-                    "POST",
-                    &format!("{path}/cancel_merge_when_pipeline_succeeds"),
-                    None,
-                    c,
-                )
-                .await?;
+                const NOT_CANCELLED: &str =
+                    "GitLab did not cancel auto-merge. Refresh to see whether it is still on.";
+                // GitLab 19.5 added `cancel_auto_merge`, which refuses with HTTP 403 or 409,
+                // and deprecated the older endpoint. An unread version keeps the older one.
+                let current = context.host_version.is_some_and(|version| {
+                    version
+                        >= HostVersion {
+                            major: 19,
+                            minor: 5,
+                        }
+                });
+                let endpoint = if current {
+                    format!("{path}/cancel_auto_merge")
+                } else {
+                    format!("{path}/cancel_merge_when_pipeline_succeeds")
+                };
+                let output = self
+                    .runner
+                    .glab(
+                        scope,
+                        &["api", "--method", "POST", &endpoint],
+                        Budget::Mutation,
+                        None,
+                        c,
+                    )
+                    .await
+                    .map_err(|f| {
+                        let mut error = from_process_error(OP, "glab", &f.error, &f.stderr);
+                        if current && error.code == "host_rejected" {
+                            // A 409: the merge request is not set to auto-merge (#156).
+                            error.message = NOT_CANCELLED.into();
+                        }
+                        error
+                    })?;
+                // The older endpoint refuses with HTTP 201 and `"status": "error"` (#156).
+                let body: Value = serde_json::from_str(&output.stdout).unwrap_or_default();
+                if !current && body["status"] == "error" {
+                    let mut error = PullRequestsOperationError::new(OP, "host_rejected");
+                    error.message = NOT_CANCELLED.into();
+                    error.host_detail = body["message"]
+                        .as_str()
+                        .map(|message| message.chars().take(240).collect());
+                    return Err(error);
+                }
                 return Ok(ActionResult::Done);
             }
             SetDraft { draft, .. } => {
@@ -285,7 +321,7 @@ impl GitLabHost {
     ) -> Result<(), PullRequestsOperationError> {
         let result = if let Some(body) = body {
             self.runner
-                .glab_api_with_body(scope, method, path, &body, c)
+                .glab_api_with_body(scope, method, path, &body, Budget::Mutation, c)
                 .await
         } else {
             self.runner
@@ -783,6 +819,7 @@ impl crate::source_control::GitLabCreateTransport for RevertCreateTransport {
                     "POST",
                     &format!("{}/merge_requests", project_path(&self.scope)),
                     &body,
+                    Budget::Mutation,
                     c,
                 )
                 .await

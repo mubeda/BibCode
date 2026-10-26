@@ -690,16 +690,52 @@ fn build_pty_command_from_launch(
         command.raw_windows_args(raw_windows_args);
     }
     command.cwd(&input.cwd);
+    apply_pty_environment(platform, &mut command, &input.env);
+    crate::process::isolate_appimage_environment(&mut command);
+    command
+}
+
+/// Variables naming the tmux, screen, or Zellij pane the server was started
+/// in. A shell that inherits them nests in or addresses that unrelated pane.
+const MULTIPLEXER_ENV_KEYS: [&str; 7] = [
+    "TMUX",
+    "TMUX_PANE",
+    "STY",
+    "WINDOW",
+    "ZELLIJ",
+    "ZELLIJ_SESSION_NAME",
+    "ZELLIJ_PANE_ID",
+];
+const FISH_FEATURES_ENV: &str = "fish_features";
+
+/// Applies `launch_env` over the server environment the command inherited.
+fn apply_pty_environment(
+    platform: Platform,
+    command: &mut CommandBuilder,
+    launch_env: &BTreeMap<String, String>,
+) {
     // Interactive agent TUIs inherit the host process environment. Cursor and
     // other agent shells often export NO_COLOR=1 / FORCE_COLOR=0, which chalk
     // and Claude Code honor by emitting no ANSI colours at all. Strip those
     // and force colour support for PTY sessions unless the launch env
     // explicitly opts out.
-    ensure_pty_color_environment(&mut command, &input.env);
-    if !input.env.keys().any(|key| key.eq_ignore_ascii_case("TERM")) {
+    ensure_pty_color_environment(command, launch_env);
+    if !launch_env
+        .keys()
+        .any(|key| key.eq_ignore_ascii_case("TERM"))
+    {
         command.env("TERM", DEFAULT_TERMINAL_TYPE);
     }
-    for (key, value) in &input.env {
+    // Only inherited values are removed: the launch env below still wins.
+    for name in MULTIPLEXER_ENV_KEYS {
+        for key in pty_env_entries(platform, command, name)
+            .map(|(key, _)| key.to_owned())
+            .collect::<Vec<_>>()
+        {
+            command.env_remove(key);
+        }
+    }
+    for (key, value) in launch_env {
         // Internal terminal theme values configure PTY setup and query
         // responses. Windows environment keys are case-insensitive.
         if is_reserved_pty_env_key_on(platform, key) {
@@ -707,8 +743,55 @@ fn build_pty_command_from_launch(
         }
         command.env(key, value);
     }
-    crate::process::isolate_appimage_environment(&mut command);
-    command
+    skip_fish_terminal_query(platform, command);
+}
+
+/// fish 4.1 and later can wait at startup for a device-attributes reply that no
+/// renderer can give before a client attaches. Appending `no-query-term` skips
+/// that query, and the fish features that need its replies, unless the
+/// inherited or launch environment already chose `query-term` or
+/// `no-query-term`.
+fn skip_fish_terminal_query(platform: Platform, command: &mut CommandBuilder) {
+    let existing = pty_env_entries(platform, command, FISH_FEATURES_ENV)
+        .next()
+        .map(|(key, value)| (key.to_owned(), value.to_owned()));
+    // fish reads the value as comma-separated flags with surrounding whitespace.
+    let chose_query = |features: &OsStr| {
+        features
+            .to_string_lossy()
+            .split(',')
+            .any(|flag| matches!(flag.trim(), "query-term" | "no-query-term"))
+    };
+    let (key, features) = match existing {
+        Some((_, features)) if chose_query(&features) => return,
+        Some((key, mut features)) => {
+            if !features.is_empty() {
+                features.push(",");
+            }
+            features.push("no-query-term");
+            (key, features)
+        }
+        None => (FISH_FEATURES_ENV.into(), "no-query-term".into()),
+    };
+    command.env(key, features);
+}
+
+/// The command's environment entries named `name`, which Windows matches
+/// case-insensitively.
+fn pty_env_entries<'a>(
+    platform: Platform,
+    command: &'a CommandBuilder,
+    name: &'a str,
+) -> impl Iterator<Item = (&'a OsStr, &'a OsStr)> {
+    command.iter_full_env().filter(move |(key, _)| {
+        key.to_str().is_some_and(|key| {
+            if platform == Platform::Windows {
+                key.eq_ignore_ascii_case(name)
+            } else {
+                key == name
+            }
+        })
+    })
 }
 
 /// Ensures PTY children can emit colours even when the BiBCode host was
@@ -2238,6 +2321,31 @@ mod tests {
     }
 
     #[test]
+    fn prepared_command_scrubs_multiplexers_and_keeps_an_explicit_pane() {
+        let executable = std::env::current_exe().expect("current test executable");
+        let input = PtySpawnInput {
+            executable: executable.to_string_lossy().into_owned(),
+            args: Vec::new(),
+            cwd: executable
+                .parent()
+                .expect("test executable directory")
+                .to_path_buf(),
+            cols: 80,
+            rows: 24,
+            env: BTreeMap::from([("TMUX_PANE".to_owned(), "%9".to_owned())]),
+        };
+
+        let command = build_pty_command_on(Platform::Unix, &input).unwrap();
+        assert_eq!(command.get_env("TMUX"), None);
+        assert_eq!(command.get_env("TMUX_PANE"), Some(OsStr::new("%9")));
+        assert!(
+            command
+                .get_env("fish_features")
+                .is_some_and(|features| features.to_string_lossy().contains("query-term"))
+        );
+    }
+
+    #[test]
     fn reserved_pty_env_keys_follow_platform_case_rules() {
         for key in [
             crate::terminal::osc::OSC_FOREGROUND_ENV,
@@ -2332,6 +2440,119 @@ mod tests {
         assert_eq!(command.get_env("bibcode_osc_cursor"), None);
         assert_eq!(command.get_env("BiBCode_Windows_Console_Theme"), None);
         assert_eq!(command.get_env("ORDINARY"), Some(OsStr::new("value")));
+    }
+
+    /// A command holding `inherited` the way a server started inside a
+    /// multiplexer would, without changing this test process's environment.
+    fn command_inheriting(inherited: &[(&str, &str)]) -> CommandBuilder {
+        let mut command = CommandBuilder::new("shell");
+        for (key, value) in inherited {
+            command.env(key, value);
+        }
+        command
+    }
+
+    #[test]
+    fn pty_environment_drops_inherited_multiplexer_variables_but_keeps_explicit_ones() {
+        let mut command = command_inheriting(&[
+            ("TMUX", "/tmp/tmux-501/default,1,0"),
+            ("TMUX_PANE", "%1"),
+            ("STY", "1.pts-0.host"),
+            ("WINDOW", "0"),
+            ("ZELLIJ", "0"),
+            ("ZELLIJ_SESSION_NAME", "outer"),
+            ("ZELLIJ_PANE_ID", "1"),
+            ("ORDINARY", "value"),
+        ]);
+        let launch_env = BTreeMap::from([("TMUX_PANE".to_owned(), "%9".to_owned())]);
+
+        apply_pty_environment(Platform::Unix, &mut command, &launch_env);
+
+        for key in [
+            "TMUX",
+            "STY",
+            "WINDOW",
+            "ZELLIJ",
+            "ZELLIJ_SESSION_NAME",
+            "ZELLIJ_PANE_ID",
+        ] {
+            assert_eq!(command.get_env(key), None, "{key}");
+        }
+        assert_eq!(command.get_env("TMUX_PANE"), Some(OsStr::new("%9")));
+        assert_eq!(command.get_env("ORDINARY"), Some(OsStr::new("value")));
+        assert_eq!(command.get_env("TERM"), Some(OsStr::new("xterm-256color")));
+        assert_eq!(command.get_env("COLORTERM"), Some(OsStr::new("truecolor")));
+        assert_eq!(command.get_env("FORCE_COLOR"), Some(OsStr::new("3")));
+    }
+
+    #[test]
+    fn pty_environment_skips_the_fish_terminal_query_unless_it_was_chosen() {
+        let mut command = command_inheriting(&[]);
+        command.env_remove("fish_features");
+        apply_pty_environment(Platform::Unix, &mut command, &BTreeMap::new());
+        assert_eq!(
+            command.get_env("fish_features"),
+            Some(OsStr::new("no-query-term"))
+        );
+
+        for (features, expected) in [
+            ("qmark-noglob", "qmark-noglob,no-query-term"),
+            ("query-term", "query-term"),
+            ("no-query-term", "no-query-term"),
+            ("qmark-noglob,no-query-term", "qmark-noglob,no-query-term"),
+            ("qmark-noglob, query-term", "qmark-noglob, query-term"),
+            ("query-term-extra", "query-term-extra,no-query-term"),
+        ] {
+            let mut inherited = command_inheriting(&[("fish_features", features)]);
+            apply_pty_environment(Platform::Unix, &mut inherited, &BTreeMap::new());
+            assert_eq!(
+                inherited.get_env("fish_features"),
+                Some(OsStr::new(expected)),
+                "inherited {features:?}"
+            );
+
+            let mut explicit = command_inheriting(&[("fish_features", "stderr-nocaret")]);
+            let launch_env = BTreeMap::from([("fish_features".to_owned(), features.to_owned())]);
+            apply_pty_environment(Platform::Unix, &mut explicit, &launch_env);
+            assert_eq!(
+                explicit.get_env("fish_features"),
+                Some(OsStr::new(expected)),
+                "explicit {features:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_pty_environment_matches_multiplexer_and_fish_names_case_insensitively() {
+        let mut command = command_inheriting(&[
+            ("Tmux", "/tmp/tmux-501/default,1,0"),
+            ("Sty", "1.pts-0.host"),
+            ("zellij_pane_id", "1"),
+            ("Fish_Features", "qmark-noglob"),
+        ]);
+        let launch_env = BTreeMap::from([("tmux_pane".to_owned(), "%9".to_owned())]);
+
+        apply_pty_environment(Platform::Windows, &mut command, &launch_env);
+
+        let environment: Vec<(String, String)> = command
+            .iter_full_env_as_str()
+            .map(|(key, value)| (key.to_owned(), value.to_owned()))
+            .collect();
+        let named = |name: &str| {
+            environment
+                .iter()
+                .filter(|(key, _)| key.eq_ignore_ascii_case(name))
+                .map(|(key, value)| (key.as_str(), value.as_str()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(named("TMUX"), []);
+        assert_eq!(named("STY"), []);
+        assert_eq!(named("ZELLIJ_PANE_ID"), []);
+        assert_eq!(named("TMUX_PANE"), [("tmux_pane", "%9")]);
+        assert_eq!(
+            named("fish_features"),
+            [("Fish_Features", "qmark-noglob,no-query-term")]
+        );
     }
 
     #[test]

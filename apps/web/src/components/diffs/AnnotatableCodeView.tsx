@@ -70,6 +70,25 @@ function appendAnnotationEntry(
   );
 }
 
+/** An unsent comment, held outside the view so it survives the view unmounting. */
+export interface LiftedCommentDraft {
+  readonly id: string;
+  readonly filePath: string;
+  readonly range: SelectedLineRange;
+  readonly rangeLabel: string;
+}
+
+/**
+ * Where an unsent comment lives when the view is not its owner: its location, and its text,
+ * which the comment field reads once when it mounts and writes on every change.
+ */
+export interface CommentDraftStore {
+  readonly draft: LiftedCommentDraft | null;
+  readonly onDraftChange: (draft: LiftedCommentDraft | null) => void;
+  readonly readDraftText: (id: string) => string;
+  readonly onDraftTextChange: (id: string, text: string) => void;
+}
+
 interface AnnotatableSelectedLines {
   readonly id: string;
   readonly range: SelectedLineRange;
@@ -81,6 +100,11 @@ export interface AnnotatableCodeViewProps {
     filePath: string;
     fileKey: string;
     collapsed: boolean;
+    /**
+     * The file comments are placed against, when the rendered one has other hunks: Compare
+     * renders a patch with its own context count, while comments index the default hunks.
+     */
+    commentFileDiff?: FileDiffMetadata;
   }>;
   sectionId: string;
   sectionTitle: string;
@@ -98,6 +122,8 @@ export interface AnnotatableCodeViewProps {
   selectedLines?: AnnotatableSelectedLines | null;
   onSelectedLinesChange?: (selection: AnnotatableSelectedLines | null) => void;
   onLineSelectionEnd?: (range: SelectedLineRange | null, context: DiffSelectionContext) => void;
+  /** Keeps an unsent comment outside the view; without it the view owns the draft. */
+  draftStore?: CommentDraftStore;
 }
 
 export interface DiffSelectionContext {
@@ -118,6 +144,7 @@ export function AnnotatableCodeView({
   selectedLines: controlledSelectedLines,
   onSelectedLinesChange,
   onLineSelectionEnd,
+  draftStore,
 }: AnnotatableCodeViewProps) {
   const addReviewComment = useComposerDraftStore((store) => store.addReviewComment);
   const removeReviewComment = useComposerDraftStore((store) => store.removeReviewComment);
@@ -127,15 +154,62 @@ export function AnnotatableCodeView({
   const [localSelectedLines, setLocalSelectedLines] = useState<AnnotatableSelectedLines | null>(
     null,
   );
-  const [draft, setDraft] = useState<{
+  const [localDraft, setLocalDraft] = useState<{
     fileKey: string;
     annotation: DiffCommentLineAnnotation;
   } | null>(null);
 
   const filesByKey = useMemo(() => new Map(files.map((file) => [file.fileKey, file])), [files]);
+  // A lifted draft is placed by path: Changes and Compare key the same file differently.
+  const liftedDraft = draftStore?.draft ?? null;
+  const draft = useMemo(() => {
+    if (!draftStore) return localDraft;
+    if (!liftedDraft) return null;
+    const file = files.find((candidate) => candidate.filePath === liftedDraft.filePath);
+    if (!file) return null;
+    return {
+      fileKey: file.fileKey,
+      annotation: {
+        side: annotationSide(liftedDraft.range),
+        lineNumber: liftedDraft.range.end,
+        metadata: {
+          entries: [
+            {
+              id: liftedDraft.id,
+              kind: "draft" as const,
+              range: liftedDraft.range,
+              rangeLabel: liftedDraft.rangeLabel,
+              text: "",
+            },
+          ],
+        },
+      },
+    };
+  }, [draftStore, files, liftedDraft, localDraft]);
+  const setDraft = useCallback(
+    (next: { fileKey: string; annotation: DiffCommentLineAnnotation } | null) => {
+      if (!draftStore) {
+        setLocalDraft(next);
+        return;
+      }
+      const entry = next?.annotation.metadata.entries[0];
+      const file = next ? filesByKey.get(next.fileKey) : undefined;
+      draftStore.onDraftChange(
+        entry && file
+          ? {
+              id: entry.id,
+              filePath: file.filePath,
+              range: entry.range,
+              rangeLabel: entry.rangeLabel,
+            }
+          : null,
+      );
+    },
+    [draftStore, filesByKey],
+  );
   const items = useMemo<CodeViewDiffItem<DiffCommentAnnotationGroup>[]>(
     () =>
-      files.map(({ fileDiff, filePath, fileKey, collapsed }) => {
+      files.map(({ fileDiff, filePath, fileKey, collapsed, commentFileDiff }) => {
         const persisted = reviewComments
           .filter(
             (comment) =>
@@ -144,7 +218,7 @@ export function AnnotatableCodeView({
               (comment.fenceLanguage ?? "diff") === "diff",
           )
           .reduce<DiffCommentLineAnnotation[]>((annotations, comment) => {
-            const range = restoreDiffReviewCommentRange(fileDiff, comment);
+            const range = restoreDiffReviewCommentRange(commentFileDiff ?? fileDiff, comment);
             if (!range) return annotations;
             return appendAnnotationEntry(annotations, range, {
               id: comment.id,
@@ -185,7 +259,7 @@ export function AnnotatableCodeView({
         removeReviewComment(composerDraftTarget, entryId);
       }
     },
-    [composerDraftTarget, draft, removeReviewComment],
+    [composerDraftTarget, draft, removeReviewComment, setDraft],
   );
 
   const submitEntry = useCallback(
@@ -200,7 +274,7 @@ export function AnnotatableCodeView({
         sectionId,
         sectionTitle,
         filePath: file.filePath,
-        fileDiff: file.fileDiff,
+        fileDiff: file.commentFileDiff ?? file.fileDiff,
         range: entry.range,
         text,
       });
@@ -208,7 +282,7 @@ export function AnnotatableCodeView({
       setLocalSelectedLines(null);
       setDraft(null);
     },
-    [addReviewComment, composerDraftTarget, draft, filesByKey, sectionId, sectionTitle],
+    [addReviewComment, composerDraftTarget, draft, filesByKey, sectionId, sectionTitle, setDraft],
   );
 
   const beginComment = useCallback(
@@ -224,7 +298,7 @@ export function AnnotatableCodeView({
         sectionId,
         sectionTitle,
         filePath: file.filePath,
-        fileDiff: file.fileDiff,
+        fileDiff: file.commentFileDiff ?? file.fileDiff,
         range,
         text: "",
       });
@@ -240,7 +314,7 @@ export function AnnotatableCodeView({
         },
       });
     },
-    [filesByKey, sectionId, sectionTitle],
+    [filesByKey, sectionId, sectionTitle, setDraft],
   );
 
   const commentSelectionEnabled = onLineSelectionEnd === undefined;
@@ -274,6 +348,12 @@ export function AnnotatableCodeView({
               kind={entry.kind}
               rangeLabel={entry.rangeLabel}
               text={entry.text}
+              {...(draftStore && entry.kind === "draft"
+                ? {
+                    initialText: draftStore.readDraftText(entry.id),
+                    onTextChange: (text: string) => draftStore.onDraftTextChange(entry.id, text),
+                  }
+                : {})}
               onCancel={() => removeEntry(entry.id)}
               onComment={(text) => submitEntry(entry.id, text)}
               onDelete={() => removeEntry(entry.id)}

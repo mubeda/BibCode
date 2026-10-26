@@ -107,6 +107,8 @@ impl TestSandbox {
             })
             .find(|candidate| candidate.is_file())
             .and_then(|candidate| std::fs::canonicalize(candidate).ok())
+            // Fixture scripts run it through `cmd`, which cannot start a `\\?\` path.
+            .map(crate::production::host_paths::process_compatible_path)
             .unwrap_or_else(|| panic!("{name} executable was not found on captured PATH"))
     }
 

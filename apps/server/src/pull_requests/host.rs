@@ -65,6 +65,8 @@ pub enum Budget {
     Large,
     Mutation,
     CheckoutWrite,
+    /// A whole job log: 90 s, and its last 16 MiB kept (`OutputPolicy::Tail`).
+    Log,
 }
 
 impl Budget {
@@ -73,15 +75,36 @@ impl Budget {
             Self::Read => Duration::from_secs(30),
             Self::Large | Self::Mutation => Duration::from_secs(60),
             Self::CheckoutWrite => crate::git::CHECKOUT_WRITE_TIMEOUT,
+            Self::Log => Duration::from_secs(90),
         }
     }
 
     fn output_limit(self) -> usize {
         match self {
             Self::Large => 8 * 1024 * 1024,
+            Self::Log => LOG_OUTPUT_LIMIT,
             Self::Read | Self::Mutation | Self::CheckoutWrite => 1024 * 1024,
         }
     }
+
+    /// A log keeps its end, where failures print; every other read fails over its cap.
+    fn output_policy(self) -> OutputPolicy {
+        match self {
+            Self::Log => OutputPolicy::Tail,
+            Self::Read | Self::Large | Self::Mutation | Self::CheckoutWrite => OutputPolicy::Error,
+        }
+    }
+}
+
+/// The most of one job log a full download keeps.
+pub const LOG_OUTPUT_LIMIT: usize = 16 * 1024 * 1024;
+
+/// A raw `glab api` answer: stdout bytes, and how many bytes of its head a
+/// `Budget::Log` read dropped.
+#[derive(Clone, Debug)]
+pub struct RawOutput {
+    pub stdout: Vec<u8>,
+    pub dropped_bytes: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -257,12 +280,116 @@ impl HostCommandRunner {
         .await
     }
 
+    /// `glab api` with the raw stdout bytes: `include_headers` adds `-i`, so
+    /// the status line and headers come before the body; a `body` is POSTed
+    /// through the private body file, as in `glab_api_with_body`.
+    pub(super) async fn glab_api_raw(
+        &self,
+        scope: &HostScope,
+        path: &str,
+        body: Option<&serde_json::Value>,
+        include_headers: bool,
+        budget: Budget,
+        c: &CancellationToken,
+    ) -> Result<RawOutput, ProcessFailure> {
+        let private_file = match body {
+            Some(body) => Some(
+                crate::source_control::PrivateJsonBody::write(
+                    &self.state_dir.join("pull-requests"),
+                    body,
+                )
+                .await
+                .map_err(body_io_error)?,
+            ),
+            None => None,
+        };
+        let mut args: Vec<OsString> = vec!["api".into()];
+        if include_headers {
+            args.push("-i".into());
+        }
+        if let Some(file) = &private_file {
+            args.extend([
+                "--method".into(),
+                "POST".into(),
+                path.into(),
+                "-H".into(),
+                "Content-Type: application/json".into(),
+                "--input".into(),
+                file.path().as_os_str().to_owned(),
+            ]);
+        } else {
+            args.push(path.into());
+        }
+        let request =
+            self.provider_request(scope, PullRequestsProvider::Gitlab, &args, budget, None);
+        self.execute_bytes(request, c).await
+    }
+
+    /// `gh api` GET with the raw stdout bytes, pinned to the scope's host and
+    /// to the REST API version both github.com and GitHub Enterprise Server
+    /// serve. `include_headers` adds `-i`, so a refusal keeps its rate-limit
+    /// headers; a log download goes without, so its kept tail is all log text.
+    pub(super) async fn gh_api_raw(
+        &self,
+        scope: &HostScope,
+        path: &str,
+        include_headers: bool,
+        budget: Budget,
+        c: &CancellationToken,
+    ) -> Result<RawOutput, ProcessFailure> {
+        self.gh_api_request(scope, None, path, include_headers, budget, c)
+            .await
+    }
+
+    /// `gh api --method POST` with no body, as `gh_api_raw` otherwise, with
+    /// the headers kept (`-i`) so a refusal keeps its rate-limit pause.
+    /// GitHub's re-run and cancel endpoints answer 201 or 202 with no body.
+    pub(super) async fn gh_api_post_raw(
+        &self,
+        scope: &HostScope,
+        path: &str,
+        budget: Budget,
+        c: &CancellationToken,
+    ) -> Result<RawOutput, ProcessFailure> {
+        self.gh_api_request(scope, Some("POST"), path, true, budget, c)
+            .await
+    }
+
+    async fn gh_api_request(
+        &self,
+        scope: &HostScope,
+        method: Option<&str>,
+        path: &str,
+        include_headers: bool,
+        budget: Budget,
+        c: &CancellationToken,
+    ) -> Result<RawOutput, ProcessFailure> {
+        let mut args: Vec<OsString> = vec!["api".into()];
+        if include_headers {
+            args.push("-i".into());
+        }
+        if let Some(method) = method {
+            args.extend(["--method".into(), method.into()]);
+        }
+        args.extend([
+            "-H".into(),
+            "X-GitHub-Api-Version: 2022-11-28".into(),
+            "--hostname".into(),
+            scope.host.clone().into(),
+            path.into(),
+        ]);
+        let request =
+            self.provider_request(scope, PullRequestsProvider::Github, &args, budget, None);
+        self.execute_bytes(request, c).await
+    }
+
     pub async fn glab_api_with_body(
         &self,
         scope: &HostScope,
         method: &str,
         path: &str,
         body: &serde_json::Value,
+        budget: Budget,
         c: &CancellationToken,
     ) -> Result<CommandOutput, ProcessFailure> {
         let private_file = crate::source_control::PrivateJsonBody::write(
@@ -283,7 +410,7 @@ impl HostCommandRunner {
                 OsStr::new("--input"),
                 private_file.path().as_os_str(),
             ],
-            Budget::Mutation,
+            budget,
             None,
             c,
         )
@@ -338,10 +465,46 @@ impl HostCommandRunner {
             stdin: stdin.map(<[u8]>::to_vec),
             timeout: budget.timeout(),
             max_output_bytes: budget.output_limit(),
-            output_policy: OutputPolicy::Error,
+            output_policy: budget.output_policy(),
             append_truncation_marker: false,
             allow_non_zero_exit: true,
         }
+    }
+
+    /// As `execute`, keeping stdout as bytes: a log's text is cut to a
+    /// character boundary by its reader, not decoded lossily here.
+    async fn execute_bytes(
+        &self,
+        request: ProcessRequest,
+        c: &CancellationToken,
+    ) -> Result<RawOutput, ProcessFailure> {
+        let operation = request.operation.clone();
+        let output = self
+            .runner
+            .run_bytes(request, c)
+            .await
+            .map_err(|error| ProcessFailure {
+                error,
+                stderr: String::new(),
+            })?;
+        if output.exit_code != 0 {
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            return Err(ProcessFailure {
+                error: ProcessError::NonZeroExit {
+                    operation,
+                    exit_code: output.exit_code,
+                    stdout_length: output.stdout.len(),
+                    stderr_length: output.stderr.len(),
+                    stdout: String::from_utf8_lossy(&output.stdout).into(),
+                    stderr: stderr.clone().into(),
+                },
+                stderr,
+            });
+        }
+        Ok(RawOutput {
+            stdout: output.stdout,
+            dropped_bytes: output.stdout_dropped_bytes,
+        })
     }
 
     async fn execute(
@@ -894,6 +1057,7 @@ cat "$8"
                     method,
                     endpoint,
                     &body,
+                    Budget::Mutation,
                     &CancellationToken::new(),
                 )
                 .await
@@ -943,8 +1107,14 @@ cat "$8"
             let scope = scope(&s);
             let c = CancellationToken::new();
             let body = serde_json::json!({ "body": "private body never in argv" });
-            let call =
-                runner.glab_api_with_body(&scope, "POST", "projects/team%2Frepo/notes", &body, &c);
+            let call = runner.glab_api_with_body(
+                &scope,
+                "POST",
+                "projects/team%2Frepo/notes",
+                &body,
+                Budget::Mutation,
+                &c,
+            );
             let inspect = async {
                 let path = tokio::time::timeout(Duration::from_secs(2), async {
                     loop {

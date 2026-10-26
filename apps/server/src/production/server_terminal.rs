@@ -12,6 +12,7 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
+use crate::ecmascript::trim as trim_ecmascript;
 use crate::{
     cloud::{RelayClientInstallEvent, RelayClientService, RelayClientStatus},
     diagnostics::{
@@ -190,8 +191,9 @@ impl ServerTerminalServices {
     }
 
     pub(crate) async fn freeze_process_ownership(&self) -> RuntimeProcessOwnership {
-        let roots = self.process_attribution.freeze_and_snapshot_identities();
-        match self
+        let frozen = self.process_attribution.freeze_and_snapshot_ownership();
+        let (roots, survivors) = (frozen.roots, frozen.survivors);
+        let ownership = match self
             .process_sampler
             .capture_runtime_process_ownership(roots.clone())
             .await
@@ -209,10 +211,12 @@ impl ServerTerminalServices {
                 );
                 RuntimeProcessOwnership::roots_only(roots)
             }
-        }
+        };
+        ownership.with_survivors(survivors)
     }
 
     pub(crate) async fn shutdown_with_process_ownership(&self, ownership: RuntimeProcessOwnership) {
+        let survivors = ownership.survivors().to_vec();
         self.workspace_watch.cancel();
         self.terminal.shutdown().await;
         match self
@@ -245,7 +249,13 @@ impl ServerTerminalServices {
                 tracing::warn!(%error, "failed to inspect remaining runtime-owned processes during shutdown");
             }
         }
-        match cleanup_server_descendants(self.process_tree_cleanup, &self.process_sampler).await {
+        match cleanup_server_descendants(
+            self.process_tree_cleanup,
+            &self.process_sampler,
+            &survivors,
+        )
+        .await
+        {
             Ok(Some(report)) if report.failure_count > 0 => {
                 tracing::warn!(
                     attempted = report.attempted,
@@ -450,13 +460,16 @@ impl ServerTerminalServices {
     }
 }
 
+/// A standalone server kills every descendant of its own pid, except the processes that
+/// survive shutdown and what they started.
 async fn cleanup_server_descendants(
     process_tree_cleanup: ProcessTreeCleanup,
     process_sampler: &NativeProcessSampler,
+    survivors: &[crate::diagnostics::ProcessIdentity],
 ) -> Result<Option<crate::process::ProcessCleanupReport>, crate::diagnostics::SignalError> {
     match process_tree_cleanup {
         ProcessTreeCleanup::StandaloneServer => process_sampler
-            .cleanup_descendants(std::process::id())
+            .cleanup_descendants(std::process::id(), survivors)
             .await
             .map(Some),
         ProcessTreeCleanup::EmbeddedHost => Ok(None),
@@ -1420,32 +1433,6 @@ const TERMINAL_LAUNCH_LABEL_MAX_LENGTH: usize = 128;
 const TERMINAL_SIZE_CLAIM_MAX_LENGTH: usize = 128;
 const PROVIDER_TERMINAL_ACTIVITY_SLUG_MAX_LENGTH: usize = 64;
 
-fn is_ecmascript_trim_character(character: char) -> bool {
-    matches!(
-        character,
-        '\u{0009}'
-            | '\u{000a}'
-            | '\u{000b}'
-            | '\u{000c}'
-            | '\u{000d}'
-            | '\u{0020}'
-            | '\u{00a0}'
-            | '\u{1680}'
-            | '\u{2000}'
-            ..='\u{200a}'
-                | '\u{2028}'
-                | '\u{2029}'
-                | '\u{202f}'
-                | '\u{205f}'
-                | '\u{3000}'
-                | '\u{feff}'
-    )
-}
-
-fn trim_ecmascript(value: &str) -> &str {
-    value.trim_matches(is_ecmascript_trim_character)
-}
-
 fn is_provider_terminal_activity_slug(value: &str) -> bool {
     let mut characters = value.chars();
     characters
@@ -2257,6 +2244,7 @@ mod tests {
         let cleanup = cleanup_server_descendants(
             ProcessTreeCleanup::EmbeddedHost,
             &NativeProcessSampler::default(),
+            &[],
         )
         .await
         .expect("embedded cleanup policy is evaluated");

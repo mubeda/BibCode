@@ -163,7 +163,7 @@ describe("FileEditingSessionRegistry", () => {
     await Promise.resolve();
 
     expect(persist).toHaveBeenCalledOnce();
-    expect(persist).toHaveBeenCalledWith("src/app.ts", "paused draft");
+    expect(persist).toHaveBeenCalledWith("src/app.ts", "paused draft", null);
   });
 
   it("keeps a paused edit explicit when its session reactivates before release", async () => {

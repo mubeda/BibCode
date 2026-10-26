@@ -25,12 +25,16 @@ export interface CommandPaletteItem {
   /** Optional content rendered inline after the title text (before the timestamp). */
   readonly titleTrailingContent?: ReactNode;
   readonly shortcutCommand?: KeybindingCommand;
+  /** A key label for a shortcut that is not a server rule, such as Find in thread's Mod+F. */
+  readonly shortcutLabel?: string;
 }
 
 export interface CommandPaletteActionItem extends CommandPaletteItem {
   readonly kind: "action";
   readonly keepOpen?: boolean;
   readonly run: () => Promise<void>;
+  /** Where focus goes once the palette closes; by default, the composer. */
+  readonly finalFocus?: () => void;
 }
 
 export interface CommandPaletteSubmenuItem extends CommandPaletteItem {

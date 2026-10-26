@@ -132,6 +132,13 @@ pub fn is_long_running(method: &str) -> bool {
             | "pullRequests.getContext"
             | "pullRequests.getVocabulary"
             | "pullRequests.getCreateDefaults"
+            // `pipelines.readSnapshot` (the database) and `pipelines.subscribe`
+            // (a stream) stay out, as their Pull Requests counterparts do.
+            | "pipelines.list"
+            | "pipelines.get"
+            | "pipelines.getJob"
+            | "pipelines.getJobLog"
+            | "pipelines.runAction"
             | "updater.check"
             | "updater.install"
             | "server.updateProvider"
@@ -146,9 +153,16 @@ pub fn is_long_running(method: &str) -> bool {
             // included.
             | "worktree.remove"
             | "agentSessions.import"
+            // Reads a whole transcript and waits on the project's mutation lock.
+            // `agentSessions.listForThread` stays out: its budget bounds it, so a slow one is a
+            // finding.
+            | "agentSessions.openInPanel"
             // Waits on discovery and `simctl`: `check_available` lists simulators (up to
             // 15 s), and a rediscovery runs the Xcode probes.
             | "device.open"
+            // Reruns every platform's discovery: `emulator -list-avds` and `-accel-check`, and
+            // `simctl` and the Xcode probes on macOS.
+            | "device.refreshCatalog"
             // Wait on the emulator: stopping it (up to 10 s), a stalled input stream (up to
             // 5 s), typing a paste on Android (at most 100 characters, 5 ms apart: under
             // 1 s), and reading back a rotation (a 2.5 s window on Android, longer when a
@@ -156,6 +170,10 @@ pub fn is_long_running(method: &str) -> bool {
             | "device.close"
             | "device.input"
             | "device.rotate"
+            // `--tool-help` probes about 30 tools (1.7 s measured), and a launch waits up to
+            // 1 s on an external program.
+            | "review.listDiffTools"
+            | "review.openDiffTool"
     )
 }
 
@@ -167,6 +185,7 @@ pub fn is_background(method: &str) -> bool {
         "vcs.",
         "worktree.",
         "pullRequests.",
+        "pipelines.",
         "server.refresh",
     ]
     .iter()
@@ -917,6 +936,13 @@ mod tests {
             "pullRequests.list",
             "server.refreshProviders",
             "projects.searchEntries",
+            "pipelines.list",
+            "pipelines.get",
+            "pipelines.getJob",
+            "pipelines.getJobLog",
+            "pipelines.readSnapshot",
+            "pipelines.subscribe",
+            "pipelines.runAction",
         ] {
             assert!(is_background(method), "{method}");
         }
@@ -1122,10 +1148,13 @@ mod tests {
             "gitManager.commit",
             "worktree.remove",
             "device.open",
+            "device.refreshCatalog",
             "device.close",
             "device.input",
             "device.rotate",
             "server.getProviderCapabilities",
+            "review.listDiffTools",
+            "review.openDiffTool",
         ] {
             book.observe(method, "success", 1_500.0, 0.0, None);
         }
@@ -1144,6 +1173,21 @@ mod tests {
         // git command timeout. A slow one is a slowness worth reporting.
         assert!(!is_long_running("worktree.adopt"));
         assert!(!is_long_running("gitManager.previewMerge"));
+        // A local, bounded read: a slow one is worth reporting.
+        assert!(!is_long_running("review.readFileVersion"));
+        // Every host-bound Pipelines read and the action wait on `glab` or
+        // `gh`; the snapshot read and the stream do not.
+        for method in [
+            "pipelines.list",
+            "pipelines.get",
+            "pipelines.getJob",
+            "pipelines.getJobLog",
+            "pipelines.runAction",
+        ] {
+            assert!(is_long_running(method), "{method}");
+        }
+        assert!(!is_long_running("pipelines.readSnapshot"));
+        assert!(!is_long_running("pipelines.subscribe"));
     }
 
     #[test]

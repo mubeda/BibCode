@@ -8,13 +8,46 @@
  * reason. Grok remains an internal compatibility driver and is intentionally
  * excluded from user-facing agent and terminal actions.
  */
-import { ProviderDriverKind } from "@bibcode/contracts";
+import {
+  ProviderDriverKind,
+  type OrchestrationThreadShell,
+  type ThreadId,
+} from "@bibcode/contracts";
 
 import {
   isProviderInstancePickerReady,
   isProviderInstancePickerVisible,
   type ProviderInstanceEntry,
 } from "~/providerInstances";
+
+/** The most closed chats Reopen closed chat and History list. */
+export const MAX_CLOSED_CHATS = 10;
+
+export interface ClosedChatPanel {
+  readonly id: ThreadId;
+  readonly title: string;
+  readonly archivedAt: string;
+}
+
+/**
+ * The host's closed (archived) chat panels, most recently closed first, at most
+ * {@link MAX_CLOSED_CHATS}: what **Reopen closed chat** and History's This thread list.
+ */
+export function selectClosedChatPanels(
+  threads: ReadonlyArray<
+    Pick<OrchestrationThreadShell, "id" | "title" | "kind" | "hostThreadId" | "archivedAt">
+  >,
+  hostThreadId: ThreadId,
+): ReadonlyArray<ClosedChatPanel> {
+  return threads
+    .flatMap((thread) =>
+      thread.kind === "panel" && thread.hostThreadId === hostThreadId && thread.archivedAt !== null
+        ? [{ id: thread.id, title: thread.title, archivedAt: thread.archivedAt }]
+        : [],
+    )
+    .toSorted((left, right) => right.archivedAt.localeCompare(left.archivedAt))
+    .slice(0, MAX_CLOSED_CHATS);
+}
 
 /** Reason shown on a visible-but-not-ready provider item. */
 export const PROVIDER_NOT_READY_REASON =

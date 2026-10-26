@@ -1,4 +1,5 @@
 import { renderToStaticMarkup } from "react-dom/server";
+import { getSharedHighlighter } from "@pierre/diffs";
 import { DEFAULT_CLIENT_SETTINGS } from "@bibcode/contracts/settings";
 import { act, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
@@ -6,6 +7,7 @@ import { Window } from "happy-dom";
 import { afterEach, beforeEach, describe, expect, it } from "vite-plus/test";
 import { vi } from "vite-plus/test";
 import { __setClientSettingsForTests } from "../hooks/useSettings";
+import { writeThemePreference } from "../hooks/useTheme";
 
 vi.mock("./ui/menu", () => ({
   Menu: ({ children }: { children?: ReactNode }) => <>{children}</>,
@@ -81,6 +83,9 @@ interface RenderOptions {
   skills?: ReadonlyArray<{ name: string; displayName: string }>;
   className?: string;
   lineBreaks?: boolean;
+  detailsOpen?: ReadonlyMap<number, boolean>;
+  onDetailsOpenChange?: (ordinal: number, open: boolean) => void;
+  findScope?: string;
 }
 
 async function renderMarkdown(text: string, options: RenderOptions = {}) {
@@ -153,8 +158,8 @@ describe("ChatMarkdown", () => {
     });
 
     it("estimates highlight memory and disambiguates duplicate file basenames", async () => {
-      const { buildFileLinkParentSuffixByPath, estimateHighlightedSize } =
-        await import("./ChatMarkdown");
+      const { estimateHighlightedSize } = await import("./ChatMarkdown");
+      const { buildFileLinkParentSuffixByPath } = await import("./chatMarkdownPipeline");
 
       expect(estimateHighlightedSize("12345", "x")).toBe(10);
       expect(estimateHighlightedSize("x", "12345")).toBe(15);
@@ -172,7 +177,8 @@ describe("ChatMarkdown", () => {
     });
 
     it("extracts markdown hrefs and rejects unsupported external hosts", async () => {
-      const { extractMarkdownLinkHrefs, resolveExternalLinkHost } = await import("./ChatMarkdown");
+      const { extractMarkdownLinkHrefs, resolveExternalLinkHost } =
+        await import("./chatMarkdownPipeline");
 
       expect(
         extractMarkdownLinkHrefs('[one](https://one.test) [two](file:///tmp/two "x")'),
@@ -812,6 +818,77 @@ describe("ChatMarkdown", () => {
       expect(details?.dataset.markdownDetailsOpen).toBe("true");
     });
 
+    it("follows a caller-owned open state for each details block and reports toggles", async () => {
+      const text = [
+        "<details>",
+        "<summary>First</summary>",
+        "",
+        "One",
+        "",
+        "</details>",
+        "",
+        "<details open>",
+        "<summary>Second</summary>",
+        "",
+        "Two",
+        "",
+        "</details>",
+      ].join("\n");
+      const onDetailsOpenChange = vi.fn();
+      const container = await mountMarkdown(text, {
+        detailsOpen: new Map([[1, false]]),
+        onDetailsOpenChange,
+      });
+      const blocks = () => [...container.querySelectorAll<HTMLElement>("[data-markdown-details]")];
+      // The first follows its authored attribute; the owner closed the second.
+      expect(blocks().map((block) => block.dataset.markdownDetailsOpen)).toEqual([
+        "false",
+        "false",
+      ]);
+
+      await click(container.querySelectorAll<HTMLElement>("[data-markdown-details-summary]")[0]!);
+
+      expect(onDetailsOpenChange).toHaveBeenCalledWith(0, true);
+      // Controlled: nothing opens until the owner says so.
+      expect(blocks()[0]?.dataset.markdownDetailsOpen).toBe("false");
+    });
+
+    it("marks the text as a find scope and its chrome as ignored", async () => {
+      const container = await mountMarkdown(
+        [
+          '```ts title="a.ts"',
+          "const x = 1;",
+          "```",
+          "",
+          "| a | b |",
+          "| - | - |",
+          "| 1 | 2 |",
+          "",
+          "<details>",
+          "",
+          "Body",
+          "",
+          "</details>",
+        ].join("\n"),
+        { findScope: "md:0" },
+      );
+
+      expect(container.querySelector(".chat-markdown")?.getAttribute("data-find-scope")).toBe(
+        "md:0",
+      );
+      expect(
+        container
+          .querySelector(".chat-markdown-codeblock-header")
+          ?.hasAttribute("data-find-ignore"),
+      ).toBe(true);
+      expect(
+        container.querySelector(".chat-markdown-table-footer")?.hasAttribute("data-find-ignore"),
+      ).toBe(true);
+      // The placeholder summary of a details block without one is chrome, not content.
+      const summary = container.querySelector("[data-markdown-details-summary] [data-find-ignore]");
+      expect(summary?.textContent).toBe("Details");
+    });
+
     it("navigates valid fragment links and preserves modified clicks", async () => {
       const container = await mountMarkdown("# Target\n\n[Jump](#target)");
       const target = document.createElement("div");
@@ -899,6 +976,214 @@ describe("ChatMarkdown", () => {
         },
         failure,
       );
+    });
+  });
+
+  describe("stable components", () => {
+    it("keeps rendered blocks and their state across a theme switch", async () => {
+      writeThemePreference("light");
+      const ChatMarkdown = ChatMarkdownComponent!;
+      const text = "```ts\nconst a = 1;\n```\n\n- [ ] task\n\n[link](https://example.com)";
+      const container = document.createElement("div");
+      document.body.append(container);
+      const root = createRoot(container);
+      mountedTrees.push({ container, root });
+      await act(async () => root.render(<ChatMarkdown text={text} cwd={undefined} />));
+      const block = container.querySelector(".chat-markdown-codeblock");
+      const wrap = () =>
+        container.querySelector<HTMLElement>(".chat-markdown-codeblock button[aria-pressed]");
+      const wrappedBefore = wrap()?.getAttribute("aria-pressed");
+      await click(wrap()!);
+      const listItem = container.querySelector("li");
+      const link = container.querySelector("a");
+
+      writeThemePreference("dark");
+      // A changed prop re-renders the memoized component, which then reads the new theme.
+      await act(async () =>
+        root.render(<ChatMarkdown text={text} cwd={undefined} className="themed" />),
+      );
+
+      for (let attempt = 0; !container.innerHTML.includes("pierre-dark"); attempt++) {
+        if (attempt > 100) throw new Error("the block was never highlighted in the dark theme");
+        await act(async () => new Promise((resolve) => setTimeout(resolve, 20)));
+      }
+      expect(container.querySelector(".chat-markdown-codeblock")).toBe(block);
+      expect(wrap()?.getAttribute("aria-pressed")).not.toBe(wrappedBefore);
+      expect(container.querySelector("li")).toBe(listItem);
+      expect(container.querySelector("a")).toBe(link);
+    });
+  });
+
+  describe("streaming replies", () => {
+    const STREAMED_LANGUAGES = ["ts", "py", "js", "sh"] as const;
+
+    function streamingRoot() {
+      const container = document.createElement("div");
+      document.body.append(container);
+      const root = createRoot(container);
+      mountedTrees.push({ container, root });
+      return {
+        container,
+        root,
+        render: async (text: string, isStreaming = true) => {
+          const ChatMarkdown = ChatMarkdownComponent!;
+          await act(async () =>
+            root.render(<ChatMarkdown text={text} cwd={undefined} isStreaming={isStreaming} />),
+          );
+        },
+      };
+    }
+
+    /** Loads each grammar once, so no streamed block waits on a grammar mid-test. */
+    async function warmStreamingGrammars() {
+      for (const language of STREAMED_LANGUAGES) {
+        const warm = streamingRoot();
+        await warm.render(`\`\`\`${language}\nwarm\n`);
+        for (let attempt = 0; !warm.container.querySelector(".chat-markdown-shiki"); attempt++) {
+          if (attempt > 100) throw new Error(`the ${language} grammar never loaded`);
+          await act(async () => new Promise((resolve) => setTimeout(resolve, 20)));
+        }
+      }
+    }
+
+    async function sharedHighlighter() {
+      return getSharedHighlighter({
+        themes: ["pierre-dark", "pierre-light"],
+        langs: ["ts"],
+        preferredHighlighter: "shiki-js",
+      });
+    }
+
+    it("keeps completed code lines and block controls mounted while the reply grows", async () => {
+      await warmStreamingGrammars();
+      const stream = streamingRoot();
+      await stream.render("Intro\n\n```ts\nconst completed = 1;\nconst cur");
+      const firstLine = stream.container.querySelector(".chat-markdown-shiki .line");
+      expect(firstLine?.textContent).toBe("const completed = 1;");
+      await click(
+        stream.container.querySelector<HTMLElement>(
+          ".chat-markdown-codeblock button[aria-pressed]",
+        )!,
+      );
+      const wrapState = () =>
+        stream.container.querySelector(".chat-markdown-codeblock")?.getAttribute("data-wrap");
+      const toggled = wrapState();
+
+      await stream.render(
+        "Intro\n\n```ts\nconst completed = 1;\nconst current = 2;\n```\n\nAfter **bold**",
+      );
+
+      expect(stream.container.querySelector(".chat-markdown-shiki .line")).toBe(firstLine);
+      expect(firstLine?.isConnected).toBe(true);
+      expect(wrapState()).toBe(toggled);
+    });
+
+    it("keeps a details block the user opened while the reply grows, and follows an edited open attribute", async () => {
+      const details = (open: string, body: string) =>
+        `<details${open}>\n<summary>More</summary>\n\n${body}\n\n</details>`;
+      const isOpen = (container: HTMLElement) =>
+        container.querySelector<HTMLElement>("[data-markdown-details]")?.dataset
+          .markdownDetailsOpen;
+      const stream = streamingRoot();
+      await stream.render(details("", "Body"));
+      await click(stream.container.querySelector<HTMLElement>("[data-markdown-details-summary]")!);
+      await stream.render(details("", "Body and more"));
+      expect(isOpen(stream.container)).toBe("true");
+
+      // An edit to the authored attribute, as in the rendered view of a Markdown file.
+      const edited = streamingRoot();
+      await edited.render(details("", "Body"), false);
+      await edited.render(details(" open", "Body"), false);
+      expect(isOpen(edited.container)).toBe("true");
+      await edited.render(details("", "Body"), false);
+      expect(isOpen(edited.container)).toBe("false");
+    });
+
+    it("does not highlight completed lines again on a delta or when the reply finishes", async () => {
+      await warmStreamingGrammars();
+      const stream = streamingRoot();
+      const text = "```ts\nconst completed = 1;\nconst cur";
+      await stream.render(text);
+      const firstLine = stream.container.querySelector(".chat-markdown-shiki .line");
+      const highlighter = await sharedHighlighter();
+      const toHast = vi.spyOn(highlighter, "codeToHast");
+      const toHtml = vi.spyOn(highlighter, "codeToHtml");
+      const highlightedCompletedLine = () =>
+        [...toHast.mock.calls, ...toHtml.mock.calls].some(([code]) =>
+          code.includes("const completed"),
+        );
+
+      await stream.render(`${text}rent = 2;`);
+      expect(highlightedCompletedLine()).toBe(false);
+      const finished = `${text}rent = 2;\n\`\`\``;
+      await stream.render(finished, false);
+      await act(async () => new Promise((resolve) => setTimeout(resolve, 50)));
+
+      expect(highlightedCompletedLine()).toBe(false);
+      // The finished block stays highlighted in place, without dropping back to plain text.
+      expect(stream.container.querySelector(".chat-markdown-shiki .line")).toBe(firstLine);
+      // A remount, such as scrolling back to the row, shows the finished highlight at once.
+      const remount = streamingRoot();
+      const ChatMarkdown = ChatMarkdownComponent!;
+      act(() => remount.root.render(<ChatMarkdown text={finished} cwd={undefined} />));
+      expect(remount.container.innerHTML).toContain("chat-markdown-shiki");
+    });
+
+    it("renders each streamed prefix as a fresh render of it, across a theme switch", async () => {
+      await warmStreamingGrammars();
+      const text = [
+        "Intro with a [link](https://example.com) and `code`.",
+        "",
+        "```ts",
+        "const a = 1;",
+        "const b = 2;",
+        "```",
+        "",
+        "~~~py",
+        "x = 1",
+        "~~~",
+        "",
+        "> ```js",
+        "> quoted();",
+        "> ```",
+        "",
+        "- [ ] task",
+        "  ```sh",
+        "  echo hi",
+        "  ```",
+        "",
+        "Done.",
+      ].join("\n");
+      // Compares the DOM, not its serialization: an element updated in place lists an attribute
+      // React added later after the others. Tooltip ids come from useId, which differs per root.
+      const markup = (container: HTMLElement) => {
+        const copy = container.cloneNode(true) as HTMLElement;
+        for (const element of copy.querySelectorAll("*")) {
+          const attributes = [...element.attributes]
+            .filter((attribute) => !attribute.value.startsWith("base-ui-"))
+            .map((attribute) => [attribute.name, attribute.value] as const)
+            .toSorted(([a], [b]) => a.localeCompare(b));
+          while (element.attributes[0]) element.removeAttribute(element.attributes[0].name);
+          for (const [name, value] of attributes) element.setAttribute(name, value);
+        }
+        return copy.innerHTML;
+      };
+      const stream = streamingRoot();
+      let switched = false;
+      for (let end = 5; ; end += 5) {
+        const slice = text.slice(0, Math.min(end, text.length));
+        if (!switched && end >= text.length / 2) {
+          writeThemePreference("dark");
+          switched = true;
+        }
+        await stream.render(slice);
+        const fresh = streamingRoot();
+        await fresh.render(slice);
+        expect(markup(stream.container), `prefix ${slice.length}`).toBe(markup(fresh.container));
+        if (end >= text.length) break;
+      }
+      expect(stream.container.innerHTML).toContain("pierre-dark");
+      expect(stream.container.innerHTML).not.toContain("pierre-light");
     });
   });
 });

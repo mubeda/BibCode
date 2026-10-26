@@ -4,19 +4,20 @@ import {
   type PullRequestsViewState,
 } from "../../../pullRequestsStore";
 import { formatRelativeTimeLabel } from "../../../timestampFormat";
+type ListViewState = Pick<PullRequestsViewState, "filters" | "listTab" | "sort">;
 /** The list settings the list view reads; the panel's first-page read uses the same. */
-export const selectListFilters = (view: PullRequestsViewState | undefined) =>
+export const selectListFilters = (view: ListViewState | undefined) =>
   view?.filters ?? DEFAULT_PULL_REQUESTS_VIEW_STATE.filters;
-export const selectListTab = (view: PullRequestsViewState | undefined) =>
+export const selectListTab = (view: ListViewState | undefined) =>
   view?.listTab ?? DEFAULT_PULL_REQUESTS_VIEW_STATE.listTab;
-export const selectListSort = (view: PullRequestsViewState | undefined) =>
+export const selectListSort = (view: ListViewState | undefined) =>
   view?.sort ?? DEFAULT_PULL_REQUESTS_VIEW_STATE.sort;
 /**
  * The Open or Closed first page the list opens on, which the panel reads
  * alongside a pending context. Merged and All wait: GitHub folds them into Closed.
  */
 export function firstPagePrefetchInput(
-  view: PullRequestsViewState | undefined,
+  view: ListViewState | undefined,
   cwd: string,
 ): PullRequestsListInput | null {
   const tab = selectListTab(view);

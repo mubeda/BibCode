@@ -65,6 +65,22 @@ impl<K: Clone + Eq + Hash, V: Clone> ContextCache<K, V> {
             .map(|(_, value)| value.clone())
     }
 
+    /// The last good value and its age, past the TTL too. The poller reuses a
+    /// copy older than the unary reads would; it never loads.
+    pub(super) fn get_any_age(&self, key: &K) -> Option<(Duration, V)> {
+        let slot = self
+            .entries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values
+            .get(key)?
+            .clone();
+        let entry = slot.try_lock().ok()?;
+        entry
+            .as_ref()
+            .map(|(at, value)| (at.elapsed(), value.clone()))
+    }
+
     pub(super) async fn get_or_load<E>(
         &self,
         key: K,
@@ -152,6 +168,22 @@ mod tests {
                 .await,
             Err("cancelled")
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pull_requests_cache_any_age_read_outlives_the_ttl_until_removed() {
+        let cache = ContextCache::default();
+        let c = CancellationToken::new();
+        assert_eq!(cache.get_any_age(&1), None);
+        cache
+            .get_or_load(1, &c, || "cancelled", async { Ok::<_, &str>(7) })
+            .await
+            .unwrap();
+        tokio::time::advance(Duration::from_secs(300)).await;
+        assert_eq!(cache.get(&1), None, "the unary reads keep the 30 s bound");
+        assert_eq!(cache.get_any_age(&1), Some((Duration::from_secs(300), 7)));
+        cache.remove(&1);
+        assert_eq!(cache.get_any_age(&1), None);
     }
 
     #[tokio::test]

@@ -2,9 +2,10 @@ import * as Effect from "effect/Effect";
 import * as Duration from "effect/Duration";
 import * as Schema from "effect/Schema";
 import * as SchemaTransformation from "effect/SchemaTransformation";
-import { TrimmedNonEmptyString, TrimmedString } from "./baseSchemas.ts";
+import { DiffContextLines, TrimmedNonEmptyString, TrimmedString } from "./baseSchemas.ts";
 import { DEFAULT_GIT_TEXT_GENERATION_MODEL, ProviderOptionSelections } from "./model.ts";
 import { ModelSelection } from "./orchestration.ts";
+import { ReviewDiffToolId } from "./review.ts";
 import {
   ProviderDriverKind,
   ProviderInstanceConfig,
@@ -116,7 +117,24 @@ export const TerminalThemePreference = TerminalThemePreferenceValue.pipe(
   Schema.withDecodingDefault(Effect.succeed(DEFAULT_TERMINAL_THEME_PREFERENCE)),
 );
 
+/** The Diff panel's view: the stacked patch (Changes) or one file side by side (Compare). */
+export const DiffViewMode = Schema.Literals(["changes", "compare"]);
+export type DiffViewMode = typeof DiffViewMode.Type;
+export const DEFAULT_DIFF_VIEW_MODE: DiffViewMode = "changes";
+
+/** How Changes lays out each file. */
+export const DiffRenderMode = Schema.Literals(["stacked", "split"]);
+export type DiffRenderMode = typeof DiffRenderMode.Type;
+export const DEFAULT_DIFF_RENDER_MODE: DiffRenderMode = "stacked";
+
+/** Compare's line filter: every line, or the changes with their context lines. */
+export const DiffCompareLines = Schema.Literals(["all", "changes"]);
+export type DiffCompareLines = typeof DiffCompareLines.Type;
+export const DEFAULT_DIFF_COMPARE_LINES: DiffCompareLines = "all";
+export const DEFAULT_DIFF_COMPARE_CONTEXT_LINES = 3;
+
 export const ClientSettingsSchema = Schema.Struct({
+  activityDockAlwaysVisible: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
   autoOpenPlanSidebar: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   browserLinkTarget: BrowserLinkTarget.pipe(
     Schema.catchDecoding(() => Effect.succeedSome(DEFAULT_BROWSER_LINK_TARGET)),
@@ -128,6 +146,27 @@ export const ClientSettingsSchema = Schema.Struct({
     Schema.withDecodingDefault(Effect.succeed([])),
   ),
   diffIgnoreWhitespace: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
+  diffCompareContextLines: DiffContextLines.pipe(
+    Schema.catchDecoding(() => Effect.succeedSome(DEFAULT_DIFF_COMPARE_CONTEXT_LINES)),
+    Schema.withDecodingDefault(Effect.succeed(DEFAULT_DIFF_COMPARE_CONTEXT_LINES)),
+  ),
+  diffCompareLines: DiffCompareLines.pipe(
+    Schema.catchDecoding(() => Effect.succeedSome(DEFAULT_DIFF_COMPARE_LINES)),
+    Schema.withDecodingDefault(Effect.succeed(DEFAULT_DIFF_COMPARE_LINES)),
+  ),
+  diffRenderMode: DiffRenderMode.pipe(
+    Schema.catchDecoding(() => Effect.succeedSome(DEFAULT_DIFF_RENDER_MODE)),
+    Schema.withDecodingDefault(Effect.succeed(DEFAULT_DIFF_RENDER_MODE)),
+  ),
+  /** The diff app last chosen in **Open with**; the default after the one Git is set to use. */
+  diffToolLastChoice: Schema.NullOr(ReviewDiffToolId).pipe(
+    Schema.catchDecoding(() => Effect.succeedSome(null)),
+    Schema.withDecodingDefault(Effect.succeed(null)),
+  ),
+  diffViewMode: DiffViewMode.pipe(
+    Schema.catchDecoding(() => Effect.succeedSome(DEFAULT_DIFF_VIEW_MODE)),
+    Schema.withDecodingDefault(Effect.succeed(DEFAULT_DIFF_VIEW_MODE)),
+  ),
   // Model favorites. Historically keyed by provider kind, now
   // widened to `ProviderInstanceId` so users can favorite a specific model
   // on a custom provider instance (e.g. "Codex Personal · gpt-5") without
@@ -154,6 +193,8 @@ export const ClientSettingsSchema = Schema.Struct({
     }),
   ).pipe(Schema.withDecodingDefault(Effect.succeed({}))),
   pullRequestsEnabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
+  /** Shows the Pipelines button on projects and repositories. */
+  pipelinesEnabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
   sidebarProjectGroupingMode: SidebarProjectGroupingMode.pipe(
     Schema.withDecodingDefault(Effect.succeed(DEFAULT_SIDEBAR_PROJECT_GROUPING_MODE)),
   ),
@@ -190,6 +231,7 @@ export const ClientSettingsSchema = Schema.Struct({
     Schema.catchDecoding(() => Effect.succeedSome(DEFAULT_USAGE_PERCENTAGE_DISPLAY)),
     Schema.withDecodingDefault(Effect.succeed(DEFAULT_USAGE_PERCENTAGE_DISPLAY)),
   ),
+  verboseChat: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   wordWrap: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
 });
 export type ClientSettings = typeof ClientSettingsSchema.Type;
@@ -694,11 +736,17 @@ export const ServerSettingsPatch = Schema.Struct({
 export type ServerSettingsPatch = typeof ServerSettingsPatch.Type;
 
 export const ClientSettingsPatch = Schema.Struct({
+  activityDockAlwaysVisible: Schema.optionalKey(Schema.Boolean),
   autoOpenPlanSidebar: Schema.optionalKey(Schema.Boolean),
   browserLinkTarget: Schema.optionalKey(BrowserLinkTarget),
   confirmThreadArchive: Schema.optionalKey(Schema.Boolean),
   confirmThreadDelete: Schema.optionalKey(Schema.Boolean),
   diffIgnoreWhitespace: Schema.optionalKey(Schema.Boolean),
+  diffCompareContextLines: Schema.optionalKey(DiffContextLines),
+  diffCompareLines: Schema.optionalKey(DiffCompareLines),
+  diffRenderMode: Schema.optionalKey(DiffRenderMode),
+  diffToolLastChoice: Schema.optionalKey(Schema.NullOr(ReviewDiffToolId)),
+  diffViewMode: Schema.optionalKey(DiffViewMode),
   favorites: Schema.optionalKey(
     Schema.Array(
       Schema.Struct({
@@ -721,6 +769,7 @@ export const ClientSettingsPatch = Schema.Struct({
     ),
   ),
   pullRequestsEnabled: Schema.optionalKey(Schema.Boolean),
+  pipelinesEnabled: Schema.optionalKey(Schema.Boolean),
   sidebarProjectGroupingMode: Schema.optionalKey(SidebarProjectGroupingMode),
   sidebarProjectGroupingOverrides: Schema.optionalKey(
     Schema.Record(TrimmedNonEmptyString, SidebarProjectGroupingMode),
@@ -735,6 +784,7 @@ export const ClientSettingsPatch = Schema.Struct({
   terminalFontPreference: Schema.optionalKey(TerminalFontPreference),
   terminalThemePreference: Schema.optionalKey(TerminalThemePreference),
   usagePercentageDisplay: Schema.optionalKey(UsagePercentageDisplay),
+  verboseChat: Schema.optionalKey(Schema.Boolean),
   wordWrap: Schema.optionalKey(Schema.Boolean),
 });
 export type ClientSettingsPatch = typeof ClientSettingsPatch.Type;

@@ -73,6 +73,13 @@ async fn workspace_unavailable_rejects_file_search_and_review_before_side_effect
             "review.getDiffPreview",
             json!({"cwd":path_string(root.path()),"baseRef":null}),
         ),
+        (
+            "review.readFileVersion",
+            json!({
+                "cwd": path_string(root.path()),
+                "version": {"_tag": "blob", "oid": "0".repeat(40)},
+            }),
+        ),
     ] {
         let error = rpc
             .handle(method, payload)
@@ -1350,12 +1357,353 @@ async fn workspace_rpc_reports_typed_index_browse_and_read_results() {
     assert_eq!(browse["failure"], "current_project_required");
 }
 
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest as _, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+async fn file_version(rpc: &WorkspaceRpc, cwd: &str, relative_path: &str) -> serde_json::Value {
+    rpc.handle(
+        "projects.getFileVersion",
+        json!({ "cwd": cwd, "relativePath": relative_path }),
+    )
+    .await
+    .expect("file version")
+}
+
+async fn write_if_unchanged(
+    rpc: &WorkspaceRpc,
+    cwd: &str,
+    relative_path: &str,
+    contents: &str,
+    precondition: serde_json::Value,
+) -> Result<serde_json::Value, serde_json::Value> {
+    rpc.handle(
+        "projects.writeFileIfUnchanged",
+        json!({
+            "cwd": cwd,
+            "relativePath": relative_path,
+            "contents": contents,
+            "precondition": precondition,
+        }),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn read_file_version_is_the_hash_of_the_returned_bytes() {
+    let root = TempDir::new().expect("root");
+    let cwd = path_string(root.path());
+    // Not valid UTF-8: the version hashes the bytes on disk, not the lossy text.
+    write(root.path(), "notes.txt", b"caf\xe9 au lait\n").await;
+    let rpc = WorkspaceRpc::new(WorkspaceService::default());
+
+    let read = rpc
+        .handle(
+            "projects.readFile",
+            json!({ "cwd": cwd, "relativePath": "notes.txt" }),
+        )
+        .await
+        .expect("read");
+
+    assert_eq!(read["version"], sha256_hex(b"caf\xe9 au lait\n"));
+    assert_eq!(
+        file_version(&rpc, &cwd, "notes.txt").await,
+        json!({ "_tag": "present", "version": sha256_hex(b"caf\xe9 au lait\n") })
+    );
+}
+
+#[tokio::test]
+async fn get_file_version_sees_outside_writes_deletion_and_unreadable_files() {
+    let root = TempDir::new().expect("root");
+    let cwd = path_string(root.path());
+    write(root.path(), "src/lib.rs", b"fn one() {}\n").await;
+    let rpc = WorkspaceRpc::new(WorkspaceService::default());
+    let read = rpc
+        .handle(
+            "projects.readFile",
+            json!({ "cwd": cwd, "relativePath": "src/lib.rs" }),
+        )
+        .await
+        .expect("read");
+    assert_eq!(
+        file_version(&rpc, &cwd, "src/lib.rs").await["version"],
+        read["version"]
+    );
+
+    // An in-place write that bypasses every RPC, same length as before.
+    std::fs::write(root.path().join("src/lib.rs"), b"fn two() {}\n").expect("outside write");
+    assert_eq!(
+        file_version(&rpc, &cwd, "src/lib.rs").await,
+        json!({ "_tag": "present", "version": sha256_hex(b"fn two() {}\n") })
+    );
+
+    std::fs::write(root.path().join("src/lib.rs"), b"fn two() {}\0").expect("binary write");
+    assert_eq!(
+        file_version(&rpc, &cwd, "src/lib.rs").await,
+        json!({
+            "_tag": "unreadable",
+            "failure": "binary_file",
+            "version": sha256_hex(b"fn two() {}\0"),
+        })
+    );
+
+    let large = vec![b'x'; 1024 * 1024 + 1];
+    std::fs::write(root.path().join("src/lib.rs"), &large).expect("large write");
+    assert_eq!(
+        file_version(&rpc, &cwd, "src/lib.rs").await,
+        json!({
+            "_tag": "unreadable",
+            "failure": "file_too_large",
+            "version": sha256_hex(&large),
+        })
+    );
+
+    std::fs::remove_file(root.path().join("src/lib.rs")).expect("delete");
+    assert_eq!(
+        file_version(&rpc, &cwd, "src/lib.rs").await,
+        json!({ "_tag": "missing" })
+    );
+    std::fs::remove_dir(root.path().join("src")).expect("delete parent");
+    assert_eq!(
+        file_version(&rpc, &cwd, "src/lib.rs").await,
+        json!({ "_tag": "missing" })
+    );
+
+    let traversal = rpc
+        .handle(
+            "projects.getFileVersion",
+            json!({ "cwd": cwd, "relativePath": "../outside.txt" }),
+        )
+        .await
+        .expect_err("traversal must fail");
+    assert_eq!(traversal["_tag"], "ProjectReadFileError");
+    assert_eq!(traversal["failure"], "workspace_path_outside_root");
+}
+
+#[tokio::test]
+async fn guarded_write_refuses_a_stale_base_and_leaves_the_file_untouched() {
+    let root = TempDir::new().expect("root");
+    let cwd = path_string(root.path());
+    write(root.path(), "notes.md", b"base\n").await;
+    let rpc = WorkspaceRpc::new(WorkspaceService::default());
+    let base = sha256_hex(b"base\n");
+
+    let saved = write_if_unchanged(
+        &rpc,
+        &cwd,
+        "notes.md",
+        "mine\n",
+        json!({ "_tag": "version", "version": base }),
+    )
+    .await
+    .expect("write from the current base");
+    assert_eq!(
+        saved,
+        json!({ "relativePath": "notes.md", "version": sha256_hex(b"mine\n") })
+    );
+    assert_eq!(
+        rpc.handle(
+            "projects.readFile",
+            json!({ "cwd": cwd, "relativePath": "notes.md" })
+        )
+        .await
+        .expect("read")["version"],
+        saved["version"]
+    );
+
+    std::fs::write(root.path().join("notes.md"), b"agent\n").expect("outside write");
+    let refused = write_if_unchanged(
+        &rpc,
+        &cwd,
+        "notes.md",
+        "mine again\n",
+        json!({ "_tag": "version", "version": saved["version"] }),
+    )
+    .await
+    .expect_err("stale base must be refused");
+    assert_eq!(refused["_tag"], "ProjectWriteFileError");
+    assert_eq!(refused["failure"], "file_changed_on_disk");
+    assert_eq!(refused["relativePath"], "notes.md");
+    assert_eq!(
+        std::fs::read(root.path().join("notes.md")).expect("read"),
+        b"agent\n"
+    );
+
+    std::fs::remove_file(root.path().join("notes.md")).expect("delete");
+    let missing = write_if_unchanged(
+        &rpc,
+        &cwd,
+        "notes.md",
+        "mine again\n",
+        json!({ "_tag": "version", "version": sha256_hex(b"agent\n") }),
+    )
+    .await
+    .expect_err("a save based on a file that is gone must be refused");
+    assert_eq!(missing["_tag"], "ProjectWriteFileError");
+    assert_eq!(missing["failure"], "file_missing_on_disk");
+    assert!(!root.path().join("notes.md").exists());
+}
+
+#[tokio::test]
+async fn guarded_write_missing_precondition_recreates_only_an_absent_file() {
+    let root = TempDir::new().expect("root");
+    let cwd = path_string(root.path());
+    let rpc = WorkspaceRpc::new(WorkspaceService::default());
+
+    let created = write_if_unchanged(
+        &rpc,
+        &cwd,
+        "docs/new.md",
+        "recreated\n",
+        json!({ "_tag": "missing" }),
+    )
+    .await
+    .expect("recreate");
+    assert_eq!(created["version"], sha256_hex(b"recreated\n"));
+    assert_eq!(
+        std::fs::read(root.path().join("docs/new.md")).expect("read"),
+        b"recreated\n"
+    );
+
+    let refused = write_if_unchanged(
+        &rpc,
+        &cwd,
+        "docs/new.md",
+        "again\n",
+        json!({ "_tag": "missing" }),
+    )
+    .await
+    .expect_err("a file now exists");
+    assert_eq!(refused["failure"], "file_changed_on_disk");
+    assert_eq!(
+        std::fs::read(root.path().join("docs/new.md")).expect("read"),
+        b"recreated\n"
+    );
+}
+
+#[tokio::test]
+async fn guarded_write_overwrites_an_unreadable_file_against_its_version() {
+    let root = TempDir::new().expect("root");
+    let cwd = path_string(root.path());
+    write(root.path(), "data.txt", b"now\0binary").await;
+    let rpc = WorkspaceRpc::new(WorkspaceService::default());
+    let shown = file_version(&rpc, &cwd, "data.txt").await;
+    assert_eq!(shown["_tag"], "unreadable");
+
+    write_if_unchanged(
+        &rpc,
+        &cwd,
+        "data.txt",
+        "text again\n",
+        json!({ "_tag": "version", "version": shown["version"] }),
+    )
+    .await
+    .expect("overwrite the state the user saw");
+    assert_eq!(
+        std::fs::read(root.path().join("data.txt")).expect("read"),
+        b"text again\n"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_guarded_writes_from_one_base_let_exactly_one_through() {
+    let root = TempDir::new().expect("root");
+    let cwd = path_string(root.path());
+    write(root.path(), "shared.txt", b"base\n").await;
+    let rpc = WorkspaceRpc::new(WorkspaceService::default());
+    let base = json!({ "_tag": "version", "version": sha256_hex(b"base\n") });
+
+    for round in 0..20 {
+        std::fs::write(root.path().join("shared.txt"), b"base\n").expect("reset");
+        let (first, second) = tokio::join!(
+            write_if_unchanged(&rpc, &cwd, "shared.txt", "first\n", base.clone()),
+            write_if_unchanged(&rpc, &cwd, "shared.txt", "second\n", base.clone()),
+        );
+        let (winner, refusal) = match (first, second) {
+            (Ok(_), Err(refusal)) => ("first\n", refusal),
+            (Err(refusal), Ok(_)) => ("second\n", refusal),
+            other => panic!("round {round}: expected exactly one write, got {other:?}"),
+        };
+        assert_eq!(refusal["failure"], "file_changed_on_disk", "round {round}");
+        assert_eq!(
+            std::fs::read(root.path().join("shared.txt")).expect("read"),
+            winner.as_bytes(),
+            "round {round}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_named_pipe_in_place_of_an_open_file_is_refused_without_blocking() {
+    /// Opening a pipe with no writer for reading blocks; the request must not get that far. If it
+    /// does, a writer releases the blocked reader so the test fails instead of hanging.
+    async fn returns_without_blocking<T>(
+        fifo: &Path,
+        request: impl std::future::Future<Output = T>,
+    ) -> T {
+        match tokio::time::timeout(Duration::from_secs(5), request).await {
+            Ok(output) => output,
+            Err(_) => {
+                let fifo = fifo.to_path_buf();
+                std::thread::spawn(move || {
+                    drop(std::fs::OpenOptions::new().write(true).open(fifo))
+                });
+                panic!("the request blocked opening a named pipe");
+            }
+        }
+    }
+
+    let root = TempDir::new().expect("root");
+    let cwd = path_string(root.path());
+    let fifo_path = root.path().join("notes.txt");
+    let fifo = std::process::Command::new("mkfifo")
+        .arg(&fifo_path)
+        .output()
+        .expect("mkfifo starts");
+    assert!(fifo.status.success(), "mkfifo failed");
+    let rpc = WorkspaceRpc::new(WorkspaceService::default());
+
+    let version = returns_without_blocking(
+        &fifo_path,
+        rpc.handle(
+            "projects.getFileVersion",
+            json!({ "cwd": cwd, "relativePath": "notes.txt" }),
+        ),
+    )
+    .await
+    .expect_err("a pipe is not a file");
+    assert_eq!(version["_tag"], "ProjectReadFileError");
+    assert_eq!(version["failure"], "path_not_file");
+
+    let write = returns_without_blocking(
+        &fifo_path,
+        write_if_unchanged(
+            &rpc,
+            &cwd,
+            "notes.txt",
+            "mine\n",
+            json!({ "_tag": "version", "version": sha256_hex(b"base\n") }),
+        ),
+    )
+    .await
+    .expect_err("a pipe is not a file");
+    assert_eq!(write["_tag"], "ProjectWriteFileError");
+    assert_eq!(write["failure"], "path_not_file");
+}
+
 #[tokio::test]
 async fn workspace_rpc_rejects_every_malformed_input_shape_and_unknown_methods() {
     let rpc = WorkspaceRpc::new(WorkspaceService::default());
     for method in [
         "projects.readFile",
+        "projects.getFileVersion",
         "projects.writeFile",
+        "projects.writeFileIfUnchanged",
         "projects.createEntry",
         "projects.renameEntry",
         "projects.deleteEntry",
@@ -2496,6 +2844,7 @@ async fn review_accepts_projects_outside_server_root_and_returns_empty_sources()
             cwd: path_string(outside.path()),
             base_ref: None,
             ignore_whitespace: None,
+            context_lines: None,
         })
         .await
         .expect("review");
@@ -2512,7 +2861,9 @@ fn owned_rpc_inventory_matches_task_six_contract_methods() {
             "projects.searchEntries",
             "projects.listEntries",
             "projects.readFile",
+            "projects.getFileVersion",
             "projects.writeFile",
+            "projects.writeFileIfUnchanged",
             "projects.createEntry",
             "projects.renameEntry",
             "projects.deleteEntry",
@@ -2522,6 +2873,9 @@ fn owned_rpc_inventory_matches_task_six_contract_methods() {
             "filesystem.browse",
             "assets.createUrl",
             "review.getDiffPreview",
+            "review.readFileVersion",
+            "review.listDiffTools",
+            "review.openDiffTool",
         ]
     );
 }

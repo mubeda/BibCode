@@ -275,7 +275,10 @@ mod tests {
         let result = browse_directory(&root.path().join("code").to_string_lossy(), None)
             .await
             .unwrap();
-        let canonical = std::fs::canonicalize(root.path().join("code")).unwrap();
+        // Browse answers the spelling a process can use, without Windows' `\\?\` prefix.
+        let canonical = crate::production::host_paths::process_compatible_path(
+            std::fs::canonicalize(root.path().join("code")).unwrap(),
+        );
         assert_eq!(
             result.directory_path.as_deref(),
             Some(canonical.to_str().unwrap())

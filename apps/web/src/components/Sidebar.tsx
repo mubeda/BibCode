@@ -12,6 +12,7 @@ import {
   SearchIcon,
   SettingsIcon,
   TriangleAlertIcon,
+  WorkflowIcon,
 } from "lucide-react";
 import {
   prStatusIndicator,
@@ -361,7 +362,9 @@ import {
   ImportCliSessionsDialog,
   type ImportCliSessionsSummary,
   type ImportCliSessionsTarget,
+  type ImportedPanel,
 } from "./ImportCliSessionsDialog";
+import { usePanelThreadOpener } from "../centerPanelActions";
 import { SidebarProjectAvailability } from "./sidebar/SidebarProjectAvailability";
 import { readCurrentEnvironmentPresentationPolicy } from "../connection/currentEnvironmentPresentation";
 import { environmentConnectionActions } from "../connection/environmentPresentationPolicy";
@@ -572,20 +575,35 @@ function formatProjectMemberActionLabel(
 async function chooseProjectMember(
   members: readonly SidebarProjectGroupMember[],
   position: { readonly x: number; readonly y: number },
+  isAvailable: (member: SidebarProjectGroupMember) => boolean = () => true,
 ): Promise<SidebarProjectGroupMember | null> {
   if (members.length <= 1) {
     return members[0] ?? null;
+  }
+  const available = members.filter(isAvailable);
+  // A single connected environment is the only one that can answer.
+  if (available.length === 1) {
+    return available[0] ?? null;
   }
   const api = readLocalApi();
   if (!api) {
     return null;
   }
+  const unavailable = members.filter((member) => !available.includes(member));
   const clickedResult = await settlePromise(() =>
     api.contextMenu.show(
-      members.map((member) => ({
-        id: member.physicalProjectKey,
-        label: formatProjectMemberActionLabel(member, members.length),
-      })),
+      [
+        ...available.map((member) => ({
+          id: member.physicalProjectKey,
+          label: formatProjectMemberActionLabel(member, members.length),
+        })),
+        ...unavailable.map((member) => ({
+          id: member.physicalProjectKey,
+          label: formatProjectMemberActionLabel(member, members.length),
+          disabled: true,
+          description: "Not connected",
+        })),
+      ],
       position,
     ),
   );
@@ -633,14 +651,36 @@ function legacyExpansionKeys(project: SidebarProjectSnapshot): string[] {
 
 // An environment card has a two-line header, taller than the fixed `sm` button
 // height; `h-auto` lets it grow while normal project rows keep their height.
+// The action strip is always visible, so the title stops short of it: 24px per icon and 2px gaps,
+// plus 22px for the sandbox badge that sits in front of the icons.
+export const PROJECT_HEADER_ACTION_PADDING = {
+  3: { plain: "pr-21", badge: "pr-27" },
+  4: { plain: "pr-27", badge: "pr-33" },
+  5: { plain: "pr-33", badge: "pr-39" },
+} as const;
+
+export type ProjectHeaderActionCount = keyof typeof PROJECT_HEADER_ACTION_PADDING;
+
+/** Project actions, New worktree and Git Manager always show; Pull Requests and Pipelines may. */
+export function projectHeaderActionCount(input: {
+  readonly showsPullRequests: boolean;
+  readonly showsPipelines: boolean;
+}): ProjectHeaderActionCount {
+  return (3 +
+    Number(input.showsPullRequests) +
+    Number(input.showsPipelines)) as ProjectHeaderActionCount;
+}
+
 export function projectHeaderButtonClassName(input: {
   readonly showsSandboxBadge: boolean;
   readonly isManualProjectSorting: boolean;
   readonly isEnvironmentCard: boolean;
+  readonly actionCount: ProjectHeaderActionCount;
 }): string {
+  const padding = PROJECT_HEADER_ACTION_PADDING[input.actionCount];
   return cn(
     "gap-2 px-2 py-1.5 text-left hover:bg-accent group-hover/project-header:bg-accent group-hover/project-header:text-sidebar-accent-foreground",
-    input.showsSandboxBadge ? "pr-20" : "pr-14",
+    input.showsSandboxBadge ? padding.badge : padding.plain,
     input.isManualProjectSorting ? "cursor-grab active:cursor-grabbing" : "cursor-pointer",
     input.isEnvironmentCard && "h-auto",
   );
@@ -1777,6 +1817,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
     environmentCard = null,
   } = props;
   const pullRequestsEnabled = usePrimarySettings((settings) => settings.pullRequestsEnabled);
+  const pipelinesEnabled = usePrimarySettings((settings) => settings.pipelinesEnabled);
   const requestWorktreeRemoval = useContext(WorktreeRemovalRequestContext);
   const threadSortOrder = useClientSettings<SidebarThreadSortOrder>(
     (settings) => settings.sidebarThreadSortOrder,
@@ -2764,6 +2805,24 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
     [openPullRequestsForProjectMember, runProjectMemberAction],
   );
 
+  const openPipelinesForProjectMember = useCallback(
+    (member: SidebarProjectGroupMember) => {
+      if (isMobile) setOpenMobile(false);
+      void navigate({
+        to: "/project/$environmentId/$projectId/pipelines",
+        params: { environmentId: member.environmentId, projectId: member.id },
+      });
+    },
+    [isMobile, navigate, setOpenMobile],
+  );
+
+  const handleOpenPipelinesClick = useCallback(
+    (event: React.MouseEvent<HTMLButtonElement>) => {
+      runProjectMemberAction(event, openPipelinesForProjectMember);
+    },
+    [openPipelinesForProjectMember, runProjectMemberAction],
+  );
+
   const attemptArchiveThread = useCallback(
     async (threadRef: ScopedThreadRef) => {
       const result = await archiveThread(threadRef);
@@ -2847,12 +2906,20 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
     if (!open) setImportSessionsTarget(null);
   }, []);
 
+  const { openPanelThread } = usePanelThreadOpener();
   const openImportedThread = useCallback(
-    (target: ImportCliSessionsTarget, threadId: ThreadId) => {
+    (target: ImportCliSessionsTarget, threadId: ThreadId, panel?: ImportedPanel) => {
       setImportSessionsTarget(null);
-      navigateToThread(scopeThreadRef(target.environmentId, threadId));
+      if (panel === undefined) {
+        navigateToThread(scopeThreadRef(target.environmentId, threadId));
+        return;
+      }
+      // A session continued from History is a chat panel: show its host with the panel active.
+      const hostRef = scopeThreadRef(target.environmentId, panel.hostThreadId);
+      void openPanelThread(hostRef, threadId, panel.title);
+      navigateToThread(hostRef);
     },
-    [navigateToThread],
+    [navigateToThread, openPanelThread],
   );
 
   const handleSessionsImported = useCallback(
@@ -3338,6 +3405,9 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
     ],
   );
 
+  // In the Repositories view the repository row owns Pull Requests and Pipelines.
+  const showsPullRequestsAction = pullRequestsEnabled && !environmentCard;
+  const showsPipelinesAction = pipelinesEnabled && !environmentCard;
   const showsSandboxBadge =
     !environmentCard &&
     project.environmentPresence === "remote-only" &&
@@ -3363,6 +3433,10 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
             showsSandboxBadge,
             isManualProjectSorting,
             isEnvironmentCard: environmentCard !== null,
+            actionCount: projectHeaderActionCount({
+              showsPullRequests: showsPullRequestsAction,
+              showsPipelines: showsPipelinesAction,
+            }),
           })}
           {...(isManualProjectSorting && dragHandleProps ? dragHandleProps.attributes : {})}
           {...(isManualProjectSorting && dragHandleProps ? dragHandleProps.listeners : {})}
@@ -3409,26 +3483,29 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
         {/* The container badge tells WSL projects apart inside Local, which
             mixes this device and WSL. A saved server's scope shows only that
             server's projects, so a cloud there said nothing and is gone. The
-            badge crossfades with the hover strip. An environment card already
+            badge sits in front of the action icons. An environment card already
             names its environment, so it shows no badge. */}
-        {showsSandboxBadge ? (
-          <Tooltip>
-            <TooltipTrigger
-              render={
-                <span
-                  aria-label="Local sandbox project"
-                  className="pointer-events-none absolute top-1 right-1.5 inline-flex size-5 items-center justify-center rounded-md text-muted-foreground/60 transition-opacity duration-150 max-sm:right-14 group-hover/project-header:opacity-0 group-focus-within/project-header:opacity-0 max-sm:group-hover/project-header:opacity-100 max-sm:group-focus-within/project-header:opacity-100"
-                />
-              }
-            >
-              <ContainerIcon className="size-3" />
-            </TooltipTrigger>
-            <TooltipPopup side="top">
-              {`Local sandbox: ${project.remoteEnvironmentLabels.join(", ")}`}
-            </TooltipPopup>
-          </Tooltip>
-        ) : null}
-        <div className="pointer-events-none absolute top-[calc(50%+1px)] right-0.5 flex -translate-y-1/2 items-center gap-0.5 opacity-0 transition-opacity duration-150 max-sm:pointer-events-auto max-sm:opacity-100 group-hover/project-header:pointer-events-auto group-hover/project-header:opacity-100 group-focus-within/project-header:pointer-events-auto group-focus-within/project-header:opacity-100">
+        <div
+          data-testid="project-actions-strip"
+          className="absolute top-[calc(50%+1px)] right-0.5 flex -translate-y-1/2 items-center gap-0.5"
+        >
+          {showsSandboxBadge ? (
+            <Tooltip>
+              <TooltipTrigger
+                render={
+                  <span
+                    aria-label="Local sandbox project"
+                    className="pointer-events-none inline-flex size-5 items-center justify-center rounded-md text-muted-foreground/60"
+                  />
+                }
+              >
+                <ContainerIcon className="size-3" />
+              </TooltipTrigger>
+              <TooltipPopup side="top">
+                {`Local sandbox: ${project.remoteEnvironmentLabels.join(", ")}`}
+              </TooltipPopup>
+            </Tooltip>
+          ) : null}
           <Tooltip>
             <TooltipTrigger
               render={
@@ -3478,7 +3555,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
             </TooltipTrigger>
             <TooltipPopup side="top">Git Manager</TooltipPopup>
           </Tooltip>
-          {pullRequestsEnabled ? (
+          {showsPullRequestsAction ? (
             <Tooltip>
               <TooltipTrigger
                 render={
@@ -3494,6 +3571,24 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
                 <GitPullRequestIcon aria-hidden="true" className="size-3.5" />
               </TooltipTrigger>
               <TooltipPopup side="top">Pull Requests</TooltipPopup>
+            </Tooltip>
+          ) : null}
+          {showsPipelinesAction ? (
+            <Tooltip>
+              <TooltipTrigger
+                render={
+                  <button
+                    type="button"
+                    aria-label={`Pipelines for ${project.displayName}`}
+                    data-testid="pipelines-button"
+                    className={SIDEBAR_ICON_ACTION_BUTTON_CLASS}
+                    onClick={handleOpenPipelinesClick}
+                  />
+                }
+              >
+                <WorkflowIcon aria-hidden="true" className="size-3.5" />
+              </TooltipTrigger>
+              <TooltipPopup side="top">Pipelines</TooltipPopup>
             </Tooltip>
           ) : null}
         </div>
@@ -3669,6 +3764,113 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
         </DialogPopup>
       </Dialog>
     </>
+  );
+});
+
+type RepositoryModuleRoute =
+  | "/project/$environmentId/$projectId/pull-requests"
+  | "/project/$environmentId/$projectId/pipelines";
+
+/**
+ * Opens a repository module for a repository row: one environment opens directly, several ask
+ * which. Closes the mobile sidebar first, as the project header's actions do.
+ */
+function useOpenRepositoryModule(
+  group: RepositoryGroup,
+  environments: ReadonlyMap<EnvironmentId, EnvironmentCardIdentity>,
+  to: RepositoryModuleRoute,
+) {
+  const navigate = useNavigate();
+  const { isMobile, setOpenMobile } = useSidebar();
+  return useCallback(
+    (event: React.MouseEvent<HTMLButtonElement>) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const members = group.cards.flatMap((card) => card.memberProjects);
+      const isAvailable = (member: SidebarProjectGroupMember) =>
+        environments.get(member.environmentId)?.available ?? true;
+      void chooseProjectMember(members, { x: event.clientX, y: event.clientY }, isAvailable).then(
+        (member) => {
+          if (!member) return;
+          if (isMobile) setOpenMobile(false);
+          void navigate({
+            to,
+            params: { environmentId: member.environmentId, projectId: member.id },
+          });
+        },
+      );
+    },
+    [environments, group.cards, isMobile, navigate, setOpenMobile, to],
+  );
+}
+
+/** Pull Requests for a repository row. */
+const SidebarRepositoryPullRequestsButton = memo(function SidebarRepositoryPullRequestsButton({
+  group,
+  environments,
+}: {
+  readonly group: RepositoryGroup;
+  readonly environments: ReadonlyMap<EnvironmentId, EnvironmentCardIdentity>;
+}) {
+  const pullRequestsEnabled = usePrimarySettings((settings) => settings.pullRequestsEnabled);
+  const handleClick = useOpenRepositoryModule(
+    group,
+    environments,
+    "/project/$environmentId/$projectId/pull-requests",
+  );
+  if (!pullRequestsEnabled) return null;
+  return (
+    <Tooltip>
+      <TooltipTrigger
+        render={
+          <button
+            type="button"
+            aria-label={`Pull Requests for ${group.title}`}
+            data-testid="repository-pull-requests-button"
+            className={SIDEBAR_ICON_ACTION_BUTTON_CLASS}
+            onClick={handleClick}
+          />
+        }
+      >
+        <GitPullRequestIcon aria-hidden="true" className="size-3.5" />
+      </TooltipTrigger>
+      <TooltipPopup side="top">Pull Requests</TooltipPopup>
+    </Tooltip>
+  );
+});
+
+/** Pipelines for a repository row. */
+const SidebarRepositoryPipelinesButton = memo(function SidebarRepositoryPipelinesButton({
+  group,
+  environments,
+}: {
+  readonly group: RepositoryGroup;
+  readonly environments: ReadonlyMap<EnvironmentId, EnvironmentCardIdentity>;
+}) {
+  const pipelinesEnabled = usePrimarySettings((settings) => settings.pipelinesEnabled);
+  const handleClick = useOpenRepositoryModule(
+    group,
+    environments,
+    "/project/$environmentId/$projectId/pipelines",
+  );
+  if (!pipelinesEnabled) return null;
+  return (
+    <Tooltip>
+      <TooltipTrigger
+        render={
+          <button
+            type="button"
+            aria-label={`Pipelines for ${group.title}`}
+            data-testid="repository-pipelines-button"
+            className={SIDEBAR_ICON_ACTION_BUTTON_CLASS}
+            onClick={handleClick}
+          />
+        }
+      >
+        <WorkflowIcon aria-hidden="true" className="size-3.5" />
+      </TooltipTrigger>
+      <TooltipPopup side="top">Pipelines</TooltipPopup>
+    </Tooltip>
   );
 });
 
@@ -4330,6 +4532,18 @@ const SidebarProjectsContent = memo(function SidebarProjectsContent(
                 key={group.key}
                 group={group}
                 expanded={repositoryGroupExpandedById[group.key] !== false}
+                actions={
+                  <>
+                    <SidebarRepositoryPullRequestsButton
+                      group={group}
+                      environments={environmentCardIdentities}
+                    />
+                    <SidebarRepositoryPipelinesButton
+                      group={group}
+                      environments={environmentCardIdentities}
+                    />
+                  </>
+                }
               >
                 {group.cards.map((project) => (
                   <SidebarProjectListRow

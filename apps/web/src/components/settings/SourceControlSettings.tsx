@@ -461,6 +461,7 @@ function EmptySourceControlDiscovery({
 
 export function SourceControlSettingsPanel() {
   const pullRequestsEnabled = usePrimarySettings((settings) => settings.pullRequestsEnabled);
+  const pipelinesEnabled = usePrimarySettings((settings) => settings.pipelinesEnabled);
   const updateSettings = useUpdatePrimarySettings();
   const environmentId = usePrimaryEnvironment()?.environmentId ?? null;
   // This scan is the explicit one: the server records the authenticated hosts it
@@ -513,6 +514,17 @@ export function SourceControlSettingsPanel() {
                 updateSettings({ pullRequestsEnabled: Boolean(checked) })
               }
               aria-label="Enable pull requests"
+            />
+          }
+        />
+        <SettingsRow
+          title="Pipelines"
+          description="Show the Pipelines button on projects and repositories."
+          control={
+            <Switch
+              checked={pipelinesEnabled}
+              onCheckedChange={(checked) => updateSettings({ pipelinesEnabled: Boolean(checked) })}
+              aria-label="Enable pipelines"
             />
           }
         />

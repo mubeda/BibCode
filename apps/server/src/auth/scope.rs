@@ -21,6 +21,7 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
     match method {
         "assets.createUrl"
         | "device.createMediaTicket"
+        | "device.refreshCatalog"
         | "device.subscribeCatalog"
         | "device.subscribeFrames"
         | "filesystem.browse"
@@ -42,6 +43,12 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         | "pullRequests.getFiles"
         | "pullRequests.readSnapshot"
         | "pullRequests.subscribe"
+        | "pipelines.list"
+        | "pipelines.get"
+        | "pipelines.getJob"
+        | "pipelines.getJobLog"
+        | "pipelines.readSnapshot"
+        | "pipelines.subscribe"
         | "orchestration.getArchivedShellSnapshot"
         | "orchestration.getFullThreadDiff"
         | "orchestration.getTurnDiff"
@@ -50,6 +57,7 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         | "orchestration.subscribeThread"
         | "preview.list"
         | "projects.createDownloadUrl"
+        | "projects.getFileVersion"
         | "projects.listEntries"
         | "projects.readFile"
         | "projects.searchEntries"
@@ -79,9 +87,11 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         | "vcs.refreshStatus"
         | "vcs.refreshWorktreeCatalog"
         | "worktree.getRemovalPlan" => Some(SCOPE_ORCHESTRATION_READ),
-        // Scan reads CLI transcripts (first prompts included) from the server host's home
-        // directory, outside BiBCode's data, so read-only credentials must not see them.
+        // Scan and History read CLI transcripts (first prompts included) from the server host's
+        // home directory, outside BiBCode's data, so read-only credentials must not see them.
         "agentSessions.import"
+        | "agentSessions.listForThread"
+        | "agentSessions.openInPanel"
         | "agentSessions.scan"
         | "git.preparePullRequestThread"
         | "git.resolvePullRequest"
@@ -95,6 +105,7 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         | "gitManager.unstagePartial"
         | "pullRequests.runAction"
         | "pullRequests.checkout"
+        | "pipelines.runAction"
         | "activity.cancelSubtree"
         | "activity.retrySubtreeCancellation"
         | "device.close"
@@ -126,6 +137,7 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         | "projects.duplicateEntry"
         | "projects.renameEntry"
         | "projects.writeFile"
+        | "projects.writeFileIfUnchanged"
         | "server.consumeCodexRateLimitReset"
         | "server.refreshProviders"
         | "server.refreshProviderUsage"
@@ -138,6 +150,8 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         | "updater.check"
         | "updater.install"
         | "shell.openInEditor"
+        // Starts a program on the server's computer, as opening an editor does.
+        | "review.openDiffTool"
         | "sourceControl.cloneRepository"
         | "sourceControl.publishRepository"
         | "vcs.cancelClone"
@@ -170,7 +184,9 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         | "terminal.writeInput"
         | "subscribeTerminalEvents"
         | "subscribeTerminalMetadata" => Some(SCOPE_TERMINAL_OPERATE),
-        "review.getDiffPreview" => Some(SCOPE_REVIEW_WRITE),
+        "review.getDiffPreview" | "review.listDiffTools" | "review.readFileVersion" => {
+            Some(SCOPE_REVIEW_WRITE)
+        }
         "cloud.getRelayClientStatus" | "cloud.installRelayClient" => Some(SCOPE_RELAY_WRITE),
         "subscribeAuthAccess" => Some(SCOPE_ACCESS_READ),
         // Two-tier policy: a pending-pairing session confirms its OWN
@@ -230,6 +246,14 @@ mod tests {
             Some(SCOPE_ORCHESTRATION_OPERATE)
         );
         assert_eq!(
+            required_scope("agentSessions.listForThread"),
+            Some(SCOPE_ORCHESTRATION_OPERATE)
+        );
+        assert_eq!(
+            required_scope("agentSessions.openInPanel"),
+            Some(SCOPE_ORCHESTRATION_OPERATE)
+        );
+        assert_eq!(
             required_scope("server.consumeCodexRateLimitReset"),
             Some(SCOPE_ORCHESTRATION_OPERATE)
         );
@@ -244,6 +268,17 @@ mod tests {
         assert_eq!(
             required_scope("subscribeAuthAccess"),
             Some(SCOPE_ACCESS_READ)
+        );
+        for method in [
+            "review.getDiffPreview",
+            "review.listDiffTools",
+            "review.readFileVersion",
+        ] {
+            assert_eq!(required_scope(method), Some(SCOPE_REVIEW_WRITE), "{method}");
+        }
+        assert_eq!(
+            required_scope("review.openDiffTool"),
+            Some(SCOPE_ORCHESTRATION_OPERATE)
         );
         assert_eq!(
             required_scope("auth.confirmPairing"),
@@ -288,6 +323,12 @@ mod tests {
             "pullRequests.getFiles",
             "pullRequests.readSnapshot",
             "pullRequests.subscribe",
+            "pipelines.list",
+            "pipelines.get",
+            "pipelines.getJob",
+            "pipelines.getJobLog",
+            "pipelines.readSnapshot",
+            "pipelines.subscribe",
             "gitManager.getCommits",
             "gitManager.getDiff",
             "gitManager.getRefs",
@@ -309,6 +350,7 @@ mod tests {
         }
         for (method, scope) in [
             ("device.subscribeCatalog", SCOPE_ORCHESTRATION_READ),
+            ("device.refreshCatalog", SCOPE_ORCHESTRATION_READ),
             ("device.subscribeFrames", SCOPE_ORCHESTRATION_READ),
             ("device.createMediaTicket", SCOPE_ORCHESTRATION_READ),
             ("device.open", SCOPE_ORCHESTRATION_OPERATE),
@@ -329,6 +371,7 @@ mod tests {
         for method in [
             "pullRequests.runAction",
             "pullRequests.checkout",
+            "pipelines.runAction",
             "gitManager.commit",
             "gitManager.discard",
             "gitManager.discardPartial",

@@ -66,7 +66,9 @@ import Sidebar, {
   handleSidebarSelectionMouseDown,
   projectExpansionPreferenceKeys,
   projectExpansionToggleKeys,
+  projectHeaderActionCount,
   projectHeaderButtonClassName,
+  PROJECT_HEADER_ACTION_PADDING,
 } from "./Sidebar";
 import { resolveProjectExpanded, setProjectExpanded, type UiState } from "../uiStateStore";
 import { WORKSPACE_CARD_STATUS } from "./Sidebar.logic";
@@ -157,11 +159,53 @@ staticDescribe("Sidebar global event helpers", () => {
   });
 
   it("lets the project header button grow only for an environment card", () => {
-    const base = { showsSandboxBadge: false, isManualProjectSorting: false };
+    const base = {
+      showsSandboxBadge: false,
+      isManualProjectSorting: false,
+      actionCount: 4 as const,
+    };
     expect(projectHeaderButtonClassName({ ...base, isEnvironmentCard: true })).toContain("h-auto");
     expect(projectHeaderButtonClassName({ ...base, isEnvironmentCard: false })).not.toContain(
       "h-auto",
     );
+  });
+
+  it("reserves header room for the always-visible actions and the sandbox badge", () => {
+    const base = { isManualProjectSorting: false, isEnvironmentCard: false };
+    expect(
+      projectHeaderButtonClassName({ ...base, showsSandboxBadge: false, actionCount: 4 }),
+    ).toContain("pr-27");
+    expect(
+      projectHeaderButtonClassName({ ...base, showsSandboxBadge: false, actionCount: 3 }),
+    ).toContain("pr-21");
+    expect(
+      projectHeaderButtonClassName({ ...base, showsSandboxBadge: true, actionCount: 4 }),
+    ).toContain("pr-33");
+    expect(
+      projectHeaderButtonClassName({ ...base, showsSandboxBadge: true, actionCount: 3 }),
+    ).toContain("pr-27");
+    expect(
+      projectHeaderButtonClassName({ ...base, showsSandboxBadge: false, actionCount: 5 }),
+    ).toContain("pr-33");
+    expect(
+      projectHeaderButtonClassName({ ...base, showsSandboxBadge: true, actionCount: 5 }),
+    ).toContain("pr-39");
+  });
+
+  // The unit project has no layout engine, so this measures the strip the way the
+  // browser lays it out: 24px icons, 2px gaps, 22px sandbox badge, 4px per `pr-*` step.
+  it.each([3, 4, 5] as const)("keeps the title clear of a %s-action strip", (count) => {
+    const strip = count * 24 + (count - 1) * 2;
+    const padding = (className: string) => Number(/pr-(\d+)/.exec(className)![1]) * 4;
+    expect(padding(PROJECT_HEADER_ACTION_PADDING[count].plain)).toBeGreaterThanOrEqual(strip);
+    expect(padding(PROJECT_HEADER_ACTION_PADDING[count].badge)).toBeGreaterThanOrEqual(strip + 22);
+  });
+
+  it("counts the always-shown actions plus Pull Requests and Pipelines", () => {
+    expect(projectHeaderActionCount({ showsPullRequests: false, showsPipelines: false })).toBe(3);
+    expect(projectHeaderActionCount({ showsPullRequests: true, showsPipelines: false })).toBe(4);
+    expect(projectHeaderActionCount({ showsPullRequests: false, showsPipelines: true })).toBe(4);
+    expect(projectHeaderActionCount({ showsPullRequests: true, showsPipelines: true })).toBe(5);
   });
 
   it("handles traversal and numbered jump shortcuts across every guard", () => {
@@ -743,6 +787,7 @@ staticDescribe("Sidebar full render", () => {
     expect(markup).toContain(`data-testid="environment-card-header-${ENV_REMOTE}"`);
     expect(markup).toContain("2 environments");
     expect(markup).toContain("Repositories · all environments");
+    // Read-only apart from Pull Requests: no menu, rename, remove or drag.
     expect(markup).not.toContain('data-testid="repository-group-actions"');
     // The view always groups by repository, so the sort menu offers no grouping choice.
     expect(markup).not.toContain("Group projects");
@@ -1805,6 +1850,41 @@ staticDescribe("project header context menu", () => {
     onImported(target, { type: "error", title: "No sessions imported", newestThreadId: null });
     await flush();
     expect(h.spies.routerNavigate).not.toHaveBeenCalled();
+  });
+
+  it("opens a session continued from History as the active panel of its host", async () => {
+    baseScenario();
+    render(<Sidebar />);
+
+    const dialog = captured("ImportCliSessionsDialog").at(-1)!;
+    const target = {
+      environmentId: projectA.environmentId,
+      projectId: projectA.id,
+      workspaceRoot: projectA.workspaceRoot,
+    };
+    const onOpenThread = dialog.props.onOpenThread as (
+      target: unknown,
+      threadId: string,
+      panel?: { hostThreadId: string; title: string },
+    ) => void;
+    onOpenThread(target, "import:claudeAgent:session-one", {
+      hostThreadId: "host-thread",
+      title: "Flaky test",
+    });
+    await flush();
+
+    expect(h.spies.routerNavigate).toHaveBeenCalledWith({
+      to: "/$environmentId/$threadId",
+      params: { environmentId: projectA.environmentId, threadId: "host-thread" },
+    });
+    // Its shell is not loaded, so the panel is reopened (unarchived) into the host's tabs.
+    expect(h.state.commandCalls).toContainEqual({
+      label: "thread.unarchive",
+      input: {
+        environmentId: projectA.environmentId,
+        input: { threadId: "import:claudeAgent:session-one" },
+      },
+    });
   });
 });
 
@@ -3566,6 +3646,14 @@ staticDescribe("new thread entry points", () => {
     expect(firstClick.preventDefault).toHaveBeenCalled();
     expect(secondClick.stopPropagation).toHaveBeenCalled();
   });
+  it("shows a project row's actions without hover", () => {
+    baseScenario();
+    const markup = render(<Sidebar />);
+    const strip = /<div[^>]*data-testid="project-actions-strip"[^>]*>/.exec(markup)?.[0];
+    expect(strip).toBeDefined();
+    expect(strip).not.toContain("opacity-0");
+  });
+
   it("hides the Pull Requests button when disabled in settings", () => {
     baseScenario();
     render(<Sidebar />);
@@ -3582,6 +3670,48 @@ staticDescribe("new thread entry points", () => {
     expect(
       mustFindProps(byAriaLabel("Pull Requests for Repo A"), "Pull Requests button"),
     ).toBeDefined();
+  });
+
+  it("puts a labelled Pipelines button after Pull Requests and opens the project's list", () => {
+    baseScenario();
+    const markup = render(<Sidebar />);
+    expect(markup.indexOf('data-testid="pipelines-button"')).toBeGreaterThan(
+      markup.indexOf('data-testid="pull-requests-button"'),
+    );
+    expect(markup).toContain("lucide-workflow");
+    const pipelines = mustFindProps(byAriaLabel("Pipelines for Repo A"), "Pipelines button");
+    const click = mouseEvent();
+    invoke(pipelines, "onClick", click);
+    expect(h.spies.navigate).toHaveBeenCalledWith({
+      to: "/project/$environmentId/$projectId/pipelines",
+      params: { environmentId: ENV_MAIN, projectId: projectA.id },
+    });
+    expect(click.preventDefault).toHaveBeenCalled();
+    expect(click.stopPropagation).toHaveBeenCalled();
+  });
+
+  it("hides the Pipelines button when disabled in settings, keeping Pull Requests", () => {
+    baseScenario();
+    h.state.clientSettings.pipelinesEnabled = false;
+    render(<Sidebar />);
+    expect(findProps(byTestId("pipelines-button"))).toBeNull();
+    expect(findProps(byTestId("pull-requests-button"))).not.toBeNull();
+  });
+
+  it("reserves title room for every shown action", () => {
+    baseScenario();
+    render(<Sidebar />);
+    const header = captured("SidebarMenuButton").find(
+      (entry) => typeof entry.props["onPointerDownCapture"] === "function",
+    )!;
+    expect(header.props["className"]).toContain(PROJECT_HEADER_ACTION_PADDING[5].plain);
+    h.state.captures = [];
+    h.state.clientSettings.pipelinesEnabled = false;
+    render(<Sidebar />);
+    const fourActions = captured("SidebarMenuButton").find(
+      (entry) => typeof entry.props["onPointerDownCapture"] === "function",
+    )!;
+    expect(fourActions.props["className"]).toContain(PROJECT_HEADER_ACTION_PADDING[4].plain);
   });
 });
 
@@ -3645,6 +3775,161 @@ staticDescribe("grouped and remote projects", () => {
       to: "/project/$environmentId/$projectId/pull-requests",
       params: { environmentId: ENV_REMOTE, projectId: ProjectId.make("project-a-remote") },
     });
+  });
+
+  it("puts one Pull Requests button on the repository row, not its environment rows", () => {
+    groupedScenario();
+    h.uiStore.setState({ sidebarView: "repositories" });
+    render(<Sidebar />);
+    expect(findProps(byTestId("pull-requests-button"))).toBeNull();
+    expect(
+      captured("TooltipTrigger").filter(
+        (entry) =>
+          (entry.props["render"] as React.ReactElement<Record<string, unknown>> | undefined)?.props[
+            "data-testid"
+          ] === "repository-pull-requests-button",
+      ),
+    ).toHaveLength(1);
+    expect(
+      mustFindProps(byAriaLabel("Pull Requests for repo-a"), "repository Pull Requests button"),
+    ).toBeDefined();
+  });
+
+  it("opens the chosen environment's Pull Requests from the repository row", async () => {
+    groupedScenario();
+    h.uiStore.setState({ sidebarView: "repositories" });
+    render(<Sidebar />);
+    fakeLocalApi();
+    h.spies.contextMenuShow.mockImplementation(
+      async (items: Array<{ id: string }>) => items[1]!.id,
+    );
+
+    const click = mouseEvent();
+    invoke(
+      mustFindProps(byTestId("repository-pull-requests-button"), "repository Pull Requests button"),
+      "onClick",
+      click,
+    );
+    await flush();
+
+    expect(click.stopPropagation).toHaveBeenCalled();
+    expect(h.spies.contextMenuShow).toHaveBeenCalled();
+    expect(h.spies.navigate).toHaveBeenCalledWith({
+      to: "/project/$environmentId/$projectId/pull-requests",
+      params: { environmentId: ENV_REMOTE, projectId: ProjectId.make("project-a-remote") },
+    });
+  });
+
+  it("opens the one connected environment from the repository row without asking", async () => {
+    groupedScenario();
+    h.state.environments = [
+      environmentFixture({ environmentId: ENV_MAIN, label: "Main", connectionId: "primary" }),
+      environmentFixture({
+        environmentId: ENV_REMOTE,
+        label: "Remote Box",
+        connectionId: "remote",
+        phase: "error",
+        error: "Remote host is offline.",
+      }),
+    ];
+    h.uiStore.setState({ sidebarView: "repositories" });
+    render(<Sidebar />);
+    fakeLocalApi();
+
+    invoke(
+      mustFindProps(byTestId("repository-pull-requests-button"), "repository Pull Requests button"),
+      "onClick",
+      mouseEvent(),
+    );
+    await flush();
+
+    expect(h.spies.contextMenuShow).not.toHaveBeenCalled();
+    expect(h.spies.navigate).toHaveBeenCalledWith({
+      to: "/project/$environmentId/$projectId/pull-requests",
+      params: { environmentId: ENV_MAIN, projectId: ProjectId.make("project-a") },
+    });
+  });
+
+  it("shows the repository row's actions without hover", () => {
+    groupedScenario();
+    h.uiStore.setState({ sidebarView: "repositories" });
+    const markup = render(<Sidebar />);
+    const strip = /<div[^>]*data-testid="repository-group-actions-strip"[^>]*>/.exec(markup)?.[0];
+    expect(strip).toBeDefined();
+    expect(strip).not.toContain("opacity-0");
+  });
+
+  it("puts Pipelines after Pull Requests on the repository row, not its environment rows", () => {
+    groupedScenario();
+    h.uiStore.setState({ sidebarView: "repositories" });
+    const markup = render(<Sidebar />);
+    expect(findProps(byTestId("pipelines-button"))).toBeNull();
+    expect(markup.indexOf('data-testid="repository-pipelines-button"')).toBeGreaterThan(
+      markup.indexOf('data-testid="repository-pull-requests-button"'),
+    );
+    expect(
+      mustFindProps(byAriaLabel("Pipelines for repo-a"), "repository Pipelines button"),
+    ).toBeDefined();
+  });
+
+  it("opens the chosen environment's Pipelines from the repository row", async () => {
+    groupedScenario();
+    h.uiStore.setState({ sidebarView: "repositories" });
+    render(<Sidebar />);
+    fakeLocalApi();
+    h.spies.contextMenuShow.mockImplementation(
+      async (items: Array<{ id: string }>) => items[1]!.id,
+    );
+    const click = mouseEvent();
+    invoke(
+      mustFindProps(byTestId("repository-pipelines-button"), "repository Pipelines button"),
+      "onClick",
+      click,
+    );
+    await flush();
+    expect(click.stopPropagation).toHaveBeenCalled();
+    expect(h.spies.contextMenuShow).toHaveBeenCalled();
+    expect(h.spies.navigate).toHaveBeenCalledWith({
+      to: "/project/$environmentId/$projectId/pipelines",
+      params: { environmentId: ENV_REMOTE, projectId: ProjectId.make("project-a-remote") },
+    });
+  });
+
+  it("opens the chosen grouped-project member's Pipelines", async () => {
+    groupedScenario();
+    render(<Sidebar />);
+    fakeLocalApi();
+    h.spies.contextMenuShow.mockImplementation(
+      async (items: Array<{ id: string }>) => items[1]!.id,
+    );
+    invoke(
+      mustFindProps(byTestId("pipelines-button"), "Pipelines button"),
+      "onClick",
+      mouseEvent(),
+    );
+    await flush();
+    expect(h.spies.contextMenuShow).toHaveBeenCalled();
+    expect(h.spies.navigate).toHaveBeenCalledWith({
+      to: "/project/$environmentId/$projectId/pipelines",
+      params: { environmentId: ENV_REMOTE, projectId: ProjectId.make("project-a-remote") },
+    });
+  });
+
+  it("hides the repository row's Pipelines button when disabled in settings", () => {
+    groupedScenario();
+    h.uiStore.setState({ sidebarView: "repositories" });
+    h.state.clientSettings.pipelinesEnabled = false;
+    render(<Sidebar />);
+    expect(findProps(byTestId("repository-pipelines-button"))).toBeNull();
+    expect(findProps(byTestId("repository-pull-requests-button"))).not.toBeNull();
+  });
+
+  it("hides the repository row's Pull Requests button when disabled in settings", () => {
+    groupedScenario();
+    h.uiStore.setState({ sidebarView: "repositories" });
+    h.state.clientSettings.pullRequestsEnabled = false;
+    render(<Sidebar />);
+    expect(findProps(byTestId("repository-pull-requests-button"))).toBeNull();
   });
 
   it("does not navigate when the grouped-project picker is unavailable or cancelled", async () => {

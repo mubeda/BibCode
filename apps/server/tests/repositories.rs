@@ -281,6 +281,7 @@ fn thread(id: &str, project_id: &str, created_at: &str) -> ProjectionThread {
         unresolved_delivery_detail: None,
         deleted_at: None,
         host_thread_id: None,
+        compaction: None,
     }
 }
 
@@ -352,6 +353,7 @@ fn public_repository_api_inventory_is_explicit() {
         "delete_pending_turn_start",
         "delete_project",
         "delete_proposed_plans_by_thread",
+        "delete_reasoning_by_thread",
         "delete_provider_session_runtime",
         "delete_thread",
         "delete_thread_session",
@@ -384,6 +386,9 @@ fn public_repository_api_inventory_is_explicit() {
         "list_projects",
         "list_projection_states",
         "list_proposed_plans_by_thread",
+        "list_reasoning_by_thread",
+        "list_streaming_reasoning",
+        "list_streaming_reasoning_by_thread",
         "list_provider_session_runtimes",
         "list_provider_turn_deliveries",
         "list_queued_provider_turn_heads",
@@ -1228,6 +1233,7 @@ async fn conversation_projection_repositories_round_trip_order_and_delete() {
         delivery_provider_instance_id: None,
         delivery_mode: None,
         delivery_held: None,
+        resend_of_message_id: None,
         message_id: "message-a".to_owned(),
         thread_id: "thread-conversation".to_owned(),
         turn_id: Some("turn-a".to_owned()),

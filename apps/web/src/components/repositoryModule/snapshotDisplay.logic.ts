@@ -1,0 +1,108 @@
+/** `incoming` replaces `current` only when `current` is unset or strictly older. */
+export function newerObservedAt(current: number | null, incoming: number): boolean {
+  return current === null || incoming > current;
+}
+
+/**
+ * The copy with the highest `revision` (the server's read generation) across
+ * every source, ignoring missing ones, so a copy on screen never moves back
+ * whichever read answers last. A copy without a revision (an older server, or
+ * a row an older build stored) ranks as 0 and never beats a stamped one; on a
+ * tie the earlier candidate wins, so with no revisions at all the first
+ * candidate present (the live value) is shown, as before.
+ */
+export function newestCopy<C extends { readonly revision?: number | undefined }>(
+  candidates: readonly (C | null | undefined)[],
+): C | null {
+  let newest: C | null = null;
+  for (const candidate of candidates) {
+    if (candidate == null) continue;
+    if (newest === null || (candidate.revision ?? 0) > (newest.revision ?? 0)) newest = candidate;
+  }
+  return newest;
+}
+
+/** The newest copy shown so far for one key (a merge request). */
+export interface KeptCopy<C> {
+  readonly key: unknown;
+  readonly copy: C;
+}
+
+/**
+ * `newestCopy` over `candidates` and the copy kept for `key`, so a source that
+ * drops out (a tab switch re-keys the snapshot read, which then has not
+ * answered or has failed) never moves the screen back to an older revision.
+ * The kept copy changes only for a strictly higher revision, or for another
+ * key; on a tie a candidate wins, so with no revisions the live value still
+ * shows first. `kept` is returned unchanged when nothing moved.
+ */
+export function keepNewestCopy<C extends { readonly revision?: number | undefined }>(
+  kept: KeptCopy<C> | null,
+  key: unknown,
+  candidates: readonly (C | null | undefined)[],
+): { shown: C | null; kept: KeptCopy<C> | null } {
+  const previous = kept?.key === key ? kept : null;
+  const shown = newestCopy([...candidates, previous?.copy]);
+  if (
+    shown !== null &&
+    (previous === null || (shown.revision ?? 0) > (previous.copy.revision ?? 0))
+  ) {
+    return { shown, kept: { key, copy: shown } };
+  }
+  return { shown, kept: previous };
+}
+
+export interface SnapshotCopy<P> {
+  readonly payload: P;
+  readonly observedAt: number;
+}
+
+/** The copy a view shows for one key, and the live page and snapshot row it last took. */
+export interface ShownCopy<P> extends SnapshotCopy<P> {
+  readonly key: string;
+  readonly live: P | null;
+  readonly snapshot: SnapshotCopy<P> | null;
+}
+
+/** The snapshot read for a key: whether it has answered, and the row it answered with. */
+export interface SnapshotSource<P> {
+  readonly answered: boolean;
+  readonly row: SnapshotCopy<P> | null;
+}
+
+/**
+ * Picks the copy to show for `key`, dropping a copy kept for another key. A new
+ * live page always replaces it, and a snapshot row replaces it only when its
+ * `observedAt` is strictly newer. A live page is stamped on the server clock with
+ * the newest snapshot `observedAt` seen when it answered, so only a copy stored
+ * afterwards replaces it. Before the snapshot read answers, the client clock
+ * stands in, so the older stored copy that read returns cannot replace the live page.
+ */
+export function shownCopy<P>(
+  previous: ShownCopy<P> | null,
+  key: string,
+  live: P | null,
+  source: SnapshotSource<P> | null,
+  now: () => number = Date.now,
+): ShownCopy<P> | null {
+  let next = previous?.key === key ? previous : null;
+  const snapshot = source?.row ?? null;
+  if (live !== null && live !== next?.live) {
+    const after = source === null ? 0 : source.answered ? (snapshot?.observedAt ?? 0) : now();
+    next = {
+      key,
+      payload: live,
+      observedAt: Math.max(after, next?.observedAt ?? 0),
+      live,
+      snapshot: next?.snapshot ?? null,
+    };
+  }
+  if (
+    snapshot !== null &&
+    snapshot !== next?.snapshot &&
+    newerObservedAt(next?.observedAt ?? null, snapshot.observedAt)
+  ) {
+    next = { key, ...snapshot, live: next?.live ?? null, snapshot };
+  }
+  return next;
+}

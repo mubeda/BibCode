@@ -628,6 +628,7 @@ describe("dependency upgrade ledger validation", () => {
 
     expect(Object.keys(workspace.patchedDependencies).sort()).toEqual([
       "@effect/vitest@4.0.2",
+      "@pierre/diffs@1.3.6",
       "@pierre/trees@1.0.0-beta.6",
       "@wdio/tauri-plugin@1.2.0",
       "effect@4.0.2",
@@ -856,8 +857,8 @@ describe("dependency upgrade ledger validation", () => {
 
     expect(validateDependencyLedger(inventory, ledger)).toEqual([]);
     expect(ledger.inventorySummary).toEqual({
-      javascriptDirect: 80,
-      javascriptLedger: 82,
+      javascriptDirect: 90,
+      javascriptLedger: 92,
       rustRegistry: 138,
       rustPath: 3,
       rustGit: 1,

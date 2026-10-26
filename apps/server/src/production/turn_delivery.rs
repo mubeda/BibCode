@@ -1053,6 +1053,19 @@ async fn fill_available_slots(
         {
             continue;
         }
+        // An unsettled compaction holds the thread; its settlement wakes delivery. The claim
+        // repeats this check.
+        if engine
+            .unsettled_thread_compaction(&row.thread_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
+            continue;
+        }
+        if row.mode == TurnDeliveryMode::Start && guard_compaction(engine, &row).await {
+            continue;
+        }
         candidates.push(row);
     }
     let retry_delay = candidates
@@ -1105,6 +1118,45 @@ async fn fill_available_slots(
         });
     }
     Ok(FillResult { retry_delay })
+}
+
+/// The guard: before a pending start is claimed, compacts the conversation it continues when the
+/// provider's latest reading of it is near the provider's own compaction point, once per
+/// delivery. The delivery then waits behind the compaction, which the claim gate holds, and is
+/// delivered once it settles. Returns whether it asked for a compaction.
+async fn guard_compaction(engine: &OrchestrationEngine, row: &ProviderTurnDelivery) -> bool {
+    match engine
+        .compaction_guard_needed(
+            &row.thread_id,
+            &row.command_id,
+            &row.provider_instance_id,
+            &row.provider_kind,
+        )
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return false,
+        Err(error) => {
+            tracing::warn!(thread_id = %row.thread_id, %error, "the compaction guard could not read the thread");
+            return false;
+        }
+    }
+    match engine
+        .dispatch(OrchestrationCommand::ThreadCompact {
+            command_id: crate::orchestration::engine::guard_command_id(&row.command_id),
+            thread_id: row.thread_id.clone(),
+            guarded_delivery_command_id: Some(row.command_id.clone()),
+            created_at: now(),
+        })
+        .await
+    {
+        Ok(_) => true,
+        Err(error) => {
+            // Delivered without the guard rather than held behind a compaction that never ran.
+            tracing::warn!(thread_id = %row.thread_id, %error, "the compaction guard could not compact before a delivery");
+            false
+        }
+    }
 }
 
 /// A delivery whose thread was deleted can never be delivered: the provider would launch a
@@ -4488,3 +4540,7 @@ mod tests {
 #[cfg(test)]
 #[path = "turn_delivery_queue_tests.rs"]
 mod queue_tests;
+
+#[cfg(test)]
+#[path = "thread_compaction_tests.rs"]
+mod thread_compaction_tests;

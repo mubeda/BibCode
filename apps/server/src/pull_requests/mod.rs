@@ -1,6 +1,7 @@
 //! Repository-scoped hosted pull request reads and operations.
 
 mod action;
+pub(crate) mod backoff;
 mod cache;
 pub mod checkout;
 pub mod context;
@@ -10,6 +11,7 @@ pub mod gitlab;
 pub mod host;
 pub mod model;
 pub mod permissions;
+pub mod pipelines;
 mod read;
 pub(crate) mod snapshot_store;
 
@@ -59,11 +61,14 @@ pub struct PullRequestsService {
     gitlab_host: Arc<gitlab::GitLabHost>,
     action_gates: Arc<ActionGates>,
     database: Option<crate::persistence::Database>,
+    /// The GitLab pollers, and per lowercased host the 429 backoff and the
+    /// logout fence every display write checks: a read that started before a
+    /// logout is not stored, even for a repository with no row yet.
     pollers: Arc<gitlab::poll::Registry>,
     hosts_restored: Arc<tokio::sync::OnceCell<()>>,
-    /// Per lowercased host, the generation of its last logout: a context read that
-    /// started before it is not stored, even for a repository with no row yet.
-    context_fences: Arc<Mutex<HashMap<String, i64>>>,
+    /// The Pipelines module's server memory: its log cache, its pollers and
+    /// its reused list counts, cleared with the contexts on rescan.
+    pipelines: Arc<pipelines::PipelinesState>,
 }
 
 /// The stored context row's kind; its key is empty.
@@ -85,6 +90,7 @@ impl PullRequestsService {
         Self {
             database: self.database,
             pollers: self.pollers,
+            pipelines: self.pipelines,
             ..Self::with_runner(
                 self.runner
                     .as_ref()
@@ -106,7 +112,7 @@ impl PullRequestsService {
             database: None,
             pollers: Arc::default(),
             hosts_restored: Arc::default(),
-            context_fences: Arc::default(),
+            pipelines: Arc::default(),
         }
     }
 
@@ -289,35 +295,20 @@ impl PullRequestsService {
                 let Ok(payload) = serde_json::to_vec(context) else {
                     return;
                 };
-                let fences = self.context_fences.clone();
-                let host = scope.host.to_ascii_lowercase();
-                let project = scope.repository.clone();
-                let _ = database
-                    .call(move |connection| {
-                        // Checked on the database worker: a logout's delete queued
-                        // before this write has already raised the fence.
-                        if fences
-                            .lock()
-                            .unwrap_or_else(|p| p.into_inner())
-                            .get(&host)
-                            .is_some_and(|fence| generation <= *fence)
-                        {
-                            return Ok(());
-                        }
-                        Ok(snapshot_store::SnapshotStore::new(connection).put(
-                            snapshot_store::Snapshot {
-                                host,
-                                project,
-                                kind: CONTEXT_KIND.into(),
-                                key: String::new(),
-                                fingerprint: String::new(),
-                                payload,
-                                observed_at_ms: snapshot_store::now_ms(),
-                                generation,
-                            },
-                        )?)
-                    })
-                    .await;
+                // Fenced on the database worker: a logout's delete queued before
+                // this write has already raised the fence.
+                gitlab::poll::store(
+                    &database,
+                    self.pollers.fences(),
+                    &scope.host,
+                    &scope.repository,
+                    CONTEXT_KIND,
+                    "",
+                    String::new(),
+                    payload,
+                    generation,
+                )
+                .await;
             }
             Ok(Context::Unavailable {
                 code:
@@ -330,6 +321,7 @@ impl PullRequestsService {
                 // this failure cannot replace a success that started later.
                 gitlab::poll::store(
                     &database,
+                    self.pollers.fences(),
                     &scope.host,
                     &scope.repository,
                     CONTEXT_KIND,
@@ -462,19 +454,19 @@ impl PullRequestsService {
                 .call(move |connection| {
                     let store = snapshot_store::SnapshotStore::new(connection);
                     let list = store.get(&host, &project, "list", &list_key)?;
-                    let detail = match number {
-                        Some(number) => {
-                            store.get(&host, &project, "detail", &number.to_string())?
-                        }
+                    let row = |kind: &str| match number {
+                        Some(number) => store.get(&host, &project, kind, &number.to_string()),
+                        None => Ok(None),
+                    };
+                    let detail = row("detail")?;
+                    let tab_row = match tab {
+                        Some(tab) => row(tab_kind(tab))?,
                         None => None,
                     };
-                    let tab_row = match (number, tab) {
-                        (Some(number), Some(tab)) => {
-                            store.get(&host, &project, tab_kind(tab), &number.to_string())?
-                        }
-                        _ => None,
-                    };
-                    Ok((list, detail, tab_row))
+                    // The poller's pipeline copy rides on every tab: the merge box
+                    // (Conversation) and the Pipelines tab both show it.
+                    let pipeline = row(gitlab::poll::PIPELINE_KIND)?;
+                    Ok((list, detail, tab_row, pipeline))
                 })
                 .await
                 .map_err(|_| snapshot_unavailable(operation))?;
@@ -483,10 +475,13 @@ impl PullRequestsService {
         .await
     }
 
+    /// `emit` answers whether the stream accepted the event; the poller re-sends
+    /// what it could not deliver. A sign-in failure from any poller read ends
+    /// the subscription with that error, after the host's rows are deleted.
     pub async fn subscribe(
         &self,
         input: SubscribeInput,
-        emit: &(dyn Fn(model::Changed) + Send + Sync),
+        emit: &(dyn Fn(model::Changed) -> bool + Send + Sync),
         c: &CancellationToken,
     ) -> Result<(), PullRequestsOperationError> {
         let operation = "pullRequests.subscribe";
@@ -505,12 +500,8 @@ impl PullRequestsService {
         let Some(database) = self.gitlab_poller_database(&scope) else {
             return Err(snapshot_unavailable(operation));
         };
-        let tab = gitlab::poll::ActiveTab {
-            commits: input.tab == Some(SubscribeTab::Commits),
-            files: input.tab == Some(SubscribeTab::Files),
-        };
         let list_key = input.list.snapshot_key();
-        gitlab::poll::run_subscriber(
+        let result = gitlab::poll::run_subscriber(
             &self.pollers,
             &self.gitlab_host,
             &database,
@@ -518,12 +509,16 @@ impl PullRequestsService {
             &input.list,
             &list_key,
             input.number,
-            tab,
+            input.tab,
             emit,
             c,
         )
         .await;
-        Ok(())
+        if let Err(error) = &result {
+            self.invalidate_failed_context(error, Some(&scope.host))
+                .await;
+        }
+        result
     }
 
     /// Only GitLab routes poll; both hosts store and read display copies.
@@ -558,6 +553,7 @@ impl PullRequestsService {
         };
         gitlab::poll::store(
             &database,
+            self.pollers.fences(),
             &scope.host,
             &scope.repository,
             kind,
@@ -645,6 +641,11 @@ impl PullRequestsService {
             }
             detail.permissions = permissions;
             detail.readiness = readiness;
+            // Stamped with the generation taken before the first host read, the same
+            // number the poller's pipeline rows carry, so the client keeps the newer.
+            if let Some(copy) = &mut detail.pipeline {
+                copy.revision = generation;
+            }
             // The poller's probe row, not this one, holds the change fingerprint.
             self.store_read(
                 &scope,
@@ -750,7 +751,8 @@ impl PullRequestsService {
                 .await
                 .map_err(|u| u.operation_error(operation))?;
             captured.set(&scope.host);
-            let value = self.host(&scope).checks(&scope, number, &c).await?;
+            let mut value = self.host(&scope).checks(&scope, number, &c).await?;
+            value.revision = Some(generation);
             self.store_read(
                 &scope,
                 "checks",
@@ -967,6 +969,9 @@ impl PullRequestsService {
         self.runner.clear_context_probes();
         self.github.invalidate_context();
         self.gitlab.invalidate_context();
+        // Downloaded logs are keyed by the account: a rescan or a sign-in
+        // change drops them with the contexts.
+        self.pipelines.forget_contexts();
     }
 
     /// Rescan uses `invalidate_contexts` directly and must leave snapshots in
@@ -996,12 +1001,10 @@ impl PullRequestsService {
             return;
         };
         let host = host.to_ascii_lowercase();
-        // Fence first: a context read that started before this logout must not
-        // write its context back once the rows are gone.
-        self.context_fences
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(host.clone(), snapshot_store::next_generation());
+        // Fence first: a read that started before this logout, the poller's
+        // included, must not write its rows back once they are gone.
+        self.pollers.fences().raise(&host);
+        self.pipelines.forget_host(&host);
         let _ = database
             .call(move |connection| {
                 Ok(snapshot_store::SnapshotStore::new(connection).delete_host(&host)?)
@@ -1104,7 +1107,12 @@ fn tab_kind(tab: SubscribeTab) -> &'static str {
 type RawSnapshotRow = Option<snapshot_store::Snapshot>;
 
 fn build_snapshot(
-    (list, detail, tab_row): (RawSnapshotRow, RawSnapshotRow, RawSnapshotRow),
+    (list, detail, tab_row, pipeline): (
+        RawSnapshotRow,
+        RawSnapshotRow,
+        RawSnapshotRow,
+        RawSnapshotRow,
+    ),
     tab: Option<SubscribeTab>,
 ) -> Snapshot {
     Snapshot {
@@ -1134,6 +1142,14 @@ fn build_snapshot(
                 }),
             _ => None,
         },
+        pipeline: pipeline.and_then(|row| {
+            serde_json::from_slice(&row.payload)
+                .ok()
+                .map(|payload| SnapshotPayload {
+                    payload,
+                    observed_at: row.observed_at_ms.max(0) as u64,
+                })
+        }),
     }
 }
 
@@ -1170,7 +1186,7 @@ fn interrupted_result<T>(
 ) -> Result<T, PullRequestsOperationError> {
     // A mutation may already have posted comments. Preserve its settled result
     // after cleanup instead of replacing that receipt with an ambiguous timeout.
-    if operation == action::OP || operation == checkout::OP {
+    if operation == action::OP || operation == checkout::OP || operation == pipelines::ACTION_OP {
         result
     } else {
         Err(PullRequestsOperationError::new(operation, "timeout"))
@@ -1316,7 +1332,7 @@ mod service_tests {
             database: None,
             pollers: Arc::default(),
             hosts_restored: Arc::default(),
-            context_fences: Arc::default(),
+            pipelines: Arc::default(),
         };
         let scope = host::HostScope {
             cwd: PathBuf::from("/repo"),
@@ -1439,7 +1455,7 @@ mod service_tests {
             database: None,
             pollers: Arc::default(),
             hosts_restored: Arc::default(),
-            context_fences: Arc::default(),
+            pipelines: Arc::default(),
         };
         let scope = host::HostScope {
             cwd: "/checkout-a".into(),
@@ -2182,6 +2198,8 @@ esac"#,
         assert!(matches!(next, Context::Unavailable { .. }), "{next:?}");
     }
 
+    // The fake `glab` and `git` are shell scripts.
+    #[cfg(unix)]
     #[tokio::test]
     async fn gitlab_poller_read_snapshot_with_a_populated_row_performs_zero_glab_calls() {
         let s = crate::test_support::TestSandbox::new("pr-read-snapshot");
@@ -2232,6 +2250,228 @@ esac"#,
             .unwrap();
         assert!(snapshot.list.is_some());
         assert!(!s.path("calls").exists(), "zero glab calls");
+    }
+
+    #[cfg(unix)]
+    fn pipeline_copy(revision: i64) -> PipelineCopy {
+        PipelineCopy {
+            revision,
+            pipeline: Pipeline::Present(PresentPipeline {
+                id: 4821,
+                status: PipelineStatus::Running,
+                warnings: false,
+                kind: PipelineKind::MergeRequest,
+                git_ref: "refs/merge-requests/3941/head".into(),
+                sha: "abc1234".into(),
+                is_for_head: Some(true),
+                url: None,
+                updated_at: "t".into(),
+                started_at: None,
+                finished_at: None,
+                duration_seconds: None,
+                stages: Some(vec![]),
+            }),
+            checks: None,
+        }
+    }
+
+    /// Its fake host tools are shell scripts.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn gitlab_poller_read_snapshot_returns_the_pipeline_row_with_zero_glab_calls() {
+        let s = crate::test_support::TestSandbox::new("pr-read-snapshot-pipeline");
+        let glab = s.executable_script("glab", "printf '%s\\n' \"$*\" >> calls\nexit 64", "");
+        let git = s.executable_script(
+            "git",
+            "printf '%s' 'git@gitlab.acme.example:team/repo.git'",
+            "",
+        );
+        let database = new_database().await;
+        let service = PullRequestsService::with_runner(
+            HostCommandRunner::new(s.path("state")).with_commands("missing-gh", &glab, &git),
+        )
+        .with_database(database.clone());
+        service.runner.provider_hosts().record(
+            "gitlab.acme.example",
+            crate::source_control::ProviderKind::Gitlab,
+        );
+        let payload = serde_json::to_vec(&pipeline_copy(7)).unwrap();
+        database
+            .call(move |connection| {
+                Ok(snapshot_store::SnapshotStore::new(connection).put(
+                    snapshot_store::Snapshot {
+                        host: "gitlab.acme.example".into(),
+                        project: "team/repo".into(),
+                        kind: gitlab::poll::PIPELINE_KIND.into(),
+                        key: "3941".into(),
+                        fingerprint: "fp".into(),
+                        payload,
+                        observed_at_ms: 5,
+                        generation: 7,
+                    },
+                )?)
+            })
+            .await
+            .unwrap();
+        for tab in ["conversation", "checks", "commits"] {
+            let input: SubscribeInput = serde_json::from_value(serde_json::json!({"cwd":s.root(),"state":"open","search":null,"author":null,"assignee":null,"reviewer":null,"reviewStatus":null,"draft":null,"labels":[],"milestone":null,"targetBranch":null,"sort":"newest","cursor":null,"refreshTotals":false,"number":3941,"tab":tab})).unwrap();
+            let snapshot = service
+                .read_snapshot(input, &CancellationToken::new())
+                .await
+                .unwrap();
+            assert_eq!(
+                snapshot.pipeline,
+                Some(SnapshotPayload {
+                    payload: pipeline_copy(7),
+                    observed_at: 5
+                }),
+                "{tab}"
+            );
+        }
+        assert!(!s.path("calls").exists(), "zero glab calls");
+    }
+
+    /// A unary read that started before a logout cannot bring its row back.
+    #[tokio::test]
+    async fn a_store_read_that_started_before_a_logout_writes_nothing() {
+        let database = new_database().await;
+        let service =
+            PullRequestsService::new(std::path::PathBuf::new()).with_database(database.clone());
+        let scope = host::HostScope {
+            cwd: PathBuf::from("/repo"),
+            host: "GitLab.Acme.Example".into(),
+            repository: "team/repo".into(),
+            provider: model::PullRequestsProvider::Gitlab,
+        };
+        let started = snapshot_store::next_generation();
+        service.delete_host_snapshots("gitlab.acme.example").await;
+        service
+            .store_read(&scope, "detail", "3941", String::new(), &"late", started)
+            .await;
+        let row = database
+            .call(|connection| {
+                Ok(snapshot_store::SnapshotStore::new(connection).get(
+                    "gitlab.acme.example",
+                    "team/repo",
+                    "detail",
+                    "3941",
+                )?)
+            })
+            .await
+            .unwrap();
+        assert!(row.is_none(), "the fenced write is skipped");
+        service
+            .store_read(
+                &scope,
+                "detail",
+                "3941",
+                String::new(),
+                &"fresh",
+                snapshot_store::next_generation(),
+            )
+            .await;
+        let row = database
+            .call(|connection| {
+                Ok(snapshot_store::SnapshotStore::new(connection).get(
+                    "gitlab.acme.example",
+                    "team/repo",
+                    "detail",
+                    "3941",
+                )?)
+            })
+            .await
+            .unwrap();
+        assert!(row.is_some(), "a read that started afterwards stores again");
+    }
+
+    /// A sign-in failure on a poller read ends the subscription with that
+    /// error and deletes the host's rows.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn gitlab_poller_auth_failure_ends_every_subscriber_and_deletes_host_rows() {
+        use futures_util::future::poll_immediate;
+        let s = crate::test_support::TestSandbox::new("pr-subscribe-auth-failure");
+        let glab = s.executable_script(
+            "glab",
+            r#"printf '%s\n' "$*" >> calls
+case "$1 $2" in
+  'mr list') echo 'HTTP 401 Unauthorized' >&2; exit 1 ;;
+  *) exit 64 ;;
+esac"#,
+            "",
+        );
+        let git = s.executable_script(
+            "git",
+            "printf '%s' 'git@gitlab.acme.example:team/repo.git'",
+            "",
+        );
+        let database = new_database().await;
+        let service = PullRequestsService::with_runner(
+            HostCommandRunner::new(s.path("state")).with_commands("missing-gh", &glab, &git),
+        )
+        .with_database(database.clone());
+        service.runner.provider_hosts().record(
+            "gitlab.acme.example",
+            crate::source_control::ProviderKind::Gitlab,
+        );
+        database
+            .call(|connection| {
+                Ok(snapshot_store::SnapshotStore::new(connection).put(
+                    snapshot_store::Snapshot {
+                        host: "gitlab.acme.example".into(),
+                        project: "team/repo".into(),
+                        kind: "detail".into(),
+                        key: "3941".into(),
+                        fingerprint: String::new(),
+                        payload: b"{}".to_vec(),
+                        observed_at_ms: 1,
+                        generation: 1,
+                    },
+                )?)
+            })
+            .await
+            .unwrap();
+        let input = |tab: &str| -> SubscribeInput {
+            serde_json::from_value(serde_json::json!({"cwd":s.root(),"state":"open","search":null,"author":null,"assignee":null,"reviewer":null,"reviewStatus":null,"draft":null,"labels":[],"milestone":null,"targetBranch":null,"sort":"newest","cursor":null,"refreshTotals":false,"number":3941,"tab":tab})).unwrap()
+        };
+        let c = CancellationToken::new();
+        let mut first = Box::pin(service.subscribe(input("conversation"), &|_| true, &c));
+        let mut second = Box::pin(service.subscribe(input("files"), &|_| true, &c));
+        let (mut first_result, mut second_result) = (None, None);
+        for step in 0..5000 {
+            if first_result.is_none() {
+                first_result = poll_immediate(first.as_mut()).await;
+            }
+            if second_result.is_none() {
+                second_result = poll_immediate(second.as_mut()).await;
+            }
+            if first_result.is_some() && second_result.is_some() {
+                break;
+            }
+            if step % 200 == 199 {
+                tokio::time::advance(Duration::from_secs(10)).await;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+            tokio::task::yield_now().await;
+        }
+        for result in [first_result, second_result] {
+            assert_eq!(
+                result.expect("the subscription ended").unwrap_err().code,
+                "not_authenticated"
+            );
+        }
+        let row = database
+            .call(|connection| {
+                Ok(snapshot_store::SnapshotStore::new(connection).get(
+                    "gitlab.acme.example",
+                    "team/repo",
+                    "detail",
+                    "3941",
+                )?)
+            })
+            .await
+            .unwrap();
+        assert!(row.is_none(), "the host's rows are deleted");
     }
 
     #[derive(Clone, Default)]
@@ -2289,6 +2529,8 @@ esac"#,
         child.complete();
     }
 
+    // The fake `glab` and `git` are shell scripts.
+    #[cfg(unix)]
     #[tokio::test]
     async fn gitlab_poller_run_action_success_deletes_the_acted_numbers_rows_and_leaves_others() {
         let s = crate::test_support::TestSandbox::new("pr-run-action-snapshots");
@@ -2333,7 +2575,7 @@ esac"#,
             database: Some(database.clone()),
             pollers: Arc::default(),
             hosts_restored: Arc::default(),
-            context_fences: Arc::default(),
+            pipelines: Arc::default(),
         };
         for (number, kind) in [
             (3941u64, "detail"),
@@ -2341,6 +2583,7 @@ esac"#,
             (3941, "commits"),
             (3941, "checks"),
             (3941, "files"),
+            (3941, "pipeline"),
             (42, "detail"),
         ] {
             database
@@ -2371,7 +2614,9 @@ esac"#,
             .await
             .unwrap();
         assert_eq!(result, ActionResult::Done);
-        for kind in ["detail", "timeline", "commits", "checks", "files"] {
+        for kind in [
+            "detail", "timeline", "commits", "checks", "files", "pipeline",
+        ] {
             let row = database
                 .call(move |connection| {
                     Ok(snapshot_store::SnapshotStore::new(connection).get(
@@ -2437,7 +2682,7 @@ esac"#,
             database: Some(database.clone()),
             pollers: Arc::default(),
             hosts_restored: Arc::default(),
-            context_fences: Arc::default(),
+            pipelines: Arc::default(),
         };
         let detail = service
             .get(s.root(), 14, &CancellationToken::new())
@@ -2451,12 +2696,14 @@ esac"#,
             .expect("GitHub reads its display copies");
         assert_eq!(snapshot.detail.map(|row| row.payload), Some(detail));
         let refused = service
-            .subscribe(input, &|_| {}, &CancellationToken::new())
+            .subscribe(input, &|_| true, &CancellationToken::new())
             .await
             .expect_err("GitHub routes do not poll");
         assert_eq!(refused.code, "unavailable");
     }
 
+    // The fake `glab` and `git` are shell scripts.
+    #[cfg(unix)]
     #[tokio::test]
     async fn gitlab_unary_get_stores_the_detail_snapshot_read_snapshot_paints() {
         let s = crate::test_support::TestSandbox::new("pr-get-stores-snapshot");
@@ -2501,7 +2748,7 @@ esac"#,
             database: Some(database.clone()),
             pollers: Arc::default(),
             hosts_restored: Arc::default(),
-            context_fences: Arc::default(),
+            pipelines: Arc::default(),
         };
         let detail = service
             .get(s.root(), 14, &CancellationToken::new())
@@ -2591,6 +2838,24 @@ esac"#,
 
 #[cfg(test)]
 mod tripwires {
+    /// Host content that must never reach a log line, pipeline stage and job
+    /// names, refs, commit SHAs and job log text included.
+    const LOG_CONTENT_FIELDS: [&str; 13] = [
+        "host",
+        "repository",
+        "branch",
+        "title",
+        "body",
+        "login",
+        "url",
+        "stderr",
+        "sha",
+        "ref",
+        "stage",
+        "name",
+        "text",
+    ];
+
     fn violations(source: &str) -> Vec<&'static str> {
         let mut result = Vec::new();
         if [
@@ -2623,19 +2888,7 @@ mod tripwires {
         }
         for call in source.split(concat!("tracing", "::")).skip(1) {
             let call = call.split_once(");").map_or(call, |(call, _)| call);
-            if [
-                "host",
-                "repository",
-                "branch",
-                "title",
-                "body",
-                "login",
-                "url",
-                "stderr",
-            ]
-            .iter()
-            .any(|field| call.contains(field))
-            {
+            if LOG_CONTENT_FIELDS.iter().any(|field| call.contains(field)) {
                 result.push("log-content");
             }
         }
@@ -2644,6 +2897,13 @@ mod tripwires {
 
     const SOURCES: &[(&str, &str)] = &[
         ("mod.rs", include_str!("mod.rs")),
+        ("backoff.rs", include_str!("backoff.rs")),
+        ("pipelines/mod.rs", include_str!("pipelines/mod.rs")),
+        ("pipelines/model.rs", include_str!("pipelines/model.rs")),
+        ("pipelines/log.rs", include_str!("pipelines/log.rs")),
+        ("pipelines/poll.rs", include_str!("pipelines/poll.rs")),
+        ("pipelines/tests.rs", include_str!("pipelines/tests.rs")),
+        ("gitlab/pipelines.rs", include_str!("gitlab/pipelines.rs")),
         ("model.rs", include_str!("model.rs")),
         ("host.rs", include_str!("host.rs")),
         ("context.rs", include_str!("context.rs")),
@@ -2658,6 +2918,7 @@ mod tripwires {
             include_str!("github/detail_tests.rs"),
         ),
         ("github/timeline.rs", include_str!("github/timeline.rs")),
+        ("github/runs.rs", include_str!("github/runs.rs")),
         ("github/files.rs", include_str!("github/files.rs")),
         ("checkout.rs", include_str!("checkout.rs")),
         ("github/mod.rs", include_str!("github/mod.rs")),
@@ -2683,6 +2944,10 @@ mod tripwires {
         (
             "production/pull_requests_rpc.rs",
             include_str!("../production/pull_requests_rpc.rs"),
+        ),
+        (
+            "production/pipelines_rpc.rs",
+            include_str!("../production/pipelines_rpc.rs"),
         ),
     ];
 
@@ -2769,7 +3034,11 @@ mod tripwires {
             let found = violations(source);
             assert!(!found.contains(&"direct-http"), "{name}");
             assert!(!found.contains(&"thread-task"), "{name}");
-            if *name != "production/pull_requests_rpc.rs" {
+            // The two RPC files spawn each subscribe stream's task.
+            if !matches!(
+                *name,
+                "production/pull_requests_rpc.rs" | "production/pipelines_rpc.rs"
+            ) {
                 assert!(!found.contains(&"async-task"), "{name}");
             }
         }
@@ -2798,16 +3067,7 @@ mod tripwires {
         ] {
             assert!(violations(&format!("{prefix}::new(binary)")).contains(&"direct-process"));
         }
-        for field in [
-            "host",
-            "repository",
-            "branch",
-            "title",
-            "body",
-            "login",
-            "url",
-            "stderr",
-        ] {
+        for field in LOG_CONTENT_FIELDS {
             let source = format!(
                 "{}info!(\n {field} = %{field},\n \"event\"\n);",
                 concat!("tracing", "::")
@@ -2822,5 +3082,12 @@ mod tripwires {
             assert!(violations(poller).contains(&"poller"));
         }
         assert!(violations(concat!("tracing", "::info!(code, length);")).is_empty());
+        // A job's name and its log text are host content too.
+        for call in [
+            concat!("tracing", "::warn!(job_name = %job.name, \"job failed\");"),
+            concat!("tracing", "::debug!(text = %chunk.text);"),
+        ] {
+            assert!(violations(call).contains(&"log-content"), "{call}");
+        }
     }
 }
