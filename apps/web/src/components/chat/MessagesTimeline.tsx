@@ -253,6 +253,12 @@ interface MessagesTimelineProps {
   anchorMessageId: MessageId | null;
   onAnchorReady: (messageId: MessageId, anchorIndex: number) => void;
   onAnchorSizeChanged: (messageId: MessageId, size: number) => void;
+  /** A row's measured height changed; `previous` is its height before. */
+  onRowSizeChanged?: (info: {
+    readonly index: number;
+    readonly previous: number;
+    readonly size: number;
+  }) => void;
   contentInsetEndAdjustment: number;
   onIsAtEndChange: (isAtEnd: boolean) => void;
   onManualNavigation: () => void;
@@ -311,6 +317,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   anchorMessageId,
   onAnchorReady,
   onAnchorSizeChanged,
+  onRowSizeChanged,
   contentInsetEndAdjustment,
   onIsAtEndChange,
   onManualNavigation,
@@ -664,6 +671,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
                     size: true,
                   }}
                   onScroll={handleScroll}
+                  {...(onRowSizeChanged ? { onItemSizeChanged: onRowSizeChanged } : {})}
                   onMetricsChange={onListMetricsChange}
                   className="scrollbar-gutter-both h-full min-h-0 overflow-x-hidden overscroll-y-contain px-3 [overflow-anchor:none] sm:px-5"
                   ListHeaderComponent={TIMELINE_LIST_HEADER}
