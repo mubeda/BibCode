@@ -139,7 +139,9 @@ budgets above include a cold compile. Native desktop keeps its 120-minute and
   including inherited mounts from previous updates. This is Git compatibility
   evidence; native packaged desktop and updater validation remain separate.
 - `.github/workflows/desktop-ui-smoke.yml` is a manual or reusable packaged-app
-  UI smoke matrix for all six supported native targets.
+  UI smoke matrix for all six supported native targets. Each target uploads its
+  screenshots, logs and the specs' JSON traces, such as the Mermaid timeline
+  samples.
 - `.github/workflows/desktop-upgrade-smoke.yml` runs real seeded updater flows on
   all six targets, including the isolated `remote-install` lane. That lane uses
   the product coordinator, verifies boot/version/storage/protection evidence,

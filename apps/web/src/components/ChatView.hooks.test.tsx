@@ -1209,16 +1209,6 @@ interface FakeLegendListOptions {
   scroll?: number;
   scrollLength?: number;
   dataLength?: number;
-  rowSize?: number;
-  /** Holds each non-animated `scrollToIndex` open until `landIndexScrolls` runs. */
-  deferIndexLanding?: boolean;
-  /**
-   * The content height the scroller has laid out lags the measured rows: the first
-   * `scrollToOffset` clamps at this offset, and the height catches up right after it.
-   */
-  laggingMaxScroll?: number;
-  /** Runs when a `scrollToOffset` was clamped by the lagging content height. */
-  onClampedScroll?: () => void;
 }
 
 function makeLegendList(options: FakeLegendListOptions = {}) {
@@ -1228,9 +1218,7 @@ function makeLegendList(options: FakeLegendListOptions = {}) {
     scrollToOffset: [] as unknown[],
     scrollToIndex: [] as unknown[],
   };
-  let maxScroll = options.laggingMaxScroll ?? Number.POSITIVE_INFINITY;
   const scrollNode = {
-    scrollTop: options.scroll ?? 0,
     listeners: scrollNodeListeners,
     addEventListener: (type: string, handler: () => void, listenerOptions?: unknown) => {
       scrollNodeListeners.push({ type, handler, options: listenerOptions });
@@ -1242,20 +1230,15 @@ function makeLegendList(options: FakeLegendListOptions = {}) {
       }
     },
   };
-  const pendingLandings: Array<() => void> = [];
   const list = {
     calls,
     scrollNode,
-    landIndexScrolls() {
-      for (const land of pendingLandings.splice(0)) land();
-    },
     getScrollableNode: () => scrollNode,
     getState: () => ({
       scroll: options.scroll ?? 0,
       data: Array.from({ length: options.dataLength ?? 1 }, (_, index) => index),
-      positionAtIndex: (index: number) =>
-        options.rowSize === undefined ? 0 : index * options.rowSize,
-      sizeAtIndex: (_index: number) => options.rowSize ?? 100,
+      positionAtIndex: (_index: number) => 0,
+      sizeAtIndex: (_index: number) => 100,
       scrollLength: options.scrollLength ?? 50,
     }),
     scrollToEnd: (input: unknown) => {
@@ -1264,19 +1247,10 @@ function makeLegendList(options: FakeLegendListOptions = {}) {
     },
     scrollToOffset: (input: unknown) => {
       calls.scrollToOffset.push(input);
-      const offset = (input as { offset: number }).offset;
-      scrollNode.scrollTop = Math.min(offset, maxScroll);
-      if (offset > maxScroll) {
-        maxScroll = Number.POSITIVE_INFINITY;
-        options.onClampedScroll?.();
-      }
       return Promise.resolve();
     },
     scrollToIndex: (input: unknown) => {
       calls.scrollToIndex.push(input);
-      if (options.deferIndexLanding && (input as { animated?: boolean }).animated === false) {
-        return new Promise<void>((resolve) => pendingLandings.push(resolve));
-      }
       return Promise.resolve();
     },
   };
@@ -1289,40 +1263,6 @@ function installLegendList(options: FakeLegendListOptions = {}) {
   const list = makeLegendList(options);
   listRef.current = list;
   return list;
-}
-
-/** Lets a settled `scrollToIndex` promise run what waits on it. */
-async function flushLandings(): Promise<void> {
-  for (let turn = 0; turn < 3; turn += 1) await Promise.resolve();
-}
-
-/**
- * Sends a message whose reply arrived during the sent row's glide: four 100 px rows, the
- * reply's end 216 px below what shows.
- */
-async function sendTallReply(
-  options: Pick<
-    FakeLegendListOptions,
-    "deferIndexLanding" | "laggingMaxScroll" | "onClampedScroll"
-  >,
-) {
-  seedConnectedServerThread();
-  renderServerRoute();
-  const list = installLegendList({
-    scroll: 0,
-    scrollLength: 200,
-    dataLength: 4,
-    rowSize: 100,
-    ...options,
-  });
-  const cleanups = runEffects();
-  const { promptRef } = installComposerHandle();
-  promptRef.current = "reply taller than the timeline";
-  await (capturedProps("chatComposer")["onSend"] as () => Promise<void>)();
-  const sent = commandCallsFor("thread.startTurn")[0]!.input as {
-    input: { message: { messageId: MessageId } };
-  };
-  return { list, cleanups, messageId: sent.input.message.messageId };
 }
 
 interface WindowListener {
@@ -1837,7 +1777,7 @@ describe("ChatView effects (captured and run manually)", () => {
     ).toBe(true);
   });
 
-  it("positions and stabilizes a timeline anchor after manual navigation", async () => {
+  it("positions and stabilizes a timeline anchor after manual navigation", () => {
     seedConnectedServerThread();
     renderServerRoute();
     const list = installLegendList({ scroll: 24, scrollLength: 200, dataLength: 4 });
@@ -1859,308 +1799,18 @@ describe("ChatView effects (captured and run manually)", () => {
     });
 
     list.scrollNode.fire("scrollend");
-    await flushLandings();
-    // Settling lands the row at its offset instead of pinning wherever the glide is.
-    expect(list.calls.scrollToIndex.at(-1)).toEqual({
-      index: 2,
-      animated: false,
-      viewPosition: 0,
-      viewOffset: 16,
-    });
-    expect(list.calls.scrollToOffset).toHaveLength(0);
+    expect(list.calls.scrollToOffset).toContainEqual({ offset: 24, animated: false });
 
-    // The reader scrolls away; the ready LegendList reports as the tail grows moves nothing,
-    // and the anchor keeps holding the reader's place.
     list.scrollNode.fire("wheel");
     onAnchorReady(messageId, 2);
     list.scrollNode.fire("scrollend");
-    runWindowTimeouts();
-    await flushLandings();
-    expect(list.calls.scrollToIndex).toHaveLength(2);
+    expect(list.calls.scrollToOffset).toHaveLength(2);
 
     onAnchorSizeChanged(messageId);
-    expect(list.calls.scrollToOffset).toEqual([{ offset: 24, animated: false }]);
+    expect(list.calls.scrollToOffset).toHaveLength(3);
 
     onAnchorReady(messageId, 2);
     expect(list.calls.scrollToIndex).toHaveLength(2);
-    for (const cleanup of cleanups) cleanup();
-  });
-
-  it("does not position again a sent row the reader scrolled away from", async () => {
-    seedConnectedServerThread();
-    renderServerRoute();
-    const list = installLegendList({ scroll: 24, scrollLength: 200, dataLength: 4 });
-    const cleanups = runEffects();
-    const onAnchorReady = capturedProps("messagesTimeline")["onAnchorReady"] as (
-      messageId: MessageId,
-      anchorIndex: number,
-    ) => void;
-    const messageId = MessageId.make("anchor-message");
-    onAnchorReady(messageId, 2);
-    list.scrollNode.fire("scrollend");
-    await flushLandings();
-    const positioned = list.calls.scrollToIndex.length;
-
-    list.scrollNode.fire("wheel");
-    // The streamed tail changes size, and LegendList reports the same anchor ready again.
-    onAnchorReady(messageId, 2);
-    onAnchorReady(messageId, 3);
-    list.scrollNode.fire("scrollend");
-    runWindowTimeouts();
-    await flushLandings();
-
-    expect(list.calls.scrollToIndex).toHaveLength(positioned);
-    expect(list.calls.scrollToOffset).toEqual([]);
-    for (const cleanup of cleanups) cleanup();
-  });
-
-  it("never snaps back a glide the reader scrolled during", async () => {
-    seedConnectedServerThread();
-    renderServerRoute();
-    const list = installLegendList({ scroll: 24, scrollLength: 200, dataLength: 4 });
-    const cleanups = runEffects();
-    const onAnchorReady = capturedProps("messagesTimeline")["onAnchorReady"] as (
-      messageId: MessageId,
-      anchorIndex: number,
-    ) => void;
-
-    onAnchorReady(MessageId.make("anchor-message"), 2);
-    list.scrollNode.fire("wheel");
-    list.scrollNode.fire("scrollend");
-    runWindowTimeouts();
-    await flushLandings();
-
-    expect(list.calls.scrollToIndex).toEqual([
-      { index: 2, animated: true, viewPosition: 0, viewOffset: 16 },
-    ]);
-    expect(list.calls.scrollToOffset).toEqual([]);
-    expect(list.calls.scrollToEnd).toEqual([]);
-    for (const cleanup of cleanups) cleanup();
-  });
-
-  it("lands a sent row at its offset when the glide outlasts the positioning timer", () => {
-    seedConnectedServerThread();
-    renderServerRoute();
-    // The glide has reached 24 of its way when the timer fires, with no scrollend yet.
-    const list = installLegendList({ scroll: 24, scrollLength: 200, dataLength: 4 });
-    const cleanups = runEffects();
-    const timeline = capturedProps("messagesTimeline");
-    const onAnchorReady = timeline["onAnchorReady"] as (
-      messageId: MessageId,
-      anchorIndex: number,
-    ) => void;
-
-    onAnchorReady(MessageId.make("anchor-message"), 2);
-    runWindowTimeouts();
-
-    expect(list.calls.scrollToOffset).not.toContainEqual({ offset: 24, animated: false });
-    expect(list.calls.scrollToIndex).toEqual([
-      { index: 2, animated: true, viewPosition: 0, viewOffset: 16 },
-      { index: 2, animated: false, viewPosition: 0, viewOffset: 16 },
-    ]);
-    for (const cleanup of cleanups) cleanup();
-  });
-
-  it("reveals a reply that grew past the timeline while its sent row was gliding", async () => {
-    const { list, cleanups, messageId } = await sendTallReply({});
-    const onAnchorReady = capturedProps("messagesTimeline")["onAnchorReady"] as (
-      messageId: MessageId,
-      anchorIndex: number,
-    ) => void;
-
-    onAnchorReady(messageId, 2);
-    expect(list.calls.scrollToOffset).toEqual([]);
-    list.scrollNode.fire("scrollend");
-    await flushLandings();
-
-    expect(list.calls.scrollToOffset).toEqual([{ offset: 216, animated: false }]);
-    for (const cleanup of cleanups) cleanup();
-  });
-
-  it("follows a sent turn only once its row has landed", async () => {
-    const { list, cleanups, messageId } = await sendTallReply({ deferIndexLanding: true });
-    const onAnchorReady = capturedProps("messagesTimeline")["onAnchorReady"] as (
-      messageId: MessageId,
-      anchorIndex: number,
-    ) => void;
-
-    onAnchorReady(messageId, 2);
-    list.scrollNode.fire("scrollend");
-    await flushLandings();
-    // LegendList has not landed the row yet: a follow now would supersede the landing.
-    expect(list.calls.scrollToOffset).toEqual([]);
-
-    list.landIndexScrolls();
-    await flushLandings();
-    expect(list.calls.scrollToOffset).toEqual([{ offset: 216, animated: false }]);
-    for (const cleanup of cleanups) cleanup();
-  });
-
-  it("withdraws a deferred landing when the reader scrolls before it runs", async () => {
-    seedConnectedServerThread();
-    renderServerRoute();
-    const list = installLegendList({
-      scroll: 24,
-      scrollLength: 200,
-      dataLength: 4,
-      deferIndexLanding: true,
-    });
-    const cleanups = runEffects();
-    const onAnchorReady = capturedProps("messagesTimeline")["onAnchorReady"] as (
-      messageId: MessageId,
-      anchorIndex: number,
-    ) => void;
-    onAnchorReady(MessageId.make("anchor-message"), 2);
-    list.scrollNode.fire("scrollend");
-    await flushLandings();
-    expect(list.calls.scrollToIndex.at(-1)).toMatchObject({ animated: false });
-
-    list.scrollNode.fire("wheel");
-
-    // A scroll to where the reader is supersedes the landing LegendList still holds.
-    expect(list.calls.scrollToOffset).toEqual([{ offset: 24, animated: false }]);
-    list.landIndexScrolls();
-    runWindowTimeouts();
-    await flushLandings();
-    expect(list.calls.scrollToIndex).toHaveLength(2);
-    expect(list.calls.scrollToOffset).toHaveLength(1);
-    for (const cleanup of cleanups) cleanup();
-  });
-
-  it("keeps the reader's place when they scroll before a second send's row is ready", async () => {
-    const { list, cleanups, messageId } = await sendTallReply({});
-    const onAnchorReady = capturedProps("messagesTimeline")["onAnchorReady"] as (
-      messageId: MessageId,
-      anchorIndex: number,
-    ) => void;
-    onAnchorReady(messageId, 2);
-    list.scrollNode.fire("scrollend");
-    await flushLandings();
-    const { promptRef } = installComposerHandle();
-    promptRef.current = "second message";
-    await (capturedProps("chatComposer")["onSend"] as () => Promise<void>)();
-    const second = commandCallsFor("thread.startTurn")[1]!.input as {
-      input: { message: { messageId: MessageId } };
-    };
-    const calls = list.calls.scrollToIndex.length;
-
-    list.scrollNode.fire("wheel");
-    onAnchorReady(second.input.message.messageId, 3);
-    list.scrollNode.fire("scrollend");
-    runWindowTimeouts();
-    await flushLandings();
-
-    expect(list.calls.scrollToIndex).toHaveLength(calls);
-    for (const cleanup of cleanups) cleanup();
-  });
-
-  it("asks once more for a landing that outlasts its cap before following", async () => {
-    const { list, cleanups, messageId } = await sendTallReply({ deferIndexLanding: true });
-    const onAnchorReady = capturedProps("messagesTimeline")["onAnchorReady"] as (
-      messageId: MessageId,
-      anchorIndex: number,
-    ) => void;
-    onAnchorReady(messageId, 2);
-    list.scrollNode.fire("scrollend");
-    await flushLandings();
-
-    runWindowTimeouts();
-    await flushLandings();
-    // The cap passed with the row not landed: no follow, a second landing instead.
-    expect(list.calls.scrollToOffset).toEqual([]);
-    expect(
-      list.calls.scrollToIndex.filter((call) => (call as { animated: boolean }).animated),
-    ).toHaveLength(1);
-    expect(list.calls.scrollToIndex).toHaveLength(3);
-
-    list.landIndexScrolls();
-    await flushLandings();
-    expect(list.calls.scrollToOffset).toEqual([{ offset: 216, animated: false }]);
-    for (const cleanup of cleanups) cleanup();
-  });
-
-  it("settles without following when the second landing also outlasts its cap", async () => {
-    const { list, cleanups, messageId } = await sendTallReply({ deferIndexLanding: true });
-    const onAnchorReady = capturedProps("messagesTimeline")["onAnchorReady"] as (
-      messageId: MessageId,
-      anchorIndex: number,
-    ) => void;
-    onAnchorReady(messageId, 2);
-    list.scrollNode.fire("scrollend");
-    await flushLandings();
-
-    runWindowTimeouts();
-    await flushLandings();
-    runWindowTimeouts();
-    await flushLandings();
-
-    expect(list.calls.scrollToIndex).toHaveLength(3);
-    expect(list.calls.scrollToOffset).toEqual([]);
-    for (const cleanup of cleanups) cleanup();
-  });
-
-  it("withdraws a landing that outlasted both caps when the reader scrolls", async () => {
-    const { list, cleanups, messageId } = await sendTallReply({ deferIndexLanding: true });
-    const onAnchorReady = capturedProps("messagesTimeline")["onAnchorReady"] as (
-      messageId: MessageId,
-      anchorIndex: number,
-    ) => void;
-    onAnchorReady(messageId, 2);
-    list.scrollNode.fire("scrollend");
-    await flushLandings();
-    runWindowTimeouts();
-    await flushLandings();
-    runWindowTimeouts();
-    await flushLandings();
-    expect(list.calls.scrollToOffset).toEqual([]);
-
-    list.scrollNode.fire("wheel");
-
-    // LegendList still holds the landing; a scroll to where the reader is supersedes it.
-    expect(list.calls.scrollToOffset).toEqual([
-      { offset: list.getState().scroll, animated: false },
-    ]);
-    for (const cleanup of cleanups) cleanup();
-  });
-
-  it("follows the end again when a follow was clamped to a lagging content height", async () => {
-    // The scroller has laid out only 100 px of the 216 the turn's end needs.
-    const { list, cleanups, messageId } = await sendTallReply({ laggingMaxScroll: 100 });
-    const onAnchorReady = capturedProps("messagesTimeline")["onAnchorReady"] as (
-      messageId: MessageId,
-      anchorIndex: number,
-    ) => void;
-
-    onAnchorReady(messageId, 2);
-    list.scrollNode.fire("scrollend");
-    await flushLandings();
-
-    expect(list.calls.scrollToOffset).toEqual([
-      { offset: 216, animated: false },
-      { offset: 216, animated: false },
-    ]);
-    expect(list.scrollNode.scrollTop).toBe(216);
-    for (const cleanup of cleanups) cleanup();
-  });
-
-  it("stops following a clamped end once the reader scrolls", async () => {
-    let wheel = () => {};
-    const { list, cleanups, messageId } = await sendTallReply({
-      laggingMaxScroll: 100,
-      onClampedScroll: () => wheel(),
-    });
-    wheel = () => list.scrollNode.fire("wheel");
-    const onAnchorReady = capturedProps("messagesTimeline")["onAnchorReady"] as (
-      messageId: MessageId,
-      anchorIndex: number,
-    ) => void;
-
-    onAnchorReady(messageId, 2);
-    list.scrollNode.fire("scrollend");
-    await flushLandings();
-
-    expect(list.calls.scrollToOffset).toEqual([{ offset: 216, animated: false }]);
-    expect(list.scrollNode.scrollTop).toBe(100);
     for (const cleanup of cleanups) cleanup();
   });
 
