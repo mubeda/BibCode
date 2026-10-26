@@ -1934,6 +1934,8 @@ async fn run_git(
 }
 
 fn checkpoint_environment(index: &Path) -> Vec<(OsString, OsString)> {
+    // Git cannot create its lock beside a `\\?\` index path on Windows.
+    let index = crate::production::host_paths::process_compatible_path(index.to_path_buf());
     [
         ("GIT_INDEX_FILE", index.to_string_lossy().as_ref()),
         ("GIT_AUTHOR_NAME", "BiBCode"),
