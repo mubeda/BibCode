@@ -21327,11 +21327,12 @@ done
 
     /// A `--resume` of an imported session that Claude ends with a failure before its first
     /// `system/init` fails its message with a pointer to Continue in a copy, and the pump
-    /// records it; the same early exit on a native thread keeps the usual error.
+    /// records it; the same early exit on a native thread keeps the usual error. The fixture
+    /// fails once the message arrives, so an exit before ownership admission cannot race it.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_refused_resume_of_an_imported_session_points_at_a_copy() {
-        const REFUSING_FIXTURE: &str = "#!/bin/sh\ncase \"$1\" in\n  --version) printf '%s\\n' '2.1.310 (Claude Code)'; exit 0;;\n  --help) printf '%s\\n' '--fork-session --session-id'; exit 0;;\nesac\nprintf '%s\\n' \"$@\" > \"$BIBCODE_TEST_ARGUMENTS\"\nprintf '%s\\n' 'Error: session is in use' >&2\nexit 1\n";
+        const REFUSING_FIXTURE: &str = "#!/bin/sh\ncase \"$1\" in\n  --version) printf '%s\\n' '2.1.310 (Claude Code)'; exit 0;;\n  --help) printf '%s\\n' '--fork-session --session-id'; exit 0;;\nesac\nprintf '%s\\n' \"$@\" > \"$BIBCODE_TEST_ARGUMENTS\"\nread -r _\nprintf '%s\\n' 'Error: session is in use' >&2\nexit 1\n";
         let session = "0f8b5c2e-4d6a-4b1c-9e3f-2a7d8c9b1e40";
         for (thread_id, refused) in [
             (format!("import:claudeAgent:{session}"), true),
