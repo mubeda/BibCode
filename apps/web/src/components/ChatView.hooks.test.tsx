@@ -1238,7 +1238,7 @@ function makeLegendList(options: FakeLegendListOptions = {}) {
     removeEventListener: () => undefined,
     fire(type: string) {
       // As in the DOM, a listener added during the dispatch waits for the next event.
-      for (const listener of [...scrollNodeListeners]) {
+      for (const listener of scrollNodeListeners.slice()) {
         if (listener.type === type) listener.handler();
       }
     },
