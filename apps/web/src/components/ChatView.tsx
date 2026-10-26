@@ -428,6 +428,11 @@ function setProjectFileSurfaceFlag(
   else nextByProject.set(projectKey, next);
   return nextByProject;
 }
+/**
+ * How many times, two frames apart, a follow toward an anchored turn's end looks again when
+ * LegendList clamped it to a content height it had not laid out yet.
+ */
+const TIMELINE_END_FOLLOW_RECHECKS = 6;
 const TYPE_TO_FOCUS_EDITABLE_SELECTOR = [
   "input",
   "textarea",
@@ -3993,11 +3998,24 @@ function ChatViewContent(props: ChatViewProps) {
   // The sent row the reader scrolled away from. LegendList reports it ready again whenever the
   // streamed tail changes size, and positioning it then would take the reader's place away.
   const releasedTimelineAnchorRef = useRef<MessageId | null>(null);
+  // The sent row whose exact landing LegendList may still hold back while rows measure.
+  const landingTimelineAnchorRef = useRef<MessageId | null>(null);
   const cancelTimelineLiveFollowForUserNavigation = useCallback(() => {
+    // A pending row belongs to the newest send; the positioned one may be an earlier turn's.
     releasedTimelineAnchorRef.current =
-      positionedTimelineAnchorRef.current ??
       pendingTimelineAnchorRef.current ??
+      positionedTimelineAnchorRef.current ??
       releasedTimelineAnchorRef.current;
+    if (landingTimelineAnchorRef.current !== null) {
+      landingTimelineAnchorRef.current = null;
+      // Clearing these refs does not withdraw a landing LegendList deferred; a scroll to where
+      // the reader is supersedes it, so it cannot snap them back later.
+      const list = legendListRef.current;
+      const scroll = list?.getState().scroll;
+      if (list && typeof scroll === "number") {
+        void list.scrollToOffset({ offset: scroll, animated: false });
+      }
+    }
     anchorUserScrollGenerationRef.current += 1;
     timelineScrollModeRef.current = "free-scrolling";
     liveFollowUserScrollGenerationRef.current = null;
@@ -4185,33 +4203,52 @@ function ChatViewContent(props: ChatViewProps) {
           // Land the sent row exactly. The timer can fire while a long glide is still under
           // way (a webview glides a long distance for over a second, a slow one longer), and
           // pinning the offset reached so far would stop it short of the row.
+          landTimelineAnchor(0);
+        };
+        // LegendList can defer the landing while rows measure. Following before it lands would
+        // supersede it, so the anchor settles once it has. A landing that outlasts the cap is
+        // asked for once more; if that one does too, the anchor settles without following.
+        const landTimelineAnchor = (attempt: number) => {
+          landingTimelineAnchorRef.current = messageId;
           const landing = list.scrollToIndex({
             index: activeTimelineAnchorIndexRef.current ?? anchorIndex,
             animated: false,
             viewPosition: 0,
             viewOffset: CHAT_LIST_ANCHOR_OFFSET,
           });
-          // LegendList can defer the landing while rows measure. Following before it lands
-          // would supersede it, so the anchor settles once it has; the timer bounds the wait.
-          let landed = false;
-          const settle = () => {
-            if (landed) {
+          let completed = false;
+          const complete = (landed: boolean) => {
+            if (completed) {
               return;
             }
-            landed = true;
+            completed = true;
             window.clearTimeout(landingTimer);
-            if (positionedTimelineAnchorRef.current !== messageId) {
+            if (
+              positionedTimelineAnchorRef.current !== messageId ||
+              landingTimelineAnchorRef.current !== messageId
+            ) {
               return;
             }
+            if (!landed && attempt === 0) {
+              landTimelineAnchor(1);
+              return;
+            }
+            landingTimelineAnchorRef.current = null;
             settledTimelineAnchorRef.current = messageId;
+            if (!landed) {
+              return;
+            }
             // Replies that arrived during the glide were not followed; follow them now rather
             // than on the next one, which a reply that has finished never sends.
             requestAnimationFrame(() => {
               requestAnimationFrame(() => followTimelineLiveEndRef.current());
             });
           };
-          const landingTimer = window.setTimeout(settle, 1_000);
-          void Promise.resolve(landing).then(settle, settle);
+          const landingTimer = window.setTimeout(() => complete(false), 1_000);
+          void Promise.resolve(landing).then(
+            () => complete(true),
+            () => complete(false),
+          );
         };
         const fallbackTimer = window.setTimeout(finishAnimatedPositioning, 750);
         scrollNode.addEventListener("scrollend", finishAnimatedPositioning, { once: true });
@@ -4353,6 +4390,42 @@ function ChatViewContent(props: ChatViewProps) {
 
       const nextOffset = list.getState().scroll + metrics.scrollDeltaToRevealEnd;
       void list.scrollToOffset({ offset: nextOffset, animated: false });
+      // LegendList clamps a scroll to the content height it has laid out, which can lag the
+      // rows it has measured (it holds a new height back while another scroll completes). A
+      // clamped scroll leaves the end hidden until the next delivery, so look again once
+      // layout has caught up, a few times at most, and stop if the reader takes over.
+      const generation = anchorUserScrollGenerationRef.current;
+      const recheck = (remaining: number) => {
+        requestAnimationFrame(() => {
+          requestAnimationFrame(() => {
+            if (
+              anchorUserScrollGenerationRef.current !== generation ||
+              liveFollowUserScrollGenerationRef.current !== generation ||
+              timelineScrollModeRef.current !== "anchoring-new-turn"
+            ) {
+              return;
+            }
+            const current = legendListRef.current;
+            const target = current ? getActiveTimelineTurnMetrics(current) : null;
+            if (!current || !target) {
+              return;
+            }
+            const scrollTop = current.getScrollableNode()?.scrollTop;
+            const reached = typeof scrollTop === "number" ? scrollTop : current.getState().scroll;
+            if (reached >= target.targetScrollToRevealEnd - 1) {
+              return;
+            }
+            void current.scrollToOffset({
+              offset: target.targetScrollToRevealEnd,
+              animated: false,
+            });
+            if (remaining > 1) {
+              recheck(remaining - 1);
+            }
+          });
+        });
+      };
+      recheck(TIMELINE_END_FOLLOW_RECHECKS);
       return;
     }
 
@@ -4406,6 +4479,7 @@ function ChatViewContent(props: ChatViewProps) {
     liveFollowUserScrollGenerationRef.current = anchorUserScrollGenerationRef.current;
     pendingTimelineAnchorRef.current = null;
     positionedTimelineAnchorRef.current = null;
+    landingTimelineAnchorRef.current = null;
     settledTimelineAnchorRef.current = null;
     activeTimelineAnchorIndexRef.current = null;
     showScrollDebouncer.current.cancel();
