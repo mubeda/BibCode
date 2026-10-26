@@ -273,7 +273,7 @@ impl DiffToolLauncher {
     }
 
     /// How many launched tools are running.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn running(&self) -> usize {
         *lock(&self.state.running)
     }

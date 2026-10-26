@@ -11,7 +11,7 @@ use super::{
     model::{
         ActionKind, ActionResult, ActionTarget, Commit, Detail, DetailStage, Job, JobDetail,
         JobGroup, JobKind, JobPermissions, ListInput, ListScope, Permission, PipelineRef, RefKind,
-        Refresh, Row, RowPermissions,
+        Refresh, Row,
     },
     *,
 };
@@ -344,7 +344,7 @@ impl PipelineHost for FakeHost {
 /// A pipeline whose actions the host neither granted nor refused (GitHub write).
 #[cfg(unix)]
 pub(super) fn unknown_permissions(mut detail: Detail) -> Detail {
-    detail.pipeline.permissions = Some(RowPermissions {
+    detail.pipeline.permissions = Some(model::RowPermissions {
         retry: Permission::Unknown,
         cancel: Permission::Unknown,
     });
