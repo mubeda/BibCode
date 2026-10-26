@@ -485,7 +485,11 @@ expiry or abandonment; staged ids never enter persisted composer drafts. This
 operation has no whole-upload deadline and does not change supervisor retry
 policy or liveness evidence. Legacy inline sends, large editor writes and large
 prompts remain subject to the existing whole-request/transport size and silence
-limits; this feature makes only capable chat attachment sends resumable.
+limits; this feature makes only capable chat attachment sends resumable. Over a
+64 KiB/s uplink, a 3 MiB inline request is reaped on the plain transport; on
+the encrypted transport it completes on macOS and Linux, while a Windows server
+ends it as writer-stalled after about 20 s when the peer stops reading during
+the upload (`inline_three_mib_upload_records_the_existing_residual`).
 
 The supervisor publishes these phases:
 

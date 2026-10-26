@@ -1032,6 +1032,8 @@ mod tests {
         );
     }
 
+    // The ` (deleted)` marker is Linux's `/proc` spelling, read only on Unix.
+    #[cfg(unix)]
     #[test]
     fn a_process_inside_a_removed_or_long_removing_worktree_holds_it_open() {
         let facts = AuditFacts {

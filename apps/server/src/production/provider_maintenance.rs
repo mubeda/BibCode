@@ -1107,7 +1107,7 @@ mod tests {
             )
             .await
             .expect("command result");
-        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.exit_code, 0, "{:?}", result.output);
         assert!(
             result
                 .output

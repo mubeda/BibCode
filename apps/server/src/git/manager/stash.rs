@@ -424,6 +424,8 @@ mod tests {
             fixture.path(),
             &["config", "user.email", "git-manager@example.test"],
         );
+        // Git for Windows installs `core.autocrlf=true`, which rewrites a restored file.
+        git(fixture.path(), &["config", "core.autocrlf", "false"]);
         fs::write(fixture.path().join("tracked.txt"), "base\n").expect("base file");
         git(fixture.path(), &["add", "tracked.txt"]);
         git(fixture.path(), &["commit", "-q", "-m", "base"]);
@@ -524,6 +526,8 @@ mod tests {
             fixture.path(),
             &["config", "user.email", "git-manager@example.test"],
         );
+        // Git for Windows installs `core.autocrlf=true`, which rewrites a restored file.
+        git(fixture.path(), &["config", "core.autocrlf", "false"]);
         fs::write(fixture.path().join("tracked.txt"), "base\n").expect("base file");
         git(fixture.path(), &["add", "tracked.txt"]);
         git(fixture.path(), &["commit", "-q", "-m", "base"]);

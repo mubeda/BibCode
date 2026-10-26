@@ -8253,10 +8253,7 @@ mod tests {
             .args(args)
             .current_dir(cwd)
             .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env(
-                "GIT_CONFIG_GLOBAL",
-                if cfg!(windows) { "NUL" } else { "/dev/null" },
-            )
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_AUTHOR_NAME", "Repository State Test")
             .env("GIT_AUTHOR_EMAIL", "repository@example.test")
             .env("GIT_COMMITTER_NAME", "Repository State Test")
@@ -8604,10 +8601,9 @@ mod tests {
             request
                 .env
                 .push(("GIT_TEST_ASSUME_DIFFERENT_OWNER".into(), "1".into()));
-            request.env.push((
-                "GIT_CONFIG_GLOBAL".into(),
-                if cfg!(windows) { "NUL" } else { "/dev/null" }.into(),
-            ));
+            request
+                .env
+                .push(("GIT_CONFIG_GLOBAL".into(), "/dev/null".into()));
             Box::pin(async move { super::ProcessRunner.run(request, cancellation).await })
         }
     }

@@ -32359,11 +32359,13 @@ printf '2.1.0 (Claude Code)\n'
     #[cfg(windows)]
     #[test]
     fn windows_launch_program_wraps_shell_scripts_without_profiles() {
-        let launch = super::prepare_provider_launch(
+        // The wrapping alone: the hermetic guard refuses a bare name on PATH.
+        let launch = crate::process::wrap_launch_program(
+            crate::process::Platform::Windows,
             std::path::Path::new("provider.ps1"),
-            ["--flag", "&literal"],
         )
-        .unwrap();
+        .unwrap()
+        .prepare(["--flag", "&literal"]);
         assert_eq!(launch.program, std::path::PathBuf::from("powershell.exe"));
         assert_eq!(
             launch.args,
@@ -32381,11 +32383,12 @@ printf '2.1.0 (Claude Code)\n'
             .map(std::ffi::OsString::from)
         );
 
-        let launch = super::prepare_provider_launch(
+        let launch = crate::process::wrap_launch_program(
+            crate::process::Platform::Windows,
             std::path::Path::new("provider.cmd"),
-            ["--flag", "&literal"],
         )
-        .unwrap();
+        .unwrap()
+        .prepare(["--flag", "&literal"]);
         assert_eq!(launch.program, std::path::PathBuf::from("provider.cmd"));
         assert_eq!(
             launch.args,
