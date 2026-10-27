@@ -13,11 +13,15 @@ Status: approved with changes and implemented. Plan:
   `AgentsRow`'s `onJumpToWorkspace` becomes optional (the Inbox omits it). The
   Inbox builds rows with the AI Terminal sources and the status clock, as the
   Agents view does, so a disconnected environment's agents read `offline`.
-- **Default tile** is persisted once settled, not held per mount: Needs
-  Attention as soon as any agent needs attention (on partial or complete
-  data); All Agents only on complete data (every environment live with a
-  snapshot and a readable catalog). Loading or partial data shows All Agents
-  without persisting. Partial data shows a note in the list.
+- **Default tile** is persisted once settled, not held per mount, and only
+  from complete data (every environment live with a snapshot and a readable
+  catalog): Needs Attention when any agent needs attention, else All Agents.
+  Partial data shows the same choice without saving it; loading shows All
+  Agents. Partial data shows a note naming its reason: an environment that
+  needs attention (degraded, storage changed, recovery required,
+  configuration error; its action switches to Environments with it
+  selected), a disconnected one, a reconnecting one, or an unreadable
+  saved-server catalog.
 - **Terminal rows** open `terminal:${terminalId}` through
   `openTerminalPanel`, never by guessing a provider command.
 - **Closed host chat**: the new `openHostChat` center-panel action puts
@@ -116,7 +120,8 @@ it is in.
   anything else becomes `"environments"` / `null`, so old blobs load
   unchanged. An older client reading `"inbox"` falls back to Environments
   (same rule it already applies to unknown values).
-- **Default tile (proposed, needs approval).** While `inboxCategory` is
+- **Default tile (superseded: see "Approved changes" above; the default is
+  shown from partial data but saved only from complete data).** While `inboxCategory` is
   `null`, the Inbox picks **Needs Attention** when its count is above 0, else
   **All Agents**. It decides once, after the environment catalog is ready, and
   keeps that pick for as long as the Inbox stays open, so the selection never

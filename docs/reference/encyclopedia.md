@@ -61,9 +61,9 @@ the view; Repositories and Inbox hide the environment rail.
 The left panel's cross-environment agent view. Four tiles with live counts
 (All Agents, Needs Attention = Pending Approval + Awaiting Input, Working,
 Done) filter the agent rows below; unknown-status agents count only under All
-Agents. The default tile is Needs Attention when it has agents, otherwise All
-Agents once every environment has reported; the tile and the view persist per
-device. Selecting a row opens the agent's host thread with its chat, chat
+Agents. Until a tile is picked the Inbox shows Needs Attention when it has
+agents, otherwise All Agents, and saves that default only once every
+environment has reported; the tile and the view persist per device. Selecting a row opens the agent's host thread with its chat, chat
 panel or AI Terminal focused.
 
 ### Workspace Card
