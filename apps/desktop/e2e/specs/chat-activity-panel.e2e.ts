@@ -54,13 +54,18 @@ interface RectSnapshot {
 }
 
 interface ActivityGeometry {
+  readonly chatSurface: RectSnapshot;
   readonly composer: RectSnapshot;
   readonly dock: RectSnapshot;
   readonly workspaceHeader: RectSnapshot;
   readonly inspector: RectSnapshot | null;
-  readonly sheet: RectSnapshot | null;
   readonly viewportHeight: number;
   readonly viewportWidth: number;
+}
+
+interface TimelineScroll {
+  readonly scrollTop: number;
+  readonly distanceFromEnd: number;
 }
 
 interface SurfacePresentation {
@@ -217,15 +222,77 @@ async function readActivityGeometry(): Promise<ActivityGeometry> {
       return { bottom, height, left, right, top, width };
     };
     return {
+      chatSurface: rectangle("[data-chat-surface]:has([data-activity-pane])", true, true)!,
       composer: rectangle('[data-chat-composer-form="true"]', true, true)!,
       dock: rectangle('[data-testid="activity-dock"]', true, true)!,
       workspaceHeader: rectangle("[data-center-panel-group-header]", true, true)!,
       inspector: rectangle("[data-activity-panel]", false),
-      sheet: rectangle('[role="dialog"]:has([data-activity-panel])', false),
       viewportHeight: window.innerHeight,
       viewportWidth: window.innerWidth,
     };
   });
+}
+
+/** The chat timeline's scroll position: LegendList's scroller is the one without overflow anchoring. */
+async function readTimelineScroll(): Promise<TimelineScroll> {
+  return browser.execute((): TimelineScroll => {
+    const scroller = document.querySelector<HTMLElement>(
+      "[data-chat-surface]:has([data-activity-pane]) [class*='overflow-anchor']",
+    );
+    if (!scroller) throw new Error("The chat timeline scroller is missing.");
+    return {
+      scrollTop: Math.round(scroller.scrollTop),
+      distanceFromEnd: Math.round(
+        scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop,
+      ),
+    };
+  });
+}
+
+/** Opening or closing the panel above the composer must not move what the user reads. */
+function expectReadingPositionKept(before: TimelineScroll, after: TimelineScroll): void {
+  if (before.distanceFromEnd <= 2) {
+    expect(after.distanceFromEnd).toBeLessThanOrEqual(2);
+  } else {
+    expect(Math.abs(after.scrollTop - before.scrollTop)).toBeLessThanOrEqual(1);
+  }
+}
+
+async function readPersistedPanelState(): Promise<{
+  readonly rightPanel: string | null;
+  readonly activityPaneThreadKeys: ReadonlyArray<string>;
+}> {
+  return browser.execute(() => {
+    const center = window.localStorage.getItem("bibcode:center-panel-state:v1");
+    const decoded = center
+      ? (JSON.parse(center) as { readonly state?: { readonly activityPanes?: object } })
+      : null;
+    return {
+      rightPanel: window.localStorage.getItem("bibcode:right-panel-state:v2"),
+      activityPaneThreadKeys: Object.keys(decoded?.state?.activityPanes ?? {}),
+    };
+  });
+}
+
+async function expectDockExpanded(expanded: boolean): Promise<void> {
+  const dock = browser.$(
+    `[data-chat-composer-overlay] button[aria-label="${desktopActivityAccessibleNames.dock}"]`,
+  );
+  await browser.waitUntil(
+    async () => (await dock.getAttribute("aria-expanded")) === String(expanded),
+    { timeoutMsg: `The Activity button did not report aria-expanded=${expanded}.` },
+  );
+  if (expanded) {
+    const controls = await dock.getAttribute("aria-controls");
+    expect(controls).toBeTruthy();
+    expect(
+      await browser.execute(
+        (id: string) =>
+          document.getElementById(id)?.querySelector("[data-activity-panel]") !== null,
+        controls!,
+      ),
+    ).toBe(true);
+  }
 }
 
 async function assertBoundedActivityGeometry(
@@ -262,37 +329,26 @@ async function assertBoundedActivityGeometry(
   }
   expect(geometry.dock.top).toBeGreaterThanOrEqual(geometry.workspaceHeader.bottom);
   expect(rectanglesOverlap(geometry.dock, geometry.composer)).toBe(false);
+  expect(geometry.dock.bottom).toBeLessThanOrEqual(geometry.composer.top + 1);
   if (expectInspector) {
-    expect(geometry.inspector).not.toBeNull();
+    // Inline in the chat pane, directly above its own button and the composer,
+    // never in a sheet or the right panel.
+    const inspector = geometry.inspector;
+    expect(inspector).not.toBeNull();
     expect(
-      isFullyContainedInViewport(
-        geometry.inspector!,
-        geometry.viewportWidth,
-        geometry.viewportHeight,
-      ),
+      isFullyContainedInViewport(inspector!, geometry.viewportWidth, geometry.viewportHeight),
     ).toBe(true);
-    expect(rectanglesOverlap(geometry.dock, geometry.inspector!)).toBe(false);
-    if (width <= 980) {
-      expect(geometry.sheet).not.toBeNull();
-      expect(
-        isFullyContainedInViewport(
-          geometry.sheet!,
-          geometry.viewportWidth,
-          geometry.viewportHeight,
-        ),
-      ).toBe(true);
-      expect(geometry.inspector!.left).toBeGreaterThanOrEqual(geometry.sheet!.left);
-      expect(geometry.inspector!.right).toBeLessThanOrEqual(geometry.sheet!.right);
-      expect(geometry.inspector!.top).toBeGreaterThanOrEqual(geometry.sheet!.top);
-      expect(geometry.inspector!.bottom).toBeLessThanOrEqual(geometry.sheet!.bottom);
-      expect(rectanglesOverlap(geometry.dock, geometry.sheet!)).toBe(false);
-    } else {
-      expect(geometry.sheet).toBeNull();
-    }
+    expect(inspector!.left).toBeGreaterThanOrEqual(geometry.chatSurface.left - 1);
+    expect(inspector!.right).toBeLessThanOrEqual(geometry.chatSurface.right + 1);
+    expect(inspector!.top).toBeGreaterThanOrEqual(geometry.workspaceHeader.bottom - 1);
+    expect(inspector!.bottom).toBeLessThanOrEqual(geometry.dock.top + 1);
+    expect(rectanglesOverlap(geometry.dock, inspector!)).toBe(false);
+    expect(rectanglesOverlap(geometry.composer, inspector!)).toBe(false);
+    expect(geometry.composer.height).toBeGreaterThan(0);
   } else {
     expect(geometry.inspector).toBeNull();
-    expect(geometry.sheet).toBeNull();
   }
+  await expectMissing('[role="dialog"] [data-activity-panel]');
 }
 
 async function assertActivityPresentation(width: 960 | 980 | 981 | 1_199 | 1_200): Promise<void> {
@@ -302,7 +358,7 @@ async function assertActivityPresentation(width: 960 | 980 | 981 | 1_199 | 1_200
       const dock = [
         ...document.querySelectorAll<HTMLElement>('[data-testid="activity-dock"]'),
       ].find((candidate) => candidate.closest("[data-provider-terminal-activity-host]") === null);
-      const summary = dock?.querySelector<HTMLButtonElement>('button[aria-label^="Open Activity"]');
+      const summary = dock?.querySelector<HTMLButtonElement>('button[aria-label^="Activity"]');
       if (!dock || !summary) throw new Error("The chat activity summary is missing.");
       return {
         activeCounts: [...summary.querySelectorAll('[data-activity-count="active"]')].map(
@@ -482,11 +538,13 @@ async function tabTo(
   throw new Error(`Tab navigation did not reach the expected control: ${JSON.stringify(visited)}`);
 }
 
+/** The button sits in the composer's region, so Shift+Tab from the composer reaches it. */
 async function tabToDockSummary(): Promise<void> {
-  const startingFocus = await focusDesktopUiElement('button[aria-label="Toggle right panel"]');
-  expect(startingFocus.ariaLabel).toBe("Toggle right panel");
+  const startingFocus = await focusDesktopUiElement('[data-testid="composer-editor"]');
+  expect(startingFocus.testId).toBe("composer-editor");
   const arrived = await tabTo(
     (element) => element.ariaLabel === desktopActivityAccessibleNames.dock,
+    "backward",
   );
   expect(arrived).toEqual(
     expect.objectContaining({
@@ -651,8 +709,8 @@ async function selectActualTheme(
       focusRing: `${focusStyle.outlineColor}|${focusStyle.boxShadow}`,
     };
   });
-  const rightPanelToggle = browser.$('button[aria-label="Toggle right panel"]');
-  await rightPanelToggle.click();
+  // Escape inside the panel collapses it; the next scenario starts collapsed.
+  await sendFocusedKeyboardKey("Escape");
   await expectMissing("[data-activity-panel]");
   return { dock, panel };
 }
@@ -845,6 +903,301 @@ async function assertRuntimeMotionContract(): Promise<void> {
   }
 }
 
+const DOCK_BUTTON = `[data-chat-composer-overlay] button[aria-label="${desktopActivityAccessibleNames.dock}"]`;
+
+/**
+ * Starts with the chat's panel just opened from the keyboard. Covers the
+ * inline placement, the disclosure, Escape, the reading position, the
+ * untouched right panel, the compact window, and keyboard detail navigation.
+ */
+async function assertInlineChatPanel(): Promise<void> {
+  await expect(browser.$("[data-chat-composer-overlay] [data-activity-panel]")).toBeDisplayed();
+  await assertBoundedActivityGeometry(1_200, true);
+  await expectDockExpanded(true);
+
+  // Escape inside the panel collapses it and gives focus back to its button.
+  const rightPanelBefore = (await readPersistedPanelState()).rightPanel;
+  const scrollWhileOpen = await readTimelineScroll();
+  expect(
+    await browser.execute(() => document.activeElement?.closest("[data-activity-panel]") !== null),
+  ).toBe(true);
+  await sendFocusedKeyboardKey("Escape");
+  await expectMissing("[data-activity-panel]");
+  expect(await describeDesktopUiFocus()).toEqual(
+    expect.objectContaining({ ariaLabel: desktopActivityAccessibleNames.dock, tagName: "BUTTON" }),
+  );
+  await expectDockExpanded(false);
+  expectReadingPositionKept(scrollWhileOpen, await readTimelineScroll());
+
+  // The button is a disclosure: Enter opens on Subagents, Enter again closes.
+  const scrollWhileClosed = await readTimelineScroll();
+  await sendFocusedKeyboardKey("Enter");
+  await expect(browser.$('section[aria-label="Subagents"]')).toBeDisplayed();
+  await expectDockExpanded(true);
+  expectReadingPositionKept(scrollWhileClosed, await readTimelineScroll());
+  await focusDesktopUiElement(DOCK_BUTTON);
+  await sendFocusedKeyboardKey("Enter");
+  await expectMissing("[data-activity-panel]");
+  await focusDesktopUiElement(DOCK_BUTTON);
+  await sendFocusedKeyboardKey("Enter");
+  await expect(browser.$("[data-activity-panel]")).toBeDisplayed();
+  expect((await readPersistedPanelState()).rightPanel).toBe(rightPanelBefore);
+
+  // A compact window keeps the panel in the pane, above the composer.
+  await setDesktopUiWindowSize(960, 720);
+  await assertBoundedActivityGeometry(960, true);
+
+  const actor = browser.$(`[data-activity-row$="${desktopActivityFixture.actor.id}"]`);
+  await actor.waitForExist();
+  await browser.waitUntil(async () => {
+    const visibility = await activityRowVisibility(desktopActivityFixture.actor.id);
+    return visibility.hasArea && visibility.intersectsViewport;
+  });
+  await expect(actor).toHaveText(expect.stringContaining(desktopActivityFixture.actor.name));
+  await expect(actor).toHaveText(expect.stringContaining("Running"));
+
+  await focusDesktopUiElement('[data-activity-panel] [role="tab"][aria-selected="true"]');
+  const focusedActor = await tabTo(
+    (element) => element.activityRow?.endsWith(desktopActivityFixture.actor.id) === true,
+  );
+  expect(focusedActor.activityRow).toEqual(
+    expect.stringContaining(desktopActivityFixture.actor.id),
+  );
+  await sendFocusedKeyboardKey("Enter");
+  await expect(browser.$("[data-activity-detail-heading]")).toBeDisplayed();
+  const back = await tabTo((element) => element.ariaLabel === "Back to Subagents", "backward");
+  expect(back.ariaLabel).toBe("Back to Subagents");
+  await sendFocusedKeyboardKey("Enter");
+  await expectMissing("[data-activity-detail-heading]");
+  expect(
+    (await sendFocusedKeyboardKey("ArrowDown")).before.activityRow?.endsWith(
+      desktopActivityFixture.actor.id,
+    ),
+  ).toBe(true);
+
+  await assertReloadRestoresDetailWithoutFocus();
+  await assertRetiredRightPanelActivityHydratesClosed();
+
+  await focusDesktopUiElement('[data-activity-panel] [role="tab"][aria-selected="true"]');
+  await sendFocusedKeyboardKey("Escape");
+  await expectMissing("[data-activity-panel]");
+}
+
+/** A reload restores the open panel and its record, while the composer keeps focus. */
+async function assertReloadRestoresDetailWithoutFocus(): Promise<void> {
+  await browser.$(`[data-activity-row$="${desktopActivityFixture.actor.id}"]`).click();
+  await expect(browser.$("[data-activity-detail-heading]")).toBeDisplayed();
+  await refreshDesktopUiDocument();
+  await installDesktopUiMotionGuard();
+  await browser.$('[data-testid="composer-editor"]').waitForDisplayed();
+  await focusDesktopUiElement('[data-testid="composer-editor"]');
+  await expect(browser.$("[data-chat-composer-overlay] [data-activity-panel]")).toBeDisplayed();
+  await expect(browser.$("[data-activity-detail-heading]")).toBeDisplayed();
+  await expectDockExpanded(true);
+  expect(await describeDesktopUiFocus()).toEqual(
+    expect.objectContaining({ testId: "composer-editor" }),
+  );
+  const back = browser.$('button[aria-label="Back to Subagents"]');
+  await back.click();
+  await expectMissing("[data-activity-detail-heading]");
+}
+
+/**
+ * Right-panel state saved before Activity moved inline (version 10, showing
+ * Activity) hydrates closed and never opens the right panel for Activity.
+ */
+async function assertRetiredRightPanelActivityHydratesClosed(): Promise<void> {
+  const [threadKey] = (await readPersistedPanelState()).activityPaneThreadKeys;
+  expect(threadKey).toBeTruthy();
+  await browser.execute((key: string) => {
+    window.localStorage.setItem(
+      "bibcode:right-panel-state:v2",
+      JSON.stringify({
+        version: 10,
+        state: {
+          byThreadKey: {
+            [key]: {
+              isOpen: true,
+              activeSurfaceId: "activity",
+              surfaces: [
+                {
+                  id: "activity",
+                  kind: "activity",
+                  scope: { _tag: "thread" },
+                  section: "subagents",
+                  selectedRecordKind: null,
+                  selectedRecordId: null,
+                },
+                { id: "diff", kind: "diff" },
+              ],
+            },
+          },
+        },
+      }),
+    );
+  }, threadKey!);
+  await refreshDesktopUiDocument();
+  await installDesktopUiMotionGuard();
+  await browser.$('[data-testid="composer-editor"]').waitForDisplayed();
+  await expect(browser.$("[data-chat-composer-overlay] [data-activity-panel]")).toBeDisplayed();
+  const hydrated = await browser.execute((key: string) => {
+    const persisted = window.localStorage.getItem("bibcode:right-panel-state:v2");
+    const decoded = persisted
+      ? (JSON.parse(persisted) as {
+          readonly version?: number;
+          readonly state?: {
+            readonly byThreadKey?: Record<
+              string,
+              { readonly isOpen?: boolean; readonly surfaces?: ReadonlyArray<{ kind: string }> }
+            >;
+          };
+        })
+      : null;
+    const thread = decoded?.state?.byThreadKey?.[key];
+    return {
+      version: decoded?.version ?? null,
+      isOpen: thread?.isOpen ?? null,
+      kinds: thread?.surfaces?.map((surface) => surface.kind) ?? [],
+      activityPanels: document.querySelectorAll("[data-activity-panel]").length,
+    };
+  }, threadKey!);
+  expect(hydrated).toEqual({ version: 11, isOpen: false, kinds: ["diff"], activityPanels: 1 });
+}
+
+/**
+ * The size the Codex fixture's terminal mode last redrew at. It draws
+ * `fixture-tui <cols>x<rows>` on start and on every SIGWINCH, and records each
+ * size under the project's `.git`, since a WebGL terminal has no text in the DOM.
+ */
+async function readTerminalTuiSize(): Promise<{
+  readonly rows: number;
+  readonly drawn: string | null;
+}> {
+  const log = NodePath.join(preparedProjectPath, ".git", "bibcode-fixture-tui-sizes.log");
+  const drawn = NodeFS.existsSync(log)
+    ? (NodeFS.readFileSync(log, "utf8").trim().split("\n").at(-1) ?? null)
+    : null;
+  return { rows: Number(drawn?.split("x")[1] ?? Number.NaN), drawn: drawn || null };
+}
+
+/** The terminal's own panel takes rows from the PTY, and the TUI redraws at each size. */
+async function assertTerminalPanelResizesTui(terminalId: string): Promise<void> {
+  const host = `[data-provider-terminal-activity-host="${terminalId}"]`;
+  await browser.waitUntil(async () => (await readTerminalTuiSize()).drawn !== null, {
+    timeoutMsg: "The Codex fixture TUI never drew its terminal size.",
+  });
+  const collapsed = await readTerminalTuiSize();
+  await browser.$(`${host} [data-testid="activity-dock"] button`).click();
+  await expect(browser.$(`${host} [data-activity-panel]`)).toBeDisplayed();
+  expect(await browser.$("[data-chat-composer-overlay] [data-activity-panel]").isExisting()).toBe(
+    false,
+  );
+  await browser.waitUntil(async () => (await readTerminalTuiSize()).rows < collapsed.rows, {
+    timeoutMsg: "Opening the terminal's Activity panel did not resize the TUI.",
+  });
+  expect((await readTerminalTuiSize()).rows).toBeGreaterThanOrEqual(5);
+  await browser.$(`${host} [data-testid="activity-dock"] button`).click();
+  await expectMissing(`${host} [data-activity-panel]`);
+  await browser.waitUntil(async () => (await readTerminalTuiSize()).rows === collapsed.rows, {
+    timeoutMsg: "Closing the terminal's Activity panel did not give the TUI its rows back.",
+  });
+}
+
+/**
+ * A narrow side-by-side split of the chat and its Codex terminal: each pane's
+ * open panel stays inside that pane, the composer stays usable, and the
+ * terminal keeps rows. Restored from a reload, so it also proves per-pane state.
+ */
+async function assertNarrowSplitUsability(terminalId: string): Promise<void> {
+  const host = `[data-provider-terminal-activity-host="${terminalId}"]`;
+  await browser.$(`${host} [data-testid="activity-dock"] button`).click();
+  await expect(browser.$(`${host} [data-activity-panel]`)).toBeDisplayed();
+  await browser.execute((id: string) => {
+    const key = "bibcode:center-panel-state:v1";
+    const persisted = JSON.parse(window.localStorage.getItem(key) ?? "{}") as {
+      state: {
+        byThreadKey: Record<
+          string,
+          { surfaces: ReadonlyArray<{ id: string }>; groups: unknown; layout: unknown }
+        >;
+      };
+    };
+    for (const thread of Object.values(persisted.state.byThreadKey)) {
+      if (!thread.surfaces.some((surface) => surface.id === `terminal:${id}`)) continue;
+      Object.assign(thread, {
+        groups: [
+          { id: "center:root", surfaceIds: ["chat:host"], activeSurfaceId: "chat:host" },
+          {
+            id: "center-group:activity-split",
+            surfaceIds: [`terminal:${id}`],
+            activeSurfaceId: `terminal:${id}`,
+          },
+        ],
+        layout: {
+          type: "split",
+          direction: "horizontal",
+          ratio: 0.5,
+          first: { type: "leaf", groupId: "center:root" },
+          second: { type: "leaf", groupId: "center-group:activity-split" },
+        },
+        focusedGroupId: "center:root",
+      });
+    }
+    window.localStorage.setItem(key, JSON.stringify(persisted));
+  }, terminalId);
+  await setDesktopUiWindowSize(960, 720);
+  await refreshDesktopUiDocument();
+  await installDesktopUiMotionGuard();
+  await browser.$('[data-testid="composer-editor"]').waitForDisplayed();
+  await expect(browser.$(`${host} [data-activity-panel]`)).toBeDisplayed();
+  await expect(browser.$("[data-chat-composer-overlay] [data-activity-panel]")).toBeDisplayed();
+  const geometry = await browser.execute((id: string) => {
+    const rect = (element: Element | null) => {
+      if (!element) return null;
+      const { bottom, height, left, right, top, width } = element.getBoundingClientRect();
+      return { bottom, height, left, right, top, width };
+    };
+    const terminalHost = document.querySelector(
+      `[data-provider-terminal-activity-host="${CSS.escape(id)}"]`,
+    );
+    return {
+      chatPane: rect(
+        document
+          .querySelector("[data-chat-composer-overlay]")
+          ?.closest("[data-center-surface-host]") ?? null,
+      ),
+      chatPanel: rect(document.querySelector("[data-chat-composer-overlay] [data-activity-panel]")),
+      composer: rect(document.querySelector('[data-chat-composer-form="true"]')),
+      terminalPane: rect(terminalHost?.closest("[data-center-surface-host]") ?? null),
+      terminalPanel: rect(terminalHost?.querySelector("[data-activity-panel]") ?? null),
+      viewportHeight: window.innerHeight,
+      viewportWidth: window.innerWidth,
+    };
+  }, terminalId);
+  for (const [pane, panel] of [
+    [geometry.chatPane, geometry.chatPanel],
+    [geometry.terminalPane, geometry.terminalPanel],
+  ] as const) {
+    expect(pane).not.toBeNull();
+    expect(panel).not.toBeNull();
+    expect(panel!.left).toBeGreaterThanOrEqual(pane!.left - 1);
+    expect(panel!.right).toBeLessThanOrEqual(pane!.right + 1);
+    expect(panel!.bottom).toBeLessThanOrEqual(pane!.bottom + 1);
+  }
+  expect(geometry.chatPane!.right).toBeLessThanOrEqual(geometry.terminalPane!.left + 1);
+  expect(
+    isFullyContainedInViewport(geometry.composer!, geometry.viewportWidth, geometry.viewportHeight),
+  ).toBe(true);
+  expect(geometry.composer!.height).toBeGreaterThan(0);
+  expect(rectanglesOverlap(geometry.composer!, geometry.chatPanel!)).toBe(false);
+  await browser.waitUntil(async () => (await readTerminalTuiSize()).rows >= 5, {
+    timeoutMsg: "The narrow terminal pane kept fewer than five rows with its panel open.",
+  });
+  await browser.saveScreenshot(
+    NodePath.join(preparedArtifactDirectory, "chat-activity-narrow-split.png"),
+  );
+}
+
 describe("packaged responsive activity experience", () => {
   it("keeps activity responsive, keyboard-operable, and focus-stable in the packaged app", async () => {
     clearDesktopActivityMarker(preparedProjectPath);
@@ -888,86 +1241,12 @@ describe("packaged responsive activity experience", () => {
       keydown: 1,
       keyup: 1,
     });
-    await expect(browser.$("[data-activity-panel]")).toBeDisplayed();
-    await expectMissing('[role="dialog"] [data-activity-panel]');
-    await assertBoundedActivityGeometry(1_200, true);
-
-    const rightPanelToggle = 'button[aria-label="Toggle right panel"]';
-    expect(await focusDesktopUiElement(rightPanelToggle)).toEqual(
-      expect.objectContaining({ ariaLabel: "Toggle right panel", tagName: "BUTTON" }),
-    );
-    await sendFocusedKeyboardKey("Enter");
-    await expectMissing("[data-activity-panel]");
-    await focusDesktopUiElement(rightPanelToggle);
-    await sendFocusedKeyboardKey("Enter");
-    await expect(browser.$("[data-activity-panel]")).toBeDisplayed();
-    await expect(browser.$('section[aria-label="Subagents"]')).toBeDisplayed();
-
-    // A second press with the panel already open keeps it open on the same section.
-    await focusDesktopUiElement(`button[aria-label="${desktopActivityAccessibleNames.dock}"]`);
-    await sendFocusedKeyboardKey("Enter");
-    await expect(browser.$("[data-activity-panel]")).toBeDisplayed();
-    await expect(browser.$('section[aria-label="Subagents"]')).toBeDisplayed();
-    await setDesktopUiWindowSize(960, 720);
-    await expect(browser.$('[role="dialog"] [data-activity-panel]')).toBeDisplayed();
-    expect(
-      await focusDesktopUiElement('[role="dialog"] [data-activity-panel] button:not([disabled])'),
-    ).toEqual(
-      expect.objectContaining({
-        tagName: "BUTTON",
-      }),
-    );
-    expect(
-      await browser.execute(() => document.activeElement?.closest('[role="dialog"]') !== null),
-    ).toBe(true);
-    await assertBoundedActivityGeometry(960, true);
-    await sendFocusedKeyboardKey("Escape");
-    await expectMissing('[role="dialog"] [data-activity-panel]');
-
-    expect(await focusDesktopUiElement(rightPanelToggle)).toEqual(
-      expect.objectContaining({ ariaLabel: "Toggle right panel", tagName: "BUTTON" }),
-    );
-    await sendFocusedKeyboardKey("Enter");
-    await expect(browser.$('[role="dialog"] [data-activity-panel]')).toBeDisplayed();
-
-    const actor = browser.$(`[data-activity-row$="${desktopActivityFixture.actor.id}"]`);
-    await actor.waitForExist();
-    await browser.waitUntil(async () => {
-      const visibility = await activityRowVisibility(desktopActivityFixture.actor.id);
-      return visibility.hasArea && visibility.intersectsViewport;
-    });
-    expect(await activityRowVisibility(desktopActivityFixture.actor.id)).toEqual({
-      hasArea: true,
-      intersectsViewport: true,
-    });
-    await expect(actor).toHaveText(expect.stringContaining(desktopActivityFixture.actor.name));
-    await expect(actor).toHaveText(expect.stringContaining("Running"));
-
-    const focusedActor = await tabTo(
-      (element) => element.activityRow?.endsWith(desktopActivityFixture.actor.id) === true,
-    );
-    expect(focusedActor.activityRow).toEqual(
-      expect.stringContaining(desktopActivityFixture.actor.id),
-    );
-    await sendFocusedKeyboardKey("Enter");
-    await expect(browser.$("[data-activity-detail-heading]")).toBeDisplayed();
-    const back = await tabTo((element) => element.ariaLabel === "Back to Subagents", "backward");
-    expect(back.ariaLabel).toBe("Back to Subagents");
-    await sendFocusedKeyboardKey("Enter");
-    await expectMissing("[data-activity-detail-heading]");
-    expect(
-      (await sendFocusedKeyboardKey("ArrowDown")).before.activityRow?.endsWith(
-        desktopActivityFixture.actor.id,
-      ),
-    ).toBe(true);
-
-    await sendFocusedKeyboardKey("Escape");
-    await expectMissing('[role="dialog"] [data-activity-panel]');
-
+    await assertInlineChatPanel();
     await setDesktopUiWindowSize(1_200, 720);
     const terminalId = await openCodexProviderTerminal();
     if (supportsCodexTerminalActivity) {
       await assertProviderTerminalGeometry(terminalId);
+      await assertTerminalPanelResizesTui(terminalId);
     }
     const terminalInput =
       '[data-terminal-owner="center-panel"] .xterm-helper-textarea, [data-terminal-owner="right-panel"] .xterm-helper-textarea';
@@ -985,7 +1264,7 @@ describe("packaged responsive activity experience", () => {
       expect.objectContaining({ tagName: "TEXTAREA" }),
     );
     const updatedSummary = browser.$(
-      'button[aria-label^="Open Activity: Subagents 1 active, 0 done; Background tasks 0 active, 1 done"]',
+      'button[aria-label^="Activity: Subagents 1 active, 0 done; Background tasks 0 active, 1 done"]',
     );
     await updatedSummary.waitForExist({
       timeoutMsg: "The provider follow-up did not materially update activity counts.",
@@ -1043,7 +1322,7 @@ describe("packaged responsive activity experience", () => {
       async () =>
         browser.execute((announcement: string) => {
           const summary = document.querySelector<HTMLButtonElement>(
-            'button[aria-label^="Open Activity: Subagents 2 active, 0 done"]',
+            'button[aria-label^="Activity: Subagents 2 active, 0 done"]',
           );
           const liveRegion = document.querySelector<HTMLElement>(
             '[data-testid="activity-dock"] [role="status"][aria-live="polite"]',
@@ -1073,6 +1352,10 @@ describe("packaged responsive activity experience", () => {
       };
     });
     expect(composerFocus).toEqual({ focused: true, lost: false });
+
+    if (supportsCodexTerminalActivity) {
+      await assertNarrowSplitUsability(terminalId);
+    }
 
     await browser.saveScreenshot(
       NodePath.join(preparedArtifactDirectory, "chat-activity-responsive.png"),
