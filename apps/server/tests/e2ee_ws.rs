@@ -1572,7 +1572,7 @@ async fn download_diagnostic_logs(
                             let bytes = STANDARD
                                 .decode(value["data"].as_str().expect("data"))
                                 .expect("base64 data");
-                            assert!(bytes.len() <= 512 * 1024, "bounded item");
+                            assert!(bytes.len() <= 64 * 1024, "bounded item");
                             archive.extend(bytes);
                         }
                         other => panic!("unexpected item {other:?}"),

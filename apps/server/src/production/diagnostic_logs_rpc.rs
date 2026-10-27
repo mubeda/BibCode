@@ -28,12 +28,14 @@ use crate::{
 
 pub const DIAGNOSTIC_LOGS_METHOD: &str = "server.downloadDiagnosticLogs";
 const OPERATE_SCOPE: &str = "orchestration:operate";
-/// Archive bytes per `Data` item. One item rides alone in its chunk, so this is what one
-/// round trip carries; a larger one would hold the connection's other traffic back longer.
-pub const DIAGNOSTIC_LOGS_CHUNK_BYTES: usize = 512 * 1024;
+/// Archive bytes per `Data` item (about 87 KiB encoded, so each still rides alone in its
+/// chunk). Small enough that a slow but working link moves an item well within
+/// [`ITEM_ACK_DEADLINE`]: the deadline only ends links slower than about 1 KiB/s.
+pub const DIAGNOSTIC_LOGS_CHUNK_BYTES: usize = 64 * 1024;
 /// How long one item may wait for the client to take the one before it. The session sends the
 /// next item only after the client acknowledges the last, so a wait this long means the client
-/// stopped acknowledging; the request then ends and its archive is released.
+/// stopped acknowledging (or its link carries under about 1 KiB/s); the request then ends and
+/// its archive is released.
 const ITEM_ACK_DEADLINE: Duration = Duration::from_secs(60);
 
 #[derive(Deserialize)]

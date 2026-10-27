@@ -223,10 +223,13 @@ export function ProfilerSection({
               : `${waitingFor.label} is not connected. Showing ${environment.label}.`
           }
           control={
-            connected.length > 1 ? (
+            // A choice to make: several connected environments, or the requested one (which
+            // the Diagnostic logs row targets) is down while another is up. The picker names
+            // the requested one, so the stand-in shown below can be picked for real.
+            connected.length > 1 || waitingFor !== undefined ? (
               <DiagnosticsEnvironmentSelect
                 environments={environments}
-                value={environment}
+                value={waitingFor ?? environment}
                 onSelectEnvironment={onSelectEnvironment}
               />
             ) : (

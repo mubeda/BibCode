@@ -296,7 +296,7 @@ describe("DiagnosticLogsAssembler", () => {
   it("refuses an item longer than the item bound before decoding it", () => {
     const assembler = new DiagnosticLogsAssembler("Omarchy", STORAGE_ID);
     expect(start(assembler, 2 * DIAGNOSTIC_LOGS_CHUNK_BYTES)).toBeNull();
-    // One byte over the bound: 524,289 bytes, whose base64 is no longer than a full item's.
+    // One byte over the bound: 65,537 bytes, whose base64 is no longer than a full item's.
     const oversized = base64(new Uint8Array(DIAGNOSTIC_LOGS_CHUNK_BYTES + 1));
     const originalAtob = globalThis.atob;
     let decoded = 0;

@@ -23,7 +23,7 @@ export interface DiagnosticsEnvironmentSelection {
   readonly primaryEnvironment: EnvironmentPresentation | null;
   /** The environment the page shows: the chosen one when connected, else a stand-in. */
   readonly environment: EnvironmentPresentation | null;
-  /** The chosen environment while it is not connected and a stand-in shows instead. */
+  /** The requested environment (the chosen one, else the primary) while it is not connected and a stand-in shows instead. */
   readonly waitingFor: EnvironmentPresentation | undefined;
 }
 
@@ -62,12 +62,17 @@ export function useDiagnosticsEnvironment(
   useEffect(() => {
     if (selectionGone) onSelectEnvironment(null);
   }, [selectionGone, onSelectEnvironment]);
-  // The requested environment is on its way, so another one shows in the meantime.
+  // The requested environment (the chosen one, else the primary) is not connected, so another
+  // one shows in the meantime.
+  const requested =
+    selectedEnvironmentId === null
+      ? (primaryEnvironment ?? undefined)
+      : environments.find((candidate) => candidate.environmentId === selectedEnvironmentId);
   const waitingFor =
     environment !== null &&
-    selectedEnvironmentId !== null &&
-    selectedEnvironmentId !== environment.environmentId
-      ? environments.find((candidate) => candidate.environmentId === selectedEnvironmentId)
+    requested !== undefined &&
+    requested.environmentId !== environment.environmentId
+      ? requested
       : undefined;
   return { environments, connected, primaryEnvironment, environment, waitingFor };
 }

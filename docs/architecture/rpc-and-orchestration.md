@@ -3725,9 +3725,11 @@ and the client side
   same session, checked in the handler before anything is built; a refusal is
   the usual `EnvironmentAuthorizationError`.
 - **Items:** one `Started` (`fileName`, `byteLength`, `manifest`), then `Data`
-  items of base64 carrying at most 512 KiB each, then completion. Each item
+  items of base64 carrying at most 64 KiB each, then completion. Each item
   rides alone in its chunk, so the client's `Ack` paces the download and other
-  replies go out between items.
+  replies go out between items. An item the client does not take within 60 s
+  (a link under about 1 KiB/s, or a client that stopped acknowledging) ends the
+  request and releases the archive.
 - **Failures:** `DiagnosticLogsError` with `reason` `invalid`, `build-failed`,
   or `too-large` (over 20 MiB, refused before any item).
 - **Client checks:** it sends the request only to a server advertising
