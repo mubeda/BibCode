@@ -3162,11 +3162,14 @@ being read, which stays within 1 px on every painted frame
 same reply twice, one delta every 300 ms, first with the diagram's source in a
 plain code block and then as a sequence diagram, the scenario's only one, whose
 chunk loads after its source shows, so it replaces the source at the end while
-more text streams. After each delivery from the diagram's draw on, the reply's
-end rests no lower below the composer than the plain reply's (or, after a
-delivery the plain reply painted no frame for, is revealed), and both end
-with the last line in view (`mermaid-timeline-streaming-follow.json` holds both
-replies' gaps and end positions). The reading-line
+more text streams. Once the sent row's glide has settled (the list first
+catches up with the end, within 2.5 s of the first delivery), each delivery
+from the diagram's draw on rests no lower below the composer than the plain
+reply's (or, after a delivery the plain reply painted no frame for, is
+revealed); the draw's own delivery may take 200 ms to be followed. Both
+replies end with the last line in view, resting within two lines of each
+other (`mermaid-timeline-streaming-follow.json` holds both replies' gaps and
+end positions). The reading-line
 checks sample painted frames, so the scenario fails early in a webview that
 paints none.
 Its other page scripts wait on timers rather than animation frames, which stop
