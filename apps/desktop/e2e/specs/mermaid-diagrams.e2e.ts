@@ -354,8 +354,8 @@ async function toggleDiagramView(label: string): Promise<void> {
 
 /** `CHAT_LIST_ANCHOR_OFFSET` in packages/shared/src/chatList.ts: where a sent row lands. */
 const SENT_ROW_ANCHOR_OFFSET = 16;
-/** How far apart two separately streamed replies may come to rest: about one line. */
-const STREAMED_REST_SLACK_PX = 24;
+/** How far apart two separately streamed replies may come to rest: about two lines. */
+const STREAMED_REST_SLACK_PX = 48;
 /** The `viewOffset` the timeline minimap scrolls a selected message to. */
 const MINIMAP_VIEW_OFFSET = 24;
 
@@ -703,11 +703,11 @@ describe("packaged Mermaid diagrams", () => {
     await saveEvidence("mermaid-timeline-minimap-landing");
   });
 
-  it("draws an evicted diagram again on remount and settles at the end", async function () {
-    // Each of the two batches of 101 draws may wait 240 s in an occluded webview, the remount
-    // up to 60 s more and the cold draw's step-by-step scroll over a minute, so the slowest
-    // runners need well past the suite's 120 s default.
-    this.timeout(900_000);
+  // Each of the two batches of 101 draws may wait 240 s in an occluded webview, the remount up
+  // to 60 s more and the cold draw's step-by-step scroll over a minute, so the slowest runners
+  // need well past the suite's 120 s default. WebdriverIO races a test against the timeout it
+  // had when it started, so the timeout is set on the test, not inside it.
+  it("draws an evicted diagram again on remount and settles at the end", async () => {
     await setDesktopUiWindowSize(1_400, 900);
     await openFixtureWorkspace();
     await sendPrompt(mermaidFixturePrompts.many);
@@ -961,10 +961,9 @@ describe("packaged Mermaid diagrams", () => {
         .every((entry) => entry.target !== null && Math.abs(entry.target - readingLine) <= 1),
     ).toBe(true);
     await saveEvidence("mermaid-timeline-cold-draw");
-  });
+  }).timeout(900_000);
 
-  it("follows the end while a streamed reply's diagram draws", async function () {
-    this.timeout(240_000);
+  it("follows the end while a streamed reply's diagram draws", async () => {
     await setDesktopUiWindowSize(1_400, 900);
     await openFixtureWorkspace();
     await expectPaintingWebview();
@@ -987,9 +986,10 @@ describe("packaged Mermaid diagrams", () => {
     expect(diagram.slice(0, drew).some((entry) => entry.fenceShown)).toBe(true);
     expect(diagram.slice(drew).some((entry) => !entry.finished)).toBe(true);
     // The list keeps following the end: it ends resting about where the plain reply rests, with
-    // the last streamed line in view. The two replies stream separately, and on a slow runner
-    // their final rests differ by up to a line (2 to 13 px seen) with both followed throughout,
-    // so the rests are compared within a line. The trace artifact records both replies' gaps.
+    // the last streamed line in view. The two replies stream separately, and on slow runners
+    // their final rests differed by 2, 12, 13 and 26 px with both followed throughout (the
+    // plain one alternating between two rests a frame apart), so the rests are compared within
+    // two lines, which still catches a scroll past the end. The trace records both gaps.
     expect(diagram.some((entry) => entry.fenceShown)).toBe(true);
     expect(plain.some((entry) => entry.fenceShown)).toBe(true);
     expect(Math.abs(diagram.at(-1)!.endGap! - plain.at(-1)!.endGap!)).toBeLessThanOrEqual(
@@ -999,20 +999,27 @@ describe("packaged Mermaid diagrams", () => {
     // The diagram's own growth is followed too: after each delivery from the one the diagram
     // drew in, before the next one lands, the reply's end is revealed as far as the plain
     // reply's is. A slow webview can paint no frame between two of the plain reply's
-    // deliveries; there the end must simply be revealed.
+    // deliveries; there the end must simply be revealed. The growth itself is followed two
+    // frames after the draw, so on a slow runner the next delivery can land first; the draw's
+    // delivery then passes when the end shows within the three painted samples after the draw.
     const plainRests = restingEnds(plain);
     const diagramRests = restingEnds(diagram);
     const drewAfter = diagram[drew]!.afterParagraphs;
+    const revealedBelow = (delivered: number) => Math.max(plainRests.get(delivered) ?? 0, 0) + 1;
+    const drawFollowed = diagram
+      .slice(drew, drew + 4)
+      .some(
+        (entry) =>
+          entry.endBelow !== null && entry.endBelow <= revealedBelow(entry.afterParagraphs),
+      );
     const endsHidden = [...diagramRests]
       .filter(([delivered]) => delivered >= drewAfter)
-      .filter(([delivered, below]) => {
-        const plainBelow = plainRests.get(delivered) ?? 0;
-        return below > Math.max(plainBelow, 0) + 1;
-      });
+      .filter(([delivered]) => !(delivered === drewAfter && drawFollowed))
+      .filter(([delivered, below]) => below > revealedBelow(delivered));
     expect(diagramRests.has(drewAfter)).toBe(true);
     expect(endsHidden).toEqual([]);
     await saveEvidence("mermaid-timeline-streaming-follow");
-  });
+  }).timeout(240_000);
 });
 
 /**
