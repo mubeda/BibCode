@@ -1,8 +1,4 @@
-import { useAtomRefresh, useAtomValue } from "@effect/atom-react";
-import {
-  EMPTY_ENVIRONMENT_ACTIVITY_STATE,
-  type EnvironmentActivityState,
-} from "@bibcode/client-runtime/state/activity";
+import { useAtomRefresh } from "@effect/atom-react";
 import {
   isAtomCommandInterrupted,
   squashAtomCommandFailure,
@@ -12,6 +8,7 @@ import {
   type ActivityRecordId,
   type ActivityRecordKind,
   type ActivityScopeRef,
+  type ActivitySnapshot,
   type EnvironmentId,
 } from "@bibcode/contracts";
 import type { TimestampFormat } from "@bibcode/contracts/settings";
@@ -37,7 +34,6 @@ import {
   type ActivityRosterPageData,
 } from "./ActivityPanel";
 import type { ActivityPaneRoute } from "./activityPaneState";
-import { activitySnapshotForState } from "./activityPresentation";
 
 type ActivityPageData = ActivityRosterPageData | ActivityDetailPageData;
 
@@ -191,26 +187,28 @@ function activityCancellationFailureMessage(failure: unknown): string {
  * Reads one Activity scope's roster, detail, and cancellation state and renders
  * the panel for a route. It mounts only while its pane's panel is expanded, so
  * a collapsed pane keeps no roster or detail query alive.
+ *
+ * The snapshot is the one the pane shows, so the panel and its button agree,
+ * and both keep the last snapshot while the live one is briefly gone.
  */
 export const ActivityPanelBinding = memo(function ActivityPanelBinding({
   target,
   route,
   timestampFormat,
   onNavigate,
+  snapshot,
   focusRequested,
   onFocusRequestHandled,
 }: {
   readonly target: ActivityStateTarget;
+  readonly snapshot: ActivitySnapshot;
   readonly route: ActivityPaneRoute;
   readonly timestampFormat: TimestampFormat;
   readonly onNavigate: (route: ActivityPaneRoute) => void;
   readonly focusRequested: boolean;
   readonly onFocusRequestHandled: () => void;
 }) {
-  const stateValueAtom = useMemo(() => environmentActivity.stateValueAtom(target), [target]);
   const stateSourceAtom = useMemo(() => environmentActivity.stateAtom(target), [target]);
-  const activityState =
-    useAtomValue(stateValueAtom) ?? (EMPTY_ENVIRONMENT_ACTIVITY_STATE as EnvironmentActivityState);
   const refreshSnapshot = useAtomRefresh(stateSourceAtom);
   const cancelSubtree = useAtomCommand(environmentActivity.cancelSubtree, {
     reportFailure: false,
@@ -223,61 +221,49 @@ export const ActivityPanelBinding = memo(function ActivityPanelBinding({
     readonly targetKey: string;
     readonly controlRevision: number;
   } | null>(null);
-  const snapshot = useMemo(() => activitySnapshotForState(activityState), [activityState]);
   const section = route.section;
-  const queryBaseKey =
-    snapshot === null ? null : `${target.environmentId}:${snapshot.scopeId}:${section}`;
+  const queryBaseKey = `${target.environmentId}:${snapshot.scopeId}:${section}`;
   const activeRosterAtomForCursor = useCallback(
     (cursor: string | null) =>
-      snapshot === null
-        ? null
-        : (environmentActivity.roster({
-            environmentId: target.environmentId,
-            input: {
-              scope: snapshot.scope,
-              scopeId: snapshot.scopeId,
-              section,
-              bucket: "active",
-              ...(cursor === null ? {} : { cursor }),
-              limit: 200,
-            },
-          }) as Atom.Atom<AsyncResult.AsyncResult<ActivityRosterPageData, unknown>>),
+      environmentActivity.roster({
+        environmentId: target.environmentId,
+        input: {
+          scope: snapshot.scope,
+          scopeId: snapshot.scopeId,
+          section,
+          bucket: "active",
+          ...(cursor === null ? {} : { cursor }),
+          limit: 200,
+        },
+      }) as Atom.Atom<AsyncResult.AsyncResult<ActivityRosterPageData, unknown>>,
     [section, snapshot, target.environmentId],
   );
   const doneRosterAtomForCursor = useCallback(
     (cursor: string | null) =>
-      snapshot === null
-        ? null
-        : (environmentActivity.roster({
-            environmentId: target.environmentId,
-            input: {
-              scope: snapshot.scope,
-              scopeId: snapshot.scopeId,
-              section,
-              bucket: "done",
-              ...(cursor === null ? {} : { cursor }),
-              limit: 200,
-            },
-          }) as Atom.Atom<AsyncResult.AsyncResult<ActivityRosterPageData, unknown>>),
+      environmentActivity.roster({
+        environmentId: target.environmentId,
+        input: {
+          scope: snapshot.scope,
+          scopeId: snapshot.scopeId,
+          section,
+          bucket: "done",
+          ...(cursor === null ? {} : { cursor }),
+          limit: 200,
+        },
+      }) as Atom.Atom<AsyncResult.AsyncResult<ActivityRosterPageData, unknown>>,
     [section, snapshot, target.environmentId],
   );
-  const activeRoster = useBoundedActivityQuery(
-    queryBaseKey === null ? null : `${queryBaseKey}:active`,
-    activeRosterAtomForCursor,
-  );
-  const doneRoster = useBoundedActivityQuery(
-    queryBaseKey === null ? null : `${queryBaseKey}:done`,
-    doneRosterAtomForCursor,
-  );
+  const activeRoster = useBoundedActivityQuery(`${queryBaseKey}:active`, activeRosterAtomForCursor);
+  const doneRoster = useBoundedActivityQuery(`${queryBaseKey}:done`, doneRosterAtomForCursor);
   const selectedRecordKind = route.selectedRecordKind;
   const selectedRecordId = route.selectedRecordId;
   const detailQueryKey =
-    queryBaseKey !== null && selectedRecordKind !== null && selectedRecordId !== null
+    selectedRecordKind !== null && selectedRecordId !== null
       ? `${queryBaseKey}:${selectedRecordKind}:${selectedRecordId}`
       : null;
   const detailAtomForCursor = useCallback(
     (cursor: string | null) =>
-      snapshot === null || selectedRecordKind === null || selectedRecordId === null
+      selectedRecordKind === null || selectedRecordId === null
         ? null
         : (environmentActivity.detail({
             environmentId: target.environmentId,
@@ -306,15 +292,20 @@ export const ActivityPanelBinding = memo(function ActivityPanelBinding({
   }, [revalidateActiveRoster, revalidateDetail, revalidateDoneRoster]);
   // Every change to the queried scope, record, or snapshot revision schedules
   // one coalesced revalidation.
-  const queryRevalidationKey =
-    snapshot === null
-      ? null
-      : JSON.stringify([queryBaseKey, detailQueryKey, snapshot.revision, snapshot.scopeId]);
+  const queryRevalidationKey = JSON.stringify([
+    queryBaseKey,
+    detailQueryKey,
+    snapshot.revision,
+    snapshot.scopeId,
+  ]);
   const refreshTimerRef = useRef<ReturnType<typeof globalThis.setTimeout> | null>(null);
+  const revalidatedKeyRef = useRef<string | null>(null);
   useEffect(() => {
-    if (queryRevalidationKey === null) {
+    // An effect re-run for the key already scheduled (a remount) schedules nothing.
+    if (revalidatedKeyRef.current === queryRevalidationKey) {
       return;
     }
+    revalidatedKeyRef.current = queryRevalidationKey;
     if (refreshTimerRef.current !== null) {
       return;
     }
@@ -365,9 +356,7 @@ export const ActivityPanelBinding = memo(function ActivityPanelBinding({
   );
   const cancellationTarget = useMemo(
     () =>
-      snapshot !== null &&
-      snapshot.scope._tag === "thread" &&
-      snapshot.capabilities.targetedActorCancellation
+      snapshot.scope._tag === "thread" && snapshot.capabilities.targetedActorCancellation
         ? {
             environmentId: target.environmentId,
             scope: snapshot.scope,
@@ -390,7 +379,7 @@ export const ActivityPanelBinding = memo(function ActivityPanelBinding({
     invocation: number;
   }>({ targetKey: null, controlRevision: -1, invocation: 0 });
   const currentCancellationTargetKey = cancellationTarget?.key ?? null;
-  const currentCancellationControlRevision = snapshot?.control.revision ?? -1;
+  const currentCancellationControlRevision = snapshot.control.revision;
   useLayoutEffect(() => {
     const ownership = cancellationOwnershipRef.current;
     ownership.targetKey = currentCancellationTargetKey;
@@ -491,9 +480,6 @@ export const ActivityPanelBinding = memo(function ActivityPanelBinding({
     [cancellationTarget, retrySubtreeCancellation],
   );
 
-  if (snapshot === null) {
-    return null;
-  }
   return (
     <ActivityPanel
       timestampFormat={timestampFormat}
