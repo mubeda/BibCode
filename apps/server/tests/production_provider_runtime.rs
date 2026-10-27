@@ -15025,7 +15025,11 @@ if [ "${{0##*/}}" != claude.sh ]; then
   exit 1
 fi
 case "$1" in
-  --version) cat "$state/version"; exit 0;;
+  --version)
+    if [ -f "$state/slow-version" ]; then sleep 0.3; fi
+    cat "$state/version" || exit 1
+    printf '(node:%s) Warning: a deprecation Node prints on every run\n' "$$" >&2
+    exit 0;;
   --help)
     if [ -f "$PWD/.claude-project" ] && [ "$SHIM_MARKER" = on ]; then cat "$state/help"
     else printf '%s\n' 'Usage: claude [options]'; fi
@@ -15290,6 +15294,61 @@ async fn claude_probe_of_a_shim_notices_a_claude_update_behind_it() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn claude_probe_keeps_a_cached_shim_answer_its_recheck_cannot_confirm() {
+    let probe_context = ClaudeActivityProbeTestContext::new();
+    let temp = TempDir::new().unwrap();
+    let shim = MultiCallShim::new(&temp, "2026.10.19 linux-x64 (2026-10-19)");
+    let project = shim.project(&temp, "project", true);
+    let link = shim.link.to_string_lossy().into_owned();
+    let first = probe_context
+        .probe_in(&link, &shim_environment(), &project)
+        .await;
+    assert!(hook_activity_support(first), "{first:?}");
+
+    // From now on `--version` fails behind the shim.
+    std::fs::remove_file(shim.state.join("version")).unwrap();
+    let unconfirmed = probe_context
+        .probe_in(&link, &shim_environment(), &project)
+        .await;
+
+    assert_eq!(
+        unconfirmed, first,
+        "an unanswered recheck keeps the cached answer"
+    );
+    assert_eq!(shim.calls("claude.sh --version"), 2);
+    assert_eq!(shim.calls("claude.sh --help"), 1);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn concurrent_launches_share_one_shim_recheck() {
+    let probe_context = ClaudeActivityProbeTestContext::new();
+    let temp = TempDir::new().unwrap();
+    let shim = MultiCallShim::new(&temp, "2026.10.19 linux-x64 (2026-10-19)");
+    let project = shim.project(&temp, "project", true);
+    let link = shim.link.to_string_lossy().into_owned();
+    let environment = shim_environment();
+    let first = probe_context.probe_in(&link, &environment, &project).await;
+    assert!(hook_activity_support(first), "{first:?}");
+    // A recheck slow enough that the second launch arrives while the first one runs it.
+    std::fs::write(shim.state.join("slow-version"), "").unwrap();
+
+    let (left, right) = tokio::join!(
+        probe_context.probe_in(&link, &environment, &project),
+        probe_context.probe_in(&link, &environment, &project),
+    );
+
+    assert_eq!(left, first);
+    assert_eq!(right, first);
+    assert_eq!(
+        shim.calls("claude.sh --version"),
+        2,
+        "one recheck for both launches"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn claude_launch_through_a_shim_probes_in_the_launch_environment_and_directory() {
     let probe_context = ClaudeActivityProbeTestContext::new();
     let temp = TempDir::new().unwrap();
@@ -15358,6 +15417,21 @@ async fn claude_launch_through_a_shim_probes_in_the_launch_environment_and_direc
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_restarted_claude_without_hook_support_stops_reporting_live_subagents() {
+    assert_a_hookless_restart_stops_reporting_live_subagents(false).await;
+}
+
+/// The same restart while Chat Activity is off: turning it back on publishes what the new
+/// process reports, not what the one before the restart did.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hookless_restart_while_chat_activity_is_off_shows_no_live_subagents_once_on() {
+    assert_a_hookless_restart_stops_reporting_live_subagents(true).await;
+}
+
+#[cfg(unix)]
+async fn assert_a_hookless_restart_stops_reporting_live_subagents(
+    activity_off_during_restart: bool,
+) {
     let state = TempDir::new().expect("state");
     let shim = MultiCallShim::new(&state, "2026.10.19 linux-x64 (2026-10-19)");
     let workspace = shim.project(&state, "workspace", true);
@@ -15471,6 +15545,9 @@ async fn a_restarted_claude_without_hook_support_stops_reporting_live_subagents(
     assert_eq!(live["capabilities"]["actors"], true, "{live}");
     assert_eq!(live["sections"]["subagents"]["state"], "live", "{live}");
 
+    if activity_off_during_restart {
+        set_chat_activity(&mut socket, "9551", false).await;
+    }
     // mise now hands off to a Claude without the flags; an effort change restarts the chat.
     shim.set_claude("2.1.312 (Claude Code)", "Usage: claude [options]");
     std::fs::remove_file(shim.state.join("arguments")).unwrap();
@@ -15507,25 +15584,48 @@ async fn a_restarted_claude_without_hook_support_stops_reporting_live_subagents(
             .any(|argument| argument == "--include-hook-events"),
         "{relaunched}"
     );
+    if activity_off_during_restart {
+        set_chat_activity(&mut socket, "9552", true).await;
+    }
     // Before #195 the inherited lifecycle kept `actors: true` and a live section here.
     let stale = wait_for_activity_snapshot(&mut socket, &snapshot_request, 9_700, |snapshot| {
         snapshot["capabilities"]["actors"] == false
     })
     .await;
-    assert_eq!(stale["sections"]["subagents"]["state"], "stale", "{stale}");
-    assert_eq!(
-        stale["sections"]["subagents"]["message"],
-        "Provider no longer reports this retained activity",
-        "{stale}"
-    );
-    assert_eq!(
-        stale["actors"][0]["id"], "claude:agent:agent-shim",
-        "{stale}"
-    );
+    assert_ne!(stale["sections"]["subagents"]["state"], "live", "{stale}");
+    if !activity_off_during_restart {
+        assert_eq!(stale["sections"]["subagents"]["state"], "stale", "{stale}");
+        assert_eq!(
+            stale["sections"]["subagents"]["message"],
+            "Provider no longer reports this retained activity",
+            "{stale}"
+        );
+        assert_eq!(
+            stale["actors"][0]["id"], "claude:agent:agent-shim",
+            "{stale}"
+        );
+    }
 
     socket.close(None).await.expect("close WebSocket");
     handle.shutdown();
     handle.join().await.expect("RPC server joins");
+}
+
+/// Turns Chat Activity on or off as the Settings switch does.
+#[cfg(unix)]
+async fn set_chat_activity<S>(socket: &mut WebSocketStream<S>, id: &str, enabled: bool)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let settings = tagged_rpc_request(
+        socket,
+        id,
+        "server.updateSettings",
+        json!({ "patch": { "enableChatAgentActivity": enabled } }),
+    )
+    .await
+    .expect("Chat Activity setting");
+    assert_eq!(settings["enableChatAgentActivity"], enabled, "{settings}");
 }
 
 #[cfg(unix)]

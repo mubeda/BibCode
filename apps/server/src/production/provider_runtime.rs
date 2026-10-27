@@ -8224,15 +8224,20 @@ async fn launch_session(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .awaiting_rediscovery = !activity_enabled_at_launch;
     let activity_capable = provider_supports_agent_activity(&request.provider);
-    if activity_capable && activity_controller.snapshot().enabled {
-        let effective_activity_capabilities = activity_lifecycle
+    // The lifecycle follows this process even while Chat Activity is off, so turning it on
+    // publishes what this process reports, not what an earlier one did.
+    let effective_activity_capabilities = activity_capable.then(|| {
+        activity_lifecycle
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .apply_startup_capabilities(
                 started.activity_capabilities.clone(),
                 driver.startup_activity_capabilities_are_final(),
-            );
-        if let Err(error) = ensure_live_activity_scope(
+            )
+    });
+    if let Some(effective_activity_capabilities) = effective_activity_capabilities
+        && activity_controller.snapshot().enabled
+        && let Err(error) = ensure_live_activity_scope(
             activity,
             &request,
             &activity_lifecycle,
@@ -8240,9 +8245,8 @@ async fn launch_session(
             format!("supervisor:launch-live:{activity_lifecycle_id}"),
         )
         .await
-        {
-            tracing::warn!(%error, "activity scope unavailable; continuing provider session");
-        }
+    {
+        tracing::warn!(%error, "activity scope unavailable; continuing provider session");
     }
     let pending_context_handoff = Arc::new(AtomicBool::new(context_handoff));
     let resume_refusal_recorded = Arc::new(AtomicBool::new(false));
@@ -15763,12 +15767,36 @@ impl ClaudeProbeCacheKey {
     }
 }
 
-/// A link whose name differs from its target's, such as mise's `shims/claude` to
-/// `/usr/bin/mise`. A multi-call binary dispatches on that name and on its own configuration,
-/// so its target's identity does not tell which Claude answers. A link that only renames a
-/// directory (`/var` to `/private/var`) keeps the name and is no shim.
+/// A link to a binary that is not a Claude install, such as mise's `shims/claude` to
+/// `/usr/bin/mise`. A multi-call binary dispatches on the link's name and on its own
+/// configuration, so its target's identity does not tell which Claude answers. A link to a
+/// Claude install (the native installer's `versions/2.1.312`, npm's `cli.js`, a `claude`
+/// binary) is no shim: an update replaces that target, which changes its identity. Neither is
+/// a link that keeps the name and only renames a directory (`/var` to `/private/var`), since a
+/// multi-call binary dispatches on the name.
 fn is_multi_call_shim(resolved: &Path, canonical: &Path) -> bool {
-    resolved.file_name() != canonical.file_name()
+    resolved.file_name() != canonical.file_name() && !is_claude_install(canonical)
+}
+
+/// Whether `path` names a Claude Code install by its file name: `claude…` (`claude`,
+/// `claude.exe`), npm's `cli.js`, or the native installer's bare version (`2.1.312`).
+fn is_claude_install(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(OsStr::to_str) else {
+        return false;
+    };
+    let name = name.to_ascii_lowercase();
+    name.starts_with("claude") || name == "cli.js" || is_release_version(&name)
+}
+
+/// `major.minor.patch`, optionally followed by a `-` or `+` suffix.
+fn is_release_version(token: &str) -> bool {
+    let release = token.split(['-', '+']).next().unwrap_or_default();
+    let mut parts = release.split('.');
+    (0..3).all(|_| {
+        parts
+            .next()
+            .is_some_and(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+    }) && parts.next().is_none()
 }
 
 /// What the probe runs Claude with: the launch's environment and working directory, since a
@@ -15809,11 +15837,15 @@ struct ClaudeInFlightProbe {
     receiver: tokio::sync::watch::Receiver<Option<ClaudeProbeOutcome>>,
 }
 
+type ClaudeShimRecheck = tokio::sync::watch::Receiver<Option<Result<Option<String>, String>>>;
+
 #[derive(Debug, Default)]
 struct ClaudeProbeCacheState {
     ready: HashMap<ClaudeVersionedProbeKey, ClaudeReadyProbe>,
     ready_versions: HashMap<ClaudeProbeCacheKey, String>,
     in_flight: HashMap<ClaudeProbeCacheKey, ClaudeInFlightProbe>,
+    /// Shim `--version` rechecks in progress (see `recheck_claude_shim_version`).
+    rechecks: HashMap<ClaudeProbeCacheKey, ClaudeShimRecheck>,
     next_id: u64,
     tick: u64,
 }
@@ -16025,6 +16057,56 @@ fn ready_claude_probe(
     Some(support)
 }
 
+/// The Claude Code version a shim's `--version` prints now (`None` when the output is not
+/// Claude Code's), or why it gave no answer by `deadline`. Launches of one shim share one
+/// recheck; it runs on its own, so a launch that stops waiting does not cancel it.
+async fn recheck_claude_shim_version(
+    key: &ClaudeProbeCacheKey,
+    context: &ClaudeProbeContext,
+    cache: &ClaudeActivityProbeCache,
+    deadline: Instant,
+    launch_policy: ClaudeProbeLaunchPolicy,
+) -> Result<Option<String>, String> {
+    let mut receiver = {
+        let mut cache_state = cache.lock();
+        if let Some(receiver) = cache_state.rechecks.get(key) {
+            receiver.clone()
+        } else {
+            let (sender, receiver) = tokio::sync::watch::channel(None);
+            cache_state.rechecks.insert(key.clone(), receiver.clone());
+            let cache = cache.clone();
+            let key = key.clone();
+            let context = context.clone();
+            tokio::spawn(async move {
+                let result = run_claude_probe_command(
+                    &key.resolved,
+                    "--version",
+                    Instant::now() + CLAUDE_ACTIVITY_PROBE_TIMEOUT,
+                    launch_policy,
+                    &context,
+                )
+                .await
+                .map(|output| claude_code_version(&output).map(str::to_owned));
+                // Only this task inserts while its entry is present, so the entry is its own.
+                cache.lock().rechecks.remove(&key);
+                sender.send_replace(Some(result));
+            });
+            receiver
+        }
+    };
+    loop {
+        let answer = receiver.borrow().clone();
+        if let Some(answer) = answer {
+            return answer;
+        }
+        match tokio::time::timeout_at(deadline, receiver.changed()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => return Err("--version recheck ended without an answer".to_owned()),
+            Err(_) => return Err("--version timed out".to_owned()),
+        }
+    }
+}
+
 async fn probe_resolved_claude_activity_support(
     key: ClaudeProbeCacheKey,
     context: ClaudeProbeContext,
@@ -16035,30 +16117,38 @@ async fn probe_resolved_claude_activity_support(
 ) -> ClaudeActivitySupport {
     // A shim keeps its identity when the Claude behind it changes, so a cached answer holds
     // only while `--version` still prints the version it was probed at. A new version runs
-    // the whole probe again.
-    let current_version = if key.is_shim() && cache.lock().ready_versions.contains_key(&key) {
-        match run_claude_probe_command(
-            &key.resolved,
-            "--version",
-            deadline,
-            launch_policy,
-            &context,
-        )
-        .await
-        {
-            Ok(version) => Some(version),
-            Err(reason) => {
-                tracing::warn!(
-                    executable = %redact_path(&key.resolved.to_string_lossy()),
-                    reason = %reason,
-                    "launching Claude without activity flags: its shim did not confirm the \
-                     probed version; a later launch checks again"
-                );
-                return ClaudeActivitySupport::default();
-            }
-        }
+    // the whole probe again. A recheck that gives no answer keeps the cached one: it proves
+    // no change, and launching without the flags would downgrade a working Claude.
+    let cached_version = if key.is_shim() {
+        cache.lock().ready_versions.get(&key).cloned()
     } else {
         None
+    };
+    let current_version = match cached_version {
+        None => None,
+        Some(cached_version) => {
+            match recheck_claude_shim_version(&key, &context, &cache, deadline, launch_policy).await
+            {
+                // Output that is not Claude Code's never matches a cached version, so the
+                // whole probe runs and reports the mismatch.
+                Ok(version) => Some(version.unwrap_or_default()),
+                Err(reason) => {
+                    let mut cache_state = cache.lock();
+                    if let Some(support) =
+                        ready_claude_probe(&mut cache_state, &key, cached_version)
+                    {
+                        tracing::warn!(
+                            executable = %redact_path(&key.resolved.to_string_lossy()),
+                            reason = %reason,
+                            "Claude shim did not confirm its probed version; launching with \
+                             the cached activity probe answer"
+                        );
+                        return support;
+                    }
+                    None
+                }
+            }
+        }
     };
     let mut receiver = {
         let mut cache_state = cache.lock();
@@ -16265,23 +16355,26 @@ fn insert_claude_ready_probe(
     }
 }
 
-/// Whether `--version` printed a Claude Code version: `2.1.311 (Claude Code)`, or the bare
-/// `2.1.311` older builds print. Anything else, such as mise's
-/// `2026.10.19 linux-x64 (2026-10-19)`, came from another program. Only the first line counts;
-/// the probe appends stderr after it.
-fn looks_like_claude_code_version(output: &str) -> bool {
-    let line = output.lines().next().unwrap_or_default().trim();
-    let (version, rest) = line
-        .split_once(char::is_whitespace)
-        .map_or((line, ""), |(version, rest)| (version, rest.trim()));
-    let release = version.split(['-', '+']).next().unwrap_or_default();
-    let mut parts = release.split('.');
-    let numeric = (0..3).all(|_| {
-        parts
-            .next()
-            .is_some_and(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
-    }) && parts.next().is_none();
-    numeric && (rest.is_empty() || rest == "(Claude Code)")
+/// How many lines of `--version` output may precede Claude Code's version: a wrapper can print
+/// a banner first, and the probe appends stderr (Node's `(node:PID)` warnings) after stdout.
+const CLAUDE_VERSION_SCAN_LINES: usize = 5;
+
+/// The Claude Code version `--version` printed: the first of its first lines that reads
+/// `2.1.311 (Claude Code)`, or the bare `2.1.311` older builds print. `None` when no line does,
+/// as for mise's `2026.10.19 linux-x64 (2026-10-19)`: another program answered. The parsed
+/// version, not the raw output, identifies a cached answer, so a changing warning does not.
+fn claude_code_version(output: &str) -> Option<&str> {
+    output
+        .lines()
+        .take(CLAUDE_VERSION_SCAN_LINES)
+        .find_map(|line| {
+            let line = line.trim();
+            let (version, rest) = line
+                .split_once(char::is_whitespace)
+                .map_or((line, ""), |(version, rest)| (version, rest.trim()));
+            (is_release_version(version) && (rest.is_empty() || rest == "(Claude Code)"))
+                .then_some(version)
+        })
 }
 
 /// Fails unless both commands answer: a `--help` that fails or runs out of time says nothing about
@@ -16293,13 +16386,13 @@ async fn probe_claude_activity_support_uncached(
     launch_policy: ClaudeProbeLaunchPolicy,
     context: &ClaudeProbeContext,
 ) -> Result<ClaudeProbeResult, ClaudeProbeFailure> {
-    let version =
+    let output =
         run_claude_probe_command(executable, "--version", deadline, launch_policy, context)
             .await
             .map_err(ClaudeProbeFailure::Failed)?;
-    if !looks_like_claude_code_version(&version) {
-        return Err(ClaudeProbeFailure::Mismatch(version));
-    }
+    let Some(version) = claude_code_version(&output).map(str::to_owned) else {
+        return Err(ClaudeProbeFailure::Mismatch(output));
+    };
     let help = run_claude_probe_command(executable, "--help", deadline, launch_policy, context)
         .await
         .map_err(ClaudeProbeFailure::Failed)?;
@@ -21234,24 +21327,72 @@ done
     }
 
     #[test]
-    fn claude_probe_accepts_only_claude_code_version_output() {
+    fn claude_probe_reads_only_a_claude_code_version() {
         for (output, expected) in [
-            ("2.1.311 (Claude Code)", true),
-            ("2.1.311", true),
-            ("2.1.311 (Claude Code)\nwarning on stderr", true),
-            ("2.2.0-beta.1 (Claude Code)", true),
+            ("2.1.311 (Claude Code)", Some("2.1.311")),
+            ("2.1.311", Some("2.1.311")),
+            ("2.2.0-beta.1 (Claude Code)", Some("2.2.0-beta.1")),
+            // Node's warnings on stderr follow stdout and change with the PID, so the version
+            // alone identifies the answer.
+            (
+                "2.1.311 (Claude Code)\n(node:4242) Warning: something deprecated",
+                Some("2.1.311"),
+            ),
+            // A wrapper's banner comes first.
+            (
+                "Using claude from ~/.wrapper\n2.1.311 (Claude Code)",
+                Some("2.1.311"),
+            ),
+            ("1\n2\n3\n4\n5\n2.1.311 (Claude Code)", None),
             // mise answering by its own name, as a canonicalized shim did (#195).
-            ("2026.10.19 linux-x64 (2026-10-19)", false),
-            ("2026.10.19 macos-arm64 (2026-10-19)", false),
-            ("glab version 1.114.0", false),
-            ("v2.1.311", false),
-            ("2.1", false),
-            ("", false),
+            ("2026.10.19 linux-x64 (2026-10-19)", None),
+            ("2026.10.19 macos-arm64 (2026-10-19)", None),
+            ("glab version 1.114.0", None),
+            ("v2.1.311", None),
+            ("2.1", None),
+            ("", None),
+        ] {
+            assert_eq!(super::claude_code_version(output), expected, "{output:?}");
+        }
+    }
+
+    #[test]
+    fn only_a_link_to_another_program_is_a_claude_shim() {
+        use std::path::Path;
+        for (resolved, canonical, expected) in [
+            // mise: the shim dispatches to a Claude its configuration picks.
+            (
+                "/home/u/.local/share/mise/shims/claude",
+                "/usr/bin/mise",
+                true,
+            ),
+            // The native installer: an update links a new version.
+            (
+                "/home/u/.local/bin/claude",
+                "/home/u/.local/share/claude/versions/2.1.312",
+                false,
+            ),
+            // npm: the package's entry point.
+            (
+                "/usr/local/bin/claude",
+                "/usr/local/lib/node_modules/@anthropic-ai/claude-code/cli.js",
+                false,
+            ),
+            // Homebrew's cask, and a Windows install.
+            (
+                "/opt/homebrew/bin/claude",
+                "/opt/homebrew/Caskroom/claude-code/2.1.312/claude",
+                false,
+            ),
+            ("C:/Users/u/bin/claude.cmd", "C:/Tools/Claude.exe", false),
+            // A plain binary, and a link that only renames a directory.
+            ("/usr/local/bin/claude", "/usr/local/bin/claude", false),
+            ("/var/tmp/tool", "/private/var/tmp/tool", false),
         ] {
             assert_eq!(
-                super::looks_like_claude_code_version(output),
+                super::is_multi_call_shim(Path::new(resolved), Path::new(canonical)),
                 expected,
-                "{output:?}"
+                "{resolved} -> {canonical}"
             );
         }
     }
