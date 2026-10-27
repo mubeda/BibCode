@@ -516,7 +516,7 @@ describe("ProfilerSection", () => {
 
     expect(buttonByText(container, "Open folder").disabled).toBe(true);
     expect(container.querySelector("[data-tooltip-popup]")!.textContent).toBe(
-      "The profiler folder is on Work Server. Use Export bundle or bibcode profiler on that machine.",
+      "The profiler folder is on Work Server. Use Export bundle here, or bibcode profiler on that machine.",
     );
     expect(h.openInEditorCalls).toHaveLength(0);
   });
@@ -831,7 +831,7 @@ describe("ProfilerSection", () => {
         (popup) => popup.textContent,
       );
       expect(reasons).toEqual([
-        "The profiler folder is on Luna. Use Export bundle or bibcode profiler on that machine.",
+        "The profiler folder is on Luna. Use Export bundle here, or bibcode profiler on that machine.",
       ]);
       await click(container.querySelector('input[type="checkbox"]') as HTMLInputElement);
       await click(buttonByText(container, "Export bundle"));
