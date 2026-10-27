@@ -1072,14 +1072,15 @@ describe("packaged Mermaid diagrams", () => {
     // checked from the earlier of its catch-up and SENT_ROW_SETTLE_MS after its first delivery;
     // a list that catches up late fails on the deliveries in between.
     //
-    // The plain reply is bounded on its own: from there on, every delivery comes to rest with
-    // the reply's end revealed. Each of those deliveries must have painted a resting frame, so
+    // The plain reply is bounded on its own: from there on, every delivery that painted a
+    // resting frame rests with the reply's end revealed. A slow runner can paint no frame
+    // between two 300 ms deliveries, so such a delivery is recorded rather than failed, but
+    // each reply must settle, finish, and paint at least MIN_SETTLED_RESTS resting frames, so
     // a webview that painted none, or a reply that stayed hidden and caught up only at its end,
-    // fails instead of passing on what it did not show.
+    // still fails instead of passing on what it did not show.
     const plainRests = restingEnds(plain);
     const plainFrom = settledFrom(plain, () => REVEALED_PX);
     const plainSettled = settledRests(plain, plainFrom);
-    expect(missingDeliveries("plain", plain, plainFrom, plainSettled)).toEqual([]);
     expect(hiddenRests("plain", plain, plainFrom, plainSettled, () => REVEALED_PX)).toEqual([]);
     // The diagram's own growth is followed too: after each delivery from the one the diagram
     // drew in, before the next one lands, the reply's end is revealed as far as the plain
@@ -1101,7 +1102,25 @@ describe("packaged Mermaid diagrams", () => {
           entry.endBelow !== null && entry.endBelow <= revealedBelow(entry.afterParagraphs),
       );
     const diagramSettled = settledRests(diagram, checkedFrom);
-    expect(missingDeliveries("diagram", diagram, checkedFrom, diagramSettled)).toEqual([]);
+    const unpainted = [
+      ...missingDeliveries("plain", plain, plainFrom, plainSettled),
+      ...missingDeliveries("diagram", diagram, checkedFrom, diagramSettled),
+    ];
+    NodeFS.writeFileSync(
+      NodePath.join(preparedArtifactDirectory, "mermaid-timeline-streaming-unpainted.json"),
+      JSON.stringify(unpainted, null, 2),
+    );
+    expect({
+      settledAndFinished: unpainted.every((entry) => !Number.isNaN(entry.delivered)),
+      plainRests: plainSettled.size >= MIN_SETTLED_RESTS,
+      diagramRests: diagramSettled.size >= MIN_SETTLED_RESTS,
+      unpainted,
+    }).toEqual({
+      settledAndFinished: true,
+      plainRests: true,
+      diagramRests: true,
+      unpainted,
+    });
     // The draw's grace covers only a delivery that rested within that time, when the next one
     // landed before the follow; a later rest of that delivery is checked like the others.
     const endsHidden = hiddenRests(
@@ -1124,7 +1143,9 @@ describe("packaged Mermaid diagrams", () => {
     expect(diagramRests.has(drewAfter)).toBe(true);
     expect(endsHidden).toEqual([]);
     // Once settled, neither reply's sent row rests below its offset (#191): a turn taller than
-    // the view follows its end, which takes the row above it.
+    // the view follows its end, which takes the row above it. This adds little for these tall
+    // replies, whose following moves the row well above its offset; the proof that a sent row
+    // lands within 1 px is the short reply's check in the reading-line case.
     expect([
       ...sentRowsBelowOffset("plain", plain, plainFrom),
       ...sentRowsBelowOffset("diagram", diagram, checkedFrom),
@@ -1189,22 +1210,133 @@ describe("packaged Mermaid diagrams", () => {
         ),
       { timeoutMsg: "The keyboard prompt's sent row never showed.", interval: 20 },
     );
-    // Wait, briefly, for the glide to be under way, so the key lands mid-glide; the trace
-    // records whether it did.
-    const glideMovingAtKey = await browser.executeAsync(
-      (surface: string, prompt: string, done: (moving: boolean) => void) => {
-        const top = () => {
-          const row = [
-            ...document.querySelectorAll<HTMLElement>(`${surface} [data-message-role="user"]`),
-          ].find((element) => element.textContent?.includes(prompt));
-          return row?.getBoundingClientRect().top ?? null;
-        };
-        const first = top();
+    // In one page script, so nothing waits on a WebDriver round trip: wait for the glide to be
+    // under way; grow a row far above the view, so LegendList holds an adjustment for the
+    // animated scroll; focus Copy code; and press PageUp, whose page step follows at once. On
+    // every painted frame of the six after the key, the content must be where the page step
+    // alone puts it: the glide stopped, and the held adjustment was applied as a scroll, not
+    // dropped as a jump.
+    const pressed = await browser.executeAsync(
+      (
+        surface: string,
+        prompt: string,
+        done: (result: {
+          trail: Array<[number | null, number]>;
+          moving: boolean;
+          keyAfterGlideMs: number;
+          grewAbove: boolean;
+          focused: boolean;
+          shiftAtKey: number | null;
+          defaultPrevented: boolean;
+          before: number;
+          after: number;
+          clientHeight: number;
+        }) => void,
+      ) => {
+        const scroller = document.querySelector<HTMLElement>(
+          `${surface} [class*='overflow-anchor']`,
+        )!;
+        const sentRowTop = () =>
+          [...document.querySelectorAll<HTMLElement>(`${surface} [data-message-role="user"]`)]
+            .find((element) => element.textContent?.includes(prompt))
+            ?.getBoundingClientRect().top ?? null;
+        const frames = (count: number, then: () => void) =>
+          count === 0 ? then() : requestAnimationFrame(() => frames(count - 1, then));
+        const first = sentRowTop();
         const started = performance.now();
+        const press = (moving: boolean, movedAt: number) => {
+          const area = scroller.getBoundingClientRect();
+          const above = [...scroller.querySelectorAll<HTMLElement>(".chat-markdown p")].find(
+            (element) => element.getBoundingClientRect().bottom < area.top - 200,
+          );
+          if (above) {
+            above.dataset.bibcodeKeyboardGrown = "true";
+            above.style.paddingTop = "160px";
+          }
+          frames(2, () => {
+            const button = [
+              ...document.querySelectorAll<HTMLElement>(`${surface} .chat-markdown-codeblock`),
+            ]
+              .filter((block) => block.textContent?.includes("Kept at the top"))
+              .sort((a, b) => b.getBoundingClientRect().top - a.getBoundingClientRect().top)[0]
+              ?.querySelector<HTMLButtonElement>('button[aria-label="Copy code"]');
+            button?.focus({ preventScroll: true });
+            const focused = !!button && document.activeElement === button;
+            // A line on screen, to see whether the content moves at the key.
+            const line = [...scroller.querySelectorAll<HTMLElement>(".chat-markdown p")].find(
+              (element) => {
+                const box = element.getBoundingClientRect();
+                return box.top >= area.top && box.bottom <= area.bottom;
+              },
+            );
+            const lineAtKey = line?.getBoundingClientRect().top ?? null;
+            const scrollAtKey = scroller.scrollTop;
+            const keyAt = performance.now();
+            const event = new KeyboardEvent("keydown", {
+              key: "PageUp",
+              bubbles: true,
+              cancelable: true,
+            });
+            (focused ? button! : scroller).dispatchEvent(event);
+            // The key's default action follows its handlers at once, as a real key press's does.
+            const step = event.defaultPrevented
+              ? 0
+              : Math.min(scrollAtKey, Math.round(scroller.clientHeight * 0.875));
+            if (!event.defaultPrevented) {
+              scroller.scrollBy({ top: -scroller.clientHeight * 0.875 });
+            }
+            // How far the line is from where the page step alone puts it, on each painted frame.
+            // (Read in this task, before the list re-renders its rows, the layout is not yet
+            // what the next frame paints, so only painted frames count.)
+            const trail: Array<[number | null, number]> = [];
+            const sample = () =>
+              trail.push([
+                line && lineAtKey !== null
+                  ? Math.round(line.getBoundingClientRect().top - lineAtKey - step)
+                  : null,
+                Math.round(scroller.scrollTop),
+              ]);
+            const sampleFrames = (count: number, then: () => void) =>
+              count === 0
+                ? then()
+                : requestAnimationFrame(() => {
+                    sample();
+                    sampleFrames(count - 1, then);
+                  });
+            sampleFrames(6, () => {
+              const deviations = trail.map(([deviation]) => deviation);
+              const shiftAtKey = deviations.some((deviation) => deviation === null)
+                ? null
+                : deviations.reduce<number>(
+                    (largest, deviation) =>
+                      Math.abs(deviation!) > Math.abs(largest) ? deviation! : largest,
+                    0,
+                  );
+              done({
+                trail,
+                moving,
+                keyAfterGlideMs: Math.round(keyAt - movedAt),
+                grewAbove: !!above,
+                focused,
+                shiftAtKey,
+                defaultPrevented: event.defaultPrevented,
+                before: scrollAtKey,
+                after: scrollAtKey - step,
+                clientHeight: scroller.clientHeight,
+              });
+            });
+          });
+        };
         const check = () => {
-          const now = top();
-          if (first !== null && now !== null && Math.abs(now - first) > 4) return done(true);
-          if (performance.now() - started > 1_500) return done(false);
+          const now = sentRowTop();
+          if (first !== null && now !== null && Math.abs(now - first) > 4) {
+            press(true, performance.now());
+            return;
+          }
+          if (performance.now() - started > 1_500) {
+            press(false, performance.now());
+            return;
+          }
           requestAnimationFrame(check);
         };
         requestAnimationFrame(check);
@@ -1212,25 +1344,27 @@ describe("packaged Mermaid diagrams", () => {
       visibleSurfaceSelector,
       mermaidFixturePrompts.keyboard,
     );
-    const focused = await browser.execute((surface: string) => {
-      const button = [
-        ...document.querySelectorAll<HTMLElement>(`${surface} .chat-markdown-codeblock`),
-      ]
-        .filter((block) => block.textContent?.includes("Kept at the top"))
-        .sort((a, b) => b.getBoundingClientRect().top - a.getBoundingClientRect().top)[0]
-        ?.querySelector<HTMLButtonElement>('button[aria-label="Copy code"]');
-      button?.focus({ preventScroll: true });
-      return !!button && document.activeElement === button;
-    }, visibleSurfaceSelector);
-    if (!focused) throw new Error("The short reply's Copy code button did not take focus.");
-    const paged = await pressTimelineKey("PageUp");
-    const keyAt = (await readKeyboardSamples()).keyAt;
-    if (keyAt === null) {
-      throw new Error("The PageUp keydown never reached the timeline's scroller.");
-    }
-    if (paged.defaultPrevented || paged.before - paged.after < paged.clientHeight / 2) {
-      throw new Error(`PageUp did not page the timeline up: ${JSON.stringify(paged)}.`);
-    }
+    const keyAt = (await readKeyboardSamples()).keyAt ?? Number.NaN;
+    // Labelled, so a failure names what went wrong: the key did not land mid-glide (within the
+    // 750 ms settle timer of the glide starting), or the content moved at the key.
+    expect({
+      landedMidGlide: pressed.moving && pressed.keyAfterGlideMs <= 750,
+      grewAbove: pressed.grewAbove,
+      focused: pressed.focused,
+      keyReachedTimeline: !Number.isNaN(keyAt),
+      contentHeldAtKey: pressed.shiftAtKey !== null && Math.abs(pressed.shiftAtKey) <= 1,
+      pagedUp:
+        !pressed.defaultPrevented && pressed.before - pressed.after >= pressed.clientHeight / 2,
+      pressed,
+    }).toEqual({
+      landedMidGlide: true,
+      grewAbove: true,
+      focused: true,
+      keyReachedTimeline: true,
+      contentHeldAtKey: true,
+      pagedUp: true,
+      pressed,
+    });
 
     // Once the view has rested, nothing ChatView asked LegendList for moves it again.
     let samples: KeyboardSample[] = [];
@@ -1265,7 +1399,16 @@ describe("packaged Mermaid diagrams", () => {
     expect(deliveredWhileReading).toBeGreaterThanOrEqual(5);
     expect(readingMoved).toEqual([]);
 
-    // End returns to the end, and following resumes: every later delivery rests revealed.
+    // End returns to the end, and following resumes: every later delivery rests revealed. The
+    // row grown above goes back to its size first.
+    await browser.execute(() => {
+      for (const element of document.querySelectorAll<HTMLElement>(
+        "[data-bibcode-keyboard-grown]",
+      )) {
+        element.style.paddingTop = "";
+        element.removeAttribute("data-bibcode-keyboard-grown");
+      }
+    });
     const endAt = (await readKeyboardSamples()).samples.at(-1)!.at;
     const ended = await pressTimelineKey("End");
     if (ended.defaultPrevented)
@@ -1285,7 +1428,7 @@ describe("packaged Mermaid diagrams", () => {
       NodePath.join(preparedArtifactDirectory, "mermaid-timeline-keyboard-takeover.json"),
       JSON.stringify(
         {
-          glideMovingAtKey,
+          pressed,
           keyAt: Math.round(keyAt),
           readingChosen: Math.round(readingChosen),
           endAt: Math.round(endAt),
@@ -1667,6 +1810,12 @@ function sentRowsBelowOffset(
       expectedAtMost: SENT_ROW_ANCHOR_OFFSET + 1,
     }));
 }
+
+/**
+ * How many resting frames each streamed reply must paint after settling: the fixture streams at
+ * least seven deliveries after the latest settling, and a slow runner may paint none for some.
+ */
+const MIN_SETTLED_RESTS = 5;
 
 /** A reply's end counts as revealed this far below the usable bottom: a pixel of rounding. */
 const REVEALED_PX = 1;
