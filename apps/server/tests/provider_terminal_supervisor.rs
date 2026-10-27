@@ -4539,6 +4539,8 @@ struct CodexFixtureHelperLauncher {
     fail: AtomicBool,
     processes: Mutex<Vec<Arc<CodexFixtureProcess>>>,
     timeline: Arc<Mutex<Vec<&'static str>>>,
+    /// How long the helper takes to become ready, as a slow machine's would.
+    start_delay: Mutex<std::time::Duration>,
 }
 
 impl CodexHelperLauncher for CodexFixtureHelperLauncher {
@@ -4558,6 +4560,10 @@ impl CodexHelperLauncher for CodexFixtureHelperLauncher {
                 .push(launch);
             if self.fail.load(Ordering::Acquire) {
                 return Err("injected helper failure".to_owned());
+            }
+            let start_delay = *self.start_delay.lock().expect("helper start delay lock");
+            if !start_delay.is_zero() {
+                tokio::time::sleep(start_delay).await;
             }
             let process = Arc::new(CodexFixtureProcess {
                 terminated: AtomicBool::new(false),
@@ -14963,4 +14969,161 @@ async fn opencode_refused_observer_worker_keeps_the_attach_session_and_its_root(
     );
     manager.shutdown().await;
     isolated.complete();
+}
+
+#[cfg(unix)]
+fn codex_preparation_input(
+    fixture: &Value,
+    configured: &std::path::Path,
+    root: &tempfile::TempDir,
+    terminal_id: &str,
+) -> TerminalLaunchPreparationInput {
+    TerminalLaunchPreparationInput {
+        executable: configured.to_string_lossy().into_owned(),
+        args: serde_json::from_value(fixture["originalArgs"].clone()).expect("original args"),
+        cwd: root.path().to_path_buf(),
+        worktree_path: None,
+        launch_env: BTreeMap::new(),
+        activity: ProviderTerminalActivityLaunch {
+            driver_kind: "codex".to_owned(),
+            provider_instance_id: "codex".to_owned(),
+        },
+        generation: TerminalObserverGeneration::new(
+            "thread-codex".to_owned(),
+            terminal_id.to_owned(),
+        ),
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn codex_preparation_that_runs_out_of_time_names_the_helper_stage() {
+    own_process!(isolated);
+    let fixture = codex_remote_fixture();
+    let root = tempfile::tempdir().expect("fixture root");
+    let configured = root.path().join("configured-codex");
+    std::fs::write(&configured, b"configured").expect("configured executable");
+    let helper = Arc::new(CodexFixtureHelperLauncher::default());
+    *helper.start_delay.lock().expect("helper start delay lock") =
+        std::time::Duration::from_secs(30);
+    let (supervisor, _projection) = codex_fixture_supervisor(
+        &root,
+        &configured,
+        helper.clone(),
+        Arc::new(CodexFixtureRemoteFactory {
+            state: Arc::new(CodexFixtureRemoteState::default()),
+        }),
+    )
+    .await;
+    let capture = TraceCapture::default();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_target(false)
+        .with_ansi(false)
+        .with_writer(capture.clone())
+        .finish();
+    let _subscriber = tracing::subscriber::set_default(subscriber);
+
+    let preparation = supervisor
+        .prepare(codex_preparation_input(
+            &fixture,
+            &configured,
+            &root,
+            "terminal-slow-helper",
+        ))
+        .await;
+
+    assert!(matches!(
+        preparation,
+        TerminalLaunchPreparation::PassThrough
+    ));
+    assert_eq!(helper.launches.lock().expect("helper launches").len(), 1);
+    let diagnostic = capture.text();
+    assert!(diagnostic.contains("preparation_timeout"), "{diagnostic}");
+    assert!(diagnostic.contains("helper_start"), "{diagnostic}");
+    assert!(diagnostic.contains("elapsed_ms="), "{diagnostic}");
+    assert!(diagnostic.contains("budget_ms="), "{diagnostic}");
+    isolated.complete();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn codex_helper_failure_is_logged_as_its_own_reason_with_the_launcher_error() {
+    own_process!(isolated);
+    let fixture = codex_remote_fixture();
+    let root = tempfile::tempdir().expect("fixture root");
+    let configured = root.path().join("configured-codex");
+    std::fs::write(&configured, b"configured").expect("configured executable");
+    let helper = Arc::new(CodexFixtureHelperLauncher::default());
+    helper.fail.store(true, Ordering::Release);
+    let (supervisor, _projection) = codex_fixture_supervisor(
+        &root,
+        &configured,
+        helper,
+        Arc::new(CodexFixtureRemoteFactory {
+            state: Arc::new(CodexFixtureRemoteState::default()),
+        }),
+    )
+    .await;
+    let capture = TraceCapture::default();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_target(false)
+        .with_ansi(false)
+        .with_writer(capture.clone())
+        .finish();
+    let _subscriber = tracing::subscriber::set_default(subscriber);
+
+    let preparation = supervisor
+        .prepare(codex_preparation_input(
+            &fixture,
+            &configured,
+            &root,
+            "terminal-failed-helper",
+        ))
+        .await;
+
+    assert!(matches!(
+        preparation,
+        TerminalLaunchPreparation::PassThrough
+    ));
+    let diagnostic = capture.text();
+    assert!(diagnostic.contains("helper_start_failed"), "{diagnostic}");
+    assert!(
+        diagnostic.contains("injected helper failure"),
+        "{diagnostic}"
+    );
+    assert!(!diagnostic.contains("preparation_timeout"), "{diagnostic}");
+    isolated.complete();
+}
+
+#[tokio::test]
+async fn codex_probe_remembers_an_unparseable_version_and_never_reprobes_that_build() {
+    let root = tempfile::tempdir().expect("fixture root");
+    let configured = root.path().join("configured-codex");
+    std::fs::write(&configured, b"configured").expect("configured executable");
+    let output = |stdout: &str| {
+        Ok(CodexProbeOutput {
+            success: true,
+            stdout: stdout.to_owned(),
+            stderr: String::new(),
+        })
+    };
+    let runner = Arc::new(CodexResultProbeRunner {
+        calls: Mutex::default(),
+        outputs: Mutex::new(VecDeque::from([
+            output("codex-cli development build"),
+            output("Usage: codex --remote unix://PATH"),
+            output("Usage: codex app-server --listen unix://PATH"),
+        ])),
+    });
+    let probe = CachedCodexCapabilityProbe::new(runner.clone());
+
+    assert!(probe.probe(&configured).await.is_none());
+    assert!(probe.probe(&configured).await.is_none());
+    assert_eq!(
+        runner.calls.lock().expect("probe calls lock").len(),
+        3,
+        "a build already known to rule observation out must pass through without spawning"
+    );
 }

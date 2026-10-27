@@ -154,33 +154,61 @@ impl CachedCodexCapabilityProbe {
     }
 
     pub async fn probe(&self, executable: &Path) -> Option<CodexCapabilities> {
+        self.probe_outcome(executable).await.ok()
+    }
+
+    /// Probes once per executable build. Capabilities, and a version the
+    /// probes cannot parse, are cached, so a build already known to rule
+    /// observation out passes through without spawning anything again. A probe
+    /// command that could not run or failed is not cached: it may be transient.
+    async fn probe_outcome(
+        &self,
+        executable: &Path,
+    ) -> Result<CodexCapabilities, CodexProbeFailure> {
         let path = std::fs::canonicalize(executable).unwrap_or_else(|_| executable.to_path_buf());
         let fingerprint = CodexExecutableFingerprint::read(&path);
         let mut cache = self.cache.lock().await;
-        if let Some(capabilities) = fingerprint
+        if let Some(cached) = fingerprint
             .as_ref()
             .and_then(|fingerprint| cache.get(fingerprint))
         {
-            return Some(capabilities);
+            return cached.map_err(|reason| CodexProbeFailure {
+                reason,
+                cached: true,
+            });
         }
-        let capabilities = self.probe_uncached(&path).await;
-        if let (Some(fingerprint), Some(capabilities)) = (fingerprint, &capabilities) {
-            cache.insert(fingerprint, capabilities.clone());
+        let outcome = self.probe_uncached(&path).await;
+        if let Some(fingerprint) = fingerprint {
+            match &outcome {
+                Ok(capabilities) => cache.insert(fingerprint, Ok(capabilities.clone())),
+                Err(CodexProbeFailure {
+                    reason: CODEX_PROBE_VERSION_UNPARSED,
+                    ..
+                }) => cache.insert(fingerprint, Err(CODEX_PROBE_VERSION_UNPARSED)),
+                Err(_) => {}
+            }
         }
-        capabilities
+        outcome
     }
 
-    async fn probe_uncached(&self, executable: &Path) -> Option<CodexCapabilities> {
+    async fn probe_uncached(
+        &self,
+        executable: &Path,
+    ) -> Result<CodexCapabilities, CodexProbeFailure> {
+        let unavailable = |_| CodexProbeFailure {
+            reason: "probe_unavailable",
+            cached: false,
+        };
         let version = self
             .runner
             .run(executable, vec!["--version".to_owned()])
             .await
-            .ok()?;
+            .map_err(unavailable)?;
         let root_help = self
             .runner
             .run(executable, vec!["--help".to_owned()])
             .await
-            .ok()?;
+            .map_err(unavailable)?;
         let app_server_help = self
             .runner
             .run(
@@ -188,15 +216,21 @@ impl CachedCodexCapabilityProbe {
                 vec!["app-server".to_owned(), "--help".to_owned()],
             )
             .await
-            .ok()?;
+            .map_err(unavailable)?;
         if !version.success || !root_help.success || !app_server_help.success {
-            return None;
+            return Err(CodexProbeFailure {
+                reason: "probe_command_failed",
+                cached: false,
+            });
         }
         let version_output = bounded_probe_text(&version.stdout, &version.stderr);
         let root_help = bounded_probe_text(&root_help.stdout, &root_help.stderr);
         let app_server_help = bounded_probe_text(&app_server_help.stdout, &app_server_help.stderr);
-        let version = parse_codex_version(&version_output)?;
-        Some(CodexCapabilities {
+        let version = parse_codex_version(&version_output).ok_or(CodexProbeFailure {
+            reason: CODEX_PROBE_VERSION_UNPARSED,
+            cached: false,
+        })?;
+        Ok(CodexCapabilities {
             version,
             unix_listener: app_server_help.contains("--listen")
                 && app_server_help.contains("unix://"),
@@ -207,21 +241,37 @@ impl CachedCodexCapabilityProbe {
     }
 }
 
+const CODEX_PROBE_VERSION_UNPARSED: &str = "probe_version_unparsed";
+
+/// Why the capability probe gave no capabilities.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CodexProbeFailure {
+    reason: &'static str,
+    /// The answer came from the cache: the probes did not run this time.
+    cached: bool,
+}
+
+type CachedCodexProbeOutcome = Result<CodexCapabilities, &'static str>;
+
 #[derive(Debug, Default)]
 struct CodexCapabilityCache {
-    entries: HashMap<CodexExecutableFingerprint, CodexCapabilities>,
+    entries: HashMap<CodexExecutableFingerprint, CachedCodexProbeOutcome>,
     recency: VecDeque<CodexExecutableFingerprint>,
 }
 
 impl CodexCapabilityCache {
-    fn get(&mut self, fingerprint: &CodexExecutableFingerprint) -> Option<CodexCapabilities> {
+    fn get(&mut self, fingerprint: &CodexExecutableFingerprint) -> Option<CachedCodexProbeOutcome> {
         let capabilities = self.entries.get(fingerprint)?.clone();
         self.recency.retain(|cached| cached != fingerprint);
         self.recency.push_back(fingerprint.clone());
         Some(capabilities)
     }
 
-    fn insert(&mut self, fingerprint: CodexExecutableFingerprint, capabilities: CodexCapabilities) {
+    fn insert(
+        &mut self,
+        fingerprint: CodexExecutableFingerprint,
+        capabilities: CachedCodexProbeOutcome,
+    ) {
         self.entries
             .retain(|cached, _| cached.path != fingerprint.path);
         self.recency
@@ -448,10 +498,33 @@ impl CodexTerminalObserverFactory {
         }
         #[cfg(unix)]
         {
-            tokio::time::timeout(CODEX_PREPARATION_BUDGET, self.prepare_unix(input))
-                .await
-                .ok()
-                .flatten()
+            let started = std::time::Instant::now();
+            let stage = CodexPreparationStage::default();
+            let provider_instance_id = input.launch.activity.provider_instance_id.clone();
+            match tokio::time::timeout(
+                CODEX_PREPARATION_BUDGET,
+                self.prepare_unix(input, stage.clone()),
+            )
+            .await
+            {
+                Ok(Ok(prepared)) => Some(prepared),
+                Ok(Err(skip)) => {
+                    skip.log(&provider_instance_id, started.elapsed());
+                    None
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        provider = "codex",
+                        provider_instance_id = %provider_instance_id,
+                        reason = "preparation_timeout",
+                        stage = stage.get(),
+                        elapsed_ms = elapsed_millis(started.elapsed()),
+                        budget_ms = elapsed_millis(CODEX_PREPARATION_BUDGET),
+                        "Codex terminal observer preparation ran out of time; the terminal starts without Activity"
+                    );
+                    None
+                }
+            }
         }
     }
 
@@ -459,25 +532,34 @@ impl CodexTerminalObserverFactory {
     async fn prepare_unix(
         &self,
         input: ProviderTerminalObserverFactoryInput,
-    ) -> Option<PreparedTerminalLaunch> {
+        stage: CodexPreparationStage,
+    ) -> Result<PreparedTerminalLaunch, CodexPreparationSkip> {
         let generation_started_at = OffsetDateTime::now_utc().unix_timestamp();
         let executable = PathBuf::from(&input.launch.executable);
-        let capabilities = self.probe.probe(&executable).await?;
+        stage.set("probe");
+        let capabilities = self
+            .probe
+            .probe_outcome(&executable)
+            .await
+            .map_err(CodexPreparationSkip::probe)?;
         if !capabilities.unix_listener || !capabilities.remote_tui {
-            return None;
+            return Err(CodexPreparationSkip::new("unsupported_capabilities"));
         }
-        let args = remote_tui_args(&input.launch.args)?;
+        stage.set("arguments");
+        let args = remote_tui_args(&input.launch.args)
+            .ok_or_else(|| CodexPreparationSkip::new("rejected_args"))?;
         let expected_cwd = effective_tui_cwd(&args, &input.launch.cwd);
         let generation_key = input.launch.generation.id().simple().to_string();
+        stage.set("generation_dir");
         let generation_dir = create_owned_generation_directory(
             &input.runtime_dir,
             &format!("c{}", &generation_key[..16]),
         )
-        .ok()?;
+        .map_err(|error| CodexPreparationSkip::with_detail("generation_dir_failed", error))?;
         let socket_path = generation_dir.join("s");
         if socket_path.as_os_str().as_encoded_bytes().len() > UNIX_SOCKET_PATH_SOFT_LIMIT {
             cleanup_owned_generation_directory(&input.runtime_dir, &generation_dir);
-            return None;
+            return Err(CodexPreparationSkip::new("socket_path_too_long"));
         }
         let resources = Arc::new(CodexEndpointResources::new(
             socket_path.clone(),
@@ -485,6 +567,8 @@ impl CodexTerminalObserverFactory {
             input.runtime_dir.clone(),
         ));
         let endpoint = format!("unix://{}", socket_path.to_string_lossy());
+        stage.set("helper_start");
+        let helper_started = std::time::Instant::now();
         let helper = self
             .helper
             .start(CodexHelperLaunch {
@@ -501,7 +585,15 @@ impl CodexTerminalObserverFactory {
                 process_attribution: input.process_attribution.clone(),
             })
             .await
-            .ok()?;
+            .map_err(|error| {
+                CodexPreparationSkip::with_detail(
+                    "helper_start_failed",
+                    format!(
+                        "{error} (helper {} ms)",
+                        elapsed_millis(helper_started.elapsed())
+                    ),
+                )
+            })?;
         resources.install_helper(helper);
         let mut tui_args = args;
         tui_args.push("--remote".to_owned());
@@ -522,12 +614,104 @@ impl CodexTerminalObserverFactory {
                 warned_undecodable_history: Mutex::default(),
             }),
         };
-        Some(PreparedTerminalLaunch {
+        Ok(PreparedTerminalLaunch {
             executable: input.launch.executable,
             args: tui_args,
             private_env: BTreeMap::new(),
             observer: Box::new(observer),
         })
+    }
+}
+
+fn elapsed_millis(elapsed: Duration) -> u64 {
+    u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// The preparation step in progress, so a launch that runs out of time can say
+/// where it was.
+#[derive(Clone, Debug)]
+struct CodexPreparationStage(Arc<Mutex<&'static str>>);
+
+impl Default for CodexPreparationStage {
+    fn default() -> Self {
+        Self(Arc::new(Mutex::new("probe")))
+    }
+}
+
+impl CodexPreparationStage {
+    fn set(&self, stage: &'static str) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = stage;
+    }
+
+    fn get(&self) -> &'static str {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// Why a Codex terminal launch passes through without an observer.
+#[derive(Debug)]
+struct CodexPreparationSkip {
+    reason: &'static str,
+    detail: Option<String>,
+}
+
+impl CodexPreparationSkip {
+    fn new(reason: &'static str) -> Self {
+        Self {
+            reason,
+            detail: None,
+        }
+    }
+
+    fn with_detail(reason: &'static str, detail: impl fmt::Display) -> Self {
+        Self {
+            reason,
+            detail: Some(detail.to_string()),
+        }
+    }
+
+    fn probe(failure: CodexProbeFailure) -> Self {
+        Self {
+            reason: failure.reason,
+            detail: failure
+                .cached
+                .then(|| "cached for this executable build".to_owned()),
+        }
+    }
+
+    /// An executable that rules observation out is expected and logged quietly;
+    /// anything that should have worked is a warning.
+    fn log(&self, provider_instance_id: &str, elapsed: Duration) {
+        let elapsed_ms = elapsed_millis(elapsed);
+        let detail = self.detail.as_deref().unwrap_or("");
+        match self.reason {
+            "unsupported_capabilities" | "rejected_args" | CODEX_PROBE_VERSION_UNPARSED => {
+                tracing::info!(
+                    provider = "codex",
+                    provider_instance_id,
+                    reason = self.reason,
+                    detail,
+                    elapsed_ms,
+                    "Codex terminal starts without Activity: this executable or command cannot be observed"
+                );
+            }
+            _ => {
+                tracing::warn!(
+                    provider = "codex",
+                    provider_instance_id,
+                    reason = self.reason,
+                    detail,
+                    elapsed_ms,
+                    "Codex terminal observer preparation failed; the terminal starts without Activity"
+                );
+            }
+        }
     }
 }
 
@@ -786,6 +970,45 @@ enum CodexObserverWait<T> {
     Completed(T),
 }
 
+/// How long root discovery may keep finding no TUI root before it says so once.
+const CODEX_ROOT_DISCOVERY_PENDING_WARNING_AFTER: Duration = Duration::from_secs(10);
+
+/// An observer that stops before or while attaching leaves its terminal without
+/// Activity, which no other log line shows.
+fn warn_codex_observer_stopped(
+    inner: &CodexObserverInner,
+    reason: &'static str,
+    observer_started: std::time::Instant,
+    detail: &str,
+) {
+    tracing::warn!(
+        provider = "codex",
+        provider_instance_id = %inner.provider_instance_id,
+        reason,
+        detail,
+        elapsed_ms = elapsed_millis(observer_started.elapsed()),
+        "Codex terminal observer stopped before publishing Activity"
+    );
+}
+
+fn warn_codex_root_discovery_pending(
+    inner: &CodexObserverInner,
+    observer_started: std::time::Instant,
+    warned: &mut bool,
+) {
+    if *warned || observer_started.elapsed() < CODEX_ROOT_DISCOVERY_PENDING_WARNING_AFTER {
+        return;
+    }
+    *warned = true;
+    tracing::warn!(
+        provider = "codex",
+        provider_instance_id = %inner.provider_instance_id,
+        reason = "root_discovery_pending",
+        elapsed_ms = elapsed_millis(observer_started.elapsed()),
+        "Codex terminal observer has not found its TUI thread yet; it keeps looking"
+    );
+}
+
 async fn run_codex_observer(
     inner: Arc<CodexObserverInner>,
     generation: TerminalObserverGenerationLease,
@@ -799,10 +1022,16 @@ async fn run_codex_observer_inner(
     generation: &TerminalObserverGenerationLease,
 ) {
     let mut activity = inner.activity.subscribe();
-    let Ok(mut client) = connect_initialized_codex_client(inner).await else {
-        generation.cancelled().await;
-        return;
+    let observer_started = std::time::Instant::now();
+    let mut client = match connect_initialized_codex_client(inner).await {
+        Ok(client) => client,
+        Err(error) => {
+            warn_codex_observer_stopped(inner, "connect_failed", observer_started, &error);
+            generation.cancelled().await;
+            return;
+        }
     };
+    let mut warned_root_discovery_pending = false;
     let mut epoch = 0_u64;
     inner.connection_epoch.store(epoch, Ordering::Release);
     let mut discovery_deadline = tokio::time::Instant::now() + CODEX_ROOT_DISCOVERY_INTERVAL;
@@ -820,6 +1049,11 @@ async fn run_codex_observer_inner(
             {
                 CodexRootDiscoveryOutcome::Found(root) => break root,
                 CodexRootDiscoveryOutcome::Retry => {
+                    warn_codex_root_discovery_pending(
+                        inner,
+                        observer_started,
+                        &mut warned_root_discovery_pending,
+                    );
                     discovery_deadline =
                         tokio::time::Instant::now() + CODEX_ROOT_DISCOVERY_INTERVAL;
                 }
@@ -827,6 +1061,12 @@ async fn run_codex_observer_inner(
                     discovery_state = CodexRootDiscoveryState::WaitingForResponse;
                 }
                 CodexRootDiscoveryOutcome::Stop => {
+                    warn_codex_observer_stopped(
+                        inner,
+                        "root_discovery_stopped",
+                        observer_started,
+                        "thread/list answered in a shape discovery cannot use",
+                    );
                     discovery_state = CodexRootDiscoveryState::Disabled;
                 }
             }
@@ -863,6 +1103,14 @@ async fn run_codex_observer_inner(
                 )
                 .await
                 else {
+                    if generation.cancellation_reason().is_none() {
+                        warn_codex_observer_stopped(
+                            inner,
+                            "root_discovery_reconnect_failed",
+                            observer_started,
+                            "the App Server connection closed before the TUI root was found",
+                        );
+                    }
                     park_codex_observer_unavailable(inner, generation, &mut activity, epoch).await;
                     return;
                 };
@@ -880,6 +1128,11 @@ async fn run_codex_observer_inner(
                 {
                     CodexRootDiscoveryOutcome::Found(root) => break root,
                     CodexRootDiscoveryOutcome::Retry => {
+                        warn_codex_root_discovery_pending(
+                            inner,
+                            observer_started,
+                            &mut warned_root_discovery_pending,
+                        );
                         discovery_deadline =
                             tokio::time::Instant::now() + CODEX_ROOT_DISCOVERY_INTERVAL;
                     }
@@ -887,6 +1140,12 @@ async fn run_codex_observer_inner(
                         discovery_state = CodexRootDiscoveryState::WaitingForResponse;
                     }
                     CodexRootDiscoveryOutcome::Stop => {
+                        warn_codex_observer_stopped(
+                            inner,
+                            "root_discovery_stopped",
+                            observer_started,
+                            "thread/list answered in a shape discovery cannot use",
+                        );
                         discovery_state = CodexRootDiscoveryState::Disabled;
                     }
                 }
@@ -911,6 +1170,12 @@ async fn run_codex_observer_inner(
             Ok(Err(error)) if is_codex_resume_materialization_pending(&error) => {
                 let retry_at = tokio::time::Instant::now() + CODEX_ROOT_DISCOVERY_INTERVAL;
                 if retry_at >= resume_deadline {
+                    warn_codex_observer_stopped(
+                        inner,
+                        "resume_materialization_timeout",
+                        observer_started,
+                        &error,
+                    );
                     generation.cancelled().await;
                     return;
                 }
@@ -925,6 +1190,14 @@ async fn run_codex_observer_inner(
                 let Some(reconnected) =
                     reconnect_initialized_codex_client(inner, generation, resume_deadline).await
                 else {
+                    if generation.cancellation_reason().is_none() {
+                        warn_codex_observer_stopped(
+                            inner,
+                            "resume_reconnect_failed",
+                            observer_started,
+                            &error,
+                        );
+                    }
                     generation.cancelled().await;
                     return;
                 };
@@ -933,32 +1206,70 @@ async fn run_codex_observer_inner(
                 client = reconnected;
                 continue;
             }
-            Ok(Err(_)) | Err(_) => {
+            Ok(Err(error)) => {
+                warn_codex_observer_stopped(inner, "resume_failed", observer_started, &error);
+                generation.cancelled().await;
+                return;
+            }
+            Err(_) => {
+                warn_codex_observer_stopped(
+                    inner,
+                    "resume_timeout",
+                    observer_started,
+                    "thread/resume did not answer before the materialization deadline",
+                );
                 generation.cancelled().await;
                 return;
             }
         };
-        let Ok(resumed) = decode_thread_read_response(response) else {
-            generation.cancelled().await;
-            return;
+        let resumed = match decode_thread_read_response(response) {
+            Ok(resumed) => resumed,
+            Err(_) => {
+                // The decoder's message can quote thread content, so it stays out of the log.
+                warn_codex_observer_stopped(
+                    inner,
+                    "resume_undecodable",
+                    observer_started,
+                    "thread/resume answered in a shape the observer cannot decode",
+                );
+                generation.cancelled().await;
+                return;
+            }
         };
         if resumed.thread.id.as_deref() != Some(&root) {
+            warn_codex_observer_stopped(
+                inner,
+                "resume_root_mismatch",
+                observer_started,
+                "thread/resume answered for another thread",
+            );
             generation.cancelled().await;
             return;
         }
         break resumed;
     };
 
-    if !inner
+    let published = inner
         .publisher
         .publish_correlated(
             "codex",
             Some(&inner.provider_instance_id),
             ActivityCapabilities::structured_full(false),
         )
-        .await
-        .unwrap_or(false)
-    {
+        .await;
+    if !matches!(published, Ok(true)) {
+        if generation.cancellation_reason().is_none() {
+            let detail = match &published {
+                Ok(_) => "the terminal generation no longer accepts publication".to_owned(),
+                Err(error) => format!("{error:?}"),
+            };
+            warn_codex_observer_stopped(
+                inner,
+                "live_publication_rejected",
+                observer_started,
+                &detail,
+            );
+        }
         return;
     }
 
@@ -2103,6 +2414,8 @@ impl SystemCodexHelperLauncher {
 impl CodexHelperLauncher for SystemCodexHelperLauncher {
     fn start(&self, launch: CodexHelperLaunch) -> CodexHelperStartFuture<'_> {
         Box::pin(async move {
+            let progress = CodexHelperStartProgress::new();
+            let result: Result<Arc<dyn CodexHelperProcess>, String> = async {
             #[cfg(feature = "hermetic-test-guard")]
             let launch = {
                 let mut launch = launch;
@@ -2124,6 +2437,7 @@ impl CodexHelperLauncher for SystemCodexHelperLauncher {
                 launch.executable = executable.to_string_lossy().into_owned();
                 launch
             };
+            progress.set("supervisor");
             let supervisor = SYSTEM_CODEX_HELPER_SUPERVISOR
                 .wait_ready()
                 .await
@@ -2132,6 +2446,7 @@ impl CodexHelperLauncher for SystemCodexHelperLauncher {
                 .reserve()
                 .ok_or_else(|| "Codex helper supervisor is at capacity".to_owned())?;
             let owned_task = self.owned_tasks.register();
+            progress.set("spawn");
             let mut command = CommandWrap::with_new(&launch.executable, |command| {
                 command
                     .args(&launch.args)
@@ -2167,6 +2482,7 @@ impl CodexHelperLauncher for SystemCodexHelperLauncher {
                 race.spawned.publish();
                 race.release.wait_after(0).await;
             }
+            progress.set("admission");
             let identity = child
                 .id()
                 .and_then(|pid| NativeProcessSampler::process_identity(pid).ok());
@@ -2241,6 +2557,7 @@ impl CodexHelperLauncher for SystemCodexHelperLauncher {
                         .and_then(|events| events.watchdog_spawn_race.clone()),
                 },
             );
+            progress.set("readiness");
             ready
                 .await
                 .map_err(|_| "Codex helper supervisor stopped before readiness".to_owned())??;
@@ -2249,11 +2566,64 @@ impl CodexHelperLauncher for SystemCodexHelperLauncher {
                 events.ready.publish();
             }
             Ok(Arc::new(process) as Arc<dyn CodexHelperProcess>)
+            }
+            .await;
+            progress.finish();
+            result
         })
     }
 
     fn shutdown(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(self.owned_tasks.drain())
+    }
+}
+
+/// Where a helper start is. A start dropped before it finishes, which is what an
+/// expired preparation budget does, says which step it was on and for how long.
+#[derive(Debug)]
+struct CodexHelperStartProgress {
+    started: std::time::Instant,
+    stage: Mutex<&'static str>,
+    finished: AtomicBool,
+}
+
+impl CodexHelperStartProgress {
+    fn new() -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            stage: Mutex::new("start"),
+            finished: AtomicBool::new(false),
+        }
+    }
+
+    fn set(&self, stage: &'static str) {
+        *self
+            .stage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = stage;
+    }
+
+    fn finish(&self) {
+        self.finished.store(true, Ordering::Release);
+    }
+}
+
+impl Drop for CodexHelperStartProgress {
+    fn drop(&mut self) {
+        if self.finished.load(Ordering::Acquire) {
+            return;
+        }
+        let stage = *self
+            .stage
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        tracing::warn!(
+            provider = "codex",
+            reason = "helper_start_abandoned",
+            stage,
+            elapsed_ms = elapsed_millis(self.started.elapsed()),
+            "Codex App Server helper start was abandoned before it finished"
+        );
     }
 }
 
