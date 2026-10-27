@@ -601,6 +601,15 @@ Cursor's fixture profile must include the generated skills in its native
 compatibility roots, including `.claude/skills` as well as `.cursor/skills`.
 The fixture-files regression checks that union; keep the exact native menu
 inventory assertion so omitted or unexpected skills still fail qualification.
+The spec's second scenario opens a new chat from the command palette (the
+primary workspace's chat is already a server thread, so it never promotes a
+draft). It types into the composer as soon as the new chat's first send clears
+it, while the draft route is still showing. After the thread's route
+retires the draft, that text must be the thread's visible composer text and its
+persisted draft, with no draft session left. Keep that assertion as well: it
+is the packaged check that unsent text survives draft promotion. To run the
+scenario alone, set `BIBCODE_E2E_SPEC=./specs/composer-native-triggers.e2e.ts`
+in the same way.
 
 The packaged scenario must show two Queued cards in FIFO order below the working
 row while the provider log still contains only the initial start. Steer the head

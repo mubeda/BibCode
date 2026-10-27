@@ -277,6 +277,8 @@ import { buildDraftThreadRouteParams, buildThreadRouteParams } from "../threadRo
 import {
   type ComposerAttachment,
   type DraftThreadEnvMode,
+  composerTargetsShareDraft,
+  resolveComposerRestoreTarget,
   useComposerDraftStore,
   type DraftId,
 } from "../composerDraftStore";
@@ -5556,6 +5558,13 @@ function ChatViewContent(props: ChatViewProps) {
     if (head) await onSteerQueuedMessage(head.id);
   }, [onSteerQueuedMessage, queuedMessages]);
 
+  // The draft the composer shows now. A send that began on a new chat's draft keeps that
+  // draft's id while the composer may have switched to the thread's own draft.
+  const liveComposerDraftTargetRef = useRef(composerDraftTarget);
+  useLayoutEffect(() => {
+    liveComposerDraftTargetRef.current = composerDraftTarget;
+  }, [composerDraftTarget]);
+
   const onSend = async (e?: { preventDefault: () => void }) => {
     e?.preventDefault();
     const enqueue = shouldEnqueueOnSend({
@@ -5579,6 +5588,7 @@ function ChatViewContent(props: ChatViewProps) {
     if (sendLease === null) return;
     try {
       let attachmentAuthority: AttachmentAdmissionAuthority | undefined;
+      let attachmentAuthorityChecked = false;
       const authorizeAttempt = async () => {
         const result = await readAttachmentAdmissionAuthority({ environmentId, input: undefined });
         if (result._tag === "Failure") {
@@ -5589,7 +5599,10 @@ function ChatViewContent(props: ChatViewProps) {
           return false;
         }
         if (result.value === null) {
-          if (stagedAttachmentAttempts.get(routeThreadRef) === undefined) return true;
+          if (stagedAttachmentAttempts.get(routeThreadRef) === undefined) {
+            attachmentAuthorityChecked = true;
+            return true;
+          }
           setThreadError(
             activeThread.id,
             "The original server cannot identify its data store. Update it before confirming this send; your draft was kept.",
@@ -5604,6 +5617,7 @@ function ChatViewContent(props: ChatViewProps) {
           return false;
         }
         attachmentAuthority = result.value;
+        attachmentAuthorityChecked = true;
         return true;
       };
       if (stagedAttachmentAttempts.get(routeThreadRef) !== undefined && !(await authorizeAttempt()))
@@ -5684,6 +5698,13 @@ function ChatViewContent(props: ChatViewProps) {
         onAdvanceActivePendingUserInput();
         return;
       }
+      // Authorize attachments before the snapshot: the send clears the composer right after
+      // it, so anything typed or attached during this round trip must be part of the snapshot.
+      const attachmentsAtAuthorityCheck = composerAttachmentsRef.current;
+      if (attachmentsAtAuthorityCheck.length > 0 && !attachmentAuthorityChecked) {
+        if (!(await authorizeAttempt())) return;
+        if (currentQueueThreadKeyRef.current !== routeThreadKey) return;
+      }
       const sendCtx = composerRef.current?.getSendContext();
       if (!sendCtx) return;
       const {
@@ -5698,7 +5719,8 @@ function ChatViewContent(props: ChatViewProps) {
         selectedPromptEffort: ctxSelectedPromptEffort,
         selectedModelSelection: ctxSelectedModelSelection,
       } = sendCtx;
-      const promptForSend = canonicalizeLegacyComposerFileReferences(promptRef.current);
+      const promptAtSnapshot = promptRef.current;
+      const promptForSend = canonicalizeLegacyComposerFileReferences(promptAtSnapshot);
       const {
         trimmedPrompt: trimmed,
         sendableTerminalContexts: sendableComposerTerminalContexts,
@@ -5752,12 +5774,17 @@ function ChatViewContent(props: ChatViewProps) {
         return;
       }
       if (!activeProject) return;
-      if (
-        composerAttachments.length > 0 &&
-        attachmentAuthority === undefined &&
-        !(await authorizeAttempt())
-      )
-        return;
+      if (composerAttachments.length > 0 && !attachmentAuthorityChecked) {
+        // The check above did not see these attachments. The clear below would delete
+        // anything entered during this wait, so the send goes ahead only if nothing was;
+        // otherwise the composer stays as it is for the next Send.
+        if (!(await authorizeAttempt())) return;
+        if (
+          promptRef.current !== promptAtSnapshot ||
+          composerAttachmentsRef.current !== attachmentsAtAuthorityCheck
+        )
+          return;
+      }
       if (currentQueueThreadKeyRef.current !== routeThreadKey) return;
       const threadIdForSend = activeThread.id;
       const isFirstMessage = !isServerThread || activeThread.messages.length === 0;
@@ -5819,11 +5846,18 @@ function ChatViewContent(props: ChatViewProps) {
         if (outgoingRestored) return;
         outgoingRestored = true;
         const store = useComposerDraftStore.getState();
-        const current = store.getComposerDraft(composerDraftTarget);
+        // A late reply can arrive after the new chat's draft was promoted and finalized;
+        // its content then belongs to the thread the draft became (#189).
+        const restoreTarget = resolveComposerRestoreTarget(composerDraftTarget);
+        const current = store.getComposerDraft(restoreTarget);
         const isCurrent = currentQueueThreadKeyRef.current === routeThreadKey;
+        // The live prompt belongs to the draft on screen; merge into it only when that is
+        // the draft being restored, or another draft's text would be copied into this one.
+        const showsRestoreTarget =
+          isCurrent && composerTargetsShareDraft(restoreTarget, liveComposerDraftTargetRef.current);
         const restored = mergeInterruptedComposerContent(
           {
-            prompt: isCurrent ? promptRef.current : (current?.prompt ?? ""),
+            prompt: showsRestoreTarget ? promptRef.current : (current?.prompt ?? ""),
             attachments: current?.attachments ?? [],
             terminalContexts: current?.terminalContexts ?? [],
             elementContexts: current?.elementContexts ?? [],
@@ -5843,19 +5877,21 @@ function ChatViewContent(props: ChatViewProps) {
             reviewComments: composerReviewCommentsSnapshot,
           },
         );
-        store.setPrompt(composerDraftTarget, restored.prompt);
-        store.addAttachments(composerDraftTarget, restored.attachments);
-        store.setTerminalContexts(composerDraftTarget, restored.terminalContexts);
-        store.setElementContexts(composerDraftTarget, restored.elementContexts);
-        store.setPreviewAnnotations(composerDraftTarget, restored.previewAnnotations);
-        store.setReviewComments(composerDraftTarget, restored.reviewComments);
-        if (isCurrent) {
-          const restoredDraft = store.getComposerDraft(composerDraftTarget);
+        store.setPrompt(restoreTarget, restored.prompt);
+        store.addAttachments(restoreTarget, restored.attachments);
+        store.setTerminalContexts(restoreTarget, restored.terminalContexts);
+        store.setElementContexts(restoreTarget, restored.elementContexts);
+        store.setPreviewAnnotations(restoreTarget, restored.previewAnnotations);
+        store.setReviewComments(restoreTarget, restored.reviewComments);
+        if (showsRestoreTarget) {
+          const restoredDraft = store.getComposerDraft(restoreTarget);
           promptRef.current = restoredDraft?.prompt ?? restored.prompt;
           composerAttachmentsRef.current = restoredDraft?.attachments ?? [];
           composerTerminalContextsRef.current = restored.terminalContexts;
           composerElementContextsRef.current = restored.elementContexts;
           resetRestoredComposerCursor(composerRef, promptRef.current);
+        }
+        if (isCurrent) {
           setOptimisticUserMessages((existing) => {
             for (const message of existing)
               if (message.id === messageIdForSend) revokeUserMessagePreviewUrls(message);
@@ -6200,7 +6236,9 @@ function ChatViewContent(props: ChatViewProps) {
             ...uncertain,
             ambiguousAdmission: {
               ...uncertain.ambiguousAdmission,
-              restoredDraft: useComposerDraftStore.getState().getComposerDraft(composerDraftTarget),
+              restoredDraft: useComposerDraftStore
+                .getState()
+                .getComposerDraft(resolveComposerRestoreTarget(composerDraftTarget)),
             },
           });
         if (
