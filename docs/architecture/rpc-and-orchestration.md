@@ -3709,6 +3709,39 @@ retain their failure/count evidence but do not contribute to latency statistics
 or slow rankings. An older server's summary lacks a known measured denominator,
 so current clients display its summary timing as unavailable.
 
+## Diagnostic logs download
+
+`server.downloadDiagnosticLogs` (`orchestration:read`, a stream) sends the
+server's redacted diagnostic bundle over the connection that asks for it, so a
+remote environment's archive needs no HTTP route of its own and stays inside a
+pinned connection's Noise channel (#194). Its schemas are in
+[`server.ts`](../../packages/contracts/src/server.ts); the server side is
+[`diagnostic_logs_rpc.rs`](../../apps/server/src/production/diagnostic_logs_rpc.rs)
+and the client side
+[`client-runtime/src/diagnostics/logs.ts`](../../packages/client-runtime/src/diagnostics/logs.ts).
+
+- **Request:** `frontendLog` (the client's bounded warning/error snapshot) and
+  optional `includeCrashDumps`. Dumps also need `orchestration:operate` of the
+  same session, checked in the handler before anything is built; a refusal is
+  the usual `EnvironmentAuthorizationError`.
+- **Items:** one `Started` (`fileName`, `byteLength`, `manifest`), then `Data`
+  items of base64 carrying at most 512 KiB each, then completion. Each item
+  rides alone in its chunk, so the client's `Ack` paces the download and other
+  replies go out between items.
+- **Failures:** `DiagnosticLogsError` with `reason` `invalid`, `build-failed`,
+  or `too-large` (over 20 MiB, refused before any item).
+- **Client checks:** it sends the request only to a server advertising
+  `capabilities.diagnosticLogs`, and fails closed: the connection's
+  `server.getConfig` must report a `storageInstanceId`, the manifest must name
+  the same one, `Started` must come first and once, and each item's encoded
+  length is checked against the item bound and the bytes still due before it
+  is decoded into the one output buffer. A stream that ends short or fails
+  saves nothing.
+
+The handler waits only on local disk reads and compression; it is timed to its
+first item like every stream, which is log-only, so it is not in
+`is_long_running`.
+
 ## Profiler timing and client reports
 
 The [Profiler](./overview.md#profiler) adds two unary methods, whose schemas are
