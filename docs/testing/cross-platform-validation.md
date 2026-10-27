@@ -735,11 +735,14 @@ multi-call script: it answers as Claude only through its `claude.sh` link and
 as mise under its real name.
 
 ```sh
-cargo test -p bibcode-server --lib claude_probe_accepts_only_claude_code_version_output
+cargo test -p bibcode-server --lib claude_probe_reads_only_a_claude_code_version
+cargo test -p bibcode-server --lib only_a_link_to_another_program_is_a_claude_shim
 cargo test -p bibcode-server --lib a_final_startup_none_replaces_capabilities_observed_at_runtime
 cargo test -p bibcode-server --test production_provider_runtime claude_probe
 cargo test -p bibcode-server --test production_provider_runtime claude_launch_through_a_shim
 cargo test -p bibcode-server --test production_provider_runtime a_restarted_claude_without_hook_support
+cargo test -p bibcode-server --test production_provider_runtime a_hookless_restart_while_chat_activity_is_off
+cargo test -p bibcode-server --test production_provider_runtime concurrent_launches_share_one_shim_recheck
 ```
 
 These tests are Unix-only. The live check runs on a remote Linux server whose
