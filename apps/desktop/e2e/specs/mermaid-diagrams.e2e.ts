@@ -295,7 +295,11 @@ async function restAnchorBelowTop(label: string, anchor: string): Promise<Readin
         if (!paragraph || !scroller || !viewport) return;
         const offset =
           paragraph.getBoundingClientRect().top - viewport.getBoundingClientRect().top - 80;
-        if (Math.abs(offset) > 0.5) scroller.scrollTop += offset;
+        if (Math.abs(offset) <= 0.5) return;
+        // A reader scrolls with the wheel, which stops the timeline following a sent turn's
+        // end; without it, the turn still being followed would take the view back to its end.
+        scroller.dispatchEvent(new WheelEvent("wheel", { deltaY: offset, bubbles: true }));
+        scroller.scrollTop += offset;
       },
       visibleSurfaceSelector,
       anchor,
