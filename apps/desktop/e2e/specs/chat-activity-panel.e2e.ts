@@ -1110,8 +1110,8 @@ async function assertTerminalPanelResizesTui(terminalId: string): Promise<void> 
  */
 async function assertNarrowSplitUsability(terminalId: string): Promise<void> {
   const host = `[data-provider-terminal-activity-host="${terminalId}"]`;
-  await browser.$(`${host} [data-testid="activity-dock"] button`).click();
-  await expect(browser.$(`${host} [data-activity-panel]`)).toBeDisplayed();
+  // The terminal tab is hidden behind the chat here, so both panes' open state is
+  // saved with the split layout and must come back from the reload on its own.
   await browser.execute((id: string) => {
     const key = "bibcode:center-panel-state:v1";
     const persisted = JSON.parse(window.localStorage.getItem(key) ?? "{}") as {
@@ -1120,10 +1120,25 @@ async function assertNarrowSplitUsability(terminalId: string): Promise<void> {
           string,
           { surfaces: ReadonlyArray<{ id: string }>; groups: unknown; layout: unknown }
         >;
+        activityPanes?: Record<string, Record<string, unknown>>;
       };
     };
-    for (const thread of Object.values(persisted.state.byThreadKey)) {
+    const open = {
+      expanded: true,
+      section: "subagents",
+      selectedRecordKind: null,
+      selectedRecordId: null,
+    };
+    for (const [threadKey, thread] of Object.entries(persisted.state.byThreadKey)) {
       if (!thread.surfaces.some((surface) => surface.id === `terminal:${id}`)) continue;
+      persisted.state.activityPanes = {
+        ...persisted.state.activityPanes,
+        [threadKey]: {
+          ...persisted.state.activityPanes?.[threadKey],
+          "chat:host": open,
+          [`terminal:${id}`]: open,
+        },
+      };
       Object.assign(thread, {
         groups: [
           { id: "center:root", surfaceIds: ["chat:host"], activeSurfaceId: "chat:host" },
