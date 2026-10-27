@@ -3134,9 +3134,12 @@ view), or free scrolling.
   comes first. A turn taller than the view is pinned where it is and then
   follows its end. A turn that fits lands its sent row by measuring the row
   on screen (`[data-message-id]` against the scroller's top), not from
-  LegendList's positions, with at most two non-animated landings, each
-  waiting up to 1 s for LegendList to finish it, so a landing clamped to
-  content that had not caught up is measured and landed again. Following
-  waits until then. A takeover, a later send (its glide replaces the landing)
+  LegendList's positions. It stays unsettled, with following waiting, until
+  the row is within 1 px of its offset: each non-animated landing is measured
+  again once LegendList has finished it (or after 1 s) and two frames of
+  layout have passed, so a landing clamped to content that had not caught up
+  lands again, for up to 2 s and 20 landings. It then settles where it is. A
+  turn that grows past the view meanwhile settles at once and follows its
+  end. A takeover, a later send (its glide replaces the landing)
   or another thread (the timeline remounts, and LegendList drops its
   requests) ends the landing; only a takeover needs to withdraw it.

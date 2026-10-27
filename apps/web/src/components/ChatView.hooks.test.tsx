@@ -2395,7 +2395,7 @@ describe("ChatView effects (captured and run manually)", () => {
     for (const cleanup of cleanups) cleanup();
   });
 
-  it("settles after its last landing even when the content height lagged both", async () => {
+  it("keeps landing until the content height catches up, then settles", async () => {
     const { list, cleanups, messageId, onAnchorReady } = await sendFittingReply({
       laggingMaxScroll: 100,
       clampSteps: [150],
@@ -2405,10 +2405,31 @@ describe("ChatView effects (captured and run manually)", () => {
     list.scrollNode.fire("scrollend");
     await flushPromises();
 
+    // Two landings clamped short, at 100 and 150; the third lands.
     expect(list.calls.scrollToOffset).toEqual([
       { offset: 184, animated: false },
       { offset: 184, animated: false },
+      { offset: 184, animated: false },
     ]);
+    expect(list.scrollNode.scrollTop).toBe(184);
+    // Settled: once the turn grows past the view, following reveals its end.
+    list.growRow(3, 500);
+    onRowSizeChanged()({ index: 3, previous: 100, size: 600 });
+    expect(list.calls.scrollToOffset.at(-1)).toEqual({ offset: 316, animated: false });
+    for (const cleanup of cleanups) cleanup();
+  });
+
+  it("settles after its landings run out while the content height still lags", async () => {
+    const { list, cleanups, messageId, onAnchorReady } = await sendFittingReply({
+      laggingMaxScroll: 150,
+      clampSteps: Array.from({ length: 30 }, () => 150),
+    });
+    onAnchorReady(messageId, 2);
+
+    list.scrollNode.fire("scrollend");
+    for (let turn = 0; turn < 20; turn += 1) await flushPromises();
+
+    expect(list.calls.scrollToOffset).toHaveLength(20);
     expect(list.scrollNode.scrollTop).toBe(150);
     // Settled: once the turn grows past the view, following reveals its end.
     list.growRow(3, 500);
