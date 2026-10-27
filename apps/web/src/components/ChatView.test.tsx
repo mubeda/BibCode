@@ -3019,6 +3019,59 @@ describe("ChatView", () => {
       }
     });
 
+    it("keys a split panel chat's Activity under its host, independent of the host pane", async () => {
+      const panelThreadId = ThreadId.make("thread-panel-split");
+      const panelThreadRef = scopeThreadRef(environmentId, panelThreadId);
+      const child = actor("actor-split", "Split reviewer");
+      const snapshot = activitySnapshot({ _tag: "thread", threadId: panelThreadId }, [child]);
+      seedEnvironment(makeEnvironmentPresentation());
+      seedProject(makeProject());
+      seedServerThread(makeThread({ id: panelThreadId, title: "Split thread" }));
+      seedGitStatus(true);
+      seedActivityState(environmentId, snapshot.scope, snapshot);
+      seedActivityQueries(environmentId, snapshot, [child]);
+      useCenterPanelStore.getState().openChatPanel(threadRef, panelThreadId);
+      // The host pane is open; the panel beside it must not inherit that.
+      openActivityPane(threadRef, "subagents");
+
+      vi.unstubAllGlobals();
+      Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+      const container = document.createElement("div");
+      document.body.append(container);
+      const root = createRoot(container);
+      await act(async () => {
+        root.render(
+          <ChatView
+            variant="panel"
+            panelThreadRef={panelThreadRef}
+            activityPaneHostRef={threadRef}
+            workspaceUnavailable={null}
+          />,
+        );
+        await Promise.resolve();
+      });
+      try {
+        const pill = container.querySelector<HTMLButtonElement>(
+          '[data-testid="activity-dock"] button',
+        )!;
+        expect(pill.getAttribute("aria-expanded")).toBe("false");
+        expect(container.querySelector("[data-activity-panel]")).toBeNull();
+
+        await click(pill);
+
+        await vi.waitFor(() => expect(container.textContent).toContain("Split reviewer"));
+        const panes = useCenterPanelStore.getState().activityPanes[scopedThreadKey(threadRef)];
+        expect(panes?.[`chat:${panelThreadId}`]?.expanded).toBe(true);
+        expect(panes?.[HOST_SURFACE_ID]?.expanded).toBe(true);
+        expect(
+          useCenterPanelStore.getState().activityPanes[scopedThreadKey(panelThreadRef)],
+        ).toBeUndefined();
+      } finally {
+        await act(async () => root.unmount());
+        container.remove();
+      }
+    });
+
     it("collapses from its button, then reopens with focus at the top of its section", async () => {
       const panelThreadId = ThreadId.make("thread-panel-refocus");
       const panelThreadRef = scopeThreadRef(environmentId, panelThreadId);
