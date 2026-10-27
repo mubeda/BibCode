@@ -1166,6 +1166,29 @@ describe("packaged Mermaid diagrams", () => {
         ),
       { timeoutMsg: "The keyboard prompt's sent row never showed.", interval: 20 },
     );
+    // Wait, briefly, for the glide to be under way, so the key lands mid-glide; the trace
+    // records whether it did.
+    const glideMovingAtKey = await browser.executeAsync(
+      (surface: string, prompt: string, done: (moving: boolean) => void) => {
+        const top = () => {
+          const row = [
+            ...document.querySelectorAll<HTMLElement>(`${surface} [data-message-role="user"]`),
+          ].find((element) => element.textContent?.includes(prompt));
+          return row?.getBoundingClientRect().top ?? null;
+        };
+        const first = top();
+        const started = performance.now();
+        const check = () => {
+          const now = top();
+          if (first !== null && now !== null && Math.abs(now - first) > 4) return done(true);
+          if (performance.now() - started > 1_500) return done(false);
+          requestAnimationFrame(check);
+        };
+        requestAnimationFrame(check);
+      },
+      visibleSurfaceSelector,
+      mermaidFixturePrompts.keyboard,
+    );
     const focused = await browser.execute((surface: string) => {
       const button = [
         ...document.querySelectorAll<HTMLElement>(`${surface} .chat-markdown-codeblock`),
@@ -1239,6 +1262,7 @@ describe("packaged Mermaid diagrams", () => {
       NodePath.join(preparedArtifactDirectory, "mermaid-timeline-keyboard-takeover.json"),
       JSON.stringify(
         {
+          glideMovingAtKey,
           keyAt: Math.round(keyAt),
           readingChosen: Math.round(readingChosen),
           endAt: Math.round(endAt),
@@ -1284,13 +1308,21 @@ async function startKeyboardSamples(): Promise<void> {
   await browser.execute(
     (surface: string, lastLine: string) => {
       const record = window as unknown as {
-        __bibcodeKeyboard?: { samples: KeyboardSample[]; keyAt: number | null; reading: string };
+        __bibcodeKeyboard?: {
+          samples: KeyboardSample[];
+          keyAt: number | null;
+          reading: HTMLElement | null;
+        };
         __bibcodeKeyboardStop?: () => void;
       };
       record.__bibcodeKeyboardStop?.();
       const scroller = document.querySelector<HTMLElement>(`${surface} [class*='overflow-anchor']`);
       if (!scroller) throw new Error("The timeline scroller is missing.");
-      const state = { samples: [] as KeyboardSample[], keyAt: null as number | null, reading: "" };
+      const state = {
+        samples: [] as KeyboardSample[],
+        keyAt: null as number | null,
+        reading: null as HTMLElement | null,
+      };
       record.__bibcodeKeyboard = state;
       const started = performance.now();
       let keydowns = 0;
@@ -1305,9 +1337,7 @@ async function startKeyboardSamples(): Promise<void> {
           ...document.querySelectorAll<HTMLElement>(`${surface} .chat-markdown p`),
         ];
         const area = scroller.getBoundingClientRect();
-        const reading = state.reading
-          ? paragraphs.find((element) => element.textContent === state.reading)
-          : undefined;
+        const reading = state.reading?.isConnected ? state.reading : null;
         const blocks = [
           ...document.querySelectorAll<HTMLElement>(
             `${surface} .chat-markdown p, ${surface} .chat-markdown-codeblock`,
@@ -1403,23 +1433,22 @@ async function readKeyboardSamples(): Promise<{ samples: KeyboardSample[]; keyAt
 }
 
 /**
- * Picks the keyboard reply's paragraph nearest the visible top that shows whole, as the line
- * being read, and returns the sample time from which it is tracked.
+ * Picks the paragraph nearest the visible top that shows whole, as the line being read, and
+ * returns the sample time from which it is tracked.
  */
 async function chooseKeyboardReadingLine(): Promise<number> {
   return browser.execute((surface: string) => {
     const record = window as unknown as {
-      __bibcodeKeyboard?: { samples: Array<{ at: number }>; reading: string };
+      __bibcodeKeyboard?: { samples: Array<{ at: number }>; reading: HTMLElement | null };
     };
     const scroller = document.querySelector<HTMLElement>(`${surface} [class*='overflow-anchor']`)!;
     const area = scroller.getBoundingClientRect();
     const paragraph = [...document.querySelectorAll<HTMLElement>(`${surface} .chat-markdown p`)]
-      .filter((element) => element.textContent?.startsWith("Keyboard before paragraph"))
-      .map((element) => ({ element, top: element.getBoundingClientRect().top }))
-      .filter((entry) => entry.top >= area.top + 40)
-      .sort((a, b) => a.top - b.top)[0];
-    if (!paragraph) throw new Error("No keyboard reply paragraph shows below the visible top.");
-    record.__bibcodeKeyboard!.reading = paragraph.element.textContent ?? "";
+      .map((element) => ({ element, box: element.getBoundingClientRect() }))
+      .filter((entry) => entry.box.top >= area.top + 40 && entry.box.bottom <= area.bottom - 160)
+      .sort((a, b) => a.box.top - b.box.top)[0];
+    if (!paragraph) throw new Error("No paragraph shows whole in the timeline to read.");
+    record.__bibcodeKeyboard!.reading = paragraph.element;
     return record.__bibcodeKeyboard!.samples.at(-1)?.at ?? 0;
   }, visibleSurfaceSelector);
 }
