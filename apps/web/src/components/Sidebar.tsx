@@ -193,6 +193,7 @@ import {
 } from "./sidebar/repositoryView.logic";
 import { SidebarRepositoryGroup } from "./sidebar/SidebarRepositoryGroup";
 import { SidebarViewToggle } from "./sidebar/SidebarViewToggle";
+import { SidebarInboxView } from "./sidebar/inbox/SidebarInboxView";
 import { ServerUpdateBadge, serverUpdateStatusFromQuery } from "./settings/ServerUpdateBadge";
 import {
   ENVIRONMENT_RAIL_WIDTH_PX,
@@ -4201,9 +4202,9 @@ function SortableProjectItem({
 
 const SidebarChromeHeader = memo(function SidebarChromeHeader() {
   // The fixed sidebar toggle overlays the rail's top strip. With the rail
-  // hidden (Repositories view) reserve that strip here so the brand stays put.
+  // hidden (Repositories and Inbox views) reserve that strip here so the brand stays put.
   // Below `md` the header carries its own trigger, so nothing is reserved.
-  const railHidden = useUiStateStore((state) => state.sidebarView === "repositories");
+  const railHidden = useUiStateStore((state) => state.sidebarView !== "environments");
   return (
     <SidebarHeader
       className={cn(
@@ -5552,66 +5553,70 @@ export default function Sidebar() {
       ) : (
         <>
           <SidebarViewToggle />
-          {repositoriesView ? null : <SidebarEnvironmentContextCard />}
-          <SidebarProjectsContent
-            showArm64IntelBuildWarning={showArm64IntelBuildWarning}
-            arm64IntelBuildWarningDescription={arm64IntelBuildWarningDescription}
-            desktopUpdateButtonAction={desktopUpdateButtonAction}
-            desktopUpdateButtonDisabled={desktopUpdateButtonDisabled}
-            handleDesktopUpdateButtonClick={handleDesktopUpdateButtonClick}
-            projectSortOrder={sidebarProjectSortOrder}
-            repositorySortOrder={sidebarRepositorySortOrder}
-            threadSortOrder={sidebarThreadSortOrder}
-            projectGroupingMode={sidebarProjectGroupingMode}
-            threadPreviewCount={sidebarThreadPreviewCount}
-            updateSettings={updateSettings}
-            openAddProject={openAddProjectCommandPalette}
-            addProjectLabel={addProjectLabel}
-            isManualProjectSorting={isManualProjectSorting}
-            projectDnDSensors={projectDnDSensors}
-            projectCollisionDetection={projectCollisionDetection}
-            handleProjectDragStart={handleProjectDragStart}
-            handleProjectDragEnd={handleProjectDragEnd}
-            handleProjectDragCancel={handleProjectDragCancel}
-            openCreateWorktreeDialog={openCreateWorktreeDialog}
-            archiveThread={archiveThread}
-            deleteThread={deleteThread}
-            sortedProjects={sortedProjects}
-            repositoriesView={repositoriesView}
-            repositoryGroups={repositoryGroups}
-            repositoryGroupExpandedById={repositoryGroupExpandedById}
-            environmentCardIdentities={environmentCardIdentities}
-            expandedThreadListsByProject={expandedThreadListsByProject}
-            activeRouteProjectKey={activeRouteProjectKey}
-            routeThreadKey={routeThreadKey}
-            moduleRouteProjectKey={moduleRouteProjectKey}
-            selectedProjectKey={selectedProjectKey}
-            selectProject={selectProject}
-            commandPaletteShortcutLabel={commandPaletteShortcutLabel}
-            threadJumpLabelByKey={visibleThreadJumpLabelByKey}
-            attachThreadListAutoAnimateRef={attachThreadListAutoAnimateRef}
-            expandThreadListForProject={expandThreadListForProject}
-            collapseThreadListForProject={collapseThreadListForProject}
-            dragInProgressRef={dragInProgressRef}
-            suppressProjectClickAfterDragRef={suppressProjectClickAfterDragRef}
-            suppressProjectClickForContextMenuRef={suppressProjectClickForContextMenuRef}
-            attachProjectListAutoAnimateRef={attachProjectListAutoAnimateRef}
-            projectAvailability={projectAvailability}
-            projectAvailabilityEnvironment={projectAvailabilityEnvironment}
-            showProjectAvailabilityRetry={showProjectAvailabilityRetry}
-            showProjectAvailabilityConnectionSettings={showProjectAvailabilityConnectionSettings}
-            showProjectAvailabilityOpenRemoteServers={showProjectAvailabilityOpenRemoteServers}
-            onRetryProjectEnvironment={handleRetryProjectEnvironment}
-            onOpenProjectSettings={handleOpenProjectSettings}
-            onViewProjectDiagnostics={handleViewProjectDiagnostics}
-            onAdoptProjectStorage={handleAdoptProjectStorage}
-            onRecoverProjectData={
-              projectAvailability.environmentId !== null &&
-              projectDataRecoveryEnvironmentIds.has(projectAvailability.environmentId)
-                ? handleRecoverProjectData
-                : undefined
-            }
-          />
+          {sidebarView === "environments" ? <SidebarEnvironmentContextCard /> : null}
+          {sidebarView === "inbox" ? (
+            <SidebarInboxView />
+          ) : (
+            <SidebarProjectsContent
+              showArm64IntelBuildWarning={showArm64IntelBuildWarning}
+              arm64IntelBuildWarningDescription={arm64IntelBuildWarningDescription}
+              desktopUpdateButtonAction={desktopUpdateButtonAction}
+              desktopUpdateButtonDisabled={desktopUpdateButtonDisabled}
+              handleDesktopUpdateButtonClick={handleDesktopUpdateButtonClick}
+              projectSortOrder={sidebarProjectSortOrder}
+              repositorySortOrder={sidebarRepositorySortOrder}
+              threadSortOrder={sidebarThreadSortOrder}
+              projectGroupingMode={sidebarProjectGroupingMode}
+              threadPreviewCount={sidebarThreadPreviewCount}
+              updateSettings={updateSettings}
+              openAddProject={openAddProjectCommandPalette}
+              addProjectLabel={addProjectLabel}
+              isManualProjectSorting={isManualProjectSorting}
+              projectDnDSensors={projectDnDSensors}
+              projectCollisionDetection={projectCollisionDetection}
+              handleProjectDragStart={handleProjectDragStart}
+              handleProjectDragEnd={handleProjectDragEnd}
+              handleProjectDragCancel={handleProjectDragCancel}
+              openCreateWorktreeDialog={openCreateWorktreeDialog}
+              archiveThread={archiveThread}
+              deleteThread={deleteThread}
+              sortedProjects={sortedProjects}
+              repositoriesView={repositoriesView}
+              repositoryGroups={repositoryGroups}
+              repositoryGroupExpandedById={repositoryGroupExpandedById}
+              environmentCardIdentities={environmentCardIdentities}
+              expandedThreadListsByProject={expandedThreadListsByProject}
+              activeRouteProjectKey={activeRouteProjectKey}
+              routeThreadKey={routeThreadKey}
+              moduleRouteProjectKey={moduleRouteProjectKey}
+              selectedProjectKey={selectedProjectKey}
+              selectProject={selectProject}
+              commandPaletteShortcutLabel={commandPaletteShortcutLabel}
+              threadJumpLabelByKey={visibleThreadJumpLabelByKey}
+              attachThreadListAutoAnimateRef={attachThreadListAutoAnimateRef}
+              expandThreadListForProject={expandThreadListForProject}
+              collapseThreadListForProject={collapseThreadListForProject}
+              dragInProgressRef={dragInProgressRef}
+              suppressProjectClickAfterDragRef={suppressProjectClickAfterDragRef}
+              suppressProjectClickForContextMenuRef={suppressProjectClickForContextMenuRef}
+              attachProjectListAutoAnimateRef={attachProjectListAutoAnimateRef}
+              projectAvailability={projectAvailability}
+              projectAvailabilityEnvironment={projectAvailabilityEnvironment}
+              showProjectAvailabilityRetry={showProjectAvailabilityRetry}
+              showProjectAvailabilityConnectionSettings={showProjectAvailabilityConnectionSettings}
+              showProjectAvailabilityOpenRemoteServers={showProjectAvailabilityOpenRemoteServers}
+              onRetryProjectEnvironment={handleRetryProjectEnvironment}
+              onOpenProjectSettings={handleOpenProjectSettings}
+              onViewProjectDiagnostics={handleViewProjectDiagnostics}
+              onAdoptProjectStorage={handleAdoptProjectStorage}
+              onRecoverProjectData={
+                projectAvailability.environmentId !== null &&
+                projectDataRecoveryEnvironmentIds.has(projectAvailability.environmentId)
+                  ? handleRecoverProjectData
+                  : undefined
+              }
+            />
+          )}
 
           <SidebarSeparator />
           <SidebarChromeFooter />

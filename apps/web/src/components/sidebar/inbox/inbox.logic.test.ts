@@ -105,7 +105,9 @@ describe("inbox data readiness", () => {
     expect(
       resolveInboxDataState(
         summary({
-          statuses: [{ environmentId: ENV, status: "synchronizing", hasSnapshot: false, error: null }],
+          statuses: [
+            { environmentId: ENV, status: "synchronizing", hasSnapshot: false, error: null },
+          ],
           hasSnapshot: false,
           canShowEmptyProjects: false,
         }),
@@ -172,9 +174,10 @@ describe("inbox tile selection", () => {
   });
 
   it("does not settle from loading data even with attention agents", () => {
-    expect(resolveInboxSelection({ persisted: null, counts: some, dataState: "loading" })).toEqual(
-      { category: "all", settle: null },
-    );
+    expect(resolveInboxSelection({ persisted: null, counts: some, dataState: "loading" })).toEqual({
+      category: "all",
+      settle: null,
+    });
   });
 });
 
