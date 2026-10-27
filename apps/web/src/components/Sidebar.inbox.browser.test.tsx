@@ -23,24 +23,18 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 const inboxTest = vi.hoisted(() => ({
-  /** Terminal rows #187 adds; appended to the built rows until that branch lands. */
-  terminalRows: [] as Array<Record<string, unknown>>,
+  /** AI Terminal summaries per environment, as the terminal metadata stream reports them. */
+  terminalSources: [] as Array<{ environmentId: string; rows: Array<Record<string, unknown>> }>,
 }));
 
 vi.mock("./agents/useAgentLiveBranches", () => ({
   useAgentLiveBranches: () => new Map<string, string>(),
 }));
 vi.mock("./chat/ProviderInstanceIcon", () => ({ ProviderInstanceIcon: () => null }));
-vi.mock("./sidebar/agentsSection.logic", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("./sidebar/agentsSection.logic")>();
-  return {
-    ...actual,
-    buildAgentRows: (input: Parameters<typeof actual.buildAgentRows>[0]) => [
-      ...actual.buildAgentRows(input),
-      ...inboxTest.terminalRows,
-    ],
-  };
-});
+vi.mock("../hooks/useAgentFreshness", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../hooks/useAgentFreshness")>()),
+  useAgentTerminalSources: () => inboxTest.terminalSources,
+}));
 
 import Sidebar from "./Sidebar";
 import {
@@ -185,7 +179,7 @@ function focusedSurfaceId(threadId: string, environmentId = ENV_MAIN): string | 
 
 beforeEach(() => {
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
-  inboxTest.terminalRows = [];
+  inboxTest.terminalSources = [];
   useCenterPanelStore.setState({ byThreadKey: {}, pendingChatPanelThreadKeys: new Set() });
   h.state.projects = [projectA];
   h.state.environments = [
@@ -352,36 +346,33 @@ describe("Sidebar Inbox view", () => {
     ).toBe(true);
   });
 
-  it("opens a terminal agent's AI terminal by its id on the host thread", async () => {
-    const hostRef = scopeThreadRef(ENV_MAIN, hostThread.id);
+  it("opens a terminal-only worktree's AI terminal by its id on the host thread", async () => {
+    const terminalHost = { ...hostThread, session: null };
+    const hostRef = scopeThreadRef(ENV_MAIN, terminalHost.id);
     useCenterPanelStore.getState().openTerminalPanel(hostRef, "term-ai");
     useCenterPanelStore.getState().openHostChat(hostRef);
     expect(focusedSurfaceId("thread-host")).toBe(HOST_SURFACE_ID);
-    h.state.threads = [hostThread];
-    inboxTest.terminalRows = [
+    h.state.threads = [terminalHost];
+    inboxTest.terminalSources = [
       {
-        key: `${scopedThreadKey(hostRef)}#terminal:term-ai`,
-        ref: hostRef,
-        shell: { ...hostThread, title: "Claude terminal" },
-        branch: null,
-        group: "working",
-        pill: { label: "Working", colorClass: "", dotClass: "", pulse: false },
-        environmentLabel: "Main",
-        environmentLive: true,
-        environmentStatus: "live",
-        projectTitle: "Repo A",
-        providerDriverKind: null,
-        providerLabel: null,
-        previewLine: null,
-        searchText: "",
-        terminalId: "term-ai",
-        unknownReason: null,
+        environmentId: ENV_MAIN,
+        rows: [
+          {
+            threadId: "thread-host",
+            terminalId: "term-ai",
+            label: "Claude Code",
+            status: "running",
+            agentStatus: { state: "working", failed: false, observedAt: "obs-1", ageMs: 0 },
+          },
+        ],
       },
     ];
-    h.uiStore.setState({ inboxCategory: "working" });
+    await renderSidebar();
+    expect(tile("working").getAttribute("aria-label")).toBe("Working, 1 agent");
+    await act(async () => tile("working").click());
     await renderSidebar();
 
-    await act(async () => agentCard("Claude terminal").click());
+    await act(async () => agentCard("Host chat").click());
 
     expect(h.spies.navigate).toHaveBeenCalledWith({
       to: "/$environmentId/$threadId",
@@ -389,6 +380,33 @@ describe("Sidebar Inbox view", () => {
     });
     expect(focusedSurfaceId("thread-host")).toBe("terminal:term-ai");
     expect(h.spies.markRead).toHaveBeenCalledWith(threadKeyOf(hostThread));
+    // The card has no Jump to workspace action, so nothing on it can fail.
+    expect(findProps((props) => props["data-mock"] === "SidebarMenuAction")).toBeNull();
+  });
+
+  it("counts a disconnected server's agents as unknown, not Needs Attention", async () => {
+    h.state.environments = [
+      environmentFixture({ environmentId: ENV_MAIN, label: "Main", connectionId: "primary" }),
+      environmentFixture({ environmentId: ENV_REMOTE, label: "Remote", connectionId: "remote" }),
+    ];
+    h.state.threads = [doneThread, remoteApproval];
+    h.state.shellSummary = {
+      ...liveSummary([ENV_MAIN]),
+      desiredEnvironmentCount: 2,
+      canShowEmptyProjects: false,
+      statuses: [
+        { environmentId: ENV_MAIN, status: "live", hasSnapshot: true, error: null },
+        { environmentId: ENV_REMOTE, status: "unavailable", hasSnapshot: true, error: null },
+      ],
+    };
+    await renderSidebar();
+
+    expect(tile("attention").getAttribute("aria-label")).toBe("Needs Attention, 0 agents");
+    expect(tile("all").getAttribute("aria-label")).toBe("All Agents, 2 agents");
+    expect(pressedTiles()).toEqual(["all"]);
+    // Partial data with nothing needing attention leaves the default unsaved.
+    expect(h.uiStore.getState().inboxCategory).toBeNull();
+    expect(agentCard("Remote approval").getAttribute("aria-label")).toContain(", Offline,");
   });
 
   it("treats a reconnecting remote as partial and settles the default once it reports", async () => {

@@ -2,6 +2,7 @@ import type { EnvironmentAvailabilityStatus } from "@bibcode/client-runtime/stat
 import { useMemo } from "react";
 
 import { isDesktopLocalConnectionTarget } from "../../../connection/desktopLocal";
+import { useAgentRowFreshness, useAgentTerminalSources } from "../../../hooks/useAgentFreshness";
 import { useProjects, useThreadShells } from "../../../state/entities";
 import { useEnvironments } from "../../../state/environments";
 import { useEnvironmentShellSummary } from "../../../state/shell";
@@ -43,6 +44,24 @@ export function useInboxAgentRows(): {
     [availabilityByEnvironmentId, projects, shells],
   );
   const liveBranchByCheckoutKey = useAgentLiveBranches(checkouts);
+  // AI Terminal rows and the status clock, as the Agents view reads them: without
+  // freshness a disconnected environment's agents would keep their last state.
+  const environmentIds = useMemo(
+    () => environments.map((environment) => environment.environmentId),
+    [environments],
+  );
+  const terminalSources = useAgentTerminalSources(environmentIds);
+  const decayable = useMemo(
+    () =>
+      shells.some(
+        (shell) => shell.session?.status === "running" || shell.session?.status === "starting",
+      ) ||
+      terminalSources.some((source) =>
+        source.rows.some((terminal) => terminal.agentStatus?.state === "working"),
+      ),
+    [shells, terminalSources],
+  );
+  const freshness = useAgentRowFreshness(decayable);
   const rows = useMemo(() => {
     const liveBranchByThreadKey = new Map<string, string>();
     for (const [threadKey, checkoutKey] of checkoutKeyByThreadKey) {
@@ -57,14 +76,18 @@ export function useInboxAgentRows(): {
       ),
       availabilityByEnvironmentId,
       liveBranchByThreadKey,
+      terminals: terminalSources,
+      freshness,
     });
   }, [
     availabilityByEnvironmentId,
     checkoutKeyByThreadKey,
     environments,
+    freshness,
     liveBranchByCheckoutKey,
     projects,
     shells,
+    terminalSources,
   ]);
   const environmentById = useMemo(
     () =>

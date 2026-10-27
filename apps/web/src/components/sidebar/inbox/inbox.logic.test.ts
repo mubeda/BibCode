@@ -4,11 +4,12 @@ import { EnvironmentId, ThreadId } from "@bibcode/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
 import { HOST_SURFACE_ID } from "../../../centerPanelStore";
-import type { InboxAgentGroupId, InboxAgentRowFields } from "./agentRowContract";
+import type { AgentGroupId } from "../agentsSection.logic";
 import {
   INBOX_CATEGORIES,
   countInboxCategories,
   describeInboxPartialReason,
+  type InboxAgentRowFields,
   inboxTargetSurfaceId,
   resolveInboxPartialReason,
   isInboxRowCurrent,
@@ -23,7 +24,7 @@ const REMOTE = EnvironmentId.make("env-2");
 
 function row(
   id: string,
-  group: InboxAgentGroupId,
+  group: AgentGroupId,
   overrides: Partial<InboxAgentRowFields> & { updatedAt?: string } = {},
 ): InboxAgentRowFields {
   const ref = overrides.ref ?? scopeThreadRef(ENV, ThreadId.make(id));

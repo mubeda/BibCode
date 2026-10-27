@@ -5,12 +5,11 @@ import type {
 import type { EnvironmentShellAvailability } from "@bibcode/client-runtime/state/shell";
 import { memo, useMemo } from "react";
 
-import { buildAgentRows } from "./agentsSection.logic";
-import type { InboxAgentRowFields } from "./inbox/agentRowContract";
+import { type AgentRow, buildAgentRows } from "./agentsSection.logic";
 import { useAgentsUnread } from "./useAgentsUnread";
 
-function isChatRow(row: InboxAgentRowFields): boolean {
-  return (row.terminalId ?? null) === null;
+function isChatRow(row: AgentRow): boolean {
+  return row.terminalId === null;
 }
 
 export interface AgentsUnreadTrackerProps {
