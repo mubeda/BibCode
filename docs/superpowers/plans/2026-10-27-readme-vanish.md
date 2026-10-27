@@ -37,10 +37,11 @@ and the diagnosis loop. Nothing is implemented yet.
 - At **00:27:06.44** the server logged `RPC connection ended reason="client-closed"` at
   DEBUG with **no page load** next to it. Every other `client-closed` in the spec's window
   comes a few ms before a `desktop_e2e_page_load_started` (a WebDriver navigation).
-  `transport.rs:250-289` logs DEBUG only when `is_abnormal()` is false. So the client
-  closed the socket in an orderly way (code none, 1000 or 1001). That rules out the
-  client liveness timeout (4408, logged as `client-liveness-timeout`) and any
-  server-initiated end.
+  `transport.rs:250-289` logs DEBUG only when `is_abnormal()` is false: the server
+  *received* a Close frame with code none, 1000 or 1001. It is not the client liveness
+  close (4408, logged as `client-liveness-timeout`). The record does not prove which
+  client code path initiated it, or that the editor went read-only while the test was
+  typing. **This close is correlated with the failure, not a proven cause.**
 - At 00:27:09.49, about 3 s later, four workspace-index requests arrive within 14 ms (one
   `cache_wait miss` and three `shared`). Searches earlier in the spec arrive one at a
   time. The burst fits a reconnect finishing after `RETRY_DELAYS_MS[0]` = 1 s ±15 %
@@ -94,9 +95,10 @@ reconnect, which also triggers that effect.
 
 ## Ranked hypotheses and what decides between them
 
-**H1: a reconnect makes the editor read-only and the keystrokes are dropped.** The close
-at 00:27:06.44 flips the phase, `setEditable(false)` lands while `addValue` is typing,
-and nothing reaches the editor.
+**H1: a reconnect makes the editor read-only and the keystrokes are dropped.** This is a
+candidate suggested by the correlated close at 00:27:06.44, not something the artifacts
+show. If the phase left `connected` while `addValue` was typing, `setEditable(false)`
+would drop the keys.
 - Prediction: at typing time the editor root has `contentEditable === "false"`, and
   `textContent` never contains "@README", not even for one frame.
 
@@ -130,100 +132,103 @@ than guessing. Candidates:
 - a registry lease release (`packages/client-runtime/src/connection/registry.ts:332,353,1010`).
 - `RetryRequested` or `DisconnectRequested` from the UI.
 
-## Diagnosis loop (phase 2, step 1)
+## Diagnosis loop (phase 2, step 1; approved with corrections)
 
 Setup:
-- Disk: `df -h /System/Volumes/Data` showed 203 GiB free, above the 60 GB floor; check
-  again before building.
-- Build `vp run test:ui:desktop:build` in the background, then install an isolated copy
-  per `docs/testing/macos-desktop.md:225-250`.
-- Use a unique `BIBCODE_E2E_WEBDRIVER_PORT=4471`. Before each run, check that
-  `lsof -nP -iTCP:4471 -sTCP:LISTEN` prints nothing.
-- Keep all loop artifacts in the session scratchpad.
+- Disk: 185 GiB free at the start of phase 2.
+- Packaged arm64 `.app` built with an isolated bundle identifier,
+  `com.bibcode.desktop.e2e.b3f`, using `tauri build ... --bundles app`
+  (`docs/testing/macos-desktop.md:491-495`), and copied with `ditto` into an install
+  folder in the scratchpad.
+- `BIBCODE_E2E_WEBDRIVER_PORT=4471`, checked free with
+  `lsof -nP -iTCP:4471 -sTCP:LISTEN` before each run.
 
-1. **Mechanism loop (deterministic; settles H1, H2 and H3).** A scratch spec under
-   `apps/desktop/e2e/specs/manual/`, which the batch deletes or keeps as a manual spec.
-   It opens the primary Codex thread, sends once, then in one page task records
-   `{t, contentEditable, textContent, activeElement === editor, placeholder}` on every
-   animation frame for about 5 s. Three arms, 10 runs each:
-   - (a) dispatch `offline`, type "@README" with `execCommand("insertText")` and with
-     WebDriver `addValue`, then dispatch `online`;
-   - (b) type first, then dispatch `offline` and `online`;
-   - (c) no injection (the H3 control).
+**Recorder.** One page task installs it and *returns before any typing*, so a waiting page
+task can never overlap the WebDriver typing it is meant to observe. It records, each with
+a `performance.now()` timestamp:
 
-   In arm (a), the server log must show an unpaired `client-closed`, which confirms the
-   synthetic trigger matches the CI signature.
-2. **Trigger loop (stochastic).** Run the real `composer-native-triggers` spec 20-50
-   times under CPU load (`yes > /dev/null &` once per core, killed afterwards; macOS has
-   no `timeout` or `cpulimit`). A recorder installed at spec start (see the changes
-   below) logs `online`/`offline` events, `visibilitychange`, and editor editable or
-   placeholder changes. After each run, grep `app-server.log` for unpaired closes.
-   - If it never fails in N runs, report that as "the trigger does not reproduce in N
-     runs", which #199 accepts as long as loop 1 has settled the mechanism.
+- DOM mutations on the visible composer editor (`characterData`, `childList`, and the
+  `contenteditable` attribute), with the resulting `textContent`;
+- `beforeinput` and `input` events on the editor. These are what reach Lexical's change
+  path (`handleEditorChange`, `ComposerPromptEditor.tsx:1997`), whose `onChange` feeds
+  ChatComposer's `setPrompt` (`ChatComposer.tsx:1590-1591`);
+- the persisted draft: on every recorded mutation it reads the thread's
+  `bibcode:composer-drafts:v1` entry;
+- a connection phase proxy, taken from the placeholder "is not connected", the composer
+  banner, and the Send button's `disabled`;
+- window `online`/`offline`/`focus`/`blur`/`visibilitychange` events;
+- every `WebSocket.prototype.close` call with its code and a stack trace, and each new
+  socket. This shows which client path initiated a close.
+
+After the run, a second page task reads the log back.
+
+Arms:
+
+- (a) **Offline before typing:** dispatch `offline`, WebDriver `addValue("@README")`,
+  dispatch `online`, then wait until Send can send again.
+- (b) **Typing through the transition:** a page `setTimeout` dispatches `offline` partway
+  through a WebDriver `addValue` of a longer string, then `online` about 1.5 s later.
+- (c) **Offline after typing:** type, then dispatch `offline` and `online`. This tests
+  H2: are typed text and the stored draft wiped on reconnect?
+- (d) **H3 control, no disconnect:** the real spec's sequence. Send `$refactor`, and as
+  soon as the provider log has it, type "@README", so the typing overlaps the fixture's
+  finishing turn update. The recorder shows the timeline row mutation next to the editor
+  mutations to prove the overlap.
+
+Each arm also checks the server log for unpaired `client-closed` records.
+
+**Trigger loop (stochastic, second).** Run the real spec repeatedly under CPU load with
+the recorder installed, and count unpaired closes. If it never fails in N runs, that is
+reported as the trigger not reproducing in N runs.
 
 ## Planned changes (after the loop reports)
 
-**Test hardening (owned, done whatever the loop shows):**
-- `setComposerValue` (`composer-native-triggers.e2e.ts:250-285`) waits until the visible
-  editor is editable (`contentEditable === "true"`) before typing.
-- When `waitForComposerValue` times out, it writes a diagnostics JSON to
-  `BIBCODE_E2E_ARTIFACT_DIR`, in the same style as `openProviderPanel`'s failure dump
-  (lines 397-430). The dump holds the editor's editable state and text,
-  `activeElement`, the placeholder or banner text, `location.hash`, the matching
-  `bibcode:composer-drafts:v1` entry, and the recorder's connectivity, visibility and
-  editable events.
-- This makes the next CI occurrence diagnosable even if the trigger stays unknown.
+**Spec (owned):**
+- Do **not** add an unconditional editable wait. Keep a regression assertion that types
+  *through* the transition (arm b as a spec case if a product fix lands).
+- On a `waitForComposerValue` timeout, write a diagnostics JSON: the recorder log,
+  editor editable state and text, `activeElement`, placeholder or banner, `location.hash`,
+  and the persisted draft.
+- Rewrite the shared `sendCurrentComposerPrompt` comment (around line 692) for both
+  cases: a server thread's route does not change, so the wait passes at once; a new
+  chat's draft route gives way to the thread. Attribute the "@README" loss to a close
+  only if the loop proves it.
 
-**Spec comment (owned; acceptance item 2):** rewrite the `sendCurrentComposerPrompt`
-comment (lines 692-694) so it states that the primary-workspace chat is already a server
-thread, so the draft-route wait does nothing there, and that the "@README" loss was a
-connection drop (or whatever the loop proves).
+**Product (only if the loop proves H1 or H2): send a design note to the coordinator
+before implementing.** The note covers:
 
-**Product fix (only if loop 1 proves H1 or H2):**
-- Keep the editor editable during transient phases and gate only Send. This is
-  `ChatComposer.tsx:2755-2760` (composer code, which I may change for a proven cause).
-- Which phases count as transient (`connecting`, `reconnecting`, `backoff`) is decided
-  by client-runtime presentation semantics. I do not own those, so I report rather than
-  edit them.
-- The change alters what a user sees while an environment is unavailable. UI.md says to
-  preserve user work, but the current "X is not connected" read-only state is
-  deliberate. Under AGENTS.md this needs a short design note approved before
-  implementation, so I will bring the loop results and a proposal back rather than ship
-  it unasked.
-- If the trigger proves to be an `offline` event tearing down a loopback desktop-local
-  connection, that is supervisor or connectivity policy in client-runtime. I report it to
-  its owner and do not fix it here.
-- If the cause is in ChatView follow/scroll code, I report it to that agent.
+- every input and Send path: the editor's `disabled` (`ChatComposer.tsx:2755-2760`),
+  type-to-focus `insertTextAtEnd` (around 2165), the collapsed mobile Send (around 1270),
+  and ChatView's silent `onSend` refusal (around 4972), which must explain itself under
+  UI.md;
+- behaviour per phase: offline (`supervisor.ts` around 779), backoff or reconnecting
+  (including prolonged remote retries), explicit disconnect, and blocked
+  identity/auth.
 
-## Files
+**Grants:**
+- ChatView composer-disable wiring (around 1708-1721 and around 4972), not follow/scroll
+  code.
+- `packages/client-runtime/src/connection/supervisor.ts`.
 
-- `apps/desktop/e2e/specs/composer-native-triggers.e2e.ts`: readiness wait, failure
-  diagnostics, recorder, comment.
-- A support helper if the diagnostics are shared, for example
-  `apps/desktop/e2e/support/ui-state.ts` or a new `composer-diagnostics.ts` with a unit
-  test.
-- Conditional: `apps/web/src/components/chat/ChatComposer.tsx` plus its tests, only
-  after the design note is approved.
-- Docs: the `docs/testing/cross-platform-validation.md` composer-native-triggers
-  paragraph (around line 600) to describe the editable-wait and diagnostics files, and
-  `docs/testing/flaky-tests.md` if it tracks this flake.
+**Docs if editor availability changes:**
+- `docs/architecture/connection-runtime.md` (around 49);
+- the composer-native-triggers paragraph in `docs/testing/cross-platform-validation.md`;
+- `docs/testing/macos-desktop.md` if commands change.
 
 ## Proof
 
-- A focused unit test for any new support helper:
-  `vp test run apps/desktop/e2e/support/<helper>.test.ts`.
-- The complete caller: the packaged `composer-native-triggers` spec passes locally on
-  macOS arm64 with the hardening, and loop 1 arm (a) shows the new diagnostics capture an
-  injected drop.
-- If the product fix lands: a ChatComposer component test showing that a
-  `reconnecting` phase leaves the editor editable and Send disabled, run with
-  `vp test run --project unit` from `apps/web`.
-- Repository gates: `vp check --no-fmt`, `vp check <changed files>`, `vp run typecheck`,
-  and `vp test run scripts/bibcode-identity.test.ts`.
+- **Loop results:** recorder logs for each arm are kept in the scratchpad and summarized
+  in the report.
+- **Full caller for any product fix:** a packaged spec injects a drop while the real
+  composer types. It asserts the DOM text, the stored draft, a disabled Send that
+  explains itself, the text surviving the reconnect, and exactly one later provider
+  delivery. It includes an offline arm and a remote-retry case, plus web component tests
+  for each changed path.
+- **macOS x64 is unverified** unless it can be run; this Mac is arm64.
+- **Gates:** `vp check --no-fmt`, `vp check <changed files>`, `vp run typecheck`, and
+  `vp test run scripts/bibcode-identity.test.ts`.
 
 ## Skipped
 
-- Changing supervisor or connectivity behaviour (not owned).
-- Collecting webview console logs in the packaged harness (a broader harness change, not
-  needed to make this failure diagnosable).
-- Re-running the six-platform CI matrix (no pushes from this batch).
+- Webview console log collection in the harness.
+- Re-running the CI matrix (no pushes from this batch).
