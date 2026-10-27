@@ -3149,7 +3149,8 @@ The fixture Codex provider then answers its diagram prompts in the timeline: a
 **Show source** swap on a diagram inside the first visible row above the top
 edge, and on one in a row wholly above the viewport, moves a reading-anchor
 paragraph by at most 1 px; a short reply's diagram drawing under its sent
-message leaves that message at the sent-row offset; and selecting an earlier
+message leaves that message within 1 px of the sent-row offset, measured from
+the scroller's top; and selecting an earlier
 message with the minimap keyboard lands it at the minimap's offset past that
 diagram and keeps it there (`mermaid-timeline-minimap-landing.json`). After a
 reply with 101 diagrams, reopening the chat draws the evicted diagram (the
@@ -3173,11 +3174,13 @@ below the composer's top; a delivery with no resting frame fails the check. The
 diagram reply must paint a rest for each delivery too, and each delivery from
 the diagram's draw on rests no lower below the composer than the plain reply's
 (or, after a delivery the plain reply painted no rest for, is revealed); the
-draw's own delivery may take 200 ms to be followed. Both replies end with the
-last line in view, resting within two lines of each other
-(`mermaid-timeline-streaming-follow.json` holds both replies' gaps and end
-positions, and, for diagnosis only, the painted frames each delivery took to
-reveal its end). Then the reader takes the timeline over with the
+draw's own delivery may take 200 ms to be followed. From settling on, neither
+reply's sent row rests more than 1 px below its offset, since following takes
+a reply taller than the view above it. Both replies end with the last line in
+view, resting within two lines of each other
+(`mermaid-timeline-streaming-follow.json` holds both replies' gaps, end and
+sent-row positions, and, for diagnosis only, the painted frames each delivery
+took to reveal its end). Then the reader takes the timeline over with the
 keyboard: after a short reply whose code block's **Copy code** button is
 mounted, a reply streams for about nine seconds; while its sent row glides
 into place, the spec focuses that button (a focus, not a press), dispatches a

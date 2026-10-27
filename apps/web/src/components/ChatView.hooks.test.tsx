@@ -1411,6 +1411,21 @@ async function sendTallReply(options: FakeLegendListOptions) {
   return { list, cleanups, messageId: sent.input.message.messageId, onAnchorReady };
 }
 
+/**
+ * Sends a message whose turn fits the view: the 600 px timeline holds the sent row and its
+ * reply, four 100 px rows from row 2 on, with the sent row mounted at its content offset.
+ */
+async function sendFittingReply(options: FakeLegendListOptions = {}) {
+  const sent = await sendTallReply({ scrollLength: 600, sentRowContentTop: 200, ...options });
+  sent.list.sentRowMessageId = sent.messageId;
+  return sent;
+}
+
+/** Lets the promise callbacks a landing chains run. */
+async function flushPromises(): Promise<void> {
+  for (let turn = 0; turn < 10; turn += 1) await Promise.resolve();
+}
+
 /** A keydown on a target inside the timeline that matches the selectors in `matches`. */
 function timelineKey(key: string, matches: readonly string[] = []) {
   return {
@@ -2201,6 +2216,111 @@ describe("ChatView effects (captured and run manually)", () => {
       expect(list.calls.scrollToOffset.at(-1), key).toEqual({ offset: 216, animated: false });
       for (const cleanup of cleanups) cleanup();
     }
+  });
+
+  it("lands a sent row that stopped short at its offset, measured on screen", async () => {
+    const { list, cleanups, messageId, onAnchorReady } = await sendFittingReply();
+    onAnchorReady(messageId, 2);
+    // The glide stopped 12 px short of 184, where the row rests 16 px below the top.
+    list.scrollNode.scrollTop = 172;
+
+    list.scrollNode.fire("scrollend");
+    await flushPromises();
+
+    expect(list.calls.scrollToOffset).toEqual([{ offset: 184, animated: false }]);
+    expect(list.scrollNode.scrollTop).toBe(184);
+    for (const cleanup of cleanups) cleanup();
+  });
+
+  it("lands the sent row the same way when the glide outlasts its timer", async () => {
+    const { list, cleanups, messageId, onAnchorReady } = await sendFittingReply();
+    onAnchorReady(messageId, 2);
+    list.scrollNode.scrollTop = 172;
+
+    runWindowTimeouts();
+    await flushPromises();
+
+    expect(list.calls.scrollToOffset).toEqual([{ offset: 184, animated: false }]);
+    for (const cleanup of cleanups) cleanup();
+  });
+
+  it("lands again when the list clamped the first landing to a lagging content height", async () => {
+    const { list, cleanups, messageId, onAnchorReady } = await sendFittingReply({
+      laggingMaxScroll: 100,
+    });
+    onAnchorReady(messageId, 2);
+
+    list.scrollNode.fire("scrollend");
+    await flushPromises();
+
+    expect(list.calls.scrollToOffset).toEqual([
+      { offset: 184, animated: false },
+      { offset: 184, animated: false },
+    ]);
+    expect(list.scrollNode.scrollTop).toBe(184);
+    for (const cleanup of cleanups) cleanup();
+  });
+
+  it("settles after its last landing even when the content height lagged both", async () => {
+    const { list, cleanups, messageId, onAnchorReady } = await sendFittingReply({
+      laggingMaxScroll: 100,
+      clampSteps: [150],
+    });
+    onAnchorReady(messageId, 2);
+
+    list.scrollNode.fire("scrollend");
+    await flushPromises();
+
+    expect(list.calls.scrollToOffset).toEqual([
+      { offset: 184, animated: false },
+      { offset: 184, animated: false },
+    ]);
+    expect(list.scrollNode.scrollTop).toBe(150);
+    // Settled: once the turn grows past the view, following reveals its end.
+    list.growRow(3, 500);
+    onRowSizeChanged()({ index: 3, previous: 100, size: 600 });
+    expect(list.calls.scrollToOffset.at(-1)).toEqual({ offset: 316, animated: false });
+    for (const cleanup of cleanups) cleanup();
+  });
+
+  it("withdraws a landing the list still holds when the reader takes over", async () => {
+    const { list, cleanups, messageId, onAnchorReady } = await sendFittingReply({
+      deferScrolls: true,
+      scrollHeight: 2_000,
+      clientHeight: 600,
+    });
+    onAnchorReady(messageId, 2);
+    list.scrollNode.scrollTop = 50;
+    list.scrollNode.fire("scrollend");
+    expect(list.calls.scrollToOffset).toEqual([{ offset: 184, animated: false }]);
+
+    list.scrollNode.fire("keydown", timelineKey("ArrowUp"));
+    list.runDeferred();
+    await flushPromises();
+
+    expect(list.calls.cancelScrollRequests).toBe(1);
+    expect(list.scrollNode.scrollTop).toBe(50);
+    expect(list.calls.scrollToOffset).toHaveLength(1);
+    for (const cleanup of cleanups) cleanup();
+  });
+
+  it("ends a held landing when a later send positions its own row", async () => {
+    const { list, cleanups, messageId, onAnchorReady } = await sendFittingReply({
+      deferScrolls: true,
+    });
+    onAnchorReady(messageId, 2);
+    list.scrollNode.fire("scrollend");
+
+    onAnchorReady(MessageId.make("later-send"), 3);
+    await flushPromises();
+    list.runDeferred();
+    await flushPromises();
+
+    // The later row's glide replaced the landing, and nothing lands the earlier row again.
+    expect(list.calls.scrollToIndex).toHaveLength(2);
+    expect(list.calls.scrollToOffset).toEqual([{ offset: 184, animated: false }]);
+    expect(list.scrollNode.scrollTop).toBe(0);
+    for (const cleanup of cleanups) cleanup();
   });
 
   it("withdraws a follow the list still holds when the reader takes over", async () => {
