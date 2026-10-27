@@ -1,5 +1,6 @@
 import { scopedThreadKey, scopeThreadRef } from "@bibcode/client-runtime/environment";
 import {
+  ACTIVITY_ID_MAX_LENGTH,
   EnvironmentId,
   ProviderDriverKind,
   ProviderInstanceId,
@@ -626,6 +627,24 @@ describe("centerPanelStore pane Activity state", () => {
       selectedRecordKind: null,
       selectedRecordId: null,
     });
+  });
+
+  it("drops a selected record id longer than an Activity id can be", () => {
+    store().navigateActivityPane(HOST, HOST_SURFACE_ID, {
+      section: "subagents",
+      selectedRecordKind: "actor",
+      selectedRecordId: "x".repeat(ACTIVITY_ID_MAX_LENGTH + 1),
+    });
+    expect(paneOf(HOST_SURFACE_ID)).toMatchObject({
+      selectedRecordKind: null,
+      selectedRecordId: null,
+    });
+    store().navigateActivityPane(HOST, HOST_SURFACE_ID, {
+      section: "subagents",
+      selectedRecordKind: "actor",
+      selectedRecordId: "x".repeat(ACTIVITY_ID_MAX_LENGTH),
+    });
+    expect(paneOf(HOST_SURFACE_ID).selectedRecordId).toHaveLength(ACTIVITY_ID_MAX_LENGTH);
   });
 
   it("ignores a pane whose surface the thread does not have", () => {

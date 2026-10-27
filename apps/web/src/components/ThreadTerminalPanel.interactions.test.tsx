@@ -2685,6 +2685,24 @@ describe("TerminalViewport mounted lifecycle", () => {
     expect(terminal.focus).toHaveBeenCalledOnce();
   });
 
+  it("leaves focus in the pane's Activity panel when using it focuses the pane", async () => {
+    const view = await mountViewport({ visible: true, autoFocus: true });
+    const terminal = view.fakeTerminal!;
+    const viewport = document.querySelector("[data-terminal-xterm-mount]")!.parentElement!;
+    const host = document.createElement("div");
+    host.setAttribute("data-provider-terminal-activity-host", "term-1");
+    const panelButton = document.createElement("button");
+    host.append(panelButton);
+    viewport.append(host);
+    panelButton.focus();
+
+    await view.flushFrame();
+
+    expect(terminal.focus).not.toHaveBeenCalled();
+    expect(document.activeElement).toBe(panelButton);
+    host.remove();
+  });
+
   it("focuses after a delayed attach runtime mounts the active renderer", async () => {
     const view = await mountViewport({
       visible: true,

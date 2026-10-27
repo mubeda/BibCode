@@ -8,8 +8,8 @@ import {
   type ComponentProps,
   type KeyboardEvent as ReactKeyboardEvent,
   useCallback,
-  useEffect,
   useId,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -44,9 +44,10 @@ export interface ActivityPaneProps {
   readonly acceptSnapshot?: (snapshot: ActivitySnapshot) => boolean;
 }
 
+/** Measured before paint, so an open panel never renders a frame at the wrong height. */
 function usePaneHeight(element: HTMLElement | null): number | null {
   const [height, setHeight] = useState<number | null>(null);
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (element === null) return;
     const measure = () => {
       const next = Math.round(element.getBoundingClientRect().height);
@@ -81,17 +82,7 @@ function ActivityPaneBody(
  * first render, so a reload restores them without an arriving record or any
  * effect deciding it, and without taking focus.
  */
-export function ActivityPane({
-  target,
-  paneOwnerRef,
-  paneId,
-  compact,
-  alwaysVisible,
-  paneElement,
-  acceptSnapshot,
-}: ActivityPaneProps) {
-  const bodyId = useId();
-  const cardRef = useRef<HTMLDivElement>(null);
+export function ActivityPane({ target, acceptSnapshot, ...card }: ActivityPaneProps) {
   const stateValueAtom = useMemo(() => environmentActivity.stateValueAtom(target), [target]);
   const activityState =
     useAtomValue(stateValueAtom) ?? (EMPTY_ENVIRONMENT_ACTIVITY_STATE as EnvironmentActivityState);
@@ -100,29 +91,54 @@ export function ActivityPane({
     rawSnapshot !== null && (acceptSnapshot === undefined || acceptSnapshot(rawSnapshot))
       ? rawSnapshot
       : null;
+  return <ActivityPaneCard {...card} snapshot={snapshot} target={target} />;
+}
+
+function ActivityPaneCard({
+  target,
+  snapshot,
+  paneOwnerRef,
+  paneId,
+  compact,
+  alwaysVisible,
+  paneElement,
+}: Omit<ActivityPaneProps, "acceptSnapshot"> & { readonly snapshot: ActivitySnapshot | null }) {
+  const bodyId = useId();
+  const cardRef = useRef<HTMLDivElement>(null);
   const paneState = useCenterPanelStore((state) =>
     selectActivityPaneState(state.activityPanes, paneOwnerRef, paneId),
   );
+  const expanded = paneState.expanded;
   const [focusRequested, setFocusRequested] = useState(false);
   // Only an open panel needs its pane's height, so a closed one observes nothing.
-  const paneHeight = usePaneHeight(paneState.expanded ? paneElement : null);
+  const paneHeight = usePaneHeight(expanded ? paneElement : null);
 
   // The card follows the rule for when the Activity button appears; the saved
   // open or closed state applies from the render in which it first appears.
   const shown =
     snapshot !== null && selectActivityDockVisibility(snapshot, { alwaysVisible }).visible;
+  // An open card keeps its last snapshot while the snapshot is briefly gone,
+  // such as during a reconnect, so focus, the open record, and scroll survive.
+  // A snapshot that says to hide (no records) still hides it.
+  const [heldSnapshot, setHeldSnapshot] = useState<ActivitySnapshot | null>(null);
+  const holding = expanded && snapshot === null;
+  const nextHeldSnapshot = !expanded ? null : shown ? snapshot : holding ? heldSnapshot : null;
+  if (nextHeldSnapshot !== heldSnapshot) {
+    setHeldSnapshot(nextHeldSnapshot);
+  }
+  const displayedSnapshot = shown ? snapshot : holding ? heldSnapshot : null;
 
   const onToggle = useCallback(
     (section: ActivitySection) => {
       const store = useCenterPanelStore.getState();
-      if (paneState.expanded) {
+      if (expanded) {
         store.setActivityPaneExpanded(paneOwnerRef, paneId, false);
         return;
       }
       store.setActivityPaneExpanded(paneOwnerRef, paneId, true, section);
       setFocusRequested(true);
     },
-    [paneId, paneOwnerRef, paneState.expanded],
+    [expanded, paneId, paneOwnerRef],
   );
   const onNavigate = useCallback(
     (route: ActivityPaneRoute) =>
@@ -132,7 +148,7 @@ export function ActivityPane({
   const onFocusRequestHandled = useCallback(() => setFocusRequested(false), []);
   const onKeyDown = useCallback(
     (event: ReactKeyboardEvent<HTMLDivElement>) => {
-      if (event.key !== "Escape" || event.defaultPrevented || !paneState.expanded) return;
+      if (event.key !== "Escape" || event.defaultPrevented || !expanded) return;
       const body = cardRef.current?.querySelector(`[id="${CSS.escape(bodyId)}"]`);
       if (!(event.target instanceof Node) || !body?.contains(event.target)) return;
       event.preventDefault();
@@ -142,22 +158,21 @@ export function ActivityPane({
         ?.querySelector<HTMLButtonElement>('[data-testid="activity-dock"] button')
         ?.focus();
     },
-    [bodyId, paneId, paneOwnerRef, paneState.expanded],
+    [bodyId, expanded, paneId, paneOwnerRef],
+  );
+  const { section, selectedRecordKind, selectedRecordId } = paneState;
+  const route = useMemo<ActivityPaneRoute>(
+    () => ({ section, selectedRecordKind, selectedRecordId }),
+    [section, selectedRecordId, selectedRecordKind],
   );
 
-  if (!shown || snapshot === null) {
+  if (displayedSnapshot === null) {
     return null;
   }
-  const route: ActivityPaneRoute = {
-    section: paneState.section,
-    selectedRecordKind: paneState.selectedRecordKind,
-    selectedRecordId: paneState.selectedRecordId,
-  };
   const bodyHeight =
     paneHeight === null
       ? `${ACTIVITY_PANE_BODY_MAX_REM}rem`
       : `min(${ACTIVITY_PANE_BODY_MAX_REM}rem, ${Math.floor(paneHeight * ACTIVITY_PANE_BODY_MAX_SHARE)}px)`;
-  const expanded = paneState.expanded;
 
   return (
     <div
@@ -184,12 +199,12 @@ export function ActivityPane({
         </div>
       ) : null}
       <ActivityDock
-        alwaysVisible={alwaysVisible}
+        alwaysVisible={alwaysVisible || holding}
         compact={compact}
         {...(expanded ? { controlsId: bodyId } : {})}
         expanded={expanded}
         onToggle={onToggle}
-        snapshot={snapshot}
+        snapshot={displayedSnapshot}
       />
     </div>
   );

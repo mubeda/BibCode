@@ -381,6 +381,33 @@ describe("ProviderTerminalActivityDock", () => {
     expect(document.activeElement).toBe(document.body);
   });
 
+  it("keeps an open card and its focus through a moment the snapshot drops away", async () => {
+    state.activityState = activityState(snapshot("terminal-codex"));
+    useCenterPanelStore
+      .getState()
+      .setActivityPaneExpanded(threadRef, "terminal:terminal-codex", true, "subagents");
+    const tree = await mount(dock());
+    const panel = tree.container.querySelector<HTMLElement>("[data-activity-panel]")!;
+    panel.tabIndex = -1;
+    panel.focus();
+
+    await publishActivityState(activityState(null, "synchronizing"));
+
+    expect(tree.container.querySelector("[data-activity-panel]")).toBe(panel);
+    expect(document.activeElement).toBe(panel);
+
+    await publishActivityState(activityState(snapshot("terminal-codex")));
+    expect(tree.container.querySelector("[data-activity-panel]")).toBe(panel);
+
+    await publishActivityState(activityState(null, "synchronizing"));
+    await act(async () => {
+      tree.container
+        .querySelector<HTMLButtonElement>('[data-testid="activity-dock"] button')!
+        .click();
+    });
+    expect(tree.container.querySelector("[data-activity-pane]")).toBeNull();
+  });
+
   it("shows no card for a saved open panel whose terminal has no records", async () => {
     useCenterPanelStore
       .getState()
