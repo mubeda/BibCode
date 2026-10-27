@@ -10,6 +10,7 @@ import {
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
+import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 import { RpcClientError } from "effect/rpc";
@@ -25,6 +26,7 @@ import type { WsRpcProtocolClient } from "../rpc/protocol.ts";
 import type * as RpcSession from "../rpc/session.ts";
 import { DiagnosticLogsAssembler, downloadDiagnosticLogs } from "./logs.ts";
 
+const decodeNumber = Schema.decodeUnknownEffect(Schema.Number);
 const STORAGE_ID = "8d5c2f63-9a0e-4d7c-b1a4-3f6e2a9d0c11";
 const TARGET = new BearerConnectionTarget({
   environmentId: EnvironmentId.make(`remote:${STORAGE_ID}`),
@@ -243,6 +245,43 @@ describe("downloadDiagnosticLogs", () => {
       expect(error.reason).toBe("crash-dumps-refused");
     }),
   );
+
+  it.effect("tells a too-large download to drop crash dumps only when it asked for them", () =>
+    Effect.gen(function* () {
+      const tooLarge = () =>
+        Stream.fail({ _tag: "DiagnosticLogsError", reason: "too-large", message: "big" });
+      const withDumps = yield* run(yield* makeHarness(downloadClient(tooLarge).client), true);
+      expect(withDumps.message).toBe(
+        "Omarchy's logs are over the 20 MiB download limit. Turn off Include crash dumps and try again.",
+      );
+      const without = yield* run(yield* makeHarness(downloadClient(tooLarge).client), false);
+      expect(without.reason).toBe("too-large");
+      expect(without.message).not.toContain("crash dumps");
+    }),
+  );
+
+  it.effect("reports an item that does not decode as an incomplete archive", () =>
+    Effect.gen(function* () {
+      // What the RPC client does with a chunk that fails its schema: a defect.
+      const schemaError = yield* Effect.flip(decodeNumber("x"));
+      const { client } = downloadClient(() => Stream.die(schemaError));
+      expect((yield* run(yield* makeHarness(client))).reason).toBe("incomplete");
+    }),
+  );
+
+  it.effect("reports any other defect as the server's failure, not a lost connection", () =>
+    Effect.gen(function* () {
+      const { client } = downloadClient(() => Stream.die(new Error("boom")));
+      expect((yield* run(yield* makeHarness(client))).reason).toBe("server-failed");
+    }),
+  );
+
+  it.effect("reports an interrupted stream as a lost connection", () =>
+    Effect.gen(function* () {
+      const { client } = downloadClient(() => Stream.fromEffect(Effect.interrupt));
+      expect((yield* run(yield* makeHarness(client))).reason).toBe("connection-lost");
+    }),
+  );
 });
 
 describe("DiagnosticLogsAssembler", () => {
@@ -257,7 +296,8 @@ describe("DiagnosticLogsAssembler", () => {
   it("refuses an item longer than the item bound before decoding it", () => {
     const assembler = new DiagnosticLogsAssembler("Omarchy", STORAGE_ID);
     expect(start(assembler, 2 * DIAGNOSTIC_LOGS_CHUNK_BYTES)).toBeNull();
-    const oversized = base64(new Uint8Array(DIAGNOSTIC_LOGS_CHUNK_BYTES + 3));
+    // One byte over the bound: 524,289 bytes, whose base64 is no longer than a full item's.
+    const oversized = base64(new Uint8Array(DIAGNOSTIC_LOGS_CHUNK_BYTES + 1));
     const originalAtob = globalThis.atob;
     let decoded = 0;
     globalThis.atob = (data: string) => {
