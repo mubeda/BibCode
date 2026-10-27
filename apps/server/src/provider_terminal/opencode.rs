@@ -25,7 +25,7 @@ use tokio::{
 
 #[cfg(test)]
 use super::TerminalObserverGeneration;
-use super::model::TerminalObserverGenerationLease;
+use super::model::{TerminalAgentState, TerminalObserverGenerationLease};
 use super::{
     NativeTerminalCommand, PreparedTerminalLaunch, PreparedTerminalObserver,
     ProviderTerminalObserverFactory, ProviderTerminalObserverFactoryInput,
@@ -396,6 +396,14 @@ pub trait OpenCodeEventStream: Send {
     fn discard_next(&mut self) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>>;
 
     fn next_data(&mut self) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send + '_>>;
+
+    /// The next event while AI Terminal activity is dormant. Only the agent's left-panel status
+    /// reads its data (#187); a stream that cannot hand it over discards it, as before.
+    fn next_dormant_data(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>, String>> + Send + '_>> {
+        Box::pin(async move { self.discard_next().await.map(|()| None) })
+    }
 }
 
 pub trait OpenCodeRemoteClient: Send {
@@ -630,7 +638,9 @@ impl OpenCodeTerminalObserverFactory {
                 handshake_timeout: self.handshake_timeout,
                 reattach_timeout: self.reattach_timeout,
                 spawned: AtomicBool::new(false),
-                activity: Arc::new(TerminalAgentActivityControl::enabled()),
+                activity: Arc::new(TerminalAgentActivityControl::with_enabled(
+                    input.activity_enabled,
+                )),
             }),
         };
         let directory = input.launch.cwd.to_string_lossy().into_owned();
@@ -1287,8 +1297,17 @@ async fn run_opencode_observer(
                         changed = activity.changed() => {
                             OpenCodeObserverEvent::ActivityChanged(changed.is_ok())
                         }
-                        discarded = current_stream.discard_next() => {
-                            OpenCodeObserverEvent::Discard(discarded)
+                        // Dormant activity still reads the root agent's state (#187).
+                        data = current_stream.next_dormant_data() => {
+                            OpenCodeObserverEvent::Discard(data.map(|data| {
+                                if let Some(data) = data {
+                                    publish_opencode_agent_status(
+                                        &generation,
+                                        &root_session_id,
+                                        &data,
+                                    );
+                                }
+                            }))
                         }
                     }
                 }
@@ -1430,6 +1449,7 @@ async fn run_opencode_observer(
                 }
             }
             OpenCodeObserverEvent::Data(Ok(data)) => {
+                publish_opencode_agent_status(&generation, &root_session_id, &data);
                 let Some(state) = live_state else {
                     continue;
                 };
@@ -1478,6 +1498,46 @@ async fn run_opencode_observer(
             OpenCodeObserverEvent::Discard(Ok(())) => {}
         }
     }
+}
+
+/// Publishes the root session's state an OpenCode event reports, for the left panel (#187).
+fn publish_opencode_agent_status(
+    generation: &TerminalObserverGenerationLease,
+    root_session_id: &str,
+    data: &[u8],
+) {
+    if let Ok(event) = serde_json::from_slice::<Value>(data)
+        && let Some((state, failed)) = opencode_root_agent_status(&event, root_session_id)
+    {
+        generation.publish_agent_status(state, failed);
+    }
+}
+
+/// The root session's state an OpenCode event reports: busy or idle, an open permission ask
+/// (blocked) or question (waiting), or an error. Child sessions leave it alone.
+pub(super) fn opencode_root_agent_status(
+    event: &Value,
+    root_session_id: &str,
+) -> Option<(TerminalAgentState, bool)> {
+    let properties = event.get("properties")?;
+    if properties.get("sessionID")?.as_str()? != root_session_id {
+        return None;
+    }
+    Some(match event.get("type")?.as_str()? {
+        "session.status" => match properties.pointer("/status/type")?.as_str()? {
+            "busy" | "retry" => (TerminalAgentState::Working, false),
+            "idle" => (TerminalAgentState::Done, false),
+            _ => return None,
+        },
+        "session.idle" => (TerminalAgentState::Done, false),
+        "session.error" => (TerminalAgentState::Done, true),
+        "permission.asked" | "permission.updated" => (TerminalAgentState::Blocked, false),
+        "question.asked" => (TerminalAgentState::Waiting, false),
+        "permission.replied" | "question.replied" | "question.rejected" => {
+            (TerminalAgentState::Working, false)
+        }
+        _ => return None,
+    })
 }
 
 fn mark_opencode_observation(
@@ -3449,6 +3509,12 @@ impl OpenCodeEventStream for SystemOpenCodeEventStream {
             }
         })
     }
+
+    fn next_dormant_data(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>, String>> + Send + '_>> {
+        Box::pin(async move { self.next_data().await.map(Some) })
+    }
 }
 
 /// OpenCode 2's event stream as the OpenCode 1 events the activity tracker consumes. One V2 event
@@ -3488,6 +3554,12 @@ impl OpenCodeEventStream for OpenCodeV2EventStream {
                 );
             }
         })
+    }
+
+    fn next_dormant_data(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>, String>> + Send + '_>> {
+        Box::pin(async move { self.next_data().await.map(Some) })
     }
 }
 

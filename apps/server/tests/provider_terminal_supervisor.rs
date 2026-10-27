@@ -66,7 +66,7 @@ use bibcode_server::{
         ProviderSettingsInventoryAuthority, ProviderTerminalActivitySupervisor,
         ProviderTerminalInventory, ProviderTerminalInventoryAuthority,
         ProviderTerminalObserverFactories, ProviderTerminalObserverFactory,
-        ProviderTerminalObserverFactoryInput, TerminalAgentActivityTransition,
+        ProviderTerminalObserverFactoryInput, TerminalAgentActivityTransition, TerminalAgentState,
         TerminalGenerationActivityPublisher, TerminalLaunchPreparation,
         TerminalLaunchPreparationInput, TerminalLaunchPreparer, TerminalObserverCancellationReason,
         TerminalObserverGeneration, TerminalObserverGenerationLease, TerminalObserverWorkerContext,
@@ -75,8 +75,8 @@ use bibcode_server::{
     server_settings::{ProviderInstanceState, ProviderSettingsState, ProviderSettingsStore},
     terminal::{
         ProviderTerminalActivityLaunch, PtyBackend, PtyExit, PtyProcess, PtySpawnInput,
-        TerminalLaunchCommand, TerminalManager, TerminalManagerOptions, TerminalOpenInput,
-        TerminalStatus,
+        TerminalAgentStatusState, TerminalLaunchCommand, TerminalManager, TerminalManagerOptions,
+        TerminalMetadataEvent, TerminalOpenInput, TerminalStatus,
     },
 };
 use serde_json::Value;
@@ -741,15 +741,20 @@ impl ProviderTerminalInventoryAuthority for CountingInventoryAuthority {
 #[derive(Debug, Default)]
 struct CountingProviderFactory {
     prepare_calls: AtomicUsize,
+    /// How many preparations ran with AI Terminal activity on.
+    activity_enabled_calls: AtomicUsize,
 }
 
 impl ProviderTerminalObserverFactory for CountingProviderFactory {
     fn prepare(
         &self,
-        _input: ProviderTerminalObserverFactoryInput,
+        input: ProviderTerminalObserverFactoryInput,
     ) -> Pin<Box<dyn Future<Output = Option<PreparedTerminalLaunch>> + Send + '_>> {
         Box::pin(async move {
             self.prepare_calls.fetch_add(1, Ordering::AcqRel);
+            if input.activity_enabled {
+                self.activity_enabled_calls.fetch_add(1, Ordering::AcqRel);
+            }
             None
         })
     }
@@ -8745,7 +8750,7 @@ fn claude_pinning_open_input(
 }
 
 #[tokio::test]
-async fn agent_activity_toggle_disabled_launch_is_pure_pass_through() {
+async fn agent_activity_toggle_disabled_launch_still_prepares_the_status_observer() {
     let fixture = tempfile::tempdir().expect("fixture root");
     let configured = fixture.path().join("configured-codex");
     std::fs::write(&configured, b"configured").expect("configured binary");
@@ -8798,12 +8803,19 @@ async fn agent_activity_toggle_disabled_launch_is_pure_pass_through() {
         })
         .await;
 
+    // The agent's left-panel status needs the observer whatever the activity setting says
+    // (#187); the setting only decides whether it also publishes activity.
     assert!(matches!(
         preparation,
         TerminalLaunchPreparation::PassThrough
     ));
-    assert_eq!(authority.calls.load(Ordering::Acquire), 0);
-    assert_eq!(factory.prepare_calls.load(Ordering::Acquire), 0);
+    assert_eq!(authority.calls.load(Ordering::Acquire), 1);
+    assert_eq!(factory.prepare_calls.load(Ordering::Acquire), 1);
+    assert_eq!(
+        factory.activity_enabled_calls.load(Ordering::Acquire),
+        0,
+        "the observer launches with activity dormant"
+    );
 }
 
 #[tokio::test]
@@ -9280,8 +9292,9 @@ async fn agent_activity_toggle_terminal_launched_disabled_stays_uninstrumented_a
     });
     manager.open(input).await.expect("pass-through terminal");
     assert_eq!(backend.spawns()[0].executable, configured.to_string_lossy());
-    assert_eq!(authority.calls.load(Ordering::Acquire), 0);
-    assert_eq!(factory.prepare_calls.load(Ordering::Acquire), 0);
+    // The status observer is prepared at launch (#187); this factory declines it.
+    assert_eq!(authority.calls.load(Ordering::Acquire), 1);
+    assert_eq!(factory.prepare_calls.load(Ordering::Acquire), 1);
 
     controller.enable();
     assert_eq!(
@@ -9290,7 +9303,7 @@ async fn agent_activity_toggle_terminal_launched_disabled_stays_uninstrumented_a
     );
     assert_eq!(
         factory.prepare_calls.load(Ordering::Acquire),
-        0,
+        1,
         "re-enable never retrofits a pass-through terminal"
     );
     assert!(!backend.latest().killed.load(Ordering::Acquire));
@@ -10007,6 +10020,14 @@ fn claude_hook_launch(backend: &RecordingBackend) -> (String, String, String, st
             "PreToolUse",
             "SubagentStart",
             "SubagentStop",
+            // The main agent's state for the left panel (#187).
+            "Notification",
+            "PermissionRequest",
+            "SessionEnd",
+            "SessionStart",
+            "Stop",
+            "StopFailure",
+            "UserPromptSubmit",
         ]
         .into_iter()
         .map(str::to_owned)
@@ -10395,7 +10416,7 @@ async fn claude_hook_sink_rejects_wrong_credentials_session_content_type_and_siz
             &token,
             &correlation,
             serde_json::json!({
-                "hook_event_name": "SessionStart",
+                "hook_event_name": "PreCompact",
                 "session_id": "claude-root-session"
             }),
         )
@@ -10403,6 +10424,22 @@ async fn claude_hook_sink_rejects_wrong_credentials_session_content_type_and_siz
         .status(),
         reqwest::StatusCode::BAD_REQUEST,
         "an unconfigured hook event must not establish root correlation"
+    );
+    // A status hook only reports the main agent's state (#187): it never reaches activity.
+    assert_eq!(
+        post_claude_hook(
+            &endpoint,
+            &token,
+            &correlation,
+            serde_json::json!({
+                "hook_event_name": "SessionStart",
+                "session_id": "claude-root-session"
+            }),
+        )
+        .await
+        .status(),
+        reqwest::StatusCode::NO_CONTENT,
+        "a status hook is acknowledged without establishing root correlation"
     );
     assert!(
         projection.snapshot(&scope).await.is_err(),
@@ -14963,4 +15000,201 @@ async fn opencode_refused_observer_worker_keeps_the_attach_session_and_its_root(
     );
     manager.shutdown().await;
     isolated.complete();
+}
+
+/// A factory whose observer reports the agent waiting for an answer as soon as it spawns.
+#[derive(Debug, Default)]
+struct StatusReportingFactory {
+    activity_enabled: AtomicUsize,
+}
+
+impl ProviderTerminalObserverFactory for StatusReportingFactory {
+    fn prepare(
+        &self,
+        input: ProviderTerminalObserverFactoryInput,
+    ) -> Pin<Box<dyn Future<Output = Option<PreparedTerminalLaunch>> + Send + '_>> {
+        Box::pin(async move {
+            if input.activity_enabled {
+                self.activity_enabled.fetch_add(1, Ordering::AcqRel);
+            }
+            Some(PreparedTerminalLaunch {
+                executable: input.launch.executable,
+                args: input.launch.args,
+                private_env: BTreeMap::new(),
+                observer: Box::new(StatusReportingObserver),
+            })
+        })
+    }
+}
+
+#[derive(Debug)]
+struct StatusReportingObserver;
+
+impl PreparedTerminalObserver for StatusReportingObserver {
+    fn on_spawned(
+        &self,
+        _pid: u32,
+        generation: TerminalObserverGenerationLease,
+        _workers: TerminalObserverWorkerContext,
+    ) {
+        generation.publish_agent_status(TerminalAgentState::Waiting, false);
+    }
+
+    fn diagnostic_label(&self) -> &str {
+        "status-reporting-observer"
+    }
+}
+
+/// Waits for the terminal's metadata to report `expected`, returning whether it failed.
+async fn next_agent_status(
+    metadata: &mut bibcode_server::terminal::TerminalMetadataAttachment,
+    terminal_id: &str,
+    expected: TerminalAgentStatusState,
+) -> bool {
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            if let Some(TerminalMetadataEvent::Upsert { terminal }) = metadata.recv().await
+                && terminal.terminal_id == terminal_id
+                && let Some(status) = terminal.agent_status
+                && status.state == expected
+            {
+                return status.failed;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{terminal_id} never reported {expected:?}"))
+}
+
+fn agent_status_of(
+    summaries: &[bibcode_server::terminal::TerminalSummary],
+    terminal_id: &str,
+) -> Option<TerminalAgentStatusState> {
+    summaries
+        .iter()
+        .find(|summary| summary.terminal_id == terminal_id)
+        .and_then(|summary| summary.agent_status.as_ref())
+        .map(|status| status.state)
+}
+
+#[tokio::test]
+async fn ai_terminal_status_reaches_metadata_with_activity_off_and_settles_on_exit() {
+    let fixture = tempfile::tempdir().expect("fixture root");
+    let configured = fixture.path().join("configured-codex");
+    std::fs::write(&configured, b"configured").expect("configured binary");
+    let mut settings = ProviderSettingsState::default();
+    settings.providers.codex.binary_path = configured.to_string_lossy().into_owned();
+    let authority = Arc::new(CountingInventoryAuthority {
+        calls: AtomicUsize::new(0),
+        inventory: ProviderTerminalInventory::from_settings(&settings),
+    });
+    let factory = Arc::new(StatusReportingFactory::default());
+    let database = Database::open_in_memory().await.expect("database");
+    database
+        .call(|connection| {
+            run_migrations(connection, None)?;
+            Ok(())
+        })
+        .await
+        .expect("migrations");
+    // AI Terminal activity is off, as it is by default.
+    let controller = AgentActivityController::new(false);
+    let projection =
+        ActivityProjection::with_controller(ActivityRepository::new(database), controller.clone());
+    let supervisor = ProviderTerminalActivitySupervisor::new_with_authority(
+        authority,
+        controller,
+        projection,
+        ProcessAttributionRegistry::new(),
+        fixture.path().join("runtime"),
+        ProviderTerminalObserverFactories {
+            codex: Some(factory.clone()),
+            ..ProviderTerminalObserverFactories::default()
+        },
+    )
+    .expect("supervisor");
+    let backend = Arc::new(RecordingBackend::new(Arc::new(Mutex::new(Vec::new()))));
+    let manager = TerminalManager::new(
+        backend.clone(),
+        TerminalManagerOptions {
+            launch_preparer: Some(Arc::new(supervisor)),
+            ..TerminalManagerOptions::default()
+        },
+    );
+    let mut metadata = manager.subscribe_metadata().await;
+    let launch = |terminal_id: &str, driver_kind: &str| {
+        let mut input = TerminalOpenInput::new(
+            "thread-status",
+            terminal_id,
+            fixture.path().to_path_buf(),
+            80,
+            24,
+        );
+        input.command = Some(TerminalLaunchCommand {
+            executable: configured.to_string_lossy().into_owned(),
+            args: Vec::new(),
+            label: Some("Agent".to_owned()),
+            activity: Some(ProviderTerminalActivityLaunch {
+                driver_kind: driver_kind.to_owned(),
+                provider_instance_id: driver_kind.to_owned(),
+            }),
+            env: None,
+        });
+        input
+    };
+
+    manager
+        .open(launch("terminal-codex", "codex"))
+        .await
+        .expect("observed terminal");
+    assert_eq!(
+        factory.activity_enabled.load(Ordering::Acquire),
+        0,
+        "the status observer launches with activity dormant"
+    );
+    assert!(
+        !next_agent_status(
+            &mut metadata,
+            "terminal-codex",
+            TerminalAgentStatusState::Waiting
+        )
+        .await,
+        "the observer's report reaches every client's metadata"
+    );
+    let observed = backend.latest();
+
+    // A provider with no observer here (Cursor, or any provider on Windows) is unavailable,
+    // never working or done, and stays so when it exits.
+    manager
+        .open(launch("terminal-cursor", "cursor"))
+        .await
+        .expect("unobserved terminal");
+    assert_eq!(
+        agent_status_of(
+            &manager.subscribe_metadata().await.initial,
+            "terminal-cursor"
+        ),
+        Some(TerminalAgentStatusState::Unavailable)
+    );
+    backend.latest().exit(0);
+
+    observed.exit(1);
+    assert!(
+        next_agent_status(
+            &mut metadata,
+            "terminal-codex",
+            TerminalAgentStatusState::Done
+        )
+        .await,
+        "an agent that exits with an error ends Done and failed"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        agent_status_of(
+            &manager.subscribe_metadata().await.initial,
+            "terminal-cursor"
+        ),
+        Some(TerminalAgentStatusState::Unavailable)
+    );
+    manager.shutdown().await;
 }

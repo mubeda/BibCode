@@ -22,6 +22,7 @@ use super::{
     TerminalRemovalReason, TerminalRestartInput, TerminalSessionSnapshot, TerminalSize,
     TerminalStatus, TerminalSummary, history::TerminalHistory,
 };
+use super::{TerminalAgentStatus, TerminalAgentStatusState};
 use crate::{
     diagnostics::{
         AttributionKind, AttributionScope, NativeProcessSampler, ProcessAttributionRegistry,
@@ -31,9 +32,10 @@ use crate::{
     },
     process::{Platform, ProcessCleanupReport, ShellCandidate, resolve_shell_candidates},
     provider_terminal::{
-        PreparedTerminalObserver, TerminalAgentActivityTransition, TerminalLaunchPreparation,
-        TerminalLaunchPreparationInput, TerminalLaunchPreparer, TerminalObserverCancellationReason,
-        TerminalObserverGeneration, TerminalObserverGenerationLease,
+        PreparedTerminalObserver, TerminalAgentActivityTransition, TerminalAgentObservation,
+        TerminalAgentState, TerminalLaunchPreparation, TerminalLaunchPreparationInput,
+        TerminalLaunchPreparer, TerminalObserverCancellationReason, TerminalObserverGeneration,
+        TerminalObserverGenerationLease,
     },
 };
 
@@ -265,7 +267,59 @@ struct Session {
     /// The executable the current process was spawned from, and when.
     executable: String,
     started: std::time::Instant,
+    /// An AI Terminal's agent state for the left panel (#187): `None` for a plain shell,
+    /// unavailable when no observer reports it, else its observer's last report.
+    agent_status: Option<SessionAgentStatus>,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SessionAgentStatus {
+    Unavailable,
+    /// Observed, before its first report: a fresh agent waits for its first prompt.
+    Ready,
+    Observed(TerminalAgentObservation),
+    /// The agent's process ended.
+    Exited {
+        failed: bool,
+    },
+}
+
+impl SessionAgentStatus {
+    fn summary(self) -> TerminalAgentStatus {
+        let (state, failed, observation) = match self {
+            Self::Unavailable => (TerminalAgentStatusState::Unavailable, false, None),
+            Self::Ready => (TerminalAgentStatusState::Done, false, None),
+            Self::Exited { failed } => (TerminalAgentStatusState::Done, failed, None),
+            Self::Observed(observation) => (
+                match observation.state {
+                    TerminalAgentState::Working => TerminalAgentStatusState::Working,
+                    TerminalAgentState::Blocked => TerminalAgentStatusState::Blocked,
+                    TerminalAgentState::Waiting => TerminalAgentStatusState::Waiting,
+                    TerminalAgentState::Done => TerminalAgentStatusState::Done,
+                },
+                observation.failed,
+                Some(observation),
+            ),
+        };
+        TerminalAgentStatus {
+            state,
+            failed,
+            age_ms: observation.map(|observation| {
+                u64::try_from(observation.observed_at.elapsed().as_millis()).unwrap_or(u64::MAX)
+            }),
+            observed_at: observation.and_then(|observation| {
+                OffsetDateTime::from(observation.observed_wall)
+                    .format(&Rfc3339)
+                    .ok()
+            }),
+        }
+    }
+}
+
+/// How often an unchanged Working report refreshes the published age: often enough that the
+/// left panel's 30-minute staleness is measured from recent evidence, rarely enough that a busy
+/// agent's tool calls do not flood the metadata stream.
+const AGENT_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
 /// What a replacement process keeps from the session it replaces.
 #[derive(Default)]
@@ -1606,6 +1660,7 @@ impl Session {
             updated_at: self.updated_at.clone(),
             center_panel: self.center_panel,
             command: self.command.clone(),
+            agent_status: self.agent_status.map(SessionAgentStatus::summary),
         }
     }
 
@@ -2251,6 +2306,8 @@ impl TerminalManager {
                 return Err(invalidated_creation_error(&input));
             }
             private_values.clear();
+            // The original command runs unobserved.
+            command_was_prepared = false;
             let Some((original, args, env)) = original_command_candidate else {
                 return Err(TerminalError::Io(
                     "prepared terminal launch has no original command".to_owned(),
@@ -2398,6 +2455,19 @@ impl TerminalManager {
             command: input.command.clone(),
             executable,
             started: std::time::Instant::now(),
+            // A launch naming its provider is an AI Terminal: observed when an observer was
+            // prepared for it, else its status is unavailable (#187).
+            agent_status: input
+                .command
+                .as_ref()
+                .and_then(|command| command.activity.as_ref())
+                .map(|_| {
+                    if command_was_prepared {
+                        SessionAgentStatus::Ready
+                    } else {
+                        SessionAgentStatus::Unavailable
+                    }
+                }),
         }));
         let _lifecycle = self.inner.lifecycle.lock().await;
         let _publication = generation.publication.lock().await;
@@ -2646,6 +2716,8 @@ impl TerminalManager {
             }
         });
 
+        Self::mirror_agent_status(&inner, &session, &generation);
+
         let activity_cancel = inner.cancellation.child_token();
         let activity_session = session;
         let activity_inner = inner.clone();
@@ -2714,6 +2786,69 @@ impl TerminalManager {
         });
     }
 
+    /// Mirrors the generation observer's agent status into the terminal's metadata summary, so
+    /// every client's left panel follows it (#187). A changed state publishes at once; an
+    /// unchanged report refreshes the published age at most once a minute. The terminal event
+    /// stream is untouched: status is metadata, not output.
+    fn mirror_agent_status(
+        inner: &Arc<Inner>,
+        session: &SharedSession,
+        generation: &Arc<SessionGeneration>,
+    ) {
+        let mut reports = generation
+            .observation
+            .observation()
+            .subscribe_agent_status();
+        // A report the observer made while the process was spawning is mirrored too.
+        reports.mark_changed();
+        let cancel = inner.cancellation.child_token();
+        let inner = inner.clone();
+        let session = session.clone();
+        let generation = generation.clone();
+        tokio::spawn(async move {
+            let mut published: Option<TerminalAgentObservation> = None;
+            loop {
+                tokio::select! {
+                    () = cancel.cancelled() => return,
+                    () = generation.cancellation.cancelled() => return,
+                    changed = reports.changed() => if changed.is_err() { return; },
+                }
+                let Some(observation) = *reports.borrow_and_update() else {
+                    continue;
+                };
+                if published.is_some_and(|previous| {
+                    previous.state == observation.state
+                        && previous.failed == observation.failed
+                        && observation
+                            .observed_at
+                            .saturating_duration_since(previous.observed_at)
+                            < AGENT_STATUS_REFRESH_INTERVAL
+                }) {
+                    continue;
+                }
+                let _publication = generation.publication.lock().await;
+                if generation.is_invalidated() {
+                    return;
+                }
+                let summary = {
+                    let mut session = session.lock().await;
+                    if session.status != TerminalStatus::Running {
+                        return;
+                    }
+                    if session.agent_status.is_none() {
+                        continue;
+                    }
+                    session.agent_status = Some(SessionAgentStatus::Observed(observation));
+                    session.summary()
+                };
+                published = Some(observation);
+                let _ = inner.metadata.send(TerminalMetadataEvent::Upsert {
+                    terminal: Box::new(summary),
+                });
+            }
+        });
+    }
+
     async fn finalize_process_exit(
         inner: &Arc<Inner>,
         session: &SharedSession,
@@ -2755,6 +2890,15 @@ impl TerminalManager {
             session.exit_signal = exit.signal;
             session.has_running_subprocess = false;
             session.child_command_label = None;
+            // An unobserved agent stays unavailable: BiBCode never saw it finish its work.
+            if session
+                .agent_status
+                .is_some_and(|status| status != SessionAgentStatus::Unavailable)
+            {
+                session.agent_status = Some(SessionAgentStatus::Exited {
+                    failed: exit.exit_code.is_some_and(|code| code != 0),
+                });
+            }
             let sequence = session.advance();
             (
                 TerminalEvent::Exited {
