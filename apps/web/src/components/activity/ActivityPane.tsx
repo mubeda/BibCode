@@ -104,7 +104,8 @@ export function ActivityPane({
     selectActivityPaneState(state.activityPanes, paneOwnerRef, paneId),
   );
   const [focusRequested, setFocusRequested] = useState(false);
-  const paneHeight = usePaneHeight(paneElement);
+  // Only an open panel needs its pane's height, so a closed one observes nothing.
+  const paneHeight = usePaneHeight(paneState.expanded ? paneElement : null);
 
   // The card follows the rule for when the Activity button appears; the saved
   // open or closed state applies from the render in which it first appears.
