@@ -213,6 +213,12 @@ Costs:
 
 ### Logging stage by stage, at the point of failure
 
+> **Superseded.** The reason names and levels actually shipped are listed in
+> the living [Activity observation](../../architecture/activity-observation.md)
+> document, in the paragraph after the pass-through rules. The table below is
+> the round-2 proposal, kept as history. As built, each occurrence is logged;
+> there is no once-per-executable limit.
+
 The plain `Option` is replaced inside `codex.rs` with a reason. Each reason is
 logged once per executable and reason, at the level it deserves:
 
@@ -398,6 +404,11 @@ about two rows while its dock is visible.
   extra "stay open" state; done records keep counting, so in practice the card
   stays. The sticky variant was dropped: it needed a set-state-in-effect, and it
   double-subscribed the activity atom on mount.
+- **A reconnect does not close an open card.** While the snapshot is briefly
+  gone (`null`), an open card keeps showing its last snapshot, so focus, the
+  open record, and scroll survive. A snapshot that says hide, such as one with
+  no records, still hides it. The held snapshot is derived state in a child
+  (`ActivityPaneCard`), so the atom reader never re-renders for it.
 - **Record-heading focus moves only after the user picks a record.** Today,
   `ActivityPanel.tsx:268-273` focuses the detail heading whenever a selected
   record is rendered. A restored route would therefore take focus from the
