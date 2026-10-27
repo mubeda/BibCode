@@ -221,6 +221,8 @@ interface MessagesTimelineProps {
   activeTurnInProgress: boolean;
   activeTurnStartedAt: string | null;
   listRef: React.RefObject<LegendListRef | null>;
+  /** Called with the list once it mounts, and with null once it unmounts. */
+  onListMount?: (list: LegendListRef | null) => void;
   timelineEntries: ReturnType<typeof deriveTimelineEntries>;
   queuedMessages: ReadonlyArray<TimelineMessage>;
   queuedStatuses: ReadonlyArray<QueuedCardStatus>;
@@ -285,6 +287,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   activeTurnInProgress,
   activeTurnStartedAt,
   listRef,
+  onListMount,
   timelineEntries,
   queuedMessages,
   queuedStatuses,
@@ -570,6 +573,15 @@ export const MessagesTimeline = memo(function MessagesTimeline({
 
   // Stable renderItem — no closure deps. Row components read shared state
   // from TimelineRowCtx, which propagates through LegendList's memo.
+  // The list's ref, and the parent's word that it mounted or unmounted.
+  const handleListRef = useCallback(
+    (list: LegendListRef | null) => {
+      listRef.current = list;
+      onListMount?.(list);
+    },
+    [listRef, onListMount],
+  );
+
   const renderItem = useCallback(
     ({ item }: { item: MessagesTimelineRow }) => (
       <div
@@ -642,7 +654,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
             <TimelineRowActivityCtx value={activityState}>
               <ReadingAnchorContext value={readingAnchor}>
                 <LegendList<MessagesTimelineRow>
-                  ref={listRef}
+                  ref={handleListRef}
                   data={rows}
                   keyExtractor={keyExtractor}
                   getItemType={getItemType}

@@ -1288,7 +1288,15 @@ function makeLegendList(options: FakeLegendListOptions = {}) {
     ) => {
       scrollNodeListeners.push({ type, handler, options: listenerOptions });
     },
-    removeEventListener: () => undefined,
+    removeEventListener: (type: string, handler: (event?: unknown) => void) => {
+      const index = scrollNodeListeners.findIndex(
+        (listener) => listener.type === type && listener.handler === handler,
+      );
+      if (index >= 0) scrollNodeListeners.splice(index, 1);
+    },
+    /** A node inside the timeline is one marked `inTimeline`, as `timelineKey` targets are. */
+    contains: (node: unknown) =>
+      node === scrollNode || (node as { inTimeline?: boolean } | null)?.inTimeline === true,
     fire(type: string, event?: unknown) {
       // As in the DOM, a listener added during the dispatch waits for the next event.
       for (const listener of scrollNodeListeners.slice()) {
@@ -1375,11 +1383,13 @@ function makeLegendList(options: FakeLegendListOptions = {}) {
   return list;
 }
 
+/** Mounts a fake list in the timeline, as LegendList's ref does once it renders. */
 function installLegendList(options: FakeLegendListOptions = {}) {
   const timeline = capturedProps("messagesTimeline");
   const listRef = timeline["listRef"] as RefObject<unknown>;
   const list = makeLegendList(options);
   listRef.current = list;
+  (timeline["onListMount"] as (list: unknown) => void)(list);
   return list;
 }
 
@@ -1433,11 +1443,17 @@ function timelineKey(key: string, matches: readonly string[] = []) {
     shiftKey: false,
     defaultPrevented: false,
     target: {
+      inTimeline: true,
       isContentEditable: false,
       closest: (selector: string) =>
         selector.split(",").some((part) => matches.includes(part.trim())) ? {} : null,
     },
   };
+}
+
+/** A keydown whose target is the page itself, as when focus stayed on the body. */
+function pageKey(key: string) {
+  return { key, shiftKey: false, defaultPrevented: false, target: documentStub.body };
 }
 
 function onRowSizeChanged(): (info: { index: number; previous: number; size: number }) => void {
@@ -1472,6 +1488,41 @@ interface WindowStub {
 
 let windowStub: WindowStub;
 let documentQuerySelectorResult: unknown = null;
+
+interface DocumentStub {
+  body: { readonly tag: "body" };
+  documentElement: { readonly tag: "html" };
+  listeners: Array<{ type: string; handler: (event: unknown) => void; options?: unknown }>;
+}
+
+let documentStub: DocumentStub;
+
+function makeDocumentStub(): DocumentStub & Record<string, unknown> {
+  const listeners: DocumentStub["listeners"] = [];
+  return {
+    body: { tag: "body" },
+    documentElement: { tag: "html" },
+    listeners,
+    querySelector: () => documentQuerySelectorResult,
+    addEventListener: (type: string, handler: (event: unknown) => void, options?: unknown) => {
+      listeners.push({ type, handler, options });
+    },
+    removeEventListener: (type: string, handler: (event: unknown) => void) => {
+      const index = listeners.findIndex(
+        (listener) => listener.type === type && listener.handler === handler,
+      );
+      if (index >= 0) listeners.splice(index, 1);
+    },
+    activeElement: null,
+  };
+}
+
+/** Dispatches `event` to the document's listeners for `type`, as a bubbled event reaches it. */
+function fireDocument(type: string, event: unknown): void {
+  for (const listener of documentStub.listeners.slice()) {
+    if (listener.type === type) listener.handler(event);
+  }
+}
 
 function makeWindowStub(): WindowStub {
   const listeners: WindowListener[] = [];
@@ -1654,12 +1705,8 @@ beforeEach(() => {
   windowStub = makeWindowStub();
   documentQuerySelectorResult = null;
   vi.stubGlobal("window", windowStub);
-  vi.stubGlobal("document", {
-    querySelector: () => documentQuerySelectorResult,
-    addEventListener: () => undefined,
-    removeEventListener: () => undefined,
-    activeElement: null,
-  });
+  documentStub = makeDocumentStub();
+  vi.stubGlobal("document", documentStub);
   vi.stubGlobal("requestAnimationFrame", (callback: (time: number) => void) => {
     callback(0);
     return 1;
@@ -1836,7 +1883,11 @@ describe("ChatView effects (captured and run manually)", () => {
     expect(windowStub.listeners.some((listener) => listener.type === "keydown")).toBe(true);
     // Manual-navigation listeners attached to the legend list scroll node.
     expect(list.scrollNode.listeners.map((listener) => listener.type)).toEqual(
-      expect.arrayContaining(["wheel", "touchmove", "pointerdown", "keydown"]),
+      expect.arrayContaining(["wheel", "touchmove", "pointerdown"]),
+    );
+    // Keys, and where the last press was, are heard on the document.
+    expect(documentStub.listeners.map((listener) => listener.type)).toEqual(
+      expect.arrayContaining(["keydown", "pointerdown", "focusin"]),
     );
     // Live-follow effect scrolled to the end because content overflows.
     expect(list.calls.scrollToEnd.length).toBeGreaterThanOrEqual(1);
@@ -2130,27 +2181,69 @@ describe("ChatView effects (captured and run manually)", () => {
     for (const cleanup of cleanups) cleanup();
   });
 
-  it("binds the reader's scroll listeners once a new thread's first turn shows the list", () => {
-    // A thread with no rows shows the empty state, with no list to bind to.
+  it("binds the reader's takeover listeners while the list is mounted", () => {
+    // A thread with no rows shows the empty state, with no list mounted to bind to.
     seedConnectedServerThread();
     renderServerRoute();
-    const empty = installLegendList({ scrollLength: 200 });
-    const emptyCleanups = runEffects();
-    expect(empty.scrollNode.listeners).toEqual([]);
-    for (const cleanup of emptyCleanups) cleanup();
-
-    // Its first turn renders the list, and the binding runs again for it.
-    seedConnectedServerThread(makeThreadWithEarlierTurn());
-    renderServerRoute();
-    const shown = installLegendList({ scrollLength: 200 });
     const cleanups = runEffects();
-    expect(shown.scrollNode.listeners.map((listener) => listener.type).toSorted()).toEqual([
-      "keydown",
+    expect(documentStub.listeners.filter((listener) => listener.type === "keydown")).toEqual([]);
+
+    // Its first turn mounts the list, which binds; unmounting it unbinds.
+    const list = installLegendList({ scrollLength: 200 });
+    expect(list.scrollNode.listeners.map((listener) => listener.type).toSorted()).toEqual([
       "pointerdown",
       "touchmove",
       "wheel",
     ]);
+    expect(documentStub.listeners.map((listener) => listener.type).toSorted()).toEqual([
+      "focusin",
+      "keydown",
+      "pointerdown",
+    ]);
+    (capturedProps("messagesTimeline")["onListMount"] as (list: unknown) => void)(null);
+    expect(list.scrollNode.listeners).toEqual([]);
+    expect(documentStub.listeners).toEqual([]);
     for (const cleanup of cleanups) cleanup();
+  });
+
+  it("stops following for a key on the page after a press in the timeline", async () => {
+    const { list, cleanups, messageId, onAnchorReady } = await sendTallReply({
+      scrollHeight: 400,
+      clientHeight: 200,
+    });
+    onAnchorReady(messageId, 2);
+    list.scrollNode.scrollTop = 50;
+
+    // A press on Copy code, which WebKit does not focus, leaves focus on the body; the
+    // browser then scrolls the timeline with the key.
+    const copyCode = { inTimeline: true, closest: () => ({}) };
+    fireDocument("pointerdown", { target: copyCode });
+    list.scrollNode.fire("pointerdown", { target: copyCode });
+    fireDocument("keydown", pageKey("PageUp"));
+    list.scrollNode.fire("scrollend");
+
+    expect(list.calls.scrollToOffset).toEqual([]);
+    for (const cleanup of cleanups) cleanup();
+  });
+
+  it("ignores a key on the page once focus or a press moved out of the timeline", async () => {
+    for (const leave of ["pointerdown", "focusin"] as const) {
+      const { list, cleanups, messageId, onAnchorReady } = await sendTallReply({
+        scrollHeight: 400,
+        clientHeight: 200,
+      });
+      onAnchorReady(messageId, 2);
+      list.scrollNode.scrollTop = 50;
+      fireDocument("pointerdown", { target: { inTimeline: true, closest: () => ({}) } });
+
+      fireDocument(leave, { target: { inTimeline: false } });
+      fireDocument("keydown", pageKey("PageUp"));
+      list.scrollNode.fire("scrollend");
+
+      // Following goes on: the settle follows the reply's end.
+      expect(list.calls.scrollToOffset.at(-1), leave).toEqual({ offset: 216, animated: false });
+      for (const cleanup of cleanups) cleanup();
+    }
   });
 
   it("positions a sent row once and keeps a released one where the reader left it", () => {
@@ -2225,7 +2318,7 @@ describe("ChatView effects (captured and run manually)", () => {
     onAnchorReady(messageId, 2);
     list.scrollNode.scrollTop = 50;
 
-    list.scrollNode.fire("keydown", timelineKey("ArrowUp", ["button"]));
+    fireDocument("keydown", timelineKey("ArrowUp", ["button"]));
     list.scrollNode.fire("scrollend");
 
     // The settle neither pins the reader nor follows the turn's end over them.
@@ -2249,7 +2342,7 @@ describe("ChatView effects (captured and run manually)", () => {
       onAnchorReady(messageId, 2);
       list.scrollNode.scrollTop = scrollTop;
 
-      list.scrollNode.fire("keydown", timelineKey(key, matches));
+      fireDocument("keydown", timelineKey(key, matches));
       list.scrollNode.fire("scrollend");
 
       // Following goes on: nothing is withdrawn, and the settle follows the reply's end.
@@ -2335,7 +2428,7 @@ describe("ChatView effects (captured and run manually)", () => {
     list.scrollNode.fire("scrollend");
     expect(list.calls.scrollToOffset).toEqual([{ offset: 184, animated: false }]);
 
-    list.scrollNode.fire("keydown", timelineKey("ArrowUp"));
+    fireDocument("keydown", timelineKey("ArrowUp"));
     list.runDeferred();
     await flushPromises();
 
