@@ -121,5 +121,5 @@ export function desktopActivityComposerFollowupTurnCommand(observedAtMs: number 
 }
 
 export const desktopActivityAccessibleNames = {
-  dock: "Open Activity: Subagents 1 active, 0 done; Background tasks 1 active, 0 done",
+  dock: "Activity: Subagents 1 active, 0 done; Background tasks 1 active, 0 done",
 } as const;

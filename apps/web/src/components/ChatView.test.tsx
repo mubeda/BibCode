@@ -46,6 +46,7 @@ import {
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
+  type ScopedThreadRef,
   type ServerProvider,
   ThreadId,
   TurnId,
@@ -70,6 +71,7 @@ const h = vi.hoisted(() => {
     /** The list the mocked timeline hands ChatView through `listRef`, as LegendList does. */
     timelineList: null as unknown,
     atomValuesByKey: new Map<string, unknown>(),
+    atomListeners: new Set<() => void>(),
     commandCalls: [] as Array<{ key: string; input: unknown }>,
     commandHandlers: new Map<string, (input: unknown) => Promise<unknown>>(),
     commandOptions: [] as Array<{ key: string; options: unknown }>,
@@ -408,11 +410,22 @@ vi.mock("./preview/previewEmptyStateLogic", () => ({
 
 vi.mock("@effect/atom-react", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@effect/atom-react")>();
+  const { useSyncExternalStore: useExternalStore } = await import("react");
   return {
     ...actual,
+    // Subscribes like the real hook, so a component that reads an atom
+    // re-renders when `publishAtomValues` reports a seeded change.
     useAtomValue: (atom: unknown) => {
       const key = (atom as { key?: string } | null | undefined)?.key;
-      return typeof key === "string" ? h.atomValuesByKey.get(key) : undefined;
+      const read = () => (typeof key === "string" ? h.atomValuesByKey.get(key) : undefined);
+      return useExternalStore(
+        (listener) => {
+          h.atomListeners.add(listener);
+          return () => h.atomListeners.delete(listener);
+        },
+        read,
+        read,
+      );
     },
     useAtomRefresh: (atom: unknown) => () => {
       const key = (atom as { key?: string } | null | undefined)?.key;
@@ -723,10 +736,25 @@ vi.mock("./activity/ActivityPanel", async (importOriginal) => {
 });
 
 import ChatView from "./ChatView";
+import { ActivityPanelBinding } from "./activity/ActivityPaneBinding";
 import type { Project, Thread } from "../types";
 import { useComposerDraftStore } from "../composerDraftStore";
 import { useRightPanelStore } from "../rightPanelStore";
 import { HOST_SURFACE_ID, useCenterPanelStore } from "../centerPanelStore";
+
+/** Tells every mounted atom reader that seeded atom values changed. */
+function publishAtomValues(): void {
+  for (const listener of h.atomListeners) listener();
+}
+
+/** Opens a chat's inline Activity panel the way its Activity button does. */
+function openActivityPane(
+  ref: ScopedThreadRef,
+  section: "subagents" | "backgroundTasks",
+  paneId: string = HOST_SURFACE_ID,
+): void {
+  useCenterPanelStore.getState().setActivityPaneExpanded(ref, paneId, true, section);
+}
 import { useUiStateStore } from "../uiStateStore";
 import { useDiffPanelStore } from "../diffPanelStore";
 import { newDraftId } from "../lib/utils";
@@ -1291,7 +1319,7 @@ describe("ChatView", () => {
 
     const openSubagents = async (container: HTMLDivElement): Promise<void> => {
       const pill = container.querySelector<HTMLButtonElement>(
-        'button[aria-label^="Open Activity: Subagents"]',
+        'button[aria-label^="Activity: Subagents"]',
       );
       expect(pill).not.toBeNull();
       await click(pill!);
@@ -1305,6 +1333,56 @@ describe("ChatView", () => {
       expect(props).toBeDefined();
       return props as ActivityPanelProps;
     };
+
+    it("offers no Stop in a terminal pane's panel, even when the provider claims cancellation", async () => {
+      const terminalScope: ActivityScopeRef = {
+        _tag: "terminal",
+        threadId,
+        terminalId: "terminal-activity-1",
+      };
+      const child = actor("terminal-actor", "Terminal observer");
+      const snapshot = activitySnapshot(terminalScope, [child], {
+        capabilities: {
+          actors: true,
+          attributedActivity: true,
+          backgroundWork: true,
+          historyRecovery: "bounded",
+          terminalObservation: true,
+          targetedActorCancellation: true,
+        },
+      });
+      seedActivityState(environmentId, terminalScope, snapshot);
+      seedActivityQueries(environmentId, snapshot, [child]);
+      vi.unstubAllGlobals();
+      Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+      const container = document.createElement("div");
+      document.body.append(container);
+      const root = createRoot(container);
+      try {
+        await act(async () => {
+          root.render(
+            <ActivityPanelBinding
+              target={{ environmentId, input: terminalScope }}
+              snapshot={snapshot}
+              route={{ section: "subagents", selectedRecordKind: null, selectedRecordId: null }}
+              timestampFormat="locale"
+              onNavigate={() => undefined}
+              focusRequested={false}
+              onFocusRequestHandled={() => undefined}
+            />,
+          );
+          await Promise.resolve();
+        });
+        await vi.waitFor(() =>
+          expect(container.querySelector("[data-activity-panel]")).not.toBeNull(),
+        );
+        expect(latestActivityPanelProps().onCancelActor).toBeUndefined();
+        expect(latestActivityPanelProps().onRetryCancellation).toBeUndefined();
+      } finally {
+        await act(async () => root.unmount());
+        container.remove();
+      }
+    });
 
     it("binds server-fenced cancel and residual retry commands without reporting raw failures", async () => {
       const child = actor("actor-cancellable", "Cancellable reviewer");
@@ -1477,7 +1555,7 @@ describe("ChatView", () => {
         seedServerThread(makeThread({ environmentId: nextEnvironmentId }));
         seedActivityState(nextEnvironmentId, nextSnapshot.scope, nextSnapshot);
         seedActivityQueries(nextEnvironmentId, nextSnapshot, [nextChild]);
-        useRightPanelStore.getState().openActivity(nextThreadRef, "subagents", nextSnapshot.scope);
+        openActivityPane(nextThreadRef, "subagents");
         await act(async () => {
           root.render(
             <ChatView
@@ -1579,7 +1657,7 @@ describe("ChatView", () => {
         seedServerThread(makeThread({ environmentId: nextEnvironmentId }));
         seedActivityState(nextEnvironmentId, nextSnapshot.scope, nextSnapshot);
         seedActivityQueries(nextEnvironmentId, nextSnapshot, [nextChild]);
-        useRightPanelStore.getState().openActivity(nextThreadRef, "subagents", nextSnapshot.scope);
+        openActivityPane(nextThreadRef, "subagents");
         await act(async () => {
           root.render(
             <ChatView
@@ -1598,7 +1676,7 @@ describe("ChatView", () => {
         );
         expect(latestActivityPanelProps().cancellationError).toBeNull();
 
-        useRightPanelStore.getState().openActivity(threadRef, "subagents", snapshot.scope);
+        openActivityPane(threadRef, "subagents");
         await act(async () => {
           root.render(
             <ChatView
@@ -1790,7 +1868,8 @@ describe("ChatView", () => {
           });
           seedActivityState(environmentId, authoritative.scope, authoritative);
           await act(async () => {
-            useRightPanelStore.getState().navigateActivity(threadRef, {
+            publishAtomValues();
+            useCenterPanelStore.getState().navigateActivityPane(threadRef, HOST_SURFACE_ID, {
               section: "subagents",
               selectedRecordKind: "actor",
               selectedRecordId: child.id,
@@ -1818,45 +1897,6 @@ describe("ChatView", () => {
       },
     );
 
-    it("keeps provider-terminal Activity bindings read-only", async () => {
-      const terminalScope: ActivityScopeRef = {
-        _tag: "terminal",
-        threadId,
-        terminalId: "terminal-activity-1",
-      };
-      const child = actor("terminal-actor", "Terminal observer");
-      const snapshot = activitySnapshot(terminalScope, [child], {
-        capabilities: {
-          actors: true,
-          attributedActivity: true,
-          backgroundWork: true,
-          historyRecovery: "bounded",
-          terminalObservation: true,
-          targetedActorCancellation: true,
-        },
-      });
-      seedEnvironment(makeEnvironmentPresentation());
-      seedProject(makeProject());
-      seedServerThread(makeThread());
-      seedGitStatus(true);
-      h.settings = { ...h.settings, enableTerminalAgentActivity: true };
-      seedActivityState(environmentId, terminalScope, snapshot);
-      seedActivityQueries(environmentId, snapshot, [child]);
-      useRightPanelStore.getState().openActivity(threadRef, "subagents", terminalScope);
-
-      const { container, root } = await mountActivityRoute();
-      try {
-        await vi.waitFor(() =>
-          expect(container.querySelector("[data-activity-panel]")).not.toBeNull(),
-        );
-        expect(latestActivityPanelProps().onCancelActor).toBeUndefined();
-        expect(latestActivityPanelProps().onRetryCancellation).toBeUndefined();
-      } finally {
-        await act(async () => root.unmount());
-        container.remove();
-      }
-    });
-
     it("removes activity UI and its persisted surface on settingsUpdated, then restores the dock", async () => {
       const child = actor("actor-settings-toggle", "Settings toggle reviewer");
       const snapshot = activitySnapshot({ _tag: "thread", threadId }, [child]);
@@ -1880,13 +1920,6 @@ describe("ChatView", () => {
         await vi.waitFor(() => {
           expect(container.querySelector('[data-testid="activity-dock"]')).toBeNull();
           expect(container.querySelector("[data-activity-panel]")).toBeNull();
-          expect(
-            useRightPanelStore
-              .getState()
-              .byThreadKey[scopedThreadKey(threadRef)]?.surfaces.some(
-                (surface) => surface.kind === "activity",
-              ) ?? false,
-          ).toBe(false);
           expect(container.querySelector('[data-mock="messages-timeline"]')).toBe(chatTimeline);
         });
 
@@ -1902,7 +1935,161 @@ describe("ChatView", () => {
       }
     });
 
-    it("removes a stale Activity surface at disabled startup without creating an activity RPC consumer", async () => {
+    // The panel sits in the measured composer overlay, so opening it grows the
+    // timeline's end inset exactly as a taller composer does. LegendList keeps
+    // the reading position for an inset change by itself; ChatView must only pass
+    // the new inset on and never scroll the list for it, whatever the list is doing.
+    it.each([
+      { mode: "reading mid-history", scroll: 400, anchored: false },
+      { mode: "following the end", scroll: 2_200, anchored: false },
+      { mode: "holding a just-sent turn anchored", scroll: 1_000, anchored: true },
+    ])(
+      "opens and closes the panel without scrolling the timeline while $mode",
+      async ({ scroll, anchored }) => {
+        const child = actor("actor-scroll", "Scroll reviewer");
+        const snapshot = activitySnapshot({ _tag: "thread", threadId }, [child]);
+        seedEnvironment(makeEnvironmentPresentation());
+        seedProject(makeProject());
+        seedServerThread(makeThread());
+        seedGitStatus(true);
+        seedActivityState(environmentId, snapshot.scope, snapshot);
+        seedActivityQueries(environmentId, snapshot, [child]);
+        const scrollNode = document.createElement("div");
+        const listScroll = {
+          scrollToEnd: vi.fn(),
+          scrollToIndex: vi.fn(),
+          scrollToOffset: vi.fn(),
+        };
+        h.timelineList = {
+          getScrollableNode: () => scrollNode,
+          getState: () => ({
+            scroll,
+            scrollLength: 800,
+            contentLength: 3_000,
+            data: [{}, {}],
+            positionAtIndex: (index: number) => index * 1_000,
+            sizeAtIndex: () => 1_000,
+          }),
+          ...listScroll,
+        };
+
+        const { container, root } = await mountActivityRoute();
+        const resizeCallbacks: Array<() => void> = [];
+        vi.stubGlobal(
+          "ResizeObserver",
+          class {
+            constructor(callback: () => void) {
+              resizeCallbacks.push(callback);
+            }
+            observe() {}
+            unobserve() {}
+            disconnect() {}
+          },
+        );
+        const overlayHeight = () =>
+          container.querySelector("[data-chat-composer-overlay] [data-activity-panel]") === null
+            ? 140
+            : 492;
+        const nativeRect = Element.prototype.getBoundingClientRect;
+        const rectSpy = vi.spyOn(Element.prototype, "getBoundingClientRect");
+        rectSpy.mockImplementation(function (this: Element) {
+          return this.matches("[data-chat-composer-overlay]")
+            ? ({ height: overlayHeight(), width: 800, top: 0, left: 0 } as DOMRect)
+            : nativeRect.call(this);
+        });
+        const reportResize = async () =>
+          act(async () => {
+            for (const callback of resizeCallbacks) callback();
+            await Promise.resolve();
+          });
+        const inset = () =>
+          capturedProps<Record<string, unknown>>("messagesTimeline")["contentInsetEndAdjustment"];
+        try {
+          // Remount so the overlay is measured by the stubbed observer.
+          await act(async () => {
+            root.render(
+              <ChatView
+                key="measured"
+                environmentId={environmentId}
+                threadId={threadId}
+                routeKind="server"
+                reserveTitleBarControlInset
+              />,
+            );
+            await Promise.resolve();
+          });
+          await reportResize();
+          expect(inset()).toBe(140);
+          if (anchored) {
+            const composer = capturedProps<Record<string, unknown>>("chatComposer");
+            (composer["composerRef"] as RefObject<ChatComposerHandle | null>).current = {
+              focusAtEnd: () => undefined,
+              resetCursorState: () => undefined,
+              addTerminalContext: () => false,
+              getSendContext: () => ({
+                prompt: "hold this turn",
+                attachments: [],
+                terminalContexts: [],
+                elementContexts: [],
+                previewAnnotations: [],
+                reviewComments: [],
+                selectedProvider: ProviderDriverKind.make("codex"),
+                selectedModel: "gpt-5.4",
+                selectedProviderModels: codexProvider.models,
+                selectedPromptEffort: null,
+                selectedModelOptionsForDispatch: undefined,
+                selectedModelSelection: { instanceId: codexInstanceId, model: "gpt-5.4" },
+              }),
+            } as Partial<ChatComposerHandle> as ChatComposerHandle;
+            (composer["promptRef"] as RefObject<string>).current = "hold this turn";
+            await act(async () => (composer["onSend"] as () => Promise<void>)());
+            const sent = h.commandCalls.find((call) => call.key === "thread.startTurn")!.input as {
+              input: { message: { messageId: MessageId } };
+            };
+            await act(async () =>
+              (
+                capturedProps<Record<string, unknown>>("messagesTimeline")["onAnchorReady"] as (
+                  id: MessageId,
+                  index: number,
+                ) => void
+              )(sent.input.message.messageId, 1),
+            );
+          }
+          // Let the send's own anchoring settle before the panel is toggled.
+          await act(
+            () =>
+              new Promise<void>((resolve) => {
+                const step = (left: number) =>
+                  left === 0 ? resolve() : requestAnimationFrame(() => step(left - 1));
+                step(6);
+              }),
+          );
+          for (const spy of Object.values(listScroll)) spy.mockClear();
+
+          await openSubagents(container);
+          await reportResize();
+          expect(inset()).toBe(492);
+
+          const pill = container.querySelector<HTMLButtonElement>(
+            '[data-testid="activity-dock"] button',
+          )!;
+          await click(pill);
+          await reportResize();
+          expect(container.querySelector("[data-activity-panel]")).toBeNull();
+          expect(inset()).toBe(140);
+
+          expect(listScroll.scrollToEnd).not.toHaveBeenCalled();
+          expect(listScroll.scrollToIndex).not.toHaveBeenCalled();
+          expect(listScroll.scrollToOffset).not.toHaveBeenCalled();
+        } finally {
+          rectSpy.mockRestore();
+          await act(async () => root.unmount());
+          container.remove();
+        }
+      },
+    );
+
+    it("keeps a saved open panel hidden at disabled startup without creating an activity RPC consumer", async () => {
       seedEnvironment(makeEnvironmentPresentation());
       seedProject(makeProject());
       seedServerThread(makeThread());
@@ -1911,19 +2098,10 @@ describe("ChatView", () => {
         ...(h.settings as Record<string, unknown>),
         enableChatAgentActivity: false,
       });
-      useRightPanelStore.getState().openActivity(threadRef, "subagents", { _tag: "thread" });
+      openActivityPane(threadRef, "subagents");
 
       const { container, root } = await mountActivityRoute();
       try {
-        await vi.waitFor(() => {
-          expect(
-            useRightPanelStore
-              .getState()
-              .byThreadKey[scopedThreadKey(threadRef)]?.surfaces.some(
-                (surface) => surface.kind === "activity",
-              ) ?? false,
-          ).toBe(false);
-        });
         expect(container.querySelector('[data-testid="activity-dock"]')).toBeNull();
         expect(container.querySelector("[data-activity-panel]")).toBeNull();
         expect(h.activityStateTargets).toEqual([]);
@@ -1934,137 +2112,19 @@ describe("ChatView", () => {
       }
     });
 
-    it("closes an Activity surface opened after its source is already disabled", async () => {
-      seedEnvironment(makeEnvironmentPresentation());
-      seedProject(makeProject());
-      seedServerThread(makeThread());
-      seedGitStatus(true);
-      h.environmentSettingsById.set(environmentId, {
-        ...(h.settings as Record<string, unknown>),
-        enableChatAgentActivity: false,
-        enableTerminalAgentActivity: true,
-      });
-
-      const { container, root } = await mountActivityRoute();
-      try {
-        expect(
-          useRightPanelStore
-            .getState()
-            .byThreadKey[scopedThreadKey(threadRef)]?.surfaces.some(
-              (surface) => surface.kind === "activity",
-            ) ?? false,
-        ).toBe(false);
-
-        await act(async () => {
-          useRightPanelStore.getState().openActivity(threadRef, "subagents", { _tag: "thread" });
-          await Promise.resolve();
-        });
-
-        await vi.waitFor(() => {
-          expect(
-            useRightPanelStore
-              .getState()
-              .byThreadKey[scopedThreadKey(threadRef)]?.surfaces.some(
-                (surface) => surface.kind === "activity",
-              ) ?? false,
-          ).toBe(false);
-        });
-        expect(container.querySelector("[data-activity-panel]")).toBeNull();
-      } finally {
-        await act(async () => root.unmount());
-        container.remove();
-      }
-    });
-
-    it("closes an inactive persisted Activity surface using its own disabled scope", async () => {
-      const terminalId = "terminal-inactive-activity";
-      seedEnvironment(makeEnvironmentPresentation());
-      seedProject(makeProject());
-      seedServerThread(makeThread());
-      seedGitStatus(true);
-      h.environmentSettingsById.set(environmentId, {
-        ...(h.settings as Record<string, unknown>),
-        enableChatAgentActivity: true,
-        enableTerminalAgentActivity: true,
-      });
-      useRightPanelStore
-        .getState()
-        .openActivity(threadRef, "subagents", { _tag: "terminal", terminalId });
-      useRightPanelStore.getState().open(threadRef, "plan");
-
-      const { container, root } = await mountActivityRoute();
-      try {
-        const initialRightPanelState =
-          useRightPanelStore.getState().byThreadKey[scopedThreadKey(threadRef)];
-        expect(initialRightPanelState?.activeSurfaceId).toBe("plan");
-        expect(initialRightPanelState?.surfaces).toEqual(
-          expect.arrayContaining([
-            expect.objectContaining({
-              kind: "activity",
-              scope: { _tag: "terminal", terminalId },
-            }),
-            expect.objectContaining({ kind: "plan" }),
-          ]),
-        );
-        expect(container.querySelector("[data-activity-panel]")).toBeNull();
-
-        await publishSettingsUpdated(environmentId, { enableTerminalAgentActivity: false });
-
-        await vi.waitFor(() => {
-          const nextRightPanelState =
-            useRightPanelStore.getState().byThreadKey[scopedThreadKey(threadRef)];
-          expect(
-            nextRightPanelState?.surfaces.some((surface) => surface.kind === "activity") ?? false,
-          ).toBe(false);
-          expect(nextRightPanelState?.surfaces).toContainEqual(
-            expect.objectContaining({ kind: "plan" }),
-          );
-          expect(nextRightPanelState?.activeSurfaceId).toBe("plan");
-        });
-      } finally {
-        await act(async () => root.unmount());
-        container.remove();
-      }
-    });
-
     it.each([
       {
-        name: "closes a thread surface when only chat activity is disabled",
-        surfaceScope: { _tag: "thread" } as const,
-        snapshotScope: { _tag: "thread", threadId } as ActivityScopeRef,
+        name: "removes a chat's open panel when only chat activity is disabled",
         nextSettings: { enableChatAgentActivity: false, enableTerminalAgentActivity: true },
         expectedOpen: false,
       },
       {
-        name: "keeps a terminal surface when only chat activity is disabled",
-        surfaceScope: { _tag: "terminal", terminalId: "terminal-isolation" } as const,
-        snapshotScope: {
-          _tag: "terminal",
-          threadId,
-          terminalId: "terminal-isolation",
-        } as ActivityScopeRef,
-        nextSettings: { enableChatAgentActivity: false, enableTerminalAgentActivity: true },
-        expectedOpen: true,
-      },
-      {
-        name: "keeps a thread surface when only terminal activity is disabled",
-        surfaceScope: { _tag: "thread" } as const,
-        snapshotScope: { _tag: "thread", threadId } as ActivityScopeRef,
+        name: "keeps a chat's open panel when only terminal activity is disabled",
         nextSettings: { enableChatAgentActivity: true, enableTerminalAgentActivity: false },
         expectedOpen: true,
       },
-      {
-        name: "closes a terminal surface when only terminal activity is disabled",
-        surfaceScope: { _tag: "terminal", terminalId: "terminal-isolation" } as const,
-        snapshotScope: {
-          _tag: "terminal",
-          threadId,
-          terminalId: "terminal-isolation",
-        } as ActivityScopeRef,
-        nextSettings: { enableChatAgentActivity: true, enableTerminalAgentActivity: false },
-        expectedOpen: false,
-      },
-    ])("$name", async ({ surfaceScope, snapshotScope, nextSettings, expectedOpen }) => {
+    ])("$name", async ({ nextSettings, expectedOpen }) => {
+      const snapshotScope: ActivityScopeRef = { _tag: "thread", threadId };
       const snapshot = activitySnapshot(snapshotScope, []);
       seedEnvironment(makeEnvironmentPresentation());
       seedProject(makeProject());
@@ -2077,7 +2137,7 @@ describe("ChatView", () => {
         enableChatAgentActivity: true,
         enableTerminalAgentActivity: true,
       });
-      useRightPanelStore.getState().openActivity(threadRef, "subagents", surfaceScope);
+      openActivityPane(threadRef, "subagents");
 
       const { container, root } = await mountActivityRoute();
       try {
@@ -2088,12 +2148,6 @@ describe("ChatView", () => {
         await publishSettingsUpdated(environmentId, nextSettings);
 
         await vi.waitFor(() => {
-          const activitySurface = useRightPanelStore
-            .getState()
-            .byThreadKey[scopedThreadKey(threadRef)]?.surfaces.find(
-              (surface) => surface.kind === "activity",
-            );
-          expect(activitySurface !== undefined).toBe(expectedOpen);
           expect(container.querySelector("[data-activity-panel]") !== null).toBe(expectedOpen);
         });
       } finally {
@@ -2259,7 +2313,7 @@ describe("ChatView", () => {
 
       expect(markup.match(/data-activity-status="stale"/g)).toHaveLength(1);
       expect(markup).toContain(
-        'aria-label="Open Activity: Subagents 1 active, 0 done; Background tasks 1 active, 0 done. Status: stale"',
+        'aria-label="Activity: Subagents 1 active, 0 done; Background tasks 1 active, 0 done. Status: stale"',
       );
     });
 
@@ -2335,7 +2389,7 @@ describe("ChatView", () => {
       }
     });
 
-    it("opens the singleton roster and detail without changing the chat route, then closes only the surface", async () => {
+    it("opens the inline roster and detail without changing the chat route or the right panel, then collapses", async () => {
       const child = actor("actor-child", "Child reviewer");
       const snapshot = activitySnapshot({ _tag: "thread", threadId }, [child]);
       seedEnvironment(makeEnvironmentPresentation());
@@ -2348,15 +2402,13 @@ describe("ChatView", () => {
       const { container, root } = await mountActivityRoute();
       try {
         expect(container.querySelector('[data-testid="activity-dock"]')).not.toBeNull();
+        const rightPanelBefore = useRightPanelStore.getState().byThreadKey;
         await openSubagents(container);
         await vi.waitFor(() => expect(container.textContent).toContain("Child reviewer"));
+        expect(useRightPanelStore.getState().byThreadKey).toBe(rightPanelBefore);
         expect(
-          useRightPanelStore
-            .getState()
-            .byThreadKey[scopedThreadKey(threadRef)]?.surfaces.filter(
-              (surface) => surface.kind === "activity",
-            ),
-        ).toHaveLength(1);
+          container.querySelector("[data-chat-composer-overlay] [data-activity-panel]"),
+        ).not.toBeNull();
 
         const rosterItem = [...container.querySelectorAll("button")].find((button) =>
           button.textContent?.includes("Child reviewer"),
@@ -2393,9 +2445,8 @@ describe("ChatView", () => {
         });
         seedActivityState(environmentId, snapshot.scope, updatedSnapshot);
         await act(async () => {
-          useRightPanelStore
-            .getState()
-            .openActivity(scopeThreadRef(environmentId, threadId), "subagents", snapshot.scope);
+          openActivityPane(scopeThreadRef(environmentId, threadId), "subagents");
+          publishAtomValues();
           await Promise.resolve();
         });
         await vi.waitFor(() => expect(h.queryRefreshCalls.length).toBeGreaterThan(0));
@@ -2427,18 +2478,14 @@ describe("ChatView", () => {
         });
         await vi.waitFor(() => expect(h.queryRefreshCalls).toContain(backgroundFirstPageKey));
 
-        const surface = useRightPanelStore
-          .getState()
-          .byThreadKey[scopedThreadKey(threadRef)]?.surfaces.find(
-            (candidate) => candidate.kind === "activity",
-          );
-        expect(surface).toBeDefined();
-        await act(async () => {
-          capturedProps<{ onCloseSurface: (surface: unknown) => void }>(
-            "rightPanelTabs",
-          ).onCloseSurface(surface);
-        });
+        const dockButton = container.querySelector<HTMLButtonElement>(
+          '[data-testid="activity-dock"] button',
+        );
+        expect(dockButton?.getAttribute("aria-expanded")).toBe("true");
+        await click(dockButton!);
         expect(container.querySelector("[data-activity-panel]")).toBeNull();
+        expect(dockButton?.getAttribute("aria-expanded")).toBe("false");
+        expect(useRightPanelStore.getState().byThreadKey).toBe(rightPanelBefore);
         expect(container.querySelector('[data-testid="activity-dock"]')).not.toBeNull();
         expect(h.activityStateTargets.at(-1)).toEqual({
           environmentId,
@@ -2703,36 +2750,7 @@ describe("ChatView", () => {
       }
     });
 
-    it("uses compact dock presentation independently from the narrower right-panel sheet", async () => {
-      const child = actor("actor-compact-band", "Compact band reviewer");
-      const snapshot = activitySnapshot({ _tag: "thread", threadId }, [child]);
-      seedEnvironment(makeEnvironmentPresentation());
-      seedProject(makeProject());
-      seedServerThread(makeThread());
-      seedGitStatus(true);
-      seedActivityState(environmentId, snapshot.scope, snapshot);
-      seedActivityQueries(environmentId, snapshot, [child]);
-      h.compactDesktop = false;
-      h.compactActivityDock = true;
-
-      const { container, root } = await mountActivityRoute();
-      try {
-        const dockProps = h.activityDockRenderProps.at(-1) as {
-          readonly avoidRightPanelSheet: boolean;
-          readonly compact: boolean;
-        };
-        expect(dockProps.compact).toBe(true);
-        expect(dockProps.avoidRightPanelSheet).toBe(false);
-        await openSubagents(container);
-        expect(container.querySelector('[data-mock="right-panel-sheet"]')).toBeNull();
-        expect(capturedProps<{ mode: string }>("rightPanelTabs").mode).toBe("inline");
-      } finally {
-        await act(async () => root.unmount());
-        container.remove();
-      }
-    });
-
-    it("retains stale activity through reconnect and uses the existing compact sheet with Back", async () => {
+    it("retains stale activity through reconnect inline in a compact window, with Back", async () => {
       const child = actor("actor-compact", "Compact reviewer");
       const snapshot = activitySnapshot({ _tag: "thread", threadId }, [child]);
       seedEnvironment(
@@ -2752,8 +2770,10 @@ describe("ChatView", () => {
       try {
         expect(container.querySelector('[data-activity-status="stale"]')).not.toBeNull();
         await openSubagents(container);
-        expect(container.querySelector('[data-mock="right-panel-sheet"]')).not.toBeNull();
-        expect(capturedProps<{ mode: string }>("rightPanelTabs").mode).toBe("sheet");
+        expect(container.querySelector('[data-mock="right-panel-sheet"]')).toBeNull();
+        expect(
+          container.querySelector("[data-chat-composer-overlay] [data-activity-panel]"),
+        ).not.toBeNull();
         await vi.waitFor(() => expect(container.textContent).toContain("Compact reviewer"));
 
         const rosterItem = [...container.querySelectorAll("button")].find((button) =>
@@ -2772,7 +2792,63 @@ describe("ChatView", () => {
           expect(container.querySelector("[data-activity-detail-heading]")).toBeNull();
           expect(container.textContent).toContain("Compact reviewer");
         });
-        expect(container.querySelector('[data-mock="right-panel-sheet"]')).not.toBeNull();
+        expect(container.querySelector('[data-mock="right-panel-sheet"]')).toBeNull();
+      } finally {
+        await act(async () => root.unmount());
+        container.remove();
+      }
+    });
+
+    it("keeps an open panel's records, focus, and scroll while its snapshot drops away", async () => {
+      const child = actor("actor-held", "Held reviewer");
+      const snapshot = activitySnapshot({ _tag: "thread", threadId }, [child]);
+      seedEnvironment(makeEnvironmentPresentation());
+      seedProject(makeProject());
+      seedServerThread(makeThread());
+      seedGitStatus(true);
+      seedActivityState(environmentId, snapshot.scope, snapshot);
+      seedActivityQueries(environmentId, snapshot, [child]);
+
+      const { container, root } = await mountActivityRoute();
+      try {
+        await openSubagents(container);
+        await vi.waitFor(() => expect(container.textContent).toContain("Held reviewer"));
+        const panel = container.querySelector<HTMLElement>(
+          "[data-chat-composer-overlay] [data-activity-panel]",
+        );
+        expect(panel).not.toBeNull();
+        const row = [...panel!.querySelectorAll<HTMLButtonElement>("button")].find((button) =>
+          button.textContent?.includes("Held reviewer"),
+        );
+        expect(row).toBeDefined();
+        act(() => row!.focus());
+        const scroller = [panel!, ...panel!.querySelectorAll<HTMLElement>("*")].find(
+          (element) => element.scrollHeight >= element.clientHeight,
+        )!;
+        scroller.scrollTop = 40;
+        const scrollTop = scroller.scrollTop;
+
+        // A reconnect: the state atom briefly has no snapshot at all.
+        seedActivityState(environmentId, snapshot.scope, null, "synchronizing");
+        await act(async () => {
+          publishAtomValues();
+          await Promise.resolve();
+        });
+
+        expect(container.querySelector("[data-activity-panel]")).toBe(panel);
+        expect(panel!.textContent).toContain("Held reviewer");
+        expect(row!.isConnected).toBe(true);
+        expect(document.activeElement).toBe(row);
+        expect(scroller.scrollTop).toBe(scrollTop);
+        expect(container.querySelector('[data-testid="activity-dock"]')).not.toBeNull();
+
+        seedActivityState(environmentId, snapshot.scope, snapshot);
+        await act(async () => {
+          publishAtomValues();
+          await Promise.resolve();
+        });
+        expect(container.querySelector("[data-activity-panel]")).toBe(panel);
+        expect(document.activeElement).toBe(row);
       } finally {
         await act(async () => root.unmount());
         container.remove();
@@ -2882,9 +2958,8 @@ describe("ChatView", () => {
         seedDetail(environmentId, updatedSnapshot, completed);
 
         await act(async () => {
-          useRightPanelStore
-            .getState()
-            .openActivity(scopeThreadRef(environmentId, threadId), "subagents", snapshot.scope);
+          openActivityPane(scopeThreadRef(environmentId, threadId), "subagents");
+          publishAtomValues();
           root.render(
             <ChatView
               environmentId={environmentId}
@@ -2979,9 +3054,8 @@ describe("ChatView", () => {
           );
           await act(async () => {
             // As in the snapshot-revision test above, the store update re-renders the binding.
-            useRightPanelStore
-              .getState()
-              .openActivity(scopeThreadRef(environmentId, threadId), "subagents", snapshot.scope);
+            openActivityPane(scopeThreadRef(environmentId, threadId), "subagents");
+            publishAtomValues();
             root.render(
               <ChatView
                 environmentId={environmentId}
@@ -3075,9 +3149,8 @@ describe("ChatView", () => {
         });
         seedActivityState(environmentId, snapshot.scope, updatedSnapshot);
         await act(async () => {
-          useRightPanelStore
-            .getState()
-            .openActivity(scopeThreadRef(environmentId, threadId), "subagents", snapshot.scope);
+          openActivityPane(scopeThreadRef(environmentId, threadId), "subagents");
+          publishAtomValues();
           root.render(
             <ChatView
               environmentId={environmentId}
@@ -3149,9 +3222,8 @@ describe("ChatView", () => {
         seedRoster(environmentId, updatedSnapshot, "subagents", "done", []);
 
         await act(async () => {
-          useRightPanelStore
-            .getState()
-            .openActivity(scopeThreadRef(environmentId, threadId), "subagents", snapshot.scope);
+          openActivityPane(scopeThreadRef(environmentId, threadId), "subagents");
+          publishAtomValues();
           await Promise.resolve();
         });
 
@@ -3195,17 +3267,12 @@ describe("ChatView", () => {
         ]);
         await openSubagents(container);
         await vi.waitFor(() => expect(container.textContent).toContain("Panel reviewer"));
-        expect(container.querySelector('[data-mock="right-panel-tabs"]')).not.toBeNull();
+        // A panel chat's Activity opens in its own pane; it never renders a right panel.
+        expect(container.querySelector('[data-mock="right-panel-tabs"]')).toBeNull();
         expect(container.querySelector('[data-mock="right-panel-sheet"]')).toBeNull();
-        expect(container.querySelector("[data-activity-panel]")).not.toBeNull();
         expect(
-          capturedProps<{ surfaces: Array<{ kind: string }>; allowAddSurfaces?: boolean }>(
-            "rightPanelTabs",
-          ).surfaces,
-        ).toEqual([expect.objectContaining({ kind: "activity" })]);
-        expect(
-          capturedProps<{ allowAddSurfaces?: boolean }>("rightPanelTabs").allowAddSurfaces,
-        ).toBe(false);
+          container.querySelector("[data-chat-composer-overlay] [data-activity-panel]"),
+        ).not.toBeNull();
         expect(h.captured["chatHeaderActions"]).toBeUndefined();
         expect(h.captured["panelLayoutControls"]).toBeUndefined();
       } finally {
@@ -3214,7 +3281,60 @@ describe("ChatView", () => {
       }
     });
 
-    it("brings an open Activity panel back into focus at the top of its section", async () => {
+    it("keys a split panel chat's Activity under its host, independent of the host pane", async () => {
+      const panelThreadId = ThreadId.make("thread-panel-split");
+      const panelThreadRef = scopeThreadRef(environmentId, panelThreadId);
+      const child = actor("actor-split", "Split reviewer");
+      const snapshot = activitySnapshot({ _tag: "thread", threadId: panelThreadId }, [child]);
+      seedEnvironment(makeEnvironmentPresentation());
+      seedProject(makeProject());
+      seedServerThread(makeThread({ id: panelThreadId, title: "Split thread" }));
+      seedGitStatus(true);
+      seedActivityState(environmentId, snapshot.scope, snapshot);
+      seedActivityQueries(environmentId, snapshot, [child]);
+      useCenterPanelStore.getState().openChatPanel(threadRef, panelThreadId);
+      // The host pane is open; the panel beside it must not inherit that.
+      openActivityPane(threadRef, "subagents");
+
+      vi.unstubAllGlobals();
+      Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+      const container = document.createElement("div");
+      document.body.append(container);
+      const root = createRoot(container);
+      await act(async () => {
+        root.render(
+          <ChatView
+            variant="panel"
+            panelThreadRef={panelThreadRef}
+            activityPaneHostRef={threadRef}
+            workspaceUnavailable={null}
+          />,
+        );
+        await Promise.resolve();
+      });
+      try {
+        const pill = container.querySelector<HTMLButtonElement>(
+          '[data-testid="activity-dock"] button',
+        )!;
+        expect(pill.getAttribute("aria-expanded")).toBe("false");
+        expect(container.querySelector("[data-activity-panel]")).toBeNull();
+
+        await click(pill);
+
+        await vi.waitFor(() => expect(container.textContent).toContain("Split reviewer"));
+        const panes = useCenterPanelStore.getState().activityPanes[scopedThreadKey(threadRef)];
+        expect(panes?.[`chat:${panelThreadId}`]?.expanded).toBe(true);
+        expect(panes?.[HOST_SURFACE_ID]?.expanded).toBe(true);
+        expect(
+          useCenterPanelStore.getState().activityPanes[scopedThreadKey(panelThreadRef)],
+        ).toBeUndefined();
+      } finally {
+        await act(async () => root.unmount());
+        container.remove();
+      }
+    });
+
+    it("collapses from its button, then reopens with focus at the top of its section", async () => {
       const panelThreadId = ThreadId.make("thread-panel-refocus");
       const panelThreadRef = scopeThreadRef(environmentId, panelThreadId);
       const child = actor("actor-refocus", "Refocus reviewer");
@@ -3232,39 +3352,22 @@ describe("ChatView", () => {
         const panel = container.querySelector<HTMLElement>("[data-activity-panel]")!;
         await vi.waitFor(() => expect(panel.contains(document.activeElement)).toBe(true));
         const pill = container.querySelector<HTMLButtonElement>(
-          'button[aria-label^="Open Activity: Subagents"]',
+          'button[aria-label^="Activity: Subagents"]',
         )!;
         pill.focus();
-        const viewport = panel.querySelector<HTMLElement>('[data-slot="scroll-area-viewport"]')!;
-        viewport.scrollTop = 200;
 
         await click(pill);
 
-        await vi.waitFor(() => expect(panel.contains(document.activeElement)).toBe(true));
+        expect(container.querySelector("[data-activity-panel]")).toBeNull();
+        expect(pill.getAttribute("aria-expanded")).toBe("false");
+        expect(document.activeElement).toBe(pill);
+
+        await click(pill);
+
+        const reopened = container.querySelector<HTMLElement>("[data-activity-panel]")!;
+        await vi.waitFor(() => expect(reopened.contains(document.activeElement)).toBe(true));
+        const viewport = reopened.querySelector<HTMLElement>('[data-slot="scroll-area-viewport"]')!;
         expect(viewport.scrollTop).toBe(0);
-        expect(container.querySelector("[data-activity-panel]")).toBe(panel);
-      } finally {
-        await act(async () => root.unmount());
-        container.remove();
-      }
-    });
-
-    it("opens a panel chat activity inspector in the compact sheet", async () => {
-      const child = actor("actor-panel-compact", "Compact panel reviewer");
-      const snapshot = activitySnapshot({ _tag: "thread", threadId }, [child]);
-      seedEnvironment(makeEnvironmentPresentation());
-      seedProject(makeProject());
-      seedServerThread(makeThread());
-      seedGitStatus(true);
-      seedActivityState(environmentId, snapshot.scope, snapshot);
-      seedActivityQueries(environmentId, snapshot, [child]);
-      h.compactDesktop = true;
-
-      const { container, root } = await mountActivityPanel();
-      try {
-        await openSubagents(container);
-        expect(container.querySelector('[data-mock="right-panel-sheet"]')).not.toBeNull();
-        expect(container.querySelector("[data-activity-panel]")).not.toBeNull();
       } finally {
         await act(async () => root.unmount());
         container.remove();
@@ -3329,334 +3432,6 @@ describe("ChatView", () => {
         'data-mock-center-surface="chat:host" data-visible="false" class="hidden"',
       );
       expect(markup).toContain("hidden host disconnected");
-    });
-
-    it("hands the inspector between host and sibling chat without duplicate shells or targets", async () => {
-      const siblingThreadId = ThreadId.make("thread-sibling-switch");
-      const siblingThreadRef = scopeThreadRef(environmentId, siblingThreadId);
-      const hostActor = actor("actor-host-switch", "Host reviewer");
-      const siblingActor = actor("actor-sibling-switch", "Sibling reviewer");
-      const hostSnapshot = activitySnapshot({ _tag: "thread", threadId }, [hostActor]);
-      const siblingSnapshot = activitySnapshot({ _tag: "thread", threadId: siblingThreadId }, [
-        siblingActor,
-      ]);
-      seedEnvironment(makeEnvironmentPresentation());
-      seedProject(makeProject());
-      seedServerThread(makeThread());
-      seedServerThread(makeThread({ id: siblingThreadId, title: "Sibling switch" }));
-      seedGitStatus(true);
-      seedActivityState(environmentId, hostSnapshot.scope, hostSnapshot);
-      seedActivityState(environmentId, siblingSnapshot.scope, siblingSnapshot);
-      seedActivityQueries(environmentId, hostSnapshot, [hostActor]);
-      seedActivityQueries(environmentId, siblingSnapshot, [siblingActor]);
-      useRightPanelStore.getState().openActivity(threadRef, "subagents", { _tag: "thread" });
-      useCenterPanelStore.getState().openChatPanel(threadRef, siblingThreadId, "Codex");
-      useCenterPanelStore.getState().activateSurface(threadRef, "center:root", HOST_SURFACE_ID);
-      publishSeededStoreState(useRightPanelStore);
-      publishSeededStoreState(useCenterPanelStore);
-
-      const { container, root } = await mountActivityRoute();
-      try {
-        expect(container.querySelectorAll('[data-testid="activity-dock"]')).toHaveLength(1);
-        expect(container.querySelectorAll('[data-mock="right-panel-tabs"]')).toHaveLength(1);
-        expect(container.querySelectorAll("[data-activity-panel]")).toHaveLength(1);
-        expect((h.activityPanelRenderProps.at(-1) as ActivityPanelProps).snapshot.scope).toEqual({
-          _tag: "thread",
-          threadId,
-        });
-
-        const centerWorkspace = capturedProps<{
-          state: {
-            focusedGroupId: string;
-            surfaces: Array<{ id: string; kind: string }>;
-          };
-          onActivate: (groupId: string, surface: { id: string; kind: string }) => void;
-        }>("centerWorkspace");
-        const siblingSurface = centerWorkspace.state.surfaces.find(
-          (surface) => surface.id === `chat:${siblingThreadId}`,
-        );
-        expect(siblingSurface).toBeDefined();
-        const siblingTargetStart = h.activityStateTargets.length;
-        await act(async () => {
-          centerWorkspace.onActivate(centerWorkspace.state.focusedGroupId, siblingSurface!);
-          await Promise.resolve();
-        });
-        await vi.waitFor(() => {
-          expect(container.querySelectorAll('[data-testid="activity-dock"]')).toHaveLength(1);
-          expect(container.querySelectorAll('[data-mock="right-panel-tabs"]')).toHaveLength(0);
-          expect(container.querySelectorAll("[data-activity-panel]")).toHaveLength(0);
-        });
-        expect(h.activityStateTargets.slice(siblingTargetStart)).toEqual([
-          {
-            environmentId,
-            input: { _tag: "thread", threadId: siblingThreadId },
-          },
-        ]);
-
-        await openSubagents(container);
-        await vi.waitFor(() => {
-          expect(container.querySelectorAll('[data-testid="activity-dock"]')).toHaveLength(1);
-          expect(container.querySelectorAll('[data-mock="right-panel-tabs"]')).toHaveLength(1);
-          expect(container.querySelectorAll("[data-activity-panel]")).toHaveLength(1);
-        });
-        expect((h.activityPanelRenderProps.at(-1) as ActivityPanelProps).snapshot.scope).toEqual({
-          _tag: "thread",
-          threadId: siblingThreadId,
-        });
-        expect(
-          useRightPanelStore.getState().byThreadKey[scopedThreadKey(siblingThreadRef)]
-            ?.activeSurfaceId,
-        ).toBe("activity");
-
-        const hostTargetStart = h.activityStateTargets.length;
-        await act(async () => {
-          centerWorkspace.onActivate(
-            centerWorkspace.state.focusedGroupId,
-            centerWorkspace.state.surfaces.find((surface) => surface.id === HOST_SURFACE_ID)!,
-          );
-          await Promise.resolve();
-        });
-        await vi.waitFor(() => {
-          expect(container.querySelectorAll('[data-testid="activity-dock"]')).toHaveLength(1);
-          expect(container.querySelectorAll('[data-mock="right-panel-tabs"]')).toHaveLength(1);
-          expect(container.querySelectorAll("[data-activity-panel]")).toHaveLength(1);
-        });
-        expect(h.activityStateTargets.slice(hostTargetStart)).toEqual([
-          {
-            environmentId,
-            input: { _tag: "thread", threadId },
-          },
-          {
-            environmentId,
-            input: { _tag: "thread", threadId },
-          },
-        ]);
-        expect((h.activityPanelRenderProps.at(-1) as ActivityPanelProps).snapshot.scope).toEqual({
-          _tag: "thread",
-          threadId,
-        });
-      } finally {
-        await act(async () => root.unmount());
-        container.remove();
-      }
-    });
-
-    it("keeps the sibling chat visible while a suppressed host Activity remains maximized", async () => {
-      const siblingThreadId = ThreadId.make("thread-sibling-maximized-host");
-      const hostActor = actor("actor-host-maximized", "Maximized host reviewer");
-      const siblingActor = actor("actor-sibling-maximized", "Visible sibling reviewer");
-      const hostSnapshot = activitySnapshot({ _tag: "thread", threadId }, [hostActor]);
-      const siblingSnapshot = activitySnapshot({ _tag: "thread", threadId: siblingThreadId }, [
-        siblingActor,
-      ]);
-      seedEnvironment(makeEnvironmentPresentation());
-      seedProject(makeProject());
-      seedServerThread(makeThread());
-      seedServerThread(makeThread({ id: siblingThreadId, title: "Visible sibling" }));
-      seedGitStatus(true);
-      seedActivityState(environmentId, hostSnapshot.scope, hostSnapshot);
-      seedActivityState(environmentId, siblingSnapshot.scope, siblingSnapshot);
-      seedActivityQueries(environmentId, hostSnapshot, [hostActor]);
-      seedActivityQueries(environmentId, siblingSnapshot, [siblingActor]);
-      useRightPanelStore.getState().openActivity(threadRef, "subagents", { _tag: "thread" });
-      useCenterPanelStore.getState().openChatPanel(threadRef, siblingThreadId, "Codex");
-      useCenterPanelStore.getState().activateSurface(threadRef, "center:root", HOST_SURFACE_ID);
-      publishSeededStoreState(useRightPanelStore);
-      publishSeededStoreState(useCenterPanelStore);
-
-      const { container, root } = await mountActivityRoute();
-      try {
-        expect(capturedProps<{ maximized: boolean }>("rightPanelMaximizeControl").maximized).toBe(
-          false,
-        );
-        await act(async () => {
-          capturedProps<{ onToggle: () => void }>("rightPanelMaximizeControl").onToggle();
-          await Promise.resolve();
-        });
-        await vi.waitFor(() => {
-          expect(
-            container.querySelector('[data-chat-column-maximized-away="true"]'),
-          ).not.toBeNull();
-        });
-
-        const centerWorkspace = capturedProps<{
-          state: {
-            focusedGroupId: string;
-            surfaces: Array<{ id: string; kind: string }>;
-          };
-          onActivate: (groupId: string, surface: { id: string; kind: string }) => void;
-        }>("centerWorkspace");
-        const siblingSurface = centerWorkspace.state.surfaces.find(
-          (surface) => surface.id === `chat:${siblingThreadId}`,
-        );
-        expect(siblingSurface).toBeDefined();
-        await act(async () => {
-          centerWorkspace.onActivate(centerWorkspace.state.focusedGroupId, siblingSurface!);
-          await Promise.resolve();
-        });
-
-        await vi.waitFor(() => {
-          const hostChatColumn = container.querySelector("[data-chat-column-maximized-away]");
-          expect(hostChatColumn?.getAttribute("data-chat-column-maximized-away")).toBe("false");
-          expect(container.querySelectorAll('[data-mock="right-panel-tabs"]')).toHaveLength(0);
-          expect(container.querySelectorAll('[data-mock="right-panel-maximize"]')).toHaveLength(0);
-          expect(container.querySelectorAll('[data-testid="activity-dock"]')).toHaveLength(1);
-        });
-        expect(
-          capturedProps<{ rightPanelOpen: boolean }>("panelLayoutControls").rightPanelOpen,
-        ).toBe(false);
-        expect(
-          capturedProps<{ reserveTitlebarControls: boolean }>("chatHeaderActions")
-            .reserveTitlebarControls,
-        ).toBe(true);
-
-        await openSubagents(container);
-        await vi.waitFor(() => {
-          expect(container.querySelectorAll('[data-mock="right-panel-tabs"]')).toHaveLength(1);
-          expect(container.querySelectorAll("[data-activity-panel]")).toHaveLength(1);
-          expect(container.querySelectorAll('[data-mock="right-panel-maximize"]')).toHaveLength(0);
-        });
-        expect((h.activityPanelRenderProps.at(-1) as ActivityPanelProps).snapshot.scope).toEqual({
-          _tag: "thread",
-          threadId: siblingThreadId,
-        });
-
-        await act(async () => {
-          centerWorkspace.onActivate(
-            centerWorkspace.state.focusedGroupId,
-            centerWorkspace.state.surfaces.find((surface) => surface.id === HOST_SURFACE_ID)!,
-          );
-          await Promise.resolve();
-        });
-        await vi.waitFor(() => {
-          expect(
-            container.querySelector('[data-chat-column-maximized-away="true"]'),
-          ).not.toBeNull();
-          expect(container.querySelectorAll('[data-mock="right-panel-tabs"]')).toHaveLength(1);
-          expect(container.querySelectorAll('[data-mock="right-panel-maximize"]')).toHaveLength(1);
-        });
-        expect(capturedProps<{ maximized: boolean }>("rightPanelMaximizeControl").maximized).toBe(
-          true,
-        );
-        expect(
-          capturedProps<{ rightPanelOpen: boolean }>("panelLayoutControls").rightPanelOpen,
-        ).toBe(true);
-        expect(
-          capturedProps<{ reserveTitlebarControls: boolean }>("chatHeaderActions")
-            .reserveTitlebarControls,
-        ).toBe(false);
-      } finally {
-        await act(async () => root.unmount());
-        container.remove();
-      }
-    });
-
-    it("keeps the persisted terminal activity scope pinned when another terminal pane becomes active", () => {
-      const terminalId = "terminal-inspected-activity";
-      const activeCenterTerminalId = "terminal-center-active";
-      const scope: ActivityScopeRef = {
-        _tag: "terminal",
-        threadId,
-        terminalId,
-      };
-      const child = actor("actor-terminal-center", "Terminal reviewer");
-      const snapshot = activitySnapshot(scope, [child]);
-      seedEnvironment(makeEnvironmentPresentation());
-      seedProject(makeProject());
-      seedServerThread(makeThread());
-      seedGitStatus(true);
-      seedActivityState(environmentId, scope, snapshot);
-      seedActivityQueries(environmentId, snapshot, [child]);
-      h.environmentSettingsById.set(environmentId, {
-        ...(h.settings as Record<string, unknown>),
-        enableTerminalAgentActivity: true,
-      });
-      useCenterPanelStore.getState().openTerminalPanel(threadRef, activeCenterTerminalId);
-      useRightPanelStore
-        .getState()
-        .openActivity(threadRef, "subagents", { _tag: "terminal", terminalId });
-      publishSeededStoreState(useCenterPanelStore);
-      publishSeededStoreState(useRightPanelStore);
-
-      const markup = renderServerRoute();
-
-      expect(markup).toContain('data-mock="center-terminal-panel"');
-      expect(markup).toContain('data-testid="activity-dock"');
-      expect(markup).toContain('data-mock="right-panel-tabs"');
-      expect(markup).toContain("data-activity-panel");
-      expect(
-        capturedProps<{ surface: { terminalId: string } }>("centerTerminalPanel"),
-      ).toMatchObject({
-        surface: { terminalId: activeCenterTerminalId },
-      });
-      // Every activity read targets the persisted terminal, never the active
-      // center pane. How many reads there are is not the behaviour: the panel
-      // folds its seeded roster pages in during render and renders again, and
-      // that pass reads twice uncompiled (root `vp test`) but three times under
-      // the React Compiler (the web package's lane).
-      expect(h.activityStateTargets.length).toBeGreaterThan(0);
-      for (const target of h.activityStateTargets) {
-        expect(target).toEqual({ environmentId, input: scope });
-      }
-    });
-
-    it("closes only Activity from a panel with hidden generic right-panel surfaces", async () => {
-      const panelThreadId = ThreadId.make("thread-panel-hidden-surfaces");
-      const panelThreadRef = scopeThreadRef(environmentId, panelThreadId);
-      const child = actor("actor-panel-hidden", "Hidden surfaces reviewer");
-      const snapshot = activitySnapshot({ _tag: "thread", threadId: panelThreadId }, [child]);
-      seedEnvironment(makeEnvironmentPresentation());
-      seedProject(makeProject());
-      seedServerThread(makeThread({ id: panelThreadId, title: "Panel hidden surfaces" }));
-      seedGitStatus(true);
-      seedActivityState(environmentId, snapshot.scope, snapshot);
-      seedActivityQueries(environmentId, snapshot, [child]);
-      h.previewState = {
-        ...h.previewState,
-        sessions: {
-          "preview-hidden": {
-            threadId: panelThreadId,
-            tabId: "preview-hidden",
-            navStatus: { _tag: "Success", url: "https://hidden.test/", title: "Hidden" },
-            canGoBack: false,
-            canGoForward: false,
-            updatedAt: now,
-          },
-        },
-      };
-      useRightPanelStore.getState().openBrowser(panelThreadRef, "preview-hidden");
-      useRightPanelStore.getState().openTerminal(panelThreadRef, "terminal-hidden");
-      useRightPanelStore.getState().openFile(panelThreadRef, "src/hidden.ts");
-      useRightPanelStore.getState().openActivity(panelThreadRef, "subagents", { _tag: "thread" });
-      publishSeededStoreState(useRightPanelStore);
-
-      const { container, root } = await mountActivityPanel(panelThreadRef);
-      try {
-        expect(container.querySelectorAll('[data-mock="right-panel-tabs"]')).toHaveLength(1);
-        const before = useRightPanelStore.getState().byThreadKey[scopedThreadKey(panelThreadRef)];
-        expect(before?.surfaces).toHaveLength(4);
-        expect(before?.surfaces.map((surface) => surface.kind)).toEqual(
-          expect.arrayContaining(["preview", "terminal", "file", "activity"]),
-        );
-
-        await act(async () => {
-          capturedProps<{ onCloseAllSurfaces: () => void }>("rightPanelTabs").onCloseAllSurfaces();
-          await Promise.resolve();
-        });
-
-        const after = useRightPanelStore.getState().byThreadKey[scopedThreadKey(panelThreadRef)];
-        expect(after?.surfaces).toHaveLength(3);
-        expect(after?.surfaces.map((surface) => surface.kind)).toEqual(
-          expect.arrayContaining(["preview", "terminal", "file"]),
-        );
-        expect(h.commandCalls.filter((call) => call.key === "preview.close")).toEqual([]);
-        expect(h.commandCalls.filter((call) => call.key === "terminal.close")).toEqual([]);
-        expect(h.releasedTerminalInputs).toEqual([]);
-        expect(container.querySelector('[data-mock="right-panel-tabs"]')).toBeNull();
-      } finally {
-        await act(async () => root.unmount());
-        container.remove();
-      }
     });
   });
 

@@ -10,7 +10,6 @@
  */
 import { scopedThreadKey } from "@bibcode/client-runtime/environment";
 import {
-  ACTIVITY_ID_MAX_LENGTH,
   type DevicePlatform,
   type ScopedThreadRef,
   SourceControlProviderKind,
@@ -31,20 +30,10 @@ export const RIGHT_PANEL_KINDS = [
   "file",
   "preview",
   "terminal",
-  "activity",
   "device",
   "pullRequest",
 ] as const;
 export type RightPanelKind = (typeof RIGHT_PANEL_KINDS)[number];
-
-export type ActivityRightPanelSurface = {
-  id: "activity";
-  kind: "activity";
-  scope: { _tag: "thread" } | { _tag: "terminal"; terminalId: string };
-  section: "subagents" | "backgroundTasks";
-  selectedRecordKind: "actor" | "workItem" | null;
-  selectedRecordId: string | null;
-};
 
 /**
  * The image a thread's Device pane last picked or started: an AVD name or a simulator UDID, which
@@ -92,11 +81,10 @@ export type RightPanelSurface =
     }
   | { id: "plan"; kind: "plan" }
   | DeviceRightPanelSurface
-  | ActivityRightPanelSurface
   | PullRequestRightPanelSurface;
 
 const RIGHT_PANEL_STORAGE_KEY = "bibcode:right-panel-state:v2";
-const RIGHT_PANEL_STORAGE_VERSION = 10;
+const RIGHT_PANEL_STORAGE_VERSION = 11;
 
 export interface ThreadRightPanelState {
   isOpen: boolean;
@@ -104,30 +92,11 @@ export interface ThreadRightPanelState {
   surfaces: RightPanelSurface[];
 }
 
-type GenericRightPanelKind = Exclude<
-  RightPanelKind,
-  "file" | "terminal" | "activity" | "pullRequest"
->;
+type GenericRightPanelKind = Exclude<RightPanelKind, "file" | "terminal" | "pullRequest">;
 
 interface RightPanelStoreState {
   byThreadKey: Record<string, ThreadRightPanelState>;
-  /**
-   * Threads whose Activity panel should take focus and scroll to the top of its
-   * section: set by every `openActivity`, cleared by the panel once it has
-   * done so. Never persisted, so a reload or a tab switch steals no focus.
-   */
-  activityFocusRequests: Record<string, true>;
   open: (ref: ScopedThreadRef, kind: GenericRightPanelKind) => void;
-  openActivity: (
-    ref: ScopedThreadRef,
-    section: ActivityRightPanelSurface["section"],
-    scope?: ActivityRightPanelSurface["scope"],
-  ) => void;
-  acknowledgeActivityFocus: (ref: ScopedThreadRef) => void;
-  navigateActivity: (
-    ref: ScopedThreadRef,
-    route: Pick<ActivityRightPanelSurface, "section" | "selectedRecordKind" | "selectedRecordId">,
-  ) => void;
   openBrowser: (ref: ScopedThreadRef, tabId: string | null) => void;
   openFile: (ref: ScopedThreadRef, relativePath: string, line?: number) => void;
   openPullRequest: (
@@ -188,77 +157,12 @@ const singletonSurface = (kind: Exclude<GenericRightPanelKind, "preview">): Righ
   }
 };
 
-const DEFAULT_ACTIVITY_SCOPE: ActivityRightPanelSurface["scope"] = { _tag: "thread" };
-
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object";
 }
 
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.length > 0;
-}
-
-function isBoundedActivityId(value: unknown): value is string {
-  return (
-    typeof value === "string" &&
-    value.length > 0 &&
-    value.length <= ACTIVITY_ID_MAX_LENGTH &&
-    value.trim() === value
-  );
-}
-
-function normalizeActivityScope(value: unknown): ActivityRightPanelSurface["scope"] {
-  if (isRecord(value) && value._tag === "terminal" && isBoundedActivityId(value.terminalId)) {
-    return { _tag: "terminal", terminalId: value.terminalId };
-  }
-  return { _tag: "thread" };
-}
-
-function normalizeActivitySection(value: unknown): ActivityRightPanelSurface["section"] {
-  return value === "backgroundTasks" ? "backgroundTasks" : "subagents";
-}
-
-function normalizeActivitySelection(
-  section: ActivityRightPanelSurface["section"],
-  kind: unknown,
-  id: unknown,
-): Pick<ActivityRightPanelSurface, "selectedRecordKind" | "selectedRecordId"> {
-  const kindMatchesSection =
-    (section === "subagents" && kind === "actor") ||
-    (section === "backgroundTasks" && kind === "workItem");
-  if (kindMatchesSection && isBoundedActivityId(id)) {
-    return { selectedRecordKind: kind, selectedRecordId: id };
-  }
-  return { selectedRecordKind: null, selectedRecordId: null };
-}
-
-function activityScopesEqual(
-  left: ActivityRightPanelSurface["scope"],
-  right: ActivityRightPanelSurface["scope"],
-): boolean {
-  return (
-    left._tag === right._tag &&
-    (left._tag === "thread" || (right._tag === "terminal" && left.terminalId === right.terminalId))
-  );
-}
-
-function normalizeActivitySurface(
-  value: Record<string, unknown>,
-): ActivityRightPanelSurface | null {
-  if (value.id !== "activity" || value.kind !== "activity") return null;
-  const section = normalizeActivitySection(value.section);
-  const selection = normalizeActivitySelection(
-    section,
-    value.selectedRecordKind,
-    value.selectedRecordId,
-  );
-  return {
-    id: "activity",
-    kind: "activity",
-    scope: normalizeActivityScope(value.scope),
-    section,
-    ...selection,
-  };
 }
 
 function normalizeDeviceImage(value: unknown): DeviceSurfaceImage | null {
@@ -370,8 +274,6 @@ function normalizePersistedSurface(value: unknown): RightPanelSurface | null {
   if (!isRecord(value) || typeof value.kind !== "string") return null;
 
   switch (value.kind) {
-    case "activity":
-      return normalizeActivitySurface(value);
     case "diff":
       return value.id === "diff" ? { id: "diff", kind: "diff" } : null;
     case "sourceControl":
@@ -478,20 +380,27 @@ export function migratePersistedRightPanelState(persistedState: unknown): {
                   surfaces.push(surface);
                 }
               }
+              // Activity left the right panel for each pane's own inline panel.
+              // A panel last showing it stays closed rather than reopening on
+              // whatever surface happens to remain.
+              const wasShowingActivity = validThreadState?.activeSurfaceId === "activity";
               const activeSurfaceId = surfaces.some(
                 (surface) => surface.id === validThreadState?.activeSurfaceId,
               )
                 ? (validThreadState?.activeSurfaceId as string)
-                : null;
+                : wasShowingActivity
+                  ? (surfaces[0]?.id ?? null)
+                  : null;
               const allPersistedSurfacesWereInvalid =
                 Array.isArray(validThreadState?.surfaces) &&
                 validThreadState.surfaces.length > 0 &&
                 surfaces.length === 0;
-              const isOpen = allPersistedSurfacesWereInvalid
-                ? false
-                : typeof validThreadState?.isOpen === "boolean"
-                  ? validThreadState.isOpen
-                  : activeSurfaceId !== null;
+              const isOpen =
+                allPersistedSurfacesWereInvalid || wasShowingActivity
+                  ? false
+                  : typeof validThreadState?.isOpen === "boolean"
+                    ? validThreadState.isOpen
+                    : activeSurfaceId !== null;
               return [threadKey, { isOpen, surfaces, activeSurfaceId }];
             },
           ),
@@ -504,7 +413,6 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
   persist(
     (set) => ({
       byThreadKey: {},
-      activityFocusRequests: {},
       open: (ref, kind) =>
         set((state) => ({
           byThreadKey: updateThread(state.byThreadKey, scopedThreadKey(ref), (current) => {
@@ -513,80 +421,6 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
               return upsertSurface(current, existing ?? browserSurface(null));
             }
             return upsertSurface(current, singletonSurface(kind));
-          }),
-        })),
-      openActivity: (ref, section, scope = DEFAULT_ACTIVITY_SCOPE) =>
-        set((state) => ({
-          activityFocusRequests: { ...state.activityFocusRequests, [scopedThreadKey(ref)]: true },
-          byThreadKey: updateThread(state.byThreadKey, scopedThreadKey(ref), (current) => {
-            const normalizedSection = normalizeActivitySection(section);
-            const normalizedScope = normalizeActivityScope(scope);
-            const existing = current.surfaces.find(
-              (surface): surface is ActivityRightPanelSurface => surface.kind === "activity",
-            );
-            const routeChanged =
-              existing === undefined ||
-              existing.section !== normalizedSection ||
-              !activityScopesEqual(existing.scope, normalizedScope);
-            const surface: ActivityRightPanelSurface = {
-              id: "activity",
-              kind: "activity",
-              scope: normalizedScope,
-              section: normalizedSection,
-              selectedRecordKind: routeChanged ? null : existing.selectedRecordKind,
-              selectedRecordId: routeChanged ? null : existing.selectedRecordId,
-            };
-            return {
-              isOpen: true,
-              activeSurfaceId: "activity",
-              surfaces: existing
-                ? current.surfaces.map((entry) => (entry.id === "activity" ? surface : entry))
-                : [...current.surfaces, surface],
-            };
-          }),
-        })),
-      acknowledgeActivityFocus: (ref) =>
-        set((state) => {
-          const threadKey = scopedThreadKey(ref);
-          if (!(threadKey in state.activityFocusRequests)) return state;
-          const { [threadKey]: _handled, ...rest } = state.activityFocusRequests;
-          return { activityFocusRequests: rest };
-        }),
-      navigateActivity: (ref, route) =>
-        set((state) => ({
-          byThreadKey: updateThread(state.byThreadKey, scopedThreadKey(ref), (current) => {
-            if (!current.isOpen) return current;
-            const existing = current.surfaces.find(
-              (surface): surface is ActivityRightPanelSurface => surface.kind === "activity",
-            );
-            if (!existing) return current;
-            const section = normalizeActivitySection(route.section);
-            const selection =
-              section === existing.section
-                ? normalizeActivitySelection(
-                    section,
-                    route.selectedRecordKind,
-                    route.selectedRecordId,
-                  )
-                : { selectedRecordKind: null, selectedRecordId: null };
-            const surface: ActivityRightPanelSurface = {
-              ...existing,
-              section,
-              ...selection,
-            };
-            if (
-              surface.section === existing.section &&
-              surface.selectedRecordKind === existing.selectedRecordKind &&
-              surface.selectedRecordId === existing.selectedRecordId
-            ) {
-              return current;
-            }
-            return {
-              ...current,
-              surfaces: current.surfaces.map((entry) =>
-                entry.id === "activity" ? surface : entry,
-              ),
-            };
           }),
         })),
       openBrowser: (ref, tabId) =>
@@ -1008,8 +842,7 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
           const threadKey = scopedThreadKey(ref);
           if (!(threadKey in state.byThreadKey)) return state;
           const { [threadKey]: _removed, ...rest } = state.byThreadKey;
-          const { [threadKey]: _request, ...activityFocusRequests } = state.activityFocusRequests;
-          return { byThreadKey: rest, activityFocusRequests };
+          return { byThreadKey: rest };
         }),
     }),
     {
@@ -1028,13 +861,6 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
     },
   ),
 );
-
-export function selectActivityFocusRequested(
-  state: Pick<RightPanelStoreState, "activityFocusRequests">,
-  ref: ScopedThreadRef | null | undefined,
-): boolean {
-  return ref ? state.activityFocusRequests[scopedThreadKey(ref)] === true : false;
-}
 
 export function selectThreadRightPanelState(
   byThreadKey: Record<string, ThreadRightPanelState>,

@@ -957,6 +957,7 @@ export function TerminalViewport({
   const rendererEpochRef = useRef(0);
   const [rendererEpoch, setRendererEpoch] = useState(0);
   const [documentVisible, setDocumentVisible] = useState(isDocumentVisible);
+  const [paneElement, setPaneElement] = useState<HTMLDivElement | null>(null);
   const shouldRender = visible && isDocumentVisible() && documentVisible;
   const enableTerminalAgentActivity = useEnvironmentSettings(
     environmentId,
@@ -2291,8 +2292,14 @@ export function TerminalViewport({
       ) {
         return;
       }
-      terminal.focus();
       fulfilledFocusRequestIdRef.current = focusRequestId;
+      // Focusing the pane by using its own Activity panel must not pull focus
+      // back into the terminal: the panel keeps it, so Escape still collapses it.
+      const activityHost = containerRef.current?.parentElement?.querySelector(
+        "[data-provider-terminal-activity-host]",
+      );
+      if (activityHost?.contains(document.activeElement)) return;
+      terminal.focus();
     });
     return () => {
       focusGenerationRef.current += 1;
@@ -2368,10 +2375,13 @@ export function TerminalViewport({
     };
   }, [rendererEpoch, shouldRender]);
   return (
-    <div className="relative h-full w-full overflow-hidden rounded-[4px] bg-background">
+    <div
+      ref={setPaneElement}
+      className="relative flex h-full w-full flex-col overflow-hidden rounded-[4px] bg-background"
+    >
       <div
         ref={containerRef}
-        className="h-full w-full overflow-hidden"
+        className="min-h-0 w-full flex-1 overflow-hidden"
         data-terminal-xterm-mount={terminalId}
       />
       {shouldRender && sizeOwnership && mirroringSize ? (
@@ -2397,8 +2407,10 @@ export function TerminalViewport({
         </div>
       ) : null}
       {enableTerminalAgentActivity && shouldRender && command?.activity !== undefined ? (
+        // In the pane's own layout: an open panel takes rows from the terminal,
+        // which refits and resizes its PTY, and collapsing gives them back.
         <div
-          className="pointer-events-none absolute inset-x-0 top-7 bottom-0 z-10"
+          className="shrink-0 px-2 pt-1.5 pb-2 empty:hidden"
           data-provider-terminal-activity-host={terminalId}
         >
           <ProviderTerminalActivityDock
@@ -2407,6 +2419,7 @@ export function TerminalViewport({
             activity={command.activity}
             visible={shouldRender}
             compact={false}
+            paneElement={paneElement}
           />
         </div>
       ) : null}

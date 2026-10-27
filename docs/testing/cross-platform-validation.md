@@ -3043,8 +3043,9 @@ sizes. Cover relevant:
 - the [durable message queue](#durable-message-queue): FIFO cards, native steer,
   Cancel restoration, reload and restart persistence, promotion, Stop drain,
   holds, and unsupported-provider explanations;
-- terminal input/output and panel switching, including reopening the global right panel after a
-  sibling chat suppresses a previously active Activity surface;
+- terminal input/output and panel switching, including each chat and Codex terminal pane's
+  own Activity panel in a split: it stays inside its pane, the composer stays usable, and
+  the terminal redraws at its new size;
 - Files tree nesting, mutations, and moves: one row per directory with its own
   expand arrow rather than merged directory chains, **New File…** creating the
   entry in the clicked nested folder while expanded folders stay expanded, a
@@ -3101,9 +3102,11 @@ sizes. Cover relevant:
   and selections stay usable, and sibling rows still open normally;
 - Activity subagents and background tasks, including elapsed time and keyboard
   navigation. One click or **Enter** on the **Activity** button opens the panel
-  on the section with an error or running work and, with the panel open, keeps
-  it open and moves focus to the section's tab; the **Background tasks** tab
-  reaches the other section. With **Settings → Agents → Always show Activity** on, a new chat on a
+  in the same pane, above the composer, on the section with an error or running
+  work, and moves focus to the section's tab. Another click, or **Escape** in
+  the panel, collapses it and returns focus to the button, without moving the
+  chat's scroll position. The right panel never opens for Activity. The
+  **Background tasks** tab reaches the other section. With **Settings → Agents → Always show Activity** on, a new chat on a
   provider that reports activity shows the muted **Activity** button before its
   first subagent; with it off, the button waits for a record;
 - with an outdated provider on the primary and on a connected remote
@@ -3208,7 +3211,13 @@ crash types, termination reasons, and faulting symbols; it excludes raw memory
 and the rest of the diagnostic report. Inspect these logs when the app or
 embedded driver exits unexpectedly. A missing provider-terminal activity dock
 also records structural pane, surface, and activity-host geometry to distinguish
-layout visibility from provider-observation failures.
+layout visibility from provider-observation failures. A visible host with no
+dock is an observation failure. Before changing layout, read the Codex observer
+lines in `app-server.log`: each names its `reason`, its `stage`, and `elapsed_ms`
+(see [Activity observation](../architecture/activity-observation.md)).
+A spec that passes alone but fails in the full suite fails only under the
+suite's load. Take the stage from the full run's `app-server.log` before
+changing an observer budget.
 Window resizing polls the actual viewport and native window until the requested
 size is reached, including when GTK startup dimensions settle independently.
 It does not depend on animation frames, which can stop in occluded macOS
