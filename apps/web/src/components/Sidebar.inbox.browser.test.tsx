@@ -163,11 +163,12 @@ function agentCard(title: string): HTMLButtonElement {
   return element;
 }
 
+/** The titles of the cards in the Inbox's agent list, whatever their status. */
 function listedTitles(): string[] {
-  return Array.from(container!.querySelectorAll<HTMLButtonElement>("button"))
-    .map((button) => button.getAttribute("aria-label") ?? "")
-    .filter((label) => /, (Pending Approval|Awaiting Input|Working|Done|Connecting)/.test(label))
-    .map((label) => label.split(", ")[0]!);
+  const list = container!.querySelector('[data-testid="sidebar-inbox-view"] [role="list"]');
+  return Array.from(list?.querySelectorAll<HTMLButtonElement>("button[aria-label]") ?? []).map(
+    (button) => button.getAttribute("aria-label")!.split(", ")[0]!,
+  );
 }
 
 function focusedSurfaceId(threadId: string, environmentId = ENV_MAIN): string | null {
@@ -490,5 +491,94 @@ describe("Sidebar Inbox view", () => {
     h.selectionStore.setState({ selectedThreadKeys: new Set<string>() });
     await act(async () => agentCard("Finished").click());
     expect(h.spies.clearSelection).not.toHaveBeenCalled();
+  });
+
+  it("shows Needs Attention from partial data without saving it as the default", async () => {
+    h.state.environments = [
+      environmentFixture({ environmentId: ENV_MAIN, label: "Main", connectionId: "primary" }),
+      environmentFixture({ environmentId: ENV_REMOTE, label: "Remote", connectionId: "remote" }),
+    ];
+    h.state.shellSummary = liveSummary([ENV_MAIN], [ENV_REMOTE]);
+    await renderSidebar();
+    expect(pressedTiles()).toEqual(["attention"]);
+    expect(listedTitles()).toEqual(["Needs approval"]);
+    expect(h.uiStore.getState().inboxCategory).toBeNull();
+    expect(h.uiStore.getState().setInboxCategory).not.toHaveBeenCalled();
+  });
+
+  it("hedges an empty Needs Attention while a server has not reported", async () => {
+    h.state.environments = [
+      environmentFixture({ environmentId: ENV_MAIN, label: "Main", connectionId: "primary" }),
+      environmentFixture({ environmentId: ENV_REMOTE, label: "Remote", connectionId: "remote" }),
+    ];
+    h.state.threads = [doneThread];
+    h.state.shellSummary = liveSummary([ENV_MAIN], [ENV_REMOTE]);
+    h.uiStore.setState({ inboxCategory: "attention" });
+    await renderSidebar();
+    expect(container!.querySelector('[data-testid="inbox-empty"]')?.textContent).toBe(
+      "Nothing needs you on the connected servers.",
+    );
+  });
+
+  it("shows a placeholder count, not 0, while agents load", async () => {
+    h.state.shellSummary = { ...liveSummary([ENV_MAIN]), catalogReady: false };
+    await renderSidebar();
+    expect(tile("attention").getAttribute("aria-label")).toBe("Needs Attention, loading");
+    expect(tile("attention").textContent).toBe("–Needs Attention");
+    expect(container!.textContent).toContain("Loading agents…");
+  });
+
+  it("names an empty Inbox's way in, chats or AI Terminals", async () => {
+    h.state.threads = [];
+    h.uiStore.setState({ inboxCategory: "all" });
+    await renderSidebar();
+    expect(container!.querySelector('[data-testid="inbox-empty"]')?.textContent).toBe(
+      "No agents yet. Start a chat or an AI Terminal in a project and it shows up here.",
+    );
+  });
+
+  it("keeps the app-level health notices in the Inbox", async () => {
+    h.state.desktopUpdateState = { phase: "idle" };
+    h.state.showArmWarning = true;
+    h.state.updateBtnAction = "download";
+    h.state.desktopBootstraps = [{ label: "Podman", httpBaseUrl: null }];
+    await renderSidebar();
+    const inbox = container!.querySelector('[data-testid="sidebar-inbox-view"]')!;
+    expect(inbox.textContent).toContain("Intel build on Apple Silicon");
+    expect(inbox.textContent).toContain("Download ARM build");
+    expect(inbox.textContent).toContain("Connecting Podman");
+  });
+
+  it("sends an environment that needs attention to Environments with it selected", async () => {
+    h.state.environments = [
+      environmentFixture({ environmentId: ENV_MAIN, label: "Main", connectionId: "primary" }),
+      environmentFixture({ environmentId: ENV_REMOTE, label: "Remote", connectionId: "remote" }),
+    ];
+    for (const status of [
+      "degraded",
+      "storage-changed",
+      "recovery-required",
+      "configuration-error",
+    ]) {
+      h.state.activeEnvironmentId = ENV_MAIN;
+      h.uiStore.setState({ sidebarView: "inbox" });
+      h.state.shellSummary = {
+        ...liveSummary([ENV_MAIN]),
+        desiredEnvironmentCount: 2,
+        canShowEmptyProjects: false,
+        statuses: [
+          { environmentId: ENV_MAIN, status: "live", hasSnapshot: true, error: null },
+          { environmentId: ENV_REMOTE, status, hasSnapshot: true, error: null },
+        ],
+      };
+      await renderSidebar();
+      const notice = container!.querySelector('[data-testid="inbox-partial"]');
+      expect(notice?.textContent, status).toBe(
+        "Remote needs attention, so its agents may be missing or out of date.Show in Environments",
+      );
+      await act(async () => notice!.querySelector<HTMLButtonElement>("button")!.click());
+      expect(h.uiStore.getState().sidebarView, status).toBe("environments");
+      expect(h.state.activeEnvironmentId, status).toBe(ENV_REMOTE);
+    }
   });
 });

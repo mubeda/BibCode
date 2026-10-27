@@ -3966,6 +3966,53 @@ function LocalSecondaryStatus() {
   );
 }
 
+type SidebarAppNoticesProps = Pick<
+  SidebarProjectsContentProps,
+  | "showArm64IntelBuildWarning"
+  | "arm64IntelBuildWarningDescription"
+  | "desktopUpdateButtonAction"
+  | "desktopUpdateButtonDisabled"
+  | "handleDesktopUpdateButtonClick"
+>;
+
+/** App-level health notices every left-panel view shows: the Intel build warning and local backends. */
+const SidebarAppNotices = memo(function SidebarAppNotices({
+  showArm64IntelBuildWarning,
+  arm64IntelBuildWarningDescription,
+  desktopUpdateButtonAction,
+  desktopUpdateButtonDisabled,
+  handleDesktopUpdateButtonClick,
+}: SidebarAppNoticesProps) {
+  return (
+    <>
+      {showArm64IntelBuildWarning && arm64IntelBuildWarningDescription ? (
+        <SidebarGroup className="px-2 pt-2 pb-0">
+          <Alert variant="warning" className="rounded-2xl border-warning/40 bg-warning/8">
+            <TriangleAlertIcon />
+            <AlertTitle>Intel build on Apple Silicon</AlertTitle>
+            <AlertDescription>{arm64IntelBuildWarningDescription}</AlertDescription>
+            {desktopUpdateButtonAction !== "none" ? (
+              <AlertAction>
+                <Button
+                  size="xs"
+                  variant="outline"
+                  disabled={desktopUpdateButtonDisabled}
+                  onClick={handleDesktopUpdateButtonClick}
+                >
+                  {desktopUpdateButtonAction === "download"
+                    ? "Download ARM build"
+                    : "Install ARM build"}
+                </Button>
+              </AlertAction>
+            ) : null}
+          </Alert>
+        </SidebarGroup>
+      ) : null}
+      <LocalSecondaryStatus />
+    </>
+  );
+});
+
 type SortableProjectHandleProps = Pick<
   ReturnType<typeof useSortable>,
   "attributes" | "listeners" | "setActivatorNodeRef"
@@ -4461,30 +4508,13 @@ const SidebarProjectsContent = memo(function SidebarProjectsContent(
         </SidebarMenu>
       </SidebarGroup>
       <AgentsNavRow />
-      {showArm64IntelBuildWarning && arm64IntelBuildWarningDescription ? (
-        <SidebarGroup className="px-2 pt-2 pb-0">
-          <Alert variant="warning" className="rounded-2xl border-warning/40 bg-warning/8">
-            <TriangleAlertIcon />
-            <AlertTitle>Intel build on Apple Silicon</AlertTitle>
-            <AlertDescription>{arm64IntelBuildWarningDescription}</AlertDescription>
-            {desktopUpdateButtonAction !== "none" ? (
-              <AlertAction>
-                <Button
-                  size="xs"
-                  variant="outline"
-                  disabled={desktopUpdateButtonDisabled}
-                  onClick={handleDesktopUpdateButtonClick}
-                >
-                  {desktopUpdateButtonAction === "download"
-                    ? "Download ARM build"
-                    : "Install ARM build"}
-                </Button>
-              </AlertAction>
-            ) : null}
-          </Alert>
-        </SidebarGroup>
-      ) : null}
-      <LocalSecondaryStatus />
+      <SidebarAppNotices
+        showArm64IntelBuildWarning={showArm64IntelBuildWarning}
+        arm64IntelBuildWarningDescription={arm64IntelBuildWarningDescription}
+        desktopUpdateButtonAction={desktopUpdateButtonAction}
+        desktopUpdateButtonDisabled={desktopUpdateButtonDisabled}
+        handleDesktopUpdateButtonClick={handleDesktopUpdateButtonClick}
+      />
       <SidebarGroup
         className="flex-1 bg-sidebar-well px-2 py-2"
         data-testid="sidebar-projects-group"
@@ -5560,7 +5590,17 @@ export default function Sidebar() {
           <SidebarViewToggle />
           {sidebarView === "environments" ? <SidebarEnvironmentContextCard /> : null}
           {sidebarView === "inbox" ? (
-            <SidebarInboxView />
+            <SidebarInboxView
+              notices={
+                <SidebarAppNotices
+                  showArm64IntelBuildWarning={showArm64IntelBuildWarning}
+                  arm64IntelBuildWarningDescription={arm64IntelBuildWarningDescription}
+                  desktopUpdateButtonAction={desktopUpdateButtonAction}
+                  desktopUpdateButtonDisabled={desktopUpdateButtonDisabled}
+                  handleDesktopUpdateButtonClick={handleDesktopUpdateButtonClick}
+                />
+              }
+            />
           ) : (
             <SidebarProjectsContent
               showArm64IntelBuildWarning={showArm64IntelBuildWarning}
