@@ -465,7 +465,9 @@ Recovery and truthful downgrade:
   `bounded` only after correlated transcript recovery; unproven hook support
   leaves activity unsupported. A session that restarts in the same server
   process keeps its activity lifecycle, and the new process's startup
-  capabilities replace what the old one reported. A Claude process whose probe
+  capabilities replace what the old one reported. This also happens while Chat
+  Activity is off, so turning it back on publishes what the new process
+  reports. A Claude process whose probe
   found no hook flags starts without a hook sink and reports `none`, so retained
   subagents turn stale instead of staying live. Other providers whose startup
   report is `none` (Cursor, Grok, OpenCode) only mean "not known yet". Their
