@@ -14461,6 +14461,7 @@ async fn claude_transcript_recovery_shutdown_breaks_event_queue_backpressure() {
 case "$1" in
   --version) printf '%s\n' '2.1.218'; exit 0;;
   --help) printf '%s\n' '--include-hook-events --forward-subagent-text'; exit 0;;
+  --thinking-display) exit 1;;
 esac
 # Short lines keep all stderr below one 4 KiB pipe page, regardless of pipe size.
 index=0
