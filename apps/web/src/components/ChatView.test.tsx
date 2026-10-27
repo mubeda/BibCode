@@ -1883,6 +1883,158 @@ describe("ChatView", () => {
       }
     });
 
+    // The panel sits in the measured composer overlay, so opening it grows the
+    // timeline's end inset exactly as a taller composer does. LegendList keeps
+    // the reading position for an inset change by itself; ChatView must only pass
+    // the new inset on and never scroll the list for it, whatever the list is doing.
+    it.each([
+      { mode: "reading mid-history", scroll: 400, anchored: false },
+      { mode: "following the end", scroll: 2_200, anchored: false },
+      { mode: "holding a just-sent turn anchored", scroll: 1_000, anchored: true },
+    ])(
+      "opens and closes the panel without scrolling the timeline while $mode",
+      async ({ scroll, anchored }) => {
+        const child = actor("actor-scroll", "Scroll reviewer");
+        const snapshot = activitySnapshot({ _tag: "thread", threadId }, [child]);
+        seedEnvironment(makeEnvironmentPresentation());
+        seedProject(makeProject());
+        seedServerThread(makeThread());
+        seedGitStatus(true);
+        seedActivityState(environmentId, snapshot.scope, snapshot);
+        seedActivityQueries(environmentId, snapshot, [child]);
+        const scrollNode = document.createElement("div");
+        const listScroll = {
+          scrollToEnd: vi.fn(),
+          scrollToIndex: vi.fn(),
+          scrollToOffset: vi.fn(),
+        };
+        h.timelineList = {
+          getScrollableNode: () => scrollNode,
+          getState: () => ({
+            scroll,
+            scrollLength: 800,
+            contentLength: 3_000,
+            data: [{}, {}],
+            positionAtIndex: (index: number) => index * 1_000,
+            sizeAtIndex: () => 1_000,
+          }),
+          ...listScroll,
+        };
+
+        const { container, root } = await mountActivityRoute();
+        const resizeCallbacks: Array<() => void> = [];
+        vi.stubGlobal(
+          "ResizeObserver",
+          class {
+            constructor(callback: () => void) {
+              resizeCallbacks.push(callback);
+            }
+            observe() {}
+            unobserve() {}
+            disconnect() {}
+          },
+        );
+        const overlayHeight = () =>
+          container.querySelector("[data-chat-composer-overlay] [data-activity-panel]") === null
+            ? 140
+            : 492;
+        const nativeRect = Element.prototype.getBoundingClientRect;
+        const rectSpy = vi.spyOn(Element.prototype, "getBoundingClientRect");
+        rectSpy.mockImplementation(function (this: Element) {
+          return this.matches("[data-chat-composer-overlay]")
+            ? ({ height: overlayHeight(), width: 800, top: 0, left: 0 } as DOMRect)
+            : nativeRect.call(this);
+        });
+        const reportResize = async () =>
+          act(async () => {
+            for (const callback of resizeCallbacks) callback();
+            await Promise.resolve();
+          });
+        const inset = () =>
+          capturedProps<Record<string, unknown>>("messagesTimeline")["contentInsetEndAdjustment"];
+        try {
+          // Remount so the overlay is measured by the stubbed observer.
+          await act(async () => {
+            root.render(
+              <ChatView
+                key="measured"
+                environmentId={environmentId}
+                threadId={threadId}
+                routeKind="server"
+                reserveTitleBarControlInset
+              />,
+            );
+            await Promise.resolve();
+          });
+          await reportResize();
+          expect(inset()).toBe(140);
+          if (anchored) {
+            const composer = capturedProps<Record<string, unknown>>("chatComposer");
+            (composer["composerRef"] as RefObject<ChatComposerHandle | null>).current = {
+              focusAtEnd: () => undefined,
+              resetCursorState: () => undefined,
+              addTerminalContext: () => false,
+              getSendContext: () => ({
+                attachments: [],
+                terminalContexts: [],
+                elementContexts: [],
+                previewAnnotations: [],
+                reviewComments: [],
+                selectedProvider: ProviderDriverKind.make("codex"),
+                selectedModel: "gpt-5.4",
+                selectedProviderModels: codexProvider.models,
+                selectedPromptEffort: null,
+                selectedModelSelection: { instanceId: codexInstanceId, model: "gpt-5.4" },
+              }),
+            } as ChatComposerHandle;
+            (composer["promptRef"] as RefObject<string>).current = "hold this turn";
+            await act(async () => (composer["onSend"] as () => Promise<void>)());
+            const sent = h.commandCalls.find((call) => call.key === "thread.startTurn")!.input as {
+              input: { message: { messageId: MessageId } };
+            };
+            await act(async () =>
+              (
+                capturedProps<Record<string, unknown>>("messagesTimeline")["onAnchorReady"] as (
+                  id: MessageId,
+                  index: number,
+                ) => void
+              )(sent.input.message.messageId, 1),
+            );
+          }
+          // Let the send's own anchoring settle before the panel is toggled.
+          await act(
+            () =>
+              new Promise<void>((resolve) => {
+                const step = (left: number) =>
+                  left === 0 ? resolve() : requestAnimationFrame(() => step(left - 1));
+                step(6);
+              }),
+          );
+          for (const spy of Object.values(listScroll)) spy.mockClear();
+
+          await openSubagents(container);
+          await reportResize();
+          expect(inset()).toBe(492);
+
+          const pill = container.querySelector<HTMLButtonElement>(
+            '[data-testid="activity-dock"] button',
+          )!;
+          await click(pill);
+          await reportResize();
+          expect(container.querySelector("[data-activity-panel]")).toBeNull();
+          expect(inset()).toBe(140);
+
+          expect(listScroll.scrollToEnd).not.toHaveBeenCalled();
+          expect(listScroll.scrollToIndex).not.toHaveBeenCalled();
+          expect(listScroll.scrollToOffset).not.toHaveBeenCalled();
+        } finally {
+          rectSpy.mockRestore();
+          await act(async () => root.unmount());
+          container.remove();
+        }
+      },
+    );
+
     it("keeps a saved open panel hidden at disabled startup without creating an activity RPC consumer", async () => {
       seedEnvironment(makeEnvironmentPresentation());
       seedProject(makeProject());
