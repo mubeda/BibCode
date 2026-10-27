@@ -56,6 +56,7 @@
       "id": "t1",
       "interactionMode": "plan",
       "kind": "workspace",
+      "lastActivityAt": "2026-07-10T10:01:04.000Z",
       "latestTurn": {
         "assistantMessageId": "m-assistant",
         "completedAt": "2026-07-10T10:01:14.000Z",
@@ -257,6 +258,7 @@
       "patch": {
         "arrays": {},
         "set": {
+          "lastActivityAt": "2026-07-10T10:01:04.000Z",
           "latestTurn": {
             "assistantMessageId": null,
             "completedAt": null,
