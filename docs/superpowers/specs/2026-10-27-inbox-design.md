@@ -1,7 +1,29 @@
 # Left-panel Inbox view (#186): design
 
-Status: proposed, awaiting approval. Plan:
+Status: approved with changes and implemented. Plan:
 [`2026-10-27-inbox.md`](../plans/2026-10-27-inbox.md).
+
+## Approved changes (supersede the sections below where they differ)
+
+- **Row shape** follows the #187 agent-row contract: `AgentGroupId` gains
+  `unknown` (counted only under All Agents), rows are per agent with
+  `terminalId: string | null` (terminal row key
+  `${threadKey}#terminal:${terminalId}`, `ref` = host thread), sessionless
+  AI-terminal worktrees get rows, `STATUS_TONES` is exported, and
+  `AgentsRow`'s `onJumpToWorkspace` becomes optional. Until that branch lands,
+  `inbox/agentRowContract.ts` carries the optional fields and mirrored tones.
+- **Default tile** is persisted once settled, not held per mount: Needs
+  Attention as soon as any agent needs attention (on partial or complete
+  data); All Agents only on complete data (every environment live with a
+  snapshot and a readable catalog). Loading or partial data shows All Agents
+  without persisting. Partial data shows a note in the list.
+- **Terminal rows** open `terminal:${terminalId}` through
+  `openTerminalPanel`, never by guessing a provider command.
+- **Closed host chat**: the new `openHostChat` center-panel action puts
+  `chat:host` back into the focused group (an empty layout persists) and
+  focuses it.
+- **Unread**: `useAgentsUnread` treats the routed thread and the chat panel
+  focused in its center layout as open; only chat rows feed the detector.
 
 ## Goal
 
