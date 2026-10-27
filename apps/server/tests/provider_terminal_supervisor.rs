@@ -15047,6 +15047,66 @@ async fn codex_preparation_that_runs_out_of_time_names_the_helper_stage() {
 }
 
 #[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_observer_says_when_its_app_server_has_not_connected_and_keeps_waiting() {
+    own_process!(isolated);
+    // Observer workers run on their own runtime threads, so this test, alone in
+    // its process, captures through the global subscriber.
+    let capture = TraceCapture::default();
+    tracing::subscriber::set_global_default(
+        tracing_subscriber::fmt()
+            .without_time()
+            .with_target(false)
+            .with_ansi(false)
+            .with_writer(capture.clone())
+            .finish(),
+    )
+    .expect("the test process's only subscriber");
+    let root = tempfile::tempdir().expect("fixture root");
+    let configured = root.path().join("configured-codex");
+    std::fs::write(&configured, b"configured").expect("configured executable");
+    let remote_state = Arc::new(CodexFixtureRemoteState::default());
+    *remote_state
+        .connect_delay
+        .lock()
+        .expect("connect delay lock") = std::time::Duration::from_millis(3_600);
+
+    let (manager, _projection, _scope) = open_codex_fixture_terminal(
+        &root,
+        &configured,
+        remote_state.clone(),
+        "terminal-slow-connect",
+    )
+    .await;
+
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !capture.text().contains("connect_timeout") {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("no connect_timeout warning: {}", capture.text()));
+    let diagnostic = capture.text();
+    assert!(diagnostic.contains("stage=\"connect\""), "{diagnostic}");
+    assert!(diagnostic.contains("elapsed_ms="), "{diagnostic}");
+    assert!(!diagnostic.contains("connect_failed"), "{diagnostic}");
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while remote_state
+            .endpoints
+            .lock()
+            .expect("remote endpoints lock")
+            .is_empty()
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the slow connection still completes after the warning");
+    manager.shutdown().await;
+    isolated.complete();
+}
+
+#[cfg(unix)]
 #[tokio::test]
 async fn codex_helper_failure_is_logged_as_its_own_reason_with_the_launcher_error() {
     own_process!(isolated);

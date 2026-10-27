@@ -3116,6 +3116,9 @@ layout visibility from provider-observation failures. A visible host with no
 dock is an observation failure. Before changing layout, read the Codex observer
 lines in `app-server.log`: each names its `reason`, its `stage`, and `elapsed_ms`
 (see [Activity observation](../architecture/activity-observation.md)).
+A spec that passes alone but fails in the full suite fails only under the
+suite's load. Take the stage from the full run's `app-server.log` before
+changing an observer budget.
 Window resizing polls the actual viewport and native window until the requested
 size is reached, including when GTK startup dimensions settle independently.
 It does not depend on animation frames, which can stop in occluded macOS
