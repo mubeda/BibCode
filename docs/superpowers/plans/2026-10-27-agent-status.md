@@ -42,6 +42,13 @@ spec, but it needs the coordinator's decisions and is not part of this plan.
    - Verify the order of OpenCode's `ready` on resume and its recovered asks.
      The recovered ask must arrive after the `ready` or reopen the request.
      Covered by the existing OpenCode resume test.
+   - Verify the Claude adapter's
+     `snapshot`/`restore_from_snapshot`, which carries pending approvals and
+     questions (`provider/claude/runtime.rs:2631-2680`). Today its only caller
+     is test code (`provider_runtime.rs` `mod tests`, ~22351). If a production
+     restore path exists by phase 2, a restored request must re-emit
+     `request.opened` or `user-input.requested` so that D2 reopens it. A
+     request kept answerable without that would be left orphaned.
 3. **D2, client side.** `apps/web/src/session-logic.ts`: `derivePendingApprovals`
    and `derivePendingUserInputs` close a request on `*.expired`. Tests first.
 4. **D3: `lastActivityAt`.**
