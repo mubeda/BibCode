@@ -183,6 +183,7 @@ import {
   resolveGitManagerRepositoryUnavailable,
 } from "./gitManager/gitManagerRepositoryAvailability";
 import { AgentsNavRow } from "./sidebar/AgentsNavRow";
+import { AgentsUnreadTracker } from "./sidebar/AgentsUnreadTracker";
 import { EnvironmentCardHeader } from "./sidebar/EnvironmentCardHeader";
 import { EnvironmentContextCard } from "./sidebar/EnvironmentContextCard";
 import {
@@ -5547,6 +5548,12 @@ export default function Sidebar() {
         <SidebarThreadDetailPrewarmer key={scopedThreadKey(threadRef)} threadRef={threadRef} />
       ))}
       <SidebarChromeHeader />
+      <AgentsUnreadTracker
+        shells={allSidebarThreads}
+        projects={allProjects}
+        environments={environments}
+        availability={shellSummary.statuses}
+      />
 
       {isOnSettings ? (
         <SettingsSidebarNav pathname={pathname} />
