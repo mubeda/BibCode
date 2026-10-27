@@ -6816,6 +6816,7 @@ function ChatViewContent(props: ChatViewProps) {
                 error={threadError}
                 attribution={threadErrorAttributionText}
                 action={threadErrorActionValue}
+                diagnosticsEnvironmentId={environmentId}
                 onDismiss={() => setThreadError(activeThread.id, null)}
               />
               <div className="flex min-h-0 min-w-0 flex-1">
