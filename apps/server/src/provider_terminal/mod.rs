@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod agent_status_tests;
 mod claude;
 mod codex;
 mod model;
@@ -22,10 +24,10 @@ pub use codex::{
 };
 pub use model::{
     NativeTerminalCommand, PreparedTerminalLaunch, PreparedTerminalObserver,
-    TerminalAgentActivityProviderEpochs, TerminalAgentActivityTransition,
-    TerminalGenerationActivityPublisher, TerminalLaunchPreparation, TerminalLaunchPreparationInput,
-    TerminalLaunchPreparer, TerminalObserverCancellationReason, TerminalObserverGeneration,
-    TerminalObserverGenerationLease, TerminalObserverWorkerContext,
+    TerminalAgentActivityProviderEpochs, TerminalAgentActivityTransition, TerminalAgentObservation,
+    TerminalAgentState, TerminalGenerationActivityPublisher, TerminalLaunchPreparation,
+    TerminalLaunchPreparationInput, TerminalLaunchPreparer, TerminalObserverCancellationReason,
+    TerminalObserverGeneration, TerminalObserverGenerationLease, TerminalObserverWorkerContext,
     TerminalObserverWorkerSpawnError,
 };
 pub use opencode::{

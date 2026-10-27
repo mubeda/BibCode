@@ -207,6 +207,34 @@ export const TerminalSessionSnapshot = Schema.Struct({
 });
 export type TerminalSessionSnapshot = typeof TerminalSessionSnapshot.Type;
 
+/**
+ * An AI Terminal agent's state as its observer last reported it, for the left panel.
+ * `unavailable`: no observer reports this agent (an unsupported provider or platform, or one
+ * that could not be prepared), so it is never shown as working or done.
+ */
+export const TerminalAgentStatusState = Schema.Literals([
+  "working",
+  "blocked",
+  "waiting",
+  "done",
+  "unavailable",
+]);
+export type TerminalAgentStatusState = typeof TerminalAgentStatusState.Type;
+
+export const TerminalAgentStatus = Schema.Struct({
+  state: TerminalAgentStatusState,
+  /** The turn that ended failed, or the agent exited with an error. */
+  failed: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  /**
+   * How old the observation was on the server's clock when the summary was built; absent
+   * before the observer reported anything. A client ages the status from its own receipt.
+   */
+  ageMs: Schema.optional(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
+  /** When the observer reported it, on the server's clock: changes with every new report. */
+  observedAt: Schema.optional(Schema.String.check(Schema.isMaxLength(64))),
+});
+export type TerminalAgentStatus = typeof TerminalAgentStatus.Type;
+
 export const TerminalSummary = Schema.Struct({
   threadId: Schema.String.check(Schema.isNonEmpty()),
   terminalId: Schema.String.check(Schema.isNonEmpty()),
@@ -226,6 +254,8 @@ export const TerminalSummary = Schema.Struct({
   centerPanel: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   /** Launch command the session was started with, when it was started with one. */
   command: Schema.optional(TerminalLaunchCommand),
+  /** An AI Terminal's agent state; absent for a plain shell and on older servers. */
+  agentStatus: Schema.optional(TerminalAgentStatus),
 });
 export type TerminalSummary = typeof TerminalSummary.Type;
 

@@ -40,7 +40,7 @@ use tokio_util::sync::CancellationToken;
 
 #[cfg(all(test, unix))]
 use super::TerminalObserverGeneration;
-use super::model::TerminalObserverGenerationLease;
+use super::model::{TerminalAgentState, TerminalObserverGenerationLease};
 #[cfg(unix)]
 use super::supervisor::create_owned_generation_directory;
 use super::{
@@ -592,7 +592,9 @@ impl ClaudeTerminalObserverFactory {
                 token: Arc::new(token.clone()),
                 correlation: Arc::new(correlation),
                 spawned: AtomicBool::new(false),
-                activity: Arc::new(TerminalAgentActivityControl::enabled()),
+                activity: Arc::new(TerminalAgentActivityControl::with_enabled(
+                    input.activity_enabled,
+                )),
                 listener_lifecycle: AtomicU64::new(pack_claude_listener_lifecycle(
                     ClaudeListenerLifecycle {
                         ready: false,
@@ -892,6 +894,8 @@ struct ClaudeHookState {
     activity: Arc<TerminalAgentActivityControl>,
     requests: mpsc::Sender<ClaudeHookRequest>,
     request_permits: Arc<Semaphore>,
+    /// Where the main agent's state goes, whatever the activity setting says (#187).
+    status: TerminalObserverGenerationLease,
 }
 
 async fn run_claude_observer(
@@ -921,6 +925,7 @@ async fn run_claude_observer(
         activity: inner.activity.clone(),
         requests: request_sender,
         request_permits: Arc::new(Semaphore::new(CLAUDE_HOOK_REQUEST_CAPACITY)),
+        status: generation.clone(),
     };
     let router = Router::new()
         .route("/claude-hook", post(capture_claude_hook))
@@ -1267,9 +1272,9 @@ async fn capture_claude_hook(
     if !authorized(&headers, &state.token, &state.correlation) {
         return StatusCode::FORBIDDEN;
     }
-    let Some(admission) = state.activity.admit() else {
-        return StatusCode::NO_CONTENT;
-    };
+    // Activity admission is taken before the body arrives, so a body that spans a disable and
+    // re-enable never creates activity under the new admission.
+    let admission = state.activity.admit();
     if !headers
         .get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
@@ -1286,15 +1291,38 @@ async fn capture_claude_hook(
     else {
         return StatusCode::PAYLOAD_TOO_LARGE;
     };
-    if !state.activity.admission_is_current(&admission) {
-        return StatusCode::NO_CONTENT;
-    }
+    // Only live activity reports malformed input; a dormant observer acknowledges it, as it did
+    // before it read bodies for the agent's status.
+    let rejected = || {
+        if admission
+            .as_ref()
+            .is_some_and(|admission| state.activity.admission_is_current(admission))
+        {
+            StatusCode::BAD_REQUEST
+        } else {
+            StatusCode::NO_CONTENT
+        }
+    };
     let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
-        return StatusCode::BAD_REQUEST;
+        return rejected();
     };
     if !value.is_object() {
-        return StatusCode::BAD_REQUEST;
+        return rejected();
     }
+    // The main agent's state is published whatever the activity setting says (#187).
+    if let Some((agent_state, failed)) = claude_hook_agent_status(&value) {
+        state.status.publish_agent_status(agent_state, failed);
+    }
+    if value
+        .get("hook_event_name")
+        .and_then(Value::as_str)
+        .is_some_and(|event| CLAUDE_STATUS_HOOK_EVENTS.contains(&event))
+    {
+        return StatusCode::NO_CONTENT;
+    }
+    let Some(admission) = admission else {
+        return StatusCode::NO_CONTENT;
+    };
     if !state.activity.admission_is_current(&admission) {
         return StatusCode::NO_CONTENT;
     }
@@ -1357,8 +1385,59 @@ fn claude_hook_settings(endpoint: &str, token: &str, correlation: &str) -> Value
             "PreToolUse": hook(),
             "PostToolUse": hook(),
             "PostToolUseFailure": hook(),
+            // The main agent's state for the left panel (#187): read only, never answered.
+            "SessionStart": hook(),
+            "UserPromptSubmit": hook(),
+            "PermissionRequest": hook(),
+            "Notification": hook(),
+            "Stop": hook(),
+            "StopFailure": hook(),
+            "SessionEnd": hook(),
         }
     })
+}
+
+/// The hooks registered only for the main agent's state: the activity worker never sees them.
+const CLAUDE_STATUS_HOOK_EVENTS: [&str; 7] = [
+    "SessionStart",
+    "UserPromptSubmit",
+    "PermissionRequest",
+    "Notification",
+    "Stop",
+    "StopFailure",
+    "SessionEnd",
+];
+
+/// The main agent's state a Claude hook reports, for the left panel (#187). A subagent's own
+/// tool hooks carry its `agent_id` and leave the main state alone; a permission prompt blocks
+/// the user whoever asks. Only the event name, the tool name and the notification type are
+/// read: never prompt, message or tool content.
+fn claude_hook_agent_status(value: &Value) -> Option<(TerminalAgentState, bool)> {
+    let event = safe_identity_field(value, "hook_event_name")?;
+    safe_identity_field(value, "session_id")?;
+    let main_agent = value.get("agent_id").is_none();
+    let state = match event {
+        "SessionStart" | "Stop" | "SessionEnd" => (TerminalAgentState::Done, false),
+        "StopFailure" => (TerminalAgentState::Done, true),
+        "UserPromptSubmit" => (TerminalAgentState::Working, false),
+        "PermissionRequest" => (TerminalAgentState::Blocked, false),
+        "Elicitation" => (TerminalAgentState::Waiting, false),
+        "PreToolUse" if main_agent => {
+            if safe_identity_field(value, "tool_name")? == "AskUserQuestion" {
+                (TerminalAgentState::Waiting, false)
+            } else {
+                (TerminalAgentState::Working, false)
+            }
+        }
+        "PostToolUse" | "PostToolUseFailure" if main_agent => (TerminalAgentState::Working, false),
+        "Notification" => match safe_identity_field(value, "notification_type")? {
+            "permission_prompt" => (TerminalAgentState::Blocked, false),
+            "elicitation_dialog" => (TerminalAgentState::Waiting, false),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    Some(state)
 }
 
 fn unsafe_interactive_settings_args(args: &[String]) -> bool {
@@ -2892,6 +2971,138 @@ mod tests {
                 .await
                 .is_err(),
             "dormant shutdown reconciliation must not publish interruptions",
+        );
+    }
+
+    #[test]
+    fn claude_hooks_map_to_the_main_agent_state() {
+        let hook = |event: &str, extra: Value| {
+            let mut value = json!({ "hook_event_name": event, "session_id": "s" });
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            claude_hook_agent_status(&value)
+        };
+        use TerminalAgentState::{Blocked, Done, Waiting, Working};
+        assert_eq!(hook("SessionStart", json!({})), Some((Done, false)));
+        assert_eq!(hook("UserPromptSubmit", json!({})), Some((Working, false)));
+        assert_eq!(
+            hook("PreToolUse", json!({"tool_name":"Bash"})),
+            Some((Working, false))
+        );
+        assert_eq!(
+            hook("PreToolUse", json!({"tool_name":"AskUserQuestion"})),
+            Some((Waiting, false))
+        );
+        assert_eq!(
+            hook("PreToolUse", json!({"tool_name":"Bash","agent_id":"sub"})),
+            None,
+            "a subagent's tool leaves the main state alone"
+        );
+        assert_eq!(hook("PermissionRequest", json!({})), Some((Blocked, false)));
+        assert_eq!(
+            hook(
+                "Notification",
+                json!({"notification_type":"permission_prompt"})
+            ),
+            Some((Blocked, false))
+        );
+        assert_eq!(
+            hook("Notification", json!({"notification_type":"idle_prompt"})),
+            None
+        );
+        assert_eq!(hook("Stop", json!({})), Some((Done, false)));
+        assert_eq!(hook("StopFailure", json!({})), Some((Done, true)));
+        assert_eq!(hook("SubagentStart", json!({})), None);
+        assert_eq!(
+            claude_hook_agent_status(&json!({"hook_event_name":"Stop"})),
+            None,
+            "a hook without a session is not trusted"
+        );
+    }
+
+    #[tokio::test]
+    async fn status_hooks_publish_with_activity_off_and_never_reach_the_activity_worker() {
+        let generation = TerminalObserverGeneration::new(
+            "thread-status-only".to_owned(),
+            "terminal-status-only".to_owned(),
+        );
+        let status = generation.observation().subscribe_agent_status();
+        let (requests, mut request_receiver) = mpsc::channel(4);
+        let state = ClaudeHookState {
+            token: Arc::new("token".to_owned()),
+            correlation: Arc::new("correlation".to_owned()),
+            activity: Arc::new(TerminalAgentActivityControl::with_enabled(false)),
+            requests,
+            request_permits: Arc::new(Semaphore::new(4)),
+            status: generation.observation(),
+        };
+        let send = |token: &str, body: Value| {
+            let mut headers = HeaderMap::new();
+            headers.insert("authorization", format!("Bearer {token}").parse().unwrap());
+            headers.insert(
+                CLAUDE_HOOK_CORRELATION_HEADER,
+                "correlation".parse().unwrap(),
+            );
+            headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+            let state = state.clone();
+            async move {
+                capture_claude_hook(State(state), headers, Body::from(body.to_string()))
+                    .await
+                    .into_response()
+                    .status()
+            }
+        };
+
+        let refused = send(
+            "wrong",
+            json!({"hook_event_name":"UserPromptSubmit","session_id":"s"}),
+        )
+        .await;
+        assert_eq!(refused, StatusCode::FORBIDDEN);
+        assert!(
+            status.borrow().is_none(),
+            "an unauthenticated hook reports nothing"
+        );
+
+        for (event, extra, expected) in [
+            ("UserPromptSubmit", json!({}), TerminalAgentState::Working),
+            ("PermissionRequest", json!({}), TerminalAgentState::Blocked),
+            (
+                "PreToolUse",
+                json!({"tool_name":"Bash","tool_use_id":"t"}),
+                TerminalAgentState::Working,
+            ),
+            ("Stop", json!({}), TerminalAgentState::Done),
+        ] {
+            let mut body = json!({"hook_event_name":event, "session_id":"s"});
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            assert_eq!(send("token", body).await, StatusCode::NO_CONTENT);
+            assert_eq!(
+                status.borrow().map(|observation| observation.state),
+                Some(expected),
+                "{event}"
+            );
+        }
+        assert!(
+            request_receiver.try_recv().is_err(),
+            "dormant activity forwards nothing to the activity worker"
+        );
+
+        // A replaced generation's late hook is ignored.
+        generation.invalidate().await;
+        let late = send(
+            "token",
+            json!({"hook_event_name":"UserPromptSubmit","session_id":"s"}),
+        )
+        .await;
+        assert_eq!(late, StatusCode::NO_CONTENT);
+        assert_eq!(
+            status.borrow().map(|observation| observation.state),
+            Some(TerminalAgentState::Done)
         );
     }
 }
