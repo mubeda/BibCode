@@ -2593,9 +2593,17 @@ while a view of a deleted thread retried every 250 ms for as long as it stayed
 mounted (#113).
 The client's thread detail projection keeps every object of a new snapshot or patch
 that equals what it already shows, and remembers which source object resolved
-to which shown one so later patches compare only what they changed. A resync
+to which shown one so later patches compare only what they changed. An array
+entry with an `id` is compared with the shown entry of that `id`, not the one at
+its position: messages are ordered by delivery and time, so a turn added while
+the client was away can land before messages it already shows. A resync
 snapshot therefore does not hand the UI a second copy of an unchanged thread;
-each copy used to stay pinned by memoized render closures (#96).
+each copy used to stay pinned by memoized render closures (#96, #134). Beside
+the shown copy, the thread state holds only the latest received snapshot,
+whatever the number of reconnects. The sidebar's thread prewarmer still reads
+the raw thread state, so its React state keeps one earlier snapshot of each
+prewarmed thread: three copies in steady state, not two (follow-up filed
+separately).
 Every shell snapshot, live or from `orchestration.getArchivedShellSnapshot`,
 is read in one SQLite job: projects, the undeleted live or archived threads
 whose project row exists, and per thread only its session, latest turn, the
