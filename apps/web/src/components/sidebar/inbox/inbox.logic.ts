@@ -85,6 +85,82 @@ function isTransientStatus(status: EnvironmentShellSummary["statuses"][number]):
   return status.status === "starting" || status.status === "synchronizing";
 }
 
+export interface InboxEnvironmentInfo {
+  readonly label: string;
+  /** A saved remote server, which Remote Servers settings can reconnect. */
+  readonly remote: boolean;
+}
+
+/** Why the lists are partial, most actionable first. */
+export type InboxPartialReason =
+  | { readonly kind: "catalog" }
+  | {
+      readonly kind: "offline";
+      readonly labels: ReadonlyArray<string>;
+      readonly allRemote: boolean;
+    }
+  | { readonly kind: "reconnecting"; readonly labels: ReadonlyArray<string> };
+
+export function resolveInboxPartialReason(
+  summary: EnvironmentShellSummary,
+  environmentById: ReadonlyMap<string, InboxEnvironmentInfo>,
+): InboxPartialReason | null {
+  if (summary.catalogHealth.status !== "ready") return { kind: "catalog" };
+  const offline: InboxEnvironmentInfo[] = [];
+  const reconnecting: InboxEnvironmentInfo[] = [];
+  for (const status of summary.statuses) {
+    if (status.status === "live" && status.hasSnapshot) continue;
+    const info = environmentById.get(status.environmentId) ?? { label: "", remote: false };
+    if (isTransientStatus(status) || status.status === "live") reconnecting.push(info);
+    else offline.push(info);
+  }
+  if (offline.length > 0) {
+    return {
+      kind: "offline",
+      labels: offline.map((info) => info.label),
+      allRemote: offline.every((info) => info.remote),
+    };
+  }
+  if (reconnecting.length > 0) {
+    return { kind: "reconnecting", labels: reconnecting.map((info) => info.label) };
+  }
+  return null;
+}
+
+export interface InboxPartialNotice {
+  readonly message: string;
+  /** Where the user can fix it; reconnecting needs no action. */
+  readonly action: { readonly to: "remote-servers" | "diagnostics"; readonly label: string } | null;
+}
+
+function serversPhrase(labels: ReadonlyArray<string>, state: string): string {
+  return labels.length === 1
+    ? `${labels[0] || "A server"} is ${state}, so its agents`
+    : `${labels.length} servers are ${state}, so their agents`;
+}
+
+export function describeInboxPartialReason(reason: InboxPartialReason): InboxPartialNotice {
+  switch (reason.kind) {
+    case "catalog":
+      return {
+        message: "Saved servers couldn't be read, so their agents aren't listed.",
+        action: { to: "diagnostics", label: "Diagnostics" },
+      };
+    case "offline":
+      return {
+        message: `${serversPhrase(reason.labels, "not connected")} may be missing or out of date.`,
+        action: reason.allRemote
+          ? { to: "remote-servers", label: "Open Remote Servers" }
+          : { to: "diagnostics", label: "Diagnostics" },
+      };
+    case "reconnecting":
+      return {
+        message: `${serversPhrase(reason.labels, "reconnecting")} may be out of date.`,
+        action: null,
+      };
+  }
+}
+
 /**
  * The tile to show and, when the default has settled, the tile to persist.
  * With nothing persisted, Needs Attention wins once any agent needs attention;

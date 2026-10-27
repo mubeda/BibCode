@@ -8,7 +8,9 @@ import type { InboxAgentGroupId, InboxAgentRowFields } from "./agentRowContract"
 import {
   INBOX_CATEGORIES,
   countInboxCategories,
+  describeInboxPartialReason,
   inboxTargetSurfaceId,
+  resolveInboxPartialReason,
   isInboxRowCurrent,
   resolveInboxDataState,
   resolveInboxOpenTarget,
@@ -139,6 +141,76 @@ describe("inbox data readiness", () => {
         }),
       ),
     ).toBe("partial");
+  });
+});
+
+describe("inbox partial-data reason", () => {
+  const environments = new Map([
+    [ENV, { label: "Local", remote: false }],
+    [REMOTE, { label: "Remote Box", remote: true }],
+  ]);
+  const withRemote = (
+    status: "unavailable" | "synchronizing" | "live",
+    hasSnapshot: boolean,
+  ): EnvironmentShellSummary =>
+    summary({
+      desiredEnvironmentCount: 2,
+      canShowEmptyProjects: false,
+      statuses: [
+        { environmentId: ENV, status: "live", hasSnapshot: true, error: null },
+        { environmentId: REMOTE, status, hasSnapshot, error: null },
+      ],
+    });
+
+  it("names an unreadable saved-server catalog even when every listed server is live", () => {
+    const reason = resolveInboxPartialReason(
+      summary({
+        catalogHealth: { status: "recovery-required", message: "Saved servers unreadable" },
+        canShowEmptyProjects: false,
+      }),
+      environments,
+    );
+    expect(reason).toEqual({ kind: "catalog" });
+    expect(describeInboxPartialReason(reason!)).toEqual({
+      message: "Saved servers couldn't be read, so their agents aren't listed.",
+      action: { to: "diagnostics", label: "Diagnostics" },
+    });
+  });
+
+  it("names a disconnected remote and offers Remote Servers", () => {
+    const reason = resolveInboxPartialReason(withRemote("unavailable", false), environments);
+    expect(reason).toEqual({ kind: "offline", labels: ["Remote Box"], allRemote: true });
+    expect(describeInboxPartialReason(reason!)).toEqual({
+      message: "Remote Box is not connected, so its agents may be missing or out of date.",
+      action: { to: "remote-servers", label: "Open Remote Servers" },
+    });
+  });
+
+  it("sends an offline local environment to Diagnostics and counts several servers", () => {
+    expect(
+      describeInboxPartialReason({ kind: "offline", labels: ["Local", "WSL"], allRemote: false }),
+    ).toEqual({
+      message: "2 servers are not connected, so their agents may be missing or out of date.",
+      action: { to: "diagnostics", label: "Diagnostics" },
+    });
+  });
+
+  it("reports a reconnecting remote without an action", () => {
+    for (const [status, hasSnapshot] of [
+      ["synchronizing", true],
+      ["live", false],
+    ] as const) {
+      const reason = resolveInboxPartialReason(withRemote(status, hasSnapshot), environments);
+      expect(reason).toEqual({ kind: "reconnecting", labels: ["Remote Box"] });
+      expect(describeInboxPartialReason(reason!)).toEqual({
+        message: "Remote Box is reconnecting, so its agents may be out of date.",
+        action: null,
+      });
+    }
+  });
+
+  it("has no reason for complete data", () => {
+    expect(resolveInboxPartialReason(summary(), environments)).toBeNull();
   });
 });
 
