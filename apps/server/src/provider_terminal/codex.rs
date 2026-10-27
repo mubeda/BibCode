@@ -172,10 +172,18 @@ impl CachedCodexCapabilityProbe {
             .as_ref()
             .and_then(|fingerprint| cache.get(fingerprint))
         {
-            return cached.map_err(|reason| CodexProbeFailure {
-                reason,
-                cached: true,
-            });
+            match cached {
+                Ok(capabilities) => return Ok(capabilities),
+                // A rejection expires, so a wrapper script whose own bytes never
+                // change recovers once the Codex behind it is upgraded.
+                Err((reason, rejected_at)) if rejected_at.elapsed() < CODEX_PROBE_REJECTION_TTL => {
+                    return Err(CodexProbeFailure {
+                        reason,
+                        cached: true,
+                    });
+                }
+                Err(_) => {}
+            }
         }
         let outcome = self.probe_uncached(&path).await;
         if let Some(fingerprint) = fingerprint {
@@ -184,7 +192,10 @@ impl CachedCodexCapabilityProbe {
                 Err(CodexProbeFailure {
                     reason: CODEX_PROBE_VERSION_UNPARSED,
                     ..
-                }) => cache.insert(fingerprint, Err(CODEX_PROBE_VERSION_UNPARSED)),
+                }) => cache.insert(
+                    fingerprint,
+                    Err((CODEX_PROBE_VERSION_UNPARSED, tokio::time::Instant::now())),
+                ),
                 Err(_) => {}
             }
         }
@@ -195,8 +206,15 @@ impl CachedCodexCapabilityProbe {
         &self,
         executable: &Path,
     ) -> Result<CodexCapabilities, CodexProbeFailure> {
-        let unavailable = |_| CodexProbeFailure {
-            reason: "probe_unavailable",
+        // Only the kind of failure is kept: the runner's text can name paths.
+        let unavailable = |error: String| CodexProbeFailure {
+            reason: if error.contains("Timeout") {
+                "probe_timeout"
+            } else if error.contains("Spawn") {
+                "probe_spawn_failed"
+            } else {
+                "probe_unavailable"
+            },
             cached: false,
         };
         let version = self
@@ -251,7 +269,10 @@ struct CodexProbeFailure {
     cached: bool,
 }
 
-type CachedCodexProbeOutcome = Result<CodexCapabilities, &'static str>;
+/// How long a rejected executable build passes through before it is probed again.
+const CODEX_PROBE_REJECTION_TTL: Duration = Duration::from_secs(10 * 60);
+
+type CachedCodexProbeOutcome = Result<CodexCapabilities, (&'static str, tokio::time::Instant)>;
 
 #[derive(Debug, Default)]
 struct CodexCapabilityCache {
@@ -379,6 +400,8 @@ pub struct CodexHelperLaunch {
     pub endpoint: String,
     pub socket_path: PathBuf,
     pub process_attribution: ProcessAttributionRegistry,
+    /// Names the launch in the helper's own diagnostics.
+    pub provider_instance_id: String,
 }
 
 impl fmt::Debug for CodexHelperLaunch {
@@ -583,6 +606,7 @@ impl CodexTerminalObserverFactory {
                 endpoint: endpoint.clone(),
                 socket_path,
                 process_attribution: input.process_attribution.clone(),
+                provider_instance_id: input.launch.activity.provider_instance_id.clone(),
             })
             .await
             .map_err(|error| {
@@ -639,6 +663,10 @@ impl Default for CodexPreparationStage {
 }
 
 impl CodexPreparationStage {
+    fn starting_at(stage: &'static str) -> Self {
+        Self(Arc::new(Mutex::new(stage)))
+    }
+
     fn set(&self, stage: &'static str) {
         *self
             .0
@@ -1023,10 +1051,42 @@ async fn run_codex_observer_inner(
 ) {
     let mut activity = inner.activity.subscribe();
     let observer_started = std::time::Instant::now();
-    let mut client = match connect_initialized_codex_client(inner).await {
+    let connect_stage = CodexPreparationStage::starting_at("connect");
+    let connect = connect_initialized_codex_client_staged(inner, &connect_stage);
+    tokio::pin!(connect);
+    let connected = tokio::select! {
+        biased;
+        _ = generation.cancelled() => return,
+        connected = &mut connect => connected,
+        () = tokio::time::sleep(CODEX_CONNECT_INITIALIZE_TIMEOUT) => {
+            // A helper that accepts the socket but never answers initialize
+            // would otherwise wait here without a trace. Say so, keep waiting.
+            tracing::warn!(
+                provider = "codex",
+                provider_instance_id = %inner.provider_instance_id,
+                reason = "connect_timeout",
+                stage = connect_stage.get(),
+                elapsed_ms = elapsed_millis(observer_started.elapsed()),
+                "Codex terminal observer has not connected to its App Server yet; it keeps waiting"
+            );
+            tokio::select! {
+                biased;
+                _ = generation.cancelled() => return,
+                connected = &mut connect => connected,
+            }
+        }
+    };
+    let mut client = match connected {
         Ok(client) => client,
         Err(error) => {
-            warn_codex_observer_stopped(inner, "connect_failed", observer_started, &error);
+            if generation.cancellation_reason().is_none() {
+                warn_codex_observer_stopped(
+                    inner,
+                    "connect_failed",
+                    observer_started,
+                    &codex_remote_error_class(&error),
+                );
+            }
             generation.cancelled().await;
             return;
         }
@@ -1174,7 +1234,7 @@ async fn run_codex_observer_inner(
                         inner,
                         "resume_materialization_timeout",
                         observer_started,
-                        &error,
+                        &codex_remote_error_class(&error),
                     );
                     generation.cancelled().await;
                     return;
@@ -1195,7 +1255,7 @@ async fn run_codex_observer_inner(
                             inner,
                             "resume_reconnect_failed",
                             observer_started,
-                            &error,
+                            &codex_remote_error_class(&error),
                         );
                     }
                     generation.cancelled().await;
@@ -1207,7 +1267,12 @@ async fn run_codex_observer_inner(
                 continue;
             }
             Ok(Err(error)) => {
-                warn_codex_observer_stopped(inner, "resume_failed", observer_started, &error);
+                warn_codex_observer_stopped(
+                    inner,
+                    "resume_failed",
+                    observer_started,
+                    &codex_remote_error_class(&error),
+                );
                 generation.cancelled().await;
                 return;
             }
@@ -1772,15 +1837,66 @@ async fn park_codex_observer_unavailable(
 async fn connect_initialized_codex_client(
     inner: &CodexObserverInner,
 ) -> Result<Box<dyn CodexRemoteClient>, String> {
+    connect_initialized_codex_client_staged(inner, &CodexPreparationStage::starting_at("connect"))
+        .await
+}
+
+/// Connects and initializes, recording the step it is on for a slow-connect warning.
+async fn connect_initialized_codex_client_staged(
+    inner: &CodexObserverInner,
+    stage: &CodexPreparationStage,
+) -> Result<Box<dyn CodexRemoteClient>, String> {
+    stage.set("connect");
     let mut client = inner.remote.connect(&inner.endpoint).await?;
+    stage.set("initialize");
     client
         .request(
             "initialize",
             build_initialize_params(env!("CARGO_PKG_VERSION")),
         )
         .await?;
+    stage.set("initialized");
     client.notify("initialized").await?;
     Ok(client)
+}
+
+/// A Codex remote error reduced to what is safe to log: the JSON-RPC error code,
+/// or which transport step failed. The text itself can quote thread content.
+fn codex_remote_error_class(error: &str) -> String {
+    if let Some(payload) = error.strip_prefix(CODEX_REMOTE_RPC_ERROR_PREFIX) {
+        return serde_json::from_str::<Value>(payload)
+            .ok()
+            .and_then(|value| value.get("code").and_then(Value::as_i64))
+            .map_or_else(
+                || "json_rpc_error".to_owned(),
+                |code| format!("json_rpc_error code={code}"),
+            );
+    }
+    const TRANSPORT_FAILURES: &[(&str, &str)] = &[
+        (
+            "failed to connect to Codex App Server",
+            "socket_connect_failed",
+        ),
+        (
+            "Codex App Server handshake failed",
+            "websocket_handshake_failed",
+        ),
+        ("Codex remote write failed", "write_failed"),
+        (
+            "Codex remote closed before response",
+            "closed_before_response",
+        ),
+        (
+            "Codex remote message exceeded its fixed bound",
+            "message_too_large",
+        ),
+        ("unsupported Codex remote endpoint", "unsupported_endpoint"),
+    ];
+    TRANSPORT_FAILURES
+        .iter()
+        .find(|(prefix, _)| error.starts_with(prefix))
+        .map_or("transport_error", |(_, class)| class)
+        .to_owned()
 }
 
 async fn reconnect_initialized_codex_client(
@@ -2414,160 +2530,8 @@ impl SystemCodexHelperLauncher {
 impl CodexHelperLauncher for SystemCodexHelperLauncher {
     fn start(&self, launch: CodexHelperLaunch) -> CodexHelperStartFuture<'_> {
         Box::pin(async move {
-            let progress = CodexHelperStartProgress::new();
-            let result: Result<Arc<dyn CodexHelperProcess>, String> = async {
-            #[cfg(feature = "hermetic-test-guard")]
-            let launch = {
-                let mut launch = launch;
-                let search_path =
-                    crate::production::provider_runtime::effective_provider_search_path(
-                        launch.env.iter().map(|(name, value)| {
-                            (std::ffi::OsStr::new(name), std::ffi::OsStr::new(value))
-                        }),
-                    );
-                let executable = crate::hermetic_guard::checked_provider_executable(
-                    Path::new(&launch.executable),
-                    Some(&launch.cwd),
-                    search_path.as_deref(),
-                )
-                .ok_or_else(|| {
-                    "failed to start Codex App Server helper: executable was not found or was refused by the hermetic test guard"
-                        .to_owned()
-                })?;
-                launch.executable = executable.to_string_lossy().into_owned();
-                launch
-            };
-            progress.set("supervisor");
-            let supervisor = SYSTEM_CODEX_HELPER_SUPERVISOR
-                .wait_ready()
-                .await
-                .ok_or_else(|| "Codex helper supervisor is unavailable".to_owned())?;
-            let permit = supervisor
-                .reserve()
-                .ok_or_else(|| "Codex helper supervisor is at capacity".to_owned())?;
-            let owned_task = self.owned_tasks.register();
-            progress.set("spawn");
-            let mut command = CommandWrap::with_new(&launch.executable, |command| {
-                command
-                    .args(&launch.args)
-                    .current_dir(&launch.cwd)
-                    .envs(&launch.env)
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null());
-                crate::provider::environment::sanitize_provider_subprocess_environment(command);
-            });
-            configure_supervised_background_command_wrap(&mut command);
-            #[cfg(not(windows))]
-            let child = spawn_retrying_busy_executable(
-                &mut command,
-                tokio::time::Instant::now() + self.readiness_timeout,
-            )
-            .await
-            .map_err(|error| format!("failed to start Codex App Server helper: {error}"))?;
-            #[cfg(windows)]
-            let child = command
-                .spawn()
-                .map_err(|error| format!("failed to start Codex App Server helper: {error}"))?;
-            #[cfg(not(unix))]
-            let mut child = child;
-            #[cfg(test)]
-            if let Some(events) = self.fixture_events.as_ref()
-                && let Some(race) = events.admission_race.as_ref()
-            {
-                if let Err(error) = events.publish_pid(child.id()) {
-                    terminate_and_reap_codex_helper(child).await;
-                    return Err(error);
-                }
-                race.spawned.publish();
-                race.release.wait_after(0).await;
-            }
-            progress.set("admission");
-            let identity = child
-                .id()
-                .and_then(|pid| NativeProcessSampler::process_identity(pid).ok());
-            let Some(identity) = identity else {
-                terminate_and_reap_codex_helper(child).await;
-                return Err("spawned Codex helper has no stable process identity".to_owned());
-            };
-            #[cfg(unix)]
-            let liveness = codex_helper_root_exited_without_reaping(identity.pid)
-                .map(|exited| exited.then_some(()));
-            #[cfg(not(unix))]
-            let liveness = child.try_wait();
-            match liveness {
-                Ok(None) => {}
-                Ok(Some(_)) => {
-                    terminate_and_reap_codex_helper(child).await;
-                    return Err("Codex helper exited before ownership admission".to_owned());
-                }
-                Err(error) => {
-                    terminate_and_reap_codex_helper(child).await;
-                    return Err(format!(
-                        "failed to revalidate Codex helper process identity: {error}"
-                    ));
-                }
-            }
-            let registration = match launch.process_attribution.register_identity(
-                identity,
-                ProcessRegistrationMetadata {
-                    scope: AttributionScope::External,
-                    kind: AttributionKind::Helper,
-                    label: "Codex App Server helper".to_owned(),
-                    source: RegistrationSource::Helper,
-                    driver: None,
-                    survives_shutdown: false,
-                },
-            ) {
-                Ok(registration) => registration,
-                Err(
-                    error @ (ProcessRegistrationError::Shutdown
-                    | ProcessRegistrationError::Capacity),
-                ) => {
-                    terminate_and_reap_codex_helper(child).await;
-                    return Err(error.to_string());
-                }
-            };
-            #[cfg(test)]
-            if let Some(events) = self.fixture_events.as_ref()
-                && let Err(error) = events.publish_spawned(child.id())
-            {
-                terminate_and_reap_codex_helper(child).await;
-                return Err(error);
-            }
-            let (process, ready) = supervisor.supervise(
-                child,
-                launch.socket_path,
-                CodexHelperSupervisionOwnership {
-                    registration: Some(registration),
-                    permit,
-                    task: owned_task,
-                },
-                self.readiness_timeout,
-                #[cfg(test)]
-                CodexHelperSupervisionFixture {
-                    integration_deadline: self.integration_deadline,
-                    reaped: self
-                        .fixture_events
-                        .as_ref()
-                        .map(|events| events.reaped.clone()),
-                    watchdog_spawn_race: self
-                        .fixture_events
-                        .as_ref()
-                        .and_then(|events| events.watchdog_spawn_race.clone()),
-                },
-            );
-            progress.set("readiness");
-            ready
-                .await
-                .map_err(|_| "Codex helper supervisor stopped before readiness".to_owned())??;
-            #[cfg(test)]
-            if let Some(events) = self.fixture_events.as_ref() {
-                events.ready.publish();
-            }
-            Ok(Arc::new(process) as Arc<dyn CodexHelperProcess>)
-            }
-            .await;
+            let progress = CodexHelperStartProgress::new(&launch.provider_instance_id);
+            let result = self.start_with_progress(launch, &progress).await;
             progress.finish();
             result
         })
@@ -2578,18 +2542,178 @@ impl CodexHelperLauncher for SystemCodexHelperLauncher {
     }
 }
 
+impl SystemCodexHelperLauncher {
+    async fn start_with_progress(
+        &self,
+        launch: CodexHelperLaunch,
+        progress: &CodexHelperStartProgress,
+    ) -> Result<Arc<dyn CodexHelperProcess>, String> {
+        #[cfg(feature = "hermetic-test-guard")]
+        let launch = {
+            let mut launch = launch;
+            let search_path = crate::production::provider_runtime::effective_provider_search_path(
+                launch
+                    .env
+                    .iter()
+                    .map(|(name, value)| (std::ffi::OsStr::new(name), std::ffi::OsStr::new(value))),
+            );
+            let executable = crate::hermetic_guard::checked_provider_executable(
+                    Path::new(&launch.executable),
+                    Some(&launch.cwd),
+                    search_path.as_deref(),
+                )
+                .ok_or_else(|| {
+                    "failed to start Codex App Server helper: executable was not found or was refused by the hermetic test guard"
+                        .to_owned()
+                })?;
+            launch.executable = executable.to_string_lossy().into_owned();
+            launch
+        };
+        progress.set("supervisor");
+        let supervisor = SYSTEM_CODEX_HELPER_SUPERVISOR
+            .wait_ready()
+            .await
+            .ok_or_else(|| "Codex helper supervisor is unavailable".to_owned())?;
+        let permit = supervisor
+            .reserve()
+            .ok_or_else(|| "Codex helper supervisor is at capacity".to_owned())?;
+        let owned_task = self.owned_tasks.register();
+        progress.set("spawn");
+        let mut command = CommandWrap::with_new(&launch.executable, |command| {
+            command
+                .args(&launch.args)
+                .current_dir(&launch.cwd)
+                .envs(&launch.env)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            crate::provider::environment::sanitize_provider_subprocess_environment(command);
+        });
+        configure_supervised_background_command_wrap(&mut command);
+        #[cfg(not(windows))]
+        let child = spawn_retrying_busy_executable(
+            &mut command,
+            tokio::time::Instant::now() + self.readiness_timeout,
+        )
+        .await
+        .map_err(|error| format!("failed to start Codex App Server helper: {error}"))?;
+        #[cfg(windows)]
+        let child = command
+            .spawn()
+            .map_err(|error| format!("failed to start Codex App Server helper: {error}"))?;
+        #[cfg(not(unix))]
+        let mut child = child;
+        #[cfg(test)]
+        if let Some(events) = self.fixture_events.as_ref()
+            && let Some(race) = events.admission_race.as_ref()
+        {
+            if let Err(error) = events.publish_pid(child.id()) {
+                terminate_and_reap_codex_helper(child).await;
+                return Err(error);
+            }
+            race.spawned.publish();
+            race.release.wait_after(0).await;
+        }
+        progress.set("admission");
+        let identity = child
+            .id()
+            .and_then(|pid| NativeProcessSampler::process_identity(pid).ok());
+        let Some(identity) = identity else {
+            terminate_and_reap_codex_helper(child).await;
+            return Err("spawned Codex helper has no stable process identity".to_owned());
+        };
+        #[cfg(unix)]
+        let liveness = codex_helper_root_exited_without_reaping(identity.pid)
+            .map(|exited| exited.then_some(()));
+        #[cfg(not(unix))]
+        let liveness = child.try_wait();
+        match liveness {
+            Ok(None) => {}
+            Ok(Some(_)) => {
+                terminate_and_reap_codex_helper(child).await;
+                return Err("Codex helper exited before ownership admission".to_owned());
+            }
+            Err(error) => {
+                terminate_and_reap_codex_helper(child).await;
+                return Err(format!(
+                    "failed to revalidate Codex helper process identity: {error}"
+                ));
+            }
+        }
+        let registration = match launch.process_attribution.register_identity(
+            identity,
+            ProcessRegistrationMetadata {
+                scope: AttributionScope::External,
+                kind: AttributionKind::Helper,
+                label: "Codex App Server helper".to_owned(),
+                source: RegistrationSource::Helper,
+                driver: None,
+                survives_shutdown: false,
+            },
+        ) {
+            Ok(registration) => registration,
+            Err(
+                error @ (ProcessRegistrationError::Shutdown | ProcessRegistrationError::Capacity),
+            ) => {
+                terminate_and_reap_codex_helper(child).await;
+                return Err(error.to_string());
+            }
+        };
+        #[cfg(test)]
+        if let Some(events) = self.fixture_events.as_ref()
+            && let Err(error) = events.publish_spawned(child.id())
+        {
+            terminate_and_reap_codex_helper(child).await;
+            return Err(error);
+        }
+        let (process, ready) = supervisor.supervise(
+            child,
+            launch.socket_path,
+            CodexHelperSupervisionOwnership {
+                registration: Some(registration),
+                permit,
+                task: owned_task,
+            },
+            self.readiness_timeout,
+            #[cfg(test)]
+            CodexHelperSupervisionFixture {
+                integration_deadline: self.integration_deadline,
+                reaped: self
+                    .fixture_events
+                    .as_ref()
+                    .map(|events| events.reaped.clone()),
+                watchdog_spawn_race: self
+                    .fixture_events
+                    .as_ref()
+                    .and_then(|events| events.watchdog_spawn_race.clone()),
+            },
+        );
+        progress.set("readiness");
+        ready
+            .await
+            .map_err(|_| "Codex helper supervisor stopped before readiness".to_owned())??;
+        #[cfg(test)]
+        if let Some(events) = self.fixture_events.as_ref() {
+            events.ready.publish();
+        }
+        Ok(Arc::new(process) as Arc<dyn CodexHelperProcess>)
+    }
+}
+
 /// Where a helper start is. A start dropped before it finishes, which is what an
 /// expired preparation budget does, says which step it was on and for how long.
 #[derive(Debug)]
 struct CodexHelperStartProgress {
+    provider_instance_id: String,
     started: std::time::Instant,
     stage: Mutex<&'static str>,
     finished: AtomicBool,
 }
 
 impl CodexHelperStartProgress {
-    fn new() -> Self {
+    fn new(provider_instance_id: &str) -> Self {
         Self {
+            provider_instance_id: provider_instance_id.to_owned(),
             started: std::time::Instant::now(),
             stage: Mutex::new("start"),
             finished: AtomicBool::new(false),
@@ -2619,6 +2743,7 @@ impl Drop for CodexHelperStartProgress {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         tracing::warn!(
             provider = "codex",
+            provider_instance_id = %self.provider_instance_id,
             reason = "helper_start_abandoned",
             stage,
             elapsed_ms = elapsed_millis(self.started.elapsed()),
@@ -3192,6 +3317,141 @@ mod tests {
     use super::*;
     use crate::test_support::{FixtureEvent, TestSandbox};
 
+    /// Answers each probe command with the next scripted result.
+    #[derive(Default)]
+    struct ScriptedProbeRunner {
+        outputs: Mutex<VecDeque<Result<CodexProbeOutput, String>>>,
+        calls: AtomicU64,
+    }
+
+    impl CodexCapabilityProbeRunner for ScriptedProbeRunner {
+        fn run(
+            &self,
+            _executable: &Path,
+            _args: Vec<String>,
+        ) -> Pin<Box<dyn Future<Output = Result<CodexProbeOutput, String>> + Send + '_>> {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            let next = self
+                .outputs
+                .lock()
+                .expect("scripted probe outputs")
+                .pop_front()
+                .unwrap_or_else(|| Err("no scripted probe output".to_owned()));
+            Box::pin(std::future::ready(next))
+        }
+    }
+
+    fn probe_output(stdout: &str) -> Result<CodexProbeOutput, String> {
+        Ok(CodexProbeOutput {
+            success: true,
+            stdout: stdout.to_owned(),
+            stderr: String::new(),
+        })
+    }
+
+    fn probe_executable(sandbox: &TestSandbox) -> PathBuf {
+        let executable = sandbox.path("codex");
+        std::fs::write(&executable, b"codex").expect("probe executable");
+        executable
+    }
+
+    #[test]
+    fn remote_error_class_keeps_only_the_code_or_transport_step() {
+        let error = format!(
+            "{CODEX_REMOTE_RPC_ERROR_PREFIX}{}",
+            json!({"code": -32600, "message": "thread said: deploy the secret token"})
+        );
+        assert_eq!(
+            codex_remote_error_class(&error),
+            "json_rpc_error code=-32600"
+        );
+        assert_eq!(
+            codex_remote_error_class(&format!(
+                "{CODEX_REMOTE_RPC_ERROR_PREFIX}{{\"message\":\"private prompt\"}}"
+            )),
+            "json_rpc_error"
+        );
+        assert_eq!(
+            codex_remote_error_class("failed to connect to Codex App Server: /private/path"),
+            "socket_connect_failed"
+        );
+        assert_eq!(
+            codex_remote_error_class("Codex App Server handshake failed: private detail"),
+            "websocket_handshake_failed"
+        );
+        assert_eq!(
+            codex_remote_error_class("anything else: private"),
+            "transport_error"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_failures_keep_only_their_kind() {
+        let sandbox = TestSandbox::new("codex-probe-failure-kinds");
+        let executable = probe_executable(&sandbox);
+        for (error, reason) in [
+            ("Codex capability probe failed: Timeout", "probe_timeout"),
+            (
+                "Codex capability probe failed: Spawn(Os { code: 2, message: \"/private/bin\" })",
+                "probe_spawn_failed",
+            ),
+            (
+                "Codex capability probe failed: Cancelled",
+                "probe_unavailable",
+            ),
+        ] {
+            let runner = Arc::new(ScriptedProbeRunner::default());
+            runner
+                .outputs
+                .lock()
+                .expect("scripted probe outputs")
+                .push_back(Err(error.to_owned()));
+            let probe = CachedCodexCapabilityProbe::new(runner);
+            assert_eq!(
+                probe.probe_outcome(&executable).await,
+                Err(CodexProbeFailure {
+                    reason,
+                    cached: false,
+                })
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unparseable_version_is_rejected_for_a_while_then_probed_again() {
+        let sandbox = TestSandbox::new("codex-probe-rejection-ttl");
+        let executable = probe_executable(&sandbox);
+        let runner = Arc::new(ScriptedProbeRunner::default());
+        runner
+            .outputs
+            .lock()
+            .expect("scripted probe outputs")
+            .extend([
+                probe_output("codex-cli development build"),
+                probe_output("Usage: codex --remote unix://PATH"),
+                probe_output("Usage: codex app-server --listen unix://PATH"),
+                probe_output("codex-cli 99.0.0"),
+                probe_output("Usage: codex --remote unix://PATH"),
+                probe_output("Usage: codex app-server --listen unix://PATH"),
+            ]);
+        let probe = CachedCodexCapabilityProbe::new(runner.clone());
+
+        assert!(probe.probe(&executable).await.is_none());
+        assert_eq!(
+            probe.probe_outcome(&executable).await,
+            Err(CodexProbeFailure {
+                reason: CODEX_PROBE_VERSION_UNPARSED,
+                cached: true,
+            })
+        );
+        assert_eq!(runner.calls.load(Ordering::Acquire), 3);
+
+        tokio::time::advance(CODEX_PROBE_REJECTION_TTL + Duration::from_secs(1)).await;
+
+        assert!(probe.probe(&executable).await.is_some());
+        assert_eq!(runner.calls.load(Ordering::Acquire), 6);
+    }
+
     #[cfg(feature = "hermetic-test-guard")]
     #[tokio::test]
     async fn hermetic_guard_refuses_direct_codex_probe_and_helper_before_spawn() {
@@ -3208,6 +3468,7 @@ mod tests {
                 .is_err()
         );
         let launch = CodexHelperLaunch {
+            provider_instance_id: "codex".to_owned(),
             executable: executable.display().to_string(),
             args: vec![],
             cwd: executable.parent().unwrap().to_path_buf(),
@@ -3311,6 +3572,7 @@ mod tests {
                     let endpoint = format!("unix://{}", socket_path.to_string_lossy());
                     let process = launcher
                         .start(CodexHelperLaunch {
+                            provider_instance_id: "codex".to_owned(),
                             executable: executable.to_string_lossy().into_owned(),
                             args: vec![
                                 "app-server".to_owned(),
@@ -3374,6 +3636,7 @@ mod tests {
         fn launch(&self, process_attribution: ProcessAttributionRegistry) -> CodexHelperLaunch {
             let endpoint = format!("unix://{}", self.socket_path.to_string_lossy());
             CodexHelperLaunch {
+                provider_instance_id: "codex".to_owned(),
                 executable: self.executable.to_string_lossy().into_owned(),
                 args: vec![
                     "app-server".to_owned(),
@@ -3939,6 +4202,7 @@ mod tests {
 
         let error = launcher
             .start(CodexHelperLaunch {
+                provider_instance_id: "codex".to_owned(),
                 executable: executable.to_string_lossy().into_owned(),
                 args: vec![
                     "app-server".to_owned(),
@@ -4095,6 +4359,7 @@ mod tests {
         let child_pid_environment = child_pid_path.to_string_lossy().into_owned();
         let helper = launcher
             .start(CodexHelperLaunch {
+                provider_instance_id: "codex".to_owned(),
                 executable: executable.to_string_lossy().into_owned(),
                 args: vec![
                     "app-server".to_owned(),
@@ -4223,6 +4488,7 @@ mod tests {
             events.clone(),
         );
         let launch = CodexHelperLaunch {
+            provider_instance_id: "codex".to_owned(),
             executable: executable.to_string_lossy().into_owned(),
             args: vec![
                 "app-server".to_owned(),
