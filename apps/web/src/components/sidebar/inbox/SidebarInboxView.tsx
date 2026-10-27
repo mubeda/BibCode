@@ -1,6 +1,6 @@
 import { parseScopedThreadKey, scopedThreadKey } from "@bibcode/client-runtime/environment";
 import { useNavigate, useParams } from "@tanstack/react-router";
-import { type ComponentType, useCallback, useEffect, useMemo } from "react";
+import { type ComponentType, useCallback, useEffect, useMemo, useRef } from "react";
 
 import {
   selectFocusedCenterSurface,
@@ -95,11 +95,16 @@ export function SidebarInboxView() {
   }, [setInboxCategory, settle]);
 
   const visibleRows = useMemo(() => selectInboxRows(rows, category), [category, rows]);
-  const rowsByKey = useMemo(() => new Map(rows.map((row) => [row.key, row])), [rows]);
+  // Rows change on every agent event; reading them through a ref keeps `openAgent`
+  // stable, so the memoized cards re-render only when their own row changes.
+  const rowsRef = useRef(rows);
+  useEffect(() => {
+    rowsRef.current = rows;
+  }, [rows]);
 
   const openAgent = useCallback(
     (key: string) => {
-      const row = rowsByKey.get(key);
+      const row = rowsRef.current.find((entry) => entry.key === key);
       if (row === undefined) return;
       const target = resolveInboxOpenTarget(row);
       // Terminal rows show their host's unread state, which the host's chat clears.
@@ -112,7 +117,7 @@ export function SidebarInboxView() {
         params: buildThreadRouteParams(target.hostRef),
       });
     },
-    [isMobile, markRead, navigate, rowsByKey, setOpenMobile],
+    [isMobile, markRead, navigate, setOpenMobile],
   );
 
   const label = INBOX_CATEGORIES.find((entry) => entry.id === category)?.label ?? "";
