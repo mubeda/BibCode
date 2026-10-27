@@ -358,6 +358,8 @@ const SENT_ROW_ANCHOR_OFFSET = 16;
 const STREAMED_REST_SLACK_PX = 48;
 /** How long after a reply's first delivery its sent row has settled, on the slowest runner. */
 const SENT_ROW_SETTLE_MS = 2_500;
+/** How soon a diagram's growth is followed: a size report, two frames and a paint. */
+const DRAW_FOLLOW_MS = 200;
 /** The `viewOffset` the timeline minimap scrolls a selected message to. */
 const MINIMAP_VIEW_OFFSET = 24;
 
@@ -1002,9 +1004,10 @@ describe("packaged Mermaid diagrams", () => {
     // The diagram's own growth is followed too: after each delivery from the one the diagram
     // drew in, before the next one lands, the reply's end is revealed as far as the plain
     // reply's is. A slow webview can paint no frame between two of the plain reply's
-    // deliveries; there the end must simply be revealed. The growth itself is followed two
-    // frames after the draw, so on a slow runner the next delivery can land first; the draw's
-    // delivery then passes when the end shows within the three painted samples after the draw.
+    // deliveries; there the end must simply be revealed. The growth itself is followed once
+    // LegendList reports the size and two frames pass, so on a slow runner the next delivery
+    // can land first; the draw's delivery then passes when the end shows within
+    // DRAW_FOLLOW_MS of the draw.
     // Following waits while the sent row glides into place, so on a slow webview the first
     // deliveries, and the draw, can land before the list first catches up with the end. The
     // glide settles within its 750 ms positioning timer and a few frames, so every delivery
@@ -1024,14 +1027,15 @@ describe("packaged Mermaid diagrams", () => {
       diagram[firstStreamed]!.at + SENT_ROW_SETTLE_MS,
     );
     const drewAfter = diagram[drew]!.afterParagraphs;
+    const drawAt = diagram[drew]!.at;
     const drawFollowed = diagram
-      .slice(drew, drew + 4)
+      .filter((entry) => entry.at >= drawAt && entry.at <= drawAt + DRAW_FOLLOW_MS)
       .some(
         (entry) =>
           entry.endBelow !== null && entry.endBelow <= revealedBelow(entry.afterParagraphs),
       );
-    // The draw's grace covers only a delivery that rested within those samples, when the next
-    // one landed before the follow; a later rest of that delivery is checked like the others.
+    // The draw's grace covers only a delivery that rested within that time, when the next one
+    // landed before the follow; a later rest of that delivery is checked like the others.
     const restingSamples = new Map<number, number>();
     for (const [index, entry] of diagram.entries()) {
       if (!entry.fenceShown || entry.endBelow === null) continue;
@@ -1040,7 +1044,12 @@ describe("packaged Mermaid diagrams", () => {
     const endsHidden = [...restingSamples]
       .filter(([delivered, index]) => delivered >= drewAfter && diagram[index]!.at >= checkedFrom)
       .filter(
-        ([delivered, index]) => !(delivered === drewAfter && drawFollowed && index < drew + 4),
+        ([delivered, index]) =>
+          !(
+            delivered === drewAfter &&
+            drawFollowed &&
+            diagram[index]!.at <= drawAt + DRAW_FOLLOW_MS
+          ),
       )
       .map(([delivered, index]) => [delivered, diagram[index]!.endBelow!] as const)
       .filter(([delivered, below]) => below > revealedBelow(delivered));
