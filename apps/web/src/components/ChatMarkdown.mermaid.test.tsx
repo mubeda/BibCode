@@ -709,10 +709,14 @@ describe("Mermaid diagrams in chat Markdown", () => {
       expect(body(remounted.container).style.height).toBe("");
       expect(renderedSources.filter((source) => source === FLOWCHART)).toHaveLength(2);
 
-      // A source that never drew reserves nothing.
+      // A source that never drew reserves nothing. The renderer is held so the check sees the
+      // source before the queue draws it, which it can otherwise do within the mount.
+      const renderer = deferred<MermaidRenderer>();
+      __setMermaidRendererLoaderForTests(() => renderer.promise);
       const fresh = await mount(fence(SEQUENCE));
       expect(hasDiagram(fresh.container)).toBe(false);
       expect(body(fresh.container).style.height).toBe("");
+      renderer.resolve(await countingRenderer());
     });
   });
 });
