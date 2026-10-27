@@ -66,6 +66,13 @@ interface StreamSample {
   readonly diagramDrawn: boolean;
   /** Where the reply's sent row starts below the visible top, or null while it is unmounted. */
   readonly sentRowTop: number | null;
+  /**
+   * The reply's code block's height as first laid out showing its source, and as first laid out
+   * drawn, or null before then. Read when the DOM changes, so a draw that lands in the same
+   * painted frame as the source still shows whether it changed the height at the end.
+   */
+  readonly sourceHeight: number | null;
+  readonly drawnHeight: number | null;
 }
 
 interface KeyboardSample {
@@ -1027,10 +1034,26 @@ describe("packaged Mermaid diagrams", () => {
     const drew = diagram.findIndex((entry) => entry.diagramDrawn);
     const firstStreamed = diagram.findIndex((entry) => entry.streaming);
     // The diagram drew while the reply streamed, after its first text was shown, and its
-    // source showed at the end first, so the draw changed the height at the end.
+    // source was laid out at the end first, so the draw changed the height at the end. A busy
+    // webview can lay the source out and draw it before painting a frame of it, so the source is
+    // read from the DOM as it changes rather than from a painted frame.
     expect(firstStreamed).toBeGreaterThanOrEqual(0);
     expect(drew).toBeGreaterThan(firstStreamed);
-    expect(diagram.slice(0, drew).some((entry) => entry.fenceShown)).toBe(true);
+    const drawnBlock = diagram.at(-1)!;
+    expect({
+      sourceLaidOut: drawnBlock.sourceHeight !== null,
+      drawChangedHeight:
+        drawnBlock.sourceHeight !== null &&
+        drawnBlock.drawnHeight !== null &&
+        drawnBlock.sourceHeight !== drawnBlock.drawnHeight,
+      sourceHeight: drawnBlock.sourceHeight,
+      drawnHeight: drawnBlock.drawnHeight,
+    }).toEqual({
+      sourceLaidOut: true,
+      drawChangedHeight: true,
+      sourceHeight: drawnBlock.sourceHeight,
+      drawnHeight: drawnBlock.drawnHeight,
+    });
     expect(diagram.slice(drew).some((entry) => !entry.finished)).toBe(true);
     // The list keeps following the end: it ends resting about where the plain reply rests, with
     // the last streamed line in view. The two replies stream separately, and on slow runners
@@ -1494,6 +1517,24 @@ async function streamAndSampleEnd(prompt: string): Promise<StreamSample[]> {
       record.__bibcodeStreamSamples = samples;
       const started = performance.now();
       let running = true;
+      // The block this reply streams is the one that was not there before it.
+      const blocksBefore = new Set(
+        document.querySelectorAll(`${surface} .chat-markdown-codeblock`),
+      );
+      let sourceHeight: number | null = null;
+      let drawnHeight: number | null = null;
+      const observeBlock = () => {
+        for (const block of document.querySelectorAll<HTMLElement>(
+          `${surface} .chat-markdown-codeblock`,
+        )) {
+          if (blocksBefore.has(block) || !block.textContent?.includes("Streamed draw")) continue;
+          const height = Math.round(block.getBoundingClientRect().height);
+          if (block.querySelector(".chat-markdown-mermaid svg")) drawnHeight ??= height;
+          else sourceHeight ??= height;
+        }
+      };
+      const blockObserver = new MutationObserver(observeBlock);
+      blockObserver.observe(document.body, { childList: true, subtree: true });
       const read = (): StreamSample => {
         const scroller = document.querySelector<HTMLElement>(
           `${surface} [class*='overflow-anchor']`,
@@ -1536,6 +1577,8 @@ async function streamAndSampleEnd(prompt: string): Promise<StreamSample[]> {
             return Math.round(end - Math.min(area.bottom, composerTop ?? area.bottom));
           })(),
           diagramDrawn: drawn() > drawnBefore,
+          sourceHeight,
+          drawnHeight,
           sentRowTop: (() => {
             // Both replies' prompts differ; the newest row sent with this one is the lowest.
             const rows = [
@@ -1561,6 +1604,7 @@ async function streamAndSampleEnd(prompt: string): Promise<StreamSample[]> {
       requestAnimationFrame(onFrame);
       record.__bibcodeStreamStop = () => {
         running = false;
+        blockObserver.disconnect();
       };
     },
     visibleSurfaceSelector,
