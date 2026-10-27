@@ -3109,7 +3109,10 @@ crash types, termination reasons, and faulting symbols; it excludes raw memory
 and the rest of the diagnostic report. Inspect these logs when the app or
 embedded driver exits unexpectedly. A missing provider-terminal activity dock
 also records structural pane, surface, and activity-host geometry to distinguish
-layout visibility from provider-observation failures.
+layout visibility from provider-observation failures. A visible host with no
+dock is an observation failure. Before changing layout, read the Codex observer
+lines in `app-server.log`: each names its `reason`, its `stage`, and `elapsed_ms`
+(see [Activity observation](../architecture/activity-observation.md)).
 Window resizing polls the actual viewport and native window until the requested
 size is reached, including when GTK startup dimensions settle independently.
 It does not depend on animation frames, which can stop in occluded macOS
