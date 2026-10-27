@@ -2044,6 +2044,47 @@ describe("ChatView effects (captured and run manually)", () => {
     for (const cleanup of cleanups) cleanup();
   });
 
+  it("reveals the end again when a row above the anchored turn grows and shifts it", async () => {
+    const { list, cleanups, messageId, onAnchorReady } = await sendTallReply({});
+    onAnchorReady(messageId, 2);
+    list.scrollNode.fire("scrollend");
+    expect(list.scrollNode.scrollTop).toBe(216);
+
+    // An earlier reply above the sent row grows, as its diagrams draw again once remounted, and
+    // the list does not scroll by it: the turn, end and all, moves 57 px down.
+    list.growRow(1, 57);
+    onRowSizeChanged()({ index: 1, previous: 100, size: 157 });
+
+    expect(list.calls.scrollToOffset.at(-1)).toEqual({ offset: 273, animated: false });
+    for (const cleanup of cleanups) cleanup();
+  });
+
+  it("leaves the view alone when the list holds the turn in place as a row above grows", async () => {
+    const { list, cleanups, messageId, onAnchorReady } = await sendTallReply({});
+    onAnchorReady(messageId, 2);
+    list.scrollNode.fire("scrollend");
+    const calls = list.calls.scrollToOffset.length;
+    const frames: Array<() => void> = [];
+    vi.stubGlobal("requestAnimationFrame", (callback: (time: number) => void) => {
+      frames.push(() => callback(0));
+      return frames.length;
+    });
+
+    // LegendList scrolls by the growth a frame later, which keeps the end where it was.
+    list.growRow(1, 57);
+    onRowSizeChanged()({ index: 1, previous: 100, size: 157 });
+    for (const frame of frames.splice(0)) frame();
+    list.scrollNode.scrollTop += 57;
+    for (const frame of frames.splice(0)) frame();
+
+    expect(list.calls.scrollToOffset).toHaveLength(calls);
+    vi.stubGlobal("requestAnimationFrame", (callback: (time: number) => void) => {
+      callback(0);
+      return 1;
+    });
+    for (const cleanup of cleanups) cleanup();
+  });
+
   it("keeps the reader's place when a row grows away from the anchored turn's end", async () => {
     const { list, cleanups, messageId, onAnchorReady } = await sendTallReply({});
     onAnchorReady(messageId, 2);

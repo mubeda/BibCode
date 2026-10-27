@@ -4579,10 +4579,12 @@ function ChatViewContent(props: ChatViewProps) {
     };
   }, [activeThread?.id, timelineEntries, followTimelineLiveEnd]);
 
-  // A row of the anchored turn that grows without a new entry, such as a diagram drawing in a
-  // reply taller than the timeline, changes layout the effect above never sees. When the turn's
-  // end was in view before the growth, one pass reveals it again; a row expanded away from the
-  // end keeps the reader's place.
+  // A row that grows without a new entry, such as a diagram drawing in a reply taller than the
+  // timeline, changes layout the effect above never sees. That includes rows above the anchored
+  // turn, such as an earlier reply whose diagrams draw again as it remounts: the list holds the
+  // row on screen in place for growth above it, but not always (#193), and the turn's end then
+  // drops out of view until the next delivery. When the turn's end was in view before the
+  // growth, one pass reveals it again; a row expanded away from the end keeps the reader's place.
   const pendingTurnGrowthRef = useRef<{ growth: number; scrollTop: number } | null>(null);
   const followGrownTurn = useCallback(
     (grown: { readonly growth: number; readonly scrollTop: number }) => {
@@ -4606,7 +4608,6 @@ function ChatViewContent(props: ChatViewProps) {
       if (
         timelineScrollModeRef.current !== "anchoring-new-turn" ||
         anchorIndex === null ||
-        info.index < anchorIndex ||
         info.size <= info.previous
       ) {
         return;
