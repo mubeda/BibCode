@@ -1325,6 +1325,73 @@ esac"#,
     }
 
     #[tokio::test]
+    async fn a_finished_read_blocked_on_the_running_copy_downloads_the_finished_log() {
+        let b = bench("pipelines-final-read-held-copy").await;
+        b.open().await;
+        b.prs
+            .pipelines
+            .logs
+            .set_range_support(HOST, RangeSupport::Unsupported);
+        lock(&b.fake.jobs).insert(
+            998,
+            Answer::Ok(job_detail(998, PipelineStatus::Running, None)),
+        );
+        lock(&b.fake.trace).log = b"running\n".to_vec();
+        b.service
+            .job_log(b.log_input(LogFrom::Tail, Refresh::User), &c())
+            .await
+            .unwrap();
+        assert_eq!(b.fake.calls("trace 998 whole"), 1);
+        // The job finishes. Another read still holds the running copy, so
+        // the final read cannot drop it before asking the cache.
+        lock(&b.fake.trace).log = b"running\nJob succeeded\n".to_vec();
+        lock(&b.fake.jobs).insert(
+            998,
+            Answer::Ok(job_detail(998, PipelineStatus::Success, Some(22))),
+        );
+        let locked = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let state = Arc::clone(&b.prs.pipelines);
+        let locked_hold = Arc::clone(&locked);
+        let release_hold = Arc::clone(&release);
+        let holder = async move {
+            state
+                .logs
+                .hold_job_log_for_test(998, &locked_hold, release_hold.notified())
+                .await;
+        };
+        let token = c();
+        let read = async {
+            locked.notified().await;
+            let pending = b
+                .service
+                .job_log(b.log_input(LogFrom::Tail, Refresh::User), &token);
+            let unblock = async {
+                while b.fake.calls("job") < 2 {
+                    tokio::task::yield_now().await;
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                for _ in 0..20 {
+                    tokio::task::yield_now().await;
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                assert_eq!(
+                    b.fake.calls("trace 998 whole"),
+                    1,
+                    "the held running copy must not answer the finished read"
+                );
+                release.notify_one();
+            };
+            tokio::join!(pending, unblock).0
+        };
+        let ((), last) = tokio::join!(holder, read);
+        let last = chunk(last.unwrap());
+        assert!(last.complete, "{last:?}");
+        assert!(last.text.ends_with("Job succeeded\n"), "{last:?}");
+        assert_eq!(b.fake.calls("trace 998 whole"), 2);
+    }
+
+    #[tokio::test]
     async fn a_memory_answer_older_than_30s_reads_the_job_first_and_a_403_refuses_the_text() {
         let b = bench("pipelines-authorized").await;
         b.open().await;
