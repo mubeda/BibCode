@@ -2246,6 +2246,42 @@ describe("ChatView effects (captured and run manually)", () => {
     }
   });
 
+  it("keeps a reader's line when the bottom region's height changes after they scroll away", () => {
+    for (const [layout, options] of [
+      // Within LegendList's end threshold of a list taller than the view.
+      ["near its end", { scroll: 190, scrollLength: 200, dataLength: 4, rowSize: 100 }],
+      // A thread shorter than the view, which only the composer makes scroll.
+      ["shorter than the view", { scroll: 10, scrollLength: 600, dataLength: 2, rowSize: 100 }],
+    ] as const) {
+      h.stateSeeds.clear();
+      h.setStateCalls.length = 0;
+      seedConnectedServerThread(makeThreadWithEarlierTurn());
+      renderServerRoute();
+      const list = installLegendList(options);
+      const cleanups = runEffects();
+      expect(capturedProps("messagesTimeline")["followsEnd"], layout).toBe(true);
+
+      list.scrollNode.fire("wheel");
+      const followsEnd = h.setStateCalls.find(
+        (call) => call.next === false && h.stateCalls[call.index]?.initial === true,
+      );
+      expect(followsEnd, layout).toBeDefined();
+      for (const cleanup of cleanups) cleanup();
+
+      // The next render, after the composer grew by 80 px: the timeline no longer follows its
+      // end, so LegendList is not asked to keep the list there.
+      h.stateSeeds.set(followsEnd!.index, {
+        value: false,
+        expectInitial: (value) => value === true,
+      });
+      h.stateSeeds.set(20, { value: 80, expectInitial: (value) => value === 0 });
+      renderServerRoute();
+      const timeline = capturedProps("messagesTimeline");
+      expect(timeline["followsEnd"], layout).toBe(false);
+      expect(timeline["contentInsetEndAdjustment"], layout).toBe(80);
+    }
+  });
+
   it("positions a sent row once and keeps a released one where the reader left it", () => {
     seedConnectedServerThread(makeThreadWithEarlierTurn());
     renderServerRoute();

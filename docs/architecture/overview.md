@@ -3125,6 +3125,13 @@ view), or free scrolling.
   and no later scroll applies it; it also releases the anchor a recent data
   change locked, which was recorded before that adjustment and would apply it
   a second time. A held request therefore never moves a reader who took over.
+- **Bottom region.** LegendList keeps the list at its end
+  (`maintainScrollAtEnd`) only while the timeline follows it and no sent turn
+  is anchored (`resolveTimelineMaintainScrollAtEnd`). Once the reader scrolls
+  away, a change in the bottom region's height (the composer growing as they
+  type, an Activity card opening or closing above it) leaves the line they
+  read in place, even when the list sits within LegendList's end threshold or
+  the thread is shorter than the view.
 - **Released sent row.** A sent row the reader scrolled away from stays
   released until the next send or thread. LegendList reports the anchor ready
   again whenever the anchored end space changes size, once per delivery; a
