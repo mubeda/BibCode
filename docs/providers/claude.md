@@ -455,8 +455,10 @@ their identity is enough. mise's `shims/claude`, a link to `mise`, is a shim:
 its own identity does not change when the Claude behind it does.
 
 For a shim, the key also holds the working directory. Each later launch reruns
-`--version` alone, bounded by the same two seconds, and launches of one shim
-share that recheck. A cached answer is reused while the parsed version is
+`--version` alone, bounded by the same two seconds. Launches of one shim share
+that recheck, but only when they have the same environment, since an
+environment can select a different Claude. A recheck that ended without an
+answer is started again. A cached answer is reused while the parsed version is
 unchanged; a new version runs the whole probe again. A recheck that fails or
 times out proves no change. The launch then keeps the cached answer and logs
 `Claude shim did not confirm its probed version`.

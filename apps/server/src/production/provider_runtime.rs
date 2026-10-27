@@ -15837,7 +15837,52 @@ struct ClaudeInFlightProbe {
     receiver: tokio::sync::watch::Receiver<Option<ClaudeProbeOutcome>>,
 }
 
-type ClaudeShimRecheck = tokio::sync::watch::Receiver<Option<Result<Option<String>, String>>>;
+/// Which launches may share one shim recheck: the recheck runs with the first one's
+/// environment, and an environment can select another Claude behind the same shim.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ClaudeShimRecheckKey {
+    executable: ClaudeProbeCacheKey,
+    environment: u64,
+}
+
+impl ClaudeShimRecheckKey {
+    fn new(executable: &ClaudeProbeCacheKey, environment: &[(OsString, OsString)]) -> Self {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        environment.hash(&mut hasher);
+        Self {
+            executable: executable.clone(),
+            environment: hasher.finish(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ClaudeShimRecheck {
+    id: u64,
+    receiver: tokio::sync::watch::Receiver<Option<Result<Option<String>, String>>>,
+}
+
+/// Removes its recheck's entry however the recheck ends, also when its task panics or is
+/// aborted, so a later launch starts a new recheck instead of waiting on a dead one.
+struct ClaudeShimRecheckGuard {
+    cache: ClaudeActivityProbeCache,
+    key: ClaudeShimRecheckKey,
+    id: u64,
+}
+
+impl Drop for ClaudeShimRecheckGuard {
+    fn drop(&mut self) {
+        let mut cache_state = self.cache.lock();
+        if cache_state
+            .rechecks
+            .get(&self.key)
+            .is_some_and(|recheck| recheck.id == self.id)
+        {
+            cache_state.rechecks.remove(&self.key);
+        }
+    }
+}
 
 #[derive(Debug, Default)]
 struct ClaudeProbeCacheState {
@@ -15845,7 +15890,7 @@ struct ClaudeProbeCacheState {
     ready_versions: HashMap<ClaudeProbeCacheKey, String>,
     in_flight: HashMap<ClaudeProbeCacheKey, ClaudeInFlightProbe>,
     /// Shim `--version` rechecks in progress (see `recheck_claude_shim_version`).
-    rechecks: HashMap<ClaudeProbeCacheKey, ClaudeShimRecheck>,
+    rechecks: HashMap<ClaudeShimRecheckKey, ClaudeShimRecheck>,
     next_id: u64,
     tick: u64,
 }
@@ -15991,28 +16036,7 @@ async fn probe_claude_activity_support_with_environment(
                 if let Some(resolution_gate) = resolution_gate {
                     resolution_gate.block();
                 }
-                let resolved =
-                    resolve_provider_executable_in_path(&binary_path, resolution_path.as_deref())?;
-                // Only the key uses the canonical target: the probe runs what the launch runs.
-                let canonical =
-                    std::fs::canonicalize(&resolved).unwrap_or_else(|_| resolved.clone());
-                let metadata = std::fs::metadata(&canonical).ok()?;
-                #[cfg(unix)]
-                let file_identity = {
-                    use std::os::unix::fs::MetadataExt;
-                    Some((metadata.dev(), metadata.ino()))
-                };
-                #[cfg(not(unix))]
-                let file_identity = None;
-                let shim_cwd = is_multi_call_shim(&resolved, &canonical).then_some(resolution_cwd);
-                Some(ClaudeProbeCacheKey {
-                    resolved,
-                    executable: canonical,
-                    modified: metadata.modified().ok(),
-                    length: metadata.len(),
-                    file_identity,
-                    shim_cwd,
-                })
+                claude_probe_cache_key(&binary_path, resolution_path.as_deref(), resolution_cwd)
             }),
         )
         .await
@@ -16034,6 +16058,35 @@ async fn probe_claude_activity_support_with_environment(
     })
     .await
     .unwrap_or_default()
+}
+
+/// Resolves `binary_path` on `search_path` and identifies the Claude a launch in `cwd` runs.
+/// Blocks on the filesystem.
+fn claude_probe_cache_key(
+    binary_path: &str,
+    search_path: Option<&OsStr>,
+    cwd: PathBuf,
+) -> Option<ClaudeProbeCacheKey> {
+    let resolved = resolve_provider_executable_in_path(binary_path, search_path)?;
+    // Only the key uses the canonical target: the probe runs what the launch runs.
+    let canonical = std::fs::canonicalize(&resolved).unwrap_or_else(|_| resolved.clone());
+    let metadata = std::fs::metadata(&canonical).ok()?;
+    #[cfg(unix)]
+    let file_identity = {
+        use std::os::unix::fs::MetadataExt;
+        Some((metadata.dev(), metadata.ino()))
+    };
+    #[cfg(not(unix))]
+    let file_identity = None;
+    let shim_cwd = is_multi_call_shim(&resolved, &canonical).then_some(cwd);
+    Some(ClaudeProbeCacheKey {
+        resolved,
+        executable: canonical,
+        modified: metadata.modified().ok(),
+        length: metadata.len(),
+        file_identity,
+        shim_cwd,
+    })
 }
 
 /// The ready answer for `key` at `version`, marked as just used.
@@ -16058,8 +16111,9 @@ fn ready_claude_probe(
 }
 
 /// The Claude Code version a shim's `--version` prints now (`None` when the output is not
-/// Claude Code's), or why it gave no answer by `deadline`. Launches of one shim share one
-/// recheck; it runs on its own, so a launch that stops waiting does not cancel it.
+/// Claude Code's), or why it gave no answer by `deadline`. Launches of one shim with one
+/// environment share one recheck; it runs on its own, so a launch that stops waiting does not
+/// cancel it. An entry whose task ended without answering is replaced by a new recheck.
 async fn recheck_claude_shim_version(
     key: &ClaudeProbeCacheKey,
     context: &ClaudeProbeContext,
@@ -16067,19 +16121,37 @@ async fn recheck_claude_shim_version(
     deadline: Instant,
     launch_policy: ClaudeProbeLaunchPolicy,
 ) -> Result<Option<String>, String> {
+    let recheck_key = ClaudeShimRecheckKey::new(key, &context.environment);
     let mut receiver = {
         let mut cache_state = cache.lock();
-        if let Some(receiver) = cache_state.rechecks.get(key) {
-            receiver.clone()
+        let running = cache_state
+            .rechecks
+            .get(&recheck_key)
+            .filter(|recheck| recheck.receiver.has_changed().is_ok())
+            .map(|recheck| recheck.receiver.clone());
+        if let Some(receiver) = running {
+            receiver
         } else {
             let (sender, receiver) = tokio::sync::watch::channel(None);
-            cache_state.rechecks.insert(key.clone(), receiver.clone());
-            let cache = cache.clone();
-            let key = key.clone();
+            cache_state.next_id = cache_state.next_id.saturating_add(1);
+            let id = cache_state.next_id;
+            cache_state.rechecks.insert(
+                recheck_key.clone(),
+                ClaudeShimRecheck {
+                    id,
+                    receiver: receiver.clone(),
+                },
+            );
+            let guard = ClaudeShimRecheckGuard {
+                cache: cache.clone(),
+                key: recheck_key,
+                id,
+            };
+            let executable = key.resolved.clone();
             let context = context.clone();
             tokio::spawn(async move {
                 let result = run_claude_probe_command(
-                    &key.resolved,
+                    &executable,
                     "--version",
                     Instant::now() + CLAUDE_ACTIVITY_PROBE_TIMEOUT,
                     launch_policy,
@@ -16087,8 +16159,8 @@ async fn recheck_claude_shim_version(
                 )
                 .await
                 .map(|output| claude_code_version(&output).map(str::to_owned));
-                // Only this task inserts while its entry is present, so the entry is its own.
-                cache.lock().rechecks.remove(&key);
+                // Later launches start their own recheck; those waiting get this answer.
+                drop(guard);
                 sender.send_replace(Some(result));
             });
             receiver
@@ -16897,6 +16969,38 @@ impl ClaudeActivityProbeTestContext {
     #[must_use]
     pub fn cache_len(&self) -> usize {
         self.cache.lock().ready.len()
+    }
+
+    /// Leaves behind the shim recheck a launch like `probe_in`'s would join, as a recheck task
+    /// that panicked or was aborted leaves it: an entry whose sender is gone without answering.
+    pub fn abandon_shim_recheck(
+        &self,
+        binary_path: &str,
+        environment: &BTreeMap<String, String>,
+        cwd: &Path,
+    ) {
+        let environment = normalize_provider_environment(
+            environment
+                .iter()
+                .map(|(name, value)| (OsStr::new(name), OsStr::new(value))),
+        );
+        let search_path = effective_provider_search_path(
+            environment
+                .iter()
+                .map(|(name, value)| (name.as_os_str(), value.as_os_str())),
+        );
+        let key = claude_probe_cache_key(binary_path, search_path.as_deref(), cwd.to_path_buf())
+            .expect("the shim resolves");
+        assert!(key.is_shim(), "only a shim is rechecked");
+        let (sender, receiver) = tokio::sync::watch::channel(None);
+        drop(sender);
+        let mut cache = self.cache.lock();
+        cache.next_id = cache.next_id.saturating_add(1);
+        let id = cache.next_id;
+        cache.rechecks.insert(
+            ClaudeShimRecheckKey::new(&key, &environment),
+            ClaudeShimRecheck { id, receiver },
+        );
     }
 
     pub fn seed_cache(&self, count: usize) {

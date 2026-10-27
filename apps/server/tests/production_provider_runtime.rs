@@ -15027,11 +15027,13 @@ fi
 case "$1" in
   --version)
     if [ -f "$state/slow-version" ]; then sleep 0.3; fi
-    cat "$state/version" || exit 1
+    if [ "$SHIM_CLAUDE" = old ]; then printf '%s\n' '2.1.200 (Claude Code)'
+    else cat "$state/version" || exit 1; fi
     printf '(node:%s) Warning: a deprecation Node prints on every run\n' "$$" >&2
     exit 0;;
   --help)
-    if [ -f "$PWD/.claude-project" ] && [ "$SHIM_MARKER" = on ]; then cat "$state/help"
+    if [ "$SHIM_CLAUDE" = old ]; then printf '%s\n' 'Usage: claude [options]'
+    elif [ -f "$PWD/.claude-project" ] && [ "$SHIM_MARKER" = on ]; then cat "$state/help"
     else printf '%s\n' 'Usage: claude [options]'; fi
     exit 0;;
   --thinking-display) exit 1;;
@@ -15344,6 +15346,62 @@ async fn concurrent_launches_share_one_shim_recheck() {
         shim.calls("claude.sh --version"),
         2,
         "one recheck for both launches"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shim_rechecks_are_shared_only_by_launches_with_one_environment() {
+    let probe_context = ClaudeActivityProbeTestContext::new();
+    let temp = TempDir::new().unwrap();
+    let shim = MultiCallShim::new(&temp, "2026.10.19 linux-x64 (2026-10-19)");
+    let project = shim.project(&temp, "project", true);
+    let link = shim.link.to_string_lossy().into_owned();
+    let current = shim_environment();
+    // Another provider instance whose environment makes the shim pick an older Claude.
+    let mut old = shim_environment();
+    old.insert("SHIM_CLAUDE".to_owned(), "old".to_owned());
+    let first = probe_context.probe_in(&link, &current, &project).await;
+    assert!(hook_activity_support(first), "{first:?}");
+    std::fs::write(shim.state.join("slow-version"), "").unwrap();
+
+    let (current_launch, old_launch) = tokio::join!(
+        probe_context.probe_in(&link, &current, &project),
+        probe_context.probe_in(&link, &old, &project),
+    );
+
+    assert_eq!(current_launch, first);
+    assert!(
+        old_launch.probe_finished && !old_launch.include_hook_events,
+        "the older Claude answers for itself: {old_launch:?}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_shim_recheck_that_ended_without_answering_is_started_again() {
+    let probe_context = ClaudeActivityProbeTestContext::new();
+    let temp = TempDir::new().unwrap();
+    let shim = MultiCallShim::new(&temp, "2026.10.19 linux-x64 (2026-10-19)");
+    let project = shim.project(&temp, "project", true);
+    let link = shim.link.to_string_lossy().into_owned();
+    let environment = shim_environment();
+    let first = probe_context.probe_in(&link, &environment, &project).await;
+    assert!(hook_activity_support(first), "{first:?}");
+    probe_context.abandon_shim_recheck(&link, &environment, &project);
+
+    // An update behind the shim that only a new recheck notices.
+    shim.set_claude("2.1.200 (Claude Code)", "Usage: claude [options]");
+    let next = probe_context.probe_in(&link, &environment, &project).await;
+
+    assert_eq!(
+        shim.calls("claude.sh --version"),
+        3,
+        "a new recheck, then the whole probe"
+    );
+    assert!(
+        next.probe_finished && !next.include_hook_events,
+        "the new Claude answers, not the abandoned recheck: {next:?}"
     );
 }
 
