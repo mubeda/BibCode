@@ -364,7 +364,7 @@ describe("Sidebar Inbox view", () => {
       params: { environmentId: ENV_MAIN, threadId: "thread-host" },
     });
     expect(focusedSurfaceId("thread-host")).toBe("terminal:term-ai");
-    expect(h.spies.markRead).not.toHaveBeenCalled();
+    expect(h.spies.markRead).toHaveBeenCalledWith(threadKeyOf(hostThread));
   });
 
   it("treats a reconnecting remote as partial and settles the default once it reports", async () => {
