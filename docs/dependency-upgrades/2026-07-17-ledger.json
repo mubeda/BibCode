@@ -676,7 +676,8 @@
       "source": "https://www.npmjs.com/package/@legendapp/list",
       "cohort": "react-ui",
       "platforms": ["linux", "macos", "windows"],
-      "status": "green"
+      "status": "green",
+      "notes": "Retain the cached-range visibility patch (patches/@legendapp__list@3.3.10.patch) while a scroll inside the cached render range refreshes idsInView only with viewability callbacks. maintainVisibleContentPosition reads idsInView for the row it holds, so without the patch a row growing after a short scroll shifts the view by its growth. Remove it when a release refreshes the rows on screen there and the packaged chat-reasoning-rows and mermaid-diagrams specs pass without the patch."
     },
     {
       "key": "js:apps/web:@lexical/react",
