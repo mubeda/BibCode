@@ -39,7 +39,7 @@ export const SidebarViewToggle = memo(function SidebarViewToggle() {
               )}
             >
               <Icon aria-hidden className="size-3.5 shrink-0" />
-              <span className="hidden truncate @[20rem]/view-toggle:inline">{label}</span>
+              <span className="hidden truncate @min-[20rem]/view-toggle:inline">{label}</span>
             </button>
           ))}
         </div>

@@ -107,8 +107,9 @@ export function SidebarInboxView() {
       const row = rowsRef.current.find((entry) => entry.key === key);
       if (row === undefined) return;
       const target = resolveInboxOpenTarget(row);
-      // Terminal rows show their host's unread state, which the host's chat clears.
-      if (target.surface.kind !== "terminal") markRead(row.key);
+      // A terminal row shows its host thread's unread state, so opening it reads the
+      // host, as selecting the host's workspace card does.
+      markRead(target.surface.kind === "terminal" ? scopedThreadKey(target.hostRef) : row.key);
       setActiveEnvironmentId(target.hostRef.environmentId);
       focusInboxTarget(target);
       if (isMobile) setOpenMobile(false);
