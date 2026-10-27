@@ -70,8 +70,10 @@ shows that tile's agents, most recent activity first, with the same rows as
 the Agents view. The first time you open the Inbox it selects Needs Attention
 when an agent needs you, otherwise All Agents once every environment has
 reported; the selected tile is then remembered on this device, and picking
-another tile replaces it. While an environment is not connected or is still
-reconnecting, the list says its agents may be missing or out of date.
+another tile replaces it. When the list may be incomplete, a note above it says
+why: a named server is not connected (with **Open Remote Servers**, or
+**Diagnostics** for this machine), a server is reconnecting, or the saved
+servers couldn't be read (with **Diagnostics**).
 Selecting an agent marks it read and opens its worktree with that agent in
 front: its chat (brought back if you had closed every tab), its chat panel, or
 its AI Terminal. The row stays highlighted while that agent is on screen.
