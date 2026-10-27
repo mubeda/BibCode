@@ -86,8 +86,9 @@ function streamedReply(language: "mermaid" | "text"): readonly string[] {
   return [
     `Streamed reply intro.\n\n${filler("Streamed before", 30)}\n\n`,
     `\`\`\`${language}\nsequenceDiagram\n  participant streamed as Streamed draw\n  participant done as Streamed done\n  streamed->>done: Streamed reply\n  done-->>streamed: Streamed answer\n\`\`\`\n\n`,
+    // Enough text after the diagram that a webview slow to draw it still draws it mid-stream.
     ...Array.from(
-      { length: 6 },
+      { length: 12 },
       (_, index) => `Streamed after paragraph ${String(index + 1)} keeps the end in view.\n\n`,
     ),
     mermaidFixtureStreamedLastLine,
