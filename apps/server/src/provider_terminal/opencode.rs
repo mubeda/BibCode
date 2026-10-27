@@ -392,6 +392,10 @@ pub trait OpenCodeHelperLauncher: Send + Sync + fmt::Debug {
     }
 }
 
+/// The next event's data while activity is dormant, when the stream can hand it over.
+pub type DormantEventData<'a> =
+    Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>, String>> + Send + 'a>>;
+
 pub trait OpenCodeEventStream: Send {
     fn discard_next(&mut self) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>>;
 
@@ -399,9 +403,7 @@ pub trait OpenCodeEventStream: Send {
 
     /// The next event while AI Terminal activity is dormant. Only the agent's left-panel status
     /// reads its data (#187); a stream that cannot hand it over discards it, as before.
-    fn next_dormant_data(
-        &mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>, String>> + Send + '_>> {
+    fn next_dormant_data(&mut self) -> DormantEventData<'_> {
         Box::pin(async move { self.discard_next().await.map(|()| None) })
     }
 }
@@ -3510,9 +3512,7 @@ impl OpenCodeEventStream for SystemOpenCodeEventStream {
         })
     }
 
-    fn next_dormant_data(
-        &mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>, String>> + Send + '_>> {
+    fn next_dormant_data(&mut self) -> DormantEventData<'_> {
         Box::pin(async move { self.next_data().await.map(Some) })
     }
 }
@@ -3556,9 +3556,7 @@ impl OpenCodeEventStream for OpenCodeV2EventStream {
         })
     }
 
-    fn next_dormant_data(
-        &mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>, String>> + Send + '_>> {
+    fn next_dormant_data(&mut self) -> DormantEventData<'_> {
         Box::pin(async move { self.next_data().await.map(Some) })
     }
 }
