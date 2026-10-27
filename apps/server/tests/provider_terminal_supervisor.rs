@@ -5409,6 +5409,96 @@ async fn agent_activity_toggle_codex_retains_connection_and_crosses_ordered_barr
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agent_activity_toggle_codex_status_only_launch_publishes_activity_once_enabled() {
+    // Mutation caught: an observer launched with activity off never creating its scope, so
+    // enabling activity later shows nothing for that terminal (#187).
+    own_process!(isolated);
+    let fixture = codex_remote_fixture();
+    let root = tempfile::tempdir().expect("fixture root");
+    let configured = root.path().join("configured-codex");
+    std::fs::write(&configured, b"configured").expect("configured executable");
+    let remote_state = Arc::new(CodexFixtureRemoteState::default());
+    remote_state
+        .events
+        .lock()
+        .expect("Codex events")
+        .push_back(codex_root_notification(
+            &fixture,
+            "terminal-status-only-root",
+            root.path(),
+        ));
+    let (supervisor, projection) = codex_fixture_supervisor(
+        &root,
+        &configured,
+        Arc::new(CodexFixtureHelperLauncher::default()),
+        Arc::new(CodexFixtureRemoteFactory {
+            state: remote_state.clone(),
+        }),
+    )
+    .await;
+    let controller = projection.agent_activity_controller_for_integration_test();
+    controller.disable().await;
+    let manager = TerminalManager::new(
+        Arc::new(RecordingBackend::new(Arc::new(Mutex::new(Vec::new())))),
+        TerminalManagerOptions {
+            launch_preparer: Some(Arc::new(supervisor)),
+            ..TerminalManagerOptions::default()
+        },
+    );
+    manager
+        .open(codex_fixture_open_input(
+            &fixture,
+            &configured,
+            &root,
+            "terminal-status-only",
+        ))
+        .await
+        .expect("Codex terminal");
+    let scope = ActivityScopeRef::Terminal {
+        thread_id: "thread-codex".to_owned(),
+        terminal_id: "terminal-status-only".to_owned(),
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while !remote_state.events.lock().expect("Codex events").is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("dormant Codex root correlation");
+    assert!(
+        projection.snapshot(&scope).await.is_err(),
+        "a status-only launch publishes no activity scope"
+    );
+
+    controller.enable();
+    let enabled = manager.set_agent_activity_enabled(true).await;
+    assert_eq!((enabled.resumed, enabled.failed), (1, 0));
+    remote_state
+        .events
+        .lock()
+        .expect("Codex events")
+        .push_back(codex_detail_notification(
+            "terminal-status-only-root",
+            "enabled-item",
+            "enabled-detail",
+        ));
+    wait_for_codex_root_detail(
+        &projection,
+        &scope,
+        "terminal-status-only-root",
+        "enabled-detail",
+    )
+    .await;
+    manager
+        .close("thread-codex", Some("terminal-status-only"))
+        .await
+        .expect("close status-only Codex terminal");
+    manager.shutdown().await;
+    isolated.complete();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn agent_activity_toggle_codex_barrier_failure_stays_dormant_then_recovers() {
     own_process!(isolated);
     let fixture = codex_remote_fixture();
@@ -12473,7 +12563,19 @@ impl OpenCodeToggleFixture {
         stream_scripts: Vec<OpenCodeFixtureStreamScript>,
         reattach_timeout: std::time::Duration,
     ) -> Self {
-        Self::open_with_reattach_timeout_and_probe(stream_scripts, reattach_timeout, None).await
+        Self::open_with_reattach_timeout_and_probe(stream_scripts, reattach_timeout, None, true)
+            .await
+    }
+
+    /// Opens the terminal while AI Terminal activity is off: its observer reports status only.
+    async fn open_with_activity_off(stream_scripts: Vec<OpenCodeFixtureStreamScript>) -> Self {
+        Self::open_with_reattach_timeout_and_probe(
+            stream_scripts,
+            std::time::Duration::from_secs(3),
+            None,
+            false,
+        )
+        .await
     }
 
     async fn open_with_activity_transition_probe(
@@ -12484,6 +12586,7 @@ impl OpenCodeToggleFixture {
             stream_scripts,
             std::time::Duration::from_secs(3),
             Some(activity_transition.clone()),
+            true,
         )
         .await;
         (fixture, activity_transition)
@@ -12493,6 +12596,7 @@ impl OpenCodeToggleFixture {
         stream_scripts: Vec<OpenCodeFixtureStreamScript>,
         reattach_timeout: std::time::Duration,
         activity_transition: Option<Arc<OpenCodeActivityTransitionProbe>>,
+        activity_enabled: bool,
     ) -> Self {
         let fixture = opencode_attach_fixture();
         let root = tempfile::tempdir().expect("OpenCode toggle root");
@@ -12554,6 +12658,12 @@ impl OpenCodeToggleFixture {
         let mut settings = ProviderSettingsState::default();
         settings.providers.opencode.binary_path = configured.to_string_lossy().into_owned();
         let projection = ActivityProjection::new(ActivityRepository::new(database));
+        if !activity_enabled {
+            projection
+                .agent_activity_controller_for_integration_test()
+                .disable()
+                .await;
+        }
         let supervisor = ProviderTerminalActivitySupervisor::new(
             settings.clone(),
             ProviderTerminalInventory::from_settings(&settings),
@@ -12737,6 +12847,43 @@ async fn wait_for_opencode_discard_count(state: &OpenCodeFixtureRemoteState, exp
     })
     .await
     .expect("OpenCode raw frame discard");
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agent_activity_toggle_opencode_status_only_launch_publishes_its_scope_once_enabled() {
+    // Mutation caught: an observer launched with activity off never creating its scope, so
+    // enabling activity later shows nothing for that terminal (#187).
+    own_process!(isolated);
+    let fixture = OpenCodeToggleFixture::open_with_activity_off(vec![
+        OpenCodeFixtureStreamScript::new([Ok(opencode_fixture_connected_frame())]),
+        OpenCodeFixtureStreamScript::new([Ok(opencode_fixture_connected_frame())]),
+    ])
+    .await;
+    let scope = ActivityScopeRef::Terminal {
+        thread_id: "thread-opencode-toggle".to_owned(),
+        terminal_id: "terminal-opencode-toggle".to_owned(),
+    };
+    assert!(
+        fixture.projection.snapshot(&scope).await.is_err(),
+        "a status-only launch publishes no activity scope"
+    );
+
+    fixture
+        .projection
+        .agent_activity_controller_for_integration_test()
+        .enable();
+    let enabled = fixture.manager.set_agent_activity_enabled(true).await;
+    assert_eq!((enabled.resumed, enabled.failed), (1, 0));
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while fixture.projection.snapshot(&scope).await.is_err() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("enabling activity publishes the OpenCode terminal scope");
+    fixture.finish().await;
+    isolated.complete();
 }
 
 #[cfg(unix)]
