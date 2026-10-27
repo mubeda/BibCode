@@ -1146,6 +1146,11 @@ describe("composerDraftStore project draft thread mapping", () => {
     expect(useComposerDraftStore.getState().getDraftThreadByProjectRef(projectRef)).toBeNull();
     expect(useComposerDraftStore.getState().getDraftThread(draftId)).toBeNull();
     expect(draftByKey(draftId)).toBeUndefined();
+    expect(
+      useComposerDraftStore
+        .getState()
+        .getComposerDraft(scopeThreadRef(TEST_ENVIRONMENT_ID, threadId))?.prompt,
+    ).toBe("promote me");
   });
 
   it("finalizes a matching materialized draft even when promotion was not pre-marked", () => {
@@ -1158,6 +1163,58 @@ describe("composerDraftStore project draft thread mapping", () => {
     expect(useComposerDraftStore.getState().getDraftThreadByProjectRef(projectRef)).toBeNull();
     expect(useComposerDraftStore.getState().getDraftThread(draftId)).toBeNull();
     expect(draftByKey(draftId)).toBeUndefined();
+    expect(
+      useComposerDraftStore
+        .getState()
+        .getComposerDraft(scopeThreadRef(TEST_ENVIRONMENT_ID, threadId))?.prompt,
+    ).toBe("promote me");
+  });
+
+  it("keeps a draft image when finalizing moves the composer onto the thread", () => {
+    const store = useComposerDraftStore.getState();
+    const threadRef = scopeThreadRef(TEST_ENVIRONMENT_ID, threadId);
+    const originalRevokeObjectUrl = URL.revokeObjectURL;
+    const revokeSpy = vi.fn<(url: string) => void>();
+    URL.revokeObjectURL = revokeSpy;
+
+    try {
+      store.setProjectDraftThreadId(projectRef, draftId, { threadId });
+      store.setPrompt(draftId, "typed after send");
+      store.addAttachment(draftId, makeImage({ id: "img-promote", previewUrl: "blob:promote" }));
+
+      finalizePromotedDraftThreadByRef(threadRef);
+
+      const kept = useComposerDraftStore.getState().getComposerDraft(threadRef);
+      expect(kept?.prompt).toBe("typed after send");
+      expect(kept?.attachments.map((attachment) => attachment.id)).toEqual(["img-promote"]);
+      expect(draftByKey(draftId)).toBeUndefined();
+      expect(revokeSpy).not.toHaveBeenCalled();
+    } finally {
+      URL.revokeObjectURL = originalRevokeObjectUrl;
+    }
+  });
+
+  it("keeps composer text already on the thread when the promoted draft also has text", () => {
+    const store = useComposerDraftStore.getState();
+    const threadRef = scopeThreadRef(TEST_ENVIRONMENT_ID, threadId);
+    const originalRevokeObjectUrl = URL.revokeObjectURL;
+    const revokeSpy = vi.fn<(url: string) => void>();
+    URL.revokeObjectURL = revokeSpy;
+    store.setPrompt(threadRef, "already on the thread");
+    store.setProjectDraftThreadId(projectRef, draftId, { threadId });
+    store.setPrompt(draftId, "typed on the draft");
+
+    try {
+      store.addAttachment(draftId, makeImage({ id: "img-dropped", previewUrl: "blob:dropped" }));
+      finalizePromotedDraftThreadByRef(threadRef);
+
+      const kept = useComposerDraftStore.getState().getComposerDraft(threadRef);
+      expect(kept?.prompt).toBe("already on the thread");
+      expect(kept?.attachments).toEqual([]);
+      expect(revokeSpy).toHaveBeenCalledWith("blob:dropped");
+    } finally {
+      URL.revokeObjectURL = originalRevokeObjectUrl;
+    }
   });
 
   it("updates branch context on an existing draft thread", () => {

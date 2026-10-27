@@ -1460,6 +1460,66 @@ function draftThreadsEqual(left: DraftThreadState | undefined, right: DraftThrea
   );
 }
 
+function composerDraftHasAuthoredContent(draft: ComposerThreadDraftState | undefined): boolean {
+  if (!draft) {
+    return false;
+  }
+  return (
+    draft.prompt.length > 0 ||
+    draft.attachments.length > 0 ||
+    draft.persistedAttachments.length > 0 ||
+    draft.terminalContexts.length > 0 ||
+    draft.elementContexts.length > 0 ||
+    draft.previewAnnotations.length > 0 ||
+    draft.reviewComments.length > 0
+  );
+}
+
+/**
+ * Moves a draft session's composer onto its promoted thread.
+ *
+ * The composer reads a thread ref, which resolves to the draft id while the
+ * session exists. Finalizing used to delete that entry, so text typed after
+ * the first send — and before the draft route gave way — disappeared. Authored
+ * content already stored on the thread key is newer and wins; otherwise the
+ * draft's content moves and its image preview URLs stay valid.
+ */
+function rehomePromotedComposerDraft(
+  draftsByThreadKey: Record<string, ComposerThreadDraftState>,
+  sourceKey: string,
+  destinationKey: string,
+): Record<string, ComposerThreadDraftState> {
+  if (sourceKey === destinationKey) {
+    return draftsByThreadKey;
+  }
+  const source = draftsByThreadKey[sourceKey];
+  if (!source) {
+    return draftsByThreadKey;
+  }
+  const destination = draftsByThreadKey[destinationKey];
+  if (composerDraftHasAuthoredContent(destination)) {
+    return draftsByThreadKey;
+  }
+  const merged: ComposerThreadDraftState = destination
+    ? {
+        ...source,
+        modelSelectionByProvider:
+          Object.keys(destination.modelSelectionByProvider).length > 0
+            ? destination.modelSelectionByProvider
+            : source.modelSelectionByProvider,
+        activeProvider: destination.activeProvider ?? source.activeProvider,
+        runtimeMode: destination.runtimeMode ?? source.runtimeMode,
+        interactionMode: destination.interactionMode ?? source.interactionMode,
+      }
+    : source;
+  if (shouldRemoveDraft(merged)) {
+    return draftsByThreadKey;
+  }
+  const nextDraftsByThreadKey = { ...draftsByThreadKey, [destinationKey]: merged };
+  delete nextDraftsByThreadKey[sourceKey];
+  return nextDraftsByThreadKey;
+}
+
 function removeDraftThreadReferences(
   state: Pick<
     ComposerDraftStoreState,
@@ -2574,10 +2634,22 @@ const composerDraftStore = create<ComposerDraftStoreState>()(
           }
           set((state) => {
             const existing = state.draftThreadsByThreadKey[threadKey];
-            if (!isDraftThreadPromoting(existing)) {
+            if (!existing || !isDraftThreadPromoting(existing)) {
               return state;
             }
-            return removeDraftThreadReferences(state, threadKey);
+            const promotedRef =
+              existing.promotedTo ?? scopeThreadRef(existing.environmentId, existing.threadId);
+            const draftsByThreadKey = rehomePromotedComposerDraft(
+              state.draftsByThreadKey,
+              threadKey,
+              composerTargetKey(promotedRef),
+            );
+            return removeDraftThreadReferences(
+              draftsByThreadKey === state.draftsByThreadKey
+                ? state
+                : { ...state, draftsByThreadKey },
+              threadKey,
+            );
           });
         },
         clearDraftThread: (threadRef) => {
