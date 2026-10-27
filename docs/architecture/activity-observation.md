@@ -544,7 +544,7 @@ Claude explicitly interrupts tracked active records when its observer ends;
 Codex does not directly terminalize them; and OpenCode retries its event stream
 but skips failed reconciliation requests without changing its advertised
 terminal history capability. The terminal remains independent of its read-only
-terminal Activity surface.
+Activity panel, which opens inside the terminal's own pane.
 
 See the ownership and fallback paths in
 [`apps/server/src/provider_terminal/supervisor.rs`](../../apps/server/src/provider_terminal/supervisor.rs)
