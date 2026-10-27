@@ -15,6 +15,7 @@ import {
   setAgentsGroupExpanded,
   setAgentsSectionExpanded,
   setDefaultAdvertisedEndpointKey,
+  setInboxCategory,
   setProjectExpanded,
   setRepositoryGroupExpanded,
   setSidebarView,
@@ -27,6 +28,7 @@ function makeUiState(overrides: Partial<UiState> = {}): UiState {
     agentsSectionExpanded: true,
     agentsGroupExpandedById: {},
     sidebarView: "environments",
+    inboxCategory: null,
     repositoryGroupExpandedById: {},
     projectExpandedById: {},
     projectOrder: [],
@@ -70,6 +72,26 @@ describe("sidebar view preference", () => {
     });
     expect(restored.sidebarView).toBe("repositories");
     expect(restored.repositoryGroupExpandedById).toEqual({ "github.com/acme/repo": false });
+  });
+
+  it("restores the Inbox view and its tile, and drops unknown tiles", () => {
+    expect(parsePersistedState({}).inboxCategory).toBeNull();
+    const restored = parsePersistedState({ sidebarView: "inbox", inboxCategory: "attention" });
+    expect(restored.sidebarView).toBe("inbox");
+    expect(restored.inboxCategory).toBe("attention");
+    for (const category of ["all", "attention", "working", "done"] as const) {
+      expect(parsePersistedState({ inboxCategory: category }).inboxCategory).toBe(category);
+    }
+    expect(parsePersistedState({ inboxCategory: "review" as never }).inboxCategory).toBeNull();
+    expect(parsePersistedState({ inboxCategory: 3 as never }).inboxCategory).toBeNull();
+  });
+
+  it("sets the Inbox tile without copying unchanged state", () => {
+    const state = parsePersistedState({});
+    const working = setInboxCategory(state, "working");
+    expect(working.inboxCategory).toBe("working");
+    expect(setInboxCategory(working, "working")).toBe(working);
+    expect(setSidebarView(state, "inbox").sidebarView).toBe("inbox");
   });
 
   it("updates without copying unchanged state", () => {
@@ -235,6 +257,7 @@ describe("parsePersistedState", () => {
     expect(parsed).toEqual({
       agentsSectionExpanded: false,
       sidebarView: "environments",
+      inboxCategory: null,
       repositoryGroupExpandedById: {},
       agentsGroupExpandedById: {
         done: true,
@@ -348,6 +371,7 @@ describe("uiStateStore persistence", () => {
         done: true,
       },
       sidebarView: "repositories",
+      inboxCategory: "done",
       repositoryGroupExpandedById: { "github.com/acme/repo": false },
       projectExpandedById: {
         logical: false,
@@ -373,6 +397,7 @@ describe("uiStateStore persistence", () => {
     expect(persisted).toEqual({
       agentsSectionExpanded: false,
       sidebarView: "repositories",
+      inboxCategory: "done",
       repositoryGroupExpandedById: { "github.com/acme/repo": false },
       agentsGroupExpandedById: {
         done: true,

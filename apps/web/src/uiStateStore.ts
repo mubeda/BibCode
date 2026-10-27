@@ -10,10 +10,15 @@ const LEGACY_PERSISTED_STATE_KEYS = [
   "codething:renderer-state:v1",
 ] as const;
 
-export type SidebarView = "environments" | "repositories";
+export type SidebarView = "environments" | "repositories" | "inbox";
+
+/** The Inbox view's category tiles; `inbox.logic.ts` maps each to agent status groups. */
+export const INBOX_CATEGORY_IDS = ["all", "attention", "working", "done"] as const;
+export type InboxCategory = (typeof INBOX_CATEGORY_IDS)[number];
 
 export interface PersistedUiState {
   sidebarView?: SidebarView;
+  inboxCategory?: InboxCategory | null;
   repositoryGroupExpandedById?: Record<string, boolean>;
   agentsSectionExpanded?: boolean;
   agentsGroupExpandedById?: Record<string, boolean>;
@@ -29,6 +34,8 @@ export interface PersistedUiState {
 
 export interface UiProjectState {
   sidebarView: SidebarView;
+  /** The selected Inbox tile; null until the Inbox settles its default or the user picks one. */
+  inboxCategory: InboxCategory | null;
   repositoryGroupExpandedById: Record<string, boolean>;
   projectExpandedById: Record<string, boolean>;
   projectOrder: string[];
@@ -50,6 +57,7 @@ export interface UiState extends UiProjectState, UiThreadState, UiEndpointState 
 
 const initialState: UiState = {
   sidebarView: "environments",
+  inboxCategory: null,
   repositoryGroupExpandedById: {},
   agentsSectionExpanded: true,
   agentsGroupExpandedById: {},
@@ -105,6 +113,10 @@ function sanitizeTimestampRecord(value: unknown): Record<string, string> {
   );
 }
 
+function isInboxCategory(value: unknown): value is InboxCategory {
+  return (INBOX_CATEGORY_IDS as ReadonlyArray<unknown>).includes(value);
+}
+
 export function parsePersistedState(parsed: PersistedUiState): UiState {
   const projectExpandedById =
     parsed.projectExpandedById === undefined
@@ -130,7 +142,11 @@ export function parsePersistedState(parsed: PersistedUiState): UiState {
       : sanitizeStringArray(parsed.projectOrder);
 
   return {
-    sidebarView: parsed.sidebarView === "repositories" ? "repositories" : "environments",
+    sidebarView:
+      parsed.sidebarView === "repositories" || parsed.sidebarView === "inbox"
+        ? parsed.sidebarView
+        : "environments",
+    inboxCategory: isInboxCategory(parsed.inboxCategory) ? parsed.inboxCategory : null,
     repositoryGroupExpandedById: sanitizeBooleanRecord(parsed.repositoryGroupExpandedById),
     agentsSectionExpanded:
       typeof parsed.agentsSectionExpanded === "boolean" ? parsed.agentsSectionExpanded : true,
@@ -221,6 +237,7 @@ export function persistState(state: UiState): void {
       PERSISTED_STATE_KEY,
       JSON.stringify({
         sidebarView: state.sidebarView,
+        inboxCategory: state.inboxCategory,
         repositoryGroupExpandedById: state.repositoryGroupExpandedById,
         agentsSectionExpanded: state.agentsSectionExpanded,
         agentsGroupExpandedById: state.agentsGroupExpandedById,
@@ -386,6 +403,10 @@ export function setSidebarView(state: UiState, sidebarView: SidebarView): UiStat
   return state.sidebarView === sidebarView ? state : { ...state, sidebarView };
 }
 
+export function setInboxCategory(state: UiState, inboxCategory: InboxCategory): UiState {
+  return state.inboxCategory === inboxCategory ? state : { ...state, inboxCategory };
+}
+
 export function setRepositoryGroupExpanded(
   state: UiState,
   key: string,
@@ -485,6 +506,7 @@ interface UiStateStore extends UiState {
   setThreadChangedFilesExpanded: (threadId: string, turnId: string, expanded: boolean) => void;
   setDefaultAdvertisedEndpointKey: (key: string | null) => void;
   setSidebarView: (view: SidebarView) => void;
+  setInboxCategory: (category: InboxCategory) => void;
   setRepositoryGroupExpanded: (key: string, expanded: boolean) => void;
   setAgentsSectionExpanded: (expanded: boolean) => void;
   setAgentsGroupExpanded: (groupId: string, expanded: boolean) => void;
@@ -507,6 +529,7 @@ export const useUiStateStore = create<UiStateStore>((set) => ({
   setDefaultAdvertisedEndpointKey: (key) =>
     set((state) => setDefaultAdvertisedEndpointKey(state, key)),
   setSidebarView: (view) => set((state) => setSidebarView(state, view)),
+  setInboxCategory: (category) => set((state) => setInboxCategory(state, category)),
   setRepositoryGroupExpanded: (key, expanded) =>
     set((state) => setRepositoryGroupExpanded(state, key, expanded)),
   setAgentsSectionExpanded: (expanded) => set((state) => setAgentsSectionExpanded(state, expanded)),
