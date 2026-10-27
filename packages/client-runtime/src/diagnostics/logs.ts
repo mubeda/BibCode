@@ -6,8 +6,10 @@ import {
   type DiagnosticLogsManifest,
   WS_METHODS,
 } from "@bibcode/contracts";
+import * as Cause from "effect/Cause";
 import * as Data from "effect/Data";
 import * as Effect from "effect/Effect";
+import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 
 import { EnvironmentSupervisor } from "../connection/supervisor.ts";
@@ -33,6 +35,11 @@ export class DiagnosticLogsDownloadError extends Data.TaggedError("DiagnosticLog
   readonly message: string;
 }> {}
 
+export interface DiagnosticLogsFailureContext {
+  /** Whether the request asked for crash dumps, which decides what a size failure says. */
+  readonly crashDumpsRequested?: boolean;
+}
+
 export interface DownloadedDiagnosticLogs {
   readonly fileName: string;
   readonly bytes: Uint8Array<ArrayBuffer>;
@@ -40,13 +47,12 @@ export interface DownloadedDiagnosticLogs {
 }
 
 const ARCHIVE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]*\.zip$/;
-/** Base64 length of a full `Data` item; anything longer is refused before it is decoded. */
-const MAX_ENCODED_CHUNK_LENGTH = Math.ceil(DIAGNOSTIC_LOGS_CHUNK_BYTES / 3) * 4;
 
 /** What a failure says, naming the environment: also the copy for a disabled download. */
 export function diagnosticLogsFailureMessage(
   reason: DiagnosticLogsFailureReason,
   label: string,
+  context: DiagnosticLogsFailureContext = {},
 ): string {
   switch (reason) {
     case "not-connected":
@@ -60,7 +66,9 @@ export function diagnosticLogsFailureMessage(
     case "incomplete":
       return `${label} sent an incomplete archive. Nothing was saved. Try again.`;
     case "too-large":
-      return `${label}'s logs are over the 20 MiB download limit. Turn off Include crash dumps and try again.`;
+      return context.crashDumpsRequested === true
+        ? `${label}'s logs are over the 20 MiB download limit. Turn off Include crash dumps and try again.`
+        : `${label}'s logs are over the 20 MiB download limit. Download them on that machine instead.`;
     case "not-permitted":
       return `This connection to ${label} cannot read its logs. Pair again with full access.`;
     case "crash-dumps-refused":
@@ -75,11 +83,12 @@ export function diagnosticLogsFailureMessage(
 export function diagnosticLogsError(
   reason: DiagnosticLogsFailureReason,
   environmentLabel: string,
+  context: DiagnosticLogsFailureContext = {},
 ): DiagnosticLogsDownloadError {
   return new DiagnosticLogsDownloadError({
     reason,
     environmentLabel,
-    message: diagnosticLogsFailureMessage(reason, environmentLabel),
+    message: diagnosticLogsFailureMessage(reason, environmentLabel, context),
   });
 }
 
@@ -99,14 +108,20 @@ export class DiagnosticLogsAssembler {
   private readonly environmentLabel: string;
   /** The storage id the connection itself verified; the manifest must name the same. */
   private readonly expectedStorageInstanceId: string;
+  private readonly context: DiagnosticLogsFailureContext;
 
-  constructor(environmentLabel: string, expectedStorageInstanceId: string) {
+  constructor(
+    environmentLabel: string,
+    expectedStorageInstanceId: string,
+    context: DiagnosticLogsFailureContext = {},
+  ) {
     this.environmentLabel = environmentLabel;
     this.expectedStorageInstanceId = expectedStorageInstanceId;
+    this.context = context;
   }
 
   private fail(reason: DiagnosticLogsFailureReason): DiagnosticLogsDownloadError {
-    return diagnosticLogsError(reason, this.environmentLabel);
+    return diagnosticLogsError(reason, this.environmentLabel, this.context);
   }
 
   accept(event: DiagnosticLogsDownloadEvent): DiagnosticLogsDownloadError | null {
@@ -127,12 +142,16 @@ export class DiagnosticLogsAssembler {
     const started = this.started;
     if (started === null) return this.fail("incomplete");
     const data = event.data;
-    if (data.length === 0 || data.length > MAX_ENCODED_CHUNK_LENGTH || data.length % 4 !== 0) {
+    if (data.length === 0 || data.length % 4 !== 0) return this.fail("incomplete");
+    const padding = data.endsWith("==") ? 2 : data.endsWith("=") ? 1 : 0;
+    // From the length alone, before anything is decoded.
+    const decodedLength = (data.length / 4) * 3 - padding;
+    if (
+      decodedLength > DIAGNOSTIC_LOGS_CHUNK_BYTES ||
+      decodedLength > started.bytes.byteLength - this.offset
+    ) {
       return this.fail("incomplete");
     }
-    const padding = data.endsWith("==") ? 2 : data.endsWith("=") ? 1 : 0;
-    const decodedLength = (data.length / 4) * 3 - padding;
-    if (decodedLength > started.bytes.byteLength - this.offset) return this.fail("incomplete");
     let binary: string;
     try {
       binary = atob(data);
@@ -172,9 +191,19 @@ function streamFailureReason(failure: StreamFailure): DiagnosticLogsFailureReaso
     case "UpdateMaintenanceActiveError":
       return "server-failed";
     default:
-      // The socket ended or the protocol failed underneath the stream.
+      // `RpcClientError`: the socket ended or the transport failed underneath the stream.
       return "connection-lost";
   }
+}
+
+/**
+ * Anything that ended the stream other than a typed failure: an interrupt (the session
+ * closed or was replaced) is a lost connection; an item that does not decode is an
+ * incomplete archive; any other defect is the server's failure, never "connection lost".
+ */
+function streamDefectReason(cause: Cause.Cause<unknown>): DiagnosticLogsFailureReason {
+  if (Cause.hasInterruptsOnly(cause)) return "connection-lost";
+  return Schema.isSchemaError(Cause.squash(cause)) ? "incomplete" : "server-failed";
 }
 
 /**
@@ -202,12 +231,21 @@ export const downloadDiagnosticLogs = Effect.fn("DiagnosticLogs.download")(funct
   if (expectedStorageInstanceId === null) {
     return yield* diagnosticLogsError("unverified", label);
   }
-  const assembler = new DiagnosticLogsAssembler(label, expectedStorageInstanceId);
+  const context = { crashDumpsRequested: input.includeCrashDumps === true };
+  const assembler = new DiagnosticLogsAssembler(label, expectedStorageInstanceId, context);
   yield* session.client[WS_METHODS.serverDownloadDiagnosticLogs](input).pipe(
-    Stream.mapError((failure) => diagnosticLogsError(streamFailureReason(failure), label)),
+    Stream.mapError((failure) => diagnosticLogsError(streamFailureReason(failure), label, context)),
     Stream.runForEach((event) => {
       const failure = assembler.accept(event);
       return failure === null ? Effect.void : Effect.fail(failure);
+    }),
+    Effect.catchCause((cause) => {
+      const failure = Cause.squash(cause);
+      return Effect.fail(
+        failure instanceof DiagnosticLogsDownloadError
+          ? failure
+          : diagnosticLogsError(streamDefectReason(cause), label, context),
+      );
     }),
   );
   const result = assembler.finish();
