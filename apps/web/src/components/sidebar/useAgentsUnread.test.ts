@@ -7,7 +7,11 @@ import { describe, expect, it, vi } from "vite-plus/test";
 
 const h = vi.hoisted(() => ({
   markUnread: vi.fn(),
-  router: { navigate: vi.fn() },
+  router: { navigate: vi.fn() } as {
+    navigate: ReturnType<typeof vi.fn>;
+    state?: { matches: Array<{ params: Record<string, string> }> };
+    subscribe?: (event: string, listener: () => void) => () => void;
+  },
 }));
 
 vi.mock("@tanstack/react-router", () => ({
@@ -20,6 +24,10 @@ vi.mock("../../sidebarWorkspaceMetaStore", () => ({
   ) => selector({ markUnread: h.markUnread }),
 }));
 
+import { scopeThreadRef } from "@bibcode/client-runtime/environment";
+import { EnvironmentId, ThreadId } from "@bibcode/contracts";
+
+import { useCenterPanelStore } from "../../centerPanelStore";
 import type { AgentRow } from "./agentsSection.logic";
 import { detectUnreadTransitions, useAgentsUnread } from "./useAgentsUnread";
 
@@ -46,7 +54,7 @@ describe("detectUnreadTransitions", () => {
     const result = detectUnreadTransitions({
       previous,
       rows: [rowWithTurn("k1", "turn-1", "completed")],
-      openThreadKey: null,
+      openThreadKeys: new Set(),
     });
 
     expect(result.markUnreadKeys).toEqual(["k1"]);
@@ -57,17 +65,17 @@ describe("detectUnreadTransitions", () => {
     const openThread = detectUnreadTransitions({
       previous: new Map([["k1", "turn-1:running"]]),
       rows: [rowWithTurn("k1", "turn-1", "completed")],
-      openThreadKey: "k1",
+      openThreadKeys: new Set(["k1"]),
     });
     const unchanged = detectUnreadTransitions({
       previous: new Map([["k1", "turn-1:completed"]]),
       rows: [rowWithTurn("k1", "turn-1", "completed")],
-      openThreadKey: null,
+      openThreadKeys: new Set(),
     });
     const firstObservation = detectUnreadTransitions({
       previous: new Map(),
       rows: [rowWithTurn("k1", "turn-1", "completed")],
-      openThreadKey: null,
+      openThreadKeys: new Set(),
     });
 
     expect(openThread.markUnreadKeys).toEqual([]);
@@ -92,7 +100,7 @@ describe("detectUnreadTransitions", () => {
         rowWithTurn("running", "turn-3", "running"),
         rowWithoutTurn("without-turn"),
       ],
-      openThreadKey: null,
+      openThreadKeys: new Set(),
     });
 
     expect(result.markUnreadKeys).toEqual(["interrupted", "error"]);
@@ -130,6 +138,61 @@ describe("useAgentsUnread", () => {
     } finally {
       await act(async () => root.unmount());
       container.remove();
+      (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = false;
+    }
+  });
+
+  it("keeps a chat panel read when it settles while focused on the routed host", async () => {
+    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+    h.markUnread.mockReset();
+    const host = scopeThreadRef(EnvironmentId.make("env-1"), ThreadId.make("host-1"));
+    const panelKey = "env-1:panel-1";
+    const otherPanelKey = "env-1:panel-2";
+    h.router = {
+      navigate: vi.fn(),
+      state: { matches: [{ params: { environmentId: "env-1", threadId: "host-1" } }] },
+      subscribe: () => () => undefined,
+    };
+    useCenterPanelStore.setState({ byThreadKey: {}, pendingChatPanelThreadKeys: new Set() });
+    useCenterPanelStore.getState().openChatPanel(host, ThreadId.make("panel-2"));
+    useCenterPanelStore.getState().openChatPanel(host, ThreadId.make("panel-1"));
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    const Probe = ({ rows }: { readonly rows: ReadonlyArray<AgentRow> }) => {
+      useAgentsUnread(rows);
+      return null;
+    };
+
+    try {
+      await act(async () =>
+        root.render(
+          createElement(Probe, {
+            rows: [
+              rowWithTurn(panelKey, "turn-1", "running"),
+              rowWithTurn(otherPanelKey, "turn-1", "running"),
+            ],
+          }),
+        ),
+      );
+      await act(async () =>
+        root.render(
+          createElement(Probe, {
+            rows: [
+              rowWithTurn(panelKey, "turn-1", "completed"),
+              rowWithTurn(otherPanelKey, "turn-1", "completed"),
+            ],
+          }),
+        ),
+      );
+
+      expect(h.markUnread).toHaveBeenCalledWith(otherPanelKey);
+      expect(h.markUnread).not.toHaveBeenCalledWith(panelKey);
+    } finally {
+      await act(async () => root.unmount());
+      container.remove();
+      h.router = { navigate: vi.fn() };
+      useCenterPanelStore.setState({ byThreadKey: {}, pendingChatPanelThreadKeys: new Set() });
       (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = false;
     }
   });
