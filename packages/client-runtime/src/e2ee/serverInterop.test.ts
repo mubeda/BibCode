@@ -14,11 +14,14 @@ import {
   AuthAccessTokenType,
   AuthEnvironmentBootstrapTokenType,
   AuthTokenExchangeGrantType,
+  DiagnosticLogsDownloadEvent,
   type RemotePairingCodePayload,
 } from "@bibcode/contracts";
 import { parsePairingCode } from "@bibcode/shared/pairingCode";
 import { afterAll, beforeAll, describe, expect, it } from "@effect/vitest";
+import * as Schema from "effect/Schema";
 
+import { DiagnosticLogsAssembler } from "../diagnostics/logs.ts";
 import { decodeBase64UrlKey } from "./noise.ts";
 import {
   type EncryptedTestSocket,
@@ -32,6 +35,8 @@ import {
   startServer,
   stopServer,
 } from "./testServer.ts";
+
+const decodeDiagnosticLogsEvent = Schema.decodeUnknownSync(DiagnosticLogsDownloadEvent);
 
 async function adminAccessToken(server: RunningServer): Promise<string> {
   if (server.adminAccessToken !== undefined) return server.adminAccessToken;
@@ -278,6 +283,70 @@ describe.skipIf(serverBinary === undefined)(
         }),
       ).toMatchObject({ requestId: "2" });
       channel.close();
+    }, 30_000);
+
+    it("assembles the server's diagnostic logs from its stream across the language boundary", async () => {
+      const { payload, hostKey } = await mintedPairing(server);
+      const channel = await openEncrypted(server, hostKey);
+      let nextRequestId = 1;
+      const nextId = () => String(nextRequestId++);
+      try {
+        channel.sendMessage(JSON.stringify({ type: "e2ee_auth", pairing: payload.token }));
+        const authenticated = JSON.parse(await channel.nextMessage()) as {
+          pairingConfirmationRequired?: boolean;
+        };
+        if (authenticated.pairingConfirmationRequired) {
+          await requestTestRpc(channel, nextId(), "auth.confirmPairing");
+        }
+        const config = (await requestTestRpc(channel, nextId(), "server.getConfig")) as {
+          exit: {
+            value: {
+              environment: {
+                storageInstanceId: string;
+                capabilities: { diagnosticLogs: boolean };
+              };
+            };
+          };
+        };
+        const environment = config.exit.value.environment;
+        expect(environment.capabilities.diagnosticLogs).toBe(true);
+
+        const requestId = nextId();
+        channel.sendMessage(
+          JSON.stringify({
+            _tag: "Request",
+            id: requestId,
+            tag: "server.downloadDiagnosticLogs",
+            payload: { frontendLog: "interop warning\n" },
+            headers: [],
+          }),
+        );
+        const assembler = new DiagnosticLogsAssembler("Interop", environment.storageInstanceId);
+        for (;;) {
+          const message = JSON.parse(await channel.nextMessage()) as {
+            _tag: string;
+            requestId?: string;
+            values?: unknown[];
+            exit?: { _tag: string };
+          };
+          if (message.requestId !== requestId) continue;
+          if (message._tag === "Exit") {
+            expect(message.exit?._tag).toBe("Success");
+            break;
+          }
+          for (const value of message.values ?? []) {
+            expect(assembler.accept(decodeDiagnosticLogsEvent(value))).toBeNull();
+          }
+          channel.sendMessage(JSON.stringify({ _tag: "Ack", requestId }));
+        }
+        const archive = assembler.finish();
+        if (archive instanceof Error) throw archive;
+        expect(archive.manifest.storageInstanceId).toBe(environment.storageInstanceId);
+        expect(archive.fileName).toMatch(/^bibcode-diagnostics-.+\.zip$/);
+        expect([...archive.bytes.subarray(0, 2)]).toEqual([0x50, 0x4b]);
+      } finally {
+        channel.close();
+      }
     }, 30_000);
 
     it("rejects a bad pairing token inside the encrypted channel", async () => {

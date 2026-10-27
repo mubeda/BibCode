@@ -266,6 +266,16 @@ vi.mock("./ProfilerSection", () => ({
   ),
 }));
 
+vi.mock("./DiagnosticLogsSection", () => ({
+  DiagnosticLogsSection: (props: AnyProps) => (
+    <section
+      data-section-title="Diagnostic logs"
+      data-logs-environment={(props.selectedEnvironmentId as string | null) ?? ""}
+      data-logs-reports-selection={typeof props.onSelectEnvironment === "function"}
+    />
+  ),
+}));
+
 vi.mock("../ui/scroll-area", () => ({
   ScrollArea: (props: AnyProps) => <div data-scroll-area>{props.children as ReactNode}</div>,
 }));
@@ -1060,74 +1070,26 @@ describe("DiagnosticsSettingsPanel profiler section", () => {
 });
 
 describe("DiagnosticsSettingsPanel diagnostic log download", () => {
-  it("renders the final download section with status-bar clearance", () => {
+  it("ends with the download section, under status-bar clearance", () => {
     seedAll();
     const markup = render();
 
     expect(markup).toContain('class="pb-12"');
-    expect(markup).toContain('data-section-title="Diagnostic logs"');
-    expect(markup).toContain("Download diagnostic logs");
-    expect(markup).toContain("server.log");
-    expect(markup).toContain("server.trace.ndjson");
-    expect(markup).toContain("frontend.log");
-    expect(markup).toContain("profiler");
-    expect(markup).toContain("Download logs");
+    const titles = [...markup.matchAll(/data-section-title="([^"]+)"/g)].map((match) => match[1]);
+    expect(titles.at(-1)).toBe("Diagnostic logs");
   });
 
-  it("disables the download action while the archive is being prepared", () => {
-    h.stateSeeds.push({ match: (initial) => initial === "idle", value: "downloading" });
+  it("gives the download the page's environment, the one the Profiler section shows", () => {
     seedAll();
-    const markup = render();
-
-    expect(markup).toContain("Preparing logs...");
-    expect(findButton("Download diagnostic logs").disabled).toBe(true);
-  });
-
-  it("downloads the captured frontend snapshot", async () => {
-    seedAll();
-    render();
-
-    (findButton("Download diagnostic logs").onClick as () => void)();
-    await flush();
-
-    expect(h.downloadCalls).toEqual(["captured frontend warning\n"]);
-    expect(h.toasts).toContainEqual(
-      expect.objectContaining({
-        type: "success",
-        title: "Diagnostic logs saved",
-        description: "C:\\Users\\test\\Downloads\\bibcode-diagnostics-test.zip",
-      }),
+    const onChange = vi.fn();
+    const markup = renderToStaticMarkup(
+      <DiagnosticsSettingsPanel
+        profilerEnvironmentId={EnvironmentId.make("luna")}
+        onProfilerEnvironmentChange={onChange}
+      />,
     );
-  });
 
-  it("shows an actionable toast when the archive cannot be downloaded", async () => {
-    h.downloadError = new Error("server unavailable");
-    seedAll();
-    render();
-
-    (findButton("Download diagnostic logs").onClick as () => void)();
-    await flush();
-
-    expect(h.toasts).toContainEqual(
-      expect.objectContaining({
-        type: "error",
-        title: "Could not download diagnostic logs",
-        description: "server unavailable",
-      }),
-    );
-  });
-
-  it("stays silent when the native save dialog is cancelled", async () => {
-    h.downloadResult = {
-      status: "cancelled",
-      filename: "bibcode-diagnostics-test.zip",
-    };
-    seedAll();
-    render();
-
-    (findButton("Download diagnostic logs").onClick as () => void)();
-    await flush();
-
-    expect(h.toasts).toHaveLength(0);
+    expect(markup).toContain('data-logs-environment="luna"');
+    expect(markup).toContain('data-logs-reports-selection="true"');
   });
 });

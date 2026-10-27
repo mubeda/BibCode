@@ -14,13 +14,18 @@ interface FakeEnvironment {
   readonly label: string;
   readonly connection: { readonly phase: string };
   readonly serverConfig: {
-    readonly environment: { readonly capabilities: { readonly profiler: boolean } };
+    readonly environment: {
+      readonly capabilities: { readonly profiler: boolean; readonly diagnosticLogs?: boolean };
+    };
   } | null;
 }
 
-/** A server config as far as the section reads it: whether the server has the profiler. */
-const configWithProfiler = (profiler: boolean) => ({
-  environment: { capabilities: { profiler } },
+/**
+ * A server config as far as the section reads it: whether the server has the profiler, and
+ * whether it sends its diagnostic bundle over RPC.
+ */
+const configWithProfiler = (profiler: boolean, diagnosticLogs = false) => ({
+  environment: { capabilities: { profiler, diagnosticLogs } },
 });
 
 const h = vi.hoisted(() => ({
@@ -328,12 +333,17 @@ async function rerender(container: HTMLDivElement) {
   });
 }
 
-function fakeEnvironment(label: string, phase = "connected", profiler = true): FakeEnvironment {
+function fakeEnvironment(
+  label: string,
+  phase = "connected",
+  profiler = true,
+  diagnosticLogs = false,
+): FakeEnvironment {
   return {
     environmentId: `environment-${label}`,
     label,
     connection: { phase },
-    serverConfig: configWithProfiler(profiler),
+    serverConfig: configWithProfiler(profiler, diagnosticLogs),
   };
 }
 
@@ -783,7 +793,7 @@ describe("ProfilerSection", () => {
       expect(container.querySelector('button[aria-label="Environment"]')!.textContent).toBe("Luna");
     });
 
-    it("keeps Open folder and Export bundle to the primary environment", async () => {
+    it("keeps Open folder to the primary, and Export bundle to servers that can send it", async () => {
       const luna = withLuna();
       const container = await render();
       expect(buttonByText(container, "Open folder").disabled).toBe(false);
@@ -798,7 +808,7 @@ describe("ProfilerSection", () => {
       );
       expect(reasons).toEqual([
         "The profiler folder is on Luna. Use bibcode profiler on that machine.",
-        "Export bundle covers Work Server only. Use bibcode profiler on Luna.",
+        "Luna runs an older BiBCode server that cannot send its logs. Update it to download them here.",
       ]);
       await click(buttonByText(container, "Export bundle"));
       expect(h.downloadCalls).toHaveLength(0);
@@ -806,8 +816,35 @@ describe("ProfilerSection", () => {
       const checkbox = container.querySelector('input[type="checkbox"]') as HTMLInputElement;
       expect(checkbox.disabled).toBe(true);
       expect(document.getElementById(checkbox.getAttribute("aria-describedby")!)?.textContent).toBe(
-        "Export bundle covers Work Server only. Use bibcode profiler on Luna.",
+        "Luna runs an older BiBCode server that cannot send its logs. Update it to download them here.",
       );
+    });
+
+    it("exports a remote environment's bundle over its own connection", async () => {
+      const luna = withLuna(fakeEnvironment("Luna", "connected", true, true));
+      const container = await render();
+      await pick(luna);
+
+      const exportButton = buttonByText(container, "Export bundle");
+      expect(exportButton.disabled).toBe(false);
+      const reasons = [...container.querySelectorAll("[data-tooltip-popup]")].map(
+        (popup) => popup.textContent,
+      );
+      expect(reasons).toEqual([
+        "The profiler folder is on Luna. Use Export bundle or bibcode profiler on that machine.",
+      ]);
+      await click(container.querySelector('input[type="checkbox"]') as HTMLInputElement);
+      await click(buttonByText(container, "Export bundle"));
+
+      expect(h.downloadCalls).toEqual([
+        {
+          frontendLog: "frontend snapshot\n",
+          options: {
+            includeCrashDumps: true,
+            environment: { environmentId: luna.environmentId, label: "Luna" },
+          },
+        },
+      ]);
     });
 
     it("keeps an export busy after switching away from the primary and back", async () => {
