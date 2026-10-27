@@ -1610,6 +1610,7 @@ async fn diagnostic_logs_download_over_a_pinned_channel_and_dumps_need_operate()
     let crashes = state_dir.join("profiler").join("crashes");
     std::fs::create_dir_all(&crashes).unwrap();
     std::fs::write(crashes.join("crash-1.dmp"), b"MDMP pinned dump").unwrap();
+    std::fs::write(crashes.join("crash-1.json"), b"{}").unwrap();
     let descriptor = Client::new()
         .get(http_url(&handle, "/.well-known/bibcode/environment"))
         .send()
