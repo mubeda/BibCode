@@ -151,7 +151,7 @@ describe("inbox partial-data reason", () => {
     [REMOTE, { label: "Remote Box", remote: true }],
   ]);
   const withRemote = (
-    status: "unavailable" | "synchronizing" | "live",
+    status: EnvironmentShellSummary["statuses"][number]["status"],
     hasSnapshot: boolean,
   ): EnvironmentShellSummary =>
     summary({
@@ -185,6 +185,51 @@ describe("inbox partial-data reason", () => {
       message: "Remote Box is not connected, so its agents may be missing or out of date.",
       action: { to: "remote-servers", label: "Open Remote Servers" },
     });
+  });
+
+  it("calls only an unavailable environment not connected", () => {
+    for (const status of [
+      "degraded",
+      "storage-changed",
+      "recovery-required",
+      "configuration-error",
+    ] as const) {
+      const reason = resolveInboxPartialReason(withRemote(status, true), environments);
+      expect(reason, status).toEqual({
+        kind: "needs-attention",
+        labels: ["Remote Box"],
+        environmentId: REMOTE,
+      });
+      expect(describeInboxPartialReason(reason!), status).toEqual({
+        message: "Remote Box needs attention, so its agents may be missing or out of date.",
+        action: { to: "environment", environmentId: REMOTE, label: "Show in Environments" },
+      });
+    }
+    expect(resolveInboxPartialReason(withRemote("unavailable", true), environments)?.kind).toBe(
+      "offline",
+    );
+  });
+
+  it("puts an environment that needs attention before a disconnected one", () => {
+    const reason = resolveInboxPartialReason(
+      summary({
+        desiredEnvironmentCount: 2,
+        canShowEmptyProjects: false,
+        statuses: [
+          { environmentId: ENV, status: "unavailable", hasSnapshot: false, error: null },
+          { environmentId: REMOTE, status: "recovery-required", hasSnapshot: true, error: null },
+        ],
+      }),
+      environments,
+    );
+    expect(reason?.kind).toBe("needs-attention");
+    expect(
+      describeInboxPartialReason({
+        kind: "needs-attention",
+        labels: ["Local", "Remote Box"],
+        environmentId: ENV,
+      }).message,
+    ).toBe("2 servers need attention, so their agents may be missing or out of date.");
   });
 
   it("sends an offline local environment to Diagnostics and counts several servers", () => {
@@ -225,13 +270,14 @@ describe("inbox tile selection", () => {
     ).toEqual({ category: "done", settle: null });
   });
 
-  it("settles Needs Attention as soon as an agent needs attention", () => {
-    for (const dataState of ["partial", "complete"] as const) {
-      expect(resolveInboxSelection({ persisted: null, counts: some, dataState })).toEqual({
-        category: "attention",
-        settle: "attention",
-      });
-    }
+  it("shows Needs Attention while an agent needs attention, saving it only on complete data", () => {
+    expect(resolveInboxSelection({ persisted: null, counts: some, dataState: "partial" })).toEqual({
+      category: "attention",
+      settle: null,
+    });
+    expect(resolveInboxSelection({ persisted: null, counts: some, dataState: "complete" })).toEqual(
+      { category: "attention", settle: "attention" },
+    );
   });
 
   it("settles All Agents only on complete data", () => {
@@ -276,7 +322,7 @@ describe("opening an inbox agent", () => {
     const target = resolveInboxOpenTarget(panel);
     expect(target).toEqual({
       hostRef: scopeThreadRef(ENV, ThreadId.make("host-1")),
-      surface: { kind: "panel", threadId: ThreadId.make("panel-1"), providerLabel: "Codex" },
+      surface: { kind: "panel", threadId: ThreadId.make("panel-1"), label: "Codex" },
     });
     expect(inboxTargetSurfaceId(target)).toBe("chat:panel-1");
   });

@@ -1,6 +1,6 @@
 import { scopedThreadKey, scopeThreadRef } from "@bibcode/client-runtime/environment";
 import type { EnvironmentShellSummary } from "@bibcode/client-runtime/state/shell";
-import type { ScopedThreadRef, ThreadId } from "@bibcode/contracts";
+import type { EnvironmentId, ScopedThreadRef, ThreadId } from "@bibcode/contracts";
 
 import { panelProviderLabel } from "../../../centerPanelAdoption";
 import { HOST_SURFACE_ID } from "../../../centerPanelStore";
@@ -96,9 +96,26 @@ export interface InboxEnvironmentInfo {
   readonly remote: boolean;
 }
 
+/**
+ * Environment states whose data needs the user (storage moved, recovery, a
+ * configuration error, or a degraded sync), as opposed to a lost connection.
+ */
+const NEEDS_ATTENTION_STATUSES: ReadonlySet<string> = new Set([
+  "degraded",
+  "storage-changed",
+  "recovery-required",
+  "configuration-error",
+]);
+
 /** Why the lists are partial, most actionable first. */
 export type InboxPartialReason =
   | { readonly kind: "catalog" }
+  | {
+      readonly kind: "needs-attention";
+      readonly labels: ReadonlyArray<string>;
+      /** The first such environment, which the action selects in Environments. */
+      readonly environmentId: EnvironmentId;
+    }
   | {
       readonly kind: "offline";
       readonly labels: ReadonlyArray<string>;
@@ -111,13 +128,28 @@ export function resolveInboxPartialReason(
   environmentById: ReadonlyMap<string, InboxEnvironmentInfo>,
 ): InboxPartialReason | null {
   if (summary.catalogHealth.status !== "ready") return { kind: "catalog" };
+  const needsAttention: Array<{ readonly environmentId: EnvironmentId; readonly label: string }> =
+    [];
   const offline: InboxEnvironmentInfo[] = [];
   const reconnecting: InboxEnvironmentInfo[] = [];
   for (const status of summary.statuses) {
     if (status.status === "live" && status.hasSnapshot) continue;
     const info = environmentById.get(status.environmentId) ?? { label: "", remote: false };
-    if (isTransientStatus(status) || status.status === "live") reconnecting.push(info);
-    else offline.push(info);
+    if (NEEDS_ATTENTION_STATUSES.has(status.status)) {
+      needsAttention.push({ environmentId: status.environmentId, label: info.label });
+    } else if (status.status === "unavailable") {
+      offline.push(info);
+    } else {
+      reconnecting.push(info);
+    }
+  }
+  const [firstNeedingAttention] = needsAttention;
+  if (firstNeedingAttention !== undefined) {
+    return {
+      kind: "needs-attention",
+      labels: needsAttention.map((entry) => entry.label),
+      environmentId: firstNeedingAttention.environmentId,
+    };
   }
   if (offline.length > 0) {
     return {
@@ -132,16 +164,21 @@ export function resolveInboxPartialReason(
   return null;
 }
 
+export type InboxPartialAction =
+  | { readonly to: "remote-servers" | "diagnostics"; readonly label: string }
+  /** Switches the panel to Environments with this environment selected on the rail. */
+  | { readonly to: "environment"; readonly environmentId: EnvironmentId; readonly label: string };
+
 export interface InboxPartialNotice {
   readonly message: string;
   /** Where the user can fix it; reconnecting needs no action. */
-  readonly action: { readonly to: "remote-servers" | "diagnostics"; readonly label: string } | null;
+  readonly action: InboxPartialAction | null;
 }
 
 function serversPhrase(labels: ReadonlyArray<string>, state: string): string {
   return labels.length === 1
-    ? `${labels[0] || "A server"} is ${state}, so its agents`
-    : `${labels.length} servers are ${state}, so their agents`;
+    ? `${labels[0] || "A server"} ${state}, so its agents`
+    : `${labels.length} servers ${state.replace(/^is /u, "are ").replace(/^needs /u, "need ")}, so their agents`;
 }
 
 export function describeInboxPartialReason(reason: InboxPartialReason): InboxPartialNotice {
@@ -151,16 +188,25 @@ export function describeInboxPartialReason(reason: InboxPartialReason): InboxPar
         message: "Saved servers couldn't be read, so their agents aren't listed.",
         action: { to: "diagnostics", label: "Diagnostics" },
       };
+    case "needs-attention":
+      return {
+        message: `${serversPhrase(reason.labels, "needs attention")} may be missing or out of date.`,
+        action: {
+          to: "environment",
+          environmentId: reason.environmentId,
+          label: "Show in Environments",
+        },
+      };
     case "offline":
       return {
-        message: `${serversPhrase(reason.labels, "not connected")} may be missing or out of date.`,
+        message: `${serversPhrase(reason.labels, "is not connected")} may be missing or out of date.`,
         action: reason.allRemote
           ? { to: "remote-servers", label: "Open Remote Servers" }
           : { to: "diagnostics", label: "Diagnostics" },
       };
     case "reconnecting":
       return {
-        message: `${serversPhrase(reason.labels, "reconnecting")} may be out of date.`,
+        message: `${serversPhrase(reason.labels, "is reconnecting")} may be out of date.`,
         action: null,
       };
   }
@@ -168,9 +214,9 @@ export function describeInboxPartialReason(reason: InboxPartialReason): InboxPar
 
 /**
  * The tile to show and, when the default has settled, the tile to persist.
- * With nothing persisted, Needs Attention wins once any agent needs attention;
- * All Agents is only persisted when every environment has reported, so a
- * missing remote cannot hide an approval behind the default.
+ * With nothing persisted the Inbox shows Needs Attention while any agent needs
+ * attention, else All Agents, and saves that default only from complete data:
+ * a server that has not reported could change the answer.
  */
 export function resolveInboxSelection(input: {
   readonly persisted: InboxCategory | null;
@@ -179,13 +225,18 @@ export function resolveInboxSelection(input: {
 }): { readonly category: InboxCategory; readonly settle: InboxCategory | null } {
   if (input.persisted !== null) return { category: input.persisted, settle: null };
   if (input.dataState === "loading") return { category: "all", settle: null };
-  if (input.counts.attention > 0) return { category: "attention", settle: "attention" };
-  return { category: "all", settle: input.dataState === "complete" ? "all" : null };
+  const category = input.counts.attention > 0 ? "attention" : "all";
+  return { category, settle: input.dataState === "complete" ? category : null };
 }
 
 export type InboxOpenSurface =
   | { readonly kind: "host" }
-  | { readonly kind: "panel"; readonly threadId: ThreadId; readonly providerLabel?: string }
+  | {
+      readonly kind: "panel";
+      readonly threadId: ThreadId;
+      /** The tab label: the panel's provider when its title names one. */
+      readonly label: string;
+    }
   | { readonly kind: "terminal"; readonly terminalId: string };
 
 export interface InboxOpenTarget {
@@ -200,13 +251,12 @@ export function resolveInboxOpenTarget(row: InboxAgentRowFields): InboxOpenTarge
   }
   const hostThreadId = row.shell.hostThreadId;
   if (row.shell.kind === "panel" && hostThreadId !== undefined) {
-    const providerLabel = panelProviderLabel(row.shell.title);
     return {
       hostRef: scopeThreadRef(row.ref.environmentId, hostThreadId),
       surface: {
         kind: "panel",
         threadId: row.ref.threadId,
-        ...(providerLabel !== undefined ? { providerLabel } : {}),
+        label: panelProviderLabel(row.shell.title) ?? row.shell.title,
       },
     };
   }

@@ -1,7 +1,8 @@
 import { parseScopedThreadKey, scopedThreadKey } from "@bibcode/client-runtime/environment";
 import { useNavigate, useParams } from "@tanstack/react-router";
-import { useCallback, useEffect, useMemo, useRef } from "react";
+import { memo, type ReactNode, useCallback, useEffect, useMemo, useRef } from "react";
 
+import { usePanelThreadOpener } from "../../../centerPanelActions";
 import {
   selectFocusedCenterSurface,
   selectThreadCenterPanelState,
@@ -21,7 +22,6 @@ import {
   INBOX_CATEGORIES,
   countInboxCategories,
   describeInboxPartialReason,
-  type InboxOpenTarget,
   isInboxRowCurrent,
   resolveInboxOpenTarget,
   resolveInboxSelection,
@@ -29,8 +29,16 @@ import {
 } from "./inbox.logic";
 import { useInboxAgentRows } from "./useInboxAgentRows";
 
-const EMPTY_STATES: Record<InboxCategory, { readonly title: string; readonly detail?: string }> = {
-  all: { title: "No agents yet.", detail: "Start a chat in a project and it shows up here." },
+interface InboxEmptyState {
+  readonly title: string;
+  readonly detail?: string;
+}
+
+const EMPTY_STATES: Record<InboxCategory, InboxEmptyState> = {
+  all: {
+    title: "No agents yet.",
+    detail: "Start a chat or an AI Terminal in a project and it shows up here.",
+  },
   attention: {
     title: "Nothing needs you.",
     detail: "Approvals and questions from agents appear here.",
@@ -39,23 +47,20 @@ const EMPTY_STATES: Record<InboxCategory, { readonly title: string; readonly det
   done: { title: "No finished agents yet." },
 };
 
-/** Focuses the agent's surface in its host's center layout; the route then shows it. */
-function focusInboxTarget(target: InboxOpenTarget): void {
-  const store = useCenterPanelStore.getState();
-  switch (target.surface.kind) {
-    case "terminal":
-      store.openTerminalPanel(target.hostRef, target.surface.terminalId);
-      return;
-    case "panel":
-      store.openChatPanel(target.hostRef, target.surface.threadId, target.surface.providerLabel);
-      return;
-    case "host":
-      store.openHostChat(target.hostRef);
-  }
+/** While some server has not reported, an empty Needs Attention can only speak for the rest. */
+const PARTIAL_ATTENTION_EMPTY_STATE: InboxEmptyState = {
+  title: "Nothing needs you on the connected servers.",
+};
+
+export interface SidebarInboxViewProps {
+  /** App-level notices every left-panel view shows above its content. */
+  readonly notices?: ReactNode;
 }
 
-export function SidebarInboxView() {
+export const SidebarInboxView = memo(function SidebarInboxView({ notices }: SidebarInboxViewProps) {
   const navigate = useNavigate();
+  const { openPanelThread } = usePanelThreadOpener();
+  const setSidebarView = useUiStateStore((state) => state.setSidebarView);
   const { isMobile, setOpenMobile } = useSidebar();
   const { rows, dataState, partialReason } = useInboxAgentRows();
   const persistedCategory = useUiStateStore((state) => state.inboxCategory);
@@ -109,25 +114,66 @@ export function SidebarInboxView() {
       if (selection.selectedThreadKeys.size > 0) selection.clearSelection();
       selection.setAnchor(scopedThreadKey(target.hostRef));
       setActiveEnvironmentId(target.hostRef.environmentId);
-      focusInboxTarget(target);
+      // Focus the agent's surface in its host's center layout; the route then shows it.
+      switch (target.surface.kind) {
+        case "terminal":
+          useCenterPanelStore
+            .getState()
+            .openTerminalPanel(target.hostRef, target.surface.terminalId);
+          break;
+        case "panel":
+          // A listed panel is never archived, so this opens or focuses its tab directly.
+          void openPanelThread(
+            target.hostRef,
+            target.surface.threadId,
+            target.surface.label,
+            false,
+          );
+          break;
+        case "host":
+          useCenterPanelStore.getState().openHostChat(target.hostRef);
+      }
       if (isMobile) setOpenMobile(false);
       void navigate({
         to: "/$environmentId/$threadId",
         params: buildThreadRouteParams(target.hostRef),
       });
     },
-    [isMobile, markRead, navigate, setOpenMobile],
+    [isMobile, markRead, navigate, openPanelThread, setOpenMobile],
   );
 
   const label = INBOX_CATEGORIES.find((entry) => entry.id === category)?.label ?? "";
-  const empty = EMPTY_STATES[category];
+  const empty =
+    category === "attention" && dataState === "partial"
+      ? PARTIAL_ATTENTION_EMPTY_STATE
+      : EMPTY_STATES[category];
   const partialNotice = partialReason === null ? null : describeInboxPartialReason(partialReason);
   const partialAction = partialNotice?.action ?? null;
+  const runPartialAction = useCallback(() => {
+    if (partialAction === null) return;
+    if (partialAction.to === "environment") {
+      setActiveEnvironmentId(partialAction.environmentId);
+      setSidebarView("environments");
+      return;
+    }
+    void navigate({
+      to:
+        partialAction.to === "remote-servers"
+          ? "/settings/remote-servers"
+          : "/settings/diagnostics",
+    });
+  }, [navigate, partialAction, setSidebarView]);
 
   return (
     <SidebarContent className="min-h-full gap-0" data-testid="sidebar-inbox-view">
+      {notices}
       <SidebarGroup className="px-2 pt-2 pb-1">
-        <InboxCategoryTiles counts={counts} selected={category} onSelect={setInboxCategory} />
+        <InboxCategoryTiles
+          counts={counts}
+          loading={dataState === "loading"}
+          selected={category}
+          onSelect={setInboxCategory}
+        />
       </SidebarGroup>
       <SidebarGroup className="px-2 py-1">
         <div className="min-w-0" data-text-surface="card">
@@ -138,18 +184,7 @@ export function SidebarInboxView() {
             >
               <span>{partialNotice.message}</span>
               {partialAction !== null ? (
-                <Button
-                  size="xs"
-                  variant="ghost"
-                  onClick={() =>
-                    void navigate({
-                      to:
-                        partialAction.to === "remote-servers"
-                          ? "/settings/remote-servers"
-                          : "/settings/diagnostics",
-                    })
-                  }
-                >
+                <Button size="xs" variant="ghost" onClick={runPartialAction}>
                   {partialAction.label}
                 </Button>
               ) : null}
@@ -183,4 +218,4 @@ export function SidebarInboxView() {
       </SidebarGroup>
     </SidebarContent>
   );
-}
+});
