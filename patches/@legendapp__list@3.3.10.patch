@@ -1,5 +1,5 @@
 diff --git a/react.js b/react.js
-index 5b171ebd6fa7ac86b0148fe17f897a0ca821d55e..7cb8fdd9ea625002a3e4b7eeb904bd02b1e052a6 100644
+index 5b171ebd6fa7ac86b0148fe17f897a0ca821d55e..9caa35a1fa1e3c7fbdfc35699599c4d97521af93 100644
 --- a/react.js
 +++ b/react.js
 @@ -1976,6 +1976,12 @@ function updateScroll(ctx, newScroll, forceUpdate, options) {
@@ -53,8 +53,37 @@ index 5b171ebd6fa7ac86b0148fe17f897a0ca821d55e..7cb8fdd9ea625002a3e4b7eeb904bd02
            (_d = stickyState == null ? void 0 : stickyState.finishCalculateItemsInView) == null ? void 0 : _d.call(stickyState);
            return;
          }
+@@ -7588,6 +7594,28 @@ function createImperativeHandle(ctx, scheduleImperativeScrollCommit) {
+       }
+       return false;
+     }),
++    // BiBCode patch: the reader took over the scroll. Withdraw the list's own scroll requests
++    // so none runs over them later: a request still waiting for layout to settle, the
++    // completion checks and target of one under way, and the adjustment an animated scroll
++    // holds for rows that resized during it, which would otherwise shift the view when the
++    // next scroll finishes. An animated scroll the browser is still running stops where it is.
++    cancelScrollRequests: () => {
++      var _a3;
++      const animating = !!((_a3 = state.scrollingTo) == null ? void 0 : _a3.animated);
++      cancelImperativeScroll(state);
++      state.scrollAdjustHandler.pendingAdjust = 0;
++      set$(ctx, "scrollAdjustPending", 0);
++      const scroller = refScroller.current;
++      if (!scroller || state.props.horizontal) {
++        return;
++      }
++      const observed = scroller.getCurrentScrollOffset();
++      if (animating) {
++        scroller.scrollTo({ animated: false, x: 0, y: observed });
++      }
++      state.scrollPending = observed;
++      updateScroll(ctx, observed, true, { markHasScrolled: false });
++    },
+     scrollToOffset: (params) => runScrollWithPromise(() => {
+       scrollTo(ctx, params);
+       return true;
 diff --git a/react.mjs b/react.mjs
-index cf549ca32946a9e35a883290c11423330bf8728b..85283e63527b3ef3dc14733efb6e511dbc61f7f4 100644
+index cf549ca32946a9e35a883290c11423330bf8728b..0b44d0dd79fb6d38419a7abe0645d3bc412aac50 100644
 --- a/react.mjs
 +++ b/react.mjs
 @@ -1955,6 +1955,12 @@ function updateScroll(ctx, newScroll, forceUpdate, options) {
@@ -108,3 +137,32 @@ index cf549ca32946a9e35a883290c11423330bf8728b..85283e63527b3ef3dc14733efb6e511d
            (_d = stickyState == null ? void 0 : stickyState.finishCalculateItemsInView) == null ? void 0 : _d.call(stickyState);
            return;
          }
+@@ -7567,6 +7573,28 @@ function createImperativeHandle(ctx, scheduleImperativeScrollCommit) {
+       }
+       return false;
+     }),
++    // BiBCode patch: the reader took over the scroll. Withdraw the list's own scroll requests
++    // so none runs over them later: a request still waiting for layout to settle, the
++    // completion checks and target of one under way, and the adjustment an animated scroll
++    // holds for rows that resized during it, which would otherwise shift the view when the
++    // next scroll finishes. An animated scroll the browser is still running stops where it is.
++    cancelScrollRequests: () => {
++      var _a3;
++      const animating = !!((_a3 = state.scrollingTo) == null ? void 0 : _a3.animated);
++      cancelImperativeScroll(state);
++      state.scrollAdjustHandler.pendingAdjust = 0;
++      set$(ctx, "scrollAdjustPending", 0);
++      const scroller = refScroller.current;
++      if (!scroller || state.props.horizontal) {
++        return;
++      }
++      const observed = scroller.getCurrentScrollOffset();
++      if (animating) {
++        scroller.scrollTo({ animated: false, x: 0, y: observed });
++      }
++      state.scrollPending = observed;
++      updateScroll(ctx, observed, true, { markHasScrolled: false });
++    },
+     scrollToOffset: (params) => runScrollWithPromise(() => {
+       scrollTo(ctx, params);
+       return true;
