@@ -426,16 +426,50 @@ Monitor watches (`task_type: "local_bash"`) never appear under **Background
 tasks**, Claude claims no background-work capability, and Activity reads
 neither `run_id` nor `parent_task_id` (Agent SDK v0.3.292).
 
+The probe runs the executable exactly as the launch will. It resolves
+**Binary path** on the launch's `PATH`, including the open-url `PATH` prefix,
+and runs that resolved path, never its symlink target. It runs with the
+launch's environment and in the chat's working directory. This matters for
+multi-call shims such as mise's `shims/claude`, a link to the `mise` binary.
+mise picks the Claude it runs from the name it was called by, and from the
+directory's configuration. Called by its real name, mise answers as itself.
+
 A launch waits up to two seconds for the probe. The probe itself may run for up
 to five seconds, so a slow first `--help` still records its answer for the next
-launch. BiBCode caches only a probe in which both commands answered, keyed by the
-executable's identity and version. A failed or timed-out probe is not cached,
-so the next launch probes again instead of running without the switches for the
-life of the server. Each probe run writes one line to `server.log`: `Claude
-activity probe finished` with `outcome` (`supported` or `unsupported`), the
-version, and the elapsed time, or a `Claude activity probe failed` warning with
-`outcome` (`failed` or `timed out`) and the reason. A launch that stops waiting
-logs `launching Claude without activity flags`.
+launch. BiBCode caches only a probe in which both commands answered and
+`--version` printed a Claude Code version (`2.1.311 (Claude Code)` or the bare
+`2.1.311`). The cache key is the resolved path plus the canonical target's
+identity and the version. Another program's answer, such as mise's
+`2026.10.19 linux-x64 (…)`, is a mismatch: BiBCode does not cache it and skips
+`--help`. A failed or timed-out probe is not cached either, so the next launch
+probes again instead of running without the switches for the life of the
+server.
+
+A shim's own identity does not change when the Claude behind it does. So for
+a resolved path whose file name differs from its target's, the key also holds
+the working directory, and each later launch reruns `--version`, bounded by the
+same two seconds. A cached answer is reused only while that version is
+unchanged; a new version runs the whole probe again.
+
+Each probe run writes one line to `server.log`, with the resolved
+`executable`, its `canonical` target and the `search_path` it was resolved on.
+All three are passed through the Profiler's path redaction, which replaces the
+home directory and secrets. The line is one of these:
+
+- `Claude activity probe finished`, an `info` line with `outcome` (`supported`
+  or `unsupported`), the version and the elapsed time.
+- `Claude activity probe found another program`, a warning with
+  `outcome = "mismatch"` and the start of the version output, redacted and cut
+  to 256 bytes.
+- `Claude activity probe failed`, a warning with `outcome` (`failed` or
+  `timed out`) and the reason.
+
+A launch that stops waiting, or whose shim fails to confirm the version, logs
+`launching Claude without activity flags`. A session restarted in the same
+server process takes its activity capabilities from the new process. When that
+process has no hook support, retained subagents show as stale. They do not stay
+live (see
+[Activity observation](../architecture/activity-observation.md)).
 
 ## Thinking
 
