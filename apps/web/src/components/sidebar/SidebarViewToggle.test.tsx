@@ -26,8 +26,30 @@ function pressed(): string[] {
     .map((button) => button.getAttribute("aria-label") ?? "");
 }
 
+/** The toggle's ResizeObserver callbacks, so a test can resize its container. */
+const resizeCallbacks: ResizeObserverCallback[] = [];
+
+async function resizeTo(width: number): Promise<void> {
+  await act(async () => {
+    for (const callback of resizeCallbacks) {
+      callback([{ contentRect: { width } } as ResizeObserverEntry], {} as ResizeObserver);
+    }
+  });
+}
+
 beforeEach(async () => {
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+  resizeCallbacks.length = 0;
+  vi.stubGlobal(
+    "ResizeObserver",
+    class {
+      constructor(callback: ResizeObserverCallback) {
+        resizeCallbacks.push(callback);
+      }
+      observe() {}
+      disconnect() {}
+    },
+  );
   useUiStateStore.setState({ sidebarView: "environments" });
   container = document.createElement("div");
   document.body.append(container);
@@ -40,6 +62,7 @@ afterEach(async () => {
   container?.remove();
   root = null;
   container = null;
+  vi.unstubAllGlobals();
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = false;
 });
 
@@ -56,10 +79,19 @@ describe("SidebarViewToggle", () => {
     for (const button of buttons()) {
       expect(button.type).toBe("button");
       expect(button.querySelector("svg")).not.toBeNull();
-      // The label can collapse to the icon at narrow widths, so the title still names it.
-      expect(button.title).toBe(button.getAttribute("aria-label")?.replace(/ view$/, ""));
+      expect(button.textContent).toBe(button.getAttribute("aria-label")?.replace(/ view$/, ""));
     }
     expect(pressed()).toEqual(["Environments view"]);
+  });
+
+  it("adds a tooltip only while the panel is too narrow for the labels", async () => {
+    const titles = () => buttons().map((button) => button.getAttribute("title"));
+    await resizeTo(400);
+    expect(titles()).toEqual([null, null, null]);
+    await resizeTo(200);
+    expect(titles()).toEqual(["Environments", "Repositories", "Inbox"]);
+    await resizeTo(320);
+    expect(titles()).toEqual([null, null, null]);
   });
 
   it("switches views by click and keeps exactly one pressed", async () => {

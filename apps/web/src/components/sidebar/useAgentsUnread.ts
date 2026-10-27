@@ -7,7 +7,7 @@ import { useRouter } from "@tanstack/react-router";
 import { useCallback, useEffect, useMemo, useRef, useSyncExternalStore } from "react";
 
 import {
-  selectFocusedCenterSurface,
+  selectVisibleCenterSurfaces,
   type ThreadCenterPanelState,
   useCenterPanelStore,
 } from "../../centerPanelStore";
@@ -18,7 +18,7 @@ import type { AgentRow } from "./agentsSection.logic";
 export function detectUnreadTransitions(input: {
   readonly previous: ReadonlyMap<string, string>;
   readonly rows: ReadonlyArray<AgentRow>;
-  /** Threads the user is looking at: the routed thread and its focused chat panel. */
+  /** Threads the user is looking at: the routed thread and its chat panels on screen. */
   readonly openThreadKeys: ReadonlySet<string>;
 }): {
   readonly next: ReadonlyMap<string, string>;
@@ -53,19 +53,26 @@ export function detectUnreadTransitions(input: {
   return { next, markUnreadKeys };
 }
 
-/** The chat panel thread focused in the routed host's center layout, as a thread key. */
-export function resolveFocusedPanelThreadKey(
+/**
+ * The chat panel threads on screen in the routed host's center layout, the
+ * active tab of any split, as newline-joined thread keys (a stable selector
+ * value).
+ */
+export function resolveVisiblePanelThreadKeys(
   byThreadKey: Readonly<Record<string, ThreadCenterPanelState>>,
   routeThreadKey: string | null,
-): string | null {
-  if (routeThreadKey === null) return null;
+): string {
+  if (routeThreadKey === null) return "";
   const hostState = byThreadKey[routeThreadKey];
   const hostRef = parseScopedThreadKey(routeThreadKey);
-  if (hostState === undefined || hostRef === null) return null;
-  const focused = selectFocusedCenterSurface(hostState);
-  return focused?.kind === "chat"
-    ? scopedThreadKey(scopeThreadRef(hostRef.environmentId, focused.threadId))
-    : null;
+  if (hostState === undefined || hostRef === null) return "";
+  return selectVisibleCenterSurfaces(hostState)
+    .flatMap(({ surface }) =>
+      surface.kind === "chat"
+        ? [scopedThreadKey(scopeThreadRef(hostRef.environmentId, surface.threadId))]
+        : [],
+    )
+    .join("\n");
 }
 
 export function useAgentsUnread(rows: ReadonlyArray<AgentRow>): void {
@@ -85,15 +92,16 @@ export function useAgentsUnread(rows: ReadonlyArray<AgentRow>): void {
     return routeThreadRef === null ? null : scopedThreadKey(routeThreadRef);
   }, [router]);
   const openThreadKey = useSyncExternalStore(subscribeToRoute, getOpenThreadKey, getOpenThreadKey);
-  const focusedPanelThreadKey = useCenterPanelStore((state) =>
-    resolveFocusedPanelThreadKey(state.byThreadKey, openThreadKey),
+  const visiblePanelThreadKeys = useCenterPanelStore((state) =>
+    resolveVisiblePanelThreadKeys(state.byThreadKey, openThreadKey),
   );
   const openThreadKeys = useMemo(() => {
-    const keys = new Set<string>();
+    const keys = new Set<string>(
+      visiblePanelThreadKeys === "" ? [] : visiblePanelThreadKeys.split("\n"),
+    );
     if (openThreadKey !== null) keys.add(openThreadKey);
-    if (focusedPanelThreadKey !== null) keys.add(focusedPanelThreadKey);
     return keys;
-  }, [focusedPanelThreadKey, openThreadKey]);
+  }, [openThreadKey, visiblePanelThreadKeys]);
   const markUnread = useSidebarWorkspaceMetaStore((state) => state.markUnread);
 
   useEffect(() => {
