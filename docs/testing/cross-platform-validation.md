@@ -3168,29 +3168,38 @@ plain code block and then as a sequence diagram, the scenario's only one, whose
 chunk loads after its source shows, so it replaces the source at the end while
 more text streams. Once each reply's sent row has settled (the list first
 catches up with the end, within 2.5 s of the first delivery), every delivery
-of the plain reply after its code block shows must paint a resting frame (the
-last before the next delivery) with the reply's end revealed, at most 1 px
-below the composer's top; a delivery with no resting frame fails the check. The
-diagram reply must paint a rest for each delivery too, and each delivery from
-the diagram's draw on rests no lower below the composer than the plain reply's
-(or, after a delivery the plain reply painted no rest for, is revealed); the
-draw's own delivery may take 200 ms to be followed. From settling on, neither
-reply's sent row rests more than 1 px below its offset, since following takes
-a reply taller than the view above it. Both replies end with the last line in
-view, resting within two lines of each other
+of the plain reply after its code block shows that paints a resting frame (the
+last before the next delivery) rests with the reply's end revealed, at most
+1 px below the composer's top. A slow runner can paint no frame between two
+deliveries, so such a delivery is recorded
+(`mermaid-timeline-streaming-unpainted.json`) rather than failed, but each
+reply must settle, finish and paint at least five resting frames. Each delivery
+of the diagram reply from its draw on rests no lower below the composer than
+the plain reply's (or, after a delivery the plain reply painted no rest for,
+is revealed); the draw's own delivery may take 200 ms to be followed. The
+diagram's source must be laid out before it draws, read from the DOM as it
+changes, and the draw must change the block's height. From settling on,
+neither reply's sent row rests more than 1 px below its offset; for these tall
+replies following takes the row well above it, so the proof that a sent row
+lands within 1 px is the short reply's check above. Both replies end with the
+last line in view, resting within two lines of each other
 (`mermaid-timeline-streaming-follow.json` holds both replies' gaps, end and
 sent-row positions, and, for diagnosis only, the painted frames each delivery
 took to reveal its end). Then the reader takes the timeline over with the
 keyboard: after a short reply whose code block's **Copy code** button is
-mounted, a reply streams for about nine seconds; while its sent row glides
-into place, the spec focuses that button (a focus, not a press), dispatches a
-PageUp keydown on it and then makes the page step that key's default action
-makes. The packaged WebDriver plugin sends keys as dispatched events, which
-scroll nothing, so the spec cannot use real key input. The paragraph then read
-stays within 1 px on every painted frame for 3 s, through the glide's settling,
-LegendList's wait for rows to settle and at least five more deliveries; an End
-keydown and a scroll to the end resume following, and at least three later
-deliveries rest with the end revealed
+mounted, a reply streams for about nine seconds. One page script waits for its
+sent row to start gliding, grows a paragraph far above the view so LegendList
+holds an adjustment for the glide, focuses that button (a focus, not a press),
+dispatches a PageUp keydown on it and, two frames later, makes the page step
+that key's default action makes. The packaged WebDriver plugin sends keys as
+dispatched events, which scroll nothing, so the spec cannot use real key
+input. The key must land within 750 ms of the glide starting, and a line on
+screen must not move between the key and the page step (the glide stops, and
+the held adjustment is applied as a scroll rather than a jump). The paragraph
+then read stays within 1 px on every painted frame for 3 s, through the
+glide's settling, LegendList's wait for rows to settle and at least five more
+deliveries; an End keydown and a scroll to the end resume following, and at
+least three later deliveries rest with the end revealed
 (`mermaid-timeline-keyboard-takeover.json`). The reading-line
 checks sample painted frames, so the scenario fails early in a webview that
 paints none.
