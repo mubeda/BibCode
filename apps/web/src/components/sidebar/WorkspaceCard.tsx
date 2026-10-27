@@ -65,6 +65,21 @@ function StatusShape({ kind }: { readonly kind: WorkspaceCardStatus["kind"] }) {
           <circle cx="5" cy="5" r="4" fill="currentColor" />
         </svg>
       );
+    case "unknown":
+      // Dashed: an agent may be at work, but BiBCode cannot vouch for its state.
+      return (
+        <svg aria-hidden viewBox="0 0 10 10" className="size-2.5">
+          <circle
+            cx="5"
+            cy="5"
+            r="3.5"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="1.5"
+            strokeDasharray="2 1.5"
+          />
+        </svg>
+      );
     case "idle":
       return (
         <svg aria-hidden viewBox="0 0 10 10" className="size-2.5">

@@ -222,6 +222,9 @@ pub struct ProviderTerminalObserverFactoryInput {
     pub activity_publisher: TerminalGenerationActivityPublisher,
     pub process_attribution: ProcessAttributionRegistry,
     pub runtime_dir: PathBuf,
+    /// Whether AI Terminal activity was on at launch. Off, the observer runs for the agent's
+    /// status only (#187) and publishes no activity until the setting turns on.
+    pub activity_enabled: bool,
 }
 
 impl fmt::Debug for ProviderTerminalObserverFactoryInput {
@@ -432,10 +435,10 @@ impl ProviderTerminalActivitySupervisor {
         &self,
         input: TerminalLaunchPreparationInput,
     ) -> TerminalLaunchPreparation {
+        // The observer runs whatever the AI Terminal activity setting says: the agent's status
+        // in the left panel needs it (#187). The setting decides only whether it also publishes
+        // activity, through the admission below.
         let activity_state = self.activity_controller.snapshot();
-        if !activity_state.enabled {
-            return TerminalLaunchPreparation::PassThrough;
-        }
         let observer_generation = input.generation.clone();
         let inventory = match self.authority.current().await {
             Ok(inventory) => inventory,
@@ -476,6 +479,7 @@ impl ProviderTerminalActivitySupervisor {
             activity_publisher,
             process_attribution: self.process_attribution.clone(),
             runtime_dir: self.runtime_dir.clone(),
+            activity_enabled: activity_state.enabled,
         };
         let requires_private_executable_pin = factory.requires_private_executable_pin();
         let preparation = match factory.prepare(factory_input).await {
@@ -497,6 +501,10 @@ impl ProviderTerminalActivitySupervisor {
                 prepared
             }
         };
+        if !activity_state.enabled {
+            // Status only: no activity admission, so the observer starts dormant.
+            return TerminalLaunchPreparation::Prepared(preparation);
+        }
         let activity_admission = self.activity_controller.admit().filter(|admission| {
             self.activity_controller.snapshot() == activity_state && admission.is_current()
         });
@@ -1120,9 +1128,7 @@ impl TerminalLaunchPreparer for ProviderTerminalActivitySupervisor {
         let input = input.clone();
         Box::pin(async move {
             let default = Duration::from_millis(500);
-            if !self.activity_controller.snapshot().enabled {
-                return default;
-            }
+            // Status observation prepares OpenCode with activity off too (#187).
             if input.activity.driver_kind != "opencode" {
                 return default;
             }

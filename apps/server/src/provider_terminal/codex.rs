@@ -22,7 +22,7 @@ use process_wrap::tokio::{ChildWrapper, CommandWrap};
 use serde_json::{Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
-use super::model::TerminalObserverGenerationLease;
+use super::model::{TerminalAgentState, TerminalObserverGenerationLease};
 #[cfg(unix)]
 use super::supervisor::create_owned_generation_directory;
 use super::{
@@ -517,7 +517,9 @@ impl CodexTerminalObserverFactory {
                 generation_started_at,
                 spawned: AtomicBool::new(false),
                 connection_epoch: AtomicU64::new(0),
-                activity: Arc::new(TerminalAgentActivityControl::enabled()),
+                activity: Arc::new(TerminalAgentActivityControl::with_enabled(
+                    input.activity_enabled,
+                )),
                 reattach_timeout: self.reattach_timeout,
                 warned_undecodable_history: Mutex::default(),
             }),
@@ -1306,6 +1308,11 @@ async fn run_codex_observer_inner(
                         continue;
                     }
                 };
+                // The root agent's state goes to the left panel whatever the activity setting
+                // says (#187).
+                if let Some((state, failed)) = codex_root_agent_status(&envelope, &root) {
+                    generation.publish_agent_status(state, failed);
+                }
                 let desired = inner.activity.snapshot();
                 if live_state != Some(desired)
                     || epoch != inner.connection_epoch.load(Ordering::Acquire)
@@ -1558,6 +1565,47 @@ enum CodexRootDiscoveryOutcome {
     Retry,
     WaitForResponse,
     Stop,
+}
+
+/// The TUI root agent's state a Codex notification reports, for the left panel (#187): its
+/// thread status (an approval or a question blocks it), or its turn starting and ending.
+pub(super) fn codex_root_agent_status(
+    envelope: &Value,
+    root: &str,
+) -> Option<(TerminalAgentState, bool)> {
+    let params = envelope.get("params")?;
+    if params.get("threadId")?.as_str()? != root {
+        return None;
+    }
+    match envelope.get("method")?.as_str()? {
+        "thread/status/changed" => {
+            let status = params.get("status")?;
+            match status.get("type")?.as_str()? {
+                "active" => {
+                    let flags = status.get("activeFlags").and_then(Value::as_array);
+                    let flagged = |flag: &str| {
+                        flags.is_some_and(|flags| flags.iter().any(|value| value == flag))
+                    };
+                    Some(if flagged("waitingOnApproval") {
+                        (TerminalAgentState::Blocked, false)
+                    } else if flagged("waitingOnUserInput") {
+                        (TerminalAgentState::Waiting, false)
+                    } else {
+                        (TerminalAgentState::Working, false)
+                    })
+                }
+                "idle" => Some((TerminalAgentState::Done, false)),
+                "systemError" => Some((TerminalAgentState::Done, true)),
+                _ => None,
+            }
+        }
+        "turn/started" => Some((TerminalAgentState::Working, false)),
+        "turn/completed" => Some((
+            TerminalAgentState::Done,
+            params.pointer("/turn/status").and_then(Value::as_str) == Some("failed"),
+        )),
+        _ => None,
+    }
 }
 
 fn is_codex_json_rpc_response(value: &Value) -> bool {

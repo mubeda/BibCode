@@ -14,8 +14,9 @@ pub use manager::{
     TerminalSubprocessInspector, WorktreeRemovalGuard,
 };
 pub use model::{
-    ProviderTerminalActivityLaunch, TerminalAttachInput, TerminalConsoleTheme, TerminalEvent,
-    TerminalLaunchCommand, TerminalMetadataEvent, TerminalOpenInput, TerminalRemovalReason,
-    TerminalRestartInput, TerminalSessionSnapshot, TerminalSize, TerminalStatus, TerminalSummary,
+    ProviderTerminalActivityLaunch, TerminalAgentStatus, TerminalAgentStatusState,
+    TerminalAttachInput, TerminalConsoleTheme, TerminalEvent, TerminalLaunchCommand,
+    TerminalMetadataEvent, TerminalOpenInput, TerminalRemovalReason, TerminalRestartInput,
+    TerminalSessionSnapshot, TerminalSize, TerminalStatus, TerminalSummary,
 };
 pub use pty::{PortablePtyBackend, PtyBackend, PtyExit, PtyProcess, PtySpawnInput};

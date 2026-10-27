@@ -1536,7 +1536,13 @@ fn shell_snapshot_value(snapshot: &crate::orchestration::Snapshot, archived: boo
         .threads
         .iter()
         .filter(|thread| thread.deleted_at.is_none() && (thread.archived_at.is_some()) == archived)
-        .map(|thread| thread_shell(thread, snapshot, previews.get(thread.thread_id.as_str())))
+        .map(|thread| {
+            let mut shell = thread_shell(thread, snapshot, previews.get(thread.thread_id.as_str()));
+            if let Some(age_ms) = last_activity_age_ms(thread.last_activity_at.as_deref()) {
+                shell["lastActivityAgeMs"] = json!(age_ms);
+            }
+            shell
+        })
         .collect::<Vec<_>>();
     json!({
         "snapshotSequence": sequence,
@@ -1544,6 +1550,15 @@ fn shell_snapshot_value(snapshot: &crate::orchestration::Snapshot, archived: boo
         "threads": threads,
         "updatedAt": now_iso(),
     })
+}
+
+/// How old a thread's provider-progress time is on this server's clock as its shell is built,
+/// so a client ages the left panel's status from its own receipt of that value instead of
+/// comparing clocks with this server (#187).
+fn last_activity_age_ms(last_activity_at: Option<&str>) -> Option<u64> {
+    let at = OffsetDateTime::parse(last_activity_at?, &Rfc3339).ok()?;
+    let age_ms = (OffsetDateTime::now_utc() - at).whole_milliseconds().max(0);
+    Some(u64::try_from(age_ms).unwrap_or(u64::MAX))
 }
 
 async fn thread_snapshot(engine: &OrchestrationEngine, thread_id: &str) -> RpcResult {
@@ -2085,6 +2100,9 @@ fn thread_shell_with_records(
     if let Some(host_thread_id) = &thread.host_thread_id {
         shell["hostThreadId"] = json!(host_thread_id);
     }
+    if let Some(last_activity_at) = &thread.last_activity_at {
+        shell["lastActivityAt"] = json!(last_activity_at);
+    }
     if let Some(preview) = preview {
         shell["conversationPreview"] = json!({
             "prompt": preview.prompt,
@@ -2370,6 +2388,7 @@ mod tests {
                 latest_user_message_at: Some("2026-07-11T00:00:00.004Z".to_owned()),
                 pending_approval_count: 0,
                 pending_user_input_count: 0,
+                last_activity_at: None,
                 has_actionable_proposed_plan: 0,
                 unresolved_delivery_state: None,
                 unresolved_delivery_detail: None,

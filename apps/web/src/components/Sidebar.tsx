@@ -156,6 +156,7 @@ import {
 import { projectDataSafetyStore } from "../state/projectDataSafety";
 
 import { useThreadActions } from "../hooks/useThreadActions";
+import { useWorkspaceCardStatus } from "../hooks/useAgentFreshness";
 import { projectEnvironment } from "../state/projects";
 import { useEnvironmentQuery } from "../state/query";
 import {
@@ -281,7 +282,6 @@ import {
   resolveWorkspaceCardAgeSource,
   resolveWorkspaceCardClassName,
   SIDEBAR_CARD_CLASS,
-  resolveWorkspaceCardStatus,
   resolveWorkspaceDirty,
   shouldShowWorkspaceBranchText,
   summarizeWorkspaceChats,
@@ -872,7 +872,7 @@ export const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThr
   );
   const keyboardMenuOpenedAtRef = useRef(Number.NEGATIVE_INFINITY);
 
-  const status = resolveWorkspaceCardStatus(thread, lastVisitedAt);
+  const status = useWorkspaceCardStatus(thread, lastVisitedAt, WORKSPACE_CARD_STATUS.idle);
   const branchLabel = resolveWorkspaceBranchLabel(gitStatus.data, thread.branch);
   const showBranchText = shouldShowWorkspaceBranchText(branchLabel, thread.title);
   // The badge belongs to the branch the card names, not the recorded one, which
@@ -1409,9 +1409,7 @@ const SidebarPrimaryCard = memo(function SidebarPrimaryCard(props: SidebarPrimar
   const openPreview = useAtomCommand(previewEnvironment.open, { reportFailure: false });
   const keyboardMenuOpenedAtRef = useRef(Number.NEGATIVE_INFINITY);
 
-  const status = primaryThread
-    ? resolveWorkspaceCardStatus(primaryThread, lastVisitedAt)
-    : WORKSPACE_CARD_STATUS.idle;
+  const status = useWorkspaceCardStatus(primaryThread, lastVisitedAt, WORKSPACE_CARD_STATUS.idle);
   const prStatus = prStatusIndicator(summary?.pr ?? null, summary?.sourceControlProvider);
   const dirty = resolveWorkspaceDirty(summary);
   const terminalStatus = terminalStatusFromRunningIds(runningTerminalIds);

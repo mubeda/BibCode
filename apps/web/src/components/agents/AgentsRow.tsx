@@ -6,13 +6,14 @@ import { selectIsUnread, useSidebarWorkspaceMetaStore } from "../../sidebarWorks
 import { formatRelativeTimeLabel } from "../../timestampFormat";
 import { ProviderInstanceIcon } from "../chat/ProviderInstanceIcon";
 import { SidebarMenuAction, SidebarMenuButton, SidebarMenuItem } from "../ui/sidebar";
-import type { AgentRow } from "../sidebar/agentsSection.logic";
+import { type AgentRow, agentRowUnreadKey } from "../sidebar/agentsSection.logic";
 
 export interface AgentsRowProps {
   readonly row: AgentRow;
   readonly selected: boolean;
   readonly onSelect: (key: string) => void;
-  readonly onJumpToWorkspace: (row: AgentRow) => void;
+  /** The row's secondary action; the Inbox omits it (#186). */
+  readonly onJumpToWorkspace?: (row: AgentRow) => void;
 }
 
 function samePill(left: AgentRow["pill"], right: AgentRow["pill"]): boolean {
@@ -34,6 +35,8 @@ function sameAgentRow(left: AgentRow, right: AgentRow): boolean {
       left.environmentLabel === right.environmentLabel &&
       left.environmentLive === right.environmentLive &&
       left.environmentStatus === right.environmentStatus &&
+      left.unknownReason === right.unknownReason &&
+      left.terminalId === right.terminalId &&
       left.projectTitle === right.projectTitle &&
       left.providerDriverKind === right.providerDriverKind &&
       left.providerLabel === right.providerLabel &&
@@ -45,7 +48,7 @@ function sameAgentRow(left: AgentRow, right: AgentRow): boolean {
 export const AgentsRow = memo(
   function AgentsRow({ row, selected, onSelect, onJumpToWorkspace }: AgentsRowProps) {
     const isUnread = useSidebarWorkspaceMetaStore((state) =>
-      selectIsUnread(state.unreadThreadKeys, row.key),
+      selectIsUnread(state.unreadThreadKeys, agentRowUnreadKey(row)),
     );
     const statusLabel = row.pill?.label ?? "Done";
     const environmentStatus = row.environmentLive ? null : row.environmentStatus;
@@ -60,8 +63,13 @@ export const AgentsRow = memo(
       onSelect(row.key);
     }, [onSelect, row.key]);
     const handleJumpToWorkspace = useCallback(() => {
-      onJumpToWorkspace(row);
+      onJumpToWorkspace?.(row);
     }, [onJumpToWorkspace, row]);
+    // A terminal row names its terminal, so two agents of one thread read apart.
+    const agentName =
+      row.terminalId === null || row.previewLine === null
+        ? row.shell.title
+        : `${row.shell.title}, ${row.previewLine}`;
 
     return (
       <SidebarMenuItem className="border-b border-border/60 last:border-b-0">
@@ -69,7 +77,7 @@ export const AgentsRow = memo(
           size="lg"
           isActive={selected}
           className="h-auto items-stretch gap-0 rounded-md px-3 py-2.5 pr-9 hover:bg-accent/60 data-[active=true]:bg-accent data-[active=true]:font-normal"
-          aria-label={`${row.shell.title}, ${statusLabel}, ${row.environmentLabel}`}
+          aria-label={`${agentName}, ${statusLabel}, ${row.environmentLabel}`}
           aria-pressed={selected}
           onClick={handleSelect}
         >
@@ -79,7 +87,8 @@ export const AgentsRow = memo(
                 className={cn(
                   "size-2 shrink-0 rounded-full",
                   row.pill?.dotClass ?? "bg-muted-foreground/40",
-                  row.pill?.pulse && "animate-pulse",
+                  // A disconnected environment's cached state is not live: nothing pulses.
+                  row.pill?.pulse && live && "animate-pulse",
                 )}
                 aria-hidden
               />
@@ -153,15 +162,17 @@ export const AgentsRow = memo(
             </div>
           </div>
         </SidebarMenuButton>
-        <SidebarMenuAction
-          showOnHover
-          className="top-2 right-2 size-6 bg-background/80"
-          aria-label={`Jump to workspace for ${row.shell.title}`}
-          title="Jump to workspace"
-          onClick={handleJumpToWorkspace}
-        >
-          <ArrowUpRightIcon className="size-3.5" aria-hidden />
-        </SidebarMenuAction>
+        {onJumpToWorkspace !== undefined ? (
+          <SidebarMenuAction
+            showOnHover
+            className="top-2 right-2 size-6 bg-background/80"
+            aria-label={`Jump to workspace for ${agentName}`}
+            title="Jump to workspace"
+            onClick={handleJumpToWorkspace}
+          >
+            <ArrowUpRightIcon className="size-3.5" aria-hidden />
+          </SidebarMenuAction>
+        ) : null}
       </SidebarMenuItem>
     );
   },
