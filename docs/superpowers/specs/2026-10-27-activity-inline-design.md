@@ -1,255 +1,366 @@
 # Inline Activity panel per pane (#188) and the macOS x64 terminal dock (#192)
 
-Status: proposed, awaiting approval. Batch `activity-inline`, branch
+Status: proposed, round 2, awaiting approval. Batch `activity-inline`, branch
 `claude/b3-activity-inline` from `origin/develop` at `27702287cc`.
 
-## 1. #192: why the live Codex terminal dock never shows on macOS x64
+Round 2 changes the design in these ways:
 
-### What the failure is, and is not
+- **Placement:** the panel now sits in the pane's flow, above the composer or
+  at the bottom of the terminal. It no longer floats over the pane.
+- **#192 confidence and timings:** the confidence is restated honestly, with
+  Codex-specific stage timings measured from the real fixture.
+- **#192 fix:** chosen so the first launch succeeds on a slow machine.
+- **#192 logging and testing:** each failure stage now gets its own log line,
+  and a Rust test runs the full chain.
+- **Restore and focus:** saved state is restored when a pane mounts, and the
+  record heading takes focus only after a user selects a record.
+- **Additional coverage:** pruning on main-pane replacement, more packaged
+  cases, and documentation updates.
 
-The issue says the diagnostics show "an activity host but no geometry". The
-host had geometry. The failure dump from run `40428617333` (job
-`121940550460`, `macos-26-intel`) lists four elements:
+## 1. #192: the live Codex terminal dock never shows on macOS x64
 
-| Element                                     | Size    | Visible |
-| ------------------------------------------- | ------- | ------- |
-| `center:root` body target                   | 840x643 | yes     |
-| `chat:host` surface                         | 840x643 | hidden  |
-| `terminal:term-1` surface                   | 840x643 | yes     |
-| `[data-provider-terminal-activity-host]`    | 832x607 | yes     |
+### What the failure is
 
-The fifth selector in the dump,
-`[data-provider-terminal-activity-host] [data-testid='activity-dock']`,
-matched nothing. The dock node was never rendered. This is not a layout fault.
+The diagnostics in the failure dump show the pane geometry and visibility were
+correct:
 
-The host is mounted from the client-side launch command alone
-(`ThreadTerminalPanel.tsx:2399`, `command?.activity !== undefined`). The dock
-inside it renders only after a terminal-scope snapshot arrives with
-`capabilities.terminalObservation` and visible records
-(`ProviderTerminalActivityDock.tsx:65-73`). On x64 no such snapshot arrived.
-That means the server never attached the Codex terminal observer.
+- The terminal surface was visible.
+- Its activity host was visible, at 832x607.
 
-### Evidence
+The dock node was never rendered: the selector
+`[data-provider-terminal-activity-host] [data-testid='activity-dock']` matched
+nothing. The host itself is mounted from the client's launch command alone
+(`ThreadTerminalPanel.tsx:2399`). The dock renders only once a terminal-scope
+snapshot with `capabilities.terminalObservation` and visible records arrives
+(`ProviderTerminalActivityDock.tsx:65-73`).
 
-1. **The observer never ran on x64.** The arm64 `app-server.log` from the same
-   run contains a `bibcode_server::provider_terminal::codex` line after the
-   terminal opens. The x64 log contains no line from that module for the whole
-   run. The module logs only once the observer is live.
-2. **Process start on the x64 runner is two to three times slower.** The Claude
-   activity probe runs one `#!/bin/sh` -> `node <fixture>.mjs --help`. It took
-   684 ms and 1120 ms on x64, against 290 ms and 392 ms on arm64 (same run,
-   `production::provider_runtime` warnings).
-3. **Codex preparation has a fixed 350 ms budget.** `prepare_inner` wraps the
-   whole of `prepare_unix` in `CODEX_PREPARATION_BUDGET = 350 ms`
-   (`apps/server/src/provider_terminal/codex.rs:77,451`). That budget covers:
-   - three probe runs, which are shell-only in the fixture and fast;
-   - starting the helper `codex app-server --listen unix://…`, which in the
-     fixture is `exec node codex-fixture.mjs`;
-   - waiting for the helper's socket.
+So on x64 the Codex terminal observer never published anything. That is not a
+layout fault.
 
-   A node cold start of 700 to 1100 ms cannot fit in 350 ms. The manager also
-   caps the whole supervisor preparation at 500 ms for every driver except
-   OpenCode, which gets 1 s (`terminal/manager.rs:41-42`,
-   `provider_terminal/supervisor.rs:1116-1140`).
-4. **The timeout is silent by design.** It resolves `.ok().flatten()` to
-   `None`. The supervisor maps `None` to `PassThrough` at `supervisor.rs:481`.
-   Every other pass-through reason on that path calls `warn_once`; this one
-   does not. That is why the log says nothing.
-5. **It is deterministic.** The chat-activity scenario failed on macOS x64 in
-   all three runs (`40351666280`, `40390697884`, `40428617333`). It never
-   failed on macOS arm64 in those runs. The arm64 margin is thin: about
-   290–390 ms of node start against a 350 ms budget.
+### What the artifacts do and do not show
 
-Root cause (high confidence, inferred): on the slower Intel runner, Codex
-terminal observer preparation goes over its fixed 350 ms budget while it waits
-for the node-backed helper's socket. The launch passes through silently, so no
-terminal activity is ever published.
+These are from run `40428617333` (`macos-26-intel` against arm64), plus the
+pass and fail pattern of runs `40351666280` and `40390697884`.
 
-The same failure can plausibly hit real users. This was not verified in this
-session, and no Codex sources are vendored under `.repos/`:
+- **The failure is consistent.** The chat-activity scenario failed on macOS x64
+  in 3 of 3 runs, and on macOS arm64 in 0 of 3.
+- **The x64 observer never logged.** The arm64 server log has a
+  `provider_terminal::codex` warning that is emitted only during descendant
+  reconciliation, which runs after the root has been found. The x64 log has no
+  line from that module at all.
 
-- A Codex installed through a package manager that wraps the binary in a Node
-  launcher would pay a Node start for each probe and for the helper.
-- A cold start, or a first-launch Gatekeeper scan on a slow Mac, can run past
-  350 ms on its own.
+  This narrows the failure to one of three stages, none of which logs today:
+  1. Preparation (`codex.rs:451`): the capability probes and the helper
+     `app-server --listen`, under a 350 ms budget inside the manager's 500 ms
+     cap.
+  2. The post-spawn connect and initialize (`connect_initialized_codex_client`,
+     with a 3 s limit). On failure the observer parks silently.
+  3. Root discovery (`run_codex_observer_inner`, about `codex.rs:802-860`). It
+     never finds the TUI root, or stops.
 
-What the code does show: a timed-out probe is cancelled before
-`CachedCodexCapabilityProbe::probe` caches it (`codex.rs:155-168`). The next
-launch therefore probes again from cold.
+  The x64 artifacts contain **no Codex-specific timing**. The 684 ms and
+  1120 ms figures belong to the Claude Node probe. They show that a Node
+  process starts about 2.3 to 2.9 times slower on that runner than on arm64
+  (290 ms and 392 ms). They do not time Codex.
+- **Local stage timings for the Codex fixture.** I materialized the real e2e
+  shims with `prepareDesktopUiTestContext` and timed each stage on this arm64
+  machine, which was loaded by parallel agents. Eight trials:
 
-### Why not a Rosetta run
+  | Stage                                               | Measured (ms)              |
+  | --------------------------------------------------- | -------------------------- |
+  | Three probes (`--version`, `--help`, `app-server --help`) | 20–33 warm; 211 the first, cold |
+  | Helper started until its socket accepts             | 174–592; median about 245; 4 of 8 over 350 |
+  | Claude `--help` (calibration)                       | 177–500; median about 289  |
 
-Under Rosetta, the x86_64 app would still `exec` the arm64 `/bin/sh` and the
-arm64 `node` from `PATH`. The helper would start at native arm64 speed, so the
-run cannot reproduce the suspected slow start. It would cost one full x86_64
-release build for compatibility evidence that does not test the hypothesis.
-I skipped it.
+  The helper's readiness tracks a Node start closely: 0.6 to 1.3 times the
+  Claude calibration. The x64 runner was 2.4 to 3.9 times slower than the
+  local median on that calibration. Scaled up, that puts x64 helper readiness
+  at about 0.6 to 2.3 s. A first, cold launch adds probes of up to about
+  0.8 s.
 
-### Fix (outside this batch's owned files)
+  Every estimate exceeds the 350 ms budget and the 500 ms outer cap.
 
-All of the fix is in `apps/server`, which this batch does not own:
+Confidence:
 
-1. **Log the timeout.** Add `warn_once("preparation_timeout", …)` in the
-   `None` arm at `supervisor.rs:481`. Better, have Codex `prepare_inner` log
-   which stage it was in (probe or helper readiness) and how long it took. This
-   is required anyway by AGENTS.md ("log failures at operational boundaries").
-   It is also the single batched CI diagnostic: one `Packaged Desktop UI Smoke`
-   dispatch on macOS x64 should show `stage=helper_ready elapsed≈350ms`.
-2. **Give Codex a budget that fits a Node-launched helper.** Follow OpenCode,
-   which has 850 ms inner and 1 s outer. Raise `CODEX_PREPARATION_BUDGET`, and
-   return 1 s for `codex` from
-   `ProviderTerminalActivitySupervisor::preparation_execution_budget`.
-   - Cost: up to about 0.65 s more launch latency, only when the observer is
-     slow.
-   - On the x64 runner (700–1100 ms node start) even 1 s is marginal. The owner
-     should decide whether the helper may outlive the launch budget, starting
-     the TUI pass-through and attaching later. That needs the TUI's
-     `--remote` endpoint at spawn, so it is a larger change.
-3. **Cache the probe outside the budget.** Let the capability probe finish
-   detached and cache its result even when the launch budget expires. This is
-   the pattern Claude's `CLAUDE_ACTIVITY_PROBE_RUN_TIMEOUT` already uses.
+- **Medium-high** that preparation times out, at the helper-ready stage.
+  Every scaled estimate exceeds the budget, and the arm64 runner passes on a
+  margin the local trials show is thin.
+- **Not proven.** A post-spawn connect or discovery failure would leave the
+  same silent log. The stage logs below are needed in any case. The batched CI
+  run decides between the three stages: either the dock appears, or the log
+  names the stage.
 
-Item 1 is the smallest change that makes the failure visible, and the
-diagnostic run proves the premise. Items 2 and 3 are the behavioral fix. The
-#188 redesign does not remove this path: the terminal dock still needs a
-terminal-scope snapshot. **Requested: assign the `apps/server` change to an
-owner, or widen this batch's ownership to `provider_terminal/codex.rs` and
-`provider_terminal/supervisor.rs`.**
+A Rosetta run was skipped. Under Rosetta the app still runs the arm64 `node`,
+so it cannot reproduce a slow helper start.
 
-## 2. #188: an inline Activity panel inside each chat and terminal pane
+### Fix: the first launch must succeed on a slow machine
+
+Two approaches were considered.
+
+**A. Attach late.** Start the TUI at once and connect the helper afterward.
+Rejected, for two reasons:
+
+- The Codex TUI needs `--remote unix://…` when it is spawned. Whether a TUI
+  whose socket is not yet listening retries or exits is not established, and
+  no Codex sources are vendored here to check.
+- The alternative is to open the terminal RPC before the PTY is spawned. That
+  changes the manager's lifecycle and its cancellation guarantees, which is far
+  more than #192 needs.
+
+**B. Raise both budgets from measured timings, with margin.** Chosen. The
+budget is a cap, not a wait, so a fast machine spawns as soon as the helper is
+ready. Only a slow machine waits longer, and on that machine the alternative is
+no Activity at all.
+
+| Constant                                                                 | Now                            | New                                                     |
+| ------------------------------------------------------------------------ | ------------------------------ | ------------------------------------------------------- |
+| `CODEX_PREPARATION_BUDGET` (`codex.rs:77`)                               | 350 ms                         | 4 s                                                     |
+| Codex result of `preparation_execution_budget` (`supervisor.rs:1116-1140`) | 500 ms (default)               | 4.25 s, adding a `codex` arm next to `opencode`         |
+| `MAX_PREPARATION_EXECUTION_BUDGET` (`manager.rs:42`, applied at `:2079`) | 1 s                            | 4.5 s                                                   |
+| `NATIVE_COMMAND_TIMEOUT` (`manager.rs:45`)                               | aliases the 1 s cap            | its own 1 s constant, so native-command probes do not change |
+
+The 4 s figure covers the worst estimate for a cold first launch: about 3.1 s,
+made of 2.3 s of helper start and 0.8 s of cold probes. It sits just above
+`CODEX_HELPER_READY_TIMEOUT` (3 s). The helper's own readiness timeout already
+assumes a start of up to 3 s; the old 350 ms outer budget contradicted it.
+
+The margin is about 30% over the worst estimate, and about four times the
+median estimate. If the batched run shows a helper-ready time above about 3 s,
+the next step is to look at the helper's cold start itself, not to raise the
+budget again.
+
+Costs:
+
+- On a slow machine, opening a Codex terminal can take up to about 4 s before
+  the TUI appears, or before it passes through.
+- That is within the profiler's 10 s hang threshold (`latency.rs:45`), so
+  `terminal.open` stays out of `is_long_running`. A slow open may occasionally
+  raise a relative `rpc.slow`; that is an accurate signal.
+- Claude's own 3.25 s budget is still capped at the 500 ms default. That is
+  left unchanged here and recorded as a residual risk.
+
+### Logging stage by stage, at the point of failure
+
+The plain `Option` is replaced inside `codex.rs` with a reason. Each reason is
+logged once per executable and reason, at the level it deserves:
+
+| Where                                  | Reason                                                                                      | Level                                                                       |
+| -------------------------------------- | ------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
+| Probe                                  | `probe_failed` (spawn error or non-zero exit), `version_unparsed`                            | warn                                                                        |
+| Capabilities                           | `unsupported_capabilities` (no unix listener or remote TUI)                                  | info, since it is expected for older Codex                                  |
+| Arguments                              | `rejected_args` (`remote_tui_args` returned `None`)                                          | info                                                                        |
+| Generation directory or socket path    | `generation_dir_failed`, `socket_path_too_long`                                              | warn                                                                        |
+| Helper                                 | `helper_start_failed`, with the launcher's error message                                     | warn                                                                        |
+| Budget expired (`prepare_inner`)       | `preparation_timeout`, with `stage` (`probe` or `helper_ready`) and `elapsed_ms`             | warn                                                                        |
+| After spawn: connect or initialize fails | `observer_connect_failed`, with the error                                                  | warn                                                                        |
+| After spawn: root discovery stops      | `root_discovery_stopped`                                                                     | warn                                                                        |
+
+The stage for the timeout comes from a small atomic cell that `prepare_unix`
+updates as it moves between stages. The supervisor's `None` arm at
+`supervisor.rs:481` adds no label of its own: the factory has already said why.
+
+Logs carry no paths or prompt content beyond the executable name, which the
+existing `warn_once` calls already include. They use `tracing`, so they reach
+the native log and trace. No profiler finding is added.
+
+### Tests
+
+- **Rust integration test** (`apps/server/tests/provider_terminal_supervisor.rs`,
+  using the existing `codex_fixture_supervisor` harness):
+  - Set up: `TerminalManager` with the supervisor and the Codex factory, and a
+    `CodexFixtureHelperLauncher` whose readiness is delayed 1.5 s. That is
+    longer than the old 350 ms, 500 ms, and 1 s caps, and shorter than the new
+    ones.
+  - Assert:
+    1. The spawned command carries `--remote unix://…`.
+    2. The observer publishes the terminal scope.
+    3. Closing the terminal terminates the helper and removes the generation
+       directory.
+- **Second integration test:** a helper that never becomes ready. Assert that
+  the launch passes through within the new budget plus slack, that the helper
+  is terminated, that the directory is cleaned up, and that the
+  `preparation_timeout stage=helper_ready` warning is recorded. The warning is
+  captured with the `tracing::subscriber::set_default` pattern that
+  `tests/production_provider_runtime.rs:8769` already uses.
+- **Unit tests:** each reason maps to its log. The two existing tests that
+  assert `elapsed < CODEX_PREPARATION_BUDGET` (`codex.rs:3936,4008`) are bounds
+  on the supervisor initializer. They keep their meaning; only the constant
+  grows.
+- **Acceptance:** the macOS x64 `chat-activity-panel` assertion passes in one
+  batched CI push. The coordinator pushes, not me. A warning by itself is not
+  the fix.
+
+## 2. #188: an inline Activity panel in each chat and terminal pane
 
 ### Requirements, from the issue
 
-- R1: The dock opens an inline panel in the same pane. The right panel never
+- **R1:** The dock opens an inline panel in the same pane. The right panel never
   opens or changes.
-- R2: The panel collapses and expands from the dock or its header, by mouse and
-  by keyboard, with `aria-expanded` and focus handling. Collapsing does not
-  shift scroll.
-- R3: The panel is scoped to that pane's chat (root plus descendants) or that
-  terminal. Each split pane has its own panel.
-- R4: It works the same in chat panes and terminal panes.
-- R5: The right-panel `activity` surface is removed, and persisted state is
+- **R2:** It collapses and expands from the dock or its header, by mouse and by
+  keyboard, with `aria-expanded` and focus handling. Collapsing returns the
+  pane to its normal layout without shifting scroll.
+- **R3:** It is scoped to that pane's chat (root plus descendants) or that
+  terminal. Each split pane has its own.
+- **R4:** It works in chat and terminal panes.
+- **R5:** The right-panel `activity` surface is removed and persisted state is
   migrated.
-- R6: Each pane's expanded state persists across reloads, and so does its
-  route.
+- **R6:** Each pane's expanded state and route persist across reloads.
 
-### Where the panel lives
+### Placement: in the pane's flow, in its bottom slot
 
-There is one component, `ActivityPane` (new, in
-`components/activity/ActivityPane.tsx`). It renders a single card anchored to
-the pane's top-right corner. The card holds:
+There is one component, `ActivityPane` (`components/activity/ActivityPane.tsx`).
+It is a single card with two parts:
 
-- **Header:** the existing dock summary row, turned into a disclosure toggle.
+- **Header:** the dock's summary row, which becomes a disclosure toggle.
 - **Body:** the existing `ActivityPanel` (tabs, roster, record detail), shown
   only while expanded.
 
-The card overlays the pane. It is positioned absolutely, in the same place the
-dock is today:
+The card is docked in the pane's bottom slot. The dock moves with it, so the
+toggle and its content stay together.
 
-- **Chat:** inside the `relative` messages wrapper at `ChatView.tsx:~7279`,
-  above `MessagesTimeline` and never in its flex flow. The composer stays
-  visible below the wrapper.
-- **Terminal:** inside the existing `data-provider-terminal-activity-host`
-  overlay (`ThreadTerminalPanel.tsx:2399`). That overlay is
-  `pointer-events-none`; the card sets `pointer-events-auto`.
+**Chat pane.** The card is the first child of the composer overlay's
+`pointer-events-auto` column (`ChatView.tsx:~7376-7385`), above
+`ComposerBannerStack`. It is aligned with the composer and has the same maximum
+width.
 
-Size:
+- That overlay is the region whose height already changes as the composer grows
+  or banners appear. `composerOverlayHeight` is measured by a ResizeObserver
+  (`ChatView.tsx:1745-1762`) and becomes the timeline's
+  `contentInsetEndAdjustment` (`ChatView.tsx:7344`).
+- **The reading anchor on height change is already handled, by LegendList
+  3.3.10 itself.** `updateContentInsetEndAdjustment` (`react.mjs:7291-7304`)
+  keeps `state.scroll` when the inset changes. It adds the difference only when
+  the list was within the end threshold and the inset grew.
+  - Away from the end: `scrollTop` does not change, and the content above does
+    not move.
+  - At the end: the list stays at the end.
+  - Shrinking at the end: the browser clamps to the new end.
 
-- Width is `min(26rem, 100% - 1.5rem)`.
-- Height is `min(32rem, 100% - 1.5rem)` of the pane area under the dock.
-- In a narrow split pane the card takes the pane's width.
-- The body scrolls inside its own `ScrollArea`, as it does today.
+  The ChatView code that reads `composerOverlayHeight` (`:4031, :4060, :4088`)
+  is the same code a growing composer exercises.
+- **No new follow code.** Phase 2 includes a unit test and a packaged
+  assertion that `scrollTop` is unchanged when the card is toggled while
+  reading mid-history, and that an at-end list stays at the end. If either
+  fails, I report the symptom to the coordinator and do not touch follow code.
+
+**Terminal pane.** `TerminalViewport`'s wrapper (`ThreadTerminalPanel.tsx:2370`)
+becomes a flex column: the xterm mount is `min-h-0 flex-1`, and the card sits in
+a bottom slot after it. The slot keeps
+`data-provider-terminal-activity-host={terminalId}` for diagnostics and tests;
+it is no longer absolute.
+
+- The xterm container's ResizeObserver (`ThreadTerminalPanel.tsx:~2303`)
+  refits the terminal. The PTY is resized on expand and collapse, and the TUI
+  redraws through SIGWINCH.
+
+**Size.**
+
+- The collapsed card is one header row of about 40 px. It is present only while
+  the dock would be visible.
+- The expanded body's maximum height is the smaller of 22 rem and 45% of the
+  pane. It is measured from the pane element (chat column or terminal
+  wrapper), so a short split pane keeps at least 55% for the timeline and
+  composer, or for terminal rows. The body scrolls in its own `ScrollArea`.
+- The scrollable content wrapper carries `data-text-surface="card"`
+  (`UI.md:175`; `index.css:383-396`).
 
 Alternatives considered:
 
-| Option                                                    | Rejected because                                                                                                                                                                                                                                                                                                                                                                                       |
-| --------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| In-flow panel above the composer or at the timeline's top | Changes the LegendList viewport height on every toggle. That moves the reading position or re-triggers end-follow, which another agent owns. In a terminal it resizes xterm and the PTY, so the Codex or Claude TUI redraws on every toggle.                                                                                                                                                             |
-| Full-height drawer along the pane's right edge            | Covers the whole pane height, including the end of the timeline, even when there are few records. The anchored card grows only to its content.                                                                                                                                                                                                                                                           |
-| Resizable card                                            | The issue makes it optional ("if resizable"). It adds a drag handle, a persisted size, and keyboard resizing. **Skipped in this change.**                                                                                                                                                                                                                                                                  |
+| Option                                                                  | Rejected because                                                                                                                                                                                                                                                      |
+| ----------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Floating card over the pane (round 1)                                   | The issue asks for a panel docked in the pane that collapses back to the normal layout. An overlay hides content without the layout acknowledging it.                                                                                                                  |
+| Keep the collapsed dock floating at the top right; dock only the body at the bottom | It costs no row while collapsed, but it separates the control from the content it controls, at opposite ends of the pane. The issue says the dock and header both toggle.                                                                                              |
+| Panel at the top of the timeline                                        | It changes the viewport from the top, so LegendList's end-inset path does not cover it, and it would need new anchor code in code another agent owns.                                                                                                                 |
+| Resizable card                                                          | Optional in the issue. **Skipped.**                                                                                                                                                                                                                                   |
 
-Trade-off: while expanded, the card covers part of the timeline or terminal
-under it. The pane itself does not move, so collapsing restores exactly what
-was there. This is how R2's "without shifting scroll position" is met, by
-construction: the timeline's and the terminal's geometry never change.
+Cost: a chat whose provider reports activity, with **Always show Activity** on
+(the default), keeps about a 40 px row above the composer. A terminal gives up
+about two rows while its dock is visible.
 
-### Interaction and accessibility
+### Interaction, accessibility, and focus
 
-- **The dock becomes the header.**
-  - It is a toggle button with `aria-expanded` and `aria-controls` pointing at
-    the body's id.
-  - Its name drops "Open": `Activity: <breakdown>`. The breakdown is the
-    existing per-section text, so the name stays stable across states. The
-    tooltip keeps the breakdown.
+- **The header is the dock.**
+  - It is a toggle with `aria-expanded` and `aria-controls` pointing at the
+    body's id.
+  - Its name is `Activity: <breakdown>`, which stays the same in both states.
   - A chevron shows the state.
-- **Expanding (click, Enter, or Space on the collapsed dock):**
-  - It opens on the section `sectionToOpen` picks: error first, then running
-    work, then most recent.
-  - If that is the remembered section, the remembered record stays open. If
-    not, the section switches and the selection clears. This matches
-    `openActivity` today.
-  - Focus moves to the selected section tab, or to the panel when there is
-    only one section. The existing `focusRequested` effect in
-    `ActivityPanel.tsx` does this; the request becomes component-local state
-    instead of `rightPanelStore.activityFocusRequests`.
-- **Collapsing:**
-  - The dock toggles it, and focus stays on the dock.
-  - Escape anywhere inside the body collapses it and moves focus to the dock.
-  - Escape is handled only in the card's own `onKeyDown`, so terminal and
-    composer key handling are untouched.
-- **Non-modal:** no focus trap, no backdrop, no outside-click dismissal. Tab
-  order runs dock, then body, then the rest of the pane.
-- **Collapsed means unmounted.** A collapsed body unmounts, so its
-  roster and detail queries stop. Re-expanding revalidates, as reopening the
-  inspector does today.
-- **Visibility:**
-  - The card is shown only while the dock would be visible. The existing rules
-    apply: `alwaysVisible` for chats; terminals wait for a record.
-  - An expanded card stays visible even if the counts drop to zero, and shows
-    the panel's empty state. Otherwise the content would vanish under the
-    user's hands.
-  - After a reload, a remembered expanded pane opens expanded without taking
-    focus.
-  - Open judgment call: a terminal pane remembered as expanded reopens its card
-    when its first record arrives after the reload. The card then covers part
-    of a live TUI the user may be typing in. It is the user's remembered
-    choice, and focus stays in the terminal. The alternative is to persist the
-    route for terminal panes but always start them collapsed. **To be decided
-    at approval.**
-- **Behavior change:** the dock now closes an open panel. Today it never
-  closes it (`docs/user/workspace-ui.md:1756-1762`). That is what the issue
-  asks for ("collapsed and expanded from its header or the dock").
-- **Remains:**
   - The live announcement region stays in the header.
-  - The compact count layout stays under 1200 px.
-  - The right-panel responsive sheet is no longer used for Activity.
+- **Expand** (click, Enter, or Space):
+  - It opens on `sectionToOpen`. When that is the remembered section, the
+    remembered record stays open. Otherwise the selection clears.
+  - Focus moves to the selected section tab, or to the panel when there is only
+    one section. The focus request is component-local; it is no longer kept in
+    `rightPanelStore.activityFocusRequests`.
+- **Collapse:**
+  - From the dock, focus stays on the dock.
+  - Escape inside the body collapses it and focuses the dock. The handler is on
+    the card, so the composer's and xterm's key handling are untouched.
+- **Non-modal.** No focus trap, backdrop, or outside-click dismissal.
+- **Collapsed means unmounted.** A collapsed body unmounts, so its queries
+  stop. Re-expanding revalidates them.
+- **An expanded card with zero counts** stays visible and shows the panel's
+  empty state.
+- **Record-heading focus moves only after the user picks a record.** Today,
+  `ActivityPanel.tsx:268-273` focuses the detail heading whenever a selected
+  record is rendered. A restored route would therefore take focus from the
+  composer or the terminal after a reload.
+  - The effect is gated on a `userNavigatedRef`. Only `selectRecord`,
+    `selectActor`, and the back and section actions set it, and it is cleared
+    after one focus.
+  - The `focusRequested` path (`:276-292`) runs only from an expand the user
+    started.
+- **Behavior change:** the dock now closes an open panel. Today it never does
+  (`docs/user/workspace-ui.md:1756-1762`). This is what the issue asks for.
+
+### Restoring saved state at mount
+
+Both pane kinds read their saved `ActivityPaneState` synchronously at mount:
+the store is persisted to localStorage and hydrated synchronously. The card's
+first render therefore uses the saved expanded state and route. No effect or
+arriving record ever expands it.
+
+- **Chat panes.** The card renders at mount whenever the chat scope is enabled
+  and the dock would be visible: with **Always show** on, from the first
+  snapshot; otherwise once a record exists.
+- **Terminal panes.** A terminal launched with an activity hint renders its
+  card at mount in its saved state, before the observation handshake.
+  - Before observation is proven, the header shows a muted "Activity" label,
+    and the expanded body shows the empty state.
+  - The card is removed only when the snapshot shows the terminal cannot be
+    observed (`terminalObservation` false), or the pane is hidden.
+  - This is a deliberate change from "terminals wait for their first record".
+    It is what makes the PTY size final at mount instead of changing when the
+    first record arrives.
+  - Residual: when the server passes the launch through, as #192 does, no
+    snapshot ever arrives, so the pre-handshake card would never be removed.
+    To cover that, the card is dropped when the terminal's activity state
+    stays `null` for a bounded window after the PTY is running: 10 s, which is
+    above the new 4.5 s preparation cap. This single timer is the only
+    exception to "decided at mount".
+  - **To be confirmed at approval.** The alternative keeps "terminals wait for
+    a record" and accepts one PTY resize when the card first appears.
 
 ### Scope and pane identity
 
-- **Chat pane:** scope is always `{ _tag: "thread" }`, resolved for that
-  `ChatView`'s own thread: the host thread, or the panel chat's
-  `panelThreadRef`. The chat dock no longer takes its scope from a right-panel
-  surface (`ChatView.tsx:2019-2039`). This removes the case where a terminal's
-  activity showed in the chat's dock.
-- **Terminal pane:** scope is `{ _tag: "terminal", terminalId }`, as today.
-- **Pane key:** the center surface id. It is `chat:host`, `chat:<threadId>`,
-  or `terminal:<terminalId>`, under the host thread key. Provider-terminal
-  commands reach `TerminalViewport` only through `CenterTerminalPanel`
-  (`ThreadTerminalPanel.tsx:2905,2937`). So only center terminals have a dock,
-  and `terminal:<terminalId>` names the pane wherever it moves among center
-  groups.
-- **Host visibility:** `siblingChatOwnsCenter` (`ChatView.tsx:1992`) is
-  deleted. It existed only because one right panel was shared, and it wrongly
-  hid the host dock whenever a sibling chat in a split was focused. The host
-  card now renders when the host surface is visible, meaning some group's
-  `activeSurfaceId === "chat:host"`. That is the same rule
-  `CenterPanelSurfaceHosts` uses (`CenterPanelSurfaceHosts.tsx:263-267`). A
-  hidden, tabbed-away host therefore mounts no dock and makes no live
-  announcements.
+- **Chat pane:** the scope is `{ _tag: "thread" }` for that `ChatView`'s own
+  thread: the host thread, or `panelThreadRef`. The scope no longer follows a
+  right-panel surface (`ChatView.tsx:2019-2039`).
+- **Terminal pane:** the scope is `{ _tag: "terminal", terminalId }`.
+- **Pane key:** the center surface id (`chat:host`, `chat:<threadId>`, or
+  `terminal:<terminalId>`) under the host thread key. Only center terminals
+  receive a provider command (`ThreadTerminalPanel.tsx:2905,2937`), so only
+  they get a dock.
+- **Panel chats need the host's ref.** A panel-variant `ChatView` reads its
+  center state as empty (`ChatView.tsx:1924-1927`). Add
+  `ChatViewPanelProps.activityPaneHostRef`, passed from
+  `LiveCenterPanelWorkspace` (`ChatView.tsx:1420-1424`).
+- **Host visibility:** `siblingChatOwnsCenter` (`:1992`) is deleted. The host
+  card renders when some group's `activeSurfaceId === "chat:host"`, the rule
+  `CenterPanelSurfaceHosts.tsx:263-267` uses. A focused sibling in a split no
+  longer hides the host's dock, and a host that is tabbed away is not
+  announced.
 
-### Per-pane persistence (`centerPanelStore`)
-
-The store gets a new root field, persisted next to `byThreadKey`:
+### Saved state per pane (`centerPanelStore`)
 
 ```ts
 activityPanes: Record<threadKey, Record<surfaceId, ActivityPaneState>>;
@@ -261,103 +372,98 @@ interface ActivityPaneState {
 }
 ```
 
-- **Actions:** `setActivityPaneExpanded(ref, surfaceId, expanded, section?)`
-  and `navigateActivityPane(ref, surfaceId, route)`. A route change for a
-  surface not in that thread's `surfaces` is a no-op, so a stale navigation
-  cannot recreate a closed pane.
-- **Pruning:** the entry is dropped in every path that removes a surface:
-  `closeSurface`, `closeOtherSurfaces`, `closeSurfacesToRight`,
-  `closeAllSurfaces`, `removeTerminalPanel`, and `removeThread`. Migration also
-  drops entries for surfaces that are not present.
-- **Placement:** a root map rather than a field on `ThreadCenterPanelState`.
-  This keeps layout reducers and `isImplicitDefault` untouched.
-- **Migration:** `CENTER_PANEL_STORAGE_VERSION` goes from 3 to 4. A missing
-  field migrates to `{}`. Malformed entries are dropped. The route
-  normalizers (`normalizeActivitySection`, `normalizeActivitySelection`, and
-  the bounded-id check) move from `rightPanelStore.ts` to a small
-  `components/activity/activityPaneState.ts`. Both the store and its tests use
-  it.
-- **Hydration:** today `centerPanelStore` has `migrate` but no `merge`. That
-  means a same-version store with a corrupt pane entry would hydrate unchecked.
-  Add a `merge` that runs the `activityPanes` normalizer on every hydration,
-  the way `rightPanelStore` does (`rightPanelStore.ts:1023`).
-- **Panel chats need the host's ref.** A panel-variant `ChatView` reads the
-  center state as empty (`ChatView.tsx:1924-1927`) and receives only
-  `panelThreadRef`. `LiveCenterPanelWorkspace` already has `hostThreadRef` at
-  the panel render site (`ChatView.tsx:1420-1424`). Add an optional
-  `activityPaneHostRef` to `ChatViewPanelProps` and pass it there. The panel
-  then reads and writes `activityPanes[hostKey]["chat:<threadId>"]`.
-- **Defaults:** collapsed, on `subagents`, with nothing selected. Default
-  entries are not written, so idle panes add nothing to storage.
+- **Actions:** `setActivityPaneExpanded` and `navigateActivityPane`. Both are
+  no-ops for a surface that is not in the thread's `surfaces`.
+- **Pruning:** a `pruneActivityPanes(threadKey, surfaces)` step runs inside
+  `withUpdatedThread`. It therefore covers every surface removal that goes
+  through it (`closeSurface`, `closeOtherSurfaces`, `closeSurfacesToRight`,
+  `closeAllSurfaces`, `removeTerminalPanel`), plus `replaceMainWithTerminal`
+  (`centerPanelStore.ts:503-518`, which writes `byThreadKey` directly) and
+  `removeThread`.
+- **Placement:** a root map, so layout reducers and `isImplicitDefault` are
+  unchanged.
+- **Migration and hydration:**
+  - `CENTER_PANEL_STORAGE_VERSION` goes from 3 to 4; a missing field becomes
+    `{}`.
+  - A new `merge` normalizes `activityPanes` on every hydration. The store has
+    only `migrate` today.
+  - Malformed entries, and entries for surfaces that are not present, are
+    dropped.
+  - The normalizers move from `rightPanelStore.ts` to
+    `components/activity/activityPaneState.ts`.
+- **Defaults:** collapsed, on `subagents`, with nothing selected. Defaults are
+  not written.
 
-### Removing the right-panel surface (`rightPanelStore`, `RightPanelTabs`)
+### Removing the right-panel surface
 
 - **`rightPanelStore.ts`:**
-  - Remove `"activity"` from `RIGHT_PANEL_KINDS`.
-  - Remove `ActivityRightPanelSurface` and its normalizers.
-  - Remove `openActivity`, `navigateActivity`, `acknowledgeActivityFocus`,
-    `activityFocusRequests`, and `selectActivityFocusRequested`.
-- **Migration:**
+  - Remove the `"activity"` kind, `ActivityRightPanelSurface`, its
+    normalizers, `openActivity`, `navigateActivity`,
+    `acknowledgeActivityFocus`, `activityFocusRequests`, and
+    `selectActivityFocusRequested`.
   - `RIGHT_PANEL_STORAGE_VERSION` goes from 10 to 11.
-  - `normalizePersistedSurface` already returns `null` for an unknown kind.
-  - New: when the persisted `activeSurfaceId` was `"activity"`, migration sets
-    `isOpen = false` and makes the first remaining surface active, or `null`.
-    Old state then cannot reopen the right panel, whether on Activity or on
-    whatever surface happens to be left.
-  - A thread whose only surface was Activity is already closed by
-    `allPersistedSurfacesWereInvalid`.
-  - `merge` runs the same sanitizer, so live hydration is covered too.
-- **`RightPanelTabs.tsx`:** remove the `activity` cases in `surfaceTitle`,
-  `SurfaceIcon`, and the tooltip bypass.
-- **`ChatView.tsx`:** remove the right-panel activity plumbing (section 4).
-  Panel chats then never render a right panel:
+  - When the persisted `activeSurfaceId` was `"activity"`: set `isOpen = false`
+    and make the first remaining surface active, or `null`.
+  - When Activity was the only surface: the existing
+    `allPersistedSurfacesWereInvalid` branch closes it.
+  - `merge` already sanitizes every hydration.
+- **`RightPanelTabs.tsx`:** remove the `activity` cases.
+- **`ChatView.tsx`** (granted activity ranges):
+  - Remove the right-panel activity plumbing.
   - `rightPanelSurfaceEligible` becomes `!isPanel`.
   - `renderedRightPanelSurfaces` becomes `rightPanelState.surfaces`.
-  - `toggleRightPanel` loses the `hostActivitySurfaceSuppressed` branch.
-- **`ActivityDock`:** drops `avoidRightPanelSheet`, because the right-panel
-  sheet no longer hosts Activity.
-  `ACTIVITY_DOCK_SHEET_INSET_CLASS_NAME` in `rightPanelLayout.ts` becomes
-  unused and is deleted.
+  - `toggleRightPanel` loses its suppressed branch.
+  - Lines 3845–3856 change only as far as needed to drop the panel-variant
+    Activity close handlers. Nothing at or after 3998 changes.
+- **`ActivityDock` and `rightPanelLayout.ts`:** remove `avoidRightPanelSheet`
+  and `ACTIVITY_DOCK_SHEET_INSET_CLASS_NAME`.
 
-### Disabled settings
+### Settings that are off
 
-With **Chat agent activity** or **Terminal agent activity** off, the card does
-not render and no activity atom is read, as the dock behaves today. Remembered
-pane state is kept, so turning the setting back on restores the panes.
-
-The effects that closed a persisted right-panel Activity surface when its
-setting was off (`ChatView.tsx:2041-2074`) are deleted.
+When **Chat agent activity** or **Terminal agent activity** is off, the card
+does not render and no activity atom is read. Saved pane state is kept. The
+effects that closed a disabled persisted right-panel surface
+(`ChatView.tsx:2041-2074`) are deleted.
 
 ## 3. Profiler, crash, and trace coverage
 
-#188 is web-only. It adds no process, RPC method, worktree path, binary mode,
-service, or profiler event, so no coverage item applies.
+- **#188:** web-only. It adds no process, RPC method, worktree path, binary
+  mode, service, or profiler event.
+- **#192:** it adds `tracing::warn!` and `tracing::info!` at the observer's
+  operational boundaries, logged once per executable and reason, with no
+  content beyond what is already logged.
+  - It changes preparation budgets, but no process is spawned differently. The
+    helper is still registered and attributed through the existing
+    `SystemCodexHelperLauncher` and `process_attribution` path.
+  - It adds no RPC method. `terminal.open` stays out of `is_long_running`,
+    because the new cap is under the 10 s hang threshold.
+  - Its documentation goes in the fallback paragraph of
+    `docs/architecture/activity-observation.md`.
 
-The proposed #192 server change adds a `tracing::warn!` at an operational
-boundary. It touches no other coverage item.
+## 4. Ownership
 
-## 4. Ownership needed beyond the brief
+**Granted:**
 
-1. **`ChatView.tsx` beyond the `ActivityDockBinding` region.** These ranges are
-   all activity plumbing, with no follow, scroll, or sent-row code:
-   - 465–619 and 636–993: `useBoundedActivityQuery`, `ActivityStateTarget`,
-     `ActivityDockBinding`, `ActivityPanelBinding`, and their error helpers.
-     They move to `components/activity/ActivityPaneBinding.tsx`.
-   - 1992 and 2001–2107: the activity scope, `siblingChatOwnsCenter`, and the
-     persisted-surface effect.
-   - 3711–3723, 3786–3807, and 3845–3856: right-panel toggling and close
-     handlers.
-   - 7192–7200: the `ActivityPanelBinding` right-panel branch.
-   - 7281–7295: the dock mount, which becomes the `ActivityPane` mount.
-   - About 1060 and 1420–1424: the `ChatViewPanelProps.activityPaneHostRef`
-     prop, and passing it from `LiveCenterPanelWorkspace`.
-   - The imports those use.
-2. **`apps/desktop/e2e/support/activity-events.ts:124`**
-   (`desktopActivityAccessibleNames.dock`), for the renamed dock label.
-3. **`apps/web/src/rightPanelLayout.ts`**, to delete the now-unused inset
-   constant.
-4. **Tests outside the named list:**
-   - `ChatView.hooks.test.tsx:~3030` calls `openActivity`.
-   - `rightPanelStore.test.ts` activity cases at lines 122–368 and 915.
-   - `centerPanelStore.test.ts` for the new state.
-5. **The #192 server files** (section 1).
+- the `ChatView.tsx` activity ranges;
+- `components/activity/ActivityPaneBinding.tsx`;
+- `e2e/support/activity-events.ts`;
+- `rightPanelLayout.ts`;
+- `provider_terminal/codex.rs`, `provider_terminal/supervisor.rs`, and
+  `terminal/manager.rs`.
+
+`ChatView.hooks.test.tsx` edits are limited to what renames force; new cases go
+in `ChatView.activityPane.test.tsx`.
+
+**Still needed:**
+
+- **`apps/desktop/e2e/support/test-project.ts`.** The Codex fixture's terminal
+  mode prints nothing and handles no SIGWINCH, so the coordinator's "test the
+  TUI redraws" cannot be observed with it. The change is small: in the
+  fixture's non-app-server branch, write `\x1b[2J\x1b[Hfixture-tui
+  <cols>x<rows>` at start and on `process.stdout.on("resize")`. The packaged
+  test then asserts that the xterm buffer shows the new size after each toggle.
+  Without this grant, the terminal toggle is proven only by xterm and PTY row
+  counts, not by a TUI redraw.
+- **`apps/server/tests/provider_terminal_supervisor.rs`**, for the two Rust
+  integration tests. It is the same crate as the granted files and its
+  existing Codex harness.
