@@ -1115,9 +1115,15 @@ async function streamAndSampleEnd(prompt: string): Promise<StreamSample[]> {
           finished: count(lastLine) > lastLinesBefore,
           afterParagraphs: afterParagraphs() - afterParagraphsBefore,
           lastLineInView: (() => {
+            // Both replies end with the same line, and the list does not keep its rows in DOM
+            // order, so the newest reply's line is the lowest one, not the last in the DOM.
             const line = [...document.querySelectorAll<HTMLElement>(`${surface} .chat-markdown p`)]
-              .findLast((element) => element.textContent === lastLine)
-              ?.getBoundingClientRect();
+              .filter((element) => element.textContent === lastLine)
+              .map((element) => element.getBoundingClientRect())
+              .reduce<DOMRect | undefined>(
+                (lowest, rect) => (lowest === undefined || rect.top > lowest.top ? rect : lowest),
+                undefined,
+              );
             const area = scroller?.getBoundingClientRect();
             return !!line && !!area && line.top >= area.top && line.bottom <= area.bottom;
           })(),
