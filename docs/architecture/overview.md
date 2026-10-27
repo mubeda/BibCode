@@ -3038,10 +3038,11 @@ renderer never sees partial source:
 - **Reading position.** A diagram replacing its source, or **Show source**,
   changes the block's height. In the timeline, a row wholly above the first
   visible row is held by LegendList's `maintainVisibleContentPosition.size`.
-  `patches/@legendapp__list@3.3.10.patch` makes that row the first on screen
-  at the current offset: upstream reads a visible-row list it refreshes only
-  when the render range changes, so after a short scroll it held a row below
-  the one that grew and shifted the view by the growth;
+  `patches/@legendapp__list@3.3.10.patch` keeps the list's rows on screen
+  current: upstream refreshes them on a scroll inside the cached render range
+  only when viewability callbacks are set, so after a short scroll it held a
+  row below the one that grew (or changed with the data, as an expanded
+  thought does) and shifted the view by the growth;
   inside the first visible row, above the viewport's top edge, the block
   commits its swap through the timeline's reading anchor
   (`chat/readingAnchor.ts`), which commits with `flushSync` and scrolls by the
