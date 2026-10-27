@@ -387,6 +387,24 @@ describe("centerPanelStore", () => {
       expect(selectFocusedCenterSurface(stateOf())?.id).toBe(HOST_SURFACE_ID);
     });
 
+    it("brings back a host chat closed beside a chat panel and a terminal", () => {
+      store().openChatPanel(HOST, PANEL_A);
+      store().openTerminalPanel(HOST, "term-1");
+      store().closeSurface(HOST, CENTER_PANEL_ROOT_GROUP_ID, HOST_SURFACE_ID);
+      expect(surfaceIds()).toEqual([`chat:${PANEL_A}`, "terminal:term-1"]);
+
+      store().openHostChat(HOST);
+
+      // The host leads the surface list again, joins the focused group and takes focus.
+      expect(surfaceIds()).toEqual([HOST_SURFACE_ID, `chat:${PANEL_A}`, "terminal:term-1"]);
+      expect(rootGroup().surfaceIds).toEqual([
+        `chat:${PANEL_A}`,
+        "terminal:term-1",
+        HOST_SURFACE_ID,
+      ]);
+      expect(selectFocusedCenterSurface(stateOf())?.id).toBe(HOST_SURFACE_ID);
+    });
+
     it("focuses the host chat where it already is", () => {
       const groupRight = createRightGroup();
       store().focusGroup(HOST, groupRight);
