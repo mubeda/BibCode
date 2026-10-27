@@ -3037,8 +3037,12 @@ renderer never sees partial source:
   code block.
 - **Reading position.** A diagram replacing its source, or **Show source**,
   changes the block's height. In the timeline, a row wholly above the first
-  visible row is held by LegendList's `maintainVisibleContentPosition.size`;
-  inside the first visible row, above the viewport's top edge, the block
+  visible row is held by LegendList's `maintainVisibleContentPosition.size`
+  (`patches/@legendapp__list@3.3.10.patch` keeps that row current after a
+  scroll: it refreshes the rows on screen inside the cached render range and
+  releases the anchor a data change locks for 300 ms; a stale row could sit
+  below one that grew, such as an expanded thought, and shift the view by the
+  growth); inside the first visible row, above the viewport's top edge, the block
   commits its swap through the timeline's reading anchor
   (`chat/readingAnchor.ts`), which commits with `flushSync` and scrolls by the
   height change. New text that replaces a block's source (a reply's final

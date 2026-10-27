@@ -88,6 +88,7 @@ packageExtensions:
 
 patchedDependencies:
   "@effect/vitest@4.0.2": patches/@effect__vitest@4.0.2.patch
+  "@legendapp/list@3.3.10": patches/@legendapp__list@3.3.10.patch
   "@pierre/diffs@1.3.6": patches/@pierre__diffs@1.3.6.patch
   "@pierre/trees@1.0.0-beta.6": patches/@pierre__trees@1.0.0-beta.6.patch
   "@wdio/tauri-plugin@1.2.0": patches/@wdio__tauri-plugin@1.2.0.patch

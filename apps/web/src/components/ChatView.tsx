@@ -428,6 +428,11 @@ function setProjectFileSurfaceFlag(
   else nextByProject.set(projectKey, next);
   return nextByProject;
 }
+/**
+ * How many times, two frames apart, a follow toward an anchored turn's end looks again when
+ * LegendList clamped it to a content height it had not laid out yet.
+ */
+const TIMELINE_END_FOLLOW_RECHECKS = 6;
 const TYPE_TO_FOCUS_EDITABLE_SELECTOR = [
   "input",
   "textarea",
@@ -3989,6 +3994,7 @@ function ChatViewContent(props: ChatViewProps) {
     readonly userScrollGeneration: number;
   } | null>(null);
   const anchorScrollRestoreFrameRef = useRef<number | null>(null);
+  const followTimelineLiveEndRef = useRef<() => void>(() => undefined);
   const cancelTimelineLiveFollowForUserNavigation = useCallback(() => {
     anchorUserScrollGenerationRef.current += 1;
     timelineScrollModeRef.current = "free-scrolling";
@@ -4172,6 +4178,11 @@ function ChatViewContent(props: ChatViewProps) {
           const scrollOffset = list.getState().scroll;
           void list.scrollToOffset({ offset: scrollOffset, animated: false });
           settledTimelineAnchorRef.current = messageId;
+          // Replies that arrived during the glide were not followed; follow them now rather
+          // than on the next one, which a reply that has finished never sends.
+          requestAnimationFrame(() => {
+            requestAnimationFrame(() => followTimelineLiveEndRef.current());
+          });
         };
         const fallbackTimer = window.setTimeout(finishAnimatedPositioning, 750);
         scrollNode.addEventListener("scrollend", finishAnimatedPositioning, { once: true });
@@ -4282,6 +4293,93 @@ function ChatViewContent(props: ChatViewProps) {
     });
   }, [getActiveTimelineTurnMetrics]);
 
+  // One pass of live following: reveals an anchored turn's end, or keeps the end in view. It
+  // waits while a sent row is still being positioned, which then runs it once it settles.
+  const followTimelineLiveEnd = useCallback(() => {
+    if (liveFollowUserScrollGenerationRef.current !== anchorUserScrollGenerationRef.current) {
+      return;
+    }
+    if (pendingTimelineAnchorRef.current !== null) {
+      return;
+    }
+    if (
+      positionedTimelineAnchorRef.current !== null &&
+      settledTimelineAnchorRef.current !== positionedTimelineAnchorRef.current
+    ) {
+      return;
+    }
+    const list = legendListRef.current;
+    if (!list) {
+      return;
+    }
+
+    if (timelineScrollModeRef.current === "anchoring-new-turn") {
+      const metrics = getActiveTimelineTurnMetrics(list);
+      if (!metrics) {
+        return;
+      }
+      if (metrics.scrollDeltaToRevealEnd <= 1) {
+        return;
+      }
+
+      const nextOffset = list.getState().scroll + metrics.scrollDeltaToRevealEnd;
+      void list.scrollToOffset({ offset: nextOffset, animated: false });
+      // LegendList clamps a scroll to the content height it has laid out, which can lag the
+      // rows it has measured. A clamped scroll leaves the end hidden until the next delivery,
+      // so look again once layout has caught up, a few times at most, and stop if the reader
+      // takes over or a later send positions its own row.
+      const generation = anchorUserScrollGenerationRef.current;
+      const anchor = positionedTimelineAnchorRef.current;
+      const recheck = (remaining: number) => {
+        requestAnimationFrame(() => {
+          requestAnimationFrame(() => {
+            if (
+              anchorUserScrollGenerationRef.current !== generation ||
+              liveFollowUserScrollGenerationRef.current !== generation ||
+              timelineScrollModeRef.current !== "anchoring-new-turn" ||
+              pendingTimelineAnchorRef.current !== null ||
+              positionedTimelineAnchorRef.current !== anchor ||
+              (anchor !== null && settledTimelineAnchorRef.current !== anchor)
+            ) {
+              return;
+            }
+            const current = legendListRef.current;
+            const target = current ? getActiveTimelineTurnMetrics(current) : null;
+            if (!current || !target) {
+              return;
+            }
+            const scrollTop = current.getScrollableNode()?.scrollTop;
+            const reached = typeof scrollTop === "number" ? scrollTop : current.getState().scroll;
+            if (reached >= target.targetScrollToRevealEnd - 1) {
+              return;
+            }
+            void current.scrollToOffset({
+              offset: target.targetScrollToRevealEnd,
+              animated: false,
+            });
+            if (remaining > 1) {
+              recheck(remaining - 1);
+            }
+          });
+        });
+      };
+      recheck(TIMELINE_END_FOLLOW_RECHECKS);
+      return;
+    }
+
+    if (timelineScrollModeRef.current !== "following-end") {
+      return;
+    }
+    if (!timelineRealContentOverflowsViewport(list)) {
+      return;
+    }
+
+    void list.scrollToEnd?.({ animated: false });
+  }, [getActiveTimelineTurnMetrics, timelineRealContentOverflowsViewport]);
+  useLayoutEffect(() => {
+    followTimelineLiveEndRef.current = followTimelineLiveEnd;
+  }, [followTimelineLiveEnd]);
+
   // Follows the end after new timeline entries render; an empty timeline has nothing to follow.
   useEffect(() => {
     if (!activeThread?.id || timelineEntries.length === 0) {
@@ -4293,47 +4391,7 @@ function ChatViewContent(props: ChatViewProps) {
 
     let secondFrame: number | null = null;
     const frame = requestAnimationFrame(() => {
-      secondFrame = requestAnimationFrame(() => {
-        if (liveFollowUserScrollGenerationRef.current !== anchorUserScrollGenerationRef.current) {
-          return;
-        }
-        if (pendingTimelineAnchorRef.current !== null) {
-          return;
-        }
-        if (
-          positionedTimelineAnchorRef.current !== null &&
-          settledTimelineAnchorRef.current !== positionedTimelineAnchorRef.current
-        ) {
-          return;
-        }
-        const list = legendListRef.current;
-        if (!list) {
-          return;
-        }
-
-        if (timelineScrollModeRef.current === "anchoring-new-turn") {
-          const metrics = getActiveTimelineTurnMetrics(list);
-          if (!metrics) {
-            return;
-          }
-          if (metrics.scrollDeltaToRevealEnd <= 1) {
-            return;
-          }
-
-          const nextOffset = list.getState().scroll + metrics.scrollDeltaToRevealEnd;
-          void list.scrollToOffset({ offset: nextOffset, animated: false });
-          return;
-        }
-
-        if (timelineScrollModeRef.current !== "following-end") {
-          return;
-        }
-        if (!timelineRealContentOverflowsViewport(list)) {
-          return;
-        }
-
-        void list.scrollToEnd?.({ animated: false });
-      });
+      secondFrame = requestAnimationFrame(followTimelineLiveEnd);
     });
 
     return () => {
@@ -4342,12 +4400,59 @@ function ChatViewContent(props: ChatViewProps) {
         cancelAnimationFrame(secondFrame);
       }
     };
-  }, [
-    activeThread?.id,
-    timelineEntries,
-    getActiveTimelineTurnMetrics,
-    timelineRealContentOverflowsViewport,
-  ]);
+  }, [activeThread?.id, timelineEntries, followTimelineLiveEnd]);
+
+  // A row of the anchored turn that grows without a new entry, such as a diagram drawing in a
+  // reply taller than the timeline, changes layout the effect above never sees. When the turn's
+  // end was in view before the growth, one pass reveals it again; a row expanded away from the
+  // end keeps the reader's place.
+  const pendingTurnGrowthRef = useRef<{ growth: number; scrollTop: number } | null>(null);
+  const followGrownTurn = useCallback(
+    (grown: { readonly growth: number; readonly scrollTop: number }) => {
+      pendingTurnGrowthRef.current = null;
+      const list = legendListRef.current;
+      const metrics = list ? getActiveTimelineTurnMetrics(list) : null;
+      if (!list || !metrics) {
+        return;
+      }
+      const held = (list.getScrollableNode()?.scrollTop ?? grown.scrollTop) - grown.scrollTop;
+      if (metrics.scrollDeltaToRevealEnd - (grown.growth - held) > 1) {
+        return;
+      }
+      followTimelineLiveEndRef.current();
+    },
+    [getActiveTimelineTurnMetrics],
+  );
+  const onTimelineRowSizeChanged = useCallback(
+    (info: { readonly index: number; readonly previous: number; readonly size: number }) => {
+      const anchorIndex = activeTimelineAnchorIndexRef.current;
+      if (
+        timelineScrollModeRef.current !== "anchoring-new-turn" ||
+        anchorIndex === null ||
+        info.index < anchorIndex ||
+        info.size <= info.previous
+      ) {
+        return;
+      }
+      const pending = pendingTurnGrowthRef.current;
+      if (pending) {
+        pending.growth += info.size - info.previous;
+        return;
+      }
+      const next = {
+        growth: info.size - info.previous,
+        scrollTop: legendListRef.current?.getScrollableNode()?.scrollTop ?? 0,
+      };
+      pendingTurnGrowthRef.current = next;
+      // LegendList lays the rows out again after it reports their sizes, and scrolls by the
+      // growth of rows above the one it holds in place, which leaves the end where it was. That
+      // scroll can wait for a frame of LegendList's own, so look two frames on.
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => followGrownTurn(next));
+      });
+    },
+    [followGrownTurn],
+  );
 
   // Per-thread view state resets while rendering the newly active thread.
   const [viewStateThreadId, setViewStateThreadId] = useState(activeThreadId);
@@ -7235,6 +7340,7 @@ function ChatViewContent(props: ChatViewProps) {
                       anchorMessageId={timelineAnchorMessageId}
                       onAnchorReady={onTimelineAnchorReady}
                       onAnchorSizeChanged={onTimelineAnchorSizeChanged}
+                      onRowSizeChanged={onTimelineRowSizeChanged}
                       contentInsetEndAdjustment={composerOverlayHeight}
                       onIsAtEndChange={onIsAtEndChange}
                       onManualNavigation={cancelTimelineLiveFollowForUserNavigation}
