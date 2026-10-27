@@ -2292,8 +2292,14 @@ export function TerminalViewport({
       ) {
         return;
       }
-      terminal.focus();
       fulfilledFocusRequestIdRef.current = focusRequestId;
+      // Focusing the pane by using its own Activity panel must not pull focus
+      // back into the terminal: the panel keeps it, so Escape still collapses it.
+      const activityHost = containerRef.current?.parentElement?.querySelector(
+        "[data-provider-terminal-activity-host]",
+      );
+      if (activityHost?.contains(document.activeElement)) return;
+      terminal.focus();
     });
     return () => {
       focusGenerationRef.current += 1;

@@ -736,6 +736,7 @@ vi.mock("./activity/ActivityPanel", async (importOriginal) => {
 });
 
 import ChatView from "./ChatView";
+import { ActivityPanelBinding } from "./activity/ActivityPaneBinding";
 import type { Project, Thread } from "../types";
 import { useComposerDraftStore } from "../composerDraftStore";
 import { useRightPanelStore } from "../rightPanelStore";
@@ -1332,6 +1333,55 @@ describe("ChatView", () => {
       expect(props).toBeDefined();
       return props as ActivityPanelProps;
     };
+
+    it("offers no Stop in a terminal pane's panel, even when the provider claims cancellation", async () => {
+      const terminalScope: ActivityScopeRef = {
+        _tag: "terminal",
+        threadId,
+        terminalId: "terminal-activity-1",
+      };
+      const child = actor("terminal-actor", "Terminal observer");
+      const snapshot = activitySnapshot(terminalScope, [child], {
+        capabilities: {
+          actors: true,
+          attributedActivity: true,
+          backgroundWork: true,
+          historyRecovery: "bounded",
+          terminalObservation: true,
+          targetedActorCancellation: true,
+        },
+      });
+      seedActivityState(environmentId, terminalScope, snapshot);
+      seedActivityQueries(environmentId, snapshot, [child]);
+      vi.unstubAllGlobals();
+      Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+      const container = document.createElement("div");
+      document.body.append(container);
+      const root = createRoot(container);
+      try {
+        await act(async () => {
+          root.render(
+            <ActivityPanelBinding
+              target={{ environmentId, input: terminalScope }}
+              route={{ section: "subagents", selectedRecordKind: null, selectedRecordId: null }}
+              timestampFormat="locale"
+              onNavigate={() => undefined}
+              focusRequested={false}
+              onFocusRequestHandled={() => undefined}
+            />,
+          );
+          await Promise.resolve();
+        });
+        await vi.waitFor(() =>
+          expect(container.querySelector("[data-activity-panel]")).not.toBeNull(),
+        );
+        expect(latestActivityPanelProps().onCancelActor).toBeUndefined();
+        expect(latestActivityPanelProps().onRetryCancellation).toBeUndefined();
+      } finally {
+        await act(async () => root.unmount());
+        container.remove();
+      }
+    });
 
     it("binds server-fenced cancel and residual retry commands without reporting raw failures", async () => {
       const child = actor("actor-cancellable", "Cancellable reviewer");
