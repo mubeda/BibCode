@@ -94,7 +94,8 @@ DiagnosticLogsDownloadInput = Struct({
 
 DiagnosticLogsManifest = Struct({
   schemaVersion: Literal(1),
-  environmentId: EnvironmentId,
+  environmentId: EnvironmentId, // the server's self-declared id (often "local")
+  storageInstanceId: NullOr(TrimmedNonEmptyString),
   environmentLabel: TrimmedNonEmptyString,
   serverVersion: TrimmedNonEmptyString,
   platform: Struct({ os: String, arch: String }),
@@ -166,9 +167,13 @@ to the primary path: additive, and it is what criterion 2 asks for.
 
 The server's own label can differ from the name the user gave a saved remote
 profile. The manifest carries the server's label and id; the client's toast and
-errors use the client's label. The client also checks
-`manifest.environmentId` against the environment it asked: a mismatch fails the
-download with an error rather than saving another machine's logs.
+errors use the client's label. The client also checks the manifest against the
+verified descriptor of the connection it asked (`readPreparedConnection(id)
+.descriptor`), not against its own environment key: the client keys a remote by
+`remote:<storageInstanceId>` (`client-runtime/connection/onboarding.ts:127`)
+while every server declares itself `local`. The check compares
+`storageInstanceId` when the descriptor has one, else `environmentId`. A
+mismatch fails the download rather than saving another machine's logs.
 
 ## Client behaviour
 

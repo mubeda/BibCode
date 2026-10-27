@@ -30,8 +30,14 @@ server's identity, so even a correct bundle could not say where it came from.
    `DiagnosticBundleService::new`; write `manifest.json` first; slugged file
    name; `includes_crash_dumps` reflects the request. Failing tests first:
    manifest fields, slug (`"Local"`, `"ai-server"`, `"Mauro's Mac 🍎"`, empty,
-   60-char label), name passes the client regex.
-   Wire identity at `production/runtime.rs:419` from config (`:664`).
+   60-char label), name passes the client regex. Update the existing
+   integration tests that enumerate entries or match the name:
+   `apps/server/tests/diagnostic_bundle.rs` and
+   `apps/server/tests/production_http_routes.rs`. The desktop save validator
+   (`apps/desktop/src-tauri/src/bridge.rs:1601`) accepts any plain `.zip`
+   name, so it needs no change.
+   Wire identity (including `storage_instance_id`) at
+   `production/runtime.rs:419` from config (`:664`).
 2. **Contracts** (`packages/contracts`). `diagnosticLogs` capability in
    `environment.ts`; `DiagnosticLogsDownloadInput`, `DiagnosticLogsManifest`,
    `DiagnosticLogsDownloadEvent`, `DiagnosticLogsError` (in `server.ts`, beside
@@ -67,6 +73,8 @@ server's identity, so even a correct bundle could not say where it came from.
    is, add that with its test. Tests in `downloadDiagnosticLogs.test.ts`:
    assembled bytes saved; byte-count mismatch, missing `Started`, id mismatch,
    oversize `byteLength`, mid-stream failure → named errors, nothing saved;
+   the identity check compares the manifest with the prepared connection's
+   descriptor (`storageInstanceId`, else `environmentId`), never the client key;
    primary still calls the HTTP executor.
 5. **UI** (`DiagnosticsSettings.tsx`, `ProfilerSection.tsx`,
    `routes/settings.diagnostics.tsx`). One resolved selection (route param →
