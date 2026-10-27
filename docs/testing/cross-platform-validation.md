@@ -2904,8 +2904,11 @@ sizes. Cover relevant:
   with that terminal tab focused (on Windows, where terminal status is not
   observed, it counts only under All Agents). Reload the window and confirm
   the Inbox, the tile and the highlighted agent come back. Disconnect the
-  remote server: the list says its agents may be missing or out of date, and
-  reconnecting removes the note and restores its agents' counts. Narrow the
+  remote server: the note names it as not connected and **Open Remote
+  Servers** opens that settings page; while it reconnects the note says so,
+  and once it is back the note goes and its agents' counts return. Select
+  several workspace cards in Environments, switch to Inbox and open an agent:
+  the multi-selection is gone. Narrow the
   panel to its minimum and confirm the switch shows icons whose tooltips name
   each view;
 - the **Environments | Repositories** switch: open one repository as a project
