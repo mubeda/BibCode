@@ -1,28 +1,30 @@
 import type { EnvironmentAvailabilityStatus } from "@bibcode/client-runtime/state/shell";
 import { useMemo } from "react";
 
+import { isDesktopLocalConnectionTarget } from "../../../connection/desktopLocal";
 import { useProjects, useThreadShells } from "../../../state/entities";
 import { useEnvironments } from "../../../state/environments";
 import { useEnvironmentShellSummary } from "../../../state/shell";
 import { useAgentLiveBranches } from "../../agents/useAgentLiveBranches";
 import { type AgentRow, buildAgentRows, resolveAgentCheckouts } from "../agentsSection.logic";
-import { useAgentsUnread } from "../useAgentsUnread";
-import type { InboxAgentRowFields } from "./agentRowContract";
-import { type InboxDataState, resolveInboxDataState } from "./inbox.logic";
-
-function isChatRow(row: InboxAgentRowFields): boolean {
-  return (row.terminalId ?? null) === null;
-}
+import {
+  type InboxDataState,
+  type InboxEnvironmentInfo,
+  type InboxPartialReason,
+  resolveInboxDataState,
+  resolveInboxPartialReason,
+} from "./inbox.logic";
 
 /**
  * Every agent row across connected environments, built as the Agents view
- * builds them (checkout live branches included), plus how complete they are.
- * The Inbox replaces the Agents nav row, so it also runs the unread detector;
- * terminal rows read their host's unread state and never feed it.
+ * builds them (checkout live branches included), plus how complete they are
+ * and, when they are not, why. Unread tracking is the left panel's
+ * `AgentsUnreadTracker`, which stays mounted across views.
  */
 export function useInboxAgentRows(): {
   readonly rows: ReadonlyArray<AgentRow>;
   readonly dataState: InboxDataState;
+  readonly partialReason: InboxPartialReason | null;
 } {
   const shells = useThreadShells();
   const projects = useProjects();
@@ -64,7 +66,26 @@ export function useInboxAgentRows(): {
     projects,
     shells,
   ]);
-  const chatRows = useMemo(() => rows.filter(isChatRow), [rows]);
-  useAgentsUnread(chatRows);
-  return { rows, dataState: resolveInboxDataState(shellSummary) };
+  const environmentById = useMemo(
+    () =>
+      new Map<string, InboxEnvironmentInfo>(
+        environments.map((environment) => [
+          environment.environmentId,
+          {
+            label: environment.label,
+            remote:
+              environment.entry.target._tag !== "PrimaryConnectionTarget" &&
+              !isDesktopLocalConnectionTarget(environment.entry.target),
+          },
+        ]),
+      ),
+    [environments],
+  );
+  const dataState = resolveInboxDataState(shellSummary);
+  const partialReason = useMemo(
+    () =>
+      dataState === "partial" ? resolveInboxPartialReason(shellSummary, environmentById) : null,
+    [dataState, environmentById, shellSummary],
+  );
+  return { rows, dataState, partialReason };
 }

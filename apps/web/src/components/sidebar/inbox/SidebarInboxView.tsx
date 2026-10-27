@@ -9,14 +9,17 @@ import {
 } from "../../../centerPanelStore";
 import { useSidebarWorkspaceMetaStore } from "../../../sidebarWorkspaceMetaStore";
 import { setActiveEnvironmentId } from "../../../state/entities";
+import { useThreadSelectionStore } from "../../../threadSelectionStore";
 import { buildThreadRouteParams, resolveThreadRouteRef } from "../../../threadRoutes";
 import { type InboxCategory, useUiStateStore } from "../../../uiStateStore";
 import { AgentsRow, type AgentsRowProps } from "../../agents/AgentsRow";
+import { Button } from "../../ui/button";
 import { SidebarContent, SidebarGroup, SidebarMenu, useSidebar } from "../../ui/sidebar";
 import { InboxCategoryTiles } from "./InboxCategoryTiles";
 import {
   INBOX_CATEGORIES,
   countInboxCategories,
+  describeInboxPartialReason,
   type InboxOpenTarget,
   isInboxRowCurrent,
   resolveInboxOpenTarget,
@@ -64,7 +67,7 @@ function focusInboxTarget(target: InboxOpenTarget): void {
 export function SidebarInboxView() {
   const navigate = useNavigate();
   const { isMobile, setOpenMobile } = useSidebar();
-  const { rows, dataState } = useInboxAgentRows();
+  const { rows, dataState, partialReason } = useInboxAgentRows();
   const persistedCategory = useUiStateStore((state) => state.inboxCategory);
   const setInboxCategory = useUiStateStore((state) => state.setInboxCategory);
   const markRead = useSidebarWorkspaceMetaStore((state) => state.markRead);
@@ -110,6 +113,11 @@ export function SidebarInboxView() {
       // A terminal row shows its host thread's unread state, so opening it reads the
       // host, as selecting the host's workspace card does.
       markRead(target.surface.kind === "terminal" ? scopedThreadKey(target.hostRef) : row.key);
+      // As thread navigation elsewhere in the panel: drop a multi-selection and
+      // anchor range selection at the opened thread.
+      const selection = useThreadSelectionStore.getState();
+      if (selection.selectedThreadKeys.size > 0) selection.clearSelection();
+      selection.setAnchor(scopedThreadKey(target.hostRef));
       setActiveEnvironmentId(target.hostRef.environmentId);
       focusInboxTarget(target);
       if (isMobile) setOpenMobile(false);
@@ -123,6 +131,8 @@ export function SidebarInboxView() {
 
   const label = INBOX_CATEGORIES.find((entry) => entry.id === category)?.label ?? "";
   const empty = EMPTY_STATES[category];
+  const partialNotice = partialReason === null ? null : describeInboxPartialReason(partialReason);
+  const partialAction = partialNotice?.action ?? null;
 
   return (
     <SidebarContent className="min-h-full gap-0" data-testid="sidebar-inbox-view">
@@ -131,10 +141,29 @@ export function SidebarInboxView() {
       </SidebarGroup>
       <SidebarGroup className="px-2 py-1">
         <div className="min-w-0" data-text-surface="card">
-          {dataState === "partial" ? (
-            <p className="px-2 pb-1.5 text-xs text-muted-foreground" data-testid="inbox-partial">
-              Some servers are not connected. Their agents may be missing or out of date.
-            </p>
+          {partialNotice !== null ? (
+            <div
+              className="flex flex-wrap items-center gap-x-2 gap-y-1 px-2 pb-1.5 text-xs text-muted-foreground"
+              data-testid="inbox-partial"
+            >
+              <span>{partialNotice.message}</span>
+              {partialAction !== null ? (
+                <Button
+                  size="xs"
+                  variant="ghost"
+                  onClick={() =>
+                    void navigate({
+                      to:
+                        partialAction.to === "remote-servers"
+                          ? "/settings/remote-servers"
+                          : "/settings/diagnostics",
+                    })
+                  }
+                >
+                  {partialAction.label}
+                </Button>
+              ) : null}
+            </div>
           ) : null}
           {dataState === "loading" ? (
             <p className="px-2 py-3 text-xs text-muted-foreground">Loading agents…</p>

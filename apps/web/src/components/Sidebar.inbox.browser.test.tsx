@@ -230,6 +230,30 @@ describe("Sidebar Inbox view", () => {
     expect(container!.querySelector('[data-testid="agents-nav-row"]')).not.toBeNull();
   });
 
+  it("marks a turn that settles in the same update as a view switch unread", async () => {
+    const turn = (state: "running" | "completed") =>
+      ({ turnId: "turn-1", state }) as unknown as EnvironmentThreadShell["latestTurn"];
+    const running = { ...workingThread, latestTurn: turn("running") };
+    h.state.threads = [running];
+    for (const [from, to] of [
+      ["environments", "inbox"],
+      ["inbox", "repositories"],
+    ] as const) {
+      h.spies.markUnread.mockClear();
+      h.state.threads = [running];
+      h.uiStore.setState({ sidebarView: from });
+      await renderSidebar();
+
+      h.state.threads = [
+        { ...running, latestTurn: turn("completed"), session: session("thread-working") },
+      ];
+      h.uiStore.setState({ sidebarView: to });
+      await renderSidebar();
+
+      expect(h.spies.markUnread).toHaveBeenCalledWith(threadKeyOf(workingThread));
+    }
+  });
+
   it("counts each tile, settles on Needs Attention, and filters by the picked tile", async () => {
     await renderSidebar();
     expect(tile("all").getAttribute("aria-label")).toBe("All Agents, 3 agents");
@@ -375,7 +399,9 @@ describe("Sidebar Inbox view", () => {
     h.state.threads = [doneThread];
     h.state.shellSummary = liveSummary([ENV_MAIN], [ENV_REMOTE]);
     await renderSidebar();
-    expect(container!.querySelector('[data-testid="inbox-partial"]')).not.toBeNull();
+    expect(container!.querySelector('[data-testid="inbox-partial"]')?.textContent).toBe(
+      "Remote is reconnecting, so its agents may be out of date.",
+    );
     expect(pressedTiles()).toEqual(["all"]);
     expect(h.uiStore.getState().inboxCategory).toBeNull();
 
@@ -386,5 +412,65 @@ describe("Sidebar Inbox view", () => {
     expect(h.uiStore.getState().inboxCategory).toBe("attention");
     expect(pressedTiles()).toEqual(["attention"]);
     expect(listedTitles()).toEqual(["Remote approval"]);
+  });
+
+  it("names the partial-data reason and offers its recovery path", async () => {
+    const notice = () => container!.querySelector('[data-testid="inbox-partial"]');
+    const action = () => notice()?.querySelector<HTMLButtonElement>("button") ?? null;
+
+    // Unreadable saved-server catalog, though every listed server is live.
+    h.state.shellSummary = {
+      ...liveSummary([ENV_MAIN]),
+      catalogHealth: { status: "recovery-required", message: "Saved servers unreadable" },
+      canShowEmptyProjects: false,
+    };
+    await renderSidebar();
+    expect(notice()?.textContent).toBe(
+      "Saved servers couldn't be read, so their agents aren't listed.Diagnostics",
+    );
+    await act(async () => action()!.click());
+    expect(h.spies.navigate).toHaveBeenCalledWith({ to: "/settings/diagnostics" });
+
+    // A disconnected remote server.
+    h.state.environments = [
+      environmentFixture({ environmentId: ENV_MAIN, label: "Main", connectionId: "primary" }),
+      environmentFixture({ environmentId: ENV_REMOTE, label: "Remote", connectionId: "remote" }),
+    ];
+    h.state.shellSummary = {
+      ...liveSummary([ENV_MAIN]),
+      desiredEnvironmentCount: 2,
+      canShowEmptyProjects: false,
+      statuses: [
+        { environmentId: ENV_MAIN, status: "live", hasSnapshot: true, error: null },
+        { environmentId: ENV_REMOTE, status: "unavailable", hasSnapshot: false, error: null },
+      ],
+    };
+    await renderSidebar();
+    expect(notice()?.textContent).toBe(
+      "Remote is not connected, so its agents may be missing or out of date.Open Remote Servers",
+    );
+    await act(async () => action()!.click());
+    expect(h.spies.navigate).toHaveBeenCalledWith({ to: "/settings/remote-servers" });
+  });
+
+  it("clears a thread multi-selection and re-anchors it when opening an agent", async () => {
+    h.selectionStore.setState({
+      selectedThreadKeys: new Set([threadKeyOf(approvalThread), threadKeyOf(workingThread)]),
+      anchorThreadKey: threadKeyOf(approvalThread),
+    });
+    h.uiStore.setState({ inboxCategory: "done" });
+    await renderSidebar();
+
+    const card = agentCard("Finished");
+    card.focus();
+    await act(async () => card.click());
+
+    expect(h.spies.clearSelection).toHaveBeenCalledTimes(1);
+    expect(h.spies.setAnchor).toHaveBeenCalledWith(threadKeyOf(doneThread));
+
+    h.spies.clearSelection.mockClear();
+    h.selectionStore.setState({ selectedThreadKeys: new Set<string>() });
+    await act(async () => agentCard("Finished").click());
+    expect(h.spies.clearSelection).not.toHaveBeenCalled();
   });
 });
