@@ -435,10 +435,12 @@ function setProjectFileSurfaceFlag(
  */
 const TIMELINE_END_FOLLOW_RECHECKS = 6;
 /**
- * How many measured landings a sent row gets once its glide stops, and how long each may wait:
- * LegendList holds a scroll up to 800 ms while rows settle and finishes it 100 ms later.
+ * How long a sent row's landing may keep measuring once its glide stops, how many landings it
+ * may ask for in that time, and how long each may wait: LegendList holds a scroll up to 800 ms
+ * while rows settle and finishes it 100 ms later.
  */
-const SENT_ROW_LANDING_ATTEMPTS = 2;
+const SENT_ROW_LANDING_MAX_MS = 2_000;
+const SENT_ROW_LANDING_ATTEMPTS = 20;
 const SENT_ROW_LANDING_ATTEMPT_MS = 1_000;
 
 /** The patched LegendList method that withdraws its scroll requests (see the patch). */
@@ -4192,12 +4194,15 @@ function ChatViewContent(props: ChatViewProps) {
   // Settles a sent row once its glide stops, on scrollend or a timer that can catch a slow
   // webview's glide still moving or not yet begun (#191). A turn taller than the view is pinned
   // where it is, since following then reveals its end. A turn that fits lands its row at its
-  // offset as measured on screen, and stays unsettled, with following waiting, until a bounded
-  // number of landings put it there; a reader who takes over, a later send or another thread
-  // ends the landing, and the takeover withdraws the landing LegendList may still hold.
+  // offset as measured on screen, and stays unsettled, with following waiting, until the row is
+  // within a pixel of it: each landing LegendList finishes, or clamps to content it has not laid
+  // out yet, is measured again once layout has caught up, for up to two seconds. A reader who
+  // takes over, a later send or another thread ends the landing, and the takeover withdraws the
+  // landing LegendList may still hold.
   const settleSentTimelineRow = useCallback(
     (messageId: MessageId) => {
       const generation = anchorUserScrollGenerationRef.current;
+      const startedAt = performance.now();
       const landing = () =>
         positionedTimelineAnchorRef.current === messageId &&
         settledTimelineAnchorRef.current !== messageId &&
@@ -4226,7 +4231,10 @@ function ChatViewContent(props: ChatViewProps) {
           turn && !turn.overflowsUsableViewport
             ? measureSentRowLanding(scrollNode, messageId)
             : undefined;
-        if (delta === undefined || delta === null || attempt > SENT_ROW_LANDING_ATTEMPTS) {
+        const outOfTime =
+          attempt > SENT_ROW_LANDING_ATTEMPTS ||
+          performance.now() - startedAt > SENT_ROW_LANDING_MAX_MS;
+        if (delta === undefined || delta === null || outOfTime) {
           if (attempt === 1) {
             // Stop the glide where it is; it would otherwise go on under the follow.
             trackTimelineScroll(
@@ -4252,7 +4260,10 @@ function ChatViewContent(props: ChatViewProps) {
           }
           next = true;
           window.clearTimeout(attemptTimer);
-          land(attempt + 1);
+          // Measure once the list has laid out what the landing scrolled to.
+          requestAnimationFrame(() => {
+            requestAnimationFrame(() => land(attempt + 1));
+          });
         };
         const attemptTimer = window.setTimeout(measureAgain, SENT_ROW_LANDING_ATTEMPT_MS);
         void Promise.resolve(request).then(measureAgain, measureAgain);
