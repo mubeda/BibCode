@@ -543,6 +543,11 @@ vi.mock("../state/activity", () => ({
     },
   },
 }));
+vi.mock("./activity/ActivityPaneBinding", () => ({
+  ActivityPanelBinding: (props: { readonly route: { readonly section: string } }) => (
+    <div data-activity-panel-stub={props.route.section} />
+  ),
+}));
 vi.mock("../state/server", () => ({
   serverEnvironment: { configValueAtom: () => "server-config" },
 }));
@@ -660,6 +665,7 @@ import ThreadTerminalPanel, {
   TerminalViewport,
 } from "./ThreadTerminalPanel";
 import { decodeTerminalLaunchCommand } from "../lib/terminalLaunchCommand";
+import { useCenterPanelStore } from "../centerPanelStore";
 import { openLink } from "~/browser/openLink";
 import { showFileOutsideWorkspaceNotice, showPreviewFailedNotice } from "~/browser/linkNotices";
 import { openFileInPreview } from "~/browser/openFileInPreview";
@@ -1458,6 +1464,77 @@ describe("TerminalViewport provider activity mount", () => {
 
     expect(testState.activityStateTargets).toEqual([]);
     expect(document.querySelector('[data-testid="activity-dock"]')).toBeNull();
+  });
+
+  it("restores a saved open panel once a delayed handshake proves observation, and keeps it through a reconnect", async () => {
+    useCenterPanelStore.setState({ byThreadKey: {}, activityPanes: {} });
+    useCenterPanelStore.getState().openTerminalPanel(THREAD_REF, "terminal-codex");
+    useCenterPanelStore
+      .getState()
+      .setActivityPaneExpanded(THREAD_REF, "terminal:terminal-codex", true, "subagents");
+    await publishTerminalAgentActivitySetting(ENVIRONMENT_ID, true);
+    testState.activityState = {
+      snapshot: Option.none(),
+      status: "synchronizing",
+      error: Option.none(),
+      recentEntries: new Map(),
+    };
+
+    const mounted = await mount(
+      <TerminalViewport
+        {...viewportProps({ terminalId: "terminal-codex", command: observedCommand() })}
+      />,
+    );
+    const host = () =>
+      mounted.container.querySelector('[data-provider-terminal-activity-host="terminal-codex"]');
+    expect(host()).not.toBeNull();
+    expect(host()?.querySelector("[data-activity-pane]")).toBeNull();
+
+    await publishActivitySnapshot(activitySnapshot("terminal-codex"));
+
+    expect(host()?.querySelector('[data-activity-pane-expanded="true"]')).not.toBeNull();
+    expect(host()?.querySelector("[data-activity-panel-stub]")).not.toBeNull();
+    const pane = host()?.querySelector("[data-activity-pane]");
+
+    await act(async () => {
+      testState.activityState = {
+        snapshot: Option.some(activitySnapshot("terminal-codex")),
+        status: "stale",
+        error: Option.none(),
+        recentEntries: new Map(),
+      };
+      for (const listener of testState.activityListeners) listener();
+    });
+
+    expect(host()?.querySelector("[data-activity-pane]")).toBe(pane);
+    expect(host()?.querySelector('[data-activity-status="stale"]')).not.toBeNull();
+    expect(host()?.querySelector("[data-activity-panel-stub]")).not.toBeNull();
+  });
+
+  it("shows no card for an empty terminal snapshot even when the pane was saved open", async () => {
+    useCenterPanelStore.setState({ byThreadKey: {}, activityPanes: {} });
+    useCenterPanelStore.getState().openTerminalPanel(THREAD_REF, "terminal-codex");
+    useCenterPanelStore
+      .getState()
+      .setActivityPaneExpanded(THREAD_REF, "terminal:terminal-codex", true, "subagents");
+    await publishTerminalAgentActivitySetting(ENVIRONMENT_ID, true);
+    await publishActivitySnapshot(
+      activitySnapshot("terminal-codex", {
+        counts: {
+          subagents: { active: 0, done: 0 },
+          backgroundTasks: { active: 0, done: 0 },
+        },
+        actors: [],
+      }),
+    );
+
+    const mounted = await mount(
+      <TerminalViewport
+        {...viewportProps({ terminalId: "terminal-codex", command: observedCommand() })}
+      />,
+    );
+
+    expect(mounted.container.querySelector("[data-activity-pane]")).toBeNull();
   });
 
   it("mounts a correlated provider dock in the exact terminal viewport", async () => {

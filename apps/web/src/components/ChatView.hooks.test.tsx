@@ -3026,31 +3026,6 @@ describe("ChatView right panel handlers", () => {
     expect(controls).not.toHaveProperty("terminalAvailable");
   });
 
-  it("opens Files with one layout-control click when a sibling chat suppresses host Activity", () => {
-    const siblingThreadId = ThreadId.make("thread-sibling-suppressed-activity");
-    seedConnectedServerThread();
-    seedServerThread(makeThread({ id: siblingThreadId, title: "Sibling thread" }));
-    useRightPanelStore.getState().openActivity(threadRef, "subagents", { _tag: "thread" });
-    useCenterPanelStore.getState().openChatPanel(threadRef, siblingThreadId, "Codex");
-    publishSeededStoreState(useRightPanelStore);
-    publishSeededStoreState(useCenterPanelStore);
-
-    renderServerRoute();
-    const controls = capturedProps("panelLayoutControls");
-    expect(controls["rightPanelOpen"]).toBe(false);
-
-    (controls["onToggleRightPanel"] as () => void)();
-
-    const panelState = useRightPanelStore.getState().byThreadKey[threadKey];
-    expect(panelState?.isOpen).toBe(true);
-    expect(panelState?.activeSurfaceId).toBe("files");
-    expect(panelState?.surfaces.map((surface) => surface.kind)).toEqual(["activity", "files"]);
-
-    publishSeededStoreState(useRightPanelStore);
-    renderServerRoute();
-    expect(capturedProps("panelLayoutControls")["rightPanelOpen"]).toBe(true);
-  });
-
   it("maximizes the inline right panel via the maximize control", () => {
     seedConnectedServerThread();
     useRightPanelStore.getState().open(threadRef, "plan");
