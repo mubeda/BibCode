@@ -27,34 +27,26 @@ Branch: `claude/b3-activity-inline`, from `origin/develop` at `27702287cc`.
 
 ## Changes, in commit order
 
+Every commit typechecks on its own. The right-panel surface is removed (step 4)
+only after nothing references it (steps 2 and 3).
+
 ### 1. Persisted pane state
 
 - Add `components/activity/activityPaneState.ts`. It holds the route
   normalizers moved from `rightPanelStore.ts`.
 - In `centerPanelStore.ts`, add the `activityPanes` root field and its two
   actions. Prune entries on surface and thread removal. Bump the storage
-  version from 3 to 4, with a migration.
+  version from 3 to 4, with a migration. Add a `merge` that normalizes
+  `activityPanes` on every hydration, which the store lacks today.
 - Tests in `centerPanelStore.test.ts`:
   - migrating version 3 to 4;
+  - a same-version hydration with a corrupt entry, which `merge` sanitizes;
   - malformed entries;
   - pruning on each removal path;
   - a stale navigation being a no-op;
   - nothing persisted for default panes.
 
-### 2. Right-panel surface removal and migration
-
-- `rightPanelStore.ts`:
-  - Remove the kind, its type, actions, focus requests, and selector.
-  - Bump the storage version from 10 to 11.
-  - When the persisted active surface was `activity`, set `isOpen = false` and
-    make the first remaining surface active.
-- `RightPanelTabs.tsx`: remove the `activity` cases.
-- Tests in `rightPanelStore.test.ts`:
-  - Delete the activity-action cases (lines 122–368).
-  - Rewrite line 915 as migration cases: Activity was the only surface;
-    Activity was active among others; Activity was inactive among others.
-
-### 3. `ActivityPane` and the dock as a toggle
+### 2. `ActivityPane` and the dock as a toggle
 
 - Move the bindings and `useBoundedActivityQuery` out of `ChatView.tsx` into
   `components/activity/ActivityPaneBinding.tsx`.
@@ -83,7 +75,7 @@ Branch: `claude/b3-activity-inline`, from `origin/develop` at `27702287cc`.
     persisted terminal scope" case with "expands inline; the right panel is
     untouched".
 
-### 4. ChatView and terminal mounts (needs the ChatView ownership grant)
+### 3. ChatView and terminal mounts (needs the ChatView ownership grant)
 
 - `ChatView.tsx`:
   - Delete the right-panel activity plumbing (design section 4, item 1).
@@ -91,6 +83,9 @@ Branch: `claude/b3-activity-inline`, from `origin/develop` at `27702287cc`.
     pane key (`chat:host`, or `chat:<threadId>` for panels).
   - Gate the host on its surface being visible, which replaces
     `siblingChatOwnsCenter`.
+  - Add `ChatViewPanelProps.activityPaneHostRef`, passed from
+    `LiveCenterPanelWorkspace` at about line 1422. This keys panel chats
+    under the host thread.
   - Leave follow and scroll code untouched.
 - `ThreadTerminalPanel.tsx:2399`: the host stays. It passes the pane key
   through `ProviderTerminalActivityDock`.
@@ -123,6 +118,19 @@ Branch: `claude/b3-activity-inline`, from `origin/develop` at `27702287cc`.
   - `ChatView.hooks.test.tsx:~3030`: drop the `openActivity` setup.
   - `ActivitySurfaces.test.tsx`: drop the `RightPanelSheet` wrapper. Cover the
     panel inside the pane card.
+
+### 4. Right-panel surface removal and migration
+
+- `rightPanelStore.ts`:
+  - Remove the kind, its type, actions, focus requests, and selector.
+  - Bump the storage version from 10 to 11.
+  - When the persisted active surface was `activity`, set `isOpen = false` and
+    make the first remaining surface active.
+- `RightPanelTabs.tsx`: remove the `activity` cases.
+- Tests in `rightPanelStore.test.ts`:
+  - Delete the activity-action cases (lines 122–368).
+  - Rewrite line 915 as migration cases: Activity was the only surface;
+    Activity was active among others; Activity was inactive among others.
 
 ### 5. Packaged end-to-end (`chat-activity-panel.e2e.ts`)
 
