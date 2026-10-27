@@ -275,10 +275,28 @@ With D2, a request is expired at the session transition that ends its turn:
   error/interrupted `hold`, `engine.rs:5295-5310`). The follow-ups stay queued
   until the user releases them.
 
-The drain behavior therefore matches today's, and it removes one held state: a
-`ready` session blocked forever by a request nobody can answer. No user work is
-sent that would not be sent after an answered approval, so no preserve-work
-prompt is needed (UI.md).
+The drain after a turn ends matches today's drain after an answered approval.
+
+**Correction found in implementation.** One case does differ from today:
+
+- **The case:** the turn ended `ready` while its request was still open. The
+  existing test `no_promotion_while_approval_or_user_input_pending` covered it.
+- **Before:** that queue stayed held until the user clicked the dead request.
+- **Now:** the request expires, and the queued follow-up is sent.
+
+Under UI.md this is a preserve-user-work question:
+
+- **Chosen: send.** The user queued the message to go "after this turn". The
+  turn is over, and no one is waiting on the request. Sending loses no work.
+  The work log's "Approval expired" says why the request closed.
+- **Rejected: hold.** The alternative was to add `ready`-with-expiry to the
+  commit's `hold`, so the user releases the queue manually. That keeps work
+  waiting on a card that cannot be answered.
+
+The test now pins the new behavior
+(`a_turn_ending_with_its_request_open_expires_it_and_then_drains_like_an_answer`).
+A request the provider raises while the session is `ready`, as OpenCode does
+for a recovered ask, still holds the queue.
 
 ### D3. One freshness clock and the `unknown` group (fixes F4, F6)
 
@@ -449,7 +467,21 @@ shown as Working or Done.
 - Activating a terminal row goes through the center-panel API
   (`terminal:${terminalId}`, `centerPanelStore.ts:533`).
 - The workspace card glyph takes the most urgent state among its chat and its
-  terminals, in the order blocked, waiting, working, done.
+  terminals, in this order:
+  1. approval
+  2. input
+  3. working
+  4. failed
+  5. plan ready
+  6. **unknown** (stale, unavailable or offline)
+  7. done
+  8. idle
+
+  Because unknown outranks done, an unobservable terminal never lets the card
+  read Done. A finished chat with a running Cursor terminal shows the
+  unavailable glyph. A terminal agent idle at its prompt counts as idle, so it
+  adds nothing to the card. In a disconnected environment, any card that
+  claims something reads offline.
 
 **Trust boundary (AGENTS.md).** Status rides the observers' existing boundaries
 and adds no new listener:
@@ -504,7 +536,7 @@ Compared with today:
 | Mounted threshold, card: a workspace card glyph moves from working to the unknown glyph at the threshold                                               | Sidebar card component test through the `useWorkspaceCardStatus` call site                                                                                      |
 | AgentsRow: no pulse in `unknown`, labels per reason, jump action omitted when no `onJumpToWorkspace`                                                  | New `AgentsRow.test.tsx`                                                                                                                                       |
 | D5 server, per provider: hook or status → `agentStatus` on `TerminalSummary`, and the metadata snapshot carries it with `ageMs`. Emitted with the activity setting off. Unavailable when unobserved. No prompt text. | `provider_terminal` unit tests; `apps/server/tests/production_server_terminal_rpc.rs`, `provider_terminal_supervisor.rs`                                         |
-| **Joined caller test**: a chat status and a terminal status are published, a client hydrates, the client reconnects (fresh snapshot), the client restarts (cached → offline → live), then grouping and card rendering | A web integration test driving the client-runtime shell and terminal-metadata states from a fake RPC session into the mounted `AgentsPage` and workspace card. The server half is covered by the `subscribeShell` (`shell_stream_coalesces_event_bursts` neighbourhood) and terminal-metadata RPC tests above. |
+| **Joined caller test**: a chat status and a terminal status are published, a client hydrates, the client reconnects (fresh snapshot), the client restarts (cached → offline → live), then grouping and card rendering | `apps/web/src/agentStatus.server.test.tsx` (opt-in: `BIBCODE_AGENT_STATUS_SERVER_BIN`). A real `bibcode serve` with a fake Codex app server publishes a question, and a Cursor AI Terminal reads unavailable. The test reads them over the authenticated WebSocket RPC, decodes them with the JSON codec, and renders the real `AgentsRow` and card glyph. It then reconnects (fresh snapshots) and restarts the server (the question expires, the row reads Failed). The observed terminal states are covered by `provider_terminal_supervisor.rs`. |
 
 ## 6. Documentation and runbooks
 
