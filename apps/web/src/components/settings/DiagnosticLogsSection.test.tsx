@@ -218,17 +218,26 @@ describe("DiagnosticLogsSection", () => {
     ]);
   });
 
-  it("switches the page's environment from its own picker", async () => {
-    const omarchy = fakeEnvironment("Omarchy");
-    h.environments = [h.primary!, omarchy];
+  it("has no picker of its own: the Profiler section's picker sets the page's environment", async () => {
+    h.environments = [h.primary!, fakeEnvironment("Omarchy")];
     const container = await render();
 
-    await act(async () => {
-      h.selectProps!.onValueChange(omarchy.environmentId);
-    });
+    expect(container.querySelector("[data-select]")).toBeNull();
+    expect(container.querySelector('button[aria-label="Environment"]')).toBeNull();
+  });
 
-    expect(h.selections).toEqual([omarchy.environmentId]);
-    expect(descriptionOf(container)).toContain("from Omarchy.");
+  it("targets a disconnected primary, never a connected remote, when none is chosen", async () => {
+    h.primary = fakeEnvironment("Work Server", { phase: "disconnected", diagnosticLogs: false });
+    h.environments = [h.primary, fakeEnvironment("Omarchy")];
+    const container = await render();
+
+    expect(descriptionOf(container)).toContain("from Work Server.");
+    expect(downloadButton(container).disabled).toBe(true);
+    expect(statusOf(container)).toBe(
+      "Work Server is not connected. Reconnect it to download its logs.",
+    );
+    await click(downloadButton(container));
+    expect(h.downloadCalls).toEqual([]);
   });
 
   it("explains, and refuses, a server too old to send its logs", async () => {
@@ -246,10 +255,28 @@ describe("DiagnosticLogsSection", () => {
     expect(h.downloadCalls).toEqual([]);
   });
 
+  it.each(["connecting", "reconnecting", "available"])(
+    "waits, without asking to reconnect, while the chosen one is %s",
+    async (phase) => {
+      const connecting = fakeEnvironment("Omarchy", { phase });
+      h.environments = [h.primary!, connecting];
+      const container = await render(connecting.environmentId);
+
+      expect(downloadButton(container).disabled).toBe(true);
+      expect(statusOf(container)).toBe(
+        "Omarchy is still connecting. Download its logs once it is connected.",
+      );
+      await click(downloadButton(container));
+      expect(h.downloadCalls).toEqual([]);
+    },
+  );
+
   it("never downloads another environment while the chosen one is not connected", async () => {
-    const connecting = fakeEnvironment("Omarchy", { phase: "connecting" });
-    h.environments = [h.primary!, connecting];
-    const container = await render(connecting.environmentId);
+    // Still listed while the catalog loads, so the page keeps the choice.
+    h.catalogReady = false;
+    const disconnected = fakeEnvironment("Omarchy", { phase: "disconnected" });
+    h.environments = [h.primary!, disconnected];
+    const container = await render(disconnected.environmentId);
 
     expect(downloadButton(container).disabled).toBe(true);
     expect(statusOf(container)).toBe(

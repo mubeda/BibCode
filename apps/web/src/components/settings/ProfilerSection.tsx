@@ -216,7 +216,7 @@ export function ProfilerSection({
       environment.environmentId !== primaryEnvironment?.environmentId ? (
         <SettingsRow
           title="Environment"
-          description="Choose which environment's profiler to view and control."
+          description="Choose which environment's profiler and diagnostic logs this page shows."
           status={
             waitingFor === undefined
               ? null
