@@ -30,7 +30,10 @@ use crate::{
         AttributionKind, AttributionScope, NativeProcessSampler, ProcessAttributionRegistry,
         ProcessRegistration, ProcessRegistrationError, ProcessRegistrationMetadata,
         RegistrationSource,
-        profiler::exits::{self, Exited, Watch},
+        profiler::{
+            exits::{self, Exited, Watch},
+            redact::redact_path,
+        },
     },
     orchestration::{
         ProviderTurnDelivery, TurnDeliveryMode, TurnDeliveryState, TurnDeliveryTransition,
@@ -364,6 +367,12 @@ impl ProviderDeliveryHandle {
 
 pub trait ProviderDriver: Send + Sync {
     fn start(&self) -> BoxRuntimeFuture<'_, Result<StartedSession, ProviderRuntimeError>>;
+    /// Whether `start`'s activity capabilities are all this process will report. When false, a
+    /// startup `ActivityCapabilities::none()` means "not known yet": a restarted session keeps
+    /// what its previous process reported until the new one reports its own.
+    fn startup_activity_capabilities_are_final(&self) -> bool {
+        false
+    }
     fn send(
         &self,
         text: String,
@@ -1041,11 +1050,16 @@ impl ProviderActivityLifecycleState {
         self.live_work_item_ids.clear();
     }
 
+    /// A provisional startup `none()` keeps capabilities a previous process reported at runtime;
+    /// a final one (see `ProviderDriver::startup_activity_capabilities_are_final`) replaces them,
+    /// so a process without activity reporting never inherits a live section.
     fn apply_startup_capabilities(
         &mut self,
         startup_capabilities: ActivityCapabilities,
+        startup_is_final: bool,
     ) -> ActivityCapabilities {
-        if !self.runtime_observed_capabilities
+        if startup_is_final
+            || !self.runtime_observed_capabilities
             || startup_capabilities != ActivityCapabilities::none()
         {
             self.capabilities = startup_capabilities;
@@ -8214,7 +8228,10 @@ async fn launch_session(
         let effective_activity_capabilities = activity_lifecycle
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .apply_startup_capabilities(started.activity_capabilities.clone());
+            .apply_startup_capabilities(
+                started.activity_capabilities.clone(),
+                driver.startup_activity_capabilities_are_final(),
+            );
         if let Err(error) = ensure_live_activity_scope(
             activity,
             &request,
@@ -12549,6 +12566,21 @@ async fn spawn_child(
     spawn_child_after_spawn(request, args, pipe_output, attribution, |_| async {}).await
 }
 
+/// The environment a provider launch adds to the server's: the request's variables, then the
+/// open-url session's, whose `PATH` prefixes the request's. The executable is resolved on its
+/// `PATH`, so a probe that must find the same executable derives its environment here too.
+fn provider_launch_environment(request: &ProviderLaunchRequest) -> Vec<(OsString, OsString)> {
+    let mut request_environment = Cow::Borrowed(&request.environment);
+    if let Some(open_url) = request.open_url.as_ref() {
+        open_url.apply(request_environment.to_mut());
+    }
+    normalize_provider_environment(
+        request_environment
+            .iter()
+            .map(|(name, value)| (OsStr::new(name), OsStr::new(value))),
+    )
+}
+
 async fn spawn_child_after_spawn<F, Fut>(
     request: &ProviderLaunchRequest,
     args: &[String],
@@ -12561,15 +12593,7 @@ where
     Fut: Future<Output = ()>,
 {
     let provider = request.provider.clone();
-    let mut request_environment = Cow::Borrowed(&request.environment);
-    if let Some(open_url) = request.open_url.as_ref() {
-        open_url.apply(request_environment.to_mut());
-    }
-    let environment = normalize_provider_environment(
-        request_environment
-            .iter()
-            .map(|(name, value)| (OsStr::new(name), OsStr::new(value))),
-    );
+    let environment = provider_launch_environment(request);
     let executable = resolve_provider_executable_with_environment(
         &request.binary_path,
         environment
@@ -15719,12 +15743,40 @@ pub struct ClaudeActivitySupport {
 /// and one that does not ignores it under `--version` and exits 0.
 const CLAUDE_THINKING_DISPLAY_PROBE_VALUE: &str = "bibcode-probe";
 
+/// Which Claude a probe answer belongs to. The probe runs `resolved`, the path the launch
+/// runs; the identity fields describe its canonical target, `executable`.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct ClaudeProbeCacheKey {
+    resolved: PathBuf,
     executable: PathBuf,
     modified: Option<SystemTime>,
     length: u64,
     file_identity: Option<(u64, u64)>,
+    /// The launch's working directory, only for a shim (see `is_multi_call_shim`): its target
+    /// may pick a different Claude per directory.
+    shim_cwd: Option<PathBuf>,
+}
+
+impl ClaudeProbeCacheKey {
+    fn is_shim(&self) -> bool {
+        self.shim_cwd.is_some()
+    }
+}
+
+/// A link whose name differs from its target's, such as mise's `shims/claude` to
+/// `/usr/bin/mise`. A multi-call binary dispatches on that name and on its own configuration,
+/// so its target's identity does not tell which Claude answers. A link that only renames a
+/// directory (`/var` to `/private/var`) keeps the name and is no shim.
+fn is_multi_call_shim(resolved: &Path, canonical: &Path) -> bool {
+    resolved.file_name() != canonical.file_name()
+}
+
+/// What the probe runs Claude with: the launch's environment and working directory, since a
+/// shim can dispatch on either.
+#[derive(Clone, Debug)]
+struct ClaudeProbeContext {
+    environment: Arc<[(OsString, OsString)]>,
+    cwd: PathBuf,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -15858,6 +15910,17 @@ struct ClaudeProbeResult {
     support: ClaudeActivitySupport,
 }
 
+/// Why a probe gave no answer to cache.
+#[derive(Debug)]
+enum ClaudeProbeFailure {
+    /// A command failed, printed nothing, or ran out of time: `<argument> timed out` or
+    /// another reason.
+    Failed(String),
+    /// `--version` printed something other than a Claude Code version: another program
+    /// answered, such as a shim's own binary called by its real name.
+    Mismatch(String),
+}
+
 static CLAUDE_ACTIVITY_PROBE_CACHE: OnceLock<ClaudeActivityProbeCache> = OnceLock::new();
 
 fn production_claude_probe_cache() -> ClaudeActivityProbeCache {
@@ -15866,17 +15929,30 @@ fn production_claude_probe_cache() -> ClaudeActivityProbeCache {
         .clone()
 }
 
-async fn probe_claude_activity_support_with_environment<'a>(
+/// `environment` is the launch's, as `provider_launch_environment` derives it, and `cwd` the
+/// launch's working directory: the probe resolves and runs Claude as the launch will.
+async fn probe_claude_activity_support_with_environment(
     binary_path: &str,
-    environment: impl IntoIterator<Item = (&'a OsStr, &'a OsStr)>,
+    environment: Vec<(OsString, OsString)>,
+    cwd: PathBuf,
     resolution_gate: Option<ClaudeActivityProbeResolutionGate>,
     cache: ClaudeActivityProbeCache,
     launch_policy: ClaudeProbeLaunchPolicy,
 ) -> ClaudeActivitySupport {
     let binary_path = binary_path.to_owned();
-    let search_path = effective_provider_search_path(environment);
+    let search_path = effective_provider_search_path(
+        environment
+            .iter()
+            .map(|(name, value)| (name.as_os_str(), value.as_os_str())),
+    );
+    let context = ClaudeProbeContext {
+        environment: environment.into(),
+        cwd,
+    };
     tokio::spawn(async move {
         let deadline = Instant::now() + CLAUDE_ACTIVITY_PROBE_TIMEOUT;
+        let resolution_path = search_path.clone();
+        let resolution_cwd = context.cwd.clone();
         let resolution = tokio::time::timeout_at(
             deadline,
             tokio::task::spawn_blocking(move || {
@@ -15884,9 +15960,11 @@ async fn probe_claude_activity_support_with_environment<'a>(
                     resolution_gate.block();
                 }
                 let resolved =
-                    resolve_provider_executable_in_path(&binary_path, search_path.as_deref())?;
-                let executable = std::fs::canonicalize(&resolved).unwrap_or(resolved);
-                let metadata = std::fs::metadata(&executable).ok()?;
+                    resolve_provider_executable_in_path(&binary_path, resolution_path.as_deref())?;
+                // Only the key uses the canonical target: the probe runs what the launch runs.
+                let canonical =
+                    std::fs::canonicalize(&resolved).unwrap_or_else(|_| resolved.clone());
+                let metadata = std::fs::metadata(&canonical).ok()?;
                 #[cfg(unix)]
                 let file_identity = {
                     use std::os::unix::fs::MetadataExt;
@@ -15894,53 +15972,106 @@ async fn probe_claude_activity_support_with_environment<'a>(
                 };
                 #[cfg(not(unix))]
                 let file_identity = None;
-                Some((
-                    ClaudeProbeCacheKey {
-                        executable: executable.clone(),
-                        modified: metadata.modified().ok(),
-                        length: metadata.len(),
-                        file_identity,
-                    },
-                    executable,
-                ))
+                let shim_cwd = is_multi_call_shim(&resolved, &canonical).then_some(resolution_cwd);
+                Some(ClaudeProbeCacheKey {
+                    resolved,
+                    executable: canonical,
+                    modified: metadata.modified().ok(),
+                    length: metadata.len(),
+                    file_identity,
+                    shim_cwd,
+                })
             }),
         )
         .await
         .ok()
         .and_then(Result::ok)
         .flatten();
-        let Some((key, executable)) = resolution else {
+        let Some(key) = resolution else {
             return ClaudeActivitySupport::default();
         };
-        probe_resolved_claude_activity_support(key, executable, deadline, cache, launch_policy)
-            .await
+        probe_resolved_claude_activity_support(
+            key,
+            context,
+            search_path,
+            deadline,
+            cache,
+            launch_policy,
+        )
+        .await
     })
     .await
     .unwrap_or_default()
 }
 
+/// The ready answer for `key` at `version`, marked as just used.
+fn ready_claude_probe(
+    cache_state: &mut ClaudeProbeCacheState,
+    key: &ClaudeProbeCacheKey,
+    version: String,
+) -> Option<ClaudeActivitySupport> {
+    cache_state.tick = cache_state.tick.saturating_add(1);
+    let tick = cache_state.tick;
+    let versioned_key = ClaudeVersionedProbeKey {
+        executable: key.clone(),
+        version,
+    };
+    let ready = cache_state.ready.get_mut(&versioned_key)?;
+    ready.last_used = tick;
+    let support = ready.probe.support;
+    cache_state
+        .ready_versions
+        .insert(key.clone(), versioned_key.version);
+    Some(support)
+}
+
 async fn probe_resolved_claude_activity_support(
     key: ClaudeProbeCacheKey,
-    executable: PathBuf,
+    context: ClaudeProbeContext,
+    search_path: Option<OsString>,
     deadline: Instant,
     cache: ClaudeActivityProbeCache,
     launch_policy: ClaudeProbeLaunchPolicy,
 ) -> ClaudeActivitySupport {
-    let probed_executable = executable.clone();
+    // A shim keeps its identity when the Claude behind it changes, so a cached answer holds
+    // only while `--version` still prints the version it was probed at. A new version runs
+    // the whole probe again.
+    let current_version = if key.is_shim() && cache.lock().ready_versions.contains_key(&key) {
+        match run_claude_probe_command(
+            &key.resolved,
+            "--version",
+            deadline,
+            launch_policy,
+            &context,
+        )
+        .await
+        {
+            Ok(version) => Some(version),
+            Err(reason) => {
+                tracing::warn!(
+                    executable = %redact_path(&key.resolved.to_string_lossy()),
+                    reason = %reason,
+                    "launching Claude without activity flags: its shim did not confirm the \
+                     probed version; a later launch checks again"
+                );
+                return ClaudeActivitySupport::default();
+            }
+        }
+    } else {
+        None
+    };
     let mut receiver = {
         let mut cache_state = cache.lock();
-        cache_state.tick = cache_state.tick.saturating_add(1);
-        let tick = cache_state.tick;
-        if let Some(version) = cache_state.ready_versions.get(&key).cloned() {
-            let versioned_key = ClaudeVersionedProbeKey {
-                executable: key.clone(),
-                version,
-            };
-            if let Some(ready) = cache_state.ready.get_mut(&versioned_key) {
-                ready.last_used = tick;
-                return ready.probe.support;
+        let version = current_version
+            .clone()
+            .or_else(|| cache_state.ready_versions.get(&key).cloned());
+        if let Some(version) = version {
+            if let Some(support) = ready_claude_probe(&mut cache_state, &key, version) {
+                return support;
             }
-            cache_state.ready_versions.remove(&key);
+            if current_version.is_none() {
+                cache_state.ready_versions.remove(&key);
+            }
         }
         if let Some(in_flight) = cache_state.in_flight.get(&key) {
             in_flight.receiver.clone()
@@ -15959,16 +16090,25 @@ async fn probe_resolved_claude_activity_support(
                 },
             );
             let producer_cache = cache.clone();
+            let producer_key = key.clone();
+            // Launches that join this probe share its environment and directory: the first
+            // caller's. A shim's key carries the directory, so those agree where it matters.
             tokio::spawn(async move {
                 // Its own budget, not the launching caller's: see CLAUDE_ACTIVITY_PROBE_RUN_TIMEOUT.
                 let started = Instant::now();
                 let result = probe_claude_activity_support_uncached(
-                    &executable,
+                    &producer_key.resolved,
                     started + CLAUDE_ACTIVITY_PROBE_RUN_TIMEOUT,
                     launch_policy,
+                    &context,
                 )
                 .await;
-                log_claude_probe_outcome(&executable, &result, started.elapsed());
+                log_claude_probe_outcome(
+                    &producer_key,
+                    search_path.as_deref(),
+                    &result,
+                    started.elapsed(),
+                );
                 let result = result.ok().map(|result| ClaudeCachedProbe {
                     version: result.version,
                     support: result.support,
@@ -15976,7 +16116,7 @@ async fn probe_resolved_claude_activity_support(
                 let outcome = result
                     .clone()
                     .map_or(ClaudeProbeOutcome::Failed, ClaudeProbeOutcome::Supported);
-                finish_claude_probe(&producer_cache, key, id, result);
+                finish_claude_probe(&producer_cache, producer_key, id, result);
                 sender.send_replace(Some(outcome));
             });
             receiver
@@ -15994,7 +16134,7 @@ async fn probe_resolved_claude_activity_support(
             Ok(Ok(()))
         ) {
             tracing::warn!(
-                executable = %probed_executable.display(),
+                executable = %redact_path(&key.resolved.to_string_lossy()),
                 "launching Claude without activity flags: its activity probe has not finished; \
                  a later launch uses the probe's result"
             );
@@ -16003,19 +16143,42 @@ async fn probe_resolved_claude_activity_support(
     }
 }
 
+/// How much of another program's `--version` output a mismatch line keeps.
+const CLAUDE_PROBE_MISMATCH_LOG_LIMIT: usize = 256;
+
+/// `value` without secrets or the home directory, cut to `limit` bytes. Redaction runs first,
+/// so the cut never splits a secret the redactor would have recognised.
+fn redacted_probe_text(value: &str, limit: usize) -> String {
+    let mut redacted = redact_path(value);
+    let mut end = redacted.len().min(limit);
+    while !redacted.is_char_boundary(end) {
+        end -= 1;
+    }
+    redacted.truncate(end);
+    redacted
+}
+
 /// One line per probe run: what a launch without activity flags needs to explain itself.
+/// Paths are redacted, the search `PATH` included.
 fn log_claude_probe_outcome(
-    executable: &Path,
-    result: &Result<ClaudeProbeResult, String>,
+    key: &ClaudeProbeCacheKey,
+    search_path: Option<&OsStr>,
+    result: &Result<ClaudeProbeResult, ClaudeProbeFailure>,
     elapsed: Duration,
 ) {
     let elapsed_ms = elapsed.as_millis();
+    let executable = redact_path(&key.resolved.to_string_lossy());
+    let canonical = redact_path(&key.executable.to_string_lossy());
+    let search_path =
+        search_path.map_or_else(String::new, |path| redact_path(&path.to_string_lossy()));
     match result {
         Ok(probe) => {
             let supported =
                 probe.support.include_hook_events && probe.support.forward_subagent_text;
             tracing::info!(
-                executable = %executable.display(),
+                executable = %executable,
+                canonical = %canonical,
+                search_path = %search_path,
                 version = %probe.version,
                 elapsed_ms,
                 outcome = if supported { "supported" } else { "unsupported" },
@@ -16025,8 +16188,19 @@ fn log_claude_probe_outcome(
                 "Claude activity probe finished"
             );
         }
-        Err(reason) => tracing::warn!(
-            executable = %executable.display(),
+        Err(ClaudeProbeFailure::Mismatch(version)) => tracing::warn!(
+            executable = %executable,
+            canonical = %canonical,
+            search_path = %search_path,
+            version = %redacted_probe_text(version, CLAUDE_PROBE_MISMATCH_LOG_LIMIT),
+            elapsed_ms,
+            outcome = "mismatch",
+            "Claude activity probe found another program; the next launch probes again"
+        ),
+        Err(ClaudeProbeFailure::Failed(reason)) => tracing::warn!(
+            executable = %executable,
+            canonical = %canonical,
+            search_path = %search_path,
             elapsed_ms,
             outcome = if reason.ends_with("timed out") { "timed out" } else { "failed" },
             reason = %reason,
@@ -16091,16 +16265,44 @@ fn insert_claude_ready_probe(
     }
 }
 
+/// Whether `--version` printed a Claude Code version: `2.1.311 (Claude Code)`, or the bare
+/// `2.1.311` older builds print. Anything else, such as mise's
+/// `2026.10.19 linux-x64 (2026-10-19)`, came from another program. Only the first line counts;
+/// the probe appends stderr after it.
+fn looks_like_claude_code_version(output: &str) -> bool {
+    let line = output.lines().next().unwrap_or_default().trim();
+    let (version, rest) = line
+        .split_once(char::is_whitespace)
+        .map_or((line, ""), |(version, rest)| (version, rest.trim()));
+    let release = version.split(['-', '+']).next().unwrap_or_default();
+    let mut parts = release.split('.');
+    let numeric = (0..3).all(|_| {
+        parts
+            .next()
+            .is_some_and(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+    }) && parts.next().is_none();
+    numeric && (rest.is_empty() || rest == "(Claude Code)")
+}
+
 /// Fails unless both commands answer: a `--help` that fails or runs out of time says nothing about
-/// the flags, and caching it as "unsupported" would downgrade every later launch.
+/// the flags, and caching it as "unsupported" would downgrade every later launch. Neither may
+/// another program's answer, so a `--version` that is not Claude Code's stops the probe.
 async fn probe_claude_activity_support_uncached(
     executable: &Path,
     deadline: Instant,
     launch_policy: ClaudeProbeLaunchPolicy,
-) -> Result<ClaudeProbeResult, String> {
+    context: &ClaudeProbeContext,
+) -> Result<ClaudeProbeResult, ClaudeProbeFailure> {
     let version =
-        run_claude_probe_command(executable, "--version", deadline, launch_policy).await?;
-    let help = run_claude_probe_command(executable, "--help", deadline, launch_policy).await?;
+        run_claude_probe_command(executable, "--version", deadline, launch_policy, context)
+            .await
+            .map_err(ClaudeProbeFailure::Failed)?;
+    if !looks_like_claude_code_version(&version) {
+        return Err(ClaudeProbeFailure::Mismatch(version));
+    }
+    let help = run_claude_probe_command(executable, "--help", deadline, launch_policy, context)
+        .await
+        .map_err(ClaudeProbeFailure::Failed)?;
     let has_exact_flag =
         |expected: &str| help.split_ascii_whitespace().any(|token| token == expected);
     let fork_session_id = crate::provider::claude::model::supports(
@@ -16108,7 +16310,9 @@ async fn probe_claude_activity_support_uncached(
         super::agent_sessions_rpc::COPY_MINIMUM_CLAUDE_VERSION,
     ) && has_exact_flag("--fork-session");
     let thinking_display =
-        probe_claude_thinking_display(executable, deadline, launch_policy).await?;
+        probe_claude_thinking_display(executable, deadline, launch_policy, context)
+            .await
+            .map_err(ClaudeProbeFailure::Failed)?;
     Ok(ClaudeProbeResult {
         version,
         support: ClaudeActivitySupport {
@@ -16130,6 +16334,7 @@ async fn probe_claude_thinking_display(
     executable: &Path,
     deadline: Instant,
     launch_policy: ClaudeProbeLaunchPolicy,
+    context: &ClaudeProbeContext,
 ) -> Result<bool, String> {
     let output = run_claude_probe(
         executable,
@@ -16140,6 +16345,7 @@ async fn probe_claude_thinking_display(
         ],
         deadline,
         launch_policy,
+        context,
     )
     .await?;
     Ok(!output.success
@@ -16155,8 +16361,10 @@ async fn run_claude_probe_command(
     argument: &str,
     deadline: Instant,
     launch_policy: ClaudeProbeLaunchPolicy,
+    context: &ClaudeProbeContext,
 ) -> Result<String, String> {
-    let output = run_claude_probe(executable, &[argument], deadline, launch_policy).await?;
+    let output =
+        run_claude_probe(executable, &[argument], deadline, launch_policy, context).await?;
     if !output.success {
         return Err(format!("{argument} exited with {}", output.status));
     }
@@ -16172,13 +16380,14 @@ struct ClaudeProbeOutput {
     text: String,
 }
 
-/// Runs one supervised probe command and returns its exit status with its trimmed output.
-/// Only a timeout or a failed spawn is an error.
+/// Runs one supervised probe command with the launch's environment and working directory, and
+/// returns its exit status with its trimmed output. Only a timeout or a failed spawn is an error.
 async fn run_claude_probe(
     executable: &Path,
     arguments: &[&str],
     deadline: Instant,
     launch_policy: ClaudeProbeLaunchPolicy,
+    context: &ClaudeProbeContext,
 ) -> Result<ClaudeProbeOutput, String> {
     const CLEANUP_RESERVE: Duration = Duration::from_millis(400);
     let argument = arguments.join(" ");
@@ -16187,9 +16396,11 @@ async fn run_claude_probe(
     let mut command = tokio::process::Command::new(launch.program);
     command
         .args(launch.args)
+        .current_dir(&context.cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    command.envs(context.environment.iter().cloned());
     sanitize_provider_subprocess_environment(&mut command);
     let cancellation = CancellationToken::new();
     let remaining = deadline.saturating_duration_since(Instant::now());
@@ -16546,10 +16757,27 @@ impl ClaudeActivityProbeTestContext {
         )
     }
 
+    /// Probes as a launch with no environment of its own, in the test's working directory.
     pub async fn probe(&self, binary_path: &str) -> ClaudeActivitySupport {
+        let cwd = std::env::current_dir().unwrap_or_default();
+        self.probe_in(binary_path, &BTreeMap::new(), &cwd).await
+    }
+
+    /// Probes as a launch with `environment` and working directory `cwd` would.
+    pub async fn probe_in(
+        &self,
+        binary_path: &str,
+        environment: &BTreeMap<String, String>,
+        cwd: &Path,
+    ) -> ClaudeActivitySupport {
         probe_claude_activity_support_with_environment(
             binary_path,
-            std::iter::empty(),
+            normalize_provider_environment(
+                environment
+                    .iter()
+                    .map(|(name, value)| (OsStr::new(name), OsStr::new(value))),
+            ),
+            cwd.to_path_buf(),
             None,
             self.cache.clone(),
             test_claude_probe_launch_policy(),
@@ -16564,7 +16792,8 @@ impl ClaudeActivityProbeTestContext {
     ) -> ClaudeActivitySupport {
         probe_claude_activity_support_with_environment(
             binary_path,
-            std::iter::empty(),
+            Vec::new(),
+            std::env::current_dir().unwrap_or_default(),
             Some(resolution_gate),
             self.cache.clone(),
             test_claude_probe_launch_policy(),
@@ -16582,10 +16811,12 @@ impl ClaudeActivityProbeTestContext {
         for index in 0..count {
             let executable = PathBuf::from(format!("/bibcode-test/claude-cache-{index}"));
             let key = ClaudeProbeCacheKey {
+                resolved: executable.clone(),
                 executable,
                 modified: None,
                 length: u64::try_from(index).unwrap_or(u64::MAX),
                 file_identity: None,
+                shim_cwd: None,
             };
             insert_claude_ready_probe(
                 &mut cache,
@@ -16673,12 +16904,12 @@ impl ClaudeDriver {
             .environment
             .entry("CLAUDE_CODE_ENTRYPOINT".to_owned())
             .or_insert_with(|| "sdk-rust".to_owned());
+        // The launch's own environment and directory: `spawn_child` resolves and runs Claude
+        // with them, so the probe answers for the same executable.
         let support = probe_claude_activity_support_with_environment(
             &request.binary_path,
-            request
-                .environment
-                .iter()
-                .map(|(name, value)| (OsStr::new(name), OsStr::new(value))),
+            provider_launch_environment(&request),
+            request.cwd.clone(),
             None,
             probe_cache,
             probe_launch_policy,
@@ -17280,6 +17511,10 @@ impl ProviderDriver for ClaudeDriver {
                 },
             })
         })
+    }
+    /// The hook sink decides: without one this process reports no subagents at all.
+    fn startup_activity_capabilities_are_final(&self) -> bool {
+        true
     }
     fn send(
         &self,
@@ -20571,6 +20806,7 @@ done
 case "$1" in
   --version) printf '%s\n' '2.1.218'; exit 0;;
   --help) printf '%s\n' '--include-hook-events --forward-subagent-text'; exit 0;;
+  --thinking-display) exit 1;;
 esac
 [ -z "$BIBCODE_TEST_READY_FIFO" ] || printf '%s\n' ready > "$BIBCODE_TEST_READY_FIFO"
 while IFS= read -r line; do
@@ -20997,6 +21233,59 @@ done
         }
     }
 
+    #[test]
+    fn claude_probe_accepts_only_claude_code_version_output() {
+        for (output, expected) in [
+            ("2.1.311 (Claude Code)", true),
+            ("2.1.311", true),
+            ("2.1.311 (Claude Code)\nwarning on stderr", true),
+            ("2.2.0-beta.1 (Claude Code)", true),
+            // mise answering by its own name, as a canonicalized shim did (#195).
+            ("2026.10.19 linux-x64 (2026-10-19)", false),
+            ("2026.10.19 macos-arm64 (2026-10-19)", false),
+            ("glab version 1.114.0", false),
+            ("v2.1.311", false),
+            ("2.1", false),
+            ("", false),
+        ] {
+            assert_eq!(
+                super::looks_like_claude_code_version(output),
+                expected,
+                "{output:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_final_startup_none_replaces_capabilities_observed_at_runtime() {
+        let live = crate::activity::ActivityCapabilities {
+            actors: true,
+            attributed_activity: true,
+            ..crate::activity::ActivityCapabilities::none()
+        };
+        for (startup_is_final, expected) in [
+            (true, crate::activity::ActivityCapabilities::none()),
+            (false, live.clone()),
+        ] {
+            let mut lifecycle = super::ProviderActivityLifecycleState::new(live.clone());
+            lifecycle.observe_projected_batch(
+                &[super::ProviderActivityMutation::SetScope {
+                    capabilities: live.clone(),
+                    observation_state: crate::activity::ActivityObservationState::Live,
+                }],
+                &[],
+            );
+            assert_eq!(
+                lifecycle.apply_startup_capabilities(
+                    crate::activity::ActivityCapabilities::none(),
+                    startup_is_final,
+                ),
+                expected,
+                "final: {startup_is_final}"
+            );
+        }
+    }
+
     /// Which transcript exists decides how a Claude cursor launches (see `ClaudeLaunch`).
     #[test]
     fn claude_launches_follow_which_transcript_exists() {
@@ -21215,7 +21504,7 @@ done
     #[cfg(unix)]
     #[tokio::test]
     async fn a_copy_needs_a_probed_claude_code_that_takes_its_session_id() {
-        const OLD_FIXTURE: &str = "#!/bin/sh\ncase \"$1\" in\n  --version) printf '%s\\n' '2.0.72 (Claude Code)'; exit 0;;\n  --help) printf '%s\\n' '--fork-session --session-id'; exit 0;;\nesac\nprintf '%s\\n' \"$@\" > \"$BIBCODE_TEST_ARGUMENTS\"\ncat >/dev/null\n";
+        const OLD_FIXTURE: &str = "#!/bin/sh\ncase \"$1\" in\n  --version) printf '%s\\n' '2.0.72 (Claude Code)'; exit 0;;\n  --help) printf '%s\\n' '--fork-session --session-id'; exit 0;;\n  --thinking-display) exit 1;;\nesac\nprintf '%s\\n' \"$@\" > \"$BIBCODE_TEST_ARGUMENTS\"\ncat >/dev/null\n";
         const UNPROBED_FIXTURE: &str = "#!/bin/sh\ncase \"$1\" in\n  --version) exit 1;;\n  --help) printf '%s\\n' '--fork-session --session-id'; exit 0;;\nesac\nprintf '%s\\n' \"$@\" > \"$BIBCODE_TEST_ARGUMENTS\"\ncat >/dev/null\n";
         let copy = json!({"sessionId":"copy","forkedFrom":"source"});
         for (fixture, expected) in [
