@@ -1,4 +1,11 @@
+import {
+  DEFAULT_SERVER_SETTINGS,
+  ProviderInstanceId,
+  type ServerProvider,
+} from "@bibcode/contracts";
 import { describe, expect, it } from "vite-plus/test";
+
+import { buildProviderAgentActions } from "./chat/providerAgentActions";
 import {
   buildSmartRows,
   canReuseBranch,
@@ -8,6 +15,7 @@ import {
   getCreateWorktreeDisabled,
   githubWorkItemBranchName,
   parseGitHubWorkItem,
+  resolveDefaultAgentChoice,
   resolveWorktreeCreateInput,
   reuseBranchHint,
   sanitizeBranchName,
@@ -598,27 +606,135 @@ describe("getCreateWorktreeDisabled", () => {
     baseRefName: "main",
   };
 
+  const ready = { hasProject: true, hasAgent: true, resolution, isSubmitting: false };
+
   it("is disabled without a project", () => {
-    expect(getCreateWorktreeDisabled({ hasProject: false, resolution, isSubmitting: false })).toBe(
-      true,
-    );
+    expect(getCreateWorktreeDisabled({ ...ready, hasProject: false })).toBe(true);
+  });
+
+  it("is disabled until the project's server has an agent to start", () => {
+    expect(getCreateWorktreeDisabled({ ...ready, hasAgent: false })).toBe(true);
   });
 
   it("is disabled without a resolution", () => {
-    expect(
-      getCreateWorktreeDisabled({ hasProject: true, resolution: null, isSubmitting: false }),
-    ).toBe(true);
+    expect(getCreateWorktreeDisabled({ ...ready, resolution: null })).toBe(true);
   });
 
   it("is disabled while submitting", () => {
-    expect(getCreateWorktreeDisabled({ hasProject: true, resolution, isSubmitting: true })).toBe(
-      true,
+    expect(getCreateWorktreeDisabled({ ...ready, isSubmitting: true })).toBe(true);
+  });
+
+  it("is enabled when project, agent and resolution are present and not submitting", () => {
+    expect(getCreateWorktreeDisabled(ready)).toBe(false);
+  });
+});
+
+describe("resolveDefaultAgentChoice", () => {
+  function provider(instanceId: string, status: "ready" | "error" = "ready"): ServerProvider {
+    return {
+      instanceId: ProviderInstanceId.make(instanceId),
+      driver: instanceId,
+      enabled: true,
+      installed: true,
+      status,
+      availability: "available",
+      models: [],
+    } as unknown as ServerProvider;
+  }
+  const claude = { kind: "chat", instanceId: ProviderInstanceId.make("claudeAgent") } as const;
+  const remote = {
+    selection: claude,
+    environmentLabel: "Remote",
+    connection: "connected",
+    isPrimaryServer: false,
+  } as const;
+  const ready = buildProviderAgentActions(
+    [provider("codex"), provider("claudeAgent")],
+    DEFAULT_SERVER_SETTINGS,
+  );
+
+  it("waits, naming the server, while it is not connected even with a cached config", () => {
+    expect(
+      resolveDefaultAgentChoice({ ...remote, actions: ready, connection: "disconnected" }),
+    ).toEqual({
+      status: "disconnected",
+      action: null,
+      notice: "Remote is not connected. Create waits until it reconnects.",
+    });
+  });
+
+  it("waits while the server is connecting", () => {
+    expect(
+      resolveDefaultAgentChoice({ ...remote, actions: null, connection: "connecting" }),
+    ).toEqual({
+      status: "connecting",
+      action: null,
+      notice: "Connecting to Remote. Create waits until it connects.",
+    });
+  });
+
+  it("waits while a connected server's agents are unknown", () => {
+    expect(resolveDefaultAgentChoice({ ...remote, actions: null })).toEqual({
+      status: "loading",
+      action: null,
+      notice: "Loading this project's agents. Create waits until they arrive.",
+    });
+  });
+
+  it("says where to fix it when the server has no ready agent", () => {
+    const actions = buildProviderAgentActions(
+      [provider("codex", "error")],
+      DEFAULT_SERVER_SETTINGS,
+    );
+    expect(resolveDefaultAgentChoice({ ...remote, actions })).toEqual({
+      status: "unavailable",
+      action: null,
+      notice: "No agent is ready on Remote. Sign in to or enable one on that server.",
+    });
+    expect(
+      resolveDefaultAgentChoice({
+        ...remote,
+        actions,
+        environmentLabel: "Local",
+        isPrimaryServer: true,
+      }).notice,
+    ).toBe("No agent is ready on Local. Sign in to or enable one in Settings → Providers.");
+  });
+
+  it("uses the saved default without a notice", () => {
+    const choice = resolveDefaultAgentChoice({ ...remote, actions: ready });
+    expect(choice.status).toBe("ready");
+    expect(choice.action?.value).toBe("chat:claudeAgent");
+    expect(choice.notice).toBeNull();
+  });
+
+  it("names the reason when the saved default is present but not selectable", () => {
+    const actions = buildProviderAgentActions(
+      [provider("codex"), provider("claudeAgent", "error")],
+      DEFAULT_SERVER_SETTINGS,
+    );
+    const saved = actions.find((action) => action.value === "chat:claudeAgent");
+    expect(saved?.disabledReason).toBeTruthy();
+    const choice = resolveDefaultAgentChoice({ ...remote, actions });
+    expect(choice.action?.value).toBe("chat:codex");
+    expect(choice.notice).toBe(
+      `${saved?.label} is unavailable (${saved?.disabledReason}), so Codex is selected.`,
     );
   });
 
-  it("is enabled when project + resolution present and not submitting", () => {
-    expect(getCreateWorktreeDisabled({ hasProject: true, resolution, isSubmitting: false })).toBe(
-      false,
+  it("names the environment when the saved default is absent there", () => {
+    const actions = buildProviderAgentActions([provider("codex")], DEFAULT_SERVER_SETTINGS);
+    const choice = resolveDefaultAgentChoice({ ...remote, actions });
+    expect(choice.action?.value).toBe("chat:codex");
+    expect(choice.notice).toBe(
+      "Your default agent is not available on Remote, so Codex is selected.",
+    );
+  });
+
+  it("says this server when the environment has no label", () => {
+    const actions = buildProviderAgentActions([provider("codex")], DEFAULT_SERVER_SETTINGS);
+    expect(resolveDefaultAgentChoice({ ...remote, actions, environmentLabel: null }).notice).toBe(
+      "Your default agent is not available on this server, so Codex is selected.",
     );
   });
 });

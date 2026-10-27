@@ -151,6 +151,14 @@ instead.
 Use the project `+` action to create a worktree. The Create Worktree dialog has a
 permanent Name field, an optional Smart/GitHub/Branch **Create From** selector,
 an agent picker, advanced options, a Create more toggle, and Ctrl+Enter submit.
+The agent picker starts on **Settings → Agents → Default Agent**, including for
+a project on another server. That setting also chooses the agent of a newly
+added project's Main. If the project's server does not offer that agent, or it
+is not ready there, the picker starts on the first ready chat. A line under the
+picker names the reason, and it goes away when you pick an agent. **Create
+worktree** stays disabled until the project's server is connected, has sent its
+agents, and has one of them ready. Until then, the line says what it is waiting
+for. When no agent is ready, the line says where to sign in to or enable one.
 Selecting any branch suggests its name and shows **Reuse branch**. It is enabled and on by default
 for a free local branch; for a remote branch or a branch already checked out
 elsewhere it stays visible but disabled, with a note explaining that a new

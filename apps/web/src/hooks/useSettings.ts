@@ -13,6 +13,7 @@ import { useCallback, useMemo, useSyncExternalStore } from "react";
 import { useAtomValue } from "@effect/atom-react";
 import {
   DEFAULT_SERVER_SETTINGS,
+  type DefaultAgentSelection,
   type EnvironmentId,
   ServerSettings,
   type ServerSettingsPatch,
@@ -267,6 +268,16 @@ export function usePrimarySettings<T = UnifiedSettings>(
   selector?: (settings: UnifiedSettings) => T,
 ): T {
   return useMergedSettings(useAtomValue(primaryServerSettingsAtom), selector);
+}
+
+const selectDefaultAgent = (settings: UnifiedSettings) => settings.defaultAgent;
+
+/**
+ * Settings → Default Agent, the primary-server setting. It applies to projects on every server;
+ * each server's own agents decide whether it can start there.
+ */
+export function usePrimaryDefaultAgent(): DefaultAgentSelection {
+  return usePrimarySettings(selectDefaultAgent);
 }
 
 /**

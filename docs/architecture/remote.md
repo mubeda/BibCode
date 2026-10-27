@@ -544,6 +544,33 @@ and presents SSH as a first-class desktop option. BiBCode Connect relay rows
 remain part of the same tab. The **Share this host** tab owns exposure and
 pairing-code generation for the primary environment.
 
+Settings pages read and write the primary server's settings. Each remote server
+keeps its own persisted settings, and nothing in Settings edits those copies.
+**Default Agent** is therefore a primary-server setting for projects on every
+server. Create Worktree and Add Project read it through `usePrimaryDefaultAgent`
+and apply it to the project's own server. That server's provider list and
+provider settings decide which agents can start there.
+
+Create Worktree:
+
+- **Fallback:** when the default agent is unavailable on that server, the
+  dialog falls back to the first ready chat and says why.
+- **Waiting:** the dialog waits, and says why, until all of these hold. Waiting
+  avoids creating a thread whose provider runtime would reject the first launch.
+  - The server's connection phase is `connected`. A server whose session
+    dropped keeps its last config snapshot, so the phase is checked first.
+  - The server's config has arrived.
+  - At least one agent is ready on that server.
+
+Add Project never waits for an agent, because there is no picker to explain the
+wait and first-time users add a project before they sign in:
+
+- It still needs the server's config to read host information.
+- It opens Main on the default agent when it is ready on the server, and
+  otherwise on the first ready chat.
+- With no ready agent, it records the default agent's provider instance as the
+  project's model selection instead of a built-in Codex fallback.
+
 Hosted `/pair` parses and normalizes its destination once before rendering or
 network access. URLs with a non-empty username or password are rejected; the
 confirmation displays the normalized `URL.host`, including punycode and an

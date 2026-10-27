@@ -17,21 +17,25 @@ import {
   scopeThreadRef,
 } from "@bibcode/client-runtime/environment";
 import type { EnvironmentId, ScopedProjectRef } from "@bibcode/contracts";
-import {
-  DEFAULT_DEFAULT_AGENT_SELECTION,
-  DEFAULT_PROVIDER_INTERACTION_MODE,
-  DEFAULT_RUNTIME_MODE,
-  DEFAULT_SERVER_SETTINGS,
-  ProviderInstanceId,
-} from "@bibcode/contracts";
+import { DEFAULT_PROVIDER_INTERACTION_MODE, DEFAULT_RUNTIME_MODE } from "@bibcode/contracts";
 import { useNavigate } from "@tanstack/react-router";
-import { type KeyboardEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  type KeyboardEvent,
+  useCallback,
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 
+import { usePrimaryDefaultAgent } from "~/hooks/useSettings";
 import { cn } from "~/lib/utils";
 import { newCommandId, newThreadId } from "~/lib/utils";
 import { resolveProviderSessionSelectionForInstance } from "~/providerSessionSelection";
 import { useCenterPanelStore } from "~/centerPanelStore";
 import { useProjects, useServerConfigs } from "~/state/entities";
+import { useEnvironment, usePrimaryEnvironmentId } from "~/state/environments";
 import { useEnvironmentQuery } from "~/state/query";
 import { useAtomCommand } from "~/state/use-atom-command";
 import { vcsEnvironment } from "~/state/vcs";
@@ -46,7 +50,9 @@ import {
   getCreateWorktreeDisabled,
   githubWorkItemBranchName,
   parseGitHubWorkItem,
+  resolveDefaultAgentChoice,
   resolveWorktreeCreateInput,
+  type AgentServerConnection,
   reuseBranchHint,
   suggestNextAvailableBranchName,
   suggestWorktreeNameFromRef,
@@ -82,7 +88,6 @@ import { stackedThreadToast, toastManager } from "./ui/toast";
 import {
   buildProviderAgentActions,
   isProviderAgentActionSelectable,
-  resolveEffectiveProviderAgentAction,
 } from "./chat/providerAgentActions";
 import { ProviderInstanceIcon } from "./chat/ProviderInstanceIcon";
 
@@ -138,6 +143,9 @@ export function CreateWorktreeDialog({
 
   const projects = useProjects();
   const serverConfigs = useServerConfigs();
+  const defaultAgent = usePrimaryDefaultAgent();
+  const primaryEnvironmentId = usePrimaryEnvironmentId();
+  const agentNoticeId = useId();
 
   const [projectSelection, setProjectSelection] = useState<WorktreeProjectSelection>(() => ({
     projectRef: defaultProjectRef,
@@ -152,9 +160,9 @@ export function CreateWorktreeDialog({
   const [baseBranchOverride, setBaseBranchOverride] = useState("");
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [createMore, setCreateMore] = useState(false);
-  const [agentActionValue, setAgentActionValue] = useState<string | null>(null);
+  // The agent the user picked in this opening; null follows the Default Agent.
+  const [pickedAgentValue, setPickedAgentValue] = useState<string | null>(null);
   const [formError, setFormError] = useState<string | null>(null);
-  const agentSelectionTouchedRef = useRef(false);
   const previousOpenRef = useRef(false);
   // The project whose branches the Create From text names, set where the user types or picks it.
   const sourceProjectRef = useRef<ScopedProjectRef | null>(null);
@@ -248,7 +256,7 @@ export function CreateWorktreeDialog({
     previousOpenRef.current = open;
     if (!open) return;
     if (!wasOpen) {
-      agentSelectionTouchedRef.current = false;
+      setPickedAgentValue(null);
       setReuseSelectedBranch(false);
       setName(forgetAutomaticName);
       // Opening for a project other than the one whose branches the source names clears it, as
@@ -363,31 +371,71 @@ export function CreateWorktreeDialog({
     [mode, sourceText, refs],
   );
 
+  // The map omits an environment whose config has not arrived, such as one still connecting.
   const serverConfig = environmentId ? serverConfigs.get(environmentId) : undefined;
+  // The project's own server decides which agents exist; Settings decides which one is default.
   const agentActions = useMemo(
     () =>
-      serverConfig ? buildProviderAgentActions(serverConfig.providers, serverConfig.settings) : [],
+      serverConfig
+        ? buildProviderAgentActions(serverConfig.providers, serverConfig.settings)
+        : null,
     [serverConfig],
   );
   const selectableAgentActions = useMemo(
-    () => agentActions.filter(isProviderAgentActionSelectable),
+    () => agentActions?.filter(isProviderAgentActionSelectable) ?? [],
     [agentActions],
   );
-  const effectiveDefaultAgent = resolveEffectiveProviderAgentAction(
-    agentActions,
-    serverConfig?.settings.defaultAgent ?? DEFAULT_DEFAULT_AGENT_SELECTION,
+  // A server keeps its last config after its session drops, so its connection decides first.
+  const environment = useEnvironment(environmentId);
+  const connectionPhase = environment?.connection.phase;
+  const agentServerConnection: AgentServerConnection =
+    connectionPhase === "connected"
+      ? "connected"
+      : connectionPhase === "connecting"
+        ? "connecting"
+        : "disconnected";
+  const environmentLabel = environment?.label ?? serverConfig?.environment.label ?? null;
+  const defaultAgentChoice = useMemo(
+    () =>
+      resolveDefaultAgentChoice({
+        actions: agentActions,
+        selection: defaultAgent,
+        environmentLabel,
+        connection: agentServerConnection,
+        isPrimaryServer: environmentId !== null && environmentId === primaryEnvironmentId,
+      }),
+    [
+      agentActions,
+      agentServerConnection,
+      defaultAgent,
+      environmentId,
+      environmentLabel,
+      primaryEnvironmentId,
+    ],
   );
-
-  useEffect(() => {
-    if (!open) return;
-    const selectionAvailable = selectableAgentActions.some(
-      (action) => action.value === agentActionValue,
-    );
-    if (!agentSelectionTouchedRef.current || !selectionAvailable) {
-      agentSelectionTouchedRef.current = false;
-      setAgentActionValue(effectiveDefaultAgent?.value ?? null);
-    }
-  }, [agentActionValue, effectiveDefaultAgent, open, selectableAgentActions]);
+  const defaultAgentAction = defaultAgentChoice.action;
+  const pickedAgentAction =
+    pickedAgentValue === null
+      ? null
+      : (selectableAgentActions.find((action) => action.value === pickedAgentValue) ?? null);
+  // A connected server that no longer offers the pick drops it, so it never comes back unseen.
+  // While the server is away or its agents are unknown, the pick waits for them.
+  const pickIsGone =
+    pickedAgentValue !== null &&
+    pickedAgentAction === null &&
+    agentServerConnection === "connected" &&
+    agentActions !== null;
+  if (pickIsGone) setPickedAgentValue(null);
+  const selectedAgentAction =
+    defaultAgentAction === null ? null : (pickedAgentAction ?? defaultAgentAction);
+  // A waiting note always shows; a fallback note only describes an agent the user did not pick.
+  const followsDefault = pickedAgentValue === null || pickIsGone;
+  const agentNotice =
+    project === null
+      ? null
+      : defaultAgentChoice.status !== "ready" || followsDefault
+        ? defaultAgentChoice.notice
+        : null;
 
   const resolution = useMemo(
     () =>
@@ -421,6 +469,7 @@ export function CreateWorktreeDialog({
 
   const createDisabled = getCreateWorktreeDisabled({
     hasProject: project !== null,
+    hasAgent: selectedAgentAction !== null,
     resolution,
     isSubmitting,
   });
@@ -438,24 +487,18 @@ export function CreateWorktreeDialog({
       setFormError("Choose a project and enter a worktree name.");
       return;
     }
+    // The agent notice under the picker says why Create is waiting.
+    const selectedAction = selectedAgentAction;
+    if (!serverConfig || !selectedAction) return;
     setFormError(null);
     setIsSubmitting(true);
     const submit = async () => {
       const threadId = newThreadId();
-      const settings = serverConfig?.settings ?? DEFAULT_SERVER_SETTINGS;
-      const requestedAction = selectableAgentActions.find(
-        (action) => action.value === agentActionValue,
-      );
-      const selectedAction =
-        requestedAction ?? resolveEffectiveProviderAgentAction(agentActions, settings.defaultAgent);
-      const targetInstanceId =
-        selectedAction?.entry.instanceId ??
-        project.defaultModelSelection?.instanceId ??
-        ProviderInstanceId.make("codex");
+      // Model defaults belong to the server that runs the thread.
       const resolvedDefault = resolveProviderSessionSelectionForInstance({
-        instanceId: targetInstanceId,
-        providers: serverConfig?.providers ?? [],
-        settings,
+        instanceId: selectedAction.entry.instanceId,
+        providers: serverConfig.providers,
+        settings: serverConfig.settings,
         projectSelection: project.defaultModelSelection,
       });
       if (resolvedDefault.fallback) {
@@ -493,7 +536,7 @@ export function CreateWorktreeDialog({
         return;
       }
 
-      if (selectedAction?.kind === "terminal" && selectedAction.terminalAction.command !== null) {
+      if (selectedAction.kind === "terminal" && selectedAction.terminalAction.command !== null) {
         useCenterPanelStore
           .getState()
           .replaceMainWithTerminal(scopeThreadRef(environmentId, threadId), [], {
@@ -519,9 +562,7 @@ export function CreateWorktreeDialog({
     cwd,
     resolution,
     createManagedWorktree,
-    agentActionValue,
-    agentActions,
-    selectableAgentActions,
+    selectedAgentAction,
     serverConfig,
     createMore,
     resetForNextCreate,
@@ -717,41 +758,49 @@ export function CreateWorktreeDialog({
             ) : null}
           </div>
 
-          <label className="grid gap-1.5">
-            <span className="text-foreground text-xs font-medium">Agent</span>
-            <Select
-              modal={false}
-              value={agentActionValue ?? undefined}
-              onValueChange={(value) => {
-                agentSelectionTouchedRef.current = true;
-                setAgentActionValue(value as string);
-              }}
-              items={selectableAgentActions.map((action) => ({
-                value: action.value,
-                label: action.label,
-              }))}
-            >
-              <SelectTrigger aria-label="Agent">
-                <SelectValue placeholder="Select an agent" />
-              </SelectTrigger>
-              <SelectPopup>
-                <SelectGroup>
-                  <SelectGroupLabel>Agent</SelectGroupLabel>
-                  {selectableAgentActions.map((action) => (
-                    <SelectItem key={action.value} value={action.value}>
-                      <ProviderInstanceIcon
-                        driverKind={action.entry.driverKind}
-                        displayName={action.entry.displayName}
-                        accentColor={action.entry.accentColor}
-                        iconClassName="size-4"
-                      />
-                      {action.label}
-                    </SelectItem>
-                  ))}
-                </SelectGroup>
-              </SelectPopup>
-            </Select>
-          </label>
+          <div className="grid gap-1.5">
+            <label className="grid gap-1.5">
+              <span className="text-foreground text-xs font-medium">Agent</span>
+              <Select
+                modal={false}
+                value={selectedAgentAction?.value ?? undefined}
+                onValueChange={(value) => setPickedAgentValue(value as string)}
+                items={selectableAgentActions.map((action) => ({
+                  value: action.value,
+                  label: action.label,
+                }))}
+              >
+                <SelectTrigger
+                  aria-label="Agent"
+                  aria-describedby={agentNotice ? agentNoticeId : undefined}
+                >
+                  <SelectValue placeholder="Select an agent" />
+                </SelectTrigger>
+                <SelectPopup>
+                  <SelectGroup>
+                    <SelectGroupLabel>Agent</SelectGroupLabel>
+                    {selectableAgentActions.map((action) => (
+                      <SelectItem key={action.value} value={action.value}>
+                        <ProviderInstanceIcon
+                          driverKind={action.entry.driverKind}
+                          displayName={action.entry.displayName}
+                          accentColor={action.entry.accentColor}
+                          iconClassName="size-4"
+                        />
+                        {action.label}
+                      </SelectItem>
+                    ))}
+                  </SelectGroup>
+                </SelectPopup>
+              </Select>
+            </label>
+            {/* Outside the label, so a click on the note does not open the picker. */}
+            {agentNotice ? (
+              <p id={agentNoticeId} className="text-muted-foreground text-xs" role="status">
+                {agentNotice}
+              </p>
+            ) : null}
+          </div>
 
           <Collapsible open={showAdvanced} onOpenChange={setShowAdvanced}>
             <CollapsibleTrigger className="text-muted-foreground hover:text-foreground text-sm font-medium">
