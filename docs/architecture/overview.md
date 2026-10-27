@@ -3113,12 +3113,14 @@ view), or free scrolling.
   turn, binds with that turn.
 - **Withdrawn requests.** LegendList can hold an imperative scroll for up to
   800 ms while rows settle, clamps it to the content it has laid out, and a
-  wheel or key scroll does not cancel it. `ChatView` counts the scroll
-  requests it made that LegendList has not finished, and a takeover withdraws
-  them through `cancelScrollRequests()`, which
+  wheel or key scroll does not cancel it. Every takeover withdraws them
+  through `cancelScrollRequests()`, which
   `patches/@legendapp__list@3.3.10.patch` adds. It drops a request waiting for
   rows to settle and the completion checks and target of a scroll under way,
-  and it stops a glide the browser is still running where it is. During an
+  and it stops a glide the browser is still running where it is, and
+  LegendList's own keeping of the list at its end, including a pass queued for
+  the next frame after a row grew; with nothing under way it changes nothing.
+  During an
   animated scroll LegendList draws the rows offset by the adjustment it holds
   for rows that resized during it; the method commits that adjustment as a
   scroll by the same amount, so the content stays where the reader sees it
@@ -3127,11 +3129,15 @@ view), or free scrolling.
   a second time. A held request therefore never moves a reader who took over.
 - **Bottom region.** LegendList keeps the list at its end
   (`maintainScrollAtEnd`) only while the timeline follows it and no sent turn
-  is anchored (`resolveTimelineMaintainScrollAtEnd`). Once the reader scrolls
-  away, a change in the bottom region's height (the composer growing as they
-  type, an Activity card opening or closing above it) leaves the line they
-  read in place, even when the list sits within LegendList's end threshold or
-  the thread is shorter than the view.
+  is anchored (`resolveTimelineMaintainScrollAtEnd`). LegendList also scrolls
+  by the growth of its bottom inset whenever the list sits within its end
+  threshold, so while the reader is away `MessagesTimeline` lets the inset it
+  gives the list shrink with the bottom region but not grow, until they return
+  to the end. Once the reader scrolls away, a change in the bottom region's
+  height (the composer growing as they type, an Activity card opening or
+  closing above it) leaves the line they read in place, even when the list
+  sits within LegendList's end threshold or the thread is shorter than the
+  view.
 - **Released sent row.** A sent row the reader scrolled away from stays
   released until the next send or thread. LegendList reports the anchor ready
   again whenever the anchored end space changes size, once per delivery; a

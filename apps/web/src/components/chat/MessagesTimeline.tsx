@@ -580,6 +580,19 @@ export const MessagesTimeline = memo(function MessagesTimeline({
 
   // Stable renderItem — no closure deps. Row components read shared state
   // from TimelineRowCtx, which propagates through LegendList's memo.
+  // The bottom inset LegendList lays the list out with. It grows with the bottom region only
+  // while the timeline follows its end: LegendList scrolls by an inset's growth whenever the list
+  // sits within its end threshold, which would move a reader who scrolled away. While they are
+  // away it shrinks with the region but does not grow, until they return to the end.
+  const [listInsetEnd, setListInsetEnd] = useState(contentInsetEndAdjustment);
+  if (
+    followsEnd
+      ? listInsetEnd !== contentInsetEndAdjustment
+      : contentInsetEndAdjustment < listInsetEnd
+  ) {
+    setListInsetEnd(contentInsetEndAdjustment);
+  }
+
   // The list's ref, and the parent's word that it mounted or unmounted.
   const handleListRef = useCallback(
     (list: LegendListRef | null) => {
@@ -670,7 +683,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
                   initialScrollAtEnd
                   recycleItems={false}
                   {...(anchoredEndSpace ? { anchoredEndSpace } : {})}
-                  contentInsetEndAdjustment={contentInsetEndAdjustment}
+                  contentInsetEndAdjustment={listInsetEnd}
                   maintainScrollAtEnd={resolveTimelineMaintainScrollAtEnd({
                     anchored: !!anchoredEndSpace,
                     followsEnd,
