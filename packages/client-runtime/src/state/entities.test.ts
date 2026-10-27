@@ -550,6 +550,159 @@ describe("environment entity projections", () => {
     expect(harness.registry.get(detailAtom)).toMatchObject({ messages: edited });
   });
 
+  // The server orders messages by delivery and time, so a turn added while the client was away
+  // can land before messages the client already shows. Matching by position then took the resent
+  // copy of every later message, one more copy of the thread per changed reconnect (#96, #134).
+  it("keeps the identity of unchanged messages a resend moved to another position", () => {
+    const harness = makeHarness();
+    const ref = { environmentId: ENVIRONMENT_ID, threadId: THREAD_ID };
+    const messagesAtom = harness.threadDetails.messagesAtom(ref);
+    const message = (id: string, text: string): OrchestrationThread["messages"][number] => ({
+      id: MessageId.make(id),
+      role: "user",
+      text,
+      turnId: null,
+      streaming: false,
+      createdAt: "2026-06-01T00:00:00.000Z",
+      updatedAt: "2026-06-01T00:00:00.000Z",
+    });
+    const resend = (messages: OrchestrationThread["messages"]) =>
+      harness.registry.set(
+        harness.threadStateAtom(THREAD_ID),
+        AsyncResult.success<EnvironmentThreadState>({
+          data: Option.some(
+            JSON.parse(
+              JSON.stringify({
+                ...THREAD_SHELL,
+                deletedAt: null,
+                messages,
+                reasoning: [],
+                proposedPlans: [],
+                activities: [],
+                checkpoints: [],
+              }),
+            ) as OrchestrationThread,
+          ),
+          status: "live",
+          error: Option.none(),
+        }),
+      );
+
+    resend([message("a", "first"), message("b", "second")]);
+    const shown = harness.registry.get(messagesAtom);
+
+    resend([message("new", "inserted"), message("a", "first"), message("b", "second")]);
+    const moved = harness.registry.get(messagesAtom);
+    expect(moved).toHaveLength(3);
+    expect(moved[0]).toMatchObject({ id: "new", text: "inserted" });
+    expect(moved[1]).toBe(shown[0]);
+    expect(moved[2]).toBe(shown[1]);
+
+    // A changed message at a moved position is still the resent copy.
+    resend([message("new", "inserted"), message("b", "second"), message("a", "edited")]);
+    const reordered = harness.registry.get(messagesAtom);
+    expect(reordered[0]).toBe(moved[0]);
+    expect(reordered[1]).toBe(shown[1]);
+    expect(reordered[2]).toMatchObject({ id: "a", text: "edited" });
+  });
+
+  describe("matching resent entries", () => {
+    const entry = (fields: Record<string, unknown>) =>
+      ({
+        role: "user",
+        text: "",
+        turnId: null,
+        streaming: false,
+        createdAt: "2026-06-01T00:00:00.000Z",
+        updatedAt: "2026-06-01T00:00:00.000Z",
+        ...fields,
+      }) as unknown as OrchestrationThread["messages"][number];
+    const setup = () => {
+      const harness = makeHarness();
+      const messagesAtom = harness.threadDetails.messagesAtom({
+        environmentId: ENVIRONMENT_ID,
+        threadId: THREAD_ID,
+      });
+      const receive = (messages: OrchestrationThread["messages"]) => {
+        harness.registry.set(
+          harness.threadStateAtom(THREAD_ID),
+          AsyncResult.success<EnvironmentThreadState>({
+            data: Option.some({
+              ...THREAD_SHELL,
+              deletedAt: null,
+              messages,
+              reasoning: [],
+              proposedPlans: [],
+              activities: [],
+              checkpoints: [],
+            }),
+            status: "live",
+            error: Option.none(),
+          }),
+        );
+        return harness.registry.get(messagesAtom);
+      };
+      return { receive };
+    };
+    const fresh = <A>(value: A): A => JSON.parse(JSON.stringify(value)) as A;
+
+    // A streaming patch appends to the array it holds; reading every shown entry's id there
+    // would cost the whole history on every new entry.
+    it("appends without reading the ids of the entries before", () => {
+      const { receive } = setup();
+      let idReads = 0;
+      const counted = (id: string) =>
+        Object.defineProperty(entry({ text: id }), "id", {
+          enumerable: true,
+          get: () => {
+            idReads += 1;
+            return id;
+          },
+        });
+      const history = [counted("a"), counted("b"), counted("c")];
+      const shown = receive(history);
+      idReads = 0;
+
+      const appended = receive([...history, entry({ id: "d", text: "new" })]);
+
+      expect(appended.slice(0, 3)).toEqual([shown[0], shown[1], shown[2]]);
+      expect(appended[3]).toMatchObject({ id: "d" });
+      expect(idReads).toBe(0);
+    });
+
+    it("compares a resent entry with the first shown entry of its id", () => {
+      const { receive } = setup();
+      const history = [
+        entry({ id: "same", text: "one" }),
+        entry({ id: "other", text: "between" }),
+        entry({ id: "same", text: "two" }),
+      ];
+      const shown = receive(fresh(history));
+
+      const resent = receive(fresh([entry({ id: "new", text: "inserted" }), ...history]));
+
+      expect(resent[1]).toBe(shown[0]);
+      expect(resent[2]).toBe(shown[1]);
+      // The second entry with that id is compared with the first, so it is the resent copy.
+      expect(resent[3]).not.toBe(shown[2]);
+      expect(resent[3]).toEqual(shown[2]);
+    });
+
+    it("compares entries without an id by position, even after a shift", () => {
+      const { receive } = setup();
+      const shown = receive(fresh([entry({ text: "first" }), entry({ text: "second" })]));
+
+      const unshifted = receive(fresh([entry({ text: "first" }), entry({ text: "second" })]));
+      expect(unshifted).toBe(shown);
+
+      const shifted = receive(
+        fresh([entry({ text: "inserted" }), entry({ text: "first" }), entry({ text: "second" })]),
+      );
+      expect(shifted[1]).not.toBe(shown[0]);
+      expect(shifted[1]).toEqual(shown[0]);
+    });
+  });
+
   // Patches share every object they did not change with the source they patched. After a resend
   // those objects are not the ones the UI holds, yet a streaming patch must still not re-compare
   // the whole history on every token.

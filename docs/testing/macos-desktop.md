@@ -480,6 +480,56 @@ Capture original-resolution screenshots and focused crops. Exclude an installed
 application splash or any frame from a different PID/bundle from acceptance
 evidence.
 
+### Thread memory across reconnects
+
+A changed reconnect resends the whole thread; the client must keep one shown
+copy of each unchanged message, plus the latest resend in its thread state,
+however many reconnects happen (#96). The manual spec
+`apps/desktop/e2e/specs/manual/thread-reconnect-memory.e2e.ts` is not in the
+default spec list; it pauses at gates for Safari Web Inspector.
+
+1. Build the packaged E2E app with a fresh identifier, so its WebKit profile is
+   new (see [Renderer-data isolation](#renderer-data-isolation)). From
+   `apps/desktop`, with `VITE_BIBCODE_DESKTOP_E2E=1`:
+   `pnpm exec tauri build --features desktop-e2e --config ./src-tauri/tauri.e2e.conf.json --config '{"identifier":"com.bibcode.desktop.e2e.<run>"}' --bundles app --target aarch64-apple-darwin`.
+   Copy the `.app` to a temporary install folder with `ditto` and set
+   `BIBCODE_E2E_APP_PATH` to it.
+2. Keep the session unlocked and run `caffeinate -dimsu` for the whole run.
+3. Start the spec:
+   `BIBCODE_E2E_SPEC=./specs/manual/thread-reconnect-memory.e2e.ts vp run test:ui:desktop`.
+   It sends 100 prompts of 60,000 characters, each starting with
+   `prompt-<n>-`, then reconnects twice with the thread unchanged and eight
+   times after a slow turn finished while the socket was down.
+4. Open Safari's **Develop** menu, attach Web Inspector to the app's page and
+   record **JavaScript Allocations** only around each gate; recording all the
+   time snapshots the page every 10 seconds and stalls WebDriver.
+5. At each gate the spec calls `console.takeHeapSnapshot(<label>)` and writes
+   `memory-gate-<label>.waiting` in the artifact directory. Export that
+   snapshot (filter the list by the label; click **Clear Filters** first),
+   then create `memory-gate-<label>.go` beside it. The labels are
+   `idle-control`, `baseline`, `changed-<n>` for the midpoint and the last
+   changed reconnect (`changed-4` and `changed-8` by default), and
+   `after-reload`.
+6. Analyze each export against the baseline:
+   `node apps/desktop/e2e/support/heap-snapshot-strings.ts <changed-8.json> --baseline <baseline.json>`.
+   JavaScriptCore records no string contents, so the tool counts strings of
+   60,000–60,100 bytes and names what holds the ones added since the baseline.
+   WebKit reports a string whose buffer has several owners (DOM text, for
+   example) at its size divided by their number, so the tool also prints the
+   count at half that size; record both, and rerun with `--min`/`--max` for a
+   band that changes between snapshots.
+7. Repeat without Web Inspector: `BIBCODE_E2E_MEMORY_GATES=0` and
+   `BIBCODE_E2E_WEBCONTENT_PID=<pid>` make the spec sample that process's
+   `footprint` after a 30-second settle at each point, into
+   `memory-steps.jsonl`. Identify the app's WebContent process before
+   starting (Activity Monitor names its owner, or quit Safari first).
+
+Pass when the prompt-size strings after the last changed reconnect are within 100 (one copy
+of each prompt) of `baseline`, the JS heap grows by at most about 0.5 MB per
+changed reconnect, and the footprint shows no linear growth. Record the
+fields of the template's thread-memory section. Paths through WebDriver's
+`__wd_el_*` element references are a harness artifact.
+
 ## Profiler crash smoke
 
 Run the shared [Profiler crash smoke](./cross-platform-validation.md#profiler-crash-smoke)
