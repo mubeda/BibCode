@@ -882,15 +882,31 @@ describe("ProfilerSection", () => {
       h.environment = { ...h.environment!, connection: { phase: "offline" } };
       withLuna();
 
+      const luna = h.environments[1]!;
       const container = await render();
 
-      expect(container.querySelector("[data-select]")).toBeNull();
       expect(container.querySelector('[role="switch"]')!.getAttribute("aria-checked")).toBe("true");
-      // The page otherwise describes the primary, so the environment in control is named.
-      expect(container.textContent).toContain("Environment");
-      expect(container.querySelector("[data-settings-row]")!.textContent).toContain("Luna");
-      // Luna is not the primary, so the folder and bundle stay with the primary.
+      // The page's environment is the primary, which is down: say so, name the stand-in, and
+      // offer the picker so the stand-in can be chosen for real (the logs row follows it).
+      expect(container.querySelector("[data-settings-row]")!.textContent).toContain(
+        "Work Server is not connected. Showing Luna.",
+      );
+      expect(container.querySelector("[data-select]")).not.toBeNull();
+      expect(container.querySelector('button[aria-label="Environment"]')!.textContent).toBe(
+        "Work Server",
+      );
+      expect(
+        container.querySelector(`[data-item="${ENVIRONMENT_ID}"]`)!.getAttribute("data-disabled"),
+      ).toBe("true");
+      // Luna is not the primary, so the folder stays with the primary.
       expect(buttonByText(container, "Open folder").disabled).toBe(true);
+
+      await pick(luna);
+      expect(h.selections).toEqual([EnvironmentId.make(luna.environmentId)]);
+      // Luna is now the page's environment and the only one to choose, so it is just named.
+      const row = container.querySelector("[data-settings-row]")!;
+      expect(row.textContent).toContain("Luna");
+      expect(row.textContent).not.toContain("is not connected");
     });
 
     it.each(["connecting", "reconnecting"])(

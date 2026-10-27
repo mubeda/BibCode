@@ -30,7 +30,7 @@ const PROFILER_OMITTED_ENTRY: &str = "profiler/OMITTED.txt";
 const MANIFEST_ENTRY: &str = "manifest.json";
 /// Archives one server holds at a time. A slot is taken before a build starts and released
 /// when its [`DiagnosticBundle`] is dropped: an RPC download keeps it until the last item is
-/// sent, the HTTP route until it hands the bytes to the response. Each archive is up to
+/// sent, the HTTP route until its response body has been sent or dropped. Each archive is up to
 /// [`MAX_DIAGNOSTIC_ARCHIVE_BYTES`] in memory and is compressed on a blocking thread, so a
 /// burst of requests waits for a slot instead of multiplying that memory and CPU.
 const MAX_ARCHIVES_IN_MEMORY: usize = 2;
@@ -77,8 +77,15 @@ pub struct DiagnosticBundle {
     pub bytes: Vec<u8>,
     /// The archive's `manifest.json`, as JSON.
     pub manifest: Value,
-    /// This archive's slot among [`MAX_ARCHIVES_IN_MEMORY`], released with the bundle.
-    _slot: Option<OwnedSemaphorePermit>,
+    /// This archive's slot among [`MAX_ARCHIVES_IN_MEMORY`]. Whoever ends up holding the bytes
+    /// keeps it with them (the HTTP route's response body, the RPC producer), so the archive
+    /// counts against the limit until its memory is released.
+    pub slot: Option<DiagnosticArchiveSlot>,
+}
+
+/// One of a server's [`MAX_ARCHIVES_IN_MEMORY`] archive slots, released when dropped.
+pub struct DiagnosticArchiveSlot {
+    _permit: OwnedSemaphorePermit,
 }
 
 #[derive(Debug, Error)]
@@ -162,7 +169,7 @@ impl DiagnosticBundleService {
                 generated_at,
             )
             .map(|bundle| DiagnosticBundle {
-                _slot: Some(permit),
+                slot: Some(DiagnosticArchiveSlot { _permit: permit }),
                 ..bundle
             })
         })
@@ -250,7 +257,7 @@ fn build_bundle(
         ),
         bytes,
         manifest,
-        _slot: None,
+        slot: None,
     })
 }
 

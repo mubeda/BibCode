@@ -534,7 +534,7 @@ export type ServerSignalProcessResult = typeof ServerSignalProcessResult.Type;
 /** The largest diagnostic archive a server sends or a client accepts (20 MiB). */
 export const DIAGNOSTIC_LOGS_MAX_ARCHIVE_BYTES = 20 * 1024 * 1024;
 /** The most archive bytes one `Data` item of `server.downloadDiagnosticLogs` carries. */
-export const DIAGNOSTIC_LOGS_CHUNK_BYTES = 512 * 1024;
+export const DIAGNOSTIC_LOGS_CHUNK_BYTES = 64 * 1024;
 
 export const DiagnosticLogsDownloadInput = Schema.Struct({
   /** This client's frontend warning/error snapshot, bounded like the HTTP request body. */

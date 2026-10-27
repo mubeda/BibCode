@@ -833,6 +833,7 @@ impl ProductionRuntime {
         Ok(DiagnosticLogsHttpResponse {
             filename: bundle.filename,
             bytes: bundle.bytes,
+            slot: bundle.slot,
         })
     }
 

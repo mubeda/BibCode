@@ -185,7 +185,7 @@ says why, and nothing is saved. It never falls back to another environment's
 bundle. The client also checks that the manifest's `storageInstanceId` is the
 one its connection verified, and refuses an archive without one. The stream
 sends a `Started` item (file name, size, manifest) and then base64 items of at
-most 512 KiB, one in flight at a time, so the connection's other traffic goes
+most 64 KiB, one in flight at a time, so the connection's other traffic goes
 out between them. A bundle holds one server's logs: diagnosing a remote launch
 or transport problem can need both the remote environment's archive and the
 primary's, downloaded one after the other.
@@ -208,7 +208,8 @@ at once: a slot is taken before the build and released when the archive is
 dropped, so an RPC download keeps it until its last item is sent and the HTTP
 route until it hands the bytes to the response, and a build whose caller went
 away keeps it until its compression thread finishes. A download whose client
-takes no item for 60 s ends there and releases its archive. The RPC refuses a
+takes no item for 60 s (a link under about 1 KiB/s, or a client that stopped
+acknowledging) ends there and releases its archive. The RPC refuses a
 `frontendLog` over the HTTP route's 512 KiB body bound with `invalid`. A crash
 dump is bundled, and counted in the manifest, only once the crash monitor has
 written its `.json` record, which it does after the dump is complete; a dump
