@@ -2025,6 +2025,7 @@ describe("ChatView", () => {
               resetCursorState: () => undefined,
               addTerminalContext: () => false,
               getSendContext: () => ({
+                prompt: "hold this turn",
                 attachments: [],
                 terminalContexts: [],
                 elementContexts: [],
@@ -2034,9 +2035,10 @@ describe("ChatView", () => {
                 selectedModel: "gpt-5.4",
                 selectedProviderModels: codexProvider.models,
                 selectedPromptEffort: null,
+                selectedModelOptionsForDispatch: undefined,
                 selectedModelSelection: { instanceId: codexInstanceId, model: "gpt-5.4" },
               }),
-            } as ChatComposerHandle;
+            } as Partial<ChatComposerHandle> as ChatComposerHandle;
             (composer["promptRef"] as RefObject<string>).current = "hold this turn";
             await act(async () => (composer["onSend"] as () => Promise<void>)());
             const sent = h.commandCalls.find((call) => call.key === "thread.startTurn")!.input as {
