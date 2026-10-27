@@ -2984,6 +2984,33 @@ sizes. Cover relevant:
 - Create Worktree exact local and remote ref selection: the exact value appears
   once, the derived name remains correct, and a remote-to-local race succeeds
   without duplicate branch creation;
+- Create Worktree and Add Project follow **Settings → Agents → Default Agent**
+  (#185). Check each of these:
+  - **Primary project:** with the app running, change Default Agent to a Claude
+    chat, open Create Worktree, and confirm the Agent picker shows it. Create
+    without touching the picker; the new thread runs Claude. Repeat with an AI
+    terminal; Main becomes that terminal.
+  - **Remote project:** on a saved server whose own settings still name the
+    built-in default, the picker and the created thread use the Settings
+    choice. Adding a project on that server opens Main with the same agent.
+  - **Unavailable agent:** on a server where the chosen agent is missing or not
+    ready, the picker selects the first ready chat. A line under it says which
+    agent is unavailable and why. Picking another agent removes the line, and
+    it stays gone if the Default Agent later becomes unavailable. Clicking the
+    line does not open the picker. On a server with no ready agent, Create
+    stays disabled and the line says where to sign in to or enable one.
+  - **Offline at start:** start the app with a saved server offline. Open the
+    dialog for that server's project. The line reads "<server> is not
+    connected. Create waits until it reconnects." and Create stays disabled.
+    Start the server; the line changes to "Connecting to <server>", then the
+    picker selects the Default Agent and Create is enabled.
+  - **Session lost:** with that dialog open and an agent picked by hand, stop
+    the server. The same "is not connected" line appears and Create is
+    disabled, although the picker still lists the last agents. Restart the
+    server; the hand-picked agent is still selected and Create is enabled.
+  - **Add Project fallback:** add a project on a server with no ready agent
+    while Default Agent is a Claude chat. Main opens as a Claude chat rather
+    than Codex.
 - Git Manager opened from the project header, its worktree selector, a Changes
   list with the partial-staging gutter, History with a selected commit diff, the
   branch dropdown, fetch/pull/push/force-with-lease sync states, the native

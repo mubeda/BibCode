@@ -4,6 +4,13 @@
  * without rendering React or touching the network.
  */
 
+import type { DefaultAgentSelection } from "@bibcode/contracts";
+
+import {
+  resolveEffectiveProviderAgentAction,
+  type ProviderAgentAction,
+} from "./chat/providerAgentActions";
+
 export type WorktreeSourceMode = "smart" | "github" | "branch";
 
 export interface GitHubWorkItemRef {
@@ -295,8 +302,86 @@ export function resolveWorktreeCreateInput(input: {
 /** Gate for the primary "Create worktree" button. */
 export function getCreateWorktreeDisabled(input: {
   readonly hasProject: boolean;
+  /** False while the project's server has no agent to start, which the agent notice explains. */
+  readonly hasAgent: boolean;
   readonly resolution: WorktreeCreateResolution | null;
   readonly isSubmitting: boolean;
 }): boolean {
-  return !input.hasProject || input.resolution === null || input.isSubmitting;
+  return !input.hasProject || !input.hasAgent || input.resolution === null || input.isSubmitting;
+}
+
+/** The project's server connection, as far as starting an agent there is concerned. */
+export type AgentServerConnection = "connected" | "connecting" | "disconnected";
+
+/**
+ * The agent the dialog starts on: Settings' Default Agent (the primary-server setting) applied
+ * to the agents of the project's own environment. Create waits while there is no agent to start,
+ * and a fallback from the saved default says why.
+ */
+export type DefaultAgentChoice =
+  | {
+      readonly status: "disconnected" | "connecting" | "loading" | "unavailable";
+      readonly action: null;
+      readonly notice: string;
+    }
+  | {
+      readonly status: "ready";
+      readonly action: ProviderAgentAction;
+      readonly notice: string | null;
+    };
+
+export function resolveDefaultAgentChoice(input: {
+  /** The environment's agents; `null` while its server config has not arrived. */
+  readonly actions: ReadonlyArray<ProviderAgentAction> | null;
+  readonly selection: DefaultAgentSelection;
+  readonly environmentLabel: string | null;
+  /** A config snapshot outlives a lost session, so the connection decides first. */
+  readonly connection: AgentServerConnection;
+  /** Settings → Providers manages the primary server's agents only. */
+  readonly isPrimaryServer: boolean;
+}): DefaultAgentChoice {
+  const { actions, selection } = input;
+  const environmentLabel = input.environmentLabel ?? "this server";
+  if (input.connection === "disconnected") {
+    return {
+      status: "disconnected",
+      action: null,
+      notice: `${environmentLabel} is not connected. Create waits until it reconnects.`,
+    };
+  }
+  if (input.connection === "connecting") {
+    return {
+      status: "connecting",
+      action: null,
+      notice: `Connecting to ${environmentLabel}. Create waits until it connects.`,
+    };
+  }
+  if (actions === null) {
+    return {
+      status: "loading",
+      action: null,
+      notice: "Loading this project's agents. Create waits until they arrive.",
+    };
+  }
+  const action = resolveEffectiveProviderAgentAction(actions, selection);
+  if (action === null) {
+    const where = input.isPrimaryServer ? "in Settings → Providers" : "on that server";
+    return {
+      status: "unavailable",
+      action: null,
+      notice: `No agent is ready on ${environmentLabel}. Sign in to or enable one ${where}.`,
+    };
+  }
+  if (action.kind === selection.kind && action.entry.instanceId === selection.instanceId) {
+    return { status: "ready", action, notice: null };
+  }
+  const saved = actions.find(
+    (candidate) =>
+      candidate.kind === selection.kind && candidate.entry.instanceId === selection.instanceId,
+  );
+  const reason = saved?.disabledReason ? ` (${saved.disabledReason})` : "";
+  const notice = saved
+    ? `${saved.label} is unavailable${reason}, so ${action.label} is selected.`
+    : `Your default agent is not available on ${environmentLabel}, so ${action.label} is selected.`;
+  return { status: "ready", action, notice };
 }
