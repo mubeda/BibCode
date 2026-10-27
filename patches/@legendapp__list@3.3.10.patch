@@ -1,0 +1,110 @@
+diff --git a/react.js b/react.js
+index 5b171ebd6fa7ac86b0148fe17f897a0ca821d55e..7cb8fdd9ea625002a3e4b7eeb904bd02b1e052a6 100644
+--- a/react.js
++++ b/react.js
+@@ -1976,6 +1976,12 @@ function updateScroll(ctx, newScroll, forceUpdate, options) {
+   state.scrollTime = currentTime;
+   const scrollDelta = Math.abs(newScroll - prevScroll);
+   const isUserScrollEvent = !!(options == null ? void 0 : options.fromNativeScrollEvent) && scrollDelta > 0.1 && !adjustChanged && scrollingTo === void 0 && !state.pendingNativeMVCPAdjust;
++  if (isUserScrollEvent) {
++    // BiBCode patch: a scroll the list did not make moves the rows on screen, so the anchor a
++    // recent data change locked no longer is one. Kept, it outlives the scroll by up to 300 ms,
++    // and a row growing above it shifts the view by the growth.
++    state.mvcpAnchorLock = void 0;
++  }
+   const didCancelMaintainScrollAtEnd = isUserScrollEvent && newScroll < prevScroll && !!(state.maintainingScrollAtEnd || state.pendingMaintainScrollAtEnd);
+   if (didCancelMaintainScrollAtEnd) {
+     finishMaintainScrollAtEnd(ctx);
+@@ -4275,7 +4281,7 @@ function updateViewabilityForCachedRange(ctx, viewabilityConfigCallbackPairs, sc
+     startNoBuffer: visibleRange.startNoBuffer
+   });
+   maybeEmitFirstVisibleItemChanged(state, visibleRange.startNoBuffer);
+-  if (visibleRange.startNoBuffer !== null && visibleRange.endNoBuffer !== null) {
++  if (viewabilityConfigCallbackPairs && visibleRange.startNoBuffer !== null && visibleRange.endNoBuffer !== null) {
+     updateViewableItems(
+       state,
+       ctx,
+@@ -4396,17 +4402,17 @@ function calculateItemsInView(ctx, params = {}) {
+         state.scrollForNextCalculateItemsInView = void 0;
+       } else if ((top === null || scrollTopBuffered > top) && (bottom === null || scrollBottomBuffered < bottom)) {
+         if (!isInMVCPActiveMode(state)) {
+-          if (viewabilityConfigCallbackPairs) {
+-            updateViewabilityForCachedRange(
+-              ctx,
+-              viewabilityConfigCallbackPairs,
+-              scrollLength,
+-              scroll,
+-              scrollBottom
+-            );
+-          } else if (state.props.onFirstVisibleItemChanged) {
+-            maybeEmitFirstVisibleItemChanged(state, findFirstVisibleIndexInCachedRange(ctx, scroll));
+-          }
++          // BiBCode patch: refresh the rows on screen even without viewability callbacks.
++          // maintainVisibleContentPosition reads idsInView for the row it holds in place, and
++          // after a scroll within the cached range it otherwise names the rows on screen at an
++          // earlier offset, so a row growing above them shifts the view by its growth.
++          updateViewabilityForCachedRange(
++            ctx,
++            viewabilityConfigCallbackPairs,
++            scrollLength,
++            scroll,
++            scrollBottom
++          );
+           (_d = stickyState == null ? void 0 : stickyState.finishCalculateItemsInView) == null ? void 0 : _d.call(stickyState);
+           return;
+         }
+diff --git a/react.mjs b/react.mjs
+index cf549ca32946a9e35a883290c11423330bf8728b..85283e63527b3ef3dc14733efb6e511dbc61f7f4 100644
+--- a/react.mjs
++++ b/react.mjs
+@@ -1955,6 +1955,12 @@ function updateScroll(ctx, newScroll, forceUpdate, options) {
+   state.scrollTime = currentTime;
+   const scrollDelta = Math.abs(newScroll - prevScroll);
+   const isUserScrollEvent = !!(options == null ? void 0 : options.fromNativeScrollEvent) && scrollDelta > 0.1 && !adjustChanged && scrollingTo === void 0 && !state.pendingNativeMVCPAdjust;
++  if (isUserScrollEvent) {
++    // BiBCode patch: a scroll the list did not make moves the rows on screen, so the anchor a
++    // recent data change locked no longer is one. Kept, it outlives the scroll by up to 300 ms,
++    // and a row growing above it shifts the view by the growth.
++    state.mvcpAnchorLock = void 0;
++  }
+   const didCancelMaintainScrollAtEnd = isUserScrollEvent && newScroll < prevScroll && !!(state.maintainingScrollAtEnd || state.pendingMaintainScrollAtEnd);
+   if (didCancelMaintainScrollAtEnd) {
+     finishMaintainScrollAtEnd(ctx);
+@@ -4254,7 +4260,7 @@ function updateViewabilityForCachedRange(ctx, viewabilityConfigCallbackPairs, sc
+     startNoBuffer: visibleRange.startNoBuffer
+   });
+   maybeEmitFirstVisibleItemChanged(state, visibleRange.startNoBuffer);
+-  if (visibleRange.startNoBuffer !== null && visibleRange.endNoBuffer !== null) {
++  if (viewabilityConfigCallbackPairs && visibleRange.startNoBuffer !== null && visibleRange.endNoBuffer !== null) {
+     updateViewableItems(
+       state,
+       ctx,
+@@ -4375,17 +4381,17 @@ function calculateItemsInView(ctx, params = {}) {
+         state.scrollForNextCalculateItemsInView = void 0;
+       } else if ((top === null || scrollTopBuffered > top) && (bottom === null || scrollBottomBuffered < bottom)) {
+         if (!isInMVCPActiveMode(state)) {
+-          if (viewabilityConfigCallbackPairs) {
+-            updateViewabilityForCachedRange(
+-              ctx,
+-              viewabilityConfigCallbackPairs,
+-              scrollLength,
+-              scroll,
+-              scrollBottom
+-            );
+-          } else if (state.props.onFirstVisibleItemChanged) {
+-            maybeEmitFirstVisibleItemChanged(state, findFirstVisibleIndexInCachedRange(ctx, scroll));
+-          }
++          // BiBCode patch: refresh the rows on screen even without viewability callbacks.
++          // maintainVisibleContentPosition reads idsInView for the row it holds in place, and
++          // after a scroll within the cached range it otherwise names the rows on screen at an
++          // earlier offset, so a row growing above them shifts the view by its growth.
++          updateViewabilityForCachedRange(
++            ctx,
++            viewabilityConfigCallbackPairs,
++            scrollLength,
++            scroll,
++            scrollBottom
++          );
+           (_d = stickyState == null ? void 0 : stickyState.finishCalculateItemsInView) == null ? void 0 : _d.call(stickyState);
+           return;
+         }

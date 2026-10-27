@@ -653,27 +653,44 @@ async function sendCurrentComposerPrompt(
   // or disabled, so a send right after Claude's /compact could be lost (#177). Checking and
   // clicking in one page task leaves no gap for that swap; until Send is live, this waits.
   // Only an explicit "not live yet" is retried: a script error may come after the click, so
-  // it fails the step instead of clicking a second time.
-  for (let attempt = 1; ; attempt += 1) {
-    const clicked = await browser.execute(() => {
-      const send = document.querySelector<HTMLButtonElement>(
-        '[data-center-surface-host][data-visible="true"] [data-chat-composer-form="true"] button[aria-label="Send message"]',
-      );
-      if (!send || send.disabled) return false;
-      send.click();
-      return true;
-    });
-    if (clicked) break;
-    if (attempt >= 200) {
-      throw new Error("The composer's Send button never became available in 20 seconds.");
-    }
-    await browser.pause(100);
-  }
+  // it fails the step instead of clicking a second time. waitUntil retries a condition that
+  // throws, so the error stops the wait and is thrown after it.
+  let clickFailure: unknown = null;
+  await browser.waitUntil(
+    async () => {
+      try {
+        return await browser.execute(() => {
+          const send = document.querySelector<HTMLButtonElement>(
+            '[data-center-surface-host][data-visible="true"] [data-chat-composer-form="true"] button[aria-label="Send message"]',
+          );
+          if (!send || send.disabled) return false;
+          send.click();
+          return true;
+        });
+      } catch (error) {
+        clickFailure = error;
+        return true;
+      }
+    },
+    {
+      timeout: 20_000,
+      interval: 100,
+      timeoutMsg: "The composer's Send button never became available in 20 seconds.",
+    },
+  );
+  if (clickFailure !== null) throw clickFailure;
   await waitForProviderInputLogEntry(
     preparedProviderInputLogPath,
     initialLogLength,
     { provider, prompt },
     { timeoutMs: 20_000 },
+  );
+  // A new chat's first send turns its draft into a thread, and the composer then shows the
+  // thread's draft; text typed before that switch stays with the old draft and is dropped. The
+  // draft route gives way to the thread's once the switch is done, so wait for it.
+  await browser.waitUntil(
+    async () => !(await browser.execute(() => window.location.hash.includes("/draft/"))),
+    { timeoutMsg: "The new chat's draft route never gave way to its thread." },
   );
 }
 

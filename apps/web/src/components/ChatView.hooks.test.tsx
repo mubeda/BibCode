@@ -1209,6 +1209,15 @@ interface FakeLegendListOptions {
   scroll?: number;
   scrollLength?: number;
   dataLength?: number;
+  /** Lays rows out at this height and lets the list's offset follow its scrolls. */
+  rowSize?: number;
+  /**
+   * The content height the scroller has laid out lags the measured rows: the first
+   * `scrollToOffset` clamps at this offset, and the height catches up right after it.
+   */
+  laggingMaxScroll?: number;
+  /** Runs when a `scrollToOffset` was clamped by the lagging content height. */
+  onClampedScroll?: () => void;
 }
 
 function makeLegendList(options: FakeLegendListOptions = {}) {
@@ -1218,14 +1227,18 @@ function makeLegendList(options: FakeLegendListOptions = {}) {
     scrollToOffset: [] as unknown[],
     scrollToIndex: [] as unknown[],
   };
+  let maxScroll = options.laggingMaxScroll ?? Number.POSITIVE_INFINITY;
+  const rowSizes = Array.from({ length: options.dataLength ?? 1 }, () => options.rowSize ?? 100);
   const scrollNode = {
+    scrollTop: options.scroll ?? 0,
     listeners: scrollNodeListeners,
     addEventListener: (type: string, handler: () => void, listenerOptions?: unknown) => {
       scrollNodeListeners.push({ type, handler, options: listenerOptions });
     },
     removeEventListener: () => undefined,
     fire(type: string) {
-      for (const listener of scrollNodeListeners) {
+      // As in the DOM, a listener added during the dispatch waits for the next event.
+      for (const listener of scrollNodeListeners.slice()) {
         if (listener.type === type) listener.handler();
       }
     },
@@ -1233,12 +1246,19 @@ function makeLegendList(options: FakeLegendListOptions = {}) {
   const list = {
     calls,
     scrollNode,
+    /** A row grows by `by` px, as a diagram drawing in it would. */
+    growRow(index: number, by: number) {
+      rowSizes[index]! += by;
+    },
     getScrollableNode: () => scrollNode,
     getState: () => ({
-      scroll: options.scroll ?? 0,
+      scroll: options.rowSize === undefined ? (options.scroll ?? 0) : scrollNode.scrollTop,
       data: Array.from({ length: options.dataLength ?? 1 }, (_, index) => index),
-      positionAtIndex: (_index: number) => 0,
-      sizeAtIndex: (_index: number) => 100,
+      positionAtIndex: (index: number) =>
+        options.rowSize === undefined
+          ? 0
+          : rowSizes.slice(0, index).reduce((top, size) => top + size, 0),
+      sizeAtIndex: (index: number) => (options.rowSize === undefined ? 100 : rowSizes[index]!),
       scrollLength: options.scrollLength ?? 50,
     }),
     scrollToEnd: (input: unknown) => {
@@ -1247,6 +1267,12 @@ function makeLegendList(options: FakeLegendListOptions = {}) {
     },
     scrollToOffset: (input: unknown) => {
       calls.scrollToOffset.push(input);
+      const offset = (input as { offset: number }).offset;
+      scrollNode.scrollTop = Math.min(offset, maxScroll);
+      if (offset > maxScroll) {
+        maxScroll = Number.POSITIVE_INFINITY;
+        options.onClampedScroll?.();
+      }
       return Promise.resolve();
     },
     scrollToIndex: (input: unknown) => {
@@ -1263,6 +1289,44 @@ function installLegendList(options: FakeLegendListOptions = {}) {
   const list = makeLegendList(options);
   listRef.current = list;
   return list;
+}
+
+/**
+ * Sends a message whose reply arrived during the sent row's glide: four 100 px rows, the
+ * reply's end 216 px below what shows.
+ */
+async function sendTallReply(
+  options: Pick<FakeLegendListOptions, "laggingMaxScroll" | "onClampedScroll">,
+) {
+  seedConnectedServerThread();
+  renderServerRoute();
+  const list = installLegendList({
+    scroll: 0,
+    scrollLength: 200,
+    dataLength: 4,
+    rowSize: 100,
+    ...options,
+  });
+  const cleanups = runEffects();
+  const { promptRef } = installComposerHandle();
+  promptRef.current = "reply taller than the timeline";
+  await (capturedProps("chatComposer")["onSend"] as () => Promise<void>)();
+  const sent = commandCallsFor("thread.startTurn")[0]!.input as {
+    input: { message: { messageId: MessageId } };
+  };
+  const onAnchorReady = capturedProps("messagesTimeline")["onAnchorReady"] as (
+    messageId: MessageId,
+    anchorIndex: number,
+  ) => void;
+  return { list, cleanups, messageId: sent.input.message.messageId, onAnchorReady };
+}
+
+function onRowSizeChanged(): (info: { index: number; previous: number; size: number }) => void {
+  return capturedProps("messagesTimeline")["onRowSizeChanged"] as (info: {
+    index: number;
+    previous: number;
+    size: number;
+  }) => void;
 }
 
 interface WindowListener {
@@ -1775,6 +1839,135 @@ describe("ChatView effects (captured and run manually)", () => {
         (call) => Array.isArray(call.applied) && (call.applied as unknown[]).length === 0,
       ),
     ).toBe(true);
+  });
+
+  it("reveals a reply that grew past the timeline while its sent row was gliding", async () => {
+    const { list, cleanups, messageId, onAnchorReady } = await sendTallReply({});
+
+    onAnchorReady(messageId, 2);
+    expect(list.calls.scrollToOffset).toEqual([]);
+    list.scrollNode.fire("scrollend");
+
+    // The glide settles where it ended, then the end the reply grew to comes into view.
+    expect(list.calls.scrollToOffset).toEqual([
+      { offset: 0, animated: false },
+      { offset: 216, animated: false },
+    ]);
+    for (const cleanup of cleanups) cleanup();
+  });
+
+  it("follows the end again when a follow was clamped to a lagging content height", async () => {
+    // The scroller has laid out only 100 px of the 216 the turn's end needs.
+    const { list, cleanups, messageId, onAnchorReady } = await sendTallReply({
+      laggingMaxScroll: 100,
+    });
+
+    onAnchorReady(messageId, 2);
+    list.scrollNode.fire("scrollend");
+
+    expect(list.calls.scrollToOffset).toEqual([
+      { offset: 0, animated: false },
+      { offset: 216, animated: false },
+      { offset: 216, animated: false },
+    ]);
+    expect(list.scrollNode.scrollTop).toBe(216);
+    for (const cleanup of cleanups) cleanup();
+  });
+
+  it("stops following a clamped end once the reader scrolls", async () => {
+    let wheel = () => {};
+    const { list, cleanups, messageId, onAnchorReady } = await sendTallReply({
+      laggingMaxScroll: 100,
+      onClampedScroll: () => wheel(),
+    });
+    wheel = () => list.scrollNode.fire("wheel");
+
+    onAnchorReady(messageId, 2);
+    list.scrollNode.fire("scrollend");
+
+    expect(list.calls.scrollToOffset).toEqual([
+      { offset: 0, animated: false },
+      { offset: 216, animated: false },
+    ]);
+    expect(list.scrollNode.scrollTop).toBe(100);
+    for (const cleanup of cleanups) cleanup();
+  });
+
+  it("stops following a clamped end once a later send positions its own row", async () => {
+    let positionNext = () => {};
+    const { list, cleanups, messageId, onAnchorReady } = await sendTallReply({
+      laggingMaxScroll: 100,
+      onClampedScroll: () => positionNext(),
+    });
+    positionNext = () => onAnchorReady(MessageId.make("later-send"), 3);
+
+    onAnchorReady(messageId, 2);
+    list.scrollNode.fire("scrollend");
+
+    expect(list.calls.scrollToOffset).toEqual([
+      { offset: 0, animated: false },
+      { offset: 216, animated: false },
+    ]);
+    for (const cleanup of cleanups) cleanup();
+  });
+
+  it("reveals the end again when a row of the anchored turn grows while it shows", async () => {
+    const { list, cleanups, messageId, onAnchorReady } = await sendTallReply({});
+    onAnchorReady(messageId, 2);
+    list.scrollNode.fire("scrollend");
+    expect(list.scrollNode.scrollTop).toBe(216);
+
+    // A diagram draws in the reply, with no new entry to follow.
+    list.growRow(3, 57);
+    onRowSizeChanged()({ index: 3, previous: 100, size: 157 });
+
+    expect(list.calls.scrollToOffset.at(-1)).toEqual({ offset: 273, animated: false });
+    for (const cleanup of cleanups) cleanup();
+  });
+
+  it("keeps the reader's place when a row grows away from the anchored turn's end", async () => {
+    const { list, cleanups, messageId, onAnchorReady } = await sendTallReply({});
+    onAnchorReady(messageId, 2);
+    list.scrollNode.fire("scrollend");
+    // A scroll the timeline does not see as the reader's own leaves the end out of view.
+    list.scrollNode.scrollTop = 0;
+    const calls = list.calls.scrollToOffset.length;
+
+    // A thought expands above the end.
+    list.growRow(2, 226);
+    onRowSizeChanged()({ index: 2, previous: 100, size: 326 });
+
+    expect(list.calls.scrollToOffset).toHaveLength(calls);
+    for (const cleanup of cleanups) cleanup();
+  });
+
+  it("keeps the reader's place when a row grows above the one LegendList holds", async () => {
+    const { list, cleanups, messageId, onAnchorReady } = await sendTallReply({});
+    onAnchorReady(messageId, 2);
+    list.scrollNode.fire("scrollend");
+    // The reader moved up 80 px with the keyboard, which keeps following on.
+    list.scrollNode.scrollTop = 136;
+    const calls = list.calls.scrollToOffset.length;
+    const frames: Array<() => void> = [];
+    vi.stubGlobal("requestAnimationFrame", (callback: (time: number) => void) => {
+      frames.push(() => callback(0));
+      return frames.length;
+    });
+
+    // The turn's first row grows above the row on screen, and LegendList scrolls by the growth
+    // a frame later to hold that row in place, so the end stays 80 px below.
+    list.growRow(2, 226);
+    onRowSizeChanged()({ index: 2, previous: 100, size: 326 });
+    for (const frame of frames.splice(0)) frame();
+    list.scrollNode.scrollTop += 226;
+    for (const frame of frames.splice(0)) frame();
+
+    expect(list.calls.scrollToOffset).toHaveLength(calls);
+    vi.stubGlobal("requestAnimationFrame", (callback: (time: number) => void) => {
+      callback(0);
+      return 1;
+    });
+    for (const cleanup of cleanups) cleanup();
   });
 
   it("positions and stabilizes a timeline anchor after manual navigation", () => {

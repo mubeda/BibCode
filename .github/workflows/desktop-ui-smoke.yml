@@ -254,4 +254,5 @@ jobs:
           path: |
             ${{ runner.temp }}/bibcode-desktop-ui-artifacts/*.png
             ${{ runner.temp }}/bibcode-desktop-ui-artifacts/*.log
+            ${{ runner.temp }}/bibcode-desktop-ui-artifacts/*.json
           if-no-files-found: warn
