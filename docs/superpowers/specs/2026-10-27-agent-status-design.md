@@ -1,6 +1,6 @@
 # Agent activity status design (#187)
 
-Status: proposed, awaiting approval. Written 2026-10-27 against `origin/develop`
+Status: revision 2, awaiting approval. Written 2026-10-27 against `origin/develop`
 at `27702287cc` and Orca `main` at `32a9b3b9` (2026-10-27).
 
 The left panel's workspace-card glyph and the Agents view group each chat into
@@ -11,9 +11,18 @@ and the Agents view maps its result to `AgentGroupId`
 traces where that state comes from, lists the cases where it is wrong, compares
 it with Orca, and picks a design.
 
-`AgentGroupId` keeps its name and its values (`working | blocked | waiting | done`).
-The #186 Inbox can build on it unchanged. What changes is which rows land in
-each group (see "Effect on #186").
+Revision 2 (same day) folds in the lead's decisions and review findings. The
+shared agent-row contract with #186 (`scratchpad/batch3/agent-row-contract.md`,
+set by the lead) fixes the following:
+
+- `AgentGroupId` is `working | blocked | waiting | done | unknown`.
+- An `unknown` row carries one reason: `stale`, `unavailable` or `offline`.
+- Rows are per agent, and a row has an optional `terminalId`.
+- `STATUS_TONES` is exported, so #186 can use the same colors.
+- `AgentsRow.tsx` takes an optional jump action.
+- One hook file owns the freshness clock.
+
+See §4 and "Effect on #186".
 
 ## 1. Current pipeline
 
@@ -161,213 +170,372 @@ Out of scope:
 
 ### D1. Awaiting Input from the projection (fixes F1)
 
-`rebuild_thread_derived_fields_tx` computes `pending_user_input_count` with the
-rule the queued-head predicate already uses: take the latest of
-`user-input.requested`, `user-input.resolved` and
-`provider.user-input.respond.failed` for each `requestId`. The request counts as
-open when that latest activity is `requested`, or is a failure that is not
-stale. The predicate moves into one shared SQL fragment in the engine, and the
-queue predicate (`repositories.rs:3052-3061`) uses the same fragment, so the two
-cannot drift apart. The latest-per-request window query is indexed by
-`thread_id`. Its cost is one more query per thread event, next to the existing
-`COUNT(*)` on approvals.
+The user-input count gets the same treatment as approvals. It is maintained
+only when a request's state changes, never on every thread event, because
+streamed assistant deltas dispatch thread events too.
 
-### D2. BiBCode expires open requests when a session leaves `running` (fixes F2, F3)
+- `rebuild_thread_derived_fields_tx` stops writing `pending_user_input_count`,
+  so the stored value stands.
+- The activities projector recomputes the count for one thread when it applies
+  any of these:
+  - `user-input.requested`
+  - `user-input.resolved`
+  - `user-input.expired` (D2)
+  - `provider.user-input.respond.failed`
 
-When the engine commits a `thread.session-set` whose new status is not
-`running` or `starting`, the same transaction appends one activity for each
-request that is still open on that thread. The precedent is the `hold` step that
-`ThreadSessionSet` already gets (`engine.rs:5301-5310`). The activity is
-`approval.expired` for an approval and `user-input.expired` for a question,
-with payload `{ requestId, reason: "session-ended", sessionStatus }` and tone
-`info`.
+The recount uses the rule the queued-head predicate already uses. Take the latest
+of those activities for each `requestId`. The request is open when that latest
+activity is `requested`, or a respond failure whose detail is not stale or
+unknown.
 
-The appended activities then reach every consumer through the normal paths:
+That rule becomes one shared SQL constant in the persistence layer. The queue
+predicate (`repositories.rs:3052-3061`) uses the same constant, so the two rules
+cannot drift apart.
 
-- The approvals projector marks the row `expired`. Unlike `resolved`, a later
-  `approval.requested` for the same id can reopen it.
-- D1's user-input rule treats `expired` as closing the request.
-- `derivePendingApprovals` and `derivePendingUserInputs` close a request on
-  `*.expired`, so the chat card disappears with the sidebar state.
-- `request_is_recorded` (`repositories.rs:955-972`) is the deduplication for
-  OpenCode's recovered asks (`provider_runtime.rs:10843-10858`). It returns
-  false when a request's latest record is an expiry. An ask that OpenCode lists
-  again after a restart or a helper crash therefore reappears and reopens the
-  request.
+### D2. Settle requests the provider no longer holds (fixes F2, F3)
 
-This works because no supported provider can finish, interrupt or lose a turn
-while it is still waiting on an answer BiBCode has to deliver. Every session
-transition out of `running` already happens on exactly those paths: completion,
-interrupt, stream end, the interrupt deadline, compaction retirement, restart
-reconciliation and workspace loss. One seam covers all seven, with no hunks in
-`provider_runtime.rs`.
+Two settlements are added. Both are written as activities, so the chat, the
+card and the queue read the same facts.
 
-| Alternative                                                           | Why rejected                                                                                                                                                                                                            |
-| --------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Count a pending request in the shell only while the session is `running`. | Fixes only the card. The chat card stays stale (F3), and queued follow-ups stay held. It also hides an OpenCode ask recovered while the session reads `ready`.                                                                                       |
-| Settle in the projector only, with no activity.                       | The chat derives its state from activities, so the chat and the card would disagree.                                                                                                                                                           |
-| Settle at each exit path in the provider runtime.                     | Seven call sites to keep in step, in code another agent owns (`provider_runtime.rs`), and the next exit path added would regress silently.                                                                       |
+**(a) Stale answers while the session still runs.** Today the server and the
+client disagree about a stale answer:
 
-**Behavior change.** Queued follow-ups that an orphaned approval held now
-deliver automatically once the session is `ready`, because the queue predicate
-reads `projection_pending_approvals`. Nobody is waiting on that approval any
-more, so delivering is correct. The design names it because the change is
-visible to users.
+- `derivePendingApprovals` (`session-logic.ts:383-390`) closes an approval on a
+  `provider.approval.respond.failed` whose detail says the request is stale or
+  unknown.
+- Migration 1604-1640 already applies the same rule to stored rows.
+- The runtime approval projector (`engine.rs:7384-7391`) ignores that kind, so
+  the shell keeps saying Pending Approval.
 
-### D3. Evidence age and decay of Working (fixes F4, F6)
+The fix: the projector handles `provider.approval.respond.failed` with that
+detail, using the migration's detail rule. It marks the row `resolved` with
+decision `stale`. User inputs already follow this rule through D1.
 
-- **Server.** A new `projection_threads.last_activity_at` column, added by a
-  migration, holds the `occurred_at` of the latest event on the thread
-  aggregate. `rebuild_thread_derived_fields_tx` writes it from the triggering
-  event; the other rebuild callers keep the stored value. The shell gains
-  `lastActivityAt: Schema.optional(IsoDateTime)`. Older servers omit it, and
-  their rows never decay.
-- **Client.** A small pure module (`agentStatusFreshness.ts`, next to
-  `agentsSection.logic.ts`) keeps, per thread key, the local time when it first
-  saw each `lastActivityAt` value. This is Orca's mirrored receipt rule. A
-  repeated value does not refresh the stamp, a new value resets it, and keys
-  that left the shell are pruned. Age is therefore measured on the client's own
-  clock, and server skew cannot stretch or shrink it.
-- **Rule.** A Working or Connecting pill whose evidence is older than
-  `AGENT_STATUS_STALE_AFTER_MS = 30 minutes` (Orca's threshold) becomes the pill
-  `No update` (not pulsing, neutral tone). The tooltip and footer read
-  "No update in 34m". The row moves to `done`, and the workspace card glyph
-  becomes an idle-kind `WORKSPACE_CARD_STATUS.stale`. Approval and question
-  rows never decay: the server holds them, and D2 ends them.
-- **Tick.** The existing shared `useMinuteClock` drives the decay. Its
-  one-minute resolution is enough for a 30-minute threshold. Only rows in the
-  Working group subscribe, through the row components or a memoized selector,
-  so idle lists pay no timer cost. That matches the `RelativeAge` rule.
-- **Offline environments (F6).** Their evidence stops changing, so their Working
-  rows decay by the same rule. Rows of a non-live environment also stop
-  pulsing.
-- **Restart.** After an app restart the first sight stamps "now", the same as
-  Orca's `restoredUnconfirmed`. A hung agent can therefore read Working for up to
-  30 minutes after launch. We accept that rather than trust a remote clock.
+**(b) Expiry when a session leaves `running`.** When the engine commits a
+`thread.session-set` whose new status is not `running` or `starting`, the same
+transaction appends an expiry activity for each request still open on that
+thread:
 
-| Alternative                                             | Why rejected                                                                                                                                                                                                                                                  |
-| ------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Keep stale rows in Working with a badge.                 | Fails the acceptance criterion that silent agents leave Working. #186 would count them as Working.                                                                                                                                                                |
-| Move stale rows to `waiting` ("needs attention").        | The group label would read **Awaiting Input** for something that is not a question. That mislabel is the class of bug this issue is about.                                                                                                                |
-| Add a fifth `AgentGroupId`, such as `stale`.             | Changes the shape #186 is building on. Deferred: the coordinator can still choose it, since moving these rows out of `done` later is a one-function change.                                                                                       |
-| Age as client now minus the server's `lastActivityAt`.   | Server clock skew breaks it. A remote server that is 40 minutes behind would mark every agent stale.                                                                                                                                           |
-| A server-side watchdog that flips `running`.             | It would invent a provider state the server cannot know, since a legitimate 40-minute tool call looks the same. Decay is a display claim, not a session transition.                                                                                       |
+- `approval.expired` for an approval, and `user-input.expired` for a question.
+- Payload `{ requestId, reason: "session-ended", sessionStatus }`, tone `info`.
+
+The precedent is the `hold` step that `ThreadSessionSet` already gets
+(`engine.rs:5301-5310`).
+
+The activity then reaches every consumer through its normal path:
+
+- **Approvals projector:** marks the row `expired`. Unlike `resolved`, a later
+  `approval.requested` with the same id reopens it.
+- **D1:** treats `expired` as closing the request.
+- **Chat:** `derivePendingApprovals` and `derivePendingUserInputs` close the
+  request on `*.expired` and reopen it on a later request.
+- **OpenCode recovery:** `request_is_recorded` (`repositories.rs:955-972`)
+  returns false when a request's latest record is an expiry. OpenCode's
+  recovered asks (`provider_runtime.rs:10843-10858`) therefore reappear.
+
+**Why this is safe.** No supported provider can complete, interrupt or lose a
+turn while it is still waiting for an answer BiBCode has to deliver. The
+session leaves `running` only on exactly those paths:
+
+- completion
+- interrupt
+- stream end
+- interrupt deadline
+- compaction retirement
+- restart reconciliation
+- workspace loss
+
+One seam covers all of them, and `provider_runtime.rs` needs no production
+changes.
+
+| Alternative                                                    | Why rejected                                                                                                                                             |
+| -------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Count a request in the shell only while the session is `running`. | Only the card changes. The chat card stays stale (F3) and the queue stays held. It also hides an OpenCode ask recovered while the session reads `ready`. |
+| Settle in the projector without an activity.                   | The chat derives its state from activities, so the chat and the card would disagree.                                                                                         |
+| Settle at each exit path in the provider runtime.              | Seven call sites in code another agent owns. The next exit path added would regress without anyone noticing.                                                    |
+
+**Queue behavior, compared with today's drain.** A queued message auto-delivers
+only when all of these hold (`repositories.rs:3036-3075`):
+
+- the session is `ready`;
+- the message is not `held`;
+- no approval or question is open;
+- no turn is running.
+
+Today an approval the user answers is marked `resolved` immediately
+(`thread.approval-response-requested`). The queue then drains when that turn
+completes `ready`.
+
+With D2, a request is expired at the session transition that ends its turn:
+
+- **Turn completes `ready`.** The queue drains exactly as it does after an
+  answered approval.
+- **Interrupt, `error`, `interrupted`, restart reconciliation.** These already
+  hold the queue in the same commit (`ThreadTurnInterrupt` and the
+  error/interrupted `hold`, `engine.rs:5295-5310`). The follow-ups stay queued
+  until the user releases them.
+
+The drain behavior therefore matches today's, and it removes one held state: a
+`ready` session blocked forever by a request nobody can answer. No user work is
+sent that would not be sent after an answered approval, so no preserve-work
+prompt is needed (UI.md).
+
+### D3. One freshness clock and the `unknown` group (fixes F4, F6)
+
+**Evidence (server).**
+
+- A migration adds `projection_threads.last_activity_at`. It is set only from
+  provider progress, and title, mode, archive and other client updates never
+  touch it. Provider progress means either of:
+  - an event the engine attributes to the provider (`infer_actor_kind` returns
+    `provider`, `engine.rs:7593-7606`);
+  - a `thread.session-set` to `running` or `starting`.
+- The shell gains `lastActivityAt: Schema.optional(IsoDateTime)`.
+- Terminal agents carry their own evidence time (D5).
+
+**Age, measured skew-free on the client.**
+
+- The age of an evidence value is taken once, from a live snapshot:
+  `serverAge = snapshot.updatedAt − lastActivityAt`. Both are server-clock
+  times, and `snapshot.updatedAt` is the server's time when it built the
+  snapshot (`orchestration_rpc.rs:1545`).
+- The client stores `evidenceAt = localNow − serverAge`. Later snapshots with
+  the same evidence value keep that stored time; a new value replaces it.
+- An app launch therefore does not grant 30 fresh minutes. An agent that has
+  been silent for 40 minutes reads stale as soon as the first live snapshot
+  arrives.
+- Terminal statuses use the same rule. Their `ageMs` is computed when the
+  summary is serialized (D5).
+
+**Clock owner.** One hook file, `apps/web/src/hooks/useAgentFreshness.ts`, owns
+the receipt map and the clock:
+
+- The map is keyed by row key and pruned to the rows that are present.
+- The clock is the existing shared `useMinuteClock`. Only callers with a decayable
+  row subscribe.
+- The hook exports `useAgentRows(...)`, which is used by the memoized
+  `AgentsPage` rows and groups and by `AgentsNavRow`.
+- It also exports `useWorkspaceCardStatus(thread, lastVisitedAt)`. The card
+  status lines in `Sidebar.tsx` (873, 1411) change by one line each, from
+  `resolveWorkspaceCardStatus(...)` to the hook. At line 1411 the conditional
+  moves inside the hook's argument, because hooks cannot run conditionally.
+- The pure resolvers (`resolveThreadStatusPill`, `resolveAgentGroup`,
+  `resolveWorkspaceCardStatus`) take `{ now, evidenceAt, environmentLive }` as
+  data and stay pure.
+
+**Rules (contract item 1).**
+
+| Condition                                                                                                                                          | Group     | Reason        | Label                                    |
+| ------------------------------------------------------------------------------------------------------------------------------------------------ | --------- | ------------- | ---------------------------------------- |
+| Environment not `live` (cached snapshot at launch, disconnected, synchronizing)                                                                   | `unknown` | `offline`     | "Offline", or "Connecting" while starting |
+| No status observer for this platform and provider (§D5 matrix)                                                                                    | `unknown` | `unavailable` | "Status unavailable"                     |
+| Working or Connecting with evidence older than `AGENT_STATUS_STALE_AFTER_MS = 30 min`                                                              | `unknown` | `stale`       | "No update in 34m"                       |
+| Open approval                                                                                                                                      | `blocked` | —             | Pending Approval (never decays)          |
+| Open question, or Plan Ready                                                                                                                       | `waiting` | —             | Awaiting Input or Plan Ready (never decays) |
+| Running or starting with fresh evidence                                                                                                            | `working` | —             | Working or Connecting                    |
+| Session `error` (D4)                                                                                                                               | `done`    | —             | Failed                                   |
+| Otherwise                                                                                                                                          | `done`    | —             | Done                                     |
+
+`offline` outranks every other state, because a cached state is not current
+evidence. Rows in `unknown` never pulse. The workspace card glyph gets
+`WORKSPACE_CARD_STATUS.unknown`, an idle-kind glyph labelled by the reason.
+
+The 30-minute threshold is Orca's (§3). It is long enough for legitimate silent
+tools, such as a 20-minute build.
+
+| Alternative                               | Why rejected                                                                                     |
+| ----------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| Stale rows go to `done`.                  | Claims a completion that nobody observed. Replaced by `unknown` (lead decision).                  |
+| Age measured as client now minus server time. | Server clock skew stretches or shrinks every age.                                            |
+| First sight stamped "now".                | Grants 30 fresh minutes on every launch (review P2).                                             |
+| A server watchdog that flips `running`.   | It would invent a session state. Decay is a display claim, not a transition.                     |
 
 ### D4. Failed is distinct inside Done (fixes F5)
 
-`buildAgentRows` gives a thread with no live pill and `session.status === "error"`
-the pill `Failed`, in the destructive tone. That matches the workspace card's
-existing failed rule. The row stays in `done`. `interrupted` and `stopped` stay
-plain Done, because a person or BiBCode's own settlement ended them.
+A session in `error` with no pending request becomes `done` with the pill
+`Failed`, in the destructive tone. This matches the card's existing failed rule.
+`interrupted` and `stopped` stay plain Done.
 
-### D5. Terminal agents through the existing observers (F7). Separable, needs approval
+`STATUS_TONES` is exported from `Sidebar.logic.ts` (contract item 3). Its
+existing keys stay unchanged, and `failed` and `unknown` are added.
 
-We reuse the observers that already exist and build no new hook infrastructure.
+### D5. Terminal agents (fixes F7). In scope
 
-**Sources, per provider:**
+**Default change, visible to users.** Every observable AI Terminal (Claude,
+Codex, OpenCode) now launches with its status observer attached. This is no
+longer tied to the default-off **AI Terminal** activity setting.
 
-- **Claude.** Add `UserPromptSubmit`, `Stop`, `StopFailure`, `PermissionRequest`,
-  `Notification` and `SessionEnd` to the settings that
-  `provider_terminal/claude.rs:1352-1360` already injects. Map them as follows:
+The setting still gates the detailed Subagents and Background Tasks activity:
+
+- The observer's activity publication stays `Dormant` unless the setting is on.
+  The `TerminalAgentActivityControl` live/dormant transition already exists.
+- Main-agent status emission is independent of that state.
+
+The user-facing effects:
+
+- A Claude Terminal runs with BiBCode's additive hook settings, from a directory
+  owned by that generation.
+- A Codex Terminal starts BiBCode's supervised Unix-socket helper.
+- OpenCode is observed through its API.
+
+Users see this as terminal rows with live statuses. The change is named in the
+release notes and in `docs/user/workspace-ui.md`. If an observer cannot be
+prepared within its existing budget, the terminal launches unobserved, and the
+row reads `unknown` / `unavailable`. Examples: Claude older than v2.1.63, a
+Codex probe failure, a rejected settings merge.
+
+**Sources, per provider (existing observers).**
+
+- **Claude** (`provider_terminal/claude.rs`). Add `UserPromptSubmit`, `Stop`,
+  `StopFailure`, `PermissionRequest`, `Notification` and `SessionEnd` to the
+  settings injected at 1352-1360, and extend `validate_claude_hook` to bound
+  their fields.
   - `UserPromptSubmit`, and `PreToolUse`/`PostToolUse` other than
     `AskUserQuestion`, map to **working**.
   - `PermissionRequest` maps to **blocked**.
   - `PreToolUse` for `AskUserQuestion`, and `Elicitation`, map to **waiting**.
   - `Stop` maps to **done**, and `StopFailure` to **done** with failed.
   - `SessionEnd` clears the status.
-- **Codex.** Map the root thread's status, already read by
-  `provider_terminal/codex.rs`, as follows:
+- **Codex** (`provider_terminal/codex.rs`). The changes go only in the observer
+  and status-emission code, from about line 802 on. The preparation
+  budget and timeouts (about 451-505) and `supervisor.rs` (about 481) belong to
+  another agent. Map the root thread's status (`thread/status/changed`, or
+  `thread/read` on reconnect):
   - `active` with `waitingOnApproval` maps to **blocked**.
   - `active` with `waitingOnUserInput` maps to **waiting**.
   - `active` with no flags maps to **working**.
   - `idle` maps to **done**, and `systemError` to **done** with failed.
-- **OpenCode.** Map session busy to **working**, idle to **done**, a permission
-  ask to **blocked**, and a question to **waiting**.
+- **OpenCode** (`provider_terminal/opencode.rs`). Session busy maps to
+  **working**, idle to **done**, a permission ask to **blocked**, and a
+  question to **waiting**.
 
-**Publication.** `TerminalSummary` gains an optional
-`agentStatus: { state, failed, observedAt }`, published through the terminal
-manager's existing metadata upsert. That stream already starts with a snapshot,
-so reconnect hydration comes for free, and the thread shell does not need a
-wake. Clients key the status by `(environment, threadId, terminalId)`, which is
-Orca's per-pane keying.
+**Supported status matrix.** Chat rows depend only on the server protocol. The
+platform is the OS of the server host that runs the PTY.
 
-**Web.**
+| Provider | Chat (any OS) | AI Terminal, macOS and Linux                                   | AI Terminal, Windows        |
+| -------- | ------------- | -------------------------------------------------------------- | --------------------------- |
+| Claude   | full          | full (Claude Code ≥ 2.1.63, else `unknown/unavailable`)        | `unknown/unavailable`       |
+| Codex    | full          | full (when the helper probe succeeds, else `unavailable`)      | `unknown/unavailable`       |
+| OpenCode | full          | full                                                           | `unknown/unavailable`       |
+| Cursor   | full          | `unknown/unavailable`                                          | `unknown/unavailable`       |
+| Grok     | full          | `unknown/unavailable`                                          | `unknown/unavailable`       |
 
-- A card or row takes the most urgent of its chat pill and the statuses of its
-  AI terminals. The order is blocked, then waiting, then working, then done.
-- A thread with no chat session but an AI terminal that has a status becomes a
-  row.
-- D3 decay applies with the local receipt of `observedAt`.
+Here "full" means all four states plus decay. An unavailable terminal is never
+shown as Working or Done.
 
-**Trust boundary.** The process and network boundary stays the one the Claude
-observer already enforces:
+**Publication and hydration.**
 
-- Its listener is bound to `Ipv4Addr::LOCALHOST` on an ephemeral port.
-- Each generation has its own bearer token, compared in constant time.
-- Its settings live in a directory owned by that generation.
-- `validate_claude_hook` bounds every field.
+- `TerminalSummary` gains an optional field:
+  `agentStatus: { state: "working"|"blocked"|"waiting"|"done"|"unavailable", failed, ageMs }`.
+  The terminal manager keeps it in memory for each generation and publishes it
+  through the existing metadata `upsert`.
+- `ageMs` is computed when the summary is serialized, so the metadata snapshot
+  that every subscription starts with carries skew-free ages. Reconnect
+  hydration needs nothing new.
+- On terminal restart, the new generation starts unobserved until its first
+  hook.
+- On server restart, PTYs end, and the summaries go with them (`remove`).
+- On client restart, the client hydrates from the metadata snapshot, applying
+  D3's age rule.
+- When a PTY exits, the status becomes `done`, or `done` with failed for a
+  non-zero exit.
 
-Hook payloads come from the agent, so they are untrusted. Only the event name
-and the enum derived from it are kept, and no prompt or message text is stored
-or sent to the profiler. Codex keeps its Unix-socket helper, which is owned and
-supervised per generation. Status reaches clients only over the existing
-authenticated terminal metadata WebSocket, and no listener is exposed beyond
-loopback on the host that runs the PTY. That host is the remote server for a
-remote environment.
+**Rows (contract item 2).**
 
-**Decisions for the coordinator:**
+- One chat row per thread with a session, keyed `scopedThreadKey`.
+- One row per AI Terminal, keyed `${scopedThreadKey}#terminal:${terminalId}`,
+  with `terminalId` set and `ref` pointing at the host thread.
+- A worktree with no chat session but an AI terminal gets its terminal row.
+- Activating a terminal row goes through the center-panel API
+  (`terminal:${terminalId}`, `centerPanelStore.ts:533`).
+- The workspace card glyph takes the most urgent state among its chat and its
+  terminals, in the order blocked, waiting, working, done.
 
-1. Should status hooks run whenever an AI Terminal is launched, rather than only
-   when the default-off AI Terminal activity setting is on? Injecting hooks
-   changes what the CLI runs.
-2. Windows has no observer, so terminal rows there have no status. This must be
-   documented in the runbooks.
-3. This part touches `packages/contracts/src/terminal.ts` and
-   `provider_terminal/*`, neither of which is on the owned-files list.
+**Trust boundary (AGENTS.md).** Status rides the observers' existing boundaries
+and adds no new listener:
 
-**Recommendation:** ship D1 to D4 first, then D5 as a follow-up commit series
-once these decisions are made.
+- The Claude receiver is bound to `Ipv4Addr::LOCALHOST` on an ephemeral port
+  (`claude.rs:558`).
+- Each generation has its own bearer token, compared in constant time
+  (1322-1339).
+- The settings live in a directory owned by that generation, and
+  `validate_claude_hook` bounds every field.
+- Codex uses a Unix socket owned by the generation's helper.
+
+The default change widens who reaches these boundaries. Every observable AI
+Terminal now opens one, not only opted-in ones. What reaches them does not
+change: local processes that hold the generation's token or socket. Hook
+payloads come from the agent and are untrusted:
+
+- Only the event name, the derived enum and the tool name are kept, and the
+  tool name only to recognize `AskUserQuestion`.
+- No prompt, message or terminal text is stored, published or recorded by the
+  profiler.
+
+Status reaches clients only over the existing authenticated terminal metadata
+WebSocket. For a remote environment, the loopback listener runs on the remote
+server host, and nothing is exposed beyond that host's loopback.
 
 ### Effect on #186
 
-`AgentGroupId` keeps its name and values. Three things change in which rows
-land in each group:
+The contract fixes the groups. The Inbox counts `unknown` in All Agents only.
+Compared with today:
 
-- `waiting` (Awaiting Input) starts receiving question rows. It never could
-  before, because of F1.
+- `waiting` starts receiving questions.
 - `blocked` loses orphaned approvals.
-- `done` gains stale Working rows (`No update`) and Failed rows. If the Inbox
-  wants them under **Needs Attention**, it can read the pill label. The group
-  does not need to change.
+- `unknown` holds stale, offline and unavailable rows.
+- `done` gains Failed rows.
+- Terminal rows appear.
 
 ## 5. Tests
 
-| Behavior                                                                                 | Test seam (extend the existing tests)                                                                                                                       |
-| ---------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| D1: requested gives 1, resolved gives 0, a non-stale respond failure stays 1, a stale one gives 0, expired gives 0 | Engine projection tests next to the approval-projection tests (`engine.rs` ~12650-12725), through `dispatch` → shell JSON                                  |
-| D2: leaving `running` (`ready`, `error`, `interrupted`, restart reconcile) appends expiries in the same commit; `running` and `starting` do not; a repeat `ready` adds no duplicate; `approval.requested` after expiry reopens | Engine dispatch tests. Restart path: `reconcile_abandoned_provider_session` test module (`provider_runtime.rs` `workspace_loss_tests`), assertions only |
-| D2: an OpenCode recovered ask reappears after an expiry                                  | `request_is_recorded` repository test (`apps/server/tests/repositories.rs`)                                                                                |
-| D2: the chat closes a request on `*.expired` and reopens it on a later request           | `apps/web/src/session-logic.test.ts`                                                                                                                      |
-| Hydration: a new `subscribeShell` after the change carries `hasPendingUserInput` and `lastActivityAt` | `shell_stream_coalesces_event_bursts` neighbourhood (`orchestration_rpc.rs:7348`); client `shell-sync.test.ts` (snapshot replaces cached flags)            |
-| D3: first-sight stamp, a repeat value does not extend, a new value resets, the 30-minute boundary, approval and question never decay, skew immunity (server time far off) | Pure tests in `agentStatusFreshness.test.ts` and `Sidebar.logic.test.ts` with injected `now` and receipt map                                               |
-| Mapping table: every pill to a group, including `No update` and `Failed` to `done` and `Plan Ready` to `waiting`; non-live rows do not pulse | `agentsSection.logic.test.ts`; a new `AgentsRow` component test                                                                                                 |
-| Complete caller: `AgentsPage` and `AgentsNavRow` group a thread whose shell has an open question under Awaiting Input, and a decayed one under Done | `AgentsPage` component test (`vp test run --project unit`)                                                                                                 |
+| Behavior                                                                                                                                                | Test seam                                                                                                                                                      |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| D1 count from request-state activities only. Requested gives 1, resolved 0, non-stale failure 1, stale failure 0, expired 0. An assistant delta does not recompute it. | Engine tests through `dispatch` → shell JSON (next to the approval-projection tests, `engine.rs` ~12650-12725)                                                |
+| D2a: a stale `provider.approval.respond.failed` while the session is running clears Pending Approval                                                  | Same engine tests                                                                                                                                              |
+| D2b: leaving `running` (`ready`, `error`, `interrupted`, restart reconcile) appends expiries in the same commit. `running` and `starting` do not. No duplicates. A re-request reopens. | Engine dispatch tests; restart assertions in the `provider_runtime.rs` test modules (test code only)                                                             |
+| D2b queue: an expiry at `ready` drains like an answered approval; an expiry on interrupt or error stays held                                           | Repository queue-head tests (`apps/server/tests/repositories.rs`) and the engine hold tests                                                                     |
+| D2: an OpenCode recovered ask reappears after an expiry                                                                                                 | `request_is_recorded` repository test                                                                                                                         |
+| D2 client: `*.expired` closes a request, and a later request reopens it                                                                               | `apps/web/src/session-logic.test.ts`                                                                                                                          |
+| D3 evidence: provider events and `running` session-sets move `lastActivityAt`; title, mode and archive updates do not                                 | Engine tests                                                                                                                                                  |
+| D3 age: skew-free conversion (server clock ±2 h), a repeated value keeps its time, a new value resets it, a launch after 40 min of silence is stale at once, 30-min boundary, approval and question never decay, offline outranks | `apps/web/src/hooks/useAgentFreshness.test.ts` and `Sidebar.logic.test.ts` (pure, injected `now`)                                                               |
+| Mapping table, every row of the D3 table plus the D5 matrix                                                                                            | `agentsSection.logic.test.ts`                                                                                                                                  |
+| Mounted threshold, AgentsPage: a row moves from Working to `unknown`/`stale` when the fake clock passes 30 min                                         | `AgentsPage.test.tsx` (`vp test run --project unit`, fake timers)                                                                                              |
+| Mounted threshold, card: a workspace card glyph moves from working to the unknown glyph at the threshold                                               | Sidebar card component test through the `useWorkspaceCardStatus` call site                                                                                      |
+| AgentsRow: no pulse in `unknown`, labels per reason, jump action omitted when no `onJumpToWorkspace`                                                  | New `AgentsRow.test.tsx`                                                                                                                                       |
+| D5 server, per provider: hook or status → `agentStatus` on `TerminalSummary`, and the metadata snapshot carries it with `ageMs`. Emitted with the activity setting off. Unavailable when unobserved. No prompt text. | `provider_terminal` unit tests; `apps/server/tests/production_server_terminal_rpc.rs`, `provider_terminal_supervisor.rs`                                         |
+| **Joined caller test**: a chat status and a terminal status are published, a client hydrates, the client reconnects (fresh snapshot), the client restarts (cached → offline → live), then grouping and card rendering | A web integration test driving the client-runtime shell and terminal-metadata states from a fake RPC session into the mounted `AgentsPage` and workspace card. The server half is covered by the `subscribeShell` (`shell_stream_coalesces_event_bursts` neighbourhood) and terminal-metadata RPC tests above. |
 
-## 6. Documentation
+## 6. Documentation and runbooks
 
-- `docs/architecture/rpc-and-orchestration.md`: the `lastActivityAt` shell field,
-  the expiry activities, and the queue behavior change.
-- `docs/user/workspace-ui.md`: Awaiting Input, the `No update` and `Failed`
-  labels, and decay.
-- `docs/testing/cross-platform-validation.md`: add the Agents view status checks,
-  covering a question, Stop during an approval, and a relaunch during an
-  approval.
-- For D5 only: `docs/architecture/activity-observation.md` and
-  `docs/providers/claude.md` for the hook list.
+- `docs/architecture/rpc-and-orchestration.md`: `lastActivityAt`, the expiry and
+  stale-failure settlements, and the queue behavior.
+- `docs/architecture/activity-observation.md`: observers always attached for
+  status, with detailed activity still gated; the status hook events; the trust
+  boundary.
+- `docs/providers/claude.md`: the injected hook list.
+- `docs/user/workspace-ui.md`:
+  - the five groups, with Unknown and its reasons, and Failed;
+  - terminal rows and activating them;
+  - the platform × provider matrix;
+  - the default change.
+- `docs/testing/cross-platform-validation.md` (native macOS, Linux and Windows):
+  - Agents view status checks for a question, Stop during an approval, and a
+    relaunch during an approval;
+  - terminal availability per platform (Windows shows `unavailable`);
+  - per-terminal row navigation;
+  - offline and restart behavior.
+- `docs/testing/ssh-environments.md` (remote): a remote AI terminal's status,
+  and a network drop showing `unknown`/`offline` and then recovering.
 
 ## 7. Profiler, crash and trace coverage
 
-D1 to D4 add no process, RPC, worktree-removal path, binary mode or service.
-Expiries are ordinary orchestration events. None applies. D5 adds hook events
-inside an existing supervised observer and no RPC. Its status must not record
-prompt text, which is already the observer's rule.
+- **Child processes.** The status observers are the existing supervised
+  observers, and the Codex helper is already registered with
+  `ProcessAttributionRegistry`. They now run for more terminals, but no new
+  process kind is added.
+- **Remaining items.** D1 to D4 add no RPC method, worktree-removal path,
+  binary mode or service.
+- **Logging.** Observer preparation failures, which lead to `unavailable`, log
+  with `tracing::warn!` at the existing boundary.
+- **Content.** Status records carry no prompt or terminal content.
