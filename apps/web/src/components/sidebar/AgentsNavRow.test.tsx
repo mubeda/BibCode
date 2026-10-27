@@ -221,7 +221,8 @@ describe("AgentsNavRow", () => {
     expect(getNavRow(mounted.container).getAttribute("aria-current")).toBeNull();
   });
 
-  it("marks a settling turn unread while mounted on a normal route", async () => {
+  // Unread detection lives in AgentsUnreadTracker, which outlives view switches.
+  it("leaves settling turns to the panel's unread tracker", async () => {
     const threadId = ThreadId.make("thread-settling");
     const runningTurn = {
       turnId: TurnId.make("turn-settling"),
@@ -244,6 +245,6 @@ describe("AgentsNavRow", () => {
     ];
     await rerenderNavRow(mounted);
 
-    expect(h.markUnread).toHaveBeenCalledExactlyOnceWith("environment-local:thread-settling");
+    expect(h.markUnread).not.toHaveBeenCalled();
   });
 });
