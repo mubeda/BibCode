@@ -2246,6 +2246,17 @@ describe("ChatView effects (captured and run manually)", () => {
     }
   });
 
+  it("withdraws LegendList's own end keeping when the reader takes over near the end", () => {
+    seedConnectedServerThread(makeThreadWithEarlierTurn());
+    renderServerRoute();
+    const list = installLegendList({ scroll: 190, scrollLength: 200, dataLength: 4, rowSize: 100 });
+    // LegendList holds nothing ChatView asked for, but a row just grew at the end, so it keeps
+    // the list there on the next frame; the reader's wheel must withdraw that too.
+    list.scrollNode.fire("wheel");
+
+    expect(list.calls.cancelScrollRequests).toBe(1);
+  });
+
   it("keeps a reader's line when the bottom region's height changes after they scroll away", () => {
     for (const [layout, options] of [
       // Within LegendList's end threshold of a list taller than the view.

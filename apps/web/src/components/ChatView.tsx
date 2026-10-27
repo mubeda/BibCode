@@ -449,21 +449,6 @@ interface CancellableTimelineList {
 }
 
 /**
- * Counts a scroll request ChatView made until LegendList finishes or drops it, so a reader who
- * takes over can withdraw one it still holds.
- */
-function trackTimelineScroll(outstanding: { current: number }, request: unknown): void {
-  if (!(request instanceof Promise)) {
-    return;
-  }
-  outstanding.current += 1;
-  const done = () => {
-    outstanding.current = Math.max(0, outstanding.current - 1);
-  };
-  request.then(done, done);
-}
-
-/**
  * How far the timeline must scroll for the sent row `messageId` to rest at its offset, measured
  * on screen: null within a pixel of it, undefined when the row is not mounted.
  */
@@ -4057,9 +4042,6 @@ function ChatViewContent(props: ChatViewProps) {
   // anchored end space changes size, as each delivery does, and positioning it then would take
   // the reader's place away, so it stays released until the next send or thread (#190).
   const releasedTimelineAnchorRef = useRef<MessageId | null>(null);
-  // Scroll requests ChatView made that LegendList has not finished. It can hold one while rows
-  // settle, and a held request would otherwise run over a reader who took over since.
-  const outstandingTimelineScrollsRef = useRef(0);
   const cancelTimelineLiveFollowForUserNavigation = useCallback(() => {
     // A send names its row pending before the previous one stops being positioned, so the
     // newest send is the one released.
@@ -4067,9 +4049,10 @@ function ChatViewContent(props: ChatViewProps) {
       pendingTimelineAnchorRef.current ??
       positionedTimelineAnchorRef.current ??
       releasedTimelineAnchorRef.current;
-    if (outstandingTimelineScrollsRef.current > 0) {
-      (legendListRef.current as CancellableTimelineList | null)?.cancelScrollRequests?.();
-    }
+    // LegendList can hold a scroll ChatView asked for while rows settle, or be about to keep the
+    // list at its end after a row grew; either would run over the reader, so withdraw both. The
+    // method changes nothing when neither is under way.
+    (legendListRef.current as CancellableTimelineList | null)?.cancelScrollRequests?.();
     anchorUserScrollGenerationRef.current += 1;
     timelineScrollModeRef.current = "free-scrolling";
     liveFollowUserScrollGenerationRef.current = null;
@@ -4150,10 +4133,7 @@ function ChatViewContent(props: ChatViewProps) {
     activeTimelineAnchorIndexRef.current = null;
     showScrollDebouncer.current.cancel();
     setScrollPillThreadId(null);
-    trackTimelineScroll(
-      outstandingTimelineScrollsRef,
-      legendListRef.current?.scrollToEnd?.({ animated }),
-    );
+    void legendListRef.current?.scrollToEnd?.({ animated });
   }, []);
   const pageTimeline = useCallback(
     (key: "PageUp" | "PageDown", repeat: boolean) => {
@@ -4173,10 +4153,7 @@ function ChatViewContent(props: ChatViewProps) {
       }
       cancelTimelineLiveFollowForUserNavigation();
       // A held key repeats faster than a glide finishes, so repeats jump.
-      trackTimelineScroll(
-        outstandingTimelineScrollsRef,
-        list.scrollToOffset({ offset, animated: !repeat && timelineScrollAnimates() }),
-      );
+      void list.scrollToOffset({ offset, animated: !repeat && timelineScrollAnimates() });
     },
     [cancelTimelineLiveFollowForUserNavigation, composerOverlayHeight],
   );
@@ -4244,13 +4221,10 @@ function ChatViewContent(props: ChatViewProps) {
         if (delta === undefined || delta === null || outOfTime) {
           if (attempt === 1) {
             // Stop the glide where it is; it would otherwise go on under the follow.
-            trackTimelineScroll(
-              outstandingTimelineScrollsRef,
-              list.scrollToOffset({
-                offset: delta === null ? scrollNode.scrollTop : list.getState().scroll,
-                animated: false,
-              }),
-            );
+            void list.scrollToOffset({
+              offset: delta === null ? scrollNode.scrollTop : list.getState().scroll,
+              animated: false,
+            });
           }
           settle();
           return;
@@ -4259,7 +4233,6 @@ function ChatViewContent(props: ChatViewProps) {
           offset: scrollNode.scrollTop + delta,
           animated: false,
         });
-        trackTimelineScroll(outstandingTimelineScrollsRef, request);
         let next = false;
         const measureAgain = () => {
           if (next) {
@@ -4327,15 +4300,12 @@ function ChatViewContent(props: ChatViewProps) {
         };
         const fallbackTimer = window.setTimeout(finishAnimatedPositioning, 750);
         scrollNode.addEventListener("scrollend", finishAnimatedPositioning, { once: true });
-        trackTimelineScroll(
-          outstandingTimelineScrollsRef,
-          list.scrollToIndex({
-            index: anchorIndex,
-            animated: true,
-            viewPosition: 0,
-            viewOffset: CHAT_LIST_ANCHOR_OFFSET,
-          }),
-        );
+        void list.scrollToIndex({
+          index: anchorIndex,
+          animated: true,
+          viewPosition: 0,
+          viewOffset: CHAT_LIST_ANCHOR_OFFSET,
+        });
       });
     };
     requestAnimationFrame(() => positionAnchor(12));
@@ -4376,10 +4346,7 @@ function ChatViewContent(props: ChatViewProps) {
           typeof currentScrollOffset === "number" &&
           Math.abs(currentScrollOffset - pending.offset) <= 2
         ) {
-          trackTimelineScroll(
-            outstandingTimelineScrollsRef,
-            list?.scrollToOffset({ offset: pending.offset, animated: false }),
-          );
+          void list?.scrollToOffset({ offset: pending.offset, animated: false });
         }
       }
     });
@@ -4434,13 +4401,10 @@ function ChatViewContent(props: ChatViewProps) {
         if (!list || !metrics || metrics.scrollDeltaToRevealEnd <= 1) {
           return;
         }
-        trackTimelineScroll(
-          outstandingTimelineScrollsRef,
-          list.scrollToOffset({
-            offset: list.getState().scroll + metrics.scrollDeltaToRevealEnd,
-            animated: false,
-          }),
-        );
+        void list.scrollToOffset({
+          offset: list.getState().scroll + metrics.scrollDeltaToRevealEnd,
+          animated: false,
+        });
       });
     });
   }, [getActiveTimelineTurnMetrics]);
@@ -4475,10 +4439,7 @@ function ChatViewContent(props: ChatViewProps) {
       }
 
       const nextOffset = list.getState().scroll + metrics.scrollDeltaToRevealEnd;
-      trackTimelineScroll(
-        outstandingTimelineScrollsRef,
-        list.scrollToOffset({ offset: nextOffset, animated: false }),
-      );
+      void list.scrollToOffset({ offset: nextOffset, animated: false });
       // LegendList clamps a scroll to the content height it has laid out, which can lag the
       // rows it has measured. A clamped scroll leaves the end hidden until the next delivery,
       // so look again once layout has caught up, a few times at most, and stop if the reader
@@ -4508,13 +4469,10 @@ function ChatViewContent(props: ChatViewProps) {
             if (reached >= target.targetScrollToRevealEnd - 1) {
               return;
             }
-            trackTimelineScroll(
-              outstandingTimelineScrollsRef,
-              current.scrollToOffset({
-                offset: target.targetScrollToRevealEnd,
-                animated: false,
-              }),
-            );
+            void current.scrollToOffset({
+              offset: target.targetScrollToRevealEnd,
+              animated: false,
+            });
             if (remaining > 1) {
               recheck(remaining - 1);
             }
@@ -4532,7 +4490,7 @@ function ChatViewContent(props: ChatViewProps) {
       return;
     }
 
-    trackTimelineScroll(outstandingTimelineScrollsRef, list.scrollToEnd?.({ animated: false }));
+    void list.scrollToEnd?.({ animated: false });
   }, [getActiveTimelineTurnMetrics, timelineRealContentOverflowsViewport]);
   useLayoutEffect(() => {
     followTimelineLiveEndRef.current = followTimelineLiveEnd;
@@ -6118,10 +6076,7 @@ function ChatViewContent(props: ChatViewProps) {
         isAtEndRef.current = true;
         timelineScrollModeRef.current = "following-end";
         setTimelineFollowsEnd(true);
-        trackTimelineScroll(
-          outstandingTimelineScrollsRef,
-          legendListRef.current?.scrollToEnd?.({ animated: false }),
-        );
+        void legendListRef.current?.scrollToEnd?.({ animated: false });
       }
       if (!enqueue || composerAttachmentsSnapshot.length > 0) {
         // Sending always returns to the live edge. The new row becomes the
