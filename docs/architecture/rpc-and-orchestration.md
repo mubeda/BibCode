@@ -2608,6 +2608,41 @@ load produces, and only the HTTP read model below loads the whole store. A
 thread's activities are read in the order of their
 `(thread_id, sequence, created_at, activity_id)` index, so the listing needs
 no temporary sort that would spill large payloads to a temporary file.
+
+The shell carries what the left panel's agent status reads (#187):
+
+- **`hasPendingApprovals`** comes from `projection_pending_approvals`.
+- **`hasPendingUserInput`** is the thread's count of open questions. A question
+  is open while the newest record for its request is the ask itself, or a
+  refused answer that the provider did not call stale. That rule is one shared
+  SQL fragment, `open_user_input_requests_sql`, which the queue head also uses.
+  The count is recomputed only when a request's state changes, not on every
+  thread event.
+- **`lastActivityAt`** is the time of the thread's latest provider progress:
+  either an event the engine attributes to the provider, or a session update to
+  `starting` or `running`. Titles, modes, archiving and BiBCode's own
+  settlements never move it.
+- **`lastActivityAgeMs`** is how old `lastActivityAt` was on the server's clock
+  when the snapshot was built. The client ages a Working status from its own
+  receipt of that value, so it never compares clocks with the server.
+
+Requests also settle without an answer:
+
+- A stale or unknown `provider.approval.respond.failed` resolves its approval.
+- When a `thread.session-set` moves the session out of `running` and `starting`,
+  the same commit appends an `approval.expired` or `user-input.expired`
+  activity for every request still open. The payload is
+  `{ requestId, reason: "session-ended", sessionStatus }`. A provider cannot
+  end, interrupt or lose a turn while it still waits on an answer, so the
+  expired requests can never be answered.
+- An expired request reopens if the provider asks it again, which OpenCode does
+  for the asks it recovers on resume. `request_is_recorded` treats an expired
+  request as not recorded, so the recovered ask is shown.
+
+Queue consequence: a session that ends a turn `ready` with a dead request no
+longer holds its queued follow-ups. They deliver as they would after an
+answered request. Interrupted, failed and restart-reconciled sessions still
+hold the queue, as before.
 `orchestration.replayEvents` with `paged: true` returns about 1 MiB pages
 `{ events, exhausted }`, keeping at least one event when any remain. Replay
 resumes from the last applied `sequence` with no server state; the cursor is
