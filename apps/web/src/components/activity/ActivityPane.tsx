@@ -119,6 +119,7 @@ function ActivityPaneCard({
     snapshot !== null && selectActivityDockVisibility(snapshot, { alwaysVisible }).visible;
   // An open card keeps its last snapshot while the snapshot is briefly gone,
   // such as during a reconnect, so focus, the open record, and scroll survive.
+  // The panel body reads this same snapshot, so it holds with the button.
   // A snapshot that says to hide (no records) still hides it.
   const [heldSnapshot, setHeldSnapshot] = useState<ActivitySnapshot | null>(null);
   const holding = expanded && snapshot === null;
@@ -194,6 +195,7 @@ function ActivityPaneCard({
             onFocusRequestHandled={onFocusRequestHandled}
             onNavigate={onNavigate}
             route={route}
+            snapshot={displayedSnapshot}
             target={target}
           />
         </div>

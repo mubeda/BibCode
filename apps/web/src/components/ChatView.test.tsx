@@ -1363,6 +1363,7 @@ describe("ChatView", () => {
           root.render(
             <ActivityPanelBinding
               target={{ environmentId, input: terminalScope }}
+              snapshot={snapshot}
               route={{ section: "subagents", selectedRecordKind: null, selectedRecordId: null }}
               timestampFormat="locale"
               onNavigate={() => undefined}
@@ -1867,6 +1868,7 @@ describe("ChatView", () => {
           });
           seedActivityState(environmentId, authoritative.scope, authoritative);
           await act(async () => {
+            publishAtomValues();
             useCenterPanelStore.getState().navigateActivityPane(threadRef, HOST_SURFACE_ID, {
               section: "subagents",
               selectedRecordKind: "actor",
@@ -2791,6 +2793,62 @@ describe("ChatView", () => {
           expect(container.textContent).toContain("Compact reviewer");
         });
         expect(container.querySelector('[data-mock="right-panel-sheet"]')).toBeNull();
+      } finally {
+        await act(async () => root.unmount());
+        container.remove();
+      }
+    });
+
+    it("keeps an open panel's records, focus, and scroll while its snapshot drops away", async () => {
+      const child = actor("actor-held", "Held reviewer");
+      const snapshot = activitySnapshot({ _tag: "thread", threadId }, [child]);
+      seedEnvironment(makeEnvironmentPresentation());
+      seedProject(makeProject());
+      seedServerThread(makeThread());
+      seedGitStatus(true);
+      seedActivityState(environmentId, snapshot.scope, snapshot);
+      seedActivityQueries(environmentId, snapshot, [child]);
+
+      const { container, root } = await mountActivityRoute();
+      try {
+        await openSubagents(container);
+        await vi.waitFor(() => expect(container.textContent).toContain("Held reviewer"));
+        const panel = container.querySelector<HTMLElement>(
+          "[data-chat-composer-overlay] [data-activity-panel]",
+        );
+        expect(panel).not.toBeNull();
+        const row = [...panel!.querySelectorAll<HTMLButtonElement>("button")].find((button) =>
+          button.textContent?.includes("Held reviewer"),
+        );
+        expect(row).toBeDefined();
+        act(() => row!.focus());
+        const scroller = [panel!, ...panel!.querySelectorAll<HTMLElement>("*")].find(
+          (element) => element.scrollHeight >= element.clientHeight,
+        )!;
+        scroller.scrollTop = 40;
+        const scrollTop = scroller.scrollTop;
+
+        // A reconnect: the state atom briefly has no snapshot at all.
+        seedActivityState(environmentId, snapshot.scope, null, "synchronizing");
+        await act(async () => {
+          publishAtomValues();
+          await Promise.resolve();
+        });
+
+        expect(container.querySelector("[data-activity-panel]")).toBe(panel);
+        expect(panel!.textContent).toContain("Held reviewer");
+        expect(row!.isConnected).toBe(true);
+        expect(document.activeElement).toBe(row);
+        expect(scroller.scrollTop).toBe(scrollTop);
+        expect(container.querySelector('[data-testid="activity-dock"]')).not.toBeNull();
+
+        seedActivityState(environmentId, snapshot.scope, snapshot);
+        await act(async () => {
+          publishAtomValues();
+          await Promise.resolve();
+        });
+        expect(container.querySelector("[data-activity-panel]")).toBe(panel);
+        expect(document.activeElement).toBe(row);
       } finally {
         await act(async () => root.unmount());
         container.remove();
