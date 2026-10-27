@@ -344,6 +344,22 @@ if (process.argv.includes("app-server") && listenArgumentIndex >= 0) {
   process.on("SIGTERM", shutdown);
   process.on("SIGINT", shutdown);
 } else {
+// In a terminal (the remote TUI a Codex Terminal runs), draw the size the PTY
+// reports and redraw it on every resize, as a real TUI does on SIGWINCH. Chat
+// sessions talk JSON-RPC over a pipe, so they never see this.
+// Each size is also appended inside .git, out of the worktree's status, where
+// the packaged scenario reads it: a WebGL terminal has no text in the DOM.
+if (process.stdout.isTTY) {
+  const drawTerminalSize = () => {
+    const size = process.stdout.columns + "x" + process.stdout.rows;
+    process.stdout.write("\x1b[2J\x1b[Hfixture-tui " + size + "\r\n");
+    try {
+      fs.appendFileSync(fixtureProjectPath + "/.git/bibcode-fixture-tui-sizes.log", size + "\n");
+    } catch {}
+  };
+  drawTerminalSize();
+  process.stdout.on("resize", drawTerminalSize);
+}
 const reader = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
 const slowTurnReleasePath = fixtureProjectPath + "/" + ${JSON.stringify(SLOW_TURN_RELEASE_FILE_NAME)};
 // The marker releases a specific turn after reload assertions; the watchdog
