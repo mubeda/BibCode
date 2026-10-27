@@ -80,7 +80,7 @@ Every commit typechecks on its own.
     - the remembered route;
     - restoring at mount with focus left in an outside input;
     - a collapsed body that mounts no queries;
-    - an expanded card at zero counts;
+    - (dropped: an open card no longer has its own visibility rule at zero counts; it follows the button rule);
     - the height cap in a short pane.
   - `ProviderTerminalActivityDock.test.tsx`:
     - keep "keeps a pre-handshake snapshot hidden";

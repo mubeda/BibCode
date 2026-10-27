@@ -66,6 +66,8 @@ interface ActivityGeometry {
 interface TimelineScroll {
   readonly scrollTop: number;
   readonly distanceFromEnd: number;
+  readonly scrollHeight: number;
+  readonly clientHeight: number;
 }
 
 interface SurfacePresentation {
@@ -245,6 +247,8 @@ async function readTimelineScroll(): Promise<TimelineScroll> {
       distanceFromEnd: Math.round(
         scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop,
       ),
+      scrollHeight: Math.round(scroller.scrollHeight),
+      clientHeight: Math.round(scroller.clientHeight),
     };
   });
 }
@@ -915,9 +919,23 @@ async function assertInlineChatPanel(): Promise<void> {
   await assertBoundedActivityGeometry(1_200, true);
   await expectDockExpanded(true);
 
-  // Escape inside the panel collapses it and gives focus back to its button.
+  // The scroll checks below only mean something if the fixture thread scrolls.
+  const scrollable = await readTimelineScroll();
+  expect(scrollable.scrollHeight).toBeGreaterThan(scrollable.clientHeight);
+
+  // Escape inside the panel collapses it and gives focus back to its button,
+  // while the user reads mid-history.
   const rightPanelBefore = (await readPersistedPanelState()).rightPanel;
+  await browser.execute(() => {
+    const scroller = document.querySelector<HTMLElement>(
+      "[data-chat-surface]:has([data-activity-pane]) [class*='overflow-anchor']",
+    );
+    if (scroller)
+      scroller.scrollTop = Math.floor((scroller.scrollHeight - scroller.clientHeight) / 2);
+  });
+  await browser.pause(250);
   const scrollWhileOpen = await readTimelineScroll();
+  expect(scrollWhileOpen.distanceFromEnd).toBeGreaterThan(2);
   expect(
     await browser.execute(() => document.activeElement?.closest("[data-activity-panel]") !== null),
   ).toBe(true);
