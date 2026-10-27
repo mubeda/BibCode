@@ -356,6 +356,8 @@ async function toggleDiagramView(label: string): Promise<void> {
 const SENT_ROW_ANCHOR_OFFSET = 16;
 /** How far apart two separately streamed replies may come to rest: about two lines. */
 const STREAMED_REST_SLACK_PX = 48;
+/** How long after a reply's first delivery its sent row has settled, on the slowest runner. */
+const SENT_ROW_SETTLE_MS = 2_500;
 /** The `viewOffset` the timeline minimap scrolls a selected message to. */
 const MINIMAP_VIEW_OFFSET = 24;
 
@@ -948,9 +950,10 @@ describe("packaged Mermaid diagrams", () => {
     expect(coldDraw.painted.length).toBeGreaterThan(0);
     const appeared = coldDraw.painted.findIndex((entry) => entry.diagramRowBottom !== null);
     const drew = coldDraw.painted.findIndex((entry) => entry.diagramDrawn);
+    // A row remounted in the buffer can draw from the cache before its first painted frame, so
+    // the check needs the diagram drawn by the end, not a frame of its source first.
     expect(appeared).toBeGreaterThanOrEqual(0);
-    expect(coldDraw.painted[appeared]!.diagramDrawn).toBe(false);
-    expect(drew).toBeGreaterThan(appeared);
+    expect(drew).toBeGreaterThanOrEqual(appeared);
     const readingLine = coldDraw.painted[appeared]!.target!;
     // The diagram's row ends where the read row begins. A display scaled 200% lays the two out
     // a fraction of a pixel apart, so the row counts as above within the same 1 px as below.
@@ -1002,19 +1005,44 @@ describe("packaged Mermaid diagrams", () => {
     // deliveries; there the end must simply be revealed. The growth itself is followed two
     // frames after the draw, so on a slow runner the next delivery can land first; the draw's
     // delivery then passes when the end shows within the three painted samples after the draw.
+    // Following waits while the sent row glides into place, so on a slow webview the first
+    // deliveries, and the draw, can land before the list first catches up with the end. The
+    // glide settles within its 750 ms positioning timer and a few frames, so every delivery
+    // resting after the earlier of the catch-up and SENT_ROW_SETTLE_MS is checked; a list that
+    // catches up late fails on the deliveries in between.
     const plainRests = restingEnds(plain);
     const diagramRests = restingEnds(diagram);
-    const drewAfter = diagram[drew]!.afterParagraphs;
     const revealedBelow = (delivered: number) => Math.max(plainRests.get(delivered) ?? 0, 0) + 1;
+    const caughtUp = diagram.find(
+      (entry) =>
+        entry.fenceShown &&
+        entry.endBelow !== null &&
+        entry.endBelow <= revealedBelow(entry.afterParagraphs),
+    );
+    const checkedFrom = Math.min(
+      caughtUp?.at ?? Number.POSITIVE_INFINITY,
+      diagram[firstStreamed]!.at + SENT_ROW_SETTLE_MS,
+    );
+    const drewAfter = diagram[drew]!.afterParagraphs;
     const drawFollowed = diagram
       .slice(drew, drew + 4)
       .some(
         (entry) =>
           entry.endBelow !== null && entry.endBelow <= revealedBelow(entry.afterParagraphs),
       );
-    const endsHidden = [...diagramRests]
-      .filter(([delivered]) => delivered >= drewAfter)
-      .filter(([delivered]) => !(delivered === drewAfter && drawFollowed))
+    // The draw's grace covers only a delivery that rested within those samples, when the next
+    // one landed before the follow; a later rest of that delivery is checked like the others.
+    const restingSamples = new Map<number, number>();
+    for (const [index, entry] of diagram.entries()) {
+      if (!entry.fenceShown || entry.endBelow === null) continue;
+      restingSamples.set(entry.afterParagraphs + (entry.finished ? 1 : 0), index);
+    }
+    const endsHidden = [...restingSamples]
+      .filter(([delivered, index]) => delivered >= drewAfter && diagram[index]!.at >= checkedFrom)
+      .filter(
+        ([delivered, index]) => !(delivered === drewAfter && drawFollowed && index < drew + 4),
+      )
+      .map(([delivered, index]) => [delivered, diagram[index]!.endBelow!] as const)
       .filter(([delivered, below]) => below > revealedBelow(delivered));
     expect(diagramRests.has(drewAfter)).toBe(true);
     expect(endsHidden).toEqual([]);
