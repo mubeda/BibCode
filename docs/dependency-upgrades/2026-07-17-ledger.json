@@ -677,7 +677,7 @@
       "cohort": "react-ui",
       "platforms": ["linux", "macos", "windows"],
       "status": "green",
-      "notes": "Retain the anchor-lock patch (patches/@legendapp__list@3.3.10.patch) while the 300 ms anchor a data change locks for maintainVisibleContentPosition survives scrolls the list did not make. The stale anchor can sit below a row that grows after the scroll, and the view shifts by the growth. Remove it when a release releases the lock on user scroll and the packaged chat-reasoning-rows spec passes without the patch."
+      "notes": "Retain the maintainVisibleContentPosition patch (patches/@legendapp__list@3.3.10.patch) while a scroll inside the cached render range refreshes idsInView only with viewability callbacks and a data change's 300 ms anchor lock survives scrolls the list did not make. Either leaves the held row stale after a scroll, so a row growing above it shifts the view by its growth. Remove it when a release refreshes the rows on screen and releases the lock on user scroll, and the packaged chat-reasoning-rows spec passes without the patch."
     },
     {
       "key": "js:apps/web:@lexical/react",

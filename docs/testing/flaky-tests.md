@@ -79,6 +79,12 @@ process and install a process-wide subscriber after holding them, because the
 refusal is logged on the manager's callback thread. A new test that starts an
 observer worker uses `own_process!` too.
 
+A packaged spec sets a long test's timeout on the test, as
+`it(...).timeout(ms)`, or on its suite. WebdriverIO races a test body against
+the timeout the test had when it started, so `this.timeout(ms)` inside the
+body never takes effect: the test still fails at the suite's 120-second
+default, reported as a bare `Error: Timeout`.
+
 For WebSocket heartbeat integration, separate exact cadence from connection
 survival. Controlled-clock transport tests pin the 15-second cadence and the
 restart after a scheduler stall; real sockets verify Pong-only survival for
