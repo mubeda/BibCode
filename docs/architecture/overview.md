@@ -2106,7 +2106,7 @@ manager never reads the read model and persists nothing: devices, owners, and
 the deletion list end with the server.
 
 **The Device pane.** `ChatView` renders `DevicePanel` for the active thread and
-passes its root thread (chat panels render only Activity, so their devices are
+passes its root thread (chat panels render no right panel, so their devices are
 their host's), and the pane's session is keyed by thread. The thread's device
 surface stores the image the pane last picked or started
 (`{ id: "device", kind: "device", image?: { platform, imageId } }`, an image id

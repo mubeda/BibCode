@@ -5,7 +5,6 @@ import { createJSONStorage } from "zustand/middleware";
 
 import {
   migratePersistedRightPanelState,
-  selectActivityFocusRequested,
   selectActiveRightPanel,
   selectActiveRightPanelSurface,
   selectThreadRightPanelState,
@@ -14,10 +13,9 @@ import {
 
 const refA = scopeThreadRef("env-1" as EnvironmentId, ThreadId.make("thread-A"));
 const refB = scopeThreadRef("env-1" as EnvironmentId, ThreadId.make("thread-B"));
-const refAOtherEnvironment = scopeThreadRef("env-2" as EnvironmentId, ThreadId.make("thread-A"));
 
 beforeEach(() => {
-  useRightPanelStore.setState({ byThreadKey: {}, activityFocusRequests: {} });
+  useRightPanelStore.setState({ byThreadKey: {} });
 });
 
 describe("rightPanelStore", () => {
@@ -119,257 +117,11 @@ describe("rightPanelStore", () => {
     expect(state.isOpen).toBe(true);
   });
 
-  it("creates and activates exactly one activity surface", () => {
-    useRightPanelStore.getState().openActivity(refA, "subagents");
-
-    const state = selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA);
-    expect(state.surfaces).toHaveLength(1);
-    expect(selectActiveRightPanelSurface(useRightPanelStore.getState().byThreadKey, refA)).toEqual({
-      id: "activity",
-      kind: "activity",
-      scope: { _tag: "thread" },
-      section: "subagents",
-      selectedRecordKind: null,
-      selectedRecordId: null,
-    });
-    expect(
-      selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refAOtherEnvironment)
-        .surfaces,
-    ).toEqual([]);
-  });
-
-  it("updates the activity section without duplicating its singleton surface", () => {
-    useRightPanelStore.getState().openActivity(refA, "subagents");
-    useRightPanelStore.getState().navigateActivity(refA, {
-      section: "subagents",
-      selectedRecordKind: "actor",
-      selectedRecordId: "actor-1",
-    });
-    useRightPanelStore.getState().openActivity(refA, "backgroundTasks");
-
-    expect(selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA)).toEqual({
-      isOpen: true,
-      activeSurfaceId: "activity",
-      surfaces: [
-        {
-          id: "activity",
-          kind: "activity",
-          scope: { _tag: "thread" },
-          section: "backgroundTasks",
-          selectedRecordKind: null,
-          selectedRecordId: null,
-        },
-      ],
-    });
-  });
-
-  it("brings an open Activity panel to the front on the requested section without closing it", () => {
-    useRightPanelStore.getState().openActivity(refA, "subagents");
-    useRightPanelStore.getState().open(refA, "sourceControl");
-    expect(
-      selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA),
-    ).toMatchObject({ isOpen: true, activeSurfaceId: "sourceControl" });
-
-    useRightPanelStore.getState().openActivity(refA, "backgroundTasks");
-
-    const state = selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA);
-    expect(state.isOpen).toBe(true);
-    expect(state.activeSurfaceId).toBe("activity");
-    expect(state.surfaces.filter((surface) => surface.kind === "activity")).toHaveLength(1);
-    expect(
-      selectActiveRightPanelSurface(useRightPanelStore.getState().byThreadKey, refA),
-    ).toMatchObject({ section: "backgroundTasks" });
-  });
-
-  it("keeps the open record when the Activity button reopens the same section", () => {
-    useRightPanelStore.getState().openActivity(refA, "subagents");
-    useRightPanelStore.getState().navigateActivity(refA, {
-      section: "subagents",
-      selectedRecordKind: "actor",
-      selectedRecordId: "actor-1",
-    });
-
-    useRightPanelStore.getState().openActivity(refA, "subagents");
-
-    expect(
-      selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA).isOpen,
-    ).toBe(true);
-    expect(
-      selectActiveRightPanelSurface(useRightPanelStore.getState().byThreadKey, refA),
-    ).toMatchObject({
-      section: "subagents",
-      selectedRecordKind: "actor",
-      selectedRecordId: "actor-1",
-    });
-  });
-
-  it("asks the Activity panel to take focus on every open until the panel handles it", () => {
-    const focusRequested = (ref: typeof refA) =>
-      selectActivityFocusRequested(useRightPanelStore.getState(), ref);
-    useRightPanelStore.getState().openActivity(refA, "subagents");
-    expect(focusRequested(refA)).toBe(true);
-    expect(focusRequested(refB)).toBe(false);
-
-    useRightPanelStore.getState().acknowledgeActivityFocus(refA);
-    expect(focusRequested(refA)).toBe(false);
-
-    // Reopening the same section with a record open asks again.
-    useRightPanelStore.getState().navigateActivity(refA, {
-      section: "subagents",
-      selectedRecordKind: "actor",
-      selectedRecordId: "actor-1",
-    });
-    expect(focusRequested(refA)).toBe(false);
-    useRightPanelStore.getState().openActivity(refA, "subagents");
-    expect(focusRequested(refA)).toBe(true);
-  });
-
-  it("never persists a pending Activity focus request", () => {
-    useRightPanelStore.getState().openActivity(refA, "subagents");
-    const partialize = useRightPanelStore.persist.getOptions().partialize;
-
-    expect(partialize?.(useRightPanelStore.getState())).toEqual({
-      byThreadKey: useRightPanelStore.getState().byThreadKey,
-    });
-  });
-
-  it("selects and clears actor and work-item activity routes", () => {
-    useRightPanelStore.getState().openActivity(refA, "subagents");
-    useRightPanelStore.getState().navigateActivity(refA, {
-      section: "subagents",
-      selectedRecordKind: "actor",
-      selectedRecordId: "actor-1",
-    });
-    expect(
-      selectActiveRightPanelSurface(useRightPanelStore.getState().byThreadKey, refA),
-    ).toMatchObject({
-      selectedRecordKind: "actor",
-      selectedRecordId: "actor-1",
-    });
-
-    useRightPanelStore.getState().openActivity(refA, "backgroundTasks");
-    useRightPanelStore.getState().navigateActivity(refA, {
-      section: "backgroundTasks",
-      selectedRecordKind: "workItem",
-      selectedRecordId: "work-1",
-    });
-    expect(
-      selectActiveRightPanelSurface(useRightPanelStore.getState().byThreadKey, refA),
-    ).toMatchObject({
-      selectedRecordKind: "workItem",
-      selectedRecordId: "work-1",
-    });
-
-    useRightPanelStore.getState().navigateActivity(refA, {
-      section: "backgroundTasks",
-      selectedRecordKind: null,
-      selectedRecordId: null,
-    });
-    expect(
-      selectActiveRightPanelSurface(useRightPanelStore.getState().byThreadKey, refA),
-    ).toMatchObject({
-      selectedRecordKind: null,
-      selectedRecordId: null,
-    });
-  });
-
-  it("clears activity selection on section or scope changes", () => {
-    useRightPanelStore.getState().openActivity(refA, "subagents");
-    useRightPanelStore.getState().navigateActivity(refA, {
-      section: "subagents",
-      selectedRecordKind: "actor",
-      selectedRecordId: "actor-1",
-    });
-    useRightPanelStore.getState().navigateActivity(refA, {
-      section: "backgroundTasks",
-      selectedRecordKind: "workItem",
-      selectedRecordId: "work-1",
-    });
-    expect(
-      selectActiveRightPanelSurface(useRightPanelStore.getState().byThreadKey, refA),
-    ).toMatchObject({
-      section: "backgroundTasks",
-      selectedRecordKind: null,
-      selectedRecordId: null,
-    });
-
-    useRightPanelStore.getState().navigateActivity(refA, {
-      section: "backgroundTasks",
-      selectedRecordKind: "workItem",
-      selectedRecordId: "work-1",
-    });
-    useRightPanelStore
-      .getState()
-      .openActivity(refA, "backgroundTasks", { _tag: "terminal", terminalId: "term-1" });
-    expect(
-      selectActiveRightPanelSurface(useRightPanelStore.getState().byThreadKey, refA),
-    ).toMatchObject({
-      scope: { _tag: "terminal", terminalId: "term-1" },
-      selectedRecordKind: null,
-      selectedRecordId: null,
-    });
-  });
-
-  it("persists only a bounded terminal id and keeps terminal scope distinct from thread scope", () => {
-    useRightPanelStore
-      .getState()
-      .openActivity(refA, "subagents", { _tag: "terminal", terminalId: "term-1" });
-    expect(
-      selectActiveRightPanelSurface(useRightPanelStore.getState().byThreadKey, refA),
-    ).toMatchObject({
-      scope: { _tag: "terminal", terminalId: "term-1" },
-    });
-
-    useRightPanelStore.getState().openActivity(refA, "subagents");
-    expect(
-      selectActiveRightPanelSurface(useRightPanelStore.getState().byThreadKey, refA),
-    ).toMatchObject({
-      scope: { _tag: "thread" },
-    });
-
-    useRightPanelStore.getState().openActivity(refA, "subagents", {
-      _tag: "terminal",
-      terminalId: ` ${"x".repeat(256)}`,
-    });
-    expect(
-      selectActiveRightPanelSurface(useRightPanelStore.getState().byThreadKey, refA),
-    ).toMatchObject({
-      scope: { _tag: "thread" },
-    });
-  });
-
-  it("does not let stale activity navigation reopen or mutate a closed surface", () => {
-    useRightPanelStore.getState().openActivity(refA, "subagents");
-    useRightPanelStore.getState().close(refA);
-    const closed = selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA);
-
-    useRightPanelStore.getState().navigateActivity(refA, {
-      section: "subagents",
-      selectedRecordKind: "actor",
-      selectedRecordId: "actor-1",
-    });
-    expect(selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA)).toEqual(
-      closed,
-    );
-
-    useRightPanelStore.getState().closeSurface(refA, "activity");
-    useRightPanelStore.getState().navigateActivity(refA, {
-      section: "backgroundTasks",
-      selectedRecordKind: "workItem",
-      selectedRecordId: "work-1",
-    });
-    expect(selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA)).toEqual({
-      isOpen: false,
-      activeSurfaceId: null,
-      surfaces: [],
-    });
-  });
-
-  it("statically excludes activity from generic open and toggle actions", () => {
+  it("has no Activity surface to open or toggle", () => {
     const genericActivityCallsMustFail = () => {
-      // @ts-expect-error Activity routes must be opened through openActivity.
+      // @ts-expect-error Activity opens inline in its chat or terminal pane.
       useRightPanelStore.getState().open(refA, "activity");
-      // @ts-expect-error Activity routes must not use the generic toggle action.
+      // @ts-expect-error Activity opens inline in its chat or terminal pane.
       useRightPanelStore.getState().toggle(refA, "activity");
     };
     void genericActivityCallsMustFail;
@@ -912,134 +664,46 @@ describe("rightPanelStore", () => {
     });
   });
 
-  it("normalizes malformed activity routes and discards corrupt surfaces without throwing", () => {
-    expect(() =>
-      migratePersistedRightPanelState({
-        byThreadKey: {
-          saved: {
-            isOpen: true,
-            activeSurfaceId: "activity",
-            surfaces: [
-              null,
-              "activity",
-              { id: "activity", kind: "unknown" },
-              { id: "diff", kind: "activity" },
-              {
-                id: "activity",
-                kind: "activity",
-                scope: {
-                  _tag: "terminal",
-                  terminalId: "",
-                  threadId: "must-not-persist",
-                },
-                section: "unknown",
-                selectedRecordKind: "unknown",
-                selectedRecordId: "record-1",
-              },
-              {
-                id: "activity",
-                kind: "activity",
-                scope: { _tag: "thread", threadId: "must-not-persist" },
-                section: "subagents",
-                selectedRecordKind: "actor",
-                selectedRecordId: "",
-              },
-            ],
-          },
-          mismatched: {
-            isOpen: true,
-            activeSurfaceId: "activity",
-            surfaces: [
-              {
-                id: "activity",
-                kind: "activity",
-                scope: { _tag: "thread" },
-                section: "backgroundTasks",
-                selectedRecordKind: "actor",
-                selectedRecordId: "actor-1",
-              },
-            ],
-          },
-        },
-      }),
-    ).not.toThrow();
-
+  it("drops the retired Activity surface and keeps a panel that showed it closed", () => {
+    const activitySurface = {
+      id: "activity",
+      kind: "activity",
+      scope: { _tag: "thread" },
+      section: "subagents",
+      selectedRecordKind: null,
+      selectedRecordId: null,
+    };
     expect(
       migratePersistedRightPanelState({
         byThreadKey: {
-          saved: {
+          onlyActivity: { isOpen: true, activeSurfaceId: "activity", surfaces: [activitySurface] },
+          activeAmongOthers: {
             isOpen: true,
             activeSurfaceId: "activity",
-            surfaces: [
-              { id: "activity", kind: "unknown" },
-              { id: "diff", kind: "activity" },
-              {
-                id: "activity",
-                kind: "activity",
-                scope: {
-                  _tag: "terminal",
-                  terminalId: "",
-                  threadId: "must-not-persist",
-                },
-                section: "unknown",
-                selectedRecordKind: "unknown",
-                selectedRecordId: "record-1",
-              },
-              {
-                id: "activity",
-                kind: "activity",
-                scope: { _tag: "thread", threadId: "must-not-persist" },
-                section: "subagents",
-                selectedRecordKind: "actor",
-                selectedRecordId: "",
-              },
-            ],
+            surfaces: [{ id: "diff", kind: "diff" }, activitySurface, { id: "plan", kind: "plan" }],
           },
-          mismatched: {
+          inactiveAmongOthers: {
             isOpen: true,
-            activeSurfaceId: "activity",
-            surfaces: [
-              {
-                id: "activity",
-                kind: "activity",
-                scope: { _tag: "thread" },
-                section: "backgroundTasks",
-                selectedRecordKind: "actor",
-                selectedRecordId: "actor-1",
-              },
-            ],
+            activeSurfaceId: "plan",
+            surfaces: [activitySurface, { id: "plan", kind: "plan" }],
           },
         },
       }),
     ).toEqual({
       byThreadKey: {
-        saved: {
-          isOpen: true,
-          activeSurfaceId: "activity",
+        onlyActivity: { isOpen: false, activeSurfaceId: null, surfaces: [] },
+        activeAmongOthers: {
+          isOpen: false,
+          activeSurfaceId: "diff",
           surfaces: [
-            {
-              id: "activity",
-              kind: "activity",
-              scope: { _tag: "thread" },
-              section: "subagents",
-              selectedRecordKind: null,
-              selectedRecordId: null,
-            },
+            { id: "diff", kind: "diff" },
+            { id: "plan", kind: "plan" },
           ],
         },
-        mismatched: {
+        inactiveAmongOthers: {
           isOpen: true,
-          activeSurfaceId: "activity",
-          surfaces: [
-            {
-              id: "activity",
-              kind: "activity",
-              scope: { _tag: "thread" },
-              section: "backgroundTasks",
-              selectedRecordKind: null,
-              selectedRecordId: null,
-            },
-          ],
+          activeSurfaceId: "plan",
+          surfaces: [{ id: "plan", kind: "plan" }],
         },
       },
     });
@@ -1138,11 +802,13 @@ describe("rightPanelStore", () => {
 
       const hydrated = useRightPanelStore.getState();
       expect(hydrated).not.toHaveProperty("injectedTopLevel");
-      expect(typeof hydrated.openActivity).toBe("function");
+      expect(typeof hydrated.open).toBe("function");
+      // Every thread last showing Activity hydrates closed: Activity now
+      // lives inline in each pane, and the right panel never reopens for it.
       expect(hydrated.byThreadKey).toEqual({
         "env-1:thread-A": {
-          isOpen: true,
-          activeSurfaceId: null,
+          isOpen: false,
+          activeSurfaceId: "plan",
           surfaces: [
             { id: "plan", kind: "plan" },
             {
@@ -1155,34 +821,8 @@ describe("rightPanelStore", () => {
             },
           ],
         },
-        "env-1:thread-B": {
-          isOpen: true,
-          activeSurfaceId: "activity",
-          surfaces: [
-            {
-              id: "activity",
-              kind: "activity",
-              scope: { _tag: "thread" },
-              section: "backgroundTasks",
-              selectedRecordKind: null,
-              selectedRecordId: null,
-            },
-          ],
-        },
-        "env-1:thread-C": {
-          isOpen: true,
-          activeSurfaceId: "activity",
-          surfaces: [
-            {
-              id: "activity",
-              kind: "activity",
-              scope: { _tag: "thread" },
-              section: "subagents",
-              selectedRecordKind: "actor",
-              selectedRecordId: "actor-1",
-            },
-          ],
-        },
+        "env-1:thread-B": { isOpen: false, activeSurfaceId: null, surfaces: [] },
+        "env-1:thread-C": { isOpen: false, activeSurfaceId: null, surfaces: [] },
         "env-1:thread-D": {
           isOpen: false,
           activeSurfaceId: null,

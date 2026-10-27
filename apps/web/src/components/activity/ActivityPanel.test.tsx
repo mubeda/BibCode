@@ -1417,6 +1417,33 @@ describe("ActivityPanel detail", () => {
     expect(container.querySelector('[data-activity-entry-id="entry-204"]')).toBeNull();
   });
 
+  it("shows a restored record without taking focus from where the user is working", async () => {
+    const composer = document.createElement("textarea");
+    document.body.append(composer);
+    composer.focus();
+    try {
+      const container = await mount(
+        <ActivityPanel
+          {...props({
+            route: {
+              section: "subagents",
+              selectedRecordKind: "actor",
+              selectedRecordId: "child",
+            },
+            detail: detailQuery("actor", "child", [
+              detailPage(actor("child", { name: "Child reviewer" }), []),
+            ]),
+          })}
+        />,
+      );
+
+      expect(container.querySelector("[data-activity-detail-heading]")).not.toBeNull();
+      expect(document.activeElement).toBe(composer);
+    } finally {
+      composer.remove();
+    }
+  });
+
   it("returns to the same roster, restores focus, and focuses the heading after selection", async () => {
     const routes: ActivityPanelProps["route"][] = [];
     const onNavigate = vi.fn((route: ActivityPanelProps["route"]) => routes.push(route));

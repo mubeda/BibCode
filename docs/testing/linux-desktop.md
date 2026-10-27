@@ -754,8 +754,10 @@ verify:
   (and, on Linux, the **Menu** key): exactly one native menu opens at the card,
   and no error toast reports a second menu;
 - thread switching, terminal I/O, Activity elapsed time, keyboard focus, and
-  responsive overlays work, including reopening the global right panel after
-  a sibling chat suppresses a previously active Activity surface; and
+  responsive overlays work, including each chat and Codex terminal pane's own
+  Activity panel. It opens in its pane, above the composer or below the
+  terminal, and never in the right panel. It collapses back from its button or
+  Escape, and each pane remembers it after a reload; and
 - repeated loaded interaction does not freeze, duplicate events, or grow an
   unbounded process tree.
 
