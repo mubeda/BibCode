@@ -136,6 +136,7 @@ import { type LegendListRef } from "@legendapp/list/react";
 import {
   getAnchoredTurnMetrics,
   getTimelinePageScrollOffset,
+  keyboardScrollStopsLiveFollow,
   pointerPressStopsLiveFollow,
   rowToggleNeedsEndReveal,
   timelineScrollAnimates,
@@ -433,6 +434,26 @@ function setProjectFileSurfaceFlag(
  * LegendList clamped it to a content height it had not laid out yet.
  */
 const TIMELINE_END_FOLLOW_RECHECKS = 6;
+/** The patched LegendList method that withdraws its scroll requests (see the patch). */
+interface CancellableTimelineList {
+  readonly cancelScrollRequests?: () => void;
+}
+
+/**
+ * Counts a scroll request ChatView made until LegendList finishes or drops it, so a reader who
+ * takes over can withdraw one it still holds.
+ */
+function trackTimelineScroll(outstanding: { current: number }, request: unknown): void {
+  if (!(request instanceof Promise)) {
+    return;
+  }
+  outstanding.current += 1;
+  const done = () => {
+    outstanding.current = Math.max(0, outstanding.current - 1);
+  };
+  request.then(done, done);
+}
+
 const TYPE_TO_FOCUS_EDITABLE_SELECTOR = [
   "input",
   "textarea",
@@ -3995,7 +4016,23 @@ function ChatViewContent(props: ChatViewProps) {
   } | null>(null);
   const anchorScrollRestoreFrameRef = useRef<number | null>(null);
   const followTimelineLiveEndRef = useRef<() => void>(() => undefined);
+  // The sent row the reader scrolled away from. LegendList reports it ready again whenever the
+  // anchored end space changes size, as each delivery does, and positioning it then would take
+  // the reader's place away, so it stays released until the next send or thread (#190).
+  const releasedTimelineAnchorRef = useRef<MessageId | null>(null);
+  // Scroll requests ChatView made that LegendList has not finished. It can hold one while rows
+  // settle, and a held request would otherwise run over a reader who took over since.
+  const outstandingTimelineScrollsRef = useRef(0);
   const cancelTimelineLiveFollowForUserNavigation = useCallback(() => {
+    // A send names its row pending before the previous one stops being positioned, so the
+    // newest send is the one released.
+    releasedTimelineAnchorRef.current =
+      pendingTimelineAnchorRef.current ??
+      positionedTimelineAnchorRef.current ??
+      releasedTimelineAnchorRef.current;
+    if (outstandingTimelineScrollsRef.current > 0) {
+      (legendListRef.current as CancellableTimelineList | null)?.cancelScrollRequests?.();
+    }
     anchorUserScrollGenerationRef.current += 1;
     timelineScrollModeRef.current = "free-scrolling";
     liveFollowUserScrollGenerationRef.current = null;
@@ -4074,7 +4111,10 @@ function ChatViewContent(props: ChatViewProps) {
     activeTimelineAnchorIndexRef.current = null;
     showScrollDebouncer.current.cancel();
     setScrollPillThreadId(null);
-    void legendListRef.current?.scrollToEnd?.({ animated });
+    trackTimelineScroll(
+      outstandingTimelineScrollsRef,
+      legendListRef.current?.scrollToEnd?.({ animated }),
+    );
   }, []);
   const pageTimeline = useCallback(
     (key: "PageUp" | "PageDown", repeat: boolean) => {
@@ -4094,14 +4134,20 @@ function ChatViewContent(props: ChatViewProps) {
       }
       cancelTimelineLiveFollowForUserNavigation();
       // A held key repeats faster than a glide finishes, so repeats jump.
-      void list.scrollToOffset({ offset, animated: !repeat && timelineScrollAnimates() });
+      trackTimelineScroll(
+        outstandingTimelineScrollsRef,
+        list.scrollToOffset({ offset, animated: !repeat && timelineScrollAnimates() }),
+      );
     },
     [cancelTimelineLiveFollowForUserNavigation, composerOverlayHeight],
   );
   // The timeline remounts per thread (it is keyed by thread id), so bind to
-  // each thread's scroll node; without a thread there is no timeline.
+  // each thread's scroll node; without a thread there is no timeline. A thread
+  // with no rows shows an empty state instead of the list, so a new thread's
+  // list mounts with its first turn and binds then.
+  const timelineListShown = timelineEntries.length > 0 || isWorking;
   useEffect(() => {
-    if (activeThreadId === null) {
+    if (activeThreadId === null || !timelineListShown) {
       return;
     }
     let removeListeners: (() => void) | null = null;
@@ -4128,10 +4174,20 @@ function ChatViewContent(props: ChatViewProps) {
       scrollNode.addEventListener("pointerdown", handlePointerDown, {
         passive: true,
       });
+      // Keys that scroll the timeline from inside it, such as from a row's focused control (#190).
+      const handleKeyDown = (event: KeyboardEvent) => {
+        if (keyboardScrollStopsLiveFollow(event, scrollNode)) {
+          handleManualNavigation();
+        }
+      };
+      scrollNode.addEventListener("keydown", handleKeyDown, {
+        passive: true,
+      });
       removeListeners = () => {
         scrollNode.removeEventListener("wheel", handleManualNavigation);
         scrollNode.removeEventListener("touchmove", handleManualNavigation);
         scrollNode.removeEventListener("pointerdown", handlePointerDown);
+        scrollNode.removeEventListener("keydown", handleKeyDown);
       };
     });
 
@@ -4139,7 +4195,7 @@ function ChatViewContent(props: ChatViewProps) {
       cancelAnimationFrame(frame);
       removeListeners?.();
     };
-  }, [activeThreadId]);
+  }, [activeThreadId, timelineListShown]);
 
   const onTimelineAnchorReady = useCallback((messageId: MessageId, anchorIndex: number) => {
     if (pendingTimelineAnchorRef.current === messageId) {
@@ -4150,6 +4206,11 @@ function ChatViewContent(props: ChatViewProps) {
       return;
     }
     positionedTimelineAnchorRef.current = messageId;
+    if (releasedTimelineAnchorRef.current === messageId) {
+      // Nothing moves; the row only goes on holding the reader's place as the tail changes.
+      settledTimelineAnchorRef.current = messageId;
+      return;
+    }
     settledTimelineAnchorRef.current = null;
     const positionAnchor = (remainingAttempts: number) => {
       requestAnimationFrame(() => {
@@ -4175,8 +4236,10 @@ function ChatViewContent(props: ChatViewProps) {
           if (positionedTimelineAnchorRef.current !== messageId) {
             return;
           }
-          const scrollOffset = list.getState().scroll;
-          void list.scrollToOffset({ offset: scrollOffset, animated: false });
+          trackTimelineScroll(
+            outstandingTimelineScrollsRef,
+            list.scrollToOffset({ offset: list.getState().scroll, animated: false }),
+          );
           settledTimelineAnchorRef.current = messageId;
           // Replies that arrived during the glide were not followed; follow them now rather
           // than on the next one, which a reply that has finished never sends.
@@ -4186,12 +4249,15 @@ function ChatViewContent(props: ChatViewProps) {
         };
         const fallbackTimer = window.setTimeout(finishAnimatedPositioning, 750);
         scrollNode.addEventListener("scrollend", finishAnimatedPositioning, { once: true });
-        void list.scrollToIndex({
-          index: anchorIndex,
-          animated: true,
-          viewPosition: 0,
-          viewOffset: CHAT_LIST_ANCHOR_OFFSET,
-        });
+        trackTimelineScroll(
+          outstandingTimelineScrollsRef,
+          list.scrollToIndex({
+            index: anchorIndex,
+            animated: true,
+            viewPosition: 0,
+            viewOffset: CHAT_LIST_ANCHOR_OFFSET,
+          }),
+        );
       });
     };
     requestAnimationFrame(() => positionAnchor(12));
@@ -4232,7 +4298,10 @@ function ChatViewContent(props: ChatViewProps) {
           typeof currentScrollOffset === "number" &&
           Math.abs(currentScrollOffset - pending.offset) <= 2
         ) {
-          void list?.scrollToOffset({ offset: pending.offset, animated: false });
+          trackTimelineScroll(
+            outstandingTimelineScrollsRef,
+            list?.scrollToOffset({ offset: pending.offset, animated: false }),
+          );
         }
       }
     });
@@ -4285,10 +4354,13 @@ function ChatViewContent(props: ChatViewProps) {
         if (!list || !metrics || metrics.scrollDeltaToRevealEnd <= 1) {
           return;
         }
-        void list.scrollToOffset({
-          offset: list.getState().scroll + metrics.scrollDeltaToRevealEnd,
-          animated: false,
-        });
+        trackTimelineScroll(
+          outstandingTimelineScrollsRef,
+          list.scrollToOffset({
+            offset: list.getState().scroll + metrics.scrollDeltaToRevealEnd,
+            animated: false,
+          }),
+        );
       });
     });
   }, [getActiveTimelineTurnMetrics]);
@@ -4323,7 +4395,10 @@ function ChatViewContent(props: ChatViewProps) {
       }
 
       const nextOffset = list.getState().scroll + metrics.scrollDeltaToRevealEnd;
-      void list.scrollToOffset({ offset: nextOffset, animated: false });
+      trackTimelineScroll(
+        outstandingTimelineScrollsRef,
+        list.scrollToOffset({ offset: nextOffset, animated: false }),
+      );
       // LegendList clamps a scroll to the content height it has laid out, which can lag the
       // rows it has measured. A clamped scroll leaves the end hidden until the next delivery,
       // so look again once layout has caught up, a few times at most, and stop if the reader
@@ -4353,10 +4428,13 @@ function ChatViewContent(props: ChatViewProps) {
             if (reached >= target.targetScrollToRevealEnd - 1) {
               return;
             }
-            void current.scrollToOffset({
-              offset: target.targetScrollToRevealEnd,
-              animated: false,
-            });
+            trackTimelineScroll(
+              outstandingTimelineScrollsRef,
+              current.scrollToOffset({
+                offset: target.targetScrollToRevealEnd,
+                animated: false,
+              }),
+            );
             if (remaining > 1) {
               recheck(remaining - 1);
             }
@@ -4374,7 +4452,7 @@ function ChatViewContent(props: ChatViewProps) {
       return;
     }
 
-    void list.scrollToEnd?.({ animated: false });
+    trackTimelineScroll(outstandingTimelineScrollsRef, list.scrollToEnd?.({ animated: false }));
   }, [getActiveTimelineTurnMetrics, timelineRealContentOverflowsViewport]);
   useLayoutEffect(() => {
     followTimelineLiveEndRef.current = followTimelineLiveEnd;
@@ -4470,6 +4548,7 @@ function ChatViewContent(props: ChatViewProps) {
     pendingTimelineAnchorRef.current = null;
     positionedTimelineAnchorRef.current = null;
     settledTimelineAnchorRef.current = null;
+    releasedTimelineAnchorRef.current = null;
     activeTimelineAnchorIndexRef.current = null;
     showScrollDebouncer.current.cancel();
     if (planSidebarOpenOnNextThreadRef.current) {
@@ -5956,7 +6035,10 @@ function ChatViewContent(props: ChatViewProps) {
         queuedMessageCache.remember(messageIdForSend, { attachments: composerAttachmentsSnapshot });
         isAtEndRef.current = true;
         timelineScrollModeRef.current = "following-end";
-        void legendListRef.current?.scrollToEnd?.({ animated: false });
+        trackTimelineScroll(
+          outstandingTimelineScrollsRef,
+          legendListRef.current?.scrollToEnd?.({ animated: false }),
+        );
       }
       if (!enqueue || composerAttachmentsSnapshot.length > 0) {
         // Sending always returns to the live edge. The new row becomes the
@@ -5966,6 +6048,7 @@ function ChatViewContent(props: ChatViewProps) {
         timelineScrollModeRef.current = "anchoring-new-turn";
         liveFollowUserScrollGenerationRef.current = anchorUserScrollGenerationRef.current;
         pendingTimelineAnchorRef.current = messageIdForSend;
+        releasedTimelineAnchorRef.current = null;
         activeTimelineAnchorIndexRef.current = null;
         showScrollDebouncer.current.cancel();
         setScrollPillThreadId(null);
@@ -6548,6 +6631,7 @@ function ChatViewContent(props: ChatViewProps) {
       timelineScrollModeRef.current = "anchoring-new-turn";
       liveFollowUserScrollGenerationRef.current = anchorUserScrollGenerationRef.current;
       pendingTimelineAnchorRef.current = messageIdForSend;
+      releasedTimelineAnchorRef.current = null;
       activeTimelineAnchorIndexRef.current = null;
       showScrollDebouncer.current.cancel();
       setScrollPillThreadId(null);

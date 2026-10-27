@@ -3087,3 +3087,41 @@ of losing output or widening the boundary; a guard test keeps `eval` and the
 `Function` constructor out of the installed Pele and DOMPurify builds. Diagram
 source and Pele's messages, which can quote it, are never logged: a failure
 logs only `{ operation, code }`.
+
+### Chat timeline following
+
+`ChatView` keeps the timeline in one of three modes: following the end,
+anchoring a sent turn (the sent row glides to `CHAT_LIST_ANCHOR_OFFSET`, 16 px
+below the top, and the turn's end is revealed as the reply grows past the
+view), or free scrolling.
+
+- **Reader takeover.** The reader scrolling stops following: the wheel, a
+  touch move, a pointer press anywhere but a control (a press on a row's
+  control is a click), the scrolling keys (ArrowUp, ArrowDown, PageUp,
+  PageDown, Home, End, Space and Shift+Space) pressed with focus inside the
+  timeline, PageUp and PageDown from the composer, the minimap and find. A key
+  that a control owns (it called `preventDefault`), that edits text, that
+  activates a focused control (Space), or that would move nothing at the end
+  it points to leaves following on. Returning to the end resumes following.
+  These listeners bind to each thread's list once it shows, so a new thread,
+  which shows an empty state until its first turn, binds with that turn.
+- **Withdrawn requests.** LegendList can hold an imperative scroll for up to
+  800 ms while rows settle, clamps it to the content it has laid out, and a
+  wheel or key scroll does not cancel it. `ChatView` counts the scroll
+  requests it made that LegendList has not finished, and a takeover withdraws
+  them through `cancelScrollRequests()`, which
+  `patches/@legendapp__list@3.3.10.patch` adds. It drops a request waiting for
+  rows to settle, the completion checks and target of a scroll under way, and
+  the adjustment an animated scroll holds for rows that resized during it, and
+  it stops a glide the browser is still running where it is. A held request
+  therefore never moves a reader who took over. One caveat: when a row above
+  the view resized during the glide, LegendList's anchor lock from the send's
+  data change can re-derive the dropped adjustment about 70 ms later, but only
+  if no scroll follows the takeover; the takeover's own scroll (a key's default
+  action, the wheel) clears that lock first, so in use it does not return.
+- **Released sent row.** A sent row the reader scrolled away from stays
+  released until the next send or thread. LegendList reports the anchor ready
+  again whenever the anchored end space changes size, once per delivery; a
+  released row then only goes on holding the reader's place. A send names its
+  row pending before the previous row stops being positioned, so a takeover
+  releases the pending row first.
