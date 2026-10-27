@@ -21,6 +21,8 @@ const h = vi.hoisted(() => ({
   availability: [] as Array<{ environmentId: string; status: string }>,
   unreadThreadKeys: [] as string[],
   groupExpandedById: {} as Record<string, boolean>,
+  /** What every atom read returns: the AI Terminal sources (#187). */
+  atomValue: [] as unknown,
   navigate: vi.fn(),
   routerNavigate: vi.fn(),
   historyCanGoBack: vi.fn(),
@@ -37,6 +39,7 @@ const h = vi.hoisted(() => ({
     h.availability = [];
     h.unreadThreadKeys = [];
     h.groupExpandedById = {};
+    h.atomValue = [];
     h.navigate.mockReset().mockResolvedValue(undefined);
     h.routerNavigate.mockReset().mockResolvedValue(undefined);
     h.historyCanGoBack.mockReset().mockReturnValue(false);
@@ -54,7 +57,7 @@ const h = vi.hoisted(() => ({
 }));
 
 vi.mock("@effect/atom-react", () => ({
-  useAtomValue: () => [],
+  useAtomValue: () => h.atomValue,
 }));
 
 vi.mock("@tanstack/react-router", () => ({
@@ -256,6 +259,8 @@ vi.mock("../ui/menu", () => ({
   ),
 }));
 
+import { scopeThreadRef, scopedThreadKey } from "@bibcode/client-runtime/environment";
+import { selectFocusedCenterSurface, useCenterPanelStore } from "../../centerPanelStore";
 import { AppSidebarLayout } from "../AppSidebarLayout";
 import { AgentsPage } from "./AgentsPage";
 
@@ -431,6 +436,87 @@ describe("Agents page shell", () => {
   });
 });
 
+describe("AgentsPage AI Terminal rows (#187)", () => {
+  it("lists a terminal agent and shows its terminal when the row is selected", async () => {
+    const host = ThreadId.make("thread-host");
+    h.shells = [makeShell({ id: host, title: "Host workspace", session: null })];
+    h.atomValue = [
+      {
+        environmentId: ENVIRONMENT_LOCAL,
+        rows: [
+          {
+            threadId: host,
+            terminalId: "t-claude",
+            cwd: "/repo",
+            worktreePath: null,
+            status: "running",
+            pid: 1,
+            exitCode: null,
+            exitSignal: null,
+            hasRunningSubprocess: true,
+            label: "claude",
+            updatedAt: "2026-10-27T11:00:00.000Z",
+            centerPanel: true,
+            command: {
+              executable: "claude",
+              args: [],
+              label: "Claude Terminal",
+              activity: { driverKind: "claudeAgent", providerInstanceId: "claudeAgent" },
+            },
+            agentStatus: { state: "blocked", failed: false },
+          },
+        ],
+      },
+    ];
+    const { container } = await mount(<AgentsPage />);
+    const row = container.querySelector<HTMLButtonElement>(
+      'button[aria-label="Host workspace, Claude Terminal, Pending Approval, Local"]',
+    );
+    expect(row).not.toBeNull();
+    expect(container.querySelector('[data-testid="agents-group-status:blocked"]')).not.toBeNull();
+
+    await click(row!);
+    const ref = scopeThreadRef(ENVIRONMENT_LOCAL, host);
+    const state = useCenterPanelStore.getState().byThreadKey[scopedThreadKey(ref)];
+    expect(state === undefined ? null : selectFocusedCenterSurface(state)?.id).toBe(
+      "terminal:t-claude",
+    );
+  });
+});
+
+describe("AgentsPage status freshness (#187)", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("moves a mounted Working row to Unknown once its evidence is 30 minutes old", async () => {
+    vi.useFakeTimers({ now: Date.parse("2026-10-27T12:00:00.000Z") });
+    h.shells = [
+      workingShell({
+        id: ThreadId.make("thread-silent"),
+        title: "Silent agent",
+        lastActivityAt: "2026-10-27T12:00:00.000Z",
+        lastActivityAgeMs: 0,
+      }),
+    ];
+    const { container } = await mount(<AgentsPage />);
+    expect(queryAgentRow(container, "Silent agent", "Working")).not.toBeNull();
+    expect(container.querySelector('[data-testid="agents-group-status:working"]')).not.toBeNull();
+
+    await act(async () => {
+      vi.advanceTimersByTime(29 * 60_000);
+    });
+    expect(queryAgentRow(container, "Silent agent", "Working")).not.toBeNull();
+
+    await act(async () => {
+      vi.advanceTimersByTime(2 * 60_000);
+    });
+    expect(queryAgentRow(container, "Silent agent", "No update")).not.toBeNull();
+    expect(container.querySelector('[data-testid="agents-group-status:working"]')).toBeNull();
+    expect(container.querySelector('[data-testid="agents-group-status:unknown"]')).not.toBeNull();
+  });
+});
+
 describe("AgentsPage", () => {
   it("uses router history for Back when an entry exists", async () => {
     h.historyCanGoBack.mockReturnValue(true);
@@ -583,7 +669,8 @@ describe("AgentsPage", () => {
     h.vcsSummaryByCwd["/wt/offline"] = "feature/old";
     const { container } = await mount(<AgentsPage />);
 
-    const row = queryAgentRow(container, "Offline agent", "Working", "Local");
+    // A disconnected environment's cached Working is not current evidence (#187).
+    const row = queryAgentRow(container, "Offline agent", "Offline", "Local");
     expect(row!.textContent).toContain("main");
     expect(row!.textContent).not.toContain("feature/old");
   });
