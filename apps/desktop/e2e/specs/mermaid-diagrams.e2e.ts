@@ -5,6 +5,7 @@ import * as NodePath from "node:path";
 
 import {
   mermaidFixtureFiles,
+  mermaidFixtureKeyboardLastLine,
   mermaidFixturePrompts,
   mermaidFixtureStreamedLastLine,
   prepareMermaidFixtureFiles,
@@ -63,6 +64,22 @@ interface StreamSample {
    */
   readonly endBelow: number | null;
   readonly diagramDrawn: boolean;
+}
+
+interface KeyboardSample {
+  readonly at: number;
+  readonly scrollTop: number;
+  readonly clientHeight: number;
+  /** How far the list is scrolled from its end. */
+  readonly endGap: number;
+  /** As in `StreamSample`: the reply's end below the usable bottom, zero or less when shown. */
+  readonly endBelow: number | null;
+  /** Streamed paragraphs shown, and the last line as one more. */
+  readonly delivered: number;
+  /** Where the paragraph being read starts, below the visible top, once one is chosen. */
+  readonly readingTop: number | null;
+  /** Keydowns that reached the timeline's scroller so far. */
+  readonly keydowns: number;
 }
 
 interface LandingSample {
@@ -1073,7 +1090,321 @@ describe("packaged Mermaid diagrams", () => {
     expect(endsHidden).toEqual([]);
     await saveEvidence("mermaid-timeline-streaming-follow");
   }).timeout(240_000);
+
+  it("hands the timeline to the reader's keyboard and resumes at the end", async () => {
+    await setDesktopUiWindowSize(1_400, 900);
+    await openFixtureWorkspace();
+    await expectPaintingWebview();
+    // A reply with a code block, whose Copy button is the control the reader's keys start from.
+    // Focusing it is no pointer press, so it does not stop following by itself.
+    await sendPrompt(mermaidFixturePrompts.short);
+    await browser.waitUntil(
+      () =>
+        browser.execute(
+          (surface: string) =>
+            [...document.querySelectorAll(`${surface} .chat-markdown-mermaid svg`)].some((svg) =>
+              svg.textContent?.includes("Kept at the top"),
+            ),
+          visibleSurfaceSelector,
+        ),
+      { timeoutMsg: "The short fixture reply's diagram never drew." },
+    );
+    await scrollTimelineToEnd("After the short diagram.");
+    // Page scripts run in the webview, so each looks the button up itself: the lowest short
+    // reply's code block's Copy code button.
+    const copyMounted = await browser.execute((surface: string) => {
+      const button = [
+        ...document.querySelectorAll<HTMLElement>(`${surface} .chat-markdown-codeblock`),
+      ]
+        .filter((block) => block.textContent?.includes("Kept at the top"))
+        .sort((a, b) => b.getBoundingClientRect().top - a.getBoundingClientRect().top)[0]
+        ?.querySelector<HTMLButtonElement>('button[aria-label="Copy code"]');
+      return !!button && button.getBoundingClientRect().height > 0;
+    }, visibleSurfaceSelector);
+    if (!copyMounted) {
+      throw new Error("The short reply's code block shows no mounted Copy code button.");
+    }
+
+    await startKeyboardSamples();
+    const editor = browser.$(composerEditorSelector);
+    await editor.click();
+    await editor.addValue(mermaidFixturePrompts.keyboard);
+    await expect(editor).toHaveText(mermaidFixturePrompts.keyboard);
+    await browser.keys("Enter");
+    // As soon as the sent row shows, while it glides into place, the reader moves focus into
+    // the timeline and pages up with the keyboard. The packaged driver sends keys as dispatched
+    // events, which scroll nothing, so the spec dispatches the keydown on the focused control
+    // and then makes the scroll that key's default action makes, as a real key press does
+    // (the runbook's manual check covers a real key's ordering against these listeners).
+    await browser.waitUntil(
+      () =>
+        browser.execute(
+          (surface: string, prompt: string) =>
+            [...document.querySelectorAll(`${surface} [data-message-role="user"]`)].some((row) =>
+              row.textContent?.includes(prompt),
+            ),
+          visibleSurfaceSelector,
+          mermaidFixturePrompts.keyboard,
+        ),
+      { timeoutMsg: "The keyboard prompt's sent row never showed.", interval: 20 },
+    );
+    const focused = await browser.execute((surface: string) => {
+      const button = [
+        ...document.querySelectorAll<HTMLElement>(`${surface} .chat-markdown-codeblock`),
+      ]
+        .filter((block) => block.textContent?.includes("Kept at the top"))
+        .sort((a, b) => b.getBoundingClientRect().top - a.getBoundingClientRect().top)[0]
+        ?.querySelector<HTMLButtonElement>('button[aria-label="Copy code"]');
+      button?.focus({ preventScroll: true });
+      return !!button && document.activeElement === button;
+    }, visibleSurfaceSelector);
+    if (!focused) throw new Error("The short reply's Copy code button did not take focus.");
+    const paged = await pressTimelineKey("PageUp");
+    const keyAt = (await readKeyboardSamples()).keyAt;
+    if (keyAt === null) {
+      throw new Error("The PageUp keydown never reached the timeline's scroller.");
+    }
+    if (paged.defaultPrevented || paged.before - paged.after < paged.clientHeight / 2) {
+      throw new Error(`PageUp did not page the timeline up: ${JSON.stringify(paged)}.`);
+    }
+
+    // Once the view has rested, nothing ChatView asked LegendList for moves it again.
+    let samples: KeyboardSample[] = [];
+    await browser.waitUntil(
+      async () => {
+        samples = (await readKeyboardSamples()).samples;
+        const after = samples.filter((entry) => entry.at > keyAt);
+        return (
+          after.length >= 4 &&
+          after.slice(-4).every((entry) => entry.scrollTop === after.at(-1)!.scrollTop)
+        );
+      },
+      { timeoutMsg: "The timeline never came to rest after PageUp.", interval: 100 },
+    );
+
+    // The reader reads a paragraph near the top. It holds within a pixel on every painted frame
+    // for three seconds, through the glide's 750 ms settle timer and LegendList's 800 ms wait for
+    // rows to settle, either of which would move it if a request ChatView made before the key
+    // were still held, and through the deliveries that keep streaming below.
+    const readingChosen = await chooseKeyboardReadingLine();
+    await browser.pause(3_000);
+    samples = (await readKeyboardSamples()).samples;
+    const reading = samples.filter(
+      (entry) => entry.at >= readingChosen && entry.readingTop !== null,
+    );
+    const readingLine = reading[0]?.readingTop ?? null;
+    expect(readingLine).not.toBeNull();
+    const readingMoved = reading
+      .filter((entry) => Math.abs(entry.readingTop! - readingLine!) > 1)
+      .map((entry) => ({ at: Math.round(entry.at), readingTop: entry.readingTop }));
+    const deliveredWhileReading = reading.at(-1)!.delivered - reading[0]!.delivered;
+    expect(deliveredWhileReading).toBeGreaterThanOrEqual(5);
+    expect(readingMoved).toEqual([]);
+
+    // End returns to the end, and following resumes: every later delivery rests revealed.
+    const endAt = (await readKeyboardSamples()).samples.at(-1)!.at;
+    const ended = await pressTimelineKey("End");
+    if (ended.defaultPrevented)
+      throw new Error(`End did not reach the end: ${JSON.stringify(ended)}.`);
+    await browser.waitUntil(
+      async () => {
+        samples = (await readKeyboardSamples()).samples;
+        const last = samples.at(-1)!;
+        return last.delivered >= 31 && last.at - endAt > 1_500;
+      },
+      { timeoutMsg: "The keyboard reply never finished after End.", timeout: 30_000 },
+    );
+    await browser.execute(() =>
+      (window as unknown as { __bibcodeKeyboardStop?: () => void }).__bibcodeKeyboardStop?.(),
+    );
+    NodeFS.writeFileSync(
+      NodePath.join(preparedArtifactDirectory, "mermaid-timeline-keyboard-takeover.json"),
+      JSON.stringify(
+        {
+          keyAt: Math.round(keyAt),
+          readingChosen: Math.round(readingChosen),
+          endAt: Math.round(endAt),
+          samples: samples.filter(
+            (entry, index, all) =>
+              index === 0 ||
+              entry.scrollTop !== all[index - 1]!.scrollTop ||
+              entry.delivered !== all[index - 1]!.delivered ||
+              entry.readingTop !== all[index - 1]!.readingTop ||
+              entry.keydowns !== all[index - 1]!.keydowns,
+          ),
+        },
+        null,
+        2,
+      ),
+    );
+    const reachedEnd = samples.find((entry) => entry.at > endAt && entry.endGap <= 1);
+    expect(reachedEnd).toBeDefined();
+    const restsAfterEnd = new Map<number, KeyboardSample>();
+    for (const entry of samples) {
+      if (entry.at > reachedEnd!.at) restsAfterEnd.set(entry.delivered, entry);
+    }
+    // The delivery the list reached the end in can rest before following resumes on the next.
+    restsAfterEnd.delete(reachedEnd!.delivered);
+    expect(restsAfterEnd.size).toBeGreaterThanOrEqual(3);
+    const hiddenAfterEnd = [...restsAfterEnd.values()]
+      .filter((entry) => entry.endBelow === null || entry.endBelow > REVEALED_PX)
+      .map((entry) => ({
+        delivered: entry.delivered,
+        at: Math.round(entry.at),
+        endBelow: entry.endBelow,
+      }));
+    expect(hiddenAfterEnd).toEqual([]);
+    await saveEvidence("mermaid-timeline-keyboard-takeover");
+  }).timeout(240_000);
 });
+
+/**
+ * Samples the timeline after each painted frame for the keyboard case, and counts the keydowns
+ * that reach its scroller.
+ */
+async function startKeyboardSamples(): Promise<void> {
+  await browser.execute(
+    (surface: string, lastLine: string) => {
+      const record = window as unknown as {
+        __bibcodeKeyboard?: { samples: KeyboardSample[]; keyAt: number | null; reading: string };
+        __bibcodeKeyboardStop?: () => void;
+      };
+      record.__bibcodeKeyboardStop?.();
+      const scroller = document.querySelector<HTMLElement>(`${surface} [class*='overflow-anchor']`);
+      if (!scroller) throw new Error("The timeline scroller is missing.");
+      const state = { samples: [] as KeyboardSample[], keyAt: null as number | null, reading: "" };
+      record.__bibcodeKeyboard = state;
+      const started = performance.now();
+      let keydowns = 0;
+      const onKeyDown = (event: KeyboardEvent) => {
+        keydowns += 1;
+        if (event.key === "PageUp") state.keyAt ??= performance.now() - started;
+      };
+      // Capture, so the count holds whatever the timeline's own listeners do with the key.
+      scroller.addEventListener("keydown", onKeyDown, { capture: true });
+      const read = (): KeyboardSample => {
+        const paragraphs = [
+          ...document.querySelectorAll<HTMLElement>(`${surface} .chat-markdown p`),
+        ];
+        const area = scroller.getBoundingClientRect();
+        const reading = state.reading
+          ? paragraphs.find((element) => element.textContent === state.reading)
+          : undefined;
+        const blocks = [
+          ...document.querySelectorAll<HTMLElement>(
+            `${surface} .chat-markdown p, ${surface} .chat-markdown-codeblock`,
+          ),
+        ];
+        const end = Math.max(...blocks.map((block) => block.getBoundingClientRect().bottom));
+        const composerTop = document
+          .querySelector(`${surface} [data-chat-composer-form="true"]`)
+          ?.getBoundingClientRect().top;
+        return {
+          at: performance.now() - started,
+          scrollTop: scroller.scrollTop,
+          clientHeight: scroller.clientHeight,
+          endGap: Math.round(scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop),
+          endBelow:
+            blocks.length === 0
+              ? null
+              : Math.round(end - Math.min(area.bottom, composerTop ?? area.bottom)),
+          delivered:
+            paragraphs.filter((element) =>
+              element.textContent?.startsWith("Keyboard streamed paragraph"),
+            ).length + (paragraphs.some((element) => element.textContent === lastLine) ? 1 : 0),
+          readingTop: reading ? reading.getBoundingClientRect().top - area.top : null,
+          keydowns,
+        };
+      };
+      let running = true;
+      // A message posted from a frame callback is handled once that frame has painted.
+      const afterPaint = new MessageChannel();
+      afterPaint.port1.addEventListener("message", () => state.samples.push(read()));
+      afterPaint.port1.start();
+      const onFrame = () => {
+        if (!running || performance.now() - started > 60_000) return;
+        afterPaint.port2.postMessage(null);
+        requestAnimationFrame(onFrame);
+      };
+      requestAnimationFrame(onFrame);
+      record.__bibcodeKeyboardStop = () => {
+        running = false;
+        scroller.removeEventListener("keydown", onKeyDown, { capture: true });
+      };
+    },
+    visibleSurfaceSelector,
+    mermaidFixtureKeyboardLastLine,
+  );
+}
+
+/**
+ * Presses `key` on the focused control inside the timeline: dispatches its keydown, which
+ * bubbles to the timeline's own listeners, and then, unless a listener prevented it, makes the
+ * scroll the key's default action makes (PageUp: 87.5% of the visible height up; End: to the
+ * end). Returns the scroller's offset before and after.
+ */
+async function pressTimelineKey(
+  key: "PageUp" | "End",
+): Promise<{ before: number; after: number; clientHeight: number; defaultPrevented: boolean }> {
+  return browser.execute(
+    (surface: string, pressed: string) => {
+      const scroller = document.querySelector<HTMLElement>(`${surface} [class*='overflow-anchor']`);
+      const target = document.activeElement;
+      if (!scroller || !(target instanceof HTMLElement) || !scroller.contains(target)) {
+        throw new Error("No control inside the timeline has focus for the key.");
+      }
+      const before = scroller.scrollTop;
+      const event = new KeyboardEvent("keydown", { key: pressed, bubbles: true, cancelable: true });
+      target.dispatchEvent(event);
+      if (!event.defaultPrevented) {
+        if (pressed === "PageUp") scroller.scrollBy({ top: -scroller.clientHeight * 0.875 });
+        else scroller.scrollTo({ top: scroller.scrollHeight });
+      }
+      target.dispatchEvent(new KeyboardEvent("keyup", { key: pressed, bubbles: true }));
+      return {
+        before,
+        after: scroller.scrollTop,
+        clientHeight: scroller.clientHeight,
+        defaultPrevented: event.defaultPrevented,
+      };
+    },
+    visibleSurfaceSelector,
+    key,
+  );
+}
+
+async function readKeyboardSamples(): Promise<{ samples: KeyboardSample[]; keyAt: number | null }> {
+  return browser.execute(() => {
+    const state = (
+      window as unknown as {
+        __bibcodeKeyboard?: { samples: KeyboardSample[]; keyAt: number | null };
+      }
+    ).__bibcodeKeyboard;
+    return { samples: state?.samples ?? [], keyAt: state?.keyAt ?? null };
+  });
+}
+
+/**
+ * Picks the keyboard reply's paragraph nearest the visible top that shows whole, as the line
+ * being read, and returns the sample time from which it is tracked.
+ */
+async function chooseKeyboardReadingLine(): Promise<number> {
+  return browser.execute((surface: string) => {
+    const record = window as unknown as {
+      __bibcodeKeyboard?: { samples: Array<{ at: number }>; reading: string };
+    };
+    const scroller = document.querySelector<HTMLElement>(`${surface} [class*='overflow-anchor']`)!;
+    const area = scroller.getBoundingClientRect();
+    const paragraph = [...document.querySelectorAll<HTMLElement>(`${surface} .chat-markdown p`)]
+      .filter((element) => element.textContent?.startsWith("Keyboard before paragraph"))
+      .map((element) => ({ element, top: element.getBoundingClientRect().top }))
+      .filter((entry) => entry.top >= area.top + 40)
+      .sort((a, b) => a.top - b.top)[0];
+    if (!paragraph) throw new Error("No keyboard reply paragraph shows below the visible top.");
+    record.__bibcodeKeyboard!.reading = paragraph.element.textContent ?? "";
+    return record.__bibcodeKeyboard!.samples.at(-1)?.at ?? 0;
+  }, visibleSurfaceSelector);
+}
 
 /**
  * Scrolls the timeline to its end, sends `prompt`, and samples after each painted frame how

@@ -4,6 +4,7 @@ import {
   getRowBottom,
   getTimelinePageScrollOffset,
   isAboveReadingLine,
+  keyboardScrollStopsLiveFollow,
   rowToggleNeedsEndReveal,
   type TimelineScrollMode,
 } from "./timelineScrollAnchoring";
@@ -200,5 +201,74 @@ describe("reading line", () => {
     expect(isAboveReadingLine({ ...base, elementTop: 10 })).toBe(false);
     expect(isAboveReadingLine({ ...base, elementTop: 0 })).toBe(false);
     expect(isAboveReadingLine({ ...base, rowTop: 40, rowBottom: 500, elementTop: 80 })).toBe(false);
+  });
+});
+
+describe("keyboard scrolling of the timeline", () => {
+  // 1000 px of content in a 400 px scroller, so the end is at 600.
+  const scroller = (scrollTop: number) => ({ scrollTop, scrollHeight: 1000, clientHeight: 400 });
+  /** A target that matches the selectors in `matches`, as `Element.closest` would. */
+  const target = (matches: readonly string[] = [], isContentEditable = false) => ({
+    isContentEditable,
+    closest: (selector: string) =>
+      selector.split(",").some((part) => matches.includes(part.trim())) ? {} : null,
+  });
+  const press = (
+    key: string,
+    options: {
+      readonly shiftKey?: boolean;
+      readonly defaultPrevented?: boolean;
+      readonly target?: unknown;
+      readonly scrollTop?: number;
+    } = {},
+  ) =>
+    keyboardScrollStopsLiveFollow(
+      {
+        key,
+        shiftKey: options.shiftKey ?? false,
+        defaultPrevented: options.defaultPrevented ?? false,
+        target: (options.target ?? target()) as EventTarget,
+      },
+      scroller(options.scrollTop ?? 300),
+    );
+
+  it("stops following for every key that scrolls the timeline", () => {
+    for (const key of ["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "]) {
+      expect(press(key)).toBe(true);
+    }
+    expect(press(" ", { shiftKey: true })).toBe(true);
+    expect(press("ArrowUp", { target: target(["button"]) })).toBe(true);
+  });
+
+  it("leaves following on for keys that do not scroll it", () => {
+    expect(press("ArrowLeft")).toBe(false);
+    expect(press("Enter")).toBe(false);
+    expect(press("a")).toBe(false);
+  });
+
+  it("leaves following on when a control owns the key", () => {
+    expect(press("ArrowDown", { defaultPrevented: true })).toBe(false);
+    expect(press(" ", { target: target(["button"]) })).toBe(false);
+    expect(press(" ", { target: target(["summary"]) })).toBe(false);
+  });
+
+  it("leaves following on while the key edits text", () => {
+    expect(press("ArrowUp", { target: target(["textarea"]) })).toBe(false);
+    expect(press("End", { target: target(["input"]) })).toBe(false);
+    expect(press("ArrowDown", { target: target(["select"]) })).toBe(false);
+    expect(press("PageUp", { target: target([], true) })).toBe(false);
+  });
+
+  it("leaves following on when the list is already at the end the key moves toward", () => {
+    for (const key of ["ArrowDown", "PageDown", "End", " "]) {
+      expect(press(key, { scrollTop: 600 })).toBe(false);
+      expect(press(key, { scrollTop: 599.5 })).toBe(false);
+      expect(press(key, { scrollTop: 0 })).toBe(true);
+    }
+    for (const key of ["ArrowUp", "PageUp", "Home"]) {
+      expect(press(key, { scrollTop: 0 })).toBe(false);
+      expect(press(key, { scrollTop: 600 })).toBe(true);
+    }
+    expect(press(" ", { shiftKey: true, scrollTop: 0 })).toBe(false);
   });
 });

@@ -2961,8 +2961,11 @@ sizes. Cover relevant:
   theme switch without flashing its source; a selection copied from inside a
   diagram pastes as its fenced source; the clipped Proposed Plan preview keeps
   a fence it cut open as source; and a diagram drawing above the line being
-  read in the chat leaves that line in place (the maintained Mermaid scenario
-  below automates the rendered-file and timeline checks);
+  read in the chat leaves that line in place; while a reply streams, scrolling
+  the timeline with the arrow keys or PageUp from a focused control in it
+  stops it following, and End returns to the end and follows again (the
+  maintained Mermaid scenario below automates the rendered-file, timeline and
+  keyboard checks);
 - the [durable message queue](#durable-message-queue): FIFO cards, native steer,
   Cancel restoration, reload and restart persistence, promotion, Stop drain,
   holds, and unsupported-provider explanations;
@@ -3174,7 +3177,18 @@ draw's own delivery may take 200 ms to be followed. Both replies end with the
 last line in view, resting within two lines of each other
 (`mermaid-timeline-streaming-follow.json` holds both replies' gaps and end
 positions, and, for diagnosis only, the painted frames each delivery took to
-reveal its end). The reading-line
+reveal its end). Then the reader takes the timeline over with the
+keyboard: after a short reply whose code block's **Copy code** button is
+mounted, a reply streams for about nine seconds; while its sent row glides
+into place, the spec focuses that button (a focus, not a press), dispatches a
+PageUp keydown on it and then makes the page step that key's default action
+makes. The packaged WebDriver plugin sends keys as dispatched events, which
+scroll nothing, so the spec cannot use real key input. The paragraph then read
+stays within 1 px on every painted frame for 3 s, through the glide's settling,
+LegendList's wait for rows to settle and at least five more deliveries; an End
+keydown and a scroll to the end resume following, and at least three later
+deliveries rest with the end revealed
+(`mermaid-timeline-keyboard-takeover.json`). The reading-line
 checks sample painted frames, so the scenario fails early in a webview that
 paints none.
 Its other page scripts wait on timers rather than animation frames, which stop
@@ -3185,6 +3199,16 @@ the 101 diagrams can take minutes there. Rerun it alone with
 the same fixture files served by a release `bibcode` server in Chromium and
 Safari: the console shows no CSP violation and the server log no
 `/mermaid-probe/` request.
+
+**Real-key check (manual, about 30 seconds).** The packaged spec cannot press a
+real key, so on each webview (WebKit on macOS and Linux, WebView2 on Windows)
+check once by hand that the timeline sees the key before the webview scrolls:
+in a chat with earlier messages, send a prompt that streams a long reply;
+while the reply streams, press Tab until a button in the timeline (such as a
+code block's **Copy code**) has focus, then press PageUp twice. The view moves
+up and stays where you read while the reply goes on streaming; End returns to
+the end and the reply is followed again. A view that jumps back to the
+streaming end after PageUp fails the check.
 
 At final packaged shutdown, inspect the raw worker and server logs. Provider and
 terminal owners, operational logs, orchestration, and the SQLite worker must all

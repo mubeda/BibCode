@@ -39,6 +39,63 @@ export function pointerPressStopsLiveFollow(target: EventTarget | null): boolean
   );
 }
 
+/** Keys that scroll the timeline toward its end, and toward its start. */
+const TIMELINE_DOWN_KEYS = new Set(["ArrowDown", "PageDown", "End"]);
+const TIMELINE_UP_KEYS = new Set(["ArrowUp", "PageUp", "Home"]);
+
+/** The parts of a keydown and of the timeline's scroll node the classification reads. */
+export interface TimelineScrollKeyEvent {
+  readonly key: string;
+  readonly shiftKey: boolean;
+  readonly defaultPrevented: boolean;
+  readonly target: EventTarget | null;
+}
+
+export interface TimelineScrollKeyScroller {
+  readonly scrollTop: number;
+  readonly scrollHeight: number;
+  readonly clientHeight: number;
+}
+
+/**
+ * Whether a key pressed inside the timeline's scroller is the reader scrolling it, which stops
+ * live following as the wheel does (#190). It is not when a control owned the key (it called
+ * `preventDefault`), when the key edits text, when Space activates a focused control, or when
+ * the list is already at the end the key moves toward: nothing moves, so following goes on.
+ */
+export function keyboardScrollStopsLiveFollow(
+  event: TimelineScrollKeyEvent,
+  scroller: TimelineScrollKeyScroller,
+): boolean {
+  if (event.defaultPrevented) {
+    return false;
+  }
+  const isSpace = event.key === " ";
+  const down = TIMELINE_DOWN_KEYS.has(event.key) || (isSpace && !event.shiftKey);
+  const up = TIMELINE_UP_KEYS.has(event.key) || (isSpace && event.shiftKey);
+  if (!down && !up) {
+    return false;
+  }
+  const element = event.target as Partial<
+    Pick<HTMLElement, "closest" | "isContentEditable">
+  > | null;
+  if (element?.isContentEditable === true) {
+    return false;
+  }
+  if (typeof element?.closest === "function") {
+    if (element.closest("input, textarea, select") !== null) {
+      return false;
+    }
+    if (isSpace && element.closest(TIMELINE_CONTROL_SELECTOR) !== null) {
+      return false;
+    }
+  }
+  if (down) {
+    return scroller.scrollTop < scroller.scrollHeight - scroller.clientHeight - 1;
+  }
+  return scroller.scrollTop > 1;
+}
+
 /** Programmatic timeline scrolls jump instead of gliding when the user asks for reduced motion. */
 export function timelineScrollAnimates(): boolean {
   return (

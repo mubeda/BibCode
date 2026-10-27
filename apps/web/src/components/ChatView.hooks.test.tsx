@@ -902,6 +902,24 @@ function seedGitStatus(isRepo: boolean): void {
   h.queryDataByKey.set("vcs.status", { isRepo });
 }
 
+/** A thread with one earlier turn, so the timeline shows its list rather than the empty state. */
+function makeThreadWithEarlierTurn(): Thread {
+  return makeThread({
+    messages: [
+      {
+        id: MessageId.make("earlier-message"),
+        role: "user",
+        text: "an earlier message",
+        attachments: [],
+        turnId: null,
+        createdAt: now,
+        updatedAt: now,
+        streaming: false,
+      },
+    ],
+  });
+}
+
 function seedConnectedServerThread(thread: Thread = makeThread()): void {
   seedEnvironment(makeEnvironmentPresentation());
   seedProject(makeProject());
@@ -1218,34 +1236,103 @@ interface FakeLegendListOptions {
   laggingMaxScroll?: number;
   /** Runs when a `scrollToOffset` was clamped by the lagging content height. */
   onClampedScroll?: () => void;
+  /**
+   * Further lagging content heights, one per later `scrollToOffset`: each clamps at its value
+   * and then catches up, as LegendList's laid-out content can trail its measured rows.
+   */
+  clampSteps?: readonly number[];
+  /** The scroller's content and visible heights, for the keyboard's at-an-end check. */
+  scrollHeight?: number;
+  clientHeight?: number;
+  /**
+   * Mounts the sent row at this content offset: `querySelectorAll` finds it under the message id
+   * the test assigns to `list.sentRowMessageId`, and it moves with `scrollTop`.
+   */
+  sentRowContentTop?: number;
+  /**
+   * Holds every `scrollToOffset` until `runDeferred`, as LegendList holds one while rows settle;
+   * a later request or `cancelScrollRequests` drops the held ones without scrolling.
+   */
+  deferScrolls?: boolean;
 }
 
 function makeLegendList(options: FakeLegendListOptions = {}) {
-  const scrollNodeListeners: Array<{ type: string; handler: () => void; options?: unknown }> = [];
+  const scrollNodeListeners: Array<{
+    type: string;
+    handler: (event?: unknown) => void;
+    options?: unknown;
+  }> = [];
   const calls = {
     scrollToEnd: [] as unknown[],
     scrollToOffset: [] as unknown[],
     scrollToIndex: [] as unknown[],
+    cancelScrollRequests: 0,
   };
   let maxScroll = options.laggingMaxScroll ?? Number.POSITIVE_INFINITY;
+  const clampSteps = [...(options.clampSteps ?? [])];
   const rowSizes = Array.from({ length: options.dataLength ?? 1 }, () => options.rowSize ?? 100);
+  let held: Array<{ offset: number; resolve: () => void }> = [];
+  const dropHeld = () => {
+    for (const request of held) request.resolve();
+    held = [];
+  };
   const scrollNode = {
     scrollTop: options.scroll ?? 0,
+    scrollHeight: options.scrollHeight ?? 10_000,
+    clientHeight: options.clientHeight ?? options.scrollLength ?? 50,
     listeners: scrollNodeListeners,
-    addEventListener: (type: string, handler: () => void, listenerOptions?: unknown) => {
+    addEventListener: (
+      type: string,
+      handler: (event?: unknown) => void,
+      listenerOptions?: unknown,
+    ) => {
       scrollNodeListeners.push({ type, handler, options: listenerOptions });
     },
     removeEventListener: () => undefined,
-    fire(type: string) {
+    fire(type: string, event?: unknown) {
       // As in the DOM, a listener added during the dispatch waits for the next event.
       for (const listener of scrollNodeListeners.slice()) {
-        if (listener.type === type) listener.handler();
+        if (listener.type === type) listener.handler(event);
       }
     },
+    getBoundingClientRect: () => ({ top: 0 }),
+    ...(options.sentRowContentTop === undefined
+      ? {}
+      : {
+          querySelectorAll: () => [
+            {
+              getAttribute: () => list.sentRowMessageId,
+              getBoundingClientRect: () => ({
+                top: options.sentRowContentTop! - scrollNode.scrollTop,
+              }),
+            },
+          ],
+        }),
+  };
+  const applyOffset = (offset: number) => {
+    scrollNode.scrollTop = Math.min(offset, maxScroll);
+    if (offset > maxScroll) {
+      maxScroll = clampSteps.shift() ?? Number.POSITIVE_INFINITY;
+      options.onClampedScroll?.();
+    }
   };
   const list = {
     calls,
     scrollNode,
+    sentRowMessageId: null as unknown,
+    /** Runs the scrolls `deferScrolls` held, as LegendList does once rows settle. */
+    runDeferred() {
+      const pending = held;
+      held = [];
+      for (const request of pending) {
+        applyOffset(request.offset);
+        request.resolve();
+      }
+    },
+    cancelScrollRequests: () => {
+      calls.cancelScrollRequests += 1;
+      dropHeld();
+    },
     /** A row grows by `by` px, as a diagram drawing in it would. */
     growRow(index: number, by: number) {
       rowSizes[index]! += by;
@@ -1263,20 +1350,25 @@ function makeLegendList(options: FakeLegendListOptions = {}) {
     }),
     scrollToEnd: (input: unknown) => {
       calls.scrollToEnd.push(input);
+      dropHeld();
       return Promise.resolve();
     },
     scrollToOffset: (input: unknown) => {
       calls.scrollToOffset.push(input);
       const offset = (input as { offset: number }).offset;
-      scrollNode.scrollTop = Math.min(offset, maxScroll);
-      if (offset > maxScroll) {
-        maxScroll = Number.POSITIVE_INFINITY;
-        options.onClampedScroll?.();
+      // A new request replaces one LegendList still holds.
+      dropHeld();
+      if (options.deferScrolls) {
+        return new Promise<void>((resolve) => {
+          held.push({ offset, resolve });
+        });
       }
+      applyOffset(offset);
       return Promise.resolve();
     },
     scrollToIndex: (input: unknown) => {
       calls.scrollToIndex.push(input);
+      dropHeld();
       return Promise.resolve();
     },
   };
@@ -1295,10 +1387,8 @@ function installLegendList(options: FakeLegendListOptions = {}) {
  * Sends a message whose reply arrived during the sent row's glide: four 100 px rows, the
  * reply's end 216 px below what shows.
  */
-async function sendTallReply(
-  options: Pick<FakeLegendListOptions, "laggingMaxScroll" | "onClampedScroll">,
-) {
-  seedConnectedServerThread();
+async function sendTallReply(options: FakeLegendListOptions) {
+  seedConnectedServerThread(makeThreadWithEarlierTurn());
   renderServerRoute();
   const list = installLegendList({
     scroll: 0,
@@ -1311,7 +1401,7 @@ async function sendTallReply(
   const { promptRef } = installComposerHandle();
   promptRef.current = "reply taller than the timeline";
   await (capturedProps("chatComposer")["onSend"] as () => Promise<void>)();
-  const sent = commandCallsFor("thread.startTurn")[0]!.input as {
+  const sent = commandCallsFor("thread.startTurn").at(-1)!.input as {
     input: { message: { messageId: MessageId } };
   };
   const onAnchorReady = capturedProps("messagesTimeline")["onAnchorReady"] as (
@@ -1319,6 +1409,20 @@ async function sendTallReply(
     anchorIndex: number,
   ) => void;
   return { list, cleanups, messageId: sent.input.message.messageId, onAnchorReady };
+}
+
+/** A keydown on a target inside the timeline that matches the selectors in `matches`. */
+function timelineKey(key: string, matches: readonly string[] = []) {
+  return {
+    key,
+    shiftKey: false,
+    defaultPrevented: false,
+    target: {
+      isContentEditable: false,
+      closest: (selector: string) =>
+        selector.split(",").some((part) => matches.includes(part.trim())) ? {} : null,
+    },
+  };
 }
 
 function onRowSizeChanged(): (info: { index: number; previous: number; size: number }) => void {
@@ -1717,7 +1821,7 @@ describe("ChatView effects (captured and run manually)", () => {
     expect(windowStub.listeners.some((listener) => listener.type === "keydown")).toBe(true);
     // Manual-navigation listeners attached to the legend list scroll node.
     expect(list.scrollNode.listeners.map((listener) => listener.type)).toEqual(
-      expect.arrayContaining(["wheel", "touchmove", "pointerdown"]),
+      expect.arrayContaining(["wheel", "touchmove", "pointerdown", "keydown"]),
     );
     // Live-follow effect scrolled to the end because content overflows.
     expect(list.calls.scrollToEnd.length).toBeGreaterThanOrEqual(1);
@@ -1945,7 +2049,7 @@ describe("ChatView effects (captured and run manually)", () => {
     const { list, cleanups, messageId, onAnchorReady } = await sendTallReply({});
     onAnchorReady(messageId, 2);
     list.scrollNode.fire("scrollend");
-    // The reader moved up 80 px with the keyboard, which keeps following on.
+    // A scroll the timeline does not see as the reader's own leaves the end 80 px below.
     list.scrollNode.scrollTop = 136;
     const calls = list.calls.scrollToOffset.length;
     const frames: Array<() => void> = [];
@@ -1970,8 +2074,31 @@ describe("ChatView effects (captured and run manually)", () => {
     for (const cleanup of cleanups) cleanup();
   });
 
-  it("positions and stabilizes a timeline anchor after manual navigation", () => {
+  it("binds the reader's scroll listeners once a new thread's first turn shows the list", () => {
+    // A thread with no rows shows the empty state, with no list to bind to.
     seedConnectedServerThread();
+    renderServerRoute();
+    const empty = installLegendList({ scrollLength: 200 });
+    const emptyCleanups = runEffects();
+    expect(empty.scrollNode.listeners).toEqual([]);
+    for (const cleanup of emptyCleanups) cleanup();
+
+    // Its first turn renders the list, and the binding runs again for it.
+    seedConnectedServerThread(makeThreadWithEarlierTurn());
+    renderServerRoute();
+    const shown = installLegendList({ scrollLength: 200 });
+    const cleanups = runEffects();
+    expect(shown.scrollNode.listeners.map((listener) => listener.type).toSorted()).toEqual([
+      "keydown",
+      "pointerdown",
+      "touchmove",
+      "wheel",
+    ]);
+    for (const cleanup of cleanups) cleanup();
+  });
+
+  it("positions a sent row once and keeps a released one where the reader left it", () => {
+    seedConnectedServerThread(makeThreadWithEarlierTurn());
     renderServerRoute();
     const list = installLegendList({ scroll: 24, scrollLength: 200, dataLength: 4 });
     const cleanups = runEffects();
@@ -1984,26 +2111,111 @@ describe("ChatView effects (captured and run manually)", () => {
     const onAnchorSizeChanged = timeline["onAnchorSizeChanged"] as (messageId: MessageId) => void;
 
     onAnchorReady(messageId, 2);
-    expect(list.calls.scrollToIndex).toContainEqual({
-      index: 2,
-      animated: true,
-      viewPosition: 0,
-      viewOffset: 16,
-    });
-
+    expect(list.calls.scrollToIndex).toEqual([
+      { index: 2, animated: true, viewPosition: 0, viewOffset: 16 },
+    ]);
     list.scrollNode.fire("scrollend");
-    expect(list.calls.scrollToOffset).toContainEqual({ offset: 24, animated: false });
+    expect(list.calls.scrollToOffset).toEqual([{ offset: 24, animated: false }]);
 
+    // The reader scrolls away. LegendList reports the row ready again as the anchored end space
+    // changes size, once per delivery, and the row neither glides nor pins over the reader.
     list.scrollNode.fire("wheel");
     onAnchorReady(messageId, 2);
-    list.scrollNode.fire("scrollend");
-    expect(list.calls.scrollToOffset).toHaveLength(2);
-
-    onAnchorSizeChanged(messageId);
-    expect(list.calls.scrollToOffset).toHaveLength(3);
-
     onAnchorReady(messageId, 2);
+    list.scrollNode.fire("scrollend");
+    expect(list.calls.scrollToIndex).toHaveLength(1);
+    expect(list.calls.scrollToOffset).toHaveLength(1);
+
+    // It goes on holding the reader's place as the tail changes size.
+    onAnchorSizeChanged(messageId);
+    expect(list.calls.scrollToOffset).toEqual([
+      { offset: 24, animated: false },
+      { offset: 24, animated: false },
+    ]);
+
+    // A row the reader never released positions itself.
+    onAnchorReady(MessageId.make("next-send"), 3);
     expect(list.calls.scrollToIndex).toHaveLength(2);
+    for (const cleanup of cleanups) cleanup();
+  });
+
+  it("releases the newest send's row when the reader scrolls before it is positioned", async () => {
+    const { list, cleanups, messageId, onAnchorReady } = await sendTallReply({});
+    onAnchorReady(messageId, 2);
+    list.scrollNode.fire("scrollend");
+    // A second send names its row pending while the first is still the positioned one.
+    const { promptRef } = installComposerHandle();
+    promptRef.current = "a second message";
+    await (capturedProps("chatComposer")["onSend"] as () => Promise<void>)();
+    const second = commandCallsFor("thread.startTurn")[1]!.input as {
+      input: { message: { messageId: MessageId } };
+    };
+    const secondId = second.input.message.messageId;
+    expect(secondId).not.toBe(messageId);
+    const glides = list.calls.scrollToIndex.length;
+
+    list.scrollNode.fire("wheel");
+    (capturedProps("messagesTimeline")["onAnchorReady"] as typeof onAnchorReady)(secondId, 4);
+
+    expect(list.calls.scrollToIndex).toHaveLength(glides);
+    for (const cleanup of cleanups) cleanup();
+  });
+
+  it("stops following when the reader scrolls the timeline with the keyboard mid-glide", async () => {
+    const { list, cleanups, messageId, onAnchorReady } = await sendTallReply({
+      scrollHeight: 400,
+      clientHeight: 200,
+    });
+    onAnchorReady(messageId, 2);
+    list.scrollNode.scrollTop = 50;
+
+    list.scrollNode.fire("keydown", timelineKey("ArrowUp", ["button"]));
+    list.scrollNode.fire("scrollend");
+
+    // The settle neither pins the reader nor follows the turn's end over them.
+    expect(list.calls.scrollToOffset).toEqual([]);
+    expect(list.scrollNode.scrollTop).toBe(50);
+    for (const cleanup of cleanups) cleanup();
+  });
+
+  it("keeps following for keys that move nothing or belong to a control", async () => {
+    for (const [key, matches, scrollTop] of [
+      // Keys that would move nothing: ArrowDown at the end, ArrowUp at the top.
+      ["ArrowDown", [], 200],
+      ["ArrowUp", [], 0],
+      ["ArrowUp", ["textarea"], 50],
+      [" ", ["button"], 50],
+    ] as const) {
+      const { list, cleanups, messageId, onAnchorReady } = await sendTallReply({
+        scrollHeight: 400,
+        clientHeight: 200,
+      });
+      onAnchorReady(messageId, 2);
+      list.scrollNode.scrollTop = scrollTop;
+
+      list.scrollNode.fire("keydown", timelineKey(key, matches));
+      list.scrollNode.fire("scrollend");
+
+      // Following goes on: nothing is withdrawn, and the settle follows the reply's end.
+      expect(list.calls.cancelScrollRequests, key).toBe(0);
+      expect(list.calls.scrollToOffset.at(-1), key).toEqual({ offset: 216, animated: false });
+      for (const cleanup of cleanups) cleanup();
+    }
+  });
+
+  it("withdraws a follow the list still holds when the reader takes over", async () => {
+    const { list, cleanups, messageId, onAnchorReady } = await sendTallReply({
+      deferScrolls: true,
+    });
+    onAnchorReady(messageId, 2);
+    list.scrollNode.fire("scrollend");
+    expect(list.calls.scrollToOffset.at(-1)).toEqual({ offset: 216, animated: false });
+
+    list.scrollNode.fire("wheel");
+    list.runDeferred();
+
+    expect(list.calls.cancelScrollRequests).toBe(1);
+    expect(list.scrollNode.scrollTop).toBe(0);
     for (const cleanup of cleanups) cleanup();
   });
 
