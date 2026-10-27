@@ -6,16 +6,23 @@
 //! base64 `Data` items of at most [`DIAGNOSTIC_LOGS_CHUNK_BYTES`], then completes. A stream has
 //! one chunk in flight until the client acknowledges it, so the client paces the download and
 //! the connection's other traffic goes out between items.
+//!
+//! The archive keeps one of the server's few archive slots until the stream ends (see
+//! `diagnostic_bundle`), and a client that takes no item for [`ITEM_ACK_DEADLINE`] ends its
+//! request, so a client that stops acknowledging cannot pin archives in memory.
+
+use std::time::Duration;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use time::OffsetDateTime;
-use tokio::sync::mpsc;
+use tokio::sync::mpsc::{self, error::SendTimeoutError};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     diagnostic_bundle::{DiagnosticBundleService, MAX_DIAGNOSTIC_ARCHIVE_BYTES},
+    production::http_routes::MAX_DIAGNOSTIC_BODY_BYTES,
     rpc::{RpcRegistry, RpcSessionContext, RpcStreamChunk},
 };
 
@@ -24,6 +31,10 @@ const OPERATE_SCOPE: &str = "orchestration:operate";
 /// Archive bytes per `Data` item. One item rides alone in its chunk, so this is what one
 /// round trip carries; a larger one would hold the connection's other traffic back longer.
 pub const DIAGNOSTIC_LOGS_CHUNK_BYTES: usize = 512 * 1024;
+/// How long one item may wait for the client to take the one before it. The session sends the
+/// next item only after the client acknowledges the last, so a wait this long means the client
+/// stopped acknowledging; the request then ends and its archive is released.
+const ITEM_ACK_DEADLINE: Duration = Duration::from_secs(60);
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -64,7 +75,14 @@ fn stream_bundle(
             // An interrupt, a lost connection, or the request ending. A build already on its
             // blocking thread finishes there, holding its build permit until it does.
             () = cancellation.cancelled() => {}
-            () = produce(&bundles, payload, &context, &sender, max_archive_bytes) => {}
+            () = produce(
+                &bundles,
+                payload,
+                &context,
+                &sender,
+                &cancellation,
+                max_archive_bytes,
+            ) => {}
         }
     });
     receiver
@@ -75,6 +93,7 @@ async fn produce(
     payload: Value,
     context: &RpcSessionContext,
     sender: &mpsc::Sender<RpcStreamChunk>,
+    cancellation: &CancellationToken,
     max_archive_bytes: usize,
 ) {
     let input: DownloadInput = match serde_json::from_value(payload) {
@@ -86,6 +105,16 @@ async fn produce(
             return;
         }
     };
+    // The HTTP route's body bound: a client bounds its snapshot to it before sending.
+    if input.frontend_log.len() > MAX_DIAGNOSTIC_BODY_BYTES {
+        let _ = sender
+            .send(Err(diagnostic_logs_error(
+                "invalid",
+                format!("frontendLog is over {MAX_DIAGNOSTIC_BODY_BYTES} bytes."),
+            )))
+            .await;
+        return;
+    }
     // Dumps are raw process memory, unlike the redacted logs `orchestration:read` covers, so
     // they take the scope of running commands, of the same credential, as on the HTTP route.
     if input.include_crash_dumps
@@ -132,14 +161,37 @@ async fn produce(
         "byteLength": bundle.bytes.len(),
         "manifest": bundle.manifest,
     });
-    if sender.send(Ok(vec![started])).await.is_err() {
+    if !send_item(sender, cancellation, started).await {
         return;
     }
     for chunk in bundle.bytes.chunks(DIAGNOSTIC_LOGS_CHUNK_BYTES) {
         let data = json!({ "_tag": "Data", "data": STANDARD.encode(chunk) });
-        if sender.send(Ok(vec![data])).await.is_err() {
+        if !send_item(sender, cancellation, data).await {
             return;
         }
+    }
+    // `bundle`, and with it the archive's slot, is released here, after the last item.
+}
+
+/// Queues `item` behind the one the session is sending; `false` once the stream is over. An
+/// item the session does not take within [`ITEM_ACK_DEADLINE`] ends the request: cancelling
+/// it makes the session interrupt the stream and drop what it still holds.
+async fn send_item(
+    sender: &mpsc::Sender<RpcStreamChunk>,
+    cancellation: &CancellationToken,
+    item: Value,
+) -> bool {
+    match sender.send_timeout(Ok(vec![item]), ITEM_ACK_DEADLINE).await {
+        Ok(()) => true,
+        Err(SendTimeoutError::Timeout(_)) => {
+            tracing::warn!(
+                method = DIAGNOSTIC_LOGS_METHOD,
+                "diagnostic logs download stopped: the client acknowledged nothing for 60 s"
+            );
+            cancellation.cancel();
+            false
+        }
+        Err(SendTimeoutError::Closed(_)) => false,
     }
 }
 
@@ -166,18 +218,8 @@ mod tests {
         )
     }
 
-    async fn collect(mut receiver: mpsc::Receiver<RpcStreamChunk>) -> Result<Vec<Value>, Value> {
-        let mut items = Vec::new();
-        while let Some(chunk) = receiver.recv().await {
-            items.extend(chunk?);
-        }
-        Ok(items)
-    }
-
-    #[tokio::test]
-    async fn streams_the_archive_in_bounded_items_after_its_manifest() {
-        let logs = tempfile::tempdir().expect("logs");
-        // Random letters compress to about 60 %, so the archive spans several items.
+    /// Random letters compress to about 60 %, so the archive spans several `Data` items.
+    fn write_noisy_server_log(logs: &std::path::Path) {
         let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
         let text: String = (0..3 * DIAGNOSTIC_LOGS_CHUNK_BYTES)
             .map(|index| {
@@ -191,7 +233,21 @@ mod tests {
                 }
             })
             .collect();
-        std::fs::write(logs.path().join("server.log"), text).expect("server log");
+        std::fs::write(logs.join("server.log"), text).expect("server log");
+    }
+
+    async fn collect(mut receiver: mpsc::Receiver<RpcStreamChunk>) -> Result<Vec<Value>, Value> {
+        let mut items = Vec::new();
+        while let Some(chunk) = receiver.recv().await {
+            items.extend(chunk?);
+        }
+        Ok(items)
+    }
+
+    #[tokio::test]
+    async fn streams_the_archive_in_bounded_items_after_its_manifest() {
+        let logs = tempfile::tempdir().expect("logs");
+        write_noisy_server_log(logs.path());
 
         let items = collect(stream_bundle(
             bundles(logs.path()),
@@ -263,6 +319,59 @@ mod tests {
         .await
         .expect_err("invalid");
         assert_eq!(error["reason"], "invalid");
+    }
+
+    #[tokio::test]
+    async fn a_frontend_log_over_the_http_bound_is_invalid() {
+        let logs = tempfile::tempdir().expect("logs");
+        let error = collect(stream_bundle(
+            bundles(logs.path()),
+            json!({ "frontendLog": "x".repeat(MAX_DIAGNOSTIC_BODY_BYTES + 1) }),
+            RpcSessionContext::unauthenticated(),
+            CancellationToken::new(),
+            MAX_DIAGNOSTIC_ARCHIVE_BYTES,
+        ))
+        .await
+        .expect_err("too long");
+        assert_eq!(error["reason"], "invalid");
+    }
+
+    /// The archive keeps its slot while it streams, and a client that stops acknowledging
+    /// ends the request at the deadline, which gives the slot back.
+    #[tokio::test(start_paused = true)]
+    async fn a_client_that_stops_acknowledging_releases_the_archive_at_the_deadline() {
+        let logs = tempfile::tempdir().expect("logs");
+        write_noisy_server_log(logs.path());
+        let service = bundles(logs.path());
+        let cancellation = CancellationToken::new();
+        let mut receiver = stream_bundle(
+            service.clone(),
+            json!({ "frontendLog": "" }),
+            RpcSessionContext::unauthenticated(),
+            cancellation.clone(),
+            MAX_DIAGNOSTIC_ARCHIVE_BYTES,
+        );
+        // Started arrives; the client then never takes the next item.
+        let started = receiver.recv().await.expect("started").expect("ok");
+        assert_eq!(started[0]["_tag"], "Started");
+        tokio::task::yield_now().await;
+        assert_eq!(service.free_slots_for_test(), 1, "held while streaming");
+
+        tokio::time::timeout(ITEM_ACK_DEADLINE * 2, cancellation.cancelled())
+            .await
+            .expect("the deadline ends the request");
+        for _ in 0..10 {
+            if service.free_slots_for_test() == 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            service.free_slots_for_test(),
+            2,
+            "released after the deadline"
+        );
+        drop(receiver);
     }
 
     #[tokio::test]

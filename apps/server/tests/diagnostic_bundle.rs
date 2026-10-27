@@ -332,6 +332,7 @@ async fn bundle_carries_crash_dumps_byte_for_byte_when_requested() {
     // Invalid UTF-8 and a NUL: a lossy text round trip would change these bytes.
     let dump = vec![0x4d, 0x44, 0x4d, 0x50, 0x00, 0xff, 0xfe, 0x80, 0x93];
     write_profiler_file(profiler.path(), "crashes/crash-1.dmp", &dump);
+    write_profiler_file(profiler.path(), "crashes/crash-1.json", b"{}");
 
     let bundle = service_with_profiler(&logs, &profiler)
         .build(String::new(), true, generated_at())
@@ -432,6 +433,7 @@ async fn bundle_lists_a_crash_dump_that_does_not_fit_instead_of_cutting_it() {
     let profiler = TempDir::new().expect("profiler directory");
     let mib = 1024 * 1024;
     write_profiler_file(profiler.path(), "crashes/huge.dmp", &vec![7u8; 17 * mib]);
+    write_profiler_file(profiler.path(), "crashes/huge.json", b"{}");
     write_profiler_file(profiler.path(), "findings.ndjson", b"{}\n");
 
     let bundle = service_with_profiler(&logs, &profiler)
@@ -475,6 +477,9 @@ async fn bundle_leaves_a_dump_out_when_the_logs_already_fill_the_archive() {
     }
     write_profiler_file(profiler.path(), "crashes/big.dmp", &noisy_text(10 * mib));
     write_profiler_file(profiler.path(), "crashes/small.dmp", &noisy_text(2 * mib));
+    // Each dump is complete: the crash monitor wrote its record.
+    write_profiler_file(profiler.path(), "crashes/big.json", b"{}");
+    write_profiler_file(profiler.path(), "crashes/small.json", b"{}");
     set_age(profiler.path(), "crashes/big.dmp", 100);
     set_age(profiler.path(), "crashes/small.dmp", 200);
 
