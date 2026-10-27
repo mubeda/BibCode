@@ -65,6 +65,16 @@ the host's sharing controls. The CI remote-install lane requires exactly one
 requester info line for its single install request and retains bounded,
 redacted evidence; it never retains bootstrap or pairing credentials.
 
+Each Claude activity probe run writes one line to `server.log`: `Claude
+activity probe finished` (`info`), `Claude activity probe found another
+program` (`warn`, `outcome = "mismatch"`), or `Claude activity probe failed`
+(`warn`). Each line carries the resolved `executable`, its `canonical` target
+and the `search_path` used to resolve it. All three pass through the
+Profiler's path redaction, so the home directory reads `~` and secrets are
+removed. A raw `PATH` is never logged. The
+[Claude guide](../providers/claude.md#activity-observation) explains each
+outcome.
+
 In headless mode, run the native server from a terminal, or install the
 per-user service (`bibcode service install`) whose stdout and stderr go to the
 service manager's log (the journal on Linux, `~/Library/Logs/bibcode-server.log`
