@@ -2599,6 +2599,7 @@ fn environment_descriptor(config: &ServerConfig, activity_protocol_registered: b
         "vcsCloneReattach": true,
         "attachmentStaging": true,
         "profiler": true,
+        "diagnosticLogs": true,
         "devicePreviews": true,
         "deviceCatalogRefresh": true,
         "cliSessionHistory": true,
@@ -6743,6 +6744,9 @@ mod tests {
         assert_eq!(descriptor["capabilities"]["pullRequestCreateOptions"], true);
         assert_eq!(descriptor["capabilities"]["vcsCloneReattach"], true);
         assert_eq!(descriptor["capabilities"]["reviewDiffTools"], true);
+        // `server.getConfig` carries this descriptor; a client downloads a remote
+        // environment's logs only when it says so (#194).
+        assert_eq!(descriptor["capabilities"]["diagnosticLogs"], true);
         assert_eq!(descriptor["capabilities"]["attachmentStaging"], true);
         assert_eq!(
             descriptor["remoteUpdateSupport"],

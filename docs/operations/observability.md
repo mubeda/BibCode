@@ -162,9 +162,17 @@ values in option values or other diagnostic fields.
 
 ## Diagnostic Bundle
 
-The Diagnostics settings page can prepare a timestamped, redacted ZIP through
-`POST /api/diagnostics/logs.zip`. Desktop clients open a native save dialog;
-browser clients download the response. The archive contains:
+The Diagnostics settings page can prepare a timestamped, redacted ZIP of the
+environment the page has selected (the primary unless `?environment=` names
+another; the Profiler section and the download share that selection). The
+server that owns the logs builds and redacts the archive. The primary
+environment's archive comes from `POST /api/diagnostics/logs.zip`. Any other
+connected environment's archive comes over that environment's own RPC
+connection, through the `server.downloadDiagnosticLogs` stream, so a pinned
+(E2EE), relay, or SSH connection carries it inside the channel it already uses.
+Desktop clients open a native save dialog; browser clients download the
+archive. The archive is named
+`bibcode-diagnostics-<environment label>-<UTC timestamp>.zip`, and it contains:
 
 - `server.log`, assembled oldest-first from the active native server log and up
   to three retained backups;
@@ -173,7 +181,24 @@ browser clients download the response. The archive contains:
 - `frontend.log`, containing the frontend warning/error snapshot supplied by
   the requesting client; and
 - `profiler/`, when the profiler directory (`<state dir>/profiler`) holds
-  files: the events and findings files and the `crashes/*.json` sidecars.
+  files: the events and findings files and the `crashes/*.json` sidecars; and
+- `manifest.json`, naming the server that built it: `environmentId`,
+  `storageInstanceId`, `environmentLabel`, `serverVersion`, `platform`,
+  `generatedAt`, and `crashDumps` (`requested`, and `included`, the number of
+  dumps actually written, which can be lower when one does not fit).
+
+Only a server whose descriptor advertises `capabilities.diagnosticLogs` is asked
+for its bundle over RPC; an older server would fail the whole connection on the
+unknown method. For an older server, a disconnected environment, a refused
+scope, or a connection lost mid-download, the page names that environment and
+says why, and nothing is saved. It never falls back to another environment's
+bundle. The client also checks that the manifest's `storageInstanceId` is the
+one its connection verified, and refuses an archive without one. The stream
+sends a `Started` item (file name, size, manifest) and then base64 items of at
+most 64 KiB, one in flight at a time, so the connection's other traffic goes
+out between them. A bundle holds one server's logs: diagnosing a remote launch
+or transport problem can need both the remote environment's archive and the
+primary's, downloaded one after the other.
 
 Provider and terminal operational logs are not included. Each retained server
 or trace file is read up to 4 MiB and marked when truncated. The frontend
@@ -187,16 +212,29 @@ out for size or because it could not be read is listed in
 `profiler/OMITTED.txt`, and symbolic links are never followed, including a
 linked `profiler` or `crashes` directory. Files are added only while the archive
 built so far, with the logs, stays under the desktop save limit of 20 MiB; a
-file is counted as if it did not compress.
+file is counted as if it did not compress. The RPC path refuses an archive over
+20 MiB before sending any of it. A server holds at most two archives in memory
+at once: a slot is taken before the build and released when the archive is
+dropped, so an RPC download keeps it until its last item is sent and the HTTP
+route until it hands the bytes to the response, and a build whose caller went
+away keeps it until its compression thread finishes. A download whose client
+takes no item for 60 s (a link under about 1 KiB/s, or a client that stopped
+acknowledging) ends there and releases its archive. The RPC refuses a
+`frontendLog` over the HTTP route's 512 KiB body bound with `invalid`. A crash
+dump is bundled, and counted in the manifest, only once the crash monitor has
+written its `.json` record, which it does after the dump is complete; a dump
+without one is listed in `profiler/OMITTED.txt` as incomplete.
 
 Crash dumps (`profiler/crashes/*.dmp`) can hold fragments of process memory,
 including prompts or tokens, so they are left out unless the request body sets
 `"includeCrashDumps": true`. The Diagnostics page sends it only when
 **Include crash dumps** is checked in the Profiler section, and the plain
 **Download logs** action never does. A body where `includeCrashDumps` is not a
-boolean is rejected with `400`. The route needs `orchestration:read`; a request
-that includes dumps also needs `orchestration:operate`, because dumps are raw
-process memory and are not redacted.
+boolean is rejected with `400`. The route and the RPC need
+`orchestration:read`; a request that includes dumps also needs
+`orchestration:operate` of the same credential, because dumps are raw process
+memory and are not redacted. The RPC refuses such a request with
+`EnvironmentAuthorizationError` before building anything.
 
 Before writing the ZIP, the server redacts authorization and proxy-authorization
 lines, bearer values, common token/API-key/password/secret assignments, and URL

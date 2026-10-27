@@ -1908,9 +1908,16 @@ under the recording line when the runtime still records. The
 status line refreshes every 5 s while the profiler is on and the page
 is visible: recording since, disk use, events, and dropped events. **Open
 folder** works only for the primary environment on desktop; **Export bundle**
-covers only the primary environment and adds crash dumps only with **Include
-crash dumps** (see [Observability](../operations/observability.md)). Both, and
-the checkbox, explain why when disabled. The 20 newest findings follow, each with
+covers the selected environment, whose own server builds the bundle (another
+environment's over its RPC connection, and only when its server advertises
+`capabilities.diagnosticLogs`), and adds crash dumps only with **Include crash
+dumps** (see [Observability](../operations/observability.md#diagnostic-bundle)).
+Both, and the checkbox, explain why when disabled. The page's last section,
+**Diagnostic logs**, downloads the same bundle without crash dumps for exactly
+the environment the route names, else the primary, picked with the Profiler
+section's selector (the page's only one). It refuses, with the environment
+named, one that is not connected, still connecting, or too old, instead of
+downloading another environment's logs. The 20 newest findings follow, each with
 its severity, title, count, and last seen. A server that does not advertise
 `capabilities.profiler` (one older than the profiler) is never asked for its
 status: the section shows only the disabled switch and "This server's BiBCode

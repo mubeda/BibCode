@@ -398,6 +398,10 @@
       "mode": "unary"
     },
     {
+      "name": "server.downloadDiagnosticLogs",
+      "mode": "stream"
+    },
+    {
       "name": "server.getConfig",
       "mode": "unary"
     },
@@ -694,8 +698,8 @@
       "mode": "unary"
     }
   ],
-  "streamMethodCount": 25,
-  "expectedTopLevelStreamShapes": 80,
+  "streamMethodCount": 26,
+  "expectedTopLevelStreamShapes": 82,
   "expectedOrchestrationEventShapes": 27,
   "streamShapeFixtures": [
     "stream-shapes/cloud__installRelayClient-00.json",
@@ -725,6 +729,8 @@
     "stream-shapes/previewAutomation__connect-00.json",
     "stream-shapes/previewAutomation__connect-01.json",
     "stream-shapes/pullRequests__subscribe-00.json",
+    "stream-shapes/server__downloadDiagnosticLogs-00.json",
+    "stream-shapes/server__downloadDiagnosticLogs-01.json",
     "stream-shapes/subscribeActivity-00.json",
     "stream-shapes/subscribeActivity-01.json",
     "stream-shapes/subscribeActivity-02.json",
@@ -1363,6 +1369,8 @@
     "typed-failures/server__consumeCodexRateLimitReset-01.json": "f21e4233466694c02754d2a3c0317c089f31f6634947c5fcc16d02c4997c35cf",
     "typed-failures/server__discoverSourceControl-00.json": "950333bb892eba89420d696b2674275ebe5de296311ca5d2045b4963fc596274",
     "typed-failures/server__discoverSourceControl-01.json": "dfe153df675ebc5cf07b6a2d483bfe18346fa23e4bbcd24940828aa1cc404308",
+    "stream-shapes/server__downloadDiagnosticLogs-00.json": "61080c04704b11b71ca45300114c1246f29c5e7fb22f02ce0c833534fbfc6229",
+    "stream-shapes/server__downloadDiagnosticLogs-01.json": "72333bca1eb0d495550890efc6dc370129311218e12a7082ec1147485491741b",
     "typed-failures/server__getConfig-00.json": "c298bc2037cf8f13bb324ee4577dde33c4aac1d29bcc147d06286b00b5c83ea8",
     "typed-failures/server__getConfig-01.json": "b141caed2961004d11a558adc37cfee4944f1ee49667137d1a553b3d1ad9d623",
     "typed-failures/server__getConfig-02.json": "f21e4233466694c02754d2a3c0317c089f31f6634947c5fcc16d02c4997c35cf",
@@ -1430,12 +1438,12 @@
     "stream-shapes/subscribePreviewEvents-04.json": "0e8bac1a898590398b306a6611fd4676d2c1d122d5029999c62a462fdf938ea5",
     "stream-shapes/subscribePreviewEvents-05.json": "e90b7e4ce2b85d04010ece2f05878ca18fcfc97a7e00e6675717aea37f63da1c",
     "stream-shapes/subscribeProjectEntries-00.json": "fb0eccee51b5c2656e762ae9e52783c5c9a78ef4b3f7c46a9a1dcdfa609c8670",
-    "stream-shapes/subscribeServerConfig-00.json": "5917da6fd49a3c6d4833f6b58240505dfb425b208c6fad3434b73ed389de25de",
+    "stream-shapes/subscribeServerConfig-00.json": "110761a0dffe0edaa9a1a428944293b901a7a1196755c8e0688ff46d68ff873e",
     "stream-shapes/subscribeServerConfig-01.json": "cf4979d2d52440102cf23f92653caeb3570e2df19a7b5a68bcb6602e06a33120",
     "stream-shapes/subscribeServerConfig-02.json": "2005009f8a5fa67a57b693b663b2d4b015c59bfd2b098035ee8a0f54d7e69464",
     "stream-shapes/subscribeServerConfig-03.json": "44a3dddf17f52f741d1de921f509d0f7ef335b71fc24bfb5ceb34ea581aa5bd6",
-    "stream-shapes/subscribeServerLifecycle-00.json": "74286ed233a27e84a2b1ee0a0734d6ccc593537c71b9a1dc7d88e80dada25fb9",
-    "stream-shapes/subscribeServerLifecycle-01.json": "0131ed04de16e4cd9cdb277bdf6d930c3f47c792f46368b368f9a638ca5efa17",
+    "stream-shapes/subscribeServerLifecycle-00.json": "69df2248ee07bd0105a6ec0978539f887ce139b75ad57fe65212450cfd1e0072",
+    "stream-shapes/subscribeServerLifecycle-01.json": "d9c64e346ba79dfc2f5bd319eadbad4c191700826b5db2d2d5768405131c152f",
     "stream-shapes/subscribeTerminalEvents-00.json": "a33bc3be33b80b3bade2e3e4e7f6f25f2ca7c9ba87dd3ea9a781b4f3cb5bea82",
     "stream-shapes/subscribeTerminalEvents-01.json": "c65433f5ba3ebe8e6f7017398c99dff865f351e8c3b9708f4be20b73f8bdff81",
     "stream-shapes/subscribeTerminalEvents-02.json": "e00813631aca2b627480406ffac3369f82397ae64f4044f02f16e263e248cec4",
@@ -1662,6 +1670,8 @@
     "stream-shapes/preview__tunnelOpen-00.json",
     "stream-shapes/preview__tunnelOpen-01.json",
     "stream-shapes/pullRequests__subscribe-00.json",
+    "stream-shapes/server__downloadDiagnosticLogs-00.json",
+    "stream-shapes/server__downloadDiagnosticLogs-01.json",
     "stream-shapes/subscribeActivity-00.json",
     "stream-shapes/subscribeActivity-01.json",
     "stream-shapes/subscribeActivity-02.json",

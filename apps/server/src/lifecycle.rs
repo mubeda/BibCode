@@ -70,6 +70,7 @@ fn connect_environment_descriptor(config: &ServerConfig) -> serde_json::Value {
             "vcsCloneReattach": true,
             "attachmentStaging": true,
             "profiler": true,
+            "diagnosticLogs": true,
             "devicePreviews": true,
             "deviceCatalogRefresh": true,
             "cliSessionHistory": true,
@@ -1206,6 +1207,8 @@ mod tests {
         assert_eq!(descriptor["capabilities"]["reviewDiffTools"], true);
         assert_eq!(descriptor["capabilities"]["attachmentStaging"], true);
         assert_eq!(descriptor["capabilities"]["profiler"], true);
+        // A client asks for `server.downloadDiagnosticLogs` only when this is set (#194).
+        assert_eq!(descriptor["capabilities"]["diagnosticLogs"], true);
         assert_eq!(descriptor["capabilities"]["devicePreviews"], true);
         // A client offers Refresh devices only when the server has `device.refreshCatalog` (#169).
         assert_eq!(descriptor["capabilities"]["deviceCatalogRefresh"], true);
