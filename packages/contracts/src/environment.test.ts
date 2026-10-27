@@ -104,6 +104,11 @@ describe("execution environment contracts", () => {
       pipelinesMutations: false,
     });
   });
+  it("defaults the diagnostic logs capability off for older servers", () => {
+    expect(decodeTerminalCapabilities({}).diagnosticLogs).toBe(false);
+    expect(decodeTerminalCapabilities({ diagnosticLogs: true }).diagnosticLogs).toBe(true);
+  });
+
   it("defaults the profiler capability off for older servers and preserves advertised support", () => {
     expect(decodeTerminalCapabilities({}).profiler).toBe(false);
     expect(decodeTerminalCapabilities({ profiler: true }).profiler).toBe(true);

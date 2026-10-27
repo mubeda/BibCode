@@ -303,6 +303,9 @@ import {
   PreviewAutomationStreamEvent,
 } from "./previewAutomation.ts";
 import {
+  DiagnosticLogsDownloadEvent,
+  DiagnosticLogsDownloadInput,
+  DiagnosticLogsError,
   ServerConfigStreamEvent,
   ServerConfig,
   ServerProviderCapabilities,
@@ -633,6 +636,7 @@ export const WS_METHODS = {
   serverUpdateSettings: "server.updateSettings",
   serverDiscoverSourceControl: "server.discoverSourceControl",
   serverGetTraceDiagnostics: "server.getTraceDiagnostics",
+  serverDownloadDiagnosticLogs: "server.downloadDiagnosticLogs",
   serverGetProcessDiagnostics: "server.getProcessDiagnostics",
   serverGetProcessResourceHistory: "server.getProcessResourceHistory",
   serverGetProfilerStatus: "server.getProfilerStatus",
@@ -775,6 +779,17 @@ export const WsServerGetTraceDiagnosticsRpc = Rpc.make(WS_METHODS.serverGetTrace
   payload: Schema.Struct({}),
   success: ServerTraceDiagnosticsResult,
   error: EnvironmentRpcError,
+});
+
+/**
+ * The server's redacted diagnostic bundle over this connection (#194). Advertised by the
+ * descriptor's `capabilities.diagnosticLogs`; never sent to a server without it.
+ */
+export const WsServerDownloadDiagnosticLogsRpc = Rpc.make(WS_METHODS.serverDownloadDiagnosticLogs, {
+  payload: DiagnosticLogsDownloadInput,
+  success: DiagnosticLogsDownloadEvent,
+  error: Schema.Union([DiagnosticLogsError, EnvironmentRpcError]),
+  stream: true,
 });
 
 export const WsServerGetProcessDiagnosticsRpc = Rpc.make(WS_METHODS.serverGetProcessDiagnostics, {
@@ -2051,6 +2066,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsServerUpdateSettingsRpc,
   WsServerDiscoverSourceControlRpc,
   WsServerGetTraceDiagnosticsRpc,
+  WsServerDownloadDiagnosticLogsRpc,
   WsServerGetProcessDiagnosticsRpc,
   WsServerGetProcessResourceHistoryRpc,
   WsServerGetProfilerStatusRpc,
