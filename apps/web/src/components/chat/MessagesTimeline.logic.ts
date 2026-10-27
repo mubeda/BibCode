@@ -23,6 +23,26 @@ export interface TimelineEndState {
   readonly isNearEnd?: boolean;
 }
 
+/** LegendList keeps a timeline that follows its end there as rows arrive, grow, or the view resizes. */
+const TIMELINE_MAINTAIN_SCROLL_AT_END = {
+  animated: false,
+  on: { dataChange: true, itemLayout: true, layout: true },
+};
+
+/**
+ * Whether LegendList keeps the timeline at its end itself. Not while a sent turn is anchored,
+ * which ChatView follows, and not once the reader has scrolled away: LegendList would otherwise
+ * move the list to its end whenever the bottom region (the composer, the Activity card) changes
+ * height while the list sits within its end threshold, or while the thread is shorter than the
+ * view, taking the line the reader reads away.
+ */
+export function resolveTimelineMaintainScrollAtEnd(input: {
+  readonly anchored: boolean;
+  readonly followsEnd: boolean;
+}): typeof TIMELINE_MAINTAIN_SCROLL_AT_END | false {
+  return input.anchored || !input.followsEnd ? false : TIMELINE_MAINTAIN_SCROLL_AT_END;
+}
+
 export function resolveTimelineIsAtEnd(state: TimelineEndState | undefined): boolean | undefined {
   return state?.isNearEnd ?? state?.isAtEnd;
 }

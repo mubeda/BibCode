@@ -18,6 +18,7 @@ import {
   normalizeCompactToolLabel,
   resolveAssistantMessageCopyState,
   resolveTimelineIsAtEnd,
+  resolveTimelineMaintainScrollAtEnd,
   resolveTimelineMinimapHasPersistentGutter,
   resolveTimelineMinimapHeightStyle,
   resolveTimelineMinimapIndexFromPointer,
@@ -2568,5 +2569,18 @@ describe("reasoning rows", () => {
         }),
       )?.latestThought,
     ).toBeNull();
+  });
+});
+
+describe("resolveTimelineMaintainScrollAtEnd", () => {
+  it("keeps the list at its end only while the timeline follows it and no turn is anchored", () => {
+    expect(resolveTimelineMaintainScrollAtEnd({ anchored: false, followsEnd: true })).toEqual({
+      animated: false,
+      on: { dataChange: true, itemLayout: true, layout: true },
+    });
+    // The reader scrolled away: a near-end list or a thread shorter than the view keeps its
+    // place when the bottom region changes height.
+    expect(resolveTimelineMaintainScrollAtEnd({ anchored: false, followsEnd: false })).toBe(false);
+    expect(resolveTimelineMaintainScrollAtEnd({ anchored: true, followsEnd: true })).toBe(false);
   });
 });

@@ -525,6 +525,12 @@ with Shift, Alt, Ctrl, or Cmd held, the keys keep their usual meaning.
 These keys and the minimap jump instead of scrolling smoothly when the system
 asks for reduced motion.
 
+While a reply streams, the timeline follows it. Scrolling the timeline yourself
+stops that: the wheel, a touch, the scrollbar, or the arrow keys, PageUp,
+PageDown, Home, End, or Space while the timeline has focus (for example after
+you tab to a button in it). Return to the end, with End or **Scroll to end**,
+and it follows again.
+
 ### Finding text in a chat
 
 Press **Mod+F** (Cmd+F on macOS, Ctrl+F elsewhere) in a chat, or choose **Find
