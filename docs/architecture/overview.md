@@ -3111,14 +3111,13 @@ view), or free scrolling.
   requests it made that LegendList has not finished, and a takeover withdraws
   them through `cancelScrollRequests()`, which
   `patches/@legendapp__list@3.3.10.patch` adds. It drops a request waiting for
-  rows to settle, the completion checks and target of a scroll under way, and
-  the adjustment an animated scroll holds for rows that resized during it, and
-  it stops a glide the browser is still running where it is. A held request
-  therefore never moves a reader who took over. One caveat: when a row above
-  the view resized during the glide, LegendList's anchor lock from the send's
-  data change can re-derive the dropped adjustment about 70 ms later, but only
-  if no scroll follows the takeover; the takeover's own scroll (a key's default
-  action, the wheel) clears that lock first, so in use it does not return.
+  rows to settle and the completion checks and target of a scroll under way,
+  and it stops a glide the browser is still running where it is. During an
+  animated scroll LegendList draws the rows offset by the adjustment it holds
+  for rows that resized during it; the method commits that adjustment as a
+  scroll by the same amount, so the content stays where the reader sees it
+  and no later scroll applies it. A held request therefore never moves a
+  reader who took over.
 - **Released sent row.** A sent row the reader scrolled away from stays
   released until the next send or thread. LegendList reports the anchor ready
   again whenever the anchored end space changes size, once per delivery; a
