@@ -179,8 +179,8 @@ export function AppSidebarLayout({ children }: { children: ReactNode }) {
         resizable={THREAD_SIDEBAR_RESIZABLE_OPTIONS}
       >
         <div className="flex h-full min-h-0 flex-row">
-          {/* Each environment card names its environment, so the Repositories view drops the rail. */}
-          {sidebarView === "repositories" ? null : <EnvironmentRail />}
+          {/* Repository cards name their environments and the Inbox spans them all, so only Environments shows the rail. */}
+          {sidebarView === "repositories" || sidebarView === "inbox" ? null : <EnvironmentRail />}
           <div className="flex h-full min-h-0 min-w-0 flex-1 flex-col">
             <ThreadSidebar />
           </div>

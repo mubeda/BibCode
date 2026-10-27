@@ -220,10 +220,14 @@ const h = vi.hoisted(() => {
     setDefaultAdvertisedEndpointKey: vi.fn(),
     setProjectExpanded: spies.setProjectExpanded,
     reorderProjects: spies.reorderProjects,
-    sidebarView: "environments" as "environments" | "repositories",
+    sidebarView: "environments" as "environments" | "repositories" | "inbox",
+    inboxCategory: null as "all" | "attention" | "working" | "done" | null,
     repositoryGroupExpandedById: {} as Record<string, boolean>,
-    setSidebarView: vi.fn((view: "environments" | "repositories") =>
+    setSidebarView: vi.fn((view: "environments" | "repositories" | "inbox") =>
       uiStore.setState({ sidebarView: view }),
+    ),
+    setInboxCategory: vi.fn((category: "all" | "attention" | "working" | "done") =>
+      uiStore.setState({ inboxCategory: category }),
     ),
     setRepositoryGroupExpanded: vi.fn((key: string, expanded: boolean) =>
       uiStore.setState({
@@ -762,6 +766,7 @@ vi.mock("./ui/sidebar", () => ({
   SidebarGroup: h.mk("SidebarGroup"),
   SidebarHeader: h.mk("SidebarHeader"),
   SidebarMenu: h.mk("SidebarMenu", "ul"),
+  SidebarMenuAction: h.mk("SidebarMenuAction", "button"),
   SidebarMenuButton: h.mk("SidebarMenuButton", "button"),
   SidebarMenuItem: h.mk("SidebarMenuItem", "li"),
   SidebarMenuSub: h.mk("SidebarMenuSub", "ul"),
