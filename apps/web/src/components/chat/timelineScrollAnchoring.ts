@@ -39,6 +39,13 @@ export function pointerPressStopsLiveFollow(target: EventTarget | null): boolean
   );
 }
 
+/**
+ * Controls that Space activates instead of scrolling. A link is not one: Space on a focused
+ * link scrolls the page.
+ */
+const SPACE_ACTIVATED_CONTROL_SELECTOR =
+  'button, input, textarea, select, summary, [role="button"]';
+
 /** Keys that scroll the timeline toward its end, and toward its start. */
 const TIMELINE_DOWN_KEYS = new Set(["ArrowDown", "PageDown", "End"]);
 const TIMELINE_UP_KEYS = new Set(["ArrowUp", "PageUp", "Home"]);
@@ -55,6 +62,86 @@ export interface TimelineScrollKeyScroller {
   readonly scrollTop: number;
   readonly scrollHeight: number;
   readonly clientHeight: number;
+}
+
+/** The parts of the timeline's scroll node and its document that the takeover listeners use. */
+export type TimelineTakeoverScrollNode = Pick<
+  HTMLElement,
+  | "contains"
+  | "addEventListener"
+  | "removeEventListener"
+  | "scrollTop"
+  | "scrollHeight"
+  | "clientHeight"
+>;
+export type TimelineTakeoverDocument = Pick<
+  Document,
+  "body" | "documentElement" | "addEventListener" | "removeEventListener"
+>;
+
+/**
+ * Listens for the reader taking the timeline's scroll over and calls `onTakeover` (#190): the
+ * wheel, a touch move, a pointer press that is not a click on a control, and the scrolling
+ * keys. A key counts when it is pressed inside the timeline, or with focus on the page itself
+ * after the last press was inside the timeline: clicking its text, or a control a webview does
+ * not focus on click (WebKit's buttons), leaves focus on the body, and the browser then scrolls
+ * the timeline with the key. Keys are heard on the document after they bubble, so a control's
+ * `preventDefault`, including one React makes at its root, is already seen. Returns a function
+ * that removes the listeners.
+ */
+export function bindTimelineTakeoverListeners(
+  scrollNode: TimelineTakeoverScrollNode,
+  ownerDocument: TimelineTakeoverDocument,
+  onTakeover: () => void,
+): () => void {
+  let pressedInTimeline = false;
+  const handleNavigation = () => onTakeover();
+  const handlePointerDown = (event: PointerEvent) => {
+    if (pointerPressStopsLiveFollow(event.target)) {
+      onTakeover();
+    }
+  };
+  const handleDocumentPointerDown = (event: PointerEvent) => {
+    pressedInTimeline = scrollNode.contains(event.target as Node | null);
+  };
+  const handleFocusIn = (event: FocusEvent) => {
+    if (!scrollNode.contains(event.target as Node | null)) {
+      pressedInTimeline = false;
+    }
+  };
+  const handleKeyDown = (event: KeyboardEvent) => {
+    const target = event.target as Node | null;
+    const fromTimeline = scrollNode.contains(target);
+    const fromPage =
+      target === ownerDocument.body ||
+      target === ownerDocument.documentElement ||
+      (target as unknown) === ownerDocument;
+    if (!fromTimeline && !(fromPage && pressedInTimeline)) {
+      return;
+    }
+    if (keyboardScrollStopsLiveFollow(event, scrollNode)) {
+      onTakeover();
+    }
+  };
+  scrollNode.addEventListener("wheel", handleNavigation, { passive: true });
+  scrollNode.addEventListener("touchmove", handleNavigation, { passive: true });
+  scrollNode.addEventListener("pointerdown", handlePointerDown, { passive: true });
+  ownerDocument.addEventListener("pointerdown", handleDocumentPointerDown, {
+    capture: true,
+    passive: true,
+  });
+  ownerDocument.addEventListener("focusin", handleFocusIn);
+  ownerDocument.addEventListener("keydown", handleKeyDown);
+  return () => {
+    scrollNode.removeEventListener("wheel", handleNavigation);
+    scrollNode.removeEventListener("touchmove", handleNavigation);
+    scrollNode.removeEventListener("pointerdown", handlePointerDown);
+    ownerDocument.removeEventListener("pointerdown", handleDocumentPointerDown, {
+      capture: true,
+    });
+    ownerDocument.removeEventListener("focusin", handleFocusIn);
+    ownerDocument.removeEventListener("keydown", handleKeyDown);
+  };
 }
 
 /**
@@ -86,7 +173,7 @@ export function keyboardScrollStopsLiveFollow(
     if (element.closest("input, textarea, select") !== null) {
       return false;
     }
-    if (isSpace && element.closest(TIMELINE_CONTROL_SELECTOR) !== null) {
+    if (isSpace && element.closest(SPACE_ACTIVATED_CONTROL_SELECTOR) !== null) {
       return false;
     }
   }

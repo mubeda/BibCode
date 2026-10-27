@@ -3203,15 +3203,25 @@ the same fixture files served by a release `bibcode` server in Chromium and
 Safari: the console shows no CSP violation and the server log no
 `/mermaid-probe/` request.
 
-**Real-key check (manual, about 30 seconds).** The packaged spec cannot press a
+**Real-key check (manual, about a minute).** The packaged spec cannot press a
 real key, so on each webview (WebKit on macOS and Linux, WebView2 on Windows)
-check once by hand that the timeline sees the key before the webview scrolls:
-in a chat with earlier messages, send a prompt that streams a long reply;
-while the reply streams, press Tab until a button in the timeline (such as a
-code block's **Copy code**) has focus, then press PageUp twice. The view moves
-up and stays where you read while the reply goes on streaming; End returns to
-the end and the reply is followed again. A view that jumps back to the
-streaming end after PageUp fails the check.
+check by hand that the timeline sees the key before the webview scrolls. In a
+chat with earlier messages, send a prompt that streams a long reply, and while
+it streams:
+
+1. Press Tab until a button in the timeline (such as a code block's **Copy
+   code**) has focus, then press PageUp twice. The view moves up and stays
+   where you read while the reply goes on streaming; End returns to the end
+   and the reply is followed again.
+2. Click a code block's **Copy code** (WebKit leaves focus on the page rather
+   than the button), or click a paragraph's text, then press PageUp. The view
+   moves up and stays; End resumes following.
+3. Send again and press PageUp right away, while the sent message is still
+   gliding up to the top. The glide stops at once and the view pages up from
+   where it stopped; no row jumps as it stops.
+
+A view that jumps back to the streaming end after PageUp, or a glide that goes
+on after the key, fails the check.
 
 At final packaged shutdown, inspect the raw worker and server logs. Provider and
 terminal owners, operational logs, orchestration, and the SQLite worker must all

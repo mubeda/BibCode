@@ -3099,12 +3099,18 @@ view), or free scrolling.
   touch move, a pointer press anywhere but a control (a press on a row's
   control is a click), the scrolling keys (ArrowUp, ArrowDown, PageUp,
   PageDown, Home, End, Space and Shift+Space) pressed with focus inside the
-  timeline, PageUp and PageDown from the composer, the minimap and find. A key
-  that a control owns (it called `preventDefault`), that edits text, that
-  activates a focused control (Space), or that would move nothing at the end
-  it points to leaves following on. Returning to the end resumes following.
-  These listeners bind to each thread's list once it shows, so a new thread,
-  which shows an empty state until its first turn, binds with that turn.
+  timeline, or with focus on the page itself after the last press was inside
+  the timeline (clicking its text, or a button WebKit does not focus, leaves
+  focus on the body, and the browser then scrolls the timeline with the key),
+  PageUp and PageDown from the composer, the minimap and find. Keys are heard
+  on the document after they bubble, so a control's `preventDefault`,
+  React's included, is seen. A key that a control owns, that edits text, that
+  activates a focused control (Space, except on a link, where it scrolls), or
+  that would move nothing at the end it points to leaves following on.
+  Returning to the end resumes following. `MessagesTimeline` reports when its
+  list mounts and unmounts (`onListMount`), and the listeners bind to the
+  mounted list, so a new thread, which shows an empty state until its first
+  turn, binds with that turn.
 - **Withdrawn requests.** LegendList can hold an imperative scroll for up to
   800 ms while rows settle, clamps it to the content it has laid out, and a
   wheel or key scroll does not cancel it. `ChatView` counts the scroll

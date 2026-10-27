@@ -253,6 +253,10 @@ describe("keyboard scrolling of the timeline", () => {
     expect(press(" ", { target: target(["summary"]) })).toBe(false);
   });
 
+  it("stops following for Space on a focused link, which scrolls rather than activates", () => {
+    expect(press(" ", { target: target(["a[href]"]) })).toBe(true);
+  });
+
   it("leaves following on while the key edits text", () => {
     expect(press("ArrowUp", { target: target(["textarea"]) })).toBe(false);
     expect(press("End", { target: target(["input"]) })).toBe(false);

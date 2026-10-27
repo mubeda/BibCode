@@ -136,9 +136,8 @@ import { type LegendListRef } from "@legendapp/list/react";
 import {
   getAnchoredTurnMetrics,
   getSentRowLandingDelta,
+  bindTimelineTakeoverListeners,
   getTimelinePageScrollOffset,
-  keyboardScrollStopsLiveFollow,
-  pointerPressStopsLiveFollow,
   rowToggleNeedsEndReveal,
   timelineScrollAnimates,
   type TimelineScrollMode,
@@ -4172,61 +4171,23 @@ function ChatViewContent(props: ChatViewProps) {
     },
     [cancelTimelineLiveFollowForUserNavigation, composerOverlayHeight],
   );
-  // The timeline remounts per thread (it is keyed by thread id), so bind to
-  // each thread's scroll node; without a thread there is no timeline. A thread
-  // with no rows shows an empty state instead of the list, so a new thread's
-  // list mounts with its first turn and binds then.
-  const timelineListShown = timelineEntries.length > 0 || isWorking;
-  useEffect(() => {
-    if (activeThreadId === null || !timelineListShown) {
+  // Binds the reader's takeover listeners to the timeline's list while it is mounted. The list
+  // remounts per thread (it is keyed by thread), and a thread with no rows shows an empty state
+  // instead, so a new thread's list mounts, and binds, with its first turn.
+  const timelineTakeoverCleanupRef = useRef<(() => void) | null>(null);
+  const onTimelineListMount = useCallback((list: LegendListRef | null) => {
+    timelineTakeoverCleanupRef.current?.();
+    timelineTakeoverCleanupRef.current = null;
+    const scrollNode = list?.getScrollableNode();
+    if (!scrollNode) {
       return;
     }
-    let removeListeners: (() => void) | null = null;
-    const frame = requestAnimationFrame(() => {
-      const scrollNode = legendListRef.current?.getScrollableNode();
-      if (!scrollNode) {
-        return;
-      }
-      const handleManualNavigation = () => {
-        cancelTimelineLiveFollowForUserNavigationRef.current();
-      };
-      scrollNode.addEventListener("wheel", handleManualNavigation, {
-        passive: true,
-      });
-      scrollNode.addEventListener("touchmove", handleManualNavigation, {
-        passive: true,
-      });
-      // A press on a row's control is a click, not a scroll, so following goes on (#173).
-      const handlePointerDown = (event: PointerEvent) => {
-        if (pointerPressStopsLiveFollow(event.target)) {
-          handleManualNavigation();
-        }
-      };
-      scrollNode.addEventListener("pointerdown", handlePointerDown, {
-        passive: true,
-      });
-      // Keys that scroll the timeline from inside it, such as from a row's focused control (#190).
-      const handleKeyDown = (event: KeyboardEvent) => {
-        if (keyboardScrollStopsLiveFollow(event, scrollNode)) {
-          handleManualNavigation();
-        }
-      };
-      scrollNode.addEventListener("keydown", handleKeyDown, {
-        passive: true,
-      });
-      removeListeners = () => {
-        scrollNode.removeEventListener("wheel", handleManualNavigation);
-        scrollNode.removeEventListener("touchmove", handleManualNavigation);
-        scrollNode.removeEventListener("pointerdown", handlePointerDown);
-        scrollNode.removeEventListener("keydown", handleKeyDown);
-      };
-    });
-
-    return () => {
-      cancelAnimationFrame(frame);
-      removeListeners?.();
-    };
-  }, [activeThreadId, timelineListShown]);
+    timelineTakeoverCleanupRef.current = bindTimelineTakeoverListeners(
+      scrollNode,
+      scrollNode.ownerDocument ?? document,
+      () => cancelTimelineLiveFollowForUserNavigationRef.current(),
+    );
+  }, []);
 
   // Settles a sent row once its glide stops, on scrollend or a timer that can catch a slow
   // webview's glide still moving or not yet begun (#191). A turn taller than the view is pinned
@@ -7486,6 +7447,7 @@ function ChatViewContent(props: ChatViewProps) {
                       activeTurnInProgress={isWorking || !latestTurnSettled}
                       activeTurnStartedAt={activeWorkStartedAt}
                       listRef={legendListRef}
+                      onListMount={onTimelineListMount}
                       timelineEntries={timelineEntries}
                       queuedMessages={queuedMessages}
                       queuedStatuses={queuedStatuses}
