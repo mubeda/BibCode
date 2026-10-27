@@ -200,6 +200,7 @@ async fn crash_dumps_in_the_diagnostic_bundle_need_the_operate_scope() {
             Ok(DiagnosticLogsHttpResponse {
                 filename: "bibcode-diagnostics-20260715T123456Z.zip".to_owned(),
                 bytes: b"PK-test-archive".to_vec(),
+                slot: None,
             })
         })
     });
@@ -241,6 +242,7 @@ async fn diagnostic_logs_route_is_bounded_authorized_and_returns_zip_headers() {
             Ok(DiagnosticLogsHttpResponse {
                 filename: "bibcode-diagnostics-20260715T123456Z.zip".to_owned(),
                 bytes: b"PK-test-archive".to_vec(),
+                slot: None,
             })
         })
     });

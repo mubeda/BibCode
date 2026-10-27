@@ -5,8 +5,9 @@ import { downloadDiagnosticLogs, type DiagnosticLogsOptions } from "./downloadDi
 import { readFrontendLogSnapshot } from "./frontendLogCapture";
 
 /**
- * Prepares the primary environment's diagnostic ZIP and reports the outcome in a toast.
- * One download runs at a time per caller.
+ * Prepares an environment's diagnostic ZIP and reports the outcome in a toast: the primary
+ * environment's unless `options.environment` names another one. One download runs at a time
+ * per caller.
  */
 export function useDiagnosticLogsDownload() {
   const [status, setStatus] = useState<"idle" | "downloading">("idle");
@@ -15,26 +16,36 @@ export function useDiagnosticLogsDownload() {
     (options?: DiagnosticLogsOptions) => {
       if (status === "downloading") return;
       setStatus("downloading");
+      const label = options?.environment?.label;
       void (async () => {
         try {
           const result = await downloadDiagnosticLogs(readFrontendLogSnapshot(), options);
           if (result.status === "saved") {
             toastManager.add({
               type: "success",
-              title: "Diagnostic logs saved",
+              title:
+                label === undefined
+                  ? "Diagnostic logs saved"
+                  : `Diagnostic logs from ${label} saved`,
               description: result.path,
             });
           } else if (result.status === "downloaded") {
             toastManager.add({
               type: "success",
-              title: "Diagnostic logs download started",
+              title:
+                label === undefined
+                  ? "Diagnostic logs download started"
+                  : `Diagnostic logs from ${label} downloading`,
               description: result.filename,
             });
           }
         } catch (error) {
           toastManager.add({
             type: "error",
-            title: "Could not download diagnostic logs",
+            title:
+              label === undefined
+                ? "Could not download diagnostic logs"
+                : `Could not download ${label}'s logs`,
             description:
               error instanceof Error ? error.message : "Unable to prepare the diagnostic archive.",
           });

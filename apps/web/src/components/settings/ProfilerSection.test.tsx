@@ -14,13 +14,18 @@ interface FakeEnvironment {
   readonly label: string;
   readonly connection: { readonly phase: string };
   readonly serverConfig: {
-    readonly environment: { readonly capabilities: { readonly profiler: boolean } };
+    readonly environment: {
+      readonly capabilities: { readonly profiler: boolean; readonly diagnosticLogs?: boolean };
+    };
   } | null;
 }
 
-/** A server config as far as the section reads it: whether the server has the profiler. */
-const configWithProfiler = (profiler: boolean) => ({
-  environment: { capabilities: { profiler } },
+/**
+ * A server config as far as the section reads it: whether the server has the profiler, and
+ * whether it sends its diagnostic bundle over RPC.
+ */
+const configWithProfiler = (profiler: boolean, diagnosticLogs = false) => ({
+  environment: { capabilities: { profiler, diagnosticLogs } },
 });
 
 const h = vi.hoisted(() => ({
@@ -328,12 +333,17 @@ async function rerender(container: HTMLDivElement) {
   });
 }
 
-function fakeEnvironment(label: string, phase = "connected", profiler = true): FakeEnvironment {
+function fakeEnvironment(
+  label: string,
+  phase = "connected",
+  profiler = true,
+  diagnosticLogs = false,
+): FakeEnvironment {
   return {
     environmentId: `environment-${label}`,
     label,
     connection: { phase },
-    serverConfig: configWithProfiler(profiler),
+    serverConfig: configWithProfiler(profiler, diagnosticLogs),
   };
 }
 
@@ -506,7 +516,7 @@ describe("ProfilerSection", () => {
 
     expect(buttonByText(container, "Open folder").disabled).toBe(true);
     expect(container.querySelector("[data-tooltip-popup]")!.textContent).toBe(
-      "The profiler folder is on Work Server. Use Export bundle or bibcode profiler on that machine.",
+      "The profiler folder is on Work Server. Use Export bundle here, or bibcode profiler on that machine.",
     );
     expect(h.openInEditorCalls).toHaveLength(0);
   });
@@ -783,7 +793,7 @@ describe("ProfilerSection", () => {
       expect(container.querySelector('button[aria-label="Environment"]')!.textContent).toBe("Workstation");
     });
 
-    it("keeps Open folder and Export bundle to the primary environment", async () => {
+    it("keeps Open folder to the primary, and Export bundle to servers that can send it", async () => {
       const workstation = withLuna();
       const container = await render();
       expect(buttonByText(container, "Open folder").disabled).toBe(false);
@@ -798,7 +808,7 @@ describe("ProfilerSection", () => {
       );
       expect(reasons).toEqual([
         "The profiler folder is on Workstation. Use bibcode profiler on that machine.",
-        "Export bundle covers Work Server only. Use bibcode profiler on Workstation.",
+        "Workstation runs an older BiBCode server that cannot send its logs. Update it to download them here.",
       ]);
       await click(buttonByText(container, "Export bundle"));
       expect(h.downloadCalls).toHaveLength(0);
@@ -806,8 +816,35 @@ describe("ProfilerSection", () => {
       const checkbox = container.querySelector('input[type="checkbox"]') as HTMLInputElement;
       expect(checkbox.disabled).toBe(true);
       expect(document.getElementById(checkbox.getAttribute("aria-describedby")!)?.textContent).toBe(
-        "Export bundle covers Work Server only. Use bibcode profiler on Workstation.",
+        "Workstation runs an older BiBCode server that cannot send its logs. Update it to download them here.",
       );
+    });
+
+    it("exports a remote environment's bundle over its own connection", async () => {
+      const workstation = withLuna(fakeEnvironment("Workstation", "connected", true, true));
+      const container = await render();
+      await pick(workstation);
+
+      const exportButton = buttonByText(container, "Export bundle");
+      expect(exportButton.disabled).toBe(false);
+      const reasons = [...container.querySelectorAll("[data-tooltip-popup]")].map(
+        (popup) => popup.textContent,
+      );
+      expect(reasons).toEqual([
+        "The profiler folder is on Workstation. Use Export bundle here, or bibcode profiler on that machine.",
+      ]);
+      await click(container.querySelector('input[type="checkbox"]') as HTMLInputElement);
+      await click(buttonByText(container, "Export bundle"));
+
+      expect(h.downloadCalls).toEqual([
+        {
+          frontendLog: "frontend snapshot\n",
+          options: {
+            includeCrashDumps: true,
+            environment: { environmentId: workstation.environmentId, label: "Workstation" },
+          },
+        },
+      ]);
     });
 
     it("keeps an export busy after switching away from the primary and back", async () => {
@@ -845,15 +882,31 @@ describe("ProfilerSection", () => {
       h.environment = { ...h.environment!, connection: { phase: "offline" } };
       withLuna();
 
+      const workstation = h.environments[1]!;
       const container = await render();
 
-      expect(container.querySelector("[data-select]")).toBeNull();
       expect(container.querySelector('[role="switch"]')!.getAttribute("aria-checked")).toBe("true");
-      // The page otherwise describes the primary, so the environment in control is named.
-      expect(container.textContent).toContain("Environment");
-      expect(container.querySelector("[data-settings-row]")!.textContent).toContain("Workstation");
-      // Workstation is not the primary, so the folder and bundle stay with the primary.
+      // The page's environment is the primary, which is down: say so, name the stand-in, and
+      // offer the picker so the stand-in can be chosen for real (the logs row follows it).
+      expect(container.querySelector("[data-settings-row]")!.textContent).toContain(
+        "Work Server is not connected. Showing Workstation.",
+      );
+      expect(container.querySelector("[data-select]")).not.toBeNull();
+      expect(container.querySelector('button[aria-label="Environment"]')!.textContent).toBe(
+        "Work Server",
+      );
+      expect(
+        container.querySelector(`[data-item="${ENVIRONMENT_ID}"]`)!.getAttribute("data-disabled"),
+      ).toBe("true");
+      // Workstation is not the primary, so the folder stays with the primary.
       expect(buttonByText(container, "Open folder").disabled).toBe(true);
+
+      await pick(workstation);
+      expect(h.selections).toEqual([EnvironmentId.make(workstation.environmentId)]);
+      // Workstation is now the page's environment and the only one to choose, so it is just named.
+      const row = container.querySelector("[data-settings-row]")!;
+      expect(row.textContent).toContain("Workstation");
+      expect(row.textContent).not.toContain("is not connected");
     });
 
     it.each(["connecting", "reconnecting"])(

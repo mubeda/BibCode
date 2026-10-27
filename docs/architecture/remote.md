@@ -921,7 +921,7 @@ is re-verified over RPC. The production call-site audit is:
 | `assets.createUrl` and `apps/web/src/assets/assetUrls.ts`                                                                                 | URL issuance is authenticated RPC over E2EE. The resulting `/api/assets/<signed capability>/<path>` GET is a documented exception: it carries a bounded, expiring, resource-scoped HMAC capability and no bearer authorization.                                                                                                                                                                                                                                                                   |
 | `projects.createDownloadUrl`, `projects.createUploadUrl`, and `apps/web/src/components/files/fileTransfers.ts`                            | Same documented exception as `assets.createUrl`. URL issuance is authenticated RPC over E2EE; the resulting `GET`/`POST /api/transfers/<token>` carries a bounded, five-minute, resource-scoped HMAC capability and no bearer authorization. A download token names one entry and an upload token one file name in one directory, so a leaked URL reaches nothing else. The browser upload sends `credentials: "omit"`; desktop mode reaches the route from the Rust host instead of the WebView. |
 | `device.createMediaTicket` and `packages/client-runtime/src/device/mediaSocket.ts`                                                        | Ticket issuance is authenticated RPC over E2EE, and the ticket is redeemable only on the E2EE route. `GET /api/device-media-e2ee` carries no credential in the URL: it runs Noise_NK with the pinned key under the prologue `bibcode-device-media/1`, then reads the single-use ticket inside the encrypted records. See [Device media sockets](#device-media-sockets).                                                                                                                           |
-| `apps/web/src/diagnostics/downloadDiagnosticLogs.ts`                                                                                      | Direct authenticated HTTP is primary-environment-only and cannot target a saved bearer profile. Environment-scoped remote diagnostics are therefore unavailable until represented as RPC; an E2EE bearer must not be added to this request.                                                                                                                                                                                                                                                       |
+| `apps/web/src/diagnostics/downloadDiagnosticLogs.ts`                                                                                      | Its direct authenticated HTTP request (`POST /api/diagnostics/logs.zip`) is primary-environment-only and never targets a saved bearer profile; an E2EE bearer must not be added to it. Another environment's bundle is environment-scoped RPC: `server.downloadDiagnosticLogs` over that environment's own connection, so on a pinned profile the archive stays inside Noise. It is sent only to a server advertising `capabilities.diagnosticLogs`.                                              |
 | `rpc/http.ts` HTTP API client and primary/cloud-link callers                                                                              | The module is a transport constructor, not an independent request. Its host-key callers are limited to the descriptor row above; primary and Connect control-plane calls are not saved host-key targets.                                                                                                                                                                                                                                                                                          |
 
 ### BiBCode Connect
@@ -1592,9 +1592,15 @@ that server's `enableProfiler` setting, and its data stays in that server's data
 root. WSL, SSH, and remote environments run their own `bibcode` process, so each
 has its own crash monitor and follows its own setting. The Diagnostics Profiler
 section switches between connected environments; **Open folder** works only for
-the desktop's primary environment and **Export bundle** covers the primary
-environment only. For any other environment, run `bibcode profiler` on its host,
-for example over SSH, or `ssh <host> bibcode profiler mcp` for an AI harness.
+the desktop's primary environment. **Export bundle** and **Download logs** cover
+the selected environment: another environment's server builds and redacts its
+own bundle and sends it with `server.downloadDiagnosticLogs` over that
+environment's RPC connection (see
+[Observability](../operations/observability.md#diagnostic-bundle)). A server
+without `capabilities.diagnosticLogs` gets no such request; the page says it
+must be updated. To query a remote profiler directly, run `bibcode profiler` on
+its host, for example over SSH, or `ssh <host> bibcode profiler mcp` for an AI
+harness.
 
 A server older than the profiler does not advertise `capabilities.profiler`. The
 client then sends it no profiler RPC, ignores the `enableProfiler: true` it may

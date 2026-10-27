@@ -3093,8 +3093,11 @@ sizes. Cover relevant:
   server is already recording to this profiler folder. Close it, then restart
   this one." when a headless `bibcode --base-dir <root> serve` on the same
   disposable data root started first and holds the folder; **Open folder** enabled only for the primary
-  environment on desktop and **Export bundle** only for the primary
-  environment, each otherwise disabled with its stated reason; **Include crash
+  environment on desktop, otherwise disabled with its stated reason; **Export
+  bundle** enabled for the primary and for a connected remote environment whose
+  server is current, and for an environment whose server is older than the
+  remote diagnostic download disabled with "<label> runs an older BiBCode server
+  that cannot send its logs. Update it to download them here."; **Include crash
   dumps** and its warning, disabled with Export bundle's reason when it is;
   where an environment runs a BiBCode older than the profiler, only
   the disabled switch with "This server's BiBCode version has no profiler.
@@ -3104,6 +3107,25 @@ sizes. Cover relevant:
   the status bar shows the **Profiler** segment; its tooltip lists the
   recording environments, clicking it opens Diagnostics on the first of them,
   and it disappears once every profiler is off;
+- **Settings → Diagnostics → Diagnostic logs** with a remote environment
+  connected: the row names the primary by default ("… from <primary label>.")
+  and **Download logs** saves the primary's `bibcode-diagnostics-<label>-….zip`
+  as before; with the primary disconnected, the button is disabled with
+  "<primary label> is not connected. Reconnect it to download its logs." and no
+  remote is downloaded instead. Choose the remote environment in the Profiler
+  section's **Environment** picker (the page's only one): the row names it, and
+  the saved ZIP's name and
+  `manifest.json` name that remote server, its `storageInstanceId`, and its
+  version, and its `server.log` is the remote host's. With a remote server
+  older than the remote download, the button is disabled with "<label> runs an
+  older BiBCode server that cannot send its logs. Update it to download them
+  here." Stop the remote server (or cut its connection) while the remote
+  download runs: the error toast reads "Could not download <label>'s logs" /
+  "The connection to <label> was lost. Reconnect and try again.", and no file is
+  saved; while the remote environment reconnects, the button is disabled with
+  "<label> is still connecting. Download its logs once it is connected.", and
+  the primary's logs are never downloaded in its place (once the app drops a
+  choice whose environment is gone, the row names the primary again);
 - Find in thread on macOS (WKWebView), Linux (WebKitGTK AppImage), and Windows
   (WebView2), in a long thread with folded turns: find a word that appears only
   in a folded turn, a tool command inside a collapsed run of tool calls, a file

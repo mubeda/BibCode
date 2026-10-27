@@ -15,6 +15,10 @@
       "types": "./src/device/index.ts",
       "default": "./src/device/index.ts"
     },
+    "./diagnostics": {
+      "types": "./src/diagnostics/index.ts",
+      "default": "./src/diagnostics/index.ts"
+    },
     "./environment": {
       "types": "./src/environment/index.ts",
       "default": "./src/environment/index.ts"

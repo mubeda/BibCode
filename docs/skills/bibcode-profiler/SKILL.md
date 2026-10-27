@@ -42,6 +42,15 @@ for the command prefix that fits the install:
   keep it.
 - **Remote hosts:** `bibcode` must be on the `PATH` of a non-interactive `ssh`
   shell, as BiBCode's own SSH launch requires. If it is not, ask where it is.
+  Without SSH access, ask the user to open **Settings → Diagnostics** in the
+  app that is connected to that host, choose the host in **Environment**, and
+  use **Download logs** (or **Export bundle**, with **Include crash dumps**
+  when a dump is needed). The remote server builds that ZIP itself and sends it
+  over the app's connection; its `manifest.json` names the host, its
+  `storageInstanceId`, and its server version, and its `profiler/` folder holds
+  the same events and findings files the commands read (parse them as NDJSON).
+  The archive holds one server's data: a launch or transport problem can also
+  need the primary's archive.
 - **WSL:** the desktop runs the Linux binary that `BIBCODE_WSL_SERVER_BINARY`
   names (a Windows path; `wsl.exe -d <distro> -- wslpath -a '<path>'` converts it)
   through `wsl.exe -d <distro> --exec`. Its data root is the distro's

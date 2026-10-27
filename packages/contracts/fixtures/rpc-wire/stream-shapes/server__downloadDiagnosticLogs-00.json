@@ -1,0 +1,27 @@
+{
+  "_tag": "Chunk",
+  "requestId": "900719925474099312345",
+  "values": [
+    {
+      "_tag": "Started",
+      "fileName": "\"",
+      "byteLength": 70,
+      "manifest": {
+        "schemaVersion": 1,
+        "environmentId": "r",
+        "storageInstanceId": null,
+        "environmentLabel": "4294967295",
+        "serverVersion": "T",
+        "platform": {
+          "os": "-1",
+          "arch": ""
+        },
+        "generatedAt": "pay?<S;\"&h",
+        "crashDumps": {
+          "requested": false,
+          "included": 51
+        }
+      }
+    }
+  ]
+}
