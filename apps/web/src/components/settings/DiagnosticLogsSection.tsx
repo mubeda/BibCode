@@ -5,14 +5,35 @@ import { useId } from "react";
 
 import { serverHasDiagnosticLogs } from "../../diagnostics/diagnosticLogsSupport";
 import { useDiagnosticLogsDownload } from "../../diagnostics/useDiagnosticLogsDownload";
+import type { EnvironmentPresentation } from "../../state/environments";
 import { Button } from "../ui/button";
-import { DiagnosticsEnvironmentSelect, useDiagnosticsEnvironment } from "./diagnosticsEnvironment";
+import { useDiagnosticsEnvironment } from "./diagnosticsEnvironment";
 import { SettingsRow, SettingsSection } from "./settingsLayout";
 
+// Phases in which an environment is on its way to connected.
+const CONNECTING_PHASES: ReadonlySet<string> = new Set(["connecting", "reconnecting", "available"]);
+
+/** Why the download cannot run for `target` now; `null` when it can. */
+function disabledReasonFor(
+  target: EnvironmentPresentation,
+  label: string,
+  isPrimary: boolean,
+): string | null {
+  const phase = target.connection.phase;
+  if (phase !== "connected") {
+    return CONNECTING_PHASES.has(phase)
+      ? `${label} is still connecting. Download its logs once it is connected.`
+      : diagnosticLogsFailureMessage("not-connected", label);
+  }
+  if (isPrimary || serverHasDiagnosticLogs(target.serverConfig)) return null;
+  return diagnosticLogsFailureMessage("unsupported", label);
+}
+
 /**
- * Downloads the redacted diagnostic ZIP of the environment the page has selected: the primary
- * over its HTTP route as before, any other over its own connection (#194). A download never
- * goes to another environment than the one this row names.
+ * Downloads the redacted diagnostic ZIP of exactly the environment the page has selected:
+ * the primary when the route names none (over its HTTP route as before), any other over its
+ * own connection (#194). The environment is picked in the Profiler section, whose selection
+ * this row shares. A download never goes to an environment this row does not name.
  */
 export function DiagnosticLogsSection({
   selectedEnvironmentId,
@@ -22,29 +43,31 @@ export function DiagnosticLogsSection({
   readonly selectedEnvironmentId: EnvironmentId | null;
   readonly onSelectEnvironment: (environmentId: EnvironmentId | null) => void;
 }) {
-  const { environments, connected, primaryEnvironment, environment, waitingFor } =
-    useDiagnosticsEnvironment(selectedEnvironmentId, onSelectEnvironment);
+  const { environments, primaryEnvironment } = useDiagnosticsEnvironment(
+    selectedEnvironmentId,
+    onSelectEnvironment,
+  );
   const { isDownloading, download } = useDiagnosticLogsDownload();
   const reasonId = useId();
-  // The chosen environment, not the stand-in the page shows while the chosen one connects.
-  const target = waitingFor ?? environment;
-  // Chosen, but not in the catalog (yet, or any more): the stand-in must not be downloaded.
-  const chosenUnknown =
-    selectedEnvironmentId !== null &&
-    waitingFor === undefined &&
-    environment?.environmentId !== selectedEnvironmentId;
-  const remote =
-    target !== null && target.environmentId !== primaryEnvironment?.environmentId ? target : null;
-  const label = chosenUnknown ? "The chosen environment" : target?.label.trim() || "the server";
-  const disabledReason = chosenUnknown
-    ? diagnosticLogsFailureMessage("not-connected", label)
-    : remote === null
-      ? null
-      : waitingFor !== undefined || remote.connection.phase !== "connected"
-        ? diagnosticLogsFailureMessage("not-connected", label)
-        : serverHasDiagnosticLogs(remote.serverConfig)
-          ? null
-          : diagnosticLogsFailureMessage("unsupported", label);
+  // The environment the route names, or the primary; never a stand-in for either.
+  const target =
+    selectedEnvironmentId === null
+      ? primaryEnvironment
+      : (environments.find((candidate) => candidate.environmentId === selectedEnvironmentId) ??
+        null);
+  const isPrimary =
+    target === null
+      ? selectedEnvironmentId === null
+      : target.environmentId === primaryEnvironment?.environmentId;
+  const label = target?.label.trim() || "the server";
+  const disabledReason =
+    target !== null
+      ? disabledReasonFor(target, label, isPrimary)
+      : selectedEnvironmentId !== null
+        ? // Chosen, but not in the catalog (yet, or any more).
+          diagnosticLogsFailureMessage("not-connected", "The chosen environment")
+        : // The catalog is still loading: the primary's HTTP route needs nothing from it.
+          null;
 
   return (
     <SettingsSection title="Diagnostic logs">
@@ -56,7 +79,7 @@ export function DiagnosticLogsSection({
             <span className="font-mono">server.trace.ndjson</span>,{" "}
             <span className="font-mono">frontend.log</span>, and any recorded{" "}
             <span className="font-mono">profiler</span> data (without crash dumps)
-            {target === null || chosenUnknown ? "" : ` from ${label}`}.
+            {target === null ? "" : ` from ${label}`}.
           </>
         }
         status={
@@ -68,30 +91,21 @@ export function DiagnosticLogsSection({
           )
         }
         control={
-          <div className="flex flex-wrap items-center gap-2">
-            {connected.length > 1 && environment !== null ? (
-              <DiagnosticsEnvironmentSelect
-                environments={environments}
-                value={target ?? environment}
-                onSelectEnvironment={onSelectEnvironment}
-              />
-            ) : null}
-            <Button
-              aria-label="Download diagnostic logs"
-              aria-describedby={disabledReason === null ? undefined : reasonId}
-              disabled={isDownloading || disabledReason !== null}
-              onClick={() =>
-                download(
-                  remote === null
-                    ? undefined
-                    : { environment: { environmentId: remote.environmentId, label } },
-                )
-              }
-            >
-              <DownloadIcon className="size-3.5" />
-              {isDownloading ? "Preparing logs..." : "Download logs"}
-            </Button>
-          </div>
+          <Button
+            aria-label="Download diagnostic logs"
+            aria-describedby={disabledReason === null ? undefined : reasonId}
+            disabled={isDownloading || disabledReason !== null}
+            onClick={() =>
+              download(
+                isPrimary || target === null
+                  ? undefined
+                  : { environment: { environmentId: target.environmentId, label } },
+              )
+            }
+          >
+            <DownloadIcon className="size-3.5" />
+            {isDownloading ? "Preparing logs..." : "Download logs"}
+          </Button>
         }
       />
     </SettingsSection>
