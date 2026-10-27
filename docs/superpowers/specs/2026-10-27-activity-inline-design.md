@@ -129,6 +129,31 @@ median estimate. If the batched run shows a helper-ready time above about 3 s,
 the next step is to look at the helper's cold start itself, not to raise the
 budget again.
 
+**The first launch has a second fail-open path the budgets do not reach.**
+`SystemCodexHelperLauncher::start` waits for the process-wide helper
+supervisor (`codex.rs:2127-2130`). That supervisor is a `LazyLock`
+(`:2307-2313`), started by the first Codex terminal launch in the process, and
+`wait_ready` gives up after `CODEX_HELPER_SUPERVISOR_INIT_TIMEOUT = 100 ms`
+(`:76, :2389-2405`). Starting it means spawning a thread and building a
+current-thread Tokio runtime. That is normally a few milliseconds, but it is
+not bounded on a loaded runner.
+
+The e2e opens exactly one Codex terminal, which is that first launch. If
+initialization misses 100 ms, the launch passes through whatever the budgets
+are.
+
+The fix has two parts:
+
+1. Start the initializer when `CodexTerminalObserverFactory::system()` is
+   built, at server start, so the first launch finds it ready.
+2. Have `wait_ready` wait for the rest of the preparation budget instead of a
+   fixed 100 ms.
+
+The existing tests at `:3920-3945` and `:3980-4030` keep their meaning: a
+failed or late initialization still fails open, but now at the preparation
+bound instead of at 100 ms. The skip reason is
+`helper_supervisor_unavailable`.
+
 Costs:
 
 - On a slow machine, opening a Codex terminal can take up to about 4 s before
@@ -150,7 +175,8 @@ logged once per executable and reason, at the level it deserves:
 | Capabilities                           | `unsupported_capabilities` (no unix listener or remote TUI)                                  | info, since it is expected for older Codex                                  |
 | Arguments                              | `rejected_args` (`remote_tui_args` returned `None`)                                          | info                                                                        |
 | Generation directory or socket path    | `generation_dir_failed`, `socket_path_too_long`                                              | warn                                                                        |
-| Helper                                 | `helper_start_failed`, with the launcher's error message                                     | warn                                                                        |
+| Helper supervisor                      | `helper_supervisor_unavailable` (initialization failed or was late)                          | warn                                                                        |
+| Helper                                 | `helper_start_failed`, with the launcher's error message, including readiness past `CODEX_HELPER_READY_TIMEOUT` | warn                                          |
 | Budget expired (`prepare_inner`)       | `preparation_timeout`, with `stage` (`probe` or `helper_ready`) and `elapsed_ms`             | warn                                                                        |
 | After spawn: connect or initialize fails | `observer_connect_failed`, with the error                                                  | warn                                                                        |
 | After spawn: root discovery stops      | `root_discovery_stopped`                                                                     | warn                                                                        |
@@ -158,6 +184,20 @@ logged once per executable and reason, at the level it deserves:
 The stage for the timeout comes from a small atomic cell that `prepare_unix`
 updates as it moves between stages. The supervisor's `None` arm at
 `supervisor.rs:481` adds no label of its own: the factory has already said why.
+
+**How to read the batched run.**
+
+- **Success:** the dock appears, and none of the lines below is logged.
+- **A slow helper:** the helper stage is bounded *inside*
+  `SystemCodexHelperLauncher::start` by `CODEX_HELPER_READY_TIMEOUT` (3 s), so
+  a helper that is too slow logs `helper_start_failed` with the readiness
+  message, not a timeout.
+- **`preparation_timeout`:** fires only when the probes, plus waiting for the
+  supervisor, take more than the remaining 1 s. Its `stage` says which.
+- **`observer_connect_failed` or `root_discovery_stopped`:** preparation
+  worked, and the failure came after the spawn.
+
+Each outcome points at a different next step, so a single push is readable.
 
 Logs carry no paths or prompt content beyond the executable name, which the
 existing `warn_once` calls already include. They use `tracing`, so they reach
@@ -238,10 +278,18 @@ width.
 
   The ChatView code that reads `composerOverlayHeight` (`:4031, :4060, :4088`)
   is the same code a growing composer exercises.
-- **No new follow code.** Phase 2 includes a unit test and a packaged
-  assertion that `scrollTop` is unchanged when the card is toggled while
-  reading mid-history, and that an at-end list stays at the end. If either
-  fails, I report the symptom to the coordinator and do not touch follow code.
+- **No new follow code.** Phase 2 includes unit tests and packaged
+  assertions for three scroll states:
+  1. Toggled while reading mid-history, `scrollTop` does not change.
+  2. Toggled at the end, the list stays at the end.
+  3. Toggled after a send, while the sent turn is anchored and before the
+     reply arrives, the anchored turn's top does not move.
+     `getAnchoredTurnMetrics` reads `composerOverlayHeight`
+     (`ChatView.tsx:4020-4035`), and that is the code the follow agent is
+     changing.
+
+  If any of these shifts, I report the symptom to the coordinator and do not
+  touch follow code.
 
 **Terminal pane.** `TerminalViewport`'s wrapper (`ThreadTerminalPanel.tsx:2370`)
 becomes a flex column: the xterm mount is `min-h-0 flex-1`, and the card sits in
@@ -322,23 +370,22 @@ arriving record ever expands it.
 - **Chat panes.** The card renders at mount whenever the chat scope is enabled
   and the dock would be visible: with **Always show** on, from the first
   snapshot; otherwise once a record exists.
-- **Terminal panes.** A terminal launched with an activity hint renders its
-  card at mount in its saved state, before the observation handshake.
-  - Before observation is proven, the header shows a muted "Activity" label,
-    and the expanded body shows the empty state.
-  - The card is removed only when the snapshot shows the terminal cannot be
-    observed (`terminalObservation` false), or the pane is hidden.
-  - This is a deliberate change from "terminals wait for their first record".
-    It is what makes the PTY size final at mount instead of changing when the
-    first record arrives.
-  - Residual: when the server passes the launch through, as #192 does, no
-    snapshot ever arrives, so the pre-handshake card would never be removed.
-    To cover that, the card is dropped when the terminal's activity state
-    stays `null` for a bounded window after the PTY is running: 10 s, which is
-    above the new 4.5 s preparation cap. This single timer is the only
-    exception to "decided at mount".
-  - **To be confirmed at approval.** The alternative keeps "terminals wait for
-    a record" and accepts one PTY resize when the card first appears.
+- **Terminal panes (recommended).** The card mounts when the server proves
+  observation, which is the existing dock rule. In that same render it is
+  already in its saved expanded or collapsed state and route. Only the store
+  decides expanded versus collapsed, never an arriving record.
+  - The cost is one PTY resize when the card mounts, which the TUI handles
+    through SIGWINCH.
+  - Rejected: mounting a placeholder card before the handshake to reserve the
+    row. No pre-handshake signal says whether observation will ever attach:
+    #192's pass-through publishes nothing. The time to a first snapshot on a
+    slow machine is unbounded in practice: a 3 s connect, discovery on 1 s
+    intervals, and up to 5 min of resume materialization.
+  - Any timeout that removed a placeholder would make a card appear, vanish,
+    and reappear on exactly the machines #192 is about. **Coordinator to
+    confirm.** If reserving the row before the handshake is still required,
+    the placeholder needs a server-sent "observation not attached" signal,
+    not a client timer.
 
 ### Scope and pane identity
 

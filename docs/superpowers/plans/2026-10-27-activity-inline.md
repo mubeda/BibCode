@@ -66,10 +66,9 @@ Every commit typechecks on its own.
   - focuses the heading only after the user navigates (`userNavigatedRef`);
   - runs `focusRequested` only after an expand the user started.
 - `ProviderTerminalActivityDock.tsx`:
-  - renders `ActivityPane` for `terminal:<terminalId>`, at mount when the
-    launch carries an activity hint;
-  - is dropped when `terminalObservation` is false, or after 10 s with no
-    state;
+  - renders `ActivityPane` for `terminal:<terminalId>` once observation is
+    proven (the existing visibility rule), already in its saved state in that
+    render;
   - when hidden: unchanged.
 - Tests:
   - `ActivityDock.test.tsx`: the toggle and its ARIA attributes.
@@ -84,9 +83,9 @@ Every commit typechecks on its own.
     - an expanded card at zero counts;
     - the height cap in a short pane.
   - `ProviderTerminalActivityDock.test.tsx`:
-    - rewrite "keeps a pre-handshake snapshot hidden" as "renders the saved
-      state at mount, then drops it once observation is unsupported", and add
-      the 10 s case;
+    - keep "keeps a pre-handshake snapshot hidden";
+    - add: a saved expanded pane mounts expanded in the same render that
+      proves observation, and no later record changes it;
     - replace "opens the exact persisted terminal scope" with "expands in
       place; the right panel is untouched".
 
@@ -114,8 +113,9 @@ Every commit typechecks on its own.
     - two split panes are independent;
     - a focused sibling does not hide the host;
     - toggling changes the composer-overlay inset, and LegendList keeps
-      `scrollTop` mid-history (mocked list state) — if this fails, report to
-      the coordinator;
+      `scrollTop` mid-history and the end at the end, and the top of an
+      anchored just-sent turn does not move (mocked list state). If any of
+      these fails, report it to the coordinator;
     - `rightPanelStore` is untouched;
     - the panel is restored at mount after a reload while the composer has
       focus.
@@ -147,7 +147,14 @@ Every commit typechecks on its own.
   - log once per executable and reason, with the levels from the design's
     table;
   - add `observer_connect_failed` and `root_discovery_stopped` logs;
-  - `CODEX_PREPARATION_BUDGET` becomes 4 s.
+  - `CODEX_PREPARATION_BUDGET` becomes 4 s;
+  - start `SYSTEM_CODEX_HELPER_SUPERVISOR` from
+    `CodexTerminalObserverFactory::system()`;
+  - `wait_ready` waits for the rest of the preparation budget instead of
+    100 ms;
+  - add the `helper_supervisor_unavailable` reason;
+  - unit test: a cold supervisor initialization that is late, but within the
+    budget, still prepares the first launch.
 - `provider_terminal/supervisor.rs`:
   - add a `codex` arm returning 4.25 s from `preparation_execution_budget`;
   - the `None` arm stays unlabelled.
@@ -175,7 +182,8 @@ Every commit typechecks on its own.
     - `aria-expanded` goes true, then false;
     - Escape returns focus to the dock;
     - the right panel is unchanged;
-    - `scrollTop` is unchanged mid-history; an at-end list stays at the end.
+    - `scrollTop` is unchanged mid-history; an at-end list stays at the end;
+      toggling after a send keeps the anchored turn's top in place.
   - Terminal:
     - expanding its own card shrinks xterm's rows and resizes the PTY;
     - with the fixture grant, the TUI redraws `fixture-tui <cols>x<rows>`;
