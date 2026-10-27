@@ -37,6 +37,8 @@ use crate::{
     git::{canonical_worktree_path_key, host_path_platform, normalize_worktree_path_key},
 };
 
+#[cfg(test)]
+mod agent_status_tests;
 mod compaction;
 
 pub use compaction::{
@@ -2913,7 +2915,7 @@ fn spawn_worker(
                                 OrchestrationCommand::ThreadTurnPromote { .. } | OrchestrationCommand::ThreadTurnSteer { .. } | OrchestrationCommand::ThreadTurnDeliveryResolve { .. } => true,
                                 // A reopened chat panel's queue becomes promotable again.
                                 OrchestrationCommand::ThreadUnarchive { .. } => true,
-                                OrchestrationCommand::ThreadActivityAppend { activity, .. } => matches!(activity.kind.as_str(), "approval.resolved" | "user-input.resolved" | "provider.user-input.respond.failed"),
+                                OrchestrationCommand::ThreadActivityAppend { activity, .. } => matches!(activity.kind.as_str(), "approval.resolved" | "user-input.resolved" | "provider.approval.respond.failed" | "provider.user-input.respond.failed"),
                                 _ => false,
                             };
                             let mut result = process_envelope(
@@ -5308,6 +5310,21 @@ async fn persist_command(
         }
         _ => None,
     };
+    // A session that leaves `running` ends its turn, and with it every request the provider
+    // was waiting on: they expire in the same commit (#187).
+    let expiry = match command {
+        OrchestrationCommand::ThreadSessionSet {
+            thread_id,
+            session,
+            created_at,
+            ..
+        } if !matches!(session.status.as_str(), "running" | "starting") => Some((
+            thread_id.clone(),
+            session.status.clone(),
+            created_at.clone(),
+        )),
+        _ => None,
+    };
     let compaction_step = CompactionStep::of(command);
     let committed = repositories
         .database()
@@ -5363,6 +5380,15 @@ async fn persist_command(
                         json!({"threadId":thread_id, "messageId":message_id, "state":state, "provider":provider, "mode":mode, "held":true, "detail":detail, "updatedAt":updated_at,
                             "delivery":delivery_value(&state, &provider, &provider_instance_id, &mode, true, detail.as_deref())})));
                 }
+            }
+            if let Some((thread_id, status, created_at)) = &expiry {
+                event_list.extend(expire_open_requests_tx(
+                    &transaction,
+                    thread_id,
+                    status,
+                    created_at,
+                    &command_id,
+                )?);
             }
             let mut committed = VecDeque::new();
             for planned in &event_list {
@@ -6693,8 +6719,157 @@ fn apply_threads_projector_tx(
     }
     if event.event.aggregate_kind == "thread" {
         rebuild_thread_derived_fields_tx(transaction, &event.event.aggregate_id)?;
+        record_agent_status_evidence_tx(transaction, event)?;
     }
     Ok(())
+}
+
+/// The activity kinds that change whether a thread's question still waits for an answer.
+const USER_INPUT_REQUEST_KINDS: [&str; 4] = [
+    "user-input.requested",
+    "user-input.resolved",
+    "user-input.expired",
+    "provider.user-input.respond.failed",
+];
+
+/// Whether `event` is the provider showing progress on its thread: one of its own events, or
+/// its session entering `starting` or `running`. Titles, modes, archives and BiBCode's own
+/// settlements are not.
+fn is_provider_progress(event: &NewOrchestrationEvent) -> bool {
+    infer_actor_kind(event) == "provider"
+        || (event.event_type == "thread.session-set"
+            && matches!(
+                event
+                    .payload
+                    .pointer("/session/status")
+                    .and_then(Value::as_str),
+                Some("running" | "starting")
+            ))
+}
+
+/// The thread fields the left panel's agent status reads (#187). The pending-question count is
+/// recounted only when a request's state changes, never on every thread event: streamed
+/// assistant text dispatches thread events too.
+fn record_agent_status_evidence_tx(
+    transaction: &Transaction<'_>,
+    event: &OrchestrationEvent,
+) -> Result<(), PersistenceError> {
+    let thread_id = &event.event.aggregate_id;
+    let activity_kind = (event.event.event_type == "thread.activity-appended")
+        .then(|| {
+            event
+                .event
+                .payload
+                .pointer("/activity/kind")
+                .and_then(Value::as_str)
+        })
+        .flatten();
+    if event.event.event_type == "thread.reverted"
+        || activity_kind.is_some_and(|kind| USER_INPUT_REQUEST_KINDS.contains(&kind))
+    {
+        let open = crate::persistence::open_user_input_requests_sql("?1");
+        transaction.execute(
+            &format!(
+                "UPDATE projection_threads SET pending_user_input_count = (SELECT COUNT(*) FROM ({open})) WHERE thread_id = ?1"
+            ),
+            [thread_id],
+        )?;
+    }
+    if is_provider_progress(&event.event) {
+        transaction.execute(
+            "UPDATE projection_threads SET last_activity_at = ? WHERE thread_id = ?",
+            params![event.event.occurred_at, thread_id],
+        )?;
+    }
+    Ok(())
+}
+
+/// A `provider.approval.respond.failed` detail saying the provider no longer holds the request,
+/// read as migration 025 and the client's `derivePendingApprovals` read it.
+fn is_stale_approval_failure(detail: &str) -> bool {
+    let detail = detail.to_lowercase();
+    [
+        "stale pending approval request",
+        "unknown pending approval request",
+        "unknown pending permission request",
+    ]
+    .iter()
+    .any(|phrase| detail.contains(phrase))
+}
+
+/// Activities expiring every request still open on `thread_id`, for a session update to
+/// `status` that ends its turn. A provider cannot finish, interrupt or lose a turn while it waits
+/// on an answer BiBCode must deliver, so once the session leaves `running` nobody holds these
+/// requests: without this they read Pending Approval or Awaiting Input forever (#187). A provider
+/// that lists one again (OpenCode recovery) reopens it.
+fn expire_open_requests_tx(
+    transaction: &Transaction<'_>,
+    thread_id: &str,
+    status: &str,
+    created_at: &str,
+    command_id: &str,
+) -> Result<Vec<NewOrchestrationEvent>, PersistenceError> {
+    let approvals = transaction
+        .prepare(
+            "SELECT request_id, turn_id FROM projection_pending_approvals WHERE thread_id = ? AND status = 'pending' ORDER BY created_at ASC, request_id ASC",
+        )?
+        .query_map([thread_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let open = crate::persistence::open_user_input_requests_sql("?1");
+    let questions = transaction
+        .prepare(&format!(
+            "SELECT open.request_id, (SELECT asked.turn_id FROM projection_thread_activities AS asked
+               WHERE asked.thread_id = ?1 AND asked.kind = 'user-input.requested'
+                 AND json_extract(asked.payload_json, '$.requestId') = open.request_id
+               ORDER BY COALESCE(asked.sequence, 0) DESC LIMIT 1)
+             FROM ({open}) AS open ORDER BY open.request_id ASC"
+        ))?
+        .query_map([thread_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let expiry = |kind: &str, summary: &str, request_id: String, turn_id: Option<String>| {
+        make_event(
+            "thread.activity-appended",
+            "thread",
+            thread_id,
+            created_at,
+            command_id,
+            json!({ "requestId": request_id }),
+            json!({
+                "threadId": thread_id,
+                "activity": {
+                    "id": format!("{kind}:{request_id}:{command_id}"),
+                    "tone": "approval",
+                    "kind": kind,
+                    "summary": summary,
+                    "payload": {
+                        "requestId": request_id,
+                        "reason": "session-ended",
+                        "sessionStatus": status,
+                    },
+                    "turnId": turn_id,
+                    "createdAt": created_at,
+                },
+            }),
+        )
+    };
+    Ok(approvals
+        .into_iter()
+        .map(|(request_id, turn_id)| {
+            expiry("approval.expired", "Approval expired", request_id, turn_id)
+        })
+        .chain(questions.into_iter().map(|(request_id, turn_id)| {
+            expiry(
+                "user-input.expired",
+                "Question expired",
+                request_id,
+                turn_id,
+            )
+        }))
+        .collect())
 }
 
 fn apply_messages_projector_tx(
@@ -7370,57 +7545,86 @@ fn apply_pending_approvals_projector_tx(
     event: &OrchestrationEvent,
 ) -> Result<(), PersistenceError> {
     let payload = &event.event.payload;
-    let (request_id, thread_id, turn_id, status, decision, created_at, resolved_at) =
-        match event.event.event_type.as_str() {
-            "thread.approval-response-requested" => (
-                required_str(payload, "requestId")?,
-                required_str(payload, "threadId")?,
-                None,
-                "resolved".to_owned(),
-                optional_string(payload.get("decision")),
-                required_str(payload, "createdAt")?,
-                Some(required_str(payload, "createdAt")?),
-            ),
-            "thread.activity-appended" => {
-                let activity = payload.get("activity").ok_or_else(|| {
-                    PersistenceError::Corrupt("missing activity payload".to_owned())
-                })?;
-                let kind = required_str(activity, "kind")?;
-                if kind != "approval.requested" && kind != "approval.resolved" {
-                    return Ok(());
-                }
-                let request_id = activity
+    let (request_id, thread_id, turn_id, status, decision, created_at, resolved_at) = match event
+        .event
+        .event_type
+        .as_str()
+    {
+        "thread.approval-response-requested" => (
+            required_str(payload, "requestId")?,
+            required_str(payload, "threadId")?,
+            None,
+            "resolved".to_owned(),
+            optional_string(payload.get("decision")),
+            required_str(payload, "createdAt")?,
+            Some(required_str(payload, "createdAt")?),
+        ),
+        "thread.activity-appended" => {
+            let activity = payload
+                .get("activity")
+                .ok_or_else(|| PersistenceError::Corrupt("missing activity payload".to_owned()))?;
+            let kind = required_str(activity, "kind")?;
+            // A refused answer the provider calls stale settles the request while the
+            // session still runs; an expiry settles it once the session left `running`.
+            let settles = match kind.as_str() {
+                "approval.requested" | "approval.resolved" => false,
+                "approval.expired" => true,
+                "provider.approval.respond.failed" => activity
+                    .pointer("/payload/detail")
+                    .and_then(Value::as_str)
+                    .is_some_and(is_stale_approval_failure),
+                _ => return Ok(()),
+            };
+            if settles {
+                let Some(request_id) = activity
                     .pointer("/payload/requestId")
                     .and_then(Value::as_str)
-                    .or_else(|| {
-                        event
-                            .event
-                            .metadata
-                            .get("requestId")
-                            .and_then(Value::as_str)
-                    })
-                    .ok_or_else(|| {
-                        PersistenceError::Corrupt("approval activity missing requestId".to_owned())
-                    })?
-                    .to_owned();
-                let created_at = required_str(activity, "createdAt")?;
-                let resolved = kind == "approval.resolved";
-                (
-                    request_id,
-                    required_str(payload, "threadId")?,
-                    optional_string(activity.get("turnId")),
-                    if resolved { "resolved" } else { "pending" }.to_owned(),
-                    if resolved {
-                        optional_string(activity.pointer("/payload/decision"))
-                    } else {
-                        None
-                    },
-                    created_at.clone(),
-                    resolved.then_some(created_at),
-                )
+                else {
+                    return Ok(());
+                };
+                let (status, decision) = if kind == "approval.expired" {
+                    ("expired", None)
+                } else {
+                    ("resolved", Some("stale"))
+                };
+                transaction.execute(
+                        "UPDATE projection_pending_approvals SET status = ?, decision = COALESCE(?, decision), resolved_at = ? WHERE request_id = ? AND status = 'pending'",
+                        params![status, decision, required_str(activity, "createdAt")?, request_id],
+                    )?;
+                return Ok(());
             }
-            _ => return Ok(()),
-        };
+            let request_id = activity
+                .pointer("/payload/requestId")
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    event
+                        .event
+                        .metadata
+                        .get("requestId")
+                        .and_then(Value::as_str)
+                })
+                .ok_or_else(|| {
+                    PersistenceError::Corrupt("approval activity missing requestId".to_owned())
+                })?
+                .to_owned();
+            let created_at = required_str(activity, "createdAt")?;
+            let resolved = kind == "approval.resolved";
+            (
+                request_id,
+                required_str(payload, "threadId")?,
+                optional_string(activity.get("turnId")),
+                if resolved { "resolved" } else { "pending" }.to_owned(),
+                if resolved {
+                    optional_string(activity.pointer("/payload/decision"))
+                } else {
+                    None
+                },
+                created_at.clone(),
+                resolved.then_some(created_at),
+            )
+        }
+        _ => return Ok(()),
+    };
     let existing = transaction
         .query_row(
             "SELECT thread_id, turn_id, status, created_at FROM projection_pending_approvals WHERE request_id = ?",
@@ -7520,7 +7724,7 @@ fn rebuild_thread_derived_fields_tx(
         .or(latest_turn_updated_at)
         .or_else(|| latest_user_message_at.clone());
     transaction.execute(
-        "UPDATE projection_threads SET latest_turn_id = ?, latest_user_message_at = ?, pending_approval_count = ?, pending_user_input_count = 0, has_actionable_proposed_plan = ?, unresolved_delivery_state = ?, unresolved_delivery_detail = ?, updated_at = COALESCE(?, updated_at) WHERE thread_id = ?",
+        "UPDATE projection_threads SET latest_turn_id = ?, latest_user_message_at = ?, pending_approval_count = ?, has_actionable_proposed_plan = ?, unresolved_delivery_state = ?, unresolved_delivery_detail = ?, updated_at = COALESCE(?, updated_at) WHERE thread_id = ?",
         params![
             latest_turn_id,
             latest_user_message_at,
