@@ -1464,6 +1464,154 @@ describe("packaged Mermaid diagrams", () => {
     expect(hiddenAfterEnd).toEqual([]);
     await saveEvidence("mermaid-timeline-keyboard-takeover");
   }).timeout(240_000);
+
+  it("keeps a reader just above the end in place as the end and the bottom region grow", async () => {
+    await setDesktopUiWindowSize(1_400, 900);
+    await openFixtureWorkspace();
+    await expectPaintingWebview();
+    const lastLine = "Following reply paragraph 60 keeps the reading position measurable.";
+    await sendPrompt(mermaidFixturePrompts.long);
+    await browser.waitUntil(
+      () =>
+        browser.execute(
+          (surface: string, line: string) =>
+            [...document.querySelectorAll(`${surface} .chat-markdown p`)].some(
+              (paragraph) => paragraph.textContent === line,
+            ),
+          visibleSurfaceSelector,
+          lastLine,
+        ),
+      { timeoutMsg: "The long fixture reply never arrived." },
+    );
+    await scrollTimelineToEnd(lastLine);
+    // First the bottom region: the reader wheels 40 px up, within LegendList's end threshold,
+    // and the bottom region then grows by 120 px, as the Activity card opening above the
+    // composer makes it. LegendList scrolls by an inset's growth near its end.
+    const region = await browser.executeAsync(
+      (
+        surface: string,
+        done: (result: {
+          endGapAfterWheel: number;
+          nearEnd: boolean;
+          composerGrew: boolean;
+          shifts: Array<number | null>;
+        }) => void,
+      ) => {
+        const scroller = document.querySelector<HTMLElement>(
+          `${surface} [class*='overflow-anchor']`,
+        )!;
+        const overlay = document.querySelector<HTMLElement>(
+          `${surface} [data-chat-composer-overlay="true"]`,
+        )!;
+        const frames = (count: number, then: () => void) =>
+          count === 0 ? then() : requestAnimationFrame(() => frames(count - 1, then));
+        scroller.dispatchEvent(new WheelEvent("wheel", { deltaY: -40, bubbles: true }));
+        scroller.scrollTop -= 40;
+        frames(10, () => {
+          const endGapAfterWheel = Math.round(
+            scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop,
+          );
+          const area = scroller.getBoundingClientRect();
+          const line = [...scroller.querySelectorAll<HTMLElement>(".chat-markdown p")].find(
+            (element) => {
+              const box = element.getBoundingClientRect();
+              return box.top >= area.top + 40 && box.bottom <= area.bottom - 200;
+            },
+          );
+          const lineAt = line?.getBoundingClientRect().top ?? null;
+          const overlayBefore = overlay.getBoundingClientRect().height;
+          overlay.style.paddingTop = "120px";
+          const shifts: Array<number | null> = [];
+          const sample = (count: number) =>
+            requestAnimationFrame(() => {
+              shifts.push(
+                line && lineAt !== null
+                  ? Math.round(line.getBoundingClientRect().top - lineAt)
+                  : null,
+              );
+              if (count > 1) return sample(count - 1);
+              const composerGrew = overlay.getBoundingClientRect().height - overlayBefore >= 100;
+              overlay.style.paddingTop = "";
+              done({
+                endGapAfterWheel,
+                nearEnd: endGapAfterWheel <= scroller.clientHeight * 0.1,
+                composerGrew,
+                shifts,
+              });
+            });
+          sample(30);
+        });
+      },
+      visibleSurfaceSelector,
+    );
+    await scrollTimelineToEnd(lastLine);
+    // Then the end: the reply's last row grows, as a diagram drawing there would, and
+    // LegendList, keeping the list at its end, queues a pass for the next frame. In that same
+    // frame, after LegendList's own observer saw the growth, the reader wheels 40 px up.
+    const row = await browser.executeAsync(
+      (surface: string, line: string, done: (result: { shifts: Array<number | null> }) => void) => {
+        const scroller = document.querySelector<HTMLElement>(
+          `${surface} [class*='overflow-anchor']`,
+        )!;
+        const last = [...scroller.querySelectorAll<HTMLElement>(".chat-markdown p")]
+          .filter((element) => element.textContent === line)
+          .sort((a, b) => b.getBoundingClientRect().top - a.getBoundingClientRect().top)[0]!;
+        const grown = last.closest<HTMLElement>("[data-timeline-root]")!;
+        // Created after LegendList's own observer for the row, so it runs after it.
+        const observer = new ResizeObserver(() => {
+          observer.disconnect();
+          scroller.dispatchEvent(new WheelEvent("wheel", { deltaY: -40, bubbles: true }));
+          scroller.scrollTop -= 40;
+          const area = scroller.getBoundingClientRect();
+          const reading = [...scroller.querySelectorAll<HTMLElement>(".chat-markdown p")].find(
+            (element) => {
+              const box = element.getBoundingClientRect();
+              return box.top >= area.top + 40 && box.bottom <= area.bottom - 200;
+            },
+          );
+          const readingAt = reading?.getBoundingClientRect().top ?? null;
+          const shifts: Array<number | null> = [];
+          const sample = (count: number) =>
+            requestAnimationFrame(() => {
+              shifts.push(
+                reading && readingAt !== null
+                  ? Math.round(reading.getBoundingClientRect().top - readingAt)
+                  : null,
+              );
+              if (count > 1) return sample(count - 1);
+              last.style.paddingBottom = "";
+              done({ shifts });
+            });
+          sample(30);
+        });
+        observer.observe(grown);
+        last.style.paddingBottom = "80px";
+      },
+      visibleSurfaceSelector,
+      lastLine,
+    );
+    NodeFS.writeFileSync(
+      NodePath.join(preparedArtifactDirectory, "mermaid-timeline-reader-near-end.json"),
+      JSON.stringify({ region, row }, null, 2),
+    );
+    const moved = (values: ReadonlyArray<number | null>) =>
+      values.filter((value) => value === null || Math.abs(value) > 1);
+    // Labelled, so a failure says which growth moved the reader, and by how much.
+    expect({
+      nearEnd: region.nearEnd,
+      composerGrew: region.composerGrew,
+      movedByRegionGrowth: moved(region.shifts),
+      movedByRowGrowth: moved(row.shifts),
+      endGapAfterWheel: region.endGapAfterWheel,
+    }).toEqual({
+      nearEnd: true,
+      composerGrew: true,
+      movedByRegionGrowth: [],
+      movedByRowGrowth: [],
+      endGapAfterWheel: region.endGapAfterWheel,
+    });
+    await scrollTimelineToEnd(lastLine);
+  }).timeout(120_000);
 });
 
 /**

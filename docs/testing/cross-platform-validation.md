@@ -3200,7 +3200,13 @@ then read stays within 1 px on every painted frame for 3 s, through the
 glide's settling, LegendList's wait for rows to settle and at least five more
 deliveries; an End keydown and a scroll to the end resume following, and at
 least three later deliveries rest with the end revealed
-(`mermaid-timeline-keyboard-takeover.json`). The reading-line
+(`mermaid-timeline-keyboard-takeover.json`). Last, with a long reply at the
+end, the reader wheels 40 px up, within LegendList's end threshold, and the
+bottom region (the composer overlay) grows by 120 px; then, back at the end,
+the reply's last row grows and the reader wheels 40 px up in the same frame,
+after LegendList has queued its pass to keep the end. A paragraph on screen
+stays within 1 px on each of the 30 painted frames after either
+(`mermaid-timeline-reader-near-end.json`). The reading-line
 checks sample painted frames, so the scenario fails early in a webview that
 paints none.
 Its other page scripts wait on timers rather than animation frames, which stop
