@@ -725,6 +725,47 @@ SQLite stays near one per 250 ms of thinking rather than one per delta. Put a
 sentinel phrase in a prompt that the model will think about and confirm it is
 absent from `server.log`, the provider operational log and the profiler JSONL.
 
+### Claude activity probe behind a shim
+
+The Claude activity probe must answer for the executable a chat launch runs
+([Activity observation](../providers/claude.md#activity-observation)). For a
+change to the probe, its cache, or the activity capabilities a restarted
+session reports, run the probe and restart seams. Their fixture is a symlinked
+multi-call script: it answers as Claude only through its `claude.sh` link and
+as mise under its real name.
+
+```sh
+cargo test -p bibcode-server --lib claude_probe_reads_only_a_claude_code_version
+cargo test -p bibcode-server --lib only_a_link_to_another_program_is_a_claude_shim
+cargo test -p bibcode-server --lib a_final_startup_none_replaces_capabilities_observed_at_runtime
+cargo test -p bibcode-server --test production_provider_runtime claude_probe
+cargo test -p bibcode-server --test production_provider_runtime claude_launch_through_a_shim
+cargo test -p bibcode-server --test production_provider_runtime a_restarted_claude_without_hook_support
+cargo test -p bibcode-server --test production_provider_runtime a_hookless_restart_while_chat_activity_is_off
+cargo test -p bibcode-server --test production_provider_runtime concurrent_launches_share_one_shim_recheck
+```
+
+These tests are Unix-only. The live check runs on a remote Linux server whose
+`claude` is a mise shim, as Omarchy installs it. Confirm with
+`readlink -f "$(command -v claude)"`, which should print the `mise` binary.
+
+1. Open a Claude chat on that server and start a subagent.
+2. In `server.log`, find the `Claude activity probe finished` line. It should
+   show `outcome="supported"`, an `executable` ending in `shims/claude`, a
+   `canonical` naming `mise`, and a redacted `search_path` with no raw home
+   directory.
+3. Under **Activity**, check that **Subagents** lists the subagent as running.
+4. Change the chat's effort. That restarts the chat in the same server process.
+   Start another subagent and check that it is listed too.
+5. Point the directory's mise configuration at a Claude Code without
+   `--include-hook-events`, then change effort again. The new probe line should
+   show the new version and `outcome="unsupported"`. **Subagents** should then
+   show "Provider no longer reports this retained activity" instead of a live
+   section.
+
+A `found another program` warning means the probe reached `mise` itself. Record
+that, and the lines around it, as a failure.
+
 ### Selecting other focused coverage
 
 For the Pull Requests web shell/detail/review, settings, and auth-host display,

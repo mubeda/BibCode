@@ -14461,6 +14461,7 @@ async fn claude_transcript_recovery_shutdown_breaks_event_queue_backpressure() {
 case "$1" in
   --version) printf '%s\n' '2.1.218'; exit 0;;
   --help) printf '%s\n' '--include-hook-events --forward-subagent-text'; exit 0;;
+  --thinking-display) exit 1;;
 esac
 # Short lines keep all stderr below one 4 KiB pipe page, regardless of pipe size.
 index=0
@@ -14985,6 +14986,752 @@ async fn claude_activity_probe_is_cached_by_executable_identity() {
         "xxx",
         "one version, one help and one thinking-display invocation should serve repeated turns"
     );
+}
+
+/// A multi-call binary such as mise (#195): `real/mise.sh` answers as Claude only when it is
+/// called through the `bin/claude.sh` link, and as itself under its own name. As Claude it
+/// prints `state/version`, and lists `state/help` only in a directory holding
+/// `.claude-project` with `SHIM_MARKER=on` set; anywhere else it lists no flags. The launch
+/// of a chat writes its arguments to `state/arguments` and its hook token to `state/token`. Every call appends `<name> <argument>` to
+/// `state/calls`.
+#[cfg(unix)]
+struct MultiCallShim {
+    link: PathBuf,
+    target: PathBuf,
+    state: PathBuf,
+}
+
+#[cfg(unix)]
+const CLAUDE_FLAGS_HELP: &str = "--include-hook-events --forward-subagent-text --fork-session";
+
+#[cfg(unix)]
+impl MultiCallShim {
+    fn new(temp: &TempDir, real_name_version: &str) -> Self {
+        let state = temp.path().join("state");
+        let real = temp.path().join("real");
+        let bin = temp.path().join("bin");
+        for directory in [&state, &real, &bin] {
+            std::fs::create_dir_all(directory).expect("shim fixture directory");
+        }
+        let script = format!(
+            r#"#!/bin/sh
+state='{state}'
+printf '%s %s\n' "${{0##*/}}" "$1" >> "$state/calls"
+if [ "${{0##*/}}" != claude.sh ]; then
+  case "$1" in
+    --version) printf '%s\n' '{real_name_version}'; exit 0;;
+    --help) printf '%s\n' 'Usage: mise [OPTIONS] [COMMAND]'; exit 0;;
+  esac
+  exit 1
+fi
+case "$1" in
+  --version)
+    if [ -f "$state/slow-version" ]; then sleep 0.3; fi
+    if [ "$SHIM_CLAUDE" = old ]; then printf '%s\n' '2.1.200 (Claude Code)'
+    else cat "$state/version" || exit 1; fi
+    printf '(node:%s) Warning: a deprecation Node prints on every run\n' "$$" >&2
+    exit 0;;
+  --help)
+    if [ "$SHIM_CLAUDE" = old ]; then printf '%s\n' 'Usage: claude [options]'
+    elif [ -f "$PWD/.claude-project" ] && [ "$SHIM_MARKER" = on ]; then cat "$state/help"
+    else printf '%s\n' 'Usage: claude [options]'; fi
+    exit 0;;
+  --thinking-display) exit 1;;
+esac
+case " $* " in
+  *' --session-id '*|*' --resume '*)
+    printf '%s' "$BIBCODE_CLAUDE_HOOK_TOKEN" > "$state/token"
+    printf '%s\n' "$@" > "$state/arguments";;
+esac
+while IFS= read -r line; do
+  case "$line" in
+    *'"type":"user"'*)
+      printf '%s\n' "$line"
+      printf '%s\n' '{{"type":"result","subtype":"success","is_error":false,"stop_reason":"end_turn","session_id":"shim-session","uuid":"shim-result"}}'
+      ;;
+  esac
+done
+"#,
+            state = state.display(),
+        );
+        let target = real.join("mise.sh");
+        executable_fixture::write_executable(&target, &script);
+        let link = bin.join("claude.sh");
+        std::os::unix::fs::symlink(&target, &link).expect("shim link");
+        let shim = Self {
+            link,
+            target,
+            state,
+        };
+        shim.set_claude("2.1.311 (Claude Code)", CLAUDE_FLAGS_HELP);
+        shim
+    }
+
+    /// The Claude the shim hands off to, as a mise update or a per-directory pin changes it.
+    fn set_claude(&self, version: &str, help: &str) {
+        std::fs::write(self.state.join("version"), format!("{version}\n")).unwrap();
+        std::fs::write(self.state.join("help"), format!("{help}\n")).unwrap();
+    }
+
+    /// A working directory whose configuration hands off to a Claude with the flags.
+    fn project(&self, temp: &TempDir, name: &str, with_flags: bool) -> PathBuf {
+        let directory = temp.path().join(name);
+        std::fs::create_dir_all(&directory).unwrap();
+        if with_flags {
+            std::fs::write(directory.join(".claude-project"), "").unwrap();
+        }
+        directory
+    }
+
+    fn calls(&self, call: &str) -> usize {
+        std::fs::read_to_string(self.state.join("calls"))
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| *line == call)
+            .count()
+    }
+}
+
+#[cfg(unix)]
+fn shim_environment() -> std::collections::BTreeMap<String, String> {
+    std::collections::BTreeMap::from([("SHIM_MARKER".to_owned(), "on".to_owned())])
+}
+
+#[cfg(unix)]
+fn hook_activity_support(support: ClaudeActivitySupport) -> bool {
+    support.probe_finished && support.include_hook_events && support.forward_subagent_text
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn claude_probe_runs_a_multi_call_shim_by_its_link_name() {
+    let probe_context = ClaudeActivityProbeTestContext::new();
+    let temp = TempDir::new().unwrap();
+    let shim = MultiCallShim::new(&temp, "2026.10.19 linux-x64 (2026-10-19)");
+    let project = shim.project(&temp, "project", true);
+
+    let support = probe_context
+        .probe_in(
+            shim.link.to_string_lossy().as_ref(),
+            &shim_environment(),
+            &project,
+        )
+        .await;
+
+    assert!(hook_activity_support(support), "{support:?}");
+    assert!(support.fork_session_id, "{support:?}");
+    assert_eq!(shim.calls("mise.sh --version"), 0);
+    assert_eq!(shim.calls("claude.sh --help"), 1);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn claude_probe_of_a_shim_ignores_a_cached_entry_for_its_target() {
+    let probe_context = ClaudeActivityProbeTestContext::new();
+    let temp = TempDir::new().unwrap();
+    // Under its real name the target answers as an old Claude without the flags, so probing
+    // it caches an "unsupported" answer for the target's identity.
+    let shim = MultiCallShim::new(&temp, "2.0.0 (Claude Code)");
+    let project = shim.project(&temp, "project", true);
+    let target = probe_context
+        .probe_in(
+            shim.target.to_string_lossy().as_ref(),
+            &shim_environment(),
+            &project,
+        )
+        .await;
+    assert!(
+        target.probe_finished && !target.include_hook_events,
+        "{target:?}"
+    );
+    assert_eq!(probe_context.cache_len(), 1);
+
+    let support = probe_context
+        .probe_in(
+            shim.link.to_string_lossy().as_ref(),
+            &shim_environment(),
+            &project,
+        )
+        .await;
+
+    assert!(hook_activity_support(support), "{support:?}");
+    assert_eq!(probe_context.cache_len(), 2);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn claude_probe_does_not_cache_another_programs_answer() {
+    let capture = TraceCapture::default();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_target(false)
+        .with_writer(capture.clone())
+        .finish();
+    let _subscriber = tracing::subscriber::set_default(subscriber);
+    let probe_context = ClaudeActivityProbeTestContext::new();
+    let temp = TempDir::new().unwrap();
+    let secret = "ghp_0123456789abcdefghijklmnopqrstuvwxyzAB";
+    let shim = MultiCallShim::new(
+        &temp,
+        &format!("2026.10.19 linux-x64 (2026-10-19) GITHUB_TOKEN={secret}"),
+    );
+    let project = shim.project(&temp, "project", true);
+    let home = dirs::home_dir().expect("home directory");
+    let home_entry = home.join(".local/share/mise/shims");
+    let mut environment = shim_environment();
+    environment.insert(
+        "PATH".to_owned(),
+        format!(
+            "{}:{}:/usr/bin:/bin",
+            shim.target.parent().unwrap().display(),
+            home_entry.display()
+        ),
+    );
+
+    for _ in 0..2 {
+        let support = probe_context
+            .probe_in("mise.sh", &environment, &project)
+            .await;
+        assert_eq!(support, ClaudeActivitySupport::default());
+    }
+
+    assert_eq!(probe_context.cache_len(), 0);
+    assert_eq!(
+        shim.calls("mise.sh --version"),
+        2,
+        "a mismatch probes again"
+    );
+    assert_eq!(
+        shim.calls("mise.sh --help"),
+        0,
+        "a mismatch stops before --help"
+    );
+    let trace = capture.text();
+    let line = trace
+        .lines()
+        .find(|line| line.contains("Claude activity probe found another program"))
+        .unwrap_or_else(|| panic!("mismatch line: {trace}"));
+    assert!(line.contains("mismatch"), "{line}");
+    assert!(line.contains("canonical="), "{line}");
+    assert!(line.contains("2026.10.19 linux-x64"), "{line}");
+    assert!(line.contains("~/.local/share/mise/shims"), "{line}");
+    assert!(!line.contains(secret), "{line}");
+    assert!(
+        !line.contains(&home.to_string_lossy().into_owned()),
+        "the search PATH is redacted: {line}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn claude_probe_keys_a_shim_by_its_working_directory() {
+    let probe_context = ClaudeActivityProbeTestContext::new();
+    let temp = TempDir::new().unwrap();
+    let shim = MultiCallShim::new(&temp, "2026.10.19 linux-x64 (2026-10-19)");
+    let with_flags = shim.project(&temp, "pinned-current", true);
+    let without_flags = shim.project(&temp, "pinned-old", false);
+    let link = shim.link.to_string_lossy().into_owned();
+
+    let first = probe_context
+        .probe_in(&link, &shim_environment(), &with_flags)
+        .await;
+    let second = probe_context
+        .probe_in(&link, &shim_environment(), &without_flags)
+        .await;
+    let again = probe_context
+        .probe_in(&link, &shim_environment(), &with_flags)
+        .await;
+
+    assert!(hook_activity_support(first), "{first:?}");
+    assert!(
+        second.probe_finished && !second.include_hook_events,
+        "another directory's Claude answers for itself: {second:?}"
+    );
+    assert_eq!(again, first);
+    assert_eq!(
+        shim.calls("claude.sh --help"),
+        2,
+        "one full probe per directory"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn claude_probe_of_a_shim_notices_a_claude_update_behind_it() {
+    let probe_context = ClaudeActivityProbeTestContext::new();
+    let temp = TempDir::new().unwrap();
+    let shim = MultiCallShim::new(&temp, "2026.10.19 linux-x64 (2026-10-19)");
+    shim.set_claude("2.1.200 (Claude Code)", "Usage: claude [options]");
+    let project = shim.project(&temp, "project", true);
+    let link = shim.link.to_string_lossy().into_owned();
+
+    let old = probe_context
+        .probe_in(&link, &shim_environment(), &project)
+        .await;
+    let unchanged = probe_context
+        .probe_in(&link, &shim_environment(), &project)
+        .await;
+    assert!(old.probe_finished && !old.include_hook_events, "{old:?}");
+    assert_eq!(unchanged, old);
+    assert_eq!(
+        shim.calls("claude.sh --version"),
+        2,
+        "a cached shim answer is revalidated"
+    );
+    assert_eq!(
+        shim.calls("claude.sh --help"),
+        1,
+        "an unchanged version reuses --help"
+    );
+
+    shim.set_claude("2.1.311 (Claude Code)", CLAUDE_FLAGS_HELP);
+    let updated = probe_context
+        .probe_in(&link, &shim_environment(), &project)
+        .await;
+
+    assert!(hook_activity_support(updated), "{updated:?}");
+    assert_eq!(shim.calls("claude.sh --help"), 2);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn claude_probe_keeps_a_cached_shim_answer_its_recheck_cannot_confirm() {
+    let probe_context = ClaudeActivityProbeTestContext::new();
+    let temp = TempDir::new().unwrap();
+    let shim = MultiCallShim::new(&temp, "2026.10.19 linux-x64 (2026-10-19)");
+    let project = shim.project(&temp, "project", true);
+    let link = shim.link.to_string_lossy().into_owned();
+    let first = probe_context
+        .probe_in(&link, &shim_environment(), &project)
+        .await;
+    assert!(hook_activity_support(first), "{first:?}");
+
+    // From now on `--version` fails behind the shim.
+    std::fs::remove_file(shim.state.join("version")).unwrap();
+    let unconfirmed = probe_context
+        .probe_in(&link, &shim_environment(), &project)
+        .await;
+
+    assert_eq!(
+        unconfirmed, first,
+        "an unanswered recheck keeps the cached answer"
+    );
+    assert_eq!(shim.calls("claude.sh --version"), 2);
+    assert_eq!(shim.calls("claude.sh --help"), 1);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn concurrent_launches_share_one_shim_recheck() {
+    let probe_context = ClaudeActivityProbeTestContext::new();
+    let temp = TempDir::new().unwrap();
+    let shim = MultiCallShim::new(&temp, "2026.10.19 linux-x64 (2026-10-19)");
+    let project = shim.project(&temp, "project", true);
+    let link = shim.link.to_string_lossy().into_owned();
+    let environment = shim_environment();
+    let first = probe_context.probe_in(&link, &environment, &project).await;
+    assert!(hook_activity_support(first), "{first:?}");
+    // A recheck slow enough that the second launch arrives while the first one runs it.
+    std::fs::write(shim.state.join("slow-version"), "").unwrap();
+
+    let (left, right) = tokio::join!(
+        probe_context.probe_in(&link, &environment, &project),
+        probe_context.probe_in(&link, &environment, &project),
+    );
+
+    assert_eq!(left, first);
+    assert_eq!(right, first);
+    assert_eq!(
+        shim.calls("claude.sh --version"),
+        2,
+        "one recheck for both launches"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shim_rechecks_are_shared_only_by_launches_with_one_environment() {
+    let probe_context = ClaudeActivityProbeTestContext::new();
+    let temp = TempDir::new().unwrap();
+    let shim = MultiCallShim::new(&temp, "2026.10.19 linux-x64 (2026-10-19)");
+    let project = shim.project(&temp, "project", true);
+    let link = shim.link.to_string_lossy().into_owned();
+    let current = shim_environment();
+    // Another provider instance whose environment makes the shim pick an older Claude.
+    let mut old = shim_environment();
+    old.insert("SHIM_CLAUDE".to_owned(), "old".to_owned());
+    let first = probe_context.probe_in(&link, &current, &project).await;
+    assert!(hook_activity_support(first), "{first:?}");
+    std::fs::write(shim.state.join("slow-version"), "").unwrap();
+
+    let (current_launch, old_launch) = tokio::join!(
+        probe_context.probe_in(&link, &current, &project),
+        probe_context.probe_in(&link, &old, &project),
+    );
+
+    assert_eq!(current_launch, first);
+    assert!(
+        old_launch.probe_finished && !old_launch.include_hook_events,
+        "the older Claude answers for itself: {old_launch:?}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_shim_recheck_that_ended_without_answering_is_started_again() {
+    let probe_context = ClaudeActivityProbeTestContext::new();
+    let temp = TempDir::new().unwrap();
+    let shim = MultiCallShim::new(&temp, "2026.10.19 linux-x64 (2026-10-19)");
+    let project = shim.project(&temp, "project", true);
+    let link = shim.link.to_string_lossy().into_owned();
+    let environment = shim_environment();
+    let first = probe_context.probe_in(&link, &environment, &project).await;
+    assert!(hook_activity_support(first), "{first:?}");
+    probe_context.abandon_shim_recheck(&link, &environment, &project);
+
+    // An update behind the shim that only a new recheck notices.
+    shim.set_claude("2.1.200 (Claude Code)", "Usage: claude [options]");
+    let next = probe_context.probe_in(&link, &environment, &project).await;
+
+    assert_eq!(
+        shim.calls("claude.sh --version"),
+        3,
+        "a new recheck, then the whole probe"
+    );
+    assert!(
+        next.probe_finished && !next.include_hook_events,
+        "the new Claude answers, not the abandoned recheck: {next:?}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn claude_launch_through_a_shim_probes_in_the_launch_environment_and_directory() {
+    let probe_context = ClaudeActivityProbeTestContext::new();
+    let temp = TempDir::new().unwrap();
+    let shim = MultiCallShim::new(&temp, "2026.10.19 linux-x64 (2026-10-19)");
+    let project = shim.project(&temp, "project", true);
+    let factory = probe_context.driver_factory(temp.path().join("attachments"));
+    let mut request = launch();
+    request.provider = "claudeAgent".to_owned();
+    request.provider_label = "Claude".to_owned();
+    // Only the open-url session's PATH prefix finds the shim, as `spawn_child` resolves it.
+    request.binary_path = "claude.sh".to_owned();
+    request.cwd = project;
+    request.environment = shim_environment();
+    request
+        .environment
+        .insert("PATH".to_owned(), "/usr/bin:/bin".to_owned());
+    request.open_url = Some(bibcode_server::open_url::OpenUrlSession {
+        endpoint: "http://127.0.0.1:9/api/preview/open-url".to_owned(),
+        token: "open-url-token".to_owned(),
+        shim_dir: shim.link.parent().unwrap().to_path_buf(),
+    });
+
+    let driver = factory.create(request).await.expect("Claude driver");
+    let started = driver.start().await.expect("Claude start");
+    let arguments = timeout(Duration::from_secs(10), async {
+        loop {
+            if let Ok(arguments) = std::fs::read_to_string(shim.state.join("arguments"))
+                && arguments.contains("--settings")
+            {
+                break arguments;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("Claude launch arguments");
+    let arguments = arguments.lines().collect::<Vec<_>>();
+
+    assert!(started.activity_capabilities.actors);
+    assert!(
+        arguments.contains(&"--include-hook-events"),
+        "{arguments:?}"
+    );
+    assert!(
+        arguments.contains(&"--forward-subagent-text"),
+        "{arguments:?}"
+    );
+    let settings = arguments
+        .windows(2)
+        .find(|pair| pair[0] == "--settings")
+        .map(|pair| serde_json::from_str::<Value>(pair[1]).expect("hook settings JSON"))
+        .expect("hook settings");
+    assert!(
+        settings["hooks"]["SubagentStart"][0]["hooks"][0]["url"]
+            .as_str()
+            .is_some_and(|url| url.starts_with("http://")),
+        "{settings}"
+    );
+    assert_eq!(shim.calls("mise.sh --version"), 0);
+    driver.shutdown().await.expect("Claude shutdown");
+}
+
+/// The remote Linux report of #195, end to end: a Claude chat behind a mise shim restarts in
+/// the same server process (here for an effort change) after the Claude behind the shim lost
+/// its hook flags. The restarted session must not keep reporting live subagents.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restarted_claude_without_hook_support_stops_reporting_live_subagents() {
+    assert_a_hookless_restart_stops_reporting_live_subagents(false).await;
+}
+
+/// The same restart while Chat Activity is off: turning it back on publishes what the new
+/// process reports, not what the one before the restart did.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hookless_restart_while_chat_activity_is_off_shows_no_live_subagents_once_on() {
+    assert_a_hookless_restart_stops_reporting_live_subagents(true).await;
+}
+
+#[cfg(unix)]
+async fn assert_a_hookless_restart_stops_reporting_live_subagents(
+    activity_off_during_restart: bool,
+) {
+    let state = TempDir::new().expect("state");
+    let shim = MultiCallShim::new(&state, "2026.10.19 linux-x64 (2026-10-19)");
+    let workspace = shim.project(&state, "workspace", true);
+    let config = test_config(&state);
+    hermetic_providers::write_hermetic_settings(
+        &config.state_dir(),
+        json!({
+            "providerInstances": {
+                "claude-shim": {
+                    "driver": "claudeAgent",
+                    "enabled": true,
+                    "config": { "binaryPath": shim.link },
+                    "environment": [{
+                        "name": "SHIM_MARKER",
+                        "value": "on",
+                        "valueRedacted": false
+                    }]
+                }
+            }
+        }),
+    );
+    let handle = ServerRuntime::start(config.clone())
+        .await
+        .expect("production RPC server");
+    let (mut socket, _) = connect_async(format!("ws://{}/ws", handle.local_addr()))
+        .await
+        .expect("WebSocket");
+    dispatch_command(
+        &mut socket,
+        "9501",
+        json!({
+            "type":"project.create","commandId":"shim-project","projectId":"shim-project",
+            "title":"Shim","workspaceRoot":workspace,"defaultModelSelection":null,"createdAt":NOW
+        }),
+    )
+    .await
+    .expect("project created");
+    dispatch_command(
+        &mut socket,
+        "9502",
+        json!({
+            "type":"thread.create","commandId":"shim-thread","threadId":"shim-thread",
+            "projectId":"shim-project","title":"Shim thread",
+            "modelSelection":{"instanceId":"claude-shim","model":"claude-sonnet"},
+            "runtimeMode":"full-access","interactionMode":"default","branch":null,
+            "worktreePath":null,"createdAt":NOW
+        }),
+    )
+    .await
+    .expect("thread created");
+    dispatch_command(
+        &mut socket,
+        "9503",
+        json!({
+            "type":"thread.turn.start","commandId":"shim-turn-1","threadId":"shim-thread",
+            "message":{"messageId":"shim-message-1","role":"user","text":"first","attachments":[]},
+            "modelSelection":{"instanceId":"claude-shim","model":"claude-sonnet"},
+            "runtimeMode":"full-access","interactionMode":"default","createdAt":NOW
+        }),
+    )
+    .await
+    .expect("first turn admitted");
+
+    let arguments = timeout(Duration::from_secs(10), async {
+        loop {
+            if let Ok(arguments) = std::fs::read_to_string(shim.state.join("arguments"))
+                && arguments.contains("--settings")
+            {
+                break arguments;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the first launch has a hook sink");
+    let arguments = arguments.lines().collect::<Vec<_>>();
+    let settings: Value = arguments
+        .windows(2)
+        .find(|pair| pair[0] == "--settings")
+        .map(|pair| serde_json::from_str(pair[1]).expect("hook settings JSON"))
+        .expect("hook settings");
+    let session_id = arguments
+        .windows(2)
+        .find(|pair| pair[0] == "--session-id" || pair[0] == "--resume")
+        .map(|pair| pair[1].to_owned())
+        .unwrap_or_else(|| panic!("Claude session ID: {arguments:?}"));
+    let hook_url = settings["hooks"]["SubagentStart"][0]["hooks"][0]["url"]
+        .as_str()
+        .expect("Claude hook URL")
+        .to_owned();
+    let hook_token = std::fs::read_to_string(shim.state.join("token")).expect("hook token");
+    assert_eq!(
+        reqwest::Client::new()
+            .post(&hook_url)
+            .header("Authorization", format!("Bearer {hook_token}"))
+            .json(&json!({
+                "hook_event_name":"SubagentStart","session_id":session_id,
+                "agent_id":"agent-shim","agent_type":"Explore"
+            }))
+            .send()
+            .await
+            .expect("authenticated Claude hook")
+            .status(),
+        reqwest::StatusCode::NO_CONTENT
+    );
+    let snapshot_request = json!({"_tag":"thread","threadId":"shim-thread"});
+    let live = wait_for_activity_snapshot(&mut socket, &snapshot_request, 9_600, |snapshot| {
+        snapshot["actors"][0]["id"] == "claude:agent:agent-shim"
+    })
+    .await;
+    assert_eq!(live["capabilities"]["actors"], true, "{live}");
+    assert_eq!(live["sections"]["subagents"]["state"], "live", "{live}");
+
+    if activity_off_during_restart {
+        set_chat_activity(&mut socket, "9551", false).await;
+    }
+    // mise now hands off to a Claude without the flags; an effort change restarts the chat.
+    shim.set_claude("2.1.312 (Claude Code)", "Usage: claude [options]");
+    std::fs::remove_file(shim.state.join("arguments")).unwrap();
+    dispatch_command(
+        &mut socket,
+        "9504",
+        json!({
+            "type":"thread.turn.start","commandId":"shim-turn-2","threadId":"shim-thread",
+            "message":{"messageId":"shim-message-2","role":"user","text":"second","attachments":[]},
+            "modelSelection":{
+                "instanceId":"claude-shim","model":"claude-sonnet",
+                "options":[{"id":"effort","value":"high"}]
+            },
+            "runtimeMode":"full-access","interactionMode":"default","createdAt":NOW
+        }),
+    )
+    .await
+    .expect("second turn admitted");
+    let relaunched = timeout(Duration::from_secs(10), async {
+        loop {
+            if let Ok(arguments) = std::fs::read_to_string(shim.state.join("arguments"))
+                && arguments.contains("--effort")
+            {
+                break arguments;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the restart relaunches Claude");
+    assert!(
+        !relaunched
+            .lines()
+            .any(|argument| argument == "--include-hook-events"),
+        "{relaunched}"
+    );
+    if activity_off_during_restart {
+        set_chat_activity(&mut socket, "9552", true).await;
+    }
+    // Before #195 the inherited lifecycle kept `actors: true` and a live section here.
+    let stale = wait_for_activity_snapshot(&mut socket, &snapshot_request, 9_700, |snapshot| {
+        snapshot["capabilities"]["actors"] == false
+    })
+    .await;
+    assert_ne!(stale["sections"]["subagents"]["state"], "live", "{stale}");
+    if !activity_off_during_restart {
+        assert_eq!(stale["sections"]["subagents"]["state"], "stale", "{stale}");
+        assert_eq!(
+            stale["sections"]["subagents"]["message"],
+            "Provider no longer reports this retained activity",
+            "{stale}"
+        );
+        assert_eq!(
+            stale["actors"][0]["id"], "claude:agent:agent-shim",
+            "{stale}"
+        );
+    }
+
+    socket.close(None).await.expect("close WebSocket");
+    handle.shutdown();
+    handle.join().await.expect("RPC server joins");
+}
+
+/// Turns Chat Activity on or off as the Settings switch does.
+#[cfg(unix)]
+async fn set_chat_activity<S>(socket: &mut WebSocketStream<S>, id: &str, enabled: bool)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let settings = tagged_rpc_request(
+        socket,
+        id,
+        "server.updateSettings",
+        json!({ "patch": { "enableChatAgentActivity": enabled } }),
+    )
+    .await
+    .expect("Chat Activity setting");
+    assert_eq!(settings["enableChatAgentActivity"], enabled, "{settings}");
+}
+
+#[cfg(unix)]
+async fn dispatch_command<S>(
+    socket: &mut WebSocketStream<S>,
+    id: &str,
+    command: Value,
+) -> Result<Value, Value>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    tagged_rpc_request(socket, id, "orchestration.dispatchCommand", command).await
+}
+
+/// Polls `activity.getSnapshot` until `done` accepts the snapshot.
+#[cfg(unix)]
+async fn wait_for_activity_snapshot<S>(
+    socket: &mut WebSocketStream<S>,
+    request: &Value,
+    first_id: u64,
+    done: impl Fn(&Value) -> bool,
+) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let mut request_id = first_id;
+    let mut last = Value::Null;
+    let outcome = timeout(Duration::from_secs(10), async {
+        loop {
+            request_id += 1;
+            if let Ok(snapshot) = tagged_rpc_request(
+                socket,
+                &request_id.to_string(),
+                "activity.getSnapshot",
+                request.clone(),
+            )
+            .await
+            {
+                if done(&snapshot) {
+                    return snapshot;
+                }
+                last = snapshot;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    outcome.unwrap_or_else(|_| panic!("activity snapshot never matched; last: {last}"))
 }
 
 #[cfg(unix)]
