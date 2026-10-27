@@ -1751,22 +1751,32 @@ the setting is off.
 ### Activity and targeted Stop
 
 Activity combines provider-attributed observation with capability-gated
-control. The **Activity** button above the chat shows the provider icon for the
-active scope and the combined **Active** and **Done** counts. One click, or
-**Enter** or **Space**, opens the Activity panel on the section that needs you:
-the one with an error, else the one with running work (Subagents first), else
-the one with the most recent record. With the panel already open, the button
-brings it to the front on that section, moves focus into it, scrolls to the top
-of the section, and never closes it; an open record stays open. When the
+control. The **Activity** button just above the composer shows the provider icon
+for that chat and the combined **Active** and **Done** counts. A Codex Terminal
+shows its own button at the bottom of its pane once BiBCode is observing it.
+
+One click, or **Enter** or **Space**, opens the Activity panel inside the same
+pane, directly above the button, on the section that needs you: the one with an
+error, else the one with running work (Subagents first), else the one with the
+most recent record. Focus moves into the panel. When that is the section you
+left, the record you had open is still open.
+
+Another click on the button, or **Escape** inside the panel, collapses it and
+returns focus to the button. The panel takes space from the pane rather than
+covering it: in a chat, what you were reading stays in place; in a terminal, the
+terminal gives up rows and redraws at its new size.
+
+Each pane has its own panel and remembers whether it was open, and on which
+section and record, after a reload, without taking focus. With split panes,
+every chat and terminal pane keeps its own. The right panel no longer shows
+Activity, and a right panel that last showed it reopens closed. When the
 provider reports both sections, **Subagents** and **Background tasks** tabs at
 the top of the panel switch between them, and a tab marks a stale or failing
 section. A stale or error icon on the button means a section, or the whole
 observation, is degraded; errors win over stale. A section that fails before its
 first record still marks the button, and a click opens it on that error. The
 button's accessible name and tooltip give the counts for each section. Each
-Subagents row in the panel shows one provider icon for its actor, and the same
-Activity presentation is used in the inline right panel and its responsive
-sheet.
+Subagents row in the panel shows one provider icon for its actor.
 
 **Settings → Agents → Always show Activity** (on by default) keeps the button
 above a chat whose provider reports subagents or background tasks even before

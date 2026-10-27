@@ -62,8 +62,12 @@ through Tauri commands/events. Browser mode connects directly to a native
 - Center surfaces are arranged into tab groups. Up to four groups can be shown
   as resizable horizontal or vertical split panes; each group has its own
   active surface, while one group owns focus and new-panel creation.
+- Each chat pane, and each Codex Terminal pane while it is observed, has its own
+  collapsible Activity panel. It sits above the composer or below the terminal.
+  Whether it is open, and its section and record, persist per pane in the
+  center-panel state.
 - Right-panel surfaces are per-thread tools: Plan, Diff, Source Control, Files,
-  individual files, Preview, Terminal, Activity, Device (kind `device`), and
+  individual files, Preview, Terminal, Device (kind `device`), and
   one tab per open pull or merge request. Preview is hidden when the active
   host does not report native preview support; Device is offered only while
   the environment's device previews are on.

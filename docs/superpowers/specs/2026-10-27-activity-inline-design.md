@@ -1,7 +1,54 @@
 # Inline Activity panel per pane (#188) and the macOS x64 terminal dock (#192)
 
-Status: proposed, round 2, awaiting approval. Batch `activity-inline`, branch
-`claude/b3-activity-inline` from `origin/develop` at `27702287cc`.
+Status: #188 approved and implemented. #192 has been re-planned as
+instrument-then-fix: Phase A (stage instrumentation only) is committed as
+`f5e26d3f2b`, and Phase B waits for the macOS x64 stage line. Batch
+`activity-inline`, branch `claude/b3-activity-inline` from `origin/develop` at
+`27702287cc`.
+
+### #192 re-plan (supersedes the fix and logging sections below)
+
+The disproved premise was that the existing artifacts show which stage fails.
+They do not, so the work is now split.
+
+**Phase A**, commit `f5e26d3f2b`, is a standalone Rust commit that applies
+cleanly to `origin/develop`. It changes no budgets.
+
+- Every silent exit in `provider_terminal/codex.rs` logs a distinct `reason`
+  with `elapsed_ms`:
+  - each preparation stage;
+  - helper readiness, including the existing 3 s readiness failure, as
+    `helper_start_failed`;
+  - an abandoned helper start, with its sub-step;
+  - the post-spawn connect;
+  - root discovery;
+  - resume;
+  - live publication.
+- A build whose version the probes cannot parse is cached, so it passes
+  through without spawning. Unsupported capabilities were already cached and
+  never wait.
+- `supervisor.rs` (admission gating, which #187 owns), `model.rs`, and
+  `manager.rs` are untouched.
+
+Phase A also settles one fact from the existing artifacts. The manager's
+isolated-callback timeout warning ("provider terminal observer callback timed
+out") is absent from the x64 log, so the outer 500 ms cap never expired.
+
+**Not done:**
+
+- No eager supervisor start: it would have no shutdown owner.
+- No budget raise until the x64 stage line and Intel timings are in.
+
+**Phase B** is the actual fix. It is chosen from the batched run's stage line.
+If the helper supervisor turns out to be slow, `wait_ready` uses the remaining
+preparation budget, with initialization still lazy. Its tests:
+
+- a production-equivalent helper failure, separately from expiry of the outer
+  preparation budget;
+- first-launch supervisor readiness through the complete caller. The existing
+  fixture launcher bypasses the process-wide supervisor
+  (`provider_terminal_supervisor.rs`, about line 4536), so that test needs the
+  system launcher.
 
 Round 2 changes the design in these ways:
 
@@ -346,15 +393,18 @@ about two rows while its dock is visible.
 - **Non-modal.** No focus trap, backdrop, or outside-click dismissal.
 - **Collapsed means unmounted.** A collapsed body unmounts, so its queries
   stop. Re-expanding revalidates them.
-- **An expanded card with zero counts** stays visible and shows the panel's
-  empty state.
+- **When the card shows** follows the existing rule for the button. An open
+  card whose counts fall to zero follows the same rule. As built, it has no
+  extra "stay open" state; done records keep counting, so in practice the card
+  stays. The sticky variant was dropped: it needed a set-state-in-effect, and it
+  double-subscribed the activity atom on mount.
 - **Record-heading focus moves only after the user picks a record.** Today,
   `ActivityPanel.tsx:268-273` focuses the detail heading whenever a selected
   record is rendered. A restored route would therefore take focus from the
   composer or the terminal after a reload.
-  - The effect is gated on a `userNavigatedRef`. Only `selectRecord`,
-    `selectActor`, and the back and section actions set it, and it is cleared
-    after one focus.
+  - As built: `userOpenedRecordIdRef` records the record that `selectRecord`
+    or `selectActor` opened. The heading takes focus only while the routed
+    record is that record.
   - The `focusRequested` path (`:276-292`) runs only from an expand the user
     started.
 - **Behavior change:** the dock now closes an open panel. Today it never does
@@ -382,10 +432,22 @@ arriving record ever expands it.
     slow machine is unbounded in practice: a 3 s connect, discovery on 1 s
     intervals, and up to 5 min of resume materialization.
   - Any timeout that removed a placeholder would make a card appear, vanish,
-    and reappear on exactly the machines #192 is about. **Coordinator to
-    confirm.** If reserving the row before the handshake is still required,
-    the placeholder needs a server-sent "observation not attached" signal,
-    not a client timer.
+    and reappear on exactly the machines #192 is about.
+  - **Resolution of review item 4 (approved):** the terminal card appears when
+    the dock appears today, once observation is proven. It renders in its saved
+    open or closed state in that same render. A placeholder before the
+    handshake would need a server-sent "observation not attached" signal, which
+    does not exist.
+  - Tests:
+    - `ProviderTerminalActivityDock.test.tsx`: a delayed handshake restores the
+      saved open state when the card appears; an empty snapshot shows no card.
+    - `ThreadTerminalPanel.interactions.test.tsx`: the same two cases through
+      the mounted `TerminalViewport`, plus a reconnect (`stale`) that keeps the
+      same open card.
+- **Panel chats without a host layout.** A panel `ChatView` rendered without
+  `activityPaneHostRef` keys its state the way a host does: under its own
+  thread, as `chat:host`. Production always passes the host ref from
+  `LiveCenterPanelWorkspace`.
 
 ### Scope and pane identity
 
