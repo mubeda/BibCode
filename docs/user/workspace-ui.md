@@ -29,8 +29,9 @@ the selected server is removed, the rail returns to Local. Saved servers show
 the name you gave them on this device (see
 [Remote access](./remote-access.md#name-a-saved-server)).
 
-The **Environments | Repositories** switch at the top of the left panel picks
-how projects are listed; the choice is remembered on this device.
+The **Environments | Repositories | Inbox** switch at the top of the left panel
+picks what the panel lists; the choice is remembered on this device. On a
+narrow panel the switch shows only its icons; hovering one names it.
 **Environments** is the per-environment view described above. **Repositories**
 hides the environment rail and lists one read-only card per Git repository,
 matched by its `origin` remote, across every connected environment. Each card
@@ -58,6 +59,23 @@ repository continues that draft there, and its branch and worktree choice
 resets.
 Switching back to **Environments** restores the rail with its previous
 selection.
+
+**Inbox** lists agents across every connected environment, so like
+Repositories it hides the rail. Four tiles sit at the top, each with a live
+count: **All Agents** (every agent), **Needs Attention** (Pending Approval and
+Awaiting Input), **Working**, and **Done**. An agent whose status is unknown
+(stale, not observable on this platform, or on a disconnected environment)
+counts only under All Agents. One tile is always selected, and the list below
+shows that tile's agents, most recent activity first, with the same rows as
+the Agents view. The first time you open the Inbox it selects Needs Attention
+when an agent needs you, otherwise All Agents once every environment has
+reported; the selected tile is then remembered on this device, and picking
+another tile replaces it. While an environment is not connected or is still
+reconnecting, the list says its agents may be missing or out of date.
+Selecting an agent marks it read and opens its worktree with that agent in
+front: its chat (brought back if you had closed every tab), its chat panel, or
+its AI Terminal. The row stays highlighted while that agent is on screen.
+An empty tile says so, for example **No agents are running.**
 
 The **Search** row is followed by an **Agents** nav row, then Projects. Its
 unread-count badge covers agents across all connected environments and is hidden when nothing is unread. Selecting

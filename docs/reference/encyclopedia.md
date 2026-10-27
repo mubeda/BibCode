@@ -53,7 +53,18 @@ environment-scoped projects with their workspace cards. The Agents row's unread
 badge aggregates across environments and is hidden when nothing is unread;
 selecting the row opens the full-screen Agents view. The panel also shows
 project groups, the primary card and worktree cards, pin/unread state, and
-grouped context menus.
+grouped context menus. Its **Environments | Repositories | Inbox** switch picks
+the view; Repositories and Inbox hide the environment rail.
+
+### Inbox View
+
+The left panel's cross-environment agent view. Four tiles with live counts
+(All Agents, Needs Attention = Pending Approval + Awaiting Input, Working,
+Done) filter the agent rows below; unknown-status agents count only under All
+Agents. The default tile is Needs Attention when it has agents, otherwise All
+Agents once every environment has reported; the tile and the view persist per
+device. Selecting a row opens the agent's host thread with its chat, chat
+panel or AI Terminal focused.
 
 ### Workspace Card
 

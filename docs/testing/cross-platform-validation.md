@@ -2890,6 +2890,24 @@ sizes. Cover relevant:
   session in the right pane, the back arrow returns to the normal view, and the
   per-row jump-to-workspace action returns to the normal view and re-points the
   rail to that row's environment;
+- the **Inbox** view: with a remote environment connected, have one agent wait
+  on an approval, one run a turn, and one finish, plus a worktree opened with
+  an AI Terminal (the "open AI terminal" worktree default) running a provider
+  CLI. Switch the left panel to **Inbox**: the rail disappears, and the tiles
+  show All Agents, Needs Attention, Working and Done with counts that match;
+  with nothing chosen before, Needs Attention is selected. Pick each tile and
+  confirm only its agents are listed and exactly one tile looks selected;
+  answer the approval and confirm the counts move without a reload. Select a
+  chat agent whose worktree had every center tab closed: its route opens with
+  the chat back in front. Select a chat panel agent: its host worktree opens
+  with that panel focused. Select the AI Terminal agent: its worktree opens
+  with that terminal tab focused (on Windows, where terminal status is not
+  observed, it counts only under All Agents). Reload the window and confirm
+  the Inbox, the tile and the highlighted agent come back. Disconnect the
+  remote server: the list says its agents may be missing or out of date, and
+  reconnecting removes the note and restores its agents' counts. Narrow the
+  panel to its minimum and confirm the switch shows icons whose tooltips name
+  each view;
 - the **Environments | Repositories** switch: open one repository as a project
   on Local and on a remote environment. Switch the left panel to
   **Repositories**: the environment rail disappears, the BiBCode brand stays where it was
