@@ -452,6 +452,25 @@ its outcome stops and joins the keeper. Success forgets the consumed stages;
 definite failure after navigation restores the captured old draft and releases
 unbound IDs, while an in-view failure may retain them for retry.
 
+A new chat's first send turns its draft into a server thread. Any attachment
+authority check runs before the send snapshots the composer, and nothing
+awaits between that snapshot and the clear of the draft's composer content.
+Once the thread arrives, the draft route shows it, and the thread's own route
+retires the draft when the thread has started. Content still in the draft at
+that point was typed after the send, or restored by a failed one, and is not
+known to have been sent; the thread's composer draft takes it over, with the
+draft's model and mode settings. Without a thread draft the entry moves
+unchanged, keeping its previews, persisted copies and identity. With one, the
+draft's content goes first and the thread draft's content and settings are
+never overwritten; only settings it lacks are filled. A send that began on the
+draft holds the draft's id. When its reply is late or lost after the server
+committed the thread and its first message, the restore resolves a retired
+draft id to its thread (`resolveComposerRestoreTarget`), so the restored
+content, and a retained replay's draft comparison, use the thread's composer.
+The restore merges into the live prompt only when the composer shows that same
+draft. The id mapping is in memory only and bounded; a live or discarded draft
+keeps its own id.
+
 Transient staged/pending/replay ownership lives in the client-runtime admission
 owner instantiated once by application thread state, keyed by environment and
 thread. Views only subscribe to its busy state and acquire an atomic send

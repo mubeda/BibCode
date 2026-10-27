@@ -74,6 +74,7 @@ import {
   markPromotedDraftThreadByRef,
   markPromotedDraftThreads,
   markPromotedDraftThreadsByRef,
+  resolveComposerRestoreTarget,
   type ComposerAttachment,
   type ComposerImageAttachment,
   useComposerDraftStore,
@@ -1146,6 +1147,8 @@ describe("composerDraftStore project draft thread mapping", () => {
     expect(useComposerDraftStore.getState().getDraftThreadByProjectRef(projectRef)).toBeNull();
     expect(useComposerDraftStore.getState().getDraftThread(draftId)).toBeNull();
     expect(draftByKey(draftId)).toBeUndefined();
+    // Anything still in the draft was never sent: the send clears it first (#189).
+    expect(draftFor(threadId, TEST_ENVIRONMENT_ID)?.prompt).toBe("promote me");
   });
 
   it("finalizes a matching materialized draft even when promotion was not pre-marked", () => {
@@ -1158,6 +1161,178 @@ describe("composerDraftStore project draft thread mapping", () => {
     expect(useComposerDraftStore.getState().getDraftThreadByProjectRef(projectRef)).toBeNull();
     expect(useComposerDraftStore.getState().getDraftThread(draftId)).toBeNull();
     expect(draftByKey(draftId)).toBeUndefined();
+    expect(draftFor(threadId, TEST_ENVIRONMENT_ID)?.prompt).toBe("promote me");
+  });
+
+  describe("carrying unsent content through promotion (#189)", () => {
+    const threadRef = scopeThreadRef(TEST_ENVIRONMENT_ID, threadId);
+
+    function sendFirstMessage(prompt: string): void {
+      const store = useComposerDraftStore.getState();
+      store.setProjectDraftThreadId(projectRef, draftId, { threadId });
+      store.setPrompt(draftId, prompt);
+      // ChatView clears the composer before it dispatches the turn.
+      store.clearComposerContent(draftId);
+    }
+
+    it("keeps text typed across the route switch and never what was sent", () => {
+      sendFirstMessage("first message");
+      // The server thread arrives: the draft route marks it and renders server-mode ChatView,
+      // whose composer targets the thread ref and still sees the draft's entry.
+      markPromotedDraftThreadByRef(threadRef);
+      useComposerDraftStore.getState().setPrompt(threadRef, "@README ");
+      expect(useComposerDraftStore.getState().getComposerDraft(threadRef)?.prompt).toBe("@README ");
+
+      finalizePromotedDraftThreadByRef(threadRef);
+
+      const state = useComposerDraftStore.getState();
+      expect(state.getDraftThread(draftId)).toBeNull();
+      expect(draftByKey(draftId)).toBeUndefined();
+      expect(state.getComposerDraft(threadRef)?.prompt).toBe("@README ");
+    });
+
+    it("moves the draft's entry as is, keeping image previews and model settings", () => {
+      const originalRevokeObjectUrl = URL.revokeObjectURL;
+      const revokeSpy = vi.fn<(url: string) => void>();
+      URL.revokeObjectURL = revokeSpy;
+      try {
+        sendFirstMessage("first message");
+        const store = useComposerDraftStore.getState();
+        store.setPrompt(draftId, "look at this");
+        store.addAttachment(draftId, makeImage({ id: "img-gap", previewUrl: "blob:gap" }));
+        store.setModelSelection(draftId, modelSelection(CODEX_DRIVER, "gpt-5"));
+        store.setRuntimeMode(draftId, "approval-required");
+        const before = draftByKey(draftId);
+
+        finalizePromotedDraftThreadByRef(threadRef);
+
+        const carried = draftFor(threadId, TEST_ENVIRONMENT_ID);
+        // The same object, so an ambiguous send's `restoredDraft ===` check still matches.
+        expect(carried).toBe(before);
+        expect(carried?.attachments.map((attachment) => attachment.id)).toEqual(["img-gap"]);
+        expect(carried?.modelSelectionByProvider[CODEX_INSTANCE]?.model).toBe("gpt-5");
+        expect(carried?.runtimeMode).toBe("approval-required");
+        expect(revokeSpy).not.toHaveBeenCalledWith("blob:gap");
+      } finally {
+        URL.revokeObjectURL = originalRevokeObjectUrl;
+      }
+    });
+
+    it("carries a draft's model and mode settings when it holds nothing else", () => {
+      sendFirstMessage("first message");
+      const store = useComposerDraftStore.getState();
+      store.setModelSelection(draftId, modelSelection(CODEX_DRIVER, "gpt-5"));
+      store.setRuntimeMode(draftId, "approval-required");
+
+      finalizePromotedDraftThreadByRef(threadRef);
+
+      expect(draftByKey(draftId)).toBeUndefined();
+      const carried = draftFor(threadId, TEST_ENVIRONMENT_ID);
+      expect(carried?.prompt).toBe("");
+      expect(carried?.modelSelectionByProvider[CODEX_INSTANCE]?.model).toBe("gpt-5");
+      expect(carried?.runtimeMode).toBe("approval-required");
+    });
+
+    it("keeps the thread's own settings over a settings-only draft's", () => {
+      const store = useComposerDraftStore.getState();
+      store.setModelSelection(threadRef, modelSelection(CLAUDE_AGENT_DRIVER, "claude-opus"));
+      sendFirstMessage("first message");
+      store.setModelSelection(draftId, modelSelection(CODEX_DRIVER, "gpt-5"));
+      store.setInteractionMode(draftId, "plan");
+
+      finalizePromotedDraftThreadByRef(threadRef);
+
+      const thread = draftFor(threadId, TEST_ENVIRONMENT_ID);
+      expect(Object.keys(thread?.modelSelectionByProvider ?? {})).toEqual([CLAUDE_AGENT_INSTANCE]);
+      expect(thread?.interactionMode).toBe("plan");
+      expect(draftByKey(draftId)).toBeUndefined();
+    });
+
+    it("keeps both drafts when the thread already has one, the draft's content first", () => {
+      const originalRevokeObjectUrl = URL.revokeObjectURL;
+      const revokeSpy = vi.fn<(url: string) => void>();
+      URL.revokeObjectURL = revokeSpy;
+      try {
+        const store = useComposerDraftStore.getState();
+        // A thread entry that exists before the draft session takes the lookup from then on.
+        store.setPrompt(threadRef, "typed on the thread");
+        store.addAttachment(threadRef, makeFile({ id: "file-thread" }));
+        store.setModelSelection(threadRef, modelSelection(CLAUDE_AGENT_DRIVER, "claude-opus"));
+        sendFirstMessage("first message");
+        store.setPrompt(draftId, "typed on the draft");
+        store.addAttachment(draftId, makeImage({ id: "img-draft", previewUrl: "blob:draft" }));
+        store.setModelSelection(draftId, modelSelection(CODEX_DRIVER, "gpt-5"));
+        store.setRuntimeMode(draftId, "approval-required");
+        markPromotedDraftThreadByRef(threadRef);
+        // The route switch shows the thread's entry; the draft's text is not lost, only hidden.
+        expect(store.getComposerDraft(threadRef)?.prompt).toBe("typed on the thread");
+
+        finalizePromotedDraftThreadByRef(threadRef);
+
+        const merged = useComposerDraftStore.getState().getComposerDraft(threadRef);
+        expect(merged?.prompt).toBe("typed on the draft\n\ntyped on the thread");
+        expect(merged?.attachments.map((attachment) => attachment.id)).toEqual([
+          "img-draft",
+          "file-thread",
+        ]);
+        // The thread's own settings are kept; only the ones it lacks are filled.
+        expect(Object.keys(merged?.modelSelectionByProvider ?? {})).toEqual([
+          CLAUDE_AGENT_INSTANCE,
+        ]);
+        expect(merged?.activeProvider).toBe(CLAUDE_AGENT_INSTANCE);
+        expect(merged?.runtimeMode).toBe("approval-required");
+        expect(draftByKey(draftId)).toBeUndefined();
+        expect(revokeSpy).not.toHaveBeenCalledWith("blob:draft");
+      } finally {
+        URL.revokeObjectURL = originalRevokeObjectUrl;
+      }
+    });
+
+    it("restamps carried terminal contexts for a thread promoted under another id", () => {
+      const promotedRef = scopeThreadRef(OTHER_TEST_ENVIRONMENT_ID, otherThreadId);
+      sendFirstMessage("first message");
+      const store = useComposerDraftStore.getState();
+      store.setTerminalContexts(draftId, [makeTerminalContext({ id: "ctx-gap" })]);
+      store.markDraftThreadPromoting(draftId, promotedRef);
+
+      finalizePromotedDraftThreadByRef(promotedRef);
+
+      const carried = draftFor(otherThreadId, OTHER_TEST_ENVIRONMENT_ID);
+      expect(carried?.terminalContexts.map((context) => context.threadId)).toEqual([otherThreadId]);
+      expect(draftFor(threadId, TEST_ENVIRONMENT_ID)).toBeUndefined();
+    });
+
+    it("routes a reply that arrives after finalization to the thread's draft", () => {
+      sendFirstMessage("first message");
+      markPromotedDraftThreadByRef(threadRef);
+      useComposerDraftStore.getState().setPrompt(threadRef, "typed in the gap");
+      finalizePromotedDraftThreadByRef(threadRef);
+
+      // The send's failure path restores through the target it captured: the draft id.
+      const target = resolveComposerRestoreTarget(draftId);
+      expect(target).toEqual(threadRef);
+      const store = useComposerDraftStore.getState();
+      store.setPrompt(target, `${store.getComposerDraft(target)?.prompt}\n\nfirst message`);
+
+      const restored = useComposerDraftStore.getState().getComposerDraft(threadRef);
+      expect(restored?.prompt).toBe("typed in the gap\n\nfirst message");
+      expect(draftByKey(draftId)).toBeUndefined();
+      // A replayed send compares the thread composer's draft with the restored one.
+      expect(useComposerDraftStore.getState().getComposerDraft(target)).toBe(restored);
+    });
+
+    it("keeps restoring to the draft until it is finalized, and never redirects a discard", () => {
+      sendFirstMessage("first message");
+      markPromotedDraftThreadByRef(threadRef);
+      expect(resolveComposerRestoreTarget(draftId)).toBe(draftId);
+      expect(resolveComposerRestoreTarget(threadRef)).toBe(threadRef);
+
+      useComposerDraftStore.getState().setProjectDraftThreadId(projectRef, otherDraftId, {
+        threadId: otherThreadId,
+      });
+      useComposerDraftStore.getState().clearDraftThread(otherDraftId);
+      expect(resolveComposerRestoreTarget(otherDraftId)).toBe(otherDraftId);
+    });
   });
 
   it("updates branch context on an existing draft thread", () => {

@@ -6690,3 +6690,150 @@ describe("ChatView find in thread", () => {
     }
   });
 });
+
+describe("ChatView send snapshot", () => {
+  it("sends text typed while attachment authority is being read instead of clearing it", async () => {
+    seedEnvironment(makeEnvironmentPresentation());
+    seedProject(makeProject());
+    seedServerThread(makeThread());
+    seedGitStatus(true);
+    const file = new File(["fake"], "shot.png", { type: "image/png" });
+    const image = { type: "image" as const, id: "img-1", name: file.name, mimeType: file.type };
+    const attachment = { ...image, sizeBytes: 4, file, previewUrl: "blob:shot" };
+    h.commandResults["thread.stageAttachments"] = () =>
+      AsyncResult.success({
+        _tag: "staged",
+        attachments: [{ ...image, sizeBytes: 4, uploadId: "upload-1" }],
+      });
+    let grantAuthority: (() => void) | undefined;
+    h.commandResults["thread.attachmentAdmissionAuthority"] = () =>
+      new Promise((resolve) => {
+        grantAuthority = () =>
+          resolve(
+            AsyncResult.success({ storageInstanceId: "test-store", hostIdentity: "test-host" }),
+          );
+      });
+    renderServerRoute();
+    const composer = capturedProps<Record<string, unknown>>("chatComposer");
+    (composer["composerAttachmentsRef"] as RefObject<unknown[]>).current = [attachment];
+    (composer["composerRef"] as RefObject<ChatComposerHandle | null>).current = {
+      focusAtEnd: () => undefined,
+      resetCursorState: () => undefined,
+      addTerminalContext: () => false,
+      getSendContext: () => ({
+        attachments: [attachment],
+        terminalContexts: [],
+        elementContexts: [],
+        previewAnnotations: [],
+        reviewComments: [],
+        selectedProvider: ProviderDriverKind.make("codex"),
+        selectedModel: "gpt-5.4",
+        selectedProviderModels: codexProvider.models,
+        selectedPromptEffort: null,
+        selectedModelSelection: { instanceId: codexInstanceId, model: "gpt-5.4" },
+      }),
+    } as unknown as ChatComposerHandle;
+    const promptRef = composer["promptRef"] as RefObject<string>;
+    promptRef.current = "look at";
+
+    const sending = (composer["onSend"] as () => Promise<void>)();
+    await vi.waitFor(() => expect(grantAuthority).toBeTypeOf("function"));
+    // Typed during the authority round trip; the send clears the composer after its snapshot.
+    promptRef.current = "look at this screenshot";
+    grantAuthority!();
+    await sending;
+
+    const startCalls = h.commandCalls.filter((call) => call.key === "thread.startTurn");
+    expect(startCalls).toHaveLength(1);
+    expect(startCalls[0]!.input).toMatchObject({
+      input: { message: { text: "look at this screenshot" } },
+    });
+  });
+
+  it("restores a failed first send into its draft without copying the thread draft on screen", async () => {
+    vi.unstubAllGlobals();
+    Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+    Object.defineProperty(Element.prototype, "getAnimations", {
+      configurable: true,
+      value: () => [],
+    });
+    seedEnvironment(makeEnvironmentPresentation());
+    seedProject(makeProject());
+    seedGitStatus(true);
+    const store = useComposerDraftStore.getState();
+    const threadRef = scopeThreadRef(environmentId, threadId);
+    // The thread's own draft exists before the new chat's draft session does.
+    store.setPrompt(threadRef, "typed on the thread");
+    const draftId = newDraftId();
+    store.setLogicalProjectDraftThreadId(
+      "logical-project-1",
+      scopeProjectRef(environmentId, projectId),
+      draftId,
+      { threadId, createdAt: now, envMode: "local" },
+    );
+    let loseReply: (() => void) | undefined;
+    h.commandResults["thread.startTurn"] = () =>
+      new Promise((resolve) => {
+        loseReply = () => resolve(AsyncResult.failure(Cause.fail(new Error("reply lost"))));
+      });
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    try {
+      const view = (routeKind: "draft" | "server") =>
+        routeKind === "draft" ? (
+          <ChatView
+            environmentId={environmentId}
+            threadId={threadId}
+            routeKind="draft"
+            draftId={draftId}
+          />
+        ) : (
+          <ChatView environmentId={environmentId} threadId={threadId} routeKind="server" />
+        );
+      await act(async () => root.render(view("draft")));
+      const composer = capturedProps<Record<string, unknown>>("chatComposer");
+      (composer["composerRef"] as RefObject<ChatComposerHandle | null>).current = {
+        focusAtEnd: () => undefined,
+        resetCursorState: () => undefined,
+        addTerminalContext: () => false,
+        getSendContext: () => ({
+          attachments: [],
+          terminalContexts: [],
+          elementContexts: [],
+          previewAnnotations: [],
+          reviewComments: [],
+          selectedProvider: ProviderDriverKind.make("codex"),
+          selectedModel: "gpt-5.4",
+          selectedProviderModels: codexProvider.models,
+          selectedPromptEffort: null,
+          selectedModelSelection: { instanceId: codexInstanceId, model: "gpt-5.4" },
+        }),
+      } as unknown as ChatComposerHandle;
+      const promptRef = composer["promptRef"] as RefObject<string>;
+      promptRef.current = "first message";
+      let sending: Promise<void> | undefined;
+      await act(async () => {
+        sending = (composer["onSend"] as () => Promise<void>)();
+      });
+      await vi.waitFor(() => expect(loseReply).toBeTypeOf("function"));
+      // The thread arrives: the draft route renders it, and the composer shows its draft.
+      seedServerThread(makeThread());
+      store.markDraftThreadPromoting(draftId, threadRef);
+      await act(async () => root.render(view("server")));
+      promptRef.current = "typed on the thread";
+      await act(async () => {
+        loseReply!();
+        await sending;
+      });
+      store.finalizePromotedDraftThread(draftId);
+
+      expect(useComposerDraftStore.getState().getComposerDraft(threadRef)?.prompt).toBe(
+        "first message\n\ntyped on the thread",
+      );
+    } finally {
+      await act(async () => root.unmount());
+      container.remove();
+    }
+  });
+});
