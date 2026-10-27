@@ -203,9 +203,16 @@ out for size or because it could not be read is listed in
 linked `profiler` or `crashes` directory. Files are added only while the archive
 built so far, with the logs, stays under the desktop save limit of 20 MiB; a
 file is counted as if it did not compress. The RPC path refuses an archive over
-20 MiB before sending any of it. A server builds at most two bundles at once;
-a build whose caller went away keeps its slot until its compression thread
-finishes.
+20 MiB before sending any of it. A server holds at most two archives in memory
+at once: a slot is taken before the build and released when the archive is
+dropped, so an RPC download keeps it until its last item is sent and the HTTP
+route until it hands the bytes to the response, and a build whose caller went
+away keeps it until its compression thread finishes. A download whose client
+takes no item for 60 s ends there and releases its archive. The RPC refuses a
+`frontendLog` over the HTTP route's 512 KiB body bound with `invalid`. A crash
+dump is bundled, and counted in the manifest, only once the crash monitor has
+written its `.json` record, which it does after the dump is complete; a dump
+without one is listed in `profiler/OMITTED.txt` as incomplete.
 
 Crash dumps (`profiler/crashes/*.dmp`) can hold fragments of process memory,
 including prompts or tokens, so they are left out unless the request body sets

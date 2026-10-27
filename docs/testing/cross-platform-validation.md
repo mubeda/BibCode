@@ -3069,8 +3069,11 @@ sizes. Cover relevant:
 - **Settings → Diagnostics → Diagnostic logs** with a remote environment
   connected: the row names the primary by default ("… from <primary label>.")
   and **Download logs** saves the primary's `bibcode-diagnostics-<label>-….zip`
-  as before. Choose the remote environment in the row's **Environment** picker
-  (the Profiler section follows): the row names it, and the saved ZIP's name and
+  as before; with the primary disconnected, the button is disabled with
+  "<primary label> is not connected. Reconnect it to download its logs." and no
+  remote is downloaded instead. Choose the remote environment in the Profiler
+  section's **Environment** picker (the page's only one): the row names it, and
+  the saved ZIP's name and
   `manifest.json` name that remote server, its `storageInstanceId`, and its
   version, and its `server.log` is the remote host's. With a remote server
   older than the remote download, the button is disabled with "<label> runs an
@@ -3078,9 +3081,10 @@ sizes. Cover relevant:
   here." Stop the remote server (or cut its connection) while the remote
   download runs: the error toast reads "Could not download <label>'s logs" /
   "The connection to <label> was lost. Reconnect and try again.", and no file is
-  saved; with the remote environment disconnected before the click, the button
-  is disabled with "<label> is not connected. Reconnect it to download its
-  logs." and the primary's logs are never downloaded instead;
+  saved; while the remote environment reconnects, the button is disabled with
+  "<label> is still connecting. Download its logs once it is connected.", and
+  the primary's logs are never downloaded in its place (once the app drops a
+  choice whose environment is gone, the row names the primary again);
 - Find in thread on macOS (WKWebView), Linux (WebKitGTK AppImage), and Windows
   (WebView2), in a long thread with folded turns: find a word that appears only
   in a folded turn, a tool command inside a collapsed run of tool calls, a file

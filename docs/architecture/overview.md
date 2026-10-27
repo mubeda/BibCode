@@ -1913,11 +1913,11 @@ environment's over its RPC connection, and only when its server advertises
 `capabilities.diagnosticLogs`), and adds crash dumps only with **Include crash
 dumps** (see [Observability](../operations/observability.md#diagnostic-bundle)).
 Both, and the checkbox, explain why when disabled. The page's last section,
-**Diagnostic logs**, downloads the same bundle without crash dumps; it shares
-the Profiler section's environment selection (the route's `?environment=`,
-else the primary) and refuses, with the environment named, a choice that is
-not connected or whose server is too old, instead of downloading another
-environment's logs. The 20 newest findings follow, each with
+**Diagnostic logs**, downloads the same bundle without crash dumps for exactly
+the environment the route names, else the primary, picked with the Profiler
+section's selector (the page's only one). It refuses, with the environment
+named, one that is not connected, still connecting, or too old, instead of
+downloading another environment's logs. The 20 newest findings follow, each with
 its severity, title, count, and last seen. A server that does not advertise
 `capabilities.profiler` (one older than the profiler) is never asked for its
 status: the section shows only the disabled switch and "This server's BiBCode
