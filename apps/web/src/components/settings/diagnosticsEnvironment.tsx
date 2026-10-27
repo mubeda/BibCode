@@ -1,4 +1,3 @@
-import type { EnvironmentConnectionPhase } from "@bibcode/client-runtime/connection";
 import { EnvironmentId } from "@bibcode/contracts";
 import { useEffect } from "react";
 
@@ -8,14 +7,6 @@ import {
   usePrimaryEnvironment,
 } from "../../state/environments";
 import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../ui/select";
-
-// A selected environment in one of these phases is kept: it is connected, or on its way.
-const STILL_CONNECTING_PHASES: ReadonlySet<EnvironmentConnectionPhase> = new Set([
-  "connected",
-  "available",
-  "connecting",
-  "reconnecting",
-]);
 
 export interface DiagnosticsEnvironmentSelection {
   readonly environments: ReadonlyArray<EnvironmentPresentation>;
@@ -48,17 +39,14 @@ export function useDiagnosticsEnvironment(
     connected[0] ??
     primaryEnvironment ??
     null;
-  // A choice whose environment has gone is dropped, so coming back online does not revive it.
-  // One that has not connected yet (a reload on a link) is kept, as is any choice while the
-  // catalog is loading, because the environment may simply not be known yet.
+  // A choice stays while its environment is in the catalog, connected or not: a link from a
+  // remote thread must keep naming that remote (its download disabled until it reconnects),
+  // never fall back to this machine's logs. Only an environment that was removed drops it,
+  // and only once the catalog has loaded, since before that it may simply not be known yet.
   const selectionGone =
     isReady &&
     selectedEnvironmentId !== null &&
-    !environments.some(
-      (candidate) =>
-        candidate.environmentId === selectedEnvironmentId &&
-        STILL_CONNECTING_PHASES.has(candidate.connection.phase),
-    );
+    !environments.some((candidate) => candidate.environmentId === selectedEnvironmentId);
   useEffect(() => {
     if (selectionGone) onSelectEnvironment(null);
   }, [selectionGone, onSelectEnvironment]);

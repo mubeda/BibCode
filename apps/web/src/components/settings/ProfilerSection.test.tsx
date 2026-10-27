@@ -941,7 +941,7 @@ describe("ProfilerSection", () => {
       expect(h.selections).toEqual([]);
     });
 
-    it("falls back to the primary environment when the selected one disconnects", async () => {
+    it("keeps a chosen environment through a disconnect, showing the primary meanwhile", async () => {
       h.settingsByEnvironment[lunaId] = true;
       const workstation = withLuna();
       const container = await render();
@@ -950,20 +950,27 @@ describe("ProfilerSection", () => {
 
       h.environments = [h.environment!, { ...workstation, connection: { phase: "offline" } }];
       await rerender(container);
+      // The primary stands in and the page says so, but the choice is not dropped.
       expect(container.querySelector('[role="switch"]')!.getAttribute("aria-checked")).toBe(
         "false",
       );
-      expect(h.selections.at(-1)).toBeNull();
+      expect(container.textContent).toContain("Workstation is not connected. Showing Work Server.");
+      expect(h.selections.at(-1)).toBe(EnvironmentId.make(workstation.environmentId));
 
-      // The choice is gone, not parked: coming back online does not select Workstation again.
+      // Back online, Workstation shows again without being chosen again.
       h.environments = [h.environment!, workstation];
       await rerender(container);
-      expect(container.querySelector('[role="switch"]')!.getAttribute("aria-checked")).toBe(
-        "false",
-      );
-      expect(container.querySelector('button[aria-label="Environment"]')!.textContent).toBe(
-        "Work Server",
-      );
+      expect(container.querySelector('[role="switch"]')!.getAttribute("aria-checked")).toBe("true");
+    });
+
+    it("drops a choice whose environment was removed", async () => {
+      const workstation = withLuna();
+      const container = await render();
+      await pick(workstation);
+
+      h.environments = [h.environment!];
+      await rerender(container);
+      expect(h.selections.at(-1)).toBeNull();
     });
   });
 
