@@ -3122,8 +3122,9 @@ view), or free scrolling.
   animated scroll LegendList draws the rows offset by the adjustment it holds
   for rows that resized during it; the method commits that adjustment as a
   scroll by the same amount, so the content stays where the reader sees it
-  and no later scroll applies it. A held request therefore never moves a
-  reader who took over.
+  and no later scroll applies it; it also releases the anchor a recent data
+  change locked, which was recorded before that adjustment and would apply it
+  a second time. A held request therefore never moves a reader who took over.
 - **Released sent row.** A sent row the reader scrolled away from stays
   released until the next send or thread. LegendList reports the anchor ready
   again whenever the anchored end space changes size, once per delivery; a
