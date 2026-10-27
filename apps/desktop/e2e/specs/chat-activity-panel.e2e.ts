@@ -21,6 +21,7 @@ import {
   focusDesktopUiElement,
   sendFocusedKeyboardKey,
 } from "../support/keyboard-input.ts";
+import { mermaidFixturePrompts } from "../support/mermaid-fixture.ts";
 import { clearDesktopActivityMarker } from "../support/test-project.ts";
 import { ensureMainSidebarOpen, setDesktopUiWindowSize } from "../support/ui-state.ts";
 
@@ -255,10 +256,14 @@ async function readTimelineScroll(): Promise<TimelineScroll> {
 
 /** Opening or closing the panel above the composer must not move what the user reads. */
 function expectReadingPositionKept(before: TimelineScroll, after: TimelineScroll): void {
-  if (before.distanceFromEnd <= 2) {
-    expect(after.distanceFromEnd).toBeLessThanOrEqual(2);
-  } else {
-    expect(Math.abs(after.scrollTop - before.scrollTop)).toBeLessThanOrEqual(1);
+  const kept =
+    before.distanceFromEnd <= 2
+      ? after.distanceFromEnd <= 2
+      : Math.abs(after.scrollTop - before.scrollTop) <= 1;
+  if (!kept) {
+    throw new Error(
+      `Toggling the Activity panel moved the chat's reading position: before ${JSON.stringify(before)}, after ${JSON.stringify(after)}`,
+    );
   }
 }
 
@@ -542,13 +547,29 @@ async function tabTo(
   throw new Error(`Tab navigation did not reach the expected control: ${JSON.stringify(visited)}`);
 }
 
-/** The button sits in the composer's region, so Shift+Tab from the composer reaches it. */
+/**
+ * The button follows the timeline in tab order, above the composer. The composer
+ * editor keeps Tab for itself, so the walk starts at the timeline's last control.
+ */
 async function tabToDockSummary(): Promise<void> {
-  const startingFocus = await focusDesktopUiElement('[data-testid="composer-editor"]');
-  expect(startingFocus.testId).toBe("composer-editor");
+  const marked = await browser.execute(() => {
+    document.querySelector("[data-e2e-tab-start]")?.removeAttribute("data-e2e-tab-start");
+    const timeline = document.querySelector<HTMLElement>(
+      "[data-chat-surface]:has([data-activity-pane]) [class*='overflow-anchor']",
+    );
+    const controls = [
+      ...(timeline?.querySelectorAll<HTMLElement>(
+        "button:not([disabled]), a[href], [tabindex='0']",
+      ) ?? []),
+    ].filter((element) => element.getClientRects().length > 0);
+    const last = controls.at(-1);
+    last?.setAttribute("data-e2e-tab-start", "");
+    return last !== undefined;
+  });
+  expect(marked).toBe(true);
+  await focusDesktopUiElement("[data-e2e-tab-start]");
   const arrived = await tabTo(
     (element) => element.ariaLabel === desktopActivityAccessibleNames.dock,
-    "backward",
   );
   expect(arrived).toEqual(
     expect.objectContaining({
@@ -909,6 +930,84 @@ async function assertRuntimeMotionContract(): Promise<void> {
 
 const DOCK_BUTTON = `[data-chat-composer-overlay] button[aria-label="${desktopActivityAccessibleNames.dock}"]`;
 
+async function scrollTimelineTo(position: "history" | "end"): Promise<TimelineScroll> {
+  await browser.execute((where: "history" | "end") => {
+    const scroller = document.querySelector<HTMLElement>(
+      "[data-chat-surface]:has([data-activity-pane]) [class*='overflow-anchor']",
+    );
+    if (!scroller) throw new Error("The chat timeline scroller is missing.");
+    const max = scroller.scrollHeight - scroller.clientHeight;
+    // The timeline stops following its end only when the reader navigates
+    // (wheel, touch, or a press), so reading history starts with a wheel turn.
+    if (where === "history") {
+      scroller.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -max }));
+    }
+    scroller.scrollTop = where === "end" ? max : 0;
+  }, position);
+  await browser.pause(300);
+  return readTimelineScroll();
+}
+
+async function toggleChatPanelAndSettle(): Promise<TimelineScroll> {
+  await focusDesktopUiElement(DOCK_BUTTON);
+  await sendFocusedKeyboardKey("Enter");
+  await browser.pause(300);
+  return readTimelineScroll();
+}
+
+/**
+ * With the panel closed, a short window makes the fixture thread scroll, so
+ * opening and closing it is checked both mid-history and at the end.
+ */
+async function assertReadingPositionAcrossToggles(): Promise<void> {
+  // The fixture thread's rows are shorter than the timeline, which only
+  // scrolls by the composer's height. LegendList keeps the end of a list that
+  // short in view, so a long reply gives the thread history to read.
+  await setDesktopUiWindowSize(960, 640);
+  const editor = browser.$('[data-testid="composer-editor"]');
+  await editor.click();
+  await editor.addValue(mermaidFixturePrompts.long);
+  await expect(editor).toHaveText(mermaidFixturePrompts.long);
+  await browser.keys("Enter");
+  await expect(editor).toHaveText("");
+  await browser
+    .$(
+      '//p[normalize-space()="Following reply paragraph 60 keeps the reading position measurable."]',
+    )
+    .waitForExist({ timeoutMsg: "The fixture's long reply never reached the chat." });
+  let lastScroll: TimelineScroll | null = null;
+  await browser
+    .waitUntil(async () => {
+      lastScroll = await readTimelineScroll();
+      return lastScroll.scrollHeight > lastScroll.clientHeight * 2;
+    })
+    .catch(() => {
+      throw new Error(
+        `The fixture thread does not scroll with the panel closed, so the reading-position checks would prove nothing: ${JSON.stringify(lastScroll)}`,
+      );
+    });
+
+  // LegendList treats a list within a tenth of its viewport of the end as at
+  // the end and keeps the end in view, as it does for a growing composer. A
+  // reader of earlier history must be outside that band.
+  const middle = await scrollTimelineTo("history");
+  expect(middle.distanceFromEnd).toBeGreaterThan(middle.clientHeight * 0.1 + 2);
+  const opened = await toggleChatPanelAndSettle();
+  await expect(browser.$("[data-chat-composer-overlay] [data-activity-panel]")).toBeDisplayed();
+  expectReadingPositionKept(middle, opened);
+  const closed = await toggleChatPanelAndSettle();
+  await expectMissing("[data-activity-panel]");
+  expectReadingPositionKept(opened, closed);
+
+  const end = await scrollTimelineTo("end");
+  expect(end.distanceFromEnd).toBeLessThanOrEqual(2);
+  const openedAtEnd = await toggleChatPanelAndSettle();
+  expectReadingPositionKept(end, openedAtEnd);
+  const closedAtEnd = await toggleChatPanelAndSettle();
+  expectReadingPositionKept(openedAtEnd, closedAtEnd);
+  await setDesktopUiWindowSize(1_200, 720);
+}
+
 /**
  * Starts with the chat's panel just opened from the keyboard. Covers the
  * inline placement, the disclosure, Escape, the reading position, the
@@ -919,23 +1018,8 @@ async function assertInlineChatPanel(): Promise<void> {
   await assertBoundedActivityGeometry(1_200, true);
   await expectDockExpanded(true);
 
-  // The scroll checks below only mean something if the fixture thread scrolls.
-  const scrollable = await readTimelineScroll();
-  expect(scrollable.scrollHeight).toBeGreaterThan(scrollable.clientHeight);
-
-  // Escape inside the panel collapses it and gives focus back to its button,
-  // while the user reads mid-history.
+  // Escape inside the panel collapses it and gives focus back to its button.
   const rightPanelBefore = (await readPersistedPanelState()).rightPanel;
-  await browser.execute(() => {
-    const scroller = document.querySelector<HTMLElement>(
-      "[data-chat-surface]:has([data-activity-pane]) [class*='overflow-anchor']",
-    );
-    if (scroller)
-      scroller.scrollTop = Math.floor((scroller.scrollHeight - scroller.clientHeight) / 2);
-  });
-  await browser.pause(250);
-  const scrollWhileOpen = await readTimelineScroll();
-  expect(scrollWhileOpen.distanceFromEnd).toBeGreaterThan(2);
   expect(
     await browser.execute(() => document.activeElement?.closest("[data-activity-panel]") !== null),
   ).toBe(true);
@@ -945,14 +1029,14 @@ async function assertInlineChatPanel(): Promise<void> {
     expect.objectContaining({ ariaLabel: desktopActivityAccessibleNames.dock, tagName: "BUTTON" }),
   );
   await expectDockExpanded(false);
-  expectReadingPositionKept(scrollWhileOpen, await readTimelineScroll());
+
+  await assertReadingPositionAcrossToggles();
 
   // The button is a disclosure: Enter opens on Subagents, Enter again closes.
-  const scrollWhileClosed = await readTimelineScroll();
+  await focusDesktopUiElement(DOCK_BUTTON);
   await sendFocusedKeyboardKey("Enter");
   await expect(browser.$('section[aria-label="Subagents"]')).toBeDisplayed();
   await expectDockExpanded(true);
-  expectReadingPositionKept(scrollWhileClosed, await readTimelineScroll());
   await focusDesktopUiElement(DOCK_BUTTON);
   await sendFocusedKeyboardKey("Enter");
   await expectMissing("[data-activity-panel]");
@@ -1101,10 +1185,20 @@ async function readTerminalTuiSize(): Promise<{
 /** The terminal's own panel takes rows from the PTY, and the TUI redraws at each size. */
 async function assertTerminalPanelResizesTui(terminalId: string): Promise<void> {
   const host = `[data-provider-terminal-activity-host="${terminalId}"]`;
-  await browser.waitUntil(async () => (await readTerminalTuiSize()).drawn !== null, {
-    timeoutMsg: "The Codex fixture TUI never drew its terminal size.",
-  });
-  const collapsed = await readTerminalTuiSize();
+  // The TUI first draws at its launch size, then again once the terminal fits
+  // its pane, so the baseline is the size that stays put.
+  let settled: { readonly rows: number; readonly drawn: string | null } | null = null;
+  await browser.waitUntil(
+    async () => {
+      const before = await readTerminalTuiSize();
+      await browser.pause(400);
+      const after = await readTerminalTuiSize();
+      settled = after;
+      return after.drawn !== null && after.drawn === before.drawn;
+    },
+    { timeoutMsg: "The Codex fixture TUI never settled on a terminal size." },
+  );
+  const collapsed = settled!;
   await browser.$(`${host} [data-testid="activity-dock"] button`).click();
   await expect(browser.$(`${host} [data-activity-panel]`)).toBeDisplayed();
   expect(await browser.$("[data-chat-composer-overlay] [data-activity-panel]").isExisting()).toBe(
@@ -1116,9 +1210,13 @@ async function assertTerminalPanelResizesTui(terminalId: string): Promise<void> 
   expect((await readTerminalTuiSize()).rows).toBeGreaterThanOrEqual(5);
   await browser.$(`${host} [data-testid="activity-dock"] button`).click();
   await expectMissing(`${host} [data-activity-panel]`);
-  await browser.waitUntil(async () => (await readTerminalTuiSize()).rows === collapsed.rows, {
-    timeoutMsg: "Closing the terminal's Activity panel did not give the TUI its rows back.",
-  });
+  await browser
+    .waitUntil(async () => (await readTerminalTuiSize()).rows === collapsed.rows)
+    .catch(async () => {
+      throw new Error(
+        `Closing the terminal's Activity panel did not give the TUI its rows back: collapsed at ${collapsed.drawn}, now ${(await readTerminalTuiSize()).drawn}.`,
+      );
+    });
 }
 
 /**
@@ -1296,8 +1394,18 @@ describe("packaged responsive activity experience", () => {
     expect(await describeDesktopUiFocus()).toEqual(
       expect.objectContaining({ tagName: "TEXTAREA" }),
     );
+    // The chat tabbed away behind its terminal mounts no Activity, so it
+    // neither reads nor announces it until it is in front again.
+    expect(await browser.$$(DOCK_BUTTON).length).toBe(0);
+    if (supportsCodexTerminalActivity) {
+      await assertProviderTerminalGeometry(terminalId);
+    }
+    const mainPanel = browser.$(
+      '//*[@data-center-panel-tab-list]//button[.//span[normalize-space()="Codex"]]',
+    );
+    await mainPanel.click();
     const updatedSummary = browser.$(
-      'button[aria-label^="Activity: Subagents 1 active, 0 done; Background tasks 0 active, 1 done"]',
+      `[data-chat-composer-overlay] button[aria-label^="Activity: Subagents 1 active, 0 done; Background tasks 0 active, 1 done"]`,
     );
     await updatedSummary.waitForExist({
       timeoutMsg: "The provider follow-up did not materially update activity counts.",
@@ -1318,13 +1426,6 @@ describe("packaged responsive activity experience", () => {
         }, updatedAnnouncement),
       { timeoutMsg: "The coalesced live announcement did not publish updated exact status." },
     );
-    if (supportsCodexTerminalActivity) {
-      await assertProviderTerminalGeometry(terminalId);
-    }
-    const mainPanel = browser.$(
-      '//*[@data-center-panel-tab-list]//button[.//span[normalize-space()="Codex"]]',
-    );
-    await mainPanel.click();
     await browser.$('[data-testid="composer-editor"]').waitForDisplayed();
     expect(await focusDesktopUiElement('[data-testid="composer-editor"]')).toEqual(
       expect.objectContaining({ testId: "composer-editor" }),
