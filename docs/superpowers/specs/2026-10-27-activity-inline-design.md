@@ -65,10 +65,17 @@ terminal observer preparation goes over its fixed 350 ms budget while it waits
 for the node-backed helper's socket. The launch passes through silently, so no
 terminal activity is ever published.
 
-The same failure can hit real users. The npm `codex` launcher is a Node script.
-A cold start, or a Gatekeeper scan on a slow Mac, can run past 350 ms on its
-own. A timed-out probe is cancelled before it is cached, so the next launch
-probes again from cold.
+The same failure can plausibly hit real users. This was not verified in this
+session, and no Codex sources are vendored under `.repos/`:
+
+- A Codex installed through a package manager that wraps the binary in a Node
+  launcher would pay a Node start for each probe and for the helper.
+- A cold start, or a first-launch Gatekeeper scan on a slow Mac, can run past
+  350 ms on its own.
+
+What the code does show: a timed-out probe is cancelled before
+`CachedCodexCapabilityProbe::probe` caches it (`codex.rs:155-168`). The next
+launch therefore probes again from cold.
 
 ### Why not a Rosetta run
 
@@ -203,6 +210,12 @@ construction: the timeline's and the terminal's geometry never change.
     user's hands.
   - After a reload, a remembered expanded pane opens expanded without taking
     focus.
+  - Open judgment call: a terminal pane remembered as expanded reopens its card
+    when its first record arrives after the reload. The card then covers part
+    of a live TUI the user may be typing in. It is the user's remembered
+    choice, and focus stays in the terminal. The alternative is to persist the
+    route for terminal panes but always start them collapsed. **To be decided
+    at approval.**
 - **Behavior change:** the dock now closes an open panel. Today it never
   closes it (`docs/user/workspace-ui.md:1756-1762`). That is what the issue
   asks for ("collapsed and expanded from its header or the dock").
@@ -264,6 +277,16 @@ interface ActivityPaneState {
   the bounded-id check) move from `rightPanelStore.ts` to a small
   `components/activity/activityPaneState.ts`. Both the store and its tests use
   it.
+- **Hydration:** today `centerPanelStore` has `migrate` but no `merge`. That
+  means a same-version store with a corrupt pane entry would hydrate unchecked.
+  Add a `merge` that runs the `activityPanes` normalizer on every hydration,
+  the way `rightPanelStore` does (`rightPanelStore.ts:1023`).
+- **Panel chats need the host's ref.** A panel-variant `ChatView` reads the
+  center state as empty (`ChatView.tsx:1924-1927`) and receives only
+  `panelThreadRef`. `LiveCenterPanelWorkspace` already has `hostThreadRef` at
+  the panel render site (`ChatView.tsx:1420-1424`). Add an optional
+  `activityPaneHostRef` to `ChatViewPanelProps` and pass it there. The panel
+  then reads and writes `activityPanes[hostKey]["chat:<threadId>"]`.
 - **Defaults:** collapsed, on `subagents`, with nothing selected. Default
   entries are not written, so idle panes add nothing to storage.
 
@@ -326,6 +349,8 @@ boundary. It touches no other coverage item.
      handlers.
    - 7192–7200: the `ActivityPanelBinding` right-panel branch.
    - 7281–7295: the dock mount, which becomes the `ActivityPane` mount.
+   - About 1060 and 1420–1424: the `ChatViewPanelProps.activityPaneHostRef`
+     prop, and passing it from `LiveCenterPanelWorkspace`.
    - The imports those use.
 2. **`apps/desktop/e2e/support/activity-events.ts:124`**
    (`desktopActivityAccessibleNames.dock`), for the renamed dock label.
