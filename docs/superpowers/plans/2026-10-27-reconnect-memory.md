@@ -388,3 +388,15 @@ reconnect, agrees:
   and one `unchanged`, or two snapshots after a server restart. The likely
   cause is a pre-verification subscription followed by a verified one; this is
   not confirmed.
+  - **Correction (#197):** the two requests are for two different threads, one
+    request each. One is the seeded thread. The other is a second, small
+    thread whose state the app makes at page load, probably the sidebar
+    prewarmer above.
+  - Tier B counted items per request id and ignored the payload's `threadId`.
+  - **The snapshot counts:**
+    - The big thread gets the snapshot.
+    - The small thread gets `unchanged`, or a 791-byte snapshot after a
+      restart.
+  - `packages/client-runtime/src/rpc/client.reconnect.test.ts` now pins one
+    request per thread per reconnect.
+  - See `2026-10-27-subscribe-once.md`.

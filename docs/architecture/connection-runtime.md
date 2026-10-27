@@ -40,7 +40,9 @@ public package has no root export; callers use focused subpaths such as
   guarantees are unchanged. The gate opens after the identity check passes and
   the supervisor reports `connected`: no data from an unverified server reaches
   domain state, and held data meets a connected environment. `session` then
-  publishes the same object, so nothing subscribes twice. An attempt that ends
+  publishes the same object, so nothing subscribes twice: each followed thread
+  sends one `subscribeThread` per connection, resuming from the revision it
+  holds (`rpc/client.reconnect.test.ts`). An attempt that ends
   unverified clears `subscriptionSession`, which interrupts its followers; their
   held data is dropped. What changes is that a read subscription's request (its
   input, such as a thread ID or cwd) reaches the server before the config's
