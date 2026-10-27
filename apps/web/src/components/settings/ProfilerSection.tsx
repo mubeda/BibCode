@@ -323,7 +323,7 @@ function EnvironmentProfiler({
     !isDesktopHost || !isPrimary ? (
       <>
         The profiler folder is on {environmentLabel}. Use{" "}
-        {isPrimary || canExport ? <>Export bundle or {profilerCommand}</> : profilerCommand} on that
+        {canExport ? <>Export bundle here, or {profilerCommand}</> : profilerCommand} on that
         machine.
       </>
     ) : profilerDirectory === null ? (

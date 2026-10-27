@@ -20,6 +20,7 @@ interface FakeEnvironment {
 const h = vi.hoisted(() => ({
   primary: null as FakeEnvironment | null,
   environments: [] as FakeEnvironment[],
+  catalogReady: true,
   selections: [] as Array<string | null>,
   selectProps: null as null | { onValueChange: (value: string) => void },
   downloadCalls: [] as Array<{ frontendLog: string; options: unknown }>,
@@ -29,7 +30,7 @@ const h = vi.hoisted(() => ({
 
 vi.mock("../../state/environments", () => ({
   usePrimaryEnvironment: () => h.primary,
-  useEnvironments: () => ({ environments: h.environments, isReady: true }),
+  useEnvironments: () => ({ environments: h.environments, isReady: h.catalogReady }),
 }));
 
 vi.mock("../../diagnostics/frontendLogCapture", () => ({
@@ -155,6 +156,7 @@ beforeEach(() => {
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
   h.primary = fakeEnvironment("Work Server", { diagnosticLogs: false });
   h.environments = [h.primary];
+  h.catalogReady = true;
   h.selections.length = 0;
   h.selectProps = null;
   h.downloadCalls.length = 0;
@@ -254,6 +256,21 @@ describe("DiagnosticLogsSection", () => {
       "Omarchy is not connected. Reconnect it to download its logs.",
     );
     expect(descriptionOf(container)).toContain("from Omarchy.");
+    await click(downloadButton(container));
+    expect(h.downloadCalls).toEqual([]);
+  });
+
+  it("never downloads the stand-in while the chosen environment is not in the catalog", async () => {
+    // A reload on a link: the catalog has not listed the chosen environment yet.
+    h.catalogReady = false;
+    h.environments = [h.primary!];
+    const container = await render("environment-Omarchy");
+
+    expect(downloadButton(container).disabled).toBe(true);
+    expect(statusOf(container)).toBe(
+      "The chosen environment is not connected. Reconnect it to download its logs.",
+    );
+    expect(descriptionOf(container)).not.toContain("from Work Server");
     await click(downloadButton(container));
     expect(h.downloadCalls).toEqual([]);
   });

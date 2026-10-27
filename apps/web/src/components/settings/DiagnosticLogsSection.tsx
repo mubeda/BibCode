@@ -28,11 +28,17 @@ export function DiagnosticLogsSection({
   const reasonId = useId();
   // The chosen environment, not the stand-in the page shows while the chosen one connects.
   const target = waitingFor ?? environment;
+  // Chosen, but not in the catalog (yet, or any more): the stand-in must not be downloaded.
+  const chosenUnknown =
+    selectedEnvironmentId !== null &&
+    waitingFor === undefined &&
+    environment?.environmentId !== selectedEnvironmentId;
   const remote =
     target !== null && target.environmentId !== primaryEnvironment?.environmentId ? target : null;
-  const label = target?.label.trim() || "the server";
-  const disabledReason =
-    remote === null
+  const label = chosenUnknown ? "The chosen environment" : target?.label.trim() || "the server";
+  const disabledReason = chosenUnknown
+    ? diagnosticLogsFailureMessage("not-connected", label)
+    : remote === null
       ? null
       : waitingFor !== undefined || remote.connection.phase !== "connected"
         ? diagnosticLogsFailureMessage("not-connected", label)
@@ -50,7 +56,7 @@ export function DiagnosticLogsSection({
             <span className="font-mono">server.trace.ndjson</span>,{" "}
             <span className="font-mono">frontend.log</span>, and any recorded{" "}
             <span className="font-mono">profiler</span> data (without crash dumps)
-            {target === null ? "" : ` from ${label}`}.
+            {target === null || chosenUnknown ? "" : ` from ${label}`}.
           </>
         }
         status={
