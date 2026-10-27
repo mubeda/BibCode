@@ -1,8 +1,39 @@
 # Remote diagnostic logs download (#194)
 
-Status: proposed (phase 1 of batch `remote-logs`). Historical once implemented;
-the living description goes to `docs/operations/observability.md`,
-`docs/architecture/remote.md`, and the profiler skill.
+Status: approved with review corrections and implemented on
+`claude/b3-remote-logs`. Historical; the living description is in
+`docs/operations/observability.md` (Diagnostic Bundle),
+`docs/architecture/remote.md`, `docs/architecture/rpc-and-orchestration.md`
+(Diagnostic logs download), and the profiler skill.
+
+## Review corrections (approved, and what was built)
+
+1. **Identity fails closed.** The client compares the manifest's
+   `storageInstanceId` with the one its own connection reports
+   (`server.getConfig` over the same session), requires both, and never falls
+   back to `environmentId` (every server declares `local`,
+   `client-runtime/src/connection/remoteIdentity.ts`).
+2. **Builds are bounded through cancellation.** `DiagnosticBundleService` holds
+   a two-slot semaphore; a build's permit moves into its `spawn_blocking`
+   closure, so an interrupted request keeps its slot until compression exits.
+3. **Items are bounded before decoding.** An encoded item longer than the
+   512 KiB bound, or one that would overrun `byteLength`, is refused before
+   `atob`; accepted items are decoded straight into one buffer.
+4. **Remote caller proof.** No existing harness joins the TypeScript registry,
+   RPC client, and a real pinned connection. The closest real seams are used:
+   the Rust pinned-channel suite (`tests/e2ee_ws.rs`), the opt-in TypeScript
+   initiator against the Rust responder (`e2ee/serverInterop.test.ts`), the
+   client-runtime supervisor/session seam, and the web download-to-save seam.
+5. **Default environment is the primary** unless `?environment=` names one.
+   No Diagnostics link starts from a thread, so passing the active thread's
+   environment is not a one-liner; that is deferred. The rail-selection default
+   below was dropped.
+6. **Manifest truth.** `crashDumps: { requested, included }`, where `included`
+   counts the dumps actually written.
+7. `docs/testing/cross-platform-validation.md` covers a capable remote, an older
+   server, and a lost connection.
+
+Sections below that contradict these are superseded by them.
 
 ## Problem
 
@@ -100,7 +131,7 @@ DiagnosticLogsManifest = Struct({
   serverVersion: TrimmedNonEmptyString,
   platform: Struct({ os: String, arch: String }),
   generatedAt: String, // RFC 3339 UTC
-  includesCrashDumps: Boolean,
+  crashDumps: Struct({ requested: Boolean, included: NonNegativeInt }),
 });
 
 DiagnosticLogsDownloadEvent = Union([
@@ -113,7 +144,7 @@ DiagnosticLogsDownloadEvent = Union([
 ]);
 
 DiagnosticLogsError = TaggedError("DiagnosticLogsError", {
-  reason: Literals(["too-large", "build-failed"]),
+  reason: Literals(["invalid", "build-failed", "too-large"]),
   message: TrimmedNonEmptyString,
 });
 // error: Union([DiagnosticLogsError, EnvironmentRpcError])
@@ -155,8 +186,8 @@ ones would cost more round trips.
 
 `DiagnosticBundleService::new` gains the server's identity (environment id,
 label, server version; `runtime.rs:419` has them from config). `build_bundle`
-then writes `manifest.json` (the manifest above, pretty-printed) as the first
-entry and names the archive
+then writes `manifest.json` (the manifest above, pretty-printed) as the last
+entry, once it knows how many dumps it wrote, and names the archive
 `bibcode-diagnostics-<label-slug>-<YYYYMMDDTHHMMSSZ>.zip`. The slug lowercases
 the label, maps every run of characters outside `[a-z0-9]` to `-`, trims `-`,
 caps at 40 characters, and falls back to `server`; the result passes the
@@ -168,12 +199,9 @@ to the primary path: additive, and it is what criterion 2 asks for.
 The server's own label can differ from the name the user gave a saved remote
 profile. The manifest carries the server's label and id; the client's toast and
 errors use the client's label. The client also checks the manifest against the
-verified descriptor of the connection it asked (`readPreparedConnection(id)
-.descriptor`), not against its own environment key: the client keys a remote by
-`remote:<storageInstanceId>` (`client-runtime/connection/onboarding.ts:127`)
-while every server declares itself `local`. The check compares
-`storageInstanceId` when the descriptor has one, else `environmentId`. A
-mismatch fails the download rather than saving another machine's logs.
+`storageInstanceId` its own connection reports, not against its environment key
+or `environmentId`: every server declares itself `local`. A missing or
+different id fails the download rather than saving another machine's logs.
 
 ## Client behaviour
 
@@ -193,28 +221,11 @@ mismatch fails the download rather than saving another machine's logs.
 
 ### Default environment
 
-The page has no notion of "the active thread" once Settings is open (the thread
-route is unmounted, and Settings keeps no return target). The closest signal is
-the environment rail's selection, `activeEnvironmentIdAtom`
-(`state/activeEnvironment.ts`), which the sidebar's threads belong to. The
-default is therefore:
-
-1. the route's `?environment=` when present (the status bar's Profiler link
-   sets it);
-2. else the rail's environment when it is connected and not the primary;
-3. else the primary.
-
-Gap, stated rather than papered over: opening a thread of another environment
-from the command palette may not move the rail selection; then the default is
-the rail's environment, and the row names it, so the user sees which one they
-will get.
-
-The Profiler section already resolves `?environment=` with its own default
-(primary). Two selectors with different values on one page would contradict
-each other, so both sections read one resolved selection (the rule above).
-That moves the Profiler section's default from "primary" to "the rail's
-environment when it is connected and remote". This is a small behaviour change,
-called out in the docs.
+The route's `?environment=` when present (the status bar's Profiler link sets
+it), else the primary. The Profiler section and the Diagnostic logs row read
+that one selection (`components/settings/diagnosticsEnvironment.tsx`), so the
+page never shows two environments at once. No Diagnostics link starts from a
+thread today; carrying the active thread's environment is deferred.
 
 ## UI (reviewed against `UI.md`)
 
@@ -284,8 +295,12 @@ stays primary-and-desktop only (it opens a local path).
   `register_stream_with_context` wrapper, which times it to its first item. It
   is not added to `is_long_running` in `diagnostics/profiler/latency.rs`: the
   handler waits on local disk reads and compression, never on a network,
-  provider, hosting service, or hook, and streams are log-only anyway, so it
-  cannot raise `rpc.slow` or `rpc.hang`.
+  provider, hosting service, or hook. Checked in `latency.rs`: a stream's timer
+  (`RequestTimer::stream`) registers no in-flight entry, so it has no hang
+  check, and `observe` never files a `rpc.slow` for the `first-item` outcome.
+  A multi-second build therefore records one log-only `rpc.timing` event and
+  cannot raise `rpc.slow`, `rpc.saturation`, or `rpc.hang`; `is_long_running`
+  and `is_background` would change nothing for it.
 - **Events/logs:** a failed build logs `tracing::warn!` at the RPC boundary
   (`diagnostic logs bundle failed`), with no path or content.
 - Child processes, worktree removal, binaries, shutdown: not touched.
