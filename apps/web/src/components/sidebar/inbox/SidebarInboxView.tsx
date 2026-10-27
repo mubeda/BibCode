@@ -1,6 +1,6 @@
 import { parseScopedThreadKey, scopedThreadKey } from "@bibcode/client-runtime/environment";
 import { useNavigate, useParams } from "@tanstack/react-router";
-import { type ComponentType, useCallback, useEffect, useMemo, useRef } from "react";
+import { useCallback, useEffect, useMemo, useRef } from "react";
 
 import {
   selectFocusedCenterSurface,
@@ -12,9 +12,10 @@ import { setActiveEnvironmentId } from "../../../state/entities";
 import { useThreadSelectionStore } from "../../../threadSelectionStore";
 import { buildThreadRouteParams, resolveThreadRouteRef } from "../../../threadRoutes";
 import { type InboxCategory, useUiStateStore } from "../../../uiStateStore";
-import { AgentsRow, type AgentsRowProps } from "../../agents/AgentsRow";
+import { AgentsRow } from "../../agents/AgentsRow";
 import { Button } from "../../ui/button";
 import { SidebarContent, SidebarGroup, SidebarMenu, useSidebar } from "../../ui/sidebar";
+import { agentRowUnreadKey } from "../agentsSection.logic";
 import { InboxCategoryTiles } from "./InboxCategoryTiles";
 import {
   INBOX_CATEGORIES,
@@ -27,17 +28,6 @@ import {
   selectInboxRows,
 } from "./inbox.logic";
 import { useInboxAgentRows } from "./useInboxAgentRows";
-
-/**
- * The agent card without its Jump to workspace action: here the whole card
- * opens the workspace. #187 makes `onJumpToWorkspace` optional on `AgentsRow`;
- * once that lands this alias is the component itself.
- */
-const InboxAgentCard = AgentsRow as unknown as ComponentType<
-  Omit<AgentsRowProps, "onJumpToWorkspace"> & {
-    readonly onJumpToWorkspace?: AgentsRowProps["onJumpToWorkspace"];
-  }
->;
 
 const EMPTY_STATES: Record<InboxCategory, { readonly title: string; readonly detail?: string }> = {
   all: { title: "No agents yet.", detail: "Start a chat in a project and it shows up here." },
@@ -112,7 +102,7 @@ export function SidebarInboxView() {
       const target = resolveInboxOpenTarget(row);
       // A terminal row shows its host thread's unread state, so opening it reads the
       // host, as selecting the host's workspace card does.
-      markRead(target.surface.kind === "terminal" ? scopedThreadKey(target.hostRef) : row.key);
+      markRead(agentRowUnreadKey(row));
       // As thread navigation elsewhere in the panel: drop a multi-selection and
       // anchor range selection at the opened thread.
       const selection = useThreadSelectionStore.getState();
@@ -175,7 +165,8 @@ export function SidebarInboxView() {
           ) : (
             <SidebarMenu role="list" aria-label={`${label} agents`} className="gap-0">
               {visibleRows.map((row) => (
-                <InboxAgentCard
+                // No Jump to workspace action: the whole card opens the workspace.
+                <AgentsRow
                   key={row.key}
                   row={row}
                   selected={isInboxRowCurrent(

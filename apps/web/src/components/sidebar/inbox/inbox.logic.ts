@@ -5,13 +5,18 @@ import type { ScopedThreadRef, ThreadId } from "@bibcode/contracts";
 import { panelProviderLabel } from "../../../centerPanelAdoption";
 import { HOST_SURFACE_ID } from "../../../centerPanelStore";
 import type { InboxCategory } from "../../../uiStateStore";
-import type { InboxAgentGroupId, InboxAgentRowFields } from "./agentRowContract";
+import type { AgentGroupId, AgentRow } from "../agentsSection.logic";
+
+/** The fields of an `AgentRow` the Inbox's pure logic reads. */
+export type InboxAgentRowFields = Pick<AgentRow, "key" | "ref" | "group" | "terminalId"> & {
+  readonly shell: Pick<AgentRow["shell"], "kind" | "hostThreadId" | "title" | "updatedAt">;
+};
 
 export interface InboxCategoryDefinition {
   readonly id: InboxCategory;
   readonly label: string;
   /** The status groups the tile lists; null lists every row, `unknown` included. */
-  readonly groups: ReadonlyArray<InboxAgentGroupId> | null;
+  readonly groups: ReadonlyArray<AgentGroupId> | null;
 }
 
 /** The confirmed tile mapping (#186). `unknown` rows appear only under All Agents. */
@@ -24,7 +29,7 @@ export const INBOX_CATEGORIES = [
 
 export type InboxCategoryCounts = Readonly<Record<InboxCategory, number>>;
 
-function categoryOf(group: InboxAgentGroupId): InboxCategory | null {
+function categoryOf(group: AgentGroupId): InboxCategory | null {
   switch (group) {
     case "blocked":
     case "waiting":
@@ -190,9 +195,8 @@ export interface InboxOpenTarget {
 }
 
 export function resolveInboxOpenTarget(row: InboxAgentRowFields): InboxOpenTarget {
-  const terminalId = row.terminalId ?? null;
-  if (terminalId !== null) {
-    return { hostRef: row.ref, surface: { kind: "terminal", terminalId } };
+  if (row.terminalId !== null) {
+    return { hostRef: row.ref, surface: { kind: "terminal", terminalId: row.terminalId } };
   }
   const hostThreadId = row.shell.hostThreadId;
   if (row.shell.kind === "panel" && hostThreadId !== undefined) {

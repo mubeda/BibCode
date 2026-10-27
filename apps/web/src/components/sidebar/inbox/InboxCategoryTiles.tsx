@@ -3,14 +3,14 @@ import { memo } from "react";
 
 import { cn } from "../../../lib/utils";
 import type { InboxCategory } from "../../../uiStateStore";
-import { INBOX_STATUS_TONES } from "./agentRowContract";
+import { STATUS_TONES } from "../../Sidebar.logic";
 import { INBOX_CATEGORIES, type InboxCategoryCounts } from "./inbox.logic";
 
 const TILE_ICONS: Record<InboxCategory, { Icon: typeof BotIcon; toneClass: string }> = {
   all: { Icon: BotIcon, toneClass: "text-foreground/70" },
-  attention: { Icon: BellDotIcon, toneClass: INBOX_STATUS_TONES.approval.colorClass },
-  working: { Icon: LoaderIcon, toneClass: INBOX_STATUS_TONES.working.colorClass },
-  done: { Icon: CircleCheckIcon, toneClass: INBOX_STATUS_TONES.completed.colorClass },
+  attention: { Icon: BellDotIcon, toneClass: STATUS_TONES.approval.colorClass },
+  working: { Icon: LoaderIcon, toneClass: STATUS_TONES.working.colorClass },
+  done: { Icon: CircleCheckIcon, toneClass: STATUS_TONES.completed.colorClass },
 };
 
 export interface InboxCategoryTilesProps {

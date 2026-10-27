@@ -10,8 +10,9 @@ Status: approved with changes and implemented. Plan:
   `terminalId: string | null` (terminal row key
   `${threadKey}#terminal:${terminalId}`, `ref` = host thread), sessionless
   AI-terminal worktrees get rows, `STATUS_TONES` is exported, and
-  `AgentsRow`'s `onJumpToWorkspace` becomes optional. Until that branch lands,
-  `inbox/agentRowContract.ts` carries the optional fields and mirrored tones.
+  `AgentsRow`'s `onJumpToWorkspace` becomes optional (the Inbox omits it). The
+  Inbox builds rows with the AI Terminal sources and the status clock, as the
+  Agents view does, so a disconnected environment's agents read `offline`.
 - **Default tile** is persisted once settled, not held per mount: Needs
   Attention as soon as any agent needs attention (on partial or complete
   data); All Agents only on complete data (every environment live with a
