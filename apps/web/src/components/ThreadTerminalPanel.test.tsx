@@ -412,7 +412,7 @@ describe("TerminalViewport", () => {
     expect(markup).toContain("<div");
   });
 
-  it("mounts an eligible activity dock after the xterm mount inside the viewport boundary", () => {
+  it("mounts an eligible activity slot below the xterm mount in the viewport's own layout", () => {
     settingsState.enableTerminalAgentActivity = true;
     const markup = renderToStaticMarkup(
       <TerminalViewport
@@ -430,9 +430,11 @@ describe("TerminalViewport", () => {
     );
     expect(xtermMountIndex).toBeGreaterThanOrEqual(0);
     expect(activityHostIndex).toBeGreaterThan(xtermMountIndex);
-    expect(markup.slice(activityHostIndex - 120, activityHostIndex + 120)).toContain(
-      "absolute inset-x-0 top-7 bottom-0 z-10",
-    );
+    const hostMarkup = markup.slice(activityHostIndex - 120, activityHostIndex + 120);
+    // In the flow, not over the terminal: opening the panel takes rows, so xterm refits.
+    expect(hostMarkup).toContain("shrink-0");
+    expect(hostMarkup).not.toContain("absolute");
+    expect(markup).toContain('class="min-h-0 w-full flex-1 overflow-hidden"');
   });
 
   it("keeps provider terminal activity off by default without removing the xterm mount", () => {

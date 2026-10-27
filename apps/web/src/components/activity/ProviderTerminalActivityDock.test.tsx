@@ -20,11 +20,30 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test"
 const state = vi.hoisted(() => ({
   activityStateTargets: [] as unknown[],
   activityState: null as unknown,
+  listeners: new Set<() => void>(),
 }));
 
-vi.mock("@effect/atom-react", () => ({
-  useAtomValue: () => state.activityState,
-}));
+vi.mock("@effect/atom-react", async () => {
+  const { useSyncExternalStore } = await import("react");
+  return {
+    useAtomValue: () =>
+      useSyncExternalStore(
+        (listener) => {
+          state.listeners.add(listener);
+          return () => state.listeners.delete(listener);
+        },
+        () => state.activityState,
+        () => state.activityState,
+      ),
+  };
+});
+
+async function publishActivityState(next: unknown): Promise<void> {
+  state.activityState = next;
+  await act(async () => {
+    for (const listener of state.listeners) listener();
+  });
+}
 
 vi.mock("~/state/activity", () => ({
   environmentActivity: {
@@ -35,7 +54,18 @@ vi.mock("~/state/activity", () => ({
   },
 }));
 
-import { selectThreadRightPanelState, useRightPanelStore } from "~/rightPanelStore";
+vi.mock("./ActivityPaneBinding", () => ({
+  ActivityPanelBinding: (props: { readonly route: { readonly section: string } }) => (
+    <div data-activity-panel data-route-section={props.route.section} />
+  ),
+}));
+
+vi.mock("~/hooks/useSettings", () => ({
+  useEnvironmentSettings: () => "locale",
+}));
+
+import { selectActivityPaneState, useCenterPanelStore } from "~/centerPanelStore";
+import { useRightPanelStore } from "~/rightPanelStore";
 import { ProviderTerminalActivityDock } from "./ProviderTerminalActivityDock";
 
 const environmentId = EnvironmentId.make("provider-terminal-dock");
@@ -125,6 +155,7 @@ function dock(overrides: Partial<Parameters<typeof ProviderTerminalActivityDock>
       activity={activity}
       visible
       compact={false}
+      paneElement={null}
       {...overrides}
     />
   );
@@ -153,6 +184,8 @@ describe("ProviderTerminalActivityDock", () => {
     state.activityStateTargets = [];
     state.activityState = activityState(null, "empty");
     useRightPanelStore.setState({ byThreadKey: {} });
+    useCenterPanelStore.setState({ byThreadKey: {}, activityPanes: {} });
+    useCenterPanelStore.getState().openTerminalPanel(threadRef, "terminal-codex");
   });
 
   afterEach(async () => {
@@ -230,9 +263,7 @@ describe("ProviderTerminalActivityDock", () => {
 
     expect(markup).toContain('data-testid="activity-dock"');
     expect(markup).toContain('data-activity-status="stale"');
-    expect(markup).toContain(
-      'aria-label="Open Activity: Subagents 1 active, 0 done. Status: stale"',
-    );
+    expect(markup).toContain('aria-label="Activity: Subagents 1 active, 0 done. Status: stale"');
   });
 
   it("does not mount an activity state reader, dock, or announcement for a hidden terminal pane", () => {
@@ -274,26 +305,98 @@ describe("ProviderTerminalActivityDock", () => {
     expect(markup).not.toContain('data-testid="activity-dock"');
   });
 
-  it("opens the exact persisted terminal scope in one click on the pill", async () => {
+  it("opens its own panel in the terminal pane and leaves the right panel alone", async () => {
     state.activityState = activityState(snapshot("terminal-codex"));
+    const rightPanelBefore = useRightPanelStore.getState().byThreadKey;
     const tree = await mount(dock());
-    const buttons = tree.container.querySelectorAll<HTMLButtonElement>("button");
-    expect(buttons).toHaveLength(1);
-    expect(buttons[0]!.getAttribute("aria-label")).toBe(
-      "Open Activity: Subagents 1 active, 0 done",
-    );
+    const button = tree.container.querySelector<HTMLButtonElement>(
+      '[data-testid="activity-dock"] button',
+    )!;
+    expect(button.getAttribute("aria-label")).toBe("Activity: Subagents 1 active, 0 done");
+    expect(button.getAttribute("aria-expanded")).toBe("false");
 
-    await act(async () => buttons[0]!.click());
+    await act(async () => button.click());
 
-    const panel = selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, threadRef);
-    expect(panel.isOpen).toBe(true);
-    expect(panel.surfaces).toContainEqual({
-      id: "activity",
-      kind: "activity",
-      scope: { _tag: "terminal", terminalId: "terminal-codex" },
+    expect(button.getAttribute("aria-expanded")).toBe("true");
+    const body = tree.container.querySelector("[data-activity-panel]")?.parentElement;
+    expect(body?.id).toBe(button.getAttribute("aria-controls"));
+    expect(body?.getAttribute("data-text-surface")).toBe("background");
+    expect(
+      selectActivityPaneState(
+        useCenterPanelStore.getState().activityPanes,
+        threadRef,
+        "terminal:terminal-codex",
+      ),
+    ).toEqual({
+      expanded: true,
       section: "subagents",
       selectedRecordKind: null,
       selectedRecordId: null,
     });
+    expect(useRightPanelStore.getState().byThreadKey).toBe(rightPanelBefore);
+
+    await act(async () => button.click());
+
+    expect(button.getAttribute("aria-expanded")).toBe("false");
+    expect(tree.container.querySelector("[data-activity-panel]")).toBeNull();
+  });
+
+  it("collapses from Escape inside the panel and returns focus to the button", async () => {
+    state.activityState = activityState(snapshot("terminal-codex"));
+    useCenterPanelStore
+      .getState()
+      .setActivityPaneExpanded(threadRef, "terminal:terminal-codex", true, "subagents");
+    const tree = await mount(dock());
+    const panel = tree.container.querySelector<HTMLElement>("[data-activity-panel]")!;
+    panel.tabIndex = -1;
+    panel.focus();
+
+    await act(async () => {
+      panel.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    });
+
+    const button = tree.container.querySelector<HTMLButtonElement>(
+      '[data-testid="activity-dock"] button',
+    )!;
+    expect(tree.container.querySelector("[data-activity-panel]")).toBeNull();
+    expect(button.getAttribute("aria-expanded")).toBe("false");
+    expect(document.activeElement).toBe(button);
+  });
+
+  it("restores a saved open panel in the render that proves observation after a delayed handshake", async () => {
+    useCenterPanelStore
+      .getState()
+      .setActivityPaneExpanded(threadRef, "terminal:terminal-codex", true, "subagents");
+    state.activityState = activityState(null, "synchronizing");
+    const tree = await mount(dock());
+    expect(tree.container.querySelector('[data-testid="activity-dock"]')).toBeNull();
+
+    await publishActivityState(activityState(snapshot("terminal-codex")));
+
+    const button = tree.container.querySelector<HTMLButtonElement>(
+      '[data-testid="activity-dock"] button',
+    );
+    expect(button?.getAttribute("aria-expanded")).toBe("true");
+    expect(tree.container.querySelector("[data-activity-panel]")).not.toBeNull();
+    expect(document.activeElement).toBe(document.body);
+  });
+
+  it("shows no card for a saved open panel whose terminal has no records", async () => {
+    useCenterPanelStore
+      .getState()
+      .setActivityPaneExpanded(threadRef, "terminal:terminal-codex", true, "subagents");
+    state.activityState = activityState(
+      snapshot("terminal-codex", {
+        counts: {
+          subagents: { active: 0, done: 0 },
+          backgroundTasks: { active: 0, done: 0 },
+        },
+        actors: [],
+      }),
+    );
+
+    const tree = await mount(dock());
+
+    expect(tree.container.querySelector("[data-activity-pane]")).toBeNull();
   });
 });
