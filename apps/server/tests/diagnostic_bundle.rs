@@ -6,10 +6,21 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use bibcode_server::diagnostic_bundle::{DiagnosticBundleService, MAX_DIAGNOSTIC_ARCHIVE_BYTES};
+use bibcode_server::diagnostic_bundle::{
+    DiagnosticBundleIdentity, DiagnosticBundleService, MAX_DIAGNOSTIC_ARCHIVE_BYTES,
+};
 use tempfile::TempDir;
 use time::OffsetDateTime;
 use zip::{CompressionMethod, ZipArchive, ZipWriter, write::SimpleFileOptions};
+
+fn identity() -> DiagnosticBundleIdentity {
+    DiagnosticBundleIdentity {
+        environment_id: "local".to_owned(),
+        storage_instance_id: None,
+        label: "Test Server".to_owned(),
+        server_version: "0.0.0-test".to_owned(),
+    }
+}
 
 fn generated_at() -> OffsetDateTime {
     OffsetDateTime::parse(
@@ -69,18 +80,26 @@ async fn bundle_contains_exact_root_entries_and_oldest_first_server_rotations() 
     ] {
         std::fs::write(temp.path().join(name), contents).expect("write retained log");
     }
-    let service = DiagnosticBundleService::new(temp.path());
+    let service = DiagnosticBundleService::new(temp.path(), identity());
 
     let bundle = service
         .build("frontend warning\n".to_owned(), false, generated_at())
         .await
         .expect("diagnostic bundle");
 
-    assert_eq!(bundle.filename, "bibcode-diagnostics-20260715T123456Z.zip");
+    assert_eq!(
+        bundle.filename,
+        "bibcode-diagnostics-test-server-20260715T123456Z.zip"
+    );
     let (names, entries) = validated_zip_entries(&bundle.bytes).expect("safe diagnostic zip");
     assert_eq!(
         names,
-        vec!["server.log", "server.trace.ndjson", "frontend.log"]
+        vec![
+            "server.log",
+            "server.trace.ndjson",
+            "frontend.log",
+            "manifest.json"
+        ]
     );
     let server = entries.get("server.log").expect("server log entry");
     let positions = ["oldest", "older", "recent", "active"].map(|text| {
@@ -103,7 +122,7 @@ async fn bundle_contains_exact_root_entries_and_oldest_first_server_rotations() 
 async fn bundle_uses_explanatory_placeholders_when_logs_are_empty() {
     let temp = TempDir::new().expect("temporary logs directory");
     std::fs::write(temp.path().join("server.log"), "").expect("write empty active log");
-    let service = DiagnosticBundleService::new(temp.path());
+    let service = DiagnosticBundleService::new(temp.path(), identity());
 
     let bundle = service
         .build(String::new(), false, generated_at())
@@ -134,7 +153,7 @@ async fn bundle_redacts_credentials_in_both_trust_boundary_inputs() {
         "{\"name\":\"trace\",\"authorization\":\"Bearer trace-secret\"}\n",
     )
     .expect("write server trace");
-    let service = DiagnosticBundleService::new(temp.path());
+    let service = DiagnosticBundleService::new(temp.path(), identity());
 
     let bundle = service
         .build(
@@ -195,7 +214,7 @@ fn rejects_path_traversal_entry_names() {
 #[tokio::test]
 async fn current_bundle_is_listable_by_the_native_archive_tool() {
     let temp = TempDir::new().expect("temporary logs directory");
-    let bundle = DiagnosticBundleService::new(temp.path())
+    let bundle = DiagnosticBundleService::new(temp.path(), identity())
         .build(String::new(), false, generated_at())
         .await
         .expect("diagnostic bundle");
@@ -263,7 +282,7 @@ fn set_age(dir: &std::path::Path, relative: &str, seconds: u64) {
 }
 
 fn service_with_profiler(logs: &TempDir, profiler: &TempDir) -> DiagnosticBundleService {
-    DiagnosticBundleService::new(logs.path()).with_profiler_dir(profiler.path())
+    DiagnosticBundleService::new(logs.path(), identity()).with_profiler_dir(profiler.path())
 }
 
 #[tokio::test]
@@ -295,6 +314,7 @@ async fn bundle_adds_profiler_files_and_leaves_crash_dumps_out_by_default() {
         names,
         vec![
             "frontend.log",
+            "manifest.json",
             "profiler/crashes/crash-1.json",
             "profiler/events-000001.ndjson",
             "profiler/findings.ndjson",
@@ -350,7 +370,7 @@ async fn bundle_without_profiler_data_has_no_profiler_entries() {
     let logs = TempDir::new().expect("logs directory");
     let missing = logs.path().join("never-created");
 
-    let bundle = DiagnosticBundleService::new(logs.path())
+    let bundle = DiagnosticBundleService::new(logs.path(), identity())
         .with_profiler_dir(&missing)
         .build(String::new(), true, generated_at())
         .await
@@ -360,7 +380,12 @@ async fn bundle_without_profiler_data_has_no_profiler_entries() {
         validated_zip_entries(&bundle.bytes)
             .expect("root entries only")
             .0,
-        vec!["server.log", "server.trace.ndjson", "frontend.log"]
+        vec![
+            "server.log",
+            "server.trace.ndjson",
+            "frontend.log",
+            "manifest.json"
+        ]
     );
 }
 
@@ -480,7 +505,7 @@ async fn bundle_skips_a_profiler_directory_that_is_a_link() {
     let linked = state.path().join("profiler");
     std::os::unix::fs::symlink(outside.path(), &linked).expect("symlink");
 
-    let bundle = DiagnosticBundleService::new(logs.path())
+    let bundle = DiagnosticBundleService::new(logs.path(), identity())
         .with_profiler_dir(&linked)
         .build(String::new(), true, generated_at())
         .await
@@ -490,7 +515,12 @@ async fn bundle_skips_a_profiler_directory_that_is_a_link() {
         validated_zip_entries(&bundle.bytes)
             .expect("root entries only")
             .0,
-        vec!["server.log", "server.trace.ndjson", "frontend.log"]
+        vec![
+            "server.log",
+            "server.trace.ndjson",
+            "frontend.log",
+            "manifest.json"
+        ]
     );
 }
 
