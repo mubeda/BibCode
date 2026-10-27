@@ -1,5 +1,5 @@
 diff --git a/react.js b/react.js
-index 5b171ebd6fa7ac86b0148fe17f897a0ca821d55e..7cb8fdd9ea625002a3e4b7eeb904bd02b1e052a6 100644
+index 5b171ebd6fa7ac86b0148fe17f897a0ca821d55e..e5c495c98cc598038cca1c7f93d48b0ff875b651 100644
 --- a/react.js
 +++ b/react.js
 @@ -1976,6 +1976,12 @@ function updateScroll(ctx, newScroll, forceUpdate, options) {
@@ -53,8 +53,50 @@ index 5b171ebd6fa7ac86b0148fe17f897a0ca821d55e..7cb8fdd9ea625002a3e4b7eeb904bd02
            (_d = stickyState == null ? void 0 : stickyState.finishCalculateItemsInView) == null ? void 0 : _d.call(stickyState);
            return;
          }
+@@ -7588,6 +7594,41 @@ function createImperativeHandle(ctx, scheduleImperativeScrollCommit) {
+       }
+       return false;
+     }),
++    // BiBCode patch: the reader took over the scroll. Withdraw the list's own scroll requests
++    // so none runs over them later: a request still waiting for layout to settle, and the
++    // completion checks and target of one under way. An animated scroll the browser is still
++    // running stops where it is. Rows that resized during an animated scroll are drawn offset
++    // by the adjustment it holds, so that adjustment is committed now, as a scroll by the same
++    // amount: the content stays where the reader sees it, and no later scroll applies it. The
++    // anchor a recent data change locked is released too: it was recorded before that
++    // adjustment, and a later pass would otherwise apply the same adjustment again. Keeping the
++    // list at its end stops as well, including a pass already queued for the next frame after a
++    // row grew. With nothing under way, the method changes nothing.
++    cancelScrollRequests: () => {
++      var _a3;
++      const animating = !!((_a3 = state.scrollingTo) == null ? void 0 : _a3.animated);
++      const scroller = refScroller.current;
++      cancelImperativeScroll(state);
++      state.mvcpAnchorLock = void 0;
++      if (state.maintainingScrollAtEnd || state.pendingMaintainScrollAtEnd) {
++        finishMaintainScrollAtEnd(ctx);
++      }
++      if (!scroller || state.props.horizontal) {
++        state.scrollAdjustHandler.commitPendingAdjust();
++        return;
++      }
++      const observed = scroller.getCurrentScrollOffset();
++      if (animating) {
++        scroller.scrollTo({ animated: false, x: 0, y: observed });
++      }
++      state.scroll = observed;
++      state.scrollPending = observed;
++      if (state.scrollAdjustHandler.pendingAdjust !== 0) {
++        state.scrollAdjustHandler.commitPendingAdjust();
++      } else {
++        updateScroll(ctx, observed, true, { markHasScrolled: false });
++      }
++    },
+     scrollToOffset: (params) => runScrollWithPromise(() => {
+       scrollTo(ctx, params);
+       return true;
 diff --git a/react.mjs b/react.mjs
-index cf549ca32946a9e35a883290c11423330bf8728b..85283e63527b3ef3dc14733efb6e511dbc61f7f4 100644
+index cf549ca32946a9e35a883290c11423330bf8728b..63e611670af874539101e2bb43f1f441951c837c 100644
 --- a/react.mjs
 +++ b/react.mjs
 @@ -1955,6 +1955,12 @@ function updateScroll(ctx, newScroll, forceUpdate, options) {
@@ -108,3 +150,45 @@ index cf549ca32946a9e35a883290c11423330bf8728b..85283e63527b3ef3dc14733efb6e511d
            (_d = stickyState == null ? void 0 : stickyState.finishCalculateItemsInView) == null ? void 0 : _d.call(stickyState);
            return;
          }
+@@ -7567,6 +7573,41 @@ function createImperativeHandle(ctx, scheduleImperativeScrollCommit) {
+       }
+       return false;
+     }),
++    // BiBCode patch: the reader took over the scroll. Withdraw the list's own scroll requests
++    // so none runs over them later: a request still waiting for layout to settle, and the
++    // completion checks and target of one under way. An animated scroll the browser is still
++    // running stops where it is. Rows that resized during an animated scroll are drawn offset
++    // by the adjustment it holds, so that adjustment is committed now, as a scroll by the same
++    // amount: the content stays where the reader sees it, and no later scroll applies it. The
++    // anchor a recent data change locked is released too: it was recorded before that
++    // adjustment, and a later pass would otherwise apply the same adjustment again. Keeping the
++    // list at its end stops as well, including a pass already queued for the next frame after a
++    // row grew. With nothing under way, the method changes nothing.
++    cancelScrollRequests: () => {
++      var _a3;
++      const animating = !!((_a3 = state.scrollingTo) == null ? void 0 : _a3.animated);
++      const scroller = refScroller.current;
++      cancelImperativeScroll(state);
++      state.mvcpAnchorLock = void 0;
++      if (state.maintainingScrollAtEnd || state.pendingMaintainScrollAtEnd) {
++        finishMaintainScrollAtEnd(ctx);
++      }
++      if (!scroller || state.props.horizontal) {
++        state.scrollAdjustHandler.commitPendingAdjust();
++        return;
++      }
++      const observed = scroller.getCurrentScrollOffset();
++      if (animating) {
++        scroller.scrollTo({ animated: false, x: 0, y: observed });
++      }
++      state.scroll = observed;
++      state.scrollPending = observed;
++      if (state.scrollAdjustHandler.pendingAdjust !== 0) {
++        state.scrollAdjustHandler.commitPendingAdjust();
++      } else {
++        updateScroll(ctx, observed, true, { markHasScrolled: false });
++      }
++    },
+     scrollToOffset: (params) => runScrollWithPromise(() => {
+       scrollTo(ctx, params);
+       return true;

@@ -3038,8 +3038,11 @@ sizes. Cover relevant:
   theme switch without flashing its source; a selection copied from inside a
   diagram pastes as its fenced source; the clipped Proposed Plan preview keeps
   a fence it cut open as source; and a diagram drawing above the line being
-  read in the chat leaves that line in place (the maintained Mermaid scenario
-  below automates the rendered-file and timeline checks);
+  read in the chat leaves that line in place; while a reply streams, scrolling
+  the timeline with the arrow keys or PageUp from a focused control in it
+  stops it following, and End returns to the end and follows again (the
+  maintained Mermaid scenario below automates the rendered-file, timeline and
+  keyboard checks);
 - the [durable message queue](#durable-message-queue): FIFO cards, native steer,
   Cancel restoration, reload and restart persistence, promotion, Stop drain,
   holds, and unsupported-provider explanations;
@@ -3254,7 +3257,8 @@ The fixture Codex provider then answers its diagram prompts in the timeline: a
 **Show source** swap on a diagram inside the first visible row above the top
 edge, and on one in a row wholly above the viewport, moves a reading-anchor
 paragraph by at most 1 px; a short reply's diagram drawing under its sent
-message leaves that message at the sent-row offset; and selecting an earlier
+message leaves that message within 1 px of the sent-row offset, measured from
+the scroller's top; and selecting an earlier
 message with the minimap keyboard lands it at the minimap's offset past that
 diagram and keeps it there (`mermaid-timeline-minimap-landing.json`). After a
 reply with 101 diagrams, reopening the chat draws the evicted diagram (the
@@ -3270,14 +3274,47 @@ being read, which stays within 1 px on every painted frame
 same reply twice, one delta every 300 ms, first with the diagram's source in a
 plain code block and then as a sequence diagram, the scenario's only one, whose
 chunk loads after its source shows, so it replaces the source at the end while
-more text streams. Once the sent row's glide has settled (the list first
-catches up with the end, within 2.5 s of the first delivery), each delivery
-from the diagram's draw on rests no lower below the composer than the plain
-reply's (or, after a delivery the plain reply painted no frame for, is
-revealed); the draw's own delivery may take 200 ms to be followed. Both
-replies end with the last line in view, resting within two lines of each
-other (`mermaid-timeline-streaming-follow.json` holds both replies' gaps and
-end positions). The reading-line
+more text streams. Once each reply's sent row has settled (the list first
+catches up with the end, within 2.5 s of the first delivery), every delivery
+of the plain reply after its code block shows that paints a resting frame (the
+last before the next delivery) rests with the reply's end revealed, at most
+1 px below the composer's top. A slow runner can paint no frame between two
+deliveries, so such a delivery is recorded
+(`mermaid-timeline-streaming-unpainted.json`) rather than failed, but each
+reply must settle, finish and paint at least five resting frames. Each delivery
+of the diagram reply from its draw on rests no lower below the composer than
+the plain reply's (or, after a delivery the plain reply painted no rest for,
+is revealed); the draw's own delivery may take 200 ms to be followed. The
+diagram's source must be laid out before it draws, read from the DOM as it
+changes, and the draw must change the block's height. From settling on,
+neither reply's sent row rests more than 1 px below its offset; for these tall
+replies following takes the row well above it, so the proof that a sent row
+lands within 1 px is the short reply's check above. Both replies end with the
+last line in view, resting within two lines of each other
+(`mermaid-timeline-streaming-follow.json` holds both replies' gaps, end and
+sent-row positions, and, for diagnosis only, the painted frames each delivery
+took to reveal its end). Then the reader takes the timeline over with the
+keyboard: after a short reply whose code block's **Copy code** button is
+mounted, a reply streams for about nine seconds. One page script waits for its
+sent row to start gliding, grows a paragraph far above the view so LegendList
+holds an adjustment for the glide, focuses that button (a focus, not a press),
+dispatches a PageUp keydown on it and, two frames later, makes the page step
+that key's default action makes. The packaged WebDriver plugin sends keys as
+dispatched events, which scroll nothing, so the spec cannot use real key
+input. The key must land within 750 ms of the glide starting, and a line on
+screen must not move between the key and the page step (the glide stops, and
+the held adjustment is applied as a scroll rather than a jump). The paragraph
+then read stays within 1 px on every painted frame for 3 s, through the
+glide's settling, LegendList's wait for rows to settle and at least five more
+deliveries; an End keydown and a scroll to the end resume following, and at
+least three later deliveries rest with the end revealed
+(`mermaid-timeline-keyboard-takeover.json`). Last, with a long reply at the
+end, the reader wheels 40 px up, within LegendList's end threshold, and the
+bottom region (the composer overlay) grows by 120 px; then, back at the end,
+the reply's last row grows and the reader wheels 40 px up in the same frame,
+after LegendList has queued its pass to keep the end. A paragraph on screen
+stays within 1 px on each of the 30 painted frames after either
+(`mermaid-timeline-reader-near-end.json`). The reading-line
 checks sample painted frames, so the scenario fails early in a webview that
 paints none.
 Its other page scripts wait on timers rather than animation frames, which stop
@@ -3288,6 +3325,26 @@ the 101 diagrams can take minutes there. Rerun it alone with
 the same fixture files served by a release `bibcode` server in Chromium and
 Safari: the console shows no CSP violation and the server log no
 `/mermaid-probe/` request.
+
+**Real-key check (manual, about a minute).** The packaged spec cannot press a
+real key, so on each webview (WebKit on macOS and Linux, WebView2 on Windows)
+check by hand that the timeline sees the key before the webview scrolls. In a
+chat with earlier messages, send a prompt that streams a long reply, and while
+it streams:
+
+1. Press Tab until a button in the timeline (such as a code block's **Copy
+   code**) has focus, then press PageUp twice. The view moves up and stays
+   where you read while the reply goes on streaming; End returns to the end
+   and the reply is followed again.
+2. Click a code block's **Copy code** (WebKit leaves focus on the page rather
+   than the button), or click a paragraph's text, then press PageUp. The view
+   moves up and stays; End resumes following.
+3. Send again and press PageUp right away, while the sent message is still
+   gliding up to the top. The glide stops at once and the view pages up from
+   where it stopped; no row jumps as it stops.
+
+A view that jumps back to the streaming end after PageUp, or a glide that goes
+on after the key, fails the check.
 
 At final packaged shutdown, inspect the raw worker and server logs. Provider and
 terminal owners, operational logs, orchestration, and the SQLite worker must all

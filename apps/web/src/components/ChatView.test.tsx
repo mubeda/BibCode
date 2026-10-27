@@ -21,6 +21,7 @@ import {
   type ReactNode,
   type RefObject,
   useEffect,
+  useLayoutEffect,
   useState,
   useSyncExternalStore,
 } from "react";
@@ -481,6 +482,13 @@ vi.mock("./chat/MessagesTimeline", () => ({
     if (h.timelineList !== null) {
       (props["listRef"] as { current: unknown }).current = h.timelineList;
     }
+    // The list reports that it mounted, as LegendList's ref does.
+    const onListMount = props["onListMount"] as ((list: unknown) => void) | undefined;
+    useLayoutEffect(() => {
+      if (h.timelineList === null) return undefined;
+      onListMount?.(h.timelineList);
+      return () => onListMount?.(null);
+    }, [onListMount]);
     return (
       <div
         data-mock="messages-timeline"
@@ -5057,7 +5065,7 @@ describe("ChatView handlers (captured from mocked children)", () => {
             <ChatView environmentId={environmentId} threadId={threadId} routeKind="server" />,
           ),
         );
-        // The list's press listeners attach one frame after the thread mounts.
+        // The list's press listeners attach once it mounts.
         await nextFrames(2);
         const composer = capturedProps<Record<string, unknown>>("chatComposer");
         (composer["composerRef"] as RefObject<ChatComposerHandle | null>).current =
