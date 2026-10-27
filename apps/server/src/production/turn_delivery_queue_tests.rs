@@ -208,10 +208,8 @@ async fn no_promotion_while_approval_or_user_input_pending() {
         let engine = engine().await;
         session(&engine, "running", "running").await;
         enqueue(&engine, "queued", true).await;
-        // A request the provider shows while its session is `ready`, as OpenCode does for an
-        // ask it recovered on resume, holds the queue until it is answered.
-        session(&engine, "ready", "ready-blocked").await;
         activity(&engine, &format!("{kind}.requested"), "request-open").await;
+        session(&engine, "ready", "ready-blocked").await;
         let (service, mut routes) = service(&engine);
         quiet(&mut routes).await;
         assert!(engine.dispatch(command(json!({"type":"thread.turn.promote", "commandId":"server:blocked-promote", "threadId":"t", "messageId":"queued", "createdAt":TIME}))).await.is_err());
@@ -228,22 +226,34 @@ async fn no_promotion_while_approval_or_user_input_pending() {
 }
 
 #[tokio::test]
-async fn a_turn_ending_with_its_request_open_expires_it_and_then_drains_like_an_answer() {
+async fn a_relaunch_with_a_recovered_ask_does_not_send_the_follow_up() {
     for kind in ["approval", "user-input"] {
         let engine = engine().await;
-        session(&engine, "running", "running").await;
+        // A suspended OpenCode session with a queued follow-up is resumed.
+        session(&engine, "stopped", "suspended").await;
         enqueue(&engine, "queued", true).await;
-        activity(&engine, &format!("{kind}.requested"), "request-open").await;
+        // It launches `starting` until its recovered asks are shown (#187): nothing is sent.
+        session(&engine, "starting", "relaunch").await;
         let (service, mut routes) = service(&engine);
         quiet(&mut routes).await;
-        // The turn ends `ready` with the request unanswered: nobody holds it any more (#187),
-        // so the queue drains exactly as it does after an answered request.
-        session(&engine, "ready", "ready-expires").await;
+        activity(&engine, &format!("{kind}.requested"), "request-recovered").await;
+        session(&engine, "ready", "recovery-settled").await;
+        // The recovered ask holds the follow-up until it is answered.
+        quiet(&mut routes).await;
+        assert_eq!(
+            row(&engine, "queued").await.state,
+            TurnDeliveryState::Queued
+        );
+        activity(&engine, &format!("{kind}.resolved"), "request-resolved").await;
+        session(&engine, "ready", "answered").await;
         received(&mut routes, "queued").await;
         service.shutdown().await;
         engine.shutdown().await;
     }
-    // An interrupted or failed turn expires its request too, but holds the queue as before.
+}
+
+#[tokio::test]
+async fn an_interrupted_or_failed_turn_expires_its_request_and_holds_the_queue() {
     for status in ["interrupted", "error"] {
         let engine = engine().await;
         session(&engine, "running", "running").await;

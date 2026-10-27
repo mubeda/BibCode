@@ -983,6 +983,10 @@ impl OpenCodeSessionRuntime {
             let mut v2 = self.inner.v2.lock().await;
             v2.adopt_on_connect = true;
             v2.reconcile_asks_on_connect = true;
+        } else {
+            // A resume OpenCode refused started afresh: it kept no asks to recover (#187).
+            self.emit("session.recovery-settled", None, None, json!({}))
+                .await;
         }
         self.start_event_pump().await?;
         self.request_reconciliation(true, None, true).await;
@@ -3494,6 +3498,9 @@ impl OpenCodeSessionRuntime {
             }
         }
         self.v1_route_listed(&session_id, &fresh).await;
+        // The asks it kept are shown: the resumed session may take queued messages (#187).
+        self.emit("session.recovery-settled", None, None, json!({}))
+            .await;
         // A list that could not be read is read again with a backoff, each failure logged, so
         // the asks it holds still appear.
         let mut delay = RESUME_READ_RETRY_FIRST;
@@ -3719,6 +3726,11 @@ impl OpenCodeSessionRuntime {
                 () = owner_cancellation.cancelled() => {}
                 () = async {
                     runtime.v2_show_recovered_asks(asks).await;
+                    // The asks it kept are shown: the resumed session may take queued
+                    // messages (#187).
+                    runtime
+                        .emit("session.recovery-settled", None, None, json!({}))
+                        .await;
                     runtime.v2_read_asks_again().await;
                 } => {}
             }
@@ -6315,6 +6327,9 @@ mod tests {
         let resolved = runtime.next_event().await.expect("resolution");
         assert_eq!(resolved.event_type, "request.resolved");
         runtime.v1_show_recovered_asks(Vec::new()).await;
+        // Recovery shows no ask and only reports that it settled (#187).
+        let settled = runtime.next_event().await.expect("recovery settled");
+        assert_eq!(settled.event_type, "session.recovery-settled");
         assert_no_queued_event(&runtime).await;
         assert!(runtime.inner.pending_permissions.lock().await.is_empty());
         server.abort();
