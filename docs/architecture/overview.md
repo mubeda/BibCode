@@ -3125,3 +3125,13 @@ view), or free scrolling.
   released row then only goes on holding the reader's place. A send names its
   row pending before the previous row stops being positioned, so a takeover
   releases the pending row first.
+- **Settling.** The glide settles on `scrollend` or after 750 ms, whichever
+  comes first. A turn taller than the view is pinned where it is and then
+  follows its end. A turn that fits lands its sent row by measuring the row
+  on screen (`[data-message-id]` against the scroller's top), not from
+  LegendList's positions, with at most two non-animated landings, each
+  waiting up to 1 s for LegendList to finish it, so a landing clamped to
+  content that had not caught up is measured and landed again. Following
+  waits until then. A takeover, a later send (its glide replaces the landing)
+  or another thread (the timeline remounts, and LegendList drops its
+  requests) ends the landing; only a takeover needs to withdraw it.

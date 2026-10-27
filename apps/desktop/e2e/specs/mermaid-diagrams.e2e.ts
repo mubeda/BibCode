@@ -64,6 +64,8 @@ interface StreamSample {
    */
   readonly endBelow: number | null;
   readonly diagramDrawn: boolean;
+  /** Where the reply's sent row starts below the visible top, or null while it is unmounted. */
+  readonly sentRowTop: number | null;
 }
 
 interface KeyboardSample {
@@ -657,7 +659,17 @@ describe("packaged Mermaid diagrams", () => {
     await browser.pause(600);
     const sentRows = await userRowOffsets(mermaidFixturePrompts.short);
     expect(sentRows).toHaveLength(1);
-    expect(Math.abs(sentRows[0]! - SENT_ROW_ANCHOR_OFFSET)).toBeLessThanOrEqual(1);
+    const sentRowOff = sentRows[0]! - SENT_ROW_ANCHOR_OFFSET;
+    // Labelled, so a failure says where the row rested and how far off (#191).
+    expect({
+      top: sentRows[0],
+      expected: SENT_ROW_ANCHOR_OFFSET,
+      withinPx: Math.abs(sentRowOff) <= 1,
+    }).toEqual({
+      top: sentRows[0],
+      expected: SENT_ROW_ANCHOR_OFFSET,
+      withinPx: true,
+    });
     await saveEvidence("mermaid-timeline-sent-row");
 
     // Minimap navigation still lands where the minimap puts it, past the diagrams above.
@@ -1088,6 +1100,12 @@ describe("packaged Mermaid diagrams", () => {
     );
     expect(diagramRests.has(drewAfter)).toBe(true);
     expect(endsHidden).toEqual([]);
+    // Once settled, neither reply's sent row rests below its offset (#191): a turn taller than
+    // the view follows its end, which takes the row above it.
+    expect([
+      ...sentRowsBelowOffset("plain", plain, plainFrom),
+      ...sentRowsBelowOffset("diagram", diagram, checkedFrom),
+    ]).toEqual([]);
     await saveEvidence("mermaid-timeline-streaming-follow");
   }).timeout(240_000);
 
@@ -1417,7 +1435,7 @@ async function streamAndSampleEnd(prompt: string): Promise<StreamSample[]> {
   }, visibleSurfaceSelector);
   await browser.pause(1_000);
   await browser.execute(
-    (surface: string, lastLine: string) => {
+    (surface: string, lastLine: string, sentPrompt: string) => {
       const record = window as unknown as {
         __bibcodeStreamSamples?: StreamSample[];
         __bibcodeStreamStop?: () => void;
@@ -1489,6 +1507,17 @@ async function streamAndSampleEnd(prompt: string): Promise<StreamSample[]> {
             return Math.round(end - Math.min(area.bottom, composerTop ?? area.bottom));
           })(),
           diagramDrawn: drawn() > drawnBefore,
+          sentRowTop: (() => {
+            // Both replies' prompts differ; the newest row sent with this one is the lowest.
+            const rows = [
+              ...document.querySelectorAll<HTMLElement>(`${surface} [data-message-role="user"]`),
+            ].filter((row) => row.textContent?.includes(sentPrompt));
+            const area = scroller?.getBoundingClientRect();
+            if (rows.length === 0 || !area) return null;
+            return Math.round(
+              Math.max(...rows.map((row) => row.getBoundingClientRect().top)) - area.top,
+            );
+          })(),
         };
       };
       // A message posted from a frame callback is handled once that frame has painted.
@@ -1507,6 +1536,7 @@ async function streamAndSampleEnd(prompt: string): Promise<StreamSample[]> {
     },
     visibleSurfaceSelector,
     mermaidFixtureStreamedLastLine,
+    prompt,
   );
   await sendPrompt(prompt);
   await browser.waitUntil(
@@ -1542,6 +1572,27 @@ function restingEnds(samples: readonly StreamSample[]): Map<number, number> {
     rests.set(entry.afterParagraphs + (entry.finished ? 1 : 0), entry.endBelow);
   }
   return rests;
+}
+
+/** The painted frames from `from` on whose sent row starts more than 1 px below its offset. */
+function sentRowsBelowOffset(
+  reply: string,
+  samples: readonly StreamSample[],
+  from: number,
+): Array<{ reply: string; at: number; sentRowTop: number; expectedAtMost: number }> {
+  return samples
+    .filter(
+      (entry) =>
+        entry.at >= from &&
+        entry.sentRowTop !== null &&
+        entry.sentRowTop > SENT_ROW_ANCHOR_OFFSET + 1,
+    )
+    .map((entry) => ({
+      reply,
+      at: Math.round(entry.at),
+      sentRowTop: entry.sentRowTop!,
+      expectedAtMost: SENT_ROW_ANCHOR_OFFSET + 1,
+    }));
 }
 
 /** A reply's end counts as revealed this far below the usable bottom: a pixel of rounding. */
@@ -1675,6 +1726,7 @@ function streamChanges(samples: readonly StreamSample[]): StreamSample[] {
       entry.afterParagraphs !== all[index - 1]!.afterParagraphs ||
       entry.endGap !== all[index - 1]!.endGap ||
       entry.endBelow !== all[index - 1]!.endBelow ||
-      entry.diagramDrawn !== all[index - 1]!.diagramDrawn,
+      entry.diagramDrawn !== all[index - 1]!.diagramDrawn ||
+      entry.sentRowTop !== all[index - 1]!.sentRowTop,
   );
 }

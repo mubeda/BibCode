@@ -2,6 +2,7 @@ import { describe, expect, it } from "vite-plus/test";
 import {
   getAnchoredTurnMetrics,
   getRowBottom,
+  getSentRowLandingDelta,
   getTimelinePageScrollOffset,
   isAboveReadingLine,
   keyboardScrollStopsLiveFollow,
@@ -270,5 +271,20 @@ describe("keyboard scrolling of the timeline", () => {
       expect(press(key, { scrollTop: 600 })).toBe(true);
     }
     expect(press(" ", { shiftKey: true, scrollTop: 0 })).toBe(false);
+  });
+});
+
+describe("sent row landing", () => {
+  it("measures how far the row rests from its offset below the scroller's top", () => {
+    expect(getSentRowLandingDelta({ rowTop: 140, viewportTop: 100, anchorOffset: 16 })).toBe(24);
+    expect(getSentRowLandingDelta({ rowTop: 104, viewportTop: 100, anchorOffset: 16 })).toBe(-12);
+  });
+
+  it("leaves a row within a pixel of its offset where it is", () => {
+    expect(getSentRowLandingDelta({ rowTop: 116, viewportTop: 100, anchorOffset: 16 })).toBeNull();
+    expect(getSentRowLandingDelta({ rowTop: 117, viewportTop: 100, anchorOffset: 16 })).toBeNull();
+    expect(getSentRowLandingDelta({ rowTop: 114.5, viewportTop: 100, anchorOffset: 16 })).toBe(
+      -1.5,
+    );
   });
 });

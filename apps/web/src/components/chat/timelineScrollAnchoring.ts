@@ -96,6 +96,23 @@ export function keyboardScrollStopsLiveFollow(
   return scroller.scrollTop > 1;
 }
 
+/**
+ * How far the timeline must scroll for a sent row to rest `anchorOffset` below the scroller's
+ * top, measured on screen (#191), or null when it is already within a pixel of there.
+ */
+export function getSentRowLandingDelta({
+  rowTop,
+  viewportTop,
+  anchorOffset,
+}: {
+  readonly rowTop: number;
+  readonly viewportTop: number;
+  readonly anchorOffset: number;
+}): number | null {
+  const delta = rowTop - viewportTop - anchorOffset;
+  return Math.abs(delta) <= 1 ? null : delta;
+}
+
 /** Programmatic timeline scrolls jump instead of gliding when the user asks for reduced motion. */
 export function timelineScrollAnimates(): boolean {
   return (
