@@ -691,6 +691,27 @@ struct TerminalObserverGenerationInner {
     cancellation_reason: StdMutex<Option<TerminalObserverCancellationReason>>,
     cancellation_requested_while_current: AtomicBool,
     cancellation: CancellationToken,
+    agent_status: watch::Sender<Option<TerminalAgentObservation>>,
+}
+
+/// A terminal agent's main state as its observer last saw it, for the left panel (#187).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TerminalAgentState {
+    Working,
+    Blocked,
+    Waiting,
+    Done,
+}
+
+/// One status observation: the state, whether the turn that ended failed, and when the
+/// observer saw it on this server's clock.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TerminalAgentObservation {
+    pub state: TerminalAgentState,
+    pub failed: bool,
+    pub observed_at: std::time::Instant,
+    /// The same moment on the wall clock: the evidence token clients age from their receipt.
+    pub observed_wall: std::time::SystemTime,
 }
 
 /// Lightweight generation identity shared with provider observer workers.
@@ -747,6 +768,7 @@ impl TerminalObserverGeneration {
                     cancellation_reason: StdMutex::new(None),
                     cancellation_requested_while_current: AtomicBool::new(false),
                     cancellation: cancellation.clone(),
+                    agent_status: watch::channel(None).0,
                 }),
             },
             workers: TerminalObserverWorkerContext {
@@ -852,6 +874,29 @@ impl TerminalObserverGenerationLease {
     /// Fresh UUID assigned to this terminal process generation.
     pub fn id(&self) -> Uuid {
         self.inner.id
+    }
+
+    /// Reports the agent's main state for the left panel (#187). It is independent of the AI
+    /// Terminal activity setting and of activity admission, and only a current generation
+    /// publishes: a replaced or ended one is ignored.
+    pub fn publish_agent_status(&self, state: TerminalAgentState, failed: bool) {
+        if !self.is_current() {
+            return;
+        }
+        self.inner
+            .agent_status
+            .send_replace(Some(TerminalAgentObservation {
+                state,
+                failed,
+                observed_at: std::time::Instant::now(),
+                observed_wall: std::time::SystemTime::now(),
+            }));
+    }
+
+    /// The agent status this generation's observer publishes; the terminal manager mirrors it
+    /// into the terminal's metadata summary.
+    pub fn subscribe_agent_status(&self) -> watch::Receiver<Option<TerminalAgentObservation>> {
+        self.inner.agent_status.subscribe()
     }
 
     /// UUID text used as the activity projection generation ID.
@@ -1432,9 +1477,16 @@ fn next_terminal_activity_generation(generation: u64) -> u64 {
 }
 
 impl TerminalAgentActivityControl {
+    #[cfg(test)]
     pub(crate) fn enabled() -> Self {
+        Self::with_enabled(true)
+    }
+
+    /// A control starting in the AI Terminal activity state its observer launched under: an
+    /// observer launched for status only (#187) publishes no activity until the setting turns on.
+    pub(crate) fn with_enabled(enabled: bool) -> Self {
         let initial_state = TerminalAgentActivityState {
-            enabled: true,
+            enabled,
             generation: 0,
         };
         let (changes, _) = watch::channel(initial_state);

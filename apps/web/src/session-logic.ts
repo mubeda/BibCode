@@ -380,7 +380,11 @@ export function derivePendingApprovals(
       continue;
     }
 
-    if (activity.kind === "approval.resolved" && requestId) {
+    // BiBCode expires a request when its session leaves `running`: nobody holds it any more.
+    if (
+      (activity.kind === "approval.resolved" || activity.kind === "approval.expired") &&
+      requestId
+    ) {
       openByRequestId.delete(requestId);
       continue;
     }
@@ -480,7 +484,10 @@ export function derivePendingUserInputs(
       continue;
     }
 
-    if (activity.kind === "user-input.resolved" && requestId) {
+    if (
+      (activity.kind === "user-input.resolved" || activity.kind === "user-input.expired") &&
+      requestId
+    ) {
       openByRequestId.delete(requestId);
       continue;
     }

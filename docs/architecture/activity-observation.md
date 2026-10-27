@@ -301,6 +301,55 @@ RPC admission, generation fencing, projection, cleanup, and observer lifecycle
 are selected from the request scope; changing one gate does not transition the
 other. Legacy `enableAgentActivity` values migrate only to Chat.
 
+### AI Terminal agent status
+
+Every observable AI Terminal (Claude, Codex, OpenCode) launches with its
+observer, whatever the AI Terminal gate says (#187). The left panel's terminal
+agent status needs the observer.
+
+**What the gate still controls.** The gate decides whether the observer also
+publishes activity:
+
+- An observer launched while the gate is off starts dormant
+  (`TerminalAgentActivityControl::with_enabled(false)`, a `Prepared` launch
+  with no admission).
+- A dormant observer follows later gate transitions like any other observer.
+
+**How each provider reports.** Each observer reports its main agent's state
+through its generation (`TerminalObserverGenerationLease::publish_agent_status`),
+independently of admission:
+
+- **Claude:** status hooks on the existing authenticated loopback receiver.
+  The hooks are `SessionStart`, `UserPromptSubmit`, `PermissionRequest`,
+  `Notification`, `Stop`, `StopFailure` and `SessionEnd`, plus main-agent
+  `PreToolUse` and `PostToolUse`. Status-only hooks never reach the activity
+  worker. Activity admission is still taken before the body arrives.
+- **Codex:** the TUI root thread's `thread/status/changed` notifications
+  (including `activeFlags`), `turn/started` and `turn/completed`.
+- **OpenCode:** root-session `session.status`, `session.idle`,
+  `session.error`, permission and question events, read from a dormant stream
+  too.
+
+**Publication.** The terminal manager mirrors the latest report into
+`TerminalSummary.agentStatus` on the metadata stream:
+
+- A changed state is mirrored at once.
+- An unchanged report refreshes its age at most once a minute.
+- The age (`ageMs`) and the evidence token (`observedAt`) are computed when the
+  summary is serialized, so the metadata snapshot that starts each subscription
+  carries current ages.
+- A launch that names a provider but gets no observer reads `unavailable`.
+  That covers Cursor and Grok, Windows, and a failed preparation, and the value
+  stays `unavailable` after exit. An observed agent settles to `done` on exit,
+  failed for a non-zero exit code.
+
+**Trust boundary.** It is unchanged. Hooks still reach only a `127.0.0.1`
+listener with a per-generation bearer token, checked in constant time, and
+settings owned by that generation. Codex still uses its generation's
+Unix-socket helper. The status carries only the derived state, never prompt,
+message or terminal content. The change is in reach: every observable AI
+Terminal now runs an observer, not only terminals launched with the gate on.
+
 ### Codex structured recovery
 
 Codex structured recovery merges validated, bounded live and root/child-history

@@ -87,9 +87,41 @@ badge.
 
 The view's list column provides a filter, grouping by **Status** (the default),
 **Project**, or **Environment**, an unread-only bell, and a menu with **Mark all
-read**. Status groups have counts and appear in fixed **Working** → **Pending
-Approval** → **Awaiting Input** → **Done** order, with Done collapsed by
-default. Each row opens with the project name, the provider icon, the status
+read**. Status groups have counts and appear in a fixed order, with Done
+collapsed by default:
+
+1. **Working**
+2. **Pending Approval**
+3. **Awaiting Input**
+4. **Unknown**
+5. **Done**
+
+Each agent gets its own row: a thread's chat, and each AI Terminal it hosts,
+even in a workspace with no chat session. Selecting a terminal row shows that
+terminal.
+
+**Unknown** holds agents whose status BiBCode cannot vouch for. The row's label
+says why:
+
+- **No update:** the agent was Working but has reported nothing for 30 minutes.
+- **Offline:** its environment is disconnected.
+- **Status unavailable:** BiBCode has no way to observe it. That applies to
+  Cursor and Grok terminals, and to every AI Terminal on Windows.
+
+A session that failed reads **Failed** in Done.
+
+**Which AI Terminals report a status.** On macOS and Linux, Claude, Codex and
+OpenCode AI Terminals report their agent's status. Claude needs Claude Code
+v2.1.63 or later. These terminals run with BiBCode's status observer even when
+**AI Terminal** activity is off; that setting now controls only the detailed
+Subagents and Background Tasks activity.
+
+**Requests the agent stopped waiting on.** An approval or question left
+unanswered when its turn ended (Stop, a crash, a restart) is expired and
+leaves Pending Approval and Awaiting Input.
+
+**Workspace cards.** A card's status glyph includes its AI Terminals. A dashed
+circle means an agent whose status is unknown, and it never reads Done. Each row opens with the project name, the provider icon, the status
 dot, and the relative time, then shows the branch as its main line (the
 checkout's current branch, as in the left panel), the thread
 title, a one-line conversation preview, and a footer with the status, the
