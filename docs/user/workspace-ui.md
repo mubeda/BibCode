@@ -67,13 +67,16 @@ Awaiting Input), **Working**, and **Done**. An agent whose status is unknown
 (stale, not observable on this platform, or on a disconnected environment)
 counts only under All Agents. One tile is always selected, and the list below
 shows that tile's agents, most recent activity first, with the same rows as
-the Agents view. The first time you open the Inbox it selects Needs Attention
-when an agent needs you, otherwise All Agents once every environment has
-reported; the selected tile is then remembered on this device, and picking
-another tile replaces it. When the list may be incomplete, a note above it says
-why: a named server is not connected (with **Open Remote Servers**, or
-**Diagnostics** for this machine), a server is reconnecting, or the saved
-servers couldn't be read (with **Diagnostics**).
+the Agents view. Until you pick a tile, the Inbox shows Needs Attention while
+an agent needs you, otherwise All Agents, and remembers that choice on this
+device only once every environment has reported; a tile you pick is
+remembered at once. Counts show a dash while agents load. When the list may be
+incomplete, a note above it says why: a named server needs attention (its
+data must be recovered, moved or reconfigured; **Show in Environments**
+switches to Environments with that server selected), is not connected (with
+**Open Remote Servers**, or **Diagnostics** for this machine), or is
+reconnecting, or the saved servers couldn't be read (with **Diagnostics**).
+The Intel-build warning and local backend notices appear in the Inbox too.
 Selecting an agent marks it read and opens its worktree with that agent in
 front: its chat (brought back if you had closed every tab), its chat panel, or
 its AI Terminal. The row stays highlighted while that agent is on screen.
