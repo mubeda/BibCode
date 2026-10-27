@@ -983,7 +983,16 @@ describe("packaged Mermaid diagrams", () => {
     const diagram = await streamAndSampleEnd(mermaidFixturePrompts.streamed);
     NodeFS.writeFileSync(
       NodePath.join(preparedArtifactDirectory, "mermaid-timeline-streaming-follow.json"),
-      JSON.stringify({ plain: streamChanges(plain), diagram: streamChanges(diagram) }, null, 2),
+      JSON.stringify(
+        {
+          plain: streamChanges(plain),
+          diagram: streamChanges(diagram),
+          // Diagnostic only: painted frames from each delivery's first to its end revealed.
+          framesToReveal: { plain: framesToReveal(plain), diagram: framesToReveal(diagram) },
+        },
+        null,
+        2,
+      ),
     );
     expect(plain.some((entry) => entry.diagramDrawn)).toBe(false);
     const drew = diagram.findIndex((entry) => entry.diagramDrawn);
@@ -1005,31 +1014,32 @@ describe("packaged Mermaid diagrams", () => {
       STREAMED_REST_SLACK_PX,
     );
     expect(diagram.at(-1)!.lastLineInView).toBe(true);
-    // The diagram's own growth is followed too: after each delivery from the one the diagram
-    // drew in, before the next one lands, the reply's end is revealed as far as the plain
-    // reply's is. A slow webview can paint no frame between two of the plain reply's
-    // deliveries; there the end must simply be revealed. The growth itself is followed once
-    // LegendList reports the size and two frames pass, so on a slow runner the next delivery
-    // can land first; the draw's delivery then passes when the end shows within
-    // DRAW_FOLLOW_MS of the draw.
     // Following waits while the sent row glides into place, so on a slow webview the first
     // deliveries, and the draw, can land before the list first catches up with the end. The
-    // glide settles within its 750 ms positioning timer and a few frames, so every delivery
-    // resting after the earlier of the catch-up and SENT_ROW_SETTLE_MS is checked; a list that
-    // catches up late fails on the deliveries in between.
+    // glide settles within its 750 ms positioning timer and a few frames, so each reply is
+    // checked from the earlier of its catch-up and SENT_ROW_SETTLE_MS after its first delivery;
+    // a list that catches up late fails on the deliveries in between.
+    //
+    // The plain reply is bounded on its own: from there on, every delivery comes to rest with
+    // the reply's end revealed. Each of those deliveries must have painted a resting frame, so
+    // a webview that painted none, or a reply that stayed hidden and caught up only at its end,
+    // fails instead of passing on what it did not show.
     const plainRests = restingEnds(plain);
+    const plainFrom = settledFrom(plain, () => REVEALED_PX);
+    const plainSettled = settledRests(plain, plainFrom);
+    expect(missingDeliveries("plain", plain, plainFrom, plainSettled)).toEqual([]);
+    expect(hiddenRests("plain", plain, plainFrom, plainSettled, () => REVEALED_PX)).toEqual([]);
+    // The diagram's own growth is followed too: after each delivery from the one the diagram
+    // drew in, before the next one lands, the reply's end is revealed as far as the plain
+    // reply's is, which the check above holds within REVEALED_PX. A delivery the plain reply
+    // painted no rest for, before its settling, must simply be revealed. The growth itself is
+    // followed once LegendList reports the size and two frames pass, so on a slow runner the
+    // next delivery can land first; the draw's delivery then passes when the end shows within
+    // DRAW_FOLLOW_MS of the draw.
     const diagramRests = restingEnds(diagram);
-    const revealedBelow = (delivered: number) => Math.max(plainRests.get(delivered) ?? 0, 0) + 1;
-    const caughtUp = diagram.find(
-      (entry) =>
-        entry.fenceShown &&
-        entry.endBelow !== null &&
-        entry.endBelow <= revealedBelow(entry.afterParagraphs),
-    );
-    const checkedFrom = Math.min(
-      caughtUp?.at ?? Number.POSITIVE_INFINITY,
-      diagram[firstStreamed]!.at + SENT_ROW_SETTLE_MS,
-    );
+    const revealedBelow = (delivered: number) =>
+      Math.max(plainRests.get(delivered) ?? 0, 0) + REVEALED_PX;
+    const checkedFrom = settledFrom(diagram, revealedBelow);
     const drewAfter = diagram[drew]!.afterParagraphs;
     const drawAt = diagram[drew]!.at;
     const drawFollowed = diagram
@@ -1038,25 +1048,27 @@ describe("packaged Mermaid diagrams", () => {
         (entry) =>
           entry.endBelow !== null && entry.endBelow <= revealedBelow(entry.afterParagraphs),
       );
+    const diagramSettled = settledRests(diagram, checkedFrom);
+    expect(missingDeliveries("diagram", diagram, checkedFrom, diagramSettled)).toEqual([]);
     // The draw's grace covers only a delivery that rested within that time, when the next one
     // landed before the follow; a later rest of that delivery is checked like the others.
-    const restingSamples = new Map<number, number>();
-    for (const [index, entry] of diagram.entries()) {
-      if (!entry.fenceShown || entry.endBelow === null) continue;
-      restingSamples.set(entry.afterParagraphs + (entry.finished ? 1 : 0), index);
-    }
-    const endsHidden = [...restingSamples]
-      .filter(([delivered, index]) => delivered >= drewAfter && diagram[index]!.at >= checkedFrom)
-      .filter(
-        ([delivered, index]) =>
-          !(
-            delivered === drewAfter &&
-            drawFollowed &&
-            diagram[index]!.at <= drawAt + DRAW_FOLLOW_MS
-          ),
-      )
-      .map(([delivered, index]) => [delivered, diagram[index]!.endBelow!] as const)
-      .filter(([delivered, below]) => below > revealedBelow(delivered));
+    const endsHidden = hiddenRests(
+      "diagram",
+      diagram,
+      checkedFrom,
+      new Map(
+        [...diagramSettled].filter(
+          ([delivered, index]) =>
+            delivered >= drewAfter &&
+            !(
+              delivered === drewAfter &&
+              drawFollowed &&
+              diagram[index]!.at <= drawAt + DRAW_FOLLOW_MS
+            ),
+        ),
+      ),
+      revealedBelow,
+    );
     expect(diagramRests.has(drewAfter)).toBe(true);
     expect(endsHidden).toEqual([]);
     await saveEvidence("mermaid-timeline-streaming-follow");
@@ -1199,6 +1211,126 @@ function restingEnds(samples: readonly StreamSample[]): Map<number, number> {
     rests.set(entry.afterParagraphs + (entry.finished ? 1 : 0), entry.endBelow);
   }
   return rests;
+}
+
+/** A reply's end counts as revealed this far below the usable bottom: a pixel of rounding. */
+const REVEALED_PX = 1;
+
+/** The delivery a sample shows: paragraphs after the code block, and the last line as one more. */
+function deliveryOf(entry: StreamSample): number {
+  return entry.afterParagraphs + (entry.finished ? 1 : 0);
+}
+
+/**
+ * When a reply's sent row has settled for the follow checks: the earlier of the first frame
+ * whose end is revealed (within `revealedBelow` for its delivery) once its code block shows,
+ * and SENT_ROW_SETTLE_MS after its first delivery.
+ */
+function settledFrom(
+  samples: readonly StreamSample[],
+  revealedBelow: (delivered: number) => number,
+): number {
+  const firstStreamed = samples.find((entry) => entry.streaming);
+  const caughtUp = samples.find(
+    (entry) =>
+      entry.fenceShown &&
+      entry.endBelow !== null &&
+      entry.endBelow <= revealedBelow(entry.afterParagraphs),
+  );
+  return Math.min(
+    caughtUp?.at ?? Number.POSITIVE_INFINITY,
+    (firstStreamed?.at ?? Number.POSITIVE_INFINITY) + SENT_ROW_SETTLE_MS,
+  );
+}
+
+/**
+ * Each delivery's resting frame, the last painted frame before the next delivery, for the
+ * deliveries that rested at or after `from`, by delivery.
+ */
+function settledRests(samples: readonly StreamSample[], from: number): Map<number, number> {
+  const rests = new Map<number, number>();
+  for (const [index, entry] of samples.entries()) {
+    if (!entry.fenceShown || entry.endBelow === null) continue;
+    rests.set(deliveryOf(entry), index);
+  }
+  return new Map([...rests].filter(([, index]) => samples[index]!.at >= from));
+}
+
+/**
+ * The deliveries from the first one shown after the reply settled through its last line that
+ * have no resting frame, so nothing showed where their end came to rest. A reply that never
+ * settled or finished counts as one missing delivery.
+ */
+function missingDeliveries(
+  reply: string,
+  samples: readonly StreamSample[],
+  from: number,
+  rests: ReadonlyMap<number, number>,
+): Array<{ reply: string; delivered: number; settledFrom: number }> {
+  const finished = samples.find((entry) => entry.finished);
+  if (!Number.isFinite(from) || !finished) {
+    return [{ reply, delivered: Number.NaN, settledFrom: from }];
+  }
+  const firstSettled = samples.find((entry) => entry.fenceShown && entry.at >= from);
+  if (!firstSettled) {
+    return [{ reply, delivered: Number.NaN, settledFrom: Math.round(from) }];
+  }
+  const first = deliveryOf(firstSettled);
+  const last = deliveryOf(finished);
+  const missing: Array<{ reply: string; delivered: number; settledFrom: number }> = [];
+  for (let delivered = first; delivered <= last; delivered += 1) {
+    if (!rests.has(delivered)) missing.push({ reply, delivered, settledFrom: Math.round(from) });
+  }
+  return missing;
+}
+
+/** The resting frames in `rests` whose reply's end lies further below than `revealedBelow`. */
+function hiddenRests(
+  reply: string,
+  samples: readonly StreamSample[],
+  from: number,
+  rests: ReadonlyMap<number, number>,
+  revealedBelow: (delivered: number) => number,
+): Array<{
+  reply: string;
+  delivered: number;
+  at: number;
+  endBelow: number;
+  allowed: number;
+  settledFrom: number;
+}> {
+  return [...rests]
+    .map(([delivered, index]) => ({
+      reply,
+      delivered,
+      at: Math.round(samples[index]!.at),
+      endBelow: samples[index]!.endBelow!,
+      allowed: revealedBelow(delivered),
+      settledFrom: Math.round(from),
+    }))
+    .filter((rest) => rest.endBelow > rest.allowed);
+}
+
+/**
+ * For each delivery once the code block shows, how many painted frames passed from its first
+ * frame until the reply's end was revealed, or null when it was not revealed before the next.
+ */
+function framesToReveal(samples: readonly StreamSample[]): Record<number, number | null> {
+  const frames: Record<number, number | null> = {};
+  let current: number | null = null;
+  let count = 0;
+  for (const entry of samples) {
+    if (!entry.fenceShown || entry.endBelow === null) continue;
+    const delivered = deliveryOf(entry);
+    if (delivered !== current) {
+      current = delivered;
+      count = 0;
+      frames[delivered] = null;
+    }
+    if (frames[delivered] === null && entry.endBelow <= REVEALED_PX) frames[delivered] = count;
+    count += 1;
+  }
+  return frames;
 }
 
 /** The samples where something changed, for a trace artifact that holds no message text. */
