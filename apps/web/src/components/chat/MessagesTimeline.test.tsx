@@ -473,6 +473,23 @@ describe("MessagesTimeline", () => {
     expect(onAnchorSizeChanged).toHaveBeenCalledWith(secondEntry.message.id, 240);
   });
 
+  it("stops LegendList keeping the list at its end once the reader scrolled away", async () => {
+    const { MessagesTimeline } = await import("./MessagesTimeline");
+    // The composer grew, as the Activity card opening makes the bottom region grow; a list the
+    // reader scrolled away from must not be moved to its end for it.
+    const markup = renderToStaticMarkup(
+      <MessagesTimeline
+        {...buildProps()}
+        timelineEntries={[buildUserTimelineEntry("hello")]}
+        contentInsetEndAdjustment={180}
+        followsEnd={false}
+      />,
+    );
+
+    expect(markup).toContain('data-content-inset-end="180"');
+    expect(markup).not.toContain('data-maintain-scroll-at-end="enabled"');
+  });
+
   it("renders collapse controls for long user messages", async () => {
     const { MessagesTimeline } = await import("./MessagesTimeline");
     const markup = renderToStaticMarkup(

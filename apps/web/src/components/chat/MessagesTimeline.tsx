@@ -100,6 +100,7 @@ import {
   TOOL_ROW_DISCLOSURE_KEY,
   resolveAssistantMessageCopyState,
   resolveTimelineIsAtEnd,
+  resolveTimelineMaintainScrollAtEnd,
   resolveTimelineMinimapHasPersistentGutter,
   resolveTimelineMinimapHeightStyle,
   resolveTimelineMinimapIndexFromPointer,
@@ -223,6 +224,11 @@ interface MessagesTimelineProps {
   listRef: React.RefObject<LegendListRef | null>;
   /** Called with the list once it mounts, and with null once it unmounts. */
   onListMount?: (list: LegendListRef | null) => void;
+  /**
+   * Whether the timeline follows its end. False once the reader has scrolled away, so a change
+   * in the bottom region's height leaves the line they read in place. Defaults to true.
+   */
+  followsEnd?: boolean;
   timelineEntries: ReturnType<typeof deriveTimelineEntries>;
   queuedMessages: ReadonlyArray<TimelineMessage>;
   queuedStatuses: ReadonlyArray<QueuedCardStatus>;
@@ -288,6 +294,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   activeTurnStartedAt,
   listRef,
   onListMount,
+  followsEnd = true,
   timelineEntries,
   queuedMessages,
   queuedStatuses,
@@ -664,18 +671,10 @@ export const MessagesTimeline = memo(function MessagesTimeline({
                   recycleItems={false}
                   {...(anchoredEndSpace ? { anchoredEndSpace } : {})}
                   contentInsetEndAdjustment={contentInsetEndAdjustment}
-                  maintainScrollAtEnd={
-                    anchoredEndSpace
-                      ? false
-                      : {
-                          animated: false,
-                          on: {
-                            dataChange: true,
-                            itemLayout: true,
-                            layout: true,
-                          },
-                        }
-                  }
+                  maintainScrollAtEnd={resolveTimelineMaintainScrollAtEnd({
+                    anchored: !!anchoredEndSpace,
+                    followsEnd,
+                  })}
                   // A row that changes size above the first visible one, such as a Mermaid
                   // diagram replacing its source, keeps the line the user reads in place.
                   maintainVisibleContentPosition={{

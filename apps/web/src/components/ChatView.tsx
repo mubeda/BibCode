@@ -4048,6 +4048,11 @@ function ChatViewContent(props: ChatViewProps) {
   } | null>(null);
   const anchorScrollRestoreFrameRef = useRef<number | null>(null);
   const followTimelineLiveEndRef = useRef<() => void>(() => undefined);
+  // Whether the timeline follows its end, as state so LegendList stops keeping the list at its
+  // end once the reader scrolls away: otherwise a change in the bottom region's height (the
+  // composer growing, the Activity card opening) moves a list near its end, or a thread
+  // shorter than the view, back to the end and takes the reader's line away.
+  const [timelineFollowsEnd, setTimelineFollowsEnd] = useState(true);
   // The sent row the reader scrolled away from. LegendList reports it ready again whenever the
   // anchored end space changes size, as each delivery does, and positioning it then would take
   // the reader's place away, so it stays released until the next send or thread (#190).
@@ -4068,6 +4073,7 @@ function ChatViewContent(props: ChatViewProps) {
     anchorUserScrollGenerationRef.current += 1;
     timelineScrollModeRef.current = "free-scrolling";
     liveFollowUserScrollGenerationRef.current = null;
+    setTimelineFollowsEnd(false);
     pendingTimelineAnchorRef.current = null;
     positionedTimelineAnchorRef.current = null;
     settledTimelineAnchorRef.current = null;
@@ -4138,6 +4144,7 @@ function ChatViewContent(props: ChatViewProps) {
   const scrollToEnd = useCallback((animated = false) => {
     isAtEndRef.current = true;
     timelineScrollModeRef.current = "following-end";
+    setTimelineFollowsEnd(true);
     liveFollowUserScrollGenerationRef.current = anchorUserScrollGenerationRef.current;
     pendingTimelineAnchorRef.current = null;
     activeTimelineAnchorIndexRef.current = null;
@@ -4392,11 +4399,13 @@ function ChatViewContent(props: ChatViewProps) {
     if (isAtEnd) {
       timelineScrollModeRef.current = "following-end";
       liveFollowUserScrollGenerationRef.current = anchorUserScrollGenerationRef.current;
+      setTimelineFollowsEnd(true);
       showScrollDebouncer.current.cancel();
       setScrollPillThreadId(null);
     } else {
       timelineScrollModeRef.current = "free-scrolling";
       liveFollowUserScrollGenerationRef.current = null;
+      setTimelineFollowsEnd(false);
       showScrollDebouncer.current.maybeExecute(scrollPillThreadIdRef.current);
     }
   }, []);
@@ -4610,6 +4619,7 @@ function ChatViewContent(props: ChatViewProps) {
     setViewStateThreadId(activeThreadId);
     setPullRequestDialogState(null);
     setScrollPillThreadId(null);
+    setTimelineFollowsEnd(true);
     setIsRevertingCheckpoint(false);
   }
 
@@ -6107,6 +6117,7 @@ function ChatViewContent(props: ChatViewProps) {
         queuedMessageCache.remember(messageIdForSend, { attachments: composerAttachmentsSnapshot });
         isAtEndRef.current = true;
         timelineScrollModeRef.current = "following-end";
+        setTimelineFollowsEnd(true);
         trackTimelineScroll(
           outstandingTimelineScrollsRef,
           legendListRef.current?.scrollToEnd?.({ animated: false }),
@@ -6121,6 +6132,7 @@ function ChatViewContent(props: ChatViewProps) {
         liveFollowUserScrollGenerationRef.current = anchorUserScrollGenerationRef.current;
         pendingTimelineAnchorRef.current = messageIdForSend;
         releasedTimelineAnchorRef.current = null;
+        setTimelineFollowsEnd(true);
         activeTimelineAnchorIndexRef.current = null;
         showScrollDebouncer.current.cancel();
         setScrollPillThreadId(null);
@@ -6704,6 +6716,7 @@ function ChatViewContent(props: ChatViewProps) {
       liveFollowUserScrollGenerationRef.current = anchorUserScrollGenerationRef.current;
       pendingTimelineAnchorRef.current = messageIdForSend;
       releasedTimelineAnchorRef.current = null;
+      setTimelineFollowsEnd(true);
       activeTimelineAnchorIndexRef.current = null;
       showScrollDebouncer.current.cancel();
       setScrollPillThreadId(null);
@@ -7459,6 +7472,7 @@ function ChatViewContent(props: ChatViewProps) {
                       activeTurnStartedAt={activeWorkStartedAt}
                       listRef={legendListRef}
                       onListMount={onTimelineListMount}
+                      followsEnd={timelineFollowsEnd}
                       timelineEntries={timelineEntries}
                       queuedMessages={queuedMessages}
                       queuedStatuses={queuedStatuses}
