@@ -3391,7 +3391,11 @@ after each painted frame, as `mermaid-timeline-evicted-remount.json`. A second
 reply of 101 diagrams then evicts every earlier one; scrolling up remounts the
 rows reply, whose diagram shows its source and draws again above the message
 being read, which stays within 1 px on every painted frame
-(`mermaid-timeline-cold-draw.json`). Last, the fixture provider streams the
+(`mermaid-timeline-cold-draw.json`). The case first waits up to 15 s, at
+the end, for the rows reply's row to unmount; if it does not, the failure and
+`mermaid-timeline-unmount-wait.json` list the mounted rows, LegendList's
+container count, the scroll metrics and the viewport, and say when the window
+came up smaller than the 1400×900 the case asks for. Last, the fixture provider streams the
 same reply twice, one delta every 300 ms, first with the diagram's source in a
 plain code block and then as a sequence diagram, the scenario's only one, whose
 chunk loads after its source shows, so it replaces the source at the end while
@@ -3399,10 +3403,14 @@ more text streams. Once each reply's sent row has settled (the list first
 catches up with the end, within 2.5 s of the first delivery), every delivery
 of the plain reply after its code block shows that paints a resting frame (the
 last before the next delivery) rests with the reply's end revealed, at most
-1 px below the composer's top. A slow runner can paint no frame between two
-deliveries, so such a delivery is recorded
-(`mermaid-timeline-streaming-unpainted.json`) rather than failed, but each
-reply must settle, finish and paint at least five resting frames. Each delivery
+1 px below the composer's top. How many deliveries paint a resting frame
+follows the webview's paint rate (on the Linux runners WebKitGTK painted the
+plain reply 360–850 ms apart, and six deliveries landed between two of its
+frames, each of which showed the end revealed), so a
+delivery with no painted frame is recorded, with each reply's frame count and
+median frame gap, in `mermaid-timeline-streaming-unpainted.json` rather than
+failed; each reply must still settle, finish and paint at least one resting
+frame after settling, and every resting frame it paints is bounded. Each delivery
 of the diagram reply from its draw on rests no lower below the composer than
 the plain reply's (or, after a delivery the plain reply painted no rest for,
 is revealed); the draw's own delivery may take 200 ms to be followed. The

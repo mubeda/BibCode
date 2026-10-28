@@ -943,23 +943,7 @@ describe("packaged Mermaid diagrams", () => {
       { timeoutMsg: "The second 101 diagrams never drew.", timeout: 240_000, interval: 1_000 },
     );
     await expectPaintingWebview();
-    await browser.waitUntil(
-      () =>
-        browser.execute(
-          (surface: string, diagramLabel: string) => {
-            const scroller = document.querySelector<HTMLElement>(
-              `${surface} [class*='overflow-anchor']`,
-            );
-            if (scroller) scroller.scrollTop = scroller.scrollHeight;
-            return ![
-              ...document.querySelectorAll<HTMLElement>(`${surface} .chat-markdown-codeblock`),
-            ].some((element) => element.textContent?.includes(diagramLabel));
-          },
-          visibleSurfaceSelector,
-          "Fixture draw",
-        ),
-      { timeoutMsg: "The rows reply's diagram never unmounted.", timeout: 15_000, interval: 500 },
-    );
+    await waitForRowsReplyUnmount({ width: 1_400, height: 900 }, "Fixture draw");
     await startReadingLineSamples(mermaidFixturePrompts.long, "Fixture draw");
     for (let step = 0; ; step += 1) {
       // Two replies of 101 diagrams lie between the end and the rows reply.
@@ -1073,11 +1057,13 @@ describe("packaged Mermaid diagrams", () => {
     // a list that catches up late fails on the deliveries in between.
     //
     // The plain reply is bounded on its own: from there on, every delivery that painted a
-    // resting frame rests with the reply's end revealed. A slow runner can paint no frame
-    // between two 300 ms deliveries, so such a delivery is recorded rather than failed, but
-    // each reply must settle, finish, and paint at least MIN_SETTLED_RESTS resting frames, so
-    // a webview that painted none, or a reply that stayed hidden and caught up only at its end,
-    // still fails instead of passing on what it did not show.
+    // resting frame rests with the reply's end revealed. How many deliveries paint one depends
+    // on how often the webview paints: on the Linux runners WebKitGTK painted the plain reply
+    // 360-850 ms apart, and six deliveries landed between two of its frames, while each frame it
+    // did paint showed the end revealed. Such a delivery is recorded rather than failed, but each
+    // reply must settle, finish, and paint at least one resting frame after settling, so a
+    // webview that painted none still fails instead of passing on what it did not show, and a
+    // reply that stays hidden fails on every rest it paints.
     const plainRests = restingEnds(plain);
     const plainFrom = settledFrom(plain, () => REVEALED_PX);
     const plainSettled = settledRests(plain, plainFrom);
@@ -1108,7 +1094,18 @@ describe("packaged Mermaid diagrams", () => {
     ];
     NodeFS.writeFileSync(
       NodePath.join(preparedArtifactDirectory, "mermaid-timeline-streaming-unpainted.json"),
-      JSON.stringify(unpainted, null, 2),
+      JSON.stringify(
+        {
+          unpainted,
+          // How often each reply painted after settling, to tell a slow painter from a gap.
+          painted: {
+            plain: paintedAfter(plain, plainFrom, plainSettled),
+            diagram: paintedAfter(diagram, checkedFrom, diagramSettled),
+          },
+        },
+        null,
+        2,
+      ),
     );
     expect({
       settledAndFinished: unpainted.every((entry) => !Number.isNaN(entry.delivered)),
@@ -1614,6 +1611,106 @@ describe("packaged Mermaid diagrams", () => {
   }).timeout(120_000);
 });
 
+/** What the list holds while the cold-draw case waits for the rows reply's row to unmount. */
+interface UnmountWaitState {
+  readonly unmounted: boolean;
+  readonly viewport: { readonly width: number; readonly height: number };
+  readonly screen: { readonly width: number; readonly height: number };
+  readonly scroll: { readonly top: number; readonly height: number; readonly client: number };
+  /** The mounted rows, in screen order: id tail, kind, top below the visible top, height. */
+  readonly rows: ReadonlyArray<{
+    readonly id: string;
+    readonly kind: string | null;
+    readonly top: number;
+    readonly height: number;
+    readonly holdsLabel: boolean;
+  }>;
+  /** LegendList's positioned containers, mounted or empty. */
+  readonly containers: number;
+}
+
+/**
+ * Scrolls the timeline to its end until the row holding `diagramLabel` unmounts, as the
+ * cold-draw case needs. On a timeout the failure, and `mermaid-timeline-unmount-wait.json`,
+ * say what the list still held: the mounted rows, LegendList's container count, the scroll
+ * metrics, and the viewport against the size the case asked for, which a small screen caps.
+ */
+async function waitForRowsReplyUnmount(
+  requested: { readonly width: number; readonly height: number },
+  diagramLabel: string,
+): Promise<void> {
+  const read = () =>
+    browser.execute(
+      (surface: string, label: string): UnmountWaitState => {
+        const scroller = document.querySelector<HTMLElement>(
+          `${surface} [class*='overflow-anchor']`,
+        );
+        if (scroller) scroller.scrollTop = scroller.scrollHeight;
+        const area = scroller?.getBoundingClientRect();
+        const rows = [
+          ...document.querySelectorAll<HTMLElement>(`${surface} [data-timeline-row-id]`),
+        ]
+          .map((row) => {
+            const box = row.getBoundingClientRect();
+            return {
+              id: (row.getAttribute("data-timeline-row-id") ?? "").slice(-12),
+              kind: row.getAttribute("data-timeline-row-kind"),
+              top: Math.round(box.top - (area?.top ?? 0)),
+              height: Math.round(box.height),
+              holdsLabel: [...row.querySelectorAll(".chat-markdown-codeblock")].some((block) =>
+                block.textContent?.includes(label),
+              ),
+            };
+          })
+          .sort((a, b) => a.top - b.top);
+        const containers = new Set(
+          [...document.querySelectorAll<HTMLElement>(`${surface} [data-timeline-root]`)].map(
+            (root) => root.parentElement,
+          ),
+        ).size;
+        return {
+          unmounted: !rows.some((row) => row.holdsLabel),
+          viewport: { width: window.innerWidth, height: window.innerHeight },
+          screen: { width: screen.availWidth, height: screen.availHeight },
+          scroll: {
+            top: Math.round(scroller?.scrollTop ?? -1),
+            height: Math.round(scroller?.scrollHeight ?? -1),
+            client: Math.round(scroller?.clientHeight ?? -1),
+          },
+          rows,
+          containers,
+        };
+      },
+      visibleSurfaceSelector,
+      diagramLabel,
+    );
+  // About 15 s: 30 readings 500 ms apart.
+  let last: UnmountWaitState | null = null;
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    last = await read();
+    if (last.unmounted) return;
+    await browser.pause(500);
+  }
+  NodeFS.writeFileSync(
+    NodePath.join(preparedArtifactDirectory, "mermaid-timeline-unmount-wait.json"),
+    JSON.stringify({ requested, last }, null, 2),
+  );
+  const state = last!;
+  const smaller =
+    state.viewport.width < requested.width || state.viewport.height < requested.height
+      ? ` The window came up at ${state.viewport.width}x${state.viewport.height}, smaller than the ` +
+        `requested ${requested.width}x${requested.height} (screen ${state.screen.width}x${state.screen.height}).`
+      : "";
+  const labelRow = state.rows.find((row) => row.holdsLabel);
+  throw new Error(
+    `The rows reply's diagram never unmounted.${smaller} The list still held ${state.rows.length} ` +
+      `rows in ${state.containers} containers, the rows reply's at ${labelRow?.top ?? "?"} px below ` +
+      `the visible top (scrollTop ${state.scroll.top}, scrollHeight ${state.scroll.height}, ` +
+      `clientHeight ${state.scroll.client}); mounted rows: ${JSON.stringify(state.rows)}. ` +
+      `See mermaid-timeline-unmount-wait.json.`,
+  );
+}
+
 /**
  * Samples the timeline after each painted frame for the keyboard case, and counts the keydowns
  * that reach its scroller.
@@ -1960,10 +2057,29 @@ function sentRowsBelowOffset(
 }
 
 /**
- * How many resting frames each streamed reply must paint after settling: the fixture streams at
- * least seven deliveries after the latest settling, and a slow runner may paint none for some.
+ * How many resting frames each streamed reply must paint after settling. Every one it paints is
+ * bounded; how many there are follows the webview's paint rate, which on a slow runner can be
+ * lower than the fixture's 300 ms deliveries, so only a reply that painted none fails here.
  */
-const MIN_SETTLED_RESTS = 5;
+const MIN_SETTLED_RESTS = 1;
+
+/** A reply's painted frames and resting frames after settling, and the median gap between frames. */
+function paintedAfter(
+  samples: readonly StreamSample[],
+  from: number,
+  rests: ReadonlyMap<number, number>,
+): { frames: number; rests: number; medianFrameGapMs: number | null } {
+  const times = samples.filter((entry) => entry.at >= from).map((entry) => entry.at);
+  const gaps = times
+    .slice(1)
+    .map((at, index) => at - times[index]!)
+    .toSorted((a, b) => a - b);
+  return {
+    frames: times.length,
+    rests: rests.size,
+    medianFrameGapMs: gaps.length === 0 ? null : Math.round(gaps[Math.floor(gaps.length / 2)]!),
+  };
+}
 
 /** A reply's end counts as revealed this far below the usable bottom: a pixel of rounding. */
 const REVEALED_PX = 1;
