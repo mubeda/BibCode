@@ -7,7 +7,9 @@
       "request": {
         "requestId": "�",
         "environment": "",
-        "includeCrashDumps": false
+        "includeCrashDumps": false,
+        "code": "__proto__",
+        "outputDirectory": "%"
       }
     }
   ]
