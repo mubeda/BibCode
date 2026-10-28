@@ -53,15 +53,25 @@ public package has no root export; callers use focused subpaths such as
 - A connection phase never gates local composer input. In every phase but
   `connected` (connecting, reconnecting, offline, an explicit disconnect, or a
   blocked identity), the composer stays editable and keeps its draft. Typing,
-  paste, type-to-focus insertion, file selection and `:` actions only change the
-  local draft, and staging happens at Send. Every action that needs the server
-  refuses and names the state the composer banner shows
-  (`describeUnavailableEnvironment`): the Send buttons, Enter, approval
-  decisions, and question answers, including a question's timed advance. The
+  paste, type-to-focus insertion, file selection, `:` actions and moving to a
+  question's next step only change local state, and staging happens at Send.
+  Every action that needs the server refuses and names the state the
+  composer banner shows (`describeUnavailableEnvironment`). That covers:
+  - the Send buttons, as "Send unavailable. <state>", and Refine, Implement and
+    a question's final Submit;
+  - Enter that would send something;
+  - Steer and Send now on the queued head;
+  - approval decisions;
+  - question answers, including a question's timed advance.
+
+  The refusal is one toast; it closes when the state changes, the thread changes
+  or the view unmounts. A provider binding conflict keeps precedence. The
   question and its answers stay. Nothing is queued for the reconnect. A send that
   passed its checks while connected and fails in a later await restores its
-  content through `restoreOutgoing`. An editor that went read-only in these
-  phases dropped keys without a sign (#199).
+  content: a turn through `restoreOutgoing`, a plan follow-up by merging its
+  cleared draft back. An editor that went read-only in these phases dropped keys
+  without a sign (#199).
+
 - `EnvironmentRegistry` owns catalog entries and their scoped supervisors. It
   reconciles platform-provided registrations and exposes environment-scoped
   execution to domain state.
