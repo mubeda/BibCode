@@ -5,6 +5,7 @@ mod monitor;
 mod native;
 pub mod profiler;
 mod registry;
+pub mod relay_cli;
 mod resource_sampler;
 mod trace;
 
