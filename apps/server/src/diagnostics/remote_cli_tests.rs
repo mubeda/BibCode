@@ -527,6 +527,11 @@ async fn a_pairing_stopped_after_writing_leaves_the_record_readable_and_the_name
 async fn a_rollback_that_cannot_remove_the_record_says_how_to_remove_it() {
     use std::os::unix::fs::PermissionsExt as _;
 
+    // Root ignores directory permissions (CAP_DAC_OVERRIDE), so removal cannot be made to fail.
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
     let (code, reached_confirmation, proceed) = refusing_remote().await;
     let cli = tempfile::tempdir().expect("cli state");
     let directory = cli.path().join(REMOTES_DIRECTORY);
