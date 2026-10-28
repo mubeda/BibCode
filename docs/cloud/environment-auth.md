@@ -22,14 +22,19 @@ Canonical scope constants are in
 | `relay:write`           | Install/configure the relay client and link or unlink the environment.        |
 | `diagnostics:read`      | Download the redacted diagnostic bundle (`server.downloadDiagnosticLogs`).    |
 
-`orchestration:read` satisfies `diagnostics:read` (one rule, `scope_satisfies`
-in `auth/model.rs`, used by every scope check), so every ordinary credential
+`orchestration:read` satisfies `diagnostics:read` through one rule,
+`scope_satisfies` in `auth/model.rs`. The RPC method check, session
+authorization, the token exchange's requested-scope subset, the pairing-offer
+subset check and `Principal::has_scope` all use it, so every ordinary credential
 keeps the diagnostic download; `diagnostics:read` satisfies nothing else. No
 standard or administrative grant lists it: only a diagnostics-only pairing
 offer (`bibcode pairing offer --access diagnostics`, or `POST
 /api/auth/pairing-offer` with `"scopes": ["diagnostics:read"]`) grants it alone,
 for `bibcode diagnostics pair`. Crash dumps in the bundle still need
-`orchestration:operate`, so such a credential cannot fetch them. The E2EE
+`orchestration:operate`, so such a credential cannot fetch them. Only
+`orchestration:operate` itself passes that check: the RPC handler asks
+`scope_satisfies`, which implies nothing for it, and the primary's HTTP route
+compares exactly (`Authorized::has_scope` in `http_routes.rs`). The E2EE
 pairing reply names the minted credential's `scopes`, so a client can refuse
 a credential wider than it asked for (see
 [Remote architecture](../architecture/remote.md#command-line-diagnostics-pairing)).

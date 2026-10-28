@@ -544,7 +544,8 @@ its own device and holds no connection between runs.
 - **Credential.** The remote mints the offer with `bibcode pairing offer
   --access diagnostics` (or the pairing-offer route with
   `scopes: ["diagnostics:read"]`); its grant holds only `diagnostics:read`,
-  which allows `server.downloadDiagnosticLogs` and nothing else, and is
+  which allows no method other than `server.downloadDiagnosticLogs` (plus
+  `auth.confirmPairing` for its own pending pairing), and is
   labelled `<name> (diagnostics)`. `pair` keeps the credential only when the
   pairing reply's `scopes` are exactly `["diagnostics:read"]`; a wider grant,
   or a server that sends no `scopes`, is refused before anything is written,
@@ -565,12 +566,19 @@ its own device and holds no connection between runs.
   written (create, never replace), then `auth.confirmPairing` on the same
   channel when the reply asks for it. A typed refusal deletes the record. A
   lost answer is settled by one bearer reconnect: authenticated keeps the
-  record, `unauthorized` deletes it, anything else keeps it and says so.
+  record, `unauthorized` deletes it, anything else keeps it and says so. A
+  deletion removes only the record this attempt wrote, matched by its random
+  pairing id (`SecretStore::remove_if` moves it aside atomically, checks it, and
+  links back one that does not match), so a `forget` and re-pair under the
+  same name during the confirmation keeps the newer record. A record whose
+  write succeeded but left a temporary link behind counts as stored and is
+  confirmed; the leftover file is reported.
 - **Storage.** One record per remote in
   `<state dir>/diagnostics-remotes/<name>.bin` through `auth::SecretStore`
   (directory 0700, files 0600 on Unix, owner-only ACLs on Windows): endpoint,
-  host key, environment and store ids, the remote's name, pairing time, and the
-  credential, which is never printed. `forget` deletes the record only.
+  host key, environment and store ids, the remote's name, pairing time, the
+  pairing id, and the credential, which is never printed. `forget` deletes the
+  record only.
 - **Download.** Bearer `e2ee_auth`, then `server.downloadDiagnosticLogs` with
   an empty `frontendLog`. `Started` must name the stored `storageInstanceId`
   and `environmentId` before any byte is kept, then the archive checks shared
