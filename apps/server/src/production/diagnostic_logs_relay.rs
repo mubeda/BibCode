@@ -66,9 +66,21 @@ pub const ITEM_DEADLINE: Duration = Duration::from_secs(60);
 /// The archive names the app may send: the shape `server.downloadDiagnosticLogs` uses.
 pub const MAX_ARCHIVE_NAME_BYTES: usize = 128;
 const MAX_ENVIRONMENT_SELECTOR_BYTES: usize = 256;
+const MAX_OUTPUT_DIRECTORY_BYTES: usize = 1024;
 const MAX_FAILURE_MESSAGE_BYTES: usize = 2 * 1024;
-const MAX_LISTED_ENVIRONMENTS: usize = 64;
-const MAX_LISTED_FIELD_BYTES: usize = 256;
+/// After a denied or unanswered request, the next waits this long, doubling with each
+/// refusal in a row up to [`MAX_COOLDOWN`], so a program cannot keep prompting the user.
+pub const FIRST_COOLDOWN: Duration = Duration::from_secs(30);
+pub const MAX_COOLDOWN: Duration = Duration::from_secs(5 * 60);
+/// Headers a local reverse proxy (Tailscale Serve, a forwarding proxy) adds: a request
+/// carrying one came from elsewhere even though its socket peer is loopback.
+const FORWARDING_HEADERS: [&str; 5] = [
+    "forwarded",
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "x-real-ip",
+];
 const MAX_MANIFEST_BYTES: usize = 16 * 1024;
 const MAX_REQUEST_BODY_BYTES: usize = 4 * 1024;
 const FAILURE_REASONS: [&str; 12] = [
@@ -100,11 +112,62 @@ pub fn is_archive_name(name: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
+/// `true` for the code a command prints and the app shows: `XXX-XX`, uppercase letters and
+/// digits.
+#[must_use]
+pub fn is_request_code(code: &str) -> bool {
+    let bytes = code.as_bytes();
+    bytes.len() == 6
+        && bytes[3] == b'-'
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| index == 3 || byte.is_ascii_uppercase() || byte.is_ascii_digit())
+}
+
+/// What a command asks for: the environment as typed, crash dumps, the code it printed, and
+/// the directory it saves in, all shown to the user before anything is shared.
+#[derive(Clone, Debug)]
+pub struct RelayRequest {
+    pub environment: String,
+    pub include_crash_dumps: bool,
+    pub code: String,
+    pub output_directory: String,
+}
+
+impl RelayRequest {
+    #[cfg(test)]
+    pub(crate) fn for_test(environment: &str, include_crash_dumps: bool) -> Self {
+        Self {
+            environment: environment.to_owned(),
+            include_crash_dumps,
+            code: "K7Q-4M".to_owned(),
+            output_directory: "/Users/me/logs".to_owned(),
+        }
+    }
+
+    fn pending_event(&self, request_id: &str) -> Value {
+        json!({
+            "_tag": "Pending",
+            "request": {
+                "requestId": request_id,
+                "environment": self.environment,
+                "includeCrashDumps": self.include_crash_dumps,
+                "code": self.code,
+                "outputDirectory": self.output_directory,
+            },
+        })
+    }
+}
+
 /// Why a relay ended without the app answering it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EndReason {
     /// Another request is in progress.
     Busy,
+    /// The last requests were denied or left unanswered; the next may start in this many
+    /// seconds.
+    CoolingDown(u64),
     /// No desktop app is subscribed to this server.
     NoApp,
     /// Nobody approved or denied it in time.
@@ -122,6 +185,7 @@ impl EndReason {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Busy => "busy",
+            Self::CoolingDown(_) => "cooling-down",
             Self::NoApp => "no-app",
             Self::Expired => "expired",
             Self::ConnectionLost => "connection-lost",
@@ -130,10 +194,15 @@ impl EndReason {
         }
     }
 
-    fn message(self) -> &'static str {
+    fn message(self) -> String {
         match self {
             Self::Busy => {
                 "Another diagnostics download is waiting in BiBCode. Try again once it ends."
+            }
+            Self::CoolingDown(seconds) => {
+                return format!(
+                    "The last request was denied or not answered. Try again in {seconds} s."
+                );
             }
             Self::NoApp => {
                 "No BiBCode desktop window is connected to this server. Open BiBCode and try again."
@@ -145,6 +214,7 @@ impl EndReason {
             Self::Stalled => "BiBCode stopped sending the logs.",
             Self::Invalid => "BiBCode sent an invalid archive. Nothing was saved.",
         }
+        .to_owned()
     }
 }
 
@@ -166,7 +236,6 @@ pub enum RelayLine {
     Failed {
         reason: String,
         message: String,
-        environments: Option<Value>,
     },
     Ended(EndReason),
 }
@@ -189,16 +258,8 @@ impl RelayLine {
             Self::Data(data) => json!({ "type": "data", "data": data }),
             Self::Finished => json!({ "type": "finished" }),
             Self::Denied => json!({ "type": "denied" }),
-            Self::Failed {
-                reason,
-                message,
-                environments,
-            } => {
-                let mut line = json!({ "type": "failed", "reason": reason, "message": message });
-                if let Some(environments) = environments {
-                    line["environments"] = environments.clone();
-                }
-                line
+            Self::Failed { reason, message } => {
+                json!({ "type": "failed", "reason": reason, "message": message })
             }
             Self::Ended(reason) => json!({
                 "type": "ended",
@@ -267,8 +328,7 @@ struct Claim {
 
 struct Active {
     request_id: String,
-    environment: String,
-    include_crash_dumps: bool,
+    request: RelayRequest,
     output: mpsc::Sender<RelayLine>,
     /// The line the command reads when the relay ends without an answer.
     end_line: Arc<std::sync::Mutex<Option<RelayLine>>>,
@@ -283,6 +343,27 @@ struct State {
     /// The last request that ended, and whether the command left (an item for it is then
     /// `cancelled`, telling the app to stop its download, rather than `stale`).
     last_ended: Option<(String, bool)>,
+    /// Denied or unanswered requests in a row, and when the next may start.
+    refusals: u32,
+    cooldown_until: Option<Instant>,
+}
+
+impl State {
+    /// A denial or an unanswered request lengthens the wait before the next; a saved
+    /// archive clears it.
+    fn note_outcome(&mut self, refused: bool) {
+        if !refused {
+            self.refusals = 0;
+            self.cooldown_until = None;
+            return;
+        }
+        self.refusals = self.refusals.saturating_add(1);
+        let doublings = self.refusals.saturating_sub(1).min(8);
+        let wait = FIRST_COOLDOWN
+            .saturating_mul(1_u32 << doublings)
+            .min(MAX_COOLDOWN);
+        self.cooldown_until = Some(Instant::now() + wait);
+    }
 }
 
 struct Inner {
@@ -371,8 +452,6 @@ enum ItemInput {
     Failed {
         reason: String,
         message: String,
-        #[serde(default)]
-        environments: Option<Vec<ListedEnvironment>>,
     },
     Started {
         #[serde(rename = "fileName")]
@@ -385,14 +464,6 @@ enum ItemInput {
         data: String,
     },
     Finished {},
-}
-
-#[derive(Deserialize, serde::Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ListedEnvironment {
-    environment_id: String,
-    label: String,
-    connected: bool,
 }
 
 #[derive(Deserialize)]
@@ -424,33 +495,13 @@ fn truncate(text: &str, limit: usize) -> String {
 fn checked_line(item: ItemInput, claim: &mut Claim) -> Result<RelayLine, &'static str> {
     match item {
         ItemInput::Denied {} if claim.expected.is_none() => Ok(RelayLine::Denied),
-        ItemInput::Failed {
-            reason,
-            message,
-            environments,
-        } if claim.expected.is_none() => {
+        ItemInput::Failed { reason, message } if claim.expected.is_none() => {
             if !FAILURE_REASONS.contains(&reason.as_str()) || message.trim().is_empty() {
                 return Err("unknown failure reason or empty message");
             }
-            let environments = match environments {
-                None => None,
-                Some(list) if list.len() > MAX_LISTED_ENVIRONMENTS => {
-                    return Err("too many environments listed");
-                }
-                Some(list) => {
-                    if list.iter().any(|entry| {
-                        entry.environment_id.len() > MAX_LISTED_FIELD_BYTES
-                            || entry.label.len() > MAX_LISTED_FIELD_BYTES
-                    }) {
-                        return Err("a listed environment is too long");
-                    }
-                    Some(serde_json::to_value(list).map_err(|_| "unlistable environments")?)
-                }
-            };
             Ok(RelayLine::Failed {
                 reason,
                 message: truncate(&message, MAX_FAILURE_MESSAGE_BYTES),
-                environments,
             })
         }
         ItemInput::Started {
@@ -516,11 +567,7 @@ impl DiagnosticLogsRelay {
 
     /// Starts a request for the command. Fails at once with [`EndReason::NoApp`] when no
     /// desktop app could see it, and [`EndReason::Busy`] while another one runs.
-    pub async fn start(
-        &self,
-        environment: &str,
-        include_crash_dumps: bool,
-    ) -> Result<RelayStream, EndReason> {
+    pub async fn start(&self, request: RelayRequest) -> Result<RelayStream, EndReason> {
         if self.inner.subscribers.load(Ordering::Acquire) == 0 {
             return Err(EndReason::NoApp);
         }
@@ -533,10 +580,18 @@ impl DiagnosticLogsRelay {
             if state.active.is_some() {
                 return Err(EndReason::Busy);
             }
+            if let Some(until) = state.cooldown_until {
+                let now = Instant::now();
+                if until > now {
+                    let wait = until - now;
+                    return Err(EndReason::CoolingDown(
+                        wait.as_secs() + u64::from(wait.subsec_nanos() > 0),
+                    ));
+                }
+            }
             state.active = Some(Active {
                 request_id: request_id.clone(),
-                environment: environment.to_owned(),
-                include_crash_dumps,
+                request: request.clone(),
                 output,
                 end_line: end_line.clone(),
                 ended: ended.clone(),
@@ -544,17 +599,10 @@ impl DiagnosticLogsRelay {
                 deadline: Instant::now() + APPROVAL_DEADLINE,
             });
         }
-        let _ = self.inner.events.send(json!({
-            "_tag": "Pending",
-            "request": {
-                "requestId": request_id,
-                "environment": environment,
-                "includeCrashDumps": include_crash_dumps,
-            },
-        }));
+        let _ = self.inner.events.send(request.pending_event(&request_id));
         tracing::info!(
             request_id = %request_id,
-            include_crash_dumps,
+            include_crash_dumps = request.include_crash_dumps,
             "diagnostics relay request waiting for approval"
         );
         tokio::spawn(
@@ -602,6 +650,9 @@ impl DiagnosticLogsRelay {
                     _ => return,
                 }
             };
+            if reason == EndReason::Expired {
+                self.inner.state.lock().await.note_outcome(true);
+            }
             self.end(&request_id, Some(reason), false).await;
             return;
         }
@@ -648,16 +699,10 @@ impl DiagnosticLogsRelay {
     async fn pending_event(&self) -> Option<Value> {
         let state = self.inner.state.lock().await;
         let active = state.active.as_ref()?;
-        active.claim.is_none().then(|| {
-            json!({
-                "_tag": "Pending",
-                "request": {
-                    "requestId": active.request_id,
-                    "environment": active.environment,
-                    "includeCrashDumps": active.include_crash_dumps,
-                },
-            })
-        })
+        active
+            .claim
+            .is_none()
+            .then(|| active.request.pending_event(&active.request_id))
     }
 
     /// The desktop app's subscription: the waiting request, if any, then every new one and
@@ -730,6 +775,11 @@ impl DiagnosticLogsRelay {
             active.ended.clone()
         };
         tracing::info!(request_id, "diagnostics relay request claimed");
+        // Other windows drop their prompt for it.
+        let _ = self
+            .inner
+            .events
+            .send(json!({ "_tag": "Claimed", "requestId": request_id }));
         // A reload, quit or lost socket of the claiming window ends the request.
         let relay = self.clone();
         let closed = claimant.closed.clone();
@@ -799,6 +849,11 @@ impl DiagnosticLogsRelay {
             }
         };
         let answer = line.is_answer();
+        let outcome = match line {
+            RelayLine::Denied => Some(true),
+            RelayLine::Finished => Some(false),
+            _ => None,
+        };
         let sent = tokio::select! {
             sent = output.send_timeout(line, ITEM_DEADLINE) => sent,
             () = ended.cancelled() => return Err(self.over(&request_id).await),
@@ -815,6 +870,9 @@ impl DiagnosticLogsRelay {
             }
         }
         if answer {
+            if let Some(refused) = outcome {
+                self.inner.state.lock().await.note_outcome(refused);
+            }
             tracing::info!(%request_id, "diagnostics relay request answered");
             self.end(&request_id, None, false).await;
         } else {
@@ -893,6 +951,28 @@ struct CommandRequest {
     environment: String,
     #[serde(default)]
     include_crash_dumps: bool,
+    code: String,
+    output_directory: String,
+}
+
+impl CommandRequest {
+    /// The request the app may show, or `None` when a field is empty, too long, or holds a
+    /// control character the prompt could be spoofed with.
+    fn checked(self) -> Option<RelayRequest> {
+        let environment = self.environment.trim();
+        let fits = |text: &str, limit: usize| {
+            !text.is_empty() && text.len() <= limit && !text.chars().any(char::is_control)
+        };
+        (fits(environment, MAX_ENVIRONMENT_SELECTOR_BYTES)
+            && is_request_code(&self.code)
+            && fits(&self.output_directory, MAX_OUTPUT_DIRECTORY_BYTES))
+        .then(|| RelayRequest {
+            environment: environment.to_owned(),
+            include_crash_dumps: self.include_crash_dumps,
+            code: self.code,
+            output_directory: self.output_directory,
+        })
+    }
 }
 
 fn route_error(status: StatusCode, tag: &str, message: &str) -> Response {
@@ -940,11 +1020,16 @@ pub(crate) async fn relay_http(
                 .local
                 .is_some_and(|local| local.ip() == addrs.peer.ip())
     });
-    if !same_host {
+    // A local reverse proxy forwards another machine's request from a loopback socket.
+    let forwarded = request.headers().keys().any(|name| {
+        let name = name.as_str();
+        FORWARDING_HEADERS.contains(&name) || name.starts_with("tailscale-")
+    });
+    if !same_host || forwarded {
         return route_error(
             StatusCode::FORBIDDEN,
             "DiagnosticLogsRelayForbiddenError",
-            "Diagnostics downloads are accepted only from this computer.",
+            "Diagnostics downloads are accepted only from this computer, not through a proxy.",
         );
     }
     let (parts, body) = request.into_parts();
@@ -962,26 +1047,17 @@ pub(crate) async fn relay_http(
             "The request is too large.",
         );
     };
-    let input = match serde_json::from_slice::<CommandRequest>(&body) {
-        Ok(input)
-            if !input.environment.trim().is_empty()
-                && input.environment.len() <= MAX_ENVIRONMENT_SELECTOR_BYTES =>
-        {
-            input
-        }
-        _ => {
-            return route_error(
-                StatusCode::BAD_REQUEST,
-                "DiagnosticLogsRelayInvalidError",
-                "Name the environment, in at most 256 bytes.",
-            );
-        }
+    let Some(input) = serde_json::from_slice::<CommandRequest>(&body)
+        .ok()
+        .and_then(CommandRequest::checked)
+    else {
+        return route_error(
+            StatusCode::BAD_REQUEST,
+            "DiagnosticLogsRelayInvalidError",
+            "Send the environment (at most 256 bytes), a request code, and the output directory.",
+        );
     };
-    let first = match route
-        .relay
-        .start(input.environment.trim(), input.include_crash_dumps)
-        .await
-    {
+    let first = match route.relay.start(input).await {
         Ok(stream) => Ok(stream),
         Err(reason) => Err(RelayLine::Ended(reason)),
     };
@@ -1139,7 +1215,7 @@ mod tests {
     async fn without_a_desktop_window_a_request_fails_at_once() {
         let relay = DiagnosticLogsRelay::new();
         assert!(matches!(
-            relay.start("Omarchy", false).await,
+            relay.start(RelayRequest::for_test("Omarchy", false)).await,
             Err(EndReason::NoApp)
         ));
     }
@@ -1151,7 +1227,7 @@ mod tests {
         let error = events.recv().await.expect("refusal").expect_err("refused");
         assert_eq!(error["reason"], "not-desktop");
         assert!(matches!(
-            relay.start("Omarchy", false).await,
+            relay.start(RelayRequest::for_test("Omarchy", false)).await,
             Err(EndReason::NoApp)
         ));
     }
@@ -1161,9 +1237,12 @@ mod tests {
         let relay = DiagnosticLogsRelay::new();
         let app = Claimant::for_test("desktop");
         let _events = subscribed(&relay, &app).await;
-        let _first = relay.start("Omarchy", false).await.expect("first");
+        let _first = relay
+            .start(RelayRequest::for_test("Omarchy", false))
+            .await
+            .expect("first");
         assert!(matches!(
-            relay.start("Luna", false).await,
+            relay.start(RelayRequest::for_test("Luna", false)).await,
             Err(EndReason::Busy)
         ));
     }
@@ -1173,7 +1252,10 @@ mod tests {
         let relay = DiagnosticLogsRelay::new();
         let app = Claimant::for_test("desktop");
         let mut events = subscribed(&relay, &app).await;
-        let mut stream = relay.start("Omarchy", true).await.expect("start");
+        let mut stream = relay
+            .start(RelayRequest::for_test("Omarchy", true))
+            .await
+            .expect("start");
         let id = pending_id(&mut events).await;
         assert!(relay.claim(&app, &id).await);
         // Another window answering later finds it taken.
@@ -1230,6 +1312,9 @@ mod tests {
         assert_eq!(lines[3], RelayLine::Finished);
         assert_eq!(lines.len(), 4);
         assert!(relay.is_idle().await);
+        // Other windows drop their prompt once one claims it…
+        let claimed = events.recv().await.expect("claimed").expect("ok").remove(0);
+        assert_eq!(claimed, json!({ "_tag": "Claimed", "requestId": id }));
         let closed = events.recv().await.expect("closed").expect("ok").remove(0);
         assert_eq!(closed, json!({ "_tag": "Closed", "requestId": id }));
         // An item after the answer is stale.
@@ -1245,7 +1330,10 @@ mod tests {
         let relay = DiagnosticLogsRelay::new();
         let app = Claimant::for_test("desktop");
         let mut events = subscribed(&relay, &app).await;
-        let mut stream = relay.start("Omarchy", false).await.expect("start");
+        let mut stream = relay
+            .start(RelayRequest::for_test("Omarchy", false))
+            .await
+            .expect("start");
         let id = pending_id(&mut events).await;
         assert!(relay.claim(&app, &id).await);
         relay
@@ -1261,7 +1349,10 @@ mod tests {
         let relay = DiagnosticLogsRelay::new();
         let app = Claimant::for_test("desktop");
         let mut events = subscribed(&relay, &app).await;
-        let _stream = relay.start("Omarchy", false).await.expect("start");
+        let _stream = relay
+            .start(RelayRequest::for_test("Omarchy", false))
+            .await
+            .expect("start");
         let id = pending_id(&mut events).await;
         // Before a claim, nobody may send.
         let unclaimed = relay
@@ -1335,7 +1426,10 @@ mod tests {
             let relay = DiagnosticLogsRelay::new();
             let app = Claimant::for_test("desktop");
             let mut events = subscribed(&relay, &app).await;
-            let mut stream = relay.start("Omarchy", false).await.expect("start");
+            let mut stream = relay
+                .start(RelayRequest::for_test("Omarchy", false))
+                .await
+                .expect("start");
             let id = pending_id(&mut events).await;
             assert!(relay.claim(&app, &id).await);
             let reader = tokio::spawn(async move {
@@ -1373,7 +1467,10 @@ mod tests {
         let relay = DiagnosticLogsRelay::new();
         let app = Claimant::for_test("desktop");
         let mut events = subscribed(&relay, &app).await;
-        let mut stream = relay.start("Omarchy", false).await.expect("start");
+        let mut stream = relay
+            .start(RelayRequest::for_test("Omarchy", false))
+            .await
+            .expect("start");
         let id = pending_id(&mut events).await;
         assert_eq!(
             stream.next().await,
@@ -1396,7 +1493,10 @@ mod tests {
         let relay = DiagnosticLogsRelay::new();
         let app = Claimant::for_test("desktop");
         let mut events = subscribed(&relay, &app).await;
-        let mut stream = relay.start("Omarchy", false).await.expect("start");
+        let mut stream = relay
+            .start(RelayRequest::for_test("Omarchy", false))
+            .await
+            .expect("start");
         let id = pending_id(&mut events).await;
         assert!(relay.claim(&app, &id).await);
         tokio::time::advance(APPROVAL_DEADLINE + Duration::from_secs(1)).await;
@@ -1416,7 +1516,10 @@ mod tests {
         let relay = DiagnosticLogsRelay::new();
         let app = Claimant::for_test("desktop");
         let mut events = subscribed(&relay, &app).await;
-        let mut stream = relay.start("Omarchy", false).await.expect("start");
+        let mut stream = relay
+            .start(RelayRequest::for_test("Omarchy", false))
+            .await
+            .expect("start");
         let id = pending_id(&mut events).await;
         assert!(relay.claim(&app, &id).await);
         app.close_for_test();
@@ -1432,11 +1535,17 @@ mod tests {
         let relay = DiagnosticLogsRelay::new();
         let app = Claimant::for_test("desktop");
         let mut events = subscribed(&relay, &app).await;
-        let stream = relay.start("Omarchy", false).await.expect("start");
+        let stream = relay
+            .start(RelayRequest::for_test("Omarchy", false))
+            .await
+            .expect("start");
         let id = pending_id(&mut events).await;
         assert!(relay.claim(&app, &id).await);
         drop(stream);
         // The app learns it from the subscription, which stops its download…
+        // Other windows drop their prompt once one claims it…
+        let claimed = events.recv().await.expect("claimed").expect("ok").remove(0);
+        assert_eq!(claimed, json!({ "_tag": "Claimed", "requestId": id }));
         let closed = events.recv().await.expect("closed").expect("ok").remove(0);
         assert_eq!(closed, json!({ "_tag": "Closed", "requestId": id }));
         assert!(relay.is_idle().await);
@@ -1453,7 +1562,10 @@ mod tests {
         let relay = DiagnosticLogsRelay::new();
         let app = Claimant::for_test("desktop");
         let mut events = subscribed(&relay, &app).await;
-        let _stream = relay.start("Omarchy", false).await.expect("start");
+        let _stream = relay
+            .start(RelayRequest::for_test("Omarchy", false))
+            .await
+            .expect("start");
         let id = pending_id(&mut events).await;
         assert!(relay.claim(&app, &id).await);
         relay
@@ -1480,12 +1592,159 @@ mod tests {
         let relay = DiagnosticLogsRelay::new();
         let first = Claimant::for_test("desktop");
         let _events = subscribed(&relay, &first).await;
-        let _stream = relay.start("Omarchy", true).await.expect("start");
+        let _stream = relay
+            .start(RelayRequest::for_test("Omarchy", true))
+            .await
+            .expect("start");
         let reloaded = Claimant::for_test("desktop-after-reload");
         let mut events = subscribed(&relay, &reloaded).await;
         let event = events.recv().await.expect("pending").expect("ok").remove(0);
         assert_eq!(event["request"]["environment"], "Omarchy");
         assert_eq!(event["request"]["includeCrashDumps"], true);
+        // The prompt shows the command's code and where the file goes.
+        assert_eq!(event["request"]["code"], "K7Q-4M");
+        assert_eq!(event["request"]["outputDirectory"], "/Users/me/logs");
+    }
+
+    async fn deny_one(
+        relay: &DiagnosticLogsRelay,
+        app: &Claimant,
+        events: &mut mpsc::Receiver<RpcStreamChunk>,
+    ) {
+        let _stream = relay
+            .start(RelayRequest::for_test("Omarchy", false))
+            .await
+            .expect("start");
+        let id = pending_id(events).await;
+        assert!(relay.claim(app, &id).await);
+        relay
+            .send(app, item(&id, json!({ "_tag": "Denied" })))
+            .await
+            .expect("denied");
+        // Claimed, then Closed.
+        let claimed = events.recv().await.expect("claimed").expect("ok").remove(0);
+        assert_eq!(claimed["_tag"], "Claimed");
+        let closed = events.recv().await.expect("closed").expect("ok").remove(0);
+        assert_eq!(closed["_tag"], "Closed");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn denials_in_a_row_make_the_next_request_wait_longer() {
+        let relay = DiagnosticLogsRelay::new();
+        let app = Claimant::for_test("desktop");
+        let mut events = subscribed(&relay, &app).await;
+        deny_one(&relay, &app, &mut events).await;
+        assert_eq!(
+            relay
+                .start(RelayRequest::for_test("Omarchy", false))
+                .await
+                .err(),
+            Some(EndReason::CoolingDown(30))
+        );
+        tokio::time::advance(FIRST_COOLDOWN).await;
+        deny_one(&relay, &app, &mut events).await;
+        assert_eq!(
+            relay
+                .start(RelayRequest::for_test("Omarchy", false))
+                .await
+                .err(),
+            Some(EndReason::CoolingDown(60))
+        );
+        // The wait stops growing at its ceiling.
+        for _ in 0..8 {
+            tokio::time::advance(MAX_COOLDOWN).await;
+            deny_one(&relay, &app, &mut events).await;
+        }
+        assert_eq!(
+            relay
+                .start(RelayRequest::for_test("Omarchy", false))
+                .await
+                .err(),
+            Some(EndReason::CoolingDown(MAX_COOLDOWN.as_secs()))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unanswered_request_also_cools_down_and_a_saved_one_clears_it() {
+        let relay = DiagnosticLogsRelay::new();
+        let app = Claimant::for_test("desktop");
+        let mut events = subscribed(&relay, &app).await;
+        let mut stream = relay
+            .start(RelayRequest::for_test("Omarchy", false))
+            .await
+            .expect("start");
+        pending_id(&mut events).await;
+        assert_eq!(
+            stream.next().await,
+            Some(RelayLine::Ended(EndReason::Expired))
+        );
+        let closed = events.recv().await.expect("closed").expect("ok").remove(0);
+        assert_eq!(closed["_tag"], "Closed");
+        assert!(matches!(
+            relay
+                .start(RelayRequest::for_test("Omarchy", false))
+                .await
+                .err(),
+            Some(EndReason::CoolingDown(_))
+        ));
+        tokio::time::advance(FIRST_COOLDOWN).await;
+        // A saved archive resets the count.
+        let mut stream = relay
+            .start(RelayRequest::for_test("Omarchy", false))
+            .await
+            .expect("start");
+        let id = pending_id(&mut events).await;
+        assert!(relay.claim(&app, &id).await);
+        let sender = relay.clone();
+        let app_task = app.clone();
+        let sent_id = id.clone();
+        let producer = tokio::spawn(async move {
+            for value in [
+                json!({ "_tag": "Started", "fileName": "logs.zip", "byteLength": 1, "manifest": manifest() }),
+                json!({ "_tag": "Data", "data": STANDARD.encode([1_u8]) }),
+                json!({ "_tag": "Finished" }),
+            ] {
+                sender
+                    .send(&app_task, item(&sent_id, value))
+                    .await
+                    .expect("item");
+            }
+        });
+        while stream.next().await.is_some() {}
+        producer.await.expect("producer");
+        assert!(
+            relay
+                .start(RelayRequest::for_test("Omarchy", false))
+                .await
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_command_request_is_shown_only_when_every_field_is_plain() {
+        let request = |environment: &str, code: &str, directory: &str| {
+            CommandRequest {
+                environment: environment.to_owned(),
+                include_crash_dumps: false,
+                code: code.to_owned(),
+                output_directory: directory.to_owned(),
+            }
+            .checked()
+        };
+        assert!(request(" Omarchy ", "K7Q-4M", "/Users/me").is_some());
+        for (environment, code, directory) in [
+            ("Omarchy\u{1b}[2J", "K7Q-4M", "/Users/me"),
+            ("Omarchy", "k7q-4m", "/Users/me"),
+            ("Omarchy", "K7Q4M", "/Users/me"),
+            ("Omarchy", "K7Q-4M", "/Users/me\nApprove"),
+            ("", "K7Q-4M", "/Users/me"),
+            ("Omarchy", "K7Q-4M", ""),
+        ] {
+            assert!(
+                request(environment, code, directory).is_none(),
+                "{environment:?} {code} {directory:?}"
+            );
+        }
     }
 
     #[test]
