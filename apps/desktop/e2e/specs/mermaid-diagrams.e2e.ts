@@ -134,10 +134,15 @@ interface LandingSample {
   readonly at: number;
   /** How far below the visible top the selected message starts. */
   readonly target: number | null;
+  readonly targetVisible: boolean;
   /** Where the row holding the evicted diagram ends, relative to the visible top. */
   readonly diagramRowBottom: number | null;
   readonly diagramDrawn: boolean;
 }
+
+type ReadingTarget =
+  | { readonly kind: "user-prompt"; readonly text: string }
+  | { readonly kind: "visible-paragraph"; readonly prefix: string };
 
 async function saveEvidence(name: string): Promise<void> {
   await browser.saveScreenshot(NodePath.join(preparedArtifactDirectory, `${name}.png`));
@@ -551,9 +556,9 @@ interface ReadingLineSamples {
  * Samples, on a timer and after each painted frame, where the user row sent as `prompt`
  * starts and where the row holding the diagram labelled `diagramLabel` ends.
  */
-async function startReadingLineSamples(prompt: string, diagramLabel: string): Promise<void> {
+async function startReadingLineSamples(target: ReadingTarget, diagramLabel: string): Promise<void> {
   await browser.execute(
-    (surface: string, targetPrompt: string, label: string) => {
+    (surface: string, target: ReadingTarget, label: string) => {
       const record = window as unknown as {
         __bibcodeReadingLineSamples?: { timer: LandingSample[]; painted: LandingSample[] };
         __bibcodeReadingLineStop?: () => void;
@@ -562,20 +567,47 @@ async function startReadingLineSamples(prompt: string, diagramLabel: string): Pr
       const samples = { timer: [] as LandingSample[], painted: [] as LandingSample[] };
       record.__bibcodeReadingLineSamples = samples;
       const started = performance.now();
+      let selectedParagraph: string | null = null;
       const read = (): LandingSample => {
         const viewport = document
           .querySelector(`${surface} [class*='overflow-anchor']`)
           ?.parentElement?.getBoundingClientRect();
-        const target = [
-          ...document.querySelectorAll<HTMLElement>(`${surface} [data-message-role="user"]`),
-        ].find((element) => element.textContent?.includes(targetPrompt));
         const block = [
           ...document.querySelectorAll<HTMLElement>(`${surface} .chat-markdown-codeblock`),
         ].find((element) => element.textContent?.includes(label));
         const blockRow = block?.closest<HTMLElement>("[data-timeline-root]");
+        if (target.kind === "visible-paragraph" && !selectedParagraph && blockRow && viewport) {
+          selectedParagraph =
+            [...document.querySelectorAll<HTMLElement>(`${surface} .chat-markdown p`)].find(
+              (element) => {
+                const box = element.getBoundingClientRect();
+                return (
+                  element.textContent?.startsWith(target.prefix) &&
+                  box.top >= viewport.top + 16 &&
+                  box.bottom <= viewport.bottom - 16
+                );
+              },
+            )?.textContent ?? null;
+        }
+        const targetElement =
+          target.kind === "user-prompt"
+            ? [
+                ...document.querySelectorAll<HTMLElement>(`${surface} [data-message-role="user"]`),
+              ].find((element) => element.textContent?.includes(target.text))
+            : selectedParagraph
+              ? [...document.querySelectorAll<HTMLElement>(`${surface} .chat-markdown p`)].find(
+                  (element) => element.textContent === selectedParagraph,
+                )
+              : null;
+        const targetBox = targetElement?.getBoundingClientRect();
         return {
           at: performance.now() - started,
-          target: target && viewport ? target.getBoundingClientRect().top - viewport.top : null,
+          target: targetBox && viewport ? targetBox.top - viewport.top : null,
+          targetVisible:
+            !!targetBox &&
+            !!viewport &&
+            targetBox.top >= viewport.top &&
+            targetBox.bottom <= viewport.bottom,
           diagramRowBottom:
             blockRow && viewport ? blockRow.getBoundingClientRect().bottom - viewport.top : null,
           diagramDrawn: block?.querySelector(".chat-markdown-mermaid svg") != null,
@@ -602,7 +634,7 @@ async function startReadingLineSamples(prompt: string, diagramLabel: string): Pr
       };
     },
     visibleSurfaceSelector,
-    prompt,
+    target,
     diagramLabel,
   );
 }
@@ -625,6 +657,7 @@ function withoutRepeats(samples: ReadingLineSamples): ReadingLineSamples {
       (entry, index, all) =>
         index === 0 ||
         entry.target !== all[index - 1]!.target ||
+        entry.targetVisible !== all[index - 1]!.targetVisible ||
         entry.diagramRowBottom !== all[index - 1]!.diagramRowBottom ||
         entry.diagramDrawn !== all[index - 1]!.diagramDrawn,
     );
@@ -865,7 +898,10 @@ describe("packaged Mermaid diagrams", () => {
       if (step > 50) throw new Error("The minimap never offered the long reply's message.");
       await pressMinimapKey("ArrowDown");
     }
-    await startReadingLineSamples(mermaidFixturePrompts.long, "Fixture draw");
+    await startReadingLineSamples(
+      { kind: "user-prompt", text: mermaidFixturePrompts.long },
+      "Fixture draw",
+    );
     await pressMinimapKey("Enter");
     let landing: ReadingLineSamples = { timer: [], painted: [] };
     const landedAt = (entries: readonly LandingSample[]) =>
@@ -1280,36 +1316,27 @@ describe("packaged Mermaid diagrams", () => {
     );
     await expectPaintingWebview();
     await waitForRowsReplyUnmount({ width: 1_400, height: 900 }, "Fixture draw");
-    await startReadingLineSamples(mermaidFixturePrompts.long, "Fixture draw");
+    await startReadingLineSamples(
+      { kind: "visible-paragraph", prefix: "Following reply paragraph " },
+      "Fixture draw",
+    );
     for (let step = 0; ; step += 1) {
       // Two replies of 101 diagrams lie between the end and the rows reply.
       if (step > 300) throw new Error("Scrolling up never reached the rows reply.");
       const reached = await browser.execute(
-        (surface: string, diagramLabel: string, readingPrompt: string) => {
+        (surface: string, diagramLabel: string) => {
           const reachedBlock = [
             ...document.querySelectorAll<HTMLElement>(`${surface} .chat-markdown-codeblock`),
           ].some((element) => element.textContent?.includes(diagramLabel));
+          if (reachedBlock) return true;
           const scroller = document.querySelector<HTMLElement>(
             `${surface} [class*='overflow-anchor']`,
           );
-          if (reachedBlock && scroller) {
-            const readingRow = [
-              ...document.querySelectorAll<HTMLElement>(`${surface} [data-message-role="user"]`),
-            ].find((element) => element.textContent?.includes(readingPrompt));
-            const readingTop = readingRow
-              ? readingRow.getBoundingClientRect().top - scroller.getBoundingClientRect().top
-              : null;
-            if (readingTop !== null && readingTop < 120) {
-              scroller.scrollTop -= 120 - readingTop;
-            }
-            return true;
-          }
           if (scroller) scroller.scrollTop -= 300;
           return false;
         },
         visibleSurfaceSelector,
         "Fixture draw",
-        mermaidFixturePrompts.long,
       );
       if (reached) break;
       await browser.pause(250);
@@ -1323,7 +1350,7 @@ describe("packaged Mermaid diagrams", () => {
     // Timer samples can see layout no frame painted, so the check reads the painted frames.
     expect(coldDraw.painted.length).toBeGreaterThan(0);
     const appeared = coldDraw.painted.findIndex(
-      (entry) => entry.diagramRowBottom !== null && entry.target !== null && entry.target >= 0,
+      (entry) => entry.diagramRowBottom !== null && entry.targetVisible,
     );
     const drew = coldDraw.painted.findIndex(
       (entry, index) => index >= appeared && entry.diagramDrawn,
@@ -1339,7 +1366,12 @@ describe("packaged Mermaid diagrams", () => {
     expect(
       coldDraw.painted
         .slice(appeared)
-        .every((entry) => entry.target !== null && Math.abs(entry.target - readingLine) <= 1),
+        .every(
+          (entry) =>
+            entry.targetVisible &&
+            entry.target !== null &&
+            Math.abs(entry.target - readingLine) <= 1,
+        ),
     ).toBe(true);
     await saveEvidence("mermaid-timeline-cold-draw");
   }).timeout(900_000);

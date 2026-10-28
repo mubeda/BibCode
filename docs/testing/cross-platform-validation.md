@@ -3502,8 +3502,8 @@ an end gap needs diagnosis. The following cold-draw case uses the earlier rows
 and long replies. A second reply of 101 diagrams evicts earlier drawings;
 scrolling up remounts the
 rows reply, whose diagram shows its source and draws again above the message
-being read. The case places that message 120 px below the visible top before it
-checks that it stays within 1 px on every painted frame
+being read. The case selects a paragraph visible in the following reply when
+the diagram row remounts, then checks that it stays within 1 px on every painted frame
 (`mermaid-timeline-cold-draw.json`). The case first waits up to 15 s, at
 the end, for the rows reply's row to unmount; if it does not, the failure and
 `mermaid-timeline-unmount-wait.json` list the mounted rows, LegendList's
