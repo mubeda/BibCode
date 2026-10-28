@@ -303,13 +303,25 @@ async fn cursor_runtime_matches_approval_and_cancel_traces() {
             .await
     });
     let mut approval_events = runtime.collect_events(4).await;
+    let approval_request_id = approval_events
+        .iter()
+        .find(|event| event.event_type == "request.opened")
+        .and_then(|event| event.request_id.clone())
+        .expect("approval id");
+    assert!(approval_request_id.starts_with("approval:"));
+    assert!(approval_request_id.ends_with(":1001"));
+    let scope = approval_request_id
+        .strip_prefix("approval:")
+        .and_then(|id| id.strip_suffix(":1001"))
+        .expect("scoped approval id");
+    uuid::Uuid::parse_str(scope).expect("connection scope UUID");
     let approval_turn = timeout(Duration::from_millis(100), &mut approval_task)
         .await
         .expect("send_turn should return while approval is pending")
         .expect("approval join")
         .expect("approval turn");
     runtime
-        .respond_to_request("approval:1001", "accept")
+        .respond_to_request(&approval_request_id, "accept")
         .await
         .expect("approval response");
     approval_events.extend(runtime.collect_events(5).await);
@@ -328,6 +340,7 @@ async fn cursor_runtime_matches_approval_and_cancel_traces() {
             })
     );
     normalize_turn_ids(&mut approval_events, &approval_turn, "turn-3");
+    normalize_request_id(&mut approval_events, &approval_request_id, "approval:1001");
     assert_eq!(approval_events, stable_fixture("trace-approval.json"));
 
     let cancel_runtime = runtime.clone();
@@ -341,6 +354,8 @@ async fn cursor_runtime_matches_approval_and_cancel_traces() {
     let cancel_turn_id = cancel_started.turn_id.clone().expect("cancel turn id");
     let request_opened = runtime.next_event().await.expect("request opened");
     assert_eq!(request_opened.event_type, "request.opened");
+    let cancel_request_id = request_opened.request_id.as_deref().expect("cancel id");
+    assert!(cancel_request_id.ends_with(":1002"));
     let returned_cancel_turn_id = timeout(Duration::from_millis(100), &mut cancel_task)
         .await
         .expect("send_turn should return while permission is pending")
@@ -351,6 +366,7 @@ async fn cursor_runtime_matches_approval_and_cancel_traces() {
     let mut cancel_events = vec![cancel_started.stable_view(), request_opened.stable_view()];
     cancel_events.extend(runtime.collect_events(2).await);
     normalize_turn_ids(&mut cancel_events, &cancel_turn_id, "turn-10");
+    normalize_request_id(&mut cancel_events, cancel_request_id, "approval:1002");
     assert_eq!(cancel_events, stable_fixture("trace-cancel.json"));
 
     peer_task.await.expect("peer");
@@ -1535,12 +1551,12 @@ async fn cursor_runtime_covers_resume_permission_and_notification_edges() {
             .send_turn(Some("permission"), Vec::new())
             .await
             .expect("permission turn");
-        let request_id = format!("approval:{wire_id}");
-        next_cursor_event_matching(&runtime, |event| {
-            event.event_type == "request.opened"
-                && event.request_id.as_deref() == Some(request_id.as_str())
-        })
-        .await;
+        let opened =
+            next_cursor_event_matching(&runtime, |event| event.event_type == "request.opened")
+                .await;
+        let request_id = opened.request_id.expect("approval id");
+        assert!(request_id.starts_with("approval:"));
+        assert!(request_id.ends_with(&format!(":{wire_id}")));
         runtime
             .respond_to_request(&request_id, decision)
             .await
@@ -1556,15 +1572,17 @@ async fn cursor_runtime_covers_resume_permission_and_notification_edges() {
         .send_turn(Some("normalize answers"), Vec::new())
         .await
         .expect("input turn");
-    let requested = next_cursor_event_matching(&runtime, |event| {
-        event.request_id.as_deref() == Some("user-input:5003")
-    })
-    .await;
+    let requested =
+        next_cursor_event_matching(&runtime, |event| event.event_type == "user-input.requested")
+            .await;
+    let input_request_id = requested.request_id.as_deref().expect("input id");
+    assert!(input_request_id.starts_with("user-input:"));
+    assert!(input_request_id.ends_with(":5003"));
     assert_eq!(requested.payload["questions"][0]["id"], "Targets");
     assert_eq!(requested.payload["questions"][1]["id"], "");
     runtime
         .respond_to_user_input(
-            "user-input:5003",
+            input_request_id,
             json!({
                 "array": ["server", "desktop"],
                 "string": "all",
@@ -1583,12 +1601,13 @@ async fn cursor_runtime_covers_resume_permission_and_notification_edges() {
         .send_turn(Some("cancel prompt"), Vec::new())
         .await
         .expect("cancel input turn");
-    next_cursor_event_matching(&runtime, |event| {
-        event.request_id.as_deref() == Some("user-input:5004")
-    })
-    .await;
+    let cancel_request =
+        next_cursor_event_matching(&runtime, |event| event.event_type == "user-input.requested")
+            .await;
+    let cancel_request_id = cancel_request.request_id.as_deref().expect("cancel id");
+    assert!(cancel_request_id.ends_with(":5004"));
     runtime
-        .respond_to_request("user-input:5004", "cancel")
+        .respond_to_request(cancel_request_id, "cancel")
         .await
         .expect("generic cancellation");
     next_cursor_event_matching(&runtime, |event| {
@@ -1730,6 +1749,18 @@ fn normalize_turn_ids(
     for event in events {
         if event.turn_id.as_deref() == Some(actual_turn_id) {
             event.turn_id = Some(stable_turn_id.to_owned());
+        }
+    }
+}
+
+fn normalize_request_id(
+    events: &mut [cursor::CursorRuntimeEventStableView],
+    actual: &str,
+    fixture_id: &str,
+) {
+    for event in events {
+        if event.request_id.as_deref() == Some(actual) {
+            event.request_id = Some(fixture_id.to_owned());
         }
     }
 }

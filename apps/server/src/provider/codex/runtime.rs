@@ -44,7 +44,8 @@ use super::{
     protocol::{IncomingEvent, JsonRpcConnection, ProtocolError},
 };
 use crate::provider::{
-    OptionRefusal, RefusedOption, model_unavailable_refusal, unsupported_option_refusal,
+    OptionRefusal, RefusedOption, RequestScope, model_unavailable_refusal,
+    unsupported_option_refusal,
 };
 
 const PROVIDER: &str = "codex";
@@ -1713,9 +1714,12 @@ impl CodexSessionRuntime {
     ) -> Option<JoinHandle<()>> {
         let previous = self.detach_incoming();
         let runtime = self.clone();
+        let request_scope = RequestScope::new();
         let task = tokio::spawn(async move {
             while let Some(event) = incoming.recv().await {
-                runtime.handle_incoming(connection.clone(), event).await;
+                runtime
+                    .handle_incoming(connection.clone(), request_scope, event)
+                    .await;
             }
         });
         *self
@@ -2436,7 +2440,12 @@ impl CodexSessionRuntime {
         }
     }
 
-    async fn handle_incoming(&self, connection: JsonRpcConnection, event: IncomingEvent) {
+    async fn handle_incoming(
+        &self,
+        connection: JsonRpcConnection,
+        request_scope: RequestScope,
+        event: IncomingEvent,
+    ) {
         if *self.inner.explicit_close.lock().await {
             return;
         }
@@ -2459,7 +2468,14 @@ impl CodexSessionRuntime {
                 params,
             } => {
                 if let Err(error) = self
-                    .handle_request(connection, correlation_id, wire_id, method, params)
+                    .handle_request(
+                        connection,
+                        request_scope,
+                        correlation_id,
+                        wire_id,
+                        method,
+                        params,
+                    )
                     .await
                 {
                     self.emit(
@@ -2910,6 +2926,7 @@ impl CodexSessionRuntime {
     async fn handle_request(
         &self,
         connection: JsonRpcConnection,
+        request_scope: RequestScope,
         correlation_id: String,
         wire_id: Value,
         method: String,
@@ -2917,7 +2934,7 @@ impl CodexSessionRuntime {
     ) -> Result<(), RuntimeError> {
         match method.as_str() {
             "item/commandExecution/requestApproval" => {
-                let request_id = format!("approval:{correlation_id}");
+                let request_id = request_scope.approval_id(&correlation_id);
                 let turn_id = params
                     .get("turnId")
                     .and_then(Value::as_str)
@@ -2948,7 +2965,7 @@ impl CodexSessionRuntime {
                 Ok(())
             }
             "item/fileChange/requestApproval" => {
-                let request_id = format!("approval:{correlation_id}");
+                let request_id = request_scope.approval_id(&correlation_id);
                 let turn_id = params
                     .get("turnId")
                     .and_then(Value::as_str)
@@ -2978,7 +2995,7 @@ impl CodexSessionRuntime {
                 Ok(())
             }
             "item/tool/requestUserInput" => {
-                let request_id = format!("user-input:{correlation_id}");
+                let request_id = request_scope.user_input_id(&correlation_id);
                 let turn_id = params
                     .get("turnId")
                     .and_then(Value::as_str)
@@ -5254,6 +5271,7 @@ mod tests {
         runtime
             .handle_incoming(
                 connection,
+                RequestScope::new(),
                 IncomingEvent::Closed {
                     reason: "transport failed".to_owned(),
                 },
@@ -5284,6 +5302,33 @@ mod tests {
                 .is_err(),
             "the runtime retains its event sender after loss; consumers must handle session.exited"
         );
+    }
+
+    #[tokio::test]
+    async fn replacing_codex_incoming_connection_changes_the_request_scope() {
+        let (connection_a, _protocol_a, _stdout_a, _stdin_a, _stderr_a) = runtime_test_connection();
+        let (sender_a, incoming_a) = mpsc::unbounded_channel();
+        let runtime =
+            CodexSessionRuntime::new(reconciliation_test_options(), connection_a, incoming_a);
+        let request = || IncomingEvent::Request {
+            correlation_id: "1".to_owned(),
+            wire_id: json!(1),
+            method: "item/commandExecution/requestApproval".to_owned(),
+            params: json!({"reason":"Approve"}),
+        };
+        sender_a.send(request()).expect("first request");
+        let first = runtime.next_event().await.expect("first event");
+        assert_eq!(first.event_type, "request.opened");
+
+        let (connection_b, _protocol_b, _stdout_b, _stdin_b, _stderr_b) = runtime_test_connection();
+        let (sender_b, incoming_b) = mpsc::unbounded_channel();
+        if let Some(previous) = runtime.attach_incoming(connection_b, incoming_b) {
+            let _ = previous.await;
+        }
+        sender_b.send(request()).expect("second request");
+        let second = runtime.next_event().await.expect("second event");
+        assert_eq!(second.event_type, "request.opened");
+        assert_ne!(first.request_id, second.request_id);
     }
 
     async fn assert_mcp_status_discovery_failure(responses: Vec<Value>, expected_warning: &str) {

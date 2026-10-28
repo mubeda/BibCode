@@ -2658,7 +2658,10 @@ Requests also settle without an answer:
   expires them (`reason: "session-ended"`): those asks end with the session.
   At startup, after abandoned sessions are reconciled, requests still open on
   such threads whose session is not live expire the same way
-  (`sessionStatus: "settled"`).
+  (`sessionStatus: "settled"`). That pass runs once before provider sessions
+  start. Each selected request gets a fresh command and activity identity:
+  provider request IDs can repeat across threads or later processes, while
+  committed expiries leave no open request for the next startup to select.
 - **OpenCode no longer lists it.** OpenCode's server outlives a BiBCode session
   and a BiBCode restart, so its session ending proves nothing and the startup
   pass skips it (`EXTERNALLY_RESUMABLE_PROVIDERS`). On resume, a completed read

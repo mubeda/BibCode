@@ -6,6 +6,7 @@ use serde_json::{Value, json};
 use super::{EngineOptions, OrchestrationCommand, OrchestrationEngine};
 use crate::orchestration::StartupProcessOwnership;
 use crate::persistence::{Database, ProjectionThread, run_migrations};
+use crate::provider::RequestScope;
 
 const AT: &str = "2026-10-27T10:00:00.000Z";
 
@@ -465,6 +466,302 @@ async fn startup_expires_the_requests_no_live_session_holds_once() {
             .unwrap(),
         0,
         "a second startup expires nothing again"
+    );
+}
+
+#[tokio::test]
+async fn startup_expires_the_same_provider_question_id_on_two_settled_threads() {
+    let (engine, first) = engine().await;
+    let second = "second-thread";
+    engine
+        .dispatch(command(json!({
+            "type":"thread.create", "commandId":"second-thread", "threadId":second,
+            "projectId":"status-project", "title":"Second",
+            "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+            "runtimeMode":"full-access", "interactionMode":"default",
+            "branch":null, "worktreePath":null, "createdAt":AT
+        })))
+        .await
+        .expect("second thread");
+
+    for thread_id in [&first[..], second] {
+        session(&engine, thread_id, "ready", AT).await;
+        activity(
+            &engine,
+            thread_id,
+            "user-input.requested",
+            json!({"requestId":"user-input:1","questions":[]}),
+        )
+        .await;
+        assert_eq!(open_requests(&engine, thread_id).await, (0, 1));
+    }
+    engine
+        .repositories()
+        .database()
+        .call(|connection| {
+            connection.execute(
+                "INSERT INTO orchestration_command_receipts
+                 (command_id, aggregate_kind, aggregate_id, accepted_at, result_sequence, status)
+                 VALUES ('queued-command', 'thread', 'second-thread', ?, 9999, 'accepted')",
+                [AT],
+            )?;
+            connection.execute(
+                "INSERT INTO provider_turn_outbox
+                 (command_id, thread_id, message_id, provider_instance_id, provider_kind,
+                  delivery_key, payload_json, state, created_at, updated_at)
+                 VALUES ('queued-command', 'second-thread', 'queued-message', 'codex', 'codex',
+                  'queued-key', '{}', 'queued', ?, ?)",
+                [AT, AT],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("queued follow-up");
+    assert!(
+        !engine
+            .repositories()
+            .can_promote_queued_provider_turn(second.to_owned(), "queued-message".to_owned(), true)
+            .await
+            .expect("question holds queue")
+    );
+
+    assert_eq!(
+        engine
+            .expire_requests_of_settled_sessions(&StartupProcessOwnership::default())
+            .await
+            .expect("startup expiry"),
+        2
+    );
+    for thread_id in [&first[..], second] {
+        assert_eq!(open_requests(&engine, thread_id).await, (0, 0));
+        assert_eq!(
+            activity_kinds(&engine, thread_id)
+                .await
+                .iter()
+                .filter(|kind| kind.as_str() == "user-input.expired")
+                .count(),
+            1
+        );
+    }
+    assert!(
+        engine
+            .repositories()
+            .can_promote_queued_provider_turn(second.to_owned(), "queued-message".to_owned(), true)
+            .await
+            .expect("expired question releases queue")
+    );
+    assert_eq!(
+        engine
+            .expire_requests_of_settled_sessions(&StartupProcessOwnership::default())
+            .await
+            .expect("repeated startup"),
+        0
+    );
+}
+
+#[tokio::test]
+async fn startup_expires_a_new_question_that_reuses_the_same_provider_id() {
+    let (engine, thread_id) = engine().await;
+    session(&engine, &thread_id, "ready", AT).await;
+    for occurrence in 1..=2 {
+        activity(
+            &engine,
+            &thread_id,
+            "user-input.requested",
+            json!({"requestId":"user-input:1","questions":[]}),
+        )
+        .await;
+        assert_eq!(open_requests(&engine, &thread_id).await, (0, 1));
+        assert_eq!(
+            engine
+                .expire_requests_of_settled_sessions(&StartupProcessOwnership::default())
+                .await
+                .expect("startup expiry"),
+            1
+        );
+        assert_eq!(open_requests(&engine, &thread_id).await, (0, 0));
+        assert_eq!(
+            activity_kinds(&engine, &thread_id)
+                .await
+                .iter()
+                .filter(|kind| kind.as_str() == "user-input.expired")
+                .count(),
+            occurrence
+        );
+    }
+    assert_eq!(
+        engine
+            .expire_requests_of_settled_sessions(&StartupProcessOwnership::default())
+            .await
+            .expect("repeated startup"),
+        0
+    );
+}
+
+#[tokio::test]
+async fn startup_repairs_an_open_question_after_a_legacy_expiry_receipt() {
+    let (engine, first) = engine().await;
+    session(&engine, &first, "ready", AT).await;
+    activity(
+        &engine,
+        &first,
+        "user-input.requested",
+        json!({"requestId":"user-input:1","questions":[]}),
+    )
+    .await;
+    engine
+        .dispatch(command(json!({
+            "type":"thread.activity.append",
+            "commandId":"server:startup-expiry:user-input.expired:user-input:1",
+            "threadId":first, "createdAt":AT,
+            "activity":{
+                "id":"user-input.expired:user-input:1:startup",
+                "tone":"approval", "kind":"user-input.expired",
+                "summary":"Question expired",
+                "payload":{"requestId":"user-input:1","reason":"session-ended"},
+                "turnId":null, "createdAt":AT
+            }
+        })))
+        .await
+        .expect("legacy accepted expiry");
+    assert_eq!(open_requests(&engine, &first).await, (0, 0));
+
+    let second = "legacy-second";
+    engine
+        .dispatch(command(json!({
+            "type":"thread.create", "commandId":"legacy-second", "threadId":second,
+            "projectId":"status-project", "title":"Second",
+            "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+            "runtimeMode":"full-access", "interactionMode":"default",
+            "branch":null, "worktreePath":null, "createdAt":AT
+        })))
+        .await
+        .expect("second thread");
+    session(&engine, second, "ready", AT).await;
+    activity(
+        &engine,
+        second,
+        "user-input.requested",
+        json!({"requestId":"user-input:1","questions":[]}),
+    )
+    .await;
+    assert_eq!(open_requests(&engine, second).await, (0, 1));
+    assert_eq!(
+        engine
+            .expire_requests_of_settled_sessions(&StartupProcessOwnership::default())
+            .await
+            .expect("new startup expiry"),
+        1
+    );
+    assert_eq!(open_requests(&engine, second).await, (0, 0));
+    assert_eq!(
+        activity_kinds(&engine, second)
+            .await
+            .iter()
+            .filter(|kind| kind.as_str() == "user-input.expired")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn startup_expires_a_legacy_pending_approval_without_an_ask_activity() {
+    let (engine, thread_id) = engine().await;
+    session(&engine, &thread_id, "ready", AT).await;
+    let row_thread = thread_id.clone();
+    engine
+        .repositories()
+        .database()
+        .call(move |connection| {
+            connection.execute(
+                "INSERT INTO projection_pending_approvals
+                 (request_id, thread_id, turn_id, status, decision, created_at, resolved_at)
+                 VALUES ('approval:legacy', ?, NULL, 'pending', NULL, ?, NULL)",
+                rusqlite::params![&row_thread, AT],
+            )?;
+            connection.execute(
+                "UPDATE projection_threads SET pending_approval_count = 1 WHERE thread_id = ?",
+                [&row_thread],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("legacy pending approval");
+    assert_eq!(open_requests(&engine, &thread_id).await, (1, 0));
+    assert_eq!(
+        engine
+            .expire_requests_of_settled_sessions(&StartupProcessOwnership::default())
+            .await
+            .expect("startup expiry"),
+        1
+    );
+    assert_eq!(open_requests(&engine, &thread_id).await, (0, 0));
+    assert_eq!(
+        engine
+            .repositories()
+            .get_pending_approval("approval:legacy".to_owned())
+            .await
+            .expect("approval")
+            .expect("row")
+            .status,
+        "expired"
+    );
+}
+
+#[tokio::test]
+async fn two_scoped_approval_requests_keep_independent_pending_rows() {
+    let (engine, first) = engine().await;
+    let second = "approval-second";
+    engine
+        .dispatch(command(json!({
+            "type":"thread.create", "commandId":"approval-second", "threadId":second,
+            "projectId":"status-project", "title":"Second",
+            "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+            "runtimeMode":"approval-required", "interactionMode":"default",
+            "branch":null, "worktreePath":null, "createdAt":AT
+        })))
+        .await
+        .expect("second thread");
+    let first_id = RequestScope::new().approval_id("1");
+    let second_id = RequestScope::new().approval_id("1");
+    assert_ne!(first_id, second_id);
+    for (thread_id, request_id) in [(&first[..], &first_id), (second, &second_id)] {
+        session(&engine, thread_id, "running", AT).await;
+        activity(
+            &engine,
+            thread_id,
+            "approval.requested",
+            json!({"requestId":request_id,"requestKind":"command"}),
+        )
+        .await;
+        assert_eq!(open_requests(&engine, thread_id).await, (1, 0));
+        let row = engine
+            .repositories()
+            .get_pending_approval(request_id.clone())
+            .await
+            .expect("approval")
+            .expect("row");
+        assert_eq!(row.thread_id, thread_id);
+    }
+
+    activity(
+        &engine,
+        &first,
+        "approval.resolved",
+        json!({"requestId":first_id,"decision":"accept"}),
+    )
+    .await;
+    assert_eq!(open_requests(&engine, &first).await, (0, 0));
+    assert_eq!(open_requests(&engine, second).await, (1, 0));
+    assert_eq!(
+        engine
+            .repositories()
+            .get_pending_approval(second_id)
+            .await
+            .expect("second approval")
+            .expect("row")
+            .status,
+        "pending"
     );
 }
 

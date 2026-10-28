@@ -2866,8 +2866,9 @@ impl OrchestrationEngine {
     /// provider holds it now. Builds before #187 left such requests open forever. A thread whose
     /// provider work may outlive BiBCode (an OpenCode server the user runs, by `ownership`, the
     /// rule that also decides which subagents startup closes) is skipped: its resume decides.
-    /// Each expiry is an ordinary activity, keyed by its request, so a repeated startup appends
-    /// nothing twice. Returns how many it expired.
+    /// Each expiry is an ordinary activity. Its committed open state makes a repeated startup
+    /// append nothing; a fresh identity avoids a receipt from another thread or an earlier ask.
+    /// Returns how many it expired.
     pub async fn expire_requests_of_settled_sessions(
         &self,
         ownership: &super::StartupProcessOwnership,
@@ -2915,8 +2916,9 @@ impl OrchestrationEngine {
             .map_err(|error| OrchestrationError::Persistence(Arc::new(error)))?;
         let created_at = now_rfc3339();
         for (thread_id, kind, request_id, turn_id) in &requests {
+            let expiry_id = Uuid::new_v4();
             self.dispatch_plain(request_expiry_command(
-                format!("server:startup-expiry:{kind}:{request_id}"),
+                format!("server:startup-expiry:{expiry_id}"),
                 thread_id,
                 kind,
                 turn_id.clone(),
@@ -2926,7 +2928,7 @@ impl OrchestrationEngine {
                     "sessionStatus": "settled",
                 }),
                 &created_at,
-                format!("{kind}:{request_id}:startup"),
+                format!("startup-expiry:{expiry_id}"),
             ))
             .await?;
         }
