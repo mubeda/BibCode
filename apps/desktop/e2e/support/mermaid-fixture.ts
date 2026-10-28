@@ -22,6 +22,7 @@ export const mermaidFixturePrompts = {
   manyAgain: "reply with deterministic second mermaid evictions",
   streamed: "reply with deterministic streamed mermaid",
   streamedPlain: "reply with deterministic streamed plain code",
+  keyboard: "reply with deterministic streamed keyboard text",
 } as const;
 
 /** A diagram source with only labels the packaged checks look for. */
@@ -66,14 +67,27 @@ export const mermaidFixtureReplies: Readonly<Record<string, string>> = {
 /** The streamed reply's last line, which the timeline follows while the reply streams. */
 export const mermaidFixtureStreamedLastLine = "Last streamed line.";
 
+/** The keyboard reply's last line. */
+export const mermaidFixtureKeyboardLastLine = "Last keyboard line.";
+
 /**
  * Replies the fixture provider streams one delta per chunk. `streamed` is taller than the
  * timeline before its diagram, so the list follows its end when the diagram's closing fence
- * arrives and the diagram draws, with more text still to come after it.
+ * arrives and the diagram draws, with more text still to come after it. `keyboard` is taller
+ * than the timeline from its first delivery and streams for about nine seconds, long enough
+ * for a reader to scroll away with the keyboard mid-glide, read while it grows, and return.
  */
 export const mermaidFixtureStreamedReplies: Readonly<Record<string, readonly string[]>> = {
   [mermaidFixturePrompts.streamed]: streamedReply("mermaid"),
   [mermaidFixturePrompts.streamedPlain]: streamedReply("text"),
+  [mermaidFixturePrompts.keyboard]: [
+    `Keyboard reply intro.\n\n${filler("Keyboard before", 30)}\n\n`,
+    ...Array.from(
+      { length: 30 },
+      (_, index) => `Keyboard streamed paragraph ${String(index + 1)} keeps the end in view.\n\n`,
+    ),
+    mermaidFixtureKeyboardLastLine,
+  ],
 };
 
 /**
