@@ -70,7 +70,11 @@ use crate::{
 const CLAUDE_PROBE_OUTPUT_LIMIT: usize = 64 * 1024;
 const CLAUDE_CAPABILITY_CACHE_CAPACITY: usize = 64;
 const CLAUDE_CAPABILITY_PROBE_CONCURRENCY: usize = 8;
-const CLAUDE_PREPARATION_BUDGET: Duration = Duration::from_millis(3_250);
+/// The probe runner's own 2 s timeout bounds the slowest step (the attestation's `codesign` is
+/// capped at 500 ms and runs beside it), plus 250 ms to pin, write the overlay and bind the
+/// listener. A healthy preparation takes 0.2-0.4 s, also under load. See "Preparation budgets"
+/// in docs/architecture/activity-observation.md.
+const CLAUDE_PREPARATION_BUDGET: Duration = Duration::from_millis(2_250);
 const CLAUDE_HOOK_BODY_LIMIT: usize = 1024 * 1024;
 const CLAUDE_HOOK_QUEUE_CAPACITY: usize = 128;
 const CLAUDE_HOOK_REQUEST_CAPACITY: usize = 32;
@@ -618,6 +622,10 @@ impl ClaudeTerminalObserverFactory {
 impl ProviderTerminalObserverFactory for ClaudeTerminalObserverFactory {
     fn requires_private_executable_pin(&self) -> bool {
         true
+    }
+
+    fn preparation_budget(&self) -> Duration {
+        CLAUDE_PREPARATION_BUDGET
     }
 
     fn prepare(

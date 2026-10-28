@@ -41,10 +41,13 @@ use crate::{
 
 const DEFAULT_SUBPROCESS_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const OBSERVER_CALLBACK_TIMEOUT: Duration = Duration::from_millis(500);
-const MAX_PREPARATION_EXECUTION_BUDGET: Duration = Duration::from_secs(1);
+/// A hard stop for a preparer that asks to be waited for too long. It sits above every provider's
+/// own budget plus the supervisor's slack (a test holds it there), so it never cuts a provider
+/// short; the default wait, when the preparer names none, is `OBSERVER_CALLBACK_TIMEOUT`.
+pub(crate) const MAX_PREPARATION_EXECUTION_BUDGET: Duration = Duration::from_secs(3);
 /// The native form of a provider command may need a cold capability probe, which OpenCode's
 /// allows 900 ms; giving up sooner would launch a command the installed version rejects.
-const NATIVE_COMMAND_TIMEOUT: Duration = MAX_PREPARATION_EXECUTION_BUDGET;
+const NATIVE_COMMAND_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_ISOLATED_OBSERVER_CALLBACKS: usize = 8;
 const MAX_GLOBAL_ISOLATED_OBSERVER_CALLBACKS: usize = 16;
 const MAX_BLOCKING_THREADS_PER_ISOLATED_OBSERVER_CALLBACK: usize = 1;

@@ -7,6 +7,8 @@ mod pty;
 
 pub use input::TerminalInputError;
 pub(crate) use input::{InputReadmissionScope, TerminalInputAdmission};
+#[cfg(test)]
+pub(crate) use manager::MAX_PREPARATION_EXECUTION_BUDGET;
 pub(crate) use manager::TerminalSessionIdentity;
 pub use manager::{
     AttachmentItem, SubprocessInspection, TerminalAttachment, TerminalError, TerminalEventReceiver,

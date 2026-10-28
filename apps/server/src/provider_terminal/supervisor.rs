@@ -31,6 +31,12 @@ use crate::{
 
 const MAX_OPERATIONAL_WARNINGS: usize = 64;
 const PUBLICATION_LOCK_PRUNE_THRESHOLD: usize = 256;
+/// How long past a factory's own preparation budget the manager keeps waiting, so the factory's
+/// timeout always fires first and cleans up before the manager gives up on the launch.
+const PREPARATION_OUTER_SLACK: Duration = Duration::from_millis(150);
+/// What the manager waits for a launch whose factory cannot be named: the validation below
+/// failed, so preparation passes through almost at once.
+const DEFAULT_PREPARATION_EXECUTION_BUDGET: Duration = Duration::from_millis(500);
 const RACED_PREPARATION_WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
 const RACED_PREPARATION_WORKER_ABORT_TIMEOUT: Duration = Duration::from_millis(50);
 // Four slots per process admitted by the 16-helper supervisor bound absorb
@@ -240,6 +246,14 @@ impl fmt::Debug for ProviderTerminalObserverFactoryInput {
 pub trait ProviderTerminalObserverFactory: Send + Sync {
     fn requires_private_executable_pin(&self) -> bool {
         false
+    }
+
+    /// How long `prepare` may run before it gives up and the terminal runs unobserved. The factory
+    /// enforces it itself; the supervisor adds `PREPARATION_OUTER_SLACK` for the manager's wait,
+    /// so this is the one number that decides how long `terminal.open` can block on a launch that
+    /// is slow to prepare. The default is Codex's.
+    fn preparation_budget(&self) -> Duration {
+        Duration::from_millis(350)
     }
 
     fn prepare(
@@ -1127,11 +1141,18 @@ impl TerminalLaunchPreparer for ProviderTerminalActivitySupervisor {
     ) -> Pin<Box<dyn Future<Output = Duration> + Send + '_>> {
         let input = input.clone();
         Box::pin(async move {
-            let default = Duration::from_millis(500);
-            // Status observation prepares OpenCode with activity off too (#187).
-            if input.activity.driver_kind != "opencode" {
+            let default = DEFAULT_PREPARATION_EXECUTION_BUDGET;
+            // A driver whose budget fits the default needs no validation to be waited for that
+            // long, so such a launch costs no extra inventory read.
+            let Some(budget) = self
+                .factory_for(&input.activity.driver_kind)
+                .map(|factory| factory.preparation_budget() + PREPARATION_OUTER_SLACK)
+                .filter(|budget| *budget > default)
+            else {
                 return default;
-            }
+            };
+            // Only a launch of a configured, enabled provider earns the longer wait, so a
+            // client cannot name a driver to hold `terminal.open` open.
             let Ok(inventory) = self.authority.current().await else {
                 return default;
             };
@@ -1141,11 +1162,10 @@ impl TerminalLaunchPreparer for ProviderTerminalActivitySupervisor {
             if !instance.enabled
                 || instance.driver_kind != input.activity.driver_kind
                 || validated_executable(&input, instance).is_none()
-                || self.factory_for(&instance.driver_kind).is_none()
             {
                 return default;
             }
-            Duration::from_secs(1)
+            budget
         })
     }
 
@@ -1291,6 +1311,37 @@ fn restrict_runtime_directory(_runtime_dir: &Path) -> Result<(), String> {
 
 #[cfg(all(test, unix))]
 mod tests {
+    /// #200: the manager's ceiling must never cut a provider's own budget short. Each factory
+    /// owns its budget, and what the manager waits is that plus the supervisor's slack.
+    #[tokio::test]
+    async fn the_manager_ceiling_never_undercuts_a_provider_budget() {
+        use super::{PREPARATION_OUTER_SLACK, ProviderTerminalObserverFactory};
+        use crate::provider_terminal::{
+            ClaudeTerminalObserverFactory, CodexTerminalObserverFactory,
+            OpenCodeTerminalObserverFactory,
+        };
+
+        let ceiling = crate::terminal::MAX_PREPARATION_EXECUTION_BUDGET;
+        for (provider, budget) in [
+            (
+                "codex",
+                CodexTerminalObserverFactory::system().preparation_budget(),
+            ),
+            (
+                "claude",
+                ClaudeTerminalObserverFactory::system().preparation_budget(),
+            ),
+            (
+                "opencode",
+                OpenCodeTerminalObserverFactory::system().preparation_budget(),
+            ),
+        ] {
+            assert!(
+                budget + PREPARATION_OUTER_SLACK <= ceiling,
+                "{provider} waits {budget:?} plus slack, but the manager stops at {ceiling:?}"
+            );
+        }
+    }
 
     #[cfg(feature = "hermetic-test-guard")]
     #[test]
