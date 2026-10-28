@@ -4,13 +4,15 @@
  * The sidebar prewarmer keeps a thread's subscription warm without React holding its data, and
  * the subscription outlives the prewarmer for the idle retention window only.
  */
-import { THREAD_STATE_IDLE_TTL_MS } from "../../../../packages/client-runtime/src/state/threadRetention";
 import { EnvironmentId, ThreadId } from "@bibcode/contracts";
 import { RegistryContext } from "@effect/atom-react";
-import { AsyncResult, Atom, AtomRegistry } from "effect/reactivity";
+import { AtomRegistry } from "effect/reactivity";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
+
+// The real thread state atom's TTL is pinned in client-runtime's threads-atoms.test.ts.
+const THREAD_STATE_IDLE_TTL_MS = vi.hoisted(() => 5 * 60_000);
 
 const harness = vi.hoisted(() => ({
   mounted: new Map<string, number>(),
@@ -25,7 +27,6 @@ vi.mock("@bibcode/client-runtime/state/threads", async (importOriginal) => {
   const { Atom } = await import("effect/reactivity");
   const { AsyncResult } = await import("effect/reactivity");
   const original = await importOriginal<typeof import("@bibcode/client-runtime/state/threads")>();
-  const retention = await import("../../../../packages/client-runtime/src/state/threadRetention");
   return {
     ...original,
     createThreadEnvironmentAtoms: () => ({}),
@@ -41,7 +42,7 @@ vi.mock("@bibcode/client-runtime/state/threads", async (importOriginal) => {
             harness.released.set(threadId, (harness.released.get(threadId) ?? 0) + 1),
           );
           return AsyncResult.success(original.EMPTY_ENVIRONMENT_THREAD_STATE);
-        }).pipe(Atom.setIdleTTL(retention.THREAD_STATE_IDLE_TTL_MS));
+        }).pipe(Atom.setIdleTTL(THREAD_STATE_IDLE_TTL_MS));
         harness.atoms.set(threadId, atom);
         return atom;
       },
