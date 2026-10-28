@@ -29,16 +29,16 @@ describe("activityRecordTimeLabel", () => {
       "Stopped after 1h",
     );
     expect(activityRecordTimeLabel(record("interrupted", "2026-08-11T19:55:00.000Z"), now)).toBe(
-      "Interrupted 5m ago",
+      "Interrupted after 4d",
     );
   });
 
   it("explains a missing Stop with the provider's name", () => {
     expect(activityStopUnavailableReason("claudeAgent")).toBe(
-      "Claude hasn't reported a way to stop this subagent yet.",
+      "Claude can't stop this subagent on its own. Stop the turn to end it.",
     );
     expect(activityStopUnavailableReason("custom")).toBe(
-      "The provider hasn't reported a way to stop this subagent yet.",
+      "The provider can't stop this subagent on its own. Stop the turn to end it.",
     );
   });
 });

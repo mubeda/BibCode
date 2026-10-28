@@ -252,7 +252,7 @@ describe("ActivityRoster targeted cancellation controls", () => {
       '[data-activity-control-unavailable="unsupported"]',
     );
     expect(unavailable?.textContent).toBe(
-      "Stop unavailable. Codex hasn't reported a way to stop this subagent yet.",
+      "Stop unavailable. Codex can't stop this subagent on its own. Stop the turn to end it.",
     );
     expect(unavailable?.getAttribute("tabindex")).toBe("0");
     expect(unavailable?.closest("button")).toBeNull();
@@ -302,7 +302,7 @@ describe("ActivityRoster targeted cancellation controls", () => {
     const row = doneSection?.querySelector('button[data-activity-row="interrupted"]');
     expect(row?.textContent).toContain("Interrupted");
     expect(row?.textContent).toContain(reason);
-    expect(row?.textContent).toContain("Interrupted 2m ago");
+    expect(row?.textContent).toContain("Interrupted after 4d");
     expect(row?.textContent).not.toContain("Completed in");
     expect(
       container.querySelector('[aria-labelledby="activity-subagents-active"]')?.textContent ?? "",
