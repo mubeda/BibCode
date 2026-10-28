@@ -136,6 +136,8 @@ interface CenterPanelStoreState {
     existingTerminalIds: ReadonlyArray<string>,
     options: OpenTerminalPanelOptions,
   ) => string;
+  /** Focuses the host chat, adding it back to the focused group when it was closed. */
+  openHostChat: (ref: ScopedThreadRef) => void;
   focusGroup: (ref: ScopedThreadRef, groupId: string) => void;
   activateSurface: (ref: ScopedThreadRef, groupId: string, surfaceId: string) => void;
   dropSurface: (ref: ScopedThreadRef, surfaceId: string, target: CenterPanelDropRequest) => boolean;
@@ -682,6 +684,17 @@ export const useCenterPanelStore = create<CenterPanelStoreState>()(
             reservation.release();
           }
         },
+        openHostChat: (ref) =>
+          set((state) =>
+            withUpdatedThread(state, ref, (current) => {
+              const inserted = insertSurface(current, HOST_SURFACE);
+              if (inserted === current || inserted.surfaces[0]?.id === HOST_SURFACE_ID) {
+                return inserted;
+              }
+              // The host chat leads the surface list, as persisted state restores it.
+              return { ...inserted, surfaces: normalizeSurfaces(inserted.surfaces, true) };
+            }),
+          ),
         focusGroup: (ref, groupId) =>
           set((state) =>
             withUpdatedThread(state, ref, (current) => {

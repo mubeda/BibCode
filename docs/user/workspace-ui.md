@@ -29,8 +29,9 @@ the selected server is removed, the rail returns to Local. Saved servers show
 the name you gave them on this device (see
 [Remote access](./remote-access.md#name-a-saved-server)).
 
-The **Environments | Repositories** switch at the top of the left panel picks
-how projects are listed; the choice is remembered on this device.
+The **Environments | Repositories | Inbox** switch at the top of the left panel
+picks what the panel lists; the choice is remembered on this device. On a
+narrow panel the switch shows only its icons; hovering one names it.
 **Environments** is the per-environment view described above. **Repositories**
 hides the environment rail and lists one read-only card per Git repository,
 matched by its `origin` remote, across every connected environment. Each card
@@ -58,6 +59,28 @@ repository continues that draft there, and its branch and worktree choice
 resets.
 Switching back to **Environments** restores the rail with its previous
 selection.
+
+**Inbox** lists agents across every connected environment, so like
+Repositories it hides the rail. Four tiles sit at the top, each with a live
+count: **All Agents** (every agent), **Needs Attention** (Pending Approval and
+Awaiting Input), **Working**, and **Done**. An agent whose status is unknown
+(stale, not observable on this platform, or on a disconnected environment)
+counts only under All Agents. One tile is always selected, and the list below
+shows that tile's agents, most recent activity first, with the same rows as
+the Agents view. Until you pick a tile, the Inbox shows Needs Attention while
+an agent needs you, otherwise All Agents, and remembers that choice on this
+device only once every environment has reported; a tile you pick is
+remembered at once. Counts show a dash while agents load. When the list may be
+incomplete, a note above it says why: a named server needs attention (its
+data must be recovered, moved or reconfigured; **Show in Environments**
+switches to Environments with that server selected), is not connected (with
+**Open Remote Servers**, or **Diagnostics** for this machine), or is
+reconnecting, or the saved servers couldn't be read (with **Diagnostics**).
+The Intel-build warning and local backend notices appear in the Inbox too.
+Selecting an agent marks it read and opens its worktree with that agent in
+front: its chat (brought back if you had closed every tab), its chat panel, or
+its AI Terminal. The row stays highlighted while that agent is on screen.
+An empty tile says so, for example **No agents are running.**
 
 The **Search** row is followed by an **Agents** nav row, then Projects. Its
 unread-count badge covers agents across all connected environments and is hidden when nothing is unread. Selecting
