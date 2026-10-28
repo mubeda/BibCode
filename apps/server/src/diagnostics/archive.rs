@@ -317,7 +317,7 @@ impl ArchiveReceiver {
     /// still expected before it is decoded, so an oversized item costs no decoding.
     pub(crate) fn accept_encoded(&mut self, encoded: &str) -> Result<(), Outcome> {
         let text = encoded.as_bytes();
-        if text.is_empty() || text.len() % 4 != 0 || text.len() > MAX_ENCODED_ITEM_BYTES {
+        if text.is_empty() || !text.len().is_multiple_of(4) || text.len() > MAX_ENCODED_ITEM_BYTES {
             return Err(incomplete_item());
         }
         let padding = text

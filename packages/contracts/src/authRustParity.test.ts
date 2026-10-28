@@ -172,6 +172,7 @@ const scopeContract = {
     "access:write",
     "relay:read",
     "relay:write",
+    "diagnostics:read",
   ],
   standardClient: [
     "orchestration:read",
