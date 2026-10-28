@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::{cmp::Ordering, collections::HashSet};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -803,13 +803,30 @@ fn append_interruption_entry(
 
 /// Why BiBCode closes the unresolved records of a scope: the start of the sentence each closed
 /// record's summary begins with, such as "Claude session ended before this".
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ActivityInterruption {
     pub cause: &'static str,
+    /// Closes only records whose last report is no later than this: the moment the process that
+    /// ran them was known gone. A later report came from a process that is still running.
+    pub reported_until: Option<String>,
 }
 
 impl ActivityInterruption {
-    fn reason(self, record_kind: ActivityRecordKind) -> String {
+    #[must_use]
+    pub const fn new(cause: &'static str) -> Self {
+        Self {
+            cause,
+            reported_until: None,
+        }
+    }
+
+    #[must_use]
+    pub fn reported_until(mut self, timestamp: impl Into<String>) -> Self {
+        self.reported_until = Some(timestamp.into());
+        self
+    }
+
+    fn reason(&self, record_kind: ActivityRecordKind) -> String {
         match record_kind {
             ActivityRecordKind::Actor => format!("{} subagent reported", self.cause),
             ActivityRecordKind::WorkItem => format!("{} task reported", self.cause),
@@ -863,7 +880,7 @@ fn unresolved_thread_scopes(
 fn interruption_mutations(
     transaction: &Transaction<'_>,
     scope_id: &str,
-    interruption: ActivityInterruption,
+    interruption: &ActivityInterruption,
     closed_at: &str,
 ) -> ActivityRepositoryResult<Vec<ProviderActivityMutation>> {
     let records = {
@@ -897,13 +914,37 @@ fn interruption_mutations(
             |entry_at| max_timestamp(updated_at, entry_at),
         )
     };
+    // A report after the bound came from a process that is still running.
+    let reported_after_bound = |reported_at: &str| {
+        interruption
+            .reported_until
+            .as_deref()
+            .map(|bound| compare_timestamps(reported_at, bound).map(Ordering::is_gt))
+            .transpose()
+            .map(Option::unwrap_or_default)
+    };
     let mut mutations = Vec::with_capacity(records.len());
+    let mut unreadable = 0_usize;
     for (record_kind, summary_json, last_entry_at) in records {
         match record_kind.as_str() {
             "actor" => {
-                let mut actor = decode_json::<ActivityActorSummary>(&summary_json)?;
-                actor.normalize_timestamps()?;
-                let reported_at = last_report(&actor.updated_at, last_entry_at.as_deref())?;
+                // One unreadable record must not keep the rest of the chat open.
+                let Ok(mut actor) = decode_json::<ActivityActorSummary>(&summary_json) else {
+                    unreadable += 1;
+                    continue;
+                };
+                if actor.normalize_timestamps().is_err() {
+                    unreadable += 1;
+                    continue;
+                }
+                let Ok(reported_at) = last_report(&actor.updated_at, last_entry_at.as_deref())
+                else {
+                    unreadable += 1;
+                    continue;
+                };
+                if reported_after_bound(&reported_at)? {
+                    continue;
+                }
                 let closed_at = max_timestamp(&reported_at, closed_at)?;
                 actor.summary = Some(interruption_summary(
                     &interruption.reason(ActivityRecordKind::Actor),
@@ -917,9 +958,23 @@ fn interruption_mutations(
                 mutations.push(ProviderActivityMutation::UpsertActor(actor));
             }
             "workItem" => {
-                let mut work_item = decode_json::<ActivityWorkItemSummary>(&summary_json)?;
-                work_item.normalize_timestamps()?;
-                let reported_at = last_report(&work_item.updated_at, last_entry_at.as_deref())?;
+                let Ok(mut work_item) = decode_json::<ActivityWorkItemSummary>(&summary_json)
+                else {
+                    unreadable += 1;
+                    continue;
+                };
+                if work_item.normalize_timestamps().is_err() {
+                    unreadable += 1;
+                    continue;
+                }
+                let Ok(reported_at) = last_report(&work_item.updated_at, last_entry_at.as_deref())
+                else {
+                    unreadable += 1;
+                    continue;
+                };
+                if reported_after_bound(&reported_at)? {
+                    continue;
+                }
                 let closed_at = max_timestamp(&reported_at, closed_at)?;
                 work_item.summary = Some(interruption_summary(
                     &interruption.reason(ActivityRecordKind::WorkItem),
@@ -932,12 +987,15 @@ fn interruption_mutations(
                 work_item.terminal_at = Some(closed_at);
                 mutations.push(ProviderActivityMutation::UpsertWorkItem(work_item));
             }
-            _ => {
-                return Err(ActivityRepositoryError::InvalidScope(
-                    "persisted record kind is invalid".to_owned(),
-                ));
-            }
+            _ => unreadable += 1,
         }
+    }
+    if unreadable > 0 {
+        tracing::warn!(
+            scope_id,
+            unreadable,
+            "left unreadable activity records open while closing the rest"
+        );
     }
     Ok(mutations)
 }
@@ -984,7 +1042,7 @@ fn apply_batch(
     let (mutations, terminalize_retained) = match mutations {
         BatchMutations::Provided(mutations) => (mutations, false),
         BatchMutations::InterruptUnresolved(interruption) => (
-            interruption_mutations(&transaction, scope_id, interruption, updated_at)?,
+            interruption_mutations(&transaction, scope_id, &interruption, updated_at)?,
             true,
         ),
     };

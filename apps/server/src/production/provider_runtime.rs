@@ -13,6 +13,10 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use crate::orchestration::process_ownership::{
+    PROCESS_OWNER_BIBCODE, PROCESS_OWNER_EXTERNAL, PROCESS_OWNER_PAYLOAD_KEY,
+    StartupProcessOwnership,
+};
 #[cfg(not(feature = "hermetic-test-guard"))]
 use crate::process::locate_executable;
 use crate::{
@@ -890,6 +894,9 @@ struct SessionEntry {
     activity_dispatch_tasks: Vec<JoinHandle<()>>,
     activity_late_dispatch_cancellation: CancellationToken,
     activity_late_dispatch_tasks: HashMap<ActivityDispatchTaskId, JoinHandle<()>>,
+    /// Closes the activity of a stream that ended by itself (#206). Reaped with the activity
+    /// tasks, so it finishes before this session's entry is replaced or the supervisor stops.
+    stream_end_closure: Option<JoinHandle<()>>,
     next_activity_late_dispatch_task_id: u64,
     activity_control: Arc<RwLock<Option<Arc<ActivityRuntimeControlRegistration>>>>,
     activity_cancellation: Arc<RwLock<Option<ActivityCancellationService>>>,
@@ -2484,18 +2491,37 @@ pub async fn reconcile_orchestration_turn(
 
 const WORKSPACE_LOSS_SESSION_ERROR: &str = "Provider session stopped because its workspace became unavailable. Review delivery status before continuing.";
 
+/// Who ran each thread's provider process, read at startup before abandoned sessions settle:
+/// the persisted runtime rows and whether the settings point OpenCode at a user's server.
+pub async fn startup_process_ownership(
+    repositories: &Repositories,
+    external_server_configured: bool,
+) -> StartupProcessOwnership {
+    match repositories.list_provider_session_runtimes().await {
+        Ok(runtimes) => StartupProcessOwnership::new(
+            runtimes
+                .iter()
+                .map(|runtime| (runtime.thread_id.as_str(), runtime.runtime_payload.as_ref())),
+            external_server_configured,
+        ),
+        Err(error) => {
+            tracing::warn!(%error, "failed to read provider runtimes for startup ownership");
+            StartupProcessOwnership::new([], external_server_configured)
+        }
+    }
+}
+
 /// At startup no provider session is live, so a subagent or background task still open in a chat
 /// scope ran in a process that died with the previous server: close it as `interrupted` (#206).
-/// An OpenCode scope closes only when its persisted runtime row proves BiBCode ran the server;
-/// a server the user runs may still be running that work, and its resume decides. Returns how
-/// many scopes were closed.
+/// A scope whose provider work may outlive BiBCode (an OpenCode server the user runs) is left to
+/// its resume, by the same rule that keeps its open requests (#187). Returns how many scopes
+/// were closed.
 pub async fn interrupt_activity_of_ended_sessions(
-    repositories: &Repositories,
+    ownership: &StartupProcessOwnership,
     activity: &ActivityProjection,
 ) -> usize {
-    const RESTART: ActivityInterruption = ActivityInterruption {
-        cause: "BiBCode restarted before this",
-    };
+    const RESTART: ActivityInterruption =
+        ActivityInterruption::new("BiBCode restarted before this");
     let scopes = match activity.unresolved_thread_scopes().await {
         Ok(scopes) => scopes,
         Err(error) => {
@@ -2506,35 +2532,13 @@ pub async fn interrupt_activity_of_ended_sessions(
     if scopes.is_empty() {
         return 0;
     }
-    let owned_opencode_threads = if scopes.iter().any(|scope| scope.provider == "opencode") {
-        match repositories.list_provider_session_runtimes().await {
-            Ok(runtimes) => runtimes
-                .into_iter()
-                .filter(|runtime| {
-                    runtime
-                        .runtime_payload
-                        .as_ref()
-                        .and_then(|payload| payload.get(PROCESS_OWNER_PAYLOAD_KEY))
-                        .and_then(Value::as_str)
-                        == Some(PROCESS_OWNER_BIBCODE)
-                })
-                .map(|runtime| runtime.thread_id)
-                .collect::<HashSet<_>>(),
-            Err(error) => {
-                tracing::warn!(%error, "failed to read provider runtimes for startup activity");
-                HashSet::new()
-            }
-        }
-    } else {
-        HashSet::new()
-    };
     let mut closed_scopes = 0;
     for scope in scopes {
-        if scope.provider == "opencode" && !owned_opencode_threads.contains(&scope.thread_id) {
+        if ownership.work_may_outlive_bibcode(&scope.thread_id, &scope.provider) {
             continue;
         }
         match activity
-            .interrupt_unresolved_scope(&scope.scope_id, RESTART)
+            .interrupt_unresolved_scope(&scope.scope_id, RESTART.clone())
             .await
         {
             Ok(deltas) if !deltas.is_empty() => closed_scopes += 1,
@@ -6524,12 +6528,23 @@ async fn run_supervisor(
                     // activity needs no further delivery (#206). Off the supervisor loop: a
                     // projection still stuck on the database must not hold other threads'
                     // traffic, and the closure time fences whatever lands first.
+                    // Bound to this stream's end: only what its process reported closes.
+                    let ended_at = now();
                     let activity = activity.clone();
                     let launch = entry.launch.clone();
                     let driver = entry.driver.clone();
-                    tokio::spawn(async move {
-                        interrupt_ended_session_activity(&activity, &launch, driver.as_ref()).await;
-                    });
+                    if let Some(previous) = entry.stream_end_closure.take() {
+                        previous.abort();
+                    }
+                    entry.stream_end_closure = Some(tokio::spawn(async move {
+                        interrupt_ended_session_activity(
+                            &activity,
+                            &launch,
+                            driver.as_ref(),
+                            Some(ended_at),
+                        )
+                        .await;
+                    }));
                 }
             }
             SupervisorMessage::Deliver {
@@ -8096,6 +8111,9 @@ async fn cancel_and_reap_activity_tasks(entry: &mut SessionEntry) {
     for task in std::mem::take(&mut entry.activity_dispatch_tasks) {
         let _ = task.await;
     }
+    if let Some(closure) = entry.stream_end_closure.take() {
+        let _ = closure.await;
+    }
 }
 
 fn normalize_agent_activity_transition_error(error: ProviderRuntimeError) -> ProviderRuntimeError {
@@ -8403,6 +8421,7 @@ async fn launch_session(
             activity_dispatch_tasks: Vec::new(),
             activity_late_dispatch_cancellation,
             activity_late_dispatch_tasks: HashMap::new(),
+            stream_end_closure: None,
             next_activity_late_dispatch_task_id: 0,
             activity_control,
             activity_cancellation,
@@ -9756,11 +9775,18 @@ async fn restart_session(
         activity_dispatch_capacity = Some(entry.activity_dispatch_capacity);
         entry.activity_control.write().await.take();
         cancel_and_reap_activity_tasks(entry).await;
-        entry.driver.shutdown().await?;
+        if let Err(error) = entry.driver.shutdown().await {
+            // The relaunch stops here, but the process that ran this work is being torn down
+            // either way: nothing will report it again (#206).
+            interrupt_ended_session_activity(activity, &entry.launch, entry.driver.as_ref(), None)
+                .await;
+            return Err(error);
+        }
     }
     if let Some(mut entry) = sessions.remove(thread_id) {
         close_publication_and_reap_event_task(&mut entry).await;
-        interrupt_ended_session_activity(activity, &entry.launch, entry.driver.as_ref()).await;
+        interrupt_ended_session_activity(activity, &entry.launch, entry.driver.as_ref(), None)
+            .await;
         {
             // The process that ran this work is gone.
             let mut lifecycle = entry
@@ -12414,7 +12440,7 @@ async fn detach_session(
     )
     .await;
     // Before the lifecycle reads the projection, so it counts nothing live.
-    interrupt_ended_session_activity(activity, &entry.launch, entry.driver.as_ref()).await;
+    interrupt_ended_session_activity(activity, &entry.launch, entry.driver.as_ref(), None).await;
     synchronize_activity_lifecycle(activity, &entry.launch.thread_id, &entry.activity_lifecycle)
         .await;
     compensate_cancelled_activity(
@@ -12490,22 +12516,14 @@ async fn shutdown_sessions(
     first_error.map_or(Ok(()), Err)
 }
 
-/// Who runs an OpenCode session's server, persisted in its runtime payload so a server start can
-/// tell, without the live driver, whether its subagents ended with BiBCode (#206).
-pub(crate) const PROCESS_OWNER_PAYLOAD_KEY: &str = "processOwner";
-pub(crate) const PROCESS_OWNER_BIBCODE: &str = "bibcode";
-pub(crate) const PROCESS_OWNER_EXTERNAL: &str = "external";
-
 /// What a closed record's summary says when its provider session ended (#206).
 pub(crate) fn provider_session_interruption(provider: &str) -> ActivityInterruption {
-    ActivityInterruption {
-        cause: match provider {
-            "claude" | "claudeAgent" => "Claude session ended before this",
-            "codex" => "Codex session ended before this",
-            "opencode" => "OpenCode session ended before this",
-            _ => "The provider session ended before this",
-        },
-    }
+    ActivityInterruption::new(match provider {
+        "claude" | "claudeAgent" => "Claude session ended before this",
+        "codex" => "Codex session ended before this",
+        "opencode" => "OpenCode session ended before this",
+        _ => "The provider session ended before this",
+    })
 }
 
 /// The process that ran this session's subagents and background work is gone: nothing will
@@ -12517,11 +12535,13 @@ async fn interrupt_ended_session_activity(
     activity: &ActivityProjection,
     launch: &ProviderLaunchRequest,
     driver: &dyn ProviderDriver,
+    reported_until: Option<String>,
 ) {
     if !driver.owns_native_work() {
         return;
     }
-    let interruption = provider_session_interruption(&launch.provider);
+    let mut interruption = provider_session_interruption(&launch.provider);
+    interruption.reported_until = reported_until;
     match activity
         .interrupt_unresolved_scope(&format!("thread:{}", launch.thread_id), interruption)
         .await
@@ -29677,6 +29697,38 @@ done
         fixture
             .assert_live("Activity reports a running child while the provider session is up")
             .await;
+        // What the left panel's agent status reads (#187): the session settled its turn and the
+        // provider last showed progress during it.
+        let thread_status = |fixture: &IdleDeadlineFixture| {
+            let repositories = fixture.engine.repositories();
+            async move {
+                let session = repositories
+                    .get_thread_session("t1".to_owned())
+                    .await
+                    .unwrap()
+                    .expect("projected session");
+                let thread = repositories
+                    .get_thread("t1".to_owned())
+                    .await
+                    .unwrap()
+                    .expect("projected thread");
+                (
+                    session.status,
+                    session.active_turn_id,
+                    thread.last_activity_at,
+                )
+            }
+        };
+        let (live_status, live_turn, live_progress) = thread_status(&fixture).await;
+        assert!(
+            !matches!(live_status.as_str(), "running" | "starting"),
+            "{live_status}"
+        );
+        assert_eq!(live_turn, None);
+        assert!(
+            live_progress.is_some(),
+            "the turn recorded provider progress"
+        );
 
         let identity = fixture
             .supervisor
@@ -29703,6 +29755,14 @@ done
             crate::activity::ActivityLifecycle::Interrupted
         );
         assert_eq!(stopped.counts.subagents.active, 0);
+        // The stop neither reads as Working nor as new provider progress.
+        let (stopped_status, stopped_turn, stopped_progress) = thread_status(&fixture).await;
+        assert!(
+            !matches!(stopped_status.as_str(), "running" | "starting"),
+            "{stopped_status}"
+        );
+        assert_eq!(stopped_turn, None);
+        assert_eq!(stopped_progress, live_progress);
         fixture.close().await;
     }
 
@@ -32206,7 +32266,16 @@ done
                     "/session",
                     post(|| async { Json(json!({"id":"owner-opencode-session"})) }),
                 )
-                .route("/event", get(|| async { "" }));
+                // The event stream stays open, so no stream end closes anything: only the
+                // startup pass under test can.
+                .route(
+                    "/event",
+                    get(|| async {
+                        axum::body::Body::from_stream(futures_util::stream::pending::<
+                            Result<axum::body::Bytes, std::io::Error>,
+                        >())
+                    }),
+                );
             let (endpoint, server) = crate::provider::opencode::server_fixtures::serve(app).await;
             let temp = TempDir::new().expect("OpenCode fixture directory");
             let factory = super::NativeProviderDriverFactory::new(
@@ -32275,7 +32344,19 @@ done
                 )
                 .await
                 .unwrap();
-            super::interrupt_activity_of_ended_sessions(&engine.repositories(), &activity).await;
+            let open = activity
+                .snapshot(&crate::activity::ActivityScopeRef::Thread {
+                    thread_id: "t1".to_owned(),
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                open.actors[0].status,
+                crate::activity::ActivityLifecycle::Running,
+                "nothing but the startup pass closes it"
+            );
+            let ownership = super::startup_process_ownership(&engine.repositories(), false).await;
+            super::interrupt_activity_of_ended_sessions(&ownership, &activity).await;
             let expected = if owned {
                 crate::activity::ActivityLifecycle::Interrupted
             } else {

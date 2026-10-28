@@ -3527,9 +3527,8 @@ fn encode_test_cursor(payload: serde_json::Value) -> String {
     URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).expect("cursor JSON"))
 }
 
-const CLAUDE_SESSION_ENDED: ActivityInterruption = ActivityInterruption {
-    cause: "Claude session ended before this",
-};
+const CLAUDE_SESSION_ENDED: ActivityInterruption =
+    ActivityInterruption::new("Claude session ended before this");
 
 async fn process_end_fixture(
     scope_id: &str,
@@ -3614,7 +3613,7 @@ async fn process_end_interrupts_unresolved_records_once_with_reason_and_a_closur
     while events.try_recv().is_ok() {}
 
     let deltas = projection
-        .interrupt_unresolved_scope(&scope.scope_id, CLAUDE_SESSION_ENDED)
+        .interrupt_unresolved_scope(&scope.scope_id, CLAUDE_SESSION_ENDED.clone())
         .await
         .expect("interrupt");
     assert!(!deltas.is_empty());
@@ -3668,7 +3667,7 @@ async fn process_end_interrupts_unresolved_records_once_with_reason_and_a_closur
     // Nothing is left to close: no error, no revision.
     assert!(
         projection
-            .interrupt_unresolved_scope(&scope.scope_id, CLAUDE_SESSION_ENDED)
+            .interrupt_unresolved_scope(&scope.scope_id, CLAUDE_SESSION_ENDED.clone())
             .await
             .expect("repeat")
             .is_empty()
@@ -3770,7 +3769,7 @@ async fn process_end_closes_a_record_retained_under_a_section_no_longer_negotiat
     );
 
     let deltas = projection
-        .interrupt_unresolved_scope(&scope.scope_id, CLAUDE_SESSION_ENDED)
+        .interrupt_unresolved_scope(&scope.scope_id, CLAUDE_SESSION_ENDED.clone())
         .await
         .expect("interrupt retained record");
     assert!(!deltas.is_empty(), "the closure is journaled");
@@ -3803,7 +3802,7 @@ async fn a_reopened_record_closed_again_keeps_one_reason() {
         .await
         .expect("seed");
     projection
-        .interrupt_unresolved_scope(&scope.scope_id, CLAUDE_SESSION_ENDED)
+        .interrupt_unresolved_scope(&scope.scope_id, CLAUDE_SESSION_ENDED.clone())
         .await
         .expect("first closure");
     let closed = projection
@@ -3837,9 +3836,7 @@ async fn a_reopened_record_closed_again_keeps_one_reason() {
     projection
         .interrupt_unresolved_scope(
             &scope.scope_id,
-            ActivityInterruption {
-                cause: "BiBCode restarted before this",
-            },
+            ActivityInterruption::new("BiBCode restarted before this"),
         )
         .await
         .expect("second closure");
@@ -3902,5 +3899,104 @@ async fn startup_lists_only_current_thread_scopes_with_unresolved_records() {
             ))
             .collect::<Vec<_>>(),
         vec![("thread:open", "open", "codex")]
+    );
+}
+
+#[tokio::test]
+async fn a_bounded_closure_leaves_later_reports_open_and_one_unreadable_row_closes_nothing_else() {
+    let anchor = recent_activity_anchor() - Duration::minutes(30);
+    let at = |minutes: i64| activity_timestamp(anchor, Duration::minutes(minutes));
+    let database = migrated_database().await;
+    let projection = ActivityProjection::new(ActivityRepository::new(database.clone()));
+    let scope = thread_scope("thread:bounded", "bounded");
+    projection.ensure_scope(scope.clone()).await.expect("scope");
+    let running = |id: &str, reported: i64| {
+        ProviderActivityMutation::UpsertActor(
+            actor_summary(
+                id,
+                None,
+                ActivityLifecycle::Running,
+                &at(0),
+                &at(reported),
+                None,
+            )
+            .expect("actor"),
+        )
+    };
+    projection
+        .apply(
+            &scope.scope_id,
+            "event:seed".to_owned(),
+            vec![running("actor:ended", 1), running("actor:relaunched", 10)],
+            at(10),
+        )
+        .await
+        .expect("seed");
+
+    // A closure for a stream that ended at minute 5 lands after the relaunched session reported.
+    projection
+        .interrupt_unresolved_scope(
+            &scope.scope_id,
+            ActivityInterruption::new("Codex session ended before this").reported_until(at(5)),
+        )
+        .await
+        .expect("bounded closure");
+    let snapshot = projection.snapshot(&scope.scope).await.expect("snapshot");
+    let status = |id: &str| {
+        snapshot
+            .actors
+            .iter()
+            .find(|actor| actor.id == id)
+            .expect("actor")
+            .status
+    };
+    assert_eq!(status("actor:ended"), ActivityLifecycle::Interrupted);
+    assert_eq!(status("actor:relaunched"), ActivityLifecycle::Running);
+
+    // A row that no longer decodes stays as it is; the rest of the chat still closes.
+    database
+        .call(|connection| {
+            connection.execute(
+                "INSERT INTO activity_records (
+                   scope_id, record_kind, record_id, parent_actor_id, owner_actor_id, status,
+                   native_sort_key, summary_json, started_at, updated_at, terminal_at
+                 ) VALUES ('thread:bounded', 'actor', 'actor:unreadable', NULL, NULL, 'running',
+                   '2026-07-30T12:00:00Z', 'not json', '2026-07-30T12:00:00Z',
+                   '2026-07-30T12:00:00Z', NULL)",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("unreadable row");
+    projection
+        .interrupt_unresolved_scope(
+            &scope.scope_id,
+            ActivityInterruption::new("Codex session ended before this"),
+        )
+        .await
+        .expect("a closure past an unreadable row");
+    let statuses = database
+        .call(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT record_id, status FROM activity_records
+                 WHERE scope_id = 'thread:bounded' ORDER BY record_id",
+            )?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await
+        .expect("statuses");
+    assert_eq!(
+        statuses,
+        vec![
+            ("actor:ended".to_owned(), "interrupted".to_owned()),
+            ("actor:relaunched".to_owned(), "interrupted".to_owned()),
+            ("actor:unreadable".to_owned(), "running".to_owned()),
+        ]
     );
 }

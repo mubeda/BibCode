@@ -1451,9 +1451,7 @@ async fn assert_process_end_repository_semantics(provider: Provider, scenario: &
     let deltas = projection
         .interrupt_unresolved_scope(
             &scope.scope_id,
-            ActivityInterruption {
-                cause: "The provider session ended before this",
-            },
+            ActivityInterruption::new("The provider session ended before this"),
         )
         .await
         .expect("process-end interruption");
@@ -1503,9 +1501,7 @@ async fn assert_process_end_repository_semantics(provider: Provider, scenario: &
         projection
             .interrupt_unresolved_scope(
                 &scope.scope_id,
-                ActivityInterruption {
-                    cause: "The provider session ended before this",
-                },
+                ActivityInterruption::new("The provider session ended before this"),
             )
             .await
             .expect("repeat")
