@@ -570,12 +570,17 @@ injected settings add these hooks to the subagent and tool hooks:
 - `UserPromptSubmit`
 - `PermissionRequest`
 - `Notification`
+- `Elicitation`
+- `ElicitationResult`
 - `Stop`
 - `StopFailure`
 - `SessionEnd`
 
 BiBCode only reads them: it answers each with no content, so none of them
-changes what Claude does.
+changes what Claude does. Status decodes only the event name, session, agent,
+tool name and notification type, never prompt or tool content, and follows the
+main session: the first one heard, then each new `SessionStart` (`/clear` and
+resume start a new session).
 
 If the terminal cannot be prepared, its status reads **Status unavailable**.
 That happens with a Claude Code older than v2.1.63 (no authenticated HTTP hooks),
