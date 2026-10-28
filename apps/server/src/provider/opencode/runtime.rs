@@ -50,9 +50,6 @@ const RECONCILIATION_HINT_CAPACITY: usize = 1;
 const RECONCILIATION_DEBOUNCE: Duration = Duration::from_millis(250);
 const RECONCILIATION_DEFERRED_DELAY: Duration = Duration::from_millis(10);
 const RECONCILIATION_TIMEOUT: Duration = Duration::from_secs(5);
-/// How long a resumed session's queued messages wait for the asks it kept to show before
-/// they may go anyway: the asks still appear when the event stream connects (#187).
-const RECOVERY_SETTLE_DEADLINE: Duration = Duration::from_secs(30);
 /// Bounds each request of an OpenCode 2 rewind, which the provider supervisor awaits.
 const REWIND_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// Bounds the whole history scan that finds a rewind's target, however many pages it reads.
@@ -969,34 +966,34 @@ impl OpenCodeSessionRuntime {
             v2.settled.clear();
         }
         let resumed = payload.get("resumed").is_some();
-        let recovered_asks = match (resumed, self.is_v2()) {
+        let (recovered_asks, listed) = match (resumed, self.is_v2()) {
             (true, true) => self.v2_restore_pending_asks(session_id).await,
             (true, false) => self.v1_restore_pending_asks(session_id).await,
-            (false, _) => Vec::new(),
+            (false, _) => (Vec::new(), None),
         };
         self.reset_activity_root(session_id).await;
         self.emit("session.started", None, None, payload).await;
         self.emit("thread.started", None, None, json!({})).await;
-        // Queued messages wait only behind asks the resumed session kept (#187).
-        let holding_asks = !recovered_asks.is_empty();
+        // A completed read of the pending lists proves that an ask BiBCode still shows but
+        // OpenCode no longer lists cannot be answered; a read that failed proves nothing (#187).
+        if let Some(listed) = listed {
+            self.emit(
+                "requests.listed",
+                None,
+                None,
+                json!({ "requestIds": listed }),
+            )
+            .await;
+        }
         // OpenCode does not replay asks made while BiBCode was away; they are shown once the
         // event stream connects (see `v1_show_recovered_asks` and `v2_show_recovered_asks`).
         self.inner.v2.lock().await.recovered_asks = recovered_asks;
         // A resumed session may still be executing (OpenCode kept working while BiBCode was away),
         // and reconciles its pending asks once subscribed.
         if resumed {
-            {
-                let mut v2 = self.inner.v2.lock().await;
-                v2.adopt_on_connect = true;
-                v2.reconcile_asks_on_connect = true;
-            }
-            if holding_asks {
-                self.settle_recovery_by_deadline();
-            } else {
-                // A resume that kept no asks has none to show first (#187).
-                self.emit("session.recovery-settled", None, None, json!({}))
-                    .await;
-            }
+            let mut v2 = self.inner.v2.lock().await;
+            v2.adopt_on_connect = true;
+            v2.reconcile_asks_on_connect = true;
         }
         self.start_event_pump().await?;
         self.request_reconciliation(true, None, true).await;
@@ -2197,25 +2194,6 @@ impl OpenCodeSessionRuntime {
         events
     }
 
-    /// Reports the recovery settled once its deadline passes, in case the event stream that
-    /// shows the kept asks never connects; a report after the real one changes nothing.
-    fn settle_recovery_by_deadline(&self) {
-        let runtime = Arc::downgrade(&self.inner);
-        let cancellation = self.inner.reconciliation_cancellation.clone();
-        tokio::spawn(async move {
-            tokio::select! {
-                () = cancellation.cancelled() => {}
-                () = tokio::time::sleep(RECOVERY_SETTLE_DEADLINE) => {
-                    if let Some(inner) = runtime.upgrade() {
-                        OpenCodeSessionRuntime::internal(inner)
-                            .emit("session.recovery-settled", None, None, json!({}))
-                            .await;
-                    }
-                }
-            }
-        });
-    }
-
     async fn start_event_pump(&self) -> Result<(), OpenCodeRuntimeError> {
         let session_id = self.session_id().await?;
         let runtime = Arc::downgrade(&self.inner);
@@ -3220,11 +3198,19 @@ impl OpenCodeSessionRuntime {
     /// connected. Those BiBCode can show are returned to be shown once the stream connects; those
     /// it cannot are queued for cancellation. A read that failed leaves the reconciliation after
     /// the subscription to try again.
+    /// Also returns, when every read completed, the ids of every ask listed (#187).
     async fn v2_restore_pending_asks(
         &self,
         root_session_id: &str,
-    ) -> Vec<(&'static str, String, Value)> {
-        let (_, pending) = self.v2_read_pending_asks(root_session_id).await;
+    ) -> (Vec<(&'static str, String, Value)>, Option<Vec<String>>) {
+        let (complete, pending) = self.v2_read_pending_asks(root_session_id).await;
+        let listed = complete.then(|| {
+            pending
+                .iter()
+                .filter_map(|(_, _, ask)| ask.get("id").and_then(Value::as_str))
+                .map(str::to_owned)
+                .collect()
+        });
         let (recovered, unanswerable) = self.v2_route_pending_asks(pending).await;
         self.inner
             .v2
@@ -3232,7 +3218,7 @@ impl OpenCodeSessionRuntime {
             .await
             .recovered_unanswerable
             .extend(unanswerable);
-        recovered
+        (recovered, listed)
     }
 
     /// Reads the session tree under the root and each session's pending permissions and forms,
@@ -3247,6 +3233,8 @@ impl OpenCodeSessionRuntime {
         let mut queue = VecDeque::from([(root_session_id.to_owned(), 0_usize)]);
         while let Some((parent, depth)) = queue.pop_front() {
             if depth == MAX_LINEAGE_DEPTH || sessions.len() >= RECONCILIATION_CHILD_LIMIT {
+                // Subagents past the bound may hold asks of their own.
+                complete = false;
                 continue;
             }
             let url = match self
@@ -3385,10 +3373,12 @@ impl OpenCodeSessionRuntime {
     /// from OpenCode's pending lists (they span every session, so only this one's are kept). Each
     /// gets its reply route now and is shown once the event stream connects. OpenCode 1 asks are
     /// shown whatever their fields, as live ones are.
+    /// Also returns, when both lists were read, the ids of every ask they list, any session's,
+    /// as OpenCode's ids are unique (#187).
     async fn v1_restore_pending_asks(
         &self,
         session_id: &str,
-    ) -> Vec<(&'static str, String, Value)> {
+    ) -> (Vec<(&'static str, String, Value)>, Option<Vec<String>>) {
         self.inner.v2.lock().await.v1_settled.clear();
         let mut recovered = Vec::new();
         let permissions = match self.request_url("/permission") {
@@ -3452,7 +3442,23 @@ impl OpenCodeSessionRuntime {
                 json!({ "questions": questions, "recovered": true }),
             ));
         }
-        recovered
+        drop(pending);
+        let listed_ids = |list: &Option<Value>| {
+            list.as_ref().and_then(Value::as_array).map(|requests| {
+                requests
+                    .iter()
+                    .filter_map(v1_request_id)
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+        };
+        let listed = listed_ids(&permissions).zip(listed_ids(&questions)).map(
+            |(mut permissions, questions)| {
+                permissions.extend(questions);
+                permissions
+            },
+        );
+        (recovered, listed)
     }
 
     /// Shows the asks an OpenCode 1 session recovered on resume, off the event pump, as
@@ -3527,9 +3533,6 @@ impl OpenCodeSessionRuntime {
             }
         }
         self.v1_route_listed(&session_id, &fresh).await;
-        // The asks it kept are shown: the resumed session may take queued messages (#187).
-        self.emit("session.recovery-settled", None, None, json!({}))
-            .await;
         // A list that could not be read is read again with a backoff, each failure logged, so
         // the asks it holds still appear.
         let mut delay = RESUME_READ_RETRY_FIRST;
@@ -3755,11 +3758,6 @@ impl OpenCodeSessionRuntime {
                 () = owner_cancellation.cancelled() => {}
                 () = async {
                     runtime.v2_show_recovered_asks(asks).await;
-                    // The asks it kept are shown: the resumed session may take queued
-                    // messages (#187).
-                    runtime
-                        .emit("session.recovery-settled", None, None, json!({}))
-                        .await;
                     runtime.v2_read_asks_again().await;
                 } => {}
             }
@@ -6310,6 +6308,74 @@ mod tests {
         server.abort();
     }
 
+    /// A resume reports which asks OpenCode still lists only when both of its lists were read:
+    /// a failed read proves nothing about the asks BiBCode shows, so none of them expires (#187).
+    #[tokio::test]
+    async fn opencode_1_resume_lists_its_asks_only_from_a_completed_read() {
+        for permission_read_fails in [true, false] {
+            let app = Router::new()
+                .route(
+                    "/permission",
+                    get(move || async move {
+                        if permission_read_fails {
+                            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                        } else {
+                            Json(json!([
+                                { "id": "per_root", "sessionID": "session-1", "permission": "bash" },
+                                { "id": "per_child", "sessionID": "child-1", "permission": "bash" }
+                            ]))
+                            .into_response()
+                        }
+                    }),
+                )
+                .route(
+                    "/question",
+                    get(|| async {
+                        Json(json!([{
+                            "id": "que_root", "sessionID": "session-1",
+                            "questions": [{ "question": "Which?", "header": "Which", "options": [] }]
+                        }]))
+                    }),
+                );
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let address = listener.local_addr().expect("address");
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.expect("serve");
+            });
+            let runtime = super::OpenCodeSessionRuntime::new(
+                &format!("http://{address}"),
+                "unit-thread",
+                "/tmp/unit",
+                None,
+            );
+
+            let (recovered, listed) = runtime.v1_restore_pending_asks("session-1").await;
+            let mut recovered = recovered
+                .into_iter()
+                .map(|(_, request_id, _)| request_id)
+                .collect::<Vec<_>>();
+            recovered.sort();
+            if permission_read_fails {
+                assert_eq!(
+                    recovered,
+                    ["que_root"],
+                    "the question read still shows its ask"
+                );
+                assert_eq!(listed, None, "a failed permission read lists nothing");
+            } else {
+                assert_eq!(recovered, ["per_root", "que_root"]);
+                let mut listed = listed.expect("a completed read lists its asks");
+                listed.sort();
+                assert_eq!(
+                    listed,
+                    ["per_child", "per_root", "que_root"],
+                    "every session's asks count: OpenCode's ids are unique"
+                );
+            }
+            server.abort();
+        }
+    }
+
     /// A recovery read that still lists an ask the event stream already settled, routed or not,
     /// does not show it again.
     #[tokio::test]
@@ -6356,9 +6422,6 @@ mod tests {
         let resolved = runtime.next_event().await.expect("resolution");
         assert_eq!(resolved.event_type, "request.resolved");
         runtime.v1_show_recovered_asks(Vec::new()).await;
-        // Recovery shows no ask and only reports that it settled (#187).
-        let settled = runtime.next_event().await.expect("recovery settled");
-        assert_eq!(settled.event_type, "session.recovery-settled");
         assert_no_queued_event(&runtime).await;
         assert!(runtime.inner.pending_permissions.lock().await.is_empty());
         server.abort();
