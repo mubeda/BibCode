@@ -598,11 +598,43 @@ Every way a Codex terminal ends up without Activity is logged under
   These lines carry no App Server error text, which can quote thread content.
   They carry the JSON-RPC error code, or which transport step failed.
 
-The preparation budget (350 ms) and the manager's callback cap (500 ms) are
-unchanged. Run alone, the packaged Activity spec passed on both macOS
-architectures with none of these lines (#192), so the earlier x64
-failures happen only with the full suite's load. Budgets change only if a full
-macOS x64 run fails and these lines name the stage that ran out.
+**Preparation budgets.** Each provider factory owns the time its preparation may take
+(`ProviderTerminalObserverFactory::preparation_budget`) and enforces it with
+its own timeout. The supervisor tells the terminal manager to wait that long
+plus a fixed 150 ms, so the factory's timeout fires first and cleans up. A
+launch the supervisor cannot validate (disabled or unknown instance, mismatched
+driver, unresolved executable) gets the manager's 500 ms default and passes
+through almost at once. The manager's own ceiling (3 s) is a stop for a
+preparer that asks to wait too long; a test keeps it above every provider's
+wait, so the ceiling never cuts a provider short (#200).
+
+| Provider | Own budget | `terminal.open` waits at most |
+| -------- | ---------- | ----------------------------- |
+| Codex    | 350 ms     | 500 ms                        |
+| OpenCode | 850 ms     | 1 s                           |
+| Claude   | 2.25 s     | 2.4 s                         |
+
+The wait applies only to a preparation still running. A launch that cannot be
+observed (an unapproved Claude build, missing capabilities) passes through in
+0.15 to 0.4 s without waiting for its budget. When the budget runs out the
+original command spawns unobserved, and the manager logs
+`provider terminal observer callback timed out` with `timeout_ms`. Claude
+cannot attach late: its observer rewrites the command (pinned executable and a
+`--settings` overlay), which has to happen before the PTY spawns.
+
+Claude's 2.25 s is the probe runner's own 2 s timeout, which bounds its slowest
+step (the attestation's `codesign` is capped at 500 ms and runs beside it),
+plus 250 ms to pin the executable, write the overlay and bind the listener.
+Measured on a 12-core Mac with a 276 MB Claude binary, the stages (`clonefile`
+pin, `--version` and `--help`, SHA-256 of the binary, `codesign`) take about
+0.2 s together, and a median of 252 ms (maximum 356 ms) with the CPU
+oversubscribed twice over. The earlier 500 ms wait cut a Claude preparation
+that was merely slow, which left the terminal without Activity or agent status.
+
+The Codex budget is unchanged. Run alone, the packaged Activity spec passed on
+both macOS architectures with none of the Codex observer lines (#192), so the
+earlier x64 failures happen only with the full suite's load. Budgets change
+only if a full macOS x64 run fails and these lines name the stage that ran out.
 
 A version the probes cannot parse is cached for that executable build for ten
 minutes, so launches in that window pass through without spawning probes. The

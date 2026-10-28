@@ -3249,7 +3249,13 @@ lines in `app-server.log`: each names its `reason`, its `stage`, and `elapsed_ms
 (see [Activity observation](../architecture/activity-observation.md)).
 A spec that passes alone but fails in the full suite fails only under the
 suite's load. Take the stage from the full run's `app-server.log` before
-changing an observer budget.
+changing an observer budget. A provider factory owns its budget
+(`preparation_budget`) and the manager waits that plus 150 ms, so change the
+factory's constant, never the manager's wait; the manager's 3 s ceiling is
+asserted to stay above every provider's wait. A terminal without Activity after
+the budget logs `provider terminal observer callback timed out` with the
+`timeout_ms` that ran out (see
+[Activity observation](../architecture/activity-observation.md), "Preparation budgets").
 Window resizing polls the actual viewport and native window until the requested
 size is reached, including when GTK startup dimensions settle independently.
 It does not depend on animation frames, which can stop in occluded macOS
