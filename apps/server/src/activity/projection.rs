@@ -10,10 +10,10 @@ use tokio::sync::{Mutex as AsyncMutex, broadcast};
 
 use super::{
     ActivityControlRegistry, ActivityControlSnapshot, ActivityDelta, ActivityDetailPage,
-    ActivityRecordKind, ActivityRecordSummary, ActivityRepository, ActivityRepositoryError,
-    ActivityRosterBucket, ActivityRosterPage, ActivityScopeRef, ActivityScopeSeed, ActivitySection,
-    ActivitySnapshot, AgentActivityAdmission, AgentActivityController, AgentActivitySource,
-    ProviderActivityMutation,
+    ActivityInterruption, ActivityRecordKind, ActivityRecordSummary, ActivityRepository,
+    ActivityRepositoryError, ActivityRosterBucket, ActivityRosterPage, ActivityScopeRef,
+    ActivityScopeSeed, ActivitySection, ActivitySnapshot, AgentActivityAdmission,
+    AgentActivityController, AgentActivitySource, ProviderActivityMutation, UnresolvedThreadScope,
 };
 
 const DEFAULT_BROADCAST_CAPACITY: usize = 256;
@@ -276,7 +276,44 @@ impl ActivityProjection {
             .repository
             .apply_batch(scope_id, &native_event_key, mutations, &created_at)
             .await?;
-        self.publish_deltas(&admission, &deltas).await;
+        self.publish_locked(&admission, scope_id, &deltas).await;
+        Ok(deltas)
+    }
+
+    /// Closes the scope's unresolved records as `interrupted` because the process that ran them is
+    /// gone (#206). The read and the journaled write are one transaction under the scope's
+    /// publication lock, which this takes once; subscribers receive ordinary deltas.
+    pub async fn interrupt_unresolved_scope(
+        &self,
+        scope_id: &str,
+        interruption: ActivityInterruption,
+    ) -> ActivityResult<Vec<ActivityDelta>> {
+        let Some(admission) = self.controller.admit() else {
+            return Ok(Vec::new());
+        };
+        let publication_lock = self.publication_lock(scope_id);
+        let _publication_guard = publication_lock.lock().await;
+        let deltas = self
+            .repository
+            .interrupt_unresolved_scope_records(scope_id, interruption)
+            .await?;
+        self.publish_locked(&admission, scope_id, &deltas).await;
+        Ok(deltas)
+    }
+
+    /// Current thread scopes with unresolved records, for the startup pass (#206).
+    pub async fn unresolved_thread_scopes(&self) -> ActivityResult<Vec<UnresolvedThreadScope>> {
+        self.repository.unresolved_thread_scopes().await
+    }
+
+    /// Publishes a committed batch; the caller holds the scope's publication lock.
+    async fn publish_locked(
+        &self,
+        admission: &AgentActivityAdmission,
+        scope_id: &str,
+        deltas: &[ActivityDelta],
+    ) {
+        self.publish_deltas(admission, deltas).await;
         if self
             .repository
             .retention_pending(scope_id)
@@ -285,8 +322,7 @@ impl ActivityProjection {
         {
             self.schedule_retention(scope_id.to_owned());
         }
-        self.publish_apply_completion(&admission, scope_id, &deltas);
-        Ok(deltas)
+        self.publish_apply_completion(admission, scope_id, deltas);
     }
 
     pub async fn interrupt_unresolved_terminal_scopes(&self) -> ActivityResult<usize> {
