@@ -266,46 +266,6 @@ impl SecretStore {
         }
     }
 
-    /// Removes `name` only when `matches` accepts the record found there, so a record that
-    /// replaced the expected one meanwhile is never removed. The record is first moved to a
-    /// private name (atomic), then checked; one that does not match is linked back without
-    /// replacing whatever was written under `name` in between. `false` when nothing was
-    /// removed.
-    pub(crate) async fn remove_if<F>(&self, name: &str, matches: F) -> Result<bool>
-    where
-        F: FnOnce(&[u8]) -> bool,
-    {
-        let path = self.secret_path(name)?;
-        let moved = self.temporary_path(name)?;
-        let persist = |operation: &'static str, path: &Path, source| SecretStoreError::Persist {
-            name: name.to_owned(),
-            path: path.to_path_buf(),
-            operation,
-            source,
-        };
-        match fs::rename(&path, &moved).await {
-            Ok(()) => {}
-            Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(false),
-            Err(source) => return Err(persist("move aside", &path, source)),
-        }
-        let matched = match fs::read(&moved).await {
-            Ok(value) => matches(&value),
-            Err(_) => false,
-        };
-        if !matched {
-            match fs::hard_link(&moved, &path).await {
-                // A newer record took the name meanwhile; the one moved aside is older still.
-                Ok(()) => {}
-                Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {}
-                Err(source) => return Err(persist("restore", &path, source)),
-            }
-        }
-        fs::remove_file(&moved)
-            .await
-            .map_err(|source| persist("remove", &moved, source))?;
-        Ok(matched)
-    }
-
     /// Removes `name`; `false` when it did not exist.
     pub(crate) async fn remove(&self, name: &str) -> Result<bool> {
         let path = self.secret_path(name)?;
@@ -835,41 +795,6 @@ mod tests {
         // A failure before publication is not reported as stored.
         let error = store.create("record", b"other").await.expect_err("exists");
         assert!(!error.is_published());
-    }
-
-    #[tokio::test]
-    async fn remove_if_removes_only_the_matching_record() {
-        let (_temp, store) = test_store().await;
-        store.create("remote", b"attempt-a").await.unwrap();
-        // Another attempt replaced the record: A's rollback must leave it.
-        assert!(store.remove("remote").await.unwrap());
-        store.create("remote", b"attempt-b").await.unwrap();
-        assert!(
-            !store
-                .remove_if("remote", |value| value == b"attempt-a")
-                .await
-                .unwrap()
-        );
-        assert_eq!(
-            store.get("remote").await.unwrap().as_deref(),
-            Some(&b"attempt-b"[..])
-        );
-        assert_eq!(store.names().await.unwrap(), ["remote"]);
-        assert!(
-            store
-                .remove_if("remote", |value| value == b"attempt-b")
-                .await
-                .unwrap()
-        );
-        assert!(store.get("remote").await.unwrap().is_none());
-        assert!(!store.remove_if("remote", |_| true).await.unwrap());
-        assert!(
-            std::fs::read_dir(store.root.as_path())
-                .unwrap()
-                .next()
-                .is_none(),
-            "nothing left behind"
-        );
     }
 
     #[tokio::test]
