@@ -118,6 +118,17 @@ function safeResponseFilename(contentDisposition: string | null, now: Date): str
   return timestampedFilename(now);
 }
 
+/**
+ * The `server.downloadDiagnosticLogs` input for `frontendLog`: the same bounded body as the
+ * HTTP route, so a remote bundle's frontend.log matches one downloaded from the primary.
+ */
+export function diagnosticLogsDownloadInput(
+  frontendLog: string,
+  options: DiagnosticLogsOptions = {},
+): DiagnosticLogsDownloadInput {
+  return JSON.parse(requestBody(frontendLog, options)) as DiagnosticLogsDownloadInput;
+}
+
 const executeAuthenticatedRequest = async (
   input: DiagnosticLogsRequest,
 ): Promise<DiagnosticLogsTransportResponse> =>
@@ -170,8 +181,7 @@ async function downloadFromEnvironment(
   environment: { readonly environmentId: EnvironmentId; readonly label: string },
   dependencies: DiagnosticDownloadDependencies,
 ): Promise<{ filename: string; archiveBytes: Uint8Array<ArrayBuffer> }> {
-  // The same bounded body as the HTTP route, so the remote bundle's frontend.log matches.
-  const input = JSON.parse(requestBody(frontendLog, options)) as DiagnosticLogsDownloadInput;
+  const input = diagnosticLogsDownloadInput(frontendLog, options);
   const archive = await dependencies.downloadFromEnvironment(
     environment.environmentId,
     environment.label,
