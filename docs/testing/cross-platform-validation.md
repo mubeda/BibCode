@@ -2900,7 +2900,10 @@ sizes. Cover relevant:
     Approval**, the chat's approval card closes, and the work log notes
     "Approval expired".
   - **Quit and relaunch during an approval.** Quit and relaunch BiBCode with an
-    approval open. The row reads **Failed** in Done, not Pending Approval.
+    approval open. A Codex or Claude chat's row reads **Failed** in Done, not
+    Pending Approval. An OpenCode chat's approval stays **Pending Approval**,
+    holding its queued messages, until the session resumes: it stays open if
+    OpenCode still lists it and expires if OpenCode no longer does.
   - **Per-terminal rows.** Open a Claude, Codex or OpenCode Terminal with **AI
     Terminal** activity off. It gets its own row, keyed apart from the chat's,
     and the row follows the agent: Working while it runs, Pending Approval at a
