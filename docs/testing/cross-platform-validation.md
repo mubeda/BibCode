@@ -413,7 +413,7 @@ message once.
 Composer **History** (needs Claude Code 2.0.73 or later on the server host):
 
 - With no Claude Code session running, check whether `<Claude config
-  dir>/sessions/` still exists and record the platform's answer; a missing
+dir>/sessions/` still exists and record the platform's answer; a missing
   directory reads every session as "Can't tell whether it's open". Then run a
   BiBCode Claude panel and record whether its process writes an entry there
   and with which `entrypoint` (`sdk-rust` is expected and skipped).
@@ -808,6 +808,52 @@ These tests are Unix-only. The live check runs on a remote Linux server whose
 
 A `found another program` warning means the probe reached `mise` itself. Record
 that, and the lines around it, as a failure.
+
+### Claude Terminal pin, attestation and shim
+
+A Claude AI Terminal is hooked only for a pinned copy of a proven build
+([Claude Terminal](../providers/claude.md)). For a change to the pin, the
+version range, the signature check, the shim resolver, or the environment
+overlay, run:
+
+```sh
+cargo test -p bibcode-server --lib provider_terminal::claude
+cargo test -p bibcode-server --test provider_terminal_supervisor claude
+cargo test -p bibcode-server --test provider_terminal_supervisor concurrent_opens_of_a_new_build
+cargo test -p bibcode-server --test provider_terminal_supervisor a_pin_still_copying
+cargo test -p bibcode-server --test provider_terminal_supervisor production_mise_resolver
+cargo test -p bibcode-server --test provider_terminal_supervisor lifecycle_environment_overlay
+```
+
+Their fixtures include a symlinked multi-call shim (`bin/claude` to a program
+named `mise`) and a shell script standing in for mise that reports the
+directory and launch variable it ran with. These tests are Unix-only.
+
+Three live checks use real builds. Each records its build's `--version`:
+
+1. **Installed build (macOS).** Copy the installed build under `$TMPDIR` (the
+   hermetic guard's root, for example with `cp -c`), then run
+   `BIBCODE_CLAUDE_ATTESTATION_FIXTURE=<copy> cargo test -p bibcode-server --lib installed_claude_build_is_approved -- --nocapture`.
+   It must pass and print the SHA-256 and probe timings.
+2. **Merge proof.** The [release step](../operations/release.md#claude-terminal-hook-ceiling)
+   is `live_user_pre_tool_use_guard_still_blocks_with_the_bibcode_overlay`.
+   Run it for any build the ceiling is raised to.
+3. **Real mise shim (Linux or macOS with mise).** Place mise, its data
+   directory with Claude installed (`mise use claude@<version>`), the shims and a
+   project whose `mise.toml` sets an `[env]` variable, all under `$TMPDIR`. Then
+   run, in release:
+
+   ```sh
+   BIBCODE_CLAUDE_MISE_SHIM=<data>/shims/claude BIBCODE_CLAUDE_MISE_PROJECT=<project> \
+   BIBCODE_CLAUDE_MISE_ENV_KEY=<variable> MISE_DATA_DIR=<data> \
+     cargo test --release -p bibcode-server --test provider_terminal_supervisor \
+     live_claude_terminal -- --ignored --nocapture
+   ```
+
+   Both opens (cold and proven build) must be hooked, carry the `[env]`
+   variable, and finish within 2.4 s. On Linux, run it on both a
+   block-sharing filesystem (btrfs or XFS) and ext4, and record the printed
+   times.
 
 ### Selecting other focused coverage
 
@@ -3712,7 +3758,7 @@ agent turn edit two files so the thread has a turn with checkpoints.
 8. **Open with**, with the platform's diff apps installed (Beyond Compare and
    FileMerge on macOS, Meld and KDiff3 on Linux, WinMerge on Windows):
    - the menu lists them with the default marked, and `git config
-     diff.guitool <tool>` moves the default to that tool;
+diff.guitool <tool>` moves the default to that tool;
    - in Compare, open the selected file, the deleted file and the rename in
      each scope, and **All files in** for the turn; the app shows the right
      two versions. In Changes, the toolbar's menu opens every file;

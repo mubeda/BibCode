@@ -110,14 +110,17 @@ says why:
 - **Offline:** its environment is disconnected.
 - **Status unavailable:** BiBCode has no way to observe it. That applies to
   Cursor and Grok terminals, to every AI Terminal on Windows, and to Claude
-  Terminals on Linux, behind a shim such as mise's, or on an unapproved build.
+  Terminals running a Claude Code that BiBCode has not verified.
 
 A session that failed reads **Failed** in Done.
 
-**Which AI Terminals report a status.** On macOS and Linux, Codex and OpenCode
-AI Terminals report their agent's status. A Claude Terminal does so only on
-macOS, with the Claude Code build BiBCode has approved, started directly and not
-through a shim such as mise's. These terminals run with BiBCode's status observer even when
+**Which AI Terminals report a status.** On macOS and Linux, Claude, Codex and
+OpenCode AI Terminals report their agent's status. A Claude Terminal needs Claude
+Code 2.1.220 to 2.1.312, installed directly or through mise. A newer Claude Code
+reads **Status unavailable** until a BiBCode update verifies it. On macOS it must
+also be Anthropic's signed build. On a slow Linux disk, a Claude Terminal can
+also read **Status unavailable** when copying the build takes longer than
+BiBCode waits. These terminals run with BiBCode's status observer even when
 **AI Terminal** activity is off; that setting now controls only the detailed
 Subagents and Background Tasks activity.
 
