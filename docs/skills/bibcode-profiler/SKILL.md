@@ -23,6 +23,7 @@ for the command prefix that fits the install:
 | ----------------------------------- | ----------------------------------------------------------------------- |
 | Server (package, archive)           | `bibcode profiler`                                                      |
 | Remote host                         | `ssh <host> bibcode profiler`                                           |
+| Remote host, no SSH (bundle only)   | `bibcode diagnostics download --environment <name>`, see below          |
 | WSL environment                     | `wsl.exe -d <distro> --exec <Linux path of the server binary> profiler` |
 | macOS desktop                       | `/Applications/BiBCode.app/Contents/MacOS/bibcode-desktop profiler`     |
 | Windows desktop                     | `& "$env:LOCALAPPDATA\BiBCode\bibcode-desktop.exe" profiler`            |
@@ -42,15 +43,24 @@ for the command prefix that fits the install:
   keep it.
 - **Remote hosts:** `bibcode` must be on the `PATH` of a non-interactive `ssh`
   shell, as BiBCode's own SSH launch requires. If it is not, ask where it is.
-  Without SSH access, ask the user to open **Settings → Diagnostics** in the
-  app that is connected to that host, choose the host in **Environment**, and
-  use **Download logs** (or **Export bundle**, with **Include crash dumps**
-  when a dump is needed). The remote server builds that ZIP itself and sends it
-  over the app's connection; its `manifest.json` names the host, its
-  `storageInstanceId`, and its server version, and its `profiler/` folder holds
-  the same events and findings files the commands read (parse them as NDJSON).
-  The archive holds one server's data: a launch or transport problem can also
-  need the primary's archive.
+  Without SSH access, when the BiBCode desktop app on this machine is connected
+  to that host, fetch its bundle with
+  `P' diagnostics download --environment <name or id> --output <dir> --json`,
+  where `P'` is this machine's prefix without `profiler` (`bibcode`, or the
+  desktop executable). Tell the user first: the app asks them to approve the
+  request ("Share <name>'s diagnostic logs?"), and it ends unanswered after 2
+  minutes. Add `--include-crash-dumps` only when a dump is needed, and say so.
+  An unknown name fails with the environments the app can reach. Exit 3 means
+  the desktop app is not running here; unattended access without the app is
+  not available yet (#202). Otherwise ask the user to open
+  **Settings → Diagnostics** in that app, choose the host in **Environment**,
+  and use **Download logs** (or **Export bundle**, with **Include crash dumps**
+  when a dump is needed). Either way the remote server builds the ZIP itself
+  and sends it over the app's connection; its `manifest.json` names the host,
+  its `storageInstanceId`, and its server version, and its `profiler/` folder
+  holds the same events and findings files the commands read (parse them as
+  NDJSON). The archive holds one server's data: a launch or transport problem
+  can also need the primary's archive.
 - **WSL:** the desktop runs the Linux binary that `BIBCODE_WSL_SERVER_BINARY`
   names (a Windows path; `wsl.exe -d <distro> -- wslpath -a '<path>'` converts it)
   through `wsl.exe -d <distro> --exec`. Its data root is the distro's
