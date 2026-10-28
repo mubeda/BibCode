@@ -1192,7 +1192,9 @@ async fn run_opencode_observer(
         terminal_observation: true,
         targeted_actor_cancellation: false,
     };
-    if !inner
+    // A scope that could not be written leaves activity unavailable and is written again after
+    // a backoff, as on enable; only a replaced generation stops here (#187).
+    let scope_written = match inner
         .publisher
         .publish_correlated(
             "opencode",
@@ -1200,23 +1202,26 @@ async fn run_opencode_observer(
             capabilities.clone(),
         )
         .await
-        .unwrap_or(false)
     {
-        keep_attach_until_cancellation(
-            &inner.resources,
-            &generation,
-            &mut *remote,
-            &root_session_id,
-        )
-        .await;
-        return;
-    }
+        Ok(true) => true,
+        Ok(false) => {
+            keep_attach_until_cancellation(
+                &inner.resources,
+                &generation,
+                &mut *remote,
+                &root_session_id,
+            )
+            .await;
+            return;
+        }
+        Err(_) => false,
+    };
 
     let mut tracker = OpenCodeActivityTracker::new(&root_session_id);
     let mut sequence = 0_u64;
     // A status-only observer shows no activity, so it attaches without first reading the
     // session tree; enabling activity reconciles it at once (#187).
-    let mut reconciled = inner.activity.snapshot().enabled;
+    let mut reconciled = scope_written && inner.activity.snapshot().enabled;
     if reconciled {
         reconcile_opencode(
             &inner.publisher,
@@ -1235,10 +1240,12 @@ async fn run_opencode_observer(
         establish_opencode_event_stream(&mut *remote, &generation, inner.handshake_timeout).await;
     let (mut mode, mut live_state) = if stream.is_some() {
         let state = inner.activity.snapshot();
-        let mode = if state.enabled {
+        let mode = if !state.enabled {
+            OpenCodeObserverMode::Dormant
+        } else if scope_written {
             OpenCodeObserverMode::Live
         } else {
-            OpenCodeObserverMode::Dormant
+            OpenCodeObserverMode::Unavailable
         };
         mark_opencode_observation(&inner, state, epoch, mode);
         (mode, (mode == OpenCodeObserverMode::Live).then_some(state))
@@ -1263,7 +1270,9 @@ async fn run_opencode_observer(
     };
     // Activity reads live only once its scope is written; one that could not be is
     // unavailable and enabled again after a backoff (#187).
-    let mut scope_retry: Option<tokio::time::Instant> = None;
+    let mut scope_retry: Option<tokio::time::Instant> =
+        (stream.is_some() && !scope_written && inner.activity.snapshot().enabled)
+            .then(|| tokio::time::Instant::now() + OPENCODE_SCOPE_RETRY_MIN);
     let mut scope_retry_delay = OPENCODE_SCOPE_RETRY_MIN;
     let mut schedule_scope_retry = |scope_retry: &mut Option<tokio::time::Instant>| {
         *scope_retry = Some(tokio::time::Instant::now() + scope_retry_delay);
