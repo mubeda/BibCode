@@ -2974,6 +2974,35 @@ sizes. Cover relevant:
   session in the right pane, the back arrow returns to the normal view, and the
   per-row jump-to-workspace action returns to the normal view and re-points the
   rail to that row's environment;
+- **agent status** in the Agents view and on workspace cards. Check each of the
+  following:
+  - **A question.** Ask a chat agent for something that makes it ask a
+    question. The row moves to **Awaiting Input** and the card glyph reads
+    "Waiting for your answer". Reload the window: the state is unchanged.
+  - **Stop during an approval.** In approval mode, wait for a command approval
+    and press **Stop** instead of answering. The row leaves **Pending
+    Approval**, the chat's approval card closes, and the work log notes
+    "Approval expired".
+  - **Quit and relaunch during an approval.** Quit and relaunch BiBCode with an
+    approval open. The row reads **Failed** in Done, not Pending Approval.
+  - **Per-terminal rows.** Open a Claude, Codex or OpenCode Terminal with **AI
+    Terminal** activity off. It gets its own row, keyed apart from the chat's,
+    and the row follows the agent: Working while it runs, Pending Approval at a
+    permission prompt, Awaiting Input at a question, Done at its prompt.
+    Selecting the row shows that terminal. A workspace with only a terminal
+    gets a row too.
+  - **Terminal availability per platform.**
+    - On Windows, every AI Terminal row reads **Status unavailable**.
+    - On macOS and Linux, a Cursor or Grok Terminal reads **Status
+      unavailable**.
+    - An unobserved terminal keeps a finished card from reading Done: its
+      glyph is a dashed circle.
+  - **Staleness.** Leave a turn running a silent 31-minute command. The row
+    moves to **Unknown** with **No update** and stops pulsing.
+  - **Offline and restart.** Disconnect a remote environment. Its rows read
+    **Offline** and stop pulsing. Reconnect, and its rows show live states
+    again. After an app relaunch, a silent agent that was already 30 minutes
+    old reads **No update** at once.
 - the **Environments | Repositories** switch: open one repository as a project
   on Local and on a remote environment. Switch the left panel to
   **Repositories**: the environment rail disappears, the BiBCode brand stays where it was
@@ -3281,7 +3310,13 @@ lines in `app-server.log`: each names its `reason`, its `stage`, and `elapsed_ms
 (see [Activity observation](../architecture/activity-observation.md)).
 A spec that passes alone but fails in the full suite fails only under the
 suite's load. Take the stage from the full run's `app-server.log` before
-changing an observer budget.
+changing an observer budget. A provider factory owns its budget
+(`preparation_budget`) and the manager waits that plus 150 ms, so change the
+factory's constant, never the manager's wait; the manager's 3 s ceiling is
+asserted to stay above every provider's wait. A terminal without Activity after
+the budget logs `provider terminal observer callback timed out` with the
+`timeout_ms` that ran out (see
+[Activity observation](../architecture/activity-observation.md), "Preparation budgets").
 Window resizing polls the actual viewport and native window until the requested
 size is reached, including when GTK startup dimensions settle independently.
 It does not depend on animation frames, which can stop in occluded macOS

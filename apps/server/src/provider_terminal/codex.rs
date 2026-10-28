@@ -22,7 +22,7 @@ use process_wrap::tokio::{ChildWrapper, CommandWrap};
 use serde_json::{Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
-use super::model::TerminalObserverGenerationLease;
+use super::model::{TerminalAgentReport, TerminalAgentState, TerminalObserverGenerationLease};
 #[cfg(unix)]
 use super::supervisor::create_owned_generation_directory;
 use super::{
@@ -60,10 +60,11 @@ use crate::{
         build_initialize_params,
         model::{
             CODEX_RECONCILIATION_BACKGROUND_LIMIT, CODEX_RECONCILIATION_THREAD_LIMIT,
-            CODEX_REMOTE_JSON_TOO_LARGE, ThreadBackgroundTerminalsListParams, ThreadListParams,
-            ThreadReadParams, ThreadReadResponse, TurnsPager,
-            decode_background_terminals_list_response, decode_thread_list_response,
-            decode_thread_read_response, is_recoverable_thread_resume_error,
+            CODEX_REMOTE_JSON_TOO_LARGE, ReconciliationThread, ReconciliationThreadStatus,
+            ThreadBackgroundTerminalsListParams, ThreadListParams, ThreadReadParams,
+            ThreadReadResponse, TurnsPager, decode_background_terminals_list_response,
+            decode_thread_list_response, decode_thread_read_response,
+            is_recoverable_thread_resume_error,
         },
     },
 };
@@ -633,7 +634,9 @@ impl CodexTerminalObserverFactory {
                 generation_started_at,
                 spawned: AtomicBool::new(false),
                 connection_epoch: AtomicU64::new(0),
-                activity: Arc::new(TerminalAgentActivityControl::enabled()),
+                activity: Arc::new(TerminalAgentActivityControl::with_enabled(
+                    input.activity_enabled,
+                )),
                 reattach_timeout: self.reattach_timeout,
                 warned_undecodable_history: Mutex::default(),
             }),
@@ -744,6 +747,10 @@ impl CodexPreparationSkip {
 }
 
 impl ProviderTerminalObserverFactory for CodexTerminalObserverFactory {
+    fn preparation_budget(&self) -> Duration {
+        CODEX_PREPARATION_BUDGET
+    }
+
     fn prepare(
         &self,
         input: ProviderTerminalObserverFactoryInput,
@@ -1313,64 +1320,44 @@ async fn run_codex_observer_inner(
         }
         break resumed;
     };
-
-    let published = inner
-        .publisher
-        .publish_correlated(
-            "codex",
-            Some(&inner.provider_instance_id),
-            ActivityCapabilities::structured_full(false),
-        )
-        .await;
-    if !matches!(published, Ok(true)) {
-        if generation.cancellation_reason().is_none() {
-            let detail = match &published {
-                Ok(_) => "the terminal generation no longer accepts publication".to_owned(),
-                Err(error) => format!("{error:?}"),
-            };
-            warn_codex_observer_stopped(
-                inner,
-                "live_publication_rejected",
-                observer_started,
-                &detail,
-            );
-        }
-        return;
+    // The left panel learns the root agent's state as soon as the observer attaches (#187).
+    if let Some((state, failed)) = codex_resumed_agent_status(resumed.thread.status.as_ref()) {
+        generation.publish_agent_status(state, failed);
     }
 
+    let initial_state = *activity.borrow_and_update();
     let mut tracker = CodexActivityTracker::new_for_terminal_observation(Some(&root));
     tracker.seed_actor(&root);
-    let native_event_key_prefix = format!("codex:terminal-observation:{epoch}");
-    let started_at_ms = current_unix_millis();
-    let mut root_output = tracker.handle_notification(
-        "thread/status/changed",
-        &json!({
-            "threadId": root,
-            "status": {"type": "active", "activeFlags": []},
-        }),
-        started_at_ms,
-        0,
-    );
-    let recovered = tracker.reconcile_thread_history(&resumed.thread);
-    root_output.mutations.extend(recovered.mutations);
-    root_output.request_reconciliation |= recovered.request_reconciliation;
-    apply_activity_output(
-        inner,
-        &format!("{native_event_key_prefix}:root"),
-        root_output,
-    )
-    .await;
-    reconcile_codex_terminal(
-        inner,
-        &native_event_key_prefix,
-        &mut *client,
-        &mut tracker,
-        &root,
-        0,
-    )
-    .await;
+    // A status-only observer publishes no activity, so it skips the history it would show;
+    // enabling activity later publishes the scope (#187).
+    let mut scope_published = false;
+    if initial_state.enabled {
+        if let Err(rejection) =
+            publish_codex_root_scope(inner, &mut tracker, &root, epoch, Some(&resumed.thread)).await
+        {
+            if generation.cancellation_reason().is_none() {
+                warn_codex_observer_stopped(
+                    inner,
+                    "live_publication_rejected",
+                    observer_started,
+                    rejection.category(),
+                );
+            }
+            return;
+        }
+        scope_published = true;
+        reconcile_codex_terminal(
+            inner,
+            &format!("codex:terminal-observation:{epoch}"),
+            &mut *client,
+            &mut tracker,
+            &root,
+            0,
+        )
+        .await;
+    }
+    drop(resumed);
 
-    let initial_state = *activity.borrow_and_update();
     let mut live_state = initial_state.enabled.then_some(initial_state);
     inner
         .activity
@@ -1532,6 +1519,16 @@ async fn run_codex_observer_inner(
                             epoch: barrier_epoch,
                             kind: TerminalAgentActivityObservationKind::Live,
                         });
+                    // An observer launched for status only never created its scope: publish
+                    // it with the root agent, then reconcile what runs under it (#187).
+                    if !scope_published
+                        && publish_codex_root_scope(inner, &mut tracker, &root, barrier_epoch, None)
+                            .await
+                            .is_ok()
+                    {
+                        scope_published = true;
+                        pending_reconciliation = true;
+                    }
                     publish_codex_live_scope(inner, barrier_epoch, receive_sequence).await;
                     receive_sequence = receive_sequence.saturating_add(1);
                     continue;
@@ -1682,6 +1679,11 @@ async fn run_codex_observer_inner(
                         continue;
                     }
                 };
+                // The root agent's state goes to the left panel whatever the activity setting
+                // says (#187).
+                if let Some(report) = codex_root_agent_status(&envelope, &root) {
+                    generation.report_agent_status(report);
+                }
                 let desired = inner.activity.snapshot();
                 if live_state != Some(desired)
                     || epoch != inner.connection_epoch.load(Ordering::Acquire)
@@ -1713,6 +1715,90 @@ async fn run_codex_observer_inner(
             }
         }
     }
+}
+
+/// Why the terminal's activity scope could not be created. The category is safe to log: it is
+/// a fixed string, never an error's text, which can quote paths or content.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CodexScopeRejection {
+    /// The terminal generation is no longer current (closed, restarted or fenced).
+    StaleGeneration,
+    /// Creating the scope failed; carries the kind of failure.
+    PublicationFailed(&'static str),
+}
+
+impl CodexScopeRejection {
+    fn category(self) -> &'static str {
+        match self {
+            Self::StaleGeneration => "the terminal generation is no longer current",
+            Self::PublicationFailed(kind) => kind,
+        }
+    }
+
+    fn from_error(error: &crate::activity::ActivityError) -> Self {
+        use crate::activity::ActivityRepositoryError as Error;
+        Self::PublicationFailed(match error {
+            Error::Persistence(_) => "activity publication failed: persistence",
+            Error::InvalidModel(_) => "activity publication failed: invalid model",
+            Error::NotFound => "activity publication failed: scope not found",
+            Error::InvalidScope(_) => "activity publication failed: invalid scope",
+            Error::InvalidCursor => "activity publication failed: invalid cursor",
+            Error::EmptyBatch | Error::TooManyMutations => {
+                "activity publication failed: invalid batch"
+            }
+            Error::InvalidReference(_) => "activity publication failed: invalid reference",
+            Error::InvalidCapabilities(_) => "activity publication failed: invalid capabilities",
+            Error::InvalidLimit => "activity publication failed: invalid limit",
+            Error::FeatureDisabled => "activity publication failed: feature disabled",
+            Error::Serialization(_) => "activity publication failed: serialization",
+        })
+    }
+}
+
+/// Creates the terminal's activity scope with the TUI root agent and, at attach, the history
+/// `thread/resume` returned. Rejected when this observer generation is no longer current or the
+/// scope could not be created.
+async fn publish_codex_root_scope(
+    inner: &CodexObserverInner,
+    tracker: &mut CodexActivityTracker,
+    root: &str,
+    epoch: u64,
+    history: Option<&ReconciliationThread>,
+) -> Result<(), CodexScopeRejection> {
+    match inner
+        .publisher
+        .publish_correlated(
+            "codex",
+            Some(&inner.provider_instance_id),
+            ActivityCapabilities::structured_full(false),
+        )
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return Err(CodexScopeRejection::StaleGeneration),
+        Err(error) => return Err(CodexScopeRejection::from_error(&error)),
+    }
+    let mut root_output = tracker.handle_notification(
+        "thread/status/changed",
+        &json!({
+            "threadId": root,
+            "status": {"type": "active", "activeFlags": []},
+        }),
+        current_unix_millis(),
+        0,
+    );
+    if let Some(history) = history {
+        let recovered = tracker.reconcile_thread_history(history);
+        root_output.mutations.extend(recovered.mutations);
+        root_output.request_reconciliation |= recovered.request_reconciliation;
+    }
+    apply_activity_output(
+        inner,
+        &format!("codex:terminal-observation:{epoch}:root"),
+        root_output,
+    )
+    .await;
+    Ok(())
 }
 
 async fn publish_codex_live_scope(inner: &CodexObserverInner, epoch: u64, receive_sequence: u128) {
@@ -1764,7 +1850,18 @@ async fn reconnect_attached_codex_client(
             client.request("thread/resume", json!({"threadId": root})),
         ) => response,
     };
-    matches!(response, Ok(Ok(_))).then_some(client)
+    let Ok(Ok(response)) = response else {
+        return None;
+    };
+    // The agent may have moved on while the connection was down (#187).
+    let status = response
+        .pointer("/thread/status")
+        .cloned()
+        .and_then(|status| serde_json::from_value::<ReconciliationThreadStatus>(status).ok());
+    if let Some((state, failed)) = codex_resumed_agent_status(status.as_ref()) {
+        generation.publish_agent_status(state, failed);
+    }
+    Some(client)
 }
 
 async fn reconnect_codex_root_discovery_client(
@@ -1985,6 +2082,78 @@ enum CodexRootDiscoveryOutcome {
     Retry,
     WaitForResponse,
     Stop,
+}
+
+/// The TUI root agent's state a Codex notification reports, for the left panel (#187): its
+/// thread status (an approval or a question blocks it), or its turn starting and ending.
+pub(super) fn codex_root_agent_status(envelope: &Value, root: &str) -> Option<TerminalAgentReport> {
+    let params = envelope.get("params")?;
+    if params.get("threadId")?.as_str()? != root {
+        return None;
+    }
+    let method = envelope.get("method")?.as_str()?;
+    let set = |state, failed| Some(TerminalAgentReport::Set(state, failed));
+    match method {
+        "thread/status/changed" => {
+            let status = params.get("status")?;
+            match status.get("type")?.as_str()? {
+                "active" => {
+                    let flags = status.get("activeFlags").and_then(Value::as_array);
+                    set(
+                        codex_active_agent_state(|flag| {
+                            flags.is_some_and(|flags| flags.iter().any(|value| value == flag))
+                        }),
+                        false,
+                    )
+                }
+                "idle" => set(TerminalAgentState::Done, false),
+                "systemError" => set(TerminalAgentState::Done, true),
+                _ => None,
+            }
+        }
+        "turn/started" => set(TerminalAgentState::Working, false),
+        "turn/completed" => set(
+            TerminalAgentState::Done,
+            params.pointer("/turn/status").and_then(Value::as_str) == Some("failed"),
+        ),
+        // A server request asks the user; an item notification is the agent's output
+        // streaming, which leaves an open ask shown.
+        _ if envelope.get("id").is_some() => match method {
+            "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
+                set(TerminalAgentState::Blocked, false)
+            }
+            "item/tool/requestUserInput" => set(TerminalAgentState::Waiting, false),
+            _ => None,
+        },
+        _ if method.starts_with("item/") => Some(TerminalAgentReport::Progress),
+        _ => None,
+    }
+}
+
+/// The root agent's state a `thread/resume` response reports, for the left panel (#187).
+pub(super) fn codex_resumed_agent_status(
+    status: Option<&ReconciliationThreadStatus>,
+) -> Option<(TerminalAgentState, bool)> {
+    match status? {
+        ReconciliationThreadStatus::Active { active_flags } => Some((
+            codex_active_agent_state(|flag| active_flags.iter().any(|value| value == flag)),
+            false,
+        )),
+        ReconciliationThreadStatus::Idle => Some((TerminalAgentState::Done, false)),
+        ReconciliationThreadStatus::SystemError => Some((TerminalAgentState::Done, true)),
+        ReconciliationThreadStatus::NotLoaded | ReconciliationThreadStatus::Unknown => None,
+    }
+}
+
+/// An active thread is blocked on an approval, waiting on the user, or working.
+fn codex_active_agent_state(flagged: impl Fn(&str) -> bool) -> TerminalAgentState {
+    if flagged("waitingOnApproval") {
+        TerminalAgentState::Blocked
+    } else if flagged("waitingOnUserInput") {
+        TerminalAgentState::Waiting
+    } else {
+        TerminalAgentState::Working
+    }
 }
 
 fn is_codex_json_rpc_response(value: &Value) -> bool {
@@ -3316,6 +3485,41 @@ impl CodexRemoteClient for SystemCodexRemoteClient {
 mod tests {
     use super::*;
     use crate::test_support::{FixtureEvent, TestSandbox};
+
+    /// A rejected root scope is logged by category. The category never carries an error's text,
+    /// which can quote a path or content.
+    #[test]
+    fn scope_rejection_names_a_safe_category() {
+        use crate::activity::ActivityRepositoryError as Error;
+
+        assert_eq!(
+            CodexScopeRejection::StaleGeneration.category(),
+            "the terminal generation is no longer current"
+        );
+        let secret = "/Users/someone/private-project";
+        for (error, expected) in [
+            (
+                Error::NotFound,
+                "activity publication failed: scope not found",
+            ),
+            (
+                Error::InvalidScope(secret.to_owned()),
+                "activity publication failed: invalid scope",
+            ),
+            (
+                Error::InvalidReference(secret.to_owned()),
+                "activity publication failed: invalid reference",
+            ),
+            (
+                Error::InvalidCapabilities(secret.to_owned()),
+                "activity publication failed: invalid capabilities",
+            ),
+        ] {
+            let category = CodexScopeRejection::from_error(&error).category();
+            assert_eq!(category, expected);
+            assert!(!category.contains(secret));
+        }
+    }
 
     /// Answers each probe command with the next scripted result.
     #[derive(Default)]

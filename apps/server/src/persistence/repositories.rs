@@ -952,7 +952,9 @@ impl Repositories {
             .await
     }
 
-    /// Whether the thread already recorded `request_id`, asked or resolved.
+    /// Whether the thread already recorded `request_id`, asked or resolved. A request BiBCode
+    /// expired when its session left `running` counts as not recorded: a provider that lists it
+    /// again (OpenCode after a restart) still waits on it, so it is shown again.
     pub(crate) async fn request_is_recorded(
         &self,
         thread_id: String,
@@ -961,10 +963,13 @@ impl Repositories {
         self.database
             .call(move |connection| {
                 Ok(connection.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM projection_thread_activities
-                       WHERE thread_id = ? AND json_extract(payload_json, '$.requestId') = ?
-                         AND kind IN ('approval.requested', 'approval.resolved',
-                                      'user-input.requested', 'user-input.resolved'))",
+                    "SELECT COALESCE((SELECT kind NOT IN ('approval.expired', 'user-input.expired')
+                       FROM projection_thread_activities
+                       WHERE thread_id = ?1 AND json_extract(payload_json, '$.requestId') = ?2
+                         AND kind IN ('approval.requested', 'approval.resolved', 'approval.expired',
+                                      'user-input.requested', 'user-input.resolved', 'user-input.expired')
+                       ORDER BY COALESCE(sequence, 0) DESC, created_at DESC, activity_id DESC
+                       LIMIT 1), 0)",
                     params![thread_id, request_id],
                     |row| row.get(0),
                 )?)
@@ -2399,6 +2404,11 @@ pub struct ProjectionThread {
     /// `failedMessageId`), projected from its events.
     #[serde(default)]
     pub compaction: Option<Value>,
+    /// When the provider last showed progress on this thread: one of its events, or the
+    /// session entering `starting` or `running`. Client edits never move it. The left
+    /// panel ages a Working status from it (#187).
+    #[serde(default)]
+    pub last_activity_at: Option<Timestamp>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2690,7 +2700,7 @@ pub struct AuthSession {
 }
 
 const PROJECT_SELECT: &str = "SELECT project_id, title, workspace_root, default_model_selection_json, scripts_json, worktree_discovery_json, (SELECT repository_key FROM project_worktree_repository_pins WHERE project_id = projection_projects.project_id), created_at, updated_at, deleted_at, repository_identity_json FROM projection_projects";
-const THREAD_SELECT: &str = "SELECT thread_id, project_id, title, kind, model_selection_json, runtime_mode, interaction_mode, branch, worktree_path, latest_turn_id, created_at, updated_at, archived_at, latest_user_message_at, pending_approval_count, pending_user_input_count, has_actionable_proposed_plan, unresolved_delivery_state, unresolved_delivery_detail, deleted_at, host_thread_id, compaction_json FROM projection_threads";
+const THREAD_SELECT: &str = "SELECT thread_id, project_id, title, kind, model_selection_json, runtime_mode, interaction_mode, branch, worktree_path, latest_turn_id, created_at, updated_at, archived_at, latest_user_message_at, pending_approval_count, pending_user_input_count, has_actionable_proposed_plan, unresolved_delivery_state, unresolved_delivery_detail, deleted_at, host_thread_id, compaction_json, last_activity_at FROM projection_threads";
 const PROJECT_LIST_ORDER: &str = " ORDER BY created_at ASC, project_id ASC";
 const MESSAGE_SELECT: &str = "SELECT message_id, thread_id, turn_id, role, text, attachments_json, is_streaming, delivery_state, delivery_provider, delivery_detail, created_at, updated_at, delivery_mode, delivery_held, delivery_reason, delivery_provider_instance_id, resend_of_message_id FROM projection_thread_messages";
 const MESSAGE_LIST_ORDER: &str = " ORDER BY CASE WHEN delivery_state = 'queued' THEN (SELECT receipt.result_sequence FROM provider_turn_outbox AS queued JOIN orchestration_command_receipts AS receipt ON receipt.command_id = queued.command_id WHERE queued.message_id = projection_thread_messages.message_id) END ASC, created_at ASC, message_id ASC";
@@ -2931,6 +2941,7 @@ fn decode_thread(row: &Row<'_>) -> rusqlite::Result<ProjectionThread> {
         deleted_at: row.get(19)?,
         host_thread_id: row.get(20)?,
         compaction: decode_optional_json(row.get(21)?, "compaction_json")?,
+        last_activity_at: row.get(22)?,
     })
 }
 fn decode_message(row: &Row<'_>) -> rusqlite::Result<ProjectionThreadMessage> {
@@ -3022,14 +3033,36 @@ pub(crate) fn queued_provider_turn_head_on(
         .map_err(Into::into)
 }
 
+/// The request ids of `thread_expr`'s questions that still wait for an answer: those whose
+/// newest record is the ask itself, or a refused answer the provider did not call stale.
+/// One rule for the queue head and the thread's pending-question count, so a question holds
+/// the queue exactly while the left panel says the agent awaits input.
+pub(crate) fn open_user_input_requests_sql(thread_expr: &str) -> String {
+    format!(
+        "SELECT request_id FROM (
+           SELECT json_extract(payload_json, '$.requestId') AS request_id, kind,
+             lower(COALESCE(json_extract(payload_json, '$.detail'), '')) AS detail,
+             ROW_NUMBER() OVER (PARTITION BY json_extract(payload_json, '$.requestId') ORDER BY COALESCE(sequence, 0) DESC, created_at DESC, activity_id DESC) AS position
+           FROM projection_thread_activities WHERE thread_id = {thread_expr}
+             AND json_extract(payload_json, '$.requestId') IS NOT NULL
+             AND kind IN ('user-input.requested', 'user-input.resolved', 'user-input.expired', 'provider.user-input.respond.failed')
+         ) WHERE position = 1 AND (kind = 'user-input.requested' OR (kind = 'provider.user-input.respond.failed'
+           AND detail NOT LIKE '%stale pending user-input request%'
+           AND detail NOT LIKE '%unknown pending user-input request%'
+           AND detail NOT LIKE '%unknown pending user input request%'
+           AND detail NOT LIKE '%unknown pending codex user input request%'))"
+    )
+}
+
 pub(crate) fn can_promote_queued_provider_turn_on(
     connection: &Connection,
     thread_id: &str,
     message_id: &str,
     automatic: bool,
 ) -> Result<bool> {
+    let open_user_inputs = open_user_input_requests_sql("queued.thread_id");
     connection.query_row(
-        "SELECT EXISTS(
+        &format!("SELECT EXISTS(
            SELECT 1 FROM provider_turn_outbox AS queued
            JOIN projection_threads AS thread ON thread.thread_id = queued.thread_id AND thread.deleted_at IS NULL
            LEFT JOIN projection_thread_sessions AS session ON session.thread_id = queued.thread_id
@@ -3049,16 +3082,7 @@ pub(crate) fn can_promote_queued_provider_turn_on(
                          AND json_extract(resolution.payload_json, '$.state') = 'dismissed'
                          AND json_extract(resolution.metadata_json, '$.deliveryPreviousState') IN ('pending', 'failed')))))
                AND NOT EXISTS(SELECT 1 FROM projection_pending_approvals WHERE thread_id = queued.thread_id AND status = 'pending')
-               AND NOT EXISTS(
-                 SELECT 1 FROM (
-                   SELECT kind, lower(COALESCE(json_extract(payload_json, '$.detail'), '')) AS detail,
-                     ROW_NUMBER() OVER (PARTITION BY json_extract(payload_json, '$.requestId') ORDER BY COALESCE(sequence, 0) DESC, created_at DESC, activity_id DESC) AS position
-                   FROM projection_thread_activities WHERE thread_id = queued.thread_id
-                     AND json_extract(payload_json, '$.requestId') IS NOT NULL
-                     AND kind IN ('user-input.requested', 'user-input.resolved', 'provider.user-input.respond.failed')
-                 ) WHERE position = 1 AND (kind = 'user-input.requested' OR (kind = 'provider.user-input.respond.failed'
-                   AND detail NOT LIKE '%stale pending user-input request%' AND detail NOT LIKE '%unknown pending user-input request%'))
-               )
+               AND NOT EXISTS({open_user_inputs})
              ))
              AND NOT EXISTS(SELECT 1 FROM provider_turn_outbox AS active
                WHERE active.thread_id = queued.thread_id AND active.state IN ('pending', 'sending'))
@@ -3072,7 +3096,7 @@ pub(crate) fn can_promote_queued_provider_turn_on(
                WHERE next.thread_id = queued.thread_id AND next.state = 'queued'
                ORDER BY receipt.result_sequence, next.created_at, next.command_id LIMIT 1
              )
-         )",
+         )"),
         params![thread_id, message_id, automatic], |row| row.get(0),
     ).map_err(Into::into)
 }

@@ -25,7 +25,7 @@ use tokio::{
 
 #[cfg(test)]
 use super::TerminalObserverGeneration;
-use super::model::TerminalObserverGenerationLease;
+use super::model::{TerminalAgentReport, TerminalAgentState, TerminalObserverGenerationLease};
 use super::{
     NativeTerminalCommand, PreparedTerminalLaunch, PreparedTerminalObserver,
     ProviderTerminalObserverFactory, ProviderTerminalObserverFactoryInput,
@@ -392,10 +392,20 @@ pub trait OpenCodeHelperLauncher: Send + Sync + fmt::Debug {
     }
 }
 
+/// The next event's data while activity is dormant, when the stream can hand it over.
+pub type DormantEventData<'a> =
+    Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>, String>> + Send + 'a>>;
+
 pub trait OpenCodeEventStream: Send {
     fn discard_next(&mut self) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>>;
 
     fn next_data(&mut self) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send + '_>>;
+
+    /// The next event while AI Terminal activity is dormant. Only the agent's left-panel status
+    /// reads its data (#187); a stream that cannot hand it over discards it, as before.
+    fn next_dormant_data(&mut self) -> DormantEventData<'_> {
+        Box::pin(async move { self.discard_next().await.map(|()| None) })
+    }
 }
 
 pub trait OpenCodeRemoteClient: Send {
@@ -630,7 +640,9 @@ impl OpenCodeTerminalObserverFactory {
                 handshake_timeout: self.handshake_timeout,
                 reattach_timeout: self.reattach_timeout,
                 spawned: AtomicBool::new(false),
-                activity: Arc::new(TerminalAgentActivityControl::enabled()),
+                activity: Arc::new(TerminalAgentActivityControl::with_enabled(
+                    input.activity_enabled,
+                )),
             }),
         };
         let directory = input.launch.cwd.to_string_lossy().into_owned();
@@ -675,6 +687,10 @@ impl OpenCodeTerminalObserverFactory {
 }
 
 impl ProviderTerminalObserverFactory for OpenCodeTerminalObserverFactory {
+    fn preparation_budget(&self) -> Duration {
+        OPENCODE_PREPARATION_BUDGET
+    }
+
     fn prepare(
         &self,
         input: ProviderTerminalObserverFactoryInput,
@@ -1027,6 +1043,8 @@ enum OpenCodeLiveWork<T> {
 }
 
 enum OpenCodeLiveData {
+    /// Rejected before decoding: activity moved on when this data was selected.
+    Undecoded,
     Stale,
     Malformed,
     Output {
@@ -1093,18 +1111,22 @@ fn opencode_live_work_is_current(
     fence.activity.admission_is_current(admission) && fence.is_current()
 }
 
+/// Decodes live data once: `on_event` reads the decoded event (the root agent's status) before
+/// the tracker does.
 fn decode_and_track_opencode_live_data(
     fence: OpenCodeLiveFence<'_>,
     tracker: &mut OpenCodeActivityTracker,
     data: &[u8],
     received_at_ms: u64,
+    on_event: impl FnOnce(&Value),
 ) -> OpenCodeLiveData {
     let Some(admission) = admit_opencode_live_work(fence) else {
-        return OpenCodeLiveData::Stale;
+        return OpenCodeLiveData::Undecoded;
     };
     let Ok(event) = serde_json::from_slice::<Value>(data) else {
         return OpenCodeLiveData::Malformed;
     };
+    on_event(&event);
     if !opencode_live_work_is_current(fence, &admission) {
         return OpenCodeLiveData::Stale;
     }
@@ -1174,7 +1196,11 @@ async fn run_opencode_observer(
     };
     if !inner
         .publisher
-        .publish_correlated("opencode", Some(&inner.provider_instance_id), capabilities)
+        .publish_correlated(
+            "opencode",
+            Some(&inner.provider_instance_id),
+            capabilities.clone(),
+        )
         .await
         .unwrap_or(false)
     {
@@ -1190,17 +1216,23 @@ async fn run_opencode_observer(
 
     let mut tracker = OpenCodeActivityTracker::new(&root_session_id);
     let mut sequence = 0_u64;
-    reconcile_opencode(
-        &inner.publisher,
-        &mut *remote,
-        &mut tracker,
-        &root_session_id,
-        &mut sequence,
-        None,
-    )
-    .await;
+    // A status-only observer shows no activity, so it attaches without first reading the
+    // session tree; enabling activity reconciles it at once (#187).
+    let mut reconciled = inner.activity.snapshot().enabled;
+    if reconciled {
+        reconcile_opencode(
+            &inner.publisher,
+            &mut *remote,
+            &mut tracker,
+            &root_session_id,
+            &mut sequence,
+            None,
+        )
+        .await;
+    }
 
     let mut epoch = 0_u64;
+    hydrate_opencode_root_status(&mut *remote, &generation, &root_session_id).await;
     let mut stream =
         establish_opencode_event_stream(&mut *remote, &generation, inner.handshake_timeout).await;
     let (mut mode, mut live_state) = if stream.is_some() {
@@ -1222,9 +1254,19 @@ async fn run_opencode_observer(
         OPENCODE_RECONCILIATION_INTERVAL,
     );
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Activity enabled on a tree never read reconciles it now, not an interval later.
+    let next_reconciliation = |reconciled: bool| {
+        tokio::time::Instant::now()
+            + if reconciled {
+                OPENCODE_RECONCILIATION_INTERVAL
+            } else {
+                Duration::ZERO
+            }
+    };
 
     loop {
         if stream.is_none() {
+            hydrate_opencode_root_status(&mut *remote, &generation, &root_session_id).await;
             stream =
                 establish_opencode_event_stream(&mut *remote, &generation, inner.handshake_timeout)
                     .await;
@@ -1236,14 +1278,24 @@ async fn run_opencode_observer(
                 tracker = OpenCodeActivityTracker::new(&root_session_id);
                 let state = inner.activity.snapshot();
                 mode = if state.enabled {
-                    interval
-                        .reset_at(tokio::time::Instant::now() + OPENCODE_RECONCILIATION_INTERVAL);
+                    interval.reset_at(next_reconciliation(reconciled));
                     live_state = Some(state);
                     OpenCodeObserverMode::Live
                 } else {
                     live_state = None;
                     OpenCodeObserverMode::Dormant
                 };
+                if mode == OpenCodeObserverMode::Live {
+                    // A status-only launch never created its scope (#187).
+                    let _ = inner
+                        .publisher
+                        .publish_correlated(
+                            "opencode",
+                            Some(&inner.provider_instance_id),
+                            capabilities.clone(),
+                        )
+                        .await;
+                }
                 mark_opencode_observation(&inner, state, epoch, mode);
                 continue;
             }
@@ -1287,8 +1339,17 @@ async fn run_opencode_observer(
                         changed = activity.changed() => {
                             OpenCodeObserverEvent::ActivityChanged(changed.is_ok())
                         }
-                        discarded = current_stream.discard_next() => {
-                            OpenCodeObserverEvent::Discard(discarded)
+                        // Dormant activity still reads the root agent's state (#187).
+                        data = current_stream.next_dormant_data() => {
+                            OpenCodeObserverEvent::Discard(data.map(|data| {
+                                if let Some(data) = data {
+                                    publish_opencode_agent_status(
+                                        &generation,
+                                        &root_session_id,
+                                        &data,
+                                    );
+                                }
+                            }))
                         }
                     }
                 }
@@ -1309,6 +1370,7 @@ async fn run_opencode_observer(
                     continue;
                 };
                 let publication = OpenCodeLivePublication { fence, admission };
+                reconciled = true;
                 let reconciliation = reconcile_opencode(
                     &inner.publisher,
                     &mut *remote,
@@ -1382,13 +1444,20 @@ async fn run_opencode_observer(
                                     tracker = OpenCodeActivityTracker::new(&root_session_id);
                                     live_state = Some(state);
                                     mode = OpenCodeObserverMode::Live;
-                                    interval.reset_at(
-                                        tokio::time::Instant::now()
-                                            + OPENCODE_RECONCILIATION_INTERVAL,
-                                    );
+                                    interval.reset_at(next_reconciliation(reconciled));
                                 },
                             );
                             if promoted {
+                                // An observer launched for status only never created its
+                                // scope (#187).
+                                let _ = inner
+                                    .publisher
+                                    .publish_correlated(
+                                        "opencode",
+                                        Some(&inner.provider_instance_id),
+                                        capabilities.clone(),
+                                    )
+                                    .await;
                                 break;
                             }
                             state = inner.activity.snapshot();
@@ -1431,6 +1500,7 @@ async fn run_opencode_observer(
             }
             OpenCodeObserverEvent::Data(Ok(data)) => {
                 let Some(state) = live_state else {
+                    publish_opencode_agent_status(&generation, &root_session_id, &data);
                     continue;
                 };
                 let fence = OpenCodeLiveFence {
@@ -1443,7 +1513,15 @@ async fn run_opencode_observer(
                     &mut tracker,
                     &data,
                     now_millis(),
+                    |event| {
+                        OpenCodeStatusEvent::from_value(event)
+                            .publish(&generation, &root_session_id);
+                    },
                 ) {
+                    OpenCodeLiveData::Undecoded => {
+                        publish_opencode_agent_status(&generation, &root_session_id, &data);
+                        continue;
+                    }
                     OpenCodeLiveData::Stale => continue,
                     OpenCodeLiveData::Malformed => {
                         stream = None;
@@ -1476,6 +1554,163 @@ async fn run_opencode_observer(
                 mark_opencode_observation(&inner, inner.activity.snapshot(), epoch, mode);
             }
             OpenCodeObserverEvent::Discard(Ok(())) => {}
+        }
+    }
+}
+
+/// Reads the root session's state as the observer attaches or reattaches, which the events it
+/// missed cannot tell (#187). OpenCode lists only sessions that are not idle; an open ask keeps
+/// its session busy, so busy reports progress and leaves the ask shown.
+async fn hydrate_opencode_root_status(
+    remote: &mut dyn OpenCodeRemoteClient,
+    generation: &TerminalObserverGenerationLease,
+    root_session_id: &str,
+) {
+    let Ok(Ok(statuses)) = tokio::time::timeout(OPENCODE_REQUEST_TIMEOUT, remote.statuses()).await
+    else {
+        return;
+    };
+    match statuses
+        .get(root_session_id)
+        .and_then(|status| status.get("type"))
+        .and_then(Value::as_str)
+    {
+        Some("busy" | "retry") => generation.publish_agent_progress(),
+        Some("idle") | None => generation.publish_agent_status(TerminalAgentState::Done, false),
+        Some(_) => {}
+    }
+}
+
+/// Publishes the root session's state an OpenCode event reports, for the left panel (#187). It
+/// decodes only the fields that state needs, so no prompt or message text is read or kept.
+fn publish_opencode_agent_status(
+    generation: &TerminalObserverGenerationLease,
+    root_session_id: &str,
+    data: &[u8],
+) {
+    if let Ok(event) = serde_json::from_slice::<OpenCodeStatusEvent>(data) {
+        event.publish(generation, root_session_id);
+    }
+}
+
+/// The root session's state an OpenCode event reports: busy or idle, an open permission ask
+/// (blocked) or question (waiting), an error, or its message parts streaming (progress, which
+/// leaves an open ask shown). Child sessions leave it alone. The dormant path's partial decode
+/// and the live path's decoded event must agree.
+#[cfg(test)]
+pub(super) fn opencode_root_agent_status(
+    event: &Value,
+    root_session_id: &str,
+) -> Option<TerminalAgentReport> {
+    let decoded = OpenCodeStatusEvent::from_value(event).status(root_session_id);
+    let partial = serde_json::from_slice::<OpenCodeStatusEvent>(
+        &serde_json::to_vec(event).expect("encode OpenCode event"),
+    )
+    .expect("partial OpenCode status decode")
+    .status(root_session_id);
+    assert_eq!(decoded, partial, "{event}");
+    decoded
+}
+
+/// The few fields of an OpenCode event the root agent's status reads (#187); serde skips the
+/// rest, message and prompt text included.
+#[derive(Debug, Default, serde::Deserialize)]
+struct OpenCodeStatusEvent {
+    #[serde(rename = "type", default)]
+    event_type: String,
+    #[serde(default)]
+    properties: OpenCodeStatusProperties,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct OpenCodeStatusProperties {
+    #[serde(rename = "sessionID", default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    status: Option<OpenCodeStatusKind>,
+    #[serde(default)]
+    part: Option<OpenCodeStatusPart>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct OpenCodeStatusKind {
+    #[serde(rename = "type", default)]
+    kind: Option<String>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct OpenCodeStatusPart {
+    #[serde(rename = "sessionID", default)]
+    session_id: Option<String>,
+    #[serde(rename = "type", default)]
+    kind: Option<String>,
+}
+
+impl OpenCodeStatusEvent {
+    /// The same fields, read from an event the live path already decoded.
+    fn from_value(event: &Value) -> Self {
+        let text = |pointer: &str| {
+            event
+                .pointer(pointer)
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        };
+        Self {
+            event_type: text("/type").unwrap_or_default(),
+            properties: OpenCodeStatusProperties {
+                session_id: text("/properties/sessionID"),
+                status: Some(OpenCodeStatusKind {
+                    kind: text("/properties/status/type"),
+                }),
+                part: Some(OpenCodeStatusPart {
+                    session_id: text("/properties/part/sessionID"),
+                    kind: text("/properties/part/type"),
+                }),
+            },
+        }
+    }
+
+    fn status(&self, root_session_id: &str) -> Option<TerminalAgentReport> {
+        let properties = &self.properties;
+        let part = properties.part.as_ref();
+        let session_id = properties
+            .session_id
+            .as_deref()
+            .or_else(|| part.and_then(|part| part.session_id.as_deref()))?;
+        if session_id != root_session_id {
+            return None;
+        }
+        let set = |state, failed| Some(TerminalAgentReport::Set(state, failed));
+        match self.event_type.as_str() {
+            "session.status" => match properties
+                .status
+                .as_ref()
+                .and_then(|status| status.kind.as_deref())?
+            {
+                "busy" | "retry" => set(TerminalAgentState::Working, false),
+                "idle" => set(TerminalAgentState::Done, false),
+                _ => None,
+            },
+            "session.idle" => set(TerminalAgentState::Done, false),
+            "session.error" => set(TerminalAgentState::Done, true),
+            "permission.asked" | "permission.updated" => set(TerminalAgentState::Blocked, false),
+            "question.asked" => set(TerminalAgentState::Waiting, false),
+            "permission.replied" | "question.replied" | "question.rejected" => {
+                set(TerminalAgentState::Working, false)
+            }
+            "message.part.delta" => Some(TerminalAgentReport::Progress),
+            // A step's closing parts can trail its last status; they report no new work.
+            "message.part.updated" => match part.and_then(|part| part.kind.as_deref()) {
+                Some("step-finish" | "snapshot" | "patch") => None,
+                _ => Some(TerminalAgentReport::Progress),
+            },
+            _ => None,
+        }
+    }
+
+    fn publish(&self, generation: &TerminalObserverGenerationLease, root_session_id: &str) {
+        if let Some(report) = self.status(root_session_id) {
+            generation.report_agent_status(report);
         }
     }
 }
@@ -3449,6 +3684,10 @@ impl OpenCodeEventStream for SystemOpenCodeEventStream {
             }
         })
     }
+
+    fn next_dormant_data(&mut self) -> DormantEventData<'_> {
+        Box::pin(async move { self.next_data().await.map(Some) })
+    }
 }
 
 /// OpenCode 2's event stream as the OpenCode 1 events the activity tracker consumes. One V2 event
@@ -3488,6 +3727,10 @@ impl OpenCodeEventStream for OpenCodeV2EventStream {
                 );
             }
         })
+    }
+
+    fn next_dormant_data(&mut self) -> DormantEventData<'_> {
+        Box::pin(async move { self.next_data().await.map(Some) })
     }
 }
 
@@ -5420,10 +5663,11 @@ mod tests {
             &mut tracker,
             &selected_data,
             1,
+            |_| panic!("data selected before disable is never decoded"),
         );
 
         assert!(
-            matches!(outcome, OpenCodeLiveData::Stale),
+            matches!(outcome, OpenCodeLiveData::Undecoded),
             "data selected before disable must be rejected before decode or tracker mutation"
         );
     }

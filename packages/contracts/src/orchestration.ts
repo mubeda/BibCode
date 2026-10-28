@@ -645,6 +645,18 @@ export const OrchestrationThreadShell = Schema.Struct({
   conversationPreview: Schema.optional(Schema.NullOr(OrchestrationConversationPreview)),
   /** Present while a conversation compaction is unsettled; absent from older servers. */
   compaction: Schema.optional(OrchestrationThreadCompaction),
+  /**
+   * When the provider last showed progress on this thread (one of its events, or its session
+   * entering `starting` or `running`). The left panel ages a Working status from it. Absent
+   * before the first provider event and from older servers.
+   */
+  lastActivityAt: Schema.optional(IsoDateTime),
+  /**
+   * How old `lastActivityAt` was, on the server's clock, when the server built this shell. A
+   * client ages the status from its own receipt of that value, so server clock skew neither
+   * stretches nor shrinks it.
+   */
+  lastActivityAgeMs: Schema.optional(NonNegativeInt),
 });
 export type OrchestrationThreadShell = typeof OrchestrationThreadShell.Type;
 

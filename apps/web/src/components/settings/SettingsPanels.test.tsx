@@ -935,7 +935,7 @@ describe("AgentsSettingsPanel", () => {
       "Show live agent and background-task activity in the Chat panel. Disabling this stops Chat activity monitoring and collection.",
     );
     expect(markup).toContain(
-      "Show live agent and background-task activity in AI Terminals. Disabling this stops AI Terminal activity monitoring and collection.",
+      "Show live agent and background-task activity in AI Terminals. When off, agent status in the sidebar still updates.",
     );
   });
 
