@@ -139,14 +139,23 @@ async function ensureFixtureProjectOpen(): Promise<void> {
 async function send(text: string): Promise<void> {
   const editor = browser.$(editorSelector);
   await editor.click();
-  const length = await browser.execute((value: string) => {
-    const target = document.activeElement;
-    if (!(target instanceof HTMLElement) || target.dataset.testid !== "composer-editor") {
-      throw new Error("The composer editor did not receive focus.");
-    }
-    document.execCommand("insertText", false, value);
-    return target.textContent?.length ?? 0;
-  }, text);
+  const length = await browser.execute(
+    async (value: string, selector: string) => {
+      const target = document.activeElement;
+      if (!(target instanceof HTMLElement) || target.dataset.testid !== "composer-editor") {
+        throw new Error("The composer editor did not receive focus.");
+      }
+      document.execCommand("insertText", false, value);
+      // The editor commits the insertion on a later frame and may replace its node, so re-read it.
+      const current = () => document.querySelector<HTMLElement>(selector)?.textContent?.length ?? 0;
+      for (let frame = 0; frame < 120 && current() !== value.length; frame += 1) {
+        await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+      }
+      return current();
+    },
+    text,
+    editorSelector,
+  );
   if (length !== text.length) {
     throw new Error(`The composer holds ${length} characters, not ${text.length}.`);
   }
@@ -285,9 +294,10 @@ async function reconnect(label: string, changed: boolean): Promise<void> {
   recordStep({ step: "reconnect", label, changed });
 }
 
-describe("packaged thread memory across reconnects (manual)", () => {
+describe("packaged thread memory across reconnects (manual)", function () {
+  // Set on the suite: WebdriverIO's test wrapper ignores a timeout set inside the running test.
+  this.timeout(6 * 60 * 60_000);
   it("keeps a fixed number of copies of each message", async function () {
-    this.timeout(6 * 60 * 60_000);
     await setDesktopUiWindowSize(1_200, 900);
     await ensureFixtureProjectOpen();
     for (let index = 0; index < PROMPTS; index += 1) {
