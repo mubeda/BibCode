@@ -634,9 +634,14 @@ original command spawns unobserved, and the manager logs
 cannot attach late: its observer rewrites the command (pinned executable and a
 `--settings` overlay), which has to happen before the PTY spawns.
 
-Claude's 2.25 s is the probe runner's own 2 s timeout, which bounds its slowest
-step (the attestation's `codesign` is capped at 500 ms and runs beside it),
-plus 250 ms to pin the executable, write the overlay and bind the listener.
+Claude's preparation runs in order: behind a mise shim, `mise which` and then
+`mise env` (750 ms each at most); the pin; the `--version` and `--help` probe
+(the probe runner's own 2 s timeout) together with the SHA-256 of the pin; and,
+for a build not yet proven, `codesign --verify` (macOS only, at most 1.25 s) once
+that probe and hash have finished. The 2.25 s budget bounds them all: a launch
+that runs past it passes through unobserved, and the next launch tries again.
+Cached probes and proven builds take a fraction of it. A cold launch of a new
+build on macOS, or behind a shim on a slow disk, is the case that can reach it.
 Measured on a 12-core Mac with a 276 MB Claude binary, the stages (`clonefile`
 pin, `--version` and `--help`, SHA-256 of the binary, `codesign`) take about
 0.2 s together, and a median of 252 ms (maximum 356 ms) with the CPU
