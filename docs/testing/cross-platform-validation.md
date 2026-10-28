@@ -413,7 +413,7 @@ message once.
 Composer **History** (needs Claude Code 2.0.73 or later on the server host):
 
 - With no Claude Code session running, check whether `<Claude config
-dir>/sessions/` still exists and record the platform's answer; a missing
+  dir>/sessions/` still exists and record the platform's answer; a missing
   directory reads every session as "Can't tell whether it's open". Then run a
   BiBCode Claude panel and record whether its process writes an entry there
   and with which `entrypoint` (`sdk-rust` is expected and skipped).
@@ -3803,7 +3803,7 @@ agent turn edit two files so the thread has a turn with checkpoints.
 8. **Open with**, with the platform's diff apps installed (Beyond Compare and
    FileMerge on macOS, Meld and KDiff3 on Linux, WinMerge on Windows):
    - the menu lists them with the default marked, and `git config
-diff.guitool <tool>` moves the default to that tool;
+     diff.guitool <tool>` moves the default to that tool;
    - in Compare, open the selected file, the deleted file and the rename in
      each scope, and **All files in** for the turn; the app shows the right
      two versions. In Changes, the toolbar's menu opens every file;
