@@ -548,6 +548,19 @@ only that disposable worktree after a successful integration.
    flow. Install and smoke-test each ordinary installer on its target operating
    system after publication.
 
+### Rolling a server back
+
+A server that runs a release older than the one that wrote its data can meet
+authorization rows it does not understand. Before rolling a server back past
+#202 (the release that added the `diagnostics:read` scope), revoke its
+diagnostics clients on its **Share this host** tab (listed as
+`<name> (diagnostics)`), or wait until they expire 30 days after pairing, and
+cancel any unused diagnostics-only pairing offer. A server from before #202
+refuses to start while such a row exists, because it treats an unknown
+persisted scope as corrupt authorization data. Servers from #202 on skip such
+rows with a warning and refuse their credentials, so later rollbacks start but
+those clients must pair again once the newer release returns.
+
 ### Failed release runs
 
 For a one-off infrastructure failure, such as an artifact upload timeout after

@@ -119,9 +119,14 @@ is) and #194 (`server.downloadDiagnosticLogs`).
   unattended credential; it needs its own approval.)
 - `server.getConfig` stays outside the scope (it returns settings, projects and
   provider state). The CLI needs no other method (see Decision 4).
-- No migration: `auth_pairing_links.scopes` and `auth_sessions.scopes` are JSON
-  text, so an added scope string needs no schema change (unlike the 031 role
-  cutover, which changed meaning, not vocabulary).
+- No schema migration: `auth_pairing_links.scopes` and `auth_sessions.scopes`
+  are JSON text, so an added scope string needs no schema change (unlike the
+  031 role cutover, which changed meaning, not vocabulary). It is not
+  rollback-free, though: a server older than #202 fails to start on a persisted
+  row naming `diagnostics:read`, because hydration treats an unknown scope as
+  corrupt (review amendment 5). From #202 on, hydration skips such rows with a
+  warning; rolling back past #202 requires revoking (or outliving) diagnostics
+  clients first (`docs/operations/release.md`, "Rolling a server back").
 - Contracts: add `AuthDiagnosticsReadScope` to the `AuthEnvironmentScope` union
   and regenerate `packages/contracts/fixtures/auth-http/scopes.json`
   (`scripts/export-rust-auth-fixtures.ts`, `authRustParity.test.ts`,

@@ -540,11 +540,13 @@ impl AuthService {
         let pairings = snapshot
             .pairings
             .into_iter()
+            .filter(|row| known_scopes_or_warn(&row.scopes, "pairing link", &row.id))
             .map(pairing_record_from_persisted)
             .collect::<Result<Vec<_>, _>>()?;
         let sessions = snapshot
             .sessions
             .into_iter()
+            .filter(|row| known_scopes_or_warn(&row.scopes, "session", &row.session_id))
             .map(session_record_from_persisted)
             .collect::<Result<Vec<_>, _>>()?;
         let pairing_offers = snapshot
@@ -2361,11 +2363,13 @@ async fn reconcile_authority_snapshot(
     let pairings = snapshot
         .pairings
         .into_iter()
+        .filter(|row| !holds_unknown_scope(&row.scopes))
         .map(pairing_record_from_persisted)
         .collect::<Result<Vec<_>, _>>()?;
     let sessions = snapshot
         .sessions
         .into_iter()
+        .filter(|row| !holds_unknown_scope(&row.scopes))
         .map(session_record_from_persisted)
         .collect::<Result<Vec<_>, _>>()?;
     let offers = snapshot
@@ -2580,7 +2584,34 @@ fn session_record_from_persisted(row: PersistedAuthSession) -> Result<SessionRec
     })
 }
 
+/// Whether a persisted row names a scope this server does not know: a row a newer server
+/// wrote (for example a `diagnostics:read` session after a rollback past #202). Such a row is
+/// unusable here, so it is skipped rather than failing startup, and its credential is refused.
+fn holds_unknown_scope(value: &serde_json::Value) -> bool {
+    value.as_array().is_some_and(|scopes| {
+        scopes
+            .iter()
+            .any(|scope| scope.as_str().is_some_and(|scope| !is_scope(scope)))
+    })
+}
+
+fn known_scopes_or_warn(value: &serde_json::Value, kind: &'static str, id: &str) -> bool {
+    if !holds_unknown_scope(value) {
+        return true;
+    }
+    tracing::warn!(
+        kind,
+        id,
+        "skipping a persisted authorization row with a scope this server does not know \
+         (written by a newer BiBCode); it cannot authenticate until that version runs again"
+    );
+    false
+}
+
 fn decode_persisted_scopes(value: serde_json::Value) -> Result<Vec<String>, AuthError> {
+    if holds_unknown_scope(&value) {
+        return Err(AuthError::InvalidCredential);
+    }
     let scopes = serde_json::from_value::<Vec<String>>(value)
         .map_err(|error| AuthError::Internal(error.to_string()))?;
     if scopes.is_empty()
@@ -4715,6 +4746,110 @@ mod tests {
         ));
         assert!(decode_persisted_scopes(serde_json::json!([])).is_err());
         assert!(decode_persisted_scopes(serde_json::json!(["unknown:scope"])).is_err());
+    }
+
+    /// A server rolled back past a scope it does not know still starts: the newer rows are
+    /// skipped, and their credential is refused instead of failing startup.
+    #[tokio::test]
+    async fn rows_with_a_scope_this_server_does_not_know_are_skipped_at_startup() {
+        let database = crate::persistence::Database::open_in_memory()
+            .await
+            .expect("in-memory database opens");
+        database
+            .call(|connection| {
+                crate::persistence::run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("all migrations apply");
+        let repositories = Repositories::new(database.clone());
+        let secrets = tempfile::tempdir().expect("secret store directory");
+        let config = ServerConfig::new(".").with_bind("127.0.0.1", 3773);
+        let first = AuthService::new_with_persistence(
+            &config,
+            vec![7_u8; 32],
+            SecretStore::new(secrets.path())
+                .await
+                .expect("secret store"),
+            repositories.clone(),
+        )
+        .await
+        .expect("first start");
+        let mut sessions = Vec::new();
+        for label in ["kept", "from-a-newer-server"] {
+            let issued = first
+                .issue_pairing(owned_scopes(STANDARD_SCOPES), Some(label.to_owned()))
+                .await
+                .expect("pairing");
+            let session = first
+                .exchange_bootstrap(
+                    &issued.credential,
+                    None,
+                    ClientMetadata::default(),
+                    None,
+                    SessionTransport::Plain,
+                )
+                .await
+                .expect("session");
+            sessions.push(session.principal.session_id);
+        }
+        first
+            .issue_pairing(owned_scopes(STANDARD_SCOPES), Some("later-link".to_owned()))
+            .await
+            .expect("unused pairing");
+        drop(first);
+        let newer = sessions[1].clone();
+        database
+            .call(move |connection| {
+                connection.execute(
+                    "UPDATE auth_sessions SET scopes = '[\"a-later:scope\"]' WHERE session_id = ?1",
+                    [&newer],
+                )?;
+                connection.execute(
+                    "UPDATE auth_pairing_links SET scopes = '[\"a-later:scope\"]' \
+                     WHERE label = 'later-link'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("rows from a newer server");
+
+        let restarted = AuthService::new_with_persistence(
+            &config,
+            vec![7_u8; 32],
+            SecretStore::new(secrets.path())
+                .await
+                .expect("secret store"),
+            repositories,
+        )
+        .await
+        .expect("a newer server's rows do not stop startup");
+
+        let clients = restarted.list_clients(&sessions[0]).await;
+        assert!(
+            clients
+                .iter()
+                .any(|client| client.session_id == sessions[0])
+        );
+        assert!(
+            !clients
+                .iter()
+                .any(|client| client.session_id == sessions[1])
+        );
+        assert!(restarted.list_pairings().await.is_empty());
+        assert!(
+            restarted
+                .authorize_session(&sessions[0], super::super::model::SCOPE_ORCHESTRATION_READ)
+                .await
+                .is_ok()
+        );
+        assert!(matches!(
+            restarted
+                .authorize_session(&sessions[1], super::super::model::SCOPE_ORCHESTRATION_READ)
+                .await,
+            Err(AuthError::InvalidCredential)
+        ));
     }
 
     #[test]
