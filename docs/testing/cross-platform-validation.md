@@ -3476,14 +3476,16 @@ same-origin load raises no CSP event) and no `securitypolicyviolation` event.
 The fixture Codex provider then answers its diagram prompts in the timeline: a
 **Show source** swap on a diagram inside the first visible row above the top
 edge, and on one in a row wholly above the viewport, moves a reading-anchor
-paragraph by at most 1 px; a short reply's diagram drawing under its sent
+paragraph by at most 1 px; a diagram-only fitting reply drawing under its sent
 message leaves that message within 1 px of the sent-row offset, measured from
 the scroller's top. The test measures the complete final assistant row,
 including its copy and timestamp area, and requires the turn to fit above the
-Activity card and composer on every painted frame. The
-`mermaid-timeline-sent-row.json` trace records about 600 ms of painted frames.
-Selecting an earlier message with the minimap keyboard lands it at the
-minimap's offset past that diagram and keeps it there
+Activity card and composer. Once the sent row reaches its offset, the
+`mermaid-timeline-sent-row.json` trace requires it to stay there for 36 painted
+frames.
+The next short diagram reply gives the minimap a later turn. Selecting an
+earlier message with the minimap keyboard lands it at the minimap's offset
+past that diagram and keeps it there
 (`mermaid-timeline-minimap-landing.json`). A separate case reopens a chat at its
 end, then opens the Activity card above the composer. The first painted frame
 with the larger card must keep the reply's last line at its settled position
@@ -3494,10 +3496,14 @@ source at the diagram's drawn height meanwhile, and every painted frame of the
 reopened chat shows the reply's last line at its end, within 1 px of where it
 rests against the bottom region (which can grow once the reopened chat's
 Activity card arrives; the end moves up with it in the same frame). The scenario keeps a per-sample trace of the last line, on a timer and
-after each painted frame, as `mermaid-timeline-evicted-remount.json`. A second
-reply of 101 diagrams then evicts every earlier one; scrolling up remounts the
+after each painted frame, as `mermaid-timeline-evicted-remount.json`. Painted
+frames also record the scroller, end padding or footer, final row and composer geometry when
+an end gap needs diagnosis. The following cold-draw case uses the earlier rows
+and long replies. A second reply of 101 diagrams evicts earlier drawings;
+scrolling up remounts the
 rows reply, whose diagram shows its source and draws again above the message
-being read, which stays within 1 px on every painted frame
+being read. The case places that message 120 px below the visible top before it
+checks that it stays within 1 px on every painted frame
 (`mermaid-timeline-cold-draw.json`). The case first waits up to 15 s, at
 the end, for the rows reply's row to unmount; if it does not, the failure and
 `mermaid-timeline-unmount-wait.json` list the mounted rows, LegendList's
@@ -3538,11 +3544,12 @@ last line in view, resting within two lines of each other
 (`mermaid-timeline-streaming-follow.json` holds both replies' gaps, end and
 sent-row positions, and, for diagnosis only, the painted frames each delivery
 took to reveal its end). Then the reader takes the timeline over with the
-keyboard: after a short reply whose code block's **Copy code** button is
-mounted, a reply streams for about nine seconds. One page script waits for its
+keyboard: after a long reply establishes scrollable history and a short reply
+mounts its code block's **Copy code** button, a reply streams for about nine
+seconds. One page script waits for its
 sent row to start gliding, grows a paragraph far above the view so LegendList
 holds an adjustment for the glide, focuses that button (a focus, not a press),
-dispatches a PageUp keydown on it and, two frames later, makes the page step
+dispatches a PageUp keydown on it and immediately makes the page step
 that key's default action makes. The packaged WebDriver plugin sends keys as
 dispatched events, which scroll nothing, so the spec cannot use real key
 input. The key must land within 750 ms of the glide starting, and a line on
@@ -3552,7 +3559,9 @@ then read stays within 1 px on every painted frame for 3 s, through the
 glide's settling, LegendList's wait for rows to settle and at least five more
 deliveries; an End keydown and a scroll to the end resume following, and at
 least three later deliveries rest with the end revealed
-(`mermaid-timeline-keyboard-takeover.json`). Last, with a long reply at the
+(`mermaid-timeline-keyboard-takeover.json`). The key-stage trace is saved before
+its assertion as `mermaid-timeline-keyboard-key.json`, so a failed takeover
+retains its scroll and captured-row geometry. Last, with a long reply at the
 end, the reader wheels 40 px up, within LegendList's end threshold, and the
 bottom region (the composer overlay) grows by 120 px; then, back at the end,
 the reply's last row grows and the reader wheels 40 px up in the same frame,

@@ -15,6 +15,7 @@ function filler(label: string, count: number): string {
 
 /** Prompts the fixture Codex provider answers with diagram replies instead of its fixed text. */
 export const mermaidFixturePrompts = {
+  fitting: "reply with deterministic fitting mermaid",
   short: "reply with deterministic short mermaid",
   rows: "reply with deterministic mermaid rows",
   long: "reply with deterministic long text",
@@ -31,6 +32,7 @@ export const mermaidFixtureDiagram = "flowchart LR\n  write[Fixture write] --> d
 
 /** A diagram in a reply shorter than the timeline, so its sent row stays anchored at the top. */
 export const mermaidFixtureShortDiagram = "flowchart LR\n  kept[Kept at the top]";
+export const mermaidFixtureFittingDiagram = "flowchart LR\n  fits[Fits at the top]";
 
 /**
  * The fixture provider's replies. `short` fits below its sent row; `rows` holds a diagram
@@ -39,6 +41,7 @@ export const mermaidFixtureShortDiagram = "flowchart LR\n  kept[Kept at the top]
  * it mounts again; `manyAgain` holds 101 others, which evict every earlier diagram.
  */
 export const mermaidFixtureReplies: Readonly<Record<string, string>> = {
+  [mermaidFixturePrompts.fitting]: fence(mermaidFixtureFittingDiagram),
   [mermaidFixturePrompts.short]: [
     fence(mermaidFixtureShortDiagram),
     "After the short diagram.",
