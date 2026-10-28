@@ -7,7 +7,8 @@
     "access:read",
     "access:write",
     "relay:read",
-    "relay:write"
+    "relay:write",
+    "diagnostics:read"
   ],
   "standardClient": [
     "orchestration:read",

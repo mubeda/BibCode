@@ -60,8 +60,8 @@ use thiserror::Error;
 
 pub use auth::pairing_code as auth_pairing_code;
 pub use config::{
-    Cli, CliAction, ConfigError, PairingCommand, ServerConfig, ServerMode, ServiceCommand,
-    StorageCommand,
+    Cli, CliAction, ConfigError, PairingAccess, PairingCommand, ServerConfig, ServerMode,
+    ServiceCommand, StorageCommand,
 };
 pub use data_root::{
     DataRootError, DataRootRequest, DataRootSource, ResolvedDataRoot, resolve_data_root,
@@ -361,9 +361,21 @@ async fn run_pairing_command(command: PairingCommand) -> Result<(), RunError> {
             reach,
             name,
             label,
+            access,
             json,
         } => {
             let name = name.unwrap_or_else(default_pairing_offer_name);
+            // The authorized-clients row says what a diagnostics credential is.
+            let label = match access {
+                PairingAccess::Full => label,
+                PairingAccess::Diagnostics => {
+                    label.or_else(|| Some(format!("{} (diagnostics)", name.trim())))
+                }
+            };
+            let scopes = match access {
+                PairingAccess::Full => auth::default_standard_scopes(),
+                PairingAccess::Diagnostics => auth::diagnostics_scopes(),
+            };
             let input =
                 auth::validate_pairing_offer_input(&name, &endpoint, &reach, label.as_deref())
                     .map_err(|error| RunError::PairingIssue(error.to_string()))?;
@@ -379,6 +391,7 @@ async fn run_pairing_command(command: PairingCommand) -> Result<(), RunError> {
                 &secret_store,
                 storage_instance_id,
                 input,
+                scopes,
             )
             .await
             .map_err(|error| RunError::PairingIssue(error.to_string()));
