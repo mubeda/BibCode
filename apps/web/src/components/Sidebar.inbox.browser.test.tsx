@@ -155,9 +155,24 @@ function pressedTiles(): string[] {
 }
 
 /** The agent card buttons, by the thread title their accessible name starts with. */
+/** A card's accessible name or description: the text of the elements its ids reference. */
+function referencedText(element: Element, attribute: "aria-labelledby" | "aria-describedby") {
+  return (element.getAttribute(attribute) ?? "")
+    .split(" ")
+    .filter((id) => id !== "")
+    .map((id) => element.ownerDocument.getElementById(id)?.textContent ?? "")
+    .join(", ");
+}
+
+function agentCards(): HTMLButtonElement[] {
+  const list = container!.querySelector('[data-testid="sidebar-inbox-view"] [role="list"]');
+  return Array.from(list?.querySelectorAll<HTMLButtonElement>("button[aria-labelledby]") ?? []);
+}
+
+/** The agent card whose name starts with the thread title (cards here have no branch). */
 function agentCard(title: string): HTMLButtonElement {
-  const element = Array.from(container!.querySelectorAll<HTMLButtonElement>("button")).find(
-    (button) => button.getAttribute("aria-label")?.startsWith(`${title}, `),
+  const element = agentCards().find(
+    (button) => referencedText(button, "aria-labelledby").split(", ")[0] === title,
   );
   if (element === undefined) throw new Error(`Missing agent card ${title}`);
   return element;
@@ -165,10 +180,7 @@ function agentCard(title: string): HTMLButtonElement {
 
 /** The titles of the cards in the Inbox's agent list, whatever their status. */
 function listedTitles(): string[] {
-  const list = container!.querySelector('[data-testid="sidebar-inbox-view"] [role="list"]');
-  return Array.from(list?.querySelectorAll<HTMLButtonElement>("button[aria-label]") ?? []).map(
-    (button) => button.getAttribute("aria-label")!.split(", ")[0]!,
-  );
+  return agentCards().map((button) => referencedText(button, "aria-labelledby").split(", ")[0]!);
 }
 
 function focusedSurfaceId(threadId: string, environmentId = ENV_MAIN): string | null {
@@ -308,11 +320,7 @@ describe("Sidebar Inbox view", () => {
     await renderSidebar();
     expect(pressedTiles()).toEqual(["done"]);
     expect(focusedSurfaceId("thread-done")).toBe(HOST_SURFACE_ID);
-    expect(
-      findProps((props) => String(props["aria-label"] ?? "").startsWith("Finished, "))?.[
-        "aria-pressed"
-      ],
-    ).toBe(true);
+    expect(agentCard("Finished").getAttribute("aria-current")).toBe("true");
   });
 
   it("opens a chat panel agent on its host thread with the panel focused", async () => {
@@ -340,11 +348,7 @@ describe("Sidebar Inbox view", () => {
     h.state.routeParams = { environmentId: ENV_MAIN, threadId: "thread-host" };
     h.state.captures.length = 0;
     await renderSidebar();
-    expect(
-      findProps((props) => String(props["aria-label"] ?? "").startsWith("Panel — Codex, "))?.[
-        "aria-pressed"
-      ],
-    ).toBe(true);
+    expect(agentCard("Panel — Codex").getAttribute("aria-current")).toBe("true");
   });
 
   it("opens a terminal-only worktree's AI terminal by its id on the host thread", async () => {
@@ -407,7 +411,7 @@ describe("Sidebar Inbox view", () => {
     expect(pressedTiles()).toEqual(["all"]);
     // Partial data with nothing needing attention leaves the default unsaved.
     expect(h.uiStore.getState().inboxCategory).toBeNull();
-    expect(agentCard("Remote approval").getAttribute("aria-label")).toContain(", Offline,");
+    expect(referencedText(agentCard("Remote approval"), "aria-describedby")).toMatch(/^Offline, /u);
   });
 
   it("treats a reconnecting remote as partial and settles the default once it reports", async () => {
