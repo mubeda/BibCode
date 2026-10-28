@@ -15492,14 +15492,25 @@ async fn a_hookless_restart_while_chat_activity_is_off_shows_no_live_subagents_o
     assert_a_hookless_restart_stops_reporting_live_subagents(true).await;
 }
 
+/// A Claude chat behind a mise shim whose subagent `agent-shim` is running, reported through the
+/// real hook sink.
 #[cfg(unix)]
-async fn assert_a_hookless_restart_stops_reporting_live_subagents(
-    activity_off_during_restart: bool,
-) {
+struct LiveClaudeSubagent {
+    state: TempDir,
+    shim: MultiCallShim,
+    handle: bibcode_server::ServerHandle,
+    socket: WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    snapshot_request: Value,
+}
+
+#[cfg(unix)]
+async fn start_live_claude_subagent(
+    configure: impl FnOnce(ServerConfig) -> ServerConfig,
+) -> LiveClaudeSubagent {
     let state = TempDir::new().expect("state");
     let shim = MultiCallShim::new(&state, "2026.10.19 linux-x64 (2026-10-19)");
     let workspace = shim.project(&state, "workspace", true);
-    let config = test_config(&state);
+    let config = configure(test_config(&state));
     hermetic_providers::write_hermetic_settings(
         &config.state_dir(),
         json!({
@@ -15608,6 +15619,26 @@ async fn assert_a_hookless_restart_stops_reporting_live_subagents(
     .await;
     assert_eq!(live["capabilities"]["actors"], true, "{live}");
     assert_eq!(live["sections"]["subagents"]["state"], "live", "{live}");
+    LiveClaudeSubagent {
+        state,
+        shim,
+        handle,
+        socket,
+        snapshot_request,
+    }
+}
+
+#[cfg(unix)]
+async fn assert_a_hookless_restart_stops_reporting_live_subagents(
+    activity_off_during_restart: bool,
+) {
+    let LiveClaudeSubagent {
+        state: _state,
+        shim,
+        handle,
+        mut socket,
+        snapshot_request,
+    } = start_live_claude_subagent(|config| config).await;
 
     if activity_off_during_restart {
         set_chat_activity(&mut socket, "9551", false).await;
@@ -15688,6 +15719,46 @@ async fn assert_a_hookless_restart_stops_reporting_live_subagents(
     socket.close(None).await.expect("close WebSocket");
     handle.shutdown();
     handle.join().await.expect("RPC server joins");
+}
+
+/// An update's protection quiesces the runtime, which ends every live provider session (#206):
+/// a Claude subagent running at that moment is persisted `interrupted`, not left running.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn update_protection_closes_a_live_claude_subagent() {
+    let live = start_live_claude_subagent(|config| {
+        config
+            .with_desktop("quiesce-bootstrap")
+            .expect("desktop config")
+    })
+    .await;
+    let database_path = ServerConfig::new(live.state.path()).database_path();
+    let maintenance = live
+        .handle
+        .update_maintenance()
+        .expect("a desktop runtime owns update maintenance");
+    let prepared = timeout(Duration::from_secs(45), maintenance.prepare())
+        .await
+        .expect("prepare stays within its bound")
+        .expect("prepare succeeds");
+    let status: String = rusqlite::Connection::open(&database_path)
+        .expect("state database")
+        .query_row(
+            "SELECT status FROM activity_records WHERE record_id = 'claude:agent:agent-shim'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("subagent record");
+    assert_eq!(status, "interrupted");
+    maintenance
+        .cancel(uuid::Uuid::parse_str(&prepared.operation_id).expect("operation id"))
+        .await
+        .expect("cancel");
+    maintenance.shutdown_after_response();
+    timeout(Duration::from_secs(5), live.handle.wait_for_shutdown())
+        .await
+        .expect("cancel exits");
+    live.handle.join().await.expect("runtime joins");
 }
 
 /// Turns Chat Activity on or off as the Settings switch does.
