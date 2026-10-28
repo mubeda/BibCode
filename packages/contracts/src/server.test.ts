@@ -393,21 +393,27 @@ describe("diagnostic logs relay (#201)", () => {
     expect(
       decodeRelayEvent({
         _tag: "Pending",
-        request: { requestId: "relay_1", environment: "Omarchy", includeCrashDumps: false },
+        request: {
+          requestId: "relay_1",
+          environment: "Omarchy",
+          includeCrashDumps: false,
+          code: "K7Q-4M",
+          outputDirectory: "/Users/me/logs",
+        },
       }),
-    ).toMatchObject({ _tag: "Pending", request: { environment: "Omarchy" } });
+    ).toMatchObject({ _tag: "Pending", request: { environment: "Omarchy", code: "K7Q-4M" } });
+    expect(decodeRelayEvent({ _tag: "Claimed", requestId: "relay_1" })._tag).toBe("Claimed");
     expect(decodeRelayEvent({ _tag: "Closed", requestId: "relay_1" })._tag).toBe("Closed");
   });
 
-  it("lists reachable environments with a failure, and refuses unknown reasons", () => {
+  it("names a failure by its reason, and refuses unknown reasons", () => {
     expect(
       decodeItem({
         _tag: "Failed",
         reason: "unknown-environment",
         message: "BiBCode has no environment named Mars.",
-        environments: [{ environmentId: "remote:1", label: "Omarchy", connected: true }],
       }),
-    ).toMatchObject({ _tag: "Failed", environments: [{ label: "Omarchy" }] });
+    ).toMatchObject({ _tag: "Failed", reason: "unknown-environment" });
     expect(() => decodeItem({ _tag: "Failed", reason: "made-up", message: "x" })).toThrow();
     expect(decodeItem({ _tag: "Finished" })._tag).toBe("Finished");
   });

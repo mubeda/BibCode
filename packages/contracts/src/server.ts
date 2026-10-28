@@ -585,22 +585,28 @@ export class DiagnosticLogsError extends Schema.TaggedError<DiagnosticLogsError>
 
 /**
  * A `bibcode diagnostics download` on this host waiting for the desktop app (#201): the
- * environment it names (an id or a label, resolved by the app), and whether it asked for
- * crash dumps. `requestId` is new for every request, so an item for an older one is stale.
+ * environment it names as typed (an id or a label, resolved by the app), whether it asked
+ * for crash dumps, the code the command printed (so the user can tell their own command
+ * from another program's), and the directory it will save in. `requestId` is new for every
+ * request, so an item for an older one is stale.
  */
 export const DiagnosticLogsRelayRequest = Schema.Struct({
   requestId: TrimmedNonEmptyString,
   environment: TrimmedNonEmptyString,
   includeCrashDumps: Schema.Boolean,
+  code: TrimmedNonEmptyString,
+  outputDirectory: TrimmedNonEmptyString,
 });
 export type DiagnosticLogsRelayRequest = typeof DiagnosticLogsRelayRequest.Type;
 
 /**
- * `server.subscribeDiagnosticLogsRelay`: a request to approve, then `Closed` once it is over
- * (answered elsewhere, expired, or the command left), so a prompt for it goes away.
+ * `server.subscribeDiagnosticLogsRelay`: a request to approve; `Claimed` once a window took
+ * it, so the others drop their prompt; then `Closed` once it is over (answered, expired, or
+ * the command left), which also stops the claiming window's download.
  */
 export const DiagnosticLogsRelayEvent = Schema.Union([
   Schema.TaggedStruct("Pending", { request: DiagnosticLogsRelayRequest }),
+  Schema.TaggedStruct("Claimed", { requestId: TrimmedNonEmptyString }),
   Schema.TaggedStruct("Closed", { requestId: TrimmedNonEmptyString }),
 ]);
 export type DiagnosticLogsRelayEvent = typeof DiagnosticLogsRelayEvent.Type;
@@ -629,14 +635,6 @@ export const DiagnosticLogsRelayFailureReason = Schema.Literals([
 ]);
 export type DiagnosticLogsRelayFailureReason = typeof DiagnosticLogsRelayFailureReason.Type;
 
-/** An environment the app can reach, listed when the requested one matched none or several. */
-export const DiagnosticLogsRelayEnvironment = Schema.Struct({
-  environmentId: TrimmedNonEmptyString,
-  label: Schema.String,
-  connected: Schema.Boolean,
-});
-export type DiagnosticLogsRelayEnvironment = typeof DiagnosticLogsRelayEnvironment.Type;
-
 /**
  * What the claiming app sends for a request, in order: `Denied` or `Failed` alone, or
  * `Started`, `Data` items (base64, at most {@link DIAGNOSTIC_LOGS_CHUNK_BYTES} each) whose
@@ -647,7 +645,6 @@ export const DiagnosticLogsRelayItem = Schema.Union([
   Schema.TaggedStruct("Failed", {
     reason: DiagnosticLogsRelayFailureReason,
     message: TrimmedNonEmptyString,
-    environments: Schema.optional(Schema.Array(DiagnosticLogsRelayEnvironment)),
   }),
   Schema.TaggedStruct("Started", {
     fileName: TrimmedNonEmptyString,
