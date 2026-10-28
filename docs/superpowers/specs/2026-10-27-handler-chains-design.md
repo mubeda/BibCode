@@ -1,7 +1,7 @@
 # Long-lived handlers in ChatView and ChatComposer (#204): design
 
-Status: approved; rounds 1 and 2 implemented. ChatComposer acceptance met; ChatView
-acceptance not met, round 3 below awaits approval. Plan:
+Status: approved and implemented in three rounds; ChatComposer and ChatView render
+scopes stay flat across changed reconnects (round 3 below). Plan:
 [`2026-10-27-handler-chains.md`](../plans/2026-10-27-handler-chains.md).
 
 ## Approved changes (supersede the sections below where they differ)
@@ -26,9 +26,16 @@ ChatView scopes (`--var handleOpenProviderTerminalPanel`) after each changed rec
 | before   | 17   |    | 29 |    | 41 |    |    |    | 65 |
 | round 1  | 16   | 21 | 26 | 31 | 36 | 41 | 46 | 51 | 56 |
 | round 2  | 16   | 21 | 26 | 31 | 36 | 41 | 46 | 51 | 56 |
+| round 3  | 13   | 14 | 15 | 15 | 15 | 15 | 15 | 15 | 15 |
 
 ChatComposer scopes (`--var submitComposer`): before 10 / 14 / 18 / 26 at
-base / 2 / 4 / 8; round 2 is 9 at base and at every one of the 8 reconnects.
+base / 2 / 4 / 8; rounds 2 and 3 are 9 at base and at every one of the 8 reconnects.
+
+Round 3's two scopes from base to changed-2 are not a chain: at changed-8 every
+retained ChatView scope is one short path from a single holder (a
+ComposerBannerStack memo cache holding the reconnect banner's actions, a menu's
+`onFocus` props, the overlay measurement effect's `updateHeight`), each replaced
+when its holder next renders, and none grows from changed-2 to changed-8.
 
 Round 1 removed the composer chain and the `refuseWhileEnvironmentUnavailable <->
 onCompactConversation` pair (6 to 5 per reconnect). Round 2 wrapped
@@ -44,7 +51,7 @@ The remaining chain is a hub, not pairs. Every top path at changed-8 alternates
 renders where most other callbacks do not, so any callback recreated at other
 times pairs with it. Wrapping partners one at a time cannot converge.
 
-## Round 3 proposal (not implemented)
+## Round 3 (approved and implemented)
 
 Stop the hub from recreating: `getActiveTimelineTurnMetrics`,
 `timelineRealContentOverflowsViewport` and `pageTimeline` all depend on
@@ -53,13 +60,16 @@ together. A latest handler is unsafe here: LegendList calls ChatView's
 `onAnchorReady` (via `useStableAnchorCallbacks`) and `onRowSizeChanged`, which
 reach these helpers through `settleSentTimelineRow`, `followTimelineLiveEnd` and
 `followGrownTurn`, from its own measurement callbacks, possibly in a child layout
-effect, where a latest handler would read the previous render. The proposal is a
-`composerOverlayHeightRef` written in the same layout-effect pass that commits the
-height, read by the three helpers instead of the captured state, giving them one
-identity. That is targeted dependency restructuring in the timeline-follow code
-owned by another batch agent (b5-timeline-follow), so it needs approval and a merge
-plan first. It must be proven with the existing timeline-follow tests plus the
-harness.
+effect, where a latest handler would read the previous render. The three helpers
+read `composerOverlayHeightRef`, written where the overlay is measured (its layout
+effect and ResizeObserver callback, beside `setComposerOverlayHeight`), so they
+keep one identity. The measurement runs before the render that commits the height,
+so a LegendList callback in that commit's child layout effects already reads the
+new height; a mirror written in ChatView's own layout effect would lag there, and
+one written during render would stop the React Compiler. The live-end follow
+effect, which used to re-run because the helpers' identity changed with the
+height, now lists the height itself. The timeline-follow agent's work had merged,
+so this change owns the helpers.
 
 ## Problem
 
