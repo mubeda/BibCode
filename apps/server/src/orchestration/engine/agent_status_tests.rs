@@ -61,13 +61,23 @@ async fn activity(engine: &OrchestrationEngine, thread_id: &str, kind: &str, pay
 }
 
 async fn session(engine: &OrchestrationEngine, thread_id: &str, status: &str, at: &str) {
+    session_as(engine, thread_id, status, at, "codex").await;
+}
+
+async fn session_as(
+    engine: &OrchestrationEngine,
+    thread_id: &str,
+    status: &str,
+    at: &str,
+    provider: &str,
+) {
     engine
         .dispatch(command(json!({
             "type":"thread.session.set",
             "commandId":format!("provider-session:{}", uuid::Uuid::new_v4()),
             "threadId":thread_id, "createdAt":at,
             "session":{
-                "threadId":thread_id, "status":status, "providerName":"codex",
+                "threadId":thread_id, "status":status, "providerName":provider,
                 "runtimeMode":"approval-required",
                 "activeTurnId": if status == "running" { json!("turn-1") } else { Value::Null },
                 "lastError":null, "updatedAt":at
@@ -496,4 +506,76 @@ async fn a_settled_session_settling_again_or_relaunching_expires_nothing() {
             .iter()
             .any(|kind| kind.ends_with(".expired"))
     );
+}
+
+#[tokio::test]
+async fn an_opencode_session_ending_keeps_its_asks_until_the_user_stops_it() {
+    // Mutation caught: expiring an OpenCode ask because its BiBCode session ended, while the
+    // OpenCode server that holds it can still take its answer after a resume (#187).
+    let (engine, thread_id) = engine().await;
+    session_as(&engine, &thread_id, "running", AT, "opencode").await;
+    ask_both(&engine, &thread_id).await;
+    for status in ["error", "interrupted", "idle", "stopped"] {
+        session_as(&engine, &thread_id, "running", AT, "opencode").await;
+        session_as(&engine, &thread_id, status, AT, "opencode").await;
+        assert_eq!(
+            open_requests(&engine, &thread_id).await,
+            (1, 1),
+            "an OpenCode session ending {status} keeps its asks"
+        );
+    }
+    engine
+        .dispatch(command(json!({
+            "type":"thread.session.stop", "commandId":"user-stop",
+            "threadId":thread_id, "createdAt":AT
+        })))
+        .await
+        .expect("stop");
+    assert_eq!(
+        open_requests(&engine, &thread_id).await,
+        (0, 0),
+        "the user stopping the session ends its asks"
+    );
+}
+
+#[tokio::test]
+async fn a_restart_keeps_opencode_asks_until_a_completed_read_drops_them() {
+    // Mutation caught: the startup pass, or a failed resume read, hiding an ask the OpenCode
+    // server that survived BiBCode's restart still holds (#187).
+    let (engine, thread_id) = engine().await;
+    session_as(&engine, &thread_id, "running", AT, "opencode").await;
+    ask_both(&engine, &thread_id).await;
+    // BiBCode restarts: reconciliation settles the abandoned session, then startup expiry runs.
+    session_as(&engine, &thread_id, "error", AT, "opencode").await;
+    assert_eq!(
+        engine.expire_requests_of_settled_sessions().await.unwrap(),
+        0
+    );
+    assert_eq!(open_requests(&engine, &thread_id).await, (1, 1));
+
+    // The resume's completed read still lists the question, not the approval.
+    let listed = std::collections::HashSet::from(["q1".to_owned()]);
+    assert_eq!(
+        engine
+            .expire_requests_unlisted_by_provider(&thread_id, &listed, "read-1")
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(open_requests(&engine, &thread_id).await, (0, 1));
+    assert!(
+        activity_kinds(&engine, &thread_id)
+            .await
+            .contains(&"approval.expired".to_owned())
+    );
+
+    // An ask OpenCode shows again reopens.
+    activity(
+        &engine,
+        &thread_id,
+        "approval.requested",
+        json!({"requestId":"a1","requestKind":"command","recovered":true}),
+    )
+    .await;
+    assert_eq!(open_requests(&engine, &thread_id).await, (1, 1));
 }
