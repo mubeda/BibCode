@@ -49,6 +49,15 @@ interface EndSample {
   readonly shown: boolean;
 }
 
+interface ActivityGrowthFrame {
+  readonly at: number;
+  readonly overlayHeight: number;
+  readonly belowUsable: number;
+  readonly endGap: number;
+  readonly expanded: boolean;
+  readonly visible: boolean;
+}
+
 interface StreamSample {
   readonly at: number;
   /** The streamed reply's first text is shown. */
@@ -413,9 +422,19 @@ interface SentRowFrame {
 }
 
 /** Samples the newest row sent as `prompt` and its turn's end on `frames` painted frames. */
-async function sampleSentRow(prompt: string, frames: number): Promise<SentRowFrame[]> {
+async function sampleSentRow(
+  prompt: string,
+  endText: string,
+  frames: number,
+): Promise<SentRowFrame[]> {
   return browser.executeAsync(
-    (surface: string, sent: string, count: number, done: (frames: SentRowFrame[]) => void) => {
+    (
+      surface: string,
+      sent: string,
+      lastLine: string,
+      count: number,
+      done: (frames: SentRowFrame[]) => void,
+    ) => {
       const started = performance.now();
       const samples: SentRowFrame[] = [];
       const read = (): SentRowFrame | null => {
@@ -430,14 +449,13 @@ async function sampleSentRow(prompt: string, frames: number): Promise<SentRowFra
         const overlay = document.querySelector<HTMLElement>(
           `${surface} [data-chat-composer-overlay="true"]`,
         );
-        if (!scroller || !row || !overlay) return null;
+        const endRow = [...document.querySelectorAll<HTMLElement>(`${surface} .chat-markdown p`)]
+          .find((paragraph) => paragraph.textContent === lastLine)
+          ?.closest<HTMLElement>("[data-timeline-root]");
+        if (!scroller || !row || !overlay || !endRow) return null;
         const area = scroller.getBoundingClientRect();
         const rowTop = row.getBoundingClientRect().top;
-        const end = Math.max(
-          ...[
-            ...scroller.querySelectorAll<HTMLElement>(".chat-markdown p, .chat-markdown-codeblock"),
-          ].map((block) => block.getBoundingClientRect().bottom),
-        );
+        const end = endRow.getBoundingClientRect().bottom;
         const usableBottom = Math.min(area.bottom, overlay.getBoundingClientRect().top);
         return {
           at: Math.round(performance.now() - started),
@@ -459,6 +477,7 @@ async function sampleSentRow(prompt: string, frames: number): Promise<SentRowFra
     },
     visibleSurfaceSelector,
     prompt,
+    endText,
     frames,
   );
 }
@@ -734,24 +753,21 @@ describe("packaged Mermaid diagrams", () => {
       { timeoutMsg: "The short fixture reply's diagram never drew." },
     );
     expect(await userRowOffsets(mermaidFixturePrompts.short)).toHaveLength(1);
-    // Where the sent row and the turn's end rest, on each painted frame for about 600 ms. A turn
-    // that fits the view holds its sent row at the offset (#191). A turn the bottom region makes
-    // taller than the view, such as on a small CI screen with the Activity card above the
-    // composer, follows its end instead, which takes the row above its offset, so there the row
-    // must not rest below the offset and the end must show.
-    const sentRowFrames = await sampleSentRow(mermaidFixturePrompts.short, 36);
+    const sentRowFrames = await sampleSentRow(
+      mermaidFixturePrompts.short,
+      "After the short diagram.",
+      36,
+    );
     NodeFS.writeFileSync(
       NodePath.join(preparedArtifactDirectory, "mermaid-timeline-sent-row.json"),
       JSON.stringify(sentRowFrames, null, 2),
     );
-    const sentRow = sentRowFrames.at(-1)!;
-    // Labelled, so a failure says where the row rested, whether the turn fit, and how far off.
-    expect({
-      ...sentRow,
-      restsAtOffset: sentRow.turnFits
-        ? Math.abs(sentRow.top - SENT_ROW_ANCHOR_OFFSET) <= 1
-        : sentRow.top <= SENT_ROW_ANCHOR_OFFSET + 1 && sentRow.endBelow <= REVEALED_PX,
-    }).toEqual({ ...sentRow, restsAtOffset: true });
+    expect(sentRowFrames).toHaveLength(36);
+    expect(
+      sentRowFrames.filter(
+        (frame) => !frame.turnFits || Math.abs(frame.top - SENT_ROW_ANCHOR_OFFSET) > 1,
+      ),
+    ).toEqual([]);
     await saveEvidence("mermaid-timeline-sent-row");
 
     // Minimap navigation still lands where the minimap puts it, past the diagrams above.
@@ -820,6 +836,129 @@ describe("packaged Mermaid diagrams", () => {
       (window as unknown as { __bibcodeReadingLineStop?: () => void }).__bibcodeReadingLineStop?.(),
     );
     await saveEvidence("mermaid-timeline-minimap-landing");
+  });
+
+  it("keeps the reply end in place when Activity opens after chat reopen", async () => {
+    const lastLine = "Activity follow paragraph 60 keeps the reading position measurable.";
+    const dock = `${visibleSurfaceSelector} [data-chat-composer-overlay] [data-testid="activity-dock"] button`;
+    await setDesktopUiWindowSize(1_400, 900);
+    await openFixtureWorkspace();
+    await sendPrompt(mermaidFixturePrompts.activity);
+    await browser.$(`//p[normalize-space()="${lastLine}"]`).waitForExist();
+    await browser.$(dock).waitForDisplayed();
+    await browser.url(`${await browser.execute(() => window.location.origin)}/#/`);
+    await openFixtureWorkspace();
+    await browser.$(`//p[normalize-space()="${lastLine}"]`).waitForExist();
+    await browser.$(dock).waitForDisplayed();
+    if ((await browser.$(dock).getAttribute("aria-expanded")) === "true") {
+      await browser.$(dock).click();
+    }
+    await scrollTimelineToEnd(lastLine);
+
+    await browser.execute(
+      (surface: string, line: string) => {
+        const host = window as unknown as {
+          __bibcodeActivityGrowthFrames?: ActivityGrowthFrame[];
+          __bibcodeActivityGrowthStop?: () => void;
+        };
+        const frames: ActivityGrowthFrame[] = [];
+        const started = performance.now();
+        const afterPaint = new MessageChannel();
+        const read = (): ActivityGrowthFrame | null => {
+          const paragraph = [
+            ...document.querySelectorAll<HTMLElement>(`${surface} .chat-markdown p`),
+          ].find((entry) => entry.textContent === line);
+          const scroller = paragraph?.closest<HTMLElement>("[class*='overflow-anchor']");
+          const overlay = document.querySelector<HTMLElement>(
+            `${surface} [data-chat-composer-overlay]`,
+          );
+          const button = overlay?.querySelector<HTMLButtonElement>(
+            '[data-testid="activity-dock"] button',
+          );
+          if (!paragraph || !scroller || !overlay || !button) return null;
+          const area = scroller.getBoundingClientRect();
+          const paragraphBox = paragraph.getBoundingClientRect();
+          const usableBottom = Math.min(area.bottom, overlay.getBoundingClientRect().top);
+          return {
+            at: Math.round(performance.now() - started),
+            overlayHeight: Math.round(overlay.getBoundingClientRect().height),
+            belowUsable: Math.round(paragraphBox.bottom - usableBottom),
+            endGap: Math.round(scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop),
+            expanded: button.getAttribute("aria-expanded") === "true",
+            visible: paragraphBox.top >= area.top && paragraphBox.bottom <= usableBottom,
+          };
+        };
+        const before = read();
+        if (before) frames.push(before);
+        afterPaint.port1.addEventListener("message", () => {
+          const frame = read();
+          if (frame) frames.push(frame);
+        });
+        afterPaint.port1.start();
+        let stopped = false;
+        const sample = () => {
+          if (stopped) return;
+          afterPaint.port2.postMessage(null);
+          requestAnimationFrame(sample);
+        };
+        requestAnimationFrame(sample);
+        host.__bibcodeActivityGrowthFrames = frames;
+        host.__bibcodeActivityGrowthStop = () => {
+          stopped = true;
+          afterPaint.port1.close();
+          afterPaint.port2.close();
+        };
+      },
+      visibleSurfaceSelector,
+      lastLine,
+    );
+
+    let frames: ActivityGrowthFrame[] = [];
+    try {
+      await browser.$(dock).click();
+      await browser.waitUntil(
+        async () => {
+          frames = await browser.execute(
+            () =>
+              (window as unknown as { __bibcodeActivityGrowthFrames?: ActivityGrowthFrame[] })
+                .__bibcodeActivityGrowthFrames ?? [],
+          );
+          const expanded = frames.filter((frame) => frame.expanded);
+          return expanded.length >= 3 && expanded.at(-1)!.at - expanded[0]!.at >= 200;
+        },
+        { timeoutMsg: "The Activity card did not paint open for 200 ms." },
+      );
+      await saveEvidence("mermaid-timeline-activity-growth");
+    } finally {
+      await browser.execute(() =>
+        (
+          window as unknown as { __bibcodeActivityGrowthStop?: () => void }
+        ).__bibcodeActivityGrowthStop?.(),
+      );
+      if ((await browser.$(dock).getAttribute("aria-expanded")) === "true") {
+        await browser.$(dock).click();
+      }
+    }
+    NodeFS.writeFileSync(
+      NodePath.join(preparedArtifactDirectory, "mermaid-timeline-activity-growth.json"),
+      JSON.stringify(frames, null, 2),
+    );
+    const before = frames[0]!;
+    expect(before.visible).toBe(true);
+    expect(before.endGap).toBeLessThanOrEqual(1);
+    const grown = frames.filter(
+      (frame) => frame.expanded && frame.overlayHeight > before.overlayHeight,
+    );
+    expect(grown.length).toBeGreaterThan(1);
+    const final = grown.at(-1)!;
+    expect(final.endGap).toBeLessThanOrEqual(1);
+    expect(final.belowUsable).toBeLessThanOrEqual(0);
+    expect(
+      grown.filter(
+        (frame) =>
+          !frame.visible || frame.endGap > 1 || Math.abs(frame.belowUsable - final.belowUsable) > 1,
+      ),
+    ).toEqual([]);
   });
 
   // Each of the two batches of 101 draws may wait 240 s in an occluded webview, the remount up

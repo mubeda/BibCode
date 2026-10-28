@@ -3478,14 +3478,17 @@ The fixture Codex provider then answers its diagram prompts in the timeline: a
 edge, and on one in a row wholly above the viewport, moves a reading-anchor
 paragraph by at most 1 px; a short reply's diagram drawing under its sent
 message leaves that message within 1 px of the sent-row offset, measured from
-the scroller's top, when the turn fits above the bottom region (on a small
-screen with the Activity card above the composer it may not; the turn then
-follows its end, so the message must rest no lower than the offset and the
-end must show; `mermaid-timeline-sent-row.json` records about 600 ms of
-painted frames of both); and selecting an earlier
-message with the minimap keyboard lands it at the minimap's offset past that
-diagram and keeps it there (`mermaid-timeline-minimap-landing.json`). After a
-reply with 101 diagrams, reopening the chat draws the evicted diagram (the
+the scroller's top. The test measures the complete final assistant row,
+including its copy and timestamp area, and requires the turn to fit above the
+Activity card and composer on every painted frame. The
+`mermaid-timeline-sent-row.json` trace records about 600 ms of painted frames.
+Selecting an earlier message with the minimap keyboard lands it at the
+minimap's offset past that diagram and keeps it there
+(`mermaid-timeline-minimap-landing.json`). A separate case reopens a chat at its
+end, then opens the Activity card above the composer. The first painted frame
+with the larger card must keep the reply's last line at its settled position
+and the list at its end (`mermaid-timeline-activity-growth.json`). After a reply
+with 101 diagrams, reopening the chat draws the evicted diagram (the
 reply's last, which the queue drew first) again through the queue, holding its
 source at the diagram's drawn height meanwhile, and every painted frame of the
 reopened chat shows the reply's last line at its end, within 1 px of where it
