@@ -197,6 +197,11 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         // confirm_pairing_policy_is_pending_capability_or_access_write and
         // the e2ee scope-bypass suite.
         "auth.confirmPairing" => Some(SCOPE_ACCESS_WRITE),
+        // The desktop app relaying `bibcode diagnostics download` (#201). The scope is only
+        // the floor: each handler also requires the desktop app's own session.
+        "server.subscribeDiagnosticLogsRelay"
+        | "server.claimDiagnosticLogsRelay"
+        | "server.sendDiagnosticLogsRelayItem" => Some(SCOPE_ACCESS_WRITE),
         _ => None,
     }
 }

@@ -1311,6 +1311,7 @@ fn expected_routes() -> Vec<(&'static str, &'static str)> {
         ("GET", "/ws"),
         ("GET", "/ws-e2ee"),
         ("POST", "/api/diagnostics/logs.zip"),
+        ("POST", "/api/diagnostics/relay"),
         ("GET", "/api/assets/*"),
         ("POST", "/api/preview/open-url"),
         ("GET", "/api/transfers/*"),
