@@ -10902,7 +10902,9 @@ async fn live_claude_terminal_through_a_real_mise_shim_is_hooked_within_its_budg
     let project = variable("BIBCODE_CLAUDE_MISE_PROJECT");
     let env_key =
         std::env::var("BIBCODE_CLAUDE_MISE_ENV_KEY").expect("set BIBCODE_CLAUDE_MISE_ENV_KEY");
-    // A pass-through names its reason (`shim_unresolved`, `build_unattested`) at debug level.
+    // A pass-through logs its fixed reason: expected outcomes (`shim_unresolved`,
+    // `build_unattested`) at debug level, failures (`budget_exceeded`, `pin_failed`, ...) as a
+    // warning with their count.
     let _ = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::DEBUG)
         .with_test_writer()

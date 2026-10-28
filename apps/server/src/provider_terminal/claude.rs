@@ -681,10 +681,13 @@ impl ClaudeTerminalObserverFactory {
         }
         #[cfg(unix)]
         {
-            tokio::time::timeout(CLAUDE_PREPARATION_BUDGET, self.prepare_unix(input))
-                .await
-                .ok()
-                .flatten()
+            match tokio::time::timeout(CLAUDE_PREPARATION_BUDGET, self.prepare_unix(input)).await {
+                Ok(prepared) => prepared,
+                Err(_) => {
+                    warn_pass_through("budget_exceeded");
+                    None
+                }
+            }
         }
     }
 
@@ -715,11 +718,11 @@ impl ClaudeTerminalObserverFactory {
             return None;
         };
         let Some(executable) = validated_install_candidate(&resolution.executable) else {
-            note_pass_through("shim_install_refused");
+            warn_pass_through("shim_install_refused");
             return None;
         };
         let Some(env) = validated_shim_environment(resolution.env) else {
-            note_pass_through("shim_env_rejected");
+            warn_pass_through("shim_env_rejected");
             return None;
         };
         Some((executable, env))
@@ -731,22 +734,25 @@ impl ClaudeTerminalObserverFactory {
         input: ProviderTerminalObserverFactoryInput,
     ) -> Option<PreparedTerminalLaunch> {
         if unsafe_interactive_settings_args(&input.launch.args) {
+            note_pass_through("unsafe_settings_args");
             return None;
         }
         let (source, env_overlay) = self.launch_source(&input).await?;
         let Some(source_fingerprint) = ClaudeExecutableFingerprint::read(&source)
             .filter(|fingerprint| fingerprint.length <= CLAUDE_PIN_SIZE_LIMIT)
         else {
-            note_pass_through("build_unreadable");
+            warn_pass_through("build_unreadable");
             return None;
         };
         let correlation = input.launch.generation.id().simple().to_string();
         let generation_key = input.launch.generation.id().simple().to_string();
-        let generation_dir = create_owned_generation_directory(
+        let Ok(generation_dir) = create_owned_generation_directory(
             &input.runtime_dir,
             &format!("h{}", &generation_key[..16]),
-        )
-        .ok()?;
+        ) else {
+            warn_pass_through("generation_dir_failed");
+            return None;
+        };
         let pinned_executable = generation_dir.join("claude");
         let overlay_path = generation_dir.join("settings.json");
         let preparation_resources = ClaudePreparationResources {
@@ -764,16 +770,19 @@ impl ClaudeTerminalObserverFactory {
         let pinner = self.pinner.clone();
         let pin_source = source.clone();
         let pin_destination = pinned_executable.clone();
-        let (mut preparation_resources, pinned) = tokio::task::spawn_blocking(move || {
+        let Ok((mut preparation_resources, pinned)) = tokio::task::spawn_blocking(move || {
             let pinned = pinner
                 .pin_cancellable(&pin_source, &pin_destination, &cancelled)
                 .and_then(|()| restrict_pinned_executable(&pin_destination));
             (preparation_resources, pinned)
         })
         .await
-        .ok()?;
+        else {
+            warn_pass_through("pin_join_failed");
+            return None;
+        };
         if pinned.is_err() {
-            note_pass_through("pin_failed");
+            warn_pass_through("pin_failed");
             return None;
         }
         let capabilities = self
@@ -793,27 +802,24 @@ impl ClaudeTerminalObserverFactory {
             note_pass_through("build_unattested");
             return None;
         }
-        let listener = match StdTcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)) {
-            Ok(listener) => listener,
-            Err(_) => return None,
+        let Some((listener, address)) = bind_loopback_hook_listener() else {
+            warn_pass_through("listener_failed");
+            return None;
         };
-        if listener.set_nonblocking(true).is_err() {
+        let Some(token) = random_secret() else {
+            warn_pass_through("secret_failed");
             return None;
-        }
-        let address = listener.local_addr().ok()?;
-        if !address.ip().is_loopback() {
-            return None;
-        }
-        let token = match random_secret() {
-            Some(token) => token,
-            None => return None,
         };
         let endpoint = format!("http://{address}/claude-hook");
         let overlay = claude_hook_settings(&endpoint, &token, &correlation);
         if write_private_overlay(&overlay_path, &overlay).is_err() {
+            warn_pass_through("overlay_write_failed");
             return None;
         }
-        let listener_lease = self.listener_counts.acquire()?;
+        let Some(listener_lease) = self.listener_counts.acquire() else {
+            warn_pass_through("listener_limit");
+            return None;
+        };
         preparation_resources.armed = false;
         let resources = Arc::new(ClaudeObserverResources {
             listener: Mutex::new(Some((listener, listener_lease))),
@@ -863,8 +869,18 @@ impl Drop for CancelOnDrop {
     }
 }
 
-/// Logs why a Claude Terminal runs unobserved, once per reason. The reason is a fixed word:
-/// never a path or an environment value.
+/// The loopback listener BiBCode's hooks post to, nonblocking, and its address.
+#[cfg(unix)]
+fn bind_loopback_hook_listener() -> Option<(StdTcpListener, std::net::SocketAddr)> {
+    let listener = StdTcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).ok()?;
+    listener.set_nonblocking(true).ok()?;
+    let address = listener.local_addr().ok()?;
+    address.ip().is_loopback().then_some((listener, address))
+}
+
+/// Logs, once per reason at debug level, an expected reason a Claude Terminal runs unobserved:
+/// a build outside the proven range, a shim mise cannot resolve, or the user's own settings
+/// switches. The reason is a fixed word, never a path or an environment value.
 fn note_pass_through(reason: &'static str) {
     static NOTED: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
     let mut noted = NOTED
@@ -875,6 +891,57 @@ fn note_pass_through(reason: &'static str) {
     }
     noted.push(reason);
     tracing::debug!(status = reason, "Claude terminal runs without status hooks");
+}
+
+/// The longest a recurring failure goes unlogged: its next line carries the cumulative count.
+const PASS_THROUGH_WARNING_INTERVAL: Duration = Duration::from_secs(10 * 60);
+
+/// Each warned reason's cumulative count and when it was last logged.
+#[derive(Debug, Default)]
+struct PassThroughWarnings {
+    reasons: Vec<(&'static str, u64, std::time::Instant)>,
+}
+
+impl PassThroughWarnings {
+    /// Counts one occurrence of `reason` at `now`, and returns the cumulative count when this
+    /// occurrence should be logged: the first one, then at most one per
+    /// `PASS_THROUGH_WARNING_INTERVAL`.
+    fn record(&mut self, reason: &'static str, now: std::time::Instant) -> Option<u64> {
+        let Some(entry) = self
+            .reasons
+            .iter_mut()
+            .find(|(known, _, _)| *known == reason)
+        else {
+            self.reasons.push((reason, 1, now));
+            return Some(1);
+        };
+        entry.1 = entry.1.saturating_add(1);
+        if now.saturating_duration_since(entry.2) < PASS_THROUGH_WARNING_INTERVAL {
+            return None;
+        }
+        entry.2 = now;
+        Some(entry.1)
+    }
+}
+
+/// Warns that a Claude Terminal runs unobserved because something failed: the first time per
+/// reason, then at most once per ten minutes with the count so far. The reason is a fixed
+/// word, never a path or an environment value.
+fn warn_pass_through(reason: &'static str) {
+    static WARNINGS: Mutex<PassThroughWarnings> = Mutex::new(PassThroughWarnings {
+        reasons: Vec::new(),
+    });
+    let count = WARNINGS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .record(reason, std::time::Instant::now());
+    if let Some(count) = count {
+        tracing::warn!(
+            status = reason,
+            count,
+            "Claude terminal runs without status hooks"
+        );
+    }
 }
 
 /// A launch through a multi-call shim: the invoked path is a link whose canonical target is a
@@ -3529,6 +3596,29 @@ mod tests {
             !capabilities.is_some_and(|capabilities| capabilities.additive_hook_merge),
             "a path whose file identity changes during attestation must fail closed"
         );
+    }
+
+    #[test]
+    fn pass_through_warnings_log_the_first_then_one_per_interval_with_the_count() {
+        let mut warnings = PassThroughWarnings::default();
+        let start = std::time::Instant::now();
+        let later = |seconds| start + Duration::from_secs(seconds);
+
+        assert_eq!(warnings.record("pin_failed", start), Some(1));
+        assert_eq!(warnings.record("pin_failed", later(1)), None);
+        assert_eq!(
+            warnings.record("listener_failed", later(2)),
+            Some(1),
+            "each reason has its own count and interval"
+        );
+        assert_eq!(warnings.record("pin_failed", later(599)), None);
+        assert_eq!(
+            warnings.record("pin_failed", later(600)),
+            Some(4),
+            "the next line carries the cumulative count"
+        );
+        assert_eq!(warnings.record("pin_failed", later(601)), None);
+        assert_eq!(warnings.record("pin_failed", later(1_200)), Some(6));
     }
 
     #[test]

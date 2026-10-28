@@ -345,10 +345,20 @@ Live validation (cannot run on this Mac, which has no mise):
 
 New child processes (`mise which`, `mise env`, `codesign --verify`) run through
 `run_supervised`, as the existing probes do. No RPC methods, removal paths,
-binaries or shutdown services are added. A preparation that passes through logs
-one bounded reason (`shim_unresolved`, `shim_env_rejected`, `build_unattested`)
-with `tracing::debug!` in `claude.rs`, warned once per reason like the
-supervisor's `warn_once`. Paths and environment values are never logged.
+binaries or shutdown services are added. `terminal.open` is in
+`is_long_running`. Every preparation that passes through logs one fixed reason
+word in `claude.rs`. Paths and environment values are never logged.
+
+- Expected outcomes are logged with `tracing::debug!`, once per process:
+  `unsafe_settings_args` (the user passed their own settings switches),
+  `shim_unresolved` (mise gave no answer) and `build_unattested` (a build outside
+  the proven range, without the switches, or unsigned).
+- Failures are logged with `tracing::warn!`, with `status` and a cumulative
+  `count`: the first occurrence, then at most one line per reason every ten
+  minutes (`PassThroughWarnings`). The reasons are `budget_exceeded`,
+  `build_unreadable`, `generation_dir_failed`, `pin_join_failed`, `pin_failed`,
+  `listener_failed`, `secret_failed`, `overlay_write_failed`, `listener_limit`,
+  `shim_install_refused` and `shim_env_rejected`.
 
 ## Approved changes and evidence
 
