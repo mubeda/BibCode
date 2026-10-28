@@ -281,7 +281,7 @@ describe("ActivityRoster targeted cancellation controls", () => {
       <ActivityRoster
         {...props({
           snapshot: snapshot({
-            provider: "claudeAgent",
+            provider: "claudeAgent" as ActivitySnapshot["provider"],
             counts: {
               subagents: { active: 0, done: 2 },
               backgroundTasks: { active: 0, done: 0 },
