@@ -22,7 +22,7 @@ use super::model::{
     ActivityRosterPage, ActivityScopeRef, ActivityScopeSeed, ActivitySection,
     ActivitySectionHealthMap, ActivitySectionObservationState, ActivitySnapshot,
     ActivitySummaryCounts, ActivityWorkItemSummary, ProviderActivityMutation, compare_timestamps,
-    max_timestamp, validate_text, validate_timestamp,
+    interruption_summary, max_timestamp, validate_text, validate_timestamp,
 };
 use super::routing::AgentActivitySource;
 
@@ -218,7 +218,7 @@ impl ActivityRepository {
                     connection,
                     &scope_id,
                     &native_event_key,
-                    mutations,
+                    BatchMutations::Provided(mutations),
                     &updated_at,
                 ))
             })
@@ -243,11 +243,52 @@ impl ActivityRepository {
                         connection,
                         &scope_id,
                         &native_event_key,
-                        Vec::new(),
+                        BatchMutations::Provided(Vec::new()),
                         &updated_at,
                     )
                 }))
             })
+            .await?
+    }
+
+    /// Closes every unresolved record of one scope as `interrupted`, because the process that ran
+    /// it is gone (#206). One transaction reads the records and journals their deltas, so a
+    /// subscriber sees the change; a record already retained under a section the scope no longer
+    /// negotiates closes too. A scope with nothing unresolved changes nothing.
+    pub async fn interrupt_unresolved_scope_records(
+        &self,
+        scope_id: &str,
+        interruption: ActivityInterruption,
+    ) -> ActivityRepositoryResult<Vec<ActivityDelta>> {
+        let scope_id = validate_text(
+            scope_id.to_owned(),
+            "scope id",
+            ACTIVITY_ID_MAX_LENGTH,
+            true,
+        )?;
+        let native_event_key = format!("activity:process-ended:{}", Uuid::new_v4());
+        self.database
+            .call(move |connection| {
+                Ok(database_now(connection).and_then(|updated_at| {
+                    apply_batch(
+                        connection,
+                        &scope_id,
+                        &native_event_key,
+                        BatchMutations::InterruptUnresolved(interruption),
+                        &updated_at,
+                    )
+                }))
+            })
+            .await?
+    }
+
+    /// Current thread scopes holding unresolved records, with their provider: what a server start
+    /// must reconcile (#206).
+    pub async fn unresolved_thread_scopes(
+        &self,
+    ) -> ActivityRepositoryResult<Vec<UnresolvedThreadScope>> {
+        self.database
+            .call(move |connection| Ok(unresolved_thread_scopes(connection)))
             .await?
     }
 
@@ -760,14 +801,157 @@ fn append_interruption_entry(
     Ok(())
 }
 
+/// Why BiBCode closes the unresolved records of a scope: the start of the sentence each closed
+/// record's summary begins with, such as "Claude session ended before this".
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ActivityInterruption {
+    pub cause: &'static str,
+}
+
+impl ActivityInterruption {
+    fn reason(self, record_kind: ActivityRecordKind) -> String {
+        match record_kind {
+            ActivityRecordKind::Actor => format!("{} subagent reported", self.cause),
+            ActivityRecordKind::WorkItem => format!("{} task reported", self.cause),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnresolvedThreadScope {
+    pub scope_id: String,
+    pub thread_id: String,
+    pub provider: String,
+}
+
+enum BatchMutations {
+    Provided(Vec<ProviderActivityMutation>),
+    /// Built inside the batch's transaction from the scope's unresolved records.
+    InterruptUnresolved(ActivityInterruption),
+}
+
+fn unresolved_thread_scopes(
+    connection: &Connection,
+) -> ActivityRepositoryResult<Vec<UnresolvedThreadScope>> {
+    let mut statement = connection
+        .prepare(
+            "SELECT DISTINCT s.scope_id, s.thread_id, s.provider_name
+             FROM activity_scopes s
+             JOIN activity_records r ON r.scope_id = s.scope_id
+             WHERE s.source_kind = 'thread' AND s.is_current = 1
+               AND r.status IN ('starting', 'running', 'waiting', 'unknown')
+             ORDER BY s.scope_id",
+        )
+        .map_err(sql_error)?;
+    statement
+        .query_map([], |row| {
+            Ok(UnresolvedThreadScope {
+                scope_id: row.get(0)?,
+                thread_id: row.get(1)?,
+                provider: row.get(2)?,
+            })
+        })
+        .map_err(sql_error)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(sql_error)
+}
+
+/// Each unresolved record of the scope, closed: `updatedAt` and `terminalAt` are the closure
+/// time, which fences any older report still in flight, and the summary says why and when the
+/// record last reported. A Claude actor is not touched by its tool hooks, so its newest entry
+/// is its last report.
+fn interruption_mutations(
+    transaction: &Transaction<'_>,
+    scope_id: &str,
+    interruption: ActivityInterruption,
+    closed_at: &str,
+) -> ActivityRepositoryResult<Vec<ProviderActivityMutation>> {
+    let records = {
+        let mut statement = transaction
+            .prepare(
+                "SELECT r.record_kind, r.summary_json,
+                        (SELECT MAX(e.created_at) FROM activity_entries e
+                          WHERE e.scope_id = r.scope_id AND e.owner_kind = r.record_kind
+                            AND e.owner_id = r.record_id)
+                 FROM activity_records r
+                 WHERE r.scope_id = ?
+                   AND r.status IN ('starting', 'running', 'waiting', 'unknown')
+                 ORDER BY r.record_kind, r.record_id",
+            )
+            .map_err(sql_error)?;
+        statement
+            .query_map([scope_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .map_err(sql_error)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(sql_error)?
+    };
+    let last_report = |updated_at: &str, last_entry_at: Option<&str>| {
+        last_entry_at.map_or_else(
+            || Ok(updated_at.to_owned()),
+            |entry_at| max_timestamp(updated_at, entry_at),
+        )
+    };
+    let mut mutations = Vec::with_capacity(records.len());
+    for (record_kind, summary_json, last_entry_at) in records {
+        match record_kind.as_str() {
+            "actor" => {
+                let mut actor = decode_json::<ActivityActorSummary>(&summary_json)?;
+                actor.normalize_timestamps()?;
+                let reported_at = last_report(&actor.updated_at, last_entry_at.as_deref())?;
+                let closed_at = max_timestamp(&reported_at, closed_at)?;
+                actor.summary = Some(interruption_summary(
+                    &interruption.reason(ActivityRecordKind::Actor),
+                    &actor.started_at,
+                    &reported_at,
+                    actor.summary.as_deref(),
+                )?);
+                actor.status = ActivityLifecycle::Interrupted;
+                actor.updated_at.clone_from(&closed_at);
+                actor.terminal_at = Some(closed_at);
+                mutations.push(ProviderActivityMutation::UpsertActor(actor));
+            }
+            "workItem" => {
+                let mut work_item = decode_json::<ActivityWorkItemSummary>(&summary_json)?;
+                work_item.normalize_timestamps()?;
+                let reported_at = last_report(&work_item.updated_at, last_entry_at.as_deref())?;
+                let closed_at = max_timestamp(&reported_at, closed_at)?;
+                work_item.summary = Some(interruption_summary(
+                    &interruption.reason(ActivityRecordKind::WorkItem),
+                    &work_item.started_at,
+                    &reported_at,
+                    work_item.summary.as_deref(),
+                )?);
+                work_item.status = ActivityLifecycle::Interrupted;
+                work_item.updated_at.clone_from(&closed_at);
+                work_item.terminal_at = Some(closed_at);
+                mutations.push(ProviderActivityMutation::UpsertWorkItem(work_item));
+            }
+            _ => {
+                return Err(ActivityRepositoryError::InvalidScope(
+                    "persisted record kind is invalid".to_owned(),
+                ));
+            }
+        }
+    }
+    Ok(mutations)
+}
+
 fn apply_batch(
     connection: &mut Connection,
     scope_id: &str,
     native_event_key: &str,
-    mut mutations: Vec<ProviderActivityMutation>,
+    mut mutations: BatchMutations,
     updated_at: &str,
 ) -> ActivityRepositoryResult<Vec<ActivityDelta>> {
-    normalize_activity_mutation_text(&mut mutations);
+    if let BatchMutations::Provided(mutations) = &mut mutations {
+        normalize_activity_mutation_text(mutations);
+    }
     let transaction = connection.transaction().map_err(sql_error)?;
     let journal_head_key = journal_event_key(native_event_key, 0);
     let duplicate = transaction
@@ -797,6 +981,13 @@ fn apply_batch(
         return Ok(Vec::new());
     }
 
+    let (mutations, terminalize_retained) = match mutations {
+        BatchMutations::Provided(mutations) => (mutations, false),
+        BatchMutations::InterruptUnresolved(interruption) => (
+            interruption_mutations(&transaction, scope_id, interruption, updated_at)?,
+            true,
+        ),
+    };
     let mut scope = load_current_scope_by_id(&transaction, scope_id)?;
     let initial_scope = scope.clone();
     let initial_counts = calculate_counts(&transaction, scope_id)?;
@@ -824,12 +1015,15 @@ fn apply_batch(
                 }
             }
             ProviderActivityMutation::UpsertActor(mut actor) => {
-                if !scope.capabilities.actors {
+                let existing = load_actor(&transaction, scope_id, &actor.id)?;
+                // Closing a record the scope still retains needs no live section.
+                let closes_retained =
+                    terminalize_retained && existing.is_some() && actor.status.is_terminal();
+                if !scope.capabilities.actors && !closes_retained {
                     return Err(ActivityRepositoryError::InvalidCapabilities(
                         "actor mutation requires actors capability".to_owned(),
                     ));
                 }
-                let existing = load_actor(&transaction, scope_id, &actor.id)?;
                 if actor.name.is_empty() {
                     let mut current = existing.clone().ok_or_else(|| {
                         ActivityRepositoryError::InvalidReference(actor.id.clone())
@@ -873,7 +1067,10 @@ fn apply_batch(
                 }
             }
             ProviderActivityMutation::UpsertWorkItem(mut work_item) => {
-                if !scope.capabilities.background_work {
+                let existing = load_work_item(&transaction, scope_id, &work_item.id)?;
+                let closes_retained =
+                    terminalize_retained && existing.is_some() && work_item.status.is_terminal();
+                if !scope.capabilities.background_work && !closes_retained {
                     return Err(ActivityRepositoryError::InvalidCapabilities(
                         "work-item mutation requires backgroundWork capability".to_owned(),
                     ));
@@ -882,7 +1079,6 @@ fn apply_batch(
                 work_item.normalize_timestamps()?;
                 work_item.validate()?;
                 validate_work_item_owner(&transaction, scope_id, &work_item)?;
-                let existing = load_work_item(&transaction, scope_id, &work_item.id)?;
                 if should_ignore_late_terminal(
                     existing.as_ref(),
                     work_item.status,
