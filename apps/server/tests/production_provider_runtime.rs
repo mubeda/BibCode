@@ -15662,6 +15662,21 @@ async fn assert_a_hookless_restart_stops_reporting_live_subagents(
             stale["actors"][0]["id"], "claude:agent:agent-shim",
             "{stale}"
         );
+        // The restart ended the process that ran it (#206): it is closed, not left running
+        // under a section nothing reports any more.
+        assert_eq!(stale["actors"][0]["status"], "interrupted", "{stale}");
+        assert_eq!(
+            stale["actors"][0]["updatedAt"], stale["actors"][0]["terminalAt"],
+            "{stale}"
+        );
+        assert!(
+            stale["actors"][0]["summary"]
+                .as_str()
+                .is_some_and(|summary| summary
+                    .starts_with("Claude session ended before this subagent reported;")),
+            "{stale}"
+        );
+        assert_eq!(stale["counts"]["subagents"]["active"], 0, "{stale}");
     }
 
     socket.close(None).await.expect("close WebSocket");

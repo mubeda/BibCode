@@ -230,5 +230,25 @@
         "backgroundTasks": { "active": 0, "done": 1 }
       }
     }
+  },
+  {
+    "name": "chat-process-ended-interrupts-active",
+    "group": "process-end",
+    "revisionSemantics": {
+      "initialRevision": 0,
+      "finalRevision": "initialPlusEffectiveMutationBatches",
+      "effectiveMutationBatchesOnly": true,
+      "duplicateOrRejectedEventsAdvance": false,
+      "assertionStage": "repository-checkpoint-3"
+    },
+    "details": {
+      "openPhases": ["start", "running"],
+      "expectedInterruptedRecords": 1,
+      "actorStatus": "interrupted",
+      "counts": {
+        "subagents": { "active": 0, "done": 1 },
+        "backgroundTasks": { "active": 0, "done": 0 }
+      }
+    }
   }
 ]
