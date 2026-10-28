@@ -465,3 +465,79 @@ describe("ChatComposer provider selection rerenders", () => {
     expect(container.textContent).toContain("Plan mode is not supported");
   });
 });
+
+describe("ChatComposer long-lived handlers", () => {
+  it("keeps one menu select handler across renders and runs the latest render's", async () => {
+    const composerRef = React.createRef<ChatComposerHandle>();
+    const promptRef = { current: prompt };
+    const renderWith = (props: ChatComposerProps) =>
+      act(async () => {
+        root.render(<ChatComposer {...props} />);
+      });
+    const openMenu = () =>
+      act(async () => {
+        const onChange = h.editorProps?.["onChange"] as
+          | ((
+              value: string,
+              cursor: number,
+              expandedCursor: number,
+              cursorAdjacentToMention: boolean,
+              terminalContextIds: string[],
+            ) => void)
+          | undefined;
+        expect(onChange).toBeTypeOf("function");
+        onChange?.(prompt, supportedDraftCursor, expandedDraftCursor, false, []);
+      });
+    const statuses = [supportedProvider, unsupportedProvider];
+
+    await renderWith(makeProps(statuses, composerRef, promptRef, supportedProvider));
+    await openMenu();
+    const firstOnSelect = h.menuProps?.["onSelect"];
+    expect(firstOnSelect).toBeTypeOf("function");
+
+    // A new thread object and new callbacks: what a changed reconnect gives the composer.
+    await renderWith(makeProps(statuses, composerRef, promptRef, supportedProvider));
+    await openMenu();
+    expect(h.menuProps?.["onSelect"]).toBe(firstOnSelect);
+
+    h.snapshot = { ...h.snapshot, cursor: prompt.length };
+    await act(async () => {
+      (firstOnSelect as (item: { id: string }) => void)({
+        id: "provider-skill:codex:dollar:refactor",
+      });
+    });
+    expect(useComposerDraftStore.getState().getComposerDraft(threadRef)?.prompt).toBe(
+      "ask $refactor then $refactor ",
+    );
+  });
+
+  it("attaches files through the file input with the latest render's state", async () => {
+    const composerRef = React.createRef<ChatComposerHandle>();
+    const promptRef = { current: prompt };
+    const statuses = [supportedProvider, unsupportedProvider];
+    const first = makeProps(statuses, composerRef, promptRef, supportedProvider);
+    await act(async () => {
+      root.render(<ChatComposer {...first} />);
+    });
+    const latest = makeProps(statuses, composerRef, promptRef, supportedProvider);
+    await act(async () => {
+      root.render(<ChatComposer {...latest} />);
+    });
+
+    const input = container.querySelector<HTMLInputElement>('input[type="file"]');
+    expect(input).not.toBeNull();
+    Object.defineProperty(input, "files", {
+      configurable: true,
+      value: [new File([], "empty.txt", { type: "text/plain" })],
+    });
+    await act(async () => {
+      input!.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+
+    expect(first.setThreadError).not.toHaveBeenCalled();
+    expect(latest.setThreadError).toHaveBeenCalledWith(
+      threadId,
+      "'empty.txt' is empty and cannot be attached.",
+    );
+  });
+});
