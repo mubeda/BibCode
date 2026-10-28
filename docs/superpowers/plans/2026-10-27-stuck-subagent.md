@@ -1,273 +1,305 @@
-# Stuck chat subagent (#206): plan
+# Stuck chat subagent (#206): plan, revision 2
 
 Batch `stuck-subagent`, branch `claude/b3g-stuck-subagent` from
-`claude/issue-batch-after-v0.12.0` (`0ecd10a38c`). File:line references below
-are against that base.
+`claude/issue-batch-after-v0.12.0` (`0ecd10a38c`, which contains #187:
+`git merge-base --is-ancestor f905efbce1 HEAD` succeeds). File:line references
+are against that base. Revision 2 folds in Codex's ten findings and the lead's
+decisions. I verified each finding against source; none was wrong. The
+"Revision 2 changes" section maps each finding to the change.
 
-## Acceptance criterion
+## Acceptance criteria
 
-A chat subagent never reads **Running** once the provider process that owned it
-is gone. On every process-ending path the server moves the thread scope's open
-actors and work items to `interrupted`, with `terminalAt`, a short reason and a
-last-seen time. Clients receive the change as ordinary activity deltas. A
-one-time-per-start pass repairs records already stuck in existing databases. The
-row never shows a fake **Completed**, and **Stop unavailable** explains itself.
+1. Root cause of the user's stuck record: identified from the remote server's
+   DB and logs, and written up. **This gate waits on the user's report.** If the
+   report hasn't arrived by merge time, the criterion is reported unmet. The
+   plan ranks no trigger.
+2. A chat subagent never reads **Running** once a BiBCode-owned provider
+   process that ran it is gone. This covers stop, removal, idle suspension,
+   shutdown/update, relaunch, crash (no further delivery needed), and server
+   start. Its actors and work items become `interrupted` with
+   `updatedAt == terminalAt == closure time`. The reason and the genuine last
+   report go in `summary`. Clients receive the change as journaled deltas, and
+   a reconnect snapshot agrees with them.
+3. Records of an external OpenCode server stay untouched on detach and at
+   startup.
+4. Turn end closes only what the complete live set proves finished. A late
+   `SubagentStop` upgrades the record to `completed`.
+5. No fake **Completed** label. **Stop unavailable** explains itself.
+6. Unchanged: `SubagentStop` completion, task-notification cancellation,
+   targeted Stop, AI Terminal interruption, the monitoring-disabled path, and
+   #187's request-expiry rules.
 
 ## Root cause (from code)
 
-**Confirmed: nothing reconciles chat-scope records when the process ends.**
-Every path that ends a chat provider process leaves the persisted actor
-`running`:
+No chat-scope reconciliation exists. Every path that ends a chat provider
+process leaves the persisted actor `running`:
 
-| Path | Code | What it does to activity |
+| Path | Code | Effect on activity |
 | --- | --- | --- |
-| Idle suspension | `suspend_idle_session` → `detach_session` (`production/provider_runtime.rs:11905`, `:12307-12340`) | Reaps the activity tasks, then `compensate_cancelled_activity` (`:12408-12440`) republishes the scope **Live** with its capabilities. Records are untouched. |
-| Stop, removal, dead-session cleanup | `stop_session` (`:11798`), the lazy detach after a stream end (`:6523`) | Same `detach_session`. |
-| App update, server shutdown | `quiesce_for_update` (`production/runtime.rs:865`) → `ProviderRuntime::shutdown` → `shutdown_sessions` (`provider_runtime.rs:12368`) | Same `detach_session` for every session. |
-| Relaunch | inline teardown (`:9650-9700`) | `forget_live_activity` clears the in-memory ids only, then compensates Live. Does not go through `detach_session`. |
-| Crash (stream ends by itself) | event pump tail (`:10268-10300`) | Marks the scope **Stale**. Records stay `running` until the next turn start detaches the session. |
-| Server start | `production/runtime.rs:353-357` → `repository.rs:504-546` | Interrupts `source_kind = 'terminal'` only. Thread scopes are skipped. |
+| Idle suspension | `suspend_idle_session` → `detach_session` (`production/provider_runtime.rs:11905`, `:12307-12340`) | Reaps the activity tasks. `compensate_cancelled_activity` (`:12408-12440`) republishes the scope **Live**. Records are untouched. |
+| Stop, removal, dead-session cleanup | `stop_session` (`:11798`), lazy detach after a stream end (`:6523`, reached only by a later delivery) | Same `detach_session`. |
+| App update, shutdown | `quiesce_for_update` (`production/runtime.rs:865`) → `shutdown_sessions` (`provider_runtime.rs:12368`) | Same `detach_session`. |
+| Relaunch | inline teardown (`:9650-9700`) | `forget_live_activity` clears in-memory ids only, then compensates Live. |
+| Crash | event-pump tail (`:10268-10300`) and supervisor `SessionStreamEnded` (`:6429-6450`) | Scope marked **Stale**. Records stay `running`, and nothing closes them without another delivery. |
+| Server start | `production/runtime.rs:353-357` → `repository.rs:504-546` | Interrupts `source_kind = 'terminal'` only. |
 
-The Claude tracker can only complete an actor through `SubagentStop`
-(`provider/claude/activity.rs:495-535`), which it accepts only for an actor in
-its in-memory `actors` map (`:425-427`). A new process has a new tracker, so a
-stop for an older actor can never arrive. The AI Terminal observer, by
-contrast, interrupts its tracked actors when it ends
-(`provider_terminal/claude.rs:1472`, `:1716-1750`).
+The Claude tracker completes an actor only through `SubagentStop`
+(`provider/claude/activity.rs:495-535`), and only for an actor in its in-memory
+map (`:425-427`). A stop for an earlier process's actor can never arrive.
 
-**Inference to confirm with the remote data.** The user saw no stale banner.
-A crash leaves the scope `Stale` until the next turn. Suspension, shutdown and
-relaunch republish it `Live` at once. Four days of **Running** with no banner
-therefore point at a detach-family trigger: idle suspension (H2) or the app
-update/shutdown. An unhandled crash fits less well. The remote prompt below
-collects what tells them apart.
+Hypotheses re-verified:
 
-**Other hypotheses, re-verified.**
+- H3, dropped `SubagentStop`: `hook_sink.rs:152-156` answers 503 or 410 with no
+  log.
+- H4, notification before the mapping: already deferred through
+  `pending_terminal_by_task` (`provider/claude/runtime.rs:796-810`,
+  `:1015-1021`). Only an actor whose mapping never arrives stays open.
+- H5, hookless relaunch: the old process's actors can sit under a section that
+  is no longer negotiated. That section is stale (`repository.rs:2137-2170`), and
+  `apply_batch` refuses actor upserts there (`:827-831`).
+- Update blocking: no code link. Which trigger leaked the user's record (crash
+  then a later delivery, suspension, update, or relaunch) is decided only by the
+  remote report (criterion 1).
 
-- H3 (lost `SubagentStop`): `hook_sink.rs:152-156` still answers 503/410 with no
-  log. Any lost stop leaves the actor open until the process ends, which this
-  fix now closes.
-- H4 (`task_notification(stopped)` before the task→agent mapping): already
-  deferred. `remember_terminal_task` keeps it in `pending_terminal_by_task`
-  (`provider/claude/runtime.rs:796-810`), and `reconcile` applies it when the
-  mapping arrives (`:1015-1021`). Only an actor whose mapping never arrives,
-  such as a foreground subagent interrupted mid-call, stays open. Process-end
-  reconciliation closes it.
-- H5 (relaunch without a hook sink): covered by the relaunch call site below.
-  The actors of the old process are interrupted before the new process starts.
-- Update blocking: still no code link. `prepare` and `quiesce_for_update` read no
-  activity. The fix adds bounded DB work to `shutdown_sessions` under the same
-  30 s deadline (see Risks). The remote logs decide whether the update failed for
-  another reason.
+## Design
 
-## Changes per desired-behavior item
+### A. One journaled interruption path (repository + projection)
 
-### 1. Process end → `interrupted` (server, provider-agnostic)
+- Repository: `interrupt_scope_records(scope_id, native_event_key, closure)`
+  runs in **one** `database.call` transaction:
+  1. It reads the scope's records with status
+     `starting | running | waiting | unknown`. With none, it commits nothing and
+     returns no deltas: no `EmptyBatch`, no warning.
+  2. For each record, last report = the later of the record's `updatedAt` and
+     the newest `activity_entries.created_at` it owns. Claude never bumps an
+     actor on tool hooks.
+  3. It builds the interrupted summary. `status = interrupted`, and
+     `updatedAt = terminalAt = max(record.updatedAt, now)`. This keeps the
+     ordering fence: the repository fences on `updatedAt` (`:2367-2380`), and the
+     client requires `terminalAt <= updatedAt` (`activityReducer.ts:109-126`)
+     while the server requires `updatedAt <= terminalAt` (`model.rs:1400-1416`).
+     `summary` = "`{reason}`; last report `{d}` after it started." with the
+     existing summary appended after it when there is one, clipped to
+     `ACTIVITY_SUMMARY_MAX_LENGTH`. `{d}` is a duration (`34m`, `2h`, `3d`), so
+     the text never goes stale and needs no timezone.
+  4. It applies them through the existing inner `apply_batch` body, refactored to
+     take the open transaction, with a `terminalize_retained` mode. In that mode
+     an actor or work-item upsert that only moves an **existing** record to a
+     terminal state skips the capability check. This is finding 5: a retained
+     record under a stale, unnegotiated section still closes. Counts, journal
+     rows, revision, event idempotency and delta chunking all come from the
+     shared code.
+- Projection: `interrupt_unresolved_scope(scope_id, reason)` takes the scope's
+  publication lock **once**, calls the repository function, then publishes the
+  deltas and the apply completion. Both steps come from a private
+  `apply_locked`-style helper that `apply()` also uses after taking the lock.
+  `apply()` is never called while the lock is held (finding 1).
+- Reasons, static and content-free:
+  - "`{Provider}` session ended before this subagent reported" (actors), or
+    "…before this task reported" (work items).
+  - "BiBCode restarted before this subagent reported", with the same split, at
+    startup.
+- Failures: `tracing::warn!` with the thread id and counts only. Detach and
+  shutdown never fail because of it.
 
-- New `ActivityProjection::interrupt_unresolved_scope(scope_id, reason, event_key)`
-  in `activity/projection.rs`. It holds the scope's publication lock, reads the
-  scope's active records through a new repository read, builds full
-  `UpsertActor` and `UpsertWorkItem` mutations, and sends them through `apply()`.
-  `apply()` journals and publishes deltas, so an open subscription sees the
-  change. The repository `interrupt_*` functions bump the revision without a
-  journal row, which is fine at startup but not for a live suspension. The read
-  returns only records with status `starting | running | waiting | unknown`, so a
-  second call is a no-op. Batches stay at 128 records or fewer (under the
-  256-mutation limit), and a bounded loop handles larger scopes.
-- Capability check: `apply_batch` rejects an actor upsert when
-  `scope.capabilities.actors` is false (`repository.rs:827-831`). Section
-  invariants (`:2137-2170`) let actor records sit under an un-negotiated, stale
-  section. The helper therefore skips a record kind whose capability the scope no
-  longer has and logs a count-only warning. Startup repair (item 6) still covers
-  those records.
-- An empty read returns early. `apply_batch` rejects an empty batch with
-  `EmptyBatch`, and a clean detach must not log a warning.
-- Call sites in `production/provider_runtime.rs`, each after
-  `cancel_and_reap_activity_tasks`. The activity dispatch queue is drained by
-  then, so no queued upsert from the dead process (with an `updatedAt` newer than
-  last seen) can revive the record:
-  - `detach_session`, before `synchronize_activity_lifecycle`, so the lifecycle
-    sees zero active, and before `compensate_cancelled_activity`. This covers
-    idle suspension, stop, removal, the lazy dead-session detach and
-    `shutdown_sessions`, which is the update path.
-  - The relaunch teardown, before `forget_live_activity`.
-  - Crash: the supervisor's `SessionStreamEnded` arm (`:6429-6450`), once
-    settlement finishes and the activity tasks are reaped. If reaping there
-    conflicts with the lazy detach, the lazy detach (`:6523`) stays the crash
-    path, and the window lasts until the next turn start.
-- Gate: only a session whose driver owns its provider process. An OpenCode
-  driver attached to a configured external server (`child: None`,
-  `provider_runtime.rs:13996`) can outlive the BiBCode session, so its children
-  are not interrupted on detach. Startup repair still runs for all of them.
-- Reason text, static and content-free: "{Provider} session ended before this
-  subagent reported", with "…this task reported" for work items. The label is
-  Claude, Codex or OpenCode, derived from `launch.provider`.
-- Failures log `tracing::warn!` with the thread id and counts only, and never
-  block detach or shutdown.
+### B. Ownership
 
-### 2. Turn end and `background_tasks_changed` (Claude tracker)
+- A process is BiBCode-owned unless it is OpenCode with a configured endpoint.
+  The Codex, Cursor and Grok drivers hold `child: SharedChild`; OpenCode holds
+  `Option<SharedChild>` and is `None` for an endpoint (`provider_runtime.rs:12985`,
+  `:13531`, `:13789`, `:13998`, `:14045`). Claude always spawns its own process.
+  The helper is `session_owns_provider_process(&launch)`.
+- Durable evidence for startup: the OpenCode driver writes
+  `"processOwner": "bibcode" | "external"` into its runtime payload, which is
+  persisted in `provider_session_runtime.runtime_payload_json` by `persist_runtime`.
+  At startup an OpenCode thread scope is interrupted only when its runtime row
+  carries `"processOwner": "bibcode"`. A missing flag (rows from older builds) or
+  `external` leaves it untouched. Every other chat provider's scope is
+  interrupted because its driver always owns the process. This is consistent
+  with #187's `EXTERNALLY_RESUMABLE_PROVIDERS` (`orchestration/engine.rs:7030`,
+  `:2865-2880`), and #187's request rules are not touched.
 
-Decision: close at turn end only what is provably finished. Recover from the
-hook/stdout race with a late-stop upgrade.
+### C. Call sites (complete callers)
 
-- The race. Hooks arrive over HTTP into an mpsc channel that a separate task
-  drains (`provider_runtime.rs:18267-18297`), while `result` arrives on stdout
-  (`:18233-18265`). If a turn-end close interrupts an actor and its
-  `SubagentStop` lands a moment later, the `"SubagentStop" if
-  actors.contains_key` arm (`activity.rs:425`) drops the stop. A finished
-  subagent would then read Interrupted.
-- Rule: at a root `result`, the tracker interrupts each open actor whose
-  correlator task mapping is known and whose task is not in
-  `ClaudeBackgroundTasks.live`. Such an actor was foreground, or its background
-  task left Claude's live set. Unmapped actors are left to the process-end path.
-  Claude cannot prove them foreground, and interrupting a live background agent
-  would hide its later tool hooks.
-- Late-stop upgrade: an actor interrupted at turn end moves to
-  `terminal_actors`, marked as closed by turn end. A later `SubagentStop` for it,
-  in the same tracker, upgrades it to `completed` with its summary. The
-  repository already accepts terminal→terminal with a newer `updatedAt`
-  (`repository.rs:2367-2380`), and the client reducer only rejects
-  terminal→non-terminal.
-- Not chosen: never closing at turn end. That relies on process end alone, with
-  latency of up to the 30-minute quiet cap plus the idle timeout. A dropped 503
-  would show **Active 1** for up to about an hour.
-- Last seen at turn end: `ClaudeActorState` gains a last-hook time, bumped by
-  each owned tool hook, so the turn-end close can follow the item-3 rule.
-- Changes: `provider/claude/activity.rs` adds a turn-end close and the
-  late-stop path. `provider/claude/runtime.rs` passes the mapped task ids and the
-  live background set to the tracker on a root `result`, and on
-  `background_tasks_changed` when no turn is open.
+Each runs only when `session_owns_provider_process` holds and Chat Activity is
+admitted:
 
-### 3. Interrupted, not Completed: reason and last seen
+1. `detach_session`, after `cancel_and_reap_activity_tasks` and before
+   `synchronize_activity_lifecycle`, so the lifecycle sees zero active, and
+   before `compensate_cancelled_activity`. This covers stop, removal, idle
+   suspension, the lazy dead-session detach and `shutdown_sessions` (update).
+2. Relaunch teardown, before `forget_live_activity`.
+3. Crash: the supervisor's `SessionStreamEnded` arm (`:6429-6450`), on **both**
+   branches. After settlement, it runs once `settled` resolves. On the
+   settlement-timeout branch, which stores `pending_stream_settlement`, it runs
+   too, because the interruption touches only activity, not the core projection
+   being settled. No later delivery is needed (finding 3). Queued non-terminal
+   upserts from the dead process carry `updatedAt` earlier than the closure, so
+   the fence drops them. A queued terminal one (a real `SubagentStop`) still
+   overwrites `interrupted`, which is correct.
+4. Startup (`production/runtime.rs:353`), next to the terminal pass and before
+   `reconcile_abandoned_provider_sessions`: the chat projection walks thread
+   scopes with active records. It applies ownership rule B and calls the same
+   `interrupt_unresolved_scope` per scope with the restart reason. That is one
+   code path, journaled, and repairs existing databases such as the user's.
 
-No contract change. The existing `interrupted` lifecycle carries:
+### D. Turn end (Claude tracker)
 
-- `summary` = the reason, when the record has no summary. A running Claude chat
-  actor always has `summary: None` (`activity.rs:477`). An existing summary is
-  kept. Old clients already render `summary`.
-- `updatedAt` = last seen: the later of the record's `updatedAt` and the newest
-  `activity_entries.created_at` the record owns. Claude does not bump the actor
-  on tool hooks, so its `updatedAt` alone is the start time. `terminalAt` = now.
-  `validate_record_chronology` (`model.rs:1400-1416`) requires
-  `startedAt ≤ updatedAt ≤ terminalAt`, which holds. Startup repair uses the same
-  rule.
-- Web (`activityPresentation.ts`, `ActivityRoster.tsx`): `recordTime` today
-  prints "Completed in X" for every terminal row (`ActivityRoster.tsx:291-297`),
-  including interrupted, failed and cancelled. A new
-  `activityRecordTimeLabel(record, now)` in `activityPresentation.ts` returns
-  "Completed in X", "Failed after X", "Stopped after X", and for interrupted rows
-  "Last seen X ago", computed from `updatedAt`.
+- At a root `result`, close an open actor as `interrupted` (reason: "Claude
+  ended its turn before this subagent reported") only when:
+  - its correlator task mapping is known, and
+  - Claude's live background set is **authoritative**: at least one
+    `background_tasks_changed` has arrived in this process, and `overflowed` is
+    false (`provider/claude/runtime.rs:1513-1545`), and
+  - the task is absent from that set.
 
-### 4. No dead-end Stop
+  Unmapped actors, or any actor while the set is incomplete, wait for process
+  end (finding 6).
+- Late-stop upgrade: an actor closed this way moves to `terminal_actors`,
+  flagged as closed by turn end. A later `SubagentStop` from the same tracker
+  upgrades it to `completed` with its summary. The repository accepts
+  terminal→terminal at a newer `updatedAt`, and the client reducer accepts it.
+- `ClaudeActorState` gains a last-hook time, so the turn-end summary uses the
+  same "last report" text.
+- Not chosen: never closing at turn end. A dropped stop hook would then show
+  **Active** until idle suspension, which takes up to the 30-minute quiet cap
+  plus the idle timeout.
 
-After items 1 and 6, an actor from a dead process is under **Done**. An active
-row with no target is now only one the live runtime has not yet linked to a
-task. `ActivityRoster.tsx:395-403` keeps the short "Stop unavailable" label but
-adds an accessible description and tooltip: "{Provider} hasn't reported a way
-to stop this subagent yet." The copy lives in `activityPresentation.ts`.
+### E. Client reducer (reopen convergence)
 
-### 5. Remote and older servers
+`resolveSummaryUpdate` refuses a terminal→non-terminal incremental update
+(`activityReducer.ts:129-131`). After this change, a Codex resume can still
+reopen an interrupted actor on the server with a newer provider timestamp
+(`provider/codex/activity.rs:945-955`). The client would then keep Interrupted
+while the server says running. Change: when an incoming non-terminal summary
+for a terminal record has a strictly newer `updatedAt`, the delta is accepted
+for its revision and `requiresSnapshotReconciliation` returns true, so the
+client fetches the snapshot. Older or equal updates are still ignored. No
+contract change.
 
-Everything is server-side and runs the same for local and remote. A new client
-against an older server keeps today's behavior, except that the honest time
-label (item 3) also fixes "Completed in X" on that server's interrupted rows.
-Skipped: client-side "No update for X" on active rows. A Claude actor's
-`updatedAt` is its start time, so that label would mislead.
+### F. Web (owned files only)
 
-### 6. Startup repair
+- `activityPresentation.ts`: new `activityRecordTimeLabel(record, now)`:
+  - completed: "Completed in X"
+  - failed: "Failed after X"
+  - cancelled: "Stopped after X"
+  - interrupted: "Interrupted X ago"
+  - active: "Elapsed X"
 
-`production/runtime.rs:353`: next to the terminal call, the chat projection runs
-`repository.interrupt_unresolved_activity_scopes("BiBCode restarted before this
-subagent reported", AgentActivitySource::Chat)` through a new projection
-wrapper, because the projection's repository is private. The function already exists
-(`repository.rs:272-288`) and nothing calls it yet. It applies the item-3
-last-seen and summary rule. `append_interruption_entry` hardcodes the
-`activity:monitoring-disabled:` id prefix (`repository.rs:715-718`); it gains a
-namespace parameter, so the restart entry gets `activity:server-restart:`. No
-provider session is live at startup: `reconcile_abandoned_provider_sessions`
-runs right after.
+  It replaces `recordTime` (`ActivityRoster.tsx:291-297`), which today labels
+  every terminal row "Completed in". The reason and last report come from
+  `summary`, which the row already renders first (`:383-387`). Old servers'
+  interrupted rows also stop reading "Completed".
+- **Stop unavailable** (`ActivityRoster.tsx:395-403`): keep the short label, add
+  an accessible description and tooltip, "`{Provider}` hasn't reported a way to
+  stop this subagent yet." After this fix, an active row has no stop target
+  only while its live runtime hasn't linked a task yet.
+- `ActivityDock.tsx`: no code change expected; tests prove its counts move.
 
-### Hook-drop log (H3 evidence)
+### G. Hook-drop log
 
-`hook_sink.rs:152-156` adds a counted `tracing::warn!` on `Full` (503) and
-`Closed` (410). It carries the `hook_event_name` and a running drop count, and
-logs the first drop and then each power of two. There is no payload, agent text
-or id beyond the hook event name. Out of scope: the 1 s handler timeout versus
-the 2 s server body timeout.
+`hook_sink.rs:152-156`: a counted `tracing::warn!` on `Full` (503) and `Closed`
+(410). It carries `hook_event_name` and the drop count, logs the first drop and
+then each power of two, and never logs the payload.
 
-## Files I will touch
-
-- Server: `apps/server/src/activity/{projection,repository}.rs`,
-  `apps/server/src/production/{provider_runtime,runtime}.rs`,
-  `apps/server/src/provider/claude/{activity,runtime,hook_sink}.rs`.
-- Server tests: `apps/server/tests/{activity_repository,activity_provider_conformance,provider_claude}.rs`
-  and `apps/server/tests/fixtures/activity-conformance/canonical-scenarios.json`.
-- Web, owned files only: `apps/web/src/components/activity/{activityPresentation.ts,activityPresentation.test.ts,ActivityRoster.tsx,ActivityRoster.test.tsx,ActivityDock.test.tsx}`.
-  `ActivityDock.tsx` changes only if the dock test shows a need.
-- Client runtime: `packages/client-runtime/src/state/activityReducer.test.ts`
-  (tests only; the reducer already handles both paths).
-- Desktop e2e: `apps/desktop/e2e/specs/chat-activity-panel.e2e.ts` and
-  `apps/desktop/e2e/support/activity-session.ts` (one new export), typechecked
-  only; the run is scheduled by the lead.
-- Docs: `docs/architecture/activity-observation.md` (teardown section `:59-66`,
-  Claude structured section, Troubleshooting states), `docs/user/workspace-ui.md`
-  ("Activity and targeted Stop"), `docs/providers/claude.md` ("Activity
-  observation"), `docs/skills/bibcode-profiler/references/` only if the new log
-  lines count as profiler-visible (they are plain `tracing`, so probably not).
-  Testing runbooks get reviewed; the desktop UI runbook gains the new e2e case if
-  it lists cases.
-
-I do not touch `ActivityPane.tsx`, ChatView timeline code, `packages/contracts`,
-or the e2e fixture shim.
-
-## Tests per acceptance criterion
+## Tests (through the real callers)
 
 | Criterion | Test |
 | --- | --- |
-| Startup interrupts thread scopes, leaves terminal scopes alone | `tests/activity_repository.rs`: seed a running actor and a waiting work item in a thread scope, plus a running actor in a terminal scope. The chat startup pass interrupts only the thread pair, sets `summary`, `updatedAt` (= last entry time) and `terminalAt`, and is idempotent. The terminal pass is unchanged. |
-| Idle suspension, `shutdown_sessions` and relaunch interrupt and do not republish Live with the actor active | `production/provider_runtime.rs`, next to `removal_suspension_tests` and `IdleDeadlineFixture`: seed an open actor through the session's activity, then run each path. Assert `interrupted`, `terminalAt` set, counts `active 0 / done 1`, a journaled delta was published, and the final snapshot is Live with no active actor. A stream-end (crash) case does the same. |
-| Interrupt mid-subagent with no `SubagentStop`; `task_notification(stopped)` before the mapping; hook dropped with 503 | `provider/claude/activity.rs` unit tests: turn-end close of a mapped foreground actor, late `SubagentStop` upgrading it to completed, an unmapped actor left open at turn end. `provider/claude/runtime.rs` unit test: the stopped notification is held, then applied when the mapping arrives. `tests/provider_claude.rs`: a fixture run where the stop hook never arrives (503) ends with the actor `interrupted` after the process ends. `hook_sink` unit test: a full channel answers 503 and counts the drop. |
-| Conformance: "provider process ended with open subagent" for every chat provider | New `chat-process-ended-interrupts-active` scenario in `canonical-scenarios.json` with a repository checkpoint in `activity_provider_conformance.rs`. The path is provider-agnostic, so it drives Claude, Codex and OpenCode actors through the same projection helper. `every_canonical_scenario_has_a_repository_checkpoint` stays green. |
-| Web: interrupted row (reason, last seen, under Done), explained no-target state, dock counts move | `activityPresentation.test.ts`: time labels per lifecycle. `ActivityRoster.test.tsx`: interrupted row under Done with its reason and "Last seen", and an active row with no target showing the description. `ActivityDock.test.tsx`: Active 1 / Done 17 becomes Active 0 / Done 18 on a snapshot change. |
-| Client runtime: running → interrupted by delta and by replacement snapshot | `activityReducer.test.ts`: both cases. |
-| Desktop e2e: interrupted by a session stop, leaves Active | `chat-activity-panel.e2e.ts`: new `it`. With the Codex fixture, the "Composer focus observer" child stays active (`test-project.ts:153-160`). The test dispatches `thread.session.stop` through a new `stopDesktopActivitySession()` export in `support/activity-session.ts` (`dispatchDesktopActivityCommands` is module-private). The step goes at the end of the existing `it` unless a second materialization with the fixed fixture ids is accepted. It asserts that the row leaves **Active**, reads Interrupted under **Done**, and shows the reason. Typecheck only for now. |
-| Update maintenance | `production/runtime.rs` or `tests/`: `quiesce_for_update` with an open actor leaves it `interrupted`. A `prepare` with persisted running records completes without delay or failure. |
-| Unchanged | The existing tests for `SubagentStop` completion, task-notification cancellation, targeted Stop, AI Terminal interruption, and the monitoring-disabled entry id stay green. |
+| Repository path | `tests/activity_repository.rs`: a single transaction interrupts thread-scope records, sets `updatedAt == terminalAt`, and sets a summary with reason and last report (including an existing summary). It journals one delta, is idempotent with no `EmptyBatch` on the second call, terminalizes a record under a stale unnegotiated section, and leaves terminal scopes alone. |
+| No deadlock | `activity/projection.rs` unit test: `interrupt_unresolved_scope` completes under a timeout while another `apply()` for the same scope is queued, and both deltas publish in order. |
+| Stop, suspension, shutdown, relaunch | `production/provider_runtime.rs` tests next to `removal_suspension_tests` and `IdleDeadlineFixture`, through `stop_session`, the idle deadline, `shutdown_sessions` and the relaunch teardown. Each asserts the record is interrupted, a published delta, counts active 0 / done N, and a final Live snapshot without an active actor. |
+| Crash, no further delivery | A fixture driver ends its stream with an open actor, and no turn is sent. The record is interrupted after settlement. A second case forces the settlement timeout. |
+| Hookless relaunch | Extend `tests/production_provider_runtime.rs::a_restarted_claude_without_hook_support_stops_reporting_live_subagents`: the old process's running actor becomes interrupted under the stale section, through a journaled delta. |
+| Startup and ownership | `tests/server_runtime.rs` or `production_provider_runtime.rs`, starting the production runtime on a seeded DB. Claude and Codex thread scopes are interrupted. OpenCode with `processOwner: bibcode` is interrupted, while `external` or a missing flag is untouched. Then resume each OpenCode session and check the record matches what the provider reports. Terminal scopes are unchanged. |
+| Update | `tests/production_maintenance.rs`: `quiesce_for_update` with an open actor leaves it interrupted. `prepare` with persisted running records completes within its normal time and never fails. |
+| Claude turn end | `provider/claude/activity.rs` and `runtime.rs` unit tests: a mapped absent actor closes when the set is authoritative. Overflow, then turn end, then a late `SubagentStop` gives no close at turn end and `completed` from the stop. Close-by-absence followed by a late stop upgrades to completed. Unmapped actors stay open. A stopped notification before the mapping is applied once the mapping arrives. |
+| Dropped hook | `tests/provider_claude.rs`: a fixture run whose stop hook is answered 503 ends `interrupted` after the process ends. A `hook_sink` unit test counts the 503 and 410 drops. |
+| Codex resume race and #187 agreement | `production_provider_runtime.rs`: a Codex session is interrupted on stop, and a concurrent resume re-reports the same child active. The server record follows the newer report. Thread status (#187 shell: session status, `lastActivityAt`) and Activity counts agree after the race and after a fresh snapshot. `activityReducer.test.ts` covers the client side: the reopen delta triggers a snapshot, which converges. |
+| Conformance | New `chat-process-ended-interrupts-active` scenario in `canonical-scenarios.json`. Its checkpoint drives Claude, Codex and OpenCode actors through the projection path; the caller-level tests above prove the callers. |
+| Web | `activityPresentation.test.ts` (labels per lifecycle). `ActivityRoster.test.tsx`: interrupted row under Done with reason, last report and "Interrupted X ago", plus the explained no-target state. `ActivityDock.test.tsx`: Active 1 / Done 17 becomes Active 0 / Done 18. |
+| Client runtime | `activityReducer.test.ts`: running → interrupted by delta, and by replacement snapshot after reconnect, plus the reopen case above. |
+| Packaged desktop | `chat-activity-panel.e2e.ts`, at the end of the existing `it`: dispatch `thread.session.stop` through a new `stopDesktopActivitySession()` export in `support/activity-session.ts`. The fixture's active "Fixture reviewer" child (marker cleared) leaves **Active** and reads Interrupted under **Done** with the reason. **Running it is required.** I'll tell the lead when ready and not start it myself. |
+
+## Docs and runbooks
+
+- `docs/architecture/activity-observation.md`:
+  - the teardown section (`:59-66`): chat-scope interruption, ownership, and
+    closure timestamps;
+  - the reducer rule (`:54-57`): a newer reopen now triggers a snapshot;
+  - the Claude structured section: turn-end close and late-stop upgrade;
+  - Troubleshooting states.
+- `docs/user/workspace-ui.md` § "Activity and targeted Stop": interrupted rows,
+  the time labels, the Stop explanation.
+- `docs/providers/claude.md` § "Activity observation": hook delivery, what ends a
+  subagent, and the hook-drop log.
+- `docs/testing/cross-platform-validation.md` § "Claude activity probe behind a
+  shim" (`:770-805`):
+  - Step 5 expects the earlier subagent row to read **Interrupted** with
+    "Claude session ended before this subagent reported", under **Done**,
+    beside the retained-activity message.
+  - The command list gains the new relaunch and startup tests.
+- The desktop UI runbook gains the e2e step if it lists cases.
+- A historical spec is not needed: there's no contract change and no new state.
 
 ## Gates
 
-`cargo fmt --all --check`; `cargo clippy -p bibcode-server --all-targets -- -D
-warnings`; focused `cargo test -p bibcode-server` (lib filters plus the
-`activity_repository`, `activity_provider_conformance` and `provider_claude`
-integration targets); `vp check --no-fmt` plus `vp check <changed files>`;
-`vp run typecheck`; `vp test run --project unit` for the web and client-runtime
-tests; `vp test run scripts/bibcode-identity.test.ts`. `vp run check:contracts`
-is not needed because contracts don't change. Reviews: UI.md and
-vercel-react-best-practices on `ActivityRoster` and `activityPresentation`.
+- `cargo fmt --all --check`
+- `cargo clippy --workspace --all-targets -- -D warnings`
+- The focused `cargo test -p bibcode-server` lib filters, plus the integration
+  targets `activity_repository`, `activity_provider_conformance`,
+  `provider_claude`, `production_provider_runtime`, `production_maintenance` and
+  `server_runtime`
+- The full `vp check` (the app-written `.claude/settings.local.json` is left
+  alone; if it fails only there, I report it)
+- `vp run typecheck`
+- `vp test run --project unit` for web and client-runtime
+- `vp test run scripts/bibcode-identity.test.ts`
+- `vp run check:contracts` is not needed, because contracts don't change.
+- Reviews: UI.md and vercel-react-best-practices on `ActivityRoster` and
+  `activityPresentation`.
+- The packaged desktop run, when the lead schedules it.
 
 ## Profiler coverage
 
-The change adds no child process, RPC, binary or worktree path. The new
-interruption and hook-drop records are plain `tracing::warn!` lines with counts,
-thread ids and hook event names only. No prompt or subagent text is recorded.
+The change adds no child process, RPC method, binary or worktree path. The
+interruption and hook-drop records are plain `tracing::warn!` lines carrying
+counts, thread ids and hook event names. No prompt or subagent text is recorded.
 
-## Risks
+## Residual risks
 
-- Shutdown under the update deadline: one read and one apply per session with
-  open records, bounded by 128 records per batch. This is negligible next to the
-  30 s deadline. Errors are logged, not returned.
-- Codex resumption can re-report a child as running with a newer timestamp,
-  which revives the record. That is truthful if Codex really reports it, and it
-  is the known Codex recovery behavior. It is noted, not fixed.
-- The turn-end close relies on correlator mappings. When a mapping is wrong, the
-  correlator's poisoning already drops the mapping, so no close happens.
+- A Codex resume that genuinely re-reports a dead child as active reopens it.
+  The client now converges on that truth, but the original "Running forever" can
+  persist for Codex if Codex's own state is stale. This is documented, not fixed
+  here.
+- An OpenCode row written before this change has no `processOwner`, so it is
+  left untouched at startup. Its next detach closes it.
 
 ## Skipped (ponytail)
 
-Skipped: a new lifecycle state, manual dismiss/archive, the client "No update
-for X" label, a longer quiet cap while a subagent is open (the cap stays; the
-record now closes), the hook timeout mismatch, and Codex/OpenCode terminal
-observer teardown.
+A new lifecycle state, a contract field, manual dismiss, the client "No update
+for X" label, a longer quiet cap, the 1 s versus 2 s hook timeout mismatch, and
+Codex/OpenCode AI Terminal teardown.
+
+## Revision 2 changes (Codex findings → change)
+
+1. Deadlock: a single lock with a single transaction, and `apply()` is never
+   called under the lock (A).
+2. Timestamps: `updatedAt == terminalAt == closure`, with the last report in
+   `summary` (A.3); the delta and reconnect are tested.
+3. Crash: the `SessionStreamEnded` arm on both branches, with no lazy detach (C.3).
+4. Startup ownership: the persisted `processOwner` flag; external OpenCode is
+   untouched on both detach and startup; #187 is preserved (B, C.4).
+5. Capability loss: the `terminalize_retained` mode in the journaled path; the
+   hookless relaunch is tested (A.4).
+6. Overflow: close-by-absence only with an authoritative set; tested (D).
+7. Startup reason and time: the same path writes the reason and last report into
+   every `summary`, including an existing one (A.3, C.4).
+8. Complete callers: caller-level tests, the Codex race, #187 agreement, the
+   reducer convergence, and the packaged run (Tests, E).
+9. Runbook and gates: the shim procedure is updated; the full `vp check` and
+   workspace Clippy are run (Docs, Gates).
+10. Trigger ranking removed: the remote report is acceptance gate 1.
 
 ## Remote server prompt (read-only, for the user to run with Claude on the server)
 
