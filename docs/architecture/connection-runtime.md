@@ -56,9 +56,10 @@ public package has no root export; callers use focused subpaths such as
   paste, type-to-focus insertion, file selection, `:` actions and moving to a
   question's next step only change local state, and staging happens at Send.
   Every action that needs the server refuses and names the state the
-  composer banner shows (`describeUnavailableEnvironment`). That covers:
-  - the Send buttons, as "Send unavailable. <state>", and Refine, Implement and
-    a question's final Submit;
+  composer banner shows (`describeUnavailableEnvironment`). A blocked button
+  stays focusable (`aria-disabled`) with "<action> unavailable. <state>" as its
+  name and tooltip, and activating it sends nothing. That covers:
+  - the Send buttons, and Refine, Implement and a question's final Submit;
   - Enter that would send something;
   - Steer and Send now on the queued head;
   - approval decisions;
@@ -69,7 +70,8 @@ public package has no root export; callers use focused subpaths such as
   question and its answers stay. Nothing is queued for the reconnect. A send that
   passed its checks while connected and fails in a later await restores its
   content: a turn through `restoreOutgoing`, a plan follow-up by merging its
-  cleared draft back. An editor that went read-only in these phases dropped keys
+  cleared draft back and returning the draft to its mode before Implement. An
+  editor that went read-only in these phases dropped keys
   without a sign (#199).
 
 - `EnvironmentRegistry` owns catalog entries and their scoped supervisors. It

@@ -5799,6 +5799,66 @@ describe("ChatView send flows", () => {
     expect(commandCallsFor("thread.startTurn")).toHaveLength(1);
   });
 
+  it.each([
+    ["its turn start fails after the mode write", "thread.startTurn"],
+    ["its mode write fails", "thread.setInteractionMode"],
+  ] as const)(
+    "keeps the plan's follow-up actions when an Implement fails because %s",
+    async (_case, failingCommand) => {
+      const turnId = TurnId.make("turn-1");
+      seedConnectedServerThread(
+        makeThread({
+          interactionMode: "plan",
+          latestTurn: {
+            turnId,
+            state: "completed",
+            requestedAt: now,
+            startedAt: now,
+            completedAt: later,
+            assistantMessageId: null,
+          },
+          reasoning: [],
+          proposedPlans: [
+            {
+              id: OrchestrationProposedPlanId.make("plan-1"),
+              turnId,
+              planMarkdown: "# Plan",
+              implementedAt: null,
+              implementationThreadId: null,
+              createdAt: now,
+              updatedAt: now,
+            },
+          ],
+        }),
+      );
+      h.commandResults[failingCommand] = () =>
+        AsyncResult.failure(Cause.fail(new Error("The connection disconnected.")));
+      renderServerRoute();
+      const { promptRef } = installComposerHandle();
+      // An empty follow-up implements the plan, which runs in default mode.
+      promptRef.current = "";
+
+      const composer = capturedProps("chatComposer");
+      expect(composer["showPlanFollowUpPrompt"]).toBe(true);
+      await (composer["onSend"] as () => Promise<void>)();
+
+      expect(commandCallsFor("thread.setInteractionMode")).toHaveLength(1);
+      expect(commandCallsFor("thread.startTurn")).toHaveLength(
+        failingCommand === "thread.startTurn" ? 1 : 0,
+      );
+      // The draft is not left in default mode, so Implement and Refine are offered again.
+      const draftMode = useComposerDraftStore
+        .getState()
+        .getComposerDraft(threadRef)?.interactionMode;
+      if (failingCommand === "thread.startTurn") {
+        // The mode write succeeded, so the draft must say plan to override the thread.
+        expect(draftMode).toBe("plan");
+      } else {
+        expect(draftMode ?? "plan").toBe("plan");
+      }
+    },
+  );
+
   it("implements the plan in a new thread and cleans up when the start fails", async () => {
     const turnId = TurnId.make("turn-1");
     seedConnectedServerThread(

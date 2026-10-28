@@ -1280,12 +1280,12 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         : null,
     [activePendingIsResponding, activePendingProgress, activePendingResolvedAnswers],
   );
+  // A blocked collapsed Send stays focusable with its reason (aria-disabled); pressing it
+  // reaches onSend, which refuses and says why. A busy or empty one is plainly disabled.
+  const isCollapsedComposerPrimaryActionBlocked = sendBlockedReason !== null;
   const collapsedComposerPrimaryActionDisabled =
-    sendBlockedReason !== null ||
-    phase === "running" ||
-    isSendBusy ||
-    isConnecting ||
-    !composerSendState.hasSendableContent;
+    !isCollapsedComposerPrimaryActionBlocked &&
+    (phase === "running" || isSendBusy || isConnecting || !composerSendState.hasSendableContent);
   const collapsedComposerPrimaryActionLabel = sendBlockedReason
     ? formatUnavailableActionLabel("Send", sendBlockedReason)
     : "Send message";
@@ -2502,8 +2502,9 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
               </button>
               <button
                 type="button"
-                className="flex size-8 shrink-0 items-center justify-center rounded-full bg-primary/90 text-primary-foreground disabled:opacity-30"
+                className="flex size-8 shrink-0 items-center justify-center rounded-full bg-primary/90 text-primary-foreground disabled:opacity-30 aria-disabled:opacity-30"
                 disabled={collapsedComposerPrimaryActionDisabled}
+                {...(isCollapsedComposerPrimaryActionBlocked ? { "aria-disabled": true } : {})}
                 aria-label={collapsedComposerPrimaryActionLabel}
                 onPointerDown={(event) => event.preventDefault()}
                 onClick={(event) => {

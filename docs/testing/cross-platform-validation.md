@@ -617,8 +617,9 @@ page harness keeps failing until it lets the retry through. In both drops:
 
 - every key is on screen and in the thread's single environment-scoped persisted
   draft after the 300 ms write debounce;
-- Send is disabled, and its accessible name is "Send unavailable." followed by the
-  state the composer banner shows;
+- Send is blocked but stays focusable (`aria-disabled`, not native `disabled`),
+  and its accessible name is "Send unavailable." followed by the state the
+  composer banner shows;
 - Enter raises a toast titled with the environment's state and keeps focus and
   text;
 - nothing reaches the provider before an explicit Send after the reconnect;
