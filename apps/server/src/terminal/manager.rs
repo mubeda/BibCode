@@ -2095,6 +2095,9 @@ impl TerminalManager {
         }
 
         let mut private_values = Vec::new();
+        // Everything redacted from spawn labels and errors: the private values and the
+        // prepared environment overlay's values.
+        let mut diagnostic_values: Vec<String> = Vec::new();
         let original_command_candidate = input.command.as_ref().map(|command| {
             (
                 command.executable.clone(),
@@ -2191,7 +2194,23 @@ impl TerminalManager {
                     right.len().cmp(&left.len()).then_with(|| left.cmp(right))
                 });
                 private_values.dedup();
+                // The overlay is the environment the user's own shim would have applied, so the
+                // user's terminal output may show it as it would unobserved: its values are
+                // redacted from the manager's diagnostics only, not from the stream.
+                diagnostic_values.extend(
+                    prepared
+                        .env_overlay
+                        .values()
+                        .filter(|value| !value.is_empty())
+                        .cloned(),
+                );
+                diagnostic_values.extend(private_values.iter().cloned());
+                diagnostic_values.sort_by(|left, right| {
+                    right.len().cmp(&left.len()).then_with(|| left.cmp(right))
+                });
+                diagnostic_values.dedup();
                 let mut env = input.env.clone();
+                env.extend(prepared.env_overlay);
                 env.extend(prepared.private_env);
                 command_candidate = Some((prepared.executable, prepared.args, env));
                 if let Err(observer) = generation.install_observer(observer) {
@@ -2217,7 +2236,7 @@ impl TerminalManager {
 
         let spawn_candidates = if let Some((executable, args, env)) = command_candidate {
             let attempted_label =
-                redact_private_values(format!("{executable} {args:?}"), &private_values);
+                redact_private_values(format!("{executable} {args:?}"), &diagnostic_values);
             vec![(
                 PtySpawnInput {
                     executable,
@@ -2266,7 +2285,7 @@ impl TerminalManager {
                     spawned = Some((process, executable));
                     break;
                 }
-                Err(error) => last_error = redact_private_values(error, &private_values),
+                Err(error) => last_error = redact_private_values(error, &diagnostic_values),
             }
         }
         let Some((mut uncommitted_process, mut executable)) = spawned else {
@@ -2309,6 +2328,7 @@ impl TerminalManager {
                 return Err(invalidated_creation_error(&input));
             }
             private_values.clear();
+            diagnostic_values.clear();
             // The original command runs unobserved.
             command_was_prepared = false;
             let Some((original, args, env)) = original_command_candidate else {

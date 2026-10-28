@@ -172,6 +172,7 @@ impl ProviderTerminalObserverFactory for LoadTerminalObserverFactory {
             Some(PreparedTerminalLaunch {
                 executable: input.launch.executable,
                 args: input.launch.args,
+                env_overlay: BTreeMap::new(),
                 private_env: BTreeMap::new(),
                 observer: Box::new(LoadTerminalObserver),
             })

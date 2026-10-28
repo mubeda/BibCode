@@ -506,7 +506,8 @@ only that disposable worktree after a successful integration.
 ## Stable Release Runbook
 
 1. Confirm the intended version and commit have passed the local verification
-   commands below. Create and push the intended tag (or dispatch `stable` with
+   commands below and the [Claude Terminal hook ceiling](#claude-terminal-hook-ceiling)
+   check. Create and push the intended tag (or dispatch `stable` with
    that explicit version) with `publish` left at its default `false`.
    If a tag-triggered run exposes a release-controller defect after the native
    artifacts have built, fix and verify the controller on `main`, then start a
@@ -547,6 +548,29 @@ only that disposable worktree after a successful integration.
    inspect finalization, and synchronize `develop` using the maintainer branch
    flow. Install and smoke-test each ordinary installer on its target operating
    system after publication.
+
+### Claude Terminal hook ceiling
+
+A Claude AI Terminal gets status hooks only on Claude Code builds whose
+`--settings` hooks BiBCode has proven to be added to the user's own hooks:
+`MIN_ADDITIVE_HOOK_VERSION ..= MAX_ADDITIVE_HOOK_VERSION` in
+`apps/server/src/provider_terminal/claude.rs`. A newer build reads **Status
+unavailable** until a release raises the ceiling. Before each release, check
+the newest Claude Code on a signed-in Mac (`claude --version`). If it is above
+the ceiling, prove it with the live check:
+
+```sh
+BIBCODE_CLAUDE_MERGE_PROOF=~/.local/share/claude/versions/<version> \
+  cargo test -p bibcode-server --lib live_user_pre_tool_use_guard -- --ignored --nocapture
+```
+
+The check costs one short Haiku turn. In a scratch project, it injects BiBCode's
+real overlay through `--settings` and asks Claude to run a shell command that a
+project `PreToolUse` guard blocks. It passes when the guard ran, the command did
+not, and BiBCode's own `UserPromptSubmit` and `PreToolUse` hooks arrived. Only
+then raise `MAX_ADDITIVE_HOOK_VERSION` to that version, in a commit that names
+the build and the run. If it fails, keep the ceiling and open an issue: hooking
+that build would drop the user's guard or BiBCode's status.
 
 ### Failed release runs
 

@@ -3,7 +3,7 @@
 // observer intentionally remains Unix-only and returns pass-through there.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     fmt,
     future::{Future, IntoFuture},
     io,
@@ -19,10 +19,7 @@ use std::{
 };
 
 #[cfg(unix)]
-use std::{
-    collections::BTreeMap,
-    net::{Ipv4Addr, SocketAddrV4},
-};
+use std::net::{Ipv4Addr, SocketAddrV4};
 
 use axum::{
     Router,
@@ -52,15 +49,20 @@ use super::{
     supervisor::cleanup_owned_generation_directory,
 };
 #[cfg(test)]
-use crate::process::supervised::{
-    run_supervised_with_spawn_observer, run_supervised_with_spawn_observer_until,
-};
+use crate::process::supervised::run_supervised_with_spawn_observer_until;
 use crate::{
     activity::{
         ActivityActorSummary, ActivityCapabilities, ActivityHistoryRecovery, ActivityLifecycle,
         ActivityObservationState, ActivityWorkItemSummary, ProviderActivityMutation,
     },
-    process::supervised::{SupervisedOverflow, SupervisedRunRequest, run_supervised},
+    diagnostics::{
+        AttributionKind, AttributionScope, NativeProcessSampler, ProcessAttributionRegistry,
+        ProcessRegistration, ProcessRegistrationMetadata, RegistrationSource,
+    },
+    process::supervised::{
+        SupervisedOverflow, SupervisedRunRequest, run_supervised,
+        run_supervised_with_spawn_observer,
+    },
     provider::claude::{
         activity::{ClaudeActivityInputSource, ClaudeActivityTracker},
         transcript::{ClaudeTranscriptRecoveryRequest, recover_transcript},
@@ -87,29 +89,28 @@ const CLAUDE_HOOK_OBJECT_LIMIT: usize = 64 * 1024;
 // Anthropic introduced HTTP hooks in Claude Code v2.1.63. Versions before
 // that explicitly reported that HTTP hooks were unsupported.
 const MIN_PROVEN_HTTP_HOOK_VERSION: (u64, u64, u64) = (2, 1, 63);
-// Approval evidence for this exact macOS arm64 build:
-// - offline SHA-256:
-//   8addc857f3fe64d5a0368af9ee50321b50afb4a6918ba3ef018ab84f5dbbe081
-// - embedded source GIT_SHA: 4073f59596e272f39393db4f96abc5f4b10eff21
-// - embedded merge markers:
-//   "3. **Merge**: Add to existing hooks, don't replace"
-//   "Failed to merge hooks from "
-// Production verifies the full on-disk SHA-256 and corroborates it with the
-// embedded codesign identity/CDHash; unknown platforms and builds fail closed.
-const APPROVED_ADDITIVE_HOOK_VERSION: &str = "2.1.220";
-const APPROVED_ADDITIVE_HOOK_BINARY_LENGTH: u64 = 256_908_272;
+/// The Claude Code builds whose `--settings` hooks BiBCode has proven to be added to the user's
+/// own hooks rather than replacing them. 2.1.220 is the build whose merge code was inspected
+/// (markers "3. **Merge**: Add to existing hooks, don't replace" and "Failed to merge hooks
+/// from "). The ceiling is the newest build the live proof passed on: a user `PreToolUse` guard
+/// still blocks a tool call with BiBCode's overlay injected
+/// (`tests::live_user_pre_tool_use_guard_still_blocks_with_the_bibcode_overlay`, a release step
+/// in docs/operations/release.md). A newer build runs unhooked until a release raises it.
+const MIN_ADDITIVE_HOOK_VERSION: (u64, u64, u64) = (2, 1, 220);
+const MAX_ADDITIVE_HOOK_VERSION: (u64, u64, u64) = (2, 1, 312);
+/// The `--version` line of a genuine build ends in this marker. A multi-call shim such as mise
+/// answers with its own dotted version, which must never pass as a Claude version.
+const CLAUDE_VERSION_MARKER: &str = "(Claude Code)";
+/// Anthropic's code signature: Developer ID team Q6L2SF6YDW, identifier
+/// com.anthropic.claude-code, anchored at Apple. `codesign --verify` hashes every page against
+/// it, so one changed byte fails.
+#[cfg(any(target_os = "macos", test))]
+const ANTHROPIC_CODE_REQUIREMENT: &str = "anchor apple generic and identifier \"com.anthropic.claude-code\" and certificate leaf[subject.OU] = \"Q6L2SF6YDW\"";
+/// Verifying a 276 MB build takes 0.4 to 0.8 s, once per build.
 #[cfg(target_os = "macos")]
-const APPROVED_ADDITIVE_HOOK_SHA256: &str =
-    "8addc857f3fe64d5a0368af9ee50321b50afb4a6918ba3ef018ab84f5dbbe081";
-#[cfg(any(target_os = "macos", all(test, unix)))]
-const APPROVED_ADDITIVE_HOOK_IDENTIFIER: &str = "com.anthropic.claude-code";
-#[cfg(any(target_os = "macos", all(test, unix)))]
-const APPROVED_ADDITIVE_HOOK_TEAM: &str = "Q6L2SF6YDW";
-#[cfg(any(target_os = "macos", all(test, unix)))]
-const APPROVED_ADDITIVE_HOOK_CDHASH: &str = "474c5a3154406ea5ee537b0a25f24f9292b1570b";
-#[cfg(any(target_os = "macos", all(test, unix)))]
-const APPROVED_ADDITIVE_HOOK_CDHASH_FULL: &str =
-    "474c5a3154406ea5ee537b0a25f24f9292b1570bc9eb0a4e555659e95a376f34";
+const CODESIGN_VERIFY_TIMEOUT: Duration = Duration::from_millis(1_250);
+/// No Claude build is near this; a larger candidate is refused before it is pinned.
+const CLAUDE_PIN_SIZE_LIMIT: u64 = 1024 * 1024 * 1024;
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct ClaudeProbeOutput {
@@ -137,16 +138,80 @@ pub trait ClaudeCapabilityProbeRunner: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<ClaudeProbeOutput, String>> + Send + '_>>;
 }
 
+/// Proves who published a build whose version is already in the approved range. It runs once
+/// per build (source fingerprint); every launch then binds its pin to the proven bytes by
+/// SHA-256.
 pub trait ClaudeAdditiveHookAttestor: Send + Sync {
     fn prove(
         &self,
         executable: &Path,
         version: &str,
     ) -> Pin<Box<dyn Future<Output = bool> + Send + '_>>;
+
+    /// `prove`, with the registry its child processes are attributed to.
+    fn prove_attributed<'a>(
+        &'a self,
+        executable: &'a Path,
+        version: &'a str,
+        _process_attribution: Option<&'a ProcessAttributionRegistry>,
+    ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
+        self.prove(executable, version)
+    }
 }
 
 pub trait ClaudeExecutablePinner: Send + Sync {
     fn pin(&self, source: &Path, destination: &Path) -> io::Result<()>;
+
+    /// `pin`, stopping early once `cancelled` is set. It runs off the async runtime, and a
+    /// failed or cancelled pin leaves no destination file behind.
+    fn pin_cancellable(
+        &self,
+        source: &Path,
+        destination: &Path,
+        _cancelled: &AtomicBool,
+    ) -> io::Result<()> {
+        self.pin(source, destination)
+    }
+}
+
+/// What a shim's manager says it would run, before any of it is trusted.
+#[derive(Clone)]
+pub struct ClaudeShimResolution {
+    /// The real install the shim hands off to; validated and attested before it is pinned.
+    pub executable: PathBuf,
+    /// The environment the shim's manager applies before it runs that install.
+    pub env: BTreeMap<String, String>,
+}
+
+impl fmt::Debug for ClaudeShimResolution {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ClaudeShimResolution")
+            .field("executable", &self.executable)
+            .field("env_keys", &self.env.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+/// A launch of a multi-call shim, as the terminal would start it.
+#[derive(Clone, Copy, Debug)]
+pub struct ClaudeShimRequest<'a> {
+    /// The path the terminal invokes, such as `~/.local/share/mise/shims/claude`.
+    pub invoked: &'a Path,
+    /// The shim's canonical target, the manager binary, such as `mise`.
+    pub manager: &'a Path,
+    pub cwd: &'a Path,
+    pub launch_env: &'a BTreeMap<String, String>,
+    pub process_attribution: &'a ProcessAttributionRegistry,
+}
+
+/// Finds the real install behind a multi-call shim. Its answer is untrusted: preparation
+/// validates the path and attests the pinned bytes, and validates the environment.
+pub trait ClaudeInstallResolver: Send + Sync {
+    fn resolve<'a>(
+        &'a self,
+        request: ClaudeShimRequest<'a>,
+    ) -> Pin<Box<dyn Future<Output = Option<ClaudeShimResolution>> + Send + 'a>>;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -162,6 +227,7 @@ pub struct CachedClaudeCapabilityProbe {
     attestor: Arc<dyn ClaudeAdditiveHookAttestor>,
     cache: tokio::sync::Mutex<ClaudeCapabilityCache>,
     probe_gates: Mutex<HashMap<ClaudeExecutableFingerprint, std::sync::Weak<ClaudeProbeGate>>>,
+    approval_gates: Mutex<HashMap<ClaudeExecutableFingerprint, std::sync::Weak<ClaudeProbeGate>>>,
     probe_permits: Semaphore,
 }
 
@@ -189,43 +255,60 @@ impl CachedClaudeCapabilityProbe {
             attestor,
             cache: tokio::sync::Mutex::new(ClaudeCapabilityCache::default()),
             probe_gates: Mutex::new(HashMap::new()),
+            approval_gates: Mutex::new(HashMap::new()),
             probe_permits: Semaphore::new(CLAUDE_CAPABILITY_PROBE_CONCURRENCY),
         }
     }
 
+    /// Probes `executable` as its own pin: what a launch of it would be granted.
     pub async fn probe(&self, executable: &Path) -> Option<ClaudeCapabilities> {
         let path = std::fs::canonicalize(executable).unwrap_or_else(|_| executable.to_path_buf());
         let fingerprint = ClaudeExecutableFingerprint::read(&path)?;
-        let capabilities = self.probe_cacheable(&path, fingerprint.clone()).await?;
-        let additive_hook_merge = if capabilities.authenticated_http_hooks {
-            self.attest_stable_build(&path, &fingerprint, &capabilities.version)
-                .await
-        } else {
-            false
-        };
-        Some(ClaudeCapabilities {
-            version: capabilities.version,
-            additional_settings: capabilities.additional_settings,
-            authenticated_http_hooks: capabilities.authenticated_http_hooks,
-            additive_hook_merge,
-        })
+        self.probe_pinned(&path, &fingerprint, &path, None).await
     }
 
-    async fn probe_pinned(&self, source: &Path, pinned: &Path) -> Option<ClaudeCapabilities> {
-        let source = std::fs::canonicalize(source).ok()?;
-        let source_fingerprint = ClaudeExecutableFingerprint::read(&source)?;
+    /// Probes the build `source` was when `source_fingerprint` was read (before it was pinned),
+    /// and grants additive hooks only when `pinned` holds exactly the bytes approved for it.
+    async fn probe_pinned(
+        &self,
+        source: &Path,
+        source_fingerprint: &ClaudeExecutableFingerprint,
+        pinned: &Path,
+        process_attribution: Option<&ProcessAttributionRegistry>,
+    ) -> Option<ClaudeCapabilities> {
         let pinned_fingerprint = ClaudeExecutableFingerprint::read(pinned)?;
-        let (capabilities, approved_pinned_build) = tokio::join!(
-            self.probe_cacheable(&source, source_fingerprint.clone()),
-            self.attest_stable_build(pinned, &pinned_fingerprint, APPROVED_ADDITIVE_HOOK_VERSION,),
+        let pinned_for_digest = pinned.to_path_buf();
+        let (capabilities, digest) = tokio::join!(
+            self.probe_cacheable(source, source_fingerprint.clone()),
+            async move {
+                tokio::task::spawn_blocking(move || sha256_file(&pinned_for_digest))
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+            },
         );
         let capabilities = capabilities?;
-        if ClaudeExecutableFingerprint::read(&source).as_ref() != Some(&source_fingerprint) {
+        // The source must still be the build that was pinned and probed.
+        if ClaudeExecutableFingerprint::read(source).as_ref() != Some(source_fingerprint) {
             return None;
         }
-        let additive_hook_merge = capabilities.authenticated_http_hooks
-            && capabilities.version == APPROVED_ADDITIVE_HOOK_VERSION
-            && approved_pinned_build;
+        let additive_hook_merge = match digest {
+            Some(digest)
+                if capabilities.authenticated_http_hooks
+                    && additive_hook_version(&capabilities.version) =>
+            {
+                self.approve_build(
+                    source_fingerprint,
+                    pinned,
+                    &pinned_fingerprint,
+                    digest,
+                    &capabilities.version,
+                    process_attribution,
+                )
+                .await
+            }
+            _ => false,
+        };
         Some(ClaudeCapabilities {
             version: capabilities.version,
             additional_settings: capabilities.additional_settings,
@@ -242,7 +325,7 @@ impl CachedClaudeCapabilityProbe {
         if let Some(capabilities) = self.cache.lock().await.get(&fingerprint) {
             return Some(capabilities);
         }
-        let probe_gate = self.probe_gate(&fingerprint);
+        let probe_gate = gate_for(&self.probe_gates, &fingerprint);
         let _probe_guard = probe_gate.lock.lock().await;
         if let Some(capabilities) = self.cache.lock().await.get(&fingerprint) {
             return Some(capabilities);
@@ -268,11 +351,49 @@ impl CachedClaudeCapabilityProbe {
         capabilities
     }
 
+    /// Whether `pinned` (whose bytes hash to `digest`) is an approved copy of the build with
+    /// `source_fingerprint`. The publisher is proven once per build, single-flight across
+    /// concurrent launches. Only a completed proof is cached, so a failed or cancelled one
+    /// publishes nothing. Every launch compares its own pin's digest with the proven one.
+    async fn approve_build(
+        &self,
+        source_fingerprint: &ClaudeExecutableFingerprint,
+        pinned: &Path,
+        pinned_fingerprint: &ClaudeExecutableFingerprint,
+        digest: [u8; 32],
+        version: &str,
+        process_attribution: Option<&ProcessAttributionRegistry>,
+    ) -> bool {
+        if let Some(approved) = self.cache.lock().await.approved_digest(source_fingerprint) {
+            return approved == digest;
+        }
+        let gate = gate_for(&self.approval_gates, source_fingerprint);
+        let _guard = gate.lock.lock().await;
+        if let Some(approved) = self.cache.lock().await.approved_digest(source_fingerprint) {
+            return approved == digest;
+        }
+        if gate.failed.load(Ordering::Acquire) {
+            return false;
+        }
+        if !self
+            .attest_stable_build(pinned, pinned_fingerprint, version, process_attribution)
+            .await
+        {
+            gate.failed.store(true, Ordering::Release);
+            return false;
+        }
+        self.cache
+            .lock()
+            .await
+            .set_approved_digest(source_fingerprint, digest)
+    }
+
     async fn attest_stable_build(
         &self,
         executable: &Path,
         expected_fingerprint: &ClaudeExecutableFingerprint,
         version: &str,
+        process_attribution: Option<&ProcessAttributionRegistry>,
     ) -> bool {
         let Ok(_attestation_permit) = self.probe_permits.acquire().await else {
             return false;
@@ -283,24 +404,13 @@ impl CachedClaudeCapabilityProbe {
         if &before != expected_fingerprint {
             return false;
         }
-        let approved = self.attestor.prove(executable, version).await;
+        let approved = self
+            .attestor
+            .prove_attributed(executable, version, process_attribution)
+            .await;
         approved
             && ClaudeExecutableFingerprint::read(executable)
                 .is_some_and(|after| after == before && &after == expected_fingerprint)
-    }
-
-    fn probe_gate(&self, fingerprint: &ClaudeExecutableFingerprint) -> Arc<ClaudeProbeGate> {
-        let mut gates = self
-            .probe_gates
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        gates.retain(|_, gate| gate.strong_count() > 0);
-        if let Some(gate) = gates.get(fingerprint).and_then(std::sync::Weak::upgrade) {
-            return gate;
-        }
-        let gate = Arc::new(ClaudeProbeGate::default());
-        gates.insert(fingerprint.clone(), Arc::downgrade(&gate));
-        gate
     }
 
     async fn probe_uncached(&self, executable: &Path) -> Option<ClaudeCacheableCapabilities> {
@@ -327,6 +437,29 @@ impl CachedClaudeCapabilityProbe {
     }
 }
 
+fn gate_for(
+    gates: &Mutex<HashMap<ClaudeExecutableFingerprint, std::sync::Weak<ClaudeProbeGate>>>,
+    fingerprint: &ClaudeExecutableFingerprint,
+) -> Arc<ClaudeProbeGate> {
+    let mut gates = gates
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    gates.retain(|_, gate| gate.strong_count() > 0);
+    if let Some(gate) = gates.get(fingerprint).and_then(std::sync::Weak::upgrade) {
+        return gate;
+    }
+    let gate = Arc::new(ClaudeProbeGate::default());
+    gates.insert(fingerprint.clone(), Arc::downgrade(&gate));
+    gate
+}
+
+/// Whether `version` is a build whose additive `--settings` hook merge BiBCode has proven.
+fn additive_hook_version(version: &str) -> bool {
+    parse_version_tuple(version).is_some_and(|version| {
+        (MIN_ADDITIVE_HOOK_VERSION..=MAX_ADDITIVE_HOOK_VERSION).contains(&version)
+    })
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ClaudeCacheableCapabilities {
     version: String,
@@ -340,9 +473,16 @@ struct ClaudeProbeGate {
     failed: AtomicBool,
 }
 
+#[derive(Debug)]
+struct ClaudeCacheEntry {
+    capabilities: ClaudeCacheableCapabilities,
+    /// The SHA-256 of the bytes whose publisher was proven, once proven.
+    approved_digest: Option<[u8; 32]>,
+}
+
 #[derive(Debug, Default)]
 struct ClaudeCapabilityCache {
-    entries: HashMap<ClaudeExecutableFingerprint, ClaudeCacheableCapabilities>,
+    entries: HashMap<ClaudeExecutableFingerprint, ClaudeCacheEntry>,
     recency: VecDeque<ClaudeExecutableFingerprint>,
 }
 
@@ -351,10 +491,28 @@ impl ClaudeCapabilityCache {
         &mut self,
         fingerprint: &ClaudeExecutableFingerprint,
     ) -> Option<ClaudeCacheableCapabilities> {
-        let value = self.entries.get(fingerprint)?.clone();
+        let value = self.entries.get(fingerprint)?.capabilities.clone();
         self.recency.retain(|cached| cached != fingerprint);
         self.recency.push_back(fingerprint.clone());
         Some(value)
+    }
+
+    fn approved_digest(&self, fingerprint: &ClaudeExecutableFingerprint) -> Option<[u8; 32]> {
+        self.entries.get(fingerprint)?.approved_digest
+    }
+
+    /// Records the proven digest. False when the build's entry is gone (evicted or replaced),
+    /// which then grants nothing: the next launch proves it again.
+    fn set_approved_digest(
+        &mut self,
+        fingerprint: &ClaudeExecutableFingerprint,
+        digest: [u8; 32],
+    ) -> bool {
+        let Some(entry) = self.entries.get_mut(fingerprint) else {
+            return false;
+        };
+        entry.approved_digest = Some(digest);
+        true
     }
 
     fn insert(
@@ -373,7 +531,13 @@ impl ClaudeCapabilityCache {
             };
             self.entries.remove(&oldest);
         }
-        self.entries.insert(fingerprint.clone(), capabilities);
+        self.entries.insert(
+            fingerprint.clone(),
+            ClaudeCacheEntry {
+                capabilities,
+                approved_digest: None,
+            },
+        );
         self.recency.push_back(fingerprint);
     }
 }
@@ -451,6 +615,7 @@ impl Drop for ClaudeListenerLease {
 pub struct ClaudeTerminalObserverFactory {
     probe: Arc<CachedClaudeCapabilityProbe>,
     pinner: Arc<dyn ClaudeExecutablePinner>,
+    resolver: Arc<dyn ClaudeInstallResolver>,
     listener_counts: Arc<ClaudeListenerCounts>,
 }
 
@@ -476,8 +641,16 @@ impl ClaudeTerminalObserverFactory {
         Self {
             probe,
             pinner,
+            resolver: Arc::new(MiseClaudeInstallResolver),
             listener_counts: Arc::new(ClaudeListenerCounts::default()),
         }
+    }
+
+    /// Replaces how the real install behind a multi-call shim is found.
+    #[must_use]
+    pub fn with_resolver(mut self, resolver: Arc<dyn ClaudeInstallResolver>) -> Self {
+        self.resolver = resolver;
+        self
     }
 
     /// Returns current and maximum bound listener counts for black-box integration diagnostics.
@@ -515,12 +688,54 @@ impl ClaudeTerminalObserverFactory {
         }
     }
 
+    /// The build the terminal will run, and the environment it runs with: the launch's own
+    /// executable, or the validated install behind a multi-call shim with its manager's
+    /// validated environment. `None` leaves the original command to run unobserved.
+    #[cfg(unix)]
+    async fn launch_source(
+        &self,
+        input: &ProviderTerminalObserverFactoryInput,
+    ) -> Option<(PathBuf, BTreeMap<String, String>)> {
+        let canonical = PathBuf::from(&input.launch.executable);
+        if !is_multi_call_shim(&input.invoked_executable, &canonical) {
+            return Some((canonical, BTreeMap::new()));
+        }
+        let resolution = self
+            .resolver
+            .resolve(ClaudeShimRequest {
+                invoked: &input.invoked_executable,
+                manager: &canonical,
+                cwd: &input.launch.cwd,
+                launch_env: &input.launch.launch_env,
+                process_attribution: &input.process_attribution,
+            })
+            .await;
+        let Some(resolution) = resolution else {
+            note_pass_through("shim_unresolved");
+            return None;
+        };
+        let Some(executable) = validated_install_candidate(&resolution.executable) else {
+            note_pass_through("shim_unresolved");
+            return None;
+        };
+        let Some(env) = validated_shim_environment(resolution.env) else {
+            note_pass_through("shim_env_rejected");
+            return None;
+        };
+        Some((executable, env))
+    }
+
     #[cfg(unix)]
     async fn prepare_unix(
         &self,
         input: ProviderTerminalObserverFactoryInput,
     ) -> Option<PreparedTerminalLaunch> {
         if unsafe_interactive_settings_args(&input.launch.args) {
+            return None;
+        }
+        let (source, env_overlay) = self.launch_source(&input).await?;
+        let source_fingerprint = ClaudeExecutableFingerprint::read(&source)?;
+        if source_fingerprint.length > CLAUDE_PIN_SIZE_LIMIT {
             return None;
         }
         let correlation = input.launch.generation.id().simple().to_string();
@@ -532,31 +747,45 @@ impl ClaudeTerminalObserverFactory {
         .ok()?;
         let pinned_executable = generation_dir.join("claude");
         let overlay_path = generation_dir.join("settings.json");
-        let mut preparation_resources = ClaudePreparationResources {
+        let preparation_resources = ClaudePreparationResources {
             runtime_dir: input.runtime_dir.clone(),
             generation_dir: generation_dir.clone(),
             armed: true,
         };
-        // The clone is generation-scoped: provider self-updates may replace
-        // the configured path for future terminals, while this terminal keeps
-        // executing the exact object attested below.
-        if self
-            .pinner
-            .pin(Path::new(&input.launch.executable), &pinned_executable)
-            .and_then(|()| restrict_pinned_executable(&pinned_executable))
-            .is_err()
-        {
-            return None;
-        }
+        // The pin is generation-scoped: provider self-updates may replace the source for future
+        // terminals, while this terminal keeps executing the exact object attested below. It
+        // runs off the async runtime and owns the generation's cleanup until it ends, so a
+        // preparation that runs out of budget mid-copy stops the copy at its next chunk and
+        // removes the partial pin only once nothing writes into it any more.
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let _cancel_pin_on_drop = CancelOnDrop(cancelled.clone());
+        let pinner = self.pinner.clone();
+        let pin_source = source.clone();
+        let pin_destination = pinned_executable.clone();
+        let (mut preparation_resources, pinned) = tokio::task::spawn_blocking(move || {
+            let pinned = pinner
+                .pin_cancellable(&pin_source, &pin_destination, &cancelled)
+                .and_then(|()| restrict_pinned_executable(&pin_destination));
+            (preparation_resources, pinned)
+        })
+        .await
+        .ok()?;
+        pinned.ok()?;
         let capabilities = self
             .probe
-            .probe_pinned(Path::new(&input.launch.executable), &pinned_executable)
+            .probe_pinned(
+                &source,
+                &source_fingerprint,
+                &pinned_executable,
+                Some(&input.process_attribution),
+            )
             .await;
         if !capabilities.is_some_and(|capabilities| {
             capabilities.additional_settings
                 && capabilities.authenticated_http_hooks
                 && capabilities.additive_hook_merge
         }) {
+            note_pass_through("build_unattested");
             return None;
         }
         let listener = match StdTcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)) {
@@ -613,10 +842,101 @@ impl ClaudeTerminalObserverFactory {
         Some(PreparedTerminalLaunch {
             executable: pinned_executable.to_string_lossy().into_owned(),
             args,
+            env_overlay,
             private_env: BTreeMap::new(),
             observer: Box::new(observer),
         })
     }
+}
+
+/// Sets its flag when dropped, which tells a pin still running off the runtime to stop.
+struct CancelOnDrop(Arc<AtomicBool>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+/// Logs why a Claude Terminal runs unobserved, once per reason. The reason is a fixed word:
+/// never a path or an environment value.
+fn note_pass_through(reason: &'static str) {
+    static NOTED: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+    let mut noted = NOTED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if noted.contains(&reason) {
+        return;
+    }
+    noted.push(reason);
+    tracing::debug!(status = reason, "Claude terminal runs without status hooks");
+}
+
+/// A launch through a multi-call shim: the invoked path is a link whose canonical target is a
+/// version manager that dispatches on its invoked name (mise), not a Claude build.
+fn is_multi_call_shim(invoked: &Path, canonical: &Path) -> bool {
+    invoked != canonical
+        && std::fs::symlink_metadata(invoked).is_ok_and(|metadata| metadata.is_symlink())
+        && canonical
+            .file_name()
+            .is_some_and(|name| name == MISE_EXECUTABLE_NAME)
+}
+
+/// The real install a shim's manager named, if it is safe to pin: an absolute path to a regular,
+/// executable file owned by this user or root, writable by nobody else, and not the manager
+/// itself. Returns its canonical path.
+#[cfg(unix)]
+fn validated_install_candidate(path: &Path) -> Option<PathBuf> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    if !path.is_absolute() || path.as_os_str().len() > SHIM_WHICH_OUTPUT_LIMIT {
+        return None;
+    }
+    let canonical = std::fs::canonicalize(path).ok()?;
+    let metadata = std::fs::metadata(&canonical).ok()?;
+    let mode = metadata.permissions().mode();
+    // SAFETY: `geteuid` has no preconditions and does not dereference memory.
+    let effective_user_id = unsafe { libc::geteuid() };
+    let owner_trusted = metadata.uid() == effective_user_id || metadata.uid() == 0;
+    let not_the_manager = canonical
+        .file_name()
+        .is_some_and(|name| name != MISE_EXECUTABLE_NAME);
+    (metadata.is_file()
+        && mode & 0o111 != 0
+        && mode & 0o022 == 0
+        && owner_trusted
+        && not_the_manager
+        && metadata.len() <= CLAUDE_PIN_SIZE_LIMIT)
+        .then_some(canonical)
+}
+
+/// The variables a shim's manager may set for an observed launch: POSIX names and values
+/// without NUL, within `SHIM_ENV_OUTPUT_LIMIT` in all. Any variable that changes how the dynamic
+/// loader loads code refuses the whole environment, and the shim then runs as configured.
+fn validated_shim_environment(env: BTreeMap<String, String>) -> Option<BTreeMap<String, String>> {
+    let mut total = 0_usize;
+    for (key, value) in &env {
+        total = total.saturating_add(key.len()).saturating_add(value.len());
+        let valid_name = key
+            .bytes()
+            .next()
+            .is_some_and(|first| first == b'_' || first.is_ascii_alphabetic())
+            && key
+                .bytes()
+                .all(|byte| byte == b'_' || byte.is_ascii_alphanumeric());
+        if !valid_name
+            || value.contains('\0')
+            || loader_override_variable(key)
+            || total > SHIM_ENV_OUTPUT_LIMIT
+        {
+            return None;
+        }
+    }
+    Some(env)
+}
+
+fn loader_override_variable(key: &str) -> bool {
+    matches!(key, "LD_PRELOAD" | "LD_LIBRARY_PATH" | "LD_AUDIT") || key.starts_with("DYLD_")
 }
 
 impl ProviderTerminalObserverFactory for ClaudeTerminalObserverFactory {
@@ -733,7 +1053,32 @@ struct NativeClaudeExecutablePinner;
 
 impl ClaudeExecutablePinner for NativeClaudeExecutablePinner {
     fn pin(&self, source: &Path, destination: &Path) -> io::Result<()> {
-        clone_executable(source, destination)
+        self.pin_cancellable(source, destination, &AtomicBool::new(false))
+    }
+
+    fn pin_cancellable(
+        &self,
+        source: &Path,
+        destination: &Path,
+        cancelled: &AtomicBool,
+    ) -> io::Result<()> {
+        #[cfg(target_os = "macos")]
+        {
+            let _ = cancelled;
+            clone_executable(source, destination)
+        }
+        #[cfg(target_os = "linux")]
+        {
+            copy_executable(source, destination, cancelled)
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            let _ = (source, destination, cancelled);
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Claude executable pinning is unavailable on this platform",
+            ))
+        }
     }
 }
 
@@ -754,12 +1099,145 @@ fn clone_executable(source: &Path, destination: &Path) -> io::Result<()> {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
-fn clone_executable(_source: &Path, _destination: &Path) -> io::Result<()> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "native copy-on-write executable pinning is unavailable",
-    ))
+/// One step of a pin copy: small enough that a cancelled preparation stops promptly.
+#[cfg(any(target_os = "linux", all(test, unix)))]
+const CLAUDE_PIN_COPY_CHUNK: usize = 16 * 1024 * 1024;
+
+/// Copies `source` into a new private `destination` (created here, never replaced), chunk by
+/// chunk until `cancelled` is set. On Linux each chunk is `copy_file_range`, which reflinks on
+/// btrfs, XFS and bcachefs and copies in the kernel elsewhere. The source must keep its identity
+/// for the whole copy. Any failure removes the destination.
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn copy_executable(source: &Path, destination: &Path, cancelled: &AtomicBool) -> io::Result<()> {
+    copy_executable_until(source, destination, &|_copied| {
+        cancelled.load(Ordering::Acquire)
+    })
+}
+
+/// `copy_executable`, asking `stop` with the bytes copied so far before every chunk.
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn copy_executable_until(
+    source: &Path,
+    destination: &Path,
+    stop: &dyn Fn(u64) -> bool,
+) -> io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut source_file = std::fs::File::open(source)?;
+    let before = source_file.metadata()?;
+    if !before.is_file() || before.len() > CLAUDE_PIN_SIZE_LIMIT {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Claude pin source is not a bounded regular file",
+        ));
+    }
+    let mut destination_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(destination)?;
+    let copied = copy_file_chunks(&mut source_file, &mut destination_file, before.len(), stop)
+        .and_then(|()| destination_file.sync_all())
+        .and_then(|()| {
+            let after = source_file.metadata()?;
+            let path_after = std::fs::metadata(source)?;
+            if same_file_state(&before, &after) && same_file_state(&before, &path_after) {
+                Ok(())
+            } else {
+                Err(io::Error::other(
+                    "Claude pin source changed while it was copied",
+                ))
+            }
+        });
+    drop(destination_file);
+    if copied.is_err() {
+        let _ = std::fs::remove_file(destination);
+    }
+    copied
+}
+
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn same_file_state(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    left.dev() == right.dev()
+        && left.ino() == right.ino()
+        && left.len() == right.len()
+        && left.mtime() == right.mtime()
+        && left.mtime_nsec() == right.mtime_nsec()
+        && left.ctime() == right.ctime()
+        && left.ctime_nsec() == right.ctime_nsec()
+}
+
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn copy_file_chunks(
+    source: &mut std::fs::File,
+    destination: &mut std::fs::File,
+    length: u64,
+    stop: &dyn Fn(u64) -> bool,
+) -> io::Result<()> {
+    let mut remaining = length;
+    #[cfg(target_os = "linux")]
+    let mut kernel_copy = true;
+    let mut buffer = Vec::new();
+    while remaining > 0 {
+        if stop(length - remaining) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "Claude pin cancelled",
+            ));
+        }
+        let chunk = usize::try_from(remaining)
+            .unwrap_or(usize::MAX)
+            .min(CLAUDE_PIN_COPY_CHUNK);
+        #[cfg(target_os = "linux")]
+        if kernel_copy {
+            use std::os::fd::AsRawFd as _;
+            // SAFETY: both descriptors are open for the call; null offsets use and advance each
+            // file's own position, as the read/write fallback below does.
+            let copied = unsafe {
+                libc::copy_file_range(
+                    source.as_raw_fd(),
+                    std::ptr::null_mut(),
+                    destination.as_raw_fd(),
+                    std::ptr::null_mut(),
+                    chunk,
+                    0,
+                )
+            };
+            if copied > 0 {
+                remaining -= copied as u64;
+                continue;
+            }
+            if copied == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "Claude pin source ended early",
+                ));
+            }
+            let error = io::Error::last_os_error();
+            match error.raw_os_error() {
+                Some(libc::EXDEV | libc::ENOSYS | libc::EOPNOTSUPP | libc::EINVAL)
+                    if remaining == length =>
+                {
+                    kernel_copy = false;
+                }
+                _ => return Err(error),
+            }
+        }
+        use std::io::{Read as _, Write as _};
+        buffer.resize(chunk.min(1024 * 1024), 0);
+        let read = source.read(&mut buffer)?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "Claude pin source ended early",
+            ));
+        }
+        destination.write_all(&buffer[..read])?;
+        remaining = remaining.saturating_sub(read as u64);
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -1670,59 +2148,157 @@ impl ClaudeAdditiveHookAttestor for ApprovedClaudeAdditiveHookAttestor {
     ) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
         let executable = executable.to_path_buf();
         let version = version.to_owned();
-        Box::pin(async move { approved_additive_hook_build(&executable, &version).await })
+        Box::pin(async move { approved_additive_hook_build(&executable, &version, None).await })
+    }
+
+    fn prove_attributed<'a>(
+        &'a self,
+        executable: &'a Path,
+        version: &'a str,
+        process_attribution: Option<&'a ProcessAttributionRegistry>,
+    ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
+        Box::pin(approved_additive_hook_build(
+            executable,
+            version,
+            process_attribution,
+        ))
     }
 }
 
-async fn approved_additive_hook_build(executable: &Path, version: &str) -> bool {
-    if version != APPROVED_ADDITIVE_HOOK_VERSION {
-        return false;
-    }
-    let Some(before) = ClaudeExecutableFingerprint::read(executable) else {
-        return false;
-    };
-    if before.length != APPROVED_ADDITIVE_HOOK_BINARY_LENGTH
+/// A build in the approved range and, on macOS, signed by Anthropic. Linux builds carry no
+/// signature of their own (Anthropic signs a release manifest instead), so on Linux the build's
+/// own `(Claude Code)` version line is trusted, as the chat path trusts it. Every other platform
+/// fails closed.
+async fn approved_additive_hook_build(
+    executable: &Path,
+    version: &str,
+    process_attribution: Option<&ProcessAttributionRegistry>,
+) -> bool {
+    if !additive_hook_version(version)
         || !std::fs::metadata(executable).is_ok_and(|metadata| metadata.is_file())
     {
         return false;
     }
-    approved_macos_codesign_build(executable).await
-        && ClaudeExecutableFingerprint::read(executable).is_some_and(|after| after == before)
-}
-
-#[cfg(target_os = "macos")]
-async fn approved_macos_codesign_build(executable: &Path) -> bool {
-    let executable_for_hash = executable.to_path_buf();
-    let (digest, display) = tokio::join!(
-        tokio::task::spawn_blocking(move || sha256_file(&executable_for_hash)),
-        run_codesign(executable, &["-dvvv", "--verbose=4"]),
-    );
-    if !digest
-        .ok()
-        .and_then(Result::ok)
-        .is_some_and(|digest| digest == APPROVED_ADDITIVE_HOOK_SHA256)
+    #[cfg(target_os = "macos")]
     {
-        return false;
+        anthropic_signed_build(executable, process_attribution).await
     }
-    let Some(display) = display else {
-        return false;
-    };
-    if !display.success {
-        return false;
+    #[cfg(target_os = "linux")]
+    {
+        let _ = process_attribution;
+        true
     }
-    let evidence = bounded_probe_text(&display.stdout, &display.stderr);
-    codesign_output_matches_approved_build(&evidence)
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = process_attribution;
+        false
+    }
 }
 
 #[cfg(target_os = "macos")]
-fn sha256_file(path: &Path) -> io::Result<String> {
+async fn anthropic_signed_build(
+    executable: &Path,
+    process_attribution: Option<&ProcessAttributionRegistry>,
+) -> bool {
+    let mut command = tokio::process::Command::new("/usr/bin/codesign");
+    command
+        .arg("--verify")
+        .arg("--strict")
+        .arg(format!("-R={ANTHROPIC_CODE_REQUIREMENT}"))
+        .arg(executable);
+    run_attributed_helper(
+        command,
+        "claude-codesign-verify",
+        CODESIGN_VERIFY_TIMEOUT,
+        16 * 1024,
+        process_attribution,
+    )
+    .await
+    .is_some_and(|output| output.success)
+}
+
+/// Runs a short helper (codesign, mise) under supervision: bounded output, a timeout, and the
+/// process group killed and reaped. While it runs it is attributed to BiBCode, so the Profiler
+/// samples it as BiBCode's own child.
+async fn run_attributed_helper(
+    mut command: tokio::process::Command,
+    label: &'static str,
+    timeout: Duration,
+    max_output_bytes: usize,
+    process_attribution: Option<&ProcessAttributionRegistry>,
+) -> Option<ClaudeProbeOutput> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let registration: Arc<Mutex<Option<ProcessRegistration>>> = Arc::default();
+    let slot = registration.clone();
+    let registry = process_attribution.cloned();
+    let output = run_supervised_with_spawn_observer(
+        SupervisedRunRequest {
+            command,
+            stdin: None,
+            timeout,
+            cleanup_timeout: Duration::from_millis(500),
+            max_output_bytes,
+            overflow: SupervisedOverflow::Error,
+        },
+        &CancellationToken::new(),
+        move |process_id| {
+            let Some(registry) = registry else {
+                return;
+            };
+            let Some(identity) =
+                process_id.and_then(|pid| NativeProcessSampler::process_identity(pid).ok())
+            else {
+                return;
+            };
+            if let Ok(registered) = registry.register_identity(
+                identity,
+                ProcessRegistrationMetadata {
+                    scope: AttributionScope::External,
+                    kind: AttributionKind::Helper,
+                    label: label.to_owned(),
+                    source: RegistrationSource::Helper,
+                    driver: None,
+                    survives_shutdown: false,
+                },
+            ) {
+                *slot
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(registered);
+            }
+        },
+    )
+    .await;
+    // The child is reaped by now: its attribution ends with it.
+    drop(registration);
+    let output = output.ok()?;
+    Some(ClaudeProbeOutput {
+        success: output.status.success(),
+        stdout: String::from_utf8_lossy(&output.stdout.bytes).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr.bytes).into_owned(),
+    })
+}
+
+/// The SHA-256 of a whole file, with CommonCrypto over a read-only mapping (0.1 s for a 276 MB
+/// build, in debug builds too). Runs on a blocking thread.
+#[cfg(target_os = "macos")]
+fn sha256_file(path: &Path) -> io::Result<[u8; 32]> {
+    use std::os::fd::AsRawFd as _;
+
     let file = std::fs::File::open(path)?;
     let length = file.metadata()?.len();
     let length = u32::try_from(length)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "executable is too large"))?;
-    use std::os::fd::AsRawFd as _;
-    // SAFETY: the file remains open for the mapping lifetime; the mapping is
-    // read-only, private, and bounded by the inspected file length.
+    if length == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "executable is empty",
+        ));
+    }
+    // SAFETY: the file remains open for the mapping lifetime; the mapping is read-only,
+    // private, and bounded by the inspected file length.
     let mapping = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
@@ -1751,13 +2327,13 @@ fn sha256_file(path: &Path) -> io::Result<String> {
         length: length as usize,
     };
     let mut digest = [0_u8; 32];
-    // SAFETY: CommonCrypto accepts a readable buffer of `length` bytes and a
-    // writable 32-byte digest output. Both remain live for the call.
+    // SAFETY: CommonCrypto reads `length` bytes of the live mapping and writes the 32-byte
+    // digest output. Both remain live for the call.
     let result = unsafe { CC_SHA256(mapping.address.cast_const(), length, digest.as_mut_ptr()) };
     if result.is_null() {
         return Err(io::Error::other("CommonCrypto SHA-256 failed"));
     }
-    Ok(crate::crypto::lowercase_hex(&digest))
+    Ok(digest)
 }
 
 #[cfg(target_os = "macos")]
@@ -1770,50 +2346,176 @@ unsafe extern "C" {
     ) -> *mut libc::c_uchar;
 }
 
+/// The SHA-256 of a whole file, read in 4 MiB steps. Runs on a blocking thread.
 #[cfg(not(target_os = "macos"))]
-async fn approved_macos_codesign_build(_executable: &Path) -> bool {
-    false
+fn sha256_file(path: &Path) -> io::Result<[u8; 32]> {
+    use sha2::{Digest as _, Sha256};
+    use std::io::Read as _;
+
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 4 * 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher.finalize().into())
 }
 
-#[cfg(target_os = "macos")]
-async fn run_codesign(executable: &Path, args: &[&str]) -> Option<ClaudeProbeOutput> {
-    let mut command = tokio::process::Command::new("/usr/bin/codesign");
-    command
-        .args(args)
-        .arg(executable)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let output = run_supervised(
-        SupervisedRunRequest {
-            command,
-            stdin: None,
-            timeout: Duration::from_millis(500),
-            cleanup_timeout: Duration::from_millis(500),
-            max_output_bytes: 16 * 1024,
-            overflow: SupervisedOverflow::Error,
-        },
-        &CancellationToken::new(),
+/// mise's multi-call binary: a shim links to it and it dispatches on the invoked name.
+const MISE_EXECUTABLE_NAME: &str = "mise";
+const SHIM_WHICH_OUTPUT_LIMIT: usize = 4 * 1024;
+const SHIM_ENV_OUTPUT_LIMIT: usize = 64 * 1024;
+/// Each mise answer takes 5 to 70 ms on a cold Linux lab disk.
+const SHIM_COMMAND_TIMEOUT: Duration = Duration::from_millis(750);
+
+/// Asks mise, with the launch's directory and environment, what its shim would run and with
+/// which environment. mise resolves both per directory. `which` and `env` run one after the
+/// other between two readings of the mise configuration files that can apply to the
+/// directory, and the pair is retried once if a file changed in between.
+#[derive(Debug, Default)]
+pub struct MiseClaudeInstallResolver;
+
+impl ClaudeInstallResolver for MiseClaudeInstallResolver {
+    fn resolve<'a>(
+        &'a self,
+        request: ClaudeShimRequest<'a>,
+    ) -> Pin<Box<dyn Future<Output = Option<ClaudeShimResolution>> + Send + 'a>> {
+        #[cfg(unix)]
+        {
+            Box::pin(resolve_through_mise(request))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = request;
+            Box::pin(std::future::ready(None))
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn resolve_through_mise(request: ClaudeShimRequest<'_>) -> Option<ClaudeShimResolution> {
+    let bin = request.invoked.file_name()?.to_str()?.to_owned();
+    for _attempt in 0..2 {
+        let before = mise_config_fingerprint(request.cwd, request.launch_env);
+        let which = run_mise(&request, &["which", &bin], SHIM_WHICH_OUTPUT_LIMIT).await?;
+        let env = run_mise(&request, &["env", "--json"], SHIM_ENV_OUTPUT_LIMIT).await?;
+        if mise_config_fingerprint(request.cwd, request.launch_env) != before {
+            continue;
+        }
+        return Some(ClaudeShimResolution {
+            executable: parse_mise_which(&which)?,
+            env: parse_mise_env(&env)?,
+        });
+    }
+    None
+}
+
+#[cfg(unix)]
+async fn run_mise(
+    request: &ClaudeShimRequest<'_>,
+    args: &[&str],
+    max_output_bytes: usize,
+) -> Option<String> {
+    let mut command = tokio::process::Command::new(request.manager);
+    command.args(args).current_dir(request.cwd);
+    crate::provider::environment::sanitize_provider_subprocess_environment(&mut command);
+    command.envs(request.launch_env);
+    let output = run_attributed_helper(
+        command,
+        "mise-shim-resolution",
+        SHIM_COMMAND_TIMEOUT,
+        max_output_bytes,
+        Some(request.process_attribution),
     )
-    .await
-    .ok()?;
-    Some(ClaudeProbeOutput {
-        success: output.status.success(),
-        stdout: String::from_utf8_lossy(&output.stdout.bytes).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr.bytes).into_owned(),
-    })
+    .await?;
+    output.success.then_some(output.stdout)
 }
 
-#[cfg(any(target_os = "macos", all(test, unix)))]
-fn codesign_output_matches_approved_build(output: &str) -> bool {
-    [
-        format!("Identifier={APPROVED_ADDITIVE_HOOK_IDENTIFIER}"),
-        format!("TeamIdentifier={APPROVED_ADDITIVE_HOOK_TEAM}"),
-        format!("CDHash={APPROVED_ADDITIVE_HOOK_CDHASH}"),
-        format!("CandidateCDHashFull sha256={APPROVED_ADDITIVE_HOOK_CDHASH_FULL}"),
-    ]
-    .iter()
-    .all(|expected| output.lines().any(|line| line == expected))
+fn parse_mise_which(output: &str) -> Option<PathBuf> {
+    let line = output.strip_suffix('\n').unwrap_or(output);
+    if line.is_empty() || line.contains(['\n', '\r', '\0']) || line.len() > SHIM_WHICH_OUTPUT_LIMIT
+    {
+        return None;
+    }
+    let path = PathBuf::from(line);
+    path.is_absolute().then_some(path)
+}
+
+fn parse_mise_env(output: &str) -> Option<BTreeMap<String, String>> {
+    if output.len() > SHIM_ENV_OUTPUT_LIMIT {
+        return None;
+    }
+    serde_json::from_str(output).ok()
+}
+
+/// A configuration file's device, inode, and modification and change times (s, ns).
+#[cfg(unix)]
+type MiseConfigStamp = (u64, u64, i64, i64, i64, i64);
+
+/// The identity of every mise configuration file that can apply to `cwd`: the project files in
+/// `cwd` and each parent, the global files, and the system file. A missing file is part of the
+/// reading too, so creating one counts as a change. Files mise reads from elsewhere (an
+/// `MISE_ENV` profile, an include) are not covered; see "Claude Terminal behind a shim" in
+/// docs/providers/claude.md.
+#[cfg(unix)]
+fn mise_config_fingerprint(
+    cwd: &Path,
+    launch_env: &BTreeMap<String, String>,
+) -> Vec<Option<MiseConfigStamp>> {
+    use std::os::unix::fs::MetadataExt;
+
+    const PROJECT_FILES: [&str; 10] = [
+        "mise.toml",
+        "mise.local.toml",
+        ".mise.toml",
+        ".mise.local.toml",
+        ".mise/config.toml",
+        "mise/config.toml",
+        ".config/mise.toml",
+        ".config/mise/config.toml",
+        ".config/mise/config.local.toml",
+        ".tool-versions",
+    ];
+    let variable = |key: &str| {
+        launch_env
+            .get(key)
+            .cloned()
+            .or_else(|| std::env::var(key).ok())
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    };
+    let mut files: Vec<PathBuf> = cwd
+        .ancestors()
+        .flat_map(|directory| PROJECT_FILES.iter().map(|file| directory.join(file)))
+        .collect();
+    let config_dir = variable("MISE_CONFIG_DIR")
+        .or_else(|| variable("XDG_CONFIG_HOME").map(|base| base.join("mise")))
+        .or_else(|| variable("HOME").map(|home| home.join(".config/mise")));
+    if let Some(config_dir) = config_dir {
+        files.push(config_dir.join("config.toml"));
+        files.push(config_dir.join("config.local.toml"));
+    }
+    files.extend(variable("MISE_GLOBAL_CONFIG_FILE"));
+    files.push(PathBuf::from("/etc/mise/config.toml"));
+    files
+        .iter()
+        .map(|file| {
+            std::fs::metadata(file).ok().map(|metadata| {
+                (
+                    metadata.dev(),
+                    metadata.ino(),
+                    metadata.mtime(),
+                    metadata.mtime_nsec(),
+                    metadata.ctime(),
+                    metadata.ctime_nsec(),
+                )
+            })
+        })
+        .collect()
 }
 
 #[cfg(unix)]
@@ -1829,18 +2531,15 @@ fn write_private_overlay(path: &Path, value: &Value) -> io::Result<()> {
     file.sync_all()
 }
 
+/// The version on the line that ends in Claude Code's `(Claude Code)` marker, such as
+/// `2.1.312 (Claude Code)`. Output without the marker, such as mise's
+/// `2026.10.19 macos-arm64 (2026-10-19)`, is not a Claude version.
 fn parse_claude_version(output: &str) -> Option<String> {
-    output
-        .split_whitespace()
-        .find(|part| {
-            let candidate = part
-                .trim_matches(|character: char| !(character.is_ascii_digit() || character == '.'));
-            parse_version_tuple(candidate).is_some()
-        })
-        .map(|part| {
-            part.trim_matches(|character: char| !(character.is_ascii_digit() || character == '.'))
-                .to_owned()
-        })
+    output.lines().find_map(|line| {
+        let (before, _) = line.split_once(CLAUDE_VERSION_MARKER)?;
+        let candidate = before.split_whitespace().last()?.trim_start_matches('v');
+        parse_version_tuple(candidate).map(|_| candidate.to_owned())
+    })
 }
 
 fn parse_version_tuple(version: &str) -> Option<(u64, u64, u64)> {
@@ -2140,7 +2839,7 @@ mod tests {
             _executable: &Path,
             version: &str,
         ) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
-            let approved = version == APPROVED_ADDITIVE_HOOK_VERSION;
+            let approved = version == "2.1.220";
             Box::pin(async move { approved })
         }
     }
@@ -2158,7 +2857,7 @@ mod tests {
         ) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
             self.calls.fetch_add(1, Ordering::AcqRel);
             let executable = executable.to_path_buf();
-            let approved_version = version == APPROVED_ADDITIVE_HOOK_VERSION;
+            let approved_version = version == "2.1.220";
             Box::pin(async move {
                 approved_version
                     && std::fs::read(executable).is_ok_and(|bytes| bytes == b"approved")
@@ -2179,7 +2878,7 @@ mod tests {
         ) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
             let executable = executable.to_path_buf();
             let replacement = self.replacement.clone();
-            let approved_version = version == APPROVED_ADDITIVE_HOOK_VERSION;
+            let approved_version = version == "2.1.220";
             Box::pin(async move {
                 std::fs::rename(replacement, executable).expect("replace during attestation");
                 approved_version
@@ -2622,7 +3321,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn capability_cache_never_reuses_exact_build_attestation() {
+    async fn build_publisher_is_proven_once_and_every_launch_rehashes_its_pin() {
         let root = tempfile::tempdir().expect("probe directory");
         let executable = root.path().join("claude");
         std::fs::write(&executable, b"approved").expect("approved executable");
@@ -2649,9 +3348,113 @@ mod tests {
         );
         assert_eq!(
             attestor.calls.load(Ordering::Acquire),
-            2,
-            "exact-build approval must run once per launch preparation"
+            1,
+            "a build's publisher is proven once; later launches only compare their pin's digest"
         );
+    }
+
+    #[tokio::test]
+    async fn a_pin_whose_bytes_differ_from_the_proven_build_is_not_hooked() {
+        let root = tempfile::tempdir().expect("probe directory");
+        let source = root.path().join("claude");
+        let first_pin = root.path().join("first-pin");
+        let second_pin = root.path().join("second-pin");
+        std::fs::write(&source, b"approved").expect("source");
+        std::fs::write(&first_pin, b"approved").expect("first pin");
+        std::fs::write(&second_pin, b"tampered").expect("second pin");
+        let attestor = Arc::new(ContentAwareClaudeAttestor::default());
+        let probe = CachedClaudeCapabilityProbe::with_attestor(
+            Arc::new(CountingClaudeProbeRunner::default()),
+            attestor.clone(),
+        );
+        let fingerprint = ClaudeExecutableFingerprint::read(&source).expect("fingerprint");
+
+        assert!(
+            probe
+                .probe_pinned(&source, &fingerprint, &first_pin, None)
+                .await
+                .is_some_and(|capabilities| capabilities.additive_hook_merge)
+        );
+        assert!(
+            probe
+                .probe_pinned(&source, &fingerprint, &second_pin, None)
+                .await
+                .is_some_and(|capabilities| !capabilities.additive_hook_merge),
+            "the proven digest, not the source fingerprint alone, grants hooks"
+        );
+        assert_eq!(attestor.calls.load(Ordering::Acquire), 1);
+    }
+
+    #[derive(Debug, Default)]
+    struct SlowCountingAttestor {
+        calls: AtomicUsize,
+        hang_first: AtomicBool,
+    }
+
+    impl ClaudeAdditiveHookAttestor for SlowCountingAttestor {
+        fn prove(
+            &self,
+            _executable: &Path,
+            _version: &str,
+        ) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
+            let call = self.calls.fetch_add(1, Ordering::AcqRel);
+            let hang = call == 0 && self.hang_first.load(Ordering::Acquire);
+            Box::pin(async move {
+                if hang {
+                    std::future::pending::<()>().await;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                true
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_launches_of_a_new_build_share_one_publisher_proof() {
+        let root = tempfile::tempdir().expect("probe directory");
+        let executable = root.path().join("claude");
+        std::fs::write(&executable, b"approved").expect("executable");
+        let attestor = Arc::new(SlowCountingAttestor::default());
+        let probe = CachedClaudeCapabilityProbe::with_attestor(
+            Arc::new(CountingClaudeProbeRunner::default()),
+            attestor.clone(),
+        );
+
+        let (first, second) = tokio::join!(probe.probe(&executable), probe.probe(&executable));
+
+        assert!(first.is_some_and(|capabilities| capabilities.additive_hook_merge));
+        assert!(second.is_some_and(|capabilities| capabilities.additive_hook_merge));
+        assert_eq!(attestor.calls.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_publisher_proof_publishes_nothing() {
+        let root = tempfile::tempdir().expect("probe directory");
+        let executable = root.path().join("claude");
+        std::fs::write(&executable, b"approved").expect("executable");
+        let attestor = Arc::new(SlowCountingAttestor {
+            calls: AtomicUsize::new(0),
+            hang_first: AtomicBool::new(true),
+        });
+        let probe = CachedClaudeCapabilityProbe::with_attestor(
+            Arc::new(CountingClaudeProbeRunner::default()),
+            attestor.clone(),
+        );
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), probe.probe(&executable))
+                .await
+                .is_err(),
+            "the first proof hangs until its preparation gives up"
+        );
+        assert!(
+            probe
+                .probe(&executable)
+                .await
+                .is_some_and(|capabilities| capabilities.additive_hook_merge),
+            "a later launch proves the build again"
+        );
+        assert_eq!(attestor.calls.load(Ordering::Acquire), 2);
     }
 
     #[tokio::test]
@@ -2724,25 +3527,221 @@ mod tests {
     }
 
     #[test]
-    fn additive_hook_attestation_rejects_any_unapproved_codesign_identity() {
-        let approved = format!(
-            "Identifier={APPROVED_ADDITIVE_HOOK_IDENTIFIER}\n\
-             TeamIdentifier={APPROVED_ADDITIVE_HOOK_TEAM}\n\
-             CDHash={APPROVED_ADDITIVE_HOOK_CDHASH}\n\
-             CandidateCDHashFull sha256={APPROVED_ADDITIVE_HOOK_CDHASH_FULL}\n"
+    fn claude_version_requires_the_claude_code_marker() {
+        assert_eq!(
+            parse_claude_version("2.1.312 (Claude Code)\n").as_deref(),
+            Some("2.1.312")
         );
-        assert!(codesign_output_matches_approved_build(&approved));
-        for marker in [
-            APPROVED_ADDITIVE_HOOK_IDENTIFIER,
-            APPROVED_ADDITIVE_HOOK_TEAM,
-            APPROVED_ADDITIVE_HOOK_CDHASH,
-            APPROVED_ADDITIVE_HOOK_CDHASH_FULL,
+        assert_eq!(
+            parse_claude_version("2026.10.19 macos-arm64 (2026-10-19)\n"),
+            None,
+            "mise's own version must never pass as a Claude version"
+        );
+        assert_eq!(parse_claude_version("claude 2.1.312\n"), None);
+        assert_eq!(parse_claude_version("(Claude Code)\n"), None);
+    }
+
+    #[test]
+    fn additive_hooks_cover_only_the_proven_version_range() {
+        assert!(!additive_hook_version("2.1.219"));
+        assert!(additive_hook_version("2.1.220"));
+        assert!(additive_hook_version("2.1.312"));
+        assert!(
+            !additive_hook_version("2.1.313"),
+            "a build newer than the last proven one runs unhooked until the ceiling is raised"
+        );
+        assert!(!additive_hook_version("2026.10.19.1"));
+        assert!(!additive_hook_version("latest"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn the_code_requirement_rejects_a_build_not_signed_by_anthropic() {
+        let root = tempfile::tempdir().expect("copy directory");
+        let copy = root.path().join("claude");
+        std::fs::copy("/bin/ls", &copy).expect("copy an Apple-signed binary");
+
+        assert!(
+            !anthropic_signed_build(&copy, None).await,
+            "Apple's own signature is not Anthropic's"
+        );
+    }
+
+    #[test]
+    fn mise_which_output_must_be_one_absolute_path() {
+        assert_eq!(
+            parse_mise_which("/home/u/.local/share/mise/installs/claude/2.1.311/claude\n"),
+            Some(PathBuf::from(
+                "/home/u/.local/share/mise/installs/claude/2.1.311/claude"
+            ))
+        );
+        for rejected in [
+            "",
+            "\n",
+            "claude\n",
+            "/a/claude\n/b/claude\n",
+            "/a/claude\r\n",
         ] {
-            assert!(
-                !codesign_output_matches_approved_build(&approved.replace(marker, "unapproved")),
-                "every allowlisted codesign marker must be mandatory"
-            );
+            assert_eq!(parse_mise_which(rejected), None, "{rejected:?}");
         }
+        assert_eq!(
+            parse_mise_which(&format!("/{}\n", "a".repeat(SHIM_WHICH_OUTPUT_LIMIT))),
+            None
+        );
+    }
+
+    #[test]
+    fn mise_env_output_must_be_a_bounded_object_of_strings() {
+        assert_eq!(
+            parse_mise_env(r#"{"PATH":"/x:/y","ANTHROPIC_BASE_URL":"https://example.invalid"}"#),
+            Some(BTreeMap::from([
+                (
+                    "ANTHROPIC_BASE_URL".to_owned(),
+                    "https://example.invalid".to_owned()
+                ),
+                ("PATH".to_owned(), "/x:/y".to_owned()),
+            ]))
+        );
+        assert_eq!(parse_mise_env(r#"{"A":1}"#), None);
+        assert_eq!(parse_mise_env(r#"["A"]"#), None);
+        assert_eq!(parse_mise_env("not json"), None);
+        assert_eq!(
+            parse_mise_env(&format!(
+                r#"{{"A":"{}"}}"#,
+                "x".repeat(SHIM_ENV_OUTPUT_LIMIT)
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn shim_environment_refuses_loader_overrides_and_invalid_names() {
+        let accepted = BTreeMap::from([
+            ("PATH".to_owned(), "/x".to_owned()),
+            ("_PRIVATE_1".to_owned(), "value".to_owned()),
+        ]);
+        assert_eq!(
+            validated_shim_environment(accepted.clone()),
+            Some(accepted.clone())
+        );
+        for (key, value) in [
+            ("LD_PRELOAD", "/tmp/x.so"),
+            ("LD_LIBRARY_PATH", "/tmp"),
+            ("LD_AUDIT", "/tmp/x.so"),
+            ("DYLD_INSERT_LIBRARIES", "/tmp/x.dylib"),
+            ("DYLD_LIBRARY_PATH", "/tmp"),
+            ("1ABC", "x"),
+            ("A=B", "x"),
+            ("", "x"),
+            ("NUL", "a\0b"),
+        ] {
+            let mut env = accepted.clone();
+            env.insert(key.to_owned(), value.to_owned());
+            assert_eq!(validated_shim_environment(env), None, "{key}");
+        }
+    }
+
+    #[test]
+    fn install_candidate_must_be_a_private_executable_that_is_not_the_manager() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("candidate directory");
+        let write = |name: &str, mode: u32| {
+            let path = root.path().join(name);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("parent directory");
+            std::fs::write(&path, b"claude").expect("candidate");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+                .expect("candidate mode");
+            path
+        };
+        let accepted = write("installs/claude/2.1.311/claude", 0o755);
+        assert_eq!(
+            validated_install_candidate(&accepted),
+            Some(std::fs::canonicalize(&accepted).expect("canonical"))
+        );
+        let link = root.path().join("latest");
+        std::os::unix::fs::symlink(&accepted, &link).expect("link");
+        assert_eq!(
+            validated_install_candidate(&link),
+            Some(std::fs::canonicalize(&accepted).expect("canonical")),
+            "a link such as installs/claude/latest is followed to its target"
+        );
+        for rejected in [
+            write("group-writable", 0o775),
+            write("world-writable", 0o757),
+            write("not-executable", 0o644),
+            write("bin/mise", 0o755),
+            root.path().join("installs"),
+            root.path().join("missing"),
+        ] {
+            assert_eq!(validated_install_candidate(&rejected), None, "{rejected:?}");
+        }
+        assert_eq!(validated_install_candidate(Path::new("claude")), None);
+    }
+
+    #[test]
+    fn only_a_link_to_mise_is_a_multi_call_shim() {
+        let root = tempfile::tempdir().expect("shim directory");
+        let mise = root.path().join("bin/mise");
+        let claude = root.path().join("versions/2.1.312");
+        for target in [&mise, &claude] {
+            std::fs::create_dir_all(target.parent().expect("parent")).expect("parent");
+            std::fs::write(target, b"binary").expect("target");
+        }
+        let shim = root.path().join("shims/claude");
+        let launcher = root.path().join("bin/claude");
+        std::fs::create_dir_all(shim.parent().expect("parent")).expect("parent");
+        std::os::unix::fs::symlink(&mise, &shim).expect("shim");
+        std::os::unix::fs::symlink(&claude, &launcher).expect("launcher");
+        let canonical = |path: &Path| std::fs::canonicalize(path).expect("canonical");
+
+        assert!(is_multi_call_shim(&shim, &canonical(&shim)));
+        assert!(!is_multi_call_shim(&launcher, &canonical(&launcher)));
+        assert!(!is_multi_call_shim(&mise, &canonical(&mise)));
+    }
+
+    #[test]
+    fn pin_copy_is_exact_private_and_leaves_nothing_when_cancelled() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("copy directory");
+        let source = root.path().join("claude");
+        let bytes: Vec<u8> = (0..(CLAUDE_PIN_COPY_CHUNK + 4096))
+            .map(|index| (index % 251) as u8)
+            .collect();
+        std::fs::write(&source, &bytes).expect("source");
+
+        let pinned = root.path().join("pinned");
+        copy_executable(&source, &pinned, &AtomicBool::new(false)).expect("copy");
+        assert_eq!(std::fs::read(&pinned).expect("pinned bytes"), bytes);
+        assert_eq!(
+            std::fs::metadata(&pinned)
+                .expect("pinned metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert!(
+            copy_executable(&source, &pinned, &AtomicBool::new(false)).is_err(),
+            "an existing destination is never replaced"
+        );
+        assert_eq!(std::fs::read(&pinned).expect("pinned bytes"), bytes);
+
+        let cancelled = root.path().join("cancelled-before");
+        let error = copy_executable(&source, &cancelled, &AtomicBool::new(true))
+            .expect_err("a cancelled pin fails");
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(!cancelled.exists());
+
+        let partial = root.path().join("cancelled-mid-copy");
+        let error = copy_executable_until(&source, &partial, &|copied| copied > 0)
+            .expect_err("a pin cancelled after its first chunk fails");
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(
+            !partial.exists(),
+            "a pin cancelled mid-copy removes its partial file"
+        );
     }
 
     fn attestation_fixture_executable() -> Option<PathBuf> {
@@ -2804,27 +3803,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn installed_v21220_binary_matches_the_approved_additive_hook_attestation() {
-        let Some(executable) = attestation_fixture_executable() else {
-            return;
-        };
-
-        assert!(
-            approved_additive_hook_build(&executable, "2.1.220").await,
-            "the locally installed, versioned Claude build must match its reviewed fingerprint and source-semantic markers"
-        );
-    }
-
-    #[tokio::test]
-    async fn installed_v21220_probe_and_per_launch_attestation_fit_preparation_budget() {
+    async fn installed_claude_build_is_approved_and_fits_the_preparation_budget() {
         let Some(executable) = attestation_fixture_executable() else {
             return;
         };
         let probe = CachedClaudeCapabilityProbe::new(Arc::new(
             SystemClaudeCapabilityProbeRunner::default(),
         ));
+        let started = std::time::Instant::now();
+        sha256_file(&executable).expect("installed digest");
+        eprintln!("installed Claude SHA-256: {:?}", started.elapsed());
 
-        for phase in ["cold", "cached-capabilities"] {
+        for phase in ["cold", "proven-build"] {
             let started = std::time::Instant::now();
             let capabilities =
                 tokio::time::timeout(CLAUDE_PREPARATION_BUDGET, probe.probe(&executable))
@@ -2833,10 +3823,179 @@ mod tests {
                         panic!("{phase} installed probe exceeded {CLAUDE_PREPARATION_BUDGET:?}")
                     })
                     .unwrap_or_else(|| panic!("{phase} installed probe failed"));
-            assert!(capabilities.additive_hook_merge);
             assert!(
-                started.elapsed() < CLAUDE_PREPARATION_BUDGET,
+                capabilities.additive_hook_merge,
+                "{phase}: the installed build {} must be approved",
+                capabilities.version
+            );
+            let elapsed = started.elapsed();
+            eprintln!("installed Claude {phase} preparation probe: {elapsed:?}");
+            assert!(
+                elapsed < CLAUDE_PREPARATION_BUDGET,
                 "{phase} installed preparation exceeded {CLAUDE_PREPARATION_BUDGET:?}"
+            );
+        }
+    }
+
+    /// The release-time proof behind `MAX_ADDITIVE_HOOK_VERSION`: with BiBCode's real overlay
+    /// injected through `--settings`, a project `PreToolUse` guard still blocks a tool call and
+    /// BiBCode's own hooks still arrive. It runs the Claude build named by
+    /// `BIBCODE_CLAUDE_MERGE_PROOF` once, signed in, and costs one short Haiku turn:
+    ///
+    /// `BIBCODE_CLAUDE_MERGE_PROOF=~/.local/share/claude/versions/<v> cargo test -p bibcode-server
+    /// --lib live_user_pre_tool_use_guard -- --ignored --nocapture`
+    #[ignore = "runs a signed-in Claude build; a release step in docs/operations/release.md"]
+    #[tokio::test]
+    async fn live_user_pre_tool_use_guard_still_blocks_with_the_bibcode_overlay() {
+        use std::{
+            io::{Read as _, Write as _},
+            os::unix::fs::PermissionsExt,
+        };
+
+        let Some(executable) = std::env::var_os("BIBCODE_CLAUDE_MERGE_PROOF").map(PathBuf::from)
+        else {
+            panic!("set BIBCODE_CLAUDE_MERGE_PROOF to the Claude build to prove");
+        };
+        let project = tempfile::tempdir().expect("proof project");
+        let project_path = std::fs::canonicalize(project.path()).expect("canonical project");
+        let guard_marker = project_path.join("guard-ran");
+        let tool_marker = project_path.join("tool-ran");
+        let guard = project_path.join("guard.sh");
+        std::fs::write(
+            &guard,
+            format!(
+                "#!/bin/sh\ncat >/dev/null\ntouch '{}'\necho 'blocked by the merge proof guard' >&2\nexit 2\n",
+                guard_marker.display()
+            ),
+        )
+        .expect("guard script");
+        std::fs::set_permissions(&guard, std::fs::Permissions::from_mode(0o700))
+            .expect("guard mode");
+        std::fs::create_dir_all(project_path.join(".claude")).expect("project settings dir");
+        std::fs::write(
+            project_path.join(".claude/settings.json"),
+            serde_json::to_vec(&json!({
+                "hooks": {
+                    "PreToolUse": [{
+                        "matcher": "Bash",
+                        "hooks": [{ "type": "command", "command": guard }],
+                    }],
+                },
+            }))
+            .expect("project settings JSON"),
+        )
+        .expect("project settings");
+
+        // BiBCode's side: its real overlay, pointed at a loopback sink that records event names.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("hook sink");
+        listener.set_nonblocking(true).expect("nonblocking sink");
+        let endpoint = format!(
+            "http://{}/claude-hook",
+            listener.local_addr().expect("sink address")
+        );
+        let events = Arc::new(Mutex::new(Vec::<String>::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let sink = {
+            let events = events.clone();
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Acquire) {
+                    let Ok((mut stream, _)) = listener.accept() else {
+                        std::thread::sleep(Duration::from_millis(10));
+                        continue;
+                    };
+                    let _ = stream.set_nonblocking(false);
+                    let mut request = Vec::new();
+                    let mut buffer = [0_u8; 8192];
+                    let body = loop {
+                        let Ok(read) = stream.read(&mut buffer) else {
+                            break None;
+                        };
+                        if read == 0 {
+                            break None;
+                        }
+                        request.extend_from_slice(&buffer[..read]);
+                        let text = String::from_utf8_lossy(&request).into_owned();
+                        let Some((head, body)) = text.split_once("\r\n\r\n") else {
+                            continue;
+                        };
+                        let length = head
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().ok())?
+                            })
+                            .unwrap_or(0);
+                        if body.len() >= length {
+                            break Some(body.to_owned());
+                        }
+                    };
+                    if let Some(event) = body
+                        .and_then(|body| serde_json::from_str::<Value>(&body).ok())
+                        .and_then(|hook| hook["hook_event_name"].as_str().map(str::to_owned))
+                    {
+                        events.lock().expect("events lock").push(event);
+                    }
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                }
+            })
+        };
+        let overlay_path = project_path.join("bibcode-overlay.json");
+        std::fs::write(
+            &overlay_path,
+            serde_json::to_vec(&claude_hook_settings(&endpoint, "proof-token", "proof"))
+                .expect("overlay JSON"),
+        )
+        .expect("overlay");
+
+        let mut command = tokio::process::Command::new(&executable);
+        command
+            .current_dir(&project_path)
+            .arg("-p")
+            .arg(format!(
+                "Run exactly this shell command with the Bash tool: touch '{}'. Do not run anything else. Then reply DONE.",
+                tool_marker.display()
+            ))
+            .arg("--model")
+            .arg("haiku")
+            .arg("--max-turns")
+            .arg("3")
+            .arg("--allowedTools")
+            .arg("Bash")
+            .arg("--settings")
+            .arg(&overlay_path)
+            .stdin(Stdio::null())
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(Duration::from_secs(180), command.output())
+            .await
+            .expect("the proof run finishes")
+            .expect("the proof run starts");
+        stop.store(true, Ordering::Release);
+        sink.join().expect("hook sink");
+        let events = events.lock().expect("events lock").clone();
+        eprintln!(
+            "proof run: status {:?}, BiBCode hook events {events:?}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout)
+        );
+
+        assert!(
+            guard_marker.exists(),
+            "the user's PreToolUse guard must run with BiBCode's overlay injected"
+        );
+        assert!(
+            !tool_marker.exists(),
+            "the user's guard must still block the tool call"
+        );
+        // A `-p` run delivers no HTTP `SessionStart` (2.1.312); the prompt and tool hooks
+        // prove BiBCode's side of the merge.
+        for expected in ["UserPromptSubmit", "PreToolUse"] {
+            assert!(
+                events.iter().any(|event| event == expected),
+                "BiBCode's own {expected} hook must still arrive: {events:?}"
             );
         }
     }
