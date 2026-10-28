@@ -1231,21 +1231,17 @@ async function typeThroughDropAndSend(input: TypeThroughDropInput): Promise<void
     { timeout: 30_000, timeoutMsg: "Send did not come back after the connection returned." },
   );
   // Reconnecting keeps the text and does not send it.
-  await browser.pause(1_500);
   expect(await composerEditor().getText()).toBe(input.text);
   expect(readProviderInputLog(preparedProviderInputLogPath).slice(logBaseline)).toEqual([]);
 
+  // The explicit Send is the only delivery: the wait fails on a second appended input
+  // (a resend on reconnect would be one) at any point in its 1.5 s settle.
   await clickSendWhenLive();
   await waitForProviderInputLogEntry(
     preparedProviderInputLogPath,
     logBaseline,
     { provider: "codex", prompt: input.text },
-    { timeoutMs: 20_000 },
+    { timeoutMs: 20_000, settleMs: 1_500 },
   );
-  await browser.pause(1_500);
-  const delivered = readProviderInputLog(preparedProviderInputLogPath)
-    .slice(logBaseline)
-    .map(({ prompt }) => prompt);
-  expect(delivered).toEqual([input.text]);
   await waitForComposerValue("");
 }

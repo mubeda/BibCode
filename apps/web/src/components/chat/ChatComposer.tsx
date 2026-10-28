@@ -758,6 +758,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     ? describeUnavailableEnvironment(environmentUnavailable).title
     : null;
   const sendBlockedReason = providerBindingConflictReason ?? environmentSendBlockedReason;
+  const isEnvironmentUnavailable = environmentUnavailable !== null;
   const terminalOpen = useThreadHasTerminalSurface(routeThreadRef);
 
   // ------------------------------------------------------------------
@@ -1853,7 +1854,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     if (!isMobileViewport) return false;
     if (isSendBusy || isConnecting || phase === "running") return false;
     // A refused send keeps focus and the visible draft.
-    if (environmentUnavailable !== null) return false;
+    if (isEnvironmentUnavailable) return false;
     if (activePendingProgress) {
       return activePendingProgress.isLastQuestion && Boolean(activePendingResolvedAnswers);
     }
@@ -1862,7 +1863,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     activePendingProgress,
     activePendingResolvedAnswers,
     composerSendState.hasSendableContent,
-    environmentUnavailable,
+    isEnvironmentUnavailable,
     isConnecting,
     isMobileViewport,
     isSendBusy,
