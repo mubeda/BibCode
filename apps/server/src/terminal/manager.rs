@@ -2896,7 +2896,7 @@ impl TerminalManager {
                 .is_some_and(|status| status != SessionAgentStatus::Unavailable)
             {
                 session.agent_status = Some(SessionAgentStatus::Exited {
-                    failed: exit.exit_code.is_some_and(|code| code != 0),
+                    failed: agent_exit_failed(&exit),
                 });
             }
             let sequence = session.advance();
@@ -4367,9 +4367,40 @@ fn now_iso() -> String {
         .unwrap_or_else(|_| OffsetDateTime::now_utc().unix_timestamp().to_string())
 }
 
+/// Whether an AI Terminal agent's exit reads as failed (#187). Quitting it with Ctrl+C (exit
+/// code 130, SIGINT, or Windows' control-C exit status) is the user's choice, not a failure.
+fn agent_exit_failed(exit: &PtyExit) -> bool {
+    const SIGINT: i32 = 2;
+    const SIGINT_EXIT_CODE: i32 = 128 + SIGINT;
+    // STATUS_CONTROL_C_EXIT, 0xC000013A, as the signed exit code Windows reports.
+    const WINDOWS_CONTROL_C_EXIT: i32 = 0xC000_013A_u32 as i32;
+    if exit.signal == Some(SIGINT) {
+        return false;
+    }
+    exit.exit_code
+        .is_some_and(|code| !matches!(code, 0 | SIGINT_EXIT_CODE | WINDOWS_CONTROL_C_EXIT))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_agent_quit_with_control_c_has_not_failed() {
+        let exit = |exit_code, signal| PtyExit { exit_code, signal };
+        assert!(!agent_exit_failed(&exit(Some(0), None)));
+        assert!(agent_exit_failed(&exit(Some(1), None)));
+        assert!(!agent_exit_failed(&exit(Some(130), None)), "Ctrl+C");
+        assert!(!agent_exit_failed(&exit(None, Some(2))), "SIGINT");
+        assert!(
+            !agent_exit_failed(&exit(Some(-1_073_741_510), None)),
+            "Windows Ctrl+C"
+        );
+        assert!(
+            !agent_exit_failed(&exit(None, Some(9))),
+            "a signal reports no failure code"
+        );
+    }
     use crate::diagnostics::{
         AttributionKind, AttributionScope, ProcessAttributionRegistry, ProcessRow,
     };
