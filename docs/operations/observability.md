@@ -245,9 +245,13 @@ command asks this host's own server, which hands the request to the app:
    server announces the request only to the desktop app's own session (the one
    minted from the desktop bootstrap), never to another paired device, however
    broad its scopes. With no such window subscribed, the command fails at once.
-   One request runs at a time. After a denied or unanswered request, the next
-   waits 30 s, doubling with each refusal in a row up to 5 minutes; a saved
-   archive clears the wait.
+   One request runs at a time. After a denied or unanswered request, or one
+   whose command left before anyone answered, the next waits 30 s, doubling
+   with each refusal in a row up to 5 minutes; a saved archive clears the wait.
+   The server refuses a request whose environment or directory is blank, too
+   long, or holds a control or Unicode format character (bidirectional
+   overrides and isolates, zero-width characters); the environment is shown
+   exactly as typed and trimmed only to look it up.
 3. The app resolves the name (an id, or a label exactly one environment has).
    An unknown, ambiguous or disconnected name is answered without a prompt,
    naming only what was asked for, never the environments the app can reach.
@@ -275,11 +279,14 @@ server version, as the manifest the app checked. The name must have the
 archive's shape (no path separator, no leading dot, ending in `.zip`) and the
 byte count must match. The archive is written and synced to a hidden
 `.<name>.<code>.partial` file in the output directory, then published under its
-name with a hard link, which never replaces an existing file (a filesystem
-without hard links gets an exclusive create instead), and the temporary file is
-removed; an interrupted run can leave only that temporary file, never a partial
-archive under the real name. Text from the app or the remote server is printed
-without control characters. The local server logs each request's id and outcome
+name with a hard link, which never replaces an existing file, and the temporary
+file is removed; a taken temporary name is skipped, never removed. On a
+filesystem without hard links the command saves nothing and says to choose a
+local `--output`, since no other publish is safe against a partial file. An
+interrupted run can leave only the temporary file, never a partial archive
+under the real name. The command waits at most 30 s for the server's response
+headers or an error body. Text from the app or the remote server is printed
+without control or format characters. The local server logs each request's id and outcome
 (waiting, claimed, answered, the command left, or the reason it ended), never
 the token, the environment name, or archive bytes.
 
