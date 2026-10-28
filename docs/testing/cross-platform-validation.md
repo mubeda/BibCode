@@ -611,6 +611,34 @@ is the packaged check that unsent text survives draft promotion. To run the
 scenario alone, set `BIBCODE_E2E_SPEC=./specs/composer-native-triggers.e2e.ts`
 in the same way.
 
+The spec's third scenario types into the primary chat one key at a time. It
+types through a window `offline` event, then through a lost RPC socket that its
+page harness keeps failing until it lets the retry through. In both drops:
+
+- every key is on screen and in the thread's single environment-scoped persisted
+  draft after the 300 ms write debounce;
+- Send is disabled and its label names the state the composer banner shows;
+- Enter raises a toast with the same words and keeps focus and text;
+- nothing reaches the provider before an explicit Send after the reconnect;
+- that Send delivers the whole text exactly once.
+
+Keep these assertions. They are the packaged check that a connection phase never
+drops typing (#199). The collapsed mobile composer cannot render in the desktop
+app, whose window is at least 960 px wide, so its refusal is covered by
+ChatComposer component tests.
+
+When `waitForComposerValue` times out, the spec writes
+`composer-value-timeout-<n>.json`. It records the editor's text, editable state
+and focus, the Send label, the toasts, `navigator.onLine`, the route, and the
+persisted drafts. Retain it with the failure screenshot.
+
+The manual loop `apps/desktop/e2e/specs/manual/composer-connection-drop.e2e.ts`
+(not in the default list) repeats offline, lost-socket and no-drop arms around
+typing. It writes a timestamped recorder log per run to
+`composer-drop-runs.jsonl`. It reproduced the #199 mechanism on macOS arm64 on
+the old composer. What closed the macOS x64 runner's connection in that CI run
+is not known.
+
 The packaged scenario must show two Queued cards in FIFO order below the working
 row while the provider log still contains only the initial start. Steer the head
 and verify exactly one `kind: "steer"` log entry for its text and the original

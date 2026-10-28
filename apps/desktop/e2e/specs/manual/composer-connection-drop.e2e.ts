@@ -171,10 +171,14 @@ async function installRecorder(threadId: string): Promise<void> {
         const parsed = JSON.parse(raw) as {
           state?: { draftsByThreadKey?: Record<string, { prompt?: string }> };
         };
-        const entry = Object.entries(parsed.state?.draftsByThreadKey ?? {}).find(([key]) =>
-          key.endsWith(`:${threadId}`),
+        // Every environment-scoped key for this thread id, so a second environment's draft
+        // shows up instead of standing in for this one.
+        const entries = Object.entries(parsed.state?.draftsByThreadKey ?? {}).filter(
+          ([key]) => key.indexOf(":") > 0 && key.slice(key.indexOf(":") + 1) === threadId,
         );
-        return entry ? (entry[1].prompt ?? "") : null;
+        if (entries.length === 0) return null;
+        if (entries.length === 1) return entries[0]![1].prompt ?? "";
+        return entries.map(([key, entry]) => `${key}=${entry.prompt ?? ""}`).join(" | ");
       } catch {
         return "<unreadable>";
       }

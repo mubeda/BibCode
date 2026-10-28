@@ -329,3 +329,21 @@ before implementing.** The note covers:
 
 - Webview console log collection in the harness.
 - Re-running the CI matrix (no pushes from this batch).
+
+## Outcome (phase 2, approved design)
+
+- **Mechanism fixed; the Intel trigger is still unidentified.** A connection phase no
+  longer makes the composer read-only.
+- **Every server-bound path refuses and names the banner's state:** Send, the
+  collapsed mobile Send, Enter, approvals, question answers and the timed advance.
+- **The draft, the question and its answers stay.** A refused mobile send keeps focus.
+  Nothing is sent on reconnect, and an in-flight send that fails restores through
+  `restoreOutgoing`.
+- **Packaged proof:** the third case of `composer-native-triggers` types through an
+  offline event and through a lost socket. It passed 2/2 on macOS arm64, and
+  `composer-message-queue` passed 1/1.
+- **Not verified:**
+  - macOS x64: no x64 runner here.
+  - The collapsed mobile composer inside the packaged app: the window is at least
+    960 px wide, so component tests cover it.
+- **Skipped as instructed:** the CPU-load trigger loop.
