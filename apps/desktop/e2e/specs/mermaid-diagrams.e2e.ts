@@ -943,23 +943,7 @@ describe("packaged Mermaid diagrams", () => {
       { timeoutMsg: "The second 101 diagrams never drew.", timeout: 240_000, interval: 1_000 },
     );
     await expectPaintingWebview();
-    await browser.waitUntil(
-      () =>
-        browser.execute(
-          (surface: string, diagramLabel: string) => {
-            const scroller = document.querySelector<HTMLElement>(
-              `${surface} [class*='overflow-anchor']`,
-            );
-            if (scroller) scroller.scrollTop = scroller.scrollHeight;
-            return ![
-              ...document.querySelectorAll<HTMLElement>(`${surface} .chat-markdown-codeblock`),
-            ].some((element) => element.textContent?.includes(diagramLabel));
-          },
-          visibleSurfaceSelector,
-          "Fixture draw",
-        ),
-      { timeoutMsg: "The rows reply's diagram never unmounted.", timeout: 15_000, interval: 500 },
-    );
+    await waitForRowsReplyUnmount({ width: 1_400, height: 900 }, "Fixture draw");
     await startReadingLineSamples(mermaidFixturePrompts.long, "Fixture draw");
     for (let step = 0; ; step += 1) {
       // Two replies of 101 diagrams lie between the end and the rows reply.
@@ -1626,6 +1610,106 @@ describe("packaged Mermaid diagrams", () => {
     await scrollTimelineToEnd(lastLine);
   }).timeout(120_000);
 });
+
+/** What the list holds while the cold-draw case waits for the rows reply's row to unmount. */
+interface UnmountWaitState {
+  readonly unmounted: boolean;
+  readonly viewport: { readonly width: number; readonly height: number };
+  readonly screen: { readonly width: number; readonly height: number };
+  readonly scroll: { readonly top: number; readonly height: number; readonly client: number };
+  /** The mounted rows, in screen order: id tail, kind, top below the visible top, height. */
+  readonly rows: ReadonlyArray<{
+    readonly id: string;
+    readonly kind: string | null;
+    readonly top: number;
+    readonly height: number;
+    readonly holdsLabel: boolean;
+  }>;
+  /** LegendList's positioned containers, mounted or empty. */
+  readonly containers: number;
+}
+
+/**
+ * Scrolls the timeline to its end until the row holding `diagramLabel` unmounts, as the
+ * cold-draw case needs. On a timeout the failure, and `mermaid-timeline-unmount-wait.json`,
+ * say what the list still held: the mounted rows, LegendList's container count, the scroll
+ * metrics, and the viewport against the size the case asked for, which a small screen caps.
+ */
+async function waitForRowsReplyUnmount(
+  requested: { readonly width: number; readonly height: number },
+  diagramLabel: string,
+): Promise<void> {
+  const read = () =>
+    browser.execute(
+      (surface: string, label: string): UnmountWaitState => {
+        const scroller = document.querySelector<HTMLElement>(
+          `${surface} [class*='overflow-anchor']`,
+        );
+        if (scroller) scroller.scrollTop = scroller.scrollHeight;
+        const area = scroller?.getBoundingClientRect();
+        const rows = [
+          ...document.querySelectorAll<HTMLElement>(`${surface} [data-timeline-row-id]`),
+        ]
+          .map((row) => {
+            const box = row.getBoundingClientRect();
+            return {
+              id: (row.getAttribute("data-timeline-row-id") ?? "").slice(-12),
+              kind: row.getAttribute("data-timeline-row-kind"),
+              top: Math.round(box.top - (area?.top ?? 0)),
+              height: Math.round(box.height),
+              holdsLabel: [...row.querySelectorAll(".chat-markdown-codeblock")].some((block) =>
+                block.textContent?.includes(label),
+              ),
+            };
+          })
+          .sort((a, b) => a.top - b.top);
+        const containers = new Set(
+          [...document.querySelectorAll<HTMLElement>(`${surface} [data-timeline-root]`)].map(
+            (root) => root.parentElement,
+          ),
+        ).size;
+        return {
+          unmounted: !rows.some((row) => row.holdsLabel),
+          viewport: { width: window.innerWidth, height: window.innerHeight },
+          screen: { width: screen.availWidth, height: screen.availHeight },
+          scroll: {
+            top: Math.round(scroller?.scrollTop ?? -1),
+            height: Math.round(scroller?.scrollHeight ?? -1),
+            client: Math.round(scroller?.clientHeight ?? -1),
+          },
+          rows,
+          containers,
+        };
+      },
+      visibleSurfaceSelector,
+      diagramLabel,
+    );
+  // About 15 s: 30 readings 500 ms apart.
+  let last: UnmountWaitState | null = null;
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    last = await read();
+    if (last.unmounted) return;
+    await browser.pause(500);
+  }
+  NodeFS.writeFileSync(
+    NodePath.join(preparedArtifactDirectory, "mermaid-timeline-unmount-wait.json"),
+    JSON.stringify({ requested, last }, null, 2),
+  );
+  const state = last!;
+  const smaller =
+    state.viewport.width < requested.width || state.viewport.height < requested.height
+      ? ` The window came up at ${state.viewport.width}x${state.viewport.height}, smaller than the ` +
+        `requested ${requested.width}x${requested.height} (screen ${state.screen.width}x${state.screen.height}).`
+      : "";
+  const labelRow = state.rows.find((row) => row.holdsLabel);
+  throw new Error(
+    `The rows reply's diagram never unmounted.${smaller} The list still held ${state.rows.length} ` +
+      `rows in ${state.containers} containers, the rows reply's at ${labelRow?.top ?? "?"} px below ` +
+      `the visible top (scrollTop ${state.scroll.top}, scrollHeight ${state.scroll.height}, ` +
+      `clientHeight ${state.scroll.client}); mounted rows: ${JSON.stringify(state.rows)}. ` +
+      `See mermaid-timeline-unmount-wait.json.`,
+  );
+}
 
 /**
  * Samples the timeline after each painted frame for the keyboard case, and counts the keydowns

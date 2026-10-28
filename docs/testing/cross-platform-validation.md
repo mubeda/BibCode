@@ -3391,7 +3391,11 @@ after each painted frame, as `mermaid-timeline-evicted-remount.json`. A second
 reply of 101 diagrams then evicts every earlier one; scrolling up remounts the
 rows reply, whose diagram shows its source and draws again above the message
 being read, which stays within 1 px on every painted frame
-(`mermaid-timeline-cold-draw.json`). Last, the fixture provider streams the
+(`mermaid-timeline-cold-draw.json`). The case first waits up to 15 s, at
+the end, for the rows reply's row to unmount; if it does not, the failure and
+`mermaid-timeline-unmount-wait.json` list the mounted rows, LegendList's
+container count, the scroll metrics and the viewport, and say when the window
+came up smaller than the 1400×900 the case asks for. Last, the fixture provider streams the
 same reply twice, one delta every 300 ms, first with the diagram's source in a
 plain code block and then as a sequence diagram, the scenario's only one, whose
 chunk loads after its source shows, so it replaces the source at the end while
