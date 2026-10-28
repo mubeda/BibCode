@@ -15,8 +15,9 @@ import { Button } from "~/components/ui/button";
 import { Spinner } from "~/components/ui/spinner";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "~/components/ui/tooltip";
 import {
-  activityElapsedLabel,
+  activityRecordTimeLabel,
   activityStatusLabel,
+  activityStopUnavailableReason,
   compareActivityTimestamps,
   isActivityLifecycleActive,
 } from "./activityPresentation";
@@ -289,13 +290,6 @@ function renderProviderIcon(provider: string, className: string) {
   return <ProviderIcon aria-hidden="true" className={className} />;
 }
 
-function recordTime(record: ActivityRecordSummary, now: string): string {
-  if (isActivityLifecycleActive(record.status) || record.terminalAt === null) {
-    return `Elapsed ${activityElapsedLabel(record.startedAt, now)}`;
-  }
-  return `Completed in ${activityElapsedLabel(record.startedAt, record.terminalAt)}`;
-}
-
 interface ActivityRecordRowProps {
   readonly record: ActivityRecordSummary;
   readonly depth: number;
@@ -390,17 +384,26 @@ function ActivityRecordRow({
             {record._tag === "actor" && record.parentActorId !== null ? (
               <span>Child agent</span>
             ) : null}
-            <span>{recordTime(record, now)}</span>
+            <span>{activityRecordTimeLabel(record, now)}</span>
           </span>
         </span>
       </Button>
       {controlUnavailable ? (
-        <span
-          className="mt-2 shrink-0 whitespace-nowrap text-xs text-muted-foreground"
-          data-activity-control-unavailable={record.id}
-        >
-          Stop unavailable
-        </span>
+        <Tooltip>
+          <TooltipTrigger
+            render={
+              <span
+                className="mt-2 shrink-0 whitespace-nowrap text-xs text-muted-foreground"
+                data-activity-control-unavailable={record.id}
+                tabIndex={0}
+              />
+            }
+          >
+            Stop unavailable
+            <span className="sr-only">. {activityStopUnavailableReason(recordProvider)}</span>
+          </TooltipTrigger>
+          <TooltipPopup>{activityStopUnavailableReason(recordProvider)}</TooltipPopup>
+        </Tooltip>
       ) : stopImpactLabel === null || control === null || onCancelActor === undefined ? null : (
         <Tooltip>
           <TooltipTrigger

@@ -8654,10 +8654,14 @@ async fn assert_capability_downgrade_preserves_history(history: RetainedActivity
     let snapshot = activity.snapshot(&scope).await.unwrap();
     assert_eq!(snapshot.capabilities, ActivityCapabilities::none());
     assert_eq!(snapshot.observation_state, ActivityObservationState::Live);
+    // The restart ended the process that ran it (#206): the history stays, closed.
     match history {
         RetainedActivityHistory::Actor => {
-            assert_eq!(snapshot.counts.subagents.active, 1);
-            assert!(snapshot.actors.iter().any(|actor| actor.id == record_id));
+            assert_eq!(snapshot.counts.subagents.active, 0);
+            assert_eq!(snapshot.counts.subagents.done, 1);
+            assert!(snapshot.actors.iter().any(
+                |actor| actor.id == record_id && actor.status == ActivityLifecycle::Interrupted
+            ));
             assert_eq!(
                 snapshot.sections.subagents.state,
                 ActivitySectionObservationState::Stale
@@ -8668,12 +8672,14 @@ async fn assert_capability_downgrade_preserves_history(history: RetainedActivity
             );
         }
         RetainedActivityHistory::WorkItem => {
-            assert_eq!(snapshot.counts.background_tasks.active, 1);
+            assert_eq!(snapshot.counts.background_tasks.active, 0);
+            assert_eq!(snapshot.counts.background_tasks.done, 1);
             assert!(
                 snapshot
                     .work_items
                     .iter()
-                    .any(|work_item| work_item.id == record_id)
+                    .any(|work_item| work_item.id == record_id
+                        && work_item.status == ActivityLifecycle::Interrupted)
             );
             assert_eq!(
                 snapshot.sections.background_tasks.state,
@@ -15486,14 +15492,25 @@ async fn a_hookless_restart_while_chat_activity_is_off_shows_no_live_subagents_o
     assert_a_hookless_restart_stops_reporting_live_subagents(true).await;
 }
 
+/// A Claude chat behind a mise shim whose subagent `agent-shim` is running, reported through the
+/// real hook sink.
 #[cfg(unix)]
-async fn assert_a_hookless_restart_stops_reporting_live_subagents(
-    activity_off_during_restart: bool,
-) {
+struct LiveClaudeSubagent {
+    state: TempDir,
+    shim: MultiCallShim,
+    handle: bibcode_server::ServerHandle,
+    socket: WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    snapshot_request: Value,
+}
+
+#[cfg(unix)]
+async fn start_live_claude_subagent(
+    configure: impl FnOnce(ServerConfig) -> ServerConfig,
+) -> LiveClaudeSubagent {
     let state = TempDir::new().expect("state");
     let shim = MultiCallShim::new(&state, "2026.10.19 linux-x64 (2026-10-19)");
     let workspace = shim.project(&state, "workspace", true);
-    let config = test_config(&state);
+    let config = configure(test_config(&state));
     hermetic_providers::write_hermetic_settings(
         &config.state_dir(),
         json!({
@@ -15602,6 +15619,26 @@ async fn assert_a_hookless_restart_stops_reporting_live_subagents(
     .await;
     assert_eq!(live["capabilities"]["actors"], true, "{live}");
     assert_eq!(live["sections"]["subagents"]["state"], "live", "{live}");
+    LiveClaudeSubagent {
+        state,
+        shim,
+        handle,
+        socket,
+        snapshot_request,
+    }
+}
+
+#[cfg(unix)]
+async fn assert_a_hookless_restart_stops_reporting_live_subagents(
+    activity_off_during_restart: bool,
+) {
+    let LiveClaudeSubagent {
+        state: _state,
+        shim,
+        handle,
+        mut socket,
+        snapshot_request,
+    } = start_live_claude_subagent(|config| config).await;
 
     if activity_off_during_restart {
         set_chat_activity(&mut socket, "9551", false).await;
@@ -15662,11 +15699,66 @@ async fn assert_a_hookless_restart_stops_reporting_live_subagents(
             stale["actors"][0]["id"], "claude:agent:agent-shim",
             "{stale}"
         );
+        // The restart ended the process that ran it (#206): it is closed, not left running
+        // under a section nothing reports any more.
+        assert_eq!(stale["actors"][0]["status"], "interrupted", "{stale}");
+        assert_eq!(
+            stale["actors"][0]["updatedAt"], stale["actors"][0]["terminalAt"],
+            "{stale}"
+        );
+        assert!(
+            stale["actors"][0]["summary"]
+                .as_str()
+                .is_some_and(|summary| summary
+                    .starts_with("Claude session ended before this subagent reported;")),
+            "{stale}"
+        );
+        assert_eq!(stale["counts"]["subagents"]["active"], 0, "{stale}");
     }
 
     socket.close(None).await.expect("close WebSocket");
     handle.shutdown();
     handle.join().await.expect("RPC server joins");
+}
+
+/// An update's protection quiesces the runtime, which ends every live provider session (#206):
+/// a Claude subagent running at that moment is persisted `interrupted`, not left running.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn update_protection_closes_a_live_claude_subagent() {
+    let live = start_live_claude_subagent(|config| {
+        config
+            .with_desktop("quiesce-bootstrap")
+            .expect("desktop config")
+    })
+    .await;
+    let database_path = ServerConfig::new(live.state.path()).database_path();
+    let maintenance = live
+        .handle
+        .update_maintenance()
+        .expect("a desktop runtime owns update maintenance");
+    let prepared = timeout(Duration::from_secs(45), maintenance.prepare())
+        .await
+        .expect("prepare stays within its bound")
+        .expect("prepare succeeds");
+    let status: String = rusqlite::Connection::open(&database_path)
+        .expect("state database")
+        .query_row(
+            "SELECT status FROM activity_records WHERE record_id = 'claude:agent:agent-shim'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("subagent record");
+    assert_eq!(status, "interrupted");
+    maintenance
+        .cancel(uuid::Uuid::parse_str(&prepared.operation_id).expect("operation id"))
+        .await
+        .expect("cancel");
+    maintenance.shutdown_after_response();
+    timeout(Duration::from_secs(5), live.handle.wait_for_shutdown())
+        .await
+        .expect("cancel exits");
+    live.handle.join().await.expect("runtime joins");
 }
 
 /// Turns Chat Activity on or off as the Settings switch does.

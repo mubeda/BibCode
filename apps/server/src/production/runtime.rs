@@ -69,8 +69,9 @@ use crate::{
         pipelines_rpc::{PipelinesRpcServices, register_pipelines_rpc},
         provider_runtime::{
             NativeProviderDriverFactory, ProviderRuntimeSupervisor, SupervisorOptions,
-            drive_thread_compaction, prepare_thread_rewind, reconcile_abandoned_provider_sessions,
-            rewind_thread_conversation,
+            drive_thread_compaction, interrupt_activity_of_ended_sessions, prepare_thread_rewind,
+            reconcile_abandoned_provider_sessions, rewind_thread_conversation,
+            startup_process_ownership,
         },
         pull_requests_rpc::{PullRequestsRpcServices, register_pull_requests_rpc},
         relay::relay_client_service,
@@ -355,11 +356,23 @@ impl ProductionRuntime {
             .interrupt_unresolved_terminal_scopes()
             .await
             .map_err(|error| error.to_string())?;
+        // Before abandoned sessions settle, while their runtime rows still say who ran them. One
+        // ownership rule decides both what this closes and what request expiry keeps.
+        let process_ownership = startup_process_ownership(
+            &repositories,
+            control.opencode_instances_with_server_url().await,
+        )
+        .await;
+        interrupt_activity_of_ended_sessions(&process_ownership, &activity_projections.chat())
+            .await;
         reconcile_abandoned_provider_sessions(&orchestration)
             .await
             .map_err(|error| error.to_string())?;
         // No provider session is live yet: a request still open now waits on nobody (#187).
-        match orchestration.expire_requests_of_settled_sessions().await {
+        match orchestration
+            .expire_requests_of_settled_sessions(&process_ownership)
+            .await
+        {
             Ok(0) => {}
             Ok(expired) => tracing::info!(expired, "expired requests of settled sessions"),
             Err(error) => {
@@ -2888,12 +2901,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn startup_interrupts_only_unresolved_terminal_activity() {
+    async fn startup_interrupts_unresolved_terminal_and_owned_chat_activity() {
         let state = TempDir::new().expect("temporary state directory");
         let config = ServerConfig::new(state.path()).with_bind("127.0.0.1", 0);
         hermetic_providers::write_hermetic_settings(
             &config.state_dir(),
-            json!({"enableChatAgentActivity": true, "enableTerminalAgentActivity": true}),
+            json!({
+                "enableChatAgentActivity": true,
+                "enableTerminalAgentActivity": true,
+                // OpenCode runs on a server the user runs, so its work may outlive BiBCode.
+                "providers": {"opencode": {"serverUrl": "http://127.0.0.1:9"}}
+            }),
         );
         let database = Database::open_in_memory().await.expect("database");
         database
@@ -2922,6 +2940,19 @@ mod tests {
             ActivityCapabilities::structured_full(false),
         )
         .expect("thread scope");
+        // No runtime row proves BiBCode ran this OpenCode server, so its work may still run.
+        let external_scope = ActivityScopeSeed::thread(
+            "thread:restart-external",
+            "thread-restart-external",
+            "opencode",
+            Some("opencode"),
+            ActivityCapabilities::structured_full(false),
+        )
+        .expect("external scope");
+        projection
+            .ensure_scope(external_scope.clone())
+            .await
+            .expect("external scope persistence");
         projection
             .ensure_scope(terminal_scope.clone())
             .await
@@ -2972,6 +3003,23 @@ mod tests {
             )
             .await
             .expect("thread activity persistence");
+        projection
+            .apply(
+                &external_scope.scope_id,
+                "external:restart-fixture".to_owned(),
+                vec![
+                    ProviderActivityMutation::upsert_actor(
+                        "external-active",
+                        None,
+                        "External active",
+                        "running",
+                    )
+                    .expect("external active actor"),
+                ],
+                now_iso(),
+            )
+            .await
+            .expect("external activity persistence");
 
         let runtime = ProductionRuntime::start(
             &config,
@@ -3025,6 +3073,37 @@ mod tests {
                 .find(|actor| actor.id == "thread-active")
                 .expect("thread active actor")
                 .status,
+            ActivityLifecycle::Interrupted
+        );
+        let thread_active = thread_snapshot
+            .actors
+            .iter()
+            .find(|actor| actor.id == "thread-active")
+            .expect("thread active actor");
+        assert_eq!(
+            Some(&thread_active.updated_at),
+            thread_active.terminal_at.as_ref()
+        );
+        assert!(
+            thread_active
+                .summary
+                .as_deref()
+                .is_some_and(|summary| summary
+                    .starts_with("BiBCode restarted before this subagent reported;")),
+            "{:?}",
+            thread_active.summary
+        );
+        assert_eq!(thread_snapshot.counts.subagents.active, 0);
+        let external_snapshot = runtime
+            .activity_projections
+            .chat()
+            .snapshot(&ActivityScopeRef::Thread {
+                thread_id: "thread-restart-external".to_owned(),
+            })
+            .await
+            .expect("external snapshot");
+        assert_eq!(
+            external_snapshot.actors[0].status,
             ActivityLifecycle::Running
         );
         runtime.shutdown().await;

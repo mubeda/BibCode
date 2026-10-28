@@ -491,6 +491,36 @@ subagents show as stale. They do not stay
 live (see
 [Activity observation](../architecture/activity-observation.md)).
 
+### What ends a subagent
+
+Hooks reach BiBCode over HTTP with no retry. A hook the sink cannot take answers
+503 when its 128-entry channel is full, or 410 once the session is going away,
+and is lost. `server.log` counts such drops: the warning
+`dropped a Claude hook that BiBCode could not take in` names only the hook
+event and the running count, on the first drop and then each power of two.
+
+A Claude subagent ends in one of these ways:
+
+- **`SubagentStop`** completes it, with Claude's last message as its summary.
+- **`task_notification`** that stopped, failed or was interrupted closes it
+  with that state once its task is linked to the subagent. A notification that
+  arrives before the link is held until the link arrives.
+- **Turn end**: at the parent turn's `result`, a subagent whose task Claude
+  confirmed is closed as **Interrupted** when Claude's complete live set
+  (`background_tasks_changed`) no longer lists that task. Its summary starts
+  "Claude stopped listing this subagent as running". An overflowed set, or one
+  with a task BiBCode cannot name, proves nothing. A `SubagentStop` that arrives
+  afterwards still completes it.
+- **Process end**: when the Claude process that ran it is gone, its record
+  closes as **Interrupted**. Gone means stopped, removed, idle-suspended, shut
+  down for an update, restarted for a setting change, crashed, or a server that
+  restarted. The summary starts "Claude session ended before this subagent
+  reported", or "BiBCode restarted before this subagent reported" at startup.
+
+A subagent BiBCode cannot link to a task, such as a foreground one interrupted
+mid-call, therefore waits for the process to end. Idle suspension still ends a
+quiet process after 30 minutes without provider events.
+
 ## Thinking
 
 Claude's thinking shows in the chat as collapsed **Thought** rows, one per

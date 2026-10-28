@@ -4,6 +4,7 @@ import {
   desktopActivityFixture,
   desktopActivityFollowupTurnCommand,
   desktopActivitySessionCommands,
+  desktopActivitySessionStopCommand,
 } from "./activity-events.ts";
 
 export interface DesktopActivitySessionMaterialization {
@@ -335,6 +336,11 @@ export async function startDesktopActivityFollowupTurn(): Promise<void> {
 
 export async function startDesktopActivityComposerFollowupTurn(): Promise<void> {
   await dispatchDesktopActivityCommands([desktopActivityComposerFollowupTurnCommand()], null);
+}
+
+/** Stops the fixture chat's provider session through the same orchestration RPC. */
+export async function stopDesktopActivitySession(): Promise<void> {
+  await dispatchDesktopActivityCommands([desktopActivitySessionStopCommand()], null);
 }
 
 /**

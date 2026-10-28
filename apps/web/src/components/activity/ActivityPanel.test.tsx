@@ -401,7 +401,7 @@ describe("ActivityPanel roster", () => {
     expect(older.className).not.toContain("sm:h-8");
     expect(older.querySelectorAll('[data-activity-provider-glyph="claude"]')).toHaveLength(1);
     expect(older.querySelector('[data-activity-record-glyph="actor"]')).toBeNull();
-    expect(rows[2]?.textContent).toContain("Completed in 18m");
+    expect(rows[2]?.textContent).toContain("Failed after 18m");
 
     await act(async () => older.click());
     expect(onNavigate).toHaveBeenCalledWith({
@@ -1665,6 +1665,38 @@ describe("ActivityPanel detail", () => {
     });
     await rerender(container, <ActivityPanel {...propsWithoutNow} />);
     expect(container.textContent).toContain("No subagents observed");
+  });
+
+  it("labels an interrupted row by how long it ran without a clock, as the pane binding renders it", async () => {
+    // ActivityPaneBinding passes no `now`: the panel falls back to the snapshot's own time, so a
+    // label counting from the current time would read "0s ago" forever (#206).
+    const interrupted = actor("interrupted-child", {
+      status: "interrupted",
+      summary:
+        "Codex session ended before this subagent reported; last report 34m after it started.",
+      startedAt: "2026-07-22T20:00:00.000Z",
+      updatedAt: "2026-07-22T21:00:00.000Z",
+      terminalAt: "2026-07-22T21:00:00.000Z",
+    });
+    const { now: _now, ...propsWithoutNow } = props({
+      snapshot: snapshot({
+        actors: [interrupted],
+        counts: {
+          subagents: { active: 0, done: 1 },
+          backgroundTasks: { active: 0, done: 0 },
+        },
+        updatedAt: "2026-07-22T21:00:00.000Z",
+      }),
+      roster: {
+        active: query([rosterPage([])]),
+        done: query([rosterPage([interrupted])]),
+      },
+    });
+    const container = await mount(<ActivityPanel {...propsWithoutNow} />);
+    const row = container.querySelector('button[data-activity-row="interrupted-child"]');
+    expect(row?.textContent).toContain("Interrupted after 1h");
+    expect(row?.textContent).not.toContain("ago");
+    expect(row?.textContent).toContain("Codex session ended before this subagent reported");
   });
 
   it("reconciles open roster and detail views after authoritative query refreshes", async () => {

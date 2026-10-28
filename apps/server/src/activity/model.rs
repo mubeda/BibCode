@@ -1351,6 +1351,75 @@ pub(crate) fn max_timestamp(left: &str, right: &str) -> ActivityModelResult<Stri
     })
 }
 
+/// The summary of a record BiBCode closed because the process that ran it is gone (#206): why,
+/// and how long after its start it last reported, then whatever the record already said. A
+/// duration, unlike a clock time, never goes stale and needs no time zone. An earlier closure's
+/// prefix is replaced rather than repeated.
+pub(crate) fn interruption_summary(
+    reason: &str,
+    started_at: &str,
+    last_report_at: &str,
+    existing: Option<&str>,
+) -> ActivityModelResult<String> {
+    let reported_after =
+        parse_timestamp(last_report_at, "timestamp")? - parse_timestamp(started_at, "timestamp")?;
+    let seconds = reported_after.whole_seconds().max(0);
+    let mut summary = if seconds == 0 {
+        format!("{reason}; no report after it started.")
+    } else {
+        format!(
+            "{reason}; last report {} after it started.",
+            compact_duration(seconds)
+        )
+    };
+    let existing = existing.map(strip_interruption_prefix).map(str::trim);
+    if let Some(existing) = existing.filter(|existing| !existing.is_empty()) {
+        summary.push(' ');
+        summary.push_str(existing);
+    }
+    Ok(clip_utf16(&summary, ACTIVITY_SUMMARY_MAX_LENGTH))
+}
+
+fn compact_duration(seconds: i64) -> String {
+    match seconds {
+        ..60 => format!("{seconds}s"),
+        60..3_600 => format!("{}m", seconds / 60),
+        3_600..86_400 => format!("{}h", seconds / 3_600),
+        _ => format!("{}d", seconds / 86_400),
+    }
+}
+
+fn strip_interruption_prefix(summary: &str) -> &str {
+    INTERRUPTION_REASONS
+        .iter()
+        .find(|reason| summary.starts_with(**reason))
+        .and_then(|_| summary.find("after it started.").map(|end| end + 17))
+        .map_or(summary, |end| &summary[end..])
+}
+
+fn clip_utf16(value: &str, maximum: usize) -> String {
+    let mut units = 0;
+    let mut clipped = String::with_capacity(value.len());
+    for character in value.chars() {
+        units += character.len_utf16();
+        if units > maximum {
+            break;
+        }
+        clipped.push(character);
+    }
+    clipped
+}
+
+/// Why BiBCode closed a record whose process is gone. Static and content-free.
+pub(crate) const INTERRUPTION_REASONS: &[&str] = &[
+    "Claude session ended before this",
+    "Codex session ended before this",
+    "OpenCode session ended before this",
+    "The provider session ended before this",
+    "BiBCode restarted before this",
+    "Claude stopped listing this subagent as running",
+];
+
 pub(crate) fn validate_text(
     value: String,
     field: &'static str,

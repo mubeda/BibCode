@@ -890,6 +890,171 @@ describe("environment activity stream state", () => {
     }),
   );
 
+  it.effect(
+    "refetches once when the server reopens an interrupted row, not again on a duplicate",
+    () =>
+      Effect.gen(function* () {
+        const closedAt = "2026-07-22T12:05:00Z";
+        const interruptedActor = {
+          ...snapshot().actors[0]!,
+          status: "interrupted" as const,
+          summary:
+            "Codex session ended before this subagent reported; last report 5m after it started.",
+          updatedAt: closedAt,
+          terminalAt: closedAt,
+        };
+        const reopenedActor = {
+          ...snapshot().actors[0]!,
+          summary: "Resumed by Codex",
+          updatedAt: closedAt,
+          terminalAt: null,
+        };
+        const harness = yield* makeHarness({
+          getSnapshot: () =>
+            Effect.succeed(
+              snapshot(4, "Reopened", { actors: [reopenedActor], updatedAt: closedAt }),
+            ),
+        });
+        yield* Queue.offer(harness.inputs, {
+          kind: "snapshot",
+          snapshot: snapshot(3, "Interrupted", {
+            actors: [interruptedActor],
+            counts: { subagents: { active: 0, done: 1 }, backgroundTasks: { active: 0, done: 0 } },
+          }),
+        });
+        yield* awaitState(harness.state, (state) => state.status === "live");
+        const reopen: ActivityDelta = {
+          scopeId: SCOPE_ID,
+          previousRevision: 3,
+          revision: 4,
+          changes: [{ kind: "actor-upserted", actor: reopenedActor }],
+          updatedAt: closedAt,
+        };
+        yield* Queue.offer(harness.inputs, { kind: "delta", delta: reopen });
+
+        const converged = yield* awaitState(
+          harness.state,
+          (state) =>
+            state.status === "live" &&
+            Option.isSome(state.snapshot) &&
+            state.snapshot.value.revision === 4,
+        );
+        expect(Option.getOrThrow(converged.snapshot).actors[0]?.status).toBe("running");
+        expect(Option.getOrThrow(converged.snapshot).counts.subagents).toEqual({
+          active: 1,
+          done: 0,
+        });
+
+        yield* Queue.offer(harness.inputs, { kind: "delta", delta: reopen });
+        for (let attempt = 0; attempt < 20; attempt += 1) {
+          yield* Effect.yieldNow;
+        }
+        expect(yield* Ref.get(harness.snapshotRequestCount)).toBe(1);
+        expect(
+          Option.getOrThrow((yield* SubscriptionRef.get(harness.state)).snapshot).revision,
+        ).toBe(4);
+      }),
+  );
+
+  it.effect("shows a row interrupted while disconnected, with its counts, after a reconnect", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness();
+      yield* Queue.offer(harness.inputs, { kind: "snapshot", snapshot: snapshot() });
+      yield* awaitState(harness.state, (state) => state.status === "live");
+
+      yield* SubscriptionRef.set(harness.supervisorSession, Option.none());
+      yield* SubscriptionRef.set(harness.supervisorState, {
+        ...AVAILABLE_CONNECTION_STATE,
+        desired: true,
+        network: "offline",
+        phase: "offline",
+        generation: 1,
+      } satisfies SupervisorConnectionState);
+      yield* awaitState(harness.state, (state) => state.status === "stale");
+      yield* harness.reconnect;
+      yield* SubscriptionRef.set(harness.supervisorState, {
+        ...AVAILABLE_CONNECTION_STATE,
+        desired: true,
+        network: "online",
+        phase: "connected",
+        generation: 2,
+      } satisfies SupervisorConnectionState);
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        if ((yield* Ref.get(harness.subscriptionCount)) === 2) break;
+        yield* Effect.yieldNow;
+      }
+      const closedAt = "2026-07-22T13:00:00Z";
+      yield* Queue.offer(harness.inputs, {
+        kind: "snapshot",
+        snapshot: snapshot(5, "Explore provider events", {
+          actors: [
+            {
+              ...snapshot().actors[0]!,
+              status: "interrupted",
+              summary:
+                "Codex session ended before this subagent reported; last report 1s after it started.",
+              updatedAt: closedAt,
+              terminalAt: closedAt,
+            },
+          ],
+          counts: { subagents: { active: 0, done: 1 }, backgroundTasks: { active: 0, done: 0 } },
+          updatedAt: closedAt,
+        }),
+      });
+
+      const reconnected = yield* awaitState(
+        harness.state,
+        (state) =>
+          state.status === "live" &&
+          Option.isSome(state.snapshot) &&
+          state.snapshot.value.revision === 5,
+      );
+      const visible = Option.getOrThrow(reconnected.snapshot);
+      expect(visible.actors[0]?.status).toBe("interrupted");
+      expect(visible.actors[0]?.summary).toContain("ended before this subagent reported");
+      expect(visible.counts.subagents).toEqual({ active: 0, done: 1 });
+      expect(yield* Ref.get(harness.snapshotRequestCount)).toBe(0);
+    }),
+  );
+
+  it.effect("keeps an older server's running rows and counts without a refetch", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness();
+      yield* Queue.offer(harness.inputs, { kind: "snapshot", snapshot: snapshot() });
+      yield* awaitState(harness.state, (state) => state.status === "live");
+      yield* Queue.offer(harness.inputs, {
+        kind: "delta",
+        delta: {
+          scopeId: SCOPE_ID,
+          previousRevision: 3,
+          revision: 4,
+          changes: [
+            {
+              kind: "actor-upserted",
+              actor: {
+                ...snapshot().actors[0]!,
+                summary: "Still exploring",
+                updatedAt: "2026-07-22T12:00:05Z",
+              },
+            },
+          ],
+          updatedAt: "2026-07-22T12:00:05Z",
+        },
+      });
+
+      const applied = yield* awaitState(
+        harness.state,
+        (state) =>
+          state.status === "live" &&
+          Option.isSome(state.snapshot) &&
+          state.snapshot.value.revision === 4,
+      );
+      expect(Option.getOrThrow(applied.snapshot).actors[0]?.status).toBe("running");
+      expect(Option.getOrThrow(applied.snapshot).counts).toEqual(snapshot().counts);
+      expect(yield* Ref.get(harness.snapshotRequestCount)).toBe(0);
+    }),
+  );
+
   it.effect("recovers an authoritative snapshot after a capped roster removes a visible row", () =>
     Effect.gen(function* () {
       const cappedActors = Array.from({ length: 200 }, (_, index) => ({

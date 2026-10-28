@@ -256,7 +256,7 @@ describe("applyActivityDelta", () => {
     ).toEqual({ kind: "gap" });
   });
 
-  it("does not regress a terminal actor when a malformed later delta arrives", () => {
+  it("recovers through a snapshot instead of regressing a terminal actor a later delta reopens", () => {
     const completed = actor({
       status: "completed",
       summary: "Finished",
@@ -282,9 +282,89 @@ describe("applyActivityDelta", () => {
       ]),
     );
 
+    // The server accepted the reopen; only its snapshot may show the row running again.
+    expect(result).toEqual({ kind: "gap" });
+    expect(current.actors[0]).toBe(completed);
+  });
+
+  it("moves a running actor to interrupted through a delta, with its counts", () => {
+    const interrupted = actor({
+      status: "interrupted",
+      summary:
+        "Claude session ended before this subagent reported; last report 34m after it started.",
+      updatedAt: "2026-07-26T12:00:00Z",
+      terminalAt: "2026-07-26T12:00:00Z",
+    });
+    const counts = {
+      subagents: { active: 0, done: 1 },
+      backgroundTasks: { active: 1, done: 0 },
+    };
+    const current = snapshot();
+
+    const result = applyActivityDelta(
+      current,
+      delta([
+        {
+          kind: "scope-updated",
+          capabilities: current.capabilities,
+          observationState: "live",
+          sections: current.sections,
+          counts,
+        },
+        { kind: "actor-upserted", actor: interrupted },
+      ]),
+    );
+
     expect(result.kind).toBe("applied");
     if (result.kind === "applied") {
-      expect(result.snapshot.actors[0]).toBe(completed);
+      expect(result.snapshot.actors[0]).toEqual(interrupted);
+      expect(result.snapshot.counts).toEqual(counts);
+    }
+  });
+
+  it("asks for a snapshot when the server reopens an interrupted actor at its closure time", () => {
+    const closedAt = "2026-07-26T12:00:00Z";
+    const current = snapshot({
+      actors: [actor({ status: "interrupted", updatedAt: closedAt, terminalAt: closedAt })],
+    });
+
+    const reopened = (updatedAt: string) =>
+      applyActivityDelta(
+        current,
+        delta([
+          {
+            kind: "actor-upserted",
+            actor: actor({ status: "running", updatedAt, terminalAt: null }),
+          },
+        ]),
+      );
+
+    expect(reopened(closedAt)).toEqual({ kind: "gap" });
+    expect(reopened("2026-07-26T12:00:01Z")).toEqual({ kind: "gap" });
+    const older = reopened("2026-07-26T11:59:59Z");
+    expect(older.kind).toBe("applied");
+    if (older.kind === "applied") {
+      expect(older.snapshot.actors[0]?.status).toBe("interrupted");
+    }
+  });
+
+  it("keeps an older server's running deltas incremental, with unchanged counts", () => {
+    const current = snapshot();
+
+    const result = applyActivityDelta(
+      current,
+      delta([
+        {
+          kind: "actor-upserted",
+          actor: actor({ summary: "Still working", updatedAt: "2026-07-22T12:00:05Z" }),
+        },
+      ]),
+    );
+
+    expect(result.kind).toBe("applied");
+    if (result.kind === "applied") {
+      expect(result.snapshot.actors[0]?.summary).toBe("Still working");
+      expect(result.snapshot.counts).toEqual(current.counts);
     }
   });
 

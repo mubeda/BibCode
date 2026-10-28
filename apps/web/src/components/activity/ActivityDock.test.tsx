@@ -619,6 +619,32 @@ describe("ActivityDock", () => {
     observer.disconnect();
   });
 
+  it("moves a subagent whose process ended from Active to Done", async () => {
+    const stuck = props({
+      compact: true,
+      snapshot: snapshot({
+        revision: 2,
+        counts: counts({ active: 1, done: 17 }, { active: 0, done: 0 }),
+      }),
+    });
+    const container = await mount(<ActivityDock {...stuck} />);
+    expect(pill(container).textContent).toContain("Active 1");
+    expect(pill(container).textContent).toContain("Done 17");
+
+    await rerender(
+      container,
+      <ActivityDock
+        {...stuck}
+        snapshot={snapshot({
+          revision: 3,
+          counts: counts({ active: 0, done: 18 }, { active: 0, done: 0 }),
+        })}
+      />,
+    );
+    expect(pill(container).textContent).toContain("Active 0");
+    expect(pill(container).textContent).toContain("Done 18");
+  });
+
   it("separates the compact counts with a bold dot", async () => {
     const container = await mount(<ActivityDock {...props({ compact: true })} />);
     const button = pill(container);

@@ -1,5 +1,6 @@
 pub mod delivery;
 pub mod engine;
+pub mod process_ownership;
 
 pub use delivery::{
     AttachmentReference, CommandAdmission, NewProviderTurnDelivery, ProviderTurnDelivery,
@@ -11,6 +12,7 @@ pub use engine::{
     EngineOptions, OrchestrationCommand, OrchestrationEngine, OrchestrationError, Snapshot,
     load_shell_snapshot, load_snapshot, load_thread_snapshot,
 };
+pub use process_ownership::StartupProcessOwnership;
 
 #[cfg(test)]
 mod delivery_tests {

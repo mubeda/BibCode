@@ -6,9 +6,9 @@ use bibcode_server::{
         ACTIVITY_DETAIL_MAX_LENGTH, ACTIVITY_ID_MAX_LENGTH, ACTIVITY_LABEL_MAX_LENGTH,
         ACTIVITY_PAGE_MAX_LENGTH, ACTIVITY_SUMMARY_MAX_LENGTH, ActivityActorSummary,
         ActivityCapabilities, ActivityEntry, ActivityEntryKind, ActivityEntryTone,
-        ActivityLifecycle, ActivityRecordKind, ActivityRepository, ActivityRepositoryError,
-        ActivityRosterBucket, ActivityScopeSeed, ActivitySection, ActivityWorkItemSummary,
-        ProviderActivityMutation,
+        ActivityInterruption, ActivityLifecycle, ActivityProjection, ActivityRecordKind,
+        ActivityRepository, ActivityRepositoryError, ActivityRosterBucket, ActivityScopeSeed,
+        ActivitySection, ActivityWorkItemSummary, ProviderActivityMutation,
     },
     persistence::{Database, run_migrations},
     provider::{
@@ -356,6 +356,15 @@ struct RecoveryLossDetails {
     counts: ExpectedSummaryCounts,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProcessEndDetails {
+    open_phases: Vec<String>,
+    expected_interrupted_records: usize,
+    actor_status: String,
+    counts: ExpectedSummaryCounts,
+}
+
 #[derive(Debug)]
 struct NativeMutationBatch {
     event_key: String,
@@ -597,6 +606,7 @@ fn checkpoint_three_canonical_scenario_groups_are_present() {
             "authoritative-history-repair",
             "malformed-and-oversized-native-input",
             "recovery-loss-interrupts-active",
+            "chat-process-ended-interrupts-active",
         ]
     );
 }
@@ -652,6 +662,11 @@ async fn every_canonical_scenario_has_a_repository_checkpoint() {
             }
             "recovery-loss-interrupts-active" => {
                 assert_recovery_loss_repository_semantics(scenario).await;
+            }
+            "chat-process-ended-interrupts-active" => {
+                for provider in [Provider::Codex, Provider::Claude, Provider::OpenCode] {
+                    assert_process_end_repository_semantics(provider, scenario).await;
+                }
             }
             other => panic!("canonical scenario lacks repository checkpoint: {other}"),
         }
@@ -1384,6 +1399,115 @@ async fn assert_recovery_loss_repository_semantics(scenario: &CanonicalScenario)
             .await
             .expect("repeated interruption snapshot"),
         snapshot
+    );
+}
+
+/// Every chat provider's child, still open when the process that ran it ends, closes through the
+/// same journaled interruption (#206): one effective batch, nothing left active, and a second
+/// pass changes nothing.
+async fn assert_process_end_repository_semantics(provider: Provider, scenario: &CanonicalScenario) {
+    let details: ProcessEndDetails = scenario.decode_details();
+    let child_alias = "open-child";
+    let trace = match provider {
+        Provider::Codex => drive_codex(&details.open_phases, child_alias),
+        Provider::Claude => drive_claude(&details.open_phases, child_alias),
+        Provider::OpenCode => drive_opencode(&details.open_phases, child_alias),
+    };
+    let projection = ActivityProjection::new(ActivityRepository::new(migrated_database().await));
+    let scope = ActivityScopeSeed::thread(
+        format!("thread:process-ended:{}", provider.name()),
+        format!("process-ended-{}", provider.name()),
+        provider.name(),
+        Some(provider.name()),
+        ActivityCapabilities::structured_full(false),
+    )
+    .expect("valid process-end scope");
+    projection.ensure_scope(scope.clone()).await.expect("scope");
+    for batch in &trace.batches {
+        if batch.mutations.is_empty() {
+            continue;
+        }
+        projection
+            .apply(
+                &scope.scope_id,
+                batch.event_key.clone(),
+                batch.mutations.clone(),
+                batch.updated_at.clone(),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{} open child: {error}", provider.name()));
+    }
+    let open = projection
+        .snapshot(&scope.scope)
+        .await
+        .expect("open snapshot");
+    assert_eq!(
+        open.counts.subagents.active,
+        1,
+        "{} leaves its child open",
+        provider.name()
+    );
+
+    let deltas = projection
+        .interrupt_unresolved_scope(
+            &scope.scope_id,
+            ActivityInterruption::new("The provider session ended before this"),
+        )
+        .await
+        .expect("process-end interruption");
+    let closed = deltas
+        .iter()
+        .flat_map(|delta| &delta.changes)
+        .filter(|change| {
+            matches!(
+                change,
+                bibcode_server::activity::ActivityChange::ActorUpserted { .. }
+                    | bibcode_server::activity::ActivityChange::WorkItemUpserted { .. }
+            )
+        })
+        .count();
+    assert_eq!(
+        closed,
+        details.expected_interrupted_records,
+        "{}",
+        provider.name()
+    );
+    let snapshot = projection
+        .snapshot(&scope.scope)
+        .await
+        .expect("closed snapshot");
+    assert_eq!(snapshot.revision, open.revision + 1, "{}", provider.name());
+    let actor = &snapshot.actors[0];
+    assert_eq!(
+        actor.status.as_str(),
+        details.actor_status,
+        "{}",
+        provider.name()
+    );
+    assert_eq!(Some(&actor.updated_at), actor.terminal_at.as_ref());
+    assert_eq!(
+        snapshot.counts.subagents.active,
+        details.counts.subagents.active
+    );
+    assert_eq!(
+        snapshot.counts.subagents.done,
+        details.counts.subagents.done
+    );
+    assert_eq!(
+        snapshot.counts.background_tasks.active,
+        details.counts.background_tasks.active
+    );
+    assert!(
+        projection
+            .interrupt_unresolved_scope(
+                &scope.scope_id,
+                ActivityInterruption::new("The provider session ended before this"),
+            )
+            .await
+            .expect("repeat")
+            .is_empty(),
+        "{} closes once",
+        provider.name()
     );
 }
 

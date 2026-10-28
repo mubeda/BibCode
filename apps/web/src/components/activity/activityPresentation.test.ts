@@ -3,9 +3,45 @@ import { describe, expect, it } from "vite-plus/test";
 
 import {
   activityElapsedLabel,
+  activityRecordTimeLabel,
   activityStatusLabel,
+  activityStopUnavailableReason,
   selectActivityDockVisibility,
 } from "./activityPresentation";
+
+describe("activityRecordTimeLabel", () => {
+  const now = "2026-08-11T20:00:00.000Z";
+  const record = (status: ActivityLifecycle, terminalAt: string | null) => ({
+    status,
+    startedAt: "2026-08-07T19:00:00.000Z",
+    terminalAt,
+  });
+
+  it("names how each record ended, never calling an interruption complete", () => {
+    expect(activityRecordTimeLabel(record("running", null), now)).toBe("Elapsed 4d");
+    expect(activityRecordTimeLabel(record("completed", "2026-08-07T19:34:00.000Z"), now)).toBe(
+      "Completed in 34m",
+    );
+    expect(activityRecordTimeLabel(record("failed", "2026-08-07T19:02:00.000Z"), now)).toBe(
+      "Failed after 2m",
+    );
+    expect(activityRecordTimeLabel(record("cancelled", "2026-08-07T20:00:00.000Z"), now)).toBe(
+      "Stopped after 1h",
+    );
+    expect(activityRecordTimeLabel(record("interrupted", "2026-08-11T19:55:00.000Z"), now)).toBe(
+      "Interrupted after 4d",
+    );
+  });
+
+  it("explains a missing Stop with the provider's name", () => {
+    expect(activityStopUnavailableReason("claudeAgent")).toBe(
+      "Claude doesn't offer a way to stop this subagent from BiBCode.",
+    );
+    expect(activityStopUnavailableReason("custom")).toBe(
+      "The provider doesn't offer a way to stop this subagent from BiBCode.",
+    );
+  });
+});
 
 const baseSnapshot = {
   protocolVersion: 2,
