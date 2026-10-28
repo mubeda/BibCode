@@ -467,15 +467,31 @@ describe("ChatComposer provider selection rerenders", () => {
 });
 
 describe("ChatComposer long-lived handlers", () => {
-  it("keeps one menu select handler across renders and runs the latest render's", async () => {
+  const statuses = [supportedProvider, unsupportedProvider];
+
+  /** The props React gave a DOM element, which hold its current handlers. */
+  function domProps(element: Element): Record<string, unknown> {
+    const key = Object.keys(element).find((name) => name.startsWith("__reactProps$"));
+    expect(key).toBeDefined();
+    return (element as unknown as Record<string, Record<string, unknown>>)[key ?? ""] ?? {};
+  }
+
+  it("keeps one menu select handler that runs the latest render's callbacks", async () => {
+    const actionPrompt = ":plan";
+    useComposerDraftStore.getState().setPrompt(threadRef, actionPrompt);
+    h.snapshot = {
+      value: actionPrompt,
+      cursor: actionPrompt.length,
+      expandedCursor: actionPrompt.length,
+      terminalContextIds: [],
+    };
     const composerRef = React.createRef<ChatComposerHandle>();
-    const promptRef = { current: prompt };
-    const renderWith = (props: ChatComposerProps) =>
-      act(async () => {
+    const promptRef = { current: actionPrompt };
+    const renderAndOpenMenu = async (props: ChatComposerProps) => {
+      await act(async () => {
         root.render(<ChatComposer {...props} />);
       });
-    const openMenu = () =>
-      act(async () => {
+      await act(async () => {
         const onChange = h.editorProps?.["onChange"] as
           | ((
               value: string,
@@ -486,46 +502,47 @@ describe("ChatComposer long-lived handlers", () => {
             ) => void)
           | undefined;
         expect(onChange).toBeTypeOf("function");
-        onChange?.(prompt, supportedDraftCursor, expandedDraftCursor, false, []);
+        onChange?.(actionPrompt, actionPrompt.length, actionPrompt.length, false, []);
       });
-    const statuses = [supportedProvider, unsupportedProvider];
+      const onSelect = h.menuProps?.["onSelect"];
+      expect(onSelect).toBeTypeOf("function");
+      return onSelect as (item: { id: string }) => void;
+    };
 
-    await renderWith(makeProps(statuses, composerRef, promptRef, supportedProvider));
-    await openMenu();
-    const firstOnSelect = h.menuProps?.["onSelect"];
-    expect(firstOnSelect).toBeTypeOf("function");
+    const first = makeProps(statuses, composerRef, promptRef, supportedProvider);
+    const firstOnSelect = await renderAndOpenMenu(first);
+    // New callbacks from the parent: what a changed reconnect gives the composer.
+    const latest = makeProps(statuses, composerRef, promptRef, supportedProvider);
+    const latestOnSelect = await renderAndOpenMenu(latest);
 
-    // A new thread object and new callbacks: what a changed reconnect gives the composer.
-    await renderWith(makeProps(statuses, composerRef, promptRef, supportedProvider));
-    await openMenu();
-    expect(h.menuProps?.["onSelect"]).toBe(firstOnSelect);
-
-    h.snapshot = { ...h.snapshot, cursor: prompt.length };
+    expect(latestOnSelect).toBe(firstOnSelect);
     await act(async () => {
-      (firstOnSelect as (item: { id: string }) => void)({
-        id: "provider-skill:codex:dollar:refactor",
-      });
+      firstOnSelect({ id: "bibcode-action:plan" });
     });
-    expect(useComposerDraftStore.getState().getComposerDraft(threadRef)?.prompt).toBe(
-      "ask $refactor then $refactor ",
-    );
+    expect(first.handleInteractionModeChange).not.toHaveBeenCalled();
+    expect(latest.handleInteractionModeChange).toHaveBeenCalledWith("plan");
   });
 
-  it("attaches files through the file input with the latest render's state", async () => {
+  it("keeps one file input handler that reports with the latest render's callbacks", async () => {
     const composerRef = React.createRef<ChatComposerHandle>();
     const promptRef = { current: prompt };
-    const statuses = [supportedProvider, unsupportedProvider];
     const first = makeProps(statuses, composerRef, promptRef, supportedProvider);
     await act(async () => {
       root.render(<ChatComposer {...first} />);
     });
+    const input = container.querySelector<HTMLInputElement>('input[type="file"]');
+    expect(input).not.toBeNull();
+    const firstOnChange = domProps(input!)["onChange"];
+    expect(firstOnChange).toBeTypeOf("function");
+
+    // New callbacks from the parent: what a changed reconnect gives the composer.
     const latest = makeProps(statuses, composerRef, promptRef, supportedProvider);
     await act(async () => {
       root.render(<ChatComposer {...latest} />);
     });
+    expect(container.querySelector('input[type="file"]')).toBe(input);
+    expect(domProps(input!)["onChange"]).toBe(firstOnChange);
 
-    const input = container.querySelector<HTMLInputElement>('input[type="file"]');
-    expect(input).not.toBeNull();
     Object.defineProperty(input, "files", {
       configurable: true,
       value: [new File([], "empty.txt", { type: "text/plain" })],
