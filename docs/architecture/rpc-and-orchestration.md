@@ -2666,11 +2666,15 @@ only after its first read of the pending lists since subscribing. Until that
 read finishes, the engine holds the thread's automatic queue promotion
 (`AskRecoveryHold`, held by the session). The read reports
 `requests.recovery-read` after showing what it found, completed or failed, which
-releases the hold; so does the session ending. There is no timer: a failed read
-releases the queue with today's behavior. Every completed read, the resume's,
+releases the hold; so does the session ending. A failed read releases the queue
+with today's behavior, and so does a subscription OpenCode has not confirmed
+(`server.connected`) 15 seconds after the stream opened (logged). A recovered
+ask whose projection fails is projected again, in order, with a bounded backoff;
+until it is recorded the read does not release the hold, and if it never is the
+queue stays held until the session ends. Every completed read, the resume's,
 the first after subscribing and each retry, reports `requests.listed`. An
-OpenCode 2 subagent list answered without its `data` array leaves the tree read
-incomplete.
+OpenCode 2 subagent list answered without its `data` array, or listing a child
+without a valid id, leaves the tree read incomplete.
 `orchestration.replayEvents` with `paged: true` returns about 1 MiB pages
 `{ events, exhausted }`, keeping at least one event when any remain. Replay
 resumes from the last applied `sequence` with no server state; the cursor is

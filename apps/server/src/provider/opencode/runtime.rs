@@ -176,6 +176,10 @@ const CONTEXT_WINDOW_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
 const RESUME_READ_RETRY_FIRST: Duration = Duration::from_millis(250);
 const RESUME_READ_RETRY_LONGEST: Duration = Duration::from_secs(10);
 const RESUME_READ_ATTEMPTS: usize = 8;
+/// How long a resumed session waits, once its event stream opens, for OpenCode's
+/// `server.connected` before its ask read counts as failed, so its queue is not held for good
+/// (#187).
+const SUBSCRIPTION_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 /// How many OpenCode 1 settlements of asks not routed yet are remembered for a recovery read.
 const MAX_TRACKED_SETTLEMENTS: usize = 256;
 /// The bound on a request made for the event stream (a form cancel, a failed message's removal,
@@ -2264,6 +2268,10 @@ impl OpenCodeSessionRuntime {
                 }
                 return;
             }
+            if let Some(inner) = runtime.upgrade() {
+                OpenCodeSessionRuntime::internal(inner)
+                    .bound_subscription_handshake(SUBSCRIPTION_HANDSHAKE_TIMEOUT);
+            }
             let mut decoder = OpenCodeSseDecoder::default();
             let mut response = response;
             loop {
@@ -3255,12 +3263,18 @@ impl OpenCodeSessionRuntime {
                 complete = false;
                 continue;
             };
-            let found = children
-                .iter()
-                .filter_map(|child| child.get("id").and_then(Value::as_str))
-                .filter(|child| valid_key(child))
-                .map(str::to_owned)
-                .collect::<Vec<_>>();
+            let mut found = Vec::new();
+            for child in &children {
+                match child
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|child| valid_key(child))
+                {
+                    Some(child) => found.push(child.to_owned()),
+                    // A subagent BiBCode cannot name may hold asks it cannot read (#187).
+                    None => complete = false,
+                }
+            }
             for child in found {
                 if !sessions.contains(&child) {
                     queue.push_back((child.clone(), depth + 1));
@@ -3588,6 +3602,40 @@ impl OpenCodeSessionRuntime {
             json!({ "requestIds": listed }),
         )
         .await;
+    }
+
+    /// A resumed session reads its pending asks once OpenCode confirms the subscription
+    /// (`server.connected`). One still unconfirmed `after` the stream opened counts as a failed
+    /// read: it is logged and reported, which releases the session's queued messages (#187). A
+    /// later confirmation still reads and shows the asks.
+    fn bound_subscription_handshake(&self, after: Duration) {
+        let runtime = Arc::downgrade(&self.inner);
+        let cancellation = self.inner.reconciliation_cancellation.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                () = cancellation.cancelled() => return,
+                () = tokio::time::sleep(after) => {}
+            }
+            let Some(inner) = runtime.upgrade() else {
+                return;
+            };
+            let runtime = OpenCodeSessionRuntime::internal(inner);
+            let unconfirmed = {
+                let v2 = runtime.inner.v2.lock().await;
+                if runtime.is_v2() {
+                    v2.reconcile_asks_on_connect
+                } else {
+                    v2.adopt_on_connect
+                }
+            };
+            if unconfirmed {
+                tracing::warn!(
+                    provider = "opencode",
+                    "OpenCode did not confirm a resumed session's event subscription in time"
+                );
+                runtime.emit_recovery_read().await;
+            }
+        });
     }
 
     /// Reports that a resumed session's first read of its pending asks since subscribing
@@ -6506,7 +6554,11 @@ mod tests {
     /// incomplete, so it never expires an ask a subagent may hold (#187).
     #[tokio::test]
     async fn a_malformed_opencode_2_subagent_list_leaves_the_tree_read_incomplete() {
-        for (children, complete) in [(json!({"data": []}), true), (json!({"ok": true}), false)] {
+        for (children, complete) in [
+            (json!({"data": []}), true),
+            (json!({"ok": true}), false),
+            (json!({"data": [{}]}), false),
+        ] {
             let app = Router::new()
                 .route(
                     "/api/session",
@@ -6535,6 +6587,32 @@ mod tests {
             assert_eq!(read_complete, complete);
             assert!(asks.is_empty());
             server.abort();
+        }
+    }
+
+    /// A resumed session whose subscription OpenCode never confirms reports its ask read failed
+    /// once the handshake bound passes, which releases its queue; a confirmed one reports
+    /// nothing extra (#187).
+    #[tokio::test]
+    async fn an_unconfirmed_subscription_counts_as_a_failed_recovery_read() {
+        for confirmed in [false, true] {
+            let runtime = super::OpenCodeSessionRuntime::new(
+                "http://127.0.0.1:9",
+                "unit-thread",
+                "/tmp/unit",
+                None,
+            );
+            runtime.inner.v2.lock().await.adopt_on_connect = !confirmed;
+            runtime.bound_subscription_handshake(std::time::Duration::from_millis(20));
+            let event =
+                tokio::time::timeout(std::time::Duration::from_millis(300), runtime.next_event())
+                    .await;
+            if confirmed {
+                assert!(event.is_err(), "a confirmed subscription reports nothing");
+            } else {
+                let event = event.expect("reported in time").expect("event");
+                assert_eq!(event.event_type, "requests.recovery-read");
+            }
         }
     }
 
