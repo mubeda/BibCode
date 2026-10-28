@@ -5469,6 +5469,24 @@ async fn agent_activity_toggle_codex_status_only_launch_publishes_activity_once_
         projection.snapshot(&scope).await.is_err(),
         "a status-only launch publishes no activity scope"
     );
+    remote_state
+        .events
+        .lock()
+        .expect("Codex events")
+        .push_back(serde_json::json!({
+            "method": "thread/status/changed",
+            "params": {
+                "threadId": "terminal-status-only-root",
+                "status": {"type": "active", "activeFlags": ["waitingOnApproval"]},
+            },
+        }));
+    // The root's state reaches the terminal's metadata with activity off (#187).
+    wait_for_terminal_agent_status(
+        &manager,
+        "terminal-status-only",
+        TerminalAgentStatusState::Blocked,
+    )
+    .await;
 
     controller.enable();
     let enabled = manager.set_agent_activity_enabled(true).await;
@@ -10111,6 +10129,8 @@ fn claude_hook_launch(backend: &RecordingBackend) -> (String, String, String, st
             "SubagentStart",
             "SubagentStop",
             // The main agent's state for the left panel (#187).
+            "Elicitation",
+            "ElicitationResult",
             "Notification",
             "PermissionRequest",
             "SessionEnd",
@@ -12868,6 +12888,14 @@ async fn agent_activity_toggle_opencode_status_only_launch_publishes_its_scope_o
         fixture.projection.snapshot(&scope).await.is_err(),
         "a status-only launch publishes no activity scope"
     );
+    // The status observer reads the root's state as it attaches: OpenCode lists no busy
+    // session, so the agent is done (#187).
+    wait_for_terminal_agent_status(
+        &fixture.manager,
+        "terminal-opencode-toggle",
+        TerminalAgentStatusState::Done,
+    )
+    .await;
 
     fixture
         .projection
@@ -12882,6 +12910,19 @@ async fn agent_activity_toggle_opencode_status_only_launch_publishes_its_scope_o
     })
     .await
     .expect("enabling activity publishes the OpenCode terminal scope");
+    push_raw_dormant_frame(
+        &fixture.remote_state,
+        &opencode_fixture_event_frame(serde_json::json!({
+            "type": "permission.asked",
+            "properties": {"sessionID": "root-tui-session", "id": "per_live"},
+        })),
+    );
+    wait_for_terminal_agent_status(
+        &fixture.manager,
+        "terminal-opencode-toggle",
+        TerminalAgentStatusState::Blocked,
+    )
+    .await;
     fixture.finish().await;
     isolated.complete();
 }
@@ -15190,6 +15231,23 @@ impl PreparedTerminalObserver for StatusReportingObserver {
     fn diagnostic_label(&self) -> &str {
         "status-reporting-observer"
     }
+}
+
+/// Waits until the terminal's current summary reports `expected`.
+async fn wait_for_terminal_agent_status(
+    manager: &TerminalManager,
+    terminal_id: &str,
+    expected: TerminalAgentStatusState,
+) {
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while agent_status_of(&manager.subscribe_metadata().await.initial, terminal_id)
+            != Some(expected)
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{terminal_id} never reported {expected:?}"));
 }
 
 /// Waits for the terminal's metadata to report `expected`, returning whether it failed.
