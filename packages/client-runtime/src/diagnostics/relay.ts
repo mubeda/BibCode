@@ -1,6 +1,5 @@
 import {
   DIAGNOSTIC_LOGS_CHUNK_BYTES,
-  type DiagnosticLogsRelayEnvironment,
   type DiagnosticLogsRelayEvent,
   type DiagnosticLogsRelayFailureReason,
   type DiagnosticLogsRelayItem,
@@ -99,23 +98,17 @@ export type RelayEnvironmentResolution =
   | {
       readonly kind: "unknown-environment" | "ambiguous-environment" | "not-connected";
       readonly message: string;
-      readonly environments: ReadonlyArray<DiagnosticLogsRelayEnvironment>;
     };
 
 /**
  * Resolves the command's `environment`: an exact id first, then a label (trimmed, ignoring
- * case) that exactly one environment has. Anything else fails with the reachable list, so
- * the command can say which names to use.
+ * case) that exactly one environment has. A failure names only what was asked for: the
+ * command never learns which other environments this app can reach.
  */
 export function resolveRelayEnvironment(
   selector: string,
   candidates: ReadonlyArray<RelayEnvironmentCandidate>,
 ): RelayEnvironmentResolution {
-  const listed = candidates.map(({ environmentId, label, connected }) => ({
-    environmentId,
-    label,
-    connected,
-  }));
   const wanted = selector.trim();
   const byId = candidates.find((candidate) => candidate.environmentId === wanted);
   const byLabel = candidates.filter(
@@ -126,20 +119,14 @@ export function resolveRelayEnvironment(
     return byLabel.length > 1
       ? {
           kind: "ambiguous-environment",
-          message: `Several environments in BiBCode are named ${wanted}. Pass its id with --environment.`,
-          environments: listed,
+          message: `Several environments in BiBCode are named ${wanted}. Rename one of them in BiBCode, then try again.`,
         }
-      : {
-          kind: "unknown-environment",
-          message: `BiBCode has no environment named ${wanted}.`,
-          environments: listed,
-        };
+      : { kind: "unknown-environment", message: `BiBCode has no environment named ${wanted}.` };
   }
   if (!match.connected) {
     return {
       kind: "not-connected",
-      message: `${match.label.trim() || match.environmentId} is not connected in BiBCode. Reconnect it, then try again.`,
-      environments: listed,
+      message: `${wanted} is not connected in BiBCode. Reconnect it, then try again.`,
     };
   }
   return { kind: "found", environment: match };

@@ -125,7 +125,13 @@ const environment = (environmentId: string, label: string, phase = "connected") 
 
 const pending = (includeCrashDumps = false): DiagnosticLogsRelayEvent => ({
   _tag: "Pending",
-  request: { requestId: "relay_1", environment: "Omarchy", includeCrashDumps },
+  request: {
+    requestId: "relay_1",
+    environment: "omarchy",
+    includeCrashDumps,
+    code: "K7Q-4M",
+    outputDirectory: "/Users/me/logs",
+  },
 });
 
 beforeEach(() => {
@@ -158,6 +164,13 @@ describe("DiagnosticLogsRelayHost", () => {
     const dialog = container.querySelector('[role="alertdialog"]');
     expect(dialog?.textContent).toContain("Share Omarchy's diagnostic logs?");
     expect(dialog?.textContent).toContain("crash dumps, which can hold fragments of memory");
+    // Who asked, as far as BiBCode can tell, and what to match against the command.
+    expect(dialog?.textContent).toContain(
+      "A program running as you on this computer (not BiBCode) asks to save Omarchy's",
+    );
+    expect(dialog?.textContent).toContain("K7Q-4M");
+    expect(dialog?.textContent).toContain("omarchy");
+    expect(dialog?.textContent).toContain("/Users/me/logs");
     expect(h.downloads).toEqual([]);
 
     await click(container, "Share logs and crash dumps");
