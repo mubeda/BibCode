@@ -29,11 +29,18 @@ import { ensureMainSidebarOpen, setDesktopUiWindowSize } from "../support/ui-sta
 const artifactDirectory = process.env.BIBCODE_E2E_ARTIFACT_DIR;
 const projectPath = process.env.BIBCODE_E2E_PROJECT_PATH;
 const shimDirectory = process.env.BIBCODE_E2E_SHIM_DIRECTORY;
-if (!artifactDirectory || !projectPath || !shimDirectory) {
+const stateRoot = process.env.BIBCODE_HOME;
+if (!artifactDirectory || !projectPath || !shimDirectory || !stateRoot) {
   throw new Error("The packaged desktop UI fixture environment was not prepared.");
 }
 const preparedArtifactDirectory: string = artifactDirectory;
 const preparedProjectPath: string = projectPath;
+const serverLogPath = NodePath.join(stateRoot, "userdata", "logs", "server.log");
+const terminalTuiLogPath = NodePath.join(
+  preparedProjectPath,
+  ".git",
+  "bibcode-fixture-tui-sizes.log",
+);
 const isWindowsE2e = process.env.BIBCODE_E2E_PLATFORM === "win";
 const supportsCodexTerminalActivity = !isWindowsE2e;
 const preparedCodexExecutable = NodePath.join(shimDirectory, isWindowsE2e ? "codex.cmd" : "codex");
@@ -393,7 +400,32 @@ async function assertActivityPresentation(width: 960 | 980 | 981 | 1_199 | 1_200
   expect(presentation.doneCounts).toEqual(["Done 0"]);
 }
 
-async function openCodexProviderTerminal(): Promise<string> {
+type CodexTerminalActivityResult = {
+  readonly terminalId: string;
+  readonly tuiLogStart: number;
+  readonly kind: "observed" | "preparation-timeout" | "unsupported";
+};
+
+async function openCodexProviderTerminal(): Promise<CodexTerminalActivityResult> {
+  const logStart = NodeFS.existsSync(serverLogPath) ? NodeFS.statSync(serverLogPath).size : 0;
+  const tuiLogStart = NodeFS.existsSync(terminalTuiLogPath)
+    ? NodeFS.statSync(terminalTuiLogPath).size
+    : 0;
+  const preparationTimedOut = () => {
+    try {
+      const log = NodeFS.readFileSync(serverLogPath);
+      const lines = log.subarray(log.length >= logStart ? logStart : 0).toString("utf8");
+      return lines
+        .split("\n")
+        .some(
+          (line) =>
+            line.includes("bibcode_server::provider_terminal::codex") &&
+            line.includes('reason="preparation_timeout"'),
+        );
+    } catch {
+      return false;
+    }
+  };
   const newPanel = browser.$('button[aria-label="New panel"]');
   await newPanel.waitForDisplayed();
   await newPanel.click();
@@ -439,10 +471,14 @@ async function openCodexProviderTerminal(): Promise<string> {
   const terminalDock = `[data-provider-terminal-activity-host="${terminalId}"] [data-testid="activity-dock"]`;
   if (supportsCodexTerminalActivity) {
     try {
-      await browser.$(terminalDock).waitForDisplayed({
-        timeout: 60_000,
-        timeoutMsg: "The live Codex terminal activity dock did not become visible.",
-      });
+      await browser.waitUntil(
+        async () => (await browser.$(terminalDock).isDisplayed()) || preparationTimedOut(),
+        {
+          timeout: 60_000,
+          timeoutMsg:
+            "The Codex terminal neither showed Activity nor logged a preparation timeout.",
+        },
+      );
     } catch (error) {
       const diagnostics = await browser
         .execute(() => ({
@@ -474,10 +510,16 @@ async function openCodexProviderTerminal(): Promise<string> {
         { cause: error },
       );
     }
+    if (!(await browser.$(terminalDock).isDisplayed())) {
+      expect(preparationTimedOut()).toBe(true);
+      await expectMissing(terminalDock);
+      return { kind: "preparation-timeout", terminalId, tuiLogStart };
+    }
   } else {
     await expectMissing(terminalDock);
+    return { kind: "unsupported", terminalId, tuiLogStart };
   }
-  return terminalId;
+  return { kind: "observed", terminalId, tuiLogStart };
 }
 
 async function assertProviderTerminalGeometry(terminalId: string): Promise<void> {
@@ -1172,34 +1214,45 @@ async function assertRetiredRightPanelActivityHydratesClosed(): Promise<void> {
  * `fixture-tui <cols>x<rows>` on start and on every SIGWINCH, and records each
  * size under the project's `.git`, since a WebGL terminal has no text in the DOM.
  */
-async function readTerminalTuiSize(): Promise<{
+interface TerminalTuiSize {
   readonly rows: number;
   readonly drawn: string | null;
-}> {
-  const log = NodePath.join(preparedProjectPath, ".git", "bibcode-fixture-tui-sizes.log");
-  const drawn = NodeFS.existsSync(log)
-    ? (NodeFS.readFileSync(log, "utf8").trim().split("\n").at(-1) ?? null)
-    : null;
-  return { rows: Number(drawn?.split("x")[1] ?? Number.NaN), drawn: drawn || null };
+  readonly bytes: number;
 }
 
-/** The terminal's own panel takes rows from the PTY, and the TUI redraws at each size. */
-async function assertTerminalPanelResizesTui(terminalId: string): Promise<void> {
-  const host = `[data-provider-terminal-activity-host="${terminalId}"]`;
+async function readTerminalTuiSize(): Promise<TerminalTuiSize> {
+  const log = NodeFS.existsSync(terminalTuiLogPath)
+    ? NodeFS.readFileSync(terminalTuiLogPath)
+    : null;
+  const drawn = log ? (log.toString("utf8").trim().split("\n").at(-1) ?? null) : null;
+  return {
+    rows: Number(drawn?.split("x")[1] ?? Number.NaN),
+    drawn: drawn || null,
+    bytes: log?.length ?? 0,
+  };
+}
+
+async function waitForFreshTerminalTuiSize(since: number): Promise<TerminalTuiSize> {
   // The TUI first draws at its launch size, then again once the terminal fits
   // its pane, so the baseline is the size that stays put.
-  let settled: { readonly rows: number; readonly drawn: string | null } | null = null;
   await browser.waitUntil(
     async () => {
       const before = await readTerminalTuiSize();
       await browser.pause(400);
       const after = await readTerminalTuiSize();
-      settled = after;
-      return after.drawn !== null && after.drawn === before.drawn;
+      return after.bytes > since && after.drawn !== null && after.drawn === before.drawn;
     },
-    { timeoutMsg: "The Codex fixture TUI never settled on a terminal size." },
+    { timeoutMsg: "The new Codex fixture TUI never drew and settled on a terminal size." },
   );
-  const collapsed = settled!;
+  return readTerminalTuiSize();
+}
+
+/** The terminal's own panel takes rows from the PTY, and the TUI redraws at each size. */
+async function assertTerminalPanelResizesTui(
+  terminalId: string,
+  collapsed: TerminalTuiSize,
+): Promise<void> {
+  const host = `[data-provider-terminal-activity-host="${terminalId}"]`;
   await browser.$(`${host} [data-testid="activity-dock"] button`).click();
   await expect(browser.$(`${host} [data-activity-panel]`)).toBeDisplayed();
   expect(await browser.$("[data-chat-composer-overlay] [data-activity-panel]").isExisting()).toBe(
@@ -1218,6 +1271,32 @@ async function assertTerminalPanelResizesTui(terminalId: string): Promise<void> 
         `Closing the terminal's Activity panel did not give the TUI its rows back: collapsed at ${collapsed.drawn}, now ${(await readTerminalTuiSize()).drawn}.`,
       );
     });
+}
+
+/** A terminal without observation still redraws when its visible pane changes width. */
+async function assertUnobservedTerminalRemainsUsable(baseline: TerminalTuiSize): Promise<void> {
+  const wrapper = browser.$('[data-slot="sidebar-wrapper"]');
+  const toggle = browser.$('button[aria-label="Toggle main sidebar"]');
+  await expect(wrapper).toHaveAttribute("data-sidebar-state", "expanded");
+  await toggle.click();
+  await expect(wrapper).toHaveAttribute("data-sidebar-state", "collapsed");
+  await browser.waitUntil(
+    async () => {
+      const widened = await readTerminalTuiSize();
+      return widened.bytes > baseline.bytes && widened.drawn !== baseline.drawn;
+    },
+    { timeoutMsg: "The unobserved Codex terminal did not redraw after its pane widened." },
+  );
+  const widened = await readTerminalTuiSize();
+  await toggle.click();
+  await expect(wrapper).toHaveAttribute("data-sidebar-state", "expanded");
+  await browser.waitUntil(
+    async () => {
+      const restored = await readTerminalTuiSize();
+      return restored.bytes > widened.bytes && restored.drawn !== widened.drawn;
+    },
+    { timeoutMsg: "The unobserved Codex terminal did not redraw after its pane narrowed." },
+  );
 }
 
 /**
@@ -1375,10 +1454,14 @@ describe("packaged responsive activity experience", () => {
     });
     await assertInlineChatPanel();
     await setDesktopUiWindowSize(1_200, 720);
-    const terminalId = await openCodexProviderTerminal();
-    if (supportsCodexTerminalActivity) {
-      await assertProviderTerminalGeometry(terminalId);
-      await assertTerminalPanelResizesTui(terminalId);
+    const terminal = await openCodexProviderTerminal();
+    if (terminal.kind === "observed") {
+      const settled = await waitForFreshTerminalTuiSize(terminal.tuiLogStart);
+      await assertProviderTerminalGeometry(terminal.terminalId);
+      await assertTerminalPanelResizesTui(terminal.terminalId, settled);
+    } else if (terminal.kind === "preparation-timeout") {
+      const settled = await waitForFreshTerminalTuiSize(terminal.tuiLogStart);
+      await assertUnobservedTerminalRemainsUsable(settled);
     }
     const terminalInput =
       '[data-terminal-owner="center-panel"] .xterm-helper-textarea, [data-terminal-owner="right-panel"] .xterm-helper-textarea';
@@ -1398,8 +1481,8 @@ describe("packaged responsive activity experience", () => {
     // The chat tabbed away behind its terminal mounts no Activity, so it
     // neither reads nor announces it until it is in front again.
     expect(await browser.$$(DOCK_BUTTON).length).toBe(0);
-    if (supportsCodexTerminalActivity) {
-      await assertProviderTerminalGeometry(terminalId);
+    if (terminal.kind === "observed") {
+      await assertProviderTerminalGeometry(terminal.terminalId);
     }
     const mainPanel = browser.$(
       '//*[@data-center-panel-tab-list]//button[.//span[normalize-space()="Codex"]]',
@@ -1488,8 +1571,8 @@ describe("packaged responsive activity experience", () => {
     });
     expect(composerFocus).toEqual({ focused: true, lost: false });
 
-    if (supportsCodexTerminalActivity) {
-      await assertNarrowSplitUsability(terminalId);
+    if (terminal.kind === "observed") {
+      await assertNarrowSplitUsability(terminal.terminalId);
     }
 
     await browser.saveScreenshot(

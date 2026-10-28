@@ -3429,17 +3429,20 @@ and the rest of the diagnostic report. Inspect these logs when the app or
 embedded driver exits unexpectedly. A missing provider-terminal activity dock
 also records structural pane, surface, and activity-host geometry to distinguish
 layout visibility from provider-observation failures. A visible host with no
-dock is an observation failure. Before changing layout, read the Codex observer
-lines in `app-server.log`: each names its `reason`, its `stage`, and `elapsed_ms`
+dock is a failure unless the current launch logged Codex `preparation_timeout`;
+then the original terminal must draw fresh TUI output and redraw when its pane
+widens and narrows, without an Activity dock. Before changing layout, read the
+Codex observer lines in `app-server.log`: each names its `reason`, its `stage`,
+and `elapsed_ms`
 (see [Activity observation](../architecture/activity-observation.md)).
 A spec that passes alone but fails in the full suite fails only under the
 suite's load. Take the stage from the full run's `app-server.log` before
 changing an observer budget. A provider factory owns its budget
 (`preparation_budget`) and the manager waits that plus 150 ms, so change the
 factory's constant, never the manager's wait; the manager's 3 s ceiling is
-asserted to stay above every provider's wait. A terminal without Activity after
-the budget logs `provider terminal observer callback timed out` with the
-`timeout_ms` that ran out (see
+asserted to stay above every provider's wait. A factory preparation timeout
+logs `reason="preparation_timeout"` and its `stage`; a manager callback timeout
+logs `provider terminal observer callback timed out` with its `timeout_ms` (see
 [Activity observation](../architecture/activity-observation.md), "Preparation budgets").
 Window resizing polls the actual viewport and native window until the requested
 size is reached, including when GTK startup dimensions settle independently.
