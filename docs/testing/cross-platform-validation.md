@@ -3283,6 +3283,38 @@ sizes. Cover relevant:
   download` inside the distro works; Ctrl-C while the app
   downloads closes the prompt or stops the download; with the app quit, the
   command exits 3;
+- unattended diagnostics (#202), with every BiBCode app on the downloading
+  machine quit: on the remote, `bibcode pairing offer --access diagnostics
+  --endpoint <address> --json`; on the downloading machine,
+  `bibcode diagnostics pair --name <name> --json` with the link on standard
+  input prints `"status":"paired"` and no credential; the remote's Share tab
+  lists `<remote name> (diagnostics)` with one scope, `diagnostics:read`;
+  `bibcode diagnostics download --remote <name> --output <dir> --json` exits 0
+  with a ZIP whose `manifest.json` names the remote's `storageInstanceId` and
+  whose `frontend.log` reads "No frontend warnings or errors were captured.";
+  `--include-crash-dumps` exits 2 with `crash-dumps-refused`; an offer minted
+  without `--access diagnostics` makes `pair` exit 1 with
+  `not-diagnostics-only` and save nothing, and the Share tab shows that client
+  revoked; revoking the diagnostics client there makes the next download exit
+  2 with `unauthorized`; `bibcode diagnostics forget <name>` removes it from
+  `bibcode diagnostics remotes`. The automated equivalents run with
+  `cargo test -p bibcode-server --test diagnostics_remote_cli -j 2` and
+  `cargo test -p bibcode-server --lib diagnostics::remote_cli`;
+- the stored credential's protection: on macOS and Linux,
+  `ls -l ~/.bibcode/userdata/diagnostics-remotes/` shows `-rw-------` records
+  in a `drwx------` directory (the integration test checks the record's mode).
+  On Windows, `icacls "$env:USERPROFILE\.bibcode\userdata\diagnostics-remotes\<name>.bin"`
+  lists only the current user, with inheritance disabled. **Unverified:** the
+  Windows ACL check has not been run on a Windows host for this command yet;
+- an `https` remote (Tailscale Serve, or a reverse proxy with a publicly
+  trusted or system-installed certificate): `pair` and `download --remote`
+  succeed against `https://<host>`; against a self-signed certificate the
+  system does not trust, `pair` exits 3 with `tls` before anything is sent, and
+  the same offer still pairs once the endpoint is fixed. The automated
+  `pairs_and_downloads_through_a_verified_wss_endpoint` test covers a test
+  authority on the host it runs on. **Unverified:** a real Tailscale Serve or
+  reverse-proxy endpoint, and the Windows and Linux platform verifiers, have
+  not been exercised by hand yet;
 - Find in thread on macOS (WKWebView), Linux (WebKitGTK AppImage), and Windows
   (WebView2), in a long thread with folded turns: find a word that appears only
   in a folded turn, a tool command inside a collapsed run of tool calls, a file

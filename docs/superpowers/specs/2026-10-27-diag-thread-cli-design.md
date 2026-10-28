@@ -1,6 +1,7 @@
 # Diagnostics from a thread, and remote bundles for the CLI (#201) — design
 
-Status: approved (Option A); unattended access (Option C) is #202. Builds on #194 (`server.downloadDiagnosticLogs`).
+Status: approved (Option A); unattended access (Option C) is #202, built with a
+diagnostics-only scope: `docs/superpowers/specs/2026-10-27-cli-pairing-design.md`. Builds on #194 (`server.downloadDiagnosticLogs`).
 
 ## Problem
 
