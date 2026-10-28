@@ -111,10 +111,9 @@ fn a_mapped_subagent_absent_from_the_complete_live_set_closes_at_turn_end() {
     let (status, summary) = actor_statuses(&outputs).pop().expect("closure");
     assert_eq!(status, ActivityLifecycle::Interrupted);
     assert!(
-        summary
-            .as_deref()
-            .is_some_and(|summary| summary
-                .starts_with("Claude ended its turn before this subagent reported;")),
+        summary.as_deref().is_some_and(
+            |summary| summary.starts_with("Claude stopped listing this subagent as running;")
+        ),
         "{summary:?}"
     );
 

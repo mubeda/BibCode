@@ -17,7 +17,7 @@ use crate::activity::{
 };
 
 /// Why a subagent closed at its parent's turn end without a stop hook (#206).
-const TURN_END_INTERRUPTION_REASON: &str = "Claude ended its turn before this subagent reported";
+const TURN_END_INTERRUPTION_REASON: &str = "Claude stopped listing this subagent as running";
 
 const MAX_TRACKED_ACTORS: usize = 256;
 const MAX_TRACKED_TOOL_LIFECYCLES: usize = 512;

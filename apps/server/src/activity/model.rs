@@ -1417,7 +1417,7 @@ pub(crate) const INTERRUPTION_REASONS: &[&str] = &[
     "OpenCode session ended before this",
     "The provider session ended before this",
     "BiBCode restarted before this",
-    "Claude ended its turn before this",
+    "Claude stopped listing this subagent as running",
 ];
 
 pub(crate) fn validate_text(

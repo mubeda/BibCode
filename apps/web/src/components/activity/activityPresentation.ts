@@ -212,9 +212,11 @@ export function activityElapsedLabel(startedAt: string, now: string): string {
 }
 
 /**
- * The time a roster row shows. A record BiBCode closed because its process
- * ended reads as interrupted, never completed; its summary says why and when
- * it last reported.
+ * The time a roster row shows: how long it ran, named by how it ended. A
+ * record BiBCode closed because its process ended reads as interrupted, never
+ * completed; its summary says why and when it last reported. Nothing here
+ * depends on the current time once the record ended, so the label never goes
+ * stale.
  */
 export function activityRecordTimeLabel(
   record: {
@@ -234,7 +236,7 @@ export function activityRecordTimeLabel(
     case "cancelled":
       return `Stopped after ${ranFor}`;
     case "interrupted":
-      return `Interrupted ${activityElapsedLabel(record.terminalAt, now)} ago`;
+      return `Interrupted after ${ranFor}`;
     default:
       return `Completed in ${ranFor}`;
   }
@@ -249,8 +251,8 @@ const PROVIDER_LABELS: Readonly<Record<string, string>> = {
   grok: "Grok",
 };
 
-/** Why a running subagent has no Stop yet: its runtime has not linked it to a task. */
+/** Why a running subagent has no Stop of its own, and what still ends it. */
 export function activityStopUnavailableReason(provider: string): string {
   const label = Object.hasOwn(PROVIDER_LABELS, provider) ? PROVIDER_LABELS[provider] : undefined;
-  return `${label ?? "The provider"} hasn't reported a way to stop this subagent yet.`;
+  return `${label ?? "The provider"} can't stop this subagent on its own. Stop the turn to end it.`;
 }
