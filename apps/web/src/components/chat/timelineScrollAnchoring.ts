@@ -39,6 +39,167 @@ export function pointerPressStopsLiveFollow(target: EventTarget | null): boolean
   );
 }
 
+/**
+ * Controls that Space activates instead of scrolling. A link is not one: Space on a focused
+ * link scrolls the page.
+ */
+const SPACE_ACTIVATED_CONTROL_SELECTOR =
+  'button, input, textarea, select, summary, [role="button"]';
+
+/** Keys that scroll the timeline toward its end, and toward its start. */
+const TIMELINE_DOWN_KEYS = new Set(["ArrowDown", "PageDown", "End"]);
+const TIMELINE_UP_KEYS = new Set(["ArrowUp", "PageUp", "Home"]);
+
+/** The parts of a keydown and of the timeline's scroll node the classification reads. */
+export interface TimelineScrollKeyEvent {
+  readonly key: string;
+  readonly shiftKey: boolean;
+  readonly defaultPrevented: boolean;
+  readonly target: EventTarget | null;
+}
+
+export interface TimelineScrollKeyScroller {
+  readonly scrollTop: number;
+  readonly scrollHeight: number;
+  readonly clientHeight: number;
+}
+
+/** The parts of the timeline's scroll node and its document that the takeover listeners use. */
+export type TimelineTakeoverScrollNode = Pick<
+  HTMLElement,
+  | "contains"
+  | "addEventListener"
+  | "removeEventListener"
+  | "scrollTop"
+  | "scrollHeight"
+  | "clientHeight"
+>;
+export type TimelineTakeoverDocument = Pick<
+  Document,
+  "body" | "documentElement" | "addEventListener" | "removeEventListener"
+>;
+
+/**
+ * Listens for the reader taking the timeline's scroll over and calls `onTakeover` (#190): the
+ * wheel, a touch move, a pointer press that is not a click on a control, and the scrolling
+ * keys. A key counts when it is pressed inside the timeline, or with focus on the page itself
+ * after the last press was inside the timeline: clicking its text, or a control a webview does
+ * not focus on click (WebKit's buttons), leaves focus on the body, and the browser then scrolls
+ * the timeline with the key. Keys are heard on the document after they bubble, so a control's
+ * `preventDefault`, including one React makes at its root, is already seen. Returns a function
+ * that removes the listeners.
+ */
+export function bindTimelineTakeoverListeners(
+  scrollNode: TimelineTakeoverScrollNode,
+  ownerDocument: TimelineTakeoverDocument,
+  onTakeover: () => void,
+): () => void {
+  let pressedInTimeline = false;
+  const handleNavigation = () => onTakeover();
+  const handlePointerDown = (event: PointerEvent) => {
+    if (pointerPressStopsLiveFollow(event.target)) {
+      onTakeover();
+    }
+  };
+  const handleDocumentPointerDown = (event: PointerEvent) => {
+    pressedInTimeline = scrollNode.contains(event.target as Node | null);
+  };
+  const handleFocusIn = (event: FocusEvent) => {
+    if (!scrollNode.contains(event.target as Node | null)) {
+      pressedInTimeline = false;
+    }
+  };
+  const handleKeyDown = (event: KeyboardEvent) => {
+    const target = event.target as Node | null;
+    const fromTimeline = scrollNode.contains(target);
+    const fromPage =
+      target === ownerDocument.body ||
+      target === ownerDocument.documentElement ||
+      (target as unknown) === ownerDocument;
+    if (!fromTimeline && !(fromPage && pressedInTimeline)) {
+      return;
+    }
+    if (keyboardScrollStopsLiveFollow(event, scrollNode)) {
+      onTakeover();
+    }
+  };
+  scrollNode.addEventListener("wheel", handleNavigation, { passive: true });
+  scrollNode.addEventListener("touchmove", handleNavigation, { passive: true });
+  scrollNode.addEventListener("pointerdown", handlePointerDown, { passive: true });
+  ownerDocument.addEventListener("pointerdown", handleDocumentPointerDown, {
+    capture: true,
+    passive: true,
+  });
+  ownerDocument.addEventListener("focusin", handleFocusIn);
+  ownerDocument.addEventListener("keydown", handleKeyDown);
+  return () => {
+    scrollNode.removeEventListener("wheel", handleNavigation);
+    scrollNode.removeEventListener("touchmove", handleNavigation);
+    scrollNode.removeEventListener("pointerdown", handlePointerDown);
+    ownerDocument.removeEventListener("pointerdown", handleDocumentPointerDown, {
+      capture: true,
+    });
+    ownerDocument.removeEventListener("focusin", handleFocusIn);
+    ownerDocument.removeEventListener("keydown", handleKeyDown);
+  };
+}
+
+/**
+ * Whether a key pressed inside the timeline's scroller is the reader scrolling it, which stops
+ * live following as the wheel does (#190). It is not when a control owned the key (it called
+ * `preventDefault`), when the key edits text, when Space activates a focused control, or when
+ * the list is already at the end the key moves toward: nothing moves, so following goes on.
+ */
+export function keyboardScrollStopsLiveFollow(
+  event: TimelineScrollKeyEvent,
+  scroller: TimelineScrollKeyScroller,
+): boolean {
+  if (event.defaultPrevented) {
+    return false;
+  }
+  const isSpace = event.key === " ";
+  const down = TIMELINE_DOWN_KEYS.has(event.key) || (isSpace && !event.shiftKey);
+  const up = TIMELINE_UP_KEYS.has(event.key) || (isSpace && event.shiftKey);
+  if (!down && !up) {
+    return false;
+  }
+  const element = event.target as Partial<
+    Pick<HTMLElement, "closest" | "isContentEditable">
+  > | null;
+  if (element?.isContentEditable === true) {
+    return false;
+  }
+  if (typeof element?.closest === "function") {
+    if (element.closest("input, textarea, select") !== null) {
+      return false;
+    }
+    if (isSpace && element.closest(SPACE_ACTIVATED_CONTROL_SELECTOR) !== null) {
+      return false;
+    }
+  }
+  if (down) {
+    return scroller.scrollTop < scroller.scrollHeight - scroller.clientHeight - 1;
+  }
+  return scroller.scrollTop > 1;
+}
+
+/**
+ * How far the timeline must scroll for a sent row to rest `anchorOffset` below the scroller's
+ * top, measured on screen (#191), or null when it is already within a pixel of there.
+ */
+export function getSentRowLandingDelta({
+  rowTop,
+  viewportTop,
+  anchorOffset,
+}: {
+  readonly rowTop: number;
+  readonly viewportTop: number;
+  readonly anchorOffset: number;
+}): number | null {
+  const delta = rowTop - viewportTop - anchorOffset;
+  return Math.abs(delta) <= 1 ? null : delta;
+}
+
 /** Programmatic timeline scrolls jump instead of gliding when the user asks for reduced motion. */
 export function timelineScrollAnimates(): boolean {
   return (

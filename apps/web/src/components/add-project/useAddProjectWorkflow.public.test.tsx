@@ -73,6 +73,16 @@ vi.mock("~/state/environments", () => ({
   usePrimaryEnvironment: () => harness.environments[0] ?? null,
 }));
 
+// Settings → Default Agent is the primary-server setting; the primary is environments[0].
+vi.mock("~/hooks/useSettings", () => ({
+  usePrimaryDefaultAgent: () => {
+    const primary = harness.environments[0] as
+      | { readonly serverConfig?: { readonly settings?: { readonly defaultAgent?: unknown } } }
+      | undefined;
+    return primary?.serverConfig?.settings?.defaultAgent;
+  },
+}));
+
 vi.mock("~/state/entities", () => ({
   useProjects: () => harness.projects,
   useActiveEnvironmentId: () => harness.activeEnvironmentId,
@@ -609,6 +619,90 @@ describe("useAddProjectWorkflow public adapter", () => {
       to: "/$environmentId/$threadId",
       params: { environmentId, threadId: defaultThreadId },
     });
+  });
+
+  it("applies the primary-server Default Agent to a project on another server (#185)", async () => {
+    const primary = harness.environments[0] as {
+      serverConfig: { settings: typeof DEFAULT_SERVER_SETTINGS };
+    };
+    primary.serverConfig.settings = {
+      ...primary.serverConfig.settings,
+      defaultAgent: { kind: "terminal", instanceId: codexInstanceId },
+    };
+    // The remote server's own persisted settings name another default (Claude chat).
+    harness.environments = [
+      ...harness.environments,
+      environment(sshEnvironmentId, "Build server", {
+        _tag: "SshConnectionTarget",
+        connectionId: "ssh:build-server",
+      }),
+    ];
+    harness.presentation = presentation("desktop", "macos");
+    harness.activeEnvironmentId = sshEnvironmentId;
+    await mountWorkflow();
+
+    act(() => currentWorkflow.setHostPath("/code/remote"));
+    await act(async () => currentWorkflow.submitHostPath());
+
+    expect(harness.createProject.mock.calls[0]?.[0]).toMatchObject({
+      environmentId: sshEnvironmentId,
+      input: {
+        defaultModelSelection: expect.objectContaining({ instanceId: codexInstanceId }),
+      },
+    });
+    expect(harness.replaceMainWithTerminal).toHaveBeenCalledWith(
+      scopeThreadRef(sshEnvironmentId, defaultThreadId),
+      [],
+      expect.objectContaining({ label: "Codex Terminal" }),
+    );
+  });
+
+  it("opens Main with the Default Agent's provider when the target server has no ready agent (#185)", async () => {
+    // The primary-server default is Claude chat (the fixture); the target names Codex.
+    const target = environment(sshEnvironmentId, "Build server", {
+      _tag: "SshConnectionTarget",
+      connectionId: "ssh:build-server",
+    });
+    target.serverConfig.providers = [
+      { ...provider, status: "error" },
+      { ...claudeProvider, status: "error" },
+    ];
+    target.serverConfig.settings = {
+      ...target.serverConfig.settings,
+      defaultAgent: { kind: "chat", instanceId: codexInstanceId },
+    };
+    harness.environments = [...harness.environments, target];
+    harness.presentation = presentation("desktop", "macos");
+    harness.activeEnvironmentId = sshEnvironmentId;
+    await mountWorkflow();
+
+    act(() => currentWorkflow.setHostPath("/code/not-ready"));
+    await act(async () => currentWorkflow.submitHostPath());
+
+    expect(harness.createProject.mock.calls[0]?.[0]).toMatchObject({
+      environmentId: sshEnvironmentId,
+      input: {
+        defaultModelSelection: expect.objectContaining({ instanceId: claudeInstanceId }),
+      },
+    });
+  });
+
+  it("waits for the target server's host information before adding a project", async () => {
+    const target = environment(sshEnvironmentId, "Build server", {
+      _tag: "SshConnectionTarget",
+      connectionId: "ssh:build-server",
+    });
+    (target as { serverConfig: unknown }).serverConfig = null;
+    harness.environments = [...harness.environments, target];
+    harness.presentation = presentation("desktop", "macos");
+    harness.activeEnvironmentId = sshEnvironmentId;
+    await mountWorkflow();
+
+    act(() => currentWorkflow.setHostPath("/code/no-config"));
+    await act(async () => currentWorkflow.submitHostPath());
+
+    // No config means no Main to open with a guessed agent.
+    expect(harness.createProject).not.toHaveBeenCalled();
   });
 
   it("falls back from an unavailable saved provider to the first ready chat", async () => {

@@ -1,28 +1,22 @@
-import { useAtomValue } from "@effect/atom-react";
-import {
-  EMPTY_ENVIRONMENT_ACTIVITY_STATE,
-  type EnvironmentActivityState,
-} from "@bibcode/client-runtime/state/activity";
 import type {
   ActivityScopeRef,
-  ActivitySection,
+  ActivitySnapshot,
   ProviderTerminalActivityLaunch,
   ScopedThreadRef,
 } from "@bibcode/contracts";
 import { useCallback, useMemo } from "react";
 
-import { useRightPanelStore } from "~/rightPanelStore";
-import { environmentActivity } from "~/state/activity";
-
-import { ActivityDock } from "./ActivityDock";
-import { activitySnapshotForState, selectActivityDockVisibility } from "./activityPresentation";
+import { ActivityPane } from "./ActivityPane";
 
 export interface ProviderTerminalActivityDockProps {
+  /** The host thread that owns the terminal pane. */
   readonly threadRef: ScopedThreadRef;
   readonly terminalId: string;
   readonly activity: ProviderTerminalActivityLaunch | undefined;
   readonly visible: boolean;
   readonly compact: boolean;
+  /** The terminal pane, whose height bounds the expanded panel. */
+  readonly paneElement: HTMLElement | null;
 }
 
 interface EligibleProviderTerminalActivityDockProps extends Omit<
@@ -34,6 +28,7 @@ function EligibleProviderTerminalActivityDock({
   threadRef,
   terminalId,
   compact,
+  paneElement,
 }: EligibleProviderTerminalActivityDockProps) {
   const scope = useMemo<ActivityScopeRef>(
     () => ({
@@ -50,30 +45,28 @@ function EligibleProviderTerminalActivityDock({
     }),
     [scope, threadRef.environmentId],
   );
-  const stateValueAtom = useMemo(() => environmentActivity.stateValueAtom(target), [target]);
-  const activityState =
-    useAtomValue(stateValueAtom) ?? (EMPTY_ENVIRONMENT_ACTIVITY_STATE as EnvironmentActivityState);
-  const snapshot = useMemo(() => activitySnapshotForState(activityState), [activityState]);
-  const onOpenSection = useCallback(
-    (section: ActivitySection) =>
-      useRightPanelStore
-        .getState()
-        .openActivity(threadRef, section, { _tag: "terminal", terminalId }),
-    [terminalId, threadRef],
+  // The card appears only once the server proves it observes this terminal,
+  // and then in the pane's saved open or closed state.
+  const acceptSnapshot = useCallback(
+    (snapshot: ActivitySnapshot) =>
+      snapshot.scope._tag === "terminal" &&
+      snapshot.scope.threadId === threadRef.threadId &&
+      snapshot.scope.terminalId === terminalId &&
+      snapshot.capabilities.terminalObservation,
+    [terminalId, threadRef.threadId],
   );
 
-  if (
-    snapshot === null ||
-    snapshot.scope._tag !== "terminal" ||
-    snapshot.scope.threadId !== threadRef.threadId ||
-    snapshot.scope.terminalId !== terminalId ||
-    !snapshot.capabilities.terminalObservation ||
-    !selectActivityDockVisibility(snapshot).visible
-  ) {
-    return null;
-  }
-
-  return <ActivityDock snapshot={snapshot} compact={compact} onOpenSection={onOpenSection} />;
+  return (
+    <ActivityPane
+      acceptSnapshot={acceptSnapshot}
+      alwaysVisible={false}
+      compact={compact}
+      paneElement={paneElement}
+      paneId={`terminal:${terminalId}`}
+      paneOwnerRef={threadRef}
+      target={target}
+    />
+  );
 }
 
 export function ProviderTerminalActivityDock(props: ProviderTerminalActivityDockProps) {
@@ -85,6 +78,7 @@ export function ProviderTerminalActivityDock(props: ProviderTerminalActivityDock
       threadRef={props.threadRef}
       terminalId={props.terminalId}
       compact={props.compact}
+      paneElement={props.paneElement}
     />
   );
 }

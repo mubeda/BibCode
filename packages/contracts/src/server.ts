@@ -531,6 +531,58 @@ export const ServerSignalProcessResult = Schema.Struct({
 });
 export type ServerSignalProcessResult = typeof ServerSignalProcessResult.Type;
 
+/** The largest diagnostic archive a server sends or a client accepts (20 MiB). */
+export const DIAGNOSTIC_LOGS_MAX_ARCHIVE_BYTES = 20 * 1024 * 1024;
+/** The most archive bytes one `Data` item of `server.downloadDiagnosticLogs` carries. */
+export const DIAGNOSTIC_LOGS_CHUNK_BYTES = 64 * 1024;
+
+export const DiagnosticLogsDownloadInput = Schema.Struct({
+  /** This client's frontend warning/error snapshot, bounded like the HTTP request body. */
+  frontendLog: Schema.String,
+  /** Crash dumps hold raw memory; they need `orchestration:operate`. Absent means false. */
+  includeCrashDumps: Schema.optional(Schema.Boolean),
+});
+export type DiagnosticLogsDownloadInput = typeof DiagnosticLogsDownloadInput.Type;
+
+/** The archive's `manifest.json`: which server built it, and what it holds. */
+export const DiagnosticLogsManifest = Schema.Struct({
+  schemaVersion: Schema.Literal(1),
+  /** The server's self-declared id, `local` on most servers. */
+  environmentId: TrimmedNonEmptyString,
+  /** The persistent store's id, which a client keys a remote environment by. */
+  storageInstanceId: Schema.NullOr(TrimmedNonEmptyString),
+  environmentLabel: TrimmedNonEmptyString,
+  serverVersion: TrimmedNonEmptyString,
+  platform: Schema.Struct({ os: Schema.String, arch: Schema.String }),
+  generatedAt: Schema.String,
+  /** `included` counts the dumps written, which can be fewer than were asked for. */
+  crashDumps: Schema.Struct({ requested: Schema.Boolean, included: NonNegativeInt }),
+});
+export type DiagnosticLogsManifest = typeof DiagnosticLogsManifest.Type;
+
+/**
+ * `server.downloadDiagnosticLogs`: one `Started` first, then `Data` items (base64, at most
+ * {@link DIAGNOSTIC_LOGS_CHUNK_BYTES} each) whose decoded lengths sum to `byteLength`, then the
+ * stream completes.
+ */
+export const DiagnosticLogsDownloadEvent = Schema.Union([
+  Schema.TaggedStruct("Started", {
+    fileName: TrimmedNonEmptyString,
+    byteLength: NonNegativeInt,
+    manifest: DiagnosticLogsManifest,
+  }),
+  Schema.TaggedStruct("Data", { data: Schema.String }),
+]);
+export type DiagnosticLogsDownloadEvent = typeof DiagnosticLogsDownloadEvent.Type;
+
+export class DiagnosticLogsError extends Schema.TaggedError<DiagnosticLogsError>()(
+  "DiagnosticLogsError",
+  {
+    reason: Schema.Literals(["invalid", "build-failed", "too-large"]),
+    message: TrimmedNonEmptyString,
+  },
+) {}
+
 export const ServerConfig = Schema.Struct({
   environment: ExecutionEnvironmentDescriptor,
   auth: ServerAuthDescriptor,

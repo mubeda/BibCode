@@ -104,7 +104,7 @@ function props(overrides: Partial<ActivityDockProps> = {}): ActivityDockProps {
   return {
     snapshot: snapshot(),
     compact: false,
-    onOpenSection: vi.fn(),
+    onToggle: vi.fn(),
     ...overrides,
   };
 }
@@ -275,47 +275,61 @@ describe("ActivityDock", () => {
       "backgroundTasks",
     ],
   ])("opens %s in one click", async (_caseName, overrides, expected) => {
-    const onOpenSection = vi.fn();
+    const onToggle = vi.fn();
     const container = await mount(
-      <ActivityDock {...props({ onOpenSection, snapshot: snapshot(overrides) })} />,
+      <ActivityDock {...props({ onToggle, snapshot: snapshot(overrides) })} />,
     );
 
     await act(async () => pill(container).click());
 
-    expect(onOpenSection).toHaveBeenCalledTimes(1);
-    expect(onOpenSection).toHaveBeenCalledWith(expected);
+    expect(onToggle).toHaveBeenCalledTimes(1);
+    expect(onToggle).toHaveBeenCalledWith(expected);
   });
 
-  it("opens the panel again on a second click instead of collapsing anything", async () => {
-    const onOpenSection = vi.fn();
-    const container = await mount(<ActivityDock {...props({ onOpenSection })} />);
+  it("reports every click to its pane, which decides whether to open or close", async () => {
+    const onToggle = vi.fn();
+    const container = await mount(<ActivityDock {...props({ onToggle })} />);
     const button = pill(container);
 
     await act(async () => button.click());
     await act(async () => button.click());
 
-    expect(onOpenSection.mock.calls).toEqual([["subagents"], ["subagents"]]);
+    expect(onToggle.mock.calls).toEqual([["subagents"], ["subagents"]]);
     expect(pill(container)).toBe(button);
     expect(container.querySelector("[data-activity-section]")).toBeNull();
   });
 
-  it("names the per-section breakdown and no longer announces an expandable control", async () => {
-    const container = await mount(
-      <ActivityDock
-        {...props({
-          alwaysVisible: true,
-          snapshot: snapshot({ counts: counts({ active: 1, done: 6 }, { active: 0, done: 0 }) }),
-        })}
-      />,
-    );
+  it("is a disclosure whose name stays the same whether its panel is open or closed", async () => {
+    const collapsedProps = props({
+      alwaysVisible: true,
+      snapshot: snapshot({ counts: counts({ active: 1, done: 6 }, { active: 0, done: 0 }) }),
+    });
+    const container = await mount(<ActivityDock {...collapsedProps} />);
     const button = pill(container);
+    const name = "Activity: Subagents 1 active, 6 done; Background tasks 0 active, 0 done";
 
     expect(button.type).toBe("button");
-    expect(button.hasAttribute("aria-expanded")).toBe(false);
-    expect(button.getAttribute("aria-label")).toBe(
-      "Open Activity: Subagents 1 active, 6 done; Background tasks 0 active, 0 done",
+    expect(button.getAttribute("aria-expanded")).toBe("false");
+    expect(button.hasAttribute("aria-controls")).toBe(false);
+    expect(button.getAttribute("aria-label")).toBe(name);
+    expect(
+      container
+        .querySelector("[data-activity-dock-chevron]")
+        ?.getAttribute("data-activity-dock-chevron"),
+    ).toBe("collapsed");
+
+    await rerender(
+      container,
+      <ActivityDock {...collapsedProps} expanded controlsId="activity-pane-body" />,
     );
-    expect(container.querySelector(".lucide-chevron-down")).toBeNull();
+    expect(pill(container).getAttribute("aria-expanded")).toBe("true");
+    expect(pill(container).getAttribute("aria-controls")).toBe("activity-pane-body");
+    expect(pill(container).getAttribute("aria-label")).toBe(name);
+    expect(
+      container
+        .querySelector("[data-activity-dock-chevron]")
+        ?.getAttribute("data-activity-dock-chevron"),
+    ).toBe("expanded");
   });
 
   it("shows the same breakdown in a tooltip", async () => {
@@ -354,7 +368,7 @@ describe("ActivityDock", () => {
       expect(button.querySelectorAll("[data-activity-status]")).toHaveLength(1);
       expect(button.querySelector(`[data-activity-status="${expected}"]`)).not.toBeNull();
       expect(button.getAttribute("aria-label")).toBe(
-        `Open Activity: Subagents 2 active, 1 done; Background tasks 1 active, 1 done. Status: ${expected}`,
+        `Activity: Subagents 2 active, 1 done; Background tasks 1 active, 1 done. Status: ${expected}`,
       );
       expect(button.textContent).toContain("Active 3");
       expect(button.textContent).toContain("Done 2");
@@ -367,7 +381,7 @@ describe("ActivityDock", () => {
   ] as const)(
     "marks and opens a failing section that has no records yet, with always visible %s",
     async (_setting, alwaysVisible) => {
-      const onOpenSection = vi.fn();
+      const onToggle = vi.fn();
       // Codex rejected its background-terminal list before any record arrived.
       const failedBeforeRecords = snapshot({
         capabilities: {
@@ -382,18 +396,16 @@ describe("ActivityDock", () => {
         counts: counts({ active: 1, done: 1 }, { active: 0, done: 0 }),
       });
       const container = await mount(
-        <ActivityDock
-          {...props({ alwaysVisible, onOpenSection, snapshot: failedBeforeRecords })}
-        />,
+        <ActivityDock {...props({ alwaysVisible, onToggle, snapshot: failedBeforeRecords })} />,
       );
       const button = pill(container);
 
       expect(button.querySelector('[data-activity-status="error"]')).not.toBeNull();
       expect(button.getAttribute("aria-label")).toBe(
-        "Open Activity: Subagents 1 active, 1 done. Status: error",
+        "Activity: Subagents 1 active, 1 done. Status: error",
       );
       await act(async () => button.click());
-      expect(onOpenSection).toHaveBeenCalledWith("backgroundTasks");
+      expect(onToggle).toHaveBeenCalledWith("backgroundTasks");
     },
   );
 
@@ -403,14 +415,14 @@ describe("ActivityDock", () => {
   });
 
   it("shows an idle Activity button before any record when always visible", async () => {
-    const onOpenSection = vi.fn();
+    const onToggle = vi.fn();
     const empty = snapshot({ counts: counts({ active: 0, done: 0 }, { active: 0, done: 0 }) });
 
     const hidden = await mount(<ActivityDock {...props({ snapshot: empty })} />);
     expect(hidden.childElementCount).toBe(0);
 
     const container = await mount(
-      <ActivityDock {...props({ snapshot: empty, alwaysVisible: true, onOpenSection })} />,
+      <ActivityDock {...props({ snapshot: empty, alwaysVisible: true, onToggle })} />,
     );
     const button = pill(container);
     const label = button.querySelector<HTMLElement>("[data-activity-idle]");
@@ -421,11 +433,11 @@ describe("ActivityDock", () => {
     expect(button.textContent).not.toContain("Active 0");
     expect(button.querySelectorAll("[data-activity-provider-glyph]")).toHaveLength(1);
     expect(button.getAttribute("aria-label")).toBe(
-      "Open Activity: Subagents 0 active, 0 done; Background tasks 0 active, 0 done",
+      "Activity: Subagents 0 active, 0 done; Background tasks 0 active, 0 done",
     );
 
     await act(async () => button.click());
-    expect(onOpenSection).toHaveBeenCalledWith("subagents");
+    expect(onToggle).toHaveBeenCalledWith("subagents");
   });
 
   it("leaves an unclaimed empty section out of the idle button", async () => {
@@ -449,9 +461,7 @@ describe("ActivityDock", () => {
       />,
     );
 
-    expect(pill(container).getAttribute("aria-label")).toBe(
-      "Open Activity: Subagents 0 active, 0 done",
-    );
+    expect(pill(container).getAttribute("aria-label")).toBe("Activity: Subagents 0 active, 0 done");
   });
 
   it.each([
@@ -480,7 +490,7 @@ describe("ActivityDock", () => {
   });
 
   it("sanitizes malformed leaves and filters malformed records without throwing", async () => {
-    const onOpenSection = vi.fn();
+    const onToggle = vi.fn();
     const malformed = {
       ...snapshot(),
       provider: { unexpected: true },
@@ -505,14 +515,10 @@ describe("ActivityDock", () => {
       workItems: [undefined, { id: "missing-fields" }, { ...workItem("valid"), updatedAt: 7 }],
     } as unknown as ActivitySnapshot;
 
-    const container = await mount(
-      <ActivityDock {...props({ onOpenSection, snapshot: malformed })} />,
-    );
+    const container = await mount(<ActivityDock {...props({ onToggle, snapshot: malformed })} />);
     const button = pill(container);
 
-    expect(button.getAttribute("aria-label")).toBe(
-      "Open Activity: Background tasks 0 active, 3 done",
-    );
+    expect(button.getAttribute("aria-label")).toBe("Activity: Background tasks 0 active, 3 done");
     expect(button.textContent).toContain("Active 0");
     expect(button.textContent).toContain("Done 3");
     expect(button.textContent).not.toContain("NaN");
@@ -520,23 +526,23 @@ describe("ActivityDock", () => {
     expect(container.querySelector('[data-activity-provider-glyph="unknown"]')).not.toBeNull();
 
     await act(async () => button.click());
-    expect(onOpenSection).toHaveBeenCalledWith("backgroundTasks");
+    expect(onToggle).toHaveBeenCalledWith("backgroundTasks");
   });
 
   it("activates the single native button once with Enter or Space", async () => {
-    const onOpenSection = vi.fn();
-    const container = await mount(<ActivityDock {...props({ onOpenSection })} />);
+    const onToggle = vi.fn();
+    const container = await mount(<ActivityDock {...props({ onToggle })} />);
     const button = pill(container);
 
     expect(button.tabIndex).toBe(0);
     const enter = await activateNativeButton(button, "Enter");
     expect(enter.defaultPrevented).toBe(false);
-    expect(onOpenSection).toHaveBeenCalledTimes(1);
+    expect(onToggle).toHaveBeenCalledTimes(1);
 
     const space = await activateNativeButton(button, " ");
     expect(space.defaultPrevented).toBe(false);
-    expect(onOpenSection).toHaveBeenCalledTimes(2);
-    expect(onOpenSection).toHaveBeenLastCalledWith("subagents");
+    expect(onToggle).toHaveBeenCalledTimes(2);
+    expect(onToggle).toHaveBeenLastCalledWith("subagents");
   });
 
   it("does not consume Escape for its surroundings", async () => {
@@ -659,7 +665,7 @@ describe("ActivityDock", () => {
   });
 
   it("never names an unsupported section while another section remains visible", async () => {
-    const onOpenSection = vi.fn();
+    const onToggle = vi.fn();
     const backgroundOnly = snapshot({
       capabilities: {
         actors: false,
@@ -675,17 +681,15 @@ describe("ActivityDock", () => {
       workItems: [workItem("work-a")],
     });
     const container = await mount(
-      <ActivityDock {...props({ onOpenSection, snapshot: backgroundOnly })} />,
+      <ActivityDock {...props({ onToggle, snapshot: backgroundOnly })} />,
     );
     const button = pill(container);
 
-    expect(button.getAttribute("aria-label")).toBe(
-      "Open Activity: Background tasks 2 active, 3 done",
-    );
+    expect(button.getAttribute("aria-label")).toBe("Activity: Background tasks 2 active, 3 done");
     expect(button.textContent).toContain("Active 2");
     expect(container.textContent).not.toContain("unsupported-actor");
     await act(async () => button.click());
-    expect(onOpenSection).toHaveBeenCalledWith("backgroundTasks");
+    expect(onToggle).toHaveBeenCalledWith("backgroundTasks");
   });
 
   it("shows the mapped provider glyph", async () => {
@@ -740,18 +744,15 @@ describe("ActivityDock", () => {
     expect(container.textContent).toContain("Active 8");
   });
 
-  it("uses bounded tokenized placement, focus, and card classes", async () => {
+  it("sits in its pane's layout, end-aligned, with bounded focus and card classes", async () => {
     const container = await mount(<ActivityDock {...props()} />);
     const placement = container.querySelector<HTMLElement>('[data-testid="activity-dock"]');
     const card = placement?.firstElementChild as HTMLElement | null;
     const button = pill(container);
 
-    expect(placement?.className).toContain("pointer-events-none");
-    expect(placement?.className).toContain("absolute");
-    expect(placement?.className).toContain("top-3");
-    expect(placement?.className).toContain("right-3");
-    expect(placement?.className).toContain("z-20");
-    expect(card?.className).toContain("pointer-events-auto");
+    expect(placement?.className).toContain("pointer-events-auto");
+    expect(placement?.className).toContain("justify-end");
+    expect(placement?.className).not.toContain("absolute");
     expect(card?.className.split(/\s+/u)).toContain("w-fit");
     expect(card?.className).toContain("max-w-72");
     expect(card?.className).toContain("border-border");
@@ -760,16 +761,5 @@ describe("ActivityDock", () => {
     expect(card?.className).not.toContain("transition");
     expect(button.className).toContain("min-h-9");
     expect(button.className).toContain("focus-visible:ring-2");
-  });
-
-  it("uses the shared responsive sheet width as an inset when the sheet is open", async () => {
-    const container = await mount(
-      <ActivityDock {...props({ avoidRightPanelSheet: true, compact: true })} />,
-    );
-    const placement = container.querySelector<HTMLElement>('[data-testid="activity-dock"]');
-
-    expect(placement?.className).toContain("right-[calc(min(42vw,28rem)+0.75rem)]");
-    expect(placement?.className).toContain("max-[760px]:right-[calc(min(88vw,24rem)+0.75rem)]");
-    expect(placement?.className.split(/\s+/u)).not.toContain("right-3");
   });
 });

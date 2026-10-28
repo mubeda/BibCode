@@ -220,6 +220,8 @@ pub struct AssetHttpResponse {
 pub struct DiagnosticLogsHttpResponse {
     pub filename: String,
     pub bytes: Vec<u8>,
+    /// The archive's slot, kept by the response body until it is sent or dropped.
+    pub slot: Option<crate::diagnostic_bundle::DiagnosticArchiveSlot>,
 }
 
 /// A download response whose body is streamed: a file's bytes, or a folder's zip archive.
@@ -835,17 +837,45 @@ fn mcp_response(response: McpHttpResponse) -> Response {
 }
 
 fn diagnostic_logs_response(response: DiagnosticLogsHttpResponse) -> Response {
+    let length = response.bytes.len();
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/zip")
+        .header(header::CONTENT_LENGTH, length)
         .header(
             header::CONTENT_DISPOSITION,
             attachment_disposition(&response.filename),
         )
         .header(header::CACHE_CONTROL, NO_STORE)
         .header("x-content-type-options", "nosniff")
-        .body(Body::from(response.bytes))
+        .body(slot_holding_body(response.bytes, response.slot))
         .unwrap_or_else(|_| internal_error())
+}
+
+/// The archive as one body frame, with its slot kept until the body asks for the frame after
+/// it (the archive has been written) or is dropped (the request went away).
+fn slot_holding_body(
+    bytes: Vec<u8>,
+    slot: Option<crate::diagnostic_bundle::DiagnosticArchiveSlot>,
+) -> Body {
+    enum Frame {
+        Unsent(
+            bytes::Bytes,
+            Option<crate::diagnostic_bundle::DiagnosticArchiveSlot>,
+        ),
+        Sent(Option<crate::diagnostic_bundle::DiagnosticArchiveSlot>),
+    }
+    Body::from_stream(futures_util::stream::unfold(
+        Frame::Unsent(bytes::Bytes::from(bytes), slot),
+        |frame| async move {
+            match frame {
+                Frame::Unsent(bytes, slot) => {
+                    Some((Ok::<_, std::convert::Infallible>(bytes), Frame::Sent(slot)))
+                }
+                Frame::Sent(_slot) => None,
+            }
+        },
+    ))
 }
 
 /// The RFC 5987 `attr-char` set: everything outside it is percent-encoded in a `filename*`.
@@ -955,5 +985,62 @@ mod tests {
         assert_eq!(bad_request("invalid").status(), StatusCode::BAD_REQUEST);
         assert_eq!(internal_error().status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(payload_too_large().status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    fn bundles(logs: &std::path::Path) -> crate::diagnostic_bundle::DiagnosticBundleService {
+        crate::diagnostic_bundle::DiagnosticBundleService::new(
+            logs,
+            crate::diagnostic_bundle::DiagnosticBundleIdentity {
+                environment_id: "local".to_owned(),
+                storage_instance_id: None,
+                label: "Local".to_owned(),
+                server_version: "0.0.0".to_owned(),
+            },
+        )
+    }
+
+    async fn response_for(
+        service: &crate::diagnostic_bundle::DiagnosticBundleService,
+    ) -> (Response, usize) {
+        let bundle = service
+            .build(String::new(), false, time::OffsetDateTime::now_utc())
+            .await
+            .expect("bundle");
+        let length = bundle.bytes.len();
+        let response = diagnostic_logs_response(DiagnosticLogsHttpResponse {
+            filename: bundle.filename,
+            bytes: bundle.bytes,
+            slot: bundle.slot,
+        });
+        (response, length)
+    }
+
+    /// The archive's slot stays taken while its response body is unsent, and is released once
+    /// the body has been read through, or dropped unread.
+    #[tokio::test]
+    async fn the_response_body_holds_the_archive_slot_until_it_is_sent_or_dropped() {
+        let logs = tempfile::tempdir().expect("logs");
+        let service = bundles(logs.path());
+        let (response, length) = response_for(&service).await;
+        assert_eq!(service.free_slots_for_test(), 1, "held by the unsent body");
+        assert_eq!(
+            response.headers()[header::CONTENT_LENGTH],
+            length.to_string().as_str()
+        );
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(body.len(), length);
+        assert!(body.starts_with(b"PK"));
+        assert_eq!(service.free_slots_for_test(), 2, "released once sent");
+
+        let (unread, _) = response_for(&service).await;
+        assert_eq!(service.free_slots_for_test(), 1);
+        drop(unread);
+        assert_eq!(
+            service.free_slots_for_test(),
+            2,
+            "released when dropped unread"
+        );
     }
 }

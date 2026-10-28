@@ -1,10 +1,5 @@
 import { attachmentAdmissionOwner } from "../state/attachmentAdmissions";
 import {
-  ActivityError,
-  type ActivityRecordId,
-  type ActivityRecordKind,
-  type ActivityScopeRef,
-  type ActivitySection,
   type AgentSessionOpenMode,
   type ApprovalRequestId,
   DEFAULT_MODEL,
@@ -61,7 +56,6 @@ import {
   mergeInterruptedComposerContent,
   reusableStagedAttachmentAttempt,
 } from "./ChatView.logic";
-import type { TimestampFormat } from "@bibcode/contracts/settings";
 import {
   type EnvironmentConnectionPresentation,
   isConnectionUnavailable,
@@ -79,7 +73,7 @@ import { projectScriptCwd, projectScriptRuntimeEnv } from "@bibcode/shared/proje
 import { truncate } from "@bibcode/shared/String";
 import { resolveTerminalSessionLabel } from "@bibcode/shared/terminalLabels";
 import { Debouncer } from "@tanstack/react-pacer";
-import { useAtomRefresh, useAtomValue } from "@effect/atom-react";
+import { useAtomValue } from "@effect/atom-react";
 import {
   lazy,
   memo,
@@ -107,13 +101,8 @@ import {
   selectWorktreeWorkspaceActionsAvailable,
 } from "@bibcode/client-runtime/state/worktrees";
 import * as Cause from "effect/Cause";
-import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
-import { AsyncResult, Atom } from "effect/reactivity";
-import {
-  EMPTY_ENVIRONMENT_ACTIVITY_STATE,
-  type EnvironmentActivityState,
-} from "@bibcode/client-runtime/state/activity";
+import { AsyncResult } from "effect/reactivity";
 import { isDesktopHost } from "../env";
 import { readLocalApi } from "../localApi";
 import { useDiffPanelStore } from "../diffPanelStore";
@@ -135,8 +124,9 @@ import {
 import { type LegendListRef } from "@legendapp/list/react";
 import {
   getAnchoredTurnMetrics,
+  getSentRowLandingDelta,
+  bindTimelineTakeoverListeners,
   getTimelinePageScrollOffset,
-  pointerPressStopsLiveFollow,
   rowToggleNeedsEndReveal,
   timelineScrollAnimates,
   type TimelineScrollMode,
@@ -184,15 +174,14 @@ import {
 import {
   selectActiveRightPanel,
   selectActiveRightPanelSurface,
-  selectActivityFocusRequested,
   selectThreadRightPanelState,
-  type ActivityRightPanelSurface,
   type RightPanelSurface,
   useRightPanelStore,
 } from "../rightPanelStore";
 import {
   type CenterSurface,
   type CenterTerminalPlacement,
+  HOST_SURFACE_ID,
   selectFocusedCenterSurface,
   selectFocusedCenterPanelGroup,
   selectThreadCenterPanelState,
@@ -277,6 +266,8 @@ import { buildDraftThreadRouteParams, buildThreadRouteParams } from "../threadRo
 import {
   type ComposerAttachment,
   type DraftThreadEnvMode,
+  composerTargetsShareDraft,
+  resolveComposerRestoreTarget,
   useComposerDraftStore,
   type DraftId,
 } from "../composerDraftStore";
@@ -310,7 +301,6 @@ import { vcsEnvironment } from "../state/vcs";
 import { useEnvironments, usePrimaryEnvironment } from "../state/environments";
 import { useProject, useThread, useThreadProposedPlans } from "../state/entities";
 import { environmentShell } from "../state/shell";
-import { environmentActivity } from "../state/activity";
 import { ChatComposer, type ChatComposerHandle } from "./chat/ChatComposer";
 import { ComposerHistoryMenu, type ImportedSessionThread } from "./chat/ComposerHistoryMenu";
 import { historyUnavailableReason } from "./chat/ComposerHistoryMenu.logic";
@@ -341,12 +331,9 @@ import {
   getStartedThreadModelChangeBlockReason,
   LAST_INVOKED_SCRIPT_BY_PROJECT_KEY,
   LastInvokedScriptByProjectSchema,
-  type KeyedActivityPage,
   type LocalDispatchSnapshot,
   PullRequestDialogState,
   cloneComposerAttachmentForRetry,
-  reconcileBoundedActivityPages,
-  resolveActivityPageLoadAction,
   resolveCenterPanelLaunchContext,
   isAgentActivityScopeEnabled,
   resolveActivityScope,
@@ -363,15 +350,8 @@ import { useLocalStorage } from "~/hooks/useLocalStorage";
 import { useComposerHandleContext } from "../composerHandleContext";
 import { sanitizeThreadErrorMessage } from "~/rpc/transportError";
 import { RightPanelSheet } from "./RightPanelSheet";
-import { ActivityDock } from "./activity/ActivityDock";
-import { activitySnapshotForState } from "./activity/activityPresentation";
-import {
-  ActivityPanel,
-  type ActivityDetailPageData,
-  type ActivityDetailQueryResult,
-  type ActivityQueryResult,
-  type ActivityRosterPageData,
-} from "./activity/ActivityPanel";
+import { ActivityPane } from "./activity/ActivityPane";
+import type { ActivityStateTarget } from "./activity/ActivityPaneBinding";
 import { previewEnvironment } from "../state/preview";
 import { useAtomCommand } from "../state/use-atom-command";
 import { Button } from "./ui/button";
@@ -433,6 +413,43 @@ function setProjectFileSurfaceFlag(
  * LegendList clamped it to a content height it had not laid out yet.
  */
 const TIMELINE_END_FOLLOW_RECHECKS = 6;
+/**
+ * How long a sent row's landing may keep measuring once its glide stops, how many landings it
+ * may ask for in that time, and how long each may wait: LegendList holds a scroll up to 800 ms
+ * while rows settle and finishes it 100 ms later.
+ */
+const SENT_ROW_LANDING_MAX_MS = 2_000;
+const SENT_ROW_LANDING_ATTEMPTS = 20;
+const SENT_ROW_LANDING_ATTEMPT_MS = 1_000;
+
+/** The patched LegendList method that withdraws its scroll requests (see the patch). */
+interface CancellableTimelineList {
+  readonly cancelScrollRequests?: () => void;
+}
+
+/**
+ * How far the timeline must scroll for the sent row `messageId` to rest at its offset, measured
+ * on screen: null within a pixel of it, undefined when the row is not mounted.
+ */
+function measureSentRowLanding(
+  scrollNode: HTMLElement | null | undefined,
+  messageId: MessageId,
+): number | null | undefined {
+  if (!scrollNode || typeof scrollNode.querySelectorAll !== "function") {
+    return undefined;
+  }
+  const row = [...scrollNode.querySelectorAll<HTMLElement>("[data-message-id]")].find(
+    (element) => element.getAttribute("data-message-id") === messageId,
+  );
+  if (!row) {
+    return undefined;
+  }
+  return getSentRowLandingDelta({
+    rowTop: row.getBoundingClientRect().top,
+    viewportTop: scrollNode.getBoundingClientRect().top,
+    anchorOffset: CHAT_LIST_ANCHOR_OFFSET,
+  });
+}
 const TYPE_TO_FOCUS_EDITABLE_SELECTOR = [
   "input",
   "textarea",
@@ -462,162 +479,6 @@ const TYPE_TO_FOCUS_FLOATING_LAYER_SELECTOR = [
   '[data-slot="autocomplete-popup"]',
 ].join(",");
 
-type ActivityPageData = ActivityRosterPageData | ActivityDetailPageData;
-
-interface BoundedActivityQuery<Page extends ActivityPageData> extends ActivityQueryResult<Page> {
-  readonly failure: unknown | null;
-  readonly loadMore: () => void;
-  /** Explicit user Retry from the newest page. */
-  readonly refresh: () => void;
-  /** Automatic re-read from the newest page; keeps an exhausted cut-off latched. */
-  readonly revalidate: () => void;
-}
-
-function useBoundedActivityQuery<Page extends ActivityPageData>(
-  queryKey: string | null,
-  atomForCursor: (
-    cursor: string | null,
-  ) => Atom.Atom<AsyncResult.AsyncResult<Page, unknown>> | null,
-): BoundedActivityQuery<Page> {
-  const [state, setState] = useState<{
-    readonly key: string | null;
-    readonly cursor: string | null;
-    readonly pages: ReadonlyArray<KeyedActivityPage<Page>>;
-    /** The query page last folded into `pages` for this key and cursor. */
-    readonly reconciled: Page | null;
-  }>({ key: queryKey, cursor: null, pages: [], reconciled: null });
-  const current =
-    state.key === queryKey ? state : { key: queryKey, cursor: null, pages: [], reconciled: null };
-  const queryAtom = useMemo(
-    () => (queryKey === null ? null : atomForCursor(current.cursor)),
-    [atomForCursor, current.cursor, queryKey],
-  );
-  const query = useEnvironmentQuery<Page, unknown>(queryAtom);
-  const { refresh: refreshQuery, revalidate: revalidateQuery } = query;
-  const newestRefreshKeyRef = useRef<{ key: string; retry: boolean } | null>(null);
-
-  const data = query.data;
-  if (queryKey !== null && data !== null && current.reconciled !== data) {
-    setState((previous) => {
-      const pages = previous.key === queryKey ? previous.pages : [];
-      return {
-        key: queryKey,
-        cursor: current.cursor,
-        pages: reconcileBoundedActivityPages<Page>(pages, current.cursor, data),
-        reconciled: data,
-      };
-    });
-  }
-
-  useEffect(() => {
-    const pending = newestRefreshKeyRef.current;
-    if (queryKey === null || current.cursor !== null || pending?.key !== queryKey) return;
-    newestRefreshKeyRef.current = null;
-    if (pending.retry) refreshQuery();
-    else revalidateQuery();
-  }, [current.cursor, queryKey, refreshQuery, revalidateQuery]);
-
-  const pages = useMemo(() => current.pages.map((entry) => entry.page), [current.pages]);
-  const failure = Option.getOrNull(AsyncResult.error(query.emission));
-  const loadMore = useCallback(() => {
-    const nextCursor = pages.at(-1)?.nextCursor ?? null;
-    if (
-      resolveActivityPageLoadAction({
-        currentCursor: current.cursor,
-        nextCursor,
-        failed: failure !== null,
-      }) === "refresh"
-    ) {
-      refreshQuery();
-      return;
-    }
-    setState((previous) => ({
-      key: queryKey,
-      cursor: nextCursor,
-      pages: previous.key === queryKey ? previous.pages : [],
-      reconciled: null,
-    }));
-  }, [current.cursor, failure, pages, queryKey, refreshQuery]);
-  // Returning to the newest page keeps whether the initiating action was an
-  // explicit Retry or an automatic re-read.
-  const refreshNewest = useCallback(
-    (retry: boolean) => {
-      if (queryKey === null) return;
-      if (current.cursor === null) {
-        if (retry) refreshQuery();
-        else revalidateQuery();
-        return;
-      }
-      newestRefreshKeyRef.current = { key: queryKey, retry };
-      setState((previous) => ({
-        key: queryKey,
-        cursor: null,
-        pages: previous.key === queryKey ? previous.pages : [],
-        reconciled: null,
-      }));
-    },
-    [current.cursor, queryKey, refreshQuery, revalidateQuery],
-  );
-  const refresh = useCallback(() => refreshNewest(true), [refreshNewest]);
-  const revalidate = useCallback(() => refreshNewest(false), [refreshNewest]);
-
-  return useMemo(
-    () => ({
-      pages,
-      loading: query.isPending,
-      error: query.error,
-      failure,
-      loadMore,
-      refresh,
-      revalidate,
-    }),
-    [failure, loadMore, pages, query.error, query.isPending, refresh, revalidate],
-  );
-}
-
-interface ActivityStateTarget {
-  readonly environmentId: EnvironmentId;
-  readonly input: ActivityScopeRef;
-}
-
-const ActivityDockBinding = memo(function ActivityDockBinding({
-  target,
-  threadRef,
-  compact,
-  alwaysVisible,
-  avoidRightPanelSheet,
-}: {
-  readonly target: ActivityStateTarget;
-  readonly threadRef: ScopedThreadRef;
-  readonly compact: boolean;
-  readonly alwaysVisible: boolean;
-  readonly avoidRightPanelSheet: boolean;
-}) {
-  const stateValueAtom = useMemo(() => environmentActivity.stateValueAtom(target), [target]);
-  const activityState =
-    useAtomValue(stateValueAtom) ?? (EMPTY_ENVIRONMENT_ACTIVITY_STATE as EnvironmentActivityState);
-  const snapshot = useMemo(() => activitySnapshotForState(activityState), [activityState]);
-  const onOpenSection = useCallback(
-    (section: ActivitySection) =>
-      useRightPanelStore.getState().openActivity(threadRef, section, target.input),
-    [target.input, threadRef],
-  );
-
-  if (snapshot === null) {
-    return null;
-  }
-  return (
-    <ActivityDock
-      snapshot={snapshot}
-      compact={compact}
-      alwaysVisible={alwaysVisible}
-      avoidRightPanelSheet={avoidRightPanelSheet}
-      onOpenSection={onOpenSection}
-    />
-  );
-});
-
-const isActivityError = Schema.is(ActivityError);
 const isUploadClientError = Schema.is(UploadClientError);
 const isUploadEnvironmentUnavailableError = Schema.is(EnvironmentRpcUnavailableError);
 const isUploadError = Schema.is(UploadError);
@@ -632,364 +493,6 @@ function admissionOutcomeIsAmbiguous(cause: Cause.Cause<unknown>): boolean {
         (isAdmissionRpcClientError(reason.error) || isAdmissionResponseTooLarge(reason.error))),
   );
 }
-
-function isRemovedActivityFailure(failure: unknown): failure is ActivityError {
-  return isActivityError(failure) && failure.reason === "notFound";
-}
-
-function activityCancellationFailureMessage(failure: unknown): string {
-  if (!isActivityError(failure)) {
-    return "Unable to stop agents. Try again.";
-  }
-  switch (failure.reason) {
-    case "cancellationUnsupported":
-      return "Stopping this agent is not supported.";
-    case "staleScope":
-    case "staleActor":
-    case "staleOperation":
-      return "Activity changed before the request could be applied. Refresh and try again.";
-    case "providerUnavailable":
-      return "The provider is unavailable. Try again when it reconnects.";
-    case "targetUnavailable":
-      return "This agent can no longer be stopped.";
-    case "partialCancellation":
-      return "Some agents are still running.";
-    case "dispatchTimeout":
-      return "Stopping agents timed out. Some agents may still be running.";
-    default:
-      return "Unable to stop agents. Try again.";
-  }
-}
-
-const ActivityPanelBinding = memo(function ActivityPanelBinding({
-  target,
-  threadRef,
-  surface,
-  timestampFormat,
-}: {
-  readonly target: ActivityStateTarget;
-  readonly threadRef: ScopedThreadRef;
-  readonly surface: ActivityRightPanelSurface;
-  readonly timestampFormat: TimestampFormat;
-}) {
-  const stateValueAtom = useMemo(() => environmentActivity.stateValueAtom(target), [target]);
-  const stateSourceAtom = useMemo(() => environmentActivity.stateAtom(target), [target]);
-  const activityState =
-    useAtomValue(stateValueAtom) ?? (EMPTY_ENVIRONMENT_ACTIVITY_STATE as EnvironmentActivityState);
-  const refreshSnapshot = useAtomRefresh(stateSourceAtom);
-  const cancelSubtree = useAtomCommand(environmentActivity.cancelSubtree, {
-    reportFailure: false,
-  });
-  const retrySubtreeCancellation = useAtomCommand(environmentActivity.retrySubtreeCancellation, {
-    reportFailure: false,
-  });
-  const [cancellationFailure, setCancellationFailure] = useState<{
-    readonly message: string;
-    readonly targetKey: string;
-    readonly controlRevision: number;
-  } | null>(null);
-  const snapshot = useMemo(() => activitySnapshotForState(activityState), [activityState]);
-  const section = surface.section;
-  const queryBaseKey =
-    snapshot === null ? null : `${threadRef.environmentId}:${snapshot.scopeId}:${section}`;
-  const activeRosterAtomForCursor = useCallback(
-    (cursor: string | null) =>
-      snapshot === null
-        ? null
-        : (environmentActivity.roster({
-            environmentId: threadRef.environmentId,
-            input: {
-              scope: snapshot.scope,
-              scopeId: snapshot.scopeId,
-              section,
-              bucket: "active",
-              ...(cursor === null ? {} : { cursor }),
-              limit: 200,
-            },
-          }) as Atom.Atom<AsyncResult.AsyncResult<ActivityRosterPageData, unknown>>),
-    [section, snapshot, threadRef.environmentId],
-  );
-  const doneRosterAtomForCursor = useCallback(
-    (cursor: string | null) =>
-      snapshot === null
-        ? null
-        : (environmentActivity.roster({
-            environmentId: threadRef.environmentId,
-            input: {
-              scope: snapshot.scope,
-              scopeId: snapshot.scopeId,
-              section,
-              bucket: "done",
-              ...(cursor === null ? {} : { cursor }),
-              limit: 200,
-            },
-          }) as Atom.Atom<AsyncResult.AsyncResult<ActivityRosterPageData, unknown>>),
-    [section, snapshot, threadRef.environmentId],
-  );
-  const activeRoster = useBoundedActivityQuery(
-    queryBaseKey === null ? null : `${queryBaseKey}:active`,
-    activeRosterAtomForCursor,
-  );
-  const doneRoster = useBoundedActivityQuery(
-    queryBaseKey === null ? null : `${queryBaseKey}:done`,
-    doneRosterAtomForCursor,
-  );
-  const selectedRecordKind = surface.selectedRecordKind;
-  const selectedRecordId = surface.selectedRecordId;
-  const detailQueryKey =
-    queryBaseKey !== null && selectedRecordKind !== null && selectedRecordId !== null
-      ? `${queryBaseKey}:${selectedRecordKind}:${selectedRecordId}`
-      : null;
-  const detailAtomForCursor = useCallback(
-    (cursor: string | null) =>
-      snapshot === null || selectedRecordKind === null || selectedRecordId === null
-        ? null
-        : (environmentActivity.detail({
-            environmentId: threadRef.environmentId,
-            input: {
-              scope: snapshot.scope,
-              scopeId: snapshot.scopeId,
-              recordKind: selectedRecordKind,
-              recordId: selectedRecordId as ActivityRecordId,
-              ...(cursor === null ? {} : { cursor }),
-              limit: 200,
-            },
-          }) as Atom.Atom<AsyncResult.AsyncResult<ActivityDetailPageData, unknown>>),
-    [selectedRecordId, selectedRecordKind, snapshot, threadRef.environmentId],
-  );
-  const detailQuery = useBoundedActivityQuery(detailQueryKey, detailAtomForCursor);
-  const revalidateActiveRoster = activeRoster.revalidate;
-  const revalidateDoneRoster = doneRoster.revalidate;
-  const revalidateDetail = detailQuery.revalidate;
-  const refreshQueriesRef = useRef<() => void>(() => undefined);
-  useLayoutEffect(() => {
-    refreshQueriesRef.current = () => {
-      revalidateActiveRoster();
-      revalidateDoneRoster();
-      revalidateDetail();
-    };
-  }, [revalidateActiveRoster, revalidateDetail, revalidateDoneRoster]);
-  // Every change to the queried scope, record, or snapshot revision schedules
-  // one coalesced revalidation.
-  const queryRevalidationKey =
-    snapshot === null
-      ? null
-      : JSON.stringify([queryBaseKey, detailQueryKey, snapshot.revision, snapshot.scopeId]);
-  const refreshTimerRef = useRef<ReturnType<typeof globalThis.setTimeout> | null>(null);
-  useEffect(() => {
-    if (queryRevalidationKey === null) {
-      return;
-    }
-    if (refreshTimerRef.current !== null) {
-      return;
-    }
-    refreshTimerRef.current = globalThis.setTimeout(() => {
-      refreshTimerRef.current = null;
-      refreshQueriesRef.current();
-    }, 100);
-  }, [queryRevalidationKey]);
-  useEffect(
-    () => () => {
-      if (refreshTimerRef.current !== null) {
-        globalThis.clearTimeout(refreshTimerRef.current);
-      }
-    },
-    [],
-  );
-  const detail = useMemo<ActivityDetailQueryResult | null>(
-    () =>
-      selectedRecordKind !== null && selectedRecordId !== null
-        ? {
-            recordKind: selectedRecordKind as ActivityRecordKind,
-            recordId: selectedRecordId as ActivityRecordId,
-            pages: detailQuery.pages,
-            loading: detailQuery.loading,
-            error: detailQuery.error,
-            ...(isRemovedActivityFailure(detailQuery.failure) ? { removed: true } : {}),
-          }
-        : null,
-    [
-      detailQuery.error,
-      detailQuery.failure,
-      detailQuery.loading,
-      detailQuery.pages,
-      selectedRecordId,
-      selectedRecordKind,
-    ],
-  );
-  const roster = useMemo(
-    () => ({ active: activeRoster, done: doneRoster }),
-    [activeRoster, doneRoster],
-  );
-  const onNavigate = useCallback(
-    (
-      route: Pick<ActivityRightPanelSurface, "section" | "selectedRecordKind" | "selectedRecordId">,
-    ) => useRightPanelStore.getState().navigateActivity(threadRef, route),
-    [threadRef],
-  );
-  const focusRequested = useRightPanelStore((state) =>
-    selectActivityFocusRequested(state, threadRef),
-  );
-  const onFocusRequestHandled = useCallback(
-    () => useRightPanelStore.getState().acknowledgeActivityFocus(threadRef),
-    [threadRef],
-  );
-  const loadMoreActiveRoster = activeRoster.loadMore;
-  const loadMoreDoneRoster = doneRoster.loadMore;
-  const onLoadMoreRoster = useCallback(
-    (bucket: "active" | "done") =>
-      bucket === "active" ? loadMoreActiveRoster() : loadMoreDoneRoster(),
-    [loadMoreActiveRoster, loadMoreDoneRoster],
-  );
-  const cancellationTarget = useMemo(
-    () =>
-      snapshot !== null &&
-      snapshot.scope._tag === "thread" &&
-      snapshot.capabilities.targetedActorCancellation
-        ? {
-            environmentId: threadRef.environmentId,
-            scope: snapshot.scope,
-            scopeId: snapshot.scopeId,
-            controlRevision: snapshot.control.revision,
-            key: JSON.stringify([
-              threadRef.environmentId,
-              snapshot.scope._tag,
-              snapshot.scope.threadId,
-              snapshot.scopeId,
-            ]),
-          }
-        : null,
-    [snapshot, threadRef.environmentId],
-  );
-  // The panel has one scoped mutation banner, so the newest cancel or retry invocation owns it.
-  const cancellationOwnershipRef = useRef<{
-    targetKey: string | null;
-    controlRevision: number;
-    invocation: number;
-  }>({ targetKey: null, controlRevision: -1, invocation: 0 });
-  const currentCancellationTargetKey = cancellationTarget?.key ?? null;
-  const currentCancellationControlRevision = snapshot?.control.revision ?? -1;
-  useLayoutEffect(() => {
-    const ownership = cancellationOwnershipRef.current;
-    ownership.targetKey = currentCancellationTargetKey;
-    ownership.controlRevision = currentCancellationControlRevision;
-    ownership.invocation += 1;
-    return () => {
-      if (
-        ownership.targetKey === currentCancellationTargetKey &&
-        ownership.controlRevision === currentCancellationControlRevision
-      ) {
-        ownership.targetKey = null;
-        ownership.invocation += 1;
-      }
-    };
-  }, [currentCancellationControlRevision, currentCancellationTargetKey]);
-  const cancellationFailureIsCurrent =
-    cancellationFailure !== null &&
-    cancellationFailure.targetKey === currentCancellationTargetKey &&
-    cancellationFailure.controlRevision === currentCancellationControlRevision;
-  // A failure belongs to the target and revision it was raised for; drop it as
-  // soon as either changes so returning to that target cannot resurface it.
-  if (cancellationFailure !== null && !cancellationFailureIsCurrent) {
-    setCancellationFailure(null);
-  }
-  const cancellationError = cancellationFailureIsCurrent ? cancellationFailure.message : null;
-  const onCancelActor = useCallback(
-    async (actorId: ActivityRecordId, expectedControlRevision: number) => {
-      if (cancellationTarget === null) {
-        return;
-      }
-      const ownership = cancellationOwnershipRef.current;
-      const invocation = ownership.invocation + 1;
-      ownership.invocation = invocation;
-      const targetKey = cancellationTarget.key;
-      const controlRevision = cancellationTarget.controlRevision;
-      setCancellationFailure(null);
-      const result = await cancelSubtree({
-        environmentId: cancellationTarget.environmentId,
-        input: {
-          scope: cancellationTarget.scope,
-          scopeId: cancellationTarget.scopeId,
-          actorId,
-          expectedControlRevision,
-        },
-      });
-      if (
-        ownership.targetKey !== targetKey ||
-        ownership.controlRevision !== controlRevision ||
-        ownership.invocation !== invocation
-      ) {
-        return;
-      }
-      if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
-        setCancellationFailure({
-          message: activityCancellationFailureMessage(squashAtomCommandFailure(result)),
-          targetKey,
-          controlRevision,
-        });
-      }
-    },
-    [cancelSubtree, cancellationTarget],
-  );
-  const onRetryCancellation = useCallback(
-    async (rootActorId: ActivityRecordId, expectedOperationRevision: number) => {
-      if (cancellationTarget === null) {
-        return;
-      }
-      const ownership = cancellationOwnershipRef.current;
-      const invocation = ownership.invocation + 1;
-      ownership.invocation = invocation;
-      const targetKey = cancellationTarget.key;
-      const controlRevision = cancellationTarget.controlRevision;
-      setCancellationFailure(null);
-      const result = await retrySubtreeCancellation({
-        environmentId: cancellationTarget.environmentId,
-        input: {
-          scope: cancellationTarget.scope,
-          scopeId: cancellationTarget.scopeId,
-          rootActorId,
-          expectedOperationRevision,
-        },
-      });
-      if (
-        ownership.targetKey !== targetKey ||
-        ownership.controlRevision !== controlRevision ||
-        ownership.invocation !== invocation
-      ) {
-        return;
-      }
-      if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
-        setCancellationFailure({
-          message: activityCancellationFailureMessage(squashAtomCommandFailure(result)),
-          targetKey,
-          controlRevision,
-        });
-      }
-    },
-    [cancellationTarget, retrySubtreeCancellation],
-  );
-
-  if (snapshot === null) {
-    return null;
-  }
-  return (
-    <ActivityPanel
-      timestampFormat={timestampFormat}
-      route={surface}
-      snapshot={snapshot}
-      roster={roster}
-      detail={detail}
-      onNavigate={onNavigate}
-      onLoadMoreRoster={onLoadMoreRoster}
-      onLoadMoreDetail={detailQuery.loadMore}
-      onRefreshSnapshot={refreshSnapshot}
-      focusRequested={focusRequested}
-      onFocusRequestHandled={onFocusRequestHandled}
-      cancellationError={cancellationError}
-      {...(cancellationTarget === null ? {} : { onCancelActor, onRetryCancellation })}
-    />
-  );
-});
 
 type EnvironmentUnavailableState = {
   readonly environmentId: EnvironmentId;
@@ -1060,6 +563,8 @@ type ChatViewRouteProps =
 type ChatViewPanelProps = {
   variant: "panel";
   panelThreadRef: ScopedThreadRef;
+  /** The host thread whose center layout holds this panel, which keys its Activity state. */
+  activityPaneHostRef?: ScopedThreadRef;
   workspaceUnavailable: string | null;
   environmentId?: never;
   threadId?: never;
@@ -1070,7 +575,11 @@ type ChatViewPanelProps = {
 };
 
 type ChatViewProps =
-  | (ChatViewRouteProps & { variant?: "host"; panelThreadRef?: never })
+  | (ChatViewRouteProps & {
+      variant?: "host";
+      panelThreadRef?: never;
+      activityPaneHostRef?: never;
+    })
   | ChatViewPanelProps;
 
 interface PersistentTerminalLaunchContext {
@@ -1420,6 +929,7 @@ const LiveCenterPanelWorkspace = memo(function LiveCenterPanelWorkspace({
             <ChatView
               variant="panel"
               panelThreadRef={scopeThreadRef(hostThreadRef.environmentId, surface.threadId)}
+              activityPaneHostRef={hostThreadRef}
               workspaceUnavailable={workspaceUnavailable}
             />
           );
@@ -1988,8 +1498,6 @@ function ChatViewContent(props: ChatViewProps) {
     },
     [activeThreadRef],
   );
-  const focusedCenterSurface = selectFocusedCenterSurface(centerPanelState);
-  const siblingChatOwnsCenter = !isPanel && focusedCenterSurface?.kind === "chat";
   const [timelineAnchor, setTimelineAnchor] = useState<{
     readonly threadKey: string | null;
     readonly messageId: MessageId | null;
@@ -2008,19 +1516,10 @@ function ChatViewContent(props: ChatViewProps) {
   const activeRightPanelSurface = useRightPanelStore((state) =>
     selectActiveRightPanelSurface(state.byThreadKey, activeThreadRef),
   );
-  const persistedActivitySurface =
-    rightPanelState.surfaces.find((surface) => surface.kind === "activity") ?? null;
-  const persistedActivitySurfaceId = persistedActivitySurface?.id ?? null;
-  const persistedActivityScopeTag = persistedActivitySurface?.scope._tag ?? null;
-  const persistedActivityTerminalId =
-    persistedActivitySurface?.scope._tag === "terminal"
-      ? persistedActivitySurface.scope.terminalId
-      : null;
-  const activeActivitySurface =
-    activeRightPanelSurface?.kind === "activity" ? activeRightPanelSurface : null;
+  // Each chat pane shows its own thread's Activity, inline above its composer.
   const activityScope = useMemo(
-    () => resolveActivityScope(activeThreadRef, activeActivitySurface?.scope ?? { _tag: "thread" }),
-    [activeActivitySurface?.scope, activeThreadRef],
+    () => resolveActivityScope(activeThreadRef, { _tag: "thread" }),
+    [activeThreadRef],
   );
   const activityScopeEnabled =
     activityScope !== null &&
@@ -2028,62 +1527,34 @@ function ChatViewContent(props: ChatViewProps) {
       enableChatAgentActivity,
       enableTerminalAgentActivity,
     });
+  // A host tabbed away behind another pane mounts no Activity: it neither reads nor announces it.
+  // Boolean() tells React Compiler this is a primitive rather than a value that
+  // may alias the center panel state.
+  const hostChatSurfaceVisible = Boolean(
+    isPanel || centerPanelState.groups.some((group) => group.activeSurfaceId === HOST_SURFACE_ID),
+  );
   const activityStateTarget = useMemo<ActivityStateTarget | null>(
     () =>
       activityScopeEnabled &&
       activeThreadRef !== null &&
       activityScope !== null &&
-      (isPanel || !siblingChatOwnsCenter)
+      hostChatSurfaceVisible
         ? { environmentId: activeThreadRef.environmentId, input: activityScope }
         : null,
-    [activeThreadRef, activityScope, activityScopeEnabled, isPanel, siblingChatOwnsCenter],
+    [activeThreadRef, activityScope, activityScopeEnabled, hostChatSurfaceVisible],
   );
-  useEffect(() => {
-    if (
-      activeThreadRef === null ||
-      persistedActivitySurfaceId === null ||
-      persistedActivityScopeTag === null
-    ) {
-      return;
-    }
-    const persistedScope =
-      persistedActivityScopeTag === "terminal"
-        ? persistedActivityTerminalId === null
-          ? null
-          : resolveActivityScope(activeThreadRef, {
-              _tag: "terminal",
-              terminalId: persistedActivityTerminalId,
-            })
-        : resolveActivityScope(activeThreadRef, { _tag: "thread" });
-    if (
-      persistedScope !== null &&
-      !isAgentActivityScopeEnabled(persistedScope, {
-        enableChatAgentActivity,
-        enableTerminalAgentActivity,
-      })
-    ) {
-      useRightPanelStore.getState().closeSurface(activeThreadRef, persistedActivitySurfaceId);
-    }
-  }, [
-    activeThreadRef,
-    enableChatAgentActivity,
-    enableTerminalAgentActivity,
-    persistedActivityScopeTag,
-    persistedActivitySurfaceId,
-    persistedActivityTerminalId,
-  ]);
-  const panelActivitySurfaceOpen =
-    isPanel &&
-    rightPanelState.isOpen &&
-    activeActivitySurface !== null &&
-    activityStateTarget !== null;
-  const hostActivitySurfaceSuppressed =
-    !isPanel && siblingChatOwnsCenter && activeActivitySurface !== null;
-  const rightPanelSurfaceEligible = isPanel
-    ? panelActivitySurfaceOpen
-    : !hostActivitySurfaceSuppressed;
-  const renderedRightPanelSurfaces =
-    isPanel && activeActivitySurface !== null ? [activeActivitySurface] : rightPanelState.surfaces;
+  // Pane Activity state lives under the host thread's center layout, so a
+  // panel chat keys its own under the host that shows it. A panel shown with
+  // no host layout keys its state the way a host does.
+  const activityPaneHostRef =
+    props.variant === "panel" ? (props.activityPaneHostRef ?? null) : null;
+  const activityPaneOwnerRef = activityPaneHostRef ?? activeThreadRef;
+  const activityPaneId =
+    activityPaneHostRef !== null && activeThreadRef !== null
+      ? `chat:${activeThreadRef.threadId}`
+      : HOST_SURFACE_ID;
+  const rightPanelSurfaceEligible = !isPanel;
+  const renderedRightPanelSurfaces = rightPanelState.surfaces;
   const activeFileSurface =
     activeRightPanelSurface?.kind === "file" ? activeRightPanelSurface : null;
   const activePreviewState = useThreadPreviewState(activeThreadRef);
@@ -3709,18 +3180,12 @@ function ChatViewContent(props: ChatViewProps) {
       }
       return;
     }
-    if (hostActivitySurfaceSuppressed) {
-      addFilesSurface();
-      return;
-    }
     useRightPanelStore.getState().toggleVisibility(activeThreadRef);
   }, [
     activeThreadRef,
-    addFilesSurface,
     closePlanSidebar,
     closePreviewPanel,
     effectiveRightPanelOpen,
-    hostActivitySurfaceSuppressed,
     planSidebarOpen,
   ]);
   const toggleRightPanelMaximized = useCallback(() => {
@@ -3783,28 +3248,6 @@ function ChatViewContent(props: ChatViewProps) {
     },
     [activeThreadRef, cleanupRightPanelSurfaces, syncActivePreviewSurface],
   );
-  const closePanelActivitySurface = useCallback(
-    (surface: RightPanelSurface) => {
-      if (
-        !isPanel ||
-        activeActivitySurface === null ||
-        surface.kind !== "activity" ||
-        surface.id !== activeActivitySurface.id
-      ) {
-        return;
-      }
-      closeRightPanelSurface(activeActivitySurface);
-    },
-    [activeActivitySurface, closeRightPanelSurface, isPanel],
-  );
-  const ignorePanelActivityMultiSurfaceClose = useCallback(
-    (_surface: RightPanelSurface) => undefined,
-    [],
-  );
-  const closeAllPanelActivitySurfaces = useCallback(() => {
-    if (!isPanel || activeActivitySurface === null) return;
-    closeRightPanelSurface(activeActivitySurface);
-  }, [activeActivitySurface, closeRightPanelSurface, isPanel]);
   const closeOtherRightPanelSurfaces = useCallback(
     (surface: RightPanelSurface) => {
       if (!activeThreadRef) return;
@@ -3842,18 +3285,11 @@ function ChatViewContent(props: ChatViewProps) {
     cleanupRightPanelSurfaces(rightPanelState.surfaces);
     useRightPanelStore.getState().closeAllSurfaces(activeThreadRef);
   }, [activeThreadRef, cleanupRightPanelSurfaces, rightPanelState.surfaces]);
-  const closeDisplayedRightPanelSurface = isPanel
-    ? closePanelActivitySurface
-    : closeRightPanelSurface;
-  const closeOtherDisplayedRightPanelSurfaces = isPanel
-    ? ignorePanelActivityMultiSurfaceClose
-    : closeOtherRightPanelSurfaces;
-  const closeDisplayedRightPanelSurfacesToRight = isPanel
-    ? ignorePanelActivityMultiSurfaceClose
-    : closeRightPanelSurfacesToRight;
-  const closeAllDisplayedRightPanelSurfaces = isPanel
-    ? closeAllPanelActivitySurfaces
-    : closeAllRightPanelSurfaces;
+  // Only the host renders the right panel; a panel chat never shows one.
+  const closeDisplayedRightPanelSurface = closeRightPanelSurface;
+  const closeOtherDisplayedRightPanelSurfaces = closeOtherRightPanelSurfaces;
+  const closeDisplayedRightPanelSurfacesToRight = closeRightPanelSurfacesToRight;
+  const closeAllDisplayedRightPanelSurfaces = closeAllRightPanelSurfaces;
   const copyRightPanelFilePath = useCallback((relativePath: string) => {
     if (typeof window === "undefined" || !navigator.clipboard?.writeText) {
       toastManager.add(
@@ -3995,10 +3431,30 @@ function ChatViewContent(props: ChatViewProps) {
   } | null>(null);
   const anchorScrollRestoreFrameRef = useRef<number | null>(null);
   const followTimelineLiveEndRef = useRef<() => void>(() => undefined);
+  // Whether the timeline follows its end, as state so LegendList stops keeping the list at its
+  // end once the reader scrolls away: otherwise a change in the bottom region's height (the
+  // composer growing, the Activity card opening) moves a list near its end, or a thread
+  // shorter than the view, back to the end and takes the reader's line away.
+  const [timelineFollowsEnd, setTimelineFollowsEnd] = useState(true);
+  // The sent row the reader scrolled away from. LegendList reports it ready again whenever the
+  // anchored end space changes size, as each delivery does, and positioning it then would take
+  // the reader's place away, so it stays released until the next send or thread (#190).
+  const releasedTimelineAnchorRef = useRef<MessageId | null>(null);
   const cancelTimelineLiveFollowForUserNavigation = useCallback(() => {
+    // A send names its row pending before the previous one stops being positioned, so the
+    // newest send is the one released.
+    releasedTimelineAnchorRef.current =
+      pendingTimelineAnchorRef.current ??
+      positionedTimelineAnchorRef.current ??
+      releasedTimelineAnchorRef.current;
+    // LegendList can hold a scroll ChatView asked for while rows settle, or be about to keep the
+    // list at its end after a row grew; either would run over the reader, so withdraw both. The
+    // method changes nothing when neither is under way.
+    (legendListRef.current as CancellableTimelineList | null)?.cancelScrollRequests?.();
     anchorUserScrollGenerationRef.current += 1;
     timelineScrollModeRef.current = "free-scrolling";
     liveFollowUserScrollGenerationRef.current = null;
+    setTimelineFollowsEnd(false);
     pendingTimelineAnchorRef.current = null;
     positionedTimelineAnchorRef.current = null;
     settledTimelineAnchorRef.current = null;
@@ -4069,6 +3525,7 @@ function ChatViewContent(props: ChatViewProps) {
   const scrollToEnd = useCallback((animated = false) => {
     isAtEndRef.current = true;
     timelineScrollModeRef.current = "following-end";
+    setTimelineFollowsEnd(true);
     liveFollowUserScrollGenerationRef.current = anchorUserScrollGenerationRef.current;
     pendingTimelineAnchorRef.current = null;
     activeTimelineAnchorIndexRef.current = null;
@@ -4098,48 +3555,105 @@ function ChatViewContent(props: ChatViewProps) {
     },
     [cancelTimelineLiveFollowForUserNavigation, composerOverlayHeight],
   );
-  // The timeline remounts per thread (it is keyed by thread id), so bind to
-  // each thread's scroll node; without a thread there is no timeline.
-  useEffect(() => {
-    if (activeThreadId === null) {
+  // Binds the reader's takeover listeners to the timeline's list while it is mounted. The list
+  // remounts per thread (it is keyed by thread), and a thread with no rows shows an empty state
+  // instead, so a new thread's list mounts, and binds, with its first turn.
+  const timelineTakeoverCleanupRef = useRef<(() => void) | null>(null);
+  const onTimelineListMount = useCallback((list: LegendListRef | null) => {
+    timelineTakeoverCleanupRef.current?.();
+    timelineTakeoverCleanupRef.current = null;
+    const scrollNode = list?.getScrollableNode();
+    if (!scrollNode) {
       return;
     }
-    let removeListeners: (() => void) | null = null;
-    const frame = requestAnimationFrame(() => {
-      const scrollNode = legendListRef.current?.getScrollableNode();
-      if (!scrollNode) {
-        return;
-      }
-      const handleManualNavigation = () => {
-        cancelTimelineLiveFollowForUserNavigationRef.current();
-      };
-      scrollNode.addEventListener("wheel", handleManualNavigation, {
-        passive: true,
-      });
-      scrollNode.addEventListener("touchmove", handleManualNavigation, {
-        passive: true,
-      });
-      // A press on a row's control is a click, not a scroll, so following goes on (#173).
-      const handlePointerDown = (event: PointerEvent) => {
-        if (pointerPressStopsLiveFollow(event.target)) {
-          handleManualNavigation();
-        }
-      };
-      scrollNode.addEventListener("pointerdown", handlePointerDown, {
-        passive: true,
-      });
-      removeListeners = () => {
-        scrollNode.removeEventListener("wheel", handleManualNavigation);
-        scrollNode.removeEventListener("touchmove", handleManualNavigation);
-        scrollNode.removeEventListener("pointerdown", handlePointerDown);
-      };
-    });
+    timelineTakeoverCleanupRef.current = bindTimelineTakeoverListeners(
+      scrollNode,
+      scrollNode.ownerDocument ?? document,
+      () => cancelTimelineLiveFollowForUserNavigationRef.current(),
+    );
+  }, []);
 
-    return () => {
-      cancelAnimationFrame(frame);
-      removeListeners?.();
-    };
-  }, [activeThreadId]);
+  // Settles a sent row once its glide stops, on scrollend or a timer that can catch a slow
+  // webview's glide still moving or not yet begun (#191). A turn taller than the view is pinned
+  // where it is, since following then reveals its end. A turn that fits lands its row at its
+  // offset as measured on screen, and stays unsettled, with following waiting, until the row is
+  // within a pixel of it: each landing LegendList finishes, or clamps to content it has not laid
+  // out yet, is measured again once layout has caught up, for up to two seconds. A reader who
+  // takes over, a later send or another thread ends the landing, and the takeover withdraws the
+  // landing LegendList may still hold.
+  const settleSentTimelineRow = useCallback(
+    (messageId: MessageId) => {
+      const generation = anchorUserScrollGenerationRef.current;
+      const startedAt = performance.now();
+      const landing = () =>
+        positionedTimelineAnchorRef.current === messageId &&
+        settledTimelineAnchorRef.current !== messageId &&
+        anchorUserScrollGenerationRef.current === generation &&
+        liveFollowUserScrollGenerationRef.current === generation;
+      const settle = () => {
+        if (!landing()) {
+          return;
+        }
+        settledTimelineAnchorRef.current = messageId;
+        // Replies that arrived during the glide were not followed; follow them now rather
+        // than on the next one, which a reply that has finished never sends.
+        requestAnimationFrame(() => {
+          requestAnimationFrame(() => followTimelineLiveEndRef.current());
+        });
+      };
+      const land = (attempt: number) => {
+        const list = legendListRef.current;
+        if (!landing() || !list) {
+          settle();
+          return;
+        }
+        const scrollNode = list.getScrollableNode();
+        const turn = getActiveTimelineTurnMetrics(list);
+        const delta =
+          turn && !turn.overflowsUsableViewport
+            ? measureSentRowLanding(scrollNode, messageId)
+            : undefined;
+        const outOfTime =
+          attempt > SENT_ROW_LANDING_ATTEMPTS ||
+          performance.now() - startedAt > SENT_ROW_LANDING_MAX_MS;
+        if (delta === undefined || delta === null || outOfTime) {
+          if (attempt === 1) {
+            // Stop the glide where it is; it would otherwise go on under the follow.
+            void list.scrollToOffset({
+              offset: delta === null ? scrollNode.scrollTop : list.getState().scroll,
+              animated: false,
+            });
+          }
+          settle();
+          return;
+        }
+        const request = list.scrollToOffset({
+          offset: scrollNode.scrollTop + delta,
+          animated: false,
+        });
+        let next = false;
+        const measureAgain = () => {
+          if (next) {
+            return;
+          }
+          next = true;
+          window.clearTimeout(attemptTimer);
+          // Measure once the list has laid out what the landing scrolled to.
+          requestAnimationFrame(() => {
+            requestAnimationFrame(() => land(attempt + 1));
+          });
+        };
+        const attemptTimer = window.setTimeout(measureAgain, SENT_ROW_LANDING_ATTEMPT_MS);
+        void Promise.resolve(request).then(measureAgain, measureAgain);
+      };
+      land(1);
+    },
+    [getActiveTimelineTurnMetrics],
+  );
+  const settleSentTimelineRowRef = useRef(settleSentTimelineRow);
+  useLayoutEffect(() => {
+    settleSentTimelineRowRef.current = settleSentTimelineRow;
+  }, [settleSentTimelineRow]);
 
   const onTimelineAnchorReady = useCallback((messageId: MessageId, anchorIndex: number) => {
     if (pendingTimelineAnchorRef.current === messageId) {
@@ -4150,6 +3664,11 @@ function ChatViewContent(props: ChatViewProps) {
       return;
     }
     positionedTimelineAnchorRef.current = messageId;
+    if (releasedTimelineAnchorRef.current === messageId) {
+      // Nothing moves; the row only goes on holding the reader's place as the tail changes.
+      settledTimelineAnchorRef.current = messageId;
+      return;
+    }
     settledTimelineAnchorRef.current = null;
     const positionAnchor = (remainingAttempts: number) => {
       requestAnimationFrame(() => {
@@ -4175,14 +3694,7 @@ function ChatViewContent(props: ChatViewProps) {
           if (positionedTimelineAnchorRef.current !== messageId) {
             return;
           }
-          const scrollOffset = list.getState().scroll;
-          void list.scrollToOffset({ offset: scrollOffset, animated: false });
-          settledTimelineAnchorRef.current = messageId;
-          // Replies that arrived during the glide were not followed; follow them now rather
-          // than on the next one, which a reply that has finished never sends.
-          requestAnimationFrame(() => {
-            requestAnimationFrame(() => followTimelineLiveEndRef.current());
-          });
+          settleSentTimelineRowRef.current(messageId);
         };
         const fallbackTimer = window.setTimeout(finishAnimatedPositioning, 750);
         scrollNode.addEventListener("scrollend", finishAnimatedPositioning, { once: true });
@@ -4252,11 +3764,13 @@ function ChatViewContent(props: ChatViewProps) {
     if (isAtEnd) {
       timelineScrollModeRef.current = "following-end";
       liveFollowUserScrollGenerationRef.current = anchorUserScrollGenerationRef.current;
+      setTimelineFollowsEnd(true);
       showScrollDebouncer.current.cancel();
       setScrollPillThreadId(null);
     } else {
       timelineScrollModeRef.current = "free-scrolling";
       liveFollowUserScrollGenerationRef.current = null;
+      setTimelineFollowsEnd(false);
       showScrollDebouncer.current.maybeExecute(scrollPillThreadIdRef.current);
     }
   }, []);
@@ -4402,10 +3916,12 @@ function ChatViewContent(props: ChatViewProps) {
     };
   }, [activeThread?.id, timelineEntries, followTimelineLiveEnd]);
 
-  // A row of the anchored turn that grows without a new entry, such as a diagram drawing in a
-  // reply taller than the timeline, changes layout the effect above never sees. When the turn's
-  // end was in view before the growth, one pass reveals it again; a row expanded away from the
-  // end keeps the reader's place.
+  // A row that grows without a new entry, such as a diagram drawing in a reply taller than the
+  // timeline, changes layout the effect above never sees. That includes rows above the anchored
+  // turn, such as an earlier reply whose diagrams draw again as it remounts: the list holds the
+  // row on screen in place for growth above it, but not always (#193), and the turn's end then
+  // drops out of view until the next delivery. When the turn's end was in view before the
+  // growth, one pass reveals it again; a row expanded away from the end keeps the reader's place.
   const pendingTurnGrowthRef = useRef<{ growth: number; scrollTop: number } | null>(null);
   const followGrownTurn = useCallback(
     (grown: { readonly growth: number; readonly scrollTop: number }) => {
@@ -4429,7 +3945,6 @@ function ChatViewContent(props: ChatViewProps) {
       if (
         timelineScrollModeRef.current !== "anchoring-new-turn" ||
         anchorIndex === null ||
-        info.index < anchorIndex ||
         info.size <= info.previous
       ) {
         return;
@@ -4460,6 +3975,7 @@ function ChatViewContent(props: ChatViewProps) {
     setViewStateThreadId(activeThreadId);
     setPullRequestDialogState(null);
     setScrollPillThreadId(null);
+    setTimelineFollowsEnd(true);
     setIsRevertingCheckpoint(false);
   }
 
@@ -4470,6 +3986,7 @@ function ChatViewContent(props: ChatViewProps) {
     pendingTimelineAnchorRef.current = null;
     positionedTimelineAnchorRef.current = null;
     settledTimelineAnchorRef.current = null;
+    releasedTimelineAnchorRef.current = null;
     activeTimelineAnchorIndexRef.current = null;
     showScrollDebouncer.current.cancel();
     if (planSidebarOpenOnNextThreadRef.current) {
@@ -5556,6 +5073,13 @@ function ChatViewContent(props: ChatViewProps) {
     if (head) await onSteerQueuedMessage(head.id);
   }, [onSteerQueuedMessage, queuedMessages]);
 
+  // The draft the composer shows now. A send that began on a new chat's draft keeps that
+  // draft's id while the composer may have switched to the thread's own draft.
+  const liveComposerDraftTargetRef = useRef(composerDraftTarget);
+  useLayoutEffect(() => {
+    liveComposerDraftTargetRef.current = composerDraftTarget;
+  }, [composerDraftTarget]);
+
   const onSend = async (e?: { preventDefault: () => void }) => {
     e?.preventDefault();
     const enqueue = shouldEnqueueOnSend({
@@ -5579,6 +5103,7 @@ function ChatViewContent(props: ChatViewProps) {
     if (sendLease === null) return;
     try {
       let attachmentAuthority: AttachmentAdmissionAuthority | undefined;
+      let attachmentAuthorityChecked = false;
       const authorizeAttempt = async () => {
         const result = await readAttachmentAdmissionAuthority({ environmentId, input: undefined });
         if (result._tag === "Failure") {
@@ -5589,7 +5114,10 @@ function ChatViewContent(props: ChatViewProps) {
           return false;
         }
         if (result.value === null) {
-          if (stagedAttachmentAttempts.get(routeThreadRef) === undefined) return true;
+          if (stagedAttachmentAttempts.get(routeThreadRef) === undefined) {
+            attachmentAuthorityChecked = true;
+            return true;
+          }
           setThreadError(
             activeThread.id,
             "The original server cannot identify its data store. Update it before confirming this send; your draft was kept.",
@@ -5604,6 +5132,7 @@ function ChatViewContent(props: ChatViewProps) {
           return false;
         }
         attachmentAuthority = result.value;
+        attachmentAuthorityChecked = true;
         return true;
       };
       if (stagedAttachmentAttempts.get(routeThreadRef) !== undefined && !(await authorizeAttempt()))
@@ -5684,6 +5213,13 @@ function ChatViewContent(props: ChatViewProps) {
         onAdvanceActivePendingUserInput();
         return;
       }
+      // Authorize attachments before the snapshot: the send clears the composer right after
+      // it, so anything typed or attached during this round trip must be part of the snapshot.
+      const attachmentsAtAuthorityCheck = composerAttachmentsRef.current;
+      if (attachmentsAtAuthorityCheck.length > 0 && !attachmentAuthorityChecked) {
+        if (!(await authorizeAttempt())) return;
+        if (currentQueueThreadKeyRef.current !== routeThreadKey) return;
+      }
       const sendCtx = composerRef.current?.getSendContext();
       if (!sendCtx) return;
       const {
@@ -5698,7 +5234,8 @@ function ChatViewContent(props: ChatViewProps) {
         selectedPromptEffort: ctxSelectedPromptEffort,
         selectedModelSelection: ctxSelectedModelSelection,
       } = sendCtx;
-      const promptForSend = canonicalizeLegacyComposerFileReferences(promptRef.current);
+      const promptAtSnapshot = promptRef.current;
+      const promptForSend = canonicalizeLegacyComposerFileReferences(promptAtSnapshot);
       const {
         trimmedPrompt: trimmed,
         sendableTerminalContexts: sendableComposerTerminalContexts,
@@ -5752,12 +5289,17 @@ function ChatViewContent(props: ChatViewProps) {
         return;
       }
       if (!activeProject) return;
-      if (
-        composerAttachments.length > 0 &&
-        attachmentAuthority === undefined &&
-        !(await authorizeAttempt())
-      )
-        return;
+      if (composerAttachments.length > 0 && !attachmentAuthorityChecked) {
+        // The check above did not see these attachments. The clear below would delete
+        // anything entered during this wait, so the send goes ahead only if nothing was;
+        // otherwise the composer stays as it is for the next Send.
+        if (!(await authorizeAttempt())) return;
+        if (
+          promptRef.current !== promptAtSnapshot ||
+          composerAttachmentsRef.current !== attachmentsAtAuthorityCheck
+        )
+          return;
+      }
       if (currentQueueThreadKeyRef.current !== routeThreadKey) return;
       const threadIdForSend = activeThread.id;
       const isFirstMessage = !isServerThread || activeThread.messages.length === 0;
@@ -5819,11 +5361,18 @@ function ChatViewContent(props: ChatViewProps) {
         if (outgoingRestored) return;
         outgoingRestored = true;
         const store = useComposerDraftStore.getState();
-        const current = store.getComposerDraft(composerDraftTarget);
+        // A late reply can arrive after the new chat's draft was promoted and finalized;
+        // its content then belongs to the thread the draft became (#189).
+        const restoreTarget = resolveComposerRestoreTarget(composerDraftTarget);
+        const current = store.getComposerDraft(restoreTarget);
         const isCurrent = currentQueueThreadKeyRef.current === routeThreadKey;
+        // The live prompt belongs to the draft on screen; merge into it only when that is
+        // the draft being restored, or another draft's text would be copied into this one.
+        const showsRestoreTarget =
+          isCurrent && composerTargetsShareDraft(restoreTarget, liveComposerDraftTargetRef.current);
         const restored = mergeInterruptedComposerContent(
           {
-            prompt: isCurrent ? promptRef.current : (current?.prompt ?? ""),
+            prompt: showsRestoreTarget ? promptRef.current : (current?.prompt ?? ""),
             attachments: current?.attachments ?? [],
             terminalContexts: current?.terminalContexts ?? [],
             elementContexts: current?.elementContexts ?? [],
@@ -5843,19 +5392,21 @@ function ChatViewContent(props: ChatViewProps) {
             reviewComments: composerReviewCommentsSnapshot,
           },
         );
-        store.setPrompt(composerDraftTarget, restored.prompt);
-        store.addAttachments(composerDraftTarget, restored.attachments);
-        store.setTerminalContexts(composerDraftTarget, restored.terminalContexts);
-        store.setElementContexts(composerDraftTarget, restored.elementContexts);
-        store.setPreviewAnnotations(composerDraftTarget, restored.previewAnnotations);
-        store.setReviewComments(composerDraftTarget, restored.reviewComments);
-        if (isCurrent) {
-          const restoredDraft = store.getComposerDraft(composerDraftTarget);
+        store.setPrompt(restoreTarget, restored.prompt);
+        store.addAttachments(restoreTarget, restored.attachments);
+        store.setTerminalContexts(restoreTarget, restored.terminalContexts);
+        store.setElementContexts(restoreTarget, restored.elementContexts);
+        store.setPreviewAnnotations(restoreTarget, restored.previewAnnotations);
+        store.setReviewComments(restoreTarget, restored.reviewComments);
+        if (showsRestoreTarget) {
+          const restoredDraft = store.getComposerDraft(restoreTarget);
           promptRef.current = restoredDraft?.prompt ?? restored.prompt;
           composerAttachmentsRef.current = restoredDraft?.attachments ?? [];
           composerTerminalContextsRef.current = restored.terminalContexts;
           composerElementContextsRef.current = restored.elementContexts;
           resetRestoredComposerCursor(composerRef, promptRef.current);
+        }
+        if (isCurrent) {
           setOptimisticUserMessages((existing) => {
             for (const message of existing)
               if (message.id === messageIdForSend) revokeUserMessagePreviewUrls(message);
@@ -5956,6 +5507,7 @@ function ChatViewContent(props: ChatViewProps) {
         queuedMessageCache.remember(messageIdForSend, { attachments: composerAttachmentsSnapshot });
         isAtEndRef.current = true;
         timelineScrollModeRef.current = "following-end";
+        setTimelineFollowsEnd(true);
         void legendListRef.current?.scrollToEnd?.({ animated: false });
       }
       if (!enqueue || composerAttachmentsSnapshot.length > 0) {
@@ -5966,6 +5518,8 @@ function ChatViewContent(props: ChatViewProps) {
         timelineScrollModeRef.current = "anchoring-new-turn";
         liveFollowUserScrollGenerationRef.current = anchorUserScrollGenerationRef.current;
         pendingTimelineAnchorRef.current = messageIdForSend;
+        releasedTimelineAnchorRef.current = null;
+        setTimelineFollowsEnd(true);
         activeTimelineAnchorIndexRef.current = null;
         showScrollDebouncer.current.cancel();
         setScrollPillThreadId(null);
@@ -6200,7 +5754,9 @@ function ChatViewContent(props: ChatViewProps) {
             ...uncertain,
             ambiguousAdmission: {
               ...uncertain.ambiguousAdmission,
-              restoredDraft: useComposerDraftStore.getState().getComposerDraft(composerDraftTarget),
+              restoredDraft: useComposerDraftStore
+                .getState()
+                .getComposerDraft(resolveComposerRestoreTarget(composerDraftTarget)),
             },
           });
         if (
@@ -6548,6 +6104,8 @@ function ChatViewContent(props: ChatViewProps) {
       timelineScrollModeRef.current = "anchoring-new-turn";
       liveFollowUserScrollGenerationRef.current = anchorUserScrollGenerationRef.current;
       pendingTimelineAnchorRef.current = messageIdForSend;
+      releasedTimelineAnchorRef.current = null;
+      setTimelineFollowsEnd(true);
       activeTimelineAnchorIndexRef.current = null;
       showScrollDebouncer.current.cancel();
       setScrollPillThreadId(null);
@@ -7189,15 +6747,6 @@ function ChatViewContent(props: ChatViewProps) {
         timestampFormat={timestampFormat}
         mode="embedded"
       />
-    ) : activeActivitySurface !== null &&
-      activityStateTarget !== null &&
-      activeThreadRef !== null ? (
-      <ActivityPanelBinding
-        target={activityStateTarget}
-        threadRef={activeThreadRef}
-        surface={activeActivitySurface}
-        timestampFormat={timestampFormat}
-      />
     ) : (activeRightPanelSurface?.kind === "files" || activeRightPanelSurface?.kind === "file") &&
       activeProject &&
       activeWorkspaceRoot ? (
@@ -7278,21 +6827,6 @@ function ChatViewContent(props: ChatViewProps) {
                 >
                   {/* Messages Wrapper */}
                   <div className="relative flex min-h-0 flex-1 flex-col">
-                    {activityStateTarget !== null &&
-                    activeThreadRef !== null &&
-                    activeThread !== null ? (
-                      <ActivityDockBinding
-                        target={activityStateTarget}
-                        threadRef={activeThreadRef}
-                        compact={shouldUseCompactActivityDock}
-                        // The setting covers the chat's own activity; a terminal scope keeps the record rule.
-                        alwaysVisible={
-                          settings.activityDockAlwaysVisible &&
-                          activityStateTarget.input._tag === "thread"
-                        }
-                        avoidRightPanelSheet={shouldUsePlanSidebarSheet && effectiveRightPanelOpen}
-                      />
-                    ) : null}
                     {/* Messages — LegendList handles virtualization and scrolling internally */}
                     <MessagesTimeline
                       // Scoped, so the same thread id in another environment starts over,
@@ -7302,6 +6836,8 @@ function ChatViewContent(props: ChatViewProps) {
                       activeTurnInProgress={isWorking || !latestTurnSettled}
                       activeTurnStartedAt={activeWorkStartedAt}
                       listRef={legendListRef}
+                      onListMount={onTimelineListMount}
+                      followsEnd={timelineFollowsEnd}
                       timelineEntries={timelineEntries}
                       queuedMessages={queuedMessages}
                       queuedStatuses={queuedStatuses}
@@ -7387,6 +6923,23 @@ function ChatViewContent(props: ChatViewProps) {
                     </div>
                     <div className="chat-composer-horizontal-inset">
                       <div className="pointer-events-auto relative z-10 isolate">
+                        {/* Inside the measured composer overlay: opening the panel grows the
+                            timeline's end inset the way a taller composer does, and LegendList
+                            keeps the reading position. */}
+                        {activityStateTarget !== null &&
+                        activityPaneOwnerRef !== null &&
+                        activeThread !== null ? (
+                          <div className="mx-auto mb-1.5 w-full max-w-3xl empty:hidden">
+                            <ActivityPane
+                              target={activityStateTarget}
+                              paneOwnerRef={activityPaneOwnerRef}
+                              paneId={activityPaneId}
+                              compact={shouldUseCompactActivityDock}
+                              alwaysVisible={settings.activityDockAlwaysVisible}
+                              paneElement={chatSurfaceElement}
+                            />
+                          </div>
+                        ) : null}
                         <ComposerBannerStack className="relative z-0" items={composerBannerItems} />
                         <div className="relative z-10">
                           <ChatComposer

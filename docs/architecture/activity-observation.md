@@ -526,7 +526,17 @@ Recovery and truthful downgrade:
   large to keep is skipped without breaking its connection.
 - **Claude**: no background-work capability. Recovery moves from `none` to
   `bounded` only after correlated transcript recovery; unproven hook support
-  leaves activity unsupported. The terminal path additionally needs settings
+  leaves activity unsupported. A session that restarts in the same server
+  process keeps its activity lifecycle, and the new process's startup
+  capabilities replace what the old one reported. This also happens while Chat
+  Activity is off, so turning it back on publishes what the new process
+  reports. A Claude process whose probe
+  found no hook flags starts without a hook sink and reports `none`, so retained
+  subagents turn stale instead of staying live. Other providers whose startup
+  report is `none` (Cursor, Grok, OpenCode) only mean "not known yet". Their
+  restarted sessions keep the capabilities observed at runtime until the new
+  process reports its own (`ProviderDriver::startup_activity_capabilities_are_final`).
+  The terminal path additionally needs settings
   composition, authenticated HTTP hooks, additive merge semantics, and a safe
   private executable pin.
 - **OpenCode**: structured chat reports no activity when the child endpoint is
@@ -560,6 +570,47 @@ and invalidates further activity publication, then continues creating and
 registering the prepared PTY as the running terminal. It does not respawn the
 original command.
 
+Every way a Codex terminal ends up without Activity is logged under
+`bibcode_server::provider_terminal::codex`. Each line carries a `reason` and an
+`elapsed_ms`:
+
+- **Preparation, as info:** an executable or command that cannot be observed
+  (`unsupported_capabilities`, `rejected_args`, `probe_version_unparsed`).
+- **Preparation, as a warning:**
+  - a failure that should have worked:
+    - `probe_timeout`, `probe_spawn_failed`, or `probe_unavailable`, which
+      carry only the kind of failure, never a path;
+    - `probe_command_failed`, `generation_dir_failed`, `socket_path_too_long`;
+    - `helper_start_failed`, with the launcher's error and helper time.
+  - `preparation_timeout`, with the `stage` the budget ran out in;
+  - `helper_start_abandoned`, with the helper step (`supervisor`, `spawn`,
+    `admission`, or `readiness`) when a helper start is dropped unfinished.
+- **After spawn, as a warning:**
+  - `connect_timeout`, once, with the step reached (`connect`, `initialize`, or
+    `initialized`), when the App Server has not connected within three
+    seconds. The observer keeps waiting.
+  - `connect_failed`, unless the terminal is already closing.
+  - `root_discovery_stopped`, `root_discovery_reconnect_failed`, the `resume_*`
+    reasons, and `live_publication_rejected`.
+  - `root_discovery_pending`, once, if no TUI thread is found within ten
+    seconds.
+
+  These lines carry no App Server error text, which can quote thread content.
+  They carry the JSON-RPC error code, or which transport step failed.
+
+The preparation budget (350 ms) and the manager's callback cap (500 ms) are
+unchanged. Run alone, the packaged Activity spec passed on both macOS
+architectures with none of these lines (#192), so the earlier x64
+failures happen only with the full suite's load. Budgets change only if a full
+macOS x64 run fails and these lines name the stage that ran out.
+
+A version the probes cannot parse is cached for that executable build for ten
+minutes, so launches in that window pass through without spawning probes. The
+window lets a wrapper script whose own bytes never change recover once the
+Codex behind it is upgraded. Unsupported capabilities are cached for the life
+of the build. A probe that could not run, or exited unsuccessfully, is not
+cached: it may be transient.
+
 Observer workers are admitted under a process-wide cap of sixty-four, and
 sixteen per terminal generation. An observed terminal holds one worker; an
 OpenCode launch briefly holds a second until its terminal spawns. A worker
@@ -584,7 +635,7 @@ Claude explicitly interrupts tracked active records when its observer ends;
 Codex does not directly terminalize them; and OpenCode retries its event stream
 but skips failed reconciliation requests without changing its advertised
 terminal history capability. The terminal remains independent of its read-only
-terminal Activity surface.
+Activity panel, which opens inside the terminal's own pane.
 
 See the ownership and fallback paths in
 [`apps/server/src/provider_terminal/supervisor.rs`](../../apps/server/src/provider_terminal/supervisor.rs)

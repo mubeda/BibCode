@@ -333,38 +333,10 @@ describe("RightPanelTabs mounted interactions", () => {
     expect(onAddDevice).toHaveBeenCalledOnce();
   });
 
-  it("can suppress generic add-surface controls for an activity-only panel", async () => {
+  it("can suppress generic add-surface controls", async () => {
     await mount(<RightPanelTabs {...tabsProps({ allowAddSurfaces: false })} />);
 
     expect(document.querySelector('[aria-label="Add panel surface"]')).toBeNull();
-  });
-
-  it("renders the Activity singleton with the Bot icon", async () => {
-    const onActivate = vi.fn();
-    const activitySurface: RightPanelSurface = {
-      id: "activity",
-      kind: "activity",
-      scope: { _tag: "thread" },
-      section: "subagents",
-      selectedRecordKind: null,
-      selectedRecordId: null,
-    };
-    await mount(
-      <RightPanelTabs
-        {...tabsProps({
-          surfaces: [activitySurface],
-          activeSurfaceId: "activity",
-          onActivate,
-        })}
-      />,
-    );
-
-    const activityButton = buttonWithText("Activity");
-    expect(activityButton).toBeDefined();
-    expect(document.querySelector(".lucide-bot")).not.toBeNull();
-    expect(document.querySelector('[data-testid="tooltip"]')).toBeNull();
-    await click(activityButton);
-    expect(onActivate).toHaveBeenCalledWith(activitySurface);
   });
 
   it("renders every surface title, icon, preview fallback, and terminal label", async () => {

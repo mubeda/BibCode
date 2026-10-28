@@ -1,8 +1,11 @@
+import type { DownloadedDiagnosticLogs } from "@bibcode/client-runtime/diagnostics";
+import type { DiagnosticLogsDownloadInput, EnvironmentId } from "@bibcode/contracts";
 import * as Effect from "effect/Effect";
 import { HttpBody, HttpClient, HttpClientRequest } from "effect/http";
 
 import { resolvePrimaryEnvironmentHttpUrl } from "../environments/primary/target";
 import { runPrimaryRawHttp } from "../lib/runtime";
+import { downloadEnvironmentDiagnosticLogs } from "./environmentDiagnosticLogs";
 
 export const MAX_DIAGNOSTIC_REQUEST_BYTES = 512 * 1024;
 const OMITTED_RECORDS_MARKER = "[oldest frontend records omitted]\n";
@@ -29,6 +32,12 @@ interface DiagnosticDownloadAnchor {
 
 interface DiagnosticDownloadDependencies {
   readonly execute: (request: DiagnosticLogsRequest) => Promise<DiagnosticLogsTransportResponse>;
+  /** The bundle of an environment other than the primary, over its own RPC connection. */
+  readonly downloadFromEnvironment: (
+    environmentId: EnvironmentId,
+    label: string,
+    input: DiagnosticLogsDownloadInput,
+  ) => Promise<DownloadedDiagnosticLogs>;
   readonly resolveUrl: (path: string) => string;
   readonly createAnchor: () => DiagnosticDownloadAnchor;
   readonly appendAnchor: (anchor: DiagnosticDownloadAnchor) => void;
@@ -48,6 +57,11 @@ export type DiagnosticLogsDownloadResult =
 export interface DiagnosticLogsOptions {
   /** Crash dumps can hold fragments of memory, so the server leaves them out unless asked. */
   readonly includeCrashDumps?: boolean;
+  /**
+   * An environment other than the primary, whose own server builds the bundle. Absent: the
+   * primary environment, over its HTTP route as before.
+   */
+  readonly environment?: { readonly environmentId: EnvironmentId; readonly label: string };
 }
 
 function requestBody(frontendLog: string, options: DiagnosticLogsOptions): string {
@@ -126,6 +140,7 @@ const executeAuthenticatedRequest = async (
 
 const liveDependencies: DiagnosticDownloadDependencies = {
   execute: executeAuthenticatedRequest,
+  downloadFromEnvironment: downloadEnvironmentDiagnosticLogs,
   resolveUrl: resolvePrimaryEnvironmentHttpUrl,
   createAnchor: () => document.createElement("a"),
   appendAnchor: (anchor) => document.body.append(anchor as HTMLAnchorElement),
@@ -142,6 +157,34 @@ export async function downloadDiagnosticLogs(
   options: DiagnosticLogsOptions = {},
   dependencies: DiagnosticDownloadDependencies = liveDependencies,
 ): Promise<DiagnosticLogsDownloadResult> {
+  const { filename, archiveBytes } =
+    options.environment === undefined
+      ? await downloadFromPrimary(frontendLog, options, dependencies)
+      : await downloadFromEnvironment(frontendLog, options, options.environment, dependencies);
+  return saveArchive(filename, archiveBytes, dependencies);
+}
+
+async function downloadFromEnvironment(
+  frontendLog: string,
+  options: DiagnosticLogsOptions,
+  environment: { readonly environmentId: EnvironmentId; readonly label: string },
+  dependencies: DiagnosticDownloadDependencies,
+): Promise<{ filename: string; archiveBytes: Uint8Array<ArrayBuffer> }> {
+  // The same bounded body as the HTTP route, so the remote bundle's frontend.log matches.
+  const input = JSON.parse(requestBody(frontendLog, options)) as DiagnosticLogsDownloadInput;
+  const archive = await dependencies.downloadFromEnvironment(
+    environment.environmentId,
+    environment.label,
+    input,
+  );
+  return { filename: archive.fileName, archiveBytes: archive.bytes };
+}
+
+async function downloadFromPrimary(
+  frontendLog: string,
+  options: DiagnosticLogsOptions,
+  dependencies: DiagnosticDownloadDependencies,
+): Promise<{ filename: string; archiveBytes: Uint8Array<ArrayBuffer> }> {
   const response = await dependencies.execute({
     url: dependencies.resolveUrl("/api/diagnostics/logs.zip"),
     contentType: "application/json",
@@ -157,6 +200,14 @@ export async function downloadDiagnosticLogs(
   const filename = safeResponseFilename(response.contentDisposition, dependencies.now());
   const archiveBytes = new Uint8Array(response.bytes.byteLength);
   archiveBytes.set(response.bytes);
+  return { filename, archiveBytes };
+}
+
+async function saveArchive(
+  filename: string,
+  archiveBytes: Uint8Array<ArrayBuffer>,
+  dependencies: DiagnosticDownloadDependencies,
+): Promise<DiagnosticLogsDownloadResult> {
   if (dependencies.saveArchive) {
     const path = await dependencies.saveArchive(filename, archiveBytes);
     return path === null ? { status: "cancelled", filename } : { status: "saved", filename, path };

@@ -1525,3 +1525,192 @@ async fn authenticated_staged_upload_ownership_survives_reconnect_and_refuses_fo
     handle.shutdown();
     handle.join().await.unwrap();
 }
+
+/// Runs `server.downloadDiagnosticLogs` the way a client does: acknowledges every chunk, and
+/// returns the `Started` item with the decoded archive, or the failure the stream ended with.
+async fn download_diagnostic_logs(
+    socket: &mut TestSocket,
+    transport: &mut TransportState,
+    id: &str,
+    include_crash_dumps: bool,
+) -> Result<(Value, Vec<u8>), Value> {
+    use base64::engine::general_purpose::STANDARD;
+    send_encrypted(
+        socket,
+        transport,
+        json!({
+            "_tag": "Request",
+            "id": id,
+            "tag": "server.downloadDiagnosticLogs",
+            "payload": {
+                "frontendLog": "pinned client warning\n",
+                "includeCrashDumps": include_crash_dumps,
+            },
+            "headers": [],
+        })
+        .to_string()
+        .as_bytes(),
+    )
+    .await;
+    let mut started = None;
+    let mut archive = Vec::new();
+    loop {
+        let message = recv_encrypted_json(socket, transport).await;
+        if message["requestId"] != id {
+            continue;
+        }
+        match message["_tag"].as_str() {
+            Some("Chunk") => {
+                for value in message["values"].as_array().expect("chunk values") {
+                    match value["_tag"].as_str() {
+                        Some("Started") => {
+                            assert!(started.is_none(), "one Started item");
+                            started = Some(value.clone());
+                        }
+                        Some("Data") => {
+                            assert!(started.is_some(), "Data follows Started");
+                            let bytes = STANDARD
+                                .decode(value["data"].as_str().expect("data"))
+                                .expect("base64 data");
+                            assert!(bytes.len() <= 64 * 1024, "bounded item");
+                            archive.extend(bytes);
+                        }
+                        other => panic!("unexpected item {other:?}"),
+                    }
+                }
+                send_encrypted(
+                    socket,
+                    transport,
+                    json!({ "_tag": "Ack", "requestId": id })
+                        .to_string()
+                        .as_bytes(),
+                )
+                .await;
+            }
+            Some("Exit") if message["exit"]["_tag"] == "Success" => {
+                return Ok((started.expect("Started item"), archive));
+            }
+            Some("Exit") => {
+                assert!(started.is_none(), "a refusal sends nothing first");
+                return Err(message["exit"]["cause"][0]["error"].clone());
+            }
+            other => panic!("unexpected message {other:?}: {message}"),
+        }
+    }
+}
+
+/// The remote path of #194 end to end over a pinned (Noise) channel: the server's own bundle,
+/// named for it, with crash dumps only for a credential that may operate.
+#[tokio::test]
+async fn diagnostic_logs_download_over_a_pinned_channel_and_dumps_need_operate() {
+    let _permit = TEST_PERMIT.acquire().await.unwrap();
+    let temp = TempDir::new().unwrap();
+    let handle = start_server(&temp).await;
+    let state_dir = ServerConfig::new(temp.path()).state_dir();
+    let crashes = state_dir.join("profiler").join("crashes");
+    std::fs::create_dir_all(&crashes).unwrap();
+    std::fs::write(crashes.join("crash-1.dmp"), b"MDMP pinned dump").unwrap();
+    std::fs::write(crashes.join("crash-1.json"), b"{}").unwrap();
+    let descriptor = Client::new()
+        .get(http_url(&handle, "/.well-known/bibcode/environment"))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    let client = Client::new();
+    let admin = exchange_plain_token(
+        &client,
+        &handle,
+        &handle.startup_access().unwrap().credential,
+    )
+    .await;
+    let mut credentials = Vec::new();
+    for scopes in [
+        json!(["orchestration:read"]),
+        json!(["orchestration:read", "orchestration:operate"]),
+    ] {
+        let response = client
+            .post(http_url(&handle, "/api/auth/pairing-token"))
+            .bearer_auth(&admin)
+            .json(&json!({ "label": "diagnostics", "scopes": scopes }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let grant = response.json::<Value>().await.unwrap()["credential"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        credentials.push(mint_e2ee_credential(&handle, temp.path(), &grant).await);
+    }
+    let host_key = read_host_public_key(temp.path());
+
+    let (mut reader, mut reader_transport, reply) =
+        open_authenticated_bearer_socket(&handle, &host_key, &credentials[0]).await;
+    assert_eq!(reply["type"], "e2ee_authenticated");
+    let refusal = download_diagnostic_logs(&mut reader, &mut reader_transport, "1", true)
+        .await
+        .expect_err("a read-only credential cannot take crash dumps");
+    assert_eq!(
+        refusal["_tag"], "EnvironmentAuthorizationError",
+        "{refusal}"
+    );
+    assert_eq!(refusal["requiredScope"], "orchestration:operate");
+    let (started, archive) =
+        download_diagnostic_logs(&mut reader, &mut reader_transport, "2", false)
+            .await
+            .expect("a read-only credential downloads the logs");
+    assert_eq!(started["manifest"]["crashDumps"]["included"], 0);
+    assert_eq!(started["byteLength"].as_u64(), Some(archive.len() as u64));
+
+    let (mut operator, mut operator_transport, reply) =
+        open_authenticated_bearer_socket(&handle, &host_key, &credentials[1]).await;
+    assert_eq!(reply["type"], "e2ee_authenticated");
+    let (started, archive) =
+        download_diagnostic_logs(&mut operator, &mut operator_transport, "1", true)
+            .await
+            .expect("an operating credential downloads the dumps too");
+    let manifest = &started["manifest"];
+    assert_eq!(
+        manifest["storageInstanceId"],
+        descriptor["storageInstanceId"]
+    );
+    assert_eq!(manifest["environmentId"], descriptor["environmentId"]);
+    assert_eq!(manifest["serverVersion"], descriptor["serverVersion"]);
+    assert_eq!(
+        manifest["crashDumps"],
+        json!({ "requested": true, "included": 1 })
+    );
+    assert!(
+        started["fileName"]
+            .as_str()
+            .unwrap()
+            .starts_with("bibcode-diagnostics-")
+    );
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(archive)).expect("valid zip");
+    let mut text = String::new();
+    std::io::Read::read_to_string(
+        &mut zip.by_name("frontend.log").expect("frontend log"),
+        &mut text,
+    )
+    .unwrap();
+    assert_eq!(text, "pinned client warning\n");
+    let mut dump = Vec::new();
+    std::io::Read::read_to_end(
+        &mut zip
+            .by_name("profiler/crashes/crash-1.dmp")
+            .expect("crash dump entry"),
+        &mut dump,
+    )
+    .unwrap();
+    assert_eq!(dump, b"MDMP pinned dump");
+    assert!(zip.by_name("server.log").is_ok());
+    assert!(zip.by_name("server.trace.ndjson").is_ok());
+
+    reader.close(None).await.unwrap();
+    operator.close(None).await.unwrap();
+    handle.shutdown();
+    handle.join().await.unwrap();
+}
