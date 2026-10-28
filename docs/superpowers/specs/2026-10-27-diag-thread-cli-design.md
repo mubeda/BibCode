@@ -135,50 +135,70 @@ bibcode diagnostics download ──HTTP (loopback, CLI token)──▶ local ser
                                        server.downloadDiagnosticLogs on <environment>
 ```
 
-1. **Finding the local server.** At listen time the server writes
-   `<state dir>/cli-endpoint.json` (mode 0600 on Unix, in the per-user data root
-   on Windows): its loopback URL and a fresh random per-boot CLI token. It removes
-   the file on shutdown; a stale file fails the request as "BiBCode is not
-   running". Reading the file needs the same access as the data root, which
-   already lets `bibcode pairing issue` mint an administrative credential, so the
-   token grants nothing new. It authorizes only the relay route.
-2. **CLI → server.** `POST /api/diagnostics/relay` from a loopback peer with the
-   token: `{ environment, includeCrashDumps }`. The response is a stream of
-   length-prefixed items: `waiting` (shown as "Approve the request in BiBCode"),
-   `started { fileName, size, manifest }`, `data` (raw bytes, at most 64 KiB),
-   `failed { reason, message }`, `end`. One relay at a time per server; a second
-   gets `busy`.
-3. **Server → client.** A new stream `server.subscribeDiagnosticLogsRelay` (scope
-   `access:write`) announces `{ requestId, environment, includeCrashDumps }`.
-   `access:write` is only the floor: as approved, each handler also requires the
-   desktop app's own session (subject `desktop-bootstrap`), so no other paired
-   device, not even an administrative one, can be made to pull logs onto this host
-   (proved by `an_administrative_session_that_is_not_the_desktop_app_cannot_serve`).
-   The first window to claim (`server.claimDiagnosticLogsRelay`) owns it, bound to
-   its session and connection.
-4. **Consent.** The claiming client shows a prompt: "A command on this computer
-   asks for <label>'s logs (with crash dumps). Allow / Deny". Nothing is
-   downloaded before **Allow**. Unanswered requests expire after two minutes.
-   Crash dumps are asked for only with `--include-crash-dumps` and named in the
-   prompt.
+1. **Finding the local server.** While it runs, the server writes
+   `<state dir>/diagnostics-relay.json` (mode 0600 on Unix, in the per-user data
+   root on Windows): its URL and a fresh random per-boot token. It removes the
+   file on shutdown; a stale file fails the request as "BiBCode is not running".
+   The command sends the token only to a loopback URL. Reading the file needs the
+   same access as the data root, which already lets `bibcode pairing issue` mint
+   an administrative credential while the server runs (`lib.rs`
+   `run_pairing_command`, `tests/cli_smoke.rs`), so the token grants nothing new.
+   It authorizes only the relay route. A WSL primary keeps the file in the
+   distro's data root, so the command runs inside the distro there.
+2. **CLI → server.** `POST /api/diagnostics/relay` with the token:
+   `{ environment, includeCrashDumps, code, outputDirectory }`, where `code` is a
+   short random code the command prints ("Approve request K7Q-4M in BiBCode…").
+   The route refuses a peer that is not this machine and any request carrying a
+   proxy's forwarding headers (`Forwarded`, `X-Forwarded-*`, `X-Real-IP`,
+   `Tailscale-*`); a proxy that strips them all could still forward a request
+   from loopback, so the token is the real gate. The response is one JSON line
+   per step: `waiting`, `started { fileName, byteLength, manifest }`, `data`
+   (base64, at most 64 KiB), `finished`, `denied`, `failed { reason, message }`,
+   or `ended { reason, message }`. One relay at a time per server; a second gets
+   `busy`. After a denied or unanswered request the next waits 30 s, doubling per
+   refusal in a row up to 5 minutes (`cooling-down`); a saved archive clears it.
+3. **Server → client.** `server.subscribeDiagnosticLogsRelay` (scope
+   `access:write`) announces `Pending { requestId, environment,
+   includeCrashDumps, code, outputDirectory }`, then `Claimed` and `Closed`.
+   `access:write` is only the floor: each handler also requires the desktop app's
+   own session (subject `desktop-bootstrap`), so no other paired device, not even
+   an administrative one, can be made to pull logs onto this host (proved by
+   `an_administrative_session_that_is_not_the_desktop_app_cannot_serve`). The
+   first window to claim owns it, bound to its session and connection; `Claimed`
+   makes the other windows drop their prompt.
+4. **Consent.** Any program running as the user can make the request (an agent
+   in a thread, a paired device's terminal), so the prompt says "A program
+   running as you on this computer (not BiBCode) asks to save <label>'s
+   redacted logs to a file" and shows the code, the environment as typed, and
+   the output directory; the user shares only when the code matches the command
+   they ran. Nothing is downloaded before **Share logs**; dismissing denies.
+   Unanswered requests expire after two minutes. Crash dumps are asked for only
+   with `--include-crash-dumps` and named in the prompt and the button.
 5. **Resolving the environment.** The client resolves `<id|label>` among its
-   connected environments. Unknown or ambiguous returns `failed` listing the
-   connected environments' labels and ids (no consent needed, nothing else
-   leaves), so `bibcode diagnostics download` without `--environment` doubles as
-   the listing.
-6. **Client → server → CLI.** The client runs `downloadDiagnosticLogs` (the
-   assembler checks every bound and the storage identity), then sends the
-   verified archive with `server.sendDiagnosticLogsRelayItem { requestId, item }`
-   in 64 KiB items, one in flight: the server answers each call only after the CLI
-   took the previous one, so it holds at most one item. The server re-checks the
-   declared size against the 20 MiB bound, each item against 64 KiB, and the
-   total against the declared size; a client that stalls for 60 s (the server's
-   existing `ITEM_ACK_DEADLINE`) ends the relay.
-7. **CLI output.** It writes `<dir>/<fileName>` atomically (temp file, then
-   rename; default dir the current one, `--output DIR`), checks the received
-   length against `started.size`, and prints the path, or one JSON document with
-   `--json` (path, environment, manifest). Exit codes: 0 saved, 1 failed (the
-   message is the same copy Settings shows), 2 denied, 3 not running.
+   environments. Unknown, ambiguous or disconnected returns `failed` naming only
+   what was asked for, without a prompt; the command never learns which other
+   environments the app can reach.
+6. **Client → server → CLI.** The client registers the request's cancellation
+   before claiming, so a request that closes during the claim never starts a
+   download. It then runs `downloadDiagnosticLogs` (the assembler checks every
+   bound and the storage identity) and sends the verified archive with
+   `server.sendDiagnosticLogsRelayItem { requestId, item }` in 64 KiB items, one
+   in flight: the server answers each call only after the CLI took the previous
+   one, so it holds at most one item. The server re-checks the declared size
+   against the 20 MiB bound, each item against 64 KiB, and the total against the
+   declared size. The request ends after 10 minutes from the claim without
+   `Started`, 60 s without the next item, or when the claiming connection closes;
+   `Closed` stops the app's download.
+7. **CLI output.** It waits at most 13 minutes for `started` and 90 s between
+   items. It checks the received length against `byteLength` and that the
+   archive's `manifest.json` names the same non-empty environment and store as
+   the relayed manifest, writes and syncs a hidden `.<name>.<code>.partial` file
+   in the output directory, publishes it under its name with a hard link (an
+   exclusive create where links are unsupported), which never replaces an
+   existing file, and removes the temporary file. It prints the path, or one JSON
+   document with `--json`, with app- and remote-provided text stripped of control
+   characters. Exit codes: 0 saved, 1 failed, 2 denied, unanswered or cooling
+   down, 3 not running.
 8. **Desktop executable.** `<desktop exe> diagnostics download …` dispatches like
    `profiler` (`cli.rs` `desktop_dispatch`), so a desktop install needs no
    separate binary.
@@ -188,22 +208,25 @@ bibcode diagnostics download ──HTTP (loopback, CLI token)──▶ local ser
 - The remote enforces its own scopes on the client's own credential; nothing the
   CLI sends reaches the remote except the two download inputs.
 - Who may ask: a process that can read the data root (equivalent to today's
-  `pairing issue`). Who may serve: only an administrative session of this host's
-  own server. Who decides: the user, per request, in the app.
+  `pairing issue`). Who may serve: only the desktop app's own session on this
+  host's server. Who decides: the user, per request, in the app, matching the
+  command's code.
 - The relay never persists bytes: they pass through one bounded slot in memory.
 - The token appears in no URL, log, profiler record or argument; it travels in an
-  `Authorization` header and is compared in constant time. The route refuses
-  non-loopback peers even when the server listens wide.
+  `Authorization` header to a loopback URL only and is compared in constant
+  time. The route refuses non-local peers and proxied requests even when the
+  server listens wide.
 - Redaction is the remote server's, unchanged. The client adds its own frontend
   log snapshot exactly as the Settings download does.
 
 ### Profiler and observability
 
-The relay route and the three RPC methods register through the `rpc/session.rs`
-wrappers; the relay waits on the user and on a remote, so its methods join
-`is_long_running` (`diagnostics/profiler/latency.rs`). Each relay outcome
-(saved, denied, expired, failed reason) logs one `tracing::info!`/`warn!` line
-with the environment id and reason, never the token or bytes.
+The three RPC methods register through the `rpc/session.rs` wrappers. The
+subscription waits on the user and the send call on the command, so those two
+join `is_long_running` (`diagnostics/profiler/latency.rs`); the claim only takes
+a lock and does not. The local server logs each request's id and outcome
+(waiting, claimed, answered, the command left, or the reason it ended) with
+`tracing::info!`/`warn!`, never the token, the environment name, or bytes.
 
 ## Out of scope
 

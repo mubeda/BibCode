@@ -54,7 +54,7 @@ Change:
   schemas in `packages/contracts/src/server.ts`/`rpc.ts`, plus the rpc-wire manifest.
 - Server: `production/diagnostic_logs_relay.rs` (new: one slot, two-minute consent
   expiry, 60 s item deadline, bound re-checks, one item in flight); the
-  `POST /api/diagnostics/relay` loopback route in `http_routes.rs`; `cli-endpoint.json`
+  `POST /api/diagnostics/relay` loopback route in `http_routes.rs`; `diagnostics-relay.json`
   written and removed in `lifecycle.rs`; scopes in `auth/scope.rs` (`access:write`);
   `is_long_running` in `diagnostics/profiler/latency.rs`.
 - CLI: `diagnostics/logs_cli.rs` (new) and `CliCommand::Diagnostics` in `config.rs`;
@@ -126,3 +126,15 @@ Files outside the first list: `production/runtime.rs` (the relay is registered w
 runtime's registry, which validates completeness), `rpc/methods.rs`, `http.rs` (route
 inventory), `config.rs`/`lib.rs` (the `diagnostics` subcommand),
 `auth/service.rs`/`auth/mod.rs` (the desktop subject), and `Sidebar.test.tsx`.
+
+## Review fixes
+
+The security review's points, each with a focused test: the command prints a request code
+that the prompt shows with "A program running as you on this computer (not BiBCode)", the
+environment as typed and the output directory; cancellation is registered before the
+claim; the archive is published from a synced temporary file by hard link, never over an
+existing file; denied or unanswered requests cool down (30 s, doubling, at most 5 min);
+an unknown name lists nothing; proxied requests are refused; the token goes only to a
+loopback URL, with 13 min / 90 s read timeouts; the manifest check requires non-empty ids;
+a WSL primary is named in the error, runbook and skill; the claim left `is_long_running`;
+`Claimed` drops other windows' prompts; printed text loses control characters.
