@@ -142,7 +142,12 @@ pub fn run_profiler_cli(args: ProfilerArgs, state_dir: PathBuf) -> i32 {
 /// data root is the desktop's: `BIBCODE_HOME` or `~/.bibcode`, and the state directory its
 /// in-process server uses.
 pub fn desktop_dispatch(attach_console: fn()) -> Option<i32> {
-    if std::env::args_os().nth(1).as_deref() != Some(OsStr::new("profiler")) {
+    let command = std::env::args_os().nth(1);
+    if command.as_deref() == Some(OsStr::new("diagnostics")) {
+        attach_console();
+        return Some(desktop_diagnostics_dispatch());
+    }
+    if command.as_deref() != Some(OsStr::new("profiler")) {
         return None;
     }
     attach_console();
@@ -160,6 +165,47 @@ pub fn desktop_dispatch(attach_console: fn()) -> Option<i32> {
             1
         }
     })
+}
+
+/// `<desktop exe> diagnostics …` (#201): asks this desktop's own running server, which the
+/// app answers. Unlike `profiler`, it needs the app running; it starts nothing itself.
+fn desktop_diagnostics_dispatch() -> i32 {
+    let cli = match DesktopDiagnosticsCli::try_parse_from(std::env::args_os().skip(1)) {
+        Ok(cli) => cli,
+        Err(error) => {
+            let _ = error.print();
+            return error.exit_code();
+        }
+    };
+    let state_dir = match crate::config::profiler_state_dir(None, None) {
+        Ok(state_dir) => state_dir,
+        Err(error) => {
+            let _ = writeln!(io::stderr(), "bibcode: {error}");
+            return 1;
+        }
+    };
+    match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime.block_on(crate::diagnostics::relay_cli::run_diagnostics_cli(
+            cli.args, state_dir,
+        )),
+        Err(error) => {
+            let _ = writeln!(io::stderr(), "bibcode: {error}");
+            1
+        }
+    }
+}
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "diagnostics",
+    about = "Save a connected environment's diagnostic logs through this BiBCode desktop app, after you approve it there."
+)]
+struct DesktopDiagnosticsCli {
+    #[command(flatten)]
+    args: crate::diagnostics::relay_cli::DiagnosticsArgs,
 }
 
 #[derive(Debug, Parser)]

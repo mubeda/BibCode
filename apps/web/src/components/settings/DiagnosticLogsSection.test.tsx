@@ -287,6 +287,34 @@ describe("DiagnosticLogsSection", () => {
     expect(h.downloadCalls).toEqual([]);
   });
 
+  it("keeps a disconnected remote chosen, disabled, until it reconnects", async () => {
+    // A link from a remote thread whose environment is offline, with the catalog loaded.
+    const offline = fakeEnvironment("Omarchy", { phase: "disconnected" });
+    h.environments = [h.primary!, offline];
+    const container = await render(offline.environmentId);
+
+    expect(h.selections).toEqual([]);
+    expect(downloadButton(container).disabled).toBe(true);
+    expect(statusOf(container)).toBe(
+      "Omarchy is not connected. Reconnect it to download its logs.",
+    );
+    expect(descriptionOf(container)).toContain("from Omarchy.");
+    await click(downloadButton(container));
+    expect(h.downloadCalls).toEqual([]);
+
+    // Reconnected: the same choice downloads that environment, never the primary.
+    h.environments = [h.primary!, { ...offline, connection: { phase: "connected" } }];
+    const entry = mounted.find((candidate) => candidate.container === container)!;
+    await act(async () => {
+      entry.root.render(<Harness initial={offline.environmentId} />);
+    });
+    expect(downloadButton(container).disabled).toBe(false);
+    await click(downloadButton(container));
+    expect(h.downloadCalls[0]?.options).toEqual({
+      environment: { environmentId: offline.environmentId, label: "Omarchy" },
+    });
+  });
+
   it("never downloads the stand-in while the chosen environment is not in the catalog", async () => {
     // A reload on a link: the catalog has not listed the chosen environment yet.
     h.catalogReady = false;

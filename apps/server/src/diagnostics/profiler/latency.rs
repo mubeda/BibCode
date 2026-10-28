@@ -114,6 +114,10 @@ pub fn is_long_running(method: &str) -> bool {
             | "sourceControl.publishRepository"
             | "sourceControl.lookupRepository"
             | "server.discoverSourceControl"
+            // The diagnostics relay waits on a person approving it, then on the command
+            // reading each item (#201).
+            | "server.subscribeDiagnosticLogsRelay"
+            | "server.sendDiagnosticLogsRelayItem"
             | "vcs.pull"
             | "vcs.generateCommitMessage"
             | "git.resolvePullRequest"

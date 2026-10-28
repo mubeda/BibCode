@@ -7,6 +7,7 @@ import { ConnectionDatabaseRecoveryDialog } from "./components/ConnectionDatabas
 import { PreviewAutomationHosts } from "./components/preview/PreviewAutomationHosts";
 import { OpenPromptBanner } from "./components/preview/OpenPromptBanner";
 import { OpenRequestRouter } from "./components/preview/OpenRequestRouter";
+import { DiagnosticLogsRelayHost } from "./diagnostics/DiagnosticLogsRelayHost";
 import { PreviewNewWindowRouter } from "./components/preview/PreviewNewWindowRouter";
 import { AppAtomRegistryProvider } from "./rpc/atomRegistry";
 import type { AppRouter } from "./router";
@@ -174,6 +175,7 @@ export function AppRoot({ router }: { readonly router: AppRouter }) {
       <PreviewAutomationHosts />
       <PreviewNewWindowRouter />
       <OpenRequestRouter router={router} />
+      {isDesktopHost ? <DiagnosticLogsRelayHost /> : null}
     </AppAtomRegistryProvider>
   );
 }

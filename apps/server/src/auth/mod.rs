@@ -28,6 +28,7 @@ pub(crate) use rpc::register_rpc_handlers;
 pub(crate) use scope::{ACTIVITY_READ_SCOPE, authorization_error, required_scope};
 pub(crate) use secret_store::{SecretStore, SecretStoreError};
 pub(crate) use service::{
-    AuthError, AuthService, AuthenticatedConnectionGuard, SessionTransport,
-    default_standard_scopes, issue_administrative_pairing_link, issue_offline_share_pairing,
+    AuthError, AuthService, AuthenticatedConnectionGuard, DESKTOP_BOOTSTRAP_SUBJECT,
+    SessionTransport, default_standard_scopes, issue_administrative_pairing_link,
+    issue_offline_share_pairing,
 };

@@ -4341,7 +4341,7 @@ interface SidebarProjectsContentProps {
   showProjectAvailabilityOpenRemoteServers: boolean;
   onRetryProjectEnvironment: (environmentId: EnvironmentId) => void;
   onOpenProjectSettings: () => void;
-  onViewProjectDiagnostics: () => void;
+  onViewProjectDiagnostics: (environmentId: EnvironmentId | null) => void;
   onAdoptProjectStorage: (environmentId: EnvironmentId) => void;
   onRecoverProjectData?: ((environmentId: EnvironmentId) => void) | undefined;
 }
@@ -4885,9 +4885,17 @@ export default function Sidebar() {
   const handleOpenProjectSettings = useCallback(() => {
     void navigate({ to: "/settings/remote-servers" });
   }, [navigate]);
-  const handleViewProjectDiagnostics = useCallback(() => {
-    void navigate({ to: "/settings/diagnostics" });
-  }, [navigate]);
+  // The project's environment when the availability banner names one; the update dialog
+  // passes none, since an update concerns this host's primary.
+  const handleViewProjectDiagnostics = useCallback(
+    (environmentId: EnvironmentId | null = null) => {
+      void navigate({
+        to: "/settings/diagnostics",
+        search: environmentId === null ? {} : { environment: environmentId },
+      });
+    },
+    [navigate],
+  );
   const handleRecoverProjectData = useCallback((environmentId: EnvironmentId) => {
     void projectDataSafetyStore.open(environmentId, "manual").catch(() => undefined);
   }, []);

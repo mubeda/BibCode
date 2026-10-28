@@ -667,7 +667,11 @@ staticDescribe("Sidebar full render", () => {
       { label: "environment.adoptStorage", input: ENV_MAIN },
     ]);
     expect(h.spies.navigate).toHaveBeenCalledWith({ to: "/settings/remote-servers" });
-    expect(h.spies.navigate).toHaveBeenCalledWith({ to: "/settings/diagnostics" });
+    // Diagnostics opens on the environment whose project data needs attention (#201).
+    expect(h.spies.navigate).toHaveBeenCalledWith({
+      to: "/settings/diagnostics",
+      search: { environment: ENV_MAIN },
+    });
     expect(h.spies.openProjectDataRecovery).toHaveBeenCalledWith(ENV_MAIN, "manual");
     expect(h.spies.dialogConfirm).toHaveBeenCalledWith(
       "Use this project data location? Projects from the two locations will not be merged.",

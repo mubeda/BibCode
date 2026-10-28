@@ -1,3 +1,5 @@
+import type { EnvironmentId } from "@bibcode/contracts";
+import { Link } from "@tanstack/react-router";
 import { memo } from "react";
 import { Alert, AlertAction, AlertDescription, AlertTitle } from "../ui/alert";
 import { Button } from "../ui/button";
@@ -16,6 +18,7 @@ export const ThreadErrorBanner = memo(function ThreadErrorBanner({
   error,
   attribution,
   action,
+  diagnosticsEnvironmentId = null,
   onDismiss,
 }: {
   error: string | null;
@@ -26,6 +29,11 @@ export const ThreadErrorBanner = memo(function ThreadErrorBanner({
    */
   attribution?: string | null;
   action?: ThreadErrorAction | null;
+  /**
+   * The thread's environment. When given, the banner links to Settings → Diagnostics with
+   * that environment chosen, so its logs (not this machine's) are the ones offered.
+   */
+  diagnosticsEnvironmentId?: EnvironmentId | null;
   onDismiss?: () => void;
 }) {
   if (!error) return null;
@@ -47,8 +55,22 @@ export const ThreadErrorBanner = memo(function ThreadErrorBanner({
             </TooltipPopup>
           </Tooltip>
         </AlertDescription>
-        {action || onDismiss ? (
+        {action || onDismiss || diagnosticsEnvironmentId !== null ? (
           <AlertAction>
+            {diagnosticsEnvironmentId !== null ? (
+              <Button
+                variant="ghost"
+                size="xs"
+                render={
+                  <Link
+                    to="/settings/diagnostics"
+                    search={{ environment: diagnosticsEnvironmentId }}
+                  />
+                }
+              >
+                Diagnostics
+              </Button>
+            ) : null}
             {action ? (
               // A disabled button receives no pointer events, so its reason sits on a wrapper.
               <span title={action.disabledReason ?? undefined}>
