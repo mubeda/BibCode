@@ -5,6 +5,8 @@ import { describe, expect, it } from "vite-plus/test";
 import { ProviderDriverKind } from "./providerInstance.ts";
 import {
   DiagnosticLogsDownloadEvent,
+  DiagnosticLogsRelayEvent,
+  DiagnosticLogsRelayItem,
   isProviderAvailable,
   ServerProcessDiagnosticsEntry,
   ServerProcessResourceTotals,
@@ -380,5 +382,39 @@ describe("DiagnosticLogsDownloadEvent", () => {
         manifest: { ...manifest, crashDumps: { requested: true, included: -1 } },
       }),
     ).toThrow();
+  });
+});
+
+const decodeItem = Schema.decodeUnknownSync(DiagnosticLogsRelayItem);
+const decodeRelayEvent = Schema.decodeUnknownSync(DiagnosticLogsRelayEvent);
+
+describe("diagnostic logs relay (#201)", () => {
+  it("carries a request to approve, then its close", () => {
+    expect(
+      decodeRelayEvent({
+        _tag: "Pending",
+        request: {
+          requestId: "relay_1",
+          environment: "Omarchy",
+          includeCrashDumps: false,
+          code: "K7Q-4M",
+          outputDirectory: "/Users/me/logs",
+        },
+      }),
+    ).toMatchObject({ _tag: "Pending", request: { environment: "Omarchy", code: "K7Q-4M" } });
+    expect(decodeRelayEvent({ _tag: "Claimed", requestId: "relay_1" })._tag).toBe("Claimed");
+    expect(decodeRelayEvent({ _tag: "Closed", requestId: "relay_1" })._tag).toBe("Closed");
+  });
+
+  it("names a failure by its reason, and refuses unknown reasons", () => {
+    expect(
+      decodeItem({
+        _tag: "Failed",
+        reason: "unknown-environment",
+        message: "BiBCode has no environment named Mars.",
+      }),
+    ).toMatchObject({ _tag: "Failed", reason: "unknown-environment" });
+    expect(() => decodeItem({ _tag: "Failed", reason: "made-up", message: "x" })).toThrow();
+    expect(decodeItem({ _tag: "Finished" })._tag).toBe("Finished");
   });
 });

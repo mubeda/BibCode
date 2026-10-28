@@ -48,8 +48,9 @@ const PENDING_PAIRING_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 const PAIRING_TTL_MS: i64 = 5 * 60 * 1_000;
 const CLOUD_PAIRING_TTL_MS: i64 = 2 * 60 * 1_000;
 const DESKTOP_BOOTSTRAP_TTL_MS: i64 = 24 * 60 * 60 * 1_000;
-/// Subject of every session minted from the desktop bootstrap credential.
-const DESKTOP_BOOTSTRAP_SUBJECT: &str = "desktop-bootstrap";
+/// Subject of every session minted from the desktop bootstrap credential: the desktop app's
+/// own WebView.
+pub(crate) const DESKTOP_BOOTSTRAP_SUBJECT: &str = "desktop-bootstrap";
 const PAIRING_ALPHABET: &[u8] = b"23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
 const PAIRING_LENGTH: usize = 12;
 const PAIRING_REJECTION_LIMIT: u8 =

@@ -1629,6 +1629,19 @@ must be updated. To query a remote profiler directly, run `bibcode profiler` on
 its host, for example over SSH, or `ssh <host> bibcode profiler mcp` for an AI
 harness.
 
+Without SSH, `bibcode diagnostics download` on the desktop's machine fetches a
+connected environment's bundle through the desktop app, after one approval
+there (#201). This adds no connection between servers: the local server only
+hands the request to the desktop app's own session, and the app downloads with
+its own credential, scopes and identity checks, exactly as **Download logs**
+does. The local server never learns a remote credential, and no other paired
+device can be asked to pull logs onto this host. Any program running as the
+user can ask, so the prompt says the request comes from a program on this
+computer, not BiBCode, and shows the code that program printed, the
+environment as typed, and the directory it saves in. Unattended access without the
+app is a follow-up (#202). See
+[Observability](../operations/observability.md#from-the-command-line).
+
 A server older than the profiler does not advertise `capabilities.profiler`. The
 client then sends it no profiler RPC, ignores the `enableProfiler: true` it may
 echo back, and shows the switch disabled with "This server's BiBCode version has

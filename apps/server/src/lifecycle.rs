@@ -299,6 +299,7 @@ impl ServerRuntime {
         } else {
             None
         };
+        let mut relay_token = None;
         let (rpc_registry, http_routes, production_runtime) = match custom_registry {
             Some(mut registry) => {
                 crate::auth::register_rpc_handlers(&mut registry, auth.clone());
@@ -416,13 +417,40 @@ impl ServerRuntime {
                         }
                     }
                 });
-                (
-                    runtime.registry.clone(),
-                    core_http_routes(auth.clone(), runtime.clone(), connect),
-                    Some(runtime),
-                )
+                // `bibcode diagnostics download` on this host, relayed by the desktop app
+                // (#201): the runtime's relay behind a route with a fresh per-boot token.
+                let relay = runtime.diagnostic_logs_relay();
+                let mut routes = core_http_routes(auth.clone(), runtime.clone(), connect);
+                match crate::production::diagnostic_logs_relay::new_relay_token() {
+                    Ok(token) => {
+                        routes.diagnostic_logs_relay = Some(
+                            crate::production::diagnostic_logs_relay::DiagnosticLogsRelayRoute::new(
+                                relay,
+                                token.clone(),
+                            ),
+                        );
+                        relay_token = Some(token);
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "could not create the diagnostics relay token");
+                    }
+                }
+                (runtime.registry.clone(), routes, Some(runtime))
             }
         };
+        // The command finds this server and its token here. Only the runtime-guard owner
+        // writes it; the server task removes it when it stops.
+        let relay_endpoint_file = relay_token.and_then(|token| {
+            crate::production::diagnostic_logs_relay::RelayEndpointFile::write(
+                &state_directory,
+                &local_http_base(local_addr),
+                &token,
+            )
+            .inspect_err(|error| {
+                tracing::warn!(%error, "could not write the diagnostics relay endpoint file");
+            })
+            .ok()
+        });
         let shutdown = CancellationToken::new();
         let admission_gate = rpc_registry.admission_gate();
         let update_maintenance_owner = if update_maintenance_owner_enabled(&config) {
@@ -480,6 +508,7 @@ impl ServerRuntime {
         let task_log_sink = log_sink.clone();
         let task = tokio::spawn(async move {
             let _log_sink = task_log_sink;
+            let _relay_endpoint_file = relay_endpoint_file;
             let result = axum::serve(
                 listener,
                 app.into_make_service_with_connect_info::<http::ConnectionAddrs>(),

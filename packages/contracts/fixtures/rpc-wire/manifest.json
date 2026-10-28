@@ -390,6 +390,10 @@
       "mode": "unary"
     },
     {
+      "name": "server.claimDiagnosticLogsRelay",
+      "mode": "unary"
+    },
+    {
       "name": "server.consumeCodexRateLimitReset",
       "mode": "unary"
     },
@@ -450,8 +454,16 @@
       "mode": "unary"
     },
     {
+      "name": "server.sendDiagnosticLogsRelayItem",
+      "mode": "unary"
+    },
+    {
       "name": "server.signalProcess",
       "mode": "unary"
+    },
+    {
+      "name": "server.subscribeDiagnosticLogsRelay",
+      "mode": "stream"
     },
     {
       "name": "server.updateProvider",
@@ -698,8 +710,8 @@
       "mode": "unary"
     }
   ],
-  "streamMethodCount": 26,
-  "expectedTopLevelStreamShapes": 82,
+  "streamMethodCount": 27,
+  "expectedTopLevelStreamShapes": 85,
   "expectedOrchestrationEventShapes": 27,
   "streamShapeFixtures": [
     "stream-shapes/cloud__installRelayClient-00.json",
@@ -731,6 +743,9 @@
     "stream-shapes/pullRequests__subscribe-00.json",
     "stream-shapes/server__downloadDiagnosticLogs-00.json",
     "stream-shapes/server__downloadDiagnosticLogs-01.json",
+    "stream-shapes/server__subscribeDiagnosticLogsRelay-00.json",
+    "stream-shapes/server__subscribeDiagnosticLogsRelay-01.json",
+    "stream-shapes/server__subscribeDiagnosticLogsRelay-02.json",
     "stream-shapes/subscribeActivity-00.json",
     "stream-shapes/subscribeActivity-01.json",
     "stream-shapes/subscribeActivity-02.json",
@@ -969,6 +984,8 @@
     "typed-failures/review__readFileVersion-00.json",
     "typed-failures/review__readFileVersion-01.json",
     "typed-failures/review__readFileVersion-02.json",
+    "typed-failures/server__claimDiagnosticLogsRelay-00.json",
+    "typed-failures/server__claimDiagnosticLogsRelay-01.json",
     "typed-failures/server__consumeCodexRateLimitReset-00.json",
     "typed-failures/server__consumeCodexRateLimitReset-01.json",
     "typed-failures/server__discoverSourceControl-00.json",
@@ -999,6 +1016,8 @@
     "typed-failures/server__reportProfilerClientBatch-00.json",
     "typed-failures/server__reportProfilerClientBatch-01.json",
     "typed-failures/server__reportProfilerClientBatch-02.json",
+    "typed-failures/server__sendDiagnosticLogsRelayItem-00.json",
+    "typed-failures/server__sendDiagnosticLogsRelayItem-01.json",
     "typed-failures/server__signalProcess-00.json",
     "typed-failures/server__signalProcess-01.json",
     "typed-failures/server__updateProvider-00.json",
@@ -1365,6 +1384,8 @@
     "typed-failures/review__readFileVersion-00.json": "2ce5c89ac988f67153377ac2cfbabd6af7c67391e8d2c36af2304e1d7cd7caa2",
     "typed-failures/review__readFileVersion-01.json": "ac9e7618ae2ed5aeb4271e4133d1ebaff18ee3d9e6341eda7735f34081ca9287",
     "typed-failures/review__readFileVersion-02.json": "f21e4233466694c02754d2a3c0317c089f31f6634947c5fcc16d02c4997c35cf",
+    "typed-failures/server__claimDiagnosticLogsRelay-00.json": "685a31ed25a91248b90c7b17d501f68c20523a70cc7dafa2da7412984f83a4c3",
+    "typed-failures/server__claimDiagnosticLogsRelay-01.json": "f21e4233466694c02754d2a3c0317c089f31f6634947c5fcc16d02c4997c35cf",
     "typed-failures/server__consumeCodexRateLimitReset-00.json": "6e23dade8593c0a59319f4ff081d53d3261c82f9223eed493544c12438f8a17c",
     "typed-failures/server__consumeCodexRateLimitReset-01.json": "f21e4233466694c02754d2a3c0317c089f31f6634947c5fcc16d02c4997c35cf",
     "typed-failures/server__discoverSourceControl-00.json": "950333bb892eba89420d696b2674275ebe5de296311ca5d2045b4963fc596274",
@@ -1397,8 +1418,13 @@
     "typed-failures/server__reportProfilerClientBatch-00.json": "b4f212ce4ab45cea366de3b6669b92236f37befba464b97f6381aae24b2057f7",
     "typed-failures/server__reportProfilerClientBatch-01.json": "6e13da8baed5e3f04364f8a967db0b5ae2537c853f5fafac614c06cc3041830e",
     "typed-failures/server__reportProfilerClientBatch-02.json": "f21e4233466694c02754d2a3c0317c089f31f6634947c5fcc16d02c4997c35cf",
+    "typed-failures/server__sendDiagnosticLogsRelayItem-00.json": "685a31ed25a91248b90c7b17d501f68c20523a70cc7dafa2da7412984f83a4c3",
+    "typed-failures/server__sendDiagnosticLogsRelayItem-01.json": "f21e4233466694c02754d2a3c0317c089f31f6634947c5fcc16d02c4997c35cf",
     "typed-failures/server__signalProcess-00.json": "950333bb892eba89420d696b2674275ebe5de296311ca5d2045b4963fc596274",
     "typed-failures/server__signalProcess-01.json": "dfe153df675ebc5cf07b6a2d483bfe18346fa23e4bbcd24940828aa1cc404308",
+    "stream-shapes/server__subscribeDiagnosticLogsRelay-00.json": "3cb21c2c1b7fa6930f48fab3b52881af80e2221e885e72e417258531fafdb8ec",
+    "stream-shapes/server__subscribeDiagnosticLogsRelay-01.json": "907ad9d6e8bf4f7c09e8ce7f40d314443c194c06a4e6d501eb061540b7562ebb",
+    "stream-shapes/server__subscribeDiagnosticLogsRelay-02.json": "238d5b12023b23ce0cc59cf3d9d1069b5540b9ad010da1ada09e3805b9423f3e",
     "typed-failures/server__updateProvider-00.json": "7b6b929d4cc7d7d283a05a1b5424809ad056f03125dca93fd2ff536e2b853edf",
     "typed-failures/server__updateProvider-01.json": "f21e4233466694c02754d2a3c0317c089f31f6634947c5fcc16d02c4997c35cf",
     "typed-failures/server__updateSettings-00.json": "b141caed2961004d11a558adc37cfee4944f1ee49667137d1a553b3d1ad9d623",
@@ -1672,6 +1698,9 @@
     "stream-shapes/pullRequests__subscribe-00.json",
     "stream-shapes/server__downloadDiagnosticLogs-00.json",
     "stream-shapes/server__downloadDiagnosticLogs-01.json",
+    "stream-shapes/server__subscribeDiagnosticLogsRelay-00.json",
+    "stream-shapes/server__subscribeDiagnosticLogsRelay-01.json",
+    "stream-shapes/server__subscribeDiagnosticLogsRelay-02.json",
     "stream-shapes/subscribeActivity-00.json",
     "stream-shapes/subscribeActivity-01.json",
     "stream-shapes/subscribeActivity-02.json",
@@ -1908,6 +1937,8 @@
     "typed-failures/review__readFileVersion-00.json",
     "typed-failures/review__readFileVersion-01.json",
     "typed-failures/review__readFileVersion-02.json",
+    "typed-failures/server__claimDiagnosticLogsRelay-00.json",
+    "typed-failures/server__claimDiagnosticLogsRelay-01.json",
     "typed-failures/server__consumeCodexRateLimitReset-00.json",
     "typed-failures/server__consumeCodexRateLimitReset-01.json",
     "typed-failures/server__discoverSourceControl-00.json",
@@ -1938,6 +1969,8 @@
     "typed-failures/server__reportProfilerClientBatch-00.json",
     "typed-failures/server__reportProfilerClientBatch-01.json",
     "typed-failures/server__reportProfilerClientBatch-02.json",
+    "typed-failures/server__sendDiagnosticLogsRelayItem-00.json",
+    "typed-failures/server__sendDiagnosticLogsRelayItem-01.json",
     "typed-failures/server__signalProcess-00.json",
     "typed-failures/server__signalProcess-01.json",
     "typed-failures/server__updateProvider-00.json",

@@ -465,3 +465,96 @@ describe("ChatComposer provider selection rerenders", () => {
     expect(container.textContent).toContain("Plan mode is not supported");
   });
 });
+
+describe("ChatComposer long-lived handlers", () => {
+  const statuses = [supportedProvider, unsupportedProvider];
+
+  /** The props React gave a DOM element, which hold its current handlers. */
+  function domProps(element: Element): Record<string, unknown> {
+    const key = Object.keys(element).find((name) => name.startsWith("__reactProps$"));
+    expect(key).toBeDefined();
+    return (element as unknown as Record<string, Record<string, unknown>>)[key ?? ""] ?? {};
+  }
+
+  it("keeps one menu select handler that runs the latest render's callbacks", async () => {
+    const actionPrompt = ":plan";
+    useComposerDraftStore.getState().setPrompt(threadRef, actionPrompt);
+    h.snapshot = {
+      value: actionPrompt,
+      cursor: actionPrompt.length,
+      expandedCursor: actionPrompt.length,
+      terminalContextIds: [],
+    };
+    const composerRef = React.createRef<ChatComposerHandle>();
+    const promptRef = { current: actionPrompt };
+    const renderAndOpenMenu = async (props: ChatComposerProps) => {
+      await act(async () => {
+        root.render(<ChatComposer {...props} />);
+      });
+      await act(async () => {
+        const onChange = h.editorProps?.["onChange"] as
+          | ((
+              value: string,
+              cursor: number,
+              expandedCursor: number,
+              cursorAdjacentToMention: boolean,
+              terminalContextIds: string[],
+            ) => void)
+          | undefined;
+        expect(onChange).toBeTypeOf("function");
+        onChange?.(actionPrompt, actionPrompt.length, actionPrompt.length, false, []);
+      });
+      const onSelect = h.menuProps?.["onSelect"];
+      expect(onSelect).toBeTypeOf("function");
+      return onSelect as (item: { id: string }) => void;
+    };
+
+    const first = makeProps(statuses, composerRef, promptRef, supportedProvider);
+    const firstOnSelect = await renderAndOpenMenu(first);
+    // New callbacks from the parent: what a changed reconnect gives the composer.
+    const latest = makeProps(statuses, composerRef, promptRef, supportedProvider);
+    const latestOnSelect = await renderAndOpenMenu(latest);
+
+    expect(latestOnSelect).toBe(firstOnSelect);
+    await act(async () => {
+      firstOnSelect({ id: "bibcode-action:plan" });
+    });
+    expect(first.handleInteractionModeChange).not.toHaveBeenCalled();
+    expect(latest.handleInteractionModeChange).toHaveBeenCalledWith("plan");
+  });
+
+  it("keeps one file input handler that reports with the latest render's callbacks", async () => {
+    const composerRef = React.createRef<ChatComposerHandle>();
+    const promptRef = { current: prompt };
+    const first = makeProps(statuses, composerRef, promptRef, supportedProvider);
+    await act(async () => {
+      root.render(<ChatComposer {...first} />);
+    });
+    const input = container.querySelector<HTMLInputElement>('input[type="file"]');
+    expect(input).not.toBeNull();
+    const firstOnChange = domProps(input!)["onChange"];
+    expect(firstOnChange).toBeTypeOf("function");
+
+    // New callbacks from the parent: what a changed reconnect gives the composer.
+    const latest = makeProps(statuses, composerRef, promptRef, supportedProvider);
+    await act(async () => {
+      root.render(<ChatComposer {...latest} />);
+    });
+    expect(container.querySelector('input[type="file"]')).toBe(input);
+    expect(domProps(input!)["onChange"]).toBe(firstOnChange);
+
+    Object.defineProperty(input, "files", {
+      configurable: true,
+      value: [new File([], "empty.txt", { type: "text/plain" })],
+    });
+    await act(async () => {
+      input!.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+
+    expect(first.setThreadError).not.toHaveBeenCalled();
+    expect(latest.setThreadError).toHaveBeenCalledWith(
+      threadId,
+      "'empty.txt' is empty and cannot be attached.",
+    );
+  });
+});

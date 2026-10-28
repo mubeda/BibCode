@@ -15,6 +15,7 @@ use url::Url;
 
 use crate::data_root::{DataRootError, DataRootRequest, DataRootSource, ResolvedDataRoot};
 use crate::diagnostics::profiler::cli::ProfilerArgs;
+use crate::diagnostics::relay_cli::DiagnosticsArgs;
 use crate::persistence::StorageInstanceId;
 use crate::remote_update::{RemoteUpdateInstallKind, RemoteUpdateSupport};
 use crate::static_assets::{StaticDirError, StaticDirSource, resolve_static_dir};
@@ -680,6 +681,10 @@ enum CliCommand {
     )]
     Profiler(ProfilerArgs),
     #[command(
+        about = "Save a connected environment's diagnostic logs through the BiBCode desktop app on this computer, after you approve it there."
+    )]
+    Diagnostics(DiagnosticsArgs),
+    #[command(
         about = "Install, remove, or inspect the per-user background service that keeps `bibcode serve` running."
     )]
     Service(ServiceArgs),
@@ -828,6 +833,12 @@ pub enum CliAction {
         args: ProfilerArgs,
         state_dir: PathBuf,
     },
+    /// Asks the running server for `state_dir`, which the desktop app answers; never
+    /// starts a server.
+    Diagnostics {
+        args: DiagnosticsArgs,
+        state_dir: PathBuf,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -919,6 +930,8 @@ pub enum ConfigError {
     OpenUrlCommandIsNotServer,
     #[error("profiler commands cannot be converted into a server configuration")]
     ProfilerCommandIsNotServer,
+    #[error("diagnostics commands cannot be converted into a server configuration")]
+    DiagnosticsCommandIsNotServer,
     #[error("failed to resolve the current executable for static web discovery")]
     CurrentExecutable(#[source] io::Error),
     #[error(transparent)]
@@ -959,6 +972,7 @@ impl Cli {
             CliAction::Service(_) => Err(ConfigError::ServiceCommandIsNotServer),
             CliAction::OpenUrl { .. } => Err(ConfigError::OpenUrlCommandIsNotServer),
             CliAction::Profiler { .. } => Err(ConfigError::ProfilerCommandIsNotServer),
+            CliAction::Diagnostics { .. } => Err(ConfigError::DiagnosticsCommandIsNotServer),
         }
     }
 
@@ -1038,6 +1052,14 @@ impl Cli {
             Some(CliCommand::Profiler(profiler)) => {
                 return Ok(CliAction::Profiler {
                     args: profiler,
+                    state_dir: profiler_state_dir(args.base_dir, args.dev_url)?,
+                });
+            }
+            // The same state directory a server for this data root writes its relay
+            // endpoint file in.
+            Some(CliCommand::Diagnostics(diagnostics)) => {
+                return Ok(CliAction::Diagnostics {
+                    args: diagnostics,
                     state_dir: profiler_state_dir(args.base_dir, args.dev_url)?,
                 });
             }

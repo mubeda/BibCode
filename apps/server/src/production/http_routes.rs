@@ -122,6 +122,10 @@ pub struct HttpRoutesState {
     /// The media socket's devices and sessions; `None` (answering `503`) without the
     /// production runtime.
     pub(crate) device_media: Option<crate::device::media_socket::MediaSocketState>,
+    /// `bibcode diagnostics download`'s side of the relay; `None` (answering `503`) without
+    /// the production runtime.
+    pub diagnostic_logs_relay:
+        Option<crate::production::diagnostic_logs_relay::DiagnosticLogsRelayRoute>,
 }
 
 impl HttpRoutesState {
@@ -144,6 +148,7 @@ impl HttpRoutesState {
             transfer_download,
             transfer_upload,
             device_media: None,
+            diagnostic_logs_relay: None,
             open_url: Arc::new(|_body, _context| {
                 Box::pin(async {
                     Err(HttpRouteError::new(
@@ -327,6 +332,10 @@ where
             post(connect_mint_credential),
         )
         .route("/api/diagnostics/logs.zip", post(diagnostic_logs))
+        .route(
+            crate::production::diagnostic_logs_relay::RELAY_PATH,
+            post(diagnostic_logs_relay),
+        )
         .route("/api/assets/{token}/{*path}", get(asset))
         .route(
             "/api/transfers/{token}",
@@ -745,6 +754,21 @@ async fn transfer_upload(
         ),
         Err(error) => error.into_response(),
     }
+}
+
+/// Token-only, from this host only: deliberately skips `state.authorize`, since no session
+/// may start a relay; only the command holding the endpoint file's token can.
+async fn diagnostic_logs_relay(
+    State(state): State<HttpRoutesState>,
+    connection: crate::http::ConnectionInfo,
+    request: Request,
+) -> Response {
+    crate::production::diagnostic_logs_relay::relay_http(
+        state.diagnostic_logs_relay,
+        connection,
+        request,
+    )
+    .await
 }
 
 /// Bearer-only: deliberately skips `state.authorize`, which would also accept a session cookie.

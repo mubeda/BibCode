@@ -200,6 +200,96 @@ out between them. A bundle holds one server's logs: diagnosing a remote launch
 or transport problem can need both the remote environment's archive and the
 primary's, downloaded one after the other.
 
+Links that start from an environment open the page on it (#201): the thread
+error banner's **Diagnostics** names the thread's environment, the sidebar's
+project-availability **Diagnostics** names the environment whose projects are
+unavailable, and the status bar's **Profiler** segment names the first
+recording environment. The desktop update dialog's **Diagnostics** opens the
+primary. A chosen environment that is not connected stays chosen: the download
+is disabled with "<label> is not connected. Reconnect it to download its logs."
+until it reconnects, and the primary's logs are never offered in its place.
+Only an environment removed from the app drops the choice.
+
+### From the command line
+
+`bibcode diagnostics download --environment <id or name>` saves the same
+bundle on a machine whose BiBCode desktop app is connected to that
+environment, after one approval in the app (#201). Unattended access, without
+the app, is a separate follow-up (#202). The desktop executable runs it too
+(`<desktop exe> diagnostics download …`); when the desktop's primary
+environment runs in WSL, run `bibcode diagnostics download` inside that distro,
+since the endpoint file lives in the distro's data root. Options:
+`--include-crash-dumps`, `--output <dir>` (the current directory by default),
+and `--json`, which prints one document with `status` (`saved`, `failed`,
+`denied`, or `unavailable`), `reason`, `message`, and on success `path`,
+`fileName`, `byteLength`, and `manifest`. Exit codes: 0 saved, 1 failed, 2
+denied, unanswered or cooling down, 3 BiBCode or its desktop window not
+running.
+
+No server holds a connection to another environment; the app does. So the
+command asks this host's own server, which hands the request to the app:
+
+1. While it runs, the server writes `diagnostics-relay.json` in its state
+   directory (owner-only on Unix), naming its URL and a fresh per-boot token,
+   and removes it when it stops. The command sends the token only to a loopback
+   URL, posting to `/api/diagnostics/relay`; the route refuses any other
+   credential, a peer that is not this machine, and any request carrying a
+   proxy's forwarding headers (`Forwarded`, `X-Forwarded-*`, `X-Real-IP`,
+   `Tailscale-*`). A proxy that strips every such header could still forward a
+   request from a loopback socket, which is why the token, not the peer
+   address, is the gate. Reading the file needs the same access as the data
+   root, which already lets `bibcode pairing issue` mint an administrative
+   credential while the server runs, so the token grants nothing new.
+2. The command prints a code ("Approve request K7Q-4M in BiBCode…") and sends
+   it with the environment as typed and its absolute output directory. The
+   server announces the request only to the desktop app's own session (the one
+   minted from the desktop bootstrap), never to another paired device, however
+   broad its scopes. With no such window subscribed, the command fails at once.
+   One request runs at a time. After a denied or unanswered request, or one
+   whose command left before anyone answered, the next waits 30 s, doubling
+   with each refusal in a row up to 5 minutes; a saved archive clears the wait.
+   The server refuses a request whose environment or directory is blank, too
+   long, or holds a control or Unicode format character (bidirectional
+   overrides and isolates, zero-width characters); the environment is shown
+   exactly as typed and trimmed only to look it up.
+3. The app resolves the name (an id, or a label exactly one environment has).
+   An unknown, ambiguous or disconnected name is answered without a prompt,
+   naming only what was asked for, never the environments the app can reach.
+   Otherwise it asks: "Share <label>'s diagnostic logs?" — a program running
+   as the user on this computer, not BiBCode, asks to save them to a file — and
+   shows the code, the environment as typed, and the directory, naming crash
+   dumps when asked for. Any program running as the user can make this
+   request (an agent in a thread, a paired device's terminal), so the user
+   shares only when the code matches the command they ran. Dismissing denies.
+4. On **Share logs**, the window claims the request (it is then bound to that
+   session and connection, and the other windows drop their prompt) and runs
+   `server.downloadDiagnosticLogs` on the named environment with every check of
+   the Settings download, then sends the verified archive back in 64 KiB items,
+   each answered only once the command read the one before.
+5. The request ends unanswered after 2 minutes without approval, 10 minutes
+   after approval without the archive starting, 60 s without the next item, or
+   when the approving window's connection closes. When the command exits, the
+   app's download stops, including one whose claim was still in flight. The
+   command itself gives up after 13 minutes without the archive starting and
+   90 s between items.
+
+The command publishes nothing until the whole archive arrived and its own
+`manifest.json` names the same non-empty environment and store, and the same
+server version, as the manifest the app checked. The name must have the
+archive's shape (no path separator, no leading dot, ending in `.zip`) and the
+byte count must match. The archive is written and synced to a hidden
+`.<name>.<code>.partial` file in the output directory, then published under its
+name with a hard link, which never replaces an existing file, and the temporary
+file is removed; a taken temporary name is skipped, never removed. On a
+filesystem without hard links the command saves nothing and says to choose a
+local `--output`, since no other publish is safe against a partial file. An
+interrupted run can leave only the temporary file, never a partial archive
+under the real name. The command waits at most 30 s for the server's response
+headers or an error body. Text from the app or the remote server is printed
+without control or format characters. The local server logs each request's id and outcome
+(waiting, claimed, answered, the command left, or the reason it ended), never
+the token, the environment name, or archive bytes.
+
 Provider and terminal operational logs are not included. Each retained server
 or trace file is read up to 4 MiB and marked when truncated. The frontend
 request and retained frontend content are bounded to 512 KiB; when necessary,
