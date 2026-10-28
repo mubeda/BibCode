@@ -1155,7 +1155,8 @@ describe("packaged Mermaid diagrams", () => {
     // delivery that landed together with earlier ones between two frames, and showed fewer than
     // FOLLOW_PAINTED_FRAMES frames before the next, is recorded too: on Linux arm64 nine landed
     // between two frames 550 ms apart, and the follow of that growth showed two frames later.
-    // Each
+    // At most MAX_EXEMPT_IN_A_ROW painted deliveries in a row are exempt so; the next is
+    // checked. Each
     // reply must settle, finish, and paint at least one resting frame after settling, so a
     // webview that painted none still fails instead of passing on what it did not show, and a
     // reply that stays hidden fails on every rest it paints.
@@ -1213,16 +1214,17 @@ describe("packaged Mermaid diagrams", () => {
         2,
       ),
     );
+    // The deliveries with no painted rest are in the artifact; what is asserted is that each
+    // reply settled and finished, and painted at least MIN_SETTLED_RESTS checked rests: rests
+    // exempt as unfollowed batches do not count toward it.
     expect({
       settledAndFinished: unpainted.every((entry) => !Number.isNaN(entry.delivered)),
-      plainRests: plainSettled.size >= MIN_SETTLED_RESTS,
-      diagramRests: diagramSettled.size >= MIN_SETTLED_RESTS,
-      unpainted,
+      plainCheckedRests: checkedRestCount(plain, plainSettled) >= MIN_SETTLED_RESTS,
+      diagramCheckedRests: checkedRestCount(diagram, diagramSettled) >= MIN_SETTLED_RESTS,
     }).toEqual({
       settledAndFinished: true,
-      plainRests: true,
-      diagramRests: true,
-      unpainted,
+      plainCheckedRests: true,
+      diagramCheckedRests: true,
     });
     // The draw's grace covers only a delivery that rested within that time, when the next one
     // landed before the follow; a later rest of that delivery is checked like the others.
@@ -2281,6 +2283,13 @@ function missingDeliveries(
 const FOLLOW_PAINTED_FRAMES = 3;
 
 /**
+ * How many painted deliveries in a row may be exempt as unfollowed batches. The next painted
+ * delivery is checked whatever its frame count, so a reply whose end stays hidden fails within
+ * three painted deliveries instead of passing on a last line that catches up.
+ */
+const MAX_EXEMPT_IN_A_ROW = 2;
+
+/**
  * The deliveries, once the reply's code block shows, that landed together with an earlier one
  * between two painted frames and then showed fewer than FOLLOW_PAINTED_FRAMES frames. A runner
  * that paints a frame only every 500 ms or more (Linux arm64 painted the plain reply 550 ms
@@ -2290,9 +2299,11 @@ const FOLLOW_PAINTED_FRAMES = 3;
  * way to the end. These rests are recorded, not checked. A delivery that follows the one
  * before it by one, the cadence of a runner that paints each delivery, stays checked on
  * every frame, and so does the last line's: no delivery replaces it, and the sampling runs
- * on until it has painted FOLLOW_PAINTED_FRAMES frames.
+ * on until it has painted FOLLOW_PAINTED_FRAMES frames. At most MAX_EXEMPT_IN_A_ROW painted
+ * deliveries in a row are exempt; the painted delivery after them is checked.
  */
 function unfollowedBatches(samples: readonly StreamSample[]): Map<number, number> {
+  // Painted deliveries in the order they first showed, with their frame counts.
   const frames = new Map<number, number>();
   const batched = new Set<number>();
   let previous: number | null = null;
@@ -2303,11 +2314,26 @@ function unfollowedBatches(samples: readonly StreamSample[]): Map<number, number
     frames.set(delivered, (frames.get(delivered) ?? 0) + 1);
     previous = delivered;
   }
-  return new Map(
-    [...frames].filter(
-      ([delivered, count]) => batched.has(delivered) && count < FOLLOW_PAINTED_FRAMES,
-    ),
-  );
+  const exempt = new Map<number, number>();
+  let inARow = 0;
+  for (const [delivered, count] of frames) {
+    if (batched.has(delivered) && count < FOLLOW_PAINTED_FRAMES && inARow < MAX_EXEMPT_IN_A_ROW) {
+      exempt.set(delivered, count);
+      inARow += 1;
+    } else {
+      inARow = 0;
+    }
+  }
+  return exempt;
+}
+
+/** How many of the resting frames in `rests` are checked: those `restsBeforeFollow` leaves. */
+function checkedRestCount(
+  samples: readonly StreamSample[],
+  rests: ReadonlyMap<number, number>,
+): number {
+  const exempt = unfollowedBatches(samples);
+  return [...rests.keys()].filter((delivered) => !exempt.has(delivered)).length;
 }
 
 /** The resting frames in `rests` of batched deliveries shown too briefly to be followed. */
