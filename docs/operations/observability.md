@@ -295,7 +295,8 @@ the token, the environment name, or archive bytes.
 
 `bibcode diagnostics pair` pairs this command with a remote server as its own
 device, from an offer minted there with `bibcode pairing offer --access
-diagnostics` (the offer on standard input, or as an argument); afterwards
+diagnostics` (pass the offer on standard input: as an argument it would show in
+the process list and shell history); afterwards
 `bibcode diagnostics download --remote <name>` fetches the bundle itself, with
 no app running anywhere. `bibcode diagnostics remotes` lists the paired
 remotes and `bibcode diagnostics forget <name>` deletes one's local credential
@@ -305,7 +306,8 @@ and storage design is in
 [Remote architecture](../architecture/remote.md#command-line-diagnostics-pairing).
 
 - The credential holds `diagnostics:read` alone, which allows
-  `server.downloadDiagnosticLogs` and no other method. `pair` reads the minted
+  no method other than `server.downloadDiagnosticLogs` (plus
+  `auth.confirmPairing` for its own pending pairing). `pair` reads the minted
   scopes from the remote's pairing reply and saves nothing unless they are
   exactly that (`not-diagnostics-only`); a remote too old to report them is
   refused too (`unsupported`). An unconfirmed credential it refuses is revoked

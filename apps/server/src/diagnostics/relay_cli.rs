@@ -75,8 +75,9 @@ pub enum DiagnosticsSubcommand {
     /// Pair with a remote BiBCode server for its diagnostic logs only, from an offer made there
     /// with `bibcode pairing offer --access diagnostics`.
     Pair {
-        /// The offer (`bibcode://pair?code=…`, a `/pair?code=…` link, or the code). Read
-        /// from standard input when left out or `-`, so it stays out of the process list.
+        /// The offer (`bibcode://pair?code=…`, a `/pair?code=…` link, or the code). Leave it
+        /// out (or pass `-`) to read it from standard input: an argument shows in the process
+        /// list and shell history until the one-time offer is used or expires.
         offer: Option<String>,
         /// The name to use with `download --remote`; from the offer's name by default.
         #[arg(long)]
