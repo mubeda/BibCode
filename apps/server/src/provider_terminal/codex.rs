@@ -644,6 +644,7 @@ impl CodexTerminalObserverFactory {
         Ok(PreparedTerminalLaunch {
             executable: input.launch.executable,
             args: tui_args,
+            env_overlay: BTreeMap::new(),
             private_env: BTreeMap::new(),
             observer: Box::new(observer),
         })

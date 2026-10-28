@@ -14,8 +14,9 @@ pub(crate) use model::{
 
 pub use claude::{
     CachedClaudeCapabilityProbe, ClaudeAdditiveHookAttestor, ClaudeCapabilities,
-    ClaudeCapabilityProbeRunner, ClaudeExecutablePinner, ClaudeProbeOutput,
-    ClaudeTerminalObserverFactory,
+    ClaudeCapabilityProbeRunner, ClaudeExecutablePinner, ClaudeInstallResolver, ClaudeProbeOutput,
+    ClaudeShimRequest, ClaudeShimResolution, ClaudeTerminalObserverFactory,
+    MiseClaudeInstallResolver,
 };
 pub use codex::{
     CachedCodexCapabilityProbe, CodexCapabilities, CodexCapabilityProbeRunner, CodexHelperLaunch,

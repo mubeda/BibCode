@@ -225,7 +225,11 @@ fn built_in_binary(driver_kind: &str) -> Option<&'static str> {
 
 #[derive(Clone)]
 pub struct ProviderTerminalObserverFactoryInput {
+    /// `launch.executable` is the validated, canonical executable.
     pub launch: TerminalLaunchPreparationInput,
+    /// The path the terminal invokes before links are resolved, such as a version manager's
+    /// shim. It names the same file as `launch.executable`.
+    pub invoked_executable: PathBuf,
     pub activity_publisher: TerminalGenerationActivityPublisher,
     pub process_attribution: ProcessAttributionRegistry,
     pub runtime_dir: PathBuf,
@@ -324,7 +328,10 @@ type LaunchSnapshots = Arc<Mutex<HashMap<Uuid, LaunchSnapshotState>>>;
 #[derive(Clone)]
 enum LaunchValidation {
     Valid {
+        /// The canonical executable.
         executable: PathBuf,
+        /// The same file as the terminal invokes it, links unresolved.
+        invoked: PathBuf,
         factory: Arc<dyn ProviderTerminalObserverFactory>,
     },
     /// The `warn_once` reason the launch passes through with.
@@ -472,7 +479,7 @@ impl ProviderTerminalActivitySupervisor {
         if instance.driver_kind != input.activity.driver_kind {
             return LaunchValidation::Rejected("driver_mismatch");
         }
-        let Some(executable) = validated_executable(input, instance) else {
+        let Some((invoked, executable)) = validated_launch_executable(input, instance) else {
             return LaunchValidation::Rejected("executable_mismatch");
         };
         let Some(factory) = self.factory_for(&instance.driver_kind) else {
@@ -480,6 +487,7 @@ impl ProviderTerminalActivitySupervisor {
         };
         LaunchValidation::Valid {
             executable,
+            invoked,
             factory,
         }
     }
@@ -578,16 +586,18 @@ impl ProviderTerminalActivitySupervisor {
         // activity, through the admission below.
         let activity_state = self.activity_controller.snapshot();
         let observer_generation = input.generation.clone();
-        let (validated_executable, factory) = match self.launch_validation(&input).await {
-            LaunchValidation::Valid {
-                executable,
-                factory,
-            } => (executable, factory),
-            LaunchValidation::Rejected(reason) => {
-                self.warn_once(reason, &input);
-                return TerminalLaunchPreparation::PassThrough;
-            }
-        };
+        let (validated_executable, invoked_executable, factory) =
+            match self.launch_validation(&input).await {
+                LaunchValidation::Valid {
+                    executable,
+                    invoked,
+                    factory,
+                } => (executable, invoked, factory),
+                LaunchValidation::Rejected(reason) => {
+                    self.warn_once(reason, &input);
+                    return TerminalLaunchPreparation::PassThrough;
+                }
+            };
         let mut input = input;
         input.executable = validated_executable.to_string_lossy().into_owned();
         let activity_publisher = TerminalGenerationActivityPublisher::new(
@@ -597,6 +607,7 @@ impl ProviderTerminalActivitySupervisor {
         );
         let factory_input = ProviderTerminalObserverFactoryInput {
             launch: input,
+            invoked_executable,
             activity_publisher,
             process_attribution: self.process_attribution.clone(),
             runtime_dir: self.runtime_dir.clone(),
@@ -1322,22 +1333,44 @@ fn validated_executable(
     input: &TerminalLaunchPreparationInput,
     instance: &ProviderTerminalInventoryEntry,
 ) -> Option<PathBuf> {
+    validated_launch_executable(input, instance).map(|(_, canonical)| canonical)
+}
+
+/// The launch's executable as the terminal invokes it (links unresolved, such as a version
+/// manager's shim) and its canonical path, when that canonical path is the configured provider
+/// executable's.
+fn validated_launch_executable(
+    input: &TerminalLaunchPreparationInput,
+    instance: &ProviderTerminalInventoryEntry,
+) -> Option<(PathBuf, PathBuf)> {
     let allowed = if instance.configured_binary.trim().is_empty() {
         instance.built_in_binary.as_deref()?
     } else {
         instance.configured_binary.as_str()
     };
-    let requested = resolve_executable(
+    let invoked = locate_launch_executable(
         &input.executable,
         &input.cwd,
         Some(&input.launch_env),
         false,
     )?;
+    let requested = std::fs::canonicalize(&invoked).ok()?;
     let allowed = resolve_executable(allowed, &input.cwd, None, true)?;
-    paths_equal(&requested, &allowed).then_some(allowed)
+    paths_equal(&requested, &allowed).then_some((invoked, allowed))
 }
 
 fn resolve_executable(
+    executable: &str,
+    cwd: &Path,
+    launch_env: Option<&BTreeMap<String, String>>,
+    configured_provider: bool,
+) -> Option<PathBuf> {
+    let path = locate_launch_executable(executable, cwd, launch_env, configured_provider)?;
+    std::fs::canonicalize(path).ok()
+}
+
+/// Finds `executable` the way the terminal's spawn would, without resolving links.
+fn locate_launch_executable(
     executable: &str,
     cwd: &Path,
     launch_env: Option<&BTreeMap<String, String>>,
@@ -1363,13 +1396,11 @@ fn resolve_executable(
             search_path.as_deref(),
             &extensions,
             false,
-        )
-        .and_then(|path| std::fs::canonicalize(path).ok());
+        );
     }
     #[cfg(not(feature = "hermetic-test-guard"))]
     let _ = configured_provider;
-    let path = locate_executable(executable, Some(cwd), search_path.as_deref(), &extensions)?;
-    std::fs::canonicalize(path).ok()
+    locate_executable(executable, Some(cwd), search_path.as_deref(), &extensions)
 }
 
 fn environment_value<'a>(environment: &'a BTreeMap<String, String>, key: &str) -> Option<&'a str> {

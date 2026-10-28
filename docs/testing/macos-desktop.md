@@ -56,6 +56,10 @@ Select focused tests from affected source and verify at least:
   remain selectable in the environment rail without bypassing desktop-owned
   connection controls;
 - Claude, Codex, Cursor, and OpenCode remain visible while Grok is absent;
+- the installed Claude Code is within the hooked range and passes Anthropic's
+  signature check within its budget, and a newer build is proven before the
+  ceiling is raised
+  ([Claude Terminal pin, attestation and shim](cross-platform-validation.md#claude-terminal-pin-attestation-and-shim));
 - Activity observation timestamps and keyboard navigation remain correct; and
 - update protection treats long-lived read subscriptions as reads, reports
   staged progress and active mutation counts while preparing, rejects a forged
@@ -411,16 +415,16 @@ as not verified, with the lock evidence (`ioreg -n Root -d1` shows
   management remains explicitly operator-owned. The local-machine flow still
   has no Host selector; remote targeting is driven by the environment rail;
 - Headless pairing: on a second machine or VM run `bibcode serve --host
-  <routable address>`, confirm the startup line contains `pairingCode`, and add it
+<routable address>`, confirm the startup line contains `pairingCode`, and add it
   through **Add Server → Pairing code**. Confirm the saved server appears
   alongside — not in place of — the app's own **Local** environment, since both
   hosts declare the environment id `local`. Mint a second offer with `bibcode
-  pairing offer --endpoint http://<address>:3773` and confirm the dialog refuses
+pairing offer --endpoint http://<address>:3773` and confirm the dialog refuses
   it by name ("<label> is already saved."): two offers describe one environment.
   Then restart the headless server and confirm the saved server reconnects
   without re-pairing.
 - Headless service: on the second machine run `bibcode service install --host
-  <routable address>`, confirm `bibcode service status` reports `active`,
+<routable address>`, confirm `bibcode service status` reports `active`,
   reboot that machine, and confirm the desktop's saved server reconnects
   without re-pairing. On Linux confirm `loginctl show-user $USER` reports
   `Linger=yes`; on macOS confirm automatic login is enabled; on Windows confirm
