@@ -306,6 +306,11 @@ import {
   DiagnosticLogsDownloadEvent,
   DiagnosticLogsDownloadInput,
   DiagnosticLogsError,
+  DiagnosticLogsRelayClaimInput,
+  DiagnosticLogsRelayClaimResult,
+  DiagnosticLogsRelayError,
+  DiagnosticLogsRelayEvent,
+  DiagnosticLogsRelaySendInput,
   ServerConfigStreamEvent,
   ServerConfig,
   ServerProviderCapabilities,
@@ -637,6 +642,9 @@ export const WS_METHODS = {
   serverDiscoverSourceControl: "server.discoverSourceControl",
   serverGetTraceDiagnostics: "server.getTraceDiagnostics",
   serverDownloadDiagnosticLogs: "server.downloadDiagnosticLogs",
+  serverSubscribeDiagnosticLogsRelay: "server.subscribeDiagnosticLogsRelay",
+  serverClaimDiagnosticLogsRelay: "server.claimDiagnosticLogsRelay",
+  serverSendDiagnosticLogsRelayItem: "server.sendDiagnosticLogsRelayItem",
   serverGetProcessDiagnostics: "server.getProcessDiagnostics",
   serverGetProcessResourceHistory: "server.getProcessResourceHistory",
   serverGetProfilerStatus: "server.getProfilerStatus",
@@ -791,6 +799,40 @@ export const WsServerDownloadDiagnosticLogsRpc = Rpc.make(WS_METHODS.serverDownl
   error: Schema.Union([DiagnosticLogsError, EnvironmentRpcError]),
   stream: true,
 });
+
+/**
+ * Requests from `bibcode diagnostics download` on this host, for the desktop app's own
+ * session only (#201): every other session is refused with `not-desktop`.
+ */
+export const WsServerSubscribeDiagnosticLogsRelayRpc = Rpc.make(
+  WS_METHODS.serverSubscribeDiagnosticLogsRelay,
+  {
+    payload: Schema.Struct({}),
+    success: DiagnosticLogsRelayEvent,
+    error: Schema.Union([DiagnosticLogsRelayError, EnvironmentRpcError]),
+    stream: true,
+  },
+);
+
+/** Takes a pending request for this connection; only its items are accepted afterwards. */
+export const WsServerClaimDiagnosticLogsRelayRpc = Rpc.make(
+  WS_METHODS.serverClaimDiagnosticLogsRelay,
+  {
+    payload: DiagnosticLogsRelayClaimInput,
+    success: DiagnosticLogsRelayClaimResult,
+    error: Schema.Union([DiagnosticLogsRelayError, EnvironmentRpcError]),
+  },
+);
+
+/** One item for the claimed request; it answers once the command took the item before. */
+export const WsServerSendDiagnosticLogsRelayItemRpc = Rpc.make(
+  WS_METHODS.serverSendDiagnosticLogsRelayItem,
+  {
+    payload: DiagnosticLogsRelaySendInput,
+    success: Schema.Struct({}),
+    error: Schema.Union([DiagnosticLogsRelayError, EnvironmentRpcError]),
+  },
+);
 
 export const WsServerGetProcessDiagnosticsRpc = Rpc.make(WS_METHODS.serverGetProcessDiagnostics, {
   payload: Schema.Struct({}),
@@ -2067,6 +2109,9 @@ export const WsRpcGroup = RpcGroup.make(
   WsServerDiscoverSourceControlRpc,
   WsServerGetTraceDiagnosticsRpc,
   WsServerDownloadDiagnosticLogsRpc,
+  WsServerSubscribeDiagnosticLogsRelayRpc,
+  WsServerClaimDiagnosticLogsRelayRpc,
+  WsServerSendDiagnosticLogsRelayItemRpc,
   WsServerGetProcessDiagnosticsRpc,
   WsServerGetProcessResourceHistoryRpc,
   WsServerGetProfilerStatusRpc,

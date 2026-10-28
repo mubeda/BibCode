@@ -611,6 +611,40 @@ is the packaged check that unsent text survives draft promotion. To run the
 scenario alone, set `BIBCODE_E2E_SPEC=./specs/composer-native-triggers.e2e.ts`
 in the same way.
 
+The spec's third scenario types into the primary chat one key at a time. It
+types through a window `offline` event, then through a lost RPC socket that its
+page harness keeps failing until it lets the retry through. In both drops:
+
+- every key is on screen and in the thread's single environment-scoped persisted
+  draft after the 300 ms write debounce;
+- Send is blocked but stays focusable (`aria-disabled`, not native `disabled`),
+  and its accessible name is "Send unavailable." followed by the state the
+  composer banner shows;
+- Enter raises a toast titled with the environment's state and keeps focus and
+  text;
+- nothing reaches the provider before an explicit Send after the reconnect;
+- that Send delivers the whole text exactly once. The provider-log wait's
+  1.5 s settle is the proof that nothing was resent on reconnect: it fails on a
+  second delivery.
+
+Keep these assertions. They are the packaged check that a connection phase never
+drops typing (#199). The collapsed mobile composer cannot render in the desktop
+app, whose window is at least 960 px wide, so its refusal is covered by
+ChatComposer component tests.
+
+When `waitForComposerValue` times out, the spec writes
+`composer-value-timeout-<n>.json`. It records the editor's text, editable state
+and focus, the Send label, the toasts, `navigator.onLine`, the route, and the
+persisted drafts. Retain it with the failure screenshot.
+
+The manual loop `apps/desktop/e2e/specs/manual/composer-connection-drop.e2e.ts`
+(not in the default list) repeats offline, lost-socket and no-drop arms around
+typing. It writes a timestamped recorder log per run to
+`composer-drop-runs.jsonl`, and fails an arm whose text is gone once the
+connection is back. Before the fix, with a read-only composer, its
+offline-before-typing arm lost the text on macOS arm64 in every run. What closed
+the macOS x64 runner's connection in that CI run is not known.
+
 The packaged scenario must show two Queued cards in FIFO order below the working
 row while the provider log still contains only the initial start. Steer the head
 and verify exactly one `kind: "steer"` log entry for its text and the original
@@ -3220,8 +3254,35 @@ sizes. Cover relevant:
   "The connection to <label> was lost. Reconnect and try again.", and no file is
   saved; while the remote environment reconnects, the button is disabled with
   "<label> is still connecting. Download its logs once it is connected.", and
-  the primary's logs are never downloaded in its place (once the app drops a
-  choice whose environment is gone, the row names the primary again);
+  the primary's logs are never downloaded in its place; with the remote
+  stopped, the remote stays chosen and the button is disabled with "<label> is
+  not connected. Reconnect it to download its logs." until it reconnects (only
+  removing the environment returns the row to the primary);
+- Diagnostics from a thread: in a remote environment's thread, make the
+  provider report an error (for example a provider with a missing binary), and
+  click the error banner's **Diagnostics**: the page opens with that remote
+  chosen in **Environment**, the Diagnostic logs row names it, and **Download
+  logs** saves its archive; repeat with the remote disconnected and confirm the
+  remote stays chosen with the download disabled. The sidebar's
+  project-availability **Diagnostics** opens on the unavailable environment;
+- `<desktop exe> diagnostics download --environment <remote label> --output
+  <dir> --json` from a terminal on the desktop's machine, with the desktop app
+  connected to the remote: the command prints "Approve request <code> in
+  BiBCode…" and the app shows "Share <label>'s diagnostic logs?" with "A program
+  running as you on this computer (not BiBCode)…", the same code, the
+  environment as typed, and the output directory; a second window drops its
+  prompt once the first answers. **Share logs**
+  saves `<dir>/bibcode-diagnostics-<label>-….zip` whose `manifest.json` names
+  the remote, its `storageInstanceId`, and its version, and the command exits 0
+  with `"status":"saved"`; a second run that finds a file of the same name
+  exits 1 and leaves it untouched. **Deny** (or
+  Esc) exits 2 with `"status":"denied"` and saves nothing, and a request right
+  after it exits 2 with `cooling-down`; an unknown name exits 1 without listing
+  any environment, with no prompt; with BiBCode's primary environment in WSL,
+  the desktop executable exits 3 naming the distro, and `bibcode diagnostics
+  download` inside the distro works; Ctrl-C while the app
+  downloads closes the prompt or stops the download; with the app quit, the
+  command exits 3;
 - Find in thread on macOS (WKWebView), Linux (WebKitGTK AppImage), and Windows
   (WebView2), in a long thread with folded turns: find a word that appears only
   in a folded turn, a tool command inside a collapsed run of tool calls, a file

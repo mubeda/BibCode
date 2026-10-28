@@ -130,6 +130,8 @@ pub struct ProductionRuntime {
     provider_update_checks: ProviderUpdateCheckTask,
     orchestration_effects: OrchestrationEffects,
     diagnostic_bundle: DiagnosticBundleService,
+    /// `bibcode diagnostics download`, relayed by the desktop app (#201).
+    diagnostic_logs_relay: crate::production::diagnostic_logs_relay::DiagnosticLogsRelay,
     managed_endpoint: ManagedEndpointRuntime,
     _worktree_catalog: WorktreeCatalogService,
     worktree_catalog_operations: WorktreeCatalogOperationRuntime,
@@ -172,6 +174,14 @@ impl ProductionRuntime {
     #[must_use]
     pub fn preview_gateway(&self) -> PreviewGateway {
         self.preview_gateway.clone()
+    }
+
+    /// The relay whose RPC methods this runtime registered; the HTTP route shares it.
+    #[must_use]
+    pub fn diagnostic_logs_relay(
+        &self,
+    ) -> crate::production::diagnostic_logs_relay::DiagnosticLogsRelay {
+        self.diagnostic_logs_relay.clone()
     }
 
     pub fn device_manager(&self) -> crate::device::DeviceManager {
@@ -651,6 +661,12 @@ impl ProductionRuntime {
             &mut registry,
             diagnostic_bundle.clone(),
         );
+        let diagnostic_logs_relay =
+            crate::production::diagnostic_logs_relay::DiagnosticLogsRelay::new();
+        crate::production::diagnostic_logs_relay::register_diagnostic_logs_relay_rpc(
+            &mut registry,
+            diagnostic_logs_relay.clone(),
+        );
         let git_manager = GitManagerRpcServices::with_dependencies(
             git_repository.clone(),
             status_broadcaster.clone(),
@@ -714,6 +730,7 @@ impl ProductionRuntime {
             provider_update_checks,
             orchestration_effects,
             diagnostic_bundle,
+            diagnostic_logs_relay,
             managed_endpoint,
             _worktree_catalog: worktree_catalog,
             worktree_catalog_operations,

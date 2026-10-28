@@ -268,7 +268,8 @@ vi.mock("./ComposerCommandMenu", () => ({
 vi.mock("./ComposerPendingApprovalActions", () => ({
   ComposerPendingApprovalActions: h.mk("ComposerPendingApprovalActions"),
 }));
-vi.mock("./ComposerPrimaryActions", () => ({
+vi.mock("./ComposerPrimaryActions", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./ComposerPrimaryActions")>()),
   ComposerPrimaryActions: h.mk("ComposerPrimaryActions"),
 }));
 vi.mock("./ComposerPendingApprovalPanel", () => ({
@@ -1164,35 +1165,53 @@ describe("ChatComposer rendering", () => {
     });
   });
 
-  it("disables the editor while connecting and when the environment is unavailable", () => {
+  it("disables the editor while connecting", () => {
     renderComposer({ isConnecting: true });
-    expect(editorProps()["disabled"]).toBe(true);
-
-    const connection: EnvironmentConnectionPresentation = {
-      phase: "offline",
-      error: null,
-      traceId: null,
-    };
-    const { markup } = renderComposer({
-      environmentUnavailable: { label: "Laptop", connection },
-    });
-    expect(markup).toContain('data-placeholder="Laptop is not connected"');
-    expect(markup).toContain("opacity-75");
     expect(editorProps()["disabled"]).toBe(true);
   });
 
-  it("names the unavailable environment without repeating the banner's reason", () => {
-    const reason =
-      "devbox rejected a new pairing credential. Connect again; if it keeps failing, remove the environment and add it again.";
-    const { markup } = renderComposer({
+  it.each([
+    ["offline", null, "Laptop: Offline"],
+    ["reconnecting", "Socket closed", "Laptop: Reconnecting…"],
+    ["connecting", null, "Laptop: Connecting…"],
+    ["available", null, "Laptop: Disconnected"],
+    ["error", "Laptop rejected a new pairing credential.", "Laptop: Connection failed"],
+  ] as const)(
+    "keeps the editor editable while the environment is %s and blocks Send with its state",
+    (phase, error, reason) => {
+      seedPrompt("kept while away");
+      const connection: EnvironmentConnectionPresentation = { phase, error, traceId: null };
+      const { markup } = renderComposer({
+        environmentUnavailable: { label: "Laptop", connection },
+      });
+
+      // Typing is never dropped by a connection state (#199); the banner states the reason.
+      expect(editorProps()["disabled"]).toBe(false);
+      expect(editorProps()["value"]).toBe("kept while away");
+      expect(editorProps()["placeholder"]).toBe(
+        "Ask anything, @ files, : BiBCode actions, or a provider-native command",
+      );
+      expect(markup).not.toContain("is not connected");
+      expect(markup).not.toContain("opacity-75");
+      const primary = findCapture("ComposerPrimaryActions");
+      expect(primary["isEnvironmentUnavailable"]).toBe(true);
+      expect(primary["environmentUnavailableReason"]).toBe(reason);
+      expect(primary["sendBlockedReason"]).toBeNull();
+      if (error) expect(markup).not.toContain(error);
+    },
+  );
+
+  it("keeps a provider binding conflict as the Send reason over the environment state", () => {
+    renderComposer({
+      providerBindingConflictReason: "This thread is bound to another provider.",
       environmentUnavailable: {
-        label: "devbox",
-        connection: { phase: "error", error: reason, traceId: null },
+        label: "Laptop",
+        connection: { phase: "offline", error: null, traceId: null },
       },
     });
-
-    expect(markup).toContain('data-placeholder="devbox is not connected"');
-    expect(markup).not.toContain("rejected a new pairing credential");
+    expect(findCapture("ComposerPrimaryActions")["sendBlockedReason"]).toBe(
+      "This thread is bound to another provider.",
+    );
   });
 
   it("shows the disconnected placeholder", () => {
@@ -2887,12 +2906,6 @@ describe("ChatComposer imperative handle", () => {
       { isConnecting: true },
       { activePendingApproval: pendingApproval, pendingApprovals: [pendingApproval] },
       { pendingUserInputs: [makePendingUserInput()] },
-      {
-        environmentUnavailable: {
-          label: "Laptop",
-          connection: { phase: "offline", error: null, traceId: null },
-        },
-      },
     ];
     for (const overrides of blockedStates) {
       const { handle } = renderComposer(overrides);
@@ -2901,6 +2914,19 @@ describe("ChatComposer imperative handle", () => {
     const { handle } = renderComposer();
     expect(handle().insertTextAtEnd("")).toBe(false);
     expect(draftOf(threadRef)?.prompt).toBe("hello");
+  });
+
+  it("inserts text while the environment is not connected", () => {
+    seedPrompt("hello");
+    const { handle } = renderComposer({
+      environmentUnavailable: {
+        label: "Laptop",
+        connection: { phase: "reconnecting", error: null, traceId: null },
+      },
+    });
+
+    expect(handle().insertTextAtEnd(" world")).toBe(true);
+    expect(draftOf(threadRef)?.prompt).toBe("hello world");
   });
 
   it("controls the model picker", () => {
@@ -3320,6 +3346,35 @@ describe("ChatComposer mobile", () => {
     (send["onClick"] as (event: unknown) => void)({ stopPropagation: vi.fn() });
 
     expect(active.blur).not.toHaveBeenCalled();
+  });
+
+  it("names the environment state on the collapsed send and keeps focus when refused", () => {
+    h.isMobile = true;
+    seedPrompt("ready to send");
+    const active = new FakeHTMLElement();
+    documentStub.activeElement = active;
+    const { markup, spies } = renderComposer({
+      environmentUnavailable: {
+        label: "Laptop",
+        connection: { phase: "offline", error: null, traceId: null },
+      },
+    });
+
+    // Blocked but focusable: its name states why, and pressing it reaches onSend's refusal.
+    const send = hostByLabel("Send unavailable. Laptop: Offline");
+    expect(send["disabled"]).toBe(false);
+    expect(send["aria-disabled"]).toBe(true);
+    expect(markup).toContain("ready to send");
+    (send["onClick"] as (event: unknown) => void)({ stopPropagation: vi.fn() });
+    expect(spies.onSend).toHaveBeenCalledTimes(1);
+    expect(active.blur).not.toHaveBeenCalled();
+
+    // Enter submits the form; ChatView refuses and states why, so the draft stays in view.
+    const form = findHost((element) => element.type === "form");
+    (form.props["onSubmit"] as (event: unknown) => void)({ preventDefault: vi.fn() });
+    expect(spies.onSend).toHaveBeenCalledTimes(2);
+    expect(active.blur).not.toHaveBeenCalled();
+    expect(setStateValues(STATE.focused)).not.toContain(false);
   });
 
   it("disables the collapsed send button without sendable content", () => {

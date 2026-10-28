@@ -127,6 +127,12 @@ pub async fn run_cli() -> Result<(), RunError> {
             0 => Ok(()),
             code => std::process::exit(code),
         },
+        CliAction::Diagnostics { args, state_dir } => {
+            match diagnostics::relay_cli::run_diagnostics_cli(args, state_dir).await {
+                0 => Ok(()),
+                code => std::process::exit(code),
+            }
+        }
         // Blocking file I/O, and `--follow` sleeps between polls.
         CliAction::Profiler { args, state_dir } => {
             match tokio::task::spawn_blocking(move || run_profiler_cli(args, state_dir))

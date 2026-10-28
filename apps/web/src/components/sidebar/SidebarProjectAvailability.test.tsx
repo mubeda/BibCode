@@ -134,7 +134,8 @@ describe("SidebarProjectAvailability", () => {
     }
     expect(onRetry).toHaveBeenCalledWith(ENVIRONMENT_ID);
     expect(onOpenSettings).toHaveBeenCalledOnce();
-    expect(onViewDiagnostics).toHaveBeenCalledOnce();
+    // Diagnostics opens on the environment whose projects are unavailable, not the primary.
+    expect(onViewDiagnostics).toHaveBeenCalledExactlyOnceWith(ENVIRONMENT_ID);
     expect(onAdoptStorage).toHaveBeenCalledWith(ENVIRONMENT_ID);
   });
 
