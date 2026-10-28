@@ -143,11 +143,11 @@ describe("ComposerPrimaryActions", () => {
       {
         isEnvironmentUnavailable: true,
         pendingAction: {
-          questionIndex: 0,
-          isLastQuestion: false,
+          questionIndex: 1,
+          isLastQuestion: true,
           canAdvance: true,
           isResponding: false,
-          isComplete: false,
+          isComplete: true,
         },
       },
     ];
@@ -168,6 +168,67 @@ describe("ComposerPrimaryActions", () => {
       },
     });
     expect(harness.buttons[0]?.disabled).toBe(false);
+  });
+
+  it("moves to the next question while disconnected and names why the final answer waits", () => {
+    renderActions({
+      isEnvironmentUnavailable: true,
+      environmentUnavailableReason: "Laptop: Offline",
+      pendingAction: {
+        questionIndex: 0,
+        isLastQuestion: false,
+        canAdvance: true,
+        isResponding: false,
+        isComplete: false,
+      },
+    });
+    expect(harness.buttons.at(-1)?.disabled).toBe(false);
+    expect(harness.buttons.at(-1)?.["aria-label"]).toBeUndefined();
+
+    harness.buttons.length = 0;
+    harness.tooltipTriggers.length = 0;
+    const { markup } = renderActions({
+      isEnvironmentUnavailable: true,
+      environmentUnavailableReason: "Laptop: Offline",
+      pendingAction: {
+        questionIndex: 1,
+        isLastQuestion: true,
+        canAdvance: true,
+        isResponding: false,
+        isComplete: true,
+      },
+    });
+    expect(harness.buttons.at(-1)?.disabled).toBe(true);
+    expect(harness.buttons.at(-1)?.["aria-label"]).toBe(
+      "Submit answers unavailable. Laptop: Offline",
+    );
+    expect(markup).toContain(
+      '<span data-tooltip="true">Submit answers unavailable. Laptop: Offline</span>',
+    );
+    // The focusable wrapper carries the tooltip, not a second name.
+    expect(harness.tooltipTriggers[0]?.props["aria-label"]).toBeUndefined();
+  });
+
+  it("names the environment state on a blocked Refine and Implement", () => {
+    for (const [promptHasText, action] of [
+      [true, "Refine"],
+      [false, "Implement"],
+    ] as const) {
+      harness.buttons.length = 0;
+      const { markup } = renderActions({
+        showPlanFollowUpPrompt: true,
+        promptHasText,
+        isEnvironmentUnavailable: true,
+        environmentUnavailableReason: "Laptop: Reconnecting…",
+      });
+      expect(harness.buttons[0]?.disabled).toBe(true);
+      expect(harness.buttons[0]?.["aria-label"]).toBe(
+        `${action} unavailable. Laptop: Reconnecting…`,
+      );
+      expect(markup).toContain(
+        `<span data-tooltip="true">${action} unavailable. Laptop: Reconnecting…</span>`,
+      );
+    }
   });
 
   it("interrupts a running response and preserves composer focus", () => {
@@ -243,7 +304,12 @@ describe("ComposerPrimaryActions", () => {
   it("labels and disables ordinary sends by highest-priority state", () => {
     const cases = [
       { expected: "Send message" },
-      { isEnvironmentUnavailable: true, expected: "Environment disconnected" },
+      { isEnvironmentUnavailable: true, expected: "Send unavailable. Environment disconnected" },
+      {
+        isEnvironmentUnavailable: true,
+        environmentUnavailableReason: "Laptop: Offline",
+        expected: "Send unavailable. Laptop: Offline",
+      },
       { isConnecting: true, expected: "Connecting" },
       { isPreparingWorktree: true, expected: "Preparing worktree" },
       { isSendBusy: true, expected: "Sending" },
@@ -264,7 +330,7 @@ describe("ComposerPrimaryActions", () => {
         isPreparingWorktree: true,
         isSendBusy: true,
       }).markup,
-    ).toContain('aria-label="Environment disconnected"');
+    ).toContain('aria-label="Send unavailable. Environment disconnected"');
   });
 
   it("uses a provider binding conflict as the accessible disabled reason", () => {
@@ -274,9 +340,10 @@ describe("ComposerPrimaryActions", () => {
     renderActions({ sendBlockedReason: reason });
 
     const trigger = harness.tooltipTriggers[0]!;
-    expect(trigger.props["aria-label"]).toBe(reason);
+    // One name, on the button, that still says it is Send.
+    expect(trigger.props["aria-label"]).toBeUndefined();
     const sendButton = trigger.props.children as ReactElement<Record<string, unknown>>;
-    expect(sendButton.props["aria-label"]).toBe(reason);
+    expect(sendButton.props["aria-label"]).toBe(`Send unavailable. ${reason}`);
     expect(sendButton.props.disabled).toBe(true);
   });
 });

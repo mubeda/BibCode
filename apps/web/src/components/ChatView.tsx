@@ -1757,23 +1757,51 @@ function ChatViewContent(props: ChatViewProps) {
       connection: activeEnvironment.connection,
     };
   }, [activeEnvironment, activeEnvironmentUnavailable, activeEnvironmentUnavailableLabel]);
-  const environmentRefusalToastIdRef = useRef<string | null>(null);
+  // The refusal describes this thread's unavailable environment in its current state; it is
+  // keyed by both, so it goes when the environment is back or its state changes, when another
+  // thread is shown, and when the view unmounts.
+  const environmentRefusalKey = activeEnvironmentUnavailableState
+    ? `${routeThreadKey}\u0000${describeUnavailableEnvironment(activeEnvironmentUnavailableState).title}`
+    : null;
+  const environmentRefusalToastRef = useRef<{ readonly id: string; readonly key: string } | null>(
+    null,
+  );
   /**
    * Refuses an action that needs the server while the environment is not connected, stating
    * what the composer banner shows. Returns true when it refused. Nothing is queued: the
    * draft, the question and its answers stay as they are for the person to resend (#199).
    */
   const refuseWhileEnvironmentUnavailable = useCallback((): boolean => {
-    if (!activeEnvironmentUnavailableState) return false;
+    if (!activeEnvironmentUnavailableState || environmentRefusalKey === null) return false;
+    // A repeat while the refusal is still on screen (key repeat, a second click) adds nothing.
+    if (environmentRefusalToastRef.current !== null) return true;
     const copy = describeUnavailableEnvironment(activeEnvironmentUnavailableState);
-    if (environmentRefusalToastIdRef.current !== null) {
-      toastManager.close(environmentRefusalToastIdRef.current);
-    }
-    environmentRefusalToastIdRef.current = toastManager.add(
-      stackedThreadToast({ type: "warning", title: copy.title, description: copy.description }),
-    );
+    const toastId = toastManager.add({
+      ...stackedThreadToast({ type: "warning", title: copy.title, description: copy.description }),
+      onClose: () => {
+        if (environmentRefusalToastRef.current?.id === toastId) {
+          environmentRefusalToastRef.current = null;
+        }
+      },
+    });
+    environmentRefusalToastRef.current = { id: toastId, key: environmentRefusalKey };
     return true;
-  }, [activeEnvironmentUnavailableState]);
+  }, [activeEnvironmentUnavailableState, environmentRefusalKey]);
+  useEffect(() => {
+    const open = environmentRefusalToastRef.current;
+    if (open === null || open.key === environmentRefusalKey) return;
+    environmentRefusalToastRef.current = null;
+    toastManager.close(open.id);
+  }, [environmentRefusalKey]);
+  useEffect(
+    () => () => {
+      const open = environmentRefusalToastRef.current;
+      if (open === null) return;
+      environmentRefusalToastRef.current = null;
+      toastManager.close(open.id);
+    },
+    [],
+  );
   const handleReconnectActiveEnvironment = useCallback(
     async (environmentId: EnvironmentId) => {
       const result = await retryEnvironment(environmentId);
@@ -5047,6 +5075,7 @@ function ChatViewContent(props: ChatViewProps) {
         return;
       const status = queuedStatuses[0];
       if (action === "steer" ? !status?.canSteer : !status?.canSendNow) return;
+      if (refuseWhileEnvironmentUnavailable()) return;
       queuedActionsInFlightRef.current.add(messageId);
       setResolvingQueuedMessageId(messageId);
       setQueuedMessageError(messageId, null);
@@ -5073,6 +5102,7 @@ function ChatViewContent(props: ChatViewProps) {
       promoteThreadTurn,
       queuedMessages,
       queuedStatuses,
+      refuseWhileEnvironmentUnavailable,
       setQueuedMessageError,
       steerThreadTurn,
     ],
@@ -5097,6 +5127,24 @@ function ChatViewContent(props: ChatViewProps) {
     liveComposerDraftTargetRef.current = composerDraftTarget;
   }, [composerDraftTarget]);
 
+  /** Whether a Send now would deliver anything: content, a plan follow-up, or a retained replay. */
+  const composerWouldSend = (): boolean => {
+    if (showPlanFollowUpPrompt && activeProposedPlan) return true;
+    if (stagedAttachmentAttempts.get(routeThreadRef) !== undefined) return true;
+    const sendContext = composerRef.current?.getSendContext();
+    const prompt = promptRef.current;
+    if (parseStandaloneComposerBiBCodeAction(prompt.trim())) return false;
+    return deriveComposerSendState({
+      prompt,
+      imageCount: sendContext?.attachments.length ?? composerAttachmentsRef.current.length,
+      terminalContexts: sendContext?.terminalContexts ?? [],
+      elementContextCount:
+        (sendContext?.elementContexts.length ?? 0) +
+        (sendContext?.previewAnnotations.length ?? 0) +
+        (sendContext?.reviewComments.length ?? 0),
+    }).hasSendableContent;
+  };
+
   const onSend = async (e?: { preventDefault: () => void }) => {
     e?.preventDefault();
     const enqueue = shouldEnqueueOnSend({
@@ -5107,8 +5155,15 @@ function ChatViewContent(props: ChatViewProps) {
     });
     if (!activeThread) return;
     // Enter and the mobile Send reach here without a disabled button to explain the refusal.
-    // Moving between a question's steps stays local; its final answer refuses on its own.
-    if (!activePendingProgress && refuseWhileEnvironmentUnavailable()) return;
+    // Moving between a question's steps stays local; its final answer refuses on its own. A
+    // provider binding conflict keeps precedence (the composer names it), and an Enter that
+    // would send nothing is refused without a toast.
+    if (activeEnvironmentUnavailableState !== null && !activePendingProgress) {
+      if (providerBinding.conflict === null && composerWouldSend()) {
+        refuseWhileEnvironmentUnavailable();
+      }
+      return;
+    }
     if (
       (isSendBusy && !enqueue) ||
       isConnecting ||
@@ -5282,13 +5337,45 @@ function ChatViewContent(props: ChatViewProps) {
           draftText: trimmed,
           planMarkdown: activeProposedPlan.planMarkdown,
         });
+        // Clear without revoking previews: a follow-up that fails (a connection that drops
+        // during its awaits, say) puts this content back, merged with anything typed since.
+        const draftStore = useComposerDraftStore.getState();
+        const followUpDraft = draftStore.getComposerDraft(composerDraftTarget);
         promptRef.current = "";
-        discardComposerDraftContent(composerDraftTarget);
+        clearComposerDraftContent(composerDraftTarget);
         composerRef.current?.resetCursorState();
-        await onSubmitPlanFollowUp({
+        const sent = await onSubmitPlanFollowUp({
           text: followUp.text,
           interactionMode: followUp.interactionMode,
         });
+        if (sent) {
+          for (const attachment of followUpDraft?.attachments ?? []) {
+            if (attachment.type === "image") revokeBlobPreviewUrl(attachment.previewUrl);
+          }
+        } else if (followUpDraft) {
+          const store = useComposerDraftStore.getState();
+          const current = store.getComposerDraft(composerDraftTarget);
+          const restored = mergeInterruptedComposerContent(
+            {
+              prompt: current?.prompt ?? "",
+              attachments: current?.attachments ?? [],
+              terminalContexts: current?.terminalContexts ?? [],
+              elementContexts: current?.elementContexts ?? [],
+              previewAnnotations: current?.previewAnnotations ?? [],
+              reviewComments: current?.reviewComments ?? [],
+            },
+            followUpDraft,
+          );
+          store.setPrompt(composerDraftTarget, restored.prompt);
+          store.addAttachments(composerDraftTarget, restored.attachments);
+          store.setTerminalContexts(composerDraftTarget, restored.terminalContexts);
+          store.setElementContexts(composerDraftTarget, restored.elementContexts);
+          store.setPreviewAnnotations(composerDraftTarget, restored.previewAnnotations);
+          store.setReviewComments(composerDraftTarget, restored.reviewComments);
+          if (liveComposerDraftTargetRef.current === composerDraftTarget) {
+            promptRef.current = restored.prompt;
+          }
+        }
         return;
       }
       if (!hasSendableContent) {
@@ -6082,7 +6169,7 @@ function ChatViewContent(props: ChatViewProps) {
     }: {
       text: string;
       interactionMode: "default" | "plan";
-    }) => {
+    }): Promise<boolean> => {
       if (
         !activeThread ||
         !isServerThread ||
@@ -6090,17 +6177,17 @@ function ChatViewContent(props: ChatViewProps) {
         isConnecting ||
         sendInFlightRef.current
       ) {
-        return;
+        return false;
       }
 
       const trimmed = text.trim();
       if (!trimmed) {
-        return;
+        return false;
       }
 
       const sendCtx = composerRef.current?.getSendContext();
       if (!sendCtx) {
-        return;
+        return false;
       }
       const {
         selectedProvider: ctxSelectedProvider,
@@ -6214,7 +6301,7 @@ function ChatViewContent(props: ChatViewProps) {
           }
         }
         sendInFlightRef.current = false;
-        return;
+        return true;
       }
 
       setOptimisticUserMessages((existing) =>
@@ -6229,6 +6316,7 @@ function ChatViewContent(props: ChatViewProps) {
       }
       sendInFlightRef.current = false;
       resetLocalDispatch();
+      return false;
     },
     [
       activeThread,
