@@ -18,6 +18,7 @@ export const mermaidFixturePrompts = {
   short: "reply with deterministic short mermaid",
   rows: "reply with deterministic mermaid rows",
   long: "reply with deterministic long text",
+  activity: "reply with deterministic Activity follow text",
   many: "reply with deterministic mermaid evictions",
   manyAgain: "reply with deterministic second mermaid evictions",
   streamed: "reply with deterministic streamed mermaid",
@@ -29,8 +30,7 @@ export const mermaidFixturePrompts = {
 export const mermaidFixtureDiagram = "flowchart LR\n  write[Fixture write] --> draw[Fixture draw]";
 
 /** A diagram in a reply shorter than the timeline, so its sent row stays anchored at the top. */
-export const mermaidFixtureShortDiagram =
-  "flowchart LR\n  sent[Sent row] --> kept[Kept at the top]";
+export const mermaidFixtureShortDiagram = "flowchart LR\n  kept[Kept at the top]";
 
 /**
  * The fixture provider's replies. `short` fits below its sent row; `rows` holds a diagram
@@ -40,7 +40,6 @@ export const mermaidFixtureShortDiagram =
  */
 export const mermaidFixtureReplies: Readonly<Record<string, string>> = {
   [mermaidFixturePrompts.short]: [
-    "Short diagram reply.",
     fence(mermaidFixtureShortDiagram),
     "After the short diagram.",
   ].join("\n\n"),
@@ -50,6 +49,7 @@ export const mermaidFixtureReplies: Readonly<Record<string, string>> = {
     filler("Below the diagram", 40),
   ].join("\n\n"),
   [mermaidFixturePrompts.long]: filler("Following reply", 60),
+  [mermaidFixturePrompts.activity]: filler("Activity follow", 60),
   [mermaidFixturePrompts.many]: [
     ...Array.from({ length: 101 }, (_, index) =>
       fence(`flowchart LR\n  m${String(index)}[Many ${String(index)}] --> n${String(index)}`),
