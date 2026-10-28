@@ -225,6 +225,45 @@ impl SecretStore {
         }
     }
 
+    /// Removes `name`; `false` when it did not exist.
+    pub(crate) async fn remove(&self, name: &str) -> Result<bool> {
+        let path = self.secret_path(name)?;
+        match fs::remove_file(&path).await {
+            Ok(()) => Ok(true),
+            Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(source) => Err(SecretStoreError::Persist {
+                name: name.to_owned(),
+                path,
+                operation: "remove",
+                source,
+            }),
+        }
+    }
+
+    /// The names of the records in the store, sorted; temporary files are not records.
+    pub(crate) async fn names(&self) -> Result<Vec<String>> {
+        let enumerate = |source| SecretStoreError::Enumerate {
+            path: self.root.clone(),
+            source,
+        };
+        let mut entries = fs::read_dir(&self.root).await.map_err(enumerate)?;
+        let mut names = Vec::new();
+        while let Some(entry) = entries.next_entry().await.map_err(enumerate)? {
+            let Some(filename) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let is_file = entry.file_type().await.is_ok_and(|kind| kind.is_file());
+            if let Some(name) = filename.strip_suffix(SECRET_FILE_SUFFIX)
+                && is_file
+                && validate_name(name).is_ok()
+            {
+                names.push(name.to_owned());
+            }
+        }
+        names.sort();
+        Ok(names)
+    }
+
     pub(crate) async fn prune_records_with_prefix<F>(
         &self,
         prefix: &str,

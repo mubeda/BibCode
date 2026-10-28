@@ -16,6 +16,8 @@ pub(crate) mod isolated_git_config;
 #[path = "../../tests/support/reexec.rs"]
 pub(crate) mod reexec;
 mod sandbox;
+#[path = "../../tests/support/tls_fixture.rs"]
+pub(crate) mod tls_fixture;
 #[path = "../../tests/support/websocket_frames.rs"]
 pub(crate) mod websocket_frames;
 

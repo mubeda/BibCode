@@ -1,5 +1,6 @@
 mod byte_budget;
 mod e2ee;
+pub(crate) mod e2ee_client;
 mod message;
 mod methods;
 mod session;
