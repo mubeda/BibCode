@@ -283,6 +283,7 @@ async fn an_item_over_the_bound_is_refused_through_the_client_and_nothing_is_sav
             storage_instance_id: "store-fake".to_owned(),
             remote_name: "Fake".to_owned(),
             paired_at: now_rfc3339(),
+            pairing_id: "attempt".to_owned(),
             credential: "credential".to_owned(),
         })
         .await
@@ -310,5 +311,177 @@ async fn an_item_over_the_bound_is_refused_through_the_client_and_nothing_is_sav
         STANDARD
             .encode(vec![0_u8; crate::production::diagnostic_logs_rpc::DIAGNOSTIC_LOGS_CHUNK_BYTES])
             .len()
+    );
+}
+
+type FakeSocket = tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>;
+
+/// The responder side of the pinned handshake, for fake remotes.
+async fn fake_handshake(socket: &mut FakeSocket, static_key: &[u8]) -> snow::TransportState {
+    let mut responder = snow::Builder::new(crate::auth::NOISE_NK_PARAMS.parse().unwrap())
+        .local_private_key(static_key)
+        .unwrap()
+        .build_responder()
+        .unwrap();
+    let Some(Ok(Message::Binary(message_a))) = socket.next().await else {
+        panic!("message A");
+    };
+    let mut scratch = vec![0_u8; 65_535];
+    responder.read_message(&message_a, &mut scratch).unwrap();
+    let length = responder.write_message(&[], &mut scratch).unwrap();
+    socket
+        .send(Message::Binary(scratch[..length].to_vec().into()))
+        .await
+        .unwrap();
+    responder.into_transport_mode().unwrap()
+}
+
+async fn fake_receive(socket: &mut FakeSocket, transport: &mut snow::TransportState) -> Value {
+    let Some(Ok(Message::Binary(frame))) = socket.next().await else {
+        panic!("record");
+    };
+    let mut plain = vec![0_u8; 65_535];
+    let length = transport.read_message(&frame, &mut plain).unwrap();
+    serde_json::from_slice(&plain[1..length]).unwrap()
+}
+
+async fn fake_send(socket: &mut FakeSocket, transport: &mut snow::TransportState, message: Value) {
+    let mut record = vec![0_u8];
+    record.extend_from_slice(message.to_string().as_bytes());
+    let mut frame = vec![0_u8; record.len() + 16];
+    let length = transport.write_message(&record, &mut frame).unwrap();
+    frame.truncate(length);
+    socket.send(Message::Binary(frame.into())).await.unwrap();
+}
+
+/// A record written by another pairing attempt under the same name.
+fn record_named(name: &str, pairing_id: &str) -> StoredRemote {
+    StoredRemote {
+        v: RECORD_VERSION,
+        name: name.to_owned(),
+        endpoint: "http://127.0.0.1:9".to_owned(),
+        host_key: URL_SAFE_NO_PAD.encode([1_u8; 32]),
+        environment_id: "local".to_owned(),
+        storage_instance_id: "store-other".to_owned(),
+        remote_name: "Other".to_owned(),
+        paired_at: now_rfc3339(),
+        pairing_id: pairing_id.to_owned(),
+        credential: "credential-b".to_owned(),
+    }
+}
+
+/// While attempt A waits for its confirmation, the user forgets `box` and pairs it again
+/// (attempt B). The remote then refuses A's confirmation: A's rollback must leave B's record.
+#[tokio::test]
+async fn a_refused_confirmation_never_removes_a_newer_record_under_the_same_name() {
+    let keypair = snow::Builder::new(crate::auth::NOISE_NK_PARAMS.parse().unwrap())
+        .generate_keypair()
+        .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let address = listener.local_addr().expect("address");
+    let (reached, reached_confirmation) = tokio::sync::oneshot::channel::<()>();
+    let (proceed, may_answer) = tokio::sync::oneshot::channel::<()>();
+    let private_key = keypair.private.clone();
+    tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.expect("accept");
+        let mut socket = tokio_tungstenite::accept_async(socket)
+            .await
+            .expect("upgrade");
+        let mut transport = fake_handshake(&mut socket, &private_key).await;
+        let auth = fake_receive(&mut socket, &mut transport).await;
+        assert_eq!(auth["pairing"], "one-time");
+        fake_send(
+            &mut socket,
+            &mut transport,
+            json!({
+                "type": "e2ee_authenticated",
+                "credential": "credential-a",
+                "environmentId": "local",
+                "storageInstanceId": "store-fake",
+                "scopes": ["diagnostics:read"],
+                "pairingConfirmationRequired": true,
+            }),
+        )
+        .await;
+        let confirm = fake_receive(&mut socket, &mut transport).await;
+        assert_eq!(confirm["tag"], "auth.confirmPairing");
+        reached.send(()).unwrap();
+        may_answer.await.unwrap();
+        fake_send(
+            &mut socket,
+            &mut transport,
+            json!({ "_tag": "Exit", "requestId": confirm["id"], "exit": {
+                "_tag": "Failure",
+                "cause": [{ "_tag": "Fail", "error": { "_tag": "AuthError", "message": "no" } }],
+            }}),
+        )
+        .await;
+        while socket.next().await.is_some() {}
+    });
+    let code = encode_pairing_code(&crate::auth::pairing_code::RemotePairingCodePayload {
+        v: crate::auth::pairing_code::REMOTE_PAIRING_CODE_VERSION,
+        endpoint: format!("http://{address}"),
+        name: "Fake".to_owned(),
+        token: "one-time".to_owned(),
+        host_key: URL_SAFE_NO_PAD.encode(&keypair.public),
+        reach: crate::auth::pairing_code::RemotePairingReach::AnotherDevice,
+        storage_instance_id: "store-fake".to_owned(),
+    })
+    .expect("offer");
+    let cli = tempfile::tempdir().expect("cli state");
+    let store = RemoteStore::open(cli.path()).await.expect("store");
+
+    let attempt_a = pair(
+        cli.path(),
+        &code,
+        Some("box".to_owned()),
+        &ServerTrust::Platform,
+    );
+    let meanwhile = async {
+        reached_confirmation
+            .await
+            .expect("A waits for its confirmation");
+        let written_by_a = store.read("box").await.unwrap().expect("A's record");
+        assert_eq!(written_by_a.credential, "credential-a");
+        // `forget box`, then attempt B pairs under the same name.
+        assert!(store.remove("box").await.unwrap());
+        store
+            .create(&record_named("box", "attempt-b"))
+            .await
+            .expect("B's record");
+        proceed.send(()).unwrap();
+    };
+    let (outcome, ()) = tokio::join!(attempt_a, meanwhile);
+
+    assert_eq!(
+        reason(&outcome.expect_err("A was refused")),
+        "pairing-rejected"
+    );
+    let kept = store
+        .read("box")
+        .await
+        .unwrap()
+        .expect("B's record survives");
+    assert_eq!(kept.pairing_id, "attempt-b");
+    assert_eq!(kept.credential, "credential-b");
+}
+
+#[tokio::test]
+async fn a_record_stored_with_a_stray_temporary_file_counts_as_stored() {
+    let cli = tempfile::tempdir().expect("cli state");
+    let store = RemoteStore {
+        store: SecretStore::new(cli.path().join(REMOTES_DIRECTORY))
+            .await
+            .expect("store")
+            .fail_published_cleanup_for_test(),
+    };
+    let note = store
+        .create(&record_named("box", "attempt"))
+        .await
+        .expect("stored despite the stray temporary file");
+    assert!(note.is_some_and(|note| note.contains("was saved")));
+    assert_eq!(
+        store.read("box").await.unwrap().expect("record").pairing_id,
+        "attempt"
     );
 }
