@@ -5176,6 +5176,12 @@ function ChatViewContent(props: ChatViewProps) {
     const sendLease = attachmentAdmissionOwner.claim(routeThreadRef);
     if (sendLease === null) return;
     try {
+      // Moving between a question's steps is local: it neither needs the staged-attempt
+      // authority nor may replay a retained send, so it runs before both.
+      if (activePendingProgress) {
+        onAdvanceActivePendingUserInput();
+        return;
+      }
       let attachmentAuthority: AttachmentAdmissionAuthority | undefined;
       let attachmentAuthorityChecked = false;
       const authorizeAttempt = async () => {
@@ -5281,10 +5287,6 @@ function ChatViewContent(props: ChatViewProps) {
           attachmentSendControllers.current.delete(replayMessageId);
           sendInFlightRef.current = false;
         }
-        return;
-      }
-      if (activePendingProgress) {
-        onAdvanceActivePendingUserInput();
         return;
       }
       // Authorize attachments before the snapshot: the send clears the composer right after
