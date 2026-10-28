@@ -35,10 +35,10 @@ describe("activityRecordTimeLabel", () => {
 
   it("explains a missing Stop with the provider's name", () => {
     expect(activityStopUnavailableReason("claudeAgent")).toBe(
-      "Claude can't stop this subagent on its own. Stop the turn to end it.",
+      "Claude doesn't offer a way to stop this subagent from BiBCode.",
     );
     expect(activityStopUnavailableReason("custom")).toBe(
-      "The provider can't stop this subagent on its own. Stop the turn to end it.",
+      "The provider doesn't offer a way to stop this subagent from BiBCode.",
     );
   });
 });

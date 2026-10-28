@@ -252,7 +252,7 @@ describe("ActivityRoster targeted cancellation controls", () => {
       '[data-activity-control-unavailable="unsupported"]',
     );
     expect(unavailable?.textContent).toBe(
-      "Stop unavailable. Codex can't stop this subagent on its own. Stop the turn to end it.",
+      "Stop unavailable. Codex doesn't offer a way to stop this subagent from BiBCode.",
     );
     expect(unavailable?.getAttribute("tabindex")).toBe("0");
     expect(unavailable?.closest("button")).toBeNull();

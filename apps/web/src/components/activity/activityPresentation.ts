@@ -251,8 +251,8 @@ const PROVIDER_LABELS: Readonly<Record<string, string>> = {
   grok: "Grok",
 };
 
-/** Why a running subagent has no Stop of its own, and what still ends it. */
+/** Why a running subagent has no Stop, without promising another way to end it. */
 export function activityStopUnavailableReason(provider: string): string {
   const label = Object.hasOwn(PROVIDER_LABELS, provider) ? PROVIDER_LABELS[provider] : undefined;
-  return `${label ?? "The provider"} can't stop this subagent on its own. Stop the turn to end it.`;
+  return `${label ?? "The provider"} doesn't offer a way to stop this subagent from BiBCode.`;
 }
