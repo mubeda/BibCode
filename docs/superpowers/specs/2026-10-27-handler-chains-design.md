@@ -1,6 +1,65 @@
 # Long-lived handlers in ChatView and ChatComposer (#204): design
 
-Status: proposed. Plan: [`2026-10-27-handler-chains.md`](../plans/2026-10-27-handler-chains.md).
+Status: approved; rounds 1 and 2 implemented. ChatComposer acceptance met; ChatView
+acceptance not met, round 3 below awaits approval. Plan:
+[`2026-10-27-handler-chains.md`](../plans/2026-10-27-handler-chains.md).
+
+## Approved changes (supersede the sections below where they differ)
+
+- **Explicit error targets.** A stable `setThreadError` would pick the error store
+  from the current route, so an operation that awaits (compaction, send, interrupt,
+  approval and question answers, plan follow-up, revert, delivery resolution, project
+  scripts) resolves `{ store, key }` (server store by environment-scoped thread key,
+  or draft store) before its first await and writes there. `setThreadError` itself
+  stays for synchronous callers and the composer prop.
+- **Harness evidence per reconnect**: baseline and after each of the 8 changed
+  reconnects.
+- **Complete-caller test**: the real ThreadErrorBanner button and the real
+  ChatComposer form, rendered inside ChatView in the compiled lane.
+
+## Measured rounds
+
+ChatView scopes (`--var handleOpenProviderTerminalPanel`) after each changed reconnect:
+
+| run      | base | 1  | 2  | 3  | 4  | 5  | 6  | 7  | 8  |
+| -------- | ---- | -- | -- | -- | -- | -- | -- | -- | -- |
+| before   | 17   |    | 29 |    | 41 |    |    |    | 65 |
+| round 1  | 16   | 21 | 26 | 31 | 36 | 41 | 46 | 51 | 56 |
+| round 2  | 16   | 21 | 26 | 31 | 36 | 41 | 46 | 51 | 56 |
+
+ChatComposer scopes (`--var submitComposer`): before 10 / 14 / 18 / 26 at
+base / 2 / 4 / 8; round 2 is 9 at base and at every one of the 8 reconnects.
+
+Round 1 removed the composer chain and the `refuseWhileEnvironmentUnavailable <->
+onCompactConversation` pair (6 to 5 per reconnect). Round 2 wrapped
+`handleOpenProviderTerminalPanel`; the series did not move and the same paths
+re-routed through `openReservedRightPanelTerminal`.
+
+## Revised premise (after two rounds)
+
+The remaining chain is a hub, not pairs. Every top path at changed-8 alternates
+`getActiveTimelineTurnMetrics` with a different partner each round
+(`handleOpenProviderTerminalPanel`, then `openReservedRightPanelTerminal`,
+`onImplementPlanInNewThread`). Its only input, `composerOverlayHeight`, changes at
+renders where most other callbacks do not, so any callback recreated at other
+times pairs with it. Wrapping partners one at a time cannot converge.
+
+## Round 3 proposal (not implemented)
+
+Stop the hub from recreating: `getActiveTimelineTurnMetrics`,
+`timelineRealContentOverflowsViewport` and `pageTimeline` all depend on
+`composerOverlayHeight` and recreate at the same render, so all three change
+together. A latest handler is unsafe here: LegendList calls ChatView's
+`onAnchorReady` (via `useStableAnchorCallbacks`) and `onRowSizeChanged`, which
+reach these helpers through `settleSentTimelineRow`, `followTimelineLiveEnd` and
+`followGrownTurn`, from its own measurement callbacks, possibly in a child layout
+effect, where a latest handler would read the previous render. The proposal is a
+`composerOverlayHeightRef` written in the same layout-effect pass that commits the
+height, read by the three helpers instead of the captured state, giving them one
+identity. That is targeted dependency restructuring in the timeline-follow code
+owned by another batch agent (b5-timeline-follow), so it needs approval and a merge
+plan first. It must be proven with the existing timeline-follow tests plus the
+harness.
 
 ## Problem
 
