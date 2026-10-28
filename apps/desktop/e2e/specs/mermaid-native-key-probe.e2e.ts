@@ -2842,6 +2842,13 @@ describe("native PageUp diagnosis", () => {
     if (!frontmost.toLowerCase().includes("bibcode")) {
       throw new Error(`The packaged app was not foreground for a native PageUp: ${frontmost}`);
     }
+    const keySender = spawn("osascript", ["-i"], { stdio: ["pipe", "pipe", "pipe"] });
+    let senderOutput = "";
+    let senderError = "";
+    keySender.stdout.on("data", (chunk) => (senderOutput += chunk.toString()));
+    keySender.stderr.on("data", (chunk) => (senderError += chunk.toString()));
+    keySender.stdin.write('tell application "System Events" to get name of first application process whose frontmost is true\n');
+    await new Promise<void>((resolve) => setTimeout(resolve, 400));
     await sendPrompt(mermaidFixturePrompts.long);
     await browser
       .$(
@@ -2860,29 +2867,6 @@ describe("native PageUp diagnosis", () => {
         ),
       { timeoutMsg: "The short fixture reply's diagram never drew." },
     );
-    await browser.execute(() => {
-      const keys: Array<{ at: number; trusted: boolean; active: string | null }> = [];
-      document.addEventListener("keydown", (event) => {
-        if (event.key === "PageUp") {
-          keys.push({
-            at: Math.round(performance.now()),
-            trusted: event.isTrusted,
-            active: document.activeElement?.tagName ?? null,
-          });
-        }
-      }, { capture: true });
-      (window as unknown as { __bibcodeAllNativeKeys?: typeof keys }).__bibcodeAllNativeKeys = keys;
-    });
-    const keySender = spawn("osascript", [
-      "-e",
-      "delay 0.95",
-      "-e",
-      'tell application "System Events" to key code 116',
-    ]);
-    let senderOutput = "";
-    let senderError = "";
-    keySender.stdout.on("data", (chunk) => (senderOutput += chunk.toString()));
-    keySender.stderr.on("data", (chunk) => (senderError += chunk.toString()));
     await scrollTimelineToEnd("After the short diagram.");
     await startKeyboardSamples();
     const editor = browser.$(composerEditorSelector);
@@ -3033,19 +3017,19 @@ describe("native PageUp diagnosis", () => {
       mermaidFixturePrompts.keyboard,
     );
     const ready = await readyPromise;
+    keySender.stdin.end('tell application "System Events" to key code 116\n');
     const senderExit =
       keySender.exitCode === null
         ? await new Promise<number | null>((resolve) => keySender.once("close", resolve))
         : keySender.exitCode;
     await browser.pause(700);
-    const { trace, earlyKeys, allKeys } = await browser.execute(() => ({
+    const { trace, earlyKeys } = await browser.execute(() => ({
       trace: (window as unknown as { __bibcodeNativeKeyTrace?: unknown }).__bibcodeNativeKeyTrace ?? null,
       earlyKeys: (window as unknown as { __bibcodeNativeEarlyKeys?: unknown }).__bibcodeNativeEarlyKeys ?? null,
-      allKeys: (window as unknown as { __bibcodeAllNativeKeys?: unknown }).__bibcodeAllNativeKeys ?? null,
     }));
     NodeFS.writeFileSync(
       NodePath.join(preparedArtifactDirectory, "native-pageup.json"),
-      JSON.stringify({ ready, frontmost, senderExit, senderOutput, senderError, allKeys, earlyKeys, trace }, null, 2),
+      JSON.stringify({ ready, frontmost, senderExit, senderOutput, senderError, earlyKeys, trace }, null, 2),
     );
     expect(ready.moving).toBe(true);
     expect(ready.focused).toBe(true);
