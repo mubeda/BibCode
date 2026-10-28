@@ -401,7 +401,7 @@ describe("ActivityPanel roster", () => {
     expect(older.className).not.toContain("sm:h-8");
     expect(older.querySelectorAll('[data-activity-provider-glyph="claude"]')).toHaveLength(1);
     expect(older.querySelector('[data-activity-record-glyph="actor"]')).toBeNull();
-    expect(rows[2]?.textContent).toContain("Completed in 18m");
+    expect(rows[2]?.textContent).toContain("Failed after 18m");
 
     await act(async () => older.click());
     expect(onNavigate).toHaveBeenCalledWith({
