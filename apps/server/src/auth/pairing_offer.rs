@@ -113,6 +113,7 @@ pub(crate) async fn mint_offline_pairing_offer(
     secret_store: &SecretStore,
     storage_instance_id: StorageInstanceId,
     input: ValidatedPairingOfferInput,
+    scopes: Vec<String>,
 ) -> Result<OfflinePairingOffer, OfflinePairingOfferError> {
     let record = secret_store
         .get(HOST_IDENTITY_SECRET_NAME)
@@ -121,6 +122,7 @@ pub(crate) async fn mint_offline_pairing_offer(
     let host_identity = HostIdentity::from_record(&record)?;
     let issued = issue_offline_share_pairing(
         repositories,
+        scopes,
         Some(input.label.clone()),
         input.reach.clone(),
         input.off_host,
@@ -273,6 +275,7 @@ mod tests {
                 None,
             )
             .expect("valid input"),
+            crate::auth::default_standard_scopes(),
         )
         .await
         .expect_err("no host identity yet");
@@ -295,6 +298,7 @@ mod tests {
                 Some("laptop"),
             )
             .expect("valid input"),
+            crate::auth::default_standard_scopes(),
         )
         .await
         .expect("mint offer");

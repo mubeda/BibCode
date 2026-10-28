@@ -849,7 +849,7 @@ impl AuthService {
         let scopes = requested_scopes.unwrap_or_else(|| grant.scopes.clone());
         if !scopes
             .iter()
-            .all(|scope| grant.scopes.iter().any(|granted| granted == scope))
+            .all(|scope| super::model::scope_satisfies(&grant.scopes, scope))
         {
             return Err(AuthError::ScopeNotGranted);
         }
@@ -1027,7 +1027,7 @@ impl AuthService {
         if session.revoked_at_ms.is_some() || session.expires_at_ms <= observed_at {
             return Err(AuthError::InvalidCredential);
         }
-        if session.scopes.iter().any(|scope| scope == required_scope) {
+        if super::model::scope_satisfies(&session.scopes, required_scope) {
             Ok(())
         } else {
             Err(AuthError::ScopeRequired(required_scope.to_owned()))
@@ -2762,12 +2762,16 @@ pub(crate) async fn issue_administrative_pairing_link(
 /// so the off-host confirmation guard and exposure accounting see it.
 pub(crate) async fn issue_offline_share_pairing(
     repositories: &Repositories,
+    scopes: Vec<String>,
     label: Option<String>,
     reach: String,
     off_host: bool,
 ) -> Result<PairingCredentialResult, AuthError> {
     if !is_valid_pairing_reach(&reach) {
         return Err(AuthError::InvalidCredential);
+    }
+    if scopes.is_empty() || scopes.iter().any(|scope| !is_scope(scope)) {
+        return Err(AuthError::InvalidScope);
     }
     let now = now_ms();
     let active = repositories
@@ -2782,7 +2786,7 @@ pub(crate) async fn issue_offline_share_pairing(
     let record = PairingRecord {
         id: Uuid::new_v4().to_string(),
         credential: generate_pairing_credential()?,
-        scopes: owned_scopes(STANDARD_SCOPES),
+        scopes,
         subject: "one-time-token".to_owned(),
         label: label.clone(),
         proof_key_thumbprint: None,
@@ -2808,6 +2812,12 @@ pub(crate) async fn issue_offline_share_pairing(
 #[must_use]
 pub fn default_standard_scopes() -> Vec<String> {
     owned_scopes(STANDARD_SCOPES)
+}
+
+/// The scopes of a diagnostics-only pairing offer: `diagnostics:read` alone.
+#[must_use]
+pub fn diagnostics_scopes() -> Vec<String> {
+    owned_scopes(super::model::DIAGNOSTICS_SCOPES)
 }
 
 #[cfg(test)]
