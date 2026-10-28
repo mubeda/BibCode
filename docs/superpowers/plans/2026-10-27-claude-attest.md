@@ -34,7 +34,9 @@ Branch `claude/b3d-claude-attest` from `claude/issue-batch-after-v0.12.0` (046c7
    the `codesign --verify --strict -R=<requirement>` check (cap 1.25 s), run once
    per source fingerprint. The cache value gains `sha256` and
    `signature_verified`. Per launch, hash the pinned copy and compare. Update the
-   existing attestation unit tests and generalize the ignored live test to the
+   existing attestation unit tests, including the policy change in
+   `capability_cache_never_reuses_exact_build_attestation` (signature once per
+   fingerprint, hash every launch), and generalize the ignored live test to the
    installed build.
 3. **Linux copy-pin.** `clone_executable` on non-macOS unix copies with
    `create_new`, 0600, `io::copy`, a fingerprint sandwich and `fsync`, then
@@ -61,8 +63,10 @@ Branch `claude/b3d-claude-attest` from `claude/issue-batch-after-v0.12.0` (046c7
 
 - `apps/server/src/provider_terminal/claude.rs`. This batch owns it; #196
   already merged into the base.
-- `apps/server/src/provider_terminal/model.rs` and `apps/server/src/terminal/manager.rs`:
-  the one new field and its merge (about 10 lines). **These are outside a
+- `apps/server/src/provider_terminal/model.rs`, `supervisor.rs` and `apps/server/src/terminal/manager.rs`:
+  `env_overlay` and its merge, and `invoked_executable`, which the supervisor
+  sets from the located but uncanonicalized path (`validated_executable`
+  canonicalizes it, so today the factory only sees `.../mise`). About 25 lines. **These are outside a
   Claude-only scope. The integrator needs to confirm no other batch agent owns
   them.**
 - `apps/server/src/provider_terminal/codex.rs` and `opencode.rs`: one

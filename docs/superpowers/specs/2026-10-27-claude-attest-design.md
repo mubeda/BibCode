@@ -106,6 +106,12 @@ still change the digest. Either way it is never reused
 (`same_length_rewrite_with_restored_mtime_cannot_reuse_build_approval` keeps its
 meaning).
 
+This changes the policy of one existing test:
+`capability_cache_never_reuses_exact_build_attestation` asserts that the attestor
+runs on every launch. Under D2 the signature is verified once per fingerprint,
+and only the hash binding runs on every launch. The test is rewritten to assert
+exactly that. This is a deliberate policy change, not a weakened test.
+
 Rejected: running `codesign --verify` on every launch. It is always correct, but
 it adds 0.4-0.8 s to every terminal, and the `run_codesign` cap would have to go
 from 500 ms to about 1.25 s. The first launch of a new build pays it once. The
@@ -119,7 +125,12 @@ untrusted hint, because hooks are only injected after the pinned bytes pass D1
 and D2/D4, whatever path they came from.
 
 1. **Detect a shim.** The configured path is a symlink whose canonical target's
-   file name is `mise`. Only mise is supported now (the user's case). The
+   file name is `mise`. The factory cannot see the link today: the supervisor's
+   `validated_executable` (`supervisor.rs` ~1321) canonicalizes the executable
+   and `prepare_inner` overwrites `input.executable` with it, so the factory
+   receives `.../mise`. The supervisor therefore also passes the located,
+   uncanonicalized path (`ProviderTerminalObserverFactoryInput::invoked_executable`).
+   Its file name (`claude`) is the bin name, and `paths_equal` validation is unchanged. Only mise is supported now (the user's case). The
    resolver is a small trait (`ClaudeInstallResolver`), so asdf or volta could
    be added later without touching preparation.
 2. **Ask the shim manager what it would run**, with the launch environment and
@@ -183,8 +194,14 @@ the open descriptor and the path. If it moved, the pin is discarded.
 
 Cost on a filesystem without reflink: about 256 MB written per live Claude
 Terminal, removed with the generation. The plan measures the time in the Linux
-lab. If a cold copy does not fit 2.25 s on the lab's disk, the budget table is
-revised with that evidence. The probe of the source runs concurrently with the
+lab, together with the per-launch SHA-256 of the copy. Without reflink that is
+a second full pass, with `sha2` rather than CommonCrypto. If cold copy, hash and
+probe do not fit 2.25 s on the lab's disk, there are two options for the
+approver. One is to revise the budget table with that evidence. The other is to
+drop the per-launch hash on Linux only. Under this threat model the
+descriptor-and-path fingerprint check around the copy already binds the copied
+bytes to the cached probe, because forging a ctime needs root. The hash is
+defence in depth. The probe of the source runs concurrently with the
 copy.
 
 Rejected:
