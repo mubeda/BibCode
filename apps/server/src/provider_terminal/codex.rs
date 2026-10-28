@@ -1026,9 +1026,9 @@ fn warn_codex_observer_stopped(
     );
 }
 
-/// A rejected root scope is logged by category, as `reason = live_publication_rejected`. A
-/// stale generation ends the observer; a failed write leaves activity unavailable until the
-/// backoff retry.
+/// Logs a root scope the observer will not create again, as
+/// `reason = live_publication_rejected`: the terminal generation is no longer current, so the
+/// observer ends without Activity.
 fn warn_codex_scope_rejected(
     inner: &CodexObserverInner,
     rejection: CodexScopeRejection,
@@ -1040,6 +1040,57 @@ fn warn_codex_scope_rejected(
         observer_started,
         rejection.category(),
     );
+}
+
+/// Logs a root scope write that failed and will be retried after a backoff, by failure
+/// category. The observer keeps running, so this does not say it stopped.
+fn warn_codex_scope_retrying(
+    inner: &CodexObserverInner,
+    rejection: CodexScopeRejection,
+    observer_started: std::time::Instant,
+) {
+    tracing::warn!(
+        provider = "codex",
+        provider_instance_id = %inner.provider_instance_id,
+        reason = "live_publication_retrying",
+        detail = rejection.category(),
+        elapsed_ms = elapsed_millis(observer_started.elapsed()),
+        "Codex terminal observer could not create its Activity scope; retrying"
+    );
+}
+
+/// Whether a failed root scope write is worth retrying, and whether it is the first of its
+/// failure streak (the only one that is logged). A stale generation never recovers.
+#[derive(Debug, Default)]
+struct CodexScopeRetryStreak {
+    warned: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CodexScopeRetry {
+    /// The generation is gone: end the observer.
+    Stop,
+    /// Retry after the backoff; `warn` is true for the first failure of the streak.
+    Retry { warn: bool },
+}
+
+impl CodexScopeRetryStreak {
+    fn on_failure(
+        &mut self,
+        rejection: CodexScopeRejection,
+        generation_current: bool,
+    ) -> CodexScopeRetry {
+        if rejection == CodexScopeRejection::StaleGeneration || !generation_current {
+            return CodexScopeRetry::Stop;
+        }
+        let warn = !self.warned;
+        self.warned = true;
+        CodexScopeRetry::Retry { warn }
+    }
+
+    fn on_success(&mut self) {
+        self.warned = false;
+    }
 }
 
 fn warn_codex_root_discovery_pending(
@@ -1347,14 +1398,24 @@ async fn run_codex_observer_inner(
     // A status-only observer publishes no activity, so it skips the history it would show;
     // enabling activity later publishes the scope (#187).
     let mut scope_published = false;
+    let mut scope_retry_streak = CodexScopeRetryStreak::default();
     if initial_state.enabled {
         match publish_codex_root_scope(inner, &mut tracker, &root, epoch, Some(&resumed.thread))
             .await
         {
             Ok(()) => scope_published = true,
             Err(rejection) => {
+                let outcome = scope_retry_streak.on_failure(rejection, generation.is_current());
                 if generation.cancellation_reason().is_none() {
-                    warn_codex_scope_rejected(inner, rejection, observer_started);
+                    match outcome {
+                        CodexScopeRetry::Stop => {
+                            warn_codex_scope_rejected(inner, rejection, observer_started);
+                        }
+                        CodexScopeRetry::Retry { warn: true } => {
+                            warn_codex_scope_retrying(inner, rejection, observer_started);
+                        }
+                        CodexScopeRetry::Retry { warn: false } => {}
+                    }
                 }
             }
         }
@@ -1546,8 +1607,29 @@ async fn run_codex_observer_inner(
                         )
                         .await
                         {
+                            let outcome =
+                                scope_retry_streak.on_failure(rejection, generation.is_current());
                             if generation.cancellation_reason().is_none() {
-                                warn_codex_scope_rejected(inner, rejection, observer_started);
+                                match outcome {
+                                    CodexScopeRetry::Stop => {
+                                        warn_codex_scope_rejected(
+                                            inner,
+                                            rejection,
+                                            observer_started,
+                                        );
+                                    }
+                                    CodexScopeRetry::Retry { warn: true } => {
+                                        warn_codex_scope_retrying(
+                                            inner,
+                                            rejection,
+                                            observer_started,
+                                        );
+                                    }
+                                    CodexScopeRetry::Retry { warn: false } => {}
+                                }
+                            }
+                            if outcome == CodexScopeRetry::Stop {
+                                return;
                             }
                             live_state = None;
                             inner
@@ -1563,6 +1645,7 @@ async fn run_codex_observer_inner(
                             continue;
                         }
                         scope_published = true;
+                        scope_retry_streak.on_success();
                         pending_reconciliation = true;
                     }
                     retry_at = None;
@@ -3538,6 +3621,43 @@ impl CodexRemoteClient for SystemCodexRemoteClient {
 mod tests {
     use super::*;
     use crate::test_support::{FixtureEvent, TestSandbox};
+
+    /// A scope write that keeps failing is logged once per failure streak, and a success starts
+    /// a new streak.
+    #[test]
+    fn repeated_scope_failures_warn_once_per_streak() {
+        let failure =
+            CodexScopeRejection::PublicationFailed("activity publication failed: persistence");
+        let mut streak = CodexScopeRetryStreak::default();
+        assert_eq!(
+            streak.on_failure(failure, true),
+            CodexScopeRetry::Retry { warn: true }
+        );
+        for _ in 0..5 {
+            assert_eq!(
+                streak.on_failure(failure, true),
+                CodexScopeRetry::Retry { warn: false }
+            );
+        }
+        streak.on_success();
+        assert_eq!(
+            streak.on_failure(failure, true),
+            CodexScopeRetry::Retry { warn: true }
+        );
+    }
+
+    /// A stale generation never recovers, so the retry stops instead of backing off forever.
+    #[test]
+    fn stale_generation_stops_the_scope_retry() {
+        let failure =
+            CodexScopeRejection::PublicationFailed("activity publication failed: persistence");
+        let mut streak = CodexScopeRetryStreak::default();
+        assert_eq!(
+            streak.on_failure(CodexScopeRejection::StaleGeneration, true),
+            CodexScopeRetry::Stop
+        );
+        assert_eq!(streak.on_failure(failure, false), CodexScopeRetry::Stop);
+    }
 
     /// A rejected root scope is logged by category. The category never carries an error's text,
     /// which can quote a path or content.
