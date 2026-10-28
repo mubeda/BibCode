@@ -207,7 +207,9 @@ const AttachmentUploadCtx = createContext<{
   readonly onCancel: (messageId: MessageId) => void;
 }>(null!);
 const TIMELINE_LIST_HEADER = <div className="h-3 sm:h-4" />;
-const TIMELINE_LIST_FOOTER = <div className="h-3 sm:h-4" />;
+// LegendList includes numeric padding in its initial end target. A measured footer leaves one
+// painted WebView2 remount frame 16 px short while its layout catches up.
+const TIMELINE_LIST_CONTENT_STYLE = { paddingBottom: 16 };
 const EMPTY_TIMELINE_SKILLS: ReadonlyArray<Pick<ServerProviderSkill, "name" | "displayName">> = [];
 const NO_MINIMAP_STEP_TARGETS: TimelineMinimapStepTargets = { previous: null, next: null };
 
@@ -698,8 +700,8 @@ export const MessagesTimeline = memo(function MessagesTimeline({
                   {...(onRowSizeChanged ? { onItemSizeChanged: onRowSizeChanged } : {})}
                   onMetricsChange={onListMetricsChange}
                   className="scrollbar-gutter-both h-full min-h-0 overflow-x-hidden overscroll-y-contain px-3 [overflow-anchor:none] sm:px-5"
+                  contentContainerStyle={TIMELINE_LIST_CONTENT_STYLE}
                   ListHeaderComponent={TIMELINE_LIST_HEADER}
-                  ListFooterComponent={TIMELINE_LIST_FOOTER}
                 />
               </ReadingAnchorContext>
               <TimelineMinimap

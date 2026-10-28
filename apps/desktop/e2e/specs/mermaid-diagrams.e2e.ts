@@ -47,6 +47,19 @@ interface EndSample {
    * and its first scroll to the end are done.
    */
   readonly shown: boolean;
+  readonly geometry?:
+    | {
+        readonly scrollTop: number;
+        readonly scrollHeight: number;
+        readonly clientHeight: number;
+        readonly contentPaddingBottom: number | null;
+        readonly footerHeight: number | null;
+        readonly footerTop: number | null;
+        readonly rowBottom: number | null;
+        readonly overlayHeight: number | null;
+        readonly overlayTop: number | null;
+      }
+    | undefined;
 }
 
 interface ActivityGrowthFrame {
@@ -104,6 +117,17 @@ interface KeyboardSample {
   readonly readingTop: number | null;
   /** Keydowns that reached the timeline's scroller so far. */
   readonly keydowns: number;
+}
+
+interface KeyboardKeyTrace {
+  readonly phase: "before-key" | "after-key" | "after-page" | "frame";
+  readonly at: number;
+  readonly scrollTop: number;
+  readonly scrollHeight: number;
+  readonly lineTop: number | null;
+  readonly lineConnected: boolean;
+  readonly rowId: string | null;
+  readonly rowTransform: string | null;
 }
 
 interface LandingSample {
@@ -170,10 +194,26 @@ async function openFixtureWorkspace(): Promise<void> {
   const primaryWorkspace = browser.$(
     '//*[@data-thread-item="true"][.//span[normalize-space()="main"]]',
   );
-  if (!(await primaryWorkspace.isDisplayed())) {
+  if ((await project.getAttribute("aria-expanded")) !== "true") {
     await project.click();
   }
   await primaryWorkspace.waitForDisplayed();
+  await browser.waitUntil(
+    () =>
+      browser.execute(() => {
+        const card = [...document.querySelectorAll<HTMLElement>("[data-thread-item]")].find(
+          (entry) => entry.textContent?.includes("main"),
+        );
+        if (!card || getComputedStyle(card).pointerEvents === "none") return false;
+        const rect = card.getBoundingClientRect();
+        const hit = document.elementFromPoint(
+          rect.left + rect.width / 2,
+          rect.top + rect.height / 2,
+        );
+        return hit === card || card.contains(hit);
+      }),
+    { timeoutMsg: "The fixture thread card never became clickable." },
+  );
   await primaryWorkspace.click();
   await browser.$(composerEditorSelector).waitForDisplayed();
 }
@@ -424,14 +464,14 @@ interface SentRowFrame {
 /** Samples the newest row sent as `prompt` and its turn's end on `frames` painted frames. */
 async function sampleSentRow(
   prompt: string,
-  endText: string,
+  diagramLabel: string,
   frames: number,
 ): Promise<SentRowFrame[]> {
   return browser.executeAsync(
     (
       surface: string,
       sent: string,
-      lastLine: string,
+      label: string,
       count: number,
       done: (frames: SentRowFrame[]) => void,
     ) => {
@@ -449,8 +489,10 @@ async function sampleSentRow(
         const overlay = document.querySelector<HTMLElement>(
           `${surface} [data-chat-composer-overlay="true"]`,
         );
-        const endRow = [...document.querySelectorAll<HTMLElement>(`${surface} .chat-markdown p`)]
-          .find((paragraph) => paragraph.textContent === lastLine)
+        const endRow = [
+          ...document.querySelectorAll<HTMLElement>(`${surface} .chat-markdown-mermaid svg`),
+        ]
+          .find((diagram) => diagram.textContent?.includes(label))
           ?.closest<HTMLElement>("[data-timeline-root]");
         if (!scroller || !row || !overlay || !endRow) return null;
         const area = scroller.getBoundingClientRect();
@@ -477,7 +519,7 @@ async function sampleSentRow(
     },
     visibleSurfaceSelector,
     prompt,
-    endText,
+    diagramLabel,
     frames,
   );
 }
@@ -740,6 +782,43 @@ describe("packaged Mermaid diagrams", () => {
     // it, once the diagram in a reply shorter than the timeline has drawn under it, with the
     // list's size anchoring on. (A reply taller than the timeline scrolls on to reveal its end
     // instead, and a first message has nothing above it to scroll past.)
+    await sendPrompt(mermaidFixturePrompts.fitting);
+    await browser.waitUntil(
+      () =>
+        browser.execute(
+          (surface: string) =>
+            [...document.querySelectorAll(`${surface} .chat-markdown-mermaid svg`)].some((svg) =>
+              svg.textContent?.includes("Fits at the top"),
+            ),
+          visibleSurfaceSelector,
+        ),
+      { timeoutMsg: "The fitting fixture reply's diagram never drew." },
+    );
+    expect(await userRowOffsets(mermaidFixturePrompts.fitting)).toHaveLength(1);
+    await browser.waitUntil(
+      async () => {
+        const [frame] = await sampleSentRow(mermaidFixturePrompts.fitting, "Fits at the top", 1);
+        return frame?.turnFits === true && Math.abs(frame.top - SENT_ROW_ANCHOR_OFFSET) <= 1;
+      },
+      {
+        timeout: 5_000,
+        interval: 100,
+        timeoutMsg: "The fitting sent row never reached its offset.",
+      },
+    );
+    const sentRowFrames = await sampleSentRow(mermaidFixturePrompts.fitting, "Fits at the top", 36);
+    NodeFS.writeFileSync(
+      NodePath.join(preparedArtifactDirectory, "mermaid-timeline-sent-row.json"),
+      JSON.stringify(sentRowFrames, null, 2),
+    );
+    expect(sentRowFrames).toHaveLength(36);
+    expect(
+      sentRowFrames.filter(
+        (frame) => !frame.turnFits || Math.abs(frame.top - SENT_ROW_ANCHOR_OFFSET) > 1,
+      ),
+    ).toEqual([]);
+    await saveEvidence("mermaid-timeline-sent-row");
+
     await sendPrompt(mermaidFixturePrompts.short);
     await browser.waitUntil(
       () =>
@@ -752,23 +831,6 @@ describe("packaged Mermaid diagrams", () => {
         ),
       { timeoutMsg: "The short fixture reply's diagram never drew." },
     );
-    expect(await userRowOffsets(mermaidFixturePrompts.short)).toHaveLength(1);
-    const sentRowFrames = await sampleSentRow(
-      mermaidFixturePrompts.short,
-      "After the short diagram.",
-      36,
-    );
-    NodeFS.writeFileSync(
-      NodePath.join(preparedArtifactDirectory, "mermaid-timeline-sent-row.json"),
-      JSON.stringify(sentRowFrames, null, 2),
-    );
-    expect(sentRowFrames).toHaveLength(36);
-    expect(
-      sentRowFrames.filter(
-        (frame) => !frame.turnFits || Math.abs(frame.top - SENT_ROW_ANCHOR_OFFSET) > 1,
-      ),
-    ).toEqual([]);
-    await saveEvidence("mermaid-timeline-sent-row");
 
     // Minimap navigation still lands where the minimap puts it, past the diagrams above.
     const minimapLabel = () =>
@@ -961,10 +1023,8 @@ describe("packaged Mermaid diagrams", () => {
     ).toEqual([]);
   });
 
-  // Each of the two batches of 101 draws may wait 240 s in an occluded webview, the remount up
-  // to 60 s more and the cold draw's step-by-step scroll over a minute, so the slowest runners
-  // need well past the suite's 120 s default. WebdriverIO races a test against the timeout it
-  // had when it started, so the timeout is set on the test, not inside it.
+  // The 101 draws may wait 240 s in an occluded webview and the remount up to 60 s more.
+  // WebdriverIO races a test against the timeout it had when it started.
   it("draws an evicted diagram again on remount and settles at the end", async () => {
     await setDesktopUiWindowSize(1_400, 900);
     await openFixtureWorkspace();
@@ -1001,7 +1061,7 @@ describe("packaged Mermaid diagrams", () => {
       record.__bibcodeMermaidSamples = samples;
       record.__bibcodeMermaidFrameSamples = frameSamples;
       const started = performance.now();
-      const read = (): EndSample => {
+      const read = (withGeometry = false): EndSample => {
         const paragraph = [
           ...document.querySelectorAll<HTMLElement>(`${surface} .chat-markdown p`),
         ].find((element) => element.textContent === "Last line after the diagrams.");
@@ -1047,6 +1107,48 @@ describe("packaged Mermaid diagrams", () => {
             }
             return true;
           })(),
+          ...(withGeometry && paragraph
+            ? {
+                geometry: (() => {
+                  const scroller = paragraph.closest<HTMLElement>("[class*='overflow-anchor']");
+                  const overlay = document.querySelector<HTMLElement>(
+                    `${surface} [data-chat-composer-overlay="true"]`,
+                  );
+                  const content = scroller?.querySelector<HTMLElement>(
+                    ".legend-list-content-container",
+                  );
+                  const spacers = content?.querySelectorAll<HTMLElement>('[class="h-3 sm:h-4"]');
+                  const footer =
+                    spacers && spacers.length > 1 ? spacers.item(spacers.length - 1) : null;
+                  return scroller
+                    ? {
+                        scrollTop: Math.round(scroller.scrollTop),
+                        scrollHeight: Math.round(scroller.scrollHeight),
+                        clientHeight: Math.round(scroller.clientHeight),
+                        contentPaddingBottom: content
+                          ? Math.round(Number.parseFloat(getComputedStyle(content).paddingBottom))
+                          : null,
+                        footerHeight: footer
+                          ? Math.round(footer.getBoundingClientRect().height)
+                          : null,
+                        footerTop: footer ? Math.round(footer.getBoundingClientRect().top) : null,
+                        rowBottom: Math.round(
+                          paragraph
+                            .closest<HTMLElement>("[data-timeline-root]")
+                            ?.getBoundingClientRect().bottom ??
+                            paragraph.getBoundingClientRect().bottom,
+                        ),
+                        overlayHeight: overlay
+                          ? Math.round(overlay.getBoundingClientRect().height)
+                          : null,
+                        overlayTop: overlay
+                          ? Math.round(overlay.getBoundingClientRect().top)
+                          : null,
+                      }
+                    : undefined;
+                })(),
+              }
+            : {}),
         };
       };
       // The first sample is where the reply ends before the chat is left; an occluded webview
@@ -1058,7 +1160,7 @@ describe("packaged Mermaid diagrams", () => {
       }, 5);
       // A message posted from a frame callback is handled once that frame has painted.
       const afterPaint = new MessageChannel();
-      afterPaint.port1.addEventListener("message", () => frameSamples.push(read()));
+      afterPaint.port1.addEventListener("message", () => frameSamples.push(read(true)));
       afterPaint.port1.start();
       const onFrame = () => {
         afterPaint.port2.postMessage(null);
@@ -1152,7 +1254,11 @@ describe("packaged Mermaid diagrams", () => {
       );
     expect(unsettledFrames).toEqual([]);
     await saveEvidence("mermaid-timeline-evicted-remount");
+  }).timeout(480_000);
 
+  it("keeps a reading line in place when a cold diagram draws above it", async () => {
+    await setDesktopUiWindowSize(1_400, 900);
+    await openFixtureWorkspace();
     // A cold first draw above the line being read. The rows reply's diagram was evicted by
     // these 101 and its row, far above, unmounted. Scrolling up a step at a time remounts that
     // row in the list's buffer above the viewport, where it shows its source and then draws
@@ -1179,19 +1285,31 @@ describe("packaged Mermaid diagrams", () => {
       // Two replies of 101 diagrams lie between the end and the rows reply.
       if (step > 300) throw new Error("Scrolling up never reached the rows reply.");
       const reached = await browser.execute(
-        (surface: string, diagramLabel: string) => {
+        (surface: string, diagramLabel: string, readingPrompt: string) => {
           const reachedBlock = [
             ...document.querySelectorAll<HTMLElement>(`${surface} .chat-markdown-codeblock`),
           ].some((element) => element.textContent?.includes(diagramLabel));
-          if (reachedBlock) return true;
           const scroller = document.querySelector<HTMLElement>(
             `${surface} [class*='overflow-anchor']`,
           );
+          if (reachedBlock && scroller) {
+            const readingRow = [
+              ...document.querySelectorAll<HTMLElement>(`${surface} [data-message-role="user"]`),
+            ].find((element) => element.textContent?.includes(readingPrompt));
+            const readingTop = readingRow
+              ? readingRow.getBoundingClientRect().top - scroller.getBoundingClientRect().top
+              : null;
+            if (readingTop !== null && readingTop < 120) {
+              scroller.scrollTop -= 120 - readingTop;
+            }
+            return true;
+          }
           if (scroller) scroller.scrollTop -= 300;
           return false;
         },
         visibleSurfaceSelector,
         "Fixture draw",
+        mermaidFixturePrompts.long,
       );
       if (reached) break;
       await browser.pause(250);
@@ -1204,8 +1322,12 @@ describe("packaged Mermaid diagrams", () => {
     );
     // Timer samples can see layout no frame painted, so the check reads the painted frames.
     expect(coldDraw.painted.length).toBeGreaterThan(0);
-    const appeared = coldDraw.painted.findIndex((entry) => entry.diagramRowBottom !== null);
-    const drew = coldDraw.painted.findIndex((entry) => entry.diagramDrawn);
+    const appeared = coldDraw.painted.findIndex(
+      (entry) => entry.diagramRowBottom !== null && entry.target !== null && entry.target >= 0,
+    );
+    const drew = coldDraw.painted.findIndex(
+      (entry, index) => index >= appeared && entry.diagramDrawn,
+    );
     // A row remounted in the buffer can draw from the cache before its first painted frame, so
     // the check needs the diagram drawn by the end, not a frame of its source first.
     expect(appeared).toBeGreaterThanOrEqual(0);
@@ -1401,6 +1523,12 @@ describe("packaged Mermaid diagrams", () => {
     await setDesktopUiWindowSize(1_400, 900);
     await openFixtureWorkspace();
     await expectPaintingWebview();
+    await sendPrompt(mermaidFixturePrompts.long);
+    await browser
+      .$(
+        "//p[normalize-space()='Following reply paragraph 60 keeps the reading position measurable.']",
+      )
+      .waitForExist();
     // A reply with a code block, whose Copy button is the control the reader's keys start from.
     // Focusing it is no pointer press, so it does not stop following by itself.
     await sendPrompt(mermaidFixturePrompts.short);
@@ -1466,6 +1594,7 @@ describe("packaged Mermaid diagrams", () => {
         prompt: string,
         done: (result: {
           trail: Array<[number | null, number]>;
+          trace: KeyboardKeyTrace[];
           moving: boolean;
           keyAfterGlideMs: number;
           grewAbove: boolean;
@@ -1516,12 +1645,28 @@ describe("packaged Mermaid diagrams", () => {
             const lineAtKey = line?.getBoundingClientRect().top ?? null;
             const scrollAtKey = scroller.scrollTop;
             const keyAt = performance.now();
+            const trace: KeyboardKeyTrace[] = [];
+            const record = (phase: KeyboardKeyTrace["phase"]) => {
+              const row = line?.closest<HTMLElement>("[data-timeline-root]");
+              trace.push({
+                phase,
+                at: Math.round(performance.now() - keyAt),
+                scrollTop: Math.round(scroller.scrollTop),
+                scrollHeight: Math.round(scroller.scrollHeight),
+                lineTop: line ? Math.round(line.getBoundingClientRect().top) : null,
+                lineConnected: line?.isConnected ?? false,
+                rowId: line?.closest<HTMLElement>("[data-message-id]")?.dataset.messageId ?? null,
+                rowTransform: row ? getComputedStyle(row).transform : null,
+              });
+            };
             const event = new KeyboardEvent("keydown", {
               key: "PageUp",
               bubbles: true,
               cancelable: true,
             });
+            record("before-key");
             (focused ? button! : scroller).dispatchEvent(event);
+            record("after-key");
             // The key's default action follows its handlers at once, as a real key press's does.
             const step = event.defaultPrevented
               ? 0
@@ -1529,17 +1674,20 @@ describe("packaged Mermaid diagrams", () => {
             if (!event.defaultPrevented) {
               scroller.scrollBy({ top: -scroller.clientHeight * 0.875 });
             }
+            record("after-page");
             // How far the line is from where the page step alone puts it, on each painted frame.
             // (Read in this task, before the list re-renders its rows, the layout is not yet
             // what the next frame paints, so only painted frames count.)
             const trail: Array<[number | null, number]> = [];
-            const sample = () =>
+            const sample = () => {
               trail.push([
                 line && lineAtKey !== null
                   ? Math.round(line.getBoundingClientRect().top - lineAtKey - step)
                   : null,
                 Math.round(scroller.scrollTop),
               ]);
+              record("frame");
+            };
             const sampleFrames = (count: number, then: () => void) =>
               count === 0
                 ? then()
@@ -1558,6 +1706,7 @@ describe("packaged Mermaid diagrams", () => {
                   );
               done({
                 trail,
+                trace,
                 moving,
                 keyAfterGlideMs: Math.round(keyAt - movedAt),
                 grewAbove: !!above,
@@ -1587,6 +1736,10 @@ describe("packaged Mermaid diagrams", () => {
       },
       visibleSurfaceSelector,
       mermaidFixturePrompts.keyboard,
+    );
+    NodeFS.writeFileSync(
+      NodePath.join(preparedArtifactDirectory, "mermaid-timeline-keyboard-key.json"),
+      JSON.stringify(pressed, null, 2),
     );
     const keyAt = (await readKeyboardSamples()).keyAt ?? Number.NaN;
     // Labelled, so a failure names what went wrong: the key did not land mid-glide (within the
