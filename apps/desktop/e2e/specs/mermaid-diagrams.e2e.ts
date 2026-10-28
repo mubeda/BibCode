@@ -1073,11 +1073,13 @@ describe("packaged Mermaid diagrams", () => {
     // a list that catches up late fails on the deliveries in between.
     //
     // The plain reply is bounded on its own: from there on, every delivery that painted a
-    // resting frame rests with the reply's end revealed. A slow runner can paint no frame
-    // between two 300 ms deliveries, so such a delivery is recorded rather than failed, but
-    // each reply must settle, finish, and paint at least MIN_SETTLED_RESTS resting frames, so
-    // a webview that painted none, or a reply that stayed hidden and caught up only at its end,
-    // still fails instead of passing on what it did not show.
+    // resting frame rests with the reply's end revealed. How many deliveries paint one depends
+    // on how often the webview paints: on the Linux runners WebKitGTK painted the plain reply
+    // 360-850 ms apart, and six deliveries landed between two of its frames, while each frame it
+    // did paint showed the end revealed. Such a delivery is recorded rather than failed, but each
+    // reply must settle, finish, and paint at least one resting frame after settling, so a
+    // webview that painted none still fails instead of passing on what it did not show, and a
+    // reply that stays hidden fails on every rest it paints.
     const plainRests = restingEnds(plain);
     const plainFrom = settledFrom(plain, () => REVEALED_PX);
     const plainSettled = settledRests(plain, plainFrom);
@@ -1108,7 +1110,18 @@ describe("packaged Mermaid diagrams", () => {
     ];
     NodeFS.writeFileSync(
       NodePath.join(preparedArtifactDirectory, "mermaid-timeline-streaming-unpainted.json"),
-      JSON.stringify(unpainted, null, 2),
+      JSON.stringify(
+        {
+          unpainted,
+          // How often each reply painted after settling, to tell a slow painter from a gap.
+          painted: {
+            plain: paintedAfter(plain, plainFrom, plainSettled),
+            diagram: paintedAfter(diagram, checkedFrom, diagramSettled),
+          },
+        },
+        null,
+        2,
+      ),
     );
     expect({
       settledAndFinished: unpainted.every((entry) => !Number.isNaN(entry.delivered)),
@@ -1960,10 +1973,29 @@ function sentRowsBelowOffset(
 }
 
 /**
- * How many resting frames each streamed reply must paint after settling: the fixture streams at
- * least seven deliveries after the latest settling, and a slow runner may paint none for some.
+ * How many resting frames each streamed reply must paint after settling. Every one it paints is
+ * bounded; how many there are follows the webview's paint rate, which on a slow runner can be
+ * lower than the fixture's 300 ms deliveries, so only a reply that painted none fails here.
  */
-const MIN_SETTLED_RESTS = 5;
+const MIN_SETTLED_RESTS = 1;
+
+/** A reply's painted frames and resting frames after settling, and the median gap between frames. */
+function paintedAfter(
+  samples: readonly StreamSample[],
+  from: number,
+  rests: ReadonlyMap<number, number>,
+): { frames: number; rests: number; medianFrameGapMs: number | null } {
+  const times = samples.filter((entry) => entry.at >= from).map((entry) => entry.at);
+  const gaps = times
+    .slice(1)
+    .map((at, index) => at - times[index]!)
+    .toSorted((a, b) => a - b);
+  return {
+    frames: times.length,
+    rests: rests.size,
+    medianFrameGapMs: gaps.length === 0 ? null : Math.round(gaps[Math.floor(gaps.length / 2)]!),
+  };
+}
 
 /** A reply's end counts as revealed this far below the usable bottom: a pixel of rounding. */
 const REVEALED_PX = 1;
