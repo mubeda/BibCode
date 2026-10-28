@@ -617,27 +617,70 @@ hook preparation. If preparation cannot be established before spawn, the
 original Claude terminal command runs without structured terminal activity.
 
 This gate differs from the chat probe above, because a prepared terminal does
-not run the path BiBCode resolved. It runs a private copy of it, so that the
-build BiBCode checked is the build that runs:
+not run the path BiBCode resolved. It runs a private copy of the build, so that
+the build BiBCode checked is the build that runs, even if an update replaces or
+deletes the installed file during the session.
 
-- **Pinning exists on macOS only.** The copy is a copy-on-write clone. Linux and
-  Windows never prepare a Claude Terminal, so the probe is never reached there:
-  the terminal runs the original command, its status reads **Status unavailable**
-  and AI Terminal activity stays off.
-- **Only the approved build is hooked.** On macOS the copy must be Claude Code
-  v2.1.220 and match that build's recorded length, SHA-256 and code signature
-  (`APPROVED_ADDITIVE_HOOK_VERSION`). Any other build also runs the original
-  command, with **Status unavailable**.
-- **A shim is never hooked.** A clone follows symlinks, so a link such as mise's
-  `shims/claude` to `mise` pins a copy of `mise`, which answers as mise and is
-  not an approved Claude build. The terminal then starts the shim exactly as
-  configured, without the hooks. The probe reads the file that would be pinned
-  (the link's canonical target), so a "not Claude" answer is never cached for a
-  Claude build. A plain renamed link to a Claude build, such as
-  `~/.local/bin/claude` to `versions/2.1.220`, is not a shim and is pinned
-  as usual. Observing a Claude Terminal behind a shim needs the real install
-  pinned and attested, which is not implemented.
+**Which builds are hooked.** A build is hooked when all of these hold:
 
+- its `--version` line ends in `(Claude Code)`, and that version is between
+  2.1.220 and 2.1.312 (`MIN_ADDITIVE_HOOK_VERSION` and
+  `MAX_ADDITIVE_HOOK_VERSION`). In those builds, BiBCode's `--settings` hooks are
+  added to the user's own hooks rather than replacing them. A newer build runs
+  unhooked until a BiBCode release raises the ceiling. That release first proves
+  the newer build keeps a user `PreToolUse` guard working with BiBCode's overlay
+  injected ([release step](../operations/release.md#stable-release-runbook)).
+- `--help` lists `--settings <file-or-json>` and `--setting-sources`.
+- On macOS, the private copy satisfies Anthropic's code signature (Developer ID
+  team `Q6L2SF6YDW`, identifier `com.anthropic.claude-code`), which
+  `codesign --verify` checks against every page. Linux builds carry no signature
+  of their own; Anthropic signs a release manifest instead. On Linux, BiBCode
+  therefore trusts the build's own version line, as the chat probe does.
+
+The signature is checked once per build. Every later launch hashes its own
+private copy and compares the SHA-256 with the checked build's. Concurrent
+launches of a new build share one check, and a check that fails or runs out of
+time is not remembered.
+
+**Platforms.**
+
+- **macOS** clones the build (`clonefile`, copy-on-write).
+- **Linux** copies it with `copy_file_range`, which shares blocks on btrfs, XFS
+  and bcachefs and copies in the kernel elsewhere (about 0.2 s for a 294 MB build
+  on ext4). The copy stops as soon as the preparation runs out of time. A slow
+  disk without block sharing can therefore leave a terminal with **Status
+  unavailable**.
+- **Windows** never prepares a Claude Terminal: it reads **Status unavailable**.
+
+**Claude Terminal behind a shim.** When `claude` is a link to mise, such as
+`~/.local/share/mise/shims/claude`, BiBCode asks mise what the shim would run.
+It runs `mise which claude` and then `mise env --json`, in the terminal's working
+directory and with its environment, because mise picks the version and the
+`[env]` per directory. The answer is not trusted:
+
+- the install must be an absolute path to an executable regular file, owned by
+  the user or root, writable by no one else, and not mise itself. It is then
+  copied and checked like a direct install;
+- the environment must be a small JSON object of strings with valid names. If it
+  sets `LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_AUDIT` or any `DYLD_*` variable, the
+  terminal runs the shim as configured, unhooked;
+- the accepted environment, such as a project's `ANTHROPIC_BASE_URL` or the
+  tools' `PATH`, is applied to the terminal over its own, as the shim would.
+  BiBCode never logs its values and redacts them from spawn errors. It does not
+  redact them from the terminal's output, which shows them as it would without
+  BiBCode.
+
+mise's configuration files for that directory (the project files in it and its
+parents, the global and system files) are read before `which` and after `env`.
+If one changed, BiBCode asks once more. If it changed again, the terminal runs
+the shim unhooked. A change that lands after that second reading, or in a file
+outside that set (an `MISE_ENV` profile or an include), can still apply between
+the check and the spawn.
+
+A plain renamed link to a Claude build, such as `~/.local/bin/claude` to
+`versions/2.1.312`, is not a shim. Its target is copied directly. Other version
+managers (asdf, volta) are not resolved: behind them, the terminal runs
+unhooked.
 Every Claude Terminal is prepared this way, whatever the AI Terminal activity
 setting says, because the left panel shows its agent's status (#187). The
 injected settings add these hooks to the subagent and tool hooks:
@@ -659,9 +702,10 @@ main session: the first one heard, then each new `SessionStart` (`/clear` and
 resume start a new session).
 
 If the terminal cannot be prepared, its status reads **Status unavailable**.
-That happens with a Claude Code older than v2.1.63 (no authenticated HTTP hooks),
-on Linux and Windows (no pinning), on macOS for any build but the approved one
-or when `claude` is a multi-call shim, or when the probe or settings merge fails.
+That happens on Windows, with a Claude Code outside 2.1.220 to 2.1.312, with an
+unsigned or re-signed build on macOS, behind a shim whose answer is refused or
+that is not mise, when a copy without block sharing outlasts the preparation
+budget, or when the probe or settings merge fails.
 
 See [Activity observation](../architecture/activity-observation.md) for the
 shared protocol and provider matrix.
