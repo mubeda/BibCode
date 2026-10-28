@@ -104,7 +104,7 @@ const CLAUDE_VERSION_MARKER: &str = "(Claude Code)";
 /// Anthropic's code signature: Developer ID team Q6L2SF6YDW, identifier
 /// com.anthropic.claude-code, anchored at Apple. `codesign --verify` hashes every page against
 /// it, so one changed byte fails.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 const ANTHROPIC_CODE_REQUIREMENT: &str = "anchor apple generic and identifier \"com.anthropic.claude-code\" and certificate leaf[subject.OU] = \"Q6L2SF6YDW\"";
 /// Verifying a 276 MB build takes 0.4 to 0.8 s, once per build.
 #[cfg(target_os = "macos")]
