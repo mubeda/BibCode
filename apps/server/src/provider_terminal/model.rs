@@ -1283,6 +1283,11 @@ impl fmt::Debug for TerminalLaunchPreparation {
 pub struct PreparedTerminalLaunch {
     pub executable: String,
     pub args: Vec<String>,
+    /// Variables the launch sets over the client's environment, such as the environment a
+    /// version manager's shim would apply before it ran the build that is pinned instead. They
+    /// may override client keys (`PATH`). Their values may be secret: they are redacted from
+    /// the manager's spawn diagnostics and never logged.
+    pub env_overlay: BTreeMap<String, String>,
     pub private_env: BTreeMap<String, String>,
     pub observer: Box<dyn PreparedTerminalObserver>,
 }
@@ -1293,6 +1298,7 @@ impl fmt::Debug for PreparedTerminalLaunch {
             .debug_struct("PreparedTerminalLaunch")
             .field("executable", &self.executable)
             .field("arg_count", &self.args.len())
+            .field("env_overlay_keys", &self.env_overlay.keys())
             .field("private_env_keys", &self.private_env.keys())
             .field("observer", &self.observer.diagnostic_label())
             .finish()

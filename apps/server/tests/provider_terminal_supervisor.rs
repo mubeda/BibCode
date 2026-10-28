@@ -56,20 +56,21 @@ use bibcode_server::{
     provider_terminal::{
         CachedClaudeCapabilityProbe, CachedCodexCapabilityProbe, CachedOpenCodeCapabilityProbe,
         ClaudeAdditiveHookAttestor, ClaudeCapabilities, ClaudeCapabilityProbeRunner,
-        ClaudeExecutablePinner, ClaudeProbeOutput, ClaudeTerminalObserverFactory,
-        CodexCapabilityProbeRunner, CodexHelperLaunch, CodexHelperLauncher, CodexHelperProcess,
-        CodexProbeOutput, CodexRemoteClient, CodexRemoteClientFactory,
-        CodexTerminalObserverFactory, OpenCodeCapabilityProbeRunner, OpenCodeEventStream,
-        OpenCodeHelperLaunch, OpenCodeHelperLauncher, OpenCodeHelperProcess, OpenCodeHelperReady,
-        OpenCodeProbeOutput, OpenCodeRemoteClient, OpenCodeRemoteClientFactory,
-        OpenCodeTerminalObserverFactory, PreparedTerminalLaunch, PreparedTerminalObserver,
-        ProviderSettingsInventoryAuthority, ProviderTerminalActivitySupervisor,
-        ProviderTerminalInventory, ProviderTerminalInventoryAuthority,
-        ProviderTerminalObserverFactories, ProviderTerminalObserverFactory,
-        ProviderTerminalObserverFactoryInput, TerminalAgentActivityTransition, TerminalAgentState,
-        TerminalGenerationActivityPublisher, TerminalLaunchPreparation,
-        TerminalLaunchPreparationInput, TerminalLaunchPreparer, TerminalObserverCancellationReason,
-        TerminalObserverGeneration, TerminalObserverGenerationLease, TerminalObserverWorkerContext,
+        ClaudeExecutablePinner, ClaudeInstallResolver, ClaudeProbeOutput, ClaudeShimRequest,
+        ClaudeShimResolution, ClaudeTerminalObserverFactory, CodexCapabilityProbeRunner,
+        CodexHelperLaunch, CodexHelperLauncher, CodexHelperProcess, CodexProbeOutput,
+        CodexRemoteClient, CodexRemoteClientFactory, CodexTerminalObserverFactory,
+        OpenCodeCapabilityProbeRunner, OpenCodeEventStream, OpenCodeHelperLaunch,
+        OpenCodeHelperLauncher, OpenCodeHelperProcess, OpenCodeHelperReady, OpenCodeProbeOutput,
+        OpenCodeRemoteClient, OpenCodeRemoteClientFactory, OpenCodeTerminalObserverFactory,
+        PreparedTerminalLaunch, PreparedTerminalObserver, ProviderSettingsInventoryAuthority,
+        ProviderTerminalActivitySupervisor, ProviderTerminalInventory,
+        ProviderTerminalInventoryAuthority, ProviderTerminalObserverFactories,
+        ProviderTerminalObserverFactory, ProviderTerminalObserverFactoryInput,
+        TerminalAgentActivityTransition, TerminalAgentState, TerminalGenerationActivityPublisher,
+        TerminalLaunchPreparation, TerminalLaunchPreparationInput, TerminalLaunchPreparer,
+        TerminalObserverCancellationReason, TerminalObserverGeneration,
+        TerminalObserverGenerationLease, TerminalObserverWorkerContext,
         TerminalObserverWorkerSpawnError,
     },
     server_settings::{ProviderInstanceState, ProviderSettingsState, ProviderSettingsStore},
@@ -364,6 +365,7 @@ impl TerminalLaunchPreparer for ReadinessBarrierPreparer {
             TerminalLaunchPreparation::Prepared(PreparedTerminalLaunch {
                 executable: "prepared-command".to_owned(),
                 args: Vec::new(),
+                env_overlay: BTreeMap::new(),
                 private_env: BTreeMap::new(),
                 observer: Box::new(ReadinessBarrierObserver(self.readiness.clone())),
             })
@@ -646,6 +648,7 @@ impl TerminalLaunchPreparer for CountingActivityPreparer {
             TerminalLaunchPreparation::Prepared(PreparedTerminalLaunch {
                 executable: input.executable,
                 args: input.args,
+                env_overlay: BTreeMap::new(),
                 private_env: BTreeMap::new(),
                 observer: Box::new(CountingActivityObserverProxy {
                     observer: self.observer.clone(),
@@ -682,6 +685,7 @@ impl TerminalLaunchPreparer for PostActivityCheckPausingPreparer {
                 PreparedTerminalLaunch {
                     executable: "instrumented-codex".to_owned(),
                     args: input.args,
+                    env_overlay: BTreeMap::new(),
                     private_env: BTreeMap::from([(
                         "BIBCODE_ACTIVITY_OBSERVER".to_owned(),
                         "enabled".to_owned(),
@@ -869,6 +873,7 @@ impl ProviderTerminalObserverFactory for RacingProviderFactory {
             Some(PreparedTerminalLaunch {
                 executable: input.launch.executable,
                 args: input.launch.args,
+                env_overlay: BTreeMap::new(),
                 private_env: BTreeMap::new(),
                 observer: Box::new(RacingPreparedObserver {
                     live_resources: self.live_resources.clone(),
@@ -939,6 +944,7 @@ impl ProviderTerminalObserverFactory for HungProviderFactory {
             Some(PreparedTerminalLaunch {
                 executable: input.launch.executable,
                 args: input.launch.args,
+                env_overlay: BTreeMap::new(),
                 private_env: BTreeMap::from([(
                     "BIBCODE_HUNG_FACTORY_OBSERVER".to_owned(),
                     "installed".to_owned(),
@@ -1047,6 +1053,7 @@ impl AgentActivitySettingsHandler for TerminalSettingsTransitionHandler {
 struct PreparedPlan {
     executable: String,
     args: Vec<String>,
+    env_overlay: BTreeMap<String, String>,
     private_env: BTreeMap<String, String>,
     observer: Arc<ObserverState>,
 }
@@ -1234,6 +1241,7 @@ impl TerminalLaunchPreparer for SerializedCallbackPreparer {
             TerminalLaunchPreparation::Prepared(PreparedTerminalLaunch {
                 executable: input.executable,
                 args: input.args,
+                env_overlay: BTreeMap::new(),
                 private_env: BTreeMap::new(),
                 observer: Box::new(SerializedCallbackObserver {
                     state: self.state.clone(),
@@ -1318,6 +1326,7 @@ impl TerminalLaunchPreparer for NonCooperativeCallbackPreparer {
             TerminalLaunchPreparation::Prepared(PreparedTerminalLaunch {
                 executable: input.executable,
                 args: input.args,
+                env_overlay: BTreeMap::new(),
                 private_env: BTreeMap::new(),
                 observer: Box::new(NonCooperativeCallbackObserver {
                     state: self.state.clone(),
@@ -1392,6 +1401,7 @@ impl TerminalLaunchPreparer for CallbackBlockingPoolPreparer {
             TerminalLaunchPreparation::Prepared(PreparedTerminalLaunch {
                 executable: input.executable,
                 args: input.args,
+                env_overlay: BTreeMap::new(),
                 private_env: BTreeMap::new(),
                 observer: Box::new(CallbackBlockingPoolObserver),
             })
@@ -1505,6 +1515,7 @@ impl TerminalLaunchPreparer for DurableObserverWorkerPreparer {
             TerminalLaunchPreparation::Prepared(PreparedTerminalLaunch {
                 executable: input.executable,
                 args: input.args,
+                env_overlay: BTreeMap::new(),
                 private_env: BTreeMap::new(),
                 observer: Box::new(DurableObserverWorker {
                     state: self.state.clone(),
@@ -1575,6 +1586,7 @@ impl TerminalLaunchPreparer for ObserverSetupBoundaryPreparer {
             TerminalLaunchPreparation::Prepared(PreparedTerminalLaunch {
                 executable: input.executable,
                 args: input.args,
+                env_overlay: BTreeMap::new(),
                 private_env: BTreeMap::new(),
                 observer: Box::new(ObserverSetupBoundary {
                     state: self.state.clone(),
@@ -1625,6 +1637,7 @@ impl TerminalLaunchPreparer for WorkerContextCapturePreparer {
             TerminalLaunchPreparation::Prepared(PreparedTerminalLaunch {
                 executable: input.executable,
                 args: input.args,
+                env_overlay: BTreeMap::new(),
                 private_env: BTreeMap::new(),
                 observer: Box::new(WorkerContextCaptureObserver),
             })
@@ -1718,6 +1731,7 @@ impl TerminalLaunchPreparer for FaultingPreparer {
             TerminalLaunchPreparation::Prepared(PreparedTerminalLaunch {
                 executable: input.executable,
                 args: input.args,
+                env_overlay: BTreeMap::new(),
                 private_env: BTreeMap::new(),
                 observer: Box::new(FaultingObserver {
                     on_spawned_fault: self.observer_on_spawned_fault,
@@ -1777,6 +1791,7 @@ impl TerminalLaunchPreparer for PlannedPreparer {
                     TerminalLaunchPreparation::Prepared(PreparedTerminalLaunch {
                         executable: plan.executable,
                         args: plan.args,
+                        env_overlay: plan.env_overlay,
                         private_env: plan.private_env,
                         observer: Box::new(RecordingObserver {
                             state: plan.observer,
@@ -1842,6 +1857,7 @@ impl ProviderTerminalObserverFactory for PinningFactory {
             Some(PreparedTerminalLaunch {
                 executable: input.launch.executable,
                 args: input.launch.args,
+                env_overlay: BTreeMap::new(),
                 private_env: BTreeMap::from([(
                     "BIBCODE_PRIVATE_TOKEN".to_owned(),
                     "observer-secret".to_owned(),
@@ -2176,6 +2192,7 @@ async fn lifecycle_prepared_launch_replaces_command_and_notifies_only_after_spaw
         [PreparationPlan::Prepared(PreparedPlan {
             executable: "observed-codex".to_owned(),
             args: vec!["app-server".to_owned()],
+            env_overlay: BTreeMap::new(),
             private_env: BTreeMap::from([
                 (
                     "BIBCODE_PRIVATE_SOCKET".to_owned(),
@@ -2272,6 +2289,7 @@ async fn lifecycle_rejects_client_collision_with_private_environment_without_spa
         [PreparationPlan::Prepared(PreparedPlan {
             executable: "observed-codex".to_owned(),
             args: vec!["app-server".to_owned()],
+            env_overlay: BTreeMap::new(),
             private_env: BTreeMap::from([(
                 "BIBCODE_PRIVATE_TOKEN".to_owned(),
                 "server-secret".to_owned(),
@@ -2323,6 +2341,7 @@ async fn lifecycle_spawn_failure_cancels_prepared_observer_without_disclosing_pr
         [PreparationPlan::Prepared(PreparedPlan {
             executable: "observed-codex".to_owned(),
             args: vec!["app-server".to_owned()],
+            env_overlay: BTreeMap::new(),
             private_env: BTreeMap::from([(
                 "BIBCODE_PRIVATE_TOKEN".to_owned(),
                 "secret-token".to_owned(),
@@ -2357,6 +2376,91 @@ async fn lifecycle_spawn_failure_cancels_prepared_observer_without_disclosing_pr
 }
 
 #[tokio::test]
+async fn lifecycle_environment_overlay_overrides_client_keys_and_stays_out_of_diagnostics() {
+    let root = tempfile::tempdir().expect("temp dir");
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let backend = Arc::new(RecordingBackend::new(events.clone()));
+    let plan = |observer: Arc<ObserverState>| {
+        PreparationPlan::Prepared(PreparedPlan {
+            executable: "observed-claude".to_owned(),
+            args: vec!["--settings".to_owned(), "overlay.json".to_owned()],
+            env_overlay: BTreeMap::from([
+                ("PATH".to_owned(), "/mise/installs/bin:/usr/bin".to_owned()),
+                (
+                    "ANTHROPIC_API_KEY".to_owned(),
+                    "mise-project-key".to_owned(),
+                ),
+            ]),
+            private_env: BTreeMap::new(),
+            observer,
+        })
+    };
+    let failed_observer = Arc::new(ObserverState::default());
+    let observer = Arc::new(ObserverState::default());
+    let preparer = Arc::new(PlannedPreparer::new(
+        events,
+        [plan(failed_observer.clone()), plan(observer.clone())],
+    ));
+    backend.fail_next("spawn rejected mise-project-key");
+    let manager = TerminalManager::new(
+        backend.clone(),
+        TerminalManagerOptions {
+            launch_preparer: Some(preparer),
+            ..TerminalManagerOptions::default()
+        },
+    );
+    let open_input = |terminal: &str| {
+        let mut input =
+            TerminalOpenInput::new("thread-1", terminal, root.path().to_path_buf(), 80, 24);
+        input.env.insert("PATH".to_owned(), "/usr/bin".to_owned());
+        input.env.insert("PUBLIC".to_owned(), "visible".to_owned());
+        input.command = Some(command(true));
+        input
+    };
+
+    let rendered = manager
+        .open(open_input("terminal-failed"))
+        .await
+        .expect_err("injected spawn failure")
+        .to_string();
+    assert!(!rendered.contains("mise-project-key"), "{rendered}");
+
+    manager
+        .open(open_input("terminal-1"))
+        .await
+        .expect("prepared terminal");
+    let spawn = backend.spawns().pop().expect("spawn");
+    assert_eq!(
+        spawn.env.get("PATH").map(String::as_str),
+        Some("/mise/installs/bin:/usr/bin"),
+        "the overlay overrides the client's PATH, as the shim would have"
+    );
+    assert_eq!(
+        spawn.env.get("ANTHROPIC_API_KEY").map(String::as_str),
+        Some("mise-project-key")
+    );
+    assert_eq!(spawn.env.get("PUBLIC").map(String::as_str), Some("visible"));
+    let prepared_debug = format!(
+        "{:?}",
+        PreparedTerminalLaunch {
+            executable: "observed-claude".to_owned(),
+            args: Vec::new(),
+            env_overlay: BTreeMap::from([("KEY".to_owned(), "mise-project-key".to_owned())]),
+            private_env: BTreeMap::new(),
+            observer: Box::new(RecordingObserver {
+                state: Arc::new(ObserverState::default()),
+            }),
+        }
+    );
+    assert!(prepared_debug.contains("KEY"), "{prepared_debug}");
+    assert!(
+        !prepared_debug.contains("mise-project-key"),
+        "{prepared_debug}"
+    );
+    manager.shutdown().await;
+}
+
+#[tokio::test]
 async fn lifecycle_exit_close_restart_and_shutdown_cancel_before_generation_invalidation() {
     let root = tempfile::tempdir().expect("temp dir");
     let events = Arc::new(Mutex::new(Vec::new()));
@@ -2370,6 +2474,7 @@ async fn lifecycle_exit_close_restart_and_shutdown_cancel_before_generation_inva
             PreparationPlan::Prepared(PreparedPlan {
                 executable: "observed-codex".to_owned(),
                 args: vec!["app-server".to_owned()],
+                env_overlay: BTreeMap::new(),
                 private_env: BTreeMap::new(),
                 observer,
             })
@@ -2477,6 +2582,7 @@ async fn lifecycle_restart_rejects_late_observer_and_pty_output_from_the_old_gen
                 PreparationPlan::Prepared(PreparedPlan {
                     executable: "observed-codex".to_owned(),
                     args: vec!["app-server".to_owned()],
+                    env_overlay: BTreeMap::new(),
                     private_env: BTreeMap::new(),
                     observer,
                 })
@@ -2550,6 +2656,7 @@ async fn lifecycle_close_cancels_a_prepared_in_flight_observer_before_invalidati
         [PreparationPlan::Prepared(PreparedPlan {
             executable: "observed-codex".to_owned(),
             args: vec!["app-server".to_owned()],
+            env_overlay: BTreeMap::new(),
             private_env: BTreeMap::new(),
             observer: observer.clone(),
         })],
@@ -4034,6 +4141,7 @@ async fn hardening_streaming_redaction_handles_every_split_longest_first_and_flu
             [PreparationPlan::Prepared(PreparedPlan {
                 executable: "observed-codex".to_owned(),
                 args: Vec::new(),
+                env_overlay: BTreeMap::new(),
                 private_env: BTreeMap::from([
                     ("A_SHORT".to_owned(), "private".to_owned()),
                     ("Z_LONG".to_owned(), secret.to_owned()),
@@ -4099,6 +4207,7 @@ async fn hardening_streaming_redaction_handles_every_split_longest_first_and_flu
                 [PreparationPlan::Prepared(PreparedPlan {
                     executable: "observed-codex".to_owned(),
                     args: Vec::new(),
+                    env_overlay: BTreeMap::new(),
                     private_env: BTreeMap::from([("PRIVATE".to_owned(), secret.to_owned())]),
                     observer: Arc::new(ObserverState::default()),
                 })],
@@ -4155,6 +4264,7 @@ async fn hardening_diagnostics_manager_debug_never_exposes_private_values() {
                 [PreparationPlan::Prepared(PreparedPlan {
                     executable: "observed-codex".to_owned(),
                     args: Vec::new(),
+                    env_overlay: BTreeMap::new(),
                     private_env: BTreeMap::from([(
                         "PRIVATE".to_owned(),
                         "secret-token".to_owned(),
@@ -4182,6 +4292,7 @@ async fn hardening_diagnostics_manager_debug_never_exposes_private_values() {
         TerminalLaunchPreparation::Prepared(PreparedTerminalLaunch {
             executable: "observed-codex".to_owned(),
             args: vec!["secret-token".to_owned()],
+            env_overlay: BTreeMap::new(),
             private_env: BTreeMap::from([("PRIVATE".to_owned(), "secret-token".to_owned(),)]),
             observer: Box::new(RecordingObserver {
                 state: Arc::new(ObserverState::default()),
@@ -4205,6 +4316,7 @@ async fn hardening_diagnostics_attempted_args_and_backend_errors_redact_private_
                 [PreparationPlan::Prepared(PreparedPlan {
                     executable: "observed-codex".to_owned(),
                     args: vec!["secret-token".to_owned(), "again-secret-token".to_owned()],
+                    env_overlay: BTreeMap::new(),
                     private_env: BTreeMap::from([(
                         "PRIVATE".to_owned(),
                         "secret-token".to_owned(),
@@ -10156,19 +10268,149 @@ fn claude_link_to_target(
     link
 }
 
+/// What a fixture resolver hands back, and the requests it saw.
 #[cfg(unix)]
-#[tokio::test]
-async fn claude_terminal_behind_a_multi_call_shim_runs_unobserved_on_the_original_command() {
-    let root = tempfile::tempdir().expect("fixture root");
-    let configured = claude_link_to_target(&root, "real/mise", b"multi-call mise");
-    let runner = Arc::new(MultiCallClaudeProbeRunner::default());
-    let supervisor = claude_fixture_supervisor_with_runner(
-        &root,
-        &configured,
-        Arc::new(CopyClaudeExecutablePinner),
-        runner.clone(),
+#[derive(Debug, Default)]
+struct RecordingShimResolver {
+    resolution: Mutex<Option<ClaudeShimResolution>>,
+    requests: Mutex<Vec<ShimRequestRecord>>,
+}
+
+/// The invoked shim path, the directory and the launch environment a resolver was asked with.
+#[cfg(unix)]
+type ShimRequestRecord = (
+    std::path::PathBuf,
+    std::path::PathBuf,
+    BTreeMap<String, String>,
+);
+
+#[cfg(unix)]
+impl RecordingShimResolver {
+    fn answering(resolution: Option<ClaudeShimResolution>) -> Arc<Self> {
+        Arc::new(Self {
+            resolution: Mutex::new(resolution),
+            requests: Mutex::new(Vec::new()),
+        })
+    }
+}
+
+#[cfg(unix)]
+impl ClaudeInstallResolver for RecordingShimResolver {
+    fn resolve<'a>(
+        &'a self,
+        request: ClaudeShimRequest<'a>,
+    ) -> Pin<Box<dyn Future<Output = Option<ClaudeShimResolution>> + Send + 'a>> {
+        self.requests.lock().expect("resolver requests").push((
+            request.invoked.to_path_buf(),
+            request.cwd.to_path_buf(),
+            request.launch_env.clone(),
+        ));
+        let resolution = self.resolution.lock().expect("resolver answer").clone();
+        Box::pin(std::future::ready(resolution))
+    }
+}
+
+/// Approves any build: the version range is the probe's own check.
+#[derive(Debug, Default)]
+struct CountingRangeAttestor {
+    calls: AtomicUsize,
+    delay: std::time::Duration,
+    hang_first: AtomicBool,
+}
+
+impl ClaudeAdditiveHookAttestor for CountingRangeAttestor {
+    fn prove(
+        &self,
+        _executable: &std::path::Path,
+        _version: &str,
+    ) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
+        let call = self.calls.fetch_add(1, Ordering::AcqRel);
+        let hang = call == 0 && self.hang_first.load(Ordering::Acquire);
+        let delay = self.delay;
+        Box::pin(async move {
+            if hang {
+                std::future::pending::<()>().await;
+            }
+            tokio::time::sleep(delay).await;
+            true
+        })
+    }
+}
+
+/// Answers `--version` with `version` and `--help` with the proven help, on every call.
+#[derive(Debug)]
+struct VersionedClaudeProbeRunner {
+    version: String,
+    executables: Mutex<Vec<std::path::PathBuf>>,
+}
+
+impl VersionedClaudeProbeRunner {
+    fn new(version: &str) -> Arc<Self> {
+        Arc::new(Self {
+            version: version.to_owned(),
+            executables: Mutex::new(Vec::new()),
+        })
+    }
+}
+
+impl ClaudeCapabilityProbeRunner for VersionedClaudeProbeRunner {
+    fn run(
+        &self,
+        executable: &std::path::Path,
+        args: Vec<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<ClaudeProbeOutput, String>> + Send + '_>> {
+        self.executables
+            .lock()
+            .expect("probed executables")
+            .push(executable.to_path_buf());
+        let fixture = claude_hook_fixture();
+        let stdout = if args.first().map(String::as_str) == Some("--version") {
+            self.version.clone()
+        } else {
+            fixture["rootHelp"].as_str().expect("root help").to_owned()
+        };
+        Box::pin(std::future::ready(Ok(ClaudeProbeOutput {
+            success: true,
+            stdout,
+            stderr: String::new(),
+        })))
+    }
+}
+
+#[cfg(unix)]
+async fn claude_supervisor_with_factory(
+    root: &tempfile::TempDir,
+    configured: &std::path::Path,
+    factory: Arc<ClaudeTerminalObserverFactory>,
+) -> ProviderTerminalActivitySupervisor {
+    let database = Database::open_in_memory().await.expect("database");
+    database
+        .call(|connection| {
+            run_migrations(connection, None)?;
+            Ok(())
+        })
+        .await
+        .expect("migrations");
+    let mut settings = ProviderSettingsState::default();
+    settings.providers.claude_agent.binary_path = configured.to_string_lossy().into_owned();
+    ProviderTerminalActivitySupervisor::new(
+        settings.clone(),
+        ProviderTerminalInventory::from_settings(&settings),
+        ActivityProjection::new(ActivityRepository::new(database)),
+        ProcessAttributionRegistry::new(),
+        root.path().join("runtime"),
+        ProviderTerminalObserverFactories {
+            claude: Some(factory),
+            ..ProviderTerminalObserverFactories::default()
+        },
     )
-    .await;
+    .expect("Claude supervisor")
+}
+
+#[cfg(unix)]
+fn claude_manager(
+    supervisor: ProviderTerminalActivitySupervisor,
+) -> (TerminalManager, Arc<RecordingBackend>) {
     let backend = Arc::new(RecordingBackend::new(Arc::new(Mutex::new(Vec::new()))));
     let manager = TerminalManager::new(
         backend.clone(),
@@ -10177,33 +10419,554 @@ async fn claude_terminal_behind_a_multi_call_shim_runs_unobserved_on_the_origina
             ..TerminalManagerOptions::default()
         },
     );
-    let input = claude_pinning_open_input(&root, &configured, "terminal-claude-shim");
-    let original_args = input.command.as_ref().expect("Claude command").args.clone();
+    (manager, backend)
+}
 
-    manager.open(input).await.expect("pass-through terminal");
+/// Writes an executable regular file at `relative` under `root`.
+#[cfg(unix)]
+fn claude_executable_file(
+    root: &tempfile::TempDir,
+    relative: &str,
+    bytes: &[u8],
+    mode: u32,
+) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
 
-    // The terminal runs a private copy of the link's target, so the probe describes the target:
-    // here a program that is not Claude Code, which no hook preparation can attest. The terminal
-    // therefore starts the configured shim unchanged and without BiBCode's settings.
+    let path = root.path().join(relative);
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("parent directory");
+    std::fs::write(&path, bytes).expect("executable");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("mode");
+    path
+}
+
+#[cfg(unix)]
+fn shim_overlay() -> BTreeMap<String, String> {
+    BTreeMap::from([
+        (
+            "ANTHROPIC_BASE_URL".to_owned(),
+            "https://proxy.example.invalid".to_owned(),
+        ),
+        (
+            "PATH".to_owned(),
+            "/mise/installs/claude/bin:/usr/bin".to_owned(),
+        ),
+    ])
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn claude_terminal_behind_a_multi_call_shim_pins_the_real_install_with_its_environment() {
+    let root = tempfile::tempdir().expect("fixture root");
+    let configured = claude_link_to_target(&root, "real/mise", b"multi-call mise");
+    let install = claude_executable_file(
+        &root,
+        "installs/claude/2.1.312/claude",
+        b"real claude",
+        0o755,
+    );
+    let runner = VersionedClaudeProbeRunner::new("2.1.312 (Claude Code)\n");
+    let resolver = RecordingShimResolver::answering(Some(ClaudeShimResolution {
+        executable: install.clone(),
+        env: shim_overlay(),
+    }));
+    let factory = Arc::new(
+        ClaudeTerminalObserverFactory::with_pinner(
+            Arc::new(CachedClaudeCapabilityProbe::with_attestor(
+                runner.clone(),
+                Arc::new(CountingRangeAttestor::default()),
+            )),
+            Arc::new(CopyClaudeExecutablePinner),
+        )
+        .with_resolver(resolver.clone()),
+    );
+    let (manager, backend) =
+        claude_manager(claude_supervisor_with_factory(&root, &configured, factory).await);
+    let mut input = claude_pinning_open_input(&root, &configured, "terminal-claude-shim");
+    input
+        .env
+        .insert("LAUNCH_MARKER".to_owned(), "launch-value".to_owned());
+
+    manager.open(input).await.expect("Claude terminal");
+
     let spawn = backend.spawns().pop().expect("Claude PTY spawn");
-    assert_eq!(spawn.executable, configured.to_string_lossy());
-    assert_eq!(spawn.args, original_args);
-    assert!(!spawn.args.iter().any(|argument| argument == "--settings"));
-    let target = std::fs::canonicalize(&configured).expect("shim target");
+    assert_ne!(spawn.executable, configured.to_string_lossy());
+    assert_eq!(
+        std::fs::read(&spawn.executable).expect("pinned executable"),
+        b"real claude",
+        "the terminal pins the install the shim hands off to, not mise"
+    );
+    assert!(spawn.args.iter().any(|argument| argument == "--settings"));
+    for (key, value) in shim_overlay() {
+        assert_eq!(
+            spawn.env.get(&key),
+            Some(&value),
+            "the shim's environment applies: {key}"
+        );
+    }
+    assert_eq!(
+        spawn.env.get("LAUNCH_MARKER").map(String::as_str),
+        Some("launch-value")
+    );
+    let requests = resolver.requests.lock().expect("resolver requests").clone();
+    assert_eq!(requests.len(), 1);
+    let (invoked, cwd, launch_env) = &requests[0];
+    assert_eq!(
+        invoked, &configured,
+        "the resolver sees the invoked shim path, before the supervisor resolved its link"
+    );
+    assert_eq!(cwd, &root.path().to_path_buf());
+    assert_eq!(
+        launch_env.get("LAUNCH_MARKER").map(String::as_str),
+        Some("launch-value")
+    );
+    let probed = runner.executables.lock().expect("probed").clone();
+    let real = std::fs::canonicalize(&install).expect("canonical install");
     assert!(
-        runner
-            .executables
-            .lock()
-            .expect("probed executables lock")
+        !probed.is_empty() && probed.iter().all(|executable| executable == &real),
+        "only the real install is probed: {probed:?}"
+    );
+    manager.shutdown().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn claude_terminal_behind_a_shim_runs_as_configured_when_resolution_is_refused() {
+    let root = tempfile::tempdir().expect("fixture root");
+    let configured = claude_link_to_target(&root, "real/mise", b"multi-call mise");
+    let install = claude_executable_file(&root, "installs/claude/claude", b"real", 0o755);
+    let group_writable = claude_executable_file(&root, "group/claude", b"real", 0o775);
+    let not_executable = claude_executable_file(&root, "plain/claude", b"real", 0o644);
+    let with = |key: &str, value: &str| {
+        let mut env = shim_overlay();
+        env.insert(key.to_owned(), value.to_owned());
+        env
+    };
+    let cases: Vec<(&str, Option<ClaudeShimResolution>)> = vec![
+        ("no answer", None),
+        (
+            "relative path",
+            Some(ClaudeShimResolution {
+                executable: "claude".into(),
+                env: shim_overlay(),
+            }),
+        ),
+        (
+            "group-writable install",
+            Some(ClaudeShimResolution {
+                executable: group_writable,
+                env: shim_overlay(),
+            }),
+        ),
+        (
+            "non-executable install",
+            Some(ClaudeShimResolution {
+                executable: not_executable,
+                env: shim_overlay(),
+            }),
+        ),
+        (
+            "the manager itself",
+            Some(ClaudeShimResolution {
+                executable: std::fs::canonicalize(&configured).expect("mise"),
+                env: shim_overlay(),
+            }),
+        ),
+        (
+            "LD_PRELOAD",
+            Some(ClaudeShimResolution {
+                executable: install.clone(),
+                env: with("LD_PRELOAD", "/tmp/inject.so"),
+            }),
+        ),
+        (
+            "LD_LIBRARY_PATH",
+            Some(ClaudeShimResolution {
+                executable: install.clone(),
+                env: with("LD_LIBRARY_PATH", "/tmp"),
+            }),
+        ),
+        (
+            "LD_AUDIT",
+            Some(ClaudeShimResolution {
+                executable: install.clone(),
+                env: with("LD_AUDIT", "/tmp/audit.so"),
+            }),
+        ),
+        (
+            "DYLD_INSERT_LIBRARIES",
+            Some(ClaudeShimResolution {
+                executable: install.clone(),
+                env: with("DYLD_INSERT_LIBRARIES", "/tmp/inject.dylib"),
+            }),
+        ),
+    ];
+    for (case, resolution) in cases {
+        let factory = Arc::new(
+            ClaudeTerminalObserverFactory::with_pinner(
+                Arc::new(CachedClaudeCapabilityProbe::with_attestor(
+                    VersionedClaudeProbeRunner::new("2.1.312 (Claude Code)\n"),
+                    Arc::new(CountingRangeAttestor::default()),
+                )),
+                Arc::new(CopyClaudeExecutablePinner),
+            )
+            .with_resolver(RecordingShimResolver::answering(resolution)),
+        );
+        let (manager, backend) =
+            claude_manager(claude_supervisor_with_factory(&root, &configured, factory).await);
+        let input = claude_pinning_open_input(&root, &configured, "terminal-claude-refused");
+        let original_args = input.command.as_ref().expect("command").args.clone();
+
+        manager.open(input).await.expect("pass-through terminal");
+
+        let spawn = backend.spawns().pop().expect("Claude PTY spawn");
+        assert_eq!(spawn.executable, configured.to_string_lossy(), "{case}");
+        assert_eq!(spawn.args, original_args, "{case}");
+        for key in ["ANTHROPIC_BASE_URL", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES"] {
+            assert!(
+                !spawn.env.contains_key(key),
+                "{case}: no shim environment applies to the unobserved shim: {key}"
+            );
+        }
+        manager.shutdown().await;
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn claude_terminal_behind_a_shim_runs_unhooked_when_its_install_is_unapproved() {
+    for version in [
+        "2026.10.19 macos-arm64 (2026-10-19)\n",
+        "2.1.219 (Claude Code)\n",
+        "2.1.313 (Claude Code)\n",
+    ] {
+        let root = tempfile::tempdir().expect("fixture root");
+        let configured = claude_link_to_target(&root, "real/mise", b"multi-call mise");
+        let install = claude_executable_file(&root, "installs/claude/claude", b"real", 0o755);
+        let factory = Arc::new(
+            ClaudeTerminalObserverFactory::with_pinner(
+                Arc::new(CachedClaudeCapabilityProbe::with_attestor(
+                    VersionedClaudeProbeRunner::new(version),
+                    Arc::new(CountingRangeAttestor::default()),
+                )),
+                Arc::new(CopyClaudeExecutablePinner),
+            )
+            .with_resolver(RecordingShimResolver::answering(Some(
+                ClaudeShimResolution {
+                    executable: install,
+                    env: shim_overlay(),
+                },
+            ))),
+        );
+        let (manager, backend) =
+            claude_manager(claude_supervisor_with_factory(&root, &configured, factory).await);
+
+        manager
+            .open(claude_pinning_open_input(
+                &root,
+                &configured,
+                "terminal-claude-unapproved",
+            ))
+            .await
+            .expect("pass-through terminal");
+
+        let spawn = backend.spawns().pop().expect("Claude PTY spawn");
+        assert_eq!(spawn.executable, configured.to_string_lossy(), "{version}");
+        assert!(!spawn.args.iter().any(|argument| argument == "--settings"));
+        assert!(!spawn.env.contains_key("ANTHROPIC_BASE_URL"));
+        assert_runtime_has_only_empty_retired_generations(
+            &root.path().join("runtime"),
+            1,
+            "unapproved shim install cleanup",
+        );
+        manager.shutdown().await;
+    }
+}
+
+/// A stand-in for mise's multi-call binary: answers `which` and `env --json` the way mise does,
+/// reporting the directory and one launch variable it ran with.
+#[cfg(unix)]
+fn fake_mise(root: &tempfile::TempDir, install: &std::path::Path) -> std::path::PathBuf {
+    let script = format!(
+        "#!/bin/sh\n\
+         case \"$1\" in\n\
+         which) [ \"$2\" = claude ] && printf '%s\\n' '{install}' && exit 0; exit 1 ;;\n\
+         env) printf '{{\"SEEN_CWD\":\"%s\",\"SEEN_MARKER\":\"%s\",\"ANTHROPIC_BASE_URL\":\"https://proxy.example.invalid\"}}' \"$PWD\" \"$LAUNCH_MARKER\"; exit 0 ;;\n\
+         esac\n\
+         exit 2\n",
+        install = install.display()
+    );
+    claude_executable_file(root, "real/mise", script.as_bytes(), 0o755)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn production_mise_resolver_asks_the_shim_manager_in_the_launch_directory_and_environment() {
+    let root = tempfile::tempdir().expect("fixture root");
+    let install = claude_executable_file(
+        &root,
+        "installs/claude/2.1.312/claude",
+        b"real claude",
+        0o755,
+    );
+    let mise = fake_mise(&root, &install);
+    let shims = root.path().join("shims");
+    std::fs::create_dir_all(&shims).expect("shims");
+    let configured = shims.join("claude");
+    std::os::unix::fs::symlink(&mise, &configured).expect("shim link");
+    let project = root.path().join("project");
+    std::fs::create_dir_all(&project).expect("project");
+    let factory = Arc::new(ClaudeTerminalObserverFactory::with_pinner(
+        Arc::new(CachedClaudeCapabilityProbe::with_attestor(
+            VersionedClaudeProbeRunner::new("2.1.312 (Claude Code)\n"),
+            Arc::new(CountingRangeAttestor::default()),
+        )),
+        Arc::new(CopyClaudeExecutablePinner),
+    ));
+    let (manager, backend) =
+        claude_manager(claude_supervisor_with_factory(&root, &configured, factory).await);
+    let mut input = claude_pinning_open_input(&root, &configured, "terminal-claude-mise");
+    input.cwd = project.clone();
+    input
+        .env
+        .insert("LAUNCH_MARKER".to_owned(), "launch-value".to_owned());
+
+    manager.open(input).await.expect("Claude terminal");
+
+    let spawn = backend.spawns().pop().expect("Claude PTY spawn");
+    assert_eq!(
+        std::fs::read(&spawn.executable).expect("pinned executable"),
+        b"real claude"
+    );
+    assert!(spawn.args.iter().any(|argument| argument == "--settings"));
+    assert_eq!(
+        spawn.env.get("SEEN_CWD").map(std::path::PathBuf::from),
+        Some(std::fs::canonicalize(&project).expect("canonical project")),
+        "mise ran in the launch directory"
+    );
+    assert_eq!(
+        spawn.env.get("SEEN_MARKER").map(String::as_str),
+        Some("launch-value"),
+        "mise ran with the launch environment"
+    );
+    assert_eq!(
+        spawn.env.get("ANTHROPIC_BASE_URL").map(String::as_str),
+        Some("https://proxy.example.invalid")
+    );
+    manager.shutdown().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn claude_direct_install_of_a_proven_newer_build_is_hooked() {
+    let root = tempfile::tempdir().expect("fixture root");
+    let configured = claude_link_to_target(&root, "versions/2.1.312", b"claude 2.1.312");
+    let factory = Arc::new(ClaudeTerminalObserverFactory::with_pinner(
+        Arc::new(CachedClaudeCapabilityProbe::with_attestor(
+            VersionedClaudeProbeRunner::new("2.1.312 (Claude Code)\n"),
+            Arc::new(CountingRangeAttestor::default()),
+        )),
+        Arc::new(CopyClaudeExecutablePinner),
+    ));
+    let (manager, backend) =
+        claude_manager(claude_supervisor_with_factory(&root, &configured, factory).await);
+
+    manager
+        .open(claude_pinning_open_input(
+            &root,
+            &configured,
+            "terminal-claude-312",
+        ))
+        .await
+        .expect("Claude terminal");
+
+    let spawn = backend.spawns().pop().expect("Claude PTY spawn");
+    assert_eq!(
+        std::fs::read(&spawn.executable).expect("pinned executable"),
+        b"claude 2.1.312"
+    );
+    assert!(spawn.args.iter().any(|argument| argument == "--settings"));
+    manager.shutdown().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn concurrent_opens_of_a_new_build_share_one_proof_and_a_cancelled_proof_publishes_nothing() {
+    let root = tempfile::tempdir().expect("fixture root");
+    let configured = claude_link_to_target(&root, "versions/2.1.312", b"claude 2.1.312");
+    let attestor = Arc::new(CountingRangeAttestor {
+        calls: AtomicUsize::new(0),
+        delay: std::time::Duration::from_millis(100),
+        hang_first: AtomicBool::new(false),
+    });
+    let factory = Arc::new(ClaudeTerminalObserverFactory::with_pinner(
+        Arc::new(CachedClaudeCapabilityProbe::with_attestor(
+            VersionedClaudeProbeRunner::new("2.1.312 (Claude Code)\n"),
+            attestor.clone(),
+        )),
+        Arc::new(CopyClaudeExecutablePinner),
+    ));
+    let (manager, backend) =
+        claude_manager(claude_supervisor_with_factory(&root, &configured, factory).await);
+
+    let (first, second) = tokio::join!(
+        manager.open(claude_pinning_open_input(&root, &configured, "terminal-a")),
+        manager.open(claude_pinning_open_input(&root, &configured, "terminal-b")),
+    );
+    first.expect("first terminal");
+    second.expect("second terminal");
+    let spawns = backend.spawns();
+    assert_eq!(spawns.len(), 2);
+    assert!(
+        spawns
             .iter()
-            .all(|executable| executable == &target),
-        "the probe reads the file the terminal would pin"
+            .all(|spawn| spawn.args.iter().any(|arg| arg == "--settings"))
     );
-    assert_runtime_has_only_empty_retired_generations(
-        &root.path().join("runtime"),
+    assert_eq!(
+        attestor.calls.load(Ordering::Acquire),
         1,
-        "shim pass-through cleanup",
+        "both opens share one proof of the new build"
     );
+    manager.shutdown().await;
+
+    // A proof cut off by the preparation budget publishes nothing; the next open proves again.
+    let root = tempfile::tempdir().expect("fixture root");
+    let configured = claude_link_to_target(&root, "versions/2.1.312", b"claude 2.1.312");
+    let attestor = Arc::new(CountingRangeAttestor {
+        calls: AtomicUsize::new(0),
+        delay: std::time::Duration::ZERO,
+        hang_first: AtomicBool::new(true),
+    });
+    let factory = Arc::new(ClaudeTerminalObserverFactory::with_pinner(
+        Arc::new(CachedClaudeCapabilityProbe::with_attestor(
+            VersionedClaudeProbeRunner::new("2.1.312 (Claude Code)\n"),
+            attestor.clone(),
+        )),
+        Arc::new(CopyClaudeExecutablePinner),
+    ));
+    let (manager, backend) =
+        claude_manager(claude_supervisor_with_factory(&root, &configured, factory).await);
+
+    manager
+        .open(claude_pinning_open_input(
+            &root,
+            &configured,
+            "terminal-cut",
+        ))
+        .await
+        .expect("pass-through terminal");
+    assert_eq!(
+        backend.spawns().pop().expect("spawn").executable,
+        configured.to_string_lossy(),
+        "a proof that runs out of budget leaves the terminal unobserved"
+    );
+    manager
+        .open(claude_pinning_open_input(
+            &root,
+            &configured,
+            "terminal-next",
+        ))
+        .await
+        .expect("Claude terminal");
+    assert!(
+        backend
+            .spawns()
+            .pop()
+            .expect("spawn")
+            .args
+            .iter()
+            .any(|arg| arg == "--settings"),
+        "the next open proves the build again and is hooked"
+    );
+    assert_eq!(attestor.calls.load(Ordering::Acquire), 2);
+    manager.shutdown().await;
+}
+
+/// Copies one chunk, then waits for the preparation to give up before it returns.
+#[cfg(unix)]
+#[derive(Debug, Default)]
+struct StallingClaudeExecutablePinner {
+    observed_cancellation: AtomicBool,
+    returned: AtomicBool,
+}
+
+#[cfg(unix)]
+impl ClaudeExecutablePinner for StallingClaudeExecutablePinner {
+    fn pin(&self, _source: &std::path::Path, _destination: &std::path::Path) -> io::Result<()> {
+        unreachable!("the factory pins cancellably")
+    }
+
+    fn pin_cancellable(
+        &self,
+        source: &std::path::Path,
+        destination: &std::path::Path,
+        cancelled: &AtomicBool,
+    ) -> io::Result<()> {
+        std::fs::write(destination, &std::fs::read(source)?[..1])?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !cancelled.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        self.observed_cancellation
+            .store(cancelled.load(Ordering::Acquire), Ordering::Release);
+        let _ = std::fs::remove_file(destination);
+        self.returned.store(true, Ordering::Release);
+        Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"))
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_pin_still_copying_when_the_budget_runs_out_stops_and_its_generation_is_removed() {
+    let root = tempfile::tempdir().expect("fixture root");
+    let configured = claude_link_to_target(&root, "versions/2.1.312", b"claude 2.1.312");
+    let pinner = Arc::new(StallingClaudeExecutablePinner::default());
+    let factory = Arc::new(ClaudeTerminalObserverFactory::with_pinner(
+        Arc::new(CachedClaudeCapabilityProbe::with_attestor(
+            VersionedClaudeProbeRunner::new("2.1.312 (Claude Code)\n"),
+            Arc::new(CountingRangeAttestor::default()),
+        )),
+        pinner.clone(),
+    ));
+    let (manager, backend) =
+        claude_manager(claude_supervisor_with_factory(&root, &configured, factory).await);
+
+    manager
+        .open(claude_pinning_open_input(
+            &root,
+            &configured,
+            "terminal-slow-disk",
+        ))
+        .await
+        .expect("pass-through terminal");
+
+    assert_eq!(
+        backend.spawns().pop().expect("spawn").executable,
+        configured.to_string_lossy(),
+        "a slow disk leaves the terminal unobserved"
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !pinner.returned.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        pinner.observed_cancellation.load(Ordering::Acquire),
+        "the copy is told to stop once the preparation gives up"
+    );
+    let runtime = root.path().join("runtime");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let settled = std::fs::read_dir(&runtime)
+            .expect("runtime directory")
+            .all(|entry| {
+                std::fs::read_dir(entry.expect("runtime entry").path())
+                    .is_ok_and(|mut contents| contents.next().is_none())
+            });
+        if settled || std::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_runtime_has_only_empty_retired_generations(&runtime, 1, "cancelled pin cleanup");
     manager.shutdown().await;
 }
 
@@ -15950,6 +16713,7 @@ impl ProviderTerminalObserverFactory for StatusReportingFactory {
             Some(PreparedTerminalLaunch {
                 executable: input.launch.executable,
                 args: input.launch.args,
+                env_overlay: BTreeMap::new(),
                 private_env: BTreeMap::new(),
                 observer: Box::new(StatusReportingObserver),
             })
