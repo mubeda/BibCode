@@ -211,17 +211,30 @@ The fix: the projector handles `provider.approval.respond.failed` with that
 detail, using the migration's detail rule. It marks the row `resolved` with
 decision `stale`. User inputs already follow this rule through D1.
 
-> **Revised after review.** Expiry no longer happens at `ready`: a provider may
-> end its turn while its ask still waits, and the queue holds behind it exactly
-> as before. A request expires only on a real transition, read in the same
-> transaction, of a `running` or `starting` session to `error`, `interrupted`,
-> `stopped` or `idle`, or on a turn interrupt; never at a launch's `ready` or on
-> a settled session settling again. A resumed OpenCode session launches
-> `starting` and turns `ready` on `session.recovery-settled`, after its stream
-> has shown the asks it kept. Startup expires, as events, requests left open on
-> threads whose session is not live, and migration 057 backfills
-> `last_activity_at` from the latest provider event. The text below records the
-> first design; the revision supersedes its `ready` case and its correction.
+> **Revised twice after review.** Expiry needs evidence that a request can no
+> longer be answered:
+>
+> - The user stopping the turn or the session, for every provider.
+> - An in-process provider's session (Codex chat, Claude chat) leaving
+>   `running` or `starting`, as below.
+> - For OpenCode, whose server outlives BiBCode, only a completed read of its
+>   pending lists that no longer includes the request. A failed OpenCode 1
+>   list read, or an OpenCode 2 read without its completeness flag, proves
+>   nothing.
+>
+> The startup pass skips OpenCode threads, and an open request holds the queue
+> exactly as before this branch.
+>
+> **Disproved premise.** Three review rounds tried to "detect when OpenCode
+> recovery has settled and release the queue automatically": a `starting` hold
+> until `session.recovery-settled`, then a 30-second deadline. Each round found
+> a new edge: a failed read taken for "no asks kept", a deadline that settled
+> unconditionally, and startup expiry hiding an ask the surviving OpenCode
+> server could still take. The hold, the `starting` state and the deadline are
+> removed; nothing infers settlement.
+>
+> The text below records the first design, which this revision supersedes for
+> its `ready` case, its correction and its OpenCode recovery.
 
 **(b) Expiry when a session leaves `running`.** When the engine commits a
 `thread.session-set` whose new status is not `running` or `starting`, the same
@@ -295,7 +308,7 @@ queued follow-up past it. Review restored today's behavior: the request stays
 open and holds the queue (`no_promotion_while_approval_or_user_input_pending`),
 and only the transitions in the revision above expire it
 (`an_interrupted_or_failed_turn_expires_its_request_and_holds_the_queue`,
-`a_relaunch_with_a_recovered_ask_does_not_send_the_follow_up`).
+`an_opencode_ask_holds_the_follow_up_until_a_completed_read_drops_it`).
 A request the provider raises while the session is `ready`, as OpenCode does
 for a recovered ask, still holds the queue.
 

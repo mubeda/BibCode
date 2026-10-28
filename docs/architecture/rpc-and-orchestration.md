@@ -2631,28 +2631,35 @@ The shell carries what the left panel's agent status reads (#187):
 Requests also settle without an answer:
 
 - A stale or unknown `provider.approval.respond.failed` resolves its approval.
-- When a turn interrupt, or a `thread.session-set` to `error`, `interrupted`,
-  `stopped` or `idle`, moves a session that was `running` or `starting` (read in
-  the same transaction), the same commit appends an `approval.expired` or
-  `user-input.expired` activity for every request still open. The payload is
-  `{ requestId, reason: "session-ended", sessionStatus }`. The session that
-  asked is gone, so those requests can never be answered.
-- A session that settles `ready` keeps its open requests: a provider may end
-  its turn while its ask still waits. A session settling again, or a launch's
-  `ready`, expires nothing.
-- At startup, after abandoned sessions are reconciled, requests still open on
-  threads whose session is neither `running` nor `starting` expire the same way,
-  as events (`sessionStatus: "settled"`).
+  A request expires only on evidence that nobody can answer it. Each expiry is an
+  `approval.expired` or `user-input.expired` activity for every request still
+  open, payload `{ requestId, reason, sessionStatus? }`:
+
+- **The user stops it.** A turn interrupt or a `thread.session.stop` expires
+  the thread's open requests in the same commit (`reason: "stopped"`), for
+  every provider.
+- **An in-process provider's session ends.** A `thread.session-set` to
+  `error`, `interrupted`, `stopped` or `idle` that moves a Codex or Claude
+  session out of `running` or `starting` (read in the same transaction)
+  expires them (`reason: "session-ended"`): those asks end with the session.
+  At startup, after abandoned sessions are reconciled, requests still open on
+  such threads whose session is not live expire the same way
+  (`sessionStatus: "settled"`).
+- **OpenCode no longer lists it.** OpenCode's server outlives a BiBCode session
+  and a BiBCode restart, so its session ending proves nothing and the startup
+  pass skips it (`EXTERNALLY_RESUMABLE_PROVIDERS`). On resume, a completed read
+  of its pending lists (both OpenCode 1 lists, or every OpenCode 2 list in the
+  session tree) reports `requests.listed`; each open request it does not list
+  expires (`reason: "provider-unlisted"`). A read that failed, or a tree read cut
+  short, reports nothing, and the requests stay open.
+- A session that settles `ready` keeps its open requests, and a session settling
+  again or a launch's `ready` expires nothing.
 - An expired request reopens if the provider asks it again, which OpenCode does
   for the asks it recovers on resume. `request_is_recorded` treats an expired
   request as not recorded, so the recovered ask is shown.
 
-Queue consequence: an open request still holds queued follow-ups after the turn
-settles `ready`, as before. A resumed OpenCode session launches `starting` and
-turns `ready` only when its runtime reports `session.recovery-settled`: at
-once when the resume kept no asks, otherwise after it has shown them (or after
-30 seconds without an event stream), so a queued follow-up never passes a
-recovered ask. A resume OpenCode refused launches `ready`.
+Queue consequence: an open request holds queued follow-ups until it is answered
+or expires, exactly as before #187; an expiry wakes the delivery service.
 `orchestration.replayEvents` with `paged: true` returns about 1 MiB pages
 `{ events, exhausted }`, keeping at least one event when any remain. Replay
 resumes from the last applied `sequence` with no server state; the cursor is
