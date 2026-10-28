@@ -19,8 +19,8 @@ use crate::{
     activity::{
         ACTIVITY_DELTA_MAX_CHANGES, ACTIVITY_ID_MAX_LENGTH, ActivityCancellationDispatcher,
         ActivityCancellationService, ActivityCapabilities, ActivityChange, ActivityDelta,
-        ActivityDispatchError, ActivityDispatchJob, ActivityHistoryRecovery, ActivityLifecycle,
-        ActivityObservationState, ActivityProjection, ActivityRepositoryError,
+        ActivityDispatchError, ActivityDispatchJob, ActivityHistoryRecovery, ActivityInterruption,
+        ActivityLifecycle, ActivityObservationState, ActivityProjection, ActivityRepositoryError,
         ActivityRuntimeControlRegistration, ActivityRuntimeGeneration, ActivityScopeRef,
         ActivityScopeSeed, ActivitySection, ActivitySectionHealth, ActivitySummaryCounts,
         ActivityTargetDispatchDisposition, AgentActivityController, ProviderActivityControlUpdate,
@@ -2483,6 +2483,78 @@ pub async fn reconcile_orchestration_turn(
 }
 
 const WORKSPACE_LOSS_SESSION_ERROR: &str = "Provider session stopped because its workspace became unavailable. Review delivery status before continuing.";
+
+/// At startup no provider session is live, so a subagent or background task still open in a chat
+/// scope ran in a process that died with the previous server: close it as `interrupted` (#206).
+/// An OpenCode scope closes only when its persisted runtime row proves BiBCode ran the server;
+/// a server the user runs may still be running that work, and its resume decides. Returns how
+/// many scopes were closed.
+pub async fn interrupt_activity_of_ended_sessions(
+    repositories: &Repositories,
+    activity: &ActivityProjection,
+) -> usize {
+    const RESTART: ActivityInterruption = ActivityInterruption {
+        cause: "BiBCode restarted before this",
+    };
+    let scopes = match activity.unresolved_thread_scopes().await {
+        Ok(scopes) => scopes,
+        Err(error) => {
+            tracing::warn!(%error, "failed to read open chat activity at startup");
+            return 0;
+        }
+    };
+    if scopes.is_empty() {
+        return 0;
+    }
+    let owned_opencode_threads = if scopes.iter().any(|scope| scope.provider == "opencode") {
+        match repositories.list_provider_session_runtimes().await {
+            Ok(runtimes) => runtimes
+                .into_iter()
+                .filter(|runtime| {
+                    runtime
+                        .runtime_payload
+                        .as_ref()
+                        .and_then(|payload| payload.get(PROCESS_OWNER_PAYLOAD_KEY))
+                        .and_then(Value::as_str)
+                        == Some(PROCESS_OWNER_BIBCODE)
+                })
+                .map(|runtime| runtime.thread_id)
+                .collect::<HashSet<_>>(),
+            Err(error) => {
+                tracing::warn!(%error, "failed to read provider runtimes for startup activity");
+                HashSet::new()
+            }
+        }
+    } else {
+        HashSet::new()
+    };
+    let mut closed_scopes = 0;
+    for scope in scopes {
+        if scope.provider == "opencode" && !owned_opencode_threads.contains(&scope.thread_id) {
+            continue;
+        }
+        match activity
+            .interrupt_unresolved_scope(&scope.scope_id, RESTART)
+            .await
+        {
+            Ok(deltas) if !deltas.is_empty() => closed_scopes += 1,
+            Ok(_) => {}
+            Err(error) => tracing::warn!(
+                %error,
+                thread_id = %scope.thread_id,
+                provider = %scope.provider,
+                "failed to close open chat activity at startup"
+            ),
+        }
+    }
+    if closed_scopes > 0 {
+        tracing::info!(
+            closed_scopes,
+            "closed chat activity left open by the previous server"
+        );
+    }
+    closed_scopes
+}
 
 pub async fn reconcile_abandoned_provider_sessions(
     engine: &OrchestrationEngine,
@@ -6448,6 +6520,14 @@ async fn run_supervisor(
                     } else {
                         entry.event_cancellation.cancel();
                     }
+                    // The process is gone whether or not its projection settled; closing its
+                    // activity needs no further delivery (#206).
+                    interrupt_ended_session_activity(
+                        &activity,
+                        &entry.launch,
+                        entry.driver.as_ref(),
+                    )
+                    .await;
                 }
             }
             SupervisorMessage::Deliver {
@@ -9678,6 +9758,7 @@ async fn restart_session(
     }
     if let Some(mut entry) = sessions.remove(thread_id) {
         close_publication_and_reap_event_task(&mut entry).await;
+        interrupt_ended_session_activity(activity, &entry.launch, entry.driver.as_ref()).await;
         {
             // The process that ran this work is gone.
             let mut lifecycle = entry
@@ -12330,6 +12411,8 @@ async fn detach_session(
         "provider-session-detach",
     )
     .await;
+    // Before the lifecycle reads the projection, so it counts nothing live.
+    interrupt_ended_session_activity(activity, &entry.launch, entry.driver.as_ref()).await;
     synchronize_activity_lifecycle(activity, &entry.launch.thread_id, &entry.activity_lifecycle)
         .await;
     compensate_cancelled_activity(
@@ -12403,6 +12486,73 @@ async fn shutdown_sessions(
         }
     }
     first_error.map_or(Ok(()), Err)
+}
+
+/// Who runs an OpenCode session's server, persisted in its runtime payload so a server start can
+/// tell, without the live driver, whether its subagents ended with BiBCode (#206).
+pub(crate) const PROCESS_OWNER_PAYLOAD_KEY: &str = "processOwner";
+pub(crate) const PROCESS_OWNER_BIBCODE: &str = "bibcode";
+pub(crate) const PROCESS_OWNER_EXTERNAL: &str = "external";
+
+/// What a closed record's summary says when its provider session ended (#206).
+pub(crate) fn provider_session_interruption(provider: &str) -> ActivityInterruption {
+    ActivityInterruption {
+        cause: match provider {
+            "claude" | "claudeAgent" => "Claude session ended before this",
+            "codex" => "Codex session ended before this",
+            "opencode" => "OpenCode session ended before this",
+            _ => "The provider session ended before this",
+        },
+    }
+}
+
+/// The process that ran this session's subagents and background work is gone: nothing will
+/// report them again, so their records close as `interrupted` (#206). Runs after the session's
+/// activity tasks stopped, or after its stream ended; an older report still in flight is fenced
+/// by the closure time, while a real terminal report still wins. A server the user runs keeps
+/// its work going, so its records stay as they are.
+async fn interrupt_ended_session_activity(
+    activity: &ActivityProjection,
+    launch: &ProviderLaunchRequest,
+    driver: &dyn ProviderDriver,
+) {
+    if !driver.owns_native_work() {
+        return;
+    }
+    let interruption = provider_session_interruption(&launch.provider);
+    match activity
+        .interrupt_unresolved_scope(&format!("thread:{}", launch.thread_id), interruption)
+        .await
+    {
+        Ok(deltas) => {
+            let closed = deltas
+                .iter()
+                .flat_map(|delta| &delta.changes)
+                .filter(|change| {
+                    matches!(
+                        change,
+                        ActivityChange::ActorUpserted { .. }
+                            | ActivityChange::WorkItemUpserted { .. }
+                    )
+                })
+                .count();
+            if closed > 0 {
+                tracing::info!(
+                    provider = %launch.provider,
+                    thread_id = %launch.thread_id,
+                    closed,
+                    "closed the open activity of an ended provider session"
+                );
+            }
+        }
+        Err(ActivityRepositoryError::NotFound) => {}
+        Err(error) => tracing::warn!(
+            %error,
+            provider = %launch.provider,
+            thread_id = %launch.thread_id,
+            "failed to close the open activity of an ended provider session"
+        ),
+    }
 }
 
 async fn compensate_cancelled_activity(
@@ -14149,9 +14299,14 @@ impl ProviderDriver for OpenCodeDriver {
                 None => self.runtime.start().await,
             }
             .map_err(provider_error("opencode"))?;
+            let process_owner = if self.child.is_some() {
+                PROCESS_OWNER_BIBCODE
+            } else {
+                PROCESS_OWNER_EXTERNAL
+            };
             Ok(StartedSession {
                 resume_cursor: Some(json!({"sessionId":id})),
-                runtime_payload: None,
+                runtime_payload: Some(json!({ PROCESS_OWNER_PAYLOAD_KEY: process_owner })),
                 activity_capabilities: ActivityCapabilities::none(),
             })
         })
@@ -29078,6 +29233,55 @@ done
             self.supervisor.shutdown().await.unwrap();
             self.engine.shutdown().await;
         }
+
+        async fn thread_activity(&self) -> crate::activity::ActivitySnapshot {
+            self.activity
+                .snapshot(&crate::activity::ActivityScopeRef::Thread {
+                    thread_id: "t1".to_owned(),
+                })
+                .await
+                .expect("thread activity snapshot")
+        }
+
+        /// The open subagent closed because its process is gone (#206): `interrupted` at one
+        /// closure time, with why in its summary, and nothing left active.
+        async fn assert_subagent_interrupted_by_session_end(&self) {
+            let snapshot = self.thread_activity().await;
+            let actor = snapshot
+                .actors
+                .iter()
+                .find(|actor| actor.id == "actor:sub")
+                .expect("subagent record");
+            assert_eq!(
+                actor.status,
+                crate::activity::ActivityLifecycle::Interrupted
+            );
+            assert_eq!(Some(&actor.updated_at), actor.terminal_at.as_ref());
+            assert!(
+                actor.summary.as_deref().is_some_and(|summary| summary
+                    .starts_with("Codex session ended before this subagent reported;")),
+                "{:?}",
+                actor.summary
+            );
+            assert_eq!(snapshot.counts.subagents.active, 0);
+            assert_eq!(snapshot.counts.subagents.done, 1);
+        }
+
+        /// Waits until the open subagent reads `interrupted`, without driving any turn.
+        async fn wait_for_subagent_interrupted(&self) {
+            // The idle clock stays paused, so this yields instead of sleeping.
+            for _ in 0..5_000 {
+                let snapshot = self.thread_activity().await;
+                if snapshot.actors.iter().any(|actor| {
+                    actor.id == "actor:sub"
+                        && actor.status == crate::activity::ActivityLifecycle::Interrupted
+                }) {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+            panic!("the subagent of an ended stream never closed");
+        }
     }
 
     #[test]
@@ -29375,7 +29579,75 @@ done
             )
             .await;
         fixture.assert_suspended_after_timeout(3).await;
+        // Suspension ended the process that ran it (#206), and the scope is live again
+        // without it.
+        fixture.assert_subagent_interrupted_by_session_end().await;
+        assert_eq!(
+            fixture.thread_activity().await.observation_state,
+            crate::activity::ActivityObservationState::Live
+        );
         fixture.close().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutting_down_interrupts_an_open_subagent_and_republishes_the_scope_without_it() {
+        let _clock = keep_idle_clock_paused();
+        let mut fixture = IdleDeadlineFixture::new(BUSY_SESSION_IDLE_TIMEOUT).await;
+        fixture.complete_first_turn_with_actor("running").await;
+        let mut published = fixture.activity.subscribe();
+        // As an app update's quiesce does.
+        fixture.supervisor.shutdown().await.unwrap();
+        fixture.assert_subagent_interrupted_by_session_end().await;
+        let snapshot = fixture.thread_activity().await;
+        assert_eq!(
+            snapshot.observation_state,
+            crate::activity::ActivityObservationState::Live
+        );
+        let mut delivered_interruption = false;
+        while let Ok(event) = published.try_recv() {
+            if let crate::activity::ActivityProjectionEvent::Delta(delta) = event {
+                delivered_interruption |= delta.changes.iter().any(|change| {
+                    matches!(
+                        change,
+                        crate::activity::ActivityChange::ActorUpserted { actor }
+                            if actor.status == crate::activity::ActivityLifecycle::Interrupted
+                    )
+                });
+            }
+        }
+        assert!(
+            delivered_interruption,
+            "subscribers receive the interruption"
+        );
+        fixture.engine.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stream_that_ends_by_itself_interrupts_its_open_subagent_without_another_turn() {
+        let _clock = keep_idle_clock_paused();
+        let mut fixture = IdleDeadlineFixture::new(BUSY_SESSION_IDLE_TIMEOUT).await;
+        fixture.complete_first_turn_with_actor("running").await;
+        // The provider process died: its event stream ends and no turn follows.
+        let (ended, _) = mpsc::channel(1);
+        drop(std::mem::replace(&mut fixture.events, ended));
+        fixture.wait_for_subagent_interrupted().await;
+        fixture.assert_subagent_interrupted_by_session_end().await;
+        fixture.close().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_server_the_user_runs_keeps_its_open_subagent_when_the_session_ends() {
+        let _clock = keep_idle_clock_paused();
+        let mut fixture = IdleDeadlineFixture::new(BUSY_SESSION_IDLE_TIMEOUT).await;
+        fixture.state.lock().unwrap().externally_owned = true;
+        fixture.complete_first_turn_with_actor("running").await;
+        fixture.supervisor.shutdown().await.unwrap();
+        let snapshot = fixture.thread_activity().await;
+        assert_eq!(
+            snapshot.actors[0].status,
+            crate::activity::ActivityLifecycle::Running
+        );
+        fixture.engine.shutdown().await;
     }
 
     #[tokio::test(start_paused = true)]
