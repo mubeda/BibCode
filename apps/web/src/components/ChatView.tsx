@@ -6198,6 +6198,9 @@ function ChatViewContent(props: ChatViewProps) {
       } = sendCtx;
 
       const threadIdForSend = activeThread.id;
+      // Implement switches the draft to default mode before its turn starts; a follow-up that
+      // does not start puts the mode back, so the plan's Implement and Refine are offered again.
+      const interactionModeBeforeFollowUp = interactionMode;
       const messageIdForSend = newMessageId();
       const messageCreatedAt = new Date().toISOString();
       const outgoingMessageText = formatOutgoingPrompt({
@@ -6307,6 +6310,12 @@ function ChatViewContent(props: ChatViewProps) {
       setOptimisticUserMessages((existing) =>
         existing.filter((message) => message.id !== messageIdForSend),
       );
+      if (nextInteractionMode !== interactionModeBeforeFollowUp) {
+        setComposerDraftInteractionMode(
+          scopeThreadRef(activeThread.environmentId, threadIdForSend),
+          interactionModeBeforeFollowUp,
+        );
+      }
       if (!isAtomCommandInterrupted(failure)) {
         const error = squashAtomCommandFailure(failure);
         setThreadError(
@@ -6323,6 +6332,7 @@ function ChatViewContent(props: ChatViewProps) {
       activeThreadRef,
       activeProposedPlan,
       beginLocalDispatch,
+      interactionMode,
       isConnecting,
       isSendBusy,
       isServerThread,

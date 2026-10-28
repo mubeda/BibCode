@@ -72,6 +72,11 @@ function renderActions(overrides: Partial<Props> = {}): { tree: ReactElement; ma
   return { tree, markup: renderToStaticMarkup(tree) };
 }
 
+/** Whether a captured button cannot act: natively disabled, or blocked and aria-disabled. */
+function unavailable(button: Record<string, unknown> | undefined): boolean {
+  return button?.["disabled"] === true || button?.["aria-disabled"] === true;
+}
+
 function invoke(props: Record<string, unknown>, key: string, ...args: unknown[]): void {
   const handler = props[key];
   if (typeof handler !== "function") throw new Error(`Missing ${key} handler`);
@@ -154,7 +159,7 @@ describe("ComposerPrimaryActions", () => {
     for (const value of cases) {
       harness.buttons.length = 0;
       renderActions(value);
-      expect(harness.buttons.at(-1)?.disabled).toBe(true);
+      expect(unavailable(harness.buttons.at(-1))).toBe(true);
     }
 
     harness.buttons.length = 0;
@@ -198,15 +203,21 @@ describe("ComposerPrimaryActions", () => {
         isComplete: true,
       },
     });
-    expect(harness.buttons.at(-1)?.disabled).toBe(true);
+    expect(unavailable(harness.buttons.at(-1))).toBe(true);
+    // Blocked, not natively disabled: it stays focusable with its reason.
+    expect(harness.buttons.at(-1)?.disabled).toBe(false);
+    expect(harness.buttons.at(-1)?.["aria-disabled"]).toBe(true);
     expect(harness.buttons.at(-1)?.["aria-label"]).toBe(
       "Submit answers unavailable. Laptop: Offline",
     );
     expect(markup).toContain(
       '<span data-tooltip="true">Submit answers unavailable. Laptop: Offline</span>',
     );
-    // The focusable wrapper carries the tooltip, not a second name.
-    expect(harness.tooltipTriggers[0]?.props["aria-label"]).toBeUndefined();
+    // The tooltip is on the named, focusable button itself; there is no wrapper focus stop.
+    expect(harness.tooltipTriggers).toHaveLength(1);
+    expect(harness.tooltipTriggers[0]?.props["aria-label"]).toBe(
+      "Submit answers unavailable. Laptop: Offline",
+    );
   });
 
   it("names the environment state on a blocked Refine and Implement", () => {
@@ -221,7 +232,7 @@ describe("ComposerPrimaryActions", () => {
         isEnvironmentUnavailable: true,
         environmentUnavailableReason: "Laptop: Reconnecting…",
       });
-      expect(harness.buttons[0]?.disabled).toBe(true);
+      expect(unavailable(harness.buttons[0])).toBe(true);
       expect(harness.buttons[0]?.["aria-label"]).toBe(
         `${action} unavailable. Laptop: Reconnecting…`,
       );
@@ -275,7 +286,7 @@ describe("ComposerPrimaryActions", () => {
         ...value,
       });
       expect(markup).toContain(value.isSendBusy || value.isConnecting ? "Sending..." : "Refine");
-      expect(harness.buttons[0]?.disabled).toBe(
+      expect(unavailable(harness.buttons[0])).toBe(
         value.isSendBusy || value.isConnecting || value.isEnvironmentUnavailable,
       );
     }
@@ -293,7 +304,7 @@ describe("ComposerPrimaryActions", () => {
       harness.menuItems.length = 0;
       const { markup } = renderActions({ showPlanFollowUpPrompt: true, ...value });
       expect(markup).toContain(value.isSendBusy || value.isConnecting ? "Sending..." : "Implement");
-      expect(harness.buttons[0]?.disabled).toBe(
+      expect(unavailable(harness.buttons[0])).toBe(
         value.isSendBusy || value.isConnecting || value.isEnvironmentUnavailable,
       );
     }
@@ -339,11 +350,11 @@ describe("ComposerPrimaryActions", () => {
 
     renderActions({ sendBlockedReason: reason });
 
-    const trigger = harness.tooltipTriggers[0]!;
-    // One name, on the button, that still says it is Send.
-    expect(trigger.props["aria-label"]).toBeUndefined();
-    const sendButton = trigger.props.children as ReactElement<Record<string, unknown>>;
+    // The tooltip trigger is the Send button itself: one focusable control with one name.
+    const sendButton = harness.tooltipTriggers[0]!;
+    expect(sendButton.type).toBe("button");
     expect(sendButton.props["aria-label"]).toBe(`Send unavailable. ${reason}`);
-    expect(sendButton.props.disabled).toBe(true);
+    expect(sendButton.props["aria-disabled"]).toBe(true);
+    expect(sendButton.props.disabled).toBe(false);
   });
 });

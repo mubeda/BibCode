@@ -1206,7 +1206,8 @@ async function typeThroughDropAndSend(input: TypeThroughDropInput): Promise<void
     { timeout: 5_000, timeoutMsg: "The text typed through the drop was not persisted." },
   );
 
-  // Send is blocked, still names itself, and names the state the banner shows.
+  // Send is blocked yet focusable (aria-disabled), still names itself, and names the state the
+  // banner shows.
   const sendLabel = await browser.waitUntil(
     () =>
       browser.execute(
@@ -1215,7 +1216,8 @@ async function typeThroughDropAndSend(input: TypeThroughDropInput): Promise<void
             '[data-center-surface-host][data-visible="true"] [data-chat-composer-form="true"] button[type="submit"]',
           );
           const label = send?.getAttribute("aria-label") ?? "";
-          return send?.disabled === true &&
+          return send?.getAttribute("aria-disabled") === "true" &&
+            !send.disabled &&
             label.startsWith(prefix) &&
             label.endsWith(`: ${expectedState}`)
             ? label

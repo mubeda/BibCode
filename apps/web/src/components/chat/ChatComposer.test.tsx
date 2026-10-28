@@ -3360,14 +3360,19 @@ describe("ChatComposer mobile", () => {
       },
     });
 
+    // Blocked but focusable: its name states why, and pressing it reaches onSend's refusal.
     const send = hostByLabel("Send unavailable. Laptop: Offline");
-    expect(send["disabled"]).toBe(true);
+    expect(send["disabled"]).toBe(false);
+    expect(send["aria-disabled"]).toBe(true);
     expect(markup).toContain("ready to send");
+    (send["onClick"] as (event: unknown) => void)({ stopPropagation: vi.fn() });
+    expect(spies.onSend).toHaveBeenCalledTimes(1);
+    expect(active.blur).not.toHaveBeenCalled();
 
     // Enter submits the form; ChatView refuses and states why, so the draft stays in view.
     const form = findHost((element) => element.type === "form");
     (form.props["onSubmit"] as (event: unknown) => void)({ preventDefault: vi.fn() });
-    expect(spies.onSend).toHaveBeenCalledTimes(1);
+    expect(spies.onSend).toHaveBeenCalledTimes(2);
     expect(active.blur).not.toHaveBeenCalled();
     expect(setStateValues(STATE.focused)).not.toContain(false);
   });

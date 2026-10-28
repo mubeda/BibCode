@@ -1,4 +1,4 @@
-import { memo, type PointerEventHandler, type ReactElement } from "react";
+import { memo, type MouseEventHandler, type PointerEventHandler, type ReactElement } from "react";
 import { ChevronDownIcon, ChevronLeftIcon } from "lucide-react";
 import { cn } from "~/lib/utils";
 import { Button } from "../ui/button";
@@ -58,10 +58,23 @@ export function formatUnavailableActionLabel(action: string, reason: string): st
   return `${action} unavailable. ${reason}`;
 }
 
+const refuseActivation: MouseEventHandler<HTMLElement> = (event) => {
+  // A blocked submit button must not submit its form; Enter in the editor states why instead.
+  event.preventDefault();
+};
+
 /**
- * Gives a disabled action its reason as a tooltip. A disabled button gets no pointer or focus
- * events, so a focusable wrapper carries the tooltip; the name stays on the button alone.
+ * A blocked action stays focusable and carries its own name and disabled state, so Tab lands
+ * on "<action> unavailable. <reason>" and its tooltip, while activating it does nothing. A
+ * natively disabled button could not take focus or show the tooltip.
  */
+function blockedActionProps(label: string | null) {
+  return label === null
+    ? {}
+    : { "aria-disabled": true as const, "aria-label": label, onClick: refuseActivation };
+}
+
+/** Shows a blocked action's reason as a tooltip on the action itself. */
 function UnavailableActionTooltip({
   label,
   children,
@@ -72,17 +85,13 @@ function UnavailableActionTooltip({
   if (label === null) return children;
   return (
     <Tooltip>
-      <TooltipTrigger
-        render={
-          <span className="inline-flex" tabIndex={0}>
-            {children}
-          </span>
-        }
-      />
+      <TooltipTrigger render={children} />
       <TooltipPopup side="top">{label}</TooltipPopup>
     </Tooltip>
   );
 }
+
+const blockedButtonClassName = "aria-disabled:cursor-not-allowed aria-disabled:opacity-64";
 
 const preventPointerFocus: PointerEventHandler<HTMLElement> = (event) => {
   event.preventDefault();
@@ -161,13 +170,15 @@ export const ComposerPrimaryActions = memo(function ComposerPrimaryActions({
           <Button
             type="submit"
             size="sm"
-            className={cn("rounded-full", compact ? "px-3" : "px-4")}
+            className={cn("rounded-full", compact ? "px-3" : "px-4", blockedButtonClassName)}
             {...pointerFocusProps}
-            {...(pendingUnavailableLabel ? { "aria-label": pendingUnavailableLabel } : {})}
+            {...blockedActionProps(pendingUnavailableLabel)}
             disabled={
-              pendingBlockedReason !== null ||
-              pendingAction.isResponding ||
-              (pendingAction.isLastQuestion ? !pendingAction.isComplete : !pendingAction.canAdvance)
+              pendingUnavailableLabel === null &&
+              (pendingAction.isResponding ||
+                (pendingAction.isLastQuestion
+                  ? !pendingAction.isComplete
+                  : !pendingAction.canAdvance))
             }
           >
             {pendingLabel}
@@ -211,10 +222,14 @@ export const ComposerPrimaryActions = memo(function ComposerPrimaryActions({
           <Button
             type="submit"
             size="sm"
-            className={cn("rounded-full", compact ? "h-9 px-3 sm:h-8" : "h-9 px-4 sm:h-8")}
+            className={cn(
+              "rounded-full",
+              compact ? "h-9 px-3 sm:h-8" : "h-9 px-4 sm:h-8",
+              blockedButtonClassName,
+            )}
             {...pointerFocusProps}
-            {...(refineUnavailableLabel ? { "aria-label": refineUnavailableLabel } : {})}
-            disabled={blockedReason !== null || isSendBusy || isConnecting}
+            {...blockedActionProps(refineUnavailableLabel)}
+            disabled={refineUnavailableLabel === null && (isSendBusy || isConnecting)}
           >
             {isConnecting || isSendBusy ? "Sending..." : "Refine"}
           </Button>
@@ -229,10 +244,10 @@ export const ComposerPrimaryActions = memo(function ComposerPrimaryActions({
           <Button
             type="submit"
             size="sm"
-            className="h-9 rounded-l-full rounded-r-none px-4 sm:h-8"
+            className={cn("h-9 rounded-l-full rounded-r-none px-4 sm:h-8", blockedButtonClassName)}
             {...pointerFocusProps}
-            {...(implementUnavailableLabel ? { "aria-label": implementUnavailableLabel } : {})}
-            disabled={blockedReason !== null || isSendBusy || isConnecting}
+            {...blockedActionProps(implementUnavailableLabel)}
+            disabled={implementUnavailableLabel === null && (isSendBusy || isConnecting)}
           >
             {isConnecting || isSendBusy ? "Sending..." : "Implement"}
           </Button>
@@ -278,37 +293,37 @@ export const ComposerPrimaryActions = memo(function ComposerPrimaryActions({
         : isSendBusy
           ? "Sending"
           : "Send message";
+  const sendUnavailableLabel = blockedReason ? sendLabel : null;
+  // A blocked Send stays focusable with its reason; a busy or empty one is plainly disabled.
   const isSendDisabled =
-    blockedReason !== null || isSendBusy || isConnecting || !hasSendableContent;
+    sendUnavailableLabel === null && (isSendBusy || isConnecting || !hasSendableContent);
 
   return (
     <Tooltip>
       <TooltipTrigger
         render={
-          // The wrapper only lets a disabled Send show its tooltip; the name is the button's.
-          <span className="inline-flex" tabIndex={isSendDisabled ? 0 : undefined}>
-            <button
-              type="submit"
-              className="flex h-9 w-9 enabled:cursor-pointer items-center justify-center rounded-full bg-primary/90 text-primary-foreground shadow-xs enabled:shadow-primary/24 enabled:inset-shadow-[0_1px_--theme(--color-white/16%)] transition-all duration-150 hover:bg-primary hover:scale-105 active:inset-shadow-[0_1px_--theme(--color-black/8%)] active:shadow-none disabled:pointer-events-none disabled:opacity-30 disabled:shadow-none disabled:hover:scale-100 sm:h-8 sm:w-8"
-              {...pointerFocusProps}
-              disabled={isSendDisabled}
-              aria-label={sendLabel}
-            >
-              {isConnecting || isSendBusy ? (
-                <Spinner className="size-3.5" aria-hidden="true" />
-              ) : (
-                <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true">
-                  <path
-                    d="M7 11.5V2.5M7 2.5L3 6.5M7 2.5L11 6.5"
-                    stroke="currentColor"
-                    strokeWidth="1.8"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                  />
-                </svg>
-              )}
-            </button>
-          </span>
+          <button
+            type="submit"
+            className="flex h-9 w-9 enabled:cursor-pointer items-center justify-center rounded-full bg-primary/90 text-primary-foreground shadow-xs enabled:shadow-primary/24 enabled:inset-shadow-[0_1px_--theme(--color-white/16%)] transition-all duration-150 hover:bg-primary hover:scale-105 active:inset-shadow-[0_1px_--theme(--color-black/8%)] active:shadow-none disabled:pointer-events-none disabled:opacity-30 disabled:shadow-none disabled:hover:scale-100 aria-disabled:cursor-not-allowed aria-disabled:opacity-30 aria-disabled:shadow-none aria-disabled:hover:scale-100 sm:h-8 sm:w-8"
+            {...pointerFocusProps}
+            disabled={isSendDisabled}
+            aria-label={sendLabel}
+            {...blockedActionProps(sendUnavailableLabel)}
+          >
+            {isConnecting || isSendBusy ? (
+              <Spinner className="size-3.5" aria-hidden="true" />
+            ) : (
+              <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true">
+                <path
+                  d="M7 11.5V2.5M7 2.5L3 6.5M7 2.5L11 6.5"
+                  stroke="currentColor"
+                  strokeWidth="1.8"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+              </svg>
+            )}
+          </button>
         }
       />
       <TooltipPopup side="top">{sendLabel}</TooltipPopup>
