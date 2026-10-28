@@ -611,6 +611,40 @@ is the packaged check that unsent text survives draft promotion. To run the
 scenario alone, set `BIBCODE_E2E_SPEC=./specs/composer-native-triggers.e2e.ts`
 in the same way.
 
+The spec's third scenario types into the primary chat one key at a time. It
+types through a window `offline` event, then through a lost RPC socket that its
+page harness keeps failing until it lets the retry through. In both drops:
+
+- every key is on screen and in the thread's single environment-scoped persisted
+  draft after the 300 ms write debounce;
+- Send is blocked but stays focusable (`aria-disabled`, not native `disabled`),
+  and its accessible name is "Send unavailable." followed by the state the
+  composer banner shows;
+- Enter raises a toast titled with the environment's state and keeps focus and
+  text;
+- nothing reaches the provider before an explicit Send after the reconnect;
+- that Send delivers the whole text exactly once. The provider-log wait's
+  1.5 s settle is the proof that nothing was resent on reconnect: it fails on a
+  second delivery.
+
+Keep these assertions. They are the packaged check that a connection phase never
+drops typing (#199). The collapsed mobile composer cannot render in the desktop
+app, whose window is at least 960 px wide, so its refusal is covered by
+ChatComposer component tests.
+
+When `waitForComposerValue` times out, the spec writes
+`composer-value-timeout-<n>.json`. It records the editor's text, editable state
+and focus, the Send label, the toasts, `navigator.onLine`, the route, and the
+persisted drafts. Retain it with the failure screenshot.
+
+The manual loop `apps/desktop/e2e/specs/manual/composer-connection-drop.e2e.ts`
+(not in the default list) repeats offline, lost-socket and no-drop arms around
+typing. It writes a timestamped recorder log per run to
+`composer-drop-runs.jsonl`, and fails an arm whose text is gone once the
+connection is back. Before the fix, with a read-only composer, its
+offline-before-typing arm lost the text on macOS arm64 in every run. What closed
+the macOS x64 runner's connection in that CI run is not known.
+
 The packaged scenario must show two Queued cards in FIFO order below the working
 row while the provider log still contains only the initial start. Steer the head
 and verify exactly one `kind: "steer"` log entry for its text and the original

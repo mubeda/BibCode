@@ -43,7 +43,11 @@ import {
   type ComposerTrigger,
   replaceTextRange,
 } from "../../composer-logic";
-import { deriveComposerSendState, readFileAsDataUrl } from "../ChatView.logic";
+import {
+  deriveComposerSendState,
+  describeUnavailableEnvironment,
+  readFileAsDataUrl,
+} from "../ChatView.logic";
 import {
   type ComposerAttachment,
   type ComposerImageAttachment,
@@ -78,7 +82,7 @@ import { ComposerCommandMenu } from "./ComposerCommandMenu";
 import { buildComposerCommandItems, type ComposerCommandItem } from "./composerCommandItems";
 import { deriveComposerCapabilityProfile } from "./composerCapabilities";
 import { ComposerPendingApprovalActions } from "./ComposerPendingApprovalActions";
-import { ComposerPrimaryActions } from "./ComposerPrimaryActions";
+import { ComposerPrimaryActions, formatUnavailableActionLabel } from "./ComposerPrimaryActions";
 import { ComposerPendingApprovalPanel } from "./ComposerPendingApprovalPanel";
 import { ComposerPendingUserInputPanel } from "./ComposerPendingUserInputPanel";
 import { ComposerPlanFollowUpBanner } from "./ComposerPlanFollowUpBanner";
@@ -435,6 +439,7 @@ const ComposerFooterPrimaryActions = memo(function ComposerFooterPrimaryActions(
   isSendBusy: boolean;
   isConnecting: boolean;
   isEnvironmentUnavailable: boolean;
+  environmentUnavailableReason: string | null;
   sendBlockedReason: string | null;
   hasSendableContent: boolean;
   isAttachmentSelectionDisabled: boolean;
@@ -487,6 +492,7 @@ const ComposerFooterPrimaryActions = memo(function ComposerFooterPrimaryActions(
         isSendBusy={props.isSendBusy}
         isConnecting={props.isConnecting}
         isEnvironmentUnavailable={props.isEnvironmentUnavailable}
+        environmentUnavailableReason={props.environmentUnavailableReason}
         sendBlockedReason={props.sendBlockedReason}
         isPreparingWorktree={props.isPreparingWorktree}
         hasSendableContent={props.hasSendableContent}
@@ -748,6 +754,13 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     historyMenu,
   } = props;
   const isProviderBindingConflicted = providerBindingConflictReason !== null;
+  // While the environment is not connected the composer stays editable (the draft is local),
+  // and every Send path names the state the composer banner shows (#199).
+  const environmentSendBlockedReason = environmentUnavailable
+    ? describeUnavailableEnvironment(environmentUnavailable).title
+    : null;
+  const sendBlockedReason = providerBindingConflictReason ?? environmentSendBlockedReason;
+  const isEnvironmentUnavailable = environmentUnavailable !== null;
   const terminalOpen = useThreadHasTerminalSurface(routeThreadRef);
 
   // ------------------------------------------------------------------
@@ -1267,13 +1280,15 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         : null,
     [activePendingIsResponding, activePendingProgress, activePendingResolvedAnswers],
   );
+  // A blocked collapsed Send stays focusable with its reason (aria-disabled); pressing it
+  // reaches onSend, which refuses and says why. A busy or empty one is plainly disabled.
+  const isCollapsedComposerPrimaryActionBlocked = sendBlockedReason !== null;
   const collapsedComposerPrimaryActionDisabled =
-    isProviderBindingConflicted ||
-    phase === "running" ||
-    isSendBusy ||
-    isConnecting ||
-    !composerSendState.hasSendableContent;
-  const collapsedComposerPrimaryActionLabel = "Send message";
+    !isCollapsedComposerPrimaryActionBlocked &&
+    (phase === "running" || isSendBusy || isConnecting || !composerSendState.hasSendableContent);
+  const collapsedComposerPrimaryActionLabel = sendBlockedReason
+    ? formatUnavailableActionLabel("Send", sendBlockedReason)
+    : "Send message";
   const showMobilePendingAnswerActions =
     isMobileViewport && !isComposerCollapsedMobile && pendingPrimaryAction !== null;
 
@@ -1842,6 +1857,8 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   const shouldBlurMobileComposerOnSubmit = useCallback(() => {
     if (!isMobileViewport) return false;
     if (isSendBusy || isConnecting || phase === "running") return false;
+    // A refused send keeps focus and the visible draft.
+    if (isEnvironmentUnavailable) return false;
     if (activePendingProgress) {
       return activePendingProgress.isLastQuestion && Boolean(activePendingResolvedAnswers);
     }
@@ -1850,6 +1867,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     activePendingProgress,
     activePendingResolvedAnswers,
     composerSendState.hasSendableContent,
+    isEnvironmentUnavailable,
     isConnecting,
     isMobileViewport,
     isSendBusy,
@@ -1865,6 +1883,8 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       }
       const currentPrompt = promptRef.current;
       const bibcodeAction = parseStandaloneComposerBiBCodeAction(currentPrompt);
+      // `:` actions (model picker, plan/default mode) only change this draft, so they run in
+      // every connection state; anything that reaches the server goes through onSend.
       if (bibcodeAction) {
         event?.preventDefault();
         const applied = applyPromptReplacement(0, currentPrompt.length, "", {
@@ -2168,8 +2188,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
           isConnecting ||
           isProviderBindingConflicted ||
           isComposerApprovalState ||
-          pendingUserInputs.length > 0 ||
-          (environmentUnavailable !== null && activePendingProgress === null)
+          pendingUserInputs.length > 0
         ) {
           return false;
         }
@@ -2288,8 +2307,6 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       isComposerApprovalState,
       isProviderBindingConflicted,
       pendingUserInputs.length,
-      environmentUnavailable,
-      activePendingProgress,
       applyPromptReplacement,
       isComposerModelPickerOpen,
       readComposerSnapshot,
@@ -2337,7 +2354,6 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
           className={cn(
             "chat-composer-glass rounded-[20px] border transition-colors duration-200",
             isDragOverComposer ? "border-primary/70 bg-accent/45" : "border-border",
-            environmentUnavailable ? "opacity-75" : null,
             composerProviderState.composerSurfaceClassName,
           )}
           onFocusCapture={(event) => {
@@ -2451,6 +2467,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                       isConnecting={isConnecting}
                       isEnvironmentUnavailable={environmentUnavailable !== null}
                       sendBlockedReason={providerBindingConflictReason}
+                      environmentUnavailableReason={environmentSendBlockedReason}
                       isPreparingWorktree={false}
                       hasSendableContent={false}
                       preserveComposerFocusOnPointerDown
@@ -2485,8 +2502,9 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
               </button>
               <button
                 type="button"
-                className="flex size-8 shrink-0 items-center justify-center rounded-full bg-primary/90 text-primary-foreground disabled:opacity-30"
+                className="flex size-8 shrink-0 items-center justify-center rounded-full bg-primary/90 text-primary-foreground disabled:opacity-30 aria-disabled:opacity-30"
                 disabled={collapsedComposerPrimaryActionDisabled}
+                {...(isCollapsedComposerPrimaryActionBlocked ? { "aria-disabled": true } : {})}
                 aria-label={collapsedComposerPrimaryActionLabel}
                 onPointerDown={(event) => event.preventDefault()}
                 onClick={(event) => {
@@ -2745,19 +2763,13 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                         ? "Type your own answer, or leave this blank to use the selected option"
                         : showPlanFollowUpPrompt && activeProposedPlan
                           ? "Add feedback to refine the plan, or leave this blank to implement it"
-                          : environmentUnavailable
-                            ? // The composer banner states the reason; this only names the state.
-                              `${environmentUnavailable.label} is not connected`
-                            : phase === "disconnected"
-                              ? "Ask for follow-up changes or attach files"
-                              : "Ask anything, @ files, : BiBCode actions, or a provider-native command"
+                          : phase === "disconnected"
+                            ? "Ask for follow-up changes or attach files"
+                            : "Ask anything, @ files, : BiBCode actions, or a provider-native command"
                 }
-                disabled={
-                  isConnecting ||
-                  isProviderBindingConflicted ||
-                  isComposerApprovalState ||
-                  (environmentUnavailable !== null && activePendingProgress === null)
-                }
+                // A connection state never makes the editor read-only: keys typed while it
+                // reconnects would be dropped silently (#199). Send paths refuse instead.
+                disabled={isConnecting || isProviderBindingConflicted || isComposerApprovalState}
               />
               {showMobilePendingAnswerActions ? (
                 <div
@@ -2774,6 +2786,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                     isConnecting={isConnecting}
                     isEnvironmentUnavailable={environmentUnavailable !== null}
                     sendBlockedReason={providerBindingConflictReason}
+                    environmentUnavailableReason={environmentSendBlockedReason}
                     isPreparingWorktree={false}
                     hasSendableContent={false}
                     preserveComposerFocusOnPointerDown
@@ -2891,6 +2904,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                   isConnecting={isConnecting}
                   isEnvironmentUnavailable={environmentUnavailable !== null}
                   sendBlockedReason={providerBindingConflictReason}
+                  environmentUnavailableReason={environmentSendBlockedReason}
                   isPreparingWorktree={isPreparingWorktree}
                   hasSendableContent={composerSendState.hasSendableContent}
                   isAttachmentSelectionDisabled={
