@@ -1517,8 +1517,19 @@ describe("packaged responsive activity experience", () => {
             ).length,
         };
       });
-    if ((await interruptedRows()).interrupted === 0) {
+    // The panel may still be open from earlier steps, possibly on Background tasks.
+    const doneSectionShown = () =>
+      browser.execute(
+        () => document.querySelector('[aria-labelledby="activity-subagents-done"]') !== null,
+      );
+    if (!(await doneSectionShown())) {
       await browser.$('button[aria-label^="Activity: Subagents 0 active, 2 done"]').click();
+    }
+    if (!(await doneSectionShown())) {
+      const subagentsTab = browser.$('//*[@role="tab"][contains(normalize-space(), "Subagents")]');
+      if (await subagentsTab.isExisting()) {
+        await subagentsTab.click();
+      }
     }
     await browser.waitUntil(async () => (await interruptedRows()).interrupted === 2, {
       timeoutMsg: "The stopped session's subagents did not read Interrupted under Done.",
