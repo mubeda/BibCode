@@ -10881,6 +10881,68 @@ async fn concurrent_opens_of_a_new_build_share_one_proof_and_a_cancelled_proof_p
     manager.shutdown().await;
 }
 
+/// The complete caller against a real mise shim: the production resolver, probe, pin and
+/// attestation, through `TerminalManager::open`. It needs mise, its shim and a Claude install
+/// under the temp directory (the hermetic guard's root), and a project whose `mise.toml` sets
+/// the `[env]` variable named by `BIBCODE_CLAUDE_MISE_ENV_KEY`:
+///
+/// `BIBCODE_CLAUDE_MISE_SHIM=<data>/shims/claude BIBCODE_CLAUDE_MISE_PROJECT=<project>
+/// BIBCODE_CLAUDE_MISE_ENV_KEY=ANTHROPIC_BASE_URL cargo test --release -p bibcode-server --test
+/// provider_terminal_supervisor live_claude_terminal -- --ignored --nocapture`
+#[cfg(unix)]
+#[ignore = "needs a real mise shim and Claude install; see docs/testing/linux-desktop.md"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_claude_terminal_through_a_real_mise_shim_is_hooked_within_its_budget() {
+    let variable = |name: &str| {
+        std::env::var_os(name)
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| panic!("set {name}"))
+    };
+    let shim = variable("BIBCODE_CLAUDE_MISE_SHIM");
+    let project = variable("BIBCODE_CLAUDE_MISE_PROJECT");
+    let env_key =
+        std::env::var("BIBCODE_CLAUDE_MISE_ENV_KEY").expect("set BIBCODE_CLAUDE_MISE_ENV_KEY");
+    let root = tempfile::tempdir().expect("fixture root");
+    let factory = Arc::new(ClaudeTerminalObserverFactory::system());
+    let (manager, backend) =
+        claude_manager(claude_supervisor_with_factory(&root, &shim, factory).await);
+
+    for (phase, terminal) in [
+        ("cold", "terminal-live-cold"),
+        ("proven-build", "terminal-live-warm"),
+    ] {
+        let mut input = claude_pinning_open_input(&root, &shim, terminal);
+        input.cwd = project.clone();
+        let started = std::time::Instant::now();
+        manager.open(input).await.expect("Claude terminal");
+        let elapsed = started.elapsed();
+        eprintln!("live mise shim {phase} open: {elapsed:?}");
+        let spawn = backend.spawns().pop().expect("Claude PTY spawn");
+        assert_ne!(
+            spawn.executable,
+            shim.to_string_lossy(),
+            "{phase}: the terminal runs a private pin of the real install"
+        );
+        assert!(
+            spawn.args.iter().any(|argument| argument == "--settings"),
+            "{phase}: the terminal is hooked"
+        );
+        assert!(
+            spawn.env.contains_key(&env_key),
+            "{phase}: mise's [env] reaches the terminal: {env_key}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(2_400),
+            "{phase}: terminal.open waits at most 2.4 s for a Claude preparation"
+        );
+        manager
+            .close("thread-claude-pin", Some(terminal))
+            .await
+            .expect("close terminal");
+    }
+    manager.shutdown().await;
+}
+
 /// Copies one chunk, then waits for the preparation to give up before it returns.
 #[cfg(unix)]
 #[derive(Debug, Default)]
