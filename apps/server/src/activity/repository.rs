@@ -839,6 +839,7 @@ pub struct UnresolvedThreadScope {
     pub scope_id: String,
     pub thread_id: String,
     pub provider: String,
+    pub provider_instance_id: Option<String>,
 }
 
 enum BatchMutations {
@@ -852,7 +853,7 @@ fn unresolved_thread_scopes(
 ) -> ActivityRepositoryResult<Vec<UnresolvedThreadScope>> {
     let mut statement = connection
         .prepare(
-            "SELECT DISTINCT s.scope_id, s.thread_id, s.provider_name
+            "SELECT DISTINCT s.scope_id, s.thread_id, s.provider_name, s.provider_instance_id
              FROM activity_scopes s
              JOIN activity_records r ON r.scope_id = s.scope_id
              WHERE s.source_kind = 'thread' AND s.is_current = 1
@@ -866,6 +867,7 @@ fn unresolved_thread_scopes(
                 scope_id: row.get(0)?,
                 thread_id: row.get(1)?,
                 provider: row.get(2)?,
+                provider_instance_id: row.get(3)?,
             })
         })
         .map_err(sql_error)?

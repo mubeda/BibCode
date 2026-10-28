@@ -555,7 +555,7 @@ async fn a_restart_keeps_opencode_asks_until_a_completed_read_drops_them() {
     // BiBCode restarts: reconciliation settles the abandoned session, then startup expiry runs.
     // Settings point OpenCode at a server the user runs, which survived the restart.
     session_as(&engine, &thread_id, "error", AT, "opencode").await;
-    let user_server = StartupProcessOwnership::new([], true);
+    let user_server = StartupProcessOwnership::new([], ["opencode".to_owned()]);
     assert_eq!(
         engine
             .expire_requests_of_settled_sessions(&user_server)
@@ -638,8 +638,8 @@ async fn a_restart_settles_or_keeps_an_opencode_threads_requests_and_subagents_t
         // A runtime row a build before #206 wrote: no recorded owner.
         let legacy_payload = json!({ "transport": "http" });
         let ownership = StartupProcessOwnership::new(
-            [(thread_id.as_str(), Some(&legacy_payload))],
-            user_server_configured,
+            [(thread_id.as_str(), Some("opencode"), Some(&legacy_payload))],
+            user_server_configured.then(|| "opencode".to_owned()),
         );
 
         // The restart: close what ended, settle the session, expire what nobody holds.

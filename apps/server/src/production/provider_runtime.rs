@@ -2495,18 +2495,22 @@ const WORKSPACE_LOSS_SESSION_ERROR: &str = "Provider session stopped because its
 /// the persisted runtime rows and whether the settings point OpenCode at a user's server.
 pub async fn startup_process_ownership(
     repositories: &Repositories,
-    external_server_configured: bool,
+    external_server_instances: Vec<String>,
 ) -> StartupProcessOwnership {
     match repositories.list_provider_session_runtimes().await {
         Ok(runtimes) => StartupProcessOwnership::new(
-            runtimes
-                .iter()
-                .map(|runtime| (runtime.thread_id.as_str(), runtime.runtime_payload.as_ref())),
-            external_server_configured,
+            runtimes.iter().map(|runtime| {
+                (
+                    runtime.thread_id.as_str(),
+                    runtime.provider_instance_id.as_deref(),
+                    runtime.runtime_payload.as_ref(),
+                )
+            }),
+            external_server_instances,
         ),
         Err(error) => {
             tracing::warn!(%error, "failed to read provider runtimes for startup ownership");
-            StartupProcessOwnership::new([], external_server_configured)
+            StartupProcessOwnership::new([], external_server_instances)
         }
     }
 }
@@ -2534,7 +2538,11 @@ pub async fn interrupt_activity_of_ended_sessions(
     }
     let mut closed_scopes = 0;
     for scope in scopes {
-        if ownership.work_may_outlive_bibcode(&scope.thread_id, &scope.provider) {
+        if ownership.work_may_outlive_bibcode(
+            &scope.thread_id,
+            &scope.provider,
+            scope.provider_instance_id.as_deref(),
+        ) {
             continue;
         }
         match activity
@@ -32355,7 +32363,8 @@ done
                 crate::activity::ActivityLifecycle::Running,
                 "nothing but the startup pass closes it"
             );
-            let ownership = super::startup_process_ownership(&engine.repositories(), false).await;
+            let ownership =
+                super::startup_process_ownership(&engine.repositories(), Vec::new()).await;
             super::interrupt_activity_of_ended_sessions(&ownership, &activity).await;
             let expected = if owned {
                 crate::activity::ActivityLifecycle::Interrupted
