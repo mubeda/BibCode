@@ -9,6 +9,37 @@ pub mod opencode;
 
 use std::fmt;
 
+#[derive(Clone, Copy)]
+pub(crate) struct RequestScope(uuid::Uuid);
+
+impl RequestScope {
+    pub(crate) fn new() -> Self {
+        Self(uuid::Uuid::new_v4())
+    }
+
+    pub(crate) fn approval_id(self, correlation_id: &str) -> String {
+        format!("approval:{}:{correlation_id}", self.0)
+    }
+
+    pub(crate) fn user_input_id(self, correlation_id: &str) -> String {
+        format!("user-input:{}:{correlation_id}", self.0)
+    }
+}
+
+#[cfg(test)]
+mod request_scope_tests {
+    use super::RequestScope;
+
+    #[test]
+    fn one_wire_id_is_stable_within_a_connection_and_distinct_across_connections() {
+        let first = RequestScope::new();
+        let second = RequestScope::new();
+        assert_eq!(first.approval_id("1"), first.approval_id("1"));
+        assert_ne!(first.approval_id("1"), second.approval_id("1"));
+        assert_ne!(first.approval_id("1"), first.user_input_id("1"));
+    }
+}
+
 /// Driver-owned capability used by both inventory and durable steer admission.
 pub(crate) fn supports_turn_steer(provider: &str) -> bool {
     matches!(provider, "codex" | "claudeAgent")

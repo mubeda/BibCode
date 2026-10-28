@@ -3110,6 +3110,167 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn production_restart_expires_same_id_questions_on_both_settled_chats() {
+        const AT: &str = "2026-10-28T10:00:00Z";
+        let state = TempDir::new().expect("state");
+        let config = ServerConfig::new(state.path()).with_bind("127.0.0.1", 0);
+        hermetic_providers::write_hermetic_settings(
+            &config.state_dir(),
+            json!({"providers":{
+                "codex":{"enabled":false},
+                "claudeAgent":{"enabled":false},
+                "cursor":{"enabled":false},
+                "grok":{"enabled":false},
+                "opencode":{"enabled":false}
+            }}),
+        );
+        let database = Database::open_in_memory().await.expect("database");
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("migrations");
+        let initial = ProductionRuntime::start(
+            &config,
+            database.clone(),
+            AuthService::new(&config, vec![7_u8; 32]),
+            vec![9_u8; 32],
+            Arc::new(crate::diagnostics::NotApplicableUiProcessObserver),
+        )
+        .await
+        .expect("first production start");
+        initial
+            .orchestration
+            .dispatch(
+                serde_json::from_value(json!({
+                    "type":"project.create", "commandId":"expiry-project",
+                    "projectId":"expiry-project", "title":"Expiry",
+                    "workspaceRoot":state.path(), "defaultModelSelection":null,
+                    "createdAt":AT
+                }))
+                .expect("project command"),
+            )
+            .await
+            .expect("project");
+        let first = initial
+            .orchestration
+            .repositories()
+            .list_threads_by_project("expiry-project".to_owned())
+            .await
+            .expect("threads")
+            .into_iter()
+            .find(|thread| thread.kind == "default")
+            .expect("default thread")
+            .thread_id;
+        let second = "expiry-second";
+        initial
+            .orchestration
+            .dispatch(
+                serde_json::from_value(json!({
+                    "type":"thread.create", "commandId":"expiry-second",
+                    "threadId":second, "projectId":"expiry-project", "title":"Second",
+                    "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+                    "runtimeMode":"full-access", "interactionMode":"default",
+                    "branch":null, "worktreePath":null, "createdAt":AT
+                }))
+                .expect("second thread command"),
+            )
+            .await
+            .expect("second thread");
+        for thread_id in [&first[..], second] {
+            let id = uuid::Uuid::new_v4();
+            initial
+                .orchestration
+                .dispatch(
+                    serde_json::from_value(json!({
+                        "type":"thread.session.set",
+                        "commandId":format!("session:{id}"),
+                        "threadId":thread_id, "createdAt":AT,
+                        "session":{
+                            "threadId":thread_id, "status":"ready", "providerName":"codex",
+                            "runtimeMode":"approval-required", "activeTurnId":null,
+                            "lastError":null, "updatedAt":AT
+                        }
+                    }))
+                    .expect("session command"),
+                )
+                .await
+                .expect("settled session");
+            initial
+                .orchestration
+                .dispatch(
+                    serde_json::from_value(json!({
+                        "type":"thread.activity.append",
+                        "commandId":format!("ask:{id}"),
+                        "threadId":thread_id, "createdAt":AT,
+                        "activity":{
+                            "id":format!("ask:{id}"), "tone":"approval",
+                            "kind":"user-input.requested", "summary":"Question",
+                            "payload":{"requestId":"user-input:1","questions":[]},
+                            "turnId":null, "createdAt":AT
+                        }
+                    }))
+                    .expect("ask command"),
+                )
+                .await
+                .expect("question");
+        }
+        initial.shutdown().await;
+        for thread_id in [&first[..], second] {
+            let id = thread_id.to_owned();
+            let pending: i64 = database
+                .call(move |connection| {
+                    let count = connection.query_row(
+                        "SELECT pending_user_input_count FROM projection_threads WHERE thread_id = ?",
+                        [id],
+                        |row| row.get(0),
+                    )?;
+                    Ok(count)
+                })
+                .await
+                .expect("pending before restart");
+            assert_eq!(pending, 1, "{thread_id}");
+        }
+
+        let restarted = ProductionRuntime::start(
+            &config,
+            database.clone(),
+            AuthService::new(&config, vec![7_u8; 32]),
+            vec![9_u8; 32],
+            Arc::new(crate::diagnostics::NotApplicableUiProcessObserver),
+        )
+        .await
+        .expect("second production start");
+        for thread_id in [&first[..], second] {
+            let row = restarted
+                .orchestration
+                .repositories()
+                .get_thread(thread_id.to_owned())
+                .await
+                .expect("thread")
+                .expect("thread exists");
+            assert_eq!(row.pending_user_input_count, 0, "{thread_id}");
+            let id = thread_id.to_owned();
+            let expiries: i64 = database
+                .call(move |connection| {
+                    let count = connection.query_row(
+                        "SELECT COUNT(*) FROM projection_thread_activities
+                         WHERE thread_id = ? AND kind = 'user-input.expired'",
+                        [id],
+                        |row| row.get(0),
+                    )?;
+                    Ok(count)
+                })
+                .await
+                .expect("expiry count");
+            assert_eq!(expiries, 1, "{thread_id}");
+        }
+        restarted.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn agent_activity_startup_migrates_legacy_true_to_chat_enabled_and_terminal_disabled() {
         let state = TempDir::new().expect("temporary state directory");
         let config = ServerConfig::new(state.path()).with_bind("127.0.0.1", 0);

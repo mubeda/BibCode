@@ -2826,18 +2826,77 @@ async fn session_runtime_matches_text_tool_and_approval_traces() {
         .await
         .expect("approval turn");
     let mut approval_events = runtime.collect_events(2).await;
+    let approval_request_id = approval_events[1].request_id.clone().expect("approval id");
+    assert!(approval_request_id.starts_with("approval:"));
+    assert!(approval_request_id.ends_with(":1001"));
+    let scope = approval_request_id
+        .strip_prefix("approval:")
+        .and_then(|id| id.strip_suffix(":1001"))
+        .expect("scoped approval id");
+    uuid::Uuid::parse_str(scope).expect("connection scope UUID");
+    normalize_request_id(&mut approval_events, &approval_request_id, "approval:1001");
     assert_eq!(
         &approval_events[..2],
         &stable_fixture("trace-approval-prefix.json")[..2]
     );
     runtime
-        .respond_to_request("approval:1001", "accept")
+        .respond_to_request(&approval_request_id, "accept")
         .await
         .expect("approval response");
     approval_events.extend(runtime.collect_events(3).await);
+    normalize_request_id(&mut approval_events, &approval_request_id, "approval:1001");
     assert_eq!(approval_events, stable_fixture("trace-approval.json"));
 
     peer_task.await.expect("peer task");
+}
+
+#[tokio::test]
+async fn two_codex_connections_keep_the_same_wire_request_distinct() {
+    let (connection_a, _protocol_a, mut peer_a) = scripted_peer();
+    let (incoming_a, received_a) = mpsc::unbounded_channel();
+    let runtime_a =
+        CodexSessionRuntime::new(codex_activity_options(None), connection_a, received_a);
+    let (connection_b, _protocol_b, mut peer_b) = scripted_peer();
+    let (incoming_b, received_b) = mpsc::unbounded_channel();
+    let runtime_b =
+        CodexSessionRuntime::new(codex_activity_options(None), connection_b, received_b);
+
+    for (sender, wire_id) in [(&incoming_a, json!(1)), (&incoming_b, json!("1"))] {
+        sender
+            .send(IncomingEvent::Request {
+                correlation_id: "1".to_owned(),
+                wire_id,
+                method: "item/commandExecution/requestApproval".to_owned(),
+                params: json!({"turnId":"turn-1","reason":"Approve"}),
+            })
+            .expect("incoming request");
+    }
+    let opened_a =
+        next_codex_event_matching(&runtime_a, |event| event.event_type == "request.opened").await;
+    let opened_b =
+        next_codex_event_matching(&runtime_b, |event| event.event_type == "request.opened").await;
+    let request_a = opened_a.request_id.expect("first request id");
+    let request_b = opened_b.request_id.expect("second request id");
+    assert_ne!(request_a, request_b);
+    assert!(request_a.ends_with(":1"));
+    assert!(request_b.ends_with(":1"));
+
+    runtime_a
+        .respond_to_request(&request_a, "accept")
+        .await
+        .expect("first response");
+    runtime_b
+        .respond_to_request(&request_b, "decline")
+        .await
+        .expect("second response");
+    let response_a =
+        read_scripted_message(&mut BufReader::new(&mut peer_a.stdin), &mut peer_a.stdout).await;
+    let response_b =
+        read_scripted_message(&mut BufReader::new(&mut peer_b.stdin), &mut peer_b.stdout).await;
+    assert_eq!(response_a["id"], json!(1));
+    assert_eq!(response_a["result"]["decision"], "accept");
+    assert_eq!(response_b["id"], json!("1"));
+    assert_eq!(response_b["result"]["decision"], "decline");
 }
 
 #[tokio::test]
@@ -10257,16 +10316,23 @@ async fn codex_runtime_covers_auto_edit_resume_requests_and_stream_edges() {
         .await
         .expect("file turn");
     let file_request = next_codex_event_matching(&runtime, |event| {
-        event.request_id.as_deref() == Some("approval:6001")
+        event.event_type == "request.opened"
+            && event.payload["requestType"] == "file_change_approval"
     })
     .await;
+    let file_request_id = file_request
+        .request_id
+        .as_deref()
+        .expect("file approval id");
+    assert!(file_request_id.starts_with("approval:"));
+    assert!(file_request_id.ends_with(":6001"));
     assert_eq!(
         file_request.payload["requestType"],
         json!("file_change_approval")
     );
     assert_eq!(file_request.payload["detail"], "");
     runtime
-        .respond_to_request("approval:6001", "decline")
+        .respond_to_request(file_request_id, "decline")
         .await
         .expect("file decision");
     let failed = next_codex_event_matching(&runtime, |event| {
@@ -10281,17 +10347,19 @@ async fn codex_runtime_covers_auto_edit_resume_requests_and_stream_edges() {
         .send_turn(Some("user input".to_owned()), Vec::new(), None, None)
         .await
         .expect("input turn");
-    let input_request = next_codex_event_matching(&runtime, |event| {
-        event.request_id.as_deref() == Some("user-input:6002")
-    })
-    .await;
+    let input_request =
+        next_codex_event_matching(&runtime, |event| event.event_type == "user-input.requested")
+            .await;
+    let input_request_id = input_request.request_id.as_deref().expect("user input id");
+    assert!(input_request_id.starts_with("user-input:"));
+    assert!(input_request_id.ends_with(":6002"));
     assert_eq!(
         input_request.payload["questions"].as_array().unwrap().len(),
         1
     );
     runtime
         .respond_to_user_input(
-            "user-input:6002",
+            input_request_id,
             json!({
                 "single": "yes",
                 "many": ["a", "b"],
@@ -10301,7 +10369,7 @@ async fn codex_runtime_covers_auto_edit_resume_requests_and_stream_edges() {
         .await
         .expect("input response");
     let resolved = next_codex_event_matching(&runtime, |event| {
-        event.request_id.as_deref() == Some("user-input:6002")
+        event.request_id.as_deref() == Some(input_request_id)
             && event.event_type == "user-input.resolved"
     })
     .await;
@@ -10317,12 +10385,13 @@ async fn codex_runtime_covers_auto_edit_resume_requests_and_stream_edges() {
         )
         .await
         .expect("generic cancellation turn");
-    next_codex_event_matching(&runtime, |event| {
-        event.request_id.as_deref() == Some("user-input:6003")
-    })
-    .await;
+    let cancel_request =
+        next_codex_event_matching(&runtime, |event| event.event_type == "user-input.requested")
+            .await;
+    let cancel_request_id = cancel_request.request_id.as_deref().expect("cancel id");
+    assert!(cancel_request_id.ends_with(":6003"));
     runtime
-        .respond_to_request("user-input:6003", "cancel")
+        .respond_to_request(cancel_request_id, "cancel")
         .await
         .expect("generic cancellation");
 
@@ -10945,6 +11014,14 @@ fn fixture(name: &str) -> Value {
 
 fn stable_fixture(name: &str) -> Vec<RuntimeEventStableView> {
     serde_json::from_value(fixture(name)).expect("stable trace fixture")
+}
+
+fn normalize_request_id(events: &mut [RuntimeEventStableView], actual: &str, fixture_id: &str) {
+    for event in events {
+        if event.request_id.as_deref() == Some(actual) {
+            event.request_id = Some(fixture_id.to_owned());
+        }
+    }
 }
 
 fn fixture_directory() -> PathBuf {
