@@ -1635,7 +1635,10 @@ there (#201). This adds no connection between servers: the local server only
 hands the request to the desktop app's own session, and the app downloads with
 its own credential, scopes and identity checks, exactly as **Download logs**
 does. The local server never learns a remote credential, and no other paired
-device can be asked to pull logs onto this host. Unattended access without the
+device can be asked to pull logs onto this host. Any program running as the
+user can ask, so the prompt says the request comes from a program on this
+computer, not BiBCode, and shows the code that program printed, the
+environment as typed, and the directory it saves in. Unattended access without the
 app is a follow-up (#202). See
 [Observability](../operations/observability.md#from-the-command-line).
 

@@ -47,12 +47,18 @@ for the command prefix that fits the install:
   to that host, fetch its bundle with
   `P' diagnostics download --environment <name or id> --output <dir> --json`,
   where `P'` is this machine's prefix without `profiler` (`bibcode`, or the
-  desktop executable). Tell the user first: the app asks them to approve the
-  request ("Share <name>'s diagnostic logs?"), and it ends unanswered after 2
-  minutes. Add `--include-crash-dumps` only when a dump is needed, and say so.
-  An unknown name fails with the environments the app can reach. Exit 3 means
-  the desktop app is not running here; unattended access without the app is
-  not available yet (#202). Otherwise ask the user to open
+  desktop executable). Tell the user first, and pass on the code the command
+  prints on stderr ("Approve request K7Q-4M in BiBCode…"): the app shows it in
+  its prompt ("Share <name>'s diagnostic logs?") with the name you passed and
+  the output directory, and the user should approve only a matching code. It
+  ends unanswered after 2 minutes; after a denial or no answer, the next
+  request waits 30 s or more (exit 2, `cooling-down`), so ask before retrying.
+  Add `--include-crash-dumps` only when a dump is needed, and say so. An
+  unknown name fails without listing others; ask the user for the name shown
+  in BiBCode. Exit 3 means the desktop app is not running here; when the
+  desktop's primary environment runs in WSL, run `bibcode diagnostics
+  download` inside that distro. Unattended access without the app is not
+  available yet (#202). Otherwise ask the user to open
   **Settings → Diagnostics** in that app, choose the host in **Environment**,
   and use **Download logs** (or **Export bundle**, with **Include crash dumps**
   when a dump is needed). Either way the remote server builds the ZIP itself

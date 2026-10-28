@@ -3179,14 +3179,20 @@ sizes. Cover relevant:
   project-availability **Diagnostics** opens on the unavailable environment;
 - `<desktop exe> diagnostics download --environment <remote label> --output
   <dir> --json` from a terminal on the desktop's machine, with the desktop app
-  connected to the remote: the command prints "Waiting for approval in
-  BiBCode…" and the app shows "Share <label>'s diagnostic logs?". **Share logs**
+  connected to the remote: the command prints "Approve request <code> in
+  BiBCode…" and the app shows "Share <label>'s diagnostic logs?" with "A program
+  running as you on this computer (not BiBCode)…", the same code, the
+  environment as typed, and the output directory; a second window drops its
+  prompt once the first answers. **Share logs**
   saves `<dir>/bibcode-diagnostics-<label>-….zip` whose `manifest.json` names
   the remote, its `storageInstanceId`, and its version, and the command exits 0
   with `"status":"saved"`; a second run that finds a file of the same name
   exits 1 and leaves it untouched. **Deny** (or
-  Esc) exits 2 with `"status":"denied"` and saves nothing; an unknown name exits
-  1 listing the reachable environments, with no prompt; Ctrl-C while the app
+  Esc) exits 2 with `"status":"denied"` and saves nothing, and a request right
+  after it exits 2 with `cooling-down`; an unknown name exits 1 without listing
+  any environment, with no prompt; with BiBCode's primary environment in WSL,
+  the desktop executable exits 3 naming the distro, and `bibcode diagnostics
+  download` inside the distro works; Ctrl-C while the app
   downloads closes the prompt or stops the download; with the app quit, the
   command exits 3;
 - Find in thread on macOS (WKWebView), Linux (WebKitGTK AppImage), and Windows
