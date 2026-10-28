@@ -70,6 +70,8 @@ const h = vi.hoisted(() => {
   return {
     openThreadFindTargets: [] as Array<EventTarget | null>,
     captured: {} as Record<string, unknown>,
+    /** Renders the real ChatComposer and ThreadErrorBanner behind their capturing mocks. */
+    realChildren: false,
     /** The list the mocked timeline hands ChatView through `listRef`, as LegendList does. */
     timelineList: null as unknown,
     atomValuesByKey: new Map<string, unknown>(),
@@ -231,6 +233,23 @@ vi.mock("./device/deviceAvailability", () => ({
   useDevicePreviewsAvailability: () => ({ known: true, supported: true, enabled: false }),
 }));
 
+// What the real ChatComposer reads when `h.realChildren` renders it; ChatView reads none of it.
+vi.mock("./chat/ProviderModelPicker", () => ({
+  ProviderModelPicker: () => <div data-mock="provider-model-picker" />,
+}));
+vi.mock("../state/providerCapabilities", () => ({
+  useProviderCapabilities: () => ({
+    data: { slashCommands: [], skills: [], agents: [], issues: [] },
+    error: null,
+    isPending: false,
+    refresh: () => undefined,
+    revalidateIfStale: () => undefined,
+  }),
+}));
+vi.mock("../lib/composerPathSearchState", () => ({
+  useComposerPathSearch: () => ({ entries: [], error: null, isPending: false }),
+}));
+
 vi.mock("../state/server", () => ({
   serverEnvironment: {
     upsertKeybinding: { key: "server.upsertKeybinding" },
@@ -341,6 +360,8 @@ vi.mock("../state/environments", () => ({
     environments: h.environments,
   }),
   usePrimaryEnvironment: () => h.primaryEnvironment,
+  // Only the real composer's history menu reads it; null keeps it off the primary-session store.
+  usePrimaryEnvironmentId: () => null,
 }));
 
 vi.mock("../state/terminalSessions", () => ({
@@ -363,6 +384,9 @@ vi.mock("../hooks/useSettings", () => ({
     ) as Record<string, unknown>;
     return selector ? selector(settings) : settings;
   },
+  // Read by the real composer's model picker when `h.realChildren` renders it.
+  useClientSettings: (selector?: (settings: Record<string, unknown>) => unknown) =>
+    selector ? selector(h.settings) : h.settings,
 }));
 
 vi.mock("../assets/assetUrls", () => ({
@@ -440,6 +464,10 @@ vi.mock("@tanstack/react-router", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@tanstack/react-router")>();
   return {
     ...actual,
+    // The real ThreadErrorBanner's Diagnostics link renders outside a router here.
+    Link: ({ to: _to, search: _search, children, ...rest }: Record<string, unknown>) => (
+      <a {...rest}>{children as ReactNode}</a>
+    ),
     useNavigate: () => (options: unknown) => {
       h.navigateCalls.push(options);
       return Promise.resolve();
@@ -460,13 +488,17 @@ vi.mock("./DiffWorkerPoolProvider", () => ({
   ),
 }));
 
-vi.mock("./chat/ChatComposer", () => ({
-  ChatComposer: (props: Record<string, unknown>) => {
-    h.captured["chatComposer"] = props;
-    h.chatComposerProps.push(props);
-    return <div data-mock="chat-composer" />;
-  },
-}));
+vi.mock("./chat/ChatComposer", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./chat/ChatComposer")>();
+  const RealChatComposer = actual.ChatComposer as unknown as (props: object) => ReactNode;
+  return {
+    ChatComposer: (props: Record<string, unknown>) => {
+      h.captured["chatComposer"] = props;
+      h.chatComposerProps.push(props);
+      return h.realChildren ? <RealChatComposer {...props} /> : <div data-mock="chat-composer" />;
+    },
+  };
+});
 
 vi.mock("./chat/threadFind/useThreadFind", () => ({
   openThreadFindForTarget: (target: EventTarget | null) => {
@@ -535,16 +567,21 @@ vi.mock("./chat/ProviderStatusBanner", () => ({
   },
 }));
 
-vi.mock("./chat/ThreadErrorBanner", () => ({
-  ThreadErrorBanner: (props: Record<string, unknown>) => {
-    h.captured["threadErrorBanner"] = props;
-    return (
-      <div data-mock="thread-error-banner">
-        {typeof props["error"] === "string" ? props["error"] : ""}
-      </div>
-    );
-  },
-}));
+vi.mock("./chat/ThreadErrorBanner", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./chat/ThreadErrorBanner")>();
+  const RealThreadErrorBanner = actual.ThreadErrorBanner as unknown as (props: object) => ReactNode;
+  return {
+    ThreadErrorBanner: (props: Record<string, unknown>) => {
+      h.captured["threadErrorBanner"] = props;
+      if (h.realChildren) return <RealThreadErrorBanner {...props} />;
+      return (
+        <div data-mock="thread-error-banner">
+          {typeof props["error"] === "string" ? props["error"] : ""}
+        </div>
+      );
+    },
+  };
+});
 
 vi.mock("./chat/ComposerBannerStack", () => ({
   ComposerBannerStack: (props: Record<string, unknown>) => {
@@ -1009,6 +1046,7 @@ beforeEach(() => {
   attachmentAdmissionOwner.dispose();
   h.openThreadFindTargets.length = 0;
   h.captured = {};
+  h.realChildren = false;
   h.timelineList = null;
   h.atomValuesByKey.clear();
   h.atomValuesByKey.set("atom:keybindings", []);
@@ -7031,5 +7069,216 @@ describe("ChatView send snapshot", () => {
       await act(async () => root.unmount());
       container.remove();
     }
+  });
+});
+
+describe("ChatView long-lived handlers (#204)", () => {
+  const remoteEnvironmentId = EnvironmentId.make("environment-remote");
+  const otherThreadId = ThreadId.make("thread-2");
+  const later = "2026-03-29T00:01:00.000Z";
+  const compactingProvider: ServerProvider = { ...codexProvider, supportsCompaction: true };
+  let container: HTMLDivElement;
+  let root: Root;
+
+  beforeEach(() => {
+    vi.unstubAllGlobals();
+    Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+    Object.defineProperty(Element.prototype, "getAnimations", {
+      configurable: true,
+      value: () => [],
+    });
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+  });
+
+  afterEach(async () => {
+    await act(async () => root.unmount());
+    container.remove();
+  });
+
+  /** A thread whose last turn failed on the context limit, so the banner offers compaction. */
+  function contextLimitThread(overrides: Partial<Thread> = {}): Thread {
+    return makeThread({
+      session: {
+        threadId: overrides.id ?? threadId,
+        status: "ready",
+        providerName: "codex",
+        providerInstanceId: codexInstanceId,
+        runtimeMode: "full-access",
+        activeTurnId: null,
+        lastError: "The conversation is longer than the model's context window.",
+        lastErrorClass: "context_limit",
+        updatedAt: now,
+      },
+      ...overrides,
+    });
+  }
+
+  function seedEnvironments(phase: TestConnectionPresentation["phase"] = "connected"): void {
+    const serverConfig = {
+      providers: [compactingProvider],
+      environment: {
+        label: "Local",
+        capabilities: { activityProtocolVersion: 2 as const, worktreeCatalog: true },
+      },
+    };
+    const local = makeEnvironmentPresentation({
+      serverConfig,
+      connection: { phase, error: null, traceId: null },
+    });
+    const remote = makeEnvironmentPresentation({
+      environmentId: remoteEnvironmentId,
+      label: "Remote",
+      serverConfig: {
+        ...serverConfig,
+        environment: { ...serverConfig.environment, label: "Remote" },
+      },
+    });
+    h.environments = [local, remote];
+    h.primaryEnvironment = local;
+  }
+
+  function seedThreads(threads: ReadonlyArray<Thread>): void {
+    for (const thread of threads) {
+      h.threadsByKey.set(`${thread.environmentId}:${thread.id}`, thread);
+      h.projectsByKey.set(
+        `${thread.environmentId}:${projectId}`,
+        makeProject({ environmentId: thread.environmentId }),
+      );
+    }
+    h.allProjects = [makeProject()];
+    h.threadRefs = threads.map((thread) => scopeThreadRef(thread.environmentId, thread.id));
+    h.queryDataByKey.set("vcs.status", { isRepo: true });
+  }
+
+  const renderRoute = (routeEnvironmentId: EnvironmentId, routeThreadId: ThreadId) =>
+    act(async () =>
+      root.render(
+        <ChatView environmentId={routeEnvironmentId} threadId={routeThreadId} routeKind="server" />,
+      ),
+    );
+
+  const bannerError = () =>
+    (capturedProps<Record<string, unknown>>("threadErrorBanner")["error"] as string | null) ?? null;
+
+  const compactAction = () =>
+    capturedProps<Record<string, unknown>>("threadErrorBanner")["action"] as {
+      readonly onClick: () => void;
+    } | null;
+
+  /** Holds the next compaction until the returned function fails it with `message`. */
+  function holdCompaction(message: string): () => Promise<void> {
+    let fail!: () => void;
+    h.commandResults["thread.compact"] = () =>
+      new Promise((resolve) => {
+        fail = () => resolve(AsyncResult.failure(Cause.fail(new Error(message))));
+      });
+    return async () => {
+      await act(async () => {
+        fail();
+        await Promise.resolve();
+      });
+    };
+  }
+
+  it("keeps one setThreadError for the composer and writes where the latest route shows", async () => {
+    seedEnvironments();
+    seedThreads([makeThread()]);
+    await renderRoute(environmentId, threadId);
+    const first = capturedProps<Record<string, unknown>>("chatComposer")["setThreadError"];
+
+    // What a changed reconnect gives ChatView: the connection drops and comes back with a new
+    // thread object.
+    seedEnvironments("reconnecting");
+    await renderRoute(environmentId, threadId);
+    seedEnvironments("connected");
+    seedThreads([makeThread({ title: "Renamed while away", updatedAt: later })]);
+    await renderRoute(environmentId, threadId);
+
+    expect(new Set(h.chatComposerProps.map((props) => props["setThreadError"]))).toEqual(
+      new Set([first]),
+    );
+    await act(async () => {
+      (first as (id: ThreadId, error: string | null) => void)(threadId, "empty.txt is empty.");
+    });
+    expect(bannerError()).toBe("empty.txt is empty.");
+  });
+
+  it("keeps the compact action across a changed render and a failure on its thread after a route switch", async () => {
+    seedEnvironments();
+    seedThreads([contextLimitThread(), makeThread({ id: otherThreadId })]);
+    const failCompaction = holdCompaction("Compaction refused.");
+    await renderRoute(environmentId, threadId);
+    const action = compactAction();
+    expect(action).not.toBeNull();
+    seedThreads([contextLimitThread({ updatedAt: later }), makeThread({ id: otherThreadId })]);
+    await renderRoute(environmentId, threadId);
+    expect(compactAction()).toBe(action);
+
+    await act(async () => action!.onClick());
+    expect(h.commandCalls.filter((call) => call.key === "thread.compact")).toEqual([
+      { key: "thread.compact", input: { environmentId, input: { threadId } } },
+    ]);
+    await renderRoute(environmentId, otherThreadId);
+    await failCompaction();
+
+    expect(bannerError()).toBeNull();
+    await renderRoute(environmentId, threadId);
+    expect(bannerError()).toBe("Compaction refused.");
+  });
+
+  it("compacts from the real banner button and sends from the real composer form after a changed render", async () => {
+    h.realChildren = true;
+    seedEnvironments();
+    seedThreads([contextLimitThread()]);
+    useComposerDraftStore.getState().setPrompt(threadRef, "continue after compacting");
+    publishSeededStoreState(useComposerDraftStore);
+    await renderRoute(environmentId, threadId);
+    seedEnvironments("reconnecting");
+    await renderRoute(environmentId, threadId);
+    seedEnvironments("connected");
+    seedThreads([contextLimitThread({ updatedAt: later })]);
+    await renderRoute(environmentId, threadId);
+
+    const compactButton = [...container.querySelectorAll("button")].find(
+      (button) => button.textContent === "Compact conversation",
+    );
+    expect(compactButton).toBeDefined();
+    await act(async () => compactButton!.click());
+    expect(h.commandCalls.filter((call) => call.key === "thread.compact")).toEqual([
+      { key: "thread.compact", input: { environmentId, input: { threadId } } },
+    ]);
+
+    const form = container.querySelector("form");
+    expect(form).not.toBeNull();
+    await act(async () => {
+      form!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    });
+    await vi.waitFor(() =>
+      expect(h.commandCalls.filter((call) => call.key === "thread.startTurn")).toHaveLength(1),
+    );
+    const sent = h.commandCalls.find((call) => call.key === "thread.startTurn")!.input as {
+      readonly environmentId: EnvironmentId;
+      readonly input: { readonly threadId: ThreadId; readonly message: { readonly text: string } };
+    };
+    expect(sent.environmentId).toBe(environmentId);
+    expect(sent.input.threadId).toBe(threadId);
+    expect(sent.input.message.text).toBe("continue after compacting");
+  });
+
+  it("keeps a compaction failure on its environment's thread after a switch to another environment", async () => {
+    seedEnvironments();
+    seedThreads([contextLimitThread(), makeThread({ environmentId: remoteEnvironmentId })]);
+    const failCompaction = holdCompaction("Compaction refused.");
+    await renderRoute(environmentId, threadId);
+    await act(async () => compactAction()!.onClick());
+
+    await renderRoute(remoteEnvironmentId, threadId);
+    await failCompaction();
+
+    expect(bannerError()).toBeNull();
+    await renderRoute(environmentId, threadId);
+    expect(bannerError()).toBe("Compaction refused.");
   });
 });

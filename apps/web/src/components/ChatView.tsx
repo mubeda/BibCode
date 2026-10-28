@@ -164,6 +164,7 @@ import {
 import { useTurnDiffSummaries } from "../hooks/useTurnDiffSummaries";
 import { isCommandPaletteOpen } from "../commandPaletteContext";
 import { buildTemporaryWorktreeBranchName } from "@bibcode/shared/git";
+import { useLatestHandler } from "../hooks/useLatestHandler";
 import { useMediaQuery } from "../hooks/useMediaQuery";
 import { resolveProviderSessionSelectionForInstance } from "../providerSessionSelection";
 import { formatProviderSlugLabel } from "../providerModels";
@@ -502,6 +503,12 @@ type EnvironmentUnavailableState = {
 
 const WORKSPACE_UNAVAILABLE_REASON =
   "Workspace unavailable. Retry detection or remove it from BiBCode.";
+
+/**
+ * Where a thread error is shown: a server thread's errors by its environment-scoped key, a
+ * draft's by its draft id (or thread id).
+ */
+type ThreadErrorTarget = { readonly store: "server" | "draft"; readonly key: string };
 
 type ThreadPlanCatalogEntry = Pick<Thread, "id" | "proposedPlans">;
 
@@ -1771,7 +1778,9 @@ function ChatViewContent(props: ChatViewProps) {
    * what the composer banner shows. Returns true when it refused. Nothing is queued: the
    * draft, the question and its answers stay as they are for the person to resend (#199).
    */
-  const refuseWhileEnvironmentUnavailable = useCallback((): boolean => {
+  // A latest handler: it and onCompactConversation, recreated at different renders, held each
+  // other's older ChatView renders across every changed reconnect (#204).
+  const refuseWhileEnvironmentUnavailable = useLatestHandler((): boolean => {
     if (!activeEnvironmentUnavailableState || environmentRefusalKey === null) return false;
     // A repeat while the refusal is still on screen (key repeat, a second click) adds nothing.
     if (environmentRefusalToastRef.current !== null) return true;
@@ -1786,7 +1795,7 @@ function ChatViewContent(props: ChatViewProps) {
     });
     environmentRefusalToastRef.current = { id: toastId, key: environmentRefusalKey };
     return true;
-  }, [activeEnvironmentUnavailableState, environmentRefusalKey]);
+  });
   useEffect(() => {
     const open = environmentRefusalToastRef.current;
     if (open === null || open.key === environmentRefusalKey) return;
@@ -2757,39 +2766,46 @@ function ChatViewContent(props: ChatViewProps) {
       (activeThread.session !== null && activeThread.session.status !== "stopped")),
   );
 
-  const setThreadError = useCallback(
-    (targetThreadId: ThreadId | null, error: string | null) => {
-      if (!targetThreadId) return;
-      const nextError = sanitizeThreadErrorMessage(error);
+  // Thread errors go through latest handlers (#204): a memoized setter recreated with the route
+  // chained old ChatView renders through every callback that held it. The route decides where
+  // an error is shown, so an operation that awaits resolves its target before the first await
+  // and writes there; a thread switch or reconnect meanwhile cannot redirect its error.
+  const resolveThreadErrorTarget = useLatestHandler(
+    (targetThreadId: ThreadId | null): ThreadErrorTarget | null => {
+      if (!targetThreadId) return null;
       if (
         serverThread &&
         targetThreadId === routeThreadRef.threadId &&
         serverThread.environmentId === routeThreadRef.environmentId &&
         serverThread.id === targetThreadId
       ) {
-        setLocalServerErrorsByThreadKey((existing) => {
-          if ((existing[routeThreadKey] ?? null) === nextError) {
-            return existing;
-          }
-          return {
-            ...existing,
-            [routeThreadKey]: nextError,
-          };
-        });
-        return;
+        return { store: "server", key: routeThreadKey };
       }
-      const localDraftErrorKey = draftId ?? targetThreadId;
-      setLocalDraftErrorsByDraftId((existing) => {
-        if ((existing[localDraftErrorKey] ?? null) === nextError) {
+      return { store: "draft", key: draftId ?? targetThreadId };
+    },
+  );
+  const writeThreadError = useLatestHandler(
+    (target: ThreadErrorTarget | null, error: string | null) => {
+      if (target === null) return;
+      const nextError = sanitizeThreadErrorMessage(error);
+      const setErrors =
+        target.store === "server" ? setLocalServerErrorsByThreadKey : setLocalDraftErrorsByDraftId;
+      setErrors((existing) => {
+        if ((existing[target.key] ?? null) === nextError) {
           return existing;
         }
         return {
           ...existing,
-          [localDraftErrorKey]: nextError,
+          [target.key]: nextError,
         };
       });
     },
-    [draftId, routeThreadKey, routeThreadRef, serverThread],
+  );
+  /** Sets a thread's error where the current route shows it; for synchronous callers. */
+  const setThreadError = useLatestHandler(
+    (targetThreadId: ThreadId | null, error: string | null) => {
+      writeThreadError(resolveThreadErrorTarget(targetThreadId), error);
+    },
   );
 
   const focusComposer = useCallback(() => {
@@ -4472,18 +4488,17 @@ function ChatViewContent(props: ChatViewProps) {
     );
     void openCenterTerminal({ type: "tab", groupId: focusedGroup.id });
   }, [activeThreadRef, openCenterTerminal]);
-  const handleOpenProviderTerminalPanel = useCallback(
-    (action: ProviderTerminalAction) => {
-      const focusedGroup = selectFocusedCenterPanelGroup(
-        selectThreadCenterPanelState(useCenterPanelStore.getState().byThreadKey, activeThreadRef),
-      );
-      void openCenterTerminal(
-        { type: "tab", groupId: focusedGroup.id },
-        { label: action.label, command: action.command },
-      );
-    },
-    [activeThreadRef, openCenterTerminal],
-  );
+  // A latest handler: it and getActiveTimelineTurnMetrics, recreated at different renders, held
+  // each other's older ChatView renders across every changed reconnect (#204).
+  const handleOpenProviderTerminalPanel = useLatestHandler((action: ProviderTerminalAction) => {
+    const focusedGroup = selectFocusedCenterPanelGroup(
+      selectThreadCenterPanelState(useCenterPanelStore.getState().byThreadKey, activeThreadRef),
+    );
+    void openCenterTerminal(
+      { type: "tab", groupId: focusedGroup.id },
+      { label: action.label, command: action.command },
+    );
+  });
   const runProjectScript = useCallback(
     async (
       script: ProjectScript,
@@ -4503,6 +4518,8 @@ function ChatViewContent(props: ChatViewProps) {
         readWorkspaceUnavailable()
       )
         return;
+      // Resolved before the first await: a failure lands on the thread it was for.
+      const errorTarget = resolveThreadErrorTarget(activeThreadId);
       if (options?.rememberAsLastInvoked !== false) {
         setLastInvokedScriptByProjectId((current) => {
           if (current[activeProject.id] === script.id) return current;
@@ -4562,8 +4579,8 @@ function ChatViewContent(props: ChatViewProps) {
         if (openResult._tag === "Failure") {
           if (!isAtomCommandInterrupted(openResult)) {
             const error = squashAtomCommandFailure(openResult);
-            setThreadError(
-              activeThreadId,
+            writeThreadError(
+              errorTarget,
               error instanceof Error ? error.message : `Failed to run script "${script.name}".`,
             );
           }
@@ -4586,7 +4603,7 @@ function ChatViewContent(props: ChatViewProps) {
         );
         if (creationResult.status !== "opened") {
           if (!(creationResult.status === "failed" && creationResult.interrupted === true)) {
-            setThreadError(activeThreadId, creationResult.reason);
+            writeThreadError(errorTarget, creationResult.reason);
           }
           return;
         }
@@ -4607,8 +4624,8 @@ function ChatViewContent(props: ChatViewProps) {
             input: { threadId: activeThreadId, terminalId: targetTerminalId, data },
           }),
         onWriteError: (error) => {
-          setThreadError(
-            activeThreadId,
+          writeThreadError(
+            errorTarget,
             error instanceof Error ? error.message : `Failed to run script "${script.name}".`,
           );
         },
@@ -4627,7 +4644,8 @@ function ChatViewContent(props: ChatViewProps) {
       readWorkspaceUnavailable,
       runningTerminalIds,
       setLastInvokedScriptByProjectId,
-      setThreadError,
+      resolveThreadErrorTarget,
+      writeThreadError,
       resolvedTheme,
       settings.terminalThemePreference,
       writeTerminal,
@@ -4842,16 +4860,18 @@ function ChatViewContent(props: ChatViewProps) {
     async (turnCount: number) => {
       const localApi = readLocalApi();
       if (!localApi || !activeThread || isRevertingCheckpoint) return;
+      // Resolved before the first await: a failure lands on the thread it was for.
+      const errorTarget = resolveThreadErrorTarget(activeThread.id);
 
       if (activeEnvironmentUnavailable && activeEnvironmentUnavailableLabel) {
-        setThreadError(
-          activeThread.id,
+        writeThreadError(
+          errorTarget,
           `Reconnect ${activeEnvironmentUnavailableLabel} before reverting checkpoints.`,
         );
         return;
       }
       if (phase === "running" || isSendBusy || isConnecting) {
-        setThreadError(activeThread.id, "Interrupt the current turn before reverting checkpoints.");
+        writeThreadError(errorTarget, "Interrupt the current turn before reverting checkpoints.");
         return;
       }
       const confirmed = await localApi.dialogs.confirm(
@@ -4865,7 +4885,7 @@ function ChatViewContent(props: ChatViewProps) {
       }
 
       setIsRevertingCheckpoint(true);
-      setThreadError(activeThread.id, null);
+      writeThreadError(errorTarget, null);
       const result = await revertThreadCheckpoint({
         environmentId,
         input: {
@@ -4875,8 +4895,8 @@ function ChatViewContent(props: ChatViewProps) {
       });
       if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
         const error = squashAtomCommandFailure(result);
-        setThreadError(
-          activeThread.id,
+        writeThreadError(
+          errorTarget,
           error instanceof Error ? error.message : "Failed to revert thread state.",
         );
       }
@@ -4893,13 +4913,16 @@ function ChatViewContent(props: ChatViewProps) {
       isSendBusy,
       phase,
       revertThreadCheckpoint,
-      setThreadError,
+      resolveThreadErrorTarget,
+      writeThreadError,
     ],
   );
 
   const onResolveTurnDelivery = useCallback(
     async (messageId: MessageId, action: TurnDeliveryResolutionAction) => {
       if (!activeThread || resolvingTurnDeliveryMessageId === messageId) return;
+      // Resolved before the first await: a failure lands on the thread it was for.
+      const errorTarget = resolveThreadErrorTarget(activeThread.id);
       const delivery = activeThread.messages.find((message) => message.id === messageId)?.delivery;
       if (!delivery || (delivery.state !== "uncertain" && delivery.state !== "failed")) return;
 
@@ -4918,15 +4941,15 @@ function ChatViewContent(props: ChatViewProps) {
       }
 
       setResolvingTurnDeliveryMessageId(messageId);
-      setThreadError(activeThread.id, null);
+      writeThreadError(errorTarget, null);
       const result = await resolveTurnDelivery({
         environmentId,
         input: { threadId: activeThread.id, messageId, action },
       });
       if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
         const error = squashAtomCommandFailure(result);
-        setThreadError(
-          activeThread.id,
+        writeThreadError(
+          errorTarget,
           error instanceof Error ? error.message : "Failed to resolve message delivery.",
         );
       }
@@ -4939,7 +4962,8 @@ function ChatViewContent(props: ChatViewProps) {
       resolvingTurnDeliveryMessageId,
       instanceLabels,
       setResolvingTurnDeliveryMessageId,
-      setThreadError,
+      resolveThreadErrorTarget,
+      writeThreadError,
     ],
   );
 
@@ -5154,6 +5178,8 @@ function ChatViewContent(props: ChatViewProps) {
       compacting: compaction !== undefined,
     });
     if (!activeThread) return;
+    // Resolved before the first await: a failure lands on the thread it was for.
+    const errorTarget = resolveThreadErrorTarget(activeThread.id);
     // Enter and the mobile Send reach here without a disabled button to explain the refusal.
     // Moving between a question's steps stays local; its final answer refuses on its own. A
     // provider binding conflict keeps precedence (the composer names it), and an Enter that
@@ -5187,8 +5213,8 @@ function ChatViewContent(props: ChatViewProps) {
       const authorizeAttempt = async () => {
         const result = await readAttachmentAdmissionAuthority({ environmentId, input: undefined });
         if (result._tag === "Failure") {
-          setThreadError(
-            activeThread.id,
+          writeThreadError(
+            errorTarget,
             "Reconnect to the original environment before confirming this send. Your draft was kept.",
           );
           return false;
@@ -5198,15 +5224,15 @@ function ChatViewContent(props: ChatViewProps) {
             attachmentAuthorityChecked = true;
             return true;
           }
-          setThreadError(
-            activeThread.id,
+          writeThreadError(
+            errorTarget,
             "The original server cannot identify its data store. Update it before confirming this send; your draft was kept.",
           );
           return false;
         }
         if (!attachmentAdmissionOwner.authorize(routeThreadRef, sendLease, result.value)) {
-          setThreadError(
-            activeThread.id,
+          writeThreadError(
+            errorTarget,
             "An earlier send belongs to another host or data store. Reconnect to the original environment before sending another copy.",
           );
           return false;
@@ -5265,7 +5291,7 @@ function ChatViewContent(props: ChatViewProps) {
                   }),
                 );
               }
-              setThreadError(activeThread.id, null);
+              writeThreadError(errorTarget, null);
             }
           } else {
             const error = squashAtomCommandFailure(result);
@@ -5274,8 +5300,8 @@ function ChatViewContent(props: ChatViewProps) {
               void releaseStagedAttachments({ environmentId, input: retained.attachments });
             }
             if (currentQueueThreadKeyRef.current === routeThreadKey)
-              setThreadError(
-                activeThread.id,
+              writeThreadError(
+                errorTarget,
                 isUploadError(error) && error.reason === "not_found"
                   ? "The earlier send was not accepted and its upload is no longer available. Your draft is unchanged; send it again."
                   : "Could not confirm the earlier send. Your draft is unchanged; reconnect and send again to check it before uploading another copy.",
@@ -5421,10 +5447,7 @@ function ChatViewContent(props: ChatViewProps) {
       const shouldCreateWorktree =
         isFirstMessage && sendEnvMode === "worktree" && !activeThread.worktreePath;
       if (shouldCreateWorktree && !activeThreadBranch) {
-        setThreadError(
-          threadIdForSend,
-          "Select a base branch before sending in New worktree mode.",
-        );
+        writeThreadError(errorTarget, "Select a base branch before sending in New worktree mode.");
         return;
       }
 
@@ -5649,7 +5672,7 @@ function ChatViewContent(props: ChatViewProps) {
           },
         ]);
       }
-      setThreadError(threadIdForSend, null);
+      writeThreadError(errorTarget, null);
       if (expiredTerminalContextCount > 0) {
         const toastCopy = buildExpiredTerminalContextToastCopy(
           expiredTerminalContextCount,
@@ -5878,8 +5901,8 @@ function ChatViewContent(props: ChatViewProps) {
             isUploadEnvironmentUnavailableError(error)
               ? error.message.replace(/\.$/u, "")
               : null;
-          setThreadError(
-            threadIdForSend,
+          writeThreadError(
+            errorTarget,
             stagingFailed
               ? attachmentUploadFailureCopy(uploadFileName, safeCause)
               : error instanceof Error
@@ -5927,6 +5950,9 @@ function ChatViewContent(props: ChatViewProps) {
 
   const onInterrupt = async () => {
     if (!activeThread || stoppingQueueRef.current) return;
+    // Resolved before the first await: a failure lands on the thread it was for.
+    const errorTarget = resolveThreadErrorTarget(activeThread.id);
+    const deliveryErrorTarget = resolveThreadErrorTarget(cancellableDeliveryThreadId);
     stoppingQueueRef.current = true;
     try {
       for (const message of queuedMessages) {
@@ -5949,8 +5975,8 @@ function ChatViewContent(props: ChatViewProps) {
         });
         if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
           const error = squashAtomCommandFailure(result);
-          setThreadError(
-            cancellableDeliveryThreadId,
+          writeThreadError(
+            deliveryErrorTarget,
             error instanceof Error ? error.message : "Failed to cancel message delivery.",
           );
         } else {
@@ -5964,8 +5990,8 @@ function ChatViewContent(props: ChatViewProps) {
       });
       if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
         const error = squashAtomCommandFailure(result);
-        setThreadError(
-          activeThread.id,
+        writeThreadError(
+          errorTarget,
           error instanceof Error ? error.message : "Failed to interrupt the current turn.",
         );
       }
@@ -5979,6 +6005,8 @@ function ChatViewContent(props: ChatViewProps) {
       if (!activeThreadId) return;
       // The request stays on screen to answer once the environment is back.
       if (refuseWhileEnvironmentUnavailable()) return;
+      // Resolved before the first await: a failure lands on the thread it was for.
+      const errorTarget = resolveThreadErrorTarget(activeThreadId);
 
       setRespondingRequestIds((existing) =>
         existing.includes(requestId) ? existing : [...existing, requestId],
@@ -5999,8 +6027,8 @@ function ChatViewContent(props: ChatViewProps) {
             });
       if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
         const error = squashAtomCommandFailure(result);
-        setThreadError(
-          activeThreadId,
+        writeThreadError(
+          errorTarget,
           error instanceof Error
             ? error.message
             : decision === "cancel"
@@ -6018,7 +6046,8 @@ function ChatViewContent(props: ChatViewProps) {
       interruptThreadTurn,
       refuseWhileEnvironmentUnavailable,
       respondToThreadApproval,
-      setThreadError,
+      resolveThreadErrorTarget,
+      writeThreadError,
     ],
   );
 
@@ -6027,6 +6056,8 @@ function ChatViewContent(props: ChatViewProps) {
       if (!activeThreadId) return;
       // Also reached by the option's timed advance: the question and its answers stay put.
       if (refuseWhileEnvironmentUnavailable()) return;
+      // Resolved before the first await: a failure lands on the thread it was for.
+      const errorTarget = resolveThreadErrorTarget(activeThreadId);
 
       setRespondingUserInputRequestIds((existing) =>
         existing.includes(requestId) ? existing : [...existing, requestId],
@@ -6041,8 +6072,8 @@ function ChatViewContent(props: ChatViewProps) {
       });
       if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
         const error = squashAtomCommandFailure(result);
-        setThreadError(
-          activeThreadId,
+        writeThreadError(
+          errorTarget,
           error instanceof Error ? error.message : "Failed to submit user input.",
         );
       }
@@ -6054,7 +6085,8 @@ function ChatViewContent(props: ChatViewProps) {
       environmentId,
       refuseWhileEnvironmentUnavailable,
       respondToThreadUserInput,
-      setThreadError,
+      resolveThreadErrorTarget,
+      writeThreadError,
     ],
   );
 
@@ -6200,6 +6232,8 @@ function ChatViewContent(props: ChatViewProps) {
       } = sendCtx;
 
       const threadIdForSend = activeThread.id;
+      // Resolved before the first await: a failure lands on the thread it was for.
+      const errorTarget = resolveThreadErrorTarget(threadIdForSend);
       // Implement switches the draft to default mode before its turn starts; a follow-up that
       // does not start puts the mode back, so the plan's Implement and Refine are offered again.
       const interactionModeBeforeFollowUp = interactionMode;
@@ -6219,7 +6253,7 @@ function ChatViewContent(props: ChatViewProps) {
         threadId: threadIdForSend,
         messageId: messageIdForSend,
       });
-      setThreadError(threadIdForSend, null);
+      writeThreadError(errorTarget, null);
 
       // Position this sent row once LegendList has measured the anchored tail.
       isAtEndRef.current = true;
@@ -6320,8 +6354,8 @@ function ChatViewContent(props: ChatViewProps) {
       }
       if (!isAtomCommandInterrupted(failure)) {
         const error = squashAtomCommandFailure(failure);
-        setThreadError(
-          threadIdForSend,
+        writeThreadError(
+          errorTarget,
           error instanceof Error ? error.message : "Failed to send plan follow-up.",
         );
       }
@@ -6342,7 +6376,8 @@ function ChatViewContent(props: ChatViewProps) {
       resetLocalDispatch,
       runtimeMode,
       setComposerDraftInteractionMode,
-      setThreadError,
+      resolveThreadErrorTarget,
+      writeThreadError,
       startThreadTurn,
       autoOpenPlanSidebar,
       environmentId,
@@ -6355,21 +6390,23 @@ function ChatViewContent(props: ChatViewProps) {
   // (an older server, or a provider without the capability) it sends the provider's compaction
   // command to the same session as an ordinary message, delivered, queued and confirmed like any
   // other. Neither resends the failed message; the user does that once the compaction finishes.
-  const onCompactConversation = useCallback(async () => {
+  const onCompactConversation = useLatestHandler(async () => {
     if (!activeThread || !isServerThread || isSendBusy || isConnecting || sendInFlightRef.current) {
       return;
     }
+    // Resolved before the first await: a failure lands on the thread it was for.
+    const errorTarget = resolveThreadErrorTarget(activeThread.id);
     if (supportsCompaction) {
       const threadIdForCompaction = activeThread.id;
-      setThreadError(threadIdForCompaction, null);
+      writeThreadError(errorTarget, null);
       const result = await compactThread({
         environmentId,
         input: { threadId: threadIdForCompaction },
       });
       if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
         const error = squashAtomCommandFailure(result);
-        setThreadError(
-          threadIdForCompaction,
+        writeThreadError(
+          errorTarget,
           error instanceof Error ? error.message : "BiBCode could not compact the conversation.",
         );
       }
@@ -6388,7 +6425,7 @@ function ChatViewContent(props: ChatViewProps) {
       threadId: threadIdForSend,
       messageId: messageIdForSend,
     });
-    setThreadError(threadIdForSend, null);
+    writeThreadError(errorTarget, null);
     setOptimisticUserMessages((existing) => [
       ...existing,
       {
@@ -6427,28 +6464,13 @@ function ChatViewContent(props: ChatViewProps) {
     );
     if (!isAtomCommandInterrupted(startResult)) {
       const error = squashAtomCommandFailure(startResult);
-      setThreadError(
-        threadIdForSend,
+      writeThreadError(
+        errorTarget,
         error instanceof Error ? error.message : "BiBCode could not send /compact.",
       );
     }
     resetLocalDispatch();
-  }, [
-    activeThread,
-    beginLocalDispatch,
-    compactThread,
-    composerRef,
-    environmentId,
-    interactionMode,
-    isConnecting,
-    isSendBusy,
-    isServerThread,
-    resetLocalDispatch,
-    runtimeMode,
-    setThreadError,
-    startThreadTurn,
-    supportsCompaction,
-  ]);
+  });
   const threadErrorCompact =
     threadError === null || !isServerThread
       ? null
