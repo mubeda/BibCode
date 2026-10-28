@@ -107,7 +107,10 @@ const h = vi.hoisted(() => {
         "data-mock": name,
       };
       const domProps = new Set([
+        "aria-current",
+        "aria-describedby",
         "aria-label",
+        "aria-labelledby",
         "autoFocus",
         "className",
         "disabled",
