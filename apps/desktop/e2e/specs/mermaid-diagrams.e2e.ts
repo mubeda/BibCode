@@ -31,6 +31,24 @@ const fileViewSelector = "[data-preview-panel-mode]";
 interface EndSample {
   readonly at: number;
   readonly bottom: number | null;
+  /** Diagnostic: the list's scroll metrics and the bottom region on this sample. */
+  readonly diag?: {
+    readonly scrollTop: number;
+    readonly scrollHeight: number;
+    readonly clientHeight: number;
+    readonly scrollerBottom: number;
+    readonly overlayTop: number | null;
+    readonly overlayHeight: number | null;
+    readonly paddingBottom: string;
+    readonly contentHeight: number | null;
+    readonly contentPaddingBottom: string | null;
+  } | null;
+  /**
+   * How far the last line ends below the usable bottom (the visible bottom or the composer
+   * overlay's top, whichever is higher). The bottom region can grow after the chat opens, when
+   * its Activity card arrives, and the end then moves up with it.
+   */
+  readonly belowUsable: number | null;
   /** The last line is inside the list's visible area. */
   readonly visible: boolean;
   /** How far the list is scrolled from its end. */
@@ -393,6 +411,70 @@ const DRAW_FOLLOW_MS = 200;
 /** The `viewOffset` the timeline minimap scrolls a selected message to. */
 const MINIMAP_VIEW_OFFSET = 24;
 
+/** The sent row and its turn on one painted frame, for the sent-row check. */
+interface SentRowFrame {
+  readonly at: number;
+  /** Where the sent row starts below the visible top. */
+  readonly top: number;
+  /** Whether the turn, from the sent row to its end, fits above the bottom region. */
+  readonly turnFits: boolean;
+  /** How far the turn's end lies below the usable bottom; zero or less when it shows. */
+  readonly endBelow: number;
+  readonly scrollTop: number;
+  readonly overlayHeight: number;
+}
+
+/** Samples the newest row sent as `prompt` and its turn's end on `frames` painted frames. */
+async function sampleSentRow(prompt: string, frames: number): Promise<SentRowFrame[]> {
+  return browser.executeAsync(
+    (surface: string, sent: string, count: number, done: (frames: SentRowFrame[]) => void) => {
+      const started = performance.now();
+      const samples: SentRowFrame[] = [];
+      const read = (): SentRowFrame | null => {
+        const scroller = document.querySelector<HTMLElement>(
+          `${surface} [class*='overflow-anchor']`,
+        );
+        const row = [
+          ...document.querySelectorAll<HTMLElement>(`${surface} [data-message-role="user"]`),
+        ]
+          .filter((element) => element.textContent?.includes(sent))
+          .sort((a, b) => b.getBoundingClientRect().top - a.getBoundingClientRect().top)[0];
+        const overlay = document.querySelector<HTMLElement>(
+          `${surface} [data-chat-composer-overlay="true"]`,
+        );
+        if (!scroller || !row || !overlay) return null;
+        const area = scroller.getBoundingClientRect();
+        const rowTop = row.getBoundingClientRect().top;
+        const end = Math.max(
+          ...[
+            ...scroller.querySelectorAll<HTMLElement>(".chat-markdown p, .chat-markdown-codeblock"),
+          ].map((block) => block.getBoundingClientRect().bottom),
+        );
+        const usableBottom = Math.min(area.bottom, overlay.getBoundingClientRect().top);
+        return {
+          at: Math.round(performance.now() - started),
+          top: Math.round(rowTop - area.top),
+          turnFits: end - rowTop <= usableBottom - area.top - 16,
+          endBelow: Math.round(end - usableBottom),
+          scrollTop: Math.round(scroller.scrollTop),
+          overlayHeight: Math.round(overlay.getBoundingClientRect().height),
+        };
+      };
+      const frame = (left: number) =>
+        requestAnimationFrame(() => {
+          const sample = read();
+          if (sample) samples.push(sample);
+          if (left > 1) frame(left - 1);
+          else done(samples);
+        });
+      frame(count);
+    },
+    visibleSurfaceSelector,
+    prompt,
+    frames,
+  );
+}
+
 /** How far below the timeline's visible top each rendered user row sent as `prompt` starts. */
 async function userRowOffsets(prompt: string): Promise<number[]> {
   return browser.execute(
@@ -651,6 +733,69 @@ describe("packaged Mermaid diagrams", () => {
     // it, once the diagram in a reply shorter than the timeline has drawn under it, with the
     // list's size anchoring on. (A reply taller than the timeline scrolls on to reveal its end
     // instead, and a first message has nothing above it to scroll past.)
+    // Diagnostic: every painted frame from before the send, for about 8 s.
+    await browser.execute(
+      (surface: string, sent: string) => {
+        const record = window as unknown as { __bibcodeDiagSwap?: unknown[] };
+        const frames: unknown[] = [];
+        record.__bibcodeDiagSwap = frames;
+        const started = performance.now();
+        const read = () => {
+          const scroller = document.querySelector<HTMLElement>(
+            `${surface} [class*='overflow-anchor']`,
+          );
+          const overlay = document.querySelector<HTMLElement>(
+            `${surface} [data-chat-composer-overlay="true"]`,
+          );
+          if (!scroller) return null;
+          const area = scroller.getBoundingClientRect();
+          const row = [
+            ...document.querySelectorAll<HTMLElement>(`${surface} [data-message-role="user"]`),
+          ]
+            .filter((element) => element.textContent?.includes(sent))
+            .sort((a, b) => b.getBoundingClientRect().top - a.getBoundingClientRect().top)[0];
+          const rows = [...scroller.querySelectorAll<HTMLElement>("[data-timeline-row-id]")]
+            .map((element) => {
+              const box = element.getBoundingClientRect();
+              return {
+                kind: element.getAttribute("data-timeline-row-kind"),
+                top: Math.round(box.top - area.top),
+                height: Math.round(box.height),
+              };
+            })
+            .filter((entry) => entry.top + entry.height > -400 && entry.top < area.height + 400);
+          const content = scroller.firstElementChild as HTMLElement | null;
+          return {
+            at: Math.round(performance.now() - started),
+            rowTop: row ? Math.round(row.getBoundingClientRect().top - area.top) : null,
+            diagrams: [...scroller.querySelectorAll(".chat-markdown-mermaid svg")].filter((svg) =>
+              svg.textContent?.includes("Kept at the top"),
+            ).length,
+            scrollTop: Math.round(scroller.scrollTop),
+            scrollHeight: scroller.scrollHeight,
+            clientHeight: scroller.clientHeight,
+            overlayTop: overlay ? Math.round(overlay.getBoundingClientRect().top - area.top) : null,
+            overlayHeight: overlay ? Math.round(overlay.getBoundingClientRect().height) : null,
+            contentHeight: content ? Math.round(content.getBoundingClientRect().height) : null,
+            contentPaddingBottom: content ? getComputedStyle(content).paddingBottom : null,
+            rows,
+          };
+        };
+        const afterPaint = new MessageChannel();
+        afterPaint.port1.addEventListener("message", () => {
+          const sample = read();
+          if (sample) frames.push(sample);
+        });
+        afterPaint.port1.start();
+        const onFrame = () => {
+          afterPaint.port2.postMessage(null);
+          if (performance.now() - started < 8_000) requestAnimationFrame(onFrame);
+        };
+        requestAnimationFrame(onFrame);
+      },
+      visibleSurfaceSelector,
+      mermaidFixturePrompts.short,
+    );
     await sendPrompt(mermaidFixturePrompts.short);
     await browser.waitUntil(
       () =>
@@ -663,20 +808,36 @@ describe("packaged Mermaid diagrams", () => {
         ),
       { timeoutMsg: "The short fixture reply's diagram never drew." },
     );
-    await browser.pause(600);
-    const sentRows = await userRowOffsets(mermaidFixturePrompts.short);
-    expect(sentRows).toHaveLength(1);
-    const sentRowOff = sentRows[0]! - SENT_ROW_ANCHOR_OFFSET;
-    // Labelled, so a failure says where the row rested and how far off (#191).
+    expect(await userRowOffsets(mermaidFixturePrompts.short)).toHaveLength(1);
+    // Where the sent row and the turn's end rest, on each painted frame for about 600 ms. A turn
+    // that fits the view holds its sent row at the offset (#191). A turn the bottom region makes
+    // taller than the view, such as on a small CI screen with the Activity card above the
+    // composer, follows its end instead, which takes the row above its offset, so there the row
+    // must not rest below the offset and the end must show.
+    const sentRowFrames = await sampleSentRow(mermaidFixturePrompts.short, 36);
+    await browser.pause(1_000);
+    NodeFS.writeFileSync(
+      NodePath.join(preparedArtifactDirectory, "mermaid-timeline-sent-row-diag.json"),
+      JSON.stringify(
+        await browser.execute(
+          () => (window as unknown as { __bibcodeDiagSwap?: unknown[] }).__bibcodeDiagSwap ?? [],
+        ),
+        null,
+        2,
+      ),
+    );
+    NodeFS.writeFileSync(
+      NodePath.join(preparedArtifactDirectory, "mermaid-timeline-sent-row.json"),
+      JSON.stringify(sentRowFrames, null, 2),
+    );
+    const sentRow = sentRowFrames.at(-1)!;
+    // Labelled, so a failure says where the row rested, whether the turn fit, and how far off.
     expect({
-      top: sentRows[0],
-      expected: SENT_ROW_ANCHOR_OFFSET,
-      withinPx: Math.abs(sentRowOff) <= 1,
-    }).toEqual({
-      top: sentRows[0],
-      expected: SENT_ROW_ANCHOR_OFFSET,
-      withinPx: true,
-    });
+      ...sentRow,
+      restsAtOffset: sentRow.turnFits
+        ? Math.abs(sentRow.top - SENT_ROW_ANCHOR_OFFSET) <= 1
+        : sentRow.top <= SENT_ROW_ANCHOR_OFFSET + 1 && sentRow.endBelow <= REVEALED_PX,
+    }).toEqual({ ...sentRow, restsAtOffset: true });
     await saveEvidence("mermaid-timeline-sent-row");
 
     // Minimap navigation still lands where the minimap puts it, past the diagrams above.
@@ -798,6 +959,39 @@ describe("packaged Mermaid diagrams", () => {
         return {
           at: performance.now() - started,
           bottom: paragraph?.getBoundingClientRect().bottom ?? null,
+          diag: (() => {
+            const scroller =
+              paragraph?.closest<HTMLElement>("[class*='overflow-anchor']") ??
+              document.querySelector<HTMLElement>(`${surface} [class*='overflow-anchor']`);
+            const overlay = document.querySelector<HTMLElement>(
+              `${surface} [data-chat-composer-overlay="true"]`,
+            );
+            if (!scroller) return null;
+            const content = scroller.firstElementChild as HTMLElement | null;
+            return {
+              scrollTop: Math.round(scroller.scrollTop),
+              scrollHeight: scroller.scrollHeight,
+              clientHeight: scroller.clientHeight,
+              scrollerBottom: Math.round(scroller.getBoundingClientRect().bottom),
+              overlayTop: overlay ? Math.round(overlay.getBoundingClientRect().top) : null,
+              overlayHeight: overlay ? Math.round(overlay.getBoundingClientRect().height) : null,
+              paddingBottom: getComputedStyle(scroller).paddingBottom,
+              contentHeight: content ? Math.round(content.getBoundingClientRect().height) : null,
+              contentPaddingBottom: content ? getComputedStyle(content).paddingBottom : null,
+            };
+          })(),
+          belowUsable: (() => {
+            const scroller = paragraph?.closest<HTMLElement>("[class*='overflow-anchor']");
+            const overlay = document.querySelector<HTMLElement>(
+              `${surface} [data-chat-composer-overlay="true"]`,
+            );
+            if (!paragraph || !scroller) return null;
+            const usableBottom = Math.min(
+              scroller.getBoundingClientRect().bottom,
+              overlay?.getBoundingClientRect().top ?? Number.POSITIVE_INFINITY,
+            );
+            return Math.round(paragraph.getBoundingClientRect().bottom - usableBottom);
+          })(),
           visible: (() => {
             const scroller = paragraph?.closest<HTMLElement>("[class*='overflow-anchor']");
             if (!paragraph || !scroller) return false;
@@ -876,7 +1070,9 @@ describe("packaged Mermaid diagrams", () => {
           entry.visible !== all[index - 1]!.visible ||
           entry.endGap !== all[index - 1]!.endGap ||
           entry.evictedDrawn !== all[index - 1]!.evictedDrawn ||
-          entry.shown !== all[index - 1]!.shown,
+          entry.shown !== all[index - 1]!.shown ||
+          entry.belowUsable !== all[index - 1]!.belowUsable ||
+          JSON.stringify(entry.diag) !== JSON.stringify(all[index - 1]!.diag),
       );
     const frameSamples = await browser.execute(
       () =>
@@ -890,6 +1086,10 @@ describe("packaged Mermaid diagrams", () => {
         {
           timerSamples: changes(samples.slice(Math.max(0, left - 1))),
           paintedFrameSamples: changes(frameSamples),
+          // Diagnostic: every painted frame from the one before the chat was left.
+          allPaintedFrames: frameSamples.slice(
+            Math.max(0, frameSamples.findIndex((entry) => entry.bottom === null) - 2),
+          ),
         },
         null,
         2,
@@ -901,10 +1101,14 @@ describe("packaged Mermaid diagrams", () => {
     expect(final.visible).toBe(true);
     expect(final.endGap).toBeLessThanOrEqual(1);
     const lastSecond = samples.filter((entry) => entry.at >= final.at - 1_000);
-    expect(lastSecond.every((entry) => Math.abs(entry.bottom! - final.bottom!) <= 1)).toBe(true);
+    expect(
+      lastSecond.every((entry) => Math.abs(entry.belowUsable! - final.belowUsable!) <= 1),
+    ).toBe(true);
     // From the first painted frame of the reopened chat on, every frame shows the last line
-    // where it rests: the evicted diagram keeps its drawn height while it draws again, so the
-    // end does not step as it redraws.
+    // where it rests against the bottom region: the evicted diagram keeps its drawn height while
+    // it draws again, so the end does not step as it redraws. It is held against the bottom
+    // region, not the window, since that region can grow once the reopened chat's Activity card
+    // arrives, and the end then moves up with it in the same frame.
     const leftFrame = frameSamples.findIndex((entry) => entry.bottom === null);
     const reopenedFrame = frameSamples.findIndex(
       (entry, index) => leftFrame >= 0 && index > leftFrame && entry.shown,
@@ -915,8 +1119,8 @@ describe("packaged Mermaid diagrams", () => {
       .filter(
         (entry) =>
           !entry.visible ||
-          entry.bottom === null ||
-          Math.abs(entry.bottom - final.bottom!) > 1 ||
+          entry.belowUsable === null ||
+          Math.abs(entry.belowUsable - final.belowUsable!) > 1 ||
           entry.endGap === null ||
           entry.endGap > 1,
       );
@@ -1064,7 +1268,6 @@ describe("packaged Mermaid diagrams", () => {
     // reply must settle, finish, and paint at least one resting frame after settling, so a
     // webview that painted none still fails instead of passing on what it did not show, and a
     // reply that stays hidden fails on every rest it paints.
-    const plainRests = restingEnds(plain);
     const plainFrom = settledFrom(plain, () => REVEALED_PX);
     const plainSettled = settledRests(plain, plainFrom);
     expect(hiddenRests("plain", plain, plainFrom, plainSettled, () => REVEALED_PX)).toEqual([]);
@@ -1076,9 +1279,16 @@ describe("packaged Mermaid diagrams", () => {
     // next delivery can land first; the draw's delivery then passes when the end shows within
     // DRAW_FOLLOW_MS of the draw.
     const diagramRests = restingEnds(diagram);
+    // Only the plain reply's rests after its own settling are a baseline: before it, a rest can
+    // still be hidden while its sent row glides (1551 px on a slow macOS x64 runner), and taking
+    // that as the diagram reply's allowance settled the diagram reply while its own sent row had
+    // not moved yet. The diagram reply settles once its own end shows.
+    const settledPlainRests = new Map(
+      [...plainSettled].map(([delivered, index]) => [delivered, plain[index]!.endBelow!] as const),
+    );
     const revealedBelow = (delivered: number) =>
-      Math.max(plainRests.get(delivered) ?? 0, 0) + REVEALED_PX;
-    const checkedFrom = settledFrom(diagram, revealedBelow);
+      Math.max(settledPlainRests.get(delivered) ?? 0, 0) + REVEALED_PX;
+    const checkedFrom = settledFrom(diagram, () => REVEALED_PX);
     const drewAfter = diagram[drew]!.afterParagraphs;
     const drawAt = diagram[drew]!.at;
     const drawFollowed = diagram
