@@ -8,7 +8,9 @@
  * Not in the default list; run it alone with
  * `BIBCODE_E2E_SPEC=./specs/manual/composer-connection-drop.e2e.ts vp run test:ui:desktop`.
  * BIBCODE_E2E_DROP_ITERATIONS (default 10) sets the runs per arm. Every run appends one line
- * to `<artifacts>/composer-drop-runs.jsonl` with the recorder's timestamped log.
+ * to `<artifacts>/composer-drop-runs.jsonl` with the recorder's timestamped log, then fails
+ * the test if the typed text is not in the composer once the connection is back: every arm
+ * must keep it since the composer stays editable in every connection phase.
  *
  * The recorder is installed by a page task that returns before any typing, so it observes
  * WebDriver typing instead of overlapping it. It logs editor mutations (text, contenteditable,
@@ -18,6 +20,7 @@
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 
+import { composerDraftStorageKey } from "../../support/connection-drop.ts";
 import {
   readProviderInputLog,
   waitForProviderInputLogEntry,
@@ -148,190 +151,201 @@ async function currentThreadId(): Promise<string> {
 
 /** Installs the recorder (and the socket harness) and returns before anything is typed. */
 async function installRecorder(threadId: string): Promise<void> {
-  await browser.execute((threadId: string) => {
-    type Entry = Record<string, unknown> & { t: number; type: string };
-    const host = window as Window & {
-      __b3fRecorder?: { events: Entry[]; reset: () => void; stop: () => void };
-      __b3fSockets?: { current: WebSocket | null; close: () => boolean };
-    };
-    host.__b3fRecorder?.stop();
-    let t0 = performance.now();
-    const events: Entry[] = [];
-    const log = (type: string, data: Record<string, unknown> = {}) => {
-      events.push({ t: Math.round(performance.now() - t0), type, ...data });
-    };
-    const formSelector =
-      '[data-center-surface-host][data-visible="true"] [data-chat-composer-form="true"]';
-    const editor = () =>
-      document.querySelector<HTMLElement>(`${formSelector} [data-testid="composer-editor"]`);
-    const draft = () => {
-      try {
-        const raw = window.localStorage.getItem("bibcode:composer-drafts:v1");
-        if (!raw) return null;
-        const parsed = JSON.parse(raw) as {
-          state?: { draftsByThreadKey?: Record<string, { prompt?: string }> };
-        };
-        // Every environment-scoped key for this thread id, so a second environment's draft
-        // shows up instead of standing in for this one.
-        const entries = Object.entries(parsed.state?.draftsByThreadKey ?? {}).filter(
-          ([key]) => key.indexOf(":") > 0 && key.slice(key.indexOf(":") + 1) === threadId,
-        );
-        if (entries.length === 0) return null;
-        if (entries.length === 1) return entries[0]![1].prompt ?? "";
-        return entries.map(([key, entry]) => `${key}=${entry.prompt ?? ""}`).join(" | ");
-      } catch {
-        return "<unreadable>";
-      }
-    };
-    let last = "";
-    const snapshot = (cause: string) => {
-      const target = editor();
-      const send = document.querySelector<HTMLButtonElement>(
-        `${formSelector} button[aria-label="Send message"]`,
-      );
-      const state = {
-        text: target?.textContent ?? null,
-        editable: target?.contentEditable ?? null,
-        focused: target !== null && document.activeElement === target,
-        placeholder: target?.getAttribute("aria-placeholder") ?? null,
-        send: send === null ? "absent" : send.disabled ? "disabled" : "enabled",
-        draft: draft(),
-        onLine: navigator.onLine,
+  await browser.execute(
+    (threadId: string, draftStorageKey: string) => {
+      type Entry = Record<string, unknown> & { t: number; type: string };
+      const host = window as Window & {
+        __composerDropRecorder?: { events: Entry[]; reset: () => void; stop: () => void };
+        __composerDropSockets?: { current: WebSocket | null; close: () => boolean };
       };
-      const key = JSON.stringify(state);
-      if (key === last) return;
-      last = key;
-      log("state", { cause, ...state });
-    };
-    const observer = new MutationObserver((records) => {
-      const kinds = new Set(records.map((record) => record.type));
-      snapshot(`mutation:${[...kinds].join("+")}`);
-    });
-    const form = document.querySelector(formSelector);
-    if (form) {
-      observer.observe(form, {
-        subtree: true,
-        childList: true,
-        characterData: true,
-        attributes: true,
-        attributeFilter: ["contenteditable", "aria-placeholder", "disabled"],
+      host.__composerDropRecorder?.stop();
+      let t0 = performance.now();
+      const events: Entry[] = [];
+      const log = (type: string, data: Record<string, unknown> = {}) => {
+        events.push({ t: Math.round(performance.now() - t0), type, ...data });
+      };
+      const formSelector =
+        '[data-center-surface-host][data-visible="true"] [data-chat-composer-form="true"]';
+      const editor = () =>
+        document.querySelector<HTMLElement>(`${formSelector} [data-testid="composer-editor"]`);
+      const draft = () => {
+        try {
+          const raw = window.localStorage.getItem(draftStorageKey);
+          if (!raw) return null;
+          const parsed = JSON.parse(raw) as {
+            state?: { draftsByThreadKey?: Record<string, { prompt?: string }> };
+          };
+          // Every environment-scoped key for this thread id, so a second environment's draft
+          // shows up instead of standing in for this one.
+          const entries = Object.entries(parsed.state?.draftsByThreadKey ?? {}).filter(
+            ([key]) => key.indexOf(":") > 0 && key.slice(key.indexOf(":") + 1) === threadId,
+          );
+          if (entries.length === 0) return null;
+          if (entries.length === 1) return entries[0]![1].prompt ?? "";
+          return entries.map(([key, entry]) => `${key}=${entry.prompt ?? ""}`).join(" | ");
+        } catch {
+          return "<unreadable>";
+        }
+      };
+      let last = "";
+      const snapshot = (cause: string) => {
+        const target = editor();
+        const send = document.querySelector<HTMLButtonElement>(
+          `${formSelector} button[aria-label="Send message"]`,
+        );
+        const state = {
+          text: target?.textContent ?? null,
+          editable: target?.contentEditable ?? null,
+          focused: target !== null && document.activeElement === target,
+          placeholder: target?.getAttribute("aria-placeholder") ?? null,
+          send: send === null ? "absent" : send.disabled ? "disabled" : "enabled",
+          draft: draft(),
+          onLine: navigator.onLine,
+        };
+        const key = JSON.stringify(state);
+        if (key === last) return;
+        last = key;
+        log("state", { cause, ...state });
+      };
+      const observer = new MutationObserver((records) => {
+        const kinds = new Set(records.map((record) => record.type));
+        snapshot(`mutation:${[...kinds].join("+")}`);
       });
-    }
-    const timeline = document.querySelector('[data-center-surface-host][data-visible="true"]');
-    let timelineRows = 0;
-    const timelineObserver = new MutationObserver(() => {
-      const rows = timeline?.querySelectorAll("[data-timeline-row-id]").length ?? 0;
-      if (rows !== timelineRows) {
-        timelineRows = rows;
-        log("timeline-rows", { rows });
+      const form = document.querySelector(formSelector);
+      if (form) {
+        observer.observe(form, {
+          subtree: true,
+          childList: true,
+          characterData: true,
+          attributes: true,
+          attributeFilter: ["contenteditable", "aria-placeholder", "disabled"],
+        });
       }
-    });
-    if (timeline) timelineObserver.observe(timeline, { subtree: true, childList: true });
-    const onInput = (event: Event) => {
-      const target = event.target as HTMLElement | null;
-      if (target?.dataset?.testid !== "composer-editor") return;
-      const input = event as InputEvent;
-      log(event.type, { inputType: input.inputType, data: input.data ?? null });
-      if (event.type === "input") snapshot("input");
-    };
-    document.addEventListener("beforeinput", onInput, true);
-    document.addEventListener("input", onInput, true);
-    const windowEvents = ["online", "offline", "focus", "blur"] as const;
-    const onWindow = (event: Event) => log(`window:${event.type}`);
-    for (const name of windowEvents) window.addEventListener(name, onWindow);
-    const onVisibility = () => log("visibility", { state: document.visibilityState });
-    document.addEventListener("visibilitychange", onVisibility);
-    const sampler = window.setInterval(() => snapshot("sample"), 25);
+      const timeline = document.querySelector('[data-center-surface-host][data-visible="true"]');
+      let timelineRows = 0;
+      const timelineObserver = new MutationObserver(() => {
+        const rows = timeline?.querySelectorAll("[data-timeline-row-id]").length ?? 0;
+        if (rows !== timelineRows) {
+          timelineRows = rows;
+          log("timeline-rows", { rows });
+        }
+      });
+      if (timeline) timelineObserver.observe(timeline, { subtree: true, childList: true });
+      const onInput = (event: Event) => {
+        const target = event.target as HTMLElement | null;
+        if (target?.dataset?.testid !== "composer-editor") return;
+        const input = event as InputEvent;
+        log(event.type, { inputType: input.inputType, data: input.data ?? null });
+        if (event.type === "input") snapshot("input");
+      };
+      document.addEventListener("beforeinput", onInput, true);
+      document.addEventListener("input", onInput, true);
+      const windowEvents = ["online", "offline", "focus", "blur"] as const;
+      const onWindow = (event: Event) => log(`window:${event.type}`);
+      for (const name of windowEvents) window.addEventListener(name, onWindow);
+      const onVisibility = () => log("visibility", { state: document.visibilityState });
+      document.addEventListener("visibilitychange", onVisibility);
+      const sampler = window.setInterval(() => snapshot("sample"), 25);
 
-    if (host.__b3fSockets === undefined) {
-      const Native = window.WebSocket;
-      const sockets: { current: WebSocket | null; close: () => boolean } = {
-        current: null,
-        close: () => {
-          if (!sockets.current) return false;
-          sockets.current.close();
-          return true;
+      if (host.__composerDropSockets === undefined) {
+        const Native = window.WebSocket;
+        const sockets: { current: WebSocket | null; close: () => boolean } = {
+          current: null,
+          close: () => {
+            if (!sockets.current) return false;
+            sockets.current.close();
+            return true;
+          },
+        };
+        const isRpc = (url: string | URL) => new URL(String(url), location.href).pathname === "/ws";
+        const recorderLog = (type: string, data: Record<string, unknown>) =>
+          (
+            window as Window & {
+              __composerDropRecorder?: { events: Entry[] };
+              __composerDropLog?: typeof log;
+            }
+          ).__composerDropLog?.(type, data);
+        const track = (socket: WebSocket) => {
+          if (sockets.current === socket) return;
+          sockets.current = socket;
+          socket.addEventListener("close", (event) =>
+            recorderLog("ws:closed", { code: event.code, clean: event.wasClean }),
+          );
+        };
+        const send = Native.prototype.send;
+        Native.prototype.send = function (this: WebSocket, data) {
+          if (isRpc(this.url)) track(this);
+          return send.call(this, data);
+        };
+        const close = Native.prototype.close;
+        Native.prototype.close = function (this: WebSocket, code?: number, reason?: string) {
+          if (isRpc(this.url)) {
+            recorderLog("ws:close-called", {
+              code: code ?? null,
+              stack: (new Error().stack ?? "").split("\n").slice(1, 14).join(" | "),
+            });
+          }
+          return close.call(this, code, reason);
+        };
+        function Harnessed(url: string | URL, protocols?: string | string[]) {
+          const socket = new Native(url, protocols);
+          if (isRpc(url)) {
+            recorderLog("ws:new", {});
+            socket.addEventListener("open", () => recorderLog("ws:open", {}), { once: true });
+            track(socket);
+          }
+          return socket;
+        }
+        Harnessed.prototype = Native.prototype;
+        Object.assign(Harnessed, {
+          CONNECTING: Native.CONNECTING,
+          OPEN: Native.OPEN,
+          CLOSING: Native.CLOSING,
+          CLOSED: Native.CLOSED,
+        });
+        window.WebSocket = Harnessed as unknown as typeof WebSocket;
+        host.__composerDropSockets = sockets;
+      }
+      (window as Window & { __composerDropLog?: typeof log }).__composerDropLog = log;
+
+      host.__composerDropRecorder = {
+        events,
+        reset: () => {
+          events.length = 0;
+          last = "";
+          t0 = performance.now();
+          snapshot("reset");
+        },
+        stop: () => {
+          observer.disconnect();
+          timelineObserver.disconnect();
+          window.clearInterval(sampler);
+          document.removeEventListener("beforeinput", onInput, true);
+          document.removeEventListener("input", onInput, true);
+          for (const name of windowEvents) window.removeEventListener(name, onWindow);
+          document.removeEventListener("visibilitychange", onVisibility);
         },
       };
-      const isRpc = (url: string | URL) => new URL(String(url), location.href).pathname === "/ws";
-      const recorderLog = (type: string, data: Record<string, unknown>) =>
-        (
-          window as Window & { __b3fRecorder?: { events: Entry[] }; __b3fLog?: typeof log }
-        ).__b3fLog?.(type, data);
-      const track = (socket: WebSocket) => {
-        if (sockets.current === socket) return;
-        sockets.current = socket;
-        socket.addEventListener("close", (event) =>
-          recorderLog("ws:closed", { code: event.code, clean: event.wasClean }),
-        );
-      };
-      const send = Native.prototype.send;
-      Native.prototype.send = function (this: WebSocket, data) {
-        if (isRpc(this.url)) track(this);
-        return send.call(this, data);
-      };
-      const close = Native.prototype.close;
-      Native.prototype.close = function (this: WebSocket, code?: number, reason?: string) {
-        if (isRpc(this.url)) {
-          recorderLog("ws:close-called", {
-            code: code ?? null,
-            stack: (new Error().stack ?? "").split("\n").slice(1, 14).join(" | "),
-          });
-        }
-        return close.call(this, code, reason);
-      };
-      function Harnessed(url: string | URL, protocols?: string | string[]) {
-        const socket = new Native(url, protocols);
-        if (isRpc(url)) {
-          recorderLog("ws:new", {});
-          socket.addEventListener("open", () => recorderLog("ws:open", {}), { once: true });
-          track(socket);
-        }
-        return socket;
-      }
-      Harnessed.prototype = Native.prototype;
-      Object.assign(Harnessed, {
-        CONNECTING: Native.CONNECTING,
-        OPEN: Native.OPEN,
-        CLOSING: Native.CLOSING,
-        CLOSED: Native.CLOSED,
-      });
-      window.WebSocket = Harnessed as unknown as typeof WebSocket;
-      host.__b3fSockets = sockets;
-    }
-    (window as Window & { __b3fLog?: typeof log }).__b3fLog = log;
-
-    host.__b3fRecorder = {
-      events,
-      reset: () => {
-        events.length = 0;
-        last = "";
-        t0 = performance.now();
-        snapshot("reset");
-      },
-      stop: () => {
-        observer.disconnect();
-        timelineObserver.disconnect();
-        window.clearInterval(sampler);
-        document.removeEventListener("beforeinput", onInput, true);
-        document.removeEventListener("input", onInput, true);
-        for (const name of windowEvents) window.removeEventListener(name, onWindow);
-        document.removeEventListener("visibilitychange", onVisibility);
-      },
-    };
-    snapshot("installed");
-  }, threadId);
+      snapshot("installed");
+    },
+    threadId,
+    composerDraftStorageKey,
+  );
 }
 
 async function resetRecorder(): Promise<void> {
   await browser.execute(() => {
-    (window as Window & { __b3fRecorder?: { reset: () => void } }).__b3fRecorder?.reset();
+    (
+      window as Window & { __composerDropRecorder?: { reset: () => void } }
+    ).__composerDropRecorder?.reset();
   });
 }
 
 async function markRecorder(label: string): Promise<void> {
   await browser.execute((label: string) => {
-    (window as Window & { __b3fLog?: (type: string, data: object) => void }).__b3fLog?.("mark", {
+    (
+      window as Window & { __composerDropLog?: (type: string, data: object) => void }
+    ).__composerDropLog?.("mark", {
       label,
     });
   }, label);
@@ -341,8 +355,8 @@ async function readRecorder(): Promise<unknown[]> {
   return browser.execute(
     () =>
       (
-        window as Window & { __b3fRecorder?: { events: unknown[] } }
-      ).__b3fRecorder?.events.slice() ?? [],
+        window as Window & { __composerDropRecorder?: { events: unknown[] } }
+      ).__composerDropRecorder?.events.slice() ?? [],
   );
 }
 
@@ -360,7 +374,8 @@ async function dispatchWindowEvent(name: "offline" | "online", delayMs = 0): Pro
 
 async function closeSocketFromPage(delayMs = 0): Promise<void> {
   await browser.execute((delayMs: number) => {
-    const sockets = (window as Window & { __b3fSockets?: { close: () => boolean } }).__b3fSockets;
+    const sockets = (window as Window & { __composerDropSockets?: { close: () => boolean } })
+      .__composerDropSockets;
     const fire = () => sockets?.close();
     if (delayMs <= 0) fire();
     else window.setTimeout(fire, delayMs);
@@ -411,7 +426,7 @@ interface RunResult {
 function recordRun(result: RunResult): void {
   NodeFS.appendFileSync(runsLogPath, `${JSON.stringify(result)}\n`, "utf8");
   console.log(
-    `[b3f] arm=${result.arm} iteration=${result.iteration} kept=${result.kept} final=${JSON.stringify(result.finalText)}`,
+    `[composer-drop] arm=${result.arm} iteration=${result.iteration} kept=${result.kept} final=${JSON.stringify(result.finalText)}`,
   );
 }
 
@@ -420,9 +435,15 @@ async function finishRun(arm: string, iteration: number, typed: string): Promise
   await sleep(1_500);
   const finalText = await composerEditor().getText();
   const events = await readRecorder();
-  recordRun({ arm, iteration, typed, finalText, kept: finalText.includes(typed), events });
+  const kept = finalText.includes(typed);
+  recordRun({ arm, iteration, typed, finalText, kept, events });
   await clearComposer();
   await sleep(500);
+  if (!kept) {
+    throw new Error(
+      `Arm ${arm} lost the typed text: the composer shows ${JSON.stringify(finalText)}.`,
+    );
+  }
 }
 
 describe("composer text through a connection drop (manual, #199)", () => {
@@ -448,8 +469,8 @@ describe("composer text through a connection drop (manual, #199)", () => {
       () =>
         browser.execute(
           () =>
-            (window as Window & { __b3fSockets?: { current: WebSocket | null } }).__b3fSockets
-              ?.current != null,
+            (window as Window & { __composerDropSockets?: { current: WebSocket | null } })
+              .__composerDropSockets?.current != null,
         ),
       { timeout: 60_000, timeoutMsg: "The harness never saw the RPC socket." },
     );

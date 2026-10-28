@@ -3,7 +3,10 @@
  * composer is in use (#199), and for reading one thread's persisted composer draft.
  */
 
-const composerDraftStorageKey = "bibcode:composer-drafts:v1";
+import { COMPOSER_DRAFT_STORAGE_KEY } from "../../../web/src/composerDraftStorageKey.ts";
+
+/** The app's own key for its persisted composer drafts, for page tasks that read them. */
+export const composerDraftStorageKey = COMPOSER_DRAFT_STORAGE_KEY;
 
 export interface ThreadDraftEntry {
   readonly key: string;
