@@ -715,7 +715,7 @@ impl ClaudeTerminalObserverFactory {
             return None;
         };
         let Some(executable) = validated_install_candidate(&resolution.executable) else {
-            note_pass_through("shim_unresolved");
+            note_pass_through("shim_install_refused");
             return None;
         };
         let Some(env) = validated_shim_environment(resolution.env) else {
@@ -734,10 +734,12 @@ impl ClaudeTerminalObserverFactory {
             return None;
         }
         let (source, env_overlay) = self.launch_source(&input).await?;
-        let source_fingerprint = ClaudeExecutableFingerprint::read(&source)?;
-        if source_fingerprint.length > CLAUDE_PIN_SIZE_LIMIT {
+        let Some(source_fingerprint) = ClaudeExecutableFingerprint::read(&source)
+            .filter(|fingerprint| fingerprint.length <= CLAUDE_PIN_SIZE_LIMIT)
+        else {
+            note_pass_through("build_unreadable");
             return None;
-        }
+        };
         let correlation = input.launch.generation.id().simple().to_string();
         let generation_key = input.launch.generation.id().simple().to_string();
         let generation_dir = create_owned_generation_directory(
@@ -770,7 +772,10 @@ impl ClaudeTerminalObserverFactory {
         })
         .await
         .ok()?;
-        pinned.ok()?;
+        if pinned.is_err() {
+            note_pass_through("pin_failed");
+            return None;
+        }
         let capabilities = self
             .probe
             .probe_pinned(
