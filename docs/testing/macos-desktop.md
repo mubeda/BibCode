@@ -250,6 +250,14 @@ test -d "$BIBCODE_E2E_APP_PATH"
 vp run test:ui:desktop
 ```
 
+The WebDriver port is set by two variables, which must always agree:
+`BIBCODE_E2E_WEBDRIVER_PORT` (the embedded driver's port, default 4445) and
+`TAURI_WEBDRIVER_PORT` (read by the worker's `browser.tauri.mock` direct-eval
+client, default 4445). To run beside another packaged run, export both with the
+same free port, checked with `lsof -nP -iTCP:<port> -sTCP:LISTEN`. With only the
+first set, every mock, such as the folder picker in project import, fails with
+`fetch failed`.
+
 When the run ends, the artifact directory (`BIBCODE_E2E_ARTIFACT_DIR`) also holds
 `app-*.log`: the last 4 MiB of each of the packaged app's own logs, with the native
 page-load lifecycle and webview process failures, next to the screenshots and
