@@ -121,6 +121,7 @@ import {
   hasActionableProposedPlan,
   isLatestTurnSettled,
 } from "../session-logic";
+import { flushSync } from "react-dom";
 import { type LegendListRef } from "@legendapp/list/react";
 import {
   getAnchoredTurnMetrics,
@@ -1280,7 +1281,12 @@ function ChatViewContent(props: ChatViewProps) {
     updateHeight();
     if (typeof ResizeObserver === "undefined") return;
 
-    const observer = new ResizeObserver(updateHeight);
+    // The overlay holds the composer and the Activity card, which can grow it after the
+    // timeline has painted (an Activity card arriving once a reopened chat's activity loads).
+    // The timeline's bottom inset follows from this height, so the change is committed before
+    // the frame paints: a deferred render left one frame with the grown overlay over the
+    // timeline's end before the list moved its end above it.
+    const observer = new ResizeObserver(() => flushSync(updateHeight));
     observer.observe(composerOverlayElement);
     return () => observer.disconnect();
   }, [composerOverlayElement]);
