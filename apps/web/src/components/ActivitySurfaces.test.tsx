@@ -209,6 +209,60 @@ afterEach(async () => {
   vi.restoreAllMocks();
 });
 
+describe("Activity card layout reporting", () => {
+  it("reports the committed card before paint when it opens and closes", async () => {
+    const props = panelProps({ _tag: "thread", threadId }, vi.fn(), vi.fn());
+    surface.panelProps = props;
+    surface.activityState = {
+      snapshot: Option.some(props.snapshot),
+      status: "live",
+      error: Option.none(),
+      recentEntries: new Map(),
+    };
+    useCenterPanelStore.setState({ byThreadKey: {}, activityPanes: {} });
+    const committed: string[] = [];
+    const onLayoutChange = () => {
+      const card = document.querySelector(`[data-activity-pane="${HOST_SURFACE_ID}"]`);
+      committed.push(card?.getAttribute("data-activity-pane-expanded") ?? "hidden");
+    };
+    const pane = () => (
+      <ActivityPane
+        target={{ environmentId, input: { _tag: "thread", threadId } }}
+        paneOwnerRef={threadRef}
+        paneId={HOST_SURFACE_ID}
+        compact={false}
+        alwaysVisible
+        paneElement={null}
+        onLayoutChange={onLayoutChange}
+      />
+    );
+    const container = await mount(pane());
+    const button = container.querySelector<HTMLButtonElement>(
+      '[data-testid="activity-dock"] button',
+    );
+    expect(button).not.toBeNull();
+    expect(committed.at(-1)).toBe("false");
+
+    surface.activityState = {
+      snapshot: Option.some({ ...props.snapshot, revision: props.snapshot.revision + 1 }),
+      status: "live",
+      error: Option.none(),
+      recentEntries: new Map(),
+    };
+    const beforeUpdate = committed.length;
+    await act(async () => {
+      mounted.at(-1)!.root.render(<TooltipProvider delay={0}>{pane()}</TooltipProvider>);
+    });
+    expect(committed).toHaveLength(beforeUpdate + 1);
+    expect(committed.at(-1)).toBe("false");
+
+    await act(async () => button?.click());
+    expect(committed.at(-1)).toBe("true");
+    await act(async () => button?.click());
+    expect(committed.at(-1)).toBe("false");
+  });
+});
+
 describe("Activity cancellation surfaces", () => {
   it.each([
     ["a wide window", 1_200, "Enter"],

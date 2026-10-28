@@ -1264,6 +1264,8 @@ function ChatViewContent(props: ChatViewProps) {
   const attachmentPreviewHandoffByMessageIdRef = useRef<Record<string, string[]>>({});
   const attachmentPreviewPromotionInFlightByMessageIdRef = useRef<Record<string, true>>({});
   const sendInFlightRef = useRef(false);
+  const measureComposerOverlayRef = useRef<() => void>(() => undefined);
+  const reportComposerOverlayLayout = useCallback(() => measureComposerOverlayRef.current(), []);
 
   useLayoutEffect(() => {
     if (!composerOverlayElement) return;
@@ -1277,12 +1279,20 @@ function ChatViewContent(props: ChatViewProps) {
       );
     };
 
+    measureComposerOverlayRef.current = updateHeight;
     updateHeight();
-    if (typeof ResizeObserver === "undefined") return;
+    if (typeof ResizeObserver === "undefined") {
+      return () => {
+        measureComposerOverlayRef.current = () => undefined;
+      };
+    }
 
     const observer = new ResizeObserver(updateHeight);
     observer.observe(composerOverlayElement);
-    return () => observer.disconnect();
+    return () => {
+      observer.disconnect();
+      measureComposerOverlayRef.current = () => undefined;
+    };
   }, [composerOverlayElement]);
 
   const fallbackDraftProjectRef = draftThread
@@ -7096,6 +7106,7 @@ function ChatViewContent(props: ChatViewProps) {
                               compact={shouldUseCompactActivityDock}
                               alwaysVisible={settings.activityDockAlwaysVisible}
                               paneElement={chatSurfaceElement}
+                              onLayoutChange={reportComposerOverlayLayout}
                             />
                           </div>
                         ) : null}

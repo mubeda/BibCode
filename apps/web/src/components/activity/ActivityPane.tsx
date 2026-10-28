@@ -42,6 +42,8 @@ export interface ActivityPaneProps {
   readonly paneElement: HTMLElement | null;
   /** Rejects a snapshot this pane must not show, such as another terminal's scope. */
   readonly acceptSnapshot?: (snapshot: ActivitySnapshot) => boolean;
+  /** Requests a chat overlay height measurement after this card commits. */
+  readonly onLayoutChange?: () => void;
 }
 
 /** Measured before paint, so an open panel never renders a frame at the wrong height. */
@@ -102,6 +104,7 @@ function ActivityPaneCard({
   compact,
   alwaysVisible,
   paneElement,
+  onLayoutChange,
 }: Omit<ActivityPaneProps, "acceptSnapshot"> & { readonly snapshot: ActivitySnapshot | null }) {
   const bodyId = useId();
   const cardRef = useRef<HTMLDivElement>(null);
@@ -128,6 +131,9 @@ function ActivityPaneCard({
     setHeldSnapshot(nextHeldSnapshot);
   }
   const displayedSnapshot = shown ? snapshot : holding ? heldSnapshot : null;
+  useLayoutEffect(() => {
+    onLayoutChange?.();
+  });
 
   const onToggle = useCallback(
     (section: ActivitySection) => {
