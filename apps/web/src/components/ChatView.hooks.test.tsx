@@ -6036,6 +6036,66 @@ describe("ChatView pending user input", () => {
     expect(commandCallsFor("thread.respondToUserInput")).toHaveLength(1);
   });
 
+  it.each(["connected", "disconnected"] as const)(
+    "onSend moves between a multi-step question's steps without replaying a retained send (%s)",
+    async (connection) => {
+      seedConnectedServerThread();
+      renderServerRoute();
+      const contexts = makeOwnedComposerContexts("retained-before-question");
+      const { promptRef } = installComposerHandle({
+        getSendContext: () => sendContextWithOwnedComposerContexts(contexts),
+      });
+      promptRef.current = "original send";
+      h.commandResults["thread.stageAttachments"] = () =>
+        AsyncResult.success({
+          _tag: "staged",
+          attachments: [
+            {
+              type: "image",
+              id: contexts.image.id,
+              name: contexts.image.name,
+              mimeType: "image/png",
+              sizeBytes: 4,
+              uploadId: "retained-stage",
+            },
+          ],
+        });
+      h.commandResults["thread.startTurn"] = () =>
+        AsyncResult.failure(
+          Cause.fail(
+            new RpcClientError.RpcClientError({
+              reason: new RpcClientError.RpcClientDefect({
+                message: "reply lost",
+                cause: new Error("closed"),
+              }),
+            }),
+          ),
+        );
+      await (capturedProps("chatComposer")["onSend"] as () => Promise<void>)();
+      expect(commandCallsFor("thread.startTurn")).toHaveLength(1);
+      const authorityReads = commandCallsFor("thread.attachmentAdmissionAuthority").length;
+
+      // The ambiguous attempt stays retained while a two-step question arrives.
+      seedConnectedServerThread(threadWithQuestions(2));
+      if (connection === "disconnected") {
+        seedEnvironment(
+          makeEnvironmentPresentation({
+            connection: { phase: "error", error: "socket closed", traceId: null },
+          }),
+        );
+        h.commandResults["thread.attachmentAdmissionAuthority"] = () =>
+          AsyncResult.failure(Cause.fail(new Error("The connection disconnected.")));
+      }
+      renderServerRoute();
+      installComposerHandle();
+      await (capturedProps("chatComposer")["onSend"] as () => Promise<void>)();
+
+      expect(commandCallsFor("thread.startTurn")).toHaveLength(1);
+      expect(commandCallsFor("thread.attachmentAdmissionAuthority")).toHaveLength(authorityReads);
+      expect(commandCallsFor("thread.respondToUserInput")).toHaveLength(0);
+    },
+  );
+
   it("reports user-input submission failures as thread errors", async () => {
     seedConnectedServerThread(threadWithQuestions(1));
     seedHostState("pendingUserInputAnswersByRequestId", {

@@ -594,9 +594,12 @@ Every way a Codex terminal ends up without Activity is logged under
     seconds. The observer keeps waiting.
   - `connect_failed`, unless the terminal is already closing.
   - `root_discovery_stopped`, `root_discovery_reconnect_failed`, the `resume_*`
-    reasons, and `live_publication_rejected`, whose detail says whether the
-    terminal generation was no longer current or creating the scope failed (the
-    kind of failure only).
+    reasons, and `live_publication_rejected`, logged when the terminal
+    generation is no longer current and the observer ends.
+  - `live_publication_retrying`, once per failure streak (a successful scope
+    write starts a new streak), when creating the scope failed; the detail is
+    the kind of failure only. The observer keeps retrying with backoff until
+    the generation is gone.
   - `root_discovery_pending`, once, if no TUI thread is found within ten
     seconds.
 
