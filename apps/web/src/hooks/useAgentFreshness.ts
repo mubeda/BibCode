@@ -12,7 +12,7 @@ import { scopeThreadRef, scopedThreadKey } from "@bibcode/client-runtime/environ
 import { type EnvironmentId, type TerminalSummary, ThreadId } from "@bibcode/contracts";
 import * as Option from "effect/Option";
 import { AsyncResult, Atom } from "effect/reactivity";
-import { useMemo, useSyncExternalStore } from "react";
+import { useEffect, useMemo, useSyncExternalStore } from "react";
 
 import {
   type AgentStatusContext,
@@ -29,21 +29,65 @@ import { appMinuteClock } from "../minuteClock";
 import { useEnvironmentShellSummary } from "../state/shell";
 import { terminalEnvironment } from "../state/terminal";
 
-interface EvidenceStamp {
+/** One row's first sight of a piece of evidence, on this client's clock. */
+export interface AgentEvidenceStamp {
+  readonly key: string;
   readonly evidence: string;
   readonly evidenceAt: number;
 }
 
 /** Bounds the stamps a long session keeps; each row holds one. */
 const STAMP_LIMIT = 4_096;
-const stamps = new Map<string, EvidenceStamp>();
+const stamps = new Map<string, Omit<AgentEvidenceStamp, "key">>();
 
 /**
  * When this client first saw `evidence` for the row `key`, on its own clock: the time
  * of that first sight less the server's age of the evidence then. A repeated value
  * keeps its first time; a new one restamps. Only a connected environment stamps, since
  * a cached snapshot's age is as old as the cache. Null when there is no evidence.
+ *
+ * A render may call it: it changes nothing. A first sight goes to `pending` and is kept
+ * only by `recordAgentEvidence`, which a committed render runs (`useRecordAgentEvidence`);
+ * the clock it reads dates that first sight and nothing else.
  */
+export function peekAgentEvidenceAt(
+  key: string,
+  evidence: string | undefined,
+  ageMs: number | undefined,
+  live: boolean,
+  pending: AgentEvidenceStamp[],
+  now: number = Date.now(),
+): number | null {
+  if (evidence === undefined) return null;
+  const stamp = stamps.get(key);
+  if (stamp?.evidence === evidence) return stamp.evidenceAt;
+  if (!live) return null;
+  const evidenceAt = now - Math.max(0, ageMs ?? 0);
+  pending.push({ key, evidence, evidenceAt });
+  return evidenceAt;
+}
+
+/** Keeps first sights a committed render saw; an earlier sight of the same evidence wins. */
+export function recordAgentEvidence(pending: ReadonlyArray<AgentEvidenceStamp>): void {
+  for (const { key, evidence, evidenceAt } of pending) {
+    const stamp = stamps.get(key);
+    if (stamp?.evidence === evidence) continue;
+    if (stamp === undefined && stamps.size >= STAMP_LIMIT) {
+      const oldest = stamps.keys().next().value;
+      if (oldest !== undefined) stamps.delete(oldest);
+    }
+    stamps.set(key, { evidence, evidenceAt });
+  }
+}
+
+/** Records the first sights a render saw, once it commits. */
+export function useRecordAgentEvidence(pending: ReadonlyArray<AgentEvidenceStamp>): void {
+  useEffect(() => {
+    if (pending.length > 0) recordAgentEvidence(pending);
+  }, [pending]);
+}
+
+/** Reads and keeps at once, for code outside a render. */
 export function agentEvidenceAt(
   key: string,
   evidence: string | undefined,
@@ -51,18 +95,13 @@ export function agentEvidenceAt(
   live: boolean,
   now: number = Date.now(),
 ): number | null {
-  if (evidence === undefined) return null;
-  const stamp = stamps.get(key);
-  if (stamp?.evidence === evidence) return stamp.evidenceAt;
-  if (!live) return null;
-  if (stamp === undefined && stamps.size >= STAMP_LIMIT) {
-    const oldest = stamps.keys().next().value;
-    if (oldest !== undefined) stamps.delete(oldest);
-  }
-  const evidenceAt = now - Math.max(0, ageMs ?? 0);
-  stamps.set(key, { evidence, evidenceAt });
+  const pending: AgentEvidenceStamp[] = [];
+  const evidenceAt = peekAgentEvidenceAt(key, evidence, ageMs, live, pending, now);
+  recordAgentEvidence(pending);
   return evidenceAt;
 }
+
+const NO_STAMPS: ReadonlyArray<AgentEvidenceStamp> = Object.freeze([]);
 
 export function resetAgentEvidenceStampsForTests(): void {
   stamps.clear();
@@ -199,10 +238,23 @@ export function useAgentTerminalSources(
   return useAtomValue(agentTerminalSourcesAtom(key)) ?? EMPTY_TERMINAL_SOURCES;
 }
 
-/** The status clock and evidence stamps an Agents row list reads. */
-export function useAgentRowFreshness(active: boolean): AgentRowFreshness {
+/**
+ * The status clock an Agents row list reads, and a pure freshness for one build of its
+ * rows: `freshness(pending)` peeks evidence stamps into `pending`, which the caller
+ * records with `useRecordAgentEvidence` once its render commits.
+ */
+export function useAgentRowFreshness(
+  active: boolean,
+): (pending: AgentEvidenceStamp[]) => AgentRowFreshness {
   const now = useAgentStatusClock(active);
-  return useMemo(() => ({ now, evidenceAt: agentEvidenceAt }), [now]);
+  return useMemo(
+    () => (pending: AgentEvidenceStamp[]) => ({
+      now,
+      evidenceAt: (key, evidence, ageMs, live) =>
+        peekAgentEvidenceAt(key, evidence, ageMs, live, pending),
+    }),
+    [now],
+  );
 }
 
 /**
@@ -231,23 +283,35 @@ export function useWorkspaceCardStatus(
     thread?.session?.status === "starting" ||
     terminals.some((terminal) => terminal.agentStatus?.state === "working");
   const now = useAgentStatusClock(decayable);
-  if (thread === null || thread === undefined) return fallback;
-  const threadKey = scopedThreadKey(scopeThreadRef(environmentId, ThreadId.make(threadId)));
-  const context: AgentStatusContext & {
-    terminals: Array<{ terminal: TerminalSummary; evidenceAt: number | null }>;
-  } = {
-    now,
-    environmentLive: live,
-    evidenceAt: agentEvidenceAt(threadKey, thread.lastActivityAt, thread.lastActivityAgeMs, live),
-    terminals: terminals.map((terminal) => ({
-      terminal,
-      evidenceAt: agentEvidenceAt(
-        terminalAgentRowKey(threadKey, terminal.terminalId),
-        terminal.agentStatus?.observedAt,
-        terminal.agentStatus?.ageMs,
+  const { status, pending } = useMemo(() => {
+    if (thread === null || thread === undefined) return { status: fallback, pending: NO_STAMPS };
+    const pending: AgentEvidenceStamp[] = [];
+    const threadKey = scopedThreadKey(scopeThreadRef(environmentId, ThreadId.make(threadId)));
+    const context: AgentStatusContext & {
+      terminals: Array<{ terminal: TerminalSummary; evidenceAt: number | null }>;
+    } = {
+      now,
+      environmentLive: live,
+      evidenceAt: peekAgentEvidenceAt(
+        threadKey,
+        thread.lastActivityAt,
+        thread.lastActivityAgeMs,
         live,
+        pending,
       ),
-    })),
-  };
-  return resolveWorkspaceCardStatus(thread, lastVisitedAt, context);
+      terminals: terminals.map((terminal) => ({
+        terminal,
+        evidenceAt: peekAgentEvidenceAt(
+          terminalAgentRowKey(threadKey, terminal.terminalId),
+          terminal.agentStatus?.observedAt,
+          terminal.agentStatus?.ageMs,
+          live,
+          pending,
+        ),
+      })),
+    };
+    return { status: resolveWorkspaceCardStatus(thread, lastVisitedAt, context), pending };
+  }, [environmentId, fallback, lastVisitedAt, live, now, terminals, thread, threadId]);
+  useRecordAgentEvidence(pending);
+  return status;
 }
