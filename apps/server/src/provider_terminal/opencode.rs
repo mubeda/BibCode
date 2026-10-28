@@ -75,6 +75,8 @@ const OPENCODE_REATTACH_REQUEST_LIMIT: u32 = (MAX_RECONCILED_CHILDREN as u32) * 
 const OPENCODE_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(2);
 const OPENCODE_SSE_RETRY_MIN: Duration = Duration::from_millis(100);
 const OPENCODE_SSE_RETRY_MAX: Duration = Duration::from_secs(2);
+/// The first wait before an activity scope that could not be written is written again.
+const OPENCODE_SCOPE_RETRY_MIN: Duration = Duration::from_millis(100);
 const OPENCODE_USERNAME: &str = "opencode";
 const OPENCODE_CLEANUP_IDLE: u8 = 0;
 const OPENCODE_CLEANUP_IN_PROGRESS: u8 = 1;
@@ -1259,6 +1261,16 @@ async fn run_opencode_observer(
                 Duration::ZERO
             }
     };
+    // Activity reads live only once its scope is written; one that could not be is
+    // unavailable and enabled again after a backoff (#187).
+    let mut scope_retry: Option<tokio::time::Instant> = None;
+    let mut scope_retry_delay = OPENCODE_SCOPE_RETRY_MIN;
+    let mut schedule_scope_retry = |scope_retry: &mut Option<tokio::time::Instant>| {
+        *scope_retry = Some(tokio::time::Instant::now() + scope_retry_delay);
+        scope_retry_delay = scope_retry_delay
+            .saturating_mul(2)
+            .min(OPENCODE_SSE_RETRY_MAX);
+    };
 
     loop {
         if stream.is_none() {
@@ -1273,25 +1285,19 @@ async fn run_opencode_observer(
             if stream.is_some() {
                 tracker = OpenCodeActivityTracker::new(&root_session_id);
                 let state = inner.activity.snapshot();
-                mode = if state.enabled {
+                // A status-only launch never created its scope (#187).
+                mode = if !state.enabled {
+                    live_state = None;
+                    OpenCodeObserverMode::Dormant
+                } else if publish_opencode_scope(&inner, &capabilities).await {
                     interval.reset_at(next_reconciliation(reconciled));
                     live_state = Some(state);
                     OpenCodeObserverMode::Live
                 } else {
                     live_state = None;
-                    OpenCodeObserverMode::Dormant
+                    schedule_scope_retry(&mut scope_retry);
+                    OpenCodeObserverMode::Unavailable
                 };
-                if mode == OpenCodeObserverMode::Live {
-                    // A status-only launch never created its scope (#187).
-                    let _ = inner
-                        .publisher
-                        .publish_correlated(
-                            "opencode",
-                            Some(&inner.provider_instance_id),
-                            capabilities.clone(),
-                        )
-                        .await;
-                }
                 mark_opencode_observation(&inner, state, epoch, mode);
                 continue;
             }
@@ -1329,11 +1335,21 @@ async fn run_opencode_observer(
                     data = current_stream.next_data() => OpenCodeObserverEvent::Data(data),
                 },
                 OpenCodeObserverMode::Dormant | OpenCodeObserverMode::Unavailable => {
+                    let retry = scope_retry;
                     tokio::select! {
                         biased;
                         _ = generation.cancelled() => OpenCodeObserverEvent::Cancelled,
                         changed = activity.changed() => {
                             OpenCodeObserverEvent::ActivityChanged(changed.is_ok())
+                        }
+                        // Enabling again writes the scope that could not be written.
+                        () = async {
+                            if let Some(at) = retry {
+                                tokio::time::sleep_until(at).await;
+                            }
+                        }, if retry.is_some() => {
+                            scope_retry = None;
+                            OpenCodeObserverEvent::ActivityChanged(true)
                         }
                         // Dormant activity still reads the root agent's state (#187).
                         data = current_stream.next_dormant_data() => {
@@ -1428,6 +1444,15 @@ async fn run_opencode_observer(
                     };
                     match outcome {
                         OpenCodeReplacementOutcome::Connected(replacement) => {
+                            // An observer launched for status only never created its scope: it
+                            // does so before it reads live (#187).
+                            if !publish_opencode_scope(&inner, &capabilities).await {
+                                drop(replacement);
+                                mode = OpenCodeObserverMode::Unavailable;
+                                mark_opencode_observation(&inner, state, epoch, mode);
+                                schedule_scope_retry(&mut scope_retry);
+                                break;
+                            }
                             let next_epoch = epoch.saturating_add(1);
                             let promoted = commit_opencode_observation(
                                 &inner,
@@ -1444,16 +1469,7 @@ async fn run_opencode_observer(
                                 },
                             );
                             if promoted {
-                                // An observer launched for status only never created its
-                                // scope (#187).
-                                let _ = inner
-                                    .publisher
-                                    .publish_correlated(
-                                        "opencode",
-                                        Some(&inner.provider_instance_id),
-                                        capabilities.clone(),
-                                    )
-                                    .await;
+                                scope_retry = None;
                                 break;
                             }
                             state = inner.activity.snapshot();
@@ -1552,6 +1568,23 @@ async fn run_opencode_observer(
             OpenCodeObserverEvent::Discard(Ok(())) => {}
         }
     }
+}
+
+/// Writes the terminal's activity scope; false when it could not be written or this observer
+/// generation is no longer current.
+async fn publish_opencode_scope(
+    inner: &OpenCodeObserverInner,
+    capabilities: &ActivityCapabilities,
+) -> bool {
+    inner
+        .publisher
+        .publish_correlated(
+            "opencode",
+            Some(&inner.provider_instance_id),
+            capabilities.clone(),
+        )
+        .await
+        .unwrap_or(false)
 }
 
 /// Reads the root session's state as the observer attaches or reattaches, which the events it
