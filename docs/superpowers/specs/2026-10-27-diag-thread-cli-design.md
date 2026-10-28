@@ -150,10 +150,12 @@ bibcode diagnostics download ──HTTP (loopback, CLI token)──▶ local ser
    gets `busy`.
 3. **Server → client.** A new stream `server.subscribeDiagnosticLogsRelay` (scope
    `access:write`) announces `{ requestId, environment, includeCrashDumps }`.
-   `access:write` limits it to administrative sessions: the desktop's own WebView
-   and command-line bootstraps, never an ordinary paired device such as a phone,
-   so another device can never be made to pull logs onto this host. The first
-   client to claim (`server.claimDiagnosticLogsRelay`) owns it, as with open-url.
+   `access:write` is only the floor: as approved, each handler also requires the
+   desktop app's own session (subject `desktop-bootstrap`), so no other paired
+   device, not even an administrative one, can be made to pull logs onto this host
+   (proved by `an_administrative_session_that_is_not_the_desktop_app_cannot_serve`).
+   The first window to claim (`server.claimDiagnosticLogsRelay`) owns it, bound to
+   its session and connection.
 4. **Consent.** The claiming client shows a prompt: "A command on this computer
    asks for <label>'s logs (with crash dumps). Allow / Deny". Nothing is
    downloaded before **Allow**. Unanswered requests expire after two minutes.
