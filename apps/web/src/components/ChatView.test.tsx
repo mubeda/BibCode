@@ -5599,18 +5599,30 @@ describe("ChatView handlers (captured from mocked children)", () => {
 
       const onSend = composer["onSend"] as () => Promise<void>;
       await onSend();
+      // Key repeat while the refusal is on screen adds nothing.
       await onSend();
 
       expect(commandCallsFor("thread.startTurn")).toHaveLength(0);
       expect(promptRef.current).toBe("hello");
-      // The refusal names what the banner shows; a repeat replaces it rather than stacking.
-      expect(add).toHaveBeenCalledTimes(2);
-      expect(add.mock.calls[0]![0]).toMatchObject({
+      expect(add).toHaveBeenCalledTimes(1);
+      const options = add.mock.calls[0]![0];
+      expect(options).toMatchObject({
         type: "warning",
         title: "Local: Connection failed",
         description: "socket closed",
       });
-      expect(close).toHaveBeenCalledWith("refusal-toast");
+      // Once it has closed, the next refused Send says so again.
+      options.onClose?.();
+      await onSend();
+      expect(add).toHaveBeenCalledTimes(2);
+      expect(close).not.toHaveBeenCalled();
+
+      // An Enter that would send nothing is refused without a toast.
+      add.mock.calls[1]![0].onClose?.();
+      promptRef.current = "   ";
+      await onSend();
+      expect(add).toHaveBeenCalledTimes(2);
+      expect(commandCallsFor("thread.startTurn")).toHaveLength(0);
     } finally {
       add.mockRestore();
       close.mockRestore();
@@ -5632,7 +5644,7 @@ describe("ChatView handlers (captured from mocked children)", () => {
 
       expect(commandCallsFor("thread.respondToApproval")).toHaveLength(0);
       expect(commandCallsFor("thread.interruptTurn")).toHaveLength(0);
-      expect(add).toHaveBeenCalledTimes(2);
+      expect(add).toHaveBeenCalledTimes(1);
       expect(
         add.mock.calls.every(([options]) => options.title === "Local: Connection failed"),
       ).toBe(true);
@@ -5713,6 +5725,148 @@ describe("ChatView handlers (captured from mocked children)", () => {
       add.mockRestore();
       await act(async () => root.unmount());
       container.remove();
+    }
+  });
+
+  it("refuses Send now on the queued head while the environment is unavailable", async () => {
+    seedEnvironment(
+      makeEnvironmentPresentation({
+        connection: { phase: "offline", error: null, traceId: null },
+      }),
+    );
+    seedProject(makeProject());
+    const queuedId = MessageId.make("queued-1");
+    seedServerThread(
+      makeThread({
+        messages: [
+          {
+            id: queuedId,
+            role: "user",
+            text: "queued while away",
+            turnId: null,
+            createdAt: now,
+            updatedAt: now,
+            streaming: false,
+            delivery: { state: "queued", mode: "start", provider: "codex" },
+          } as Thread["messages"][number],
+        ],
+      }),
+    );
+    seedGitStatus(true);
+    const add = vi.spyOn(toastManager, "add").mockReturnValue("refusal-toast");
+    try {
+      renderServerRoute();
+      const timeline = capturedProps<Record<string, unknown>>("messagesTimeline");
+      const onSendNow = timeline["onSendNowQueuedMessage"] as
+        | ((messageId: MessageId) => Promise<void>)
+        | undefined;
+      expect(onSendNow).toBeTypeOf("function");
+      await onSendNow!(queuedId);
+
+      expect(commandCallsFor("thread.promoteTurn")).toHaveLength(0);
+      expect(add.mock.calls[0]![0]).toMatchObject({ title: "Local: Offline" });
+    } finally {
+      add.mockRestore();
+    }
+  });
+
+  it("closes the refusal when the environment returns and when the view unmounts", async () => {
+    vi.unstubAllGlobals();
+    Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+    Object.defineProperty(Element.prototype, "getAnimations", {
+      configurable: true,
+      value: () => [],
+    });
+    seedUnavailableServerThread();
+    let nextId = 0;
+    const add = vi.spyOn(toastManager, "add").mockImplementation(() => `refusal-${++nextId}`);
+    const close = vi.spyOn(toastManager, "close").mockImplementation(() => undefined);
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    try {
+      const view = () => (
+        <ChatView environmentId={environmentId} threadId={threadId} routeKind="server" />
+      );
+      await act(async () => root.render(view()));
+      const refuse = async () => {
+        const composer = capturedProps<Record<string, unknown>>("chatComposer");
+        (composer["composerRef"] as RefObject<ChatComposerHandle | null>).current =
+          composerHandle();
+        (composer["promptRef"] as RefObject<string>).current = "hello";
+        await act(async () => (composer["onSend"] as () => Promise<void>)());
+      };
+      await refuse();
+      expect(add).toHaveBeenCalledTimes(1);
+
+      seedEnvironment(makeEnvironmentPresentation());
+      await act(async () => root.render(view()));
+      expect(close).toHaveBeenCalledWith("refusal-1");
+
+      seedEnvironment(
+        makeEnvironmentPresentation({
+          connection: { phase: "offline", error: null, traceId: null },
+        }),
+      );
+      await act(async () => root.render(view()));
+      await refuse();
+      expect(add).toHaveBeenCalledTimes(2);
+      await act(async () => root.unmount());
+      expect(close).toHaveBeenCalledWith("refusal-2");
+    } finally {
+      add.mockRestore();
+      close.mockRestore();
+      container.remove();
+    }
+  });
+
+  it("leaves a provider binding conflict's refusal to the composer while also disconnected", async () => {
+    const customInstanceId = ProviderInstanceId.make("codex_personal");
+    const contradictoryProvider: ServerProvider = {
+      ...codexProvider,
+      instanceId: customInstanceId,
+      driver: ProviderDriverKind.make("claude"),
+      displayName: "Contradictory Claude",
+    };
+    seedEnvironment(
+      makeEnvironmentPresentation({
+        connection: { phase: "offline", error: null, traceId: null },
+        serverConfig: {
+          providers: [contradictoryProvider, codexProvider],
+          environment: { label: "Local" },
+        },
+      }),
+    );
+    seedProject(makeProject());
+    seedServerThread(
+      makeThread({
+        modelSelection: { instanceId: customInstanceId, model: "gpt-5.4" },
+        session: {
+          threadId,
+          status: "ready",
+          providerName: "codex",
+          providerInstanceId: customInstanceId,
+          runtimeMode: "full-access",
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: now,
+        },
+      }),
+    );
+    seedGitStatus(true);
+    const add = vi.spyOn(toastManager, "add").mockReturnValue("refusal-toast");
+    try {
+      renderServerRoute();
+      const composer = capturedProps<Record<string, unknown>>("chatComposer");
+      expect(composer["providerBindingConflictReason"]).toEqual(expect.any(String));
+      (composer["composerRef"] as RefObject<ChatComposerHandle | null>).current = composerHandle();
+      (composer["promptRef"] as RefObject<string>).current = "blocked twice";
+      await (composer["onSend"] as () => Promise<void>)();
+
+      expect(commandCallsFor("thread.startTurn")).toHaveLength(0);
+      expect(add).not.toHaveBeenCalled();
+    } finally {
+      add.mockRestore();
     }
   });
 

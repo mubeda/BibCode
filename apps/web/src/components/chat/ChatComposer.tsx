@@ -82,7 +82,7 @@ import { ComposerCommandMenu } from "./ComposerCommandMenu";
 import { buildComposerCommandItems, type ComposerCommandItem } from "./composerCommandItems";
 import { deriveComposerCapabilityProfile } from "./composerCapabilities";
 import { ComposerPendingApprovalActions } from "./ComposerPendingApprovalActions";
-import { ComposerPrimaryActions } from "./ComposerPrimaryActions";
+import { ComposerPrimaryActions, formatUnavailableActionLabel } from "./ComposerPrimaryActions";
 import { ComposerPendingApprovalPanel } from "./ComposerPendingApprovalPanel";
 import { ComposerPendingUserInputPanel } from "./ComposerPendingUserInputPanel";
 import { ComposerPlanFollowUpBanner } from "./ComposerPlanFollowUpBanner";
@@ -439,6 +439,7 @@ const ComposerFooterPrimaryActions = memo(function ComposerFooterPrimaryActions(
   isSendBusy: boolean;
   isConnecting: boolean;
   isEnvironmentUnavailable: boolean;
+  environmentUnavailableReason: string | null;
   sendBlockedReason: string | null;
   hasSendableContent: boolean;
   isAttachmentSelectionDisabled: boolean;
@@ -491,6 +492,7 @@ const ComposerFooterPrimaryActions = memo(function ComposerFooterPrimaryActions(
         isSendBusy={props.isSendBusy}
         isConnecting={props.isConnecting}
         isEnvironmentUnavailable={props.isEnvironmentUnavailable}
+        environmentUnavailableReason={props.environmentUnavailableReason}
         sendBlockedReason={props.sendBlockedReason}
         isPreparingWorktree={props.isPreparingWorktree}
         hasSendableContent={props.hasSendableContent}
@@ -1284,7 +1286,9 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     isSendBusy ||
     isConnecting ||
     !composerSendState.hasSendableContent;
-  const collapsedComposerPrimaryActionLabel = sendBlockedReason ?? "Send message";
+  const collapsedComposerPrimaryActionLabel = sendBlockedReason
+    ? formatUnavailableActionLabel("Send", sendBlockedReason)
+    : "Send message";
   const showMobilePendingAnswerActions =
     isMobileViewport && !isComposerCollapsedMobile && pendingPrimaryAction !== null;
 
@@ -2462,7 +2466,8 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                       isSendBusy={isSendBusy}
                       isConnecting={isConnecting}
                       isEnvironmentUnavailable={environmentUnavailable !== null}
-                      sendBlockedReason={sendBlockedReason}
+                      sendBlockedReason={providerBindingConflictReason}
+                      environmentUnavailableReason={environmentSendBlockedReason}
                       isPreparingWorktree={false}
                       hasSendableContent={false}
                       preserveComposerFocusOnPointerDown
@@ -2779,7 +2784,8 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                     isSendBusy={isSendBusy}
                     isConnecting={isConnecting}
                     isEnvironmentUnavailable={environmentUnavailable !== null}
-                    sendBlockedReason={sendBlockedReason}
+                    sendBlockedReason={providerBindingConflictReason}
+                    environmentUnavailableReason={environmentSendBlockedReason}
                     isPreparingWorktree={false}
                     hasSendableContent={false}
                     preserveComposerFocusOnPointerDown
@@ -2896,7 +2902,8 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                   isSendBusy={isSendBusy}
                   isConnecting={isConnecting}
                   isEnvironmentUnavailable={environmentUnavailable !== null}
-                  sendBlockedReason={sendBlockedReason}
+                  sendBlockedReason={providerBindingConflictReason}
+                  environmentUnavailableReason={environmentSendBlockedReason}
                   isPreparingWorktree={isPreparingWorktree}
                   hasSendableContent={composerSendState.hasSendableContent}
                   isAttachmentSelectionDisabled={

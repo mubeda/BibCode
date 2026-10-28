@@ -268,7 +268,8 @@ vi.mock("./ComposerCommandMenu", () => ({
 vi.mock("./ComposerPendingApprovalActions", () => ({
   ComposerPendingApprovalActions: h.mk("ComposerPendingApprovalActions"),
 }));
-vi.mock("./ComposerPrimaryActions", () => ({
+vi.mock("./ComposerPrimaryActions", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./ComposerPrimaryActions")>()),
   ComposerPrimaryActions: h.mk("ComposerPrimaryActions"),
 }));
 vi.mock("./ComposerPendingApprovalPanel", () => ({
@@ -1173,7 +1174,7 @@ describe("ChatComposer rendering", () => {
     ["offline", null, "Laptop: Offline"],
     ["reconnecting", "Socket closed", "Laptop: Reconnecting…"],
     ["connecting", null, "Laptop: Connecting…"],
-    ["available", null, "Laptop: Available"],
+    ["available", null, "Laptop: Disconnected"],
     ["error", "Laptop rejected a new pairing credential.", "Laptop: Connection failed"],
   ] as const)(
     "keeps the editor editable while the environment is %s and blocks Send with its state",
@@ -1192,7 +1193,10 @@ describe("ChatComposer rendering", () => {
       );
       expect(markup).not.toContain("is not connected");
       expect(markup).not.toContain("opacity-75");
-      expect(findCapture("ComposerPrimaryActions")["sendBlockedReason"]).toBe(reason);
+      const primary = findCapture("ComposerPrimaryActions");
+      expect(primary["isEnvironmentUnavailable"]).toBe(true);
+      expect(primary["environmentUnavailableReason"]).toBe(reason);
+      expect(primary["sendBlockedReason"]).toBeNull();
       if (error) expect(markup).not.toContain(error);
     },
   );
@@ -3356,7 +3360,7 @@ describe("ChatComposer mobile", () => {
       },
     });
 
-    const send = hostByLabel("Laptop: Offline");
+    const send = hostByLabel("Send unavailable. Laptop: Offline");
     expect(send["disabled"]).toBe(true);
     expect(markup).toContain("ready to send");
 
