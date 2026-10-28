@@ -2095,6 +2095,25 @@ describe("ChatView effects (captured and run manually)", () => {
     for (const cleanup of cleanups) cleanup();
   });
 
+  it("reveals the end with a composer height measured in the same commit as the row's growth", async () => {
+    // The overlay measures 40 px in ChatView's layout effect, and the list reports the growth
+    // before ChatView renders that height: the geometry helpers must already use it (#204).
+    vi.stubGlobal("ResizeObserver", undefined);
+    seedHostState("composerOverlayElement", { getBoundingClientRect: () => ({ height: 40 }) });
+    const { list, cleanups, messageId, onAnchorReady } = await sendTallReply({});
+    // The height is set (state 20) but this render, and its captured props, still hold 0.
+    expect(h.setStateCalls.some((call) => call.index === 20 && call.applied === 40)).toBe(true);
+    onAnchorReady(messageId, 2);
+    list.scrollNode.fire("scrollend");
+
+    list.growRow(3, 57);
+    onRowSizeChanged()({ index: 3, previous: 100, size: 157 });
+
+    // 40 px further than the same growth with no composer (273): the end clears the overlay.
+    expect(list.calls.scrollToOffset.at(-1)).toEqual({ offset: 313, animated: false });
+    for (const cleanup of cleanups) cleanup();
+  });
+
   it("reveals the end again when a row above the anchored turn grows and shifts it", async () => {
     const { list, cleanups, messageId, onAnchorReady } = await sendTallReply({});
     onAnchorReady(messageId, 2);
