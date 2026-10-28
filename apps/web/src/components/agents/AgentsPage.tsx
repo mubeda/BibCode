@@ -13,7 +13,12 @@ import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } f
 
 import { findCenterPanelGroupForSurface } from "../../centerPanelLayout";
 import { useCenterPanelStore } from "../../centerPanelStore";
-import { useAgentRowFreshness, useAgentTerminalSources } from "../../hooks/useAgentFreshness";
+import {
+  type AgentEvidenceStamp,
+  useAgentRowFreshness,
+  useAgentTerminalSources,
+  useRecordAgentEvidence,
+} from "../../hooks/useAgentFreshness";
 import { cn } from "../../lib/utils";
 import { ChatRouteInset } from "../../routes/-ChatRouteInset";
 import { selectIsUnread, useSidebarWorkspaceMetaStore } from "../../sidebarWorkspaceMetaStore";
@@ -114,13 +119,14 @@ export function AgentsPage() {
     [shells, terminalSources],
   );
   const freshness = useAgentRowFreshness(decayable);
-  const rows = useMemo(() => {
+  const { rows, evidence } = useMemo(() => {
     const liveBranchByThreadKey = new Map<string, string>();
     for (const [threadKey, checkoutKey] of checkoutKeyByThreadKey) {
       const branch = liveBranchByCheckoutKey.get(checkoutKey);
       if (branch !== undefined) liveBranchByThreadKey.set(threadKey, branch);
     }
-    return buildAgentRows({
+    const evidence: AgentEvidenceStamp[] = [];
+    const rows = buildAgentRows({
       shells,
       projectTitleById: new Map<string, string>(
         projects.map((project) => [project.id, project.title]),
@@ -131,8 +137,9 @@ export function AgentsPage() {
       availabilityByEnvironmentId,
       liveBranchByThreadKey,
       terminals: terminalSources,
-      freshness,
+      freshness: freshness(evidence),
     });
+    return { rows, evidence };
   }, [
     availabilityByEnvironmentId,
     checkoutKeyByThreadKey,
@@ -143,6 +150,7 @@ export function AgentsPage() {
     shells,
     terminalSources,
   ]);
+  useRecordAgentEvidence(evidence);
   const unreadCount = useMemo(
     () => countUnreadAgentRows(rows, unreadThreadKeys),
     [rows, unreadThreadKeys],

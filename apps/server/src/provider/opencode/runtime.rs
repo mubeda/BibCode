@@ -50,6 +50,9 @@ const RECONCILIATION_HINT_CAPACITY: usize = 1;
 const RECONCILIATION_DEBOUNCE: Duration = Duration::from_millis(250);
 const RECONCILIATION_DEFERRED_DELAY: Duration = Duration::from_millis(10);
 const RECONCILIATION_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a resumed session's queued messages wait for the asks it kept to show before
+/// they may go anyway: the asks still appear when the event stream connects (#187).
+const RECOVERY_SETTLE_DEADLINE: Duration = Duration::from_secs(30);
 /// Bounds each request of an OpenCode 2 rewind, which the provider supervisor awaits.
 const REWIND_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// Bounds the whole history scan that finds a rewind's target, however many pages it reads.
@@ -974,15 +977,26 @@ impl OpenCodeSessionRuntime {
         self.reset_activity_root(session_id).await;
         self.emit("session.started", None, None, payload).await;
         self.emit("thread.started", None, None, json!({})).await;
+        // Queued messages wait only behind asks the resumed session kept (#187).
+        let holding_asks = !recovered_asks.is_empty();
         // OpenCode does not replay asks made while BiBCode was away; they are shown once the
         // event stream connects (see `v1_show_recovered_asks` and `v2_show_recovered_asks`).
         self.inner.v2.lock().await.recovered_asks = recovered_asks;
         // A resumed session may still be executing (OpenCode kept working while BiBCode was away),
         // and reconciles its pending asks once subscribed.
         if resumed {
-            let mut v2 = self.inner.v2.lock().await;
-            v2.adopt_on_connect = true;
-            v2.reconcile_asks_on_connect = true;
+            {
+                let mut v2 = self.inner.v2.lock().await;
+                v2.adopt_on_connect = true;
+                v2.reconcile_asks_on_connect = true;
+            }
+            if holding_asks {
+                self.settle_recovery_by_deadline();
+            } else {
+                // A resume that kept no asks has none to show first (#187).
+                self.emit("session.recovery-settled", None, None, json!({}))
+                    .await;
+            }
         }
         self.start_event_pump().await?;
         self.request_reconciliation(true, None, true).await;
@@ -2181,6 +2195,25 @@ impl OpenCodeSessionRuntime {
             events.push(event.stable_view());
         }
         events
+    }
+
+    /// Reports the recovery settled once its deadline passes, in case the event stream that
+    /// shows the kept asks never connects; a report after the real one changes nothing.
+    fn settle_recovery_by_deadline(&self) {
+        let runtime = Arc::downgrade(&self.inner);
+        let cancellation = self.inner.reconciliation_cancellation.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                () = cancellation.cancelled() => {}
+                () = tokio::time::sleep(RECOVERY_SETTLE_DEADLINE) => {
+                    if let Some(inner) = runtime.upgrade() {
+                        OpenCodeSessionRuntime::internal(inner)
+                            .emit("session.recovery-settled", None, None, json!({}))
+                            .await;
+                    }
+                }
+            }
+        });
     }
 
     async fn start_event_pump(&self) -> Result<(), OpenCodeRuntimeError> {
@@ -3494,6 +3527,9 @@ impl OpenCodeSessionRuntime {
             }
         }
         self.v1_route_listed(&session_id, &fresh).await;
+        // The asks it kept are shown: the resumed session may take queued messages (#187).
+        self.emit("session.recovery-settled", None, None, json!({}))
+            .await;
         // A list that could not be read is read again with a backoff, each failure logged, so
         // the asks it holds still appear.
         let mut delay = RESUME_READ_RETRY_FIRST;
@@ -3719,6 +3755,11 @@ impl OpenCodeSessionRuntime {
                 () = owner_cancellation.cancelled() => {}
                 () = async {
                     runtime.v2_show_recovered_asks(asks).await;
+                    // The asks it kept are shown: the resumed session may take queued
+                    // messages (#187).
+                    runtime
+                        .emit("session.recovery-settled", None, None, json!({}))
+                        .await;
                     runtime.v2_read_asks_again().await;
                 } => {}
             }
@@ -6315,6 +6356,9 @@ mod tests {
         let resolved = runtime.next_event().await.expect("resolution");
         assert_eq!(resolved.event_type, "request.resolved");
         runtime.v1_show_recovered_asks(Vec::new()).await;
+        // Recovery shows no ask and only reports that it settled (#187).
+        let settled = runtime.next_event().await.expect("recovery settled");
+        assert_eq!(settled.event_type, "session.recovery-settled");
         assert_no_queued_event(&runtime).await;
         assert!(runtime.inner.pending_permissions.lock().await.is_empty());
         server.abort();

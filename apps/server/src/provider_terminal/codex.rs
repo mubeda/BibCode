@@ -22,7 +22,7 @@ use process_wrap::tokio::{ChildWrapper, CommandWrap};
 use serde_json::{Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
-use super::model::{TerminalAgentState, TerminalObserverGenerationLease};
+use super::model::{TerminalAgentReport, TerminalAgentState, TerminalObserverGenerationLease};
 #[cfg(unix)]
 use super::supervisor::create_owned_generation_directory;
 use super::{
@@ -60,10 +60,11 @@ use crate::{
         build_initialize_params,
         model::{
             CODEX_RECONCILIATION_BACKGROUND_LIMIT, CODEX_RECONCILIATION_THREAD_LIMIT,
-            CODEX_REMOTE_JSON_TOO_LARGE, ThreadBackgroundTerminalsListParams, ThreadListParams,
-            ThreadReadParams, ThreadReadResponse, TurnsPager,
-            decode_background_terminals_list_response, decode_thread_list_response,
-            decode_thread_read_response, is_recoverable_thread_resume_error,
+            CODEX_REMOTE_JSON_TOO_LARGE, ReconciliationThread, ReconciliationThreadStatus,
+            ThreadBackgroundTerminalsListParams, ThreadListParams, ThreadReadParams,
+            ThreadReadResponse, TurnsPager, decode_background_terminals_list_response,
+            decode_thread_list_response, decode_thread_read_response,
+            is_recoverable_thread_resume_error,
         },
     },
 };
@@ -950,53 +951,35 @@ async fn run_codex_observer_inner(
         }
         break resumed;
     };
-
-    if !inner
-        .publisher
-        .publish_correlated(
-            "codex",
-            Some(&inner.provider_instance_id),
-            ActivityCapabilities::structured_full(false),
-        )
-        .await
-        .unwrap_or(false)
-    {
-        return;
+    // The left panel learns the root agent's state as soon as the observer attaches (#187).
+    if let Some((state, failed)) = codex_resumed_agent_status(resumed.thread.status.as_ref()) {
+        generation.publish_agent_status(state, failed);
     }
 
+    let initial_state = *activity.borrow_and_update();
     let mut tracker = CodexActivityTracker::new_for_terminal_observation(Some(&root));
     tracker.seed_actor(&root);
-    let native_event_key_prefix = format!("codex:terminal-observation:{epoch}");
-    let started_at_ms = current_unix_millis();
-    let mut root_output = tracker.handle_notification(
-        "thread/status/changed",
-        &json!({
-            "threadId": root,
-            "status": {"type": "active", "activeFlags": []},
-        }),
-        started_at_ms,
-        0,
-    );
-    let recovered = tracker.reconcile_thread_history(&resumed.thread);
-    root_output.mutations.extend(recovered.mutations);
-    root_output.request_reconciliation |= recovered.request_reconciliation;
-    apply_activity_output(
-        inner,
-        &format!("{native_event_key_prefix}:root"),
-        root_output,
-    )
-    .await;
-    reconcile_codex_terminal(
-        inner,
-        &native_event_key_prefix,
-        &mut *client,
-        &mut tracker,
-        &root,
-        0,
-    )
-    .await;
+    // A status-only observer publishes no activity, so it skips the history it would show;
+    // enabling activity later publishes the scope (#187).
+    let mut scope_published = false;
+    if initial_state.enabled {
+        if !publish_codex_root_scope(inner, &mut tracker, &root, epoch, Some(&resumed.thread)).await
+        {
+            return;
+        }
+        scope_published = true;
+        reconcile_codex_terminal(
+            inner,
+            &format!("codex:terminal-observation:{epoch}"),
+            &mut *client,
+            &mut tracker,
+            &root,
+            0,
+        )
+        .await;
+    }
+    drop(resumed);
 
-    let initial_state = *activity.borrow_and_update();
     let mut live_state = initial_state.enabled.then_some(initial_state);
     inner
         .activity
@@ -1158,6 +1141,15 @@ async fn run_codex_observer_inner(
                             epoch: barrier_epoch,
                             kind: TerminalAgentActivityObservationKind::Live,
                         });
+                    // An observer launched for status only never created its scope: publish
+                    // it with the root agent, then reconcile what runs under it (#187).
+                    if !scope_published
+                        && publish_codex_root_scope(inner, &mut tracker, &root, barrier_epoch, None)
+                            .await
+                    {
+                        scope_published = true;
+                        pending_reconciliation = true;
+                    }
                     publish_codex_live_scope(inner, barrier_epoch, receive_sequence).await;
                     receive_sequence = receive_sequence.saturating_add(1);
                     continue;
@@ -1310,8 +1302,8 @@ async fn run_codex_observer_inner(
                 };
                 // The root agent's state goes to the left panel whatever the activity setting
                 // says (#187).
-                if let Some((state, failed)) = codex_root_agent_status(&envelope, &root) {
-                    generation.publish_agent_status(state, failed);
+                if let Some(report) = codex_root_agent_status(&envelope, &root) {
+                    generation.report_agent_status(report);
                 }
                 let desired = inner.activity.snapshot();
                 if live_state != Some(desired)
@@ -1344,6 +1336,50 @@ async fn run_codex_observer_inner(
             }
         }
     }
+}
+
+/// Creates the terminal's activity scope with the TUI root agent and, at attach, the history
+/// `thread/resume` returned. False when this observer generation is no longer current.
+async fn publish_codex_root_scope(
+    inner: &CodexObserverInner,
+    tracker: &mut CodexActivityTracker,
+    root: &str,
+    epoch: u64,
+    history: Option<&ReconciliationThread>,
+) -> bool {
+    if !inner
+        .publisher
+        .publish_correlated(
+            "codex",
+            Some(&inner.provider_instance_id),
+            ActivityCapabilities::structured_full(false),
+        )
+        .await
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    let mut root_output = tracker.handle_notification(
+        "thread/status/changed",
+        &json!({
+            "threadId": root,
+            "status": {"type": "active", "activeFlags": []},
+        }),
+        current_unix_millis(),
+        0,
+    );
+    if let Some(history) = history {
+        let recovered = tracker.reconcile_thread_history(history);
+        root_output.mutations.extend(recovered.mutations);
+        root_output.request_reconciliation |= recovered.request_reconciliation;
+    }
+    apply_activity_output(
+        inner,
+        &format!("codex:terminal-observation:{epoch}:root"),
+        root_output,
+    )
+    .await;
+    true
 }
 
 async fn publish_codex_live_scope(inner: &CodexObserverInner, epoch: u64, receive_sequence: u128) {
@@ -1395,7 +1431,18 @@ async fn reconnect_attached_codex_client(
             client.request("thread/resume", json!({"threadId": root})),
         ) => response,
     };
-    matches!(response, Ok(Ok(_))).then_some(client)
+    let Ok(Ok(response)) = response else {
+        return None;
+    };
+    // The agent may have moved on while the connection was down (#187).
+    let status = response
+        .pointer("/thread/status")
+        .cloned()
+        .and_then(|status| serde_json::from_value::<ReconciliationThreadStatus>(status).ok());
+    if let Some((state, failed)) = codex_resumed_agent_status(status.as_ref()) {
+        generation.publish_agent_status(state, failed);
+    }
+    Some(client)
 }
 
 async fn reconnect_codex_root_discovery_client(
@@ -1569,42 +1616,73 @@ enum CodexRootDiscoveryOutcome {
 
 /// The TUI root agent's state a Codex notification reports, for the left panel (#187): its
 /// thread status (an approval or a question blocks it), or its turn starting and ending.
-pub(super) fn codex_root_agent_status(
-    envelope: &Value,
-    root: &str,
-) -> Option<(TerminalAgentState, bool)> {
+pub(super) fn codex_root_agent_status(envelope: &Value, root: &str) -> Option<TerminalAgentReport> {
     let params = envelope.get("params")?;
     if params.get("threadId")?.as_str()? != root {
         return None;
     }
-    match envelope.get("method")?.as_str()? {
+    let method = envelope.get("method")?.as_str()?;
+    let set = |state, failed| Some(TerminalAgentReport::Set(state, failed));
+    match method {
         "thread/status/changed" => {
             let status = params.get("status")?;
             match status.get("type")?.as_str()? {
                 "active" => {
                     let flags = status.get("activeFlags").and_then(Value::as_array);
-                    let flagged = |flag: &str| {
-                        flags.is_some_and(|flags| flags.iter().any(|value| value == flag))
-                    };
-                    Some(if flagged("waitingOnApproval") {
-                        (TerminalAgentState::Blocked, false)
-                    } else if flagged("waitingOnUserInput") {
-                        (TerminalAgentState::Waiting, false)
-                    } else {
-                        (TerminalAgentState::Working, false)
-                    })
+                    set(
+                        codex_active_agent_state(|flag| {
+                            flags.is_some_and(|flags| flags.iter().any(|value| value == flag))
+                        }),
+                        false,
+                    )
                 }
-                "idle" => Some((TerminalAgentState::Done, false)),
-                "systemError" => Some((TerminalAgentState::Done, true)),
+                "idle" => set(TerminalAgentState::Done, false),
+                "systemError" => set(TerminalAgentState::Done, true),
                 _ => None,
             }
         }
-        "turn/started" => Some((TerminalAgentState::Working, false)),
-        "turn/completed" => Some((
+        "turn/started" => set(TerminalAgentState::Working, false),
+        "turn/completed" => set(
             TerminalAgentState::Done,
             params.pointer("/turn/status").and_then(Value::as_str) == Some("failed"),
-        )),
+        ),
+        // A server request asks the user; an item notification is the agent's output
+        // streaming, which leaves an open ask shown.
+        _ if envelope.get("id").is_some() => match method {
+            "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
+                set(TerminalAgentState::Blocked, false)
+            }
+            "item/tool/requestUserInput" => set(TerminalAgentState::Waiting, false),
+            _ => None,
+        },
+        _ if method.starts_with("item/") => Some(TerminalAgentReport::Progress),
         _ => None,
+    }
+}
+
+/// The root agent's state a `thread/resume` response reports, for the left panel (#187).
+pub(super) fn codex_resumed_agent_status(
+    status: Option<&ReconciliationThreadStatus>,
+) -> Option<(TerminalAgentState, bool)> {
+    match status? {
+        ReconciliationThreadStatus::Active { active_flags } => Some((
+            codex_active_agent_state(|flag| active_flags.iter().any(|value| value == flag)),
+            false,
+        )),
+        ReconciliationThreadStatus::Idle => Some((TerminalAgentState::Done, false)),
+        ReconciliationThreadStatus::SystemError => Some((TerminalAgentState::Done, true)),
+        ReconciliationThreadStatus::NotLoaded | ReconciliationThreadStatus::Unknown => None,
+    }
+}
+
+/// An active thread is blocked on an approval, waiting on the user, or working.
+fn codex_active_agent_state(flagged: impl Fn(&str) -> bool) -> TerminalAgentState {
+    if flagged("waitingOnApproval") {
+        TerminalAgentState::Blocked
+    } else if flagged("waitingOnUserInput") {
+        TerminalAgentState::Waiting
+    } else {
+        TerminalAgentState::Working
     }
 }
 

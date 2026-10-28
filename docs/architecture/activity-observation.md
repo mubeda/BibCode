@@ -312,8 +312,11 @@ publishes activity:
 
 - An observer launched while the gate is off starts dormant
   (`TerminalAgentActivityControl::with_enabled(false)`, a `Prepared` launch
-  with no admission).
+  with no admission). It skips the history and child reconciliation it would
+  publish.
 - A dormant observer follows later gate transitions like any other observer.
+  When the gate opens on one that never published, it creates its activity
+  scope with the root agent then; OpenCode reconciles the session tree at once.
 
 **How each provider reports.** Each observer reports its main agent's state
 through its generation (`TerminalObserverGenerationLease::publish_agent_status`),
@@ -321,14 +324,24 @@ independently of admission:
 
 - **Claude:** status hooks on the existing authenticated loopback receiver.
   The hooks are `SessionStart`, `UserPromptSubmit`, `PermissionRequest`,
-  `Notification`, `Stop`, `StopFailure` and `SessionEnd`, plus main-agent
-  `PreToolUse` and `PostToolUse`. Status-only hooks never reach the activity
-  worker. Activity admission is still taken before the body arrives.
+  `Notification` (`idle_prompt` reads Done), `Elicitation`,
+  `ElicitationResult`, `Stop`, `StopFailure` and `SessionEnd`, plus main-agent
+  `PreToolUse` and `PostToolUse`; any agent's finished tool ends an approval
+  prompt. Status follows the main session, rebinding on `SessionStart`.
+  Status-only hooks never reach the activity worker, and status decodes only
+  the fields it reads; a hook is decoded whole only for live activity.
+  Activity admission is still taken before the body arrives.
 - **Codex:** the TUI root thread's `thread/status/changed` notifications
-  (including `activeFlags`), `turn/started` and `turn/completed`.
+  (including `activeFlags`), `turn/started`, `turn/completed`, its approval and
+  question requests, and its `item/*` notifications as progress. The
+  `thread/resume` response sets the state at attach and reattach.
 - **OpenCode:** root-session `session.status`, `session.idle`,
-  `session.error`, permission and question events, read from a dormant stream
-  too.
+  `session.error`, permission and question events, and its `message.part.*`
+  events as progress, read from a dormant stream too, which decodes only the
+  type, session and status fields. The session statuses set the state at
+  attach and reconnect (OpenCode lists only sessions that are not idle).
+- **Progress** reads Working unless the agent is blocked on an approval or
+  waiting on the user, which only an answer or a new status ends.
 
 **Publication.** The terminal manager mirrors the latest report into
 `TerminalSummary.agentStatus` on the metadata stream:
@@ -341,7 +354,8 @@ independently of admission:
 - A launch that names a provider but gets no observer reads `unavailable`.
   That covers Cursor and Grok, Windows, and a failed preparation, and the value
   stays `unavailable` after exit. An observed agent settles to `done` on exit,
-  failed for a non-zero exit code.
+  failed for a non-zero exit code other than a Ctrl+C quit (130, SIGINT, or
+  Windows' control-C status).
 
 **Trust boundary.** It is unchanged. Hooks still reach only a `127.0.0.1`
 listener with a per-generation bearer token, checked in constant time, and

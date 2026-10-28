@@ -2659,6 +2659,20 @@ fn migration_057(transaction: &Transaction<'_>) -> Result<()> {
         transaction
             .execute_batch("ALTER TABLE projection_threads ADD COLUMN last_activity_at TEXT;")?;
     }
+    if table_exists(transaction, "orchestration_events")? {
+        // Existing threads age from their latest provider event, so a long-silent one reads
+        // stale at once instead of fresh for another 30 minutes.
+        transaction.execute_batch(
+            "UPDATE projection_threads SET last_activity_at = (
+               SELECT MAX(event.occurred_at) FROM orchestration_events AS event
+                WHERE event.aggregate_kind = 'thread'
+                  AND event.stream_id = projection_threads.thread_id
+                  AND event.actor_kind = 'provider'
+             ) WHERE last_activity_at IS NULL;",
+        )?;
+    }
+    // Startup then expires the recounted questions and approvals that no live session holds
+    // (`OrchestrationEngine::expire_requests_of_settled_sessions`), as ordinary activities.
     if table_exists(transaction, "projection_thread_activities")? {
         let open =
             super::repositories::open_user_input_requests_sql("projection_threads.thread_id");
@@ -2808,6 +2822,35 @@ mod tests {
             )
             .unwrap();
         assert_eq!(value, None);
+    }
+
+    #[test]
+    fn migration_057_recounts_questions_and_backfills_provider_progress() -> rusqlite::Result<()> {
+        let mut connection = rusqlite::Connection::open_in_memory()?;
+        run_migrations(&mut connection, Some(56))?;
+        connection.execute_batch(
+            "INSERT INTO projection_threads (thread_id, project_id, title, model_selection_json, runtime_mode, interaction_mode, branch, worktree_path, latest_turn_id, created_at, updated_at, archived_at, deleted_at) VALUES ('t', 'p', 'T', '{}', 'full-access', 'default', NULL, NULL, NULL, '2026-10-08T00:00:00Z', '2026-10-08T00:00:00Z', NULL, NULL);
+             INSERT INTO projection_threads (thread_id, project_id, title, model_selection_json, runtime_mode, interaction_mode, branch, worktree_path, latest_turn_id, created_at, updated_at, archived_at, deleted_at) VALUES ('quiet', 'p', 'Q', '{}', 'full-access', 'default', NULL, NULL, NULL, '2026-10-08T00:00:00Z', '2026-10-08T00:00:00Z', NULL, NULL);
+             INSERT INTO projection_thread_activities (activity_id, thread_id, turn_id, tone, kind, summary, payload_json, sequence, created_at) VALUES ('ask', 't', NULL, 'info', 'user-input.requested', 'Q', '{\"requestId\":\"q1\"}', 1, '2026-10-08T00:01:00Z');
+             INSERT INTO projection_thread_activities (activity_id, thread_id, turn_id, tone, kind, summary, payload_json, sequence, created_at) VALUES ('ask-2', 't', NULL, 'info', 'user-input.requested', 'Q', '{\"requestId\":\"q2\"}', 2, '2026-10-08T00:02:00Z');
+             INSERT INTO projection_thread_activities (activity_id, thread_id, turn_id, tone, kind, summary, payload_json, sequence, created_at) VALUES ('answer-2', 't', NULL, 'info', 'user-input.resolved', 'A', '{\"requestId\":\"q2\"}', 3, '2026-10-08T00:03:00Z');
+             INSERT INTO orchestration_events (event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at, command_id, causation_event_id, correlation_id, actor_kind, payload_json, metadata_json) VALUES ('e1', 'thread', 't', 1, 'thread.activity-appended', '2026-10-08T00:01:00Z', 'provider:1', NULL, NULL, 'provider', '{}', '{}');
+             INSERT INTO orchestration_events (event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at, command_id, causation_event_id, correlation_id, actor_kind, payload_json, metadata_json) VALUES ('e2', 'thread', 't', 2, 'thread.meta-updated', '2026-10-08T00:09:00Z', 'client', NULL, NULL, 'client', '{}', '{}');",
+        )?;
+
+        run_migrations(&mut connection, Some(57))?;
+
+        let read = |thread: &str| {
+            connection.query_row(
+                "SELECT pending_user_input_count, last_activity_at FROM projection_threads WHERE thread_id = ?",
+                [thread],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+        };
+        // Only the unanswered question counts; the client rename is not provider progress.
+        assert_eq!(read("t")?, (1, Some("2026-10-08T00:01:00Z".to_owned())));
+        assert_eq!(read("quiet")?, (0, None));
+        Ok(())
     }
 
     #[test]

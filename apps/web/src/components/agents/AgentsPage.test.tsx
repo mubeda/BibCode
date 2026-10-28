@@ -371,9 +371,27 @@ function getButtonByText(container: HTMLElement, text: string): HTMLButtonElemen
   return button;
 }
 
+/** A row's accessible name or description: the text of the lines it references. */
+function referencedText(element: Element, attribute: "aria-labelledby" | "aria-describedby") {
+  return (element.getAttribute(attribute) ?? "")
+    .split(" ")
+    .filter((id) => id !== "")
+    .map((id) => element.ownerDocument.getElementById(id)?.textContent ?? "")
+    .join(", ");
+}
+
 function queryAgentRow(container: HTMLElement, title: string, status = "Working", env = "Local") {
-  return container.querySelector<HTMLButtonElement>(
-    `button[aria-label="${title}, ${status}, ${env}"]`,
+  return (
+    Array.from(container.querySelectorAll<HTMLButtonElement>("button[aria-labelledby]")).find(
+      (button) => {
+        const description = referencedText(button, "aria-describedby").split(", ");
+        return (
+          referencedText(button, "aria-labelledby").split(", ").includes(title) &&
+          description[0] === status &&
+          description.some((part) => part === env || part.startsWith(`${env} · `))
+        );
+      },
+    ) ?? null
   );
 }
 
@@ -469,10 +487,9 @@ describe("AgentsPage AI Terminal rows (#187)", () => {
       },
     ];
     const { container } = await mount(<AgentsPage />);
-    const row = container.querySelector<HTMLButtonElement>(
-      'button[aria-label="Host workspace, Claude Terminal, Pending Approval, Local"]',
-    );
+    const row = queryAgentRow(container, "Host workspace", "Pending Approval");
     expect(row).not.toBeNull();
+    expect(referencedText(row!, "aria-labelledby")).toContain("Claude Terminal");
     expect(container.querySelector('[data-testid="agents-group-status:blocked"]')).not.toBeNull();
 
     await click(row!);

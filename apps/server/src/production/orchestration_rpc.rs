@@ -2574,6 +2574,40 @@ mod tests {
     }
 
     #[test]
+    fn shell_snapshot_ages_provider_progress_on_the_server_clock() {
+        // Mutation caught: the shell dropping `lastActivityAgeMs`, or aging it from a clock the
+        // client does not share, so the left panel's freshness compares two clocks (#187).
+        let mut snapshot = preview_snapshot_fixture("running");
+        let shell = shell_snapshot_value(&snapshot, false);
+        assert!(
+            shell["threads"][0].get("lastActivityAgeMs").is_none(),
+            "a thread with no provider progress carries no age"
+        );
+
+        let at = OffsetDateTime::now_utc() - time::Duration::seconds(90);
+        snapshot.threads[0].last_activity_at = Some(at.format(&Rfc3339).unwrap());
+        let shell = shell_snapshot_value(&snapshot, false);
+        let age_ms = shell["threads"][0]["lastActivityAgeMs"]
+            .as_u64()
+            .expect("an age in whole milliseconds");
+        assert!((90_000..120_000).contains(&age_ms), "{age_ms}");
+
+        let future = OffsetDateTime::now_utc() + time::Duration::minutes(5);
+        snapshot.threads[0].last_activity_at = Some(future.format(&Rfc3339).unwrap());
+        assert_eq!(
+            shell_snapshot_value(&snapshot, false)["threads"][0]["lastActivityAgeMs"],
+            0,
+            "a time ahead of this clock is fresh, never negative"
+        );
+        snapshot.threads[0].last_activity_at = Some("not a time".to_owned());
+        assert!(
+            shell_snapshot_value(&snapshot, false)["threads"][0]
+                .get("lastActivityAgeMs")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn thread_shell_embeds_preview_and_detail_omits_it() {
         let snapshot = preview_snapshot_fixture("running");
         let previews = build_conversation_previews(&snapshot);
