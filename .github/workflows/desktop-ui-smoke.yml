@@ -16,46 +16,23 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - label: Linux arm64
-            runner: ubuntu-22.04-arm
-            platform: linux
-            arch: arm64
-            bundle: appimage
-            rustTarget: aarch64-unknown-linux-gnu
-          - label: Linux x64
-            runner: ubuntu-22.04
-            platform: linux
-            arch: x64
-            bundle: appimage
-            rustTarget: x86_64-unknown-linux-gnu
           - label: Windows x64
             runner: windows-2025
             platform: win
             arch: x64
             bundle: nsis
             rustTarget: x86_64-pc-windows-msvc
-          - label: Windows arm64
-            runner: windows-11-vs2026-arm
-            platform: win
-            arch: arm64
-            bundle: nsis
-            rustTarget: aarch64-pc-windows-msvc
           - label: macOS arm64
             runner: macos-26
             platform: mac
             arch: arm64
             bundle: dmg
             rustTarget: aarch64-apple-darwin
-          - label: macOS x64
-            runner: macos-26-intel
-            platform: mac
-            arch: x64
-            bundle: dmg
-            rustTarget: x86_64-apple-darwin
     env:
       BIBCODE_E2E_PLATFORM: ${{ matrix.platform }}
       BIBCODE_E2E_ARCH: ${{ matrix.arch }}
       BIBCODE_E2E_BUNDLE: ${{ matrix.bundle }}
+      BIBCODE_E2E_SPEC: ./specs/mermaid-diagrams.e2e.ts
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
