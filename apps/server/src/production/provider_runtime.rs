@@ -32955,6 +32955,10 @@ printf '2.1.0 (Claude Code)\n'
                         "--version",
                         tokio::time::Instant::now() + Duration::from_secs(10),
                         super::ClaudeProbeLaunchPolicy::Direct,
+                        &super::ClaudeProbeContext {
+                            environment: std::env::vars_os().collect::<Vec<_>>().into(),
+                            cwd: temp.path().to_path_buf(),
+                        },
                     ))
                     .expect("Claude probe completes");
                 assert_eq!(output.lines().next(), Some("2.1.0 (Claude Code)"));
