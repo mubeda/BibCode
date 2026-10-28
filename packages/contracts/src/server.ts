@@ -583,6 +583,101 @@ export class DiagnosticLogsError extends Schema.TaggedError<DiagnosticLogsError>
   },
 ) {}
 
+/**
+ * A `bibcode diagnostics download` on this host waiting for the desktop app (#201): the
+ * environment it names (an id or a label, resolved by the app), and whether it asked for
+ * crash dumps. `requestId` is new for every request, so an item for an older one is stale.
+ */
+export const DiagnosticLogsRelayRequest = Schema.Struct({
+  requestId: TrimmedNonEmptyString,
+  environment: TrimmedNonEmptyString,
+  includeCrashDumps: Schema.Boolean,
+});
+export type DiagnosticLogsRelayRequest = typeof DiagnosticLogsRelayRequest.Type;
+
+/**
+ * `server.subscribeDiagnosticLogsRelay`: a request to approve, then `Closed` once it is over
+ * (answered elsewhere, expired, or the command left), so a prompt for it goes away.
+ */
+export const DiagnosticLogsRelayEvent = Schema.Union([
+  Schema.TaggedStruct("Pending", { request: DiagnosticLogsRelayRequest }),
+  Schema.TaggedStruct("Closed", { requestId: TrimmedNonEmptyString }),
+]);
+export type DiagnosticLogsRelayEvent = typeof DiagnosticLogsRelayEvent.Type;
+
+export const DiagnosticLogsRelayClaimInput = Schema.Struct({ requestId: TrimmedNonEmptyString });
+export type DiagnosticLogsRelayClaimInput = typeof DiagnosticLogsRelayClaimInput.Type;
+
+/** `claimed` is false when another window answered first or the request is already over. */
+export const DiagnosticLogsRelayClaimResult = Schema.Struct({ claimed: Schema.Boolean });
+export type DiagnosticLogsRelayClaimResult = typeof DiagnosticLogsRelayClaimResult.Type;
+
+/** Why the app could not relay the logs; the command prints `message`. */
+export const DiagnosticLogsRelayFailureReason = Schema.Literals([
+  "unknown-environment",
+  "ambiguous-environment",
+  "not-connected",
+  "unsupported",
+  "unverified",
+  "wrong-environment",
+  "incomplete",
+  "too-large",
+  "not-permitted",
+  "crash-dumps-refused",
+  "server-failed",
+  "connection-lost",
+]);
+export type DiagnosticLogsRelayFailureReason = typeof DiagnosticLogsRelayFailureReason.Type;
+
+/** An environment the app can reach, listed when the requested one matched none or several. */
+export const DiagnosticLogsRelayEnvironment = Schema.Struct({
+  environmentId: TrimmedNonEmptyString,
+  label: Schema.String,
+  connected: Schema.Boolean,
+});
+export type DiagnosticLogsRelayEnvironment = typeof DiagnosticLogsRelayEnvironment.Type;
+
+/**
+ * What the claiming app sends for a request, in order: `Denied` or `Failed` alone, or
+ * `Started`, `Data` items (base64, at most {@link DIAGNOSTIC_LOGS_CHUNK_BYTES} each) whose
+ * decoded lengths sum to `byteLength`, then `Finished`.
+ */
+export const DiagnosticLogsRelayItem = Schema.Union([
+  Schema.TaggedStruct("Denied", {}),
+  Schema.TaggedStruct("Failed", {
+    reason: DiagnosticLogsRelayFailureReason,
+    message: TrimmedNonEmptyString,
+    environments: Schema.optional(Schema.Array(DiagnosticLogsRelayEnvironment)),
+  }),
+  Schema.TaggedStruct("Started", {
+    fileName: TrimmedNonEmptyString,
+    byteLength: NonNegativeInt,
+    manifest: DiagnosticLogsManifest,
+  }),
+  Schema.TaggedStruct("Data", { data: Schema.String }),
+  Schema.TaggedStruct("Finished", {}),
+]);
+export type DiagnosticLogsRelayItem = typeof DiagnosticLogsRelayItem.Type;
+
+export const DiagnosticLogsRelaySendInput = Schema.Struct({
+  requestId: TrimmedNonEmptyString,
+  item: DiagnosticLogsRelayItem,
+});
+export type DiagnosticLogsRelaySendInput = typeof DiagnosticLogsRelaySendInput.Type;
+
+/**
+ * Why the server refused an item. `stale`: the request is over or was never this
+ * connection's (stop sending); `cancelled`: the command left (stop the download);
+ * `invalid`: the item broke the order or a bound, which ends the request.
+ */
+export class DiagnosticLogsRelayError extends Schema.TaggedError<DiagnosticLogsRelayError>()(
+  "DiagnosticLogsRelayError",
+  {
+    reason: Schema.Literals(["stale", "cancelled", "invalid", "not-desktop"]),
+    message: TrimmedNonEmptyString,
+  },
+) {}
+
 export const ServerConfig = Schema.Struct({
   environment: ExecutionEnvironmentDescriptor,
   auth: ServerAuthDescriptor,
