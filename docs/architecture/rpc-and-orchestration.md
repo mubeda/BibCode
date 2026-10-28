@@ -2649,9 +2649,10 @@ Requests also settle without an answer:
 
 Queue consequence: an open request still holds queued follow-ups after the turn
 settles `ready`, as before. A resumed OpenCode session launches `starting` and
-turns `ready` only when its runtime reports `session.recovery-settled`, after
-it has shown the asks it kept, so a queued follow-up never passes a recovered
-ask.
+turns `ready` only when its runtime reports `session.recovery-settled`: at
+once when the resume kept no asks, otherwise after it has shown them (or after
+30 seconds without an event stream), so a queued follow-up never passes a
+recovered ask. A resume OpenCode refused launches `ready`.
 `orchestration.replayEvents` with `paged: true` returns about 1 MiB pages
 `{ events, exhausted }`, keeping at least one event when any remain. Replay
 resumes from the last applied `sequence` with no server state; the cursor is
