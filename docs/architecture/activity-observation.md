@@ -51,10 +51,12 @@ Terminal-state monotonicity currently differs by layer:
 - The repository rejects a terminal-to-non-terminal update only when its
   `updatedAt` is strictly older than the stored terminal update. Equal or newer
   updates are accepted.
-- The client incremental reducer rejects every terminal-to-non-terminal summary
-  update while still accepting the containing delta revision. That delta does
-  not itself trigger recovery, so the client can show the terminal summary until
-  a later authoritative snapshot replaces it.
+- The client incremental reducer never moves a visible summary from terminal
+  back to active. A non-terminal update of a visible terminal summary at the same
+  or a newer `updatedAt` is one the repository accepted, such as a resumed Codex
+  child reported again. The reducer treats it as a gap: it returns before
+  advancing the revision, and the client fetches one authoritative snapshot. An
+  older update is dropped and the delta applies.
 
 Interruption on teardown is also topology-specific. The Claude terminal
 observer explicitly marks tracked active records `interrupted` when its worker
@@ -64,6 +66,44 @@ observer and then invalidates further publication. Separately, repository
 startup cleanup interrupts unresolved records in persisted terminal scopes, and
 replacing the current generation for the same terminal interrupts active
 records in the prior scope.
+
+A structured chat closes its own unresolved records when the provider process
+that ran them is gone (#206). Nothing will report them again. The provider
+runtime calls `ActivityProjection::interrupt_unresolved_scope` for the thread
+scope in these places:
+
+- `detach_session`, after the session's activity tasks are reaped and before the
+  scope is republished Live. This covers stop, removal, idle suspension, the
+  lazy detach of an ended session, and `shutdown_sessions`, which an app
+  update's quiesce runs.
+- The relaunch teardown, before the new process starts.
+- The supervisor's `SessionStreamEnded` arm, on both the settled and the
+  settlement-timeout branch. A crashed process closes without waiting for
+  another delivery.
+- Server start, after the terminal pass and before abandoned sessions are
+  reconciled.
+
+The interruption runs in one transaction under the scope's publication lock:
+the repository reads the unresolved records and journals their deltas through
+the same batch code as provider mutations, so subscribers receive ordinary
+deltas. Each closed record gets `updatedAt == terminalAt ==` the closure time.
+That time is the ordering fence: a report from the dead process with an older
+`updatedAt` cannot reopen the record, while a real terminal report still
+replaces `interrupted`. The summary says why and when the record last reported,
+for example "Claude session ended before this subagent reported; last report 34m
+after it started." It keeps any earlier summary after it, and replaces an
+earlier closure's prefix. The last report is the later of the record's
+`updatedAt` and its newest entry. Closing a record retained under a section the
+scope no longer negotiates needs no capability, so a hookless relaunch closes
+its predecessor's subagents too.
+
+Only a BiBCode-owned process is treated as gone. `ProviderDriver::owns_native_work`
+is false for an OpenCode session attached to a server the user runs, and its
+records stay as they are on detach. At startup there is no live driver: an
+OpenCode scope closes only when its persisted `provider_session_runtime` row
+carries `processOwner: "bibcode"`, which `OpenCodeDriver::start` writes. Every
+other chat provider always runs its own child. This matches #187's
+`EXTERNALLY_RESUMABLE_PROVIDERS` rule for open requests.
 
 ## Protocol v2, revisions, control overlays, and resync
 
@@ -447,6 +487,15 @@ for the pass with a log warning, the snapshot stays partial (background work is
 not treated as authoritative), and the next pass asks again.
 These recovery downgrades do not disable ordinary Codex chat.
 
+A Claude chat subagent that is still open at its parent turn's `result` closes as
+`interrupted` only when its correlator-confirmed task is missing from Claude's
+complete live set. The set is complete after a `background_tasks_changed` whose
+every non-ambient task had a usable `task_id`. An overflow, or a list with an
+unnamed task, makes it incomplete until the next complete list. A
+`SubagentStop` that arrives after such a close, in the same tracker, completes
+the record at a time no earlier than the closure. An actor without a confirmed
+task waits for its stop hook or for its process to end.
+
 Claude structured control normally joins native task identity only through the
 complete same-session, same-generation Agent/Task `tool_use_id` chain: an Agent
 tool invocation from either the current `assistant` record or the legacy
@@ -734,13 +783,14 @@ and [`apps/server/tests/provider_opencode.rs`](../../apps/server/tests/provider_
 
 ## Troubleshooting states
 
-| State            | Meaning                                                                                                                                                                           | Operator response                                                                                                                                 |
-| ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Live**         | The scope or section is current and contiguous revisions are applying.                                                                                                            | No action.                                                                                                                                        |
-| **Reconnecting** | If emitted, the scope says its observer is attempting to re-establish provider state. A client transport reconnect separately keeps the last snapshot stale until resubscription. | Wait for a replacement snapshot; inspect provider connectivity if it persists.                                                                    |
-| **Stale**        | Previously valid data is retained, but reconciliation or transport recovery has not established that it is current.                                                               | Treat the data as historical and resolve the reported provider/connection condition.                                                              |
-| **Error**        | A scope's bare `observationState` is `error`, or a section health object is `error`. Only section health has `message` and `retryable` fields.                                    | For a section, inspect its message and retryability. For a scope, use operational logs plus reconnect, resubscribe, and snapshot-resync evidence. |
-| **Interrupted**  | A record—not the scope—reached the terminal `interrupted` lifecycle through a provider-specific transition or repository cleanup.                                                 | Treat that work as ended; start a new provider operation if needed.                                                                               |
+| State                                             | Meaning                                                                                                                                                                           | Operator response                                                                                                                                                                                                         |
+| ------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Live**                                          | The scope or section is current and contiguous revisions are applying.                                                                                                            | No action.                                                                                                                                                                                                                |
+| **Reconnecting**                                  | If emitted, the scope says its observer is attempting to re-establish provider state. A client transport reconnect separately keeps the last snapshot stale until resubscription. | Wait for a replacement snapshot; inspect provider connectivity if it persists.                                                                                                                                            |
+| **Stale**                                         | Previously valid data is retained, but reconciliation or transport recovery has not established that it is current.                                                               | Treat the data as historical and resolve the reported provider/connection condition.                                                                                                                                      |
+| **Error**                                         | A scope's bare `observationState` is `error`, or a section health object is `error`. Only section health has `message` and `retryable` fields.                                    | For a section, inspect its message and retryability. For a scope, use operational logs plus reconnect, resubscribe, and snapshot-resync evidence.                                                                         |
+| **Interrupted**                                   | A record—not the scope—reached the terminal `interrupted` lifecycle through a provider-specific transition or repository cleanup.                                                 | Treat that work as ended; start a new provider operation if needed.                                                                                                                                                       |
+| **Interrupted, "… ended before this … reported"** | BiBCode closed the record because the process that ran it is gone: a stop, suspension, relaunch, crash, update or server restart. The summary gives the last report.              | Look in `server.log` for `closed the open activity of an ended provider session` or `closed chat activity left open by the previous server`. A record still **Running** for an OpenCode server the user runs is expected. |
 
 An absent dock is also meaningful: protocol v2 may be unavailable, the provider
 may be unsupported, or a terminal handshake may not have established correlated

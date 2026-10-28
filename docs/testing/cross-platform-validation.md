@@ -788,6 +788,19 @@ cargo test -p bibcode-server --test production_provider_runtime a_hookless_resta
 cargo test -p bibcode-server --test production_provider_runtime concurrent_launches_share_one_shim_recheck
 ```
 
+For a change to how a chat's subagents close when their process ends (#206),
+also run the process-end seams. They cover the callers: idle suspension,
+shutdown, a crash with no further turn, a server the user runs, a Codex child
+reported again, the OpenCode owner flag across a restart, startup repair, and
+the Claude turn-end close:
+
+```sh
+cargo test -p bibcode-server --test activity_repository process_end
+cargo test -p bibcode-server --test activity_provider_conformance
+cargo test -p bibcode-server --test production_maintenance open_subagent_records
+cargo test -p bibcode-server --lib -- interrupts_an_open_subagent ends_by_itself a_server_the_user_runs idle_deadline_suspends_a_running_subagent a_live_codex_report_after opencode_records_who_runs startup_interrupts_unresolved turn_end_activity_tests hook_sink
+```
+
 These tests are Unix-only. The live check runs on a remote Linux server whose
 `claude` is a mise shim, as Omarchy installs it. Confirm with
 `readlink -f "$(command -v claude)"`, which should print the `mise` binary.
@@ -804,7 +817,11 @@ These tests are Unix-only. The live check runs on a remote Linux server whose
    `--include-hook-events`, then change effort again. The new probe line should
    show the new version and `outcome="unsupported"`. **Subagents** should then
    show "Provider no longer reports this retained activity" instead of a live
-   section.
+   section. A subagent that was still running before the restart is under
+   **Done** as **Interrupted**, and its first line starts "Claude session ended
+   before this subagent reported". `server.log` has a
+   `closed the open activity of an ended provider session` line for the thread.
+   A row still reading **Running** there is a failure (#206).
 
 A `found another program` warning means the probe reached `mise` itself. Record
 that, and the lines around it, as a failure.
@@ -3183,6 +3200,9 @@ sizes. Cover relevant:
 - terminal input/output and panel switching, including each chat and Codex terminal pane's
   own Activity panel in a split: it stays inside its pane, the composer stays usable, and
   the terminal redraws at its new size;
+- stopping a chat whose subagents still run moves them from **Active** to **Done** as
+  **Interrupted**, each saying its session ended before it reported (the packaged
+  `chat-activity-panel` spec automates this with its Codex fixture);
 - Files tree nesting, mutations, and moves: one row per directory with its own
   expand arrow rather than merged directory chains, **New File…** creating the
   entry in the clicked nested folder while expanded folders stay expanded, a

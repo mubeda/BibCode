@@ -301,6 +301,42 @@ Codex/OpenCode AI Terminal teardown.
    workspace Clippy are run (Docs, Gates).
 10. Trigger ranking removed: the remote report is acceptance gate 1.
 
+## Revision 3 (Codex second pass, folded in during implementation)
+
+1. **Equal-timestamp reopen.** The reducer treats a non-terminal update of a
+   visible terminal summary at the same or a newer `updatedAt` as a gap. It
+   returns before advancing the revision. `activity.test.ts` drives the client
+   recovery caller: exactly one snapshot fetch, convergence on the reopened
+   row, and no second fetch for a duplicate delta.
+2. **Malformed live set.** `background_tasks_changed` is complete only when
+   every non-ambient task has a usable `task_id`. A missing `tasks` array, an
+   unnamed task, or an overflow makes it incomplete.
+   `turn_end_activity_tests.rs` covers the unnamed-task frame followed by a
+   root `result`: the mapped actor stays open.
+3. **OpenCode ownership end to end.** `OpenCodeDriver::start` returns
+   `{"processOwner": "bibcode" | "external"}` from `child.is_some()`. The test
+   `opencode_records_who_runs_its_server_and_startup_closes_only_bibcode_owned_work`
+   launches a real `OpenCodeDriver` through the supervisor against an HTTP
+   fixture, reads the persisted runtime row, and runs the startup repair. The
+   flag is never seeded. An owned server uses a stand-in child process. Live
+   detach uses `ProviderDriver::owns_native_work`, the existing ownership
+   predicate, rather than the launch endpoint.
+4. **Remote and older servers.** `activity.test.ts` covers both: a reconnected
+   subscription whose snapshot shows the interrupted row and its counts with no
+   extra fetch, and an older server's running deltas, which apply with no
+   refetch and unchanged counts.
+
+Placement changes from the table above:
+
+- The caller-level stop, suspension, shutdown, crash, external-server and Codex
+  reopen tests live in `production/provider_runtime.rs` next to the
+  `IdleDeadlineFixture`.
+- Startup ownership is covered by `production/runtime.rs` and
+  `tests/production_maintenance.rs`.
+- The dropped-hook proof is the `hook_sink` unit test plus the process-end
+  tests. `tests/provider_claude.rs` gained no case, because the fixture adapter
+  there has no process to end.
+
 ## Remote server prompt (read-only, for the user to run with Claude on the server)
 
 ```
