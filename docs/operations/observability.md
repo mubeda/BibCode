@@ -327,7 +327,10 @@ and storage design is in
   `incomplete`, `too-large`, `exists`, `store-failed`, `protocol` or
   `server-failed`; 2 for `unauthorized` (revoked or expired) or
   `crash-dumps-refused`; 3 for `not-paired`, `unreachable`, `tls` or
-  `unsupported`. `pair` uses the same codes: 0 paired, 2 `offer-refused`.
+  `unsupported`. `pair` uses the same codes: 0 paired, 2 `offer-refused`, and 1
+  for `pairing-rejected`, `busy` (another command holds the name for more than
+  90 s) or `rollback-failed` (a refused pairing's record could not be deleted;
+  the message names `bibcode diagnostics forget <name>`).
 - An `https` remote's certificate is verified against the operating system's
   trust; a certificate it cannot verify exits 3 with `tls` before anything is
   sent, so the offer stays unused.

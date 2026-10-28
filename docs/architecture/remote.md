@@ -566,11 +566,17 @@ its own device and holds no connection between runs.
   written (create, never replace), then `auth.confirmPairing` on the same
   channel when the reply asks for it. A typed refusal deletes the record. A
   lost answer is settled by one bearer reconnect: authenticated keeps the
-  record, `unauthorized` deletes it, anything else keeps it and says so. A
-  deletion removes only the record this attempt wrote, matched by its random
-  pairing id (`SecretStore::remove_if` moves it aside atomically, checks it, and
-  links back one that does not match), so a `forget` and re-pair under the
-  same name during the confirmation keeps the newer record. A record whose
+  record, `unauthorized` deletes it, anything else keeps it and says so. The
+  whole attempt, from the name check through any rollback, holds an advisory OS
+  lock on `<name>.lock` in the store directory (`flock` on Unix, `LockFileEx`
+  on Windows), as does `forget`; the system releases it when the holder exits,
+  crashed or not, so a dead holder never blocks the name. A `forget` and
+  re-pair of the same name therefore waits for a pairing in progress. Under
+  the lock, a rollback reads the record and deletes it only if it holds this
+  attempt's random pairing id; nothing is ever moved aside, so a crash leaves
+  the record readable under its name. A rollback that cannot delete the record
+  exits 1 with `rollback-failed` and names `bibcode diagnostics forget <name>`.
+  A record whose
   write succeeded but left a temporary link behind counts as stored and is
   confirmed; the leftover file is reported.
 - **Storage.** One record per remote in

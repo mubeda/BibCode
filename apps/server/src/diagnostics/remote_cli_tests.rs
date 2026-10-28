@@ -370,10 +370,14 @@ fn record_named(name: &str, pairing_id: &str) -> StoredRemote {
     }
 }
 
-/// While attempt A waits for its confirmation, the user forgets `box` and pairs it again
-/// (attempt B). The remote then refuses A's confirmation: A's rollback must leave B's record.
-#[tokio::test]
-async fn a_refused_confirmation_never_removes_a_newer_record_under_the_same_name() {
+/// A fake remote that accepts a diagnostics pairing, then holds the confirmation until the
+/// test lets it answer, and refuses it. Returns the offer, a signal for "the confirmation
+/// arrived" (A's record is written by then), and the switch that lets it answer.
+async fn refusing_remote() -> (
+    String,
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
     let keypair = snow::Builder::new(crate::auth::NOISE_NK_PARAMS.parse().unwrap())
         .generate_keypair()
         .unwrap();
@@ -405,8 +409,10 @@ async fn a_refused_confirmation_never_removes_a_newer_record_under_the_same_name
         .await;
         let confirm = fake_receive(&mut socket, &mut transport).await;
         assert_eq!(confirm["tag"], "auth.confirmPairing");
-        reached.send(()).unwrap();
-        may_answer.await.unwrap();
+        let _ = reached.send(());
+        if may_answer.await.is_err() {
+            return;
+        }
         fake_send(
             &mut socket,
             &mut transport,
@@ -428,6 +434,15 @@ async fn a_refused_confirmation_never_removes_a_newer_record_under_the_same_name
         storage_instance_id: "store-fake".to_owned(),
     })
     .expect("offer");
+    (code, reached_confirmation, proceed)
+}
+
+/// While attempt A waits for its confirmation, the user runs `forget box` and pairs it again
+/// (attempt B). B waits for A's lock instead of interleaving; A's refused confirmation removes
+/// only A's record; B's record then stands.
+#[tokio::test]
+async fn a_concurrent_forget_and_re_pair_waits_for_the_pairing_and_keeps_the_newer_record() {
+    let (code, reached_confirmation, proceed) = refusing_remote().await;
     let cli = tempfile::tempdir().expect("cli state");
     let store = RemoteStore::open(cli.path()).await.expect("store");
 
@@ -443,13 +458,28 @@ async fn a_refused_confirmation_never_removes_a_newer_record_under_the_same_name
             .expect("A waits for its confirmation");
         let written_by_a = store.read("box").await.unwrap().expect("A's record");
         assert_eq!(written_by_a.credential, "credential-a");
-        // `forget box`, then attempt B pairs under the same name.
-        assert!(store.remove("box").await.unwrap());
-        store
-            .create(&record_named("box", "attempt-b"))
+        let busy = store
+            .lock("box", Duration::ZERO)
             .await
-            .expect("B's record");
-        proceed.send(()).unwrap();
+            .err()
+            .expect("A holds the name");
+        assert_eq!(reason(&busy), "busy");
+        let forget_and_re_pair = async {
+            let lock = store.lock("box", LOCK_WAIT).await.expect("A lets go");
+            let forgot = store.remove("box").await.unwrap();
+            store
+                .create(&record_named("box", "attempt-b"))
+                .await
+                .expect("B's record");
+            drop(lock);
+            forgot
+        };
+        let let_a_finish = async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            proceed.send(()).unwrap();
+        };
+        let (forgot, ()) = tokio::join!(forget_and_re_pair, let_a_finish);
+        assert!(!forgot, "A had already removed its own record");
     };
     let (outcome, ()) = tokio::join!(attempt_a, meanwhile);
 
@@ -466,14 +496,90 @@ async fn a_refused_confirmation_never_removes_a_newer_record_under_the_same_name
     assert_eq!(kept.credential, "credential-b");
 }
 
+/// A pairing that stops between writing its record and its confirmation (here its future is
+/// dropped, as a crash ends it; the OS releases the lock of a dead process the same way)
+/// leaves the record readable under its own name and the name free.
+#[tokio::test]
+async fn a_pairing_stopped_after_writing_leaves_the_record_readable_and_the_name_free() {
+    let (code, reached_confirmation, _proceed) = refusing_remote().await;
+    let cli = tempfile::tempdir().expect("cli state");
+    let store = RemoteStore::open(cli.path()).await.expect("store");
+
+    tokio::select! {
+        _ = pair(cli.path(), &code, Some("box".to_owned()), &ServerTrust::Platform) => {
+            panic!("the pairing waits for its confirmation");
+        }
+        reached = reached_confirmation => reached.expect("A waits for its confirmation"),
+    }
+
+    let record = store.read("box").await.unwrap().expect("readable by name");
+    assert_eq!(record.credential, "credential-a");
+    assert_eq!(store.names().await.unwrap(), ["box"]);
+    store
+        .lock("box", Duration::ZERO)
+        .await
+        .expect("the stopped pairing's lock is released");
+}
+
+/// A refused pairing whose record cannot be removed says so, names `forget`, and fails.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_rollback_that_cannot_remove_the_record_says_how_to_remove_it() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let (code, reached_confirmation, proceed) = refusing_remote().await;
+    let cli = tempfile::tempdir().expect("cli state");
+    let directory = cli.path().join(REMOTES_DIRECTORY);
+
+    let attempt = pair(
+        cli.path(),
+        &code,
+        Some("box".to_owned()),
+        &ServerTrust::Platform,
+    );
+    let meanwhile = async {
+        reached_confirmation
+            .await
+            .expect("A waits for its confirmation");
+        // A record in a directory that refuses removal.
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o500)).unwrap();
+        proceed.send(()).unwrap();
+    };
+    let (outcome, ()) = tokio::join!(attempt, meanwhile);
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let outcome = outcome.expect_err("the pairing failed");
+    assert_eq!(reason(&outcome), "rollback-failed", "{outcome:?}");
+    assert_eq!(outcome.exit_code(), 1);
+    let Outcome::Failed { message, .. } = &outcome else {
+        panic!("{outcome:?}");
+    };
+    assert!(
+        message.contains("bibcode diagnostics forget box"),
+        "{message}"
+    );
+    assert!(
+        RemoteStore::open(cli.path())
+            .await
+            .unwrap()
+            .read("box")
+            .await
+            .unwrap()
+            .is_some(),
+        "the record remains, as the message says"
+    );
+}
+
 #[tokio::test]
 async fn a_record_stored_with_a_stray_temporary_file_counts_as_stored() {
     let cli = tempfile::tempdir().expect("cli state");
+    let root = cli.path().join(REMOTES_DIRECTORY);
     let store = RemoteStore {
-        store: SecretStore::new(cli.path().join(REMOTES_DIRECTORY))
+        store: SecretStore::new(&root)
             .await
             .expect("store")
             .fail_published_cleanup_for_test(),
+        root,
     };
     let note = store
         .create(&record_named("box", "attempt"))
