@@ -6521,13 +6521,15 @@ async fn run_supervisor(
                         entry.event_cancellation.cancel();
                     }
                     // The process is gone whether or not its projection settled; closing its
-                    // activity needs no further delivery (#206).
-                    interrupt_ended_session_activity(
-                        &activity,
-                        &entry.launch,
-                        entry.driver.as_ref(),
-                    )
-                    .await;
+                    // activity needs no further delivery (#206). Off the supervisor loop: a
+                    // projection still stuck on the database must not hold other threads'
+                    // traffic, and the closure time fences whatever lands first.
+                    let activity = activity.clone();
+                    let launch = entry.launch.clone();
+                    let driver = entry.driver.clone();
+                    tokio::spawn(async move {
+                        interrupt_ended_session_activity(&activity, &launch, driver.as_ref()).await;
+                    });
                 }
             }
             SupervisorMessage::Deliver {
