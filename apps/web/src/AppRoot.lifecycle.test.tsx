@@ -60,6 +60,10 @@ vi.mock("./rpc/atomRegistry", () => ({
   AppAtomRegistryProvider: ({ children }: { readonly children?: React.ReactNode }) => children,
 }));
 
+vi.mock("./diagnostics/DiagnosticLogsRelayHost", () => ({
+  DiagnosticLogsRelayHost: () => null,
+}));
+
 vi.mock("./components/preview/PreviewAutomationHosts", () => ({
   PreviewAutomationHosts: () => null,
 }));

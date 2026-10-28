@@ -109,6 +109,17 @@ function threadAfter(added: number): OrchestrationThread {
 }
 
 const settle = Effect.promise(() => new Promise((resolve) => setTimeout(resolve, 20)));
+// A fixed delay is a guess about how fast the state reaches the view; under parallel load it is
+// too short and the view still shows the previous thread. Wait for the state itself instead.
+const waitUntil = (description: string, condition: () => boolean) =>
+  Effect.gen(function* () {
+    for (let attempt = 0; attempt < 1_000 && !condition(); attempt += 1) {
+      yield* Effect.promise(() => new Promise((resolve) => setTimeout(resolve, 10)));
+    }
+    if (!condition()) {
+      return yield* Effect.die(new Error(`Timed out waiting for ${description}.`));
+    }
+  });
 const collect = Effect.gen(function* () {
   // WeakRef targets read in this job stay alive until it ends, hence a macrotask each time.
   for (let round = 0; round < 3; round += 1) {
@@ -212,6 +223,10 @@ const makeHarness = Effect.fn("ReconnectRetention.makeHarness")(function* () {
       yield* SubscriptionRef.set(session, Option.none());
       yield* settle;
       yield* SubscriptionRef.set(session, Option.some(next));
+      yield* waitUntil(
+        `the view to show all ${decoded.messages.length} messages of resend ${sequence}`,
+        () => registry.get(messagesAtom).length === decoded.messages.length,
+      );
       yield* settle;
       return next.delivered.last !== null;
     });
