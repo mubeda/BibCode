@@ -148,6 +148,7 @@ impl ProviderDriverFactory for RejectingProviderDriverFactory {
 #[derive(Debug, Default)]
 struct LoadTerminalObserverFactory {
     helper_launches: AtomicUsize,
+    status_only_launches: AtomicUsize,
     dormant_frames: AtomicUsize,
     decoded_events: AtomicUsize,
 }
@@ -165,6 +166,9 @@ impl ProviderTerminalObserverFactory for LoadTerminalObserverFactory {
     ) -> Pin<Box<dyn Future<Output = Option<PreparedTerminalLaunch>> + Send + '_>> {
         Box::pin(async move {
             self.helper_launches.fetch_add(1, Ordering::AcqRel);
+            if !input.activity_enabled {
+                self.status_only_launches.fetch_add(1, Ordering::AcqRel);
+            }
             Some(PreparedTerminalLaunch {
                 executable: input.launch.executable,
                 args: input.launch.args,
@@ -442,6 +446,9 @@ async fn disabled_gate_rejects_dormant_volume_without_work_or_trace_growth() {
 
     let helper_launches_before_disabled_terminals =
         terminal_factory.helper_launches.load(Ordering::Acquire);
+    let status_only_before_disabled_terminals = terminal_factory
+        .status_only_launches
+        .load(Ordering::Acquire);
     for index in 0..DISABLED_TERMINAL_LAUNCHES {
         terminal_manager
             .open(activity_terminal_input(
@@ -453,11 +460,26 @@ async fn disabled_gate_rejects_dormant_volume_without_work_or_trace_growth() {
             .await
             .expect("disabled pass-through terminal");
     }
+    // #187: observable AI terminals keep an observer for the sidebar status even with the
+    // setting off, but it must be launched status-only (dormant), never as an activity helper.
     assert_eq!(
         terminal_factory.helper_launches.load(Ordering::Acquire)
             - helper_launches_before_disabled_terminals,
-        0,
-        "disabled terminal launches start no activity helpers"
+        DISABLED_TERMINAL_LAUNCHES,
+        "disabled terminal launches start one status observer each"
+    );
+    assert_eq!(
+        terminal_factory
+            .status_only_launches
+            .load(Ordering::Acquire)
+            - status_only_before_disabled_terminals,
+        DISABLED_TERMINAL_LAUNCHES,
+        "every observer launched while disabled is status-only"
+    );
+    assert_eq!(
+        trace_record_count(&trace),
+        trace_count_before_rejected_volume,
+        "status-only observers create no trace growth"
     );
     assert_eq!(
         *backend.spawns.lock().expect("spawn count"),
@@ -466,8 +488,8 @@ async fn disabled_gate_rejects_dormant_volume_without_work_or_trace_growth() {
     );
     assert_eq!(
         terminal_manager.agent_activity_restart_descriptor_count_for_integration_test(),
-        PREVIOUSLY_INSTRUMENTED_TERMINALS,
-        "only live terminals instrumented before disable retain restart descriptors"
+        PREVIOUSLY_INSTRUMENTED_TERMINALS + DISABLED_TERMINAL_LAUNCHES,
+        "live observers are the terminals instrumented before disable plus the status-only ones"
     );
 
     let scope = ActivityScopeSeed::thread(
