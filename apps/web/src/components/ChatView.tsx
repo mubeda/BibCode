@@ -1252,6 +1252,12 @@ function ChatViewContent(props: ChatViewProps) {
   const legendListRef = useRef<LegendListRef | null>(null);
   const [composerOverlayElement, setComposerOverlayElement] = useState<HTMLDivElement | null>(null);
   const [composerOverlayHeight, setComposerOverlayHeight] = useState(0);
+  // The overlay's latest measured height, written where it is measured, for the timeline
+  // geometry helpers. Read through this, they keep one identity (a helper recreated with the
+  // height chained old ChatView renders, #204), and a LegendList measurement in a child layout
+  // effect still reads the height being committed: the measurement runs before that render, so
+  // a mirror written in this component's own layout effect would lag by one render there.
+  const composerOverlayHeightRef = useRef(0);
   // The chat column, so Mod+F inside it opens this chat's find rather than the host's.
   const [chatSurfaceElement, setChatSurfaceElement] = useState<HTMLDivElement | null>(null);
   const isAtEndRef = useRef(true);
@@ -1265,6 +1271,7 @@ function ChatViewContent(props: ChatViewProps) {
     const updateHeight = () => {
       const nextHeight = Math.ceil(composerOverlayElement.getBoundingClientRect().height);
       if (nextHeight <= 0) return;
+      composerOverlayHeightRef.current = nextHeight;
       setComposerOverlayHeight((currentHeight) =>
         currentHeight === nextHeight ? currentHeight : nextHeight,
       );
@@ -3533,53 +3540,47 @@ function ChatViewContent(props: ChatViewProps) {
     cancelTimelineLiveFollowForUserNavigationRef.current =
       cancelTimelineLiveFollowForUserNavigation;
   }, [cancelTimelineLiveFollowForUserNavigation]);
-  const getActiveTimelineTurnMetrics = useCallback(
-    (list?: LegendListRef | null) => {
-      const resolvedList = list ?? legendListRef.current;
-      const anchorIndex = activeTimelineAnchorIndexRef.current;
-      const state = resolvedList?.getState();
-      if (!resolvedList || !state || anchorIndex === null) {
-        return null;
-      }
+  const getActiveTimelineTurnMetrics = useCallback((list?: LegendListRef | null) => {
+    const resolvedList = list ?? legendListRef.current;
+    const anchorIndex = activeTimelineAnchorIndexRef.current;
+    const state = resolvedList?.getState();
+    if (!resolvedList || !state || anchorIndex === null) {
+      return null;
+    }
 
-      return getAnchoredTurnMetrics({
-        state,
-        anchorIndex,
-        composerOverlayHeight,
-        anchorOffset: CHAT_LIST_ANCHOR_OFFSET,
-      });
-    },
-    [composerOverlayHeight],
-  );
-  const timelineRealContentOverflowsViewport = useCallback(
-    (list?: LegendListRef | null) => {
-      const resolvedList = list ?? legendListRef.current;
-      const state = resolvedList?.getState();
-      if (!resolvedList || !state || state.data.length === 0) {
-        return false;
-      }
+    return getAnchoredTurnMetrics({
+      state,
+      anchorIndex,
+      composerOverlayHeight: composerOverlayHeightRef.current,
+      anchorOffset: CHAT_LIST_ANCHOR_OFFSET,
+    });
+  }, []);
+  const timelineRealContentOverflowsViewport = useCallback((list?: LegendListRef | null) => {
+    const resolvedList = list ?? legendListRef.current;
+    const state = resolvedList?.getState();
+    if (!resolvedList || !state || state.data.length === 0) {
+      return false;
+    }
 
-      const lastRowIndex = state.data.length - 1;
-      const lastRowTop = state.positionAtIndex(lastRowIndex);
-      const lastRowHeight = state.sizeAtIndex(lastRowIndex);
-      if (
-        typeof lastRowTop !== "number" ||
-        typeof lastRowHeight !== "number" ||
-        !Number.isFinite(lastRowTop) ||
-        !Number.isFinite(lastRowHeight)
-      ) {
-        return false;
-      }
+    const lastRowIndex = state.data.length - 1;
+    const lastRowTop = state.positionAtIndex(lastRowIndex);
+    const lastRowHeight = state.sizeAtIndex(lastRowIndex);
+    if (
+      typeof lastRowTop !== "number" ||
+      typeof lastRowHeight !== "number" ||
+      !Number.isFinite(lastRowTop) ||
+      !Number.isFinite(lastRowHeight)
+    ) {
+      return false;
+    }
 
-      const realContentBottom = lastRowTop + Math.max(1, lastRowHeight);
-      const visibleScrollLength = Math.max(
-        0,
-        (state.scrollLength ?? 0) - composerOverlayHeight - CHAT_LIST_ANCHOR_OFFSET,
-      );
-      return realContentBottom > visibleScrollLength;
-    },
-    [composerOverlayHeight],
-  );
+    const realContentBottom = lastRowTop + Math.max(1, lastRowHeight);
+    const visibleScrollLength = Math.max(
+      0,
+      (state.scrollLength ?? 0) - composerOverlayHeightRef.current - CHAT_LIST_ANCHOR_OFFSET,
+    );
+    return realContentBottom > visibleScrollLength;
+  }, []);
 
   // Live-follow stays active after send/thread-open until an actual list scroll
   // gesture opts out.
@@ -3603,7 +3604,7 @@ function ChatViewContent(props: ChatViewProps) {
       }
       const offset = getTimelinePageScrollOffset({
         state,
-        composerOverlayHeight,
+        composerOverlayHeight: composerOverlayHeightRef.current,
         direction: key === "PageUp" ? -1 : 1,
       });
       // Already at that end: nothing moves, and following the live end must not stop.
@@ -3614,7 +3615,7 @@ function ChatViewContent(props: ChatViewProps) {
       // A held key repeats faster than a glide finishes, so repeats jump.
       void list.scrollToOffset({ offset, animated: !repeat && timelineScrollAnimates() });
     },
-    [cancelTimelineLiveFollowForUserNavigation, composerOverlayHeight],
+    [cancelTimelineLiveFollowForUserNavigation],
   );
   // Binds the reader's takeover listeners to the timeline's list while it is mounted. The list
   // remounts per thread (it is keyed by thread), and a thread with no rows shows an empty state
@@ -3956,8 +3957,13 @@ function ChatViewContent(props: ChatViewProps) {
   }, [followTimelineLiveEnd]);
 
   // Follows the end after new timeline entries render; an empty timeline has nothing to follow.
+  // A composer height change follows again too, as it did when the geometry helpers were
+  // recreated with the height (#204).
   useEffect(() => {
-    if (!activeThread?.id || timelineEntries.length === 0) {
+    // The overlay height is never negative: comparing it makes the height an input, so a new
+    // height follows again, as it did when the helpers were recreated with it. A `void` read is
+    // compiled away and leaves the dependency "unnecessary", which stops the compiler.
+    if (!activeThread?.id || timelineEntries.length === 0 || composerOverlayHeight < 0) {
       return;
     }
     if (liveFollowUserScrollGenerationRef.current !== anchorUserScrollGenerationRef.current) {
@@ -3975,7 +3981,7 @@ function ChatViewContent(props: ChatViewProps) {
         cancelAnimationFrame(secondFrame);
       }
     };
-  }, [activeThread?.id, timelineEntries, followTimelineLiveEnd]);
+  }, [activeThread?.id, timelineEntries, followTimelineLiveEnd, composerOverlayHeight]);
 
   // A row that grows without a new entry, such as a diagram drawing in a reply taller than the
   // timeline, changes layout the effect above never sees. That includes rows above the anchored
