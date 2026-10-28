@@ -138,6 +138,7 @@ import {
   deriveLatestContextWindowSnapshot,
   formatProviderDisplayName,
 } from "../../lib/contextWindow";
+import { useLatestHandler } from "../../hooks/useLatestHandler";
 import { useMediaQuery } from "../../hooks/useMediaQuery";
 import type { ReviewCommentContext } from "../../reviewCommentContext";
 import { useThreadHasTerminalSurface } from "../../terminalSurfaceState";
@@ -244,24 +245,6 @@ const terminalContextIdListsEqual = (
 
 function isInsideComposerFloatingLayer(element: Element): boolean {
   return element.closest(COMPOSER_FLOATING_LAYER_SELECTOR) !== null;
-}
-
-/**
- * One function for the composer's life that calls the latest render's `handler`, for event
- * handlers only (the ref updates in a layout effect). React Compiler keeps each handler from the
- * last render whose inputs changed, and every closure of a render holds that render's whole
- * scope, so handlers recreated at different times held each other's older renders and every
- * changed reconnect kept one more composer and chat view render (#198). Created in this hook,
- * the kept function's scope holds only the ref.
- */
-function useLatestHandler<Args extends unknown[], Result>(
-  handler: (...args: Args) => Result,
-): (...args: Args) => Result {
-  const latest = useRef(handler);
-  useLayoutEffect(() => {
-    latest.current = handler;
-  }, [handler]);
-  return useCallback((...args: Args) => latest.current(...args), []);
 }
 
 /**
@@ -1869,7 +1852,8 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     setIsComposerFocused(false);
   }, [isMobileViewport]);
 
-  const shouldBlurMobileComposerOnSubmit = useCallback(() => {
+  // Recreated at other renders than `submitComposer`, so it is a latest handler (#204).
+  const shouldBlurMobileComposerOnSubmit = useLatestHandler(() => {
     if (!isMobileViewport) return false;
     if (isSendBusy || isConnecting || phase === "running") return false;
     // A refused send keeps focus and the visible draft.
@@ -1878,17 +1862,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       return activePendingProgress.isLastQuestion && Boolean(activePendingResolvedAnswers);
     }
     return showPlanFollowUpPrompt || composerSendState.hasSendableContent;
-  }, [
-    activePendingProgress,
-    activePendingResolvedAnswers,
-    composerSendState.hasSendableContent,
-    isEnvironmentUnavailable,
-    isConnecting,
-    isMobileViewport,
-    isSendBusy,
-    phase,
-    showPlanFollowUpPrompt,
-  ]);
+  });
 
   const submitComposer = useCallback(
     (event?: { preventDefault: () => void }) => {
