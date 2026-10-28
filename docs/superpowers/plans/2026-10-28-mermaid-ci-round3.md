@@ -44,53 +44,71 @@ the round-2 traces.
 
 **Goal.** From the first painted frame of a reopened chat, the reply's last line sits at its
 end against the bottom region, including when the Activity card arrives and grows the bottom
-region right after the chat opens. This uses no `flushSync` from a ResizeObserver callback.
+region right after the chat opens. This uses no `flushSync` from a ResizeObserver callback, and
+it never moves a reader who took over. The eviction case keeps its every-frame assertion. The
+round-2 fallback of starting the check after the bottom region's last height change is
+dropped.
 
-Two changes, either of which shortens the lag. Both are needed to remove it.
+Three changes.
 
-1. **LegendList patch: apply the preserved end correction in the same pass.** In
-   `schedulePreservedEndAnchorCorrection`, apply the correction once synchronously: compute
-   `getPreservedEndAnchorOffsetDiff`, and when it is larger than the epsilon, `requestAdjust`
-   it. Then schedule the existing frame loop for any later drift. That removes LegendList's own
-   frame: the inset's layout effect then moves the end in the same commit.
-   - This only ever moves a list LegendList is keeping at its end.
-   - A reader who took over has the list's end keeping finished (`cancelScrollRequests`), and,
-     while away, a held inset that does not grow (`MessagesTimeline`). The correction never
-     runs over them.
-   - Patch hash and lockfile update; frozen install verified.
-2. **ChatView: get the overlay's new height to the list in the same commit, without
-   `flushSync`.** Measure the overlay in a layout effect that runs whenever ChatView commits
-   something that changes the overlay's content: the Activity card's presence and size inputs
-   it renders (`activityStateTarget`, `shouldUseCompactActivityDock`,
-   `settings.activityDockAlwaysVisible`, the pending-input and queue banners). A `setState`
-   from a layout effect re-renders synchronously before paint, which React supports. That runs
-   at commit time, not inside the browser's ResizeObserver delivery, where `flushSync`
-   (round 2) is suspected of re-entering LegendList's layout effects before LegendList had
-   processed its own row sizes.
-   - The ResizeObserver stays for growth that ChatView does not render itself: the Activity
-     card's own content loading, and the composer's text wrapping.
-   - That path keeps its one frame of lag. Changes to the card's content are #188's (the
-     Activity card owner's) code, so if it matters there, the card can report its layout to
-     ChatView through a callback from its own layout effect. I won't change #188's files.
-3. **Test side, only if (2) cannot cover the card's arrival.** If the card's first height comes
-   from its own content loading, so only the ResizeObserver sees it, the intended UI includes
-   one frame where the card has arrived and the list has not yet moved. The eviction case then
-   starts its every-frame check from the first painted frame after the bottom region's height
-   last changed. The trace records the overlay height per frame, and the check records which
-   frame it starts from and why. That keeps the case strict on what it is for (the evicted
-   diagram's redraw never steps the end) without requiring a frame the UI does not produce.
+1. **LegendList patch: apply the preserved end correction in the same pass, once.** In
+   `schedulePreservedEndAnchorCorrection` (`react.mjs` about line 2614):
+   - Compute `getPreservedEndAnchorOffsetDiff` (about line 2604). When it is larger than the
+     epsilon, `requestAdjust` it immediately.
+   - Record the immediate request as the correction's `lastRequestTime` before starting the
+     existing frame loop. The loop's `hasObservedNativeScrollAfterRequest` check (about line
+     2636) then waits for a native scroll after that request before it can adjust again, so the
+     offset is not applied twice before the browser's scroll event arrives.
+   - A frame loop that finds the diff within the epsilon stops, as today.
+2. **LegendList patch: a takeover ends the preserved end target and its correction.** The
+   offset check above does not know whether the timeline still follows its end, and
+   `cancelScrollRequests()` (about line 7586) leaves both the pending correction and the
+   retained initial end target in place, so either could still move a reader who took over
+   while a reopened chat settles. `cancelScrollRequests()` therefore also:
+   - clears `state.preservedEndAnchorCorrection`, so a queued frame of it returns;
+   - releases the retained initial end target with LegendList's own
+     `clearPreservedInitialScrollTarget(state)` (about line 935), so nothing re-derives one;
+   - cancels the `preservedInitialScroll` scheduled work.
 
-**Bisection, before (a) is implemented.**
+   Every takeover already calls the method, and with nothing under way it changes nothing.
+   Patch hash and lockfile update; frozen install verified.
+3. **Report the overlay's child-owned height changes before paint.**
+   - The Activity card's own height changes (a snapshot arriving, a reconnect, expanding or
+     collapsing inside `ActivityPane.tsx` around line 85) do not commit ChatView, so neither a
+     ChatView layout effect nor its after-paint ResizeObserver render reaches the list in the
+     same frame.
+   - The fix: ChatView provides a small overlay-layout context
+     (`ComposerOverlayLayoutContext`, in `apps/web/src/components/chat/`) with a report
+     function. It measures the overlay element, writes `composerOverlayHeightRef`, and sets the
+     overlay height state.
+   - `ActivityPaneCard` calls the context's report from its own `useLayoutEffect`, with no
+     dependency list, so it runs on each of its commits. A `setState` from a layout effect
+     re-renders synchronously before paint, so the list's inset, and LegendList's scroll by its
+     growth (with change 1, in the same pass), land before the frame paints.
+   - ChatView's ResizeObserver stays as the backstop for changes no React component reports
+     (the composer's text wrapping, fonts loading).
+   - `ActivityPane.tsx` belongs to #188's owner, so this one-line call is coordinated with them,
+     or they add it. No other #188 file changes.
 
-| Build | What it decides |
-| --- | --- |
-| Integration head `0ecd10a38c` (no `flushSync`) | Baseline for the eviction first frame and the round-2 regressions. |
-| Head plus (a1) | Whether LegendList's own frame is the eviction lag. |
-| Head plus (a1) and (a2) | Whether the lag is gone without `flushSync`. |
-| Head with #204's round-3 change reverted | Second suspect for the round-2 regressions, if round-3 CI does not clear them. |
-
-Each build runs the full Mermaid spec three times on a dedicated WebDriver port pair. No
-product change is committed without three local passes.
+**Tests.**
+- **Hooks (`ChatView.hooks.test.tsx`).** The overlay-layout context's report sets the overlay
+  height from the measured element in the same pass.
+- **ActivityPane test.** The pane calls the report from a layout effect when its expanded state
+  or snapshot changes.
+- **Packaged, the eviction case unchanged.** Every painted frame of the reopened chat, from the
+  first, holds the last line against the usable bottom within 1 px, with the overlay height
+  recorded per frame.
+- **Packaged, new: a takeover during a reopen.** Reopen the chat, and while LegendList still
+  holds its preserved end target, the reader wheels 40 px up in one run and presses PageUp, with
+  its page step, in another. The Activity card then grows the bottom region. On every painted
+  frame after the takeover, the reader's line stays where their scroll put it.
+- **Patch, delayed native scroll.** The double-adjustment guard depends on when the browser
+  delivers the scroll event. A packaged probe holds back native scroll handling: a capture
+  `scroll` listener on the scroller that records events, while the bottom region grows during
+  the preserved window. It asserts the content moves by the growth once, not twice, across
+  the frames before and after the delayed event. If a happy-dom mount of the real LegendList
+  can model the scroll-event timing, the same check also goes in a unit test; otherwise the
+  packaged probe is the proof.
 
 ## (b) Diagram swap: a sent turn that starts to fit again
 
@@ -98,15 +116,17 @@ product change is committed without three local passes.
 diagram replaced its taller source, the sent row returns to its offset (`CHAT_LIST_ANCHOR_OFFSET`,
 16 px) while the end stays in view. This is bounded, and never against a reader who took over.
 
-**Change, in ChatView's anchored-turn growth handling.**
+**Change, in ChatView's anchored-turn size handling.**
 - `onTimelineRowSizeChanged` today ignores shrinking rows (`info.size <= info.previous`). A
-  shrink of a row in or above the anchored turn queues one re-landing pass, coalesced like
-  growth (`pendingTurnShrinkRef`) and run two frames later, after LegendList has laid the rows
-  out again.
+  shrink of a row **in** the anchored turn (`info.index >= anchorIndex`) queues one re-landing
+  pass, coalesced like growth (`pendingTurnShrinkRef`) and run two frames later, after
+  LegendList has laid the rows out again.
+- An earlier row shrinking is LegendList's to hold, so it queues nothing.
 - The pass runs only when all of these hold:
-  - the mode is still `anchoring-new-turn`, following is on (`liveFollowUserScrollGeneration`
-    equals the current generation, so a takeover since cancels it), and the positioned and
-    settled anchor is the same row;
+  - the mode is still `anchoring-new-turn` and following is on
+    (`liveFollowUserScrollGeneration` equals the generation captured when the shrink was
+    reported, so a takeover since cancels it);
+  - the positioned and settled anchor is the same row;
   - the turn now fits the view (`getActiveTimelineTurnMetrics(...).overflowsUsableViewport` is
     false);
   - the sent row, measured on screen (`measureSentRowLanding`), sits more than 1 px above its
@@ -114,23 +134,63 @@ diagram replaced its taller source, the sent row returns to its offset (`CHAT_LI
     overflowing turn shrinks.
 - The pass then makes one non-animated `scrollToOffset(scrollTop + delta)`, where delta is
   negative: it scrolls up to the row. The turn fits, so its end stays above the bottom region.
+- **Bounded re-check.** Like the landing path (`settleSentTimelineRow`), once LegendList
+  resolves the request (or 1 s passes), and two frames of layout later, the pass measures again
+  under the same guards. It retries only while the row is still more than 1 px off, at most 3
+  times or 1 s, so a scroll LegendList clamped to content it had not laid out yet still lands.
 - A row below its offset is the landing's case (#191). A turn that still overflows keeps
   following its end. Neither is touched here.
-- No retry loop. If LegendList clamps the scroll, the next shrink or growth report runs the
-  pass again, and the follow pass handles growth.
 
 **Tests (hooks, `ChatView.hooks.test.tsx`).**
 - A tall reply is followed past the anchor (the scroll is beyond `anchorTop - 16`), then its row
-  shrinks so the turn fits: one `scrollToOffset` puts the row at 16.
-- After a wheel takeover, the same shrink scrolls nothing.
+  shrinks so the turn fits: the row comes back to 16.
+- The same, with the first correction clamped by a lagging content height
+  (`laggingMaxScroll`): the re-check lands it, within its bound.
+- After a wheel takeover between the shrink report and the queued pass, nothing scrolls.
 - A shrink that leaves the turn still overflowing scrolls nothing (following keeps the end).
 - A shrink with the row already within 1 px of its offset scrolls nothing.
+- An earlier row, above the anchored turn, shrinking leaves the view in place.
 - Growth behavior is unchanged: the existing growth-follow tests stay green.
 
-**Packaged proof.** The Mermaid reading-line case's sent-row check (`mermaid-timeline-sent-row.json`
-frames). On the CI macOS arm64 geometry (1000×650 window, Activity card above the composer),
-the row must come back to 16 ± 1 once the short reply's diagram draws. Locally, the same check
-3× per build.
+**Packaged proof.** In the Mermaid reading-line case, frame capture starts **before** the short
+reply's diagram draws: the sampler starts when the prompt is sent, and records the sent row's
+top, whether the turn fits, the end's position and the overlay height on each painted frame.
+It asserts:
+- the turn overflowed (at least one frame with `turnFits` false while the source shows), then
+  fit after the draw;
+- the row returned to 16 ± 1 within a bounded number of frames after it fit;
+- a second run of the same sequence, with a real takeover (a wheel event and its scroll) dispatched
+  after the shrink's size report and before the queued pass, keeps the row where the reader's
+  scroll put it on every later frame.
+
+The CI macOS arm64 geometry (1000×650 window, Activity card above the composer) is where the
+overflow happens. Locally, the window is sized to reproduce it.
+
+## Gates before committing either change
+
+- Bisection, starting with one run of the failing recipe (the full Mermaid spec on the build
+  expected to fail) to confirm it reproduces, before repeating it:
+
+  | Build | What it decides |
+  | --- | --- |
+  | Integration head `0ecd10a38c` (no `flushSync`) | Baseline for the eviction first frame and the diagram swap. |
+  | Head plus (a1) and (a2) | Whether LegendList's own frame and the retained target are the eviction lag, and that a takeover during a reopen holds. |
+  | Head plus (a1), (a2) and (a3) | Whether the eviction lag is gone without `flushSync`. |
+  | Head plus (a) and (b) | The diagram swap, with everything together. |
+  | Head with #204's round-3 change reverted | Second suspect for the round-2 regressions, if round-3 CI does not clear them. |
+
+- Each build runs the full Mermaid spec, and the `chat-activity-panel.e2e.ts` collapse and
+  expand scroll scenario, three times on a dedicated WebDriver port pair. No product change is
+  committed without three local passes.
+- `vp check --no-fmt`, `vp check` on the changed files, and `vp run typecheck`, plus the hooks,
+  `ChatView`, `MessagesTimeline` and Activity suites.
+- React review (vercel-react-best-practices) of the context, the ActivityPane layout effect and
+  ChatView's handlers. UI.md review of the takeover and bottom-region behavior.
+- Docs: `docs/architecture/overview.md`'s Chat timeline following section (about line 3103):
+  the same-pass preserved end correction, the takeover clearing it, the overlay-layout report,
+  and the fitting turn's return to its offset. The Mermaid runbook paragraph in
+  `docs/testing/cross-platform-validation.md` (about line 3446): the swap observation and the
+  reopen takeover check.
 
 ## Round-2 regressions after the revert
 
@@ -147,6 +207,6 @@ expected back with the revert. If round 3 still fails any of them, the next susp
 
 ## Skipped
 
-- Changing #188's Activity card to reserve its space before its content loads. That is its
-  owner's call; (a3) covers the test if needed.
+- Reserving the Activity card's space before its content loads: (a3) reports its height before
+  paint instead, which covers expand and collapse too.
 - Upgrading LegendList (3.7.0) for its end-following rework.
