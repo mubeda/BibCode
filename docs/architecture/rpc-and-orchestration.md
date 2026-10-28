@@ -2598,7 +2598,13 @@ entry with an `id` is compared with the shown entry of that `id`, not the one at
 its position: messages are ordered by delivery and time, so a turn added while
 the client was away can land before messages it already shows. A resync
 snapshot therefore does not hand the UI a second copy of an unchanged thread;
-each copy used to stay pinned by memoized render closures (#96, #134). Beside
+each copy used to stay pinned by memoized render closures (#96, #134). Memoized
+callbacks recreated at different renders also pin each other's older renders,
+so ChatView and ChatComposer route such handlers through
+`apps/web/src/hooks/useLatestHandler.ts` (one identity, the latest committed
+handler, called only after commit). An operation that awaits resolves where its
+error is shown before its first await, so a thread or environment switch cannot
+redirect it (#198, #204). Beside
 the shown copy, the thread state holds only the latest received snapshot,
 whatever the number of reconnects. The sidebar's thread prewarmer still reads
 the raw thread state, so its React state keeps one earlier snapshot of each

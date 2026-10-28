@@ -16,6 +16,8 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 const h = vi.hoisted(() => ({
+  /** Whether the composer's `max-sm` query matches. */
+  mobile: false,
   capabilityCatalogs: [] as import("@bibcode/contracts").ServerProvider[],
   editorProps: null as Record<string, unknown> | null,
   menuProps: null as Record<string, unknown> | null,
@@ -143,7 +145,7 @@ vi.mock("../../lib/composerPathSearchState", () => ({
   useComposerPathSearch: () => ({ entries: [], error: null, isPending: false }),
 }));
 vi.mock("../../hooks/useMediaQuery", () => ({
-  useMediaQuery: () => false,
+  useMediaQuery: (query: string) => query === "max-sm" && h.mobile,
   useIsMobile: () => false,
 }));
 vi.mock("../../state/threads", () => ({
@@ -348,6 +350,7 @@ let container: HTMLDivElement;
 beforeEach(() => {
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
   resettableComposerStore.setState({ ...pristineComposerState }, true);
+  h.mobile = false;
   h.editorProps = null;
   h.menuProps = null;
   h.providerPickerProps = null;
@@ -556,5 +559,36 @@ describe("ChatComposer long-lived handlers", () => {
       threadId,
       "'empty.txt' is empty and cannot be attached.",
     );
+  });
+
+  it("blurs a mobile composer on submit by the latest render's state", async () => {
+    h.mobile = true;
+    const composerRef = React.createRef<ChatComposerHandle>();
+    const promptRef = { current: prompt };
+    const statuses = [supportedProvider, unsupportedProvider];
+    const props = makeProps(statuses, composerRef, promptRef, supportedProvider);
+    const outside = document.createElement("input");
+    document.body.append(outside);
+    const submitWith = async (next: ChatComposerProps) => {
+      await act(async () => {
+        root.render(<ChatComposer {...next} />);
+      });
+      outside.focus();
+      await act(async () => {
+        container
+          .querySelector("form")!
+          .dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+      });
+    };
+    try {
+      // A running turn keeps focus on submit (it queues); once it ends, a submit blurs.
+      await submitWith({ ...props, phase: "running" });
+      expect(document.activeElement).toBe(outside);
+      await submitWith({ ...props, phase: "ready" });
+      expect(document.activeElement).not.toBe(outside);
+      expect(props.onSend).toHaveBeenCalledTimes(2);
+    } finally {
+      outside.remove();
+    }
   });
 });
