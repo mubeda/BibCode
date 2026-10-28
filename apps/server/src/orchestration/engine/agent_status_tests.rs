@@ -4,6 +4,7 @@
 use serde_json::{Value, json};
 
 use super::{EngineOptions, OrchestrationCommand, OrchestrationEngine};
+use crate::orchestration::StartupProcessOwnership;
 use crate::persistence::{Database, ProjectionThread, run_migrations};
 
 const AT: &str = "2026-10-27T10:00:00.000Z";
@@ -445,7 +446,10 @@ async fn startup_expires_the_requests_no_live_session_holds_once() {
     .await;
 
     assert_eq!(
-        engine.expire_requests_of_settled_sessions().await.unwrap(),
+        engine
+            .expire_requests_of_settled_sessions(&StartupProcessOwnership::default())
+            .await
+            .unwrap(),
         2
     );
     assert_eq!(open_requests(&engine, &settled).await, (0, 0));
@@ -455,7 +459,10 @@ async fn startup_expires_the_requests_no_live_session_holds_once() {
         "a running session's question is left to its provider"
     );
     assert_eq!(
-        engine.expire_requests_of_settled_sessions().await.unwrap(),
+        engine
+            .expire_requests_of_settled_sessions(&StartupProcessOwnership::default())
+            .await
+            .unwrap(),
         0,
         "a second startup expires nothing again"
     );
@@ -546,9 +553,14 @@ async fn a_restart_keeps_opencode_asks_until_a_completed_read_drops_them() {
     session_as(&engine, &thread_id, "running", AT, "opencode").await;
     ask_both(&engine, &thread_id).await;
     // BiBCode restarts: reconciliation settles the abandoned session, then startup expiry runs.
+    // Settings point OpenCode at a server the user runs, which survived the restart.
     session_as(&engine, &thread_id, "error", AT, "opencode").await;
+    let user_server = StartupProcessOwnership::new([], true);
     assert_eq!(
-        engine.expire_requests_of_settled_sessions().await.unwrap(),
+        engine
+            .expire_requests_of_settled_sessions(&user_server)
+            .await
+            .unwrap(),
         0
     );
     assert_eq!(open_requests(&engine, &thread_id).await, (1, 1));
@@ -578,4 +590,90 @@ async fn a_restart_keeps_opencode_asks_until_a_completed_read_drops_them() {
     )
     .await;
     assert_eq!(open_requests(&engine, &thread_id).await, (1, 1));
+}
+
+/// One ownership rule decides what a restart closes and what it expires (#206, #187): an OpenCode
+/// thread whose server BiBCode ran (a row from before the owner was recorded, with no server URL
+/// configured) has both its open subagent and its open requests settled; one on a server the
+/// user runs keeps both.
+#[tokio::test]
+async fn a_restart_settles_or_keeps_an_opencode_threads_requests_and_subagents_together() {
+    use crate::activity::{
+        ActivityCapabilities, ActivityLifecycle, ActivityProjection, ActivityRepository,
+        ActivityScopeRef, ActivityScopeSeed, ProviderActivityMutation,
+    };
+    for user_server_configured in [false, true] {
+        let (engine, thread_id) = engine().await;
+        session_as(&engine, &thread_id, "running", AT, "opencode").await;
+        ask_both(&engine, &thread_id).await;
+        let activity = ActivityProjection::new(ActivityRepository::new(
+            engine.repositories().database().clone(),
+        ));
+        let scope_id = format!("thread:{thread_id}");
+        activity
+            .ensure_scope(
+                ActivityScopeSeed::thread(
+                    &scope_id,
+                    &thread_id,
+                    "opencode",
+                    Some("opencode"),
+                    ActivityCapabilities::structured_full(false),
+                )
+                .expect("scope"),
+            )
+            .await
+            .expect("scope");
+        activity
+            .apply(
+                &scope_id,
+                "open-subagent".to_owned(),
+                vec![
+                    ProviderActivityMutation::upsert_actor("actor:sub", None, "Sub", "running")
+                        .expect("actor"),
+                ],
+                AT.to_owned(),
+            )
+            .await
+            .expect("open subagent");
+        // A runtime row a build before #206 wrote: no recorded owner.
+        let legacy_payload = json!({ "transport": "http" });
+        let ownership = StartupProcessOwnership::new(
+            [(thread_id.as_str(), Some(&legacy_payload))],
+            user_server_configured,
+        );
+
+        // The restart: close what ended, settle the session, expire what nobody holds.
+        crate::production::provider_runtime::interrupt_activity_of_ended_sessions(
+            &ownership, &activity,
+        )
+        .await;
+        session_as(&engine, &thread_id, "error", AT, "opencode").await;
+        engine
+            .expire_requests_of_settled_sessions(&ownership)
+            .await
+            .expect("startup expiry");
+
+        let subagent = activity
+            .snapshot(&ScopeRef::thread(&thread_id))
+            .await
+            .expect("snapshot")
+            .actors[0]
+            .status;
+        if user_server_configured {
+            assert_eq!(subagent, ActivityLifecycle::Running);
+            assert_eq!(open_requests(&engine, &thread_id).await, (1, 1));
+        } else {
+            assert_eq!(subagent, ActivityLifecycle::Interrupted);
+            assert_eq!(open_requests(&engine, &thread_id).await, (0, 0));
+        }
+    }
+
+    struct ScopeRef;
+    impl ScopeRef {
+        fn thread(thread_id: &str) -> ActivityScopeRef {
+            ActivityScopeRef::Thread {
+                thread_id: thread_id.to_owned(),
+            }
+        }
+    }
 }

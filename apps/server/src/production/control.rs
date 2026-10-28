@@ -516,6 +516,13 @@ impl NativeServerControl {
         agent_activity_enabled(&*self.settings.read().await, source)
     }
 
+    /// Whether any OpenCode instance points at a server the user runs (#206).
+    pub(crate) async fn opencode_server_url_configured(&self) -> bool {
+        crate::production::provider_inventory::opencode_server_url_configured(
+            &*self.settings.read().await,
+        )
+    }
+
     async fn update_settings(&self, payload: Value) -> Result<Value, Value> {
         let mut patch = payload.get("patch").cloned().ok_or_else(|| {
             settings_error(&self.settings_path, "normalize", "missing settings patch")

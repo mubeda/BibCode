@@ -202,6 +202,14 @@ pub(crate) fn instance_custom_models(settings: &Value, instance_id: &str) -> Vec
         .unwrap_or_default()
 }
 
+/// Whether any OpenCode instance points at a server URL, so its sessions run on a server the
+/// user runs rather than on BiBCode's own child.
+pub(crate) fn opencode_server_url_configured(settings: &Value) -> bool {
+    definitions(settings)
+        .iter()
+        .any(|definition| definition.driver == "opencode" && definition.endpoint.is_some())
+}
+
 fn definitions(settings: &Value) -> Vec<ProviderDefinition> {
     let legacy = settings.get("providers").and_then(Value::as_object);
     let instances = settings.get("providerInstances").and_then(Value::as_object);
