@@ -3149,7 +3149,12 @@ view), or free scrolling.
   height (the composer growing as they type, an Activity card opening or
   closing above it) leaves the line they read in place, even when the list
   sits within LegendList's end threshold or the thread is shorter than the
-  view.
+  view. The Activity card reports each commit to `ChatView` in a layout effect,
+  so a changed card height reaches the timeline before paint. For a reopened
+  list that still holds its initial end target, the LegendList patch applies a
+  growing bottom inset in that same pass and coalesces repeated corrections
+  until native scroll catches up. Reader takeover cancels the pending end
+  correction and the preserved target.
 - **Released sent row.** A sent row the reader scrolled away from stays
   released until the next send or thread. LegendList reports the anchor ready
   again whenever the anchored end space changes size, once per delivery; a
