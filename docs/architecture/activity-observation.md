@@ -317,8 +317,9 @@ publishes activity:
 - A dormant observer follows later gate transitions like any other observer.
   When the gate opens on one that never published, it creates its activity
   scope with the root agent then; OpenCode reconciles the session tree at once.
-  It reads live only once that scope is written: a write that fails leaves
-  activity unavailable, and it is retried with a backoff.
+  It reads live only once that scope is written: a write that fails, on enable
+  or at an OpenCode observer's launch, leaves activity unavailable, and it is
+  retried with a backoff.
 
 **How each provider reports.** Each observer reports its main agent's state
 through its generation (`TerminalObserverGenerationLease::publish_agent_status`),

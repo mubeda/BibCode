@@ -12729,8 +12729,28 @@ impl OpenCodeToggleFixture {
         stream_scripts: Vec<OpenCodeFixtureStreamScript>,
         reattach_timeout: std::time::Duration,
     ) -> Self {
-        Self::open_with_reattach_timeout_and_probe(stream_scripts, reattach_timeout, None, true)
-            .await
+        Self::open_with_reattach_timeout_and_probe(
+            stream_scripts,
+            reattach_timeout,
+            None,
+            true,
+            false,
+        )
+        .await
+    }
+
+    /// Opens the terminal with activity on while every activity scope write fails.
+    async fn open_refusing_activity_scopes(
+        stream_scripts: Vec<OpenCodeFixtureStreamScript>,
+    ) -> Self {
+        Self::open_with_reattach_timeout_and_probe(
+            stream_scripts,
+            std::time::Duration::from_secs(3),
+            None,
+            true,
+            true,
+        )
+        .await
     }
 
     /// Opens the terminal while AI Terminal activity is off: its observer reports status only.
@@ -12739,6 +12759,7 @@ impl OpenCodeToggleFixture {
             stream_scripts,
             std::time::Duration::from_secs(3),
             None,
+            false,
             false,
         )
         .await
@@ -12753,6 +12774,7 @@ impl OpenCodeToggleFixture {
             std::time::Duration::from_secs(3),
             Some(activity_transition.clone()),
             true,
+            false,
         )
         .await;
         (fixture, activity_transition)
@@ -12763,6 +12785,7 @@ impl OpenCodeToggleFixture {
         reattach_timeout: std::time::Duration,
         activity_transition: Option<Arc<OpenCodeActivityTransitionProbe>>,
         activity_enabled: bool,
+        refuse_scopes: bool,
     ) -> Self {
         let fixture = opencode_attach_fixture();
         let root = tempfile::tempdir().expect("OpenCode toggle root");
@@ -12824,6 +12847,9 @@ impl OpenCodeToggleFixture {
         let mut settings = ProviderSettingsState::default();
         settings.providers.opencode.binary_path = configured.to_string_lossy().into_owned();
         let projection = ActivityProjection::new(ActivityRepository::new(database.clone()));
+        if refuse_scopes {
+            refuse_activity_scopes(&database).await;
+        }
         if !activity_enabled {
             projection
                 .agent_activity_controller_for_integration_test()
@@ -13101,6 +13127,38 @@ async fn agent_activity_toggle_opencode_enable_retries_a_scope_it_could_not_writ
         enabled.resumed, 0,
         "an observer whose scope could not be written does not read live"
     );
+    assert!(fixture.projection.snapshot(&scope).await.is_err());
+
+    allow_activity_scopes(&fixture.database).await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while fixture.projection.snapshot(&scope).await.is_err() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the retry writes the OpenCode terminal scope");
+    fixture.finish().await;
+    isolated.complete();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agent_activity_opencode_launch_retries_a_scope_it_could_not_write() {
+    // Mutation caught: an OpenCode observer whose first scope write fails detaching for good,
+    // so the terminal never shows activity until it restarts (#187).
+    own_process!(isolated);
+    let fixture = OpenCodeToggleFixture::open_refusing_activity_scopes(vec![
+        OpenCodeFixtureStreamScript::new([Ok(opencode_fixture_connected_frame())]),
+        OpenCodeFixtureStreamScript::new([Ok(opencode_fixture_connected_frame())]),
+        OpenCodeFixtureStreamScript::new([Ok(opencode_fixture_connected_frame())]),
+        OpenCodeFixtureStreamScript::new([Ok(opencode_fixture_connected_frame())]),
+    ])
+    .await;
+    let scope = ActivityScopeRef::Terminal {
+        thread_id: "thread-opencode-toggle".to_owned(),
+        terminal_id: "terminal-opencode-toggle".to_owned(),
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     assert!(fixture.projection.snapshot(&scope).await.is_err());
 
     allow_activity_scopes(&fixture.database).await;

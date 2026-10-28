@@ -9840,6 +9840,20 @@ fn selection_effort(options: &[Value]) -> Option<String> {
         .find_map(|id| selection_string_option_from(options, id))
 }
 
+/// How often, and how far apart, the event pump tries again to record an ask a resumed session
+/// recovered before it gives up and keeps the session's queue held (#187).
+const RECOVERED_ASK_ATTEMPTS: usize = 8;
+const RECOVERED_ASK_RETRY_FIRST: Duration = Duration::from_millis(100);
+const RECOVERED_ASK_RETRY_LONGEST: Duration = Duration::from_secs(2);
+
+/// An ask a provider shows again after a resume (OpenCode's `recovered` asks).
+fn is_recovered_ask(event: &ProviderEvent) -> bool {
+    matches!(
+        event.event_type.as_str(),
+        "request.opened" | "user-input.requested"
+    ) && event.payload.get("recovered") == Some(&Value::Bool(true))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_event_pump(
     engine: OrchestrationEngine,
@@ -9882,6 +9896,8 @@ fn spawn_event_pump(
         };
         let mut last_exit_reason: Option<String> = None;
         let mut reasoning = ReasoningCoalescer::default();
+        // An ask the resumed session recovered could not be recorded (#187).
+        let mut recovered_ask_unprojected = false;
         let settled_tx = loop {
             let reasoning_due = reasoning.next_deadline();
             tokio::select! {
@@ -10123,6 +10139,21 @@ fn spawn_event_pump(
                         .then(|| idle_generation.fetch_add(1, Ordering::Relaxed) + 1);
                     let completed = event.event_type == "turn.completed"
                         && event.payload.get("state").and_then(Value::as_str) != Some("failed");
+                    // A resumed session's first ask read finished: its queued messages may go,
+                    // unless an ask it recovered could not be recorded, which keeps them held
+                    // until the session ends (#187).
+                    if event.event_type == "requests.recovery-read" {
+                        if recovered_ask_unprojected {
+                            tracing::warn!(
+                                thread_id = %launch.thread_id,
+                                "a recovered ask could not be recorded; its queued messages stay held"
+                            );
+                        } else {
+                            engine.release_promotion_after_ask_recovery(&launch.thread_id);
+                        }
+                        continue;
+                    }
+                    let recovered_ask = is_recovered_ask(&event).then(|| event.clone());
                     let mut core_publication = publication.lock().await;
                     if core_publication.closed || cancellation.is_cancelled() {
                         return;
@@ -10143,6 +10174,53 @@ fn spawn_event_pump(
                         core_publication.after_terminal_session.as_ref(),
                     ).await;
                     drop(core_publication);
+                    // An ask a resumed session recovered holds its queue only once recorded: one
+                    // that failed is projected again, in order, with a bounded backoff (#187).
+                    let projection = match (projection, recovered_ask) {
+                        (Err(error), Some(ask)) => {
+                            tracing::warn!(%error, "failed to record a recovered provider ask; retrying");
+                            let mut delay = RECOVERED_ASK_RETRY_FIRST;
+                            let mut outcome = Err(error);
+                            for _ in 1..RECOVERED_ASK_ATTEMPTS {
+                                if matches!(outcome, Err(ProviderRuntimeError::Orchestration(_)))
+                                    && provider_thread_was_deleted(&engine.repositories(), &launch.thread_id).await
+                                {
+                                    return;
+                                }
+                                tokio::select! {
+                                    biased;
+                                    () = cancellation.cancelled() => return,
+                                    () = tokio::time::sleep(delay) => {}
+                                }
+                                delay = delay.saturating_mul(2).min(RECOVERED_ASK_RETRY_LONGEST);
+                                let core_publication = publication.lock().await;
+                                if core_publication.closed || cancellation.is_cancelled() {
+                                    return;
+                                }
+                                outcome = project_provider_event(
+                                    &engine,
+                                    &launch,
+                                    resume_cursor.clone(),
+                                    runtime_payload_with_context_handoff(
+                                        runtime_payload.clone(),
+                                        pending_context_handoff.load(Ordering::Acquire),
+                                    ),
+                                    ask.clone(),
+                                    #[cfg(test)]
+                                    core_publication.after_terminal_session.as_ref(),
+                                ).await;
+                                drop(core_publication);
+                                if outcome.is_ok() {
+                                    break;
+                                }
+                            }
+                            if outcome.is_err() {
+                                recovered_ask_unprojected = true;
+                            }
+                            outcome
+                        }
+                        (projection, _) => projection,
+                    };
                     if let Err(error) = projection {
                         if matches!(error, ProviderRuntimeError::Orchestration(_))
                             && provider_thread_was_deleted(&engine.repositories(), &launch.thread_id)
@@ -10865,12 +10943,6 @@ async fn project_provider_event(
             .await
             .map_err(|error| ProviderRuntimeError::Persistence(error.to_string()))?
     {
-        return Ok(());
-    }
-    // A resumed session's first read of the asks its provider kept finished, completed or not:
-    // the asks it found are projected, so queued messages may be promoted (#187).
-    if event.event_type == "requests.recovery-read" {
-        engine.release_promotion_after_ask_recovery(&launch.thread_id);
         return Ok(());
     }
     // A provider that keeps its asks across restarts (OpenCode) read its pending lists in full:
@@ -25656,6 +25728,97 @@ done
             .unwrap_or_else(|_| panic!("{label}: the finished read releases the queue"));
             engine.shutdown().await;
         }
+    }
+
+    #[tokio::test]
+    async fn a_recovered_ask_that_fails_to_record_keeps_the_queue_held_until_it_is_recorded() {
+        // Mutation caught: a recovered ask whose projection failed is skipped, and the finished
+        // ask read then releases a queued follow-up past it (#187).
+        let engine = supervisor_engine().await;
+        let database = engine.repositories().database().clone();
+        // Recording an approval fails while the switch holds a row, as a transient error would.
+        database
+            .call(|connection| {
+                connection.execute_batch(
+                    "CREATE TABLE refuse_approvals (x);
+                     INSERT INTO refuse_approvals VALUES (1);
+                     CREATE TRIGGER refuse_approvals BEFORE INSERT ON projection_pending_approvals
+                     WHEN EXISTS (SELECT 1 FROM refuse_approvals)
+                     BEGIN SELECT RAISE(ABORT, 'injected approval failure'); END;",
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("refuse approvals");
+        let (events_tx, events_rx) = mpsc::channel(4);
+        let supervisor = super::ProviderRuntimeSupervisor::start(
+            engine.clone(),
+            Arc::new(SupervisorFactory {
+                state: Arc::new(StdMutex::new(SupervisorDriverState::default())),
+                events: StdMutex::new(Some(events_rx)),
+            }),
+            super::ActivityProjection::new(ActivityRepository::new(database.clone())),
+            super::SupervisorOptions::default(),
+        );
+        let temp = TempDir::new().expect("launch directory");
+        let mut launch = native_launch(&temp, "opencode");
+        launch.thread_id = "t1".to_owned();
+        launch.resume_cursor = Some(json!({"threadId":"unit-session"}));
+        supervisor.launch(launch).await.expect("launch runtime");
+        assert!(engine.promotion_held_for_ask_recovery("t1"));
+        let event =
+            |event_type: &str, request_id: Option<&str>, payload: Value| super::ProviderEvent {
+                native_event_id: None,
+                event_type: event_type.to_owned(),
+                thread_id: "t1".to_owned(),
+                turn_id: None,
+                item_id: None,
+                request_id: request_id.map(str::to_owned),
+                payload,
+                activity: Vec::new(),
+                activity_controls: super::ProviderActivityControls::default(),
+            };
+        events_tx
+            .send(event(
+                "request.opened",
+                Some("per_recovered"),
+                json!({"requestType":"exec_command_approval","detail":"ls","recovered":true}),
+            ))
+            .await
+            .expect("recovered ask");
+        events_tx
+            .send(event("requests.recovery-read", None, json!({})))
+            .await
+            .expect("recovery read");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(
+            engine.promotion_held_for_ask_recovery("t1"),
+            "the queue stays held while the recovered ask is not recorded"
+        );
+
+        // The write succeeds again: the retry records the ask, then the read releases.
+        database
+            .call(|connection| {
+                connection.execute_batch("DELETE FROM refuse_approvals;")?;
+                Ok(())
+            })
+            .await
+            .expect("allow approvals");
+        timeout(Duration::from_secs(10), async {
+            while engine.promotion_held_for_ask_recovery("t1") {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the recorded ask lets the finished read release the queue");
+        let thread = engine
+            .repositories()
+            .get_thread("t1".to_owned())
+            .await
+            .expect("read thread")
+            .expect("thread");
+        assert_eq!(thread.pending_approval_count, 1);
+        engine.shutdown().await;
     }
 
     #[tokio::test]
