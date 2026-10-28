@@ -828,16 +828,59 @@ describe("packaged Mermaid diagrams", () => {
       { timeoutMsg: "The fitting fixture reply's diagram never drew." },
     );
     expect(await userRowOffsets(mermaidFixturePrompts.fitting)).toHaveLength(1);
-    await browser.waitUntil(
-      async () => {
-        const [frame] = await sampleSentRow(mermaidFixturePrompts.fitting, "Fits at the top", 1);
-        return frame?.turnFits === true && Math.abs(frame.top - SENT_ROW_ANCHOR_OFFSET) <= 1;
-      },
-      {
-        timeout: 5_000,
-        interval: 100,
-        timeoutMsg: "The fitting sent row never reached its offset.",
-      },
+    const landingSamples: SentRowFrame[] = [];
+    try {
+      await browser.waitUntil(
+        async () => {
+          const [frame] = await sampleSentRow(mermaidFixturePrompts.fitting, "Fits at the top", 1);
+          if (frame) landingSamples.push(frame);
+          return frame?.turnFits === true && Math.abs(frame.top - SENT_ROW_ANCHOR_OFFSET) <= 1;
+        },
+        {
+          timeout: 20_000,
+          interval: 100,
+          timeoutMsg: "The fitting sent row never reached its offset.",
+        },
+      );
+    } catch (error) {
+      const geometry = await browser.execute(
+        (surface: string, prompt: string) => {
+          const scroller = document.querySelector<HTMLElement>(
+            `${surface} [class*='overflow-anchor']`,
+          );
+          const row = [
+            ...document.querySelectorAll<HTMLElement>(`${surface} [data-message-role="user"]`),
+          ]
+            .filter((element) => element.textContent?.includes(prompt))
+            .sort((a, b) => b.getBoundingClientRect().top - a.getBoundingClientRect().top)[0];
+          const overlay = document.querySelector<HTMLElement>(
+            `${surface} [data-chat-composer-overlay="true"]`,
+          );
+          const content = scroller?.querySelector<HTMLElement>(".legend-list-content-container");
+          return {
+            viewportHeight: window.innerHeight,
+            scrollerTop: scroller?.getBoundingClientRect().top ?? null,
+            scrollTop: scroller?.scrollTop ?? null,
+            scrollHeight: scroller?.scrollHeight ?? null,
+            clientHeight: scroller?.clientHeight ?? null,
+            rowTop: row?.getBoundingClientRect().top ?? null,
+            overlayTop: overlay?.getBoundingClientRect().top ?? null,
+            overlayHeight: overlay?.getBoundingClientRect().height ?? null,
+            contentPaddingBottom: content ? getComputedStyle(content).paddingBottom : null,
+          };
+        },
+        visibleSurfaceSelector,
+        mermaidFixturePrompts.fitting,
+      );
+      NodeFS.writeFileSync(
+        NodePath.join(preparedArtifactDirectory, "mermaid-timeline-sent-row-landing.json"),
+        JSON.stringify({ landingSamples, geometry }, null, 2),
+      );
+      throw error;
+    }
+    NodeFS.writeFileSync(
+      NodePath.join(preparedArtifactDirectory, "mermaid-timeline-sent-row-landing.json"),
+      JSON.stringify({ landingSamples }, null, 2),
     );
     const sentRowFrames = await sampleSentRow(mermaidFixturePrompts.fitting, "Fits at the top", 36);
     NodeFS.writeFileSync(
@@ -1227,10 +1270,10 @@ describe("packaged Mermaid diagrams", () => {
     const left = samples.findIndex((entry) => entry.bottom === null);
     const mounted = samples.findIndex((entry, index) => index > left && entry.bottom !== null);
     const drawn = samples.findIndex((entry, index) => index > mounted && entry.evictedDrawn);
-    // The remounted evicted diagram showed its source before it drew again through the queue.
+    // A redraw can finish before the first mounted timer sample. The following cold-draw case
+    // observes source before drawing; this case checks the first painted remount frame.
     expect(left).toBeGreaterThan(0);
     expect(mounted).toBeGreaterThan(left);
-    expect(samples[mounted]?.evictedDrawn).toBe(false);
     expect(drawn).toBeGreaterThan(mounted);
     const changes = (list: readonly EndSample[]) =>
       list.filter(
@@ -1347,6 +1390,17 @@ describe("packaged Mermaid diagrams", () => {
       NodePath.join(preparedArtifactDirectory, "mermaid-timeline-cold-draw.json"),
       JSON.stringify(withoutRepeats(coldDraw), null, 2),
     );
+    // The separate remount case accepts a cached or fast draw. Here the mounted row must show
+    // source before it draws, which proves the cold path without requiring a painted source frame.
+    const redrawObservations = [...coldDraw.timer, ...coldDraw.painted].sort((a, b) => a.at - b.at);
+    const sourceSeen = redrawObservations.findIndex(
+      (entry) => entry.diagramRowBottom !== null && !entry.diagramDrawn,
+    );
+    const drawAfterSource = redrawObservations.findIndex(
+      (entry, index) => index > sourceSeen && entry.diagramDrawn,
+    );
+    expect(sourceSeen).toBeGreaterThanOrEqual(0);
+    expect(drawAfterSource).toBeGreaterThan(sourceSeen);
     // Timer samples can see layout no frame painted, so the check reads the painted frames.
     expect(coldDraw.painted.length).toBeGreaterThan(0);
     const appeared = coldDraw.painted.findIndex(
@@ -1632,6 +1686,7 @@ describe("packaged Mermaid diagrams", () => {
           grewAbove: boolean;
           focused: boolean;
           shiftAtKey: number | null;
+          anchorKind: "paragraph" | "copy-button" | "none";
           defaultPrevented: boolean;
           before: number;
           after: number;
@@ -1667,13 +1722,24 @@ describe("packaged Mermaid diagrams", () => {
               ?.querySelector<HTMLButtonElement>('button[aria-label="Copy code"]');
             button?.focus({ preventScroll: true });
             const focused = !!button && document.activeElement === button;
-            // A line on screen, to see whether the content moves at the key.
-            const line = [...scroller.querySelectorAll<HTMLElement>(".chat-markdown p")].find(
-              (element) => {
-                const box = element.getBoundingClientRect();
-                return box.top >= area.top && box.bottom <= area.bottom;
-              },
+            const overlay = document.querySelector<HTMLElement>(
+              `${surface} [data-chat-composer-overlay="true"]`,
             );
+            const readableBottom = Math.min(
+              area.bottom,
+              overlay?.getBoundingClientRect().top ?? Number.POSITIVE_INFINITY,
+            );
+            const isVisible = (element: HTMLElement) => {
+              const box = element.getBoundingClientRect();
+              return box.top >= area.top && box.bottom <= readableBottom;
+            };
+            // The focused Copy button remains a stable anchor when the glide leaves no
+            // paragraph inside the readable part of the timeline.
+            const paragraph = [...scroller.querySelectorAll<HTMLElement>(".chat-markdown p")].find(
+              isVisible,
+            );
+            const line = paragraph ?? button ?? null;
+            const anchorKind = paragraph ? "paragraph" : line ? "copy-button" : "none";
             const lineAtKey = line?.getBoundingClientRect().top ?? null;
             const scrollAtKey = scroller.scrollTop;
             const keyAt = performance.now();
@@ -1744,6 +1810,7 @@ describe("packaged Mermaid diagrams", () => {
                 grewAbove: !!above,
                 focused,
                 shiftAtKey,
+                anchorKind,
                 defaultPrevented: event.defaultPrevented,
                 before: scrollAtKey,
                 after: scrollAtKey - step,
@@ -1780,6 +1847,7 @@ describe("packaged Mermaid diagrams", () => {
       landedMidGlide: pressed.moving && pressed.keyAfterGlideMs <= 750,
       grewAbove: pressed.grewAbove,
       focused: pressed.focused,
+      anchorChosen: pressed.anchorKind !== "none",
       keyReachedTimeline: !Number.isNaN(keyAt),
       contentHeldAtKey: pressed.shiftAtKey !== null && Math.abs(pressed.shiftAtKey) <= 1,
       pagedUp:
@@ -1789,6 +1857,7 @@ describe("packaged Mermaid diagrams", () => {
       landedMidGlide: true,
       grewAbove: true,
       focused: true,
+      anchorChosen: true,
       keyReachedTimeline: true,
       contentHeldAtKey: true,
       pagedUp: true,

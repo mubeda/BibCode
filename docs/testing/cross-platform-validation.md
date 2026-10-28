@@ -3502,7 +3502,8 @@ an end gap needs diagnosis. The following cold-draw case uses the earlier rows
 and long replies. A second reply of 101 diagrams evicts earlier drawings;
 scrolling up remounts the
 rows reply, whose diagram shows its source and draws again above the message
-being read. The case selects a paragraph visible in the following reply when
+being read. A timer or painted sample must show the mounted source before a later
+drawn sample. The case selects a paragraph visible in the following reply when
 the diagram row remounts, then checks that it stays within 1 px on every painted frame
 (`mermaid-timeline-cold-draw.json`). The case first waits up to 15 s, at
 the end, for the rows reply's row to unmount; if it does not, the failure and
@@ -3552,9 +3553,10 @@ holds an adjustment for the glide, focuses that button (a focus, not a press),
 dispatches a PageUp keydown on it and immediately makes the page step
 that key's default action makes. The packaged WebDriver plugin sends keys as
 dispatched events, which scroll nothing, so the spec cannot use real key
-input. The key must land within 750 ms of the glide starting, and a line on
-screen must not move between the key and the page step (the glide stops, and
-the held adjustment is applied as a scroll rather than a jump). The paragraph
+input. The key must land within 750 ms of the glide starting, and a visible
+paragraph or the focused Copy button must not move between the key and the page
+step. The glide stops, and the held adjustment is applied as a scroll instead of
+a jump. The paragraph
 then read stays within 1 px on every painted frame for 3 s, through the
 glide's settling, LegendList's wait for rows to settle and at least five more
 deliveries; an End keydown and a scroll to the end resume following, and at
