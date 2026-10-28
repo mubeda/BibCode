@@ -9,7 +9,7 @@
         "error": {
           "_tag": "EnvironmentAuthorizationError",
           "message": "toString",
-          "requiredScope": "relay:read"
+          "requiredScope": "relay:write"
         }
       }
     ]

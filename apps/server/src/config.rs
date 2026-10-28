@@ -573,6 +573,7 @@ mod tests {
             reach,
             name,
             label,
+            access,
             json,
         }) = action
         else {
@@ -584,6 +585,7 @@ mod tests {
         assert_eq!(reach, "another-device");
         assert_eq!(name, None);
         assert_eq!(label.as_deref(), Some("laptop"));
+        assert_eq!(access, PairingAccess::Full, "full access unless asked");
         assert!(json);
 
         assert!(
@@ -739,6 +741,16 @@ enum PairingReachArg {
     Custom,
 }
 
+/// What a pairing offer's credential may do.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+pub enum PairingAccess {
+    /// The ordinary scopes of a paired client.
+    #[default]
+    Full,
+    /// Only the diagnostic bundle (`diagnostics:read`), for `bibcode diagnostics pair`.
+    Diagnostics,
+}
+
 impl PairingReachArg {
     fn as_str(self) -> &'static str {
         match self {
@@ -772,6 +784,10 @@ enum PairingSubcommand {
         name: Option<String>,
         #[arg(long)]
         label: Option<String>,
+        /// `diagnostics` grants only the diagnostic logs, for `bibcode diagnostics pair` on
+        /// the other machine.
+        #[arg(long, value_enum, default_value_t = PairingAccess::Full)]
+        access: PairingAccess,
         #[arg(long)]
         json: bool,
     },
@@ -856,6 +872,7 @@ pub enum PairingCommand {
         reach: String,
         name: Option<String>,
         label: Option<String>,
+        access: PairingAccess,
         json: bool,
     },
 }
@@ -1037,6 +1054,7 @@ impl Cli {
                         reach,
                         name,
                         label,
+                        access,
                         json,
                     } => PairingCommand::Offer {
                         root,
@@ -1045,6 +1063,7 @@ impl Cli {
                         reach: reach.as_str().to_owned(),
                         name,
                         label,
+                        access,
                         json,
                     },
                 }));

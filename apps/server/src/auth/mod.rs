@@ -21,6 +21,7 @@ pub(crate) use http::{
 };
 pub(crate) use model::ClientMetadata;
 pub(crate) use model::Principal;
+pub(crate) use model::SCOPE_DIAGNOSTICS_READ;
 #[cfg(test)]
 pub(crate) use model::STANDARD_SCOPES;
 pub(crate) use pairing_offer::{mint_offline_pairing_offer, validate_pairing_offer_input};
@@ -29,6 +30,6 @@ pub(crate) use scope::{ACTIVITY_READ_SCOPE, authorization_error, required_scope}
 pub(crate) use secret_store::{SecretStore, SecretStoreError};
 pub(crate) use service::{
     AuthError, AuthService, AuthenticatedConnectionGuard, DESKTOP_BOOTSTRAP_SUBJECT,
-    SessionTransport, default_standard_scopes, issue_administrative_pairing_link,
-    issue_offline_share_pairing,
+    SessionTransport, default_standard_scopes, diagnostics_scopes,
+    issue_administrative_pairing_link, issue_offline_share_pairing,
 };

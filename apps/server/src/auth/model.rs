@@ -8,6 +8,8 @@ pub const SCOPE_ACCESS_READ: &str = "access:read";
 pub const SCOPE_ACCESS_WRITE: &str = "access:write";
 pub const SCOPE_RELAY_READ: &str = "relay:read";
 pub const SCOPE_RELAY_WRITE: &str = "relay:write";
+/// Only `server.downloadDiagnosticLogs`: the credential `bibcode diagnostics pair` holds (#202).
+pub const SCOPE_DIAGNOSTICS_READ: &str = "diagnostics:read";
 
 pub const ALL_SCOPES: &[&str] = &[
     SCOPE_ORCHESTRATION_READ,
@@ -18,7 +20,23 @@ pub const ALL_SCOPES: &[&str] = &[
     SCOPE_ACCESS_WRITE,
     SCOPE_RELAY_READ,
     SCOPE_RELAY_WRITE,
+    SCOPE_DIAGNOSTICS_READ,
 ];
+
+/// The one scope a diagnostics-only pairing offer grants.
+pub const DIAGNOSTICS_SCOPES: &[&str] = &[SCOPE_DIAGNOSTICS_READ];
+
+/// Whether a credential holding `granted` may do what `required` allows. Exact match, plus
+/// one implication: `orchestration:read` already reads the redacted diagnostic bundle, so it
+/// satisfies `diagnostics:read`. The implication is one-way.
+#[must_use]
+pub fn scope_satisfies<S: AsRef<str>>(granted: &[S], required: &str) -> bool {
+    granted.iter().any(|scope| {
+        let scope = scope.as_ref();
+        scope == required
+            || (required == SCOPE_DIAGNOSTICS_READ && scope == SCOPE_ORCHESTRATION_READ)
+    })
+}
 
 pub const STANDARD_SCOPES: &[&str] = &[
     SCOPE_ORCHESTRATION_READ,
@@ -243,6 +261,6 @@ pub struct Principal {
 impl Principal {
     #[must_use]
     pub fn has_scope(&self, scope: &str) -> bool {
-        self.scopes.iter().any(|candidate| candidate == scope)
+        scope_satisfies(&self.scopes, scope)
     }
 }

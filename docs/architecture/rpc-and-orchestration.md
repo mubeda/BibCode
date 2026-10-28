@@ -3792,7 +3792,8 @@ so current clients display its summary timing as unavailable.
 
 ## Diagnostic logs download
 
-`server.downloadDiagnosticLogs` (`orchestration:read`, a stream) sends the
+`server.downloadDiagnosticLogs` (`diagnostics:read`, which `orchestration:read`
+satisfies; a stream) sends the
 server's redacted diagnostic bundle over the connection that asks for it, so a
 remote environment's archive needs no HTTP route of its own and stays inside a
 pinned connection's Noise channel (#194). Its schemas are in

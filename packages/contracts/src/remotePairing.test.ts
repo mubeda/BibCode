@@ -83,4 +83,19 @@ describe("remote pairing contract", () => {
       decodeReady({ type: "e2ee_authenticated", features: ["interleave-v1"] }).features,
     ).toEqual(["interleave-v1"]);
   });
+
+  // Servers from #202 add the minted credential's `scopes` to the pairing reply. A client
+  // whose schema predates a field must still pair: excess keys are dropped, not refused.
+  it("decodes the pairing reply's scopes, and tolerates fields it does not know", () => {
+    const reply = {
+      type: "e2ee_authenticated",
+      credential: "bearer-token",
+      environmentId: "env-1",
+      scopes: ["diagnostics:read", "a-scope-from-a-later-server"],
+    };
+    expect(decodeReady(reply).scopes).toEqual(["diagnostics:read", "a-scope-from-a-later-server"]);
+    const later = decodeReady({ ...reply, aFieldFromALaterServer: { nested: true } });
+    expect(later.credential).toBe("bearer-token");
+    expect("aFieldFromALaterServer" in later).toBe(false);
+  });
 });

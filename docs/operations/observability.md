@@ -214,8 +214,9 @@ Only an environment removed from the app drops the choice.
 
 `bibcode diagnostics download --environment <id or name>` saves the same
 bundle on a machine whose BiBCode desktop app is connected to that
-environment, after one approval in the app (#201). Unattended access, without
-the app, is a separate follow-up (#202). The desktop executable runs it too
+environment, after one approval in the app (#201). For unattended access with
+the app closed, see [Without the app](#without-the-app) below (#202). The
+desktop executable runs it too
 (`<desktop exe> diagnostics download …`); when the desktop's primary
 environment runs in WSL, run `bibcode diagnostics download` inside that distro,
 since the endpoint file lives in the distro's data root. Options:
@@ -289,6 +290,47 @@ headers or an error body. Text from the app or the remote server is printed
 without control or format characters. The local server logs each request's id and outcome
 (waiting, claimed, answered, the command left, or the reason it ended), never
 the token, the environment name, or archive bytes.
+
+#### Without the app
+
+`bibcode diagnostics pair` pairs this command with a remote server as its own
+device, from an offer minted there with `bibcode pairing offer --access
+diagnostics` (pass the offer on standard input: as an argument it would show in
+the process list and shell history); afterwards
+`bibcode diagnostics download --remote <name>` fetches the bundle itself, with
+no app running anywhere. `bibcode diagnostics remotes` lists the paired
+remotes and `bibcode diagnostics forget <name>` deletes one's local credential
+(the remote keeps listing the client until it is revoked on its Share tab or
+expires 30 days after pairing; credentials are not renewed). The wire, scope
+and storage design is in
+[Remote architecture](../architecture/remote.md#command-line-diagnostics-pairing).
+
+- The credential holds `diagnostics:read` alone, which allows
+  no method other than `server.downloadDiagnosticLogs` (plus
+  `auth.confirmPairing` for its own pending pairing). `pair` reads the minted
+  scopes from the remote's pairing reply and saves nothing unless they are
+  exactly that (`not-diagnostics-only`); a remote too old to report them is
+  refused too (`unsupported`). An unconfirmed credential it refuses is revoked
+  when it closes the channel.
+- The remote applies the same redaction, 20 MiB limit and crash-dump check as
+  for the app: `--include-crash-dumps` exits 2 with `crash-dumps-refused`,
+  since dumps need `orchestration:operate`. `frontend.log` reads "No frontend
+  warnings or errors were captured.", because the command has no frontend.
+- The download checks what the app's does: the host key pinned at pairing
+  (`host-identity-mismatch`), the store and environment recorded at pairing
+  against the announced manifest before any byte is kept
+  (`wrong-environment`), each item's encoded length against the 64 KiB item
+  bound and the bytes still expected before decoding (`incomplete`), and then
+  the same publish as above.
+- Exit codes and the `--json` document are those of `--environment`, with
+  these reasons: 1 for `host-identity-mismatch`, `wrong-environment`,
+  `incomplete`, `too-large`, `exists`, `store-failed`, `protocol` or
+  `server-failed`; 2 for `unauthorized` (revoked or expired) or
+  `crash-dumps-refused`; 3 for `not-paired`, `unreachable`, `tls` or
+  `unsupported`. `pair` uses the same codes: 0 paired, 2 `offer-refused`.
+- An `https` remote's certificate is verified against the operating system's
+  trust; a certificate it cannot verify exits 3 with `tls` before anything is
+  sent, so the offer stays unused.
 
 Provider and terminal operational logs are not included. Each retained server
 or trace file is read up to 4 MiB and marked when truncated. The frontend
