@@ -1,6 +1,9 @@
 # AI Terminal Claude: attest the real install, widen the approved builds, Linux pinning (#203)
 
-Status: proposed, awaiting approval. Parent: #196 (merged as `ac0bda0a57`).
+Status: approved with changes, implemented. Parent: #196 (merged as `ac0bda0a57`).
+The approval changed D1, D3 and D4. **Approved changes and evidence** at the end
+records what was built and measured. Where it differs from the proposal below,
+it wins.
 
 ## Problem
 
@@ -346,3 +349,55 @@ binaries or shutdown services are added. A preparation that passes through logs
 one bounded reason (`shim_unresolved`, `shim_env_rejected`, `build_unattested`)
 with `tracing::debug!` in `claude.rs`, warned once per reason like the
 supervisor's `warn_once`. Paths and environment values are never logged.
+
+## Approved changes and evidence
+
+**D1, bounded range.** Instead of an open floor, the hooked builds are
+`2.1.220 ..= 2.1.312` (`MIN_ADDITIVE_HOOK_VERSION`, `MAX_ADDITIVE_HOOK_VERSION`).
+The ceiling is the newest build on which the live proof passed:
+`live_user_pre_tool_use_guard_still_blocks_with_the_bibcode_overlay`, run on
+2026-10-28 against the installed 2.1.312 on macOS. A project `PreToolUse` guard
+ran and blocked the `touch` it guarded. BiBCode's overlay hooks delivered
+`UserPromptSubmit`, `PreToolUse`, `Stop` and `SessionEnd`. A `-p` run delivers
+no HTTP `SessionStart`. A newer build runs unhooked until a release proves it and
+raises the ceiling (docs/operations/release.md, "Claude Terminal hook ceiling").
+Builds 2.1.221 to 2.1.308 were not proven live. They rest on the inspected
+2.1.220 merge code and on the 2.1.312 proof.
+
+**D2.** As proposed. On macOS the per-launch hash stays CommonCrypto over a
+mapping. The pure-Rust `sha2` took 2.7 s for 276 MB in a debug build, which
+would break the budget in tests. Measured on this Mac (2.1.312, 276 MB) in the
+installed-build test: SHA-256 0.53 s cold, a cold preparation probe (version,
+help, codesign) 0.29 s after it, and a proven-build probe 0.12 s.
+
+**D3.** mise runs `which` then `env --json` one after the other. Each runs
+supervised, capped at 750 ms, and is attributed to BiBCode while it runs.
+BiBCode reads the identity of mise's config files (the project files in the
+directory and its parents, the global and system files) before and after, and
+retries once on a change, else passes through. Any `LD_PRELOAD`,
+`LD_LIBRARY_PATH`, `LD_AUDIT` or `DYLD_*` key passes through on the shim. The
+accepted environment is `PreparedTerminalLaunch::env_overlay`. The manager
+applies it over the client environment and redacts its values from spawn
+labels and errors. One deviation from the approval: the values are not added to
+the terminal output-stream redactor. The user's own shim would print them
+unredacted, and a short value (`1`) or `PATH` would corrupt the terminal's
+output. The root cause of the shim's misdetection was the supervisor's
+canonicalization (`validated_executable`). The supervisor now passes the
+located, uncanonicalized path as `ProviderTerminalObserverFactoryInput::invoked_executable`,
+validated exactly as before.
+
+**D4, measured first.** The Linux lab is a privileged throwaway container from
+`bibcode-linux-lab:22.04`: Ubuntu 22.04 arm64 on the Docker Desktop VM, 12 CPUs,
+7 GB, mise 2026.10.20, and Claude 2.1.311 through `aqua`, 294 MB. Each run is a
+complete cold launch with page caches dropped: `mise which` and `env`, a pin by
+`copy_file_range` with fsync, an OpenSSL SHA-256 of the pin, and `--version` and
+`--help` of the pin. Totals: btrfs (reflink) 0.34 to 0.35 s, XFS (reflink) 0.30
+to 0.34 s, ext4 (kernel copy, 0.18 to 0.21 s of it) 0.48 to 0.50 s. Every
+filesystem fits 2.25 s, so the copy and a per-launch hash are used everywhere.
+A slower disk without block sharing is bounded by the preparation budget. The
+copy runs off the runtime in 16 MiB chunks and stops at the next chunk once the
+preparation is dropped. The blocking task owns the generation directory's
+cleanup until it returns, so a partial pin is removed only after nothing writes
+to it (`a_pin_still_copying_when_the_budget_runs_out_stops_and_its_generation_is_removed`).
+The Rust `sha2` timings from a release build in the lab are pending: that run
+stopped when this Mac's free disk fell under 60 GB.
