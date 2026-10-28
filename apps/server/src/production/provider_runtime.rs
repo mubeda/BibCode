@@ -29635,6 +29635,75 @@ done
         fixture.close().await;
     }
 
+    /// A closure can race a live Codex session that reports the same child again, as a resume
+    /// does (#206). A report newer than the closure reopens the record, and Activity and the
+    /// thread's own status both say the provider is up; when that session stops, both say it is
+    /// not, and the record closes again.
+    #[tokio::test(start_paused = true)]
+    async fn a_live_codex_report_after_a_closure_reopens_the_child_and_status_agrees() {
+        let _clock = keep_idle_clock_paused();
+        let mut fixture = IdleDeadlineFixture::new(BUSY_SESSION_IDLE_TIMEOUT).await;
+        fixture.complete_first_turn_with_actor("running").await;
+        fixture
+            .activity
+            .interrupt_unresolved_scope("thread:t1", super::provider_session_interruption("codex"))
+            .await
+            .unwrap();
+        let closed = fixture.thread_activity().await;
+        assert_eq!(closed.counts.subagents.active, 0);
+        let closed_at = closed.actors[0].updated_at.clone();
+
+        let ProviderActivityMutation::UpsertActor(mut reported) =
+            ProviderActivityMutation::upsert_actor("actor:sub", None, "Sub", "running").unwrap()
+        else {
+            unreachable!("upsert_actor builds an actor upsert");
+        };
+        reported.started_at.clone_from(&closed.actors[0].started_at);
+        reported.updated_at = closed_at;
+        fixture
+            .emit_activity_batch(
+                "codex-resume-report",
+                vec![ProviderActivityMutation::UpsertActor(reported)],
+            )
+            .await;
+        let reopened = fixture.thread_activity().await;
+        assert_eq!(
+            reopened.actors[0].status,
+            crate::activity::ActivityLifecycle::Running
+        );
+        assert_eq!(reopened.counts.subagents.active, 1);
+        fixture
+            .assert_live("Activity reports a running child while the provider session is up")
+            .await;
+
+        let identity = fixture
+            .supervisor
+            .capture_session_identity("t1")
+            .await
+            .unwrap()
+            .expect("live session");
+        fixture
+            .supervisor
+            .stop_session_if_current(identity)
+            .await
+            .unwrap();
+        assert!(
+            fixture
+                .supervisor
+                .capture_session_identity("t1")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let stopped = fixture.thread_activity().await;
+        assert_eq!(
+            stopped.actors[0].status,
+            crate::activity::ActivityLifecycle::Interrupted
+        );
+        assert_eq!(stopped.counts.subagents.active, 0);
+        fixture.close().await;
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_server_the_user_runs_keeps_its_open_subagent_when_the_session_ends() {
         let _clock = keep_idle_clock_paused();
@@ -32103,6 +32172,134 @@ done
                 .shutdown()
                 .await
                 .expect("ACP driver should shut down");
+        }
+    }
+
+    /// Hands the supervisor one prepared driver.
+    struct PreparedDriverFactory(StdMutex<Option<Arc<dyn ProviderDriver>>>);
+
+    impl ProviderDriverFactory for PreparedDriverFactory {
+        fn create(
+            &self,
+            _request: super::ProviderLaunchRequest,
+        ) -> super::BoxRuntimeFuture<'_, Result<Arc<dyn ProviderDriver>, super::ProviderRuntimeError>>
+        {
+            let driver = self.0.lock().unwrap().take().expect("one prepared driver");
+            Box::pin(async move { Ok(driver) })
+        }
+    }
+
+    /// A started OpenCode session records who runs its server, and a server start closes the
+    /// open subagent of a server BiBCode ran but leaves one the user runs to its own resume
+    /// (#206). The flag comes from the driver's own start, never from the test.
+    #[tokio::test]
+    async fn opencode_records_who_runs_its_server_and_startup_closes_only_bibcode_owned_work() {
+        for owned in [true, false] {
+            let app = Router::new()
+                .route(
+                    "/global/health",
+                    get(|| async { Json(json!({"healthy":true,"version":"1.18.32"})) }),
+                )
+                .route(
+                    "/session",
+                    post(|| async { Json(json!({"id":"owner-opencode-session"})) }),
+                )
+                .route("/event", get(|| async { "" }));
+            let (endpoint, server) = crate::provider::opencode::server_fixtures::serve(app).await;
+            let temp = TempDir::new().expect("OpenCode fixture directory");
+            let factory = super::NativeProviderDriverFactory::new(
+                temp.path().join("state").join("attachments"),
+            );
+            let mut request = native_launch(&temp, "opencode");
+            request.thread_id = "t1".to_owned();
+            request.endpoint = Some(endpoint);
+            let mut driver = super::OpenCodeDriver::spawn(
+                request.clone(),
+                factory.attachments.clone(),
+                factory.attribution.clone(),
+                true,
+            )
+            .await
+            .expect("OpenCode driver");
+            // A server BiBCode spawned is its child; the fixture stands in for that server.
+            let child = owned.then(opencode_endpoint_child);
+            driver.child.clone_from(&child);
+            let engine = supervisor_engine().await;
+            let activity = super::ActivityProjection::new(
+                crate::activity::ActivityRepository::new(engine.repositories().database().clone()),
+            );
+            let supervisor = super::ProviderRuntimeSupervisor::start(
+                engine.clone(),
+                Arc::new(PreparedDriverFactory(StdMutex::new(Some(
+                    Arc::new(driver) as Arc<dyn ProviderDriver>
+                )))),
+                activity.clone(),
+                super::SupervisorOptions::default(),
+            );
+            supervisor.launch(request).await.expect("OpenCode launch");
+
+            let row = engine
+                .repositories()
+                .get_provider_session_runtime("t1".to_owned())
+                .await
+                .unwrap()
+                .expect("persisted runtime row");
+            let expected_owner = if owned { "bibcode" } else { "external" };
+            assert_eq!(
+                row.runtime_payload
+                    .as_ref()
+                    .and_then(|payload| payload.get(super::PROCESS_OWNER_PAYLOAD_KEY))
+                    .and_then(Value::as_str),
+                Some(expected_owner)
+            );
+
+            // The provider reported a subagent, which was still open when the previous server
+            // stopped; then a server start.
+            let mut reported = super::activity_scope_mutations(
+                &crate::activity::ActivityCapabilities::structured_full(false),
+                crate::activity::ActivityObservationState::Live,
+                super::RetainedActivitySections::default(),
+            );
+            reported.push(
+                ProviderActivityMutation::upsert_actor("actor:sub", None, "Sub", "running")
+                    .unwrap(),
+            );
+            activity
+                .apply(
+                    "thread:t1",
+                    "owner:open-subagent".to_owned(),
+                    reported,
+                    super::now(),
+                )
+                .await
+                .unwrap();
+            super::interrupt_activity_of_ended_sessions(&engine.repositories(), &activity).await;
+            let expected = if owned {
+                crate::activity::ActivityLifecycle::Interrupted
+            } else {
+                crate::activity::ActivityLifecycle::Running
+            };
+            let status = |snapshot: crate::activity::ActivitySnapshot| {
+                snapshot
+                    .actors
+                    .into_iter()
+                    .find(|actor| actor.id == "actor:sub")
+                    .expect("subagent")
+                    .status
+            };
+            let scope = crate::activity::ActivityScopeRef::Thread {
+                thread_id: "t1".to_owned(),
+            };
+            assert_eq!(status(activity.snapshot(&scope).await.unwrap()), expected);
+
+            // Ending the session for its resume leaves the user's server's work as it was.
+            supervisor.shutdown().await.unwrap();
+            assert_eq!(status(activity.snapshot(&scope).await.unwrap()), expected);
+            server.abort();
+            if let Some(child) = &child {
+                super::kill_child(child).await;
+            }
+            engine.shutdown().await;
         }
     }
 
