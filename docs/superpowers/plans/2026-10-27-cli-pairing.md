@@ -1,6 +1,7 @@
 # Plan: unattended CLI diagnostics (#202)
 
-Design: `docs/superpowers/specs/2026-10-27-cli-pairing-design.md` (approval pending).
+Design: `docs/superpowers/specs/2026-10-27-cli-pairing-design.md` (approved with
+amendments; see its "Approval amendments").
 Branch `claude/b3d-cli-pairing` from `claude/issue-batch-after-v0.12.0`.
 
 ## Acceptance criteria
@@ -70,9 +71,13 @@ Outside this batch's usual files: `relay_cli.rs` (#201's), contracts (shared).
 
 ## Validation
 
-`cargo fmt --all --check`; `cargo test -p bibcode-server --lib auth:: rpc::e2ee_client
-diagnostics::`; `cargo test -p bibcode-server --test diagnostics_remote_cli --test
-e2ee_ws --test auth_http --test diagnostic_logs_relay --test cli_smoke`;
+`cargo fmt --all --check`; one filter per `cargo test` run (cargo takes a single
+positional filter): `cargo test -p bibcode-server --lib auth::`,
+`cargo test -p bibcode-server --lib rpc::e2ee_client`,
+`cargo test -p bibcode-server --lib diagnostics::`, then the full
+`cargo test -p bibcode-server --lib`; `cargo test -p bibcode-server --test
+diagnostics_remote_cli --test e2ee_ws --test auth_http --test diagnostic_logs_relay
+--test cli_smoke` (several `--test` targets in one run are fine);
 `cargo clippy -p bibcode-server --all-targets -- -D warnings`; `vp check --no-fmt`,
 `vp check <changed files>`, `vp run typecheck`, contracts tests
 (`vp test run packages/contracts/src/authRustParity.test.ts`),

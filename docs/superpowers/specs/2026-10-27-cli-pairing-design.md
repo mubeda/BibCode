@@ -1,6 +1,8 @@
 # Unattended CLI diagnostics: the CLI pairs as its own device (#202) — design
 
-Status: proposed, awaiting approval. Follows #201 (relay through the app,
+Status: approved (scope option C, crash dumps refused, `wss` committed, `forget`
+local-only, 30-day expiry documented), with the amendments at the end. Follows
+#201 (relay through the app,
 `docs/superpowers/specs/2026-10-27-diag-thread-cli-design.md`, whose Option C this
 is) and #194 (`server.downloadDiagnosticLogs`).
 
@@ -359,3 +361,33 @@ new RPC); credential renewal past 30 days; `bibcode profiler --remote`;
 1. Scope option C (`diagnostics:read`), with crash dumps refused for it?
 2. TLS feature on `tokio-tungstenite` for `https` remotes, or `http` only in v1?
 3. `forget` local-only (as proposed), or also a self-revoke RPC now?
+
+Answered at approval: 1 yes; 2 `wss` committed (no lockfile condition); 3
+local-only, documented with the 30-day expiry.
+
+## Approval amendments
+
+1. **The saved credential is proven diagnostics-only.** Neither the pairing code
+   nor the bearer reply says what a grant holds, so a full-access offer would
+   otherwise be saved. The pairing reply (`e2ee_authenticated` with a credential)
+   now carries the minted credential's `scopes`; `pair` saves nothing unless they
+   are exactly `["diagnostics:read"]` (`not-diagnostics-only`), and a server that
+   sends no `scopes` (older than #202) is refused (`unsupported`). Closing the
+   unconfirmed channel revokes the pending session; an on-host grant, already
+   active, is named for revocation on the Share tab. The contracts type gains an
+   optional string array, which the web client ignores.
+2. **TLS** uses rustls (aws-lc-rs provider) with `rustls-platform-verifier`, as
+   `reqwest` does, passed to `tokio-tungstenite`'s rustls connector; no crate is
+   added to `Cargo.lock`. Tests build a throwaway P-256 authority and server
+   certificate at run time (`tests/support/tls_fixture.rs`, 30-day validity, so
+   no fixture expires and Apple's validity limit holds) rather than adding
+   `rcgen`, which would have re-resolved unrelated lockfile entries.
+3. **Shared receiver** bounds each item's encoded length (the padded base64 of
+   64 KiB) and its decoded length against the bytes still expected before
+   decoding, as `DiagnosticLogsAssembler` does; the relay path now gets the same
+   bound.
+4. **Fault tests through the real command**: a record that cannot be written
+   (the pending grant is revoked), a connection lost before confirmation
+   (record deleted, grant revoked) and after it (record kept), expiry after a
+   restart, and an interrupted download (both archive slots come back), plus a
+   seeded secret redacted in `server.log` and the empty-frontend text.

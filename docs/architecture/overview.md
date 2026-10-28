@@ -1994,7 +1994,8 @@ bounded memory, and works while the server is stopped.
   remote host is reached as `ssh <host> bibcode profiler mcp`. Without SSH,
   `bibcode diagnostics download` fetches a connected environment's bundle,
   whose `profiler/` folder holds the same files, through the desktop app after
-  one approval there (see
+  one approval there, or with the app closed through a diagnostics-only
+  credential of its own, `download --remote` (see
   [Observability](../operations/observability.md#from-the-command-line)).
 - **Skill.** [`docs/skills/bibcode-profiler/`](../skills/bibcode-profiler/SKILL.md)
   uses these readers to monitor, diagnose, and file deduplicated GitHub issues.

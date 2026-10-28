@@ -20,6 +20,19 @@ Canonical scope constants are in
 | `access:write`          | Create or revoke pairing links and client sessions.                           |
 | `relay:read`            | Read the environment's persisted Connect link state.                          |
 | `relay:write`           | Install/configure the relay client and link or unlink the environment.        |
+| `diagnostics:read`      | Download the redacted diagnostic bundle (`server.downloadDiagnosticLogs`).    |
+
+`orchestration:read` satisfies `diagnostics:read` (one rule, `scope_satisfies`
+in `auth/model.rs`, used by every scope check), so every ordinary credential
+keeps the diagnostic download; `diagnostics:read` satisfies nothing else. No
+standard or administrative grant lists it: only a diagnostics-only pairing
+offer (`bibcode pairing offer --access diagnostics`, or `POST
+/api/auth/pairing-offer` with `"scopes": ["diagnostics:read"]`) grants it alone,
+for `bibcode diagnostics pair`. Crash dumps in the bundle still need
+`orchestration:operate`, so such a credential cannot fetch them. The E2EE
+pairing reply names the minted credential's `scopes`, so a client can refuse
+a credential wider than it asked for (see
+[Remote architecture](../architecture/remote.md#command-line-diagnostics-pairing)).
 
 Ordinary pairing credentials grant:
 
