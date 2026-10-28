@@ -1332,14 +1332,15 @@ async fn run_codex_observer_inner(
     // enabling activity later publishes the scope (#187).
     let mut scope_published = false;
     if initial_state.enabled {
-        if !publish_codex_root_scope(inner, &mut tracker, &root, epoch, Some(&resumed.thread)).await
+        if let Err(rejection) =
+            publish_codex_root_scope(inner, &mut tracker, &root, epoch, Some(&resumed.thread)).await
         {
             if generation.cancellation_reason().is_none() {
                 warn_codex_observer_stopped(
                     inner,
                     "live_publication_rejected",
                     observer_started,
-                    "the terminal generation no longer accepts publication",
+                    rejection.category(),
                 );
             }
             return;
@@ -1523,6 +1524,7 @@ async fn run_codex_observer_inner(
                     if !scope_published
                         && publish_codex_root_scope(inner, &mut tracker, &root, barrier_epoch, None)
                             .await
+                            .is_ok()
                     {
                         scope_published = true;
                         pending_reconciliation = true;
@@ -1715,16 +1717,55 @@ async fn run_codex_observer_inner(
     }
 }
 
+/// Why the terminal's activity scope could not be created. The category is safe to log: it is
+/// a fixed string, never an error's text, which can quote paths or content.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CodexScopeRejection {
+    /// The terminal generation is no longer current (closed, restarted or fenced).
+    StaleGeneration,
+    /// Creating the scope failed; carries the kind of failure.
+    PublicationFailed(&'static str),
+}
+
+impl CodexScopeRejection {
+    fn category(self) -> &'static str {
+        match self {
+            Self::StaleGeneration => "the terminal generation is no longer current",
+            Self::PublicationFailed(kind) => kind,
+        }
+    }
+
+    fn from_error(error: &crate::activity::ActivityError) -> Self {
+        use crate::activity::ActivityRepositoryError as Error;
+        Self::PublicationFailed(match error {
+            Error::Persistence(_) => "activity publication failed: persistence",
+            Error::InvalidModel(_) => "activity publication failed: invalid model",
+            Error::NotFound => "activity publication failed: scope not found",
+            Error::InvalidScope(_) => "activity publication failed: invalid scope",
+            Error::InvalidCursor => "activity publication failed: invalid cursor",
+            Error::EmptyBatch | Error::TooManyMutations => {
+                "activity publication failed: invalid batch"
+            }
+            Error::InvalidReference(_) => "activity publication failed: invalid reference",
+            Error::InvalidCapabilities(_) => "activity publication failed: invalid capabilities",
+            Error::InvalidLimit => "activity publication failed: invalid limit",
+            Error::FeatureDisabled => "activity publication failed: feature disabled",
+            Error::Serialization(_) => "activity publication failed: serialization",
+        })
+    }
+}
+
 /// Creates the terminal's activity scope with the TUI root agent and, at attach, the history
-/// `thread/resume` returned. False when this observer generation is no longer current.
+/// `thread/resume` returned. Rejected when this observer generation is no longer current or the
+/// scope could not be created.
 async fn publish_codex_root_scope(
     inner: &CodexObserverInner,
     tracker: &mut CodexActivityTracker,
     root: &str,
     epoch: u64,
     history: Option<&ReconciliationThread>,
-) -> bool {
-    if !inner
+) -> Result<(), CodexScopeRejection> {
+    match inner
         .publisher
         .publish_correlated(
             "codex",
@@ -1732,9 +1773,10 @@ async fn publish_codex_root_scope(
             ActivityCapabilities::structured_full(false),
         )
         .await
-        .unwrap_or(false)
     {
-        return false;
+        Ok(true) => {}
+        Ok(false) => return Err(CodexScopeRejection::StaleGeneration),
+        Err(error) => return Err(CodexScopeRejection::from_error(&error)),
     }
     let mut root_output = tracker.handle_notification(
         "thread/status/changed",
@@ -1756,7 +1798,7 @@ async fn publish_codex_root_scope(
         root_output,
     )
     .await;
-    true
+    Ok(())
 }
 
 async fn publish_codex_live_scope(inner: &CodexObserverInner, epoch: u64, receive_sequence: u128) {
@@ -3443,6 +3485,41 @@ impl CodexRemoteClient for SystemCodexRemoteClient {
 mod tests {
     use super::*;
     use crate::test_support::{FixtureEvent, TestSandbox};
+
+    /// A rejected root scope is logged by category. The category never carries an error's text,
+    /// which can quote a path or content.
+    #[test]
+    fn scope_rejection_names_a_safe_category() {
+        use crate::activity::ActivityRepositoryError as Error;
+
+        assert_eq!(
+            CodexScopeRejection::StaleGeneration.category(),
+            "the terminal generation is no longer current"
+        );
+        let secret = "/Users/someone/private-project";
+        for (error, expected) in [
+            (
+                Error::NotFound,
+                "activity publication failed: scope not found",
+            ),
+            (
+                Error::InvalidScope(secret.to_owned()),
+                "activity publication failed: invalid scope",
+            ),
+            (
+                Error::InvalidReference(secret.to_owned()),
+                "activity publication failed: invalid reference",
+            ),
+            (
+                Error::InvalidCapabilities(secret.to_owned()),
+                "activity publication failed: invalid capabilities",
+            ),
+        ] {
+            let category = CodexScopeRejection::from_error(&error).category();
+            assert_eq!(category, expected);
+            assert!(!category.contains(secret));
+        }
+    }
 
     /// Answers each probe command with the next scripted result.
     #[derive(Default)]

@@ -591,7 +591,9 @@ Every way a Codex terminal ends up without Activity is logged under
     seconds. The observer keeps waiting.
   - `connect_failed`, unless the terminal is already closing.
   - `root_discovery_stopped`, `root_discovery_reconnect_failed`, the `resume_*`
-    reasons, and `live_publication_rejected`.
+    reasons, and `live_publication_rejected`, whose detail says whether the
+    terminal generation was no longer current or creating the scope failed (the
+    kind of failure only).
   - `root_discovery_pending`, once, if no TUI thread is found within ten
     seconds.
 
@@ -606,7 +608,11 @@ launch the supervisor cannot validate (disabled or unknown instance, mismatched
 driver, unresolved executable) gets the manager's 500 ms default and passes
 through almost at once. The manager's own ceiling (3 s) is a stop for a
 preparer that asks to wait too long; a test keeps it above every provider's
-wait, so the ceiling never cuts a provider short (#200).
+wait, so the ceiling never cuts a provider short (#200). The settings are read
+once per launch: the lookup that chooses the wait keeps the validated reading,
+and preparation of the same launch uses it, so settings that change between the
+two cannot start a preparation under the wrong wait. If that lookup is cut off,
+the launch passes through without a second read.
 
 | Provider | Own budget | `terminal.open` waits at most |
 | -------- | ---------- | ----------------------------- |
