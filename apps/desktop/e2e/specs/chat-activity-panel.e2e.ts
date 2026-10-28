@@ -9,6 +9,7 @@ import {
   materializeDesktopActivitySession,
   startDesktopActivityComposerFollowupTurn,
   startDesktopActivityFollowupTurn,
+  stopDesktopActivitySession,
 } from "../support/activity-session.ts";
 import {
   desktopActivityAccessibleNames,
@@ -1493,6 +1494,38 @@ describe("packaged responsive activity experience", () => {
 
     await browser.saveScreenshot(
       NodePath.join(preparedArtifactDirectory, "chat-activity-responsive.png"),
+    );
+
+    // Stopping the session ends the process that ran its subagents (#206): they
+    // leave Active and read Interrupted under Done, saying why.
+    await stopDesktopActivitySession();
+    await browser.$('button[aria-label^="Activity: Subagents 0 active, 2 done"]').waitForExist({
+      timeoutMsg: "Stopping the session did not move its subagents from Active to Done.",
+    });
+    const interruptedRows = () =>
+      browser.execute(() => {
+        const done = document.querySelector('[aria-labelledby="activity-subagents-done"]');
+        const active = document.querySelector('[aria-labelledby="activity-subagents-active"]');
+        return {
+          activeRows: active?.querySelectorAll("[data-activity-row]").length ?? 0,
+          interrupted: [...(done?.querySelectorAll<HTMLElement>("[data-activity-row]") ?? [])]
+            .map((row) => row.textContent ?? "")
+            .filter(
+              (text) =>
+                text.includes("Interrupted") &&
+                text.includes("Codex session ended before this subagent reported"),
+            ).length,
+        };
+      });
+    if ((await interruptedRows()).interrupted === 0) {
+      await browser.$('button[aria-label^="Activity: Subagents 0 active, 2 done"]').click();
+    }
+    await browser.waitUntil(async () => (await interruptedRows()).interrupted === 2, {
+      timeoutMsg: "The stopped session's subagents did not read Interrupted under Done.",
+    });
+    expect((await interruptedRows()).activeRows).toBe(0);
+    await browser.saveScreenshot(
+      NodePath.join(preparedArtifactDirectory, "chat-activity-session-stopped.png"),
     );
   });
 });
