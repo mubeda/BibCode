@@ -109,13 +109,15 @@ says why:
 - **No update:** the agent was Working but has reported nothing for 30 minutes.
 - **Offline:** its environment is disconnected.
 - **Status unavailable:** BiBCode has no way to observe it. That applies to
-  Cursor and Grok terminals, and to every AI Terminal on Windows.
+  Cursor and Grok terminals, to every AI Terminal on Windows, and to Claude
+  Terminals on Linux, behind a shim such as mise's, or on an unapproved build.
 
 A session that failed reads **Failed** in Done.
 
-**Which AI Terminals report a status.** On macOS and Linux, Claude, Codex and
-OpenCode AI Terminals report their agent's status. Claude needs Claude Code
-v2.1.63 or later. These terminals run with BiBCode's status observer even when
+**Which AI Terminals report a status.** On macOS and Linux, Codex and OpenCode
+AI Terminals report their agent's status. A Claude Terminal does so only on
+macOS, with the Claude Code build BiBCode has approved, started directly and not
+through a shim such as mise's. These terminals run with BiBCode's status observer even when
 **AI Terminal** activity is off; that setting now controls only the detailed
 Subagents and Background Tasks activity.
 
