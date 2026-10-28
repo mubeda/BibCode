@@ -2880,8 +2880,6 @@ describe("ChatView", () => {
         await vi.waitFor(() => expect(container.textContent).toContain("Stable reviewer"));
         const dockCount = h.activityDockRenderProps.length;
         const panelCount = h.activityPanelRenderProps.length;
-        const dockProps = h.activityDockRenderProps.at(-1);
-        const panelProps = h.activityPanelRenderProps.at(-1);
         const atomTargetCount = h.activityAtomTargets.length;
         const stateTargetCount = h.activityStateTargets.length;
         h.threadsByKey.set(`${environmentId}:${threadId}`, {
@@ -2912,12 +2910,23 @@ describe("ChatView", () => {
           await Promise.resolve();
         });
 
-        expect(h.activityDockRenderProps).toHaveLength(dockCount);
-        expect(h.activityPanelRenderProps).toHaveLength(panelCount);
+        // Render counts differ by lane: the web package compiles ChatView with the React
+        // Compiler, which skips the dock and panel when their props are unchanged, while the
+        // root runner re-renders them. The binding property is that every prop keeps its
+        // identity, so any render after the stream starts receives the same values.
+        const expectPropsUnchanged = (renders: readonly unknown[], count: number) => {
+          const baseline = renders[count - 1] as Record<string, unknown>;
+          for (const props of renders.slice(count) as Array<Record<string, unknown>>) {
+            expect(Object.keys(props).toSorted()).toEqual(Object.keys(baseline).toSorted());
+            for (const key of Object.keys(baseline)) {
+              expect(props[key], `prop ${key}`).toBe(baseline[key]);
+            }
+          }
+        };
+        expectPropsUnchanged(h.activityDockRenderProps, dockCount);
+        expectPropsUnchanged(h.activityPanelRenderProps, panelCount);
         expect(h.activityAtomTargets).toHaveLength(atomTargetCount);
         expect(h.activityStateTargets).toHaveLength(stateTargetCount);
-        expect(h.activityDockRenderProps.at(-1)).toBe(dockProps);
-        expect(h.activityPanelRenderProps.at(-1)).toBe(panelProps);
         expect(
           capturedProps<{ activeThread: Thread }>("chatComposer").activeThread.messages,
         ).toHaveLength(1);
