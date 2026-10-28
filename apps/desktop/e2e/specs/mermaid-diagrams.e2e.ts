@@ -1151,7 +1151,11 @@ describe("packaged Mermaid diagrams", () => {
     // resting frame rests with the reply's end revealed. How many deliveries paint one depends
     // on how often the webview paints: on the Linux runners WebKitGTK painted the plain reply
     // 360-850 ms apart, and six deliveries landed between two of its frames, while each frame it
-    // did paint showed the end revealed. Such a delivery is recorded rather than failed, but each
+    // did paint showed the end revealed. Such a delivery is recorded rather than failed. A
+    // delivery that landed together with earlier ones between two frames, and showed fewer than
+    // FOLLOW_PAINTED_FRAMES frames before the next, is recorded too: on Linux arm64 nine landed
+    // between two frames 550 ms apart, and the follow of that growth showed two frames later.
+    // Each
     // reply must settle, finish, and paint at least one resting frame after settling, so a
     // webview that painted none still fails instead of passing on what it did not show, and a
     // reply that stays hidden fails on every rest it paints.
@@ -1199,6 +1203,11 @@ describe("packaged Mermaid diagrams", () => {
             plain: paintedAfter(plain, plainFrom, plainSettled),
             diagram: paintedAfter(diagram, checkedFrom, diagramSettled),
           },
+          // The rests not checked: batched deliveries shown too briefly to be followed.
+          beforeFollow: [
+            ...restsBeforeFollow("plain", plain, plainSettled),
+            ...restsBeforeFollow("diagram", diagram, diagramSettled),
+          ],
         },
         null,
         2,
@@ -2108,6 +2117,22 @@ async function streamAndSampleEnd(prompt: string): Promise<StreamSample[]> {
     { timeoutMsg: `The streamed reply to "${prompt}" never finished.`, timeout: 60_000 },
   );
   await browser.pause(1_500);
+  // The last line's rest is checked like any other, so it gets the frames its follow needs.
+  await browser.waitUntil(
+    () =>
+      browser.execute(
+        (needed: number) =>
+          (
+            (window as unknown as { __bibcodeStreamSamples?: StreamSample[] })
+              .__bibcodeStreamSamples ?? []
+          ).filter((entry) => entry.finished).length >= needed,
+        FOLLOW_PAINTED_FRAMES,
+      ),
+    {
+      timeoutMsg: `The streamed reply to "${prompt}" painted too few frames after finishing.`,
+      timeout: 10_000,
+    },
+  );
   return browser.execute(() => {
     const record = window as unknown as {
       __bibcodeStreamSamples?: StreamSample[];
@@ -2249,7 +2274,63 @@ function missingDeliveries(
   return missing;
 }
 
-/** The resting frames in `rests` whose reply's end lies further below than `revealedBelow`. */
+/**
+ * How many painted frames a batched delivery must show before its resting frame can reflect
+ * the follow: the frame that shows it, and the two frames the follow pass waits for after it.
+ */
+const FOLLOW_PAINTED_FRAMES = 3;
+
+/**
+ * The deliveries, once the reply's code block shows, that landed together with an earlier one
+ * between two painted frames and then showed fewer than FOLLOW_PAINTED_FRAMES frames. A runner
+ * that paints a frame only every 500 ms or more (Linux arm64 painted the plain reply 550 ms
+ * apart, and nine deliveries landed between two of its frames) shows such a delivery's growth
+ * all at once, with no frame for the follow of each delivery in it; the follow of the whole
+ * growth comes after the frame that shows it, so a rest within those frames is still on its
+ * way to the end. These rests are recorded, not checked. A delivery that follows the one
+ * before it by one, the cadence of a runner that paints each delivery, stays checked on
+ * every frame, and so does the last line's: no delivery replaces it, and the sampling runs
+ * on until it has painted FOLLOW_PAINTED_FRAMES frames.
+ */
+function unfollowedBatches(samples: readonly StreamSample[]): Map<number, number> {
+  const frames = new Map<number, number>();
+  const batched = new Set<number>();
+  let previous: number | null = null;
+  for (const entry of samples) {
+    if (!entry.fenceShown || entry.endBelow === null) continue;
+    const delivered = deliveryOf(entry);
+    if (!entry.finished && previous !== null && delivered > previous + 1) batched.add(delivered);
+    frames.set(delivered, (frames.get(delivered) ?? 0) + 1);
+    previous = delivered;
+  }
+  return new Map(
+    [...frames].filter(
+      ([delivered, count]) => batched.has(delivered) && count < FOLLOW_PAINTED_FRAMES,
+    ),
+  );
+}
+
+/** The resting frames in `rests` of batched deliveries shown too briefly to be followed. */
+function restsBeforeFollow(
+  reply: string,
+  samples: readonly StreamSample[],
+  rests: ReadonlyMap<number, number>,
+): Array<{ reply: string; delivered: number; frames: number; endBelow: number }> {
+  const batches = unfollowedBatches(samples);
+  return [...rests]
+    .filter(([delivered]) => batches.has(delivered))
+    .map(([delivered, index]) => ({
+      reply,
+      delivered,
+      frames: batches.get(delivered)!,
+      endBelow: samples[index]!.endBelow!,
+    }));
+}
+
+/**
+ * The resting frames in `rests`, except those of `restsBeforeFollow`, whose reply's end lies
+ * further below than `revealedBelow`.
+ */
 function hiddenRests(
   reply: string,
   samples: readonly StreamSample[],
@@ -2264,7 +2345,9 @@ function hiddenRests(
   allowed: number;
   settledFrom: number;
 }> {
+  const batches = unfollowedBatches(samples);
   return [...rests]
+    .filter(([delivered]) => !batches.has(delivered))
     .map(([delivered, index]) => ({
       reply,
       delivered,

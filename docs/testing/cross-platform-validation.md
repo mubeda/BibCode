@@ -3493,7 +3493,13 @@ frames, each of which showed the end revealed), so a
 delivery with no painted frame is recorded, with each reply's frame count and
 median frame gap, in `mermaid-timeline-streaming-unpainted.json` rather than
 failed; each reply must still settle, finish and paint at least one resting
-frame after settling, and every resting frame it paints is bounded. Each delivery
+frame after settling, and every resting frame it paints is bounded, except for
+a delivery that landed together with earlier ones between two painted frames
+and showed fewer than three frames before the next (on Linux arm64 nine landed
+between two frames 550 ms apart, and the follow of that growth showed two
+frames later): its rest, still on its way to the end, is recorded under
+`beforeFollow` in the same file. The last line's delivery is always bounded,
+and sampling continues until it has painted three frames. Each delivery
 of the diagram reply from its draw on rests no lower below the composer than
 the plain reply's (or, after a delivery the plain reply painted no rest for,
 is revealed); the draw's own delivery may take 200 ms to be followed. The
