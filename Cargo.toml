@@ -75,6 +75,8 @@ reqwest = { version = "0.13.4", default-features = false, features = [
   "stream",
 ] }
 rusqlite = { version = "0.40.2", features = ["backup", "bundled", "hooks"] }
+rustls = { version = "0.23.46", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+rustls-platform-verifier = "0.7.0"
 semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -108,6 +110,7 @@ tokio = { version = "1.53.1", features = [
   "sync",
   "time",
 ] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["aws_lc_rs"] }
 tokio-stream = { version = "0.1.19", features = ["net", "sync"] }
 tokio-util = { version = "0.7.19", features = ["io", "io-util", "rt"] }
 tokio-tungstenite = "0.30.0"
