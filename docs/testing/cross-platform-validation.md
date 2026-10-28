@@ -798,7 +798,8 @@ the Claude turn-end close:
 cargo test -p bibcode-server --test activity_repository process_end
 cargo test -p bibcode-server --test activity_provider_conformance
 cargo test -p bibcode-server --test production_maintenance open_subagent_records
-cargo test -p bibcode-server --lib -- interrupts_an_open_subagent ends_by_itself a_server_the_user_runs idle_deadline_suspends_a_running_subagent a_live_codex_report_after opencode_records_who_runs startup_interrupts_unresolved turn_end_activity_tests hook_sink
+cargo test -p bibcode-server --lib -- interrupts_an_open_subagent ends_by_itself a_server_the_user_runs idle_deadline_suspends_a_running_subagent a_live_codex_report_after opencode_records_who_runs startup_interrupts_unresolved turn_end_activity_tests hook_sink process_ownership a_restart_settles_or_keeps
+cargo test -p bibcode-server --test production_provider_runtime update_protection_closes_a_live_claude_subagent
 ```
 
 These tests are Unix-only. The live check runs on a remote Linux server whose
