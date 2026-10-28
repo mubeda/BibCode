@@ -262,7 +262,9 @@ The one-time token remains consumed, so the user generates a new offer, but the
 pending credential cannot reconnect as steady-state authority. The server
 returns `e2ee_authenticated` with the minted string credential,
 `environmentId`, optional `storageInstanceId`, the credential's `scopes` (from
-#202; older servers omit them, and the web client ignores them), and
+#202; older servers omit them, and a client whose schema predates the field
+drops it, since `Schema.Struct` decoding ignores excess keys, which
+`remotePairing.test.ts` pins), and
 `pairingConfirmationRequired: true` exactly when the grant was off-host. The
 reply flag is the client's only confirmation signal: when it is present the
 client must call `auth.confirmPairing` on the same channel before the
