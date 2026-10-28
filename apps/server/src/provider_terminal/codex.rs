@@ -963,11 +963,14 @@ async fn run_codex_observer_inner(
     // enabling activity later publishes the scope (#187).
     let mut scope_published = false;
     if initial_state.enabled {
-        if !publish_codex_root_scope(inner, &mut tracker, &root, epoch, Some(&resumed.thread)).await
-        {
+        scope_published =
+            publish_codex_root_scope(inner, &mut tracker, &root, epoch, Some(&resumed.thread))
+                .await;
+        if !generation.is_current() {
             return;
         }
-        scope_published = true;
+    }
+    if scope_published {
         reconcile_codex_terminal(
             inner,
             &format!("codex:terminal-observation:{epoch}"),
@@ -980,20 +983,25 @@ async fn run_codex_observer_inner(
     }
     drop(resumed);
 
-    let mut live_state = initial_state.enabled.then_some(initial_state);
+    // Activity reads live only once its scope exists; one that could not be written is
+    // unavailable and published again after a backoff (#187).
+    let live = initial_state.enabled && scope_published;
+    let mut live_state = live.then_some(initial_state);
     inner
         .activity
         .mark_observed(TerminalAgentActivityObservation {
             state: initial_state,
             epoch,
-            kind: if initial_state.enabled {
+            kind: if live {
                 TerminalAgentActivityObservationKind::Live
+            } else if initial_state.enabled {
+                TerminalAgentActivityObservationKind::Unavailable
             } else {
                 TerminalAgentActivityObservationKind::Dormant
             },
         });
     let mut receive_sequence = 1_u128;
-    if initial_state.enabled {
+    if live {
         publish_codex_live_scope(inner, epoch, receive_sequence).await;
         receive_sequence = receive_sequence.saturating_add(1);
     }
@@ -1001,7 +1009,8 @@ async fn run_codex_observer_inner(
     let mut reconciliation_sequence = 1_u128;
     let mut pending_barrier = None;
     let mut pending_reconciliation = false;
-    let mut retry_at = None;
+    let mut retry_at = (initial_state.enabled && !scope_published)
+        .then(|| tokio::time::Instant::now() + CODEX_ACTIVITY_RETRY_MIN);
     let mut retry_delay = CODEX_ACTIVITY_RETRY_MIN;
     let mut recovering = false;
 
@@ -1131,6 +1140,36 @@ async fn run_codex_observer_inner(
                     tracker = CodexActivityTracker::new_for_terminal_observation(Some(&root));
                     tracker.seed_actor(&root);
                     pending_reconciliation = false;
+                    // An observer launched for status only never created its scope: it does so
+                    // with the root agent before it reads live, then reconciles what runs under
+                    // it. A scope it cannot create leaves activity unavailable, and the barrier
+                    // is crossed again after a backoff (#187).
+                    if !scope_published {
+                        if !publish_codex_root_scope(
+                            inner,
+                            &mut tracker,
+                            &root,
+                            barrier_epoch,
+                            None,
+                        )
+                        .await
+                        {
+                            live_state = None;
+                            inner
+                                .activity
+                                .mark_observed(TerminalAgentActivityObservation {
+                                    state: desired,
+                                    epoch: barrier_epoch,
+                                    kind: TerminalAgentActivityObservationKind::Unavailable,
+                                });
+                            retry_at = Some(tokio::time::Instant::now() + retry_delay);
+                            retry_delay =
+                                retry_delay.saturating_mul(2).min(CODEX_ACTIVITY_RETRY_MAX);
+                            continue;
+                        }
+                        scope_published = true;
+                        pending_reconciliation = true;
+                    }
                     retry_at = None;
                     retry_delay = CODEX_ACTIVITY_RETRY_MIN;
                     live_state = Some(desired);
@@ -1141,15 +1180,6 @@ async fn run_codex_observer_inner(
                             epoch: barrier_epoch,
                             kind: TerminalAgentActivityObservationKind::Live,
                         });
-                    // An observer launched for status only never created its scope: publish
-                    // it with the root agent, then reconcile what runs under it (#187).
-                    if !scope_published
-                        && publish_codex_root_scope(inner, &mut tracker, &root, barrier_epoch, None)
-                            .await
-                    {
-                        scope_published = true;
-                        pending_reconciliation = true;
-                    }
                     publish_codex_live_scope(inner, barrier_epoch, receive_sequence).await;
                     receive_sequence = receive_sequence.saturating_add(1);
                     continue;
@@ -1339,7 +1369,8 @@ async fn run_codex_observer_inner(
 }
 
 /// Creates the terminal's activity scope with the TUI root agent and, at attach, the history
-/// `thread/resume` returned. False when this observer generation is no longer current.
+/// `thread/resume` returned. False when this observer generation is no longer current or the
+/// scope or its root agent could not be written.
 async fn publish_codex_root_scope(
     inner: &CodexObserverInner,
     tracker: &mut CodexActivityTracker,
@@ -1373,13 +1404,18 @@ async fn publish_codex_root_scope(
         root_output.mutations.extend(recovered.mutations);
         root_output.request_reconciliation |= recovered.request_reconciliation;
     }
-    apply_activity_output(
-        inner,
-        &format!("codex:terminal-observation:{epoch}:root"),
-        root_output,
-    )
-    .await;
-    true
+    // The root agent is what the terminal's activity hangs from: without it the scope is not
+    // published either.
+    root_output.mutations.is_empty()
+        || inner
+            .publisher
+            .apply(
+                &format!("codex:terminal-observation:{epoch}:root"),
+                root_output.mutations,
+                &current_timestamp(),
+            )
+            .await
+            .is_ok()
 }
 
 async fn publish_codex_live_scope(inner: &CodexObserverInner, epoch: u64, receive_sequence: u128) {
