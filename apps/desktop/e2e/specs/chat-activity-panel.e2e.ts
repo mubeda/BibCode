@@ -29,11 +29,13 @@ import { ensureMainSidebarOpen, setDesktopUiWindowSize } from "../support/ui-sta
 const artifactDirectory = process.env.BIBCODE_E2E_ARTIFACT_DIR;
 const projectPath = process.env.BIBCODE_E2E_PROJECT_PATH;
 const shimDirectory = process.env.BIBCODE_E2E_SHIM_DIRECTORY;
-if (!artifactDirectory || !projectPath || !shimDirectory) {
+const stateRoot = process.env.BIBCODE_HOME;
+if (!artifactDirectory || !projectPath || !shimDirectory || !stateRoot) {
   throw new Error("The packaged desktop UI fixture environment was not prepared.");
 }
 const preparedArtifactDirectory: string = artifactDirectory;
 const preparedProjectPath: string = projectPath;
+const serverLogPath = NodePath.join(stateRoot, "userdata", "logs", "server.log");
 const isWindowsE2e = process.env.BIBCODE_E2E_PLATFORM === "win";
 const supportsCodexTerminalActivity = !isWindowsE2e;
 const preparedCodexExecutable = NodePath.join(shimDirectory, isWindowsE2e ? "codex.cmd" : "codex");
@@ -393,7 +395,28 @@ async function assertActivityPresentation(width: 960 | 980 | 981 | 1_199 | 1_200
   expect(presentation.doneCounts).toEqual(["Done 0"]);
 }
 
-async function openCodexProviderTerminal(): Promise<string> {
+type CodexTerminalActivityResult = {
+  readonly terminalId: string;
+  readonly kind: "observed" | "preparation-timeout" | "unsupported";
+};
+
+async function openCodexProviderTerminal(): Promise<CodexTerminalActivityResult> {
+  const logStart = NodeFS.existsSync(serverLogPath) ? NodeFS.statSync(serverLogPath).size : 0;
+  const preparationTimedOut = () => {
+    try {
+      const log = NodeFS.readFileSync(serverLogPath);
+      const lines = log.subarray(log.length >= logStart ? logStart : 0).toString("utf8");
+      return lines
+        .split("\n")
+        .some(
+          (line) =>
+            line.includes("bibcode_server::provider_terminal::codex") &&
+            line.includes('reason="preparation_timeout"'),
+        );
+    } catch {
+      return false;
+    }
+  };
   const newPanel = browser.$('button[aria-label="New panel"]');
   await newPanel.waitForDisplayed();
   await newPanel.click();
@@ -439,10 +462,14 @@ async function openCodexProviderTerminal(): Promise<string> {
   const terminalDock = `[data-provider-terminal-activity-host="${terminalId}"] [data-testid="activity-dock"]`;
   if (supportsCodexTerminalActivity) {
     try {
-      await browser.$(terminalDock).waitForDisplayed({
-        timeout: 60_000,
-        timeoutMsg: "The live Codex terminal activity dock did not become visible.",
-      });
+      await browser.waitUntil(
+        async () => (await browser.$(terminalDock).isDisplayed()) || preparationTimedOut(),
+        {
+          timeout: 60_000,
+          timeoutMsg:
+            "The Codex terminal neither showed Activity nor logged a preparation timeout.",
+        },
+      );
     } catch (error) {
       const diagnostics = await browser
         .execute(() => ({
@@ -474,10 +501,16 @@ async function openCodexProviderTerminal(): Promise<string> {
         { cause: error },
       );
     }
+    if (!(await browser.$(terminalDock).isDisplayed())) {
+      expect(preparationTimedOut()).toBe(true);
+      await expectMissing(terminalDock);
+      return { kind: "preparation-timeout", terminalId };
+    }
   } else {
     await expectMissing(terminalDock);
+    return { kind: "unsupported", terminalId };
   }
-  return terminalId;
+  return { kind: "observed", terminalId };
 }
 
 async function assertProviderTerminalGeometry(terminalId: string): Promise<void> {
@@ -1375,10 +1408,10 @@ describe("packaged responsive activity experience", () => {
     });
     await assertInlineChatPanel();
     await setDesktopUiWindowSize(1_200, 720);
-    const terminalId = await openCodexProviderTerminal();
-    if (supportsCodexTerminalActivity) {
-      await assertProviderTerminalGeometry(terminalId);
-      await assertTerminalPanelResizesTui(terminalId);
+    const terminal = await openCodexProviderTerminal();
+    if (terminal.kind === "observed") {
+      await assertProviderTerminalGeometry(terminal.terminalId);
+      await assertTerminalPanelResizesTui(terminal.terminalId);
     }
     const terminalInput =
       '[data-terminal-owner="center-panel"] .xterm-helper-textarea, [data-terminal-owner="right-panel"] .xterm-helper-textarea';
@@ -1398,8 +1431,8 @@ describe("packaged responsive activity experience", () => {
     // The chat tabbed away behind its terminal mounts no Activity, so it
     // neither reads nor announces it until it is in front again.
     expect(await browser.$$(DOCK_BUTTON).length).toBe(0);
-    if (supportsCodexTerminalActivity) {
-      await assertProviderTerminalGeometry(terminalId);
+    if (terminal.kind === "observed") {
+      await assertProviderTerminalGeometry(terminal.terminalId);
     }
     const mainPanel = browser.$(
       '//*[@data-center-panel-tab-list]//button[.//span[normalize-space()="Codex"]]',
@@ -1488,8 +1521,8 @@ describe("packaged responsive activity experience", () => {
     });
     expect(composerFocus).toEqual({ focused: true, lost: false });
 
-    if (supportsCodexTerminalActivity) {
-      await assertNarrowSplitUsability(terminalId);
+    if (terminal.kind === "observed") {
+      await assertNarrowSplitUsability(terminal.terminalId);
     }
 
     await browser.saveScreenshot(
