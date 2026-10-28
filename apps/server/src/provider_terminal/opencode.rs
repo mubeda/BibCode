@@ -682,6 +682,7 @@ impl OpenCodeTerminalObserverFactory {
         Some(PreparedTerminalLaunch {
             executable,
             args,
+            env_overlay: BTreeMap::new(),
             private_env,
             observer: Box::new(observer),
         })
