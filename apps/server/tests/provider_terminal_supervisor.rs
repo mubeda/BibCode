@@ -743,6 +743,75 @@ impl ProviderTerminalInventoryAuthority for CountingInventoryAuthority {
     }
 }
 
+/// An inventory authority that answers each read from a script, so a test can change the settings
+/// or stall a read between the budget lookup and preparation of one launch.
+#[derive(Debug)]
+struct ScriptedInventoryAuthority {
+    calls: AtomicUsize,
+    /// What each successive read waits, then answers; the last entry answers any further read.
+    script: Vec<(std::time::Duration, ProviderTerminalInventory)>,
+}
+
+impl ProviderTerminalInventoryAuthority for ScriptedInventoryAuthority {
+    fn current(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<ProviderTerminalInventory, ()>> + Send + '_>> {
+        let index = self.calls.fetch_add(1, Ordering::AcqRel);
+        let (delay, inventory) = self.script[index.min(self.script.len() - 1)].clone();
+        Box::pin(async move {
+            tokio::time::sleep(delay).await;
+            Ok(inventory)
+        })
+    }
+}
+
+#[cfg(unix)]
+fn claude_inventory(configured: &std::path::Path, enabled: bool) -> ProviderTerminalInventory {
+    let mut settings = ProviderSettingsState::default();
+    settings.providers.claude_agent.binary_path = configured.to_string_lossy().into_owned();
+    settings.providers.claude_agent.enabled = enabled;
+    ProviderTerminalInventory::from_settings(&settings)
+}
+
+/// Opens a Claude terminal whose settings reads follow `script` (enabled or not, delay), and
+/// returns how many reads the launch made.
+#[cfg(unix)]
+async fn open_claude_with_settings_script(
+    probe_delay: std::time::Duration,
+    script: Vec<(std::time::Duration, bool)>,
+) -> (
+    Arc<RecordingBackend>,
+    TerminalManager,
+    std::path::PathBuf,
+    tempfile::TempDir,
+    std::time::Duration,
+    usize,
+) {
+    let captured = Arc::new(Mutex::new(None::<Arc<ScriptedInventoryAuthority>>));
+    let capture = captured.clone();
+    let (backend, manager, configured, root, elapsed) =
+        open_claude_with_inventory(probe_delay, move |configured| {
+            let authority = Arc::new(ScriptedInventoryAuthority {
+                calls: AtomicUsize::new(0),
+                script: script
+                    .into_iter()
+                    .map(|(delay, enabled)| (delay, claude_inventory(configured, enabled)))
+                    .collect(),
+            });
+            *capture.lock().expect("authority capture") = Some(authority.clone());
+            Some(authority)
+        })
+        .await;
+    let reads = captured
+        .lock()
+        .expect("authority capture")
+        .take()
+        .expect("authority")
+        .calls
+        .load(Ordering::Acquire);
+    (backend, manager, configured, root, elapsed, reads)
+}
+
 #[derive(Debug, Default)]
 struct CountingProviderFactory {
     prepare_calls: AtomicUsize,
@@ -8851,6 +8920,16 @@ async fn claude_fixture_supervisor_with_runner(
     pinner: Arc<dyn ClaudeExecutablePinner>,
     runner: Arc<dyn ClaudeCapabilityProbeRunner>,
 ) -> ProviderTerminalActivitySupervisor {
+    claude_fixture_supervisor_with_authority(root, configured, pinner, runner, None).await
+}
+
+async fn claude_fixture_supervisor_with_authority(
+    root: &tempfile::TempDir,
+    configured: &std::path::Path,
+    pinner: Arc<dyn ClaudeExecutablePinner>,
+    runner: Arc<dyn ClaudeCapabilityProbeRunner>,
+    authority: Option<Arc<dyn ProviderTerminalInventoryAuthority>>,
+) -> ProviderTerminalActivitySupervisor {
     let factory = Arc::new(ClaudeTerminalObserverFactory::with_pinner(
         Arc::new(CachedClaudeCapabilityProbe::with_attestor(
             runner,
@@ -8868,16 +8947,31 @@ async fn claude_fixture_supervisor_with_runner(
         .expect("migrations");
     let mut settings = ProviderSettingsState::default();
     settings.providers.claude_agent.binary_path = configured.to_string_lossy().into_owned();
+    let controller = AgentActivityController::new(true);
+    let projection =
+        ActivityProjection::with_controller(ActivityRepository::new(database), controller.clone());
+    let factories = ProviderTerminalObserverFactories {
+        claude: Some(factory),
+        ..ProviderTerminalObserverFactories::default()
+    };
+    if let Some(authority) = authority {
+        return ProviderTerminalActivitySupervisor::new_with_authority(
+            authority,
+            controller,
+            projection,
+            ProcessAttributionRegistry::new(),
+            root.path().join("runtime"),
+            factories,
+        )
+        .expect("Claude supervisor");
+    }
     ProviderTerminalActivitySupervisor::new(
         settings.clone(),
         ProviderTerminalInventory::from_settings(&settings),
-        ActivityProjection::new(ActivityRepository::new(database)),
+        projection,
         ProcessAttributionRegistry::new(),
         root.path().join("runtime"),
-        ProviderTerminalObserverFactories {
-            claude: Some(factory),
-            ..ProviderTerminalObserverFactories::default()
-        },
+        factories,
     )
     .expect("Claude supervisor")
 }
@@ -9629,6 +9723,22 @@ async fn open_claude_with_probe_delay(
     tempfile::TempDir,
     std::time::Duration,
 ) {
+    open_claude_with_inventory(delay, |_| None).await
+}
+
+/// Opens a Claude terminal whose probe takes `delay`. `authority` builds the inventory authority
+/// from the configured Claude path; `None` uses the static, always-enabled inventory.
+#[cfg(unix)]
+async fn open_claude_with_inventory(
+    delay: std::time::Duration,
+    authority: impl FnOnce(&std::path::Path) -> Option<Arc<dyn ProviderTerminalInventoryAuthority>>,
+) -> (
+    Arc<RecordingBackend>,
+    TerminalManager,
+    std::path::PathBuf,
+    tempfile::TempDir,
+    std::time::Duration,
+) {
     use std::os::unix::fs::PermissionsExt;
 
     let root = tempfile::tempdir().expect("fixture root");
@@ -9641,11 +9751,12 @@ async fn open_claude_with_probe_delay(
         delay,
     });
     // The approved-build seam is `ClaudeAttestorFixture`: it vouches for 2.1.220 without a real install.
-    let supervisor = claude_fixture_supervisor_with_runner(
+    let supervisor = claude_fixture_supervisor_with_authority(
         &root,
         &configured,
         Arc::new(CopyClaudeExecutablePinner),
         runner,
+        authority(&configured),
     )
     .await;
     let backend = Arc::new(RecordingBackend::new(Arc::new(Mutex::new(Vec::new()))));
@@ -9716,6 +9827,88 @@ async fn claude_preparation_that_never_finishes_waits_its_budget_then_runs_unobs
         "the original command runs unobserved"
     );
     assert!(!spawn.args.iter().any(|arg| arg == "--settings"));
+    manager.shutdown().await;
+    isolated.complete();
+}
+
+/// #200 review: the wait and the preparation of one launch read the provider settings once. A
+/// Claude that is enabled when the wait is chosen is prepared under that wait, even if the
+/// settings change before preparation would have read them again.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn claude_launch_uses_one_settings_snapshot_when_disabled_after_the_wait_is_chosen() {
+    own_process!(isolated);
+    let zero = std::time::Duration::ZERO;
+    let (backend, manager, configured, _root, elapsed, reads) = open_claude_with_settings_script(
+        std::time::Duration::from_millis(700),
+        vec![(zero, true), (zero, false)],
+    )
+    .await;
+
+    assert_eq!(reads, 1, "the launch must read the provider settings once");
+    assert!(
+        elapsed >= std::time::Duration::from_millis(650),
+        "the valid 700 ms preparation must run to completion: {elapsed:?}"
+    );
+    let spawn = backend.spawns().pop().expect("Claude PTY spawn");
+    assert_ne!(
+        std::path::PathBuf::from(&spawn.executable),
+        configured,
+        "the launch the wait was chosen for is observed"
+    );
+    manager.shutdown().await;
+    isolated.complete();
+}
+
+/// The other order: Claude is disabled when the wait is chosen and enabled before preparation
+/// would read again. The launch follows its snapshot and passes through at once, instead of
+/// preparing under the 500 ms fallback.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn claude_launch_uses_one_settings_snapshot_when_enabled_after_the_wait_is_chosen() {
+    own_process!(isolated);
+    let zero = std::time::Duration::ZERO;
+    let (backend, manager, configured, _root, elapsed, reads) = open_claude_with_settings_script(
+        std::time::Duration::from_millis(700),
+        vec![(zero, false), (zero, true)],
+    )
+    .await;
+
+    assert_eq!(reads, 1);
+    assert!(
+        elapsed < std::time::Duration::from_millis(400),
+        "a launch rejected by its snapshot must not run a preparation: {elapsed:?}"
+    );
+    let spawn = backend.spawns().pop().expect("Claude PTY spawn");
+    assert_eq!(std::path::PathBuf::from(&spawn.executable), configured);
+    manager.shutdown().await;
+    isolated.complete();
+}
+
+/// A settings read that stalls costs the wait lookup's 500 ms once. Preparation of the same
+/// launch does not read again and wait another 500 ms.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn claude_launch_with_a_stalled_settings_read_waits_for_it_once() {
+    own_process!(isolated);
+    let stall = std::time::Duration::from_secs(5);
+    let (backend, manager, configured, _root, elapsed, reads) = open_claude_with_settings_script(
+        std::time::Duration::ZERO,
+        vec![(stall, true), (stall, true)],
+    )
+    .await;
+
+    assert_eq!(
+        reads, 1,
+        "preparation must not read the stalled settings a second time"
+    );
+    assert!(
+        elapsed >= std::time::Duration::from_millis(450)
+            && elapsed < std::time::Duration::from_millis(800),
+        "a stalled read must cost 500 ms once, not twice: {elapsed:?}"
+    );
+    let spawn = backend.spawns().pop().expect("Claude PTY spawn");
+    assert_eq!(std::path::PathBuf::from(&spawn.executable), configured);
     manager.shutdown().await;
     isolated.complete();
 }
