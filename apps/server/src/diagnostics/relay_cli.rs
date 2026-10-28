@@ -30,6 +30,7 @@ use crate::{
     production::{
         diagnostic_logs_relay::{
             APPROVAL_DEADLINE, RELAY_ENDPOINT_FILE, RELAY_PATH, START_DEADLINE, is_archive_name,
+            is_deceptive_char,
         },
         diagnostic_logs_rpc::DIAGNOSTIC_LOGS_CHUNK_BYTES,
     },
@@ -38,6 +39,11 @@ use crate::{
 /// The longest response line: a `Data` item's base64 plus its envelope, or a manifest.
 const MAX_LINE_BYTES: usize = 256 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long the server may take to answer the request's headers, or to send an error body.
+/// It answers at once and streams the rest, so this only ends a server that hangs.
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Fresh names tried for the temporary file before giving up.
+const TEMPORARY_ATTEMPTS: usize = 8;
 /// How long the command waits for the archive to start: past the server's own approval
 /// and start deadlines, so the server's answer normally arrives first.
 const WAIT_FOR_START: Duration = APPROVAL_DEADLINE
@@ -151,7 +157,7 @@ impl Outcome {
 #[must_use]
 pub fn printable(text: &str) -> String {
     text.chars()
-        .filter(|character| !character.is_control())
+        .filter(|character| !is_deceptive_char(*character))
         .collect()
 }
 
@@ -243,9 +249,10 @@ struct Receiving {
 }
 
 /// Publishes `bytes` as a new `directory/file_name`, never over an existing file: written
-/// and synced to a temporary file beside it, then hard-linked under the name (which fails
-/// if the name exists). A filesystem without hard links gets an exclusive create instead.
-/// Any failure removes what this call wrote.
+/// and synced to a temporary file beside it (a fresh name, retried if one is taken), then
+/// hard-linked under the name, which fails if the name exists. Without hard links there is
+/// no publish that cannot replace a file, so the command fails instead of risking a partial
+/// archive under the name. Only the temporary file this call created is removed.
 fn save_new(directory: &Path, file_name: &str, bytes: &[u8]) -> Result<PathBuf, Outcome> {
     if !is_archive_name(file_name) {
         return Err(Outcome::failed(
@@ -263,50 +270,71 @@ fn save_new(directory: &Path, file_name: &str, bytes: &[u8]) -> Result<PathBuf, 
             ),
         )
     };
-    let write_failed = |target: &Path, error: io::Error| {
+    if path.symlink_metadata().is_ok() {
+        return Err(exists());
+    }
+    let temporary = write_temporary(directory, file_name, bytes)?;
+    let published = match std::fs::hard_link(&temporary, &path) {
+        Ok(()) => Ok(path.clone()),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Err(exists()),
+        Err(error) => Err(Outcome::failed(
+            "no-safe-publish",
+            format!(
+                "{} cannot hold hard links ({error}), so the archive cannot be saved without \
+                 risking a partial file. Nothing was saved; pass an --output on a local disk.",
+                directory.display()
+            ),
+        )),
+    };
+    let _ = std::fs::remove_file(&temporary);
+    published
+}
+
+/// Writes and syncs `bytes` to a new hidden file in `directory`, retrying with a fresh name
+/// when one is taken. A name another process holds is never touched.
+fn write_temporary(directory: &Path, file_name: &str, bytes: &[u8]) -> Result<PathBuf, Outcome> {
+    write_temporary_named(directory, file_name, bytes, &mut new_request_code)
+}
+
+fn write_temporary_named(
+    directory: &Path,
+    file_name: &str,
+    bytes: &[u8],
+    next_suffix: &mut dyn FnMut() -> io::Result<String>,
+) -> Result<PathBuf, Outcome> {
+    let failed = |target: &Path, error: io::Error| {
         Outcome::failed(
             "write-failed",
             format!("Could not write {}: {error}", target.display()),
         )
     };
-    if path.symlink_metadata().is_ok() {
-        return Err(exists());
+    for _ in 0..TEMPORARY_ATTEMPTS {
+        let suffix = next_suffix().map_err(|error| failed(directory, error))?;
+        let temporary = directory.join(format!(".{file_name}.{suffix}.partial"));
+        let mut file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(failed(&temporary, error)),
+        };
+        // From here the file is this call's own.
+        if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+            drop(file);
+            let _ = std::fs::remove_file(&temporary);
+            return Err(failed(&temporary, error));
+        }
+        return Ok(temporary);
     }
-    let suffix = new_request_code().map_err(|error| write_failed(&path, error))?;
-    let temporary = directory.join(format!(".{file_name}.{suffix}.partial"));
-    let written = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)
-        .and_then(|mut file| file.write_all(bytes).and_then(|()| file.sync_all()));
-    if let Err(error) = written {
-        let _ = std::fs::remove_file(&temporary);
-        return Err(write_failed(&temporary, error));
-    }
-    let published = match std::fs::hard_link(&temporary, &path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Err(exists()),
-        // No hard links here (some network and FAT filesystems): an exclusive create.
-        Err(_) => publish_by_copy(&path, bytes).map_err(|error| match error.kind() {
-            io::ErrorKind::AlreadyExists => exists(),
-            _ => write_failed(&path, error),
-        }),
-    };
-    let _ = std::fs::remove_file(&temporary);
-    published.map(|()| path)
-}
-
-fn publish_by_copy(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)?;
-    let written = file.write_all(bytes).and_then(|()| file.sync_all());
-    if written.is_err() {
-        drop(file);
-        let _ = std::fs::remove_file(path);
-    }
-    written
+    Err(failed(
+        directory,
+        io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "every temporary name tried was taken",
+        ),
+    ))
 }
 
 /// The archive's own `manifest.json` names the environment and store the app's manifest
@@ -509,8 +537,13 @@ pub async fn download(
             "code": request.code,
             "outputDirectory": output.display().to_string(),
         }))
-        .send()
-        .await;
+        .send();
+    let Ok(response) = tokio::time::timeout(RESPONSE_TIMEOUT, response).await else {
+        return Outcome::failed(
+            "stalled",
+            "BiBCode's server did not answer the request. Nothing was saved.",
+        );
+    };
     let mut response = match response {
         Ok(response) => response,
         Err(error) if error.is_connect() => {
@@ -525,10 +558,10 @@ pub async fn download(
     };
     let status = response.status();
     if !status.is_success() {
-        let message = response
-            .json::<Value>()
+        let message = tokio::time::timeout(RESPONSE_TIMEOUT, response.json::<Value>())
             .await
             .ok()
+            .and_then(Result::ok)
             .and_then(|body| body["message"].as_str().map(printable))
             .unwrap_or_else(|| format!("BiBCode answered {status}."));
         return if status == reqwest::StatusCode::UNAUTHORIZED {
@@ -767,15 +800,50 @@ mod tests {
     }
 
     #[test]
-    fn a_name_taken_after_the_check_is_still_never_replaced() {
-        // The publish step itself refuses an existing name: link and exclusive create both
-        // fail on it, so a file appearing between the check and the publish survives.
+    fn a_taken_temporary_name_is_skipped_and_left_alone() {
         let output = tempfile::tempdir().expect("output");
+        let taken = output.path().join(".logs.zip.AAA-AA.partial");
+        std::fs::write(&taken, b"theirs").expect("taken");
+        let mut suffixes = ["AAA-AA", "BBB-BB"].into_iter();
+        let temporary = write_temporary_named(output.path(), "logs.zip", b"archive", &mut || {
+            Ok(suffixes.next().expect("suffix").to_owned())
+        })
+        .expect("written under the next name");
+        assert_eq!(temporary, output.path().join(".logs.zip.BBB-BB.partial"));
+        assert_eq!(std::fs::read(&temporary).expect("ours"), b"archive");
+        assert_eq!(
+            std::fs::read(&taken).expect("theirs"),
+            b"theirs",
+            "never removed"
+        );
+        // Every name taken: it gives up and still removes nothing.
+        let error = write_temporary_named(output.path(), "logs.zip", b"archive", &mut || {
+            Ok("AAA-AA".to_owned())
+        })
+        .expect_err("all taken");
+        assert!(matches!(&error, Outcome::Failed { reason, .. } if reason == "write-failed"));
+        assert_eq!(std::fs::read(&taken).expect("theirs"), b"theirs");
+    }
+
+    #[test]
+    fn a_name_taken_after_the_check_is_still_never_replaced() {
+        // The hard link itself refuses an existing name, so a file appearing between the
+        // check and the publish survives.
+        let output = tempfile::tempdir().expect("output");
+        let temporary = write_temporary(output.path(), "logs.zip", b"new").expect("temporary");
         let path = output.path().join("logs.zip");
         std::fs::write(&path, b"raced").expect("raced");
-        let error = publish_by_copy(&path, b"new").expect_err("exists");
+        let error = std::fs::hard_link(&temporary, &path).expect_err("exists");
         assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
         assert_eq!(std::fs::read(&path).expect("raced"), b"raced");
+    }
+
+    #[test]
+    fn printed_text_loses_bidi_and_zero_width_characters() {
+        assert_eq!(
+            printable("Omar\u{202E}yhc\u{2066}x\u{2069}\u{200B}\u{FEFF}\u{1b}[0m"),
+            "Omaryhcx[0m"
+        );
     }
 
     #[test]

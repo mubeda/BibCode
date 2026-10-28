@@ -155,8 +155,11 @@ bibcode diagnostics download ──HTTP (loopback, CLI token)──▶ local ser
    per step: `waiting`, `started { fileName, byteLength, manifest }`, `data`
    (base64, at most 64 KiB), `finished`, `denied`, `failed { reason, message }`,
    or `ended { reason, message }`. One relay at a time per server; a second gets
-   `busy`. After a denied or unanswered request the next waits 30 s, doubling per
-   refusal in a row up to 5 minutes (`cooling-down`); a saved archive clears it.
+   `busy`. After a denied or unanswered request, or a command that left before an
+   answer, the next waits 30 s, doubling per refusal in a row up to 5 minutes
+   (`cooling-down`); a saved archive clears it. Fields with control or Unicode
+   format characters (Cc, Cf) are refused; the environment is kept as typed for
+   display and trimmed only for lookup.
 3. **Server → client.** `server.subscribeDiagnosticLogsRelay` (scope
    `access:write`) announces `Pending { requestId, environment,
    includeCrashDumps, code, outputDirectory }`, then `Claimed` and `Closed`.
@@ -193,11 +196,12 @@ bibcode diagnostics download ──HTTP (loopback, CLI token)──▶ local ser
    items. It checks the received length against `byteLength` and that the
    archive's `manifest.json` names the same non-empty environment and store as
    the relayed manifest, writes and syncs a hidden `.<name>.<code>.partial` file
-   in the output directory, publishes it under its name with a hard link (an
-   exclusive create where links are unsupported), which never replaces an
-   existing file, and removes the temporary file. It prints the path, or one JSON
-   document with `--json`, with app- and remote-provided text stripped of control
-   characters. Exit codes: 0 saved, 1 failed, 2 denied, unanswered or cooling
+   in the output directory (a fresh name if one is taken), publishes it under its
+   name with a hard link, which never replaces an existing file, and removes the
+   temporary file; without hard links it saves nothing rather than risk a partial
+   file. Response headers and error bodies get 30 s. It prints the path, or one
+   JSON document with `--json`, with app- and remote-provided text stripped of
+   control and format characters. Exit codes: 0 saved, 1 failed, 2 denied, unanswered or cooling
    down, 3 not running.
 8. **Desktop executable.** `<desktop exe> diagnostics download …` dispatches like
    `profiler` (`cli.rs` `desktop_dispatch`), so a desktop install needs no

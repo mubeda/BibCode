@@ -138,3 +138,8 @@ an unknown name lists nothing; proxied requests are refused; the token goes only
 loopback URL, with 13 min / 90 s read timeouts; the manifest check requires non-empty ids;
 a WSL primary is named in the error, runbook and skill; the claim left `is_long_running`;
 `Claimed` drops other windows' prompts; printed text loses control characters.
+A second round: a command leaving before an answer counts toward the cooldown; without
+hard links the command saves nothing instead of copying; response headers and error
+bodies are bounded at 30 s; Unicode format characters (Cf) are refused and stripped like
+controls; a taken temporary name is retried and never removed; every `x-forwarded-*`
+header is refused; the environment is displayed exactly as typed.

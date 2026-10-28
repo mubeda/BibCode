@@ -72,15 +72,47 @@ const MAX_FAILURE_MESSAGE_BYTES: usize = 2 * 1024;
 /// refusal in a row up to [`MAX_COOLDOWN`], so a program cannot keep prompting the user.
 pub const FIRST_COOLDOWN: Duration = Duration::from_secs(30);
 pub const MAX_COOLDOWN: Duration = Duration::from_secs(5 * 60);
-/// Headers a local reverse proxy (Tailscale Serve, a forwarding proxy) adds: a request
-/// carrying one came from elsewhere even though its socket peer is loopback.
-const FORWARDING_HEADERS: [&str; 5] = [
-    "forwarded",
-    "x-forwarded-for",
-    "x-forwarded-host",
-    "x-forwarded-proto",
-    "x-real-ip",
-];
+/// Whether a request header is one a local reverse proxy (Tailscale Serve, a forwarding
+/// proxy) adds: a request carrying one came from elsewhere even though its socket peer is
+/// loopback. `name` is lowercase, as `HeaderName` stores it.
+fn is_forwarding_header(name: &str) -> bool {
+    name == "forwarded"
+        || name == "x-real-ip"
+        || name.starts_with("x-forwarded-")
+        || name.starts_with("tailscale-")
+}
+
+/// Characters that could make shown text say something other than what it holds: controls
+/// (Cc) and Unicode format characters (Cf), which include the bidirectional overrides and
+/// isolates, zero-width characters, and tag characters.
+#[must_use]
+pub fn is_deceptive_char(character: char) -> bool {
+    character.is_control()
+        || matches!(
+            u32::from(character),
+            0x00AD
+                | 0x0600..=0x0605
+                | 0x061C
+                | 0x06DD
+                | 0x070F
+                | 0x0890..=0x0891
+                | 0x08E2
+                | 0x180E
+                | 0x200B..=0x200F
+                | 0x202A..=0x202E
+                | 0x2060..=0x2064
+                | 0x2066..=0x206F
+                | 0xFEFF
+                | 0xFFF9..=0xFFFB
+                | 0x110BD
+                | 0x110CD
+                | 0x13430..=0x1343F
+                | 0x1BCA0..=0x1BCA3
+                | 0x1D173..=0x1D17A
+                | 0xE0001
+                | 0xE0020..=0xE007F
+        )
+}
 const MAX_MANIFEST_BYTES: usize = 16 * 1024;
 const MAX_REQUEST_BODY_BYTES: usize = 4 * 1024;
 const FAILURE_REASONS: [&str; 12] = [
@@ -665,6 +697,11 @@ impl DiagnosticLogsRelay {
             let mut state = self.inner.state.lock().await;
             match &state.active {
                 Some(active) if active.request_id == request_id => {
+                    // A command that leaves before anyone answered counts like an
+                    // unanswered request, so closing and reopening cannot skip the cooldown.
+                    if command_left && active.claim.is_none() {
+                        state.note_outcome(true);
+                    }
                     state.last_ended = Some((request_id.to_owned(), command_left));
                     state.active.take()
                 }
@@ -956,18 +993,18 @@ struct CommandRequest {
 }
 
 impl CommandRequest {
-    /// The request the app may show, or `None` when a field is empty, too long, or holds a
-    /// control character the prompt could be spoofed with.
+    /// The request the app may show, or `None` when a field is blank, too long, or holds a
+    /// character the prompt could be spoofed with ([`is_deceptive_char`]). The environment
+    /// is kept exactly as typed, for display; the app trims it only to look it up.
     fn checked(self) -> Option<RelayRequest> {
-        let environment = self.environment.trim();
         let fits = |text: &str, limit: usize| {
-            !text.is_empty() && text.len() <= limit && !text.chars().any(char::is_control)
+            !text.trim().is_empty() && text.len() <= limit && !text.chars().any(is_deceptive_char)
         };
-        (fits(environment, MAX_ENVIRONMENT_SELECTOR_BYTES)
+        let plain = fits(&self.environment, MAX_ENVIRONMENT_SELECTOR_BYTES)
             && is_request_code(&self.code)
-            && fits(&self.output_directory, MAX_OUTPUT_DIRECTORY_BYTES))
-        .then(|| RelayRequest {
-            environment: environment.to_owned(),
+            && fits(&self.output_directory, MAX_OUTPUT_DIRECTORY_BYTES);
+        plain.then_some(RelayRequest {
+            environment: self.environment,
             include_crash_dumps: self.include_crash_dumps,
             code: self.code,
             output_directory: self.output_directory,
@@ -1021,10 +1058,10 @@ pub(crate) async fn relay_http(
                 .is_some_and(|local| local.ip() == addrs.peer.ip())
     });
     // A local reverse proxy forwards another machine's request from a loopback socket.
-    let forwarded = request.headers().keys().any(|name| {
-        let name = name.as_str();
-        FORWARDING_HEADERS.contains(&name) || name.starts_with("tailscale-")
-    });
+    let forwarded = request
+        .headers()
+        .keys()
+        .any(|name| is_forwarding_header(name.as_str()));
     if !same_host || forwarded {
         return route_error(
             StatusCode::FORBIDDEN,
@@ -1230,6 +1267,45 @@ mod tests {
             relay.start(RelayRequest::for_test("Omarchy", false)).await,
             Err(EndReason::NoApp)
         ));
+    }
+
+    #[test]
+    fn every_forwarding_header_marks_a_proxied_request() {
+        for name in [
+            "forwarded",
+            "x-forwarded-for",
+            "x-forwarded-port",
+            "x-forwarded-prefix",
+            "x-real-ip",
+            "tailscale-user-login",
+        ] {
+            assert!(is_forwarding_header(name), "{name}");
+        }
+        assert!(!is_forwarding_header("authorization"));
+        assert!(!is_forwarding_header("content-type"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_command_that_leaves_before_an_answer_still_cools_down() {
+        let relay = DiagnosticLogsRelay::new();
+        let app = Claimant::for_test("desktop");
+        let mut events = subscribed(&relay, &app).await;
+        let stream = relay
+            .start(RelayRequest::for_test("Omarchy", false))
+            .await
+            .expect("start");
+        pending_id(&mut events).await;
+        // Open, close before approval, reopen: the reopen waits.
+        drop(stream);
+        let closed = events.recv().await.expect("closed").expect("ok").remove(0);
+        assert_eq!(closed["_tag"], "Closed");
+        assert_eq!(
+            relay
+                .start(RelayRequest::for_test("Omarchy", false))
+                .await
+                .err(),
+            Some(EndReason::CoolingDown(30))
+        );
     }
 
     #[tokio::test]
@@ -1731,12 +1807,21 @@ mod tests {
             }
             .checked()
         };
-        assert!(request(" Omarchy ", "K7Q-4M", "/Users/me").is_some());
+        // Kept exactly as typed, for the prompt.
+        assert_eq!(
+            request(" Omarchy ", "K7Q-4M", "/Users/me").map(|request| request.environment),
+            Some(" Omarchy ".to_owned())
+        );
         for (environment, code, directory) in [
             ("Omarchy\u{1b}[2J", "K7Q-4M", "/Users/me"),
             ("Omarchy", "k7q-4m", "/Users/me"),
             ("Omarchy", "K7Q4M", "/Users/me"),
             ("Omarchy", "K7Q-4M", "/Users/me\nApprove"),
+            // A right-to-left override, an isolate, and a zero-width space.
+            ("Omar\u{202E}yhc", "K7Q-4M", "/Users/me"),
+            ("Omarchy", "K7Q-4M", "/Users/\u{2066}me\u{2069}"),
+            ("Omar\u{200B}chy", "K7Q-4M", "/Users/me"),
+            ("   ", "K7Q-4M", "/Users/me"),
             ("", "K7Q-4M", "/Users/me"),
             ("Omarchy", "K7Q-4M", ""),
         ] {
