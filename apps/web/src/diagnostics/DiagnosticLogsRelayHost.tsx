@@ -114,12 +114,10 @@ export function DiagnosticLogsRelayDialog({
         <AlertDialogHeader>
           <AlertDialogTitle>Share {prompt.label}'s diagnostic logs?</AlertDialogTitle>
           <AlertDialogDescription>
-            A command on this computer (<span className="font-mono">bibcode diagnostics</span>) asks
-            for {prompt.label}'s redacted logs. They are saved where that command runs.
-            {prompt.includeCrashDumps
-              ? " It also asks for crash dumps, which can hold fragments of memory."
-              : ""}{" "}
-            The request ends in 2 minutes if you do not answer.
+            <span className="font-mono">bibcode diagnostics</span> on this computer asks for{" "}
+            {prompt.label}'s redacted logs
+            {prompt.includeCrashDumps ? " and crash dumps, which can hold fragments of memory" : ""}
+            . Unanswered, it ends in 2 minutes.
           </AlertDialogDescription>
         </AlertDialogHeader>
         <AlertDialogFooter>
