@@ -747,6 +747,10 @@ impl CodexPreparationSkip {
 }
 
 impl ProviderTerminalObserverFactory for CodexTerminalObserverFactory {
+    fn preparation_budget(&self) -> Duration {
+        CODEX_PREPARATION_BUDGET
+    }
+
     fn prepare(
         &self,
         input: ProviderTerminalObserverFactoryInput,

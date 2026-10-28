@@ -491,10 +491,15 @@ impl TerminalLaunchPreparer for OversizedBudgetPreparer {
 #[derive(Debug)]
 struct DelayedProviderFactory {
     delay: std::time::Duration,
+    budget: std::time::Duration,
     completed: Arc<AtomicBool>,
 }
 
 impl ProviderTerminalObserverFactory for DelayedProviderFactory {
+    fn preparation_budget(&self) -> std::time::Duration {
+        self.budget
+    }
+
     fn prepare(
         &self,
         _input: ProviderTerminalObserverFactoryInput,
@@ -1851,7 +1856,7 @@ async fn lifecycle_unhinted_bypasses_preparer_and_hinted_prepares_before_spawn()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn hardening_preparation_execution_budget_defaults_to_500ms_and_clamps_at_1s() {
+async fn hardening_preparation_execution_budget_defaults_to_500ms_and_clamps_at_3s() {
     let root = tempfile::tempdir().expect("timeout root");
     let default_completed = Arc::new(AtomicBool::new(false));
     let default_preparer = Arc::new(DelayedPassThroughPreparer {
@@ -1918,7 +1923,7 @@ async fn hardening_preparation_execution_budget_defaults_to_500ms_and_clamps_at_
         Arc::new(RecordingBackend::new(Arc::new(Mutex::new(Vec::new())))),
         TerminalManagerOptions {
             launch_preparer: Some(Arc::new(OversizedBudgetPreparer {
-                delay: std::time::Duration::from_millis(1_500),
+                delay: std::time::Duration::from_millis(3_500),
                 completed: oversized_completed.clone(),
             })),
             ..TerminalManagerOptions::default()
@@ -1939,20 +1944,20 @@ async fn hardening_preparation_execution_budget_defaults_to_500ms_and_clamps_at_
         .expect("clamped-budget terminal");
     let oversized_elapsed = oversized_started.elapsed();
     assert!(
-        oversized_elapsed >= std::time::Duration::from_millis(900)
-            && oversized_elapsed < std::time::Duration::from_millis(1_350),
-        "preparer override escaped the hard 1s cap: {oversized_elapsed:?}"
+        oversized_elapsed >= std::time::Duration::from_millis(2_900)
+            && oversized_elapsed < std::time::Duration::from_millis(3_350),
+        "preparer override escaped the hard 3s cap: {oversized_elapsed:?}"
     );
     assert!(
         !oversized_completed.load(Ordering::Acquire),
-        "the 1.5s callback unexpectedly completed inside the hard cap"
+        "the 3.5s callback unexpectedly completed inside the hard cap"
     );
-    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
     oversized_manager.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn hardening_only_validated_opencode_preparation_receives_the_1s_budget() {
+async fn hardening_validated_preparation_receives_the_budget_its_factory_owns() {
     let root = tempfile::tempdir().expect("provider budget root");
     let codex = root.path().join("configured-codex");
     let claude = root.path().join("configured-claude");
@@ -1973,10 +1978,14 @@ async fn hardening_only_validated_opencode_preparation_receives_the_1s_budget() 
         .await
         .expect("migrations");
     let completed = Arc::new(AtomicBool::new(false));
-    let factory = Arc::new(DelayedProviderFactory {
-        delay: std::time::Duration::from_millis(612),
-        completed: completed.clone(),
-    });
+    // Each factory owns its budget, so the table below reads three different ones.
+    let delayed_factory = |budget_ms: u64| {
+        Arc::new(DelayedProviderFactory {
+            delay: std::time::Duration::from_millis(612),
+            budget: std::time::Duration::from_millis(budget_ms),
+            completed: completed.clone(),
+        })
+    };
     let supervisor = ProviderTerminalActivitySupervisor::new(
         settings.clone(),
         ProviderTerminalInventory::from_settings(&settings),
@@ -1984,9 +1993,9 @@ async fn hardening_only_validated_opencode_preparation_receives_the_1s_budget() 
         ProcessAttributionRegistry::new(),
         root.path().join("runtime"),
         ProviderTerminalObserverFactories {
-            codex: Some(factory.clone()),
-            claude: Some(factory.clone()),
-            opencode: Some(factory),
+            codex: Some(delayed_factory(350)),
+            claude: Some(delayed_factory(2_250)),
+            opencode: Some(delayed_factory(850)),
         },
     )
     .expect("provider budget supervisor");
@@ -2016,7 +2025,7 @@ async fn hardening_only_validated_opencode_preparation_receives_the_1s_budget() 
         ),
         (
             preparation_input(&claude, "claudeAgent", "claudeAgent"),
-            std::time::Duration::from_millis(500),
+            std::time::Duration::from_millis(2_400),
         ),
         (
             preparation_input(&opencode, "opencode", "opencode"),
@@ -8744,6 +8753,31 @@ impl ClaudeExecutablePinner for UnsupportedClaudeExecutablePinner {
     }
 }
 
+/// A Claude capability probe that takes `delay` before it answers from the shared fixture, so a
+/// slow machine's preparation can be driven through the real factory.
+#[cfg(unix)]
+#[derive(Debug)]
+struct DelayedClaudeProbeRunner {
+    inner: Arc<ClaudeProbeFixtureRunner>,
+    delay: std::time::Duration,
+}
+
+#[cfg(unix)]
+impl ClaudeCapabilityProbeRunner for DelayedClaudeProbeRunner {
+    fn run(
+        &self,
+        executable: &std::path::Path,
+        args: Vec<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<ClaudeProbeOutput, String>> + Send + '_>> {
+        // The fixture answers in call order, so take the answer now and only delay its delivery.
+        let output = self.inner.run(executable, args);
+        Box::pin(async move {
+            tokio::time::sleep(self.delay).await;
+            output.await
+        })
+    }
+}
+
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug)]
 enum ClaudeSourceMutation {
@@ -8785,8 +8819,13 @@ async fn claude_pinning_fixture_supervisor(
     configured: &std::path::Path,
     pinner: Arc<dyn ClaudeExecutablePinner>,
 ) -> ProviderTerminalActivitySupervisor {
+    let runner = claude_probe_fixture_runner();
+    claude_fixture_supervisor_with_runner(root, configured, pinner, runner).await
+}
+
+fn claude_probe_fixture_runner() -> Arc<ClaudeProbeFixtureRunner> {
     let fixture = claude_hook_fixture();
-    let runner = Arc::new(ClaudeProbeFixtureRunner {
+    Arc::new(ClaudeProbeFixtureRunner {
         calls: Mutex::new(Vec::new()),
         outputs: Mutex::new(VecDeque::from([
             Ok(ClaudeProbeOutput {
@@ -8803,7 +8842,15 @@ async fn claude_pinning_fixture_supervisor(
                 stderr: String::new(),
             }),
         ])),
-    });
+    })
+}
+
+async fn claude_fixture_supervisor_with_runner(
+    root: &tempfile::TempDir,
+    configured: &std::path::Path,
+    pinner: Arc<dyn ClaudeExecutablePinner>,
+    runner: Arc<dyn ClaudeCapabilityProbeRunner>,
+) -> ProviderTerminalActivitySupervisor {
     let factory = Arc::new(ClaudeTerminalObserverFactory::with_pinner(
         Arc::new(CachedClaudeCapabilityProbe::with_attestor(
             runner,
@@ -9569,6 +9616,107 @@ async fn claude_atomic_replacement_after_preparation_cannot_change_pinned_spawn(
 async fn claude_in_place_mutation_after_preparation_cannot_change_pinned_spawn() {
     own_process!(isolated);
     assert_claude_source_mutation_cannot_change_pinned_spawn(ClaudeSourceMutation::InPlace).await;
+    isolated.complete();
+}
+
+#[cfg(unix)]
+async fn open_claude_with_probe_delay(
+    delay: std::time::Duration,
+) -> (
+    Arc<RecordingBackend>,
+    TerminalManager,
+    std::path::PathBuf,
+    tempfile::TempDir,
+    std::time::Duration,
+) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().expect("fixture root");
+    let configured = root.path().join("configured-claude");
+    std::fs::write(&configured, b"approved").expect("approved Claude");
+    std::fs::set_permissions(&configured, std::fs::Permissions::from_mode(0o700))
+        .expect("Claude permissions");
+    let runner = Arc::new(DelayedClaudeProbeRunner {
+        inner: claude_probe_fixture_runner(),
+        delay,
+    });
+    // The approved-build seam is `ClaudeAttestorFixture`: it vouches for 2.1.220 without a real install.
+    let supervisor = claude_fixture_supervisor_with_runner(
+        &root,
+        &configured,
+        Arc::new(CopyClaudeExecutablePinner),
+        runner,
+    )
+    .await;
+    let backend = Arc::new(RecordingBackend::new(Arc::new(Mutex::new(Vec::new()))));
+    let manager = TerminalManager::new(
+        backend.clone(),
+        TerminalManagerOptions {
+            launch_preparer: Some(Arc::new(supervisor)),
+            ..TerminalManagerOptions::default()
+        },
+    );
+    let started = std::time::Instant::now();
+    manager
+        .open(claude_pinning_open_input(
+            &root,
+            &configured,
+            "terminal-claude-slow",
+        ))
+        .await
+        .expect("Claude terminal");
+    let elapsed = started.elapsed();
+    (backend, manager, configured, root, elapsed)
+}
+
+/// #200: the manager used to give Claude the 500 ms default, so a preparation that needs longer
+/// than that, but is well inside Claude's own budget, ran unobserved.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn claude_preparation_slower_than_500ms_but_within_its_budget_is_observed() {
+    own_process!(isolated);
+    let (backend, manager, configured, _root, elapsed) =
+        open_claude_with_probe_delay(std::time::Duration::from_millis(700)).await;
+
+    assert!(
+        elapsed >= std::time::Duration::from_millis(650)
+            && elapsed < std::time::Duration::from_millis(2_000),
+        "the slow probe should be waited for, not cut at 500 ms or run to the budget: {elapsed:?}"
+    );
+    let spawn = backend.spawns().pop().expect("Claude PTY spawn");
+    assert_ne!(
+        std::path::PathBuf::from(&spawn.executable),
+        configured,
+        "an observed launch runs the pinned executable"
+    );
+    let (_, _, _, settings_path) = claude_hook_launch(&backend);
+    assert!(settings_path.exists(), "the hook overlay must be installed");
+    manager.shutdown().await;
+    isolated.complete();
+}
+
+/// A probe that never answers costs `terminal.open` Claude's own budget, not more, and the
+/// original command then runs unobserved.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn claude_preparation_that_never_finishes_waits_its_budget_then_runs_unobserved() {
+    own_process!(isolated);
+    let (backend, manager, configured, _root, elapsed) =
+        open_claude_with_probe_delay(std::time::Duration::from_secs(60)).await;
+
+    assert!(
+        elapsed >= std::time::Duration::from_millis(2_200)
+            && elapsed < std::time::Duration::from_millis(3_000),
+        "a hung preparation must stop at Claude's 2.25 s budget: {elapsed:?}"
+    );
+    let spawn = backend.spawns().pop().expect("Claude PTY spawn");
+    assert_eq!(
+        std::path::PathBuf::from(&spawn.executable),
+        configured,
+        "the original command runs unobserved"
+    );
+    assert!(!spawn.args.iter().any(|arg| arg == "--settings"));
+    manager.shutdown().await;
     isolated.complete();
 }
 

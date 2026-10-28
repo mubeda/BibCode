@@ -687,6 +687,10 @@ impl OpenCodeTerminalObserverFactory {
 }
 
 impl ProviderTerminalObserverFactory for OpenCodeTerminalObserverFactory {
+    fn preparation_budget(&self) -> Duration {
+        OPENCODE_PREPARATION_BUDGET
+    }
+
     fn prepare(
         &self,
         input: ProviderTerminalObserverFactoryInput,
