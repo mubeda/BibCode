@@ -10099,6 +10099,155 @@ async fn claude_unsupported_clone_is_exact_original_pass_through() {
     manager.shutdown().await;
 }
 
+/// Answers the way a multi-call binary does: as another program when run under `mise`, its real
+/// name, and as Claude Code under any other name.
+#[cfg(unix)]
+#[derive(Debug, Default)]
+struct MultiCallClaudeProbeRunner {
+    executables: Mutex<Vec<std::path::PathBuf>>,
+}
+
+#[cfg(unix)]
+impl ClaudeCapabilityProbeRunner for MultiCallClaudeProbeRunner {
+    fn run(
+        &self,
+        executable: &std::path::Path,
+        args: Vec<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<ClaudeProbeOutput, String>> + Send + '_>> {
+        self.executables
+            .lock()
+            .expect("probed executables lock")
+            .push(executable.to_path_buf());
+        let as_claude = executable.file_name().is_some_and(|name| name != "mise");
+        let fixture = claude_hook_fixture();
+        let stdout = match (as_claude, args.first().map(String::as_str)) {
+            (true, Some("--version")) => fixture["versionOutput"].as_str().expect("version"),
+            (true, _) => fixture["rootHelp"].as_str().expect("root help"),
+            (false, Some("--version")) => "2026.10.19 macos-arm64 (2026-10-19)",
+            (false, _) => "mise: the front-end to your dev env\n",
+        }
+        .to_owned();
+        Box::pin(std::future::ready(Ok(ClaudeProbeOutput {
+            success: true,
+            stdout,
+            stderr: String::new(),
+        })))
+    }
+}
+
+/// Links `bin/claude` to `target_relative` under `root`, with `target_bytes` as the target.
+#[cfg(unix)]
+fn claude_link_to_target(
+    root: &tempfile::TempDir,
+    target_relative: &str,
+    target_bytes: &[u8],
+) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let target = root.path().join(target_relative);
+    std::fs::create_dir_all(target.parent().expect("target directory")).expect("target dir");
+    std::fs::write(&target, target_bytes).expect("target binary");
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700))
+        .expect("target permissions");
+    let bin = root.path().join("bin");
+    std::fs::create_dir_all(&bin).expect("bin dir");
+    let link = bin.join("claude");
+    std::os::unix::fs::symlink(&target, &link).expect("claude link");
+    link
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn claude_terminal_behind_a_multi_call_shim_runs_unobserved_on_the_original_command() {
+    let root = tempfile::tempdir().expect("fixture root");
+    let configured = claude_link_to_target(&root, "real/mise", b"multi-call mise");
+    let runner = Arc::new(MultiCallClaudeProbeRunner::default());
+    let supervisor = claude_fixture_supervisor_with_runner(
+        &root,
+        &configured,
+        Arc::new(CopyClaudeExecutablePinner),
+        runner.clone(),
+    )
+    .await;
+    let backend = Arc::new(RecordingBackend::new(Arc::new(Mutex::new(Vec::new()))));
+    let manager = TerminalManager::new(
+        backend.clone(),
+        TerminalManagerOptions {
+            launch_preparer: Some(Arc::new(supervisor)),
+            ..TerminalManagerOptions::default()
+        },
+    );
+    let input = claude_pinning_open_input(&root, &configured, "terminal-claude-shim");
+    let original_args = input.command.as_ref().expect("Claude command").args.clone();
+
+    manager.open(input).await.expect("pass-through terminal");
+
+    // The terminal runs a private copy of the link's target, so the probe describes the target:
+    // here a program that is not Claude Code, which no hook preparation can attest. The terminal
+    // therefore starts the configured shim unchanged and without BiBCode's settings.
+    let spawn = backend.spawns().pop().expect("Claude PTY spawn");
+    assert_eq!(spawn.executable, configured.to_string_lossy());
+    assert_eq!(spawn.args, original_args);
+    assert!(!spawn.args.iter().any(|argument| argument == "--settings"));
+    let target = std::fs::canonicalize(&configured).expect("shim target");
+    assert!(
+        runner
+            .executables
+            .lock()
+            .expect("probed executables lock")
+            .iter()
+            .all(|executable| executable == &target),
+        "the probe reads the file the terminal would pin"
+    );
+    assert_runtime_has_only_empty_retired_generations(
+        &root.path().join("runtime"),
+        1,
+        "shim pass-through cleanup",
+    );
+    manager.shutdown().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn claude_terminal_behind_a_renamed_link_to_a_claude_build_is_still_observed() {
+    let root = tempfile::tempdir().expect("fixture root");
+    let configured = claude_link_to_target(&root, "versions/2.1.220", b"approved");
+    let supervisor = claude_fixture_supervisor_with_runner(
+        &root,
+        &configured,
+        Arc::new(CopyClaudeExecutablePinner),
+        Arc::new(MultiCallClaudeProbeRunner::default()),
+    )
+    .await;
+    let backend = Arc::new(RecordingBackend::new(Arc::new(Mutex::new(Vec::new()))));
+    let manager = TerminalManager::new(
+        backend.clone(),
+        TerminalManagerOptions {
+            launch_preparer: Some(Arc::new(supervisor)),
+            ..TerminalManagerOptions::default()
+        },
+    );
+
+    manager
+        .open(claude_pinning_open_input(
+            &root,
+            &configured,
+            "terminal-claude-versions",
+        ))
+        .await
+        .expect("Claude terminal");
+
+    let spawn = backend.spawns().pop().expect("Claude PTY spawn");
+    assert_ne!(spawn.executable, configured.to_string_lossy());
+    assert_eq!(
+        std::fs::read(&spawn.executable).expect("pinned executable"),
+        b"approved",
+        "the terminal pins the link's target, not the link"
+    );
+    assert!(spawn.args.iter().any(|argument| argument == "--settings"));
+    manager.shutdown().await;
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn claude_spawn_failure_removes_pin_overlay_and_generation_directory() {

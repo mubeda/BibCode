@@ -616,6 +616,28 @@ executable must support the required settings switches and BiBCode's additive
 hook preparation. If preparation cannot be established before spawn, the
 original Claude terminal command runs without structured terminal activity.
 
+This gate differs from the chat probe above, because a prepared terminal does
+not run the path BiBCode resolved. It runs a private copy of it, so that the
+build BiBCode checked is the build that runs:
+
+- **Pinning exists on macOS only.** The copy is a copy-on-write clone. Linux and
+  Windows never prepare a Claude Terminal, so the probe is never reached there:
+  the terminal runs the original command, its status reads **Status unavailable**
+  and AI Terminal activity stays off.
+- **Only the approved build is hooked.** On macOS the copy must be Claude Code
+  v2.1.220 and match that build's recorded length, SHA-256 and code signature
+  (`APPROVED_ADDITIVE_HOOK_VERSION`). Any other build also runs the original
+  command, with **Status unavailable**.
+- **A shim is never hooked.** A clone follows symlinks, so a link such as mise's
+  `shims/claude` to `mise` pins a copy of `mise`, which answers as mise and is
+  not an approved Claude build. The terminal then starts the shim exactly as
+  configured, without the hooks. The probe reads the file that would be pinned
+  (the link's canonical target), so a "not Claude" answer is never cached for a
+  Claude build. A plain renamed link to a Claude build, such as
+  `~/.local/bin/claude` to `versions/2.1.220`, is not a shim and is pinned
+  as usual. Observing a Claude Terminal behind a shim needs the real install
+  pinned and attested, which is not implemented.
+
 Every Claude Terminal is prepared this way, whatever the AI Terminal activity
 setting says, because the left panel shows its agent's status (#187). The
 injected settings add these hooks to the subagent and tool hooks:
@@ -638,7 +660,8 @@ resume start a new session).
 
 If the terminal cannot be prepared, its status reads **Status unavailable**.
 That happens with a Claude Code older than v2.1.63 (no authenticated HTTP hooks),
-on Windows, or when the probe or settings merge fails.
+on Linux and Windows (no pinning), on macOS for any build but the approved one
+or when `claude` is a multi-call shim, or when the probe or settings merge fails.
 
 See [Activity observation](../architecture/activity-observation.md) for the
 shared protocol and provider matrix.
