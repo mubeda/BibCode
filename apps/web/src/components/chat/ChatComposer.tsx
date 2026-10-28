@@ -247,6 +247,24 @@ function isInsideComposerFloatingLayer(element: Element): boolean {
 }
 
 /**
+ * One function for the composer's life that calls the latest render's `handler`, for event
+ * handlers only (the ref updates in a layout effect). React Compiler keeps each handler from the
+ * last render whose inputs changed, and every closure of a render holds that render's whole
+ * scope, so handlers recreated at different times held each other's older renders and every
+ * changed reconnect kept one more composer and chat view render (#198). Created in this hook,
+ * the kept function's scope holds only the ref.
+ */
+function useLatestHandler<Args extends unknown[], Result>(
+  handler: (...args: Args) => Result,
+): (...args: Args) => Result {
+  const latest = useRef(handler);
+  useLayoutEffect(() => {
+    latest.current = handler;
+  }, [handler]);
+  return useCallback((...args: Args) => latest.current(...args), []);
+}
+
+/**
  * Renders the provider trait controls from an element, so their callbacks are props rather than
  * arguments of a render-time call.
  */
@@ -1772,49 +1790,46 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     };
   }, [composerCapabilities.trigger, readComposerSnapshot]);
 
-  const onSelectComposerItem = useCallback(
-    (selectedItem: ComposerCommandItem) => {
-      if (composerSelectLockRef.current) return;
-      const item = composerMenuItemsRef.current.find(
-        (currentItem) => currentItem.id === selectedItem.id,
-      );
-      if (!item) return;
-      composerSelectLockRef.current = true;
-      window.requestAnimationFrame(() => {
-        composerSelectLockRef.current = false;
+  const onSelectComposerItem = useLatestHandler((selectedItem: ComposerCommandItem) => {
+    if (composerSelectLockRef.current) return;
+    const item = composerMenuItemsRef.current.find(
+      (currentItem) => currentItem.id === selectedItem.id,
+    );
+    if (!item) return;
+    composerSelectLockRef.current = true;
+    window.requestAnimationFrame(() => {
+      composerSelectLockRef.current = false;
+    });
+    const { snapshot, trigger } = resolveActiveComposerTrigger();
+    if (!trigger || !composerItemMatchesTrigger(item, trigger)) return;
+    if (item.type === "bibcode-action") {
+      const applied = applyPromptReplacement(trigger.rangeStart, trigger.rangeEnd, "", {
+        expectedText: snapshot.value.slice(trigger.rangeStart, trigger.rangeEnd),
       });
-      const { snapshot, trigger } = resolveActiveComposerTrigger();
-      if (!trigger || !composerItemMatchesTrigger(item, trigger)) return;
-      if (item.type === "bibcode-action") {
-        const applied = applyPromptReplacement(trigger.rangeStart, trigger.rangeEnd, "", {
-          expectedText: snapshot.value.slice(trigger.rangeStart, trigger.rangeEnd),
-        });
-        if (applied) {
-          setComposerHighlightedItemId(null);
-          setComposerHighlightedSearchKey(null);
-          executeBiBCodeAction(item.action);
-        }
-        return;
-      }
-
-      const replacementRangeEnd = extendReplacementRangeForTrailingSpace(
-        snapshot.value,
-        trigger.rangeEnd,
-        item.replacement,
-      );
-      const applied = applyPromptReplacement(
-        trigger.rangeStart,
-        replacementRangeEnd,
-        item.replacement,
-        { expectedText: snapshot.value.slice(trigger.rangeStart, replacementRangeEnd) },
-      );
       if (applied) {
         setComposerHighlightedItemId(null);
         setComposerHighlightedSearchKey(null);
+        executeBiBCodeAction(item.action);
       }
-    },
-    [applyPromptReplacement, executeBiBCodeAction, resolveActiveComposerTrigger],
-  );
+      return;
+    }
+
+    const replacementRangeEnd = extendReplacementRangeForTrailingSpace(
+      snapshot.value,
+      trigger.rangeEnd,
+      item.replacement,
+    );
+    const applied = applyPromptReplacement(
+      trigger.rangeStart,
+      replacementRangeEnd,
+      item.replacement,
+      { expectedText: snapshot.value.slice(trigger.rangeStart, replacementRangeEnd) },
+    );
+    if (applied) {
+      setComposerHighlightedItemId(null);
+      setComposerHighlightedSearchKey(null);
+    }
+  });
 
   const onComposerMenuItemHighlighted = useCallback(
     (itemId: string | null) => {
@@ -2000,7 +2015,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   // ------------------------------------------------------------------
   // Callbacks: attachments
   // ------------------------------------------------------------------
-  const addComposerAttachments = (files: File[]) => {
+  const addComposerAttachments = useLatestHandler((files: File[]) => {
     if (isProviderBindingConflicted) return;
     if (!activeThreadId || files.length === 0) return;
     if (isComposerApprovalState || pendingUserInputs.length > 0) {
@@ -2053,18 +2068,21 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     }
     const firstRejection = rejections.sort((left, right) => left.index - right.index)[0];
     setThreadError(activeThreadId, firstRejection?.message ?? null);
-  };
+  });
 
   const removeComposerAttachment = (attachmentId: string) => {
     removeComposerAttachmentFromDraft(attachmentId);
   };
 
-  const onComposerFileInputChange = (event: React.ChangeEvent<HTMLInputElement>) => {
-    if (!isProviderBindingConflicted) {
-      addComposerAttachments(Array.from(event.currentTarget.files ?? []));
-    }
-    event.currentTarget.value = "";
-  };
+  // The page's saved form state keeps this input, and with it the handler it was given.
+  const onComposerFileInputChange = useLatestHandler(
+    (event: React.ChangeEvent<HTMLInputElement>) => {
+      if (!isProviderBindingConflicted) {
+        addComposerAttachments(Array.from(event.currentTarget.files ?? []));
+      }
+      event.currentTarget.value = "";
+    },
+  );
 
   // ------------------------------------------------------------------
   // Callbacks: paste / drag
