@@ -80,13 +80,25 @@ collects what tells them apart.
   section. The helper therefore skips a record kind whose capability the scope no
   longer has and logs a count-only warning. Startup repair (item 6) still covers
   those records.
-- Call sites in `production/provider_runtime.rs`:
-  - `detach_session`, after reaping and before `compensate_cancelled_activity`.
-    This covers idle suspension, stop, removal, the lazy dead-session detach and
+- An empty read returns early. `apply_batch` rejects an empty batch with
+  `EmptyBatch`, and a clean detach must not log a warning.
+- Call sites in `production/provider_runtime.rs`, each after
+  `cancel_and_reap_activity_tasks`. The activity dispatch queue is drained by
+  then, so no queued upsert from the dead process (with an `updatedAt` newer than
+  last seen) can revive the record:
+  - `detach_session`, before `synchronize_activity_lifecycle`, so the lifecycle
+    sees zero active, and before `compensate_cancelled_activity`. This covers
+    idle suspension, stop, removal, the lazy dead-session detach and
     `shutdown_sessions`, which is the update path.
   - The relaunch teardown, before `forget_live_activity`.
-  - The event-pump tail, right after the scope is marked Stale on an unexpected
-    stream end (crash).
+  - Crash: the supervisor's `SessionStreamEnded` arm (`:6429-6450`), once
+    settlement finishes and the activity tasks are reaped. If reaping there
+    conflicts with the lazy detach, the lazy detach (`:6523`) stays the crash
+    path, and the window lasts until the next turn start.
+- Gate: only a session whose driver owns its provider process. An OpenCode
+  driver attached to a configured external server (`child: None`,
+  `provider_runtime.rs:13996`) can outlive the BiBCode session, so its children
+  are not interrupted on detach. Startup repair still runs for all of them.
 - Reason text, static and content-free: "{Provider} session ended before this
   subagent reported", with "…this task reported" for work items. The label is
   Claude, Codex or OpenCode, derived from `launch.provider`.
@@ -119,6 +131,8 @@ hook/stdout race with a late-stop upgrade.
 - Not chosen: never closing at turn end. That relies on process end alone, with
   latency of up to the 30-minute quiet cap plus the idle timeout. A dropped 503
   would show **Active 1** for up to about an hour.
+- Last seen at turn end: `ClaudeActorState` gains a last-hook time, bumped by
+  each owned tool hook, so the turn-end close can follow the item-3 rule.
 - Changes: `provider/claude/activity.rs` adds a turn-end close and the
   late-stop path. `provider/claude/runtime.rs` passes the mapped task ids and the
   live background set to the tracker on a root `result`, and on
@@ -164,7 +178,8 @@ Skipped: client-side "No update for X" on active rows. A Claude actor's
 
 `production/runtime.rs:353`: next to the terminal call, the chat projection runs
 `repository.interrupt_unresolved_activity_scopes("BiBCode restarted before this
-subagent reported", AgentActivitySource::Chat)`. The function already exists
+subagent reported", AgentActivitySource::Chat)` through a new projection
+wrapper, because the projection's repository is private. The function already exists
 (`repository.rs:272-288`) and nothing calls it yet. It applies the item-3
 last-seen and summary rule. `append_interruption_entry` hardcodes the
 `activity:monitoring-disabled:` id prefix (`repository.rs:715-718`); it gains a
@@ -191,7 +206,8 @@ the 2 s server body timeout.
   `ActivityDock.tsx` changes only if the dock test shows a need.
 - Client runtime: `packages/client-runtime/src/state/activityReducer.test.ts`
   (tests only; the reducer already handles both paths).
-- Desktop e2e: `apps/desktop/e2e/specs/chat-activity-panel.e2e.ts`, typechecked
+- Desktop e2e: `apps/desktop/e2e/specs/chat-activity-panel.e2e.ts` and
+  `apps/desktop/e2e/support/activity-session.ts` (one new export), typechecked
   only; the run is scheduled by the lead.
 - Docs: `docs/architecture/activity-observation.md` (teardown section `:59-66`,
   Claude structured section, Troubleshooting states), `docs/user/workspace-ui.md`
@@ -214,7 +230,7 @@ or the e2e fixture shim.
 | Conformance: "provider process ended with open subagent" for every chat provider | New `chat-process-ended-interrupts-active` scenario in `canonical-scenarios.json` with a repository checkpoint in `activity_provider_conformance.rs`. The path is provider-agnostic, so it drives Claude, Codex and OpenCode actors through the same projection helper. `every_canonical_scenario_has_a_repository_checkpoint` stays green. |
 | Web: interrupted row (reason, last seen, under Done), explained no-target state, dock counts move | `activityPresentation.test.ts`: time labels per lifecycle. `ActivityRoster.test.tsx`: interrupted row under Done with its reason and "Last seen", and an active row with no target showing the description. `ActivityDock.test.tsx`: Active 1 / Done 17 becomes Active 0 / Done 18 on a snapshot change. |
 | Client runtime: running → interrupted by delta and by replacement snapshot | `activityReducer.test.ts`: both cases. |
-| Desktop e2e: interrupted by a session stop, leaves Active | `chat-activity-panel.e2e.ts`: new `it`. With the Codex fixture, the "Composer focus observer" child stays active (`test-project.ts:153-160`). The test dispatches `thread.session.stop` through the existing RPC helper in `support/activity-session.ts`, then asserts that the row leaves **Active**, reads Interrupted under **Done**, and shows the reason. Typecheck only for now. |
+| Desktop e2e: interrupted by a session stop, leaves Active | `chat-activity-panel.e2e.ts`: new `it`. With the Codex fixture, the "Composer focus observer" child stays active (`test-project.ts:153-160`). The test dispatches `thread.session.stop` through a new `stopDesktopActivitySession()` export in `support/activity-session.ts` (`dispatchDesktopActivityCommands` is module-private). The step goes at the end of the existing `it` unless a second materialization with the fixed fixture ids is accepted. It asserts that the row leaves **Active**, reads Interrupted under **Done**, and shows the reason. Typecheck only for now. |
 | Update maintenance | `production/runtime.rs` or `tests/`: `quiesce_for_update` with an open actor leaves it `interrupted`. A `prepare` with persisted running records completes without delay or failure. |
 | Unchanged | The existing tests for `SubagentStop` completion, task-notification cancellation, targeted Stop, AI Terminal interruption, and the monitoring-disabled entry id stay green. |
 
