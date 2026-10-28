@@ -44,7 +44,10 @@ async fn engine_with_hooks(hooks: crate::orchestration::engine::TestHooks) -> Or
     engine
 }
 async fn session(engine: &OrchestrationEngine, status: &str, id: &str) {
-    engine.dispatch(command(json!({"type":"thread.session.set", "commandId":id, "threadId":"t", "session":{"threadId":"t", "status":status, "providerName":"codex", "activeTurnId":if status == "running" {Some(id)} else {None}, "lastError":null, "updatedAt":TIME}, "createdAt":TIME}))).await.unwrap();
+    session_as(engine, status, id, "codex").await;
+}
+async fn session_as(engine: &OrchestrationEngine, status: &str, id: &str, provider: &str) {
+    engine.dispatch(command(json!({"type":"thread.session.set", "commandId":id, "threadId":"t", "session":{"threadId":"t", "status":status, "providerName":provider, "activeTurnId":if status == "running" {Some(id)} else {None}, "lastError":null, "updatedAt":TIME}, "createdAt":TIME}))).await.unwrap();
 }
 async fn enqueue(engine: &OrchestrationEngine, id: &str, queued: bool) {
     enqueue_for(engine, "t", id, queued).await;
@@ -226,26 +229,65 @@ async fn no_promotion_while_approval_or_user_input_pending() {
 }
 
 #[tokio::test]
-async fn a_relaunch_with_a_recovered_ask_does_not_send_the_follow_up() {
-    for kind in ["approval", "user-input"] {
+async fn a_resumed_session_reading_its_asks_holds_the_follow_up_until_the_read_finishes() {
+    // Mutation caught: a resumed OpenCode session turning `ready` sends a queued follow-up
+    // before its first read has shown an ask BiBCode never recorded (#187).
+    for read_finds_an_ask in [true, false] {
         let engine = engine().await;
-        // A suspended OpenCode session with a queued follow-up is resumed.
-        session(&engine, "stopped", "suspended").await;
+        session_as(&engine, "running", "running", "opencode").await;
         enqueue(&engine, "queued", true).await;
-        // It launches `starting` until its recovered asks are shown (#187): nothing is sent.
-        session(&engine, "starting", "relaunch").await;
+        session_as(&engine, "stopped", "suspended", "opencode").await;
+        let hold = engine.hold_promotion_for_ask_recovery("t");
+        session_as(&engine, "ready", "relaunch", "opencode").await;
         let (service, mut routes) = service(&engine);
         quiet(&mut routes).await;
-        activity(&engine, &format!("{kind}.requested"), "request-recovered").await;
-        session(&engine, "ready", "recovery-settled").await;
-        // The recovered ask holds the follow-up until it is answered.
+        if read_finds_an_ask {
+            // The read shows the ask, then reports it finished: the ask holds the queue.
+            activity(&engine, "approval.requested", "request-recovered").await;
+            engine.release_promotion_after_ask_recovery("t");
+            quiet(&mut routes).await;
+            assert_eq!(
+                row(&engine, "queued").await.state,
+                TurnDeliveryState::Queued
+            );
+        } else {
+            // The read failed: it releases the queue, today's behavior without a read.
+            engine.release_promotion_after_ask_recovery("t");
+            received(&mut routes, "queued").await;
+        }
+        drop(hold);
+        service.shutdown().await;
+        engine.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn an_opencode_ask_holds_the_follow_up_until_a_completed_read_drops_it() {
+    // Mutation caught: a relaunch, or a resume whose read of OpenCode's pending lists failed,
+    // releasing a follow-up past an ask the OpenCode server may still hold (#187).
+    for kind in ["approval", "user-input"] {
+        let engine = engine().await;
+        session_as(&engine, "running", "running", "opencode").await;
+        enqueue(&engine, "queued", true).await;
+        activity(&engine, &format!("{kind}.requested"), "request-open").await;
+        // The session ends and relaunches; the resume's read failed, so it listed nothing.
+        session_as(&engine, "stopped", "suspended", "opencode").await;
+        session_as(&engine, "ready", "relaunch", "opencode").await;
+        let (service, mut routes) = service(&engine);
         quiet(&mut routes).await;
         assert_eq!(
             row(&engine, "queued").await.state,
             TurnDeliveryState::Queued
         );
-        activity(&engine, &format!("{kind}.resolved"), "request-resolved").await;
-        session(&engine, "ready", "answered").await;
+        // A completed read that no longer lists the ask expires it, and the follow-up goes.
+        let listed = std::collections::HashSet::new();
+        assert_eq!(
+            engine
+                .expire_requests_unlisted_by_provider("t", &listed, "read")
+                .await
+                .unwrap(),
+            1
+        );
         received(&mut routes, "queued").await;
         service.shutdown().await;
         engine.shutdown().await;

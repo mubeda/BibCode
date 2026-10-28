@@ -2950,7 +2950,10 @@ sizes. Cover relevant:
     Approval**, the chat's approval card closes, and the work log notes
     "Approval expired".
   - **Quit and relaunch during an approval.** Quit and relaunch BiBCode with an
-    approval open. The row reads **Failed** in Done, not Pending Approval.
+    approval open. A Codex or Claude chat's row reads **Failed** in Done, not
+    Pending Approval. An OpenCode chat's approval stays **Pending Approval**,
+    holding its queued messages, until the session resumes: it stays open if
+    OpenCode still lists it and expires if OpenCode no longer does.
   - **Per-terminal rows.** Open a Claude, Codex or OpenCode Terminal with **AI
     Terminal** activity off. It gets its own row, keyed apart from the chat's,
     and the row follows the agent: Working while it runs, Pending Approval at a
@@ -2969,6 +2972,28 @@ sizes. Cover relevant:
     **Offline** and stop pulsing. Reconnect, and its rows show live states
     again. After an app relaunch, a silent agent that was already 30 minutes
     old reads **No update** at once.
+- the **Inbox** view: with a remote environment connected, have one agent wait
+  on an approval, one run a turn, and one finish, plus a worktree opened with
+  an AI Terminal (the "open AI terminal" worktree default) running a provider
+  CLI. Switch the left panel to **Inbox**: the rail disappears, and the tiles
+  show All Agents, Needs Attention, Working and Done with counts that match;
+  with nothing chosen before, Needs Attention is selected. Pick each tile and
+  confirm only its agents are listed and exactly one tile looks selected;
+  answer the approval and confirm the counts move without a reload. Select a
+  chat agent whose worktree had every center tab closed: its route opens with
+  the chat back in front. Select a chat panel agent: its host worktree opens
+  with that panel focused. Select the AI Terminal agent: its worktree opens
+  with that terminal tab focused (on Windows, where terminal status is not
+  observed, it counts only under All Agents). Reload the window and confirm
+  the Inbox, the tile and the highlighted agent come back. Disconnect the
+  remote server: its agents read **Offline**, count only under All Agents
+  (not Needs Attention), the note names it as not connected and **Open Remote
+  Servers** opens that settings page; while it reconnects the note says so,
+  and once it is back the note goes and its agents' counts return. Select
+  several workspace cards in Environments, switch to Inbox and open an agent:
+  the multi-selection is gone. Narrow the
+  panel to its minimum and confirm the switch shows icons whose tooltips name
+  each view;
 - the **Environments | Repositories** switch: open one repository as a project
   on Local and on a remote environment. Switch the left panel to
   **Repositories**: the environment rail disappears, the BiBCode brand stays where it was

@@ -1957,8 +1957,47 @@ pub struct OrchestrationEngine {
     workspace_ownership: WorkspaceOwnershipFence,
     thread_turns: ThreadTurnFence,
     compaction_waiters: CompactionWaiters,
+    ask_recovery_holds: AskRecoveryHolds,
     #[cfg(test)]
     test_hooks: TestHooks,
+}
+
+/// Threads whose resumed session has not yet read the asks its provider kept (#187), each with
+/// the id of the hold that owns it.
+#[derive(Clone, Default)]
+struct AskRecoveryHolds {
+    threads: Arc<StdMutex<(u64, HashMap<String, u64>)>>,
+}
+
+/// Holds a thread's automatic queue promotion while its resumed session reads the asks its
+/// provider kept: one it never recorded must be shown before a queued follow-up goes. The
+/// read finishing, completed or failed, releases it; dropping it (the session ended) does too.
+pub(crate) struct AskRecoveryHold {
+    engine: OrchestrationEngine,
+    thread_id: String,
+    id: u64,
+}
+
+impl Drop for AskRecoveryHold {
+    fn drop(&mut self) {
+        let released = {
+            let mut holds = self
+                .engine
+                .ask_recovery_holds
+                .threads
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if holds.1.get(&self.thread_id) == Some(&self.id) {
+                holds.1.remove(&self.thread_id);
+                true
+            } else {
+                false
+            }
+        };
+        if released {
+            self.engine.wake_turn_delivery();
+        }
+    }
 }
 
 impl OrchestrationEngine {
@@ -1998,6 +2037,7 @@ impl OrchestrationEngine {
             workspace_ownership: WorkspaceOwnershipFence::default(),
             thread_turns: ThreadTurnFence::default(),
             compaction_waiters: CompactionWaiters::default(),
+            ask_recovery_holds: AskRecoveryHolds::default(),
             #[cfg(test)]
             test_hooks: options.test_hooks,
         })
@@ -2649,6 +2689,50 @@ impl OrchestrationEngine {
         self.thread_turns.is_reserved(thread_id)
     }
 
+    /// Holds the thread's automatic queue promotion until its resumed session has read the asks
+    /// its provider kept. See `AskRecoveryHold`.
+    pub(crate) fn hold_promotion_for_ask_recovery(&self, thread_id: &str) -> AskRecoveryHold {
+        let mut holds = self
+            .ask_recovery_holds
+            .threads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        holds.0 = holds.0.wrapping_add(1);
+        let id = holds.0;
+        holds.1.insert(thread_id.to_owned(), id);
+        AskRecoveryHold {
+            engine: self.clone(),
+            thread_id: thread_id.to_owned(),
+            id,
+        }
+    }
+
+    /// The thread's session finished reading the asks its provider kept: queued messages may be
+    /// promoted again.
+    pub(crate) fn release_promotion_after_ask_recovery(&self, thread_id: &str) {
+        let released = self
+            .ask_recovery_holds
+            .threads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .1
+            .remove(thread_id)
+            .is_some();
+        if released {
+            self.wake_turn_delivery();
+        }
+    }
+
+    /// Whether the thread's automatic queue promotion waits on an ask recovery.
+    pub(crate) fn promotion_held_for_ask_recovery(&self, thread_id: &str) -> bool {
+        self.ask_recovery_holds
+            .threads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .1
+            .contains_key(thread_id)
+    }
+
     /// Where the event pump reports a compaction's tagged turn to the compaction effect.
     pub fn compaction_waiters(&self) -> &CompactionWaiters {
         &self.compaction_waiters
@@ -2778,83 +2862,103 @@ impl OrchestrationEngine {
     }
 
     /// At startup, once abandoned sessions are reconciled, expires every request still open on a
-    /// thread whose session is not live: no provider holds it now. Builds before #187 left such
-    /// requests open forever, and a provider that still holds one (OpenCode on resume) shows it
-    /// again, which reopens it. Each expiry is an ordinary activity, keyed by its request, so a
-    /// repeated startup appends nothing twice. Returns how many it expired.
+    /// thread whose session is not live and whose provider ends its asks with its session: no
+    /// provider holds it now. Builds before #187 left such requests open forever. A provider
+    /// whose server outlives BiBCode (OpenCode) is skipped: its resume decides. Each expiry is an
+    /// ordinary activity, keyed by its request, so a repeated startup appends nothing twice.
+    /// Returns how many it expired.
     pub async fn expire_requests_of_settled_sessions(&self) -> Result<usize, OrchestrationError> {
-        let open = crate::persistence::open_user_input_requests_sql("?1");
+        let kept = EXTERNALLY_RESUMABLE_PROVIDERS
+            .iter()
+            .map(|provider| format!("'{provider}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
         let requests = self
             .repositories()
             .database()
             .call(move |connection| {
                 // Only threads with something open are visited: the counts say which.
                 let threads = connection
-                    .prepare(
+                    .prepare(&format!(
                         "SELECT thread.thread_id FROM projection_threads AS thread
                            LEFT JOIN projection_thread_sessions AS session
                              ON session.thread_id = thread.thread_id
                           WHERE thread.deleted_at IS NULL
                             AND (thread.pending_approval_count > 0 OR thread.pending_user_input_count > 0)
-                            AND COALESCE(session.status, 'idle') NOT IN ('running', 'starting')",
-                    )?
+                            AND COALESCE(session.status, 'idle') NOT IN ('running', 'starting')
+                            AND COALESCE(session.provider_name, '') NOT IN ({kept})"
+                    ))?
                     .query_map([], |row| row.get::<_, String>(0))?
                     .collect::<Result<Vec<_>, _>>()?;
                 let mut requests = Vec::new();
                 for thread_id in threads {
-                    let rows = connection
-                        .prepare(&format!(
-                            "SELECT 'approval.expired', request_id, turn_id FROM projection_pending_approvals
-                              WHERE thread_id = ?1 AND status = 'pending'
-                             UNION ALL
-                             SELECT 'user-input.expired', open.request_id, NULL FROM ({open}) AS open"
-                        ))?
-                        .query_map([&thread_id], |row| {
-                            Ok((
-                                thread_id.clone(),
-                                row.get::<_, String>(0)?,
-                                row.get::<_, String>(1)?,
-                                row.get::<_, Option<String>>(2)?,
-                            ))
-                        })?
-                        .collect::<Result<Vec<_>, _>>()?;
-                    requests.extend(rows);
+                    for (kind, request_id, turn_id) in open_requests_of_thread(connection, &thread_id)? {
+                        requests.push((thread_id.clone(), kind, request_id, turn_id));
+                    }
                 }
                 Ok(requests)
             })
             .await
             .map_err(|error| OrchestrationError::Persistence(Arc::new(error)))?;
-        let created_at = time::OffsetDateTime::now_utc()
-            .format(&time::format_description::well_known::Rfc3339)
-            .unwrap_or_default();
+        let created_at = now_rfc3339();
         for (thread_id, kind, request_id, turn_id) in &requests {
-            let summary = if kind == "approval.expired" {
-                "Approval expired"
-            } else {
-                "Question expired"
-            };
-            self.dispatch_plain(OrchestrationCommand::ThreadActivityAppend {
-                command_id: format!("server:startup-expiry:{kind}:{request_id}"),
-                thread_id: thread_id.clone(),
-                activity: ActivityInput {
-                    id: format!("{kind}:{request_id}:startup"),
-                    tone: "approval".to_owned(),
-                    kind: kind.clone(),
-                    summary: summary.to_owned(),
-                    payload: json!({
-                        "requestId": request_id,
-                        "reason": "session-ended",
-                        "sessionStatus": "settled",
-                    }),
-                    turn_id: turn_id.clone(),
-                    sequence: None,
-                    created_at: created_at.clone(),
-                },
-                created_at: created_at.clone(),
-            })
+            self.dispatch_plain(request_expiry_command(
+                format!("server:startup-expiry:{kind}:{request_id}"),
+                thread_id,
+                kind,
+                turn_id.clone(),
+                json!({
+                    "requestId": request_id,
+                    "reason": "session-ended",
+                    "sessionStatus": "settled",
+                }),
+                &created_at,
+                format!("{kind}:{request_id}:startup"),
+            ))
             .await?;
         }
         Ok(requests.len())
+    }
+
+    /// Expires each request open on `thread_id` that a provider's completed read of its pending
+    /// lists (`listed`) no longer holds: nobody can answer it (#187). A read that failed or was
+    /// cut short proves nothing, so its caller passes none. `listing_id` keys the expiries of one
+    /// read. Returns how many it expired.
+    pub async fn expire_requests_unlisted_by_provider(
+        &self,
+        thread_id: &str,
+        listed: &std::collections::HashSet<String>,
+        listing_id: &str,
+    ) -> Result<usize, OrchestrationError> {
+        let thread = thread_id.to_owned();
+        let open = self
+            .repositories()
+            .database()
+            .call(move |connection| Ok(open_requests_of_thread(connection, &thread)?))
+            .await
+            .map_err(|error| OrchestrationError::Persistence(Arc::new(error)))?;
+        let created_at = now_rfc3339();
+        let mut expired = 0;
+        for (kind, request_id, turn_id) in open {
+            if listed.contains(&request_id) {
+                continue;
+            }
+            self.dispatch_plain(request_expiry_command(
+                format!("provider:unlisted-expiry:{listing_id}:{kind}:{request_id}"),
+                thread_id,
+                kind,
+                turn_id,
+                json!({
+                    "requestId": request_id,
+                    "reason": "provider-unlisted",
+                }),
+                &created_at,
+                format!("{kind}:{request_id}:{listing_id}"),
+            ))
+            .await?;
+            expired += 1;
+        }
+        Ok(expired)
     }
 
     pub fn subscribe_events(&self) -> broadcast::Receiver<OrchestrationEvent> {
@@ -2995,7 +3099,7 @@ fn spawn_worker(
                                 OrchestrationCommand::ThreadTurnPromote { .. } | OrchestrationCommand::ThreadTurnSteer { .. } | OrchestrationCommand::ThreadTurnDeliveryResolve { .. } => true,
                                 // A reopened chat panel's queue becomes promotable again.
                                 OrchestrationCommand::ThreadUnarchive { .. } => true,
-                                OrchestrationCommand::ThreadActivityAppend { activity, .. } => matches!(activity.kind.as_str(), "approval.resolved" | "user-input.resolved" | "provider.approval.respond.failed" | "provider.user-input.respond.failed"),
+                                OrchestrationCommand::ThreadActivityAppend { activity, .. } => matches!(activity.kind.as_str(), "approval.resolved" | "user-input.resolved" | "approval.expired" | "user-input.expired" | "provider.approval.respond.failed" | "provider.user-input.respond.failed"),
                                 _ => false,
                             };
                             let mut result = process_envelope(
@@ -5390,10 +5494,9 @@ async fn persist_command(
         }
         _ => None,
     };
-    // A turn the user stopped, or one that failed, was interrupted or lost its session, ends
-    // with every request the provider was waiting on: they expire in the same commit (#187).
-    // A turn the provider completed (`ready`) does not: the provider settles its own requests,
-    // and one it leaves open keeps holding the queue until it is answered, as before.
+    // A request expires only on evidence that it can no longer be answered (#187): the user
+    // stopping the turn or the session, or an in-process provider's session ending. A turn the
+    // provider completed (`ready`) keeps its requests, which hold the queue until answered.
     let expiry = match command {
         OrchestrationCommand::ThreadTurnInterrupt {
             thread_id,
@@ -5401,7 +5504,16 @@ async fn persist_command(
             ..
         } => Some((
             thread_id.clone(),
-            "interrupted".to_owned(),
+            RequestExpiryCause::UserStopped("interrupted"),
+            created_at.clone(),
+        )),
+        OrchestrationCommand::ThreadSessionStop {
+            thread_id,
+            created_at,
+            ..
+        } => Some((
+            thread_id.clone(),
+            RequestExpiryCause::UserStopped("stopped"),
             created_at.clone(),
         )),
         OrchestrationCommand::ThreadSessionSet {
@@ -5416,7 +5528,7 @@ async fn persist_command(
         {
             Some((
                 thread_id.clone(),
-                session.status.clone(),
+                RequestExpiryCause::SessionEnded(session.status.clone()),
                 created_at.clone(),
             ))
         }
@@ -5478,11 +5590,11 @@ async fn persist_command(
                             "delivery":delivery_value(&state, &provider, &provider_instance_id, &mode, true, detail.as_deref())})));
                 }
             }
-            if let Some((thread_id, status, created_at)) = &expiry {
+            if let Some((thread_id, cause, created_at)) = &expiry {
                 event_list.extend(expire_open_requests_tx(
                     &transaction,
                     thread_id,
-                    status,
+                    cause,
                     created_at,
                     &command_id,
                 )?);
@@ -6903,43 +7015,47 @@ fn is_stale_approval_failure(detail: &str) -> bool {
     .any(|phrase| detail.contains(phrase))
 }
 
-/// Activities expiring every request still open on `thread_id`, for a session update to
-/// `status` that ends its turn. A provider cannot finish, interrupt or lose a turn while it waits
-/// on an answer BiBCode must deliver, so once the session leaves `running` nobody holds these
-/// requests: without this they read Pending Approval or Awaiting Input forever (#187). A provider
-/// that lists one again (OpenCode recovery) reopens it.
-fn expire_open_requests_tx(
-    transaction: &Transaction<'_>,
+/// Why the requests still open on a thread expire in a commit (#187).
+enum RequestExpiryCause {
+    /// The user stopped the turn or the session: for every provider.
+    UserStopped(&'static str),
+    /// The session left `running` or `starting` with this status: for an in-process provider
+    /// only, whose asks end with its session.
+    SessionEnded(String),
+}
+
+/// Providers whose server outlives a BiBCode session and keeps its asks across a restart of
+/// either side (OpenCode). Their session ending proves nothing: only a completed read of their
+/// pending lists (`expire_requests_unlisted_by_provider`) or the user stopping them does (#187).
+pub(crate) const EXTERNALLY_RESUMABLE_PROVIDERS: [&str; 1] = ["opencode"];
+
+fn provider_keeps_requests(provider: Option<&str>) -> bool {
+    provider.is_some_and(|provider| EXTERNALLY_RESUMABLE_PROVIDERS.contains(&provider))
+}
+
+/// The requests open on `thread_id`, oldest approval first: (activity kind of their expiry,
+/// request id, turn id).
+/// A request open on a thread: the activity kind of its expiry, its id and its turn's id.
+type OpenRequest = (&'static str, String, Option<String>);
+
+fn open_requests_of_thread(
+    connection: &rusqlite::Connection,
     thread_id: &str,
-    status: &str,
-    created_at: &str,
-    command_id: &str,
-) -> Result<Vec<NewOrchestrationEvent>, PersistenceError> {
-    // Only a session that was live ends a turn here: a repeated settlement, or one of a session
-    // that was already settled (a relaunch, say), leaves its requests as they are.
-    let previous_status = transaction
-        .query_row(
-            "SELECT status FROM projection_thread_sessions WHERE thread_id = ?",
-            [thread_id],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?;
-    if !matches!(previous_status.as_deref(), Some("running" | "starting")) {
-        return Ok(Vec::new());
-    }
-    // A provider adapter's own record of an expired request (the Claude adapter's pending
-    // approvals, say) needs no notice: the turn that held it is over, so the provider no longer
-    // waits on it, and an answer to it is refused as stale. The entry ends with its process.
-    let approvals = transaction
+) -> Result<Vec<OpenRequest>, rusqlite::Error> {
+    let approvals = connection
         .prepare(
             "SELECT request_id, turn_id FROM projection_pending_approvals WHERE thread_id = ? AND status = 'pending' ORDER BY created_at ASC, request_id ASC",
         )?
         .query_map([thread_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            Ok((
+                "approval.expired",
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+            ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
     let open = crate::persistence::open_user_input_requests_sql("?1");
-    let questions = transaction
+    let questions = connection
         .prepare(&format!(
             "SELECT open.request_id, (SELECT asked.turn_id FROM projection_thread_activities AS asked
                WHERE asked.thread_id = ?1 AND asked.kind = 'user-input.requested'
@@ -6948,48 +7064,121 @@ fn expire_open_requests_tx(
              FROM ({open}) AS open ORDER BY open.request_id ASC"
         ))?
         .query_map([thread_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            Ok((
+                "user-input.expired",
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+            ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
-    let expiry = |kind: &str, summary: &str, request_id: String, turn_id: Option<String>| {
-        make_event(
-            "thread.activity-appended",
-            "thread",
-            thread_id,
-            created_at,
-            command_id,
-            json!({ "requestId": request_id }),
-            json!({
-                "threadId": thread_id,
-                "activity": {
-                    "id": format!("{kind}:{request_id}:{command_id}"),
-                    "tone": "approval",
-                    "kind": kind,
-                    "summary": summary,
-                    "payload": {
-                        "requestId": request_id,
-                        "reason": "session-ended",
-                        "sessionStatus": status,
-                    },
-                    "turnId": turn_id,
-                    "createdAt": created_at,
-                },
-            }),
+    Ok(approvals.into_iter().chain(questions).collect())
+}
+
+fn request_expiry_command(
+    command_id: String,
+    thread_id: &str,
+    kind: &str,
+    turn_id: Option<String>,
+    payload: Value,
+    created_at: &str,
+    activity_id: String,
+) -> OrchestrationCommand {
+    OrchestrationCommand::ThreadActivityAppend {
+        command_id,
+        thread_id: thread_id.to_owned(),
+        activity: ActivityInput {
+            id: activity_id,
+            tone: "approval".to_owned(),
+            kind: kind.to_owned(),
+            summary: request_expiry_summary(kind).to_owned(),
+            payload,
+            turn_id,
+            sequence: None,
+            created_at: created_at.to_owned(),
+        },
+        created_at: created_at.to_owned(),
+    }
+}
+
+fn now_rfc3339() -> String {
+    time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_default()
+}
+
+fn request_expiry_summary(kind: &str) -> &'static str {
+    if kind == "approval.expired" {
+        "Approval expired"
+    } else {
+        "Question expired"
+    }
+}
+
+/// Activities expiring every request still open on `thread_id` when `cause` proves nobody can
+/// answer them (#187); without this they read Pending Approval or Awaiting Input forever. A
+/// provider that asks one again reopens it.
+fn expire_open_requests_tx(
+    transaction: &Transaction<'_>,
+    thread_id: &str,
+    cause: &RequestExpiryCause,
+    created_at: &str,
+    command_id: &str,
+) -> Result<Vec<NewOrchestrationEvent>, PersistenceError> {
+    let session = transaction
+        .query_row(
+            "SELECT status, provider_name FROM projection_thread_sessions WHERE thread_id = ?",
+            [thread_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
         )
+        .optional()?;
+    let (reason, status) = match cause {
+        RequestExpiryCause::UserStopped(status) => ("stopped", *status),
+        RequestExpiryCause::SessionEnded(status) => {
+            // Only a live session ends a turn: a repeated settlement, or one of a session that
+            // was already settled (a relaunch, say), leaves its requests as they are. A provider
+            // that keeps its asks past its session still holds them.
+            let Some((previous, provider)) = session.as_ref() else {
+                return Ok(Vec::new());
+            };
+            if !matches!(previous.as_str(), "running" | "starting")
+                || provider_keeps_requests(provider.as_deref())
+            {
+                return Ok(Vec::new());
+            }
+            ("session-ended", status.as_str())
+        }
     };
-    Ok(approvals
+    // A provider adapter's own record of an expired request (the Claude adapter's pending
+    // approvals, say) needs no notice: the turn that held it is over, so the provider no longer
+    // waits on it, and an answer to it is refused as stale. The entry ends with its process.
+    Ok(open_requests_of_thread(transaction, thread_id)?
         .into_iter()
-        .map(|(request_id, turn_id)| {
-            expiry("approval.expired", "Approval expired", request_id, turn_id)
-        })
-        .chain(questions.into_iter().map(|(request_id, turn_id)| {
-            expiry(
-                "user-input.expired",
-                "Question expired",
-                request_id,
-                turn_id,
+        .map(|(kind, request_id, turn_id)| {
+            make_event(
+                "thread.activity-appended",
+                "thread",
+                thread_id,
+                created_at,
+                command_id,
+                json!({ "requestId": request_id }),
+                json!({
+                    "threadId": thread_id,
+                    "activity": {
+                        "id": format!("{kind}:{request_id}:{command_id}"),
+                        "tone": "approval",
+                        "kind": kind,
+                        "summary": request_expiry_summary(kind),
+                        "payload": {
+                            "requestId": request_id,
+                            "reason": reason,
+                            "sessionStatus": status,
+                        },
+                        "turnId": turn_id,
+                        "createdAt": created_at,
+                    },
+                }),
             )
-        }))
+        })
         .collect())
 }
 

@@ -5152,6 +5152,17 @@ async fn codex_fixture_supervisor_with_reattach_timeout(
     remote: Arc<CodexFixtureRemoteFactory>,
     reattach_timeout: Option<std::time::Duration>,
 ) -> (ProviderTerminalActivitySupervisor, ActivityProjection) {
+    codex_fixture_supervisor_on(
+        migrated_database().await,
+        root,
+        configured,
+        helper,
+        remote,
+        reattach_timeout,
+    )
+}
+
+async fn migrated_database() -> Database {
     let database = Database::open_in_memory().await.expect("database");
     database
         .call(|connection| {
@@ -5160,6 +5171,42 @@ async fn codex_fixture_supervisor_with_reattach_timeout(
         })
         .await
         .expect("migrations");
+    database
+}
+
+/// Makes every new activity scope fail to write, as a transient database error would, until
+/// `allow_activity_scopes` (#187).
+async fn refuse_activity_scopes(database: &Database) {
+    database
+        .call(|connection| {
+            connection.execute_batch(
+                "CREATE TRIGGER refuse_activity_scopes BEFORE INSERT ON activity_scopes
+                 BEGIN SELECT RAISE(ABORT, 'injected activity scope failure'); END;",
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("refuse activity scopes");
+}
+
+async fn allow_activity_scopes(database: &Database) {
+    database
+        .call(|connection| {
+            connection.execute_batch("DROP TRIGGER refuse_activity_scopes;")?;
+            Ok(())
+        })
+        .await
+        .expect("allow activity scopes");
+}
+
+fn codex_fixture_supervisor_on(
+    database: Database,
+    root: &tempfile::TempDir,
+    configured: &std::path::Path,
+    helper: Arc<CodexFixtureHelperLauncher>,
+    remote: Arc<CodexFixtureRemoteFactory>,
+    reattach_timeout: Option<std::time::Duration>,
+) -> (ProviderTerminalActivitySupervisor, ActivityProjection) {
     let projection = ActivityProjection::new(ActivityRepository::new(database));
     let mut settings = ProviderSettingsState::default();
     settings.providers.codex.binary_path = configured.to_string_lossy().into_owned();
@@ -5595,6 +5642,104 @@ async fn agent_activity_toggle_codex_status_only_launch_publishes_activity_once_
         .close("thread-codex", Some("terminal-status-only"))
         .await
         .expect("close status-only Codex terminal");
+    manager.shutdown().await;
+    isolated.complete();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agent_activity_toggle_codex_enable_retries_a_scope_it_could_not_write() {
+    // Mutation caught: enabling activity on a status-only Codex observer reading live before its
+    // scope is written, so a transient write failure leaves live observation with no scope
+    // until another toggle or restart (#187).
+    own_process!(isolated);
+    let fixture = codex_remote_fixture();
+    let root = tempfile::tempdir().expect("fixture root");
+    let configured = root.path().join("configured-codex");
+    std::fs::write(&configured, b"configured").expect("configured executable");
+    let remote_state = Arc::new(CodexFixtureRemoteState::default());
+    remote_state
+        .events
+        .lock()
+        .expect("Codex events")
+        .push_back(codex_root_notification(
+            &fixture,
+            "terminal-scope-retry-root",
+            root.path(),
+        ));
+    let database = migrated_database().await;
+    let (supervisor, projection) = codex_fixture_supervisor_on(
+        database.clone(),
+        &root,
+        &configured,
+        Arc::new(CodexFixtureHelperLauncher::default()),
+        Arc::new(CodexFixtureRemoteFactory {
+            state: remote_state.clone(),
+        }),
+        None,
+    );
+    let controller = projection.agent_activity_controller_for_integration_test();
+    controller.disable().await;
+    let manager = TerminalManager::new(
+        Arc::new(RecordingBackend::new(Arc::new(Mutex::new(Vec::new())))),
+        TerminalManagerOptions {
+            launch_preparer: Some(Arc::new(supervisor)),
+            ..TerminalManagerOptions::default()
+        },
+    );
+    manager
+        .open(codex_fixture_open_input(
+            &fixture,
+            &configured,
+            &root,
+            "terminal-scope-retry",
+        ))
+        .await
+        .expect("Codex terminal");
+    let scope = ActivityScopeRef::Terminal {
+        thread_id: "thread-codex".to_owned(),
+        terminal_id: "terminal-scope-retry".to_owned(),
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while !remote_state.events.lock().expect("Codex events").is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("dormant Codex root correlation");
+
+    refuse_activity_scopes(&database).await;
+    controller.enable();
+    let enabled = manager.set_agent_activity_enabled(true).await;
+    assert_eq!(
+        enabled.resumed, 0,
+        "an observer whose scope could not be written does not read live"
+    );
+    assert!(projection.snapshot(&scope).await.is_err());
+
+    // The write succeeds again: the retry publishes the scope, then its activity.
+    allow_activity_scopes(&database).await;
+    wait_for_codex_initial_live(&projection, &scope).await;
+    remote_state
+        .events
+        .lock()
+        .expect("Codex events")
+        .push_back(codex_detail_notification(
+            "terminal-scope-retry-root",
+            "after-retry-item",
+            "after-retry-detail",
+        ));
+    wait_for_codex_root_detail(
+        &projection,
+        &scope,
+        "terminal-scope-retry-root",
+        "after-retry-detail",
+    )
+    .await;
+    manager
+        .close("thread-codex", Some("terminal-scope-retry"))
+        .await
+        .expect("close Codex terminal");
     manager.shutdown().await;
     isolated.complete();
 }
@@ -12914,6 +13059,7 @@ async fn opencode_publication_failure_keeps_attach_usable_until_terminal_closes(
 struct OpenCodeToggleFixture {
     _root: tempfile::TempDir,
     manager: TerminalManager,
+    database: Database,
     projection: ActivityProjection,
     remote_state: Arc<OpenCodeFixtureRemoteState>,
     helper: Arc<OpenCodeFixtureHelperLauncher>,
@@ -12930,8 +13076,28 @@ impl OpenCodeToggleFixture {
         stream_scripts: Vec<OpenCodeFixtureStreamScript>,
         reattach_timeout: std::time::Duration,
     ) -> Self {
-        Self::open_with_reattach_timeout_and_probe(stream_scripts, reattach_timeout, None, true)
-            .await
+        Self::open_with_reattach_timeout_and_probe(
+            stream_scripts,
+            reattach_timeout,
+            None,
+            true,
+            false,
+        )
+        .await
+    }
+
+    /// Opens the terminal with activity on while every activity scope write fails.
+    async fn open_refusing_activity_scopes(
+        stream_scripts: Vec<OpenCodeFixtureStreamScript>,
+    ) -> Self {
+        Self::open_with_reattach_timeout_and_probe(
+            stream_scripts,
+            std::time::Duration::from_secs(3),
+            None,
+            true,
+            true,
+        )
+        .await
     }
 
     /// Opens the terminal while AI Terminal activity is off: its observer reports status only.
@@ -12940,6 +13106,7 @@ impl OpenCodeToggleFixture {
             stream_scripts,
             std::time::Duration::from_secs(3),
             None,
+            false,
             false,
         )
         .await
@@ -12954,6 +13121,7 @@ impl OpenCodeToggleFixture {
             std::time::Duration::from_secs(3),
             Some(activity_transition.clone()),
             true,
+            false,
         )
         .await;
         (fixture, activity_transition)
@@ -12964,6 +13132,7 @@ impl OpenCodeToggleFixture {
         reattach_timeout: std::time::Duration,
         activity_transition: Option<Arc<OpenCodeActivityTransitionProbe>>,
         activity_enabled: bool,
+        refuse_scopes: bool,
     ) -> Self {
         let fixture = opencode_attach_fixture();
         let root = tempfile::tempdir().expect("OpenCode toggle root");
@@ -13024,7 +13193,10 @@ impl OpenCodeToggleFixture {
             .expect("migrations");
         let mut settings = ProviderSettingsState::default();
         settings.providers.opencode.binary_path = configured.to_string_lossy().into_owned();
-        let projection = ActivityProjection::new(ActivityRepository::new(database));
+        let projection = ActivityProjection::new(ActivityRepository::new(database.clone()));
+        if refuse_scopes {
+            refuse_activity_scopes(&database).await;
+        }
         if !activity_enabled {
             projection
                 .agent_activity_controller_for_integration_test()
@@ -13098,6 +13270,7 @@ impl OpenCodeToggleFixture {
         Self {
             _root: root,
             manager,
+            database,
             projection,
             remote_state,
             helper,
@@ -13270,6 +13443,79 @@ async fn agent_activity_toggle_opencode_status_only_launch_publishes_its_scope_o
         TerminalAgentStatusState::Blocked,
     )
     .await;
+    fixture.finish().await;
+    isolated.complete();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agent_activity_toggle_opencode_enable_retries_a_scope_it_could_not_write() {
+    // Mutation caught: an OpenCode observer reading live after a scope write failed on enable,
+    // so it reports live observation with no scope until another toggle (#187).
+    own_process!(isolated);
+    let fixture = OpenCodeToggleFixture::open_with_activity_off(vec![
+        OpenCodeFixtureStreamScript::new([Ok(opencode_fixture_connected_frame())]),
+        OpenCodeFixtureStreamScript::new([Ok(opencode_fixture_connected_frame())]),
+        OpenCodeFixtureStreamScript::new([Ok(opencode_fixture_connected_frame())]),
+        OpenCodeFixtureStreamScript::new([Ok(opencode_fixture_connected_frame())]),
+    ])
+    .await;
+    let scope = ActivityScopeRef::Terminal {
+        thread_id: "thread-opencode-toggle".to_owned(),
+        terminal_id: "terminal-opencode-toggle".to_owned(),
+    };
+    refuse_activity_scopes(&fixture.database).await;
+    fixture
+        .projection
+        .agent_activity_controller_for_integration_test()
+        .enable();
+    let enabled = fixture.manager.set_agent_activity_enabled(true).await;
+    assert_eq!(
+        enabled.resumed, 0,
+        "an observer whose scope could not be written does not read live"
+    );
+    assert!(fixture.projection.snapshot(&scope).await.is_err());
+
+    allow_activity_scopes(&fixture.database).await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while fixture.projection.snapshot(&scope).await.is_err() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the retry writes the OpenCode terminal scope");
+    fixture.finish().await;
+    isolated.complete();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agent_activity_opencode_launch_retries_a_scope_it_could_not_write() {
+    // Mutation caught: an OpenCode observer whose first scope write fails detaching for good,
+    // so the terminal never shows activity until it restarts (#187).
+    own_process!(isolated);
+    let fixture = OpenCodeToggleFixture::open_refusing_activity_scopes(vec![
+        OpenCodeFixtureStreamScript::new([Ok(opencode_fixture_connected_frame())]),
+        OpenCodeFixtureStreamScript::new([Ok(opencode_fixture_connected_frame())]),
+        OpenCodeFixtureStreamScript::new([Ok(opencode_fixture_connected_frame())]),
+        OpenCodeFixtureStreamScript::new([Ok(opencode_fixture_connected_frame())]),
+    ])
+    .await;
+    let scope = ActivityScopeRef::Terminal {
+        thread_id: "thread-opencode-toggle".to_owned(),
+        terminal_id: "terminal-opencode-toggle".to_owned(),
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert!(fixture.projection.snapshot(&scope).await.is_err());
+
+    allow_activity_scopes(&fixture.database).await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while fixture.projection.snapshot(&scope).await.is_err() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the retry writes the OpenCode terminal scope");
     fixture.finish().await;
     isolated.complete();
 }

@@ -238,6 +238,13 @@ describe("AppSidebarLayout", () => {
       useUiStateStore.setState({ sidebarView: "environments" });
     });
     expect(rail()).not.toBeNull();
+
+    // The Inbox spans every environment, so it drops the rail too.
+    await act(async () => {
+      useUiStateStore.setState({ sidebarView: "inbox" });
+    });
+    expect(rail()).toBeNull();
+    expect(container.querySelector('[data-testid="thread-sidebar-mock"]')).not.toBeNull();
   });
 
   it("routes supported desktop menu actions independently", async () => {

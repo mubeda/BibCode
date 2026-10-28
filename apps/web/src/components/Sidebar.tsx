@@ -184,6 +184,7 @@ import {
   resolveGitManagerRepositoryUnavailable,
 } from "./gitManager/gitManagerRepositoryAvailability";
 import { AgentsNavRow } from "./sidebar/AgentsNavRow";
+import { AgentsUnreadTracker } from "./sidebar/AgentsUnreadTracker";
 import { EnvironmentCardHeader } from "./sidebar/EnvironmentCardHeader";
 import { EnvironmentContextCard } from "./sidebar/EnvironmentContextCard";
 import {
@@ -194,6 +195,7 @@ import {
 } from "./sidebar/repositoryView.logic";
 import { SidebarRepositoryGroup } from "./sidebar/SidebarRepositoryGroup";
 import { SidebarViewToggle } from "./sidebar/SidebarViewToggle";
+import { SidebarInboxView } from "./sidebar/inbox/SidebarInboxView";
 import { ServerUpdateBadge, serverUpdateStatusFromQuery } from "./settings/ServerUpdateBadge";
 import {
   ENVIRONMENT_RAIL_WIDTH_PX,
@@ -3964,6 +3966,53 @@ function LocalSecondaryStatus() {
   );
 }
 
+type SidebarAppNoticesProps = Pick<
+  SidebarProjectsContentProps,
+  | "showArm64IntelBuildWarning"
+  | "arm64IntelBuildWarningDescription"
+  | "desktopUpdateButtonAction"
+  | "desktopUpdateButtonDisabled"
+  | "handleDesktopUpdateButtonClick"
+>;
+
+/** App-level health notices every left-panel view shows: the Intel build warning and local backends. */
+const SidebarAppNotices = memo(function SidebarAppNotices({
+  showArm64IntelBuildWarning,
+  arm64IntelBuildWarningDescription,
+  desktopUpdateButtonAction,
+  desktopUpdateButtonDisabled,
+  handleDesktopUpdateButtonClick,
+}: SidebarAppNoticesProps) {
+  return (
+    <>
+      {showArm64IntelBuildWarning && arm64IntelBuildWarningDescription ? (
+        <SidebarGroup className="px-2 pt-2 pb-0">
+          <Alert variant="warning" className="rounded-2xl border-warning/40 bg-warning/8">
+            <TriangleAlertIcon />
+            <AlertTitle>Intel build on Apple Silicon</AlertTitle>
+            <AlertDescription>{arm64IntelBuildWarningDescription}</AlertDescription>
+            {desktopUpdateButtonAction !== "none" ? (
+              <AlertAction>
+                <Button
+                  size="xs"
+                  variant="outline"
+                  disabled={desktopUpdateButtonDisabled}
+                  onClick={handleDesktopUpdateButtonClick}
+                >
+                  {desktopUpdateButtonAction === "download"
+                    ? "Download ARM build"
+                    : "Install ARM build"}
+                </Button>
+              </AlertAction>
+            ) : null}
+          </Alert>
+        </SidebarGroup>
+      ) : null}
+      <LocalSecondaryStatus />
+    </>
+  );
+});
+
 type SortableProjectHandleProps = Pick<
   ReturnType<typeof useSortable>,
   "attributes" | "listeners" | "setActivatorNodeRef"
@@ -4199,9 +4248,9 @@ function SortableProjectItem({
 
 const SidebarChromeHeader = memo(function SidebarChromeHeader() {
   // The fixed sidebar toggle overlays the rail's top strip. With the rail
-  // hidden (Repositories view) reserve that strip here so the brand stays put.
+  // hidden (Repositories and Inbox views) reserve that strip here so the brand stays put.
   // Below `md` the header carries its own trigger, so nothing is reserved.
-  const railHidden = useUiStateStore((state) => state.sidebarView === "repositories");
+  const railHidden = useUiStateStore((state) => state.sidebarView !== "environments");
   return (
     <SidebarHeader
       className={cn(
@@ -4459,30 +4508,13 @@ const SidebarProjectsContent = memo(function SidebarProjectsContent(
         </SidebarMenu>
       </SidebarGroup>
       <AgentsNavRow />
-      {showArm64IntelBuildWarning && arm64IntelBuildWarningDescription ? (
-        <SidebarGroup className="px-2 pt-2 pb-0">
-          <Alert variant="warning" className="rounded-2xl border-warning/40 bg-warning/8">
-            <TriangleAlertIcon />
-            <AlertTitle>Intel build on Apple Silicon</AlertTitle>
-            <AlertDescription>{arm64IntelBuildWarningDescription}</AlertDescription>
-            {desktopUpdateButtonAction !== "none" ? (
-              <AlertAction>
-                <Button
-                  size="xs"
-                  variant="outline"
-                  disabled={desktopUpdateButtonDisabled}
-                  onClick={handleDesktopUpdateButtonClick}
-                >
-                  {desktopUpdateButtonAction === "download"
-                    ? "Download ARM build"
-                    : "Install ARM build"}
-                </Button>
-              </AlertAction>
-            ) : null}
-          </Alert>
-        </SidebarGroup>
-      ) : null}
-      <LocalSecondaryStatus />
+      <SidebarAppNotices
+        showArm64IntelBuildWarning={showArm64IntelBuildWarning}
+        arm64IntelBuildWarningDescription={arm64IntelBuildWarningDescription}
+        desktopUpdateButtonAction={desktopUpdateButtonAction}
+        desktopUpdateButtonDisabled={desktopUpdateButtonDisabled}
+        handleDesktopUpdateButtonClick={handleDesktopUpdateButtonClick}
+      />
       <SidebarGroup
         className="flex-1 bg-sidebar-well px-2 py-2"
         data-testid="sidebar-projects-group"
@@ -5544,72 +5576,92 @@ export default function Sidebar() {
         <SidebarThreadDetailPrewarmer key={scopedThreadKey(threadRef)} threadRef={threadRef} />
       ))}
       <SidebarChromeHeader />
+      <AgentsUnreadTracker
+        shells={allSidebarThreads}
+        projects={allProjects}
+        environments={environments}
+        availability={shellSummary.statuses}
+      />
 
       {isOnSettings ? (
         <SettingsSidebarNav pathname={pathname} />
       ) : (
         <>
           <SidebarViewToggle />
-          {repositoriesView ? null : <SidebarEnvironmentContextCard />}
-          <SidebarProjectsContent
-            showArm64IntelBuildWarning={showArm64IntelBuildWarning}
-            arm64IntelBuildWarningDescription={arm64IntelBuildWarningDescription}
-            desktopUpdateButtonAction={desktopUpdateButtonAction}
-            desktopUpdateButtonDisabled={desktopUpdateButtonDisabled}
-            handleDesktopUpdateButtonClick={handleDesktopUpdateButtonClick}
-            projectSortOrder={sidebarProjectSortOrder}
-            repositorySortOrder={sidebarRepositorySortOrder}
-            threadSortOrder={sidebarThreadSortOrder}
-            projectGroupingMode={sidebarProjectGroupingMode}
-            threadPreviewCount={sidebarThreadPreviewCount}
-            updateSettings={updateSettings}
-            openAddProject={openAddProjectCommandPalette}
-            addProjectLabel={addProjectLabel}
-            isManualProjectSorting={isManualProjectSorting}
-            projectDnDSensors={projectDnDSensors}
-            projectCollisionDetection={projectCollisionDetection}
-            handleProjectDragStart={handleProjectDragStart}
-            handleProjectDragEnd={handleProjectDragEnd}
-            handleProjectDragCancel={handleProjectDragCancel}
-            openCreateWorktreeDialog={openCreateWorktreeDialog}
-            archiveThread={archiveThread}
-            deleteThread={deleteThread}
-            sortedProjects={sortedProjects}
-            repositoriesView={repositoriesView}
-            repositoryGroups={repositoryGroups}
-            repositoryGroupExpandedById={repositoryGroupExpandedById}
-            environmentCardIdentities={environmentCardIdentities}
-            expandedThreadListsByProject={expandedThreadListsByProject}
-            activeRouteProjectKey={activeRouteProjectKey}
-            routeThreadKey={routeThreadKey}
-            moduleRouteProjectKey={moduleRouteProjectKey}
-            selectedProjectKey={selectedProjectKey}
-            selectProject={selectProject}
-            commandPaletteShortcutLabel={commandPaletteShortcutLabel}
-            threadJumpLabelByKey={visibleThreadJumpLabelByKey}
-            attachThreadListAutoAnimateRef={attachThreadListAutoAnimateRef}
-            expandThreadListForProject={expandThreadListForProject}
-            collapseThreadListForProject={collapseThreadListForProject}
-            dragInProgressRef={dragInProgressRef}
-            suppressProjectClickAfterDragRef={suppressProjectClickAfterDragRef}
-            suppressProjectClickForContextMenuRef={suppressProjectClickForContextMenuRef}
-            attachProjectListAutoAnimateRef={attachProjectListAutoAnimateRef}
-            projectAvailability={projectAvailability}
-            projectAvailabilityEnvironment={projectAvailabilityEnvironment}
-            showProjectAvailabilityRetry={showProjectAvailabilityRetry}
-            showProjectAvailabilityConnectionSettings={showProjectAvailabilityConnectionSettings}
-            showProjectAvailabilityOpenRemoteServers={showProjectAvailabilityOpenRemoteServers}
-            onRetryProjectEnvironment={handleRetryProjectEnvironment}
-            onOpenProjectSettings={handleOpenProjectSettings}
-            onViewProjectDiagnostics={handleViewProjectDiagnostics}
-            onAdoptProjectStorage={handleAdoptProjectStorage}
-            onRecoverProjectData={
-              projectAvailability.environmentId !== null &&
-              projectDataRecoveryEnvironmentIds.has(projectAvailability.environmentId)
-                ? handleRecoverProjectData
-                : undefined
-            }
-          />
+          {sidebarView === "environments" ? <SidebarEnvironmentContextCard /> : null}
+          {sidebarView === "inbox" ? (
+            <SidebarInboxView
+              notices={
+                <SidebarAppNotices
+                  showArm64IntelBuildWarning={showArm64IntelBuildWarning}
+                  arm64IntelBuildWarningDescription={arm64IntelBuildWarningDescription}
+                  desktopUpdateButtonAction={desktopUpdateButtonAction}
+                  desktopUpdateButtonDisabled={desktopUpdateButtonDisabled}
+                  handleDesktopUpdateButtonClick={handleDesktopUpdateButtonClick}
+                />
+              }
+            />
+          ) : (
+            <SidebarProjectsContent
+              showArm64IntelBuildWarning={showArm64IntelBuildWarning}
+              arm64IntelBuildWarningDescription={arm64IntelBuildWarningDescription}
+              desktopUpdateButtonAction={desktopUpdateButtonAction}
+              desktopUpdateButtonDisabled={desktopUpdateButtonDisabled}
+              handleDesktopUpdateButtonClick={handleDesktopUpdateButtonClick}
+              projectSortOrder={sidebarProjectSortOrder}
+              repositorySortOrder={sidebarRepositorySortOrder}
+              threadSortOrder={sidebarThreadSortOrder}
+              projectGroupingMode={sidebarProjectGroupingMode}
+              threadPreviewCount={sidebarThreadPreviewCount}
+              updateSettings={updateSettings}
+              openAddProject={openAddProjectCommandPalette}
+              addProjectLabel={addProjectLabel}
+              isManualProjectSorting={isManualProjectSorting}
+              projectDnDSensors={projectDnDSensors}
+              projectCollisionDetection={projectCollisionDetection}
+              handleProjectDragStart={handleProjectDragStart}
+              handleProjectDragEnd={handleProjectDragEnd}
+              handleProjectDragCancel={handleProjectDragCancel}
+              openCreateWorktreeDialog={openCreateWorktreeDialog}
+              archiveThread={archiveThread}
+              deleteThread={deleteThread}
+              sortedProjects={sortedProjects}
+              repositoriesView={repositoriesView}
+              repositoryGroups={repositoryGroups}
+              repositoryGroupExpandedById={repositoryGroupExpandedById}
+              environmentCardIdentities={environmentCardIdentities}
+              expandedThreadListsByProject={expandedThreadListsByProject}
+              activeRouteProjectKey={activeRouteProjectKey}
+              routeThreadKey={routeThreadKey}
+              moduleRouteProjectKey={moduleRouteProjectKey}
+              selectedProjectKey={selectedProjectKey}
+              selectProject={selectProject}
+              commandPaletteShortcutLabel={commandPaletteShortcutLabel}
+              threadJumpLabelByKey={visibleThreadJumpLabelByKey}
+              attachThreadListAutoAnimateRef={attachThreadListAutoAnimateRef}
+              expandThreadListForProject={expandThreadListForProject}
+              collapseThreadListForProject={collapseThreadListForProject}
+              dragInProgressRef={dragInProgressRef}
+              suppressProjectClickAfterDragRef={suppressProjectClickAfterDragRef}
+              suppressProjectClickForContextMenuRef={suppressProjectClickForContextMenuRef}
+              attachProjectListAutoAnimateRef={attachProjectListAutoAnimateRef}
+              projectAvailability={projectAvailability}
+              projectAvailabilityEnvironment={projectAvailabilityEnvironment}
+              showProjectAvailabilityRetry={showProjectAvailabilityRetry}
+              showProjectAvailabilityConnectionSettings={showProjectAvailabilityConnectionSettings}
+              showProjectAvailabilityOpenRemoteServers={showProjectAvailabilityOpenRemoteServers}
+              onRetryProjectEnvironment={handleRetryProjectEnvironment}
+              onOpenProjectSettings={handleOpenProjectSettings}
+              onViewProjectDiagnostics={handleViewProjectDiagnostics}
+              onAdoptProjectStorage={handleAdoptProjectStorage}
+              onRecoverProjectData={
+                projectAvailability.environmentId !== null &&
+                projectDataRecoveryEnvironmentIds.has(projectAvailability.environmentId)
+                  ? handleRecoverProjectData
+                  : undefined
+              }
+            />
+          )}
 
           <SidebarSeparator />
           <SidebarChromeFooter />
