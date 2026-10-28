@@ -82,7 +82,13 @@ function harness(
 const pending = (environment: string, includeCrashDumps = false) =>
   ({
     _tag: "Pending",
-    request: { requestId: "relay_1", environment, includeCrashDumps },
+    request: {
+      requestId: "relay_1",
+      environment,
+      includeCrashDumps,
+      code: "K7Q-4M",
+      outputDirectory: "/Users/me/logs",
+    },
   }) as const;
 
 const prompts = () => useDiagnosticLogsRelayPrompts.getState().prompts;
@@ -103,6 +109,9 @@ describe("DiagnosticLogsRelayController", () => {
         environmentId: "remote:omarchy",
         label: "Omarchy",
         includeCrashDumps: true,
+        requested: "omarchy",
+        code: "K7Q-4M",
+        outputDirectory: "/Users/me/logs",
       },
     ]);
     expect(h.claims).toEqual([]);
@@ -127,7 +136,7 @@ describe("DiagnosticLogsRelayController", () => {
     expect(h.downloads).toEqual([]);
   });
 
-  it("answers an unknown name with the reachable list, asking nothing", async () => {
+  it("answers an unknown name without listing what it can reach, asking nothing", async () => {
     const h = harness();
     h.controller.handle(pending("Mars"));
     await settle();
@@ -137,12 +146,35 @@ describe("DiagnosticLogsRelayController", () => {
         _tag: "Failed",
         reason: "unknown-environment",
         message: "BiBCode has no environment named Mars.",
-        environments: [
-          { environmentId: "primary", label: "This Mac", connected: true },
-          { environmentId: "remote:omarchy", label: "Omarchy", connected: true },
-        ],
       },
     ]);
+    expect(h.downloads).toEqual([]);
+  });
+
+  it("never downloads a request that closed while its claim was in flight", async () => {
+    let finishClaim: (claimed: boolean) => void = () => {};
+    const h = harness({
+      claim: () =>
+        new Promise<boolean>((resolve) => {
+          finishClaim = resolve;
+        }),
+    });
+    h.controller.handle(pending("Omarchy"));
+    const approved = h.controller.approve(prompts()[0]!);
+    await settle();
+    // The command exits while the claim is on its way.
+    h.controller.handle({ _tag: "Closed", requestId: "relay_1" });
+    finishClaim(true);
+    await approved;
+    expect(h.downloads).toEqual([]);
+    expect(h.sent).toEqual([]);
+  });
+
+  it("drops its prompt once another window claims the request", () => {
+    const h = harness();
+    h.controller.handle(pending("Omarchy"));
+    h.controller.handle({ _tag: "Claimed", requestId: "relay_1" });
+    expect(prompts()).toEqual([]);
     expect(h.downloads).toEqual([]);
   });
 
@@ -218,7 +250,7 @@ describe("DiagnosticLogsRelayController", () => {
     expect(prompts()).toEqual([]);
     h.controller.handle({
       _tag: "Pending",
-      request: { requestId: "relay_2", environment: "Omarchy", includeCrashDumps: false },
+      request: { ...pending("Omarchy").request, requestId: "relay_2" },
     });
     expect(prompts()).toEqual([]);
     expect(h.claims).toEqual([]);

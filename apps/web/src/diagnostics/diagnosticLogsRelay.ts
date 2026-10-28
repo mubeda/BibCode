@@ -14,12 +14,19 @@ import type {
 } from "@bibcode/contracts";
 import { create } from "zustand";
 
-/** A `bibcode diagnostics download` waiting for the user, naming the resolved environment. */
+/**
+ * A `bibcode diagnostics download` waiting for the user: the resolved environment, and what
+ * the command sent so the user can recognise it (the environment as typed, its printed code,
+ * and the directory it saves in).
+ */
 export interface DiagnosticLogsRelayPrompt {
   readonly requestId: string;
   readonly environmentId: EnvironmentId;
   readonly label: string;
   readonly includeCrashDumps: boolean;
+  readonly requested: string;
+  readonly code: string;
+  readonly outputDirectory: string;
 }
 
 /** The prompts on screen, oldest first; the relay allows one request at a time anyway. */
@@ -70,12 +77,17 @@ export class DiagnosticLogsRelayController {
 
   handle(event: DiagnosticLogsRelayEvent): void {
     if (this.#disposed) return;
+    if (event._tag === "Claimed") {
+      // A window took it; this one, if it was not that window, has nothing left to ask.
+      removePrompt(event.requestId);
+      return;
+    }
     if (event._tag === "Closed") {
       removePrompt(event.requestId);
       this.#running.get(event.requestId)?.abort();
       return;
     }
-    const { requestId, environment, includeCrashDumps } = event.request;
+    const { requestId, environment, includeCrashDumps, code, outputDirectory } = event.request;
     if (this.#handled.has(requestId)) return;
     this.#handled.add(requestId);
     if (this.#handled.size > HANDLED_LIMIT) {
@@ -83,12 +95,11 @@ export class DiagnosticLogsRelayController {
     }
     const resolution = resolveRelayEnvironment(environment, this.#dependencies.candidates());
     if (resolution.kind !== "found") {
-      // Nothing leaves but the list of names, so this needs no approval.
+      // Only the name the command sent comes back, so this needs no approval.
       void this.#answer(requestId, {
         _tag: "Failed",
         reason: resolution.kind,
         message: resolution.message,
-        environments: resolution.environments,
       });
       return;
     }
@@ -97,6 +108,9 @@ export class DiagnosticLogsRelayController {
       environmentId: resolution.environment.environmentId as EnvironmentId,
       label: resolution.environment.label.trim() || resolution.environment.environmentId,
       includeCrashDumps,
+      requested: environment,
+      code,
+      outputDirectory,
     };
     useDiagnosticLogsRelayPrompts.setState(({ prompts }) => ({ prompts: [...prompts, prompt] }));
   }
@@ -104,10 +118,15 @@ export class DiagnosticLogsRelayController {
   /** The user allowed it: claim it for this window, then relay the download. */
   async approve(prompt: DiagnosticLogsRelayPrompt): Promise<void> {
     removePrompt(prompt.requestId);
-    if (this.#disposed || !(await this.#claim(prompt.requestId))) return;
+    if (this.#disposed) return;
+    // Registered before the claim, so a request that closes while the claim is in flight
+    // (the command left, it expired) never starts a download.
     const abort = new AbortController();
     this.#running.set(prompt.requestId, abort);
     try {
+      if (!(await this.#claim(prompt.requestId)) || abort.signal.aborted || this.#disposed) {
+        return;
+      }
       let archive: DownloadedDiagnosticLogs;
       try {
         archive = await this.#dependencies.download(

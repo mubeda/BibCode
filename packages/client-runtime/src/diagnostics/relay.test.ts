@@ -94,13 +94,13 @@ describe("resolveRelayEnvironment", () => {
     });
   });
 
-  it("lists what it can reach when the name matches none or several", () => {
+  it("names only what was asked for when the name matches none or several", () => {
     const unknown = resolveRelayEnvironment("Mars", CANDIDATES);
-    expect(unknown).toMatchObject({
+    expect(unknown).toEqual({
       kind: "unknown-environment",
       message: "BiBCode has no environment named Mars.",
     });
-    expect(unknown.kind !== "found" && unknown.environments).toHaveLength(CANDIDATES.length);
+    expect(JSON.stringify(unknown)).not.toContain("Omarchy");
     expect(resolveRelayEnvironment("twin", CANDIDATES).kind).toBe("ambiguous-environment");
   });
 
@@ -149,8 +149,15 @@ describe("relay calls", () => {
       const announced: DiagnosticLogsRelayEvent[] = [
         {
           _tag: "Pending",
-          request: { requestId: "relay_1", environment: "Omarchy", includeCrashDumps: false },
+          request: {
+            requestId: "relay_1",
+            environment: "Omarchy",
+            includeCrashDumps: false,
+            code: "K7Q-4M",
+            outputDirectory: "/Users/me/logs",
+          },
         },
+        { _tag: "Claimed", requestId: "relay_1" },
         { _tag: "Closed", requestId: "relay_1" },
       ];
       const supervisor = yield* primary({
