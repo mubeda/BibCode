@@ -337,6 +337,38 @@ Placement changes from the table above:
   tests. `tests/provider_claude.rs` gained no case, because the fixture adapter
   there has no process to end.
 
+## Revision 4 (diff review)
+
+1. **Stale stream-end closure.** The closure is bounded with
+   `ActivityInterruption::reported_until`, set to the stream's end, so only
+   records last reported then or earlier close. It is held in
+   `SessionEntry::stream_end_closure` and awaited by
+   `cancel_and_reap_activity_tasks`, so it finishes before a relaunch replaces
+   the entry or the supervisor stops. That join makes a separate generation
+   check unnecessary: a newer generation of the scope can only start after the
+   entry that owns the closure is reaped.
+2. **One ownership rule.** `StartupProcessOwnership`
+   (`orchestration/process_ownership.rs`) is read before abandoned sessions
+   settle. The startup activity close and #187's startup request expiry both
+   use it. A row with no recorded owner follows the settings: a configured
+   OpenCode Server URL means the work may still run.
+3. **Time label.** "Interrupted after {ranFor}", with no dependence on the
+   current time.
+4. **Relaunch failure.** `restart_session` closes the old records when the
+   driver's shutdown fails, before the error propagates.
+5. **Unreadable rows.** These are skipped and counted in a content-free
+   warning, and the rest of the scope closes.
+6. **Tests.**
+   - `update_protection_closes_a_live_claude_subagent` drives `prepare()`.
+   - The Codex reopen test asserts the #187 fields on both sides of Stop.
+   - The OpenCode startup test keeps its event stream open.
+   - `a_bounded_closure_…` and `a_restart_settles_or_keeps_…` are new.
+7. **Copy.**
+   - Turn-end summary: "Claude stopped listing this subagent as running".
+   - Stop tooltip: "… can't stop this subagent on its own. Stop the turn to
+     end it."
+8. **Docs.** The provider matrix now lists `background_tasks_changed`.
+
 ## Remote server prompt (read-only, for the user to run with Claude on the server)
 
 ```

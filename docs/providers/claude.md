@@ -507,9 +507,10 @@ A Claude subagent ends in one of these ways:
   arrives before the link is held until the link arrives.
 - **Turn end**: at the parent turn's `result`, a subagent whose task Claude
   confirmed is closed as **Interrupted** when Claude's complete live set
-  (`background_tasks_changed`) no longer lists that task. An overflowed set, or
-  one with a task BiBCode cannot name, proves nothing. A `SubagentStop` that
-  arrives afterwards still completes it.
+  (`background_tasks_changed`) no longer lists that task. Its summary starts
+  "Claude stopped listing this subagent as running". An overflowed set, or one
+  with a task BiBCode cannot name, proves nothing. A `SubagentStop` that arrives
+  afterwards still completes it.
 - **Process end**: when the Claude process that ran it is gone, its record
   closes as **Interrupted**. Gone means stopped, removed, idle-suspended, shut
   down for an update, restarted for a setting change, crashed, or a server that
