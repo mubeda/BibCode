@@ -633,6 +633,64 @@ async fn a_connection_lost_after_confirmation_keeps_the_confirmed_credential() {
     stop(handle).await;
 }
 
+/// The command dies between writing its record and confirming it: the record stays readable
+/// under its name, and the dead process's lock on the name does not block `forget`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pairing_killed_before_confirmation_leaves_a_readable_record_and_a_free_name() {
+    let _permit = TEST_PERMIT.acquire().await.unwrap();
+    let remote = TempDir::new().unwrap();
+    let handle = start_server(remote.path()).await;
+    // Server messages: Noise B, then e2ee_authenticated; the confirmation is held.
+    let (proxy, mut held) =
+        fault_proxy(handle.local_addr(), vec![Fault::HoldAfterServerMessage(2)]).await;
+    let cli_root = TempDir::new().unwrap();
+    let mut child = cli(cli_root.path(), &["pair", "--name", "box"])
+        .stdin(Stdio::piped())
+        .spawn()
+        .expect("run pair");
+    let offer = offer(remote.path(), "diagnostics", &endpoint(proxy));
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(format!("{offer}\n").as_bytes())
+        .unwrap();
+    timeout(Duration::from_secs(30), held.recv())
+        .await
+        .expect("the pairing reply went out")
+        .expect("proxy event");
+    timeout(Duration::from_secs(10), async {
+        while !record_path(cli_root.path()).is_file() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the record is written before the confirmation");
+    child.kill().expect("the command dies");
+    let _ = child.wait();
+
+    assert!(
+        record(cli_root.path())["credential"].is_string(),
+        "readable by name"
+    );
+    let started = std::time::Instant::now();
+    let forgot = cli(cli_root.path(), &["forget", "box"]).output().unwrap();
+    assert_eq!(
+        forgot.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&forgot.stdout)
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "the dead holder's lock was free"
+    );
+    assert!(!record_path(cli_root.path()).exists());
+    // The unconfirmed credential dies with the channel.
+    wait_until_revoked(remote.path()).await;
+    stop(handle).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_interrupted_download_releases_its_archive_slot_and_leaves_no_file() {
     let _permit = TEST_PERMIT.acquire().await.unwrap();

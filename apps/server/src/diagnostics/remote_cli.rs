@@ -98,7 +98,27 @@ impl StoredRemote {
 
 struct RemoteStore {
     store: SecretStore,
+    root: std::path::PathBuf,
 }
+
+/// Exclusive use of one remote name: held by `pair` from its name check through writing,
+/// confirming and any rollback, and by `forget`. It is an advisory OS lock on
+/// `<name>.lock` in the store directory (`flock` on Unix, `LockFileEx` on Windows), which
+/// the system releases when the holder exits, crashed or not, so a dead holder never
+/// strands it. The lock file itself stays; it is not a record.
+struct RemoteLock {
+    file: std::fs::File,
+}
+
+impl Drop for RemoteLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+/// How long `pair` or `forget` waits for another command using the same name.
+const LOCK_WAIT: Duration = Duration::from_secs(90);
+const LOCK_RETRY: Duration = Duration::from_millis(50);
 
 fn store_failed(error: impl fmt::Display) -> Outcome {
     Outcome::failed(
@@ -109,10 +129,43 @@ fn store_failed(error: impl fmt::Display) -> Outcome {
 
 impl RemoteStore {
     async fn open(state_dir: &Path) -> Result<Self, Outcome> {
-        SecretStore::new(state_dir.join(REMOTES_DIRECTORY))
+        let root = state_dir.join(REMOTES_DIRECTORY);
+        SecretStore::new(&root)
             .await
-            .map(|store| Self { store })
+            .map(|store| Self { store, root })
             .map_err(store_failed)
+    }
+
+    /// Takes `name`'s lock, waiting up to `wait` for another command holding it.
+    async fn lock(&self, name: &str, wait: Duration) -> Result<RemoteLock, Outcome> {
+        let path = self.root.join(format!("{name}.lock"));
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .map_err(store_failed)?;
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(RemoteLock { file }),
+                Err(std::fs::TryLockError::WouldBlock)
+                    if tokio::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(LOCK_RETRY).await;
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    return Err(Outcome::failed(
+                        "busy",
+                        format!(
+                            "Another `bibcode diagnostics` command is pairing or forgetting \
+                             {name}. Try again when it has finished."
+                        ),
+                    ));
+                }
+                Err(std::fs::TryLockError::Error(error)) => return Err(store_failed(error)),
+            }
+        }
     }
 
     /// Names with a record file; a directory or anything else under a record's name is not
@@ -154,15 +207,26 @@ impl RemoteStore {
         }
     }
 
-    /// Removes `remote`'s record only if it is still the one this pairing attempt wrote.
-    async fn remove_own(&self, remote: &StoredRemote) -> bool {
-        self.store
-            .remove_if(&remote.name, |bytes| {
-                serde_json::from_slice::<StoredRemote>(bytes)
-                    .is_ok_and(|stored| stored.pairing_id == remote.pairing_id)
-            })
+    /// Removes `remote`'s record if it is still the one this pairing attempt wrote. The
+    /// caller holds the name's lock, so nothing replaces the record between the read and the
+    /// removal, and nothing is ever moved aside.
+    async fn remove_own(&self, _lock: &RemoteLock, remote: &StoredRemote) -> Result<bool, String> {
+        let stored = self
+            .store
+            .get(&remote.name)
             .await
-            .unwrap_or(false)
+            .map_err(|error| error.to_string())?;
+        let ours = stored.is_some_and(|bytes| {
+            serde_json::from_slice::<StoredRemote>(&bytes)
+                .is_ok_and(|stored| stored.pairing_id == remote.pairing_id)
+        });
+        if !ours {
+            return Ok(false);
+        }
+        self.store
+            .remove(&remote.name)
+            .await
+            .map_err(|error| error.to_string())
     }
 
     async fn remove(&self, name: &str) -> Result<bool, Outcome> {
@@ -331,6 +395,8 @@ pub(crate) async fn pair(
         return Err(invalid_name(&name));
     }
     let store = RemoteStore::open(state_dir).await?;
+    // Held until this attempt's record is confirmed or rolled back.
+    let lock = store.lock(&name, LOCK_WAIT).await?;
     if store.names().await?.contains(&name) {
         return Err(Outcome::failed(
             "exists",
@@ -487,19 +553,36 @@ pub(crate) async fn pair(
         // The server answered and refused: the credential never became active.
         Err(RpcCallError::Failed(_) | RpcCallError::Defect(_)) => {
             client.close().await;
-            store.remove_own(&remote).await;
-            Err(pairing_rejected(&remote_name))
+            Err(roll_back(&store, &lock, &remote).await)
         }
         // The answer was lost: the confirmation may have committed. One reconnect settles it.
         Err(RpcCallError::Client(_) | RpcCallError::Ended | RpcCallError::Rejected(_)) => {
             drop(client);
-            settle_unconfirmed(&store, remote, trust)
+            settle_unconfirmed(&store, &lock, remote, trust)
                 .await
                 .map(|paired| Paired {
                     note: paired.note.or(stored_note),
                     ..paired
                 })
         }
+    }
+}
+
+/// Removes the record this refused attempt wrote, and says what remains if that fails.
+async fn roll_back(store: &RemoteStore, lock: &RemoteLock, remote: &StoredRemote) -> Outcome {
+    match store.remove_own(lock, remote).await {
+        Ok(_) => pairing_rejected(&remote.remote_name),
+        Err(error) => Outcome::failed(
+            "rollback-failed",
+            format!(
+                "{} did not accept the pairing, and its unusable credential could not be \
+                 removed from this computer ({}). Remove it with `bibcode diagnostics forget {}`, \
+                 then create a new offer there.",
+                printable(&remote.remote_name),
+                printable(&error),
+                remote.name
+            ),
+        ),
     }
 }
 
@@ -517,6 +600,7 @@ fn pairing_rejected(remote_name: &str) -> Outcome {
 /// remote refuses was not, and its record is deleted; anything else keeps the record.
 async fn settle_unconfirmed(
     store: &RemoteStore,
+    lock: &RemoteLock,
     remote: StoredRemote,
     trust: &ServerTrust,
 ) -> Result<Paired, Outcome> {
@@ -525,10 +609,7 @@ async fn settle_unconfirmed(
             client.close().await;
             Ok(Paired { remote, note: None })
         }
-        Err(E2eeClientError::Unauthorized) => {
-            store.remove_own(&remote).await;
-            Err(pairing_rejected(&remote.remote_name))
-        }
+        Err(E2eeClientError::Unauthorized) => Err(roll_back(store, lock, &remote).await),
         Err(_) => Ok(Paired {
             note: Some(format!(
                 "The connection was lost while {} confirmed the pairing, so it may not have. \
@@ -845,7 +926,12 @@ pub(crate) async fn run_forget(state_dir: &Path, name: &str, json: bool) -> i32 
     if !is_valid_name(name) {
         return report(&invalid_name(name), json);
     }
-    let removed = async { RemoteStore::open(state_dir).await?.remove(name).await }.await;
+    let removed = async {
+        let store = RemoteStore::open(state_dir).await?;
+        let _lock = store.lock(name, LOCK_WAIT).await?;
+        store.remove(name).await
+    }
+    .await;
     match removed {
         Ok(true) => {
             let message = format!(
