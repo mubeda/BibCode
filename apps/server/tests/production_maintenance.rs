@@ -1189,7 +1189,19 @@ fn subagent_status(database_path: &std::path::Path, thread_id: &str) -> String {
 #[tokio::test]
 async fn open_subagent_records_are_repaired_at_start_and_never_hold_up_update_protection() {
     let root = tempfile::tempdir().expect("records data root");
-    disable_provider_processes(root.path());
+    // OpenCode points at a server the user runs, so its open subagent may still run.
+    let mut providers = hermetic_providers::BUILTIN_PROVIDER_DRIVERS
+        .iter()
+        .map(|driver| ((*driver).to_owned(), json!({"enabled": false})))
+        .collect::<serde_json::Map<String, Value>>();
+    providers.insert(
+        "opencode".to_owned(),
+        json!({"enabled": false, "serverUrl": "http://127.0.0.1:9"}),
+    );
+    hermetic_providers::write_hermetic_settings(
+        &ServerConfig::new(root.path()).state_dir(),
+        json!({"providers": providers}),
+    );
     let config = desktop_config(root.path(), "records-bootstrap");
     let first = ServerRuntime::start(config.clone())
         .await

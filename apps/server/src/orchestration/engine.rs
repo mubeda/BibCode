@@ -2863,33 +2863,39 @@ impl OrchestrationEngine {
 
     /// At startup, once abandoned sessions are reconciled, expires every request still open on a
     /// thread whose session is not live and whose provider ends its asks with its session: no
-    /// provider holds it now. Builds before #187 left such requests open forever. A provider
-    /// whose server outlives BiBCode (OpenCode) is skipped: its resume decides. Each expiry is an
-    /// ordinary activity, keyed by its request, so a repeated startup appends nothing twice.
-    /// Returns how many it expired.
-    pub async fn expire_requests_of_settled_sessions(&self) -> Result<usize, OrchestrationError> {
-        let kept = EXTERNALLY_RESUMABLE_PROVIDERS
-            .iter()
-            .map(|provider| format!("'{provider}'"))
-            .collect::<Vec<_>>()
-            .join(", ");
+    /// provider holds it now. Builds before #187 left such requests open forever. A thread whose
+    /// provider work may outlive BiBCode (an OpenCode server the user runs, by `ownership`, the
+    /// rule that also decides which subagents startup closes) is skipped: its resume decides.
+    /// Each expiry is an ordinary activity, keyed by its request, so a repeated startup appends
+    /// nothing twice. Returns how many it expired.
+    pub async fn expire_requests_of_settled_sessions(
+        &self,
+        ownership: &super::StartupProcessOwnership,
+    ) -> Result<usize, OrchestrationError> {
+        let ownership = ownership.clone();
         let requests = self
             .repositories()
             .database()
             .call(move |connection| {
                 // Only threads with something open are visited: the counts say which.
                 let threads = connection
-                    .prepare(&format!(
-                        "SELECT thread.thread_id FROM projection_threads AS thread
+                    .prepare(
+                        "SELECT thread.thread_id, COALESCE(session.provider_name, '')
+                           FROM projection_threads AS thread
                            LEFT JOIN projection_thread_sessions AS session
                              ON session.thread_id = thread.thread_id
                           WHERE thread.deleted_at IS NULL
                             AND (thread.pending_approval_count > 0 OR thread.pending_user_input_count > 0)
-                            AND COALESCE(session.status, 'idle') NOT IN ('running', 'starting')
-                            AND COALESCE(session.provider_name, '') NOT IN ({kept})"
-                    ))?
-                    .query_map([], |row| row.get::<_, String>(0))?
-                    .collect::<Result<Vec<_>, _>>()?;
+                            AND COALESCE(session.status, 'idle') NOT IN ('running', 'starting')",
+                    )?
+                    .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .filter(|(thread_id, provider)| {
+                        !ownership.work_may_outlive_bibcode(thread_id, provider)
+                    })
+                    .map(|(thread_id, _)| thread_id)
+                    .collect::<Vec<_>>();
                 let mut requests = Vec::new();
                 for thread_id in threads {
                     for (kind, request_id, turn_id) in open_requests_of_thread(connection, &thread_id)? {
