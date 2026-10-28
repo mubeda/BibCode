@@ -8,9 +8,10 @@ Part 1 is independent of the Part 2 decision and lands first.
 
 1. **AC1.** Opening Diagnostics from a thread, or from an error surface that links
    there, opens it with that environment selected, so **Download logs** targets it.
-2. **AC2.** `bibcode diagnostics download --environment <id|label>` saves a connected
-   remote environment's bundle through `server.downloadDiagnosticLogs`, with the same
-   scopes, redaction and size bounds; the profiler skill documents it.
+2. **AC2.** A CLI on a machine running the desktop app can fetch a connected remote's
+   bundle with one in-app approval (`bibcode diagnostics download --environment
+   <id|label>`), through `server.downloadDiagnosticLogs` with the same scopes, redaction
+   and size bounds; the profiler skill documents it. Unattended access is #202.
 
 ## Root cause
 
@@ -102,3 +103,26 @@ Option C (CLI as its own paired device), `profiler --remote`, a diagnostics-only
 scope, a "last thread" default, an Activity panel link. Residual for A: a
 `bibcode serve` user whose browser page holds only an ordinary session has no client
 that may serve the relay; the CLI then says so.
+
+## Approved changes and implementation notes
+
+Approved with Option A, plus these requirements, all implemented and tested:
+
+- A disconnected thread target stays chosen and disabled; only a removed environment
+  drops it (`diagnosticsEnvironment.tsx`). The command-palette action was dropped.
+- A claim binds to the desktop app's own session (subject `desktop-bootstrap`) and
+  connection, not to any `access:write` session; an administrative credential minted
+  for another device is refused (integration test).
+- The command validates the archive name, never overwrites, rechecks byte counts, and
+  checks the inner `manifest.json` against the relayed one.
+- Lifecycle: approval 2 min, start 10 min after a claim (the app downloads the whole
+  archive first), 60 s per item; the claimant's disconnect, the command leaving, and
+  stale items after the end are each tested.
+- `bibcode pairing issue` works while the server runs (`lib.rs` `run_pairing_command`,
+  `tests/cli_smoke.rs` pairing tests), so the endpoint file's token grants nothing the
+  data root does not already.
+
+Files outside the first list: `production/runtime.rs` (the relay is registered with the
+runtime's registry, which validates completeness), `rpc/methods.rs`, `http.rs` (route
+inventory), `config.rs`/`lib.rs` (the `diagnostics` subcommand),
+`auth/service.rs`/`auth/mod.rs` (the desktop subject), and `Sidebar.test.tsx`.

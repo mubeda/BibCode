@@ -3166,8 +3166,29 @@ sizes. Cover relevant:
   "The connection to <label> was lost. Reconnect and try again.", and no file is
   saved; while the remote environment reconnects, the button is disabled with
   "<label> is still connecting. Download its logs once it is connected.", and
-  the primary's logs are never downloaded in its place (once the app drops a
-  choice whose environment is gone, the row names the primary again);
+  the primary's logs are never downloaded in its place; with the remote
+  stopped, the remote stays chosen and the button is disabled with "<label> is
+  not connected. Reconnect it to download its logs." until it reconnects (only
+  removing the environment returns the row to the primary);
+- Diagnostics from a thread: in a remote environment's thread, make the
+  provider report an error (for example a provider with a missing binary), and
+  click the error banner's **Diagnostics**: the page opens with that remote
+  chosen in **Environment**, the Diagnostic logs row names it, and **Download
+  logs** saves its archive; repeat with the remote disconnected and confirm the
+  remote stays chosen with the download disabled. The sidebar's
+  project-availability **Diagnostics** opens on the unavailable environment;
+- `<desktop exe> diagnostics download --environment <remote label> --output
+  <dir> --json` from a terminal on the desktop's machine, with the desktop app
+  connected to the remote: the command prints "Waiting for approval in
+  BiBCode…" and the app shows "Share <label>'s diagnostic logs?". **Share logs**
+  saves `<dir>/bibcode-diagnostics-<label>-….zip` whose `manifest.json` names
+  the remote, its `storageInstanceId`, and its version, and the command exits 0
+  with `"status":"saved"`; a second run that finds a file of the same name
+  exits 1 and leaves it untouched. **Deny** (or
+  Esc) exits 2 with `"status":"denied"` and saves nothing; an unknown name exits
+  1 listing the reachable environments, with no prompt; Ctrl-C while the app
+  downloads closes the prompt or stops the download; with the app quit, the
+  command exits 3;
 - Find in thread on macOS (WKWebView), Linux (WebKitGTK AppImage), and Windows
   (WebView2), in a long thread with folded turns: find a word that appears only
   in a folded turn, a tool command inside a collapsed run of tool calls, a file

@@ -3752,6 +3752,44 @@ The handler waits only on local disk reads and compression; it is timed to its
 first item like every stream, which is log-only, so it is not in
 `is_long_running`.
 
+## Diagnostic logs relay
+
+`bibcode diagnostics download` reaches a connected environment through the
+desktop app, which holds the connection (#201). Three methods serve the app's
+side, all requiring `access:write` and, in the handler, the desktop app's own
+session (subject `desktop-bootstrap`); any other session is refused with
+`DiagnosticLogsRelayError` `not-desktop`. The server side is
+[`diagnostic_logs_relay.rs`](../../apps/server/src/production/diagnostic_logs_relay.rs),
+the app side
+[`client-runtime/src/diagnostics/relay.ts`](../../packages/client-runtime/src/diagnostics/relay.ts)
+and [`apps/web/src/diagnostics/`](../../apps/web/src/diagnostics/), and the
+command [`relay_cli.rs`](../../apps/server/src/diagnostics/relay_cli.rs).
+
+- **`server.subscribeDiagnosticLogsRelay`** (stream): the waiting request on
+  subscribing, then `Pending { requestId, environment, includeCrashDumps }` for
+  each new one and `Closed { requestId }` when one ends. A new `requestId` is
+  minted for every request.
+- **`server.claimDiagnosticLogsRelay { requestId }`** → `{ claimed }`: binds a
+  waiting request to the calling session and connection; `false` when it is
+  taken or over.
+- **`server.sendDiagnosticLogsRelayItem { requestId, item }`**: `Denied` or
+  `Failed { reason, message, environments? }` alone, or `Started`, `Data`
+  (base64, at most 64 KiB) and `Finished`, checked against the order, the
+  20 MiB archive bound, the archive-name shape and the declared length. It
+  answers once the command read the previous item, so the server holds at most
+  one. An item from another connection, or for a request that is over, is
+  `stale`; one for a request whose command left is `cancelled`; a broken order
+  or bound is `invalid` and ends the request.
+
+The command's side is `POST /api/diagnostics/relay`, accepted only from this
+machine with the per-boot token of the state directory's
+`diagnostics-relay.json`, answering one JSON line per step (`waiting`,
+`started`, `data`, `finished`, `denied`, `failed`, or `ended` with `busy`,
+`no-app`, `expired`, `connection-lost`, `stalled` or `invalid`). The relay
+methods wait on a person and on the command, so they are in
+`is_long_running`. Deadlines and outcomes are in
+[Observability](../operations/observability.md#from-the-command-line).
+
 ## Profiler timing and client reports
 
 The [Profiler](./overview.md#profiler) adds two unary methods, whose schemas are

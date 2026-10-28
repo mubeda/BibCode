@@ -1,6 +1,6 @@
 # Diagnostics from a thread, and remote bundles for the CLI (#201) — design
 
-Status: proposed, awaiting approval. Builds on #194 (`server.downloadDiagnosticLogs`).
+Status: approved (Option A); unattended access (Option C) is #202. Builds on #194 (`server.downloadDiagnosticLogs`).
 
 ## Problem
 

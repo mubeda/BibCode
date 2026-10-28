@@ -200,6 +200,65 @@ out between them. A bundle holds one server's logs: diagnosing a remote launch
 or transport problem can need both the remote environment's archive and the
 primary's, downloaded one after the other.
 
+Links that start from an environment open the page on it (#201): the thread
+error banner's **Diagnostics** names the thread's environment, the sidebar's
+project-availability **Diagnostics** names the environment whose projects are
+unavailable, and the status bar's **Profiler** segment names the first
+recording environment. The desktop update dialog's **Diagnostics** opens the
+primary. A chosen environment that is not connected stays chosen: the download
+is disabled with "<label> is not connected. Reconnect it to download its logs."
+until it reconnects, and the primary's logs are never offered in its place.
+Only an environment removed from the app drops the choice.
+
+### From the command line
+
+`bibcode diagnostics download --environment <id or name>` saves the same
+bundle on a machine whose BiBCode desktop app is connected to that
+environment, after one approval in the app (#201). Unattended access, without
+the app, is a separate follow-up (#202). The desktop executable runs it too
+(`<desktop exe> diagnostics download …`). Options: `--include-crash-dumps`,
+`--output <dir>` (the current directory by default), and `--json`, which prints
+one document with `status` (`saved`, `failed`, `denied`, or `unavailable`),
+`reason`, `message`, and on success `path`, `fileName`, `byteLength`, and
+`manifest`. Exit codes: 0 saved, 1 failed, 2 denied or unanswered, 3 BiBCode or
+its desktop window not running.
+
+No server holds a connection to another environment; the app does. So the
+command asks this host's own server, which hands the request to the app:
+
+1. While it runs, the server writes `diagnostics-relay.json` in its state
+   directory (owner-only on Unix), naming its loopback URL and a fresh per-boot
+   token, and removes it when it stops. The command posts to
+   `/api/diagnostics/relay` with that token; the route refuses any other
+   credential and any peer that is not this machine. Reading the file needs the
+   same access as the data root, which already lets `bibcode pairing issue`
+   mint an administrative credential while the server runs, so the token grants
+   nothing new.
+2. The server announces the request only to the desktop app's own session (the
+   one minted from the desktop bootstrap), never to another paired device,
+   however broad its scopes. With no such window subscribed, the command fails
+   at once. One request runs at a time.
+3. The app resolves the name (an id, or a label exactly one environment has)
+   and asks: "Share <label>'s diagnostic logs?", naming crash dumps when asked
+   for. Dismissing denies. An unknown or ambiguous name is answered with the
+   list of reachable environments, without a prompt.
+4. On **Share logs**, the window claims the request (it is then bound to that
+   session and connection) and runs `server.downloadDiagnosticLogs` on the
+   named environment with every check of the Settings download, then sends
+   the verified archive back in 64 KiB items, each answered only once the
+   command read the one before.
+5. The request ends unanswered after 2 minutes without approval, 10 minutes
+   after approval without the archive starting, 60 s without the next item, or
+   when the approving window's connection closes. When the command exits, the
+   app's download stops.
+
+The command saves nothing until the whole archive arrived and its own
+`manifest.json` names the environment, store and server version of the
+manifest the app checked. The name must have the archive's shape (no path
+separator, no leading dot, ending in `.zip`), the byte count must match, and
+an existing file is never replaced. Each outcome is logged by the local server
+with the request id and reason, never the token or archive bytes.
+
 Provider and terminal operational logs are not included. Each retained server
 or trace file is read up to 4 MiB and marked when truncated. The frontend
 request and retained frontend content are bounded to 512 KiB; when necessary,

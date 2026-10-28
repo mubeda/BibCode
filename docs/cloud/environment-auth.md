@@ -28,7 +28,11 @@ orchestration:read orchestration:operate terminal:operate review:write relay:rea
 ```
 
 Desktop and command-line administrative bootstraps additionally grant
-`access:read`, `access:write`, and `relay:write`. The current
+`access:read`, `access:write`, and `relay:write`. The diagnostics relay methods
+(`server.subscribeDiagnosticLogsRelay`, `server.claimDiagnosticLogsRelay`,
+`server.sendDiagnosticLogsRelayItem`) require `access:write` and, beyond it, the
+desktop app's own session (subject `desktop-bootstrap`): an administrative
+credential minted for another device is refused. The current
 `cloud.getRelayClientStatus` and `cloud.installRelayClient` RPC methods require
 `relay:write`; ordinary paired clients cannot invoke them. The exact RPC map is
 [`required_scope`](../../apps/server/src/auth/scope.rs), and the Connect HTTP
