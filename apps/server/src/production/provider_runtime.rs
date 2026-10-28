@@ -8239,9 +8239,10 @@ async fn launch_session(
     .await?;
     // A resumed OpenCode session shows the asks it kept only once its event stream connects,
     // and may still be executing: it stays `starting`, holding its queued messages, until it
-    // reports `session.recovery-settled` (#187).
-    let awaiting_recovery =
-        provider_recovers_pending_requests(&request.provider) && request.resume_cursor.is_some();
+    // reports `session.recovery-settled` (#187). A resume it refused started afresh.
+    let awaiting_recovery = provider_recovers_pending_requests(&request.provider)
+        && request.resume_cursor.is_some()
+        && !resume_lost;
     dispatch_session_state(
         engine,
         &request,
@@ -25588,11 +25589,16 @@ done
     async fn a_resumed_opencode_session_holds_starting_until_its_recovery_settles() {
         // Mutation caught: a resumed OpenCode launch reading `ready` before its stream has shown
         // the asks it kept, so a queued follow-up is sent past a recovered question (#187).
+        // The fixture driver always resumes `unit-session`.
+        let resumed = || Some(json!({"threadId":"unit-session"}));
         for (provider, resume, held) in [
-            ("opencode", true, true),
-            ("opencode", false, false),
-            ("codex", true, false),
+            ("opencode", resumed(), true),
+            ("opencode", None, false),
+            // OpenCode refused the resume and started afresh: no asks were kept.
+            ("opencode", Some(json!({"threadId":"lost-session"})), false),
+            ("codex", resumed(), false),
         ] {
+            let resumed = resume.is_some();
             let engine = supervisor_engine().await;
             let (events_tx, events_rx) = mpsc::channel(4);
             let supervisor = super::ProviderRuntimeSupervisor::start(
@@ -25609,7 +25615,7 @@ done
             let temp = TempDir::new().expect("launch directory");
             let mut launch = native_launch(&temp, provider);
             launch.thread_id = "t1".to_owned();
-            launch.resume_cursor = resume.then(|| json!({"sessionID":"recovered"}));
+            launch.resume_cursor = resume;
             supervisor.launch(launch).await.expect("launch runtime");
             let status = || async {
                 engine
@@ -25621,7 +25627,7 @@ done
                     .status
             };
             let expected = if held { "starting" } else { "ready" };
-            assert_eq!(status().await, expected, "{provider} resumed={resume}");
+            assert_eq!(status().await, expected, "{provider} resumed={resumed}");
             events_tx
                 .send(super::ProviderEvent {
                     native_event_id: None,
@@ -25642,7 +25648,7 @@ done
                 }
             })
             .await
-            .unwrap_or_else(|_| panic!("{provider} resumed={resume} settles ready"));
+            .unwrap_or_else(|_| panic!("{provider} resumed={resumed} settles ready"));
             engine.shutdown().await;
         }
     }
