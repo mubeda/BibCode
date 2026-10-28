@@ -3,11 +3,11 @@ use bibcode_server::{
     activity::{
         ActivityActorControlState, ActivityActorSummary, ActivityCapabilities, ActivityChange,
         ActivityDelta, ActivityEntry, ActivityEntryKind, ActivityEntryTone,
-        ActivityHistoryRecovery, ActivityLifecycle, ActivityObservationState, ActivityProjection,
-        ActivityProjections, ActivityRecordKind, ActivityRepository, ActivityRepositoryError,
-        ActivityRosterBucket, ActivityScopeRef, ActivityScopeSeed, ActivitySection,
-        ActivitySectionHealth, ActivityWorkItemSummary, AgentActivityController,
-        AgentActivitySource, ProviderActivityMutation,
+        ActivityHistoryRecovery, ActivityInterruption, ActivityLifecycle, ActivityObservationState,
+        ActivityProjection, ActivityProjectionEvent, ActivityProjections, ActivityRecordKind,
+        ActivityRepository, ActivityRepositoryError, ActivityRosterBucket, ActivityScopeRef,
+        ActivityScopeSeed, ActivitySection, ActivitySectionHealth, ActivityWorkItemSummary,
+        AgentActivityController, AgentActivitySource, ProviderActivityMutation,
     },
     persistence::{Database, run_migrations},
 };
@@ -3525,4 +3525,382 @@ fn entry(
 
 fn encode_test_cursor(payload: serde_json::Value) -> String {
     URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).expect("cursor JSON"))
+}
+
+const CLAUDE_SESSION_ENDED: ActivityInterruption = ActivityInterruption {
+    cause: "Claude session ended before this",
+};
+
+async fn process_end_fixture(
+    scope_id: &str,
+    thread_id: &str,
+) -> (ActivityProjection, ActivityScopeSeed) {
+    let projection = ActivityProjection::new(ActivityRepository::new(migrated_database().await));
+    let scope = thread_scope(scope_id, thread_id);
+    projection.ensure_scope(scope.clone()).await.expect("scope");
+    (projection, scope)
+}
+
+#[tokio::test]
+async fn process_end_interrupts_unresolved_records_once_with_reason_and_a_closure_fence() {
+    // Recent enough that retention keeps the completed record.
+    let anchor = recent_activity_anchor() - Duration::minutes(50);
+    let at = |minutes: i64| activity_timestamp(anchor, Duration::minutes(minutes));
+    let (projection, scope) = process_end_fixture("thread:process-ended", "process-ended").await;
+    let mut events = projection.subscribe();
+    let mut described = actor_summary(
+        "actor:described",
+        None,
+        ActivityLifecycle::Waiting,
+        &at(0),
+        &at(0),
+        None,
+    )
+    .expect("described actor");
+    described.summary = Some("Reading protocol schemas".to_owned());
+    projection
+        .apply(
+            &scope.scope_id,
+            "event:seed".to_owned(),
+            vec![
+                ProviderActivityMutation::UpsertActor(
+                    actor_summary(
+                        "actor:running",
+                        None,
+                        ActivityLifecycle::Running,
+                        &at(0),
+                        &at(0),
+                        None,
+                    )
+                    .expect("running actor"),
+                ),
+                ProviderActivityMutation::UpsertActor(described),
+                ProviderActivityMutation::UpsertActor(
+                    actor_summary(
+                        "actor:done",
+                        None,
+                        ActivityLifecycle::Completed,
+                        &at(0),
+                        &at(1),
+                        Some(at(1).as_str()),
+                    )
+                    .expect("completed actor"),
+                ),
+                ProviderActivityMutation::UpsertWorkItem(
+                    work_item_summary(
+                        "work:waiting",
+                        Some("actor:running"),
+                        ActivityLifecycle::Waiting,
+                        &at(0),
+                        &at(0),
+                        None,
+                    )
+                    .expect("waiting work item"),
+                ),
+                ProviderActivityMutation::AppendEntry(
+                    entry(
+                        "entry:last-tool",
+                        ActivityRecordKind::Actor,
+                        "actor:running",
+                        &at(34),
+                    )
+                    .expect("tool entry"),
+                ),
+            ],
+            at(0),
+        )
+        .await
+        .expect("seed");
+    while events.try_recv().is_ok() {}
+
+    let deltas = projection
+        .interrupt_unresolved_scope(&scope.scope_id, CLAUDE_SESSION_ENDED)
+        .await
+        .expect("interrupt");
+    assert!(!deltas.is_empty());
+    let mut published = 0;
+    while let Ok(ActivityProjectionEvent::Delta(delta)) = events.try_recv() {
+        assert_eq!(delta.scope_id, scope.scope_id);
+        published += 1;
+    }
+    assert_eq!(
+        published,
+        deltas.len(),
+        "every journaled delta is published"
+    );
+
+    let snapshot = projection.snapshot(&scope.scope).await.expect("snapshot");
+    let actor = |id: &str| {
+        snapshot
+            .actors
+            .iter()
+            .find(|actor| actor.id == id)
+            .expect("actor")
+            .clone()
+    };
+    let running = actor("actor:running");
+    assert_eq!(running.status, ActivityLifecycle::Interrupted);
+    assert_eq!(Some(&running.updated_at), running.terminal_at.as_ref());
+    assert_eq!(
+        running.summary.as_deref(),
+        Some(
+            "Claude session ended before this subagent reported; last report 34m after it started."
+        )
+    );
+    assert_eq!(
+        actor("actor:described").summary.as_deref(),
+        Some(
+            "Claude session ended before this subagent reported; no report after it started. \
+             Reading protocol schemas"
+        )
+    );
+    assert_eq!(actor("actor:done").status, ActivityLifecycle::Completed);
+    let work_item = &snapshot.work_items[0];
+    assert_eq!(work_item.status, ActivityLifecycle::Interrupted);
+    assert_eq!(
+        work_item.summary.as_deref(),
+        Some("Claude session ended before this task reported; no report after it started.")
+    );
+    assert_eq!(snapshot.counts.subagents.active, 0);
+    assert_eq!(snapshot.counts.subagents.done, 3);
+    assert_eq!(snapshot.counts.background_tasks.active, 0);
+
+    // Nothing is left to close: no error, no revision.
+    assert!(
+        projection
+            .interrupt_unresolved_scope(&scope.scope_id, CLAUDE_SESSION_ENDED)
+            .await
+            .expect("repeat")
+            .is_empty()
+    );
+    // A report the dead process sent before the closure cannot reopen it.
+    projection
+        .apply(
+            &scope.scope_id,
+            "event:late-running".to_owned(),
+            vec![ProviderActivityMutation::UpsertActor(
+                actor_summary(
+                    "actor:running",
+                    None,
+                    ActivityLifecycle::Running,
+                    &at(0),
+                    &at(35),
+                    None,
+                )
+                .expect("late running report"),
+            )],
+            at(35),
+        )
+        .await
+        .expect("late report");
+    let after = projection.snapshot(&scope.scope).await.expect("snapshot");
+    assert_eq!(after.revision, snapshot.revision);
+    assert_eq!(
+        after
+            .actors
+            .iter()
+            .find(|actor| actor.id == "actor:running")
+            .expect("actor")
+            .status,
+        ActivityLifecycle::Interrupted
+    );
+}
+
+#[tokio::test]
+async fn process_end_closes_a_record_retained_under_a_section_no_longer_negotiated() {
+    let (projection, scope) = process_end_fixture("thread:hookless", "hookless").await;
+    projection
+        .apply(
+            &scope.scope_id,
+            "event:seed".to_owned(),
+            vec![
+                ProviderActivityMutation::upsert_actor(
+                    "actor:retained",
+                    None,
+                    "Retained",
+                    "running",
+                )
+                .expect("actor"),
+            ],
+            "2026-07-30T12:00:00Z".to_owned(),
+        )
+        .await
+        .expect("seed");
+    // A relaunched process without hook support no longer reports actors.
+    projection
+        .apply(
+            &scope.scope_id,
+            "event:hookless".to_owned(),
+            vec![
+                ProviderActivityMutation::SetScope {
+                    capabilities: ActivityCapabilities::none(),
+                    observation_state: ActivityObservationState::Live,
+                },
+                ProviderActivityMutation::SetSectionHealth {
+                    section: ActivitySection::Subagents,
+                    health: ActivitySectionHealth::try_stale(
+                        "Provider no longer reports this retained activity",
+                        false,
+                    )
+                    .expect("stale health"),
+                },
+                ProviderActivityMutation::SetSectionHealth {
+                    section: ActivitySection::BackgroundTasks,
+                    health: ActivitySectionHealth::unsupported(),
+                },
+            ],
+            "2026-07-30T12:01:00Z".to_owned(),
+        )
+        .await
+        .expect("hookless relaunch");
+    assert!(
+        projection
+            .apply(
+                &scope.scope_id,
+                "event:provider-close".to_owned(),
+                vec![
+                    ProviderActivityMutation::set_actor_status("actor:retained", "interrupted")
+                        .expect("status"),
+                ],
+                "2026-07-30T12:02:00Z".to_owned(),
+            )
+            .await
+            .is_err(),
+        "a provider batch still needs the capability"
+    );
+
+    let deltas = projection
+        .interrupt_unresolved_scope(&scope.scope_id, CLAUDE_SESSION_ENDED)
+        .await
+        .expect("interrupt retained record");
+    assert!(!deltas.is_empty(), "the closure is journaled");
+    let snapshot = projection.snapshot(&scope.scope).await.expect("snapshot");
+    assert_eq!(snapshot.actors[0].status, ActivityLifecycle::Interrupted);
+    assert!(!snapshot.capabilities.actors);
+    assert_eq!(snapshot.counts.subagents.active, 0);
+}
+
+#[tokio::test]
+async fn a_reopened_record_closed_again_keeps_one_reason() {
+    let (projection, scope) = process_end_fixture("thread:reopened", "reopened").await;
+    let mut actor = actor_summary(
+        "actor:reopened",
+        None,
+        ActivityLifecycle::Running,
+        "2026-07-30T12:00:00Z",
+        "2026-07-30T12:00:00Z",
+        None,
+    )
+    .expect("actor");
+    actor.summary = Some("Reading protocol schemas".to_owned());
+    projection
+        .apply(
+            &scope.scope_id,
+            "event:seed".to_owned(),
+            vec![ProviderActivityMutation::UpsertActor(actor)],
+            "2026-07-30T12:00:00Z".to_owned(),
+        )
+        .await
+        .expect("seed");
+    projection
+        .interrupt_unresolved_scope(&scope.scope_id, CLAUDE_SESSION_ENDED)
+        .await
+        .expect("first closure");
+    let closed = projection
+        .snapshot(&scope.scope)
+        .await
+        .expect("snapshot")
+        .actors[0]
+        .clone();
+    // A resumed provider reports it running again at its closure time, which the server accepts.
+    let mut reopened = closed.clone();
+    reopened.status = ActivityLifecycle::Running;
+    reopened.terminal_at = None;
+    projection
+        .apply(
+            &scope.scope_id,
+            "event:reopened".to_owned(),
+            vec![ProviderActivityMutation::UpsertActor(reopened)],
+            closed.updated_at.clone(),
+        )
+        .await
+        .expect("reopen");
+    assert_eq!(
+        projection
+            .snapshot(&scope.scope)
+            .await
+            .expect("snapshot")
+            .actors[0]
+            .status,
+        ActivityLifecycle::Running
+    );
+    projection
+        .interrupt_unresolved_scope(
+            &scope.scope_id,
+            ActivityInterruption {
+                cause: "BiBCode restarted before this",
+            },
+        )
+        .await
+        .expect("second closure");
+    let summary = projection
+        .snapshot(&scope.scope)
+        .await
+        .expect("snapshot")
+        .actors[0]
+        .summary
+        .clone()
+        .expect("summary");
+    assert!(
+        summary.starts_with("BiBCode restarted before this subagent reported;"),
+        "{summary}"
+    );
+    assert_eq!(
+        summary.matches("before this subagent reported").count(),
+        1,
+        "{summary}"
+    );
+    assert!(summary.ends_with("Reading protocol schemas"), "{summary}");
+}
+
+#[tokio::test]
+async fn startup_lists_only_current_thread_scopes_with_unresolved_records() {
+    let database = migrated_database().await;
+    let projection = ActivityProjection::new(ActivityRepository::new(database));
+    let open = thread_scope("thread:open", "open");
+    let settled = thread_scope("thread:settled", "settled");
+    let terminal = terminal_scope("terminal:open", "generation:open", "terminal:open");
+    for seed in [&open, &settled, &terminal] {
+        projection.ensure_scope(seed.clone()).await.expect("scope");
+    }
+    for (seed, status) in [
+        (&open, "running"),
+        (&settled, "completed"),
+        (&terminal, "running"),
+    ] {
+        projection
+            .apply(
+                &seed.scope_id,
+                format!("event:{}", seed.scope_id),
+                vec![
+                    ProviderActivityMutation::upsert_actor("actor:one", None, "One", status)
+                        .expect("actor"),
+                ],
+                "2026-07-30T12:00:00Z".to_owned(),
+            )
+            .await
+            .expect("seed");
+    }
+    let scopes = projection.unresolved_thread_scopes().await.expect("scopes");
+    assert_eq!(
+        scopes
+            .iter()
+            .map(|scope| (
+                scope.scope_id.as_str(),
+                scope.thread_id.as_str(),
+                scope.provider.as_str()
+            ))
+            .collect::<Vec<_>>(),
+        vec![("thread:open", "open", "codex")]
+    );
 }
