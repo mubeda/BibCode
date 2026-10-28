@@ -66,6 +66,9 @@ pub(crate) struct StoredRemote {
     /// The name the remote gave itself in its offer.
     remote_name: String,
     paired_at: String,
+    /// Random per pairing attempt: a rollback removes only the record its own attempt wrote,
+    /// never one a concurrent `forget` and re-pair put under the same name.
+    pairing_id: String,
     credential: String,
 }
 
@@ -137,12 +140,29 @@ impl RemoteStore {
             })
     }
 
-    async fn create(&self, remote: &StoredRemote) -> Result<(), String> {
+    /// Writes a new record. `Ok(Some(warning))`: the record was stored, but its temporary
+    /// link was left behind, which the caller reports and otherwise ignores.
+    async fn create(&self, remote: &StoredRemote) -> Result<Option<String>, String> {
         let bytes = serde_json::to_vec(remote).map_err(|error| error.to_string())?;
+        match self.store.create(&remote.name, &bytes).await {
+            Ok(()) => Ok(None),
+            Err(error) if error.is_published() => Ok(Some(format!(
+                "The credential for {} was saved, but a temporary file was left beside it: {error}",
+                remote.name
+            ))),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    /// Removes `remote`'s record only if it is still the one this pairing attempt wrote.
+    async fn remove_own(&self, remote: &StoredRemote) -> bool {
         self.store
-            .create(&remote.name, &bytes)
+            .remove_if(&remote.name, |bytes| {
+                serde_json::from_slice::<StoredRemote>(bytes)
+                    .is_ok_and(|stored| stored.pairing_id == remote.pairing_id)
+            })
             .await
-            .map_err(|error| error.to_string())
+            .unwrap_or(false)
     }
 
     async fn remove(&self, name: &str) -> Result<bool, Outcome> {
@@ -428,22 +448,30 @@ pub(crate) async fn pair(
         storage_instance_id: payload.storage_instance_id.clone(),
         remote_name: remote_name.clone(),
         paired_at: now_rfc3339(),
+        pairing_id: uuid::Uuid::new_v4().to_string(),
         credential: credential.to_owned(),
     };
-    if let Err(error) = store.create(&remote).await {
-        client.close().await;
-        return Err(Outcome::failed(
-            "store-failed",
-            left_on_remote(format!(
-                "Could not save the credential for {name}: {}. The offer is used up; create a \
-                 new one.",
-                printable(&error)
-            )),
-        ));
-    }
+    // A record stored with a stray temporary file is still a stored record: confirm it.
+    let stored_note = match store.create(&remote).await {
+        Ok(note) => note,
+        Err(error) => {
+            client.close().await;
+            return Err(Outcome::failed(
+                "store-failed",
+                left_on_remote(format!(
+                    "Could not save the credential for {name}: {}. The offer is used up; create \
+                     a new one.",
+                    printable(&error)
+                )),
+            ));
+        }
+    };
     if !confirmation_required {
         client.close().await;
-        return Ok(Paired { remote, note: None });
+        return Ok(Paired {
+            remote,
+            note: stored_note,
+        });
     }
     let confirmed = client
         .unary("auth.confirmPairing", json!({}), CONFIRM_WAIT)
@@ -451,18 +479,26 @@ pub(crate) async fn pair(
     match confirmed {
         Ok(_) => {
             client.close().await;
-            Ok(Paired { remote, note: None })
+            Ok(Paired {
+                remote,
+                note: stored_note,
+            })
         }
         // The server answered and refused: the credential never became active.
         Err(RpcCallError::Failed(_) | RpcCallError::Defect(_)) => {
             client.close().await;
-            let _ = store.remove(&name).await;
+            store.remove_own(&remote).await;
             Err(pairing_rejected(&remote_name))
         }
         // The answer was lost: the confirmation may have committed. One reconnect settles it.
         Err(RpcCallError::Client(_) | RpcCallError::Ended | RpcCallError::Rejected(_)) => {
             drop(client);
-            settle_unconfirmed(&store, remote, trust).await
+            settle_unconfirmed(&store, remote, trust)
+                .await
+                .map(|paired| Paired {
+                    note: paired.note.or(stored_note),
+                    ..paired
+                })
         }
     }
 }
@@ -490,7 +526,7 @@ async fn settle_unconfirmed(
             Ok(Paired { remote, note: None })
         }
         Err(E2eeClientError::Unauthorized) => {
-            let _ = store.remove(&remote.name).await;
+            store.remove_own(&remote).await;
             Err(pairing_rejected(&remote.remote_name))
         }
         Err(_) => Ok(Paired {
@@ -890,6 +926,7 @@ mod tests {
             storage_instance_id: "store".to_owned(),
             remote_name: "Box".to_owned(),
             paired_at: now_rfc3339(),
+            pairing_id: "attempt".to_owned(),
             credential: "very-secret-credential".to_owned(),
         };
         assert!(!format!("{remote:?}").contains("very-secret-credential"));
