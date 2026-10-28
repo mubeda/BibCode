@@ -24,6 +24,7 @@ for the command prefix that fits the install:
 | Server (package, archive)           | `bibcode profiler`                                                      |
 | Remote host                         | `ssh <host> bibcode profiler`                                           |
 | Remote host, no SSH (bundle only)   | `bibcode diagnostics download --environment <name>`, see below          |
+| Remote host, no SSH, app closed     | `bibcode diagnostics download --remote <name>` once paired, see below   |
 | WSL environment                     | `wsl.exe -d <distro> --exec <Linux path of the server binary> profiler` |
 | macOS desktop                       | `/Applications/BiBCode.app/Contents/MacOS/bibcode-desktop profiler`     |
 | Windows desktop                     | `& "$env:LOCALAPPDATA\BiBCode\bibcode-desktop.exe" profiler`            |
@@ -57,8 +58,16 @@ for the command prefix that fits the install:
   unknown name fails without listing others; ask the user for the name shown
   in BiBCode. Exit 3 means the desktop app is not running here; when the
   desktop's primary environment runs in WSL, run `bibcode diagnostics
-  download` inside that distro. Unattended access without the app is not
-  available yet (#202). Otherwise ask the user to open
+  download` inside that distro. With no app to approve (unattended), ask the
+  user once to run `bibcode pairing offer --access diagnostics --endpoint
+  <address the remote is reached at>` on that host and hand you the link; pass
+  it on standard input to `P' diagnostics pair --name <name>`, then fetch with
+  `P' diagnostics download --remote <name> --output <dir> --json`. That
+  credential reads the bundle only: `--include-crash-dumps` is refused (exit
+  2, `crash-dumps-refused`), and exit 2 `unauthorized` means it was revoked or
+  is over 30 days old, so ask for a new offer. It cannot reach a host only
+  reachable through the desktop's SSH tunnel or BiBCode Connect. Otherwise ask
+  the user to open
   **Settings → Diagnostics** in that app, choose the host in **Environment**,
   and use **Download logs** (or **Export bundle**, with **Include crash dumps**
   when a dump is needed). Either way the remote server builds the ZIP itself

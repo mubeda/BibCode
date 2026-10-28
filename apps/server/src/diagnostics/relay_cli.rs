@@ -15,25 +15,19 @@
 //! an existing file, so an interrupted run leaves no partial archive under that name.
 
 use std::{
-    io::{self, Cursor, Read as _, Write as _},
+    io::{self, Write as _},
     path::{Path, PathBuf},
     time::Duration,
 };
 
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 use clap::{Args, Subcommand};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::{
-    diagnostic_bundle::MAX_DIAGNOSTIC_ARCHIVE_BYTES,
-    production::{
-        diagnostic_logs_relay::{
-            APPROVAL_DEADLINE, RELAY_ENDPOINT_FILE, RELAY_PATH, START_DEADLINE, is_archive_name,
-            is_deceptive_char,
-        },
-        diagnostic_logs_rpc::DIAGNOSTIC_LOGS_CHUNK_BYTES,
-    },
+use super::archive::ArchiveReceiver;
+pub use super::archive::{Outcome, new_request_code, printable};
+use crate::production::diagnostic_logs_relay::{
+    APPROVAL_DEADLINE, RELAY_ENDPOINT_FILE, RELAY_PATH, START_DEADLINE,
 };
 
 /// The longest response line: a `Data` item's base64 plus its envelope, or a manifest.
@@ -42,8 +36,6 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long the server may take to answer the request's headers, or to send an error body.
 /// It answers at once and streams the rest, so this only ends a server that hangs.
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
-/// Fresh names tried for the temporary file before giving up.
-const TEMPORARY_ATTEMPTS: usize = 8;
 /// How long the command waits for the archive to start: past the server's own approval
 /// and start deadlines, so the server's answer normally arrives first.
 const WAIT_FOR_START: Duration = APPROVAL_DEADLINE
@@ -51,9 +43,6 @@ const WAIT_FOR_START: Duration = APPROVAL_DEADLINE
     .saturating_add(Duration::from_secs(60));
 /// How long the command waits for each line once the archive started.
 const WAIT_BETWEEN_ITEMS: Duration = Duration::from_secs(90);
-/// The request code alphabet: no 0/O or 1/I, so it reads back unambiguously.
-const CODE_ALPHABET: &[u8] = b"23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
-
 #[derive(Clone, Debug, Args)]
 pub struct DiagnosticsArgs {
     #[command(subcommand)]
@@ -62,12 +51,16 @@ pub struct DiagnosticsArgs {
 
 #[derive(Clone, Debug, Subcommand)]
 pub enum DiagnosticsSubcommand {
-    /// Save a connected environment's diagnostic logs through the BiBCode desktop app on this
-    /// computer, after you approve the request there.
+    /// Save an environment's diagnostic logs: through the BiBCode desktop app on this computer
+    /// after you approve it there (--environment), or straight from a remote this command
+    /// paired with (--remote), with the app closed.
     Download {
         /// The environment: its id or its name in BiBCode.
+        #[arg(long, required_unless_present = "remote", conflicts_with = "remote")]
+        environment: Option<String>,
+        /// A remote paired with `bibcode diagnostics pair`.
         #[arg(long)]
-        environment: String,
+        remote: Option<String>,
         /// Also ask for crash dumps, which can hold fragments of memory.
         #[arg(long)]
         include_crash_dumps: bool,
@@ -79,101 +72,35 @@ pub enum DiagnosticsSubcommand {
         #[arg(long)]
         json: bool,
     },
-}
-
-/// How the command ended, and its exit code.
-#[derive(Clone, Debug, PartialEq)]
-pub enum Outcome {
-    Saved {
-        path: PathBuf,
-        file_name: String,
-        byte_length: u64,
-        manifest: Value,
+    /// Pair with a remote BiBCode server for its diagnostic logs only, from an offer made there
+    /// with `bibcode pairing offer --access diagnostics`.
+    Pair {
+        /// The offer (`bibcode://pair?code=…`, a `/pair?code=…` link, or the code). Leave it
+        /// out (or pass `-`) to read it from standard input: an argument shows in the process
+        /// list and shell history until the one-time offer is used or expires.
+        offer: Option<String>,
+        /// The name to use with `download --remote`; from the offer's name by default.
+        #[arg(long)]
+        name: Option<String>,
+        /// Print one JSON document, whatever the outcome.
+        #[arg(long)]
+        json: bool,
     },
-    /// The app or the relay refused or failed: `reason` and `message` from it.
-    Failed { reason: String, message: String },
-    /// The user said no, nobody answered, or the last requests were turned down.
-    Denied { reason: String, message: String },
-    /// No server, or no desktop app, to ask.
-    Unavailable { reason: String, message: String },
-}
-
-impl Outcome {
-    #[must_use]
-    pub fn exit_code(&self) -> i32 {
-        match self {
-            Self::Saved { .. } => 0,
-            Self::Failed { .. } => 1,
-            Self::Denied { .. } => 2,
-            Self::Unavailable { .. } => 3,
-        }
-    }
-
-    fn failed(reason: &str, message: impl Into<String>) -> Self {
-        Self::Failed {
-            reason: reason.to_owned(),
-            message: message.into(),
-        }
-    }
-
-    fn unavailable(reason: &str, message: impl Into<String>) -> Self {
-        Self::Unavailable {
-            reason: reason.to_owned(),
-            message: message.into(),
-        }
-    }
-
-    #[must_use]
-    pub fn to_json(&self) -> Value {
-        match self {
-            Self::Saved {
-                path,
-                file_name,
-                byte_length,
-                manifest,
-            } => json!({
-                "status": "saved",
-                "path": path,
-                "fileName": file_name,
-                "byteLength": byte_length,
-                "manifest": manifest,
-            }),
-            Self::Failed { reason, message } => {
-                json!({ "status": "failed", "reason": reason, "message": message })
-            }
-            Self::Denied { reason, message } => {
-                json!({ "status": "denied", "reason": reason, "message": message })
-            }
-            Self::Unavailable { reason, message } => {
-                json!({ "status": "unavailable", "reason": reason, "message": message })
-            }
-        }
-    }
-}
-
-/// `text` without control characters (escape sequences, carriage returns, bidi tricks
-/// rendered as controls), which the app or a remote server could otherwise use to rewrite
-/// what the terminal shows.
-#[must_use]
-pub fn printable(text: &str) -> String {
-    text.chars()
-        .filter(|character| !is_deceptive_char(*character))
-        .collect()
-}
-
-/// A fresh request code, `XXX-XX`, from [`CODE_ALPHABET`].
-pub fn new_request_code() -> io::Result<String> {
-    let mut bytes = [0_u8; 5];
-    getrandom::fill(&mut bytes).map_err(|error| io::Error::other(error.to_string()))?;
-    let letters: Vec<char> = bytes
-        .iter()
-        .map(|byte| char::from(CODE_ALPHABET[usize::from(*byte) % CODE_ALPHABET.len()]))
-        .collect();
-    Ok(format!(
-        "{}-{}",
-        letters[..3].iter().collect::<String>(),
-        letters[3..].iter().collect::<String>()
-    ))
+    /// List the remotes this command paired with.
+    Remotes {
+        /// Print one JSON document.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Delete a paired remote's credential from this computer. The remote keeps listing the
+    /// client until it is revoked there or expires.
+    Forget {
+        /// The remote's name.
+        name: String,
+        /// Print one JSON document, whatever the outcome.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Deserialize)]
@@ -240,138 +167,10 @@ fn is_loopback_host(url: &reqwest::Url) -> bool {
     }
 }
 
-/// The archive being received, checked line by line.
-struct Receiving {
-    file_name: String,
-    manifest: Value,
-    expected: usize,
-    bytes: Vec<u8>,
-}
-
-/// Publishes `bytes` as a new `directory/file_name`, never over an existing file: written
-/// and synced to a temporary file beside it (a fresh name, retried if one is taken), then
-/// hard-linked under the name, which fails if the name exists. Without hard links there is
-/// no publish that cannot replace a file, so the command fails instead of risking a partial
-/// archive under the name. Only the temporary file this call created is removed.
-fn save_new(directory: &Path, file_name: &str, bytes: &[u8]) -> Result<PathBuf, Outcome> {
-    if !is_archive_name(file_name) {
-        return Err(Outcome::failed(
-            "invalid",
-            "BiBCode sent an archive name that is not a diagnostics archive. Nothing was saved.",
-        ));
-    }
-    let path = directory.join(file_name);
-    let exists = || {
-        Outcome::failed(
-            "exists",
-            format!(
-                "{} already exists. Nothing was replaced; move it or pass another --output.",
-                path.display()
-            ),
-        )
-    };
-    if path.symlink_metadata().is_ok() {
-        return Err(exists());
-    }
-    let temporary = write_temporary(directory, file_name, bytes)?;
-    let published = match std::fs::hard_link(&temporary, &path) {
-        Ok(()) => Ok(path.clone()),
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Err(exists()),
-        Err(error) => Err(Outcome::failed(
-            "no-safe-publish",
-            format!(
-                "{} cannot hold hard links ({error}), so the archive cannot be saved without \
-                 risking a partial file. Nothing was saved; pass an --output on a local disk.",
-                directory.display()
-            ),
-        )),
-    };
-    let _ = std::fs::remove_file(&temporary);
-    published
-}
-
-/// Writes and syncs `bytes` to a new hidden file in `directory`, retrying with a fresh name
-/// when one is taken. A name another process holds is never touched.
-fn write_temporary(directory: &Path, file_name: &str, bytes: &[u8]) -> Result<PathBuf, Outcome> {
-    write_temporary_named(directory, file_name, bytes, &mut new_request_code)
-}
-
-fn write_temporary_named(
-    directory: &Path,
-    file_name: &str,
-    bytes: &[u8],
-    next_suffix: &mut dyn FnMut() -> io::Result<String>,
-) -> Result<PathBuf, Outcome> {
-    let failed = |target: &Path, error: io::Error| {
-        Outcome::failed(
-            "write-failed",
-            format!("Could not write {}: {error}", target.display()),
-        )
-    };
-    for _ in 0..TEMPORARY_ATTEMPTS {
-        let suffix = next_suffix().map_err(|error| failed(directory, error))?;
-        let temporary = directory.join(format!(".{file_name}.{suffix}.partial"));
-        let mut file = match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)
-        {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(failed(&temporary, error)),
-        };
-        // From here the file is this call's own.
-        if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
-            drop(file);
-            let _ = std::fs::remove_file(&temporary);
-            return Err(failed(&temporary, error));
-        }
-        return Ok(temporary);
-    }
-    Err(failed(
-        directory,
-        io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "every temporary name tried was taken",
-        ),
-    ))
-}
-
-/// The archive's own `manifest.json` names the environment and store the app's manifest
-/// does, and both are present and non-empty: what is saved is what the app checked against
-/// its connection.
-fn archive_matches_manifest(bytes: &[u8], manifest: &Value) -> bool {
-    let Ok(mut archive) = zip::ZipArchive::new(Cursor::new(bytes)) else {
-        return false;
-    };
-    let Ok(entry) = archive.by_name("manifest.json") else {
-        return false;
-    };
-    let mut text = String::new();
-    if entry.take(64 * 1024).read_to_string(&mut text).is_err() {
-        return false;
-    }
-    let Ok(inner) = serde_json::from_str::<Value>(&text) else {
-        return false;
-    };
-    let present = |value: &Value, key: &str| {
-        value
-            .get(key)
-            .and_then(Value::as_str)
-            .is_some_and(|text| !text.trim().is_empty())
-    };
-    ["environmentId", "storageInstanceId"]
-        .iter()
-        .all(|key| present(&inner, key) && present(manifest, key))
-        && ["environmentId", "storageInstanceId", "serverVersion"]
-            .iter()
-            .all(|key| inner.get(key) == manifest.get(key))
-}
-
 /// Applies one response line. `Ok(Some)` ends the command.
 fn accept_line(
     line: &[u8],
-    receiving: &mut Option<Receiving>,
+    receiving: &mut Option<ArchiveReceiver>,
     output: &Path,
     on_waiting: &mut (dyn FnMut() + Send),
 ) -> Result<Option<Outcome>, Outcome> {
@@ -389,80 +188,26 @@ fn accept_line(
             Ok(None)
         }
         Some("started") if receiving.is_none() => {
-            let file_name = line
-                .get("fileName")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned();
-            let byte_length = line
-                .get("byteLength")
-                .and_then(Value::as_u64)
-                .and_then(|length| usize::try_from(length).ok())
-                .ok_or_else(protocol)?;
-            if !is_archive_name(&file_name) {
-                return Err(Outcome::failed(
-                    "invalid",
-                    "BiBCode sent an archive name that is not a diagnostics archive. Nothing was saved.",
-                ));
-            }
-            if byte_length > MAX_DIAGNOSTIC_ARCHIVE_BYTES {
-                return Err(Outcome::failed(
-                    "too-large",
-                    "The archive is over the 20 MiB limit. Nothing was saved.",
-                ));
-            }
-            let manifest = line
-                .get("manifest")
-                .cloned()
-                .filter(Value::is_object)
-                .ok_or_else(protocol)?;
-            *receiving = Some(Receiving {
-                file_name,
-                manifest,
-                expected: byte_length,
-                bytes: Vec::with_capacity(byte_length),
-            });
+            *receiving = Some(ArchiveReceiver::start(
+                line.get("fileName")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                line.get("byteLength").and_then(Value::as_u64),
+                line.get("manifest").cloned(),
+            )?);
             Ok(None)
         }
         Some("data") => {
             let receiving = receiving.as_mut().ok_or_else(protocol)?;
-            let data = STANDARD.decode(text("data")).map_err(|_| protocol())?;
-            if data.is_empty()
-                || data.len() > DIAGNOSTIC_LOGS_CHUNK_BYTES
-                || receiving.bytes.len() + data.len() > receiving.expected
-            {
-                return Err(Outcome::failed(
-                    "incomplete",
-                    "BiBCode sent more than the archive it announced. Nothing was saved.",
-                ));
-            }
-            receiving.bytes.extend_from_slice(&data);
+            receiving
+                .accept_encoded(line.get("data").and_then(Value::as_str).unwrap_or_default())?;
             Ok(None)
         }
         Some("finished") => {
             let Some(received) = receiving.take() else {
                 return Err(protocol());
             };
-            if received.bytes.len() != received.expected {
-                return Err(Outcome::failed(
-                    "incomplete",
-                    "The archive arrived incomplete. Nothing was saved.",
-                ));
-            }
-            if !archive_matches_manifest(&received.bytes, &received.manifest) {
-                return Err(Outcome::failed(
-                    "wrong-environment",
-                    "The archive's manifest does not name the environment BiBCode checked. Nothing was saved.",
-                ));
-            }
-            let path = save_new(output, &received.file_name, &received.bytes)?;
-            let path = std::fs::canonicalize(&path).unwrap_or(path);
-            Ok(Some(Outcome::Saved {
-                path,
-                file_name: received.file_name,
-                byte_length: received.expected as u64,
-                manifest: received.manifest,
-            }))
+            received.finish(output).map(Some)
         }
         Some("denied") => Ok(Some(Outcome::Denied {
             reason: "denied".to_owned(),
@@ -645,12 +390,46 @@ fn print_text(outcome: &Outcome) {
 
 /// Runs a `diagnostics` command against the server for `state_dir` and returns the exit code.
 pub async fn run_diagnostics_cli(args: DiagnosticsArgs, state_dir: PathBuf) -> i32 {
-    let DiagnosticsSubcommand::Download {
-        environment,
-        include_crash_dumps,
-        output,
-        json,
-    } = args.command;
+    let (environment, include_crash_dumps, output, json) = match args.command {
+        DiagnosticsSubcommand::Download {
+            remote: Some(remote),
+            include_crash_dumps,
+            output,
+            json,
+            ..
+        } => {
+            let output = output.unwrap_or_else(|| PathBuf::from("."));
+            return super::remote_cli::run_download(
+                &state_dir,
+                &remote,
+                include_crash_dumps,
+                &output,
+                json,
+            )
+            .await;
+        }
+        DiagnosticsSubcommand::Download {
+            environment,
+            include_crash_dumps,
+            output,
+            json,
+            ..
+        } => (
+            environment.unwrap_or_default(),
+            include_crash_dumps,
+            output,
+            json,
+        ),
+        DiagnosticsSubcommand::Pair { offer, name, json } => {
+            return super::remote_cli::run_pair(&state_dir, offer, name, json).await;
+        }
+        DiagnosticsSubcommand::Remotes { json } => {
+            return super::remote_cli::run_remotes(&state_dir, json).await;
+        }
+        DiagnosticsSubcommand::Forget { name, json } => {
+            return super::remote_cli::run_forget(&state_dir, &name, json).await;
+        }
+    };
     let output = output.unwrap_or_else(|| PathBuf::from("."));
     let code = match new_request_code() {
         Ok(code) => code,
@@ -674,10 +453,15 @@ pub async fn run_diagnostics_cli(args: DiagnosticsArgs, state_dir: PathBuf) -> i
         &mut on_waiting,
     )
     .await;
+    report(&outcome, json)
+}
+
+/// Prints `outcome` (one JSON document with `json`) and returns its exit code.
+pub(crate) fn report(outcome: &Outcome, json: bool) -> i32 {
     if json {
         println!("{}", outcome.to_json());
     } else {
-        print_text(&outcome);
+        print_text(outcome);
     }
     let _ = io::stdout().flush();
     outcome.exit_code()
@@ -685,8 +469,19 @@ pub async fn run_diagnostics_cli(args: DiagnosticsArgs, state_dir: PathBuf) -> i
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+
     use super::*;
-    use crate::production::diagnostic_logs_relay::is_request_code;
+    use crate::{
+        diagnostic_bundle::MAX_DIAGNOSTIC_ARCHIVE_BYTES,
+        diagnostics::archive::{write_temporary, write_temporary_named},
+        production::{
+            diagnostic_logs_relay::is_request_code,
+            diagnostic_logs_rpc::DIAGNOSTIC_LOGS_CHUNK_BYTES,
+        },
+    };
 
     fn zip_with_manifest(manifest: &Value) -> Vec<u8> {
         let mut cursor = Cursor::new(Vec::new());

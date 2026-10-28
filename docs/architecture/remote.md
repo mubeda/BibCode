@@ -261,7 +261,10 @@ active database row whose in-memory state and latch still appear pending.
 The one-time token remains consumed, so the user generates a new offer, but the
 pending credential cannot reconnect as steady-state authority. The server
 returns `e2ee_authenticated` with the minted string credential,
-`environmentId`, optional `storageInstanceId`, and
+`environmentId`, optional `storageInstanceId`, the credential's `scopes` (from
+#202; older servers omit them, and a client whose schema predates the field
+drops it, since `Schema.Struct` decoding ignores excess keys, which
+`remotePairing.test.ts` pins), and
 `pairingConfirmationRequired: true` exactly when the grant was off-host. The
 reply flag is the client's only confirmation signal: when it is present the
 client must call `auth.confirmPairing` on the same channel before the
@@ -529,6 +532,61 @@ restart. Failures are classified as `unreachable`,
 `duplicate-storage-identity`, and cleanup copy reports any local compensation
 failure. The client does not claim transparent retry with the same one-time
 code.
+
+### Command-line diagnostics pairing
+
+`bibcode diagnostics pair` and `bibcode diagnostics download --remote` (#202)
+are the one production Rust client of `/ws-e2ee`
+(`apps/server/src/rpc/e2ee_client.rs`; design in
+`docs/superpowers/specs/2026-10-27-cli-pairing-design.md`). The command pairs as
+its own device and holds no connection between runs.
+
+- **Credential.** The remote mints the offer with `bibcode pairing offer
+  --access diagnostics` (or the pairing-offer route with
+  `scopes: ["diagnostics:read"]`); its grant holds only `diagnostics:read`,
+  which allows no method other than `server.downloadDiagnosticLogs` (plus
+  `auth.confirmPairing` for its own pending pairing), and is
+  labelled `<name> (diagnostics)`. `pair` keeps the credential only when the
+  pairing reply's `scopes` are exactly `["diagnostics:read"]`; a wider grant,
+  or a server that sends no `scopes`, is refused before anything is written,
+  and closing the unconfirmed channel revokes the pending session as for any
+  client.
+- **Client.** It opens `ws(s)://<offer endpoint>/ws-e2ee` (the path replaced,
+  as the web client does; no proxy, no redirect), runs Noise NK pinned to the
+  offer's host key with empty payloads, and treats close code 4403 as a host
+  identity mismatch. It offers no channel features, so only `0x00` and `0x01`
+  records are valid; it refuses empty continuations, more than 2,048 records,
+  and logical messages over 1 MiB (the pre-auth reply over 64 KiB). Requests
+  use the same `ClientMessage`/`ServerMessage` types as the server, and each
+  stream chunk is acknowledged only after its items were accepted. An `https`
+  endpoint uses rustls with the operating system's verifier (as `reqwest`
+  does).
+- **Pairing order.** Pinned handshake, `e2ee_auth{pairing}`, the scope check,
+  the in-channel `storageInstanceId` against the offer's, then the record is
+  written (create, never replace), then `auth.confirmPairing` on the same
+  channel when the reply asks for it. A typed refusal deletes the record. A
+  lost answer is settled by one bearer reconnect: authenticated keeps the
+  record, `unauthorized` deletes it, anything else keeps it and says so. A
+  deletion removes only the record this attempt wrote, matched by its random
+  pairing id (`SecretStore::remove_if` moves it aside atomically, checks it, and
+  links back one that does not match), so a `forget` and re-pair under the
+  same name during the confirmation keeps the newer record. A record whose
+  write succeeded but left a temporary link behind counts as stored and is
+  confirmed; the leftover file is reported.
+- **Storage.** One record per remote in
+  `<state dir>/diagnostics-remotes/<name>.bin` through `auth::SecretStore`
+  (directory 0700, files 0600 on Unix, owner-only ACLs on Windows): endpoint,
+  host key, environment and store ids, the remote's name, pairing time, the
+  pairing id, and the credential, which is never printed. `forget` deletes the
+  record only.
+- **Download.** Bearer `e2ee_auth`, then `server.downloadDiagnosticLogs` with
+  an empty `frontendLog`. `Started` must name the stored `storageInstanceId`
+  and `environmentId` before any byte is kept, then the archive checks shared
+  with the relay path (`diagnostics/archive.rs`) apply: 20 MiB, each item's
+  encoded length against the 64 KiB item bound and the bytes still expected
+  before it is decoded, the exact total, the inner `manifest.json`, and a
+  publish that never replaces a file. Redaction, the size limit and the
+  crash-dump scope check are the remote's own, unchanged.
 
 ### Remote Servers settings and pairing entry points
 
@@ -1638,8 +1696,10 @@ does. The local server never learns a remote credential, and no other paired
 device can be asked to pull logs onto this host. Any program running as the
 user can ask, so the prompt says the request comes from a program on this
 computer, not BiBCode, and shows the code that program printed, the
-environment as typed, and the directory it saves in. Unattended access without the
-app is a follow-up (#202). See
+environment as typed, and the directory it saves in. With the app closed,
+`bibcode diagnostics download --remote` uses a diagnostics-only credential of
+its own instead (#202; see
+[Command-line diagnostics pairing](#command-line-diagnostics-pairing)). See
 [Observability](../operations/observability.md#from-the-command-line).
 
 A server older than the profiler does not advertise `capabilities.profiler`. The
@@ -1738,6 +1798,13 @@ performed on the machine that owns that server and filesystem.
   session). Sessions
   minted for SSH expire after 30 days; a standard-scope bearer cannot revoke
   them.
+- `bibcode diagnostics download --remote` reaches only direct endpoints. An
+  environment reached only through desktop-managed SSH or only through
+  BiBCode Connect has no endpoint for it (the tunnel is the app's; Connect
+  needs a Clerk sign-in); use `--environment` through the app instead. Its
+  credential expires 30 days after pairing and is not renewed, and `forget`
+  deletes it locally only: the remote lists the client until it is revoked on
+  its Share tab or expires. A remote whose address changes needs a new pairing.
 - The remote bounds cannot end a process stuck in uninterruptible I/O. A
   recorded server stuck that way blocks new launches of its environment until
   it exits.

@@ -96,9 +96,26 @@ pub enum SecretStoreError {
     },
     #[error("secret {name:?} disappeared after a concurrent creator won the race")]
     ConcurrentRead { name: String, path: PathBuf },
+    /// `create` published the secret, but its temporary link could not be removed: the
+    /// secret is stored, and only a stray temporary file is left behind.
+    #[error(
+        "secret {name:?} was stored, but its temporary link {temporary_path} could not be removed"
+    )]
+    PublishedTemporaryLeft {
+        name: String,
+        temporary_path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
 }
 
 impl SecretStoreError {
+    /// Whether a failed `create` still stored the secret under its name.
+    #[must_use]
+    pub const fn is_published(&self) -> bool {
+        matches!(self, Self::PublishedTemporaryLeft { .. })
+    }
+
     #[must_use]
     pub const fn is_already_exists(&self) -> bool {
         matches!(
@@ -113,6 +130,10 @@ pub type Result<T> = std::result::Result<T, SecretStoreError>;
 #[derive(Clone, Debug)]
 pub struct SecretStore {
     root: PathBuf,
+    /// Tests make removing a published temporary link fail, which a real filesystem rarely
+    /// does on demand.
+    #[cfg(test)]
+    fail_published_cleanup: bool,
 }
 
 impl SecretStore {
@@ -132,7 +153,17 @@ impl SecretStore {
                 source,
             })?;
 
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            #[cfg(test)]
+            fail_published_cleanup: false,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_published_cleanup_for_test(mut self) -> Self {
+        self.fail_published_cleanup = true;
+        self
     }
 
     pub async fn get(&self, name: &str) -> Result<Option<Vec<u8>>> {
@@ -166,7 +197,17 @@ impl SecretStore {
         // A hard link publishes the fully-synced inode with create-new
         // semantics, so racing readers cannot observe a partial secret.
         match fs::hard_link(&temporary_path, &path).await {
-            Ok(()) => remove_published_temporary(name, &temporary_path).await,
+            Ok(()) => {
+                #[cfg(test)]
+                if self.fail_published_cleanup {
+                    return Err(SecretStoreError::PublishedTemporaryLeft {
+                        name: name.to_owned(),
+                        temporary_path,
+                        source: io::Error::other("injected cleanup failure"),
+                    });
+                }
+                remove_published_temporary(name, &temporary_path).await
+            }
             Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
                 Err(already_exists_error_after_cleanup(name, path, temporary_path, source).await)
             }
@@ -223,6 +264,85 @@ impl SecretStore {
             }
             Err(error) => Err(error),
         }
+    }
+
+    /// Removes `name` only when `matches` accepts the record found there, so a record that
+    /// replaced the expected one meanwhile is never removed. The record is first moved to a
+    /// private name (atomic), then checked; one that does not match is linked back without
+    /// replacing whatever was written under `name` in between. `false` when nothing was
+    /// removed.
+    pub(crate) async fn remove_if<F>(&self, name: &str, matches: F) -> Result<bool>
+    where
+        F: FnOnce(&[u8]) -> bool,
+    {
+        let path = self.secret_path(name)?;
+        let moved = self.temporary_path(name)?;
+        let persist = |operation: &'static str, path: &Path, source| SecretStoreError::Persist {
+            name: name.to_owned(),
+            path: path.to_path_buf(),
+            operation,
+            source,
+        };
+        match fs::rename(&path, &moved).await {
+            Ok(()) => {}
+            Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(source) => return Err(persist("move aside", &path, source)),
+        }
+        let matched = match fs::read(&moved).await {
+            Ok(value) => matches(&value),
+            Err(_) => false,
+        };
+        if !matched {
+            match fs::hard_link(&moved, &path).await {
+                // A newer record took the name meanwhile; the one moved aside is older still.
+                Ok(()) => {}
+                Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(source) => return Err(persist("restore", &path, source)),
+            }
+        }
+        fs::remove_file(&moved)
+            .await
+            .map_err(|source| persist("remove", &moved, source))?;
+        Ok(matched)
+    }
+
+    /// Removes `name`; `false` when it did not exist.
+    pub(crate) async fn remove(&self, name: &str) -> Result<bool> {
+        let path = self.secret_path(name)?;
+        match fs::remove_file(&path).await {
+            Ok(()) => Ok(true),
+            Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(source) => Err(SecretStoreError::Persist {
+                name: name.to_owned(),
+                path,
+                operation: "remove",
+                source,
+            }),
+        }
+    }
+
+    /// The names of the records in the store, sorted; temporary files are not records.
+    pub(crate) async fn names(&self) -> Result<Vec<String>> {
+        let enumerate = |source| SecretStoreError::Enumerate {
+            path: self.root.clone(),
+            source,
+        };
+        let mut entries = fs::read_dir(&self.root).await.map_err(enumerate)?;
+        let mut names = Vec::new();
+        while let Some(entry) = entries.next_entry().await.map_err(enumerate)? {
+            let Some(filename) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let is_file = entry.file_type().await.is_ok_and(|kind| kind.is_file());
+            if let Some(name) = filename.strip_suffix(SECRET_FILE_SUFFIX)
+                && is_file
+                && validate_name(name).is_ok()
+            {
+                names.push(name.to_owned());
+            }
+        }
+        names.sort();
+        Ok(names)
     }
 
     pub(crate) async fn prune_records_with_prefix<F>(
@@ -674,14 +794,13 @@ async fn already_exists_error_after_cleanup(
 }
 
 async fn remove_published_temporary(name: &str, temporary_path: &Path) -> Result<()> {
-    fs::remove_file(temporary_path)
-        .await
-        .map_err(|source| SecretStoreError::Persist {
+    fs::remove_file(temporary_path).await.map_err(|source| {
+        SecretStoreError::PublishedTemporaryLeft {
             name: name.to_owned(),
-            path: temporary_path.to_path_buf(),
-            operation: "remove published temporary link for",
+            temporary_path: temporary_path.to_path_buf(),
             source,
-        })
+        }
+    })
 }
 
 #[cfg(test)]
@@ -698,6 +817,59 @@ mod tests {
             .await
             .expect("create secret store");
         (temp_dir, store)
+    }
+
+    #[tokio::test]
+    async fn a_create_whose_temporary_link_stays_still_reports_the_secret_stored() {
+        let (_temp, store) = test_store().await;
+        let store = store.fail_published_cleanup_for_test();
+        let error = store
+            .create("record", b"value")
+            .await
+            .expect_err("cleanup fails");
+        assert!(error.is_published(), "{error}");
+        assert_eq!(
+            store.get("record").await.unwrap().as_deref(),
+            Some(&b"value"[..])
+        );
+        // A failure before publication is not reported as stored.
+        let error = store.create("record", b"other").await.expect_err("exists");
+        assert!(!error.is_published());
+    }
+
+    #[tokio::test]
+    async fn remove_if_removes_only_the_matching_record() {
+        let (_temp, store) = test_store().await;
+        store.create("remote", b"attempt-a").await.unwrap();
+        // Another attempt replaced the record: A's rollback must leave it.
+        assert!(store.remove("remote").await.unwrap());
+        store.create("remote", b"attempt-b").await.unwrap();
+        assert!(
+            !store
+                .remove_if("remote", |value| value == b"attempt-a")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store.get("remote").await.unwrap().as_deref(),
+            Some(&b"attempt-b"[..])
+        );
+        assert_eq!(store.names().await.unwrap(), ["remote"]);
+        assert!(
+            store
+                .remove_if("remote", |value| value == b"attempt-b")
+                .await
+                .unwrap()
+        );
+        assert!(store.get("remote").await.unwrap().is_none());
+        assert!(!store.remove_if("remote", |_| true).await.unwrap());
+        assert!(
+            std::fs::read_dir(store.root.as_path())
+                .unwrap()
+                .next()
+                .is_none(),
+            "nothing left behind"
+        );
     }
 
     #[tokio::test]

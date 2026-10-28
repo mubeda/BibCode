@@ -876,10 +876,13 @@ pub(crate) fn e2ee_authenticated_json(features: E2eeFeatures) -> Vec<u8> {
     serde_json::to_vec(&reply).expect("static JSON")
 }
 
+/// The pairing reply. `scopes` are the minted credential's (#202): a client that must hold
+/// only some scopes checks them before it keeps the credential. Servers before #202 omit them.
 pub(crate) fn e2ee_authenticated_with_credential_json(
     credential: &str,
     environment_id: &str,
     storage_instance_id: Option<&str>,
+    scopes: &[String],
     pairing_confirmation_required: bool,
     features: E2eeFeatures,
 ) -> Vec<u8> {
@@ -887,6 +890,7 @@ pub(crate) fn e2ee_authenticated_with_credential_json(
         "type": "e2ee_authenticated",
         "credential": credential,
         "environmentId": environment_id,
+        "scopes": scopes,
     });
     if let Some(storage_instance_id) = storage_instance_id {
         reply
@@ -1125,12 +1129,13 @@ pub(crate) async fn run_e2ee_session(
         let storage_instance_id = config.storage_instance_id.as_ref().map(ToString::to_string);
         let reply = match &accept {
             E2eeAccept::Authenticated {
+                principal,
                 minted: Some(minted),
-                ..
             } => e2ee_authenticated_with_credential_json(
                 &minted.credential,
                 &config.environment_id,
                 storage_instance_id.as_deref(),
+                &principal.scopes,
                 minted.delivery_guard.is_some(),
                 features,
             ),
@@ -2081,6 +2086,7 @@ mod tests {
                 "credential",
                 "environment",
                 None,
+                &[],
                 true,
                 E2eeFeatures::default(),
             ))
@@ -2092,11 +2098,13 @@ mod tests {
                 "credential",
                 "environment",
                 Some("storage"),
+                &["diagnostics:read".to_owned()],
                 true,
                 E2eeFeatures::default(),
             ))
             .expect("present storage reply");
         assert_eq!(present["storageInstanceId"], "storage");
+        assert_eq!(present["scopes"], json!(["diagnostics:read"]));
     }
 
     #[test]
@@ -2117,6 +2125,7 @@ mod tests {
                 "credential",
                 "environment",
                 None,
+                &[],
                 false,
                 E2eeFeatures {
                     interleave: true,
