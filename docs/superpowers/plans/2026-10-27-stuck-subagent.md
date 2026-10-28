@@ -168,7 +168,7 @@ admitted:
 ### E. Client reducer (reopen convergence)
 
 `resolveSummaryUpdate` refuses a terminal→non-terminal incremental update
-(`activityReducer.ts:129-131`). After this change, a Codex resume can still
+(`activityReducer.ts:132-134`). After this change, a Codex resume can still
 reopen an interrupted actor on the server with a newer provider timestamp
 (`provider/codex/activity.rs:945-955`). The client would then keep Interrupted
 while the server says running. Change: when an incoming non-terminal summary
