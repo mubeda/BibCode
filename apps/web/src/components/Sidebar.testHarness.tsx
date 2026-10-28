@@ -194,7 +194,7 @@ const h = vi.hoisted(() => {
     clearDraftThread: vi.fn(),
     clearProjectDraftThreadId: vi.fn(),
     openDiscoveredPort: vi.fn(),
-    useEnvironmentThread: vi.fn(),
+    usePrewarmEnvironmentThread: vi.fn(),
     autoAnimate: vi.fn(),
     pointerWithin: vi.fn(),
     closestCorners: vi.fn(),
@@ -471,7 +471,7 @@ vi.mock("../state/threads", () => ({
     create: { label: "thread.create" },
     unarchive: { label: "thread.unarchive" },
   },
-  useEnvironmentThread: h.spies.useEnvironmentThread,
+  usePrewarmEnvironmentThread: h.spies.usePrewarmEnvironmentThread,
 }));
 
 vi.mock("../state/vcs", () => ({

@@ -1,4 +1,4 @@
-import { useAtomValue } from "@effect/atom-react";
+import { useAtomMount, useAtomValue } from "@effect/atom-react";
 import { parseScopedThreadKey, scopedThreadKey } from "@bibcode/client-runtime/environment";
 import {
   createEnvironmentThreadDetailAtoms,
@@ -90,4 +90,20 @@ export function useEnvironmentThread(
     AsyncResult.value(result),
     () => EMPTY_ENVIRONMENT_THREAD_STATE,
   ) as EnvironmentThreadState;
+}
+
+/**
+ * Keeps a thread's stream subscription warm without reading its data. Mounting the atom holds
+ * the subscription (and its idle retention) while React holds no snapshot of the thread, unlike
+ * `useEnvironmentThread`, whose hook state keeps one earlier copy of the thread alive.
+ */
+export function usePrewarmEnvironmentThread(
+  environmentId: EnvironmentId | null,
+  threadId: ThreadId | null,
+): void {
+  useAtomMount(
+    environmentId !== null && threadId !== null
+      ? environmentThreads.stateAtom(environmentId, threadId)
+      : EMPTY_THREAD_STATE_ATOM,
+  );
 }
