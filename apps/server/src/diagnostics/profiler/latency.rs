@@ -117,7 +117,6 @@ pub fn is_long_running(method: &str) -> bool {
             // The diagnostics relay waits on a person approving it, then on the command
             // reading each item (#201).
             | "server.subscribeDiagnosticLogsRelay"
-            | "server.claimDiagnosticLogsRelay"
             | "server.sendDiagnosticLogsRelayItem"
             | "vcs.pull"
             | "vcs.generateCommitMessage"

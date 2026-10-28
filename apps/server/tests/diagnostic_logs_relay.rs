@@ -8,7 +8,7 @@ use std::{collections::VecDeque, net::SocketAddr, path::PathBuf, time::Duration}
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use bibcode_server::{
     ServerConfig, ServerHandle, ServerRuntime,
-    diagnostics::relay_cli::{Outcome, download},
+    diagnostics::relay_cli::{DownloadRequest, Outcome, download},
 };
 use futures_util::SinkExt as _;
 use serde_json::{Value, json};
@@ -224,7 +224,26 @@ fn spawn_command(
     let state = hosts.local_state.clone();
     let output = output.path().to_owned();
     let environment = environment.to_owned();
-    tokio::spawn(async move { download(&state, &environment, false, &output, &mut || {}).await })
+    tokio::spawn(async move { command(&state, &environment, &output).await })
+}
+
+async fn command(state: &std::path::Path, environment: &str, output: &std::path::Path) -> Outcome {
+    download(
+        state,
+        &DownloadRequest {
+            environment,
+            include_crash_dumps: false,
+            output,
+            code: "K7Q-4M",
+        },
+        &mut || {},
+    )
+    .await
+}
+
+async fn expect_claimed(app: &mut Rpc, subscription: &str, request_id: &Value) {
+    let event = app.stream_item(subscription).await.expect("claimed");
+    assert_eq!(event, json!({ "_tag": "Claimed", "requestId": request_id }));
 }
 
 async fn pending(app: &mut Rpc, subscription: &str) -> Value {
@@ -301,6 +320,15 @@ async fn an_approved_request_saves_the_remote_environments_bundle() {
     let request = pending(&mut app, &subscription).await;
     assert_eq!(request["environment"], "Omarchy");
     assert_eq!(request["includeCrashDumps"], false);
+    // What the prompt shows: the command's code and the directory it saves in.
+    assert_eq!(request["code"], "K7Q-4M");
+    assert_eq!(
+        request["outputDirectory"],
+        std::fs::canonicalize(output.path())
+            .expect("output")
+            .display()
+            .to_string()
+    );
     let request_id = request["requestId"]
         .as_str()
         .expect("request id")
@@ -361,6 +389,7 @@ async fn an_approved_request_saves_the_remote_environments_bundle() {
         inner["storageInstanceId"], hosts.remote_storage_id,
         "the remote's logs, not this host's"
     );
+    expect_claimed(&mut app, &subscription, &json!(request_id)).await;
     assert_eq!(
         app.stream_item(&subscription).await.expect("closed")["_tag"],
         "Closed"
@@ -453,6 +482,7 @@ async fn the_command_leaving_tells_the_app_to_stop() {
     )
     .await
     .expect("claim");
+    expect_claimed(&mut app, &subscription, &request_id).await;
     // Ctrl-C: the command's connection closes.
     command.abort();
     let closed = app.stream_item(&subscription).await.expect("closed");
@@ -514,14 +544,7 @@ async fn an_administrative_session_that_is_not_the_desktop_app_cannot_serve() {
 
     // With no desktop window subscribed, the command learns it at once.
     let output = TempDir::new().expect("output");
-    let outcome = download(
-        &hosts.local_state,
-        "Omarchy",
-        false,
-        output.path(),
-        &mut || {},
-    )
-    .await;
+    let outcome = command(&hosts.local_state, "Omarchy", output.path()).await;
     assert!(
         matches!(&outcome, Outcome::Unavailable { reason, .. } if reason == "no-app"),
         "{outcome:?}"
@@ -547,5 +570,41 @@ async fn the_relay_route_needs_the_endpoint_token() {
         reqwest::StatusCode::UNAUTHORIZED,
         "a session token is not the command's token"
     );
+    shutdown(hosts).await;
+}
+
+#[tokio::test]
+async fn a_request_through_a_local_proxy_is_refused() {
+    let hosts = hosts().await;
+    let endpoint: Value = serde_json::from_slice(
+        &std::fs::read(hosts.local_state.join("diagnostics-relay.json")).expect("endpoint"),
+    )
+    .expect("endpoint JSON");
+    let token = endpoint["token"].as_str().expect("token");
+    // Tailscale Serve or another reverse proxy on this host forwards a remote request from a
+    // loopback socket; its headers give it away.
+    for (name, value) in [
+        ("x-forwarded-for", "100.64.0.7"),
+        ("forwarded", "for=100.64.0.7"),
+        ("x-forwarded-host", "laptop.tailnet.ts.net"),
+        ("tailscale-user-login", "someone@example.com"),
+    ] {
+        let response = reqwest::Client::new()
+            .post(format!(
+                "http://{}/api/diagnostics/relay",
+                hosts.local.local_addr()
+            ))
+            .bearer_auth(token)
+            .header(name, value)
+            .json(&json!({
+                "environment": "Omarchy",
+                "code": "K7Q-4M",
+                "outputDirectory": "/tmp",
+            }))
+            .send()
+            .await
+            .expect("relay request");
+        assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN, "{name}");
+    }
     shutdown(hosts).await;
 }
