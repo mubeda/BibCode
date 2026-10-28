@@ -8654,10 +8654,14 @@ async fn assert_capability_downgrade_preserves_history(history: RetainedActivity
     let snapshot = activity.snapshot(&scope).await.unwrap();
     assert_eq!(snapshot.capabilities, ActivityCapabilities::none());
     assert_eq!(snapshot.observation_state, ActivityObservationState::Live);
+    // The restart ended the process that ran it (#206): the history stays, closed.
     match history {
         RetainedActivityHistory::Actor => {
-            assert_eq!(snapshot.counts.subagents.active, 1);
-            assert!(snapshot.actors.iter().any(|actor| actor.id == record_id));
+            assert_eq!(snapshot.counts.subagents.active, 0);
+            assert_eq!(snapshot.counts.subagents.done, 1);
+            assert!(snapshot.actors.iter().any(
+                |actor| actor.id == record_id && actor.status == ActivityLifecycle::Interrupted
+            ));
             assert_eq!(
                 snapshot.sections.subagents.state,
                 ActivitySectionObservationState::Stale
@@ -8668,12 +8672,14 @@ async fn assert_capability_downgrade_preserves_history(history: RetainedActivity
             );
         }
         RetainedActivityHistory::WorkItem => {
-            assert_eq!(snapshot.counts.background_tasks.active, 1);
+            assert_eq!(snapshot.counts.background_tasks.active, 0);
+            assert_eq!(snapshot.counts.background_tasks.done, 1);
             assert!(
                 snapshot
                     .work_items
                     .iter()
-                    .any(|work_item| work_item.id == record_id)
+                    .any(|work_item| work_item.id == record_id
+                        && work_item.status == ActivityLifecycle::Interrupted)
             );
             assert_eq!(
                 snapshot.sections.background_tasks.state,
