@@ -3457,14 +3457,19 @@ The fixture Codex provider then answers its diagram prompts in the timeline: a
 edge, and on one in a row wholly above the viewport, moves a reading-anchor
 paragraph by at most 1 px; a short reply's diagram drawing under its sent
 message leaves that message within 1 px of the sent-row offset, measured from
-the scroller's top; and selecting an earlier
+the scroller's top, when the turn fits above the bottom region (on a small
+screen with the Activity card above the composer it may not; the turn then
+follows its end, so the message must rest no lower than the offset and the
+end must show; `mermaid-timeline-sent-row.json` records about 600 ms of
+painted frames of both); and selecting an earlier
 message with the minimap keyboard lands it at the minimap's offset past that
 diagram and keeps it there (`mermaid-timeline-minimap-landing.json`). After a
 reply with 101 diagrams, reopening the chat draws the evicted diagram (the
 reply's last, which the queue drew first) again through the queue, holding its
 source at the diagram's drawn height meanwhile, and every painted frame of the
 reopened chat shows the reply's last line at its end, within 1 px of where it
-rests. The scenario keeps a per-sample trace of the last line, on a timer and
+rests against the bottom region (which can grow once the reopened chat's
+Activity card arrives; the end moves up with it in the same frame). The scenario keeps a per-sample trace of the last line, on a timer and
 after each painted frame, as `mermaid-timeline-evicted-remount.json`. A second
 reply of 101 diagrams then evicts every earlier one; scrolling up remounts the
 rows reply, whose diagram shows its source and draws again above the message
