@@ -867,6 +867,9 @@ type SessionPublicationFence = Arc<Mutex<SessionPublicationState>>;
 struct SessionEntry {
     launch: ProviderLaunchRequest,
     driver: Arc<dyn ProviderDriver>,
+    /// Holds queued messages while a resumed session reads the asks its provider kept (#187);
+    /// released by that read finishing or by the session ending.
+    _ask_recovery: Option<crate::orchestration::AskRecoveryHold>,
     /// Settles what the session leaves streaming once its pump is reaped, whoever detaches it.
     engine: OrchestrationEngine,
     configuration_healthy: bool,
@@ -8237,6 +8240,13 @@ async fn launch_session(
         runtime_payload_with_context_handoff(started.runtime_payload.clone(), context_handoff),
     )
     .await?;
+    // A resumed OpenCode session may hold asks BiBCode never recorded, shown only once its
+    // event stream has read them: queued messages wait for that read to finish (#187).
+    let ask_recovery = (crate::orchestration::EXTERNALLY_RESUMABLE_PROVIDERS
+        .contains(&request.provider.as_str())
+        && request.resume_cursor.is_some()
+        && !resume_lost)
+        .then(|| engine.hold_promotion_for_ask_recovery(&request.thread_id));
     dispatch_session_state(engine, &request, "ready", None, None, None).await?;
     if resume_lost {
         append_context_handoff_activity(engine, &request).await;
@@ -8279,6 +8289,7 @@ async fn launch_session(
         SessionEntry {
             launch: request,
             driver,
+            _ask_recovery: ask_recovery,
             engine: engine.clone(),
             configuration_healthy: true,
             resume_cursor: started.resume_cursor,
@@ -10854,6 +10865,12 @@ async fn project_provider_event(
             .await
             .map_err(|error| ProviderRuntimeError::Persistence(error.to_string()))?
     {
+        return Ok(());
+    }
+    // A resumed session's first read of the asks its provider kept finished, completed or not:
+    // the asks it found are projected, so queued messages may be promoted (#187).
+    if event.event_type == "requests.recovery-read" {
+        engine.release_promotion_after_ask_recovery(&launch.thread_id);
         return Ok(());
     }
     // A provider that keeps its asks across restarts (OpenCode) read its pending lists in full:
@@ -25578,6 +25595,67 @@ done
         assert_eq!(first.lock().unwrap().shutdowns, 1);
         assert_eq!(second.lock().unwrap().shutdowns, 1);
         engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_resumed_opencode_launch_holds_promotion_until_its_first_ask_read_finishes() {
+        // Mutation caught: a resumed OpenCode session's queue promoted before its first read of
+        // the asks OpenCode kept, or a hold left on a fresh start (#187).
+        // The fixture driver always resumes `unit-session`.
+        let resumed = || Some(json!({"threadId":"unit-session"}));
+        for (provider, resume, held) in [
+            ("opencode", resumed(), true),
+            ("opencode", None, false),
+            ("opencode", Some(json!({"threadId":"lost-session"})), false),
+            ("codex", resumed(), false),
+        ] {
+            let engine = supervisor_engine().await;
+            let (events_tx, events_rx) = mpsc::channel(4);
+            let supervisor = super::ProviderRuntimeSupervisor::start(
+                engine.clone(),
+                Arc::new(SupervisorFactory {
+                    state: Arc::new(StdMutex::new(SupervisorDriverState::default())),
+                    events: StdMutex::new(Some(events_rx)),
+                }),
+                super::ActivityProjection::new(ActivityRepository::new(
+                    engine.repositories().database().clone(),
+                )),
+                super::SupervisorOptions::default(),
+            );
+            let temp = TempDir::new().expect("launch directory");
+            let mut launch = native_launch(&temp, provider);
+            launch.thread_id = "t1".to_owned();
+            let label = format!("{provider} {resume:?}");
+            launch.resume_cursor = resume;
+            supervisor.launch(launch).await.expect("launch runtime");
+            assert_eq!(
+                engine.promotion_held_for_ask_recovery("t1"),
+                held,
+                "{label}"
+            );
+            events_tx
+                .send(super::ProviderEvent {
+                    native_event_id: None,
+                    event_type: "requests.recovery-read".to_owned(),
+                    thread_id: "t1".to_owned(),
+                    turn_id: None,
+                    item_id: None,
+                    request_id: None,
+                    payload: json!({}),
+                    activity: Vec::new(),
+                    activity_controls: super::ProviderActivityControls::default(),
+                })
+                .await
+                .expect("recovery read event");
+            timeout(Duration::from_secs(2), async {
+                while engine.promotion_held_for_ask_recovery("t1") {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{label}: the finished read releases the queue"));
+            engine.shutdown().await;
+        }
     }
 
     #[tokio::test]

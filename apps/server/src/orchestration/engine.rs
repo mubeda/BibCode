@@ -1957,8 +1957,47 @@ pub struct OrchestrationEngine {
     workspace_ownership: WorkspaceOwnershipFence,
     thread_turns: ThreadTurnFence,
     compaction_waiters: CompactionWaiters,
+    ask_recovery_holds: AskRecoveryHolds,
     #[cfg(test)]
     test_hooks: TestHooks,
+}
+
+/// Threads whose resumed session has not yet read the asks its provider kept (#187), each with
+/// the id of the hold that owns it.
+#[derive(Clone, Default)]
+struct AskRecoveryHolds {
+    threads: Arc<StdMutex<(u64, HashMap<String, u64>)>>,
+}
+
+/// Holds a thread's automatic queue promotion while its resumed session reads the asks its
+/// provider kept: one it never recorded must be shown before a queued follow-up goes. The
+/// read finishing, completed or failed, releases it; dropping it (the session ended) does too.
+pub(crate) struct AskRecoveryHold {
+    engine: OrchestrationEngine,
+    thread_id: String,
+    id: u64,
+}
+
+impl Drop for AskRecoveryHold {
+    fn drop(&mut self) {
+        let released = {
+            let mut holds = self
+                .engine
+                .ask_recovery_holds
+                .threads
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if holds.1.get(&self.thread_id) == Some(&self.id) {
+                holds.1.remove(&self.thread_id);
+                true
+            } else {
+                false
+            }
+        };
+        if released {
+            self.engine.wake_turn_delivery();
+        }
+    }
 }
 
 impl OrchestrationEngine {
@@ -1998,6 +2037,7 @@ impl OrchestrationEngine {
             workspace_ownership: WorkspaceOwnershipFence::default(),
             thread_turns: ThreadTurnFence::default(),
             compaction_waiters: CompactionWaiters::default(),
+            ask_recovery_holds: AskRecoveryHolds::default(),
             #[cfg(test)]
             test_hooks: options.test_hooks,
         })
@@ -2647,6 +2687,50 @@ impl OrchestrationEngine {
     /// Whether a revert or turn delivery of the thread runs now.
     pub(crate) fn thread_turns_reserved(&self, thread_id: &str) -> bool {
         self.thread_turns.is_reserved(thread_id)
+    }
+
+    /// Holds the thread's automatic queue promotion until its resumed session has read the asks
+    /// its provider kept. See `AskRecoveryHold`.
+    pub(crate) fn hold_promotion_for_ask_recovery(&self, thread_id: &str) -> AskRecoveryHold {
+        let mut holds = self
+            .ask_recovery_holds
+            .threads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        holds.0 = holds.0.wrapping_add(1);
+        let id = holds.0;
+        holds.1.insert(thread_id.to_owned(), id);
+        AskRecoveryHold {
+            engine: self.clone(),
+            thread_id: thread_id.to_owned(),
+            id,
+        }
+    }
+
+    /// The thread's session finished reading the asks its provider kept: queued messages may be
+    /// promoted again.
+    pub(crate) fn release_promotion_after_ask_recovery(&self, thread_id: &str) {
+        let released = self
+            .ask_recovery_holds
+            .threads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .1
+            .remove(thread_id)
+            .is_some();
+        if released {
+            self.wake_turn_delivery();
+        }
+    }
+
+    /// Whether the thread's automatic queue promotion waits on an ask recovery.
+    pub(crate) fn promotion_held_for_ask_recovery(&self, thread_id: &str) -> bool {
+        self.ask_recovery_holds
+            .threads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .1
+            .contains_key(thread_id)
     }
 
     /// Where the event pump reports a compaction's tagged turn to the compaction effect.

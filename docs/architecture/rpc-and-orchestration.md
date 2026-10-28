@@ -2660,6 +2660,17 @@ Requests also settle without an answer:
 
 Queue consequence: an open request holds queued follow-ups until it is answered
 or expires, exactly as before #187; an expiry wakes the delivery service.
+
+A resumed OpenCode session may hold an ask BiBCode never recorded, which it shows
+only after its first read of the pending lists since subscribing. Until that
+read finishes, the engine holds the thread's automatic queue promotion
+(`AskRecoveryHold`, held by the session). The read reports
+`requests.recovery-read` after showing what it found, completed or failed, which
+releases the hold; so does the session ending. There is no timer: a failed read
+releases the queue with today's behavior. Every completed read, the resume's,
+the first after subscribing and each retry, reports `requests.listed`. An
+OpenCode 2 subagent list answered without its `data` array leaves the tree read
+incomplete.
 `orchestration.replayEvents` with `paged: true` returns about 1 MiB pages
 `{ events, exhausted }`, keeping at least one event when any remain. Replay
 resumes from the last applied `sequence` with no server state; the cursor is

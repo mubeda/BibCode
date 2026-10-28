@@ -229,6 +229,39 @@ async fn no_promotion_while_approval_or_user_input_pending() {
 }
 
 #[tokio::test]
+async fn a_resumed_session_reading_its_asks_holds_the_follow_up_until_the_read_finishes() {
+    // Mutation caught: a resumed OpenCode session turning `ready` sends a queued follow-up
+    // before its first read has shown an ask BiBCode never recorded (#187).
+    for read_finds_an_ask in [true, false] {
+        let engine = engine().await;
+        session_as(&engine, "running", "running", "opencode").await;
+        enqueue(&engine, "queued", true).await;
+        session_as(&engine, "stopped", "suspended", "opencode").await;
+        let hold = engine.hold_promotion_for_ask_recovery("t");
+        session_as(&engine, "ready", "relaunch", "opencode").await;
+        let (service, mut routes) = service(&engine);
+        quiet(&mut routes).await;
+        if read_finds_an_ask {
+            // The read shows the ask, then reports it finished: the ask holds the queue.
+            activity(&engine, "approval.requested", "request-recovered").await;
+            engine.release_promotion_after_ask_recovery("t");
+            quiet(&mut routes).await;
+            assert_eq!(
+                row(&engine, "queued").await.state,
+                TurnDeliveryState::Queued
+            );
+        } else {
+            // The read failed: it releases the queue, today's behavior without a read.
+            engine.release_promotion_after_ask_recovery("t");
+            received(&mut routes, "queued").await;
+        }
+        drop(hold);
+        service.shutdown().await;
+        engine.shutdown().await;
+    }
+}
+
+#[tokio::test]
 async fn an_opencode_ask_holds_the_follow_up_until_a_completed_read_drops_it() {
     // Mutation caught: a relaunch, or a resume whose read of OpenCode's pending lists failed,
     // releasing a follow-up past an ask the OpenCode server may still hold (#187).

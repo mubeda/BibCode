@@ -977,13 +977,7 @@ impl OpenCodeSessionRuntime {
         // A completed read of the pending lists proves that an ask BiBCode still shows but
         // OpenCode no longer lists cannot be answered; a read that failed proves nothing (#187).
         if let Some(listed) = listed {
-            self.emit(
-                "requests.listed",
-                None,
-                None,
-                json!({ "requestIds": listed }),
-            )
-            .await;
+            self.emit_listed(listed).await;
         }
         // OpenCode does not replay asks made while BiBCode was away; they are shown once the
         // event stream connects (see `v1_show_recovered_asks` and `v2_show_recovered_asks`).
@@ -3242,9 +3236,18 @@ impl OpenCodeSessionRuntime {
                 .and_then(|url| append_query_pair(url, "parentID", &parent))
             {
                 Ok(url) => url,
-                Err(_) => break,
+                Err(_) => {
+                    complete = false;
+                    break;
+                }
             };
-            let Some(children) = self.v2_get_json(url).await else {
+            // Only a well-formed list is authoritative: a response without its `data` array
+            // lists nothing, so the read is incomplete, never complete and empty (#187).
+            let Some(children) = self
+                .v2_get_json(url)
+                .await
+                .and_then(|children| children.get("data").and_then(Value::as_array).cloned())
+            else {
                 tracing::warn!(
                     provider = "opencode",
                     "a resumed OpenCode 2 session's subagents could not be listed"
@@ -3253,10 +3256,7 @@ impl OpenCodeSessionRuntime {
                 continue;
             };
             let found = children
-                .get("data")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
+                .iter()
                 .filter_map(|child| child.get("id").and_then(Value::as_str))
                 .filter(|child| valid_key(child))
                 .map(str::to_owned)
@@ -3484,6 +3484,7 @@ impl OpenCodeSessionRuntime {
 
     async fn v1_show_recovered_asks(&self, asks: Vec<(&'static str, String, Value)>) {
         let Ok(session_id) = self.session_id().await else {
+            self.emit_recovery_read().await;
             return;
         };
         // Each list read afresh, now that the event stream is subscribed; `None` when it could
@@ -3533,6 +3534,10 @@ impl OpenCodeSessionRuntime {
             }
         }
         self.v1_route_listed(&session_id, &fresh).await;
+        self.emit_v1_listed(&fresh).await;
+        // The first read since the subscription finished, completed or not: the asks it found
+        // are shown, so queued messages may go (#187).
+        self.emit_recovery_read().await;
         // A list that could not be read is read again with a backoff, each failure logged, so
         // the asks it holds still appear.
         let mut delay = RESUME_READ_RETRY_FIRST;
@@ -3555,8 +3560,41 @@ impl OpenCodeSessionRuntime {
             attempt += 1;
             fresh = self.v1_read_pending_lists().await;
             self.v1_route_listed(&session_id, &fresh).await;
+            self.emit_v1_listed(&fresh).await;
         }
         self.inner.v2.lock().await.v1_settled.clear();
+    }
+
+    /// Reports, after a read of both OpenCode 1 lists, the id of every ask they list, any
+    /// session's, as OpenCode's ids are unique; a list that could not be read reports nothing.
+    async fn emit_v1_listed(&self, lists: &HashMap<&'static str, Option<Vec<Value>>>) {
+        let mut listed = Vec::new();
+        for path in ["/permission", "/question"] {
+            let Some(Some(requests)) = lists.get(path) else {
+                return;
+            };
+            listed.extend(requests.iter().filter_map(v1_request_id).map(str::to_owned));
+        }
+        self.emit_listed(listed).await;
+    }
+
+    /// Reports the asks a completed read of the provider's pending lists holds, so the server
+    /// expires the ones it shows that are gone (#187).
+    async fn emit_listed(&self, listed: Vec<String>) {
+        self.emit(
+            "requests.listed",
+            None,
+            None,
+            json!({ "requestIds": listed }),
+        )
+        .await;
+    }
+
+    /// Reports that a resumed session's first read of its pending asks since subscribing
+    /// finished, completed or failed, after showing what it found (#187).
+    async fn emit_recovery_read(&self) {
+        self.emit("requests.recovery-read", None, None, json!({}))
+            .await;
     }
 
     /// OpenCode 1's pending permission and question lists, each read bounded; `None` for one
@@ -3770,11 +3808,19 @@ impl OpenCodeSessionRuntime {
     /// attempts run out. Newly found asks are shown (or, if BiBCode cannot show them, cancelled).
     async fn v2_read_asks_again(&self) {
         let Ok(root_session_id) = self.session_id().await else {
+            self.emit_recovery_read().await;
             return;
         };
         let mut delay = RESUME_READ_RETRY_FIRST;
         for attempt in 1..=RESUME_READ_ATTEMPTS {
             let (complete, pending) = self.v2_read_pending_asks(&root_session_id).await;
+            let listed = complete.then(|| {
+                pending
+                    .iter()
+                    .filter_map(|(_, _, ask)| ask.get("id").and_then(Value::as_str))
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            });
             let (asks, unanswerable) = self.v2_route_pending_asks(pending).await;
             for (event_type, request_id, ask) in asks {
                 // Shown while still routed, under the lock its settlement takes.
@@ -3787,6 +3833,14 @@ impl OpenCodeSessionRuntime {
             for (form_id, session_id) in unanswerable {
                 self.spawn_v2_cancel_unanswerable_form(form_id, session_id, None)
                     .await;
+            }
+            if let Some(listed) = listed {
+                self.emit_listed(listed).await;
+            }
+            // The first read since the subscription finished, completed or not: the asks it
+            // found are shown, so queued messages may go (#187).
+            if attempt == 1 {
+                self.emit_recovery_read().await;
             }
             if complete {
                 return;
@@ -6376,6 +6430,114 @@ mod tests {
         }
     }
 
+    /// A resumed OpenCode 1 session's first read since subscribing shows an ask BiBCode never
+    /// recorded before it reports the read finished, which releases queued messages; a failed
+    /// first read releases them too, and the retry that completes lists its asks (#187).
+    #[tokio::test]
+    async fn opencode_1_first_recovery_read_shows_new_asks_then_releases_and_retries_list() {
+        for first_read_fails in [false, true] {
+            let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let app = Router::new()
+                .route(
+                    "/permission",
+                    get({
+                        let reads = reads.clone();
+                        move || {
+                            let reads = reads.clone();
+                            async move {
+                                if first_read_fails
+                                    && reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0
+                                {
+                                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                                }
+                                Json(json!([
+                                    { "id": "per_new", "sessionID": "session-1", "permission": "bash" }
+                                ]))
+                                .into_response()
+                            }
+                        }
+                    }),
+                )
+                .route("/question", get(|| async { Json(json!([])) }));
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let address = listener.local_addr().expect("address");
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.expect("serve");
+            });
+            let runtime = super::OpenCodeSessionRuntime::new(
+                &format!("http://{address}"),
+                "unit-thread",
+                "/tmp/unit",
+                None,
+            );
+            *runtime.inner.session_id.lock().await = Some("session-1".to_owned());
+
+            runtime.v1_show_recovered_asks(Vec::new()).await;
+            let mut events = Vec::new();
+            while let Ok(Some(event)) =
+                tokio::time::timeout(std::time::Duration::from_millis(50), runtime.next_event())
+                    .await
+            {
+                events.push((event.event_type, event.request_id));
+            }
+            let event = |event_type: &str, request_id: Option<&str>| {
+                (event_type.to_owned(), request_id.map(str::to_owned))
+            };
+            let expected = if first_read_fails {
+                vec![
+                    // The failed read released the queue: today's behavior without a read.
+                    event("requests.recovery-read", None),
+                    event("request.opened", Some("per_new")),
+                    event("requests.listed", None),
+                ]
+            } else {
+                vec![
+                    event("request.opened", Some("per_new")),
+                    event("requests.listed", None),
+                    event("requests.recovery-read", None),
+                ]
+            };
+            assert_eq!(events, expected, "first read fails: {first_read_fails}");
+            server.abort();
+        }
+    }
+
+    /// A subagent list answered without its `data` array is not an empty list: the tree read is
+    /// incomplete, so it never expires an ask a subagent may hold (#187).
+    #[tokio::test]
+    async fn a_malformed_opencode_2_subagent_list_leaves_the_tree_read_incomplete() {
+        for (children, complete) in [(json!({"data": []}), true), (json!({"ok": true}), false)] {
+            let app = Router::new()
+                .route(
+                    "/api/session",
+                    get(move || {
+                        let children = children.clone();
+                        async move { Json(children) }
+                    }),
+                )
+                .route(
+                    "/api/session/{session_id}/{kind}",
+                    get(|| async { Json(json!({"data": []})) }),
+                );
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let address = listener.local_addr().expect("address");
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.expect("serve");
+            });
+            let runtime = super::OpenCodeSessionRuntime::new(
+                &format!("http://{address}"),
+                "unit-thread",
+                "/tmp/unit",
+                None,
+            );
+            runtime.use_v2_api();
+            let (read_complete, asks) = runtime.v2_read_pending_asks("session-1").await;
+            assert_eq!(read_complete, complete);
+            assert!(asks.is_empty());
+            server.abort();
+        }
+    }
+
     /// A recovery read that still lists an ask the event stream already settled, routed or not,
     /// does not show it again.
     #[tokio::test]
@@ -6422,6 +6584,15 @@ mod tests {
         let resolved = runtime.next_event().await.expect("resolution");
         assert_eq!(resolved.event_type, "request.resolved");
         runtime.v1_show_recovered_asks(Vec::new()).await;
+        // The completed read reports what it lists, then that the recovery read finished (#187).
+        let listed = runtime.next_event().await.expect("listed");
+        assert_eq!(listed.event_type, "requests.listed");
+        assert_eq!(
+            listed.payload["requestIds"],
+            json!(["per_routed", "per_unrouted"])
+        );
+        let read = runtime.next_event().await.expect("recovery read");
+        assert_eq!(read.event_type, "requests.recovery-read");
         assert_no_queued_event(&runtime).await;
         assert!(runtime.inner.pending_permissions.lock().await.is_empty());
         server.abort();
