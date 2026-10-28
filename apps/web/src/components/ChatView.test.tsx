@@ -36,6 +36,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test"
 import {
   ApprovalRequestId,
   ActivityError,
+  EventId,
   type ActivityActorSummary,
   type ActivityEntry,
   ActivityRecordId,
@@ -770,6 +771,7 @@ import type { ProviderInstanceEntry } from "../providerInstances";
 import type { ChatComposerHandle } from "./chat/ChatComposer";
 import type { ComposerBannerStackItem } from "./chat/ComposerBannerStack";
 import { FileEditingSessionRegistry } from "./files/fileEditingSessionRegistry";
+import { toastManager } from "./ui/toast";
 import type {
   ActivityDetailPageData,
   ActivityPanelProps,
@@ -5572,7 +5574,7 @@ describe("ChatView handlers (captured from mocked children)", () => {
     expect(typeof setThreadError).toBe("function");
   });
 
-  it("onSend is a no-op when the environment is unavailable", async () => {
+  function seedUnavailableServerThread(): void {
     seedEnvironment(
       makeEnvironmentPresentation({
         connection: { phase: "error", error: "socket closed", traceId: null },
@@ -5581,18 +5583,210 @@ describe("ChatView handlers (captured from mocked children)", () => {
     seedProject(makeProject());
     seedServerThread(makeThread());
     seedGitStatus(true);
+  }
 
-    renderServerRoute();
-    const composer = capturedProps<Record<string, unknown>>("chatComposer");
-    const composerRef = composer["composerRef"] as RefObject<ChatComposerHandle | null>;
-    composerRef.current = composerHandle();
-    const promptRef = composer["promptRef"] as RefObject<string>;
-    promptRef.current = "hello";
+  it("onSend refuses while the environment is unavailable, says why, and keeps the prompt", async () => {
+    seedUnavailableServerThread();
+    const add = vi.spyOn(toastManager, "add").mockReturnValue("refusal-toast");
+    const close = vi.spyOn(toastManager, "close").mockImplementation(() => undefined);
+    try {
+      renderServerRoute();
+      const composer = capturedProps<Record<string, unknown>>("chatComposer");
+      const composerRef = composer["composerRef"] as RefObject<ChatComposerHandle | null>;
+      composerRef.current = composerHandle();
+      const promptRef = composer["promptRef"] as RefObject<string>;
+      promptRef.current = "hello";
 
-    const onSend = composer["onSend"] as () => Promise<void>;
-    await onSend();
+      const onSend = composer["onSend"] as () => Promise<void>;
+      await onSend();
+      await onSend();
 
-    expect(commandCallsFor("thread.startTurn")).toHaveLength(0);
+      expect(commandCallsFor("thread.startTurn")).toHaveLength(0);
+      expect(promptRef.current).toBe("hello");
+      // The refusal names what the banner shows; a repeat replaces it rather than stacking.
+      expect(add).toHaveBeenCalledTimes(2);
+      expect(add.mock.calls[0]![0]).toMatchObject({
+        type: "warning",
+        title: "Local: Connection failed",
+        description: "socket closed",
+      });
+      expect(close).toHaveBeenCalledWith("refusal-toast");
+    } finally {
+      add.mockRestore();
+      close.mockRestore();
+    }
+  });
+
+  it("refuses approval decisions while the environment is unavailable", async () => {
+    seedUnavailableServerThread();
+    const add = vi.spyOn(toastManager, "add").mockReturnValue("refusal-toast");
+    try {
+      renderServerRoute();
+      const composer = capturedProps<Record<string, unknown>>("chatComposer");
+      const onRespondToApproval = composer["onRespondToApproval"] as (
+        requestId: ApprovalRequestId,
+        decision: string,
+      ) => Promise<unknown>;
+      await onRespondToApproval(ApprovalRequestId.make("approval-1"), "accept");
+      await onRespondToApproval(ApprovalRequestId.make("approval-1"), "cancel");
+
+      expect(commandCallsFor("thread.respondToApproval")).toHaveLength(0);
+      expect(commandCallsFor("thread.interruptTurn")).toHaveLength(0);
+      expect(add).toHaveBeenCalledTimes(2);
+      expect(
+        add.mock.calls.every(([options]) => options.title === "Local: Connection failed"),
+      ).toBe(true);
+    } finally {
+      add.mockRestore();
+    }
+  });
+
+  it("keeps a question and its answer when its timed advance fires while disconnected", async () => {
+    vi.unstubAllGlobals();
+    Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+    Object.defineProperty(Element.prototype, "getAnimations", {
+      configurable: true,
+      value: () => [],
+    });
+    seedEnvironment(
+      makeEnvironmentPresentation({
+        connection: { phase: "reconnecting", error: null, traceId: null },
+      }),
+    );
+    seedProject(makeProject());
+    seedServerThread(
+      makeThread({
+        activities: [
+          {
+            id: EventId.make("user-input-open"),
+            createdAt: now,
+            kind: "user-input.requested",
+            summary: "User input requested",
+            tone: "info",
+            payload: {
+              requestId: "input-1",
+              questions: [
+                {
+                  id: "mode",
+                  header: "Mode",
+                  question: "Which mode?",
+                  options: [{ label: "safe", description: "Read only" }],
+                  multiSelect: false,
+                },
+              ],
+            },
+            turnId: null,
+          },
+        ],
+      }),
+    );
+    seedGitStatus(true);
+    const add = vi.spyOn(toastManager, "add").mockReturnValue("refusal-toast");
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    try {
+      const view = (
+        <ChatView environmentId={environmentId} threadId={threadId} routeKind="server" />
+      );
+      await act(async () => root.render(view));
+      let composer = capturedProps<Record<string, unknown>>("chatComposer");
+      await act(async () => {
+        (composer["onSelectActivePendingUserInputOption"] as (q: string, o: string) => void)(
+          "mode",
+          "safe",
+        );
+      });
+      composer = capturedProps<Record<string, unknown>>("chatComposer");
+      // The option's timed advance calls this on the last question.
+      await act(async () => {
+        (composer["onAdvanceActivePendingUserInput"] as () => void)();
+      });
+
+      expect(commandCallsFor("thread.respondToUserInput")).toHaveLength(0);
+      expect(add.mock.calls[0]![0]).toMatchObject({ title: "Local: Reconnecting…" });
+      composer = capturedProps<Record<string, unknown>>("chatComposer");
+      expect(composer["pendingUserInputs"]).toHaveLength(1);
+      expect(composer["activePendingResolvedAnswers"]).toMatchObject({ mode: "safe" });
+      expect(composer["respondingRequestIds"]).toEqual([]);
+    } finally {
+      add.mockRestore();
+      await act(async () => root.unmount());
+      container.remove();
+    }
+  });
+
+  it("refuses a send for the thread whose environment is down while another is connected", async () => {
+    const remoteId = EnvironmentId.make("environment-remote");
+    const local = makeEnvironmentPresentation({
+      connection: { phase: "reconnecting", error: null, traceId: null },
+    });
+    const remote = makeEnvironmentPresentation({ environmentId: remoteId, label: "Remote" });
+    h.environments = [local, remote];
+    h.primaryEnvironment = remote;
+    seedProject(makeProject());
+    seedServerThread(makeThread());
+    seedGitStatus(true);
+    const add = vi.spyOn(toastManager, "add").mockReturnValue("refusal-toast");
+    try {
+      renderServerRoute();
+      const composer = capturedProps<Record<string, unknown>>("chatComposer");
+      expect(composer["environmentUnavailable"]).toMatchObject({
+        environmentId,
+        label: "Local",
+      });
+      (composer["composerRef"] as RefObject<ChatComposerHandle | null>).current = composerHandle();
+      (composer["promptRef"] as RefObject<string>).current = "for local";
+      await (composer["onSend"] as () => Promise<void>)();
+
+      expect(commandCallsFor("thread.startTurn")).toHaveLength(0);
+      expect(add.mock.calls[0]![0]).toMatchObject({ title: "Local: Reconnecting…" });
+    } finally {
+      add.mockRestore();
+    }
+  });
+
+  it("refuses a new chat's first send on its draft route while the environment is down", async () => {
+    seedEnvironment(
+      makeEnvironmentPresentation({
+        connection: { phase: "offline", error: null, traceId: null },
+      }),
+    );
+    seedProject(makeProject());
+    seedGitStatus(true);
+    const draftId = newDraftId();
+    useComposerDraftStore
+      .getState()
+      .setLogicalProjectDraftThreadId(
+        "logical-project-1",
+        scopeProjectRef(environmentId, projectId),
+        draftId,
+        { threadId, createdAt: now, envMode: "local" },
+      );
+    publishSeededStoreState(useComposerDraftStore);
+    const add = vi.spyOn(toastManager, "add").mockReturnValue("refusal-toast");
+    try {
+      renderToStaticMarkup(
+        <ChatView
+          environmentId={environmentId}
+          threadId={threadId}
+          routeKind="draft"
+          draftId={draftId}
+        />,
+      );
+      const composer = capturedProps<Record<string, unknown>>("chatComposer");
+      (composer["composerRef"] as RefObject<ChatComposerHandle | null>).current = composerHandle();
+      const promptRef = composer["promptRef"] as RefObject<string>;
+      promptRef.current = "first message";
+      await (composer["onSend"] as () => Promise<void>)();
+
+      expect(commandCallsFor("thread.startTurn")).toHaveLength(0);
+      expect(promptRef.current).toBe("first message");
+      expect(useComposerDraftStore.getState().getDraftSession(draftId)).not.toBeNull();
+      expect(add.mock.calls[0]![0]).toMatchObject({ title: "Local: Offline" });
+    } finally {
+      add.mockRestore();
+    }
   });
 
   it("onSend promotes a draft session by bootstrapping thread creation", async () => {
@@ -6540,6 +6734,62 @@ describe("ChatView send snapshot", () => {
     expect(startCalls[0]!.input).toMatchObject({
       input: { message: { text: "look at this screenshot" } },
     });
+  });
+
+  it("restores a send whose staging fails when the connection drops, and never resends it", async () => {
+    seedEnvironment(makeEnvironmentPresentation());
+    seedProject(makeProject());
+    seedServerThread(makeThread());
+    seedGitStatus(true);
+    const file = new File(["fake"], "shot.png", { type: "image/png" });
+    const image = { type: "image" as const, id: "img-1", name: file.name, mimeType: file.type };
+    const attachment = { ...image, sizeBytes: 4, file, previewUrl: "blob:shot" };
+    h.commandResults["thread.attachmentAdmissionAuthority"] = () =>
+      AsyncResult.success({ storageInstanceId: "test-store", hostIdentity: "test-host" });
+    let dropConnection: (() => void) | undefined;
+    h.commandResults["thread.stageAttachments"] = () =>
+      new Promise((resolve) => {
+        dropConnection = () =>
+          resolve(AsyncResult.failure(Cause.fail(new Error("The connection disconnected."))));
+      });
+    renderServerRoute();
+    const composer = capturedProps<Record<string, unknown>>("chatComposer");
+    (composer["composerAttachmentsRef"] as RefObject<unknown[]>).current = [attachment];
+    (composer["composerRef"] as RefObject<ChatComposerHandle | null>).current = {
+      focusAtEnd: () => undefined,
+      resetCursorState: () => undefined,
+      addTerminalContext: () => false,
+      getSendContext: () => ({
+        attachments: [attachment],
+        terminalContexts: [],
+        elementContexts: [],
+        previewAnnotations: [],
+        reviewComments: [],
+        selectedProvider: ProviderDriverKind.make("codex"),
+        selectedModel: "gpt-5.4",
+        selectedProviderModels: codexProvider.models,
+        selectedPromptEffort: null,
+        selectedModelSelection: { instanceId: codexInstanceId, model: "gpt-5.4" },
+      }),
+    } as unknown as ChatComposerHandle;
+    (composer["promptRef"] as RefObject<string>).current = "look at this";
+
+    const sending = (composer["onSend"] as () => Promise<void>)();
+    await vi.waitFor(() => expect(dropConnection).toBeTypeOf("function"));
+    dropConnection!();
+    await sending;
+
+    // The send cleared the composer before staging; the failure puts its content back.
+    const restored = useComposerDraftStore.getState().getComposerDraft(threadRef);
+    expect(restored?.prompt).toBe("look at this");
+    expect(restored?.attachments.map((entry) => entry.name)).toEqual(["shot.png"]);
+    expect(h.commandCalls.filter((call) => call.key === "thread.startTurn")).toHaveLength(0);
+
+    // Reconnecting does not resume it: only an explicit Send would.
+    seedEnvironment(makeEnvironmentPresentation());
+    renderServerRoute();
+    await Promise.resolve();
+    expect(h.commandCalls.filter((call) => call.key === "thread.startTurn")).toHaveLength(0);
   });
 
   it("restores a failed first send into its draft without copying the thread draft on screen", async () => {

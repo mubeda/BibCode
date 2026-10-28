@@ -1757,6 +1757,23 @@ function ChatViewContent(props: ChatViewProps) {
       connection: activeEnvironment.connection,
     };
   }, [activeEnvironment, activeEnvironmentUnavailable, activeEnvironmentUnavailableLabel]);
+  const environmentRefusalToastIdRef = useRef<string | null>(null);
+  /**
+   * Refuses an action that needs the server while the environment is not connected, stating
+   * what the composer banner shows. Returns true when it refused. Nothing is queued: the
+   * draft, the question and its answers stay as they are for the person to resend (#199).
+   */
+  const refuseWhileEnvironmentUnavailable = useCallback((): boolean => {
+    if (!activeEnvironmentUnavailableState) return false;
+    const copy = describeUnavailableEnvironment(activeEnvironmentUnavailableState);
+    if (environmentRefusalToastIdRef.current !== null) {
+      toastManager.close(environmentRefusalToastIdRef.current);
+    }
+    environmentRefusalToastIdRef.current = toastManager.add(
+      stackedThreadToast({ type: "warning", title: copy.title, description: copy.description }),
+    );
+    return true;
+  }, [activeEnvironmentUnavailableState]);
   const handleReconnectActiveEnvironment = useCallback(
     async (environmentId: EnvironmentId) => {
       const result = await retryEnvironment(environmentId);
@@ -5088,11 +5105,13 @@ function ChatViewContent(props: ChatViewProps) {
       hasPendingDelivery: canCancelPendingSend,
       compacting: compaction !== undefined,
     });
+    if (!activeThread) return;
+    // Enter and the mobile Send reach here without a disabled button to explain the refusal.
+    // Moving between a question's steps stays local; its final answer refuses on its own.
+    if (!activePendingProgress && refuseWhileEnvironmentUnavailable()) return;
     if (
-      !activeThread ||
       (isSendBusy && !enqueue) ||
       isConnecting ||
-      activeEnvironmentUnavailable ||
       workspaceUnavailable !== null ||
       providerBinding.conflict !== null ||
       stoppingQueueRef.current ||
@@ -5869,6 +5888,8 @@ function ChatViewContent(props: ChatViewProps) {
   const onRespondToApproval = useCallback(
     async (requestId: ApprovalRequestId, decision: ProviderApprovalDecision) => {
       if (!activeThreadId) return;
+      // The request stays on screen to answer once the environment is back.
+      if (refuseWhileEnvironmentUnavailable()) return;
 
       setRespondingRequestIds((existing) =>
         existing.includes(requestId) ? existing : [...existing, requestId],
@@ -5906,6 +5927,7 @@ function ChatViewContent(props: ChatViewProps) {
       activeThreadId,
       environmentId,
       interruptThreadTurn,
+      refuseWhileEnvironmentUnavailable,
       respondToThreadApproval,
       setThreadError,
     ],
@@ -5914,6 +5936,8 @@ function ChatViewContent(props: ChatViewProps) {
   const onRespondToUserInput = useCallback(
     async (requestId: ApprovalRequestId, answers: Record<string, unknown>) => {
       if (!activeThreadId) return;
+      // Also reached by the option's timed advance: the question and its answers stay put.
+      if (refuseWhileEnvironmentUnavailable()) return;
 
       setRespondingUserInputRequestIds((existing) =>
         existing.includes(requestId) ? existing : [...existing, requestId],
@@ -5936,7 +5960,13 @@ function ChatViewContent(props: ChatViewProps) {
       setRespondingUserInputRequestIds((existing) => existing.filter((id) => id !== requestId));
       return result;
     },
-    [activeThreadId, environmentId, respondToThreadUserInput, setThreadError],
+    [
+      activeThreadId,
+      environmentId,
+      refuseWhileEnvironmentUnavailable,
+      respondToThreadUserInput,
+      setThreadError,
+    ],
   );
 
   const setActivePendingUserInputQuestionIndex = useCallback(
