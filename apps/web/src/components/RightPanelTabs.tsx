@@ -2,7 +2,6 @@ import type { ContextMenuItem, PreviewSessionSnapshot } from "@bibcode/contracts
 import { formatChangeRequestNumber } from "@bibcode/shared/sourceControl";
 import { getTerminalLabel } from "@bibcode/shared/terminalLabels";
 import {
-  Bot,
   ClipboardList,
   FileDiff,
   Files,
@@ -240,8 +239,6 @@ function surfaceTitle(
   terminalLabelsById: ReadonlyMap<string, string>,
 ): string {
   switch (surface.kind) {
-    case "activity":
-      return "Activity";
     case "diff":
       return "Diff";
     case "sourceControl":
@@ -283,8 +280,6 @@ function surfaceTitle(
 
 function SurfaceIcon({ surface, theme }: { surface: RightPanelSurface; theme: "light" | "dark" }) {
   switch (surface.kind) {
-    case "activity":
-      return <Bot className="size-3.5 shrink-0" />;
     case "preview":
       return <Globe2 className="size-3.5 shrink-0" />;
     case "diff":
@@ -451,16 +446,10 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
                       : "text-muted-foreground hover:bg-accent/60 hover:text-foreground",
                   )}
                 >
-                  {surface.kind === "activity" ? (
-                    tabButton
-                  ) : (
-                    <Tooltip>
-                      <TooltipTrigger render={tabButton} />
-                      <TooltipPopup>
-                        {conflicted ? `${title} — changed on disk` : title}
-                      </TooltipPopup>
-                    </Tooltip>
-                  )}
+                  <Tooltip>
+                    <TooltipTrigger render={tabButton} />
+                    <TooltipPopup>{conflicted ? `${title} — changed on disk` : title}</TooltipPopup>
+                  </Tooltip>
                   <button
                     type="button"
                     className={cn(

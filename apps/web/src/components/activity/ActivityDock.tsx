@@ -4,14 +4,13 @@ import {
   type ActivitySection,
   type ActivitySnapshot,
 } from "@bibcode/contracts";
-import { BotIcon, RefreshCwIcon, TriangleAlertIcon } from "lucide-react";
+import { BotIcon, ChevronDownIcon, RefreshCwIcon, TriangleAlertIcon } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 
 import { PROVIDER_ICON_BY_PROVIDER } from "~/components/chat/providerIconUtils";
 import { Button } from "~/components/ui/button";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "~/components/ui/tooltip";
 import { cn } from "~/lib/utils";
-import { ACTIVITY_DOCK_SHEET_INSET_CLASS_NAME } from "~/rightPanelLayout";
 import { compareActivityTimestamps, selectActivityDockVisibility } from "./activityPresentation";
 
 const LIVE_ANNOUNCEMENT_WINDOW_MS = 500;
@@ -293,16 +292,21 @@ export interface ActivityDockProps {
   readonly compact: boolean;
   /** Show the button before any record exists, for sections the provider reports. */
   readonly alwaysVisible?: boolean;
-  readonly avoidRightPanelSheet?: boolean;
-  readonly onOpenSection: (section: ActivitySection) => void;
+  /** Whether the pane's Activity panel this button discloses is open. */
+  readonly expanded?: boolean;
+  /** The id of the panel body the button discloses. */
+  readonly controlsId?: string;
+  /** Called with the section an expand opens on: the one that needs the user. */
+  readonly onToggle: (section: ActivitySection) => void;
 }
 
 export function ActivityDock({
   snapshot,
   compact,
   alwaysVisible = false,
-  avoidRightPanelSheet = false,
-  onOpenSection,
+  expanded = false,
+  controlsId,
+  onToggle,
 }: ActivityDockProps) {
   const viewModel = normalizeActivityDockSnapshot(snapshot, alwaysVisible);
   if (viewModel === null || !viewModel.visibility.visible) {
@@ -364,21 +368,17 @@ export function ActivityDock({
   const idle = active === 0 && done === 0;
 
   return (
-    <div
-      className={cn(
-        "pointer-events-none absolute top-3 z-20",
-        avoidRightPanelSheet ? ACTIVITY_DOCK_SHEET_INSET_CLASS_NAME : "right-3",
-      )}
-      data-testid="activity-dock"
-    >
-      <div className="pointer-events-auto w-fit max-w-72 rounded-lg border border-border bg-popover text-popover-foreground shadow-md">
+    <div className="pointer-events-auto flex justify-end" data-testid="activity-dock">
+      <div className="w-fit max-w-72 rounded-lg border border-border bg-popover text-popover-foreground shadow-sm">
         <Tooltip>
           <TooltipTrigger
             render={
               <Button
-                aria-label={`Open Activity: ${breakdown}`}
+                aria-controls={controlsId}
+                aria-expanded={expanded}
+                aria-label={`Activity: ${breakdown}`}
                 className="h-9 min-h-9 w-full min-w-9 gap-2 px-2"
-                onClick={() => onOpenSection(sectionToOpen(visibility, subagents, backgroundTasks))}
+                onClick={() => onToggle(sectionToOpen(visibility, subagents, backgroundTasks))}
                 size="sm"
                 variant="ghost"
               >
@@ -425,6 +425,15 @@ export function ActivityDock({
                     </span>
                   </>
                 )}
+                {/* The panel opens above the button, so the chevron points up to open it. */}
+                <ChevronDownIcon
+                  aria-hidden="true"
+                  className={cn(
+                    "size-3.5 shrink-0 text-muted-foreground",
+                    expanded ? null : "rotate-180",
+                  )}
+                  data-activity-dock-chevron={expanded ? "expanded" : "collapsed"}
+                />
               </Button>
             }
           />

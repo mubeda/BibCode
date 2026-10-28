@@ -22,7 +22,7 @@ use crate::{
     assets::{AssetAccess, ResolvedAsset},
     auth::AuthService,
     crypto::sha256_hex,
-    diagnostic_bundle::DiagnosticBundleService,
+    diagnostic_bundle::{DiagnosticBundleIdentity, DiagnosticBundleService},
     diagnostics::{
         DesktopUiProcessObserver, DiagnosticsMonitor, NativeProcessSampler, NativeResourceSampler,
         ProcessAttributionRegistry, TraceDiagnosticsStore, bound_diagnostic_string,
@@ -424,8 +424,16 @@ impl ProductionRuntime {
             },
             process_attribution.clone(),
         );
-        let diagnostic_bundle = DiagnosticBundleService::new(&state_paths.logs_dir)
-            .with_profiler_dir(profiler_dir(&state_paths.state_dir));
+        let diagnostic_bundle = DiagnosticBundleService::new(
+            &state_paths.logs_dir,
+            DiagnosticBundleIdentity {
+                environment_id: config.environment_id.clone(),
+                storage_instance_id: config.storage_instance_id.as_ref().map(ToString::to_string),
+                label: config.environment_label.clone(),
+                server_version: config.server_version.clone(),
+            },
+        )
+        .with_profiler_dir(profiler_dir(&state_paths.state_dir));
         let operational_logs = OperationalLogs::start(
             &state_paths,
             &terminal_manager,
@@ -639,6 +647,10 @@ impl ProductionRuntime {
         );
         register_workspace_preview_rpc(&mut registry, workspace_preview);
         crate::production::device_rpc::register_device_rpc(&mut registry, device_manager.clone());
+        crate::production::diagnostic_logs_rpc::register_diagnostic_logs_rpc(
+            &mut registry,
+            diagnostic_bundle.clone(),
+        );
         let git_manager = GitManagerRpcServices::with_dependencies(
             git_repository.clone(),
             status_broadcaster.clone(),
@@ -829,6 +841,7 @@ impl ProductionRuntime {
         Ok(DiagnosticLogsHttpResponse {
             filename: bundle.filename,
             bytes: bundle.bytes,
+            slot: bundle.slot,
         })
     }
 

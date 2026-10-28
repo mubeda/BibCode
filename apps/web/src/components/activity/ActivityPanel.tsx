@@ -10,18 +10,15 @@ import type { TimestampFormat } from "@bibcode/contracts/settings";
 import { RefreshCwIcon, TriangleAlertIcon } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import type { ActivityRightPanelSurface } from "~/rightPanelStore";
 import { Alert, AlertAction, AlertDescription } from "~/components/ui/alert";
 import { Button } from "~/components/ui/button";
 import { ScrollArea } from "~/components/ui/scroll-area";
 import { Tabs, TabsList, TabsTab } from "~/components/ui/tabs";
 import { ActivityRecordDetail } from "./ActivityRecordDetail";
 import { ActivityRoster, reconcileActivityRosterRecords } from "./ActivityRoster";
+import type { ActivityPaneRoute } from "./activityPaneState";
 
-export type ActivityPanelRoute = Pick<
-  ActivityRightPanelSurface,
-  "section" | "selectedRecordKind" | "selectedRecordId"
->;
+export type ActivityPanelRoute = ActivityPaneRoute;
 
 export type ActivityRosterPageData = typeof ActivityRosterPageSchema.Type;
 export type ActivityDetailPageData = typeof ActivityDetailPageSchema.Type;
@@ -199,6 +196,9 @@ export function ActivityPanel({
   const panelRef = useRef<HTMLDivElement>(null);
   const headingRef = useRef<HTMLHeadingElement>(null);
   const selectedForFocusRef = useRef<string | null>(null);
+  // The record the user opened in this panel. A route restored after a reload
+  // shows its detail without taking focus from where the user is working.
+  const userOpenedRecordIdRef = useRef<string | null>(null);
   const handledRemovalRef = useRef<string | null>(null);
   const previousSectionRef = useRef(route.section);
   const [restoreFocusRecordId, setRestoreFocusRecordId] = useState<string | null>(null);
@@ -267,11 +267,12 @@ export function ActivityPanel({
 
   const headingFocusKey =
     selected && !removed ? `${route.selectedRecordId}\u0000${detailRecord?.id ?? ""}` : null;
+  const routedRecordId = route.selectedRecordId;
   useEffect(() => {
-    if (headingFocusKey !== null) {
+    if (headingFocusKey !== null && routedRecordId === userOpenedRecordIdRef.current) {
       headingRef.current?.focus();
     }
-  }, [headingFocusKey]);
+  }, [headingFocusKey, routedRecordId]);
 
   // The request lives outside the panel, so honouring it is a DOM side effect.
   // The selected section tab is the focus target; one section alone focuses the panel.
@@ -316,6 +317,7 @@ export function ActivityPanel({
   const selectRecord = useCallback(
     (record: ActivityRecordSummary) => {
       selectedForFocusRef.current = record.id;
+      userOpenedRecordIdRef.current = record.id;
       handledRemovalRef.current = null;
       setRemovalNotice(null);
       onNavigate({
@@ -337,6 +339,7 @@ export function ActivityPanel({
   const selectActor = useCallback(
     (actor: Extract<ActivityRecordSummary, { readonly _tag: "actor" }>) => {
       selectedForFocusRef.current = actor.id;
+      userOpenedRecordIdRef.current = actor.id;
       handledRemovalRef.current = null;
       setRemovalNotice(null);
       onNavigate({

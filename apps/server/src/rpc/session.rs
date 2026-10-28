@@ -399,6 +399,19 @@ impl RpcSessionContext {
         self.principal.as_ref()
     }
 
+    /// Authorizes this connection's session for `scope` on top of the method's own, for a
+    /// handler whose input asks for more (crash dumps in a diagnostic bundle). The refusal is
+    /// the same `EnvironmentAuthorizationError` the method scope check sends. An
+    /// unauthenticated server has no scopes to check.
+    pub(crate) async fn authorize_scope(&self, scope: &'static str) -> Result<(), Value> {
+        let (Some(principal), Some(auth)) = (&self.principal, &self.auth) else {
+            return Ok(());
+        };
+        auth.authorize_session(&principal.session_id, scope)
+            .await
+            .map_err(|_| authorization_error(scope))
+    }
+
     #[must_use]
     pub(crate) fn current_session_id(&self) -> Option<&str> {
         self.principal

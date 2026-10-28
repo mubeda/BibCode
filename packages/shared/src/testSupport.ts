@@ -34,6 +34,7 @@ export function makeTestExecutionEnvironmentCapabilities(
     vcsCloneReattach: false,
     attachmentStaging: false,
     profiler: false,
+    diagnosticLogs: false,
     devicePreviews: false,
     deviceCatalogRefresh: false,
     cliSessionHistory: false,

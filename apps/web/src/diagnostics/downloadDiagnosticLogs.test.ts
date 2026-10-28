@@ -1,4 +1,15 @@
+import {
+  diagnosticLogsError,
+  type DownloadedDiagnosticLogs,
+} from "@bibcode/client-runtime/diagnostics";
+import { EnvironmentId } from "@bibcode/contracts";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
+
+vi.mock("./environmentDiagnosticLogs", () => ({
+  downloadEnvironmentDiagnosticLogs: () => {
+    throw new Error("tests inject the environment download");
+  },
+}));
 
 import {
   MAX_DIAGNOSTIC_REQUEST_BYTES,
@@ -44,6 +55,9 @@ function harness(
         requests.push(request);
         return response;
       },
+      downloadFromEnvironment: vi.fn(async (): Promise<DownloadedDiagnosticLogs> => {
+        throw new Error("the primary path must not reach an environment connection");
+      }),
       resolveUrl: (path: string) => `http://primary.test${path}`,
       createAnchor: () => anchor,
       appendAnchor,
@@ -173,6 +187,65 @@ describe("downloadDiagnosticLogs", () => {
     const decoded = JSON.parse(body) as { frontendLog: string; includeCrashDumps?: boolean };
     expect(decoded.includeCrashDumps).toBe(true);
     expect(decoded.frontendLog).toContain("newest-record");
+  });
+
+  describe("for an environment other than the primary", () => {
+    const OMARCHY = { environmentId: EnvironmentId.make("remote:storage-1"), label: "Omarchy" };
+    const remoteArchive: DownloadedDiagnosticLogs = {
+      fileName: "bibcode-diagnostics-omarchy-20261027T120000Z.zip",
+      bytes: new Uint8Array([0x50, 0x4b, 3, 4, 5]),
+      manifest: {
+        schemaVersion: 1,
+        environmentId: "local",
+        storageInstanceId: "storage-1",
+        environmentLabel: "omarchy",
+        serverVersion: "0.12.0",
+        platform: { os: "linux", arch: "x86_64" },
+        generatedAt: "2026-10-27T12:00:00Z",
+        crashDumps: { requested: true, included: 1 },
+      },
+    };
+
+    it("saves the bundle that environment's connection sends, under its name", async () => {
+      const saveArchive = vi.fn(async () => "/Users/test/Downloads/omarchy.zip");
+      const h = harness(zipResponse(), saveArchive);
+      const downloadFromEnvironment = vi.fn(async () => remoteArchive);
+
+      const result = await downloadDiagnosticLogs(
+        "frontend warning\n",
+        { environment: OMARCHY, includeCrashDumps: true },
+        { ...h.dependencies, downloadFromEnvironment },
+      );
+
+      expect(downloadFromEnvironment).toHaveBeenCalledWith(OMARCHY.environmentId, "Omarchy", {
+        frontendLog: "frontend warning\n",
+        includeCrashDumps: true,
+      });
+      expect(h.requests).toEqual([]);
+      expect(saveArchive).toHaveBeenCalledWith(remoteArchive.fileName, remoteArchive.bytes);
+      expect(result).toEqual({
+        status: "saved",
+        filename: remoteArchive.fileName,
+        path: "/Users/test/Downloads/omarchy.zip",
+      });
+    });
+
+    it("fails with the environment's error and never falls back to the primary", async () => {
+      const saveArchive = vi.fn(async () => "/never");
+      const h = harness(zipResponse(), saveArchive);
+      const lost = diagnosticLogsError("connection-lost", "Omarchy");
+
+      await expect(
+        downloadDiagnosticLogs(
+          "warning",
+          { environment: OMARCHY },
+          { ...h.dependencies, downloadFromEnvironment: async () => Promise.reject(lost) },
+        ),
+      ).rejects.toThrow("The connection to Omarchy was lost. Reconnect and try again.");
+      expect(h.requests).toEqual([]);
+      expect(saveArchive).not.toHaveBeenCalled();
+      expect(h.createObjectURL).not.toHaveBeenCalled();
+    });
   });
 
   it("keeps the JSON request within the server limit while retaining newest records", async () => {

@@ -164,7 +164,7 @@ import {
   shellEnvironment,
   useEnvironmentShellSummary,
 } from "../state/shell";
-import { threadEnvironment, useEnvironmentThread } from "../state/threads";
+import { threadEnvironment, usePrewarmEnvironmentThread } from "../state/threads";
 import { vcsEnvironment } from "../state/vcs";
 import {
   type EnvironmentPresentation,
@@ -548,7 +548,7 @@ export function handleSidebarSelectionMouseDown(input: {
 }
 
 function SidebarThreadDetailPrewarmer({ threadRef }: { readonly threadRef: ScopedThreadRef }) {
-  useEnvironmentThread(threadRef.environmentId, threadRef.threadId);
+  usePrewarmEnvironmentThread(threadRef.environmentId, threadRef.threadId);
   return null;
 }
 
