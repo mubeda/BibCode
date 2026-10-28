@@ -378,7 +378,7 @@ retries once on a change, else passes through. Any `LD_PRELOAD`,
 `LD_LIBRARY_PATH`, `LD_AUDIT` or `DYLD_*` key passes through on the shim. The
 accepted environment is `PreparedTerminalLaunch::env_overlay`. The manager
 applies it over the client environment and redacts its values from spawn
-labels and errors. One deviation from the approval: the values are not added to
+labels and errors. One deviation from the approval, since accepted: the values are not added to
 the terminal output-stream redactor. The user's own shim would print them
 unredacted, and a short value (`1`) or `PATH` would corrupt the terminal's
 output. The root cause of the shim's misdetection was the supervisor's
