@@ -290,7 +290,8 @@ describe("applyActivityDelta", () => {
   it("moves a running actor to interrupted through a delta, with its counts", () => {
     const interrupted = actor({
       status: "interrupted",
-      summary: "Claude session ended before this subagent reported; last report 34m after it started.",
+      summary:
+        "Claude session ended before this subagent reported; last report 34m after it started.",
       updatedAt: "2026-07-26T12:00:00Z",
       terminalAt: "2026-07-26T12:00:00Z",
     });

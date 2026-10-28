@@ -890,65 +890,70 @@ describe("environment activity stream state", () => {
     }),
   );
 
-  it.effect("refetches once when the server reopens an interrupted row, not again on a duplicate", () =>
-    Effect.gen(function* () {
-      const closedAt = "2026-07-22T12:05:00Z";
-      const interruptedActor = {
-        ...snapshot().actors[0]!,
-        status: "interrupted" as const,
-        summary: "Codex session ended before this subagent reported; last report 5m after it started.",
-        updatedAt: closedAt,
-        terminalAt: closedAt,
-      };
-      const reopenedActor = {
-        ...snapshot().actors[0]!,
-        summary: "Resumed by Codex",
-        updatedAt: closedAt,
-        terminalAt: null,
-      };
-      const harness = yield* makeHarness({
-        getSnapshot: () =>
-          Effect.succeed(snapshot(4, "Reopened", { actors: [reopenedActor], updatedAt: closedAt })),
-      });
-      yield* Queue.offer(harness.inputs, {
-        kind: "snapshot",
-        snapshot: snapshot(3, "Interrupted", {
-          actors: [interruptedActor],
-          counts: { subagents: { active: 0, done: 1 }, backgroundTasks: { active: 0, done: 0 } },
-        }),
-      });
-      yield* awaitState(harness.state, (state) => state.status === "live");
-      const reopen: ActivityDelta = {
-        scopeId: SCOPE_ID,
-        previousRevision: 3,
-        revision: 4,
-        changes: [{ kind: "actor-upserted", actor: reopenedActor }],
-        updatedAt: closedAt,
-      };
-      yield* Queue.offer(harness.inputs, { kind: "delta", delta: reopen });
+  it.effect(
+    "refetches once when the server reopens an interrupted row, not again on a duplicate",
+    () =>
+      Effect.gen(function* () {
+        const closedAt = "2026-07-22T12:05:00Z";
+        const interruptedActor = {
+          ...snapshot().actors[0]!,
+          status: "interrupted" as const,
+          summary:
+            "Codex session ended before this subagent reported; last report 5m after it started.",
+          updatedAt: closedAt,
+          terminalAt: closedAt,
+        };
+        const reopenedActor = {
+          ...snapshot().actors[0]!,
+          summary: "Resumed by Codex",
+          updatedAt: closedAt,
+          terminalAt: null,
+        };
+        const harness = yield* makeHarness({
+          getSnapshot: () =>
+            Effect.succeed(
+              snapshot(4, "Reopened", { actors: [reopenedActor], updatedAt: closedAt }),
+            ),
+        });
+        yield* Queue.offer(harness.inputs, {
+          kind: "snapshot",
+          snapshot: snapshot(3, "Interrupted", {
+            actors: [interruptedActor],
+            counts: { subagents: { active: 0, done: 1 }, backgroundTasks: { active: 0, done: 0 } },
+          }),
+        });
+        yield* awaitState(harness.state, (state) => state.status === "live");
+        const reopen: ActivityDelta = {
+          scopeId: SCOPE_ID,
+          previousRevision: 3,
+          revision: 4,
+          changes: [{ kind: "actor-upserted", actor: reopenedActor }],
+          updatedAt: closedAt,
+        };
+        yield* Queue.offer(harness.inputs, { kind: "delta", delta: reopen });
 
-      const converged = yield* awaitState(
-        harness.state,
-        (state) =>
-          state.status === "live" &&
-          Option.isSome(state.snapshot) &&
-          state.snapshot.value.revision === 4,
-      );
-      expect(Option.getOrThrow(converged.snapshot).actors[0]?.status).toBe("running");
-      expect(Option.getOrThrow(converged.snapshot).counts.subagents).toEqual({
-        active: 1,
-        done: 0,
-      });
+        const converged = yield* awaitState(
+          harness.state,
+          (state) =>
+            state.status === "live" &&
+            Option.isSome(state.snapshot) &&
+            state.snapshot.value.revision === 4,
+        );
+        expect(Option.getOrThrow(converged.snapshot).actors[0]?.status).toBe("running");
+        expect(Option.getOrThrow(converged.snapshot).counts.subagents).toEqual({
+          active: 1,
+          done: 0,
+        });
 
-      yield* Queue.offer(harness.inputs, { kind: "delta", delta: reopen });
-      for (let attempt = 0; attempt < 20; attempt += 1) {
-        yield* Effect.yieldNow;
-      }
-      expect(yield* Ref.get(harness.snapshotRequestCount)).toBe(1);
-      expect(Option.getOrThrow((yield* SubscriptionRef.get(harness.state)).snapshot).revision).toBe(
-        4,
-      );
-    }),
+        yield* Queue.offer(harness.inputs, { kind: "delta", delta: reopen });
+        for (let attempt = 0; attempt < 20; attempt += 1) {
+          yield* Effect.yieldNow;
+        }
+        expect(yield* Ref.get(harness.snapshotRequestCount)).toBe(1);
+        expect(
+          Option.getOrThrow((yield* SubscriptionRef.get(harness.state)).snapshot).revision,
+        ).toBe(4);
+      }),
   );
 
   it.effect("shows a row interrupted while disconnected, with its counts, after a reconnect", () =>
