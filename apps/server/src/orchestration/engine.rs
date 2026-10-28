@@ -2777,6 +2777,86 @@ impl OrchestrationEngine {
         Ok(())
     }
 
+    /// At startup, once abandoned sessions are reconciled, expires every request still open on a
+    /// thread whose session is not live: no provider holds it now. Builds before #187 left such
+    /// requests open forever, and a provider that still holds one (OpenCode on resume) shows it
+    /// again, which reopens it. Each expiry is an ordinary activity, keyed by its request, so a
+    /// repeated startup appends nothing twice. Returns how many it expired.
+    pub async fn expire_requests_of_settled_sessions(&self) -> Result<usize, OrchestrationError> {
+        let open = crate::persistence::open_user_input_requests_sql("?1");
+        let requests = self
+            .repositories()
+            .database()
+            .call(move |connection| {
+                // Only threads with something open are visited: the counts say which.
+                let threads = connection
+                    .prepare(
+                        "SELECT thread.thread_id FROM projection_threads AS thread
+                           LEFT JOIN projection_thread_sessions AS session
+                             ON session.thread_id = thread.thread_id
+                          WHERE thread.deleted_at IS NULL
+                            AND (thread.pending_approval_count > 0 OR thread.pending_user_input_count > 0)
+                            AND COALESCE(session.status, 'idle') NOT IN ('running', 'starting')",
+                    )?
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mut requests = Vec::new();
+                for thread_id in threads {
+                    let rows = connection
+                        .prepare(&format!(
+                            "SELECT 'approval.expired', request_id, turn_id FROM projection_pending_approvals
+                              WHERE thread_id = ?1 AND status = 'pending'
+                             UNION ALL
+                             SELECT 'user-input.expired', open.request_id, NULL FROM ({open}) AS open"
+                        ))?
+                        .query_map([&thread_id], |row| {
+                            Ok((
+                                thread_id.clone(),
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, Option<String>>(2)?,
+                            ))
+                        })?
+                        .collect::<Result<Vec<_>, _>>()?;
+                    requests.extend(rows);
+                }
+                Ok(requests)
+            })
+            .await
+            .map_err(|error| OrchestrationError::Persistence(Arc::new(error)))?;
+        let created_at = time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_default();
+        for (thread_id, kind, request_id, turn_id) in &requests {
+            let summary = if kind == "approval.expired" {
+                "Approval expired"
+            } else {
+                "Question expired"
+            };
+            self.dispatch_plain(OrchestrationCommand::ThreadActivityAppend {
+                command_id: format!("server:startup-expiry:{kind}:{request_id}"),
+                thread_id: thread_id.clone(),
+                activity: ActivityInput {
+                    id: format!("{kind}:{request_id}:startup"),
+                    tone: "approval".to_owned(),
+                    kind: kind.clone(),
+                    summary: summary.to_owned(),
+                    payload: json!({
+                        "requestId": request_id,
+                        "reason": "session-ended",
+                        "sessionStatus": "settled",
+                    }),
+                    turn_id: turn_id.clone(),
+                    sequence: None,
+                    created_at: created_at.clone(),
+                },
+                created_at: created_at.clone(),
+            })
+            .await?;
+        }
+        Ok(requests.len())
+    }
+
     pub fn subscribe_events(&self) -> broadcast::Receiver<OrchestrationEvent> {
         self.events.subscribe()
     }
@@ -5310,19 +5390,36 @@ async fn persist_command(
         }
         _ => None,
     };
-    // A session that leaves `running` ends its turn, and with it every request the provider
-    // was waiting on: they expire in the same commit (#187).
+    // A turn the user stopped, or one that failed, was interrupted or lost its session, ends
+    // with every request the provider was waiting on: they expire in the same commit (#187).
+    // A turn the provider completed (`ready`) does not: the provider settles its own requests,
+    // and one it leaves open keeps holding the queue until it is answered, as before.
     let expiry = match command {
+        OrchestrationCommand::ThreadTurnInterrupt {
+            thread_id,
+            created_at,
+            ..
+        } => Some((
+            thread_id.clone(),
+            "interrupted".to_owned(),
+            created_at.clone(),
+        )),
         OrchestrationCommand::ThreadSessionSet {
             thread_id,
             session,
             created_at,
             ..
-        } if !matches!(session.status.as_str(), "running" | "starting") => Some((
-            thread_id.clone(),
-            session.status.clone(),
-            created_at.clone(),
-        )),
+        } if matches!(
+            session.status.as_str(),
+            "error" | "interrupted" | "stopped" | "idle"
+        ) =>
+        {
+            Some((
+                thread_id.clone(),
+                session.status.clone(),
+                created_at.clone(),
+            ))
+        }
         _ => None,
     };
     let compaction_step = CompactionStep::of(command);
@@ -6736,7 +6833,14 @@ const USER_INPUT_REQUEST_KINDS: [&str; 4] = [
 /// its session entering `starting` or `running`. Titles, modes, archives and BiBCode's own
 /// settlements are not.
 fn is_provider_progress(event: &NewOrchestrationEvent) -> bool {
-    infer_actor_kind(event) == "provider"
+    // A refused answer is BiBCode's report about the provider, not the provider's progress.
+    let bibcode_report = event.event_type == "thread.activity-appended"
+        && event
+            .payload
+            .pointer("/activity/kind")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| kind.ends_with(".respond.failed"));
+    (infer_actor_kind(event) == "provider" && !bibcode_report)
         || (event.event_type == "thread.session-set"
             && matches!(
                 event
@@ -6776,8 +6880,10 @@ fn record_agent_status_evidence_tx(
         )?;
     }
     if is_provider_progress(&event.event) {
+        // Never backwards: a provider event stamped earlier than one already applied (a replay,
+        // or a clock step) leaves the newer evidence.
         transaction.execute(
-            "UPDATE projection_threads SET last_activity_at = ? WHERE thread_id = ?",
+            "UPDATE projection_threads SET last_activity_at = MAX(COALESCE(last_activity_at, ''), ?1) WHERE thread_id = ?2",
             params![event.event.occurred_at, thread_id],
         )?;
     }
@@ -6809,6 +6915,21 @@ fn expire_open_requests_tx(
     created_at: &str,
     command_id: &str,
 ) -> Result<Vec<NewOrchestrationEvent>, PersistenceError> {
+    // Only a session that was live ends a turn here: a repeated settlement, or one of a session
+    // that was already settled (a relaunch, say), leaves its requests as they are.
+    let previous_status = transaction
+        .query_row(
+            "SELECT status FROM projection_thread_sessions WHERE thread_id = ?",
+            [thread_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if !matches!(previous_status.as_deref(), Some("running" | "starting")) {
+        return Ok(Vec::new());
+    }
+    // A provider adapter's own record of an expired request (the Claude adapter's pending
+    // approvals, say) needs no notice: the turn that held it is over, so the provider no longer
+    // waits on it, and an answer to it is refused as stale. The entry ends with its process.
     let approvals = transaction
         .prepare(
             "SELECT request_id, turn_id FROM projection_pending_approvals WHERE thread_id = ? AND status = 'pending' ORDER BY created_at ASC, request_id ASC",

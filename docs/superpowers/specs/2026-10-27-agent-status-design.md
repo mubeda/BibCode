@@ -211,6 +211,18 @@ The fix: the projector handles `provider.approval.respond.failed` with that
 detail, using the migration's detail rule. It marks the row `resolved` with
 decision `stale`. User inputs already follow this rule through D1.
 
+> **Revised after review.** Expiry no longer happens at `ready`: a provider may
+> end its turn while its ask still waits, and the queue holds behind it exactly
+> as before. A request expires only on a real transition, read in the same
+> transaction, of a `running` or `starting` session to `error`, `interrupted`,
+> `stopped` or `idle`, or on a turn interrupt; never at a launch's `ready` or on
+> a settled session settling again. A resumed OpenCode session launches
+> `starting` and turns `ready` on `session.recovery-settled`, after its stream
+> has shown the asks it kept. Startup expires, as events, requests left open on
+> threads whose session is not live, and migration 057 backfills
+> `last_activity_at` from the latest provider event. The text below records the
+> first design; the revision supersedes its `ready` case and its correction.
+
 **(b) Expiry when a session leaves `running`.** When the engine commits a
 `thread.session-set` whose new status is not `running` or `starting`, the same
 transaction appends an expiry activity for each request still open on that
@@ -277,24 +289,13 @@ With D2, a request is expired at the session transition that ends its turn:
 
 The drain after a turn ends matches today's drain after an answered approval.
 
-**Correction found in implementation.** One case does differ from today:
-
-- **The case:** the turn ended `ready` while its request was still open. The
-  existing test `no_promotion_while_approval_or_user_input_pending` covered it.
-- **Before:** that queue stayed held until the user clicked the dead request.
-- **Now:** the request expires, and the queued follow-up is sent.
-
-Under UI.md this is a preserve-user-work question:
-
-- **Chosen: send.** The user queued the message to go "after this turn". The
-  turn is over, and no one is waiting on the request. Sending loses no work.
-  The work log's "Approval expired" says why the request closed.
-- **Rejected: hold.** The alternative was to add `ready`-with-expiry to the
-  commit's `hold`, so the user releases the queue manually. That keeps work
-  waiting on a card that cannot be answered.
-
-The test now pins the new behavior
-(`a_turn_ending_with_its_request_open_expires_it_and_then_drains_like_an_answer`).
+**Correction found in implementation, then withdrawn.** The first
+implementation expired a request when its turn ended `ready`, which sent a
+queued follow-up past it. Review restored today's behavior: the request stays
+open and holds the queue (`no_promotion_while_approval_or_user_input_pending`),
+and only the transitions in the revision above expire it
+(`an_interrupted_or_failed_turn_expires_its_request_and_holds_the_queue`,
+`a_relaunch_with_a_recovered_ask_does_not_send_the_follow_up`).
 A request the provider raises while the session is `ready`, as OpenCode does
 for a recovered ask, still holds the queue.
 

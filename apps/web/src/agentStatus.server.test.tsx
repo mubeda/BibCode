@@ -394,6 +394,15 @@ function cardStatus(
 
 let root: Root | null = null;
 
+/** A row's accessible name or description: the text of the lines it references. */
+function referencedText(element: Element, attribute: "aria-labelledby" | "aria-describedby") {
+  return (element.getAttribute(attribute) ?? "")
+    .split(" ")
+    .filter((id) => id !== "")
+    .map((id) => element.ownerDocument.getElementById(id)?.textContent ?? "")
+    .join(", ");
+}
+
 /** Mounts the real rows and card glyph and returns what they render. */
 async function render(
   rows: ReadonlyArray<AgentRow>,
@@ -416,8 +425,9 @@ async function render(
     );
   });
   return {
-    rows: [...container.querySelectorAll("ul button[aria-label]")].map(
-      (button) => button.getAttribute("aria-label") ?? "",
+    rows: [...container.querySelectorAll("ul button[aria-labelledby]")].map(
+      (button) =>
+        `${referencedText(button, "aria-labelledby")}: ${referencedText(button, "aria-describedby")}`,
     ),
     card: container.querySelector("[data-status]")?.getAttribute("aria-label") ?? null,
   };
@@ -509,8 +519,8 @@ describe.skipIf(serverBinary === undefined)("agent status over the production wi
 
     const live = await render(agentRows(asking, unavailable), cardStatus(asking, unavailable));
     expect(live.rows).toEqual([
-      "Agent status thread, Awaiting Input, Wire",
-      "Agent status thread, Cursor Terminal, Status unavailable, Wire",
+      "main, Agent status thread: Awaiting Input, Codex, Wire, Agent status project",
+      "main, Agent status thread, Cursor Terminal: Status unavailable, Cursor, Wire, Agent status project",
     ]);
     expect(live.card).toBe(WORKSPACE_CARD_STATUS.input.label);
 
@@ -536,7 +546,9 @@ describe.skipIf(serverBinary === undefined)("agent status over the production wi
       (thread) => !thread.hasPendingUserInput && thread.session?.status !== "running",
     );
     const afterRestart = await render(agentRows(restarted, []), cardStatus(restarted, []));
-    expect(afterRestart.rows).toEqual(["Agent status thread, Failed, Wire"]);
+    expect(afterRestart.rows).toEqual([
+      "main, Agent status thread: Failed, Codex, Wire, Agent status project",
+    ]);
     expect(afterRestart.card).toBe(WORKSPACE_CARD_STATUS.failed.label);
     client.close();
     NodeFS.rmSync(workspace, { recursive: true, force: true });

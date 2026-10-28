@@ -8237,7 +8237,25 @@ async fn launch_session(
         runtime_payload_with_context_handoff(started.runtime_payload.clone(), context_handoff),
     )
     .await?;
-    dispatch_session_state(engine, &request, "ready", None, None, None).await?;
+    // A resumed OpenCode session shows the asks it kept only once its event stream connects,
+    // and may still be executing: it stays `starting`, holding its queued messages, until it
+    // reports `session.recovery-settled` (#187). A resume it refused started afresh.
+    let awaiting_recovery = provider_recovers_pending_requests(&request.provider)
+        && request.resume_cursor.is_some()
+        && !resume_lost;
+    dispatch_session_state(
+        engine,
+        &request,
+        if awaiting_recovery {
+            "starting"
+        } else {
+            "ready"
+        },
+        None,
+        None,
+        None,
+    )
+    .await?;
     if resume_lost {
         append_context_handoff_activity(engine, &request).await;
     }
@@ -10856,6 +10874,20 @@ async fn project_provider_event(
     {
         return Ok(());
     }
+    // A resumed session has shown the asks it kept: it is ready, unless it already moved on
+    // (a turn it adopted runs, or it ended), and its queued messages may go (#187).
+    if event.event_type == "session.recovery-settled" {
+        let starting = engine
+            .repositories()
+            .get_thread_session(launch.thread_id.clone())
+            .await
+            .map_err(|error| ProviderRuntimeError::Persistence(error.to_string()))?
+            .is_some_and(|session| session.status == "starting");
+        if starting {
+            dispatch_session_state(engine, launch, "ready", None, None, None).await?;
+        }
+        return Ok(());
+    }
     let assistant_message_id = assistant_message_id(&event);
     let compaction_id = event
         .payload
@@ -11701,6 +11733,12 @@ pub(crate) fn session_holds_a_turn(session: &ProjectionThreadSession) -> bool {
 /// driver marks a turn the provider started itself with `providerStarted: true` instead.
 fn provider_reports_its_turns(provider: &str) -> bool {
     matches!(provider, "codex" | "claude" | "claudeAgent")
+}
+
+/// Whether a resumed session shows again the asks its provider kept while BiBCode was away,
+/// after launch, ending that recovery with `session.recovery-settled` (#187).
+fn provider_recovers_pending_requests(provider: &str) -> bool {
+    provider == "opencode"
 }
 
 /// Whether BiBCode can see the session's work outside a turn, so its absence means idle. Claude
@@ -25545,6 +25583,74 @@ done
         assert_eq!(first.lock().unwrap().shutdowns, 1);
         assert_eq!(second.lock().unwrap().shutdowns, 1);
         engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_resumed_opencode_session_holds_starting_until_its_recovery_settles() {
+        // Mutation caught: a resumed OpenCode launch reading `ready` before its stream has shown
+        // the asks it kept, so a queued follow-up is sent past a recovered question (#187).
+        // The fixture driver always resumes `unit-session`.
+        let resumed = || Some(json!({"threadId":"unit-session"}));
+        for (provider, resume, held) in [
+            ("opencode", resumed(), true),
+            ("opencode", None, false),
+            // OpenCode refused the resume and started afresh: no asks were kept.
+            ("opencode", Some(json!({"threadId":"lost-session"})), false),
+            ("codex", resumed(), false),
+        ] {
+            let resumed = resume.is_some();
+            let engine = supervisor_engine().await;
+            let (events_tx, events_rx) = mpsc::channel(4);
+            let supervisor = super::ProviderRuntimeSupervisor::start(
+                engine.clone(),
+                Arc::new(SupervisorFactory {
+                    state: Arc::new(StdMutex::new(SupervisorDriverState::default())),
+                    events: StdMutex::new(Some(events_rx)),
+                }),
+                super::ActivityProjection::new(ActivityRepository::new(
+                    engine.repositories().database().clone(),
+                )),
+                super::SupervisorOptions::default(),
+            );
+            let temp = TempDir::new().expect("launch directory");
+            let mut launch = native_launch(&temp, provider);
+            launch.thread_id = "t1".to_owned();
+            launch.resume_cursor = resume;
+            supervisor.launch(launch).await.expect("launch runtime");
+            let status = || async {
+                engine
+                    .repositories()
+                    .get_thread_session("t1".to_owned())
+                    .await
+                    .expect("read session")
+                    .expect("projected session")
+                    .status
+            };
+            let expected = if held { "starting" } else { "ready" };
+            assert_eq!(status().await, expected, "{provider} resumed={resumed}");
+            events_tx
+                .send(super::ProviderEvent {
+                    native_event_id: None,
+                    event_type: "session.recovery-settled".to_owned(),
+                    thread_id: "t1".to_owned(),
+                    turn_id: None,
+                    item_id: None,
+                    request_id: None,
+                    payload: json!({}),
+                    activity: Vec::new(),
+                    activity_controls: super::ProviderActivityControls::default(),
+                })
+                .await
+                .expect("settle event");
+            timeout(Duration::from_secs(2), async {
+                while status().await != "ready" {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{provider} resumed={resumed} settles ready"));
+            engine.shutdown().await;
+        }
     }
 
     #[tokio::test]

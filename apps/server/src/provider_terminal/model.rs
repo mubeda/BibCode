@@ -703,6 +703,15 @@ pub enum TerminalAgentState {
     Done,
 }
 
+/// What one provider event says about the agent's main state (#187).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TerminalAgentReport {
+    /// The agent is in this state; the flag marks a turn that ended in failure.
+    Set(TerminalAgentState, bool),
+    /// The agent's output is streaming: it is working, unless an open ask still waits.
+    Progress,
+}
+
 /// One status observation: the state, whether the turn that ended failed, and when the
 /// observer saw it on this server's clock.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -891,6 +900,49 @@ impl TerminalObserverGenerationLease {
                 observed_at: std::time::Instant::now(),
                 observed_wall: std::time::SystemTime::now(),
             }));
+    }
+
+    /// Reports what one provider event says about the agent (#187).
+    pub fn report_agent_status(&self, report: TerminalAgentReport) {
+        match report {
+            TerminalAgentReport::Set(state, failed) => self.publish_agent_status(state, failed),
+            TerminalAgentReport::Progress => self.publish_agent_progress(),
+        }
+    }
+
+    /// Reports that the agent is making progress: it reads Working unless it is blocked on an
+    /// approval or waiting on the user, which only an answer or a new status ends (#187).
+    pub fn publish_agent_progress(&self) {
+        self.publish_agent_status_if(TerminalAgentState::Working, false, |current| {
+            !matches!(
+                current,
+                Some(TerminalAgentState::Blocked | TerminalAgentState::Waiting)
+            )
+        });
+    }
+
+    /// Reports `state` only when `applies` accepts the state already shown, atomically.
+    pub fn publish_agent_status_if(
+        &self,
+        state: TerminalAgentState,
+        failed: bool,
+        applies: impl FnOnce(Option<TerminalAgentState>) -> bool,
+    ) {
+        if !self.is_current() {
+            return;
+        }
+        self.inner.agent_status.send_if_modified(|current| {
+            if !applies(current.map(|observation| observation.state)) {
+                return false;
+            }
+            *current = Some(TerminalAgentObservation {
+                state,
+                failed,
+                observed_at: std::time::Instant::now(),
+                observed_wall: std::time::SystemTime::now(),
+            });
+            true
+        });
     }
 
     /// The agent status this generation's observer publishes; the terminal manager mirrors it

@@ -1,7 +1,13 @@
 import { afterEach, describe, expect, it } from "vite-plus/test";
 
 import { AGENT_STATUS_STALE_AFTER_MS, isAgentEvidenceStale } from "../components/Sidebar.logic";
-import { agentEvidenceAt, resetAgentEvidenceStampsForTests } from "./useAgentFreshness";
+import {
+  type AgentEvidenceStamp,
+  agentEvidenceAt,
+  peekAgentEvidenceAt,
+  recordAgentEvidence,
+  resetAgentEvidenceStampsForTests,
+} from "./useAgentFreshness";
 
 // Evidence age is measured on this client's clock from its first sight of each piece of
 // evidence, less the server's own age of it then (#187).
@@ -55,5 +61,27 @@ describe("agentEvidenceAt", () => {
   it("has no evidence without a timestamp", () => {
     expect(agentEvidenceAt("row", undefined, undefined, true, CLIENT_NOW)).toBeNull();
     expect(isAgentEvidenceStale(null, CLIENT_NOW + AGENT_STATUS_STALE_AFTER_MS * 2)).toBe(false);
+  });
+});
+
+describe("peekAgentEvidenceAt", () => {
+  it("keeps nothing until a committed render records what it saw", () => {
+    // A render React discards must not stamp: its first sight is only pending.
+    const discarded: AgentEvidenceStamp[] = [];
+    expect(peekAgentEvidenceAt("row", "e1", 0, true, discarded, CLIENT_NOW)).toBe(CLIENT_NOW);
+    expect(discarded).toEqual([{ key: "row", evidence: "e1", evidenceAt: CLIENT_NOW }]);
+    const later: AgentEvidenceStamp[] = [];
+    expect(peekAgentEvidenceAt("row", "e1", 0, true, later, CLIENT_NOW + MINUTE)).toBe(
+      CLIENT_NOW + MINUTE,
+    );
+
+    // Once recorded, the first sight holds and nothing more is pending.
+    recordAgentEvidence(later);
+    recordAgentEvidence(discarded);
+    const repeat: AgentEvidenceStamp[] = [];
+    expect(peekAgentEvidenceAt("row", "e1", 0, true, repeat, CLIENT_NOW + 5 * MINUTE)).toBe(
+      CLIENT_NOW + MINUTE,
+    );
+    expect(repeat).toEqual([]);
   });
 });

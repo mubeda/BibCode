@@ -896,6 +896,9 @@ struct ClaudeHookState {
     request_permits: Arc<Semaphore>,
     /// Where the main agent's state goes, whatever the activity setting says (#187).
     status: TerminalObserverGenerationLease,
+    /// The main session the state follows: the first one heard, then each new `SessionStart`
+    /// (`/clear` and resume begin a new session).
+    status_session: Arc<Mutex<Option<String>>>,
 }
 
 async fn run_claude_observer(
@@ -926,6 +929,7 @@ async fn run_claude_observer(
         requests: request_sender,
         request_permits: Arc::new(Semaphore::new(CLAUDE_HOOK_REQUEST_CAPACITY)),
         status: generation.clone(),
+        status_session: Arc::new(Mutex::new(None)),
     };
     let router = Router::new()
         .route("/claude-hook", post(capture_claude_hook))
@@ -1303,19 +1307,16 @@ async fn capture_claude_hook(
             StatusCode::NO_CONTENT
         }
     };
-    let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+    // The main agent's state is published whatever the activity setting says (#187). It reads
+    // only the fields that state needs: a hook only activity would read is decoded whole only
+    // while activity is live, so status alone never reads prompt or tool content.
+    let Ok(hook) = serde_json::from_slice::<ClaudeStatusHook>(&bytes) else {
         return rejected();
     };
-    if !value.is_object() {
-        return rejected();
-    }
-    // The main agent's state is published whatever the activity setting says (#187).
-    if let Some((agent_state, failed)) = claude_hook_agent_status(&value) {
-        state.status.publish_agent_status(agent_state, failed);
-    }
-    if value
-        .get("hook_event_name")
-        .and_then(Value::as_str)
+    publish_claude_hook_status(&state, &hook);
+    if hook
+        .hook_event_name
+        .as_deref()
         .is_some_and(|event| CLAUDE_STATUS_HOOK_EVENTS.contains(&event))
     {
         return StatusCode::NO_CONTENT;
@@ -1326,6 +1327,9 @@ async fn capture_claude_hook(
     if !state.activity.admission_is_current(&admission) {
         return StatusCode::NO_CONTENT;
     }
+    let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+        return StatusCode::BAD_REQUEST;
+    };
     let (response, receiver) = oneshot::channel();
     if state
         .requests
@@ -1390,6 +1394,8 @@ fn claude_hook_settings(endpoint: &str, token: &str, correlation: &str) -> Value
             "UserPromptSubmit": hook(),
             "PermissionRequest": hook(),
             "Notification": hook(),
+            "Elicitation": hook(),
+            "ElicitationResult": hook(),
             "Stop": hook(),
             "StopFailure": hook(),
             "SessionEnd": hook(),
@@ -1398,46 +1404,111 @@ fn claude_hook_settings(endpoint: &str, token: &str, correlation: &str) -> Value
 }
 
 /// The hooks registered only for the main agent's state: the activity worker never sees them.
-const CLAUDE_STATUS_HOOK_EVENTS: [&str; 7] = [
+const CLAUDE_STATUS_HOOK_EVENTS: [&str; 9] = [
     "SessionStart",
     "UserPromptSubmit",
     "PermissionRequest",
     "Notification",
+    "Elicitation",
+    "ElicitationResult",
     "Stop",
     "StopFailure",
     "SessionEnd",
 ];
 
+/// The few fields of a Claude hook the main agent's state reads (#187); serde skips the rest,
+/// prompt, message and tool content included.
+#[derive(Debug, Default, serde::Deserialize)]
+struct ClaudeStatusHook {
+    #[serde(default)]
+    hook_event_name: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    /// Present on a subagent's own hooks.
+    #[serde(default)]
+    agent_id: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
+    tool_name: Option<String>,
+    #[serde(default)]
+    notification_type: Option<String>,
+}
+
+/// What one Claude hook says about the main agent.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClaudeAgentReport {
+    Set(TerminalAgentState, bool),
+    /// A subagent's tool finished: an approval it waited on was answered.
+    ToolFinished,
+}
+
+/// Publishes the main agent's state a hook reports, for the main session only.
+fn publish_claude_hook_status(state: &ClaudeHookState, hook: &ClaudeStatusHook) {
+    let Some(report) = claude_hook_agent_status(hook) else {
+        return;
+    };
+    let Some(session_id) = safe_text(hook.session_id.as_deref()) else {
+        return;
+    };
+    {
+        let mut bound = state
+            .status_session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match bound.as_deref() {
+            Some(root) if root == session_id => {}
+            Some(_) if hook.hook_event_name.as_deref() != Some("SessionStart") => return,
+            _ => *bound = Some(session_id.to_owned()),
+        }
+    }
+    match report {
+        ClaudeAgentReport::Set(agent_state, failed) => {
+            state.status.publish_agent_status(agent_state, failed);
+        }
+        ClaudeAgentReport::ToolFinished => {
+            state
+                .status
+                .publish_agent_status_if(TerminalAgentState::Working, false, |current| {
+                    current == Some(TerminalAgentState::Blocked)
+                })
+        }
+    }
+}
+
 /// The main agent's state a Claude hook reports, for the left panel (#187). A subagent's own
-/// tool hooks carry its `agent_id` and leave the main state alone; a permission prompt blocks
-/// the user whoever asks. Only the event name, the tool name and the notification type are
-/// read: never prompt, message or tool content.
-fn claude_hook_agent_status(value: &Value) -> Option<(TerminalAgentState, bool)> {
-    let event = safe_identity_field(value, "hook_event_name")?;
-    safe_identity_field(value, "session_id")?;
-    let main_agent = value.get("agent_id").is_none();
-    let state = match event {
-        "SessionStart" | "Stop" | "SessionEnd" => (TerminalAgentState::Done, false),
-        "StopFailure" => (TerminalAgentState::Done, true),
-        "UserPromptSubmit" => (TerminalAgentState::Working, false),
-        "PermissionRequest" => (TerminalAgentState::Blocked, false),
-        "Elicitation" => (TerminalAgentState::Waiting, false),
+/// tool hooks carry its `agent_id` and leave the main state alone, except that its finished
+/// tool ends an approval prompt; a permission prompt blocks the user whoever asks. Only the
+/// event name, the tool name and the notification type are read.
+fn claude_hook_agent_status(hook: &ClaudeStatusHook) -> Option<ClaudeAgentReport> {
+    let event = safe_text(hook.hook_event_name.as_deref())?;
+    safe_text(hook.session_id.as_deref())?;
+    let main_agent = hook.agent_id.is_none();
+    let set = |state, failed| Some(ClaudeAgentReport::Set(state, failed));
+    match event {
+        "SessionStart" | "Stop" | "SessionEnd" => set(TerminalAgentState::Done, false),
+        "StopFailure" => set(TerminalAgentState::Done, true),
+        "UserPromptSubmit" | "ElicitationResult" => set(TerminalAgentState::Working, false),
+        "PermissionRequest" => set(TerminalAgentState::Blocked, false),
+        "Elicitation" => set(TerminalAgentState::Waiting, false),
         "PreToolUse" if main_agent => {
-            if safe_identity_field(value, "tool_name")? == "AskUserQuestion" {
-                (TerminalAgentState::Waiting, false)
+            if safe_text(hook.tool_name.as_deref())? == "AskUserQuestion" {
+                set(TerminalAgentState::Waiting, false)
             } else {
-                (TerminalAgentState::Working, false)
+                set(TerminalAgentState::Working, false)
             }
         }
-        "PostToolUse" | "PostToolUseFailure" if main_agent => (TerminalAgentState::Working, false),
-        "Notification" => match safe_identity_field(value, "notification_type")? {
-            "permission_prompt" => (TerminalAgentState::Blocked, false),
-            "elicitation_dialog" => (TerminalAgentState::Waiting, false),
-            _ => return None,
+        "PostToolUse" | "PostToolUseFailure" if main_agent => {
+            set(TerminalAgentState::Working, false)
+        }
+        "PostToolUse" | "PostToolUseFailure" => Some(ClaudeAgentReport::ToolFinished),
+        "Notification" => match safe_text(hook.notification_type.as_deref())? {
+            "permission_prompt" => set(TerminalAgentState::Blocked, false),
+            "elicitation_dialog" => set(TerminalAgentState::Waiting, false),
+            // Claude has waited on the user's next prompt for a while.
+            "idle_prompt" => set(TerminalAgentState::Done, false),
+            _ => None,
         },
-        _ => return None,
-    };
-    Some(state)
+        _ => None,
+    }
 }
 
 fn unsafe_interactive_settings_args(args: &[String]) -> bool {
@@ -1451,7 +1522,11 @@ fn unsafe_interactive_settings_args(args: &[String]) -> bool {
 }
 
 fn safe_identity_field<'a>(value: &'a Value, field: &str) -> Option<&'a str> {
-    value.get(field).and_then(Value::as_str).filter(|value| {
+    safe_text(value.get(field).and_then(Value::as_str))
+}
+
+fn safe_text(value: Option<&str>) -> Option<&str> {
+    value.filter(|value| {
         !value.is_empty() && value.chars().count() <= 256 && !value.chars().any(char::is_control)
     })
 }
@@ -2982,44 +3057,94 @@ mod tests {
                 .as_object_mut()
                 .unwrap()
                 .extend(extra.as_object().unwrap().clone());
-            claude_hook_agent_status(&value)
+            claude_hook_agent_status(&serde_json::from_value(value).expect("status hook"))
         };
+        use ClaudeAgentReport::{Set, ToolFinished};
         use TerminalAgentState::{Blocked, Done, Waiting, Working};
-        assert_eq!(hook("SessionStart", json!({})), Some((Done, false)));
-        assert_eq!(hook("UserPromptSubmit", json!({})), Some((Working, false)));
+        assert_eq!(hook("SessionStart", json!({})), Some(Set(Done, false)));
+        assert_eq!(
+            hook("UserPromptSubmit", json!({})),
+            Some(Set(Working, false))
+        );
         assert_eq!(
             hook("PreToolUse", json!({"tool_name":"Bash"})),
-            Some((Working, false))
+            Some(Set(Working, false))
         );
         assert_eq!(
             hook("PreToolUse", json!({"tool_name":"AskUserQuestion"})),
-            Some((Waiting, false))
+            Some(Set(Waiting, false))
         );
         assert_eq!(
             hook("PreToolUse", json!({"tool_name":"Bash","agent_id":"sub"})),
             None,
             "a subagent's tool leaves the main state alone"
         );
-        assert_eq!(hook("PermissionRequest", json!({})), Some((Blocked, false)));
+        assert_eq!(
+            hook("PostToolUse", json!({"tool_name":"Bash"})),
+            Some(Set(Working, false))
+        );
+        assert_eq!(
+            hook(
+                "PostToolUseFailure",
+                json!({"tool_name":"Bash","agent_id":"sub"})
+            ),
+            Some(ToolFinished),
+            "a subagent's finished tool may end an approval prompt"
+        );
+        assert_eq!(
+            hook("PermissionRequest", json!({})),
+            Some(Set(Blocked, false))
+        );
         assert_eq!(
             hook(
                 "Notification",
                 json!({"notification_type":"permission_prompt"})
             ),
-            Some((Blocked, false))
+            Some(Set(Blocked, false))
         );
         assert_eq!(
             hook("Notification", json!({"notification_type":"idle_prompt"})),
+            Some(Set(Done, false)),
+            "Claude waiting on the next prompt is done"
+        );
+        assert_eq!(
+            hook("Notification", json!({"notification_type":"auth_success"})),
             None
         );
-        assert_eq!(hook("Stop", json!({})), Some((Done, false)));
-        assert_eq!(hook("StopFailure", json!({})), Some((Done, true)));
+        assert_eq!(hook("Elicitation", json!({})), Some(Set(Waiting, false)));
+        assert_eq!(
+            hook("ElicitationResult", json!({})),
+            Some(Set(Working, false))
+        );
+        assert_eq!(hook("Stop", json!({})), Some(Set(Done, false)));
+        assert_eq!(hook("StopFailure", json!({})), Some(Set(Done, true)));
         assert_eq!(hook("SubagentStart", json!({})), None);
         assert_eq!(
-            claude_hook_agent_status(&json!({"hook_event_name":"Stop"})),
+            claude_hook_agent_status(
+                &serde_json::from_value(json!({"hook_event_name":"Stop"})).unwrap()
+            ),
             None,
             "a hook without a session is not trusted"
         );
+    }
+
+    #[test]
+    fn status_hooks_keep_no_prompt_or_tool_content() {
+        // Mutation caught: the status path decoding a hook whole, so a prompt or tool output
+        // is read and held while AI Terminal activity is off (#187).
+        let hook: ClaudeStatusHook = serde_json::from_value(json!({
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "s",
+            "prompt": "private prompt text",
+            "tool_input": {"command": "private tool input"},
+            "tool_response": "private tool output",
+            "transcript_path": "/private/transcript.jsonl",
+        }))
+        .expect("status hook");
+        let kept = format!("{hook:?}");
+        for private in ["private prompt", "private tool", "transcript"] {
+            assert!(!kept.contains(private), "{kept}");
+        }
     }
 
     #[tokio::test]
@@ -3037,6 +3162,7 @@ mod tests {
             requests,
             request_permits: Arc::new(Semaphore::new(4)),
             status: generation.observation(),
+            status_session: Arc::new(Mutex::new(None)),
         };
         let send = |token: &str, body: Value| {
             let mut headers = HeaderMap::new();
@@ -3091,18 +3217,70 @@ mod tests {
             request_receiver.try_recv().is_err(),
             "dormant activity forwards nothing to the activity worker"
         );
+        let state_of = || status.borrow().map(|observation| observation.state);
+
+        // A subagent's finished tool ends an approval prompt, and only that.
+        let subagent_tool = json!({
+            "hook_event_name":"PostToolUse", "session_id":"s", "agent_id":"sub", "tool_name":"Bash"
+        });
+        assert_eq!(
+            send("token", subagent_tool.clone()).await,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            state_of(),
+            Some(TerminalAgentState::Done),
+            "done stays done"
+        );
+        send(
+            "token",
+            json!({"hook_event_name":"PermissionRequest","session_id":"s"}),
+        )
+        .await;
+        send("token", subagent_tool).await;
+        assert_eq!(state_of(), Some(TerminalAgentState::Working));
+
+        // Another session's hooks leave the main one alone until a new session starts.
+        send(
+            "token",
+            json!({"hook_event_name":"Stop","session_id":"other"}),
+        )
+        .await;
+        assert_eq!(state_of(), Some(TerminalAgentState::Working));
+        send(
+            "token",
+            json!({"hook_event_name":"SessionStart","session_id":"cleared","source":"clear"}),
+        )
+        .await;
+        assert_eq!(state_of(), Some(TerminalAgentState::Done));
+        send(
+            "token",
+            json!({"hook_event_name":"UserPromptSubmit","session_id":"s","prompt":"old"}),
+        )
+        .await;
+        assert_eq!(
+            state_of(),
+            Some(TerminalAgentState::Done),
+            "the session before /clear no longer reports"
+        );
+        send(
+            "token",
+            json!({"hook_event_name":"UserPromptSubmit","session_id":"cleared","prompt":"new"}),
+        )
+        .await;
+        assert_eq!(state_of(), Some(TerminalAgentState::Working));
 
         // A replaced generation's late hook is ignored.
         generation.invalidate().await;
         let late = send(
             "token",
-            json!({"hook_event_name":"UserPromptSubmit","session_id":"s"}),
+            json!({"hook_event_name":"Stop","session_id":"cleared"}),
         )
         .await;
         assert_eq!(late, StatusCode::NO_CONTENT);
         assert_eq!(
             status.borrow().map(|observation| observation.state),
-            Some(TerminalAgentState::Done)
+            Some(TerminalAgentState::Working)
         );
     }
 }
