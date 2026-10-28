@@ -1,5 +1,41 @@
 # Changelog
 
+## [v0.13.0] - 2026-10-28
+
+BiBCode v0.13.0 adds an Inbox for agent work, makes agent status more reliable, and moves Activity into each chat and AI Terminal. Chats keep drafts and their reading position through reconnects and streaming. Diagnostics can collect logs from a connected server, and a paired CLI can download a remote bundle while the desktop app is closed. This release includes the changes since v0.12.0.
+
+### Agents and Activity
+
+- The sidebar Inbox groups agents into All Agents, Needs Attention, Working, and Done. Open a row to return to its exact chat or terminal. (#186)
+- Agent status distinguishes active work, questions, failed work, and a provider that has stopped reporting. Open subagents close as Interrupted when their BiBCode-owned provider process ends. (#187, #206)
+- Activity opens as a collapsible card in its chat or AI Terminal. Each pane keeps its own open state and section. (#188)
+- Create Worktree and Add Project use the Default Agent selected in Settings for the target environment. (#185)
+
+### Chats and composer
+
+- Text typed while a new chat starts or an attachment waits for authorization stays in the composer. A failed first send restores the draft in the thread. (#189)
+- The composer stays editable during a disconnect. Send and other actions explain why they cannot run, and a reconnect does not send saved text by itself. (#199)
+- Keyboard scrolling stops live following. A new sent message lands at its intended offset, and a growing reply or Activity card keeps the right reading position. (#190, #191, #193)
+- Sidebar subscriptions retain less thread data across reconnects, and long-lived chat handlers no longer hold old renders. (#198, #204)
+
+### Diagnostics and remote access
+
+- Diagnostics downloads logs from the selected connected environment. A download opened from a thread uses that thread's environment. (#194, #201)
+- The CLI can request a remote diagnostics bundle through an in-app approval, or pair a diagnostics-only credential for unattended downloads while the app is closed. (#201, #202)
+- A v0.13.0 server skips an authorization row with an unknown future scope, warns, and refuses that credential. Before rolling back to v0.12.0 or earlier, revoke diagnostics clients in Share this host or wait for them to expire. (#202)
+
+### AI Terminals and providers
+
+- Claude status checks use the executable and environment that the terminal will launch, including supported mise shims. A failed probe no longer leaves subagents looking active. (#195, #196)
+- Each provider controls its terminal preparation time. Claude has a bounded preparation period before it starts without status observation. (#200)
+- Claude AI Terminal status hooks cover the proven Claude Code 2.1.220 through 2.1.312 builds. Newer builds show Status unavailable until a release proves their hooks safe. (#203)
+- Silent Codex terminal observer exits now log their stage and elapsed time without prompt or terminal content. The macOS x64 terminal Activity check remains open for native confirmation. (#192)
+
+### Known limitations
+
+- The macOS reconnect footprint still needs heap evidence to distinguish a leak from retained allocator memory. (#134)
+- The trigger behind the reported remote-server subagent case was not captured; process-end closure is covered by tests, but that exact remote incident remains unconfirmed. (#206)
+
 ## [v0.12.0] - 2026-10-26
 
 BiBCode v0.12.0 adds a Pipelines module for GitLab pipelines and GitHub Actions runs, with a page for each pipeline and each job's log. Chats gain Thinking rows for Claude and Codex reasoning, Mermaid diagrams, find in thread, a History menu for past chats and Claude Code terminal sessions, and recovery from a full context window: BiBCode compacts the conversation and sends your message again. The Diff panel gains a side-by-side Compare view and Open with for your diff app, open files reload when an agent changes them on disk, the Device panel runs up to four devices at once, and a failed Source Control action now names the step that failed, with Git's reason. This release includes the changes since v0.11.0.
