@@ -202,12 +202,14 @@ pub(crate) fn instance_custom_models(settings: &Value, instance_id: &str) -> Vec
         .unwrap_or_default()
 }
 
-/// Whether any OpenCode instance points at a server URL, so its sessions run on a server the
-/// user runs rather than on BiBCode's own child.
-pub(crate) fn opencode_server_url_configured(settings: &Value) -> bool {
+/// The OpenCode instances that point at a server URL: their sessions run on a server the user
+/// runs rather than on BiBCode's own child.
+pub(crate) fn opencode_instances_with_server_url(settings: &Value) -> Vec<String> {
     definitions(settings)
-        .iter()
-        .any(|definition| definition.driver == "opencode" && definition.endpoint.is_some())
+        .into_iter()
+        .filter(|definition| definition.driver == "opencode" && definition.endpoint.is_some())
+        .map(|definition| definition.instance_id)
+        .collect()
 }
 
 fn definitions(settings: &Value) -> Vec<ProviderDefinition> {
@@ -1993,6 +1995,35 @@ mod tests {
 
     #[cfg(unix)]
     use crate::test_support::TestSandbox;
+
+    /// A local OpenCode instance beside one on a server the user runs: only the latter counts
+    /// as external, so a legacy thread on the local one settles at startup (#206).
+    #[test]
+    fn only_opencode_instances_with_a_server_url_run_on_a_users_server() {
+        let settings = json!({
+            "providerInstances": {
+                "local-opencode": { "driver": "opencode", "config": { "serverUrl": "" } },
+                "remote-opencode": {
+                    "driver": "opencode",
+                    "config": { "serverUrl": "http://192.0.2.10:4096" }
+                },
+                "codex": { "driver": "codex", "config": { "apiEndpoint": "http://192.0.2.11" } }
+            }
+        });
+        assert_eq!(
+            opencode_instances_with_server_url(&settings),
+            vec!["remote-opencode".to_owned()]
+        );
+        let ownership = crate::orchestration::StartupProcessOwnership::new(
+            [(
+                "local-thread",
+                Some("local-opencode"),
+                Some(&json!({ "transport": "http" })),
+            )],
+            opencode_instances_with_server_url(&settings),
+        );
+        assert!(!ownership.work_may_outlive_bibcode("local-thread", "opencode", None));
+    }
     use axum::{Json, Router, routing::get};
 
     #[cfg(target_os = "linux")]

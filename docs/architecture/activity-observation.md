@@ -108,9 +108,10 @@ state read before abandoned sessions settle:
   `processOwner: "bibcode"`, which `OpenCodeDriver::start` writes, ended too;
   `"external"` may still run.
 - An OpenCode thread with no recorded owner (a row from an older build, or no
-  row) follows the current settings: a configured OpenCode **Server URL** means
-  the user's server ran it and it may still run; none means BiBCode's child ran
-  it and it ended.
+  row) follows the current settings of its own provider instance, from the row
+  or else from the session or scope: a **Server URL** on that instance means the
+  user's server ran it and it may still run; none means BiBCode's child ran it
+  and it ended. With no known instance, any configured Server URL keeps it.
 
 The same rule decides #187's startup request expiry
 (`expire_requests_of_settled_sessions`), so a thread never shows its subagents

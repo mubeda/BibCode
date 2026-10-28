@@ -1877,8 +1877,8 @@ actor and the number of currently active child agents included in the subtree.
 An active actor without a current exact provider target keeps its observed
 **Running** lifecycle and shows read-only **Stop unavailable** in the action
 column. The label can take keyboard focus, and its tooltip and accessible
-description say the provider can't stop that subagent on its own and that
-stopping the turn ends it.
+description say the provider doesn't offer a way to stop that subagent from
+BiBCode.
 That label performs no RPC and is distinct from server-authoritative
 **Stopping**; it makes target-retirement state explicit without inventing
 cancellation authority.
@@ -1896,7 +1896,7 @@ reports the same subagent running again, as a resumed Codex session can, the row
 returns to **Active**. A chat attached to an OpenCode server you run yourself
 keeps its rows as they are, because that server may still be running them. A
 chat from before this behavior, whose owner BiBCode never recorded, counts as
-yours when **Settings → Providers → OpenCode → Server URL** is set.
+yours when its own OpenCode provider instance has a **Server URL** set.
 
 **Stop subtree** targets the selected actor and every attributable descendant
 in its canonical subtree; **Stop** targets an actor with no active descendants.

@@ -3,7 +3,7 @@
 //! and what it closes (open subagents and background tasks), so a thread never shows its
 //! subagents interrupted beside requests still waiting on the same, dead, process.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::Value;
 
@@ -14,50 +14,78 @@ pub(crate) const PROCESS_OWNER_PAYLOAD_KEY: &str = "processOwner";
 pub(crate) const PROCESS_OWNER_BIBCODE: &str = "bibcode";
 pub(crate) const PROCESS_OWNER_EXTERNAL: &str = "external";
 
+/// One persisted runtime row, as a server start reads it.
+pub type StartupRuntimeRow<'a> = (&'a str, Option<&'a str>, Option<&'a Value>);
+
+#[derive(Clone, Debug, Default)]
+struct RecordedRuntime {
+    owner: Option<String>,
+    provider_instance_id: Option<String>,
+}
+
 /// What a server start knows about who ran each thread's provider process: the persisted
-/// runtime rows, read before abandoned sessions are settled, and whether the settings point
-/// OpenCode at a server the user runs.
+/// runtime rows (thread, provider instance, payload), read before abandoned sessions are
+/// settled, and which provider instances the settings point at a server the user runs.
 #[derive(Clone, Debug, Default)]
 pub struct StartupProcessOwnership {
-    owners: HashMap<String, Option<String>>,
-    external_server_configured: bool,
+    runtimes: HashMap<String, RecordedRuntime>,
+    external_server_instances: HashSet<String>,
 }
 
 impl StartupProcessOwnership {
     #[must_use]
     pub fn new<'a>(
-        runtimes: impl IntoIterator<Item = (&'a str, Option<&'a Value>)>,
-        external_server_configured: bool,
+        runtimes: impl IntoIterator<Item = StartupRuntimeRow<'a>>,
+        external_server_instances: impl IntoIterator<Item = String>,
     ) -> Self {
-        let owners = runtimes
+        let runtimes = runtimes
             .into_iter()
-            .map(|(thread_id, payload)| {
+            .map(|(thread_id, provider_instance_id, payload)| {
                 let owner = payload
                     .and_then(|payload| payload.get(PROCESS_OWNER_PAYLOAD_KEY))
                     .and_then(Value::as_str)
                     .map(str::to_owned);
-                (thread_id.to_owned(), owner)
+                (
+                    thread_id.to_owned(),
+                    RecordedRuntime {
+                        owner,
+                        provider_instance_id: provider_instance_id.map(str::to_owned),
+                    },
+                )
             })
             .collect();
         Self {
-            owners,
-            external_server_configured,
+            runtimes,
+            external_server_instances: external_server_instances.into_iter().collect(),
         }
     }
 
     /// Whether the thread's provider may still be running its work. Only a provider that can
-    /// attach to a server the user runs (OpenCode) can be. Its persisted owner decides; a row
-    /// written before the owner was recorded, or no row at all, follows the current settings: a
-    /// configured server URL means the user's server ran it, none means BiBCode's own child did.
+    /// attach to a server the user runs (OpenCode) can be. Its persisted owner decides. A row
+    /// written before the owner was recorded, or no row at all, follows the current settings of
+    /// the thread's own provider instance (from its row, else `provider_instance_id`): a server
+    /// URL means the user's server ran it, none means BiBCode's own child did. With no known
+    /// instance, any configured server URL keeps the work.
     #[must_use]
-    pub fn work_may_outlive_bibcode(&self, thread_id: &str, provider: &str) -> bool {
+    pub fn work_may_outlive_bibcode(
+        &self,
+        thread_id: &str,
+        provider: &str,
+        provider_instance_id: Option<&str>,
+    ) -> bool {
         if !EXTERNALLY_RESUMABLE_PROVIDERS.contains(&provider) {
             return false;
         }
-        match self.owners.get(thread_id).and_then(Option::as_deref) {
+        let recorded = self.runtimes.get(thread_id);
+        match recorded.and_then(|runtime| runtime.owner.as_deref()) {
             Some(PROCESS_OWNER_BIBCODE) => false,
             Some(PROCESS_OWNER_EXTERNAL) => true,
-            _ => self.external_server_configured,
+            _ => recorded
+                .and_then(|runtime| runtime.provider_instance_id.as_deref())
+                .or(provider_instance_id)
+                .map_or(!self.external_server_instances.is_empty(), |instance| {
+                    self.external_server_instances.contains(instance)
+                }),
         }
     }
 }
@@ -74,30 +102,48 @@ mod tests {
         let external = json!({ "processOwner": "external" });
         let legacy = json!({ "transport": "http" });
         let rows = [
-            ("owned", Some(&owned)),
-            ("external", Some(&external)),
-            ("legacy", Some(&legacy)),
-            ("no-payload", None),
+            ("owned", Some("opencode"), Some(&owned)),
+            ("external", Some("opencode"), Some(&external)),
+            ("legacy", Some("opencode"), Some(&legacy)),
+            ("no-payload", Some("opencode"), None),
         ];
         for configured in [false, true] {
-            let ownership = StartupProcessOwnership::new(rows, configured);
-            assert!(!ownership.work_may_outlive_bibcode("owned", "opencode"));
-            assert!(ownership.work_may_outlive_bibcode("external", "opencode"));
+            let instances = configured.then(|| "opencode".to_owned());
+            let ownership = StartupProcessOwnership::new(rows, instances);
+            assert!(!ownership.work_may_outlive_bibcode("owned", "opencode", None));
+            assert!(ownership.work_may_outlive_bibcode("external", "opencode", None));
             assert_eq!(
-                ownership.work_may_outlive_bibcode("legacy", "opencode"),
+                ownership.work_may_outlive_bibcode("legacy", "opencode", None),
                 configured
             );
             assert_eq!(
-                ownership.work_may_outlive_bibcode("no-payload", "opencode"),
+                ownership.work_may_outlive_bibcode("no-payload", "opencode", None),
                 configured
             );
             assert_eq!(
-                ownership.work_may_outlive_bibcode("no-row", "opencode"),
+                ownership.work_may_outlive_bibcode("no-row", "opencode", Some("opencode")),
                 configured
             );
             // Claude and Codex always run their own child.
-            assert!(!ownership.work_may_outlive_bibcode("external", "claudeAgent"));
-            assert!(!ownership.work_may_outlive_bibcode("legacy", "codex"));
+            assert!(!ownership.work_may_outlive_bibcode("external", "claudeAgent", None));
+            assert!(!ownership.work_may_outlive_bibcode("legacy", "codex", None));
         }
+    }
+
+    #[test]
+    fn a_legacy_row_follows_its_own_instance_beside_a_remote_one() {
+        let legacy = json!({ "transport": "http" });
+        let ownership = StartupProcessOwnership::new(
+            [
+                ("local-thread", Some("local-opencode"), Some(&legacy)),
+                ("remote-thread", Some("remote-opencode"), Some(&legacy)),
+            ],
+            ["remote-opencode".to_owned()],
+        );
+        assert!(!ownership.work_may_outlive_bibcode("local-thread", "opencode", None));
+        assert!(ownership.work_may_outlive_bibcode("remote-thread", "opencode", None));
+        // Without a row, the caller's instance decides; with no instance known, any remote one.
+        assert!(!ownership.work_may_outlive_bibcode("rowless", "opencode", Some("local-opencode")));
+        assert!(ownership.work_may_outlive_bibcode("rowless", "opencode", None));
     }
 }

@@ -516,9 +516,9 @@ impl NativeServerControl {
         agent_activity_enabled(&*self.settings.read().await, source)
     }
 
-    /// Whether any OpenCode instance points at a server the user runs (#206).
-    pub(crate) async fn opencode_server_url_configured(&self) -> bool {
-        crate::production::provider_inventory::opencode_server_url_configured(
+    /// The OpenCode instances that point at a server the user runs (#206).
+    pub(crate) async fn opencode_instances_with_server_url(&self) -> Vec<String> {
+        crate::production::provider_inventory::opencode_instances_with_server_url(
             &*self.settings.read().await,
         )
     }

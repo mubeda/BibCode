@@ -360,7 +360,7 @@ impl ProductionRuntime {
         // ownership rule decides both what this closes and what request expiry keeps.
         let process_ownership = startup_process_ownership(
             &repositories,
-            control.opencode_server_url_configured().await,
+            control.opencode_instances_with_server_url().await,
         )
         .await;
         interrupt_activity_of_ended_sessions(&process_ownership, &activity_projections.chat())

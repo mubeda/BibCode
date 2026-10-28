@@ -2880,7 +2880,8 @@ impl OrchestrationEngine {
                 // Only threads with something open are visited: the counts say which.
                 let threads = connection
                     .prepare(
-                        "SELECT thread.thread_id, COALESCE(session.provider_name, '')
+                        "SELECT thread.thread_id, COALESCE(session.provider_name, ''),
+                                session.provider_instance_id
                            FROM projection_threads AS thread
                            LEFT JOIN projection_thread_sessions AS session
                              ON session.thread_id = thread.thread_id
@@ -2888,13 +2889,19 @@ impl OrchestrationEngine {
                             AND (thread.pending_approval_count > 0 OR thread.pending_user_input_count > 0)
                             AND COALESCE(session.status, 'idle') NOT IN ('running', 'starting')",
                     )?
-                    .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                        ))
+                    })?
                     .collect::<Result<Vec<_>, _>>()?
                     .into_iter()
-                    .filter(|(thread_id, provider)| {
-                        !ownership.work_may_outlive_bibcode(thread_id, provider)
+                    .filter(|(thread_id, provider, instance)| {
+                        !ownership.work_may_outlive_bibcode(thread_id, provider, instance.as_deref())
                     })
-                    .map(|(thread_id, _)| thread_id)
+                    .map(|(thread_id, _, _)| thread_id)
                     .collect::<Vec<_>>();
                 let mut requests = Vec::new();
                 for thread_id in threads {
