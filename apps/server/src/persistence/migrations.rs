@@ -687,6 +687,7 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration::new(54, "ProjectionThreadHostThread", migration_054),
     Migration::new(55, "ProjectionThreadReasoning", migration_055),
     Migration::new(56, "ThreadCompactions", migration_056),
+    Migration::new(57, "ProjectionThreadAgentStatus", migration_057),
 ];
 
 impl Migration {
@@ -2648,6 +2649,40 @@ fn migration_056(transaction: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
+fn migration_057(transaction: &Transaction<'_>) -> Result<()> {
+    // The left panel's agent status (#187): when the provider last showed progress on a thread,
+    // and its pending-question count, which earlier builds reset to 0 on every thread event.
+    if !table_exists(transaction, "projection_threads")? {
+        return Ok(());
+    }
+    if !table_has_column(transaction, "projection_threads", "last_activity_at")? {
+        transaction
+            .execute_batch("ALTER TABLE projection_threads ADD COLUMN last_activity_at TEXT;")?;
+    }
+    if table_exists(transaction, "orchestration_events")? {
+        // Existing threads age from their latest provider event, so a long-silent one reads
+        // stale at once instead of fresh for another 30 minutes.
+        transaction.execute_batch(
+            "UPDATE projection_threads SET last_activity_at = (
+               SELECT MAX(event.occurred_at) FROM orchestration_events AS event
+                WHERE event.aggregate_kind = 'thread'
+                  AND event.stream_id = projection_threads.thread_id
+                  AND event.actor_kind = 'provider'
+             ) WHERE last_activity_at IS NULL;",
+        )?;
+    }
+    // Startup then expires the recounted questions and approvals that no live session holds
+    // (`OrchestrationEngine::expire_requests_of_settled_sessions`), as ordinary activities.
+    if table_exists(transaction, "projection_thread_activities")? {
+        let open =
+            super::repositories::open_user_input_requests_sql("projection_threads.thread_id");
+        transaction.execute_batch(&format!(
+            "UPDATE projection_threads SET pending_user_input_count = (SELECT COUNT(*) FROM ({open}));"
+        ))?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -2790,6 +2825,35 @@ mod tests {
     }
 
     #[test]
+    fn migration_057_recounts_questions_and_backfills_provider_progress() -> rusqlite::Result<()> {
+        let mut connection = rusqlite::Connection::open_in_memory()?;
+        run_migrations(&mut connection, Some(56))?;
+        connection.execute_batch(
+            "INSERT INTO projection_threads (thread_id, project_id, title, model_selection_json, runtime_mode, interaction_mode, branch, worktree_path, latest_turn_id, created_at, updated_at, archived_at, deleted_at) VALUES ('t', 'p', 'T', '{}', 'full-access', 'default', NULL, NULL, NULL, '2026-10-08T00:00:00Z', '2026-10-08T00:00:00Z', NULL, NULL);
+             INSERT INTO projection_threads (thread_id, project_id, title, model_selection_json, runtime_mode, interaction_mode, branch, worktree_path, latest_turn_id, created_at, updated_at, archived_at, deleted_at) VALUES ('quiet', 'p', 'Q', '{}', 'full-access', 'default', NULL, NULL, NULL, '2026-10-08T00:00:00Z', '2026-10-08T00:00:00Z', NULL, NULL);
+             INSERT INTO projection_thread_activities (activity_id, thread_id, turn_id, tone, kind, summary, payload_json, sequence, created_at) VALUES ('ask', 't', NULL, 'info', 'user-input.requested', 'Q', '{\"requestId\":\"q1\"}', 1, '2026-10-08T00:01:00Z');
+             INSERT INTO projection_thread_activities (activity_id, thread_id, turn_id, tone, kind, summary, payload_json, sequence, created_at) VALUES ('ask-2', 't', NULL, 'info', 'user-input.requested', 'Q', '{\"requestId\":\"q2\"}', 2, '2026-10-08T00:02:00Z');
+             INSERT INTO projection_thread_activities (activity_id, thread_id, turn_id, tone, kind, summary, payload_json, sequence, created_at) VALUES ('answer-2', 't', NULL, 'info', 'user-input.resolved', 'A', '{\"requestId\":\"q2\"}', 3, '2026-10-08T00:03:00Z');
+             INSERT INTO orchestration_events (event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at, command_id, causation_event_id, correlation_id, actor_kind, payload_json, metadata_json) VALUES ('e1', 'thread', 't', 1, 'thread.activity-appended', '2026-10-08T00:01:00Z', 'provider:1', NULL, NULL, 'provider', '{}', '{}');
+             INSERT INTO orchestration_events (event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at, command_id, causation_event_id, correlation_id, actor_kind, payload_json, metadata_json) VALUES ('e2', 'thread', 't', 2, 'thread.meta-updated', '2026-10-08T00:09:00Z', 'client', NULL, NULL, 'client', '{}', '{}');",
+        )?;
+
+        run_migrations(&mut connection, Some(57))?;
+
+        let read = |thread: &str| {
+            connection.query_row(
+                "SELECT pending_user_input_count, last_activity_at FROM projection_threads WHERE thread_id = ?",
+                [thread],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+        };
+        // Only the unanswered question counts; the client rename is not provider progress.
+        assert_eq!(read("t")?, (1, Some("2026-10-08T00:01:00Z".to_owned())));
+        assert_eq!(read("quiet")?, (0, None));
+        Ok(())
+    }
+
+    #[test]
     fn migration_054_adds_nullable_host_thread_column() -> rusqlite::Result<()> {
         let mut connection = rusqlite::Connection::open_in_memory()?;
         run_migrations(&mut connection, Some(53))?;
@@ -2829,7 +2893,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [55, 56]
+            [55, 56, 57]
         );
         connection.execute(
             "INSERT INTO projection_thread_reasoning (reasoning_id, thread_id, turn_id, text, is_streaming, created_at, updated_at) VALUES ('r', 't', NULL, 'A thought', 1, '2026-10-24T00:00:00Z', '2026-10-24T00:00:00Z')",
@@ -3558,7 +3622,7 @@ mod tests {
             .map(|migration| migration.id)
             .collect::<Vec<_>>();
 
-        assert_eq!(ids, (1..=56).collect::<Vec<_>>());
+        assert_eq!(ids, (1..=57).collect::<Vec<_>>());
         assert_eq!(MIGRATIONS[0].name, "OrchestrationEvents");
         assert_eq!(MIGRATIONS[33].name, "ActivityProjection");
         assert_eq!(MIGRATIONS[34].name, "ActivityJournalEventKeyNamespace");
@@ -3617,6 +3681,7 @@ mod tests {
                 (54, "ProjectionThreadHostThread"),
                 (55, "ProjectionThreadReasoning"),
                 (56, "ThreadCompactions"),
+                (57, "ProjectionThreadAgentStatus"),
             ],
         );
         assert_eq!(
@@ -3713,13 +3778,14 @@ mod tests {
         assert_eq!(first[15].id, 16);
 
         let second = run_migrations(&mut connection, None)?;
-        assert_eq!(second.len(), 40);
+        assert_eq!(second.len(), 41);
         assert_eq!(second[0].id, 17);
         assert_eq!(second[35].id, 52);
         assert_eq!(second[36].id, 53);
         assert_eq!(second[37].id, 54);
         assert_eq!(second[38].id, 55);
         assert_eq!(second[39].id, 56);
+        assert_eq!(second[40].id, 57);
 
         let third = run_migrations(&mut connection, None)?;
         assert!(third.is_empty());
@@ -3827,7 +3893,7 @@ mod tests {
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
             [
-                40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56
+                40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57
             ]
         );
         let policy = connection.query_row(
@@ -3866,7 +3932,7 @@ mod tests {
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
             [
-                41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56
+                41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57
             ]
         );
         let pin = connection.query_row(
@@ -3895,7 +3961,9 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56]
+            [
+                42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57
+            ]
         );
         let pin = connection.query_row(
             "SELECT repository_key FROM project_worktree_repository_pins WHERE project_id = 'project-pinned'",
@@ -4035,7 +4103,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [48, 49, 50, 51, 52, 53, 54, 55, 56]
+            [48, 49, 50, 51, 52, 53, 54, 55, 56, 57]
         );
         assert_eq!(
             connection.query_row(
@@ -4064,7 +4132,7 @@ mod tests {
         )?;
 
         let applied = run_migrations(&mut connection, None)?;
-        assert_eq!(applied.len(), 23);
+        assert_eq!(applied.len(), 24);
         assert_eq!(applied[0].id, 34);
         assert_eq!(applied[1].id, 35);
         assert_eq!(applied[2].id, 36);
@@ -4088,6 +4156,7 @@ mod tests {
         assert_eq!(applied[20].id, 54);
         assert_eq!(applied[21].id, 55);
         assert_eq!(applied[22].id, 56);
+        assert_eq!(applied[23].id, 57);
         let value = connection.query_row("SELECT value FROM legacy_user_data", [], |row| {
             row.get::<_, String>(0)
         })?;

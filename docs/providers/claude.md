@@ -616,5 +616,29 @@ executable must support the required settings switches and BiBCode's additive
 hook preparation. If preparation cannot be established before spawn, the
 original Claude terminal command runs without structured terminal activity.
 
+Every Claude Terminal is prepared this way, whatever the AI Terminal activity
+setting says, because the left panel shows its agent's status (#187). The
+injected settings add these hooks to the subagent and tool hooks:
+
+- `SessionStart`
+- `UserPromptSubmit`
+- `PermissionRequest`
+- `Notification`
+- `Elicitation`
+- `ElicitationResult`
+- `Stop`
+- `StopFailure`
+- `SessionEnd`
+
+BiBCode only reads them: it answers each with no content, so none of them
+changes what Claude does. Status decodes only the event name, session, agent,
+tool name and notification type, never prompt or tool content, and follows the
+main session: the first one heard, then each new `SessionStart` (`/clear` and
+resume start a new session).
+
+If the terminal cannot be prepared, its status reads **Status unavailable**.
+That happens with a Claude Code older than v2.1.63 (no authenticated HTTP hooks),
+on Windows, or when the probe or settings merge fails.
+
 See [Activity observation](../architecture/activity-observation.md) for the
 shared protocol and provider matrix.

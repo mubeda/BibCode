@@ -301,6 +301,69 @@ RPC admission, generation fencing, projection, cleanup, and observer lifecycle
 are selected from the request scope; changing one gate does not transition the
 other. Legacy `enableAgentActivity` values migrate only to Chat.
 
+### AI Terminal agent status
+
+Every observable AI Terminal (Claude, Codex, OpenCode) launches with its
+observer, whatever the AI Terminal gate says (#187). The left panel's terminal
+agent status needs the observer.
+
+**What the gate still controls.** The gate decides whether the observer also
+publishes activity:
+
+- An observer launched while the gate is off starts dormant
+  (`TerminalAgentActivityControl::with_enabled(false)`, a `Prepared` launch
+  with no admission). It skips the history and child reconciliation it would
+  publish.
+- A dormant observer follows later gate transitions like any other observer.
+  When the gate opens on one that never published, it creates its activity
+  scope with the root agent then; OpenCode reconciles the session tree at once.
+
+**How each provider reports.** Each observer reports its main agent's state
+through its generation (`TerminalObserverGenerationLease::publish_agent_status`),
+independently of admission:
+
+- **Claude:** status hooks on the existing authenticated loopback receiver.
+  The hooks are `SessionStart`, `UserPromptSubmit`, `PermissionRequest`,
+  `Notification` (`idle_prompt` reads Done), `Elicitation`,
+  `ElicitationResult`, `Stop`, `StopFailure` and `SessionEnd`, plus main-agent
+  `PreToolUse` and `PostToolUse`; any agent's finished tool ends an approval
+  prompt. Status follows the main session, rebinding on `SessionStart`.
+  Status-only hooks never reach the activity worker, and status decodes only
+  the fields it reads; a hook is decoded whole only for live activity.
+  Activity admission is still taken before the body arrives.
+- **Codex:** the TUI root thread's `thread/status/changed` notifications
+  (including `activeFlags`), `turn/started`, `turn/completed`, its approval and
+  question requests, and its `item/*` notifications as progress. The
+  `thread/resume` response sets the state at attach and reattach.
+- **OpenCode:** root-session `session.status`, `session.idle`,
+  `session.error`, permission and question events, and its `message.part.*`
+  events as progress, read from a dormant stream too, which decodes only the
+  type, session and status fields. The session statuses set the state at
+  attach and reconnect (OpenCode lists only sessions that are not idle).
+- **Progress** reads Working unless the agent is blocked on an approval or
+  waiting on the user, which only an answer or a new status ends.
+
+**Publication.** The terminal manager mirrors the latest report into
+`TerminalSummary.agentStatus` on the metadata stream:
+
+- A changed state is mirrored at once.
+- An unchanged report refreshes its age at most once a minute.
+- The age (`ageMs`) and the evidence token (`observedAt`) are computed when the
+  summary is serialized, so the metadata snapshot that starts each subscription
+  carries current ages.
+- A launch that names a provider but gets no observer reads `unavailable`.
+  That covers Cursor and Grok, Windows, and a failed preparation, and the value
+  stays `unavailable` after exit. An observed agent settles to `done` on exit,
+  failed for a non-zero exit code other than a Ctrl+C quit (130, SIGINT, or
+  Windows' control-C status).
+
+**Trust boundary.** It is unchanged. Hooks still reach only a `127.0.0.1`
+listener with a per-generation bearer token, checked in constant time, and
+settings owned by that generation. Codex still uses its generation's
+Unix-socket helper. The status carries only the derived state, never prompt,
+message or terminal content. The change is in reach: every observable AI
+Terminal now runs an observer, not only terminals launched with the gate on.
+
 ### Codex structured recovery
 
 Codex structured recovery merges validated, bounded live and root/child-history
@@ -528,18 +591,56 @@ Every way a Codex terminal ends up without Activity is logged under
     seconds. The observer keeps waiting.
   - `connect_failed`, unless the terminal is already closing.
   - `root_discovery_stopped`, `root_discovery_reconnect_failed`, the `resume_*`
-    reasons, and `live_publication_rejected`.
+    reasons, and `live_publication_rejected`, whose detail says whether the
+    terminal generation was no longer current or creating the scope failed (the
+    kind of failure only).
   - `root_discovery_pending`, once, if no TUI thread is found within ten
     seconds.
 
   These lines carry no App Server error text, which can quote thread content.
   They carry the JSON-RPC error code, or which transport step failed.
 
-The preparation budget (350 ms) and the manager's callback cap (500 ms) are
-unchanged. Run alone, the packaged Activity spec passed on both macOS
-architectures with none of these lines (#192), so the earlier x64
-failures happen only with the full suite's load. Budgets change only if a full
-macOS x64 run fails and these lines name the stage that ran out.
+**Preparation budgets.** Each provider factory owns the time its preparation may take
+(`ProviderTerminalObserverFactory::preparation_budget`) and enforces it with
+its own timeout. The supervisor tells the terminal manager to wait that long
+plus a fixed 150 ms, so the factory's timeout fires first and cleans up. A
+launch the supervisor cannot validate (disabled or unknown instance, mismatched
+driver, unresolved executable) gets the manager's 500 ms default and passes
+through almost at once. The manager's own ceiling (3 s) is a stop for a
+preparer that asks to wait too long; a test keeps it above every provider's
+wait, so the ceiling never cuts a provider short (#200). The settings are read
+once per launch: the lookup that chooses the wait keeps the validated reading,
+and preparation of the same launch uses it, so settings that change between the
+two cannot start a preparation under the wrong wait. If that lookup is cut off,
+the launch passes through without a second read.
+
+| Provider | Own budget | `terminal.open` waits at most |
+| -------- | ---------- | ----------------------------- |
+| Codex    | 350 ms     | 500 ms                        |
+| OpenCode | 850 ms     | 1 s                           |
+| Claude   | 2.25 s     | 2.4 s                         |
+
+The wait applies only to a preparation still running. A launch that cannot be
+observed (an unapproved Claude build, missing capabilities) passes through in
+0.15 to 0.4 s without waiting for its budget. When the budget runs out the
+original command spawns unobserved, and the manager logs
+`provider terminal observer callback timed out` with `timeout_ms`. Claude
+cannot attach late: its observer rewrites the command (pinned executable and a
+`--settings` overlay), which has to happen before the PTY spawns.
+
+Claude's 2.25 s is the probe runner's own 2 s timeout, which bounds its slowest
+step (the attestation's `codesign` is capped at 500 ms and runs beside it),
+plus 250 ms to pin the executable, write the overlay and bind the listener.
+Measured on a 12-core Mac with a 276 MB Claude binary, the stages (`clonefile`
+pin, `--version` and `--help`, SHA-256 of the binary, `codesign`) take about
+0.2 s together, and a median of 252 ms (maximum 356 ms) with the CPU
+oversubscribed twice over. The earlier 500 ms wait cut a Claude preparation
+that was merely slow, which left the terminal without Activity or agent status.
+
+The Codex budget is unchanged. Run alone, the packaged Activity spec passed on
+both macOS architectures with none of the Codex observer lines (#192), so the
+earlier x64 failures happen only with the full suite's load. Budgets change
+only if a full macOS x64 run fails and these lines name the stage that ran out.
 
 A version the probes cannot parse is cached for that executable build for ten
 minutes, so launches in that window pass through without spawning probes. The

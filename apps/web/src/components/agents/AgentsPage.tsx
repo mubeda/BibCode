@@ -1,3 +1,4 @@
+import { scopedThreadKey } from "@bibcode/client-runtime/environment";
 import type { EnvironmentAvailabilityStatus } from "@bibcode/client-runtime/state/shell";
 import type { ScopedThreadRef } from "@bibcode/contracts";
 import { useRouter } from "@tanstack/react-router";
@@ -8,8 +9,16 @@ import {
   MoreHorizontalIcon,
   SearchIcon,
 } from "lucide-react";
-import { useCallback, useDeferredValue, useMemo, useState } from "react";
+import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 
+import { findCenterPanelGroupForSurface } from "../../centerPanelLayout";
+import { useCenterPanelStore } from "../../centerPanelStore";
+import {
+  type AgentEvidenceStamp,
+  useAgentRowFreshness,
+  useAgentTerminalSources,
+  useRecordAgentEvidence,
+} from "../../hooks/useAgentFreshness";
 import { cn } from "../../lib/utils";
 import { ChatRouteInset } from "../../routes/-ChatRouteInset";
 import { selectIsUnread, useSidebarWorkspaceMetaStore } from "../../sidebarWorkspaceMetaStore";
@@ -21,6 +30,7 @@ import { resolveAgentsGroupExpanded, useUiStateStore } from "../../uiStateStore"
 import ChatView from "../ChatView";
 import {
   type AgentRow,
+  agentRowUnreadKey,
   type AgentsGroupByMode,
   buildAgentRows,
   resolveAgentCheckouts,
@@ -48,6 +58,20 @@ const GROUP_BY_LABELS: Record<AgentsGroupByMode, string> = {
 
 function isAgentsGroupByMode(value: string | null): value is AgentsGroupByMode {
   return value === "status" || value === "project" || value === "environment";
+}
+
+/** Shows an AI Terminal row's terminal in its host thread's center panel. */
+function revealTerminalSurface(ref: ScopedThreadRef, terminalId: string): void {
+  const store = useCenterPanelStore.getState();
+  const surfaceId = `terminal:${terminalId}`;
+  const state = store.byThreadKey[scopedThreadKey(ref)];
+  const group = state === undefined ? undefined : findCenterPanelGroupForSurface(state, surfaceId);
+  if (group === undefined) {
+    store.openTerminalPanel(ref, terminalId);
+    return;
+  }
+  store.activateSurface(ref, group.id, surfaceId);
+  store.focusGroup(ref, group.id);
 }
 
 export function AgentsPage() {
@@ -78,13 +102,31 @@ export function AgentsPage() {
     [availabilityByEnvironmentId, projects, shells],
   );
   const liveBranchByCheckoutKey = useAgentLiveBranches(checkouts);
-  const rows = useMemo(() => {
+  const environmentIds = useMemo(
+    () => environments.map((environment) => environment.environmentId),
+    [environments],
+  );
+  const terminalSources = useAgentTerminalSources(environmentIds);
+  // Only a list with a status that can decay re-renders on the status clock.
+  const decayable = useMemo(
+    () =>
+      shells.some(
+        (shell) => shell.session?.status === "running" || shell.session?.status === "starting",
+      ) ||
+      terminalSources.some((source) =>
+        source.rows.some((terminal) => terminal.agentStatus?.state === "working"),
+      ),
+    [shells, terminalSources],
+  );
+  const freshness = useAgentRowFreshness(decayable);
+  const { rows, evidence } = useMemo(() => {
     const liveBranchByThreadKey = new Map<string, string>();
     for (const [threadKey, checkoutKey] of checkoutKeyByThreadKey) {
       const branch = liveBranchByCheckoutKey.get(checkoutKey);
       if (branch !== undefined) liveBranchByThreadKey.set(threadKey, branch);
     }
-    return buildAgentRows({
+    const evidence: AgentEvidenceStamp[] = [];
+    const rows = buildAgentRows({
       shells,
       projectTitleById: new Map<string, string>(
         projects.map((project) => [project.id, project.title]),
@@ -94,15 +136,21 @@ export function AgentsPage() {
       ),
       availabilityByEnvironmentId,
       liveBranchByThreadKey,
+      terminals: terminalSources,
+      freshness: freshness(evidence),
     });
+    return { rows, evidence };
   }, [
     availabilityByEnvironmentId,
     checkoutKeyByThreadKey,
     environments,
+    freshness,
     liveBranchByCheckoutKey,
     projects,
     shells,
+    terminalSources,
   ]);
+  useRecordAgentEvidence(evidence);
   const unreadCount = useMemo(
     () => countUnreadAgentRows(rows, unreadThreadKeys),
     [rows, unreadThreadKeys],
@@ -145,9 +193,19 @@ export function AgentsPage() {
     [router],
   );
 
+  // Read through a ref so the select handler keeps its identity and memoised rows skip
+  // re-rendering when only the list changed.
+  const rowsRef = useRef(rows);
+  useEffect(() => {
+    rowsRef.current = rows;
+  }, [rows]);
   const handleSelect = useCallback(
     (key: string) => {
-      markRead(key);
+      const row = rowsRef.current.find((candidate) => candidate.key === key);
+      markRead(row === undefined ? key : agentRowUnreadKey(row));
+      if (row !== undefined && row.terminalId !== null) {
+        revealTerminalSurface(row.ref, row.terminalId);
+      }
       setSelectedKey(key);
     },
     [markRead],
@@ -155,8 +213,9 @@ export function AgentsPage() {
 
   const handleJumpToWorkspace = useCallback(
     (row: AgentRow) => {
-      markRead(row.key);
+      markRead(agentRowUnreadKey(row));
       setActiveEnvironmentId(row.ref.environmentId);
+      if (row.terminalId !== null) revealTerminalSurface(row.ref, row.terminalId);
       navigateToThread(row.ref);
     },
     [markRead, navigateToThread],
@@ -164,8 +223,9 @@ export function AgentsPage() {
 
   const handleMarkAllRead = useCallback(() => {
     for (const row of rows) {
-      if (selectIsUnread(unreadThreadKeys, row.key)) {
-        markRead(row.key);
+      const unreadKey = agentRowUnreadKey(row);
+      if (selectIsUnread(unreadThreadKeys, unreadKey)) {
+        markRead(unreadKey);
       }
     }
   }, [markRead, rows, unreadThreadKeys]);

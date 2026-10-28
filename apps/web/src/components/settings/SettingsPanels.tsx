@@ -1123,7 +1123,7 @@ export function AgentsSettingsPanel() {
               Experimental
             </Badge>
           }
-          description="Show live agent and background-task activity in AI Terminals. Disabling this stops AI Terminal activity monitoring and collection."
+          description="Show live agent and background-task activity in AI Terminals. When off, agent status in the sidebar still updates."
           resetAction={
             settings.enableTerminalAgentActivity !==
             DEFAULT_SERVER_SETTINGS.enableTerminalAgentActivity ? (

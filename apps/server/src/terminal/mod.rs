@@ -7,6 +7,8 @@ mod pty;
 
 pub use input::TerminalInputError;
 pub(crate) use input::{InputReadmissionScope, TerminalInputAdmission};
+#[cfg(test)]
+pub(crate) use manager::MAX_PREPARATION_EXECUTION_BUDGET;
 pub(crate) use manager::TerminalSessionIdentity;
 pub use manager::{
     AttachmentItem, SubprocessInspection, TerminalAttachment, TerminalError, TerminalEventReceiver,
@@ -14,8 +16,9 @@ pub use manager::{
     TerminalSubprocessInspector, WorktreeRemovalGuard,
 };
 pub use model::{
-    ProviderTerminalActivityLaunch, TerminalAttachInput, TerminalConsoleTheme, TerminalEvent,
-    TerminalLaunchCommand, TerminalMetadataEvent, TerminalOpenInput, TerminalRemovalReason,
-    TerminalRestartInput, TerminalSessionSnapshot, TerminalSize, TerminalStatus, TerminalSummary,
+    ProviderTerminalActivityLaunch, TerminalAgentStatus, TerminalAgentStatusState,
+    TerminalAttachInput, TerminalConsoleTheme, TerminalEvent, TerminalLaunchCommand,
+    TerminalMetadataEvent, TerminalOpenInput, TerminalRemovalReason, TerminalRestartInput,
+    TerminalSessionSnapshot, TerminalSize, TerminalStatus, TerminalSummary,
 };
 pub use pty::{PortablePtyBackend, PtyBackend, PtyExit, PtyProcess, PtySpawnInput};

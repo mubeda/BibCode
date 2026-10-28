@@ -226,6 +226,52 @@ async fn no_promotion_while_approval_or_user_input_pending() {
 }
 
 #[tokio::test]
+async fn a_relaunch_with_a_recovered_ask_does_not_send_the_follow_up() {
+    for kind in ["approval", "user-input"] {
+        let engine = engine().await;
+        // A suspended OpenCode session with a queued follow-up is resumed.
+        session(&engine, "stopped", "suspended").await;
+        enqueue(&engine, "queued", true).await;
+        // It launches `starting` until its recovered asks are shown (#187): nothing is sent.
+        session(&engine, "starting", "relaunch").await;
+        let (service, mut routes) = service(&engine);
+        quiet(&mut routes).await;
+        activity(&engine, &format!("{kind}.requested"), "request-recovered").await;
+        session(&engine, "ready", "recovery-settled").await;
+        // The recovered ask holds the follow-up until it is answered.
+        quiet(&mut routes).await;
+        assert_eq!(
+            row(&engine, "queued").await.state,
+            TurnDeliveryState::Queued
+        );
+        activity(&engine, &format!("{kind}.resolved"), "request-resolved").await;
+        session(&engine, "ready", "answered").await;
+        received(&mut routes, "queued").await;
+        service.shutdown().await;
+        engine.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn an_interrupted_or_failed_turn_expires_its_request_and_holds_the_queue() {
+    for status in ["interrupted", "error"] {
+        let engine = engine().await;
+        session(&engine, "running", "running").await;
+        enqueue(&engine, "queued", true).await;
+        activity(&engine, "approval.requested", "request-open").await;
+        session(&engine, status, "settle").await;
+        let (service, mut routes) = service(&engine);
+        quiet(&mut routes).await;
+        assert_eq!(
+            row(&engine, "queued").await.state,
+            TurnDeliveryState::Queued
+        );
+        service.shutdown().await;
+        engine.shutdown().await;
+    }
+}
+
+#[tokio::test]
 async fn no_promotion_after_interrupted_or_error_settle() {
     for status in [
         "idle",

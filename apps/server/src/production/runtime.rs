@@ -358,6 +358,14 @@ impl ProductionRuntime {
         reconcile_abandoned_provider_sessions(&orchestration)
             .await
             .map_err(|error| error.to_string())?;
+        // No provider session is live yet: a request still open now waits on nobody (#187).
+        match orchestration.expire_requests_of_settled_sessions().await {
+            Ok(0) => {}
+            Ok(expired) => tracing::info!(expired, "expired requests of settled sessions"),
+            Err(error) => {
+                tracing::warn!(%error, "failed to expire requests of settled sessions");
+            }
+        }
         let referenced_attachment_ids = repositories
             .list_referenced_attachment_ids()
             .await

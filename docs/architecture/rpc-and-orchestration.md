@@ -2616,6 +2616,51 @@ load produces, and only the HTTP read model below loads the whole store. A
 thread's activities are read in the order of their
 `(thread_id, sequence, created_at, activity_id)` index, so the listing needs
 no temporary sort that would spill large payloads to a temporary file.
+
+The shell carries what the left panel's agent status reads (#187):
+
+- **`hasPendingApprovals`** comes from `projection_pending_approvals`.
+- **`hasPendingUserInput`** is the thread's count of open questions. A question
+  is open while the newest record for its request is the ask itself, or a
+  refused answer that the provider did not call stale. That rule is one shared
+  SQL fragment, `open_user_input_requests_sql`, which the queue head also uses.
+  The count is recomputed only when a request's state changes, not on every
+  thread event.
+- **`lastActivityAt`** is the time of the thread's latest provider progress:
+  either an event the engine attributes to the provider, or a session update to
+  `starting` or `running`. Titles, modes, archiving and BiBCode's own
+  settlements (a refused answer's `*.respond.failed` included) never move it,
+  and it never moves backwards. Migration 057 seeds it from each thread's latest
+  provider event.
+- **`lastActivityAgeMs`** is how old `lastActivityAt` was on the server's clock
+  when the snapshot was built. The client ages a Working status from its own
+  receipt of that value, so it never compares clocks with the server.
+
+Requests also settle without an answer:
+
+- A stale or unknown `provider.approval.respond.failed` resolves its approval.
+- When a turn interrupt, or a `thread.session-set` to `error`, `interrupted`,
+  `stopped` or `idle`, moves a session that was `running` or `starting` (read in
+  the same transaction), the same commit appends an `approval.expired` or
+  `user-input.expired` activity for every request still open. The payload is
+  `{ requestId, reason: "session-ended", sessionStatus }`. The session that
+  asked is gone, so those requests can never be answered.
+- A session that settles `ready` keeps its open requests: a provider may end
+  its turn while its ask still waits. A session settling again, or a launch's
+  `ready`, expires nothing.
+- At startup, after abandoned sessions are reconciled, requests still open on
+  threads whose session is neither `running` nor `starting` expire the same way,
+  as events (`sessionStatus: "settled"`).
+- An expired request reopens if the provider asks it again, which OpenCode does
+  for the asks it recovers on resume. `request_is_recorded` treats an expired
+  request as not recorded, so the recovered ask is shown.
+
+Queue consequence: an open request still holds queued follow-ups after the turn
+settles `ready`, as before. A resumed OpenCode session launches `starting` and
+turns `ready` only when its runtime reports `session.recovery-settled`: at
+once when the resume kept no asks, otherwise after it has shown them (or after
+30 seconds without an event stream), so a queued follow-up never passes a
+recovered ask. A resume OpenCode refused launches `ready`.
 `orchestration.replayEvents` with `paged: true` returns about 1 MiB pages
 `{ events, exhausted }`, keeping at least one event when any remain. Replay
 resumes from the last applied `sequence` with no server state; the cursor is
