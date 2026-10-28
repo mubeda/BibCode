@@ -401,3 +401,38 @@ cleanup until it returns, so a partial pin is removed only after nothing writes
 to it (`a_pin_still_copying_when_the_budget_runs_out_stops_and_its_generation_is_removed`).
 The Rust `sha2` timings from a release build in the lab are pending: that run
 stopped when this Mac's free disk fell under 60 GB.
+
+### Linux lab results (integration head, 2026-10-28)
+
+These ran on the integration head (`0ecd10a38c` plus `d2524e3506`), in a
+throwaway privileged container from `bibcode-linux-lab:22.04`: Ubuntu 22.04
+arm64 on the Docker Desktop VM (12 CPUs, 7.7 GB), with the build in a Docker
+volume and temporary swap, because a 2-job debug build of the lib tests runs
+out of memory without it. mise was 2026.10.20 and Claude Code 2.1.311 came
+through `aqua`, 294 MB.
+
+- `cargo clippy -p bibcode-server --all-targets -- -D warnings`: clean.
+- `cargo test -p bibcode-server --lib provider_terminal`: 133 passed, 1 ignored.
+  Run as root, `cleanup_reports_failure_while_direct_artifacts_remain` fails,
+  because root ignores the 0500 directory that test relies on. Run as an
+  unprivileged user, all 133 pass. That test predates this change.
+- `cargo test -p bibcode-server --test provider_terminal_supervisor`: 130 passed,
+  2 ignored (the live tests).
+- Release live test through a real mise shim, with page caches dropped before
+  each run. The test copies, hashes with the Rust `sha2`, probes and opens the
+  terminal through `TerminalManager::open`. Both opens of each run were hooked
+  and carried mise's `[env]`.
+
+  | Filesystem      | Cold open            | Proven-build open | `sha2` of 294 MB |
+  | --------------- | -------------------- | ----------------- | ---------------- |
+  | btrfs (reflink) | 0.29 to 0.44 s       | 0.20 to 0.27 s    | 0.20 to 0.24 s   |
+  | ext4 (copy)     | 0.41 to 0.58 s       | 0.24 to 0.33 s    | 0.19 to 0.20 s   |
+
+  The first sequence, run right after the first release compile with the VM
+  swapping, had slower times (btrfs cold up to 0.97 s, ext4 cold up to 1.86 s).
+  Two of its three cold ext4 opens passed through unhooked after about 0.8 s,
+  inside the budget. That pass-through did not recur in 19 later cold opens,
+  three of them under 6.5 GB of memory pressure. The run had no reason logging
+  for an unreadable build or a failed pin, so `d2524e3506` now names every
+  pass-through reason and the live test prints them. The likely cause, a mise
+  answer past its 750 ms cap while the VM swapped, is unconfirmed.
