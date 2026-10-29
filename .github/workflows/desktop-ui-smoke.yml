@@ -77,7 +77,7 @@ jobs:
           name: desktop-package-mac-x64
           run-id: 40852510126
           github-token: ${{ github.token }}
-          path: target/${{ matrix.rustTarget }}/release/bundle/dmg
+          path: target/${{ matrix.rustTarget }}/release/bundle
 
       - name: Resolve Linux AppImage
         if: matrix.platform == 'linux'
