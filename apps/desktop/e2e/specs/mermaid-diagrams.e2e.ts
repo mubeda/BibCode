@@ -595,9 +595,13 @@ interface ReadingLineSamples {
  * Samples, on a timer and after each painted frame, where the user row sent as `prompt`
  * starts and where the row holding the diagram labelled `diagramLabel` ends.
  */
-async function startReadingLineSamples(target: ReadingTarget, diagramLabel: string): Promise<void> {
+async function startReadingLineSamples(
+  target: ReadingTarget,
+  diagramLabel: string,
+  stopAfterMs = 60_000,
+): Promise<void> {
   await browser.execute(
-    (surface: string, target: ReadingTarget, label: string) => {
+    (surface: string, target: ReadingTarget, label: string, stopAfter: number) => {
       const record = window as unknown as {
         __bibcodeReadingLineSamples?: { timer: LandingSample[]; painted: LandingSample[] };
         __bibcodeReadingLineStop?: () => void;
@@ -655,7 +659,7 @@ async function startReadingLineSamples(target: ReadingTarget, diagramLabel: stri
       let running = true;
       const timer = setInterval(() => {
         samples.timer.push(read());
-        if (performance.now() - started > 60_000) record.__bibcodeReadingLineStop?.();
+        if (performance.now() - started > stopAfter) record.__bibcodeReadingLineStop?.();
       }, 5);
       // A message posted from a frame callback is handled once that frame has painted.
       const afterPaint = new MessageChannel();
@@ -675,6 +679,7 @@ async function startReadingLineSamples(target: ReadingTarget, diagramLabel: stri
     visibleSurfaceSelector,
     target,
     diagramLabel,
+    stopAfterMs,
   );
 }
 
@@ -1398,9 +1403,12 @@ describe("packaged Mermaid diagrams", () => {
     );
     await expectPaintingWebview();
     await waitForRowsReplyUnmount({ width: 1_400, height: 900 }, "Fixture draw");
+    // The step-by-step scroll up takes over a minute on a slow runner (Linux arm64), so the
+    // samples run until the row has drawn rather than stopping at the usual minute.
     await startReadingLineSamples(
       { kind: "visible-paragraph", prefix: "Following reply paragraph " },
       "Fixture draw",
+      240_000,
     );
     for (let step = 0; ; step += 1) {
       // Two replies of 101 diagrams lie between the end and the rows reply.
@@ -1425,6 +1433,9 @@ describe("packaged Mermaid diagrams", () => {
     }
     await browser.pause(1_500);
     const coldDraw = await readReadingLineSamples();
+    await browser.execute(() =>
+      (window as unknown as { __bibcodeReadingLineStop?: () => void }).__bibcodeReadingLineStop?.(),
+    );
     NodeFS.writeFileSync(
       NodePath.join(preparedArtifactDirectory, "mermaid-timeline-cold-draw.json"),
       JSON.stringify(withoutRepeats(coldDraw), null, 2),
