@@ -2454,6 +2454,24 @@ describe("ChatView effects (captured and run manually)", () => {
     for (const cleanup of cleanups) cleanup();
   });
 
+  it("reveals a tall turn again after its anchored space changes", async () => {
+    const { list, cleanups, messageId, onAnchorReady } = await sendTallReply({});
+    onAnchorReady(messageId, 2);
+    list.scrollNode.scrollTop = 216;
+    list.scrollNode.fire("scrollend");
+    await flushPromises();
+
+    list.scrollNode.scrollTop = 106;
+    const onAnchorSizeChanged = capturedProps("messagesTimeline")["onAnchorSizeChanged"] as (
+      messageId: MessageId,
+    ) => void;
+    onAnchorSizeChanged(messageId);
+    await flushPromises();
+
+    expect(list.scrollNode.scrollTop).toBe(216);
+    for (const cleanup of cleanups) cleanup();
+  });
+
   it("keeps the reader's position when takeover cancels a queued relanding", async () => {
     const { list, cleanups, messageId, onAnchorReady } = await sendFittingReply();
     onAnchorReady(messageId, 2);
