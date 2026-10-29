@@ -3555,8 +3555,10 @@ paragraph far above the view so LegendList holds an adjustment, and focuses
 that button (a focus, not a press). On macOS, it sends a trusted PageUp through
 System Events after the webview reports glide and focus readiness; the packaged
 WebDriver plugin's dispatched key has no native scroll there. The first painted
-frame must hold the same reading line within 1 px, and subsequent frames must
-move it only in the page direction. On Linux and Windows, one page script
+frame must either hold the reading line while the pending row adjustment commits
+or move it only by the native PageUp scroll. Later frames keep its content
+position within 1 px and move it only in the page direction. On Linux
+and Windows, one page script
 dispatches the keydown and immediately makes its page step because their
 packaged driver also dispatches keys without native scrolling. The key must
 land within 750 ms of the glide starting. The held adjustment is applied as a
