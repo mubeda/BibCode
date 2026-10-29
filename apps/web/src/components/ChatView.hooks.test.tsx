@@ -2501,6 +2501,37 @@ describe("ChatView effects (captured and run manually)", () => {
     for (const cleanup of cleanups) cleanup();
   });
 
+  it("does not re-land the old sent row after another send begins", async () => {
+    const { list, cleanups, messageId, onAnchorReady } = await sendFittingReply();
+    onAnchorReady(messageId, 2);
+    list.scrollNode.scrollTop = 184;
+    list.scrollNode.fire("scrollend");
+    await flushPromises();
+    const frames: Array<() => void> = [];
+    vi.stubGlobal("requestAnimationFrame", (callback: (time: number) => void) => {
+      frames.push(() => callback(0));
+      return frames.length;
+    });
+
+    list.scrollNode.scrollTop = 173;
+    const onAnchorSizeChanged = capturedProps("messagesTimeline")["onAnchorSizeChanged"] as (
+      messageId: MessageId,
+    ) => void;
+    onAnchorSizeChanged(messageId);
+    const { promptRef } = installComposerHandle();
+    promptRef.current = "next message";
+    await (capturedProps("chatComposer")["onSend"] as () => Promise<void>)();
+    const callsAfterSend = list.calls.scrollToOffset.length;
+    for (let turn = 0; turn < 2; turn += 1) {
+      for (const frame of frames.splice(0)) frame();
+    }
+    await flushPromises();
+
+    expect(list.calls.scrollToOffset).toHaveLength(callsAfterSend);
+    expect(list.scrollNode.scrollTop).toBe(173);
+    for (const cleanup of cleanups) cleanup();
+  });
+
   it("lands the sent row the same way when the glide outlasts its timer", async () => {
     const { list, cleanups, messageId, onAnchorReady } = await sendFittingReply();
     onAnchorReady(messageId, 2);
