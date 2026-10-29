@@ -254,6 +254,12 @@ test -d "$BIBCODE_E2E_APP_PATH"
 vp run test:ui:desktop
 ```
 
+The Mermaid keyboard case sends a trusted PageUp through `osascript` and System
+Events. Run it in a logged-in desktop session that allows the process invoking
+`vp` to control System Events in macOS Privacy & Security settings. The case
+fails if native input cannot reach the packaged app; a dispatched key does not
+perform WebKit's PageUp scroll.
+
 The WebDriver port is set by two variables, which must always agree:
 `BIBCODE_E2E_WEBDRIVER_PORT` (the embedded driver's port, default 4445) and
 `TAURI_WEBDRIVER_PORT` (read by the worker's `browser.tauri.mock` direct-eval
