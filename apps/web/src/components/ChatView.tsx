@@ -3785,6 +3785,33 @@ function ChatViewContent(props: ChatViewProps) {
       return;
     }
     if (liveFollowUserScrollGenerationRef.current === anchorUserScrollGenerationRef.current) {
+      if (
+        positionedTimelineAnchorRef.current !== messageId ||
+        pendingTimelineAnchorRef.current !== null
+      ) {
+        return;
+      }
+      // The anchored end space can shrink after the first landing. WebView2 may then move the
+      // scroller even when its total height stays fixed, so measure the sent row again once
+      // that layout has painted. A reader takeover, another send or another thread's list
+      // cancels this pass.
+      settledTimelineAnchorRef.current = null;
+      const generation = anchorUserScrollGenerationRef.current;
+      const list = legendListRef.current;
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          if (
+            legendListRef.current === list &&
+            positionedTimelineAnchorRef.current === messageId &&
+            pendingTimelineAnchorRef.current === null &&
+            releasedTimelineAnchorRef.current !== messageId &&
+            anchorUserScrollGenerationRef.current === generation &&
+            liveFollowUserScrollGenerationRef.current === generation
+          ) {
+            settleSentTimelineRowRef.current(messageId);
+          }
+        });
+      });
       return;
     }
     const scrollOffset = legendListRef.current?.getState().scroll;
