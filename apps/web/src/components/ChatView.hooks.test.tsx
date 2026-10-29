@@ -2432,6 +2432,57 @@ describe("ChatView effects (captured and run manually)", () => {
     for (const cleanup of cleanups) cleanup();
   });
 
+  it("relands a fitting sent row after its anchored space shrinks", async () => {
+    const { list, cleanups, messageId, onAnchorReady } = await sendFittingReply();
+    onAnchorReady(messageId, 2);
+    list.scrollNode.scrollTop = 184;
+    list.scrollNode.fire("scrollend");
+    await flushPromises();
+    const settledCalls = list.calls.scrollToOffset.length;
+
+    // A late measured-size change left WebView2 11 px short without changing content height.
+    list.scrollNode.scrollTop = 173;
+    const onAnchorSizeChanged = capturedProps("messagesTimeline")["onAnchorSizeChanged"] as (
+      messageId: MessageId,
+    ) => void;
+    onAnchorSizeChanged(messageId);
+    await flushPromises();
+
+    expect(list.calls.scrollToOffset).toHaveLength(settledCalls + 1);
+    expect(list.calls.scrollToOffset.at(-1)).toEqual({ offset: 184, animated: false });
+    expect(list.scrollNode.scrollTop).toBe(184);
+    for (const cleanup of cleanups) cleanup();
+  });
+
+  it("keeps the reader's position when takeover cancels a queued relanding", async () => {
+    const { list, cleanups, messageId, onAnchorReady } = await sendFittingReply();
+    onAnchorReady(messageId, 2);
+    list.scrollNode.scrollTop = 184;
+    list.scrollNode.fire("scrollend");
+    await flushPromises();
+    const settledCalls = list.calls.scrollToOffset.length;
+    const frames: Array<() => void> = [];
+    vi.stubGlobal("requestAnimationFrame", (callback: (time: number) => void) => {
+      frames.push(() => callback(0));
+      return frames.length;
+    });
+
+    list.scrollNode.scrollTop = 173;
+    const onAnchorSizeChanged = capturedProps("messagesTimeline")["onAnchorSizeChanged"] as (
+      messageId: MessageId,
+    ) => void;
+    onAnchorSizeChanged(messageId);
+    list.scrollNode.fire("wheel");
+    for (let turn = 0; turn < 2; turn += 1) {
+      for (const frame of frames.splice(0)) frame();
+    }
+    await flushPromises();
+
+    expect(list.calls.scrollToOffset).toHaveLength(settledCalls);
+    expect(list.scrollNode.scrollTop).toBe(173);
+    for (const cleanup of cleanups) cleanup();
+  });
+
   it("lands the sent row the same way when the glide outlasts its timer", async () => {
     const { list, cleanups, messageId, onAnchorReady } = await sendFittingReply();
     onAnchorReady(messageId, 2);
