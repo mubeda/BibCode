@@ -2478,7 +2478,7 @@ async function pressNativePageUpDuringGlide(
                     const sites = new Set<string>();
                     for (const call of debugCalls as { stack: string[] }[]) {
                       for (const line of call.stack) {
-                        const match = /(\S+?):(\d+):(\d+)\)?$/u.exec(line);
+                        const match = /(?:^|@|\()([a-z]+:\/\/\S+?):(\d+):(\d+)\)?$/u.exec(line);
                         if (match) sites.add(`${match[1]}|${match[2]}|${match[3]}`);
                       }
                     }
