@@ -1889,6 +1889,16 @@ describe("packaged Mermaid diagrams", () => {
       const lineMovement = pressed.frames.map((frame) =>
         lineAtKey === null || frame.lineTop === null ? null : frame.lineTop - lineAtKey,
       );
+      const contentPositionAtKey = lineAtKey === null ? null : lineAtKey + pressed.key.scrollTop;
+      const contentPositionAtFirst =
+        firstFrame?.lineTop === null || firstFrame?.lineTop === undefined
+          ? null
+          : firstFrame.lineTop + firstFrame.scrollTop;
+      const contentDrift = pressed.frames.map((frame) =>
+        contentPositionAtFirst === null || frame.lineTop === null
+          ? null
+          : frame.lineTop + frame.scrollTop - contentPositionAtFirst,
+      );
       expect({
         landedMidGlide: pressed.moving && pressed.keyAfterGlideMs <= 750,
         grewAbove: pressed.grewAbove,
@@ -1897,10 +1907,13 @@ describe("packaged Mermaid diagrams", () => {
         keyReachedTimeline: !Number.isNaN(keyAt) && pressed.key.trusted,
         contentHeldAtKey:
           firstFrame !== undefined &&
-          lineMovement[0] !== null &&
-          lineMovement[0] !== undefined &&
-          Math.abs(lineMovement[0]) <= 1 &&
+          lineAtKey !== null &&
+          contentPositionAtKey !== null &&
+          firstFrame.lineTop !== null &&
+          (Math.abs(firstFrame.lineTop - lineAtKey) <= 1 ||
+            Math.abs(firstFrame.lineTop + firstFrame.scrollTop - contentPositionAtKey) <= 1) &&
           pressed.frames.every((frame) => frame.lineConnected) &&
+          contentDrift.every((drift) => drift !== null && Math.abs(drift) <= 1) &&
           lineMovement.every((movement, index) => {
             const previous = lineMovement[index - 1];
             return (
