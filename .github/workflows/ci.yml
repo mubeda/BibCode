@@ -311,7 +311,7 @@ jobs:
     name: Crash smoke - ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     # A cold optimized build of the server and two pinned tool compiles.
-    timeout-minutes: 60
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:

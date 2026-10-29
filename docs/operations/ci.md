@@ -105,6 +105,11 @@ workflow as idle.
   in `~/.cargo/bin`. A failed run uploads the dump, its sidecar, the symbol
   store, and the stack walk as the `crash-smoke-<os>` artifact. The Windows
   ARM64 dump path stays disabled, so the job has no ARM64 rows.
+  Its 90-minute job budget covers a cold macOS run: the crash step alone took
+  52 minutes on `39356f37`, and the old 60-minute limit cancelled the job
+  twice on `0f9ba817` in pull request 205. A cancelled main run saves no
+  cache, so pull requests keep restoring an older or missing cache until a
+  main run completes.
 
 The Check and Test jobs install the Linux libraries required by Tauri. The
 native matrix installs them only on Linux and otherwise uses each platform's
