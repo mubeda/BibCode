@@ -6,6 +6,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   desktop_ui_smoke:
@@ -69,8 +70,14 @@ jobs:
       - name: Install frozen dependencies
         run: vp install --frozen-lockfile
 
-      - name: Build packaged test application
-        run: vp run --filter @bibcode/desktop test:ui:build
+      # [DEBUG-k64] reuse the exact macOS x64 package from run 40852510126 (c1a2e78f).
+      - name: Download packaged test application
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: desktop-package-mac-x64
+          run-id: 40852510126
+          github-token: ${{ github.token }}
+          path: target/${{ matrix.rustTarget }}/release/bundle/dmg
 
       - name: Resolve Linux AppImage
         if: matrix.platform == 'linux'

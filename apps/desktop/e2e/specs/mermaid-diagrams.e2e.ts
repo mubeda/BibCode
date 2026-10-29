@@ -167,6 +167,9 @@ interface NativePageUpTrace {
   key: NativePageUpEvidence["key"] | null;
   frames: NativePageUpFrame[];
   done: boolean;
+  // [DEBUG-k64] every programmatic scroll and scroll event from the glide on.
+  calls?: unknown[];
+  sources?: Record<string, string>;
 }
 
 interface LandingSample {
@@ -2372,6 +2375,47 @@ async function pressNativePageUpDuringGlide(
         const now = sentTop();
         if (first !== null && now !== null && Math.abs(now - first) > 4) {
           const glideAt = performance.now();
+          // [DEBUG-k64] record who scrolls the timeline from the glide to the end of the trace.
+          const debugCalls: unknown[] = [];
+          (window as unknown as { __k64Calls?: unknown[] }).__k64Calls = debugCalls;
+          const where = () =>
+            (new Error().stack ?? "")
+              .split("\n")
+              .slice(2, 7)
+              .map((line) => line.trim());
+          const record = (kind: string, value: unknown) =>
+            debugCalls.push({
+              at: Math.round(performance.now()),
+              kind,
+              value,
+              scrollTop: Math.round(scroller.scrollTop),
+              scrollHeight: scroller.scrollHeight,
+              stack: kind === "scroll-event" || kind === "keydown" ? [] : where(),
+            });
+          for (const method of ["scrollTo", "scrollBy", "scrollIntoView"] as const) {
+            const original = (scroller as unknown as Record<string, (...args: unknown[]) => void>)[
+              method
+            ]!.bind(scroller);
+            (scroller as unknown as Record<string, unknown>)[method] = (...args: unknown[]) => {
+              record(method, args);
+              original(...args);
+            };
+          }
+          const topDescriptor = Object.getOwnPropertyDescriptor(Element.prototype, "scrollTop")!;
+          Object.defineProperty(scroller, "scrollTop", {
+            configurable: true,
+            get: () => topDescriptor.get!.call(scroller),
+            set: (value: number) => {
+              record("scrollTop=", value);
+              topDescriptor.set!.call(scroller, value);
+            },
+          });
+          scroller.addEventListener("scroll", () => record("scroll-event", null), {
+            passive: true,
+          });
+          document.addEventListener("keydown", (event) => record("keydown", event.key), {
+            capture: true,
+          });
           const area = scroller.getBoundingClientRect();
           const above = [...scroller.querySelectorAll<HTMLElement>(".chat-markdown p")].find(
             (element) => element.getBoundingClientRect().bottom < area.top - 200,
@@ -2428,7 +2472,32 @@ async function pressNativePageUpDuringGlide(
                   } else {
                     const key = trace.key;
                     if (key) trace.key = { ...key, defaultPrevented: event.defaultPrevented };
-                    trace.done = true;
+                    trace.calls = debugCalls;
+                    // [DEBUG-k64] the bundled code at each distinct caller, so minified names
+                    // can be read against their property names.
+                    const sites = new Set<string>();
+                    for (const call of debugCalls as { stack: string[] }[]) {
+                      for (const line of call.stack) {
+                        const match = /(\S+?):(\d+):(\d+)\)?$/u.exec(line);
+                        if (match) sites.add(`${match[1]}|${match[2]}|${match[3]}`);
+                      }
+                    }
+                    const sources: Record<string, string> = {};
+                    const texts = new Map<string, Promise<string>>();
+                    void Promise.all(
+                      [...sites].map(async (site) => {
+                        const [url, line, column] = site.split("|");
+                        if (!url || !texts.has(url))
+                          texts.set(url!, window.fetch(url!).then((r) => r.text(), () => ""));
+                        const text = await texts.get(url!)!;
+                        const row = text.split("\n")[Number(line) - 1] ?? "";
+                        const at = Number(column) - 1;
+                        sources[site] = row.slice(Math.max(0, at - 220), at + 120);
+                      }),
+                    ).finally(() => {
+                      trace.sources = sources;
+                      trace.done = true;
+                    });
                     document.removeEventListener("keydown", onKeyDown, { capture: true });
                   }
                 };
@@ -2492,7 +2561,10 @@ async function pressNativePageUpDuringGlide(
     key: trace.key,
     frames: trace.frames,
     sender,
-  };
+    // [DEBUG-k64]
+    calls: trace.calls,
+    sources: trace.sources,
+  } as NativePageUpEvidence;
 }
 
 /**
