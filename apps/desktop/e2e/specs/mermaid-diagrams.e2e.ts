@@ -1,6 +1,7 @@
 // @effect-diagnostics nodeBuiltinImport:off - Packaged UI tests write disposable fixture files and save screenshots.
 // @effect-diagnostics globalTimers:off - Page scripts wait and sample on timers inside the packaged webview.
 import * as NodeFS from "node:fs";
+import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 
 import {
@@ -27,6 +28,11 @@ const preparedProjectPath: string = projectPath;
 const visibleSurfaceSelector = '[data-center-surface-host][data-visible="true"]';
 const composerEditorSelector = `${visibleSurfaceSelector} [data-chat-composer-form="true"] [data-testid="composer-editor"]`;
 const fileViewSelector = "[data-preview-panel-mode]";
+function isMacDesktopUi(): boolean {
+  if (process.env.BIBCODE_E2E_PLATFORM) return process.env.BIBCODE_E2E_PLATFORM === "mac";
+  // oxlint-disable-next-line bibcode/no-global-process-runtime -- This standalone native spec follows WDIO's host fallback when no platform was supplied.
+  return NodeOS.platform() === "darwin";
+}
 
 interface EndSample {
   readonly at: number;
@@ -128,6 +134,39 @@ interface KeyboardKeyTrace {
   readonly lineConnected: boolean;
   readonly rowId: string | null;
   readonly rowTransform: string | null;
+}
+
+interface NativePageUpFrame {
+  readonly at: number;
+  readonly scrollTop: number;
+  readonly lineTop: number | null;
+  readonly lineConnected: boolean;
+}
+
+interface NativePageUpEvidence {
+  readonly kind: "native";
+  readonly moving: boolean;
+  readonly focused: boolean;
+  readonly grewAbove: boolean;
+  readonly keyAfterGlideMs: number;
+  readonly key: {
+    readonly at: number;
+    readonly scrollTop: number;
+    readonly lineTop: number | null;
+    readonly clientHeight: number;
+    readonly trusted: boolean;
+    readonly defaultPrevented: boolean;
+    readonly targetFocused: boolean;
+    readonly anchorKind: "paragraph" | "copy-button" | "none";
+  };
+  readonly frames: readonly NativePageUpFrame[];
+  readonly sender: { readonly output: string; readonly error: string };
+}
+
+interface NativePageUpTrace {
+  key: NativePageUpEvidence["key"] | null;
+  frames: NativePageUpFrame[];
+  done: boolean;
 }
 
 interface LandingSample {
@@ -1645,17 +1684,16 @@ describe("packaged Mermaid diagrams", () => {
       throw new Error("The short reply's code block shows no mounted Copy code button.");
     }
 
+    const nativePageUpSender = isMacDesktopUi() ? await prepareMacPageUpSender() : null;
     await startKeyboardSamples();
     const editor = browser.$(composerEditorSelector);
     await editor.click();
     await editor.addValue(mermaidFixturePrompts.keyboard);
     await expect(editor).toHaveText(mermaidFixturePrompts.keyboard);
     await browser.keys("Enter");
-    // As soon as the sent row shows, while it glides into place, the reader moves focus into
-    // the timeline and pages up with the keyboard. The packaged driver sends keys as dispatched
-    // events, which scroll nothing, so the spec dispatches the keydown on the focused control
-    // and then makes the scroll that key's default action makes, as a real key press does
-    // (the runbook's manual check covers a real key's ordering against these listeners).
+    // As soon as the sent row shows, the reader focuses the timeline and pages up. macOS sends
+    // a trusted key because its packaged driver dispatches synthetic events with no native
+    // scroll; the other packaged drivers use the dispatched key and its page step below.
     await browser.waitUntil(
       () =>
         browser.execute(
@@ -1668,174 +1706,175 @@ describe("packaged Mermaid diagrams", () => {
         ),
       { timeoutMsg: "The keyboard prompt's sent row never showed.", interval: 20 },
     );
-    // In one page script, so nothing waits on a WebDriver round trip: wait for the glide to be
-    // under way; grow a row far above the view, so LegendList holds an adjustment for the
-    // animated scroll; focus Copy code; and press PageUp, whose page step follows at once. On
-    // every painted frame of the six after the key, the content must be where the page step
-    // alone puts it: the glide stopped, and the held adjustment was applied as a scroll, not
-    // dropped as a jump.
-    const pressed = await browser.executeAsync(
-      (
-        surface: string,
-        prompt: string,
-        done: (result: {
-          trail: Array<[number | null, number]>;
-          trace: KeyboardKeyTrace[];
-          moving: boolean;
-          keyAfterGlideMs: number;
-          grewAbove: boolean;
-          focused: boolean;
-          shiftAtKey: number | null;
-          anchorKind: "paragraph" | "copy-button" | "none";
-          defaultPrevented: boolean;
-          before: number;
-          after: number;
-          clientHeight: number;
-        }) => void,
-      ) => {
-        const scroller = document.querySelector<HTMLElement>(
-          `${surface} [class*='overflow-anchor']`,
-        )!;
-        const sentRowTop = () =>
-          [...document.querySelectorAll<HTMLElement>(`${surface} [data-message-role="user"]`)]
-            .find((element) => element.textContent?.includes(prompt))
-            ?.getBoundingClientRect().top ?? null;
-        const frames = (count: number, then: () => void) =>
-          count === 0 ? then() : requestAnimationFrame(() => frames(count - 1, then));
-        const first = sentRowTop();
-        const started = performance.now();
-        const press = (moving: boolean, movedAt: number) => {
-          const area = scroller.getBoundingClientRect();
-          const above = [...scroller.querySelectorAll<HTMLElement>(".chat-markdown p")].find(
-            (element) => element.getBoundingClientRect().bottom < area.top - 200,
-          );
-          if (above) {
-            above.dataset.bibcodeKeyboardGrown = "true";
-            above.style.paddingTop = "160px";
-          }
-          frames(2, () => {
-            const button = [
-              ...document.querySelectorAll<HTMLElement>(`${surface} .chat-markdown-codeblock`),
-            ]
-              .filter((block) => block.textContent?.includes("Kept at the top"))
-              .sort((a, b) => b.getBoundingClientRect().top - a.getBoundingClientRect().top)[0]
-              ?.querySelector<HTMLButtonElement>('button[aria-label="Copy code"]');
-            button?.focus({ preventScroll: true });
-            const focused = !!button && document.activeElement === button;
-            const overlay = document.querySelector<HTMLElement>(
-              `${surface} [data-chat-composer-overlay="true"]`,
+    // The non-macOS driver needs one page script for the glide, held row adjustment, focused
+    // Copy button, dispatched key, page step, and six painted frames. macOS sends a trusted
+    // key after its page script reports the same glide and focus preparation.
+    const pressSyntheticPageUp = () =>
+      browser.executeAsync(
+        (
+          surface: string,
+          prompt: string,
+          done: (result: {
+            trail: Array<[number | null, number]>;
+            trace: KeyboardKeyTrace[];
+            moving: boolean;
+            keyAfterGlideMs: number;
+            grewAbove: boolean;
+            focused: boolean;
+            shiftAtKey: number | null;
+            anchorKind: "paragraph" | "copy-button" | "none";
+            defaultPrevented: boolean;
+            before: number;
+            after: number;
+            clientHeight: number;
+          }) => void,
+        ) => {
+          const scroller = document.querySelector<HTMLElement>(
+            `${surface} [class*='overflow-anchor']`,
+          )!;
+          const sentRowTop = () =>
+            [...document.querySelectorAll<HTMLElement>(`${surface} [data-message-role="user"]`)]
+              .find((element) => element.textContent?.includes(prompt))
+              ?.getBoundingClientRect().top ?? null;
+          const frames = (count: number, then: () => void) =>
+            count === 0 ? then() : requestAnimationFrame(() => frames(count - 1, then));
+          const first = sentRowTop();
+          const started = performance.now();
+          const press = (moving: boolean, movedAt: number) => {
+            const area = scroller.getBoundingClientRect();
+            const above = [...scroller.querySelectorAll<HTMLElement>(".chat-markdown p")].find(
+              (element) => element.getBoundingClientRect().bottom < area.top - 200,
             );
-            const readableBottom = Math.min(
-              area.bottom,
-              overlay?.getBoundingClientRect().top ?? Number.POSITIVE_INFINITY,
-            );
-            const isVisible = (element: HTMLElement) => {
-              const box = element.getBoundingClientRect();
-              return box.top >= area.top && box.bottom <= readableBottom;
-            };
-            // The focused Copy button remains a stable anchor when the glide leaves no
-            // paragraph inside the readable part of the timeline.
-            const paragraph = [...scroller.querySelectorAll<HTMLElement>(".chat-markdown p")].find(
-              isVisible,
-            );
-            const line = paragraph ?? button ?? null;
-            const anchorKind = paragraph ? "paragraph" : line ? "copy-button" : "none";
-            const lineAtKey = line?.getBoundingClientRect().top ?? null;
-            const scrollAtKey = scroller.scrollTop;
-            const keyAt = performance.now();
-            const trace: KeyboardKeyTrace[] = [];
-            const record = (phase: KeyboardKeyTrace["phase"]) => {
-              const row = line?.closest<HTMLElement>("[data-timeline-root]");
-              trace.push({
-                phase,
-                at: Math.round(performance.now() - keyAt),
-                scrollTop: Math.round(scroller.scrollTop),
-                scrollHeight: Math.round(scroller.scrollHeight),
-                lineTop: line ? Math.round(line.getBoundingClientRect().top) : null,
-                lineConnected: line?.isConnected ?? false,
-                rowId: line?.closest<HTMLElement>("[data-message-id]")?.dataset.messageId ?? null,
-                rowTransform: row ? getComputedStyle(row).transform : null,
-              });
-            };
-            const event = new KeyboardEvent("keydown", {
-              key: "PageUp",
-              bubbles: true,
-              cancelable: true,
-            });
-            record("before-key");
-            (focused ? button! : scroller).dispatchEvent(event);
-            record("after-key");
-            // The key's default action follows its handlers at once, as a real key press's does.
-            const step = event.defaultPrevented
-              ? 0
-              : Math.min(scrollAtKey, Math.round(scroller.clientHeight * 0.875));
-            if (!event.defaultPrevented) {
-              scroller.scrollBy({ top: -scroller.clientHeight * 0.875 });
+            if (above) {
+              above.dataset.bibcodeKeyboardGrown = "true";
+              above.style.paddingTop = "160px";
             }
-            record("after-page");
-            // How far the line is from where the page step alone puts it, on each painted frame.
-            // (Read in this task, before the list re-renders its rows, the layout is not yet
-            // what the next frame paints, so only painted frames count.)
-            const trail: Array<[number | null, number]> = [];
-            const sample = () => {
-              trail.push([
-                line && lineAtKey !== null
-                  ? Math.round(line.getBoundingClientRect().top - lineAtKey - step)
-                  : null,
-                Math.round(scroller.scrollTop),
-              ]);
-              record("frame");
-            };
-            const sampleFrames = (count: number, then: () => void) =>
-              count === 0
-                ? then()
-                : requestAnimationFrame(() => {
-                    sample();
-                    sampleFrames(count - 1, then);
-                  });
-            sampleFrames(6, () => {
-              const deviations = trail.map(([deviation]) => deviation);
-              const shiftAtKey = deviations.some((deviation) => deviation === null)
-                ? null
-                : deviations.reduce<number>(
-                    (largest, deviation) =>
-                      Math.abs(deviation!) > Math.abs(largest) ? deviation! : largest,
-                    0,
-                  );
-              done({
-                trail,
-                trace,
-                moving,
-                keyAfterGlideMs: Math.round(keyAt - movedAt),
-                grewAbove: !!above,
-                focused,
-                shiftAtKey,
-                anchorKind,
-                defaultPrevented: event.defaultPrevented,
-                before: scrollAtKey,
-                after: scrollAtKey - step,
-                clientHeight: scroller.clientHeight,
+            frames(2, () => {
+              const button = [
+                ...document.querySelectorAll<HTMLElement>(`${surface} .chat-markdown-codeblock`),
+              ]
+                .filter((block) => block.textContent?.includes("Kept at the top"))
+                .sort((a, b) => b.getBoundingClientRect().top - a.getBoundingClientRect().top)[0]
+                ?.querySelector<HTMLButtonElement>('button[aria-label="Copy code"]');
+              button?.focus({ preventScroll: true });
+              const focused = !!button && document.activeElement === button;
+              const overlay = document.querySelector<HTMLElement>(
+                `${surface} [data-chat-composer-overlay="true"]`,
+              );
+              const readableBottom = Math.min(
+                area.bottom,
+                overlay?.getBoundingClientRect().top ?? Number.POSITIVE_INFINITY,
+              );
+              const isVisible = (element: HTMLElement) => {
+                const box = element.getBoundingClientRect();
+                return box.top >= area.top && box.bottom <= readableBottom;
+              };
+              // The focused Copy button remains a stable anchor when the glide leaves no
+              // paragraph inside the readable part of the timeline.
+              const paragraph = [
+                ...scroller.querySelectorAll<HTMLElement>(".chat-markdown p"),
+              ].find(isVisible);
+              const line = paragraph ?? button ?? null;
+              const anchorKind = paragraph ? "paragraph" : line ? "copy-button" : "none";
+              const lineAtKey = line?.getBoundingClientRect().top ?? null;
+              const scrollAtKey = scroller.scrollTop;
+              const keyAt = performance.now();
+              const trace: KeyboardKeyTrace[] = [];
+              const record = (phase: KeyboardKeyTrace["phase"]) => {
+                const row = line?.closest<HTMLElement>("[data-timeline-root]");
+                trace.push({
+                  phase,
+                  at: Math.round(performance.now() - keyAt),
+                  scrollTop: Math.round(scroller.scrollTop),
+                  scrollHeight: Math.round(scroller.scrollHeight),
+                  lineTop: line ? Math.round(line.getBoundingClientRect().top) : null,
+                  lineConnected: line?.isConnected ?? false,
+                  rowId: line?.closest<HTMLElement>("[data-message-id]")?.dataset.messageId ?? null,
+                  rowTransform: row ? getComputedStyle(row).transform : null,
+                });
+              };
+              const event = new KeyboardEvent("keydown", {
+                key: "PageUp",
+                bubbles: true,
+                cancelable: true,
+              });
+              record("before-key");
+              (focused ? button! : scroller).dispatchEvent(event);
+              record("after-key");
+              // The key's default action follows its handlers at once, as a real key press's does.
+              const step = event.defaultPrevented
+                ? 0
+                : Math.min(scrollAtKey, Math.round(scroller.clientHeight * 0.875));
+              if (!event.defaultPrevented) {
+                scroller.scrollBy({ top: -scroller.clientHeight * 0.875 });
+              }
+              record("after-page");
+              // How far the line is from where the page step alone puts it, on each painted frame.
+              // (Read in this task, before the list re-renders its rows, the layout is not yet
+              // what the next frame paints, so only painted frames count.)
+              const trail: Array<[number | null, number]> = [];
+              const sample = () => {
+                trail.push([
+                  line && lineAtKey !== null
+                    ? Math.round(line.getBoundingClientRect().top - lineAtKey - step)
+                    : null,
+                  Math.round(scroller.scrollTop),
+                ]);
+                record("frame");
+              };
+              const sampleFrames = (count: number, then: () => void) =>
+                count === 0
+                  ? then()
+                  : requestAnimationFrame(() => {
+                      sample();
+                      sampleFrames(count - 1, then);
+                    });
+              sampleFrames(6, () => {
+                const deviations = trail.map(([deviation]) => deviation);
+                const shiftAtKey = deviations.some((deviation) => deviation === null)
+                  ? null
+                  : deviations.reduce<number>(
+                      (largest, deviation) =>
+                        Math.abs(deviation!) > Math.abs(largest) ? deviation! : largest,
+                      0,
+                    );
+                done({
+                  trail,
+                  trace,
+                  moving,
+                  keyAfterGlideMs: Math.round(keyAt - movedAt),
+                  grewAbove: !!above,
+                  focused,
+                  shiftAtKey,
+                  anchorKind,
+                  defaultPrevented: event.defaultPrevented,
+                  before: scrollAtKey,
+                  after: scrollAtKey - step,
+                  clientHeight: scroller.clientHeight,
+                });
               });
             });
-          });
-        };
-        const check = () => {
-          const now = sentRowTop();
-          if (first !== null && now !== null && Math.abs(now - first) > 4) {
-            press(true, performance.now());
-            return;
-          }
-          if (performance.now() - started > 1_500) {
-            press(false, performance.now());
-            return;
-          }
+          };
+          const check = () => {
+            const now = sentRowTop();
+            if (first !== null && now !== null && Math.abs(now - first) > 4) {
+              press(true, performance.now());
+              return;
+            }
+            if (performance.now() - started > 1_500) {
+              press(false, performance.now());
+              return;
+            }
+            requestAnimationFrame(check);
+          };
           requestAnimationFrame(check);
-        };
-        requestAnimationFrame(check);
-      },
-      visibleSurfaceSelector,
-      mermaidFixturePrompts.keyboard,
-    );
+        },
+        visibleSurfaceSelector,
+        mermaidFixturePrompts.keyboard,
+      );
+    const pressed = nativePageUpSender
+      ? await pressNativePageUpDuringGlide(nativePageUpSender)
+      : await pressSyntheticPageUp();
     NodeFS.writeFileSync(
       NodePath.join(preparedArtifactDirectory, "mermaid-timeline-keyboard-key.json"),
       JSON.stringify(pressed, null, 2),
@@ -1843,26 +1882,70 @@ describe("packaged Mermaid diagrams", () => {
     const keyAt = (await readKeyboardSamples()).keyAt ?? Number.NaN;
     // Labelled, so a failure names what went wrong: the key did not land mid-glide (within the
     // 750 ms settle timer of the glide starting), or the content moved at the key.
-    expect({
-      landedMidGlide: pressed.moving && pressed.keyAfterGlideMs <= 750,
-      grewAbove: pressed.grewAbove,
-      focused: pressed.focused,
-      anchorChosen: pressed.anchorKind !== "none",
-      keyReachedTimeline: !Number.isNaN(keyAt),
-      contentHeldAtKey: pressed.shiftAtKey !== null && Math.abs(pressed.shiftAtKey) <= 1,
-      pagedUp:
-        !pressed.defaultPrevented && pressed.before - pressed.after >= pressed.clientHeight / 2,
-      pressed,
-    }).toEqual({
-      landedMidGlide: true,
-      grewAbove: true,
-      focused: true,
-      anchorChosen: true,
-      keyReachedTimeline: true,
-      contentHeldAtKey: true,
-      pagedUp: true,
-      pressed,
-    });
+    if ("kind" in pressed) {
+      const firstFrame = pressed.frames[0];
+      const lastFrame = pressed.frames.at(-1);
+      const lineAtKey = pressed.key.lineTop;
+      const lineMovement = pressed.frames.map((frame) =>
+        lineAtKey === null || frame.lineTop === null ? null : frame.lineTop - lineAtKey,
+      );
+      expect({
+        landedMidGlide: pressed.moving && pressed.keyAfterGlideMs <= 750,
+        grewAbove: pressed.grewAbove,
+        focused: pressed.focused && pressed.key.targetFocused,
+        anchorChosen: pressed.key.anchorKind !== "none",
+        keyReachedTimeline: !Number.isNaN(keyAt) && pressed.key.trusted,
+        contentHeldAtKey:
+          firstFrame !== undefined &&
+          lineMovement[0] !== null &&
+          lineMovement[0] !== undefined &&
+          Math.abs(lineMovement[0]) <= 1 &&
+          pressed.frames.every((frame) => frame.lineConnected) &&
+          lineMovement.every((movement, index) => {
+            const previous = lineMovement[index - 1];
+            return (
+              movement !== null &&
+              movement >= -1 &&
+              (previous === undefined || (previous !== null && movement >= previous - 1))
+            );
+          }),
+        pagedUp:
+          lastFrame !== undefined &&
+          !pressed.key.defaultPrevented &&
+          pressed.key.scrollTop - lastFrame.scrollTop >= pressed.key.clientHeight / 2,
+        pressed,
+      }).toEqual({
+        landedMidGlide: true,
+        grewAbove: true,
+        focused: true,
+        anchorChosen: true,
+        keyReachedTimeline: true,
+        contentHeldAtKey: true,
+        pagedUp: true,
+        pressed,
+      });
+    } else {
+      expect({
+        landedMidGlide: pressed.moving && pressed.keyAfterGlideMs <= 750,
+        grewAbove: pressed.grewAbove,
+        focused: pressed.focused,
+        anchorChosen: pressed.anchorKind !== "none",
+        keyReachedTimeline: !Number.isNaN(keyAt),
+        contentHeldAtKey: pressed.shiftAtKey !== null && Math.abs(pressed.shiftAtKey) <= 1,
+        pagedUp:
+          !pressed.defaultPrevented && pressed.before - pressed.after >= pressed.clientHeight / 2,
+        pressed,
+      }).toEqual({
+        landedMidGlide: true,
+        grewAbove: true,
+        focused: true,
+        anchorChosen: true,
+        keyReachedTimeline: true,
+        contentHeldAtKey: true,
+        pagedUp: true,
+        pressed,
+      });
+    }
 
     // Once the view has rested, nothing ChatView asked LegendList for moves it again.
     let samples: KeyboardSample[] = [];
@@ -2210,6 +2293,193 @@ async function waitForRowsReplyUnmount(
       `clientHeight ${state.scroll.client}); mounted rows: ${JSON.stringify(state.rows)}. ` +
       `See mermaid-timeline-unmount-wait.json.`,
   );
+}
+
+/** The packaged driver dispatches synthetic keys on macOS, so send a trusted PageUp there. */
+async function prepareMacPageUpSender(): Promise<
+  (press: boolean) => Promise<{ readonly output: string; readonly error: string }>
+> {
+  const { execFileSync, spawn } = await import("node:child_process");
+  execFileSync("osascript", ["-e", 'tell application id "com.bibcode.desktop.e2e" to activate']);
+  const frontmost = execFileSync(
+    "osascript",
+    [
+      "-e",
+      'tell application "System Events" to get name of first application process whose frontmost is true',
+    ],
+    { encoding: "utf8" },
+  ).trim();
+  if (!frontmost.toLowerCase().includes("bibcode")) {
+    throw new Error(`The packaged app is not foreground for PageUp: ${frontmost}.`);
+  }
+  const sender = spawn("osascript", ["-i"], { stdio: ["pipe", "pipe", "pipe"] });
+  let output = "";
+  let error = "";
+  sender.stdout.on("data", (chunk: Buffer) => (output += chunk.toString()));
+  sender.stderr.on("data", (chunk: Buffer) => (error += chunk.toString()));
+  sender.stdin.write(
+    'tell application "System Events" to get name of first application process whose frontmost is true\n',
+  );
+  await new Promise<void>((resolve) => setTimeout(resolve, 400));
+  return async (press: boolean) => {
+    sender.stdin.end(press ? 'tell application "System Events" to key code 116\n' : "");
+    const code =
+      sender.exitCode === null
+        ? await new Promise<number | null>((resolve) => sender.once("close", resolve))
+        : sender.exitCode;
+    if (code !== 0) throw new Error(`Native PageUp sender exited ${code}: ${error}`);
+    return { output, error };
+  };
+}
+
+async function pressNativePageUpDuringGlide(
+  finishSender: (press: boolean) => Promise<{ readonly output: string; readonly error: string }>,
+): Promise<NativePageUpEvidence> {
+  const ready = await browser.executeAsync(
+    (
+      surface: string,
+      prompt: string,
+      done: (result: {
+        moving: boolean;
+        focused: boolean;
+        grewAbove: boolean;
+        glideAt: number | null;
+      }) => void,
+    ) => {
+      const scroller = document.querySelector<HTMLElement>(
+        `${surface} [class*='overflow-anchor']`,
+      )!;
+      const sentTop = () =>
+        [...document.querySelectorAll<HTMLElement>(`${surface} [data-message-role="user"]`)]
+          .find((row) => row.textContent?.includes(prompt))
+          ?.getBoundingClientRect().top ?? null;
+      const first = sentTop();
+      const started = performance.now();
+      const check = () => {
+        const now = sentTop();
+        if (first !== null && now !== null && Math.abs(now - first) > 4) {
+          const glideAt = performance.now();
+          const area = scroller.getBoundingClientRect();
+          const above = [...scroller.querySelectorAll<HTMLElement>(".chat-markdown p")].find(
+            (element) => element.getBoundingClientRect().bottom < area.top - 200,
+          );
+          if (above) {
+            above.dataset.bibcodeKeyboardGrown = "true";
+            above.style.paddingTop = "160px";
+          }
+          requestAnimationFrame(() =>
+            requestAnimationFrame(() => {
+              const button = [
+                ...document.querySelectorAll<HTMLElement>(`${surface} .chat-markdown-codeblock`),
+              ]
+                .filter((block) => block.textContent?.includes("Kept at the top"))
+                .sort((a, b) => b.getBoundingClientRect().top - a.getBoundingClientRect().top)[0]
+                ?.querySelector<HTMLButtonElement>('button[aria-label="Copy code"]');
+              button?.focus({ preventScroll: true });
+              const overlay = document.querySelector<HTMLElement>(
+                `${surface} [data-chat-composer-overlay="true"]`,
+              );
+              const readableBottom = Math.min(
+                area.bottom,
+                overlay?.getBoundingClientRect().top ?? Number.POSITIVE_INFINITY,
+              );
+              const trace: NativePageUpTrace = { key: null, frames: [], done: false };
+              const onKeyDown = (event: KeyboardEvent) => {
+                if (event.key !== "PageUp" || trace.key !== null) return;
+                const paragraph = [
+                  ...scroller.querySelectorAll<HTMLElement>(".chat-markdown p"),
+                ].find((element) => {
+                  const box = element.getBoundingClientRect();
+                  return box.top >= area.top && box.bottom <= readableBottom;
+                });
+                const line = paragraph ?? button ?? null;
+                trace.key = {
+                  at: Math.round(performance.now()),
+                  scrollTop: Math.round(scroller.scrollTop),
+                  lineTop: line ? Math.round(line.getBoundingClientRect().top) : null,
+                  clientHeight: scroller.clientHeight,
+                  trusted: event.isTrusted,
+                  defaultPrevented: false,
+                  targetFocused: event.target === button,
+                  anchorKind: paragraph ? "paragraph" : button ? "copy-button" : "none",
+                };
+                const sample = () => {
+                  trace.frames.push({
+                    at: Math.round(performance.now()),
+                    scrollTop: Math.round(scroller.scrollTop),
+                    lineTop: line ? Math.round(line.getBoundingClientRect().top) : null,
+                    lineConnected: line?.isConnected ?? false,
+                  });
+                  if (trace.frames.length < 16) {
+                    requestAnimationFrame(sample);
+                  } else {
+                    const key = trace.key;
+                    if (key) trace.key = { ...key, defaultPrevented: event.defaultPrevented };
+                    trace.done = true;
+                    document.removeEventListener("keydown", onKeyDown, { capture: true });
+                  }
+                };
+                requestAnimationFrame(sample);
+              };
+              document.addEventListener("keydown", onKeyDown, { capture: true });
+              (
+                window as unknown as { __bibcodeNativePageUpTrace?: NativePageUpTrace }
+              ).__bibcodeNativePageUpTrace = trace;
+              done({
+                moving: true,
+                focused: document.activeElement === button,
+                grewAbove: !!above,
+                glideAt: Math.round(glideAt),
+              });
+            }),
+          );
+          return;
+        }
+        if (performance.now() - started > 1_500) {
+          done({ moving: false, focused: false, grewAbove: false, glideAt: null });
+          return;
+        }
+        requestAnimationFrame(check);
+      };
+      requestAnimationFrame(check);
+    },
+    visibleSurfaceSelector,
+    mermaidFixturePrompts.keyboard,
+  );
+  if (!ready.moving || !ready.focused || ready.glideAt === null) {
+    await finishSender(false);
+    throw new Error(
+      `The native PageUp could not land during the sent-row glide: ${JSON.stringify(ready)}.`,
+    );
+  }
+  const sender = await finishSender(true);
+  await browser.waitUntil(
+    () =>
+      browser.execute(
+        () =>
+          (window as unknown as { __bibcodeNativePageUpTrace?: NativePageUpTrace })
+            .__bibcodeNativePageUpTrace?.done === true,
+      ),
+    {
+      timeoutMsg: `The trusted PageUp produced no painted trace. Sender: ${JSON.stringify(sender)}.`,
+    },
+  );
+  const trace = await browser.execute(
+    () =>
+      (window as unknown as { __bibcodeNativePageUpTrace?: NativePageUpTrace })
+        .__bibcodeNativePageUpTrace ?? null,
+  );
+  if (!trace?.key) throw new Error("The native PageUp trace has no keydown.");
+  return {
+    kind: "native",
+    moving: ready.moving,
+    focused: ready.focused,
+    grewAbove: ready.grewAbove,
+    keyAfterGlideMs: trace.key.at - ready.glideAt,
+    key: trace.key,
+    frames: trace.frames,
+    sender,
+  };
 }
 
 /**

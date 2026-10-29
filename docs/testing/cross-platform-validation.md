@@ -3550,16 +3550,17 @@ sent-row positions, and, for diagnosis only, the painted frames each delivery
 took to reveal its end). Then the reader takes the timeline over with the
 keyboard: after a long reply establishes scrollable history and a short reply
 mounts its code block's **Copy code** button, a reply streams for about nine
-seconds. One page script waits for its
-sent row to start gliding, grows a paragraph far above the view so LegendList
-holds an adjustment for the glide, focuses that button (a focus, not a press),
-dispatches a PageUp keydown on it and immediately makes the page step
-that key's default action makes. The packaged WebDriver plugin sends keys as
-dispatched events, which scroll nothing, so the spec cannot use real key
-input. The key must land within 750 ms of the glide starting, and a visible
-paragraph or the focused Copy button must not move between the key and the page
-step. The glide stops, and the held adjustment is applied as a scroll instead of
-a jump. The paragraph
+seconds. The scenario waits for the sent row to start gliding, grows a
+paragraph far above the view so LegendList holds an adjustment, and focuses
+that button (a focus, not a press). On macOS, it sends a trusted PageUp through
+System Events after the webview reports glide and focus readiness; the packaged
+WebDriver plugin's dispatched key has no native scroll there. The first painted
+frame must hold the same reading line within 1 px, and subsequent frames must
+move it only in the page direction. On Linux and Windows, one page script
+dispatches the keydown and immediately makes its page step because their
+packaged driver also dispatches keys without native scrolling. The key must
+land within 750 ms of the glide starting. The held adjustment is applied as a
+scroll instead of a jump. The paragraph
 then read stays within 1 px on every painted frame for 3 s, through the
 glide's settling, LegendList's wait for rows to settle and at least five more
 deliveries; an End keydown and a scroll to the end resume following, and at
