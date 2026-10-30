@@ -733,16 +733,18 @@ async fn malformed_connect_and_mcp_requests_preserve_transport_errors() {
         .expect("unsupported method should fail");
     assert_eq!(unsupported.status(), StatusCode::METHOD_NOT_ALLOWED);
 
+    // A malformed message is answered with 400 and its JSON-RPC error in the body.
     for body in [
         b"not-json".to_vec(),
         serde_json::to_vec(&json!({"id":1})).unwrap(),
     ] {
-        let error = service
+        let response = service
             .mcp(Method::POST, body, context(headers.clone()))
             .await
-            .err()
-            .expect("invalid JSON-RPC request should fail");
-        assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+            .expect("an MCP error response");
+        assert_eq!(response.status, 400);
+        let message: Value = serde_json::from_slice(&response.body).unwrap();
+        assert!(message["error"]["code"].is_i64(), "{message}");
     }
 
     let missing_session = service

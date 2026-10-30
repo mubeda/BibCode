@@ -611,7 +611,9 @@ impl Relay {
         let Some(credential) = self.credential.lock().await.take() else {
             return;
         };
-        if let Err(error) = revoke_sessions(&self.options, std::slice::from_ref(&credential.session_id)).await {
+        if let Err(error) =
+            revoke_sessions(&self.options, std::slice::from_ref(&credential.session_id)).await
+        {
             eprintln!("bibcode: could not revoke this MCP connection's credential: {error}");
             return;
         }

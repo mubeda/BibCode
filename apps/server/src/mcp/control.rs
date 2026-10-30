@@ -1613,7 +1613,7 @@ pub(crate) struct MessagePage {
     pub(crate) queued_count: i64,
     pub(crate) next_cursor: Option<String>,
     /// How many message rows the page query stepped over: its `LIMIT` bounds it.
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) rows_read: usize,
 }
 
