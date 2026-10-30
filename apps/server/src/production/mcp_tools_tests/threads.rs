@@ -740,7 +740,7 @@ async fn the_ceiling_caps_starts_and_refuses_driving_a_thread_above_it() {
 }
 
 #[tokio::test]
-async fn questions_are_answered_and_approvals_are_not() {
+async fn questions_are_answered_with_answer_question_not_answer_approval() {
     let harness = Harness::new().await;
     let (agent, _) = harness.agent(McpAccess::FullAccess).await;
     let (thread_id, _) = start(&harness, &agent, basic_start()).await;
@@ -794,7 +794,7 @@ async fn questions_are_answered_and_approvals_are_not() {
     {
         let approval = &pending["approvals"][0];
         assert_eq!(approval["requestId"], "a1", "{pending}");
-        assert_eq!(approval["answerWith"], "a person, in BiBCode");
+        assert_eq!(approval["answerWith"], "answer_approval");
         assert_eq!(
             error_tag(
                 &harness
@@ -805,7 +805,7 @@ async fn questions_are_answered_and_approvals_are_not() {
                     )
                     .await
             ),
-            "McpApprovalNotAnswerableError"
+            "McpRequestKindError"
         );
     }
     let answered = harness
@@ -818,7 +818,7 @@ async fn questions_are_answered_and_approvals_are_not() {
     // The faked provider has no live session to take the answer; what matters is that the
     // tool reached the RPC handler instead of refusing it.
     if answered["isError"] == true {
-        assert_ne!(error_tag(&answered), "McpApprovalNotAnswerableError");
+        assert_ne!(error_tag(&answered), "McpRequestKindError");
         assert_ne!(error_tag(&answered), "McpScopeError");
     }
     // The faked provider has no live session either, so the handler refuses the interrupt
