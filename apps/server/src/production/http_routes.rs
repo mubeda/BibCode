@@ -126,6 +126,9 @@ pub struct HttpRoutesState {
     /// the production runtime.
     pub diagnostic_logs_relay:
         Option<crate::production::diagnostic_logs_relay::DiagnosticLogsRelayRoute>,
+    /// The per-boot key `POST /mcp/endpoint-proof` signs with; `None` (answering `503`)
+    /// without the production runtime.
+    pub mcp_proof_key: Option<crate::mcp::endpoint::ProofKey>,
 }
 
 impl HttpRoutesState {
@@ -149,6 +152,7 @@ impl HttpRoutesState {
             transfer_upload,
             device_media: None,
             diagnostic_logs_relay: None,
+            mcp_proof_key: None,
             open_url: Arc::new(|_body, _context| {
                 Box::pin(async {
                     Err(HttpRouteError::new(
@@ -280,6 +284,9 @@ pub struct McpHttpResponse {
     pub status: u16,
     pub headers: BTreeMap<String, String>,
     pub body: Vec<u8>,
+    /// A streamed body (`text/event-stream`) in place of `body`: each item is sent as it
+    /// comes, and dropping the response closes the channel, which ends the work behind it.
+    pub stream: Option<tokio::sync::mpsc::Receiver<Vec<u8>>>,
 }
 
 #[derive(Debug)]
@@ -345,6 +352,17 @@ where
         .route(DEVICE_MEDIA_PATH, get(device_media))
         .route(DEVICE_MEDIA_E2EE_PATH, get(device_media_e2ee))
         .route("/mcp", post(mcp_post).delete(mcp_delete))
+        .route(crate::mcp::endpoint::PROOF_PATH, post(mcp_endpoint_proof))
+}
+
+/// Unauthenticated and loopback-only: it reads no bearer, and signs only a nonce the caller
+/// chose, so it reveals nothing secret (see `mcp::endpoint`).
+async fn mcp_endpoint_proof(
+    State(state): State<HttpRoutesState>,
+    connection: crate::http::ConnectionInfo,
+    request: Request,
+) -> Response {
+    crate::mcp::endpoint::proof_http(state.mcp_proof_key, connection, request).await
 }
 
 async fn device_media(
@@ -848,13 +866,20 @@ fn mcp_response(response: McpHttpResponse) -> Response {
     let Ok(mut status) = StatusCode::from_u16(response.status) else {
         return internal_error();
     };
-    if status == StatusCode::OK && response.body.is_empty() {
+    if status == StatusCode::OK && response.body.is_empty() && response.stream.is_none() {
         status = StatusCode::ACCEPTED;
     }
+    let body = match response.stream {
+        Some(stream) => Body::from_stream(tokio_stream::StreamExt::map(
+            tokio_stream::wrappers::ReceiverStream::new(stream),
+            Ok::<_, std::convert::Infallible>,
+        )),
+        None => Body::from(response.body),
+    };
     let mut output = Response::builder()
         .status(status)
         .header(header::CACHE_CONTROL, NO_STORE)
-        .body(Body::from(response.body))
+        .body(body)
         .unwrap_or_else(|_| internal_error());
     append_headers(&mut output, response.headers);
     output

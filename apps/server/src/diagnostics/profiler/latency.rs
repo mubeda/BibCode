@@ -104,6 +104,13 @@ pub fn judge(ms: f64, p95: Option<f64>, samples: u64, interactive: bool) -> Tier
 /// duration says little about the server. These methods still emit `rpc.timing`, but never
 /// raise `rpc.slow` or count toward `rpc.saturation`, and their hang budget is 300 s.
 pub fn is_long_running(method: &str) -> bool {
+    // An MCP tool call (#139) is long-running when it waits by design or any RPC method it
+    // dispatches to is.
+    if let Some(tool) = method.strip_prefix("mcp.") {
+        return crate::mcp::control::tool_spec(tool).is_some_and(|spec| {
+            spec.waits || spec.methods.iter().any(|method| is_long_running(method))
+        });
+    }
     matches!(
         method,
         "vcs.clone"
@@ -1141,6 +1148,24 @@ mod tests {
         assert!(Tier::None < Tier::RelativeLogOnly);
         assert!(Tier::RelativeLogOnly < Tier::Warn);
         assert!(Tier::Warn < Tier::Severe);
+    }
+
+    #[test]
+    fn an_mcp_tool_is_long_running_when_it_waits_or_dispatches_to_a_long_running_method() {
+        assert!(is_long_running("mcp.wait_for_thread"));
+        assert!(is_long_running("mcp.preview_wait_for"));
+        assert!(is_long_running("mcp.device_open"));
+        assert!(!is_long_running("mcp.read_thread"));
+        assert!(!is_long_running("mcp.no_such_tool"));
+        for spec in crate::mcp::control::CLIENT_TOOLS {
+            let expected = spec.waits || spec.methods.iter().any(|method| is_long_running(method));
+            assert_eq!(
+                is_long_running(&crate::mcp::control::timing_name(spec.name)),
+                expected,
+                "{}",
+                spec.name
+            );
+        }
     }
 
     #[test]

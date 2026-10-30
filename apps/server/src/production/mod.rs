@@ -16,6 +16,8 @@ pub mod jwt;
 mod keybindings;
 mod local_servers;
 pub mod managed_endpoint;
+#[cfg(test)]
+pub(crate) mod mcp_tools_tests;
 pub mod operational_logs;
 pub mod orchestration_effects;
 pub mod orchestration_rpc;

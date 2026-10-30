@@ -675,6 +675,16 @@ export class DiagnosticLogsRelayError extends Schema.TaggedError<DiagnosticLogsR
   },
 ) {}
 
+/**
+ * The command an AI agent on the server's host runs to reach it over MCP (#139): the server's
+ * own executable, `mcp`, its data root and, for the `dev` state, its dev URL. Clients wrap it
+ * for WSL or SSH and quote it for the shell; they never guess any part of it.
+ */
+export const ServerMcpLaunch = Schema.Struct({
+  argv: Schema.Array(Schema.String),
+});
+export type ServerMcpLaunch = typeof ServerMcpLaunch.Type;
+
 export const ServerConfig = Schema.Struct({
   environment: ExecutionEnvironmentDescriptor,
   auth: ServerAuthDescriptor,
@@ -686,6 +696,8 @@ export const ServerConfig = Schema.Struct({
   availableEditors: Schema.Array(EditorId),
   observability: ServerObservability,
   settings: ServerSettings,
+  /** Absent from a server older than MCP support; `null` when it cannot name its executable. */
+  mcpLaunch: Schema.optionalKey(Schema.NullOr(ServerMcpLaunch)),
 });
 export type ServerConfig = typeof ServerConfig.Type;
 

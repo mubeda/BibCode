@@ -51,6 +51,12 @@ const DESKTOP_BOOTSTRAP_TTL_MS: i64 = 24 * 60 * 60 * 1_000;
 /// Subject of every session minted from the desktop bootstrap credential: the desktop app's
 /// own WebView.
 pub(crate) const DESKTOP_BOOTSTRAP_SUBJECT: &str = "desktop-bootstrap";
+/// The subject of an outside agent's MCP credential (#139). Such a session authenticates
+/// `/mcp` only, through [`AuthService::authenticate_mcp_client`]; every other bearer, cookie,
+/// ticket and E2EE path refuses it, so the tools it is given are all it can reach.
+pub(crate) const MCP_CLIENT_SUBJECT: &str = "mcp-client";
+/// How long the relay's MCP pairing link lives: it exchanges it at once.
+const MCP_PAIRING_TTL_MS: i64 = 60 * 1_000;
 const PAIRING_ALPHABET: &[u8] = b"23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
 const PAIRING_LENGTH: usize = 12;
 const PAIRING_REJECTION_LIMIT: u8 =
@@ -273,6 +279,8 @@ struct AuthGrantMetadata {
     proof_key_thumbprint: Option<String>,
     reach: Option<String>,
     off_host: Option<bool>,
+    /// The MCP access ceiling an `mcp-client` credential carries; `None` for every other kind.
+    mcp_access: Option<String>,
 }
 
 struct AuthSessionIssuanceMetadata {
@@ -328,6 +336,8 @@ struct SessionRecord {
     transport: SessionTransport,
     reach: Option<String>,
     off_host: Option<bool>,
+    /// The MCP access ceiling an `mcp-client` credential carries; `None` for every other kind.
+    mcp_access: Option<String>,
     delivery_state: AuthSessionDeliveryState,
 }
 
@@ -345,6 +355,8 @@ struct PairingRecord {
     revoked_at_ms: Option<i64>,
     reach: Option<String>,
     off_host: Option<bool>,
+    /// The MCP access ceiling an `mcp-client` credential carries; `None` for every other kind.
+    mcp_access: Option<String>,
 }
 
 struct Grant {
@@ -353,6 +365,8 @@ struct Grant {
     label: Option<String>,
     reach: Option<String>,
     off_host: Option<bool>,
+    /// The MCP access ceiling an `mcp-client` credential carries; `None` for every other kind.
+    mcp_access: Option<String>,
     /// The reusable desktop bootstrap credential of this backend process. The
     /// host's own WebView exchanges it on every load and after every backend
     /// restart, so a new exchange supersedes the sessions it minted before.
@@ -872,6 +886,7 @@ impl AuthService {
                     proof_key_thumbprint,
                     reach: grant.reach,
                     off_host: grant.off_host,
+                    mcp_access: grant.mcp_access,
                 },
                 delivery_state,
             },
@@ -884,6 +899,35 @@ impl AuthService {
         token: &str,
         surface: SessionTransport,
     ) -> Result<Principal, AuthError> {
+        let (principal, _) = self.authenticate_session_token(token, surface).await?;
+        // Audience binding: an outside agent's credential reaches `/mcp` and nothing else.
+        if principal.subject == MCP_CLIENT_SUBJECT {
+            return Err(AuthError::InvalidCredential);
+        }
+        Ok(principal)
+    }
+
+    /// Authenticates an outside agent's MCP credential (subject `mcp-client`) and returns its
+    /// access ceiling, `None` when the session has none (callers treat that as read-only).
+    /// Every other session token is refused.
+    pub(crate) async fn authenticate_mcp_client(
+        &self,
+        token: &str,
+    ) -> Result<(Principal, Option<String>), AuthError> {
+        let (principal, access) = self
+            .authenticate_session_token(token, SessionTransport::Plain)
+            .await?;
+        if principal.subject != MCP_CLIENT_SUBJECT {
+            return Err(AuthError::InvalidCredential);
+        }
+        Ok((principal, access))
+    }
+
+    async fn authenticate_session_token(
+        &self,
+        token: &str,
+        surface: SessionTransport,
+    ) -> Result<(Principal, Option<String>), AuthError> {
         let claims: SessionClaims = self
             .signer
             .verify(token)
@@ -916,14 +960,18 @@ impl AuthService {
         {
             return Err(AuthError::InvalidCredential);
         }
-        Ok(Principal {
-            session_id: claims.sid,
-            subject: claims.sub,
-            method: claims.method,
-            scopes: claims.scopes,
-            proof_key_thumbprint: claims.jkt,
-            expires_at_ms: claims.exp,
-        })
+        let access = record.mcp_access.clone();
+        Ok((
+            Principal {
+                session_id: claims.sid,
+                subject: claims.sub,
+                method: claims.method,
+                scopes: claims.scopes,
+                proof_key_thumbprint: claims.jkt,
+                expires_at_ms: claims.exp,
+            },
+            access,
+        ))
     }
 
     pub async fn verify_dpop(
@@ -991,7 +1039,7 @@ impl AuthService {
         // Defense in depth for the no-downgrade invariant: tickets are only
         // accepted by the plain `/ws` route, so only plain-transport sessions
         // may redeem them.
-        if record.transport != SessionTransport::Plain {
+        if record.transport != SessionTransport::Plain || record.subject == MCP_CLIENT_SUBJECT {
             return Err(AuthError::InvalidCredential);
         }
         let principal = record.principal();
@@ -1272,6 +1320,7 @@ impl AuthService {
             proof_key_thumbprint,
             reach,
             off_host,
+            mcp_access,
         } = metadata;
         let _issuance = self.issuance.lock().await;
         if scopes.is_empty()
@@ -1335,6 +1384,7 @@ impl AuthService {
             revoked_at_ms: None,
             reach,
             off_host,
+            mcp_access,
         };
         let view = record.view();
         if let Some(repositories) = &self.repositories {
@@ -2094,6 +2144,7 @@ impl AuthService {
                     proof_key_thumbprint,
                     reach,
                     off_host,
+                    mcp_access,
                 },
             delivery_state,
         } = metadata;
@@ -2137,6 +2188,7 @@ impl AuthService {
             transport,
             reach,
             off_host,
+            mcp_access,
             delivery_state,
         };
         {
@@ -2215,6 +2267,7 @@ impl AuthService {
                     label: None,
                     reach: None,
                     off_host: None,
+                    mcp_access: None,
                     desktop_bootstrap: true,
                 })
             } else {
@@ -2247,6 +2300,7 @@ impl AuthService {
                 label: pairing.label,
                 reach: pairing.reach,
                 off_host: pairing.off_host,
+                mcp_access: pairing.mcp_access,
                 desktop_bootstrap: false,
             });
         }
@@ -2275,6 +2329,7 @@ impl AuthService {
             label: pairing.label.clone(),
             reach: pairing.reach.clone(),
             off_host: pairing.off_host,
+            mcp_access: pairing.mcp_access.clone(),
             desktop_bootstrap: false,
         };
         drop(state);
@@ -2448,6 +2503,7 @@ fn persisted_pairing_link(record: &PairingRecord) -> PersistedPairingLink {
         revoked_at: record.revoked_at_ms.map(format_iso),
         reach: record.reach.clone(),
         off_host: record.off_host,
+        mcp_access: record.mcp_access.clone(),
     }
 }
 
@@ -2469,6 +2525,7 @@ fn persisted_auth_session(record: &SessionRecord) -> NewAuthSession {
         expires_at: format_iso(record.expires_at_ms),
         reach: record.reach.clone(),
         off_host: record.off_host,
+        mcp_access: record.mcp_access.clone(),
         delivery_state: record.delivery_state,
     }
 }
@@ -2496,6 +2553,7 @@ fn pairing_record_from_persisted(row: PersistedPairingLink) -> Result<PairingRec
             .transpose()?,
         reach: row.reach,
         off_host: row.off_host,
+        mcp_access: row.mcp_access,
     })
 }
 
@@ -2580,6 +2638,7 @@ fn session_record_from_persisted(row: PersistedAuthSession) -> Result<SessionRec
         transport: SessionTransport::Plain,
         reach: row.reach,
         off_host: row.off_host,
+        mcp_access: row.mcp_access,
         delivery_state: row.delivery_state,
     })
 }
@@ -2771,6 +2830,7 @@ pub(crate) async fn issue_administrative_pairing_link(
         revoked_at_ms: None,
         reach: None,
         off_host: None,
+        mcp_access: None,
     };
     repositories
         .create_auth_pairing_link(persisted_pairing_link(&record))
@@ -2827,6 +2887,7 @@ pub(crate) async fn issue_offline_share_pairing(
         revoked_at_ms: None,
         reach: Some(reach),
         off_host: Some(off_host),
+        mcp_access: None,
     };
     repositories
         .create_auth_pairing_link(persisted_pairing_link(&record))
@@ -2836,6 +2897,53 @@ pub(crate) async fn issue_offline_share_pairing(
         id: record.id,
         credential: record.credential,
         label,
+        expires_at: format_iso(record.expires_at_ms),
+    })
+}
+
+/// Issues the one-time pairing link an MCP relay (`bibcode mcp`) exchanges for its credential,
+/// directly against a data root's repositories, like `issue_administrative_pairing_link`. It
+/// never holds more than `orchestration:read orchestration:operate`, so a stolen link cannot be
+/// widened at exchange; its subject is `mcp-client`, which binds the session to `/mcp`; and it
+/// carries the access ceiling `access` into the session. It lives 60 s.
+pub(crate) async fn issue_mcp_pairing_link(
+    repositories: &Repositories,
+    label: String,
+    access: &str,
+) -> Result<PairingCredentialResult, AuthError> {
+    let now = now_ms();
+    let active = repositories
+        .list_active_auth_pairing_links(format_iso(now))
+        .await
+        .map_err(|error| AuthError::Internal(error.to_string()))?;
+    if active.len() >= MAX_ACTIVE_PAIRINGS {
+        return Err(AuthError::Internal(
+            "active pairing capacity exceeded".to_owned(),
+        ));
+    }
+    let record = PairingRecord {
+        id: Uuid::new_v4().to_string(),
+        credential: generate_pairing_credential()?,
+        scopes: owned_scopes(super::model::MCP_CLIENT_SCOPES),
+        subject: MCP_CLIENT_SUBJECT.to_owned(),
+        label: Some(label.clone()),
+        proof_key_thumbprint: None,
+        created_at_ms: now,
+        expires_at_ms: now.saturating_add(MCP_PAIRING_TTL_MS),
+        consumed_at_ms: None,
+        revoked_at_ms: None,
+        reach: None,
+        off_host: None,
+        mcp_access: Some(access.to_owned()),
+    };
+    repositories
+        .create_auth_pairing_link(persisted_pairing_link(&record))
+        .await
+        .map_err(|error| AuthError::Internal(error.to_string()))?;
+    Ok(PairingCredentialResult {
+        id: record.id,
+        credential: record.credential,
+        label: Some(label),
         expires_at: format_iso(record.expires_at_ms),
     })
 }
@@ -2970,6 +3078,149 @@ mod tests {
                     SessionTransport::Plain,
                 )
                 .await,
+            Err(AuthError::InvalidCredential)
+        ));
+    }
+
+    async fn mcp_test_service() -> (AuthService, Repositories, tempfile::TempDir) {
+        let database = crate::persistence::Database::open_in_memory()
+            .await
+            .expect("in-memory database opens");
+        database
+            .call(|connection| {
+                crate::persistence::run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("all migrations apply");
+        let repositories = Repositories::new(database);
+        let secrets = tempfile::tempdir().expect("secret store directory");
+        let secret_store = SecretStore::new(secrets.path())
+            .await
+            .expect("secret store opens");
+        let config = ServerConfig::new(".").with_bind("127.0.0.1", 3773);
+        let service = AuthService::new_with_persistence(
+            &config,
+            vec![7_u8; 32],
+            secret_store,
+            repositories.clone(),
+        )
+        .await
+        .expect("service hydrates");
+        (service, repositories, secrets)
+    }
+
+    #[tokio::test]
+    async fn the_mcp_issuer_mints_two_scopes_bound_to_mcp_with_its_ceiling() {
+        let (service, repositories, _secrets) = mcp_test_service().await;
+        let issued = issue_mcp_pairing_link(
+            &repositories,
+            "MCP · Claude Code".into(),
+            "approval-required",
+        )
+        .await
+        .expect("link issues");
+        let link = repositories
+            .get_auth_pairing_link_by_credential(issued.credential.clone())
+            .await
+            .expect("read")
+            .expect("link exists");
+        assert_eq!(link.subject, MCP_CLIENT_SUBJECT);
+        assert_eq!(link.mcp_access.as_deref(), Some("approval-required"));
+        let lifetime = parse_timestamp_ms(&link.expires_at).unwrap()
+            - parse_timestamp_ms(&link.created_at).unwrap();
+        assert_eq!(lifetime, 60_000);
+
+        // Exchange cannot widen the grant.
+        let widened = service
+            .exchange_bootstrap(
+                &issued.credential,
+                Some(owned_scopes(&["orchestration:read", "terminal:operate"])),
+                ClientMetadata::default(),
+                None,
+                SessionTransport::Plain,
+            )
+            .await;
+        assert!(matches!(widened, Err(AuthError::ScopeNotGranted)));
+
+        let issued = issue_mcp_pairing_link(&repositories, "MCP · Claude Code".into(), "read-only")
+            .await
+            .expect("link issues");
+        let session = service
+            .exchange_bootstrap(
+                &issued.credential,
+                None,
+                ClientMetadata::default(),
+                None,
+                SessionTransport::Plain,
+            )
+            .await
+            .expect("exchange");
+        assert_eq!(
+            session.principal.scopes,
+            owned_scopes(&["orchestration:read", "orchestration:operate"])
+        );
+        let stored = repositories
+            .get_auth_session(session.principal.session_id.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.mcp_access.as_deref(), Some("read-only"));
+        assert_eq!(stored.client.label.as_deref(), Some("MCP · Claude Code"));
+
+        // Audience: only the MCP surface accepts it.
+        assert!(matches!(
+            service
+                .authenticate_token(&session.token, SessionTransport::Plain)
+                .await,
+            Err(AuthError::InvalidCredential)
+        ));
+        let (principal, access) = service
+            .authenticate_mcp_client(&session.token)
+            .await
+            .expect("the MCP surface accepts it");
+        assert_eq!(principal.session_id, session.principal.session_id);
+        assert_eq!(access.as_deref(), Some("read-only"));
+        let ticket = service
+            .issue_websocket_ticket(&principal)
+            .expect("ticket signs")
+            .0;
+        assert!(service.verify_websocket_ticket(&ticket).await.is_err());
+
+        // Revoking the row through the data root ends it on the next request.
+        repositories
+            .revoke_auth_session(principal.session_id.clone(), format_iso(now_ms()))
+            .await
+            .unwrap();
+        assert!(
+            service
+                .authenticate_mcp_client(&session.token)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_mcp_surface_refuses_every_other_session() {
+        let (service, repositories, _secrets) = mcp_test_service().await;
+        let issued = issue_administrative_pairing_link(&repositories, None)
+            .await
+            .expect("link");
+        let session = service
+            .exchange_bootstrap(
+                &issued.credential,
+                Some(owned_scopes(&[
+                    "orchestration:read",
+                    "orchestration:operate",
+                ])),
+                ClientMetadata::default(),
+                None,
+                SessionTransport::Plain,
+            )
+            .await
+            .expect("exchange");
+        assert!(matches!(
+            service.authenticate_mcp_client(&session.token).await,
             Err(AuthError::InvalidCredential)
         ));
     }
@@ -3993,6 +4244,7 @@ mod tests {
                 expires_at: format_iso(now + SESSION_TTL_MS),
                 reach: Some(PAIRING_REACH_ANOTHER_DEVICE.to_owned()),
                 off_host: Some(true),
+                mcp_access: None,
                 delivery_state: AuthSessionDeliveryState::PendingPairing,
             })
             .await
@@ -4892,6 +5144,7 @@ mod tests {
                         revoked_at_ms: None,
                         reach: None,
                         off_host: None,
+                        mcp_access: None,
                     },
                 );
             }
@@ -4940,6 +5193,7 @@ mod tests {
                         transport: SessionTransport::Plain,
                         reach: None,
                         off_host: None,
+                        mcp_access: None,
                         delivery_state: AuthSessionDeliveryState::Active,
                     },
                 );
@@ -4976,6 +5230,7 @@ mod tests {
                 revoked_at_ms: None,
                 reach: Some("another-device".to_owned()),
                 off_host: Some(true),
+                mcp_access: None,
             },
         );
     }
@@ -5659,6 +5914,7 @@ mod tests {
                 revoked_at: None,
                 reach: Some("another-device".to_owned()),
                 off_host: Some(true),
+                mcp_access: None,
             })
             .await
             .expect("expiring authority row");

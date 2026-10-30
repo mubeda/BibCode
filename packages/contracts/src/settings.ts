@@ -240,6 +240,19 @@ export const DEFAULT_CLIENT_SETTINGS: ClientSettings = Schema.decodeSync(ClientS
 
 // ── Server Settings (server-authoritative) ────────────────────
 
+/**
+ * The most an outside agent's MCP connection may do on this environment (#139): read only, or
+ * start and message threads that run at most in this runtime mode.
+ */
+export const McpServerAccess = Schema.Literals([
+  "read-only",
+  "approval-required",
+  "auto-accept-edits",
+  "full-access",
+]);
+export type McpServerAccess = typeof McpServerAccess.Type;
+export const DEFAULT_MCP_SERVER_ACCESS: McpServerAccess = "approval-required";
+
 export const ThreadEnvMode = Schema.Literals(["local", "worktree"]);
 export type ThreadEnvMode = typeof ThreadEnvMode.Type;
 
@@ -538,6 +551,10 @@ export const ServerSettings = Schema.Struct({
   ),
   enableProfiler: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   enableDevicePreviews: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  enableMcpServer: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
+  mcpServerAccess: McpServerAccess.pipe(
+    Schema.withDecodingDefault(Effect.succeed(DEFAULT_MCP_SERVER_ACCESS)),
+  ),
   automaticGitFetchInterval: Schema.DurationFromMillis.pipe(
     Schema.withDecodingDefault(
       Effect.succeed(Duration.toMillis(DEFAULT_AUTOMATIC_GIT_FETCH_INTERVAL)),
@@ -705,6 +722,8 @@ export const ServerSettingsPatch = Schema.Struct({
   enableTerminalAgentActivity: Schema.optionalKey(Schema.Boolean),
   enableProfiler: Schema.optionalKey(Schema.Boolean),
   enableDevicePreviews: Schema.optionalKey(Schema.Boolean),
+  enableMcpServer: Schema.optionalKey(Schema.Boolean),
+  mcpServerAccess: Schema.optionalKey(McpServerAccess),
   automaticGitFetchInterval: Schema.optionalKey(Schema.DurationFromMillis),
   defaultThreadEnvMode: Schema.optionalKey(ThreadEnvMode),
   newWorktreesStartFromOrigin: Schema.optionalKey(Schema.Boolean),

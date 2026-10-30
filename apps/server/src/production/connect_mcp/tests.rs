@@ -1195,20 +1195,19 @@ async fn mcp_json_rpc_and_preview_tools_preserve_wire_results() {
         .unwrap();
     let auth = authorization(&issued);
 
-    for body in [
-        b"not-json".to_vec(),
-        serde_json::to_vec(&json!({"id":1})).unwrap(),
+    // A malformed message gets 400 with its JSON-RPC error in the body.
+    for (body, code) in [
+        (b"not-json".to_vec(), -32700),
+        (serde_json::to_vec(&json!({"id":1})).unwrap(), -32600),
     ] {
-        assert_eq!(
-            error(
-                harness
-                    .service
-                    .mcp(Method::POST, body, context(auth.clone()))
-                    .await
-            )
-            .status,
-            StatusCode::BAD_REQUEST
-        );
+        let response = harness
+            .service
+            .mcp(Method::POST, body, context(auth.clone()))
+            .await
+            .unwrap();
+        assert_eq!(response.status, 400);
+        let body: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body["error"]["code"], code);
     }
     assert_eq!(
         error(
@@ -1240,19 +1239,19 @@ async fn mcp_json_rpc_and_preview_tools_preserve_wire_results() {
         .status,
         StatusCode::NOT_FOUND
     );
+    // A message without an id is a notification: accepted, never answered.
     assert_eq!(
-        error(
-            harness
-                .service
-                .mcp(
-                    Method::POST,
-                    serde_json::to_vec(&json!({"method":"initialize"})).unwrap(),
-                    context(auth.clone()),
-                )
-                .await
-        )
-        .status,
-        StatusCode::BAD_REQUEST
+        harness
+            .service
+            .mcp(
+                Method::POST,
+                serde_json::to_vec(&json!({"method":"initialize"})).unwrap(),
+                context(auth.clone()),
+            )
+            .await
+            .unwrap()
+            .status,
+        202
     );
 
     let headers = initialize(&harness.service, &issued).await;
@@ -1271,10 +1270,10 @@ async fn mcp_json_rpc_and_preview_tools_preserve_wire_results() {
     let unknown = rpc(
         &harness.service,
         headers.clone(),
-        json!({"method":"unknown"}),
+        json!({"id":9,"method":"unknown"}),
     )
     .await;
-    assert_eq!(unknown["id"], Value::Null);
+    assert_eq!(unknown["id"], 9);
     assert_eq!(unknown["error"]["code"], -32601);
 
     let listed = rpc(
@@ -1791,21 +1790,16 @@ async fn sqlite_failures_map_to_route_specific_errors_without_partial_responses(
 
 #[test]
 fn json_rpc_helpers_preserve_ids_headers_and_errors() {
-    let response = json_rpc_result(Some(json!(7)), json!({"ok":true}), None).unwrap();
+    let message = json!({"jsonrpc":"2.0","id":7,"result":{"ok":true}});
+    let response = mcp_json(StatusCode::OK, &message, None).unwrap();
     assert_eq!(response.headers.len(), 1);
     assert_eq!(
         serde_json::from_slice::<Value>(&response.body).unwrap()["id"],
         7
     );
-    assert_eq!(
-        error(json_rpc_result(None, Value::Null, None)).status,
-        StatusCode::BAD_REQUEST
-    );
-    let response = json_rpc_error(None, -32601, "missing", Some("session".into())).unwrap();
+    let response = mcp_json(StatusCode::NOT_FOUND, &message, Some("session".into())).unwrap();
+    assert_eq!(response.status, 404);
     assert_eq!(response.headers["mcp-session-id"], "session");
-    let body: Value = serde_json::from_slice(&response.body).unwrap();
-    assert_eq!(body["id"], Value::Null);
-    assert_eq!(body["error"]["message"], "missing");
 
     let error = ConnectMcpError::invalid_mcp_credential();
     assert_eq!(error.headers[header::WWW_AUTHENTICATE.as_str()], "Bearer");
@@ -2708,4 +2702,317 @@ mod device_tools {
                 .is_empty()
         );
     }
+}
+
+fn bearer(token: &str) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+    );
+    headers
+}
+
+async fn post(service: &ConnectMcpService, headers: HeaderMap, request: Value) -> McpHttpResponse {
+    service
+        .mcp(
+            Method::POST,
+            serde_json::to_vec(&request).unwrap(),
+            context(headers),
+        )
+        .await
+        .expect("MCP response")
+}
+
+fn body(response: &McpHttpResponse) -> Value {
+    serde_json::from_slice(&response.body).expect("JSON body")
+}
+
+fn names(listed: &Value) -> Vec<String> {
+    listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[tokio::test]
+async fn providers_and_outside_agents_share_mcp_with_separate_tools_and_checks() {
+    let tools = crate::production::mcp_tools_tests::Harness::new().await;
+    let (_agent, token) = tools
+        .agent(crate::mcp::control::McpAccess::FullAccess)
+        .await;
+    let connect = harness(4, 4).await;
+    let service = connect.service.clone().with_control(tools.control.clone());
+    let issued = service
+        .issue_mcp_credential("thread", "thread", "provider")
+        .await
+        .unwrap();
+
+    // A web page's Origin is refused; this server's own origin is not.
+    let mut from_page = bearer(&token);
+    from_page.insert(
+        header::ORIGIN,
+        HeaderValue::from_static("https://evil.example"),
+    );
+    let refused = service
+        .mcp(
+            Method::POST,
+            serde_json::to_vec(&json!({"jsonrpc":"2.0","id":1,"method":"ping"})).unwrap(),
+            context(from_page),
+        )
+        .await;
+    assert_eq!(error(refused).status, StatusCode::FORBIDDEN);
+    let mut own = bearer(&token);
+    own.insert(
+        header::ORIGIN,
+        HeaderValue::from_static("http://127.0.0.1:3773"),
+    );
+    own.insert(header::HOST, HeaderValue::from_static("127.0.0.1:3773"));
+    assert_eq!(
+        post(
+            &service,
+            own,
+            json!({"jsonrpc":"2.0","id":1,"method":"ping"})
+        )
+        .await
+        .status,
+        200
+    );
+
+    // A legacy outside agent: no HTTP session, and an unknown version answers 2025-11-25.
+    let initialized = post(
+        &service,
+        bearer(&token),
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2099-01-01"}}),
+    )
+    .await;
+    assert!(!initialized.headers.contains_key("mcp-session-id"));
+    assert_eq!(
+        body(&initialized)["result"]["protocolVersion"],
+        "2025-11-25"
+    );
+    let mut later = bearer(&token);
+    later.insert(
+        "mcp-protocol-version",
+        HeaderValue::from_static("2025-11-25"),
+    );
+    let listed = body(
+        &post(
+            &service,
+            later,
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
+        )
+        .await,
+    );
+    let client_tools = names(&listed);
+    assert!(client_tools.contains(&"start_thread".to_owned()));
+    assert!(
+        client_tools
+            .iter()
+            .all(|name| !name.starts_with("preview_"))
+    );
+    assert_eq!(listed["result"]["cacheScope"], "private");
+
+    // A provider lists no thread tools, and a provider's legacy initialize also negotiates.
+    let provider = initialize(&service, &issued).await;
+    let provider_tools = names(
+        &rpc(
+            &service,
+            provider.clone(),
+            json!({"jsonrpc":"2.0","id":3,"method":"tools/list"}),
+        )
+        .await,
+    );
+    assert!(
+        provider_tools
+            .iter()
+            .all(|name| name.starts_with("preview_") || name.starts_with("device_"))
+    );
+
+    // Each kind's call to the other's tool is a scope refusal.
+    let crossed = rpc(
+        &service,
+        provider,
+        json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"start_thread","arguments":{}}}),
+    )
+    .await;
+    assert_eq!(
+        crossed["result"]["structuredContent"]["error"]["_tag"],
+        "McpScopeError"
+    );
+    let crossed = body(
+        &post(
+            &service,
+            bearer(&token),
+            json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"preview_status","arguments":{}}}),
+        )
+        .await,
+    );
+    assert_eq!(
+        crossed["result"]["structuredContent"]["error"]["_tag"],
+        "McpScopeError"
+    );
+
+    // A modern request whose headers disagree with its body is refused.
+    let meta = json!({"io.modelcontextprotocol/protocolVersion": "2026-07-28"});
+    let mut mismatched = bearer(&token);
+    mismatched.insert(
+        "mcp-protocol-version",
+        HeaderValue::from_static("2026-07-28"),
+    );
+    mismatched.insert("mcp-method", HeaderValue::from_static("tools/call"));
+    mismatched.insert("mcp-name", HeaderValue::from_static("read_thread"));
+    let response = post(
+        &service,
+        mismatched.clone(),
+        json!({"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"list_projects_and_threads","arguments":{},"_meta":meta}}),
+    )
+    .await;
+    assert_eq!(response.status, 400);
+    assert_eq!(body(&response)["error"]["code"], -32020);
+    mismatched.insert(
+        "mcp-name",
+        HeaderValue::from_static("list_projects_and_threads"),
+    );
+    let response = post(
+        &service,
+        mismatched,
+        json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"list_projects_and_threads","arguments":{},"_meta":meta}}),
+    )
+    .await;
+    assert_eq!(response.status, 200);
+    assert_eq!(body(&response)["result"]["resultType"], "complete");
+
+    // Any other session token is not an MCP credential.
+    let link = crate::auth::issue_administrative_pairing_link(&tools.repositories, None)
+        .await
+        .unwrap();
+    let standard = tools
+        .auth
+        .exchange_bootstrap(
+            &link.credential,
+            Some(vec![
+                "orchestration:read".into(),
+                "orchestration:operate".into(),
+            ]),
+            crate::auth::ClientMetadata::default(),
+            None,
+            crate::auth::SessionTransport::Plain,
+        )
+        .await
+        .unwrap();
+    let refused = service
+        .mcp(
+            Method::POST,
+            serde_json::to_vec(&json!({"jsonrpc":"2.0","id":8,"method":"tools/list"})).unwrap(),
+            context(bearer(&standard.token)),
+        )
+        .await;
+    assert_eq!(error(refused).status, StatusCode::UNAUTHORIZED);
+
+    // Off: a typed refusal for outside agents, while provider tools keep working.
+    tools
+        .settings
+        .send_replace(crate::mcp::control::McpServerSettings {
+            enabled: false,
+            access: crate::mcp::control::McpAccess::FullAccess,
+        });
+    let off = body(
+        &post(
+            &service,
+            bearer(&token),
+            json!({"jsonrpc":"2.0","id":9,"method":"tools/list"}),
+        )
+        .await,
+    );
+    assert_eq!(off["error"]["data"]["_tag"], "McpServerDisabledError");
+    let provider = initialize(&service, &issued).await;
+    let status = rpc(
+        &service,
+        provider,
+        json!({"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"preview_status","arguments":{}}}),
+    )
+    .await;
+    assert_ne!(
+        status["result"]["structuredContent"]["error"]["_tag"],
+        "McpServerDisabledError"
+    );
+    assert_ne!(
+        status["result"]["structuredContent"]["error"]["_tag"],
+        "McpScopeError"
+    );
+    // On again: the same token works with no new initialize.
+    tools
+        .settings
+        .send_replace(crate::mcp::control::McpServerSettings {
+            enabled: true,
+            access: crate::mcp::control::McpAccess::FullAccess,
+        });
+    let mut again = bearer(&token);
+    again.insert(
+        "mcp-protocol-version",
+        HeaderValue::from_static("2025-11-25"),
+    );
+    let listed = body(
+        &post(
+            &service,
+            again,
+            json!({"jsonrpc":"2.0","id":11,"method":"tools/list"}),
+        )
+        .await,
+    );
+    assert!(names(&listed).contains(&"read_thread".to_owned()));
+    tools.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_wait_with_a_progress_token_streams_progress_then_its_result() {
+    let tools = crate::production::mcp_tools_tests::Harness::new().await;
+    let (agent, token) = tools
+        .agent(crate::mcp::control::McpAccess::FullAccess)
+        .await;
+    let started = tools
+        .control
+        .call(
+            &agent,
+            "start_thread",
+            &serde_json::from_value(json!({"projectId":"p1","prompt":"hi","providerInstanceId":"codex","model":"gpt-5"})).unwrap(),
+            None,
+            CancellationToken::new(),
+        )
+        .await;
+    let thread_id = started["structuredContent"]["threadId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let connect = harness(4, 4).await;
+    let service = connect.service.clone().with_control(tools.control.clone());
+    let mut response = post(
+        &service,
+        bearer(&token),
+        json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"wait_for_thread","arguments":{"threadId":thread_id,"timeoutMs":300},"_meta":{"progressToken":"p-1"}}}),
+    )
+    .await;
+    assert_eq!(response.headers["content-type"], "text/event-stream");
+    let mut stream = response.stream.take().expect("a streamed body");
+    let mut frames = Vec::new();
+    while let Some(frame) = stream.recv().await {
+        frames.push(String::from_utf8(frame).unwrap());
+    }
+    let messages: Vec<Value> = frames
+        .iter()
+        .map(|frame| {
+            serde_json::from_str(frame.trim().strip_prefix("event: message\ndata: ").unwrap())
+                .unwrap()
+        })
+        .collect();
+    assert!(messages.len() >= 2, "{frames:?}");
+    assert_eq!(messages[0]["method"], "notifications/progress");
+    assert_eq!(messages[0]["params"]["progressToken"], "p-1");
+    let last = messages.last().unwrap();
+    assert_eq!(last["id"], 1);
+    assert_eq!(last["result"]["structuredContent"]["timedOut"], true);
+    tools.shutdown().await;
 }

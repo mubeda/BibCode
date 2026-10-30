@@ -651,6 +651,61 @@ impl RpcRegistry {
         self.methods.get(name).cloned()
     }
 
+    /// Runs the unary method `tag` for a caller with no socket (the `/mcp` thread tools), with
+    /// the same checks a WebSocket request gets: the method's declared scope on `context`'s
+    /// session, then its maintenance admission, then the registered handler and its timing.
+    pub(crate) async fn invoke_local(
+        &self,
+        tag: &str,
+        payload: Value,
+        context: RpcSessionContext,
+        cancellation: CancellationToken,
+    ) -> RpcResult {
+        let Some(RpcMethod::Unary(handler)) = self.get(tag) else {
+            return Err(json!({
+                "_tag": "RpcMethodNotFoundError",
+                "message": format!("Unknown unary RPC method: {tag}"),
+            }));
+        };
+        if let (Some(principal), Some(auth)) = (&context.principal, &context.auth) {
+            let scope = required_scope(tag).ok_or_else(|| {
+                json!({
+                    "_tag": "EnvironmentAuthorizationError",
+                    "message": format!("RPC method {tag} has no declared authorization scope"),
+                })
+            })?;
+            match auth.authorize_session(&principal.session_id, scope).await {
+                Ok(()) => {}
+                Err(crate::auth::AuthError::ScopeRequired(_)) => {
+                    return Err(authorization_error(scope));
+                }
+                Err(_) => {
+                    return Err(json!({
+                        "_tag": "EnvironmentAuthenticationError",
+                        "message": "Authenticated session is no longer valid",
+                    }));
+                }
+            }
+        }
+        let admission = self
+            .admission_gate
+            .admit_named(rpc_mutability(tag), tag.to_owned())
+            .map_err(|error| {
+                json!({ "_tag": "UpdateMaintenanceActiveError", "message": error.to_string() })
+            })?;
+        let request = RpcRequest {
+            id: RequestId::try_from("0").expect("a decimal request id"),
+            tag: tag.to_owned(),
+            payload,
+            headers: Vec::new(),
+            trace_id: None,
+            span_id: None,
+            sampled: None,
+        };
+        let context = context.with_admission(admission);
+        handler(request, context, cancellation).await.result
+    }
+
     pub fn validate_complete(&self) -> Result<(), String> {
         let mut issues = Vec::new();
         for spec in ACTIVE_RPC_METHODS {

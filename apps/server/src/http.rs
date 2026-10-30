@@ -134,6 +134,8 @@ pub const ROUTE_INVENTORY: &[RouteSpec] = &[
     route(RouteMethod::Get, MAINTENANCE_UPDATE_STATUS_PATH),
     route(RouteMethod::Post, "/mcp"),
     route(RouteMethod::Delete, "/mcp"),
+    // Unauthenticated and loopback-only: reads no bearer (`mcp::endpoint`).
+    route(RouteMethod::Post, crate::mcp::endpoint::PROOF_PATH),
     route(RouteMethod::Get, "*"),
 ];
 

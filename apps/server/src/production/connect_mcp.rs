@@ -18,7 +18,13 @@ use uuid::Uuid;
 use super::http_routes::{
     HttpRouteError, JsonOperation, JsonRouteResponse, McpHttpResponse, RouteContext,
 };
-use crate::preview::{OpenRequestError, PreviewManager};
+use crate::{
+    mcp::{
+        control::{ClientPrincipal, McpControl, PROVIDER_SCOPES, PrincipalKind, authorize_call},
+        protocol::{self, Incoming},
+    },
+    preview::{OpenRequestError, PreviewManager},
+};
 
 mod device_tools;
 pub use device_tools::DeviceTools;
@@ -306,6 +312,8 @@ pub struct ConnectMcpService {
     preview: PreviewInvoker,
     devices: Option<DeviceTools>,
     mcp: Arc<Mutex<McpState>>,
+    /// The outside-agent thread tools; `None` serves provider tools only.
+    control: Option<McpControl>,
     /// Serializes changes to the stored link and its managed endpoint (link, unlink, and the
     /// startup restore), so a restore never reapplies a config a newer change replaced.
     link_mutation: Arc<Mutex<()>>,
@@ -370,8 +378,16 @@ impl ConnectMcpService {
             preview,
             devices,
             mcp: Arc::new(Mutex::new(McpState::default())),
+            control: None,
             link_mutation: Arc::default(),
         })
+    }
+
+    /// Serves the outside-agent thread tools on `/mcp` too.
+    #[must_use]
+    pub fn with_control(mut self, control: McpControl) -> Self {
+        self.control = Some(control);
+        self
     }
 
     pub async fn json(
@@ -952,91 +968,177 @@ impl ConnectMcpService {
         body: Vec<u8>,
         context: RouteContext,
     ) -> Result<McpHttpResponse, ConnectMcpError> {
-        let token = bearer_token(&context)?;
-        let token_hash = hash_token(token);
+        // The 2026-07-28 transport: a browser page must not reach this endpoint. No BiBCode
+        // surface sends an Origin here, and the MCP clients providers run send none.
+        if !origin_is_own(&context) {
+            return Err(ConnectMcpError::mcp(
+                StatusCode::FORBIDDEN,
+                "MCP requests from a web page are not accepted.",
+            ));
+        }
+        let token = bearer_token(&context)?.to_owned();
+        let token_hash = hash_token(&token);
         let now = (self.config.now_epoch_seconds)();
-        let request: Value = serde_json::from_slice(&body)
-            .map_err(|_| ConnectMcpError::mcp(StatusCode::BAD_REQUEST, "Invalid JSON-RPC body."))?;
-        let method = request
-            .get("method")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                ConnectMcpError::mcp(StatusCode::BAD_REQUEST, "JSON-RPC method is required.")
-            })?;
-        let request_id = request.get("id").cloned();
-        let mut state = self.mcp.lock().await;
-        prune_mcp(&mut state, now);
-        let credential = state
-            .credentials
-            .get_mut(&token_hash)
-            .ok_or_else(ConnectMcpError::invalid_mcp_credential)?;
-        credential.last_used_at = now;
-        let scope = credential.scope.clone();
-        let supplied_session = context
-            .headers
-            .get("mcp-session-id")
-            .and_then(|value| value.to_str().ok());
-        let session_id = if method == "initialize" {
-            if state.sessions.len() >= self.config.max_mcp_sessions.max(1) {
-                return Err(ConnectMcpError::mcp(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "MCP session capacity exceeded.",
-                ));
-            }
-            let session_id = Uuid::new_v4().to_string();
-            state.sessions.insert(
-                session_id.clone(),
-                McpSessionRecord {
-                    credential_hash: token_hash.clone(),
-                    last_used_at: now,
-                },
-            );
-            session_id
-        } else {
-            let supplied = supplied_session.ok_or_else(|| {
-                ConnectMcpError::mcp(StatusCode::BAD_REQUEST, "MCP session id is required.")
-            })?;
-            let session = state.sessions.get_mut(supplied).ok_or_else(|| {
-                ConnectMcpError::mcp(StatusCode::NOT_FOUND, "MCP session was not found.")
-            })?;
-            if session.credential_hash != token_hash {
-                return Err(ConnectMcpError::invalid_mcp_credential());
-            }
-            session.last_used_at = now;
-            supplied.to_owned()
+        let provider_scope = {
+            let mut state = self.mcp.lock().await;
+            prune_mcp(&mut state, now);
+            state.credentials.get_mut(&token_hash).map(|credential| {
+                credential.last_used_at = now;
+                credential.scope.clone()
+            })
         };
-        drop(state);
+        let principal = match provider_scope {
+            Some(scope) => McpPrincipal::Provider(scope),
+            None => match &self.control {
+                Some(control) => McpPrincipal::Client(
+                    control
+                        .authenticate(&token)
+                        .await
+                        .ok_or_else(ConnectMcpError::invalid_mcp_credential)?,
+                ),
+                None => return Err(ConnectMcpError::invalid_mcp_credential()),
+            },
+        };
+        let request = match protocol::parse(&body) {
+            Incoming::Ignore => {
+                return Ok(McpHttpResponse {
+                    status: 202,
+                    headers: BTreeMap::new(),
+                    body: Vec::new(),
+                    stream: None,
+                });
+            }
+            Incoming::Reply(reply) => return mcp_json(StatusCode::BAD_REQUEST, &reply, None),
+            Incoming::Request(request) => request,
+        };
+        if let Err(message) = check_transport_headers(&context, &request) {
+            return mcp_json(
+                StatusCode::BAD_REQUEST,
+                &protocol::failure(
+                    request.id,
+                    protocol::rpc_error(protocol::HEADER_MISMATCH, &message),
+                ),
+                None,
+            );
+        }
+        match principal {
+            McpPrincipal::Provider(scope) => {
+                self.provider_request(request, scope, token_hash, now, context)
+                    .await
+            }
+            McpPrincipal::Client(principal) => {
+                let control = self
+                    .control
+                    .clone()
+                    .ok_or_else(ConnectMcpError::invalid_mcp_credential)?;
+                client_request(control, request, principal, context).await
+            }
+        }
+    }
 
+    /// A provider's request: legacy sessions as providers already launched use them, or the
+    /// modern era with no session. Only `preview_*` and `device_*`, each scope-checked.
+    async fn provider_request(
+        &self,
+        request: protocol::Request,
+        scope: PreviewScope,
+        token_hash: String,
+        now: i64,
+        context: RouteContext,
+    ) -> Result<McpHttpResponse, ConnectMcpError> {
+        let method = request.method.as_str();
+        let session_id = if request.modern {
+            None
+        } else {
+            let mut state = self.mcp.lock().await;
+            let supplied_session = context
+                .headers
+                .get("mcp-session-id")
+                .and_then(|value| value.to_str().ok());
+            Some(if method == "initialize" {
+                if state.sessions.len() >= self.config.max_mcp_sessions.max(1) {
+                    return Err(ConnectMcpError::mcp(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "MCP session capacity exceeded.",
+                    ));
+                }
+                let session_id = Uuid::new_v4().to_string();
+                state.sessions.insert(
+                    session_id.clone(),
+                    McpSessionRecord {
+                        credential_hash: token_hash.clone(),
+                        last_used_at: now,
+                    },
+                );
+                session_id
+            } else {
+                let supplied = supplied_session.ok_or_else(|| {
+                    ConnectMcpError::mcp(StatusCode::BAD_REQUEST, "MCP session id is required.")
+                })?;
+                let session = state.sessions.get_mut(supplied).ok_or_else(|| {
+                    ConnectMcpError::mcp(StatusCode::NOT_FOUND, "MCP session was not found.")
+                })?;
+                if session.credential_hash != token_hash {
+                    return Err(ConnectMcpError::invalid_mcp_credential());
+                }
+                session.last_used_at = now;
+                supplied.to_owned()
+            })
+        };
         if context.cancellation.is_cancelled() && method != "tools/call" {
             return Err(ConnectMcpError::mcp(
                 StatusCode::REQUEST_TIMEOUT,
                 "MCP request was cancelled.",
             ));
         }
+        let params = request.params.as_ref();
         let result = match method {
-            "initialize" => json!({
-                "protocolVersion": request.pointer("/params/protocolVersion").and_then(Value::as_str).unwrap_or("2025-06-18"),
-                "capabilities":{"tools":{"listChanged":false}},
-                "serverInfo":{"name":"BiBCode","version":env!("CARGO_PKG_VERSION")}
-            }),
-            "ping" => json!({}),
-            "tools/list" => {
-                json!({"tools": tool_descriptors(self.devices.as_ref().is_some_and(DeviceTools::enabled))})
-            }
+            "initialize" => Ok(protocol::initialize_result(
+                params,
+                json!({ "tools": { "listChanged": false } }),
+                server_info(),
+            )),
+            "server/discover" => Ok(protocol::discover_result(
+                json!({ "tools": { "listChanged": false } }),
+                server_info(),
+                PROVIDER_LIST_TTL_MS,
+            )),
+            "ping" => Ok(json!({})),
+            "tools/list" => Ok(protocol::list_result(
+                Value::Array(tool_descriptors(
+                    self.devices.as_ref().is_some_and(DeviceTools::enabled),
+                )),
+                PROVIDER_LIST_TTL_MS,
+            )),
             "tools/call" => {
-                self.call_tool(request.get("params"), scope, context.cancellation)
-                    .await
+                let name = params
+                    .and_then(|params| params.get("name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                let timer = crate::diagnostics::profiler::latency::RequestTimer::unary(
+                    &crate::mcp::control::timing_name(&name),
+                    &[],
+                );
+                let result = match authorize_call(PrincipalKind::Provider, PROVIDER_SCOPES, &name) {
+                    Ok(_) => self.call_tool(params, scope, context.cancellation).await,
+                    Err(refusal) => refusal,
+                };
+                finish_timer(timer, &name, &result);
+                log_failure(&name, &result);
+                Ok(result)
             }
-            "notifications/initialized" => {
-                return Ok(McpHttpResponse {
-                    status: 202,
-                    headers: BTreeMap::new(),
-                    body: Vec::new(),
-                });
-            }
-            _ => return json_rpc_error(request_id, -32601, "Method not found", Some(session_id)),
+            _ => Err(protocol::rpc_error(
+                protocol::METHOD_NOT_FOUND,
+                &format!("Method not found: {method}"),
+            )),
         };
-        json_rpc_result(request_id, result, Some(session_id))
+        let status = unknown_method_status(&request, &result);
+        mcp_json(
+            status,
+            &protocol::finish(request.id, request.modern, result),
+            session_id,
+        )
     }
 
     async fn mcp_delete(&self, context: RouteContext) -> Result<McpHttpResponse, ConnectMcpError> {
@@ -1066,6 +1168,7 @@ impl ConnectMcpService {
             status: 204,
             headers: BTreeMap::new(),
             body: Vec::new(),
+            stream: None,
         })
     }
 
@@ -1561,48 +1664,301 @@ fn prune_mcp(state: &mut McpState, now: i64) {
     });
 }
 
-fn json_rpc_result(
-    id: Option<Value>,
-    result: Value,
+/// The two kinds of credential `/mcp` accepts. Any other bearer gets 401.
+enum McpPrincipal {
+    /// A provider BiBCode launched: the random token in `McpState`.
+    Provider(PreviewScope),
+    /// An outside agent: a signed `mcp-client` session.
+    Client(ClientPrincipal),
+}
+
+/// How long a provider may cache its tool list.
+const PROVIDER_LIST_TTL_MS: u64 = 60_000;
+
+fn server_info() -> Value {
+    json!({ "name": "BiBCode", "version": env!("CARGO_PKG_VERSION") })
+}
+
+/// Whether the request carries no `Origin`, or this server's own (from its `Host`).
+fn origin_is_own(context: &RouteContext) -> bool {
+    let Some(origin) = context.headers.get(header::ORIGIN) else {
+        return true;
+    };
+    let Some(host) = context
+        .headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    origin.to_str().ok().is_some_and(|origin| {
+        let origin = origin.trim_end_matches('/');
+        origin.eq_ignore_ascii_case(&format!("http://{host}"))
+            || origin.eq_ignore_ascii_case(&format!("https://{host}"))
+    })
+}
+
+/// A modern request names its version, method and (for a call) tool in headers that must
+/// match its body; a legacy request may repeat its negotiated version, which must be one this
+/// server speaks.
+fn check_transport_headers(
+    context: &RouteContext,
+    request: &protocol::Request,
+) -> Result<(), String> {
+    let header = |name: &str| {
+        context
+            .headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+    };
+    if !request.modern {
+        return match header("mcp-protocol-version") {
+            Some(version) if !protocol::VERSIONS.contains(&version) => Err(format!(
+                "MCP-Protocol-Version {} is not supported",
+                protocol::bounded(version)
+            )),
+            _ => Ok(()),
+        };
+    }
+    if request.method == "server/discover"
+        && protocol::modern_version(request.params.as_ref()).is_none()
+    {
+        return Ok(());
+    }
+    let version = protocol::modern_version(request.params.as_ref());
+    if header("mcp-protocol-version") != version {
+        return Err("MCP-Protocol-Version must match the request's protocol version".into());
+    }
+    if header("mcp-method") != Some(request.method.as_str()) {
+        return Err("Mcp-Method must match the request's method".into());
+    }
+    if request.method == "tools/call" {
+        let name = request
+            .params
+            .as_ref()
+            .and_then(|params| params.get("name"))
+            .and_then(Value::as_str);
+        if header("mcp-name") != name {
+            return Err("Mcp-Name must match the called tool's name".into());
+        }
+    }
+    Ok(())
+}
+
+/// 404 for an unknown method in the modern era, as the 2026-07-28 transport asks; the legacy
+/// era answers it in a 200 body, as before.
+fn unknown_method_status(request: &protocol::Request, result: &Result<Value, Value>) -> StatusCode {
+    match result {
+        Err(error) if request.modern && error["code"] == protocol::METHOD_NOT_FOUND => {
+            StatusCode::NOT_FOUND
+        }
+        _ => StatusCode::OK,
+    }
+}
+
+fn mcp_json(
+    status: StatusCode,
+    message: &Value,
     session_id: Option<String>,
 ) -> Result<McpHttpResponse, ConnectMcpError> {
-    let id = id.ok_or_else(|| {
-        ConnectMcpError::mcp(StatusCode::BAD_REQUEST, "JSON-RPC request id is required.")
-    })?;
     let mut headers = BTreeMap::from([("content-type".into(), "application/json".into())]);
     if let Some(session_id) = session_id {
         headers.insert("mcp-session-id".into(), session_id);
     }
     Ok(McpHttpResponse {
-        status: 200,
+        status: status.as_u16(),
         headers,
-        body: serde_json::to_vec(&json!({"jsonrpc":"2.0","id":id,"result":result}))
+        body: serde_json::to_vec(message)
             .map_err(|error| ConnectMcpError::internal(error.to_string()))?,
+        stream: None,
     })
 }
 
-fn json_rpc_error(
-    id: Option<Value>,
-    code: i64,
-    message: &str,
-    session_id: Option<String>,
-) -> Result<McpHttpResponse, ConnectMcpError> {
-    let mut headers = BTreeMap::from([("content-type".into(), "application/json".into())]);
-    if let Some(session_id) = session_id {
-        headers.insert("mcp-session-id".into(), session_id);
+fn finish_timer(
+    timer: Option<crate::diagnostics::profiler::latency::RequestTimer>,
+    tool: &str,
+    result: &Value,
+) {
+    if let Some(timer) = timer {
+        let outcome = if result["isError"] == true {
+            "failure"
+        } else {
+            "success"
+        };
+        timer.finish(&crate::mcp::control::timing_name(tool), outcome);
     }
-    Ok(McpHttpResponse {
-        status: 200,
-        headers,
-        body: serde_json::to_vec(&json!({
-            "jsonrpc":"2.0",
-            "id":id.unwrap_or(Value::Null),
-            "error":{"code":code,"message":message}
-        }))
-        .map_err(|error| ConnectMcpError::internal(error.to_string()))?,
-    })
 }
 
+/// An outside agent's request. Client principals hold no HTTP session: the bearer, a durable
+/// session row, identifies the caller, so a restart or an off/on cycle loses nothing.
+async fn client_request(
+    control: McpControl,
+    request: protocol::Request,
+    principal: ClientPrincipal,
+    context: RouteContext,
+) -> Result<McpHttpResponse, ConnectMcpError> {
+    let method = request.method.as_str();
+    let params = request.params.as_ref();
+    let disabled = || {
+        Err(json!({
+            "code": crate::mcp::control::DISABLED_CODE,
+            "message": crate::mcp::control::DISABLED_MESSAGE,
+            "data": { "_tag": crate::mcp::control::DISABLED_TAG },
+        }))
+    };
+    let enabled = control.settings().enabled;
+    let result = match method {
+        "initialize" if enabled => Ok(protocol::initialize_result(
+            params,
+            json!({ "tools": { "listChanged": false } }),
+            server_info(),
+        )),
+        "server/discover" if enabled => Ok(protocol::discover_result(
+            json!({ "tools": { "listChanged": false } }),
+            server_info(),
+            control.list_ttl_ms(),
+        )),
+        "ping" => Ok(json!({})),
+        "tools/list" if enabled => Ok(protocol::list_result(
+            control.tools(&principal),
+            control.list_ttl_ms(),
+        )),
+        "initialize" | "server/discover" | "tools/list" => disabled(),
+        "tools/call" => {
+            let name = params
+                .and_then(|params| params.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            let arguments = match params.and_then(|params| params.get("arguments")) {
+                None | Some(Value::Null) => Map::new(),
+                Some(Value::Object(arguments)) => arguments.clone(),
+                Some(_) => {
+                    return mcp_json(
+                        StatusCode::OK,
+                        &protocol::failure(
+                            request.id,
+                            protocol::invalid("arguments must be an object"),
+                        ),
+                        None,
+                    );
+                }
+            };
+            let progress_token = params
+                .and_then(|params| params.pointer("/_meta/progressToken"))
+                .filter(|token| token.is_string() || token.is_number())
+                .cloned();
+            if let (true, Some(token)) = (name == "wait_for_thread", progress_token) {
+                return Ok(progress_stream(
+                    control, request, principal, name, arguments, token,
+                ));
+            }
+            let timer = crate::diagnostics::profiler::latency::RequestTimer::unary(
+                &crate::mcp::control::timing_name(&name),
+                &[],
+            );
+            let result = control
+                .call(&principal, &name, &arguments, None, context.cancellation)
+                .await;
+            finish_timer(timer, &name, &result);
+            Ok(result)
+        }
+        _ => Err(protocol::rpc_error(
+            protocol::METHOD_NOT_FOUND,
+            &format!("Method not found: {method}"),
+        )),
+    };
+    let status = unknown_method_status(&request, &result);
+    mcp_json(
+        status,
+        &protocol::finish(request.id, request.modern, result),
+        None,
+    )
+}
+
+/// Logs a failed provider tool call at the `/mcp` boundary: the tool and the error type only,
+/// never its arguments. (`McpControl::call` logs the outside agents' calls.)
+fn log_failure(tool: &str, result: &Value) {
+    if result["isError"] == true {
+        let tag = result["structuredContent"]["error"]["_tag"]
+            .as_str()
+            .unwrap_or("McpToolError");
+        tracing::warn!(tool, error = tag, "MCP tool call failed");
+    }
+}
+
+/// A `wait_for_thread` call that asked for progress: `text/event-stream`, with each
+/// `notifications/progress` and then the result as its own event. Closing the stream cancels
+/// the wait, which drops its event receiver.
+fn progress_stream(
+    control: McpControl,
+    request: protocol::Request,
+    principal: ClientPrincipal,
+    name: String,
+    arguments: Map<String, Value>,
+    token: Value,
+) -> McpHttpResponse {
+    let (frames, receiver) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+    let (progress, mut notifications) = tokio::sync::mpsc::channel::<Value>(8);
+    let cancellation = CancellationToken::new();
+    tokio::spawn(async move {
+        let timer = crate::diagnostics::profiler::latency::RequestTimer::unary(
+            &crate::mcp::control::timing_name(&name),
+            &[],
+        );
+        let call = control.call(
+            &principal,
+            &name,
+            &arguments,
+            Some((progress, token)),
+            cancellation.clone(),
+        );
+        tokio::pin!(call);
+        let result = loop {
+            tokio::select! {
+                result = &mut call => break Some(result),
+                () = frames.closed() => {
+                    cancellation.cancel();
+                    break None;
+                }
+                Some(notification) = notifications.recv() => {
+                    if frames.send(sse_frame(&notification)).await.is_err() {
+                        cancellation.cancel();
+                        break None;
+                    }
+                }
+            }
+        };
+        let Some(result) = result else {
+            // The client went away: the wait above was dropped with its receiver.
+            return;
+        };
+        finish_timer(timer, &name, &result);
+        while let Ok(notification) = notifications.try_recv() {
+            let _ = frames.send(sse_frame(&notification)).await;
+        }
+        let _ = frames
+            .send(sse_frame(&protocol::finish(
+                request.id,
+                request.modern,
+                Ok(result),
+            )))
+            .await;
+    });
+    McpHttpResponse {
+        status: 200,
+        headers: BTreeMap::from([
+            ("content-type".into(), "text/event-stream".into()),
+            ("x-accel-buffering".into(), "no".into()),
+        ]),
+        body: Vec::new(),
+        stream: Some(receiver),
+    }
+}
+
+fn sse_frame(message: &Value) -> Vec<u8> {
+    format!("event: message\ndata: {message}\n\n").into_bytes()
+}
 fn tool_failure(tag: &str, message: &str) -> Value {
     json!({
         "isError":true,

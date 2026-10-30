@@ -2049,7 +2049,7 @@ impl Repositories {
     pub async fn create_auth_session(&self, row: NewAuthSession) -> Result<()> {
         self.database.call(move |connection| {
             let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            transaction.execute("INSERT INTO auth_sessions (session_id, subject, scopes, method, client_label, client_ip_address, client_user_agent, client_device_type, client_os, client_browser, issued_at, expires_at, revoked_at, reach, off_host, delivery_state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)", params![row.session_id,row.subject,encode_json(&row.scopes)?,row.method,row.client.label,row.client.ip_address,row.client.user_agent,row.client.device_type,row.client.os,row.client.browser,row.issued_at,row.expires_at,row.reach,row.off_host,row.delivery_state.as_str()])?;
+            transaction.execute("INSERT INTO auth_sessions (session_id, subject, scopes, method, client_label, client_ip_address, client_user_agent, client_device_type, client_os, client_browser, issued_at, expires_at, revoked_at, reach, off_host, delivery_state, mcp_access) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)", params![row.session_id,row.subject,encode_json(&row.scopes)?,row.method,row.client.label,row.client.ip_address,row.client.user_agent,row.client.device_type,row.client.os,row.client.browser,row.issued_at,row.expires_at,row.reach,row.off_host,row.delivery_state.as_str(),row.mcp_access])?;
             bump_auth_authority_revision_on(&transaction)?;
             transaction.commit()?;
             Ok(())
@@ -2597,6 +2597,8 @@ pub struct AuthPairingLink {
     pub revoked_at: Option<Timestamp>,
     pub reach: Option<String>,
     pub off_host: Option<bool>,
+    /// The MCP access ceiling of an `mcp-client` credential; `None` for every other kind.
+    pub mcp_access: Option<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NewAuthPairingOffer {
@@ -2681,6 +2683,8 @@ pub struct NewAuthSession {
     pub expires_at: Timestamp,
     pub reach: Option<String>,
     pub off_host: Option<bool>,
+    /// The MCP access ceiling of an `mcp-client` credential; `None` for every other kind.
+    pub mcp_access: Option<String>,
     pub delivery_state: AuthSessionDeliveryState,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2696,6 +2700,8 @@ pub struct AuthSession {
     pub revoked_at: Option<Timestamp>,
     pub reach: Option<String>,
     pub off_host: Option<bool>,
+    /// The MCP access ceiling of an `mcp-client` credential; `None` for every other kind.
+    pub mcp_access: Option<String>,
     pub delivery_state: AuthSessionDeliveryState,
 }
 
@@ -2716,11 +2722,11 @@ const PROJECTION_STATE_LIST: &str = "SELECT projector, last_applied_sequence, up
 const PROVIDER_TURN_DELIVERY_SELECT: &str = "SELECT command_id, thread_id, message_id, provider_instance_id, provider_kind, provider_session_id, delivery_key, payload_json, state, attempts, last_error, created_at, updated_at, mode, held FROM provider_turn_outbox";
 const TURN_SELECT: &str = "SELECT thread_id, turn_id, pending_message_id, source_proposed_plan_thread_id, source_proposed_plan_id, assistant_message_id, state, requested_at, started_at, completed_at, checkpoint_turn_count, checkpoint_ref, checkpoint_status, checkpoint_files_json FROM projection_turns";
 const TURN_UPSERT_SQL: &str = "INSERT INTO projection_turns (thread_id, turn_id, pending_message_id, source_proposed_plan_thread_id, source_proposed_plan_id, assistant_message_id, state, requested_at, started_at, completed_at, checkpoint_turn_count, checkpoint_ref, checkpoint_status, checkpoint_files_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (thread_id, turn_id) DO UPDATE SET pending_message_id=excluded.pending_message_id, source_proposed_plan_thread_id=excluded.source_proposed_plan_thread_id, source_proposed_plan_id=excluded.source_proposed_plan_id, assistant_message_id=excluded.assistant_message_id, state=excluded.state, requested_at=excluded.requested_at, started_at=excluded.started_at, completed_at=excluded.completed_at, checkpoint_turn_count=excluded.checkpoint_turn_count, checkpoint_ref=excluded.checkpoint_ref, checkpoint_status=excluded.checkpoint_status, checkpoint_files_json=excluded.checkpoint_files_json";
-const PAIRING_SELECT: &str = "SELECT id, credential, method, scopes, subject, label, proof_key_thumbprint, created_at, expires_at, consumed_at, revoked_at, reach, off_host FROM auth_pairing_links";
+const PAIRING_SELECT: &str = "SELECT id, credential, method, scopes, subject, label, proof_key_thumbprint, created_at, expires_at, consumed_at, revoked_at, reach, off_host, mcp_access FROM auth_pairing_links";
 const PAIRING_OFFER_SELECT: &str = "SELECT principal_id, idempotency_key, input_fingerprint, pairing_id, result_json, expires_at, cancelled_at FROM auth_pairing_offer_idempotency WHERE expires_at > ? ORDER BY expires_at, principal_id, idempotency_key";
 const PAIRING_OFFER_BY_KEY_SQL: &str = "SELECT principal_id, idempotency_key, input_fingerprint, pairing_id, result_json, expires_at, cancelled_at FROM auth_pairing_offer_idempotency WHERE expires_at > ? AND principal_id = ? AND idempotency_key = ?";
-const PAIRING_RETURNING_SQL: &str = "UPDATE auth_pairing_links SET consumed_at = ? WHERE credential = ? AND revoked_at IS NULL AND consumed_at IS NULL AND expires_at > ? AND (proof_key_thumbprint IS NULL OR proof_key_thumbprint = ?) RETURNING id, credential, method, scopes, subject, label, proof_key_thumbprint, created_at, expires_at, consumed_at, revoked_at, reach, off_host";
-const AUTH_SESSION_SELECT: &str = "SELECT session_id, subject, scopes, method, client_label, client_ip_address, client_user_agent, client_device_type, client_os, client_browser, issued_at, expires_at, last_connected_at, revoked_at, reach, off_host, delivery_state FROM auth_sessions";
+const PAIRING_RETURNING_SQL: &str = "UPDATE auth_pairing_links SET consumed_at = ? WHERE credential = ? AND revoked_at IS NULL AND consumed_at IS NULL AND expires_at > ? AND (proof_key_thumbprint IS NULL OR proof_key_thumbprint = ?) RETURNING id, credential, method, scopes, subject, label, proof_key_thumbprint, created_at, expires_at, consumed_at, revoked_at, reach, off_host, mcp_access";
+const AUTH_SESSION_SELECT: &str = "SELECT session_id, subject, scopes, method, client_label, client_ip_address, client_user_agent, client_device_type, client_os, client_browser, issued_at, expires_at, last_connected_at, revoked_at, reach, off_host, delivery_state, mcp_access FROM auth_sessions";
 
 fn collect<T, P>(
     connection: &rusqlite::Connection,
@@ -2740,8 +2746,8 @@ fn insert_auth_pairing_link_on(connection: &Connection, row: &AuthPairingLink) -
     connection.execute(
         "INSERT INTO auth_pairing_links (
             id, credential, method, scopes, subject, label, proof_key_thumbprint,
-            created_at, expires_at, consumed_at, revoked_at, reach, off_host
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)",
+            created_at, expires_at, consumed_at, revoked_at, reach, off_host, mcp_access
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?)",
         params![
             row.id,
             row.credential,
@@ -2754,6 +2760,7 @@ fn insert_auth_pairing_link_on(connection: &Connection, row: &AuthPairingLink) -
             row.expires_at,
             row.reach,
             row.off_host,
+            row.mcp_access,
         ],
     )?;
     Ok(())
@@ -3302,6 +3309,7 @@ fn decode_pairing_link(row: &Row<'_>) -> rusqlite::Result<AuthPairingLink> {
         revoked_at: row.get(10)?,
         reach: row.get(11)?,
         off_host: row.get(12)?,
+        mcp_access: row.get(13)?,
     })
 }
 fn decode_pairing_offer(row: &Row<'_>) -> rusqlite::Result<AuthPairingOffer> {
@@ -3338,6 +3346,7 @@ fn decode_auth_session(row: &Row<'_>) -> rusqlite::Result<AuthSession> {
         revoked_at: row.get(13)?,
         reach: row.get(14)?,
         off_host: row.get(15)?,
+        mcp_access: row.get(17)?,
         delivery_state: row.get(16)?,
     })
 }

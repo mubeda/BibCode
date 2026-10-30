@@ -56,6 +56,7 @@ const CORE_TABLES: &[(u32, &str)] = &[
     (43, "worktree_removal_receipts"),
     (53, "pull_request_snapshots"),
     (55, "projection_thread_reasoning"),
+    (58, "mcp_tool_requests"),
 ];
 
 #[derive(Debug, Error)]
@@ -688,6 +689,7 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration::new(55, "ProjectionThreadReasoning", migration_055),
     Migration::new(56, "ThreadCompactions", migration_056),
     Migration::new(57, "ProjectionThreadAgentStatus", migration_057),
+    Migration::new(58, "McpClientAccessAndRequests", migration_058),
 ];
 
 impl Migration {
@@ -2683,6 +2685,33 @@ fn migration_057(transaction: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
+fn migration_058(transaction: &Transaction<'_>) -> Result<()> {
+    // Outside agents over MCP (#139): the access ceiling an `mcp-client` pairing link carries
+    // into its session, and the first commands of each retryable tool call, so a retry
+    // dispatches the same payloads and command admission replays them by receipt.
+    for table in ["auth_pairing_links", "auth_sessions"] {
+        if table_exists(transaction, table)? && !table_has_column(transaction, table, "mcp_access")?
+        {
+            transaction
+                .execute_batch(&format!("ALTER TABLE {table} ADD COLUMN mcp_access TEXT;"))?;
+        }
+    }
+    transaction.execute_batch(
+        "CREATE TABLE IF NOT EXISTS mcp_tool_requests (
+           session_id TEXT NOT NULL,
+           client_request_id TEXT NOT NULL,
+           tool TEXT NOT NULL,
+           arguments_digest TEXT NOT NULL,
+           commands_json TEXT NOT NULL,
+           created_at TEXT NOT NULL,
+           PRIMARY KEY (session_id, client_request_id)
+         );
+         CREATE INDEX IF NOT EXISTS idx_mcp_tool_requests_created_at
+           ON mcp_tool_requests(created_at);",
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -2893,7 +2922,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [55, 56, 57]
+            [55, 56, 57, 58]
         );
         connection.execute(
             "INSERT INTO projection_thread_reasoning (reasoning_id, thread_id, turn_id, text, is_streaming, created_at, updated_at) VALUES ('r', 't', NULL, 'A thought', 1, '2026-10-24T00:00:00Z', '2026-10-24T00:00:00Z')",
@@ -3622,7 +3651,7 @@ mod tests {
             .map(|migration| migration.id)
             .collect::<Vec<_>>();
 
-        assert_eq!(ids, (1..=57).collect::<Vec<_>>());
+        assert_eq!(ids, (1..=58).collect::<Vec<_>>());
         assert_eq!(MIGRATIONS[0].name, "OrchestrationEvents");
         assert_eq!(MIGRATIONS[33].name, "ActivityProjection");
         assert_eq!(MIGRATIONS[34].name, "ActivityJournalEventKeyNamespace");
@@ -3682,6 +3711,7 @@ mod tests {
                 (55, "ProjectionThreadReasoning"),
                 (56, "ThreadCompactions"),
                 (57, "ProjectionThreadAgentStatus"),
+                (58, "McpClientAccessAndRequests"),
             ],
         );
         assert_eq!(
@@ -3778,7 +3808,7 @@ mod tests {
         assert_eq!(first[15].id, 16);
 
         let second = run_migrations(&mut connection, None)?;
-        assert_eq!(second.len(), 41);
+        assert_eq!(second.len(), 42);
         assert_eq!(second[0].id, 17);
         assert_eq!(second[35].id, 52);
         assert_eq!(second[36].id, 53);
@@ -3786,6 +3816,7 @@ mod tests {
         assert_eq!(second[38].id, 55);
         assert_eq!(second[39].id, 56);
         assert_eq!(second[40].id, 57);
+        assert_eq!(second[41].id, 58);
 
         let third = run_migrations(&mut connection, None)?;
         assert!(third.is_empty());
@@ -3797,7 +3828,7 @@ mod tests {
             [],
             |row| row.get::<_, u32>(0),
         )?;
-        assert_eq!(application_table_count, 31);
+        assert_eq!(application_table_count, 32);
         assert_delivery_schema(&connection)?;
 
         Ok(())
@@ -3893,7 +3924,7 @@ mod tests {
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
             [
-                40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57
+                40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58
             ]
         );
         let policy = connection.query_row(
@@ -3932,7 +3963,7 @@ mod tests {
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
             [
-                41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57
+                41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58
             ]
         );
         let pin = connection.query_row(
@@ -3962,7 +3993,7 @@ mod tests {
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
             [
-                42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57
+                42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58
             ]
         );
         let pin = connection.query_row(
@@ -4103,7 +4134,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [48, 49, 50, 51, 52, 53, 54, 55, 56, 57]
+            [48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58]
         );
         assert_eq!(
             connection.query_row(
@@ -4132,7 +4163,7 @@ mod tests {
         )?;
 
         let applied = run_migrations(&mut connection, None)?;
-        assert_eq!(applied.len(), 24);
+        assert_eq!(applied.len(), 25);
         assert_eq!(applied[0].id, 34);
         assert_eq!(applied[1].id, 35);
         assert_eq!(applied[2].id, 36);
@@ -4157,6 +4188,7 @@ mod tests {
         assert_eq!(applied[21].id, 55);
         assert_eq!(applied[22].id, 56);
         assert_eq!(applied[23].id, 57);
+        assert_eq!(applied[24].id, 58);
         let value = connection.query_row("SELECT value FROM legacy_user_data", [], |row| {
             row.get::<_, String>(0)
         })?;
