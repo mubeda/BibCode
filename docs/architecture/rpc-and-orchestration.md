@@ -3269,12 +3269,21 @@ failure is a `checkpoint.revert.failed` activity.
 
 ## Outside-agent thread tools
 
-The thread tools an outside agent calls on `/mcp` (#139, `mcp::control`) run inside
-the server. They reach the same handlers the UI uses through
-`RpcRegistry::invoke_local`, which checks the method's declared scope on the
-caller's session, takes its maintenance admission and runs the registered handler
-with its timing; `thread.turn.start` therefore goes through the durable ingress,
-workspace admission and receipt replay exactly as a WebSocket request does.
+The tools an outside agent calls on `/mcp` (#139) run inside the server. They live
+in families under `mcp::tools` (`threads`, `previews`, and one per later slice), each
+registered by one line in `mcp::control::FAMILIES`; a tool's `ToolSpec` names its
+principal kind, scope, RPC methods, capability set and hints, and lookup is by kind
+and name, so a client tool may share a provider tool's name. They reach the same
+handlers the UI uses through `RpcRegistry::invoke_local`, which checks the method's
+declared scope on the caller's session, takes its maintenance admission and runs the
+registered handler with its timing; `thread.turn.start` therefore goes through the
+durable ingress, workspace admission and receipt replay exactly as a WebSocket
+request does. Stream-only methods (`gitManager.runOperation`,
+`git.runStackedAction`) go through `RpcRegistry::invoke_local_stream`, which runs
+the same checks and drains the stream to its schema's terminal event: `finished` or
+`action_finished` is success, `failed`, `action_failed` or an error chunk is a typed
+failure, and a stream that closes first (or is cancelled, or passes its budget) is
+`McpStreamEndedError`.
 
 | Tool                        | Maps to                                                                               | Scope   |
 | --------------------------- | ------------------------------------------------------------------------------------- | ------- |
@@ -3286,7 +3295,7 @@ workspace admission and receipt replay exactly as a WebSocket request does.
 | `read_thread`               | one keyset page of `projection_thread_messages` with `LIMIT`, texts cut in SQL        | read    |
 | `list_pending_requests`     | open questions and pending approvals, read directly                                   | read    |
 | `answer_question`           | `thread.user-input.respond`; approvals refused                                        | operate |
-| `interrupt_turn`            | `thread.turn.interrupt`                                                               | operate |
+| `interrupt_turn`            | `thread.turn.interrupt` for the running turn; nothing when no turn runs               | operate |
 | `get_turn_diff`             | `orchestration.getTurnDiff`, paged by file and offset                                 | read    |
 | `git_status`                | `vcs.refreshStatus` on the thread's folder                                            | read    |
 
@@ -3295,6 +3304,16 @@ workspace admission and receipt replay exactly as a WebSocket request does.
   argument digest). Every call with that key dispatches the stored payloads, so
   command admission replays them by receipt state; other arguments under the same
   key get `idempotency_conflict`. Rows older than 24 h are pruned on insert.
+- **Recorded outcomes.** A tool whose RPC has no command receipt (Git and pull
+  request writes) runs it through `ToolCall::recorded` (`mcp::outcome`). With a
+  `clientRequestId` it is an owned mutation: its `mcp_tool_requests` row goes
+  `running`, then `done`, `failed` or `unknown` with the tool result (migration 59;
+  slice-1 rows read `commands`), it runs as a task `McpControl` owns, and a retry
+  returns the stored outcome without running anything. A `running` row no process
+  owns answers `McpOutcomeUnknownError`. Owned and unkeyed work alike runs under one
+  token that the off switch, read-only, revoking the session (through
+  `mark_connected_guard`) and `McpControl::shutdown` cancel; work they interrupt is
+  `unknown`, never success.
 - **Ceiling.** A start runs at most at the lower of the session's `mcp_access` and
   `mcpServerAccess`; a send or an answer to a thread above it is refused, and
   `read-only` hides and refuses every operate tool.
@@ -3306,8 +3325,15 @@ workspace admission and receipt replay exactly as a WebSocket request does.
   the answer into `text/event-stream` with status-only `notifications/progress`.
   Every way out drops the receiver.
 - **Bounds.** At most 8 calls and 4 waits per session and 32 waits per
-  environment. `enableMcpServer` off refuses calls with `McpServerDisabledError`
-  and ends waits; shutdown ends them right after the profiler starts stopping.
+  environment; only a tool that idles on the engine (`wait_for_thread`) holds a wait
+  slot. Owned mutations take 2 slots per session and 8 per environment, held until
+  their outcome is written. `enableMcpServer` off refuses calls with
+  `McpServerDisabledError` and ends waits; shutdown ends them right after the
+  profiler starts stopping.
+- **Capability sets.** `mcpCapabilities` turns tool sets on or off per environment
+  (`workspace`, `sourceControl`, `files`, `diagnostics` on; `terminals` off). A set
+  that is off hides its tools and refuses them with `McpCapabilityDisabledError`,
+  live.
 - **Clients.** `bibcode mcp` relays an agent's messages unchanged. `bibcode thread`
   (`mcp::thread_cli`) calls the same tools itself in the modern era, over the
   relay's `Connection` (setting check, endpoint proof, credential minted on first

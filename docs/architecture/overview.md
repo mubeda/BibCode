@@ -2012,12 +2012,15 @@ bounded memory, and works while the server is stopped.
 - **Skill.** [`docs/skills/bibcode-profiler/`](../skills/bibcode-profiler/SKILL.md)
   uses these readers to monitor, diagnose, and file deduplicated GitHub issues.
 - **MCP tool calls.** Each `/mcp` tool call is timed as `mcp.<tool>` (`rpc.timing`
-  and the hang check). `mcp.wait_for_thread`, every `mcp.preview_*` and
-  `mcp.device_*` call, and any `mcp.*` tool whose RPC method is long-running are
-  long-running; the thread tools' own RPC dispatches keep their RPC names' timing.
+  and the hang check). A tool is long-running when its `ToolSpec` says so
+  (`mcp.wait_for_thread`, every `mcp.preview_*` and `mcp.device_*` call, network
+  tools) or its RPC method is long-running; a client tool and a provider tool of one
+  name are both asked. The tools' own RPC dispatches keep their RPC names' timing.
   `/mcp` logs a failed call's tool, thread id and error type, never its arguments,
-  prompts or replies. The MCP service stops right after `begin_stopping()`, ending
-  every wait in flight, before the orchestration engine shuts down.
+  prompts or replies; a destructive tool also writes one content-free
+  `MCP destructive tool` line. The MCP service stops right after `begin_stopping()`,
+  ending every wait in flight and interrupting owned mutations (recorded `unknown`),
+  before the orchestration engine shuts down.
 
 ### Known limits
 
