@@ -10079,6 +10079,7 @@ mod tests {
         assert_eq!(
             runner.requests()[0].args,
             [
+                "--literal-pathspecs",
                 "-c",
                 "core.quotePath=false",
                 "ls-files",
