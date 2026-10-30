@@ -127,6 +127,11 @@ pub async fn run_cli() -> Result<(), RunError> {
             0 => Ok(()),
             code => std::process::exit(code),
         },
+        // Stdout carries only JSON-RPC, so nothing here logs to it.
+        CliAction::Mcp(options) => match mcp::relay::run_mcp_cli(options).await {
+            0 => Ok(()),
+            code => std::process::exit(code),
+        },
         CliAction::Diagnostics { args, state_dir } => {
             match diagnostics::relay_cli::run_diagnostics_cli(args, state_dir).await {
                 0 => Ok(()),
