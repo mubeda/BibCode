@@ -2393,6 +2393,60 @@ describe("ChatView effects (captured and run manually)", () => {
     for (const cleanup of cleanups) cleanup();
   });
 
+  it("holds the list's own scrolls while a scroll key's native scroll may still start", async () => {
+    // WebKit starts a key's scroll up to 816 ms after the keydown on a slow runner, and a scroll
+    // the list makes before then, such as holding a row in place as a streamed reply grows above
+    // it, cancels the key's scroll (#207).
+    const { list, cleanups, messageId, onAnchorReady } = await sendTallReply({
+      scrollHeight: 400,
+      clientHeight: 200,
+    });
+    onAnchorReady(messageId, 2);
+    list.scrollNode.scrollTop = 50;
+    const before = h.setStateCalls.length;
+
+    fireDocument("keydown", timelineKey("ArrowUp", ["button"]));
+    const held = h.setStateCalls
+      .slice(before)
+      .filter((call) => call.next === true && h.stateCalls[call.index]?.initial === false);
+    expect(held).toHaveLength(1);
+    const index = held[0]!.index;
+
+    // The hold ends on its own once the key's scroll has had time to start.
+    runWindowTimeouts();
+    expect(
+      h.setStateCalls
+        .slice(before)
+        .filter((call) => call.index === index)
+        .map((call) => call.next),
+    ).toEqual([true, false]);
+    for (const cleanup of cleanups) cleanup();
+
+    // While it holds, the timeline asks LegendList to keep no content position.
+    h.stateSeeds.set(index, { value: true, expectInitial: (value) => value === false });
+    renderServerRoute();
+    expect(capturedProps("messagesTimeline")["nativeScrollPending"]).toBe(true);
+  });
+
+  it("does not hold the list's scrolls for a wheel or a press, which scroll at once", async () => {
+    for (const takeover of ["wheel", "pointerdown"] as const) {
+      const { list, cleanups, messageId, onAnchorReady } = await sendTallReply({});
+      onAnchorReady(messageId, 2);
+      const before = h.setStateCalls.length;
+
+      list.scrollNode.fire(takeover, { target: { closest: () => null } });
+
+      expect(list.calls.cancelScrollRequests, takeover).toBe(1);
+      expect(
+        h.setStateCalls
+          .slice(before)
+          .filter((call) => call.next === true && h.stateCalls[call.index]?.initial === false),
+        takeover,
+      ).toEqual([]);
+      for (const cleanup of cleanups) cleanup();
+    }
+  });
+
   it("keeps following for keys that move nothing or belong to a control", async () => {
     for (const [key, matches, scrollTop] of [
       // Keys that would move nothing: ArrowDown at the end, ArrowUp at the top.
