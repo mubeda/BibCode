@@ -3174,3 +3174,13 @@ view), or free scrolling.
   end. A takeover, a later send (its glide replaces the landing)
   or another thread (the timeline remounts, and LegendList drops its
   requests) ends the landing; only a takeover needs to withdraw it.
+- **Scroll keys.** The browser scrolls for a key after the keydown, and WebKit
+  can start that scroll several hundred milliseconds later on a busy webview.
+  Any scroll the list makes in between cancels it, such as LegendList holding
+  the row below a streamed reply in place as the reply grows. For
+  `TIMELINE_NATIVE_SCROLL_PENDING_MS` (1.2 s) after a key takeover, renewed by
+  each key, `MessagesTimeline` therefore asks LegendList to keep no content
+  position (`resolveTimelineMaintainVisibleContentPosition`). A row that
+  changes size above the reading line in that window moves it. The wheel, a
+  touch and a press scroll at once and do not hold, nor do the composer's
+  PageUp and PageDown, which scroll the list themselves.
