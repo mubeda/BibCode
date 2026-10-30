@@ -308,7 +308,11 @@ import { ComposerHistoryMenu, type ImportedSessionThread } from "./chat/Composer
 import { historyUnavailableReason } from "./chat/ComposerHistoryMenu.logic";
 import { ExpandedImageDialog } from "./chat/ExpandedImageDialog";
 import { PullRequestThreadDialog } from "./PullRequestThreadDialog";
-import { MessagesTimeline } from "./chat/MessagesTimeline";
+import {
+  MessagesTimeline,
+  debugListSnapshot208,
+  debugTimeline208,
+} from "./chat/MessagesTimeline";
 import { ChatHeaderActions } from "./chat/ChatHeaderActions";
 import { type ProviderTerminalAction } from "./chat/providerTerminalActions";
 import { PanelLayoutControls, RightPanelMaximizeControl } from "./chat/PanelLayoutControls";
@@ -3529,6 +3533,7 @@ function ChatViewContent(props: ChatViewProps) {
   // the reader's place away, so it stays released until the next send or thread (#190).
   const releasedTimelineAnchorRef = useRef<MessageId | null>(null);
   const cancelTimelineLiveFollowForUserNavigation = useCallback((input?: TimelineTakeoverInput) => {
+    debugTimeline208("takeover", { input: input ?? null });
     // A send names its row pending before the previous one stops being positioned, so the
     // newest send is the one released.
     releasedTimelineAnchorRef.current =
@@ -3691,8 +3696,10 @@ function ChatViewContent(props: ChatViewProps) {
         liveFollowUserScrollGenerationRef.current === generation;
       const settle = () => {
         if (!landing()) {
+          debugTimeline208("settle-skipped", { messageId });
           return;
         }
+        debugTimeline208("settle", { messageId });
         settledTimelineAnchorRef.current = messageId;
         // Replies that arrived during the glide were not followed; follow them now rather
         // than on the next one, which a reply that has finished never sends.
@@ -3755,6 +3762,7 @@ function ChatViewContent(props: ChatViewProps) {
   }, [settleSentTimelineRow]);
 
   const onTimelineAnchorReady = useCallback((messageId: MessageId, anchorIndex: number) => {
+    debugTimeline208("anchor-ready", { messageId, anchorIndex, positioned: positionedTimelineAnchorRef.current });
     if (pendingTimelineAnchorRef.current === messageId) {
       pendingTimelineAnchorRef.current = null;
     }
@@ -3807,7 +3815,13 @@ function ChatViewContent(props: ChatViewProps) {
     };
     requestAnimationFrame(() => positionAnchor(12));
   }, []);
-  const onTimelineAnchorSizeChanged = useCallback((messageId: MessageId) => {
+  const onTimelineAnchorSizeChanged = useCallback((messageId: MessageId, size?: number) => {
+    debugTimeline208("anchor-size", {
+      messageId,
+      size,
+      settled: settledTimelineAnchorRef.current,
+      list: debugListSnapshot208(legendListRef.current),
+    });
     if (settledTimelineAnchorRef.current !== messageId) {
       return;
     }
@@ -3877,6 +3891,7 @@ function ChatViewContent(props: ChatViewProps) {
   }, []);
 
   const onIsAtEndChange = useCallback((isAtEnd: boolean) => {
+    debugTimeline208("is-at-end", { isAtEnd, mode: timelineScrollModeRef.current });
     if (
       !isAtEnd &&
       liveFollowUserScrollGenerationRef.current === anchorUserScrollGenerationRef.current
@@ -3936,31 +3951,51 @@ function ChatViewContent(props: ChatViewProps) {
   // One pass of live following: reveals an anchored turn's end, or keeps the end in view. It
   // waits while a sent row is still being positioned, which then runs it once it settles.
   const followTimelineLiveEnd = useCallback(() => {
+    const debug = (result: string, extra: Record<string, unknown> = {}) =>
+      debugTimeline208("follow", {
+        result,
+        mode: timelineScrollModeRef.current,
+        liveGen: liveFollowUserScrollGenerationRef.current,
+        gen: anchorUserScrollGenerationRef.current,
+        pending: pendingTimelineAnchorRef.current,
+        positioned: positionedTimelineAnchorRef.current,
+        settled: settledTimelineAnchorRef.current,
+        anchorIndex: activeTimelineAnchorIndexRef.current,
+        list: debugListSnapshot208(legendListRef.current),
+        ...extra,
+      });
     if (liveFollowUserScrollGenerationRef.current !== anchorUserScrollGenerationRef.current) {
+      debug("generation");
       return;
     }
     if (pendingTimelineAnchorRef.current !== null) {
+      debug("pending-anchor");
       return;
     }
     if (
       positionedTimelineAnchorRef.current !== null &&
       settledTimelineAnchorRef.current !== positionedTimelineAnchorRef.current
     ) {
+      debug("unsettled-anchor");
       return;
     }
     const list = legendListRef.current;
     if (!list) {
+      debug("no-list");
       return;
     }
 
     if (timelineScrollModeRef.current === "anchoring-new-turn") {
       const metrics = getActiveTimelineTurnMetrics(list);
       if (!metrics) {
+        debug("no-metrics");
         return;
       }
       if (metrics.scrollDeltaToRevealEnd <= 1) {
+        debug("anchored-revealed", { metrics });
         return;
       }
+      debug("anchored-scroll", { metrics });
 
       const nextOffset = list.getState().scroll + metrics.scrollDeltaToRevealEnd;
       void list.scrollToOffset({ offset: nextOffset, animated: false });
@@ -3991,8 +4026,10 @@ function ChatViewContent(props: ChatViewProps) {
             const scrollTop = current.getScrollableNode()?.scrollTop;
             const reached = typeof scrollTop === "number" ? scrollTop : current.getState().scroll;
             if (reached >= target.targetScrollToRevealEnd - 1) {
+              debugTimeline208("recheck", { result: "reached", reached, target });
               return;
             }
+            debugTimeline208("recheck", { result: "scroll", reached, target });
             void current.scrollToOffset({
               offset: target.targetScrollToRevealEnd,
               animated: false,
@@ -4008,12 +4045,15 @@ function ChatViewContent(props: ChatViewProps) {
     }
 
     if (timelineScrollModeRef.current !== "following-end") {
+      debug("free");
       return;
     }
     if (!timelineRealContentOverflowsViewport(list)) {
+      debug("fits");
       return;
     }
 
+    debug("scroll-to-end");
     void list.scrollToEnd?.({ animated: false });
   }, [getActiveTimelineTurnMetrics, timelineRealContentOverflowsViewport]);
   useLayoutEffect(() => {
@@ -4035,11 +4075,17 @@ function ChatViewContent(props: ChatViewProps) {
     }
 
     let secondFrame: number | null = null;
+    let ran = false;
+    debugTimeline208("follow-effect", { entries: timelineEntries.length, composerOverlayHeight });
     const frame = requestAnimationFrame(() => {
-      secondFrame = requestAnimationFrame(followTimelineLiveEnd);
+      secondFrame = requestAnimationFrame(() => {
+        ran = true;
+        followTimelineLiveEnd();
+      });
     });
 
     return () => {
+      if (!ran) debugTimeline208("follow-effect-cancelled", {});
       cancelAnimationFrame(frame);
       if (secondFrame !== null) {
         cancelAnimationFrame(secondFrame);
@@ -4059,6 +4105,7 @@ function ChatViewContent(props: ChatViewProps) {
       pendingTurnGrowthRef.current = null;
       const list = legendListRef.current;
       const metrics = list ? getActiveTimelineTurnMetrics(list) : null;
+      debugTimeline208("grown-turn", { grown, metrics, scrollTop: list?.getScrollableNode()?.scrollTop });
       if (!list || !metrics) {
         return;
       }
@@ -4072,6 +4119,13 @@ function ChatViewContent(props: ChatViewProps) {
   );
   const onTimelineRowSizeChanged = useCallback(
     (info: { readonly index: number; readonly previous: number; readonly size: number }) => {
+      debugTimeline208("row-size", {
+        index: info.index,
+        previous: info.previous,
+        size: info.size,
+        mode: timelineScrollModeRef.current,
+        list: debugListSnapshot208(legendListRef.current),
+      });
       const anchorIndex = activeTimelineAnchorIndexRef.current;
       if (
         timelineScrollModeRef.current !== "anchoring-new-turn" ||

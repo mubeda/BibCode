@@ -422,6 +422,27 @@ export const MessagesTimeline = memo(function MessagesTimeline({
     ],
   );
   const rows = useStableRows(rawRows);
+  // [DEBUG-208] the row tail before React commits a rows change, after LegendList laid it out,
+  // and a frame later.
+  const debugRowsRef = useRef<typeof rows | null>(null);
+  if (debugRowsRef.current !== rows) {
+    debugRowsRef.current = rows;
+    debugTimeline208("rows-render", {
+      keys: rows.slice(-6).map((row) => `${row.kind}:${row.id}`),
+      length: rows.length,
+      anchorMessageId,
+      followsEnd,
+      nativeScrollPending,
+      list: debugListSnapshot208(listRef.current),
+    });
+  }
+  useLayoutEffect(() => {
+    debugTimeline208("rows-layout", { length: rows.length, list: debugListSnapshot208(listRef.current) });
+    const frame = requestAnimationFrame(() =>
+      debugTimeline208("rows-frame", { length: rows.length, list: debugListSnapshot208(listRef.current) }),
+    );
+    return () => cancelAnimationFrame(frame);
+  }, [rows, listRef]);
   const minimapItems = useMemo(() => deriveTimelineMinimapItems(rows), [rows]);
   const [timelineViewportElement, setTimelineViewportElement] = useState<HTMLDivElement | null>(
     null,
@@ -847,6 +868,44 @@ function useStableAnchorCallbacks(
     }
   }, []);
   return { handleAnchorReady, handleAnchorSizeChanged };
+}
+
+// [DEBUG-208]
+export function debugTimeline208(kind: string, data: Record<string, unknown>): void {
+  if (typeof window === "undefined") return;
+  const record = window as unknown as { __bibcodeTimelineDiag?: unknown[] };
+  (record.__bibcodeTimelineDiag ??= []).push({ at: Math.round(performance.now()), kind, ...data });
+}
+
+// [DEBUG-208]
+export function debugListSnapshot208(list: LegendListRef | null): unknown {
+  const state = list?.getState();
+  if (!state) return null;
+  const node = list?.getScrollableNode() as HTMLElement | undefined;
+  const length = state.data.length;
+  const tail = [];
+  for (let index = Math.max(0, length - 6); index < length; index += 1) {
+    const item = state.data[index] as MessagesTimelineRow | undefined;
+    tail.push({
+      index,
+      key: item ? `${item.kind}:${item.id}` : null,
+      top: state.positionAtIndex(index),
+      size: state.sizeAtIndex(index) ?? null,
+    });
+  }
+  return {
+    scroll: Math.round(state.scroll),
+    scrollLength: state.scrollLength,
+    contentLength: state.contentLength,
+    start: state.start,
+    end: state.end,
+    scrollTop: node ? Math.round(node.scrollTop) : null,
+    scrollHeight: node?.scrollHeight ?? null,
+    clientHeight: node?.clientHeight ?? null,
+    isAtEnd: state.isAtEnd,
+    isNearEnd: state.isNearEnd,
+    tail,
+  };
 }
 
 function keyExtractor(item: MessagesTimelineRow) {
