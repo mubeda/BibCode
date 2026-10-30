@@ -66,7 +66,7 @@ an agent waits longer by calling it again.
 `bibcode thread` calls the same tools from a terminal or a script. It runs on the host where
 the server runs (the desktop app's executable takes it as `<desktop exe> thread`, like
 `mcp`), finds the server and signs in as `bibcode mcp` does, and revokes its credential
-when it exits. While it runs it shows as one **MCP · bibcode thread** row in **Authorized
+when it exits. While it runs it shows as one **CLI · bibcode thread** row in **Authorized
 clients**.
 
 | Command                                    | What it does                                                                 |

@@ -295,6 +295,17 @@ async fn only_bibcode_thread_credentials_share_their_client_request_ids() {
         start(&harness, &another, arguments.clone()).await,
         "another agent's session has requests of its own"
     );
+
+    // The relay labels an agent `MCP · <clientInfo.name>`, so one calling itself `bibcode thread`
+    // cannot reach the CLI's scope.
+    let (impostor, _) = harness
+        .agent_labelled("MCP · bibcode thread", McpAccess::FullAccess)
+        .await;
+    assert_ne!(
+        start(&harness, &first, arguments.clone()).await,
+        start(&harness, &impostor, arguments).await,
+        "an agent naming itself bibcode thread keeps a scope of its own"
+    );
     harness.shutdown().await;
 }
 

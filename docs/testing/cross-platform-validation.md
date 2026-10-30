@@ -1747,7 +1747,7 @@ from `apps/web`.
    ends it with the app.
 7. From a terminal in the project's folder, run `bibcode thread start . "Say hello"
    --wait` (the desktop executable's `thread` on a desktop): it prints the reply and
-   exits 0, and **MCP · bibcode thread** shows in **Authorized clients** only while
+   exits 0, and **CLI · bibcode thread** shows in **Authorized clients** only while
    it runs. `bibcode thread list --json` lists the thread. With a Supervised thread
    stopped at an approval, `send <thread> <message> --wait` exits 2. With **MCP
    server** off, `bibcode thread list` exits 1 naming the setting. On Windows, check
