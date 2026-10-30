@@ -2095,6 +2095,52 @@ describe("ChatView effects (captured and run manually)", () => {
     for (const cleanup of cleanups) cleanup();
   });
 
+  it("follows the anchored turn's end once the turn settles and its rows change (#208)", async () => {
+    const { list, cleanups, messageId, onAnchorReady } = await sendTallReply({});
+    onAnchorReady(messageId, 2);
+    list.scrollNode.fire("scrollend");
+    expect(list.scrollNode.scrollTop).toBe(216);
+
+    // The turn settles with no new entry: its "Worked for" row lands above the reply at the
+    // size the list expected, so no row reports a size change, and the reply moves 44 px down.
+    list.growRow(2, 44);
+    (capturedProps("messagesTimeline")["onTurnSettled"] as (() => void) | undefined)?.();
+    expect(list.calls.scrollToOffset.at(-1)).toEqual({ offset: 260, animated: false });
+
+    // The reply's meta row then measures 38 px: the end showed before it grew, so it follows.
+    list.growRow(3, 38);
+    onRowSizeChanged()({ index: 3, previous: 100, size: 138 });
+    expect(list.calls.scrollToOffset.at(-1)).toEqual({ offset: 298, animated: false });
+    for (const cleanup of cleanups) cleanup();
+  });
+
+  it("follows the end once the turn settles while following the end (#208)", () => {
+    seedConnectedServerThread(makeThreadWithEarlierTurn());
+    renderServerRoute();
+    const list = installLegendList({ scrollLength: 50 });
+    const cleanups = runEffects();
+    const before = list.calls.scrollToEnd.length;
+
+    (capturedProps("messagesTimeline")["onTurnSettled"] as (() => void) | undefined)?.();
+
+    expect(list.calls.scrollToEnd).toHaveLength(before + 1);
+    for (const cleanup of cleanups) cleanup();
+  });
+
+  it("does not follow a settling turn once the reader has scrolled away (#208)", () => {
+    seedConnectedServerThread(makeThreadWithEarlierTurn());
+    renderServerRoute();
+    const list = installLegendList({ scrollLength: 50 });
+    const cleanups = runEffects();
+    list.scrollNode.fire("wheel");
+    const calls = list.calls.scrollToEnd.length + list.calls.scrollToOffset.length;
+
+    (capturedProps("messagesTimeline")["onTurnSettled"] as () => void)();
+
+    expect(list.calls.scrollToEnd.length + list.calls.scrollToOffset.length).toBe(calls);
+    for (const cleanup of cleanups) cleanup();
+  });
+
   it("reveals the end with a composer height measured in the same commit as the row's growth", async () => {
     // The overlay measures 40 px in ChatView's layout effect, and the list reports the growth
     // before ChatView renders that height: the geometry helpers must already use it (#204).
