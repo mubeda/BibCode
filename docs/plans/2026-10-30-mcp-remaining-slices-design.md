@@ -3149,3 +3149,46 @@ G was implemented on `claude/v0131-139-g`, from `claude/v0131-139-f0`. It regist
   default level.
 - **Docs.** `docs/user/mcp.md` gains a **Git** subsection. Its "Not available" and
   approvals bullets are slice Z's cross-cutting text and still say these tools do not exist.
+
+## P (pull request tools) implementation notes (2026-10-30)
+
+Slice P was implemented on `claude/v0131-139-p`, from `claude/v0131-139-f0`. It adds
+`mcp/tools/pull_requests.rs` and `mcp_tools_tests/pull_requests.rs`, and one registration
+line in each shared file. No contract, handler or migration changed.
+
+**Choices the design left open:**
+
+- **The checks summary in `view_pull_request`** comes from a second read,
+  `pullRequests.getChecks`, run together with `pullRequests.get` (both are in the spec's
+  `methods`). It holds the host's summary, a count per state, and up to 20 failing check
+  names. A checks read that fails does not fail the view: `checks` then carries its typed
+  error.
+- **`list_pull_requests`** sends a full `ListQuery` (`labels: []`, `sort: "newest"`, no
+  filters), because the handler's struct has no serde defaults. Rows are compact (number,
+  title, state, draft, author login, branches, checks and review summary, URL), and no
+  row is dropped to fit: the host's cursor is opaque, so a dropped row could never be read.
+- **No head-branch filter.** `ListQuery` has none; `targetBranch` is the base. An unknown
+  create is resolved by reading `headBranch` on the rows. That instruction is in
+  `create_pull_request`'s description, because `recorded` owns the
+  `McpOutcomeUnknownError` text. The stacked action also returns an already open pull
+  request for the branch (`status: "opened_existing"`), so a repeated create does not open a
+  second one.
+- **`draft` on create** is sent as `pullRequestOptions` only when it is true, with every
+  other option empty, so other creates keep the host's own defaults. On a host other than
+  GitHub or GitLab a draft create is refused by the handler's existing rule.
+- **`update_pull_request`** runs `editPullRequest` (title and body, `baseBranch: null`),
+  then `setDraft`, in one recorded call. When the edit lands and `setDraft` fails, it
+  returns `McpPartialOutcomeError` with `updated`, `failed: "draft"`, the cause's tag and
+  `code`; a keyed retry replays it, as G's branch delete does.
+- **Arguments are checked at the tool:** `number` is 1 to 2^53−1, a title is non-blank and at
+  most 256 characters, a body at most 65,536 (the stacked action's limits), `state` and
+  `method` are from their enums, and `headSha` is required. Unknown arguments, `bypass`
+  included, are refused by `only()`.
+- **Merge** sends `bypass: false`, `subject: null` and `body: null`, so the host's default
+  merge message applies.
+
+**Tests.** The hosting service is faked under the real tags, and the fake decodes each
+`pullRequests.*` payload with the real `ListQuery` and `ActionRequest` types, so a shape
+the real handler would refuse fails the test. The unavailable-host test runs the real
+`register_pull_requests_rpc` with no provider CLI or Git. The tests and the tools were
+written in one pass; the first run of the suite was green.

@@ -120,6 +120,30 @@ the same handlers as the Source Control panel. They belong to the **Source contr
 - **Results** end with the folder's Git status. A refused operation returns its `code` and,
   when a guard refused it, its `blocked` reason, such as uncommitted changes.
 
+### Pull requests
+
+These work on the repository of the folder a thread works in, through the provider CLI
+(`gh` or `glab`) the **Pull Requests** panel uses. They are in the **Source control** set.
+
+| Tool                  | What it does                                                                                                           |
+| --------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `list_pull_requests`  | A page of pull requests (`open` unless `state` says otherwise), newest first, with branches, checks and review summary |
+| `view_pull_request`   | One pull request: state, branches, `headSha`, merge readiness, allowed merge methods, a checks summary, and its body   |
+| `pull_request_checks` | Each check's name, state and URL                                                                                       |
+| `create_pull_request` | Opens a pull request from the thread's branch, pushing it first, as Source Control's **Create pull request** does      |
+| `update_pull_request` | Changes the title, the body or the draft state                                                                         |
+| `merge_pull_request`  | Merges, or turns on auto-merge with `auto`; needs the `headSha` the agent read                                         |
+
+- A body is cut at 16,000 characters, with its full length. Bodies and check names are
+  untrusted.
+- A merge never bypasses branch protection, and is refused when the branch moved since the
+  agent read `headSha`. It is marked destructive, so agents that prompt before destructive
+  tools prompt for it.
+- When a create is cut off and BiBCode cannot tell whether it happened, the agent gets
+  `McpOutcomeUnknownError` and should look for the branch's pull request with
+  `list_pull_requests` before creating again. When one is already open for the branch, a
+  create returns it.
+
 ## From a shell: `bibcode thread`
 
 `bibcode thread` calls the same tools from a terminal or a script. It runs on the host where
