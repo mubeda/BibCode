@@ -187,6 +187,27 @@ describe("ServerSettings MCP server", () => {
   it("rejects an unknown access level", () => {
     expect(() => decodeServerSettingsPatch({ mcpServerAccess: "everything" })).toThrow();
   });
+
+  it("turns every capability set on but terminals, and fills a partial document", () => {
+    expect(DEFAULT_SERVER_SETTINGS.mcpCapabilities).toEqual({
+      workspace: true,
+      sourceControl: true,
+      files: true,
+      diagnostics: true,
+      terminals: false,
+    });
+    expect(decodeServerSettings({ mcpCapabilities: { files: false } }).mcpCapabilities).toEqual({
+      ...DEFAULT_SERVER_SETTINGS.mcpCapabilities,
+      files: false,
+    });
+  });
+
+  it("patches any subset of the capability sets and rejects a non-boolean one", () => {
+    expect(decodeServerSettingsPatch({ mcpCapabilities: { terminals: true } })).toEqual({
+      mcpCapabilities: { terminals: true },
+    });
+    expect(() => decodeServerSettingsPatch({ mcpCapabilities: { terminals: "yes" } })).toThrow();
+  });
 });
 
 describe("ServerSettings profiler", () => {

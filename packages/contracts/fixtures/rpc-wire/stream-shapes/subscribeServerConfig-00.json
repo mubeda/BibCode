@@ -53,6 +53,13 @@
           "enableDevicePreviews": false,
           "enableMcpServer": true,
           "mcpServerAccess": "approval-required",
+          "mcpCapabilities": {
+            "workspace": true,
+            "sourceControl": true,
+            "files": true,
+            "diagnostics": true,
+            "terminals": false
+          },
           "automaticGitFetchInterval": 180000,
           "defaultThreadEnvMode": "local",
           "newWorktreesStartFromOrigin": false,
