@@ -4,6 +4,7 @@
 //! Each tool family has its own file; this one holds the shared harness.
 
 mod foundation;
+mod git;
 mod thread_actions;
 mod threads;
 mod worktrees;
