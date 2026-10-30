@@ -71,6 +71,17 @@ impl Fake {
                     receiver
                 });
             }
+            // A unary mutation registered as `gitManager.commit` is: its handler drops the
+            // request's context (and so its admission) before its work finishes.
+            let fake = fake.clone();
+            registry.register_unary("gitManager.commit", move |_, _| {
+                let fake = fake.clone();
+                async move {
+                    fake.runs.fetch_add(1, Ordering::SeqCst);
+                    fake.release.notified().await;
+                    Ok(json!({ "commitSha": "abc123" }))
+                }
+            });
         })
         .await
     }
@@ -982,5 +993,176 @@ async fn interrupt_turn_dispatches_only_for_a_running_turn_and_is_not_idempotent
         settled,
         "a repeat holds nothing"
     );
+    harness.shutdown().await;
+}
+
+/// A keyed `git_commit` stand-in: one unary `gitManager.commit`, recorded.
+async fn commit(
+    harness: &Harness,
+    agent: &ClientPrincipal,
+    arguments: Value,
+    cancellation: CancellationToken,
+) -> Value {
+    let Value::Object(arguments) = arguments else {
+        panic!("arguments are an object");
+    };
+    let call = ToolCall {
+        control: &harness.control,
+        principal: agent,
+        arguments: &arguments,
+        cancellation,
+    };
+    let payload = json!({ "message": "m" });
+    call.recorded("git_commit", &payload.clone(), move |owned| async move {
+        let committed = owned.invoke("gitManager.commit", payload).await?;
+        Ok(tool_result(committed, &[]))
+    })
+    .await
+    .unwrap_or_else(|failure| failure)
+}
+
+async fn row_state(harness: &Harness, key: &str) -> String {
+    let key = key.to_owned();
+    harness
+        .repositories
+        .database()
+        .call(move |connection| {
+            Ok(connection.query_row(
+                "SELECT state FROM mcp_tool_requests WHERE client_request_id = ?",
+                [key],
+                |row| row.get(0),
+            )?)
+        })
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn update_preparation_waits_for_a_disconnected_owned_mutation_to_record_its_outcome() {
+    let fake = Fake::default();
+    let harness = fake.harness().await;
+    let (agent, _) = harness.agent(McpAccess::FullAccess).await;
+    let cancellation = CancellationToken::new();
+    let (result, ()) = tokio::join!(
+        commit(&harness, &agent, keyed("gone"), cancellation.clone()),
+        async {
+            until(|| fake.runs() == 1).await;
+            cancellation.cancel();
+        },
+    );
+    assert_eq!(error_tag(&result), "McpCancelledError");
+
+    // The client is gone but the commit still runs: update preparation must wait for it.
+    let gate = harness.control.registry().admission_gate();
+    assert!(
+        gate.snapshot()
+            .blockers
+            .iter()
+            .any(|blocker| blocker.operation == "MCP git_commit"),
+        "the owned commit holds its own admission"
+    );
+    let drain = gate.close_and_drain(tokio::time::Instant::now() + Duration::from_secs(5));
+    tokio::pin!(drain);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), &mut drain)
+            .await
+            .is_err(),
+        "the drain waits for the owned commit"
+    );
+    assert_eq!(row_state(&harness, "gone").await, "running");
+    fake.release.notify_one();
+    drain.await.expect("drains once settled");
+    assert_eq!(
+        row_state(&harness, "gone").await,
+        "done",
+        "the outcome is written before the admission is released"
+    );
+
+    // While maintenance holds admission closed, a new keyed mutation is refused and records
+    // nothing, so the same key runs once admission reopens.
+    let refused = commit(&harness, &agent, keyed("closed"), CancellationToken::new()).await;
+    assert_eq!(error_tag(&refused), "UpdateMaintenanceActiveError");
+    gate.release().unwrap();
+    assert_eq!(fake.runs(), 1);
+    let (retried, ()) = tokio::join!(
+        commit(&harness, &agent, keyed("closed"), CancellationToken::new()),
+        async {
+            until(|| fake.runs() == 2).await;
+            fake.release.notify_one();
+        },
+    );
+    assert_eq!(structured(&retried)["commitSha"], "abc123");
+    harness.shutdown().await;
+}
+
+async fn fail_updates(harness: &Harness, when: &'static str) {
+    harness
+        .repositories
+        .database()
+        .call(move |connection| {
+            connection.execute_batch(&format!(
+                "DROP TRIGGER IF EXISTS fail_outcome; CREATE TRIGGER fail_outcome BEFORE UPDATE ON mcp_tool_requests WHEN {when} BEGIN SELECT RAISE(ABORT, 'injected'); END;"
+            ))?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn an_outcome_that_cannot_be_written_is_unknown_never_success() {
+    let fake = Fake::default();
+    let harness = fake.harness().await;
+    let (agent, _) = harness.agent(McpAccess::FullAccess).await;
+    let ok = json!({ "events": [finished()] });
+
+    // The success cannot be recorded, but `unknown` can: the caller and every retry get the
+    // same `unknown`.
+    fail_updates(&harness, "NEW.state = 'done'").await;
+    let pushed = push(
+        &harness,
+        &agent,
+        keyed("lost"),
+        ok.clone(),
+        CancellationToken::new(),
+    )
+    .await;
+    assert_eq!(reason(&pushed), "unrecorded");
+    let again = push(
+        &harness,
+        &agent,
+        keyed("lost"),
+        ok.clone(),
+        CancellationToken::new(),
+    )
+    .await;
+    assert_eq!(pushed, again);
+    assert_eq!(row_state(&harness, "lost").await, "unknown");
+    assert_eq!(fake.runs(), 1);
+
+    // Nothing can be recorded: the row stays `running`, and every answer is still unknown.
+    fail_updates(&harness, "1").await;
+    let pushed = push(
+        &harness,
+        &agent,
+        keyed("stuck"),
+        ok.clone(),
+        CancellationToken::new(),
+    )
+    .await;
+    assert_eq!(reason(&pushed), "unrecorded");
+    for _ in 0..2 {
+        let again = push(
+            &harness,
+            &agent,
+            keyed("stuck"),
+            ok.clone(),
+            CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(reason(&again), "restarted");
+    }
+    assert_eq!(row_state(&harness, "stuck").await, "running");
+    assert_eq!(fake.runs(), 2);
     harness.shutdown().await;
 }

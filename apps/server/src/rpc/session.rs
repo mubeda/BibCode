@@ -787,6 +787,7 @@ impl RpcRegistry {
     /// Runs the unary method `tag` for a caller with no socket (the `/mcp` tools), with the
     /// same checks a WebSocket request gets: the method's declared scope on `context`'s
     /// session, then its maintenance admission, then the registered handler and its timing.
+    /// The admission is held until the handler returns, as a WebSocket request's is.
     pub(crate) async fn invoke_local(
         &self,
         tag: &str,
@@ -801,6 +802,7 @@ impl RpcRegistry {
             }));
         };
         let (request, context) = self.admit_local(tag, payload, context).await?;
+        let _admission = context.admission_permit();
         handler(request, context, cancellation).await.result
     }
 

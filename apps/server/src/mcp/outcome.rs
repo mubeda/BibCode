@@ -14,10 +14,13 @@
 //!
 //! **At most once.** With a `clientRequestId`, the work is an *owned mutation*: it runs as a
 //! task owned by `McpControl`, so a cancelled MCP call stops waiting but not the work, and it
-//! holds its RPC admission and one of 2 per-session (8 per-environment) owned slots until its
-//! outcome is written. Its row in `mcp_tool_requests` goes `running`, then `done`, `failed` or
-//! `unknown`, and a retry returns the stored outcome without running anything. A `running`
-//! row with no in-process claim (a restart or crash mid-call) answers `McpOutcomeUnknownError`.
+//! holds its own maintenance admission and one of 2 per-session (8 per-environment) owned
+//! slots until its outcome is written. Its row in `mcp_tool_requests` goes `running`, then
+//! `done`, `failed` or `unknown`, and a retry returns the stored outcome without running
+//! anything. An outcome that cannot be written is answered as `McpOutcomeUnknownError`
+//! (`unrecorded`), never as the work's result. A `running` row with no in-process claim (a
+//! restart or crash mid-call, or an outcome nothing could write) answers
+//! `McpOutcomeUnknownError`.
 //! Without a key the work runs inline, under the same controls plus the call's cancellation.
 
 use std::{
@@ -39,7 +42,11 @@ use super::{
     },
     protocol::typed_tool_failure,
 };
-use crate::rpc::{RpcRegistry, RpcSessionContext, STREAM_ENDED_TAG, StreamOutcome};
+use crate::{
+    RpcMutability,
+    persistence::Database,
+    rpc::{RpcRegistry, RpcSessionContext, STREAM_ENDED_TAG, StreamOutcome},
+};
 
 pub(crate) const OUTCOME_UNKNOWN_TAG: &str = "McpOutcomeUnknownError";
 /// How long interrupted work may take to notice its token before it is dropped.
@@ -58,6 +65,8 @@ pub(crate) enum Interruption {
     StreamEnded,
     /// A `running` row that no process owns: BiBCode restarted or crashed mid-call.
     Restarted,
+    /// The work ended but its outcome could not be written.
+    Unrecorded,
 }
 
 impl Interruption {
@@ -70,6 +79,7 @@ impl Interruption {
             Self::Cancelled => "cancelled",
             Self::StreamEnded => "stream-ended",
             Self::Restarted => "restarted",
+            Self::Unrecorded => "unrecorded",
         }
     }
 
@@ -82,6 +92,7 @@ impl Interruption {
             Self::Cancelled => "the call was cancelled while it ran",
             Self::StreamEnded => "the operation stopped reporting before it finished",
             Self::Restarted => "BiBCode restarted while it ran",
+            Self::Unrecorded => "BiBCode could not save its outcome",
         }
     }
 }
@@ -357,6 +368,17 @@ impl ToolCall<'_> {
             return self.answer(&key, row, Some(claim)).await;
         }
         let slot = self.control.admit_owned(&key.session_id)?;
+        // The work's own maintenance admission: a unary handler drops its request's permit
+        // before its work ends, and the call's request may end first. Update preparation
+        // therefore waits for this until the outcome is written.
+        let admission = self
+            .control
+            .registry()
+            .admission_gate()
+            .admit_named(RpcMutability::Mutation, format!("MCP {tool}"))
+            .map_err(|error| {
+                typed_tool_failure("UpdateMaintenanceActiveError", &error.to_string())
+            })?;
         let controls = LiveControls::start(self.control, self.principal, None).await?;
         let payload_json = serde_json::to_string(payload).map_err(storage_failure)?;
         if !self.insert_running(&key, payload_json).await? {
@@ -367,9 +389,9 @@ impl ToolCall<'_> {
             };
         }
         let owned = self.owned(controls.token.clone());
-        let repositories = self.control.repositories().clone();
+        let database = self.control.repositories().database().clone();
         let (sender, receiver) = oneshot::channel();
-        let row_key = (key.session_id.clone(), key.client_request_id.clone());
+        let row_key = key.clone();
         tokio::spawn(async move {
             let (result, interruption) = controls.run(work(owned)).await;
             let state = match (&result, interruption) {
@@ -380,22 +402,23 @@ impl ToolCall<'_> {
             let outcome = match &result {
                 Ok(value) | Err(value) => value.to_string(),
             };
-            let (session_id, client_request_id) = row_key;
-            let written = repositories
-                .database()
-                .call(move |connection| {
-                    connection.execute(
-                        "UPDATE mcp_tool_requests SET state = ?, outcome_json = ? WHERE session_id = ? AND client_request_id = ?",
-                        params![state, outcome, session_id, client_request_id],
-                    )?;
-                    Ok(())
-                })
-                .await;
-            if let Err(error) = written {
-                // The row stays `running`, which a retry answers as unknown: never success.
-                tracing::warn!(%error, "an MCP tool could not record its outcome");
-            }
-            // Released only once the outcome is written.
+            let result = match settle(&database, &row_key, state, outcome).await {
+                Ok(true) => result,
+                written => {
+                    tracing::warn!(?written, "an MCP tool could not record its outcome");
+                    // Never answer what was not recorded. Record `unknown` instead; if that
+                    // fails too, the row stays `running`, which a retry answers as unknown.
+                    let failure = unknown_failure(Interruption::Unrecorded);
+                    if let Err(error) =
+                        settle(&database, &row_key, "unknown", failure.to_string()).await
+                    {
+                        tracing::warn!(%error, "an MCP tool could not record its unknown outcome");
+                    }
+                    Err(failure)
+                }
+            };
+            // Released only once the outcome is settled (or could not be).
+            drop(admission);
             drop(slot);
             drop(claim);
             let _ = sender.send(result);
@@ -488,25 +511,34 @@ impl ToolCall<'_> {
         }
         let failure = unknown_failure(Interruption::Restarted);
         if claim.is_some() {
-            let (session_id, client_request_id) =
-                (key.session_id.clone(), key.client_request_id.clone());
-            let outcome = failure.to_string();
-            self.control
-                .repositories()
-                .database()
-                .call(move |connection| {
-                    connection.execute(
-                        "UPDATE mcp_tool_requests SET state = 'unknown', outcome_json = ? WHERE session_id = ? AND client_request_id = ? AND state = 'running'",
-                        params![outcome, session_id, client_request_id],
-                    )?;
-                    Ok(())
-                })
-                .await
-                .map_err(storage_failure)?;
+            let database = self.control.repositories().database();
+            if let Err(error) = settle(database, key, "unknown", failure.to_string()).await {
+                // Still unknown: the row stays `running`, and the next retry tries again.
+                tracing::warn!(%error, "an MCP tool could not record an unowned outcome");
+            }
         }
         drop(claim);
         Err(failure)
     }
+}
+
+/// Writes the outcome of `key`'s `running` row; `false` when no such row was there.
+async fn settle(
+    database: &Database,
+    key: &RequestKey,
+    state: &'static str,
+    outcome: String,
+) -> crate::persistence::Result<bool> {
+    let (session_id, client_request_id) = (key.session_id.clone(), key.client_request_id.clone());
+    database
+        .call(move |connection| {
+            let updated = connection.execute(
+                "UPDATE mcp_tool_requests SET state = ?, outcome_json = ? WHERE session_id = ? AND client_request_id = ? AND state = 'running'",
+                params![state, outcome, session_id, client_request_id],
+            )?;
+            Ok(updated == 1)
+        })
+        .await
 }
 
 fn cancelled() -> Value {
