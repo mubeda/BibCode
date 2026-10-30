@@ -167,6 +167,9 @@ interface NativePageUpTrace {
   key: NativePageUpEvidence["key"] | null;
   frames: NativePageUpFrame[];
   done: boolean;
+  // [DEBUG-k64] every programmatic scroll and scroll event from the glide on.
+  calls?: unknown[];
+  sources?: Record<string, string>;
 }
 
 interface LandingSample {
@@ -1655,7 +1658,10 @@ describe("packaged Mermaid diagrams", () => {
     await saveEvidence("mermaid-timeline-streaming-follow");
   }).timeout(240_000);
 
-  it("hands the timeline to the reader's keyboard and resumes at the end", async () => {
+  // [DEBUG-k64r] repeat the keyboard case with a varied key delay to raise the repro rate.
+  for (const iteration of [1, 2, 3, 4, 5]) {
+  it(`hands the timeline to the reader's keyboard and resumes at the end #${iteration}`, async () => {
+    (globalThis as { __k64Iteration?: number }).__k64Iteration = iteration;
     await setDesktopUiWindowSize(1_400, 900);
     await openFixtureWorkspace();
     await expectPaintingWebview();
@@ -1887,7 +1893,7 @@ describe("packaged Mermaid diagrams", () => {
       ? await pressNativePageUpDuringGlide(nativePageUpSender)
       : await pressSyntheticPageUp();
     NodeFS.writeFileSync(
-      NodePath.join(preparedArtifactDirectory, "mermaid-timeline-keyboard-key.json"),
+      NodePath.join(preparedArtifactDirectory, `mermaid-timeline-keyboard-key-${iteration}.json`),
       JSON.stringify(pressed, null, 2),
     );
     const keyAt = (await readKeyboardSamples()).keyAt ?? Number.NaN;
@@ -2030,7 +2036,7 @@ describe("packaged Mermaid diagrams", () => {
       (window as unknown as { __bibcodeKeyboardStop?: () => void }).__bibcodeKeyboardStop?.(),
     );
     NodeFS.writeFileSync(
-      NodePath.join(preparedArtifactDirectory, "mermaid-timeline-keyboard-takeover.json"),
+      NodePath.join(preparedArtifactDirectory, `mermaid-timeline-keyboard-takeover-${iteration}.json`),
       JSON.stringify(
         {
           pressed,
@@ -2067,8 +2073,9 @@ describe("packaged Mermaid diagrams", () => {
         endBelow: entry.endBelow,
       }));
     expect(hiddenAfterEnd).toEqual([]);
-    await saveEvidence("mermaid-timeline-keyboard-takeover");
+    await saveEvidence(`mermaid-timeline-keyboard-takeover-${iteration}`);
   }).timeout(240_000);
+  }
 
   it("keeps a reader just above the end in place as the end and the bottom region grow", async () => {
     await setDesktopUiWindowSize(1_400, 900);
@@ -2383,6 +2390,47 @@ async function pressNativePageUpDuringGlide(
         const now = sentTop();
         if (first !== null && now !== null && Math.abs(now - first) > 4) {
           const glideAt = performance.now();
+          // [DEBUG-k64] record who scrolls the timeline from the glide to the end of the trace.
+          const debugCalls: unknown[] = [];
+          (window as unknown as { __k64Calls?: unknown[] }).__k64Calls = debugCalls;
+          const where = () =>
+            (new Error().stack ?? "")
+              .split("\n")
+              .slice(2, 27)
+              .map((line) => line.trim());
+          const record = (kind: string, value: unknown) =>
+            debugCalls.push({
+              at: Math.round(performance.now()),
+              kind,
+              value,
+              scrollTop: Math.round(scroller.scrollTop),
+              scrollHeight: scroller.scrollHeight,
+              stack: kind === "scroll-event" || kind === "keydown" ? [] : where(),
+            });
+          for (const method of ["scrollTo", "scrollBy", "scrollIntoView"] as const) {
+            const original = (scroller as unknown as Record<string, (...args: unknown[]) => void>)[
+              method
+            ]!.bind(scroller);
+            (scroller as unknown as Record<string, unknown>)[method] = (...args: unknown[]) => {
+              record(method, args);
+              original(...args);
+            };
+          }
+          const topDescriptor = Object.getOwnPropertyDescriptor(Element.prototype, "scrollTop")!;
+          Object.defineProperty(scroller, "scrollTop", {
+            configurable: true,
+            get: () => topDescriptor.get!.call(scroller),
+            set: (value: number) => {
+              record("scrollTop=", value);
+              topDescriptor.set!.call(scroller, value);
+            },
+          });
+          scroller.addEventListener("scroll", () => record("scroll-event", null), {
+            passive: true,
+          });
+          document.addEventListener("keydown", (event) => record("keydown", event.key), {
+            capture: true,
+          });
           const area = scroller.getBoundingClientRect();
           const above = [...scroller.querySelectorAll<HTMLElement>(".chat-markdown p")].find(
             (element) => element.getBoundingClientRect().bottom < area.top - 200,
@@ -2434,12 +2482,37 @@ async function pressNativePageUpDuringGlide(
                     lineTop: line ? Math.round(line.getBoundingClientRect().top) : null,
                     lineConnected: line?.isConnected ?? false,
                   });
-                  if (trace.frames.length < 16) {
+                  if (trace.frames.length < 40) {
                     requestAnimationFrame(sample);
                   } else {
                     const key = trace.key;
                     if (key) trace.key = { ...key, defaultPrevented: event.defaultPrevented };
-                    trace.done = true;
+                    trace.calls = debugCalls;
+                    // [DEBUG-k64] the bundled code at each distinct caller, so minified names
+                    // can be read against their property names.
+                    const sites = new Set<string>();
+                    for (const call of debugCalls as { stack: string[] }[]) {
+                      for (const line of call.stack) {
+                        const match = /(?:^|@|\()([a-z]+:\/\/\S+?):(\d+):(\d+)\)?$/u.exec(line);
+                        if (match) sites.add(`${match[1]}|${match[2]}|${match[3]}`);
+                      }
+                    }
+                    const sources: Record<string, string> = {};
+                    const texts = new Map<string, Promise<string>>();
+                    void Promise.all(
+                      [...sites].map(async (site) => {
+                        const [url, line, column] = site.split("|");
+                        if (!url || !texts.has(url))
+                          texts.set(url!, window.fetch(url!).then((r) => r.text(), () => ""));
+                        const text = await texts.get(url!)!;
+                        const row = text.split("\n")[Number(line) - 1] ?? "";
+                        const at = Number(column) - 1;
+                        sources[site] = row.slice(Math.max(0, at - 220), at + 120);
+                      }),
+                    ).finally(() => {
+                      trace.sources = sources;
+                      trace.done = true;
+                    });
                     document.removeEventListener("keydown", onKeyDown, { capture: true });
                   }
                 };
@@ -2476,6 +2549,9 @@ async function pressNativePageUpDuringGlide(
       `The native PageUp could not land during the sent-row glide: ${JSON.stringify(ready)}.`,
     );
   }
+  // [DEBUG-k64r] 0, 40, 80, 120 or 160 ms later than the plain recipe.
+  const iteration = (globalThis as { __k64Iteration?: number }).__k64Iteration ?? 1;
+  await new Promise<void>((resolve) => setTimeout(resolve, (iteration - 1) * 40));
   const sender = await finishSender(true);
   await browser.waitUntil(
     () =>
@@ -2503,7 +2579,10 @@ async function pressNativePageUpDuringGlide(
     key: trace.key,
     frames: trace.frames,
     sender,
-  };
+    // [DEBUG-k64]
+    calls: trace.calls,
+    sources: trace.sources,
+  } as NativePageUpEvidence;
 }
 
 /**
