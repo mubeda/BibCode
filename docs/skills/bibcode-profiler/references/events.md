@@ -116,7 +116,9 @@ Follow one process across restarts by `kind` and `label`; its `pid` changes.
 A request the server handled that crossed a latency tier. Requests under every
 tier write nothing.
 
-- `method`;
+- `method`: an RPC method, or `mcp.<tool>` for a `/mcp` tool call (an outside
+  agent's thread tool such as `mcp.wait_for_thread`, or a provider's
+  `mcp.preview_*` and `mcp.device_*`);
 - `outcome`: `success`, `failure`, or `first-item` for a stream timed to its
   first item;
 - `ms`: handler time;

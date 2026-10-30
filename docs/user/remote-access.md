@@ -168,9 +168,11 @@ To keep the server running across reboots, install it as a per-user service
 with `bibcode service install --host <address>`; see
 [Standalone server installation](./server-installation.md#run-as-a-per-user-service).
 
-The CLI does not print a QR code and has no `project` subcommand. Pairing
-credentials come from `bibcode pairing offer` (encrypted offers for the desktop
-app) and `bibcode pairing issue` (the desktop SSH bootstrap). Use
+The CLI does not print a QR code and has no `project` or `thread` subcommand.
+Pairing credentials come from `bibcode pairing offer` (encrypted offers for the
+desktop app) and `bibcode pairing issue` (the desktop SSH bootstrap). An AI agent
+operates threads through `bibcode mcp`, including on a remote host as
+`ssh <host> bibcode mcp`; see [Outside agents over MCP](./mcp.md). Use
 `bibcode serve --help` for the implemented options.
 
 `--static-dir` explicitly overrides packaged web discovery and must contain

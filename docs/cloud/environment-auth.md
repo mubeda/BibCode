@@ -109,6 +109,35 @@ every method. Tickets are bounded and consumed by
 `authenticate_websocket` in
 [`auth/http.rs`](../../apps/server/src/auth/http.rs).
 
+### Outside agents over MCP
+
+`bibcode mcp` (and `<desktop exe> mcp`) mints its own credential from the data
+root with `issue_mcp_pairing_link`: a 60-second one-time link with exactly
+`orchestration:read orchestration:operate`, subject `mcp-client`, the label
+`MCP · <agent name>`, and an access ceiling in the nullable `mcp_access` column
+(migration 58). Because the link never holds more, exchange cannot widen it. The
+relay exchanges it at `/oauth/token` over loopback, after proving the listener
+(see [Remote environments](../architecture/remote.md)), and the exchange copies
+`mcp_access` into the session.
+
+- **Audience.** `authenticate_token`, which every cookie, bearer, DPoP, ticket
+  and E2EE path uses, refuses the `mcp-client` subject. Only
+  `authenticate_mcp_client`, which `/mcp` calls, accepts it. The credential
+  therefore reaches the thread tools and nothing else, although its scopes would
+  satisfy many RPC methods.
+- **Ceiling.** Every call uses the lower of the session's `mcp_access` and the
+  environment's `mcpServerAccess`. A session whose `mcp_access` is `NULL` is
+  read-only.
+- **Lifetime.** The token lives only in the relay's memory. The relay records
+  `<state dir>/mcp-clients/<sid>.json` (`pid` and process start time, no
+  secret), revokes the session through the data root when it exits, and revokes
+  the sessions of records whose process is gone when it starts. Revoking the row
+  in Authorized clients ends it on the next call; the relay never mints again
+  after a 401.
+- **Off switch.** With `enableMcpServer` off, `bibcode mcp` exits before minting,
+  and `/mcp` answers outside agents with `McpServerDisabledError`. No session is
+  revoked, so turning it back on needs no new pairing.
+
 ## Access administration
 
 Administrative sessions use the `/api/auth/pairing-*` and
