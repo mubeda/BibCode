@@ -117,7 +117,8 @@ fn tool_text(name: &str) -> (&'static str, Value) {
                     "projectId": { "type": "string", "description": "Only this project's threads." },
                     "includeArchived": { "type": "boolean", "description": "Also archived threads. Off unless set." },
                     "limit": { "type": "integer", "minimum": 1, "maximum": MOST_LIST_LIMIT, "description": "Threads per page; 50 unless set." },
-                    "cursor": { "type": "string", "description": "nextCursor of the previous page." },
+                    "cursor": { "type": "string", "description": "nextCursor of the previous page: continues the threads, and returns no projects unless projectCursor is set too." },
+                    "projectCursor": { "type": "string", "description": "nextProjectCursor of the previous page: continues the projects, and returns no threads unless cursor is set too." },
                 }),
                 &[],
             ),
@@ -225,7 +226,13 @@ fn tool_text(name: &str) -> (&'static str, Value) {
 
 impl ToolCall<'_> {
     async fn list_projects_and_threads(&self) -> ToolResult {
-        self.only(&["projectId", "includeArchived", "limit", "cursor"])?;
+        self.only(&[
+            "projectId",
+            "includeArchived",
+            "limit",
+            "cursor",
+            "projectCursor",
+        ])?;
         let project_id = self.string("projectId")?;
         let include_archived = self.boolean("includeArchived")?.unwrap_or(false);
         let limit = self.integer("limit")?.map_or(DEFAULT_LIST_LIMIT, |limit| {
@@ -233,13 +240,25 @@ impl ToolCall<'_> {
                 .unwrap_or(MOST_LIST_LIMIT)
                 .clamp(1, MOST_LIST_LIMIT)
         });
-        let offset = match self.string("cursor")? {
+        let thread_cursor = self.string("cursor")?;
+        let offset = match thread_cursor {
             None => 0,
             Some(cursor) => cursor
                 .strip_prefix("t:")
                 .and_then(|offset| offset.parse::<usize>().ok())
                 .ok_or_else(|| invalid_argument("cursor is not one this tool returned"))?,
         };
+        let project_cursor = self.string("projectCursor")?;
+        let project_offset = match project_cursor {
+            None => 0,
+            Some(cursor) => cursor
+                .strip_prefix("p:")
+                .and_then(|offset| offset.parse::<usize>().ok())
+                .ok_or_else(|| invalid_argument("projectCursor is not one this tool returned"))?,
+        };
+        // A call that continues only one of the two lists returns only that list.
+        let with_projects = thread_cursor.is_none() || project_cursor.is_some();
+        let with_threads = project_cursor.is_none() || thread_cursor.is_some();
         let engine = self.control.engine();
         let mut shell = crate::production::orchestration_rpc::shell_snapshot(engine, false)
             .await
@@ -281,18 +300,41 @@ impl ToolCall<'_> {
                 .then_with(|| left["threadId"].as_str().cmp(&right["threadId"].as_str()))
         });
         let total = threads.len();
-        let page: Vec<Value> = threads.into_iter().skip(offset).take(limit).collect();
+        let page: Vec<Value> = if with_threads {
+            threads.into_iter().skip(offset).take(limit).collect()
+        } else {
+            Vec::new()
+        };
+        let project_total = projects.len();
+        let projects: Vec<Value> = if with_projects {
+            projects.into_iter().skip(project_offset).collect()
+        } else {
+            Vec::new()
+        };
         let mut next = offset + page.len();
+        let mut next_project = project_offset + projects.len();
         let mut content = json!({
             "projects": projects,
-            "threads": page,
+            "threads": [],
             "threadCount": total,
+            "projectCount": project_total,
             "nextCursor": null,
+            "nextProjectCursor": null,
         });
-        // The cursor continues after the last thread this page returns.
+        // Each cursor continues after the last entry its page returns. The projects fit first,
+        // so a long threads page cannot starve them; then the threads, then the projects again
+        // for the room one thread always takes.
+        next_project -= fit_list(&mut content, "/projects", Cut::Back, 1);
+        content["threads"] = page.into();
         next -= fit_list(&mut content, "/threads", Cut::Back, 1);
-        content["nextCursor"] = (next < total).then(|| format!("t:{next}")).into();
-        Ok(tool_result(content, &[("/projects", Cut::Back)]))
+        next_project -= fit_list(&mut content, "/projects", Cut::Back, 1);
+        content["nextCursor"] = (with_threads && next < total)
+            .then(|| format!("t:{next}"))
+            .into();
+        content["nextProjectCursor"] = (with_projects && next_project < project_total)
+            .then(|| format!("p:{next_project}"))
+            .into();
+        Ok(tool_result(content, &[]))
     }
 
     async fn list_providers_and_models(&self) -> ToolResult {

@@ -54,7 +54,8 @@ own loopback server. Remote MCP over HTTP is not supported yet.
 | `git_status`                | Branch, ahead/behind and changed files of the thread's folder                                                          |
 
 Every result is capped at 80,000 characters and says that thread content is untrusted
-output from agents and tools. Mutating tools take an optional `clientRequestId`, so an agent
+output from agents and tools. A result cut to fit continues with `nextCursor` (threads) and
+`nextProjectCursor` (projects). Mutating tools take an optional `clientRequestId`, so an agent
 can retry a call without starting a second turn.
 
 Codex stops a tool call after 60 seconds by default, so one wait lasts at most 50 seconds and
@@ -82,7 +83,16 @@ clients**.
   30-second calls of `wait_for_thread`, and prints the reply. Stopping it with Ctrl-C stops
   only the waiting: the turn goes on.
 - `--json` prints one JSON document. For `start` and `send` it is
-  `{ "threadId", "messageId", "status", "reply", "error" }`, also on failure.
+  `{ "threadId", "messageId", "status", "reply", "requestId", "error" }`, also on failure.
+- `start` and `send` take `--request-id <id>` (1 to 256 characters); without it one is made
+  up and printed as `requestId`. If a run is interrupted, or loses BiBCode before it hears
+  back, it may already have started the thread or sent the message. It prints the id and
+  the hint "Run the same command with --request-id <id> to finish it without repeating it."
+  Run that exact command, with the same message and options: BiBCode returns the original
+  thread and message instead of starting or sending again, for 24 hours. The same id with
+  anything else changed is refused as `idempotency_conflict`.
+- `list` and `start .` read every page of projects and threads (up to 50 pages), so a long
+  list never hides the project that holds the current directory.
 - `--base-dir <root>` picks another data root, as for `bibcode mcp`.
 
 It exits 0 on success, 1 on a failure or a turn that ended interrupted, failed or

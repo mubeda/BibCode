@@ -3287,7 +3287,7 @@ failure, and a stream that closes first (or is cancelled, or passes its budget) 
 
 | Tool                        | Maps to                                                                               | Scope   |
 | --------------------------- | ------------------------------------------------------------------------------------- | ------- |
-| `list_projects_and_threads` | the `subscribeShell` builder, paged by offset                                         | read    |
+| `list_projects_and_threads` | the `subscribeShell` builder, threads and projects each paged by offset               | read    |
 | `list_providers_and_models` | `server.getConfig` providers and session defaults                                     | read    |
 | `start_thread`              | `thread.turn.start` with `bootstrap.createThread`                                     | operate |
 | `send_message`              | `thread.turn.start` with `queued: true`, then `thread.turn.steer` for `mode: "steer"` | operate |
@@ -3303,7 +3303,10 @@ failure, and a stream that closes first (or is cancelled, or passes its budget) 
   in `mcp_tool_requests` (`INSERT OR IGNORE`, keyed by session and id, with the
   argument digest). Every call with that key dispatches the stored payloads, so
   command admission replays them by receipt state; other arguments under the same
-  key get `idempotency_conflict`. Rows older than 24 h are pruned on insert.
+  key get `idempotency_conflict`. Rows older than 24 h are pruned on insert. The
+  credentials labelled `MCP · bibcode thread` share one scope instead of a session
+  each, because every CLI run mints its own; the scope is resolved from
+  `auth_sessions.client_label` in the same SQLite job.
 - **Recorded outcomes.** A tool whose RPC has no command receipt (Git and pull
   request writes) runs it through `ToolCall::recorded` (`mcp::outcome`). With a
   `clientRequestId` it is an owned mutation: its `mcp_tool_requests` row goes
@@ -3314,6 +3317,10 @@ failure, and a stream that closes first (or is cancelled, or passes its budget) 
   token that the off switch, read-only, revoking the session (through
   `mark_connected_guard`) and `McpControl::shutdown` cancel; work they interrupt is
   `unknown`, never success.
+- **Pages.** `list_projects_and_threads` pages threads with `cursor`/`nextCursor`
+  (`t:<n>`) and projects with `projectCursor`/`nextProjectCursor` (`p:<n>`), each
+  cursor continuing after the last entry its page returns. A call that continues
+  only one list returns only that list.
 - **Ceiling.** A start runs at most at the lower of the session's `mcp_access` and
   `mcpServerAccess`; a send or an answer to a thread above it is refused, and
   `read-only` hides and refuses every operate tool.
@@ -3338,8 +3345,9 @@ failure, and a stream that closes first (or is cancelled, or passes its budget) 
   (`mcp::thread_cli`) calls the same tools itself in the modern era, over the
   relay's `Connection` (setting check, endpoint proof, credential minted on first
   call and revoked on exit, orphan sweep). It resolves `start .` from
-  `list_projects_and_threads`'s `workspaceRoot`, sends a fresh `clientRequestId`
-  with each start and send, and loops `wait_for_thread` in 30 s slices for
+  `list_projects_and_threads`'s `workspaceRoot` over every project page, sends a
+  `clientRequestId` with each start and send (`--request-id`, else made up, and
+  reported as `requestId`), and loops `wait_for_thread` in 30 s slices for
   `--wait`.
 
 ## Targeted Activity cancellation flow

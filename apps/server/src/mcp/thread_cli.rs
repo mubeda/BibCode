@@ -17,13 +17,16 @@ use tokio_util::sync::CancellationToken;
 
 use super::relay::{Connection, RelayOptions};
 
-/// The credential's row in Authorized clients.
-const LABEL: &str = "MCP · bibcode thread";
+/// The credential's row in Authorized clients. Every run of the CLI mints a credential of its
+/// own, so the server keeps the `clientRequestId`s of all of them in one scope.
+pub(crate) const LABEL: &str = "MCP · bibcode thread";
 /// One `wait_for_thread` call under `--wait`; a slice that times out is followed by another.
 pub(crate) const WAIT_SLICE_MS: u64 = 30_000;
 const STOPPED_WAITING: &str =
     "Stopped waiting; the work goes on in BiBCode. Run `bibcode thread show` to check on it.";
 const INTERRUPTED: &str = "Interrupted; whatever BiBCode already accepted goes on.";
+/// Pages of `list_projects_and_threads` that one command reads before it gives up.
+const MOST_PAGES: usize = 50;
 /// Store hiccups in a row that a wait repeats, a second apart, before it gives up.
 const MOST_TRANSIENT: u32 = 3;
 
@@ -60,6 +63,11 @@ pub enum ThreadCommand {
         /// Wait until the turn settles or needs a person, and print its reply.
         #[arg(long)]
         wait: bool,
+        /// An id for this request, 1 to 256 characters; one is made up unless set. After an
+        /// interrupted run, the same command with the id it printed does not start a second
+        /// thread.
+        #[arg(long, value_name = "ID", value_parser = request_id)]
+        request_id: Option<String>,
     },
     /// Send a message to a thread. It queues behind a running turn and never interrupts it.
     Send {
@@ -70,12 +78,47 @@ pub enum ThreadCommand {
         /// Wait until its turn settles or needs a person, and print its reply.
         #[arg(long)]
         wait: bool,
+        /// An id for this request, 1 to 256 characters; one is made up unless set. After an
+        /// interrupted run, the same command with the id it printed does not send twice.
+        #[arg(long, value_name = "ID", value_parser = request_id)]
+        request_id: Option<String>,
     },
     /// Show a thread's status and its latest messages.
     Show {
         /// A thread id, as `list` prints it.
         thread: String,
     },
+}
+
+/// The most characters of a `clientRequestId`, as the server takes it.
+const MOST_REQUEST_ID_BYTES: usize = 256;
+
+fn request_id(text: &str) -> Result<String, String> {
+    if text.is_empty() || text.len() > MOST_REQUEST_ID_BYTES {
+        return Err(format!(
+            "an id of 1 to {MOST_REQUEST_ID_BYTES} characters, not {}",
+            text.len()
+        ));
+    }
+    Ok(text.to_owned())
+}
+
+impl ThreadCommand {
+    /// The id this `start` or `send` carries as its `clientRequestId`, once it has one.
+    fn request_id(&self) -> Option<&str> {
+        match self {
+            Self::Start { request_id, .. } | Self::Send { request_id, .. } => request_id.as_deref(),
+            Self::List | Self::Show { .. } => None,
+        }
+    }
+
+    /// This command with a request id of its own made up, unless it has one.
+    fn with_request_id(mut self) -> Self {
+        if let Self::Start { request_id, .. } | Self::Send { request_id, .. } = &mut self {
+            request_id.get_or_insert_with(|| uuid::Uuid::new_v4().to_string());
+        }
+        self
+    }
 }
 
 /// What a subcommand calls: one tool's `result`, a tool failure included, or why the call
@@ -134,8 +177,9 @@ pub(crate) async fn run(
     err: &mut impl Write,
     interrupt: impl Future<Output = ()> + Send + 'static,
 ) -> i32 {
-    let report = match message_of(&args.command, stdin) {
-        Err(error) => failure(&args.command, error),
+    let command = args.command.with_request_id();
+    let report = match message_of(&command, stdin) {
+        Err(error) => failure(&command, error),
         Ok(message) => {
             let stop = CancellationToken::new();
             let watcher = tokio::spawn({
@@ -145,7 +189,7 @@ pub(crate) async fn run(
                     stop.cancel();
                 }
             });
-            let report = connect_and_execute(options, &args.command, message, cwd, &stop).await;
+            let report = connect_and_execute(options, &command, message, cwd, &stop).await;
             watcher.abort();
             report
         }
@@ -173,13 +217,23 @@ async fn connect_and_execute(
         },
         Err(error) => return failure(command, error),
     };
-    let report = tokio::select! {
-        biased;
-        report = execute(command, message, &remote, cwd, stop) => report,
-        () = stop.cancelled() => failure(command, INTERRUPTED.to_owned()),
-    };
+    let report = until_stopped(command, stop, execute(command, message, &remote, cwd, stop)).await;
     remote.connection.revoke().await;
     report
+}
+
+/// `work`, or, when `stop` comes first, the interruption: a `start` or `send` that was
+/// under way may have been accepted, so its report names the request id to finish it with.
+async fn until_stopped(
+    command: &ThreadCommand,
+    stop: &CancellationToken,
+    work: impl Future<Output = Report>,
+) -> Report {
+    tokio::select! {
+        biased;
+        report = work => report,
+        () = stop.cancelled() => unknown_outcome(command, INTERRUPTED.to_owned()),
+    }
 }
 
 fn print(report: &Report, json: bool, out: &mut impl Write, err: &mut impl Write) {
@@ -190,8 +244,8 @@ fn print(report: &Report, json: bool, out: &mut impl Write, err: &mut impl Write
             let _ = writeln!(out, "{line}");
         }
     }
-    if let Some(note) = &report.note {
-        let _ = writeln!(err, "bibcode: {note}");
+    for line in report.note.iter().flat_map(|note| note.lines()) {
+        let _ = writeln!(err, "bibcode: {line}");
     }
     let _ = out.flush();
 }
@@ -258,10 +312,8 @@ pub(crate) fn project_for(cwd: &Path, projects: &[Value]) -> Result<String, Stri
 fn failure(command: &ThreadCommand, error: String) -> Report {
     let json = match command {
         ThreadCommand::Start { .. } | ThreadCommand::Send { .. } => turn_json(
-            &Value::Null,
-            &Value::Null,
-            &Value::Null,
-            &Value::Null,
+            [&Value::Null; 4],
+            &command.request_id().into(),
             Some(&error),
         ),
         ThreadCommand::List | ThreadCommand::Show { .. } => json!({ "error": error }),
@@ -274,11 +326,23 @@ fn failure(command: &ThreadCommand, error: String) -> Report {
     }
 }
 
+/// A failure of a `start` or `send` whose request BiBCode may have accepted: the report
+/// names the request id and says how to finish it without repeating it.
+fn unknown_outcome(command: &ThreadCommand, error: String) -> Report {
+    let mut report = failure(command, error);
+    if let (Some(id), Some(note)) = (command.request_id(), &mut report.note) {
+        note.push_str(&format!(
+            "\nRun the same command with --request-id {id} to finish it without repeating it."
+        ));
+    }
+    report
+}
+
+/// The document `start` and `send` print: `[threadId, messageId, status, reply]`, the id of
+/// the request, and the error.
 fn turn_json(
-    thread_id: &Value,
-    message_id: &Value,
-    status: &Value,
-    reply: &Value,
+    [thread_id, message_id, status, reply]: [&Value; 4],
+    request_id: &Value,
     error: Option<&str>,
 ) -> Value {
     json!({
@@ -286,6 +350,7 @@ fn turn_json(
         "messageId": message_id,
         "status": status,
         "reply": reply,
+        "requestId": request_id,
         "error": error,
     })
 }
@@ -318,6 +383,8 @@ pub(crate) async fn execute(
     cwd: &Path,
     stop: &CancellationToken,
 ) -> Report {
+    let command = &command.clone().with_request_id();
+    let request_id = command.request_id().unwrap_or_default();
     let outcome = match command {
         ThreadCommand::List => list(tools).await,
         ThreadCommand::Show { thread } => show(tools, thread).await,
@@ -334,23 +401,31 @@ pub(crate) async fn execute(
                 cwd,
                 project,
                 message.unwrap_or_default(),
-                title.as_deref(),
-                provider.as_deref(),
-                model.as_deref(),
+                [title.as_deref(), provider.as_deref(), model.as_deref()],
+                request_id,
             )
             .await;
             return match started {
-                Err(error) => failure(command, error),
+                Err(Failed { error, unknown }) => {
+                    if unknown {
+                        unknown_outcome(command, error)
+                    } else {
+                        failure(command, error)
+                    }
+                }
                 Ok((thread_id, message_id)) if *wait => {
-                    wait_for(tools, &thread_id, &message_id, stop).await
+                    wait_for(tools, &thread_id, &message_id, request_id, stop).await
                 }
                 Ok((thread_id, message_id)) => Report {
                     code: 0,
                     json: turn_json(
-                        &thread_id.as_str().into(),
-                        &message_id.as_str().into(),
-                        &"started".into(),
-                        &Value::Null,
+                        [
+                            &thread_id.as_str().into(),
+                            &message_id.as_str().into(),
+                            &"started".into(),
+                            &Value::Null,
+                        ],
+                        &request_id.into(),
                         None,
                     ),
                     text: vec![format!(
@@ -361,22 +436,28 @@ pub(crate) async fn execute(
             };
         }
         ThreadCommand::Send { thread, wait, .. } => {
-            let sent = tool(
+            let sent = mutate(
                 tools,
                 "send_message",
                 json!({
                     "threadId": thread,
                     "text": message.unwrap_or_default(),
-                    "clientRequestId": uuid::Uuid::new_v4().to_string(),
+                    "clientRequestId": request_id,
                 }),
             )
             .await;
             return match sent {
-                Err(error) => failure(command, error),
+                Err(Failed { error, unknown }) => {
+                    if unknown {
+                        unknown_outcome(command, error)
+                    } else {
+                        failure(command, error)
+                    }
+                }
                 Ok(sent) => {
                     let message_id = sent["messageId"].as_str().unwrap_or_default().to_owned();
                     if *wait {
-                        wait_for(tools, thread, &message_id, stop).await
+                        wait_for(tools, thread, &message_id, request_id, stop).await
                     } else {
                         let status = if sent["queued"] == true {
                             "queued"
@@ -386,10 +467,13 @@ pub(crate) async fn execute(
                         Report {
                             code: 0,
                             json: turn_json(
-                                &thread.as_str().into(),
-                                &message_id.as_str().into(),
-                                &status.into(),
-                                &Value::Null,
+                                [
+                                    &thread.as_str().into(),
+                                    &message_id.as_str().into(),
+                                    &status.into(),
+                                    &Value::Null,
+                                ],
+                                &request_id.into(),
                                 None,
                             ),
                             text: vec![format!(
@@ -406,7 +490,7 @@ pub(crate) async fn execute(
 }
 
 async fn list(tools: &impl Tools) -> Result<Report, String> {
-    let listed = tool(tools, "list_projects_and_threads", json!({ "limit": 200 })).await?;
+    let listed = list_all(tools, true).await?;
     let mut text = Vec::new();
     let threads = listed["threads"].as_array().cloned().unwrap_or_default();
     for project in listed["projects"].as_array().into_iter().flatten() {
@@ -469,8 +553,78 @@ async fn show(tools: &impl Tools, thread: &str) -> Result<Report, String> {
     })
 }
 
+/// Every project, and with `threads` every thread, of `list_projects_and_threads`: a result
+/// cut to fit continues in a second page, so the match for `.` and the listing read all of
+/// them. The projects and the threads have a cursor each; a page that continues only one of
+/// them returns only that one. The merged document has the shape of one page, nothing cut.
+async fn list_all(tools: &impl Tools, threads: bool) -> Result<Value, String> {
+    let mut merged = Value::Null;
+    let (mut cursor, mut project_cursor) = (None::<String>, None::<String>);
+    for _ in 0..MOST_PAGES {
+        let mut arguments = json!({ "limit": if threads { 200 } else { 1 } });
+        if let Some(cursor) = &cursor {
+            arguments["cursor"] = cursor.as_str().into();
+        }
+        if let Some(cursor) = &project_cursor {
+            arguments["projectCursor"] = cursor.as_str().into();
+        }
+        let mut page = tool(tools, "list_projects_and_threads", arguments).await?;
+        cursor = page["nextCursor"]
+            .as_str()
+            .filter(|_| threads)
+            .map(str::to_owned);
+        project_cursor = page["nextProjectCursor"].as_str().map(str::to_owned);
+        if merged.is_null() {
+            merged = page;
+        } else {
+            for key in ["projects", "threads"] {
+                let more = page[key].as_array_mut().map(std::mem::take);
+                if let Some(Value::Array(all)) = merged.get_mut(key) {
+                    all.extend(more.into_iter().flatten());
+                }
+            }
+        }
+        if cursor.is_none() && project_cursor.is_none() {
+            if let Some(merged) = merged.as_object_mut() {
+                merged.remove("truncated");
+                merged.remove("nextProjectCursor");
+                merged.insert("nextCursor".to_owned(), Value::Null);
+            }
+            return Ok(merged);
+        }
+    }
+    Err(format!(
+        "BiBCode lists more than {MOST_PAGES} pages of projects and threads; name a project by its id."
+    ))
+}
+
 fn field(value: &Value) -> &str {
     value.as_str().unwrap_or("-")
+}
+
+/// Why a `start` or `send` did not happen, or may not have: `unknown` when its call went
+/// out and no answer came back, so BiBCode may have accepted it.
+struct Failed {
+    error: String,
+    unknown: bool,
+}
+
+impl From<String> for Failed {
+    fn from(error: String) -> Self {
+        Self {
+            error,
+            unknown: false,
+        }
+    }
+}
+
+/// [`tool`] for a call that changes something, which says when its outcome is unknown.
+async fn mutate(tools: &impl Tools, name: &str, arguments: Value) -> Result<Value, Failed> {
+    let result = tools.call(name, arguments).await.map_err(|error| Failed {
+        error,
+        unknown: true,
+    })?;
+    structured(result).map_err(Failed::from)
 }
 
 async fn start(
@@ -478,12 +632,11 @@ async fn start(
     cwd: &Path,
     project: &str,
     message: String,
-    title: Option<&str>,
-    provider: Option<&str>,
-    model: Option<&str>,
-) -> Result<(String, String), String> {
+    [title, provider, model]: [Option<&str>; 3],
+    request_id: &str,
+) -> Result<(String, String), Failed> {
     let project_id = if project == "." {
-        let listed = tool(tools, "list_projects_and_threads", json!({ "limit": 1 })).await?;
+        let listed = list_all(tools, false).await?;
         project_for(
             cwd,
             listed["projects"].as_array().map_or(&[][..], Vec::as_slice),
@@ -494,7 +647,7 @@ async fn start(
     let mut arguments = json!({
         "projectId": project_id,
         "prompt": message,
-        "clientRequestId": uuid::Uuid::new_v4().to_string(),
+        "clientRequestId": request_id,
     });
     for (key, value) in [
         ("title", title),
@@ -505,10 +658,10 @@ async fn start(
             arguments[key] = value.into();
         }
     }
-    let started = tool(tools, "start_thread", arguments).await?;
+    let started = mutate(tools, "start_thread", arguments).await?;
     match (started["threadId"].as_str(), started["messageId"].as_str()) {
         (Some(thread_id), Some(message_id)) => Ok((thread_id.to_owned(), message_id.to_owned())),
-        _ => Err("BiBCode started no thread.".to_owned()),
+        _ => Err("BiBCode started no thread.".to_owned().into()),
     }
 }
 
@@ -519,13 +672,19 @@ async fn wait_for(
     tools: &impl Tools,
     thread_id: &str,
     message_id: &str,
+    request_id: &str,
     stop: &CancellationToken,
 ) -> Report {
     let ids = (Value::from(thread_id), Value::from(message_id));
+    let request_id = Value::from(request_id);
     let mut status = Value::Null;
     let ended = |status: &Value, error: String| Report {
         code: 1,
-        json: turn_json(&ids.0, &ids.1, status, &Value::Null, Some(&error)),
+        json: turn_json(
+            [&ids.0, &ids.1, status, &Value::Null],
+            &request_id,
+            Some(&error),
+        ),
         text: Vec::new(),
         note: Some(error),
     };
@@ -592,7 +751,11 @@ async fn wait_for(
     let error = (code == 1).then(|| note.clone()).flatten();
     Report {
         code,
-        json: turn_json(&ids.0, &ids.1, &status, &reply, error.as_deref()),
+        json: turn_json(
+            [&ids.0, &ids.1, &status, &reply],
+            &request_id,
+            error.as_deref(),
+        ),
         text: reply
             .as_str()
             .map(|text| vec![text.to_owned()])

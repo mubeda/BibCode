@@ -773,6 +773,8 @@ mod tests {
             "thread-1",
             "-",
             "--wait",
+            "--request-id",
+            "req-1",
             "--json",
             "--base-dir",
             "/data root",
@@ -787,6 +789,7 @@ mod tests {
             thread,
             message,
             wait,
+            request_id,
         } = cli.args.command
         else {
             panic!("a send");
@@ -795,6 +798,7 @@ mod tests {
             (thread.as_str(), message.as_str(), wait),
             ("thread-1", "-", true)
         );
+        assert_eq!(request_id.as_deref(), Some("req-1"));
         assert!(DesktopThreadCli::try_parse_from(["thread", "send", "thread-1"]).is_err());
     }
 

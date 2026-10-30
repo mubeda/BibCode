@@ -86,6 +86,7 @@ fn start(project: &str, wait: bool) -> ThreadCommand {
         provider: None,
         model: None,
         wait,
+        request_id: Some("req-1".into()),
     }
 }
 
@@ -131,6 +132,8 @@ fn every_subcommand_and_flag_parses() {
         "--model",
         "gpt-5",
         "--wait",
+        "--request-id",
+        "req-9",
         "--json",
     ]);
     assert_eq!(options.root.requested, root.path());
@@ -143,6 +146,7 @@ fn every_subcommand_and_flag_parses() {
         provider,
         model,
         wait,
+        request_id,
     } = args.command
     else {
         panic!("a start");
@@ -152,12 +156,13 @@ fn every_subcommand_and_flag_parses() {
     assert_eq!(provider.as_deref(), Some("codex"));
     assert_eq!(model.as_deref(), Some("gpt-5"));
     assert!(wait);
+    assert_eq!(request_id.as_deref(), Some("req-9"));
 
     let (_, args) = parse(&["bibcode", "thread", "--json", "send", "thread-1", "hi"]);
     assert!(args.json, "--json before the subcommand");
     assert!(matches!(
         args.command,
-        ThreadCommand::Send { ref thread, ref message, wait: false } if thread == "thread-1" && message == "hi"
+        ThreadCommand::Send { ref thread, ref message, wait: false, request_id: None } if thread == "thread-1" && message == "hi"
     ));
     let (_, args) = parse(&["bibcode", "thread", "list"]);
     assert!(!args.json && matches!(args.command, ThreadCommand::List));
@@ -266,7 +271,7 @@ async fn json_has_one_shape_on_success_and_on_failure() {
     assert_eq!(report.code, 0);
     assert_eq!(
         report.json,
-        json!({ "threadId": "thread-1", "messageId": "message-1", "status": "completed", "reply": "Hello.", "error": null })
+        json!({ "threadId": "thread-1", "messageId": "message-1", "status": "completed", "reply": "Hello.", "requestId": "req-1", "error": null })
     );
     assert_eq!(report.text, vec!["Hello."]);
 
@@ -278,7 +283,7 @@ async fn json_has_one_shape_on_success_and_on_failure() {
     assert_eq!(report.code, 1);
     assert_eq!(
         report.json,
-        json!({ "threadId": null, "messageId": null, "status": null, "reply": null, "error": "No project nope." })
+        json!({ "threadId": null, "messageId": null, "status": null, "reply": null, "requestId": "req-1", "error": "No project nope." })
     );
 
     let tools = Scripted::new(vec![
@@ -289,7 +294,7 @@ async fn json_has_one_shape_on_success_and_on_failure() {
     assert_eq!(report.code, 1);
     assert_eq!(
         report.json,
-        json!({ "threadId": "thread-1", "messageId": "message-1", "status": null, "reply": null, "error": "BiBCode is not reachable." }),
+        json!({ "threadId": "thread-1", "messageId": "message-1", "status": null, "reply": null, "requestId": "req-1", "error": "BiBCode is not reachable." }),
         "a failure after the start keeps its ids"
     );
 
@@ -298,7 +303,7 @@ async fn json_has_one_shape_on_success_and_on_failure() {
     assert_eq!(report.code, 0);
     assert_eq!(
         report.json,
-        json!({ "threadId": "thread-1", "messageId": "message-1", "status": "started", "reply": null, "error": null })
+        json!({ "threadId": "thread-1", "messageId": "message-1", "status": "started", "reply": null, "requestId": "req-1", "error": null })
     );
 }
 
@@ -323,6 +328,7 @@ async fn exit_codes_say_success_failure_or_a_person_must_answer() {
             thread: "thread-1".into(),
             message: "next".into(),
             wait: true,
+            request_id: Some("req-1".into()),
         };
         let report = execute_now(&command, &tools).await;
         assert_eq!(report.code, code, "{status}: {report:?}");
@@ -356,6 +362,7 @@ async fn wait_calls_the_tool_in_30_second_slices_and_never_interrupts() {
         thread: "thread-1".into(),
         message: "next".into(),
         wait: true,
+        request_id: Some("req-1".into()),
     };
     tokio::time::pause();
     let report = execute_now(&command, &tools).await;
@@ -391,7 +398,7 @@ impl Tools for Slow {
 #[tokio::test]
 async fn stopping_a_wait_leaves_the_work_running_and_exits_1() {
     let stop = CancellationToken::new();
-    let waiting = wait_for(&Slow, "thread-1", "message-1", &stop);
+    let waiting = wait_for(&Slow, "thread-1", "message-1", "req-1", &stop);
     let stopper = async {
         tokio::time::sleep(Duration::from_millis(50)).await;
         stop.cancel();
@@ -442,6 +449,7 @@ fn a_dash_reads_the_message_from_standard_input() {
         thread: "thread-1".into(),
         message: message.into(),
         wait: false,
+        request_id: None,
     };
     assert_eq!(
         message_of(&send("-"), std::io::Cursor::new("line one\nline two\n")).unwrap(),
@@ -759,6 +767,370 @@ async fn start_send_and_show_against_a_real_server() {
             .iter()
             .all(|(_, revoked)| *revoked)
     );
+    server.shutdown();
+    server.join().await.expect("server joins");
+}
+
+/// Creates a project, `created` seconds into the test's day.
+async fn create_project(server: &ServerHandle, id: &str, title: &str, root: &Path, created: u32) {
+    server
+        .orchestration_for_test()
+        .expect("engine")
+        .dispatch(
+            serde_json::from_value(json!({
+                "type": "project.create", "commandId": format!("project-{id}"), "projectId": id,
+                "title": title, "workspaceRoot": root,
+                "defaultModelSelection": { "instanceId": "codex", "model": "gpt-5" },
+                "createdAt": format!("2026-10-30T00:{:02}:{:02}.000Z", created / 60, created % 60),
+            }))
+            .expect("command"),
+        )
+        .await
+        .expect("project");
+}
+
+/// The project list is cut to fit one result, so the nested project that holds the current
+/// folder is on a later page; `start .` and `list` read every page.
+#[tokio::test]
+async fn dot_and_list_read_every_page_of_projects() {
+    let root = tempfile::tempdir().expect("root");
+    let server = start_server(root.path(), &root.path().join("no-such-codex")).await;
+    let cwd = project(&server, root.path()).await;
+    for index in 0..59 {
+        let folder = root.path().join(format!("filler-{index:02}"));
+        std::fs::create_dir_all(&folder).unwrap();
+        let title = format!("{index:02} {}", "t".repeat(2_000));
+        let id = format!("filler-{index:02}");
+        create_project(&server, &id, &title, &folder, 60 + index).await;
+    }
+    create_project(&server, "nested", "Nested", &cwd, 200).await;
+
+    let started = run_in(root.path(), &cwd, &["start", ".", "hi", "--json"], "").await;
+    assert_eq!(started.code, 0, "{} {}", started.out, started.err);
+    let thread = started.json()["threadId"].as_str().unwrap().to_owned();
+
+    let listed = run_in(root.path(), &cwd, &["list", "--json"], "").await;
+    assert_eq!(listed.code, 0, "{}", listed.err);
+    let listed = listed.json();
+    assert_eq!(
+        listed["projects"].as_array().unwrap().len(),
+        61,
+        "every project, once"
+    );
+    assert!(listed["truncated"].is_null() && listed["nextCursor"].is_null());
+    let thread = listed["threads"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|candidate| candidate["threadId"] == thread.as_str())
+        .expect("the started thread is listed");
+    assert_eq!(
+        thread["projectId"], "nested",
+        "the deepest project holds src"
+    );
+    server.shutdown();
+    server.join().await.expect("server joins");
+}
+
+fn page(projects: &[&str], threads: &[&str], cursor: Option<&str>, project: Option<&str>) -> Value {
+    json!({
+        "projects": projects.iter().map(|id| json!({ "projectId": id, "workspaceRoot": "/x" })).collect::<Vec<_>>(),
+        "threads": threads.iter().map(|id| json!({ "threadId": id, "projectId": "a" })).collect::<Vec<_>>(),
+        "threadCount": 3, "projectCount": 3, "truncated": true,
+        "nextCursor": cursor, "nextProjectCursor": project,
+    })
+}
+
+#[tokio::test]
+async fn list_follows_both_cursors_into_one_document() {
+    let tools = Scripted::new(vec![
+        (
+            "list_projects_and_threads",
+            ok(page(&["a"], &["t1"], Some("t:1"), Some("p:1"))),
+        ),
+        (
+            "list_projects_and_threads",
+            ok(page(&["b"], &["t2"], Some("t:2"), Some("p:2"))),
+        ),
+        (
+            "list_projects_and_threads",
+            ok(page(&["c"], &["th3"], None, Some("p:3"))),
+        ),
+        (
+            "list_projects_and_threads",
+            ok(page(&["d"], &[], None, None)),
+        ),
+    ]);
+    let report = list(&tools).await.expect("a listing");
+    let ids = |key: &str, id: &str| -> Vec<String> {
+        report.json[key]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry[id].as_str().unwrap().to_owned())
+            .collect()
+    };
+    assert_eq!(ids("projects", "projectId"), ["a", "b", "c", "d"]);
+    assert_eq!(ids("threads", "threadId"), ["t1", "t2", "th3"]);
+    assert!(report.json["truncated"].is_null() && report.json["nextCursor"].is_null());
+    let calls = tools.calls();
+    assert_eq!(calls[0].1, json!({ "limit": 200 }));
+    assert_eq!(
+        calls[1].1,
+        json!({ "limit": 200, "cursor": "t:1", "projectCursor": "p:1" })
+    );
+    // Once the threads are read, the projects continue alone.
+    assert_eq!(calls[3].1, json!({ "limit": 200, "projectCursor": "p:3" }));
+}
+
+#[tokio::test]
+async fn dot_reads_only_the_project_pages_and_stops_at_a_bound() {
+    let tools = Scripted::new(vec![
+        (
+            "list_projects_and_threads",
+            ok(page(&["outer"], &["t1"], Some("t:1"), Some("p:1"))),
+        ),
+        (
+            "list_projects_and_threads",
+            ok(page(&["inner"], &[], None, None)),
+        ),
+    ]);
+    let listed = list_all(&tools, false).await.expect("projects");
+    assert_eq!(listed["projects"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        tools.calls()[1].1,
+        json!({ "limit": 1, "projectCursor": "p:1" }),
+        "the thread cursor is not followed"
+    );
+
+    let endless = (0..MOST_PAGES)
+        .map(|_| {
+            (
+                "list_projects_and_threads",
+                ok(page(&["a"], &[], None, Some("p:1"))),
+            )
+        })
+        .collect();
+    let tools = Scripted::new(endless);
+    let error = list_all(&tools, false).await.unwrap_err();
+    assert!(error.contains("more than 50 pages"), "{error}");
+    assert_eq!(tools.calls().len(), MOST_PAGES);
+}
+
+fn send(request_id: Option<&str>) -> ThreadCommand {
+    ThreadCommand::Send {
+        thread: "thread-1".into(),
+        message: "next".into(),
+        wait: false,
+        request_id: request_id.map(str::to_owned),
+    }
+}
+
+#[tokio::test]
+async fn the_request_id_is_the_client_request_id_and_is_reported() {
+    let tools = Scripted::new(vec![("start_thread", started())]);
+    let report = execute_now(&start("p1", false), &tools).await;
+    assert_eq!(tools.calls()[0].1["clientRequestId"], "req-1");
+    assert_eq!(report.json["requestId"], "req-1");
+
+    // Without one, a request id is made up, and it is the one reported.
+    let tools = Scripted::new(vec![(
+        "send_message",
+        ok(json!({ "threadId": "thread-1", "messageId": "message-1", "queued": false })),
+    )]);
+    let report = execute_now(&send(None), &tools).await;
+    let made_up = tools.calls()[0].1["clientRequestId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(report.json["requestId"], made_up.as_str());
+    assert!(!made_up.is_empty());
+}
+
+#[tokio::test]
+async fn an_unknown_outcome_names_the_request_id_and_a_refusal_does_not() {
+    for command in [start("p1", false), send(Some("req-1"))] {
+        let name = if matches!(command, ThreadCommand::Start { .. }) {
+            "start_thread"
+        } else {
+            "send_message"
+        };
+        let tools = Scripted::new(vec![(name, Err("BiBCode is not reachable.".into()))]);
+        let report = execute_now(&command, &tools).await;
+        assert_eq!(report.code, 1);
+        assert_eq!(report.json["requestId"], "req-1");
+        assert_eq!(report.json["error"], "BiBCode is not reachable.");
+        let note = report.note.unwrap();
+        assert!(
+            note.ends_with(
+                "Run the same command with --request-id req-1 to finish it without repeating it."
+            ),
+            "{note}"
+        );
+
+        let tools = Scripted::new(vec![(name, tool_error("McpProjectNotFoundError", "No."))]);
+        let report = execute_now(&command, &tools).await;
+        assert_eq!(report.json["requestId"], "req-1");
+        assert_eq!(
+            report.note.as_deref(),
+            Some("No."),
+            "a refusal changed nothing"
+        );
+    }
+}
+
+/// A start whose answer never comes.
+struct Silent;
+
+impl Tools for Silent {
+    async fn call(&self, name: &str, _arguments: Value) -> Result<Value, String> {
+        assert_eq!(name, "start_thread");
+        std::future::pending().await
+    }
+}
+
+#[tokio::test]
+async fn an_interrupted_start_names_the_request_id() {
+    let command = start("p1", false);
+    let stop = CancellationToken::new();
+    let work = execute(&command, Some("hi".into()), &Silent, Path::new("."), &stop);
+    let stopper = async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        stop.cancel();
+    };
+    let (report, ()) = tokio::join!(until_stopped(&command, &stop, work), stopper);
+    assert_eq!(report.code, 1);
+    assert_eq!(report.json["requestId"], "req-1");
+    assert_eq!(report.json["threadId"], Value::Null);
+    let note = report.note.unwrap();
+    assert!(note.starts_with(INTERRUPTED), "{note}");
+    assert!(note.contains("--request-id req-1"), "{note}");
+}
+
+#[test]
+fn a_request_id_is_one_to_256_characters() {
+    for bad in [String::new(), "x".repeat(257)] {
+        let argv = [
+            "bibcode",
+            "thread",
+            "send",
+            "thread-1",
+            "hi",
+            "--request-id",
+            &bad,
+        ];
+        assert!(
+            crate::Cli::try_parse_from(argv).is_err(),
+            "{} characters",
+            bad.len()
+        );
+    }
+    let longest = "x".repeat(256);
+    let argv = [
+        "bibcode",
+        "thread",
+        "send",
+        "thread-1",
+        "hi",
+        "--request-id",
+        &longest,
+    ];
+    assert!(crate::Cli::try_parse_from(argv).is_ok());
+    let argv = [
+        "bibcode",
+        "thread",
+        "start",
+        "p1",
+        "hi",
+        "--request-id",
+        "r",
+    ];
+    assert!(crate::Cli::try_parse_from(argv).is_ok());
+    let argv = ["bibcode", "thread", "show", "thread-1", "--request-id", "r"];
+    assert!(
+        crate::Cli::try_parse_from(argv).is_err(),
+        "only start and send take one"
+    );
+}
+
+/// Running the same `start` again with the id the first run printed starts nothing: each run
+/// has a credential of its own, and BiBCode replays the request by its id across them.
+#[tokio::test]
+async fn a_start_run_again_with_its_request_id_does_not_start_a_second_thread() {
+    let root = tempfile::tempdir().expect("root");
+    let server = start_server(root.path(), &root.path().join("no-such-codex")).await;
+    let cwd = project(&server, root.path()).await;
+
+    let first = run_in(root.path(), &cwd, &["start", ".", "hi", "--json"], "").await;
+    assert_eq!(first.code, 0, "{} {}", first.out, first.err);
+    let first = first.json();
+    let request_id = first["requestId"]
+        .as_str()
+        .expect("a request id")
+        .to_owned();
+
+    let again = run_in(
+        root.path(),
+        &cwd,
+        &["start", ".", "hi", "--request-id", &request_id, "--json"],
+        "",
+    )
+    .await;
+    assert_eq!(again.code, 0, "{} {}", again.out, again.err);
+    let again = again.json();
+    assert_eq!(again["threadId"], first["threadId"], "{again}");
+    assert_eq!(again["messageId"], first["messageId"], "{again}");
+    assert_eq!(again["requestId"], request_id.as_str());
+
+    let listed = run_in(root.path(), &cwd, &["list", "--json"], "").await;
+    // (The project's own main thread is listed too.)
+    let started_threads = listed.json()["threads"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|thread| thread["title"] == "hi")
+        .count();
+    assert_eq!(started_threads, 1, "{}", listed.out);
+
+    // The same id for another message is refused, not started.
+    let other = run_in(
+        root.path(),
+        &cwd,
+        &[
+            "start",
+            ".",
+            "something else",
+            "--request-id",
+            &request_id,
+            "--json",
+        ],
+        "",
+    )
+    .await;
+    assert_eq!(other.code, 1);
+    assert!(
+        other.json()["error"]
+            .as_str()
+            .unwrap()
+            .contains("different call")
+    );
+
+    // So does a send.
+    let thread = first["threadId"].as_str().unwrap();
+    let args = ["send", thread, "again", "--request-id", "send-1", "--json"];
+    let sent = run_in(root.path(), &cwd, &args, "").await;
+    assert_eq!(sent.code, 0, "{} {}", sent.out, sent.err);
+    let repeated = run_in(root.path(), &cwd, &args, "").await;
+    assert_eq!(repeated.json()["messageId"], sent.json()["messageId"]);
+    let shown = run_in(root.path(), &cwd, &["show", thread, "--json"], "").await;
+    let shown = shown.json();
+    let sends = shown["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["text"] == "again")
+        .count();
+    assert_eq!(sends, 1, "{shown}");
     server.shutdown();
     server.join().await.expect("server joins");
 }
