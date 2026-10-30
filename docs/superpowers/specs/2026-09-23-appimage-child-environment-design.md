@@ -1,6 +1,9 @@
 # AppImage child environment isolation
 
-Status: **Approved by the user on 2026-09-23**.
+Status: **Approved by the user on 2026-09-23**. Amended on 2026-10-30 for
+issue #209: the extracted-AppDir gate derives the root from the running
+executable instead of `APPDIR` (see [Gate and effective
+environment](#gate-and-effective-environment)).
 
 ## Ownership and scope
 
@@ -31,7 +34,7 @@ depend on it.
   for byte intact. This also covers future launcher variables without an
   application release, at the cost of scanning the environment on AppImage
   child spawns.
-- **Restore versus strip:** strip entries rooted in `APPDIR` or absolute paths
+- **Restore versus strip:** strip entries under the gated AppDir root or absolute paths
   with a `.mount_*` component. The launcher keeps no `ORIGINAL_*` copy, so the
   pre-launch environment cannot be restored. Do not invent distribution paths.
 - **Per-child versus process-wide:** change only selected child commands.
@@ -53,11 +56,38 @@ depend on it.
 ## Gate and effective environment
 
 Retain the existing trigger: nonempty `APPIMAGE` and absolute, non-root
-`APPDIR`. Also support manually extracted AppDirs without `APPIMAGE`: require
-the current executable to be under `APPDIR` and `$APPDIR/AppRun` to exist.
-Pass the executable path to the policy for focused positive and negative gate
-tests. Missing executable identity fails closed. A stray `APPDIR=/usr` alone
-must not change a normal installed server's environment.
+`APPDIR` make `APPDIR` the root. Also support manually extracted AppDirs
+without `APPIMAGE`: the root is the directory `<root>` of a current executable
+at `<root>/usr/bin/<name>` when `<root>` is not `/` and `<root>/AppRun` exists.
+`APPDIR` plays no part in this case; once gated it is removed like the other
+launcher markers. Pass the executable path to the policy for focused positive
+and negative gate tests. Missing executable identity fails closed. A stray
+`APPDIR=/usr` alone must not change a normal installed server's environment.
+
+The 2026-10-30 amendment (#209) replaced the original extracted-AppDir rule,
+which required the executable to be under `APPDIR` and `$APPDIR/AppRun` to
+exist. The shipped `apprun-hooks/linuxdeploy-plugin-gtk.sh` keeps an inherited
+`APPDIR`, while `AppRun.wrapped` builds `LD_LIBRARY_PATH` and the other paths
+from its own location. A preset, mismatched `APPDIR`, or a launcher that execs
+`usr/bin/bibcode-desktop` without one, therefore skipped isolation, and system
+Git loaded the bundled `libnghttp2`. Alternatives considered:
+
+- **Trust `APPDIR` versus the executable:** `APPDIR` is inherited state that
+  the hook does not correct; `/proc/self/exe` names the directory whose paths
+  the runtime actually added. Derive the extracted root from the executable.
+- **Fixed layout versus ancestor walk:** walking every ancestor for `AppRun`
+  costs a `stat` per ancestor on each PTY, Git, and provider spawn and could
+  match an unrelated directory. The linuxdeploy layout is fixed, so check
+  only `<root>/usr/bin/<name>`: at most one `stat`, none for an installed
+  `/usr/local/bin` binary.
+- **A second root from a valid `APPDIR`:** stripping both the executable's
+  root and an `APPDIR` naming another AppDir was rejected as speculative; the
+  runtime does not add paths under a stale `APPDIR`.
+- **Removing launcher markers without a root:** always removing `APPDIR`,
+  `APPIMAGE`, `ARGV0`, and `OWD` was rejected; it would change an ordinary
+  installation's children and break the no-op cases above.
+- **Mounted AppImages:** unchanged. `APPIMAGE` with `APPDIR` stays independent
+  of the executable location, and stale `.mount_*` entries are still removed.
 
 Overlay command-local additions and removals on the inherited environment;
 `Cleared` commands never recover ambient values. PTYs use their captured
