@@ -2987,6 +2987,12 @@ in the threads family (`mcp/tools/threads.rs`); its tests are
   fails with `UploadError` `not_found`, which the tool returns as
   `McpAttachmentExpiredError` ("send it again without clientRequestId"). Quota and other
   upload refusals come back as the service's typed `UploadError` with its `reason`.
+- **The 3 MiB cap is not quite reachable.** 3 MiB decoded is exactly 4,194,304 base64
+  characters, and both the `/mcp` body (`MAX_MCP_BODY_BYTES`) and the stdio relay's line
+  (`protocol::MAX_LINE_BYTES`) are 4 MiB including the JSON-RPC envelope. A call within a few
+  KiB of 3 MiB is therefore refused by the transport first, as a JSON-RPC parse error (relay)
+  or a 413 (`/mcp`), not as a typed tool failure. The tool's own check stays at the design's
+  3 MiB; slice Z's docs should say "a little under 3 MiB".
 - **Images.** PNG, JPEG, GIF and WebP go as `image`; any other `image/*` is refused (the
   contract forbids it as a `file`); everything else is a `file`.
 - **An accepted answer can still return a provider error.** The engine records the answer
