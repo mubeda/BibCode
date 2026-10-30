@@ -3215,6 +3215,16 @@ view), or free scrolling.
   end. A takeover, a later send (its glide replaces the landing)
   or another thread (the timeline remounts, and LegendList drops its
   requests) ends the landing; only a takeover needs to withdraw it.
+- **Following without a new entry.** A follow pass runs two frames after new
+  entries render. Rows can also change with no new entry. A row of the
+  anchored turn that grows is followed when the turn's end showed before the
+  growth, so a row expanded away from the end keeps the reader's place. When
+  the latest turn settles, its "Worked for" row arrives above the answer and
+  the work and working rows below it go; those were the rows LegendList held
+  in place, so it holds none and the answer's end can drop out of view.
+  `MessagesTimeline` reports the settled turn (`onTurnSettled`) from a layout
+  effect, after LegendList has taken the new rows, and `ChatView` runs the
+  same follow pass two frames later, unless the reader has taken over.
 - **Scroll keys.** The browser scrolls for a key after the keydown, and WebKit
   can start that scroll several hundred milliseconds later on a busy webview.
   Any scroll the list makes in between cancels it, such as LegendList holding
