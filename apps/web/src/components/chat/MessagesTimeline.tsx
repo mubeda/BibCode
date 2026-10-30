@@ -275,6 +275,11 @@ interface MessagesTimelineProps {
     readonly previous: number;
     readonly size: number;
   }) => void;
+  /**
+   * The latest turn settled: its "Worked for" row arrived and the rows that showed its work went,
+   * with no new entry. Called once the list has taken the new rows.
+   */
+  onTurnSettled?: () => void;
   contentInsetEndAdjustment: number;
   onIsAtEndChange: (isAtEnd: boolean) => void;
   onManualNavigation: () => void;
@@ -337,6 +342,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   onAnchorReady,
   onAnchorSizeChanged,
   onRowSizeChanged,
+  onTurnSettled,
   contentInsetEndAdjustment,
   onIsAtEndChange,
   onManualNavigation,
@@ -577,6 +583,15 @@ export const MessagesTimeline = memo(function MessagesTimeline({
     ],
   );
   const unsettledTurnId = deriveUnsettledTurnId(latestTurn, runningTurnId);
+  // Runs after LegendList's own layout effects have taken the settled turn's rows (#208).
+  const settlingTurnIdRef = useRef(unsettledTurnId);
+  useLayoutEffect(() => {
+    const settled = settlingTurnIdRef.current !== null && unsettledTurnId === null;
+    settlingTurnIdRef.current = unsettledTurnId;
+    if (settled) {
+      onTurnSettled?.();
+    }
+  }, [onTurnSettled, unsettledTurnId]);
   const activityState = useMemo<TimelineRowActivityState>(
     () => ({
       isWorking,

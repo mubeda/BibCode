@@ -2298,6 +2298,72 @@ describe("MessagesTimeline minimap", () => {
 });
 
 describe("MessagesTimeline mounted interactions", () => {
+  it("reports once when the latest turn settles, with no new entry (#208)", async () => {
+    const onTurnSettled = vi.fn();
+    const entries = [
+      buildUserTimelineEntry("Explain this."),
+      buildAssistantTimelineEntry({
+        id: "entry-2",
+        messageId: "message-assistant-1",
+        text: "Here is the answer.",
+        turnId: TURN_ID,
+      }),
+    ];
+    const running = {
+      turnId: TURN_ID,
+      state: "running" as const,
+      startedAt: MESSAGE_CREATED_AT,
+      completedAt: null,
+    };
+    const completed = { ...running, state: "completed" as const, completedAt: LATER_CREATED_AT };
+    const MessagesTimeline = await loadMessagesTimeline();
+    await mountTimeline({
+      timelineEntries: entries,
+      latestTurn: running,
+      runningTurnId: TURN_ID,
+      onTurnSettled,
+    });
+    const mounted = mountedTrees.at(-1)!;
+    const rerender = (props: Partial<MessagesTimelineProps>) =>
+      act(async () =>
+        mounted.root.render(
+          <MessagesTimeline
+            {...buildProps()}
+            timelineEntries={entries}
+            onTurnSettled={onTurnSettled}
+            {...props}
+          />,
+        ),
+      );
+
+    // An entry change while the turn runs is followed as an entry, not as a settled turn.
+    await rerender({ latestTurn: running, runningTurnId: TURN_ID, timelineEntries: [...entries] });
+    expect(onTurnSettled).not.toHaveBeenCalled();
+
+    await rerender({ latestTurn: completed, runningTurnId: null });
+    expect(onTurnSettled).toHaveBeenCalledTimes(1);
+
+    // Still settled: nothing more to report.
+    await rerender({ latestTurn: completed, runningTurnId: null, timelineEntries: [...entries] });
+    expect(onTurnSettled).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not report a turn that was already settled when the timeline mounted (#208)", async () => {
+    const onTurnSettled = vi.fn();
+    await mountTimeline({
+      timelineEntries: [buildUserTimelineEntry("Explain this.")],
+      latestTurn: {
+        turnId: TURN_ID,
+        state: "completed",
+        startedAt: MESSAGE_CREATED_AT,
+        completedAt: LATER_CREATED_AT,
+      },
+      onTurnSettled,
+    });
+
+    expect(onTurnSettled).not.toHaveBeenCalled();
+  });
+
   it("scopes retry and dismiss actions to the affected message", async () => {
     const onResolveTurnDelivery = vi.fn();
     const entry = buildUserTimelineEntry("Send this once.");
