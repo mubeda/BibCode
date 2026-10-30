@@ -145,6 +145,8 @@ export const config = {
   mochaOpts: {
     ui: "bdd",
     timeout: 120_000,
+    // [DEBUG-208]
+    ...(process.env.BIBCODE_E2E_GREP ? { grep: process.env.BIBCODE_E2E_GREP } : {}),
   },
   before: async () => {
     const pluginReady = await browser.execute(() => {

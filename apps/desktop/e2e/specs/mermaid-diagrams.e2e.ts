@@ -1488,7 +1488,9 @@ describe("packaged Mermaid diagrams", () => {
     // the baseline, then as a diagram that draws while the list follows the end and more text
     // streams after it. Each is taller than the timeline before the fence.
     const plain = await streamAndSampleEnd(mermaidFixturePrompts.streamedPlain);
+    await saveDebug208(plain);
     const diagram = await streamAndSampleEnd(mermaidFixturePrompts.streamed);
+    await saveDebug208(diagram);
     NodeFS.writeFileSync(
       NodePath.join(preparedArtifactDirectory, "mermaid-timeline-streaming-follow.json"),
       JSON.stringify(
@@ -2700,6 +2702,56 @@ async function streamAndSampleEnd(prompt: string): Promise<StreamSample[]> {
       record.__bibcodeStreamSamples = samples;
       const started = performance.now();
       let running = true;
+      // [DEBUG-208] the app's follow log and every programmatic scroll of the timeline.
+      const debugWindow = window as unknown as {
+        __bibcodeTimelineDiag?: unknown[];
+        __bibcode208Calls?: unknown[];
+        __bibcode208Started?: number;
+      };
+      debugWindow.__bibcodeTimelineDiag = [];
+      debugWindow.__bibcode208Calls = [];
+      debugWindow.__bibcode208Started = started;
+      const debugScroller = document.querySelector<HTMLElement>(
+        `${surface} [class*='overflow-anchor']`,
+      );
+      if (debugScroller && !(debugScroller as unknown as { __traced?: boolean }).__traced) {
+        (debugScroller as unknown as { __traced?: boolean }).__traced = true;
+        const where = () =>
+          (new Error().stack ?? "")
+            .split("\n")
+            .slice(2, 9)
+            .map((line) => line.trim());
+        const recordCall = (kind: string, value: unknown) =>
+          (debugWindow.__bibcode208Calls ??= []).push({
+            at: Math.round(performance.now()),
+            kind,
+            value,
+            scrollTop: Math.round(debugScroller.scrollTop),
+            scrollHeight: debugScroller.scrollHeight,
+            stack: kind === "scroll-event" ? [] : where(),
+          });
+        for (const method of ["scrollTo", "scrollBy", "scrollIntoView"] as const) {
+          const original = (
+            debugScroller as unknown as Record<string, (...args: unknown[]) => void>
+          )[method]!.bind(debugScroller);
+          (debugScroller as unknown as Record<string, unknown>)[method] = (...args: unknown[]) => {
+            recordCall(method, args);
+            original(...args);
+          };
+        }
+        const topDescriptor = Object.getOwnPropertyDescriptor(Element.prototype, "scrollTop")!;
+        Object.defineProperty(debugScroller, "scrollTop", {
+          configurable: true,
+          get: () => topDescriptor.get!.call(debugScroller),
+          set: (value: number) => {
+            recordCall("scrollTop=", value);
+            topDescriptor.set!.call(debugScroller, value);
+          },
+        });
+        debugScroller.addEventListener("scroll", () => recordCall("scroll-event", null), {
+          passive: true,
+        });
+      }
       // The block this reply streams is the one that was not there before it.
       const blocksBefore = new Set(
         document.querySelectorAll(`${surface} .chat-markdown-codeblock`),
@@ -2830,6 +2882,28 @@ async function streamAndSampleEnd(prompt: string): Promise<StreamSample[]> {
     record.__bibcodeStreamStop?.();
     return record.__bibcodeStreamSamples ?? [];
   });
+}
+
+// [DEBUG-208] writes the app's follow log and the scroll calls for one streamed reply.
+let debug208Count = 0;
+async function saveDebug208(samples: readonly StreamSample[]): Promise<void> {
+  debug208Count += 1;
+  const debug = await browser.execute(() => {
+    const record = window as unknown as {
+      __bibcodeTimelineDiag?: unknown[];
+      __bibcode208Calls?: unknown[];
+      __bibcode208Started?: number;
+    };
+    return {
+      started: record.__bibcode208Started ?? null,
+      diag: record.__bibcodeTimelineDiag ?? [],
+      calls: record.__bibcode208Calls ?? [],
+    };
+  });
+  NodeFS.writeFileSync(
+    NodePath.join(preparedArtifactDirectory, `debug-208-${debug208Count}.json`),
+    JSON.stringify({ ...debug, samples }, null, 1),
+  );
 }
 
 /**
