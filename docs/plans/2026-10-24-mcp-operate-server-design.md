@@ -1265,3 +1265,9 @@ updated on 2026-10-27.
   `reserved` or `prepared` one) still meet the current ceiling, for the command's own
   `runtimeMode` and the thread's; accepted and rejected ones go to the engine's replay, which
   answers as it did the first time.
+- **Every read of a wait is bounded.** `wait_for_thread` awaited the thread lookup, its first
+  read and each re-read outside the select on the deadline, so a stalled store held a call
+  past its 50 s cap, its cancellation and the off switch. The deadline is now set before the
+  lookup, and one stop future (cancellation, shutdown, the setting off, the deadline) races
+  every read. A deadline that passes before the first read answers is `McpStorageError`
+  ("the work goes on. Wait again."); a later one returns the last state read, `timedOut: true`.

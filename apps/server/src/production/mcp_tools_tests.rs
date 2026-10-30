@@ -981,6 +981,101 @@ async fn read_thread_reads_one_page_and_every_character_is_reachable() {
     harness.shutdown().await;
 }
 
+/// Holds the store's one worker until the returned sender is dropped or sent to (at most 10 s).
+async fn stall_the_store(harness: &Harness) -> std::sync::mpsc::Sender<()> {
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    let (started, running) = tokio::sync::oneshot::channel();
+    let database = harness.repositories.database().clone();
+    tokio::spawn(async move {
+        database
+            .call(move |_| {
+                let _ = started.send(());
+                let _ = held.recv_timeout(Duration::from_secs(10));
+                Ok(())
+            })
+            .await
+    });
+    running.await.expect("the stall runs");
+    release
+}
+
+/// The wait's deadline, its cancellation and the off switch hold while a read of the store is
+/// still pending, including the first one.
+#[tokio::test]
+async fn a_stalled_store_never_holds_a_wait_past_its_deadline_or_a_stop() {
+    let harness = Harness::new().await;
+    let (agent, _) = harness.agent(McpAccess::FullAccess).await;
+    let (thread_id, message_id) = start(&harness, &agent, basic_start()).await;
+    let wait = |timeout_ms: u64, cancellation: CancellationToken| {
+        let control = harness.control.clone();
+        let agent = agent.clone();
+        let mut arguments = Map::new();
+        arguments.insert("threadId".into(), json!(thread_id));
+        arguments.insert("messageId".into(), json!(message_id));
+        arguments.insert("timeoutMs".into(), json!(timeout_ms));
+        tokio::spawn(async move {
+            control
+                .call(&agent, "wait_for_thread", &arguments, None, cancellation)
+                .await
+        })
+    };
+    let in_time = Duration::from_secs(3);
+
+    // The deadline.
+    let release = stall_the_store(&harness).await;
+    let started = std::time::Instant::now();
+    let waited = tokio::time::timeout(in_time, wait(300, CancellationToken::new()))
+        .await
+        .expect("the wait ends at its deadline")
+        .unwrap();
+    assert!(started.elapsed() < in_time);
+    assert_eq!(error_tag(&waited), "McpStorageError", "{waited}");
+    drop(release);
+
+    // A cancelled call.
+    let release = stall_the_store(&harness).await;
+    let cancellation = CancellationToken::new();
+    let waiter = wait(20_000, cancellation.clone());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    cancellation.cancel();
+    let waited = tokio::time::timeout(in_time, waiter)
+        .await
+        .expect("a cancelled wait ends")
+        .unwrap();
+    assert_eq!(error_tag(&waited), "McpCancelledError");
+    drop(release);
+
+    // The off switch, while a later read stalls: the first read saw a running turn.
+    harness
+        .provider_turn(&thread_id, "turn-1", "partial", false)
+        .await;
+    let waiter = wait(20_000, CancellationToken::new());
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // An event makes the wait read again 100 ms later; the store stalls before then.
+    harness
+        .engine
+        .dispatch(command(json!({
+            "type": "thread.message.assistant.delta", "commandId": "delta-more",
+            "threadId": thread_id, "messageId": "reply-turn-1", "delta": " more",
+            "turnId": "turn-1", "createdAt": CREATED_AT,
+        })))
+        .await
+        .expect("provider event");
+    let release = stall_the_store(&harness).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    harness.settings.send_replace(McpServerSettings {
+        enabled: false,
+        access: McpAccess::FullAccess,
+    });
+    let waited = tokio::time::timeout(in_time, waiter)
+        .await
+        .expect("turning the server off ends the wait")
+        .unwrap();
+    assert_eq!(error_tag(&waited), "McpServerDisabledError");
+    drop(release);
+    harness.shutdown().await;
+}
+
 /// A page cut to fit the 80 000-character cap names, as its cursor, the oldest message it
 /// returns, so following `nextCursor` reads every message.
 #[tokio::test]
