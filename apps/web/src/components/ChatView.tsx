@@ -4098,6 +4098,7 @@ function ChatViewContent(props: ChatViewProps) {
   // held were the ones that went, and the answer's end can drop out of view (#208). Follow as a
   // new entry does, once the list has laid the new rows out.
   const onTimelineTurnSettled = useCallback(() => {
+    debugTimeline208("turn-settled", { list: debugListSnapshot208(legendListRef.current) });
     requestAnimationFrame(() => {
       requestAnimationFrame(() => followTimelineLiveEndRef.current());
     });
