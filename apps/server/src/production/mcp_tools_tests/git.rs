@@ -189,6 +189,7 @@ impl Fixture {
     }
 
     /// Runs `tool` with `arguments` on its own task under `token`.
+    #[cfg(unix)]
     fn spawn(
         &self,
         tool: &'static str,
@@ -549,6 +550,8 @@ async fn a_refused_remote_delete_is_a_partial_outcome_that_replays_and_recovers(
     // A keyed retry replays the partial: the truth, not a second attempt.
     let replayed = fixture.call("git_delete_branch", arguments).await;
     assert_eq!(error(&replayed), outcome);
+    assert_eq!(branches(&fixture.repo), "main");
+    assert_eq!(branches(&fixture.remote), "feature\nmain");
 
     fixture.remote_git(&["config", "receive.denyDeletes", "false"]);
     let recovered = fixture
