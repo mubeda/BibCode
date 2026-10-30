@@ -4,6 +4,7 @@
 //! Each tool family has its own file; this one holds the shared harness.
 
 mod foundation;
+mod thread_actions;
 mod threads;
 
 use std::{sync::Arc, time::Duration};
@@ -103,17 +104,24 @@ impl Harness {
             router,
         ));
         let mut registry = RpcRegistry::empty();
+        // One upload registry serves `uploads.*` and turn admission, as in production.
+        let uploads = crate::transfer::staging::UploadRegistry::new(
+            state.path().join("uploads"),
+            crate::transfer::staging::UploadLimits::default(),
+            Arc::new(tokio::time::Instant::now),
+        );
         super::orchestration_rpc::register_orchestration_rpc_with_delivery(
             &mut registry,
             engine.clone(),
             provider.clone(),
             state.path().to_path_buf(),
             delivery.clone(),
-            crate::transfer::staging::UploadRegistry::new(
-                state.path().join("uploads"),
-                crate::transfer::staging::UploadLimits::default(),
-                Arc::new(tokio::time::Instant::now),
-            ),
+            uploads.clone(),
+        );
+        super::uploads_rpc::register_uploads_rpc(
+            &mut registry,
+            uploads,
+            state.path().join("pastes"),
         );
         register(&mut registry);
         let repositories = Repositories::new(database);
