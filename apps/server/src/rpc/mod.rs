@@ -29,7 +29,8 @@ pub(crate) use methods::{MethodMutability, method_mutability};
 pub(crate) use session::PairingConfirmationLatch;
 pub(crate) use session::{
     PreparedRpcResponse, RpcResponseEnqueueGuard, RpcResponseEnqueuePermit, RpcSessionContext,
-    RpcUnaryResult, encoded_server_message_len, response_too_large_failure, run_session,
+    RpcUnaryResult, STREAM_ENDED_TAG, StreamOutcome, encoded_server_message_len,
+    response_too_large_failure, run_session,
 };
 pub(crate) use transport::{
     ConnectionLiveness, HeartbeatTiming, MAX_RECORDED_MESSAGE_BYTES, plain_subprotocols,

@@ -25,7 +25,7 @@ pub(crate) use model::Principal;
 pub(crate) use model::STANDARD_SCOPES;
 pub(crate) use model::{
     ACCESS_TOKEN_TYPE, BOOTSTRAP_TOKEN_TYPE, SCOPE_DIAGNOSTICS_READ, SCOPE_ORCHESTRATION_OPERATE,
-    SCOPE_ORCHESTRATION_READ, TOKEN_GRANT_TYPE,
+    SCOPE_ORCHESTRATION_READ, SCOPE_TERMINAL_OPERATE, TOKEN_GRANT_TYPE,
 };
 pub(crate) use pairing_offer::{mint_offline_pairing_offer, validate_pairing_offer_input};
 pub(crate) use rpc::register_rpc_handlers;

@@ -13,6 +13,7 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use super::*;
+use crate::mcp::tools::previews::{TOOL_OPERATIONS, operation_wire_name};
 
 type PreviewCall = (PreviewScope, String, Value, Option<String>);
 
@@ -2095,6 +2096,25 @@ fn device_screenshot_describes_both_image_formats() {
 }
 
 #[test]
+fn every_listed_provider_tool_is_registered_for_providers_only() {
+    use crate::mcp::control::{PrincipalKind, tool_spec, tool_specs};
+    let listed: Vec<String> = tool_descriptors(true)
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap().to_owned())
+        .collect();
+    let registered: Vec<&str> = tool_specs(PrincipalKind::Provider)
+        .map(|spec| spec.name)
+        .collect();
+    assert_eq!(listed, registered);
+    for name in &listed {
+        let spec = tool_spec(PrincipalKind::Provider, name).unwrap();
+        // They wait on a page or an emulator, so `mcp.<name>` is long-running.
+        assert!(spec.long_running, "{name}");
+        assert!(tool_spec(PrincipalKind::Client, name).is_none(), "{name}");
+    }
+}
+
+#[test]
 fn device_open_takes_a_platform_and_an_image() {
     let tools = tool_descriptors(true);
     let open = tools
@@ -2918,6 +2938,7 @@ async fn providers_and_outside_agents_share_mcp_with_separate_tools_and_checks()
         .send_replace(crate::mcp::control::McpServerSettings {
             enabled: false,
             access: crate::mcp::control::McpAccess::FullAccess,
+            ..Default::default()
         });
     let off = body(
         &post(
@@ -2949,6 +2970,7 @@ async fn providers_and_outside_agents_share_mcp_with_separate_tools_and_checks()
         .send_replace(crate::mcp::control::McpServerSettings {
             enabled: true,
             access: crate::mcp::control::McpAccess::FullAccess,
+            ..Default::default()
         });
     let mut again = bearer(&token);
     again.insert(

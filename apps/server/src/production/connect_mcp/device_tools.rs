@@ -58,7 +58,7 @@ impl DeviceTools {
     /// Runs `operation` (the tool name without `device_`) for the thread `scope` names, and
     /// returns the MCP tool result. `cancellation` ends a wait for boot; the device stays
     /// with the manager and keeps booting.
-    pub(super) async fn call(
+    pub(crate) async fn call(
         &self,
         scope: &PreviewScope,
         operation: &str,

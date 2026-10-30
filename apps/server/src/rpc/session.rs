@@ -489,6 +489,139 @@ impl RpcSessionContext {
     }
 }
 
+/// The tag of the error a locally invoked stream returns when it ended before its terminal
+/// event: closed early, cancelled, or past its budget. Under a recorded outcome it is
+/// `unknown`, never success.
+pub(crate) const STREAM_ENDED_TAG: &str = "McpStreamEndedError";
+/// The output lines a locally invoked stream keeps, newest last.
+pub(crate) const STREAM_OUTPUT_EVENTS: usize = 64;
+/// The characters those lines may hold together.
+pub(crate) const STREAM_OUTPUT_CHARS: usize = 16_000;
+
+/// How a stream method reports its end (C3).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StreamSchema {
+    /// `gitManager.runOperation`: `output` lines; `finished` succeeds; `failed` carries `code`
+    /// and `blocked`.
+    GitOperation,
+    /// `git.runStackedAction`: `action_finished` succeeds; `action_failed` carries `phase`;
+    /// the other `action_*`, `phase_*` and `hook_*` kinds are output.
+    StackedAction,
+}
+
+impl StreamSchema {
+    fn of(tag: &str) -> Option<Self> {
+        match tag {
+            "gitManager.runOperation" => Some(Self::GitOperation),
+            "git.runStackedAction" => Some(Self::StackedAction),
+            _ => None,
+        }
+    }
+}
+
+/// What a locally invoked stream ended with.
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct StreamOutcome {
+    /// The success event, as the handler sent it.
+    pub(crate) terminal: Value,
+    /// The newest output lines, oldest first.
+    pub(crate) output: Vec<String>,
+    /// Output lines dropped to stay within the bounds.
+    pub(crate) dropped_output: usize,
+    /// Events of a kind the schema does not know.
+    pub(crate) ignored: usize,
+}
+
+struct StreamCollector {
+    schema: StreamSchema,
+    output: std::collections::VecDeque<String>,
+    chars: usize,
+    dropped: usize,
+    ignored: usize,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl StreamCollector {
+    fn new(schema: StreamSchema) -> Self {
+        Self {
+            schema,
+            output: std::collections::VecDeque::new(),
+            chars: 0,
+            dropped: 0,
+            ignored: 0,
+        }
+    }
+
+    /// Takes one event; `Some` once it is terminal.
+    fn push(&mut self, event: Value) -> Option<Result<StreamOutcome, Value>> {
+        let text = |key: &str| event.get(key).and_then(Value::as_str).unwrap_or_default();
+        match self.schema {
+            StreamSchema::GitOperation => match text("_tag") {
+                "output" => self.line(text("text").to_owned()),
+                "finished" => return Some(Ok(self.finish(event))),
+                "failed" => {
+                    return Some(Err(json!({
+                        "_tag": "GitOperationFailedError",
+                        "message": event.get("message").cloned().unwrap_or_else(|| "The Git operation failed.".into()),
+                        "code": event.get("code").cloned().unwrap_or(Value::Null),
+                        "blocked": event.get("blocked").cloned().unwrap_or(Value::Null),
+                    })));
+                }
+                _ => self.ignored += 1,
+            },
+            StreamSchema::StackedAction => match text("kind") {
+                "action_finished" => return Some(Ok(self.finish(event))),
+                "action_failed" => {
+                    return Some(Err(json!({
+                        "_tag": "GitActionFailedError",
+                        "message": event.get("message").cloned().unwrap_or_else(|| "The Git action failed.".into()),
+                        "phase": event.get("phase").cloned().unwrap_or(Value::Null),
+                    })));
+                }
+                kind @ ("action_started" | "phase_started" | "hook_started" | "hook_output"
+                | "hook_finished") => {
+                    let line = match event.get("text").and_then(Value::as_str) {
+                        Some(text) => text.to_owned(),
+                        None => match event.get("phase").and_then(Value::as_str) {
+                            Some(phase) => format!("{kind} {phase}"),
+                            None => kind.to_owned(),
+                        },
+                    };
+                    self.line(line);
+                }
+                _ => self.ignored += 1,
+            },
+        }
+        None
+    }
+
+    fn line(&mut self, mut line: String) {
+        let count = line.chars().count();
+        if count > STREAM_OUTPUT_CHARS {
+            line = line.chars().skip(count - STREAM_OUTPUT_CHARS).collect();
+        }
+        self.chars += line.chars().count();
+        self.output.push_back(line);
+        while self.output.len() > STREAM_OUTPUT_EVENTS || self.chars > STREAM_OUTPUT_CHARS {
+            let Some(oldest) = self.output.pop_front() else {
+                break;
+            };
+            self.chars -= oldest.chars().count();
+            self.dropped += 1;
+        }
+    }
+
+    fn finish(&mut self, terminal: Value) -> StreamOutcome {
+        StreamOutcome {
+            terminal,
+            output: std::mem::take(&mut self.output).into(),
+            dropped_output: self.dropped,
+            ignored: self.ignored,
+        }
+    }
+}
+
 #[derive(Clone)]
 enum RpcMethod {
     Unary(UnaryHandler),
@@ -651,8 +784,8 @@ impl RpcRegistry {
         self.methods.get(name).cloned()
     }
 
-    /// Runs the unary method `tag` for a caller with no socket (the `/mcp` thread tools), with
-    /// the same checks a WebSocket request gets: the method's declared scope on `context`'s
+    /// Runs the unary method `tag` for a caller with no socket (the `/mcp` tools), with the
+    /// same checks a WebSocket request gets: the method's declared scope on `context`'s
     /// session, then its maintenance admission, then the registered handler and its timing.
     pub(crate) async fn invoke_local(
         &self,
@@ -667,6 +800,80 @@ impl RpcRegistry {
                 "message": format!("Unknown unary RPC method: {tag}"),
             }));
         };
+        let (request, context) = self.admit_local(tag, payload, context).await?;
+        handler(request, context, cancellation).await.result
+    }
+
+    /// Runs the stream method `tag` for a caller with no socket (the `/mcp` git and pull
+    /// request tools, C3) with [`Self::invoke_local`]'s checks, and drains it into a bounded
+    /// collector: the last [`STREAM_OUTPUT_EVENTS`] output lines, at most
+    /// [`STREAM_OUTPUT_CHARS`] characters, and the terminal event. Success and failure come
+    /// from the method's `StreamSchema`, never from "the last chunk": its success event is
+    /// `Ok`, its failure event and an `Err` chunk are `Err`. A stream that ends before a
+    /// terminal event, a cancellation and the `budget` return [`STREAM_ENDED_TAG`]; the last
+    /// two cancel the handler and drop the receiver, as a WebSocket client's disconnect does.
+    /// The maintenance admission is held until the stream ends.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn invoke_local_stream(
+        &self,
+        tag: &str,
+        payload: Value,
+        context: RpcSessionContext,
+        cancellation: CancellationToken,
+        budget: Duration,
+    ) -> Result<StreamOutcome, Value> {
+        let (Some(schema), Some(RpcMethod::Stream(handler))) =
+            (StreamSchema::of(tag), self.get(tag))
+        else {
+            return Err(json!({
+                "_tag": "RpcMethodNotFoundError",
+                "message": format!("No stream RPC method with a known end: {tag}"),
+            }));
+        };
+        let (request, context) = self.admit_local(tag, payload, context).await?;
+        let _admission = context.admission_permit();
+        let handler_cancellation = cancellation.child_token();
+        let mut receiver = handler(request, context, handler_cancellation.clone());
+        let mut collector = StreamCollector::new(schema);
+        let deadline = tokio::time::sleep(budget);
+        tokio::pin!(deadline);
+        let ended = |reason: &str, message: &str| json!({ "_tag": STREAM_ENDED_TAG, "message": message, "reason": reason });
+        loop {
+            tokio::select! {
+                biased;
+                () = cancellation.cancelled() => {
+                    handler_cancellation.cancel();
+                    return Err(ended("cancelled", "The operation was stopped before it reported a result."));
+                }
+                () = &mut deadline => {
+                    handler_cancellation.cancel();
+                    return Err(ended("budget", "The operation did not report a result in time."));
+                }
+                chunk = receiver.recv() => match chunk {
+                    None => {
+                        return Err(ended("closed", "The operation's stream ended before it reported a result."));
+                    }
+                    Some(Err(error)) => return Err(error),
+                    Some(Ok(items)) => {
+                        for item in items {
+                            if let Some(end) = collector.push(item) {
+                                return end;
+                            }
+                        }
+                    }
+                },
+            }
+        }
+    }
+
+    /// The declared scope on `context`'s session, then the maintenance admission, which the
+    /// returned context holds.
+    async fn admit_local(
+        &self,
+        tag: &str,
+        payload: Value,
+        context: RpcSessionContext,
+    ) -> Result<(RpcRequest, RpcSessionContext), Value> {
         if let (Some(principal), Some(auth)) = (&context.principal, &context.auth) {
             let scope = required_scope(tag).ok_or_else(|| {
                 json!({
@@ -702,8 +909,7 @@ impl RpcRegistry {
             span_id: None,
             sampled: None,
         };
-        let context = context.with_admission(admission);
-        handler(request, context, cancellation).await.result
+        Ok((request, context.with_admission(admission)))
     }
 
     pub fn validate_complete(&self) -> Result<(), String> {

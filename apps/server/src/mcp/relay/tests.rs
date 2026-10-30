@@ -204,10 +204,14 @@ async fn the_relay_serves_a_legacy_agent_concurrently_and_revokes_on_eof() {
 
     // An orphan: a credential whose relay process is gone.
     let (repositories, database) = repositories(root.path()).await;
-    let link =
-        crate::auth::issue_mcp_pairing_link(&repositories, "MCP · crashed".into(), "read-only")
-            .await
-            .unwrap();
+    let link = crate::auth::issue_mcp_pairing_link(
+        &repositories,
+        "MCP · crashed".into(),
+        "read-only",
+        &[],
+    )
+    .await
+    .unwrap();
     database.close().await;
     let orphan: Value = reqwest::Client::new()
         .post(format!("{base}/oauth/token"))
@@ -1065,10 +1069,14 @@ async fn an_mcp_credential_is_no_credential_on_every_other_route() {
     let server = start_server(root.path()).await;
     let base = format!("http://{}", server.local_addr());
     let (repositories, database) = repositories(root.path()).await;
-    let link =
-        crate::auth::issue_mcp_pairing_link(&repositories, "MCP · audience".into(), "full-access")
-            .await
-            .unwrap();
+    let link = crate::auth::issue_mcp_pairing_link(
+        &repositories,
+        "MCP · audience".into(),
+        "full-access",
+        &[],
+    )
+    .await
+    .unwrap();
     database.close().await;
     let exchanged: Value = reqwest::Client::new()
         .post(format!("{base}/oauth/token"))
@@ -1141,4 +1149,21 @@ async fn an_mcp_credential_is_no_credential_on_every_other_route() {
     assert!(listed["result"]["tools"].is_array(), "{listed}");
     server.shutdown();
     server.join().await.expect("server joins");
+}
+
+#[test]
+fn a_credential_carries_the_terminal_scope_only_with_terminals_on_at_full_access() {
+    let mut settings = McpServerSettings {
+        access: McpAccess::FullAccess,
+        ..McpServerSettings::default()
+    };
+    assert!(extra_scopes(settings, McpAccess::FullAccess).is_empty());
+    settings.capabilities.terminals = true;
+    assert_eq!(
+        extra_scopes(settings, McpAccess::FullAccess),
+        [crate::auth::SCOPE_TERMINAL_OPERATE]
+    );
+    assert!(extra_scopes(settings, McpAccess::AutoAcceptEdits).is_empty());
+    settings.access = McpAccess::AutoAcceptEdits;
+    assert!(extra_scopes(settings, McpAccess::FullAccess).is_empty());
 }
