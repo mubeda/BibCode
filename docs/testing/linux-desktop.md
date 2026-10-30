@@ -192,8 +192,11 @@ The regressions must cover:
 - Extracted AppDirs, paths containing spaces, stale absolute `.mount_*` paths,
   the five ordinary-launch no-op cases (`unset-appimage`, `empty-appimage`,
   `relative-appdir`, `root-appdir`, and `unset-appdir`), and the positive and
-  negative extracted AppDir gate cases. Exercise both text and binary Git
-  output and a real PTY shell and Python process.
+  negative extracted AppDir gate cases, including a copied executable in an
+  AppDir launched with a stale or missing `APPDIR` (the root comes from the
+  executable, not `APPDIR`). Exercise both text and binary Git output, the
+  incompatible-library HTTPS helper in the mounted and both extracted
+  launches, and a real PTY shell and Python process.
 - An unchanged complete parent environment and the login-shell PATH-probe
   exemption, including its AppDir-first PATH and original launcher values.
   Each re-executed test phase must prove entry and completion; a successful
@@ -253,7 +256,9 @@ configured Claude Code status line whose script invokes Python renders normally.
 Open a configured Flatpak editor and a file manager from the app and check for
 GLib symbol errors and AppImage-rooted `xdg-open` selection. Repeat terminal
 Git/Python and tool launch checks from an extracted `squashfs-root/AppRun`
-without `APPIMAGE`, including Ubuntu without libfuse2. Record desktop URL/path
+without `APPIMAGE`, including Ubuntu without libfuse2, and again with a preset
+mismatched `APPDIR` (`APPDIR=/tmp/stale squashfs-root/AppRun`): Clone from URL
+over `https://` must succeed. Record desktop URL/path
 opening, Linux file reveal, deep-link registration, and the GTK hook's
 `XDG_DATA_DIRS` limitation separately against the
 [current limitations](../architecture/overview.md#appimage-child-environments).

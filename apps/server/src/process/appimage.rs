@@ -156,19 +156,23 @@ mod linux {
         variable: impl Fn(&str) -> Option<OsString>,
         current_executable: impl FnOnce() -> Option<PathBuf>,
     ) -> Option<PathBuf> {
-        let appdir = PathBuf::from(variable("APPDIR")?);
-        if !appdir.is_absolute() || appdir.parent().is_none() {
-            return None;
+        if variable("APPIMAGE").is_some_and(|marker| !marker.is_empty()) {
+            let appdir = PathBuf::from(variable("APPDIR")?);
+            return (appdir.is_absolute() && appdir.parent().is_some()).then_some(appdir);
         }
-        // Extracted AppRun launches have no APPIMAGE. Resolve the executable
-        // only for this fallback, and inspect AppRun exactly once per command.
-        if variable("APPIMAGE").as_deref().is_none_or(OsStr::is_empty)
-            && (!current_executable().is_some_and(|path| path.starts_with(&appdir))
-                || !appdir.join("AppRun").exists())
-        {
-            return None;
-        }
-        Some(appdir)
+        // Extracted AppDirs have no APPIMAGE. AppRun keeps an inherited APPDIR and
+        // a launcher may exec the binary without one, while AppRun.wrapped roots
+        // loader paths in its own directory. So trust only the executable's
+        // `<root>/usr/bin/<name>` layout beside `<root>/AppRun`: one stat per command.
+        let executable = current_executable()?;
+        let bin = executable.parent()?;
+        let usr = bin.parent()?;
+        let root = usr.parent()?;
+        (bin.ends_with("bin")
+            && usr.ends_with("usr")
+            && root.parent().is_some()
+            && root.join("AppRun").exists())
+        .then(|| root.to_path_buf())
     }
 
     pub(super) fn isolate(mut command: ChildCommand<'_>) {
@@ -317,8 +321,56 @@ mod linux {
             std::fs::remove_file(appdir.join("AppRun")).unwrap();
             assert!(
                 gated_overrides(&environment(&appdir, None), Some(&executable)).is_empty(),
-                "stray APPDIR without AppRun must not strip an installed server's paths"
+                "an executable without AppRun beside its usr/bin must not strip paths"
             );
+        }
+
+        #[test]
+        fn extracted_appdir_root_comes_from_the_executable_not_appdir() {
+            let fixture = tempfile::tempdir().unwrap();
+            let appdir = fixture.path().join("BiBCode.AppDir");
+            let other = fixture.path().join("Other.AppDir");
+            for directory in [&appdir, &other] {
+                std::fs::create_dir(directory).unwrap();
+                std::fs::write(directory.join("AppRun"), "launcher").unwrap();
+            }
+            let executable = appdir.join("usr/bin/bibcode-desktop");
+            let library_path = OsString::from(format!("{}/usr/lib:/host/keep", appdir.display()));
+            // AppRun keeps an inherited APPDIR, and a launcher may exec the binary
+            // without one, while AppRun.wrapped roots loader paths in the real AppDir.
+            for stray in [None, Some(fixture.path().join("stale")), Some(other)] {
+                let mut environment =
+                    BTreeMap::from([("LD_LIBRARY_PATH".into(), library_path.clone())]);
+                if let Some(stray) = &stray {
+                    environment.insert("APPDIR".into(), stray.clone().into_os_string());
+                }
+                let overrides = gated_overrides(&environment, Some(&executable));
+                assert!(
+                    overrides.contains(&("LD_LIBRARY_PATH".into(), Some("/host/keep".into()))),
+                    "APPDIR {stray:?} must not hide the running AppDir"
+                );
+                assert_eq!(
+                    overrides.contains(&("APPDIR".into(), None)),
+                    stray.is_some()
+                );
+            }
+            // An ordinary install whose environment names a real AppDir keeps it.
+            let environment = BTreeMap::from([
+                ("APPDIR".into(), appdir.clone().into_os_string()),
+                ("LD_LIBRARY_PATH".into(), library_path),
+            ]);
+            for outside in [
+                PathBuf::from("/usr/bin/bibcode"),
+                fixture.path().join("usr/bin/bibcode"),
+                appdir.join("bibcode"),
+                appdir.join("usr/lib/bibcode"),
+            ] {
+                assert!(
+                    gated_overrides(&environment, Some(&outside)).is_empty(),
+                    "{}",
+                    outside.display()
+                );
+            }
         }
 
         #[test]

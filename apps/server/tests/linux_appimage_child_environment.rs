@@ -20,6 +20,22 @@ use appimage_environment::{
     ENVIRONMENT_CASES, HOST_PATH_FIXTURE, assert_child_environment, check_inherited_environment,
 };
 
+fn environment_probe() -> ProcessRequest {
+    ProcessRequest {
+        operation: "AppImage environment probe".to_owned(),
+        command: "/usr/bin/env".into(),
+        args: vec!["-0".into()],
+        cwd: std::env::temp_dir(),
+        env: Vec::new(),
+        stdin: None,
+        timeout: Duration::from_secs(10),
+        max_output_bytes: 128 * 1024,
+        output_policy: OutputPolicy::Error,
+        append_truncation_marker: false,
+        allow_non_zero_exit: false,
+    }
+}
+
 async fn run_pty_probe(input: PtySpawnInput) -> PtyExit {
     let process = PortablePtyBackend.spawn(&input).expect("real PTY child");
     let mut exit = process.subscribe_exit();
@@ -74,21 +90,8 @@ fn git_children_ignore_appimage_environment() {
         ENVIRONMENT_CASES,
         |expected| {
             tokio::runtime::Runtime::new().unwrap().block_on(async {
-                let request = ProcessRequest {
-                    operation: "AppImage environment probe".to_owned(),
-                    command: "/usr/bin/env".into(),
-                    args: vec!["-0".into()],
-                    cwd: std::env::temp_dir(),
-                    env: Vec::new(),
-                    stdin: None,
-                    timeout: Duration::from_secs(10),
-                    max_output_bytes: 128 * 1024,
-                    output_policy: OutputPolicy::Error,
-                    append_truncation_marker: false,
-                    allow_non_zero_exit: false,
-                };
                 let output = ProcessRunner
-                    .run_bytes(request, &CancellationToken::new())
+                    .run_bytes(environment_probe(), &CancellationToken::new())
                     .await
                     .expect("Git runner environment probe");
                 assert_child_environment(&output.stdout, expected);
@@ -105,7 +108,8 @@ fn extracted_appdir_isolates_real_child_commands() {
     const TEST: &str = "extracted_appdir_isolates_real_child_commands";
     const PHASE: &str = "copied-executable";
     if let Some(child) = reexec::enter(TEST, PHASE) {
-        let appdir = PathBuf::from(std::env::var_os("APPDIR").unwrap());
+        // APPDIR may be stale or absent; the copied executable names the AppDir.
+        let appdir = PathBuf::from(std::env::var_os("BIBCODE_TEST_REAL_APPDIR").unwrap());
         assert!(std::env::current_exe().unwrap().starts_with(&appdir));
         assert!(std::env::var_os("APPIMAGE").is_none_or(|value| value.is_empty()));
         let parent = std::env::vars_os().collect::<BTreeMap<_, _>>();
@@ -149,6 +153,13 @@ fn extracted_appdir_isolates_real_child_commands() {
             assert!(output.status.success());
             assert_child_environment(&output.stdout, &expected);
 
+            // The Git runner's process_command path, which Clone from URL uses.
+            let output = ProcessRunner
+                .run_bytes(environment_probe(), &CancellationToken::new())
+                .await
+                .expect("Git runner environment probe");
+            assert_child_environment(&output.stdout, &expected);
+
             let directory = tempfile::tempdir().unwrap();
             let capture = directory.path().join("pty-environment");
             let completed = run_pty_probe(PtySpawnInput {
@@ -181,13 +192,20 @@ fn extracted_appdir_isolates_real_child_commands() {
     executable_fixture::copy_executable(&std::env::current_exe().unwrap(), &executable);
     let apprun = appdir.join("AppRun");
     std::fs::write(&apprun, "fixture launcher").unwrap();
-    for case in ["unset", "empty", "missing-launcher"] {
+    for case in [
+        "unset",
+        "empty",
+        "stale-appdir",
+        "no-appdir",
+        "missing-launcher",
+    ] {
         if case == "missing-launcher" {
             std::fs::remove_file(&apprun).unwrap();
         }
         reexec::run(TEST, PHASE, Some(&executable), |command| {
             command
                 .env("APPDIR", &appdir)
+                .env("BIBCODE_TEST_REAL_APPDIR", &appdir)
                 .env(
                     "LD_LIBRARY_PATH",
                     format!("{}/usr/lib:/host/keep", appdir.display()),
@@ -206,6 +224,12 @@ fn extracted_appdir_isolates_real_child_commands() {
                 command.env("APPIMAGE", "");
             } else {
                 command.env_remove("APPIMAGE");
+            }
+            // AppRun keeps an inherited APPDIR; a launcher may exec the binary without one.
+            if case == "stale-appdir" {
+                command.env("APPDIR", directory.path().join("stale AppDir"));
+            } else if case == "no-appdir" {
+                command.env_remove("APPDIR");
             }
         });
     }
