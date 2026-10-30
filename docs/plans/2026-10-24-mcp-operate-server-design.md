@@ -1236,9 +1236,9 @@ updated on 2026-10-27.
   wrappers, but the Settings row does not yet look up an SSH or WSL environment's target
   through the desktop bridge. For an environment other than the primary one it shows the
   server's own command and says to run it on that host or after `ssh <host> --`.
-- **Not covered by a test in this slice:** a retry after a crash between reservation and
-  enqueue, and a retry of a rejected command. Both rest on the existing command-admission
-  replay, which the tools reach unchanged with the stored payloads.
+- **Retries after a crash and after a rejection** rest on the existing command-admission
+  replay, which the tools reach unchanged with the stored payloads; the review round below
+  added tests for both.
 
 **Review fixes (2026-10-30):**
 
@@ -1271,3 +1271,18 @@ updated on 2026-10-27.
   lookup, and one stop future (cancellation, shutdown, the setting off, the deadline) races
   every read. A deadline that passes before the first read answers is `McpStorageError`
   ("the work goes on. Wait again."); a later one returns the last state read, `timedOut: true`.
+- **Tests the first round left out** now exist: a retry after a crash between reservation and
+  enqueue (a `reserved` receipt is resumed and answered once admitted), a retry of a rejected
+  command (the original error), the relay's `MCP-Protocol-Version` on legacy calls with no
+  `Mcp-Session-Id`, the server's receiver released after a stdio `notifications/cancelled`,
+  steer, and, through the relay against a real server with every provider unable to run,
+  `list_providers_and_models`, `start_thread` with the Default Agent's model, and
+  `git_status`.
+- **Discrepancy: the runtime guard is shared.** "Not overwritten by a second server that
+  fails the guard" assumed an exclusive guard, but `StoreRuntimeGuard` takes a shared lock
+  (`persistence/backup.rs`), so a second server for the same data root on another port
+  starts, and its record replaces the first's (the diagnostics relay's
+  `diagnostics-relay.json` behaves the same). When that second server stops, its record is
+  removed and relays report no server until the first restarts. Only a second server on the
+  same port is stopped, by `bind_listener` before the record is written; the test covers
+  that case. Making the guard exclusive is a separate decision.

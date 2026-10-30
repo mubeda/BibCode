@@ -663,11 +663,23 @@ async fn store_request(
     if let Some(mode) = start["runtimeMode"].as_str().map(str::to_owned) {
         start["bootstrap"]["createThread"]["runtimeMode"] = json!(mode);
     }
+    insert_request(harness, agent, tool, arguments, &[start.clone()]).await;
+    start
+}
+
+/// Writes the `mcp_tool_requests` row a call with `arguments` stores, holding `commands`.
+async fn insert_request(
+    harness: &Harness,
+    agent: &ClientPrincipal,
+    tool: &str,
+    arguments: &Value,
+    commands: &[Value],
+) {
     let digest = crate::orchestration::delivery::canonical_command_digest(arguments).unwrap();
     let session_id = agent.principal.session_id.clone();
     let client_request_id = arguments["clientRequestId"].as_str().unwrap().to_owned();
     let tool = tool.to_owned();
-    let commands = json!([start.clone()]).to_string();
+    let commands = serde_json::to_string(commands).unwrap();
     harness
         .repositories
         .database()
@@ -680,7 +692,186 @@ async fn store_request(
         })
         .await
         .unwrap();
-    start
+}
+
+/// A stored `send_message` whose turn start was accepted but whose steer was not (the server
+/// stopped between them): the steer is new work on a thread now above the ceiling, so the
+/// retry is refused before it is dispatched.
+#[tokio::test]
+async fn an_unaccepted_stored_command_meets_the_ceiling_of_the_thread_it_advances() {
+    let harness = Harness::new().await;
+    let (agent, _) = harness.agent(McpAccess::FullAccess).await;
+    let mut arguments = basic_start();
+    arguments["runtimeMode"] = json!("full-access");
+    let (thread_id, _) = start(&harness, &agent, arguments).await;
+    let send = json!({ "threadId": thread_id, "text": "more", "mode": "steer", "clientRequestId": "half-sent" });
+    let start_command = json!({
+        "type": "thread.turn.start", "commandId": "half-start", "threadId": thread_id,
+        "message": { "messageId": "half-message", "role": "user", "text": "more", "attachments": [] },
+        "runtimeMode": "approval-required", "interactionMode": "default", "queued": true,
+        "createdAt": CREATED_AT,
+    });
+    let steer_command = json!({
+        "type": "thread.turn.steer", "commandId": "half-steer", "threadId": thread_id,
+        "messageId": "half-message", "createdAt": CREATED_AT,
+    });
+    insert_request(
+        &harness,
+        &agent,
+        "send_message",
+        &send,
+        &[start_command.clone(), steer_command],
+    )
+    .await;
+    receipt(&harness, &start_command, "accepted", None).await;
+    lower_ceiling(&harness, McpAccess::ApprovalRequired);
+    assert_eq!(
+        error_tag(&harness.call(&agent, "send_message", send).await),
+        "McpAccessCeilingError"
+    );
+    harness.shutdown().await;
+}
+
+/// A receipt for `command` in `status`, written as the engine writes one.
+async fn receipt(harness: &Harness, command: &Value, status: &str, error: Option<&str>) {
+    harness
+        .repositories
+        .reserve_command_receipt(crate::persistence::CommandReceipt {
+            command_id: command["commandId"].as_str().unwrap().to_owned(),
+            aggregate_kind: "thread".to_owned(),
+            aggregate_id: command["threadId"].as_str().unwrap().to_owned(),
+            accepted_at: CREATED_AT.to_owned(),
+            result_sequence: 0,
+            status: status.to_owned(),
+            error: error.map(str::to_owned),
+            payload_digest: Some(
+                crate::orchestration::delivery::canonical_command_digest(command).unwrap(),
+            ),
+        })
+        .await
+        .expect("receipt");
+}
+
+/// A server that stopped after it reserved the command's receipt but before it enqueued the
+/// turn: the retry resumes the admission, and answers once the turn is admitted.
+#[tokio::test]
+async fn a_retry_after_a_crash_between_reservation_and_enqueue_resumes_delivery() {
+    let harness = Harness::new().await;
+    let (agent, _) = harness.agent(McpAccess::FullAccess).await;
+    let mut arguments = basic_start();
+    arguments["clientRequestId"] = json!("crashed");
+    let stored = store_request(&harness, &agent, "start_thread", &arguments, |_| {}).await;
+    receipt(&harness, &stored, "reserved", None).await;
+    let started = harness.call(&agent, "start_thread", arguments).await;
+    let started = structured(&started);
+    assert_eq!(started["threadId"], "stored-thread");
+    assert_eq!(started["messageId"], "stored-message");
+    let receipt = harness
+        .repositories
+        .get_command_receipt("stored-command".to_owned())
+        .await
+        .unwrap()
+        .expect("receipt");
+    assert_eq!(receipt.status, "accepted", "admitted before the answer");
+    let admitted: (i64, i64) = harness
+        .repositories
+        .database()
+        .call(|connection| {
+            Ok(connection.query_row(
+                "SELECT (SELECT COUNT(*) FROM projection_thread_messages WHERE message_id = 'stored-message'),
+                        (SELECT COUNT(*) FROM projection_turns WHERE pending_message_id = 'stored-message')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(admitted, (1, 1), "the message and its turn exist");
+    harness.shutdown().await;
+}
+
+/// A retry of a command the engine rejected answers with that rejection, never success.
+#[tokio::test]
+async fn a_retry_of_a_rejected_command_returns_its_original_error() {
+    let harness = Harness::new().await;
+    let (agent, _) = harness.agent(McpAccess::FullAccess).await;
+    let mut arguments = basic_start();
+    arguments["clientRequestId"] = json!("rejected");
+    let stored = store_request(&harness, &agent, "start_thread", &arguments, |_| {}).await;
+    receipt(
+        &harness,
+        &stored,
+        "rejected",
+        Some("The original rejection."),
+    )
+    .await;
+    for _ in 0..2 {
+        let retried = harness
+            .call(&agent, "start_thread", arguments.clone())
+            .await;
+        error_tag(&retried);
+        assert!(
+            retried["structuredContent"]["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("The original rejection."),
+            "{retried}"
+        );
+    }
+    let threads: i64 = harness
+        .repositories
+        .database()
+        .call(|connection| {
+            Ok(connection.query_row(
+                "SELECT COUNT(*) FROM projection_threads WHERE thread_id = 'stored-thread'",
+                [],
+                |row| row.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(threads, 0, "nothing was started");
+    harness.shutdown().await;
+}
+
+/// `mode: steer` on a running turn: the message is queued and promoted to steer it, by two
+/// commands with their own ids, and a retry replays both.
+#[tokio::test]
+async fn steer_queues_the_message_and_steers_the_running_turn() {
+    let harness = Harness::new().await;
+    let (agent, _) = harness.agent(McpAccess::FullAccess).await;
+    let (thread_id, _) = start(&harness, &agent, basic_start()).await;
+    harness
+        .provider_turn(&thread_id, "turn-1", "working", false)
+        .await;
+    let arguments = json!({ "threadId": thread_id, "text": "use the other file", "mode": "steer", "clientRequestId": "steer-1" });
+    let sent = harness
+        .call(&agent, "send_message", arguments.clone())
+        .await;
+    let sent = structured(&sent).clone();
+    assert!(sent["messageId"].is_string(), "{sent}");
+    assert_eq!(sent["steer"]["steered"], true, "{sent}");
+    let stored: String = harness
+        .repositories
+        .database()
+        .call(|connection| {
+            Ok(connection.query_row(
+                "SELECT commands_json FROM mcp_tool_requests WHERE client_request_id = 'steer-1'",
+                [],
+                |row| row.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    let stored: Vec<Value> = serde_json::from_str(&stored).unwrap();
+    assert_eq!(stored.len(), 2);
+    assert_eq!(stored[0]["type"], "thread.turn.start");
+    assert_eq!(stored[1]["type"], "thread.turn.steer");
+    assert_ne!(stored[0]["commandId"], stored[1]["commandId"]);
+    assert_eq!(stored[1]["messageId"], sent["messageId"]);
+    let retried = harness.call(&agent, "send_message", arguments).await;
+    assert_eq!(structured(&retried)["messageId"], sent["messageId"]);
+    harness.shutdown().await;
 }
 
 #[tokio::test]

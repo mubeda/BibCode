@@ -819,6 +819,14 @@ impl ServerHandle {
             .map(|runtime| runtime.profiler_enabled_signal())
     }
 
+    /// How many receivers the production runtime's orchestration event stream has.
+    #[cfg(test)]
+    pub(crate) fn event_subscriber_count_for_test(&self) -> Option<usize> {
+        self._production_runtime
+            .as_ref()
+            .map(|runtime| runtime.orchestration.event_subscriber_count_for_test())
+    }
+
     pub fn shutdown(&self) {
         self.shutdown.cancel();
     }

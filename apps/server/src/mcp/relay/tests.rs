@@ -632,13 +632,19 @@ async fn the_other_loopback_family_on_the_same_port_is_another_listener() {
     let state_dir = ServerConfig::new(root.path()).state_dir();
     let record = EndpointRecord::read(&state_dir).unwrap().expect("record");
     assert_eq!(record.dial_host.as_deref(), Some("127.0.0.1"));
-    let split = std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, real.port()));
-    let Some(seen) = forwarder(split, real).await else {
-        eprintln!("skipped: this host cannot listen on {split}");
+    if TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, 0))
+        .await
+        .is_err()
+    {
+        eprintln!("skipped: this host has no IPv6 loopback");
         server.shutdown();
         server.join().await.expect("server joins");
         return;
-    };
+    }
+    let split = std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, real.port()));
+    let seen = forwarder(split, real)
+        .await
+        .unwrap_or_else(|| panic!("listen on {split} beside {real}"));
     // Named with --url, it is not the record's listener.
     let error = refused_in_time(RelayOptions {
         url: Some(format!("http://{split}/").parse().unwrap()),
@@ -705,6 +711,303 @@ async fn a_url_that_names_the_records_listener_is_served() {
     })
     .await;
     assert!(error.contains("--url"), "{error}");
+    server.shutdown();
+    server.join().await.expect("server joins");
+}
+
+/// A second server for the data root on the running server's port fails to bind, which comes
+/// before the record is written, so the running server's record stays. (The runtime guard is
+/// a shared lock: a second server on another port does start, and its record wins.)
+#[tokio::test]
+async fn a_second_server_that_cannot_start_leaves_the_record_alone() {
+    let root = tempfile::tempdir().expect("root");
+    let server = start_server(root.path()).await;
+    let state_dir = ServerConfig::new(root.path()).state_dir();
+    let record = || std::fs::read(state_dir.join(crate::mcp::endpoint::ENDPOINT_RECORD_FILE));
+    let before = record().expect("record");
+    let second = tokio::time::timeout(
+        Duration::from_secs(30),
+        ServerRuntime::start(
+            ServerConfig::new(root.path()).with_bind("127.0.0.1", server.local_addr().port()),
+        ),
+    )
+    .await
+    .expect("the second start ends");
+    assert!(second.is_err(), "the port is taken");
+    assert_eq!(record().expect("record"), before);
+    // The running server is still the one a relay reaches.
+    let mut relay = Running::start(options(root.path()));
+    relay
+        .send(json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
+        .await;
+    assert!(relay.line().await["result"]["tools"].is_array());
+    relay.close().await.expect("relay ends");
+    server.shutdown();
+    server.join().await.expect("server joins");
+}
+
+/// A legacy client's negotiated version goes on every later request as `MCP-Protocol-Version`,
+/// and the relay never sends an `Mcp-Session-Id`.
+#[tokio::test]
+async fn a_legacy_clients_version_is_sent_on_every_later_request() {
+    let (port, seen) =
+        impostor(r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18"}}"#).await;
+    let root = tempfile::tempdir().expect("root");
+    let relay = Relay {
+        options: options(root.path()),
+        state_dir: root.path().to_path_buf(),
+        http: reqwest::Client::builder().no_proxy().build().unwrap(),
+        access: McpAccess::ReadOnly,
+        endpoint: Mutex::new(Endpoint {
+            base: format!("http://127.0.0.1:{port}/").parse().unwrap(),
+        }),
+        credential: Mutex::new(Some(Credential {
+            token: "test-bearer".into(),
+            session_id: "test-session".into(),
+        })),
+        legacy_version: std::sync::Mutex::new(None),
+    };
+    let (lines, _frames) = mpsc::channel(4);
+    let initialized = relay
+        .forward(
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+                "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": { "name": "a", "version": "1" },
+            }}),
+            &lines,
+        )
+        .await
+        .expect("an answer");
+    assert!(initialized.contains("2025-06-18"), "{initialized}");
+    for id in [2, 3] {
+        relay
+            .forward(
+                json!({ "jsonrpc": "2.0", "id": id, "method": "tools/list" }),
+                &lines,
+            )
+            .await
+            .expect("an answer");
+    }
+    let requests: Vec<String> = seen
+        .lock()
+        .await
+        .iter()
+        .map(|request| request.to_ascii_lowercase())
+        .collect();
+    assert_eq!(requests.len(), 3, "{requests:?}");
+    assert!(
+        !requests[0].contains("mcp-protocol-version"),
+        "{}",
+        requests[0]
+    );
+    for request in &requests[1..] {
+        assert!(
+            request.contains("mcp-protocol-version: 2025-06-18"),
+            "{request}"
+        );
+    }
+    for request in &requests {
+        assert!(!request.contains("mcp-session-id"), "{request}");
+        assert!(
+            request.contains("authorization: bearer test-bearer"),
+            "{request}"
+        );
+    }
+}
+
+/// Waits up to 5 s for the server's event stream to have `expected` receivers.
+async fn receivers_reach(server: &ServerHandle, expected: usize) -> usize {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let count = server.event_subscriber_count_for_test().expect("runtime");
+        if count == expected || tokio::time::Instant::now() > deadline {
+            return count;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// A stdio `notifications/cancelled` ends the server's wait too: the receiver it held on the
+/// engine's event stream is released, long before the wait's own timeout.
+#[tokio::test]
+async fn a_cancelled_wait_releases_the_servers_receiver() {
+    let root = tempfile::tempdir().expect("root");
+    let server = start_server(root.path()).await;
+    let base = format!("http://{}", server.local_addr());
+    let admin = admin_token(root.path(), &base).await;
+    dispatch(
+        &base,
+        &admin,
+        json!({
+            "type": "project.create", "commandId": "project", "projectId": "p1", "title": "P",
+            "workspaceRoot": root.path(), "createdAt": "2026-10-30T00:00:00.000Z",
+        }),
+    )
+    .await;
+    dispatch(
+        &base,
+        &admin,
+        json!({
+            "type": "thread.create", "commandId": "thread", "threadId": "t1", "projectId": "p1",
+            "title": "T", "modelSelection": { "instanceId": "codex", "model": "gpt-5" },
+            "runtimeMode": "approval-required", "interactionMode": "default", "branch": null,
+            "worktreePath": null, "createdAt": "2026-10-30T00:00:00.000Z",
+        }),
+    )
+    .await;
+    let mut relay = Running::start(options(root.path()));
+    relay
+        .send(json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": { "name": "a", "version": "1" },
+        }}))
+        .await;
+    relay.line().await;
+    let baseline = server.event_subscriber_count_for_test().expect("runtime");
+    relay
+        .send(json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+            "name": "wait_for_thread", "arguments": { "threadId": "t1", "messageId": "not-yet", "timeoutMs": 40_000 },
+        }}))
+        .await;
+    assert_eq!(receivers_reach(&server, baseline + 1).await, baseline + 1);
+    relay
+        .send(json!({ "jsonrpc": "2.0", "method": "notifications/cancelled", "params": { "requestId": 2 } }))
+        .await;
+    assert_eq!(
+        receivers_reach(&server, baseline).await,
+        baseline,
+        "the server still holds the cancelled wait's receiver"
+    );
+    relay
+        .send(json!({ "jsonrpc": "2.0", "id": 3, "method": "ping" }))
+        .await;
+    assert_eq!(
+        relay.line().await["id"],
+        3,
+        "no answer for the cancelled call"
+    );
+    relay.close().await.expect("relay ends");
+    server.shutdown();
+    server.join().await.expect("server joins");
+}
+
+/// One tool call through the relay; its `structuredContent`, or the whole answer on an error.
+async fn call_tool(relay: &mut Running, id: i64, name: &str, arguments: Value) -> Value {
+    relay
+        .send(json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call", "params": { "name": name, "arguments": arguments } }))
+        .await;
+    let answer = relay.line().await;
+    assert_eq!(answer["id"], id, "{answer}");
+    if answer["result"]["isError"] == true {
+        answer
+    } else {
+        answer["result"]["structuredContent"].clone()
+    }
+}
+
+/// The real server end to end, through the relay, with every provider turned off so no
+/// provider runs: the provider list, the Default Agent's model for a start that names none,
+/// and a thread's Git status.
+#[tokio::test]
+async fn the_tools_read_the_servers_providers_defaults_and_git() {
+    let root = tempfile::tempdir().expect("root");
+    let mut providers = crate::test_support::hermetic_providers::BUILTIN_PROVIDER_DRIVERS
+        .iter()
+        .map(|driver| ((*driver).to_owned(), json!({ "enabled": false })))
+        .collect::<serde_json::Map<String, Value>>();
+    providers.insert(
+        "codex".into(),
+        json!({ "enabled": true, "binaryPath": root.path().join("no-such-codex") }),
+    );
+    crate::test_support::hermetic_providers::write_hermetic_settings(
+        &ServerConfig::new(root.path()).state_dir(),
+        json!({
+            "providers": providers,
+            "defaultAgent": { "kind": "chat", "instanceId": "codex" },
+            "providerSessionDefaults": { "codex": { "model": "gpt-5.1-codex" } },
+        }),
+    );
+    let server = ServerRuntime::start(ServerConfig::new(root.path()).with_bind("127.0.0.1", 0))
+        .await
+        .expect("server starts");
+    let base = format!("http://{}", server.local_addr());
+    let admin = admin_token(root.path(), &base).await;
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let git = crate::test_support::isolated_git_config::IsolatedGitConfig::new();
+    let mut init = std::process::Command::new("git");
+    git.apply_to_command(&mut init);
+    let status = init
+        .args(["init", "--quiet", "--initial-branch=main"])
+        .current_dir(&workspace)
+        .status()
+        .expect("git init");
+    assert!(status.success());
+    std::fs::write(workspace.join("notes.txt"), "draft\n").unwrap();
+    dispatch(
+        &base,
+        &admin,
+        json!({
+            "type": "project.create", "commandId": "project", "projectId": "p1", "title": "P",
+            "workspaceRoot": workspace, "defaultModelSelection": null,
+            "createdAt": "2026-10-30T00:00:00.000Z",
+        }),
+    )
+    .await;
+    dispatch(
+        &base,
+        &admin,
+        json!({
+            "type": "thread.create", "commandId": "thread", "threadId": "t1", "projectId": "p1",
+            "title": "T", "modelSelection": { "instanceId": "codex", "model": "gpt-5" },
+            "runtimeMode": "approval-required", "interactionMode": "default", "branch": null,
+            "worktreePath": null, "createdAt": "2026-10-30T00:00:00.000Z",
+        }),
+    )
+    .await;
+    let mut relay = Running::start(options(root.path()));
+
+    let listed = call_tool(&mut relay, 1, "list_providers_and_models", json!({})).await;
+    let providers = listed["providers"]
+        .as_array()
+        .unwrap_or_else(|| panic!("providers: {listed}"));
+    assert!(!providers.is_empty(), "{listed}");
+    let codex = providers
+        .iter()
+        .find(|provider| provider["providerInstanceId"] == "codex")
+        .unwrap_or_else(|| panic!("codex is listed: {listed}"));
+    assert_eq!(codex["defaultAgent"], true, "{codex}");
+    for model in codex["models"].as_array().expect("models") {
+        assert!(
+            model["model"].is_string() && model["default"].is_boolean(),
+            "{model}"
+        );
+    }
+
+    let started = call_tool(
+        &mut relay,
+        2,
+        "start_thread",
+        json!({ "projectId": "p1", "prompt": "Say hello" }),
+    )
+    .await;
+    assert_eq!(
+        started["modelSelection"],
+        json!({ "instanceId": "codex", "model": "gpt-5.1-codex" }),
+        "{started}"
+    );
+    assert_eq!(started["runtimeMode"], "approval-required");
+
+    let status = call_tool(&mut relay, 3, "git_status", json!({ "threadId": "t1" })).await;
+    assert_eq!(status["isRepo"], true, "{status}");
+    assert_eq!(status["hasWorkingTreeChanges"], true, "{status}");
+    assert!(
+        status["files"]
+            .as_array()
+            .expect("files")
+            .iter()
+            .any(|file| file.to_string().contains("notes.txt")),
+        "{status}"
+    );
+    relay.close().await.expect("relay ends");
     server.shutdown();
     server.join().await.expect("server joins");
 }
