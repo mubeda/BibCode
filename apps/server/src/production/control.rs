@@ -516,6 +516,13 @@ impl NativeServerControl {
         agent_activity_enabled(&*self.settings.read().await, source)
     }
 
+    /// The OpenCode instances that point at a server the user runs (#206).
+    pub(crate) async fn opencode_instances_with_server_url(&self) -> Vec<String> {
+        crate::production::provider_inventory::opencode_instances_with_server_url(
+            &*self.settings.read().await,
+        )
+    }
+
     async fn update_settings(&self, payload: Value) -> Result<Value, Value> {
         let mut patch = payload.get("patch").cloned().ok_or_else(|| {
             settings_error(&self.settings_path, "normalize", "missing settings patch")
@@ -2599,6 +2606,7 @@ fn environment_descriptor(config: &ServerConfig, activity_protocol_registered: b
         "vcsCloneReattach": true,
         "attachmentStaging": true,
         "profiler": true,
+        "diagnosticLogs": true,
         "devicePreviews": true,
         "deviceCatalogRefresh": true,
         "cliSessionHistory": true,
@@ -6743,6 +6751,9 @@ mod tests {
         assert_eq!(descriptor["capabilities"]["pullRequestCreateOptions"], true);
         assert_eq!(descriptor["capabilities"]["vcsCloneReattach"], true);
         assert_eq!(descriptor["capabilities"]["reviewDiffTools"], true);
+        // `server.getConfig` carries this descriptor; a client downloads a remote
+        // environment's logs only when it says so (#194).
+        assert_eq!(descriptor["capabilities"]["diagnosticLogs"], true);
         assert_eq!(descriptor["capabilities"]["attachmentStaging"], true);
         assert_eq!(
             descriptor["remoteUpdateSupport"],

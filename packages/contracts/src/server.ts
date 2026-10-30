@@ -531,6 +531,150 @@ export const ServerSignalProcessResult = Schema.Struct({
 });
 export type ServerSignalProcessResult = typeof ServerSignalProcessResult.Type;
 
+/** The largest diagnostic archive a server sends or a client accepts (20 MiB). */
+export const DIAGNOSTIC_LOGS_MAX_ARCHIVE_BYTES = 20 * 1024 * 1024;
+/** The most archive bytes one `Data` item of `server.downloadDiagnosticLogs` carries. */
+export const DIAGNOSTIC_LOGS_CHUNK_BYTES = 64 * 1024;
+
+export const DiagnosticLogsDownloadInput = Schema.Struct({
+  /** This client's frontend warning/error snapshot, bounded like the HTTP request body. */
+  frontendLog: Schema.String,
+  /** Crash dumps hold raw memory; they need `orchestration:operate`. Absent means false. */
+  includeCrashDumps: Schema.optional(Schema.Boolean),
+});
+export type DiagnosticLogsDownloadInput = typeof DiagnosticLogsDownloadInput.Type;
+
+/** The archive's `manifest.json`: which server built it, and what it holds. */
+export const DiagnosticLogsManifest = Schema.Struct({
+  schemaVersion: Schema.Literal(1),
+  /** The server's self-declared id, `local` on most servers. */
+  environmentId: TrimmedNonEmptyString,
+  /** The persistent store's id, which a client keys a remote environment by. */
+  storageInstanceId: Schema.NullOr(TrimmedNonEmptyString),
+  environmentLabel: TrimmedNonEmptyString,
+  serverVersion: TrimmedNonEmptyString,
+  platform: Schema.Struct({ os: Schema.String, arch: Schema.String }),
+  generatedAt: Schema.String,
+  /** `included` counts the dumps written, which can be fewer than were asked for. */
+  crashDumps: Schema.Struct({ requested: Schema.Boolean, included: NonNegativeInt }),
+});
+export type DiagnosticLogsManifest = typeof DiagnosticLogsManifest.Type;
+
+/**
+ * `server.downloadDiagnosticLogs`: one `Started` first, then `Data` items (base64, at most
+ * {@link DIAGNOSTIC_LOGS_CHUNK_BYTES} each) whose decoded lengths sum to `byteLength`, then the
+ * stream completes.
+ */
+export const DiagnosticLogsDownloadEvent = Schema.Union([
+  Schema.TaggedStruct("Started", {
+    fileName: TrimmedNonEmptyString,
+    byteLength: NonNegativeInt,
+    manifest: DiagnosticLogsManifest,
+  }),
+  Schema.TaggedStruct("Data", { data: Schema.String }),
+]);
+export type DiagnosticLogsDownloadEvent = typeof DiagnosticLogsDownloadEvent.Type;
+
+export class DiagnosticLogsError extends Schema.TaggedError<DiagnosticLogsError>()(
+  "DiagnosticLogsError",
+  {
+    reason: Schema.Literals(["invalid", "build-failed", "too-large"]),
+    message: TrimmedNonEmptyString,
+  },
+) {}
+
+/**
+ * A `bibcode diagnostics download` on this host waiting for the desktop app (#201): the
+ * environment it names as typed (an id or a label, resolved by the app), whether it asked
+ * for crash dumps, the code the command printed (so the user can tell their own command
+ * from another program's), and the directory it will save in. `requestId` is new for every
+ * request, so an item for an older one is stale.
+ */
+export const DiagnosticLogsRelayRequest = Schema.Struct({
+  requestId: TrimmedNonEmptyString,
+  environment: TrimmedNonEmptyString,
+  includeCrashDumps: Schema.Boolean,
+  code: TrimmedNonEmptyString,
+  outputDirectory: TrimmedNonEmptyString,
+});
+export type DiagnosticLogsRelayRequest = typeof DiagnosticLogsRelayRequest.Type;
+
+/**
+ * `server.subscribeDiagnosticLogsRelay`: a request to approve; `Claimed` once a window took
+ * it, so the others drop their prompt; then `Closed` once it is over (answered, expired, or
+ * the command left), which also stops the claiming window's download.
+ */
+export const DiagnosticLogsRelayEvent = Schema.Union([
+  Schema.TaggedStruct("Pending", { request: DiagnosticLogsRelayRequest }),
+  Schema.TaggedStruct("Claimed", { requestId: TrimmedNonEmptyString }),
+  Schema.TaggedStruct("Closed", { requestId: TrimmedNonEmptyString }),
+]);
+export type DiagnosticLogsRelayEvent = typeof DiagnosticLogsRelayEvent.Type;
+
+export const DiagnosticLogsRelayClaimInput = Schema.Struct({ requestId: TrimmedNonEmptyString });
+export type DiagnosticLogsRelayClaimInput = typeof DiagnosticLogsRelayClaimInput.Type;
+
+/** `claimed` is false when another window answered first or the request is already over. */
+export const DiagnosticLogsRelayClaimResult = Schema.Struct({ claimed: Schema.Boolean });
+export type DiagnosticLogsRelayClaimResult = typeof DiagnosticLogsRelayClaimResult.Type;
+
+/** Why the app could not relay the logs; the command prints `message`. */
+export const DiagnosticLogsRelayFailureReason = Schema.Literals([
+  "unknown-environment",
+  "ambiguous-environment",
+  "not-connected",
+  "unsupported",
+  "unverified",
+  "wrong-environment",
+  "incomplete",
+  "too-large",
+  "not-permitted",
+  "crash-dumps-refused",
+  "server-failed",
+  "connection-lost",
+]);
+export type DiagnosticLogsRelayFailureReason = typeof DiagnosticLogsRelayFailureReason.Type;
+
+/**
+ * What the claiming app sends for a request, in order: `Denied` or `Failed` alone, or
+ * `Started`, `Data` items (base64, at most {@link DIAGNOSTIC_LOGS_CHUNK_BYTES} each) whose
+ * decoded lengths sum to `byteLength`, then `Finished`.
+ */
+export const DiagnosticLogsRelayItem = Schema.Union([
+  Schema.TaggedStruct("Denied", {}),
+  Schema.TaggedStruct("Failed", {
+    reason: DiagnosticLogsRelayFailureReason,
+    message: TrimmedNonEmptyString,
+  }),
+  Schema.TaggedStruct("Started", {
+    fileName: TrimmedNonEmptyString,
+    byteLength: NonNegativeInt,
+    manifest: DiagnosticLogsManifest,
+  }),
+  Schema.TaggedStruct("Data", { data: Schema.String }),
+  Schema.TaggedStruct("Finished", {}),
+]);
+export type DiagnosticLogsRelayItem = typeof DiagnosticLogsRelayItem.Type;
+
+export const DiagnosticLogsRelaySendInput = Schema.Struct({
+  requestId: TrimmedNonEmptyString,
+  item: DiagnosticLogsRelayItem,
+});
+export type DiagnosticLogsRelaySendInput = typeof DiagnosticLogsRelaySendInput.Type;
+
+/**
+ * Why the server refused an item. `stale`: the request is over or was never this
+ * connection's (stop sending); `cancelled`: the command left (stop the download);
+ * `invalid`: the item broke the order or a bound, which ends the request.
+ */
+export class DiagnosticLogsRelayError extends Schema.TaggedError<DiagnosticLogsRelayError>()(
+  "DiagnosticLogsRelayError",
+  {
+    reason: Schema.Literals(["stale", "cancelled", "invalid", "not-desktop"]),
+    message: TrimmedNonEmptyString,
+  },
+) {}
+
 export const ServerConfig = Schema.Struct({
   environment: ExecutionEnvironmentDescriptor,
   auth: ServerAuthDescriptor,

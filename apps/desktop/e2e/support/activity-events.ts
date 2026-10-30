@@ -120,6 +120,16 @@ export function desktopActivityComposerFollowupTurnCommand(observedAtMs: number 
   } as const;
 }
 
+/** Stops the fixture chat's provider session, as the composer's session stop does (#206). */
+export function desktopActivitySessionStopCommand(observedAtMs: number = Date.now()) {
+  return {
+    type: "thread.session.stop",
+    commandId: "bibcode-ui-activity-session-stop",
+    threadId: desktopActivityFixture.thread.id,
+    createdAt: activityCommandTimestamp(observedAtMs, 0),
+  } as const;
+}
+
 export const desktopActivityAccessibleNames = {
-  dock: "Open Activity: Subagents 1 active, 0 done; Background tasks 1 active, 0 done",
+  dock: "Activity: Subagents 1 active, 0 done; Background tasks 1 active, 0 done",
 } as const;

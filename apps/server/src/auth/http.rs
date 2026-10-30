@@ -362,9 +362,7 @@ async fn create_pairing_offer(
             .collect::<std::collections::HashSet<_>>()
             .len()
             != scopes.len()
-        || !scopes
-            .iter()
-            .all(|scope| principal.scopes.iter().any(|granted| granted == scope))
+        || !scopes.iter().all(|scope| principal.has_scope(scope))
     {
         return invalid_pairing_offer_response("requested scope exceeds the caller's grant");
     }

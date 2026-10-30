@@ -259,6 +259,8 @@ describe("zero-telemetry privacy contract", () => {
       "prost",
       "reqwest",
       "rusqlite",
+      "rustls",
+      "rustls-platform-verifier",
       "semver",
       "serde",
       "serde_json",

@@ -57,8 +57,11 @@ Computer Use capture:
 - Every guest command runs as the logged-in interactive Windows account:
 
   ```sh
-  prlctl exec 'Windows 11' --current-user -- pwsh -NoProfile -Command '...'
+  prlctl exec 'Windows 11' --current-user pwsh -NoProfile -Command '...'
   ```
+
+  Parallels 27 takes the guest command directly after `--current-user`; an
+  extra `--` exits before running the command.
 
   Without `--current-user`, `prlctl exec` runs as `NT AUTHORITY\SYSTEM`. Tauri
   then caches the NSIS toolset under

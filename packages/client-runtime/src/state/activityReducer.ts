@@ -275,6 +275,32 @@ function visibleActiveSummaryBecomesTerminal<T extends ActivitySummary>(
   return isTerminal(resolveSummaryUpdate(current.value, incoming).status);
 }
 
+/**
+ * The server reopened a record this snapshot shows as ended: a provider reported it running
+ * again at the same time as its closure or later, which the server accepts (#206). An
+ * incremental update never moves a summary from terminal back to active, so only a fresh
+ * snapshot can show it.
+ */
+function visibleTerminalSummaryReopens<T extends ActivitySummary>(
+  summaries: ReadonlyArray<T>,
+  incoming: T,
+): boolean {
+  if (isTerminal(incoming.status) || !hasValidChronology(incoming)) {
+    return false;
+  }
+  const current = Arr.findFirst(summaries, (summary) => summary.id === incoming.id);
+  if (Option.isNone(current) || !isTerminal(current.value.status)) {
+    return false;
+  }
+  const currentUpdatedAt = timestampMillis(current.value.updatedAt);
+  const incomingUpdatedAt = timestampMillis(incoming.updatedAt);
+  return (
+    currentUpdatedAt !== undefined &&
+    incomingUpdatedAt !== undefined &&
+    incomingUpdatedAt >= currentUpdatedAt
+  );
+}
+
 function requiresSnapshotReconciliation(
   snapshot: ActivitySnapshot,
   changes: ReadonlyArray<ActivityChange>,
@@ -299,7 +325,12 @@ function requiresSnapshotReconciliation(
         break;
       case "actor-upserted":
         if (
-          visibleActiveSummaryBecomesTerminal(snapshot.actors, snapshot.actorsHasMore, change.actor)
+          visibleActiveSummaryBecomesTerminal(
+            snapshot.actors,
+            snapshot.actorsHasMore,
+            change.actor,
+          ) ||
+          visibleTerminalSummaryReopens(snapshot.actors, change.actor)
         ) {
           return true;
         }
@@ -310,7 +341,8 @@ function requiresSnapshotReconciliation(
             snapshot.workItems,
             snapshot.workItemsHasMore,
             change.workItem,
-          )
+          ) ||
+          visibleTerminalSummaryReopens(snapshot.workItems, change.workItem)
         ) {
           return true;
         }

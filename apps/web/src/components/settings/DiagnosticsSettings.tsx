@@ -1,11 +1,4 @@
-import {
-  AlertTriangleIcon,
-  CopyIcon,
-  DownloadIcon,
-  FolderOpenIcon,
-  InfoIcon,
-  RefreshCwIcon,
-} from "lucide-react";
+import { AlertTriangleIcon, CopyIcon, FolderOpenIcon, InfoIcon, RefreshCwIcon } from "lucide-react";
 import { useAtomValue } from "@effect/atom-react";
 import {
   isAtomCommandInterrupted,
@@ -16,7 +9,6 @@ import type { EnvironmentId, ServerProcessSignal } from "@bibcode/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Option from "effect/Option";
 
-import { useDiagnosticLogsDownload } from "../../diagnostics/useDiagnosticLogsDownload";
 import { cn } from "../../lib/utils";
 import { formatRelativeTime } from "../../timestampFormat";
 import { useEnvironmentQuery } from "../../state/query";
@@ -27,13 +19,9 @@ import { Button } from "../ui/button";
 import { ScrollArea } from "../ui/scroll-area";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { toastManager } from "../ui/toast";
-import {
-  SettingsPageContainer,
-  SettingsRow,
-  SettingsSection,
-  useRelativeTimeTick,
-} from "./settingsLayout";
+import { SettingsPageContainer, SettingsSection, useRelativeTimeTick } from "./settingsLayout";
 import { useAtomCommand } from "../../state/use-atom-command";
+import { DiagnosticLogsSection } from "./DiagnosticLogsSection";
 import { ProfilerSection } from "./ProfilerSection";
 import { ResourceDiagnosticsSections } from "./ResourceDiagnosticsSections";
 import { useOpenDirectoryInEditor } from "./useOpenDirectoryInEditor";
@@ -391,7 +379,6 @@ export function DiagnosticsSettingsPanel({
     error: openLogsDirectoryError,
     open: openDirectory,
   } = useOpenDirectoryInEditor("Unable to open logs folder.");
-  const { isDownloading, download: downloadLogs } = useDiagnosticLogsDownload();
 
   const openLogsDirectory = useCallback(() => {
     const logsDirectoryPath = observability?.logsDirectoryPath ?? null;
@@ -774,29 +761,10 @@ export function DiagnosticsSettingsPanel({
         )}
       </SettingsSection>
 
-      <SettingsSection title="Diagnostic logs">
-        <SettingsRow
-          title="Download diagnostic logs"
-          description={
-            <>
-              Download a redacted ZIP containing <span className="font-mono">server.log</span>,{" "}
-              <span className="font-mono">server.trace.ndjson</span>,{" "}
-              <span className="font-mono">frontend.log</span>, and any recorded{" "}
-              <span className="font-mono">profiler</span> data (without crash dumps).
-            </>
-          }
-          control={
-            <Button
-              aria-label="Download diagnostic logs"
-              disabled={isDownloading}
-              onClick={() => downloadLogs()}
-            >
-              <DownloadIcon className="size-3.5" />
-              {isDownloading ? "Preparing logs..." : "Download logs"}
-            </Button>
-          }
-        />
-      </SettingsSection>
+      <DiagnosticLogsSection
+        selectedEnvironmentId={profilerEnvironmentId}
+        onSelectEnvironment={onProfilerEnvironmentChange}
+      />
     </SettingsPageContainer>
   );
 }

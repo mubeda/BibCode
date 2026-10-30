@@ -21,7 +21,8 @@ export interface SidebarProjectAvailabilityProps {
   readonly showOpenRemoteServers?: boolean;
   readonly onRetry: (environmentId: EnvironmentId) => void;
   readonly onOpenSettings: () => void;
-  readonly onViewDiagnostics: () => void;
+  /** Opens Settings → Diagnostics with the view's environment chosen (the primary when none). */
+  readonly onViewDiagnostics: (environmentId: EnvironmentId | null) => void;
   readonly onAdoptStorage: (environmentId: EnvironmentId) => void;
   readonly onRecoverData?: ((environmentId: EnvironmentId) => void) | undefined;
 }
@@ -162,7 +163,7 @@ export function SidebarProjectAvailability({
               Settings
             </Button>
           ) : null}
-          <Button size="xs" variant="ghost" onClick={onViewDiagnostics}>
+          <Button size="xs" variant="ghost" onClick={() => onViewDiagnostics(view.environmentId)}>
             Diagnostics
           </Button>
           {view.kind === "storage-changed" && canActOnEnvironment ? (

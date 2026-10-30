@@ -12,8 +12,12 @@ use crate::activity::{
     ACTIVITY_DETAIL_MAX_LENGTH, ACTIVITY_ID_MAX_LENGTH, ACTIVITY_LABEL_MAX_LENGTH,
     ACTIVITY_SUMMARY_MAX_LENGTH, ActivityActorSummary, ActivityCapabilities, ActivityEntry,
     ActivityEntryKind, ActivityEntryTone, ActivityHistoryRecovery, ActivityLifecycle,
-    ActivityObservationState, ActivityRecordKind, ProviderActivityMutation,
+    ActivityObservationState, ActivityRecordKind, ProviderActivityMutation, interruption_summary,
+    max_timestamp,
 };
+
+/// Why a subagent closed at its parent's turn end without a stop hook (#206).
+const TURN_END_INTERRUPTION_REASON: &str = "Claude stopped listing this subagent as running";
 
 const MAX_TRACKED_ACTORS: usize = 256;
 const MAX_TRACKED_TOOL_LIFECYCLES: usize = 512;
@@ -60,6 +64,10 @@ struct ClaudeActorState {
     started_at: String,
     updated_at: String,
     terminal_at: Option<String>,
+    /// The latest hook this actor's own work sent: tool hooks never change the actor itself.
+    last_reported_at: String,
+    /// Closed at its parent's turn end without a stop hook; a later stop still completes it.
+    closed_at_turn_end: bool,
 }
 
 impl ClaudeActorState {
@@ -427,6 +435,14 @@ impl ClaudeActivityTracker {
             "SubagentStop" if self.actors.contains_key(&agent_key) => {
                 self.handle_subagent_stop(value, agent_id, &agent_key, emitted_at_ms)
             }
+            "SubagentStop"
+                if self
+                    .terminal_actors
+                    .get(&agent_key)
+                    .is_some_and(|actor| actor.closed_at_turn_end) =>
+            {
+                self.handle_late_subagent_stop(value, agent_id, &agent_key, emitted_at_ms)
+            }
             "PreToolUse" if self.actors.contains_key(&agent_key) => {
                 self.handle_pre_tool(value, agent_id, &agent_key, emitted_at_ms)
             }
@@ -477,8 +493,10 @@ impl ClaudeActivityTracker {
             status: ActivityLifecycle::Starting,
             summary: None,
             started_at: timestamp.clone(),
-            updated_at: timestamp,
+            updated_at: timestamp.clone(),
             terminal_at: None,
+            last_reported_at: timestamp,
+            closed_at_turn_end: false,
         };
         let mut output = ClaudeActivityOutput::default();
         if let Some(summary) = actor.to_summary() {
@@ -531,6 +549,98 @@ impl ClaudeActivityTracker {
             .retain(|_, lifecycle| lifecycle.owner_key != agent_key);
         let mut output = ClaudeActivityOutput::default();
         output.push(ProviderActivityMutation::UpsertActor(summary));
+        output
+    }
+
+    /// The stop hook of a subagent already closed at its parent's turn end arrived after all: the
+    /// stop is the truth, so the record completes. Its time never precedes the closure, which
+    /// both the repository and the client order by.
+    fn handle_late_subagent_stop(
+        &mut self,
+        value: &Value,
+        agent_id: &str,
+        agent_key: &str,
+        emitted_at_ms: u64,
+    ) -> ClaudeActivityOutput {
+        let semantic_key = semantic_key(&["SubagentStop", agent_id]);
+        if self.seen_events.contains(&semantic_key) {
+            return ClaudeActivityOutput::default();
+        }
+        let Some(actor) = self.terminal_actors.get(agent_key) else {
+            return ClaudeActivityOutput::default();
+        };
+        let stopped_at = unix_millis_to_timestamp(emitted_at_ms);
+        let Ok(timestamp) = max_timestamp(&stopped_at, &actor.updated_at) else {
+            return ClaudeActivityOutput::default();
+        };
+        let mut candidate = actor.clone();
+        candidate.status = ActivityLifecycle::Completed;
+        candidate.closed_at_turn_end = false;
+        candidate.summary = value
+            .get("last_assistant_message")
+            .and_then(Value::as_str)
+            .and_then(safe_summary);
+        candidate.updated_at.clone_from(&timestamp);
+        candidate.terminal_at = Some(timestamp);
+        let Some(summary) = candidate.to_summary() else {
+            return ClaudeActivityOutput::default();
+        };
+        if !self.seen_events.insert(&semantic_key) {
+            return ClaudeActivityOutput::default();
+        }
+        self.insert_terminal_actor(agent_key.to_owned(), candidate);
+        let mut output = ClaudeActivityOutput::default();
+        output.push(ProviderActivityMutation::UpsertActor(summary));
+        output
+    }
+
+    /// The parent's turn ended and Claude's complete live set no longer holds these subagents'
+    /// tasks: none of them still runs. Each still open closes as `interrupted`, because no stop
+    /// hook said how it ended; a stop that arrives later completes it.
+    pub(crate) fn handle_turn_end_absent(
+        &mut self,
+        agent_ids: &[String],
+        emitted_at_ms: u64,
+    ) -> ClaudeActivityOutput {
+        let mut output = ClaudeActivityOutput::default();
+        let closed_at = unix_millis_to_timestamp(emitted_at_ms);
+        for agent_id in agent_ids {
+            let agent_key = retained_key("agent", agent_id);
+            let Some(actor) = self.actors.get(&agent_key) else {
+                continue;
+            };
+            if actor.status.is_terminal() {
+                continue;
+            }
+            let Ok(timestamp) = max_timestamp(&closed_at, &actor.updated_at)
+                .and_then(|timestamp| max_timestamp(&timestamp, &actor.last_reported_at))
+            else {
+                continue;
+            };
+            let Ok(summary_text) = interruption_summary(
+                TURN_END_INTERRUPTION_REASON,
+                &actor.started_at,
+                &actor.last_reported_at,
+                actor.summary.as_deref(),
+            ) else {
+                continue;
+            };
+            let mut candidate = actor.clone();
+            candidate.status = ActivityLifecycle::Interrupted;
+            candidate.closed_at_turn_end = true;
+            candidate.summary = Some(summary_text);
+            candidate.updated_at.clone_from(&timestamp);
+            candidate.terminal_at = Some(timestamp);
+            let Some(summary) = candidate.to_summary() else {
+                continue;
+            };
+            self.terminal_actor_keys.insert(&agent_key);
+            self.actors.remove(&agent_key);
+            self.insert_terminal_actor(agent_key.clone(), candidate);
+            self.tool_owner_by_use_id
+                .retain(|_, lifecycle| lifecycle.owner_key != agent_key);
+            output.push(ProviderActivityMutation::UpsertActor(summary));
+        }
         output
     }
 
@@ -658,9 +768,14 @@ impl ClaudeActivityTracker {
             return ClaudeActivityOutput::default();
         }
         self.recovery_seen_events.insert(&semantic_key);
-        let Some(actor) = self.actors.get(agent_key) else {
+        let reported_at = unix_millis_to_timestamp(emitted_at_ms);
+        let Some(actor) = self.actors.get_mut(agent_key) else {
             return ClaudeActivityOutput::default();
         };
+        if let Ok(latest) = max_timestamp(&actor.last_reported_at, &reported_at) {
+            actor.last_reported_at = latest;
+        }
+        let actor = &*actor;
         let tool_name = bounded_label(raw_tool_name);
         if tool_name.is_empty() {
             return ClaudeActivityOutput::default();
@@ -787,6 +902,12 @@ impl ClaudeActivityTracker {
         }
         self.recovery_seen_events.insert(&semantic_key);
         self.tool_owner_by_use_id.remove(&tool_key);
+        let reported_at = unix_millis_to_timestamp(emitted_at_ms);
+        if let Some(actor) = self.actors.get_mut(&lifecycle.owner_key)
+            && let Ok(latest) = max_timestamp(&actor.last_reported_at, &reported_at)
+        {
+            actor.last_reported_at = latest;
+        }
         let mut output = ClaudeActivityOutput::default();
         output.push(ProviderActivityMutation::AppendEntry(entry));
         output

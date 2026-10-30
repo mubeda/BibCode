@@ -208,6 +208,39 @@ pub struct TerminalSummary {
     pub center_panel: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<TerminalLaunchCommand>,
+    /// The AI Terminal agent's state for the left panel; absent for a plain shell (#187).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_status: Option<TerminalAgentStatus>,
+}
+
+/// An AI Terminal agent's state as its observer last reported it.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TerminalAgentStatusState {
+    Working,
+    Blocked,
+    Waiting,
+    Done,
+    /// No observer reports this agent: an unsupported provider or platform, or one that could
+    /// not be prepared. Never shown as working or done.
+    Unavailable,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalAgentStatus {
+    pub state: TerminalAgentStatusState,
+    /// The turn that ended failed, or the agent exited with an error.
+    #[serde(default)]
+    pub failed: bool,
+    /// How old the observation was on this server's clock when the summary was built; absent
+    /// before the observer reported anything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub age_ms: Option<u64>,
+    /// When the observer reported it, on this server's clock: a token that changes with every
+    /// new report, so a client restamps its receipt only for new evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]

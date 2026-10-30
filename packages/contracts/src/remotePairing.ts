@@ -50,6 +50,11 @@ export const E2eeAuthenticatedMessage = Schema.Struct({
   environmentId: Schema.optionalKey(EnvironmentId),
   storageInstanceId: Schema.optionalKey(TrimmedNonEmptyString),
   pairingConfirmationRequired: Schema.optionalKey(Schema.Literal(true)),
+  /**
+   * The minted credential's scopes (pairing replies from #202 on). Kept as strings, so a scope
+   * this client does not know never fails a pairing; `bibcode diagnostics pair` reads it.
+   */
+  scopes: Schema.optionalKey(Schema.Array(Schema.String)),
   features: Schema.optionalKey(E2eeChannelFeatures),
 });
 export type E2eeAuthenticatedMessage = typeof E2eeAuthenticatedMessage.Type;

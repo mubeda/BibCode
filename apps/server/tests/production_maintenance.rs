@@ -1130,3 +1130,122 @@ async fn a_loopback_desktop_runtime_shares_one_maintenance_owner_between_http_an
         .expect("cancel exits the quiesced runtime");
     server.join().await.expect("loopback runtime joins");
 }
+
+/// Seeds a chat scope with one subagent left `running`, as a server that stopped mid-run would.
+async fn seed_open_subagent(
+    database: &bibcode_server::persistence::Database,
+    thread_id: &str,
+    provider: &str,
+) {
+    use bibcode_server::activity::{
+        ActivityCapabilities, ActivityProjection, ActivityRepository, ActivityScopeSeed,
+        ProviderActivityMutation,
+    };
+    let projection = ActivityProjection::new(ActivityRepository::new(database.clone()));
+    let scope_id = format!("thread:{thread_id}");
+    projection
+        .ensure_scope(
+            ActivityScopeSeed::thread(
+                &scope_id,
+                thread_id,
+                provider,
+                Some(provider),
+                ActivityCapabilities::structured_full(false),
+            )
+            .expect("thread scope"),
+        )
+        .await
+        .expect("scope");
+    projection
+        .apply(
+            &scope_id,
+            format!("seed:{thread_id}"),
+            vec![
+                ProviderActivityMutation::upsert_actor("actor:open", None, "Open", "running")
+                    .expect("actor"),
+            ],
+            time::OffsetDateTime::now_utc()
+                .format(&time::format_description::well_known::Rfc3339)
+                .expect("timestamp"),
+        )
+        .await
+        .expect("open subagent");
+}
+
+fn subagent_status(database_path: &std::path::Path, thread_id: &str) -> String {
+    let connection = rusqlite::Connection::open(database_path).expect("read the state database");
+    connection
+        .query_row(
+            "SELECT status FROM activity_records WHERE scope_id = ? AND record_id = 'actor:open'",
+            [format!("thread:{thread_id}")],
+            |row| row.get(0),
+        )
+        .expect("subagent record")
+}
+
+/// Records of subagents a previous server left open are repaired at start and never hold up the
+/// update's protection (#206): a Claude subagent closes, an OpenCode one whose server BiBCode
+/// cannot prove it ran stays as it was, and `prepare` still succeeds within its bound.
+#[tokio::test]
+async fn open_subagent_records_are_repaired_at_start_and_never_hold_up_update_protection() {
+    let root = tempfile::tempdir().expect("records data root");
+    // OpenCode points at a server the user runs, so its open subagent may still run.
+    let mut providers = hermetic_providers::BUILTIN_PROVIDER_DRIVERS
+        .iter()
+        .map(|driver| ((*driver).to_owned(), json!({"enabled": false})))
+        .collect::<serde_json::Map<String, Value>>();
+    providers.insert(
+        "opencode".to_owned(),
+        json!({"enabled": false, "serverUrl": "http://127.0.0.1:9"}),
+    );
+    hermetic_providers::write_hermetic_settings(
+        &ServerConfig::new(root.path()).state_dir(),
+        json!({"providers": providers}),
+    );
+    let config = desktop_config(root.path(), "records-bootstrap");
+    let first = ServerRuntime::start(config.clone())
+        .await
+        .expect("first runtime");
+    first.shutdown();
+    first.join().await.expect("first runtime joins");
+
+    let database = bibcode_server::persistence::Database::open_existing(config.database_path())
+        .await
+        .expect("state database");
+    seed_open_subagent(&database, "claude-thread", "claudeAgent").await;
+    seed_open_subagent(&database, "opencode-thread", "opencode").await;
+    drop(database);
+
+    let server = ServerRuntime::start(config.clone())
+        .await
+        .expect("restarted runtime");
+    assert_eq!(
+        subagent_status(&config.database_path(), "claude-thread"),
+        "interrupted"
+    );
+    assert_eq!(
+        subagent_status(&config.database_path(), "opencode-thread"),
+        "running"
+    );
+
+    let maintenance = server.update_maintenance().expect("maintenance owner");
+    let started = Instant::now();
+    let prepared = timeout(Duration::from_secs(45), maintenance.prepare())
+        .await
+        .expect("prepare stays within its bound")
+        .expect("prepare succeeds with open subagent records");
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "open records must not delay protection: {:?}",
+        started.elapsed()
+    );
+    maintenance
+        .cancel(uuid::Uuid::parse_str(&prepared.operation_id).expect("uuid"))
+        .await
+        .expect("cancel succeeds");
+    maintenance.shutdown_after_response();
+    timeout(Duration::from_secs(2), server.wait_for_shutdown())
+        .await
+        .expect("cancel exits");
+    server.join().await.expect("join");
+}

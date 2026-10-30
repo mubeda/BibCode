@@ -1,5 +1,6 @@
 import { scopedThreadKey, scopeThreadRef } from "@bibcode/client-runtime/environment";
 import {
+  ACTIVITY_ID_MAX_LENGTH,
   EnvironmentId,
   ProviderDriverKind,
   ProviderInstanceId,
@@ -11,6 +12,7 @@ import { CENTER_PANEL_ROOT_GROUP_ID } from "./centerPanelLayout";
 import {
   HOST_SURFACE_ID,
   migratePersistedCenterPanelState,
+  selectActivityPaneState,
   selectActiveCenterSurface,
   selectFocusedCenterPanelGroup,
   selectFocusedCenterSurface,
@@ -379,6 +381,44 @@ describe("centerPanelStore", () => {
       expect(store().byThreadKey).toBe(before);
     });
 
+    it("restores and focuses the host chat after every surface was closed", () => {
+      store().closeAllSurfaces(HOST, CENTER_PANEL_ROOT_GROUP_ID);
+      store().openHostChat(HOST);
+      // Back to the implicit default, so nothing is persisted for the thread.
+      expect(store().byThreadKey).toEqual({});
+      expect(selectFocusedCenterSurface(stateOf())?.id).toBe(HOST_SURFACE_ID);
+    });
+
+    it("brings back a host chat closed beside a chat panel and a terminal", () => {
+      store().openChatPanel(HOST, PANEL_A);
+      store().openTerminalPanel(HOST, "term-1");
+      store().closeSurface(HOST, CENTER_PANEL_ROOT_GROUP_ID, HOST_SURFACE_ID);
+      expect(surfaceIds()).toEqual([`chat:${PANEL_A}`, "terminal:term-1"]);
+
+      store().openHostChat(HOST);
+
+      // The host leads the surface list again, joins the focused group and takes focus.
+      expect(surfaceIds()).toEqual([HOST_SURFACE_ID, `chat:${PANEL_A}`, "terminal:term-1"]);
+      expect(rootGroup().surfaceIds).toEqual([
+        `chat:${PANEL_A}`,
+        "terminal:term-1",
+        HOST_SURFACE_ID,
+      ]);
+      expect(selectFocusedCenterSurface(stateOf())?.id).toBe(HOST_SURFACE_ID);
+    });
+
+    it("focuses the host chat where it already is", () => {
+      const groupRight = createRightGroup();
+      store().focusGroup(HOST, groupRight);
+      store().openHostChat(HOST);
+      expect(stateOf().focusedGroupId).toBe(CENTER_PANEL_ROOT_GROUP_ID);
+      expect(rootGroup().activeSurfaceId).toBe(HOST_SURFACE_ID);
+      expect(surfaceIds().filter((id) => id === HOST_SURFACE_ID)).toHaveLength(1);
+      const before = store().byThreadKey;
+      store().openHostChat(HOST);
+      expect(store().byThreadKey).toBe(before);
+    });
+
     it("persists an explicit empty root group after closing all surfaces", () => {
       const removed = store().closeAllSurfaces(HOST, CENTER_PANEL_ROOT_GROUP_ID);
       expect(removed.map((surface) => surface.id)).toEqual([HOST_SURFACE_ID]);
@@ -563,3 +603,194 @@ function createFourGroups() {
   expect(stateOf().groups).toHaveLength(4);
   return randomUUID;
 }
+
+describe("centerPanelStore pane Activity state", () => {
+  const TERMINAL_SURFACE = "terminal:term-activity";
+  const paneOf = (surfaceId: string, ref = HOST) =>
+    selectActivityPaneState(store().activityPanes, ref, surfaceId);
+
+  beforeEach(() =>
+    useCenterPanelStore.setState({
+      byThreadKey: {},
+      activityPanes: {},
+      pendingChatPanelThreadKeys: new Set(),
+    }),
+  );
+
+  it("starts collapsed on Subagents and writes nothing for a default pane", () => {
+    expect(paneOf(HOST_SURFACE_ID)).toEqual({
+      expanded: false,
+      section: "subagents",
+      selectedRecordKind: null,
+      selectedRecordId: null,
+    });
+    store().setActivityPaneExpanded(HOST, HOST_SURFACE_ID, false);
+    expect(store().activityPanes).toEqual({});
+  });
+
+  it("expands onto a section, keeps its record only for the same section, and collapses", () => {
+    store().setActivityPaneExpanded(HOST, HOST_SURFACE_ID, true, "subagents");
+    store().navigateActivityPane(HOST, HOST_SURFACE_ID, {
+      section: "subagents",
+      selectedRecordKind: "actor",
+      selectedRecordId: "actor-1",
+    });
+    store().setActivityPaneExpanded(HOST, HOST_SURFACE_ID, false);
+    store().setActivityPaneExpanded(HOST, HOST_SURFACE_ID, true, "subagents");
+    expect(paneOf(HOST_SURFACE_ID)).toEqual({
+      expanded: true,
+      section: "subagents",
+      selectedRecordKind: "actor",
+      selectedRecordId: "actor-1",
+    });
+
+    store().setActivityPaneExpanded(HOST, HOST_SURFACE_ID, false);
+    store().setActivityPaneExpanded(HOST, HOST_SURFACE_ID, true, "backgroundTasks");
+    expect(paneOf(HOST_SURFACE_ID)).toEqual({
+      expanded: true,
+      section: "backgroundTasks",
+      selectedRecordKind: null,
+      selectedRecordId: null,
+    });
+  });
+
+  it("normalizes a route whose record does not belong to its section", () => {
+    store().navigateActivityPane(HOST, HOST_SURFACE_ID, {
+      section: "backgroundTasks",
+      selectedRecordKind: "actor",
+      selectedRecordId: "actor-1",
+    });
+    expect(paneOf(HOST_SURFACE_ID)).toMatchObject({
+      section: "backgroundTasks",
+      selectedRecordKind: null,
+      selectedRecordId: null,
+    });
+  });
+
+  it("drops a selected record id longer than an Activity id can be", () => {
+    store().navigateActivityPane(HOST, HOST_SURFACE_ID, {
+      section: "subagents",
+      selectedRecordKind: "actor",
+      selectedRecordId: "x".repeat(ACTIVITY_ID_MAX_LENGTH + 1),
+    });
+    expect(paneOf(HOST_SURFACE_ID)).toMatchObject({
+      selectedRecordKind: null,
+      selectedRecordId: null,
+    });
+    store().navigateActivityPane(HOST, HOST_SURFACE_ID, {
+      section: "subagents",
+      selectedRecordKind: "actor",
+      selectedRecordId: "x".repeat(ACTIVITY_ID_MAX_LENGTH),
+    });
+    expect(paneOf(HOST_SURFACE_ID).selectedRecordId).toHaveLength(ACTIVITY_ID_MAX_LENGTH);
+  });
+
+  it("ignores a pane whose surface the thread does not have", () => {
+    store().setActivityPaneExpanded(HOST, TERMINAL_SURFACE, true, "subagents");
+    store().navigateActivityPane(HOST, `chat:${PANEL_A}`, {
+      section: "backgroundTasks",
+      selectedRecordKind: null,
+      selectedRecordId: null,
+    });
+    expect(store().activityPanes).toEqual({});
+  });
+
+  it("drops a pane's state on every path that removes its surface", () => {
+    const expandTerminal = () => {
+      store().openTerminalPanel(HOST, "term-activity");
+      store().setActivityPaneExpanded(HOST, TERMINAL_SURFACE, true, "subagents");
+      expect(paneOf(TERMINAL_SURFACE).expanded).toBe(true);
+    };
+    const groupOf = (surfaceId: string) =>
+      stateOf().groups.find((group) => group.surfaceIds.includes(surfaceId))!.id;
+
+    expandTerminal();
+    store().closeSurface(HOST, groupOf(TERMINAL_SURFACE), TERMINAL_SURFACE);
+    expect(paneOf(TERMINAL_SURFACE).expanded).toBe(false);
+
+    expandTerminal();
+    store().removeTerminalPanel(HOST, "term-activity");
+    expect(paneOf(TERMINAL_SURFACE).expanded).toBe(false);
+
+    expandTerminal();
+    store().closeOtherSurfaces(HOST, groupOf(HOST_SURFACE_ID), HOST_SURFACE_ID);
+    expect(paneOf(TERMINAL_SURFACE).expanded).toBe(false);
+
+    expandTerminal();
+    store().closeSurfacesToRight(HOST, groupOf(HOST_SURFACE_ID), HOST_SURFACE_ID);
+    expect(paneOf(TERMINAL_SURFACE).expanded).toBe(false);
+
+    expandTerminal();
+    store().closeAllSurfaces(HOST, groupOf(TERMINAL_SURFACE));
+    expect(paneOf(TERMINAL_SURFACE).expanded).toBe(false);
+    expect(store().activityPanes).toEqual({});
+  });
+
+  it("drops the host pane's state when the main pane is replaced with a terminal", () => {
+    store().setActivityPaneExpanded(HOST, HOST_SURFACE_ID, true, "subagents");
+    const terminalId = store().replaceMainWithTerminal(HOST, [], {});
+    expect(surfaceIds()).toEqual([`terminal:${terminalId}`]);
+    expect(store().activityPanes).toEqual({});
+  });
+
+  it("drops a removed thread's panes, including its host pane", () => {
+    store().openChatPanel(HOST, PANEL_A);
+    store().setActivityPaneExpanded(HOST, HOST_SURFACE_ID, true, "subagents");
+    store().setActivityPaneExpanded(HOST, `chat:${PANEL_A}`, true, "backgroundTasks");
+    store().removeThread(scopeThreadRef(HOST.environmentId, PANEL_A));
+    expect(Object.keys(store().activityPanes[scopedThreadKey(HOST)] ?? {})).toEqual([
+      HOST_SURFACE_ID,
+    ]);
+
+    store().removeThread(HOST);
+    expect(store().activityPanes).toEqual({});
+  });
+
+  it("migrates version 3 state with no pane Activity and keeps valid entries", () => {
+    const hostKey = scopedThreadKey(HOST);
+    expect(migratePersistedCenterPanelState({ byThreadKey: {} }).activityPanes).toEqual({});
+    const migrated = migratePersistedCenterPanelState({
+      byThreadKey: {},
+      activityPanes: {
+        [hostKey]: {
+          [HOST_SURFACE_ID]: { expanded: true, section: "backgroundTasks" },
+          "terminal:gone": { expanded: true },
+        },
+      },
+    });
+    expect(migrated.activityPanes).toEqual({
+      [hostKey]: {
+        [HOST_SURFACE_ID]: {
+          expanded: true,
+          section: "backgroundTasks",
+          selectedRecordKind: null,
+          selectedRecordId: null,
+        },
+      },
+    });
+  });
+
+  it("re-validates same-version pane state on every hydration", () => {
+    const hostKey = scopedThreadKey(HOST);
+    const merge = useCenterPanelStore.persist.getOptions().merge!;
+    const merged = merge(
+      {
+        byThreadKey: {},
+        activityPanes: {
+          [hostKey]: {
+            [HOST_SURFACE_ID]: {
+              expanded: "yes",
+              section: "unknown",
+              selectedRecordKind: "actor",
+              selectedRecordId: " padded ",
+            },
+            "chat:missing": { expanded: true },
+          },
+          broken: "not-an-object",
+        },
+      },
+      store(),
+    );
+    expect(merged.activityPanes).toEqual({});
+  });
+});

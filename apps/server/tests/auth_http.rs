@@ -68,7 +68,8 @@ fn language_neutral_auth_fixtures_match_the_rust_http_inventory() {
             "access:read",
             "access:write",
             "relay:read",
-            "relay:write"
+            "relay:write",
+            "diagnostics:read"
         ])
     );
     for fixture in manifest["fixtures"].as_array().expect("auth fixture list") {

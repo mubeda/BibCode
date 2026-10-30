@@ -22,7 +22,7 @@ use crate::{
     assets::{AssetAccess, ResolvedAsset},
     auth::AuthService,
     crypto::sha256_hex,
-    diagnostic_bundle::DiagnosticBundleService,
+    diagnostic_bundle::{DiagnosticBundleIdentity, DiagnosticBundleService},
     diagnostics::{
         DesktopUiProcessObserver, DiagnosticsMonitor, NativeProcessSampler, NativeResourceSampler,
         ProcessAttributionRegistry, TraceDiagnosticsStore, bound_diagnostic_string,
@@ -69,8 +69,9 @@ use crate::{
         pipelines_rpc::{PipelinesRpcServices, register_pipelines_rpc},
         provider_runtime::{
             NativeProviderDriverFactory, ProviderRuntimeSupervisor, SupervisorOptions,
-            drive_thread_compaction, prepare_thread_rewind, reconcile_abandoned_provider_sessions,
-            rewind_thread_conversation,
+            drive_thread_compaction, interrupt_activity_of_ended_sessions, prepare_thread_rewind,
+            reconcile_abandoned_provider_sessions, rewind_thread_conversation,
+            startup_process_ownership,
         },
         pull_requests_rpc::{PullRequestsRpcServices, register_pull_requests_rpc},
         relay::relay_client_service,
@@ -130,6 +131,8 @@ pub struct ProductionRuntime {
     provider_update_checks: ProviderUpdateCheckTask,
     orchestration_effects: OrchestrationEffects,
     diagnostic_bundle: DiagnosticBundleService,
+    /// `bibcode diagnostics download`, relayed by the desktop app (#201).
+    diagnostic_logs_relay: crate::production::diagnostic_logs_relay::DiagnosticLogsRelay,
     managed_endpoint: ManagedEndpointRuntime,
     _worktree_catalog: WorktreeCatalogService,
     worktree_catalog_operations: WorktreeCatalogOperationRuntime,
@@ -172,6 +175,14 @@ impl ProductionRuntime {
     #[must_use]
     pub fn preview_gateway(&self) -> PreviewGateway {
         self.preview_gateway.clone()
+    }
+
+    /// The relay whose RPC methods this runtime registered; the HTTP route shares it.
+    #[must_use]
+    pub fn diagnostic_logs_relay(
+        &self,
+    ) -> crate::production::diagnostic_logs_relay::DiagnosticLogsRelay {
+        self.diagnostic_logs_relay.clone()
     }
 
     pub fn device_manager(&self) -> crate::device::DeviceManager {
@@ -345,9 +356,29 @@ impl ProductionRuntime {
             .interrupt_unresolved_terminal_scopes()
             .await
             .map_err(|error| error.to_string())?;
+        // Before abandoned sessions settle, while their runtime rows still say who ran them. One
+        // ownership rule decides both what this closes and what request expiry keeps.
+        let process_ownership = startup_process_ownership(
+            &repositories,
+            control.opencode_instances_with_server_url().await,
+        )
+        .await;
+        interrupt_activity_of_ended_sessions(&process_ownership, &activity_projections.chat())
+            .await;
         reconcile_abandoned_provider_sessions(&orchestration)
             .await
             .map_err(|error| error.to_string())?;
+        // No provider session is live yet: a request still open now waits on nobody (#187).
+        match orchestration
+            .expire_requests_of_settled_sessions(&process_ownership)
+            .await
+        {
+            Ok(0) => {}
+            Ok(expired) => tracing::info!(expired, "expired requests of settled sessions"),
+            Err(error) => {
+                tracing::warn!(%error, "failed to expire requests of settled sessions");
+            }
+        }
         let referenced_attachment_ids = repositories
             .list_referenced_attachment_ids()
             .await
@@ -416,8 +447,16 @@ impl ProductionRuntime {
             },
             process_attribution.clone(),
         );
-        let diagnostic_bundle = DiagnosticBundleService::new(&state_paths.logs_dir)
-            .with_profiler_dir(profiler_dir(&state_paths.state_dir));
+        let diagnostic_bundle = DiagnosticBundleService::new(
+            &state_paths.logs_dir,
+            DiagnosticBundleIdentity {
+                environment_id: config.environment_id.clone(),
+                storage_instance_id: config.storage_instance_id.as_ref().map(ToString::to_string),
+                label: config.environment_label.clone(),
+                server_version: config.server_version.clone(),
+            },
+        )
+        .with_profiler_dir(profiler_dir(&state_paths.state_dir));
         let operational_logs = OperationalLogs::start(
             &state_paths,
             &terminal_manager,
@@ -631,6 +670,16 @@ impl ProductionRuntime {
         );
         register_workspace_preview_rpc(&mut registry, workspace_preview);
         crate::production::device_rpc::register_device_rpc(&mut registry, device_manager.clone());
+        crate::production::diagnostic_logs_rpc::register_diagnostic_logs_rpc(
+            &mut registry,
+            diagnostic_bundle.clone(),
+        );
+        let diagnostic_logs_relay =
+            crate::production::diagnostic_logs_relay::DiagnosticLogsRelay::new();
+        crate::production::diagnostic_logs_relay::register_diagnostic_logs_relay_rpc(
+            &mut registry,
+            diagnostic_logs_relay.clone(),
+        );
         let git_manager = GitManagerRpcServices::with_dependencies(
             git_repository.clone(),
             status_broadcaster.clone(),
@@ -694,6 +743,7 @@ impl ProductionRuntime {
             provider_update_checks,
             orchestration_effects,
             diagnostic_bundle,
+            diagnostic_logs_relay,
             managed_endpoint,
             _worktree_catalog: worktree_catalog,
             worktree_catalog_operations,
@@ -821,6 +871,7 @@ impl ProductionRuntime {
         Ok(DiagnosticLogsHttpResponse {
             filename: bundle.filename,
             bytes: bundle.bytes,
+            slot: bundle.slot,
         })
     }
 
@@ -2850,12 +2901,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn startup_interrupts_only_unresolved_terminal_activity() {
+    async fn startup_interrupts_unresolved_terminal_and_owned_chat_activity() {
         let state = TempDir::new().expect("temporary state directory");
         let config = ServerConfig::new(state.path()).with_bind("127.0.0.1", 0);
         hermetic_providers::write_hermetic_settings(
             &config.state_dir(),
-            json!({"enableChatAgentActivity": true, "enableTerminalAgentActivity": true}),
+            json!({
+                "enableChatAgentActivity": true,
+                "enableTerminalAgentActivity": true,
+                // OpenCode runs on a server the user runs, so its work may outlive BiBCode.
+                "providers": {"opencode": {"serverUrl": "http://127.0.0.1:9"}}
+            }),
         );
         let database = Database::open_in_memory().await.expect("database");
         database
@@ -2884,6 +2940,19 @@ mod tests {
             ActivityCapabilities::structured_full(false),
         )
         .expect("thread scope");
+        // No runtime row proves BiBCode ran this OpenCode server, so its work may still run.
+        let external_scope = ActivityScopeSeed::thread(
+            "thread:restart-external",
+            "thread-restart-external",
+            "opencode",
+            Some("opencode"),
+            ActivityCapabilities::structured_full(false),
+        )
+        .expect("external scope");
+        projection
+            .ensure_scope(external_scope.clone())
+            .await
+            .expect("external scope persistence");
         projection
             .ensure_scope(terminal_scope.clone())
             .await
@@ -2934,6 +3003,23 @@ mod tests {
             )
             .await
             .expect("thread activity persistence");
+        projection
+            .apply(
+                &external_scope.scope_id,
+                "external:restart-fixture".to_owned(),
+                vec![
+                    ProviderActivityMutation::upsert_actor(
+                        "external-active",
+                        None,
+                        "External active",
+                        "running",
+                    )
+                    .expect("external active actor"),
+                ],
+                now_iso(),
+            )
+            .await
+            .expect("external activity persistence");
 
         let runtime = ProductionRuntime::start(
             &config,
@@ -2987,9 +3073,201 @@ mod tests {
                 .find(|actor| actor.id == "thread-active")
                 .expect("thread active actor")
                 .status,
+            ActivityLifecycle::Interrupted
+        );
+        let thread_active = thread_snapshot
+            .actors
+            .iter()
+            .find(|actor| actor.id == "thread-active")
+            .expect("thread active actor");
+        assert_eq!(
+            Some(&thread_active.updated_at),
+            thread_active.terminal_at.as_ref()
+        );
+        assert!(
+            thread_active
+                .summary
+                .as_deref()
+                .is_some_and(|summary| summary
+                    .starts_with("BiBCode restarted before this subagent reported;")),
+            "{:?}",
+            thread_active.summary
+        );
+        assert_eq!(thread_snapshot.counts.subagents.active, 0);
+        let external_snapshot = runtime
+            .activity_projections
+            .chat()
+            .snapshot(&ActivityScopeRef::Thread {
+                thread_id: "thread-restart-external".to_owned(),
+            })
+            .await
+            .expect("external snapshot");
+        assert_eq!(
+            external_snapshot.actors[0].status,
             ActivityLifecycle::Running
         );
         runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn production_restart_expires_same_id_questions_on_both_settled_chats() {
+        const AT: &str = "2026-10-28T10:00:00Z";
+        let state = TempDir::new().expect("state");
+        let config = ServerConfig::new(state.path()).with_bind("127.0.0.1", 0);
+        hermetic_providers::write_hermetic_settings(
+            &config.state_dir(),
+            json!({"providers":{
+                "codex":{"enabled":false},
+                "claudeAgent":{"enabled":false},
+                "cursor":{"enabled":false},
+                "grok":{"enabled":false},
+                "opencode":{"enabled":false}
+            }}),
+        );
+        let database = Database::open_in_memory().await.expect("database");
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("migrations");
+        let initial = ProductionRuntime::start(
+            &config,
+            database.clone(),
+            AuthService::new(&config, vec![7_u8; 32]),
+            vec![9_u8; 32],
+            Arc::new(crate::diagnostics::NotApplicableUiProcessObserver),
+        )
+        .await
+        .expect("first production start");
+        initial
+            .orchestration
+            .dispatch(
+                serde_json::from_value(json!({
+                    "type":"project.create", "commandId":"expiry-project",
+                    "projectId":"expiry-project", "title":"Expiry",
+                    "workspaceRoot":state.path(), "defaultModelSelection":null,
+                    "createdAt":AT
+                }))
+                .expect("project command"),
+            )
+            .await
+            .expect("project");
+        let first = initial
+            .orchestration
+            .repositories()
+            .list_threads_by_project("expiry-project".to_owned())
+            .await
+            .expect("threads")
+            .into_iter()
+            .find(|thread| thread.kind == "default")
+            .expect("default thread")
+            .thread_id;
+        let second = "expiry-second";
+        initial
+            .orchestration
+            .dispatch(
+                serde_json::from_value(json!({
+                    "type":"thread.create", "commandId":"expiry-second",
+                    "threadId":second, "projectId":"expiry-project", "title":"Second",
+                    "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+                    "runtimeMode":"full-access", "interactionMode":"default",
+                    "branch":null, "worktreePath":null, "createdAt":AT
+                }))
+                .expect("second thread command"),
+            )
+            .await
+            .expect("second thread");
+        for thread_id in [&first[..], second] {
+            let id = uuid::Uuid::new_v4();
+            initial
+                .orchestration
+                .dispatch(
+                    serde_json::from_value(json!({
+                        "type":"thread.session.set",
+                        "commandId":format!("session:{id}"),
+                        "threadId":thread_id, "createdAt":AT,
+                        "session":{
+                            "threadId":thread_id, "status":"ready", "providerName":"codex",
+                            "runtimeMode":"approval-required", "activeTurnId":null,
+                            "lastError":null, "updatedAt":AT
+                        }
+                    }))
+                    .expect("session command"),
+                )
+                .await
+                .expect("settled session");
+            initial
+                .orchestration
+                .dispatch(
+                    serde_json::from_value(json!({
+                        "type":"thread.activity.append",
+                        "commandId":format!("ask:{id}"),
+                        "threadId":thread_id, "createdAt":AT,
+                        "activity":{
+                            "id":format!("ask:{id}"), "tone":"approval",
+                            "kind":"user-input.requested", "summary":"Question",
+                            "payload":{"requestId":"user-input:1","questions":[]},
+                            "turnId":null, "createdAt":AT
+                        }
+                    }))
+                    .expect("ask command"),
+                )
+                .await
+                .expect("question");
+        }
+        initial.shutdown().await;
+        for thread_id in [&first[..], second] {
+            let id = thread_id.to_owned();
+            let pending: i64 = database
+                .call(move |connection| {
+                    let count = connection.query_row(
+                        "SELECT pending_user_input_count FROM projection_threads WHERE thread_id = ?",
+                        [id],
+                        |row| row.get(0),
+                    )?;
+                    Ok(count)
+                })
+                .await
+                .expect("pending before restart");
+            assert_eq!(pending, 1, "{thread_id}");
+        }
+
+        let restarted = ProductionRuntime::start(
+            &config,
+            database.clone(),
+            AuthService::new(&config, vec![7_u8; 32]),
+            vec![9_u8; 32],
+            Arc::new(crate::diagnostics::NotApplicableUiProcessObserver),
+        )
+        .await
+        .expect("second production start");
+        for thread_id in [&first[..], second] {
+            let row = restarted
+                .orchestration
+                .repositories()
+                .get_thread(thread_id.to_owned())
+                .await
+                .expect("thread")
+                .expect("thread exists");
+            assert_eq!(row.pending_user_input_count, 0, "{thread_id}");
+            let id = thread_id.to_owned();
+            let expiries: i64 = database
+                .call(move |connection| {
+                    let count = connection.query_row(
+                        "SELECT COUNT(*) FROM projection_thread_activities
+                         WHERE thread_id = ? AND kind = 'user-input.expired'",
+                        [id],
+                        |row| row.get(0),
+                    )?;
+                    Ok(count)
+                })
+                .await
+                .expect("expiry count");
+            assert_eq!(expiries, 1, "{thread_id}");
+        }
+        restarted.shutdown().await;
     }
 
     #[tokio::test]

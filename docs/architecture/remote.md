@@ -261,7 +261,10 @@ active database row whose in-memory state and latch still appear pending.
 The one-time token remains consumed, so the user generates a new offer, but the
 pending credential cannot reconnect as steady-state authority. The server
 returns `e2ee_authenticated` with the minted string credential,
-`environmentId`, optional `storageInstanceId`, and
+`environmentId`, optional `storageInstanceId`, the credential's `scopes` (from
+#202; older servers omit them, and a client whose schema predates the field
+drops it, since `Schema.Struct` decoding ignores excess keys, which
+`remotePairing.test.ts` pins), and
 `pairingConfirmationRequired: true` exactly when the grant was off-host. The
 reply flag is the client's only confirmation signal: when it is present the
 client must call `auth.confirmPairing` on the same channel before the
@@ -530,6 +533,67 @@ restart. Failures are classified as `unreachable`,
 failure. The client does not claim transparent retry with the same one-time
 code.
 
+### Command-line diagnostics pairing
+
+`bibcode diagnostics pair` and `bibcode diagnostics download --remote` (#202)
+are the one production Rust client of `/ws-e2ee`
+(`apps/server/src/rpc/e2ee_client.rs`; design in
+`docs/superpowers/specs/2026-10-27-cli-pairing-design.md`). The command pairs as
+its own device and holds no connection between runs.
+
+- **Credential.** The remote mints the offer with `bibcode pairing offer
+  --access diagnostics` (or the pairing-offer route with
+  `scopes: ["diagnostics:read"]`); its grant holds only `diagnostics:read`,
+  which allows no method other than `server.downloadDiagnosticLogs` (plus
+  `auth.confirmPairing` for its own pending pairing), and is
+  labelled `<name> (diagnostics)`. `pair` keeps the credential only when the
+  pairing reply's `scopes` are exactly `["diagnostics:read"]`; a wider grant,
+  or a server that sends no `scopes`, is refused before anything is written,
+  and closing the unconfirmed channel revokes the pending session as for any
+  client.
+- **Client.** It opens `ws(s)://<offer endpoint>/ws-e2ee` (the path replaced,
+  as the web client does; no proxy, no redirect), runs Noise NK pinned to the
+  offer's host key with empty payloads, and treats close code 4403 as a host
+  identity mismatch. It offers no channel features, so only `0x00` and `0x01`
+  records are valid; it refuses empty continuations, more than 2,048 records,
+  and logical messages over 1 MiB (the pre-auth reply over 64 KiB). Requests
+  use the same `ClientMessage`/`ServerMessage` types as the server, and each
+  stream chunk is acknowledged only after its items were accepted. An `https`
+  endpoint uses rustls with the operating system's verifier (as `reqwest`
+  does).
+- **Pairing order.** Pinned handshake, `e2ee_auth{pairing}`, the scope check,
+  the in-channel `storageInstanceId` against the offer's, then the record is
+  written (create, never replace), then `auth.confirmPairing` on the same
+  channel when the reply asks for it. A typed refusal deletes the record. A
+  lost answer is settled by one bearer reconnect: authenticated keeps the
+  record, `unauthorized` deletes it, anything else keeps it and says so. The
+  whole attempt, from the name check through any rollback, holds an advisory OS
+  lock on `<name>.lock` in the store directory (`flock` on Unix, `LockFileEx`
+  on Windows), as does `forget`; the system releases it when the holder exits,
+  crashed or not, so a dead holder never blocks the name. A `forget` and
+  re-pair of the same name therefore waits for a pairing in progress. Under
+  the lock, a rollback reads the record and deletes it only if it holds this
+  attempt's random pairing id; nothing is ever moved aside, so a crash leaves
+  the record readable under its name. A rollback that cannot delete the record
+  exits 1 with `rollback-failed` and names `bibcode diagnostics forget <name>`.
+  A record whose
+  write succeeded but left a temporary link behind counts as stored and is
+  confirmed; the leftover file is reported.
+- **Storage.** One record per remote in
+  `<state dir>/diagnostics-remotes/<name>.bin` through `auth::SecretStore`
+  (directory 0700, files 0600 on Unix, owner-only ACLs on Windows): endpoint,
+  host key, environment and store ids, the remote's name, pairing time, the
+  pairing id, and the credential, which is never printed. `forget` deletes the
+  record only.
+- **Download.** Bearer `e2ee_auth`, then `server.downloadDiagnosticLogs` with
+  an empty `frontendLog`. `Started` must name the stored `storageInstanceId`
+  and `environmentId` before any byte is kept, then the archive checks shared
+  with the relay path (`diagnostics/archive.rs`) apply: 20 MiB, each item's
+  encoded length against the 64 KiB item bound and the bytes still expected
+  before it is decoded, the exact total, the inner `manifest.json`, and a
+  publish that never replaces a file. Redaction, the size limit and the
+  crash-dump scope check are the remote's own, unchanged.
+
 ### Remote Servers settings and pairing entry points
 
 Settings exposes remote connectivity at `/settings/remote-servers` as **Remote
@@ -543,6 +607,33 @@ pairing code first, keeps manual endpoint-and-token entry under **Advanced**,
 and presents SSH as a first-class desktop option. BiBCode Connect relay rows
 remain part of the same tab. The **Share this host** tab owns exposure and
 pairing-code generation for the primary environment.
+
+Settings pages read and write the primary server's settings. Each remote server
+keeps its own persisted settings, and nothing in Settings edits those copies.
+**Default Agent** is therefore a primary-server setting for projects on every
+server. Create Worktree and Add Project read it through `usePrimaryDefaultAgent`
+and apply it to the project's own server. That server's provider list and
+provider settings decide which agents can start there.
+
+Create Worktree:
+
+- **Fallback:** when the default agent is unavailable on that server, the
+  dialog falls back to the first ready chat and says why.
+- **Waiting:** the dialog waits, and says why, until all of these hold. Waiting
+  avoids creating a thread whose provider runtime would reject the first launch.
+  - The server's connection phase is `connected`. A server whose session
+    dropped keeps its last config snapshot, so the phase is checked first.
+  - The server's config has arrived.
+  - At least one agent is ready on that server.
+
+Add Project never waits for an agent, because there is no picker to explain the
+wait and first-time users add a project before they sign in:
+
+- It still needs the server's config to read host information.
+- It opens Main on the default agent when it is ready on the server, and
+  otherwise on the first ready chat.
+- With no ready agent, it records the default agent's provider instance as the
+  project's model selection instead of a built-in Codex fallback.
 
 Hosted `/pair` parses and normalizes its destination once before rendering or
 network access. URLs with a non-empty username or password are rejected; the
@@ -921,7 +1012,7 @@ is re-verified over RPC. The production call-site audit is:
 | `assets.createUrl` and `apps/web/src/assets/assetUrls.ts`                                                                                 | URL issuance is authenticated RPC over E2EE. The resulting `/api/assets/<signed capability>/<path>` GET is a documented exception: it carries a bounded, expiring, resource-scoped HMAC capability and no bearer authorization.                                                                                                                                                                                                                                                                   |
 | `projects.createDownloadUrl`, `projects.createUploadUrl`, and `apps/web/src/components/files/fileTransfers.ts`                            | Same documented exception as `assets.createUrl`. URL issuance is authenticated RPC over E2EE; the resulting `GET`/`POST /api/transfers/<token>` carries a bounded, five-minute, resource-scoped HMAC capability and no bearer authorization. A download token names one entry and an upload token one file name in one directory, so a leaked URL reaches nothing else. The browser upload sends `credentials: "omit"`; desktop mode reaches the route from the Rust host instead of the WebView. |
 | `device.createMediaTicket` and `packages/client-runtime/src/device/mediaSocket.ts`                                                        | Ticket issuance is authenticated RPC over E2EE, and the ticket is redeemable only on the E2EE route. `GET /api/device-media-e2ee` carries no credential in the URL: it runs Noise_NK with the pinned key under the prologue `bibcode-device-media/1`, then reads the single-use ticket inside the encrypted records. See [Device media sockets](#device-media-sockets).                                                                                                                           |
-| `apps/web/src/diagnostics/downloadDiagnosticLogs.ts`                                                                                      | Direct authenticated HTTP is primary-environment-only and cannot target a saved bearer profile. Environment-scoped remote diagnostics are therefore unavailable until represented as RPC; an E2EE bearer must not be added to this request.                                                                                                                                                                                                                                                       |
+| `apps/web/src/diagnostics/downloadDiagnosticLogs.ts`                                                                                      | Its direct authenticated HTTP request (`POST /api/diagnostics/logs.zip`) is primary-environment-only and never targets a saved bearer profile; an E2EE bearer must not be added to it. Another environment's bundle is environment-scoped RPC: `server.downloadDiagnosticLogs` over that environment's own connection, so on a pinned profile the archive stays inside Noise. It is sent only to a server advertising `capabilities.diagnosticLogs`.                                              |
 | `rpc/http.ts` HTTP API client and primary/cloud-link callers                                                                              | The module is a transport constructor, not an independent request. Its host-key callers are limited to the descriptor row above; primary and Connect control-plane calls are not saved host-key targets.                                                                                                                                                                                                                                                                                          |
 
 ### BiBCode Connect
@@ -1592,9 +1683,30 @@ that server's `enableProfiler` setting, and its data stays in that server's data
 root. WSL, SSH, and remote environments run their own `bibcode` process, so each
 has its own crash monitor and follows its own setting. The Diagnostics Profiler
 section switches between connected environments; **Open folder** works only for
-the desktop's primary environment and **Export bundle** covers the primary
-environment only. For any other environment, run `bibcode profiler` on its host,
-for example over SSH, or `ssh <host> bibcode profiler mcp` for an AI harness.
+the desktop's primary environment. **Export bundle** and **Download logs** cover
+the selected environment: another environment's server builds and redacts its
+own bundle and sends it with `server.downloadDiagnosticLogs` over that
+environment's RPC connection (see
+[Observability](../operations/observability.md#diagnostic-bundle)). A server
+without `capabilities.diagnosticLogs` gets no such request; the page says it
+must be updated. To query a remote profiler directly, run `bibcode profiler` on
+its host, for example over SSH, or `ssh <host> bibcode profiler mcp` for an AI
+harness.
+
+Without SSH, `bibcode diagnostics download` on the desktop's machine fetches a
+connected environment's bundle through the desktop app, after one approval
+there (#201). This adds no connection between servers: the local server only
+hands the request to the desktop app's own session, and the app downloads with
+its own credential, scopes and identity checks, exactly as **Download logs**
+does. The local server never learns a remote credential, and no other paired
+device can be asked to pull logs onto this host. Any program running as the
+user can ask, so the prompt says the request comes from a program on this
+computer, not BiBCode, and shows the code that program printed, the
+environment as typed, and the directory it saves in. With the app closed,
+`bibcode diagnostics download --remote` uses a diagnostics-only credential of
+its own instead (#202; see
+[Command-line diagnostics pairing](#command-line-diagnostics-pairing)). See
+[Observability](../operations/observability.md#from-the-command-line).
 
 A server older than the profiler does not advertise `capabilities.profiler`. The
 client then sends it no profiler RPC, ignores the `enableProfiler: true` it may
@@ -1692,6 +1804,13 @@ performed on the machine that owns that server and filesystem.
   session). Sessions
   minted for SSH expire after 30 days; a standard-scope bearer cannot revoke
   them.
+- `bibcode diagnostics download --remote` reaches only direct endpoints. An
+  environment reached only through desktop-managed SSH or only through
+  BiBCode Connect has no endpoint for it (the tunnel is the app's; Connect
+  needs a Clerk sign-in); use `--environment` through the app instead. Its
+  credential expires 30 days after pairing and is not renewed, and `forget`
+  deletes it locally only: the remote lists the client until it is revoked on
+  its Share tab or expires. A remote whose address changes needs a new pairing.
 - The remote bounds cannot end a process stuck in uninterruptible I/O. A
   recorded server stuck that way blocks new launches of its environment until
   it exits.

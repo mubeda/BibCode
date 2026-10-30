@@ -143,6 +143,10 @@ const captured = vi.hoisted(() => ({
 const testState = vi.hoisted(() => ({
   projects: [] as Array<Record<string, unknown>>,
   serverConfigs: new Map<string, Record<string, unknown>>(),
+  // The primary-server settings that Settings → Default Agent reads and writes.
+  primarySettings: {} as Record<string, unknown>,
+  labelledConfigs: new WeakMap<object, Record<string, unknown>>(),
+  connectionPhases: new Map<string, string>(),
   refs: [] as Array<{
     name: string;
     isRemote?: boolean;
@@ -177,7 +181,38 @@ vi.mock("~/lib/utils", () => ({
 
 vi.mock("~/state/entities", () => ({
   useProjects: () => testState.projects,
-  useServerConfigs: () => testState.serverConfigs,
+  // Fixtures may omit the environment descriptor; give each config a stable labelled copy.
+  useServerConfigs: () => {
+    const configs = new Map<string, Record<string, unknown>>();
+    for (const [environmentId, config] of testState.serverConfigs) {
+      let labelled = testState.labelledConfigs.get(config);
+      if (!labelled) {
+        labelled = { environment: { label: `${environmentId} server` }, ...config };
+        testState.labelledConfigs.set(config, labelled);
+      }
+      configs.set(environmentId, labelled);
+    }
+    return configs;
+  },
+}));
+
+vi.mock("~/hooks/useSettings", () => ({
+  usePrimaryDefaultAgent: () => testState.primarySettings["defaultAgent"],
+}));
+
+// Each environment is connected unless a test sets its supervisor phase.
+vi.mock("~/state/environments", () => ({
+  usePrimaryEnvironmentId: () => "local",
+  useEnvironment: (environmentId: string | null) => {
+    if (environmentId === null) return null;
+    const config = testState.serverConfigs.get(environmentId) as
+      | { environment?: { label?: string } }
+      | undefined;
+    return {
+      label: config?.environment?.label ?? `${environmentId} server`,
+      connection: { phase: testState.connectionPhases.get(environmentId) ?? "connected" },
+    };
+  },
 }));
 
 vi.mock("~/state/query", () => ({
@@ -259,7 +294,11 @@ vi.mock("./ui/select", () => ({
   SelectGroupLabel: ({ children }: { children?: ReactNode }) => <span>{children}</span>,
   SelectItem: ({ children }: { children?: ReactNode }) => <span>{children}</span>,
   SelectPopup: ({ children }: { children?: ReactNode }) => <div>{children}</div>,
-  SelectTrigger: ({ children }: { children?: ReactNode }) => <div>{children}</div>,
+  SelectTrigger: (props: { "aria-describedby"?: string; children?: ReactNode }) => (
+    <div data-select-trigger="" aria-describedby={props["aria-describedby"]}>
+      {props.children}
+    </div>
+  ),
   SelectValue: ({ placeholder }: { placeholder?: string }) => <span>{placeholder}</span>,
 }));
 
@@ -344,6 +383,33 @@ function project(overrides: Record<string, unknown> = {}) {
   };
 }
 
+function readyProvider(instanceId: string, overrides: Record<string, unknown> = {}) {
+  return {
+    instanceId,
+    driver: instanceId,
+    enabled: true,
+    installed: true,
+    status: "ready",
+    models: [],
+    ...overrides,
+  };
+}
+
+function serverConfig(
+  providers: ReadonlyArray<Record<string, unknown>>,
+  settings: Record<string, unknown> = DEFAULT_SERVER_SETTINGS,
+  label = "Local",
+): Record<string, unknown> {
+  return { environment: { label }, providers, settings };
+}
+
+function setDefaultAgent(kind: "chat" | "terminal", instanceId: string): void {
+  testState.primarySettings = {
+    ...testState.primarySettings,
+    defaultAgent: { kind, instanceId: ProviderInstanceId.make(instanceId) },
+  };
+}
+
 function success(value: unknown) {
   return { _tag: "Success", value };
 }
@@ -405,7 +471,9 @@ function resetScenario(): void {
   hooks.reset();
   captured.clear();
   testState.projects = [project()];
-  testState.serverConfigs = new Map();
+  testState.primarySettings = DEFAULT_SERVER_SETTINGS;
+  testState.connectionPhases = new Map();
+  testState.serverConfigs = new Map([[ENVIRONMENT_ID, serverConfig([readyProvider("codex")])]]);
   testState.refs = [];
   testState.refsError = null;
   testState.queryAtoms = [];
@@ -673,11 +741,9 @@ staticDescribe("CreateWorktreeDialog", () => {
           models: [],
         },
       ],
-      settings: {
-        ...DEFAULT_SERVER_SETTINGS,
-        defaultAgent: { kind: "chat", instanceId: ProviderInstanceId.make("claudeAgent") },
-      },
+      settings: DEFAULT_SERVER_SETTINGS,
     });
+    setDefaultAgent("chat", "claudeAgent");
 
     render();
     expect(captured.selects[1]?.value).toBe("chat:claudeAgent");
@@ -707,11 +773,9 @@ staticDescribe("CreateWorktreeDialog", () => {
           models: [],
         },
       ],
-      settings: {
-        ...DEFAULT_SERVER_SETTINGS,
-        defaultAgent: { kind: "terminal", instanceId: ProviderInstanceId.make("codex") },
-      },
+      settings: DEFAULT_SERVER_SETTINGS,
     });
+    setDefaultAgent("terminal", "codex");
 
     render();
     expect(captured.selects[1]?.value).toBe("terminal:codex");
@@ -787,14 +851,15 @@ staticDescribe("CreateWorktreeDialog", () => {
           models: [],
         },
       ],
-      settings: {
-        ...DEFAULT_SERVER_SETTINGS,
-        defaultAgent: { kind: "terminal", instanceId: ProviderInstanceId.make("disabled") },
-      },
+      settings: DEFAULT_SERVER_SETTINGS,
     });
+    setDefaultAgent("terminal", "disabled");
 
-    render();
+    const markup = render();
     expect(captured.selects[1]?.value).toBe("chat:codex");
+    expect(markup).toContain(
+      "Your default agent is not available on local server, so Codex is selected.",
+    );
     await submitWorktree();
 
     expect(testState.createWorktree).toHaveBeenCalledWith(
@@ -1739,6 +1804,7 @@ if (browserRuntime) {
         }),
       ];
       testState.refs = [{ name: "remote-feature" }];
+      testState.serverConfigs.set(remoteEnvironmentId, serverConfig([readyProvider("codex")]));
       testState.createWorktree.mockResolvedValue(
         success({
           threadId: "thread-created",
@@ -1800,6 +1866,7 @@ if (browserRuntime) {
         }),
       ];
       testState.refs = [{ name: "main" }];
+      testState.serverConfigs.set(secondEnvironmentId, serverConfig([readyProvider("codex")]));
       const { container, root } = await mountDialog(true, PROJECT_REF);
 
       await React.act(async () => requiredButton(container, "Branch").click());
@@ -2036,6 +2103,7 @@ if (browserRuntime) {
             displayName: "Claude",
             enabled: true,
             installed: true,
+            status: "ready",
             models: [{ slug: "sonnet", name: "Sonnet", isCustom: false, capabilities: null }],
           },
         ],
@@ -2093,6 +2161,378 @@ if (browserRuntime) {
 
       await React.act(async () => root.unmount());
       container.remove();
+    });
+
+    describe("Default Agent (#185)", () => {
+      const REMOTE_ENVIRONMENT_ID = EnvironmentId.make("remote");
+      const REMOTE_PROJECT_REF = scopeProjectRef(REMOTE_ENVIRONMENT_ID, PROJECT_ID);
+
+      function agentPickerValue(container: ParentNode): string | undefined {
+        const pickers = container.querySelectorAll<HTMLElement>("[data-select-value]");
+        return pickers[1]?.dataset["selectValue"];
+      }
+
+      /** Settings writes the primary server; its config stream carries the new settings back. */
+      function changeDefaultAgentInSettings(kind: "chat" | "terminal", instanceId: string): void {
+        setDefaultAgent(kind, instanceId);
+        const primaryConfig = testState.serverConfigs.get(ENVIRONMENT_ID);
+        if (primaryConfig) {
+          testState.serverConfigs.set(ENVIRONMENT_ID, {
+            ...primaryConfig,
+            settings: testState.primarySettings,
+          });
+        }
+      }
+
+      function useRemoteProject(providers: ReadonlyArray<Record<string, unknown>>): void {
+        testState.projects = [
+          project({ environmentId: REMOTE_ENVIRONMENT_ID, workspaceRoot: "/remote/repo" }),
+        ];
+        // The remote server's own persisted settings keep the built-in Default Agent.
+        testState.serverConfigs.set(
+          REMOTE_ENVIRONMENT_ID,
+          serverConfig(providers, DEFAULT_SERVER_SETTINGS, "Remote"),
+        );
+      }
+
+      async function typeName(container: HTMLDivElement): Promise<void> {
+        await setInputValue(
+          requiredElement<HTMLInputElement>(container, "input[placeholder='Worktree name']"),
+          "agent-default",
+        );
+      }
+
+      async function createWithoutTouchingAgent(container: HTMLDivElement): Promise<void> {
+        await typeName(container);
+        await React.act(async () => requiredButton(container, "Create worktree").click());
+        await React.act(async () => flushPromises());
+      }
+
+      function createdInstanceId(): unknown {
+        const call = testState.createWorktree.mock.calls.at(-1)?.[0] as
+          | { input: { threadDefaults: { modelSelection: { instanceId: unknown } } } }
+          | undefined;
+        return call?.input.threadDefaults.modelSelection.instanceId;
+      }
+
+      it("opens on a Default Agent changed while the app runs and creates with it", async () => {
+        testState.serverConfigs.set(
+          ENVIRONMENT_ID,
+          serverConfig([readyProvider("codex"), readyProvider("claudeAgent")]),
+        );
+        const { container, root } = await mountDialog(true, PROJECT_REF);
+        expect(agentPickerValue(container)).toBe("chat:codex");
+        await renderDialog(root, false, PROJECT_REF);
+
+        changeDefaultAgentInSettings("chat", "claudeAgent");
+        await renderDialog(root, true, PROJECT_REF);
+
+        expect(agentPickerValue(container)).toBe("chat:claudeAgent");
+        await createWithoutTouchingAgent(container);
+        expect(createdInstanceId()).toBe("claudeAgent");
+        expect(testState.replaceMainWithTerminal).not.toHaveBeenCalled();
+
+        await renderDialog(root, false, PROJECT_REF);
+        changeDefaultAgentInSettings("terminal", "codex");
+        await renderDialog(root, true, PROJECT_REF);
+
+        expect(agentPickerValue(container)).toBe("terminal:codex");
+        await createWithoutTouchingAgent(container);
+        expect(createdInstanceId()).toBe("codex");
+        expect(testState.replaceMainWithTerminal).toHaveBeenCalledWith(
+          scopeThreadRef(ENVIRONMENT_ID, ThreadId.make(testState.nextThreadId)),
+          [],
+          expect.objectContaining({ label: "Codex Terminal" }),
+        );
+
+        await React.act(async () => root.unmount());
+        container.remove();
+      });
+
+      it("applies the primary-server Default Agent to a project on another server", async () => {
+        useRemoteProject([readyProvider("codex"), readyProvider("claudeAgent")]);
+        changeDefaultAgentInSettings("chat", "claudeAgent");
+        const { container, root } = await mountDialog(true, REMOTE_PROJECT_REF);
+
+        expect(agentPickerValue(container)).toBe("chat:claudeAgent");
+        expect(container.textContent).not.toContain("so Codex is selected");
+        await createWithoutTouchingAgent(container);
+        expect(testState.createWorktree).toHaveBeenCalledWith(
+          expect.objectContaining({ environmentId: REMOTE_ENVIRONMENT_ID }),
+        );
+        expect(createdInstanceId()).toBe("claudeAgent");
+
+        await React.act(async () => root.unmount());
+        container.remove();
+      });
+
+      it("says why it falls back when the other server lacks the Default Agent", async () => {
+        useRemoteProject([readyProvider("codex")]);
+        changeDefaultAgentInSettings("chat", "claudeAgent");
+        const { container, root } = await mountDialog(true, REMOTE_PROJECT_REF);
+
+        const notice = "Your default agent is not available on Remote, so Codex is selected.";
+        expect(agentPickerValue(container)).toBe("chat:codex");
+        expect(container.textContent).toContain(notice);
+        // The note describes the picker without being part of its label: clicking it opens nothing.
+        const note = requiredElement<HTMLElement>(container, "[role='status']");
+        expect(note.textContent).toBe(notice);
+        expect(note.closest("label")).toBeNull();
+        expect(
+          requiredElement<HTMLElement>(container, "[aria-describedby]").getAttribute(
+            "aria-describedby",
+          ),
+        ).toBe(note.id);
+
+        await React.act(async () => captured.selects.at(-1)?.onValueChange?.("terminal:codex"));
+        expect(agentPickerValue(container)).toBe("terminal:codex");
+        expect(container.textContent).not.toContain(notice);
+        expect(container.querySelector("[aria-describedby]")).toBeNull();
+
+        await React.act(async () => root.unmount());
+        container.remove();
+      });
+
+      it("names the reason when the Default Agent is present but not ready", async () => {
+        useRemoteProject([
+          readyProvider("codex"),
+          readyProvider("claudeAgent", { status: "error" }),
+        ]);
+        changeDefaultAgentInSettings("chat", "claudeAgent");
+        const { container, root } = await mountDialog(true, REMOTE_PROJECT_REF);
+
+        expect(agentPickerValue(container)).toBe("chat:codex");
+        expect(container.textContent).toMatch(
+          /Claude is unavailable \(.+\), so Codex is selected\./,
+        );
+        await createWithoutTouchingAgent(container);
+        expect(createdInstanceId()).toBe("codex");
+
+        await React.act(async () => root.unmount());
+        container.remove();
+      });
+
+      it("waits for the project's agents before creating, then uses the Default Agent", async () => {
+        testState.serverConfigs = new Map();
+        changeDefaultAgentInSettings("chat", "claudeAgent");
+        const { container, root } = await mountDialog(true, PROJECT_REF);
+        await typeName(container);
+
+        expect(agentPickerValue(container)).toBeUndefined();
+        expect(container.textContent).toContain(
+          "Loading this project's agents. Create waits until they arrive.",
+        );
+        expect(requiredButton(container, "Create worktree").disabled).toBe(true);
+
+        testState.serverConfigs.set(
+          ENVIRONMENT_ID,
+          serverConfig([readyProvider("codex"), readyProvider("claudeAgent")]),
+        );
+        await renderDialog(root, true, PROJECT_REF);
+
+        expect(agentPickerValue(container)).toBe("chat:claudeAgent");
+        expect(container.textContent).not.toContain("Loading this project's agents");
+        await React.act(async () => requiredButton(container, "Create worktree").click());
+        await React.act(async () => flushPromises());
+        expect(createdInstanceId()).toBe("claudeAgent");
+
+        await React.act(async () => root.unmount());
+        container.remove();
+      });
+
+      it("waits while the project's server has no ready agent", async () => {
+        testState.serverConfigs.set(
+          ENVIRONMENT_ID,
+          serverConfig([readyProvider("codex", { status: "error" })]),
+        );
+        const { container, root } = await mountDialog(true, PROJECT_REF);
+        await typeName(container);
+
+        expect(container.textContent).toContain(
+          "No agent is ready on Local. Sign in to or enable one in Settings → Providers.",
+        );
+        expect(requiredButton(container, "Create worktree").disabled).toBe(true);
+        await React.act(async () => {
+          requiredElement<HTMLDivElement>(container, "[data-testid='dialog-popup']").dispatchEvent(
+            new KeyboardEvent("keydown", { key: "Enter", ctrlKey: true, bubbles: true }),
+          );
+        });
+        expect(testState.createWorktree).not.toHaveBeenCalled();
+
+        await React.act(async () => root.unmount());
+        container.remove();
+      });
+
+      it("says where to fix it when another server has no ready agent", async () => {
+        useRemoteProject([readyProvider("codex", { status: "error" })]);
+        const { container, root } = await mountDialog(true, REMOTE_PROJECT_REF);
+
+        expect(container.textContent).toContain(
+          "No agent is ready on Remote. Sign in to or enable one on that server.",
+        );
+        expect(requiredButton(container, "Create worktree").disabled).toBe(true);
+
+        await React.act(async () => root.unmount());
+        container.remove();
+      });
+
+      it("waits while the session is lost even though the last config remains", async () => {
+        useRemoteProject([readyProvider("codex"), readyProvider("claudeAgent")]);
+        const { container, root } = await mountDialog(true, REMOTE_PROJECT_REF);
+        await typeName(container);
+        await React.act(async () => captured.selects.at(-1)?.onValueChange?.("chat:claudeAgent"));
+        expect(requiredButton(container, "Create worktree").disabled).toBe(false);
+
+        // The supervisor loses the session; the config map keeps the last snapshot.
+        testState.connectionPhases.set(REMOTE_ENVIRONMENT_ID, "reconnecting");
+        await renderDialog(root, true, REMOTE_PROJECT_REF);
+        expect(testState.serverConfigs.has(REMOTE_ENVIRONMENT_ID)).toBe(true);
+        expect(container.textContent).toContain(
+          "Remote is not connected. Create waits until it reconnects.",
+        );
+        expect(requiredButton(container, "Create worktree").disabled).toBe(true);
+        await React.act(async () => requiredButton(container, "Create worktree").click());
+        expect(testState.createWorktree).not.toHaveBeenCalled();
+
+        testState.connectionPhases.set(REMOTE_ENVIRONMENT_ID, "connected");
+        await renderDialog(root, true, REMOTE_PROJECT_REF);
+        expect(agentPickerValue(container)).toBe("chat:claudeAgent");
+        expect(container.textContent).not.toContain("is not connected");
+        expect(requiredButton(container, "Create worktree").disabled).toBe(false);
+
+        await React.act(async () => root.unmount());
+        container.remove();
+      });
+
+      it("says a server offline since start is not connected, then uses the default", async () => {
+        testState.projects = [
+          project({ environmentId: REMOTE_ENVIRONMENT_ID, workspaceRoot: "/remote/repo" }),
+        ];
+        testState.connectionPhases.set(REMOTE_ENVIRONMENT_ID, "offline");
+        changeDefaultAgentInSettings("chat", "claudeAgent");
+        const { container, root } = await mountDialog(true, REMOTE_PROJECT_REF);
+        await typeName(container);
+
+        expect(container.textContent).toContain(
+          "remote server is not connected. Create waits until it reconnects.",
+        );
+        expect(container.textContent).not.toContain("Loading this project's agents");
+        expect(requiredButton(container, "Create worktree").disabled).toBe(true);
+
+        testState.connectionPhases.set(REMOTE_ENVIRONMENT_ID, "connecting");
+        await renderDialog(root, true, REMOTE_PROJECT_REF);
+        expect(container.textContent).toContain(
+          "Connecting to remote server. Create waits until it connects.",
+        );
+
+        testState.connectionPhases.set(REMOTE_ENVIRONMENT_ID, "connected");
+        await renderDialog(root, true, REMOTE_PROJECT_REF);
+        expect(container.textContent).toContain("Loading this project's agents");
+
+        testState.serverConfigs.set(
+          REMOTE_ENVIRONMENT_ID,
+          serverConfig([readyProvider("codex"), readyProvider("claudeAgent")], undefined, "Remote"),
+        );
+        await renderDialog(root, true, REMOTE_PROJECT_REF);
+        expect(agentPickerValue(container)).toBe("chat:claudeAgent");
+        expect(requiredButton(container, "Create worktree").disabled).toBe(false);
+
+        await React.act(async () => root.unmount());
+        container.remove();
+      });
+
+      it("drops a manual pick its connected server stops offering, so it never returns unseen", async () => {
+        const ready = [readyProvider("codex"), readyProvider("claudeAgent")];
+        testState.serverConfigs.set(ENVIRONMENT_ID, serverConfig(ready));
+        changeDefaultAgentInSettings("chat", "claudeAgent");
+        const { container, root } = await mountDialog(true, PROJECT_REF);
+        await React.act(async () => captured.selects.at(-1)?.onValueChange?.("chat:codex"));
+        expect(agentPickerValue(container)).toBe("chat:codex");
+
+        testState.serverConfigs.set(
+          ENVIRONMENT_ID,
+          serverConfig([readyProvider("codex", { status: "error" }), readyProvider("claudeAgent")]),
+        );
+        await renderDialog(root, true, PROJECT_REF);
+        expect(agentPickerValue(container)).toBe("chat:claudeAgent");
+
+        testState.serverConfigs.set(ENVIRONMENT_ID, serverConfig(ready));
+        await renderDialog(root, true, PROJECT_REF);
+        expect(agentPickerValue(container)).toBe("chat:claudeAgent");
+        await createWithoutTouchingAgent(container);
+        expect(createdInstanceId()).toBe("claudeAgent");
+
+        await React.act(async () => root.unmount());
+        container.remove();
+      });
+
+      it("shows the fallback note again once a dropped pick leaves the fallback selected", async () => {
+        testState.serverConfigs.set(
+          ENVIRONMENT_ID,
+          serverConfig([readyProvider("codex"), readyProvider("cursor")]),
+        );
+        changeDefaultAgentInSettings("chat", "claudeAgent");
+        const { container, root } = await mountDialog(true, PROJECT_REF);
+        const notice = "Your default agent is not available on Local, so Codex is selected.";
+        expect(container.textContent).toContain(notice);
+        await React.act(async () => captured.selects.at(-1)?.onValueChange?.("chat:cursor"));
+        expect(container.textContent).not.toContain(notice);
+
+        testState.serverConfigs.set(
+          ENVIRONMENT_ID,
+          serverConfig([readyProvider("codex"), readyProvider("cursor", { status: "error" })]),
+        );
+        await renderDialog(root, true, PROJECT_REF);
+        expect(agentPickerValue(container)).toBe("chat:codex");
+        expect(container.textContent).toContain(notice);
+
+        await React.act(async () => root.unmount());
+        container.remove();
+      });
+
+      it("keeps a manual pick while the agents are loading or the server is away", async () => {
+        const config = serverConfig([readyProvider("codex"), readyProvider("claudeAgent")]);
+        testState.serverConfigs.set(ENVIRONMENT_ID, config);
+        const { container, root } = await mountDialog(true, PROJECT_REF);
+        await React.act(async () => captured.selects.at(-1)?.onValueChange?.("chat:claudeAgent"));
+
+        testState.serverConfigs = new Map();
+        await renderDialog(root, true, PROJECT_REF);
+        expect(container.textContent).toContain("Loading this project's agents");
+        testState.connectionPhases.set(ENVIRONMENT_ID, "connecting");
+        await renderDialog(root, true, PROJECT_REF);
+        expect(container.textContent).toContain("Connecting to");
+
+        testState.connectionPhases.set(ENVIRONMENT_ID, "connected");
+        testState.serverConfigs = new Map([[ENVIRONMENT_ID, config]]);
+        await renderDialog(root, true, PROJECT_REF);
+        expect(agentPickerValue(container)).toBe("chat:claudeAgent");
+
+        await React.act(async () => root.unmount());
+        container.remove();
+      });
+
+      it("keeps a manual pick without a fallback note when the default stops being ready", async () => {
+        const providers = [readyProvider("codex"), readyProvider("claudeAgent")];
+        testState.serverConfigs.set(ENVIRONMENT_ID, serverConfig(providers));
+        changeDefaultAgentInSettings("chat", "claudeAgent");
+        const { container, root } = await mountDialog(true, PROJECT_REF);
+        expect(agentPickerValue(container)).toBe("chat:claudeAgent");
+        await React.act(async () => captured.selects.at(-1)?.onValueChange?.("chat:codex"));
+
+        testState.serverConfigs.set(
+          ENVIRONMENT_ID,
+          serverConfig([readyProvider("codex"), readyProvider("claudeAgent", { status: "error" })]),
+        );
+        await renderDialog(root, true, PROJECT_REF);
+
+        expect(agentPickerValue(container)).toBe("chat:codex");
+        expect(container.textContent).not.toContain("is selected");
+        expect(container.querySelector("[role='status']")).toBeNull();
+
+        await React.act(async () => root.unmount());
+        container.remove();
+      });
     });
 
     it("explains when the branch list could not be loaded", async () => {

@@ -251,12 +251,66 @@ describe("ActivityRoster targeted cancellation controls", () => {
     const unavailable = container.querySelector(
       '[data-activity-control-unavailable="unsupported"]',
     );
-    expect(unavailable?.textContent).toBe("Stop unavailable");
+    expect(unavailable?.textContent).toBe(
+      "Stop unavailable. Codex doesn't offer a way to stop this subagent from BiBCode.",
+    );
+    expect(unavailable?.getAttribute("tabindex")).toBe("0");
     expect(unavailable?.closest("button")).toBeNull();
     expect(
       container.querySelector('button[data-activity-row="unsupported"]')?.textContent,
     ).toContain("Running");
     expect(container.querySelector('[data-activity-control-unavailable="done"]')).toBeNull();
+  });
+
+  it("lists a subagent whose process ended under Done as interrupted, with why", async () => {
+    const reason =
+      "Claude session ended before this subagent reported; last report 34m after it started.";
+    const interrupted = actor("interrupted", "react-senior-developer", {
+      status: "interrupted",
+      summary: reason,
+      providerType: "claude",
+      startedAt: "2026-08-07T20:00:00.000Z",
+      updatedAt: "2026-08-11T20:00:00.000Z",
+      terminalAt: "2026-08-11T20:00:00.000Z",
+    });
+    const completed = actor("completed", "Hamilton", {
+      status: "completed",
+      terminalAt: "2026-08-11T20:01:00.000Z",
+    });
+    const container = await mount(
+      <ActivityRoster
+        {...props({
+          snapshot: snapshot({
+            provider: "claudeAgent" as ActivitySnapshot["provider"],
+            counts: {
+              subagents: { active: 0, done: 2 },
+              backgroundTasks: { active: 0, done: 0 },
+            },
+          }),
+          active: { pages: [page([])], loading: false, error: null },
+          done: {
+            pages: [page([interrupted, completed])],
+            loading: false,
+            error: null,
+          },
+          reconciled: { active: [], done: [interrupted, completed] },
+        })}
+      />,
+    );
+
+    const doneSection = container.querySelector('[aria-labelledby="activity-subagents-done"]');
+    const row = doneSection?.querySelector('button[data-activity-row="interrupted"]');
+    expect(row?.textContent).toContain("Interrupted");
+    expect(row?.textContent).toContain(reason);
+    expect(row?.textContent).toContain("Interrupted after 4d");
+    expect(row?.textContent).not.toContain("Completed in");
+    expect(
+      container.querySelector('[aria-labelledby="activity-subagents-active"]')?.textContent ?? "",
+    ).not.toContain("react-senior-developer");
+    expect(container.querySelector('[data-activity-control-unavailable="interrupted"]')).toBeNull();
+    expect(
+      doneSection?.querySelector('button[data-activity-row="completed"]')?.textContent,
+    ).toContain("Completed in 1m");
   });
 
   it("is keyboard reachable and exposes the same exact subtree impact in its tooltip", async () => {

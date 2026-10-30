@@ -27,6 +27,17 @@ import {
   type CenterPanelLayoutPath,
   type CenterPanelLayoutState,
 } from "./centerPanelLayout";
+import {
+  DEFAULT_ACTIVITY_PANE_STATE,
+  activityPaneStatesEqual,
+  isDefaultActivityPaneState,
+  normalizeActivityPaneRoute,
+  normalizeActivityPaneState,
+  normalizeActivitySection,
+  type ActivityPaneRoute,
+  type ActivityPaneSection,
+  type ActivityPaneState,
+} from "./components/activity/activityPaneState";
 import { decodePersistedTerminalLaunchCommand } from "./lib/terminalLaunchCommand";
 import { resolveStorage } from "./lib/storage";
 import { reserveTerminalId } from "./terminalIdReservations";
@@ -68,8 +79,24 @@ export interface ThreadCenterPanelState extends CenterPanelLayoutState {
   readonly surfaces: readonly CenterSurface[];
 }
 
+/** Per host thread, the inline Activity state of each pane, keyed by center surface id. */
+export type ActivityPanesByThreadKey = Record<string, Record<string, ActivityPaneState>>;
+
 interface CenterPanelStoreState {
   byThreadKey: Record<string, ThreadCenterPanelState>;
+  activityPanes: ActivityPanesByThreadKey;
+  /**
+   * Expands or collapses a pane's Activity panel. Expanding onto another
+   * section switches to it and clears the selected record; the remembered
+   * record survives only an expand onto its own section.
+   */
+  setActivityPaneExpanded: (
+    ref: ScopedThreadRef,
+    surfaceId: string,
+    expanded: boolean,
+    section?: ActivityPaneSection,
+  ) => void;
+  navigateActivityPane: (ref: ScopedThreadRef, surfaceId: string, route: ActivityPaneRoute) => void;
   readonly pendingChatPanelThreadKeys: ReadonlySet<string>;
   openChatPanel: (ref: ScopedThreadRef, threadId: ThreadId, providerLabel?: string) => void;
   reserveChatPanel: (ref: ScopedThreadRef, threadId: ThreadId, providerLabel?: string) => void;
@@ -109,6 +136,8 @@ interface CenterPanelStoreState {
     existingTerminalIds: ReadonlyArray<string>,
     options: OpenTerminalPanelOptions,
   ) => string;
+  /** Focuses the host chat, adding it back to the focused group when it was closed. */
+  openHostChat: (ref: ScopedThreadRef) => void;
   focusGroup: (ref: ScopedThreadRef, groupId: string) => void;
   activateSurface: (ref: ScopedThreadRef, groupId: string, surfaceId: string) => void;
   dropSurface: (ref: ScopedThreadRef, surfaceId: string, target: CenterPanelDropRequest) => boolean;
@@ -127,7 +156,7 @@ interface CenterPanelStoreState {
 
 const HOST_SURFACE: CenterSurface = { id: HOST_SURFACE_ID, kind: "chat-host" };
 const CENTER_PANEL_STORAGE_KEY = "bibcode:center-panel-state:v1";
-const CENTER_PANEL_STORAGE_VERSION = 3;
+const CENTER_PANEL_STORAGE_VERSION = 4;
 
 const EMPTY_THREAD_STATE: ThreadCenterPanelState = {
   surfaces: [HOST_SURFACE],
@@ -214,6 +243,80 @@ function withUpdatedThread(
 ): CenterPanelStoreState | Pick<CenterPanelStoreState, "byThreadKey"> {
   const byThreadKey = updateThread(state.byThreadKey, scopedThreadKey(ref), updater);
   return byThreadKey === state.byThreadKey ? state : { byThreadKey };
+}
+
+function threadSurfaceIds(
+  byThreadKey: Record<string, ThreadCenterPanelState>,
+  threadKey: string,
+): Set<string> {
+  return new Set(
+    (byThreadKey[threadKey] ?? EMPTY_THREAD_STATE).surfaces.map((surface) => surface.id),
+  );
+}
+
+function writeActivityPane(
+  activityPanes: ActivityPanesByThreadKey,
+  threadKey: string,
+  surfaceId: string,
+  next: ActivityPaneState,
+): ActivityPanesByThreadKey {
+  const current = activityPanes[threadKey]?.[surfaceId] ?? DEFAULT_ACTIVITY_PANE_STATE;
+  if (activityPaneStatesEqual(current, next)) return activityPanes;
+  const panes = { ...activityPanes[threadKey] };
+  if (isDefaultActivityPaneState(next)) delete panes[surfaceId];
+  else panes[surfaceId] = next;
+  const result = { ...activityPanes };
+  if (Object.keys(panes).length === 0) delete result[threadKey];
+  else result[threadKey] = panes;
+  return result;
+}
+
+/** Drops the Activity state of every pane whose surface its thread no longer has. */
+function pruneActivityPanes(
+  activityPanes: ActivityPanesByThreadKey,
+  byThreadKey: Record<string, ThreadCenterPanelState>,
+): ActivityPanesByThreadKey {
+  let next = activityPanes;
+  for (const [threadKey, panes] of Object.entries(activityPanes)) {
+    const surfaceIds = threadSurfaceIds(byThreadKey, threadKey);
+    const kept = Object.entries(panes).filter(([surfaceId]) => surfaceIds.has(surfaceId));
+    if (kept.length === Object.keys(panes).length) continue;
+    if (next === activityPanes) next = { ...activityPanes };
+    if (kept.length === 0) delete next[threadKey];
+    else next[threadKey] = Object.fromEntries(kept);
+  }
+  return next;
+}
+
+function normalizePersistedActivityPanes(
+  value: unknown,
+  byThreadKey: Record<string, ThreadCenterPanelState>,
+): ActivityPanesByThreadKey {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const activityPanes: ActivityPanesByThreadKey = {};
+  for (const [threadKey, panes] of Object.entries(value as Record<string, unknown>)) {
+    if (!panes || typeof panes !== "object" || Array.isArray(panes)) continue;
+    const normalized: Record<string, ActivityPaneState> = {};
+    for (const [surfaceId, candidate] of Object.entries(panes as Record<string, unknown>)) {
+      const state = normalizeActivityPaneState(candidate);
+      if (state !== null && !isDefaultActivityPaneState(state)) normalized[surfaceId] = state;
+    }
+    if (Object.keys(normalized).length > 0) activityPanes[threadKey] = normalized;
+  }
+  return pruneActivityPanes(activityPanes, byThreadKey);
+}
+
+/** Keeps pane Activity state in step with every layout write, whichever action made it. */
+function withPrunedActivityPanes(
+  state: CenterPanelStoreState,
+  partial: Partial<CenterPanelStoreState>,
+): Partial<CenterPanelStoreState> {
+  if (partial === state || !partial.byThreadKey || partial.byThreadKey === state.byThreadKey) {
+    return partial;
+  }
+  const base = partial.activityPanes ?? state.activityPanes;
+  const activityPanes = pruneActivityPanes(base, partial.byThreadKey);
+  return activityPanes === base ? partial : { ...partial, activityPanes };
 }
 
 function insertSurface(
@@ -328,8 +431,11 @@ function sanitizeSurface(surface: unknown): CenterSurface[] {
 
 export function migratePersistedCenterPanelState(persistedState: unknown): {
   byThreadKey: Record<string, ThreadCenterPanelState>;
+  activityPanes: ActivityPanesByThreadKey;
 } {
-  if (!persistedState || typeof persistedState !== "object") return { byThreadKey: {} };
+  if (!persistedState || typeof persistedState !== "object") {
+    return { byThreadKey: {}, activityPanes: {} };
+  }
   const raw =
     "byThreadKey" in persistedState &&
     persistedState.byThreadKey &&
@@ -366,328 +472,436 @@ export function migratePersistedCenterPanelState(persistedState: unknown): {
     const state: ThreadCenterPanelState = { surfaces, ...layoutState };
     if (!isImplicitDefault(state)) byThreadKey[threadKey] = state;
   }
-  return { byThreadKey };
+  const activityPanes = normalizePersistedActivityPanes(
+    "activityPanes" in persistedState ? persistedState.activityPanes : undefined,
+    byThreadKey,
+  );
+  return { byThreadKey, activityPanes };
 }
 
 export const useCenterPanelStore = create<CenterPanelStoreState>()(
   persist(
-    (set, get) => ({
-      byThreadKey: {},
-      pendingChatPanelThreadKeys: new Set<string>(),
-      openChatPanel: (ref, threadId, providerLabel) =>
-        set((state) =>
-          withUpdatedThread(state, ref, (current) =>
-            insertSurface(current, chatSurface(threadId, providerLabel)),
+    (rawSet, get) => {
+      const set = (
+        updater: (state: CenterPanelStoreState) => Partial<CenterPanelStoreState>,
+      ): void => {
+        rawSet((state) => withPrunedActivityPanes(state, updater(state)));
+      };
+      return {
+        byThreadKey: {},
+        activityPanes: {},
+        pendingChatPanelThreadKeys: new Set<string>(),
+        setActivityPaneExpanded: (ref, surfaceId, expanded, section) =>
+          set((state) => {
+            const threadKey = scopedThreadKey(ref);
+            if (!threadSurfaceIds(state.byThreadKey, threadKey).has(surfaceId)) return state;
+            const current =
+              state.activityPanes[threadKey]?.[surfaceId] ?? DEFAULT_ACTIVITY_PANE_STATE;
+            const nextSection =
+              section === undefined ? current.section : normalizeActivitySection(section);
+            const next: ActivityPaneState =
+              nextSection === current.section
+                ? { ...current, expanded }
+                : {
+                    expanded,
+                    section: nextSection,
+                    selectedRecordKind: null,
+                    selectedRecordId: null,
+                  };
+            const activityPanes = writeActivityPane(
+              state.activityPanes,
+              threadKey,
+              surfaceId,
+              next,
+            );
+            return activityPanes === state.activityPanes ? state : { activityPanes };
+          }),
+        navigateActivityPane: (ref, surfaceId, route) =>
+          set((state) => {
+            const threadKey = scopedThreadKey(ref);
+            if (!threadSurfaceIds(state.byThreadKey, threadKey).has(surfaceId)) return state;
+            const current =
+              state.activityPanes[threadKey]?.[surfaceId] ?? DEFAULT_ACTIVITY_PANE_STATE;
+            const next: ActivityPaneState = {
+              expanded: current.expanded,
+              ...normalizeActivityPaneRoute(route),
+            };
+            const activityPanes = writeActivityPane(
+              state.activityPanes,
+              threadKey,
+              surfaceId,
+              next,
+            );
+            return activityPanes === state.activityPanes ? state : { activityPanes };
+          }),
+        openChatPanel: (ref, threadId, providerLabel) =>
+          set((state) =>
+            withUpdatedThread(state, ref, (current) =>
+              insertSurface(current, chatSurface(threadId, providerLabel)),
+            ),
           ),
-        ),
-      reserveChatPanel: (ref, threadId, providerLabel) =>
-        set((state) => {
-          const panelKey = scopedThreadKey({ environmentId: ref.environmentId, threadId });
-          const updated = withUpdatedThread(state, ref, (current) =>
-            insertSurface(current, chatSurface(threadId, providerLabel)),
-          );
-          if (
-            updated.byThreadKey === state.byThreadKey &&
-            state.pendingChatPanelThreadKeys.has(panelKey)
-          ) {
-            return state;
-          }
-          return {
-            byThreadKey: updated.byThreadKey,
-            pendingChatPanelThreadKeys: new Set(state.pendingChatPanelThreadKeys).add(panelKey),
-          };
-        }),
-      releaseChatPanelReservation: (ref) =>
-        set((state) => {
-          const threadKey = scopedThreadKey(ref);
-          if (!state.pendingChatPanelThreadKeys.has(threadKey)) return state;
-          const pendingChatPanelThreadKeys = new Set(state.pendingChatPanelThreadKeys);
-          pendingChatPanelThreadKeys.delete(threadKey);
-          return { pendingChatPanelThreadKeys };
-        }),
-      validateTerminalPanelPlacement: (ref, placement) => {
-        const current = get().byThreadKey[scopedThreadKey(ref)] ?? EMPTY_THREAD_STATE;
-        return validateTerminalPanelPlacement(current, placement);
-      },
-      placeTerminalPanel: (ref, terminalId, placement, options) => {
-        const surface = terminalSurface(terminalId, options);
-        let changed = false;
-        set((state) =>
-          withUpdatedThread(state, ref, (current) => {
-            if (!validateTerminalPanelPlacement(current, placement).ok) return current;
-            const inserted = insertCenterPanelSurface(current, surface.id, placement.groupId);
-            if (placement.type === "tab") {
-              if (!inserted.changed) return current;
+        reserveChatPanel: (ref, threadId, providerLabel) =>
+          set((state) => {
+            const panelKey = scopedThreadKey({ environmentId: ref.environmentId, threadId });
+            const updated = withUpdatedThread(state, ref, (current) =>
+              insertSurface(current, chatSurface(threadId, providerLabel)),
+            );
+            if (
+              updated.byThreadKey === state.byThreadKey &&
+              state.pendingChatPanelThreadKeys.has(panelKey)
+            ) {
+              return state;
+            }
+            return {
+              byThreadKey: updated.byThreadKey,
+              pendingChatPanelThreadKeys: new Set(state.pendingChatPanelThreadKeys).add(panelKey),
+            };
+          }),
+        releaseChatPanelReservation: (ref) =>
+          set((state) => {
+            const threadKey = scopedThreadKey(ref);
+            if (!state.pendingChatPanelThreadKeys.has(threadKey)) return state;
+            const pendingChatPanelThreadKeys = new Set(state.pendingChatPanelThreadKeys);
+            pendingChatPanelThreadKeys.delete(threadKey);
+            return { pendingChatPanelThreadKeys };
+          }),
+        validateTerminalPanelPlacement: (ref, placement) => {
+          const current = get().byThreadKey[scopedThreadKey(ref)] ?? EMPTY_THREAD_STATE;
+          return validateTerminalPanelPlacement(current, placement);
+        },
+        placeTerminalPanel: (ref, terminalId, placement, options) => {
+          const surface = terminalSurface(terminalId, options);
+          let changed = false;
+          set((state) =>
+            withUpdatedThread(state, ref, (current) => {
+              if (!validateTerminalPanelPlacement(current, placement).ok) return current;
+              const inserted = insertCenterPanelSurface(current, surface.id, placement.groupId);
+              if (placement.type === "tab") {
+                if (!inserted.changed) return current;
+                changed = true;
+                const surfaces = current.surfaces.some((entry) => entry.id === surface.id)
+                  ? current.surfaces
+                  : [...current.surfaces, surface];
+                return { ...inserted.state, surfaces };
+              }
+
+              // @effect-diagnostics-next-line cryptoRandomUUID:off -- Group identifiers are generated at the impure Zustand store boundary.
+              const newGroupId = `center-group:${crypto.randomUUID()}`;
+              const mutation = dropCenterPanelSurface(inserted.state, surface.id, {
+                groupId: placement.groupId,
+                splitDirection: placement.direction,
+                newGroupId,
+              });
+              if (!mutation.changed) return current;
               changed = true;
               const surfaces = current.surfaces.some((entry) => entry.id === surface.id)
                 ? current.surfaces
                 : [...current.surfaces, surface];
-              return { ...inserted.state, surfaces };
-            }
-
-            // @effect-diagnostics-next-line cryptoRandomUUID:off -- Group identifiers are generated at the impure Zustand store boundary.
-            const newGroupId = `center-group:${crypto.randomUUID()}`;
-            const mutation = dropCenterPanelSurface(inserted.state, surface.id, {
-              groupId: placement.groupId,
-              splitDirection: placement.direction,
-              newGroupId,
-            });
-            if (!mutation.changed) return current;
-            changed = true;
-            const surfaces = current.surfaces.some((entry) => entry.id === surface.id)
-              ? current.surfaces
-              : [...current.surfaces, surface];
-            return { ...mutation.state, surfaces };
-          }),
-        );
-        return changed;
-      },
-      openTerminalPanel: (ref, terminalId, options) => {
-        const current = get().byThreadKey[scopedThreadKey(ref)] ?? EMPTY_THREAD_STATE;
-        get().placeTerminalPanel(
-          ref,
-          terminalId,
-          { type: "tab", groupId: current.focusedGroupId },
-          options,
-        );
-      },
-      adoptTerminalPanel: (ref, terminalId, options) =>
-        set((state) =>
-          withUpdatedThread(state, ref, (current) =>
-            appendInactiveSurface(current, terminalSurface(terminalId, options)),
-          ),
-        ),
-      adoptChatPanel: (ref, threadId, providerLabel) =>
-        set((state) =>
-          withUpdatedThread(state, ref, (current) =>
-            appendInactiveSurface(current, chatSurface(threadId, providerLabel)),
-          ),
-        ),
-      syncTerminalPanelCommand: (ref, terminalId, command) => {
-        const threadKey = scopedThreadKey(ref);
-        const current = get().byThreadKey[threadKey];
-        const surfaceId = `terminal:${terminalId}`;
-        const surface = current?.surfaces.find((entry) => entry.id === surfaceId);
-        // Checked before `set`: the persist middleware writes the whole layout on every call.
-        if (
-          !current ||
-          surface?.kind !== "terminal" ||
-          JSON.stringify(surface.command) === JSON.stringify(command)
-        ) {
-          return;
-        }
-        // A label taken from the previous command follows the new one; a custom label stays.
-        const label = surface.label === surface.command?.label ? command?.label : surface.label;
-        const next = terminalSurface(terminalId, {
-          ...(label !== undefined ? { label } : {}),
-          ...(command !== undefined ? { command } : {}),
-        });
-        set((state) => ({
-          byThreadKey: {
-            ...state.byThreadKey,
-            [threadKey]: {
-              ...current,
-              surfaces: current.surfaces.map((entry) => (entry.id === surfaceId ? next : entry)),
-            },
-          },
-        }));
-      },
-      removeTerminalPanel: (ref, terminalId) =>
-        set((state) =>
-          withUpdatedThread(
-            state,
+              return { ...mutation.state, surfaces };
+            }),
+          );
+          return changed;
+        },
+        openTerminalPanel: (ref, terminalId, options) => {
+          const current = get().byThreadKey[scopedThreadKey(ref)] ?? EMPTY_THREAD_STATE;
+          get().placeTerminalPanel(
             ref,
-            (current) => applySurfaceRemoval(current, new Set([`terminal:${terminalId}`])).state,
+            terminalId,
+            { type: "tab", groupId: current.focusedGroupId },
+            options,
+          );
+        },
+        adoptTerminalPanel: (ref, terminalId, options) =>
+          set((state) =>
+            withUpdatedThread(state, ref, (current) =>
+              appendInactiveSurface(current, terminalSurface(terminalId, options)),
+            ),
           ),
-        ),
-      replaceMainWithTerminal: (ref, existingTerminalIds, options) => {
-        const threadKey = scopedThreadKey(ref);
-        const current = get().byThreadKey[threadKey] ?? EMPTY_THREAD_STATE;
-        const storedTerminalIds = current.surfaces.flatMap((surface) =>
-          surface.kind === "terminal" ? [surface.terminalId] : [],
-        );
-        const reservation = reserveTerminalId(ref, [...existingTerminalIds, ...storedTerminalIds]);
-        try {
-          const surface = terminalSurface(reservation.terminalId, options);
-          const layoutState = createCenterPanelLayoutState([surface.id], surface.id);
+        adoptChatPanel: (ref, threadId, providerLabel) =>
+          set((state) =>
+            withUpdatedThread(state, ref, (current) =>
+              appendInactiveSurface(current, chatSurface(threadId, providerLabel)),
+            ),
+          ),
+        syncTerminalPanelCommand: (ref, terminalId, command) => {
+          const threadKey = scopedThreadKey(ref);
+          const current = get().byThreadKey[threadKey];
+          const surfaceId = `terminal:${terminalId}`;
+          const surface = current?.surfaces.find((entry) => entry.id === surfaceId);
+          // Checked before `set`: the persist middleware writes the whole layout on every call.
+          if (
+            !current ||
+            surface?.kind !== "terminal" ||
+            JSON.stringify(surface.command) === JSON.stringify(command)
+          ) {
+            return;
+          }
+          // A label taken from the previous command follows the new one; a custom label stays.
+          const label = surface.label === surface.command?.label ? command?.label : surface.label;
+          const next = terminalSurface(terminalId, {
+            ...(label !== undefined ? { label } : {}),
+            ...(command !== undefined ? { command } : {}),
+          });
           set((state) => ({
             byThreadKey: {
               ...state.byThreadKey,
-              [threadKey]: { surfaces: [surface], ...layoutState },
+              [threadKey]: {
+                ...current,
+                surfaces: current.surfaces.map((entry) => (entry.id === surfaceId ? next : entry)),
+              },
             },
           }));
-          return reservation.terminalId;
-        } finally {
-          reservation.release();
-        }
-      },
-      focusGroup: (ref, groupId) =>
-        set((state) =>
-          withUpdatedThread(state, ref, (current) => {
-            if (!findCenterPanelGroup(current, groupId) || current.focusedGroupId === groupId) {
-              return current;
-            }
-            return { ...current, focusedGroupId: groupId };
-          }),
-        ),
-      activateSurface: (ref, groupId, surfaceId) =>
-        set((state) =>
-          withUpdatedThread(state, ref, (current) =>
-            activateGroupSurface(current, groupId, surfaceId),
+        },
+        removeTerminalPanel: (ref, terminalId) =>
+          set((state) =>
+            withUpdatedThread(
+              state,
+              ref,
+              (current) => applySurfaceRemoval(current, new Set([`terminal:${terminalId}`])).state,
+            ),
           ),
-        ),
-      dropSurface: (ref, surfaceId, target) => {
-        let changed = false;
-        set((state) =>
-          withUpdatedThread(state, ref, (current) => {
-            if (!canDropCenterPanelSurface(current, surfaceId, target)) return current;
-            const completedTarget: CenterPanelDropTarget =
-              "splitDirection" in target
-                ? {
-                    groupId: target.groupId,
-                    splitDirection: target.splitDirection,
-                    // @effect-diagnostics-next-line cryptoRandomUUID:off -- Group identifiers are generated at the impure Zustand store boundary.
-                    newGroupId: `center-group:${crypto.randomUUID()}`,
-                  }
-                : target;
-            const mutation = dropCenterPanelSurface(current, surfaceId, completedTarget);
-            if (!mutation.changed) return current;
-            changed = true;
-            return { ...mutation.state, surfaces: current.surfaces };
-          }),
-        );
-        return changed;
-      },
-      mergeGroup: (ref, groupId) => {
-        let changed = false;
-        set((state) =>
-          withUpdatedThread(state, ref, (current) => {
-            const mutation = mergeCenterPanelGroup(current, groupId);
-            if (!mutation.changed) return current;
-            changed = true;
-            return { ...mutation.state, surfaces: current.surfaces };
-          }),
-        );
-        return changed;
-      },
-      setSplitRatio: (ref, path, ratio) =>
-        set((state) =>
-          withUpdatedThread(state, ref, (current) => {
-            const mutation = setCenterPanelSplitRatio(current, path, ratio);
-            return mutation.changed ? { ...mutation.state, surfaces: current.surfaces } : current;
-          }),
-        ),
-      closeSurface: (ref, groupId, surfaceId) => {
-        let removed: CenterSurface[] = [];
-        set((state) =>
-          withUpdatedThread(state, ref, (current) => {
-            const group = findCenterPanelGroup(current, groupId);
-            if (!group || !group.surfaceIds.includes(surfaceId)) return current;
-            const result = applySurfaceRemoval(current, new Set([surfaceId]));
-            removed = result.removed;
-            return result.state;
-          }),
-        );
-        return removed;
-      },
-      closeOtherSurfaces: (ref, groupId, surfaceId) => {
-        let removed: CenterSurface[] = [];
-        set((state) =>
-          withUpdatedThread(state, ref, (current) => {
-            const group = findCenterPanelGroup(current, groupId);
-            if (!group || !group.surfaceIds.includes(surfaceId)) return current;
-            const requestedIds = new Set(
-              group.surfaceIds.filter((id) => id !== surfaceId && id !== HOST_SURFACE_ID),
-            );
-            const result = applySurfaceRemoval(current, requestedIds);
-            removed = result.removed;
-            return result.state;
-          }),
-        );
-        return removed;
-      },
-      closeSurfacesToRight: (ref, groupId, surfaceId) => {
-        let removed: CenterSurface[] = [];
-        set((state) =>
-          withUpdatedThread(state, ref, (current) => {
-            const group = findCenterPanelGroup(current, groupId);
-            const index = group?.surfaceIds.indexOf(surfaceId) ?? -1;
-            if (!group || index < 0) return current;
-            const result = applySurfaceRemoval(current, new Set(group.surfaceIds.slice(index + 1)));
-            removed = result.removed;
-            return result.state;
-          }),
-        );
-        return removed;
-      },
-      closeAllSurfaces: (ref, groupId) => {
-        let removed: CenterSurface[] = [];
-        set((state) =>
-          withUpdatedThread(state, ref, (current) => {
-            const group = findCenterPanelGroup(current, groupId);
-            if (!group) return current;
-            const result = applySurfaceRemoval(current, new Set(group.surfaceIds));
-            removed = result.removed;
-            return result.state;
-          }),
-        );
-        return removed;
-      },
-      removeThread: (ref) =>
-        set((state) => {
+        replaceMainWithTerminal: (ref, existingTerminalIds, options) => {
           const threadKey = scopedThreadKey(ref);
-          let byThreadKey = state.byThreadKey;
-          const pendingKeysToRemove = new Set([threadKey]);
-          for (const surface of state.byThreadKey[threadKey]?.surfaces ?? []) {
-            if (surface.kind === "chat") {
-              pendingKeysToRemove.add(
-                scopedThreadKey({ environmentId: ref.environmentId, threadId: surface.threadId }),
+          const current = get().byThreadKey[threadKey] ?? EMPTY_THREAD_STATE;
+          const storedTerminalIds = current.surfaces.flatMap((surface) =>
+            surface.kind === "terminal" ? [surface.terminalId] : [],
+          );
+          const reservation = reserveTerminalId(ref, [
+            ...existingTerminalIds,
+            ...storedTerminalIds,
+          ]);
+          try {
+            const surface = terminalSurface(reservation.terminalId, options);
+            const layoutState = createCenterPanelLayoutState([surface.id], surface.id);
+            set((state) => ({
+              byThreadKey: {
+                ...state.byThreadKey,
+                [threadKey]: { surfaces: [surface], ...layoutState },
+              },
+            }));
+            return reservation.terminalId;
+          } finally {
+            reservation.release();
+          }
+        },
+        openHostChat: (ref) =>
+          set((state) =>
+            withUpdatedThread(state, ref, (current) => {
+              const inserted = insertSurface(current, HOST_SURFACE);
+              if (inserted === current || inserted.surfaces[0]?.id === HOST_SURFACE_ID) {
+                return inserted;
+              }
+              // The host chat leads the surface list, as persisted state restores it.
+              return { ...inserted, surfaces: normalizeSurfaces(inserted.surfaces, true) };
+            }),
+          ),
+        focusGroup: (ref, groupId) =>
+          set((state) =>
+            withUpdatedThread(state, ref, (current) => {
+              if (!findCenterPanelGroup(current, groupId) || current.focusedGroupId === groupId) {
+                return current;
+              }
+              return { ...current, focusedGroupId: groupId };
+            }),
+          ),
+        activateSurface: (ref, groupId, surfaceId) =>
+          set((state) =>
+            withUpdatedThread(state, ref, (current) =>
+              activateGroupSurface(current, groupId, surfaceId),
+            ),
+          ),
+        dropSurface: (ref, surfaceId, target) => {
+          let changed = false;
+          set((state) =>
+            withUpdatedThread(state, ref, (current) => {
+              if (!canDropCenterPanelSurface(current, surfaceId, target)) return current;
+              const completedTarget: CenterPanelDropTarget =
+                "splitDirection" in target
+                  ? {
+                      groupId: target.groupId,
+                      splitDirection: target.splitDirection,
+                      // @effect-diagnostics-next-line cryptoRandomUUID:off -- Group identifiers are generated at the impure Zustand store boundary.
+                      newGroupId: `center-group:${crypto.randomUUID()}`,
+                    }
+                  : target;
+              const mutation = dropCenterPanelSurface(current, surfaceId, completedTarget);
+              if (!mutation.changed) return current;
+              changed = true;
+              return { ...mutation.state, surfaces: current.surfaces };
+            }),
+          );
+          return changed;
+        },
+        mergeGroup: (ref, groupId) => {
+          let changed = false;
+          set((state) =>
+            withUpdatedThread(state, ref, (current) => {
+              const mutation = mergeCenterPanelGroup(current, groupId);
+              if (!mutation.changed) return current;
+              changed = true;
+              return { ...mutation.state, surfaces: current.surfaces };
+            }),
+          );
+          return changed;
+        },
+        setSplitRatio: (ref, path, ratio) =>
+          set((state) =>
+            withUpdatedThread(state, ref, (current) => {
+              const mutation = setCenterPanelSplitRatio(current, path, ratio);
+              return mutation.changed ? { ...mutation.state, surfaces: current.surfaces } : current;
+            }),
+          ),
+        closeSurface: (ref, groupId, surfaceId) => {
+          let removed: CenterSurface[] = [];
+          set((state) =>
+            withUpdatedThread(state, ref, (current) => {
+              const group = findCenterPanelGroup(current, groupId);
+              if (!group || !group.surfaceIds.includes(surfaceId)) return current;
+              const result = applySurfaceRemoval(current, new Set([surfaceId]));
+              removed = result.removed;
+              return result.state;
+            }),
+          );
+          return removed;
+        },
+        closeOtherSurfaces: (ref, groupId, surfaceId) => {
+          let removed: CenterSurface[] = [];
+          set((state) =>
+            withUpdatedThread(state, ref, (current) => {
+              const group = findCenterPanelGroup(current, groupId);
+              if (!group || !group.surfaceIds.includes(surfaceId)) return current;
+              const requestedIds = new Set(
+                group.surfaceIds.filter((id) => id !== surfaceId && id !== HOST_SURFACE_ID),
+              );
+              const result = applySurfaceRemoval(current, requestedIds);
+              removed = result.removed;
+              return result.state;
+            }),
+          );
+          return removed;
+        },
+        closeSurfacesToRight: (ref, groupId, surfaceId) => {
+          let removed: CenterSurface[] = [];
+          set((state) =>
+            withUpdatedThread(state, ref, (current) => {
+              const group = findCenterPanelGroup(current, groupId);
+              const index = group?.surfaceIds.indexOf(surfaceId) ?? -1;
+              if (!group || index < 0) return current;
+              const result = applySurfaceRemoval(
+                current,
+                new Set(group.surfaceIds.slice(index + 1)),
+              );
+              removed = result.removed;
+              return result.state;
+            }),
+          );
+          return removed;
+        },
+        closeAllSurfaces: (ref, groupId) => {
+          let removed: CenterSurface[] = [];
+          set((state) =>
+            withUpdatedThread(state, ref, (current) => {
+              const group = findCenterPanelGroup(current, groupId);
+              if (!group) return current;
+              const result = applySurfaceRemoval(current, new Set(group.surfaceIds));
+              removed = result.removed;
+              return result.state;
+            }),
+          );
+          return removed;
+        },
+        removeThread: (ref) =>
+          set((state) => {
+            const threadKey = scopedThreadKey(ref);
+            let byThreadKey = state.byThreadKey;
+            const pendingKeysToRemove = new Set([threadKey]);
+            for (const surface of state.byThreadKey[threadKey]?.surfaces ?? []) {
+              if (surface.kind === "chat") {
+                pendingKeysToRemove.add(
+                  scopedThreadKey({ environmentId: ref.environmentId, threadId: surface.threadId }),
+                );
+              }
+            }
+            if (threadKey in byThreadKey) {
+              const { [threadKey]: _removed, ...rest } = byThreadKey;
+              byThreadKey = rest;
+            }
+            for (const [hostThreadKey, hostState] of Object.entries(state.byThreadKey)) {
+              if (hostThreadKey === threadKey) continue;
+              const hostRef = parseScopedThreadKey(hostThreadKey);
+              if (!hostRef || hostRef.environmentId !== ref.environmentId) continue;
+              const referencedSurfaceIds = new Set(
+                hostState.surfaces.flatMap((surface) =>
+                  surface.kind === "chat" && surface.threadId === ref.threadId ? [surface.id] : [],
+                ),
+              );
+              if (referencedSurfaceIds.size === 0) continue;
+              byThreadKey = updateThread(
+                byThreadKey,
+                hostThreadKey,
+                (current) => applySurfaceRemoval(current, referencedSurfaceIds).state,
               );
             }
-          }
-          if (threadKey in byThreadKey) {
-            const { [threadKey]: _removed, ...rest } = byThreadKey;
-            byThreadKey = rest;
-          }
-          for (const [hostThreadKey, hostState] of Object.entries(state.byThreadKey)) {
-            if (hostThreadKey === threadKey) continue;
-            const hostRef = parseScopedThreadKey(hostThreadKey);
-            if (!hostRef || hostRef.environmentId !== ref.environmentId) continue;
-            const referencedSurfaceIds = new Set(
-              hostState.surfaces.flatMap((surface) =>
-                surface.kind === "chat" && surface.threadId === ref.threadId ? [surface.id] : [],
-              ),
+            const pendingChatPanelThreadKeys = new Set(
+              [...state.pendingChatPanelThreadKeys].filter((key) => !pendingKeysToRemove.has(key)),
             );
-            if (referencedSurfaceIds.size === 0) continue;
-            byThreadKey = updateThread(
-              byThreadKey,
-              hostThreadKey,
-              (current) => applySurfaceRemoval(current, referencedSurfaceIds).state,
-            );
-          }
-          const pendingChatPanelThreadKeys = new Set(
-            [...state.pendingChatPanelThreadKeys].filter((key) => !pendingKeysToRemove.has(key)),
-          );
-          if (
-            byThreadKey === state.byThreadKey &&
-            pendingChatPanelThreadKeys.size === state.pendingChatPanelThreadKeys.size
-          ) {
-            return state;
-          }
-          return { byThreadKey, pendingChatPanelThreadKeys };
-        }),
-    }),
+            // The removed thread's own panes go too: its default layout would
+            // otherwise still claim the host surface.
+            let activityPanes = state.activityPanes;
+            if (threadKey in activityPanes) {
+              const { [threadKey]: _removedPanes, ...restPanes } = activityPanes;
+              activityPanes = restPanes;
+            }
+            if (
+              byThreadKey === state.byThreadKey &&
+              activityPanes === state.activityPanes &&
+              pendingChatPanelThreadKeys.size === state.pendingChatPanelThreadKeys.size
+            ) {
+              return state;
+            }
+            return { byThreadKey, activityPanes, pendingChatPanelThreadKeys };
+          }),
+      };
+    },
     {
       name: CENTER_PANEL_STORAGE_KEY,
       version: CENTER_PANEL_STORAGE_VERSION,
       storage: createJSONStorage(() =>
         resolveStorage(typeof window !== "undefined" ? window.localStorage : undefined),
       ),
-      partialize: (state) => ({ byThreadKey: state.byThreadKey }),
+      partialize: (state) => ({
+        byThreadKey: state.byThreadKey,
+        activityPanes: state.activityPanes,
+      }),
       migrate: migratePersistedCenterPanelState,
+      // Same-version layout is trusted, but pane Activity state is always
+      // re-validated: it carries record ids and routes a bad write could break.
+      merge: (persistedState, currentState) => {
+        const persisted =
+          persistedState && typeof persistedState === "object"
+            ? (persistedState as Partial<CenterPanelStoreState>)
+            : {};
+        const merged = { ...currentState, ...persisted };
+        return {
+          ...merged,
+          activityPanes: normalizePersistedActivityPanes(
+            persisted.activityPanes,
+            merged.byThreadKey,
+          ),
+        };
+      },
     },
   ),
 );
+
+export function selectActivityPaneState(
+  activityPanes: ActivityPanesByThreadKey,
+  ref: ScopedThreadRef | null | undefined,
+  surfaceId: string,
+): ActivityPaneState {
+  if (!ref) return DEFAULT_ACTIVITY_PANE_STATE;
+  return activityPanes[scopedThreadKey(ref)]?.[surfaceId] ?? DEFAULT_ACTIVITY_PANE_STATE;
+}
 
 export function selectThreadCenterPanelState(
   byThreadKey: Record<string, ThreadCenterPanelState>,

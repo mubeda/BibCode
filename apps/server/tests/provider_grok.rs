@@ -161,6 +161,18 @@ async fn grok_runtime_matches_user_input_and_cancel_traces() {
     assert_eq!(second.event_type, "thread.started");
     let first_turn_id = send_turn.await.expect("first join").expect("first turn");
     let mut requested = runtime.collect_events(4).await;
+    let input_request_id = requested
+        .iter()
+        .find(|event| event.event_type == "user-input.requested")
+        .and_then(|event| event.request_id.clone())
+        .expect("user input id");
+    assert!(input_request_id.starts_with("user-input:"));
+    assert!(input_request_id.ends_with(":2001"));
+    let scope = input_request_id
+        .strip_prefix("user-input:")
+        .and_then(|id| id.strip_suffix(":2001"))
+        .expect("scoped user input id");
+    uuid::Uuid::parse_str(scope).expect("connection scope UUID");
     let (assistant_chunk_index, assistant_chunk) = requested
         .iter()
         .enumerate()
@@ -172,6 +184,7 @@ async fn grok_runtime_matches_user_input_and_cancel_traces() {
         event.event_type == "turn.completed" && event.turn_id == assistant_chunk.turn_id
     }));
     normalize_turn_ids(&mut requested, &first_turn_id, "turn-3");
+    normalize_request_id(&mut requested, &input_request_id, "user-input:2001");
     assert_eq!(
         requested,
         stable_fixture("trace-user-input-before-response.json")
@@ -179,13 +192,14 @@ async fn grok_runtime_matches_user_input_and_cancel_traces() {
 
     runtime
         .respond_to_user_input(
-            "user-input:2001",
+            &input_request_id,
             json!({ "Which scope should Grok use?": "Workspace" }),
         )
         .await
         .expect("respond");
     let mut resolved = runtime.collect_events(1).await;
     normalize_turn_ids(&mut resolved, &first_turn_id, "turn-3");
+    normalize_request_id(&mut resolved, &input_request_id, "user-input:2001");
     assert_eq!(
         resolved,
         stable_fixture("trace-user-input-after-response.json")
@@ -502,12 +516,11 @@ async fn grok_runtime_covers_resume_modes_permissions_and_protocol_edges() {
             .send_turn(Some("permission"), Vec::new())
             .await
             .expect("manual permission turn");
-        let request_id = format!("approval:{wire_id}");
-        let opened = next_event_matching(&runtime, |event| {
-            event.event_type == "request.opened"
-                && event.request_id.as_deref() == Some(request_id.as_str())
-        })
-        .await;
+        let opened =
+            next_event_matching(&runtime, |event| event.event_type == "request.opened").await;
+        let request_id = opened.request_id.as_deref().expect("approval id");
+        assert!(request_id.starts_with("approval:"));
+        assert!(request_id.ends_with(&format!(":{wire_id}")));
         assert_eq!(
             opened.payload["detail"],
             json!(match wire_id {
@@ -518,12 +531,12 @@ async fn grok_runtime_covers_resume_modes_permissions_and_protocol_edges() {
             })
         );
         runtime
-            .respond_to_request(&request_id, decision)
+            .respond_to_request(request_id, decision)
             .await
             .expect("permission response");
         let resolved = next_event_matching(&runtime, |event| {
             event.event_type == "request.resolved"
-                && event.request_id.as_deref() == Some(request_id.as_str())
+                && event.request_id.as_deref() == Some(request_id)
         })
         .await;
         assert_eq!(resolved.payload["decision"], json!(decision));
@@ -538,16 +551,16 @@ async fn grok_runtime_covers_resume_modes_permissions_and_protocol_edges() {
         .send_turn(Some("ask"), Vec::new())
         .await
         .expect("user input turn");
-    let input_request = next_event_matching(&runtime, |event| {
-        event.event_type == "user-input.requested"
-            && event.request_id.as_deref() == Some("user-input:2201")
-    })
-    .await;
+    let input_request =
+        next_event_matching(&runtime, |event| event.event_type == "user-input.requested").await;
+    let input_request_id = input_request.request_id.as_deref().expect("input id");
+    assert!(input_request_id.starts_with("user-input:"));
+    assert!(input_request_id.ends_with(":2201"));
     assert_eq!(input_request.payload["questions"][0]["id"], "targets");
     assert_eq!(input_request.payload["questions"][1]["id"], "");
     runtime
         .respond_to_user_input(
-            "user-input:2201",
+            input_request_id,
             json!({
                 "targets": ["server", "desktop"],
                 "notes": "run all",
@@ -558,7 +571,7 @@ async fn grok_runtime_covers_resume_modes_permissions_and_protocol_edges() {
         .expect("user input response");
     next_event_matching(&runtime, |event| {
         event.event_type == "user-input.resolved"
-            && event.request_id.as_deref() == Some("user-input:2201")
+            && event.request_id.as_deref() == Some(input_request_id)
     })
     .await;
     next_event_matching(&runtime, |event| {
@@ -684,6 +697,18 @@ fn normalize_turn_ids(
     for event in events {
         if event.turn_id.as_deref() == Some(actual_turn_id) {
             event.turn_id = Some(stable_turn_id.to_owned());
+        }
+    }
+}
+
+fn normalize_request_id(
+    events: &mut [grok::GrokRuntimeEventStableView],
+    actual: &str,
+    fixture_id: &str,
+) {
+    for event in events {
+        if event.request_id.as_deref() == Some(actual) {
+            event.request_id = Some(fixture_id.to_owned());
         }
     }
 }

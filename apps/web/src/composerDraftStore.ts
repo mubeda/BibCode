@@ -54,11 +54,12 @@ import { createDebouncedStorage, createMemoryStorage } from "./lib/storage";
 import { getDefaultServerModel } from "./providerModels";
 import { UnifiedSettings } from "@bibcode/contracts/settings";
 import { ReviewCommentContextSchema, type ReviewCommentContext } from "./reviewCommentContext";
+import { COMPOSER_DRAFT_STORAGE_KEY } from "./composerDraftStorageKey";
 const isRuntimeMode = Schema.is(RuntimeMode);
 const isProviderDriverKind = Schema.is(ProviderDriverKind);
 const isReviewCommentContext = Schema.is(ReviewCommentContextSchema);
 
-export const COMPOSER_DRAFT_STORAGE_KEY = "bibcode:composer-drafts:v1";
+export { COMPOSER_DRAFT_STORAGE_KEY };
 const COMPOSER_DRAFT_STORAGE_VERSION = 8;
 const DraftThreadEnvModeSchema = Schema.Literals(["local", "worktree"]);
 export type DraftThreadEnvMode = typeof DraftThreadEnvModeSchema.Type;
@@ -1490,6 +1491,86 @@ function removeDraftThreadReferences(
   };
 }
 
+function appendNewById<T extends { readonly id: string }>(
+  first: ReadonlyArray<T>,
+  second: ReadonlyArray<T>,
+): T[] {
+  const ids = new Set(first.map((item) => item.id));
+  return [...first, ...second.filter((item) => !ids.has(item.id))];
+}
+
+function stampThreadId<T extends { readonly threadId: ThreadId }>(
+  items: T[],
+  threadId: ThreadId,
+): T[] {
+  return items.some((item) => item.threadId !== threadId)
+    ? items.map((item) => ({ ...item, threadId }))
+    : items;
+}
+
+/**
+ * The thread draft a promoted draft's unsent content becomes. Without a thread
+ * draft the entry moves unchanged, so its previews, persisted copies and object
+ * identity survive. With one, nothing of the thread's is overwritten: the
+ * draft's content goes first (keeping inline terminal-context placeholders in
+ * order) and only the model and mode settings the thread lacks are filled.
+ */
+function carryPromotedDraftContent(
+  draft: ComposerThreadDraftState,
+  threadDraft: ComposerThreadDraftState | undefined,
+  threadId: ThreadId,
+): ComposerThreadDraftState {
+  const terminalContexts = stampThreadId(draft.terminalContexts, threadId);
+  const elementContexts = stampThreadId(draft.elementContexts, threadId);
+  if (!threadDraft) {
+    return terminalContexts === draft.terminalContexts && elementContexts === draft.elementContexts
+      ? draft
+      : { ...draft, terminalContexts, elementContexts };
+  }
+  return {
+    ...threadDraft,
+    prompt: [draft.prompt, threadDraft.prompt].filter(Boolean).join("\n\n"),
+    attachments: appendNewById(draft.attachments, threadDraft.attachments),
+    nonPersistedAttachmentIds: [
+      ...new Set([...draft.nonPersistedAttachmentIds, ...threadDraft.nonPersistedAttachmentIds]),
+    ],
+    persistedAttachments: appendNewById(
+      draft.persistedAttachments,
+      threadDraft.persistedAttachments,
+    ),
+    terminalContexts: appendNewById(terminalContexts, threadDraft.terminalContexts),
+    elementContexts: appendNewById(elementContexts, threadDraft.elementContexts),
+    previewAnnotations: appendNewById(draft.previewAnnotations, threadDraft.previewAnnotations),
+    reviewComments: appendNewById(draft.reviewComments, threadDraft.reviewComments),
+    modelSelectionByProvider:
+      Object.keys(threadDraft.modelSelectionByProvider).length > 0
+        ? threadDraft.modelSelectionByProvider
+        : draft.modelSelectionByProvider,
+    activeProvider: threadDraft.activeProvider ?? draft.activeProvider,
+    runtimeMode: threadDraft.runtimeMode ?? draft.runtimeMode,
+    interactionMode: threadDraft.interactionMode ?? draft.interactionMode,
+  };
+}
+
+/**
+ * Draft ids finalized into server threads during this page's life. A send that
+ * started on a draft captured its `DraftId`; if its reply arrives after the
+ * canonical route finalized the draft, its restore must reach the thread.
+ * In memory only, because no send outlives a reload. Bounded so a long session
+ * does not grow it without limit.
+ */
+const promotedDraftHandoffs = new Map<DraftId, ScopedThreadRef>();
+const MAX_PROMOTED_DRAFT_HANDOFFS = 64;
+
+function recordPromotedDraftHandoff(draftId: DraftId, threadRef: ScopedThreadRef): void {
+  promotedDraftHandoffs.delete(draftId);
+  promotedDraftHandoffs.set(draftId, threadRef);
+  if (promotedDraftHandoffs.size > MAX_PROMOTED_DRAFT_HANDOFFS) {
+    const oldest = promotedDraftHandoffs.keys().next().value;
+    if (oldest !== undefined) promotedDraftHandoffs.delete(oldest);
+  }
+}
+
 function normalizePersistedDraftThreads(
   rawDraftThreadsByThreadId: unknown,
   rawProjectDraftThreadIdByProjectKey: unknown,
@@ -2572,13 +2653,37 @@ const composerDraftStore = create<ComposerDraftStoreState>()(
           if (threadKey.length === 0) {
             return;
           }
+          const promotedTo = get().draftThreadsByThreadKey[threadKey]?.promotedTo;
+          if (!promotedTo) {
+            return;
+          }
           set((state) => {
-            const existing = state.draftThreadsByThreadKey[threadKey];
-            if (!isDraftThreadPromoting(existing)) {
-              return state;
+            const draft = state.draftsByThreadKey[threadKey];
+            if (!draft || shouldRemoveDraft(draft)) {
+              return removeDraftThreadReferences(state, threadKey);
             }
-            return removeDraftThreadReferences(state, threadKey);
+            // The send cleared the draft's content before dispatching, so any content left is
+            // not known to have been sent. It and the draft's model and mode settings go to the
+            // thread's composer, never overwriting what the thread's own draft holds (#189).
+            const { [threadKey]: _carried, ...draftsWithoutDraft } = state.draftsByThreadKey;
+            const next = removeDraftThreadReferences(
+              { ...state, draftsByThreadKey: draftsWithoutDraft },
+              threadKey,
+            );
+            const threadDraftKey = composerTargetKey(promotedTo);
+            return {
+              ...next,
+              draftsByThreadKey: {
+                ...next.draftsByThreadKey,
+                [threadDraftKey]: carryPromotedDraftContent(
+                  draft,
+                  next.draftsByThreadKey[threadDraftKey],
+                  promotedTo.threadId,
+                ),
+              },
+            };
           });
+          recordPromotedDraftHandoff(DraftId.make(threadKey), promotedTo);
         },
         clearDraftThread: (threadRef) => {
           const threadKey = resolveComposerDraftKey(get(), threadRef) ?? "";
@@ -3684,6 +3789,32 @@ export function finalizePromotedDraftThreadByRef(threadRef: ScopedThreadRef): vo
       draftStore.finalizePromotedDraftThread(target);
     }
   }
+}
+
+/**
+ * The composer target a send's restore should write to. A send started on a
+ * draft keeps its `DraftId`; once that draft has been promoted and finalized
+ * (its session is gone), the restore belongs to the server thread it became.
+ * A draft that is still live, or was discarded rather than promoted, keeps its id.
+ */
+export function resolveComposerRestoreTarget(
+  target: ScopedThreadRef | DraftId,
+): ScopedThreadRef | DraftId {
+  if (typeof target !== "string") return target;
+  if (useComposerDraftStore.getState().draftThreadsByThreadKey[target] !== undefined) {
+    return target;
+  }
+  return promotedDraftHandoffs.get(target) ?? target;
+}
+
+/** Whether two composer targets read and write the same stored draft right now. */
+export function composerTargetsShareDraft(
+  left: ScopedThreadRef | DraftId,
+  right: ScopedThreadRef | DraftId,
+): boolean {
+  const state = useComposerDraftStore.getState();
+  const leftKey = resolveComposerDraftKey(state, left);
+  return leftKey !== null && leftKey === resolveComposerDraftKey(state, right);
 }
 
 export function finalizePromotedDraftThreadsByRef(

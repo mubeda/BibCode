@@ -1,8 +1,8 @@
 use serde_json::{Value, json};
 
 use super::model::{
-    SCOPE_ACCESS_READ, SCOPE_ACCESS_WRITE, SCOPE_ORCHESTRATION_OPERATE, SCOPE_ORCHESTRATION_READ,
-    SCOPE_RELAY_WRITE, SCOPE_REVIEW_WRITE, SCOPE_TERMINAL_OPERATE,
+    SCOPE_ACCESS_READ, SCOPE_ACCESS_WRITE, SCOPE_DIAGNOSTICS_READ, SCOPE_ORCHESTRATION_OPERATE,
+    SCOPE_ORCHESTRATION_READ, SCOPE_RELAY_WRITE, SCOPE_REVIEW_WRITE, SCOPE_TERMINAL_OPERATE,
 };
 
 pub(crate) const ACTIVITY_READ_SCOPE: &str = SCOPE_ORCHESTRATION_READ;
@@ -187,6 +187,9 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         "review.getDiffPreview" | "review.listDiffTools" | "review.readFileVersion" => {
             Some(SCOPE_REVIEW_WRITE)
         }
+        // The redacted bundle only; `orchestration:read` satisfies it too (`scope_satisfies`).
+        // Crash dumps additionally need `orchestration:operate`, checked by the handler.
+        "server.downloadDiagnosticLogs" => Some(SCOPE_DIAGNOSTICS_READ),
         "cloud.getRelayClientStatus" | "cloud.installRelayClient" => Some(SCOPE_RELAY_WRITE),
         "subscribeAuthAccess" => Some(SCOPE_ACCESS_READ),
         // Two-tier policy: a pending-pairing session confirms its OWN
@@ -196,6 +199,11 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         // confirm_pairing_policy_is_pending_capability_or_access_write and
         // the e2ee scope-bypass suite.
         "auth.confirmPairing" => Some(SCOPE_ACCESS_WRITE),
+        // The desktop app relaying `bibcode diagnostics download` (#201). The scope is only
+        // the floor: each handler also requires the desktop app's own session.
+        "server.subscribeDiagnosticLogsRelay"
+        | "server.claimDiagnosticLogsRelay"
+        | "server.sendDiagnosticLogsRelayItem" => Some(SCOPE_ACCESS_WRITE),
         _ => None,
     }
 }
@@ -422,6 +430,43 @@ mod tests {
         );
         assert_eq!(required_scope("unknown.method"), None);
     }
+    #[test]
+    fn only_the_diagnostic_bundle_takes_the_diagnostics_scope() {
+        use crate::auth::model::scope_satisfies;
+        let named: Vec<_> = ACTIVE_RPC_METHODS
+            .iter()
+            .filter(|method| required_scope(method.name) == Some(SCOPE_DIAGNOSTICS_READ))
+            .map(|method| method.name)
+            .collect();
+        assert_eq!(named, ["server.downloadDiagnosticLogs"]);
+        assert!(scope_satisfies(
+            &[SCOPE_ORCHESTRATION_READ],
+            SCOPE_DIAGNOSTICS_READ
+        ));
+        assert!(scope_satisfies(
+            &[SCOPE_DIAGNOSTICS_READ],
+            SCOPE_DIAGNOSTICS_READ
+        ));
+        for required in [
+            SCOPE_ORCHESTRATION_READ,
+            SCOPE_ORCHESTRATION_OPERATE,
+            SCOPE_TERMINAL_OPERATE,
+            SCOPE_REVIEW_WRITE,
+            SCOPE_ACCESS_READ,
+            SCOPE_ACCESS_WRITE,
+            SCOPE_RELAY_WRITE,
+        ] {
+            assert!(
+                !scope_satisfies(&[SCOPE_DIAGNOSTICS_READ], required),
+                "diagnostics:read must not satisfy {required}"
+            );
+        }
+        assert!(!scope_satisfies(
+            &[SCOPE_ORCHESTRATION_OPERATE],
+            SCOPE_DIAGNOSTICS_READ
+        ));
+    }
+
     #[test]
     fn staged_uploads_all_require_orchestration_operate() {
         for method in [

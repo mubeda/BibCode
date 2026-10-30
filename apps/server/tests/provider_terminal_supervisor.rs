@@ -56,27 +56,28 @@ use bibcode_server::{
     provider_terminal::{
         CachedClaudeCapabilityProbe, CachedCodexCapabilityProbe, CachedOpenCodeCapabilityProbe,
         ClaudeAdditiveHookAttestor, ClaudeCapabilities, ClaudeCapabilityProbeRunner,
-        ClaudeExecutablePinner, ClaudeProbeOutput, ClaudeTerminalObserverFactory,
-        CodexCapabilityProbeRunner, CodexHelperLaunch, CodexHelperLauncher, CodexHelperProcess,
-        CodexProbeOutput, CodexRemoteClient, CodexRemoteClientFactory,
-        CodexTerminalObserverFactory, OpenCodeCapabilityProbeRunner, OpenCodeEventStream,
-        OpenCodeHelperLaunch, OpenCodeHelperLauncher, OpenCodeHelperProcess, OpenCodeHelperReady,
-        OpenCodeProbeOutput, OpenCodeRemoteClient, OpenCodeRemoteClientFactory,
-        OpenCodeTerminalObserverFactory, PreparedTerminalLaunch, PreparedTerminalObserver,
-        ProviderSettingsInventoryAuthority, ProviderTerminalActivitySupervisor,
-        ProviderTerminalInventory, ProviderTerminalInventoryAuthority,
-        ProviderTerminalObserverFactories, ProviderTerminalObserverFactory,
-        ProviderTerminalObserverFactoryInput, TerminalAgentActivityTransition,
-        TerminalGenerationActivityPublisher, TerminalLaunchPreparation,
-        TerminalLaunchPreparationInput, TerminalLaunchPreparer, TerminalObserverCancellationReason,
-        TerminalObserverGeneration, TerminalObserverGenerationLease, TerminalObserverWorkerContext,
+        ClaudeExecutablePinner, ClaudeInstallResolver, ClaudeProbeOutput, ClaudeShimRequest,
+        ClaudeShimResolution, ClaudeTerminalObserverFactory, CodexCapabilityProbeRunner,
+        CodexHelperLaunch, CodexHelperLauncher, CodexHelperProcess, CodexProbeOutput,
+        CodexRemoteClient, CodexRemoteClientFactory, CodexTerminalObserverFactory,
+        OpenCodeCapabilityProbeRunner, OpenCodeEventStream, OpenCodeHelperLaunch,
+        OpenCodeHelperLauncher, OpenCodeHelperProcess, OpenCodeHelperReady, OpenCodeProbeOutput,
+        OpenCodeRemoteClient, OpenCodeRemoteClientFactory, OpenCodeTerminalObserverFactory,
+        PreparedTerminalLaunch, PreparedTerminalObserver, ProviderSettingsInventoryAuthority,
+        ProviderTerminalActivitySupervisor, ProviderTerminalInventory,
+        ProviderTerminalInventoryAuthority, ProviderTerminalObserverFactories,
+        ProviderTerminalObserverFactory, ProviderTerminalObserverFactoryInput,
+        TerminalAgentActivityTransition, TerminalAgentState, TerminalGenerationActivityPublisher,
+        TerminalLaunchPreparation, TerminalLaunchPreparationInput, TerminalLaunchPreparer,
+        TerminalObserverCancellationReason, TerminalObserverGeneration,
+        TerminalObserverGenerationLease, TerminalObserverWorkerContext,
         TerminalObserverWorkerSpawnError,
     },
     server_settings::{ProviderInstanceState, ProviderSettingsState, ProviderSettingsStore},
     terminal::{
         ProviderTerminalActivityLaunch, PtyBackend, PtyExit, PtyProcess, PtySpawnInput,
-        TerminalLaunchCommand, TerminalManager, TerminalManagerOptions, TerminalOpenInput,
-        TerminalStatus,
+        TerminalAgentStatusState, TerminalLaunchCommand, TerminalManager, TerminalManagerOptions,
+        TerminalMetadataEvent, TerminalOpenInput, TerminalStatus,
     },
 };
 use serde_json::Value;
@@ -364,6 +365,7 @@ impl TerminalLaunchPreparer for ReadinessBarrierPreparer {
             TerminalLaunchPreparation::Prepared(PreparedTerminalLaunch {
                 executable: "prepared-command".to_owned(),
                 args: Vec::new(),
+                env_overlay: BTreeMap::new(),
                 private_env: BTreeMap::new(),
                 observer: Box::new(ReadinessBarrierObserver(self.readiness.clone())),
             })
@@ -491,10 +493,15 @@ impl TerminalLaunchPreparer for OversizedBudgetPreparer {
 #[derive(Debug)]
 struct DelayedProviderFactory {
     delay: std::time::Duration,
+    budget: std::time::Duration,
     completed: Arc<AtomicBool>,
 }
 
 impl ProviderTerminalObserverFactory for DelayedProviderFactory {
+    fn preparation_budget(&self) -> std::time::Duration {
+        self.budget
+    }
+
     fn prepare(
         &self,
         _input: ProviderTerminalObserverFactoryInput,
@@ -641,6 +648,7 @@ impl TerminalLaunchPreparer for CountingActivityPreparer {
             TerminalLaunchPreparation::Prepared(PreparedTerminalLaunch {
                 executable: input.executable,
                 args: input.args,
+                env_overlay: BTreeMap::new(),
                 private_env: BTreeMap::new(),
                 observer: Box::new(CountingActivityObserverProxy {
                     observer: self.observer.clone(),
@@ -677,6 +685,7 @@ impl TerminalLaunchPreparer for PostActivityCheckPausingPreparer {
                 PreparedTerminalLaunch {
                     executable: "instrumented-codex".to_owned(),
                     args: input.args,
+                    env_overlay: BTreeMap::new(),
                     private_env: BTreeMap::from([(
                         "BIBCODE_ACTIVITY_OBSERVER".to_owned(),
                         "enabled".to_owned(),
@@ -738,18 +747,92 @@ impl ProviderTerminalInventoryAuthority for CountingInventoryAuthority {
     }
 }
 
+/// An inventory authority that answers each read from a script, so a test can change the settings
+/// or stall a read between the budget lookup and preparation of one launch.
+#[derive(Debug)]
+struct ScriptedInventoryAuthority {
+    calls: AtomicUsize,
+    /// What each successive read waits, then answers; the last entry answers any further read.
+    script: Vec<(std::time::Duration, ProviderTerminalInventory)>,
+}
+
+impl ProviderTerminalInventoryAuthority for ScriptedInventoryAuthority {
+    fn current(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<ProviderTerminalInventory, ()>> + Send + '_>> {
+        let index = self.calls.fetch_add(1, Ordering::AcqRel);
+        let (delay, inventory) = self.script[index.min(self.script.len() - 1)].clone();
+        Box::pin(async move {
+            tokio::time::sleep(delay).await;
+            Ok(inventory)
+        })
+    }
+}
+
+#[cfg(unix)]
+fn claude_inventory(configured: &std::path::Path, enabled: bool) -> ProviderTerminalInventory {
+    let mut settings = ProviderSettingsState::default();
+    settings.providers.claude_agent.binary_path = configured.to_string_lossy().into_owned();
+    settings.providers.claude_agent.enabled = enabled;
+    ProviderTerminalInventory::from_settings(&settings)
+}
+
+/// Opens a Claude terminal whose settings reads follow `script` (enabled or not, delay), and
+/// returns how many reads the launch made.
+#[cfg(unix)]
+async fn open_claude_with_settings_script(
+    probe_delay: std::time::Duration,
+    script: Vec<(std::time::Duration, bool)>,
+) -> (
+    Arc<RecordingBackend>,
+    TerminalManager,
+    std::path::PathBuf,
+    tempfile::TempDir,
+    std::time::Duration,
+    usize,
+) {
+    let captured = Arc::new(Mutex::new(None::<Arc<ScriptedInventoryAuthority>>));
+    let capture = captured.clone();
+    let (backend, manager, configured, root, elapsed) =
+        open_claude_with_inventory(probe_delay, move |configured| {
+            let authority = Arc::new(ScriptedInventoryAuthority {
+                calls: AtomicUsize::new(0),
+                script: script
+                    .into_iter()
+                    .map(|(delay, enabled)| (delay, claude_inventory(configured, enabled)))
+                    .collect(),
+            });
+            *capture.lock().expect("authority capture") = Some(authority.clone());
+            Some(authority)
+        })
+        .await;
+    let reads = captured
+        .lock()
+        .expect("authority capture")
+        .take()
+        .expect("authority")
+        .calls
+        .load(Ordering::Acquire);
+    (backend, manager, configured, root, elapsed, reads)
+}
+
 #[derive(Debug, Default)]
 struct CountingProviderFactory {
     prepare_calls: AtomicUsize,
+    /// How many preparations ran with AI Terminal activity on.
+    activity_enabled_calls: AtomicUsize,
 }
 
 impl ProviderTerminalObserverFactory for CountingProviderFactory {
     fn prepare(
         &self,
-        _input: ProviderTerminalObserverFactoryInput,
+        input: ProviderTerminalObserverFactoryInput,
     ) -> Pin<Box<dyn Future<Output = Option<PreparedTerminalLaunch>> + Send + '_>> {
         Box::pin(async move {
             self.prepare_calls.fetch_add(1, Ordering::AcqRel);
+            if input.activity_enabled {
+                self.activity_enabled_calls.fetch_add(1, Ordering::AcqRel);
+            }
             None
         })
     }
@@ -790,6 +873,7 @@ impl ProviderTerminalObserverFactory for RacingProviderFactory {
             Some(PreparedTerminalLaunch {
                 executable: input.launch.executable,
                 args: input.launch.args,
+                env_overlay: BTreeMap::new(),
                 private_env: BTreeMap::new(),
                 observer: Box::new(RacingPreparedObserver {
                     live_resources: self.live_resources.clone(),
@@ -860,6 +944,7 @@ impl ProviderTerminalObserverFactory for HungProviderFactory {
             Some(PreparedTerminalLaunch {
                 executable: input.launch.executable,
                 args: input.launch.args,
+                env_overlay: BTreeMap::new(),
                 private_env: BTreeMap::from([(
                     "BIBCODE_HUNG_FACTORY_OBSERVER".to_owned(),
                     "installed".to_owned(),
@@ -968,6 +1053,7 @@ impl AgentActivitySettingsHandler for TerminalSettingsTransitionHandler {
 struct PreparedPlan {
     executable: String,
     args: Vec<String>,
+    env_overlay: BTreeMap<String, String>,
     private_env: BTreeMap<String, String>,
     observer: Arc<ObserverState>,
 }
@@ -1155,6 +1241,7 @@ impl TerminalLaunchPreparer for SerializedCallbackPreparer {
             TerminalLaunchPreparation::Prepared(PreparedTerminalLaunch {
                 executable: input.executable,
                 args: input.args,
+                env_overlay: BTreeMap::new(),
                 private_env: BTreeMap::new(),
                 observer: Box::new(SerializedCallbackObserver {
                     state: self.state.clone(),
@@ -1239,6 +1326,7 @@ impl TerminalLaunchPreparer for NonCooperativeCallbackPreparer {
             TerminalLaunchPreparation::Prepared(PreparedTerminalLaunch {
                 executable: input.executable,
                 args: input.args,
+                env_overlay: BTreeMap::new(),
                 private_env: BTreeMap::new(),
                 observer: Box::new(NonCooperativeCallbackObserver {
                     state: self.state.clone(),
@@ -1313,6 +1401,7 @@ impl TerminalLaunchPreparer for CallbackBlockingPoolPreparer {
             TerminalLaunchPreparation::Prepared(PreparedTerminalLaunch {
                 executable: input.executable,
                 args: input.args,
+                env_overlay: BTreeMap::new(),
                 private_env: BTreeMap::new(),
                 observer: Box::new(CallbackBlockingPoolObserver),
             })
@@ -1426,6 +1515,7 @@ impl TerminalLaunchPreparer for DurableObserverWorkerPreparer {
             TerminalLaunchPreparation::Prepared(PreparedTerminalLaunch {
                 executable: input.executable,
                 args: input.args,
+                env_overlay: BTreeMap::new(),
                 private_env: BTreeMap::new(),
                 observer: Box::new(DurableObserverWorker {
                     state: self.state.clone(),
@@ -1496,6 +1586,7 @@ impl TerminalLaunchPreparer for ObserverSetupBoundaryPreparer {
             TerminalLaunchPreparation::Prepared(PreparedTerminalLaunch {
                 executable: input.executable,
                 args: input.args,
+                env_overlay: BTreeMap::new(),
                 private_env: BTreeMap::new(),
                 observer: Box::new(ObserverSetupBoundary {
                     state: self.state.clone(),
@@ -1546,6 +1637,7 @@ impl TerminalLaunchPreparer for WorkerContextCapturePreparer {
             TerminalLaunchPreparation::Prepared(PreparedTerminalLaunch {
                 executable: input.executable,
                 args: input.args,
+                env_overlay: BTreeMap::new(),
                 private_env: BTreeMap::new(),
                 observer: Box::new(WorkerContextCaptureObserver),
             })
@@ -1639,6 +1731,7 @@ impl TerminalLaunchPreparer for FaultingPreparer {
             TerminalLaunchPreparation::Prepared(PreparedTerminalLaunch {
                 executable: input.executable,
                 args: input.args,
+                env_overlay: BTreeMap::new(),
                 private_env: BTreeMap::new(),
                 observer: Box::new(FaultingObserver {
                     on_spawned_fault: self.observer_on_spawned_fault,
@@ -1698,6 +1791,7 @@ impl TerminalLaunchPreparer for PlannedPreparer {
                     TerminalLaunchPreparation::Prepared(PreparedTerminalLaunch {
                         executable: plan.executable,
                         args: plan.args,
+                        env_overlay: plan.env_overlay,
                         private_env: plan.private_env,
                         observer: Box::new(RecordingObserver {
                             state: plan.observer,
@@ -1763,6 +1857,7 @@ impl ProviderTerminalObserverFactory for PinningFactory {
             Some(PreparedTerminalLaunch {
                 executable: input.launch.executable,
                 args: input.launch.args,
+                env_overlay: BTreeMap::new(),
                 private_env: BTreeMap::from([(
                     "BIBCODE_PRIVATE_TOKEN".to_owned(),
                     "observer-secret".to_owned(),
@@ -1846,7 +1941,7 @@ async fn lifecycle_unhinted_bypasses_preparer_and_hinted_prepares_before_spawn()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn hardening_preparation_execution_budget_defaults_to_500ms_and_clamps_at_1s() {
+async fn hardening_preparation_execution_budget_defaults_to_500ms_and_clamps_at_3s() {
     let root = tempfile::tempdir().expect("timeout root");
     let default_completed = Arc::new(AtomicBool::new(false));
     let default_preparer = Arc::new(DelayedPassThroughPreparer {
@@ -1913,7 +2008,7 @@ async fn hardening_preparation_execution_budget_defaults_to_500ms_and_clamps_at_
         Arc::new(RecordingBackend::new(Arc::new(Mutex::new(Vec::new())))),
         TerminalManagerOptions {
             launch_preparer: Some(Arc::new(OversizedBudgetPreparer {
-                delay: std::time::Duration::from_millis(1_500),
+                delay: std::time::Duration::from_millis(3_500),
                 completed: oversized_completed.clone(),
             })),
             ..TerminalManagerOptions::default()
@@ -1934,20 +2029,20 @@ async fn hardening_preparation_execution_budget_defaults_to_500ms_and_clamps_at_
         .expect("clamped-budget terminal");
     let oversized_elapsed = oversized_started.elapsed();
     assert!(
-        oversized_elapsed >= std::time::Duration::from_millis(900)
-            && oversized_elapsed < std::time::Duration::from_millis(1_350),
-        "preparer override escaped the hard 1s cap: {oversized_elapsed:?}"
+        oversized_elapsed >= std::time::Duration::from_millis(2_900)
+            && oversized_elapsed < std::time::Duration::from_millis(3_350),
+        "preparer override escaped the hard 3s cap: {oversized_elapsed:?}"
     );
     assert!(
         !oversized_completed.load(Ordering::Acquire),
-        "the 1.5s callback unexpectedly completed inside the hard cap"
+        "the 3.5s callback unexpectedly completed inside the hard cap"
     );
-    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
     oversized_manager.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn hardening_only_validated_opencode_preparation_receives_the_1s_budget() {
+async fn hardening_validated_preparation_receives_the_budget_its_factory_owns() {
     let root = tempfile::tempdir().expect("provider budget root");
     let codex = root.path().join("configured-codex");
     let claude = root.path().join("configured-claude");
@@ -1968,10 +2063,14 @@ async fn hardening_only_validated_opencode_preparation_receives_the_1s_budget() 
         .await
         .expect("migrations");
     let completed = Arc::new(AtomicBool::new(false));
-    let factory = Arc::new(DelayedProviderFactory {
-        delay: std::time::Duration::from_millis(612),
-        completed: completed.clone(),
-    });
+    // Each factory owns its budget, so the table below reads three different ones.
+    let delayed_factory = |budget_ms: u64| {
+        Arc::new(DelayedProviderFactory {
+            delay: std::time::Duration::from_millis(612),
+            budget: std::time::Duration::from_millis(budget_ms),
+            completed: completed.clone(),
+        })
+    };
     let supervisor = ProviderTerminalActivitySupervisor::new(
         settings.clone(),
         ProviderTerminalInventory::from_settings(&settings),
@@ -1979,9 +2078,9 @@ async fn hardening_only_validated_opencode_preparation_receives_the_1s_budget() 
         ProcessAttributionRegistry::new(),
         root.path().join("runtime"),
         ProviderTerminalObserverFactories {
-            codex: Some(factory.clone()),
-            claude: Some(factory.clone()),
-            opencode: Some(factory),
+            codex: Some(delayed_factory(350)),
+            claude: Some(delayed_factory(2_250)),
+            opencode: Some(delayed_factory(850)),
         },
     )
     .expect("provider budget supervisor");
@@ -2011,7 +2110,7 @@ async fn hardening_only_validated_opencode_preparation_receives_the_1s_budget() 
         ),
         (
             preparation_input(&claude, "claudeAgent", "claudeAgent"),
-            std::time::Duration::from_millis(500),
+            std::time::Duration::from_millis(2_400),
         ),
         (
             preparation_input(&opencode, "opencode", "opencode"),
@@ -2093,6 +2192,7 @@ async fn lifecycle_prepared_launch_replaces_command_and_notifies_only_after_spaw
         [PreparationPlan::Prepared(PreparedPlan {
             executable: "observed-codex".to_owned(),
             args: vec!["app-server".to_owned()],
+            env_overlay: BTreeMap::new(),
             private_env: BTreeMap::from([
                 (
                     "BIBCODE_PRIVATE_SOCKET".to_owned(),
@@ -2189,6 +2289,7 @@ async fn lifecycle_rejects_client_collision_with_private_environment_without_spa
         [PreparationPlan::Prepared(PreparedPlan {
             executable: "observed-codex".to_owned(),
             args: vec!["app-server".to_owned()],
+            env_overlay: BTreeMap::new(),
             private_env: BTreeMap::from([(
                 "BIBCODE_PRIVATE_TOKEN".to_owned(),
                 "server-secret".to_owned(),
@@ -2240,6 +2341,7 @@ async fn lifecycle_spawn_failure_cancels_prepared_observer_without_disclosing_pr
         [PreparationPlan::Prepared(PreparedPlan {
             executable: "observed-codex".to_owned(),
             args: vec!["app-server".to_owned()],
+            env_overlay: BTreeMap::new(),
             private_env: BTreeMap::from([(
                 "BIBCODE_PRIVATE_TOKEN".to_owned(),
                 "secret-token".to_owned(),
@@ -2274,6 +2376,91 @@ async fn lifecycle_spawn_failure_cancels_prepared_observer_without_disclosing_pr
 }
 
 #[tokio::test]
+async fn lifecycle_environment_overlay_overrides_client_keys_and_stays_out_of_diagnostics() {
+    let root = tempfile::tempdir().expect("temp dir");
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let backend = Arc::new(RecordingBackend::new(events.clone()));
+    let plan = |observer: Arc<ObserverState>| {
+        PreparationPlan::Prepared(PreparedPlan {
+            executable: "observed-claude".to_owned(),
+            args: vec!["--settings".to_owned(), "overlay.json".to_owned()],
+            env_overlay: BTreeMap::from([
+                ("PATH".to_owned(), "/mise/installs/bin:/usr/bin".to_owned()),
+                (
+                    "ANTHROPIC_API_KEY".to_owned(),
+                    "mise-project-key".to_owned(),
+                ),
+            ]),
+            private_env: BTreeMap::new(),
+            observer,
+        })
+    };
+    let failed_observer = Arc::new(ObserverState::default());
+    let observer = Arc::new(ObserverState::default());
+    let preparer = Arc::new(PlannedPreparer::new(
+        events,
+        [plan(failed_observer.clone()), plan(observer.clone())],
+    ));
+    backend.fail_next("spawn rejected mise-project-key");
+    let manager = TerminalManager::new(
+        backend.clone(),
+        TerminalManagerOptions {
+            launch_preparer: Some(preparer),
+            ..TerminalManagerOptions::default()
+        },
+    );
+    let open_input = |terminal: &str| {
+        let mut input =
+            TerminalOpenInput::new("thread-1", terminal, root.path().to_path_buf(), 80, 24);
+        input.env.insert("PATH".to_owned(), "/usr/bin".to_owned());
+        input.env.insert("PUBLIC".to_owned(), "visible".to_owned());
+        input.command = Some(command(true));
+        input
+    };
+
+    let rendered = manager
+        .open(open_input("terminal-failed"))
+        .await
+        .expect_err("injected spawn failure")
+        .to_string();
+    assert!(!rendered.contains("mise-project-key"), "{rendered}");
+
+    manager
+        .open(open_input("terminal-1"))
+        .await
+        .expect("prepared terminal");
+    let spawn = backend.spawns().pop().expect("spawn");
+    assert_eq!(
+        spawn.env.get("PATH").map(String::as_str),
+        Some("/mise/installs/bin:/usr/bin"),
+        "the overlay overrides the client's PATH, as the shim would have"
+    );
+    assert_eq!(
+        spawn.env.get("ANTHROPIC_API_KEY").map(String::as_str),
+        Some("mise-project-key")
+    );
+    assert_eq!(spawn.env.get("PUBLIC").map(String::as_str), Some("visible"));
+    let prepared_debug = format!(
+        "{:?}",
+        PreparedTerminalLaunch {
+            executable: "observed-claude".to_owned(),
+            args: Vec::new(),
+            env_overlay: BTreeMap::from([("KEY".to_owned(), "mise-project-key".to_owned())]),
+            private_env: BTreeMap::new(),
+            observer: Box::new(RecordingObserver {
+                state: Arc::new(ObserverState::default()),
+            }),
+        }
+    );
+    assert!(prepared_debug.contains("KEY"), "{prepared_debug}");
+    assert!(
+        !prepared_debug.contains("mise-project-key"),
+        "{prepared_debug}"
+    );
+    manager.shutdown().await;
+}
+
+#[tokio::test]
 async fn lifecycle_exit_close_restart_and_shutdown_cancel_before_generation_invalidation() {
     let root = tempfile::tempdir().expect("temp dir");
     let events = Arc::new(Mutex::new(Vec::new()));
@@ -2287,6 +2474,7 @@ async fn lifecycle_exit_close_restart_and_shutdown_cancel_before_generation_inva
             PreparationPlan::Prepared(PreparedPlan {
                 executable: "observed-codex".to_owned(),
                 args: vec!["app-server".to_owned()],
+                env_overlay: BTreeMap::new(),
                 private_env: BTreeMap::new(),
                 observer,
             })
@@ -2394,6 +2582,7 @@ async fn lifecycle_restart_rejects_late_observer_and_pty_output_from_the_old_gen
                 PreparationPlan::Prepared(PreparedPlan {
                     executable: "observed-codex".to_owned(),
                     args: vec!["app-server".to_owned()],
+                    env_overlay: BTreeMap::new(),
                     private_env: BTreeMap::new(),
                     observer,
                 })
@@ -2467,6 +2656,7 @@ async fn lifecycle_close_cancels_a_prepared_in_flight_observer_before_invalidati
         [PreparationPlan::Prepared(PreparedPlan {
             executable: "observed-codex".to_owned(),
             args: vec!["app-server".to_owned()],
+            env_overlay: BTreeMap::new(),
             private_env: BTreeMap::new(),
             observer: observer.clone(),
         })],
@@ -3951,6 +4141,7 @@ async fn hardening_streaming_redaction_handles_every_split_longest_first_and_flu
             [PreparationPlan::Prepared(PreparedPlan {
                 executable: "observed-codex".to_owned(),
                 args: Vec::new(),
+                env_overlay: BTreeMap::new(),
                 private_env: BTreeMap::from([
                     ("A_SHORT".to_owned(), "private".to_owned()),
                     ("Z_LONG".to_owned(), secret.to_owned()),
@@ -4016,6 +4207,7 @@ async fn hardening_streaming_redaction_handles_every_split_longest_first_and_flu
                 [PreparationPlan::Prepared(PreparedPlan {
                     executable: "observed-codex".to_owned(),
                     args: Vec::new(),
+                    env_overlay: BTreeMap::new(),
                     private_env: BTreeMap::from([("PRIVATE".to_owned(), secret.to_owned())]),
                     observer: Arc::new(ObserverState::default()),
                 })],
@@ -4072,6 +4264,7 @@ async fn hardening_diagnostics_manager_debug_never_exposes_private_values() {
                 [PreparationPlan::Prepared(PreparedPlan {
                     executable: "observed-codex".to_owned(),
                     args: Vec::new(),
+                    env_overlay: BTreeMap::new(),
                     private_env: BTreeMap::from([(
                         "PRIVATE".to_owned(),
                         "secret-token".to_owned(),
@@ -4099,6 +4292,7 @@ async fn hardening_diagnostics_manager_debug_never_exposes_private_values() {
         TerminalLaunchPreparation::Prepared(PreparedTerminalLaunch {
             executable: "observed-codex".to_owned(),
             args: vec!["secret-token".to_owned()],
+            env_overlay: BTreeMap::new(),
             private_env: BTreeMap::from([("PRIVATE".to_owned(), "secret-token".to_owned(),)]),
             observer: Box::new(RecordingObserver {
                 state: Arc::new(ObserverState::default()),
@@ -4122,6 +4316,7 @@ async fn hardening_diagnostics_attempted_args_and_backend_errors_redact_private_
                 [PreparationPlan::Prepared(PreparedPlan {
                     executable: "observed-codex".to_owned(),
                     args: vec!["secret-token".to_owned(), "again-secret-token".to_owned()],
+                    env_overlay: BTreeMap::new(),
                     private_env: BTreeMap::from([(
                         "PRIVATE".to_owned(),
                         "secret-token".to_owned(),
@@ -4539,6 +4734,8 @@ struct CodexFixtureHelperLauncher {
     fail: AtomicBool,
     processes: Mutex<Vec<Arc<CodexFixtureProcess>>>,
     timeline: Arc<Mutex<Vec<&'static str>>>,
+    /// How long the helper takes to become ready, as a slow machine's would.
+    start_delay: Mutex<std::time::Duration>,
 }
 
 impl CodexHelperLauncher for CodexFixtureHelperLauncher {
@@ -4558,6 +4755,10 @@ impl CodexHelperLauncher for CodexFixtureHelperLauncher {
                 .push(launch);
             if self.fail.load(Ordering::Acquire) {
                 return Err("injected helper failure".to_owned());
+            }
+            let start_delay = *self.start_delay.lock().expect("helper start delay lock");
+            if !start_delay.is_zero() {
+                tokio::time::sleep(start_delay).await;
             }
             let process = Arc::new(CodexFixtureProcess {
                 terminated: AtomicBool::new(false),
@@ -5063,6 +5264,17 @@ async fn codex_fixture_supervisor_with_reattach_timeout(
     remote: Arc<CodexFixtureRemoteFactory>,
     reattach_timeout: Option<std::time::Duration>,
 ) -> (ProviderTerminalActivitySupervisor, ActivityProjection) {
+    codex_fixture_supervisor_on(
+        migrated_database().await,
+        root,
+        configured,
+        helper,
+        remote,
+        reattach_timeout,
+    )
+}
+
+async fn migrated_database() -> Database {
     let database = Database::open_in_memory().await.expect("database");
     database
         .call(|connection| {
@@ -5071,6 +5283,42 @@ async fn codex_fixture_supervisor_with_reattach_timeout(
         })
         .await
         .expect("migrations");
+    database
+}
+
+/// Makes every new activity scope fail to write, as a transient database error would, until
+/// `allow_activity_scopes` (#187).
+async fn refuse_activity_scopes(database: &Database) {
+    database
+        .call(|connection| {
+            connection.execute_batch(
+                "CREATE TRIGGER refuse_activity_scopes BEFORE INSERT ON activity_scopes
+                 BEGIN SELECT RAISE(ABORT, 'injected activity scope failure'); END;",
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("refuse activity scopes");
+}
+
+async fn allow_activity_scopes(database: &Database) {
+    database
+        .call(|connection| {
+            connection.execute_batch("DROP TRIGGER refuse_activity_scopes;")?;
+            Ok(())
+        })
+        .await
+        .expect("allow activity scopes");
+}
+
+fn codex_fixture_supervisor_on(
+    database: Database,
+    root: &tempfile::TempDir,
+    configured: &std::path::Path,
+    helper: Arc<CodexFixtureHelperLauncher>,
+    remote: Arc<CodexFixtureRemoteFactory>,
+    reattach_timeout: Option<std::time::Duration>,
+) -> (ProviderTerminalActivitySupervisor, ActivityProjection) {
     let projection = ActivityProjection::new(ActivityRepository::new(database));
     let mut settings = ProviderSettingsState::default();
     settings.providers.codex.binary_path = configured.to_string_lossy().into_owned();
@@ -5398,6 +5646,212 @@ async fn agent_activity_toggle_codex_retains_connection_and_crosses_ordered_barr
         .close("thread-codex", Some("terminal-retained"))
         .await
         .expect("close retained Codex terminal");
+    manager.shutdown().await;
+    isolated.complete();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agent_activity_toggle_codex_status_only_launch_publishes_activity_once_enabled() {
+    // Mutation caught: an observer launched with activity off never creating its scope, so
+    // enabling activity later shows nothing for that terminal (#187).
+    own_process!(isolated);
+    let fixture = codex_remote_fixture();
+    let root = tempfile::tempdir().expect("fixture root");
+    let configured = root.path().join("configured-codex");
+    std::fs::write(&configured, b"configured").expect("configured executable");
+    let remote_state = Arc::new(CodexFixtureRemoteState::default());
+    remote_state
+        .events
+        .lock()
+        .expect("Codex events")
+        .push_back(codex_root_notification(
+            &fixture,
+            "terminal-status-only-root",
+            root.path(),
+        ));
+    let (supervisor, projection) = codex_fixture_supervisor(
+        &root,
+        &configured,
+        Arc::new(CodexFixtureHelperLauncher::default()),
+        Arc::new(CodexFixtureRemoteFactory {
+            state: remote_state.clone(),
+        }),
+    )
+    .await;
+    let controller = projection.agent_activity_controller_for_integration_test();
+    controller.disable().await;
+    let manager = TerminalManager::new(
+        Arc::new(RecordingBackend::new(Arc::new(Mutex::new(Vec::new())))),
+        TerminalManagerOptions {
+            launch_preparer: Some(Arc::new(supervisor)),
+            ..TerminalManagerOptions::default()
+        },
+    );
+    manager
+        .open(codex_fixture_open_input(
+            &fixture,
+            &configured,
+            &root,
+            "terminal-status-only",
+        ))
+        .await
+        .expect("Codex terminal");
+    let scope = ActivityScopeRef::Terminal {
+        thread_id: "thread-codex".to_owned(),
+        terminal_id: "terminal-status-only".to_owned(),
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while !remote_state.events.lock().expect("Codex events").is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("dormant Codex root correlation");
+    assert!(
+        projection.snapshot(&scope).await.is_err(),
+        "a status-only launch publishes no activity scope"
+    );
+    remote_state
+        .events
+        .lock()
+        .expect("Codex events")
+        .push_back(serde_json::json!({
+            "method": "thread/status/changed",
+            "params": {
+                "threadId": "terminal-status-only-root",
+                "status": {"type": "active", "activeFlags": ["waitingOnApproval"]},
+            },
+        }));
+    // The root's state reaches the terminal's metadata with activity off (#187).
+    wait_for_terminal_agent_status(
+        &manager,
+        "terminal-status-only",
+        TerminalAgentStatusState::Blocked,
+    )
+    .await;
+
+    controller.enable();
+    let enabled = manager.set_agent_activity_enabled(true).await;
+    assert_eq!((enabled.resumed, enabled.failed), (1, 0));
+    remote_state
+        .events
+        .lock()
+        .expect("Codex events")
+        .push_back(codex_detail_notification(
+            "terminal-status-only-root",
+            "enabled-item",
+            "enabled-detail",
+        ));
+    wait_for_codex_root_detail(
+        &projection,
+        &scope,
+        "terminal-status-only-root",
+        "enabled-detail",
+    )
+    .await;
+    manager
+        .close("thread-codex", Some("terminal-status-only"))
+        .await
+        .expect("close status-only Codex terminal");
+    manager.shutdown().await;
+    isolated.complete();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agent_activity_toggle_codex_enable_retries_a_scope_it_could_not_write() {
+    // Mutation caught: enabling activity on a status-only Codex observer reading live before its
+    // scope is written, so a transient write failure leaves live observation with no scope
+    // until another toggle or restart (#187).
+    own_process!(isolated);
+    let fixture = codex_remote_fixture();
+    let root = tempfile::tempdir().expect("fixture root");
+    let configured = root.path().join("configured-codex");
+    std::fs::write(&configured, b"configured").expect("configured executable");
+    let remote_state = Arc::new(CodexFixtureRemoteState::default());
+    remote_state
+        .events
+        .lock()
+        .expect("Codex events")
+        .push_back(codex_root_notification(
+            &fixture,
+            "terminal-scope-retry-root",
+            root.path(),
+        ));
+    let database = migrated_database().await;
+    let (supervisor, projection) = codex_fixture_supervisor_on(
+        database.clone(),
+        &root,
+        &configured,
+        Arc::new(CodexFixtureHelperLauncher::default()),
+        Arc::new(CodexFixtureRemoteFactory {
+            state: remote_state.clone(),
+        }),
+        None,
+    );
+    let controller = projection.agent_activity_controller_for_integration_test();
+    controller.disable().await;
+    let manager = TerminalManager::new(
+        Arc::new(RecordingBackend::new(Arc::new(Mutex::new(Vec::new())))),
+        TerminalManagerOptions {
+            launch_preparer: Some(Arc::new(supervisor)),
+            ..TerminalManagerOptions::default()
+        },
+    );
+    manager
+        .open(codex_fixture_open_input(
+            &fixture,
+            &configured,
+            &root,
+            "terminal-scope-retry",
+        ))
+        .await
+        .expect("Codex terminal");
+    let scope = ActivityScopeRef::Terminal {
+        thread_id: "thread-codex".to_owned(),
+        terminal_id: "terminal-scope-retry".to_owned(),
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while !remote_state.events.lock().expect("Codex events").is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("dormant Codex root correlation");
+
+    refuse_activity_scopes(&database).await;
+    controller.enable();
+    let enabled = manager.set_agent_activity_enabled(true).await;
+    assert_eq!(
+        enabled.resumed, 0,
+        "an observer whose scope could not be written does not read live"
+    );
+    assert!(projection.snapshot(&scope).await.is_err());
+
+    // The write succeeds again: the retry publishes the scope, then its activity.
+    allow_activity_scopes(&database).await;
+    wait_for_codex_initial_live(&projection, &scope).await;
+    remote_state
+        .events
+        .lock()
+        .expect("Codex events")
+        .push_back(codex_detail_notification(
+            "terminal-scope-retry-root",
+            "after-retry-item",
+            "after-retry-detail",
+        ));
+    wait_for_codex_root_detail(
+        &projection,
+        &scope,
+        "terminal-scope-retry-root",
+        "after-retry-detail",
+    )
+    .await;
+    manager
+        .close("thread-codex", Some("terminal-scope-retry"))
+        .await
+        .expect("close Codex terminal");
     manager.shutdown().await;
     isolated.complete();
 }
@@ -8625,6 +9079,31 @@ impl ClaudeExecutablePinner for UnsupportedClaudeExecutablePinner {
     }
 }
 
+/// A Claude capability probe that takes `delay` before it answers from the shared fixture, so a
+/// slow machine's preparation can be driven through the real factory.
+#[cfg(unix)]
+#[derive(Debug)]
+struct DelayedClaudeProbeRunner {
+    inner: Arc<ClaudeProbeFixtureRunner>,
+    delay: std::time::Duration,
+}
+
+#[cfg(unix)]
+impl ClaudeCapabilityProbeRunner for DelayedClaudeProbeRunner {
+    fn run(
+        &self,
+        executable: &std::path::Path,
+        args: Vec<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<ClaudeProbeOutput, String>> + Send + '_>> {
+        // The fixture answers in call order, so take the answer now and only delay its delivery.
+        let output = self.inner.run(executable, args);
+        Box::pin(async move {
+            tokio::time::sleep(self.delay).await;
+            output.await
+        })
+    }
+}
+
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug)]
 enum ClaudeSourceMutation {
@@ -8666,8 +9145,13 @@ async fn claude_pinning_fixture_supervisor(
     configured: &std::path::Path,
     pinner: Arc<dyn ClaudeExecutablePinner>,
 ) -> ProviderTerminalActivitySupervisor {
+    let runner = claude_probe_fixture_runner();
+    claude_fixture_supervisor_with_runner(root, configured, pinner, runner).await
+}
+
+fn claude_probe_fixture_runner() -> Arc<ClaudeProbeFixtureRunner> {
     let fixture = claude_hook_fixture();
-    let runner = Arc::new(ClaudeProbeFixtureRunner {
+    Arc::new(ClaudeProbeFixtureRunner {
         calls: Mutex::new(Vec::new()),
         outputs: Mutex::new(VecDeque::from([
             Ok(ClaudeProbeOutput {
@@ -8684,7 +9168,25 @@ async fn claude_pinning_fixture_supervisor(
                 stderr: String::new(),
             }),
         ])),
-    });
+    })
+}
+
+async fn claude_fixture_supervisor_with_runner(
+    root: &tempfile::TempDir,
+    configured: &std::path::Path,
+    pinner: Arc<dyn ClaudeExecutablePinner>,
+    runner: Arc<dyn ClaudeCapabilityProbeRunner>,
+) -> ProviderTerminalActivitySupervisor {
+    claude_fixture_supervisor_with_authority(root, configured, pinner, runner, None).await
+}
+
+async fn claude_fixture_supervisor_with_authority(
+    root: &tempfile::TempDir,
+    configured: &std::path::Path,
+    pinner: Arc<dyn ClaudeExecutablePinner>,
+    runner: Arc<dyn ClaudeCapabilityProbeRunner>,
+    authority: Option<Arc<dyn ProviderTerminalInventoryAuthority>>,
+) -> ProviderTerminalActivitySupervisor {
     let factory = Arc::new(ClaudeTerminalObserverFactory::with_pinner(
         Arc::new(CachedClaudeCapabilityProbe::with_attestor(
             runner,
@@ -8702,16 +9204,31 @@ async fn claude_pinning_fixture_supervisor(
         .expect("migrations");
     let mut settings = ProviderSettingsState::default();
     settings.providers.claude_agent.binary_path = configured.to_string_lossy().into_owned();
+    let controller = AgentActivityController::new(true);
+    let projection =
+        ActivityProjection::with_controller(ActivityRepository::new(database), controller.clone());
+    let factories = ProviderTerminalObserverFactories {
+        claude: Some(factory),
+        ..ProviderTerminalObserverFactories::default()
+    };
+    if let Some(authority) = authority {
+        return ProviderTerminalActivitySupervisor::new_with_authority(
+            authority,
+            controller,
+            projection,
+            ProcessAttributionRegistry::new(),
+            root.path().join("runtime"),
+            factories,
+        )
+        .expect("Claude supervisor");
+    }
     ProviderTerminalActivitySupervisor::new(
         settings.clone(),
         ProviderTerminalInventory::from_settings(&settings),
-        ActivityProjection::new(ActivityRepository::new(database)),
+        projection,
         ProcessAttributionRegistry::new(),
         root.path().join("runtime"),
-        ProviderTerminalObserverFactories {
-            claude: Some(factory),
-            ..ProviderTerminalObserverFactories::default()
-        },
+        factories,
     )
     .expect("Claude supervisor")
 }
@@ -8745,7 +9262,7 @@ fn claude_pinning_open_input(
 }
 
 #[tokio::test]
-async fn agent_activity_toggle_disabled_launch_is_pure_pass_through() {
+async fn agent_activity_toggle_disabled_launch_still_prepares_the_status_observer() {
     let fixture = tempfile::tempdir().expect("fixture root");
     let configured = fixture.path().join("configured-codex");
     std::fs::write(&configured, b"configured").expect("configured binary");
@@ -8798,12 +9315,19 @@ async fn agent_activity_toggle_disabled_launch_is_pure_pass_through() {
         })
         .await;
 
+    // The agent's left-panel status needs the observer whatever the activity setting says
+    // (#187); the setting only decides whether it also publishes activity.
     assert!(matches!(
         preparation,
         TerminalLaunchPreparation::PassThrough
     ));
-    assert_eq!(authority.calls.load(Ordering::Acquire), 0);
-    assert_eq!(factory.prepare_calls.load(Ordering::Acquire), 0);
+    assert_eq!(authority.calls.load(Ordering::Acquire), 1);
+    assert_eq!(factory.prepare_calls.load(Ordering::Acquire), 1);
+    assert_eq!(
+        factory.activity_enabled_calls.load(Ordering::Acquire),
+        0,
+        "the observer launches with activity dormant"
+    );
 }
 
 #[tokio::test]
@@ -9280,8 +9804,9 @@ async fn agent_activity_toggle_terminal_launched_disabled_stays_uninstrumented_a
     });
     manager.open(input).await.expect("pass-through terminal");
     assert_eq!(backend.spawns()[0].executable, configured.to_string_lossy());
-    assert_eq!(authority.calls.load(Ordering::Acquire), 0);
-    assert_eq!(factory.prepare_calls.load(Ordering::Acquire), 0);
+    // The status observer is prepared at launch (#187); this factory declines it.
+    assert_eq!(authority.calls.load(Ordering::Acquire), 1);
+    assert_eq!(factory.prepare_calls.load(Ordering::Acquire), 1);
 
     controller.enable();
     assert_eq!(
@@ -9290,7 +9815,7 @@ async fn agent_activity_toggle_terminal_launched_disabled_stays_uninstrumented_a
     );
     assert_eq!(
         factory.prepare_calls.load(Ordering::Acquire),
-        0,
+        1,
         "re-enable never retrofits a pass-through terminal"
     );
     assert!(!backend.latest().killed.load(Ordering::Acquire));
@@ -9446,6 +9971,206 @@ async fn claude_in_place_mutation_after_preparation_cannot_change_pinned_spawn()
 }
 
 #[cfg(unix)]
+async fn open_claude_with_probe_delay(
+    delay: std::time::Duration,
+) -> (
+    Arc<RecordingBackend>,
+    TerminalManager,
+    std::path::PathBuf,
+    tempfile::TempDir,
+    std::time::Duration,
+) {
+    open_claude_with_inventory(delay, |_| None).await
+}
+
+/// Opens a Claude terminal whose probe takes `delay`. `authority` builds the inventory authority
+/// from the configured Claude path; `None` uses the static, always-enabled inventory.
+#[cfg(unix)]
+async fn open_claude_with_inventory(
+    delay: std::time::Duration,
+    authority: impl FnOnce(&std::path::Path) -> Option<Arc<dyn ProviderTerminalInventoryAuthority>>,
+) -> (
+    Arc<RecordingBackend>,
+    TerminalManager,
+    std::path::PathBuf,
+    tempfile::TempDir,
+    std::time::Duration,
+) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().expect("fixture root");
+    let configured = root.path().join("configured-claude");
+    std::fs::write(&configured, b"approved").expect("approved Claude");
+    std::fs::set_permissions(&configured, std::fs::Permissions::from_mode(0o700))
+        .expect("Claude permissions");
+    let runner = Arc::new(DelayedClaudeProbeRunner {
+        inner: claude_probe_fixture_runner(),
+        delay,
+    });
+    // The approved-build seam is `ClaudeAttestorFixture`: it vouches for 2.1.220 without a real install.
+    let supervisor = claude_fixture_supervisor_with_authority(
+        &root,
+        &configured,
+        Arc::new(CopyClaudeExecutablePinner),
+        runner,
+        authority(&configured),
+    )
+    .await;
+    let backend = Arc::new(RecordingBackend::new(Arc::new(Mutex::new(Vec::new()))));
+    let manager = TerminalManager::new(
+        backend.clone(),
+        TerminalManagerOptions {
+            launch_preparer: Some(Arc::new(supervisor)),
+            ..TerminalManagerOptions::default()
+        },
+    );
+    let started = std::time::Instant::now();
+    manager
+        .open(claude_pinning_open_input(
+            &root,
+            &configured,
+            "terminal-claude-slow",
+        ))
+        .await
+        .expect("Claude terminal");
+    let elapsed = started.elapsed();
+    (backend, manager, configured, root, elapsed)
+}
+
+/// #200: the manager used to give Claude the 500 ms default, so a preparation that needs longer
+/// than that, but is well inside Claude's own budget, ran unobserved.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn claude_preparation_slower_than_500ms_but_within_its_budget_is_observed() {
+    own_process!(isolated);
+    let (backend, manager, configured, _root, elapsed) =
+        open_claude_with_probe_delay(std::time::Duration::from_millis(700)).await;
+
+    assert!(
+        elapsed >= std::time::Duration::from_millis(650)
+            && elapsed < std::time::Duration::from_millis(2_000),
+        "the slow probe should be waited for, not cut at 500 ms or run to the budget: {elapsed:?}"
+    );
+    let spawn = backend.spawns().pop().expect("Claude PTY spawn");
+    assert_ne!(
+        std::path::PathBuf::from(&spawn.executable),
+        configured,
+        "an observed launch runs the pinned executable"
+    );
+    let (_, _, _, settings_path) = claude_hook_launch(&backend);
+    assert!(settings_path.exists(), "the hook overlay must be installed");
+    manager.shutdown().await;
+    isolated.complete();
+}
+
+/// A probe that never answers costs `terminal.open` Claude's own budget, not more, and the
+/// original command then runs unobserved.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn claude_preparation_that_never_finishes_waits_its_budget_then_runs_unobserved() {
+    own_process!(isolated);
+    let (backend, manager, configured, _root, elapsed) =
+        open_claude_with_probe_delay(std::time::Duration::from_secs(60)).await;
+
+    assert!(
+        elapsed >= std::time::Duration::from_millis(2_200)
+            && elapsed < std::time::Duration::from_millis(3_000),
+        "a hung preparation must stop at Claude's 2.25 s budget: {elapsed:?}"
+    );
+    let spawn = backend.spawns().pop().expect("Claude PTY spawn");
+    assert_eq!(
+        std::path::PathBuf::from(&spawn.executable),
+        configured,
+        "the original command runs unobserved"
+    );
+    assert!(!spawn.args.iter().any(|arg| arg == "--settings"));
+    manager.shutdown().await;
+    isolated.complete();
+}
+
+/// #200 review: the wait and the preparation of one launch read the provider settings once. A
+/// Claude that is enabled when the wait is chosen is prepared under that wait, even if the
+/// settings change before preparation would have read them again.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn claude_launch_uses_one_settings_snapshot_when_disabled_after_the_wait_is_chosen() {
+    own_process!(isolated);
+    let zero = std::time::Duration::ZERO;
+    let (backend, manager, configured, _root, elapsed, reads) = open_claude_with_settings_script(
+        std::time::Duration::from_millis(700),
+        vec![(zero, true), (zero, false)],
+    )
+    .await;
+
+    assert_eq!(reads, 1, "the launch must read the provider settings once");
+    assert!(
+        elapsed >= std::time::Duration::from_millis(650),
+        "the valid 700 ms preparation must run to completion: {elapsed:?}"
+    );
+    let spawn = backend.spawns().pop().expect("Claude PTY spawn");
+    assert_ne!(
+        std::path::PathBuf::from(&spawn.executable),
+        configured,
+        "the launch the wait was chosen for is observed"
+    );
+    manager.shutdown().await;
+    isolated.complete();
+}
+
+/// The other order: Claude is disabled when the wait is chosen and enabled before preparation
+/// would read again. The launch follows its snapshot and passes through at once, instead of
+/// preparing under the 500 ms fallback.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn claude_launch_uses_one_settings_snapshot_when_enabled_after_the_wait_is_chosen() {
+    own_process!(isolated);
+    let zero = std::time::Duration::ZERO;
+    let (backend, manager, configured, _root, elapsed, reads) = open_claude_with_settings_script(
+        std::time::Duration::from_millis(700),
+        vec![(zero, false), (zero, true)],
+    )
+    .await;
+
+    assert_eq!(reads, 1);
+    assert!(
+        elapsed < std::time::Duration::from_millis(400),
+        "a launch rejected by its snapshot must not run a preparation: {elapsed:?}"
+    );
+    let spawn = backend.spawns().pop().expect("Claude PTY spawn");
+    assert_eq!(std::path::PathBuf::from(&spawn.executable), configured);
+    manager.shutdown().await;
+    isolated.complete();
+}
+
+/// A settings read that stalls costs the wait lookup's 500 ms once. Preparation of the same
+/// launch does not read again and wait another 500 ms.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn claude_launch_with_a_stalled_settings_read_waits_for_it_once() {
+    own_process!(isolated);
+    let stall = std::time::Duration::from_secs(5);
+    let (backend, manager, configured, _root, elapsed, reads) = open_claude_with_settings_script(
+        std::time::Duration::ZERO,
+        vec![(stall, true), (stall, true)],
+    )
+    .await;
+
+    assert_eq!(
+        reads, 1,
+        "preparation must not read the stalled settings a second time"
+    );
+    assert!(
+        elapsed >= std::time::Duration::from_millis(450)
+            && elapsed < std::time::Duration::from_millis(800),
+        "a stalled read must cost 500 ms once, not twice: {elapsed:?}"
+    );
+    let spawn = backend.spawns().pop().expect("Claude PTY spawn");
+    assert_eq!(std::path::PathBuf::from(&spawn.executable), configured);
+    manager.shutdown().await;
+    isolated.complete();
+}
+
+#[cfg(unix)]
 #[tokio::test]
 async fn claude_unsupported_clone_is_exact_original_pass_through() {
     use std::os::unix::fs::PermissionsExt;
@@ -9483,6 +10208,875 @@ async fn claude_unsupported_clone_is_exact_original_pass_through() {
         1,
         "failed pinning cleanup",
     );
+    manager.shutdown().await;
+}
+
+/// Answers the way a multi-call binary does: as another program when run under `mise`, its real
+/// name, and as Claude Code under any other name.
+#[cfg(unix)]
+#[derive(Debug, Default)]
+struct MultiCallClaudeProbeRunner {
+    executables: Mutex<Vec<std::path::PathBuf>>,
+}
+
+#[cfg(unix)]
+impl ClaudeCapabilityProbeRunner for MultiCallClaudeProbeRunner {
+    fn run(
+        &self,
+        executable: &std::path::Path,
+        args: Vec<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<ClaudeProbeOutput, String>> + Send + '_>> {
+        self.executables
+            .lock()
+            .expect("probed executables lock")
+            .push(executable.to_path_buf());
+        let as_claude = executable.file_name().is_some_and(|name| name != "mise");
+        let fixture = claude_hook_fixture();
+        let stdout = match (as_claude, args.first().map(String::as_str)) {
+            (true, Some("--version")) => fixture["versionOutput"].as_str().expect("version"),
+            (true, _) => fixture["rootHelp"].as_str().expect("root help"),
+            (false, Some("--version")) => "2026.10.19 macos-arm64 (2026-10-19)",
+            (false, _) => "mise: the front-end to your dev env\n",
+        }
+        .to_owned();
+        Box::pin(std::future::ready(Ok(ClaudeProbeOutput {
+            success: true,
+            stdout,
+            stderr: String::new(),
+        })))
+    }
+}
+
+/// Links `bin/claude` to `target_relative` under `root`, with `target_bytes` as the target.
+#[cfg(unix)]
+fn claude_link_to_target(
+    root: &tempfile::TempDir,
+    target_relative: &str,
+    target_bytes: &[u8],
+) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let target = root.path().join(target_relative);
+    std::fs::create_dir_all(target.parent().expect("target directory")).expect("target dir");
+    std::fs::write(&target, target_bytes).expect("target binary");
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700))
+        .expect("target permissions");
+    let bin = root.path().join("bin");
+    std::fs::create_dir_all(&bin).expect("bin dir");
+    let link = bin.join("claude");
+    std::os::unix::fs::symlink(&target, &link).expect("claude link");
+    link
+}
+
+/// What a fixture resolver hands back, and the requests it saw.
+#[cfg(unix)]
+#[derive(Debug, Default)]
+struct RecordingShimResolver {
+    resolution: Mutex<Option<ClaudeShimResolution>>,
+    requests: Mutex<Vec<ShimRequestRecord>>,
+}
+
+/// The invoked shim path, the directory and the launch environment a resolver was asked with.
+#[cfg(unix)]
+type ShimRequestRecord = (
+    std::path::PathBuf,
+    std::path::PathBuf,
+    BTreeMap<String, String>,
+);
+
+#[cfg(unix)]
+impl RecordingShimResolver {
+    fn answering(resolution: Option<ClaudeShimResolution>) -> Arc<Self> {
+        Arc::new(Self {
+            resolution: Mutex::new(resolution),
+            requests: Mutex::new(Vec::new()),
+        })
+    }
+}
+
+#[cfg(unix)]
+impl ClaudeInstallResolver for RecordingShimResolver {
+    fn resolve<'a>(
+        &'a self,
+        request: ClaudeShimRequest<'a>,
+    ) -> Pin<Box<dyn Future<Output = Option<ClaudeShimResolution>> + Send + 'a>> {
+        self.requests.lock().expect("resolver requests").push((
+            request.invoked.to_path_buf(),
+            request.cwd.to_path_buf(),
+            request.launch_env.clone(),
+        ));
+        let resolution = self.resolution.lock().expect("resolver answer").clone();
+        Box::pin(std::future::ready(resolution))
+    }
+}
+
+/// Approves any build: the version range is the probe's own check.
+#[derive(Debug, Default)]
+struct CountingRangeAttestor {
+    calls: AtomicUsize,
+    delay: std::time::Duration,
+    hang_first: AtomicBool,
+}
+
+impl ClaudeAdditiveHookAttestor for CountingRangeAttestor {
+    fn prove(
+        &self,
+        _executable: &std::path::Path,
+        _version: &str,
+    ) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
+        let call = self.calls.fetch_add(1, Ordering::AcqRel);
+        let hang = call == 0 && self.hang_first.load(Ordering::Acquire);
+        let delay = self.delay;
+        Box::pin(async move {
+            if hang {
+                std::future::pending::<()>().await;
+            }
+            tokio::time::sleep(delay).await;
+            true
+        })
+    }
+}
+
+/// Answers `--version` with `version` and `--help` with the proven help, on every call.
+#[derive(Debug)]
+struct VersionedClaudeProbeRunner {
+    version: String,
+    executables: Mutex<Vec<std::path::PathBuf>>,
+}
+
+impl VersionedClaudeProbeRunner {
+    fn new(version: &str) -> Arc<Self> {
+        Arc::new(Self {
+            version: version.to_owned(),
+            executables: Mutex::new(Vec::new()),
+        })
+    }
+}
+
+impl ClaudeCapabilityProbeRunner for VersionedClaudeProbeRunner {
+    fn run(
+        &self,
+        executable: &std::path::Path,
+        args: Vec<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<ClaudeProbeOutput, String>> + Send + '_>> {
+        self.executables
+            .lock()
+            .expect("probed executables")
+            .push(executable.to_path_buf());
+        let fixture = claude_hook_fixture();
+        let stdout = if args.first().map(String::as_str) == Some("--version") {
+            self.version.clone()
+        } else {
+            fixture["rootHelp"].as_str().expect("root help").to_owned()
+        };
+        Box::pin(std::future::ready(Ok(ClaudeProbeOutput {
+            success: true,
+            stdout,
+            stderr: String::new(),
+        })))
+    }
+}
+
+#[cfg(unix)]
+async fn claude_supervisor_with_factory(
+    root: &tempfile::TempDir,
+    configured: &std::path::Path,
+    factory: Arc<ClaudeTerminalObserverFactory>,
+) -> ProviderTerminalActivitySupervisor {
+    let database = Database::open_in_memory().await.expect("database");
+    database
+        .call(|connection| {
+            run_migrations(connection, None)?;
+            Ok(())
+        })
+        .await
+        .expect("migrations");
+    let mut settings = ProviderSettingsState::default();
+    settings.providers.claude_agent.binary_path = configured.to_string_lossy().into_owned();
+    ProviderTerminalActivitySupervisor::new(
+        settings.clone(),
+        ProviderTerminalInventory::from_settings(&settings),
+        ActivityProjection::new(ActivityRepository::new(database)),
+        ProcessAttributionRegistry::new(),
+        root.path().join("runtime"),
+        ProviderTerminalObserverFactories {
+            claude: Some(factory),
+            ..ProviderTerminalObserverFactories::default()
+        },
+    )
+    .expect("Claude supervisor")
+}
+
+#[cfg(unix)]
+fn claude_manager(
+    supervisor: ProviderTerminalActivitySupervisor,
+) -> (TerminalManager, Arc<RecordingBackend>) {
+    let backend = Arc::new(RecordingBackend::new(Arc::new(Mutex::new(Vec::new()))));
+    let manager = TerminalManager::new(
+        backend.clone(),
+        TerminalManagerOptions {
+            launch_preparer: Some(Arc::new(supervisor)),
+            ..TerminalManagerOptions::default()
+        },
+    );
+    (manager, backend)
+}
+
+/// Writes an executable regular file at `relative` under `root`.
+#[cfg(unix)]
+fn claude_executable_file(
+    root: &tempfile::TempDir,
+    relative: &str,
+    bytes: &[u8],
+    mode: u32,
+) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = root.path().join(relative);
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("parent directory");
+    std::fs::write(&path, bytes).expect("executable");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("mode");
+    path
+}
+
+#[cfg(unix)]
+fn shim_overlay() -> BTreeMap<String, String> {
+    BTreeMap::from([
+        (
+            "ANTHROPIC_BASE_URL".to_owned(),
+            "https://proxy.example.invalid".to_owned(),
+        ),
+        (
+            "PATH".to_owned(),
+            "/mise/installs/claude/bin:/usr/bin".to_owned(),
+        ),
+    ])
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn claude_terminal_behind_a_multi_call_shim_pins_the_real_install_with_its_environment() {
+    let root = tempfile::tempdir().expect("fixture root");
+    let configured = claude_link_to_target(&root, "real/mise", b"multi-call mise");
+    let install = claude_executable_file(
+        &root,
+        "installs/claude/2.1.312/claude",
+        b"real claude",
+        0o755,
+    );
+    let runner = VersionedClaudeProbeRunner::new("2.1.312 (Claude Code)\n");
+    let resolver = RecordingShimResolver::answering(Some(ClaudeShimResolution {
+        executable: install.clone(),
+        env: shim_overlay(),
+    }));
+    let factory = Arc::new(
+        ClaudeTerminalObserverFactory::with_pinner(
+            Arc::new(CachedClaudeCapabilityProbe::with_attestor(
+                runner.clone(),
+                Arc::new(CountingRangeAttestor::default()),
+            )),
+            Arc::new(CopyClaudeExecutablePinner),
+        )
+        .with_resolver(resolver.clone()),
+    );
+    let (manager, backend) =
+        claude_manager(claude_supervisor_with_factory(&root, &configured, factory).await);
+    let mut input = claude_pinning_open_input(&root, &configured, "terminal-claude-shim");
+    input
+        .env
+        .insert("LAUNCH_MARKER".to_owned(), "launch-value".to_owned());
+
+    manager.open(input).await.expect("Claude terminal");
+
+    let spawn = backend.spawns().pop().expect("Claude PTY spawn");
+    assert_ne!(spawn.executable, configured.to_string_lossy());
+    assert_eq!(
+        std::fs::read(&spawn.executable).expect("pinned executable"),
+        b"real claude",
+        "the terminal pins the install the shim hands off to, not mise"
+    );
+    assert!(spawn.args.iter().any(|argument| argument == "--settings"));
+    for (key, value) in shim_overlay() {
+        assert_eq!(
+            spawn.env.get(&key),
+            Some(&value),
+            "the shim's environment applies: {key}"
+        );
+    }
+    assert_eq!(
+        spawn.env.get("LAUNCH_MARKER").map(String::as_str),
+        Some("launch-value")
+    );
+    let requests = resolver.requests.lock().expect("resolver requests").clone();
+    assert_eq!(requests.len(), 1);
+    let (invoked, cwd, launch_env) = &requests[0];
+    assert_eq!(
+        invoked, &configured,
+        "the resolver sees the invoked shim path, before the supervisor resolved its link"
+    );
+    assert_eq!(cwd, &root.path().to_path_buf());
+    assert_eq!(
+        launch_env.get("LAUNCH_MARKER").map(String::as_str),
+        Some("launch-value")
+    );
+    let probed = runner.executables.lock().expect("probed").clone();
+    let real = std::fs::canonicalize(&install).expect("canonical install");
+    assert!(
+        !probed.is_empty() && probed.iter().all(|executable| executable == &real),
+        "only the real install is probed: {probed:?}"
+    );
+    manager.shutdown().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn claude_terminal_behind_a_shim_runs_as_configured_when_resolution_is_refused() {
+    let root = tempfile::tempdir().expect("fixture root");
+    let configured = claude_link_to_target(&root, "real/mise", b"multi-call mise");
+    let install = claude_executable_file(&root, "installs/claude/claude", b"real", 0o755);
+    let group_writable = claude_executable_file(&root, "group/claude", b"real", 0o775);
+    let not_executable = claude_executable_file(&root, "plain/claude", b"real", 0o644);
+    let with = |key: &str, value: &str| {
+        let mut env = shim_overlay();
+        env.insert(key.to_owned(), value.to_owned());
+        env
+    };
+    let cases: Vec<(&str, Option<ClaudeShimResolution>)> = vec![
+        ("no answer", None),
+        (
+            "relative path",
+            Some(ClaudeShimResolution {
+                executable: "claude".into(),
+                env: shim_overlay(),
+            }),
+        ),
+        (
+            "group-writable install",
+            Some(ClaudeShimResolution {
+                executable: group_writable,
+                env: shim_overlay(),
+            }),
+        ),
+        (
+            "non-executable install",
+            Some(ClaudeShimResolution {
+                executable: not_executable,
+                env: shim_overlay(),
+            }),
+        ),
+        (
+            "the manager itself",
+            Some(ClaudeShimResolution {
+                executable: std::fs::canonicalize(&configured).expect("mise"),
+                env: shim_overlay(),
+            }),
+        ),
+        (
+            "LD_PRELOAD",
+            Some(ClaudeShimResolution {
+                executable: install.clone(),
+                env: with("LD_PRELOAD", "/tmp/inject.so"),
+            }),
+        ),
+        (
+            "LD_LIBRARY_PATH",
+            Some(ClaudeShimResolution {
+                executable: install.clone(),
+                env: with("LD_LIBRARY_PATH", "/tmp"),
+            }),
+        ),
+        (
+            "LD_AUDIT",
+            Some(ClaudeShimResolution {
+                executable: install.clone(),
+                env: with("LD_AUDIT", "/tmp/audit.so"),
+            }),
+        ),
+        (
+            "DYLD_INSERT_LIBRARIES",
+            Some(ClaudeShimResolution {
+                executable: install.clone(),
+                env: with("DYLD_INSERT_LIBRARIES", "/tmp/inject.dylib"),
+            }),
+        ),
+    ];
+    for (case, resolution) in cases {
+        let factory = Arc::new(
+            ClaudeTerminalObserverFactory::with_pinner(
+                Arc::new(CachedClaudeCapabilityProbe::with_attestor(
+                    VersionedClaudeProbeRunner::new("2.1.312 (Claude Code)\n"),
+                    Arc::new(CountingRangeAttestor::default()),
+                )),
+                Arc::new(CopyClaudeExecutablePinner),
+            )
+            .with_resolver(RecordingShimResolver::answering(resolution)),
+        );
+        let (manager, backend) =
+            claude_manager(claude_supervisor_with_factory(&root, &configured, factory).await);
+        let input = claude_pinning_open_input(&root, &configured, "terminal-claude-refused");
+        let original_args = input.command.as_ref().expect("command").args.clone();
+
+        manager.open(input).await.expect("pass-through terminal");
+
+        let spawn = backend.spawns().pop().expect("Claude PTY spawn");
+        assert_eq!(spawn.executable, configured.to_string_lossy(), "{case}");
+        assert_eq!(spawn.args, original_args, "{case}");
+        for key in ["ANTHROPIC_BASE_URL", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES"] {
+            assert!(
+                !spawn.env.contains_key(key),
+                "{case}: no shim environment applies to the unobserved shim: {key}"
+            );
+        }
+        manager.shutdown().await;
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn claude_terminal_behind_a_shim_runs_unhooked_when_its_install_is_unapproved() {
+    for version in [
+        "2026.10.19 macos-arm64 (2026-10-19)\n",
+        "2.1.219 (Claude Code)\n",
+        "2.1.313 (Claude Code)\n",
+    ] {
+        let root = tempfile::tempdir().expect("fixture root");
+        let configured = claude_link_to_target(&root, "real/mise", b"multi-call mise");
+        let install = claude_executable_file(&root, "installs/claude/claude", b"real", 0o755);
+        let factory = Arc::new(
+            ClaudeTerminalObserverFactory::with_pinner(
+                Arc::new(CachedClaudeCapabilityProbe::with_attestor(
+                    VersionedClaudeProbeRunner::new(version),
+                    Arc::new(CountingRangeAttestor::default()),
+                )),
+                Arc::new(CopyClaudeExecutablePinner),
+            )
+            .with_resolver(RecordingShimResolver::answering(Some(
+                ClaudeShimResolution {
+                    executable: install,
+                    env: shim_overlay(),
+                },
+            ))),
+        );
+        let (manager, backend) =
+            claude_manager(claude_supervisor_with_factory(&root, &configured, factory).await);
+
+        manager
+            .open(claude_pinning_open_input(
+                &root,
+                &configured,
+                "terminal-claude-unapproved",
+            ))
+            .await
+            .expect("pass-through terminal");
+
+        let spawn = backend.spawns().pop().expect("Claude PTY spawn");
+        assert_eq!(spawn.executable, configured.to_string_lossy(), "{version}");
+        assert!(!spawn.args.iter().any(|argument| argument == "--settings"));
+        assert!(!spawn.env.contains_key("ANTHROPIC_BASE_URL"));
+        assert_runtime_has_only_empty_retired_generations(
+            &root.path().join("runtime"),
+            1,
+            "unapproved shim install cleanup",
+        );
+        manager.shutdown().await;
+    }
+}
+
+/// A stand-in for mise's multi-call binary: answers `which` and `env --json` the way mise does,
+/// reporting the directory and one launch variable it ran with.
+#[cfg(unix)]
+fn fake_mise(root: &tempfile::TempDir, install: &std::path::Path) -> std::path::PathBuf {
+    let script = format!(
+        "#!/bin/sh\n\
+         case \"$1\" in\n\
+         which) [ \"$2\" = claude ] && printf '%s\\n' '{install}' && exit 0; exit 1 ;;\n\
+         env) printf '{{\"SEEN_CWD\":\"%s\",\"SEEN_MARKER\":\"%s\",\"ANTHROPIC_BASE_URL\":\"https://proxy.example.invalid\"}}' \"$PWD\" \"$LAUNCH_MARKER\"; exit 0 ;;\n\
+         esac\n\
+         exit 2\n",
+        install = install.display()
+    );
+    claude_executable_file(root, "real/mise", script.as_bytes(), 0o755)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn production_mise_resolver_asks_the_shim_manager_in_the_launch_directory_and_environment() {
+    let root = tempfile::tempdir().expect("fixture root");
+    let install = claude_executable_file(
+        &root,
+        "installs/claude/2.1.312/claude",
+        b"real claude",
+        0o755,
+    );
+    let mise = fake_mise(&root, &install);
+    let shims = root.path().join("shims");
+    std::fs::create_dir_all(&shims).expect("shims");
+    let configured = shims.join("claude");
+    std::os::unix::fs::symlink(&mise, &configured).expect("shim link");
+    let project = root.path().join("project");
+    std::fs::create_dir_all(&project).expect("project");
+    let factory = Arc::new(ClaudeTerminalObserverFactory::with_pinner(
+        Arc::new(CachedClaudeCapabilityProbe::with_attestor(
+            VersionedClaudeProbeRunner::new("2.1.312 (Claude Code)\n"),
+            Arc::new(CountingRangeAttestor::default()),
+        )),
+        Arc::new(CopyClaudeExecutablePinner),
+    ));
+    let (manager, backend) =
+        claude_manager(claude_supervisor_with_factory(&root, &configured, factory).await);
+    let mut input = claude_pinning_open_input(&root, &configured, "terminal-claude-mise");
+    input.cwd = project.clone();
+    input
+        .env
+        .insert("LAUNCH_MARKER".to_owned(), "launch-value".to_owned());
+
+    manager.open(input).await.expect("Claude terminal");
+
+    let spawn = backend.spawns().pop().expect("Claude PTY spawn");
+    assert_eq!(
+        std::fs::read(&spawn.executable).expect("pinned executable"),
+        b"real claude"
+    );
+    assert!(spawn.args.iter().any(|argument| argument == "--settings"));
+    assert_eq!(
+        spawn.env.get("SEEN_CWD").map(std::path::PathBuf::from),
+        Some(std::fs::canonicalize(&project).expect("canonical project")),
+        "mise ran in the launch directory"
+    );
+    assert_eq!(
+        spawn.env.get("SEEN_MARKER").map(String::as_str),
+        Some("launch-value"),
+        "mise ran with the launch environment"
+    );
+    assert_eq!(
+        spawn.env.get("ANTHROPIC_BASE_URL").map(String::as_str),
+        Some("https://proxy.example.invalid")
+    );
+    manager.shutdown().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn claude_direct_install_of_a_proven_newer_build_is_hooked() {
+    let root = tempfile::tempdir().expect("fixture root");
+    let configured = claude_link_to_target(&root, "versions/2.1.312", b"claude 2.1.312");
+    let factory = Arc::new(ClaudeTerminalObserverFactory::with_pinner(
+        Arc::new(CachedClaudeCapabilityProbe::with_attestor(
+            VersionedClaudeProbeRunner::new("2.1.312 (Claude Code)\n"),
+            Arc::new(CountingRangeAttestor::default()),
+        )),
+        Arc::new(CopyClaudeExecutablePinner),
+    ));
+    let (manager, backend) =
+        claude_manager(claude_supervisor_with_factory(&root, &configured, factory).await);
+
+    manager
+        .open(claude_pinning_open_input(
+            &root,
+            &configured,
+            "terminal-claude-312",
+        ))
+        .await
+        .expect("Claude terminal");
+
+    let spawn = backend.spawns().pop().expect("Claude PTY spawn");
+    assert_eq!(
+        std::fs::read(&spawn.executable).expect("pinned executable"),
+        b"claude 2.1.312"
+    );
+    assert!(spawn.args.iter().any(|argument| argument == "--settings"));
+    manager.shutdown().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn concurrent_opens_of_a_new_build_share_one_proof_and_a_cancelled_proof_publishes_nothing() {
+    let root = tempfile::tempdir().expect("fixture root");
+    let configured = claude_link_to_target(&root, "versions/2.1.312", b"claude 2.1.312");
+    let attestor = Arc::new(CountingRangeAttestor {
+        calls: AtomicUsize::new(0),
+        delay: std::time::Duration::from_millis(100),
+        hang_first: AtomicBool::new(false),
+    });
+    let factory = Arc::new(ClaudeTerminalObserverFactory::with_pinner(
+        Arc::new(CachedClaudeCapabilityProbe::with_attestor(
+            VersionedClaudeProbeRunner::new("2.1.312 (Claude Code)\n"),
+            attestor.clone(),
+        )),
+        Arc::new(CopyClaudeExecutablePinner),
+    ));
+    let (manager, backend) =
+        claude_manager(claude_supervisor_with_factory(&root, &configured, factory).await);
+
+    let (first, second) = tokio::join!(
+        manager.open(claude_pinning_open_input(&root, &configured, "terminal-a")),
+        manager.open(claude_pinning_open_input(&root, &configured, "terminal-b")),
+    );
+    first.expect("first terminal");
+    second.expect("second terminal");
+    let spawns = backend.spawns();
+    assert_eq!(spawns.len(), 2);
+    assert!(
+        spawns
+            .iter()
+            .all(|spawn| spawn.args.iter().any(|arg| arg == "--settings"))
+    );
+    assert_eq!(
+        attestor.calls.load(Ordering::Acquire),
+        1,
+        "both opens share one proof of the new build"
+    );
+    manager.shutdown().await;
+
+    // A proof cut off by the preparation budget publishes nothing; the next open proves again.
+    let root = tempfile::tempdir().expect("fixture root");
+    let configured = claude_link_to_target(&root, "versions/2.1.312", b"claude 2.1.312");
+    let attestor = Arc::new(CountingRangeAttestor {
+        calls: AtomicUsize::new(0),
+        delay: std::time::Duration::ZERO,
+        hang_first: AtomicBool::new(true),
+    });
+    let factory = Arc::new(ClaudeTerminalObserverFactory::with_pinner(
+        Arc::new(CachedClaudeCapabilityProbe::with_attestor(
+            VersionedClaudeProbeRunner::new("2.1.312 (Claude Code)\n"),
+            attestor.clone(),
+        )),
+        Arc::new(CopyClaudeExecutablePinner),
+    ));
+    let (manager, backend) =
+        claude_manager(claude_supervisor_with_factory(&root, &configured, factory).await);
+
+    manager
+        .open(claude_pinning_open_input(
+            &root,
+            &configured,
+            "terminal-cut",
+        ))
+        .await
+        .expect("pass-through terminal");
+    assert_eq!(
+        backend.spawns().pop().expect("spawn").executable,
+        configured.to_string_lossy(),
+        "a proof that runs out of budget leaves the terminal unobserved"
+    );
+    manager
+        .open(claude_pinning_open_input(
+            &root,
+            &configured,
+            "terminal-next",
+        ))
+        .await
+        .expect("Claude terminal");
+    assert!(
+        backend
+            .spawns()
+            .pop()
+            .expect("spawn")
+            .args
+            .iter()
+            .any(|arg| arg == "--settings"),
+        "the next open proves the build again and is hooked"
+    );
+    assert_eq!(attestor.calls.load(Ordering::Acquire), 2);
+    manager.shutdown().await;
+}
+
+/// The complete caller against a real mise shim: the production resolver, probe, pin and
+/// attestation, through `TerminalManager::open`. It needs mise, its shim and a Claude install
+/// under the temp directory (the hermetic guard's root), and a project whose `mise.toml` sets
+/// the `[env]` variable named by `BIBCODE_CLAUDE_MISE_ENV_KEY`:
+///
+/// `BIBCODE_CLAUDE_MISE_SHIM=<data>/shims/claude BIBCODE_CLAUDE_MISE_PROJECT=<project>
+/// BIBCODE_CLAUDE_MISE_ENV_KEY=ANTHROPIC_BASE_URL cargo test --release -p bibcode-server --test
+/// provider_terminal_supervisor live_claude_terminal -- --ignored --nocapture`
+#[cfg(unix)]
+#[ignore = "needs a real mise shim and Claude install; see docs/testing/linux-desktop.md"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_claude_terminal_through_a_real_mise_shim_is_hooked_within_its_budget() {
+    let variable = |name: &str| {
+        std::env::var_os(name)
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| panic!("set {name}"))
+    };
+    let shim = variable("BIBCODE_CLAUDE_MISE_SHIM");
+    let project = variable("BIBCODE_CLAUDE_MISE_PROJECT");
+    let env_key =
+        std::env::var("BIBCODE_CLAUDE_MISE_ENV_KEY").expect("set BIBCODE_CLAUDE_MISE_ENV_KEY");
+    // A pass-through logs its fixed reason: expected outcomes (`shim_unresolved`,
+    // `build_unattested`) at debug level, failures (`budget_exceeded`, `pin_failed`, ...) as a
+    // warning with their count.
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_test_writer()
+        .try_init();
+    let root = tempfile::tempdir().expect("fixture root");
+    let factory = Arc::new(ClaudeTerminalObserverFactory::system());
+    let (manager, backend) =
+        claude_manager(claude_supervisor_with_factory(&root, &shim, factory).await);
+
+    for (phase, terminal) in [
+        ("cold", "terminal-live-cold"),
+        ("proven-build", "terminal-live-warm"),
+    ] {
+        let mut input = claude_pinning_open_input(&root, &shim, terminal);
+        input.cwd = project.clone();
+        let started = std::time::Instant::now();
+        manager.open(input).await.expect("Claude terminal");
+        let elapsed = started.elapsed();
+        eprintln!("live mise shim {phase} open: {elapsed:?}");
+        let spawn = backend.spawns().pop().expect("Claude PTY spawn");
+        assert_ne!(
+            spawn.executable,
+            shim.to_string_lossy(),
+            "{phase}: the terminal runs a private pin of the real install"
+        );
+        assert!(
+            spawn.args.iter().any(|argument| argument == "--settings"),
+            "{phase}: the terminal is hooked"
+        );
+        assert!(
+            spawn.env.contains_key(&env_key),
+            "{phase}: mise's [env] reaches the terminal: {env_key}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(2_400),
+            "{phase}: terminal.open waits at most 2.4 s for a Claude preparation"
+        );
+        manager
+            .close("thread-claude-pin", Some(terminal))
+            .await
+            .expect("close terminal");
+    }
+    manager.shutdown().await;
+}
+
+/// Copies one chunk, then waits for the preparation to give up before it returns.
+#[cfg(unix)]
+#[derive(Debug, Default)]
+struct StallingClaudeExecutablePinner {
+    observed_cancellation: AtomicBool,
+    returned: AtomicBool,
+}
+
+#[cfg(unix)]
+impl ClaudeExecutablePinner for StallingClaudeExecutablePinner {
+    fn pin(&self, _source: &std::path::Path, _destination: &std::path::Path) -> io::Result<()> {
+        unreachable!("the factory pins cancellably")
+    }
+
+    fn pin_cancellable(
+        &self,
+        source: &std::path::Path,
+        destination: &std::path::Path,
+        cancelled: &AtomicBool,
+    ) -> io::Result<()> {
+        std::fs::write(destination, &std::fs::read(source)?[..1])?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !cancelled.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        self.observed_cancellation
+            .store(cancelled.load(Ordering::Acquire), Ordering::Release);
+        let _ = std::fs::remove_file(destination);
+        self.returned.store(true, Ordering::Release);
+        Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"))
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_pin_still_copying_when_the_budget_runs_out_stops_and_its_generation_is_removed() {
+    let root = tempfile::tempdir().expect("fixture root");
+    let configured = claude_link_to_target(&root, "versions/2.1.312", b"claude 2.1.312");
+    let pinner = Arc::new(StallingClaudeExecutablePinner::default());
+    let factory = Arc::new(ClaudeTerminalObserverFactory::with_pinner(
+        Arc::new(CachedClaudeCapabilityProbe::with_attestor(
+            VersionedClaudeProbeRunner::new("2.1.312 (Claude Code)\n"),
+            Arc::new(CountingRangeAttestor::default()),
+        )),
+        pinner.clone(),
+    ));
+    let (manager, backend) =
+        claude_manager(claude_supervisor_with_factory(&root, &configured, factory).await);
+
+    manager
+        .open(claude_pinning_open_input(
+            &root,
+            &configured,
+            "terminal-slow-disk",
+        ))
+        .await
+        .expect("pass-through terminal");
+
+    assert_eq!(
+        backend.spawns().pop().expect("spawn").executable,
+        configured.to_string_lossy(),
+        "a slow disk leaves the terminal unobserved"
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !pinner.returned.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        pinner.observed_cancellation.load(Ordering::Acquire),
+        "the copy is told to stop once the preparation gives up"
+    );
+    let runtime = root.path().join("runtime");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let settled = std::fs::read_dir(&runtime)
+            .expect("runtime directory")
+            .all(|entry| {
+                std::fs::read_dir(entry.expect("runtime entry").path())
+                    .is_ok_and(|mut contents| contents.next().is_none())
+            });
+        if settled || std::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_runtime_has_only_empty_retired_generations(&runtime, 1, "cancelled pin cleanup");
+    manager.shutdown().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn claude_terminal_behind_a_renamed_link_to_a_claude_build_is_still_observed() {
+    let root = tempfile::tempdir().expect("fixture root");
+    let configured = claude_link_to_target(&root, "versions/2.1.220", b"approved");
+    let supervisor = claude_fixture_supervisor_with_runner(
+        &root,
+        &configured,
+        Arc::new(CopyClaudeExecutablePinner),
+        Arc::new(MultiCallClaudeProbeRunner::default()),
+    )
+    .await;
+    let backend = Arc::new(RecordingBackend::new(Arc::new(Mutex::new(Vec::new()))));
+    let manager = TerminalManager::new(
+        backend.clone(),
+        TerminalManagerOptions {
+            launch_preparer: Some(Arc::new(supervisor)),
+            ..TerminalManagerOptions::default()
+        },
+    );
+
+    manager
+        .open(claude_pinning_open_input(
+            &root,
+            &configured,
+            "terminal-claude-versions",
+        ))
+        .await
+        .expect("Claude terminal");
+
+    let spawn = backend.spawns().pop().expect("Claude PTY spawn");
+    assert_ne!(spawn.executable, configured.to_string_lossy());
+    assert_eq!(
+        std::fs::read(&spawn.executable).expect("pinned executable"),
+        b"approved",
+        "the terminal pins the link's target, not the link"
+    );
+    assert!(spawn.args.iter().any(|argument| argument == "--settings"));
     manager.shutdown().await;
 }
 
@@ -10007,6 +11601,16 @@ fn claude_hook_launch(backend: &RecordingBackend) -> (String, String, String, st
             "PreToolUse",
             "SubagentStart",
             "SubagentStop",
+            // The main agent's state for the left panel (#187).
+            "Elicitation",
+            "ElicitationResult",
+            "Notification",
+            "PermissionRequest",
+            "SessionEnd",
+            "SessionStart",
+            "Stop",
+            "StopFailure",
+            "UserPromptSubmit",
         ]
         .into_iter()
         .map(str::to_owned)
@@ -10395,7 +11999,7 @@ async fn claude_hook_sink_rejects_wrong_credentials_session_content_type_and_siz
             &token,
             &correlation,
             serde_json::json!({
-                "hook_event_name": "SessionStart",
+                "hook_event_name": "PreCompact",
                 "session_id": "claude-root-session"
             }),
         )
@@ -10403,6 +12007,22 @@ async fn claude_hook_sink_rejects_wrong_credentials_session_content_type_and_siz
         .status(),
         reqwest::StatusCode::BAD_REQUEST,
         "an unconfigured hook event must not establish root correlation"
+    );
+    // A status hook only reports the main agent's state (#187): it never reaches activity.
+    assert_eq!(
+        post_claude_hook(
+            &endpoint,
+            &token,
+            &correlation,
+            serde_json::json!({
+                "hook_event_name": "SessionStart",
+                "session_id": "claude-root-session"
+            }),
+        )
+        .await
+        .status(),
+        reqwest::StatusCode::NO_CONTENT,
+        "a status hook is acknowledged without establishing root correlation"
     );
     assert!(
         projection.snapshot(&scope).await.is_err(),
@@ -12420,6 +14040,7 @@ async fn opencode_publication_failure_keeps_attach_usable_until_terminal_closes(
 struct OpenCodeToggleFixture {
     _root: tempfile::TempDir,
     manager: TerminalManager,
+    database: Database,
     projection: ActivityProjection,
     remote_state: Arc<OpenCodeFixtureRemoteState>,
     helper: Arc<OpenCodeFixtureHelperLauncher>,
@@ -12436,7 +14057,40 @@ impl OpenCodeToggleFixture {
         stream_scripts: Vec<OpenCodeFixtureStreamScript>,
         reattach_timeout: std::time::Duration,
     ) -> Self {
-        Self::open_with_reattach_timeout_and_probe(stream_scripts, reattach_timeout, None).await
+        Self::open_with_reattach_timeout_and_probe(
+            stream_scripts,
+            reattach_timeout,
+            None,
+            true,
+            false,
+        )
+        .await
+    }
+
+    /// Opens the terminal with activity on while every activity scope write fails.
+    async fn open_refusing_activity_scopes(
+        stream_scripts: Vec<OpenCodeFixtureStreamScript>,
+    ) -> Self {
+        Self::open_with_reattach_timeout_and_probe(
+            stream_scripts,
+            std::time::Duration::from_secs(3),
+            None,
+            true,
+            true,
+        )
+        .await
+    }
+
+    /// Opens the terminal while AI Terminal activity is off: its observer reports status only.
+    async fn open_with_activity_off(stream_scripts: Vec<OpenCodeFixtureStreamScript>) -> Self {
+        Self::open_with_reattach_timeout_and_probe(
+            stream_scripts,
+            std::time::Duration::from_secs(3),
+            None,
+            false,
+            false,
+        )
+        .await
     }
 
     async fn open_with_activity_transition_probe(
@@ -12447,6 +14101,8 @@ impl OpenCodeToggleFixture {
             stream_scripts,
             std::time::Duration::from_secs(3),
             Some(activity_transition.clone()),
+            true,
+            false,
         )
         .await;
         (fixture, activity_transition)
@@ -12456,6 +14112,8 @@ impl OpenCodeToggleFixture {
         stream_scripts: Vec<OpenCodeFixtureStreamScript>,
         reattach_timeout: std::time::Duration,
         activity_transition: Option<Arc<OpenCodeActivityTransitionProbe>>,
+        activity_enabled: bool,
+        refuse_scopes: bool,
     ) -> Self {
         let fixture = opencode_attach_fixture();
         let root = tempfile::tempdir().expect("OpenCode toggle root");
@@ -12516,7 +14174,16 @@ impl OpenCodeToggleFixture {
             .expect("migrations");
         let mut settings = ProviderSettingsState::default();
         settings.providers.opencode.binary_path = configured.to_string_lossy().into_owned();
-        let projection = ActivityProjection::new(ActivityRepository::new(database));
+        let projection = ActivityProjection::new(ActivityRepository::new(database.clone()));
+        if refuse_scopes {
+            refuse_activity_scopes(&database).await;
+        }
+        if !activity_enabled {
+            projection
+                .agent_activity_controller_for_integration_test()
+                .disable()
+                .await;
+        }
         let supervisor = ProviderTerminalActivitySupervisor::new(
             settings.clone(),
             ProviderTerminalInventory::from_settings(&settings),
@@ -12584,6 +14251,7 @@ impl OpenCodeToggleFixture {
         Self {
             _root: root,
             manager,
+            database,
             projection,
             remote_state,
             helper,
@@ -12700,6 +14368,137 @@ async fn wait_for_opencode_discard_count(state: &OpenCodeFixtureRemoteState, exp
     })
     .await
     .expect("OpenCode raw frame discard");
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agent_activity_toggle_opencode_status_only_launch_publishes_its_scope_once_enabled() {
+    // Mutation caught: an observer launched with activity off never creating its scope, so
+    // enabling activity later shows nothing for that terminal (#187).
+    own_process!(isolated);
+    let fixture = OpenCodeToggleFixture::open_with_activity_off(vec![
+        OpenCodeFixtureStreamScript::new([Ok(opencode_fixture_connected_frame())]),
+        OpenCodeFixtureStreamScript::new([Ok(opencode_fixture_connected_frame())]),
+    ])
+    .await;
+    let scope = ActivityScopeRef::Terminal {
+        thread_id: "thread-opencode-toggle".to_owned(),
+        terminal_id: "terminal-opencode-toggle".to_owned(),
+    };
+    assert!(
+        fixture.projection.snapshot(&scope).await.is_err(),
+        "a status-only launch publishes no activity scope"
+    );
+    // The status observer reads the root's state as it attaches: OpenCode lists no busy
+    // session, so the agent is done (#187).
+    wait_for_terminal_agent_status(
+        &fixture.manager,
+        "terminal-opencode-toggle",
+        TerminalAgentStatusState::Done,
+    )
+    .await;
+
+    fixture
+        .projection
+        .agent_activity_controller_for_integration_test()
+        .enable();
+    let enabled = fixture.manager.set_agent_activity_enabled(true).await;
+    assert_eq!((enabled.resumed, enabled.failed), (1, 0));
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while fixture.projection.snapshot(&scope).await.is_err() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("enabling activity publishes the OpenCode terminal scope");
+    push_raw_dormant_frame(
+        &fixture.remote_state,
+        &opencode_fixture_event_frame(serde_json::json!({
+            "type": "permission.asked",
+            "properties": {"sessionID": "root-tui-session", "id": "per_live"},
+        })),
+    );
+    wait_for_terminal_agent_status(
+        &fixture.manager,
+        "terminal-opencode-toggle",
+        TerminalAgentStatusState::Blocked,
+    )
+    .await;
+    fixture.finish().await;
+    isolated.complete();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agent_activity_toggle_opencode_enable_retries_a_scope_it_could_not_write() {
+    // Mutation caught: an OpenCode observer reading live after a scope write failed on enable,
+    // so it reports live observation with no scope until another toggle (#187).
+    own_process!(isolated);
+    let fixture = OpenCodeToggleFixture::open_with_activity_off(vec![
+        OpenCodeFixtureStreamScript::new([Ok(opencode_fixture_connected_frame())]),
+        OpenCodeFixtureStreamScript::new([Ok(opencode_fixture_connected_frame())]),
+        OpenCodeFixtureStreamScript::new([Ok(opencode_fixture_connected_frame())]),
+        OpenCodeFixtureStreamScript::new([Ok(opencode_fixture_connected_frame())]),
+    ])
+    .await;
+    let scope = ActivityScopeRef::Terminal {
+        thread_id: "thread-opencode-toggle".to_owned(),
+        terminal_id: "terminal-opencode-toggle".to_owned(),
+    };
+    refuse_activity_scopes(&fixture.database).await;
+    fixture
+        .projection
+        .agent_activity_controller_for_integration_test()
+        .enable();
+    let enabled = fixture.manager.set_agent_activity_enabled(true).await;
+    assert_eq!(
+        enabled.resumed, 0,
+        "an observer whose scope could not be written does not read live"
+    );
+    assert!(fixture.projection.snapshot(&scope).await.is_err());
+
+    allow_activity_scopes(&fixture.database).await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while fixture.projection.snapshot(&scope).await.is_err() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the retry writes the OpenCode terminal scope");
+    fixture.finish().await;
+    isolated.complete();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agent_activity_opencode_launch_retries_a_scope_it_could_not_write() {
+    // Mutation caught: an OpenCode observer whose first scope write fails detaching for good,
+    // so the terminal never shows activity until it restarts (#187).
+    own_process!(isolated);
+    let fixture = OpenCodeToggleFixture::open_refusing_activity_scopes(vec![
+        OpenCodeFixtureStreamScript::new([Ok(opencode_fixture_connected_frame())]),
+        OpenCodeFixtureStreamScript::new([Ok(opencode_fixture_connected_frame())]),
+        OpenCodeFixtureStreamScript::new([Ok(opencode_fixture_connected_frame())]),
+        OpenCodeFixtureStreamScript::new([Ok(opencode_fixture_connected_frame())]),
+    ])
+    .await;
+    let scope = ActivityScopeRef::Terminal {
+        thread_id: "thread-opencode-toggle".to_owned(),
+        terminal_id: "terminal-opencode-toggle".to_owned(),
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert!(fixture.projection.snapshot(&scope).await.is_err());
+
+    allow_activity_scopes(&fixture.database).await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while fixture.projection.snapshot(&scope).await.is_err() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the retry writes the OpenCode terminal scope");
+    fixture.finish().await;
+    isolated.complete();
 }
 
 #[cfg(unix)]
@@ -14963,4 +16762,436 @@ async fn opencode_refused_observer_worker_keeps_the_attach_session_and_its_root(
     );
     manager.shutdown().await;
     isolated.complete();
+}
+
+/// A factory whose observer reports the agent waiting for an answer as soon as it spawns.
+#[derive(Debug, Default)]
+struct StatusReportingFactory {
+    activity_enabled: AtomicUsize,
+}
+
+impl ProviderTerminalObserverFactory for StatusReportingFactory {
+    fn prepare(
+        &self,
+        input: ProviderTerminalObserverFactoryInput,
+    ) -> Pin<Box<dyn Future<Output = Option<PreparedTerminalLaunch>> + Send + '_>> {
+        Box::pin(async move {
+            if input.activity_enabled {
+                self.activity_enabled.fetch_add(1, Ordering::AcqRel);
+            }
+            Some(PreparedTerminalLaunch {
+                executable: input.launch.executable,
+                args: input.launch.args,
+                env_overlay: BTreeMap::new(),
+                private_env: BTreeMap::new(),
+                observer: Box::new(StatusReportingObserver),
+            })
+        })
+    }
+}
+
+#[derive(Debug)]
+struct StatusReportingObserver;
+
+impl PreparedTerminalObserver for StatusReportingObserver {
+    fn on_spawned(
+        &self,
+        _pid: u32,
+        generation: TerminalObserverGenerationLease,
+        _workers: TerminalObserverWorkerContext,
+    ) {
+        generation.publish_agent_status(TerminalAgentState::Waiting, false);
+    }
+
+    fn diagnostic_label(&self) -> &str {
+        "status-reporting-observer"
+    }
+}
+
+/// Waits until the terminal's current summary reports `expected`.
+async fn wait_for_terminal_agent_status(
+    manager: &TerminalManager,
+    terminal_id: &str,
+    expected: TerminalAgentStatusState,
+) {
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while agent_status_of(&manager.subscribe_metadata().await.initial, terminal_id)
+            != Some(expected)
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{terminal_id} never reported {expected:?}"));
+}
+
+/// Waits for the terminal's metadata to report `expected`, returning whether it failed.
+async fn next_agent_status(
+    metadata: &mut bibcode_server::terminal::TerminalMetadataAttachment,
+    terminal_id: &str,
+    expected: TerminalAgentStatusState,
+) -> bool {
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            if let Some(TerminalMetadataEvent::Upsert { terminal }) = metadata.recv().await
+                && terminal.terminal_id == terminal_id
+                && let Some(status) = terminal.agent_status
+                && status.state == expected
+            {
+                return status.failed;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{terminal_id} never reported {expected:?}"))
+}
+
+fn agent_status_of(
+    summaries: &[bibcode_server::terminal::TerminalSummary],
+    terminal_id: &str,
+) -> Option<TerminalAgentStatusState> {
+    summaries
+        .iter()
+        .find(|summary| summary.terminal_id == terminal_id)
+        .and_then(|summary| summary.agent_status.as_ref())
+        .map(|status| status.state)
+}
+
+#[tokio::test]
+async fn ai_terminal_status_reaches_metadata_with_activity_off_and_settles_on_exit() {
+    let fixture = tempfile::tempdir().expect("fixture root");
+    let configured = fixture.path().join("configured-codex");
+    std::fs::write(&configured, b"configured").expect("configured binary");
+    let mut settings = ProviderSettingsState::default();
+    settings.providers.codex.binary_path = configured.to_string_lossy().into_owned();
+    let authority = Arc::new(CountingInventoryAuthority {
+        calls: AtomicUsize::new(0),
+        inventory: ProviderTerminalInventory::from_settings(&settings),
+    });
+    let factory = Arc::new(StatusReportingFactory::default());
+    let database = Database::open_in_memory().await.expect("database");
+    database
+        .call(|connection| {
+            run_migrations(connection, None)?;
+            Ok(())
+        })
+        .await
+        .expect("migrations");
+    // AI Terminal activity is off, as it is by default.
+    let controller = AgentActivityController::new(false);
+    let projection =
+        ActivityProjection::with_controller(ActivityRepository::new(database), controller.clone());
+    let supervisor = ProviderTerminalActivitySupervisor::new_with_authority(
+        authority,
+        controller,
+        projection,
+        ProcessAttributionRegistry::new(),
+        fixture.path().join("runtime"),
+        ProviderTerminalObserverFactories {
+            codex: Some(factory.clone()),
+            ..ProviderTerminalObserverFactories::default()
+        },
+    )
+    .expect("supervisor");
+    let backend = Arc::new(RecordingBackend::new(Arc::new(Mutex::new(Vec::new()))));
+    let manager = TerminalManager::new(
+        backend.clone(),
+        TerminalManagerOptions {
+            launch_preparer: Some(Arc::new(supervisor)),
+            ..TerminalManagerOptions::default()
+        },
+    );
+    let mut metadata = manager.subscribe_metadata().await;
+    let launch = |terminal_id: &str, driver_kind: &str| {
+        let mut input = TerminalOpenInput::new(
+            "thread-status",
+            terminal_id,
+            fixture.path().to_path_buf(),
+            80,
+            24,
+        );
+        input.command = Some(TerminalLaunchCommand {
+            executable: configured.to_string_lossy().into_owned(),
+            args: Vec::new(),
+            label: Some("Agent".to_owned()),
+            activity: Some(ProviderTerminalActivityLaunch {
+                driver_kind: driver_kind.to_owned(),
+                provider_instance_id: driver_kind.to_owned(),
+            }),
+            env: None,
+        });
+        input
+    };
+
+    manager
+        .open(launch("terminal-codex", "codex"))
+        .await
+        .expect("observed terminal");
+    assert_eq!(
+        factory.activity_enabled.load(Ordering::Acquire),
+        0,
+        "the status observer launches with activity dormant"
+    );
+    assert!(
+        !next_agent_status(
+            &mut metadata,
+            "terminal-codex",
+            TerminalAgentStatusState::Waiting
+        )
+        .await,
+        "the observer's report reaches every client's metadata"
+    );
+    let observed = backend.latest();
+
+    // A provider with no observer here (Cursor, or any provider on Windows) is unavailable,
+    // never working or done, and stays so when it exits.
+    manager
+        .open(launch("terminal-cursor", "cursor"))
+        .await
+        .expect("unobserved terminal");
+    assert_eq!(
+        agent_status_of(
+            &manager.subscribe_metadata().await.initial,
+            "terminal-cursor"
+        ),
+        Some(TerminalAgentStatusState::Unavailable)
+    );
+    backend.latest().exit(0);
+
+    observed.exit(1);
+    assert!(
+        next_agent_status(
+            &mut metadata,
+            "terminal-codex",
+            TerminalAgentStatusState::Done
+        )
+        .await,
+        "an agent that exits with an error ends Done and failed"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        agent_status_of(
+            &manager.subscribe_metadata().await.initial,
+            "terminal-cursor"
+        ),
+        Some(TerminalAgentStatusState::Unavailable)
+    );
+    manager.shutdown().await;
+}
+
+#[cfg(unix)]
+fn codex_preparation_input(
+    fixture: &Value,
+    configured: &std::path::Path,
+    root: &tempfile::TempDir,
+    terminal_id: &str,
+) -> TerminalLaunchPreparationInput {
+    TerminalLaunchPreparationInput {
+        executable: configured.to_string_lossy().into_owned(),
+        args: serde_json::from_value(fixture["originalArgs"].clone()).expect("original args"),
+        cwd: root.path().to_path_buf(),
+        worktree_path: None,
+        launch_env: BTreeMap::new(),
+        activity: ProviderTerminalActivityLaunch {
+            driver_kind: "codex".to_owned(),
+            provider_instance_id: "codex".to_owned(),
+        },
+        generation: TerminalObserverGeneration::new(
+            "thread-codex".to_owned(),
+            terminal_id.to_owned(),
+        ),
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn codex_preparation_that_runs_out_of_time_names_the_helper_stage() {
+    own_process!(isolated);
+    let fixture = codex_remote_fixture();
+    let root = tempfile::tempdir().expect("fixture root");
+    let configured = root.path().join("configured-codex");
+    std::fs::write(&configured, b"configured").expect("configured executable");
+    let helper = Arc::new(CodexFixtureHelperLauncher::default());
+    *helper.start_delay.lock().expect("helper start delay lock") =
+        std::time::Duration::from_secs(30);
+    let (supervisor, _projection) = codex_fixture_supervisor(
+        &root,
+        &configured,
+        helper.clone(),
+        Arc::new(CodexFixtureRemoteFactory {
+            state: Arc::new(CodexFixtureRemoteState::default()),
+        }),
+    )
+    .await;
+    let capture = TraceCapture::default();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_target(false)
+        .with_ansi(false)
+        .with_writer(capture.clone())
+        .finish();
+    let _subscriber = tracing::subscriber::set_default(subscriber);
+
+    let preparation = supervisor
+        .prepare(codex_preparation_input(
+            &fixture,
+            &configured,
+            &root,
+            "terminal-slow-helper",
+        ))
+        .await;
+
+    assert!(matches!(
+        preparation,
+        TerminalLaunchPreparation::PassThrough
+    ));
+    assert_eq!(helper.launches.lock().expect("helper launches").len(), 1);
+    let diagnostic = capture.text();
+    assert!(diagnostic.contains("preparation_timeout"), "{diagnostic}");
+    assert!(diagnostic.contains("helper_start"), "{diagnostic}");
+    assert!(diagnostic.contains("elapsed_ms="), "{diagnostic}");
+    assert!(diagnostic.contains("budget_ms="), "{diagnostic}");
+    isolated.complete();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_observer_says_when_its_app_server_has_not_connected_and_keeps_waiting() {
+    own_process!(isolated);
+    // Observer workers run on their own runtime threads, so this test, alone in
+    // its process, captures through the global subscriber.
+    let capture = TraceCapture::default();
+    tracing::subscriber::set_global_default(
+        tracing_subscriber::fmt()
+            .without_time()
+            .with_target(false)
+            .with_ansi(false)
+            .with_writer(capture.clone())
+            .finish(),
+    )
+    .expect("the test process's only subscriber");
+    let root = tempfile::tempdir().expect("fixture root");
+    let configured = root.path().join("configured-codex");
+    std::fs::write(&configured, b"configured").expect("configured executable");
+    let remote_state = Arc::new(CodexFixtureRemoteState::default());
+    *remote_state
+        .connect_delay
+        .lock()
+        .expect("connect delay lock") = std::time::Duration::from_millis(3_600);
+
+    let (manager, _projection, _scope) = open_codex_fixture_terminal(
+        &root,
+        &configured,
+        remote_state.clone(),
+        "terminal-slow-connect",
+    )
+    .await;
+
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !capture.text().contains("connect_timeout") {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("no connect_timeout warning: {}", capture.text()));
+    let diagnostic = capture.text();
+    assert!(diagnostic.contains("stage=\"connect\""), "{diagnostic}");
+    assert!(diagnostic.contains("elapsed_ms="), "{diagnostic}");
+    assert!(!diagnostic.contains("connect_failed"), "{diagnostic}");
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while remote_state
+            .endpoints
+            .lock()
+            .expect("remote endpoints lock")
+            .is_empty()
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the slow connection still completes after the warning");
+    manager.shutdown().await;
+    isolated.complete();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn codex_helper_failure_is_logged_as_its_own_reason_with_the_launcher_error() {
+    own_process!(isolated);
+    let fixture = codex_remote_fixture();
+    let root = tempfile::tempdir().expect("fixture root");
+    let configured = root.path().join("configured-codex");
+    std::fs::write(&configured, b"configured").expect("configured executable");
+    let helper = Arc::new(CodexFixtureHelperLauncher::default());
+    helper.fail.store(true, Ordering::Release);
+    let (supervisor, _projection) = codex_fixture_supervisor(
+        &root,
+        &configured,
+        helper,
+        Arc::new(CodexFixtureRemoteFactory {
+            state: Arc::new(CodexFixtureRemoteState::default()),
+        }),
+    )
+    .await;
+    let capture = TraceCapture::default();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_target(false)
+        .with_ansi(false)
+        .with_writer(capture.clone())
+        .finish();
+    let _subscriber = tracing::subscriber::set_default(subscriber);
+
+    let preparation = supervisor
+        .prepare(codex_preparation_input(
+            &fixture,
+            &configured,
+            &root,
+            "terminal-failed-helper",
+        ))
+        .await;
+
+    assert!(matches!(
+        preparation,
+        TerminalLaunchPreparation::PassThrough
+    ));
+    let diagnostic = capture.text();
+    assert!(diagnostic.contains("helper_start_failed"), "{diagnostic}");
+    assert!(
+        diagnostic.contains("injected helper failure"),
+        "{diagnostic}"
+    );
+    assert!(!diagnostic.contains("preparation_timeout"), "{diagnostic}");
+    isolated.complete();
+}
+
+#[tokio::test]
+async fn codex_probe_remembers_an_unparseable_version_and_never_reprobes_that_build() {
+    let root = tempfile::tempdir().expect("fixture root");
+    let configured = root.path().join("configured-codex");
+    std::fs::write(&configured, b"configured").expect("configured executable");
+    let output = |stdout: &str| {
+        Ok(CodexProbeOutput {
+            success: true,
+            stdout: stdout.to_owned(),
+            stderr: String::new(),
+        })
+    };
+    let runner = Arc::new(CodexResultProbeRunner {
+        calls: Mutex::default(),
+        outputs: Mutex::new(VecDeque::from([
+            output("codex-cli development build"),
+            output("Usage: codex --remote unix://PATH"),
+            output("Usage: codex app-server --listen unix://PATH"),
+        ])),
+    });
+    let probe = CachedCodexCapabilityProbe::new(runner.clone());
+
+    assert!(probe.probe(&configured).await.is_none());
+    assert!(probe.probe(&configured).await.is_none());
+    assert_eq!(
+        runner.calls.lock().expect("probe calls lock").len(),
+        3,
+        "a build already known to rule observation out must pass through without spawning"
+    );
 }

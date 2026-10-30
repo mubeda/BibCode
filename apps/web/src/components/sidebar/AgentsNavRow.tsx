@@ -9,7 +9,6 @@ import { useEnvironments } from "../../state/environments";
 import { useEnvironmentShellSummary } from "../../state/shell";
 import { SidebarGroup, SidebarMenu, SidebarMenuButton, SidebarMenuItem } from "../ui/sidebar";
 import { buildAgentRows, countUnreadAgentRows } from "./agentsSection.logic";
-import { useAgentsUnread } from "./useAgentsUnread";
 
 export function AgentsNavRow() {
   const navigate = useNavigate();
@@ -35,7 +34,6 @@ export function AgentsNavRow() {
       }),
     [availability, environments, projects, shells],
   );
-  useAgentsUnread(rows);
   const unreadCount = useMemo(
     () => countUnreadAgentRows(rows, unreadThreadKeys),
     [rows, unreadThreadKeys],

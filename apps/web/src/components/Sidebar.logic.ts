@@ -2,7 +2,12 @@ import * as React from "react";
 import type { SidebarProjectSortOrder, SidebarThreadSortOrder } from "@bibcode/contracts/settings";
 import type { EnvironmentShellAvailability } from "@bibcode/client-runtime/state/shell";
 import type { ConnectionCatalogHealth } from "@bibcode/client-runtime/platform";
-import type { EnvironmentId, VcsStatusResult, VcsStatusSummary } from "@bibcode/contracts";
+import type {
+  EnvironmentId,
+  TerminalSummary,
+  VcsStatusResult,
+  VcsStatusSummary,
+} from "@bibcode/contracts";
 import {
   getThreadSortTimestamp,
   sortThreads,
@@ -113,10 +118,10 @@ type SidebarProject = {
 export type ThreadTraversalDirection = "previous" | "next";
 
 /**
- * Status tones shared by the thread pill (Agents view) and the card glyphs, so
- * both surfaces colour a status the same way.
+ * Status tones shared by the thread pill (Agents view), the card glyphs and the
+ * Inbox, so every surface colours a status the same way.
  */
-const STATUS_TONES = {
+export const STATUS_TONES = {
   approval: {
     colorClass: "text-amber-600 dark:text-amber-300/90",
     dotClass: "bg-amber-500 dark:bg-amber-300/90",
@@ -137,6 +142,15 @@ const STATUS_TONES = {
     colorClass: "text-emerald-600 dark:text-emerald-300/90",
     dotClass: "bg-emerald-500 dark:bg-emerald-300/90",
   },
+  failed: {
+    colorClass: "text-destructive",
+    dotClass: "bg-destructive",
+  },
+  /** A status BiBCode cannot vouch for: stale, offline, or not observed. */
+  unknown: {
+    colorClass: "text-muted-foreground",
+    dotClass: "bg-muted-foreground/50",
+  },
 } as const;
 
 export interface ThreadStatusPill {
@@ -146,7 +160,11 @@ export interface ThreadStatusPill {
     | "Completed"
     | "Pending Approval"
     | "Awaiting Input"
-    | "Plan Ready";
+    | "Plan Ready"
+    | "Failed"
+    | "No update"
+    | "Offline"
+    | "Status unavailable";
   colorClass: string;
   dotClass: string;
   pulse: boolean;
@@ -515,12 +533,128 @@ export function resolveThreadStatusPill(input: {
   return null;
 }
 
+/**
+ * How long a Working status lasts without new provider evidence before the left
+ * panel stops claiming it (Orca's threshold, #187). A legitimate silent tool, such
+ * as a long build, fits well inside it.
+ */
+export const AGENT_STATUS_STALE_AFTER_MS = 30 * 60_000;
+
+/** Why a row's status is unknown: no recent evidence, no observer, or no connection. */
+export type AgentUnknownReason = "stale" | "unavailable" | "offline";
+
+/**
+ * What the status rules need beyond the thread: the time, when the client first saw
+ * the status's current evidence (on its own clock), and whether the environment is
+ * connected. Absent, nothing decays and every environment counts as connected.
+ */
+export interface AgentStatusContext {
+  readonly now: number;
+  readonly evidenceAt: number | null;
+  readonly environmentLive: boolean;
+}
+
+/** One agent's status in the left panel: its pill, and why it is unknown if it is. */
+export interface AgentStatus {
+  readonly pill: ThreadStatusPill | null;
+  readonly unknownReason: AgentUnknownReason | null;
+}
+
+const UNKNOWN_PILLS = {
+  stale: { label: "No update", ...STATUS_TONES.unknown, pulse: false },
+  unavailable: { label: "Status unavailable", ...STATUS_TONES.unknown, pulse: false },
+  offline: { label: "Offline", ...STATUS_TONES.unknown, pulse: false },
+} as const satisfies Record<AgentUnknownReason, ThreadStatusPill>;
+
+const AGENT_PILLS = {
+  approval: { label: "Pending Approval", ...STATUS_TONES.approval, pulse: false },
+  input: { label: "Awaiting Input", ...STATUS_TONES.input, pulse: false },
+  working: { label: "Working", ...STATUS_TONES.working, pulse: true },
+  failed: { label: "Failed", ...STATUS_TONES.failed, pulse: false },
+} as const satisfies Record<string, ThreadStatusPill>;
+
+/** Whether evidence first seen at `evidenceAt` is too old to vouch for a Working status. */
+export function isAgentEvidenceStale(evidenceAt: number | null, now: number): boolean {
+  return evidenceAt !== null && now - evidenceAt > AGENT_STATUS_STALE_AFTER_MS;
+}
+
+function unknownStatus(reason: AgentUnknownReason): AgentStatus {
+  return { pill: UNKNOWN_PILLS[reason], unknownReason: reason };
+}
+
+/**
+ * A chat agent's status. A disconnected environment's cached state is not current
+ * evidence, so it reads offline; a Working or Connecting status without provider
+ * evidence for 30 minutes reads stale; a session that errored reads Failed. Pending
+ * approvals and questions never decay: the server holds them and expires them when
+ * their turn ends.
+ */
+export function resolveThreadAgentStatus(
+  thread: ThreadStatusInput,
+  context?: AgentStatusContext,
+): AgentStatus {
+  if (context !== undefined && !context.environmentLive) {
+    return unknownStatus("offline");
+  }
+  const pill = resolveThreadStatusPill({ thread });
+  if (
+    context !== undefined &&
+    (pill?.label === "Working" || pill?.label === "Connecting") &&
+    isAgentEvidenceStale(context.evidenceAt, context.now)
+  ) {
+    return unknownStatus("stale");
+  }
+  if (pill === null && thread.session?.status === "error") {
+    return { pill: AGENT_PILLS.failed, unknownReason: null };
+  }
+  return { pill, unknownReason: null };
+}
+
+/** The part of a terminal's metadata its agent status reads. */
+export type TerminalAgentStatusInput = Pick<TerminalSummary, "status" | "agentStatus">;
+
+/**
+ * An AI Terminal agent's status, or `null` when the terminal is not an agent to
+ * list: a plain shell, or an unobserved agent whose process ended. An unobserved
+ * agent is never Working or Done.
+ */
+export function resolveTerminalAgentStatus(
+  terminal: TerminalAgentStatusInput,
+  context?: AgentStatusContext,
+): AgentStatus | null {
+  const agent = terminal.agentStatus;
+  if (agent === undefined) return null;
+  const running = terminal.status === "running" || terminal.status === "starting";
+  if (agent.state === "unavailable") {
+    if (!running) return null;
+    return context !== undefined && !context.environmentLive
+      ? unknownStatus("offline")
+      : unknownStatus("unavailable");
+  }
+  if (context !== undefined && !context.environmentLive) {
+    return unknownStatus("offline");
+  }
+  switch (agent.state) {
+    case "blocked":
+      return { pill: AGENT_PILLS.approval, unknownReason: null };
+    case "waiting":
+      return { pill: AGENT_PILLS.input, unknownReason: null };
+    case "working":
+      return context !== undefined && isAgentEvidenceStale(context.evidenceAt, context.now)
+        ? unknownStatus("stale")
+        : { pill: AGENT_PILLS.working, unknownReason: null };
+    case "done":
+      return { pill: agent.failed ? AGENT_PILLS.failed : null, unknownReason: null };
+  }
+}
+
 export type WorkspaceCardStatusKind =
   | "approval"
   | "input"
   | "working"
   | "failed"
   | "plan"
+  | "unknown"
   | "done"
   | "idle";
 
@@ -550,6 +684,21 @@ export const WORKSPACE_CARD_STATUS = {
   connecting: { kind: "working", label: "Connecting", colorClass: STATUS_TONES.working.colorClass },
   failed: { kind: "failed", label: "Failed", colorClass: "text-destructive" },
   plan: { kind: "plan", label: "Plan ready", colorClass: STATUS_TONES.plan.colorClass },
+  stale: {
+    kind: "unknown",
+    label: "No update from the agent for 30 minutes",
+    colorClass: STATUS_TONES.unknown.colorClass,
+  },
+  unavailable: {
+    kind: "unknown",
+    label: "An agent is running whose status BiBCode cannot see",
+    colorClass: STATUS_TONES.unknown.colorClass,
+  },
+  offline: {
+    kind: "unknown",
+    label: "Offline: the agent's status is unknown",
+    colorClass: STATUS_TONES.unknown.colorClass,
+  },
   done: {
     kind: "done",
     label: "Finished, not opened yet",
@@ -562,14 +711,73 @@ export type WorkspaceCardStatusInput = Omit<ThreadStatusInput, "lastVisitedAt"> 
   Pick<SidebarThreadSummary, "unresolvedDelivery">;
 
 /**
+ * The status rules for a card: the chat's freshness and connection, and the AI
+ * Terminals running in the card's workspace, each with its own evidence time.
+ */
+export interface WorkspaceCardStatusContext extends AgentStatusContext {
+  readonly terminals: ReadonlyArray<{
+    readonly terminal: TerminalAgentStatusInput;
+    readonly evidenceAt: number | null;
+  }>;
+}
+
+const UNKNOWN_CARD_STATUS = {
+  stale: WORKSPACE_CARD_STATUS.stale,
+  unavailable: WORKSPACE_CARD_STATUS.unavailable,
+  offline: WORKSPACE_CARD_STATUS.offline,
+} as const satisfies Record<AgentUnknownReason, WorkspaceCardStatus>;
+
+function terminalCardStatus(status: AgentStatus): WorkspaceCardStatus {
+  if (status.unknownReason !== null) return UNKNOWN_CARD_STATUS[status.unknownReason];
+  switch (status.pill?.label) {
+    case "Pending Approval":
+      return WORKSPACE_CARD_STATUS.approval;
+    case "Awaiting Input":
+      return WORKSPACE_CARD_STATUS.input;
+    case "Working":
+      return WORKSPACE_CARD_STATUS.working;
+    case "Failed":
+      return WORKSPACE_CARD_STATUS.failed;
+    default:
+      // A terminal agent waiting at its prompt asks nothing of the user.
+      return WORKSPACE_CARD_STATUS.idle;
+  }
+}
+
+/**
  * A card's glyph, wrapping the thread pill so the Agents view keeps its labels.
- * First match wins: approval, input, working/connecting, failed (session error,
- * refused delivery, or an unseen turn that errored — the pill calls that
- * "Completed"), plan ready, finished-not-opened, idle.
+ * First match wins: approval, input, working/connecting (stale after 30
+ * minutes without evidence), failed (session error, refused delivery, or an unseen
+ * turn that errored — the pill calls that "Completed"), plan ready,
+ * finished-not-opened, idle. Then the card takes the most urgent of that and its AI
+ * Terminals' statuses, so an agent BiBCode cannot see (`unknown`) outranks a
+ * finished chat and the card never reads Done over it. In a disconnected
+ * environment any claim reads offline.
  */
 export function resolveWorkspaceCardStatus(
   thread: WorkspaceCardStatusInput,
   lastVisitedAt: string | null | undefined,
+  context?: WorkspaceCardStatusContext,
+): WorkspaceCardStatus {
+  let status = resolveChatCardStatus(thread, lastVisitedAt, context);
+  if (context === undefined) return status;
+  for (const { terminal, evidenceAt } of context.terminals) {
+    const agent = resolveTerminalAgentStatus(terminal, { ...context, evidenceAt });
+    if (agent !== null) {
+      status = pickMoreUrgentWorkspaceCardStatus(status, terminalCardStatus(agent));
+    }
+  }
+  // A disconnected environment's cached claim (working, waiting, done) is not current
+  // evidence; an idle card claims nothing and stays idle.
+  return !context.environmentLive && status.kind !== "idle"
+    ? WORKSPACE_CARD_STATUS.offline
+    : status;
+}
+
+function resolveChatCardStatus(
+  thread: WorkspaceCardStatusInput,
+  lastVisitedAt: string | null | undefined,
+  context: AgentStatusContext | undefined,
 ): WorkspaceCardStatus {
   const visited: ThreadStatusInput = lastVisitedAt ? { ...thread, lastVisitedAt } : thread;
   const pill = resolveThreadStatusPill({ thread: visited });
@@ -579,9 +787,13 @@ export function resolveWorkspaceCardStatus(
     case "Awaiting Input":
       return WORKSPACE_CARD_STATUS.input;
     case "Working":
-      return WORKSPACE_CARD_STATUS.working;
     case "Connecting":
-      return WORKSPACE_CARD_STATUS.connecting;
+      if (context !== undefined && isAgentEvidenceStale(context.evidenceAt, context.now)) {
+        return WORKSPACE_CARD_STATUS.stale;
+      }
+      return pill.label === "Working"
+        ? WORKSPACE_CARD_STATUS.working
+        : WORKSPACE_CARD_STATUS.connecting;
     default:
       break;
   }
@@ -602,11 +814,12 @@ export function resolveWorkspaceCardStatus(
 }
 
 const WORKSPACE_CARD_STATUS_PRIORITY: Record<WorkspaceCardStatusKind, number> = {
-  approval: 7,
-  input: 6,
-  working: 5,
-  failed: 4,
-  plan: 3,
+  approval: 8,
+  input: 7,
+  working: 6,
+  failed: 5,
+  plan: 4,
+  unknown: 3,
   done: 2,
   idle: 1,
 };

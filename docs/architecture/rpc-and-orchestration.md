@@ -2593,9 +2593,23 @@ while a view of a deleted thread retried every 250 ms for as long as it stayed
 mounted (#113).
 The client's thread detail projection keeps every object of a new snapshot or patch
 that equals what it already shows, and remembers which source object resolved
-to which shown one so later patches compare only what they changed. A resync
+to which shown one so later patches compare only what they changed. An array
+entry with an `id` is compared with the shown entry of that `id`, not the one at
+its position: messages are ordered by delivery and time, so a turn added while
+the client was away can land before messages it already shows. A resync
 snapshot therefore does not hand the UI a second copy of an unchanged thread;
-each copy used to stay pinned by memoized render closures (#96).
+each copy used to stay pinned by memoized render closures (#96, #134). Memoized
+callbacks recreated at different renders also pin each other's older renders,
+so ChatView and ChatComposer route such handlers through
+`apps/web/src/hooks/useLatestHandler.ts` (one identity, the latest committed
+handler, called only after commit). An operation that awaits resolves where its
+error is shown before its first await, so a thread or environment switch cannot
+redirect it (#198, #204). Beside
+the shown copy, the thread state holds only the latest received snapshot,
+whatever the number of reconnects. The sidebar's thread prewarmer still reads
+the raw thread state, so its React state keeps one earlier snapshot of each
+prewarmed thread: three copies in steady state, not two (follow-up filed
+separately).
 Every shell snapshot, live or from `orchestration.getArchivedShellSnapshot`,
 is read in one SQLite job: projects, the undeleted live or archived threads
 whose project row exists, and per thread only its session, latest turn, the
@@ -2608,6 +2622,76 @@ load produces, and only the HTTP read model below loads the whole store. A
 thread's activities are read in the order of their
 `(thread_id, sequence, created_at, activity_id)` index, so the listing needs
 no temporary sort that would spill large payloads to a temporary file.
+
+The shell carries what the left panel's agent status reads (#187):
+
+- **`hasPendingApprovals`** comes from `projection_pending_approvals`.
+- **`hasPendingUserInput`** is the thread's count of open questions. A question
+  is open while the newest record for its request is the ask itself, or a
+  refused answer that the provider did not call stale. That rule is one shared
+  SQL fragment, `open_user_input_requests_sql`, which the queue head also uses.
+  The count is recomputed only when a request's state changes, not on every
+  thread event.
+- **`lastActivityAt`** is the time of the thread's latest provider progress:
+  either an event the engine attributes to the provider, or a session update to
+  `starting` or `running`. Titles, modes, archiving and BiBCode's own
+  settlements (a refused answer's `*.respond.failed` included) never move it,
+  and it never moves backwards. Migration 057 seeds it from each thread's latest
+  provider event.
+- **`lastActivityAgeMs`** is how old `lastActivityAt` was on the server's clock
+  when the snapshot was built. The client ages a Working status from its own
+  receipt of that value, so it never compares clocks with the server.
+
+Requests also settle without an answer:
+
+- A stale or unknown `provider.approval.respond.failed` resolves its approval.
+  A request expires only on evidence that nobody can answer it. Each expiry is an
+  `approval.expired` or `user-input.expired` activity for every request still
+  open, payload `{ requestId, reason, sessionStatus? }`:
+
+- **The user stops it.** A turn interrupt or a `thread.session.stop` expires
+  the thread's open requests in the same commit (`reason: "stopped"`), for
+  every provider.
+- **An in-process provider's session ends.** A `thread.session-set` to
+  `error`, `interrupted`, `stopped` or `idle` that moves a Codex or Claude
+  session out of `running` or `starting` (read in the same transaction)
+  expires them (`reason: "session-ended"`): those asks end with the session.
+  At startup, after abandoned sessions are reconciled, requests still open on
+  such threads whose session is not live expire the same way
+  (`sessionStatus: "settled"`). That pass runs once before provider sessions
+  start. Each selected request gets a fresh command and activity identity:
+  provider request IDs can repeat across threads or later processes, while
+  committed expiries leave no open request for the next startup to select.
+- **OpenCode no longer lists it.** OpenCode's server outlives a BiBCode session
+  and a BiBCode restart, so its session ending proves nothing and the startup
+  pass skips it (`EXTERNALLY_RESUMABLE_PROVIDERS`). On resume, a completed read
+  of its pending lists (both OpenCode 1 lists, or every OpenCode 2 list in the
+  session tree) reports `requests.listed`; each open request it does not list
+  expires (`reason: "provider-unlisted"`). A read that failed, or a tree read cut
+  short, reports nothing, and the requests stay open.
+- A session that settles `ready` keeps its open requests, and a session settling
+  again or a launch's `ready` expires nothing.
+- An expired request reopens if the provider asks it again, which OpenCode does
+  for the asks it recovers on resume. `request_is_recorded` treats an expired
+  request as not recorded, so the recovered ask is shown.
+
+Queue consequence: an open request holds queued follow-ups until it is answered
+or expires, exactly as before #187; an expiry wakes the delivery service.
+
+A resumed OpenCode session may hold an ask BiBCode never recorded, which it shows
+only after its first read of the pending lists since subscribing. Until that
+read finishes, the engine holds the thread's automatic queue promotion
+(`AskRecoveryHold`, held by the session). The read reports
+`requests.recovery-read` after showing what it found, completed or failed, which
+releases the hold; so does the session ending. A failed read releases the queue
+with today's behavior, and so does a subscription OpenCode has not confirmed
+(`server.connected`) 15 seconds after the stream opened (logged). A recovered
+ask whose projection fails is projected again, in order, with a bounded backoff;
+until it is recorded the read does not release the hold, and if it never is the
+queue stays held until the session ends. Every completed read, the resume's,
+the first after subscribing and each retry, reports `requests.listed`. An
+OpenCode 2 subagent list answered without its `data` array, or listing a child
+without a valid id, leaves the tree read incomplete.
 `orchestration.replayEvents` with `paged: true` returns about 1 MiB pages
 `{ events, exhausted }`, keeping at least one event when any remain. Replay
 resumes from the last applied `sequence` with no server state; the cursor is
@@ -3708,6 +3792,85 @@ unavailable, while positive legacy durations remain measured. Unknown samples
 retain their failure/count evidence but do not contribute to latency statistics
 or slow rankings. An older server's summary lacks a known measured denominator,
 so current clients display its summary timing as unavailable.
+
+## Diagnostic logs download
+
+`server.downloadDiagnosticLogs` (`diagnostics:read`, which `orchestration:read`
+satisfies; a stream) sends the
+server's redacted diagnostic bundle over the connection that asks for it, so a
+remote environment's archive needs no HTTP route of its own and stays inside a
+pinned connection's Noise channel (#194). Its schemas are in
+[`server.ts`](../../packages/contracts/src/server.ts); the server side is
+[`diagnostic_logs_rpc.rs`](../../apps/server/src/production/diagnostic_logs_rpc.rs)
+and the client side
+[`client-runtime/src/diagnostics/logs.ts`](../../packages/client-runtime/src/diagnostics/logs.ts).
+
+- **Request:** `frontendLog` (the client's bounded warning/error snapshot) and
+  optional `includeCrashDumps`. Dumps also need `orchestration:operate` of the
+  same session, checked in the handler before anything is built; a refusal is
+  the usual `EnvironmentAuthorizationError`.
+- **Items:** one `Started` (`fileName`, `byteLength`, `manifest`), then `Data`
+  items of base64 carrying at most 64 KiB each, then completion. Each item
+  rides alone in its chunk, so the client's `Ack` paces the download and other
+  replies go out between items. An item the client does not take within 60 s
+  (a link under about 1 KiB/s, or a client that stopped acknowledging) ends the
+  request and releases the archive.
+- **Failures:** `DiagnosticLogsError` with `reason` `invalid`, `build-failed`,
+  or `too-large` (over 20 MiB, refused before any item).
+- **Client checks:** it sends the request only to a server advertising
+  `capabilities.diagnosticLogs`, and fails closed: the connection's
+  `server.getConfig` must report a `storageInstanceId`, the manifest must name
+  the same one, `Started` must come first and once, and each item's encoded
+  length is checked against the item bound and the bytes still due before it
+  is decoded into the one output buffer. A stream that ends short or fails
+  saves nothing.
+
+The handler waits only on local disk reads and compression; it is timed to its
+first item like every stream, which is log-only, so it is not in
+`is_long_running`.
+
+## Diagnostic logs relay
+
+`bibcode diagnostics download` reaches a connected environment through the
+desktop app, which holds the connection (#201). Three methods serve the app's
+side, all requiring `access:write` and, in the handler, the desktop app's own
+session (subject `desktop-bootstrap`); any other session is refused with
+`DiagnosticLogsRelayError` `not-desktop`. The server side is
+[`diagnostic_logs_relay.rs`](../../apps/server/src/production/diagnostic_logs_relay.rs),
+the app side
+[`client-runtime/src/diagnostics/relay.ts`](../../packages/client-runtime/src/diagnostics/relay.ts)
+and [`apps/web/src/diagnostics/`](../../apps/web/src/diagnostics/), and the
+command [`relay_cli.rs`](../../apps/server/src/diagnostics/relay_cli.rs).
+
+- **`server.subscribeDiagnosticLogsRelay`** (stream): the waiting request on
+  subscribing, then `Pending { requestId, environment, includeCrashDumps,
+  code, outputDirectory }` for each new one (the environment as typed, the
+  code the command printed, and its output directory, all for the prompt),
+  `Claimed { requestId }` once a window took it, and `Closed { requestId }`
+  when it ends. A new `requestId` is minted for every request.
+- **`server.claimDiagnosticLogsRelay { requestId }`** → `{ claimed }`: binds a
+  waiting request to the calling session and connection; `false` when it is
+  taken or over.
+- **`server.sendDiagnosticLogsRelayItem { requestId, item }`**: `Denied` or
+  `Failed { reason, message }` alone, or `Started`, `Data`
+  (base64, at most 64 KiB) and `Finished`, checked against the order, the
+  20 MiB archive bound, the archive-name shape and the declared length. It
+  answers once the command read the previous item, so the server holds at most
+  one. An item from another connection, or for a request that is over, is
+  `stale`; one for a request whose command left is `cancelled`; a broken order
+  or bound is `invalid` and ends the request.
+
+The command's side is `POST /api/diagnostics/relay` with `{ environment,
+includeCrashDumps, code, outputDirectory }`, accepted only from a peer on this
+machine, without forwarding headers, with the per-boot token of the state
+directory's `diagnostics-relay.json`, and only when no field holds a control
+character. It answers one JSON line per step (`waiting`, `started`, `data`,
+`finished`, `denied`, `failed`, or `ended` with `busy`, `cooling-down`,
+`no-app`, `expired`, `connection-lost`, `stalled` or `invalid`). The
+subscription waits on a person and the send call on the command, so those two
+are in `is_long_running`; the claim only takes a lock and is not. Deadlines and
+outcomes are in
+[Observability](../operations/observability.md#from-the-command-line).
 
 ## Profiler timing and client reports
 

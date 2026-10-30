@@ -1,15 +1,18 @@
 pub mod delivery;
 pub mod engine;
+pub mod process_ownership;
 
 pub use delivery::{
     AttachmentReference, CommandAdmission, NewProviderTurnDelivery, ProviderTurnDelivery,
     TurnDeliveryFailureReason, TurnDeliveryMode, TurnDeliveryState, TurnDeliveryTransition,
     canonical_command_digest,
 };
+pub(crate) use engine::{AskRecoveryHold, EXTERNALLY_RESUMABLE_PROVIDERS};
 pub use engine::{
     EngineOptions, OrchestrationCommand, OrchestrationEngine, OrchestrationError, Snapshot,
     load_shell_snapshot, load_snapshot, load_thread_snapshot,
 };
+pub use process_ownership::StartupProcessOwnership;
 
 #[cfg(test)]
 mod delivery_tests {

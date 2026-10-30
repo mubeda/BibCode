@@ -13,14 +13,18 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use crate::orchestration::process_ownership::{
+    PROCESS_OWNER_BIBCODE, PROCESS_OWNER_EXTERNAL, PROCESS_OWNER_PAYLOAD_KEY,
+    StartupProcessOwnership,
+};
 #[cfg(not(feature = "hermetic-test-guard"))]
 use crate::process::locate_executable;
 use crate::{
     activity::{
         ACTIVITY_DELTA_MAX_CHANGES, ACTIVITY_ID_MAX_LENGTH, ActivityCancellationDispatcher,
         ActivityCancellationService, ActivityCapabilities, ActivityChange, ActivityDelta,
-        ActivityDispatchError, ActivityDispatchJob, ActivityHistoryRecovery, ActivityLifecycle,
-        ActivityObservationState, ActivityProjection, ActivityRepositoryError,
+        ActivityDispatchError, ActivityDispatchJob, ActivityHistoryRecovery, ActivityInterruption,
+        ActivityLifecycle, ActivityObservationState, ActivityProjection, ActivityRepositoryError,
         ActivityRuntimeControlRegistration, ActivityRuntimeGeneration, ActivityScopeRef,
         ActivityScopeSeed, ActivitySection, ActivitySectionHealth, ActivitySummaryCounts,
         ActivityTargetDispatchDisposition, AgentActivityController, ProviderActivityControlUpdate,
@@ -30,7 +34,10 @@ use crate::{
         AttributionKind, AttributionScope, NativeProcessSampler, ProcessAttributionRegistry,
         ProcessRegistration, ProcessRegistrationError, ProcessRegistrationMetadata,
         RegistrationSource,
-        profiler::exits::{self, Exited, Watch},
+        profiler::{
+            exits::{self, Exited, Watch},
+            redact::redact_path,
+        },
     },
     orchestration::{
         ProviderTurnDelivery, TurnDeliveryMode, TurnDeliveryState, TurnDeliveryTransition,
@@ -364,6 +371,12 @@ impl ProviderDeliveryHandle {
 
 pub trait ProviderDriver: Send + Sync {
     fn start(&self) -> BoxRuntimeFuture<'_, Result<StartedSession, ProviderRuntimeError>>;
+    /// Whether `start`'s activity capabilities are all this process will report. When false, a
+    /// startup `ActivityCapabilities::none()` means "not known yet": a restarted session keeps
+    /// what its previous process reported until the new one reports its own.
+    fn startup_activity_capabilities_are_final(&self) -> bool {
+        false
+    }
     fn send(
         &self,
         text: String,
@@ -867,6 +880,9 @@ type SessionPublicationFence = Arc<Mutex<SessionPublicationState>>;
 struct SessionEntry {
     launch: ProviderLaunchRequest,
     driver: Arc<dyn ProviderDriver>,
+    /// Holds queued messages while a resumed session reads the asks its provider kept (#187);
+    /// released by that read finishing or by the session ending.
+    _ask_recovery: Option<crate::orchestration::AskRecoveryHold>,
     /// Settles what the session leaves streaming once its pump is reaped, whoever detaches it.
     engine: OrchestrationEngine,
     configuration_healthy: bool,
@@ -878,6 +894,9 @@ struct SessionEntry {
     activity_dispatch_tasks: Vec<JoinHandle<()>>,
     activity_late_dispatch_cancellation: CancellationToken,
     activity_late_dispatch_tasks: HashMap<ActivityDispatchTaskId, JoinHandle<()>>,
+    /// Closes the activity of a stream that ended by itself (#206). Reaped with the activity
+    /// tasks, so it finishes before this session's entry is replaced or the supervisor stops.
+    stream_end_closure: Option<JoinHandle<()>>,
     next_activity_late_dispatch_task_id: u64,
     activity_control: Arc<RwLock<Option<Arc<ActivityRuntimeControlRegistration>>>>,
     activity_cancellation: Arc<RwLock<Option<ActivityCancellationService>>>,
@@ -1041,11 +1060,16 @@ impl ProviderActivityLifecycleState {
         self.live_work_item_ids.clear();
     }
 
+    /// A provisional startup `none()` keeps capabilities a previous process reported at runtime;
+    /// a final one (see `ProviderDriver::startup_activity_capabilities_are_final`) replaces them,
+    /// so a process without activity reporting never inherits a live section.
     fn apply_startup_capabilities(
         &mut self,
         startup_capabilities: ActivityCapabilities,
+        startup_is_final: bool,
     ) -> ActivityCapabilities {
-        if !self.runtime_observed_capabilities
+        if startup_is_final
+            || !self.runtime_observed_capabilities
             || startup_capabilities != ActivityCapabilities::none()
         {
             self.capabilities = startup_capabilities;
@@ -2466,6 +2490,83 @@ pub async fn reconcile_orchestration_turn(
 }
 
 const WORKSPACE_LOSS_SESSION_ERROR: &str = "Provider session stopped because its workspace became unavailable. Review delivery status before continuing.";
+
+/// Who ran each thread's provider process, read at startup before abandoned sessions settle:
+/// the persisted runtime rows and whether the settings point OpenCode at a user's server.
+pub async fn startup_process_ownership(
+    repositories: &Repositories,
+    external_server_instances: Vec<String>,
+) -> StartupProcessOwnership {
+    match repositories.list_provider_session_runtimes().await {
+        Ok(runtimes) => StartupProcessOwnership::new(
+            runtimes.iter().map(|runtime| {
+                (
+                    runtime.thread_id.as_str(),
+                    runtime.provider_instance_id.as_deref(),
+                    runtime.runtime_payload.as_ref(),
+                )
+            }),
+            external_server_instances,
+        ),
+        Err(error) => {
+            tracing::warn!(%error, "failed to read provider runtimes for startup ownership");
+            StartupProcessOwnership::new([], external_server_instances)
+        }
+    }
+}
+
+/// At startup no provider session is live, so a subagent or background task still open in a chat
+/// scope ran in a process that died with the previous server: close it as `interrupted` (#206).
+/// A scope whose provider work may outlive BiBCode (an OpenCode server the user runs) is left to
+/// its resume, by the same rule that keeps its open requests (#187). Returns how many scopes
+/// were closed.
+pub async fn interrupt_activity_of_ended_sessions(
+    ownership: &StartupProcessOwnership,
+    activity: &ActivityProjection,
+) -> usize {
+    const RESTART: ActivityInterruption =
+        ActivityInterruption::new("BiBCode restarted before this");
+    let scopes = match activity.unresolved_thread_scopes().await {
+        Ok(scopes) => scopes,
+        Err(error) => {
+            tracing::warn!(%error, "failed to read open chat activity at startup");
+            return 0;
+        }
+    };
+    if scopes.is_empty() {
+        return 0;
+    }
+    let mut closed_scopes = 0;
+    for scope in scopes {
+        if ownership.work_may_outlive_bibcode(
+            &scope.thread_id,
+            &scope.provider,
+            scope.provider_instance_id.as_deref(),
+        ) {
+            continue;
+        }
+        match activity
+            .interrupt_unresolved_scope(&scope.scope_id, RESTART.clone())
+            .await
+        {
+            Ok(deltas) if !deltas.is_empty() => closed_scopes += 1,
+            Ok(_) => {}
+            Err(error) => tracing::warn!(
+                %error,
+                thread_id = %scope.thread_id,
+                provider = %scope.provider,
+                "failed to close open chat activity at startup"
+            ),
+        }
+    }
+    if closed_scopes > 0 {
+        tracing::info!(
+            closed_scopes,
+            "closed chat activity left open by the previous server"
+        );
+    }
+    closed_scopes
+}
 
 pub async fn reconcile_abandoned_provider_sessions(
     engine: &OrchestrationEngine,
@@ -6431,6 +6532,27 @@ async fn run_supervisor(
                     } else {
                         entry.event_cancellation.cancel();
                     }
+                    // The process is gone whether or not its projection settled; closing its
+                    // activity needs no further delivery (#206). Off the supervisor loop: a
+                    // projection still stuck on the database must not hold other threads'
+                    // traffic, and the closure time fences whatever lands first.
+                    // Bound to this stream's end: only what its process reported closes.
+                    let ended_at = now();
+                    let activity = activity.clone();
+                    let launch = entry.launch.clone();
+                    let driver = entry.driver.clone();
+                    if let Some(previous) = entry.stream_end_closure.take() {
+                        previous.abort();
+                    }
+                    entry.stream_end_closure = Some(tokio::spawn(async move {
+                        interrupt_ended_session_activity(
+                            &activity,
+                            &launch,
+                            driver.as_ref(),
+                            Some(ended_at),
+                        )
+                        .await;
+                    }));
                 }
             }
             SupervisorMessage::Deliver {
@@ -7997,6 +8119,9 @@ async fn cancel_and_reap_activity_tasks(entry: &mut SessionEntry) {
     for task in std::mem::take(&mut entry.activity_dispatch_tasks) {
         let _ = task.await;
     }
+    if let Some(closure) = entry.stream_end_closure.take() {
+        let _ = closure.await;
+    }
 }
 
 fn normalize_agent_activity_transition_error(error: ProviderRuntimeError) -> ProviderRuntimeError {
@@ -8210,12 +8335,20 @@ async fn launch_session(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .awaiting_rediscovery = !activity_enabled_at_launch;
     let activity_capable = provider_supports_agent_activity(&request.provider);
-    if activity_capable && activity_controller.snapshot().enabled {
-        let effective_activity_capabilities = activity_lifecycle
+    // The lifecycle follows this process even while Chat Activity is off, so turning it on
+    // publishes what this process reports, not what an earlier one did.
+    let effective_activity_capabilities = activity_capable.then(|| {
+        activity_lifecycle
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .apply_startup_capabilities(started.activity_capabilities.clone());
-        if let Err(error) = ensure_live_activity_scope(
+            .apply_startup_capabilities(
+                started.activity_capabilities.clone(),
+                driver.startup_activity_capabilities_are_final(),
+            )
+    });
+    if let Some(effective_activity_capabilities) = effective_activity_capabilities
+        && activity_controller.snapshot().enabled
+        && let Err(error) = ensure_live_activity_scope(
             activity,
             &request,
             &activity_lifecycle,
@@ -8223,9 +8356,8 @@ async fn launch_session(
             format!("supervisor:launch-live:{activity_lifecycle_id}"),
         )
         .await
-        {
-            tracing::warn!(%error, "activity scope unavailable; continuing provider session");
-        }
+    {
+        tracing::warn!(%error, "activity scope unavailable; continuing provider session");
     }
     let pending_context_handoff = Arc::new(AtomicBool::new(context_handoff));
     let resume_refusal_recorded = Arc::new(AtomicBool::new(false));
@@ -8237,6 +8369,13 @@ async fn launch_session(
         runtime_payload_with_context_handoff(started.runtime_payload.clone(), context_handoff),
     )
     .await?;
+    // A resumed OpenCode session may hold asks BiBCode never recorded, shown only once its
+    // event stream has read them: queued messages wait for that read to finish (#187).
+    let ask_recovery = (crate::orchestration::EXTERNALLY_RESUMABLE_PROVIDERS
+        .contains(&request.provider.as_str())
+        && request.resume_cursor.is_some()
+        && !resume_lost)
+        .then(|| engine.hold_promotion_for_ask_recovery(&request.thread_id));
     dispatch_session_state(engine, &request, "ready", None, None, None).await?;
     if resume_lost {
         append_context_handoff_activity(engine, &request).await;
@@ -8279,6 +8418,7 @@ async fn launch_session(
         SessionEntry {
             launch: request,
             driver,
+            _ask_recovery: ask_recovery,
             engine: engine.clone(),
             configuration_healthy: true,
             resume_cursor: started.resume_cursor,
@@ -8289,6 +8429,7 @@ async fn launch_session(
             activity_dispatch_tasks: Vec::new(),
             activity_late_dispatch_cancellation,
             activity_late_dispatch_tasks: HashMap::new(),
+            stream_end_closure: None,
             next_activity_late_dispatch_task_id: 0,
             activity_control,
             activity_cancellation,
@@ -9642,10 +9783,18 @@ async fn restart_session(
         activity_dispatch_capacity = Some(entry.activity_dispatch_capacity);
         entry.activity_control.write().await.take();
         cancel_and_reap_activity_tasks(entry).await;
-        entry.driver.shutdown().await?;
+        if let Err(error) = entry.driver.shutdown().await {
+            // The relaunch stops here, but the process that ran this work is being torn down
+            // either way: nothing will report it again (#206).
+            interrupt_ended_session_activity(activity, &entry.launch, entry.driver.as_ref(), None)
+                .await;
+            return Err(error);
+        }
     }
     if let Some(mut entry) = sessions.remove(thread_id) {
         close_publication_and_reap_event_task(&mut entry).await;
+        interrupt_ended_session_activity(activity, &entry.launch, entry.driver.as_ref(), None)
+            .await;
         {
             // The process that ran this work is gone.
             let mut lifecycle = entry
@@ -9829,6 +9978,20 @@ fn selection_effort(options: &[Value]) -> Option<String> {
         .find_map(|id| selection_string_option_from(options, id))
 }
 
+/// How often, and how far apart, the event pump tries again to record an ask a resumed session
+/// recovered before it gives up and keeps the session's queue held (#187).
+const RECOVERED_ASK_ATTEMPTS: usize = 8;
+const RECOVERED_ASK_RETRY_FIRST: Duration = Duration::from_millis(100);
+const RECOVERED_ASK_RETRY_LONGEST: Duration = Duration::from_secs(2);
+
+/// An ask a provider shows again after a resume (OpenCode's `recovered` asks).
+fn is_recovered_ask(event: &ProviderEvent) -> bool {
+    matches!(
+        event.event_type.as_str(),
+        "request.opened" | "user-input.requested"
+    ) && event.payload.get("recovered") == Some(&Value::Bool(true))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_event_pump(
     engine: OrchestrationEngine,
@@ -9871,6 +10034,8 @@ fn spawn_event_pump(
         };
         let mut last_exit_reason: Option<String> = None;
         let mut reasoning = ReasoningCoalescer::default();
+        // An ask the resumed session recovered could not be recorded (#187).
+        let mut recovered_ask_unprojected = false;
         let settled_tx = loop {
             let reasoning_due = reasoning.next_deadline();
             tokio::select! {
@@ -10112,6 +10277,21 @@ fn spawn_event_pump(
                         .then(|| idle_generation.fetch_add(1, Ordering::Relaxed) + 1);
                     let completed = event.event_type == "turn.completed"
                         && event.payload.get("state").and_then(Value::as_str) != Some("failed");
+                    // A resumed session's first ask read finished: its queued messages may go,
+                    // unless an ask it recovered could not be recorded, which keeps them held
+                    // until the session ends (#187).
+                    if event.event_type == "requests.recovery-read" {
+                        if recovered_ask_unprojected {
+                            tracing::warn!(
+                                thread_id = %launch.thread_id,
+                                "a recovered ask could not be recorded; its queued messages stay held"
+                            );
+                        } else {
+                            engine.release_promotion_after_ask_recovery(&launch.thread_id);
+                        }
+                        continue;
+                    }
+                    let recovered_ask = is_recovered_ask(&event).then(|| event.clone());
                     let mut core_publication = publication.lock().await;
                     if core_publication.closed || cancellation.is_cancelled() {
                         return;
@@ -10132,6 +10312,53 @@ fn spawn_event_pump(
                         core_publication.after_terminal_session.as_ref(),
                     ).await;
                     drop(core_publication);
+                    // An ask a resumed session recovered holds its queue only once recorded: one
+                    // that failed is projected again, in order, with a bounded backoff (#187).
+                    let projection = match (projection, recovered_ask) {
+                        (Err(error), Some(ask)) => {
+                            tracing::warn!(%error, "failed to record a recovered provider ask; retrying");
+                            let mut delay = RECOVERED_ASK_RETRY_FIRST;
+                            let mut outcome = Err(error);
+                            for _ in 1..RECOVERED_ASK_ATTEMPTS {
+                                if matches!(outcome, Err(ProviderRuntimeError::Orchestration(_)))
+                                    && provider_thread_was_deleted(&engine.repositories(), &launch.thread_id).await
+                                {
+                                    return;
+                                }
+                                tokio::select! {
+                                    biased;
+                                    () = cancellation.cancelled() => return,
+                                    () = tokio::time::sleep(delay) => {}
+                                }
+                                delay = delay.saturating_mul(2).min(RECOVERED_ASK_RETRY_LONGEST);
+                                let core_publication = publication.lock().await;
+                                if core_publication.closed || cancellation.is_cancelled() {
+                                    return;
+                                }
+                                outcome = project_provider_event(
+                                    &engine,
+                                    &launch,
+                                    resume_cursor.clone(),
+                                    runtime_payload_with_context_handoff(
+                                        runtime_payload.clone(),
+                                        pending_context_handoff.load(Ordering::Acquire),
+                                    ),
+                                    ask.clone(),
+                                    #[cfg(test)]
+                                    core_publication.after_terminal_session.as_ref(),
+                                ).await;
+                                drop(core_publication);
+                                if outcome.is_ok() {
+                                    break;
+                                }
+                            }
+                            if outcome.is_err() {
+                                recovered_ask_unprojected = true;
+                            }
+                            outcome
+                        }
+                        (projection, _) => projection,
+                    };
                     if let Err(error) = projection {
                         if matches!(error, ProviderRuntimeError::Orchestration(_))
                             && provider_thread_was_deleted(&engine.repositories(), &launch.thread_id)
@@ -10854,6 +11081,39 @@ async fn project_provider_event(
             .await
             .map_err(|error| ProviderRuntimeError::Persistence(error.to_string()))?
     {
+        return Ok(());
+    }
+    // A provider that keeps its asks across restarts (OpenCode) read its pending lists in full:
+    // a request BiBCode still shows that they no longer hold cannot be answered (#187).
+    if event.event_type == "requests.listed" {
+        let Some(listed) = event
+            .payload
+            .get("requestIds")
+            .and_then(Value::as_array)
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect::<HashSet<_>>()
+            })
+        else {
+            return Ok(());
+        };
+        let expired = engine
+            .expire_requests_unlisted_by_provider(
+                &launch.thread_id,
+                &listed,
+                &Uuid::new_v4().to_string(),
+            )
+            .await
+            .map_err(|error| ProviderRuntimeError::Persistence(error.to_string()))?;
+        if expired > 0 {
+            tracing::info!(
+                thread_id = %launch.thread_id,
+                expired,
+                "expired requests the provider no longer lists"
+            );
+        }
         return Ok(());
     }
     let assistant_message_id = assistant_message_id(&event);
@@ -12187,6 +12447,8 @@ async fn detach_session(
         "provider-session-detach",
     )
     .await;
+    // Before the lifecycle reads the projection, so it counts nothing live.
+    interrupt_ended_session_activity(activity, &entry.launch, entry.driver.as_ref(), None).await;
     synchronize_activity_lifecycle(activity, &entry.launch.thread_id, &entry.activity_lifecycle)
         .await;
     compensate_cancelled_activity(
@@ -12260,6 +12522,67 @@ async fn shutdown_sessions(
         }
     }
     first_error.map_or(Ok(()), Err)
+}
+
+/// What a closed record's summary says when its provider session ended (#206).
+pub(crate) fn provider_session_interruption(provider: &str) -> ActivityInterruption {
+    ActivityInterruption::new(match provider {
+        "claude" | "claudeAgent" => "Claude session ended before this",
+        "codex" => "Codex session ended before this",
+        "opencode" => "OpenCode session ended before this",
+        _ => "The provider session ended before this",
+    })
+}
+
+/// The process that ran this session's subagents and background work is gone: nothing will
+/// report them again, so their records close as `interrupted` (#206). Runs after the session's
+/// activity tasks stopped, or after its stream ended; an older report still in flight is fenced
+/// by the closure time, while a real terminal report still wins. A server the user runs keeps
+/// its work going, so its records stay as they are.
+async fn interrupt_ended_session_activity(
+    activity: &ActivityProjection,
+    launch: &ProviderLaunchRequest,
+    driver: &dyn ProviderDriver,
+    reported_until: Option<String>,
+) {
+    if !driver.owns_native_work() {
+        return;
+    }
+    let mut interruption = provider_session_interruption(&launch.provider);
+    interruption.reported_until = reported_until;
+    match activity
+        .interrupt_unresolved_scope(&format!("thread:{}", launch.thread_id), interruption)
+        .await
+    {
+        Ok(deltas) => {
+            let closed = deltas
+                .iter()
+                .flat_map(|delta| &delta.changes)
+                .filter(|change| {
+                    matches!(
+                        change,
+                        ActivityChange::ActorUpserted { .. }
+                            | ActivityChange::WorkItemUpserted { .. }
+                    )
+                })
+                .count();
+            if closed > 0 {
+                tracing::info!(
+                    provider = %launch.provider,
+                    thread_id = %launch.thread_id,
+                    closed,
+                    "closed the open activity of an ended provider session"
+                );
+            }
+        }
+        Err(ActivityRepositoryError::NotFound) => {}
+        Err(error) => tracing::warn!(
+            %error,
+            provider = %launch.provider,
+            thread_id = %launch.thread_id,
+            "failed to close the open activity of an ended provider session"
+        ),
+    }
 }
 
 async fn compensate_cancelled_activity(
@@ -12549,6 +12872,21 @@ async fn spawn_child(
     spawn_child_after_spawn(request, args, pipe_output, attribution, |_| async {}).await
 }
 
+/// The environment a provider launch adds to the server's: the request's variables, then the
+/// open-url session's, whose `PATH` prefixes the request's. The executable is resolved on its
+/// `PATH`, so a probe that must find the same executable derives its environment here too.
+fn provider_launch_environment(request: &ProviderLaunchRequest) -> Vec<(OsString, OsString)> {
+    let mut request_environment = Cow::Borrowed(&request.environment);
+    if let Some(open_url) = request.open_url.as_ref() {
+        open_url.apply(request_environment.to_mut());
+    }
+    normalize_provider_environment(
+        request_environment
+            .iter()
+            .map(|(name, value)| (OsStr::new(name), OsStr::new(value))),
+    )
+}
+
 async fn spawn_child_after_spawn<F, Fut>(
     request: &ProviderLaunchRequest,
     args: &[String],
@@ -12561,15 +12899,7 @@ where
     Fut: Future<Output = ()>,
 {
     let provider = request.provider.clone();
-    let mut request_environment = Cow::Borrowed(&request.environment);
-    if let Some(open_url) = request.open_url.as_ref() {
-        open_url.apply(request_environment.to_mut());
-    }
-    let environment = normalize_provider_environment(
-        request_environment
-            .iter()
-            .map(|(name, value)| (OsStr::new(name), OsStr::new(value))),
-    );
+    let environment = provider_launch_environment(request);
     let executable = resolve_provider_executable_with_environment(
         &request.binary_path,
         environment
@@ -13999,9 +14329,14 @@ impl ProviderDriver for OpenCodeDriver {
                 None => self.runtime.start().await,
             }
             .map_err(provider_error("opencode"))?;
+            let process_owner = if self.child.is_some() {
+                PROCESS_OWNER_BIBCODE
+            } else {
+                PROCESS_OWNER_EXTERNAL
+            };
             Ok(StartedSession {
                 resume_cursor: Some(json!({"sessionId":id})),
-                runtime_payload: None,
+                runtime_payload: Some(json!({ PROCESS_OWNER_PAYLOAD_KEY: process_owner })),
                 activity_capabilities: ActivityCapabilities::none(),
             })
         })
@@ -15719,12 +16054,64 @@ pub struct ClaudeActivitySupport {
 /// and one that does not ignores it under `--version` and exits 0.
 const CLAUDE_THINKING_DISPLAY_PROBE_VALUE: &str = "bibcode-probe";
 
+/// Which Claude a probe answer belongs to. The probe runs `resolved`, the path the launch
+/// runs; the identity fields describe its canonical target, `executable`.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct ClaudeProbeCacheKey {
+    resolved: PathBuf,
     executable: PathBuf,
     modified: Option<SystemTime>,
     length: u64,
     file_identity: Option<(u64, u64)>,
+    /// The launch's working directory, only for a shim (see `is_multi_call_shim`): its target
+    /// may pick a different Claude per directory.
+    shim_cwd: Option<PathBuf>,
+}
+
+impl ClaudeProbeCacheKey {
+    fn is_shim(&self) -> bool {
+        self.shim_cwd.is_some()
+    }
+}
+
+/// A link to a binary that is not a Claude install, such as mise's `shims/claude` to
+/// `/usr/bin/mise`. A multi-call binary dispatches on the link's name and on its own
+/// configuration, so its target's identity does not tell which Claude answers. A link to a
+/// Claude install (the native installer's `versions/2.1.312`, npm's `cli.js`, a `claude`
+/// binary) is no shim: an update replaces that target, which changes its identity. Neither is
+/// a link that keeps the name and only renames a directory (`/var` to `/private/var`), since a
+/// multi-call binary dispatches on the name.
+fn is_multi_call_shim(resolved: &Path, canonical: &Path) -> bool {
+    resolved.file_name() != canonical.file_name() && !is_claude_install(canonical)
+}
+
+/// Whether `path` names a Claude Code install by its file name: `claude…` (`claude`,
+/// `claude.exe`), npm's `cli.js`, or the native installer's bare version (`2.1.312`).
+fn is_claude_install(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(OsStr::to_str) else {
+        return false;
+    };
+    let name = name.to_ascii_lowercase();
+    name.starts_with("claude") || name == "cli.js" || is_release_version(&name)
+}
+
+/// `major.minor.patch`, optionally followed by a `-` or `+` suffix.
+fn is_release_version(token: &str) -> bool {
+    let release = token.split(['-', '+']).next().unwrap_or_default();
+    let mut parts = release.split('.');
+    (0..3).all(|_| {
+        parts
+            .next()
+            .is_some_and(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+    }) && parts.next().is_none()
+}
+
+/// What the probe runs Claude with: the launch's environment and working directory, since a
+/// shim can dispatch on either.
+#[derive(Clone, Debug)]
+struct ClaudeProbeContext {
+    environment: Arc<[(OsString, OsString)]>,
+    cwd: PathBuf,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -15757,11 +16144,60 @@ struct ClaudeInFlightProbe {
     receiver: tokio::sync::watch::Receiver<Option<ClaudeProbeOutcome>>,
 }
 
+/// Which launches may share one shim recheck: the recheck runs with the first one's
+/// environment, and an environment can select another Claude behind the same shim.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ClaudeShimRecheckKey {
+    executable: ClaudeProbeCacheKey,
+    environment: u64,
+}
+
+impl ClaudeShimRecheckKey {
+    fn new(executable: &ClaudeProbeCacheKey, environment: &[(OsString, OsString)]) -> Self {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        environment.hash(&mut hasher);
+        Self {
+            executable: executable.clone(),
+            environment: hasher.finish(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ClaudeShimRecheck {
+    id: u64,
+    receiver: tokio::sync::watch::Receiver<Option<Result<Option<String>, String>>>,
+}
+
+/// Removes its recheck's entry however the recheck ends, also when its task panics or is
+/// aborted, so a later launch starts a new recheck instead of waiting on a dead one.
+struct ClaudeShimRecheckGuard {
+    cache: ClaudeActivityProbeCache,
+    key: ClaudeShimRecheckKey,
+    id: u64,
+}
+
+impl Drop for ClaudeShimRecheckGuard {
+    fn drop(&mut self) {
+        let mut cache_state = self.cache.lock();
+        if cache_state
+            .rechecks
+            .get(&self.key)
+            .is_some_and(|recheck| recheck.id == self.id)
+        {
+            cache_state.rechecks.remove(&self.key);
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct ClaudeProbeCacheState {
     ready: HashMap<ClaudeVersionedProbeKey, ClaudeReadyProbe>,
     ready_versions: HashMap<ClaudeProbeCacheKey, String>,
     in_flight: HashMap<ClaudeProbeCacheKey, ClaudeInFlightProbe>,
+    /// Shim `--version` rechecks in progress (see `recheck_claude_shim_version`).
+    rechecks: HashMap<ClaudeShimRecheckKey, ClaudeShimRecheck>,
     next_id: u64,
     tick: u64,
 }
@@ -15858,6 +16294,17 @@ struct ClaudeProbeResult {
     support: ClaudeActivitySupport,
 }
 
+/// Why a probe gave no answer to cache.
+#[derive(Debug)]
+enum ClaudeProbeFailure {
+    /// A command failed, printed nothing, or ran out of time: `<argument> timed out` or
+    /// another reason.
+    Failed(String),
+    /// `--version` printed something other than a Claude Code version: another program
+    /// answered, such as a shim's own binary called by its real name.
+    Mismatch(String),
+}
+
 static CLAUDE_ACTIVITY_PROBE_CACHE: OnceLock<ClaudeActivityProbeCache> = OnceLock::new();
 
 fn production_claude_probe_cache() -> ClaudeActivityProbeCache {
@@ -15866,81 +16313,234 @@ fn production_claude_probe_cache() -> ClaudeActivityProbeCache {
         .clone()
 }
 
-async fn probe_claude_activity_support_with_environment<'a>(
+/// `environment` is the launch's, as `provider_launch_environment` derives it, and `cwd` the
+/// launch's working directory: the probe resolves and runs Claude as the launch will.
+async fn probe_claude_activity_support_with_environment(
     binary_path: &str,
-    environment: impl IntoIterator<Item = (&'a OsStr, &'a OsStr)>,
+    environment: Vec<(OsString, OsString)>,
+    cwd: PathBuf,
     resolution_gate: Option<ClaudeActivityProbeResolutionGate>,
     cache: ClaudeActivityProbeCache,
     launch_policy: ClaudeProbeLaunchPolicy,
 ) -> ClaudeActivitySupport {
     let binary_path = binary_path.to_owned();
-    let search_path = effective_provider_search_path(environment);
+    let search_path = effective_provider_search_path(
+        environment
+            .iter()
+            .map(|(name, value)| (name.as_os_str(), value.as_os_str())),
+    );
+    let context = ClaudeProbeContext {
+        environment: environment.into(),
+        cwd,
+    };
     tokio::spawn(async move {
         let deadline = Instant::now() + CLAUDE_ACTIVITY_PROBE_TIMEOUT;
+        let resolution_path = search_path.clone();
+        let resolution_cwd = context.cwd.clone();
         let resolution = tokio::time::timeout_at(
             deadline,
             tokio::task::spawn_blocking(move || {
                 if let Some(resolution_gate) = resolution_gate {
                     resolution_gate.block();
                 }
-                let resolved =
-                    resolve_provider_executable_in_path(&binary_path, search_path.as_deref())?;
-                let executable = std::fs::canonicalize(&resolved).unwrap_or(resolved);
-                let metadata = std::fs::metadata(&executable).ok()?;
-                #[cfg(unix)]
-                let file_identity = {
-                    use std::os::unix::fs::MetadataExt;
-                    Some((metadata.dev(), metadata.ino()))
-                };
-                #[cfg(not(unix))]
-                let file_identity = None;
-                Some((
-                    ClaudeProbeCacheKey {
-                        executable: executable.clone(),
-                        modified: metadata.modified().ok(),
-                        length: metadata.len(),
-                        file_identity,
-                    },
-                    executable,
-                ))
+                claude_probe_cache_key(&binary_path, resolution_path.as_deref(), resolution_cwd)
             }),
         )
         .await
         .ok()
         .and_then(Result::ok)
         .flatten();
-        let Some((key, executable)) = resolution else {
+        let Some(key) = resolution else {
             return ClaudeActivitySupport::default();
         };
-        probe_resolved_claude_activity_support(key, executable, deadline, cache, launch_policy)
-            .await
+        probe_resolved_claude_activity_support(
+            key,
+            context,
+            search_path,
+            deadline,
+            cache,
+            launch_policy,
+        )
+        .await
     })
     .await
     .unwrap_or_default()
 }
 
+/// Resolves `binary_path` on `search_path` and identifies the Claude a launch in `cwd` runs.
+/// Blocks on the filesystem.
+fn claude_probe_cache_key(
+    binary_path: &str,
+    search_path: Option<&OsStr>,
+    cwd: PathBuf,
+) -> Option<ClaudeProbeCacheKey> {
+    let resolved = resolve_provider_executable_in_path(binary_path, search_path)?;
+    // Only the key uses the canonical target: the probe runs what the launch runs.
+    let canonical = std::fs::canonicalize(&resolved).unwrap_or_else(|_| resolved.clone());
+    let metadata = std::fs::metadata(&canonical).ok()?;
+    #[cfg(unix)]
+    let file_identity = {
+        use std::os::unix::fs::MetadataExt;
+        Some((metadata.dev(), metadata.ino()))
+    };
+    #[cfg(not(unix))]
+    let file_identity = None;
+    let shim_cwd = is_multi_call_shim(&resolved, &canonical).then_some(cwd);
+    Some(ClaudeProbeCacheKey {
+        resolved,
+        executable: canonical,
+        modified: metadata.modified().ok(),
+        length: metadata.len(),
+        file_identity,
+        shim_cwd,
+    })
+}
+
+/// The ready answer for `key` at `version`, marked as just used.
+fn ready_claude_probe(
+    cache_state: &mut ClaudeProbeCacheState,
+    key: &ClaudeProbeCacheKey,
+    version: String,
+) -> Option<ClaudeActivitySupport> {
+    cache_state.tick = cache_state.tick.saturating_add(1);
+    let tick = cache_state.tick;
+    let versioned_key = ClaudeVersionedProbeKey {
+        executable: key.clone(),
+        version,
+    };
+    let ready = cache_state.ready.get_mut(&versioned_key)?;
+    ready.last_used = tick;
+    let support = ready.probe.support;
+    cache_state
+        .ready_versions
+        .insert(key.clone(), versioned_key.version);
+    Some(support)
+}
+
+/// The Claude Code version a shim's `--version` prints now (`None` when the output is not
+/// Claude Code's), or why it gave no answer by `deadline`. Launches of one shim with one
+/// environment share one recheck; it runs on its own, so a launch that stops waiting does not
+/// cancel it. An entry whose task ended without answering is replaced by a new recheck.
+async fn recheck_claude_shim_version(
+    key: &ClaudeProbeCacheKey,
+    context: &ClaudeProbeContext,
+    cache: &ClaudeActivityProbeCache,
+    deadline: Instant,
+    launch_policy: ClaudeProbeLaunchPolicy,
+) -> Result<Option<String>, String> {
+    let recheck_key = ClaudeShimRecheckKey::new(key, &context.environment);
+    let mut receiver = {
+        let mut cache_state = cache.lock();
+        let running = cache_state
+            .rechecks
+            .get(&recheck_key)
+            .filter(|recheck| recheck.receiver.has_changed().is_ok())
+            .map(|recheck| recheck.receiver.clone());
+        if let Some(receiver) = running {
+            receiver
+        } else {
+            let (sender, receiver) = tokio::sync::watch::channel(None);
+            cache_state.next_id = cache_state.next_id.saturating_add(1);
+            let id = cache_state.next_id;
+            cache_state.rechecks.insert(
+                recheck_key.clone(),
+                ClaudeShimRecheck {
+                    id,
+                    receiver: receiver.clone(),
+                },
+            );
+            let guard = ClaudeShimRecheckGuard {
+                cache: cache.clone(),
+                key: recheck_key,
+                id,
+            };
+            let executable = key.resolved.clone();
+            let context = context.clone();
+            tokio::spawn(async move {
+                let result = run_claude_probe_command(
+                    &executable,
+                    "--version",
+                    Instant::now() + CLAUDE_ACTIVITY_PROBE_TIMEOUT,
+                    launch_policy,
+                    &context,
+                )
+                .await
+                .map(|output| claude_code_version(&output).map(str::to_owned));
+                // Later launches start their own recheck; those waiting get this answer.
+                drop(guard);
+                sender.send_replace(Some(result));
+            });
+            receiver
+        }
+    };
+    loop {
+        let answer = receiver.borrow().clone();
+        if let Some(answer) = answer {
+            return answer;
+        }
+        match tokio::time::timeout_at(deadline, receiver.changed()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => return Err("--version recheck ended without an answer".to_owned()),
+            Err(_) => return Err("--version timed out".to_owned()),
+        }
+    }
+}
+
 async fn probe_resolved_claude_activity_support(
     key: ClaudeProbeCacheKey,
-    executable: PathBuf,
+    context: ClaudeProbeContext,
+    search_path: Option<OsString>,
     deadline: Instant,
     cache: ClaudeActivityProbeCache,
     launch_policy: ClaudeProbeLaunchPolicy,
 ) -> ClaudeActivitySupport {
-    let probed_executable = executable.clone();
+    // A shim keeps its identity when the Claude behind it changes, so a cached answer holds
+    // only while `--version` still prints the version it was probed at. A new version runs
+    // the whole probe again. A recheck that gives no answer keeps the cached one: it proves
+    // no change, and launching without the flags would downgrade a working Claude.
+    let cached_version = if key.is_shim() {
+        cache.lock().ready_versions.get(&key).cloned()
+    } else {
+        None
+    };
+    let current_version = match cached_version {
+        None => None,
+        Some(cached_version) => {
+            match recheck_claude_shim_version(&key, &context, &cache, deadline, launch_policy).await
+            {
+                // Output that is not Claude Code's never matches a cached version, so the
+                // whole probe runs and reports the mismatch.
+                Ok(version) => Some(version.unwrap_or_default()),
+                Err(reason) => {
+                    let mut cache_state = cache.lock();
+                    if let Some(support) =
+                        ready_claude_probe(&mut cache_state, &key, cached_version)
+                    {
+                        tracing::warn!(
+                            executable = %redact_path(&key.resolved.to_string_lossy()),
+                            reason = %reason,
+                            "Claude shim did not confirm its probed version; launching with \
+                             the cached activity probe answer"
+                        );
+                        return support;
+                    }
+                    None
+                }
+            }
+        }
+    };
     let mut receiver = {
         let mut cache_state = cache.lock();
-        cache_state.tick = cache_state.tick.saturating_add(1);
-        let tick = cache_state.tick;
-        if let Some(version) = cache_state.ready_versions.get(&key).cloned() {
-            let versioned_key = ClaudeVersionedProbeKey {
-                executable: key.clone(),
-                version,
-            };
-            if let Some(ready) = cache_state.ready.get_mut(&versioned_key) {
-                ready.last_used = tick;
-                return ready.probe.support;
+        let version = current_version
+            .clone()
+            .or_else(|| cache_state.ready_versions.get(&key).cloned());
+        if let Some(version) = version {
+            if let Some(support) = ready_claude_probe(&mut cache_state, &key, version) {
+                return support;
             }
-            cache_state.ready_versions.remove(&key);
+            if current_version.is_none() {
+                cache_state.ready_versions.remove(&key);
+            }
         }
         if let Some(in_flight) = cache_state.in_flight.get(&key) {
             in_flight.receiver.clone()
@@ -15959,16 +16559,25 @@ async fn probe_resolved_claude_activity_support(
                 },
             );
             let producer_cache = cache.clone();
+            let producer_key = key.clone();
+            // Launches that join this probe share its environment and directory: the first
+            // caller's. A shim's key carries the directory, so those agree where it matters.
             tokio::spawn(async move {
                 // Its own budget, not the launching caller's: see CLAUDE_ACTIVITY_PROBE_RUN_TIMEOUT.
                 let started = Instant::now();
                 let result = probe_claude_activity_support_uncached(
-                    &executable,
+                    &producer_key.resolved,
                     started + CLAUDE_ACTIVITY_PROBE_RUN_TIMEOUT,
                     launch_policy,
+                    &context,
                 )
                 .await;
-                log_claude_probe_outcome(&executable, &result, started.elapsed());
+                log_claude_probe_outcome(
+                    &producer_key,
+                    search_path.as_deref(),
+                    &result,
+                    started.elapsed(),
+                );
                 let result = result.ok().map(|result| ClaudeCachedProbe {
                     version: result.version,
                     support: result.support,
@@ -15976,7 +16585,7 @@ async fn probe_resolved_claude_activity_support(
                 let outcome = result
                     .clone()
                     .map_or(ClaudeProbeOutcome::Failed, ClaudeProbeOutcome::Supported);
-                finish_claude_probe(&producer_cache, key, id, result);
+                finish_claude_probe(&producer_cache, producer_key, id, result);
                 sender.send_replace(Some(outcome));
             });
             receiver
@@ -15994,7 +16603,7 @@ async fn probe_resolved_claude_activity_support(
             Ok(Ok(()))
         ) {
             tracing::warn!(
-                executable = %probed_executable.display(),
+                executable = %redact_path(&key.resolved.to_string_lossy()),
                 "launching Claude without activity flags: its activity probe has not finished; \
                  a later launch uses the probe's result"
             );
@@ -16003,19 +16612,42 @@ async fn probe_resolved_claude_activity_support(
     }
 }
 
+/// How much of another program's `--version` output a mismatch line keeps.
+const CLAUDE_PROBE_MISMATCH_LOG_LIMIT: usize = 256;
+
+/// `value` without secrets or the home directory, cut to `limit` bytes. Redaction runs first,
+/// so the cut never splits a secret the redactor would have recognised.
+fn redacted_probe_text(value: &str, limit: usize) -> String {
+    let mut redacted = redact_path(value);
+    let mut end = redacted.len().min(limit);
+    while !redacted.is_char_boundary(end) {
+        end -= 1;
+    }
+    redacted.truncate(end);
+    redacted
+}
+
 /// One line per probe run: what a launch without activity flags needs to explain itself.
+/// Paths are redacted, the search `PATH` included.
 fn log_claude_probe_outcome(
-    executable: &Path,
-    result: &Result<ClaudeProbeResult, String>,
+    key: &ClaudeProbeCacheKey,
+    search_path: Option<&OsStr>,
+    result: &Result<ClaudeProbeResult, ClaudeProbeFailure>,
     elapsed: Duration,
 ) {
     let elapsed_ms = elapsed.as_millis();
+    let executable = redact_path(&key.resolved.to_string_lossy());
+    let canonical = redact_path(&key.executable.to_string_lossy());
+    let search_path =
+        search_path.map_or_else(String::new, |path| redact_path(&path.to_string_lossy()));
     match result {
         Ok(probe) => {
             let supported =
                 probe.support.include_hook_events && probe.support.forward_subagent_text;
             tracing::info!(
-                executable = %executable.display(),
+                executable = %executable,
+                canonical = %canonical,
+                search_path = %search_path,
                 version = %probe.version,
                 elapsed_ms,
                 outcome = if supported { "supported" } else { "unsupported" },
@@ -16025,8 +16657,19 @@ fn log_claude_probe_outcome(
                 "Claude activity probe finished"
             );
         }
-        Err(reason) => tracing::warn!(
-            executable = %executable.display(),
+        Err(ClaudeProbeFailure::Mismatch(version)) => tracing::warn!(
+            executable = %executable,
+            canonical = %canonical,
+            search_path = %search_path,
+            version = %redacted_probe_text(version, CLAUDE_PROBE_MISMATCH_LOG_LIMIT),
+            elapsed_ms,
+            outcome = "mismatch",
+            "Claude activity probe found another program; the next launch probes again"
+        ),
+        Err(ClaudeProbeFailure::Failed(reason)) => tracing::warn!(
+            executable = %executable,
+            canonical = %canonical,
+            search_path = %search_path,
             elapsed_ms,
             outcome = if reason.ends_with("timed out") { "timed out" } else { "failed" },
             reason = %reason,
@@ -16091,16 +16734,47 @@ fn insert_claude_ready_probe(
     }
 }
 
+/// How many lines of `--version` output may precede Claude Code's version: a wrapper can print
+/// a banner first, and the probe appends stderr (Node's `(node:PID)` warnings) after stdout.
+const CLAUDE_VERSION_SCAN_LINES: usize = 5;
+
+/// The Claude Code version `--version` printed: the first of its first lines that reads
+/// `2.1.311 (Claude Code)`, or the bare `2.1.311` older builds print. `None` when no line does,
+/// as for mise's `2026.10.19 linux-x64 (2026-10-19)`: another program answered. The parsed
+/// version, not the raw output, identifies a cached answer, so a changing warning does not.
+fn claude_code_version(output: &str) -> Option<&str> {
+    output
+        .lines()
+        .take(CLAUDE_VERSION_SCAN_LINES)
+        .find_map(|line| {
+            let line = line.trim();
+            let (version, rest) = line
+                .split_once(char::is_whitespace)
+                .map_or((line, ""), |(version, rest)| (version, rest.trim()));
+            (is_release_version(version) && (rest.is_empty() || rest == "(Claude Code)"))
+                .then_some(version)
+        })
+}
+
 /// Fails unless both commands answer: a `--help` that fails or runs out of time says nothing about
-/// the flags, and caching it as "unsupported" would downgrade every later launch.
+/// the flags, and caching it as "unsupported" would downgrade every later launch. Neither may
+/// another program's answer, so a `--version` that is not Claude Code's stops the probe.
 async fn probe_claude_activity_support_uncached(
     executable: &Path,
     deadline: Instant,
     launch_policy: ClaudeProbeLaunchPolicy,
-) -> Result<ClaudeProbeResult, String> {
-    let version =
-        run_claude_probe_command(executable, "--version", deadline, launch_policy).await?;
-    let help = run_claude_probe_command(executable, "--help", deadline, launch_policy).await?;
+    context: &ClaudeProbeContext,
+) -> Result<ClaudeProbeResult, ClaudeProbeFailure> {
+    let output =
+        run_claude_probe_command(executable, "--version", deadline, launch_policy, context)
+            .await
+            .map_err(ClaudeProbeFailure::Failed)?;
+    let Some(version) = claude_code_version(&output).map(str::to_owned) else {
+        return Err(ClaudeProbeFailure::Mismatch(output));
+    };
+    let help = run_claude_probe_command(executable, "--help", deadline, launch_policy, context)
+        .await
+        .map_err(ClaudeProbeFailure::Failed)?;
     let has_exact_flag =
         |expected: &str| help.split_ascii_whitespace().any(|token| token == expected);
     let fork_session_id = crate::provider::claude::model::supports(
@@ -16108,7 +16782,9 @@ async fn probe_claude_activity_support_uncached(
         super::agent_sessions_rpc::COPY_MINIMUM_CLAUDE_VERSION,
     ) && has_exact_flag("--fork-session");
     let thinking_display =
-        probe_claude_thinking_display(executable, deadline, launch_policy).await?;
+        probe_claude_thinking_display(executable, deadline, launch_policy, context)
+            .await
+            .map_err(ClaudeProbeFailure::Failed)?;
     Ok(ClaudeProbeResult {
         version,
         support: ClaudeActivitySupport {
@@ -16130,6 +16806,7 @@ async fn probe_claude_thinking_display(
     executable: &Path,
     deadline: Instant,
     launch_policy: ClaudeProbeLaunchPolicy,
+    context: &ClaudeProbeContext,
 ) -> Result<bool, String> {
     let output = run_claude_probe(
         executable,
@@ -16140,6 +16817,7 @@ async fn probe_claude_thinking_display(
         ],
         deadline,
         launch_policy,
+        context,
     )
     .await?;
     Ok(!output.success
@@ -16155,8 +16833,10 @@ async fn run_claude_probe_command(
     argument: &str,
     deadline: Instant,
     launch_policy: ClaudeProbeLaunchPolicy,
+    context: &ClaudeProbeContext,
 ) -> Result<String, String> {
-    let output = run_claude_probe(executable, &[argument], deadline, launch_policy).await?;
+    let output =
+        run_claude_probe(executable, &[argument], deadline, launch_policy, context).await?;
     if !output.success {
         return Err(format!("{argument} exited with {}", output.status));
     }
@@ -16172,13 +16852,14 @@ struct ClaudeProbeOutput {
     text: String,
 }
 
-/// Runs one supervised probe command and returns its exit status with its trimmed output.
-/// Only a timeout or a failed spawn is an error.
+/// Runs one supervised probe command with the launch's environment and working directory, and
+/// returns its exit status with its trimmed output. Only a timeout or a failed spawn is an error.
 async fn run_claude_probe(
     executable: &Path,
     arguments: &[&str],
     deadline: Instant,
     launch_policy: ClaudeProbeLaunchPolicy,
+    context: &ClaudeProbeContext,
 ) -> Result<ClaudeProbeOutput, String> {
     const CLEANUP_RESERVE: Duration = Duration::from_millis(400);
     let argument = arguments.join(" ");
@@ -16187,9 +16868,11 @@ async fn run_claude_probe(
     let mut command = tokio::process::Command::new(launch.program);
     command
         .args(launch.args)
+        .current_dir(&context.cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    command.envs(context.environment.iter().cloned());
     sanitize_provider_subprocess_environment(&mut command);
     let cancellation = CancellationToken::new();
     let remaining = deadline.saturating_duration_since(Instant::now());
@@ -16546,10 +17229,27 @@ impl ClaudeActivityProbeTestContext {
         )
     }
 
+    /// Probes as a launch with no environment of its own, in the test's working directory.
     pub async fn probe(&self, binary_path: &str) -> ClaudeActivitySupport {
+        let cwd = std::env::current_dir().unwrap_or_default();
+        self.probe_in(binary_path, &BTreeMap::new(), &cwd).await
+    }
+
+    /// Probes as a launch with `environment` and working directory `cwd` would.
+    pub async fn probe_in(
+        &self,
+        binary_path: &str,
+        environment: &BTreeMap<String, String>,
+        cwd: &Path,
+    ) -> ClaudeActivitySupport {
         probe_claude_activity_support_with_environment(
             binary_path,
-            std::iter::empty(),
+            normalize_provider_environment(
+                environment
+                    .iter()
+                    .map(|(name, value)| (OsStr::new(name), OsStr::new(value))),
+            ),
+            cwd.to_path_buf(),
             None,
             self.cache.clone(),
             test_claude_probe_launch_policy(),
@@ -16564,7 +17264,8 @@ impl ClaudeActivityProbeTestContext {
     ) -> ClaudeActivitySupport {
         probe_claude_activity_support_with_environment(
             binary_path,
-            std::iter::empty(),
+            Vec::new(),
+            std::env::current_dir().unwrap_or_default(),
             Some(resolution_gate),
             self.cache.clone(),
             test_claude_probe_launch_policy(),
@@ -16577,15 +17278,49 @@ impl ClaudeActivityProbeTestContext {
         self.cache.lock().ready.len()
     }
 
+    /// Leaves behind the shim recheck a launch like `probe_in`'s would join, as a recheck task
+    /// that panicked or was aborted leaves it: an entry whose sender is gone without answering.
+    pub fn abandon_shim_recheck(
+        &self,
+        binary_path: &str,
+        environment: &BTreeMap<String, String>,
+        cwd: &Path,
+    ) {
+        let environment = normalize_provider_environment(
+            environment
+                .iter()
+                .map(|(name, value)| (OsStr::new(name), OsStr::new(value))),
+        );
+        let search_path = effective_provider_search_path(
+            environment
+                .iter()
+                .map(|(name, value)| (name.as_os_str(), value.as_os_str())),
+        );
+        let key = claude_probe_cache_key(binary_path, search_path.as_deref(), cwd.to_path_buf())
+            .expect("the shim resolves");
+        assert!(key.is_shim(), "only a shim is rechecked");
+        let (sender, receiver) = tokio::sync::watch::channel(None);
+        drop(sender);
+        let mut cache = self.cache.lock();
+        cache.next_id = cache.next_id.saturating_add(1);
+        let id = cache.next_id;
+        cache.rechecks.insert(
+            ClaudeShimRecheckKey::new(&key, &environment),
+            ClaudeShimRecheck { id, receiver },
+        );
+    }
+
     pub fn seed_cache(&self, count: usize) {
         let mut cache = self.cache.lock();
         for index in 0..count {
             let executable = PathBuf::from(format!("/bibcode-test/claude-cache-{index}"));
             let key = ClaudeProbeCacheKey {
+                resolved: executable.clone(),
                 executable,
                 modified: None,
                 length: u64::try_from(index).unwrap_or(u64::MAX),
                 file_identity: None,
+                shim_cwd: None,
             };
             insert_claude_ready_probe(
                 &mut cache,
@@ -16673,12 +17408,12 @@ impl ClaudeDriver {
             .environment
             .entry("CLAUDE_CODE_ENTRYPOINT".to_owned())
             .or_insert_with(|| "sdk-rust".to_owned());
+        // The launch's own environment and directory: `spawn_child` resolves and runs Claude
+        // with them, so the probe answers for the same executable.
         let support = probe_claude_activity_support_with_environment(
             &request.binary_path,
-            request
-                .environment
-                .iter()
-                .map(|(name, value)| (OsStr::new(name), OsStr::new(value))),
+            provider_launch_environment(&request),
+            request.cwd.clone(),
             None,
             probe_cache,
             probe_launch_policy,
@@ -17280,6 +18015,10 @@ impl ProviderDriver for ClaudeDriver {
                 },
             })
         })
+    }
+    /// The hook sink decides: without one this process reports no subagents at all.
+    fn startup_activity_capabilities_are_final(&self) -> bool {
+        true
     }
     fn send(
         &self,
@@ -20571,6 +21310,7 @@ done
 case "$1" in
   --version) printf '%s\n' '2.1.218'; exit 0;;
   --help) printf '%s\n' '--include-hook-events --forward-subagent-text'; exit 0;;
+  --thinking-display) exit 1;;
 esac
 [ -z "$BIBCODE_TEST_READY_FIFO" ] || printf '%s\n' ready > "$BIBCODE_TEST_READY_FIFO"
 while IFS= read -r line; do
@@ -20997,6 +21737,107 @@ done
         }
     }
 
+    #[test]
+    fn claude_probe_reads_only_a_claude_code_version() {
+        for (output, expected) in [
+            ("2.1.311 (Claude Code)", Some("2.1.311")),
+            ("2.1.311", Some("2.1.311")),
+            ("2.2.0-beta.1 (Claude Code)", Some("2.2.0-beta.1")),
+            // Node's warnings on stderr follow stdout and change with the PID, so the version
+            // alone identifies the answer.
+            (
+                "2.1.311 (Claude Code)\n(node:4242) Warning: something deprecated",
+                Some("2.1.311"),
+            ),
+            // A wrapper's banner comes first.
+            (
+                "Using claude from ~/.wrapper\n2.1.311 (Claude Code)",
+                Some("2.1.311"),
+            ),
+            ("1\n2\n3\n4\n5\n2.1.311 (Claude Code)", None),
+            // mise answering by its own name, as a canonicalized shim did (#195).
+            ("2026.10.19 linux-x64 (2026-10-19)", None),
+            ("2026.10.19 macos-arm64 (2026-10-19)", None),
+            ("glab version 1.114.0", None),
+            ("v2.1.311", None),
+            ("2.1", None),
+            ("", None),
+        ] {
+            assert_eq!(super::claude_code_version(output), expected, "{output:?}");
+        }
+    }
+
+    #[test]
+    fn only_a_link_to_another_program_is_a_claude_shim() {
+        use std::path::Path;
+        for (resolved, canonical, expected) in [
+            // mise: the shim dispatches to a Claude its configuration picks.
+            (
+                "/home/u/.local/share/mise/shims/claude",
+                "/usr/bin/mise",
+                true,
+            ),
+            // The native installer: an update links a new version.
+            (
+                "/home/u/.local/bin/claude",
+                "/home/u/.local/share/claude/versions/2.1.312",
+                false,
+            ),
+            // npm: the package's entry point.
+            (
+                "/usr/local/bin/claude",
+                "/usr/local/lib/node_modules/@anthropic-ai/claude-code/cli.js",
+                false,
+            ),
+            // Homebrew's cask, and a Windows install.
+            (
+                "/opt/homebrew/bin/claude",
+                "/opt/homebrew/Caskroom/claude-code/2.1.312/claude",
+                false,
+            ),
+            ("C:/Users/u/bin/claude.cmd", "C:/Tools/Claude.exe", false),
+            // A plain binary, and a link that only renames a directory.
+            ("/usr/local/bin/claude", "/usr/local/bin/claude", false),
+            ("/var/tmp/tool", "/private/var/tmp/tool", false),
+        ] {
+            assert_eq!(
+                super::is_multi_call_shim(Path::new(resolved), Path::new(canonical)),
+                expected,
+                "{resolved} -> {canonical}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_final_startup_none_replaces_capabilities_observed_at_runtime() {
+        let live = crate::activity::ActivityCapabilities {
+            actors: true,
+            attributed_activity: true,
+            ..crate::activity::ActivityCapabilities::none()
+        };
+        for (startup_is_final, expected) in [
+            (true, crate::activity::ActivityCapabilities::none()),
+            (false, live.clone()),
+        ] {
+            let mut lifecycle = super::ProviderActivityLifecycleState::new(live.clone());
+            lifecycle.observe_projected_batch(
+                &[super::ProviderActivityMutation::SetScope {
+                    capabilities: live.clone(),
+                    observation_state: crate::activity::ActivityObservationState::Live,
+                }],
+                &[],
+            );
+            assert_eq!(
+                lifecycle.apply_startup_capabilities(
+                    crate::activity::ActivityCapabilities::none(),
+                    startup_is_final,
+                ),
+                expected,
+                "final: {startup_is_final}"
+            );
+        }
+    }
+
     /// Which transcript exists decides how a Claude cursor launches (see `ClaudeLaunch`).
     #[test]
     fn claude_launches_follow_which_transcript_exists() {
@@ -21215,7 +22056,7 @@ done
     #[cfg(unix)]
     #[tokio::test]
     async fn a_copy_needs_a_probed_claude_code_that_takes_its_session_id() {
-        const OLD_FIXTURE: &str = "#!/bin/sh\ncase \"$1\" in\n  --version) printf '%s\\n' '2.0.72 (Claude Code)'; exit 0;;\n  --help) printf '%s\\n' '--fork-session --session-id'; exit 0;;\nesac\nprintf '%s\\n' \"$@\" > \"$BIBCODE_TEST_ARGUMENTS\"\ncat >/dev/null\n";
+        const OLD_FIXTURE: &str = "#!/bin/sh\ncase \"$1\" in\n  --version) printf '%s\\n' '2.0.72 (Claude Code)'; exit 0;;\n  --help) printf '%s\\n' '--fork-session --session-id'; exit 0;;\n  --thinking-display) exit 1;;\nesac\nprintf '%s\\n' \"$@\" > \"$BIBCODE_TEST_ARGUMENTS\"\ncat >/dev/null\n";
         const UNPROBED_FIXTURE: &str = "#!/bin/sh\ncase \"$1\" in\n  --version) exit 1;;\n  --help) printf '%s\\n' '--fork-session --session-id'; exit 0;;\nesac\nprintf '%s\\n' \"$@\" > \"$BIBCODE_TEST_ARGUMENTS\"\ncat >/dev/null\n";
         let copy = json!({"sessionId":"copy","forkedFrom":"source"});
         for (fixture, expected) in [
@@ -25548,6 +26389,240 @@ done
     }
 
     #[tokio::test]
+    async fn a_resumed_opencode_launch_holds_promotion_until_its_first_ask_read_finishes() {
+        // Mutation caught: a resumed OpenCode session's queue promoted before its first read of
+        // the asks OpenCode kept, or a hold left on a fresh start (#187).
+        // The fixture driver always resumes `unit-session`.
+        let resumed = || Some(json!({"threadId":"unit-session"}));
+        for (provider, resume, held) in [
+            ("opencode", resumed(), true),
+            ("opencode", None, false),
+            ("opencode", Some(json!({"threadId":"lost-session"})), false),
+            ("codex", resumed(), false),
+        ] {
+            let engine = supervisor_engine().await;
+            let (events_tx, events_rx) = mpsc::channel(4);
+            let supervisor = super::ProviderRuntimeSupervisor::start(
+                engine.clone(),
+                Arc::new(SupervisorFactory {
+                    state: Arc::new(StdMutex::new(SupervisorDriverState::default())),
+                    events: StdMutex::new(Some(events_rx)),
+                }),
+                super::ActivityProjection::new(ActivityRepository::new(
+                    engine.repositories().database().clone(),
+                )),
+                super::SupervisorOptions::default(),
+            );
+            let temp = TempDir::new().expect("launch directory");
+            let mut launch = native_launch(&temp, provider);
+            launch.thread_id = "t1".to_owned();
+            let label = format!("{provider} {resume:?}");
+            launch.resume_cursor = resume;
+            supervisor.launch(launch).await.expect("launch runtime");
+            assert_eq!(
+                engine.promotion_held_for_ask_recovery("t1"),
+                held,
+                "{label}"
+            );
+            events_tx
+                .send(super::ProviderEvent {
+                    native_event_id: None,
+                    event_type: "requests.recovery-read".to_owned(),
+                    thread_id: "t1".to_owned(),
+                    turn_id: None,
+                    item_id: None,
+                    request_id: None,
+                    payload: json!({}),
+                    activity: Vec::new(),
+                    activity_controls: super::ProviderActivityControls::default(),
+                })
+                .await
+                .expect("recovery read event");
+            timeout(Duration::from_secs(2), async {
+                while engine.promotion_held_for_ask_recovery("t1") {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{label}: the finished read releases the queue"));
+            engine.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_recovered_ask_that_fails_to_record_keeps_the_queue_held_until_it_is_recorded() {
+        // Mutation caught: a recovered ask whose projection failed is skipped, and the finished
+        // ask read then releases a queued follow-up past it (#187).
+        let engine = supervisor_engine().await;
+        let database = engine.repositories().database().clone();
+        // Recording an approval fails while the switch holds a row, as a transient error would.
+        database
+            .call(|connection| {
+                connection.execute_batch(
+                    "CREATE TABLE refuse_approvals (x);
+                     INSERT INTO refuse_approvals VALUES (1);
+                     CREATE TRIGGER refuse_approvals BEFORE INSERT ON projection_pending_approvals
+                     WHEN EXISTS (SELECT 1 FROM refuse_approvals)
+                     BEGIN SELECT RAISE(ABORT, 'injected approval failure'); END;",
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("refuse approvals");
+        let (events_tx, events_rx) = mpsc::channel(4);
+        let supervisor = super::ProviderRuntimeSupervisor::start(
+            engine.clone(),
+            Arc::new(SupervisorFactory {
+                state: Arc::new(StdMutex::new(SupervisorDriverState::default())),
+                events: StdMutex::new(Some(events_rx)),
+            }),
+            super::ActivityProjection::new(ActivityRepository::new(database.clone())),
+            super::SupervisorOptions::default(),
+        );
+        let temp = TempDir::new().expect("launch directory");
+        let mut launch = native_launch(&temp, "opencode");
+        launch.thread_id = "t1".to_owned();
+        launch.resume_cursor = Some(json!({"threadId":"unit-session"}));
+        supervisor.launch(launch).await.expect("launch runtime");
+        assert!(engine.promotion_held_for_ask_recovery("t1"));
+        let event =
+            |event_type: &str, request_id: Option<&str>, payload: Value| super::ProviderEvent {
+                native_event_id: None,
+                event_type: event_type.to_owned(),
+                thread_id: "t1".to_owned(),
+                turn_id: None,
+                item_id: None,
+                request_id: request_id.map(str::to_owned),
+                payload,
+                activity: Vec::new(),
+                activity_controls: super::ProviderActivityControls::default(),
+            };
+        events_tx
+            .send(event(
+                "request.opened",
+                Some("per_recovered"),
+                json!({"requestType":"exec_command_approval","detail":"ls","recovered":true}),
+            ))
+            .await
+            .expect("recovered ask");
+        events_tx
+            .send(event("requests.recovery-read", None, json!({})))
+            .await
+            .expect("recovery read");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(
+            engine.promotion_held_for_ask_recovery("t1"),
+            "the queue stays held while the recovered ask is not recorded"
+        );
+
+        // The write succeeds again: the retry records the ask, then the read releases.
+        database
+            .call(|connection| {
+                connection.execute_batch("DELETE FROM refuse_approvals;")?;
+                Ok(())
+            })
+            .await
+            .expect("allow approvals");
+        timeout(Duration::from_secs(10), async {
+            while engine.promotion_held_for_ask_recovery("t1") {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the recorded ask lets the finished read release the queue");
+        let thread = engine
+            .repositories()
+            .get_thread("t1".to_owned())
+            .await
+            .expect("read thread")
+            .expect("thread");
+        assert_eq!(thread.pending_approval_count, 1);
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_completed_listing_expires_only_the_requests_the_provider_no_longer_holds() {
+        // Mutation caught: a resume's listing leaving an ask OpenCode dropped open forever, or
+        // expiring one it still holds (#187).
+        let engine = supervisor_engine().await;
+        let (events_tx, events_rx) = mpsc::channel(4);
+        let supervisor = super::ProviderRuntimeSupervisor::start(
+            engine.clone(),
+            Arc::new(SupervisorFactory {
+                state: Arc::new(StdMutex::new(SupervisorDriverState::default())),
+                events: StdMutex::new(Some(events_rx)),
+            }),
+            super::ActivityProjection::new(ActivityRepository::new(
+                engine.repositories().database().clone(),
+            )),
+            super::SupervisorOptions::default(),
+        );
+        let temp = TempDir::new().expect("launch directory");
+        let mut launch = native_launch(&temp, "opencode");
+        launch.thread_id = "t1".to_owned();
+        supervisor.launch(launch).await.expect("launch runtime");
+        for (kind, request_id) in [
+            ("approval.requested", "per_kept"),
+            ("approval.requested", "per_gone"),
+            ("user-input.requested", "que_gone"),
+        ] {
+            engine
+                .dispatch(OrchestrationCommand::ThreadActivityAppend {
+                    command_id: format!("ask-{request_id}"),
+                    thread_id: "t1".to_owned(),
+                    activity: super::ActivityInput {
+                        id: format!("ask-{request_id}"),
+                        tone: "approval".to_owned(),
+                        kind: kind.to_owned(),
+                        summary: "Ask".to_owned(),
+                        payload: json!({"requestId":request_id,"questions":[]}),
+                        turn_id: None,
+                        sequence: None,
+                        created_at: "2026-10-27T12:00:00Z".to_owned(),
+                    },
+                    created_at: "2026-10-27T12:00:00Z".to_owned(),
+                })
+                .await
+                .expect("ask");
+        }
+        let counts = || async {
+            let thread = engine
+                .repositories()
+                .get_thread("t1".to_owned())
+                .await
+                .expect("read thread")
+                .expect("thread");
+            (
+                thread.pending_approval_count,
+                thread.pending_user_input_count,
+            )
+        };
+        assert_eq!(counts().await, (2, 1));
+        events_tx
+            .send(super::ProviderEvent {
+                native_event_id: None,
+                event_type: "requests.listed".to_owned(),
+                thread_id: "t1".to_owned(),
+                turn_id: None,
+                item_id: None,
+                request_id: None,
+                payload: json!({"requestIds":["per_kept","per_elsewhere"]}),
+                activity: Vec::new(),
+                activity_controls: super::ProviderActivityControls::default(),
+            })
+            .await
+            .expect("listing event");
+        timeout(Duration::from_secs(2), async {
+            while counts().await != (1, 0) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the unlisted requests expire and the listed one stays");
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn claude_targeted_unsupported_clears_the_current_overlay_before_returning() {
         // Mutation caught: leaving sibling targets available or issuing another provider call after downgrade.
         let engine = supervisor_engine().await;
@@ -28188,6 +29263,55 @@ done
             self.supervisor.shutdown().await.unwrap();
             self.engine.shutdown().await;
         }
+
+        async fn thread_activity(&self) -> crate::activity::ActivitySnapshot {
+            self.activity
+                .snapshot(&crate::activity::ActivityScopeRef::Thread {
+                    thread_id: "t1".to_owned(),
+                })
+                .await
+                .expect("thread activity snapshot")
+        }
+
+        /// The open subagent closed because its process is gone (#206): `interrupted` at one
+        /// closure time, with why in its summary, and nothing left active.
+        async fn assert_subagent_interrupted_by_session_end(&self) {
+            let snapshot = self.thread_activity().await;
+            let actor = snapshot
+                .actors
+                .iter()
+                .find(|actor| actor.id == "actor:sub")
+                .expect("subagent record");
+            assert_eq!(
+                actor.status,
+                crate::activity::ActivityLifecycle::Interrupted
+            );
+            assert_eq!(Some(&actor.updated_at), actor.terminal_at.as_ref());
+            assert!(
+                actor.summary.as_deref().is_some_and(|summary| summary
+                    .starts_with("Codex session ended before this subagent reported;")),
+                "{:?}",
+                actor.summary
+            );
+            assert_eq!(snapshot.counts.subagents.active, 0);
+            assert_eq!(snapshot.counts.subagents.done, 1);
+        }
+
+        /// Waits until the open subagent reads `interrupted`, without driving any turn.
+        async fn wait_for_subagent_interrupted(&self) {
+            // The idle clock stays paused, so this yields instead of sleeping.
+            for _ in 0..5_000 {
+                let snapshot = self.thread_activity().await;
+                if snapshot.actors.iter().any(|actor| {
+                    actor.id == "actor:sub"
+                        && actor.status == crate::activity::ActivityLifecycle::Interrupted
+                }) {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+            panic!("the subagent of an ended stream never closed");
+        }
     }
 
     #[test]
@@ -28485,7 +29609,184 @@ done
             )
             .await;
         fixture.assert_suspended_after_timeout(3).await;
+        // Suspension ended the process that ran it (#206), and the scope is live again
+        // without it.
+        fixture.assert_subagent_interrupted_by_session_end().await;
+        assert_eq!(
+            fixture.thread_activity().await.observation_state,
+            crate::activity::ActivityObservationState::Live
+        );
         fixture.close().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutting_down_interrupts_an_open_subagent_and_republishes_the_scope_without_it() {
+        let _clock = keep_idle_clock_paused();
+        let mut fixture = IdleDeadlineFixture::new(BUSY_SESSION_IDLE_TIMEOUT).await;
+        fixture.complete_first_turn_with_actor("running").await;
+        let mut published = fixture.activity.subscribe();
+        // As an app update's quiesce does.
+        fixture.supervisor.shutdown().await.unwrap();
+        fixture.assert_subagent_interrupted_by_session_end().await;
+        let snapshot = fixture.thread_activity().await;
+        assert_eq!(
+            snapshot.observation_state,
+            crate::activity::ActivityObservationState::Live
+        );
+        let mut delivered_interruption = false;
+        while let Ok(event) = published.try_recv() {
+            if let crate::activity::ActivityProjectionEvent::Delta(delta) = event {
+                delivered_interruption |= delta.changes.iter().any(|change| {
+                    matches!(
+                        change,
+                        crate::activity::ActivityChange::ActorUpserted { actor }
+                            if actor.status == crate::activity::ActivityLifecycle::Interrupted
+                    )
+                });
+            }
+        }
+        assert!(
+            delivered_interruption,
+            "subscribers receive the interruption"
+        );
+        fixture.engine.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stream_that_ends_by_itself_interrupts_its_open_subagent_without_another_turn() {
+        let _clock = keep_idle_clock_paused();
+        let mut fixture = IdleDeadlineFixture::new(BUSY_SESSION_IDLE_TIMEOUT).await;
+        fixture.complete_first_turn_with_actor("running").await;
+        // The provider process died: its event stream ends and no turn follows.
+        let (ended, _) = mpsc::channel(1);
+        drop(std::mem::replace(&mut fixture.events, ended));
+        fixture.wait_for_subagent_interrupted().await;
+        fixture.assert_subagent_interrupted_by_session_end().await;
+        fixture.close().await;
+    }
+
+    /// A closure can race a live Codex session that reports the same child again, as a resume
+    /// does (#206). A report newer than the closure reopens the record, and Activity and the
+    /// thread's own status both say the provider is up; when that session stops, both say it is
+    /// not, and the record closes again.
+    #[tokio::test(start_paused = true)]
+    async fn a_live_codex_report_after_a_closure_reopens_the_child_and_status_agrees() {
+        let _clock = keep_idle_clock_paused();
+        let mut fixture = IdleDeadlineFixture::new(BUSY_SESSION_IDLE_TIMEOUT).await;
+        fixture.complete_first_turn_with_actor("running").await;
+        fixture
+            .activity
+            .interrupt_unresolved_scope("thread:t1", super::provider_session_interruption("codex"))
+            .await
+            .unwrap();
+        let closed = fixture.thread_activity().await;
+        assert_eq!(closed.counts.subagents.active, 0);
+        let closed_at = closed.actors[0].updated_at.clone();
+
+        let ProviderActivityMutation::UpsertActor(mut reported) =
+            ProviderActivityMutation::upsert_actor("actor:sub", None, "Sub", "running").unwrap()
+        else {
+            unreachable!("upsert_actor builds an actor upsert");
+        };
+        reported.started_at.clone_from(&closed.actors[0].started_at);
+        reported.updated_at = closed_at;
+        fixture
+            .emit_activity_batch(
+                "codex-resume-report",
+                vec![ProviderActivityMutation::UpsertActor(reported)],
+            )
+            .await;
+        let reopened = fixture.thread_activity().await;
+        assert_eq!(
+            reopened.actors[0].status,
+            crate::activity::ActivityLifecycle::Running
+        );
+        assert_eq!(reopened.counts.subagents.active, 1);
+        fixture
+            .assert_live("Activity reports a running child while the provider session is up")
+            .await;
+        // What the left panel's agent status reads (#187): the session settled its turn and the
+        // provider last showed progress during it.
+        let thread_status = |fixture: &IdleDeadlineFixture| {
+            let repositories = fixture.engine.repositories();
+            async move {
+                let session = repositories
+                    .get_thread_session("t1".to_owned())
+                    .await
+                    .unwrap()
+                    .expect("projected session");
+                let thread = repositories
+                    .get_thread("t1".to_owned())
+                    .await
+                    .unwrap()
+                    .expect("projected thread");
+                (
+                    session.status,
+                    session.active_turn_id,
+                    thread.last_activity_at,
+                )
+            }
+        };
+        let (live_status, live_turn, live_progress) = thread_status(&fixture).await;
+        assert!(
+            !matches!(live_status.as_str(), "running" | "starting"),
+            "{live_status}"
+        );
+        assert_eq!(live_turn, None);
+        assert!(
+            live_progress.is_some(),
+            "the turn recorded provider progress"
+        );
+
+        let identity = fixture
+            .supervisor
+            .capture_session_identity("t1")
+            .await
+            .unwrap()
+            .expect("live session");
+        fixture
+            .supervisor
+            .stop_session_if_current(identity)
+            .await
+            .unwrap();
+        assert!(
+            fixture
+                .supervisor
+                .capture_session_identity("t1")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let stopped = fixture.thread_activity().await;
+        assert_eq!(
+            stopped.actors[0].status,
+            crate::activity::ActivityLifecycle::Interrupted
+        );
+        assert_eq!(stopped.counts.subagents.active, 0);
+        // The stop neither reads as Working nor as new provider progress.
+        let (stopped_status, stopped_turn, stopped_progress) = thread_status(&fixture).await;
+        assert!(
+            !matches!(stopped_status.as_str(), "running" | "starting"),
+            "{stopped_status}"
+        );
+        assert_eq!(stopped_turn, None);
+        assert_eq!(stopped_progress, live_progress);
+        fixture.close().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_server_the_user_runs_keeps_its_open_subagent_when_the_session_ends() {
+        let _clock = keep_idle_clock_paused();
+        let mut fixture = IdleDeadlineFixture::new(BUSY_SESSION_IDLE_TIMEOUT).await;
+        fixture.state.lock().unwrap().externally_owned = true;
+        fixture.complete_first_turn_with_actor("running").await;
+        fixture.supervisor.shutdown().await.unwrap();
+        let snapshot = fixture.thread_activity().await;
+        assert_eq!(
+            snapshot.actors[0].status,
+            crate::activity::ActivityLifecycle::Running
+        );
+        fixture.engine.shutdown().await;
     }
 
     #[tokio::test(start_paused = true)]
@@ -30944,6 +32245,156 @@ done
         }
     }
 
+    /// Hands the supervisor one prepared driver.
+    struct PreparedDriverFactory(StdMutex<Option<Arc<dyn ProviderDriver>>>);
+
+    impl ProviderDriverFactory for PreparedDriverFactory {
+        fn create(
+            &self,
+            _request: super::ProviderLaunchRequest,
+        ) -> super::BoxRuntimeFuture<'_, Result<Arc<dyn ProviderDriver>, super::ProviderRuntimeError>>
+        {
+            let driver = self.0.lock().unwrap().take().expect("one prepared driver");
+            Box::pin(async move { Ok(driver) })
+        }
+    }
+
+    /// A started OpenCode session records who runs its server, and a server start closes the
+    /// open subagent of a server BiBCode ran but leaves one the user runs to its own resume
+    /// (#206). The flag comes from the driver's own start, never from the test.
+    #[tokio::test]
+    async fn opencode_records_who_runs_its_server_and_startup_closes_only_bibcode_owned_work() {
+        for owned in [true, false] {
+            let app = Router::new()
+                .route(
+                    "/global/health",
+                    get(|| async { Json(json!({"healthy":true,"version":"1.18.32"})) }),
+                )
+                .route(
+                    "/session",
+                    post(|| async { Json(json!({"id":"owner-opencode-session"})) }),
+                )
+                // The event stream stays open, so no stream end closes anything: only the
+                // startup pass under test can.
+                .route(
+                    "/event",
+                    get(|| async {
+                        axum::body::Body::from_stream(futures_util::stream::pending::<
+                            Result<axum::body::Bytes, std::io::Error>,
+                        >())
+                    }),
+                );
+            let (endpoint, server) = crate::provider::opencode::server_fixtures::serve(app).await;
+            let temp = TempDir::new().expect("OpenCode fixture directory");
+            let factory = super::NativeProviderDriverFactory::new(
+                temp.path().join("state").join("attachments"),
+            );
+            let mut request = native_launch(&temp, "opencode");
+            request.thread_id = "t1".to_owned();
+            request.endpoint = Some(endpoint);
+            let mut driver = super::OpenCodeDriver::spawn(
+                request.clone(),
+                factory.attachments.clone(),
+                factory.attribution.clone(),
+                true,
+            )
+            .await
+            .expect("OpenCode driver");
+            // A server BiBCode spawned is its child; the fixture stands in for that server.
+            let child = owned.then(opencode_endpoint_child);
+            driver.child.clone_from(&child);
+            let engine = supervisor_engine().await;
+            let activity = super::ActivityProjection::new(
+                crate::activity::ActivityRepository::new(engine.repositories().database().clone()),
+            );
+            let supervisor = super::ProviderRuntimeSupervisor::start(
+                engine.clone(),
+                Arc::new(PreparedDriverFactory(StdMutex::new(Some(
+                    Arc::new(driver) as Arc<dyn ProviderDriver>
+                )))),
+                activity.clone(),
+                super::SupervisorOptions::default(),
+            );
+            supervisor.launch(request).await.expect("OpenCode launch");
+
+            let row = engine
+                .repositories()
+                .get_provider_session_runtime("t1".to_owned())
+                .await
+                .unwrap()
+                .expect("persisted runtime row");
+            let expected_owner = if owned { "bibcode" } else { "external" };
+            assert_eq!(
+                row.runtime_payload
+                    .as_ref()
+                    .and_then(|payload| payload.get(super::PROCESS_OWNER_PAYLOAD_KEY))
+                    .and_then(Value::as_str),
+                Some(expected_owner)
+            );
+
+            // The provider reported a subagent, which was still open when the previous server
+            // stopped; then a server start.
+            let mut reported = super::activity_scope_mutations(
+                &crate::activity::ActivityCapabilities::structured_full(false),
+                crate::activity::ActivityObservationState::Live,
+                super::RetainedActivitySections::default(),
+            );
+            reported.push(
+                ProviderActivityMutation::upsert_actor("actor:sub", None, "Sub", "running")
+                    .unwrap(),
+            );
+            activity
+                .apply(
+                    "thread:t1",
+                    "owner:open-subagent".to_owned(),
+                    reported,
+                    super::now(),
+                )
+                .await
+                .unwrap();
+            let open = activity
+                .snapshot(&crate::activity::ActivityScopeRef::Thread {
+                    thread_id: "t1".to_owned(),
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                open.actors[0].status,
+                crate::activity::ActivityLifecycle::Running,
+                "nothing but the startup pass closes it"
+            );
+            let ownership =
+                super::startup_process_ownership(&engine.repositories(), Vec::new()).await;
+            super::interrupt_activity_of_ended_sessions(&ownership, &activity).await;
+            let expected = if owned {
+                crate::activity::ActivityLifecycle::Interrupted
+            } else {
+                crate::activity::ActivityLifecycle::Running
+            };
+            let status = |snapshot: crate::activity::ActivitySnapshot| {
+                snapshot
+                    .actors
+                    .into_iter()
+                    .find(|actor| actor.id == "actor:sub")
+                    .expect("subagent")
+                    .status
+            };
+            let scope = crate::activity::ActivityScopeRef::Thread {
+                thread_id: "t1".to_owned(),
+            };
+            assert_eq!(status(activity.snapshot(&scope).await.unwrap()), expected);
+
+            // Ending the session for its resume leaves the user's server's work as it was.
+            supervisor.shutdown().await.unwrap();
+            assert_eq!(status(activity.snapshot(&scope).await.unwrap()), expected);
+            server.abort();
+            if let Some(child) = &child {
+                super::kill_child(child).await;
+            }
+            engine.shutdown().await;
+        }
+    }
+
     fn opencode_endpoint_child() -> super::SharedChild {
         #[cfg(windows)]
         let child = tokio::process::Command::new("cmd.exe")
@@ -32065,6 +33516,10 @@ printf '2.1.0 (Claude Code)\n'
                         "--version",
                         tokio::time::Instant::now() + Duration::from_secs(10),
                         super::ClaudeProbeLaunchPolicy::Direct,
+                        &super::ClaudeProbeContext {
+                            environment: std::env::vars_os().collect::<Vec<_>>().into(),
+                            cwd: temp.path().to_path_buf(),
+                        },
                     ))
                     .expect("Claude probe completes");
                 assert_eq!(output.lines().next(), Some("2.1.0 (Claude Code)"));

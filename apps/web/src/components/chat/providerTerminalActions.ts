@@ -55,12 +55,6 @@ const DEFINITIONS: Partial<Record<ProviderDriverKind, ProviderTerminalDefinition
   },
 };
 
-const OBSERVABLE_TERMINAL_DRIVERS = new Set<ProviderDriverKind>([
-  ProviderDriverKind.make("codex"),
-  ProviderDriverKind.make("claudeAgent"),
-  ProviderDriverKind.make("opencode"),
-]);
-
 export interface ProviderTerminalAction {
   readonly entry: ProviderInstanceEntry;
   readonly label: string;
@@ -172,12 +166,12 @@ export function resolveProviderTerminalAction(
   const legacy = (settings.providers as Readonly<Record<string, unknown>>)[entry.driverKind];
   const executable = binaryPath(instance?.config) ?? binaryPath(legacy) ?? definition.executable;
   const label = `${entry.displayName} Terminal`;
-  const activity = OBSERVABLE_TERMINAL_DRIVERS.has(entry.driverKind)
-    ? {
-        driverKind: entry.driverKind,
-        providerInstanceId: entry.instanceId,
-      }
-    : undefined;
+  // Every AI Terminal names its provider: the server observes the ones it can (Codex, Claude,
+  // OpenCode on macOS and Linux) and reports the rest as status unavailable (#187).
+  const activity = {
+    driverKind: entry.driverKind,
+    providerInstanceId: entry.instanceId,
+  };
   const resolution = resolveProviderSessionDefault({
     driver: entry.driverKind,
     instanceId: entry.instanceId,
@@ -189,7 +183,7 @@ export function resolveProviderTerminalAction(
     args: [...definition.args, ...providerArguments(entry.driverKind, resolution, entry.models)],
     label,
     ...(definition.env ? { env: { ...definition.env } } : {}),
-    ...(activity ? { activity } : {}),
+    activity,
   });
   if (command === null) {
     return {
