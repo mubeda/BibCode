@@ -703,6 +703,15 @@ pub(crate) struct ToolCall<'a> {
     pub(crate) cancellation: CancellationToken,
 }
 
+/// One `clientRequestId` of one client session, and the call it names.
+#[derive(Clone)]
+struct RequestKey {
+    session_id: String,
+    client_request_id: String,
+    tool: String,
+    digest: String,
+}
+
 pub(crate) fn invalid_argument(message: &str) -> Value {
     typed_tool_failure("McpInvalidArgumentError", message)
 }
@@ -833,11 +842,36 @@ impl ToolCall<'_> {
         Ok(())
     }
 
-    /// The commands to dispatch: the ones stored for this `clientRequestId`, or `fresh` (also
-    /// stored, when there is an id). See the design's Retries section.
-    async fn commands(&self, tool: &str, fresh: Vec<Value>) -> Result<Vec<Value>, Value> {
+    /// The commands to dispatch. A `clientRequestId` already stored is resolved first, before
+    /// anything `fresh` would check, so a retry whose first answer was lost replays the stored
+    /// commands even after the thread, the question or the setting changed; only the ones the
+    /// engine has not accepted yet still meet the current ceiling. Otherwise `fresh` runs the
+    /// current checks and builds new commands, stored when there is an id. `thread_id` names
+    /// the existing thread the commands advance. See the design's Retries section.
+    async fn commands(
+        &self,
+        tool: &str,
+        thread_id: Option<&str>,
+        fresh: impl AsyncFnOnce() -> Result<Vec<Value>, Value>,
+    ) -> Result<Vec<Value>, Value> {
+        let Some(key) = self.request_key(tool)? else {
+            return fresh().await;
+        };
+        if let Some(stored) = self.stored_request(&key, None).await? {
+            self.check_unaccepted(&stored, thread_id).await?;
+            return Ok(stored);
+        }
+        let fresh = fresh().await?;
+        // Another call with the same id may have stored its commands meanwhile; then those
+        // are the ones dispatched.
+        self.stored_request(&key, Some(&fresh))
+            .await?
+            .ok_or_else(|| storage_failure("a stored MCP request is missing"))
+    }
+
+    fn request_key(&self, tool: &str) -> Result<Option<RequestKey>, Value> {
         let Some(client_request_id) = self.string("clientRequestId")? else {
-            return Ok(fresh);
+            return Ok(None);
         };
         if client_request_id.is_empty() || client_request_id.len() > 256 {
             return Err(invalid_argument(
@@ -848,49 +882,112 @@ impl ToolCall<'_> {
             self.arguments.clone(),
         ))
         .map_err(|error| invalid_argument(&error))?;
-        let session_id = self.principal.principal.session_id.clone();
-        let client_request_id = client_request_id.to_owned();
-        let tool = tool.to_owned();
-        let fresh_json = serde_json::to_string(&fresh).map_err(storage_failure)?;
+        Ok(Some(RequestKey {
+            session_id: self.principal.principal.session_id.clone(),
+            client_request_id: client_request_id.to_owned(),
+            tool: tool.to_owned(),
+            digest,
+        }))
+    }
+
+    /// The commands stored for `key`, after storing `fresh` when nothing is stored yet.
+    async fn stored_request(
+        &self,
+        key: &RequestKey,
+        fresh: Option<&[Value]>,
+    ) -> Result<Option<Vec<Value>>, Value> {
+        let fresh_json = fresh
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(storage_failure)?;
+        let RequestKey {
+            session_id,
+            client_request_id,
+            ..
+        } = key.clone();
+        let tool = key.tool.clone();
+        let digest = key.digest.clone();
         let stored = self
             .control
             .repositories()
             .database()
             .call(move |connection| {
-                let now = time::OffsetDateTime::now_utc();
-                let cutoff = (now - time::Duration::seconds(REQUEST_ROW_TTL_SECONDS))
-                    .format(&time::format_description::well_known::Rfc3339)
-                    .unwrap_or_default();
-                let created = now
-                    .format(&time::format_description::well_known::Rfc3339)
-                    .unwrap_or_default();
                 let transaction = connection.transaction()?;
-                transaction.execute(
-                    "DELETE FROM mcp_tool_requests WHERE created_at < ?",
-                    [&cutoff],
-                )?;
-                transaction.execute(
-                    "INSERT OR IGNORE INTO mcp_tool_requests (session_id, client_request_id, tool, arguments_digest, commands_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                    params![session_id, client_request_id, tool, digest, fresh_json, created],
-                )?;
-                let row = transaction.query_row(
-                    "SELECT tool, arguments_digest, commands_json FROM mcp_tool_requests WHERE session_id = ? AND client_request_id = ?",
-                    params![session_id, client_request_id],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
-                )?;
+                if let Some(fresh_json) = fresh_json {
+                    let now = time::OffsetDateTime::now_utc();
+                    let cutoff = (now - time::Duration::seconds(REQUEST_ROW_TTL_SECONDS))
+                        .format(&time::format_description::well_known::Rfc3339)
+                        .unwrap_or_default();
+                    let created = now
+                        .format(&time::format_description::well_known::Rfc3339)
+                        .unwrap_or_default();
+                    transaction.execute(
+                        "DELETE FROM mcp_tool_requests WHERE created_at < ?",
+                        [&cutoff],
+                    )?;
+                    transaction.execute(
+                        "INSERT OR IGNORE INTO mcp_tool_requests (session_id, client_request_id, tool, arguments_digest, commands_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                        params![session_id, client_request_id, tool, digest, fresh_json, created],
+                    )?;
+                }
+                let row = transaction
+                    .query_row(
+                        "SELECT tool, arguments_digest, commands_json FROM mcp_tool_requests WHERE session_id = ? AND client_request_id = ?",
+                        params![session_id, client_request_id],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
+                    )
+                    .optional()?;
                 transaction.commit()?;
-                Ok((row, tool, digest))
+                Ok(row)
             })
             .await
             .map_err(storage_failure)?;
-        let ((stored_tool, stored_digest, commands), tool, digest) = stored;
-        if stored_tool != tool || stored_digest != digest {
+        let Some((stored_tool, stored_digest, commands)) = stored else {
+            return Ok(None);
+        };
+        if stored_tool != key.tool || stored_digest != key.digest {
             return Err(typed_tool_failure(
                 "idempotency_conflict",
                 "This clientRequestId was already used for a different call; use a new id.",
             ));
         }
-        serde_json::from_str(&commands).map_err(storage_failure)
+        serde_json::from_str(&commands)
+            .map(Some)
+            .map_err(storage_failure)
+    }
+
+    /// Refuses stored commands the engine has not accepted yet when they would run above the
+    /// current ceiling: replaying accepted work changes nothing, but the rest is new work. An
+    /// accepted or rejected command is left to the engine's replay, which answers as it did.
+    async fn check_unaccepted(
+        &self,
+        commands: &[Value],
+        thread_id: Option<&str>,
+    ) -> Result<(), Value> {
+        let mut thread_checked = false;
+        for command in commands {
+            let receipt = self
+                .control
+                .repositories()
+                .get_command_receipt(command["commandId"].as_str().unwrap_or_default().to_owned())
+                .await
+                .map_err(storage_failure)?;
+            if receipt
+                .is_some_and(|receipt| !matches!(receipt.status.as_str(), "reserved" | "prepared"))
+            {
+                continue;
+            }
+            if let Some(mode) = command["runtimeMode"].as_str() {
+                self.check_thread_mode(mode)?;
+            }
+            if let Some(thread_id) = thread_id
+                && !thread_checked
+            {
+                self.check_thread_mode(&self.thread(thread_id).await?.runtime_mode)?;
+                thread_checked = true;
+            }
+        }
+        Ok(())
     }
 
     async fn dispatch(&self, command: Value) -> Result<Value, Value> {
@@ -1104,28 +1201,17 @@ impl ToolCall<'_> {
         if prompt.chars().count() > 120_000 {
             return Err(invalid_argument("prompt is longer than 120000 characters"));
         }
-        let ceiling = self.control.effective_ceiling(self.principal);
-        let runtime_mode = match self.string("runtimeMode")? {
-            None => ceiling,
-            Some(mode) => {
-                let level = McpAccess::parse(mode)
+        let asked_mode = match self.string("runtimeMode")? {
+            None => None,
+            Some(mode) => Some(
+                McpAccess::parse(mode)
                     .filter(|level| *level != McpAccess::ReadOnly)
                     .ok_or_else(|| {
                         invalid_argument(
                             "runtimeMode is approval-required, auto-accept-edits or full-access",
                         )
-                    })?;
-                if level > ceiling {
-                    return Err(typed_tool_failure(
-                        "McpAccessCeilingError",
-                        &format!(
-                            "runtimeMode {mode} is above this MCP connection's limit ({}). Raise Settings → Agents → Agent integrations → Agents may, then restart the MCP server in your agent.",
-                            ceiling.as_str()
-                        ),
-                    ));
-                }
-                level
-            }
+                    })?,
+            ),
         };
         let interaction_mode = match self.string("interactionMode")? {
             None | Some("default") => "default",
@@ -1134,7 +1220,19 @@ impl ToolCall<'_> {
         };
         // A retry with a known clientRequestId dispatches the stored commands instead, so a
         // default that changed since then does not change what it replays.
-        let fresh = {
+        let fresh = async || {
+            let ceiling = self.control.effective_ceiling(self.principal);
+            let runtime_mode = asked_mode.unwrap_or(ceiling);
+            if runtime_mode > ceiling {
+                return Err(typed_tool_failure(
+                    "McpAccessCeilingError",
+                    &format!(
+                        "runtimeMode {} is above this MCP connection's limit ({}). Raise Settings → Agents → Agent integrations → Agents may, then restart the MCP server in your agent.",
+                        runtime_mode.as_str(),
+                        ceiling.as_str()
+                    ),
+                ));
+            }
             let project = self
                 .control
                 .repositories()
@@ -1162,7 +1260,7 @@ impl ToolCall<'_> {
                 .map_or_else(|| title_from(prompt), str::to_owned);
             let created_at = now_iso();
             let thread_id = Uuid::new_v4().to_string();
-            vec![json!({
+            Ok(vec![json!({
                 "type": "thread.turn.start",
                 "commandId": Uuid::new_v4().to_string(),
                 "threadId": thread_id,
@@ -1189,9 +1287,9 @@ impl ToolCall<'_> {
                     },
                 },
                 "createdAt": created_at,
-            })]
+            })])
         };
-        let commands = self.commands("start_thread", fresh).await?;
+        let commands = self.commands("start_thread", None, fresh).await?;
         let command = commands
             .into_iter()
             .next()
@@ -1220,30 +1318,35 @@ impl ToolCall<'_> {
             Some("steer") => true,
             Some(_) => return Err(invalid_argument("mode is queue or steer")),
         };
-        let thread = self.thread(thread_id).await?;
-        self.check_thread_mode(&thread.runtime_mode)?;
-        let created_at = now_iso();
-        let message_id = Uuid::new_v4().to_string();
-        let mut fresh = vec![json!({
-            "type": "thread.turn.start",
-            "commandId": Uuid::new_v4().to_string(),
-            "threadId": thread_id,
-            "message": { "messageId": message_id, "role": "user", "text": text, "attachments": [] },
-            "runtimeMode": thread.runtime_mode,
-            "interactionMode": thread.interaction_mode,
-            "queued": true,
-            "createdAt": created_at,
-        })];
-        if steer {
-            fresh.push(json!({
-                "type": "thread.turn.steer",
+        let fresh = async || {
+            let thread = self.thread(thread_id).await?;
+            self.check_thread_mode(&thread.runtime_mode)?;
+            let created_at = now_iso();
+            let message_id = Uuid::new_v4().to_string();
+            let mut fresh = vec![json!({
+                "type": "thread.turn.start",
                 "commandId": Uuid::new_v4().to_string(),
                 "threadId": thread_id,
-                "messageId": message_id,
+                "message": { "messageId": message_id, "role": "user", "text": text, "attachments": [] },
+                "runtimeMode": thread.runtime_mode,
+                "interactionMode": thread.interaction_mode,
+                "queued": true,
                 "createdAt": created_at,
-            }));
-        }
-        let commands = self.commands("send_message", fresh).await?;
+            })];
+            if steer {
+                fresh.push(json!({
+                    "type": "thread.turn.steer",
+                    "commandId": Uuid::new_v4().to_string(),
+                    "threadId": thread_id,
+                    "messageId": message_id,
+                    "createdAt": created_at,
+                }));
+            }
+            Ok(fresh)
+        };
+        let commands = self
+            .commands("send_message", Some(thread_id), fresh)
+            .await?;
         let mut commands = commands.into_iter();
         let start = commands
             .next()
@@ -1378,39 +1481,44 @@ impl ToolCall<'_> {
             Some(Value::Object(answers)) => Value::Object(answers.clone()),
             _ => return Err(invalid_argument("answers must be an object")),
         };
-        let thread = self.thread(&thread_id).await?;
-        let pending = read_pending_requests(self.control.repositories(), &thread_id)
-            .await
-            .map_err(storage_failure)?;
-        if pending
-            .approvals
-            .iter()
-            .any(|approval| approval["requestId"] == request_id.as_str())
+        let fresh = async || {
+            let thread = self.thread(&thread_id).await?;
+            let pending = read_pending_requests(self.control.repositories(), &thread_id)
+                .await
+                .map_err(storage_failure)?;
+            if pending
+                .approvals
+                .iter()
+                .any(|approval| approval["requestId"] == request_id.as_str())
+            {
+                return Err(typed_tool_failure(
+                    "McpApprovalNotAnswerableError",
+                    "This is an approval. Approvals are answered by a person in BiBCode, never over MCP.",
+                ));
+            }
+            if !pending
+                .questions
+                .iter()
+                .any(|question| question["requestId"] == request_id.as_str())
+            {
+                return Err(invalid_argument(
+                    "No open question with this requestId; list_pending_requests lists them.",
+                ));
+            }
+            self.check_thread_mode(&thread.runtime_mode)?;
+            Ok(vec![json!({
+                "type": "thread.user-input.respond",
+                "commandId": Uuid::new_v4().to_string(),
+                "threadId": thread_id,
+                "requestId": request_id,
+                "answers": answers,
+                "createdAt": now_iso(),
+            })])
+        };
+        for command in self
+            .commands("answer_question", Some(&thread_id), fresh)
+            .await?
         {
-            return Err(typed_tool_failure(
-                "McpApprovalNotAnswerableError",
-                "This is an approval. Approvals are answered by a person in BiBCode, never over MCP.",
-            ));
-        }
-        if !pending
-            .questions
-            .iter()
-            .any(|question| question["requestId"] == request_id.as_str())
-        {
-            return Err(invalid_argument(
-                "No open question with this requestId; list_pending_requests lists them.",
-            ));
-        }
-        self.check_thread_mode(&thread.runtime_mode)?;
-        let fresh = vec![json!({
-            "type": "thread.user-input.respond",
-            "commandId": Uuid::new_v4().to_string(),
-            "threadId": thread_id,
-            "requestId": request_id,
-            "answers": answers,
-            "createdAt": now_iso(),
-        })];
-        for command in self.commands("answer_question", fresh).await? {
             self.dispatch(command).await?;
         }
         Ok(tool_result(

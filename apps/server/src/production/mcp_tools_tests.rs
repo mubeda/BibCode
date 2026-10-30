@@ -515,6 +515,174 @@ async fn retries_with_one_client_request_id_start_one_turn() {
     harness.shutdown().await;
 }
 
+/// The provider asks `request_id` on `thread_id`.
+async fn ask(harness: &Harness, thread_id: &str, request_id: &str) {
+    harness
+        .engine
+        .dispatch(command(json!({
+            "type": "thread.activity.append", "commandId": format!("ask-{request_id}"),
+            "threadId": thread_id,
+            "activity": {
+                "id": format!("ask-{request_id}"), "tone": "approval", "kind": "user-input.requested",
+                "summary": "Needs you",
+                "payload": { "requestId": request_id, "questions": [{ "id": "color", "header": "Color", "question": "Which?", "options": [{ "label": "Red", "description": "" }] }] },
+                "turnId": "turn-1", "createdAt": CREATED_AT,
+            },
+            "createdAt": CREATED_AT,
+        })))
+        .await
+        .expect("question asked");
+}
+
+fn lower_ceiling(harness: &Harness, access: McpAccess) {
+    harness.settings.send_replace(McpServerSettings {
+        enabled: true,
+        access,
+    });
+}
+
+/// A retry whose first answer was lost replays what was accepted, even when what the tool
+/// checks before new work has changed since: the ceiling fell, or the question was answered.
+#[tokio::test]
+async fn a_retry_after_a_lost_response_replays_the_accepted_call() {
+    let harness = Harness::new().await;
+    let (agent, _) = harness.agent(McpAccess::FullAccess).await;
+    let mut arguments = basic_start();
+    arguments["runtimeMode"] = json!("full-access");
+    arguments["clientRequestId"] = json!("lost-start");
+    let first = harness
+        .call(&agent, "start_thread", arguments.clone())
+        .await;
+    let thread_id = structured(&first)["threadId"].as_str().unwrap().to_owned();
+    harness.provider_turn(&thread_id, "turn-1", "", false).await;
+    let send = json!({ "threadId": thread_id, "text": "more", "clientRequestId": "lost-send" });
+    let sent = harness.call(&agent, "send_message", send.clone()).await;
+    structured(&sent);
+    ask(&harness, &thread_id, "q1").await;
+    let answer = json!({ "threadId": thread_id, "requestId": "q1", "answers": { "color": "Red" }, "clientRequestId": "lost-answer" });
+    // The engine accepts the answer; only the faked provider, which has no live session to
+    // take it, fails afterwards. That failure stands in for the lost response.
+    harness
+        .call(&agent, "answer_question", answer.clone())
+        .await;
+    harness
+        .engine
+        .dispatch(command(json!({
+            "type": "thread.activity.append", "commandId": "resolve-q1", "threadId": thread_id,
+            "activity": {
+                "id": "resolve-q1", "tone": "info", "kind": "user-input.resolved", "summary": "Answered",
+                "payload": { "requestId": "q1" }, "turnId": "turn-1", "createdAt": CREATED_AT,
+            },
+            "createdAt": CREATED_AT,
+        })))
+        .await
+        .expect("question resolved");
+    let open = harness
+        .call(
+            &agent,
+            "list_pending_requests",
+            json!({ "threadId": thread_id }),
+        )
+        .await;
+    assert_eq!(structured(&open)["questions"], json!([]), "{open}");
+
+    // The question is no longer open, and the ceiling is below the thread's mode.
+    lower_ceiling(&harness, McpAccess::ApprovalRequired);
+    let retried = harness.call(&agent, "start_thread", arguments).await;
+    assert_eq!(structured(&retried), structured(&first));
+    let retried = harness.call(&agent, "send_message", send).await;
+    assert_eq!(
+        structured(&retried)["messageId"],
+        structured(&sent)["messageId"]
+    );
+    let retried = harness.call(&agent, "answer_question", answer).await;
+    assert_eq!(
+        structured(&retried),
+        &json!({ "threadId": thread_id, "requestId": "q1", "answered": true })
+    );
+    harness.shutdown().await;
+}
+
+/// A stored request whose command the engine never accepted is new work: the current ceiling
+/// applies to it before it is dispatched.
+#[tokio::test]
+async fn a_stored_request_not_yet_accepted_meets_the_current_ceiling() {
+    let harness = Harness::new().await;
+    let (agent, _) = harness.agent(McpAccess::FullAccess).await;
+    let mut arguments = basic_start();
+    arguments["runtimeMode"] = json!("full-access");
+    arguments["clientRequestId"] = json!("never-dispatched");
+    store_request(&harness, &agent, "start_thread", &arguments, |command| {
+        command["runtimeMode"] = json!("full-access");
+    })
+    .await;
+    lower_ceiling(&harness, McpAccess::ApprovalRequired);
+    assert_eq!(
+        error_tag(
+            &harness
+                .call(&agent, "start_thread", arguments.clone())
+                .await
+        ),
+        "McpAccessCeilingError"
+    );
+    // Raised again, the stored command is the one dispatched.
+    lower_ceiling(&harness, McpAccess::FullAccess);
+    let started = harness.call(&agent, "start_thread", arguments).await;
+    assert_eq!(structured(&started)["threadId"], "stored-thread");
+    harness.shutdown().await;
+}
+
+/// Writes the `mcp_tool_requests` row a call with `arguments` stores, holding one
+/// `thread.turn.start` for thread `stored-thread`, as if the server stopped before dispatching
+/// it. Returns the stored command.
+async fn store_request(
+    harness: &Harness,
+    agent: &ClientPrincipal,
+    tool: &str,
+    arguments: &Value,
+    adjust: impl FnOnce(&mut Value),
+) -> Value {
+    let mut start = json!({
+        "type": "thread.turn.start",
+        "commandId": "stored-command",
+        "threadId": "stored-thread",
+        "message": { "messageId": "stored-message", "role": "user", "text": arguments["prompt"], "attachments": [] },
+        "modelSelection": { "instanceId": "codex", "model": "gpt-5" },
+        "titleSeed": "Stored",
+        "runtimeMode": "approval-required",
+        "interactionMode": "default",
+        "bootstrap": { "createThread": {
+            "projectId": "p1", "title": "Stored",
+            "modelSelection": { "instanceId": "codex", "model": "gpt-5" },
+            "runtimeMode": "approval-required", "interactionMode": "default",
+            "branch": null, "worktreePath": null, "createdAt": CREATED_AT,
+        }},
+        "createdAt": CREATED_AT,
+    });
+    adjust(&mut start);
+    if let Some(mode) = start["runtimeMode"].as_str().map(str::to_owned) {
+        start["bootstrap"]["createThread"]["runtimeMode"] = json!(mode);
+    }
+    let digest = crate::orchestration::delivery::canonical_command_digest(arguments).unwrap();
+    let session_id = agent.principal.session_id.clone();
+    let client_request_id = arguments["clientRequestId"].as_str().unwrap().to_owned();
+    let tool = tool.to_owned();
+    let commands = json!([start.clone()]).to_string();
+    harness
+        .repositories
+        .database()
+        .call(move |connection| {
+            connection.execute(
+                "INSERT INTO mcp_tool_requests (session_id, client_request_id, tool, arguments_digest, commands_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                rusqlite::params![session_id, client_request_id, tool, digest, commands, "2099-10-30T00:00:00Z"],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    start
+}
+
 #[tokio::test]
 async fn the_ceiling_caps_starts_and_refuses_driving_a_thread_above_it() {
     let harness = Harness::new().await;
