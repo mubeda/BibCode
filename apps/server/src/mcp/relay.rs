@@ -40,6 +40,8 @@ pub const DISABLED_EXIT_MESSAGE: &str = "The MCP server is turned off for this e
 pub const NO_SERVER_MESSAGE: &str =
     "No BiBCode server with MCP support is running on this data root. Start or update BiBCode.";
 pub const REVOKED_MESSAGE: &str = "BiBCode ended this MCP connection's access. Restart the MCP server in your agent to sign in again.";
+/// `bibcode thread` signs in again on its next run.
+const CLI_REVOKED_MESSAGE: &str = "BiBCode ended this command's access (its row in Authorized clients was revoked). Run it again.";
 
 /// What `bibcode mcp` was asked to do.
 #[derive(Clone, Debug)]
@@ -81,7 +83,8 @@ pub async fn run_mcp_cli(options: RelayOptions) -> i32 {
     }
 }
 
-async fn shutdown_signal() {
+/// Ctrl-C, SIGTERM or SIGHUP, or a Windows console close.
+pub(crate) async fn shutdown_signal() {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
@@ -111,47 +114,15 @@ pub async fn run(
     output: impl AsyncWrite + Unpin + Send + 'static,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<(), String> {
-    let paths = options.paths();
-    let settings = read_settings(&paths.settings)?;
-    if !settings.enabled {
-        return Err(DISABLED_EXIT_MESSAGE.to_owned());
-    }
-    let access = match options.access {
-        Some(asked) if asked > settings.access => {
-            return Err(format!(
-                "--access {} is above this environment's limit ({}). Raise Settings → Agents → Agent integrations → Agents may, or ask for less.",
-                asked.as_str(),
-                settings.access.as_str()
-            ));
-        }
-        Some(asked) => asked,
-        None => settings.access,
-    };
-    if let Some(url) = &options.url {
-        check_loopback_url(url)?;
-    }
-    let http = reqwest::Client::builder()
-        .connect_timeout(CONNECT_TIMEOUT)
-        .timeout(REQUEST_TIMEOUT)
-        .no_proxy()
-        .build()
-        .map_err(|error| error.to_string())?;
-    let endpoint = discover(&paths.state_dir, options.url.as_ref(), &http).await?;
-    sweep_orphans(&options).await;
     let relay = Arc::new(Relay {
-        options,
-        state_dir: paths.state_dir.clone(),
-        http,
-        access,
-        endpoint: Mutex::new(endpoint),
-        credential: Mutex::new(None),
+        connection: Connection::open(options).await?,
         legacy_version: std::sync::Mutex::new(None),
     });
     let (lines, receiver) = mpsc::channel::<String>(64);
     let writer = tokio::spawn(write_lines(output, receiver));
     let served = serve(&relay, input, lines, shutdown).await;
     let _ = writer.await;
-    relay.revoke().await;
+    relay.connection.revoke().await;
     served
 }
 
@@ -242,16 +213,120 @@ struct Credential {
     session_id: String,
 }
 
-struct Relay {
+/// One client's way to this data root's server, shared by the relay and `bibcode thread`: the
+/// checks that run before any credential exists, the proven endpoint, the credential minted on
+/// first use, and its revocation.
+pub(crate) struct Connection {
     options: RelayOptions,
     state_dir: PathBuf,
     http: reqwest::Client,
     access: McpAccess,
     endpoint: Mutex<Endpoint>,
-    /// Minted on the first request, so its label can name the agent.
+    /// Minted on the first request, so the relay's label can name the agent.
     credential: Mutex<Option<Credential>>,
+}
+
+struct Relay {
+    connection: Connection,
     /// The version a legacy client's `initialize` negotiated.
     legacy_version: std::sync::Mutex<Option<String>>,
+}
+
+impl Connection {
+    /// The setting, the access level, the record and the endpoint proof, then the orphan
+    /// sweep. No credential exists until all of them pass.
+    pub(crate) async fn open(options: RelayOptions) -> Result<Self, String> {
+        let paths = options.paths();
+        let settings = read_settings(&paths.settings)?;
+        if !settings.enabled {
+            return Err(DISABLED_EXIT_MESSAGE.to_owned());
+        }
+        let access = match options.access {
+            Some(asked) if asked > settings.access => {
+                return Err(format!(
+                    "--access {} is above this environment's limit ({}). Raise Settings → Agents → Agent integrations → Agents may, or ask for less.",
+                    asked.as_str(),
+                    settings.access.as_str()
+                ));
+            }
+            Some(asked) => asked,
+            None => settings.access,
+        };
+        if let Some(url) = &options.url {
+            check_loopback_url(url)?;
+        }
+        let http = reqwest::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT)
+            .no_proxy()
+            .build()
+            .map_err(|error| error.to_string())?;
+        let endpoint = discover(&paths.state_dir, options.url.as_ref(), &http).await?;
+        sweep_orphans(&options).await;
+        Ok(Self {
+            options,
+            state_dir: paths.state_dir,
+            http,
+            access,
+            endpoint: Mutex::new(endpoint),
+            credential: Mutex::new(None),
+        })
+    }
+
+    /// Calls one tool in the modern protocol era and returns its `result`, a tool failure
+    /// included. `label` names the credential if this call mints it.
+    pub(crate) async fn call_tool(
+        &self,
+        id: u64,
+        name: &str,
+        arguments: Value,
+        label: &str,
+    ) -> Result<Value, String> {
+        let message = json!({
+            "jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": {
+                "name": name,
+                "arguments": arguments,
+                "_meta": { "io.modelcontextprotocol/protocolVersion": protocol::MODERN_VERSION },
+            },
+        });
+        let token = self.token(|| label.to_owned()).await?;
+        let response = match self.send(&message, &token, None).await {
+            Sent::Response(response) => response,
+            Sent::Unauthorized => return Err(CLI_REVOKED_MESSAGE.to_owned()),
+            Sent::Unreachable(error) => return Err(error),
+        };
+        let status = response.status();
+        let body = response
+            .bytes()
+            .await
+            .map_err(|error| format!("BiBCode did not answer: {error}"))?;
+        let reply: Value = serde_json::from_slice(&body)
+            .map_err(|_| format!("BiBCode answered {status} with no MCP message."))?;
+        if let Some(error) = reply.get("error") {
+            return Err(error["message"]
+                .as_str()
+                .unwrap_or("BiBCode refused the request.")
+                .to_owned());
+        }
+        reply
+            .get("result")
+            .cloned()
+            .ok_or_else(|| format!("BiBCode answered {status} with no result."))
+    }
+
+    /// Posts `message`; when the server is unreachable, reads the record again, proves it and
+    /// retries once, because a restart may have moved the port.
+    async fn send(&self, message: &Value, token: &str, legacy_version: Option<String>) -> Sent {
+        let sent = self.post(message, token, legacy_version.clone()).await;
+        if !matches!(sent, Sent::Unreachable(_)) {
+            return sent;
+        }
+        if let Err(error) = self.rediscover().await {
+            return Sent::Unreachable(error);
+        }
+        self.post(message, token, legacy_version).await
+    }
 }
 
 async fn write_lines(mut output: impl AsyncWrite + Unpin, mut lines: mpsc::Receiver<String>) {
@@ -366,19 +441,16 @@ impl Relay {
             id.clone()
                 .map(|id| protocol::failure(id, error).to_string())
         };
-        let token = match self.credential(&message).await {
+        let token = match self.connection.token(|| agent_label(&message)).await {
             Ok(token) => token,
             Err(error) => return failure(protocol::rpc_error(protocol::INTERNAL_ERROR, &error)),
         };
-        let mut sent = self.post(&message, &token).await;
-        if matches!(sent, Sent::Unreachable(_)) {
-            // A restart may have moved the port: read the record again, prove it, retry once.
-            if let Err(error) = self.rediscover().await {
-                return failure(protocol::rpc_error(protocol::INTERNAL_ERROR, &error));
-            }
-            sent = self.post(&message, &token).await;
-        }
-        let response = match sent {
+        let legacy_version = self
+            .legacy_version
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let response = match self.connection.send(&message, &token, legacy_version).await {
             Sent::Response(response) => response,
             // Never re-mint: the user may have revoked this client on purpose.
             Sent::Unauthorized => {
@@ -461,8 +533,27 @@ impl Relay {
         }
         last
     }
+}
 
-    async fn post(&self, message: &Value, token: &str) -> Sent {
+/// The credential label for the agent that sent `first`: `MCP · <its clientInfo name>`.
+fn agent_label(first: &Value) -> String {
+    let name = first
+        .pointer("/params/clientInfo/name")
+        .or_else(|| first.pointer("/params/_meta/io.modelcontextprotocol~1clientInfo/name"))
+        .and_then(Value::as_str)
+        .map(|name| {
+            name.chars()
+                .filter(|c| !c.is_control())
+                .take(60)
+                .collect::<String>()
+        })
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| "agent".to_owned());
+    format!("MCP · {name}")
+}
+
+impl Connection {
+    async fn post(&self, message: &Value, token: &str, legacy_version: Option<String>) -> Sent {
         let base = self.endpoint.lock().await.base.clone();
         let Ok(url) = base.join("mcp") else {
             return Sent::Unreachable("The BiBCode address is not valid.".to_owned());
@@ -491,12 +582,7 @@ impl Relay {
             {
                 request = request.header("Mcp-Name", name);
             }
-        } else if let Some(version) = self
-            .legacy_version
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-        {
+        } else if let Some(version) = legacy_version {
             request = request.header("MCP-Protocol-Version", version);
         }
         match request.send().await {
@@ -518,25 +604,13 @@ impl Relay {
     }
 
     /// The credential, minted on the first request: a 60 s link from the data root, exchanged
-    /// at once over loopback, labelled with the agent's name.
-    async fn credential(&self, first: &Value) -> Result<String, String> {
+    /// at once over loopback, labelled `label()`.
+    async fn token(&self, label: impl FnOnce() -> String) -> Result<String, String> {
         let mut credential = self.credential.lock().await;
         if let Some(credential) = credential.as_ref() {
             return Ok(credential.token.clone());
         }
-        let name = first
-            .pointer("/params/clientInfo/name")
-            .or_else(|| first.pointer("/params/_meta/io.modelcontextprotocol~1clientInfo/name"))
-            .and_then(Value::as_str)
-            .map(|name| {
-                name.chars()
-                    .filter(|c| !c.is_control())
-                    .take(60)
-                    .collect::<String>()
-            })
-            .filter(|name| !name.trim().is_empty())
-            .unwrap_or_else(|| "agent".to_owned());
-        let minted = mint(&self.options, &format!("MCP · {name}"), self.access).await?;
+        let minted = mint(&self.options, &label(), self.access).await?;
         let base = self.endpoint.lock().await.base.clone();
         let exchanged = self
             .http
@@ -578,8 +652,8 @@ impl Relay {
         Ok(token)
     }
 
-    /// Revokes this relay's credential through the data root and removes its record.
-    async fn revoke(&self) {
+    /// Revokes this connection's credential through the data root and removes its record.
+    pub(crate) async fn revoke(&self) {
         let Some(credential) = self.credential.lock().await.take() else {
             return;
         };

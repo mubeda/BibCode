@@ -797,17 +797,19 @@ async fn a_legacy_clients_version_is_sent_on_every_later_request() {
         impostor(r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18"}}"#).await;
     let root = tempfile::tempdir().expect("root");
     let relay = Relay {
-        options: options(root.path()),
-        state_dir: root.path().to_path_buf(),
-        http: reqwest::Client::builder().no_proxy().build().unwrap(),
-        access: McpAccess::ReadOnly,
-        endpoint: Mutex::new(Endpoint {
-            base: format!("http://127.0.0.1:{port}/").parse().unwrap(),
-        }),
-        credential: Mutex::new(Some(Credential {
-            token: "test-bearer".into(),
-            session_id: "test-session".into(),
-        })),
+        connection: Connection {
+            options: options(root.path()),
+            state_dir: root.path().to_path_buf(),
+            http: reqwest::Client::builder().no_proxy().build().unwrap(),
+            access: McpAccess::ReadOnly,
+            endpoint: Mutex::new(Endpoint {
+                base: format!("http://127.0.0.1:{port}/").parse().unwrap(),
+            }),
+            credential: Mutex::new(Some(Credential {
+                token: "test-bearer".into(),
+                session_id: "test-session".into(),
+            })),
+        },
         legacy_version: std::sync::Mutex::new(None),
     };
     let (lines, _frames) = mpsc::channel(4);

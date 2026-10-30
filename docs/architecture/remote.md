@@ -1790,7 +1790,7 @@ Remote Server mode, the joined record's slow part (`server`, `network`, or
   `initialize` and `Mcp-Session-Id`; outside agents get no HTTP session, so a
   restart or an off/on cycle loses nothing.
 - Outside agents reach `/mcp` from the same host only: `bibcode mcp` relays stdio
-  to loopback after proving the listener with `POST /mcp/endpoint-proof`, an
+  to loopback, and `bibcode thread` calls the same tools, after proving the listener with `POST /mcp/endpoint-proof`, an
   unauthenticated, loopback-only route that signs a caller's nonce and the local
   address and port the connection reached with the per-boot key in the
   owner-only `server-runtime.json`. The relay dials exactly the record's

@@ -31,6 +31,11 @@ a message when the server is off, not running, or not this BiBCode; tell the use
 message. MCP servers load when the agent starts, so the user restarts the agent after
 adding one. Give the user these commands to run: they change the agent's own configuration.
 
+Without the MCP server, a shell can call the same tools with `bibcode thread list`,
+`start <project|.> <message|->`, `send <thread> <message|->` and `show <thread>`; `--wait`
+waits for the turn and `--json` prints `{ threadId, messageId, status, reply, error }`. It
+exits 0 on success, 1 on failure and 2 when the thread waits on a person.
+
 ## Hand off work and wait
 
 1. `start_thread` (or `send_message`) with a `clientRequestId` you keep. On a timeout or a

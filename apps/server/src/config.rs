@@ -691,6 +691,10 @@ enum CliCommand {
     )]
     Mcp(McpArgs),
     #[command(
+        about = "List, start, message and show this data root's threads on its running BiBCode server, through the same tools as `bibcode mcp`."
+    )]
+    Thread(crate::mcp::thread_cli::ThreadArgs),
+    #[command(
         about = "Install, remove, or inspect the per-user background service that keeps `bibcode serve` running."
     )]
     Service(ServiceArgs),
@@ -875,6 +879,11 @@ pub enum CliAction {
     },
     /// Relays an agent's MCP to the data root's running server; never starts one.
     Mcp(crate::mcp::relay::RelayOptions),
+    /// Calls the data root's running server's MCP thread tools; never starts one.
+    Thread {
+        options: crate::mcp::relay::RelayOptions,
+        args: crate::mcp::thread_cli::ThreadArgs,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -971,6 +980,8 @@ pub enum ConfigError {
     DiagnosticsCommandIsNotServer,
     #[error("mcp cannot be converted into a server configuration")]
     McpCommandIsNotServer,
+    #[error("thread cannot be converted into a server configuration")]
+    ThreadCommandIsNotServer,
     #[error("failed to resolve the current executable for static web discovery")]
     CurrentExecutable(#[source] io::Error),
     #[error(transparent)]
@@ -1013,6 +1024,7 @@ impl Cli {
             CliAction::Profiler { .. } => Err(ConfigError::ProfilerCommandIsNotServer),
             CliAction::Diagnostics { .. } => Err(ConfigError::DiagnosticsCommandIsNotServer),
             CliAction::Mcp(_) => Err(ConfigError::McpCommandIsNotServer),
+            CliAction::Thread { .. } => Err(ConfigError::ThreadCommandIsNotServer),
         }
     }
 
@@ -1111,6 +1123,20 @@ impl Cli {
                     args.dev_url,
                     mcp,
                 )?));
+            }
+            // The same data root and connection as `mcp`, at the environment's own limit.
+            Some(CliCommand::Thread(thread)) => {
+                return Ok(CliAction::Thread {
+                    options: relay_options(
+                        args.base_dir,
+                        args.dev_url,
+                        McpArgs {
+                            url: None,
+                            access: None,
+                        },
+                    )?,
+                    args: thread,
+                });
             }
             Some(CliCommand::Service(service)) => {
                 return Ok(CliAction::Service(match service.command {

@@ -1307,3 +1307,50 @@ updated on 2026-10-27.
   byte for byte, and a relay reaches the first after the second stops (`relay/tests.rs`); a
   dead pid's record, a live pid without its listener, and a silent listener that keeps the
   record within the bound (`endpoint.rs`). The same-port case is still covered.
+
+**CLI front end (2026-10-30):** implemented on `claude/v0131-139-cli`, on top of slice 1, as
+designed in "CLI front end (next slice)". Nothing settled changes: no new route, RPC
+method, table or persisted shape.
+
+- **One connection.** `relay.rs` now holds a `Connection` (setting and `--access` checks,
+  `--url` check, record, endpoint proof, orphan sweep, credential minted on first use,
+  revocation, the rediscover-and-retry-once post). The relay and `mcp::thread_cli` both use
+  it, so discovery, mint, revoke and sweep exist once. `Connection::call_tool` sends a
+  modern-era `tools/call` (`_meta` protocol version, so `post` adds the three headers) and
+  returns the tool's `result`. A 401 says to run the command again, not to restart an MCP
+  server.
+- **Two tool outputs grew, for the CLI's needs.** `list_projects_and_threads` returns each
+  project's `workspaceRoot`, because `start .` is matched client-side from `list` and the
+  projection had dropped the folder. `read_thread` returns the thread's `status` (the same
+  `derive_status` as the list, with the latest turn's state read in the page's SQLite job),
+  so `show` needs no second call.
+- **Matching `.`** canonicalizes the current directory and each root, takes the deepest root
+  that holds it by path components, and refuses a tie (two projects on one folder) or no
+  match, naming `bibcode thread list`.
+- **Output and exit codes.** `--json` prints `{ threadId, messageId, status, reply, error }`
+  for `start` and `send`, with `null` for what is unknown, also on failure; `list` and
+  `show` print the tool's structured content, or `{ error }`. Without `--wait`, `status` is
+  `started`, or `queued` for a queued send. `reply` is the whole text: a reply the wait cut
+  at 16,000 characters is completed with `read_thread` slices. Exit 0 on `completed` or a
+  call that succeeded, 2 on `awaiting_approval` or `awaiting_input`, 1 otherwise. The
+  desktop executable maps clap's usage-error code 2 to 1, so 2 keeps one meaning; the
+  `bibcode` binary already exits 1 on a usage error.
+- **Waiting.** `--wait` calls `wait_for_thread` with the start's or send's `messageId` and
+  `timeoutMs: 30000` until `timedOut` is false. A `McpStorageError` is retried a second
+  later, at most 3 times in a row. Ctrl-C (or SIGTERM/SIGHUP, a console close) stops the
+  wait, revokes the credential and exits 1 with the ids; it never calls `interrupt_turn`.
+- **Idempotency.** Each `start` and `send` sends a fresh UUID v4 `clientRequestId`, so the
+  connection's retry after a lost answer replays instead of starting a second turn. A new
+  run mints a new session, so the key cannot span runs.
+- **Credential label** is `MCP · bibcode thread`. The access ceiling is the environment's
+  `mcpServerAccess`; the CLI has no `--access` or `--url`.
+- **Desktop.** `desktop_dispatch` takes `thread` next to `mcp` and `diagnostics`, after
+  `crash::attach()`, and always attaches the parent console, because its output is for a
+  person or a pipe, not JSON-RPC.
+- **Tests** (`mcp/thread_cli/tests.rs`): parsing of every subcommand and flag (and the
+  desktop's in `profiler/cli.rs`), `.` resolution, the JSON shape on success and failure,
+  exit codes 0/1/2, 30 s slicing with no `interrupt_turn`, a stopped wait, a long reply,
+  standard input, the setting off; and against a real server, a delivery that fails
+  (exit 1, every run's credential revoked), and, with a fake Codex app-server script
+  (Unix only), `start . --wait` and `send --wait` (exit 0 with the reply), an approval
+  (exit 2), `show` and `list`.

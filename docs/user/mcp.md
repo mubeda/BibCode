@@ -39,19 +39,19 @@ own loopback server. Remote MCP over HTTP is not supported yet.
 
 ## Tools
 
-| Tool                        | What it does                                                                                                      |
-| --------------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| `list_projects_and_threads` | Projects and threads with each thread's status, pending flags, latest turn, provider and model                    |
-| `list_providers_and_models` | Provider instances with availability, default and custom models                                                   |
-| `start_thread`              | Starts a thread in a project with a first prompt                                                                  |
-| `send_message`              | Sends a message; queued behind a running turn, never interrupts; `mode: "steer"` asks the running turn to take it |
-| `wait_for_thread`           | Waits up to 50 s for the turn to settle or need a person; a timeout never stops the work                          |
-| `read_thread`               | A page of messages; long messages and older pages are reachable with `textOffset` and `cursor`                    |
-| `list_pending_requests`     | Open questions and approvals                                                                                      |
-| `answer_question`           | Answers an open question                                                                                          |
-| `interrupt_turn`            | Stops a running turn                                                                                              |
-| `get_turn_diff`             | One turn's patch, paged                                                                                           |
-| `git_status`                | Branch, ahead/behind and changed files of the thread's folder                                                     |
+| Tool                        | What it does                                                                                                           |
+| --------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `list_projects_and_threads` | Projects with their folders, and threads with each thread's status, pending flags, latest turn, provider and model     |
+| `list_providers_and_models` | Provider instances with availability, default and custom models                                                        |
+| `start_thread`              | Starts a thread in a project with a first prompt                                                                       |
+| `send_message`              | Sends a message; queued behind a running turn, never interrupts; `mode: "steer"` asks the running turn to take it      |
+| `wait_for_thread`           | Waits up to 50 s for the turn to settle or need a person; a timeout never stops the work                               |
+| `read_thread`               | The thread's status and a page of messages; long messages and older pages are reachable with `textOffset` and `cursor` |
+| `list_pending_requests`     | Open questions and approvals                                                                                           |
+| `answer_question`           | Answers an open question                                                                                               |
+| `interrupt_turn`            | Stops a running turn                                                                                                   |
+| `get_turn_diff`             | One turn's patch, paged                                                                                                |
+| `git_status`                | Branch, ahead/behind and changed files of the thread's folder                                                          |
 
 Every result is capped at 80,000 characters and says that thread content is untrusted
 output from agents and tools. Mutating tools take an optional `clientRequestId`, so an agent
@@ -59,6 +59,40 @@ can retry a call without starting a second turn.
 
 Codex stops a tool call after 60 seconds by default, so one wait lasts at most 50 seconds and
 an agent waits longer by calling it again.
+
+## From a shell: `bibcode thread`
+
+`bibcode thread` calls the same tools from a terminal or a script. It runs on the host where
+the server runs (the desktop app's executable takes it as `<desktop exe> thread`, like
+`mcp`), finds the server and signs in as `bibcode mcp` does, and revokes its credential
+when it exits. While it runs it shows as one **MCP · bibcode thread** row in **Authorized
+clients**.
+
+| Command                                    | What it does                                                                 |
+| ------------------------------------------ | ---------------------------------------------------------------------------- |
+| `bibcode thread list`                      | Projects with their folders, and their threads with each status              |
+| `bibcode thread start <project> <message>` | Starts a thread; `.` is the project whose folder holds the current directory |
+| `bibcode thread send <thread> <message>`   | Sends a message; it queues behind a running turn and never interrupts it     |
+| `bibcode thread show <thread>`             | The thread's status and its latest messages                                  |
+
+- Pass `-` as the message to read it from standard input.
+- `start` takes `--title`, `--provider <instance>` and `--model`. Without them it uses the
+  project's default model, else the Default Agent's.
+- `--wait` (on `start` and `send`) waits until the turn settles or needs a person, in
+  30-second calls of `wait_for_thread`, and prints the reply. Stopping it with Ctrl-C stops
+  only the waiting: the turn goes on.
+- `--json` prints one JSON document. For `start` and `send` it is
+  `{ "threadId", "messageId", "status", "reply", "error" }`, also on failure.
+- `--base-dir <root>` picks another data root, as for `bibcode mcp`.
+
+It exits 0 on success, 1 on a failure or a turn that ended interrupted, failed or
+undelivered, and 2 when the thread waits on a person (an approval or a question): answer it
+in BiBCode. With **MCP server** off it exits 1 with the same message as `bibcode mcp`.
+
+```sh
+bibcode thread start . "Summarize the README" --wait
+echo "Now list the open TODOs" | bibcode thread send <thread id> - --wait --json
+```
 
 ## What it can and cannot do
 

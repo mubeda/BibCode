@@ -1724,7 +1724,8 @@ Do not run destructive worktree scenarios against a user repository.
 
 Run on each desktop (macOS, Windows, Linux) and on a server, against a disposable
 project. The focused gates are `cargo test -p bibcode-server --lib -- mcp::
-mcp_tools_tests connect_mcp auth::service::tests::the_mcp` and
+mcp_tools_tests connect_mcp auth::service::tests::the_mcp` (`mcp::` includes the
+`bibcode thread` tests in `mcp::thread_cli`) and
 `vp test run --project unit src/components/settings/AgentIntegrationsSection.test.tsx`
 from `apps/web`.
 
@@ -1744,7 +1745,14 @@ from `apps/web`.
 6. On Windows, run the desktop executable's `mcp` from an agent and check that
    stdout carries only JSON-RPC (no console output mixed in). A Windows update
    ends it with the app.
-7. Over SSH and in WSL, see [SSH environments](./ssh-environments.md#outside-agents-over-ssh).
+7. From a terminal in the project's folder, run `bibcode thread start . "Say hello"
+   --wait` (the desktop executable's `thread` on a desktop): it prints the reply and
+   exits 0, and **MCP · bibcode thread** shows in **Authorized clients** only while
+   it runs. `bibcode thread list --json` lists the thread. With a Supervised thread
+   stopped at an approval, `send <thread> <message> --wait` exits 2. With **MCP
+   server** off, `bibcode thread list` exits 1 naming the setting. On Windows, check
+   that the desktop executable's output reaches the terminal and a pipe.
+8. Over SSH and in WSL, see [SSH environments](./ssh-environments.md#outside-agents-over-ssh).
 
 Record the agent versions, the protocol version each negotiated and every
 message shown in the execution report.

@@ -2044,9 +2044,10 @@ bounded memory, and works while the server is stopped.
   scripts.
 - The restart waiter of a Windows update treats a `bibcode-desktop.exe` with a
   window as the relaunched app, so the profiler's windowless `profiler mcp`
-  server, an outside agent's `mcp` relay and the crash monitor do not count. The
-  passive installer's preinstall hook ends every same-user `bibcode-desktop.exe`,
-  both MCP servers included; the agent restarts its MCP server afterwards.
+  server, an outside agent's `mcp` relay, a `thread` command and the crash
+  monitor do not count. The passive installer's preinstall hook ends every
+  same-user `bibcode-desktop.exe`, both MCP servers and a running `thread`
+  included; the agent restarts its MCP server afterwards.
 
 ## Device previews
 

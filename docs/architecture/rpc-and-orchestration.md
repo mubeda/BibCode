@@ -3308,6 +3308,13 @@ workspace admission and receipt replay exactly as a WebSocket request does.
 - **Bounds.** At most 8 calls and 4 waits per session and 32 waits per
   environment. `enableMcpServer` off refuses calls with `McpServerDisabledError`
   and ends waits; shutdown ends them right after the profiler starts stopping.
+- **Clients.** `bibcode mcp` relays an agent's messages unchanged. `bibcode thread`
+  (`mcp::thread_cli`) calls the same tools itself in the modern era, over the
+  relay's `Connection` (setting check, endpoint proof, credential minted on first
+  call and revoked on exit, orphan sweep). It resolves `start .` from
+  `list_projects_and_threads`'s `workspaceRoot`, sends a fresh `clientRequestId`
+  with each start and send, and loops `wait_for_thread` in 30 s slices for
+  `--wait`.
 
 ## Targeted Activity cancellation flow
 
