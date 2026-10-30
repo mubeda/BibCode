@@ -85,6 +85,18 @@ vi.mock("~/state/server", () => ({
 vi.mock("~/state/environments", () => ({
   usePrimaryEnvironment: () => ({ environmentId: "local" }),
   usePrimaryEnvironmentId: () => "local",
+  // Settings → Agents also mounts Agent integrations, which picks among connected environments.
+  useEnvironments: () => ({
+    environments: [
+      {
+        environmentId: "local",
+        label: "local",
+        connection: { phase: "connected" },
+        serverConfig: null,
+      },
+    ],
+    isReady: true,
+  }),
   useEnvironment: (environmentId: string | null) =>
     environmentId === null ? null : { label: environmentId, connection: { phase: "connected" } },
 }));
