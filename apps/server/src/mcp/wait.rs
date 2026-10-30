@@ -5,17 +5,23 @@
 //! thread's events, and re-reads one targeted wait state at most once per 100 ms burst. It
 //! returns when the selected turn settles, the thread needs a person, delivery fails, the turn
 //! errors, or the timeout passes. A timeout never cancels work. Returning, timing out, a
-//! cancelled call, the setting turning off, and server shutdown all drop the receiver (#113).
+//! cancelled call, the setting turning off, and server shutdown all drop the receiver (#113),
+//! and they end the call even while a read of the store is still pending.
 
 use std::time::Duration;
 
 use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
-use tokio::{sync::broadcast::error::RecvError, time::Instant};
+use tokio::{
+    sync::{broadcast::error::RecvError, watch},
+    time::Instant,
+};
+use tokio_util::sync::CancellationToken;
 
 use super::{
     control::{
-        DISABLED_MESSAGE, DISABLED_TAG, MESSAGE_TEXT_CHARS, ProgressSink, ToolCall, derive_status,
+        DISABLED_MESSAGE, DISABLED_TAG, MESSAGE_TEXT_CHARS, McpServerSettings, ProgressSink,
+        ToolCall, derive_status,
     },
     protocol::{tool_result, typed_tool_failure},
 };
@@ -75,14 +81,33 @@ pub(crate) async fn wait_for_thread(
         .map_or(DEFAULT_TIMEOUT_MS, |ms| u64::try_from(ms).unwrap_or(0));
     let effective_timeout_ms = requested.min(MOST_TIMEOUT_MS);
     let control = call.control;
+    // The deadline, cancellation, shutdown and the off switch bound every read of the store
+    // too, so a stalled read never holds the call past them.
+    let deadline = Instant::now() + Duration::from_millis(effective_timeout_ms);
     // Subscribe before the first read, so no event between the read and the wait is missed.
     let mut events = control.engine().subscribe_events();
     let mut settings = control.settings_signal();
     let shutdown = control.shutdown_token();
-    call.thread(&thread_id).await?;
-    let deadline = Instant::now() + Duration::from_millis(effective_timeout_ms);
+    let ended = |stop: Stop, state: Option<&WaitState>| match (stop, state) {
+        (Stop::Deadline, Some(state)) => Ok(finish(&thread_id, state, effective_timeout_ms, true)),
+        (stop, _) => Err(stop.failure()),
+    };
+    match bounded(
+        stopped(call, &shutdown, &mut settings, deadline),
+        call.thread(&thread_id),
+    )
+    .await
+    {
+        Ok(found) => {
+            found?;
+        }
+        Err(stop) => return ended(stop, None),
+    }
     let read = || read_wait_state(control.repositories(), &thread_id, message_id.as_deref());
-    let mut state = read().await.map_err(storage_failure)?;
+    let mut state = match bounded(stopped(call, &shutdown, &mut settings, deadline), read()).await {
+        Ok(state) => state.map_err(storage_failure)?,
+        Err(stop) => return ended(stop, None),
+    };
     let mut progress = progress.map(|(sink, token)| Progress {
         sink,
         token,
@@ -100,28 +125,19 @@ pub(crate) async fn wait_for_thread(
         }
         tokio::select! {
             biased;
-            () = call.cancellation.cancelled() => {
-                return Err(typed_tool_failure("McpCancelledError", "The wait was cancelled."));
-            }
-            () = shutdown.cancelled() => {
-                return Err(typed_tool_failure(
-                    "McpServerStoppingError",
-                    "This BiBCode server is shutting down; the work goes on. Wait again once it is back.",
-                ));
-            }
-            changed = settings.changed() => {
-                if changed.is_err() || !settings.borrow_and_update().enabled {
-                    return Err(typed_tool_failure(DISABLED_TAG, DISABLED_MESSAGE));
-                }
-            }
-            () = tokio::time::sleep_until(deadline) => {
-                return Ok(finish(&thread_id, &state, effective_timeout_ms, true));
+            stop = stopped(call, &shutdown, &mut settings, deadline) => {
+                return ended(stop, Some(&state));
             }
             () = async { tokio::time::sleep_until(reread_at.unwrap_or(deadline)).await },
                 if reread_at.is_some() =>
             {
                 reread_at = None;
-                state = read().await.map_err(storage_failure)?;
+                state = match bounded(stopped(call, &shutdown, &mut settings, deadline), read())
+                    .await
+                {
+                    Ok(read) => read.map_err(storage_failure)?,
+                    Err(stop) => return ended(stop, Some(&state)),
+                };
             }
             _ = ticker.tick() => {
                 if let Some(progress) = &mut progress {
@@ -136,14 +152,77 @@ pub(crate) async fn wait_for_thread(
                 Err(RecvError::Lagged(_)) => {
                     reread_at.get_or_insert_with(|| Instant::now() + REREAD_DELAY);
                 }
-                Err(RecvError::Closed) => {
-                    return Err(typed_tool_failure(
-                        "McpServerStoppingError",
-                        "This BiBCode server is shutting down; the work goes on. Wait again once it is back.",
-                    ));
-                }
+                Err(RecvError::Closed) => return Err(Stop::Stopping.failure()),
             },
         }
+    }
+}
+
+/// Why a wait ends before what it waits for.
+enum Stop {
+    Cancelled,
+    Stopping,
+    Disabled,
+    Deadline,
+}
+
+impl Stop {
+    /// The failure for every stop but a deadline that has a state to report. A deadline that
+    /// passes before the first read answers has none.
+    fn failure(self) -> Value {
+        match self {
+            Self::Cancelled => typed_tool_failure("McpCancelledError", "The wait was cancelled."),
+            Self::Stopping => typed_tool_failure(
+                "McpServerStoppingError",
+                "This BiBCode server is shutting down; the work goes on. Wait again once it is back.",
+            ),
+            Self::Disabled => typed_tool_failure(DISABLED_TAG, DISABLED_MESSAGE),
+            Self::Deadline => {
+                tracing::warn!("wait_for_thread reached its deadline before the store answered");
+                typed_tool_failure(
+                    "McpStorageError",
+                    "BiBCode's store did not answer before the wait ended; the work goes on. Wait again.",
+                )
+            }
+        }
+    }
+}
+
+/// Ends when the wait must: its call is cancelled, the server stops, the setting turns off,
+/// or the deadline passes.
+async fn stopped(
+    call: &ToolCall<'_>,
+    shutdown: &CancellationToken,
+    settings: &mut watch::Receiver<McpServerSettings>,
+    deadline: Instant,
+) -> Stop {
+    loop {
+        if !settings.borrow_and_update().enabled {
+            return Stop::Disabled;
+        }
+        tokio::select! {
+            biased;
+            () = call.cancellation.cancelled() => return Stop::Cancelled,
+            () = shutdown.cancelled() => return Stop::Stopping,
+            changed = settings.changed() => {
+                if changed.is_err() {
+                    return Stop::Disabled;
+                }
+            }
+            () = tokio::time::sleep_until(deadline) => return Stop::Deadline,
+        }
+    }
+}
+
+/// `work`, unless `stop` ends first.
+async fn bounded<T>(
+    stop: impl Future<Output = Stop>,
+    work: impl Future<Output = T>,
+) -> Result<T, Stop> {
+    tokio::select! {
+        biased;
+        value = work => Ok(value),
+        stop = stop => Err(stop),
     }
 }
 
