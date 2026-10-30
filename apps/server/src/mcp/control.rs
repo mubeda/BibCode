@@ -23,7 +23,7 @@ use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use super::protocol::{Cut, tool_descriptor, tool_result, typed_tool_failure};
+use super::protocol::{Cut, fit_list, tool_descriptor, tool_result, typed_tool_failure};
 use crate::{
     auth::{AuthService, Principal, SCOPE_ORCHESTRATION_OPERATE, SCOPE_ORCHESTRATION_READ},
     orchestration::OrchestrationEngine,
@@ -953,16 +953,17 @@ impl ToolCall<'_> {
         });
         let total = threads.len();
         let page: Vec<Value> = threads.into_iter().skip(offset).take(limit).collect();
-        let next = offset + page.len();
-        Ok(tool_result(
-            json!({
-                "projects": projects,
-                "threads": page,
-                "threadCount": total,
-                "nextCursor": (next < total).then(|| format!("t:{next}")),
-            }),
-            &[("/threads", Cut::Back), ("/projects", Cut::Back)],
-        ))
+        let mut next = offset + page.len();
+        let mut content = json!({
+            "projects": projects,
+            "threads": page,
+            "threadCount": total,
+            "nextCursor": null,
+        });
+        // The cursor continues after the last thread this page returns.
+        next -= fit_list(&mut content, "/threads", Cut::Back, 1);
+        content["nextCursor"] = (next < total).then(|| format!("t:{next}")).into();
+        Ok(tool_result(content, &[("/projects", Cut::Back)]))
     }
 
     async fn list_providers_and_models(&self) -> ToolResult {
@@ -1334,21 +1335,26 @@ impl ToolCall<'_> {
         let page = read_message_page(self.control.repositories(), &thread_id, before, limit)
             .await
             .map_err(storage_failure)?;
-        Ok(tool_result(
-            json!({
-                "threadId": thread.thread_id,
-                "title": thread.title,
-                "runtimeMode": thread.runtime_mode,
-                "hasPendingApprovals": thread.pending_approval_count > 0,
-                "hasPendingUserInput": thread.pending_user_input_count > 0,
-                "session": page.session,
-                "messages": page.messages,
-                "queuedMessages": page.queued,
-                "queuedCount": page.queued_count,
-                "nextCursor": page.next_cursor,
-            }),
-            &[("/messages", Cut::Front), ("/queuedMessages", Cut::Back)],
-        ))
+        let mut content = json!({
+            "threadId": thread.thread_id,
+            "title": thread.title,
+            "runtimeMode": thread.runtime_mode,
+            "hasPendingApprovals": thread.pending_approval_count > 0,
+            "hasPendingUserInput": thread.pending_user_input_count > 0,
+            "session": page.session,
+            "messages": page.messages,
+            "queuedMessages": page.queued,
+            "queuedCount": page.queued_count,
+            "nextCursor": page.next_cursor,
+        });
+        // Queued messages, which `queuedCount` still counts, give way first. Then the oldest
+        // messages do, and the cursor moves to the oldest one returned, so following it reads
+        // the ones dropped here.
+        fit_list(&mut content, "/queuedMessages", Cut::Back, 0);
+        if fit_list(&mut content, "/messages", Cut::Front, 1) > 0 {
+            content["nextCursor"] = message_cursor(&content["messages"][0]).into();
+        }
+        Ok(tool_result(content, &[]))
     }
 
     async fn list_pending_requests(&self) -> ToolResult {
@@ -1617,6 +1623,15 @@ pub(crate) struct MessagePage {
     pub(crate) rows_read: usize,
 }
 
+/// The cursor that reads the messages older than `message`.
+fn message_cursor(message: &Value) -> String {
+    format!(
+        "{}\u{1f}{}",
+        message["createdAt"].as_str().unwrap_or_default(),
+        message["messageId"].as_str().unwrap_or_default()
+    )
+}
+
 /// One keyset page of a thread's delivered messages, newest `limit` before `before`, in one
 /// SQLite job, plus the session and at most 20 queued messages. Each text is cut at
 /// [`MESSAGE_TEXT_CHARS`] in SQL.
@@ -1669,14 +1684,7 @@ pub(crate) async fn read_message_page(
             let more = messages.len() as i64 > limit;
             messages.truncate(usize::try_from(limit).unwrap_or(0));
             messages.reverse();
-            let next_cursor = more.then(|| {
-                let oldest = &messages[0];
-                format!(
-                    "{}\u{1f}{}",
-                    oldest["createdAt"].as_str().unwrap_or_default(),
-                    oldest["messageId"].as_str().unwrap_or_default()
-                )
-            });
+            let next_cursor = more.then(|| message_cursor(&messages[0]));
             let mut queued_statement = connection.prepare_cached(
                 "SELECT message_id, substr(text, 1, ?), length(text), created_at FROM projection_thread_messages
                  WHERE thread_id = ? AND delivery_state = 'queued' ORDER BY created_at ASC, message_id ASC LIMIT ?",

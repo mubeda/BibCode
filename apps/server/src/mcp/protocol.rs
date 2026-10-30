@@ -255,7 +255,7 @@ pub fn tool_result(mut content: Value, lists: &[(&str, Cut)]) -> Value {
                 let excess = chars(&text).saturating_sub(MAX_RESULT_CHARS);
                 match content.pointer_mut(pointer) {
                     Some(Value::Array(items)) if excess > 0 && !items.is_empty() => {
-                        drop_entries(items, cut, excess);
+                        drop_entries(items, cut, excess, 0);
                     }
                     _ => break,
                 }
@@ -275,11 +275,35 @@ pub fn tool_result(mut content: Value, lists: &[(&str, Cut)]) -> Value {
     })
 }
 
-/// Drops entries from `cut`'s end of `items` until about `excess` characters are gone.
-fn drop_entries(items: &mut Vec<Value>, cut: Cut, excess: usize) {
+/// Room [`fit_list`] leaves for the cursor a paged tool sets after it.
+const CURSOR_ROOM: usize = 256;
+
+/// Drops entries from `cut`'s end of the list at `pointer`, keeping at least `keep`, until
+/// `content` fits in a result with room for a cursor, and sets `truncated` when it drops any.
+/// Returns how many it dropped. A paged tool fits its page here and then sets its cursor from
+/// the entries left, so following the cursor skips nothing; [`tool_result`] cuts after the
+/// cursor is set and suits only lists that have none.
+pub fn fit_list(content: &mut Value, pointer: &str, cut: Cut, keep: usize) -> usize {
+    let limit = MAX_RESULT_CHARS - CURSOR_ROOM;
+    let mut dropped = 0;
+    loop {
+        let excess = chars(&to_json(content)).saturating_sub(limit);
+        match content.pointer_mut(pointer) {
+            Some(Value::Array(items)) if excess > 0 && items.len() > keep => {
+                dropped += drop_entries(items, cut, excess, keep);
+                content["truncated"] = true.into();
+            }
+            _ => return dropped,
+        }
+    }
+}
+
+/// Drops entries from `cut`'s end of `items`, keeping at least `keep`, until about `excess`
+/// characters are gone, and returns how many it dropped.
+fn drop_entries(items: &mut Vec<Value>, cut: Cut, excess: usize, keep: usize) -> usize {
     let mut freed = 0;
     let mut count = 0;
-    while freed < excess && count < items.len() {
+    while freed < excess && count < items.len().saturating_sub(keep) {
         let item = match cut {
             Cut::Front => &items[count],
             Cut::Back => &items[items.len() - 1 - count],
@@ -292,6 +316,7 @@ fn drop_entries(items: &mut Vec<Value>, cut: Cut, excess: usize) {
         Cut::Front => drop(items.drain(..count)),
         Cut::Back => items.truncate(items.len() - count),
     }
+    count
 }
 
 #[must_use]
