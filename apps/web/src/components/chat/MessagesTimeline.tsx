@@ -101,6 +101,7 @@ import {
   resolveAssistantMessageCopyState,
   resolveTimelineIsAtEnd,
   resolveTimelineMaintainScrollAtEnd,
+  resolveTimelineMaintainVisibleContentPosition,
   resolveTimelineMinimapHasPersistentGutter,
   resolveTimelineMinimapHeightStyle,
   resolveTimelineMinimapIndexFromPointer,
@@ -231,6 +232,11 @@ interface MessagesTimelineProps {
    * in the bottom region's height leaves the line they read in place. Defaults to true.
    */
   followsEnd?: boolean;
+  /**
+   * Whether a scroll key's native scroll may still be about to start, during which LegendList
+   * keeps no content position, since a scroll of its own would cancel the key's (#207).
+   */
+  nativeScrollPending?: boolean;
   timelineEntries: ReturnType<typeof deriveTimelineEntries>;
   queuedMessages: ReadonlyArray<TimelineMessage>;
   queuedStatuses: ReadonlyArray<QueuedCardStatus>;
@@ -297,6 +303,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   listRef,
   onListMount,
   followsEnd = true,
+  nativeScrollPending = false,
   timelineEntries,
   queuedMessages,
   queuedStatuses,
@@ -690,12 +697,9 @@ export const MessagesTimeline = memo(function MessagesTimeline({
                     anchored: !!anchoredEndSpace,
                     followsEnd,
                   })}
-                  // A row that changes size above the first visible one, such as a Mermaid
-                  // diagram replacing its source, keeps the line the user reads in place.
-                  maintainVisibleContentPosition={{
-                    data: true,
-                    size: true,
-                  }}
+                  maintainVisibleContentPosition={resolveTimelineMaintainVisibleContentPosition(
+                    nativeScrollPending,
+                  )}
                   onScroll={handleScroll}
                   {...(onRowSizeChanged ? { onItemSizeChanged: onRowSizeChanged } : {})}
                   onMetricsChange={onListMetricsChange}
