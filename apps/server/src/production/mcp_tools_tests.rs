@@ -813,6 +813,122 @@ async fn read_thread_reads_one_page_and_every_character_is_reachable() {
     harness.shutdown().await;
 }
 
+/// A page cut to fit the 80 000-character cap names, as its cursor, the oldest message it
+/// returns, so following `nextCursor` reads every message.
+#[tokio::test]
+async fn a_page_cut_to_fit_continues_from_the_oldest_message_it_returns() {
+    let harness = Harness::new().await;
+    let (agent, _) = harness.agent(McpAccess::FullAccess).await;
+    let (thread_id, prompt_id) = start(&harness, &agent, basic_start()).await;
+    let thread = thread_id.clone();
+    harness
+        .repositories
+        .database()
+        .call(move |connection| {
+            for index in 0..5 {
+                let at = format!("2099-10-30T01:00:0{index}.000Z");
+                connection.execute(
+                    "INSERT INTO projection_thread_messages (message_id, thread_id, turn_id, role, text, is_streaming, created_at, updated_at) VALUES (?, ?, NULL, 'assistant', ?, 0, ?, ?)",
+                    rusqlite::params![format!("long-{index}"), thread, "y".repeat(16_000), at, at],
+                )?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let mut seen = Vec::new();
+    let mut cursor = Value::Null;
+    let mut pages = 0;
+    loop {
+        let read = harness
+            .call(
+                &agent,
+                "read_thread",
+                json!({ "threadId": thread_id, "cursor": cursor }),
+            )
+            .await;
+        assert!(
+            read["content"][0]["text"].as_str().unwrap().chars().count()
+                <= crate::mcp::protocol::MAX_RESULT_CHARS
+        );
+        let read = structured(&read).clone();
+        let messages = read["messages"].as_array().unwrap();
+        assert!(!messages.is_empty(), "{read}");
+        // Newest last, and every page older than the one before it.
+        let ids: Vec<String> = messages
+            .iter()
+            .map(|message| message["messageId"].as_str().unwrap().to_owned())
+            .collect();
+        seen.splice(0..0, ids);
+        pages += 1;
+        if read["nextCursor"].is_null() {
+            break;
+        }
+        cursor = read["nextCursor"].clone();
+        assert!(pages < 10, "the cursor moves");
+    }
+    assert!(pages > 1, "the first page was cut");
+    let mut expected = vec![prompt_id];
+    expected.extend((0..5).map(|index| format!("long-{index}")));
+    assert_eq!(seen, expected);
+    harness.shutdown().await;
+}
+
+/// The same for the thread list: a page cut to fit continues after the last thread it
+/// returns.
+#[tokio::test]
+async fn a_thread_list_cut_to_fit_continues_after_the_last_thread_it_returns() {
+    let harness = Harness::new().await;
+    let (agent, _) = harness.agent(McpAccess::FullAccess).await;
+    for index in 0..60 {
+        harness
+            .engine
+            .dispatch(command(json!({
+                "type": "thread.create", "commandId": format!("create-{index}"),
+                "threadId": format!("wide-{index:02}"), "projectId": "p1",
+                "title": format!("{index:02} {}", "t".repeat(2_000)),
+                "modelSelection": { "instanceId": "codex", "model": "gpt-5" },
+                "runtimeMode": "approval-required", "interactionMode": "default", "branch": null,
+                "worktreePath": null, "createdAt": CREATED_AT,
+            })))
+            .await
+            .expect("thread created");
+    }
+    let mut seen = Vec::new();
+    let mut cursor = Value::Null;
+    let mut pages = 0;
+    let total = loop {
+        let listed = harness
+            .call(
+                &agent,
+                "list_projects_and_threads",
+                json!({ "limit": 200, "cursor": cursor }),
+            )
+            .await;
+        let listed = structured(&listed).clone();
+        seen.extend(
+            listed["threads"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|thread| thread["threadId"].as_str().unwrap().to_owned()),
+        );
+        pages += 1;
+        if listed["nextCursor"].is_null() {
+            break listed["threadCount"].as_u64().unwrap();
+        }
+        cursor = listed["nextCursor"].clone();
+        assert!(pages < 10, "the cursor moves");
+    };
+    assert!(pages > 1, "the first page was cut");
+    assert_eq!(seen.len() as u64, total);
+    seen.sort();
+    seen.dedup();
+    assert_eq!(seen.len() as u64, total, "no thread is returned twice");
+    assert!((0..60).all(|index| seen.contains(&format!("wide-{index:02}"))));
+    harness.shutdown().await;
+}
+
 #[derive(Clone, Default)]
 struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
 

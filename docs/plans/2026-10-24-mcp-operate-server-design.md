@@ -1250,3 +1250,10 @@ updated on 2026-10-27.
   `RECORD_VERSION` is 2. The relay dials the record's `dialHost` and `port` as an address,
   never a name, and a `--url` must name that listener (`localhost` on its port is allowed).
   `dialHost` is now the bind address itself for a loopback bind, not always `127.0.0.1`.
+- **A page cut to fit sets its cursor afterwards.** `read_thread` set `nextCursor` from the
+  page it read and `tool_result` then dropped the oldest messages to meet the 80,000-character
+  cap, so following the cursor skipped them (and a page that fit its `limit` had no cursor at
+  all). `list_projects_and_threads` had the same gap at the back of its thread page.
+  `protocol::fit_list` now cuts a paged list first (keeping at least one entry) and the tool
+  sets its cursor from the entries left. `read_thread` lets queued messages, still counted in
+  `queuedCount`, give way before history.
