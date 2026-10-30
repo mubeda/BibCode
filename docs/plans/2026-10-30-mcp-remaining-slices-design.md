@@ -2925,3 +2925,22 @@ left open.
 - **No Settings UI.** `mcpCapabilities` has no switch until slice T; until then
   `McpCapabilityDisabledError` can only follow a hand-edited settings file, and its message
   already names the section where T puts the switches.
+
+**Review fixes (Codex P2, round 2):**
+
+- **An owned mutation takes its own maintenance admission.** C4 said it holds "the
+  registry admission permit" until settled, but the permit `invoke_local` takes rides in
+  the request context, which unary registrations such as `gitManager.commit` drop before
+  their work ends; the `/mcp` request's HTTP permit ends when the client disconnects. A
+  keyed call now admits `MCP <tool>` as a mutation before it inserts its `running` row and
+  releases it after the outcome write, so update preparation's drain waits for detached
+  work. While maintenance holds admission closed, a keyed call is refused with
+  `UpdateMaintenanceActiveError` and records nothing, so its key stays usable.
+  `invoke_local` also holds its permit until the handler returns, as the WebSocket path
+  and `invoke_local_stream` do. No helper signature changed.
+- **An outcome that cannot be written is `unknown`, never the work's result.** The task
+  answers the caller `McpOutcomeUnknownError` (`reason: "unrecorded"`) and tries to record
+  that answer; only then does it release the admission, slot and claim. If that write
+  fails too, the row stays `running` and every retry answers `unknown`
+  (`reason: "restarted"`); rewriting an unowned `running` row no longer turns a storage
+  error into `McpStorageError`, since the answer is `unknown` either way.
