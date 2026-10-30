@@ -6,6 +6,7 @@
 mod foundation;
 mod thread_actions;
 mod threads;
+mod worktrees;
 
 use std::{sync::Arc, time::Duration};
 
