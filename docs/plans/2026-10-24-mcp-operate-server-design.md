@@ -1257,3 +1257,11 @@ updated on 2026-10-27.
   `protocol::fit_list` now cuts a paged list first (keeping at least one entry) and the tool
   sets its cursor from the entries left. `read_thread` lets queued messages, still counted in
   `queuedCount`, give way before history.
+- **A retry resolves its `clientRequestId` first.** `start_thread`, `send_message` and
+  `answer_question` checked the ceiling, the thread, the project or the open question before
+  looking up the stored request, so a retry whose first answer was lost could fail before it
+  replayed (the question it answered is no longer open; the setting was lowered). The stored
+  request is now read first. Stored commands the engine has not accepted (no receipt, or a
+  `reserved` or `prepared` one) still meet the current ceiling, for the command's own
+  `runtimeMode` and the thread's; accepted and rejected ones go to the engine's replay, which
+  answers as it did the first time.
