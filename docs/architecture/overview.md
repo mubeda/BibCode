@@ -3183,4 +3183,6 @@ view), or free scrolling.
   position (`resolveTimelineMaintainVisibleContentPosition`). A row that
   changes size above the reading line in that window moves it. The wheel, a
   touch and a press scroll at once and do not hold, nor do the composer's
-  PageUp and PageDown, which scroll the list themselves.
+  PageUp and PageDown, the minimap and find, which scroll the list
+  themselves; any of them ends a key's hold at once, so LegendList keeps the
+  reading line in place again while the reader scrolls by other means.
