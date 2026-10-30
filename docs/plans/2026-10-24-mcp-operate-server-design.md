@@ -1131,3 +1131,82 @@ application service. It reuses the existing command admission: the new table
 only keeps a retry byte-identical and holds no replay logic. Pages are read
 directly, waits are short and tied to one turn, and the thread CLI remains a
 follow-up.
+
+## Implementation notes (2026-10-30)
+
+Slice 1 was implemented on `claude/v0131-139-mcp`, based on v0.13.0 (`a0ea849ef9`).
+Before any code, every "Current behavior" claim and every file in "Files to change" was
+re-checked against that commit. The design was verified at `4e023ac5ff`, before v0.12.0
+and v0.13.0. Nothing below changes a settled decision (transport, credential model, trust
+boundary or persisted shape). The changes are a renumbered migration, moved line
+references, one reused file-writing pattern, and the Settings placement that the issue
+updated on 2026-10-27.
+
+**Drift found:**
+
+- **Migration number.** `MIGRATIONS` now ends at 57 (`ProjectionThreadAgentStatus`), and
+  55 is `ProjectionThreadReasoning`. `McpClientAccessAndRequests` is therefore
+  **migration 58**, with a `(58, "mcp_tool_requests")` row in `CORE_TABLES`. The design's
+  shape (nullable `mcp_access` on `auth_pairing_links` and `auth_sessions`, plus
+  `mcp_tool_requests`) is unchanged.
+- **Desktop dispatch.** `desktop_dispatch` (`diagnostics/profiler/cli.rs:144-160`) now
+  also dispatches `diagnostics` (#201), on a `current_thread` Tokio runtime. `mcp` follows
+  that template. It attaches the parent console only when stdin and stdout are terminals,
+  because stdout must carry only JSON-RPC.
+- **Endpoint record precedent.** `server-runtime.json` is still declared but unused
+  (`persistence/state_files.rs:82`). v0.13.0 added `diagnostics-relay.json`, written by
+  `RelayEndpointFile` (`production/diagnostic_logs_relay.rs:1145-1196`): it is written
+  through a temporary file and a rename with mode 0600, after `bind_listener` under the
+  `StoreRuntimeGuard` owner (`lifecycle.rs:440-452`), and removed on drop only while it
+  is still ours. `relay_cli.rs:124` reads it, loopback-only. The MCP endpoint record uses
+  the same write, drop and read discipline. The design's per-boot `proofKey` and the
+  endpoint proof stay as designed: the diagnostics relay trusts the recorded URL without
+  a proof, which is weaker than what this design settled.
+- **Scopes.** v0.13.0 added `diagnostics:read`, and `orchestration:read` now satisfies it
+  one way (`auth/model.rs:30-39`). An `mcp-client` session therefore also satisfies
+  `diagnostics:read`. The audience rule already keeps that session off every RPC and HTTP
+  route except `/mcp`, so nothing changes.
+- **Auth.** `consume_grant` (`auth/service.rs:2202`) still checks no policy, so a
+  data-root pairing link is still accepted by a desktop's in-process server.
+  `issue_offline_share_pairing` (`auth/service.rs:2794`) is the template for the new
+  issuer (custom scopes, subject and label written straight into the data root).
+  `authenticate_token` (`:882`) is the single bearer check that every HTTP, cookie and
+  ticket path goes through. It now refuses the `mcp-client` subject by default, and only
+  a separate MCP-surface authenticate accepts it. That fails closed for any caller added
+  later.
+- **`/mcp`.** The `initialize` echo is now at `connect_mcp.rs:1018` and still falls back
+  to `2025-06-18`; `call_tool` is at `:1072`, and the "valid credential is the operate
+  grant" invariant is at `:1079`. The route is at `http_routes.rs:347` and its handler at
+  `:802`. It still skips `state.authorize`, like the documented precedents
+  `preview_open_url` and `diagnostic_logs_relay`.
+- **RPC registry.** `RpcRegistry::get` is private at `rpc/session.rs:650`. The timing
+  wrapper is `:571-604`, `admit_request` is `:1186`, and
+  `RpcSessionContext::authenticated` is `:332`.
+- **Shutdown.** `quiesce_for_update` is `production/runtime.rs:878`, `begin_stopping`
+  is `:886`, `orchestration.shutdown()` is `:928`, and `end_session` is `:931`. The HTTP
+  dispatch refusal of `thread.turn.start` is now `:786`.
+- **Engine.** `subscribe_events` is `orchestration/engine.rs:2979`. Turn rows still record
+  `pending_message_id` and `assistant_message_id`, and queued deliveries are
+  `provider_turn_outbox` rows. Migrations 54 (`host_thread_id`) and 57 (agent status) add
+  thread fields that the shell builder now emits. `list_projects_and_threads` passes the
+  shell builder's thread fields through instead of re-deriving them.
+- **Profiler.** `is_long_running` is `diagnostics/profiler/latency.rs:106`, and v0.13.0
+  added the diagnostics relay methods there. The profiler stdio MCP
+  (`diagnostics/profiler/mcp.rs`) is unchanged since `4e023ac5ff`.
+- **Existing module.** `apps/server/src/mcp/` already exists and holds
+  `preview_automation.rs`. The new files are added beside it.
+
+**Design adjustments:**
+
+- **Settings placement.** The issue's 2026-10-27 edit moves the MCP row into the **MCP**
+  tab of a **Settings → Agent integrations** section. This slice adds that section with
+  the MCP content only. Webhooks belong to the extended scope, so the tab bar arrives
+  with the second tab. The relay's off message names "Settings → Agent integrations → MCP
+  server".
+- **`rmcp`.** The issue's 2026-10-27 note says to reevaluate the official Rust SDK before
+  writing a third MCP framing. This slice writes none: `mcp/protocol.rs` replaces the
+  profiler's framing and the `/mcp` one, which leaves one copy. No dependency is added.
+- **Origin smoke test.** The design gates the `Origin` 403 on a launch smoke test of every
+  provider. That test needs real provider CLIs and was not run here. The check is
+  implemented and tested (no `Origin`, or this server's own origin, passes), and the
+  untested provider launch is reported as a residual risk.
