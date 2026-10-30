@@ -831,6 +831,17 @@ impl ServerHandle {
             .map(|runtime| runtime.orchestration.event_subscriber_count_for_test())
     }
 
+    /// The production runtime's orchestration engine, so a test can dispatch what a provider
+    /// runtime would.
+    #[cfg(test)]
+    pub(crate) fn orchestration_for_test(
+        &self,
+    ) -> Option<crate::orchestration::OrchestrationEngine> {
+        self._production_runtime
+            .as_ref()
+            .map(|runtime| runtime.orchestration.clone())
+    }
+
     pub fn shutdown(&self) {
         self.shutdown.cancel();
     }

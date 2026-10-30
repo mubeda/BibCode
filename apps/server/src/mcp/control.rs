@@ -583,7 +583,7 @@ fn tool_text(name: &str) -> (&'static str, Value) {
     let object = |properties: Value, required: &[&str]| json!({ "type": "object", "properties": properties, "required": required, "additionalProperties": false });
     match name {
         "list_projects_and_threads" => (
-            "BiBCode projects and their threads, newest first, with each thread's status (idle, running, queued, awaiting_approval, awaiting_input, delivery_failed, error, interrupted), pending flags, latest turn, provider and model.",
+            "BiBCode projects, with their folders, and their threads, newest first, with each thread's status (idle, running, queued, awaiting_approval, awaiting_input, delivery_failed, error, interrupted), pending flags, latest turn, provider and model.",
             object(
                 json!({
                     "projectId": { "type": "string", "description": "Only this project's threads." },
@@ -641,7 +641,7 @@ fn tool_text(name: &str) -> (&'static str, Value) {
             ),
         ),
         "read_thread" => (
-            "A page of a thread's messages, newest last, with queued messages listed apart. Each message's text is cut at 16000 characters with its full length; pass messageId and textOffset to read the rest. cursor pages back through older messages.",
+            "A thread's status and a page of its messages, newest last, with queued messages listed apart. Each message's text is cut at 16000 characters with its full length; pass messageId and textOffset to read the rest. cursor pages back through older messages.",
             object(
                 json!({
                     "threadId": thread,
@@ -1033,6 +1033,8 @@ impl ToolCall<'_> {
                 json!({
                     "projectId": project["id"],
                     "title": project["title"],
+                    // `bibcode thread start .` finds the project that holds the current folder.
+                    "workspaceRoot": project["workspaceRoot"],
                     "defaultModelSelection": project.get("defaultModelSelection"),
                 })
             })
@@ -1438,9 +1440,17 @@ impl ToolCall<'_> {
         let page = read_message_page(self.control.repositories(), &thread_id, before, limit)
             .await
             .map_err(storage_failure)?;
+        let status = derive_status(
+            thread.pending_approval_count > 0,
+            thread.pending_user_input_count > 0,
+            thread.unresolved_delivery_state.is_some(),
+            page.session["status"].as_str(),
+            page.latest_turn_state.as_deref(),
+        );
         let mut content = json!({
             "threadId": thread.thread_id,
             "title": thread.title,
+            "status": status,
             "runtimeMode": thread.runtime_mode,
             "hasPendingApprovals": thread.pending_approval_count > 0,
             "hasPendingUserInput": thread.pending_user_input_count > 0,
@@ -1726,6 +1736,8 @@ pub(crate) struct MessagePage {
     pub(crate) queued: Vec<Value>,
     pub(crate) queued_count: i64,
     pub(crate) next_cursor: Option<String>,
+    /// The state of the thread's latest turn, for its status.
+    pub(crate) latest_turn_state: Option<String>,
     /// How many message rows the page query stepped over: its `LIMIT` bounds it.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) rows_read: usize,
@@ -1812,12 +1824,22 @@ pub(crate) async fn read_message_page(
                 [&thread_id],
                 |row| row.get(0),
             )?;
+            let latest_turn_state = connection
+                .query_row(
+                    "SELECT turn.state FROM projection_threads AS thread
+                       JOIN projection_turns AS turn ON turn.thread_id = thread.thread_id AND turn.turn_id = thread.latest_turn_id
+                      WHERE thread.thread_id = ?",
+                    [&thread_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
             Ok(MessagePage {
                 session,
                 messages,
                 queued,
                 queued_count,
                 next_cursor,
+                latest_turn_state,
                 rows_read,
             })
         })

@@ -156,6 +156,10 @@ pub fn desktop_dispatch(attach_console: fn()) -> Option<i32> {
         attach_console();
         return Some(desktop_diagnostics_dispatch());
     }
+    if command.as_deref() == Some(OsStr::new("thread")) {
+        attach_console();
+        return Some(desktop_thread_dispatch());
+    }
     if command.as_deref() != Some(OsStr::new("profiler")) {
         return None;
     }
@@ -250,6 +254,58 @@ struct DesktopMcpCli {
     dev_url: Option<url::Url>,
     #[command(flatten)]
     args: crate::config::McpArgs,
+}
+
+/// `<desktop exe> thread …` (#139): `bibcode thread` against this desktop's own running
+/// server. A usage error exits 1, not clap's 2, which means a person must answer in BiBCode.
+fn desktop_thread_dispatch() -> i32 {
+    let cli = match DesktopThreadCli::try_parse_from(std::env::args_os().skip(1)) {
+        Ok(cli) => cli,
+        Err(error) => {
+            let _ = error.print();
+            return i32::from(error.exit_code() != 0);
+        }
+    };
+    let options = match crate::config::relay_options(
+        cli.base_dir,
+        cli.dev_url,
+        crate::config::McpArgs {
+            url: None,
+            access: None,
+        },
+    ) {
+        Ok(options) => options,
+        Err(error) => {
+            let _ = writeln!(io::stderr(), "bibcode: {error}");
+            return 1;
+        }
+    };
+    match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime.block_on(crate::mcp::thread_cli::run_thread_cli(options, cli.args)),
+        Err(error) => {
+            let _ = writeln!(io::stderr(), "bibcode: {error}");
+            1
+        }
+    }
+}
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "thread",
+    about = "List, start, message and show this BiBCode app's threads."
+)]
+struct DesktopThreadCli {
+    /// The data root; BIBCODE_HOME or ~/.bibcode by default, as the desktop app uses.
+    #[arg(long, global = true)]
+    base_dir: Option<PathBuf>,
+    /// The dev state's URL, as a development build's server uses.
+    #[arg(long, global = true)]
+    dev_url: Option<url::Url>,
+    #[command(flatten)]
+    args: crate::mcp::thread_cli::ThreadArgs,
 }
 
 #[derive(Debug, Parser)]
@@ -707,6 +763,39 @@ mod tests {
             Some(crate::mcp::control::McpAccess::ReadOnly)
         );
         assert!(DesktopMcpCli::try_parse_from(["mcp", "--access", "everything"]).is_err());
+    }
+
+    #[test]
+    fn the_desktop_executable_parses_a_thread_command() {
+        let cli = DesktopThreadCli::try_parse_from([
+            "thread",
+            "send",
+            "thread-1",
+            "-",
+            "--wait",
+            "--json",
+            "--base-dir",
+            "/data root",
+        ])
+        .expect("a thread command parses");
+        assert_eq!(
+            cli.base_dir.as_deref(),
+            Some(std::path::Path::new("/data root"))
+        );
+        assert!(cli.args.json);
+        let crate::mcp::thread_cli::ThreadCommand::Send {
+            thread,
+            message,
+            wait,
+        } = cli.args.command
+        else {
+            panic!("a send");
+        };
+        assert_eq!(
+            (thread.as_str(), message.as_str(), wait),
+            ("thread-1", "-", true)
+        );
+        assert!(DesktopThreadCli::try_parse_from(["thread", "send", "thread-1"]).is_err());
     }
 
     fn parse(args: &[&str]) -> Result<ProfilerSubcommand, clap::Error> {

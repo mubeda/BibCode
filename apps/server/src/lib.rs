@@ -132,6 +132,12 @@ pub async fn run_cli() -> Result<(), RunError> {
             0 => Ok(()),
             code => std::process::exit(code),
         },
+        CliAction::Thread { options, args } => {
+            match mcp::thread_cli::run_thread_cli(options, args).await {
+                0 => Ok(()),
+                code => std::process::exit(code),
+            }
+        }
         CliAction::Diagnostics { args, state_dir } => {
             match diagnostics::relay_cli::run_diagnostics_cli(args, state_dir).await {
                 0 => Ok(()),
