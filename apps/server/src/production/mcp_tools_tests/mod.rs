@@ -5,6 +5,7 @@
 
 mod foundation;
 mod git;
+mod pull_requests;
 mod thread_actions;
 mod threads;
 mod worktrees;
