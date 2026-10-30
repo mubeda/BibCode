@@ -876,13 +876,13 @@ fn listed(harness: &Harness, agent: &ClientPrincipal) -> Vec<String> {
 async fn a_capability_set_turned_off_hides_and_refuses_its_tools_live() {
     let harness = Harness::new().await;
     let (agent, _) = harness.agent(McpAccess::FullAccess).await;
-    assert_eq!(
-        listed(&harness, &agent),
+    // Later families add their own tools beside these.
+    let defaults = listed(&harness, &agent);
+    assert!(
         threads::TOOLS
             .iter()
-            .map(|spec| spec.name)
-            .collect::<Vec<_>>(),
-        "the defaults list every slice-1 tool"
+            .all(|spec| defaults.iter().any(|name| name == spec.name)),
+        "the defaults list every slice-1 tool: {defaults:?}"
     );
     let (thread_id, _) = start(&harness, &agent, basic_start()).await;
     let mut settings = McpServerSettings {
