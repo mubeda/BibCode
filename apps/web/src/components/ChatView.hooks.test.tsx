@@ -2447,6 +2447,37 @@ describe("ChatView effects (captured and run manually)", () => {
     }
   });
 
+  // Held, LegendList keeps no content position, and streamed growth above the view would move the
+  // line a reader scrolling by wheel or touch is reading.
+  for (const takeover of ["wheel", "touchmove", "pointerdown"] as const) {
+    it(`ends a scroll key's hold once the reader takes over by ${takeover}`, async () => {
+      const { list, cleanups, messageId, onAnchorReady } = await sendTallReply({
+        scrollHeight: 400,
+        clientHeight: 200,
+      });
+      onAnchorReady(messageId, 2);
+      list.scrollNode.scrollTop = 50;
+      const before = h.setStateCalls.length;
+      fireDocument("keydown", timelineKey("ArrowUp", ["button"]));
+      const held = h.setStateCalls
+        .slice(before)
+        .filter((call) => call.next === true && h.stateCalls[call.index]?.initial === false);
+      expect(held, takeover).toHaveLength(1);
+      const index = held[0]!.index;
+
+      list.scrollNode.fire(takeover, { target: { closest: () => null } });
+
+      expect(
+        h.setStateCalls
+          .slice(before)
+          .filter((call) => call.index === index)
+          .map((call) => call.next),
+        takeover,
+      ).toEqual([true, false]);
+      for (const cleanup of cleanups) cleanup();
+    });
+  }
+
   it("keeps following for keys that move nothing or belong to a control", async () => {
     for (const [key, matches, scrollTop] of [
       // Keys that would move nothing: ArrowDown at the end, ArrowUp at the top.
