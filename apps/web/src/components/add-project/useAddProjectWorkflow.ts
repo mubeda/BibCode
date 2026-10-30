@@ -15,10 +15,11 @@ import {
   DEFAULT_SERVER_SETTINGS,
   EnvironmentId,
   PRIMARY_LOCAL_ENVIRONMENT_ID,
-  ProviderInstanceId,
 } from "@bibcode/contracts";
 import { useNavigate } from "@tanstack/react-router";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+
+import { usePrimaryDefaultAgent } from "~/hooks/useSettings";
 
 import { isDesktopLocalConnectionTarget, desktopLocalBackendId } from "~/connection/desktopLocal";
 import { readCurrentEnvironmentPresentationPolicy } from "~/connection/currentEnvironmentPresentation";
@@ -940,6 +941,7 @@ export function useAddProjectWorkflow(input: {
   const desktopLocalBootstraps = useDesktopLocalBootstraps();
   const projects = useProjects();
   const getProjects = useLatestGetter(projects);
+  const getDefaultAgent = useLatestGetter(usePrimaryDefaultAgent());
   const navigate = useNavigate();
   const createProject = useAtomCommand(projectEnvironment.create, { reportFailure: false });
   const createDefaultThread = useAtomCommand(threadEnvironment.create, { reportFailure: false });
@@ -1018,12 +1020,15 @@ export function useAddProjectWorkflow(input: {
           );
           const serverConfig = environment?.serverConfig;
           const settings = serverConfig?.settings ?? DEFAULT_SERVER_SETTINGS;
+          const defaultAgent = getDefaultAgent();
           const selectedAction = resolveEffectiveProviderAgentAction(
             buildProviderAgentActions(serverConfig?.providers ?? [], settings),
-            settings.defaultAgent,
+            defaultAgent,
           );
+          // Adding a project never waits for an agent: before sign-in, or while the server's
+          // agents are unknown, Main still opens on the Default Agent's provider.
           const resolution = resolveProviderSessionSelectionForInstance({
-            instanceId: selectedAction?.entry.instanceId ?? ProviderInstanceId.make("codex"),
+            instanceId: selectedAction?.entry.instanceId ?? defaultAgent.instanceId,
             providers: serverConfig?.providers ?? [],
             settings,
           });
@@ -1088,9 +1093,10 @@ export function useAddProjectWorkflow(input: {
             (candidate) => candidate.environmentId === commandInput.environmentId,
           )?.serverConfig;
           const settings = serverConfig?.settings ?? DEFAULT_SERVER_SETTINGS;
+          const defaultAgent = getDefaultAgent();
           const selectedAction = resolveEffectiveProviderAgentAction(
             buildProviderAgentActions(serverConfig?.providers ?? [], settings),
-            settings.defaultAgent,
+            defaultAgent,
           );
           if (!defaultThreadId) {
             defaultThreadId = newThreadId();
@@ -1100,7 +1106,7 @@ export function useAddProjectWorkflow(input: {
                 candidate.id === commandInput.projectId,
             );
             const resolution = resolveProviderSessionSelectionForInstance({
-              instanceId: selectedAction?.entry.instanceId ?? ProviderInstanceId.make("codex"),
+              instanceId: selectedAction?.entry.instanceId ?? defaultAgent.instanceId,
               providers: serverConfig?.providers ?? [],
               settings,
               projectSelection: project?.defaultModelSelection ?? null,
@@ -1164,6 +1170,7 @@ export function useAddProjectWorkflow(input: {
       createDefaultThread,
       createProject,
       environments,
+      getDefaultAgent,
       getProjects,
       navigate,
     ],

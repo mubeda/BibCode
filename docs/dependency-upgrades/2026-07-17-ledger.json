@@ -63,9 +63,9 @@
       "verificationDate": "2026-09-04",
       "status": "partial",
       "ledgerClosure": {
-        "rows": 257,
+        "rows": 260,
         "statuses": {
-          "green": 132,
+          "green": 135,
           "current": 78,
           "blocked": 42,
           "removed": 5
@@ -310,7 +310,7 @@
   "inventorySummary": {
     "javascriptDirect": 90,
     "javascriptLedger": 92,
-    "rustRegistry": 138,
+    "rustRegistry": 141,
     "rustPath": 3,
     "rustGit": 1,
     "actions": 9,
@@ -3275,6 +3275,42 @@
       "platforms": ["linux", "macos", "windows"],
       "status": "green",
       "notes": "Build dependency: compiles the vendored emulator_controller.proto in pure Rust so the build needs no protoc. 0.10.0 fixes a stack overflow on deeply nested protos and drops the duplicate logos 0.15."
+    },
+    {
+      "key": "rust:workspace:rustls",
+      "name": "rustls",
+      "current": "0.23.46",
+      "target": "0.23.46",
+      "channel": "stable",
+      "source": "https://crates.io/crates/rustls",
+      "cohort": "remote-diagnostics-cli",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "green",
+      "notes": "Already in the graph through reqwest. Direct for the TLS client configuration of `bibcode diagnostics` wss connections (aws-lc-rs provider, platform verifier); covered by remote_cli wss tests and tests/diagnostics_remote_cli.rs."
+    },
+    {
+      "key": "rust:workspace:rustls-platform-verifier",
+      "name": "rustls-platform-verifier",
+      "current": "0.7.0",
+      "target": "0.7.0",
+      "channel": "stable",
+      "source": "https://crates.io/crates/rustls-platform-verifier",
+      "cohort": "remote-diagnostics-cli",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "green",
+      "notes": "Already in the graph through reqwest. Verifies https remotes against the operating system's trust, as reqwest does; covered by the verified and unverifiable wss tests."
+    },
+    {
+      "key": "rust:workspace:tokio-rustls",
+      "name": "tokio-rustls",
+      "current": "0.26.4",
+      "target": "0.26.4",
+      "channel": "stable",
+      "source": "https://crates.io/crates/tokio-rustls",
+      "cohort": "remote-diagnostics-cli",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "green",
+      "notes": "Dev-dependency, already in the graph through reqwest and tokio-tungstenite: the TLS-terminating test proxy in tests/support/tls_fixture.rs."
     },
     {
       "key": "rust:workspace:tokio-stream",

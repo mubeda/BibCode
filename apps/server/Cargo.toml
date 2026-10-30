@@ -1,6 +1,6 @@
 [package]
 name = "bibcode-server"
-version = "0.12.0"
+version = "0.13.0"
 description = "BiBCode Rust server runtime"
 default-run = "bibcode"
 edition.workspace = true
@@ -54,6 +54,8 @@ process-wrap.workspace = true
 prost.workspace = true
 reqwest.workspace = true
 rusqlite.workspace = true
+rustls.workspace = true
+rustls-platform-verifier.workspace = true
 semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -66,7 +68,9 @@ time.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
 tokio-util.workspace = true
-tokio-tungstenite.workspace = true
+# `rustls-tls-native-roots` builds in the rustls connector; the E2EE client passes its own
+# configuration (platform verifier), so the native-roots default is never used.
+tokio-tungstenite = { workspace = true, features = ["rustls-tls-native-roots"] }
 tonic.workspace = true
 tonic-prost.workspace = true
 tower-http.workspace = true
@@ -83,6 +87,7 @@ tonic-prost-build.workspace = true
 
 [dev-dependencies]
 bibcode-server = { workspace = true, features = ["hermetic-test-guard"] }
+tokio-rustls.workspace = true
 tempfile.workspace = true
 time = { workspace = true, features = ["macros"] }
 tokio = { workspace = true, features = ["test-util"] }

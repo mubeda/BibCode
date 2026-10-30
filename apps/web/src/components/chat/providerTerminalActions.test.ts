@@ -175,6 +175,10 @@ describe("resolveProviderTerminalAction", () => {
         executable: "cursor-agent",
         args: ["--yolo", "--model", "cursor-large[effort=high,fast=true]"],
         label: "Cursor Terminal",
+        activity: {
+          driverKind: CURSOR_DRIVER,
+          providerInstanceId: ProviderInstanceId.make("cursor"),
+        },
       },
     },
     {
@@ -189,6 +193,10 @@ describe("resolveProviderTerminalAction", () => {
         executable: "grok",
         args: ["--permission-mode", "bypassPermissions", "--model", "grok-4", "--effort", "high"],
         label: "Grok Terminal",
+        activity: {
+          driverKind: GROK_DRIVER,
+          providerInstanceId: ProviderInstanceId.make("grok"),
+        },
       },
     },
     {
@@ -630,11 +638,16 @@ describe("resolveProviderTerminalAction", () => {
   it.each([
     { driver: CURSOR_DRIVER, executable: "cursor-agent" },
     { driver: GROK_DRIVER, executable: "grok" },
-  ])("never attaches observer activity to $driver terminal commands", ({ driver, executable }) => {
+  ])("names the $driver provider so its status reads unavailable", ({ driver, executable }) => {
     const action = resolveProviderTerminalAction(entry(driver, driver), DEFAULT_SERVER_SETTINGS);
 
     expect(action?.command?.executable).toBe(executable);
-    expect(action?.command).not.toHaveProperty("activity");
+    // The server has no observer for this provider; the identity lets the left panel list the
+    // agent with an unavailable status instead of hiding it (#187).
+    expect(action?.command?.activity).toEqual({
+      driverKind: driver,
+      providerInstanceId: driver,
+    });
   });
 
   it.each([

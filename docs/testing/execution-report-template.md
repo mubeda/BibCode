@@ -299,6 +299,18 @@ Delete the unused result values above. Do not leave an ambiguous status.
 - Light/dark upload and reconnect/Cancel screenshots:
 - Browser queued-data-after-close/Ping-Pong probe; WebKitGTK measured or explicitly not measured:
 
+## Thread memory across reconnects
+
+- Build tested, bundle identifier, WebContent PID and how it was attributed to the app:
+- Spec environment (`BIBCODE_E2E_MEMORY_*`, `BIBCODE_E2E_WEBCONTENT_PID`), prompts and prompt length:
+- Inspector attached (yes/no), and when recording ran:
+- Per reconnect: unchanged or changed, and the resubscribe's item kind (`unchanged` or `snapshot`) and inbound size when observable:
+- Strings of the prompt size per snapshot (`idle-control`, `baseline`, `changed-<half>`, `changed-<last>`, `after-reload`), in count and MB:
+- Strings added since `baseline`, by retaining name, and the top three retaining paths (`heap-snapshot-strings.ts` output):
+- JS heap size per snapshot, and growth per changed reconnect between `baseline` and the last snapshot:
+- Footprint per step (`memory-steps.jsonl`), and 120 seconds after the last step:
+- Paths excluded as harness artifacts (for example WebDriver `__wd_el_*` references):
+
 ## High-latency measurement
 
 - Server build profile, round trips and jitter measured:

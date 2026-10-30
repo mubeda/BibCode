@@ -80,6 +80,8 @@ export const ExecutionEnvironmentCapabilities = Schema.Struct({
   vcsCloneReattach: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   /** `server.getProfilerStatus` and `server.reportProfilerClientBatch`, and `enableProfiler`. */
   profiler: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  /** `server.downloadDiagnosticLogs`: the diagnostic bundle over RPC (#194). */
+  diagnosticLogs: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   /** `device.*` methods, the device media socket, and `enableDevicePreviews`. */
   devicePreviews: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   /** `device.refreshCatalog` reruns device discovery past its cache (#169). */

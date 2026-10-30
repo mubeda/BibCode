@@ -182,6 +182,67 @@ describe("derivePendingApprovals", () => {
   });
 });
 
+describe("expired requests (#187)", () => {
+  const question = {
+    id: "q",
+    header: "Pick",
+    question: "Which?",
+    options: [{ label: "a", description: "A" }],
+    multiSelect: false,
+  };
+  const asked = (id: string, at: string) =>
+    makeActivity({
+      id,
+      createdAt: at,
+      kind: "user-input.requested",
+      summary: "Question",
+      tone: "info",
+      payload: { requestId: "q-1", questions: [question] },
+    });
+  const approval = (id: string, at: string) =>
+    makeActivity({
+      id,
+      createdAt: at,
+      kind: "approval.requested",
+      summary: "Approval",
+      tone: "approval",
+      payload: { requestId: "a-1", requestKind: "command" },
+    });
+  const expired = (id: string, kind: string, requestId: string, at: string) =>
+    makeActivity({
+      id,
+      createdAt: at,
+      kind,
+      summary: "Expired",
+      tone: "approval",
+      payload: { requestId, reason: "session-ended", sessionStatus: "ready" },
+    });
+
+  it("closes an approval and a question the server expired", () => {
+    const activities = [
+      approval("a", "2026-10-27T00:00:01.000Z"),
+      asked("q", "2026-10-27T00:00:02.000Z"),
+      expired("ae", "approval.expired", "a-1", "2026-10-27T00:00:03.000Z"),
+      expired("qe", "user-input.expired", "q-1", "2026-10-27T00:00:03.000Z"),
+    ];
+    expect(derivePendingApprovals(activities)).toEqual([]);
+    expect(derivePendingUserInputs(activities)).toEqual([]);
+  });
+
+  it("reopens a request the provider asks again after its expiry", () => {
+    const activities = [
+      approval("a", "2026-10-27T00:00:01.000Z"),
+      asked("q", "2026-10-27T00:00:01.000Z"),
+      expired("ae", "approval.expired", "a-1", "2026-10-27T00:00:02.000Z"),
+      expired("qe", "user-input.expired", "q-1", "2026-10-27T00:00:02.000Z"),
+      approval("a2", "2026-10-27T00:00:03.000Z"),
+      asked("q2", "2026-10-27T00:00:03.000Z"),
+    ];
+    expect(derivePendingApprovals(activities).map((entry) => entry.requestId)).toEqual(["a-1"]);
+    expect(derivePendingUserInputs(activities).map((entry) => entry.requestId)).toEqual(["q-1"]);
+  });
+});
+
 describe("derivePendingUserInputs", () => {
   it("tracks open structured prompts and removes resolved ones", () => {
     const activities: OrchestrationThreadActivity[] = [

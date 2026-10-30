@@ -5,22 +5,45 @@ import type {
   ActivityActorSummary,
   ActivitySnapshot,
 } from "@bibcode/contracts";
-import { ActivityScopeId, ThreadId } from "@bibcode/contracts";
+import { scopeThreadRef } from "@bibcode/client-runtime/environment";
+import { ActivityScopeId, EnvironmentId, ThreadId } from "@bibcode/contracts";
+import * as Option from "effect/Option";
 import { act, type ReactElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
+
+// The production inline surface: the real pane card, with its data binding
+// reduced to the panel it renders.
+const surface = vi.hoisted(() => ({
+  activityState: null as unknown,
+  panelProps: null as unknown,
+}));
+vi.mock("@effect/atom-react", () => ({ useAtomValue: () => surface.activityState }));
+vi.mock("~/state/activity", () => ({
+  environmentActivity: { stateValueAtom: (target: unknown) => ({ target }) },
+}));
+vi.mock("~/hooks/useSettings", () => ({ useEnvironmentSettings: () => "24-hour" }));
+vi.mock("./activity/ActivityPaneBinding", async () => {
+  const { ActivityPanel: Panel } = await import("./activity/ActivityPanel");
+  return {
+    ActivityPanelBinding: () => <Panel {...(surface.panelProps as ActivityPanelProps)} />,
+  };
+});
 
 import {
   ActivityPanel,
   type ActivityPanelProps,
   type ActivityRosterPageData,
 } from "./activity/ActivityPanel";
-import { RightPanelSheet } from "./RightPanelSheet";
+import { ActivityPane } from "./activity/ActivityPane";
+import { HOST_SURFACE_ID, useCenterPanelStore } from "../centerPanelStore";
 import { TooltipProvider } from "./ui/tooltip";
 
 const mounted: Array<{ readonly root: Root; readonly container: HTMLDivElement }> = [];
 const scopeId = ActivityScopeId.make("scope:surface");
 const threadId = ThreadId.make("thread-1");
+const environmentId = EnvironmentId.make("environment-surface");
+const threadRef = scopeThreadRef(environmentId, threadId);
 
 function actor(
   id: string,
@@ -186,32 +209,97 @@ afterEach(async () => {
   vi.restoreAllMocks();
 });
 
+describe("Activity card layout reporting", () => {
+  it("reports the committed card before paint when it opens and closes", async () => {
+    const props = panelProps({ _tag: "thread", threadId }, vi.fn(), vi.fn());
+    surface.panelProps = props;
+    surface.activityState = {
+      snapshot: Option.some(props.snapshot),
+      status: "live",
+      error: Option.none(),
+      recentEntries: new Map(),
+    };
+    useCenterPanelStore.setState({ byThreadKey: {}, activityPanes: {} });
+    const committed: string[] = [];
+    const onLayoutChange = () => {
+      const card = document.querySelector(`[data-activity-pane="${HOST_SURFACE_ID}"]`);
+      committed.push(card?.getAttribute("data-activity-pane-expanded") ?? "hidden");
+    };
+    const pane = () => (
+      <ActivityPane
+        target={{ environmentId, input: { _tag: "thread", threadId } }}
+        paneOwnerRef={threadRef}
+        paneId={HOST_SURFACE_ID}
+        compact={false}
+        alwaysVisible
+        paneElement={null}
+        onLayoutChange={onLayoutChange}
+      />
+    );
+    const container = await mount(pane());
+    const button = container.querySelector<HTMLButtonElement>(
+      '[data-testid="activity-dock"] button',
+    );
+    expect(button).not.toBeNull();
+    expect(committed.at(-1)).toBe("false");
+
+    surface.activityState = {
+      snapshot: Option.some({ ...props.snapshot, revision: props.snapshot.revision + 1 }),
+      status: "live",
+      error: Option.none(),
+      recentEntries: new Map(),
+    };
+    const beforeUpdate = committed.length;
+    await act(async () => {
+      mounted.at(-1)!.root.render(<TooltipProvider delay={0}>{pane()}</TooltipProvider>);
+    });
+    expect(committed).toHaveLength(beforeUpdate + 1);
+    expect(committed.at(-1)).toBe("false");
+
+    await act(async () => button?.click());
+    expect(committed.at(-1)).toBe("true");
+    await act(async () => button?.click());
+    expect(committed.at(-1)).toBe("false");
+  });
+});
+
 describe("Activity cancellation surfaces", () => {
   it.each([
-    ["right panel", false, "Enter"],
-    ["responsive sheet", true, " "],
+    ["a wide window", 1_200, "Enter"],
+    ["a compact window", 640, " "],
   ] as const)(
-    "keeps the trailing Stop action keyboard-reachable in the %s",
-    async (_name, sheet, key) => {
-      if (sheet) {
-        window.innerWidth = 640;
-        window.dispatchEvent(new Event("resize"));
-      }
+    "keeps the trailing Stop action keyboard-reachable in a chat's inline panel in %s",
+    async (_name, width, key) => {
+      window.innerWidth = width;
+      window.dispatchEvent(new Event("resize"));
       const onCancelActor = vi.fn();
       const onNavigate = vi.fn();
-      const roster = (
-        <ActivityPanel {...panelProps({ _tag: "thread", threadId }, onCancelActor, onNavigate)} />
-      );
+      const props = panelProps({ _tag: "thread", threadId }, onCancelActor, onNavigate);
+      surface.panelProps = props;
+      surface.activityState = {
+        snapshot: Option.some(props.snapshot),
+        status: "live",
+        error: Option.none(),
+        recentEntries: new Map(),
+      };
+      useCenterPanelStore.setState({ byThreadKey: {}, activityPanes: {} });
+      useCenterPanelStore
+        .getState()
+        .setActivityPaneExpanded(threadRef, HOST_SURFACE_ID, true, "subagents");
       const container = await mount(
-        sheet ? (
-          <RightPanelSheet open onClose={vi.fn()}>
-            {roster}
-          </RightPanelSheet>
-        ) : (
-          <section aria-label="Activity right panel">{roster}</section>
-        ),
+        <ActivityPane
+          target={{ environmentId, input: { _tag: "thread", threadId } }}
+          paneOwnerRef={threadRef}
+          paneId={HOST_SURFACE_ID}
+          compact={width < 1_200}
+          alwaysVisible
+          paneElement={null}
+        />,
       );
-      const searchRoot = sheet ? document.body : container;
+      const searchRoot = container;
+      expect(
+        container.querySelector(`[data-activity-pane="${HOST_SURFACE_ID}"] [data-activity-panel]`),
+      ).not.toBeNull();
       const parentDetail = searchRoot.querySelector<HTMLButtonElement>(
         'button[data-activity-row="actor:parent"]',
       );

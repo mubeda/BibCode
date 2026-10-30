@@ -1417,6 +1417,13 @@ impl ClaudeTaskControlCorrelator {
             && self.pending_terminal_by_task.len() <= ACTIVITY_PAGE_MAX_LENGTH
     }
 
+    /// Subagents whose task id Claude confirmed, with that task.
+    fn mapped_agents(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.agent_by_task
+            .iter()
+            .map(|(task_id, agent_id)| (agent_id.as_str(), task_id.as_str()))
+    }
+
     #[cfg(test)]
     fn active_identity_maps_are_empty(&self) -> bool {
         self.correlations_by_tool_use.is_empty()
@@ -1463,9 +1470,18 @@ struct ClaudeBackgroundTasks {
     /// finishes during a turn needs no bridge: that turn's completion arms a fresh idle deadline,
     /// and a notification Claude replayed before that completion opens the answer's turn with it.
     follow_ups_owed: usize,
+    /// The live set is Claude's own complete list: set by a `background_tasks_changed` whose every
+    /// task was usable, and cleared by an overflow or a list BiBCode could not fully read. Only
+    /// then does a task's absence prove it no longer runs (#206).
+    complete: bool,
 }
 
 impl ClaudeBackgroundTasks {
+    /// The background tasks Claude reports running, when that list is known to be complete.
+    fn complete_live_set(&self) -> Option<&BTreeSet<String>> {
+        (self.complete && !self.overflowed).then_some(&self.live)
+    }
+
     /// Applies one stream message; the live count when it changed or confirmed it.
     fn observe(&mut self, value: &Value, turn_open: bool) -> Option<usize> {
         match value.get("type").and_then(Value::as_str)? {
@@ -1511,14 +1527,21 @@ impl ClaudeBackgroundTasks {
             "task_notification" => self.finish(task_id?, turn_open),
             // The complete live set (Claude Code 2.1.203 and later); it corrects a missed message.
             "background_tasks_changed" => {
-                let tasks = value.get("tasks")?.as_array()?;
+                let Some(tasks) = value.get("tasks").and_then(Value::as_array) else {
+                    self.complete = false;
+                    return Some(());
+                };
                 self.live.clear();
                 self.overflowed = false;
+                let mut complete = true;
                 for task in tasks.iter().filter(|task| !ambient(task)) {
-                    if let Some(task_id) = task.get("task_id").and_then(Value::as_str) {
-                        self.insert(task_id);
+                    match task.get("task_id").and_then(Value::as_str) {
+                        Some(task_id) if !task_id.is_empty() => self.insert(task_id),
+                        // A task BiBCode cannot name could be any of them.
+                        _ => complete = false,
                     }
                 }
+                self.complete = complete;
             }
             // A running task's progress changes nothing, but shows Claude is still reporting.
             "task_progress" => {}
@@ -1540,6 +1563,7 @@ impl ClaudeBackgroundTasks {
             self.live.insert(task_id.to_owned());
         } else if !self.live.contains(task_id) {
             self.overflowed = true;
+            self.complete = false;
         }
     }
 }
@@ -1983,8 +2007,18 @@ impl ClaudeProviderRuntime {
         };
         let pending_turn_started = self.pending_turn_started.take();
         let turn_id = self.current_turn_id.clone();
+        let turn_was_open = self.turn_open;
         let mut output = self.handle_non_usage_raw_value(value, emitted_at_ms, authenticated_hook);
         output.background_tasks = background_tasks;
+        if turn_was_open
+            && !self.turn_open
+            && !authenticated_hook
+            && value.get("type").and_then(Value::as_str) == Some("result")
+        {
+            output
+                .activity
+                .extend(self.close_subagents_absent_at_turn_end(emitted_at_ms));
+        }
         if self.turn_open
             && output
                 .events
@@ -2325,6 +2359,31 @@ impl ClaudeProviderRuntime {
                 .unwrap_or_default(),
             _ => Vec::new(),
         }
+    }
+
+    /// At a turn's end, a subagent whose task Claude confirmed and whose task is missing from
+    /// Claude's complete live set has stopped running: close it if no stop hook did. A subagent
+    /// without a confirmed task, or any while the set is incomplete, waits for its stop hook or
+    /// the process's end (#206).
+    fn close_subagents_absent_at_turn_end(
+        &mut self,
+        emitted_at_ms: u64,
+    ) -> Vec<ProviderActivityMutation> {
+        let Some(live) = self.background_tasks.complete_live_set() else {
+            return Vec::new();
+        };
+        let absent = self
+            .task_control_correlator
+            .mapped_agents()
+            .filter(|(_, task_id)| !live.contains(*task_id))
+            .map(|(agent_id, _)| agent_id.to_owned())
+            .collect::<Vec<_>>();
+        if absent.is_empty() {
+            return Vec::new();
+        }
+        self.activity_tracker
+            .handle_turn_end_absent(&absent, emitted_at_ms)
+            .mutations
     }
 
     fn apply_task_control_effects(
@@ -7110,3 +7169,7 @@ mod tool_result_tests {
 #[cfg(test)]
 #[path = "compaction_turn_tests.rs"]
 mod compaction_turn_tests;
+
+#[cfg(test)]
+#[path = "turn_end_activity_tests.rs"]
+mod turn_end_activity_tests;

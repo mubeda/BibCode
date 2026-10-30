@@ -1224,6 +1224,8 @@ async fn promote_settled_threads(
         // that cannot start yet.
         if head.held
             || engine.thread_turns_reserved(&head.thread_id)
+            // A resumed session still reading the asks its provider kept (#187).
+            || engine.promotion_held_for_ask_recovery(&head.thread_id)
             || !repositories
                 .can_promote_queued_provider_turn(
                     head.thread_id.clone(),

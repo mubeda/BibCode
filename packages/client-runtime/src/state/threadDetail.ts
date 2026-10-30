@@ -23,11 +23,50 @@ function isPlainObject(value: unknown): value is Readonly<Record<string, unknown
   return prototype === Object.prototype || prototype === null;
 }
 
+function entityId(value: unknown): string | undefined {
+  if (!isPlainObject(value)) return undefined;
+  const id = value["id"];
+  return typeof id === "string" ? id : undefined;
+}
+
+/**
+ * The entry of `previous` to compare `item` with: the one at `index`, unless `item` is an entity
+ * whose `id` that entry does not have, then the entry with that `id` (the first, if several have
+ * it). An entry without an `id` is always compared by position.
+ *
+ * The id index is built at the first entry whose position holds another entity. Entries past the
+ * end of `previous` are appended: they use the index only when an earlier entry already built it,
+ * so a patch that keeps its entries in place or appends to them never builds it.
+ */
+function counterpart(
+  previous: ReadonlyArray<unknown>,
+  item: unknown,
+  index: number,
+  byId: { current: Map<string, unknown> | null },
+): unknown {
+  const positional = previous[index];
+  if (positional === item) return positional;
+  const id = entityId(item);
+  if (id === undefined || entityId(positional) === id) return positional;
+  if (index >= previous.length && byId.current === null) return positional;
+  if (byId.current === null) {
+    byId.current = new Map();
+    for (const entry of previous) {
+      const entryId = entityId(entry);
+      if (entryId !== undefined && !byId.current.has(entryId)) byId.current.set(entryId, entry);
+    }
+  }
+  return byId.current.get(id) ?? positional;
+}
+
 /**
  * `next`, keeping `previous` wherever the two are deep-equal.
  *
  * Only arrays and plain objects are compared, element by element and key by key; any other value
  * is kept from `previous` only when identical. A thread is decoded JSON, so this covers all of it.
+ * An array entry with an `id` is compared with the previous entry of that `id`: the server orders
+ * messages by delivery and time, so a turn added during a disconnect can land before entries the
+ * UI already shows, and matching by position then took a resent copy of every later one (#96).
  *
  * `shared` remembers what each `next` object resolved to. A patch keeps every object it did not
  * change, so a source that still holds one costs a lookup rather than another deep comparison,
@@ -39,8 +78,9 @@ function shareUnchanged<T>(previous: unknown, next: T, shared: WeakMap<object, u
   let result: unknown = next;
   if (Array.isArray(previous) && Array.isArray(next)) {
     let unchanged = previous.length === next.length;
+    const byId = { current: null as Map<string, unknown> | null };
     const items = next.map((item: unknown, index) => {
-      const value = shareUnchanged(previous[index], item, shared);
+      const value = shareUnchanged(counterpart(previous, item, index, byId), item, shared);
       if (value !== previous[index]) unchanged = false;
       return value;
     });

@@ -29,8 +29,9 @@ the selected server is removed, the rail returns to Local. Saved servers show
 the name you gave them on this device (see
 [Remote access](./remote-access.md#name-a-saved-server)).
 
-The **Environments | Repositories** switch at the top of the left panel picks
-how projects are listed; the choice is remembered on this device.
+The **Environments | Repositories | Inbox** switch at the top of the left panel
+picks what the panel lists; the choice is remembered on this device. On a
+narrow panel the switch shows only its icons; hovering one names it.
 **Environments** is the per-environment view described above. **Repositories**
 hides the environment rail and lists one read-only card per Git repository,
 matched by its `origin` remote, across every connected environment. Each card
@@ -59,6 +60,28 @@ resets.
 Switching back to **Environments** restores the rail with its previous
 selection.
 
+**Inbox** lists agents across every connected environment, so like
+Repositories it hides the rail. Four tiles sit at the top, each with a live
+count: **All Agents** (every agent), **Needs Attention** (Pending Approval and
+Awaiting Input), **Working**, and **Done**. An agent whose status is unknown
+(stale, not observable on this platform, or on a disconnected environment)
+counts only under All Agents. One tile is always selected, and the list below
+shows that tile's agents, most recent activity first, with the same rows as
+the Agents view. Until you pick a tile, the Inbox shows Needs Attention while
+an agent needs you, otherwise All Agents, and remembers that choice on this
+device only once every environment has reported; a tile you pick is
+remembered at once. Counts show a dash while agents load. When the list may be
+incomplete, a note above it says why: a named server needs attention (its
+data must be recovered, moved or reconfigured; **Show in Environments**
+switches to Environments with that server selected), is not connected (with
+**Open Remote Servers**, or **Diagnostics** for this machine), or is
+reconnecting, or the saved servers couldn't be read (with **Diagnostics**).
+The Intel-build warning and local backend notices appear in the Inbox too.
+Selecting an agent marks it read and opens its worktree with that agent in
+front: its chat (brought back if you had closed every tab), its chat panel, or
+its AI Terminal. The row stays highlighted while that agent is on screen.
+An empty tile says so, for example **No agents are running.**
+
 The **Search** row is followed by an **Agents** nav row, then Projects. Its
 unread-count badge covers agents across all connected environments and is hidden when nothing is unread. Selecting
 the row opens the full-screen Agents view; its top strip has a back arrow for
@@ -67,9 +90,46 @@ badge.
 
 The view's list column provides a filter, grouping by **Status** (the default),
 **Project**, or **Environment**, an unread-only bell, and a menu with **Mark all
-read**. Status groups have counts and appear in fixed **Working** → **Pending
-Approval** → **Awaiting Input** → **Done** order, with Done collapsed by
-default. Each row opens with the project name, the provider icon, the status
+read**. Status groups have counts and appear in a fixed order, with Done
+collapsed by default:
+
+1. **Working**
+2. **Pending Approval**
+3. **Awaiting Input**
+4. **Unknown**
+5. **Done**
+
+Each agent gets its own row: a thread's chat, and each AI Terminal it hosts,
+even in a workspace with no chat session. Selecting a terminal row shows that
+terminal.
+
+**Unknown** holds agents whose status BiBCode cannot vouch for. The row's label
+says why:
+
+- **No update:** the agent was Working but has reported nothing for 30 minutes.
+- **Offline:** its environment is disconnected.
+- **Status unavailable:** BiBCode has no way to observe it. That applies to
+  Cursor and Grok terminals, to every AI Terminal on Windows, and to Claude
+  Terminals running a Claude Code that BiBCode has not verified.
+
+A session that failed reads **Failed** in Done.
+
+**Which AI Terminals report a status.** On macOS and Linux, Claude, Codex and
+OpenCode AI Terminals report their agent's status. A Claude Terminal needs Claude
+Code 2.1.220 to 2.1.312, installed directly or through mise. A newer Claude Code
+reads **Status unavailable** until a BiBCode update verifies it. On macOS it must
+also be Anthropic's signed build. On a slow Linux disk, a Claude Terminal can
+also read **Status unavailable** when copying the build takes longer than
+BiBCode waits. These terminals run with BiBCode's status observer even when
+**AI Terminal** activity is off; that setting now controls only the detailed
+Subagents and Background Tasks activity.
+
+**Requests the agent stopped waiting on.** An approval or question left
+unanswered when its turn ended (Stop, a crash, a restart) is expired and
+leaves Pending Approval and Awaiting Input.
+
+**Workspace cards.** A card's status glyph includes its AI Terminals. A dashed
+circle means an agent whose status is unknown, and it never reads Done. Each row opens with the project name, the provider icon, the status
 dot, and the relative time, then shows the branch as its main line (the
 checkout's current branch, as in the left panel), the thread
 title, a one-line conversation preview, and a footer with the status, the
@@ -151,6 +211,14 @@ instead.
 Use the project `+` action to create a worktree. The Create Worktree dialog has a
 permanent Name field, an optional Smart/GitHub/Branch **Create From** selector,
 an agent picker, advanced options, a Create more toggle, and Ctrl+Enter submit.
+The agent picker starts on **Settings → Agents → Default Agent**, including for
+a project on another server. That setting also chooses the agent of a newly
+added project's Main. If the project's server does not offer that agent, or it
+is not ready there, the picker starts on the first ready chat. A line under the
+picker names the reason, and it goes away when you pick an agent. **Create
+worktree** stays disabled until the project's server is connected, has sent its
+agents, and has one of them ready. Until then, the line says what it is waiting
+for. When no agent is ready, the line says where to sign in to or enable one.
 Selecting any branch suggests its name and shows **Reuse branch**. It is enabled and on by default
 for a free local branch; for a remote branch or a branch already checked out
 elsewhere it stays visible but disabled, with a note explaining that a new
@@ -516,6 +584,12 @@ last. A long paragraph's wrapped lines count as lines. With text selected, or
 with Shift, Alt, Ctrl, or Cmd held, the keys keep their usual meaning.
 These keys and the minimap jump instead of scrolling smoothly when the system
 asks for reduced motion.
+
+While a reply streams, the timeline follows it. Scrolling the timeline yourself
+stops that: the wheel, a touch, the scrollbar, or the arrow keys, PageUp,
+PageDown, Home, End, or Space while the timeline has focus (for example after
+you tab to a button in it). Return to the end, with End or **Scroll to end**,
+and it follows again.
 
 ### Finding text in a chat
 
@@ -1751,22 +1825,32 @@ the setting is off.
 ### Activity and targeted Stop
 
 Activity combines provider-attributed observation with capability-gated
-control. The **Activity** button above the chat shows the provider icon for the
-active scope and the combined **Active** and **Done** counts. One click, or
-**Enter** or **Space**, opens the Activity panel on the section that needs you:
-the one with an error, else the one with running work (Subagents first), else
-the one with the most recent record. With the panel already open, the button
-brings it to the front on that section, moves focus into it, scrolls to the top
-of the section, and never closes it; an open record stays open. When the
+control. The **Activity** button just above the composer shows the provider icon
+for that chat and the combined **Active** and **Done** counts. A Codex Terminal
+shows its own button at the bottom of its pane once BiBCode is observing it.
+
+One click, or **Enter** or **Space**, opens the Activity panel inside the same
+pane, directly above the button, on the section that needs you: the one with an
+error, else the one with running work (Subagents first), else the one with the
+most recent record. Focus moves into the panel. When that is the section you
+left, the record you had open is still open.
+
+Another click on the button, or **Escape** inside the panel, collapses it and
+returns focus to the button. The panel takes space from the pane rather than
+covering it: in a chat, what you were reading stays in place; in a terminal, the
+terminal gives up rows and redraws at its new size.
+
+Each pane has its own panel and remembers whether it was open, and on which
+section and record, after a reload, without taking focus. With split panes,
+every chat and terminal pane keeps its own. The right panel no longer shows
+Activity, and a right panel that last showed it reopens closed. When the
 provider reports both sections, **Subagents** and **Background tasks** tabs at
 the top of the panel switch between them, and a tab marks a stale or failing
 section. A stale or error icon on the button means a section, or the whole
 observation, is degraded; errors win over stale. A section that fails before its
 first record still marks the button, and a click opens it on that error. The
 button's accessible name and tooltip give the counts for each section. Each
-Subagents row in the panel shows one provider icon for its actor, and the same
-Activity presentation is used in the inline right panel and its responsive
-sheet.
+Subagents row in the panel shows one provider icon for its actor.
 
 **Settings → Agents → Always show Activity** (on by default) keeps the button
 above a chat whose provider reports subagents or background tasks even before
@@ -1792,9 +1876,27 @@ immediately and does not open detail. Its accessible label and tooltip name the
 actor and the number of currently active child agents included in the subtree.
 An active actor without a current exact provider target keeps its observed
 **Running** lifecycle and shows read-only **Stop unavailable** in the action
-column. That label performs no RPC and is distinct from server-authoritative
-**Stopping**; it makes restart or target-retirement state explicit without
-inventing cancellation authority.
+column. The label can take keyboard focus, and its tooltip and accessible
+description say the provider doesn't offer a way to stop that subagent from
+BiBCode.
+That label performs no RPC and is distinct from server-authoritative
+**Stopping**; it makes target-retirement state explicit without inventing
+cancellation authority.
+
+A subagent or background task whose provider process ended before it reported
+an end moves to **Done** as **Interrupted**. Its process ends when the chat is
+stopped, removed, suspended when idle, restarted for a setting change, shut down
+for an update, or crashes, or when BiBCode restarts. Its first line says why,
+for example "Claude session ended before this subagent reported; last report 34m
+after it started." Its time reads "Interrupted after …", how long it ran.
+Rows never read
+**Completed** unless the provider reported completion: failed rows read
+"Failed after …" and stopped rows "Stopped after …". If a provider later
+reports the same subagent running again, as a resumed Codex session can, the row
+returns to **Active**. A chat attached to an OpenCode server you run yourself
+keeps its rows as they are, because that server may still be running them. A
+chat from before this behavior, whose owner BiBCode never recorded, counts as
+yours when its own OpenCode provider instance has a **Server URL** set.
 
 **Stop subtree** targets the selected actor and every attributable descendant
 in its canonical subtree; **Stop** targets an actor with no active descendants.

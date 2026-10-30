@@ -1908,9 +1908,16 @@ under the recording line when the runtime still records. The
 status line refreshes every 5 s while the profiler is on and the page
 is visible: recording since, disk use, events, and dropped events. **Open
 folder** works only for the primary environment on desktop; **Export bundle**
-covers only the primary environment and adds crash dumps only with **Include
-crash dumps** (see [Observability](../operations/observability.md)). Both, and
-the checkbox, explain why when disabled. The 20 newest findings follow, each with
+covers the selected environment, whose own server builds the bundle (another
+environment's over its RPC connection, and only when its server advertises
+`capabilities.diagnosticLogs`), and adds crash dumps only with **Include crash
+dumps** (see [Observability](../operations/observability.md#diagnostic-bundle)).
+Both, and the checkbox, explain why when disabled. The page's last section,
+**Diagnostic logs**, downloads the same bundle without crash dumps for exactly
+the environment the route names, else the primary, picked with the Profiler
+section's selector (the page's only one). It refuses, with the environment
+named, one that is not connected, still connecting, or too old, instead of
+downloading another environment's logs. The 20 newest findings follow, each with
 its severity, title, count, and last seen. A server that does not advertise
 `capabilities.profiler` (one older than the profiler) is never asked for its
 status: the section shows only the disabled switch and "This server's BiBCode
@@ -1984,7 +1991,12 @@ bounded memory, and works while the server is stopped.
   results inline. Only `profiler_symbolicate` with `download: true` uses the
   network; `profiler_crash` never downloads. Tool descriptions mark the output
   as untrusted application data. Authentication is filesystem permissions; a
-  remote host is reached as `ssh <host> bibcode profiler mcp`.
+  remote host is reached as `ssh <host> bibcode profiler mcp`. Without SSH,
+  `bibcode diagnostics download` fetches a connected environment's bundle,
+  whose `profiler/` folder holds the same files, through the desktop app after
+  one approval there, or with the app closed through a diagnostics-only
+  credential of its own, `download --remote` (see
+  [Observability](../operations/observability.md#from-the-command-line)).
 - **Skill.** [`docs/skills/bibcode-profiler/`](../skills/bibcode-profiler/SKILL.md)
   uses these readers to monitor, diagnose, and file deduplicated GitHub issues.
 
@@ -2099,7 +2111,7 @@ manager never reads the read model and persists nothing: devices, owners, and
 the deletion list end with the server.
 
 **The Device pane.** `ChatView` renders `DevicePanel` for the active thread and
-passes its root thread (chat panels render only Activity, so their devices are
+passes its root thread (chat panels render no right panel, so their devices are
 their host's), and the pane's session is keyed by thread. The thread's device
 surface stores the image the pane last picked or started
 (`{ id: "device", kind: "device", image?: { platform, imageId } }`, an image id
@@ -3087,3 +3099,78 @@ of losing output or widening the boundary; a guard test keeps `eval` and the
 `Function` constructor out of the installed Pele and DOMPurify builds. Diagram
 source and Pele's messages, which can quote it, are never logged: a failure
 logs only `{ operation, code }`.
+
+### Chat timeline following
+
+`ChatView` keeps the timeline in one of three modes: following the end,
+anchoring a sent turn (the sent row glides to `CHAT_LIST_ANCHOR_OFFSET`, 16 px
+below the top, and the turn's end is revealed as the reply grows past the
+view), or free scrolling.
+
+- **Reader takeover.** The reader scrolling stops following: the wheel, a
+  touch move, a pointer press anywhere but a control (a press on a row's
+  control is a click), the scrolling keys (ArrowUp, ArrowDown, PageUp,
+  PageDown, Home, End, Space and Shift+Space) pressed with focus inside the
+  timeline, or with focus on the page itself after the last press was inside
+  the timeline (clicking its text, or a button WebKit does not focus, leaves
+  focus on the body, and the browser then scrolls the timeline with the key),
+  PageUp and PageDown from the composer, the minimap and find. Keys are heard
+  on the document after they bubble, so a control's `preventDefault`,
+  React's included, is seen. A key that a control owns, that edits text, that
+  activates a focused control (Space, except on a link, where it scrolls), or
+  that would move nothing at the end it points to leaves following on.
+  Returning to the end resumes following. `MessagesTimeline` reports when its
+  list mounts and unmounts (`onListMount`), and the listeners bind to the
+  mounted list, so a new thread, which shows an empty state until its first
+  turn, binds with that turn.
+- **Withdrawn requests.** LegendList can hold an imperative scroll for up to
+  800 ms while rows settle, clamps it to the content it has laid out, and a
+  wheel or key scroll does not cancel it. Every takeover withdraws them
+  through `cancelScrollRequests()`, which
+  `patches/@legendapp__list@3.3.10.patch` adds. It drops a request waiting for
+  rows to settle and the completion checks and target of a scroll under way,
+  and it stops a glide the browser is still running where it is, and
+  LegendList's own keeping of the list at its end, including a pass queued for
+  the next frame after a row grew; with nothing under way it changes nothing.
+  During an
+  animated scroll LegendList draws the rows offset by the adjustment it holds
+  for rows that resized during it; the method commits that adjustment as a
+  scroll by the same amount, so the content stays where the reader sees it
+  and no later scroll applies it; it also releases the anchor a recent data
+  change locked, which was recorded before that adjustment and would apply it
+  a second time. A held request therefore never moves a reader who took over.
+- **Bottom region.** LegendList keeps the list at its end
+  (`maintainScrollAtEnd`) only while the timeline follows it and no sent turn
+  is anchored (`resolveTimelineMaintainScrollAtEnd`). LegendList also scrolls
+  by the growth of its bottom inset whenever the list sits within its end
+  threshold, so while the reader is away `MessagesTimeline` lets the inset it
+  gives the list shrink with the bottom region but not grow, until they return
+  to the end. Once the reader scrolls away, a change in the bottom region's
+  height (the composer growing as they type, an Activity card opening or
+  closing above it) leaves the line they read in place, even when the list
+  sits within LegendList's end threshold or the thread is shorter than the
+  view. The Activity card reports each commit to `ChatView` in a layout effect,
+  so a changed card height reaches the timeline before paint. For a reopened
+  list that still holds its initial end target, the LegendList patch applies a
+  growing bottom inset in that same pass and coalesces repeated corrections
+  until native scroll catches up. Reader takeover cancels the pending end
+  correction and the preserved target.
+- **Released sent row.** A sent row the reader scrolled away from stays
+  released until the next send or thread. LegendList reports the anchor ready
+  again whenever the anchored end space changes size, once per delivery; a
+  released row then only goes on holding the reader's place. A send names its
+  row pending before the previous row stops being positioned, so a takeover
+  releases the pending row first.
+- **Settling.** The glide settles on `scrollend` or after 750 ms, whichever
+  comes first. A turn taller than the view is pinned where it is and then
+  follows its end. A turn that fits lands its sent row by measuring the row
+  on screen (`[data-message-id]` against the scroller's top), not from
+  LegendList's positions. It stays unsettled, with following waiting, until
+  the row is within 1 px of its offset: each non-animated landing is measured
+  again once LegendList has finished it (or after 1 s) and two frames of
+  layout have passed, so a landing clamped to content that had not caught up
+  lands again, for up to 2 s and 20 landings. It then settles where it is. A
+  turn that grows past the view meanwhile settles at once and follows its
+  end. A takeover, a later send (its glide replaces the landing)
+  or another thread (the timeline remounts, and LegendList drops its
+  requests) ends the landing; only a takeover needs to withdraw it.

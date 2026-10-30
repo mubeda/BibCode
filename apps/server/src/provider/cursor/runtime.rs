@@ -11,7 +11,9 @@ use tokio::{
 };
 use uuid::Uuid;
 
-use crate::provider::{OptionRefusal, RefusedOption, default_model_unavailable_refusal};
+use crate::provider::{
+    OptionRefusal, RefusedOption, RequestScope, default_model_unavailable_refusal,
+};
 
 use super::{
     acp::{
@@ -797,9 +799,12 @@ impl CursorSessionRuntime {
         mut incoming: mpsc::UnboundedReceiver<IncomingEvent>,
     ) {
         let runtime = self.clone();
+        let request_scope = RequestScope::new();
         let task = tokio::spawn(async move {
             while let Some(event) = incoming.recv().await {
-                runtime.handle_incoming(connection.clone(), event).await;
+                runtime
+                    .handle_incoming(connection.clone(), request_scope, event)
+                    .await;
             }
         });
         tokio::spawn({
@@ -812,7 +817,12 @@ impl CursorSessionRuntime {
         });
     }
 
-    async fn handle_incoming(&self, connection: AcpJsonRpcConnection, event: IncomingEvent) {
+    async fn handle_incoming(
+        &self,
+        connection: AcpJsonRpcConnection,
+        request_scope: RequestScope,
+        event: IncomingEvent,
+    ) {
         match event {
             IncomingEvent::Notification { method, params } => {
                 self.handle_notification(method, params).await;
@@ -824,7 +834,14 @@ impl CursorSessionRuntime {
                 params,
             } => {
                 if let Err(error) = self
-                    .handle_request(connection, correlation_id, wire_id, method, params)
+                    .handle_request(
+                        connection,
+                        request_scope,
+                        correlation_id,
+                        wire_id,
+                        method,
+                        params,
+                    )
                     .await
                 {
                     self.emit(
@@ -991,6 +1008,7 @@ impl CursorSessionRuntime {
     async fn handle_request(
         &self,
         connection: AcpJsonRpcConnection,
+        request_scope: RequestScope,
         correlation_id: String,
         wire_id: Value,
         method: String,
@@ -998,7 +1016,7 @@ impl CursorSessionRuntime {
     ) -> Result<(), CursorRuntimeError> {
         match method.as_str() {
             "cursor/ask_question" => {
-                let request_id = format!("user-input:{correlation_id}");
+                let request_id = request_scope.user_input_id(&correlation_id);
                 let turn_id = self.inner.active_turn_id.lock().await.clone();
                 let questions = params
                     .get("questions")
@@ -1074,7 +1092,7 @@ impl CursorSessionRuntime {
                 Ok(())
             }
             "session/request_permission" => {
-                let request_id = format!("approval:{correlation_id}");
+                let request_id = request_scope.approval_id(&correlation_id);
                 let turn_id = self.inner.active_turn_id.lock().await.clone();
                 let options = params
                     .get("options")
@@ -1128,7 +1146,7 @@ impl CursorSessionRuntime {
                 Ok(())
             }
             "_x.ai/ask_user_question" | "x.ai/ask_user_question" => {
-                let request_id = format!("user-input:{correlation_id}");
+                let request_id = request_scope.user_input_id(&correlation_id);
                 let turn_id = self.inner.active_turn_id.lock().await.clone();
                 let questions = params
                     .get("params")

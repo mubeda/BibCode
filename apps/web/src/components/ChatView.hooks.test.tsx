@@ -902,6 +902,24 @@ function seedGitStatus(isRepo: boolean): void {
   h.queryDataByKey.set("vcs.status", { isRepo });
 }
 
+/** A thread with one earlier turn, so the timeline shows its list rather than the empty state. */
+function makeThreadWithEarlierTurn(): Thread {
+  return makeThread({
+    messages: [
+      {
+        id: MessageId.make("earlier-message"),
+        role: "user",
+        text: "an earlier message",
+        attachments: [],
+        turnId: null,
+        createdAt: now,
+        updatedAt: now,
+        streaming: false,
+      },
+    ],
+  });
+}
+
 function seedConnectedServerThread(thread: Thread = makeThread()): void {
   seedEnvironment(makeEnvironmentPresentation());
   seedProject(makeProject());
@@ -1218,34 +1236,111 @@ interface FakeLegendListOptions {
   laggingMaxScroll?: number;
   /** Runs when a `scrollToOffset` was clamped by the lagging content height. */
   onClampedScroll?: () => void;
+  /**
+   * Further lagging content heights, one per later `scrollToOffset`: each clamps at its value
+   * and then catches up, as LegendList's laid-out content can trail its measured rows.
+   */
+  clampSteps?: readonly number[];
+  /** The scroller's content and visible heights, for the keyboard's at-an-end check. */
+  scrollHeight?: number;
+  clientHeight?: number;
+  /**
+   * Mounts the sent row at this content offset: `querySelectorAll` finds it under the message id
+   * the test assigns to `list.sentRowMessageId`, and it moves with `scrollTop`.
+   */
+  sentRowContentTop?: number;
+  /**
+   * Holds every `scrollToOffset` until `runDeferred`, as LegendList holds one while rows settle;
+   * a later request or `cancelScrollRequests` drops the held ones without scrolling.
+   */
+  deferScrolls?: boolean;
 }
 
 function makeLegendList(options: FakeLegendListOptions = {}) {
-  const scrollNodeListeners: Array<{ type: string; handler: () => void; options?: unknown }> = [];
+  const scrollNodeListeners: Array<{
+    type: string;
+    handler: (event?: unknown) => void;
+    options?: unknown;
+  }> = [];
   const calls = {
     scrollToEnd: [] as unknown[],
     scrollToOffset: [] as unknown[],
     scrollToIndex: [] as unknown[],
+    cancelScrollRequests: 0,
   };
   let maxScroll = options.laggingMaxScroll ?? Number.POSITIVE_INFINITY;
+  const clampSteps = [...(options.clampSteps ?? [])];
   const rowSizes = Array.from({ length: options.dataLength ?? 1 }, () => options.rowSize ?? 100);
+  let held: Array<{ offset: number; resolve: () => void }> = [];
+  const dropHeld = () => {
+    for (const request of held) request.resolve();
+    held = [];
+  };
   const scrollNode = {
     scrollTop: options.scroll ?? 0,
+    scrollHeight: options.scrollHeight ?? 10_000,
+    clientHeight: options.clientHeight ?? options.scrollLength ?? 50,
     listeners: scrollNodeListeners,
-    addEventListener: (type: string, handler: () => void, listenerOptions?: unknown) => {
+    addEventListener: (
+      type: string,
+      handler: (event?: unknown) => void,
+      listenerOptions?: unknown,
+    ) => {
       scrollNodeListeners.push({ type, handler, options: listenerOptions });
     },
-    removeEventListener: () => undefined,
-    fire(type: string) {
+    removeEventListener: (type: string, handler: (event?: unknown) => void) => {
+      const index = scrollNodeListeners.findIndex(
+        (listener) => listener.type === type && listener.handler === handler,
+      );
+      if (index >= 0) scrollNodeListeners.splice(index, 1);
+    },
+    /** A node inside the timeline is one marked `inTimeline`, as `timelineKey` targets are. */
+    contains: (node: unknown) =>
+      node === scrollNode || (node as { inTimeline?: boolean } | null)?.inTimeline === true,
+    fire(type: string, event?: unknown) {
       // As in the DOM, a listener added during the dispatch waits for the next event.
       for (const listener of scrollNodeListeners.slice()) {
-        if (listener.type === type) listener.handler();
+        if (listener.type === type) listener.handler(event);
       }
     },
+    getBoundingClientRect: () => ({ top: 0 }),
+    ...(options.sentRowContentTop === undefined
+      ? {}
+      : {
+          querySelectorAll: () => [
+            {
+              getAttribute: () => list.sentRowMessageId,
+              getBoundingClientRect: () => ({
+                top: options.sentRowContentTop! - scrollNode.scrollTop,
+              }),
+            },
+          ],
+        }),
+  };
+  const applyOffset = (offset: number) => {
+    scrollNode.scrollTop = Math.min(offset, maxScroll);
+    if (offset > maxScroll) {
+      maxScroll = clampSteps.shift() ?? Number.POSITIVE_INFINITY;
+      options.onClampedScroll?.();
+    }
   };
   const list = {
     calls,
     scrollNode,
+    sentRowMessageId: null as unknown,
+    /** Runs the scrolls `deferScrolls` held, as LegendList does once rows settle. */
+    runDeferred() {
+      const pending = held;
+      held = [];
+      for (const request of pending) {
+        applyOffset(request.offset);
+        request.resolve();
+      }
+    },
+    cancelScrollRequests: () => {
+      calls.cancelScrollRequests += 1;
+      dropHeld();
+    },
     /** A row grows by `by` px, as a diagram drawing in it would. */
     growRow(index: number, by: number) {
       rowSizes[index]! += by;
@@ -1263,31 +1358,38 @@ function makeLegendList(options: FakeLegendListOptions = {}) {
     }),
     scrollToEnd: (input: unknown) => {
       calls.scrollToEnd.push(input);
+      dropHeld();
       return Promise.resolve();
     },
     scrollToOffset: (input: unknown) => {
       calls.scrollToOffset.push(input);
       const offset = (input as { offset: number }).offset;
-      scrollNode.scrollTop = Math.min(offset, maxScroll);
-      if (offset > maxScroll) {
-        maxScroll = Number.POSITIVE_INFINITY;
-        options.onClampedScroll?.();
+      // A new request replaces one LegendList still holds.
+      dropHeld();
+      if (options.deferScrolls) {
+        return new Promise<void>((resolve) => {
+          held.push({ offset, resolve });
+        });
       }
+      applyOffset(offset);
       return Promise.resolve();
     },
     scrollToIndex: (input: unknown) => {
       calls.scrollToIndex.push(input);
+      dropHeld();
       return Promise.resolve();
     },
   };
   return list;
 }
 
+/** Mounts a fake list in the timeline, as LegendList's ref does once it renders. */
 function installLegendList(options: FakeLegendListOptions = {}) {
   const timeline = capturedProps("messagesTimeline");
   const listRef = timeline["listRef"] as RefObject<unknown>;
   const list = makeLegendList(options);
   listRef.current = list;
+  (timeline["onListMount"] as (list: unknown) => void)(list);
   return list;
 }
 
@@ -1295,10 +1397,8 @@ function installLegendList(options: FakeLegendListOptions = {}) {
  * Sends a message whose reply arrived during the sent row's glide: four 100 px rows, the
  * reply's end 216 px below what shows.
  */
-async function sendTallReply(
-  options: Pick<FakeLegendListOptions, "laggingMaxScroll" | "onClampedScroll">,
-) {
-  seedConnectedServerThread();
+async function sendTallReply(options: FakeLegendListOptions) {
+  seedConnectedServerThread(makeThreadWithEarlierTurn());
   renderServerRoute();
   const list = installLegendList({
     scroll: 0,
@@ -1311,7 +1411,7 @@ async function sendTallReply(
   const { promptRef } = installComposerHandle();
   promptRef.current = "reply taller than the timeline";
   await (capturedProps("chatComposer")["onSend"] as () => Promise<void>)();
-  const sent = commandCallsFor("thread.startTurn")[0]!.input as {
+  const sent = commandCallsFor("thread.startTurn").at(-1)!.input as {
     input: { message: { messageId: MessageId } };
   };
   const onAnchorReady = capturedProps("messagesTimeline")["onAnchorReady"] as (
@@ -1319,6 +1419,41 @@ async function sendTallReply(
     anchorIndex: number,
   ) => void;
   return { list, cleanups, messageId: sent.input.message.messageId, onAnchorReady };
+}
+
+/**
+ * Sends a message whose turn fits the view: the 600 px timeline holds the sent row and its
+ * reply, four 100 px rows from row 2 on, with the sent row mounted at its content offset.
+ */
+async function sendFittingReply(options: FakeLegendListOptions = {}) {
+  const sent = await sendTallReply({ scrollLength: 600, sentRowContentTop: 200, ...options });
+  sent.list.sentRowMessageId = sent.messageId;
+  return sent;
+}
+
+/** Lets the promise callbacks a landing chains run. */
+async function flushPromises(): Promise<void> {
+  for (let turn = 0; turn < 10; turn += 1) await Promise.resolve();
+}
+
+/** A keydown on a target inside the timeline that matches the selectors in `matches`. */
+function timelineKey(key: string, matches: readonly string[] = []) {
+  return {
+    key,
+    shiftKey: false,
+    defaultPrevented: false,
+    target: {
+      inTimeline: true,
+      isContentEditable: false,
+      closest: (selector: string) =>
+        selector.split(",").some((part) => matches.includes(part.trim())) ? {} : null,
+    },
+  };
+}
+
+/** A keydown whose target is the page itself, as when focus stayed on the body. */
+function pageKey(key: string) {
+  return { key, shiftKey: false, defaultPrevented: false, target: documentStub.body };
 }
 
 function onRowSizeChanged(): (info: { index: number; previous: number; size: number }) => void {
@@ -1353,6 +1488,41 @@ interface WindowStub {
 
 let windowStub: WindowStub;
 let documentQuerySelectorResult: unknown = null;
+
+interface DocumentStub {
+  body: { readonly tag: "body" };
+  documentElement: { readonly tag: "html" };
+  listeners: Array<{ type: string; handler: (event: unknown) => void; options?: unknown }>;
+}
+
+let documentStub: DocumentStub;
+
+function makeDocumentStub(): DocumentStub & Record<string, unknown> {
+  const listeners: DocumentStub["listeners"] = [];
+  return {
+    body: { tag: "body" },
+    documentElement: { tag: "html" },
+    listeners,
+    querySelector: () => documentQuerySelectorResult,
+    addEventListener: (type: string, handler: (event: unknown) => void, options?: unknown) => {
+      listeners.push({ type, handler, options });
+    },
+    removeEventListener: (type: string, handler: (event: unknown) => void) => {
+      const index = listeners.findIndex(
+        (listener) => listener.type === type && listener.handler === handler,
+      );
+      if (index >= 0) listeners.splice(index, 1);
+    },
+    activeElement: null,
+  };
+}
+
+/** Dispatches `event` to the document's listeners for `type`, as a bubbled event reaches it. */
+function fireDocument(type: string, event: unknown): void {
+  for (const listener of documentStub.listeners.slice()) {
+    if (listener.type === type) listener.handler(event);
+  }
+}
 
 function makeWindowStub(): WindowStub {
   const listeners: WindowListener[] = [];
@@ -1535,12 +1705,8 @@ beforeEach(() => {
   windowStub = makeWindowStub();
   documentQuerySelectorResult = null;
   vi.stubGlobal("window", windowStub);
-  vi.stubGlobal("document", {
-    querySelector: () => documentQuerySelectorResult,
-    addEventListener: () => undefined,
-    removeEventListener: () => undefined,
-    activeElement: null,
-  });
+  documentStub = makeDocumentStub();
+  vi.stubGlobal("document", documentStub);
   vi.stubGlobal("requestAnimationFrame", (callback: (time: number) => void) => {
     callback(0);
     return 1;
@@ -1718,6 +1884,10 @@ describe("ChatView effects (captured and run manually)", () => {
     // Manual-navigation listeners attached to the legend list scroll node.
     expect(list.scrollNode.listeners.map((listener) => listener.type)).toEqual(
       expect.arrayContaining(["wheel", "touchmove", "pointerdown"]),
+    );
+    // Keys, and where the last press was, are heard on the document.
+    expect(documentStub.listeners.map((listener) => listener.type)).toEqual(
+      expect.arrayContaining(["keydown", "pointerdown", "focusin"]),
     );
     // Live-follow effect scrolled to the end because content overflows.
     expect(list.calls.scrollToEnd.length).toBeGreaterThanOrEqual(1);
@@ -1925,6 +2095,66 @@ describe("ChatView effects (captured and run manually)", () => {
     for (const cleanup of cleanups) cleanup();
   });
 
+  it("reveals the end with a composer height measured in the same commit as the row's growth", async () => {
+    // The overlay measures 40 px in ChatView's layout effect, and the list reports the growth
+    // before ChatView renders that height: the geometry helpers must already use it (#204).
+    vi.stubGlobal("ResizeObserver", undefined);
+    seedHostState("composerOverlayElement", { getBoundingClientRect: () => ({ height: 40 }) });
+    const { list, cleanups, messageId, onAnchorReady } = await sendTallReply({});
+    // The height is set (state 20) but this render, and its captured props, still hold 0.
+    expect(h.setStateCalls.some((call) => call.index === 20 && call.applied === 40)).toBe(true);
+    onAnchorReady(messageId, 2);
+    list.scrollNode.fire("scrollend");
+
+    list.growRow(3, 57);
+    onRowSizeChanged()({ index: 3, previous: 100, size: 157 });
+
+    // 40 px further than the same growth with no composer (273): the end clears the overlay.
+    expect(list.calls.scrollToOffset.at(-1)).toEqual({ offset: 313, animated: false });
+    for (const cleanup of cleanups) cleanup();
+  });
+
+  it("reveals the end again when a row above the anchored turn grows and shifts it", async () => {
+    const { list, cleanups, messageId, onAnchorReady } = await sendTallReply({});
+    onAnchorReady(messageId, 2);
+    list.scrollNode.fire("scrollend");
+    expect(list.scrollNode.scrollTop).toBe(216);
+
+    // An earlier reply above the sent row grows, as its diagrams draw again once remounted, and
+    // the list does not scroll by it: the turn, end and all, moves 57 px down.
+    list.growRow(1, 57);
+    onRowSizeChanged()({ index: 1, previous: 100, size: 157 });
+
+    expect(list.calls.scrollToOffset.at(-1)).toEqual({ offset: 273, animated: false });
+    for (const cleanup of cleanups) cleanup();
+  });
+
+  it("leaves the view alone when the list holds the turn in place as a row above grows", async () => {
+    const { list, cleanups, messageId, onAnchorReady } = await sendTallReply({});
+    onAnchorReady(messageId, 2);
+    list.scrollNode.fire("scrollend");
+    const calls = list.calls.scrollToOffset.length;
+    const frames: Array<() => void> = [];
+    vi.stubGlobal("requestAnimationFrame", (callback: (time: number) => void) => {
+      frames.push(() => callback(0));
+      return frames.length;
+    });
+
+    // LegendList scrolls by the growth a frame later, which keeps the end where it was.
+    list.growRow(1, 57);
+    onRowSizeChanged()({ index: 1, previous: 100, size: 157 });
+    for (const frame of frames.splice(0)) frame();
+    list.scrollNode.scrollTop += 57;
+    for (const frame of frames.splice(0)) frame();
+
+    expect(list.calls.scrollToOffset).toHaveLength(calls);
+    vi.stubGlobal("requestAnimationFrame", (callback: (time: number) => void) => {
+      callback(0);
+      return 1;
+    });
+    for (const cleanup of cleanups) cleanup();
+  });
+
   it("keeps the reader's place when a row grows away from the anchored turn's end", async () => {
     const { list, cleanups, messageId, onAnchorReady } = await sendTallReply({});
     onAnchorReady(messageId, 2);
@@ -1945,7 +2175,7 @@ describe("ChatView effects (captured and run manually)", () => {
     const { list, cleanups, messageId, onAnchorReady } = await sendTallReply({});
     onAnchorReady(messageId, 2);
     list.scrollNode.fire("scrollend");
-    // The reader moved up 80 px with the keyboard, which keeps following on.
+    // A scroll the timeline does not see as the reader's own leaves the end 80 px below.
     list.scrollNode.scrollTop = 136;
     const calls = list.calls.scrollToOffset.length;
     const frames: Array<() => void> = [];
@@ -1970,8 +2200,120 @@ describe("ChatView effects (captured and run manually)", () => {
     for (const cleanup of cleanups) cleanup();
   });
 
-  it("positions and stabilizes a timeline anchor after manual navigation", () => {
+  it("binds the reader's takeover listeners while the list is mounted", () => {
+    // A thread with no rows shows the empty state, with no list mounted to bind to.
     seedConnectedServerThread();
+    renderServerRoute();
+    const cleanups = runEffects();
+    expect(documentStub.listeners.filter((listener) => listener.type === "keydown")).toEqual([]);
+
+    // Its first turn mounts the list, which binds; unmounting it unbinds.
+    const list = installLegendList({ scrollLength: 200 });
+    expect(list.scrollNode.listeners.map((listener) => listener.type).toSorted()).toEqual([
+      "pointerdown",
+      "touchmove",
+      "wheel",
+    ]);
+    expect(documentStub.listeners.map((listener) => listener.type).toSorted()).toEqual([
+      "focusin",
+      "keydown",
+      "pointerdown",
+    ]);
+    (capturedProps("messagesTimeline")["onListMount"] as (list: unknown) => void)(null);
+    expect(list.scrollNode.listeners).toEqual([]);
+    expect(documentStub.listeners).toEqual([]);
+    for (const cleanup of cleanups) cleanup();
+  });
+
+  it("stops following for a key on the page after a press in the timeline", async () => {
+    const { list, cleanups, messageId, onAnchorReady } = await sendTallReply({
+      scrollHeight: 400,
+      clientHeight: 200,
+    });
+    onAnchorReady(messageId, 2);
+    list.scrollNode.scrollTop = 50;
+
+    // A press on Copy code, which WebKit does not focus, leaves focus on the body; the
+    // browser then scrolls the timeline with the key.
+    const copyCode = { inTimeline: true, closest: () => ({}) };
+    fireDocument("pointerdown", { target: copyCode });
+    list.scrollNode.fire("pointerdown", { target: copyCode });
+    fireDocument("keydown", pageKey("PageUp"));
+    list.scrollNode.fire("scrollend");
+
+    expect(list.calls.scrollToOffset).toEqual([]);
+    for (const cleanup of cleanups) cleanup();
+  });
+
+  it("ignores a key on the page once focus or a press moved out of the timeline", async () => {
+    for (const leave of ["pointerdown", "focusin"] as const) {
+      const { list, cleanups, messageId, onAnchorReady } = await sendTallReply({
+        scrollHeight: 400,
+        clientHeight: 200,
+      });
+      onAnchorReady(messageId, 2);
+      list.scrollNode.scrollTop = 50;
+      fireDocument("pointerdown", { target: { inTimeline: true, closest: () => ({}) } });
+
+      fireDocument(leave, { target: { inTimeline: false } });
+      fireDocument("keydown", pageKey("PageUp"));
+      list.scrollNode.fire("scrollend");
+
+      // Following goes on: the settle follows the reply's end.
+      expect(list.calls.scrollToOffset.at(-1), leave).toEqual({ offset: 216, animated: false });
+      for (const cleanup of cleanups) cleanup();
+    }
+  });
+
+  it("withdraws LegendList's own end keeping when the reader takes over near the end", () => {
+    seedConnectedServerThread(makeThreadWithEarlierTurn());
+    renderServerRoute();
+    const list = installLegendList({ scroll: 190, scrollLength: 200, dataLength: 4, rowSize: 100 });
+    // LegendList holds nothing ChatView asked for, but a row just grew at the end, so it keeps
+    // the list there on the next frame; the reader's wheel must withdraw that too.
+    list.scrollNode.fire("wheel");
+
+    expect(list.calls.cancelScrollRequests).toBe(1);
+  });
+
+  it("keeps a reader's line when the bottom region's height changes after they scroll away", () => {
+    for (const [layout, options] of [
+      // Within LegendList's end threshold of a list taller than the view.
+      ["near its end", { scroll: 190, scrollLength: 200, dataLength: 4, rowSize: 100 }],
+      // A thread shorter than the view, which only the composer makes scroll.
+      ["shorter than the view", { scroll: 10, scrollLength: 600, dataLength: 2, rowSize: 100 }],
+    ] as const) {
+      h.stateSeeds.clear();
+      h.setStateCalls.length = 0;
+      seedConnectedServerThread(makeThreadWithEarlierTurn());
+      renderServerRoute();
+      const list = installLegendList(options);
+      const cleanups = runEffects();
+      expect(capturedProps("messagesTimeline")["followsEnd"], layout).toBe(true);
+
+      list.scrollNode.fire("wheel");
+      const followsEnd = h.setStateCalls.find(
+        (call) => call.next === false && h.stateCalls[call.index]?.initial === true,
+      );
+      expect(followsEnd, layout).toBeDefined();
+      for (const cleanup of cleanups) cleanup();
+
+      // The next render, after the composer grew by 80 px: the timeline no longer follows its
+      // end, so LegendList is not asked to keep the list there.
+      h.stateSeeds.set(followsEnd!.index, {
+        value: false,
+        expectInitial: (value) => value === true,
+      });
+      h.stateSeeds.set(20, { value: 80, expectInitial: (value) => value === 0 });
+      renderServerRoute();
+      const timeline = capturedProps("messagesTimeline");
+      expect(timeline["followsEnd"], layout).toBe(false);
+      expect(timeline["contentInsetEndAdjustment"], layout).toBe(80);
+    }
+  });
+
+  it("positions a sent row once and keeps a released one where the reader left it", () => {
+    seedConnectedServerThread(makeThreadWithEarlierTurn());
     renderServerRoute();
     const list = installLegendList({ scroll: 24, scrollLength: 200, dataLength: 4 });
     const cleanups = runEffects();
@@ -1984,26 +2326,367 @@ describe("ChatView effects (captured and run manually)", () => {
     const onAnchorSizeChanged = timeline["onAnchorSizeChanged"] as (messageId: MessageId) => void;
 
     onAnchorReady(messageId, 2);
-    expect(list.calls.scrollToIndex).toContainEqual({
-      index: 2,
-      animated: true,
-      viewPosition: 0,
-      viewOffset: 16,
-    });
-
+    expect(list.calls.scrollToIndex).toEqual([
+      { index: 2, animated: true, viewPosition: 0, viewOffset: 16 },
+    ]);
     list.scrollNode.fire("scrollend");
-    expect(list.calls.scrollToOffset).toContainEqual({ offset: 24, animated: false });
+    expect(list.calls.scrollToOffset).toEqual([{ offset: 24, animated: false }]);
 
+    // The reader scrolls away. LegendList reports the row ready again as the anchored end space
+    // changes size, once per delivery, and the row neither glides nor pins over the reader.
     list.scrollNode.fire("wheel");
     onAnchorReady(messageId, 2);
-    list.scrollNode.fire("scrollend");
-    expect(list.calls.scrollToOffset).toHaveLength(2);
-
-    onAnchorSizeChanged(messageId);
-    expect(list.calls.scrollToOffset).toHaveLength(3);
-
     onAnchorReady(messageId, 2);
+    list.scrollNode.fire("scrollend");
+    expect(list.calls.scrollToIndex).toHaveLength(1);
+    expect(list.calls.scrollToOffset).toHaveLength(1);
+
+    // It goes on holding the reader's place as the tail changes size.
+    onAnchorSizeChanged(messageId);
+    expect(list.calls.scrollToOffset).toEqual([
+      { offset: 24, animated: false },
+      { offset: 24, animated: false },
+    ]);
+
+    // A row the reader never released positions itself.
+    onAnchorReady(MessageId.make("next-send"), 3);
     expect(list.calls.scrollToIndex).toHaveLength(2);
+    for (const cleanup of cleanups) cleanup();
+  });
+
+  it("releases the newest send's row when the reader scrolls before it is positioned", async () => {
+    const { list, cleanups, messageId, onAnchorReady } = await sendTallReply({});
+    onAnchorReady(messageId, 2);
+    list.scrollNode.fire("scrollend");
+    // A second send names its row pending while the first is still the positioned one.
+    const { promptRef } = installComposerHandle();
+    promptRef.current = "a second message";
+    await (capturedProps("chatComposer")["onSend"] as () => Promise<void>)();
+    const second = commandCallsFor("thread.startTurn")[1]!.input as {
+      input: { message: { messageId: MessageId } };
+    };
+    const secondId = second.input.message.messageId;
+    expect(secondId).not.toBe(messageId);
+    const glides = list.calls.scrollToIndex.length;
+
+    list.scrollNode.fire("wheel");
+    (capturedProps("messagesTimeline")["onAnchorReady"] as typeof onAnchorReady)(secondId, 4);
+
+    expect(list.calls.scrollToIndex).toHaveLength(glides);
+    for (const cleanup of cleanups) cleanup();
+  });
+
+  it("stops following when the reader scrolls the timeline with the keyboard mid-glide", async () => {
+    const { list, cleanups, messageId, onAnchorReady } = await sendTallReply({
+      scrollHeight: 400,
+      clientHeight: 200,
+    });
+    onAnchorReady(messageId, 2);
+    list.scrollNode.scrollTop = 50;
+
+    fireDocument("keydown", timelineKey("ArrowUp", ["button"]));
+    list.scrollNode.fire("scrollend");
+
+    // The settle neither pins the reader nor follows the turn's end over them.
+    expect(list.calls.scrollToOffset).toEqual([]);
+    expect(list.scrollNode.scrollTop).toBe(50);
+    for (const cleanup of cleanups) cleanup();
+  });
+
+  it("keeps following for keys that move nothing or belong to a control", async () => {
+    for (const [key, matches, scrollTop] of [
+      // Keys that would move nothing: ArrowDown at the end, ArrowUp at the top.
+      ["ArrowDown", [], 200],
+      ["ArrowUp", [], 0],
+      ["ArrowUp", ["textarea"], 50],
+      [" ", ["button"], 50],
+    ] as const) {
+      const { list, cleanups, messageId, onAnchorReady } = await sendTallReply({
+        scrollHeight: 400,
+        clientHeight: 200,
+      });
+      onAnchorReady(messageId, 2);
+      list.scrollNode.scrollTop = scrollTop;
+
+      fireDocument("keydown", timelineKey(key, matches));
+      list.scrollNode.fire("scrollend");
+
+      // Following goes on: nothing is withdrawn, and the settle follows the reply's end.
+      expect(list.calls.cancelScrollRequests, key).toBe(0);
+      expect(list.calls.scrollToOffset.at(-1), key).toEqual({ offset: 216, animated: false });
+      for (const cleanup of cleanups) cleanup();
+    }
+  });
+
+  it("lands a sent row that stopped short at its offset, measured on screen", async () => {
+    const { list, cleanups, messageId, onAnchorReady } = await sendFittingReply();
+    onAnchorReady(messageId, 2);
+    // The glide stopped 12 px short of 184, where the row rests 16 px below the top.
+    list.scrollNode.scrollTop = 172;
+
+    list.scrollNode.fire("scrollend");
+    await flushPromises();
+
+    expect(list.calls.scrollToOffset).toEqual([{ offset: 184, animated: false }]);
+    expect(list.scrollNode.scrollTop).toBe(184);
+    for (const cleanup of cleanups) cleanup();
+  });
+
+  it("relands a fitting sent row after its anchored space shrinks", async () => {
+    const { list, cleanups, messageId, onAnchorReady } = await sendFittingReply();
+    onAnchorReady(messageId, 2);
+    list.scrollNode.scrollTop = 184;
+    list.scrollNode.fire("scrollend");
+    await flushPromises();
+    const settledCalls = list.calls.scrollToOffset.length;
+
+    // A late measured-size change left WebView2 11 px short without changing content height.
+    list.scrollNode.scrollTop = 173;
+    const onAnchorSizeChanged = capturedProps("messagesTimeline")["onAnchorSizeChanged"] as (
+      messageId: MessageId,
+    ) => void;
+    onAnchorSizeChanged(messageId);
+    await flushPromises();
+
+    expect(list.calls.scrollToOffset).toHaveLength(settledCalls + 1);
+    expect(list.calls.scrollToOffset.at(-1)).toEqual({ offset: 184, animated: false });
+    expect(list.scrollNode.scrollTop).toBe(184);
+    for (const cleanup of cleanups) cleanup();
+  });
+
+  it("reveals a tall turn again after its anchored space changes", async () => {
+    const { list, cleanups, messageId, onAnchorReady } = await sendTallReply({});
+    onAnchorReady(messageId, 2);
+    list.scrollNode.scrollTop = 216;
+    list.scrollNode.fire("scrollend");
+    await flushPromises();
+
+    list.scrollNode.scrollTop = 106;
+    const onAnchorSizeChanged = capturedProps("messagesTimeline")["onAnchorSizeChanged"] as (
+      messageId: MessageId,
+    ) => void;
+    onAnchorSizeChanged(messageId);
+    await flushPromises();
+
+    expect(list.scrollNode.scrollTop).toBe(216);
+    for (const cleanup of cleanups) cleanup();
+  });
+
+  it("keeps the reader's position when takeover cancels a queued relanding", async () => {
+    const { list, cleanups, messageId, onAnchorReady } = await sendFittingReply();
+    onAnchorReady(messageId, 2);
+    list.scrollNode.scrollTop = 184;
+    list.scrollNode.fire("scrollend");
+    await flushPromises();
+    const settledCalls = list.calls.scrollToOffset.length;
+    const frames: Array<() => void> = [];
+    vi.stubGlobal("requestAnimationFrame", (callback: (time: number) => void) => {
+      frames.push(() => callback(0));
+      return frames.length;
+    });
+
+    list.scrollNode.scrollTop = 173;
+    const onAnchorSizeChanged = capturedProps("messagesTimeline")["onAnchorSizeChanged"] as (
+      messageId: MessageId,
+    ) => void;
+    onAnchorSizeChanged(messageId);
+    list.scrollNode.fire("wheel");
+    for (let turn = 0; turn < 2; turn += 1) {
+      for (const frame of frames.splice(0)) frame();
+    }
+    await flushPromises();
+
+    expect(list.calls.scrollToOffset).toHaveLength(settledCalls);
+    expect(list.scrollNode.scrollTop).toBe(173);
+    for (const cleanup of cleanups) cleanup();
+  });
+
+  it("does not re-land the old sent row after another send begins", async () => {
+    const { list, cleanups, messageId, onAnchorReady } = await sendFittingReply();
+    onAnchorReady(messageId, 2);
+    list.scrollNode.scrollTop = 184;
+    list.scrollNode.fire("scrollend");
+    await flushPromises();
+    const frames: Array<() => void> = [];
+    vi.stubGlobal("requestAnimationFrame", (callback: (time: number) => void) => {
+      frames.push(() => callback(0));
+      return frames.length;
+    });
+
+    list.scrollNode.scrollTop = 173;
+    const onAnchorSizeChanged = capturedProps("messagesTimeline")["onAnchorSizeChanged"] as (
+      messageId: MessageId,
+    ) => void;
+    onAnchorSizeChanged(messageId);
+    const { promptRef } = installComposerHandle();
+    promptRef.current = "next message";
+    await (capturedProps("chatComposer")["onSend"] as () => Promise<void>)();
+    const callsAfterSend = list.calls.scrollToOffset.length;
+    for (let turn = 0; turn < 2; turn += 1) {
+      for (const frame of frames.splice(0)) frame();
+    }
+    await flushPromises();
+
+    expect(list.calls.scrollToOffset).toHaveLength(callsAfterSend);
+    expect(list.scrollNode.scrollTop).toBe(173);
+    for (const cleanup of cleanups) cleanup();
+  });
+
+  it("does not re-land the old sent row on another thread's list", async () => {
+    const { list, cleanups, messageId, onAnchorReady } = await sendFittingReply();
+    onAnchorReady(messageId, 2);
+    list.scrollNode.scrollTop = 184;
+    list.scrollNode.fire("scrollend");
+    await flushPromises();
+    const settledCalls = list.calls.scrollToOffset.length;
+    const frames: Array<() => void> = [];
+    vi.stubGlobal("requestAnimationFrame", (callback: (time: number) => void) => {
+      frames.push(() => callback(0));
+      return frames.length;
+    });
+
+    list.scrollNode.scrollTop = 173;
+    const onAnchorSizeChanged = capturedProps("messagesTimeline")["onAnchorSizeChanged"] as (
+      messageId: MessageId,
+    ) => void;
+    onAnchorSizeChanged(messageId);
+    // Another thread's list mounts before the queued pass runs, ahead of the switch's reset.
+    const next = installLegendList();
+    for (let turn = 0; turn < 2; turn += 1) {
+      for (const frame of frames.splice(0)) frame();
+    }
+    await flushPromises();
+
+    expect(list.calls.scrollToOffset).toHaveLength(settledCalls);
+    expect(next.calls.scrollToOffset).toEqual([]);
+    for (const cleanup of cleanups) cleanup();
+  });
+
+  it("lands the sent row the same way when the glide outlasts its timer", async () => {
+    const { list, cleanups, messageId, onAnchorReady } = await sendFittingReply();
+    onAnchorReady(messageId, 2);
+    list.scrollNode.scrollTop = 172;
+
+    runWindowTimeouts();
+    await flushPromises();
+
+    expect(list.calls.scrollToOffset).toEqual([{ offset: 184, animated: false }]);
+    for (const cleanup of cleanups) cleanup();
+  });
+
+  it("lands again when the list clamped the first landing to a lagging content height", async () => {
+    const { list, cleanups, messageId, onAnchorReady } = await sendFittingReply({
+      laggingMaxScroll: 100,
+    });
+    onAnchorReady(messageId, 2);
+
+    list.scrollNode.fire("scrollend");
+    await flushPromises();
+
+    expect(list.calls.scrollToOffset).toEqual([
+      { offset: 184, animated: false },
+      { offset: 184, animated: false },
+    ]);
+    expect(list.scrollNode.scrollTop).toBe(184);
+    for (const cleanup of cleanups) cleanup();
+  });
+
+  it("keeps landing until the content height catches up, then settles", async () => {
+    const { list, cleanups, messageId, onAnchorReady } = await sendFittingReply({
+      laggingMaxScroll: 100,
+      clampSteps: [150],
+    });
+    onAnchorReady(messageId, 2);
+
+    list.scrollNode.fire("scrollend");
+    await flushPromises();
+
+    // Two landings clamped short, at 100 and 150; the third lands.
+    expect(list.calls.scrollToOffset).toEqual([
+      { offset: 184, animated: false },
+      { offset: 184, animated: false },
+      { offset: 184, animated: false },
+    ]);
+    expect(list.scrollNode.scrollTop).toBe(184);
+    // Settled: once the turn grows past the view, following reveals its end.
+    list.growRow(3, 500);
+    onRowSizeChanged()({ index: 3, previous: 100, size: 600 });
+    expect(list.calls.scrollToOffset.at(-1)).toEqual({ offset: 316, animated: false });
+    for (const cleanup of cleanups) cleanup();
+  });
+
+  it("settles after its landings run out while the content height still lags", async () => {
+    const { list, cleanups, messageId, onAnchorReady } = await sendFittingReply({
+      laggingMaxScroll: 150,
+      clampSteps: Array.from({ length: 30 }, () => 150),
+    });
+    onAnchorReady(messageId, 2);
+
+    list.scrollNode.fire("scrollend");
+    for (let turn = 0; turn < 20; turn += 1) await flushPromises();
+
+    expect(list.calls.scrollToOffset).toHaveLength(20);
+    expect(list.scrollNode.scrollTop).toBe(150);
+    // Settled: once the turn grows past the view, following reveals its end.
+    list.growRow(3, 500);
+    onRowSizeChanged()({ index: 3, previous: 100, size: 600 });
+    expect(list.calls.scrollToOffset.at(-1)).toEqual({ offset: 316, animated: false });
+    for (const cleanup of cleanups) cleanup();
+  });
+
+  it("withdraws a landing the list still holds when the reader takes over", async () => {
+    const { list, cleanups, messageId, onAnchorReady } = await sendFittingReply({
+      deferScrolls: true,
+      scrollHeight: 2_000,
+      clientHeight: 600,
+    });
+    onAnchorReady(messageId, 2);
+    list.scrollNode.scrollTop = 50;
+    list.scrollNode.fire("scrollend");
+    expect(list.calls.scrollToOffset).toEqual([{ offset: 184, animated: false }]);
+
+    fireDocument("keydown", timelineKey("ArrowUp"));
+    list.runDeferred();
+    await flushPromises();
+
+    expect(list.calls.cancelScrollRequests).toBe(1);
+    expect(list.scrollNode.scrollTop).toBe(50);
+    expect(list.calls.scrollToOffset).toHaveLength(1);
+    for (const cleanup of cleanups) cleanup();
+  });
+
+  it("ends a held landing when a later send positions its own row", async () => {
+    const { list, cleanups, messageId, onAnchorReady } = await sendFittingReply({
+      deferScrolls: true,
+    });
+    onAnchorReady(messageId, 2);
+    list.scrollNode.fire("scrollend");
+
+    onAnchorReady(MessageId.make("later-send"), 3);
+    await flushPromises();
+    list.runDeferred();
+    await flushPromises();
+
+    // The later row's glide replaced the landing, and nothing lands the earlier row again.
+    expect(list.calls.scrollToIndex).toHaveLength(2);
+    expect(list.calls.scrollToOffset).toEqual([{ offset: 184, animated: false }]);
+    expect(list.scrollNode.scrollTop).toBe(0);
+    for (const cleanup of cleanups) cleanup();
+  });
+
+  it("withdraws a follow the list still holds when the reader takes over", async () => {
+    const { list, cleanups, messageId, onAnchorReady } = await sendTallReply({
+      deferScrolls: true,
+    });
+    onAnchorReady(messageId, 2);
+    list.scrollNode.fire("scrollend");
+    expect(list.calls.scrollToOffset.at(-1)).toEqual({ offset: 216, animated: false });
+
+    list.scrollNode.fire("wheel");
+    list.runDeferred();
+
+    expect(list.calls.cancelScrollRequests).toBe(1);
+    expect(list.scrollNode.scrollTop).toBe(0);
     for (const cleanup of cleanups) cleanup();
   });
 
@@ -3024,31 +3707,6 @@ describe("ChatView right panel handlers", () => {
     expect(controls).not.toHaveProperty("onToggleTerminal");
     expect(controls).not.toHaveProperty("terminalOpen");
     expect(controls).not.toHaveProperty("terminalAvailable");
-  });
-
-  it("opens Files with one layout-control click when a sibling chat suppresses host Activity", () => {
-    const siblingThreadId = ThreadId.make("thread-sibling-suppressed-activity");
-    seedConnectedServerThread();
-    seedServerThread(makeThread({ id: siblingThreadId, title: "Sibling thread" }));
-    useRightPanelStore.getState().openActivity(threadRef, "subagents", { _tag: "thread" });
-    useCenterPanelStore.getState().openChatPanel(threadRef, siblingThreadId, "Codex");
-    publishSeededStoreState(useRightPanelStore);
-    publishSeededStoreState(useCenterPanelStore);
-
-    renderServerRoute();
-    const controls = capturedProps("panelLayoutControls");
-    expect(controls["rightPanelOpen"]).toBe(false);
-
-    (controls["onToggleRightPanel"] as () => void)();
-
-    const panelState = useRightPanelStore.getState().byThreadKey[threadKey];
-    expect(panelState?.isOpen).toBe(true);
-    expect(panelState?.activeSurfaceId).toBe("files");
-    expect(panelState?.surfaces.map((surface) => surface.kind)).toEqual(["activity", "files"]);
-
-    publishSeededStoreState(useRightPanelStore);
-    renderServerRoute();
-    expect(capturedProps("panelLayoutControls")["rightPanelOpen"]).toBe(true);
   });
 
   it("maximizes the inline right panel via the maximize control", () => {
@@ -5236,6 +5894,120 @@ describe("ChatView send flows", () => {
     expect(errorWrites.length).toBeGreaterThanOrEqual(1);
   });
 
+  it("puts a plan follow-up's text back when its start fails as the connection drops", async () => {
+    const turnId = TurnId.make("turn-1");
+    seedConnectedServerThread(
+      makeThread({
+        interactionMode: "plan",
+        latestTurn: {
+          turnId,
+          state: "completed",
+          requestedAt: now,
+          startedAt: now,
+          completedAt: later,
+          assistantMessageId: null,
+        },
+        reasoning: [],
+        proposedPlans: [
+          {
+            id: OrchestrationProposedPlanId.make("plan-1"),
+            turnId,
+            planMarkdown: "# Plan",
+            implementedAt: null,
+            implementationThreadId: null,
+            createdAt: now,
+            updatedAt: now,
+          },
+        ],
+      }),
+    );
+    useComposerDraftStore.getState().setPrompt(threadRef, "tighten step two");
+    publishSeededStoreState(useComposerDraftStore);
+    let dropConnection: (() => void) | undefined;
+    h.commandResults["thread.startTurn"] = () =>
+      new Promise((resolve) => {
+        dropConnection = () =>
+          resolve(AsyncResult.failure(Cause.fail(new Error("The connection disconnected."))));
+      });
+    renderServerRoute();
+    const { promptRef } = installComposerHandle();
+    promptRef.current = "tighten step two";
+
+    const composer = capturedProps("chatComposer");
+    const sending = (composer["onSend"] as () => Promise<void>)();
+    await vi.waitFor(() => expect(dropConnection).toBeTypeOf("function"));
+    // The follow-up cleared the composer before its awaits; something typed meanwhile stays.
+    expect(useComposerDraftStore.getState().getComposerDraft(threadRef)?.prompt ?? "").toBe("");
+    useComposerDraftStore.getState().setPrompt(threadRef, "and step three");
+    dropConnection!();
+    await sending;
+
+    expect(useComposerDraftStore.getState().getComposerDraft(threadRef)?.prompt).toBe(
+      "and step three\n\ntighten step two",
+    );
+    expect(commandCallsFor("thread.startTurn")).toHaveLength(1);
+  });
+
+  it.each([
+    ["its turn start fails after the mode write", "thread.startTurn"],
+    ["its mode write fails", "thread.setInteractionMode"],
+  ] as const)(
+    "keeps the plan's follow-up actions when an Implement fails because %s",
+    async (_case, failingCommand) => {
+      const turnId = TurnId.make("turn-1");
+      seedConnectedServerThread(
+        makeThread({
+          interactionMode: "plan",
+          latestTurn: {
+            turnId,
+            state: "completed",
+            requestedAt: now,
+            startedAt: now,
+            completedAt: later,
+            assistantMessageId: null,
+          },
+          reasoning: [],
+          proposedPlans: [
+            {
+              id: OrchestrationProposedPlanId.make("plan-1"),
+              turnId,
+              planMarkdown: "# Plan",
+              implementedAt: null,
+              implementationThreadId: null,
+              createdAt: now,
+              updatedAt: now,
+            },
+          ],
+        }),
+      );
+      h.commandResults[failingCommand] = () =>
+        AsyncResult.failure(Cause.fail(new Error("The connection disconnected.")));
+      renderServerRoute();
+      const { promptRef } = installComposerHandle();
+      // An empty follow-up implements the plan, which runs in default mode.
+      promptRef.current = "";
+
+      const composer = capturedProps("chatComposer");
+      expect(composer["showPlanFollowUpPrompt"]).toBe(true);
+      await (composer["onSend"] as () => Promise<void>)();
+
+      expect(commandCallsFor("thread.setInteractionMode")).toHaveLength(1);
+      expect(commandCallsFor("thread.startTurn")).toHaveLength(
+        failingCommand === "thread.startTurn" ? 1 : 0,
+      );
+      // The draft is not left in default mode, so Implement and Refine are offered again.
+      const draftMode = useComposerDraftStore
+        .getState()
+        .getComposerDraft(threadRef)?.interactionMode;
+      if (failingCommand === "thread.startTurn") {
+        // The mode write succeeded, so the draft must say plan to override the thread.
+        expect(draftMode).toBe("plan");
+      } else {
+        expect(draftMode ?? "plan").toBe("plan");
+      }
+    },
+  );
+
   it("implements the plan in a new thread and cleans up when the start fails", async () => {
     const turnId = TurnId.make("turn-1");
     seedConnectedServerThread(
@@ -5412,6 +6184,66 @@ describe("ChatView pending user input", () => {
     expect(commandCallsFor("thread.startTurn")).toHaveLength(0);
     expect(commandCallsFor("thread.respondToUserInput")).toHaveLength(1);
   });
+
+  it.each(["connected", "disconnected"] as const)(
+    "onSend moves between a multi-step question's steps without replaying a retained send (%s)",
+    async (connection) => {
+      seedConnectedServerThread();
+      renderServerRoute();
+      const contexts = makeOwnedComposerContexts("retained-before-question");
+      const { promptRef } = installComposerHandle({
+        getSendContext: () => sendContextWithOwnedComposerContexts(contexts),
+      });
+      promptRef.current = "original send";
+      h.commandResults["thread.stageAttachments"] = () =>
+        AsyncResult.success({
+          _tag: "staged",
+          attachments: [
+            {
+              type: "image",
+              id: contexts.image.id,
+              name: contexts.image.name,
+              mimeType: "image/png",
+              sizeBytes: 4,
+              uploadId: "retained-stage",
+            },
+          ],
+        });
+      h.commandResults["thread.startTurn"] = () =>
+        AsyncResult.failure(
+          Cause.fail(
+            new RpcClientError.RpcClientError({
+              reason: new RpcClientError.RpcClientDefect({
+                message: "reply lost",
+                cause: new Error("closed"),
+              }),
+            }),
+          ),
+        );
+      await (capturedProps("chatComposer")["onSend"] as () => Promise<void>)();
+      expect(commandCallsFor("thread.startTurn")).toHaveLength(1);
+      const authorityReads = commandCallsFor("thread.attachmentAdmissionAuthority").length;
+
+      // The ambiguous attempt stays retained while a two-step question arrives.
+      seedConnectedServerThread(threadWithQuestions(2));
+      if (connection === "disconnected") {
+        seedEnvironment(
+          makeEnvironmentPresentation({
+            connection: { phase: "error", error: "socket closed", traceId: null },
+          }),
+        );
+        h.commandResults["thread.attachmentAdmissionAuthority"] = () =>
+          AsyncResult.failure(Cause.fail(new Error("The connection disconnected.")));
+      }
+      renderServerRoute();
+      installComposerHandle();
+      await (capturedProps("chatComposer")["onSend"] as () => Promise<void>)();
+
+      expect(commandCallsFor("thread.startTurn")).toHaveLength(1);
+      expect(commandCallsFor("thread.attachmentAdmissionAuthority")).toHaveLength(authorityReads);
+      expect(commandCallsFor("thread.respondToUserInput")).toHaveLength(0);
+    },
+  );
 
   it("reports user-input submission failures as thread errors", async () => {
     seedConnectedServerThread(threadWithQuestions(1));

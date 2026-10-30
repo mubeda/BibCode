@@ -1,4 +1,4 @@
-import type { EnvironmentAvailabilityStatus } from "@bibcode/client-runtime/state/shell";
+import { scopedThreadKey } from "@bibcode/client-runtime/environment";
 import type { ScopedThreadRef } from "@bibcode/contracts";
 import { useRouter } from "@tanstack/react-router";
 import {
@@ -8,22 +8,21 @@ import {
   MoreHorizontalIcon,
   SearchIcon,
 } from "lucide-react";
-import { useCallback, useDeferredValue, useMemo, useState } from "react";
+import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 
+import { findCenterPanelGroupForSurface } from "../../centerPanelLayout";
+import { useCenterPanelStore } from "../../centerPanelStore";
 import { cn } from "../../lib/utils";
 import { ChatRouteInset } from "../../routes/-ChatRouteInset";
 import { selectIsUnread, useSidebarWorkspaceMetaStore } from "../../sidebarWorkspaceMetaStore";
-import { setActiveEnvironmentId, useProjects, useThreadShells } from "../../state/entities";
-import { useEnvironments } from "../../state/environments";
-import { useEnvironmentShellSummary } from "../../state/shell";
+import { setActiveEnvironmentId } from "../../state/entities";
 import { buildThreadRouteParams } from "../../threadRoutes";
 import { resolveAgentsGroupExpanded, useUiStateStore } from "../../uiStateStore";
 import ChatView from "../ChatView";
 import {
   type AgentRow,
+  agentRowUnreadKey,
   type AgentsGroupByMode,
-  buildAgentRows,
-  resolveAgentCheckouts,
   buildAgentViewGroups,
   countUnreadAgentRows,
 } from "../sidebar/agentsSection.logic";
@@ -38,7 +37,7 @@ import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../
 import { SidebarMenu } from "../ui/sidebar";
 import { Toggle } from "../ui/toggle";
 import { AgentsRow } from "./AgentsRow";
-import { useAgentLiveBranches } from "./useAgentLiveBranches";
+import { useAgentRows } from "./useAgentRows";
 
 const GROUP_BY_LABELS: Record<AgentsGroupByMode, string> = {
   status: "Status",
@@ -50,12 +49,22 @@ function isAgentsGroupByMode(value: string | null): value is AgentsGroupByMode {
   return value === "status" || value === "project" || value === "environment";
 }
 
+/** Shows an AI Terminal row's terminal in its host thread's center panel. */
+function revealTerminalSurface(ref: ScopedThreadRef, terminalId: string): void {
+  const store = useCenterPanelStore.getState();
+  const surfaceId = `terminal:${terminalId}`;
+  const state = store.byThreadKey[scopedThreadKey(ref)];
+  const group = state === undefined ? undefined : findCenterPanelGroupForSurface(state, surfaceId);
+  if (group === undefined) {
+    store.openTerminalPanel(ref, terminalId);
+    return;
+  }
+  store.activateSurface(ref, group.id, surfaceId);
+  store.focusGroup(ref, group.id);
+}
+
 export function AgentsPage() {
   const router = useRouter();
-  const shells = useThreadShells();
-  const projects = useProjects();
-  const { environments } = useEnvironments();
-  const availability = useEnvironmentShellSummary().statuses;
   const unreadThreadKeys = useSidebarWorkspaceMetaStore((state) => state.unreadThreadKeys);
   const markRead = useSidebarWorkspaceMetaStore((state) => state.markRead);
   const agentsGroupExpandedById = useUiStateStore((state) => state.agentsGroupExpandedById);
@@ -66,43 +75,7 @@ export function AgentsPage() {
   const [unreadOnly, setUnreadOnly] = useState(false);
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
 
-  const availabilityByEnvironmentId = useMemo(
-    () =>
-      new Map<string, EnvironmentAvailabilityStatus>(
-        availability.map(({ environmentId, status }) => [environmentId, status]),
-      ),
-    [availability],
-  );
-  const { checkoutKeyByThreadKey, checkouts } = useMemo(
-    () => resolveAgentCheckouts({ shells, projects, availabilityByEnvironmentId }),
-    [availabilityByEnvironmentId, projects, shells],
-  );
-  const liveBranchByCheckoutKey = useAgentLiveBranches(checkouts);
-  const rows = useMemo(() => {
-    const liveBranchByThreadKey = new Map<string, string>();
-    for (const [threadKey, checkoutKey] of checkoutKeyByThreadKey) {
-      const branch = liveBranchByCheckoutKey.get(checkoutKey);
-      if (branch !== undefined) liveBranchByThreadKey.set(threadKey, branch);
-    }
-    return buildAgentRows({
-      shells,
-      projectTitleById: new Map<string, string>(
-        projects.map((project) => [project.id, project.title]),
-      ),
-      environmentLabelById: new Map<string, string>(
-        environments.map((environment) => [environment.environmentId, environment.label]),
-      ),
-      availabilityByEnvironmentId,
-      liveBranchByThreadKey,
-    });
-  }, [
-    availabilityByEnvironmentId,
-    checkoutKeyByThreadKey,
-    environments,
-    liveBranchByCheckoutKey,
-    projects,
-    shells,
-  ]);
+  const rows = useAgentRows();
   const unreadCount = useMemo(
     () => countUnreadAgentRows(rows, unreadThreadKeys),
     [rows, unreadThreadKeys],
@@ -145,9 +118,19 @@ export function AgentsPage() {
     [router],
   );
 
+  // Read through a ref so the select handler keeps its identity and memoised rows skip
+  // re-rendering when only the list changed.
+  const rowsRef = useRef(rows);
+  useEffect(() => {
+    rowsRef.current = rows;
+  }, [rows]);
   const handleSelect = useCallback(
     (key: string) => {
-      markRead(key);
+      const row = rowsRef.current.find((candidate) => candidate.key === key);
+      markRead(row === undefined ? key : agentRowUnreadKey(row));
+      if (row !== undefined && row.terminalId !== null) {
+        revealTerminalSurface(row.ref, row.terminalId);
+      }
       setSelectedKey(key);
     },
     [markRead],
@@ -155,8 +138,9 @@ export function AgentsPage() {
 
   const handleJumpToWorkspace = useCallback(
     (row: AgentRow) => {
-      markRead(row.key);
+      markRead(agentRowUnreadKey(row));
       setActiveEnvironmentId(row.ref.environmentId);
+      if (row.terminalId !== null) revealTerminalSurface(row.ref, row.terminalId);
       navigateToThread(row.ref);
     },
     [markRead, navigateToThread],
@@ -164,8 +148,9 @@ export function AgentsPage() {
 
   const handleMarkAllRead = useCallback(() => {
     for (const row of rows) {
-      if (selectIsUnread(unreadThreadKeys, row.key)) {
-        markRead(row.key);
+      const unreadKey = agentRowUnreadKey(row);
+      if (selectIsUnread(unreadThreadKeys, unreadKey)) {
+        markRead(unreadKey);
       }
     }
   }, [markRead, rows, unreadThreadKeys]);

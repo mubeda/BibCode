@@ -40,7 +40,9 @@ public package has no root export; callers use focused subpaths such as
   guarantees are unchanged. The gate opens after the identity check passes and
   the supervisor reports `connected`: no data from an unverified server reaches
   domain state, and held data meets a connected environment. `session` then
-  publishes the same object, so nothing subscribes twice. An attempt that ends
+  publishes the same object, so nothing subscribes twice: each followed thread
+  sends one `subscribeThread` per connection, resuming from the revision it
+  holds (`rpc/client.reconnect.test.ts`). An attempt that ends
   unverified clears `subscriptionSession`, which interrupts its followers; their
   held data is dropped. What changes is that a read subscription's request (its
   input, such as a thread ID or cwd) reaches the server before the config's
@@ -48,6 +50,30 @@ public package has no root export; callers use focused subpaths such as
   applies.
 - `EnvironmentSupervisor` owns desired state, connectivity, retries, the
   prepared connection, and the live RPC session for one environment.
+- A connection phase never gates local composer input. In every phase but
+  `connected` (connecting, reconnecting, offline, an explicit disconnect, or a
+  blocked identity), the composer stays editable and keeps its draft. Typing,
+  paste, type-to-focus insertion, file selection, `:` actions and moving to a
+  question's next step only change local state, and staging happens at Send.
+  Every action that needs the server refuses and names the state the
+  composer banner shows (`describeUnavailableEnvironment`). A blocked button
+  stays focusable (`aria-disabled`) with "<action> unavailable. <state>" as its
+  name and tooltip, and activating it sends nothing. That covers:
+  - the Send buttons, and Refine, Implement and a question's final Submit;
+  - Enter that would send something;
+  - Steer and Send now on the queued head;
+  - approval decisions;
+  - question answers, including a question's timed advance.
+
+  The refusal is one toast; it closes when the state changes, the thread changes
+  or the view unmounts. A provider binding conflict keeps precedence. The
+  question and its answers stay. Nothing is queued for the reconnect. A send that
+  passed its checks while connected and fails in a later await restores its
+  content: a turn through `restoreOutgoing`, a plan follow-up by merging its
+  cleared draft back and returning the draft to its mode before Implement. An
+  editor that went read-only in these phases dropped keys
+  without a sign (#199).
+
 - `EnvironmentRegistry` owns catalog entries and their scoped supervisors. It
   reconciles platform-provided registrations and exposes environment-scoped
   execution to domain state.
@@ -451,6 +477,25 @@ reconnect policy. Route disposal does not abort or release an admitting send;
 its outcome stops and joins the keeper. Success forgets the consumed stages;
 definite failure after navigation restores the captured old draft and releases
 unbound IDs, while an in-view failure may retain them for retry.
+
+A new chat's first send turns its draft into a server thread. Any attachment
+authority check runs before the send snapshots the composer, and nothing
+awaits between that snapshot and the clear of the draft's composer content.
+Once the thread arrives, the draft route shows it, and the thread's own route
+retires the draft when the thread has started. Content still in the draft at
+that point was typed after the send, or restored by a failed one, and is not
+known to have been sent; the thread's composer draft takes it over, with the
+draft's model and mode settings. Without a thread draft the entry moves
+unchanged, keeping its previews, persisted copies and identity. With one, the
+draft's content goes first and the thread draft's content and settings are
+never overwritten; only settings it lacks are filled. A send that began on the
+draft holds the draft's id. When its reply is late or lost after the server
+committed the thread and its first message, the restore resolves a retired
+draft id to its thread (`resolveComposerRestoreTarget`), so the restored
+content, and a retained replay's draft comparison, use the thread's composer.
+The restore merges into the live prompt only when the composer shows that same
+draft. The id mapping is in memory only and bounded; a live or discarded draft
+keeps its own id.
 
 Transient staged/pending/replay ownership lives in the client-runtime admission
 owner instantiated once by application thread state, keyed by environment and

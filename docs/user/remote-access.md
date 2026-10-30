@@ -217,6 +217,40 @@ data root and refuses to run before the server has ever started there. Revoke
 the resulting device from the Share tab like any other client. The focused
 `bibcode pairing issue` command remains for desktop-managed SSH bootstrap.
 
+### Diagnostics-only access for the command line
+
+An agent or script can fetch a remote server's diagnostic bundle on its own,
+with no BiBCode app running, through a credential that reads that bundle and
+nothing else (`diagnostics:read`). On the remote, mint the offer:
+
+```sh
+bibcode pairing offer --access diagnostics --endpoint http://100.64.0.10:3773
+```
+
+On the machine that downloads, pass the link on standard input (it then stays
+out of the process list and shell history), then download:
+
+```sh
+bibcode diagnostics pair --name omarchy < offer.txt
+bibcode diagnostics download --remote omarchy --output ~/Downloads --json
+```
+
+`pair` refuses an offer whose credential would hold anything but
+`diagnostics:read`, so a full-access offer is never saved. The credential is
+kept in `~/.bibcode/userdata/diagnostics-remotes/` (owner-only files) and never
+printed. The archive is redacted by the remote exactly as **Download logs** in
+the app is; `--include-crash-dumps` is refused for this credential, because
+dumps can hold fragments of memory. `bibcode diagnostics remotes` lists what is
+paired; `bibcode diagnostics forget <name>` deletes the local credential only.
+The remote lists the client as `<name> (diagnostics)` on its Share tab until it
+is revoked there or expires, 30 days after pairing; pair again then.
+
+This works for direct endpoints, `http` or `https` (the certificate is
+verified against the operating system's trust). An environment reached only
+through desktop-managed SSH or only through BiBCode Connect has no endpoint the
+command can reach: use `bibcode diagnostics download --environment <name>`
+through the app, or run `bibcode profiler` on that host.
+
 A server started with `--dev-url` keeps its data in `<base>/dev`; without it,
 the server uses `<base>/userdata`. Pass the same `--dev-url`, or set
 `VITE_DEV_SERVER_URL`, for `bibcode pairing offer` and `bibcode pairing issue`

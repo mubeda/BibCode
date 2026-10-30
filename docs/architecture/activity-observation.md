@@ -51,10 +51,12 @@ Terminal-state monotonicity currently differs by layer:
 - The repository rejects a terminal-to-non-terminal update only when its
   `updatedAt` is strictly older than the stored terminal update. Equal or newer
   updates are accepted.
-- The client incremental reducer rejects every terminal-to-non-terminal summary
-  update while still accepting the containing delta revision. That delta does
-  not itself trigger recovery, so the client can show the terminal summary until
-  a later authoritative snapshot replaces it.
+- The client incremental reducer never moves a visible summary from terminal
+  back to active. A non-terminal update of a visible terminal summary at the same
+  or a newer `updatedAt` is one the repository accepted, such as a resumed Codex
+  child reported again. The reducer treats it as a gap: it returns before
+  advancing the revision, and the client fetches one authoritative snapshot. An
+  older update is dropped and the delta applies.
 
 Interruption on teardown is also topology-specific. The Claude terminal
 observer explicitly marks tracked active records `interrupted` when its worker
@@ -64,6 +66,65 @@ observer and then invalidates further publication. Separately, repository
 startup cleanup interrupts unresolved records in persisted terminal scopes, and
 replacing the current generation for the same terminal interrupts active
 records in the prior scope.
+
+A structured chat closes its own unresolved records when the provider process
+that ran them is gone (#206). Nothing will report them again. The provider
+runtime calls `ActivityProjection::interrupt_unresolved_scope` for the thread
+scope in these places:
+
+- `detach_session`, after the session's activity tasks are reaped and before the
+  scope is republished Live. This covers stop, removal, idle suspension, the
+  lazy detach of an ended session, and `shutdown_sessions`, which an app
+  update's quiesce runs.
+- The relaunch teardown, before the new process starts.
+- The supervisor's `SessionStreamEnded` arm, on both the settled and the
+  settlement-timeout branch. A crashed process closes without waiting for
+  another delivery.
+- Server start, after the terminal pass and before abandoned sessions are
+  reconciled.
+
+The interruption runs in one transaction under the scope's publication lock:
+the repository reads the unresolved records and journals their deltas through
+the same batch code as provider mutations, so subscribers receive ordinary
+deltas. Each closed record gets `updatedAt == terminalAt ==` the closure time.
+That time is the ordering fence: a report from the dead process with an older
+`updatedAt` cannot reopen the record, while a real terminal report still
+replaces `interrupted`. The summary says why and when the record last reported,
+for example "Claude session ended before this subagent reported; last report 34m
+after it started." It keeps any earlier summary after it, and replaces an
+earlier closure's prefix. The last report is the later of the record's
+`updatedAt` and its newest entry. Closing a record retained under a section the
+scope no longer negotiates needs no capability, so a hookless relaunch closes
+its predecessor's subagents too.
+
+Only a BiBCode-owned process is treated as gone. `ProviderDriver::owns_native_work`
+is false for an OpenCode session attached to a server the user runs, and its
+records stay as they are on detach. At startup there is no live driver, so
+`StartupProcessOwnership` (`orchestration/process_ownership.rs`) decides from
+state read before abandoned sessions settle:
+
+- Claude, Codex, Cursor and Grok always run their own child: their work ended.
+- An OpenCode thread whose persisted `provider_session_runtime` payload says
+  `processOwner: "bibcode"`, which `OpenCodeDriver::start` writes, ended too;
+  `"external"` may still run.
+- An OpenCode thread with no recorded owner (a row from an older build, or no
+  row) follows the current settings of its own provider instance, from the row
+  or else from the session or scope: a **Server URL** on that instance means the
+  user's server ran it and it may still run; none means BiBCode's child ran it
+  and it ended. With no known instance, any configured Server URL keeps it.
+
+The same rule decides #187's startup request expiry
+(`expire_requests_of_settled_sessions`), so a thread never shows its subagents
+**Interrupted** beside requests still waiting on the same process.
+
+A stream that ends by itself closes its activity off the supervisor loop, so a
+projection stuck on the database cannot hold other threads' traffic. That closure
+is bounded to the stream's end: only records last reported at or before that
+moment close. It is reaped with the session's activity tasks, so it finishes
+before the session's entry is replaced by a relaunch or the supervisor stops. A
+relaunch whose old driver fails to shut down still closes the old records before
+the error propagates. A record whose stored summary no longer decodes is left as
+it is and counted in a warning; the rest of the scope still closes.
 
 ## Protocol v2, revisions, control overlays, and resync
 
@@ -301,6 +362,72 @@ RPC admission, generation fencing, projection, cleanup, and observer lifecycle
 are selected from the request scope; changing one gate does not transition the
 other. Legacy `enableAgentActivity` values migrate only to Chat.
 
+### AI Terminal agent status
+
+Every observable AI Terminal (Claude, Codex, OpenCode) launches with its
+observer, whatever the AI Terminal gate says (#187). The left panel's terminal
+agent status needs the observer.
+
+**What the gate still controls.** The gate decides whether the observer also
+publishes activity:
+
+- An observer launched while the gate is off starts dormant
+  (`TerminalAgentActivityControl::with_enabled(false)`, a `Prepared` launch
+  with no admission). It skips the history and child reconciliation it would
+  publish.
+- A dormant observer follows later gate transitions like any other observer.
+  When the gate opens on one that never published, it creates its activity
+  scope with the root agent then; OpenCode reconciles the session tree at once.
+  It reads live only once that scope is written: a write that fails, on enable
+  or at an OpenCode observer's launch, leaves activity unavailable, and it is
+  retried with a backoff.
+
+**How each provider reports.** Each observer reports its main agent's state
+through its generation (`TerminalObserverGenerationLease::publish_agent_status`),
+independently of admission:
+
+- **Claude:** status hooks on the existing authenticated loopback receiver.
+  The hooks are `SessionStart`, `UserPromptSubmit`, `PermissionRequest`,
+  `Notification` (`idle_prompt` reads Done), `Elicitation`,
+  `ElicitationResult`, `Stop`, `StopFailure` and `SessionEnd`, plus main-agent
+  `PreToolUse` and `PostToolUse`; any agent's finished tool ends an approval
+  prompt. Status follows the main session, rebinding on `SessionStart`.
+  Status-only hooks never reach the activity worker, and status decodes only
+  the fields it reads; a hook is decoded whole only for live activity.
+  Activity admission is still taken before the body arrives.
+- **Codex:** the TUI root thread's `thread/status/changed` notifications
+  (including `activeFlags`), `turn/started`, `turn/completed`, its approval and
+  question requests, and its `item/*` notifications as progress. The
+  `thread/resume` response sets the state at attach and reattach.
+- **OpenCode:** root-session `session.status`, `session.idle`,
+  `session.error`, permission and question events, and its `message.part.*`
+  events as progress, read from a dormant stream too, which decodes only the
+  type, session and status fields. The session statuses set the state at
+  attach and reconnect (OpenCode lists only sessions that are not idle).
+- **Progress** reads Working unless the agent is blocked on an approval or
+  waiting on the user, which only an answer or a new status ends.
+
+**Publication.** The terminal manager mirrors the latest report into
+`TerminalSummary.agentStatus` on the metadata stream:
+
+- A changed state is mirrored at once.
+- An unchanged report refreshes its age at most once a minute.
+- The age (`ageMs`) and the evidence token (`observedAt`) are computed when the
+  summary is serialized, so the metadata snapshot that starts each subscription
+  carries current ages.
+- A launch that names a provider but gets no observer reads `unavailable`.
+  That covers Cursor and Grok, Windows, and a failed preparation, and the value
+  stays `unavailable` after exit. An observed agent settles to `done` on exit,
+  failed for a non-zero exit code other than a Ctrl+C quit (130, SIGINT, or
+  Windows' control-C status).
+
+**Trust boundary.** It is unchanged. Hooks still reach only a `127.0.0.1`
+listener with a per-generation bearer token, checked in constant time, and
+settings owned by that generation. Codex still uses its generation's
+Unix-socket helper. The status carries only the derived state, never prompt,
+message or terminal content. The change is in reach: every observable AI
+Terminal now runs an observer, not only terminals launched with the gate on.
+
 ### Codex structured recovery
 
 Codex structured recovery merges validated, bounded live and root/child-history
@@ -381,6 +508,17 @@ for the pass with a log warning, the snapshot stays partial (background work is
 not treated as authoritative), and the next pass asks again.
 These recovery downgrades do not disable ordinary Codex chat.
 
+A Claude chat subagent that is still open at its parent turn's `result` closes as
+`interrupted` only when its correlator-confirmed task is missing from Claude's
+complete live set. The set is complete after a `background_tasks_changed` whose
+every non-ambient task had a usable `task_id`. An overflow, or a list with an
+unnamed task, makes it incomplete until the next complete list. A
+`SubagentStop` that arrives after such a close, in the same tracker, completes
+the record at a time no earlier than the closure. An actor without a confirmed
+task waits for its stop hook or for its process to end. The summary of such a
+close starts "Claude stopped listing this subagent as running", because Claude
+dropped it from its list rather than reporting an end.
+
 Claude structured control normally joins native task identity only through the
 complete same-session, same-generation Agent/Task `tool_use_id` chain: an Agent
 tool invocation from either the current `assistant` record or the legacy
@@ -441,16 +579,16 @@ means the signal BiBCode uses still matches the provider's documentation;
 **unused** names documented signals BiBCode does not read yet. The
 [provider guides](../providers/README.md) quote the references.
 
-| Provider | Surface  | Signals BiBCode uses                                                                                                                                                                                                                       | Reference                                                                                                                                                                                               | Minimum version                                                                                        | Status                                                                                                                                                                  |
-| -------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Claude   | Chat     | `--include-hook-events` and `--forward-subagent-text`, both listed by `--help`; `SubagentStart`/`SubagentStop` hooks; Agent and legacy Task `tool_use` with `parent_tool_use_id`; `task_started`/`task_notification` for targeted Stop     | [CLI reference](https://code.claude.com/docs/en/cli-reference), [headless](https://code.claude.com/docs/en/headless#follow-subagent-messages), [hooks](https://code.claude.com/docs/en/hooks)           | `--forward-subagent-text` v2.1.211; every nesting depth v2.1.219; `--include-hook-events` undocumented | Current, help-gated. Unused: `local_bash` tasks and `background_tasks_changed` (v2.1.203), `run_id` and `parent_task_id` (Agent SDK v0.3.292), forked skills, teammates |
-| Claude   | Terminal | `--settings` with `--setting-sources`, both listed by `--help`; authenticated HTTP hooks; additive hook merge; private executable pin                                                                                                      | [CLI reference](https://code.claude.com/docs/en/cli-reference), [hooks](https://code.claude.com/docs/en/hooks)                                                                                          | HTTP hooks v2.1.63, the oldest version BiBCode proved                                                  | Current, help-gated                                                                                                                                                     |
-| Codex    | Chat     | App Server with `experimentalApi`: `subAgentActivity` items, `thread/read`, `thread/turns/list`, `thread/list`, `thread/backgroundTerminals/list`                                                                                          | [App Server README](https://github.com/openai/codex/blob/main/codex-rs/app-server/README.md), [protocol](https://github.com/openai/codex/blob/main/codex-rs/app-server-protocol/src/protocol/common.rs) | None pinned; each method is feature-detected                                                           | Current. Unused: `thread/backgroundTerminals/terminate` and `/clean` (experimental), so no Stop for background terminals                                                |
-| Codex    | Terminal | Unix App Server listener and remote TUI; `thread/list` reconciliation that `subAgentActivity` can wake                                                                                                                                     | Same as chat                                                                                                                                                                                            | Probe-gated                                                                                            | Current                                                                                                                                                                 |
-| OpenCode | Chat     | OpenCode 1: `GET /session/:id/children`, `GET /session/status`, `GET /session/:id/message`, `GET /event`, `POST /session/:id/abort`. OpenCode 2: `GET /api/session?parentID=…`, `GET /api/session/active`, `GET /api/session/{id}/message` | [Server](https://opencode.ai/docs/server/) (OpenCode 1 routes only)                                                                                                                                     | 1.x and 2.x; 2.x replayed from captured 2.0.29 responses                                               | Current for 1.x; the 2.x routes are not in the server documentation                                                                                                     |
-| OpenCode | Terminal | Authenticated serve, then `attach` (1) or `--server`/`--session` (2); owned-root correlation; the chat routes                                                                                                                              | [Server](https://opencode.ai/docs/server/)                                                                                                                                                              | 1.x and 2.x                                                                                            | Current                                                                                                                                                                 |
-| Cursor   | Chat     | None; ordinary ACP chat only                                                                                                                                                                                                               | [CLI ACP](https://cursor.com/docs/cli/acp)                                                                                                                                                              | None                                                                                                   | Unsupported in protocol v2. Unused: `cursor/task` (subagent completion) and `cursor/generate_image`                                                                     |
-| Cursor   | Terminal | None                                                                                                                                                                                                                                       | [CLI ACP](https://cursor.com/docs/cli/acp), [subagents](https://cursor.com/docs/subagents)                                                                                                              | None                                                                                                   | Unsupported: no documented live signal                                                                                                                                  |
+| Provider | Surface  | Signals BiBCode uses                                                                                                                                                                                                                                                                                                                                                 | Reference                                                                                                                                                                                                   | Minimum version                                                                                        | Status                                                                                                                        |
+| -------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------- |
+| Claude   | Chat     | `--include-hook-events` and `--forward-subagent-text`, both listed by `--help`; `SubagentStart`/`SubagentStop` hooks; Agent and legacy Task `tool_use` with `parent_tool_use_id`; `task_started`/`task_notification` for targeted Stop; `background_tasks_changed` (v2.1.203) as the complete live set that lets turn end close a confirmed subagent missing from it | [CLI reference](https://code.claude.com/docs/en/cli-reference), [headless](https://code.claude.com/docs/en/headless#follow-subagent-messages), [hooks](https://code.claude.com/docs/en/hooks)               | `--forward-subagent-text` v2.1.211; every nesting depth v2.1.219; `--include-hook-events` undocumented | Current, help-gated. Unused: `local_bash` tasks, `run_id` and `parent_task_id` (Agent SDK v0.3.292), forked skills, teammates |
+| Claude   | Terminal | `--settings` with `--setting-sources`, both listed by `--help`; authenticated HTTP hooks; additive hook merge; private executable pin; Anthropic's code signature on macOS; `mise which` and `mise env --json` behind a mise shim                                                                                                                                    | [CLI reference](https://code.claude.com/docs/en/cli-reference), [hooks](https://code.claude.com/docs/en/hooks), [binary integrity](https://code.claude.com/docs/en/setup#binary-integrity-and-code-signing) | 2.1.220 to 2.1.312, the range whose additive merge BiBCode proved                                      | Current, help-gated; macOS and Linux                                                                                          |
+| Codex    | Chat     | App Server with `experimentalApi`: `subAgentActivity` items, `thread/read`, `thread/turns/list`, `thread/list`, `thread/backgroundTerminals/list`                                                                                                                                                                                                                    | [App Server README](https://github.com/openai/codex/blob/main/codex-rs/app-server/README.md), [protocol](https://github.com/openai/codex/blob/main/codex-rs/app-server-protocol/src/protocol/common.rs)     | None pinned; each method is feature-detected                                                           | Current. Unused: `thread/backgroundTerminals/terminate` and `/clean` (experimental), so no Stop for background terminals      |
+| Codex    | Terminal | Unix App Server listener and remote TUI; `thread/list` reconciliation that `subAgentActivity` can wake                                                                                                                                                                                                                                                               | Same as chat                                                                                                                                                                                                | Probe-gated                                                                                            | Current                                                                                                                       |
+| OpenCode | Chat     | OpenCode 1: `GET /session/:id/children`, `GET /session/status`, `GET /session/:id/message`, `GET /event`, `POST /session/:id/abort`. OpenCode 2: `GET /api/session?parentID=…`, `GET /api/session/active`, `GET /api/session/{id}/message`                                                                                                                           | [Server](https://opencode.ai/docs/server/) (OpenCode 1 routes only)                                                                                                                                         | 1.x and 2.x; 2.x replayed from captured 2.0.29 responses                                               | Current for 1.x; the 2.x routes are not in the server documentation                                                           |
+| OpenCode | Terminal | Authenticated serve, then `attach` (1) or `--server`/`--session` (2); owned-root correlation; the chat routes                                                                                                                                                                                                                                                        | [Server](https://opencode.ai/docs/server/)                                                                                                                                                                  | 1.x and 2.x                                                                                            | Current                                                                                                                       |
+| Cursor   | Chat     | None; ordinary ACP chat only                                                                                                                                                                                                                                                                                                                                         | [CLI ACP](https://cursor.com/docs/cli/acp)                                                                                                                                                                  | None                                                                                                   | Unsupported in protocol v2. Unused: `cursor/task` (subagent completion) and `cursor/generate_image`                           |
+| Cursor   | Terminal | None                                                                                                                                                                                                                                                                                                                                                                 | [CLI ACP](https://cursor.com/docs/cli/acp), [subagents](https://cursor.com/docs/subagents)                                                                                                                  | None                                                                                                   | Unsupported: no documented live signal                                                                                        |
 
 Recovery and truthful downgrade:
 
@@ -463,7 +601,17 @@ Recovery and truthful downgrade:
   large to keep is skipped without breaking its connection.
 - **Claude**: no background-work capability. Recovery moves from `none` to
   `bounded` only after correlated transcript recovery; unproven hook support
-  leaves activity unsupported. The terminal path additionally needs settings
+  leaves activity unsupported. A session that restarts in the same server
+  process keeps its activity lifecycle, and the new process's startup
+  capabilities replace what the old one reported. This also happens while Chat
+  Activity is off, so turning it back on publishes what the new process
+  reports. A Claude process whose probe
+  found no hook flags starts without a hook sink and reports `none`, so retained
+  subagents turn stale instead of staying live. Other providers whose startup
+  report is `none` (Cursor, Grok, OpenCode) only mean "not known yet". Their
+  restarted sessions keep the capabilities observed at runtime until the new
+  process reports its own (`ProviderDriver::startup_activity_capabilities_are_final`).
+  The terminal path additionally needs settings
   composition, authenticated HTTP hooks, additive merge semantics, and a safe
   private executable pin.
 - **OpenCode**: structured chat reports no activity when the child endpoint is
@@ -497,6 +645,93 @@ and invalidates further activity publication, then continues creating and
 registering the prepared PTY as the running terminal. It does not respawn the
 original command.
 
+Every way a Codex terminal ends up without Activity is logged under
+`bibcode_server::provider_terminal::codex`. Each line carries a `reason` and an
+`elapsed_ms`:
+
+- **Preparation, as info:** an executable or command that cannot be observed
+  (`unsupported_capabilities`, `rejected_args`, `probe_version_unparsed`).
+- **Preparation, as a warning:**
+  - a failure that should have worked:
+    - `probe_timeout`, `probe_spawn_failed`, or `probe_unavailable`, which
+      carry only the kind of failure, never a path;
+    - `probe_command_failed`, `generation_dir_failed`, `socket_path_too_long`;
+    - `helper_start_failed`, with the launcher's error and helper time.
+  - `preparation_timeout`, with the `stage` the budget ran out in;
+  - `helper_start_abandoned`, with the helper step (`supervisor`, `spawn`,
+    `admission`, or `readiness`) when a helper start is dropped unfinished.
+- **After spawn, as a warning:**
+  - `connect_timeout`, once, with the step reached (`connect`, `initialize`, or
+    `initialized`), when the App Server has not connected within three
+    seconds. The observer keeps waiting.
+  - `connect_failed`, unless the terminal is already closing.
+  - `root_discovery_stopped`, `root_discovery_reconnect_failed`, the `resume_*`
+    reasons, and `live_publication_rejected`, logged when the terminal
+    generation is no longer current and the observer ends.
+  - `live_publication_retrying`, once per failure streak (a successful scope
+    write starts a new streak), when creating the scope failed; the detail is
+    the kind of failure only. The observer keeps retrying with backoff until
+    the generation is gone.
+  - `root_discovery_pending`, once, if no TUI thread is found within ten
+    seconds.
+
+  These lines carry no App Server error text, which can quote thread content.
+  They carry the JSON-RPC error code, or which transport step failed.
+
+**Preparation budgets.** Each provider factory owns the time its preparation may take
+(`ProviderTerminalObserverFactory::preparation_budget`) and enforces it with
+its own timeout. The supervisor tells the terminal manager to wait that long
+plus a fixed 150 ms, so the factory's timeout fires first and cleans up. A
+launch the supervisor cannot validate (disabled or unknown instance, mismatched
+driver, unresolved executable) gets the manager's 500 ms default and passes
+through almost at once. The manager's own ceiling (3 s) is a stop for a
+preparer that asks to wait too long; a test keeps it above every provider's
+wait, so the ceiling never cuts a provider short (#200). The settings are read
+once per launch: the lookup that chooses the wait keeps the validated reading,
+and preparation of the same launch uses it, so settings that change between the
+two cannot start a preparation under the wrong wait. If that lookup is cut off,
+the launch passes through without a second read.
+
+| Provider | Own budget | `terminal.open` waits at most |
+| -------- | ---------- | ----------------------------- |
+| Codex    | 350 ms     | 500 ms                        |
+| OpenCode | 850 ms     | 1 s                           |
+| Claude   | 2.25 s     | 2.4 s                         |
+
+The wait applies only to a preparation still running. A launch that cannot be
+observed (an unapproved Claude build, missing capabilities) passes through in
+0.15 to 0.4 s without waiting for its budget. When the budget runs out the
+original command spawns unobserved, and the manager logs
+`provider terminal observer callback timed out` with `timeout_ms`. Claude
+cannot attach late: its observer rewrites the command (pinned executable and a
+`--settings` overlay), which has to happen before the PTY spawns.
+
+Claude's preparation runs in order: behind a mise shim, `mise which` and then
+`mise env` (750 ms each at most); the pin; the `--version` and `--help` probe
+(the probe runner's own 2 s timeout) together with the SHA-256 of the pin; and,
+for a build not yet proven, `codesign --verify` (macOS only, at most 1.25 s) once
+that probe and hash have finished. The 2.25 s budget bounds them all: a launch
+that runs past it passes through unobserved, and the next launch tries again.
+Cached probes and proven builds take a fraction of it. A cold launch of a new
+build on macOS, or behind a shim on a slow disk, is the case that can reach it.
+Measured on a 12-core Mac with a 276 MB Claude binary, the stages (`clonefile`
+pin, `--version` and `--help`, SHA-256 of the binary, `codesign`) take about
+0.2 s together, and a median of 252 ms (maximum 356 ms) with the CPU
+oversubscribed twice over. The earlier 500 ms wait cut a Claude preparation
+that was merely slow, which left the terminal without Activity or agent status.
+
+The Codex budget is unchanged. Run alone, the packaged Activity spec passed on
+both macOS architectures with none of the Codex observer lines (#192), so the
+earlier x64 failures happen only with the full suite's load. Budgets change
+only if a full macOS x64 run fails and these lines name the stage that ran out.
+
+A version the probes cannot parse is cached for that executable build for ten
+minutes, so launches in that window pass through without spawning probes. The
+window lets a wrapper script whose own bytes never change recover once the
+Codex behind it is upgraded. Unsupported capabilities are cached for the life
+of the build. A probe that could not run, or exited unsuccessfully, is not
+cached: it may be transient.
+
 Observer workers are admitted under a process-wide cap of sixty-four, and
 sixteen per terminal generation. An observed terminal holds one worker; an
 OpenCode launch briefly holds a second until its terminal spawns. A worker
@@ -521,7 +756,7 @@ Claude explicitly interrupts tracked active records when its observer ends;
 Codex does not directly terminalize them; and OpenCode retries its event stream
 but skips failed reconciliation requests without changing its advertised
 terminal history capability. The terminal remains independent of its read-only
-terminal Activity surface.
+Activity panel, which opens inside the terminal's own pane.
 
 See the ownership and fallback paths in
 [`apps/server/src/provider_terminal/supervisor.rs`](../../apps/server/src/provider_terminal/supervisor.rs)
@@ -571,13 +806,14 @@ and [`apps/server/tests/provider_opencode.rs`](../../apps/server/tests/provider_
 
 ## Troubleshooting states
 
-| State            | Meaning                                                                                                                                                                           | Operator response                                                                                                                                 |
-| ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Live**         | The scope or section is current and contiguous revisions are applying.                                                                                                            | No action.                                                                                                                                        |
-| **Reconnecting** | If emitted, the scope says its observer is attempting to re-establish provider state. A client transport reconnect separately keeps the last snapshot stale until resubscription. | Wait for a replacement snapshot; inspect provider connectivity if it persists.                                                                    |
-| **Stale**        | Previously valid data is retained, but reconciliation or transport recovery has not established that it is current.                                                               | Treat the data as historical and resolve the reported provider/connection condition.                                                              |
-| **Error**        | A scope's bare `observationState` is `error`, or a section health object is `error`. Only section health has `message` and `retryable` fields.                                    | For a section, inspect its message and retryability. For a scope, use operational logs plus reconnect, resubscribe, and snapshot-resync evidence. |
-| **Interrupted**  | A record—not the scope—reached the terminal `interrupted` lifecycle through a provider-specific transition or repository cleanup.                                                 | Treat that work as ended; start a new provider operation if needed.                                                                               |
+| State                                             | Meaning                                                                                                                                                                           | Operator response                                                                                                                                                                                                         |
+| ------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Live**                                          | The scope or section is current and contiguous revisions are applying.                                                                                                            | No action.                                                                                                                                                                                                                |
+| **Reconnecting**                                  | If emitted, the scope says its observer is attempting to re-establish provider state. A client transport reconnect separately keeps the last snapshot stale until resubscription. | Wait for a replacement snapshot; inspect provider connectivity if it persists.                                                                                                                                            |
+| **Stale**                                         | Previously valid data is retained, but reconciliation or transport recovery has not established that it is current.                                                               | Treat the data as historical and resolve the reported provider/connection condition.                                                                                                                                      |
+| **Error**                                         | A scope's bare `observationState` is `error`, or a section health object is `error`. Only section health has `message` and `retryable` fields.                                    | For a section, inspect its message and retryability. For a scope, use operational logs plus reconnect, resubscribe, and snapshot-resync evidence.                                                                         |
+| **Interrupted**                                   | A record—not the scope—reached the terminal `interrupted` lifecycle through a provider-specific transition or repository cleanup.                                                 | Treat that work as ended; start a new provider operation if needed.                                                                                                                                                       |
+| **Interrupted, "… ended before this … reported"** | BiBCode closed the record because the process that ran it is gone: a stop, suspension, relaunch, crash, update or server restart. The summary gives the last report.              | Look in `server.log` for `closed the open activity of an ended provider session` or `closed chat activity left open by the previous server`. A record still **Running** for an OpenCode server the user runs is expected. |
 
 An absent dock is also meaningful: protocol v2 may be unavailable, the provider
 may be unsupported, or a terminal handshake may not have established correlated

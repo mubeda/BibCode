@@ -62,8 +62,12 @@ through Tauri commands/events. Browser mode connects directly to a native
 - Center surfaces are arranged into tab groups. Up to four groups can be shown
   as resizable horizontal or vertical split panes; each group has its own
   active surface, while one group owns focus and new-panel creation.
+- Each chat pane, and each Codex Terminal pane while it is observed, has its own
+  collapsible Activity panel. It sits above the composer or below the terminal.
+  Whether it is open, and its section and record, persist per pane in the
+  center-panel state.
 - Right-panel surfaces are per-thread tools: Plan, Diff, Source Control, Files,
-  individual files, Preview, Terminal, Activity, Device (kind `device`), and
+  individual files, Preview, Terminal, Device (kind `device`), and
   one tab per open pull or merge request. Preview is hidden when the active
   host does not report native preview support; Device is offered only while
   the environment's device previews are on.
@@ -71,5 +75,15 @@ through Tauri commands/events. Browser mode connects directly to a native
 Center layout, focus, tab order, and split ratios persist across reloads. Closing
 a split pane merges its tabs into the adjacent layout; explicitly closing a tab
 closes its panel thread or terminal session as appropriate.
+
+The left panel's view (`sidebarView`: `environments`, `repositories` or
+`inbox`) and the Inbox's selected tile (`inboxCategory`: `all`, `attention`,
+`working` or `done`, or `null` until the default settles) persist per device in
+the `bibcode:ui-state:v1` local-storage blob owned by
+`apps/web/src/uiStateStore.ts`; unknown values load as `environments` and
+`null`. The Inbox lists the same agent rows as the Agents view and opens an
+agent through the center layout of its host thread: the host chat (restored
+when every tab was closed), the chat panel, or the AI terminal named by the
+row's terminal id.
 
 See [Workspace UI](../user/workspace-ui.md) for the user-facing model.

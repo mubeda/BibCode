@@ -601,6 +601,49 @@ Cursor's fixture profile must include the generated skills in its native
 compatibility roots, including `.claude/skills` as well as `.cursor/skills`.
 The fixture-files regression checks that union; keep the exact native menu
 inventory assertion so omitted or unexpected skills still fail qualification.
+The spec's second scenario opens a new chat from the command palette (the
+primary workspace's chat is already a server thread, so it never promotes a
+draft). It types into the composer as soon as the new chat's first send clears
+it, while the draft route is still showing. After the thread's route
+retires the draft, that text must be the thread's visible composer text and its
+persisted draft, with no draft session left. Keep that assertion as well: it
+is the packaged check that unsent text survives draft promotion. To run the
+scenario alone, set `BIBCODE_E2E_SPEC=./specs/composer-native-triggers.e2e.ts`
+in the same way.
+
+The spec's third scenario types into the primary chat one key at a time. It
+types through a window `offline` event, then through a lost RPC socket that its
+page harness keeps failing until it lets the retry through. In both drops:
+
+- every key is on screen and in the thread's single environment-scoped persisted
+  draft after the 300 ms write debounce;
+- Send is blocked but stays focusable (`aria-disabled`, not native `disabled`),
+  and its accessible name is "Send unavailable." followed by the state the
+  composer banner shows;
+- Enter raises a toast titled with the environment's state and keeps focus and
+  text;
+- nothing reaches the provider before an explicit Send after the reconnect;
+- that Send delivers the whole text exactly once. The provider-log wait's
+  1.5 s settle is the proof that nothing was resent on reconnect: it fails on a
+  second delivery.
+
+Keep these assertions. They are the packaged check that a connection phase never
+drops typing (#199). The collapsed mobile composer cannot render in the desktop
+app, whose window is at least 960 px wide, so its refusal is covered by
+ChatComposer component tests.
+
+When `waitForComposerValue` times out, the spec writes
+`composer-value-timeout-<n>.json`. It records the editor's text, editable state
+and focus, the Send label, the toasts, `navigator.onLine`, the route, and the
+persisted drafts. Retain it with the failure screenshot.
+
+The manual loop `apps/desktop/e2e/specs/manual/composer-connection-drop.e2e.ts`
+(not in the default list) repeats offline, lost-socket and no-drop arms around
+typing. It writes a timestamped recorder log per run to
+`composer-drop-runs.jsonl`, and fails an arm whose text is gone once the
+connection is back. Before the fix, with a read-only composer, its
+offline-before-typing arm lost the text on macOS arm64 in every run. What closed
+the macOS x64 runner's connection in that CI run is not known.
 
 The packaged scenario must show two Queued cards in FIFO order below the working
 row while the provider log still contains only the initial start. Steer the head
@@ -724,6 +767,111 @@ the latest thought, and that the number of `thread.reasoning-sent` events in
 SQLite stays near one per 250 ms of thinking rather than one per delta. Put a
 sentinel phrase in a prompt that the model will think about and confirm it is
 absent from `server.log`, the provider operational log and the profiler JSONL.
+
+### Claude activity probe behind a shim
+
+The Claude activity probe must answer for the executable a chat launch runs
+([Activity observation](../providers/claude.md#activity-observation)). For a
+change to the probe, its cache, or the activity capabilities a restarted
+session reports, run the probe and restart seams. Their fixture is a symlinked
+multi-call script: it answers as Claude only through its `claude.sh` link and
+as mise under its real name.
+
+```sh
+cargo test -p bibcode-server --lib claude_probe_reads_only_a_claude_code_version
+cargo test -p bibcode-server --lib only_a_link_to_another_program_is_a_claude_shim
+cargo test -p bibcode-server --lib a_final_startup_none_replaces_capabilities_observed_at_runtime
+cargo test -p bibcode-server --test production_provider_runtime claude_probe
+cargo test -p bibcode-server --test production_provider_runtime claude_launch_through_a_shim
+cargo test -p bibcode-server --test production_provider_runtime a_restarted_claude_without_hook_support
+cargo test -p bibcode-server --test production_provider_runtime a_hookless_restart_while_chat_activity_is_off
+cargo test -p bibcode-server --test production_provider_runtime concurrent_launches_share_one_shim_recheck
+```
+
+For a change to how a chat's subagents close when their process ends (#206),
+also run the process-end seams. They cover the callers: idle suspension,
+shutdown, a crash with no further turn, a server the user runs, a Codex child
+reported again, the OpenCode owner flag across a restart, startup repair, and
+the Claude turn-end close:
+
+```sh
+cargo test -p bibcode-server --test activity_repository process_end
+cargo test -p bibcode-server --test activity_provider_conformance
+cargo test -p bibcode-server --test production_maintenance open_subagent_records
+cargo test -p bibcode-server --lib -- interrupts_an_open_subagent ends_by_itself a_server_the_user_runs idle_deadline_suspends_a_running_subagent a_live_codex_report_after opencode_records_who_runs startup_interrupts_unresolved turn_end_activity_tests hook_sink process_ownership a_restart_settles_or_keeps
+cargo test -p bibcode-server --test production_provider_runtime update_protection_closes_a_live_claude_subagent
+```
+
+These tests are Unix-only. The live check runs on a remote Linux server whose
+`claude` is a mise shim, as Omarchy installs it. Confirm with
+`readlink -f "$(command -v claude)"`, which should print the `mise` binary.
+
+1. Open a Claude chat on that server and start a subagent.
+2. In `server.log`, find the `Claude activity probe finished` line. It should
+   show `outcome="supported"`, an `executable` ending in `shims/claude`, a
+   `canonical` naming `mise`, and a redacted `search_path` with no raw home
+   directory.
+3. Under **Activity**, check that **Subagents** lists the subagent as running.
+4. Change the chat's effort. That restarts the chat in the same server process.
+   Start another subagent and check that it is listed too.
+5. Point the directory's mise configuration at a Claude Code without
+   `--include-hook-events`, then change effort again. The new probe line should
+   show the new version and `outcome="unsupported"`. **Subagents** should then
+   show "Provider no longer reports this retained activity" instead of a live
+   section. A subagent that was still running before the restart is under
+   **Done** as **Interrupted**, and its first line starts "Claude session ended
+   before this subagent reported". `server.log` has a
+   `closed the open activity of an ended provider session` line for the thread.
+   A row still reading **Running** there is a failure (#206).
+
+A `found another program` warning means the probe reached `mise` itself. Record
+that, and the lines around it, as a failure.
+
+### Claude Terminal pin, attestation and shim
+
+A Claude AI Terminal is hooked only for a pinned copy of a proven build
+([Claude Terminal](../providers/claude.md)). For a change to the pin, the
+version range, the signature check, the shim resolver, or the environment
+overlay, run:
+
+```sh
+cargo test -p bibcode-server --lib provider_terminal::claude
+cargo test -p bibcode-server --test provider_terminal_supervisor claude
+cargo test -p bibcode-server --test provider_terminal_supervisor concurrent_opens_of_a_new_build
+cargo test -p bibcode-server --test provider_terminal_supervisor a_pin_still_copying
+cargo test -p bibcode-server --test provider_terminal_supervisor production_mise_resolver
+cargo test -p bibcode-server --test provider_terminal_supervisor lifecycle_environment_overlay
+```
+
+Their fixtures include a symlinked multi-call shim (`bin/claude` to a program
+named `mise`) and a shell script standing in for mise that reports the
+directory and launch variable it ran with. These tests are Unix-only.
+
+Three live checks use real builds. Each records its build's `--version`:
+
+1. **Installed build (macOS).** Copy the installed build under `$TMPDIR` (the
+   hermetic guard's root, for example with `cp -c`), then run
+   `BIBCODE_CLAUDE_ATTESTATION_FIXTURE=<copy> cargo test -p bibcode-server --lib installed_claude_build_is_approved -- --nocapture`.
+   It must pass and print the SHA-256 and probe timings.
+2. **Merge proof.** The [release step](../operations/release.md#claude-terminal-hook-ceiling)
+   is `live_user_pre_tool_use_guard_still_blocks_with_the_bibcode_overlay`.
+   Run it for any build the ceiling is raised to.
+3. **Real mise shim (Linux or macOS with mise).** Place mise, its data
+   directory with Claude installed (`mise use claude@<version>`), the shims and a
+   project whose `mise.toml` sets an `[env]` variable, all under `$TMPDIR`. Then
+   run, in release:
+
+   ```sh
+   BIBCODE_CLAUDE_MISE_SHIM=<data>/shims/claude BIBCODE_CLAUDE_MISE_PROJECT=<project> \
+   BIBCODE_CLAUDE_MISE_ENV_KEY=<variable> MISE_DATA_DIR=<data> \
+     cargo test --release -p bibcode-server --test provider_terminal_supervisor \
+     live_claude_terminal -- --ignored --nocapture
+   ```
+
+   Both opens (cold and proven build) must be hooked, carry the `[env]`
+   variable, and finish within 2.4 s. On Linux, run it on both a
+   block-sharing filesystem (btrfs or XFS) and ext4, and record the printed
+   times.
 
 ### Selecting other focused coverage
 
@@ -2890,6 +3038,60 @@ sizes. Cover relevant:
   session in the right pane, the back arrow returns to the normal view, and the
   per-row jump-to-workspace action returns to the normal view and re-points the
   rail to that row's environment;
+- **agent status** in the Agents view and on workspace cards. Check each of the
+  following:
+  - **A question.** Ask a chat agent for something that makes it ask a
+    question. The row moves to **Awaiting Input** and the card glyph reads
+    "Waiting for your answer". Reload the window: the state is unchanged.
+  - **Stop during an approval.** In approval mode, wait for a command approval
+    and press **Stop** instead of answering. The row leaves **Pending
+    Approval**, the chat's approval card closes, and the work log notes
+    "Approval expired".
+  - **Quit and relaunch during an approval.** Quit and relaunch BiBCode with an
+    approval open. A Codex or Claude chat's row reads **Failed** in Done, not
+    Pending Approval. An OpenCode chat's approval stays **Pending Approval**,
+    holding its queued messages, until the session resumes: it stays open if
+    OpenCode still lists it and expires if OpenCode no longer does.
+  - **Per-terminal rows.** Open a Claude, Codex or OpenCode Terminal with **AI
+    Terminal** activity off. It gets its own row, keyed apart from the chat's,
+    and the row follows the agent: Working while it runs, Pending Approval at a
+    permission prompt, Awaiting Input at a question, Done at its prompt.
+    Selecting the row shows that terminal. A workspace with only a terminal
+    gets a row too.
+  - **Terminal availability per platform.**
+    - On Windows, every AI Terminal row reads **Status unavailable**.
+    - On macOS and Linux, a Cursor or Grok Terminal reads **Status
+      unavailable**.
+    - An unobserved terminal keeps a finished card from reading Done: its
+      glyph is a dashed circle.
+  - **Staleness.** Leave a turn running a silent 31-minute command. The row
+    moves to **Unknown** with **No update** and stops pulsing.
+  - **Offline and restart.** Disconnect a remote environment. Its rows read
+    **Offline** and stop pulsing. Reconnect, and its rows show live states
+    again. After an app relaunch, a silent agent that was already 30 minutes
+    old reads **No update** at once.
+- the **Inbox** view: with a remote environment connected, have one agent wait
+  on an approval, one run a turn, and one finish, plus a worktree opened with
+  an AI Terminal (the "open AI terminal" worktree default) running a provider
+  CLI. Switch the left panel to **Inbox**: the rail disappears, and the tiles
+  show All Agents, Needs Attention, Working and Done with counts that match;
+  with nothing chosen before, Needs Attention is selected. Pick each tile and
+  confirm only its agents are listed and exactly one tile looks selected;
+  answer the approval and confirm the counts move without a reload. Select a
+  chat agent whose worktree had every center tab closed: its route opens with
+  the chat back in front. Select a chat panel agent: its host worktree opens
+  with that panel focused. Select the AI Terminal agent: its worktree opens
+  with that terminal tab focused (on Windows, where terminal status is not
+  observed, it counts only under All Agents). Reload the window and confirm
+  the Inbox, the tile and the highlighted agent come back. Disconnect the
+  remote server: its agents read **Offline**, count only under All Agents
+  (not Needs Attention), the note names it as not connected and **Open Remote
+  Servers** opens that settings page; while it reconnects the note says so,
+  and once it is back the note goes and its agents' counts return. Select
+  several workspace cards in Environments, switch to Inbox and open an agent:
+  the multi-selection is gone. Narrow the
+  panel to its minimum and confirm the switch shows icons whose tooltips name
+  each view;
 - the **Environments | Repositories** switch: open one repository as a project
   on Local and on a remote environment. Switch the left panel to
   **Repositories**: the environment rail disappears, the BiBCode brand stays where it was
@@ -2943,6 +3145,33 @@ sizes. Cover relevant:
 - Create Worktree exact local and remote ref selection: the exact value appears
   once, the derived name remains correct, and a remote-to-local race succeeds
   without duplicate branch creation;
+- Create Worktree and Add Project follow **Settings → Agents → Default Agent**
+  (#185). Check each of these:
+  - **Primary project:** with the app running, change Default Agent to a Claude
+    chat, open Create Worktree, and confirm the Agent picker shows it. Create
+    without touching the picker; the new thread runs Claude. Repeat with an AI
+    terminal; Main becomes that terminal.
+  - **Remote project:** on a saved server whose own settings still name the
+    built-in default, the picker and the created thread use the Settings
+    choice. Adding a project on that server opens Main with the same agent.
+  - **Unavailable agent:** on a server where the chosen agent is missing or not
+    ready, the picker selects the first ready chat. A line under it says which
+    agent is unavailable and why. Picking another agent removes the line, and
+    it stays gone if the Default Agent later becomes unavailable. Clicking the
+    line does not open the picker. On a server with no ready agent, Create
+    stays disabled and the line says where to sign in to or enable one.
+  - **Offline at start:** start the app with a saved server offline. Open the
+    dialog for that server's project. The line reads "<server> is not
+    connected. Create waits until it reconnects." and Create stays disabled.
+    Start the server; the line changes to "Connecting to <server>", then the
+    picker selects the Default Agent and Create is enabled.
+  - **Session lost:** with that dialog open and an agent picked by hand, stop
+    the server. The same "is not connected" line appears and Create is
+    disabled, although the picker still lists the last agents. Restart the
+    server; the hand-picked agent is still selected and Create is enabled.
+  - **Add Project fallback:** add a project on a server with no ready agent
+    while Default Agent is a Claude chat. Main opens as a Claude chat rather
+    than Codex.
 - Git Manager opened from the project header, its worktree selector, a Changes
   list with the partial-staging gutter, History with a selected commit diff, the
   branch dropdown, fetch/pull/push/force-with-lease sync states, the native
@@ -2961,13 +3190,20 @@ sizes. Cover relevant:
   theme switch without flashing its source; a selection copied from inside a
   diagram pastes as its fenced source; the clipped Proposed Plan preview keeps
   a fence it cut open as source; and a diagram drawing above the line being
-  read in the chat leaves that line in place (the maintained Mermaid scenario
-  below automates the rendered-file and timeline checks);
+  read in the chat leaves that line in place; while a reply streams, scrolling
+  the timeline with the arrow keys or PageUp from a focused control in it
+  stops it following, and End returns to the end and follows again (the
+  maintained Mermaid scenario below automates the rendered-file, timeline and
+  keyboard checks);
 - the [durable message queue](#durable-message-queue): FIFO cards, native steer,
   Cancel restoration, reload and restart persistence, promotion, Stop drain,
   holds, and unsupported-provider explanations;
-- terminal input/output and panel switching, including reopening the global right panel after a
-  sibling chat suppresses a previously active Activity surface;
+- terminal input/output and panel switching, including each chat and Codex terminal pane's
+  own Activity panel in a split: it stays inside its pane, the composer stays usable, and
+  the terminal redraws at its new size;
+- stopping a chat whose subagents still run moves them from **Active** to **Done** as
+  **Interrupted**, each saying its session ended before it reported (the packaged
+  `chat-activity-panel` spec automates this with its Codex fixture);
 - Files tree nesting, mutations, and moves: one row per directory with its own
   expand arrow rather than merged directory chains, **New File…** creating the
   entry in the clicked nested folder while expanded folders stay expanded, a
@@ -3024,9 +3260,11 @@ sizes. Cover relevant:
   and selections stay usable, and sibling rows still open normally;
 - Activity subagents and background tasks, including elapsed time and keyboard
   navigation. One click or **Enter** on the **Activity** button opens the panel
-  on the section with an error or running work and, with the panel open, keeps
-  it open and moves focus to the section's tab; the **Background tasks** tab
-  reaches the other section. With **Settings → Agents → Always show Activity** on, a new chat on a
+  in the same pane, above the composer, on the section with an error or running
+  work, and moves focus to the section's tab. Another click, or **Escape** in
+  the panel, collapses it and returns focus to the button, without moving the
+  chat's scroll position. The right panel never opens for Activity. The
+  **Background tasks** tab reaches the other section. With **Settings → Agents → Always show Activity** on, a new chat on a
   provider that reports activity shows the muted **Activity** button before its
   first subagent; with it off, the button waits for a record;
 - with an outdated provider on the primary and on a connected remote
@@ -3052,8 +3290,11 @@ sizes. Cover relevant:
   server is already recording to this profiler folder. Close it, then restart
   this one." when a headless `bibcode --base-dir <root> serve` on the same
   disposable data root started first and holds the folder; **Open folder** enabled only for the primary
-  environment on desktop and **Export bundle** only for the primary
-  environment, each otherwise disabled with its stated reason; **Include crash
+  environment on desktop, otherwise disabled with its stated reason; **Export
+  bundle** enabled for the primary and for a connected remote environment whose
+  server is current, and for an environment whose server is older than the
+  remote diagnostic download disabled with "<label> runs an older BiBCode server
+  that cannot send its logs. Update it to download them here."; **Include crash
   dumps** and its warning, disabled with Export bundle's reason when it is;
   where an environment runs a BiBCode older than the profiler, only
   the disabled switch with "This server's BiBCode version has no profiler.
@@ -3063,6 +3304,84 @@ sizes. Cover relevant:
   the status bar shows the **Profiler** segment; its tooltip lists the
   recording environments, clicking it opens Diagnostics on the first of them,
   and it disappears once every profiler is off;
+- **Settings → Diagnostics → Diagnostic logs** with a remote environment
+  connected: the row names the primary by default ("… from <primary label>.")
+  and **Download logs** saves the primary's `bibcode-diagnostics-<label>-….zip`
+  as before; with the primary disconnected, the button is disabled with
+  "<primary label> is not connected. Reconnect it to download its logs." and no
+  remote is downloaded instead. Choose the remote environment in the Profiler
+  section's **Environment** picker (the page's only one): the row names it, and
+  the saved ZIP's name and
+  `manifest.json` name that remote server, its `storageInstanceId`, and its
+  version, and its `server.log` is the remote host's. With a remote server
+  older than the remote download, the button is disabled with "<label> runs an
+  older BiBCode server that cannot send its logs. Update it to download them
+  here." Stop the remote server (or cut its connection) while the remote
+  download runs: the error toast reads "Could not download <label>'s logs" /
+  "The connection to <label> was lost. Reconnect and try again.", and no file is
+  saved; while the remote environment reconnects, the button is disabled with
+  "<label> is still connecting. Download its logs once it is connected.", and
+  the primary's logs are never downloaded in its place; with the remote
+  stopped, the remote stays chosen and the button is disabled with "<label> is
+  not connected. Reconnect it to download its logs." until it reconnects (only
+  removing the environment returns the row to the primary);
+- Diagnostics from a thread: in a remote environment's thread, make the
+  provider report an error (for example a provider with a missing binary), and
+  click the error banner's **Diagnostics**: the page opens with that remote
+  chosen in **Environment**, the Diagnostic logs row names it, and **Download
+  logs** saves its archive; repeat with the remote disconnected and confirm the
+  remote stays chosen with the download disabled. The sidebar's
+  project-availability **Diagnostics** opens on the unavailable environment;
+- `<desktop exe> diagnostics download --environment <remote label> --output
+  <dir> --json` from a terminal on the desktop's machine, with the desktop app
+  connected to the remote: the command prints "Approve request <code> in
+  BiBCode…" and the app shows "Share <label>'s diagnostic logs?" with "A program
+  running as you on this computer (not BiBCode)…", the same code, the
+  environment as typed, and the output directory; a second window drops its
+  prompt once the first answers. **Share logs**
+  saves `<dir>/bibcode-diagnostics-<label>-….zip` whose `manifest.json` names
+  the remote, its `storageInstanceId`, and its version, and the command exits 0
+  with `"status":"saved"`; a second run that finds a file of the same name
+  exits 1 and leaves it untouched. **Deny** (or
+  Esc) exits 2 with `"status":"denied"` and saves nothing, and a request right
+  after it exits 2 with `cooling-down`; an unknown name exits 1 without listing
+  any environment, with no prompt; with BiBCode's primary environment in WSL,
+  the desktop executable exits 3 naming the distro, and `bibcode diagnostics
+  download` inside the distro works; Ctrl-C while the app
+  downloads closes the prompt or stops the download; with the app quit, the
+  command exits 3;
+- unattended diagnostics (#202), with every BiBCode app on the downloading
+  machine quit: on the remote, `bibcode pairing offer --access diagnostics
+  --endpoint <address> --json`; on the downloading machine,
+  `bibcode diagnostics pair --name <name> --json` with the link on standard
+  input prints `"status":"paired"` and no credential; the remote's Share tab
+  lists `<remote name> (diagnostics)` with one scope, `diagnostics:read`;
+  `bibcode diagnostics download --remote <name> --output <dir> --json` exits 0
+  with a ZIP whose `manifest.json` names the remote's `storageInstanceId` and
+  whose `frontend.log` reads "No frontend warnings or errors were captured.";
+  `--include-crash-dumps` exits 2 with `crash-dumps-refused`; an offer minted
+  without `--access diagnostics` makes `pair` exit 1 with
+  `not-diagnostics-only` and save nothing, and the Share tab shows that client
+  revoked; revoking the diagnostics client there makes the next download exit
+  2 with `unauthorized`; `bibcode diagnostics forget <name>` removes it from
+  `bibcode diagnostics remotes`. The automated equivalents run with
+  `cargo test -p bibcode-server --test diagnostics_remote_cli -j 2` and
+  `cargo test -p bibcode-server --lib diagnostics::remote_cli`;
+- the stored credential's protection: on macOS and Linux,
+  `ls -l ~/.bibcode/userdata/diagnostics-remotes/` shows `-rw-------` records
+  in a `drwx------` directory (the integration test checks the record's mode).
+  On Windows, `icacls "$env:USERPROFILE\.bibcode\userdata\diagnostics-remotes\<name>.bin"`
+  lists only the current user, with inheritance disabled. **Unverified:** the
+  Windows ACL check has not been run on a Windows host for this command yet;
+- an `https` remote (Tailscale Serve, or a reverse proxy with a publicly
+  trusted or system-installed certificate): `pair` and `download --remote`
+  succeed against `https://<host>`; against a self-signed certificate the
+  system does not trust, `pair` exits 3 with `tls` before anything is sent, and
+  the same offer still pairs once the endpoint is fixed. The automated
+  `pairs_and_downloads_through_a_verified_wss_endpoint` test covers a test
+  authority on the host it runs on. **Unverified:** a real Tailscale Serve or
+  reverse-proxy endpoint, and the Windows and Linux platform verifiers, have
+  not been exercised by hand yet;
 - Find in thread on macOS (WKWebView), Linux (WebKitGTK AppImage), and Windows
   (WebView2), in a long thread with folded turns: find a word that appears only
   in a folded turn, a tool command inside a collapsed run of tool calls, a file
@@ -3109,7 +3428,22 @@ crash types, termination reasons, and faulting symbols; it excludes raw memory
 and the rest of the diagnostic report. Inspect these logs when the app or
 embedded driver exits unexpectedly. A missing provider-terminal activity dock
 also records structural pane, surface, and activity-host geometry to distinguish
-layout visibility from provider-observation failures.
+layout visibility from provider-observation failures. A visible host with no
+dock is a failure unless the current launch logged Codex `preparation_timeout`;
+then the original terminal must draw fresh TUI output and redraw when its pane
+widens and narrows, without an Activity dock. Before changing layout, read the
+Codex observer lines in `app-server.log`: each names its `reason`, its `stage`,
+and `elapsed_ms`
+(see [Activity observation](../architecture/activity-observation.md)).
+A spec that passes alone but fails in the full suite fails only under the
+suite's load. Take the stage from the full run's `app-server.log` before
+changing an observer budget. A provider factory owns its budget
+(`preparation_budget`) and the manager waits that plus 150 ms, so change the
+factory's constant, never the manager's wait; the manager's 3 s ceiling is
+asserted to stay above every provider's wait. A factory preparation timeout
+logs `reason="preparation_timeout"` and its `stage`; a manager callback timeout
+logs `provider terminal observer callback timed out` with its `timeout_ms` (see
+[Activity observation](../architecture/activity-observation.md), "Preparation budgets").
 Window resizing polls the actual viewport and native window until the requested
 size is reached, including when GTK startup dimensions settle independently.
 It does not depend on animation frames, which can stop in occluded macOS
@@ -3145,31 +3479,103 @@ same-origin load raises no CSP event) and no `securitypolicyviolation` event.
 The fixture Codex provider then answers its diagram prompts in the timeline: a
 **Show source** swap on a diagram inside the first visible row above the top
 edge, and on one in a row wholly above the viewport, moves a reading-anchor
-paragraph by at most 1 px; a short reply's diagram drawing under its sent
-message leaves that message at the sent-row offset; and selecting an earlier
-message with the minimap keyboard lands it at the minimap's offset past that
-diagram and keeps it there (`mermaid-timeline-minimap-landing.json`). After a
-reply with 101 diagrams, reopening the chat draws the evicted diagram (the
+paragraph by at most 1 px; a diagram-only fitting reply drawing under its sent
+message leaves that message within 1 px of the sent-row offset, measured from
+the scroller's top. The test measures the complete final assistant row,
+including its copy and timestamp area, and requires the turn to fit above the
+Activity card and composer. Once the sent row reaches its offset, the
+`mermaid-timeline-sent-row.json` trace requires it to stay there for 36 painted
+frames.
+The next short diagram reply gives the minimap a later turn. Selecting an
+earlier message with the minimap keyboard lands it at the minimap's offset
+past that diagram and keeps it there
+(`mermaid-timeline-minimap-landing.json`). A separate case reopens a chat at its
+end, then opens the Activity card above the composer. The first painted frame
+with the larger card must keep the reply's last line at its settled position
+and the list at its end (`mermaid-timeline-activity-growth.json`). After a reply
+with 101 diagrams, reopening the chat draws the evicted diagram (the
 reply's last, which the queue drew first) again through the queue, holding its
 source at the diagram's drawn height meanwhile, and every painted frame of the
 reopened chat shows the reply's last line at its end, within 1 px of where it
-rests. The scenario keeps a per-sample trace of the last line, on a timer and
-after each painted frame, as `mermaid-timeline-evicted-remount.json`. A second
-reply of 101 diagrams then evicts every earlier one; scrolling up remounts the
+rests against the bottom region (which can grow once the reopened chat's
+Activity card arrives; the end moves up with it in the same frame). The scenario keeps a per-sample trace of the last line, on a timer and
+after each painted frame, as `mermaid-timeline-evicted-remount.json`. Painted
+frames also record the scroller, end padding or footer, final row and composer geometry when
+an end gap needs diagnosis. The following cold-draw case uses the earlier rows
+and long replies. A second reply of 101 diagrams evicts earlier drawings;
+scrolling up remounts the
 rows reply, whose diagram shows its source and draws again above the message
-being read, which stays within 1 px on every painted frame
-(`mermaid-timeline-cold-draw.json`). Last, the fixture provider streams the
+being read. A timer or painted sample must show the mounted source before a later
+drawn sample. The case selects a paragraph visible in the following reply when
+the diagram row remounts, then checks that it stays within 1 px on every painted frame
+(`mermaid-timeline-cold-draw.json`). The case first waits up to 15 s, at
+the end, for the rows reply's row to unmount; if it does not, the failure and
+`mermaid-timeline-unmount-wait.json` list the mounted rows, LegendList's
+container count, the scroll metrics and the viewport, and say when the window
+came up smaller than the 1400×900 the case asks for. Last, the fixture provider streams the
 same reply twice, one delta every 300 ms, first with the diagram's source in a
 plain code block and then as a sequence diagram, the scenario's only one, whose
 chunk loads after its source shows, so it replaces the source at the end while
-more text streams. Once the sent row's glide has settled (the list first
-catches up with the end, within 2.5 s of the first delivery), each delivery
-from the diagram's draw on rests no lower below the composer than the plain
-reply's (or, after a delivery the plain reply painted no frame for, is
-revealed); the draw's own delivery may take 200 ms to be followed. Both
-replies end with the last line in view, resting within two lines of each
-other (`mermaid-timeline-streaming-follow.json` holds both replies' gaps and
-end positions). The reading-line
+more text streams. Once each reply's sent row has settled (the list first
+catches up with the end, within 2.5 s of the first delivery), every delivery
+of the plain reply after its code block shows that paints a resting frame (the
+last before the next delivery) rests with the reply's end revealed, at most
+1 px below the composer's top. How many deliveries paint a resting frame
+follows the webview's paint rate (on the Linux runners WebKitGTK painted the
+plain reply 360–850 ms apart, and six deliveries landed between two of its
+frames, each of which showed the end revealed), so a
+delivery with no painted frame is recorded, with each reply's frame count and
+median frame gap, in `mermaid-timeline-streaming-unpainted.json` rather than
+failed; each reply must still settle, finish and paint at least one resting
+frame after settling, and every resting frame it paints is bounded, except for
+a delivery that landed together with earlier ones between two painted frames
+and showed fewer than three frames before the next (on Linux arm64 nine landed
+between two frames 550 ms apart, and the follow of that growth showed two
+frames later): its rest, still on its way to the end, is recorded under
+`beforeFollow` in the same file. At most two painted deliveries in a row are
+exempt so; the next painted delivery is bounded whatever its frame count, and
+each reply needs at least one bounded rest. The last line's delivery is always
+bounded, and sampling continues until it has painted three frames. Each delivery
+of the diagram reply from its draw on rests no lower below the composer than
+the plain reply's (or, after a delivery the plain reply painted no rest for,
+is revealed); the draw's own delivery may take 200 ms to be followed. The
+diagram's source must be laid out before it draws, read from the DOM as it
+changes, and the draw must change the block's height. From settling on,
+neither reply's sent row rests more than 1 px below its offset; for these tall
+replies following takes the row well above it, so the proof that a sent row
+lands within 1 px is the short reply's check above. Both replies end with the
+last line in view, resting within two lines of each other
+(`mermaid-timeline-streaming-follow.json` holds both replies' gaps, end and
+sent-row positions, and, for diagnosis only, the painted frames each delivery
+took to reveal its end). Then the reader takes the timeline over with the
+keyboard: after a long reply establishes scrollable history and a short reply
+mounts its code block's **Copy code** button, a reply streams for about nine
+seconds. The scenario waits for the sent row to start gliding, grows a
+paragraph far above the view so LegendList holds an adjustment, and focuses
+that button (a focus, not a press). On macOS, it sends a trusted PageUp through
+System Events after the webview reports glide and focus readiness; the packaged
+WebDriver plugin's dispatched key has no native scroll there. The first painted
+frame must either hold the reading line while the pending row adjustment commits
+or move it only by the native PageUp scroll. Later frames keep its content
+position within 1 px and move it only in the page direction. On Linux
+and Windows, one page script
+dispatches the keydown and immediately makes its page step because their
+packaged driver also dispatches keys without native scrolling. The key must
+land within 750 ms of the glide starting. The held adjustment is applied as a
+scroll instead of a jump. The paragraph
+then read stays within 1 px on every painted frame for 3 s, through the
+glide's settling, LegendList's wait for rows to settle and at least five more
+deliveries; an End keydown and a scroll to the end resume following, and at
+least three later deliveries rest with the end revealed
+(`mermaid-timeline-keyboard-takeover.json`). The key-stage trace is saved before
+its assertion as `mermaid-timeline-keyboard-key.json`, so a failed takeover
+retains its scroll and captured-row geometry. Last, with a long reply at the
+end, the reader wheels 40 px up, within LegendList's end threshold, and the
+bottom region (the composer overlay) grows by 120 px; then, back at the end,
+the reply's last row grows and the reader wheels 40 px up in the same frame,
+after LegendList has queued its pass to keep the end. A paragraph on screen
+stays within 1 px on each of the 30 painted frames after either
+(`mermaid-timeline-reader-near-end.json`). The reading-line
 checks sample painted frames, so the scenario fails early in a webview that
 paints none.
 Its other page scripts wait on timers rather than animation frames, which stop
@@ -3180,6 +3586,26 @@ the 101 diagrams can take minutes there. Rerun it alone with
 the same fixture files served by a release `bibcode` server in Chromium and
 Safari: the console shows no CSP violation and the server log no
 `/mermaid-probe/` request.
+
+**Real-key check (manual, about a minute).** The packaged spec cannot press a
+real key, so on each webview (WebKit on macOS and Linux, WebView2 on Windows)
+check by hand that the timeline sees the key before the webview scrolls. In a
+chat with earlier messages, send a prompt that streams a long reply, and while
+it streams:
+
+1. Press Tab until a button in the timeline (such as a code block's **Copy
+   code**) has focus, then press PageUp twice. The view moves up and stays
+   where you read while the reply goes on streaming; End returns to the end
+   and the reply is followed again.
+2. Click a code block's **Copy code** (WebKit leaves focus on the page rather
+   than the button), or click a paragraph's text, then press PageUp. The view
+   moves up and stays; End resumes following.
+3. Send again and press PageUp right away, while the sent message is still
+   gliding up to the top. The glide stops at once and the view pages up from
+   where it stopped; no row jumps as it stops.
+
+A view that jumps back to the streaming end after PageUp, or a glide that goes
+on after the key, fails the check.
 
 At final packaged shutdown, inspect the raw worker and server logs. Provider and
 terminal owners, operational logs, orchestration, and the SQLite worker must all

@@ -23,6 +23,8 @@ for the command prefix that fits the install:
 | ----------------------------------- | ----------------------------------------------------------------------- |
 | Server (package, archive)           | `bibcode profiler`                                                      |
 | Remote host                         | `ssh <host> bibcode profiler`                                           |
+| Remote host, no SSH (bundle only)   | `bibcode diagnostics download --environment <name>`, see below          |
+| Remote host, no SSH, app closed     | `bibcode diagnostics download --remote <name>` once paired, see below   |
 | WSL environment                     | `wsl.exe -d <distro> --exec <Linux path of the server binary> profiler` |
 | macOS desktop                       | `/Applications/BiBCode.app/Contents/MacOS/bibcode-desktop profiler`     |
 | Windows desktop                     | `& "$env:LOCALAPPDATA\BiBCode\bibcode-desktop.exe" profiler`            |
@@ -42,6 +44,38 @@ for the command prefix that fits the install:
   keep it.
 - **Remote hosts:** `bibcode` must be on the `PATH` of a non-interactive `ssh`
   shell, as BiBCode's own SSH launch requires. If it is not, ask where it is.
+  Without SSH access, when the BiBCode desktop app on this machine is connected
+  to that host, fetch its bundle with
+  `P' diagnostics download --environment <name or id> --output <dir> --json`,
+  where `P'` is this machine's prefix without `profiler` (`bibcode`, or the
+  desktop executable). Tell the user first, and pass on the code the command
+  prints on stderr ("Approve request K7Q-4M in BiBCode…"): the app shows it in
+  its prompt ("Share <name>'s diagnostic logs?") with the name you passed and
+  the output directory, and the user should approve only a matching code. It
+  ends unanswered after 2 minutes; after a denial or no answer, the next
+  request waits 30 s or more (exit 2, `cooling-down`), so ask before retrying.
+  Add `--include-crash-dumps` only when a dump is needed, and say so. An
+  unknown name fails without listing others; ask the user for the name shown
+  in BiBCode. Exit 3 means the desktop app is not running here; when the
+  desktop's primary environment runs in WSL, run `bibcode diagnostics
+  download` inside that distro. With no app to approve (unattended), ask the
+  user once to run `bibcode pairing offer --access diagnostics --endpoint
+  <address the remote is reached at>` on that host and hand you the link; pass
+  it on standard input to `P' diagnostics pair --name <name>`, then fetch with
+  `P' diagnostics download --remote <name> --output <dir> --json`. That
+  credential reads the bundle only: `--include-crash-dumps` is refused (exit
+  2, `crash-dumps-refused`), and exit 2 `unauthorized` means it was revoked or
+  is over 30 days old, so ask for a new offer. It cannot reach a host only
+  reachable through the desktop's SSH tunnel or BiBCode Connect. Otherwise ask
+  the user to open
+  **Settings → Diagnostics** in that app, choose the host in **Environment**,
+  and use **Download logs** (or **Export bundle**, with **Include crash dumps**
+  when a dump is needed). Either way the remote server builds the ZIP itself
+  and sends it over the app's connection; its `manifest.json` names the host,
+  its `storageInstanceId`, and its server version, and its `profiler/` folder
+  holds the same events and findings files the commands read (parse them as
+  NDJSON). The archive holds one server's data: a launch or transport problem
+  can also need the primary's archive.
 - **WSL:** the desktop runs the Linux binary that `BIBCODE_WSL_SERVER_BINARY`
   names (a Windows path; `wsl.exe -d <distro> -- wslpath -a '<path>'` converts it)
   through `wsl.exe -d <distro> --exec`. Its data root is the distro's

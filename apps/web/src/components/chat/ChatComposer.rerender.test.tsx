@@ -16,6 +16,8 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 const h = vi.hoisted(() => ({
+  /** Whether the composer's `max-sm` query matches. */
+  mobile: false,
   capabilityCatalogs: [] as import("@bibcode/contracts").ServerProvider[],
   editorProps: null as Record<string, unknown> | null,
   menuProps: null as Record<string, unknown> | null,
@@ -143,7 +145,7 @@ vi.mock("../../lib/composerPathSearchState", () => ({
   useComposerPathSearch: () => ({ entries: [], error: null, isPending: false }),
 }));
 vi.mock("../../hooks/useMediaQuery", () => ({
-  useMediaQuery: () => false,
+  useMediaQuery: (query: string) => query === "max-sm" && h.mobile,
   useIsMobile: () => false,
 }));
 vi.mock("../../state/threads", () => ({
@@ -348,6 +350,7 @@ let container: HTMLDivElement;
 beforeEach(() => {
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
   resettableComposerStore.setState({ ...pristineComposerState }, true);
+  h.mobile = false;
   h.editorProps = null;
   h.menuProps = null;
   h.providerPickerProps = null;
@@ -463,5 +466,129 @@ describe("ChatComposer provider selection rerenders", () => {
     });
 
     expect(container.textContent).toContain("Plan mode is not supported");
+  });
+});
+
+describe("ChatComposer long-lived handlers", () => {
+  const statuses = [supportedProvider, unsupportedProvider];
+
+  /** The props React gave a DOM element, which hold its current handlers. */
+  function domProps(element: Element): Record<string, unknown> {
+    const key = Object.keys(element).find((name) => name.startsWith("__reactProps$"));
+    expect(key).toBeDefined();
+    return (element as unknown as Record<string, Record<string, unknown>>)[key ?? ""] ?? {};
+  }
+
+  it("keeps one menu select handler that runs the latest render's callbacks", async () => {
+    const actionPrompt = ":plan";
+    useComposerDraftStore.getState().setPrompt(threadRef, actionPrompt);
+    h.snapshot = {
+      value: actionPrompt,
+      cursor: actionPrompt.length,
+      expandedCursor: actionPrompt.length,
+      terminalContextIds: [],
+    };
+    const composerRef = React.createRef<ChatComposerHandle>();
+    const promptRef = { current: actionPrompt };
+    const renderAndOpenMenu = async (props: ChatComposerProps) => {
+      await act(async () => {
+        root.render(<ChatComposer {...props} />);
+      });
+      await act(async () => {
+        const onChange = h.editorProps?.["onChange"] as
+          | ((
+              value: string,
+              cursor: number,
+              expandedCursor: number,
+              cursorAdjacentToMention: boolean,
+              terminalContextIds: string[],
+            ) => void)
+          | undefined;
+        expect(onChange).toBeTypeOf("function");
+        onChange?.(actionPrompt, actionPrompt.length, actionPrompt.length, false, []);
+      });
+      const onSelect = h.menuProps?.["onSelect"];
+      expect(onSelect).toBeTypeOf("function");
+      return onSelect as (item: { id: string }) => void;
+    };
+
+    const first = makeProps(statuses, composerRef, promptRef, supportedProvider);
+    const firstOnSelect = await renderAndOpenMenu(first);
+    // New callbacks from the parent: what a changed reconnect gives the composer.
+    const latest = makeProps(statuses, composerRef, promptRef, supportedProvider);
+    const latestOnSelect = await renderAndOpenMenu(latest);
+
+    expect(latestOnSelect).toBe(firstOnSelect);
+    await act(async () => {
+      firstOnSelect({ id: "bibcode-action:plan" });
+    });
+    expect(first.handleInteractionModeChange).not.toHaveBeenCalled();
+    expect(latest.handleInteractionModeChange).toHaveBeenCalledWith("plan");
+  });
+
+  it("keeps one file input handler that reports with the latest render's callbacks", async () => {
+    const composerRef = React.createRef<ChatComposerHandle>();
+    const promptRef = { current: prompt };
+    const first = makeProps(statuses, composerRef, promptRef, supportedProvider);
+    await act(async () => {
+      root.render(<ChatComposer {...first} />);
+    });
+    const input = container.querySelector<HTMLInputElement>('input[type="file"]');
+    expect(input).not.toBeNull();
+    const firstOnChange = domProps(input!)["onChange"];
+    expect(firstOnChange).toBeTypeOf("function");
+
+    // New callbacks from the parent: what a changed reconnect gives the composer.
+    const latest = makeProps(statuses, composerRef, promptRef, supportedProvider);
+    await act(async () => {
+      root.render(<ChatComposer {...latest} />);
+    });
+    expect(container.querySelector('input[type="file"]')).toBe(input);
+    expect(domProps(input!)["onChange"]).toBe(firstOnChange);
+
+    Object.defineProperty(input, "files", {
+      configurable: true,
+      value: [new File([], "empty.txt", { type: "text/plain" })],
+    });
+    await act(async () => {
+      input!.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+
+    expect(first.setThreadError).not.toHaveBeenCalled();
+    expect(latest.setThreadError).toHaveBeenCalledWith(
+      threadId,
+      "'empty.txt' is empty and cannot be attached.",
+    );
+  });
+
+  it("blurs a mobile composer on submit by the latest render's state", async () => {
+    h.mobile = true;
+    const composerRef = React.createRef<ChatComposerHandle>();
+    const promptRef = { current: prompt };
+    const statuses = [supportedProvider, unsupportedProvider];
+    const props = makeProps(statuses, composerRef, promptRef, supportedProvider);
+    const outside = document.createElement("input");
+    document.body.append(outside);
+    const submitWith = async (next: ChatComposerProps) => {
+      await act(async () => {
+        root.render(<ChatComposer {...next} />);
+      });
+      outside.focus();
+      await act(async () => {
+        container
+          .querySelector("form")!
+          .dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+      });
+    };
+    try {
+      // A running turn keeps focus on submit (it queues); once it ends, a submit blurs.
+      await submitWith({ ...props, phase: "running" });
+      expect(document.activeElement).toBe(outside);
+      await submitWith({ ...props, phase: "ready" });
+      expect(document.activeElement).not.toBe(outside);
+      expect(props.onSend).toHaveBeenCalledTimes(2);
+    } finally {
+      outside.remove();
+    }
   });
 });

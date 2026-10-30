@@ -473,6 +473,23 @@ describe("MessagesTimeline", () => {
     expect(onAnchorSizeChanged).toHaveBeenCalledWith(secondEntry.message.id, 240);
   });
 
+  it("stops LegendList keeping the list at its end once the reader scrolled away", async () => {
+    const { MessagesTimeline } = await import("./MessagesTimeline");
+    // The composer grew, as the Activity card opening makes the bottom region grow; a list the
+    // reader scrolled away from must not be moved to its end for it.
+    const markup = renderToStaticMarkup(
+      <MessagesTimeline
+        {...buildProps()}
+        timelineEntries={[buildUserTimelineEntry("hello")]}
+        contentInsetEndAdjustment={180}
+        followsEnd={false}
+      />,
+    );
+
+    expect(markup).toContain('data-content-inset-end="180"');
+    expect(markup).not.toContain('data-maintain-scroll-at-end="enabled"');
+  });
+
   it("renders collapse controls for long user messages", async () => {
     const { MessagesTimeline } = await import("./MessagesTimeline");
     const markup = renderToStaticMarkup(
@@ -791,6 +808,39 @@ describe("MessagesTimeline", () => {
     );
 
     expect(markup).toMatch(/1h 0m (49|50|51)s/);
+  });
+
+  it("holds the list's bottom inset while the reader is away from the end", async () => {
+    const MessagesTimeline = await loadMessagesTimeline();
+    const entries = [buildUserTimelineEntry("hello")];
+    await mountTimeline({ timelineEntries: entries, contentInsetEndAdjustment: 100 });
+    const { root } = mountedTrees.at(-1)!;
+    const renderWith = (inset: number, followsEnd: boolean) =>
+      act(async () =>
+        root.render(
+          <MessagesTimeline
+            {...buildProps()}
+            timelineEntries={entries}
+            contentInsetEndAdjustment={inset}
+            followsEnd={followsEnd}
+          />,
+        ),
+      );
+    const listInset = () => h.legendListProps?.["contentInsetEndAdjustment"];
+    expect(listInset()).toBe(100);
+
+    // The reader scrolled away; the Activity card opening grows the bottom region. LegendList
+    // would scroll by the growth near its end, so the list keeps the inset it had.
+    await renderWith(220, false);
+    expect(listInset()).toBe(100);
+    // It still shrinks with the region, and does not grow back while the reader is away.
+    await renderWith(60, false);
+    expect(listInset()).toBe(60);
+    await renderWith(220, false);
+    expect(listInset()).toBe(60);
+    // Back at the end, the list takes the whole inset again.
+    await renderWith(220, true);
+    expect(listInset()).toBe(220);
   });
 
   it("stops scheduling waiting timer paints after unmount", async () => {

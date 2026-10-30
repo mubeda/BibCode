@@ -100,6 +100,7 @@ import {
   TOOL_ROW_DISCLOSURE_KEY,
   resolveAssistantMessageCopyState,
   resolveTimelineIsAtEnd,
+  resolveTimelineMaintainScrollAtEnd,
   resolveTimelineMinimapHasPersistentGutter,
   resolveTimelineMinimapHeightStyle,
   resolveTimelineMinimapIndexFromPointer,
@@ -206,7 +207,9 @@ const AttachmentUploadCtx = createContext<{
   readonly onCancel: (messageId: MessageId) => void;
 }>(null!);
 const TIMELINE_LIST_HEADER = <div className="h-3 sm:h-4" />;
-const TIMELINE_LIST_FOOTER = <div className="h-3 sm:h-4" />;
+// LegendList includes numeric padding in its initial end target. A measured footer leaves one
+// painted WebView2 remount frame 16 px short while its layout catches up.
+const TIMELINE_LIST_CONTENT_STYLE = { paddingBottom: 16 };
 const EMPTY_TIMELINE_SKILLS: ReadonlyArray<Pick<ServerProviderSkill, "name" | "displayName">> = [];
 const NO_MINIMAP_STEP_TARGETS: TimelineMinimapStepTargets = { previous: null, next: null };
 
@@ -221,6 +224,13 @@ interface MessagesTimelineProps {
   activeTurnInProgress: boolean;
   activeTurnStartedAt: string | null;
   listRef: React.RefObject<LegendListRef | null>;
+  /** Called with the list once it mounts, and with null once it unmounts. */
+  onListMount?: (list: LegendListRef | null) => void;
+  /**
+   * Whether the timeline follows its end. False once the reader has scrolled away, so a change
+   * in the bottom region's height leaves the line they read in place. Defaults to true.
+   */
+  followsEnd?: boolean;
   timelineEntries: ReturnType<typeof deriveTimelineEntries>;
   queuedMessages: ReadonlyArray<TimelineMessage>;
   queuedStatuses: ReadonlyArray<QueuedCardStatus>;
@@ -285,6 +295,8 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   activeTurnInProgress,
   activeTurnStartedAt,
   listRef,
+  onListMount,
+  followsEnd = true,
   timelineEntries,
   queuedMessages,
   queuedStatuses,
@@ -570,6 +582,28 @@ export const MessagesTimeline = memo(function MessagesTimeline({
 
   // Stable renderItem — no closure deps. Row components read shared state
   // from TimelineRowCtx, which propagates through LegendList's memo.
+  // The bottom inset LegendList lays the list out with. It grows with the bottom region only
+  // while the timeline follows its end: LegendList scrolls by an inset's growth whenever the list
+  // sits within its end threshold, which would move a reader who scrolled away. While they are
+  // away it shrinks with the region but does not grow, until they return to the end.
+  const [listInsetEnd, setListInsetEnd] = useState(contentInsetEndAdjustment);
+  if (
+    followsEnd
+      ? listInsetEnd !== contentInsetEndAdjustment
+      : contentInsetEndAdjustment < listInsetEnd
+  ) {
+    setListInsetEnd(contentInsetEndAdjustment);
+  }
+
+  // The list's ref, and the parent's word that it mounted or unmounted.
+  const handleListRef = useCallback(
+    (list: LegendListRef | null) => {
+      listRef.current = list;
+      onListMount?.(list);
+    },
+    [listRef, onListMount],
+  );
+
   const renderItem = useCallback(
     ({ item }: { item: MessagesTimelineRow }) => (
       <div
@@ -642,7 +676,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
             <TimelineRowActivityCtx value={activityState}>
               <ReadingAnchorContext value={readingAnchor}>
                 <LegendList<MessagesTimelineRow>
-                  ref={listRef}
+                  ref={handleListRef}
                   data={rows}
                   keyExtractor={keyExtractor}
                   getItemType={getItemType}
@@ -651,19 +685,11 @@ export const MessagesTimeline = memo(function MessagesTimeline({
                   initialScrollAtEnd
                   recycleItems={false}
                   {...(anchoredEndSpace ? { anchoredEndSpace } : {})}
-                  contentInsetEndAdjustment={contentInsetEndAdjustment}
-                  maintainScrollAtEnd={
-                    anchoredEndSpace
-                      ? false
-                      : {
-                          animated: false,
-                          on: {
-                            dataChange: true,
-                            itemLayout: true,
-                            layout: true,
-                          },
-                        }
-                  }
+                  contentInsetEndAdjustment={listInsetEnd}
+                  maintainScrollAtEnd={resolveTimelineMaintainScrollAtEnd({
+                    anchored: !!anchoredEndSpace,
+                    followsEnd,
+                  })}
                   // A row that changes size above the first visible one, such as a Mermaid
                   // diagram replacing its source, keeps the line the user reads in place.
                   maintainVisibleContentPosition={{
@@ -674,8 +700,8 @@ export const MessagesTimeline = memo(function MessagesTimeline({
                   {...(onRowSizeChanged ? { onItemSizeChanged: onRowSizeChanged } : {})}
                   onMetricsChange={onListMetricsChange}
                   className="scrollbar-gutter-both h-full min-h-0 overflow-x-hidden overscroll-y-contain px-3 [overflow-anchor:none] sm:px-5"
+                  contentContainerStyle={TIMELINE_LIST_CONTENT_STYLE}
                   ListHeaderComponent={TIMELINE_LIST_HEADER}
-                  ListFooterComponent={TIMELINE_LIST_FOOTER}
                 />
               </ReadingAnchorContext>
               <TimelineMinimap

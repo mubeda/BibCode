@@ -943,6 +943,14 @@ export function describeUnavailableEnvironment(input: {
   readonly label: string;
   readonly connection: EnvironmentConnectionPresentation;
 }): { readonly title: string; readonly description: string } {
+  // `available` means the environment was disconnected on purpose; "Available" would read as
+  // ready to use.
+  if (input.connection.phase === "available") {
+    return {
+      title: `${input.label}: Disconnected`,
+      description: "Connect this environment to send messages.",
+    };
+  }
   return {
     title: `${input.label}: ${connectionStatusText({ phase: input.connection.phase, error: null, traceId: null })}`,
     description:

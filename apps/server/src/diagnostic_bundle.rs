@@ -2,11 +2,14 @@ use std::{
     fs::{self, File},
     io::{Cursor, Read, Write},
     path::{Path, PathBuf},
+    sync::Arc,
     time::SystemTime,
 };
 
+use serde_json::{Value, json};
 use thiserror::Error;
-use time::OffsetDateTime;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
 use crate::{
@@ -24,6 +27,15 @@ const EMPTY_FRONTEND_LOG: &str = "No frontend warnings or errors were captured.\
 const PROFILER_ENTRY_DIR: &str = "profiler";
 const PROFILER_CRASHES_DIR: &str = "crashes";
 const PROFILER_OMITTED_ENTRY: &str = "profiler/OMITTED.txt";
+const MANIFEST_ENTRY: &str = "manifest.json";
+/// Archives one server holds at a time. A slot is taken before a build starts and released
+/// when its [`DiagnosticBundle`] is dropped: an RPC download keeps it until the last item is
+/// sent, the HTTP route until its response body has been sent or dropped. Each archive is up to
+/// [`MAX_DIAGNOSTIC_ARCHIVE_BYTES`] in memory and is compressed on a blocking thread, so a
+/// burst of requests waits for a slot instead of multiplying that memory and CPU.
+const MAX_ARCHIVES_IN_MEMORY: usize = 2;
+/// The longest environment label the archive name carries.
+const FILE_NAME_LABEL_MAX_CHARS: usize = 40;
 /// The largest archive the desktop host will save. Profiler files are only added while the
 /// archive, as built so far, leaves room for them.
 pub const MAX_DIAGNOSTIC_ARCHIVE_BYTES: usize = 20 * 1024 * 1024;
@@ -37,15 +49,43 @@ const PROFILER_BUNDLE_MAX_BYTES: u64 = 4 * SERVER_LOG_MAX_BYTES;
 /// One text file is read up to the profiler's rotation size and marked when truncated.
 const PROFILER_TEXT_FILE_MAX_BYTES: u64 = 10 * 1024 * 1024;
 
+/// The server a bundle comes from, as its `manifest.json` and file name state it.
+#[derive(Clone, Debug)]
+pub struct DiagnosticBundleIdentity {
+    /// The id the server declares in its environment descriptor.
+    pub environment_id: String,
+    /// The persistent store's id, which clients key a remote environment by.
+    pub storage_instance_id: Option<String>,
+    pub label: String,
+    pub server_version: String,
+}
+
 #[derive(Clone)]
 pub struct DiagnosticBundleService {
     logs_dir: PathBuf,
     profiler_dir: Option<PathBuf>,
+    identity: DiagnosticBundleIdentity,
+    /// See [`MAX_ARCHIVES_IN_MEMORY`]. A caller that stops waiting (an interrupted RPC, a
+    /// closed HTTP request) still holds its slot until the thread it started is done.
+    build_permits: Arc<Semaphore>,
+    #[cfg(test)]
+    before_build: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 pub struct DiagnosticBundle {
     pub filename: String,
     pub bytes: Vec<u8>,
+    /// The archive's `manifest.json`, as JSON.
+    pub manifest: Value,
+    /// This archive's slot among [`MAX_ARCHIVES_IN_MEMORY`]. Whoever ends up holding the bytes
+    /// keeps it with them (the HTTP route's response body, the RPC producer), so the archive
+    /// counts against the limit until its memory is released.
+    pub slot: Option<DiagnosticArchiveSlot>,
+}
+
+/// One of a server's [`MAX_ARCHIVES_IN_MEMORY`] archive slots, released when dropped.
+pub struct DiagnosticArchiveSlot {
+    _permit: OwnedSemaphorePermit,
 }
 
 #[derive(Debug, Error)]
@@ -58,14 +98,20 @@ pub enum DiagnosticBundleError {
     Write(#[source] std::io::Error),
     #[error("diagnostic archive construction task failed")]
     Join(#[source] tokio::task::JoinError),
+    #[error("diagnostic archive builds have stopped")]
+    Closed,
 }
 
 impl DiagnosticBundleService {
     #[must_use]
-    pub fn new(logs_dir: impl AsRef<Path>) -> Self {
+    pub fn new(logs_dir: impl AsRef<Path>, identity: DiagnosticBundleIdentity) -> Self {
         Self {
             logs_dir: logs_dir.as_ref().to_path_buf(),
             profiler_dir: None,
+            identity,
+            build_permits: Arc::new(Semaphore::new(MAX_ARCHIVES_IN_MEMORY)),
+            #[cfg(test)]
+            before_build: None,
         }
     }
 
@@ -73,6 +119,19 @@ impl DiagnosticBundleService {
     #[must_use]
     pub fn with_profiler_dir(mut self, profiler_dir: impl AsRef<Path>) -> Self {
         self.profiler_dir = Some(profiler_dir.as_ref().to_path_buf());
+        self
+    }
+
+    /// Free archive slots, for tests that check one is held or released.
+    #[cfg(test)]
+    pub(crate) fn free_slots_for_test(&self) -> usize {
+        self.build_permits.available_permits()
+    }
+
+    /// Runs `hook` on the blocking thread before each build, while it holds its permit.
+    #[cfg(test)]
+    fn with_before_build(mut self, hook: impl Fn() + Send + Sync + 'static) -> Self {
+        self.before_build = Some(Arc::new(hook));
         self
     }
 
@@ -84,16 +143,35 @@ impl DiagnosticBundleService {
         include_crash_dumps: bool,
         generated_at: OffsetDateTime,
     ) -> Result<DiagnosticBundle, DiagnosticBundleError> {
+        let permit = Arc::clone(&self.build_permits)
+            .acquire_owned()
+            .await
+            .map_err(|_| DiagnosticBundleError::Closed)?;
         let logs_dir = self.logs_dir.clone();
         let profiler_dir = self.profiler_dir.clone();
+        let identity = self.identity.clone();
+        #[cfg(test)]
+        let before_build = self.before_build.clone();
+        // The permit moves into the blocking closure and out with the bundle: dropping the
+        // returned future (the caller went away) cannot release it while the thread still
+        // compresses, and the caller holds it for as long as it holds the archive.
         tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            if let Some(hook) = before_build {
+                hook();
+            }
             build_bundle(
                 &logs_dir,
                 profiler_dir.as_deref(),
+                &identity,
                 &frontend_log,
                 include_crash_dumps,
                 generated_at,
             )
+            .map(|bundle| DiagnosticBundle {
+                slot: Some(DiagnosticArchiveSlot { _permit: permit }),
+                ..bundle
+            })
         })
         .await
         .map_err(DiagnosticBundleError::Join)?
@@ -103,6 +181,7 @@ impl DiagnosticBundleService {
 fn build_bundle(
     logs_dir: &Path,
     profiler_dir: Option<&Path>,
+    identity: &DiagnosticBundleIdentity,
     frontend_log: &str,
     include_crash_dumps: bool,
     generated_at: OffsetDateTime,
@@ -141,16 +220,34 @@ fn build_bundle(
     writer
         .write_all(frontend_log.as_bytes())
         .map_err(DiagnosticBundleError::Write)?;
-    if let Some(profiler_dir) = profiler_dir {
-        write_profiler_entries(&mut writer, options, profiler_dir, include_crash_dumps)?;
-    }
+    let crash_dumps_included = match profiler_dir {
+        Some(profiler_dir) => {
+            write_profiler_entries(&mut writer, options, profiler_dir, include_crash_dumps)?
+        }
+        None => 0,
+    };
+    let manifest = manifest(
+        identity,
+        generated_at,
+        include_crash_dumps,
+        crash_dumps_included,
+    );
+    let mut manifest_text = serde_json::to_string_pretty(&manifest).expect("JSON serializes");
+    manifest_text.push('\n');
+    writer
+        .start_file(MANIFEST_ENTRY, options)
+        .map_err(DiagnosticBundleError::Zip)?;
+    writer
+        .write_all(manifest_text.as_bytes())
+        .map_err(DiagnosticBundleError::Write)?;
     let bytes = writer
         .finish()
         .map_err(DiagnosticBundleError::Zip)?
         .into_inner();
     Ok(DiagnosticBundle {
         filename: format!(
-            "bibcode-diagnostics-{:04}{:02}{:02}T{:02}{:02}{:02}Z.zip",
+            "bibcode-diagnostics-{}-{:04}{:02}{:02}T{:02}{:02}{:02}Z.zip",
+            file_name_label(&identity.label),
             generated_at.year(),
             u8::from(generated_at.month()),
             generated_at.day(),
@@ -159,7 +256,61 @@ fn build_bundle(
             generated_at.second(),
         ),
         bytes,
+        manifest,
+        slot: None,
     })
+}
+
+/// What `manifest.json` says. `crashDumps.included` counts the dumps actually written, which
+/// can be fewer than were asked for when one does not fit or cannot be read.
+fn manifest(
+    identity: &DiagnosticBundleIdentity,
+    generated_at: OffsetDateTime,
+    crash_dumps_requested: bool,
+    crash_dumps_included: usize,
+) -> Value {
+    json!({
+        "schemaVersion": 1,
+        "environmentId": identity.environment_id,
+        "storageInstanceId": identity.storage_instance_id,
+        "environmentLabel": identity.label,
+        "serverVersion": identity.server_version,
+        "platform": { "os": std::env::consts::OS, "arch": std::env::consts::ARCH },
+        "generatedAt": generated_at
+            .format(&Rfc3339)
+            .unwrap_or_else(|_| generated_at.unix_timestamp().to_string()),
+        "crashDumps": {
+            "requested": crash_dumps_requested,
+            "included": crash_dumps_included,
+        },
+    })
+}
+
+/// The environment label as a file-name part: lowercase ASCII letters and digits, each other
+/// run of characters one `-`, at most [`FILE_NAME_LABEL_MAX_CHARS`], and `server` when nothing
+/// is left.
+fn file_name_label(label: &str) -> String {
+    let mut slug = String::new();
+    for character in label.chars() {
+        if character.is_ascii_alphanumeric() {
+            slug.push(character.to_ascii_lowercase());
+        } else if !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    let mut slug: String = slug
+        .trim_matches('-')
+        .chars()
+        .take(FILE_NAME_LABEL_MAX_CHARS)
+        .collect();
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+    if slug.is_empty() {
+        "server".to_owned()
+    } else {
+        slug
+    }
 }
 
 struct ProfilerFile {
@@ -173,13 +324,14 @@ struct ProfilerFile {
 /// Adds the profiler directory's files, newest first, within `PROFILER_BUNDLE_MAX_BYTES`.
 /// A file that cannot be read or does not fit is listed in `profiler/OMITTED.txt` instead
 /// of failing the whole bundle. Symbolic links are never followed, not even to a linked
-/// profiler or `crashes` directory.
+/// profiler or `crashes` directory. Returns how many crash dumps it wrote.
 fn write_profiler_entries(
     writer: &mut ZipWriter<Cursor<Vec<u8>>>,
     options: SimpleFileOptions,
     profiler_dir: &Path,
     include_crash_dumps: bool,
-) -> Result<(), DiagnosticBundleError> {
+) -> Result<usize, DiagnosticBundleError> {
+    let mut dumps_written = 0;
     let mut omitted = Vec::new();
     let mut files = Vec::new();
     // `read_dir` follows a link, so a linked directory is skipped rather than listed.
@@ -245,6 +397,9 @@ fn write_profiler_entries(
         writer
             .write_all(&contents)
             .map_err(DiagnosticBundleError::Write)?;
+        if file.is_dump {
+            dumps_written += 1;
+        }
     }
     if !omitted.is_empty() {
         writer
@@ -259,11 +414,15 @@ fn write_profiler_entries(
                 .map_err(DiagnosticBundleError::Write)?;
         }
     }
-    Ok(())
+    Ok(dumps_written)
 }
 
 fn is_real_directory(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir())
+}
+
+fn is_real_file(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file())
 }
 
 fn list_profiler_files(
@@ -294,6 +453,15 @@ fn list_profiler_files(
         }
         let is_dump = name.to_ascii_lowercase().ends_with(".dmp");
         if is_dump && !include_crash_dumps {
+            continue;
+        }
+        // The crash monitor creates a dump at its final name and writes its `.json` sidecar
+        // only once the dump is complete, so a dump without one is still being written (or
+        // was cut short) and is left out rather than bundled, and counted, half written.
+        if is_dump && !is_real_file(&dir.join(Path::new(&name).with_extension("json"))) {
+            omitted.push(format!(
+                "{entry_prefix}/{name} (incomplete: no crash record yet)"
+            ));
             continue;
         }
         let Ok(metadata) = item.metadata() else {
@@ -407,4 +575,199 @@ fn bounded_frontend_log(input: &str) -> String {
         String::from_utf8_lossy(&input.as_bytes()[..FRONTEND_LOG_MAX_BYTES]).into_owned();
     output.push_str("\n[truncated]\n");
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        sync::{Mutex, mpsc},
+        time::Duration,
+    };
+
+    use super::*;
+
+    fn identity(label: &str) -> DiagnosticBundleIdentity {
+        DiagnosticBundleIdentity {
+            environment_id: "local".to_owned(),
+            storage_instance_id: Some("storage-1".to_owned()),
+            label: label.to_owned(),
+            server_version: "9.9.9".to_owned(),
+        }
+    }
+
+    fn generated_at() -> OffsetDateTime {
+        OffsetDateTime::parse("2026-07-15T12:34:56Z", &Rfc3339).expect("timestamp")
+    }
+
+    #[test]
+    fn file_name_label_is_a_bounded_ascii_slug() {
+        assert_eq!(file_name_label("Local"), "local");
+        assert_eq!(file_name_label("ai-server"), "ai-server");
+        assert_eq!(file_name_label("Mauro's Mac 🍎"), "mauro-s-mac");
+        assert_eq!(file_name_label("  --  "), "server");
+        assert_eq!(file_name_label("日本"), "server");
+        let cut = file_name_label(&format!("{} tail", "x".repeat(39)));
+        assert_eq!(cut, "x".repeat(39), "a slug never ends with a dash");
+        assert!(file_name_label(&"y".repeat(60)).len() == FILE_NAME_LABEL_MAX_CHARS);
+    }
+
+    #[tokio::test]
+    async fn bundle_names_its_server_in_the_file_name_and_manifest() {
+        let logs = tempfile::tempdir().expect("logs");
+        let bundle = DiagnosticBundleService::new(logs.path(), identity("Omarchy Box"))
+            .build(String::new(), false, generated_at())
+            .await
+            .expect("bundle");
+        assert_eq!(
+            bundle.filename,
+            "bibcode-diagnostics-omarchy-box-20260715T123456Z.zip"
+        );
+        let mut archive = zip::ZipArchive::new(Cursor::new(&bundle.bytes)).expect("zip");
+        let mut text = String::new();
+        archive
+            .by_name(MANIFEST_ENTRY)
+            .expect("manifest entry")
+            .read_to_string(&mut text)
+            .expect("manifest text");
+        let written: Value = serde_json::from_str(&text).expect("manifest JSON");
+        assert_eq!(written, bundle.manifest);
+        assert_eq!(
+            written,
+            json!({
+                "schemaVersion": 1,
+                "environmentId": "local",
+                "storageInstanceId": "storage-1",
+                "environmentLabel": "Omarchy Box",
+                "serverVersion": "9.9.9",
+                "platform": { "os": std::env::consts::OS, "arch": std::env::consts::ARCH },
+                "generatedAt": "2026-07-15T12:34:56Z",
+                "crashDumps": { "requested": false, "included": 0 },
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn manifest_counts_only_the_crash_dumps_it_wrote() {
+        let logs = tempfile::tempdir().expect("logs");
+        let profiler = tempfile::tempdir().expect("profiler");
+        let crashes = profiler.path().join(PROFILER_CRASHES_DIR);
+        fs::create_dir_all(&crashes).expect("crashes dir");
+        fs::write(crashes.join("small.dmp"), b"MDMP small").expect("small dump");
+        fs::write(crashes.join("small.json"), b"{}").expect("small record");
+        // Larger than the whole bundle budget, so it is listed as omitted, not written.
+        let oversized = File::create(crashes.join("huge.dmp")).expect("huge dump");
+        oversized
+            .set_len(PROFILER_BUNDLE_MAX_BYTES + 1)
+            .expect("sparse dump");
+        fs::write(crashes.join("huge.json"), b"{}").expect("huge record");
+        // The monitor is still writing it: no crash record yet.
+        fs::write(crashes.join("partial.dmp"), b"MDMP part").expect("partial dump");
+        let service = DiagnosticBundleService::new(logs.path(), identity("Local"))
+            .with_profiler_dir(profiler.path());
+
+        let requested = service
+            .build(String::new(), true, generated_at())
+            .await
+            .expect("bundle with dumps");
+        assert_eq!(
+            requested.manifest["crashDumps"],
+            json!({ "requested": true, "included": 1 })
+        );
+        let mut archive = zip::ZipArchive::new(Cursor::new(&requested.bytes)).expect("zip");
+        assert!(archive.by_name("profiler/crashes/small.dmp").is_ok());
+        assert!(archive.by_name("profiler/crashes/partial.dmp").is_err());
+        let mut omitted = String::new();
+        archive
+            .by_name(PROFILER_OMITTED_ENTRY)
+            .expect("omitted list")
+            .read_to_string(&mut omitted)
+            .expect("omitted text");
+        assert!(omitted.contains("profiler/crashes/partial.dmp (incomplete: no crash record yet)"));
+        assert!(omitted.contains("profiler/crashes/huge.dmp (over the bundle size limit)"));
+        drop(requested);
+
+        let declined = service
+            .build(String::new(), false, generated_at())
+            .await
+            .expect("bundle without dumps");
+        assert_eq!(
+            declined.manifest["crashDumps"],
+            json!({ "requested": false, "included": 0 })
+        );
+    }
+
+    /// The archive keeps its slot for as long as the caller holds it, so archives waiting to
+    /// be sent count against the limit as much as archives being built.
+    #[tokio::test]
+    async fn a_bundle_holds_its_slot_until_it_is_dropped() {
+        let logs = tempfile::tempdir().expect("logs");
+        let service = DiagnosticBundleService::new(logs.path(), identity("Local"));
+        let first = service
+            .build(String::new(), false, generated_at())
+            .await
+            .expect("first");
+        let second = service
+            .build(String::new(), false, generated_at())
+            .await
+            .expect("second");
+        assert_eq!(service.free_slots_for_test(), 0);
+        let third = tokio::spawn({
+            let service = service.clone();
+            async move { service.build(String::new(), false, generated_at()).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!third.is_finished(), "a third archive waits for a slot");
+        drop(first);
+        third.await.expect("third task").expect("third");
+        drop(second);
+        assert_eq!(service.free_slots_for_test(), MAX_ARCHIVES_IN_MEMORY);
+    }
+
+    /// A build whose caller stopped waiting keeps its permit until its blocking work returns,
+    /// so the next build waits for the thread rather than running beside it.
+    #[tokio::test]
+    async fn an_abandoned_build_holds_its_permit_until_its_thread_finishes() {
+        let logs = tempfile::tempdir().expect("logs");
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let entered_tx = Mutex::new(entered_tx);
+        let release_rx = Mutex::new(release_rx);
+        let first_call = std::sync::atomic::AtomicBool::new(true);
+        let mut service = DiagnosticBundleService::new(logs.path(), identity("Local"))
+            .with_before_build(move || {
+                if first_call.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    entered_tx.lock().unwrap().send(()).unwrap();
+                    release_rx.lock().unwrap().recv().unwrap();
+                }
+            });
+        service.build_permits = Arc::new(Semaphore::new(1));
+
+        let abandoned = tokio::spawn({
+            let service = service.clone();
+            async move { service.build(String::new(), false, generated_at()).await }
+        });
+        tokio::task::spawn_blocking(move || entered_rx.recv().unwrap())
+            .await
+            .expect("first build entered its thread");
+        abandoned.abort();
+        let _ = abandoned.await;
+        assert_eq!(
+            service.build_permits.available_permits(),
+            0,
+            "the aborted build's thread still holds the permit"
+        );
+
+        let next = tokio::spawn({
+            let service = service.clone();
+            async move { service.build(String::new(), false, generated_at()).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!next.is_finished(), "the next build waits for the permit");
+
+        release_tx.send(()).unwrap();
+        next.await
+            .expect("next build task")
+            .expect("next build succeeds once the permit is free");
+        assert_eq!(service.build_permits.available_permits(), 1);
+    }
 }

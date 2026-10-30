@@ -426,16 +426,100 @@ Monitor watches (`task_type: "local_bash"`) never appear under **Background
 tasks**, Claude claims no background-work capability, and Activity reads
 neither `run_id` nor `parent_task_id` (Agent SDK v0.3.292).
 
+The probe runs the executable exactly as the launch will. It resolves
+**Binary path** on the launch's `PATH`, including the open-url `PATH` prefix,
+and runs that resolved path, never its symlink target. It runs with the
+launch's environment and in the chat's working directory. This matters for
+multi-call shims such as mise's `shims/claude`, a link to the `mise` binary.
+mise picks the Claude it runs from the name it was called by, and from the
+directory's configuration. Called by its real name, mise answers as itself.
+
 A launch waits up to two seconds for the probe. The probe itself may run for up
 to five seconds, so a slow first `--help` still records its answer for the next
-launch. BiBCode caches only a probe in which both commands answered, keyed by the
-executable's identity and version. A failed or timed-out probe is not cached,
-so the next launch probes again instead of running without the switches for the
-life of the server. Each probe run writes one line to `server.log`: `Claude
-activity probe finished` with `outcome` (`supported` or `unsupported`), the
-version, and the elapsed time, or a `Claude activity probe failed` warning with
-`outcome` (`failed` or `timed out`) and the reason. A launch that stops waiting
-logs `launching Claude without activity flags`.
+launch. BiBCode caches only a probe in which both commands answered and
+`--version` printed a Claude Code version (`2.1.311 (Claude Code)` or the bare
+`2.1.311`) on one of its first five lines. Those lines can include a wrapper's
+banner and Node's warnings on stderr. The cache key is the resolved path plus
+the canonical target's identity and the parsed version, never the raw output.
+Another program's answer, such as mise's `2026.10.19 linux-x64 (…)`, is a
+mismatch: BiBCode does not cache it and skips `--help`. A failed or timed-out
+probe is not cached either, so the next launch probes again instead of running
+without the switches for the life of the server.
+
+A resolved path is a **shim** when it is a link with a different file name
+from its target, and the target is not a Claude install. A target counts as a
+Claude install when its name starts with `claude` (`claude`, `claude.exe`), is
+npm's `cli.js`, or is a bare version such as the native installer's
+`versions/2.1.312`. Those targets change identity when Claude updates, so
+their identity is enough. mise's `shims/claude`, a link to `mise`, is a shim:
+its own identity does not change when the Claude behind it does.
+
+For a shim, the key also holds the working directory. Each later launch reruns
+`--version` alone, bounded by the same two seconds. Launches of one shim share
+that recheck, but only when they have the same environment, since an
+environment can select a different Claude. A recheck that ended without an
+answer is started again. A cached answer is reused while the parsed version is
+unchanged; a new version runs the whole probe again. A recheck that fails or
+times out proves no change. The launch then keeps the cached answer and logs
+`Claude shim did not confirm its probed version`.
+
+The cache assumes `--help` depends only on the Claude version a shim
+dispatches to. The working directory is part of a shim's key, but the
+environment is not. Script shims are not detected, since they are files rather
+than links: asdf, proto and Scoop shims are examples. Their identity is the
+script's, so a Claude update behind such a shim shows only after a BiBCode
+restart, or once the cache entry is evicted.
+
+Each probe run writes one line to `server.log`, with the resolved
+`executable`, its `canonical` target and the `search_path` it was resolved on.
+All three are passed through the Profiler's path redaction, which replaces the
+home directory and secrets. The line is one of these:
+
+- `Claude activity probe finished`, an `info` line with `outcome` (`supported`
+  or `unsupported`), the version and the elapsed time.
+- `Claude activity probe found another program`, a warning with
+  `outcome = "mismatch"` and the start of the version output, redacted and cut
+  to 256 bytes.
+- `Claude activity probe failed`, a warning with `outcome` (`failed` or
+  `timed out`) and the reason.
+
+A launch that stops waiting for the probe logs
+`launching Claude without activity flags`. A session restarted in the same
+server process takes its activity capabilities from the new process, also
+while Chat Activity is off. When that process has no hook support, retained
+subagents show as stale. They do not stay
+live (see
+[Activity observation](../architecture/activity-observation.md)).
+
+### What ends a subagent
+
+Hooks reach BiBCode over HTTP with no retry. A hook the sink cannot take answers
+503 when its 128-entry channel is full, or 410 once the session is going away,
+and is lost. `server.log` counts such drops: the warning
+`dropped a Claude hook that BiBCode could not take in` names only the hook
+event and the running count, on the first drop and then each power of two.
+
+A Claude subagent ends in one of these ways:
+
+- **`SubagentStop`** completes it, with Claude's last message as its summary.
+- **`task_notification`** that stopped, failed or was interrupted closes it
+  with that state once its task is linked to the subagent. A notification that
+  arrives before the link is held until the link arrives.
+- **Turn end**: at the parent turn's `result`, a subagent whose task Claude
+  confirmed is closed as **Interrupted** when Claude's complete live set
+  (`background_tasks_changed`) no longer lists that task. Its summary starts
+  "Claude stopped listing this subagent as running". An overflowed set, or one
+  with a task BiBCode cannot name, proves nothing. A `SubagentStop` that arrives
+  afterwards still completes it.
+- **Process end**: when the Claude process that ran it is gone, its record
+  closes as **Interrupted**. Gone means stopped, removed, idle-suspended, shut
+  down for an update, restarted for a setting change, crashed, or a server that
+  restarted. The summary starts "Claude session ended before this subagent
+  reported", or "BiBCode restarted before this subagent reported" at startup.
+
+A subagent BiBCode cannot link to a task, such as a foreground one interrupted
+mid-call, therefore waits for the process to end. Idle suspension still ends a
+quiet process after 30 minutes without provider events.
 
 ## Thinking
 
@@ -561,6 +645,97 @@ Provider-terminal observation has a separate capability and safety gate. The
 executable must support the required settings switches and BiBCode's additive
 hook preparation. If preparation cannot be established before spawn, the
 original Claude terminal command runs without structured terminal activity.
+
+This gate differs from the chat probe above, because a prepared terminal does
+not run the path BiBCode resolved. It runs a private copy of the build, so that
+the build BiBCode checked is the build that runs, even if an update replaces or
+deletes the installed file during the session.
+
+**Which builds are hooked.** A build is hooked when all of these hold:
+
+- its `--version` line ends in `(Claude Code)`, and that version is between
+  2.1.220 and 2.1.312 (`MIN_ADDITIVE_HOOK_VERSION` and
+  `MAX_ADDITIVE_HOOK_VERSION`). In those builds, BiBCode's `--settings` hooks are
+  added to the user's own hooks rather than replacing them. A newer build runs
+  unhooked until a BiBCode release raises the ceiling. That release first proves
+  the newer build keeps a user `PreToolUse` guard working with BiBCode's overlay
+  injected ([release step](../operations/release.md#stable-release-runbook)).
+- `--help` lists `--settings <file-or-json>` and `--setting-sources`.
+- On macOS, the private copy satisfies Anthropic's code signature (Developer ID
+  team `Q6L2SF6YDW`, identifier `com.anthropic.claude-code`), which
+  `codesign --verify` checks against every page. Linux builds carry no signature
+  of their own; Anthropic signs a release manifest instead. On Linux, BiBCode
+  therefore trusts the build's own version line, as the chat probe does.
+
+The signature is checked once per build. Every later launch hashes its own
+private copy and compares the SHA-256 with the checked build's. Concurrent
+launches of a new build share one check, and a check that fails or runs out of
+time is not remembered.
+
+**Platforms.**
+
+- **macOS** clones the build (`clonefile`, copy-on-write).
+- **Linux** copies it with `copy_file_range`, which shares blocks on btrfs, XFS
+  and bcachefs and copies in the kernel elsewhere (about 0.2 s for a 294 MB build
+  on ext4). The copy stops as soon as the preparation runs out of time. A slow
+  disk without block sharing can therefore leave a terminal with **Status
+  unavailable**.
+- **Windows** never prepares a Claude Terminal: it reads **Status unavailable**.
+
+**Claude Terminal behind a shim.** When `claude` is a link to mise, such as
+`~/.local/share/mise/shims/claude`, BiBCode asks mise what the shim would run.
+It runs `mise which claude` and then `mise env --json`, in the terminal's working
+directory and with its environment, because mise picks the version and the
+`[env]` per directory. The answer is not trusted:
+
+- the install must be an absolute path to an executable regular file, owned by
+  the user or root, writable by no one else, and not mise itself. It is then
+  copied and checked like a direct install;
+- the environment must be a small JSON object of strings with valid names. If it
+  sets `LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_AUDIT` or any `DYLD_*` variable, the
+  terminal runs the shim as configured, unhooked;
+- the accepted environment, such as a project's `ANTHROPIC_BASE_URL` or the
+  tools' `PATH`, is applied to the terminal over its own, as the shim would.
+  BiBCode never logs its values and redacts them from spawn errors. It does not
+  redact them from the terminal's output, which shows them as it would without
+  BiBCode.
+
+mise's configuration files for that directory (the project files in it and its
+parents, the global and system files) are read before `which` and after `env`.
+If one changed, BiBCode asks once more. If it changed again, the terminal runs
+the shim unhooked. A change that lands after that second reading, or in a file
+outside that set (an `MISE_ENV` profile or an include), can still apply between
+the check and the spawn.
+
+A plain renamed link to a Claude build, such as `~/.local/bin/claude` to
+`versions/2.1.312`, is not a shim. Its target is copied directly. Other version
+managers (asdf, volta) are not resolved: behind them, the terminal runs
+unhooked.
+Every Claude Terminal is prepared this way, whatever the AI Terminal activity
+setting says, because the left panel shows its agent's status (#187). The
+injected settings add these hooks to the subagent and tool hooks:
+
+- `SessionStart`
+- `UserPromptSubmit`
+- `PermissionRequest`
+- `Notification`
+- `Elicitation`
+- `ElicitationResult`
+- `Stop`
+- `StopFailure`
+- `SessionEnd`
+
+BiBCode only reads them: it answers each with no content, so none of them
+changes what Claude does. Status decodes only the event name, session, agent,
+tool name and notification type, never prompt or tool content, and follows the
+main session: the first one heard, then each new `SessionStart` (`/clear` and
+resume start a new session).
+
+If the terminal cannot be prepared, its status reads **Status unavailable**.
+That happens on Windows, with a Claude Code outside 2.1.220 to 2.1.312, with an
+unsigned or re-signed build on macOS, behind a shim whose answer is refused or
+that is not mise, when a copy without block sharing outlasts the preparation
+budget, or when the probe or settings merge fails.
 
 See [Activity observation](../architecture/activity-observation.md) for the
 shared protocol and provider matrix.

@@ -194,6 +194,12 @@ protocol:
 | Grok     | Agent Client Protocol                          | Unsupported           | Files only, with notice | No structured Activity observation.                                                        |
 | OpenCode | OpenCode server/events API                     | Unsupported           | Rewinds, then files     | Structured chat and managed-terminal observation.                                          |
 
+Codex, Cursor, and Grok keep the provider's JSON-RPC request ID for their wire
+response. BiBCode gives each approval or question an opaque request ID scoped
+to the incoming provider connection. The same wire ID can therefore occur on
+another chat or after reconnect without replacing another pending approval in
+the server's global request projection.
+
 See [Checkpoint revert](./rpc-and-orchestration.md#checkpoint-revert).
 
 The OpenCode driver speaks two wires. OpenCode 1.x serves the V1 server API;

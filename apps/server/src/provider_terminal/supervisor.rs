@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fmt,
     future::Future,
     path::{Path, PathBuf},
@@ -13,6 +13,7 @@ use std::io::Write;
 
 use serde_json::Value;
 use tokio::sync::Mutex as AsyncMutex;
+use uuid::Uuid;
 
 #[cfg(unix)]
 use std::os::{fd::AsRawFd, unix::ffi::OsStrExt};
@@ -31,6 +32,12 @@ use crate::{
 
 const MAX_OPERATIONAL_WARNINGS: usize = 64;
 const PUBLICATION_LOCK_PRUNE_THRESHOLD: usize = 256;
+/// How long past a factory's own preparation budget the manager keeps waiting, so the factory's
+/// timeout always fires first and cleans up before the manager gives up on the launch.
+const PREPARATION_OUTER_SLACK: Duration = Duration::from_millis(150);
+/// What the manager waits for a launch whose factory cannot be named: the validation below
+/// failed, so preparation passes through almost at once.
+const DEFAULT_PREPARATION_EXECUTION_BUDGET: Duration = Duration::from_millis(500);
 const RACED_PREPARATION_WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
 const RACED_PREPARATION_WORKER_ABORT_TIMEOUT: Duration = Duration::from_millis(50);
 // Four slots per process admitted by the 16-helper supervisor bound absorb
@@ -218,10 +225,17 @@ fn built_in_binary(driver_kind: &str) -> Option<&'static str> {
 
 #[derive(Clone)]
 pub struct ProviderTerminalObserverFactoryInput {
+    /// `launch.executable` is the validated, canonical executable.
     pub launch: TerminalLaunchPreparationInput,
+    /// The path the terminal invokes before links are resolved, such as a version manager's
+    /// shim. It names the same file as `launch.executable`.
+    pub invoked_executable: PathBuf,
     pub activity_publisher: TerminalGenerationActivityPublisher,
     pub process_attribution: ProcessAttributionRegistry,
     pub runtime_dir: PathBuf,
+    /// Whether AI Terminal activity was on at launch. Off, the observer runs for the agent's
+    /// status only (#187) and publishes no activity until the setting turns on.
+    pub activity_enabled: bool,
 }
 
 impl fmt::Debug for ProviderTerminalObserverFactoryInput {
@@ -237,6 +251,14 @@ impl fmt::Debug for ProviderTerminalObserverFactoryInput {
 pub trait ProviderTerminalObserverFactory: Send + Sync {
     fn requires_private_executable_pin(&self) -> bool {
         false
+    }
+
+    /// How long `prepare` may run before it gives up and the terminal runs unobserved. The factory
+    /// enforces it itself; the supervisor adds `PREPARATION_OUTER_SLACK` for the manager's wait,
+    /// so this is the one number that decides how long `terminal.open` can block on a launch that
+    /// is slow to prepare. The default is Codex's.
+    fn preparation_budget(&self) -> Duration {
+        Duration::from_millis(350)
     }
 
     fn prepare(
@@ -295,6 +317,70 @@ pub struct ProviderTerminalActivitySupervisor {
     factories: ProviderTerminalObserverFactories,
     warnings: Arc<Mutex<WarningState>>,
     publication_locks: PublicationLocks,
+    launch_snapshots: LaunchSnapshots,
+}
+
+type LaunchSnapshots = Arc<Mutex<HashMap<Uuid, LaunchSnapshotState>>>;
+
+/// One reading of the provider settings for a launch, validated once. It chooses the wait and,
+/// for the same launch, what preparation runs, so the two cannot disagree when the settings
+/// change between them.
+#[derive(Clone)]
+enum LaunchValidation {
+    Valid {
+        /// The canonical executable.
+        executable: PathBuf,
+        /// The same file as the terminal invokes it, links unresolved.
+        invoked: PathBuf,
+        factory: Arc<dyn ProviderTerminalObserverFactory>,
+    },
+    /// The `warn_once` reason the launch passes through with.
+    Rejected(&'static str),
+}
+
+enum LaunchSnapshotState {
+    /// The budget lookup is reading the settings.
+    Pending,
+    /// The lookup ended without an answer (cut off, or it panicked); preparation does not read
+    /// the settings again to find out.
+    Abandoned,
+    Ready(LaunchValidation),
+}
+
+/// Marks a launch's snapshot abandoned unless the lookup completes it.
+struct LaunchSnapshotGuard {
+    snapshots: LaunchSnapshots,
+    id: Uuid,
+    completed: bool,
+}
+
+impl LaunchSnapshotGuard {
+    fn complete(mut self, validation: LaunchValidation) {
+        self.completed = true;
+        let mut snapshots = self
+            .snapshots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Preparation may already have taken the entry; it then validated for itself.
+        if let Some(state) = snapshots.get_mut(&self.id) {
+            *state = LaunchSnapshotState::Ready(validation);
+        }
+    }
+}
+
+impl Drop for LaunchSnapshotGuard {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        let mut snapshots = self
+            .snapshots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(state) = snapshots.get_mut(&self.id) {
+            *state = LaunchSnapshotState::Abandoned;
+        }
+    }
 }
 
 type PublicationLocks = Arc<Mutex<BTreeMap<(String, String), Weak<AsyncMutex<()>>>>>;
@@ -365,6 +451,7 @@ impl ProviderTerminalActivitySupervisor {
             factories,
             warnings: Arc::new(Mutex::new(WarningState::default())),
             publication_locks: Arc::new(Mutex::new(BTreeMap::new())),
+            launch_snapshots: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -374,6 +461,68 @@ impl ProviderTerminalActivitySupervisor {
             "claudeAgent" => self.factories.claude.clone(),
             "opencode" => self.factories.opencode.clone(),
             _ => None,
+        }
+    }
+
+    /// Reads the provider settings once and checks the launch against them.
+    async fn validate_launch(&self, input: &TerminalLaunchPreparationInput) -> LaunchValidation {
+        let inventory = match self.authority.current().await {
+            Ok(inventory) => inventory,
+            Err(()) => return LaunchValidation::Rejected("inventory_unavailable"),
+        };
+        let Some(instance) = inventory.get(&input.activity.provider_instance_id) else {
+            return LaunchValidation::Rejected("unknown_instance");
+        };
+        if !instance.enabled {
+            return LaunchValidation::Rejected("disabled_instance");
+        }
+        if instance.driver_kind != input.activity.driver_kind {
+            return LaunchValidation::Rejected("driver_mismatch");
+        }
+        let Some((invoked, executable)) = validated_launch_executable(input, instance) else {
+            return LaunchValidation::Rejected("executable_mismatch");
+        };
+        let Some(factory) = self.factory_for(&instance.driver_kind) else {
+            return LaunchValidation::Rejected("observer_unavailable");
+        };
+        LaunchValidation::Valid {
+            executable,
+            invoked,
+            factory,
+        }
+    }
+
+    fn begin_launch_snapshot(&self, id: Uuid) -> LaunchSnapshotGuard {
+        let mut snapshots = self
+            .launch_snapshots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A launch whose preparation never ran leaves its entry behind; dropping them all only
+        // makes the launches still in flight validate for themselves.
+        if snapshots.len() >= PUBLICATION_LOCK_PRUNE_THRESHOLD {
+            snapshots.clear();
+        }
+        snapshots.insert(id, LaunchSnapshotState::Pending);
+        LaunchSnapshotGuard {
+            snapshots: self.launch_snapshots.clone(),
+            id,
+            completed: false,
+        }
+    }
+
+    /// The validation the budget lookup made for this launch, or a fresh one when it made none.
+    async fn launch_validation(&self, input: &TerminalLaunchPreparationInput) -> LaunchValidation {
+        let state = self
+            .launch_snapshots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&input.generation.id());
+        match state {
+            Some(LaunchSnapshotState::Ready(validation)) => validation,
+            Some(LaunchSnapshotState::Pending | LaunchSnapshotState::Abandoned) => {
+                LaunchValidation::Rejected("inventory_unavailable")
+            }
+            None => self.validate_launch(input).await,
         }
     }
 
@@ -432,38 +581,23 @@ impl ProviderTerminalActivitySupervisor {
         &self,
         input: TerminalLaunchPreparationInput,
     ) -> TerminalLaunchPreparation {
+        // The observer runs whatever the AI Terminal activity setting says: the agent's status
+        // in the left panel needs it (#187). The setting decides only whether it also publishes
+        // activity, through the admission below.
         let activity_state = self.activity_controller.snapshot();
-        if !activity_state.enabled {
-            return TerminalLaunchPreparation::PassThrough;
-        }
         let observer_generation = input.generation.clone();
-        let inventory = match self.authority.current().await {
-            Ok(inventory) => inventory,
-            Err(()) => {
-                self.warn_once("inventory_unavailable", &input);
-                return TerminalLaunchPreparation::PassThrough;
-            }
-        };
-        let Some(instance) = inventory.get(&input.activity.provider_instance_id) else {
-            self.warn_once("unknown_instance", &input);
-            return TerminalLaunchPreparation::PassThrough;
-        };
-        if !instance.enabled {
-            self.warn_once("disabled_instance", &input);
-            return TerminalLaunchPreparation::PassThrough;
-        }
-        if instance.driver_kind != input.activity.driver_kind {
-            self.warn_once("driver_mismatch", &input);
-            return TerminalLaunchPreparation::PassThrough;
-        }
-        let Some(validated_executable) = validated_executable(&input, instance) else {
-            self.warn_once("executable_mismatch", &input);
-            return TerminalLaunchPreparation::PassThrough;
-        };
-        let Some(factory) = self.factory_for(&instance.driver_kind) else {
-            self.warn_once("observer_unavailable", &input);
-            return TerminalLaunchPreparation::PassThrough;
-        };
+        let (validated_executable, invoked_executable, factory) =
+            match self.launch_validation(&input).await {
+                LaunchValidation::Valid {
+                    executable,
+                    invoked,
+                    factory,
+                } => (executable, invoked, factory),
+                LaunchValidation::Rejected(reason) => {
+                    self.warn_once(reason, &input);
+                    return TerminalLaunchPreparation::PassThrough;
+                }
+            };
         let mut input = input;
         input.executable = validated_executable.to_string_lossy().into_owned();
         let activity_publisher = TerminalGenerationActivityPublisher::new(
@@ -473,9 +607,11 @@ impl ProviderTerminalActivitySupervisor {
         );
         let factory_input = ProviderTerminalObserverFactoryInput {
             launch: input,
+            invoked_executable,
             activity_publisher,
             process_attribution: self.process_attribution.clone(),
             runtime_dir: self.runtime_dir.clone(),
+            activity_enabled: activity_state.enabled,
         };
         let requires_private_executable_pin = factory.requires_private_executable_pin();
         let preparation = match factory.prepare(factory_input).await {
@@ -497,6 +633,10 @@ impl ProviderTerminalActivitySupervisor {
                 prepared
             }
         };
+        if !activity_state.enabled {
+            // Status only: no activity admission, so the observer starts dormant.
+            return TerminalLaunchPreparation::Prepared(preparation);
+        }
         let activity_admission = self.activity_controller.admit().filter(|admission| {
             self.activity_controller.snapshot() == activity_state && admission.is_current()
         });
@@ -1119,27 +1259,27 @@ impl TerminalLaunchPreparer for ProviderTerminalActivitySupervisor {
     ) -> Pin<Box<dyn Future<Output = Duration> + Send + '_>> {
         let input = input.clone();
         Box::pin(async move {
-            let default = Duration::from_millis(500);
-            if !self.activity_controller.snapshot().enabled {
-                return default;
-            }
-            if input.activity.driver_kind != "opencode" {
-                return default;
-            }
-            let Ok(inventory) = self.authority.current().await else {
-                return default;
-            };
-            let Some(instance) = inventory.get(&input.activity.provider_instance_id) else {
+            let default = DEFAULT_PREPARATION_EXECUTION_BUDGET;
+            // A driver whose budget fits the default needs no validation to be waited for that
+            // long, so such a launch costs no extra inventory read.
+            let Some(budget) = self
+                .factory_for(&input.activity.driver_kind)
+                .map(|factory| factory.preparation_budget() + PREPARATION_OUTER_SLACK)
+                .filter(|budget| *budget > default)
+            else {
                 return default;
             };
-            if !instance.enabled
-                || instance.driver_kind != input.activity.driver_kind
-                || validated_executable(&input, instance).is_none()
-                || self.factory_for(&instance.driver_kind).is_none()
-            {
-                return default;
-            }
-            Duration::from_secs(1)
+            // Only a launch of a configured, enabled provider earns the longer wait, so a
+            // client cannot name a driver to hold `terminal.open` open. The settings are read
+            // once: preparation of this launch uses the same reading.
+            let snapshot = self.begin_launch_snapshot(input.generation.id());
+            let validation = self.validate_launch(&input).await;
+            let wait = match &validation {
+                LaunchValidation::Valid { .. } => budget,
+                LaunchValidation::Rejected(_) => default,
+            };
+            snapshot.complete(validation);
+            wait
         })
     }
 
@@ -1193,22 +1333,44 @@ fn validated_executable(
     input: &TerminalLaunchPreparationInput,
     instance: &ProviderTerminalInventoryEntry,
 ) -> Option<PathBuf> {
+    validated_launch_executable(input, instance).map(|(_, canonical)| canonical)
+}
+
+/// The launch's executable as the terminal invokes it (links unresolved, such as a version
+/// manager's shim) and its canonical path, when that canonical path is the configured provider
+/// executable's.
+fn validated_launch_executable(
+    input: &TerminalLaunchPreparationInput,
+    instance: &ProviderTerminalInventoryEntry,
+) -> Option<(PathBuf, PathBuf)> {
     let allowed = if instance.configured_binary.trim().is_empty() {
         instance.built_in_binary.as_deref()?
     } else {
         instance.configured_binary.as_str()
     };
-    let requested = resolve_executable(
+    let invoked = locate_launch_executable(
         &input.executable,
         &input.cwd,
         Some(&input.launch_env),
         false,
     )?;
+    let requested = std::fs::canonicalize(&invoked).ok()?;
     let allowed = resolve_executable(allowed, &input.cwd, None, true)?;
-    paths_equal(&requested, &allowed).then_some(allowed)
+    paths_equal(&requested, &allowed).then_some((invoked, allowed))
 }
 
 fn resolve_executable(
+    executable: &str,
+    cwd: &Path,
+    launch_env: Option<&BTreeMap<String, String>>,
+    configured_provider: bool,
+) -> Option<PathBuf> {
+    let path = locate_launch_executable(executable, cwd, launch_env, configured_provider)?;
+    std::fs::canonicalize(path).ok()
+}
+
+/// Finds `executable` the way the terminal's spawn would, without resolving links.
+fn locate_launch_executable(
     executable: &str,
     cwd: &Path,
     launch_env: Option<&BTreeMap<String, String>>,
@@ -1234,13 +1396,11 @@ fn resolve_executable(
             search_path.as_deref(),
             &extensions,
             false,
-        )
-        .and_then(|path| std::fs::canonicalize(path).ok());
+        );
     }
     #[cfg(not(feature = "hermetic-test-guard"))]
     let _ = configured_provider;
-    let path = locate_executable(executable, Some(cwd), search_path.as_deref(), &extensions)?;
-    std::fs::canonicalize(path).ok()
+    locate_executable(executable, Some(cwd), search_path.as_deref(), &extensions)
 }
 
 fn environment_value<'a>(environment: &'a BTreeMap<String, String>, key: &str) -> Option<&'a str> {
@@ -1285,6 +1445,37 @@ fn restrict_runtime_directory(_runtime_dir: &Path) -> Result<(), String> {
 
 #[cfg(all(test, unix))]
 mod tests {
+    /// #200: the manager's ceiling must never cut a provider's own budget short. Each factory
+    /// owns its budget, and what the manager waits is that plus the supervisor's slack.
+    #[tokio::test]
+    async fn the_manager_ceiling_never_undercuts_a_provider_budget() {
+        use super::{PREPARATION_OUTER_SLACK, ProviderTerminalObserverFactory};
+        use crate::provider_terminal::{
+            ClaudeTerminalObserverFactory, CodexTerminalObserverFactory,
+            OpenCodeTerminalObserverFactory,
+        };
+
+        let ceiling = crate::terminal::MAX_PREPARATION_EXECUTION_BUDGET;
+        for (provider, budget) in [
+            (
+                "codex",
+                CodexTerminalObserverFactory::system().preparation_budget(),
+            ),
+            (
+                "claude",
+                ClaudeTerminalObserverFactory::system().preparation_budget(),
+            ),
+            (
+                "opencode",
+                OpenCodeTerminalObserverFactory::system().preparation_budget(),
+            ),
+        ] {
+            assert!(
+                budget + PREPARATION_OUTER_SLACK <= ceiling,
+                "{provider} waits {budget:?} plus slack, but the manager stops at {ceiling:?}"
+            );
+        }
+    }
 
     #[cfg(feature = "hermetic-test-guard")]
     #[test]

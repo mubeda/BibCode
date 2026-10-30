@@ -9,7 +9,7 @@
         "error": {
           "_tag": "EnvironmentAuthorizationError",
           "message": "+pyVLbTk?L",
-          "requiredScope": "terminal:operate"
+          "requiredScope": "review:write"
         }
       }
     ]

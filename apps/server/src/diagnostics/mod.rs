@@ -1,3 +1,4 @@
+mod archive;
 mod attribution;
 pub(crate) mod history;
 mod model;
@@ -5,6 +6,8 @@ mod monitor;
 mod native;
 pub mod profiler;
 mod registry;
+pub mod relay_cli;
+pub mod remote_cli;
 mod resource_sampler;
 mod trace;
 

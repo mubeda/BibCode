@@ -1874,6 +1874,18 @@ describe("describeUnavailableEnvironment", () => {
       description: "Reconnect this environment before sending messages or running actions.",
     });
   });
+
+  it("names a deliberately disconnected environment as disconnected, not available", () => {
+    expect(
+      describeUnavailableEnvironment({
+        label: "Laptop",
+        connection: { phase: "available", error: null, traceId: null },
+      }),
+    ).toEqual({
+      title: "Laptop: Disconnected",
+      description: "Connect this environment to send messages.",
+    });
+  });
 });
 
 describe("buildRevertCheckpointConfirmation", () => {

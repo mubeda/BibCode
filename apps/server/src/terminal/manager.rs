@@ -22,6 +22,7 @@ use super::{
     TerminalRemovalReason, TerminalRestartInput, TerminalSessionSnapshot, TerminalSize,
     TerminalStatus, TerminalSummary, history::TerminalHistory,
 };
+use super::{TerminalAgentStatus, TerminalAgentStatusState};
 use crate::{
     diagnostics::{
         AttributionKind, AttributionScope, NativeProcessSampler, ProcessAttributionRegistry,
@@ -31,18 +32,22 @@ use crate::{
     },
     process::{Platform, ProcessCleanupReport, ShellCandidate, resolve_shell_candidates},
     provider_terminal::{
-        PreparedTerminalObserver, TerminalAgentActivityTransition, TerminalLaunchPreparation,
-        TerminalLaunchPreparationInput, TerminalLaunchPreparer, TerminalObserverCancellationReason,
-        TerminalObserverGeneration, TerminalObserverGenerationLease,
+        PreparedTerminalObserver, TerminalAgentActivityTransition, TerminalAgentObservation,
+        TerminalAgentState, TerminalLaunchPreparation, TerminalLaunchPreparationInput,
+        TerminalLaunchPreparer, TerminalObserverCancellationReason, TerminalObserverGeneration,
+        TerminalObserverGenerationLease,
     },
 };
 
 const DEFAULT_SUBPROCESS_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const OBSERVER_CALLBACK_TIMEOUT: Duration = Duration::from_millis(500);
-const MAX_PREPARATION_EXECUTION_BUDGET: Duration = Duration::from_secs(1);
+/// A hard stop for a preparer that asks to be waited for too long. It sits above every provider's
+/// own budget plus the supervisor's slack (a test holds it there), so it never cuts a provider
+/// short; the default wait, when the preparer names none, is `OBSERVER_CALLBACK_TIMEOUT`.
+pub(crate) const MAX_PREPARATION_EXECUTION_BUDGET: Duration = Duration::from_secs(3);
 /// The native form of a provider command may need a cold capability probe, which OpenCode's
 /// allows 900 ms; giving up sooner would launch a command the installed version rejects.
-const NATIVE_COMMAND_TIMEOUT: Duration = MAX_PREPARATION_EXECUTION_BUDGET;
+const NATIVE_COMMAND_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_ISOLATED_OBSERVER_CALLBACKS: usize = 8;
 const MAX_GLOBAL_ISOLATED_OBSERVER_CALLBACKS: usize = 16;
 const MAX_BLOCKING_THREADS_PER_ISOLATED_OBSERVER_CALLBACK: usize = 1;
@@ -265,7 +270,59 @@ struct Session {
     /// The executable the current process was spawned from, and when.
     executable: String,
     started: std::time::Instant,
+    /// An AI Terminal's agent state for the left panel (#187): `None` for a plain shell,
+    /// unavailable when no observer reports it, else its observer's last report.
+    agent_status: Option<SessionAgentStatus>,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SessionAgentStatus {
+    Unavailable,
+    /// Observed, before its first report: a fresh agent waits for its first prompt.
+    Ready,
+    Observed(TerminalAgentObservation),
+    /// The agent's process ended.
+    Exited {
+        failed: bool,
+    },
+}
+
+impl SessionAgentStatus {
+    fn summary(self) -> TerminalAgentStatus {
+        let (state, failed, observation) = match self {
+            Self::Unavailable => (TerminalAgentStatusState::Unavailable, false, None),
+            Self::Ready => (TerminalAgentStatusState::Done, false, None),
+            Self::Exited { failed } => (TerminalAgentStatusState::Done, failed, None),
+            Self::Observed(observation) => (
+                match observation.state {
+                    TerminalAgentState::Working => TerminalAgentStatusState::Working,
+                    TerminalAgentState::Blocked => TerminalAgentStatusState::Blocked,
+                    TerminalAgentState::Waiting => TerminalAgentStatusState::Waiting,
+                    TerminalAgentState::Done => TerminalAgentStatusState::Done,
+                },
+                observation.failed,
+                Some(observation),
+            ),
+        };
+        TerminalAgentStatus {
+            state,
+            failed,
+            age_ms: observation.map(|observation| {
+                u64::try_from(observation.observed_at.elapsed().as_millis()).unwrap_or(u64::MAX)
+            }),
+            observed_at: observation.and_then(|observation| {
+                OffsetDateTime::from(observation.observed_wall)
+                    .format(&Rfc3339)
+                    .ok()
+            }),
+        }
+    }
+}
+
+/// How often an unchanged Working report refreshes the published age: often enough that the
+/// left panel's 30-minute staleness is measured from recent evidence, rarely enough that a busy
+/// agent's tool calls do not flood the metadata stream.
+const AGENT_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
 /// What a replacement process keeps from the session it replaces.
 #[derive(Default)]
@@ -1606,6 +1663,7 @@ impl Session {
             updated_at: self.updated_at.clone(),
             center_panel: self.center_panel,
             command: self.command.clone(),
+            agent_status: self.agent_status.map(SessionAgentStatus::summary),
         }
     }
 
@@ -2037,6 +2095,9 @@ impl TerminalManager {
         }
 
         let mut private_values = Vec::new();
+        // Everything redacted from spawn labels and errors: the private values and the
+        // prepared environment overlay's values.
+        let mut diagnostic_values: Vec<String> = Vec::new();
         let original_command_candidate = input.command.as_ref().map(|command| {
             (
                 command.executable.clone(),
@@ -2133,7 +2194,23 @@ impl TerminalManager {
                     right.len().cmp(&left.len()).then_with(|| left.cmp(right))
                 });
                 private_values.dedup();
+                // The overlay is the environment the user's own shim would have applied, so the
+                // user's terminal output may show it as it would unobserved: its values are
+                // redacted from the manager's diagnostics only, not from the stream.
+                diagnostic_values.extend(
+                    prepared
+                        .env_overlay
+                        .values()
+                        .filter(|value| !value.is_empty())
+                        .cloned(),
+                );
+                diagnostic_values.extend(private_values.iter().cloned());
+                diagnostic_values.sort_by(|left, right| {
+                    right.len().cmp(&left.len()).then_with(|| left.cmp(right))
+                });
+                diagnostic_values.dedup();
                 let mut env = input.env.clone();
+                env.extend(prepared.env_overlay);
                 env.extend(prepared.private_env);
                 command_candidate = Some((prepared.executable, prepared.args, env));
                 if let Err(observer) = generation.install_observer(observer) {
@@ -2159,7 +2236,7 @@ impl TerminalManager {
 
         let spawn_candidates = if let Some((executable, args, env)) = command_candidate {
             let attempted_label =
-                redact_private_values(format!("{executable} {args:?}"), &private_values);
+                redact_private_values(format!("{executable} {args:?}"), &diagnostic_values);
             vec![(
                 PtySpawnInput {
                     executable,
@@ -2208,7 +2285,7 @@ impl TerminalManager {
                     spawned = Some((process, executable));
                     break;
                 }
-                Err(error) => last_error = redact_private_values(error, &private_values),
+                Err(error) => last_error = redact_private_values(error, &diagnostic_values),
             }
         }
         let Some((mut uncommitted_process, mut executable)) = spawned else {
@@ -2251,6 +2328,9 @@ impl TerminalManager {
                 return Err(invalidated_creation_error(&input));
             }
             private_values.clear();
+            diagnostic_values.clear();
+            // The original command runs unobserved.
+            command_was_prepared = false;
             let Some((original, args, env)) = original_command_candidate else {
                 return Err(TerminalError::Io(
                     "prepared terminal launch has no original command".to_owned(),
@@ -2398,6 +2478,19 @@ impl TerminalManager {
             command: input.command.clone(),
             executable,
             started: std::time::Instant::now(),
+            // A launch naming its provider is an AI Terminal: observed when an observer was
+            // prepared for it, else its status is unavailable (#187).
+            agent_status: input
+                .command
+                .as_ref()
+                .and_then(|command| command.activity.as_ref())
+                .map(|_| {
+                    if command_was_prepared {
+                        SessionAgentStatus::Ready
+                    } else {
+                        SessionAgentStatus::Unavailable
+                    }
+                }),
         }));
         let _lifecycle = self.inner.lifecycle.lock().await;
         let _publication = generation.publication.lock().await;
@@ -2646,6 +2739,8 @@ impl TerminalManager {
             }
         });
 
+        Self::mirror_agent_status(&inner, &session, &generation);
+
         let activity_cancel = inner.cancellation.child_token();
         let activity_session = session;
         let activity_inner = inner.clone();
@@ -2714,6 +2809,69 @@ impl TerminalManager {
         });
     }
 
+    /// Mirrors the generation observer's agent status into the terminal's metadata summary, so
+    /// every client's left panel follows it (#187). A changed state publishes at once; an
+    /// unchanged report refreshes the published age at most once a minute. The terminal event
+    /// stream is untouched: status is metadata, not output.
+    fn mirror_agent_status(
+        inner: &Arc<Inner>,
+        session: &SharedSession,
+        generation: &Arc<SessionGeneration>,
+    ) {
+        let mut reports = generation
+            .observation
+            .observation()
+            .subscribe_agent_status();
+        // A report the observer made while the process was spawning is mirrored too.
+        reports.mark_changed();
+        let cancel = inner.cancellation.child_token();
+        let inner = inner.clone();
+        let session = session.clone();
+        let generation = generation.clone();
+        tokio::spawn(async move {
+            let mut published: Option<TerminalAgentObservation> = None;
+            loop {
+                tokio::select! {
+                    () = cancel.cancelled() => return,
+                    () = generation.cancellation.cancelled() => return,
+                    changed = reports.changed() => if changed.is_err() { return; },
+                }
+                let Some(observation) = *reports.borrow_and_update() else {
+                    continue;
+                };
+                if published.is_some_and(|previous| {
+                    previous.state == observation.state
+                        && previous.failed == observation.failed
+                        && observation
+                            .observed_at
+                            .saturating_duration_since(previous.observed_at)
+                            < AGENT_STATUS_REFRESH_INTERVAL
+                }) {
+                    continue;
+                }
+                let _publication = generation.publication.lock().await;
+                if generation.is_invalidated() {
+                    return;
+                }
+                let summary = {
+                    let mut session = session.lock().await;
+                    if session.status != TerminalStatus::Running {
+                        return;
+                    }
+                    if session.agent_status.is_none() {
+                        continue;
+                    }
+                    session.agent_status = Some(SessionAgentStatus::Observed(observation));
+                    session.summary()
+                };
+                published = Some(observation);
+                let _ = inner.metadata.send(TerminalMetadataEvent::Upsert {
+                    terminal: Box::new(summary),
+                });
+            }
+        });
+    }
+
     async fn finalize_process_exit(
         inner: &Arc<Inner>,
         session: &SharedSession,
@@ -2755,6 +2913,15 @@ impl TerminalManager {
             session.exit_signal = exit.signal;
             session.has_running_subprocess = false;
             session.child_command_label = None;
+            // An unobserved agent stays unavailable: BiBCode never saw it finish its work.
+            if session
+                .agent_status
+                .is_some_and(|status| status != SessionAgentStatus::Unavailable)
+            {
+                session.agent_status = Some(SessionAgentStatus::Exited {
+                    failed: agent_exit_failed(&exit),
+                });
+            }
             let sequence = session.advance();
             (
                 TerminalEvent::Exited {
@@ -4223,9 +4390,40 @@ fn now_iso() -> String {
         .unwrap_or_else(|_| OffsetDateTime::now_utc().unix_timestamp().to_string())
 }
 
+/// Whether an AI Terminal agent's exit reads as failed (#187). Quitting it with Ctrl+C (exit
+/// code 130, SIGINT, or Windows' control-C exit status) is the user's choice, not a failure.
+fn agent_exit_failed(exit: &PtyExit) -> bool {
+    const SIGINT: i32 = 2;
+    const SIGINT_EXIT_CODE: i32 = 128 + SIGINT;
+    // STATUS_CONTROL_C_EXIT, 0xC000013A, as the signed exit code Windows reports.
+    const WINDOWS_CONTROL_C_EXIT: i32 = 0xC000_013A_u32 as i32;
+    if exit.signal == Some(SIGINT) {
+        return false;
+    }
+    exit.exit_code
+        .is_some_and(|code| !matches!(code, 0 | SIGINT_EXIT_CODE | WINDOWS_CONTROL_C_EXIT))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_agent_quit_with_control_c_has_not_failed() {
+        let exit = |exit_code, signal| PtyExit { exit_code, signal };
+        assert!(!agent_exit_failed(&exit(Some(0), None)));
+        assert!(agent_exit_failed(&exit(Some(1), None)));
+        assert!(!agent_exit_failed(&exit(Some(130), None)), "Ctrl+C");
+        assert!(!agent_exit_failed(&exit(None, Some(2))), "SIGINT");
+        assert!(
+            !agent_exit_failed(&exit(Some(-1_073_741_510), None)),
+            "Windows Ctrl+C"
+        );
+        assert!(
+            !agent_exit_failed(&exit(None, Some(9))),
+            "a signal reports no failure code"
+        );
+    }
     use crate::diagnostics::{
         AttributionKind, AttributionScope, ProcessAttributionRegistry, ProcessRow,
     };

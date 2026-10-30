@@ -114,6 +114,10 @@ pub fn is_long_running(method: &str) -> bool {
             | "sourceControl.publishRepository"
             | "sourceControl.lookupRepository"
             | "server.discoverSourceControl"
+            // The diagnostics relay waits on a person approving it, then on the command
+            // reading each item (#201).
+            | "server.subscribeDiagnosticLogsRelay"
+            | "server.sendDiagnosticLogsRelayItem"
             | "vcs.pull"
             | "vcs.generateCommitMessage"
             | "git.resolvePullRequest"
@@ -149,6 +153,9 @@ pub fn is_long_running(method: &str) -> bool {
             // Saving settings re-probes the providers, which runs OpenCode's `--version` (#115).
             | "server.updateSettings"
             | "worktree.createManaged"
+            // An AI Terminal's preparation waits on its provider: for Claude, a mise shim's
+            // `which` and `env` and a new build's `codesign --verify` (#203).
+            | "terminal.open"
             // `git worktree remove --force` deletes the whole tree, `node_modules` and `target`
             // included.
             | "worktree.remove"
@@ -1188,6 +1195,9 @@ mod tests {
         }
         assert!(!is_long_running("pipelines.readSnapshot"));
         assert!(!is_long_running("pipelines.subscribe"));
+        // Preparing an AI Terminal runs its provider's probe, a shim's manager and codesign.
+        assert!(is_long_running("terminal.open"));
+        assert!(!is_long_running("terminal.writeInput"));
     }
 
     #[test]

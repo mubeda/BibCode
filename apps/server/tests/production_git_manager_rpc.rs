@@ -198,6 +198,7 @@ impl Fixture {
                 latest_user_message_at: None,
                 pending_approval_count: 0,
                 pending_user_input_count: 0,
+                last_activity_at: None,
                 has_actionable_proposed_plan: 0,
                 unresolved_delivery_state: None,
                 unresolved_delivery_detail: None,

@@ -65,6 +65,16 @@ the host's sharing controls. The CI remote-install lane requires exactly one
 requester info line for its single install request and retains bounded,
 redacted evidence; it never retains bootstrap or pairing credentials.
 
+Each Claude activity probe run writes one line to `server.log`: `Claude
+activity probe finished` (`info`), `Claude activity probe found another
+program` (`warn`, `outcome = "mismatch"`), or `Claude activity probe failed`
+(`warn`). Each line carries the resolved `executable`, its `canonical` target
+and the `search_path` used to resolve it. All three pass through the
+Profiler's path redaction, so the home directory reads `~` and secrets are
+removed. A raw `PATH` is never logged. The
+[Claude guide](../providers/claude.md#activity-observation) explains each
+outcome.
+
 In headless mode, run the native server from a terminal, or install the
 per-user service (`bibcode service install`) whose stdout and stderr go to the
 service manager's log (the journal on Linux, `~/Library/Logs/bibcode-server.log`
@@ -152,9 +162,17 @@ values in option values or other diagnostic fields.
 
 ## Diagnostic Bundle
 
-The Diagnostics settings page can prepare a timestamped, redacted ZIP through
-`POST /api/diagnostics/logs.zip`. Desktop clients open a native save dialog;
-browser clients download the response. The archive contains:
+The Diagnostics settings page can prepare a timestamped, redacted ZIP of the
+environment the page has selected (the primary unless `?environment=` names
+another; the Profiler section and the download share that selection). The
+server that owns the logs builds and redacts the archive. The primary
+environment's archive comes from `POST /api/diagnostics/logs.zip`. Any other
+connected environment's archive comes over that environment's own RPC
+connection, through the `server.downloadDiagnosticLogs` stream, so a pinned
+(E2EE), relay, or SSH connection carries it inside the channel it already uses.
+Desktop clients open a native save dialog; browser clients download the
+archive. The archive is named
+`bibcode-diagnostics-<environment label>-<UTC timestamp>.zip`, and it contains:
 
 - `server.log`, assembled oldest-first from the active native server log and up
   to three retained backups;
@@ -163,7 +181,159 @@ browser clients download the response. The archive contains:
 - `frontend.log`, containing the frontend warning/error snapshot supplied by
   the requesting client; and
 - `profiler/`, when the profiler directory (`<state dir>/profiler`) holds
-  files: the events and findings files and the `crashes/*.json` sidecars.
+  files: the events and findings files and the `crashes/*.json` sidecars; and
+- `manifest.json`, naming the server that built it: `environmentId`,
+  `storageInstanceId`, `environmentLabel`, `serverVersion`, `platform`,
+  `generatedAt`, and `crashDumps` (`requested`, and `included`, the number of
+  dumps actually written, which can be lower when one does not fit).
+
+Only a server whose descriptor advertises `capabilities.diagnosticLogs` is asked
+for its bundle over RPC; an older server would fail the whole connection on the
+unknown method. For an older server, a disconnected environment, a refused
+scope, or a connection lost mid-download, the page names that environment and
+says why, and nothing is saved. It never falls back to another environment's
+bundle. The client also checks that the manifest's `storageInstanceId` is the
+one its connection verified, and refuses an archive without one. The stream
+sends a `Started` item (file name, size, manifest) and then base64 items of at
+most 64 KiB, one in flight at a time, so the connection's other traffic goes
+out between them. A bundle holds one server's logs: diagnosing a remote launch
+or transport problem can need both the remote environment's archive and the
+primary's, downloaded one after the other.
+
+Links that start from an environment open the page on it (#201): the thread
+error banner's **Diagnostics** names the thread's environment, the sidebar's
+project-availability **Diagnostics** names the environment whose projects are
+unavailable, and the status bar's **Profiler** segment names the first
+recording environment. The desktop update dialog's **Diagnostics** opens the
+primary. A chosen environment that is not connected stays chosen: the download
+is disabled with "<label> is not connected. Reconnect it to download its logs."
+until it reconnects, and the primary's logs are never offered in its place.
+Only an environment removed from the app drops the choice.
+
+### From the command line
+
+`bibcode diagnostics download --environment <id or name>` saves the same
+bundle on a machine whose BiBCode desktop app is connected to that
+environment, after one approval in the app (#201). For unattended access with
+the app closed, see [Without the app](#without-the-app) below (#202). The
+desktop executable runs it too
+(`<desktop exe> diagnostics download …`); when the desktop's primary
+environment runs in WSL, run `bibcode diagnostics download` inside that distro,
+since the endpoint file lives in the distro's data root. Options:
+`--include-crash-dumps`, `--output <dir>` (the current directory by default),
+and `--json`, which prints one document with `status` (`saved`, `failed`,
+`denied`, or `unavailable`), `reason`, `message`, and on success `path`,
+`fileName`, `byteLength`, and `manifest`. Exit codes: 0 saved, 1 failed, 2
+denied, unanswered or cooling down, 3 BiBCode or its desktop window not
+running.
+
+No server holds a connection to another environment; the app does. So the
+command asks this host's own server, which hands the request to the app:
+
+1. While it runs, the server writes `diagnostics-relay.json` in its state
+   directory (owner-only on Unix), naming its URL and a fresh per-boot token,
+   and removes it when it stops. The command sends the token only to a loopback
+   URL, posting to `/api/diagnostics/relay`; the route refuses any other
+   credential, a peer that is not this machine, and any request carrying a
+   proxy's forwarding headers (`Forwarded`, `X-Forwarded-*`, `X-Real-IP`,
+   `Tailscale-*`). A proxy that strips every such header could still forward a
+   request from a loopback socket, which is why the token, not the peer
+   address, is the gate. Reading the file needs the same access as the data
+   root, which already lets `bibcode pairing issue` mint an administrative
+   credential while the server runs, so the token grants nothing new.
+2. The command prints a code ("Approve request K7Q-4M in BiBCode…") and sends
+   it with the environment as typed and its absolute output directory. The
+   server announces the request only to the desktop app's own session (the one
+   minted from the desktop bootstrap), never to another paired device, however
+   broad its scopes. With no such window subscribed, the command fails at once.
+   One request runs at a time. After a denied or unanswered request, or one
+   whose command left before anyone answered, the next waits 30 s, doubling
+   with each refusal in a row up to 5 minutes; a saved archive clears the wait.
+   The server refuses a request whose environment or directory is blank, too
+   long, or holds a control or Unicode format character (bidirectional
+   overrides and isolates, zero-width characters); the environment is shown
+   exactly as typed and trimmed only to look it up.
+3. The app resolves the name (an id, or a label exactly one environment has).
+   An unknown, ambiguous or disconnected name is answered without a prompt,
+   naming only what was asked for, never the environments the app can reach.
+   Otherwise it asks: "Share <label>'s diagnostic logs?" — a program running
+   as the user on this computer, not BiBCode, asks to save them to a file — and
+   shows the code, the environment as typed, and the directory, naming crash
+   dumps when asked for. Any program running as the user can make this
+   request (an agent in a thread, a paired device's terminal), so the user
+   shares only when the code matches the command they ran. Dismissing denies.
+4. On **Share logs**, the window claims the request (it is then bound to that
+   session and connection, and the other windows drop their prompt) and runs
+   `server.downloadDiagnosticLogs` on the named environment with every check of
+   the Settings download, then sends the verified archive back in 64 KiB items,
+   each answered only once the command read the one before.
+5. The request ends unanswered after 2 minutes without approval, 10 minutes
+   after approval without the archive starting, 60 s without the next item, or
+   when the approving window's connection closes. When the command exits, the
+   app's download stops, including one whose claim was still in flight. The
+   command itself gives up after 13 minutes without the archive starting and
+   90 s between items.
+
+The command publishes nothing until the whole archive arrived and its own
+`manifest.json` names the same non-empty environment and store, and the same
+server version, as the manifest the app checked. The name must have the
+archive's shape (no path separator, no leading dot, ending in `.zip`) and the
+byte count must match. The archive is written and synced to a hidden
+`.<name>.<code>.partial` file in the output directory, then published under its
+name with a hard link, which never replaces an existing file, and the temporary
+file is removed; a taken temporary name is skipped, never removed. On a
+filesystem without hard links the command saves nothing and says to choose a
+local `--output`, since no other publish is safe against a partial file. An
+interrupted run can leave only the temporary file, never a partial archive
+under the real name. The command waits at most 30 s for the server's response
+headers or an error body. Text from the app or the remote server is printed
+without control or format characters. The local server logs each request's id and outcome
+(waiting, claimed, answered, the command left, or the reason it ended), never
+the token, the environment name, or archive bytes.
+
+#### Without the app
+
+`bibcode diagnostics pair` pairs this command with a remote server as its own
+device, from an offer minted there with `bibcode pairing offer --access
+diagnostics` (pass the offer on standard input: as an argument it would show in
+the process list and shell history); afterwards
+`bibcode diagnostics download --remote <name>` fetches the bundle itself, with
+no app running anywhere. `bibcode diagnostics remotes` lists the paired
+remotes and `bibcode diagnostics forget <name>` deletes one's local credential
+(the remote keeps listing the client until it is revoked on its Share tab or
+expires 30 days after pairing; credentials are not renewed). The wire, scope
+and storage design is in
+[Remote architecture](../architecture/remote.md#command-line-diagnostics-pairing).
+
+- The credential holds `diagnostics:read` alone, which allows
+  no method other than `server.downloadDiagnosticLogs` (plus
+  `auth.confirmPairing` for its own pending pairing). `pair` reads the minted
+  scopes from the remote's pairing reply and saves nothing unless they are
+  exactly that (`not-diagnostics-only`); a remote too old to report them is
+  refused too (`unsupported`). An unconfirmed credential it refuses is revoked
+  when it closes the channel.
+- The remote applies the same redaction, 20 MiB limit and crash-dump check as
+  for the app: `--include-crash-dumps` exits 2 with `crash-dumps-refused`,
+  since dumps need `orchestration:operate`. `frontend.log` reads "No frontend
+  warnings or errors were captured.", because the command has no frontend.
+- The download checks what the app's does: the host key pinned at pairing
+  (`host-identity-mismatch`), the store and environment recorded at pairing
+  against the announced manifest before any byte is kept
+  (`wrong-environment`), each item's encoded length against the 64 KiB item
+  bound and the bytes still expected before decoding (`incomplete`), and then
+  the same publish as above.
+- Exit codes and the `--json` document are those of `--environment`, with
+  these reasons: 1 for `host-identity-mismatch`, `wrong-environment`,
+  `incomplete`, `too-large`, `exists`, `store-failed`, `protocol` or
+  `server-failed`; 2 for `unauthorized` (revoked or expired) or
+  `crash-dumps-refused`; 3 for `not-paired`, `unreachable`, `tls` or
+  `unsupported`. `pair` uses the same codes: 0 paired, 2 `offer-refused`, and 1
+  for `pairing-rejected`, `busy` (another command holds the name for more than
+  90 s) or `rollback-failed` (a refused pairing's record could not be deleted;
+  the message names `bibcode diagnostics forget <name>`).
+- An `https` remote's certificate is verified against the operating system's
+  trust; a certificate it cannot verify exits 3 with `tls` before anything is
+  sent, so the offer stays unused.
 
 Provider and terminal operational logs are not included. Each retained server
 or trace file is read up to 4 MiB and marked when truncated. The frontend
@@ -177,16 +347,29 @@ out for size or because it could not be read is listed in
 `profiler/OMITTED.txt`, and symbolic links are never followed, including a
 linked `profiler` or `crashes` directory. Files are added only while the archive
 built so far, with the logs, stays under the desktop save limit of 20 MiB; a
-file is counted as if it did not compress.
+file is counted as if it did not compress. The RPC path refuses an archive over
+20 MiB before sending any of it. A server holds at most two archives in memory
+at once: a slot is taken before the build and released when the archive is
+dropped, so an RPC download keeps it until its last item is sent and the HTTP
+route until it hands the bytes to the response, and a build whose caller went
+away keeps it until its compression thread finishes. A download whose client
+takes no item for 60 s (a link under about 1 KiB/s, or a client that stopped
+acknowledging) ends there and releases its archive. The RPC refuses a
+`frontendLog` over the HTTP route's 512 KiB body bound with `invalid`. A crash
+dump is bundled, and counted in the manifest, only once the crash monitor has
+written its `.json` record, which it does after the dump is complete; a dump
+without one is listed in `profiler/OMITTED.txt` as incomplete.
 
 Crash dumps (`profiler/crashes/*.dmp`) can hold fragments of process memory,
 including prompts or tokens, so they are left out unless the request body sets
 `"includeCrashDumps": true`. The Diagnostics page sends it only when
 **Include crash dumps** is checked in the Profiler section, and the plain
 **Download logs** action never does. A body where `includeCrashDumps` is not a
-boolean is rejected with `400`. The route needs `orchestration:read`; a request
-that includes dumps also needs `orchestration:operate`, because dumps are raw
-process memory and are not redacted.
+boolean is rejected with `400`. The route and the RPC need
+`orchestration:read`; a request that includes dumps also needs
+`orchestration:operate` of the same credential, because dumps are raw process
+memory and are not redacted. The RPC refuses such a request with
+`EnvironmentAuthorizationError` before building anything.
 
 Before writing the ZIP, the server redacts authorization and proxy-authorization
 lines, bearer values, common token/API-key/password/secret assignments, and URL
