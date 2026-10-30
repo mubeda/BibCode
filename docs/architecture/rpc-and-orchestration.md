@@ -3289,12 +3289,14 @@ failure, and a stream that closes first (or is cancelled, or passes its budget) 
 | --------------------------- | ------------------------------------------------------------------------------------- | ------- |
 | `list_projects_and_threads` | the `subscribeShell` builder, threads and projects each paged by offset               | read    |
 | `list_providers_and_models` | `server.getConfig` providers and session defaults                                     | read    |
-| `start_thread`              | `thread.turn.start` with `bootstrap.createThread`                                     | operate |
+| `start_thread`              | `thread.turn.start` with `bootstrap.createThread`; attachments staged first           | operate |
 | `send_message`              | `thread.turn.start` with `queued: true`, then `thread.turn.steer` for `mode: "steer"` | operate |
 | `wait_for_thread`           | engine events and one targeted read                                                   | read    |
 | `read_thread`               | one keyset page of `projection_thread_messages` with `LIMIT`, texts cut in SQL        | read    |
 | `list_pending_requests`     | open questions and pending approvals, read directly                                   | read    |
-| `answer_question`           | `thread.user-input.respond`; approvals refused                                        | operate |
+| `answer_question`           | `thread.user-input.respond`; an approval id is refused (`McpRequestKindError`)        | operate |
+| `answer_approval`           | `thread.approval.respond`; a question id is refused (`McpRequestKindError`)           | operate |
+| `revert_thread_to_turn`     | `thread.checkpoint.revert`, then the effects worker's outcome event                   | operate |
 | `interrupt_turn`            | `thread.turn.interrupt` for the running turn; nothing when no turn runs               | operate |
 | `get_turn_diff`             | `orchestration.getTurnDiff`, paged by file and offset                                 | read    |
 | `git_status`                | `vcs.refreshStatus` on the thread's folder                                            | read    |
@@ -3322,8 +3324,25 @@ failure, and a stream that closes first (or is cancelled, or passes its budget) 
   cursor continuing after the last entry its page returns. A call that continues
   only one list returns only that list.
 - **Ceiling.** A start runs at most at the lower of the session's `mcp_access` and
-  `mcpServerAccess`; a send or an answer to a thread above it is refused, and
-  `read-only` hides and refuses every operate tool.
+  `mcpServerAccess`; a send, an answer, an accepted approval or a revert on a thread
+  above it is refused, and `read-only` hides and refuses every operate tool. Declining
+  or cancelling an approval stops work, so it passes no thread to `ToolCall::commands`
+  and a retry is judged as its first call was.
+- **Attachments.** `start_thread` and `send_message` take at most 8 attachments, 3 MiB
+  decoded per call, as base64. A new request stages each through `uploads.begin` and
+  `uploads.append` under the MCP session, which owns the uploads and whose quota bounds
+  them, and stores commands that name the `uploadId`s, never the bytes; turn admission
+  consumes them. A failure cancels the uploads the call began. A staged upload lives
+  10 minutes idle and is lost on restart, so a retry whose stored turn was never
+  admitted after that gets `McpAttachmentExpiredError`, never a turn without its
+  attachments.
+- **Checkpoint revert.** `revert_thread_to_turn` refuses a running turn
+  (`McpTurnRunningError`, as the UI does) and a `turnCount` past the latest checkpoint,
+  then subscribes to engine events, dispatches, and waits up to 30 s for the first
+  outcome after its dispatch sequence in `orchestration_events`: `thread.reverted`,
+  `checkpoint.revert.files-only` (files restored, conversation kept), or
+  `checkpoint.revert.failed` (`McpCheckpointRevertError` with the worker's detail).
+  Reading the log rather than the live stream also answers a receipt replay.
 - **Waiting.** `wait_for_thread` subscribes to `subscribe_events()` before its first
   read, keeps only the thread's events, re-reads at most once per 100 ms burst, and
   returns when the selected turn settles (or, without `messageId`, the thread is

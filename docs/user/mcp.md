@@ -3,7 +3,7 @@
 An AI agent that BiBCode did not start, such as Claude Code or Codex in a terminal, can
 operate a BiBCode environment's threads through MCP. It can start a thread on any provider
 and model, send it messages, wait for its turns, answer its questions, interrupt it, and
-read its replies and diffs. A person still answers every approval in BiBCode.
+read its replies and diffs, answer its approvals, and revert it to an earlier checkpoint.
 
 Each BiBCode environment hosts its own MCP server. The agent runs `bibcode mcp` on the host
 where that environment's server runs, and that command relays to the server over loopback.
@@ -43,13 +43,15 @@ own loopback server. Remote MCP over HTTP is not supported yet.
 | --------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
 | `list_projects_and_threads` | Projects with their folders, and threads with each thread's status, pending flags, latest turn, provider and model     |
 | `list_providers_and_models` | Provider instances with availability, default and custom models                                                        |
-| `start_thread`              | Starts a thread in a project with a first prompt                                                                       |
-| `send_message`              | Sends a message; queued behind a running turn, never interrupts; `mode: "steer"` asks the running turn to take it      |
+| `start_thread`              | Starts a thread in a project with a first prompt and up to 8 attachments (3 MiB in all)                                |
+| `send_message`              | Sends a message, with attachments; queued behind a running turn; `mode: "steer"` asks the running turn to take it      |
 | `wait_for_thread`           | Waits up to 50 s for the turn to settle or need a person; a timeout never stops the work                               |
 | `read_thread`               | The thread's status and a page of messages; long messages and older pages are reachable with `textOffset` and `cursor` |
-| `list_pending_requests`     | Open questions and approvals                                                                                           |
+| `list_pending_requests`     | Open questions and approvals, with each approval's kind, summary and decisions                                         |
 | `answer_question`           | Answers an open question                                                                                               |
+| `answer_approval`           | Accepts, accepts for the session, declines or cancels a pending approval                                               |
 | `interrupt_turn`            | Stops the running turn; when no turn runs it does nothing and says so                                                  |
+| `revert_thread_to_turn`     | Restores the files to a turn's checkpoint and rewinds the provider; refused while a turn runs                          |
 | `get_turn_diff`             | One turn's patch, paged                                                                                                |
 | `git_status`                | Branch, ahead/behind and changed files of the thread's folder                                                          |
 
@@ -109,9 +111,9 @@ echo "Now list the open TODOs" | bibcode thread send <thread id> - --wait --json
 - **Access.** A thread an agent starts never runs above **Agents may**, and an agent cannot
   message or answer a thread that runs above it. Lowering the setting applies at once to
   connected agents. Raising it reaches an agent only after its MCP server restarts.
-- **Approvals.** An agent never answers an approval. A Supervised thread stops at its first
-  approval until you answer it in BiBCode; the agent sees `awaiting_approval` and can tell
-  you.
+- **Approvals.** A Supervised thread stops at its first approval, and whoever drives it may
+  answer: you in BiBCode, or the agent with `answer_approval`. An agent may accept only on a
+  thread at or below **Agents may**; it may decline or cancel on any thread.
 - **Not available.** There are no tools for worktree removal, discard, undo, revert,
   delete, force-push, settings, credentials, the updater, pairing or relay.
 - **Credential.** `bibcode mcp` signs in with its own credential, limited to reading and
