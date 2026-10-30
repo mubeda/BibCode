@@ -83,6 +83,43 @@ read the change counts first, and a worktree that changed since is refused. Its 
 A removal finishes in BiBCode even if the agent's call is cancelled, and a retry with the
 same `clientRequestId` returns the first result without removing anything again.
 
+### Git
+
+These tools work in the thread's folder (its worktree, else its project's folder), through
+the same handlers as the Source Control panel. They belong to the **Source control** set.
+
+| Tool                       | What it does                                                                                                     |
+| -------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `git_stage`                | Stages files or folders                                                                                          |
+| `git_unstage`              | Unstages files or folders, keeping their changes                                                                 |
+| `git_commit`               | Commits what is staged, running the repository's hooks; no amend and no `--no-verify`                            |
+| `git_undo_commit`          | **Destructive.** Removes the last commit when it was never pushed, keeping its changes, and returns its message  |
+| `git_revert_commit`        | Adds a commit that reverts another; nothing is lost                                                              |
+| `git_push`                 | Pushes a branch; a branch without an upstream is published                                                       |
+| `git_force_push`           | **Destructive.** Force-pushes with `--force-with-lease`: refused if the remote moved since the last fetch        |
+| `git_fetch`                | Fetches a remote                                                                                                 |
+| `git_pull`                 | Pulls the current branch                                                                                         |
+| `git_create_branch`        | Creates a branch and switches to it unless `checkout` is false                                                   |
+| `git_switch_branch`        | Switches branch; `carryChanges` stashes uncommitted changes or brings them along                                 |
+| `git_delete_branch`        | **Destructive.** Deletes a local branch, and with `deleteRemote` its upstream branch too                         |
+| `git_delete_remote_branch` | **Destructive.** Deletes a branch on a remote only                                                               |
+| `git_discard`              | **Destructive.** Discards changes; files go to the trash unless the trash cannot take them and `permanent` is on |
+
+- **Paths** are literal and relative to the thread's folder, at most 200 per call. A path
+  that leaves the folder, directly or through a symlinked folder, and globs or Git pathspec
+  magic (`:(glob)…`, `*`, `?`, `[`, `\`) are refused. A file whose name contains one of
+  those characters cannot be named over MCP.
+- **Retries.** Every tool but `git_stage`, `git_unstage`, `git_fetch`, `git_create_branch`
+  and `git_switch_branch` takes a `clientRequestId`. A retry with it returns the first
+  call's outcome without running Git again. If BiBCode cannot tell whether the call ran
+  (MCP was turned off or read-only mid-push, the agent was revoked, or BiBCode stopped), the
+  answer is `McpOutcomeUnknownError`: check `git_status`, then retry with a new id.
+- **Deleting a branch with its remote** is two steps. If the remote step fails, the local
+  branch is already gone and the answer is `McpPartialOutcomeError`, naming the
+  `git_delete_remote_branch` call that finishes it.
+- **Results** end with the folder's Git status. A refused operation returns its `code` and,
+  when a guard refused it, its `blocked` reason, such as uncommitted changes.
+
 ## From a shell: `bibcode thread`
 
 `bibcode thread` calls the same tools from a terminal or a script. It runs on the host where

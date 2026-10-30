@@ -3068,3 +3068,84 @@ W was implemented on `claude/v0131-139-w`, from `claude/v0131-139-f0`. It adds
 - **Docs.** `docs/user/mcp.md` gains a "Worktrees" subsection and
   `docs/architecture/rpc-and-orchestration.md` a "Worktree tools" subsection. The user doc's
   "Not available" bullet still lists worktree removal; slice Z rewrites that section.
+
+## G (git write tools) implementation notes (2026-10-30)
+
+G was implemented on `claude/v0131-139-g`, from `claude/v0131-139-f0`. It registers the
+`git` family (`mcp/tools/git.rs`, 14 tools in the Source control set) and its tests
+(`production/mcp_tools_tests/git.rs`), and changes the Git boundary for every caller.
+
+**Drift found:**
+
+- **Failure output is not returned.** The design returns the last 16,000 characters of
+  output when an operation fails. `StreamCollector::push` (`rpc/session.rs`) returns the
+  `failed` event without the lines it collected, and `rpc_failure` (`mcp/control.rs`) keeps
+  only `code`, `blocked`, `phase` and `reason`. Both are F0's files, so G returns the typed
+  failure with `code` and `blocked` only. The follow-up: attach the collector's bounded
+  `output` to the failure, keep it in `rpc_failure`, and mark it untrusted.
+- **The handler does not validate names.** "Branch names and remotes are passed to the RPC,
+  which already validates them" (C5) is not so: push runs `git push <remote> <refspec>`
+  without `--`, and branch create, delete, checkout, fetch and pull pass names unchecked, so
+  a remote of `--receive-pack=…` would be read as an option. The tools therefore check
+  every name before any RPC: a remote must be one `gitManager.getRefs` lists, a branch name
+  must pass `is_branch_name` (`git/manager/operations.rs`, strict `check-ref-format`: no
+  leading `-` or `+`, no `:`, whitespace, control or wildcard characters, `..`, `@{`, `//`,
+  `.`-led parts or `.lock`), and a revision (`sha`, `startPoint`) may not start with `-` or
+  hold whitespace. The new `remote-branch-delete` checks both in the handler. The other
+  operations' handler paths are unchanged for the Source Control panel, which sends names
+  it read from the repository; hardening them is a follow-up.
+- **`branch-checkout` with `strategy: "stash"` is not implemented** by the handler
+  (`is_implemented_through_phase_16`). `git_switch_branch` with `carryChanges: "stash"`
+  does what the panel does: `stash-push` with untracked files, then a plain checkout. A
+  clean folder skips the stash; a checkout that fails after a stash returns its failure with
+  `stashed: true`.
+
+**Choices made while implementing:**
+
+- **Literal pathspecs** (`--literal-pathspecs` as the first argument) cover `stage_files`,
+  `unstage_files` (both forms), `discard_files` (listing, restore and clean),
+  `git_manager_tracked_paths` and `git_manager_restore_tracked_paths`. Not covered:
+  `git_manager_stash_push`'s paths (only the panel sends them; no stash tool exists) and
+  `undo_head_commit`'s restore of deleted paths, whose names come from Git itself (a file
+  named with a glob character there is a pre-existing quirk). `validate_pathspecs` is
+  unchanged, so every path the panel sends still passes.
+- **Discard containment** runs first in `discard_paths`: the deepest existing folder of
+  each path is canonicalized, and one outside the canonical `cwd` refuses the whole call
+  before anything is trashed or restored. It returns `DiscardError::Git`, so
+  `production/git_manager_rpc.rs` needed no change.
+- **Methods.** Each spec lists only its mutating method. The reads a tool also makes
+  (`gitManager.getRefs`, `vcs.refreshStatus`) need `orchestration:read`, and the family test
+  pins `scope == required_scope(method)`.
+- **Hints.** As the table says, plus `git_delete_branch` is `open_world` (and so
+  long-running): hints are per tool, and with `deleteRemote` it reaches the remote.
+  `git_stage` and `git_unstage` carry no `idempotentHint`; only `git_fetch` does.
+- **Keys.** Every tool runs through `call.recorded`. `git_stage`, `git_unstage`,
+  `git_fetch`, `git_create_branch` and `git_switch_branch` take no `clientRequestId`, as
+  the table lists, and run inline under the live controls.
+- **Resolution inside the work.** The current branch, its upstream, the remote and the kind
+  of push are resolved inside the recorded work, so a keyed retry returns the stored outcome
+  even after the branch or upstream changed. The stored payload of those tools is the
+  arguments with `cwd`, not one RPC payload.
+- **Push defaults.** The branch is the current one; the remote is the named one, else the
+  upstream's, else `origin`, else the only remote. A branch without an upstream is
+  `publish-branch`. Pushed to its upstream's remote, a branch updates its upstream branch
+  whatever its name there.
+- **The partial outcome** is `McpPartialOutcomeError` with `local: "deleted"`,
+  `remote: "failed"`, `remoteName`, `remoteBranch`, `reason` (the handler's `code`) and
+  `recovery: { tool: "git_delete_remote_branch", arguments: { remote, branch } }`. It is
+  stored as `failed`, so a keyed retry replays it. If the remote step's stream ended before
+  its result, the call is `unknown` instead, since the remote may have deleted it.
+  `deleteRemote` without an upstream refuses with `code: "no-upstream"` before anything is
+  deleted.
+- **The status summary** duplicates `git_status`'s mapping (slice A owns `threads.rs` in
+  this wave). It is read after the outcome, also on a replay, so it is current, and it is
+  `null` when it cannot be read: a status read never fails work that ran.
+- **Tests** run the real `vcs.*` and `gitManager.*` handlers on a temporary repository whose
+  `origin` is a bare repository, through `Harness::with_methods`. The Git handlers resolve a
+  folder's project from a store of their own, holding project `p1` at the repository. The
+  trash is faked. A slow `pre-receive` hook proves a cancelled keyed push still lands and the
+  off switch mid-push records `unknown`; `receive.denyDeletes` makes the remote refuse a
+  deletion. The agent runs at Supervised, so the destructive tools are proven at the
+  default level.
+- **Docs.** `docs/user/mcp.md` gains a **Git** subsection. Its "Not available" and
+  approvals bullets are slice Z's cross-cutting text and still say these tools do not exist.
