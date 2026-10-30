@@ -4,3 +4,4 @@
 
 pub(crate) mod previews;
 pub(crate) mod threads;
+pub(crate) mod worktrees;

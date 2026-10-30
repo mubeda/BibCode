@@ -404,6 +404,7 @@ pub(crate) struct Family {
 pub(crate) const FAMILIES: &[Family] = &[
     super::tools::threads::FAMILY,
     super::tools::previews::FAMILY,
+    super::tools::worktrees::FAMILY,
 ];
 
 /// The spec and family of `name` for `kind` in `families`.
