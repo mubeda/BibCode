@@ -2,6 +2,7 @@
 //! description and input schema of each client tool, and its dispatch. `control::FAMILIES`
 //! registers it.
 
+pub(crate) mod git;
 pub(crate) mod previews;
 pub(crate) mod threads;
 pub(crate) mod worktrees;

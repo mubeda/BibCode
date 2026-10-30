@@ -403,6 +403,7 @@ pub(crate) struct Family {
 /// Every tool family. A slice adds its family with one line here and one in `tools/mod.rs`.
 pub(crate) const FAMILIES: &[Family] = &[
     super::tools::threads::FAMILY,
+    super::tools::git::FAMILY,
     super::tools::previews::FAMILY,
     super::tools::worktrees::FAMILY,
 ];
