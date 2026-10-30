@@ -143,6 +143,15 @@ pub fn run_profiler_cli(args: ProfilerArgs, state_dir: PathBuf) -> i32 {
 /// in-process server uses.
 pub fn desktop_dispatch(attach_console: fn()) -> Option<i32> {
     let command = std::env::args_os().nth(1);
+    if command.as_deref() == Some(OsStr::new("mcp")) {
+        // Stdout carries only JSON-RPC: an agent's pipes are not a console, and attaching the
+        // parent's would mix its output in.
+        use std::io::IsTerminal as _;
+        if io::stdin().is_terminal() && io::stdout().is_terminal() {
+            attach_console();
+        }
+        return Some(desktop_mcp_dispatch());
+    }
     if command.as_deref() == Some(OsStr::new("diagnostics")) {
         attach_console();
         return Some(desktop_diagnostics_dispatch());
@@ -196,6 +205,51 @@ fn desktop_diagnostics_dispatch() -> i32 {
             1
         }
     }
+}
+
+/// `<desktop exe> mcp …` (#139): the relay to this desktop's own running server, which it
+/// finds through the endpoint record in the desktop's data root.
+fn desktop_mcp_dispatch() -> i32 {
+    let cli = match DesktopMcpCli::try_parse_from(std::env::args_os().skip(1)) {
+        Ok(cli) => cli,
+        Err(error) => {
+            let _ = error.print();
+            return error.exit_code();
+        }
+    };
+    let options = match crate::config::relay_options(cli.base_dir, cli.dev_url, cli.args) {
+        Ok(options) => options,
+        Err(error) => {
+            let _ = writeln!(io::stderr(), "bibcode: {error}");
+            return 1;
+        }
+    };
+    match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime.block_on(crate::mcp::relay::run_mcp_cli(options)),
+        Err(error) => {
+            let _ = writeln!(io::stderr(), "bibcode: {error}");
+            1
+        }
+    }
+}
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "mcp",
+    about = "Serve MCP on stdin and stdout so an AI agent on this computer can operate this BiBCode app's threads."
+)]
+struct DesktopMcpCli {
+    /// The data root; BIBCODE_HOME or ~/.bibcode by default, as the desktop app uses.
+    #[arg(long)]
+    base_dir: Option<PathBuf>,
+    /// The dev state's URL, as a development build's server uses.
+    #[arg(long)]
+    dev_url: Option<url::Url>,
+    #[command(flatten)]
+    args: crate::config::McpArgs,
 }
 
 #[derive(Debug, Parser)]
@@ -631,6 +685,29 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn the_desktop_executable_parses_the_mcp_launch_command() {
+        let cli = DesktopMcpCli::try_parse_from([
+            "mcp",
+            "--base-dir",
+            "/data root",
+            "--dev-url",
+            "http://localhost:5733",
+            "--access",
+            "read-only",
+        ])
+        .expect("the copied launch command parses");
+        assert_eq!(
+            cli.base_dir.as_deref(),
+            Some(std::path::Path::new("/data root"))
+        );
+        assert_eq!(
+            cli.args.access,
+            Some(crate::mcp::control::McpAccess::ReadOnly)
+        );
+        assert!(DesktopMcpCli::try_parse_from(["mcp", "--access", "everything"]).is_err());
+    }
 
     fn parse(args: &[&str]) -> Result<ProfilerSubcommand, clap::Error> {
         DesktopCli::try_parse_from(std::iter::once("profiler").chain(args.iter().copied()))

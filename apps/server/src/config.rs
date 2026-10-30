@@ -687,6 +687,10 @@ enum CliCommand {
     )]
     Diagnostics(DiagnosticsArgs),
     #[command(
+        about = "Serve MCP on stdin and stdout so an AI agent on this computer (or over SSH) can operate this data root's running BiBCode server."
+    )]
+    Mcp(McpArgs),
+    #[command(
         about = "Install, remove, or inspect the per-user background service that keeps `bibcode serve` running."
     )]
     Service(ServiceArgs),
@@ -696,6 +700,19 @@ enum CliCommand {
         hide = true
     )]
     OpenUrl { url: String },
+}
+
+/// `bibcode mcp`: the data root and dev state come from the global `--base-dir` and
+/// `--dev-url`.
+#[derive(Clone, Debug, Args)]
+pub struct McpArgs {
+    /// A loopback address that replaces the one in the server's endpoint record.
+    #[arg(long, value_name = "URL")]
+    pub url: Option<Url>,
+    /// A lower limit than Settings → Agents → Agent integrations → Agents may: read-only,
+    /// approval-required, auto-accept-edits or full-access.
+    #[arg(long, value_name = "LEVEL", value_parser = crate::mcp::relay::parse_access)]
+    pub access: Option<crate::mcp::control::McpAccess>,
 }
 
 #[derive(Debug, Args)]
@@ -855,6 +872,8 @@ pub enum CliAction {
         args: DiagnosticsArgs,
         state_dir: PathBuf,
     },
+    /// Relays an agent's MCP to the data root's running server; never starts one.
+    Mcp(crate::mcp::relay::RelayOptions),
 }
 
 #[derive(Clone, Debug)]
@@ -949,6 +968,8 @@ pub enum ConfigError {
     ProfilerCommandIsNotServer,
     #[error("diagnostics commands cannot be converted into a server configuration")]
     DiagnosticsCommandIsNotServer,
+    #[error("mcp cannot be converted into a server configuration")]
+    McpCommandIsNotServer,
     #[error("failed to resolve the current executable for static web discovery")]
     CurrentExecutable(#[source] io::Error),
     #[error(transparent)]
@@ -990,6 +1011,7 @@ impl Cli {
             CliAction::OpenUrl { .. } => Err(ConfigError::OpenUrlCommandIsNotServer),
             CliAction::Profiler { .. } => Err(ConfigError::ProfilerCommandIsNotServer),
             CliAction::Diagnostics { .. } => Err(ConfigError::DiagnosticsCommandIsNotServer),
+            CliAction::Mcp(_) => Err(ConfigError::McpCommandIsNotServer),
         }
     }
 
@@ -1081,6 +1103,13 @@ impl Cli {
                     args: diagnostics,
                     state_dir: profiler_state_dir(args.base_dir, args.dev_url)?,
                 });
+            }
+            Some(CliCommand::Mcp(mcp)) => {
+                return Ok(CliAction::Mcp(relay_options(
+                    args.base_dir,
+                    args.dev_url,
+                    mcp,
+                )?));
             }
             Some(CliCommand::Service(service)) => {
                 return Ok(CliAction::Service(match service.command {
@@ -1206,6 +1235,24 @@ pub(crate) fn profiler_state_dir(
     let mut config = ServerConfig::new(&root.effective);
     config.dev_url = dev_url;
     Ok(config.state_dir())
+}
+
+/// What `mcp` relays to, resolved as every command that reads a data root does: with no
+/// `--base-dir`, `BIBCODE_HOME` or `~/.bibcode`, which is also the desktop's root.
+pub(crate) fn relay_options(
+    base_dir: Option<PathBuf>,
+    dev_url: Option<Url>,
+    mcp: McpArgs,
+) -> Result<crate::mcp::relay::RelayOptions, ConfigError> {
+    let home_dir = dirs::home_dir().ok_or(DataRootError::HomeDirectoryUnavailable)?;
+    let request =
+        select_data_root_request(base_dir, bibcode_env_var("BIBCODE_HOME"), None, home_dir);
+    Ok(crate::mcp::relay::RelayOptions {
+        root: crate::data_root::resolve_data_root(request)?,
+        dev_url,
+        url: mcp.url,
+        access: mcp.access,
+    })
 }
 
 fn select_data_root_request(
