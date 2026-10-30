@@ -432,7 +432,7 @@ const TIMELINE_NATIVE_SCROLL_PENDING_MS = 1_200;
 
 /** The patched LegendList method that withdraws its scroll requests (see the patch). */
 interface CancellableTimelineList {
-  readonly cancelScrollRequests?: () => void;
+  readonly cancelScrollRequests?: (input?: { readonly holdStop?: boolean }) => void;
 }
 
 /**
@@ -3537,8 +3537,12 @@ function ChatViewContent(props: ChatViewProps) {
       releasedTimelineAnchorRef.current;
     // LegendList can hold a scroll ChatView asked for while rows settle, or be about to keep the
     // list at its end after a row grew; either would run over the reader, so withdraw both. The
-    // method changes nothing when neither is under way.
-    (legendListRef.current as CancellableTimelineList | null)?.cancelScrollRequests?.();
+    // method changes nothing when neither is under way. A key's scroll starts only after the
+    // keydown, so until it does, a glide the browser still runs off the page's thread must not
+    // move the content past the stop (#214).
+    (legendListRef.current as CancellableTimelineList | null)?.cancelScrollRequests?.(
+      input === "keyboard" ? { holdStop: true } : undefined,
+    );
     anchorUserScrollGenerationRef.current += 1;
     timelineScrollModeRef.current = "free-scrolling";
     liveFollowUserScrollGenerationRef.current = null;
