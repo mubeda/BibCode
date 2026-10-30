@@ -43,6 +43,10 @@
       "types": "./src/shell.ts",
       "import": "./src/shell.ts"
     },
+    "./launchCommand": {
+      "types": "./src/launchCommand.ts",
+      "import": "./src/launchCommand.ts"
+    },
     "./semver": {
       "types": "./src/semver.ts",
       "import": "./src/semver.ts"
