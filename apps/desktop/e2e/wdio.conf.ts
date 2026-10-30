@@ -144,6 +144,8 @@ export const config = {
   reporters: ["spec"],
   mochaOpts: {
     ui: "bdd",
+    // [DEBUG-k64r]
+    ...(process.env.BIBCODE_E2E_GREP ? { grep: process.env.BIBCODE_E2E_GREP } : {}),
     timeout: 120_000,
   },
   before: async () => {

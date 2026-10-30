@@ -1647,7 +1647,10 @@ describe("packaged Mermaid diagrams", () => {
     await saveEvidence("mermaid-timeline-streaming-follow");
   }).timeout(240_000);
 
-  it("hands the timeline to the reader's keyboard and resumes at the end", async () => {
+  // [DEBUG-k64r] repeat the keyboard case with a varied key delay to raise the repro rate.
+  for (const iteration of [1, 2, 3, 4, 5]) {
+  it(`hands the timeline to the reader's keyboard and resumes at the end #${iteration}`, async () => {
+    (globalThis as { __k64Iteration?: number }).__k64Iteration = iteration;
     await setDesktopUiWindowSize(1_400, 900);
     await openFixtureWorkspace();
     await expectPaintingWebview();
@@ -1879,7 +1882,7 @@ describe("packaged Mermaid diagrams", () => {
       ? await pressNativePageUpDuringGlide(nativePageUpSender)
       : await pressSyntheticPageUp();
     NodeFS.writeFileSync(
-      NodePath.join(preparedArtifactDirectory, "mermaid-timeline-keyboard-key.json"),
+      NodePath.join(preparedArtifactDirectory, `mermaid-timeline-keyboard-key-${iteration}.json`),
       JSON.stringify(pressed, null, 2),
     );
     const keyAt = (await readKeyboardSamples()).keyAt ?? Number.NaN;
@@ -2022,7 +2025,7 @@ describe("packaged Mermaid diagrams", () => {
       (window as unknown as { __bibcodeKeyboardStop?: () => void }).__bibcodeKeyboardStop?.(),
     );
     NodeFS.writeFileSync(
-      NodePath.join(preparedArtifactDirectory, "mermaid-timeline-keyboard-takeover.json"),
+      NodePath.join(preparedArtifactDirectory, `mermaid-timeline-keyboard-takeover-${iteration}.json`),
       JSON.stringify(
         {
           pressed,
@@ -2059,8 +2062,9 @@ describe("packaged Mermaid diagrams", () => {
         endBelow: entry.endBelow,
       }));
     expect(hiddenAfterEnd).toEqual([]);
-    await saveEvidence("mermaid-timeline-keyboard-takeover");
+    await saveEvidence(`mermaid-timeline-keyboard-takeover-${iteration}`);
   }).timeout(240_000);
+  }
 
   it("keeps a reader just above the end in place as the end and the bottom region grow", async () => {
     await setDesktopUiWindowSize(1_400, 900);
@@ -2467,7 +2471,7 @@ async function pressNativePageUpDuringGlide(
                     lineTop: line ? Math.round(line.getBoundingClientRect().top) : null,
                     lineConnected: line?.isConnected ?? false,
                   });
-                  if (trace.frames.length < 16) {
+                  if (trace.frames.length < 40) {
                     requestAnimationFrame(sample);
                   } else {
                     const key = trace.key;
@@ -2534,6 +2538,9 @@ async function pressNativePageUpDuringGlide(
       `The native PageUp could not land during the sent-row glide: ${JSON.stringify(ready)}.`,
     );
   }
+  // [DEBUG-k64r] 0, 40, 80, 120 or 160 ms later than the plain recipe.
+  const iteration = (globalThis as { __k64Iteration?: number }).__k64Iteration ?? 1;
+  await new Promise<void>((resolve) => setTimeout(resolve, (iteration - 1) * 40));
   const sender = await finishSender(true);
   await browser.waitUntil(
     () =>
