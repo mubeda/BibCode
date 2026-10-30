@@ -1813,6 +1813,7 @@ async fn auth_pairing_links_consume_and_revoke_atomically() {
         revoked_at: None,
         reach: None,
         off_host: None,
+        mcp_access: None,
     };
     let later_pairing = AuthPairingLink {
         id: "pairing-b".to_owned(),
@@ -1979,6 +1980,7 @@ async fn pairing_offer_reservation_completion_and_cancellation_are_durable() {
         revoked_at: None,
         reach: Some("another-device".to_owned()),
         off_host: Some(true),
+        mcp_access: None,
     };
     repositories
         .create_auth_pairing_link_with_offer(
@@ -2346,6 +2348,7 @@ fn pairing_offer_link(index: usize) -> AuthPairingLink {
         revoked_at: None,
         reach: Some("another-device".to_owned()),
         off_host: Some(true),
+        mcp_access: None,
     }
 }
 
@@ -2367,6 +2370,7 @@ async fn auth_pairing_reach_round_trips_through_persistence() {
             revoked_at: None,
             reach: Some("another-device".to_owned()),
             off_host: Some(true),
+            mcp_access: None,
         })
         .await
         .expect("pairing insert");
@@ -2388,6 +2392,7 @@ async fn auth_pairing_reach_round_trips_through_persistence() {
             expires_at: FUTURE.to_owned(),
             reach: Some("this-computer".to_owned()),
             off_host: Some(false),
+            mcp_access: None,
             delivery_state: AuthSessionDeliveryState::Active,
         })
         .await
@@ -2413,6 +2418,7 @@ async fn auth_sessions_round_trip_order_connect_and_revoke() {
         expires_at: FUTURE.to_owned(),
         reach: None,
         off_host: None,
+        mcp_access: None,
         delivery_state: AuthSessionDeliveryState::Active,
     };
     let session_b = NewAuthSession {
@@ -2551,6 +2557,7 @@ async fn pending_auth_sessions_confirm_by_id_and_startup_cleanup_is_selective() 
         expires_at: FUTURE.to_owned(),
         reach: Some("another-device".to_owned()),
         off_host: Some(true),
+        mcp_access: None,
         delivery_state,
     };
     repositories

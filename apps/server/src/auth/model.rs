@@ -23,6 +23,10 @@ pub const ALL_SCOPES: &[&str] = &[
     SCOPE_DIAGNOSTICS_READ,
 ];
 
+/// The scopes of an outside agent's MCP credential (#139): never `terminal:operate`,
+/// `access:*` or `relay:*`.
+pub const MCP_CLIENT_SCOPES: &[&str] = &[SCOPE_ORCHESTRATION_READ, SCOPE_ORCHESTRATION_OPERATE];
+
 /// The one scope a diagnostics-only pairing offer grants.
 pub const DIAGNOSTICS_SCOPES: &[&str] = &[SCOPE_DIAGNOSTICS_READ];
 

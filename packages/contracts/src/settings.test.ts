@@ -175,6 +175,20 @@ describe("ServerSettings device previews", () => {
   });
 });
 
+describe("ServerSettings MCP server", () => {
+  it("defaults on and Supervised, and an older document decodes to the defaults", () => {
+    expect(DEFAULT_SERVER_SETTINGS.enableMcpServer).toBe(true);
+    expect(DEFAULT_SERVER_SETTINGS.mcpServerAccess).toBe("approval-required");
+    expect(
+      decodeServerSettingsPatch({ enableMcpServer: false, mcpServerAccess: "read-only" }),
+    ).toEqual({ enableMcpServer: false, mcpServerAccess: "read-only" });
+  });
+
+  it("rejects an unknown access level", () => {
+    expect(() => decodeServerSettingsPatch({ mcpServerAccess: "everything" })).toThrow();
+  });
+});
+
 describe("ServerSettings profiler", () => {
   it("defaults off and patches the toggle", () => {
     expect(decodeServerSettings({}).enableProfiler).toBe(false);

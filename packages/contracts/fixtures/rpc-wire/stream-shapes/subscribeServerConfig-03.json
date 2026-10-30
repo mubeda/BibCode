@@ -13,6 +13,8 @@
           "enableTerminalAgentActivity": false,
           "enableProfiler": false,
           "enableDevicePreviews": false,
+          "enableMcpServer": true,
+          "mcpServerAccess": "approval-required",
           "automaticGitFetchInterval": 180000,
           "defaultThreadEnvMode": "local",
           "newWorktreesStartFromOrigin": false,

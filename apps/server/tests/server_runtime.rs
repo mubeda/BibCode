@@ -1325,6 +1325,7 @@ fn expected_routes() -> Vec<(&'static str, &'static str)> {
         ("GET", "/api/maintenance/update/status"),
         ("POST", "/mcp"),
         ("DELETE", "/mcp"),
+        ("POST", "/mcp/endpoint-proof"),
         ("GET", "*"),
     ]
 }

@@ -300,6 +300,7 @@ impl ServerRuntime {
             None
         };
         let mut relay_token = None;
+        let mut mcp_proof_key = None;
         let (rpc_registry, http_routes, production_runtime) = match custom_registry {
             Some(mut registry) => {
                 crate::auth::register_rpc_handlers(&mut registry, auth.clone());
@@ -397,7 +398,8 @@ impl ServerRuntime {
                         )),
                     )
                     .await
-                    .map_err(|error| ServerError::ProductionInitialize(format!("{error:?}")))?,
+                    .map_err(|error| ServerError::ProductionInitialize(format!("{error:?}")))?
+                    .with_control(runtime.mcp_control()),
                 );
                 runtime.attach_connect_mcp(connect.clone()).await;
                 // The tunnel starts only on a link; a restart brings it back from the stored one.
@@ -435,6 +437,14 @@ impl ServerRuntime {
                         tracing::warn!(%error, "could not create the diagnostics relay token");
                     }
                 }
+                // `bibcode mcp` proves this listener with the per-boot key in the record.
+                match crate::mcp::endpoint::new_proof_key() {
+                    Ok(key) => {
+                        routes.mcp_proof_key = Some(key.clone());
+                        mcp_proof_key = Some(key);
+                    }
+                    Err(error) => tracing::warn!(%error, "could not create the MCP proof key"),
+                }
                 (runtime.registry.clone(), routes, Some(runtime))
             }
         };
@@ -449,6 +459,18 @@ impl ServerRuntime {
             .inspect_err(|error| {
                 tracing::warn!(%error, "could not write the diagnostics relay endpoint file");
             })
+            .ok()
+        });
+        // `bibcode mcp` finds and proves this server through this record (#139). Written by
+        // the runtime-guard owner only, after bind; removed when the server task ends.
+        let mcp_endpoint_record = mcp_proof_key.and_then(|key| {
+            crate::mcp::endpoint::EndpointRecordFile::write(
+                &state_directory,
+                local_addr,
+                &config.boot_id.unwrap_or_default().to_string(),
+                &key,
+            )
+            .inspect_err(|error| tracing::warn!(%error, "could not write the MCP endpoint record"))
             .ok()
         });
         let shutdown = CancellationToken::new();
@@ -509,6 +531,7 @@ impl ServerRuntime {
         let task = tokio::spawn(async move {
             let _log_sink = task_log_sink;
             let _relay_endpoint_file = relay_endpoint_file;
+            let _mcp_endpoint_record = mcp_endpoint_record;
             let result = axum::serve(
                 listener,
                 app.into_make_service_with_connect_info::<http::ConnectionAddrs>(),

@@ -110,6 +110,8 @@ use crate::{
 
 pub struct ProductionRuntime {
     pub registry: RpcRegistry,
+    /// The outside-agent tools on `/mcp` (#139).
+    mcp_control: crate::mcp::control::McpControl,
     attachment_uploads: crate::transfer::staging::UploadRegistry,
     upload_sweeper: crate::transfer::staging::UploadSweepTask,
     pub orchestration: OrchestrationEngine,
@@ -159,6 +161,12 @@ pub fn finalize_rpc_registry(
 impl ProductionRuntime {
     pub async fn attach_connect_mcp(&self, service: Arc<ConnectMcpService>) {
         self.provider_runtime.attach_connect_mcp(service).await;
+    }
+
+    /// The outside-agent MCP tools, for the `/mcp` endpoint.
+    #[must_use]
+    pub fn mcp_control(&self) -> crate::mcp::control::McpControl {
+        self.mcp_control.clone()
     }
 
     /// The committed `enableProfiler`, which drives a desktop host's crash monitor.
@@ -641,7 +649,7 @@ impl ProductionRuntime {
         ));
 
         let mut registry = RpcRegistry::with_trace_diagnostics(trace_diagnostics.clone());
-        crate::auth::register_rpc_handlers(&mut registry, auth);
+        crate::auth::register_rpc_handlers(&mut registry, auth.clone());
         register_activity_rpc(
             &mut registry,
             activity_projections.clone(),
@@ -720,8 +728,15 @@ impl ProductionRuntime {
             ),
         );
         finalize_rpc_registry(&registry, &control)?;
+        let mcp_control = crate::mcp::control::McpControl::new(
+            registry.clone(),
+            auth.clone(),
+            orchestration.clone(),
+            control.mcp_server_signal(),
+        );
 
         Ok(Self {
+            mcp_control,
             registry,
             attachment_uploads,
             upload_sweeper,
@@ -884,6 +899,9 @@ impl ProductionRuntime {
         // as an incomplete shutdown on the next start, not as a crash.
         let profiler = self.profiler.clone();
         let _ = tokio::task::spawn_blocking(move || profiler.begin_stopping()).await;
+        // Outside agents' MCP calls: refused from here on, and every wait in flight ends, long
+        // before the orchestration engine shuts down.
+        self.mcp_control.shutdown();
         // Early, so diagnostics stop sampling before process ownership is frozen and cleaned up.
         self.process_monitor.shutdown().await;
         self.server_control.shutdown_capability_discovery().await;
