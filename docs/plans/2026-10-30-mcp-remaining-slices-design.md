@@ -2944,3 +2944,72 @@ left open.
   fails too, the row stays `running` and every retry answers `unknown`
   (`reason: "restarted"`); rewriting an unowned `running` row no longer turns a storage
   error into `McpStorageError`, since the answer is `unknown` either way.
+
+## A (thread actions: approvals, checkpoint revert, attachments) implementation notes
+
+Slice A was implemented on `claude/v0131-139-a`, from `claude/v0131-139-f0`. The tools stay
+in the threads family (`mcp/tools/threads.rs`); its tests are
+`production/mcp_tools_tests/thread_actions.rs`. Nothing below changes a settled decision.
+
+**Delivered:**
+
+- `answer_approval` (`thread.approval.respond`, `.destroys()`). A question's id, or an
+  approval's id given to `answer_question`, is `McpRequestKindError`, naming the right tool;
+  an id that is not pending is `McpInvalidArgumentError`. `accept` and `acceptForSession`
+  meet the ceiling and pass the thread to `commands()`; `decline` and `cancel` pass `None`.
+- `list_pending_requests` returns each approval with `answerWith: "answer_approval"`, its
+  `kind`, its summary and `decisions` (the contract's four; the UI offers all four for
+  every kind).
+- `revert_thread_to_turn` (`thread.checkpoint.revert`, `.destroys().runs_long()`).
+- `attachments` on `start_thread` and `send_message`, staged through `uploads.begin` and
+  `uploads.append`, which both tools now list among their methods.
+
+**Drift and verified facts:**
+
+- **Revert while a turn runs has no RPC error tag.** The engine accepts
+  `thread.checkpoint.revert` whatever the session does; the effects worker refuses later
+  and appends a `checkpoint.revert.failed` activity ("Interrupt the current turn before
+  reverting checkpoints."). The tool therefore refuses a running turn itself, before any
+  command (`McpTurnRunningError`, the UI's own guard), and refuses a `turnCount` past the
+  latest checkpoint (`McpInvalidArgumentError`).
+- **A revert's outcome is asynchronous**, so "the result names the turn reverted to" needs
+  a wait. The tool subscribes to engine events before dispatching, then reads
+  `orchestration_events` after its dispatch's sequence for `thread.reverted`, a
+  `checkpoint.revert.files-only` activity (`conversationRewound: false`) or a
+  `checkpoint.revert.failed` activity (`McpCheckpointRevertError` with the worker's
+  detail), waking on the thread's events, for at most 30 s. Reading the log, not the live
+  stream, also answers a receipt replay. Past 30 s, cancellation or shutdown it returns
+  `reverted: null` and says the revert is still running.
+- **Upload lifetime.** A staged upload lives in memory for 600 s idle
+  (`UploadLimits::idle`) and is lost on restart. Turn admission binds and retires it, and
+  a replay of an admitted turn never binds again (the receipt skips attachment
+  preparation), so expiry matters only for a stored request never admitted. That dispatch
+  fails with `UploadError` `not_found`, which the tool returns as
+  `McpAttachmentExpiredError` ("send it again without clientRequestId"). Quota and other
+  upload refusals come back as the service's typed `UploadError` with its `reason`.
+- **Images.** PNG, JPEG, GIF and WebP go as `image`; any other `image/*` is refused (the
+  contract forbids it as a `file`); everything else is a `file`.
+- **An accepted answer can still return a provider error.** The engine records the answer
+  (the projection resolves the approval) before routing it to the provider; with no live
+  session the routing error comes back, as it does for the UI and `answer_question`. A
+  retry with the same `clientRequestId` replays the receipt and succeeds without a second
+  answer.
+- **Shared files touched beyond the one-line registration.** The test harness
+  (`mcp_tools_tests/mod.rs`) now builds one `UploadRegistry` and registers `uploads.*` on
+  it beside the orchestration RPC, as production does, so staged ids reach turn admission.
+  The slice-1 test file (`mcp_tools_tests/threads.rs`) changed three assertions and one
+  test name for `McpRequestKindError` and `answerWith`.
+- **Docs.** `docs/user/mcp.md` gained the tool rows; its first sentence and the
+  "Approvals" bullet were false after this slice and now say an agent may answer. Slice Z
+  still owns the rest of "What it can and cannot do": its "Not available" list still names
+  "revert", and the `bibcode-mcp` skill's eval 2 still expects a refusal.
+
+**Choices made while implementing:**
+
+- Attachments are decoded and checked (count, 3 MiB decoded in all, by base64 length
+  first, shape, type) before anything is staged. A staging failure cancels the uploads the
+  call began.
+- The faked provider has no live session, so the approval tests assert what BiBCode
+  records (the projection's status and decision, and one answer event per retry), not a
+  provider resuming. The revert test runs `OrchestrationEffects` over a real Git checkout
+  with checkpoints, so the files are really restored.
