@@ -288,6 +288,13 @@ impl LiveControls {
     }
 }
 
+impl Drop for LiveControls {
+    /// Ends the watcher however the work ended, a dropped call included.
+    fn drop(&mut self) {
+        self.settled.cancel();
+    }
+}
+
 fn is_stream_ended(failure: &Value) -> bool {
     failure["structuredContent"]["error"]["_tag"] == STREAM_ENDED_TAG
 }
