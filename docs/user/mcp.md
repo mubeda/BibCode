@@ -49,7 +49,7 @@ own loopback server. Remote MCP over HTTP is not supported yet.
 | `read_thread`               | The thread's status and a page of messages; long messages and older pages are reachable with `textOffset` and `cursor` |
 | `list_pending_requests`     | Open questions and approvals                                                                                           |
 | `answer_question`           | Answers an open question                                                                                               |
-| `interrupt_turn`            | Stops a running turn                                                                                                   |
+| `interrupt_turn`            | Stops the running turn; when no turn runs it does nothing and says so                                                  |
 | `get_turn_diff`             | One turn's patch, paged                                                                                                |
 | `git_status`                | Branch, ahead/behind and changed files of the thread's folder                                                          |
 

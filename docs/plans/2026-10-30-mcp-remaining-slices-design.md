@@ -695,7 +695,7 @@ changes then move with the code instead of conflicting with it.
   call, `mcp::tools::previews::run(scope, name, arguments, cancellation, invoker, devices)`.
   Provider behavior does not change. The client twins come in slice D.
 - **Migration 59, `McpToolOutcomes`.** `ALTER TABLE mcp_tool_requests ADD COLUMN state TEXT
-NOT NULL DEFAULT 'commands'` and `ADD COLUMN outcome_json TEXT`. Slice-1 rows read as
+  NOT NULL DEFAULT 'commands'` and `ADD COLUMN outcome_json TEXT`. Slice-1 rows read as
   `commands` and keep their receipt replay.
 - **Capability sets contract (C8).**
   - `ServerSettings`/`ServerSettingsPatch` gain `mcpCapabilities` (the five booleans
@@ -1847,7 +1847,7 @@ revision it pins, `98a54789`, file `crates/rmcp/src/transport/auth.rs`; installe
    harness asks for it; a request that includes it anyway is accepted and the scope
    ignored.
 5. **Treats an empty scope request as the default pair** (`orchestration:read
-orchestration:operate`), which is what Codex sends after a refused scope set.
+   orchestration:operate`), which is what Codex sends after a refused scope set.
 6. **Advertises `iss` support and sends `iss`.** Codex then uses `/callback`, and both
    check it.
 7. **Keeps `issuer` stable as the origin**, because Codex binds stored refresh tokens to
@@ -1997,7 +1997,7 @@ route answers 404 when the origin is not eligible.
       `MCP · <client_name> (remote)`, method bearer, and an expiry 30 days after its last
       refresh;
     - the response is `{ access_token, token_type: "Bearer", expires_in: 3600,
-refresh_token, scope }`;
+      refresh_token, scope }`;
     - a second use of a code revokes the session it minted (RFC 6749 §4.1.2).
   - **`refresh_token`**, with `refresh_token`, `client_id` and `resource`, on an eligible
     origin:
@@ -2578,3 +2578,95 @@ One remains:
    next to a registered project (`parentProjectId`). The alternative is a new setting
    listing allowed clone roots, which would let an agent clone into an empty machine.
    Recommended: next to a registered project only, until a person asks for more.
+
+## F0 implementation notes (2026-10-30)
+
+F0 was implemented on `claude/v0131-139-f0`, from `claude/issue-batch-after-v0.13.0` at
+`2c791ec593` (slice 1, the `bibcode thread` CLI and this design). Nothing below changes a
+settled decision; it records drift, the APIs later slices plug into, and choices the design
+left open.
+
+**Drift found:**
+
+- **The log test pins its own path.** `the_log_never_sees_a_prompt_or_a_reply` runs in its
+  own process by test path; after the move it is
+  `production::mcp_tools_tests::threads::the_log_never_sees_a_prompt_or_a_reply`.
+- **Migration tests enumerate ids.** `exposes_all_ordered_migration_metadata`, the
+  legacy-ledger tests and the applied-range assertions list every id up to 58; each now
+  includes 59. Migration 59 adds columns only, so `CORE_TABLES` is unchanged.
+- **Struct literals.** Every `McpServerSettings { enabled, access }` in the tests gained
+  `..McpServerSettings::default()`; `Default` stays "on, Supervised", which the relay's
+  missing-settings path relies on.
+- **Three failure shapes, not two.** Besides `failed` and `action_failed`, both stream
+  handlers send an `Err(Value)` chunk (workspace unavailable); the collector returns it as
+  the typed failure it is.
+- **Provider dispatch reaches `DeviceTools::call`.** It was `pub(super)` in
+  `connect_mcp/device_tools.rs` (slice D's file); F0 widened only that method to
+  `pub(crate)` so `mcp::tools::previews::run` can call it. `device_tools.rs` still imports
+  `snapshot_tool_result` and `tool_failure` through `connect_mcp`, which re-exports them
+  from `previews.rs`.
+- **`SCOPE_TERMINAL_OPERATE`** was not exported from `auth/mod.rs`; F0 exports the existing
+  constant for the relay (and slice T's specs). No scope constant is new.
+- **Outcome rows stay in `mcp/outcome.rs`.** Slice 1 keeps its `mcp_tool_requests` SQL in
+  the tool layer, so the outcome rows do too; `persistence/repositories.rs` is unchanged.
+
+**APIs later slices plug into:**
+
+- **Registering a family.** Add `mcp/tools/<family>.rs` exporting
+  `pub(crate) const FAMILY: Family = Family { tools, text, call }`, one `pub(crate) mod` line
+  in `mcp/tools/mod.rs`, and one line in `control::FAMILIES`. `text(name)` returns
+  `Some((description, input schema))` for each client tool (use `object_schema` and
+  `CLIENT_REQUEST_ID`); `call` returns a boxed future that matches the name.
+- **Specs.** `ToolSpec::client(name, scope, methods)` is a mutating Workspace tool; chain
+  `.reads()` (read-only and idempotent), `.runs_long()`, `.waits()` (wait slot; only for a
+  tool that idles on the engine), `.destroys()` (destructive and audited, never
+  idempotent), `.audit()` (`git_revert_commit`), `.repeats_safely()` (`git_fetch`,
+  `terminal_resize`), `.open_world()` (also long-running), `.in_set(Some(set))`. A
+  provider tool is `ToolSpec::provider(name, scope)`. The family test checks unique names
+  per kind, scope equals each method's `required_scope`, and destructive implies audited.
+- **Targets and paths.** `call.target(thread_id)` returns the thread, its project id and
+  `cwd`; `validate_paths(cwd, paths)` applies C5 (literal paths only, at most 200, no
+  `..`, NUL, absolute path, glob or magic character, no parent that resolves outside
+  `cwd`). A path that is itself a symlink is allowed, because Git tracks the link.
+- **Recorded mutations.** `call.recorded(tool, &payload, move |owned| async move { … })`
+  runs the work under the live controls, at most once with a `clientRequestId`. Inside,
+  `owned.invoke(tag, payload)` and `owned.invoke_stream(tag, payload)` (C3, returns
+  `StreamOutcome { terminal, output, dropped_output, ignored }`) carry the credential and
+  the live token; `owned.cancellation()` is the token for anything else the work starts.
+  Return the finished tool result; a typed failure is stored as `failed`, a stream that
+  ended early and any interruption as `unknown`.
+- **Receipt-backed tools** (worktrees, approvals, checkpoint revert) keep using
+  `call.commands(tool, thread_id, fresh)`. A `commands` row under a recorded tool's key
+  (or the reverse) is `idempotency_conflict`.
+- **Capabilities.** `McpServerSettings.capabilities` (`McpCapabilities`) is live through
+  the settings watch; `McpCapability::{key,label}` name a set. The relay's
+  `extra_scopes(settings, access)` decides `terminal:operate` at mint.
+
+**Choices made while implementing:**
+
+- **Unkeyed mutations** run inline under the live controls plus the call's cancellation,
+  and take no owned slot: they cannot outlive their call, so the per-call admission
+  bounds them. Interrupted, they return `McpOutcomeUnknownError` without a row.
+- **A capability turned off mid-call does not interrupt work in flight.** C4 lists only
+  the off switch, read-only, revocation and shutdown; the next call is refused.
+- **Interrupted work gets 10 s** to notice its token before it is dropped; either way it
+  is `unknown`, and the slot and claim are released only after the outcome is written.
+- **Stream budget.** `invoke_local_stream` takes a budget; owned work uses 30 minutes, and
+  a stream past it is `McpStreamEndedError` (`reason: "budget"`), so `unknown`.
+- **A `running` row found while this process holds the key's claim** has no owner, so it
+  is rewritten as `unknown` (`reason: "restarted"`) and every retry gets the same answer.
+- **The issuer** refuses any extra scope other than `terminal:operate`. The relay asks for
+  it when `mcpCapabilities.terminals` is on and the lower of `--access` and
+  `mcpServerAccess`, read again at mint, is `full-access`.
+- **`interrupt_turn` with a named turn** that is not running also dispatches nothing. Its
+  result always carries `turnRunning`. The harness has no live provider session, so the
+  running case is proven by the engine's refusal naming `thread.turn.interrupt`.
+- **The wait-slot test** uses a test family through `McpControl::call_in`: three
+  long-running tools and four waits in flight are admitted, a fifth wait is busy, and a
+  fourth long-running call is still admitted. `git_push` and `device_open` client tools
+  do not exist yet.
+- **The capability test** uses `sourceControl` and `workspace`, because the X5 `files`
+  tools do not exist yet.
+- **No Settings UI.** `mcpCapabilities` has no switch until slice T; until then
+  `McpCapabilityDisabledError` can only follow a hand-edited settings file, and its message
+  already names the section where T puts the switches.
