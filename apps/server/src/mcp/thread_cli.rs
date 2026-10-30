@@ -18,8 +18,9 @@ use tokio_util::sync::CancellationToken;
 use super::relay::{Connection, RelayOptions};
 
 /// The credential's row in Authorized clients. Every run of the CLI mints a credential of its
-/// own, so the server keeps the `clientRequestId`s of all of them in one scope.
-pub(crate) const LABEL: &str = "MCP · bibcode thread";
+/// own, so the server keeps the `clientRequestId`s of all of them in one scope. The relay labels
+/// every agent `MCP · <name>`, so no agent can take this label and join that scope.
+pub(crate) const LABEL: &str = "CLI · bibcode thread";
 /// One `wait_for_thread` call under `--wait`; a slice that times out is followed by another.
 pub(crate) const WAIT_SLICE_MS: u64 = 30_000;
 const STOPPED_WAITING: &str =

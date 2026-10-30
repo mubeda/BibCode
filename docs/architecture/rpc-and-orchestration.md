@@ -3304,7 +3304,7 @@ failure, and a stream that closes first (or is cancelled, or passes its budget) 
   argument digest). Every call with that key dispatches the stored payloads, so
   command admission replays them by receipt state; other arguments under the same
   key get `idempotency_conflict`. Rows older than 24 h are pruned on insert. The
-  credentials labelled `MCP · bibcode thread` share one scope instead of a session
+  credentials labelled `CLI · bibcode thread` share one scope instead of a session
   each, because every CLI run mints its own; the scope is resolved from
   `auth_sessions.client_label` in the same SQLite job.
 - **Recorded outcomes.** A tool whose RPC has no command receipt (Git and pull

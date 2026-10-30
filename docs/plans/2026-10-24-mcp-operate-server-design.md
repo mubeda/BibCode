@@ -1355,7 +1355,7 @@ added project paging to `list_projects_and_threads`.
   (a) key every `mcp-client` credential together, which would make two agents that number
   their requests `1, 2, ...` collide for 24 hours; (b) keep one CLI credential across runs,
   which the revoke-on-exit rule forbids and which leaves a long-lived secret; (c) key the
-  rows of credentials labelled `MCP · bibcode thread` together and every other credential by
+  rows of credentials labelled `CLI · bibcode thread` together and every other credential by
   its session. (c) is implemented, inside the one SQLite job that stores or reads the row
   (`stored_request`), with no schema change. The trade-off: every `bibcode thread` run on a
   data root shares one retry namespace, which is the same operator and the same trust
@@ -1370,7 +1370,7 @@ added project paging to `list_projects_and_threads`.
   starves. `list` follows both cursors, and `start .` the project cursor with `limit: 1`,
   at most 50 pages, with a clear error beyond. `list --json` is one merged page: nothing
   cut, no `truncated`, both cursors null.
-- **Credential label** is `MCP · bibcode thread`. The access ceiling is the environment's
+- **Credential label** is `CLI · bibcode thread`. The access ceiling is the environment's
   `mcpServerAccess`; the CLI has no `--access` or `--url`.
 - **Desktop.** `desktop_dispatch` takes `thread` next to `mcp` and `diagnostics`, after
   `crash::attach()`, and always attaches the parent console, because its output is for a
