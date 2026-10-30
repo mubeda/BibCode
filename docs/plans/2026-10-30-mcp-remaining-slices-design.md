@@ -1,9 +1,40 @@
 # MCP for Outside Agents: Remaining Slices
 
-Status: Revised — pending Codex re-review. Issue #139. Extends the approved slice-1 design
+Status: Revision 3. Slices X2, X5, X6, X8 and R are revised and pending Codex re-review;
+every other slice is approved (2026-10-30). Each slice carries its own status line.
+Issue #139. Extends the approved slice-1 design
 (`docs/plans/2026-10-24-mcp-operate-server-design.md`, "slice 1" below) and does not
 replace it. Verified at `ba143353d4` (`origin/claude/issue-batch-after-v0.13.0`, draft
 PR #213). Line references are to that commit.
+
+## Revision 3 (2026-10-30)
+
+This revision answers the Codex re-review of Revision 2. It changes only X2, X5, X6, X8
+and R, and the file ownership rows they need; F0 and the other slices are approved and
+unchanged. Every finding was checked against the source at `ba143353d4` before it was
+accepted. None was refuted.
+
+| #   | Finding                                                                                                                                                                          | Resolution                                                                                                                                                                                                                                                                                                                                                                 |
+| --- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| P1  | X5: a transfer URL is trusted on its signed token alone (`production/transfer_routes.rs:155`), so it outlives Stop, revocation, read-only and MCP off                            | **Accepted (X5).** An MCP-minted token names its session. The route checks that session and the live controls when the transfer starts, runs it under C4's cancellation token, and checks again just before the upload's final rename. An ended access removes the partial file and answers as an expired token. UI tokens are unchanged ([X5](#slice-x5-workspace-files)) |
+| P2  | X2: `redact_sensitive_text` blanks credentials only (`diagnostics/trace.rs:474`, `:527`), and provider output lines are logged verbatim (`production/provider_runtime.rs:19265`) | **Accepted (X2).** `get_server_logs` is dropped. Process and trace tools return an allowlisted projection, never a command line, `cause` or message text. Content is kept out by projection, not by redaction ([X2](#slice-x2-diagnostics-tools))                                                                                                                          |
+| P2  | X6: a detached clone keeps running after the call (`production/clone_operations.rs:5-6`, `:288`), and nothing owns the later `project.create`                                    | **Accepted (X6).** The clone and its registration run as one C4 owned mutation, under the live controls. The recorded request, with its frozen `projectId` and `commandId`, is the durable registration intent ([X6](#slice-x6-clone))                                                                                                                                     |
+| P2  | X6: an operate client can make the server clone from loopback or private hosts (`git/repository.rs:7376`)                                                                        | **Accepted (X6).** Public hosts only, checked after Git's own URL rewriting, with the HTTPS address pinned and redirects refused. The UI's clone is unchanged ([X6](#slice-x6-clone))                                                                                                                                                                                      |
+| P2  | R: returning the new pair to a replay of the old refresh token within 60 seconds hides a theft                                                                                   | **Accepted (R).** A refresh token works once. A second use is refused and revokes the grant. The 60-second grace is gone: Codex serializes its refreshes across processes and rereads the stored token under a lock, so it never replays one ([R](#slice-r-remote-streamable-http-with-mcp-oauth))                                                                         |
+| P2  | X8: `profiler.finding` has no catch-up path, since `changes_since` reads only events and activity rows                                                                           | **Accepted (X8).** A finding payload carries the finding's id, count and `lastSeen`, and a receiver catches up with X2's `profiler_findings { since }`, which is inclusive. X3 is unchanged ([X8](#slice-x8-outbound-webhooks-and-the-agent-integrations-tabs))                                                                                                            |
+
+**Also changed:**
+
+- **Question 8 is resolved:** an agent clones only next to a registered project, with no
+  new allow-list setting.
+- Lines outside the five slices that the fixes made stale are corrected: X2's summary in
+  [In scope](#in-scope) (no server logs), the Profiler table's "log tools", the "Refresh
+  races" risk, Question 8, and one new
+  [Could not verify](#could-not-verify) entry (Claude Code refreshing from two processes).
+- The wave order is unchanged. Only file ownership grows: X5 adds `production/runtime.rs`
+  and an accessor in `mcp/outcome.rs`, and X6 adds `git/repository.rs` and
+  `production/git_vcs.rs`, each after its earlier owner (see
+  [Shared files](#shared-files-and-their-owners-in-order)).
 
 ## Revision 2 (2026-10-30)
 
@@ -88,7 +119,7 @@ What protection remains is set out honestly in [Safety model](#c6-safety-model-f
 | **T**    | Terminal tools under `terminal:operate`                                                                                                                                                   |
 | **D**    | Device and browser preview tools for outside agents                                                                                                                                       |
 | **X1**   | Actor attribution: who acted, on events, messages and threads; the agent activity log, indicator, **Stop** and **Take over**                                                              |
-| **X2**   | Diagnostics tools: profiler, environment report, processes, traces, server logs                                                                                                           |
+| **X2**   | Diagnostics tools: profiler, environment report, processes, traces (projected)                                                                                                            |
 | **X3**   | `server_capabilities` and the `changes_since` feed                                                                                                                                        |
 | **X4**   | Chat panels, `send_panel_message`, and the advisory `focus_ui` intent                                                                                                                     |
 | **X5**   | Workspace file tools: list, read, search, write, create, rename, delete, download, upload                                                                                                 |
@@ -670,6 +701,8 @@ their calls fail typed.
 
 ## Slice F0: Foundation
 
+Status: Approved 2026-10-30 (user pre-approval; reviewed by Codex and advisor).
+
 **Owns:** C1 to C5 and C8, migration 59, the live controls for owned mutations, and the
 slice-1 `interrupt_turn` fix.
 
@@ -773,6 +806,8 @@ changes then move with the code instead of conflicting with it.
 
 ## Slice A: Thread tools (approvals, checkpoint revert, attachments)
 
+Status: Approved 2026-10-30 (user pre-approval; reviewed by Codex and advisor).
+
 ### Approvals
 
 **Alternatives:**
@@ -866,6 +901,8 @@ are never logged.
 
 ## Slice W: Worktree tools
 
+Status: Approved 2026-10-30 (user pre-approval; reviewed by Codex and advisor).
+
 **Alternatives:** expose `worktree.adopt`, `retarget` and `updateDiscoveryPolicy` too.
 They are not requested; they remain RPC-only.
 
@@ -917,6 +954,8 @@ Notes:
 - with a Supervised ceiling, `create_worktree runtimeMode: full-access` is refused.
 
 ## Slice G: Git write tools
+
+Status: Approved 2026-10-30 (user pre-approval; reviewed by Codex and advisor).
 
 Every tool here takes `threadId` (C5), and the server adds `cwd` and `projectId`. Retries
 use recorded outcomes (C4). Push, fetch and pull are marked `long_running: true`, because they
@@ -1018,6 +1057,8 @@ layer. `mcp.git_push`, `mcp.git_force_push`, `mcp.git_fetch` and `mcp.git_pull` 
 
 ## Slice P: Pull request tools
 
+Status: Approved 2026-10-30 (user pre-approval; reviewed by Codex and advisor).
+
 | Tool                  | Arguments                                                                                             | Maps to                                                        | Hints                       |
 | --------------------- | ----------------------------------------------------------------------------------------------------- | -------------------------------------------------------------- | --------------------------- |
 | `list_pull_requests`  | `threadId`, `state` (`open`), `cursor?`                                                               | `pullRequests.list`                                            | read-only, open world       |
@@ -1063,6 +1104,8 @@ again.
   typed error, not an empty list.
 
 ## Slice T: Terminals
+
+Status: Approved 2026-10-30 (user pre-approval; reviewed by Codex and advisor).
 
 **What this grants.** A terminal runs any command as the server's user. This is a wider
 grant than every tool above, and terminal output is a second channel for injected
@@ -1180,6 +1223,8 @@ T also owns the MCP tab's copy changes (UI review below).
 
 ## Slice D: Device and browser previews for outside agents
 
+Status: Approved 2026-10-30 (user pre-approval; reviewed by Codex and advisor).
+
 **Alternatives:**
 
 - Proxy an outside agent through a provider credential. That confuses the two
@@ -1238,6 +1283,8 @@ slices above, and the facts it rests on are in [Current behavior](#current-behav
 Every tool takes ids, plus workspace-relative paths only where C5 allows them.
 
 ## Slice X1: Actor attribution and agent activity
+
+Status: Approved 2026-10-30 (user pre-approval; reviewed by Codex and advisor).
 
 Agent actions now look like a person's (C6), so this slice comes in the second wave.
 
@@ -1334,6 +1381,8 @@ fingerprints.
 
 ## Slice X2: Diagnostics tools
 
+Status: Revised (Revision 3) — pending Codex re-review.
+
 **Current behavior.** The profiler's tools exist only on the stdio `bibcode profiler mcp`
 server, as private pure functions over a disk `Reader`. The diagnostics RPCs are unary
 reads, except `server.refreshProviders` (operate). `getProcessDiagnostics` returns raw
@@ -1348,50 +1397,64 @@ above).
   `diagnostics` capability set, scope `orchestration:read` (as `server.getProfilerStatus`
   is, `auth/scope.rs:68`).
 
-| Tool                   | Arguments                                                                 | Maps to                                                                                    | Hints                 |
-| ---------------------- | ------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ | --------------------- |
-| `profiler_status`      | —                                                                         | the stdio handler, in-process over the server's own profiler `Reader`, in `spawn_blocking` | read-only, idempotent |
-| `profiler_findings`    | `since?`, `kind?`, `limit?`                                               | the same                                                                                   | read-only, idempotent |
-| `profiler_events`      | `since?`, `kind?`, `limit?`                                               | the same                                                                                   | read-only, idempotent |
-| `profiler_crash`       | `id`                                                                      | the same, with local symbols only                                                          | read-only, idempotent |
-| `diagnose_environment` | —                                                                         | `server.getConfig` (projected), `server.discoverSourceControl`, `server.getProfilerStatus` | read-only, idempotent |
-| `refresh_providers`    | —                                                                         | `server.refreshProviders` (operate)                                                        | idempotent            |
-| `process_diagnostics`  | `historyWindowMs?`, `bucketMs?`                                           | `server.getProcessDiagnostics`, `server.getProcessResourceHistory`                         | read-only, idempotent |
-| `trace_diagnostics`    | `limit?`                                                                  | `server.getTraceDiagnostics`                                                               | read-only, idempotent |
-| `get_server_logs`      | `file` (`server` or `trace`), `tail?` (200 lines), `cursor?`, `contains?` | a new paged reader over `server.log` and its backups, or `server.trace.ndjson`             | read-only, idempotent |
+| Tool                   | Arguments                       | Maps to                                                                                    | Hints                 |
+| ---------------------- | ------------------------------- | ------------------------------------------------------------------------------------------ | --------------------- |
+| `profiler_status`      | —                               | the stdio handler, in-process over the server's own profiler `Reader`, in `spawn_blocking` | read-only, idempotent |
+| `profiler_findings`    | `since?`, `kind?`, `limit?`     | the same                                                                                   | read-only, idempotent |
+| `profiler_events`      | `since?`, `kind?`, `limit?`     | the same                                                                                   | read-only, idempotent |
+| `profiler_crash`       | `id`                            | the same, with local symbols only                                                          | read-only, idempotent |
+| `diagnose_environment` | —                               | `server.getConfig` (projected), `server.discoverSourceControl`, `server.getProfilerStatus` | read-only, idempotent |
+| `refresh_providers`    | —                               | `server.refreshProviders` (operate)                                                        | idempotent            |
+| `process_diagnostics`  | `historyWindowMs?`, `bucketMs?` | `server.getProcessDiagnostics`, `server.getProcessResourceHistory` (projected)             | read-only, idempotent |
+| `trace_diagnostics`    | `limit?`                        | `server.getTraceDiagnostics` (projected)                                                   | read-only, idempotent |
 
 Decisions:
 
 - **`profiler_symbolicate` stays on stdio.** Its `symbolsDir` is an arbitrary host path,
   and `download` fetches symbols for minutes from GitHub (`diagnostics/profiler/mcp.rs:254`).
-- **`diagnose_environment` projects.** It returns the environment descriptor's version
-  and capability flags, each provider's install, auth and version state, and config
-  issues. It never returns paths, settings, `mcpLaunch` or the auth descriptor.
-- **Redaction.** Command lines and log lines go through `redact_sensitive_text`
-  (`diagnostics/trace.rs:474`) and the profiler's home-to-`~` rule
-  (`diagnostics/profiler/redact.rs`).
-- **`get_server_logs`.** Pages of at most 16,000 characters; the cursor is opaque (file,
-  rotation generation, byte offset); a cursor into a rotated-away file reports
-  `dropped: true`; `contains` is a plain substring of at most 100 characters, not a
-  regex; one call scans at most 1 MiB.
+- **Every tool returns an allowlisted projection (review, Revision 3).** A secret-pattern
+  redactor cannot keep content out: `redact_sensitive_text` blanks only the tail after a
+  credential marker (`diagnostics/trace.rs:527`), and the server logs provider output
+  lines verbatim (`production/provider_runtime.rs:19265`). So the tools build their output
+  from named fields and drop everything else:
+  - **`diagnose_environment`** returns the environment descriptor's version and
+    capability flags, each provider's install, auth and version state, and config issue
+    codes. It never returns paths, settings, `mcpLaunch` or the auth descriptor.
+  - **`process_diagnostics`** returns, per process, `pid`, `ppid`, `depth`, `status`,
+    `elapsed`, the CPU and memory samples, and BiBCode's attribution `scope`, `kind` and
+    `confidence`, plus the totals and buckets. It never returns `command` or the
+    attribution `label`, a registrant's free text (wire shapes:
+    `production/server_terminal.rs:1789`, `:1865`).
+  - **`trace_diagnostics`** returns span names, counts, durations, failure and
+    interruption counts, and the log level counts. It never returns a failure's `cause`,
+    a log entry's `message`, or a file path (`diagnostics/trace.rs:310-395`); a `cause`
+    holds up to 8,192 characters of arbitrary error text (`:465-471`).
+  - **The profiler tools** return the profiler's own records, as the stdio server does.
+    Those are content-free by the profiler's rules (AGENTS.md: never record prompt,
+    message or terminal content), with paths through `diagnostics/profiler/redact.rs`.
+- **No server log tool.** `server.log` is a plain-text `fmt` layer (`logging.rs:1561`),
+  so its lines have no fields to allowlist, and filtering text would only redact. An
+  agent diagnoses through findings, events, crashes, processes and traces; a person still
+  reads the logs and downloads the bundle in the UI. A structured warning feed from a
+  `tracing` layer is a possible follow-up, not part of X2.
 - **`export_diagnostic_bundle` is not offered.** It is an in-memory 20 MiB archive built
   for a person (`diagnostic_bundle.rs`), the zip route refuses an `mcp-client` bearer
-  (audience rule), crash dumps are binary, and the tools above return the same content in
-  pages an agent can read. A person still downloads the bundle in the UI.
+  (audience rule), it holds the raw logs, and crash dumps are binary.
 
-**Trust boundaries.** All output is untrusted and redacted. Prompt and message text never
-appears, as the profiler's own rules already guarantee.
+**Trust boundaries.** All output is untrusted. Content is kept out by projection, not by
+redaction: no prompt, message, tool output, command line or log text reaches an agent.
 
 **Profiler.** `mcp.refresh_providers` is long-running through its method
 (`latency.rs:156`); the others do bounded disk or memory reads.
 
 **Tests (fail first):** each profiler tool over `/mcp` matches the stdio result on a
-fixture store; a bearer token in a log line comes back `[REDACTED]`; a home path comes
-back as `~`; a cursor survives a page boundary and reports `dropped` after rotation; a
-1 MiB scan cap holds; `diagnose_environment` contains no path; with `diagnostics` off the
-tools are hidden.
+fixture store; a process whose command line holds a marker string, and a trace failure
+whose `cause` holds it, never return the marker; `diagnose_environment` contains no path;
+with `diagnostics` off the tools are hidden.
 
 ## Slice X3: `server_capabilities` and `changes_since`
+
+Status: Approved 2026-10-30 (user pre-approval; reviewed by Codex and advisor).
 
 **`server_capabilities`** (no capability set; read-only, idempotent) returns:
 
@@ -1446,6 +1509,8 @@ filters; the scan cap returns progress; an old cursor reports `activityDropped`.
 
 ## Slice X4: Chat panels, panel messages, and UI intents
 
+Status: Approved 2026-10-30 (user pre-approval; reviewed by Codex and advisor).
+
 | Tool                 | Arguments                                                                                                         | Maps to                                                      | Hints     |
 | -------------------- | ----------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------ | --------- |
 | `create_chat_panel`  | `hostThreadId`, `title?`, `providerInstanceId?`, `model?`, `runtimeMode?`, `purpose?`, `clientRequestId?`         | `worktree.createPanel` (receipt)                             | —         |
@@ -1497,6 +1562,8 @@ client, moves nothing, and expires after 60 seconds; 17 pending intents are refu
 
 ## Slice X5: Workspace files
 
+Status: Revised (Revision 3) — pending Codex re-review.
+
 All tools take `threadId`; the server resolves `cwd` (C5). Capability set `files`.
 
 | Tool             | Arguments                                                        | Maps to                                                                             | Hints                       |
@@ -1539,7 +1606,33 @@ All tools take `threadId`; the server resolves `cwd` (C5). Capability set `files
   - Chunked transfers through MCP remain a follow-up if an agent has MCP but no other
     path to the host.
   - The URL is a short-lived capability in the agent's context. It reaches one file or
-    one directory target, for 5 minutes.
+    one directory target, for 5 minutes, and only while the agent's access lasts (below).
+- **An MCP-minted transfer ends with the agent's access (review P1, Revision 3).** Today
+  the route trusts the signed token alone (`production/transfer_routes.rs:155`), so a
+  URL would outlive **Stop**, revocation, read-only and the off switch. X5 binds it to
+  the live controls F0 already defines (C4):
+  - **The token names its session.** `TransferClaims::Upload` and `Download` gain an
+    optional `mcp_session_id`, inside the signed claims, so it cannot be added or changed.
+    The UI's tokens leave it out and behave exactly as today.
+  - **The route checks access when the transfer starts.** For a token with a session, the
+    session must be live (not revoked, so not stopped), `enableMcpServer` on, and the
+    `files` capability on; an upload also needs a mutating ceiling, so read-only and
+    **Take over** refuse it. A failed check answers like an expired token (404), so the
+    route still confirms nothing about the path.
+  - **The transfer runs under C4's cancellation token** for that session, built by an
+    accessor on F0's live-control builder (`mcp/outcome.rs`). It fires on shutdown, on
+    the settings watch (MCP off or `files` off; read-only and **Take over** fire it for
+    uploads only), and on revocation through `mark_connected_guard`. A transfer takes no
+    owned-mutation slot.
+  - **An upload is checked again before its final rename.** `write_upload` streams into
+    a partial file and renames it last (`transfer/upload.rs:221`). It selects on the
+    token while it reads the body, and checks it once more just before the rename. A
+    fired token removes the partial file and answers 404, so the target is never
+    created or overwritten after access ends. A download's body stream ends when the
+    token fires.
+  - The one remaining window is between that last check and the rename, a single local
+    system call. A transfer finished in that window writes its activity row like any
+    other, so it is attributed.
 - **Activity.** Every mutating call, and each MCP-minted transfer when the route finishes
   it, writes an activity row (X1), so the change shows who made it.
 
@@ -1548,52 +1641,132 @@ with a stale `expectedVersion` is refused; `createOnly` on an existing file is r
 `files_delete` trashes and `permanent: true` removes; a symlink escape is refused for
 every tool; an upload URL minted without `overwrite` refuses `?overwrite=1`; a download
 URL from a relay call uses the bound address; with `files` off the tools are hidden. (R
-tests that a remote OAuth call gets its own origin.)
+tests that a remote OAuth call gets its own origin.) For live access: an MCP-minted URL
+used after revocation, after the off switch, or after `files` is turned off answers 404,
+and an upload URL also does after read-only; revoking during an upload leaves neither
+the target nor a partial file; a download stream stops on revocation; a UI-minted token
+is unaffected by every switch.
 
 ## Slice X6: Clone
 
-| Tool               | Arguments                                                                                       | Maps to                                                                 | Hints      |
-| ------------------ | ----------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------- | ---------- |
-| `clone_repository` | `url`, `parentProjectId`, `directoryName?`, `addAsProject` (true), `title?`, `clientRequestId?` | `vcs.clone` with `detach: true`, then `project.create` (receipt)        | open world |
-| `clone_status`     | `cloneId`                                                                                       | the clone registry's live or kept outcome (`clone_operations.rs:34-41`) | read-only  |
-| `cancel_clone`     | `cloneId`                                                                                       | `vcs.cancelClone`                                                       | —          |
+Status: Revised (Revision 3) — pending Codex re-review.
 
-**Where a clone may go.** The extended scope says `parentPath` is "limited to the roots
-allowed in settings", but no such setting exists (`production/host_paths.rs:24`).
+| Tool               | Arguments                                                                                       | Maps to                                                                         | Hints      |
+| ------------------ | ----------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- | ---------- |
+| `clone_repository` | `url`, `parentProjectId`, `directoryName?`, `addAsProject` (true), `title?`, `clientRequestId?` | one owned mutation: `vcs.clone` (not detached), then `project.create` (receipt) | open world |
+| `clone_status`     | `cloneId`                                                                                       | the clone's recorded outcome row (C4)                                           | read-only  |
+| `cancel_clone`     | `cloneId`                                                                                       | cancels that owned mutation                                                     | —          |
+
+**Where a clone may go (Question 8, resolved 2026-10-30).** The extended scope says
+`parentPath` is "limited to the roots allowed in settings", but no such setting exists
+(`production/host_paths.rs:24`).
 
 - **Chosen:** `parentProjectId`. The clone goes next to that registered project, in its
   workspace root's parent. This keeps "ids, never paths", and puts the clone where the
   person already keeps projects.
-- An absolute `parentPath` is not accepted. A settings allowlist of clone roots would
-  allow other places; see Question 8.
+- An absolute `parentPath` is not accepted, and no allow-list setting of clone roots is
+  added.
 
-**Behavior:**
+**One owner for clone and registration (review P2, Revision 3).** A detached clone keeps
+running after its caller leaves (`production/clone_operations.rs:5-6`, `:288`), and
+nothing would own the later `project.create`. So the whole tool call is one C4 owned
+mutation:
 
-- `url` must be `https://` or SSH form, with no user information (no `user:token@`),
-  so a credential never sits in tool arguments. It is never logged.
-- `detach: true` keeps the clone running when the MCP call ends
-  (`clone_operations.rs:286`). The call waits up to 50 seconds, then returns
-  `{ state: "running", cloneId }`; `clone_status` reads it later. `cloneId` names the
-  destination.
-- On success with `addAsProject`, the tool dispatches `project.create` with a frozen
-  `commandId` and `projectId`, as the web does after a clone
-  (`useAddProjectWorkflow.ts:715-750`).
-- Retries: the clone step uses a recorded outcome (C4); a second call for the same
-  destination joins the live clone (`clone_operations.rs:1-11`).
+- **Always owned.** `clone_repository` always runs as an owned mutation, with or without
+  a `clientRequestId`; without one the server mints the key. `cloneId` is that key. The
+  recorded request, with the URL's destination and a frozen `projectId` and `commandId`,
+  is the durable registration intent. The clone holds one owned-mutation slot (2 per
+  session, 8 per environment) until it settles.
+- **The task, not the call, runs both steps.** The owned task calls `vcs.clone` with
+  `detach: false`, so the clone runtime cancels a clone this task started when the task
+  leaves, and leaves alone a clone it only joined, such as one a person started in the
+  UI. On success with `addAsProject`, the same task dispatches `project.create` with the
+  frozen ids, as the web does after a clone (`useAddProjectWorkflow.ts:715-750`). A
+  refusal because the root is already registered (`engine.rs:3958`) is returned as that
+  project, so a retry never creates a second one. Then it writes the outcome.
+- **The call waits up to 50 seconds,** then returns `{ state: "running", cloneId }`;
+  `clone_status` reads the outcome row later, across reconnects.
+- **Live controls.** The task runs under C4's token: the off switch, read-only,
+  revocation, **Stop**, **Take over** and shutdown cancel the clone, and the clone
+  runtime removes the folder it created. `cancel_clone` cancels the same token. A clone
+  stopped before Git finished records `unknown` with the reason, as C4 does for any
+  interruption, because Git may have finished at the same instant. Once Git has
+  finished, registration is local and bounded, and it completes like C4's handler-owned
+  steps.
+- **Restart.** A row still `running` after a restart returns `McpOutcomeUnknownError`
+  (C4). A retry with a new `clientRequestId` is safe: the runtime returns a finished
+  clone of the same URL as `Existing` instead of cloning again, and registration then
+  finds or creates the project.
 - Progress for other clients comes from the activity row (X1) and then `project.created`.
 
+**Which hosts an agent may clone from (review P2, Revision 3).** Without a policy, an
+operate client could make the server reach loopback or private hosts that the client
+itself cannot reach. **Chosen: public hosts only, for any clone an `mcp-client` principal
+starts.** `vcs.clone` and `sourceControl.cloneRepository` read the principal from their
+context (`register_unary_with_context`, as `orchestration.dispatchCommand` does), so an
+agent cannot avoid the policy by calling the RPC directly; a person's clone in the UI is
+unchanged. A new `git/clone_policy.rs` checks, and `ReservedClone::transfer`
+(`git/repository.rs:7376`) applies what it decides:
+
+- **Shape.** The URL must be `https://` or SSH form, with no user information (no
+  `user:token@`), so a credential never sits in tool arguments. It is never logged.
+- **Git's own rewrites first.** `git ls-remote --get-url <url>` expands
+  `url.<base>.insteadOf` without contacting the remote (git-ls-remote(1)). The expanded
+  URL must still be `https` or SSH, and the host checks below apply to it. Git applies
+  the same rewrite again when it clones, so the checked host is the one it contacts.
+- **Allowed protocols.** The clone runs with `-c protocol.allow=never`,
+  `-c protocol.https.allow=always` and `-c protocol.ssh.allow=always`. Git applies this
+  policy to the rewritten URL too (git-config(1), `url.<base>.insteadOf`), so a rewrite to
+  `file:` or `ext::` fails.
+- **HTTPS: resolved, checked, pinned.** The host is resolved once. Every address must be
+  public: loopback, private, link-local, CGNAT (`100.64.0.0/10`), unique-local,
+  multicast and unspecified addresses are refused, including IPv4-mapped forms, the same
+  list X8 uses. The clone then runs with `-c http.curloptResolve=<host>:<port>:<address>`,
+  so Git connects to the checked address and DNS rebinding cannot move it, and with
+  `-c http.followRedirects=false`, so a redirect cannot take it to another host. A
+  repository that moved and now redirects fails with a typed error naming the redirect,
+  and the agent retries with the new URL.
+- **SSH: checked, guarded by the host key.** `ssh -G <host>` gives the effective
+  `hostname` and `port` after the person's SSH config. The clone is refused when that
+  config sets `ProxyCommand` or `ProxyJump`, when `core.sshCommand`, `GIT_SSH` or
+  `GIT_SSH_COMMAND` replaces `ssh` (BiBCode cannot see where those connect), or when
+  `StrictHostKeyChecking` is `no` or `accept-new`. The hostname must resolve to public
+  addresses only. SSH resolves the name again itself, so the address is not pinned;
+  rebinding is caught instead by the host key check, which compares the key with the one
+  known for that hostname, and with `yes` or `ask` (the default) a non-interactive clone
+  never accepts an unknown key.
+- **Refusal.** A refused host returns `clone_host_refused`: "BiBCode does not clone from
+  local or private network addresses for an agent. Clone it in BiBCode yourself." No
+  setting widens this.
+- **Versions.** `http.curloptResolve` needs Git 2.37 or later. Git ignores an unknown
+  `-c` key, so an older Git would silently skip the pin; X6 refuses an HTTPS agent clone
+  on an older Git with a typed error naming the version.
+
 **Trust boundaries.** Clone runs Git against an outside URL; hooks do not run on clone.
-The destination is always a sibling of a registered project.
+The destination is always a sibling of a registered project, and the source is a public
+host. A configured HTTP proxy resolves the name itself, so behind a proxy the check
+covers the local answer only; this is a stated residual risk.
 
-**Profiler.** No new process path: clone runs through the existing supervised repository
-layer. `mcp.clone_repository` is long-running through `vcs.clone`, and holds no wait slot.
+**Profiler.** No new process path: `git ls-remote --get-url`, `ssh -G` and the clone run
+through the existing supervised repository layer, each bounded by a timeout.
+`mcp.clone_repository` is long-running through `vcs.clone`, and holds no wait slot.
 
-**Tests (fail first):** a clone from a local bare repository next to a project registers
-it; a URL with user information is refused; an existing destination is refused; a call
-past 50 seconds returns `running` and `clone_status` later returns the project; cancel
-stops it; a keyed retry creates one project.
+**Tests (fail first):** with a test-only policy that admits the fixture, a clone from a local
+bare repository next to a project registers it; a URL with user information is
+refused; an existing destination is refused; a call past 50 seconds returns `running`
+and `clone_status` later returns the project; `cancel_clone`, revocation and the off
+switch each stop a clone the agent started and remove its folder, and leave a clone a
+person started running; a keyed retry creates one project; a retry after a restart
+registers the finished clone without cloning again. For hosts: `https://127.0.0.1/`,
+`https://10.0.0.1/`, a name resolving to `::1`, an `insteadOf` rewrite from a public URL
+to a private one, a rewrite to `file://`, and a redirect are each refused; an SSH host
+whose config sets `ProxyJump` or `StrictHostKeyChecking accept-new` is refused; the
+pinned address is the one Git connects to; a person's UI clone of a private host still
+works.
 
 ## Slice X7: Source Control reads and the commit message suggestion
+
+Status: Approved 2026-10-30 (user pre-approval; reviewed by Codex and advisor).
 
 **Reads** (capability `sourceControl`, read-only, idempotent):
 
@@ -1633,6 +1806,8 @@ opened after the suggestion still receives it.
 
 ## Slice X8: Outbound webhooks and the Agent integrations tabs
 
+Status: Revised (Revision 3) — pending Codex re-review.
+
 **Current behavior.** No webhook code exists. `reqwest` and `hmac` are dependencies, and
 `SecretStore` keeps 0600 plaintext files (see "Webhooks" above).
 
@@ -1664,18 +1839,38 @@ state to change) and `diagnostics.bundle_ready` (bundles are built on request, n
 the background).
 
 **Payload.** `{ id, type, occurredAt, environmentId, threadId?, worktreeId?, actor?,
-cursor }`, where `cursor` is X3's. No prompt, message, file, diff, token or secret; any
-text field goes through `redact_sensitive_text`.
+cursor?, finding? }`. Every event from X3's two sources carries `cursor`, X3's.
+`profiler.finding` carries `finding: { id, count, lastSeen }` instead, because findings
+are not in X3's feed. No prompt, message, file, diff, token or secret; any text field
+goes through `redact_sensitive_text`.
+
+**Gap recovery (review P2, Revision 3).** Every event type has a durable catch-up read,
+and X3 is unchanged:
+
+- **Events and activity:** `changes_since { cursor }` (X3), with the last `cursor` the
+  receiver processed.
+- **Findings:** X2's `profiler_findings { since }`, with the `lastSeen` of the last
+  finding the receiver processed. `since` is inclusive ("at or after",
+  `diagnostics/profiler/reader.rs:162-178`), so a finding seen in the same second is not
+  missed; the receiver drops repeats by `id` and `count`. The findings book keeps at most
+  1,000 findings, and one call returns up to 10,000, so one call covers a gap.
+- `profiler.finding` is offered only while the `diagnostics` capability set is on, so its
+  recovery tool always exists. The receiver guide names each recovery read.
+- **Alternative not taken:** a third component in X3's cursor for findings. That changes
+  an approved slice for one event type, and findings have no sequence: they are a
+  compacted book keyed by id, rewritten in place (`diagnostics/profiler/findings.rs:139-153`).
 
 **Delivery.**
 
 - **Source.** A `WebhookDispatcher` service follows three durable sources, each from a
-  stored position: the event sequence and the activity ids (X3's two), and the newest
-  profiler finding it has seen. It never uses the in-process broadcast, which drops events
-  under load (`engine.rs:2013`).
+  stored position: the event sequence and the activity ids (X3's two), and, for
+  findings, the `lastSeen`, `id` and `count` it last delivered. A finding is delivered
+  when it appears or its count rises, as `Reader::follow_findings` reports
+  (`reader.rs:322`). It never uses the in-process broadcast, which drops events under
+  load (`engine.rs:2013`).
 - **Queue.** `webhook_deliveries` rows are durable, so a restart resumes them. At most
   10,000 are pending; past that the oldest are abandoned with a warning, and a receiver
-  recovers through `changes_since`.
+  recovers through the reads above.
 - **Request.** HTTPS only, or loopback `http` with a per-endpoint opt-in. Headers:
   `X-BibCode-Event`, `X-BibCode-Delivery`, `X-BibCode-Timestamp`, and
   `X-BibCode-Signature: v1=<hex HMAC-SHA256(secret, timestamp + "." + body)>`. A 10-second
@@ -1721,9 +1916,13 @@ positions).
 schedule on 500 and stop on 400; the queue resumes after a restart; a private address is
 refused; a payload contains no message text; disabling an endpoint stops its delivery;
 revoking a paired client disables its endpoints; a receiver that drops every second
-delivery still sees every transition through `changes_since`.
+delivery still sees every transition through `changes_since`, and every finding through
+`profiler_findings { since }`, including two findings recorded in the same second; with
+`diagnostics` off no `profiler.finding` is delivered.
 
 ## Slice R: Remote Streamable HTTP with MCP OAuth
+
+Status: Revised (Revision 3) — pending Codex re-review.
 
 R lands last among the code slices. It inherits F0's `production/connect_mcp.rs` and the
 `bibcode thread` CLI's `lib.rs` and `config.rs` edits, which land on the batch branch
@@ -2005,13 +2204,22 @@ route answers 404 when the origin is not eligible.
       and its client and resource the grant's; it is marked used, and a new access token
       and refresh token are returned; the session's expiry moves to 30 days from now;
     - `scope`, if sent, may only narrow the grant; it never widens it;
-    - **reuse:** a refresh token used again more than 60 seconds after its rotation
-      revokes the whole grant (RFC 9700 §4.14.2);
-    - **a race inside 60 seconds** gets the **same** new pair the first refresh returned.
-      Both harnesses treat `invalid_grant` as "sign in again", so refusing the loser would
-      still break it. The rotation result is kept in memory only, keyed by the old token's
-      hash, for 60 seconds; after a restart the loser gets `invalid_grant` and
-      reauthorizes, which is rare;
+    - **reuse (review P2, Revision 3):** a refresh token works once. Any second use, at
+      any time, is refused with `invalid_grant` and revokes the whole grant, so both
+      the thief and the agent must sign in again and the theft is visible (RFC 9700
+      §4.14.2). There is no grace window and no cached rotation result: returning the new
+      pair to a replay would hand a thief the grant undetected. Sender-constrained tokens
+      (DPoP) would make a grace window safe, but Codex's MCP client has no DPoP code
+      (`rmcp-client` and `codex-mcp` at rust-v0.165.0), so there is nothing to bind to;
+    - **why strict reuse does not break the harnesses:** Codex serializes every refresh
+      across processes with a file lock, and rereads the stored credential under that
+      lock before refreshing, so a second process adopts the winner's rotated token and
+      never replays the old one (`rmcp-client/src/oauth/refresh_lock.rs:1-5`,
+      `refresh_transaction.rs:104-130`). Claude Code's docs say it refreshes
+      automatically; whether two of its processes can refresh one token at once could
+      not be verified. If they do, the result is a **Re-authenticate** prompt, never
+      access for anyone else. A response lost after the server rotated has the same
+      result;
     - refresh still works while `enableMcpServer` is off, so turning MCP back on does not
       force every agent to reauthorize; `/mcp` refuses their calls meanwhile.
   - **Access tokens** are `SessionClaims` with `exp` one hour out (`auth/token.rs:73-85`),
@@ -2116,7 +2324,8 @@ Registration and authorization are open, so they must not let one caller lock ou
   page's poll continues afterwards.
 - Codes and refresh tokens are single-use under one SQLite transaction. Two exchanges of
   one code race, and the second loses and revokes. Two refreshes of one token race, and
-  the second gets the same new pair (inside 60 seconds).
+  the second loses and revokes the grant; nothing about a rotation is kept in memory, so
+  a restart changes nothing.
 - With `enableMcpServer` off, the authorize page says the MCP server is off, the token
   endpoint refuses `authorization_code`, refresh still works, and `/mcp` answers
   `McpServerDisabledError`. Sessions are kept.
@@ -2187,8 +2396,9 @@ The number is assigned in the [migration summary](#persistence-and-migration-sum
     is refused.
 - **Refresh.**
   - A refresh returns a new pair, and the old refresh token then fails.
-  - The old token used again after 60 seconds revokes the grant; within 60 seconds it gets
-    the same new pair as the first refresh, and the grant lives.
+  - The old token used again, at once or later, gets `invalid_grant` and revokes the
+    grant, so the new access and refresh tokens fail too; two concurrent refreshes of one
+    token leave one success, then a revoked grant.
   - A remote OAuth call's `files_download` URL uses the session's origin (X5's base).
   - A refresh asking for `terminal:operate` that was not granted is refused.
   - An access token past `exp` gets 401 at `/mcp`, and a refresh restores access.
@@ -2293,15 +2503,15 @@ routes (R).
 
 ## Profiler, crash, and trace coverage
 
-| Item                  | Coverage                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Child processes       | None new. Git runs through the repository layer, terminals through the terminal runtime, and devices through `DeviceManager`, each already supervised and attributed.                                                                                                                                                                                                                                                                                                                                                                                            |
-| RPC methods           | B1 and `invoke_local_stream` keep the registry's admission. X2's profiler and log tools read in process and take no RPC admission; they are still timed as `mcp.<tool>`. Every tool is timed as `mcp.<tool>`, and `is_long_running` derives from `ToolSpec` (network tools are `long_running: true`). The F0 test iterates every family. New methods (X1, X4, X8) register through the `rpc/session.rs` wrappers; `webhooks.sendTest` and `webhooks.redeliver` join `is_long_running`. The new HTTP routes are not RPC; they log failures with `tracing::warn!`. |
-| Worktree removal      | Both modes reach the handlers that call `record_removal_outcome`. A test asserts one event per real removal and none per replay. No new removal path.                                                                                                                                                                                                                                                                                                                                                                                                            |
-| Binaries and re-exec  | `mcp authorize` is dispatched after `crash::attach()` in both `main.rs` files, under the existing `mcp` branch.                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| Shutdown              | Owned mutations and terminal-read waits stop at `McpControl::shutdown`, which already runs right after `profiler.begin_stopping()` and before orchestration and profiler teardown. The webhook dispatcher (X8) is a new service and stops in the same place, before the profiler's teardown.                                                                                                                                                                                                                                                                     |
-| Events, logs, records | One `info` line per destructive call (C7). No prompt, message, commit message, PR body, path, terminal content or webhook URL, and nothing new in fingerprints. Activity rows (X1) and webhook payloads (X8) hold ids and counts only.                                                                                                                                                                                                                                                                                                                           |
-| Documentation         | The new `mcp.*` names, and the note that `mcp.<tool>` timing covers them, go in `docs/skills/bibcode-profiler/references/` and the Profiler section of `overview.md` (slice Z).                                                                                                                                                                                                                                                                                                                                                                                  |
+| Item                  | Coverage                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Child processes       | None new. Git runs through the repository layer, terminals through the terminal runtime, and devices through `DeviceManager`, each already supervised and attributed.                                                                                                                                                                                                                                                                                                                                                                                    |
+| RPC methods           | B1 and `invoke_local_stream` keep the registry's admission. X2's profiler tools read in process and take no RPC admission; they are still timed as `mcp.<tool>`. Every tool is timed as `mcp.<tool>`, and `is_long_running` derives from `ToolSpec` (network tools are `long_running: true`). The F0 test iterates every family. New methods (X1, X4, X8) register through the `rpc/session.rs` wrappers; `webhooks.sendTest` and `webhooks.redeliver` join `is_long_running`. The new HTTP routes are not RPC; they log failures with `tracing::warn!`. |
+| Worktree removal      | Both modes reach the handlers that call `record_removal_outcome`. A test asserts one event per real removal and none per replay. No new removal path.                                                                                                                                                                                                                                                                                                                                                                                                    |
+| Binaries and re-exec  | `mcp authorize` is dispatched after `crash::attach()` in both `main.rs` files, under the existing `mcp` branch.                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| Shutdown              | Owned mutations and terminal-read waits stop at `McpControl::shutdown`, which already runs right after `profiler.begin_stopping()` and before orchestration and profiler teardown. The webhook dispatcher (X8) is a new service and stops in the same place, before the profiler's teardown.                                                                                                                                                                                                                                                             |
+| Events, logs, records | One `info` line per destructive call (C7). No prompt, message, commit message, PR body, path, terminal content or webhook URL, and nothing new in fingerprints. Activity rows (X1) and webhook payloads (X8) hold ids and counts only.                                                                                                                                                                                                                                                                                                                   |
+| Documentation         | The new `mcp.*` names, and the note that `mcp.<tool>` timing covers them, go in `docs/skills/bibcode-profiler/references/` and the Profiler section of `overview.md` (slice Z).                                                                                                                                                                                                                                                                                                                                                                          |
 
 ## UI review (UI.md)
 
@@ -2456,11 +2666,11 @@ shared file has one owner per wave, listed below.
 | X1    | `orchestration/engine.rs` (actor in planning), its projector, `production/orchestration_rpc.rs`, `production/worktree_catalog_rpc.rs` (actor pass-through), `persistence/migrations.rs` (60), `persistence/repositories.rs` (projection columns, activity rows), new `mcp/activity.rs`, `mcp/control.rs` (one activity hook), `mcp/tools/threads.rs` and `worktrees.rs` (`purpose`), `auth/http.rs` and `auth/service.rs` (`mcp-access` route), `rpc/methods.rs` and `auth/scope.rs` (one stream), `packages/contracts/src/orchestration.ts` and a new activity contract, the client-runtime stream, `MessagesTimeline.tsx`, the thread list chip, the header indicator, the Source Control commit-row chip, new `McpAgentsPanel.tsx`                                                                                               |
 | T     | new `mcp/tools/terminals.rs`, `terminal/history.rs`, `terminal/manager.rs`, new `mcp_tools_tests/terminals.rs`, `AgentIntegrationsSection.tsx` and its test (capability switches and MCP-tab copy; owner in W2; X1 adds one mount line after it)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | D     | `mcp/tools/previews.rs` (client twins), `production/connect_mcp/device_tools.rs` only for a `pub(crate)` accessor, new `mcp_tools_tests/previews.rs`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| X2    | new `mcp/tools/diagnostics.rs`, `diagnostics/profiler/mcp.rs` (handlers `pub(crate)`), new `diagnostics/log_reader.rs`, new `mcp_tools_tests/diagnostics.rs`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| X2    | new `mcp/tools/diagnostics.rs` (tools and projections), `diagnostics/profiler/mcp.rs` (handlers `pub(crate)`), new `mcp_tools_tests/diagnostics.rs`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | X3    | new `mcp/tools/feed.rs`, `persistence/repositories.rs` (the transition read; owner in W3), new `mcp_tools_tests/feed.rs`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | X4    | new `mcp/tools/panels.rs`, new `production/ui_intents_rpc.rs`, `rpc/methods.rs` and `auth/scope.rs` (owner in W3), a new intents contract, the web intent toast, the provenance label in `MessagesTimeline.tsx`, new `mcp_tools_tests/panels.rs`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
-| X5    | new `mcp/tools/files.rs`, `workspace/rpc.rs` and `workspace/service.rs` (`toTrash`), `transfer/mod.rs`, `transfer/upload.rs`, `production/transfer_routes.rs` (bound `overwrite`, activity rows), `packages/contracts/src/project.ts`, new `mcp_tools_tests/files.rs`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
-| X6    | new `mcp/tools/clone.rs`, `production/clone_operations.rs` (a `pub(crate)` status accessor only), new `mcp_tools_tests/clone.rs`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| X5    | new `mcp/tools/files.rs`, `workspace/rpc.rs` and `workspace/service.rs` (`toTrash`), `transfer/mod.rs` (session claim), `transfer/upload.rs` (cancellation before the rename), `production/transfer_routes.rs` (bound `overwrite`, live access check, activity rows), `production/runtime.rs` (handler wiring), `mcp/outcome.rs` (a live-token accessor only), `packages/contracts/src/project.ts`, new `mcp_tools_tests/files.rs`                                                                                                                                                                                                                                                                                                                                                                                                  |
+| X6    | new `mcp/tools/clone.rs`, new `git/clone_policy.rs`, `git/repository.rs` (policy arguments in `ReservedClone::transfer`), `production/clone_operations.rs` (the policy on `CloneRequest`), `production/git_vcs.rs` (the principal on `vcs.clone` and `sourceControl.cloneRepository`), new `mcp_tools_tests/clone.rs`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 | X7    | `mcp/tools/git.rs` (reads, commit message tools), `production/ui_intents_rpc.rs` (the `commitMessage` kind), the Source Control panel and `sourceControlPanelStore.ts`, new `mcp_tools_tests/git_reads.rs`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | X8    | new `webhooks/` module (store, dispatcher, delivery, signing), `persistence/migrations.rs` (61) and `repositories.rs`, `rpc/methods.rs`, `auth/scope.rs`, `diagnostics/profiler/latency.rs` (owner in W4), the runtime's quiesce sequence, `packages/contracts/src/settings.ts` (`enableWebhooks`) and a new webhooks contract, `AgentIntegrationsSection.tsx` (tabs and status line; owner in W4), new `WebhooksTab.tsx`, `docs/user/webhooks.md`                                                                                                                                                                                                                                                                                                                                                                                  |
 | R     | `http.rs` (forwarded-header rule), `auth/http.rs`, `auth/service.rs` (authorization-code and refresh grants, audience), new `auth/oauth.rs`, new `auth/consent_page.rs`, `production/http_routes.rs` (routes, `ROUTE_INVENTORY`), `production/connect_mcp.rs` (401 challenge, audience), `production/connect_mcp/tests.rs`, `persistence/migrations.rs` (62), `persistence/repositories.rs` (OAuth rows), `lib.rs` and `config.rs` (`mcp authorize`), `apps/desktop/src-tauri/src/main.rs` (only if dispatch needs it), `packages/contracts/src/auth.ts`, new `McpRemoteAgentsPanel.tsx` and its test, the toast hook, one mount line in `AgentIntegrationsSection.tsx`, one line in `mcp/tools/files.rs` (the remote transfer base), `docs/architecture/remote.md`, `docs/cloud/environment-auth.md`, `docs/user/remote-access.md` |
@@ -2479,6 +2689,10 @@ shared file has one owner per wave, listed below.
 - **`auth/http.rs`, `auth/service.rs`:** F0 (issuer only), X1 (`mcp-access`), R.
 - **`production/connect_mcp.rs`:** F0, then R.
 - **`mcp/tools/files.rs`:** X5, then R's one line for the remote transfer base.
+- **`mcp/outcome.rs`:** F0, then X5's live-token accessor (W3).
+- **`production/runtime.rs`:** X5's transfer handler wiring (W3), then X8's quiesce step
+  (W4) if it lands there.
+- **`git/repository.rs`, `production/git_vcs.rs`:** G (W1), then X6 (W3).
 - **`production/ui_intents_rpc.rs`:** X4, then X7.
 - **`AgentIntegrationsSection.tsx`:** T (W2, X1's mount line after it), X8 (W4), R's
   mount line (W5).
@@ -2527,9 +2741,10 @@ Manual smoke tests:
   recipe is unaffected; the runbook and `remote.md` say so.
 - **Tunnel source keys** (R). Through the managed tunnel, a flood can delay tunnel
   authorizations; it cannot grant access or block other paths.
-- **Refresh races.** Inside 60 seconds a reused refresh token gets the same new pair (R),
-  so a harness that reconnects twice keeps working; the cost is a 60-second window in
-  which a stolen, just-rotated token is replayed rather than detected.
+- **Strict refresh reuse** (R). Any second use of a refresh token revokes the grant. A
+  harness that refreshes one token twice, or loses a refresh response, must sign in
+  again. Codex serializes its refreshes; Claude Code's behavior with two processes is
+  unverified.
 - **The upload lifetime** shorter than the retry window (slice A). This is a typed error,
   not a lost attachment.
 - **Cached tool lists.** As slice 1 notes, a harness that cached its list keeps showing
@@ -2561,6 +2776,9 @@ Manual smoke tests:
   `destructiveHint` tools (its docs describe only the retry and parallel behaviors of the
   other hints). C2 does not depend on it.
 - **The relay's mapping of a refused credential** to a typed tool result (X3 checks it).
+- **Claude Code refreshing one token from two processes** (R). Its docs do not say
+  whether it serializes refreshes as Codex does. If it does not, strict reuse shows a
+  **Re-authenticate** prompt; it never grants access.
 - **The input shapes of `gitManager.getDiff`, `getCommits`, `getRefs` and `getStashes`**
   (X7).
 
@@ -2572,12 +2790,10 @@ Code's refresh, step-up and redirect behavior (from its docs).
 ## Questions for approval
 
 Questions 1 to 7 of the first draft are answered (see [Revision 2](#revision-2-2026-10-30)).
-One remains:
+Question 8 is answered too (see [Revision 3](#revision-3-2026-10-30)), so none remains:
 
-8. **Where may an agent clone?** No setting limits clone destinations today. X6 clones only
-   next to a registered project (`parentProjectId`). The alternative is a new setting
-   listing allowed clone roots, which would let an agent clone into an empty machine.
-   Recommended: next to a registered project only, until a person asks for more.
+8. **Where may an agent clone?** Resolved 2026-10-30: only next to a registered project
+   (`parentProjectId`), with no new allow-list setting of clone roots.
 
 ## F0 implementation notes (2026-10-30)
 
