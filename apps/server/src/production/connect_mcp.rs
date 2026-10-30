@@ -22,6 +22,7 @@ use crate::{
     mcp::{
         control::{ClientPrincipal, McpControl, PROVIDER_SCOPES, PrincipalKind, authorize_call},
         protocol::{self, Incoming},
+        tools::previews::{snapshot_tool_result, tool_failure},
     },
     preview::{OpenRequestError, PreviewManager},
 };
@@ -180,6 +181,18 @@ impl PreviewInvoker {
                 Box::pin(invoke(scope, operation, input, tab_id, cancellation))
             },
         ))
+    }
+
+    /// Runs one preview operation for the thread `scope` names.
+    pub(crate) async fn invoke(
+        &self,
+        scope: PreviewScope,
+        operation: String,
+        input: Value,
+        tab_id: Option<String>,
+        cancellation: CancellationToken,
+    ) -> Result<Value, String> {
+        (self.0)(scope, operation, input, tab_id, cancellation).await
     }
 }
 
@@ -1182,56 +1195,19 @@ impl ConnectMcpService {
             .and_then(|value| value.get("name"))
             .and_then(Value::as_str)
             .unwrap_or_default();
-        if let Some(operation) = name.strip_prefix("device_") {
-            let arguments = params
-                .and_then(|value| value.get("arguments"))
-                .cloned()
-                .unwrap_or_else(|| json!({}));
-            // A valid MCP credential is the operate grant here, as for `preview_*`: see
-            // `DeviceTools`.
-            return match &self.devices {
-                Some(devices) => {
-                    devices
-                        .call(&scope, operation, arguments, cancellation)
-                        .await
-                }
-                None => tool_failure("McpUnknownToolError", "Unknown tool."),
-            };
-        }
-        let Some(operation) = name.strip_prefix("preview_") else {
-            return tool_failure("McpUnknownToolError", "Unknown preview tool.");
-        };
-        if !TOOL_OPERATIONS.contains(&operation) {
-            return tool_failure("McpUnknownToolError", "Unknown preview tool.");
-        }
-        let mut arguments = params
+        let arguments = params
             .and_then(|value| value.get("arguments"))
             .cloned()
             .unwrap_or_else(|| json!({}));
-        let tab_id = arguments
-            .get("tabId")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        if let Some(object) = arguments.as_object_mut() {
-            object.remove("tabId");
-        }
-        match (self.preview.0)(
+        crate::mcp::tools::previews::run(
             scope,
-            operation_wire_name(operation).into(),
+            name,
             arguments,
-            tab_id,
             cancellation,
+            &self.preview,
+            self.devices.as_ref(),
         )
         .await
-        {
-            Ok(value) if operation == "snapshot" => snapshot_tool_result(value),
-            Ok(value) => json!({
-                "isError":false,
-                "structuredContent":value,
-                "content":[{"type":"text","text":value.to_string()}]
-            }),
-            Err(message) => tool_failure("PreviewAutomationExecutionError", &message),
-        }
     }
 
     async fn read_secret(&self, name: &'static str) -> Result<Option<String>, ConnectMcpError> {
@@ -1959,103 +1935,12 @@ fn progress_stream(
 fn sse_frame(message: &Value) -> Vec<u8> {
     format!("event: message\ndata: {message}\n\n").into_bytes()
 }
-fn tool_failure(tag: &str, message: &str) -> Value {
-    json!({
-        "isError":true,
-        "structuredContent":{"error":{"_tag":tag,"message":message}},
-        "content":[{"type":"text","text":message}]
-    })
-}
-
-fn snapshot_tool_result(mut value: Value) -> Value {
-    let screenshot = value
-        .as_object_mut()
-        .and_then(|object| object.remove("screenshot"));
-    let Some(screenshot) = screenshot else {
-        return tool_failure(
-            "PreviewAutomationMalformedResponseError",
-            "Preview snapshot response did not include a screenshot.",
-        );
-    };
-    let data = screenshot
-        .get("data")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let mime_type = screenshot
-        .get("mimeType")
-        .and_then(Value::as_str)
-        .unwrap_or("image/png");
-    let metadata = json!({
-        "mimeType": mime_type,
-        "width": screenshot.get("width").cloned().unwrap_or(Value::Null),
-        "height": screenshot.get("height").cloned().unwrap_or(Value::Null)
-    });
-    if let Some(object) = value.as_object_mut() {
-        object.insert("screenshot".into(), metadata);
-    }
-    json!({
-        "isError":false,
-        "structuredContent":value,
-        "content":[
-            {"type":"text","text":value.to_string()},
-            {"type":"image","data":data,"mimeType":mime_type}
-        ]
-    })
-}
-
-const TOOL_OPERATIONS: &[&str] = &[
-    "status",
-    "open",
-    "navigate",
-    "resize",
-    "snapshot",
-    "click",
-    "type",
-    "press",
-    "scroll",
-    "evaluate",
-    "wait_for",
-    "recording_start",
-    "recording_stop",
-];
-
-fn operation_wire_name(operation: &str) -> &str {
-    match operation {
-        "wait_for" => "waitFor",
-        "recording_start" => "recordingStart",
-        "recording_stop" => "recordingStop",
-        other => other,
-    }
-}
-
 fn tool_descriptors(devices_enabled: bool) -> Vec<Value> {
-    let mut tools = preview_tool_descriptors();
+    let mut tools = crate::mcp::tools::previews::preview_tool_descriptors();
     if devices_enabled {
         tools.extend(device_tool_descriptors());
     }
     tools
-}
-
-fn preview_tool_descriptors() -> Vec<Value> {
-    TOOL_OPERATIONS
-        .iter()
-        .map(|operation| {
-            let name = format!("preview_{operation}");
-            let read_only = matches!(*operation, "status" | "snapshot" | "wait_for");
-            json!({
-                "name":name,
-                "description":format!("Control the collaborative browser preview ({operation})."),
-                "inputSchema":{"type":"object","additionalProperties":true},
-                "annotations":{
-                    "title":format!("Preview {operation}"),
-                    "readOnlyHint":read_only,
-                    "destructiveHint":!read_only,
-                    "idempotentHint":read_only,
-                    "openWorldHint":true
-                }
-            })
-        })
-        .collect()
 }
 
 #[cfg(test)]

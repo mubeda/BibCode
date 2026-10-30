@@ -2905,12 +2905,31 @@ pub(crate) async fn issue_offline_share_pairing(
 /// directly against a data root's repositories, like `issue_administrative_pairing_link`. It
 /// never holds more than `orchestration:read orchestration:operate`, so a stolen link cannot be
 /// widened at exchange; its subject is `mcp-client`, which binds the session to `/mcp`; and it
-/// carries the access ceiling `access` into the session. It lives 60 s.
+/// carries the access ceiling `access` into the session. It lives 60 s. `extra_scopes` may
+/// add `terminal:operate` and nothing else: the relay asks for it when terminals are on for MCP
+/// agents and the ceiling is full access.
 pub(crate) async fn issue_mcp_pairing_link(
     repositories: &Repositories,
     label: String,
     access: &str,
+    extra_scopes: &[&str],
 ) -> Result<PairingCredentialResult, AuthError> {
+    if let Some(scope) = extra_scopes
+        .iter()
+        .find(|scope| **scope != super::model::SCOPE_TERMINAL_OPERATE)
+    {
+        return Err(AuthError::Internal(format!(
+            "an MCP credential cannot carry {scope}"
+        )));
+    }
+    let mut scopes = owned_scopes(super::model::MCP_CLIENT_SCOPES);
+    scopes.extend(
+        extra_scopes
+            .iter()
+            .map(|scope| (*scope).to_owned())
+            .filter(|scope| !scopes.contains(scope))
+            .collect::<Vec<_>>(),
+    );
     let now = now_ms();
     let active = repositories
         .list_active_auth_pairing_links(format_iso(now))
@@ -2924,7 +2943,7 @@ pub(crate) async fn issue_mcp_pairing_link(
     let record = PairingRecord {
         id: Uuid::new_v4().to_string(),
         credential: generate_pairing_credential()?,
-        scopes: owned_scopes(super::model::MCP_CLIENT_SCOPES),
+        scopes,
         subject: MCP_CLIENT_SUBJECT.to_owned(),
         label: Some(label.clone()),
         proof_key_thumbprint: None,
@@ -3111,12 +3130,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_mcp_issuer_adds_only_the_terminal_scope() {
+        let (service, repositories, _secrets) = mcp_test_service().await;
+        let issued = issue_mcp_pairing_link(
+            &repositories,
+            "MCP · terminals".into(),
+            "full-access",
+            &["terminal:operate"],
+        )
+        .await
+        .expect("link issues");
+        let session = service
+            .exchange_bootstrap(
+                &issued.credential,
+                None,
+                ClientMetadata::default(),
+                None,
+                SessionTransport::Plain,
+            )
+            .await
+            .expect("exchange");
+        assert_eq!(
+            session.principal.scopes,
+            owned_scopes(&[
+                "orchestration:read",
+                "orchestration:operate",
+                "terminal:operate"
+            ])
+        );
+        for scope in ["access:write", "relay:write", "orchestration:operate"] {
+            assert!(
+                issue_mcp_pairing_link(&repositories, "MCP".into(), "full-access", &[scope])
+                    .await
+                    .is_err(),
+                "{scope}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn the_mcp_issuer_mints_two_scopes_bound_to_mcp_with_its_ceiling() {
         let (service, repositories, _secrets) = mcp_test_service().await;
         let issued = issue_mcp_pairing_link(
             &repositories,
             "MCP · Claude Code".into(),
             "approval-required",
+            &[],
         )
         .await
         .expect("link issues");
@@ -3143,9 +3202,10 @@ mod tests {
             .await;
         assert!(matches!(widened, Err(AuthError::ScopeNotGranted)));
 
-        let issued = issue_mcp_pairing_link(&repositories, "MCP · Claude Code".into(), "read-only")
-            .await
-            .expect("link issues");
+        let issued =
+            issue_mcp_pairing_link(&repositories, "MCP · Claude Code".into(), "read-only", &[])
+                .await
+                .expect("link issues");
         let session = service
             .exchange_bootstrap(
                 &issued.credential,

@@ -19,11 +19,9 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    control::{
-        DISABLED_MESSAGE, DISABLED_TAG, MESSAGE_TEXT_CHARS, McpServerSettings, ProgressSink,
-        ToolCall, derive_status,
-    },
+    control::{DISABLED_MESSAGE, DISABLED_TAG, McpServerSettings, ProgressSink, ToolCall},
     protocol::{tool_result, typed_tool_failure},
+    tools::threads::{MESSAGE_TEXT_CHARS, derive_status},
 };
 use crate::persistence::Repositories;
 

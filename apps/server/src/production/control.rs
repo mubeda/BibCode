@@ -666,6 +666,7 @@ impl NativeServerControl {
                 tracing::info!(
                     enabled = next_mcp_server.enabled,
                     access = next_mcp_server.access.as_str(),
+                    capabilities = ?next_mcp_server.capabilities,
                     "MCP server setting changed"
                 );
                 *current = next_mcp_server;
@@ -2032,6 +2033,14 @@ fn validate_settings_document(settings: &Value) -> Result<(), String> {
                 .to_owned(),
         );
     }
+    if let Some(capabilities) = object.get("mcpCapabilities") {
+        let capabilities = capabilities
+            .as_object()
+            .ok_or_else(|| "mcpCapabilities must be an object".to_owned())?;
+        for capability in crate::mcp::control::McpCapability::ALL {
+            validate_optional_bool(capabilities, capability.key())?;
+        }
+    }
     validate_optional_bool(object, "newWorktreesStartFromOrigin")?;
     validate_optional_string(object, "worktreeBaseDirectory")?;
     validate_optional_string(object, "addProjectBaseDirectory")?;
@@ -2446,6 +2455,13 @@ fn apply_settings_defaults(settings: &mut Value) {
             "enableTerminalAgentActivity": false,
             "enableMcpServer": true,
             "mcpServerAccess": "approval-required",
+            "mcpCapabilities": {
+                "workspace": true,
+                "sourceControl": true,
+                "files": true,
+                "diagnostics": true,
+                "terminals": false,
+            },
             "automaticGitFetchInterval": 180_000,
             "defaultThreadEnvMode": "local",
             "newWorktreesStartFromOrigin": false,
@@ -5057,6 +5073,45 @@ mod tests {
         let committed = *signal.borrow();
         assert!(!committed.enabled);
         assert_eq!(committed.access, crate::mcp::control::McpAccess::ReadOnly);
+    }
+
+    #[tokio::test]
+    async fn mcp_capabilities_default_validate_and_patch_one_set_at_a_time() {
+        let temp = tempfile::tempdir().expect("state");
+        let config = ServerConfig::new(temp.path());
+        hermetic_providers::write_hermetic_settings(&config.state_dir(), json!({}));
+        let control = NativeServerControl::new(config, json!({"policy":"test"})).await;
+        let mut signal = control.mcp_server_signal();
+        assert_eq!(
+            signal.borrow().capabilities,
+            crate::mcp::control::McpCapabilities::default()
+        );
+        for invalid in [
+            json!({"mcpCapabilities": true}),
+            json!({"mcpCapabilities": {"terminals": "yes"}}),
+        ] {
+            assert!(validate_settings_document(&invalid).is_err(), "{invalid}");
+        }
+        let updated = control
+            .update_settings(json!({"patch":{"mcpCapabilities":{"terminals":true}}}))
+            .await
+            .expect("update");
+        assert_eq!(
+            updated["mcpCapabilities"],
+            json!({
+                "workspace": true, "sourceControl": true, "files": true,
+                "diagnostics": true, "terminals": true,
+            })
+        );
+        signal.changed().await.expect("changed");
+        assert!(signal.borrow().capabilities.terminals);
+        control
+            .update_settings(json!({"patch":{"mcpCapabilities":{"files":false}}}))
+            .await
+            .expect("update");
+        signal.changed().await.expect("changed");
+        let committed = signal.borrow().capabilities;
+        assert!(committed.terminals && !committed.files && committed.workspace);
     }
 
     #[tokio::test]

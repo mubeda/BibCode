@@ -724,15 +724,28 @@ async fn open_store(
     Ok((guard, database))
 }
 
+/// The scopes a credential minted now adds to the operate grant: `terminal:operate` when
+/// terminals are on for MCP agents and the ceiling is full access, else none.
+fn extra_scopes(settings: McpServerSettings, access: McpAccess) -> &'static [&'static str] {
+    if settings.capabilities.terminals && access.min(settings.access) == McpAccess::FullAccess {
+        &[crate::auth::SCOPE_TERMINAL_OPERATE]
+    } else {
+        &[]
+    }
+}
+
 async fn mint(options: &RelayOptions, label: &str, access: McpAccess) -> Result<String, String> {
+    let extra = extra_scopes(read_settings(&options.paths().settings)?, access);
     let (_guard, database) = open_store(options).await?;
     let repositories = crate::persistence::Repositories::new(database.clone());
-    let issued =
-        crate::auth::issue_mcp_pairing_link(&repositories, label.to_owned(), access.as_str())
-            .await
-            .map_err(|error| {
-                format!("Could not issue this MCP connection's credential: {error:?}")
-            });
+    let issued = crate::auth::issue_mcp_pairing_link(
+        &repositories,
+        label.to_owned(),
+        access.as_str(),
+        extra,
+    )
+    .await
+    .map_err(|error| format!("Could not issue this MCP connection's credential: {error:?}"));
     database.close().await;
     issued.map(|issued| issued.credential)
 }

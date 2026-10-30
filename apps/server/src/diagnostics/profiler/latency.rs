@@ -104,12 +104,17 @@ pub fn judge(ms: f64, p95: Option<f64>, samples: u64, interactive: bool) -> Tier
 /// duration says little about the server. These methods still emit `rpc.timing`, but never
 /// raise `rpc.slow` or count toward `rpc.saturation`, and their hang budget is 300 s.
 pub fn is_long_running(method: &str) -> bool {
-    // An MCP tool call (#139) is long-running when it waits by design or any RPC method it
-    // dispatches to is.
+    // An MCP tool call (#139) is long-running when its spec says so (waits, network,
+    // devices) or any RPC method it dispatches to is. A client tool and a provider tool may
+    // share a name, so both kinds are asked.
     if let Some(tool) = method.strip_prefix("mcp.") {
-        return crate::mcp::control::tool_spec(tool).is_some_and(|spec| {
-            spec.waits || spec.methods.iter().any(|method| is_long_running(method))
-        });
+        use crate::mcp::control::{PrincipalKind, tool_spec};
+        return [PrincipalKind::Client, PrincipalKind::Provider]
+            .into_iter()
+            .filter_map(|kind| tool_spec(kind, tool))
+            .any(|spec| {
+                spec.long_running || spec.methods.iter().any(|method| is_long_running(method))
+            });
     }
     matches!(
         method,
@@ -1157,8 +1162,9 @@ mod tests {
         assert!(is_long_running("mcp.device_open"));
         assert!(!is_long_running("mcp.read_thread"));
         assert!(!is_long_running("mcp.no_such_tool"));
-        for spec in crate::mcp::control::CLIENT_TOOLS {
-            let expected = spec.waits || spec.methods.iter().any(|method| is_long_running(method));
+        for spec in crate::mcp::control::tool_specs(crate::mcp::control::PrincipalKind::Client) {
+            let expected =
+                spec.long_running || spec.methods.iter().any(|method| is_long_running(method));
             assert_eq!(
                 is_long_running(&crate::mcp::control::timing_name(spec.name)),
                 expected,
