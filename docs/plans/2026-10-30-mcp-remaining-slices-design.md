@@ -3192,3 +3192,10 @@ line in each shared file. No contract, handler or migration changed.
 the real handler would refuse fails the test. The unavailable-host test runs the real
 `register_pull_requests_rpc` with no provider CLI or Git. The tests and the tools were
 written in one pass; the first run of the suite was green.
+
+**For the other slices.** F0's `a_capability_set_turned_off_hides_and_refuses_its_tools_live`
+compared the default tool list with slice 1's tools exactly, so registering any family
+failed it. P changed it (`foundation.rs`, outside P's files) to check that every slice-1
+tool is listed; sibling slices that make the same change will conflict trivially. `vp run
+typecheck` and `vp run check:contracts` build the server with whatever `cargo` is first on
+`PATH`, so run them with the pinned toolchain first too.
