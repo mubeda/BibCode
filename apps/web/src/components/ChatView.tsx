@@ -4047,6 +4047,16 @@ function ChatViewContent(props: ChatViewProps) {
     };
   }, [activeThread?.id, timelineEntries, followTimelineLiveEnd, composerOverlayHeight]);
 
+  // A turn that settles changes its rows with no new entry: its "Worked for" row arrives above
+  // the answer and the rows below it go. The list then keeps no row in place, since the rows it
+  // held were the ones that went, and the answer's end can drop out of view (#208). Follow as a
+  // new entry does, once the list has laid the new rows out.
+  const onTimelineTurnSettled = useCallback(() => {
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => followTimelineLiveEndRef.current());
+    });
+  }, []);
+
   // A row that grows without a new entry, such as a diagram drawing in a reply taller than the
   // timeline, changes layout the effect above never sees. That includes rows above the anchored
   // turn, such as an earlier reply whose diagrams draw again as it remounts: the list holds the
@@ -7102,6 +7112,7 @@ function ChatViewContent(props: ChatViewProps) {
                       onAnchorReady={onTimelineAnchorReady}
                       onAnchorSizeChanged={onTimelineAnchorSizeChanged}
                       onRowSizeChanged={onTimelineRowSizeChanged}
+                      onTurnSettled={onTimelineTurnSettled}
                       contentInsetEndAdjustment={composerOverlayHeight}
                       onIsAtEndChange={onIsAtEndChange}
                       onManualNavigation={cancelTimelineLiveFollowForUserNavigation}
