@@ -11,7 +11,9 @@ use tokio::{
 };
 
 use super::*;
-use crate::{ServerConfig, ServerHandle, ServerRuntime, persistence::Repositories};
+use crate::{
+    ServerConfig, ServerHandle, ServerRuntime, mcp::endpoint::hex, persistence::Repositories,
+};
 
 fn options(root: &Path) -> RelayOptions {
     RelayOptions {
@@ -715,9 +717,50 @@ async fn a_url_that_names_the_records_listener_is_served() {
     server.join().await.expect("server joins");
 }
 
+/// The runtime guard is a shared lock, so a second server for the data root on another port
+/// starts. The first, still running and answering its proof, keeps the record: the second's
+/// start and stop leave it alone, and relays still reach the first.
+#[tokio::test]
+async fn a_second_server_on_another_port_leaves_the_running_servers_record() {
+    let root = tempfile::tempdir().expect("root");
+    let first = start_server(root.path()).await;
+    let state_dir = ServerConfig::new(root.path()).state_dir();
+    let record = || std::fs::read(state_dir.join(crate::mcp::endpoint::ENDPOINT_RECORD_FILE));
+    let before = record().expect("record");
+    let second = start_server(root.path()).await;
+    assert_ne!(second.local_addr().port(), first.local_addr().port());
+    assert_eq!(record().expect("record"), before, "the first keeps it");
+    // The second still runs normally.
+    let health = reqwest::Client::new()
+        .get(format!(
+            "http://{}{}",
+            second.local_addr(),
+            crate::http::ENVIRONMENT_DESCRIPTOR_PATH
+        ))
+        .send()
+        .await
+        .expect("the second answers");
+    assert!(health.status().is_success(), "{}", health.status());
+    second.shutdown();
+    second.join().await.expect("second joins");
+    assert_eq!(
+        record().expect("record"),
+        before,
+        "the second's stop leaves it"
+    );
+    let mut relay = Running::start(options(root.path()));
+    relay
+        .send(json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
+        .await;
+    assert!(relay.line().await["result"]["tools"].is_array());
+    relay.close().await.expect("relay ends");
+    first.shutdown();
+    first.join().await.expect("first joins");
+    assert!(record().is_err(), "the first removes its own record");
+}
+
 /// A second server for the data root on the running server's port fails to bind, which comes
-/// before the record is written, so the running server's record stays. (The runtime guard is
-/// a shared lock: a second server on another port does start, and its record wins.)
+/// before the record is written, so the running server's record stays.
 #[tokio::test]
 async fn a_second_server_that_cannot_start_leaves_the_record_alone() {
     let root = tempfile::tempdir().expect("root");

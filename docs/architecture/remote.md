@@ -1796,7 +1796,11 @@ Remote Server mode, the joined record's slow part (`server`, `network`, or
   owner-only `server-runtime.json`. The relay dials exactly the record's
   `dialHost` and `port` (a `--url` must name that listener), so another
   listener on the same port of the other loopback family, or one that
-  forwards to the real server, cannot pass the proof. A remote
+  forwards to the real server, cannot pass the proof. The first live owner
+  keeps the record: a second server for the same data root on another port
+  (the runtime guard is shared) leaves a record whose pid is alive and whose
+  listener answers the proof, or does not answer within 2 s, and runs without
+  MCP discovery; a record whose owner is gone is replaced. A remote
   agent uses `ssh <host> bibcode mcp`. Remote Streamable HTTP for outside agents
   needs MCP OAuth and is not served.
 - Emulator, adb, and scrcpy sockets listen on loopback only; BiBCode never

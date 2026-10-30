@@ -332,13 +332,14 @@ tokens are route-bound. The audience rule needs no new column, because
 ### Discovery and launch
 
 - **Endpoint record.** The server writes `server-runtime.json` (mode 0600)
-  after `bind_listener`, under the `StoreRuntimeGuard` owner, and removes it at
-  shutdown. It holds `{ version, pid, dialHost, port, bootId, startedAt,
+  after `bind_listener` and removes it at shutdown. It holds `{ version, pid, dialHost, port, bootId, startedAt,
   proofKey }`, and is written in the `userdata` or `dev` state directory the
   server uses. `dialHost` is a loopback address that reaches the listener:
   `127.0.0.1` or `::1` for a wildcard or loopback bind, and `null` when the
   server listens only on other interfaces. The desktop's in-process server
-  writes it the same way.
+  writes it the same way. The first live owner keeps it: a starting server
+  leaves a record in place whose pid is alive and whose listener answers the
+  recorded proof (see Review fixes).
 - **Relay start.** `bibcode mcp [--base-dir] [--dev-url] [--url] [--access]`
   resolves the data root and state directory as `pairing issue` does. Then,
   within Codex's 10 s default startup timeout, it:
@@ -940,7 +941,9 @@ Setting:
 Discovery:
 
 - the record is written after bind, is mode 0600, is removed on shutdown, and
-  is not overwritten by a second server that fails the guard;
+  is not overwritten by a second server that fails the guard, nor by one that
+  starts on another port while the first still runs; a record whose owner is
+  gone is replaced;
 - a stale record whose pid is gone makes the relay exit 1 before minting;
 - a replacement listener on the recorded port, which cannot answer the proof,
   makes the relay exit 1, and the listener receives no `/oauth/token` body
@@ -1278,11 +1281,29 @@ updated on 2026-10-27.
   steer, and, through the relay against a real server with every provider unable to run,
   `list_providers_and_models`, `start_thread` with the Default Agent's model, and
   `git_status`.
-- **Discrepancy: the runtime guard is shared.** "Not overwritten by a second server that
+- **The first live owner keeps the endpoint record.** "Not overwritten by a second server that
   fails the guard" assumed an exclusive guard, but `StoreRuntimeGuard` takes a shared lock
   (`persistence/backup.rs`), so a second server for the same data root on another port
-  starts, and its record replaces the first's (the diagnostics relay's
-  `diagnostics-relay.json` behaves the same). When that second server stops, its record is
-  removed and relays report no server until the first restarts. Only a second server on the
-  same port is stopped, by `bind_listener` before the record is written; the test covers
-  that case. Making the guard exclusive is a separate decision.
+  started and its record replaced the first's. When that second server stopped, it removed
+  the record, and relays reported no server although the first still ran. The guard and the
+  record's shape are unchanged. Instead, a starting server writes the record through
+  `EndpointRecordFile::claim`: when a record exists, its pid is alive (`sysinfo`, the relay's
+  own check) and its listener answers a fresh nonce with the recorded `proofKey` (the
+  relay's `endpoint::prove`), the record stays, the server logs a content-free warning that
+  MCP discovery stays with the running server, and it runs normally without being reachable
+  by `bibcode mcp`. A dead pid, an older record version, a refused connection, a missing
+  route or a wrong proof (a recycled pid, or another program on the port) means the owner
+  is gone, and the record is replaced as before. Removal is unchanged: only while the record
+  is still ours. The probe runs once, at startup, with a 2 s connect and request timeout.
+  **A probe that times out counts as live.** It can only time out when the pid is alive and
+  something accepts on the recorded listener without answering, which is almost always the
+  owner itself, stalled or suspended. Wrongly counting it live costs only the second server's
+  discoverability, which stopping the first and restarting the second recovers. Wrongly counting it dead
+  reproduces this bug: the record moves to the second server and disappears when it stops,
+  while the first still runs. Startup waits at most the timeout. Two servers that start at
+  the same instant can still both see no record, and the later rename wins (the same race as
+  before). `diagnostics-relay.json` keeps the old last-writer-wins behavior; it has no proof
+  to check liveness with. Tests: a second server on another port leaves the first's record
+  byte for byte, and a relay reaches the first after the second stops (`relay/tests.rs`); a
+  dead pid's record, a live pid without its listener, and a silent listener that keeps the
+  record within the bound (`endpoint.rs`). The same-port case is still covered.

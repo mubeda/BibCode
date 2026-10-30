@@ -95,5 +95,10 @@ an agent waits longer by calling it again.
 | "BiBCode ended this MCP connection's access."                              | The agent's row was revoked                                 | Restart the MCP server in the agent                         |
 | `--access … is above this environment's limit`                             | Asked for more than Agents may                              | Raise Agents may, or ask for less                           |
 
+When two BiBCode servers run on the same data root, such as the desktop app and a
+`bibcode serve` on another port, `bibcode mcp` reaches the one that started first. The
+other logs that MCP discovery stays with the running server. Stop the first one and
+restart the other to move discovery to it.
+
 A Windows update ends a desktop-hosted `mcp` process along with the app; restart the MCP
 server in the agent afterwards.

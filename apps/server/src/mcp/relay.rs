@@ -24,7 +24,7 @@ use url::Url;
 
 use super::{
     control::{McpAccess, McpServerSettings, mcp_server_settings},
-    endpoint::{EndpointRecord, PROOF_PATH, RECORD_VERSION, hex, proof, unhex},
+    endpoint::{EndpointRecord, Proof, RECORD_VERSION, process_alive, process_started_at, prove},
     protocol,
 };
 use crate::data_root::ResolvedDataRoot;
@@ -215,17 +215,9 @@ async fn discover(
         return Err(NO_SERVER_MESSAGE.to_owned());
     }
     let key = record.key().ok_or_else(|| NO_SERVER_MESSAGE.to_owned())?;
-    // The exact listener the record names. The relay dials this address, never a name, so
-    // `localhost` cannot resolve to another listener on the same port.
-    let listener = record
-        .dial_host
-        .as_deref()
-        .and_then(|host| host.parse::<std::net::IpAddr>().ok())
-        .filter(std::net::IpAddr::is_loopback)
-        .map(|host| std::net::SocketAddr::new(host, record.port))
-        .ok_or_else(|| {
-            "This BiBCode server does not listen on this computer's loopback address.".to_owned()
-        })?;
+    let listener = record.listener().ok_or_else(|| {
+        "This BiBCode server does not listen on this computer's loopback address.".to_owned()
+    })?;
     if let Some(url) = url
         && !names_listener(url, listener)
     {
@@ -234,48 +226,15 @@ async fn discover(
         ));
     }
     let base = Url::parse(&format!("http://{listener}/")).map_err(|error| error.to_string())?;
-    let not_ours = || format!("The program listening on {base} is not this BiBCode server.");
-    let mut nonce = [0_u8; 32];
-    getrandom::fill(&mut nonce).map_err(|error| error.to_string())?;
-    let answer = http
-        .post(
-            base.join(PROOF_PATH.trim_start_matches('/'))
-                .map_err(|error| error.to_string())?,
-        )
-        .json(&json!({ "nonce": hex(&nonce) }))
-        .send()
+    let proven = prove(http, listener, &key)
         .await
-        .map_err(|_| not_ours())?;
-    if !answer.status().is_success() {
-        return Err(not_ours());
-    }
-    let answer: Value = answer.json().await.map_err(|_| not_ours())?;
-    let expected = proof(&key, &nonce, listener);
-    let given = answer["proof"].as_str().and_then(unhex).unwrap_or_default();
-    if !bool::from(subtle::ConstantTimeEq::ct_eq(
-        given.as_slice(),
-        expected.as_slice(),
-    )) {
-        return Err(not_ours());
+        .map_err(|error| error.to_string())?;
+    if proven != Proof::Proven {
+        return Err(format!(
+            "The program listening on {base} is not this BiBCode server."
+        ));
     }
     Ok(Endpoint { base })
-}
-
-/// Whether `pid` is a running process.
-fn process_alive(pid: u32) -> bool {
-    process_started_at(pid).is_some()
-}
-
-/// When `pid` started, in seconds since the epoch, or `None` when no such process runs.
-fn process_started_at(pid: u32) -> Option<u64> {
-    let pid = sysinfo::Pid::from_u32(pid);
-    let mut system = sysinfo::System::new();
-    system.refresh_processes_specifics(
-        sysinfo::ProcessesToUpdate::Some(&[pid]),
-        true,
-        sysinfo::ProcessRefreshKind::nothing(),
-    );
-    system.process(pid).map(sysinfo::Process::start_time)
 }
 
 struct Credential {
