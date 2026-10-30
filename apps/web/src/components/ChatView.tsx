@@ -126,6 +126,7 @@ import {
   getAnchoredTurnMetrics,
   getSentRowLandingDelta,
   bindTimelineTakeoverListeners,
+  type TimelineTakeoverInput,
   getTimelinePageScrollOffset,
   rowToggleNeedsEndReveal,
   timelineScrollAnimates,
@@ -422,6 +423,12 @@ const TIMELINE_END_FOLLOW_RECHECKS = 6;
 const SENT_ROW_LANDING_MAX_MS = 2_000;
 const SENT_ROW_LANDING_ATTEMPTS = 20;
 const SENT_ROW_LANDING_ATTEMPT_MS = 1_000;
+/**
+ * How long after a scroll key LegendList keeps no content position, so its own scrolls do not
+ * cancel the key's native scroll: WebKit started that scroll up to 816 ms after the keydown on
+ * the macOS x64 runners (#207).
+ */
+const TIMELINE_NATIVE_SCROLL_PENDING_MS = 1_200;
 
 /** The patched LegendList method that withdraws its scroll requests (see the patch). */
 interface CancellableTimelineList {
@@ -3514,11 +3521,14 @@ function ChatViewContent(props: ChatViewProps) {
   // composer growing, the Activity card opening) moves a list near its end, or a thread
   // shorter than the view, back to the end and takes the reader's line away.
   const [timelineFollowsEnd, setTimelineFollowsEnd] = useState(true);
+  // Whether a scroll key's native scroll may still be about to start (#207).
+  const [timelineNativeScrollPending, setTimelineNativeScrollPending] = useState(false);
+  const timelineNativeScrollTimerRef = useRef<number | null>(null);
   // The sent row the reader scrolled away from. LegendList reports it ready again whenever the
   // anchored end space changes size, as each delivery does, and positioning it then would take
   // the reader's place away, so it stays released until the next send or thread (#190).
   const releasedTimelineAnchorRef = useRef<MessageId | null>(null);
-  const cancelTimelineLiveFollowForUserNavigation = useCallback(() => {
+  const cancelTimelineLiveFollowForUserNavigation = useCallback((input?: TimelineTakeoverInput) => {
     // A send names its row pending before the previous one stops being positioned, so the
     // newest send is the one released.
     releasedTimelineAnchorRef.current =
@@ -3541,6 +3551,19 @@ function ChatViewContent(props: ChatViewProps) {
     if (anchorScrollRestoreFrameRef.current !== null) {
       cancelAnimationFrame(anchorScrollRestoreFrameRef.current);
       anchorScrollRestoreFrameRef.current = null;
+    }
+    // The browser scrolls for a key only after the keydown, and a scroll LegendList makes before
+    // then, such as holding the row below a streamed reply in place as it grows, cancels the
+    // key's scroll. The wheel, touch and a press scroll at once.
+    if (input === "keyboard") {
+      setTimelineNativeScrollPending(true);
+      if (timelineNativeScrollTimerRef.current !== null) {
+        window.clearTimeout(timelineNativeScrollTimerRef.current);
+      }
+      timelineNativeScrollTimerRef.current = window.setTimeout(() => {
+        timelineNativeScrollTimerRef.current = null;
+        setTimelineNativeScrollPending(false);
+      }, TIMELINE_NATIVE_SCROLL_PENDING_MS);
     }
   }, []);
   const cancelTimelineLiveFollowForUserNavigationRef = useRef(
@@ -3641,7 +3664,7 @@ function ChatViewContent(props: ChatViewProps) {
     timelineTakeoverCleanupRef.current = bindTimelineTakeoverListeners(
       scrollNode,
       scrollNode.ownerDocument ?? document,
-      () => cancelTimelineLiveFollowForUserNavigationRef.current(),
+      (input) => cancelTimelineLiveFollowForUserNavigationRef.current(input),
     );
   }, []);
 
@@ -4091,6 +4114,7 @@ function ChatViewContent(props: ChatViewProps) {
     setPullRequestDialogState(null);
     setScrollPillThreadId(null);
     setTimelineFollowsEnd(true);
+    setTimelineNativeScrollPending(false);
     setIsRevertingCheckpoint(false);
   }
 
@@ -7045,6 +7069,7 @@ function ChatViewContent(props: ChatViewProps) {
                       listRef={legendListRef}
                       onListMount={onTimelineListMount}
                       followsEnd={timelineFollowsEnd}
+                      nativeScrollPending={timelineNativeScrollPending}
                       timelineEntries={timelineEntries}
                       queuedMessages={queuedMessages}
                       queuedStatuses={queuedStatuses}

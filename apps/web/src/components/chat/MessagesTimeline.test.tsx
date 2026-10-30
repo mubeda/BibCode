@@ -473,6 +473,21 @@ describe("MessagesTimeline", () => {
     expect(onAnchorSizeChanged).toHaveBeenCalledWith(secondEntry.message.id, 240);
   });
 
+  it("keeps no content position while a scroll key's native scroll may still start", async () => {
+    const { MessagesTimeline } = await import("./MessagesTimeline");
+    // A scroll LegendList makes to hold a row in place would cancel the key's scroll (#207).
+    const markup = renderToStaticMarkup(
+      <MessagesTimeline
+        {...buildProps()}
+        timelineEntries={[buildUserTimelineEntry("hello")]}
+        nativeScrollPending
+      />,
+    );
+
+    expect(markup).toContain('data-maintain-visible-content-position-data="false"');
+    expect(markup).toContain('data-maintain-visible-content-position-size="false"');
+  });
+
   it("stops LegendList keeping the list at its end once the reader scrolled away", async () => {
     const { MessagesTimeline } = await import("./MessagesTimeline");
     // The composer grew, as the Activity card opening makes the bottom region grow; a list the
