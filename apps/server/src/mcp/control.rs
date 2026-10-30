@@ -1112,6 +1112,18 @@ impl ToolCall<'_> {
             .database()
             .call(move |connection| {
                 let transaction = connection.transaction()?;
+                // A `bibcode thread` run mints a credential of its own and revokes it on the
+                // way out, so a retry from a new run could not find the first run's request:
+                // those credentials share one scope. Any other client's request belongs to
+                // its session.
+                let session_id: String = transaction
+                    .query_row(
+                        "SELECT CASE WHEN client_label = ?1 THEN ?1 ELSE session_id END FROM auth_sessions WHERE session_id = ?2",
+                        params![super::thread_cli::LABEL, session_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                    .unwrap_or(session_id);
                 if let Some(fresh_json) = fresh_json {
                     prune_request_rows(&transaction)?;
                     transaction.execute(

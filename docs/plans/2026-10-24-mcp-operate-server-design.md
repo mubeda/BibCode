@@ -445,7 +445,8 @@ lets the existing command admission replay them:
   reservation released, is tried again. The message is enqueued either way,
   so the worst case is the same fallback to queued.
 - **Scope.** Rows belong to one client session, which is one running MCP
-  server in the agent. Rows older than 24 h are deleted on insert, and a
+  server in the agent (the credentials of `bibcode thread` share one scope; see
+  the CLI implementation notes). Rows older than 24 h are deleted on insert, and a
   reused key after that is a new request whose ids differ. The
   `clientRequestId` description says this.
 
@@ -1309,8 +1310,9 @@ updated on 2026-10-27.
   record within the bound (`endpoint.rs`). The same-port case is still covered.
 
 **CLI front end (2026-10-30):** implemented on `claude/v0131-139-cli`, on top of slice 1, as
-designed in "CLI front end (next slice)". Nothing settled changes: no new route, RPC
-method, table or persisted shape.
+designed in "CLI front end (next slice)". No new route, RPC method, table or persisted
+shape; the review round (below) widened the retry scope of `bibcode thread` credentials and
+added project paging to `list_projects_and_threads`.
 
 - **One connection.** `relay.rs` now holds a `Connection` (setting and `--access` checks,
   `--url` check, record, endpoint proof, orphan sweep, credential minted on first use,
@@ -1339,9 +1341,35 @@ method, table or persisted shape.
   `timeoutMs: 30000` until `timedOut` is false. A `McpStorageError` is retried a second
   later, at most 3 times in a row. Ctrl-C (or SIGTERM/SIGHUP, a console close) stops the
   wait, revokes the credential and exits 1 with the ids; it never calls `interrupt_turn`.
-- **Idempotency.** Each `start` and `send` sends a fresh UUID v4 `clientRequestId`, so the
-  connection's retry after a lost answer replays instead of starting a second turn. A new
-  run mints a new session, so the key cannot span runs.
+- **Idempotency.** Each `start` and `send` sends a `clientRequestId`: the `--request-id` the
+  person gave (1 to 256 characters, validated at parse), else a fresh UUID v4 made up once
+  per run. The id is reported as `requestId` in `--json` output, success or failure. A run
+  that is interrupted while its `start_thread` or `send_message` is in flight, or whose call
+  fails without an answer (not a tool's refusal), may have been accepted, so it prints the
+  id and "Run the same command with --request-id <id> to finish it without repeating it."
+  The retry must send identical arguments, because the stored row's digest covers all of
+  them; `.` resolves to the same project from the same directory.
+- **Retry scope (changed after review).** The Retries section keys `mcp_tool_requests` by
+  the client session, and the CLI mints a session per run, so a re-run with the same id
+  found no row and started a second thread (the test for it failed that way). Alternatives:
+  (a) key every `mcp-client` credential together, which would make two agents that number
+  their requests `1, 2, ...` collide for 24 hours; (b) keep one CLI credential across runs,
+  which the revoke-on-exit rule forbids and which leaves a long-lived secret; (c) key the
+  rows of credentials labelled `MCP · bibcode thread` together and every other credential by
+  its session. (c) is implemented, inside the one SQLite job that stores or reads the row
+  (`stored_request`), with no schema change. The trade-off: every `bibcode thread` run on a
+  data root shares one retry namespace, which is the same operator and the same trust
+  level; a ceiling is still checked for work the engine has not accepted. An agent that
+  calls itself `bibcode thread` gets the same scope, which exposes nothing beyond the
+  operator's own requests. Pending approval of this decision.
+- **Pages.** `list_projects_and_threads` cut a long project list at the back and gave no way
+  to read the rest, because `nextCursor` pages threads only; `start .` then matched against
+  an incomplete list. The tool now also pages projects: `nextProjectCursor` (`p:<n>`), taken
+  as `projectCursor`, and `projectCount` beside `threadCount`. A call that continues only one
+  list returns only that list. The projects fit first, then the threads, so neither
+  starves. `list` follows both cursors, and `start .` the project cursor with `limit: 1`,
+  at most 50 pages, with a clear error beyond. `list --json` is one merged page: nothing
+  cut, no `truncated`, both cursors null.
 - **Credential label** is `MCP · bibcode thread`. The access ceiling is the environment's
   `mcpServerAccess`; the CLI has no `--access` or `--url`.
 - **Desktop.** `desktop_dispatch` takes `thread` next to `mcp` and `diagnostics`, after
@@ -1350,7 +1378,13 @@ method, table or persisted shape.
 - **Tests** (`mcp/thread_cli/tests.rs`): parsing of every subcommand and flag (and the
   desktop's in `profiler/cli.rs`), `.` resolution, the JSON shape on success and failure,
   exit codes 0/1/2, 30 s slicing with no `interrupt_turn`, a stopped wait, a long reply,
-  standard input, the setting off; and against a real server, a delivery that fails
+  standard input, `--request-id` (parse, validation, the id in the JSON, the hint after an
+  unknown outcome or an interruption, none after a refusal), merging project and thread
+  pages and the 50-page bound, the setting off; and against a real server, a project list
+  cut across pages with the nested project on the second (`start .` and `list`), a `start`
+  and a `send` run again with their request id (same ids, one thread, a changed message
+  refused), and `mcp_tools_tests` for the shared CLI scope against separate agent sessions;
+  and against a real server, a delivery that fails
   (exit 1, every run's credential revoked), and, with a fake Codex app-server script
   (Unix only), `start . --wait` and `send --wait` (exit 0 with the reply), an approval
   (exit 2), `show` and `list`.

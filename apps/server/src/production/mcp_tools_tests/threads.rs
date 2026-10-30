@@ -272,6 +272,32 @@ async fn retries_with_one_client_request_id_start_one_turn() {
     harness.shutdown().await;
 }
 
+/// A retry spans `bibcode thread` runs, each of which has a credential of its own, but not the
+/// sessions of any other agent.
+#[tokio::test]
+async fn only_bibcode_thread_credentials_share_their_client_request_ids() {
+    let harness = Harness::new().await;
+    let mut arguments = basic_start();
+    arguments["clientRequestId"] = json!("run-1");
+    let label = crate::mcp::thread_cli::LABEL;
+    let (first, _) = harness.agent_labelled(label, McpAccess::FullAccess).await;
+    let (second, _) = harness.agent_labelled(label, McpAccess::FullAccess).await;
+    assert_eq!(
+        start(&harness, &first, arguments.clone()).await,
+        start(&harness, &second, arguments.clone()).await,
+        "a later run finds the first run's request"
+    );
+
+    let (other, _) = harness.agent(McpAccess::FullAccess).await;
+    let (another, _) = harness.agent(McpAccess::FullAccess).await;
+    assert_ne!(
+        start(&harness, &other, arguments.clone()).await,
+        start(&harness, &another, arguments.clone()).await,
+        "another agent's session has requests of its own"
+    );
+    harness.shutdown().await;
+}
+
 /// The provider asks `request_id` on `thread_id`.
 async fn ask(harness: &Harness, thread_id: &str, request_id: &str) {
     harness

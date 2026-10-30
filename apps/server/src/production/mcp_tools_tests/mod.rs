@@ -150,14 +150,14 @@ impl Harness {
     /// An outside agent's credential with ceiling `access`, minted and exchanged as the relay
     /// does.
     pub(crate) async fn agent(&self, access: McpAccess) -> (ClientPrincipal, String) {
-        let link = issue_mcp_pairing_link(
-            &self.repositories,
-            "MCP · test".into(),
-            access.as_str(),
-            &[],
-        )
-        .await
-        .expect("link");
+        self.agent_labelled("MCP · test", access).await
+    }
+
+    /// [`Self::agent`] with the credential's label `label`.
+    async fn agent_labelled(&self, label: &str, access: McpAccess) -> (ClientPrincipal, String) {
+        let link = issue_mcp_pairing_link(&self.repositories, label.into(), access.as_str(), &[])
+            .await
+            .expect("link");
         let session = self
             .auth
             .exchange_bootstrap(
