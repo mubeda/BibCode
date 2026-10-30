@@ -1418,8 +1418,9 @@ Decisions:
   lines verbatim (`production/provider_runtime.rs:19265`). So the tools build their output
   from named fields and drop everything else:
   - **`diagnose_environment`** returns the environment descriptor's version and
-    capability flags, each provider's install, auth and version state, and config issue
-    codes. It never returns paths, settings, `mcpLaunch` or the auth descriptor.
+    capability flags, each provider's install, auth and version state, and the count and
+    kind of each config issue, never its message. It never returns paths, settings,
+    `mcpLaunch` or the auth descriptor.
   - **`process_diagnostics`** returns, per process, `pid`, `ppid`, `depth`, `status`,
     `elapsed`, the CPU and memory samples, and BiBCode's attribution `scope`, `kind` and
     `confidence`, plus the totals and buckets. It never returns `command` or the
@@ -1678,9 +1679,12 @@ mutation:
   is the durable registration intent. The clone holds one owned-mutation slot (2 per
   session, 8 per environment) until it settles.
 - **The task, not the call, runs both steps.** The owned task calls `vcs.clone` with
-  `detach: false`, so the clone runtime cancels a clone this task started when the task
-  leaves, and leaves alone a clone it only joined, such as one a person started in the
-  UI. On success with `addAsProject`, the same task dispatches `project.create` with the
+  `detach: false`. The handler's `cancellation` argument bounds only an attach's disk
+  check (`clone_operations.rs:233-234`), so it does not stop Git. Instead, when C4's
+  token fires, the task stops waiting and drops its `vcs.clone` future. With
+  `detach: false` that trips the runtime's drop guard (`:288`), which cancels a clone
+  this task started, and leaves alone a clone it only joined, such as one a person
+  started in the UI. On success with `addAsProject`, the same task dispatches `project.create` with the
   frozen ids, as the web does after a clone (`useAddProjectWorkflow.ts:715-750`). A
   refusal because the root is already registered (`engine.rs:3958`) is returned as that
   project, so a retry never creates a second one. Then it writes the outcome.
@@ -1738,9 +1742,10 @@ unchanged. A new `git/clone_policy.rs` checks, and `ReservedClone::transfer`
 - **Refusal.** A refused host returns `clone_host_refused`: "BiBCode does not clone from
   local or private network addresses for an agent. Clone it in BiBCode yourself." No
   setting widens this.
-- **Versions.** `http.curloptResolve` needs Git 2.37 or later. Git ignores an unknown
-  `-c` key, so an older Git would silently skip the pin; X6 refuses an HTTPS agent clone
-  on an older Git with a typed error naming the version.
+- **Versions.** `http.curloptResolve` needs the Git release that added it (2.37, to be
+  confirmed against Git's release notes in X6). Git ignores an unknown `-c` key, so an
+  older Git would silently skip the pin; X6 refuses an HTTPS agent clone on an older Git
+  with a typed error naming the version.
 
 **Trust boundaries.** Clone runs Git against an outside URL; hooks do not run on clone.
 The destination is always a sibling of a registered project, and the source is a public
@@ -1751,10 +1756,12 @@ covers the local answer only; this is a stated residual risk.
 through the existing supervised repository layer, each bounded by a timeout.
 `mcp.clone_repository` is long-running through `vcs.clone`, and holds no wait slot.
 
-**Tests (fail first):** with a test-only policy that admits the fixture, a clone from a local
-bare repository next to a project registers it; a URL with user information is
-refused; an existing destination is refused; a call past 50 seconds returns `running`
-and `clone_status` later returns the project; `cancel_clone`, revocation and the off
+**Tests (fail first):** with a test-only policy that admits the fixture, a clone from a
+local bare repository next to a project registers it; a URL with user information is
+refused; a destination holding anything but a finished clone of the same URL is
+refused, while such a clone is registered without cloning again (`Existing`,
+`git/repository.rs:7356`); a call past 50 seconds returns `running` and `clone_status`
+later returns the project; dropping the task's `vcs.clone` future stops Git; `cancel_clone`, revocation and the off
 switch each stop a clone the agent started and remove its folder, and leave a clone a
 person started running; a keyed retry creates one project; a retry after a restart
 registers the finished clone without cloning again. For hosts: `https://127.0.0.1/`,
@@ -2210,7 +2217,8 @@ route answers 404 when the origin is not eligible.
       §4.14.2). There is no grace window and no cached rotation result: returning the new
       pair to a replay would hand a thief the grant undetected. Sender-constrained tokens
       (DPoP) would make a grace window safe, but Codex's MCP client has no DPoP code
-      (`rmcp-client` and `codex-mcp` at rust-v0.165.0), so there is nothing to bind to;
+      (`rmcp-client` and `codex-mcp` at rust-v0.165.0; the pinned `rmcp` crate was not
+      reread), so there is nothing to bind to;
     - **why strict reuse does not break the harnesses:** Codex serializes every refresh
       across processes with a file lock, and rereads the stored credential under that
       lock before refreshing, so a second process adopts the winner's rotated token and
