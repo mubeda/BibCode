@@ -152,6 +152,21 @@ fn git_subprocesses_ignore_appimage_libraries() {
             };
         });
     }
+
+    // Launched from the first AppDir, a second one keeps its APPDIR and its
+    // incompatible libraries on the loader path (#209).
+    let inner = fixture.path().join("Inner AppDir");
+    fs::create_dir_all(inner.join("usr/bin")).expect("inner AppDir executable directory");
+    let stacked = inner.join("usr/bin/bibcode-git-test");
+    executable_fixture::copy_executable(
+        &std::env::current_exe().expect("test executable"),
+        &stacked,
+    );
+    fs::write(inner.join("AppRun"), "fixture launcher").expect("inner AppDir launcher");
+    reexec::run(TEST, PHASE, Some(&stacked), |command| {
+        launch(command);
+        command.env_remove("APPIMAGE").env("APPDIR", &appdir);
+    });
 }
 
 async fn assert_git_children() {

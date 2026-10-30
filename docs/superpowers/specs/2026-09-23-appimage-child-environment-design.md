@@ -2,7 +2,8 @@
 
 Status: **Approved by the user on 2026-09-23**. Amended on 2026-10-30 for
 issue #209: the extracted-AppDir gate derives the root from the running
-executable instead of `APPDIR` (see [Gate and effective
+executable instead of `APPDIR`, and also strips an inherited `APPDIR` that
+names another AppDir (see [Gate and effective
 environment](#gate-and-effective-environment)).
 
 ## Ownership and scope
@@ -59,8 +60,10 @@ Retain the existing trigger: nonempty `APPIMAGE` and absolute, non-root
 `APPDIR` make `APPDIR` the root. Also support manually extracted AppDirs
 without `APPIMAGE`: the root is the directory `<root>` of a current executable
 at `<root>/usr/bin/<name>` when `<root>` is not `/` and `<root>/AppRun` exists.
-`APPDIR` plays no part in this case; once gated it is removed like the other
-launcher markers. Pass the executable path to the policy for focused positive
+`APPDIR` does not choose this root; once gated it is removed like the other
+launcher markers. If it names a different absolute, non-root directory that
+contains `AppRun`, its entries are stripped as a second root, because an AppDir
+launched from another extracted AppDir keeps the outer AppDir's paths. Pass the executable path to the policy for focused positive
 and negative gate tests. Missing executable identity fails closed. A stray
 `APPDIR=/usr` alone must not change a normal installed server's environment.
 
@@ -80,9 +83,16 @@ Git loaded the bundled `libnghttp2`. Alternatives considered:
   match an unrelated directory. The linuxdeploy layout is fixed, so check
   only `<root>/usr/bin/<name>`: at most one `stat`, none for an installed
   `/usr/local/bin` binary.
-- **A second root from a valid `APPDIR`:** stripping both the executable's
-  root and an `APPDIR` naming another AppDir was rejected as speculative; the
-  runtime does not add paths under a stale `APPDIR`.
+- **A second root from a valid `APPDIR`:** first rejected as speculative,
+  because the runtime does not add paths under a stale `APPDIR`. Review then
+  found the stacked case: extracted AppDir B launched from extracted AppDir A
+  inherits A's `APPDIR` and A's `usr/lib` entries, and B's `AppRun.wrapped`
+  only prepends its own paths. Stripping B alone left A's libraries for system
+  Git, the issue's inherited-`APPDIR` hypothesis. So once the executable gate
+  matches, an `APPDIR` naming a different absolute, non-root directory with
+  `AppRun` is a second root. That costs one more `stat` only on gated spawns
+  with such an `APPDIR`; an ungated process still ignores `APPDIR` entirely,
+  and a stale or non-AppDir `APPDIR` adds nothing, so host paths under it stay.
 - **Removing launcher markers without a root:** always removing `APPDIR`,
   `APPIMAGE`, `ARGV0`, and `OWD` was rejected; it would change an ordinary
   installation's children and break the no-op cases above.

@@ -192,11 +192,15 @@ fn extracted_appdir_isolates_real_child_commands() {
     executable_fixture::copy_executable(&std::env::current_exe().unwrap(), &executable);
     let apprun = appdir.join("AppRun");
     std::fs::write(&apprun, "fixture launcher").unwrap();
+    let outer = directory.path().join("Outer AppDir");
+    std::fs::create_dir(&outer).unwrap();
+    std::fs::write(outer.join("AppRun"), "fixture launcher").unwrap();
     for case in [
         "unset",
         "empty",
         "stale-appdir",
         "no-appdir",
+        "stacked-appdir",
         "missing-launcher",
     ] {
         if case == "missing-launcher" {
@@ -230,6 +234,16 @@ fn extracted_appdir_isolates_real_child_commands() {
                 command.env("APPDIR", directory.path().join("stale AppDir"));
             } else if case == "no-appdir" {
                 command.env_remove("APPDIR");
+            } else if case == "stacked-appdir" {
+                // Launched from another AppDir, which kept its own library path.
+                command.env("APPDIR", &outer).env(
+                    "LD_LIBRARY_PATH",
+                    format!(
+                        "{}/usr/lib:{}/usr/lib:/host/keep",
+                        appdir.display(),
+                        outer.display()
+                    ),
+                );
             }
         });
     }

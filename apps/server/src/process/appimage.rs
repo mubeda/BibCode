@@ -100,7 +100,7 @@ mod linux {
     /// and BiBCode's own binaries, need the bundled environment.
     pub(crate) fn child_environment_overrides(
         environment: &BTreeMap<OsString, OsString>,
-        appdir: &Path,
+        roots: &[PathBuf],
     ) -> Vec<(OsString, Option<OsString>)> {
         // Both launcher layers keep adding paths (Python, Qt, GStreamer, GTK), so
         // inspect every value instead of maintaining a name list.
@@ -127,7 +127,7 @@ mod linux {
                 .filter(|path| {
                     // Include extracted AppDirs and stale mounts from prior versions,
                     // but keep host paths that only share the AppDir's name prefix.
-                    let bundled = path.starts_with(appdir)
+                    let bundled = roots.iter().any(|root| path.starts_with(root))
                         || (path.is_absolute()
                             && path.components().any(|component| {
                                 component.as_os_str().as_bytes().starts_with(b".mount_")
@@ -152,39 +152,57 @@ mod linux {
         overrides
     }
 
-    fn appimage_root(
+    /// AppDir roots whose paths user-facing children must not inherit, or `None`
+    /// outside an AppImage or AppDir.
+    fn appimage_roots(
         variable: impl Fn(&str) -> Option<OsString>,
         current_executable: impl FnOnce() -> Option<PathBuf>,
-    ) -> Option<PathBuf> {
+    ) -> Option<Vec<PathBuf>> {
         if variable("APPIMAGE").is_some_and(|marker| !marker.is_empty()) {
             let appdir = PathBuf::from(variable("APPDIR")?);
-            return (appdir.is_absolute() && appdir.parent().is_some()).then_some(appdir);
+            return (appdir.is_absolute() && appdir.parent().is_some()).then(|| vec![appdir]);
         }
         // Extracted AppDirs have no APPIMAGE. AppRun keeps an inherited APPDIR and
         // a launcher may exec the binary without one, while AppRun.wrapped roots
         // loader paths in its own directory. So trust only the executable's
-        // `<root>/usr/bin/<name>` layout beside `<root>/AppRun`: one stat per command.
+        // `<root>/usr/bin/<name>` layout beside `<root>/AppRun`: one stat per command,
+        // plus one when gated with an `APPDIR` naming another directory.
         let executable = current_executable()?;
         let bin = executable.parent()?;
         let usr = bin.parent()?;
         let root = usr.parent()?;
-        (bin.ends_with("bin")
+        if !(bin.ends_with("bin")
             && usr.ends_with("usr")
             && root.parent().is_some()
             && root.join("AppRun").exists())
-        .then(|| root.to_path_buf())
+        {
+            return None;
+        }
+        let mut roots = vec![root.to_path_buf()];
+        // Launched from another extracted AppDir, AppRun.wrapped prepends its own
+        // paths to the outer AppDir's and the GTK hook keeps the outer APPDIR.
+        // Strip that root too, but only once gated and only for a real AppDir.
+        if let Some(outer) = variable("APPDIR").map(PathBuf::from)
+            && outer.is_absolute()
+            && outer.parent().is_some()
+            && outer != root
+            && outer.join("AppRun").exists()
+        {
+            roots.push(outer);
+        }
+        Some(roots)
     }
 
     pub(super) fn isolate(mut command: ChildCommand<'_>) {
         // The single gate does cheap lookups before copying an environment.
-        let Some(appdir) = appimage_root(
+        let Some(roots) = appimage_roots(
             |name| command.variable(name),
             || std::env::current_exe().ok(),
         ) else {
             return;
         };
         let environment = command.environment();
-        for (name, value) in child_environment_overrides(&environment, &appdir) {
+        for (name, value) in child_environment_overrides(&environment, &roots) {
             command.apply_override(name, value);
         }
     }
@@ -275,11 +293,11 @@ mod linux {
             environment: &BTreeMap<OsString, OsString>,
             executable: Option<&Path>,
         ) -> Vec<(OsString, Option<OsString>)> {
-            appimage_root(
+            appimage_roots(
                 |name| environment.get(OsStr::new(name)).cloned(),
                 || executable.map(Path::to_path_buf),
             )
-            .map(|root| child_environment_overrides(environment, &root))
+            .map(|roots| child_environment_overrides(environment, &roots))
             .unwrap_or_default()
         }
 
@@ -371,6 +389,51 @@ mod linux {
                     outside.display()
                 );
             }
+        }
+
+        #[test]
+        fn extracted_appdir_launched_from_another_appdir_strips_both_roots() {
+            let fixture = tempfile::tempdir().unwrap();
+            let outer = fixture.path().join("Outer.AppDir");
+            let inner = fixture.path().join("BiBCode.AppDir");
+            let not_appdir = fixture.path().join("NotAnAppDir");
+            for directory in [&outer, &inner, &not_appdir] {
+                std::fs::create_dir(directory).unwrap();
+            }
+            for directory in [&outer, &inner] {
+                std::fs::write(directory.join("AppRun"), "launcher").unwrap();
+            }
+            let executable = inner.join("usr/bin/bibcode-desktop");
+            // AppRun.wrapped prepends its own paths and keeps the outer AppDir's.
+            let library_path = |outer: &Path| {
+                OsString::from(format!(
+                    "{}/usr/lib:{}/usr/lib:/host/keep",
+                    inner.display(),
+                    outer.display()
+                ))
+            };
+            let overrides = |appdir: &Path| {
+                let environment = BTreeMap::from([
+                    ("APPDIR".into(), appdir.as_os_str().to_owned()),
+                    ("LD_LIBRARY_PATH".into(), library_path(appdir)),
+                ]);
+                gated_overrides(&environment, Some(&executable))
+            };
+            assert!(
+                overrides(&outer).contains(&("LD_LIBRARY_PATH".into(), Some("/host/keep".into()))),
+                "an inherited APPDIR naming another AppDir must not leave its libraries"
+            );
+            // Only a validated AppDir adds a root; otherwise its entries are host paths.
+            let kept = format!("{}/usr/lib:/host/keep", not_appdir.display());
+            assert!(
+                overrides(&not_appdir).contains(&("LD_LIBRARY_PATH".into(), Some(kept.into())))
+            );
+            // An ordinary install with the same inherited state strips nothing.
+            let environment = BTreeMap::from([
+                ("APPDIR".into(), outer.clone().into_os_string()),
+                ("LD_LIBRARY_PATH".into(), library_path(&outer)),
+            ]);
+            assert!(gated_overrides(&environment, Some(Path::new("/usr/bin/bibcode"))).is_empty());
         }
 
         #[test]
