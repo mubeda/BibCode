@@ -1,9 +1,53 @@
 # MCP for Outside Agents: Remaining Slices
 
-Status: Proposed — awaiting approval. Issue #139. Extends the approved slice-1 design
+Status: Revised — pending Codex re-review. Issue #139. Extends the approved slice-1 design
 (`docs/plans/2026-10-24-mcp-operate-server-design.md`, "slice 1" below) and does not
 replace it. Verified at `ba143353d4` (`origin/claude/issue-batch-after-v0.13.0`, draft
-PR #213).
+PR #213). Line references are to that commit.
+
+## Revision 2 (2026-10-30)
+
+This revision answers the Codex design review, the advisor's additions, and the user's
+answers to the seven questions. Every finding below was checked against the source before
+it was accepted. None was refuted.
+
+| #   | Finding                                                                                                           | Resolution                                                                                                                                                                                                                                    |
+| --- | ----------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| P1  | The off switch does not stop detached writes: `McpControl::call` reads `enabled` once (`mcp/control.rs:428`)      | **Accepted (F0).** An owned mutation observes the live off switch, read-only and revocation. It holds its admission until it settles, and an interruption records `unknown`, never success ([C4](#c4-retries-for-rpcs-without-receipts))      |
+| P2  | Provider and relay bearers have no audience; `X-Forwarded-Host` is trusted from any loopback peer (`http.rs:191`) | **Accepted (R).** Provider and relay bearers are accepted only on a direct local request. The forwarded-header rule is narrowed so a client value can no longer replace `Host` through the tunnel ([Origins](#origins-and-forwarded-headers)) |
+| P2  | Remote OAuth still issues a 30-day bearer                                                                         | **Accepted (R).** One-hour access tokens and a rotating refresh token, with reuse detection. Both harnesses refresh (see [Harness facts](#harness-facts-design-inputs))                                                                       |
+| P2  | Unauthenticated requests can take every consent slot                                                              | **Accepted (R).** Per-client and per-source caps, and a global cap that keeps headroom for others ([Admission](#admission-for-unauthenticated-routes))                                                                                        |
+| P2  | The origin gate would break the existing `POST /oauth/token` exchange (`auth/http.rs:40`, `:119`)                 | **Accepted (R).** The rule applies per `grant_type`: the RFC 8693 exchange is unchanged                                                                                                                                                       |
+| P2  | The stream collector ignores `action_failed`/`action_finished` (`production/git_vcs.rs:1613`, `:1618`)            | **Accepted (F0).** The collector normalizes both stream schemas, and tests cover each terminal event and a close before one ([C3](#c3-stream-invocation))                                                                                     |
+| P2  | Git pathspec magic: `validate_pathspecs` checks components only (`git/repository.rs:11528-11549`)                 | **Accepted (G).** Literal pathspecs at the Git boundary for every caller, glob and magic syntax refused by the tool, and symlink containment checked where the operation runs ([C5](#c5-thread-targets-and-paths))                            |
+| P2  | `idempotentHint` on `git_stage`, `git_unstage` and `interrupt_turn` (slice 1 sets it, `mcp/control.rs:567`)       | **Accepted.** The hint is removed from all three ([C2](#c2-annotations)). F0 fixes slice 1's `interrupt_turn`: it resolves the running turn and dispatches nothing when no turn runs                                                          |
+| P2  | Branch delete is local first, then remote (`git/manager/operations.rs:1229-1261`): a remote failure is lost       | **Accepted (G).** The tool deletes in two steps and returns a typed partial outcome naming `git_delete_remote_branch`, a new remote-only operation                                                                                            |
+
+**Advisor additions:**
+
+- **Codex as an OAuth client** is now a design input. Its source (rust-v0.165.0) and the
+  `rmcp` revision it pins were read. Slice R is shaped to what both harnesses do: see
+  [Harness facts](#harness-facts-design-inputs).
+- **Tunnel headers** were settled from source: the managed tunnel delivers the public
+  hostname in `Host`, and whether the edge strips a client's `X-Forwarded-*` cannot be
+  known from this repository. Slice R therefore does not depend on forwarded headers for
+  the tunnel ([Origins](#origins-and-forwarded-headers)).
+
+**Questions resolved by the user (2026-10-30):**
+
+1. Destructive tools work at every operate level (kept).
+2. `anthropic/requiresUserInteraction` stays off.
+3. Terminals need all three gates, and a remote client reauthorizes to gain the terminal
+   scope.
+4. Remote consent is approved in BiBCode, bound to the exact client, redirect URI,
+   resource and scopes.
+5. DCR now; CIMD is a recorded follow-up.
+6. Short-lived remote access tokens, with rotating refresh tokens (both harnesses refresh).
+7. The extended scope of 2026-10-27 is designed in this round, with actor attribution
+   early: slices X1 to X8 below.
+
+The [Implementation partition](#implementation-partition) is rewritten as waves of at most
+four writers.
 
 ## Goal
 
@@ -34,19 +78,27 @@ What protection remains is set out honestly in [Safety model](#c6-safety-model-f
 
 ### In scope
 
-| Slice    | What                                                                                                                                                              |
-| -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **F0**   | Foundation: tool families, kind-aware registration, stream invocation, recorded outcomes for RPCs without receipts, thread targets, the terminal setting contract |
-| **A**    | Thread tools: `answer_approval`, `revert_thread_to_turn`, attachments on `start_thread`/`send_message`                                                            |
-| **W**    | Worktree tools: list, create, removal plan, remove                                                                                                                |
-| **G**    | Git write tools: stage, unstage, commit, undo commit, revert commit, push, force-push, fetch, pull, branch create/switch/delete, discard                          |
-| **P**    | Pull request tools: create, list, view, checks, update, merge                                                                                                     |
-| **T**    | Terminal tools under `terminal:operate`                                                                                                                           |
-| **D**    | Device and browser preview tools for outside agents                                                                                                               |
-| **R**    | Remote Streamable HTTP at `<environment>/mcp` with MCP OAuth                                                                                                      |
-| **Z**    | Cross-cutting docs, runbooks, and the `bibcode-mcp` skill and evals                                                                                               |
-| —        | `bibcode thread` CLI: designed in slice 1 ("CLI front end"), implemented in parallel by another writer, and not redesigned here (see [CLI](#bibcode-thread-cli))  |
-| Deferred | The Tasks extension and resources, with reasons (see [Deferred](#deferred-tasks-and-resources))                                                                   |
+| Slice    | What                                                                                                                                                                                      |
+| -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **F0**   | Foundation: tool families, kind-aware registration, stream invocation, recorded outcomes that obey the live off switch, thread targets, capability sets, the slice-1 `interrupt_turn` fix |
+| **A**    | Thread tools: `answer_approval`, `revert_thread_to_turn`, attachments on `start_thread`/`send_message`                                                                                    |
+| **W**    | Worktree tools: list, create, removal plan, remove                                                                                                                                        |
+| **G**    | Git write tools: stage, unstage, commit, undo commit, revert commit, push, force-push, fetch, pull, branch create/switch/delete, remote branch delete, discard                            |
+| **P**    | Pull request tools: create, list, view, checks, update, merge                                                                                                                             |
+| **T**    | Terminal tools under `terminal:operate`                                                                                                                                                   |
+| **D**    | Device and browser preview tools for outside agents                                                                                                                                       |
+| **X1**   | Actor attribution: who acted, on events, messages and threads; the agent activity log, indicator, **Stop** and **Take over**                                                              |
+| **X2**   | Diagnostics tools: profiler, environment report, processes, traces, server logs                                                                                                           |
+| **X3**   | `server_capabilities` and the `changes_since` feed                                                                                                                                        |
+| **X4**   | Chat panels, `send_panel_message`, and the advisory `focus_ui` intent                                                                                                                     |
+| **X5**   | Workspace file tools: list, read, search, write, create, rename, delete, download, upload                                                                                                 |
+| **X6**   | Clone tools: clone, status, cancel                                                                                                                                                        |
+| **X7**   | Source Control reads and the server-side commit draft                                                                                                                                     |
+| **X8**   | Outbound webhooks and the Agent integrations MCP and Webhooks tabs                                                                                                                        |
+| **R**    | Remote Streamable HTTP at `<environment>/mcp` with MCP OAuth                                                                                                                              |
+| **Z**    | Cross-cutting docs, runbooks, and the `bibcode-mcp` skill and evals                                                                                                                       |
+| —        | `bibcode thread` CLI: designed in slice 1 ("CLI front end"), implemented in parallel by another writer, and not redesigned here (see [CLI](#bibcode-thread-cli))                          |
+| Deferred | The Tasks extension and resources, with reasons (see [Deferred](#deferred-tasks-and-resources))                                                                                           |
 
 ### Out of scope
 
@@ -55,16 +107,32 @@ What protection remains is set out honestly in [Safety model](#c6-safety-model-f
   `cloud.*`, `connect.*` or `agentSessions.*`. The audience rule still keeps an
   `mcp-client` session off every RPC and HTTP route except `/mcp` (slice 1). The new
   OAuth routes take no MCP bearer.
-- The extended scope of 2026-10-27 (sections A and B). Where it overlaps a slice here, the
-  slice here takes its place:
-  - `scm_stage`, `scm_commit`, `scm_run_operation` and `scm_discard` become slice G;
-  - `create_worktree` and `list_worktrees` become slice W;
-  - `open_terminal_panel` becomes slice T.
+- A server-side environment registry and a cross-environment proxy (extended-scope gap
+  12). Each environment keeps its own `/mcp`, and an agent registers one server per
+  environment. A registry would make one server the owner of other environments'
+  credentials, which `remote.md` rules out for the relay too.
+- `export_diagnostic_bundle`: see slice X2.
 
-  The rest needs its own design, because each part adds new server state or a new event
-  kind: diagnostics tools, clone, files and transfers, `focus_ui`, `send_panel_message`,
-  `changes_since`, `server_capabilities`, actor attribution, the server-side commit draft,
-  webhooks, and per-environment capability sets. See Question 7.
+**How the extended scope of 2026-10-27 maps onto these slices.** The user included it in
+this round (Question 7):
+
+| Extended-scope item                                                                                      | Slice                                                                                        |
+| -------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| `scm_stage`, `scm_unstage`, `scm_commit`, `scm_run_operation`, `scm_discard`, `scm_undo_commit`          | G (hunk staging stays out, as G explains)                                                    |
+| `scm_status`, `scm_diff`, `scm_log`, `scm_refs`, `scm_set_commit_message`, `scm_generate_commit_message` | slice 1's `git_status`, and X7                                                               |
+| `create_worktree`, `list_worktrees`                                                                      | W                                                                                            |
+| `open_terminal_panel`                                                                                    | T                                                                                            |
+| `list_pending_requests`, `answer_pending_request`                                                        | slice 1's `list_pending_requests` and `answer_question`, and A's `answer_approval`           |
+| Diagnostics (section A)                                                                                  | X2                                                                                           |
+| `clone_repository`, `clone_status`, `cancel_clone`                                                       | X6                                                                                           |
+| `create_chat_panel`, `list_chat_panels`, `send_panel_message`, `focus_ui`                                | X4                                                                                           |
+| `files_*`                                                                                                | X5                                                                                           |
+| Actor attribution, requester metadata, agent indicator, Stop, Take over                                  | X1                                                                                           |
+| `server_capabilities`, `changes_since`                                                                   | X3                                                                                           |
+| Per-environment capability sets                                                                          | F0 (contract, enforcement), T (switches)                                                     |
+| Outbound webhooks, the Agent integrations tabs                                                           | X8                                                                                           |
+| Typed errors                                                                                             | every slice, through the tag table in X3                                                     |
+| "Approval in the UI" and "MCP never answers its own approval"                                            | superseded by the [user decision](#user-decision-2026-10-30): destructive tools run directly |
 
 ## Current behavior (verified at ba143353d4)
 
@@ -180,6 +248,97 @@ RPC surface for the new tools:
 - **Skill.** `docs/skills/bibcode-mcp/evals/evals.json` eval 2 ("just approve it")
   expects the agent to refuse and relay the approval.
 
+Facts this revision adds (verified at `ba143353d4`):
+
+- **Off switch and revocation.** `McpControl::call` checks `enabled` once, at its start
+  (`mcp/control.rs:428`); its shutdown token is separate (`:367`, `:376-378`).
+  `AuthService::revoke_session` cancels every token registered for the session through
+  `mark_connected_guard` (`auth/service.rs:1941-1975`, `:2054`; registry `:211`).
+- **`interrupt_turn`.** `turnId` is optional, each call mints a fresh `commandId`
+  (`mcp/control.rs:1530-1547`), and `describe` hardcodes `idempotentHint` for it (`:567`).
+  The engine's interrupt holds the thread's queue and expires its pending requests whether
+  or not a turn runs (`orchestration/engine.rs:5496-5525`).
+- **Stacked actions** emit `action_started`, `action_finished` and `action_failed`
+  (`production/git_vcs.rs:1522`, `:1613`, `:1618`), not the git manager's `finished` and
+  `failed` (`packages/contracts/src/gitManager.ts:343-363`).
+- **Pathspecs.** `validate_pathspecs` refuses absolute paths and non-`Normal` components
+  only (`git/repository.rs:11528-11549`), so `:(glob)**` passes. Nothing in the Git layer
+  sets `--literal-pathspecs`. `discard_paths` joins each path onto `cwd` for the trash
+  without a containment check (`git/manager/operations.rs:2269-2283`).
+- **Branch delete** deletes the local branch, then the remote one, and a remote failure
+  returns an error that carries the local success (`git/manager/operations.rs:1229-1261`).
+- **Forwarded headers.** From a loopback peer, the first `X-Forwarded-Host` replaces `Host`,
+  and the header stays on the request (`http.rs:191-208`). An existing check treats a
+  request as direct only when its `Host` is loopback and no `X-Forwarded-*` header is
+  present (`production/connect_mcp.rs:1609-1612`).
+- **Provider endpoint.** Providers are given `http://<bound address>/mcp`, loopback for a
+  wildcard bind (`lifecycle.rs:918-931`). The relay dials the record's `dialHost`, which is
+  loopback (`mcp/endpoint.rs:1-16`).
+- **Managed tunnel.** The relay configures Cloudflare Tunnel ingress as
+  `{ hostname, service }` per hostname and a final `http_status:404`, with no
+  `originRequest` options (`infra/relay/src/environments/ManagedEndpointProvider.ts:741-753`).
+  The connector runs on the host (`production/managed_endpoint.rs`), so its peer is
+  loopback. The preview gateway recognizes tunnel traffic by a loopback socket plus a
+  `Host` that names the managed hostname (`preview/gateway/relay.rs:85-91`), so the public
+  hostname arrives in `Host`. Whether the edge removes a client's `X-Forwarded-Host` or
+  `X-Forwarded-Proto` is not visible in this repository.
+- **Tokens.** Session tokens are signed `SessionClaims` with their own `exp`
+  (`auth/token.rs:73-85`). A one-hour session lifetime already exists for DPoP sessions
+  (`auth/service.rs:41`).
+- **Attribution.** `OrchestrationEventMetadata` has no actor
+  (`packages/contracts/src/orchestration.ts:1480-1486`). `plan_command` starts every
+  client event with empty metadata (`orchestration/engine.rs:3889`).
+  `orchestration_events.actor_kind` exists (`persistence/migrations.rs:840`), but
+  `infer_actor_kind` (`engine.rs:8122`) reads only a command-id prefix, so MCP and UI
+  commands both read `client`, and `wire_event` never sends it
+  (`production/orchestration_rpc.rs:2116-2130`). The dispatch handler has the principal in
+  its context (`orchestration_rpc.rs:133-137`, `rpc/session.rs:398`), and MCP calls carry
+  their `mcp-client` principal into it (`mcp/control.rs:793-798`). No message, thread or
+  worktree records who created it.
+- **Event sequence.** `orchestration_events.sequence` is a global autoincrement
+  (`persistence/migrations.rs:830`). `orchestration.replayEvents {fromSequenceExclusive}`
+  pages events (`production/orchestration_rpc.rs:176-215`, `:2250`). Nothing prunes the
+  table. Worktree catalog, git manager and project entries signals carry only in-memory
+  generations, or none (`worktree_catalog/service.rs:1029`, `git/broadcaster.rs:154`,
+  `packages/contracts/src/project.ts:57-60`).
+- **Panels and open requests.** `worktree.createPanel` takes a `commandId` and replays by
+  claim (`production/worktree_catalog_rpc.rs:1399-1498`). Every client adopts a live
+  panel as an inactive tab (`apps/web/src/centerPanelAdoption.ts:90-127`). Preview open
+  requests are in-memory, expire after 60 s, allow 64 per thread, and the first
+  `claimOpenRequest` wins (`preview/mod.rs:24-27`, `:483-536`;
+  `apps/web/src/components/preview/OpenRequestRouter.tsx:25`).
+- **Workspace files.** Reads cap at 1 MiB and refuse binary content
+  (`workspace/service.rs:19`, `:262-285`). `writeFileIfUnchanged` takes a version or
+  `missing` precondition under a per-path lock (`:344-375`); no write size cap exists.
+  `deleteEntry` hard-deletes (`:486-512`). Reads and deletes check symlink containment,
+  writes check the deepest existing ancestor (`workspace/paths.rs:33-100`). Transfer URLs
+  last 5 minutes and are their own authority (`transfer/mod.rs:15`,
+  `production/transfer_routes.rs:1-6`); `?overwrite=1` is a query flag, not part of the
+  token (`production/http_routes.rs:705`).
+- **Clone.** `vcs.clone` is unary, with no server progress; one live clone per destination,
+  16 at once, and `detach: true` keeps it running after the caller leaves
+  (`production/clone_operations.rs:1-41`, `:286`). No setting limits where clones go
+  (`production/host_paths.rs:24`). The web registers the project with a separate
+  `project.create` (`apps/web/src/components/add-project/useAddProjectWorkflow.ts:715-750`).
+- **Commit draft.** It lives only in browser storage, keyed by environment and `cwd`
+  (`apps/web/src/sourceControlPanelStore.ts:41`, `:90-94`;
+  `apps/web/src/sourceControlDraft.ts:12-15`). `vcs.generateCommitMessage` is
+  deterministic ("Update <paths>", `production/git_vcs.rs:3316`).
+- **Diagnostics.** The profiler's stdio tools are private, pure functions over a disk
+  `Reader` (`diagnostics/profiler/mcp.rs:89-254`, `reader.rs:119`).
+  `server.getProcessDiagnostics` returns raw command lines without redaction
+  (`production/server_terminal.rs:589`, `:1843`). `server.getConfig` includes
+  `mcpLaunch.argv`, paths and the full settings (`production/control.rs:467-489`,
+  `:2077-2091`). `server.log` rotates at 4 MiB with 3 backups (`logging.rs:21-22`), and
+  `redact_sensitive_text` blanks a line's tail after a credential marker
+  (`diagnostics/trace.rs:474`).
+- **Webhooks.** None exist. `reqwest` and `hmac` are dependencies (`apps/server/Cargo.toml:37`,
+  `:55`). `SecretStore` keeps 0600 plaintext files (`auth/secret_store.rs:18`, `:549`).
+- **Agent integrations.** The section renders the environment picker, the MCP server
+  switch, **Agents may**, and the launch commands
+  (`apps/web/src/components/settings/AgentIntegrationsSection.tsx:66-277`). It lists no
+  authorized clients.
+
 ## Cross-cutting decisions
 
 These rules apply to every tool slice. F0 builds the mechanisms.
@@ -233,15 +392,23 @@ These follow the 2026-07-28 tool annotations, plus Claude Code's documented beha
 - **`git_revert_commit` is not destructive.** It adds a commit and loses nothing. It is
   still listed in the user's set of operations in the Safety model, and is logged as
   destructive.
-- **`idempotentHint`** is set only when a blind repeat with the same arguments is
-  harmless **without** a `clientRequestId`:
+- **`idempotentHint`** is set only when a repeat with the same arguments has no further
+  effect **without** a `clientRequestId`, whatever changed in between. Hints are per tool,
+  not per call, so a tool qualifies only if every argument combination does:
   - reads;
-  - `interrupt_turn`;
-  - `git_stage` and `git_unstage`;
   - `git_fetch`;
   - `terminal_resize`.
 
-  Destructive tools never carry it, so a harness never repeats them on its own.
+  Not idempotent, after the review:
+  - `git_stage` and `git_unstage` act on the file's state at call time
+    (`production/git_vcs.rs:628-640`). If a person edits or stages the file between two
+    calls, a repeat changes the index again.
+  - `interrupt_turn` with no `turnId` would stop whatever runs next. Slice 1 marks it
+    idempotent (`mcp/control.rs:567`); F0 removes the hint.
+
+  Destructive tools never carry it, so a harness never repeats them on its own. Claude
+  Code repeats an `idempotentHint` or `readOnlyHint` call once, on a new connection, when
+  the old one closed with the call pending (its MCP docs, "safe to call twice").
 
 - **`openWorldHint`** marks tools that touch a remote or hosting service: push, fetch,
   pull, and every pull request tool.
@@ -267,7 +434,16 @@ them.
   stream handler. It drains the chunks into a bounded collector: the last 64 `output`
   events, capped at 16,000 characters, and the terminal event. It returns
   `Ok(final event)` or `Err(typed error)`.
-  - A `failed` event becomes a typed tool error carrying its `code` and `blocked` reason.
+  - **Two stream schemas.** The collector takes a `StreamSchema` per method, so success
+    and failure are explicit, never inferred from "the last chunk":
+    - `gitManager.runOperation`: `output` lines; `finished` is success; `failed` is a typed
+      tool error carrying its `code` and `blocked` reason (`gitManager.ts:343-363`).
+    - `git.runStackedAction`: `action_finished` is success; `action_failed` is a typed
+      tool error carrying its `phase` and message (`git_vcs.rs:1613`, `:1618`). The other
+      `action_*` progress kinds count as output.
+    - Any other kind is ignored and counted. A stream that **ends before a terminal
+      event**, or whose receiver closes first, returns `McpStreamEndedError`. Under a
+      recorded outcome (C4) that is `unknown`, never success.
   - Cancelling the token, or reaching the budget, drops the receiver. This is the same
     path a WebSocket client's disconnect takes, so the handler stops as it does today.
   - One mechanism serves every stream-only operation, and the Source Control panel keeps
@@ -299,11 +475,12 @@ How a call with a `clientRequestId` runs:
 1. One SQLite job runs `INSERT OR IGNORE` with `state = 'running'` and the exact RPC
    payload, then reads the row back. The tool and digest checks are slice 1's
    (`idempotency_conflict`).
-2. **New row.** The call runs as a task owned by `McpControl`, so a cancelled MCP call
-   stops waiting but not the work. It writes `state = 'done'` with the bounded tool
-   result, or `state = 'failed'` with the typed error. An in-process claim map holds the
-   key while the task runs.
-3. **Row is `done` or `failed`.** The call returns the stored outcome unchanged.
+2. **New row.** The call runs as a task owned by `McpControl` (an **owned mutation**), so
+   a cancelled MCP call stops waiting but not the work. It writes `state = 'done'` with the
+   bounded tool result, or `state = 'failed'` with the typed error. An in-process claim map
+   holds the key while the task runs. The owned mutation obeys the live controls (below).
+3. **Row is `done`, `failed` or `unknown`.** The call returns the stored outcome unchanged;
+   `unknown` returns `McpOutcomeUnknownError` with its reason.
 4. **Row is `running` and the claim is held** (a concurrent retry). The call awaits the
    claim within its own deadline, then reads the outcome.
 5. **Row is `running` with no claim** (the server restarted or crashed mid-call). The
@@ -315,20 +492,66 @@ Without a `clientRequestId`, a call runs inline and cancellation propagates, as 
 Stored outcomes are tool results, capped at 80,000 characters. They are pruned at 24 hours
 with their rows, like slice 1's.
 
+**Live controls for owned mutations (review P1).** Without these, a keyed force-push could
+finish after the person turned MCP off, because `call` checks `enabled` only at its start
+(`mcp/control.rs:428`). Each owned mutation:
+
+- **Runs under one cancellation token**, the child of three sources:
+  - `McpControl::shutdown`;
+  - a settings watch that fires when `enabled` turns off or the effective ceiling drops to
+    `read-only` (`McpControl` already holds the `watch::Receiver`, `mcp/control.rs:308`, `:549`);
+  - the session's revocation: the task registers through
+    `AuthService::mark_connected_guard(session_id, token)` (`auth/service.rs:2054`), so
+    `revoke_session` cancels it (`:1951`). The guard also makes the client show as
+    connected in Authorized clients while it works.
+- **Passes that token to the RPC handler** as its cancellation, so Git and the hosting
+  client stop as they do on a UI disconnect.
+- **Holds its admission until it settles.** The registry admission permit, and one of
+  `McpControl`'s new owned-mutation slots (2 per session, 8 per environment), are released
+  when the outcome is written, not when the MCP call returns. Cancel-and-retry therefore
+  cannot pile up detached work. A call over the limit gets `McpBusyError`.
+- **Records `unknown` when interrupted.** If the token fires before the handler returns a
+  terminal result, the row becomes `state = 'unknown'` with the reason (`mcp-disabled`,
+  `read-only`, `revoked` or `shutdown`). A push or PR create cut off mid-flight may or may
+  not have reached the remote, so success is never claimed. If the handler returns its
+  terminal result first, that result is recorded.
+
+Handler-owned operations are not owned mutations and are not aborted: an engine command
+already accepted, and a worktree removal running in the catalog's own
+`operation_runtime` (slice W). Aborting a removal part-way leaves orphan cleanup, which is
+worse than finishing it; it is local and bounded. The off switch refuses their next call.
+
 ### C5. Thread targets and paths
 
 Every workspace tool takes `threadId`. The server resolves `cwd` (the thread's worktree
 path, else the project root) and `projectId`. `git_status`'s resolver (`control.rs:1609-1630`)
 moves to a shared `mcp/target.rs`.
 
-Tools that name files (`git_stage`, `git_unstage`, `git_discard`) take workspace-relative
-paths. This extends slice 1's "ids, never paths" rule, because the operations are
-file-scoped:
+Tools that name files (`git_stage`, `git_unstage`, `git_discard`, and the `files_*` tools
+of X5) take workspace-relative paths. This extends slice 1's "ids, never paths" rule,
+because the operations are file-scoped. The rules are checked in two places.
+
+**In the tool (`mcp/target.rs`), before any RPC:**
 
 - each path is at most `PROJECT_ENTRY_PATH_MAX_LENGTH`;
-- a path that is absolute, contains `..` or NUL, or resolves outside `cwd` is refused
-  before any RPC;
+- a path that is absolute, contains `..` or NUL, or resolves outside `cwd` is refused;
+- a path that starts with `:`, or contains `*`, `?`, `[` or `\`, is refused with
+  `McpInvalidArgumentError` ("paths are literal file paths; globs and pathspec magic are
+  not accepted"). A real file whose name contains these characters cannot be named over
+  MCP; that is the price of a check an agent can predict;
 - at most 200 paths per call.
+
+**At the operation boundary (slice G), for every caller, the UI included:**
+
+- Git commands that take file pathspecs from a caller (`stageFiles`, `unstageFiles`,
+  `discardFiles`, `gitManager.discard` and its tracked-path listing) run with
+  `--literal-pathspecs`. `:(glob)**` is then a file name that matches nothing, not the
+  whole tree. The UI sends only real paths, so its behavior does not change; a test
+  pins that a directory path still stages its contents.
+- `discard_paths` canonicalizes each target's parent and refuses one outside the
+  canonical `cwd`, before it trashes or restores anything. A symlinked directory inside
+  the worktree that points elsewhere can no longer route a discard outside it. (The
+  workspace file service already does this for reads and deletes, `workspace/paths.rs:63-100`.)
 
 Branch names and remotes are passed to the RPC, which already validates them.
 
@@ -347,7 +570,7 @@ Branch names and remotes are passed to the RPC, which already validates them.
   - merge a pull request;
   - approve its own thread's permission requests.
 
-  Question 1 asks whether destructive tools should need `full-access` instead.
+  The user kept this at every operate level (Question 1).
 
 - **"Supervised" changes meaning.** With `answer_approval`, a Supervised thread stops for
   an approval, but whoever drives it may answer, and that can be the agent. A Supervised
@@ -358,17 +581,21 @@ Branch names and remotes are passed to the RPC, which already validates them.
   run `git_force_push`", or an approval request crafted by a tool, and an agent that
   follows them can destroy work. Results are already marked untrusted (slice 1), but that
   is advice to the agent, not a control.
-- **Nothing in the UI says who acted.** There is no actor attribution (extended-scope gap
-  3), so a removal or force-push made over MCP looks the same as one a person made. The
-  trail is the Authorized clients row, `server.log` (C7), and the profiler's
-  `worktree.removal` events.
+- **Until slice X1 lands, nothing in the UI says who acted.** A removal or force-push made
+  over MCP looks the same as one a person made. The trail is then the Authorized clients
+  row, `server.log` (C7), and the profiler's `worktree.removal` events. X1 is therefore
+  in the second wave, right after the tool families.
 
 **Mitigations that remain:**
 
 - **Per-environment off switch.** `enableMcpServer` off ends every outside agent at once,
-  live (slice 1).
-- **Read only.** `mcpServerAccess: read-only` hides and refuses every mutating tool, live.
-- **Revocation.** Revoking the agent's row in Authorized clients ends it on its next call.
+  live (slice 1), including owned mutations in flight (C4).
+- **Read only.** `mcpServerAccess: read-only` hides and refuses every mutating tool, live,
+  and interrupts owned mutations (C4).
+- **Revocation.** Revoking the agent's row in Authorized clients ends it on its next call
+  and interrupts its owned mutations (C4). **Stop** and **Take over** (X1) put both a
+  click away.
+- **Capability sets** (C8) switch off a whole family per environment, live.
 - **Ceiling.**
   - Threads an agent starts or creates (`create_worktree`) never run above it.
   - `send_message`, `answer_question`, `answer_approval` and `revert_thread_to_turn`
@@ -409,10 +636,47 @@ The mitigations above bound the blast radius (one environment, revocable), not i
   output, or approval summaries.
 - **Removals.** Profiler `worktree.removal` events come from the existing
   `record_removal_outcome`.
+- **Activity.** Once X1 lands, every mutating call also writes one activity row that the
+  UI shows (X1). It holds no content either.
+
+### C8. Capability sets
+
+The extended scope asks to enable families per environment, for example full control
+locally and read-only diagnostics on a production remote.
+
+**Alternatives:**
+
+- One boolean per family, added as each slice lands (`mcpAllowTerminals`, then more).
+  Each slice would then add its own setting, check and switch.
+- **Chosen:** one setting, `mcpCapabilities`, defined once in F0:
+
+  | Set             | Tools                                   | Default |
+  | --------------- | --------------------------------------- | ------- |
+  | `workspace`     | slice 1's thread tools, A, W, D, X4, X6 | on      |
+  | `sourceControl` | slice 1's `git_status`, G, P, X7        | on      |
+  | `files`         | X5                                      | on      |
+  | `diagnostics`   | X2                                      | on      |
+  | `terminals`     | T                                       | **off** |
+
+  `server_capabilities` and `changes_since` (X3) belong to no set and are always listed.
+  The defaults keep slice 1's behavior, and the user's "included fully" decision, for
+  everything but terminals.
+
+**Enforcement.** `ToolSpec` gains `capability`. `tools()` hides a tool whose set is off,
+and `call` refuses it with `McpCapabilityDisabledError` ("Turn on <set> for MCP agents in
+Settings → Agent integrations"). Both read the live settings, as the ceiling does, so a
+change applies without a restart. A harness that cached its list keeps showing the tools;
+their calls fail typed.
 
 ## Slice F0: Foundation
 
-**Owns:** C1 to C5, migration 59, and the contract for the terminal setting.
+**Owns:** C1 to C5 and C8, migration 59, the live controls for owned mutations, and the
+slice-1 `interrupt_turn` fix.
+
+F0 starts from the batch branch after the `bibcode thread` CLI (branch
+`claude/v0131-139-cli`) lands there. That branch edits `mcp/control.rs` (`tool_text`,
+`list_projects_and_threads`, `read_thread`) and `mcp/relay.rs`, which F0 moves; the CLI's
+changes then move with the code instead of conflicting with it.
 
 **Changes:**
 
@@ -433,16 +697,28 @@ The mitigations above bound the blast radius (one environment, revocable), not i
 - **Migration 59, `McpToolOutcomes`.** `ALTER TABLE mcp_tool_requests ADD COLUMN state TEXT
 NOT NULL DEFAULT 'commands'` and `ADD COLUMN outcome_json TEXT`. Slice-1 rows read as
   `commands` and keep their receipt replay.
-- **Terminal setting contract.**
-  - `ServerSettings`/`ServerSettingsPatch` gain `mcpAllowTerminals` (default `false`),
-    with fixtures (`packages/contracts/src/settings.ts`).
+- **Capability sets contract (C8).**
+  - `ServerSettings`/`ServerSettingsPatch` gain `mcpCapabilities` (the five booleans
+    above; the patch takes any subset), with fixtures (`packages/contracts/src/settings.ts`).
   - It is validated and published on `mcp_server_signal()`, and `McpServerSettings` gains
-    `allow_terminals` (`production/control.rs`, `mcp/control.rs:106-135`).
+    `capabilities` (`production/control.rs`, `mcp/control.rs:106-135`).
 - **Issuer.** `issue_mcp_pairing_link` takes an optional extra-scope list, which only
   `terminal:operate` may use.
-  - The relay asks for it when `mcpAllowTerminals` is on **and** the ceiling is
+  - The relay asks for it when `mcpCapabilities.terminals` is on **and** the ceiling is
     `full-access` at mint time.
   - The relay mints on its first request (slice-1 implementation note).
+- **Live controls (C4).** `mcp/outcome.rs` runs owned mutations under the combined token,
+  holds their slots to settlement, and writes `unknown` on interruption.
+- **`interrupt_turn` fix (review P2, slice-1 code in PR #213).**
+  - Without `turnId`, the tool reads the thread's running turn (its `latest_turn_id` while
+    the latest turn is `running`) and puts that id in the command.
+  - When the named or resolved turn is not running, it dispatches nothing and returns
+    `{ interruptRequested: false, turnRunning: false }`. A repeat therefore never holds the
+    queue or expires the requests of a turn that started later
+    (`orchestration/engine.rs:5496-5525`).
+  - The hardcoded `idempotentHint` (`mcp/control.rs:567`) is removed, because hints are per
+    tool. The race between the check and the dispatch remains; the UI's stop button has
+    the same one.
 - **Profiler.** `diagnostics/profiler/latency.rs` gets the kind-aware lookup.
 - **Tests.** `production/mcp_tools_tests.rs` becomes a directory module
   (`mcp_tools_tests/mod.rs` plus `threads.rs`), so each slice adds its own test file.
@@ -450,9 +726,9 @@ NOT NULL DEFAULT 'commands'` and `ADD COLUMN outcome_json TEXT`. Slice-1 rows re
 **Failure and cancellation:**
 
 - `invoke_local_stream` drops its receiver on cancel, budget and shutdown.
-- Recorded-outcome tasks are tracked in `McpControl` and stop at `McpControl::shutdown`.
-  A row left `running` answers `McpOutcomeUnknownError` on its next retry, which is never
-  a false success.
+- Owned mutations are tracked in `McpControl` and stop at `McpControl::shutdown`, the off
+  switch, read-only and revocation (C4). A row left `running` by a crash answers
+  `McpOutcomeUnknownError` on its next retry, which is never a false success.
 
 **Tests (written to fail first):**
 
@@ -462,8 +738,10 @@ NOT NULL DEFAULT 'commands'` and `ADD COLUMN outcome_json TEXT`. Slice-1 rows re
   and each kind's `tools/list` shows only its own.
 - **Hints.** `describe` emits `destructiveHint: true` for a spec marked destructive.
   Today it hardcodes `false`.
-- **Stream invocation**, through a fake stream handler:
-  - `failed` becomes a typed error with `code`;
+- **Stream invocation**, through fake stream handlers of both schemas:
+  - `failed` and `action_failed` each become a typed error, with `code` or `phase`;
+  - `finished` and `action_finished` each become success;
+  - a stream that closes before a terminal event returns `McpStreamEndedError`;
   - cancel mid-stream drops the receiver;
   - an `output` flood is capped at the collector's bound;
   - a stream method without the scope is refused before the handler runs.
@@ -472,9 +750,23 @@ NOT NULL DEFAULT 'commands'` and `ADD COLUMN outcome_json TEXT`. Slice-1 rows re
   - concurrent calls run it once;
   - a `running` row with no claim returns `McpOutcomeUnknownError` and does not run;
   - another digest returns `idempotency_conflict`;
-  - a slice-1 `commands` row still replays by receipt.
+  - a slice-1 `commands` row still replays by receipt;
+  - a keyed retry after each of success, typed failure and stream-ended returns the
+    stored outcome without running the handler.
+- **Live controls**, with a fake handler that blocks until cancelled:
+  - turning `enableMcpServer` off mid-call cancels the handler and records `unknown`
+    (`mcp-disabled`); a retry returns `McpOutcomeUnknownError`;
+  - dropping the ceiling to read-only, and revoking the session, do the same;
+  - a handler that finishes before the switch records its result;
+  - the MCP call cancelled by its client leaves the handler running, and a third
+    owned mutation for the session gets `McpBusyError` until one settles.
+- **`interrupt_turn`.** With no running turn it dispatches nothing; a second call after
+  the turn ended does not hold the queue of a turn queued behind it; `tools/list` no
+  longer marks it idempotent.
+- **Capability sets.** With `files` off, the X5 tools are hidden and refused with
+  `McpCapabilityDisabledError`, live; the defaults list every slice-1 tool.
 - **Paths.** Path validation refuses absolute paths, `..`, NUL, a symlink that escapes
-  `cwd`, and 201 paths.
+  `cwd`, `:(glob)**`, `*.rs`, and 201 paths.
 - **Unchanged behavior.** The slice-1 integration suite passes unchanged after the move,
   and the provider `preview_*`/`device_*` suite in `connect_mcp/tests.rs` passes
   unchanged.
@@ -630,21 +922,22 @@ Every tool here takes `threadId` (C5), and the server adds `cwd` and `projectId`
 use recorded outcomes (C4). Push, fetch and pull are marked `long_running: true`, because they
 wait on a network.
 
-| Tool                | Arguments                                                                                               | Maps to                                                                                                            | Hints                           |
-| ------------------- | ------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ | ------------------------------- |
-| `git_stage`         | `paths[]`                                                                                               | `vcs.stageFiles`                                                                                                   | idempotent                      |
-| `git_unstage`       | `paths[]`                                                                                               | `vcs.unstageFiles`                                                                                                 | idempotent                      |
-| `git_commit`        | `summary`, `description?`, `clientRequestId?`                                                           | `gitManager.commit` with `amend: false`, `noVerify: false`, `signoff: false`, `allowEmpty: false`, `coAuthors: []` | not idempotent                  |
-| `git_undo_commit`   | `clientRequestId?`                                                                                      | `gitManager.undoCommit`                                                                                            | **destructive**                 |
-| `git_revert_commit` | `sha`, `clientRequestId?`                                                                               | `runOperation revert`                                                                                              | not destructive (adds a commit) |
-| `git_push`          | `remote?` (upstream or `origin`), `branch?` (current), `remoteBranch?`, `pushTags?`, `clientRequestId?` | `runOperation push`, or `publish-branch` when there is no upstream                                                 | open world                      |
-| `git_force_push`    | the same as `git_push`                                                                                  | `runOperation force-push` (`--force-with-lease`)                                                                   | **destructive**, open world     |
-| `git_fetch`         | `remote?`                                                                                               | `runOperation fetch`                                                                                               | idempotent, open world          |
-| `git_pull`          | `remote?`, `clientRequestId?`                                                                           | `runOperation pull`                                                                                                | open world                      |
-| `git_create_branch` | `name`, `startPoint?`, `checkout` (true)                                                                | `runOperation branch-create`                                                                                       | —                               |
-| `git_switch_branch` | `name`, `carryChanges?` (`stash` or `bring`)                                                            | `runOperation branch-checkout`                                                                                     | —                               |
-| `git_delete_branch` | `name`, `force` (false), `deleteRemote` (false), `clientRequestId?`                                     | `runOperation branch-delete`                                                                                       | **destructive**                 |
-| `git_discard`       | `paths[]`, `permanent` (false), `clientRequestId?`                                                      | `gitManager.discard` (`permitPermanent = permanent`)                                                               | **destructive**                 |
+| Tool                       | Arguments                                                                                               | Maps to                                                                                                            | Hints                           |
+| -------------------------- | ------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ | ------------------------------- |
+| `git_stage`                | `paths[]`                                                                                               | `vcs.stageFiles`                                                                                                   | —                               |
+| `git_unstage`              | `paths[]`                                                                                               | `vcs.unstageFiles`                                                                                                 | —                               |
+| `git_commit`               | `summary`, `description?`, `clientRequestId?`                                                           | `gitManager.commit` with `amend: false`, `noVerify: false`, `signoff: false`, `allowEmpty: false`, `coAuthors: []` | not idempotent                  |
+| `git_undo_commit`          | `clientRequestId?`                                                                                      | `gitManager.undoCommit`                                                                                            | **destructive**                 |
+| `git_revert_commit`        | `sha`, `clientRequestId?`                                                                               | `runOperation revert`                                                                                              | not destructive (adds a commit) |
+| `git_push`                 | `remote?` (upstream or `origin`), `branch?` (current), `remoteBranch?`, `pushTags?`, `clientRequestId?` | `runOperation push`, or `publish-branch` when there is no upstream                                                 | open world                      |
+| `git_force_push`           | the same as `git_push`                                                                                  | `runOperation force-push` (`--force-with-lease`)                                                                   | **destructive**, open world     |
+| `git_fetch`                | `remote?`                                                                                               | `runOperation fetch`                                                                                               | idempotent, open world          |
+| `git_pull`                 | `remote?`, `clientRequestId?`                                                                           | `runOperation pull`                                                                                                | open world                      |
+| `git_create_branch`        | `name`, `startPoint?`, `checkout` (true)                                                                | `runOperation branch-create`                                                                                       | —                               |
+| `git_switch_branch`        | `name`, `carryChanges?` (`stash` or `bring`)                                                            | `runOperation branch-checkout`                                                                                     | —                               |
+| `git_delete_branch`        | `name`, `force` (false), `deleteRemote` (false), `clientRequestId?`                                     | `runOperation branch-delete` (local only), then `remote-branch-delete` (below)                                     | **destructive**                 |
+| `git_delete_remote_branch` | `remote`, `branch`, `clientRequestId?`                                                                  | new `runOperation remote-branch-delete`                                                                            | **destructive**, open world     |
+| `git_discard`              | `paths[]`, `permanent` (false), `clientRequestId?`                                                      | `gitManager.discard` (`permitPermanent = permanent`)                                                               | **destructive**                 |
 
 **Not exposed:**
 
@@ -668,8 +961,30 @@ wait on a network.
 
 - A `blocked` reason, such as a rebase in progress or a dirty tree, comes back as a
   typed `GitManagerOperationError` with its `code` and `blocked`.
-- Cancelling a call with a key stops the wait, not the push (C4).
+- Cancelling a call with a key stops the wait, not the push (C4). Turning MCP off,
+  read-only, or a revocation does stop it, and records `unknown` (C4).
 - Cancelling a call without a key cancels the stream as a UI disconnect does.
+
+**Branch delete in two steps (review P2).** The handler's combined delete removes the
+local branch and then pushes the remote deletion, and a remote failure comes back as an
+error although the local branch is gone (`git/manager/operations.rs:1229-1261`). Recording
+that as `failed` would replay a failure for a half-done change, and a new call would no
+longer find the upstream. So:
+
+- G adds `remote-branch-delete { cwd, remote, branch }` to `GitManagerOperationRequest`
+  (`packages/contracts/src/gitManager.ts`), run by the existing
+  `git_manager_delete_remote_branch` (`operations.rs:1255`). The Source Control panel may
+  use it later; it does not change today.
+- `git_delete_branch` resolves the upstream first. With `deleteRemote: true` and no
+  upstream it refuses before deleting anything (the handler's own `no-upstream` rule).
+- It then runs the local delete, then the remote delete, as two operations. The outcome
+  it records is one of:
+  - `{ local: "deleted", remote: "deleted" | "not-requested" }`;
+  - a typed `McpPartialOutcomeError` with `local: "deleted"`, `remote: "failed"`, the
+    remote, the remote branch, the reason, and the recovery call
+    `git_delete_remote_branch { remote, branch }`. A keyed retry replays this partial,
+    which is the truth.
+- `git_delete_remote_branch` also serves an agent that wants only the remote gone.
 
 **Concurrency.** Two calls on one repository are serialized by the handler's existing
 mutation lease (`run_mutation`, `git_manager_rpc.rs:460`). Nothing new is needed.
@@ -686,9 +1001,19 @@ layer. `mcp.git_push`, `mcp.git_force_push`, `mcp.git_fetch` and `mcp.git_pull` 
 - `git_discard` with `permanent: false` trashes files, or reports `trashUnavailable`;
 - `git_undo_commit` returns the message and leaves the changes;
 - `git_delete_branch` with `deleteRemote: true` removes both branches;
+- with a remote that refuses the deletion, `git_delete_branch` returns the partial
+  outcome, the local branch is gone, a keyed retry replays the partial, and
+  `git_delete_remote_branch` then removes the remote branch;
 - a path that escapes the workspace is refused;
+- `git_stage` with `:(glob)**` is refused by the tool; `vcs.stageFiles` called directly
+  with it stages nothing (literal pathspecs), and with a directory path still stages the
+  directory's files;
+- `git_discard` through a symlinked directory that points outside the worktree is
+  refused, and the target outside is untouched;
 - a blocked operation returns its typed reason;
 - a cancelled push with a key still records `done`, and the retry returns it;
+- a keyed push to a bare remote behind a slow hook, with MCP turned off mid-push, records
+  `unknown`, and the retry returns `McpOutcomeUnknownError`;
 - a captured tracing subscriber never sees a commit message, path or branch name.
 
 ## Slice P: Pull request tools
@@ -728,6 +1053,9 @@ again.
 **Tests (fail first), with a faked hosting service:**
 
 - create returns a number and URL, and a keyed retry creates none;
+- a create that ends with `action_failed` returns a typed error and records `failed`, and
+  a keyed retry returns that failure without calling the host;
+- a create whose stream closes before `action_finished` records `unknown`;
 - merge with a stale `headSha` is refused;
 - merge never sends `bypass`;
 - view caps a long body and reports its length;
@@ -750,17 +1078,19 @@ instructions.
   it would be the second ceiling dimension.
 - **Chosen:** three conditions, all checked on every call. The setting and the ceiling
   are read live; the scope is fixed at mint.
-  1. **The setting** `mcpAllowTerminals` (default **off**) is on.
+  1. **The setting** `mcpCapabilities.terminals` (default **off**) is on.
   2. **The credential holds `terminal:operate`.** The stdio relay asks for it when the
      setting is on and the ceiling is `full-access` at mint time (F0). The OAuth approval
-     card offers it under the same two conditions (slice R).
+     card offers it under the same two conditions, and only when the client asked for the
+     scope (slice R).
   3. **The effective ceiling is `full-access`.** Full access is the only level at which a
      thread runs commands without approval, so an agent's terminal, which runs any
      command, needs the same.
 
 Turning the setting off, or lowering the ceiling, hides and refuses the tools at once.
-Turning it on reaches an agent only after its MCP server restarts and mints again, as the
-ceiling does.
+Turning it on reaches a stdio agent only after its MCP server restarts and mints again, as
+the ceiling does. A remote OAuth client must reauthorize and ask for `terminal:operate`,
+because a refresh cannot widen a grant (slice R).
 
 ### Tools
 
@@ -815,13 +1145,21 @@ marked untrusted, never logged, and never goes into a profiler record.
 
 ### UI
 
-The Agent integrations section gains an **Allow terminals** switch: "Let MCP agents open
-terminals and run any command in this environment."
+Slice T owns the MCP tab's controls for C8. Under **Agents may**, a **What agents can use**
+group has one switch per capability set:
 
-- It is disabled with "Set Agents may to Full access first." while the ceiling is lower,
-  and with "Turn on MCP server first." while the server is off.
-- Turning it on asks nothing, because it is reversible. Agents pick it up only after
-  their MCP server restarts, and the description says so.
+- **Threads and worktrees**, **Source Control and pull requests**, **Files**,
+  **Diagnostics**: on by default.
+- **Terminals**: "Let MCP agents open terminals and run any command in this
+  environment." Off by default.
+  - It is disabled with "Set Agents may to Full access first." while the ceiling is
+    lower.
+  - Agents pick it up only after their MCP server restarts, or after a remote agent
+    reauthorizes; the description says so.
+- The whole group is disabled with "Turn on MCP server first." while the server is off.
+- Switching asks nothing, because every switch is reversible and applies live.
+
+T also owns the MCP tab's copy changes (UI review below).
 
 **Tests (fail first):**
 
@@ -836,7 +1174,9 @@ terminals and run any command in this environment."
 - a 17,000-character write is refused;
 - concurrent writes do not interleave within one call's data;
 - a captured tracing subscriber and the profiler sink never see terminal input or
-  output.
+  output;
+- web: each capability switch writes its own key of `mcpCapabilities`, and the
+  Terminals switch is disabled with its reason below Full access.
 
 ## Slice D: Device and browser previews for outside agents
 
@@ -890,7 +1230,504 @@ no new process: emulators start through `DeviceManager`.
 - a provider credential still reaches its own tools and not the client twins;
 - two outside agents get separate tab assignments.
 
+## Extended scope (slices X1 to X8)
+
+The user included the extended scope of 2026-10-27 in this round. Each slice below uses
+the same registry, per-call checks, untrusted-output marking, caps and cursors as the tool
+slices above, and the facts it rests on are in [Current behavior](#current-behavior-verified-at-ba143353d4).
+Every tool takes ids, plus workspace-relative paths only where C5 allows them.
+
+## Slice X1: Actor attribution and agent activity
+
+Agent actions now look like a person's (C6), so this slice comes in the second wave.
+
+**Current behavior.** Events carry no actor, `actor_kind` is inferred from a command-id
+prefix and never sent, and no message, thread or worktree records its creator (see
+"Attribution" above). Git and file RPCs emit no orchestration events at all.
+
+**Alternatives:**
+
+- Prefix MCP command ids with `mcp:<sid>:`, so `infer_actor_kind` (`engine.rs:8122`)
+  marks them. Cheap, but a command id is chosen by the client, so any UI client could
+  claim to be an agent, and it carries no label.
+- Add `actor` to every command schema. Every client could then claim any actor.
+- **Chosen: the server stamps the actor from the authenticated principal.** No client
+  input decides it.
+
+**Design:**
+
+- **Actor.** `{ kind: "mcp-client", clientId, label }`. `clientId` is the session id and
+  `label` the Authorized clients label at dispatch time. It is set only for an
+  `mcp-client` principal (`auth/service.rs:57`); a person's commands carry none, so the
+  default renders as today.
+- **Stamping.** The `orchestration.dispatchCommand` handler takes the actor from its
+  context (`orchestration_rpc.rs:133-137`) and passes it to the engine's dispatch. MCP
+  calls already arrive with their principal (`mcp/control.rs:793-798`).
+  `worktree.createManaged` and `worktree.createPanel`, which dispatch `thread.create`
+  themselves (`worktree_catalog_rpc.rs:1485-1498`), pass their context's actor too.
+- **Events.** `plan_command` writes `metadata.actor` on every event it plans for that
+  command (`engine.rs:3889`), and `infer_actor_kind` returns `mcp-client` when it is set.
+  The metadata column is JSON, so events need no migration. `wire_event` sends it, and
+  `OrchestrationEventMetadata` gains an optional `actor`
+  (`packages/contracts/src/orchestration.ts:1480-1486`).
+- **Projections.** `projection_thread_messages.actor_json` (a user-role message an agent
+  sent) and `projection_threads.requester_json` (`{ actor, purpose }` for a thread an agent
+  created, worktree host threads and panels included). `projection_thread_messages` also
+  gains `source_thread_id`, which X4 uses for provenance; this keeps X4 free of a
+  migration.
+- **Purpose.** `start_thread`, `create_worktree` and `create_chat_panel` (X4) take an
+  optional `purpose` (at most 200 characters, untrusted text). It travels in a new
+  optional `purpose` field of `thread.create` and is shown, never logged.
+- **Activity log.** `mcp_activity` holds one row per **mutating** tool call: time,
+  session, label, tool, `threadId`, outcome tag, and a structured target with no content
+  (commit SHA, PR number, worktree key, file count, clone or transfer id). `McpControl`
+  writes it when the call settles. Rows are pruned after 7 days or past 5,000. A write
+  failure is logged with `tracing::warn!` and does not fail the call, so a push that
+  happened is not reported as failed.
+- **Stream.** `subscribeMcpActivity` (read stream, `access:read`) sends the last 200 rows
+  and then each new one, plus `active`: each client with a call in the last 2 minutes or
+  an owned mutation running.
+- **Stop.** Revokes the client (the existing revoke route), which ends its calls and owned
+  mutations (C4), and interrupts each running turn whose latest user message carries that
+  client's actor.
+- **Take over.** Sets that client's `mcp_access` to `read-only` through a new
+  `POST /api/auth/clients/mcp-access { sessionId, access }` (`access:write`). The agent
+  can still read; every mutating call is refused, and the route cancels the session's live
+  tokens so owned mutations stop (C4). **Hand back** restores the previous level. Nothing
+  else needs a lock: a person can always type in any thread.
+
+**UI** (UI.md: show who acted, keep the controls one click away):
+
+- An **Agent · <label>** chip on agent-sent messages (`MessagesTimeline.tsx`
+  `UserTimelineRow`, `:1283`) and on threads and panels an agent created, with the purpose
+  in its tooltip.
+- Source Control commit rows show the chip when their SHA is in a recent activity row;
+  commits have no event of their own.
+- While any agent is active, the app header shows **Agent active · <label>** with
+  **Stop** and **Take over** (or **Hand back**).
+- The MCP tab gains **Agents**: each authorized MCP client with its label, last call,
+  scopes and access, and **Revoke** and **Take over**; below it, the activity list.
+  Stop and Revoke ask for no confirmation: both are reversible by reconnecting, and they
+  only stop an agent.
+
+**Trust boundaries.** The actor comes only from the authenticated session. Labels and
+purposes are untrusted text, rendered as text. Activity rows hold ids and counts, never
+paths, messages or output.
+
+**Profiler.** One new stream, registered through the `rpc/session.rs` wrappers; one new
+HTTP route, which logs failures with `tracing::warn!`. No new process, and nothing new in
+fingerprints.
+
+**Tests (fail first):**
+
+- a `start_thread` over MCP produces events whose `metadata.actor` names the client, and
+  the UI's own dispatch produces none;
+- a client cannot set `actor` by sending it in a command;
+- `create_worktree` and `create_chat_panel` stamp the host thread and the panel;
+- `read_thread` and the shell snapshot carry the message actor and the thread requester;
+- one activity row per mutating call and none per read; a replayed retry adds none;
+- **Stop** revokes, interrupts the agent's running turn, and cancels an owned mutation;
+- **Take over** makes the next mutating call refused and stops an owned mutation, and
+  **Hand back** restores it;
+- web: the chip renders for an actor and not without one; the indicator appears with an
+  active client and its buttons call the two routes.
+
+## Slice X2: Diagnostics tools
+
+**Current behavior.** The profiler's tools exist only on the stdio `bibcode profiler mcp`
+server, as private pure functions over a disk `Reader`. The diagnostics RPCs are unary
+reads, except `server.refreshProviders` (operate). `getProcessDiagnostics` returns raw
+command lines, and `getConfig` carries paths and the launch argv (see "Diagnostics"
+above).
+
+**Alternatives:**
+
+- Proxy the agent to `bibcode profiler mcp`. That needs a second MCP server per
+  environment, and it is unreachable over remote HTTP.
+- **Chosen:** mount the profiler handlers and new diagnostic tools on `/mcp`, in the
+  `diagnostics` capability set, scope `orchestration:read` (as `server.getProfilerStatus`
+  is, `auth/scope.rs:68`).
+
+| Tool                   | Arguments                                                                 | Maps to                                                                                    | Hints                 |
+| ---------------------- | ------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ | --------------------- |
+| `profiler_status`      | —                                                                         | the stdio handler, in-process over the server's own profiler `Reader`, in `spawn_blocking` | read-only, idempotent |
+| `profiler_findings`    | `since?`, `kind?`, `limit?`                                               | the same                                                                                   | read-only, idempotent |
+| `profiler_events`      | `since?`, `kind?`, `limit?`                                               | the same                                                                                   | read-only, idempotent |
+| `profiler_crash`       | `id`                                                                      | the same, with local symbols only                                                          | read-only, idempotent |
+| `diagnose_environment` | —                                                                         | `server.getConfig` (projected), `server.discoverSourceControl`, `server.getProfilerStatus` | read-only, idempotent |
+| `refresh_providers`    | —                                                                         | `server.refreshProviders` (operate)                                                        | idempotent            |
+| `process_diagnostics`  | `historyWindowMs?`, `bucketMs?`                                           | `server.getProcessDiagnostics`, `server.getProcessResourceHistory`                         | read-only, idempotent |
+| `trace_diagnostics`    | `limit?`                                                                  | `server.getTraceDiagnostics`                                                               | read-only, idempotent |
+| `get_server_logs`      | `file` (`server` or `trace`), `tail?` (200 lines), `cursor?`, `contains?` | a new paged reader over `server.log` and its backups, or `server.trace.ndjson`             | read-only, idempotent |
+
+Decisions:
+
+- **`profiler_symbolicate` stays on stdio.** Its `symbolsDir` is an arbitrary host path,
+  and `download` fetches symbols for minutes from GitHub (`diagnostics/profiler/mcp.rs:254`).
+- **`diagnose_environment` projects.** It returns the environment descriptor's version
+  and capability flags, each provider's install, auth and version state, and config
+  issues. It never returns paths, settings, `mcpLaunch` or the auth descriptor.
+- **Redaction.** Command lines and log lines go through `redact_sensitive_text`
+  (`diagnostics/trace.rs:474`) and the profiler's home-to-`~` rule
+  (`diagnostics/profiler/redact.rs`).
+- **`get_server_logs`.** Pages of at most 16,000 characters; the cursor is opaque (file,
+  rotation generation, byte offset); a cursor into a rotated-away file reports
+  `dropped: true`; `contains` is a plain substring of at most 100 characters, not a
+  regex; one call scans at most 1 MiB.
+- **`export_diagnostic_bundle` is not offered.** It is an in-memory 20 MiB archive built
+  for a person (`diagnostic_bundle.rs`), the zip route refuses an `mcp-client` bearer
+  (audience rule), crash dumps are binary, and the tools above return the same content in
+  pages an agent can read. A person still downloads the bundle in the UI.
+
+**Trust boundaries.** All output is untrusted and redacted. Prompt and message text never
+appears, as the profiler's own rules already guarantee.
+
+**Profiler.** `mcp.refresh_providers` is long-running through its method
+(`latency.rs:156`); the others do bounded disk or memory reads.
+
+**Tests (fail first):** each profiler tool over `/mcp` matches the stdio result on a
+fixture store; a bearer token in a log line comes back `[REDACTED]`; a home path comes
+back as `~`; a cursor survives a page boundary and reports `dropped` after rotation; a
+1 MiB scan cap holds; `diagnose_environment` contains no path; with `diagnostics` off the
+tools are hidden.
+
+## Slice X3: `server_capabilities` and `changes_since`
+
+**`server_capabilities`** (no capability set; read-only, idempotent) returns:
+
+- the server version and MCP protocol versions (from the environment descriptor,
+  `production/control.rs:2636-2693`);
+- a `toolsVersion`, the hash of this principal's visible tool list, so an agent knows when
+  to list again;
+- the effective ceiling, the capability sets, and the scopes held;
+- the **typed error table**: every tag a tool returns, with what it means and what fixes
+  it. This answers "clear errors": disabled server, capability off, scope missing,
+  busy, outcome unknown, idempotency conflict, partial outcome, credential refused (HTTP
+  401). The relay must turn a refused credential or an unreachable server into a typed
+  tool result; verify slice 1's relay does, and fix it here if not.
+
+**`changes_since { cursor?, threadId?, limit (100, at most 500) }`** (no capability set;
+read-only, idempotent).
+
+**Alternatives:**
+
+- A new change table written by every subsystem. That duplicates the event log.
+- `orchestration.replayEvents` as is. It returns whole event payloads, content included
+  (`orchestration_rpc.rs:2116-2130`).
+- **Chosen:** a filtered, content-free read of two durable sequences:
+  - `orchestration_events.sequence` (`persistence/migrations.rs:830`), mapped to
+    transitions: thread created or archived, panel created, turn started, completed,
+    interrupted or failed, approval and input requested or resolved, session status;
+  - `mcp_activity` ids (X1), for git operations, pull requests, clones and transfers an
+    agent ran.
+
+**Rules:**
+
+- An entry is `{ cursor, at, kind, threadId?, status?, requestId?, actor? }`, with no
+  text.
+- The cursor is opaque (`v1.<sequence>.<activityId>`) and strictly increasing. Both
+  sequences are durable, so nothing is missed across a reconnect or a restart.
+- With no cursor, the call returns the current head and no entries, so an agent starts
+  from now.
+- One call scans at most 5,000 events and returns the last scanned position, even when
+  few matched.
+- Events are never pruned. Activity rows are (X1), so a cursor older than the oldest row
+  reports `activityDropped: true`.
+- **Not in the feed:** Git operations a person ran in the UI, and worktree catalog or file
+  changes, because no durable record of them exists (their generations are in memory,
+  `worktree_catalog/service.rs:1029`, `git/broadcaster.rs:154`). The tool description
+  says so.
+
+Webhooks (X8) carry this cursor, so a receiver closes any gap with `changes_since`.
+
+**Tests (fail first):** cursors increase strictly; entries hold no message text; a
+transition written while the server was stopped and restarted is returned; `threadId`
+filters; the scan cap returns progress; an old cursor reports `activityDropped`.
+
+## Slice X4: Chat panels, panel messages, and UI intents
+
+| Tool                 | Arguments                                                                                                         | Maps to                                                      | Hints     |
+| -------------------- | ----------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------ | --------- |
+| `create_chat_panel`  | `hostThreadId`, `title?`, `providerInstanceId?`, `model?`, `runtimeMode?`, `purpose?`, `clientRequestId?`         | `worktree.createPanel` (receipt)                             | —         |
+| `list_chat_panels`   | `hostThreadId`                                                                                                    | the shell projection: threads of kind `panel` with that host | read-only |
+| `send_panel_message` | `fromThreadId`, `toThreadId`, `text`, `mode` (`queue` or `steer`), `includeLastReply` (false), `clientRequestId?` | `thread.turn.start` (queued) or `thread.turn.steer`          | —         |
+| `focus_ui`           | `threadId`, `surface` (`thread`, `files`, `sourceControl`, `diff`), `path?`                                       | a new UI intent                                              | —         |
+
+**`create_chat_panel`.** Its model and mode are resolved as `start_thread` resolves them,
+capped by the ceiling. The `commandId` and `threadId` are frozen in the stored request, so
+a retry replays by claim (`worktree_catalog_rpc.rs:1412-1421`). Every client adopts the
+panel as an inactive tab (`centerPanelAdoption.ts:90-127`).
+
+**`send_panel_message`.**
+
+- Both threads must exist and share a host thread (the same `hostThreadId`, or one is the
+  other's host), so they are in one worktree. Otherwise `McpNotSameWorktreeError`.
+- The target is checked against the ceiling, as `send_message` is.
+- With `includeLastReply`, the source's last assistant reply is appended as a quote,
+  capped at 16,000 characters.
+- The message records `sourceThreadId` (the column X1 adds), and the UI shows
+  **From <panel title>** beside the agent chip. The server checks the source, so a client
+  cannot point provenance at an unrelated thread.
+
+**`focus_ui`.**
+
+**Alternatives:**
+
+- Move the client's layout to show the surface. That steals focus while a person types,
+  which the issue forbids.
+- The preview open request's claim model (`preview/mod.rs:483-536`), where the first
+  client wins. Needed for opening a window once; not for a suggestion.
+- **Chosen: an advisory intent.** `ui.publishIntent` (operate) puts
+  `{ intentId, threadId, surface, path?, actor, createdAt }` on a new read stream,
+  `subscribeUiIntents`. It is in memory, expires after 60 seconds, and allows 16 pending
+  per thread. Every visible client showing that environment raises a non-modal toast,
+  **Agent <label> wants to show <surface> · Show**; nothing moves until a person clicks
+  **Show**. The result reports how many clients were subscribed.
+- X7 adds a second intent kind to the same stream.
+
+**Trust boundaries.** `path` is validated by C5. Titles and quoted replies are untrusted
+text.
+
+**Profiler.** One new RPC method and one stream, through the wrappers; no new process.
+
+**Tests (fail first):** a panel created over MCP is adopted by a second client; a keyed
+retry returns the same panel; `send_panel_message` across worktrees is refused; the
+quoted reply is capped; the provenance renders; `focus_ui` raises a toast in a subscribed
+client, moves nothing, and expires after 60 seconds; 17 pending intents are refused.
+
+## Slice X5: Workspace files
+
+All tools take `threadId`; the server resolves `cwd` (C5). Capability set `files`.
+
+| Tool             | Arguments                                                        | Maps to                                                                             | Hints                       |
+| ---------------- | ---------------------------------------------------------------- | ----------------------------------------------------------------------------------- | --------------------------- |
+| `files_list`     | `threadId`, `limit?` (200 at most)                               | `projects.listEntries`                                                              | read-only, idempotent       |
+| `files_search`   | `threadId`, `query`, `limit?`                                    | `projects.searchEntries`                                                            | read-only, idempotent       |
+| `files_read`     | `threadId`, `path`, `offset?`                                    | `projects.readFile`                                                                 | read-only, idempotent       |
+| `files_write`    | `threadId`, `path`, `content`, `expectedVersion` or `createOnly` | `projects.writeFileIfUnchanged`                                                     | —                           |
+| `files_create`   | `threadId`, `path`, `kind` (`file` or `directory`)               | `projects.createEntry`                                                              | —                           |
+| `files_rename`   | `threadId`, `from`, `to`                                         | `projects.renameEntry` (refuses an existing target, `workspace/service.rs:469-473`) | —                           |
+| `files_delete`   | `threadId`, `path`, `permanent` (false), `clientRequestId?`      | `projects.deleteEntry`, with a new `toTrash` option                                 | **destructive**             |
+| `files_download` | `threadId`, `path`                                               | `projects.createDownloadUrl`                                                        | read-only                   |
+| `files_upload`   | `threadId`, `directory`, `fileName`, `overwrite` (false)         | `projects.createUploadUrl`, with `overwrite` bound in the token                     | **destructive** (overwrite) |
+
+**Decisions:**
+
+- **Reads** return pages of at most 16,000 characters with `byteLength`, `truncated` and
+  `version`. A file over the 1 MiB read cap, or a binary file, is refused for reading and
+  writing (`workspace/service.rs:19`, `:278`); it can be downloaded.
+- **Writes need a precondition.** `files_write` sends the `version` of a complete read,
+  or `missing` with `createOnly`. A file changed since the agent read it is refused
+  (`file_changed_on_disk`), so a write never loses an edit the agent did not see. Content
+  is capped at 1 MiB, a new cap: the service has none.
+- **Delete goes to the trash by default.** `deleteEntry` hard-deletes today
+  (`workspace/service.rs:486-512`). X5 adds `toTrash` (default false, so the UI is
+  unchanged) using the trash service `git_discard` uses, and `files_delete` sends it unless
+  `permanent: true`, mirroring `git_discard`.
+- **Transfers move no bytes through MCP.** `files_download` and `files_upload` return a
+  transfer URL valid for 5 minutes (`transfer/mod.rs:15`), built on the base the agent
+  reached. X5 ships the direct base: the bound address, loopback for a local relay or the
+  `bibcode thread` CLI. Remote OAuth sessions do not exist until R, so R adds their
+  base, the origin of the session's `mcp_resource`, as a one-line change in
+  `mcp/tools/files.rs`.
+  - The upload token binds `overwrite`; today it is a query flag anyone holding the URL
+    can set (`production/http_routes.rs:705`). A token minted without it refuses
+    `?overwrite=1`. The UI's tokens keep today's behavior.
+  - Over `ssh <host> bibcode mcp` the URL is the host's loopback, which the agent cannot
+    reach. The agent has SSH to that host already, so the description tells it to use
+    `scp`; rebuilding file copy over MCP would duplicate what its own transport does.
+  - Chunked transfers through MCP remain a follow-up if an agent has MCP but no other
+    path to the host.
+  - The URL is a short-lived capability in the agent's context. It reaches one file or
+    one directory target, for 5 minutes.
+- **Activity.** Every mutating call, and each MCP-minted transfer when the route finishes
+  it, writes an activity row (X1), so the change shows who made it.
+
+**Tests (fail first):** a read of a 2 MiB file is refused with the download hint; a write
+with a stale `expectedVersion` is refused; `createOnly` on an existing file is refused;
+`files_delete` trashes and `permanent: true` removes; a symlink escape is refused for
+every tool; an upload URL minted without `overwrite` refuses `?overwrite=1`; a download
+URL from a relay call uses the bound address; with `files` off the tools are hidden. (R
+tests that a remote OAuth call gets its own origin.)
+
+## Slice X6: Clone
+
+| Tool               | Arguments                                                                                       | Maps to                                                                 | Hints      |
+| ------------------ | ----------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------- | ---------- |
+| `clone_repository` | `url`, `parentProjectId`, `directoryName?`, `addAsProject` (true), `title?`, `clientRequestId?` | `vcs.clone` with `detach: true`, then `project.create` (receipt)        | open world |
+| `clone_status`     | `cloneId`                                                                                       | the clone registry's live or kept outcome (`clone_operations.rs:34-41`) | read-only  |
+| `cancel_clone`     | `cloneId`                                                                                       | `vcs.cancelClone`                                                       | —          |
+
+**Where a clone may go.** The extended scope says `parentPath` is "limited to the roots
+allowed in settings", but no such setting exists (`production/host_paths.rs:24`).
+
+- **Chosen:** `parentProjectId`. The clone goes next to that registered project, in its
+  workspace root's parent. This keeps "ids, never paths", and puts the clone where the
+  person already keeps projects.
+- An absolute `parentPath` is not accepted. A settings allowlist of clone roots would
+  allow other places; see Question 8.
+
+**Behavior:**
+
+- `url` must be `https://` or SSH form, with no user information (no `user:token@`),
+  so a credential never sits in tool arguments. It is never logged.
+- `detach: true` keeps the clone running when the MCP call ends
+  (`clone_operations.rs:286`). The call waits up to 50 seconds, then returns
+  `{ state: "running", cloneId }`; `clone_status` reads it later. `cloneId` names the
+  destination.
+- On success with `addAsProject`, the tool dispatches `project.create` with a frozen
+  `commandId` and `projectId`, as the web does after a clone
+  (`useAddProjectWorkflow.ts:715-750`).
+- Retries: the clone step uses a recorded outcome (C4); a second call for the same
+  destination joins the live clone (`clone_operations.rs:1-11`).
+- Progress for other clients comes from the activity row (X1) and then `project.created`.
+
+**Trust boundaries.** Clone runs Git against an outside URL; hooks do not run on clone.
+The destination is always a sibling of a registered project.
+
+**Profiler.** No new process path: clone runs through the existing supervised repository
+layer. `mcp.clone_repository` is long-running through `vcs.clone`, and holds no wait slot.
+
+**Tests (fail first):** a clone from a local bare repository next to a project registers
+it; a URL with user information is refused; an existing destination is refused; a call
+past 50 seconds returns `running` and `clone_status` later returns the project; cancel
+stops it; a keyed retry creates one project.
+
+## Slice X7: Source Control reads and the commit message suggestion
+
+**Reads** (capability `sourceControl`, read-only, idempotent):
+
+| Tool       | Arguments                                 | Maps to                                              |
+| ---------- | ----------------------------------------- | ---------------------------------------------------- |
+| `git_diff` | `threadId`, `path?`, `staged?`, `cursor?` | `gitManager.getDiff` (`rpc/methods.rs:86`)           |
+| `git_log`  | `threadId`, `ref?`, `limit?`, `cursor?`   | `gitManager.getCommits` (`:85`)                      |
+| `git_refs` | `threadId`                                | `gitManager.getRefs` and `getStashes` (`:87`, `:89`) |
+
+Diff pages are at most 16,000 characters and untrusted. Verify each method's input shape
+in implementation.
+
+**`git_generate_commit_message { threadId, paths? }`** maps to `vcs.generateCommitMessage`.
+It is deterministic ("Update <paths>", `production/git_vcs.rs:3316`); the description says
+so, and that an agent usually writes a better message itself.
+
+**`git_set_commit_message { threadId, message }`** (at most 8,000 characters).
+
+**Alternatives:**
+
+- Not offered: `git_commit` already takes the message.
+- A server-side draft store that replaces the browser draft. That changes a working panel
+  for every person, and needs a migration and a sync model.
+- **Chosen: a suggestion.** A second intent kind on X4's `subscribeUiIntents`,
+  `commitMessage { cwd, message, actor }`, kept in memory as the last one per `cwd` for
+  24 hours, so a panel opened later still gets it.
+
+**UI.** When the suggestion's `cwd` matches the Source Control panel:
+
+- an empty draft is filled, with **Message from Agent <label>** under it;
+- a draft with text is never overwritten (UI.md: preserve user work); the panel shows
+  **Agent <label> suggested a message · Use it · Dismiss**.
+
+**Tests (fail first):** the reads return capped, untrusted text; a suggestion fills an
+empty draft in a second client; a non-empty draft is kept and offered **Use it**; a panel
+opened after the suggestion still receives it.
+
+## Slice X8: Outbound webhooks and the Agent integrations tabs
+
+**Current behavior.** No webhook code exists. `reqwest` and `hmac` are dependencies, and
+`SecretStore` keeps 0600 plaintext files (see "Webhooks" above).
+
+**Settings.**
+
+- **Agent integrations** gains two tabs, **MCP** and **Webhooks**, under the existing
+  environment picker (`diagnosticsEnvironment.tsx:26-69`).
+- A status line in the section header: MCP on or off, connected agents, active and failing
+  endpoints.
+- `enableWebhooks` (default **off**) joins `ServerSettings`.
+
+**Endpoints.** At most 20 per environment, each with a name, an HTTPS URL, an enabled
+flag, event filters by category and type, an optional project filter, and an optional
+paired MCP client. Its secret is generated, shown once, rotatable, and kept in
+`SecretStore` as `webhook-<id>`; it is plaintext at rest like the host identity secret,
+and never in settings, client state or logs.
+
+**Events.**
+
+| Event                                                                                                   | Source                                                |
+| ------------------------------------------------------------------------------------------------------- | ----------------------------------------------------- |
+| `thread.status_changed`, `worktree.created`, `panel.created`, `approval.requested`, `approval.resolved` | orchestration events, through X3's transition mapping |
+| `clone.completed`, `scm.operation_completed`, `transfer.completed`, `transfer.failed`                   | activity rows (X1): operations an agent ran           |
+| `profiler.finding`                                                                                      | the profiler's findings, read through its `Reader`    |
+| `webhook.test`                                                                                          | **Send test event**                                   |
+
+Two catalog entries are dropped: `server.health_changed` (the server has no health
+state to change) and `diagnostics.bundle_ready` (bundles are built on request, never in
+the background).
+
+**Payload.** `{ id, type, occurredAt, environmentId, threadId?, worktreeId?, actor?,
+cursor }`, where `cursor` is X3's. No prompt, message, file, diff, token or secret; any
+text field goes through `redact_sensitive_text`.
+
+**Delivery.**
+
+- **Source.** A `WebhookDispatcher` service follows three durable sources, each from a
+  stored position: the event sequence and the activity ids (X3's two), and the newest
+  profiler finding it has seen. It never uses the in-process broadcast, which drops events
+  under load (`engine.rs:2013`).
+- **Queue.** `webhook_deliveries` rows are durable, so a restart resumes them. At most
+  10,000 are pending; past that the oldest are abandoned with a warning, and a receiver
+  recovers through `changes_since`.
+- **Request.** HTTPS only, or loopback `http` with a per-endpoint opt-in. Headers:
+  `X-BibCode-Event`, `X-BibCode-Delivery`, `X-BibCode-Timestamp`, and
+  `X-BibCode-Signature: v1=<hex HMAC-SHA256(secret, timestamp + "." + body)>`. A 10-second
+  timeout, no redirects followed, and the response body is not kept.
+- **SSRF.** The host is resolved once per attempt, and loopback, private, link-local and
+  CGNAT addresses are refused (loopback only with the opt-in); the connection uses the
+  resolved address, so DNS rebinding cannot redirect it.
+- **Retries.** 5 attempts over about 30 minutes (30 s, 2 min, 5 min, 10 min, 15 min) on a
+  timeout, connection error, 5xx or 429. Other 4xx responses fail at once.
+- **Health.** 10 consecutive failed deliveries disable the endpoint, with a warning and a
+  **Re-enable** button.
+- **Off is immediate.** Turning webhooks off, or disabling an endpoint, cancels its
+  in-flight request and leaves the rest queued as abandoned.
+- **Pairing.** Revoking a paired MCP client disables its endpoints, with a warning in both
+  tabs (the dispatcher listens for `AuthAccessChange::ClientRemoved`,
+  `auth/service.rs:1954`).
+
+**Administration.** `webhooks.list`, `listDeliveries` (`access:read`) and `upsert`,
+`delete`, `rotateSecret`, `sendTest`, `redeliver` (`access:write`). An `mcp-client`
+session never holds an `access:*` scope, so agents cannot configure webhooks, like the
+other settings.
+
+**Webhooks tab.** The on/off switch, the endpoint list (add, edit, disable, delete), the
+secret shown once with **Copy**, the filters, **Send test event**, and per endpoint the
+recent deliveries (time, type, status, attempts, latency) with **Redeliver**. Deleting an
+endpoint asks for confirmation, since its delivery log goes with it; nothing else does.
+
+**Persistence.** The X8 migration: `webhook_endpoints`, `webhook_deliveries` (kept 7
+days, or the last 1,000 per endpoint), and `webhook_state` (the dispatcher's three
+positions).
+
+**Profiler.**
+
+- Outbound HTTP is not a child process.
+- The new RPC methods go through the wrappers; `webhooks.sendTest` and
+  `webhooks.redeliver` wait on a network, so they join `is_long_running`.
+- A failed delivery logs `tracing::warn!` with the endpoint id and status, never the URL,
+  which may carry a token.
+- The dispatcher stops in the quiesce sequence before the profiler's teardown.
+
+**Tests (fail first):** a signed delivery verifies with the secret over its
+`X-BibCode-Timestamp` (the receiver guide documents the 5-minute window); retries follow the
+schedule on 500 and stop on 400; the queue resumes after a restart; a private address is
+refused; a payload contains no message text; disabling an endpoint stops its delivery;
+revoking a paired client disables its endpoints; a receiver that drops every second
+delivery still sees every transition through `changes_since`.
+
 ## Slice R: Remote Streamable HTTP with MCP OAuth
+
+R lands last among the code slices. It inherits F0's `production/connect_mcp.rs` and the
+`bibcode thread` CLI's `lib.rs` and `config.rs` edits, which land on the batch branch
+first.
 
 ### Spec requirements relied on
 
@@ -924,79 +1761,216 @@ These were verified in the 2026-07-28 and 2025-11-25 authorization pages on 2026
   - Clients MUST NOT assume refresh tokens will be issued.
 - **`iss` (RFC 9207, 2026-07-28 only).** Servers SHOULD include `iss` in authorization
   responses, and advertise `authorization_response_iss_parameter_supported`.
+- **Loopback redirects (RFC 8252 §7.3).** The authorization server MUST allow any port in
+  a loopback redirect URI, because native clients pick one at run time.
 - **Streamable HTTP.**
   - Servers MUST validate `Origin`, and answer an invalid one with 403.
   - There are no sessions and no GET stream in 2026-07-28.
   - 2025-11-25 sessions are optional for the server.
-- **Claude Code** (its MCP docs, read 2026-10-30):
-  - It supports DCR, CIMD, and `--client-id`/`--callback-port` pre-registration.
-  - It sends OAuth credentials only to a token endpoint that is HTTPS or loopback.
-  - Its HTTP idle window is 5 minutes. Calls running past 2 minutes move to a
-    background task.
+
+### Harness facts (design inputs)
+
+**Codex** (source read at `rust-v0.165.0`, crate `codex-rs/rmcp-client`, and the `rmcp`
+revision it pins, `98a54789`, file `crates/rmcp/src/transport/auth.rs`; installed CLI
+0.165.0):
+
+- **Discovery.** It first sends an unauthenticated request to the MCP URL and reads
+  `resource_metadata` from a 401 (`auth.rs:2925-2944`), then tries the RFC 9728
+  well-known paths and RFC 8414 on each named authorization server (`auth.rs:1341-1366`,
+  `:2486-2513`). PRM `resource` must be a prefix of the configured URL, and the issuer
+  must match (`auth.rs:2615`, `:2775-2833`).
+- **`codex mcp add <name> --url <url>`** probes discovery and starts the browser flow
+  itself when metadata is published; otherwise it says to run `codex mcp login <name>`
+  (`cli/src/mcp_cmd.rs:463-492`). A metadata-less fallback counts as "unsupported"
+  (`rmcp-client/src/auth_status.rs:254-258`).
+- **Registration.** `Auto` picks a pre-registered `--oauth-client-id`, else CIMD when the
+  server advertises it with `none` auth, else DCR (`oauth_client_registration.rs:53-110`).
+  DCR sends `client_name: "Codex"`, `token_endpoint_auth_method: "none"`, and
+  `grant_types: [authorization_code, refresh_token]` (`auth.rs:1757-1800`).
+- **Redirect URI.** `http://127.0.0.1:<random port>/callback/<id>`, or `/callback` when
+  the server advertises `iss` support, with a new port each login
+  (`perform_oauth_login.rs:474-483`, `oauth_callback.rs:52-102`).
+- **`resource`** is sent on the authorize, token and refresh requests, with the PRM's
+  value (`auth.rs:1892`, `:2205`, `:2371-2373`, `:1927-1932`).
+- **Refresh.** It refreshes proactively within 30 seconds of `expires_in` before each call,
+  and once on a 401 before retrying (`rmcp-client/src/oauth.rs:1043-1054`,
+  `rmcp/src/transport/common/auth/streamable_http_client.rs:36-67`). It stores a rotated
+  refresh token (`refresh_transaction.rs:381-396`). On `invalid_grant`, or with no refresh
+  token, it never opens a browser: the server fails with "Run `codex mcp login <name>`"
+  (`codex-mcp/src/connection_manager/startup.rs:120-126`).
+- **`iss`** is required when the server advertises it, and a mismatch is always refused
+  (`auth.rs:2141-2175`).
+- **Scopes.** `--scopes`, then configured scopes, then the 401 challenge's `scope`, then
+  PRM `scopes_supported`; `offline_access` is appended only when listed; a refused scope
+  set is retried with none (`codex-mcp/src/mcp/auth.rs:161-193`,
+  `cli/src/mcp_login.rs:67-127`).
+- **403 `insufficient_scope`** is not stepped up; the call just fails
+  (`http_client_adapter.rs:300-310`, `startup_error.rs:19-95`).
+- **Blocked hosts.** An authorization server on a loopback, private, link-local or
+  `100.64.0.0/10` IP literal is refused unless the MCP server is itself loopback
+  (`auth.rs:1244-1313`). A Tailscale `100.x` address therefore fails; its MagicDNS name
+  does not.
+- **HTTPS** is not required by Codex.
+- **Progress.** `rmcp` gives every request a `progressToken` (`rmcp/src/service.rs:887-899`).
+  Progress is only logged and does not extend the 300-second default tool timeout
+  (`logging_client_handler.rs:63-71`, `codex-mcp/src/rmcp_client.rs:114-115`). This
+  settles slice 1's open question on Codex progress tokens.
+
+**Claude Code** (its MCP docs, read 2026-10-30):
+
+- PRM, then RFC 8414 discovery; DCR, CIMD, and `--client-id`/`--callback-port`
+  pre-registration.
+- Redirect `http://localhost:<random port>/callback`, or a fixed port with
+  `--callback-port`.
+- "Authentication tokens are stored securely and refreshed automatically." On a 401 it
+  refreshes, reconnects and retries once; when the refresh token is refused it asks the
+  person to **Re-authenticate** in `/mcp`. `offline_access` is appended only when listed.
+- Credentials go only to an HTTPS or loopback token endpoint, and an unexpected `iss` is
+  refused.
+- `403 insufficient_scope` fails the call; re-authenticating requests the pinned
+  `oauth.scopes`, not the scope the server named.
+- `claude -p` and Agent SDK runs cannot complete OAuth: sign in interactively first.
+- The HTTP idle window is 5 minutes, reset by progress; calls past 2 minutes move to a
+  background task.
+
+**What R does with them:**
+
+1. **Answers an unauthenticated `/mcp` request with 401 and `resource_metadata`**, for GET
+   as well as POST. An authenticated GET stays 405. Codex's first probe and
+   `codex mcp add` then work.
+2. **Matches loopback redirect URIs on scheme, host and path, with any port.** Both
+   harnesses use a new random port per login. HTTPS redirect URIs match exactly.
+3. **Issues one-hour access tokens with `expires_in`, and rotating refresh tokens.** Both
+   harnesses refresh before expiry and store the rotated token. Neither reopens a browser
+   by itself, so without refresh tokens every agent would stop each hour.
+4. **Issues the refresh token without `offline_access`.** It is not listed, so neither
+   harness asks for it; a request that includes it anyway is accepted and the scope
+   ignored.
+5. **Treats an empty scope request as the default pair** (`orchestration:read
+orchestration:operate`), which is what Codex sends after a refused scope set.
+6. **Advertises `iss` support and sends `iss`.** Codex then uses `/callback`, and both
+   check it.
+7. **Keeps `issuer` stable as the origin**, because Codex binds stored refresh tokens to
+   it.
 
 ### Alternatives
 
-| Choice                      | Options                                                                                                                                                                                                                                                                                                                                                                                                                                                  | Decision                                                                                                                                                                                                                                            |
-| --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Transport auth              | R1 MCP OAuth; R2 static bearer in the harness config (not conformant, and it parks a 30-day operate token in a file)                                                                                                                                                                                                                                                                                                                                     | **R1** (slice 1's answer)                                                                                                                                                                                                                           |
-| Authorization server        | BiBCode as its own authorization server on the same origin; an external one (the Connect relay, Clerk)                                                                                                                                                                                                                                                                                                                                                   | **Same origin.** The environment owns its sessions (`remote.md`: the relay "does not become the owner of environment sessions")                                                                                                                     |
-| Client registration         | DCR; CIMD (the server fetches the client's HTTPS metadata, so it needs an SSRF-safe fetcher); a pre-registered id issued in Settings                                                                                                                                                                                                                                                                                                                     | **DCR now.** Both harnesses can use it, and it needs no outbound fetch from the server. CIMD is a follow-up. Pre-registration is a fallback for a client without DCR (Question 5)                                                                   |
-| Consent                     | (a) type a pairing code on the consent page (the upstream project's model; BiBCode's pairing codes are long base64 blobs, `auth/pairing_code.rs`); (b) the consent page needs a BiBCode cookie session; (c) **approve in BiBCode**: the page shows a short code, and any BiBCode client with `access:write` on that environment shows a card with the same code to approve or deny, with `bibcode mcp authorize <code>` on the host as the headless path | **(c)** (Question 4). Nothing to remember or type (UI.md), the decision stays in an authenticated BiBCode surface, and the matching code defeats a look-alike request                                                                               |
-| Token lifetime              | short access token plus rotating refresh token; the existing 30-day session, with no refresh token                                                                                                                                                                                                                                                                                                                                                       | **30-day session, no refresh token** (Question 6). Revocation already takes effect on the next request, because every bearer re-reads its session row, and rotation adds a table and a reuse-detection rule. This declines the "short-lived" SHOULD |
-| Plain HTTP on a LAN address | serve OAuth anyway; refuse                                                                                                                                                                                                                                                                                                                                                                                                                               | **Refuse.** The spec requires HTTPS for authorization endpoints, and Claude Code refuses a non-loopback `http` token endpoint. Plain-HTTP environments keep `ssh <host> bibcode mcp`                                                                |
-| A new setting               | `mcpRemoteHttp` on or off; gate on `enableMcpServer` only                                                                                                                                                                                                                                                                                                                                                                                                | **No new setting.** Every grant still needs approval in BiBCode, and the unauthenticated routes only create bounded, expiring rows                                                                                                                  |
+| Choice                      | Options                                                                                                                                                                                                                                                                                                                                                                                                                                                  | Decision                                                                                                                                                                                                 |
+| --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Transport auth              | R1 MCP OAuth; R2 static bearer in the harness config (not conformant, and it parks a 30-day operate token in a file)                                                                                                                                                                                                                                                                                                                                     | **R1** (slice 1's answer)                                                                                                                                                                                |
+| Authorization server        | BiBCode as its own authorization server on the same origin; an external one (the Connect relay, Clerk)                                                                                                                                                                                                                                                                                                                                                   | **Same origin.** The environment owns its sessions (`remote.md`: the relay "does not become the owner of environment sessions")                                                                          |
+| Client registration         | DCR; CIMD (the server fetches the client's HTTPS metadata, so it needs an SSRF-safe fetcher); a pre-registered id issued in Settings                                                                                                                                                                                                                                                                                                                     | **DCR now** (Question 5). Both harnesses use it when CIMD is not advertised. **CIMD is a follow-up** for the 2026-07-28 SHOULD                                                                           |
+| Consent                     | (a) type a pairing code on the consent page (the upstream project's model; BiBCode's pairing codes are long base64 blobs, `auth/pairing_code.rs`); (b) the consent page needs a BiBCode cookie session; (c) **approve in BiBCode**: the page shows a short code, and any BiBCode client with `access:write` on that environment shows a card with the same code to approve or deny, with `bibcode mcp authorize <code>` on the host as the headless path | **(c)** (Question 4), bound to the exact client, redirect URI, resource and requested scopes. Nothing to remember or type (UI.md), and the decision stays in an authenticated BiBCode surface            |
+| Token lifetime              | (a) the existing 30-day session as the bearer, no refresh token; (b) one-hour access token and a rotating refresh token; (c) one-hour access token and reauthorization on expiry                                                                                                                                                                                                                                                                         | **(b)** (Question 6). (a) leaves a stolen bearer usable for 30 days (review P2). (c) would stop every agent each hour, because neither harness reauthorizes by itself. Both harnesses refresh and rotate |
+| Redirect URI matching       | exact string; exact with any port for loopback                                                                                                                                                                                                                                                                                                                                                                                                           | **Any port for loopback** (RFC 8252 §7.3); exact for HTTPS                                                                                                                                               |
+| Where the origin comes from | the rewritten `Host` and `X-Forwarded-*` from any loopback peer (today); a new configured public origin; **what the server knows**: direct loopback, its own managed hostname, or a local proxy that overwrites the forwarded headers                                                                                                                                                                                                                    | **What the server knows** ([Origins](#origins-and-forwarded-headers)). It needs no new setting, and it does not depend on headers this repository cannot prove a client is unable to set                 |
+| Plain HTTP on a LAN address | serve OAuth anyway; refuse                                                                                                                                                                                                                                                                                                                                                                                                                               | **Refuse.** The spec requires HTTPS for authorization endpoints, and Claude Code refuses a non-loopback `http` token endpoint. Plain-HTTP environments keep `ssh <host> bibcode mcp`                     |
+| A new setting               | `mcpRemoteHttp` on or off; gate on `enableMcpServer` only                                                                                                                                                                                                                                                                                                                                                                                                | **No new setting.** Every grant still needs approval in BiBCode, and the unauthenticated routes only create bounded, expiring rows                                                                       |
+
+### Origins and forwarded headers
+
+**What source shows.** The managed tunnel's connector runs on the host, so its requests
+come from a loopback peer. The relay's ingress routes only the listed hostnames and ends
+with `http_status:404`, with no `originRequest` override
+(`ManagedEndpointProvider.ts:741-753`), and the preview gateway already identifies tunnel
+traffic by its `Host` (`preview/gateway/relay.rs:85-91`). The public hostname therefore
+arrives in `Host`. Whether the edge removes a `X-Forwarded-Host` or `X-Forwarded-Proto`
+that the client sent is not visible here, so R must not depend on either for the tunnel.
+
+Today `apply_forwarded_headers` trusts both headers from **any** loopback peer
+(`http.rs:191-208`). Through the tunnel, a client that sends `X-Forwarded-Host: 127.0.0.1`
+would therefore turn its `Host` into a loopback name (review P2).
+
+**The rule, in `http.rs`, for every route:** `X-Forwarded-Host` and `X-Forwarded-Proto` are
+honored only when the peer is loopback **and the raw `Host` is a loopback name or the
+bound address**. Otherwise both are removed and `Host` is kept.
+
+- The documented nginx recipe keeps working: nginx sends `Host: $proxy_host`
+  (`127.0.0.1:3773`) and overwrites both headers with `proxy_set_header`
+  (`docs/user/remote-access.md:82-96`), so a client's own values never reach the server.
+- Through the tunnel the raw `Host` is the public hostname, so injected headers are
+  dropped.
+- A proxy that sends the public `Host` itself loses only `X-Forwarded-Proto`, so it is not
+  eligible for OAuth until it follows the recipe. The runbook says so.
+
+**Request classes**, computed once per request:
+
+| Class          | Condition                                                                                                                        | Effective origin                                      |
+| -------------- | -------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------- |
+| Direct         | raw `Host` is a loopback name or the bound address, and no forwarded header was present (the rule at `connect_mcp.rs:1609-1612`) | `http://<Host>`                                       |
+| Managed tunnel | loopback socket, and `Host` names the managed hostname in `RelayHosts`                                                           | `https://<managed hostname>`, fixed by the server     |
+| Local proxy    | loopback peer, loopback raw `Host`, and `X-Forwarded-Host` present                                                               | `<X-Forwarded-Proto, else http>://<X-Forwarded-Host>` |
+| Other          | anything else, including a preview gateway hostname                                                                              | none                                                  |
+
+An **eligible origin** for the OAuth routes is a managed tunnel, a local proxy with
+`https`, or a direct request (loopback `http`, as the spec allows).
+
+**Audience on `/mcp` (review P2):**
+
+- A **provider token** is accepted only on a direct request. Providers are given the
+  bound address (`lifecycle.rs:918-931`), so a provider token that leaked cannot be used
+  through the tunnel or a proxy.
+- A **relay or CLI session** (`mcp_resource` NULL) is accepted only on a direct request.
+  The relay dials loopback (`mcp/endpoint.rs`).
+- An **OAuth session** is accepted only when the request's effective `<origin>/mcp`
+  equals its `mcp_resource`.
+- Anything else gets 401.
+
+A token minted through one hostname does not work through another, and a tunnel hostname
+change requires a new authorization. This is intentional (RFC 8707 audience).
 
 ### Routes
 
-Every metadata value is computed per request from the **effective origin**:
-
-- the scheme is `https` when `X-Forwarded-Proto: https` comes from a loopback peer (the
-  existing forwarded-header trust rule, `remote.md` "Security boundaries"), else `http`;
-- the host is `Host`, after the existing loopback-only `X-Forwarded-Host` rule.
-
-An **eligible origin** is `https`, or `http` with a loopback host. Every route below
-answers 404 on any other origin, and on a preview gateway hostname.
+Every metadata value below is computed from the request's effective origin. Every OAuth
+route answers 404 when the origin is not eligible.
 
 - **`GET /.well-known/oauth-protected-resource/mcp`** and
   **`GET /.well-known/oauth-protected-resource`** return:
   - `resource: "<origin>/mcp"`;
   - `authorization_servers: ["<origin>"]`;
-  - `scopes_supported: ["orchestration:read", "orchestration:operate"]`;
+  - `scopes_supported: ["orchestration:read", "orchestration:operate"]`, plus
+    `terminal:operate` while `mcpCapabilities.terminals` is on;
   - `bearer_methods_supported: ["header"]`;
   - `resource_name`: the environment label.
 - **`GET /.well-known/oauth-authorization-server`** returns:
   - `issuer: "<origin>"`;
   - `authorization_endpoint`, `token_endpoint` (`/oauth/token`) and
     `registration_endpoint`;
-  - `response_types_supported: ["code"]`, `grant_types_supported: ["authorization_code"]`;
+  - `response_types_supported: ["code"]`,
+    `grant_types_supported: ["authorization_code", "refresh_token"]`;
   - `code_challenge_methods_supported: ["S256"]`,
     `token_endpoint_auth_methods_supported: ["none"]`;
-  - `scopes_supported`, with `terminal:operate` added while `mcpAllowTerminals` is on;
+  - the same `scopes_supported`;
   - `authorization_response_iss_parameter_supported: true`.
 - **`POST /oauth/register`** (RFC 7591):
   - **Clients.** Public clients only (`token_endpoint_auth_method: "none"`).
-  - **`redirect_uris`.** One to five, each `http://localhost|127.0.0.1|[::1]:<port>/…`
-    or `https://…`, with no fragment.
+  - **Other fields.** `grant_types` and `response_types` are accepted when they are within
+    what the metadata advertises (Codex sends `[authorization_code, refresh_token]` and
+    `[code]`); `application_type`, `scope` and unknown fields are accepted and ignored
+    (RFC 7591 §2). A strict refusal would turn Codex's registration away.
+  - **`redirect_uris`.** One to five, each `http://localhost|127.0.0.1|[::1][:<port>]/…`
+    or `https://…`, with no fragment. A loopback URI's port is not part of its identity.
   - **`client_name`.** Up to 100 characters, shown as untrusted text.
-  - **Storage and limits.** It stores a row in `mcp_oauth_clients`. At most 64 clients
-    may never have been approved; past that, the oldest is pruned. Clients that were
-    never approved are pruned after 24 hours, and approved ones after 90 days unused.
+  - **Storage and limits.** A row in `mcp_oauth_clients`, under the
+    [admission limits](#admission-for-unauthenticated-routes). Clients that were never
+    approved are pruned after 24 hours, and approved ones after 90 days unused.
   - **Response.** `client_id`, `client_id_issued_at`, `redirect_uris`, `client_name`,
     `token_endpoint_auth_method`.
 - **`GET /oauth/authorize`** validates before it redirects anywhere:
-  - the client and the **exact** redirect URI; on failure it shows an error page and
-    never redirects;
+  - the client and the redirect URI (loopback port free, otherwise exact); on failure it
+    shows an error page and never redirects;
   - `response_type=code`;
   - `code_challenge_method=S256` with a 43–128 character challenge;
   - `resource` equals `<origin>/mcp` exactly (case-insensitive scheme and host);
-  - the requested scopes are within `scopes_supported`.
+  - the requested scopes are within `scopes_supported`, with `offline_access` ignored
+    and an empty request meaning the default pair.
 
   Then it creates a pending authorization in `mcp_oauth_authorizations`:
   - an id, and a `user_code` of 8 characters from an unambiguous alphabet, shown as
     `XXXX-XXXX`;
-  - the client, redirect URI, challenge, `state`, resource, requested scopes, the
-    effective origin, and the peer address class;
-  - expiry after 10 minutes; at most 16 pending per environment.
+  - the client, the exact redirect URI including its port, the challenge, `state`, the
+    resource, the requested scopes, the effective origin, and the source key;
+  - expiry after 10 minutes, under the admission limits.
 
   It answers with the consent page (below).
 
@@ -1010,25 +1984,45 @@ answers 404 on any other origin, and on a preview gateway hostname.
   The status cookie is an HttpOnly, `SameSite=Strict` random value bound to the pending
   row, so another page cannot read the code.
 
-- **`POST /oauth/token`** gains `grant_type=authorization_code`, with `code`,
-  `code_verifier`, `redirect_uri`, `client_id` and `resource`.
-  - **Code.** Single use, valid for 60 seconds. Its PKCE S256 must verify, and its
-    redirect URI and resource must match.
-  - **Session.** Exchange mints an `mcp-client` session through the existing session
-    writer:
-    - scopes as approved, and `mcp_access` as approved;
-    - `mcp_resource` set to the resource;
-    - label `MCP · <client_name> (remote)`, method bearer;
-    - lifetime 30 days.
-  - **Response.** `{ access_token, token_type: "Bearer", expires_in, scope }`. No refresh
-    token is issued.
-  - **Code reuse.** A second use of a code revokes the session it minted, as RFC 6749
-    §4.1.2 recommends.
+- **`POST /oauth/token`** dispatches on `grant_type`. The eligibility rule applies to the
+  new grants only (review P2):
+  - **`urn:ietf:params:oauth:grant-type:token-exchange`** (RFC 8693, today's only grant,
+    `auth/http.rs:40`, `:119-140`) is **unchanged**, on every origin it serves today.
+  - **`authorization_code`**, with `code`, `code_verifier`, `redirect_uri`, `client_id` and
+    `resource`, on an eligible origin:
+    - the code is single use and valid for 60 seconds; its PKCE S256 must verify; its
+      client, exact redirect URI, resource and scopes must match what was approved;
+    - exchange mints the grant: an `mcp-client` session through the existing session
+      writer, with the approved scopes and `mcp_access`, `mcp_resource` set, label
+      `MCP · <client_name> (remote)`, method bearer, and an expiry 30 days after its last
+      refresh;
+    - the response is `{ access_token, token_type: "Bearer", expires_in: 3600,
+refresh_token, scope }`;
+    - a second use of a code revokes the session it minted (RFC 6749 §4.1.2).
+  - **`refresh_token`**, with `refresh_token`, `client_id` and `resource`, on an eligible
+    origin:
+    - in one SQLite transaction, the presented token must be unused, its session live,
+      and its client and resource the grant's; it is marked used, and a new access token
+      and refresh token are returned; the session's expiry moves to 30 days from now;
+    - `scope`, if sent, may only narrow the grant; it never widens it;
+    - **reuse:** a refresh token used again more than 60 seconds after its rotation
+      revokes the whole grant (RFC 9700 §4.14.2);
+    - **a race inside 60 seconds** gets the **same** new pair the first refresh returned.
+      Both harnesses treat `invalid_grant` as "sign in again", so refusing the loser would
+      still break it. The rotation result is kept in memory only, keyed by the old token's
+      hash, for 60 seconds; after a restart the loser gets `invalid_grant` and
+      reauthorizes, which is rare;
+    - refresh still works while `enableMcpServer` is off, so turning MCP back on does not
+      force every agent to reauthorize; `/mcp` refuses their calls meanwhile.
+  - **Access tokens** are `SessionClaims` with `exp` one hour out (`auth/token.rs:73-85`),
+    as DPoP sessions already are (`auth/service.rs:41`). Revoking the session ends both
+    tokens at the next request.
 - **`POST /api/auth/mcp-authorizations/{id}/approve`** with `{ access, terminals }`, and
   **`/deny`**:
   - They need `access:write`, like the other `/api/auth/*` administration routes.
-  - `access` is at most the current `mcpServerAccess`, and `terminals` is allowed only
-    under slice T's conditions.
+  - `access` is at most the current `mcpServerAccess`.
+  - `terminals` is allowed only when the client asked for `terminal:operate` and slice T's
+    conditions hold. Unchecking it narrows the grant; nothing widens it.
   - The pending list reaches clients on the existing `subscribeAuthAccess` stream, as a
     new optional `pendingMcpAuthorizations` field.
 - **Host CLI.** `bibcode mcp authorize [<code>] [--access <level>] [--terminals] [--deny]`
@@ -1036,45 +2030,65 @@ answers 404 on any other origin, and on a preview gateway hostname.
   - With no code it lists the pending requests.
   - `<desktop exe> mcp authorize` is dispatched after `crash::attach()`, like `mcp`.
 
+### Admission for unauthenticated routes
+
+Registration and authorization are open, so they must not let one caller lock out others
+(review P2).
+
+- **Source key.** The same key the existing pre-auth admission uses: the peer address, or
+  for a loopback peer the last `X-Forwarded-For` entry, bucketed by network
+  (`docs/architecture/remote.md:320-336`). Managed-tunnel requests form their own source
+  class.
+- **Limits:**
+  - per client: 2 pending authorizations;
+  - per source: 8 registrations an hour, and 4 pending authorizations;
+  - global: 64 never-approved clients and 64 pending authorizations, of which 16 are held
+    back for sources that have none pending.
+- **When the global cap is full**, a new request evicts the oldest pending entry of the
+  source with the most; a source alone at its own cap gets 429. A flood from one source
+  therefore evicts its own entries, not another source's.
+- **Residual.** Through the managed tunnel this repository cannot prove the source key is
+  unforgeable, so a flood through the tunnel can delay authorizations that also arrive
+  through the tunnel. It cannot grant access, and it cannot exclude direct, SSH or proxy
+  requests. Turning MCP off ends it.
+
 ### `/mcp` changes
 
-- **401 challenge.** On an eligible origin, a 401 now carries
-  `WWW-Authenticate: Bearer resource_metadata="<origin>/.well-known/oauth-protected-resource/mcp", scope="orchestration:read orchestration:operate"`.
-  A provider never sends a request without its token, so providers see no difference.
-- **Audience, checked in `authenticate_mcp_client`:**
-  - A session with `mcp_resource` set is accepted only when the request's effective
-    `<origin>/mcp` equals it.
-  - A session with `mcp_resource` NULL, minted by the stdio relay, is accepted only when
-    the effective host is a loopback literal or `localhost`. This closes a path slice 1
-    left open: through a tunnel, requests come from a loopback peer but carry the public
-    host, so a relay credential that leaked could otherwise be used through the tunnel.
-  - Provider credentials are unchanged.
+- **401 challenge.** On an eligible origin, a 401 carries
+  `WWW-Authenticate: Bearer resource_metadata="<origin>/.well-known/oauth-protected-resource/mcp", scope="orchestration:read orchestration:operate"`,
+  for an unauthenticated POST and GET alike. A provider never sends a request without its
+  token, so providers see no difference. `terminal:operate` is never in the challenge; an
+  agent asks for it explicitly (Question 3).
+- **Audience** is checked as set out in [Origins](#origins-and-forwarded-headers), for all
+  three bearer kinds.
 - **Origin.** The existing 403 for a foreign `Origin` stays. A DNS-rebinding page sends
   its own `Origin`, so it gets 403. The consent page sends `frame-ancestors 'none'`,
   `X-Frame-Options: DENY`, and a CSP with no script.
 - **Legacy session shape.**
   - Providers keep `initialize` and `Mcp-Session-Id` (slice 1).
   - OAuth clients are sessionless in both eras, as relay clients already are.
-  - `DELETE /mcp` from a client principal gets 405. GET stays 405.
+  - `DELETE /mcp` from a client principal gets 405. An authenticated GET stays 405.
 - **Insufficient scope.** A tool the credential lacks is hidden from `tools/list` and
-  refused as a typed `McpScopeError` tool result. It is not refused with HTTP 403
-  `insufficient_scope`, because a step-up re-authorization cannot grant more than
-  approval in BiBCode does. Whether harnesses act on step-up at all is unverified.
+  refused as a typed `McpScopeError` tool result naming the reauthorization step. It is
+  not refused with HTTP 403 `insufficient_scope`: neither harness steps up by itself.
+
+**Gaining the terminal scope later** means reauthorizing with it requested (Question 3):
+
+- Codex: `codex mcp login bibcode --scopes orchestration:read,orchestration:operate,terminal:operate`.
+- Claude Code: set the server's `oauth.scopes` to
+  `"orchestration:read orchestration:operate terminal:operate"`, then **Re-authenticate**
+  in `/mcp`.
 
 ### Tunnels and relays
 
 - **BiBCode Connect's managed tunnel** gives an environment an HTTPS hostname, so remote
-  MCP works there. Its connector runs on the host, so the peer is loopback, and the
-  origin comes from the forwarded headers.
-  - **Verify in implementation:** whether the connector sends `Host` or
-    `X-Forwarded-Host` with the public name, and `X-Forwarded-Proto: https`. If it does
-    not, the origin is wrong and every token is refused, which fails closed.
-  - A token minted through one hostname does not work through another, and a tunnel
-    hostname change requires a new authorization. This is intentional (RFC 8707
-    audience).
-- **A reverse proxy** with TLS on the host (with `X-Forwarded-Host`, `remote.md`
-  already requires it), Tailscale Serve, or `ssh -L` to loopback also give an eligible
-  origin.
+  MCP works there, with the origin fixed by the server
+  ([Origins](#origins-and-forwarded-headers)).
+- **A reverse proxy** on the host that follows the nginx recipe, or `ssh -L` to loopback,
+  also gives an eligible origin. **Tailscale Serve** is eligible only if it presents as
+  that recipe does (loopback `Host` plus both forwarded headers); this is unverified, and
+  the runbook says to check it or use nginx. Use the MagicDNS name, never a `100.x`
+  address, which Codex refuses.
 - **The Connect relay's own tokens** never reach `/mcp`. They are not `mcp-client`
   sessions, and `/mcp` accepts no other session.
 - **Preview gateway hostnames** never serve these routes.
@@ -1086,52 +2100,58 @@ answers 404 on any other origin, and on a preview gateway hostname.
     themselves. Approval needs `access:write` in BiBCode, or the data root.
   - The approval card names the client, the redirect host ("Returns to
     `localhost:53682`"; the spec says the host MUST be displayed), the origin the request
-    used, and the matching code.
+    used, the scopes asked for, and the matching code.
   - When the redirect URI is localhost only, the card warns "Only approve if you just
     started this in an AI tool on that computer.", as the spec's localhost-impersonation
     note asks.
-- **What the token reaches.** Only `/mcp` at that resource, within the approved scopes
-  and the lower of its ceiling and the environment's.
-- **Abuse.** Pending authorizations and registered clients are capped and expire, and
-  each route does constant work. A flood fills the caps and then gets 429. It cannot
-  grant access or grow storage without bound.
+- **What the tokens reach.** The access token reaches only `/mcp` at that resource, within
+  the approved scopes and the lower of its ceiling and the environment's, for one hour.
+  The refresh token reaches only the token endpoint, for that client and resource.
+- **Abuse.** See [Admission](#admission-for-unauthenticated-routes). Each route does
+  constant work, and storage stays bounded.
 
 ### Failure, restart, concurrency
 
 - Pending authorizations are durable rows, so a restart does not lose them, and the
   page's poll continues afterwards.
-- Codes are single-use under one SQLite transaction. Two exchanges of one code race,
-  and the second loses and revokes (above).
+- Codes and refresh tokens are single-use under one SQLite transaction. Two exchanges of
+  one code race, and the second loses and revokes. Two refreshes of one token race, and
+  the second gets the same new pair (inside 60 seconds).
 - With `enableMcpServer` off, the authorize page says the MCP server is off, the token
-  endpoint refuses `authorization_code`, and `/mcp` answers `McpServerDisabledError`.
-  Sessions are kept.
-- **Unverified:** Codex refreshing OAuth tokens. Third-party reports describe a refresh
-  bug, which issuing no refresh token sidesteps.
+  endpoint refuses `authorization_code`, refresh still works, and `/mcp` answers
+  `McpServerDisabledError`. Sessions are kept.
+- An agent whose refresh token was revoked or expired gets `invalid_grant`. Codex then
+  says "Run `codex mcp login bibcode`", and Claude Code shows **Re-authenticate**.
 
-### Persistence: migration 60, `McpOAuth`
+### Persistence: `McpOAuth` migration
+
+The number is assigned in the [migration summary](#persistence-and-migration-summary).
 
 - `mcp_oauth_clients`: `client_id` (primary key), `client_name`, `redirect_uris_json`,
-  `created_at`, `approved_at`, `last_used_at`.
+  `source_key`, `created_at`, `approved_at`, `last_used_at`.
 - `mcp_oauth_authorizations`: `id` (primary key), `user_code` (unique), `client_id`,
-  `redirect_uri`, `code_challenge`, `state`, `resource`, `scopes`, `origin`,
+  `redirect_uri`, `code_challenge`, `state`, `resource`, `scopes`, `origin`, `source_key`,
   `status_cookie_hash`, `status` (`pending`, `approved`, `denied`, `exchanged`),
   `approved_access`, `approved_scopes`, `code_hash`, `code_expires_at`, `session_id`,
   `created_at`, `expires_at`.
+- `mcp_oauth_refresh_tokens`: `token_hash` (primary key), `session_id`, `client_id`,
+  `issued_at`, `used_at`. Rows go with their session.
 - `auth_sessions.mcp_resource TEXT NULL`.
 
 ### UI (Agent integrations, MCP tab)
 
-- **Remote agents row.** For an environment whose saved endpoint is eligible, it shows the
-  MCP URL with **Copy for Claude Code**
+- **Remote agents row.** For an environment with an eligible origin (a managed tunnel, or
+  a saved HTTPS endpoint), it shows the MCP URL with **Copy for Claude Code**
   (`claude mcp add --transport http bibcode <url>`) and **Copy for Codex**
-  (`codex mcp add bibcode --url <url>`, unverified syntax).
+  (`codex mcp add bibcode --url <url>`, which starts sign-in itself).
   - Otherwise it says: "Remote agents need an HTTPS address. Use the launch command over
     SSH instead."
 - **Requests to connect.** A card for each pending authorization, with:
-  - the client name (untrusted text), the redirect host, the request origin and the
-    code;
+  - the client name (untrusted text), the redirect host, the request origin, the scopes
+    asked for, and the code;
   - an **Agents may** select, defaulting to and capped at the environment's;
-  - an **Allow terminals** checkbox, shown only when slice T's conditions hold;
+  - an **Allow terminals** checkbox, shown only when the client asked for it and slice
+    T's conditions hold, unchecked by default;
   - **Approve** and **Deny**.
 - **Toast.** A new pending request also raises a toast in every BiBCode client with
   `access:write`: "Claude Code wants to operate <environment>. Review". **Review** opens
@@ -1146,33 +2166,58 @@ answers 404 on any other origin, and on a preview gateway hostname.
 - **Metadata.**
   - PRM at both well-known paths, with `resource` equal to the request origin plus
     `/mcp`.
-  - AS metadata with an `issuer` equal to the origin and `S256`.
+  - AS metadata with an `issuer` equal to the origin, `S256`, both grant types, and
+    `authorization_response_iss_parameter_supported`.
   - Both are 404 on a non-loopback `http` origin and on a preview hostname.
-- **401 challenge.** It names the PRM URL, and is absent on an ineligible origin.
-- **Register.** It refuses a non-loopback `http` redirect URI, and a 65th unapproved
-  client prunes the oldest.
+- **401 challenge.** An unauthenticated POST and GET both name the PRM URL; it is absent on
+  an ineligible origin; an authenticated GET is 405.
+- **Register.** It refuses a non-loopback `http` redirect URI; the per-source and global
+  limits hold.
 - **Authorize.**
   - An unknown client or redirect URI shows an error page with no redirect.
+  - A loopback redirect URI with a different port from the registered one is accepted;
+    an HTTPS one with any difference is refused.
   - A missing or `plain` PKCE method is refused.
   - A `resource` for another origin is refused.
+  - An empty scope request is the default pair; `offline_access` is ignored.
 - **Flow.** Approve, then status redirects with `code`, `state` and `iss`, then token
-  with the right verifier returns a bearer.
+  with the right verifier returns an access token with `expires_in: 3600` and a refresh
+  token.
   - A wrong verifier, a reused code (which also revokes the session), or an expired code
     is refused.
+- **Refresh.**
+  - A refresh returns a new pair, and the old refresh token then fails.
+  - The old token used again after 60 seconds revokes the grant; within 60 seconds it gets
+    the same new pair as the first refresh, and the grant lives.
+  - A remote OAuth call's `files_download` URL uses the session's origin (X5's base).
+  - A refresh asking for `terminal:operate` that was not granted is refused.
+  - An access token past `exp` gets 401 at `/mcp`, and a refresh restores access.
+  - Revoking the client makes the next refresh `invalid_grant`.
+- **Token exchange unchanged.** The RFC 8693 exchange still works on a plain-HTTP
+  non-loopback origin, where `authorization_code` is refused.
+- **Forwarded headers.**
+  - A tunnel-shaped request (loopback peer, `Host` the managed hostname,
+    `X-Forwarded-Host: 127.0.0.1`) keeps its `Host`.
+  - An nginx-shaped request (loopback peer, `Host: 127.0.0.1:3773`, both forwarded
+    headers) gets the forwarded host and scheme, as today.
 - **Audience.**
-  - The token works at its origin's `/mcp` and gets 401 at another `Host`.
-  - A relay (NULL-resource) token gets 401 when `X-Forwarded-Host` names a public host
-    from a loopback peer.
+  - An OAuth token works at its origin's `/mcp` and gets 401 at another `Host`.
+  - A relay token and a provider token each get 401 through the tunnel and through a
+    proxy, and work on a direct request.
+- **Admission.** A flood of authorizations from one source leaves room for a request
+  from another source; a flood from one client leaves room for another client.
 - **Approval route.**
   - It needs `access:write`; a standard pairing bearer is refused.
   - `access` above `mcpServerAccess` is refused.
-  - `terminals` is refused while the setting is off.
+  - `terminals` is refused when the client did not ask for it, or the setting is off.
 - **CLI.** `bibcode mcp authorize` lists and approves through the data root.
-- **Off switch.** The token endpoint refuses, and the page explains why.
+- **Off switch.** The authorization-code grant is refused, refresh works, and the page
+  explains why.
 - **Inventory.** `ROUTE_INVENTORY` lists the new routes with their auth class, and the
   audience test still refuses an `mcp-client` token on every authenticated route.
-- **Live smoke.** A Claude Code `claude mcp add --transport http` against an HTTPS
-  reverse proxy completes the flow.
+- **Live smoke.** `claude mcp add --transport http` and `codex mcp add --url` each
+  complete the flow through an HTTPS reverse proxy and through BiBCode Connect, and keep
+  working across a refresh (an access lifetime shortened for the test).
 
 ## Deferred: Tasks and resources
 
@@ -1206,54 +2251,80 @@ design does not change it, with three notes:
 - **No new subcommands.** There is no approve or destructive subcommand. Exit code 2
   still means "a person must answer". An agent using MCP may now answer instead, but the
   CLI does not.
-- **Shared files.** The CLI writer and slice R both edit `apps/server/src/lib.rs` and
-  `config.rs` (subcommand dispatch for `thread` and for `mcp authorize`). Slice R
-  rebases on the CLI if the CLI lands first.
+- **Shared files.** The CLI (branch `claude/v0131-139-cli`) edits `lib.rs`, `config.rs`,
+  `lifecycle.rs`, `mcp/control.rs`, `mcp/relay.rs` and `diagnostics/profiler/cli.rs`, and
+  adds no migration. It lands on the batch branch before F0 starts and before R starts,
+  so F0 moves its `control.rs` changes with the code, and R adds `mcp authorize` beside
+  its `thread` dispatch.
+- **Its sessions** are relay-style (`mcp_resource` NULL) on a direct loopback request, so
+  R's audience rule accepts them unchanged.
 - **Attachments.** The CLI's `start` and `send` could take attachments after slice A;
   this is not planned here.
 
 ## Persistence and migration summary
 
-| Migration            | Slice | Change                                                                                                 |
-| -------------------- | ----- | ------------------------------------------------------------------------------------------------------ |
-| 59 `McpToolOutcomes` | F0    | `mcp_tool_requests.state` (default `commands`), `mcp_tool_requests.outcome_json`                       |
-| 60 `McpOAuth`        | R     | `mcp_oauth_clients`, `mcp_oauth_authorizations`, `auth_sessions.mcp_resource`, with `CORE_TABLES` rows |
+| Migration                | Slice | Change                                                                                                                                      |
+| ------------------------ | ----- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| 59 `McpToolOutcomes`     | F0    | `mcp_tool_requests.state` (default `commands`; also `running`, `done`, `failed`, `unknown`), `mcp_tool_requests.outcome_json`               |
+| 60 `McpActorAttribution` | X1    | `projection_thread_messages.actor_json`, `projection_thread_messages.source_thread_id`, `projection_threads.requester_json`, `mcp_activity` |
+| 61 `Webhooks`            | X8    | `webhook_endpoints`, `webhook_deliveries`, `webhook_state`                                                                                  |
+| 62 `McpOAuth`            | R     | `mcp_oauth_clients`, `mcp_oauth_authorizations`, `mcp_oauth_refresh_tokens`, `auth_sessions.mcp_resource`, with `CORE_TABLES` rows          |
 
-The numbers are assigned here. If another branch lands a migration first, both renumber in
-order, and nothing depends on the numbers.
+Each migration has one owner, and the waves land them in number order (58 is the last one
+used, by slice 1). If another branch lands a migration first, the remaining ones renumber
+in order at landing; nothing depends on the numbers. X7's suggestion and X4's intents are
+in memory and need none.
 
 **Contracts:**
 
-- `settings.ts`: `mcpAllowTerminals` (F0);
-- `auth.ts`: `AuthAccessStreamEvent.pendingMcpAuthorizations`, optional (R).
+- `settings.ts`: `mcpCapabilities` (F0); `enableWebhooks` (X8);
+- `orchestration.ts`: `OrchestrationEventMetadata.actor`, `thread.create.purpose`, the
+  turn message's `sourceThreadId`, and the projected actor and requester (all X1, optional);
+- `gitManager.ts`: the `remote-branch-delete` operation (G);
+- `project.ts`: `deleteEntry.toTrash`, optional (X5);
+- `auth.ts`: `AuthAccessStreamEvent.pendingMcpAuthorizations`, optional (R);
+- new: the activity stream (X1), the UI intent stream (X4, X7), and the webhook methods
+  (X8).
 
-No new RPC methods.
+**New RPC methods**, each registered through the `rpc/session.rs` wrappers:
+`subscribeMcpActivity` (X1); `ui.publishIntent` and `subscribeUiIntents` (X4);
+`webhooks.*` (X8). **New HTTP routes:** `/api/auth/clients/mcp-access` (X1) and the OAuth
+routes (R).
 
 ## Profiler, crash, and trace coverage
 
-| Item                  | Coverage                                                                                                                                                                                                                                                                                                        |
-| --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Child processes       | None new. Git runs through the repository layer, terminals through the terminal runtime, and devices through `DeviceManager`, each already supervised and attributed.                                                                                                                                           |
-| RPC methods           | None new. B1 and `invoke_local_stream` keep the registry's admission. Every tool is timed as `mcp.<tool>`, and `is_long_running` derives from `ToolSpec` (network tools are `long_running: true`). The F0 test iterates every family. The new HTTP routes are not RPC; they log failures with `tracing::warn!`. |
-| Worktree removal      | Both modes reach the handlers that call `record_removal_outcome`. A test asserts one event per real removal and none per replay. No new removal path.                                                                                                                                                           |
-| Binaries and re-exec  | `mcp authorize` is dispatched after `crash::attach()` in both `main.rs` files, under the existing `mcp` branch.                                                                                                                                                                                                 |
-| Shutdown              | Recorded-outcome tasks and terminal-read waits stop at `McpControl::shutdown`, which already runs right after `profiler.begin_stopping()` and before orchestration and profiler teardown.                                                                                                                       |
-| Events, logs, records | One `info` line per destructive call (C7). No prompt, message, commit message, PR body, path or terminal content, and nothing new in fingerprints.                                                                                                                                                              |
-| Documentation         | The new `mcp.*` names, and the note that `mcp.<tool>` timing covers them, go in `docs/skills/bibcode-profiler/references/` and the Profiler section of `overview.md` (slice Z).                                                                                                                                 |
+| Item                  | Coverage                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Child processes       | None new. Git runs through the repository layer, terminals through the terminal runtime, and devices through `DeviceManager`, each already supervised and attributed.                                                                                                                                                                                                                                                                                                                                                                                            |
+| RPC methods           | B1 and `invoke_local_stream` keep the registry's admission. X2's profiler and log tools read in process and take no RPC admission; they are still timed as `mcp.<tool>`. Every tool is timed as `mcp.<tool>`, and `is_long_running` derives from `ToolSpec` (network tools are `long_running: true`). The F0 test iterates every family. New methods (X1, X4, X8) register through the `rpc/session.rs` wrappers; `webhooks.sendTest` and `webhooks.redeliver` join `is_long_running`. The new HTTP routes are not RPC; they log failures with `tracing::warn!`. |
+| Worktree removal      | Both modes reach the handlers that call `record_removal_outcome`. A test asserts one event per real removal and none per replay. No new removal path.                                                                                                                                                                                                                                                                                                                                                                                                            |
+| Binaries and re-exec  | `mcp authorize` is dispatched after `crash::attach()` in both `main.rs` files, under the existing `mcp` branch.                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| Shutdown              | Owned mutations and terminal-read waits stop at `McpControl::shutdown`, which already runs right after `profiler.begin_stopping()` and before orchestration and profiler teardown. The webhook dispatcher (X8) is a new service and stops in the same place, before the profiler's teardown.                                                                                                                                                                                                                                                                     |
+| Events, logs, records | One `info` line per destructive call (C7). No prompt, message, commit message, PR body, path, terminal content or webhook URL, and nothing new in fingerprints. Activity rows (X1) and webhook payloads (X8) hold ids and counts only.                                                                                                                                                                                                                                                                                                                           |
+| Documentation         | The new `mcp.*` names, and the note that `mcp.<tool>` timing covers them, go in `docs/skills/bibcode-profiler/references/` and the Profiler section of `overview.md` (slice Z).                                                                                                                                                                                                                                                                                                                                                                                  |
 
 ## UI review (UI.md)
 
 **Changed surfaces:**
 
-- The MCP tab's copy.
-- The **Allow terminals** switch (T).
+- The MCP tab's copy, and the **What agents can use** switches (T).
+- The **Agents** list, the activity list, the agent chips, and the header indicator with
+  **Stop**, **Take over** and **Hand back** (X1).
+- The **From <panel>** provenance and the **wants to show** toast (X4).
+- The commit message suggestion in the Source Control panel (X7).
+- The **MCP** and **Webhooks** tabs and the section's status line (X8).
 - The **Remote agents** row, the **Requests to connect** cards, and the toast (R).
 - The server-rendered consent page (R).
 
 Against UI.md:
 
-- **Defaults stay safe.** Terminals are off. Remote access needs an explicit approval
-  each time.
+- **Defaults stay safe.** Terminals and webhooks are off. Remote access needs an explicit
+  approval each time, and the terminal checkbox starts unchecked.
+- **Who acted is visible.** Agent work carries its label wherever it shows up, and the
+  person can stop or pause the agent from any screen.
+- **User work is preserved.** `focus_ui` never moves the layout by itself, a commit
+  message suggestion never overwrites a draft, and `files_write` refuses a file that
+  changed since the agent read it.
 - **The access description tells the truth.** It becomes: "Threads an MCP agent starts
   or messages never run with more access than this. At any level above Read only,
   agents can also answer approvals, remove worktrees, discard changes, force-push and
@@ -1266,13 +2337,16 @@ Against UI.md:
   - "Remote agents need an HTTPS address…"
 - **Recognition over recall.** Copy buttons give the exact commands. Approval needs no
   typed code, only a code to compare.
-- **No confirmation dialogs.** Every switch is reversible, and Approve is itself the
-  confirmation.
+- **Confirmation only where something is lost.** Every switch is reversible, Approve is
+  itself the confirmation, and Stop and Take over only stop an agent. Deleting a webhook
+  endpoint asks, because its delivery log goes with it.
 - **Errors are actionable.** The consent page and the typed tool errors name the setting
   or the action that fixes them.
 
-The `vercel-react-best-practices` review applies to `AgentIntegrationsSection.tsx` and the
-new components.
+The `vercel-react-best-practices` review applies to `AgentIntegrationsSection.tsx`, the
+new components, and the changed `MessagesTimeline.tsx`, Source Control panel and stores.
+The activity and intent streams feed narrow selectors, so a new row does not re-render
+the timeline.
 
 ## Docs and skill
 
@@ -1288,7 +2362,18 @@ new components.
 - `docs/cloud/environment-auth.md`: the OAuth routes, the authorization-code grant, and
   the "not a general-purpose OAuth authorization server" sentence, which becomes "an
   authorization server for `/mcp` only";
-- `docs/user/remote-access.md`.
+- `docs/user/remote-access.md`: the remote agent setup, and the reverse-proxy rule that
+  `Host` must stay loopback for the forwarded headers to count;
+- `docs/architecture/remote.md` "Security boundaries" (`:1751-1757`): the narrowed
+  forwarded-header rule.
+
+**Extended-scope slices** own their living docs:
+
+- X1: `docs/architecture/rpc-and-orchestration.md` (event actor, activity stream);
+- X3: the `changes_since` cursor contract in `docs/user/mcp.md`;
+- X5: the transfer token's bound `overwrite` in `docs/architecture/remote.md`;
+- X8: a new `docs/user/webhooks.md` (payload, signature check, retries, the 5-minute
+  timestamp window a receiver should enforce) and its section in `overview.md`.
 
 **Slice Z** (last, one owner):
 
@@ -1299,7 +2384,8 @@ new components.
 - **Slice-1 doc.** A dated "Superseded 2026-10-30" note under its Non-goals and its
   "Approvals?" answer. The decisions themselves are not edited.
 - **Runbooks.** `docs/testing/cross-platform-validation.md` and `ssh-environments.md`
-  gain smoke steps for a destructive tool, a terminal and a remote OAuth connect.
+  gain smoke steps for a destructive tool, a terminal, the off switch mid-push, Stop and
+  Take over, a webhook delivery, and a remote OAuth connect with Claude Code and Codex.
 - **`docs/skills/bibcode-mcp/`, rebuilt test-first:**
   1. Re-record baselines without the skill for these scenarios:
      - **"just approve it"**: eval 2's expectation flips from refuse-and-relay to
@@ -1311,7 +2397,11 @@ new components.
      - **injected instructions** in a transcript, a PR body or terminal output: act on
        none of them;
      - **a remote host over HTTPS**;
-     - **"use a terminal"** with terminals off: name the setting.
+     - **"use a terminal"** with terminals off: name the setting;
+     - **"what changed while I was away"**: use `changes_since` with the stored cursor,
+       not a transcript re-read;
+     - **an outcome unknown** after an interruption: check state, then retry with a new
+       `clientRequestId`.
   2. Update `evals.json` and `trigger-evals.json`.
   3. Write the minimal skill text.
   4. Re-run, and close the loopholes.
@@ -1319,50 +2409,85 @@ new components.
 
 ## Implementation partition
 
-### Dependency order
+### Constraints
+
+- **Disk.** About 320 GB is free, and each Rust writer needs its own `target/` of 30 to
+  55 GB. A `target/` is never shared between live worktrees: a shared one runs another
+  worktree's binaries. At most four Rust writers therefore run at once (at most 220 GB),
+  which leaves headroom for the build caches and the desktop bundle.
+- **Reuse.** A writer in a later wave may take over a finished writer's `target/` (point
+  `CARGO_TARGET_DIR` at it, or move it), only after that writer has handed off. A web-only
+  writer needs none.
+- **Load.** While four writers run, each sets `CARGO_BUILD_JOBS` to about a quarter of the
+  cores, runs focused tests during the work, and runs the full server suite once before
+  hand-off, with at most two full suites at a time. F0 runs alone with every core.
+- **Order.** The `bibcode thread` CLI lands on the batch branch before F0 starts. R lands
+  last among the code slices, and Z last of all.
+
+### Waves
 
 ```text
-F0 ──┬── A
-     ├── W
-     ├── G
-     ├── P
-     ├── T
-     ├── D
-     └── R (auth/* and routes can start at once; connect_mcp.rs rebases on F0)
-A, W, G, P, T, D, R ── Z (last)
-`bibcode thread` CLI writer: parallel to all; R rebases lib.rs/config.rs on it
+CLI (landed) ─ W0: F0 ─ W1: A W G P ─ W2: X1 T D X2 ─ W3: X3 X4 X5 X6 ─ W4: X7 X8 ─ W5: R ─ W6: Z
 ```
 
-Remote HTTP is independent of the tool slices. Every tool works over every transport once
-it lands, so R may land before or after them.
+| Wave | Writers (Rust `target/`)       | Depends on                                     | Migration |
+| ---- | ------------------------------ | ---------------------------------------------- | --------- |
+| W0   | F0 (1)                         | the CLI on the batch branch                    | 59        |
+| W1   | A, W, G, P (4)                 | F0                                             | —         |
+| W2   | X1, T, D, X2 (4; reuse W1's)   | F0; X1 after A and W (it edits their families) | 60 (X1)   |
+| W3   | X3, X4, X5, X6 (4; reuse W2's) | X1 (activity rows, actor, `source_thread_id`)  | —         |
+| W4   | X7, X8 (2; reuse W3's)         | X4 (intent stream), X3 (cursor), X1            | 61 (X8)   |
+| W5   | R (1; reuses one)              | F0, the CLI, X8 (the section's tabs)           | 62 (R)    |
+| W6   | Z (docs only)                  | everything                                     | —         |
+
+Within a wave the writers share only one-line registrations (`FAMILIES`,
+`mcp/tools/mod.rs`, `mcp_tools_tests/mod.rs`), whose conflicts are trivial. Every other
+shared file has one owner per wave, listed below.
 
 ### File ownership
 
-| Slice | Owns (new or changed)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | Touches after its owner (one-line or rebase)                                                                                                        |
-| ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------- |
-| F0    | `apps/server/src/mcp/control.rs`, `mcp/mod.rs`, `mcp/wait.rs`, new `mcp/tools/mod.rs`, new `mcp/tools/threads.rs` (move only), new `mcp/target.rs`, new `mcp/outcome.rs`, new `mcp/tools/previews.rs` (provider dispatch extracted), `mcp/relay.rs` (terminal scope at mint), `rpc/session.rs`, `persistence/migrations.rs` (59), `persistence/repositories.rs` (outcome rows), `production/connect_mcp.rs` (extraction, kind-aware call), `production/connect_mcp/tests.rs`, `production/control.rs` (setting), `production/mcp_tools_tests.rs` → `mcp_tools_tests/{mod,threads}.rs`, `diagnostics/profiler/latency.rs`, `auth/service.rs` (`issue_mcp_pairing_link` extra scope only), `packages/contracts/src/settings.ts` and fixtures | —                                                                                                                                                   |
-| A     | `mcp/tools/threads.rs`, new `production/mcp_tools_tests/thread_actions.rs`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | `mcp/control.rs` `FAMILIES` (no change: threads already listed), `mcp_tools_tests/mod.rs` (one `mod` line)                                          |
-| W     | new `mcp/tools/worktrees.rs`, new `production/mcp_tools_tests/worktrees.rs`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                | `mcp/control.rs` `FAMILIES`, `mcp/tools/mod.rs`, `mcp_tools_tests/mod.rs` (one line each)                                                           |
-| G     | new `mcp/tools/git.rs`, new `production/mcp_tools_tests/git.rs`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            | the same one-liners                                                                                                                                 |
-| P     | new `mcp/tools/pull_requests.rs`, new `production/mcp_tools_tests/pull_requests.rs`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        | the same one-liners                                                                                                                                 |
-| T     | new `mcp/tools/terminals.rs`, `terminal/history.rs`, `terminal/manager.rs` (read window), new `production/mcp_tools_tests/terminals.rs`, `apps/web/src/components/settings/AgentIntegrationsSection.tsx` and its test (the terminals switch **and** all MCP-tab copy changes)                                                                                                                                                                                                                                                                                                                                                                                                                                                              | the same one-liners                                                                                                                                 |
-| D     | `mcp/tools/previews.rs` (client twins), `production/connect_mcp/device_tools.rs` only if a `pub(crate)` accessor is needed, new `production/mcp_tools_tests/previews.rs`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | the same one-liners                                                                                                                                 |
-| R     | `auth/http.rs`, `auth/service.rs` (authorization-code grant, audience), new `auth/oauth.rs`, new `auth/consent_page.rs`, `production/http_routes.rs` (routes, `ROUTE_INVENTORY`), `production/connect_mcp.rs` (401 challenge, after F0), `persistence/migrations.rs` (60), `persistence/repositories.rs` (OAuth rows), `lib.rs` and `config.rs` (`mcp authorize`), `apps/desktop/src-tauri/src/main.rs` (only if dispatch needs it), `packages/contracts/src/auth.ts`, new `apps/web/src/components/settings/McpRemoteAgentsPanel.tsx` and its test, the toast hook, `docs/architecture/remote.md`, `docs/cloud/environment-auth.md`, `docs/user/remote-access.md`                                                                         | `AgentIntegrationsSection.tsx` (one import and mount line, after T); `production/connect_mcp/tests.rs` (401 challenge and audience tests, after F0) |
-| Z     | `docs/user/mcp.md` (cross-cutting sections), `docs/architecture/overview.md`, `docs/skills/bibcode-profiler/references/*`, `docs/skills/bibcode-mcp/**`, the `.agents/skills/` and `.claude/skills/` stubs, `docs/testing/*`, `docs/plans/2026-10-24-mcp-operate-server-design.md` (superseded note)                                                                                                                                                                                                                                                                                                                                                                                                                                       | —                                                                                                                                                   |
+| Slice | Owns (new or changed)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| ----- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| F0    | `mcp/control.rs`, `mcp/mod.rs`, `mcp/wait.rs`, new `mcp/tools/mod.rs`, new `mcp/tools/threads.rs` (move, plus the `interrupt_turn` fix), new `mcp/target.rs`, new `mcp/outcome.rs` (recorded outcomes and live controls), new `mcp/tools/previews.rs` (provider dispatch extracted), `mcp/relay.rs` (terminal scope at mint), `rpc/session.rs`, `persistence/migrations.rs` (59), `persistence/repositories.rs` (outcome rows), `production/connect_mcp.rs` (extraction, kind-aware call), `production/connect_mcp/tests.rs`, `production/control.rs` (`mcpCapabilities`), `production/mcp_tools_tests.rs` → `mcp_tools_tests/{mod,threads}.rs`, `diagnostics/profiler/latency.rs`, `auth/service.rs` (`issue_mcp_pairing_link` extra scope only), `packages/contracts/src/settings.ts` and fixtures                                |
+| A     | `mcp/tools/threads.rs`, new `mcp_tools_tests/thread_actions.rs`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| W     | new `mcp/tools/worktrees.rs`, new `mcp_tools_tests/worktrees.rs`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| G     | new `mcp/tools/git.rs`, `git/repository.rs` (literal pathspecs), `git/manager/operations.rs` (discard containment, `remote-branch-delete`), `production/git_vcs.rs` (literal pathspecs on the `vcs.*` file paths), `packages/contracts/src/gitManager.ts` (and any exhaustive web `switch` over operation kinds), new `mcp_tools_tests/git.rs`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| P     | new `mcp/tools/pull_requests.rs`, new `mcp_tools_tests/pull_requests.rs`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| X1    | `orchestration/engine.rs` (actor in planning), its projector, `production/orchestration_rpc.rs`, `production/worktree_catalog_rpc.rs` (actor pass-through), `persistence/migrations.rs` (60), `persistence/repositories.rs` (projection columns, activity rows), new `mcp/activity.rs`, `mcp/control.rs` (one activity hook), `mcp/tools/threads.rs` and `worktrees.rs` (`purpose`), `auth/http.rs` and `auth/service.rs` (`mcp-access` route), `rpc/methods.rs` and `auth/scope.rs` (one stream), `packages/contracts/src/orchestration.ts` and a new activity contract, the client-runtime stream, `MessagesTimeline.tsx`, the thread list chip, the header indicator, the Source Control commit-row chip, new `McpAgentsPanel.tsx`                                                                                               |
+| T     | new `mcp/tools/terminals.rs`, `terminal/history.rs`, `terminal/manager.rs`, new `mcp_tools_tests/terminals.rs`, `AgentIntegrationsSection.tsx` and its test (capability switches and MCP-tab copy; owner in W2; X1 adds one mount line after it)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| D     | `mcp/tools/previews.rs` (client twins), `production/connect_mcp/device_tools.rs` only for a `pub(crate)` accessor, new `mcp_tools_tests/previews.rs`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| X2    | new `mcp/tools/diagnostics.rs`, `diagnostics/profiler/mcp.rs` (handlers `pub(crate)`), new `diagnostics/log_reader.rs`, new `mcp_tools_tests/diagnostics.rs`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| X3    | new `mcp/tools/feed.rs`, `persistence/repositories.rs` (the transition read; owner in W3), new `mcp_tools_tests/feed.rs`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| X4    | new `mcp/tools/panels.rs`, new `production/ui_intents_rpc.rs`, `rpc/methods.rs` and `auth/scope.rs` (owner in W3), a new intents contract, the web intent toast, the provenance label in `MessagesTimeline.tsx`, new `mcp_tools_tests/panels.rs`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| X5    | new `mcp/tools/files.rs`, `workspace/rpc.rs` and `workspace/service.rs` (`toTrash`), `transfer/mod.rs`, `transfer/upload.rs`, `production/transfer_routes.rs` (bound `overwrite`, activity rows), `packages/contracts/src/project.ts`, new `mcp_tools_tests/files.rs`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| X6    | new `mcp/tools/clone.rs`, `production/clone_operations.rs` (a `pub(crate)` status accessor only), new `mcp_tools_tests/clone.rs`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| X7    | `mcp/tools/git.rs` (reads, commit message tools), `production/ui_intents_rpc.rs` (the `commitMessage` kind), the Source Control panel and `sourceControlPanelStore.ts`, new `mcp_tools_tests/git_reads.rs`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| X8    | new `webhooks/` module (store, dispatcher, delivery, signing), `persistence/migrations.rs` (61) and `repositories.rs`, `rpc/methods.rs`, `auth/scope.rs`, `diagnostics/profiler/latency.rs` (owner in W4), the runtime's quiesce sequence, `packages/contracts/src/settings.ts` (`enableWebhooks`) and a new webhooks contract, `AgentIntegrationsSection.tsx` (tabs and status line; owner in W4), new `WebhooksTab.tsx`, `docs/user/webhooks.md`                                                                                                                                                                                                                                                                                                                                                                                  |
+| R     | `http.rs` (forwarded-header rule), `auth/http.rs`, `auth/service.rs` (authorization-code and refresh grants, audience), new `auth/oauth.rs`, new `auth/consent_page.rs`, `production/http_routes.rs` (routes, `ROUTE_INVENTORY`), `production/connect_mcp.rs` (401 challenge, audience), `production/connect_mcp/tests.rs`, `persistence/migrations.rs` (62), `persistence/repositories.rs` (OAuth rows), `lib.rs` and `config.rs` (`mcp authorize`), `apps/desktop/src-tauri/src/main.rs` (only if dispatch needs it), `packages/contracts/src/auth.ts`, new `McpRemoteAgentsPanel.tsx` and its test, the toast hook, one mount line in `AgentIntegrationsSection.tsx`, one line in `mcp/tools/files.rs` (the remote transfer base), `docs/architecture/remote.md`, `docs/cloud/environment-auth.md`, `docs/user/remote-access.md` |
+| Z     | `docs/user/mcp.md` (cross-cutting sections), `docs/architecture/overview.md`, `docs/skills/bibcode-profiler/references/*`, `docs/skills/bibcode-mcp/**`, the `.agents/skills/` and `.claude/skills/` stubs, `docs/testing/*`, `docs/plans/2026-10-24-mcp-operate-server-design.md` (superseded note)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 
-### Shared files and their single owners
+### Shared files and their owners, in order
 
-- **The tool table** (`mcp/control.rs` `FAMILIES`, `mcp/tools/mod.rs`): F0. Each family
-  adds one line, and the conflicts are trivial.
-- **The scope set:** no new scope constant, so `auth/model.rs` and `auth/scope.rs` are
-  untouched. `ToolSpec.scope` widening is F0.
-- **Contracts:** `settings.ts` belongs to F0, `auth.ts` to R.
-- **`persistence/migrations.rs` and `repositories.rs`:** F0 first (59), then R (60).
-- **`production/connect_mcp.rs`:** F0 first, then R.
-- **`AgentIntegrationsSection.tsx`:** T, then R's one mount line.
+- **`mcp/control.rs` `FAMILIES`, `mcp/tools/mod.rs`, `mcp_tools_tests/mod.rs`:** F0, then
+  one line per family.
+- **`mcp/tools/threads.rs`:** F0 (move), A, then X1 (`purpose`).
+- **`mcp/tools/git.rs`:** G, then X7.
+- **`persistence/migrations.rs`:** F0 (59), X1 (60), X8 (61), R (62).
+- **`persistence/repositories.rs`:** F0, X1, X3, X8, R, one per wave.
+- **`rpc/methods.rs`, `auth/scope.rs`:** X1 (W2), X4 (W3), X8 (W4).
+- **`diagnostics/profiler/latency.rs`:** F0, then X8.
+- **`auth/http.rs`, `auth/service.rs`:** F0 (issuer only), X1 (`mcp-access`), R.
+- **`production/connect_mcp.rs`:** F0, then R.
+- **`mcp/tools/files.rs`:** X5, then R's one line for the remote transfer base.
+- **`production/ui_intents_rpc.rs`:** X4, then X7.
+- **`AgentIntegrationsSection.tsx`:** T (W2, X1's mount line after it), X8 (W4), R's
+  mount line (W5).
+- **`MessagesTimeline.tsx`:** X1, then X4.
+- **Contracts:** `settings.ts` F0 then X8; `orchestration.ts` X1; `gitManager.ts` G;
+  `project.ts` X5; `auth.ts` R.
 - **`docs/user/mcp.md`:** each slice its own subsection; Z the cross-cutting sections,
   last.
-- **`production/mcp_tools_tests/mod.rs`:** F0, then one `mod` line per slice.
+- **The scope set:** no new scope constant, so `auth/model.rs` is untouched.
 
 ## Verification
 
@@ -1374,79 +2499,82 @@ Per slice:
 - the server test suite;
 - `vp check` and `vp run typecheck`.
 
-UI slices (T, R) add the web tests, the UI.md review and the
+UI slices (T, X1, X4, X7, X8, R) add the web tests, the UI.md review and the
 `vercel-react-best-practices` review.
 
 Manual smoke tests:
 
 - Claude Code over stdio running the full flow: create a worktree, start, wait, stage,
-  commit, push, create the PR, merge, remove the worktree.
+  commit, push, create the PR, merge, remove the worktree. A second BiBCode client shows
+  each step with the agent's label.
 - Codex with its default timeouts, including a push.
 - `ssh <host> bibcode mcp` with terminals on.
-- Remote OAuth through an HTTPS reverse proxy and through BiBCode Connect.
-- Revoking mid-session, and the off switch mid-push.
+- Remote OAuth with Claude Code and with Codex, through an HTTPS reverse proxy and through
+  BiBCode Connect, across an access-token refresh.
+- Revoking mid-session, **Stop** and **Take over** mid-push, and the off switch mid-push.
+- A webhook receiver that drops deliveries, catching up through `changes_since`.
 
 ## Risks
 
 - **Destructive defaults** (C6). This is the main risk, and it is accepted by the user's
-  decision. Question 1 is the remaining lever.
-- **No actor attribution.** Agent actions look like a person's. This is mitigated only by
-  logs, Authorized clients and the skill, until the extended-scope attribution design
-  lands.
-- **Outcome unknown after a crash** (C4) pushes the agent to check state by hand. This is
-  rare, and it is never a false success.
-- **Tunnel headers** (slice R). An unverified forwarded-host behavior would refuse every
-  token through Connect. That fails closed and is caught by the live smoke test.
+  decision (Question 1).
+- **Attribution lands in the second wave.** Until X1 ships, agent actions look like a
+  person's; the activity log, chips and Stop follow it.
+- **Outcome unknown** after a crash or an interruption (C4) makes the agent check state by
+  hand. This is rare, and it is never a false success.
+- **The narrowed forwarded-header rule** (R) changes every route: a proxy that sends the
+  public `Host` and relies on `X-Forwarded-Proto` loses the scheme. The documented nginx
+  recipe is unaffected; the runbook and `remote.md` say so.
+- **Tunnel source keys** (R). Through the managed tunnel, a flood can delay tunnel
+  authorizations; it cannot grant access or block other paths.
+- **Refresh races.** Inside 60 seconds a reused refresh token gets the same new pair (R),
+  so a harness that reconnects twice keeps working; the cost is a 60-second window in
+  which a stolen, just-rotated token is replayed rather than detected.
 - **The upload lifetime** shorter than the retry window (slice A). This is a typed error,
   not a lost attachment.
 - **Cached tool lists.** As slice 1 notes, a harness that cached its list keeps showing
-  the terminal tools after the setting turns off; their calls still fail typed.
+  tools after a capability turns off; their calls still fail typed.
 - **The HTTPS requirement** leaves plain-HTTP LAN environments on SSH only. This is
   documented.
+- **Webhook secrets** sit in plaintext 0600 files, as the host identity secret does.
+- **Transfer URLs** in an agent's context (X5) are capabilities for 5 minutes.
 
 ## Could not verify
 
-- **Codex.** Whether it supports DCR, CIMD and the OAuth flow for Streamable HTTP, its
-  `mcp add --url` syntax, and its refresh behavior. Only third-party guides and one
-  GitHub issue were found.
 - **Tasks client support.** The client matrix page came back with empty cells. Claude
   Code's beta support comes from its own docs.
-- **Step-up.** Whether Claude Code or Codex acts on a 403 `insufficient_scope` challenge.
-- **Progress tokens.** Whether Codex sends a `progressToken` (carried from slice 1).
-- **The Connect tunnel's headers.** Whether its connector forwards the public `Host` (or
-  `X-Forwarded-Host`) and `X-Forwarded-Proto: https`.
-- **Upload lifetime.** How long an incomplete or unconsumed upload lives
-  (`production/uploads_rpc.rs`).
+- **The edge's handling of client `X-Forwarded-*` headers** through the managed tunnel.
+  R no longer depends on it.
+- **Tailscale Serve's headers.** R treats it as eligible only if it presents as the nginx
+  recipe does.
+- **Codex's `modern_session` tool path** sending a `progressToken`; the default path does
+  (`rmcp/src/service.rs:887-899`).
+- **Upload lifetime.** The staging service expires an idle upload after 600 seconds
+  (`transfer/staging.rs:44-60`); whether a staged but unconsumed attachment outlives that
+  needs a test in slice A.
 - **Checkpoint revert during a turn.** The exact error tag when `thread.checkpoint.revert`
   runs while a turn is running.
 - **The 2025-06-18 revision.** `protocol.rs` also serves it (`VERSIONS`), but only the
-  2026-07-28 and 2025-11-25 authorization pages were read. The 2025-06-18 revision is
-  expected to want DCR, which slice R serves, but this was not checked.
+  2026-07-28 and 2025-11-25 authorization pages were read.
 - **`DELETE` headers.** Whether any harness sends `MCP-Protocol-Version` on `DELETE`.
 - **Claude Code and `destructiveHint`.** Whether it prompts differently for
-  `destructiveHint` tools (its permissions page was not read). C2 does not depend on it.
+  `destructiveHint` tools (its docs describe only the retry and parallel behaviors of the
+  other hints). C2 does not depend on it.
+- **The relay's mapping of a refused credential** to a typed tool result (X3 checks it).
+- **The input shapes of `gitManager.getDiff`, `getCommits`, `getRefs` and `getStashes`**
+  (X7).
+
+Settled since the first draft: Codex's DCR, CIMD, `resource`, refresh, `iss`, step-up and
+`mcp add --url` behavior, and its progress tokens (from its source); whether the tunnel
+delivers the public `Host` (from the relay's ingress and the preview gateway); and Claude
+Code's refresh, step-up and redirect behavior (from its docs).
 
 ## Questions for approval
 
-1. **Destructive tools at every operate level?** The decision reads "any MCP credential
-   with operate access", so remove, discard, force-push, branch delete, merge and
-   `answer_approval` work at the default **Supervised** ceiling, with the UI copy saying
-   so. The alternative is to also require `full-access`. Recommended: as decided, at
-   every operate level.
-2. **Leave `anthropic/requiresUserInteraction` off?** Setting it makes Claude Code prompt
-   on every call and blocks headless use. Recommended: off.
-3. **Terminals: three conditions?** They would need the `mcpAllowTerminals` setting
-   (default off), a credential minted with `terminal:operate`, and the **Full access**
-   ceiling. Recommended: yes.
-4. **Remote consent: approve in BiBCode?** The consent page would show a short code, and
-   the request would be approved in BiBCode by any client with `access:write`, or with
-   `bibcode mcp authorize <code>` on the host. The alternative is typing a code on the
-   page. Recommended: approve in BiBCode.
-5. **Client registration: DCR only for now?** CIMD and Settings-issued pre-registered
-   client ids would come only if a target harness lacks DCR. Recommended: yes.
-6. **Tokens: no refresh token?** Remote tokens would be 30-day revocable sessions,
-   declining the spec's "short-lived" SHOULD. Recommended: yes.
-7. **The extended scope of 2026-10-27:** diagnostics, clone, files, `focus_ui`,
-   `send_panel_message`, `changes_since`, attribution, webhooks and capability sets would
-   stay out of these slices and get their own design. Given C6, should actor attribution
-   come first there?
+Questions 1 to 7 of the first draft are answered (see [Revision 2](#revision-2-2026-10-30)).
+One remains:
+
+8. **Where may an agent clone?** No setting limits clone destinations today. X6 clones only
+   next to a registered project (`parentProjectId`). The alternative is a new setting
+   listing allowed clone roots, which would let an agent clone into an empty machine.
+   Recommended: next to a registered project only, until a person asks for more.
