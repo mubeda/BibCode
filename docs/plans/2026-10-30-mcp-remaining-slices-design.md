@@ -22,6 +22,22 @@ failing-first test each, rather than another design round:
 | X2    | P2: a rejected `git.runStackedAction` records its client-supplied `action` text in the profiler event (`diagnostics/profiler/git_actions.rs:105`), which `profiler_events` returns.    | Record only a known action name, or `unknown`, and allowlist profiler event fields returned over MCP. Test a rejected-action marker never appears.                                                   |
 | X8    | P2: `profiler_findings` clamps to 100 newest-first (`diagnostics/profiler/mcp.rs:31`, `:295`), so a gap over 100 findings cannot be caught up.                                         | Add a cursor to `profiler_findings` (oldest-first from `since`, with `nextCursor`). Test a gap of more than 100 findings.                                                                            |
 
+**Agent-facing reference (user request, 2026-10-30).** Slice Z also writes the complete
+MCP and webhook reference in `docs/` so another AI can operate BiBCode from it alone,
+written from the finished code, not this design:
+
+- `docs/reference/mcp.md`: how to connect over each transport (stdio `bibcode mcp`, the
+  desktop executable, `ssh <host> bibcode mcp`, remote HTTP with OAuth, `bibcode thread`);
+  protocol eras; access levels and capability sets; then every tool with its arguments,
+  result shape, errors, annotations, required access and capability, idempotency and
+  `clientRequestId` rules, pagination and size caps, wait and progress semantics, and a
+  worked call for each family; and the safety model, including destructive tools.
+- `docs/reference/webhooks.md`: enabling and registering, every event with its payload
+  schema, signature verification with a worked example, retries, auto-disable, and
+  catch-up through `changes_since` and `profiler_findings`.
+- Both are linked from `docs/README.md` and the `bibcode-mcp` skill, and a test fails when
+  a registered tool or webhook event is missing from them.
+
 ## Revision 3 (2026-10-30)
 
 This revision answers the Codex re-review of Revision 2. It changes only X2, X5, X6, X8
@@ -2697,7 +2713,7 @@ shared file has one owner per wave, listed below.
 | X7    | `mcp/tools/git.rs` (reads, commit message tools), `production/ui_intents_rpc.rs` (the `commitMessage` kind), the Source Control panel and `sourceControlPanelStore.ts`, new `mcp_tools_tests/git_reads.rs`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | X8    | new `webhooks/` module (store, dispatcher, delivery, signing), `persistence/migrations.rs` (61) and `repositories.rs`, `rpc/methods.rs`, `auth/scope.rs`, `diagnostics/profiler/latency.rs` (owner in W4), the runtime's quiesce sequence, `packages/contracts/src/settings.ts` (`enableWebhooks`) and a new webhooks contract, `AgentIntegrationsSection.tsx` (tabs and status line; owner in W4), new `WebhooksTab.tsx`, `docs/user/webhooks.md`                                                                                                                                                                                                                                                                                                                                                                                  |
 | R     | `http.rs` (forwarded-header rule), `auth/http.rs`, `auth/service.rs` (authorization-code and refresh grants, audience), new `auth/oauth.rs`, new `auth/consent_page.rs`, `production/http_routes.rs` (routes, `ROUTE_INVENTORY`), `production/connect_mcp.rs` (401 challenge, audience), `production/connect_mcp/tests.rs`, `persistence/migrations.rs` (62), `persistence/repositories.rs` (OAuth rows), `lib.rs` and `config.rs` (`mcp authorize`), `apps/desktop/src-tauri/src/main.rs` (only if dispatch needs it), `packages/contracts/src/auth.ts`, new `McpRemoteAgentsPanel.tsx` and its test, the toast hook, one mount line in `AgentIntegrationsSection.tsx`, one line in `mcp/tools/files.rs` (the remote transfer base), `docs/architecture/remote.md`, `docs/cloud/environment-auth.md`, `docs/user/remote-access.md` |
-| Z     | `docs/user/mcp.md` (cross-cutting sections), `docs/architecture/overview.md`, `docs/skills/bibcode-profiler/references/*`, `docs/skills/bibcode-mcp/**`, the `.agents/skills/` and `.claude/skills/` stubs, `docs/testing/*`, `docs/plans/2026-10-24-mcp-operate-server-design.md` (superseded note)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| Z     | new `docs/reference/mcp.md` and `docs/reference/webhooks.md` (the agent-facing references, see Revision 4), a drift test that every registered tool and webhook event appears in them, `docs/README.md` (links), `docs/user/mcp.md` (cross-cutting sections), `docs/architecture/overview.md`, `docs/skills/bibcode-profiler/references/*`, `docs/skills/bibcode-mcp/**`, the `.agents/skills/` and `.claude/skills/` stubs, `docs/testing/*`, `docs/plans/2026-10-24-mcp-operate-server-design.md` (superseded note)                                                                                                                                                                                                                                                                                                               |
 
 ### Shared files and their owners, in order
 
