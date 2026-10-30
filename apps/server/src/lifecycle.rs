@@ -461,18 +461,22 @@ impl ServerRuntime {
             })
             .ok()
         });
-        // `bibcode mcp` finds and proves this server through this record (#139). Written by
-        // the runtime-guard owner only, after bind; removed when the server task ends.
-        let mcp_endpoint_record = mcp_proof_key.and_then(|key| {
-            crate::mcp::endpoint::EndpointRecordFile::write(
+        // `bibcode mcp` finds and proves this server through this record (#139). Written after
+        // bind unless another server for this data root still runs and holds it (the runtime
+        // guard is shared); removed when the server task ends, only while it is ours.
+        let mcp_endpoint_record = match mcp_proof_key {
+            Some(key) => crate::mcp::endpoint::EndpointRecordFile::claim(
                 &state_directory,
                 local_addr,
                 &config.boot_id.unwrap_or_default().to_string(),
                 &key,
             )
+            .await
             .inspect_err(|error| tracing::warn!(%error, "could not write the MCP endpoint record"))
             .ok()
-        });
+            .flatten(),
+            None => None,
+        };
         let shutdown = CancellationToken::new();
         let admission_gate = rpc_registry.admission_gate();
         let update_maintenance_owner = if update_maintenance_owner_enabled(&config) {

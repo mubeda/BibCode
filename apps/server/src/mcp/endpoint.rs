@@ -1,7 +1,7 @@
 //! How `bibcode mcp` finds this server and proves it is talking to it (#139).
 //!
 //! The server writes [`ENDPOINT_RECORD_FILE`] (`server-runtime.json`, mode 0600) in its state
-//! directory after it binds, as the runtime-guard owner, and removes it when it stops. The
+//! directory after it binds and removes it when it stops, only while it is still ours. The
 //! record holds a per-boot `proofKey` that exists nowhere else but server memory. Before the
 //! relay sends any credential, it posts a fresh nonce to `POST /mcp/endpoint-proof`, which
 //! answers `HMAC-SHA256(proofKey, "bibcode-mcp-endpoint-v2" ‖ nonce ‖ local address ‖ port)`.
@@ -10,11 +10,16 @@
 //! another address or port, such as `[::1]:P` while BiBCode listens on `127.0.0.1:P`, gets a
 //! proof that does not verify. The route is unauthenticated, accepts only this host's peers,
 //! and reveals nothing secret: it signs a nonce the caller chose.
+//!
+//! The runtime guard is a shared lock, so a second server for the same data root can start on
+//! another port. The first live owner keeps the record: a server writes it only when no other
+//! server that is still running answers the recorded proof (see [`EndpointRecordFile::claim`]).
 
 use std::{
     io::{self, Write as _},
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use axum::{
@@ -35,6 +40,8 @@ pub const PROOF_PATH: &str = "/mcp/endpoint-proof";
 pub const RECORD_VERSION: u32 = 2;
 const PROOF_CONTEXT: &[u8] = b"bibcode-mcp-endpoint-v2";
 const NONCE_BYTES: usize = 32;
+/// How long a starting server waits for the recorded owner to answer its proof.
+const OWNER_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// A per-boot proof key.
 pub type ProofKey = Arc<[u8; 32]>;
@@ -107,6 +114,28 @@ pub struct EndpointRecordFile {
 }
 
 impl EndpointRecordFile {
+    /// Writes the record, unless another server that is still running holds it: its pid is
+    /// alive and its recorded listener answers the recorded proof. That server keeps MCP
+    /// discovery, and this one runs undiscovered by `bibcode mcp` (`Ok(None)`). A record whose
+    /// owner is gone, or whose pid now belongs to another program, is replaced.
+    pub async fn claim(
+        state_dir: &Path,
+        local_addr: std::net::SocketAddr,
+        boot_id: &str,
+        key: &[u8; 32],
+    ) -> io::Result<Option<Self>> {
+        if let Some(owner) = EndpointRecord::read(state_dir)?
+            && owner.boot_id != boot_id
+            && owner_is_running(&owner).await
+        {
+            tracing::warn!(
+                "another BiBCode server for this data root is running; MCP discovery stays with it, so `bibcode mcp` does not reach this server"
+            );
+            return Ok(None);
+        }
+        Self::write(state_dir, local_addr, boot_id, key).map(Some)
+    }
+
     /// Writes the record readable by its owner only, through a temporary file and a rename,
     /// so a relay never reads half of it.
     pub fn write(
@@ -168,6 +197,100 @@ impl Drop for EndpointRecordFile {
     }
 }
 
+/// Whether the record's owner still runs. A proof that does not answer in time counts as
+/// running: something holds the recorded listener of a live pid, most likely the owner itself
+/// stalled or suspended, and taking the record from it would lose discovery of a running
+/// server when this one stops. A refused connection or a wrong proof means it is gone.
+async fn owner_is_running(record: &EndpointRecord) -> bool {
+    let (Some(listener), Some(key)) = (record.listener(), record.key()) else {
+        return false;
+    };
+    if record.version < RECORD_VERSION || !process_alive(record.pid) {
+        return false;
+    }
+    let http = reqwest::Client::builder()
+        .connect_timeout(OWNER_PROBE_TIMEOUT)
+        .timeout(OWNER_PROBE_TIMEOUT)
+        .no_proxy()
+        .build();
+    // Being unable to ask is not evidence that the owner is gone.
+    let Ok(http) = http else { return true };
+    !matches!(prove(&http, listener, &key).await, Ok(Proof::Refused))
+}
+
+/// What a listener answered to a fresh nonce.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Proof {
+    /// It holds the key.
+    Proven,
+    /// It refused the connection, has no proof route, or answered a wrong proof.
+    Refused,
+    /// It did not answer before the client's timeout.
+    TimedOut,
+}
+
+/// Sends a fresh nonce to `listener`'s proof route and checks the answer against `key`, in
+/// constant time. Nothing but the nonce is sent.
+pub async fn prove(
+    http: &reqwest::Client,
+    listener: std::net::SocketAddr,
+    key: &[u8; 32],
+) -> io::Result<Proof> {
+    let mut nonce = [0_u8; NONCE_BYTES];
+    getrandom::fill(&mut nonce).map_err(|error| io::Error::other(error.to_string()))?;
+    let failed = |error: reqwest::Error| {
+        if error.is_timeout() {
+            Proof::TimedOut
+        } else {
+            Proof::Refused
+        }
+    };
+    let answer = match http
+        .post(format!("http://{listener}{PROOF_PATH}"))
+        .json(&json!({ "nonce": hex(&nonce) }))
+        .send()
+        .await
+    {
+        Ok(answer) if answer.status().is_success() => answer,
+        Ok(_) => return Ok(Proof::Refused),
+        Err(error) => return Ok(failed(error)),
+    };
+    let answer: Value = match answer.json().await {
+        Ok(answer) => answer,
+        Err(error) => return Ok(failed(error)),
+    };
+    let expected = proof(key, &nonce, listener);
+    let given = answer["proof"].as_str().and_then(unhex).unwrap_or_default();
+    let proven = bool::from(subtle::ConstantTimeEq::ct_eq(
+        given.as_slice(),
+        expected.as_slice(),
+    ));
+    Ok(if proven {
+        Proof::Proven
+    } else {
+        Proof::Refused
+    })
+}
+
+/// Whether `pid` is a running process.
+#[must_use]
+pub fn process_alive(pid: u32) -> bool {
+    process_started_at(pid).is_some()
+}
+
+/// When `pid` started, in seconds since the epoch, or `None` when no such process runs.
+#[must_use]
+pub fn process_started_at(pid: u32) -> Option<u64> {
+    let pid = sysinfo::Pid::from_u32(pid);
+    let mut system = sysinfo::System::new();
+    system.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::Some(&[pid]),
+        true,
+        sysinfo::ProcessRefreshKind::nothing(),
+    );
+    system.process(pid).map(sysinfo::Process::start_time)
+}
+
 /// The record as a relay reads it.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -192,6 +315,17 @@ impl EndpointRecord {
     #[must_use]
     pub fn key(&self) -> Option<[u8; 32]> {
         unhex(&self.proof_key)?.try_into().ok()
+    }
+
+    /// The exact loopback listener the record names, as an address, so a name such as
+    /// `localhost` cannot resolve to another listener on the same port.
+    #[must_use]
+    pub fn listener(&self) -> Option<std::net::SocketAddr> {
+        self.dial_host
+            .as_deref()
+            .and_then(|host| host.parse::<std::net::IpAddr>().ok())
+            .filter(std::net::IpAddr::is_loopback)
+            .map(|host| std::net::SocketAddr::new(host, self.port))
     }
 }
 
@@ -300,6 +434,79 @@ mod tests {
         assert_eq!(dial_host("127.0.0.2"), some("127.0.0.2"));
         assert_eq!(dial_host("::1"), some("::1"));
         assert_eq!(dial_host("192.168.1.4"), None);
+    }
+
+    /// Another server's record: `pid`, listening on `127.0.0.1:port`.
+    fn others_record(dir: &Path, pid: u32, port: u16) {
+        let record = json!({
+            "version": RECORD_VERSION,
+            "pid": pid,
+            "dialHost": "127.0.0.1",
+            "port": port,
+            "bootId": "other",
+            "startedAt": "",
+            "proofKey": hex(&[3_u8; 32]),
+        });
+        std::fs::write(dir.join(ENDPOINT_RECORD_FILE), record.to_string()).unwrap();
+    }
+
+    async fn claim(dir: &Path) -> Option<EndpointRecordFile> {
+        EndpointRecordFile::claim(dir, "127.0.0.1:1".parse().unwrap(), "ours", &[9_u8; 32])
+            .await
+            .unwrap()
+    }
+
+    fn boot_id(dir: &Path) -> String {
+        EndpointRecord::read(dir).unwrap().unwrap().boot_id
+    }
+
+    /// A listener that never answers, as a stalled or suspended owner does.
+    async fn silent_listener() -> tokio::net::TcpListener {
+        tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_dead_owners_record_is_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut exited = std::process::Command::new("true").spawn().unwrap();
+        let pid = exited.id();
+        exited.wait().unwrap();
+        // Something still holds the port; the dead pid alone settles it.
+        let held = silent_listener().await;
+        others_record(dir.path(), pid, held.local_addr().unwrap().port());
+        let ours = claim(dir.path()).await;
+        assert!(ours.is_some());
+        assert_eq!(boot_id(dir.path()), "ours");
+    }
+
+    /// A live pid whose recorded listener is gone, such as a pid the system gave to another
+    /// program, does not pin the record.
+    #[tokio::test]
+    async fn a_live_pid_without_its_listener_loses_the_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let port = silent_listener().await.local_addr().unwrap().port();
+        others_record(dir.path(), std::process::id(), port);
+        let ours = claim(dir.path()).await;
+        assert!(ours.is_some());
+        assert_eq!(boot_id(dir.path()), "ours");
+    }
+
+    /// An owner that does not answer within the probe's timeout keeps the record, and the
+    /// starting server waits no longer than that timeout.
+    #[tokio::test]
+    async fn an_owner_that_does_not_answer_in_time_keeps_the_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = silent_listener().await;
+        others_record(
+            dir.path(),
+            std::process::id(),
+            held.local_addr().unwrap().port(),
+        );
+        let started = std::time::Instant::now();
+        assert!(claim(dir.path()).await.is_none());
+        assert!(started.elapsed() < OWNER_PROBE_TIMEOUT * 3, "bounded");
+        assert_eq!(boot_id(dir.path()), "other");
     }
 
     #[test]
