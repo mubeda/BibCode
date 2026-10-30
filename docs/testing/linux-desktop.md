@@ -194,8 +194,10 @@ The regressions must cover:
   `relative-appdir`, `root-appdir`, and `unset-appdir`), and the positive and
   negative extracted AppDir gate cases, including a copied executable in an
   AppDir launched with a stale or missing `APPDIR` (the root comes from the
-  executable, not `APPDIR`) and from another AppDir whose `APPDIR` and
-  `usr/lib` it inherits (both roots are stripped). Exercise both text and binary Git output, the
+  executable, not `APPDIR`), from another AppDir whose `APPDIR` and
+  `usr/lib` it inherits (both roots are stripped), and from a mounted
+  AppImage whose `APPIMAGE` and `.mount_*` `APPDIR` it inherits (its own root
+  is stripped too). Exercise both text and binary Git output, the
   incompatible-library HTTPS helper in the mounted and both extracted
   launches, and a real PTY shell and Python process.
 - An unchanged complete parent environment and the login-shell PATH-probe
@@ -259,7 +261,9 @@ GLib symbol errors and AppImage-rooted `xdg-open` selection. Repeat terminal
 Git/Python and tool launch checks from an extracted `squashfs-root/AppRun`
 without `APPIMAGE`, including Ubuntu without libfuse2, and again with a preset
 mismatched `APPDIR` (`APPDIR=/tmp/stale squashfs-root/AppRun`) and with the
-`APPDIR` of another extracted AppDir (`APPDIR=<other AppDir> squashfs-root/AppRun`):
+`APPDIR` of another extracted AppDir (`APPDIR=<other AppDir> squashfs-root/AppRun`)
+and launched from another mounted AppImage, such as an AppImage terminal
+(it inherits that `APPIMAGE` and `.mount_*` `APPDIR`):
 Clone from URL over `https://` must succeed. Record desktop URL/path
 opening, Linux file reveal, deep-link registration, and the GTK hook's
 `XDG_DATA_DIRS` limitation separately against the

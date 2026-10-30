@@ -2,8 +2,9 @@
 
 Status: **Approved by the user on 2026-09-23**. Amended on 2026-10-30 for
 issue #209: the extracted-AppDir gate derives the root from the running
-executable instead of `APPDIR`, and also strips an inherited `APPDIR` that
-names another AppDir (see [Gate and effective
+executable instead of `APPDIR`, also strips an inherited `APPDIR` that
+names another AppDir, and the mounted gate also strips the executable's own
+extracted AppDir (see [Gate and effective
 environment](#gate-and-effective-environment)).
 
 ## Ownership and scope
@@ -57,7 +58,9 @@ depend on it.
 ## Gate and effective environment
 
 Retain the existing trigger: nonempty `APPIMAGE` and absolute, non-root
-`APPDIR` make `APPDIR` the root. Also support manually extracted AppDirs
+`APPDIR` make `APPDIR` the root. When the executable is not under that
+`APPDIR` and has the extracted layout below, its `<root>` is a second root.
+Also support manually extracted AppDirs
 without `APPIMAGE`: the root is the directory `<root>` of a current executable
 at `<root>/usr/bin/<name>` when `<root>` is not `/` and `<root>/AppRun` exists.
 `APPDIR` does not choose this root; once gated it is removed like the other
@@ -96,8 +99,15 @@ Git loaded the bundled `libnghttp2`. Alternatives considered:
 - **Removing launcher markers without a root:** always removing `APPDIR`,
   `APPIMAGE`, `ARGV0`, and `OWD` was rejected; it would change an ordinary
   installation's children and break the no-op cases above.
-- **Mounted AppImages:** unchanged. `APPIMAGE` with `APPDIR` stays independent
-  of the executable location, and stale `.mount_*` entries are still removed.
+- **Mounted AppImages:** `APPIMAGE` with `APPDIR` still activates the gate
+  regardless of the executable location, and stale `.mount_*` entries are
+  still removed. Review found a second stacked case: extracted AppDir B
+  launched from mounted AppImage A inherits A's `APPIMAGE` and
+  `APPDIR=/tmp/.mount_A…`, so the gate rooted only in A's mount and left B's
+  own `usr/lib` for system Git. When the executable is not under `APPDIR`, the
+  extracted-layout rule above now adds its `<root>` as well. A genuine mounted
+  launch runs under `APPDIR`, so it gains one `/proc/self/exe` readlink per
+  gated spawn and no `stat`, and its roots are unchanged.
 
 Overlay command-local additions and removals on the inherited environment;
 `Cleared` commands never recover ambient values. PTYs use their captured

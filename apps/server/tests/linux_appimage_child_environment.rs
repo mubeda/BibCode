@@ -111,7 +111,11 @@ fn extracted_appdir_isolates_real_child_commands() {
         // APPDIR may be stale or absent; the copied executable names the AppDir.
         let appdir = PathBuf::from(std::env::var_os("BIBCODE_TEST_REAL_APPDIR").unwrap());
         assert!(std::env::current_exe().unwrap().starts_with(&appdir));
-        assert!(std::env::var_os("APPIMAGE").is_none_or(|value| value.is_empty()));
+        let mounted = std::env::var_os("BIBCODE_TEST_MOUNTED_LAUNCHER").is_some();
+        assert_eq!(
+            std::env::var_os("APPIMAGE").is_some_and(|value| !value.is_empty()),
+            mounted
+        );
         let parent = std::env::vars_os().collect::<BTreeMap<_, _>>();
         let isolate = std::env::var("BIBCODE_TEST_EXPECT_ISOLATION").unwrap() == "yes";
         let expected = if isolate {
@@ -195,12 +199,15 @@ fn extracted_appdir_isolates_real_child_commands() {
     let outer = directory.path().join("Outer AppDir");
     std::fs::create_dir(&outer).unwrap();
     std::fs::write(outer.join("AppRun"), "fixture launcher").unwrap();
+    let mount = directory.path().join(".mount_OtherAB12");
+    std::fs::create_dir(&mount).unwrap();
     for case in [
         "unset",
         "empty",
         "stale-appdir",
         "no-appdir",
         "stacked-appdir",
+        "mounted-launcher",
         "missing-launcher",
     ] {
         if case == "missing-launcher" {
@@ -244,6 +251,20 @@ fn extracted_appdir_isolates_real_child_commands() {
                         outer.display()
                     ),
                 );
+            } else if case == "mounted-launcher" {
+                // Launched from a mounted AppImage, which kept its markers and paths.
+                command
+                    .env("APPIMAGE", "/opt/Other.AppImage")
+                    .env("APPDIR", &mount)
+                    .env("BIBCODE_TEST_MOUNTED_LAUNCHER", "yes")
+                    .env(
+                        "LD_LIBRARY_PATH",
+                        format!(
+                            "{}/usr/lib:{}/usr/lib:/host/keep",
+                            appdir.display(),
+                            mount.display()
+                        ),
+                    );
             }
         });
     }

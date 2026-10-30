@@ -160,25 +160,24 @@ mod linux {
     ) -> Option<Vec<PathBuf>> {
         if variable("APPIMAGE").is_some_and(|marker| !marker.is_empty()) {
             let appdir = PathBuf::from(variable("APPDIR")?);
-            return (appdir.is_absolute() && appdir.parent().is_some()).then(|| vec![appdir]);
+            if !(appdir.is_absolute() && appdir.parent().is_some()) {
+                return None;
+            }
+            // An extracted AppDir launched from a mounted AppImage inherits its
+            // APPIMAGE and APPDIR, so also strip the executable's own AppDir. A
+            // normal mounted launch runs under APPDIR and needs no stat.
+            let extra = current_executable()
+                .filter(|executable| !executable.starts_with(&appdir))
+                .and_then(|executable| extracted_appdir(&executable));
+            return Some([appdir].into_iter().chain(extra).collect());
         }
         // Extracted AppDirs have no APPIMAGE. AppRun keeps an inherited APPDIR and
         // a launcher may exec the binary without one, while AppRun.wrapped roots
         // loader paths in its own directory. So trust only the executable's
         // `<root>/usr/bin/<name>` layout beside `<root>/AppRun`: one stat per command,
         // plus one when gated with an `APPDIR` naming another directory.
-        let executable = current_executable()?;
-        let bin = executable.parent()?;
-        let usr = bin.parent()?;
-        let root = usr.parent()?;
-        if !(bin.ends_with("bin")
-            && usr.ends_with("usr")
-            && root.parent().is_some()
-            && root.join("AppRun").exists())
-        {
-            return None;
-        }
-        let mut roots = vec![root.to_path_buf()];
+        let root = extracted_appdir(&current_executable()?)?;
+        let mut roots = vec![root.clone()];
         // Launched from another extracted AppDir, AppRun.wrapped prepends its own
         // paths to the outer AppDir's and the GTK hook keeps the outer APPDIR.
         // Strip that root too, but only once gated and only for a real AppDir.
@@ -191,6 +190,18 @@ mod linux {
             roots.push(outer);
         }
         Some(roots)
+    }
+
+    /// `<root>` of an executable at `<root>/usr/bin/<name>` beside `<root>/AppRun`.
+    fn extracted_appdir(executable: &Path) -> Option<PathBuf> {
+        let bin = executable.parent()?;
+        let usr = bin.parent()?;
+        let root = usr.parent()?;
+        (bin.ends_with("bin")
+            && usr.ends_with("usr")
+            && root.parent().is_some()
+            && root.join("AppRun").exists())
+        .then(|| root.to_path_buf())
     }
 
     pub(super) fn isolate(mut command: ChildCommand<'_>) {
@@ -434,6 +445,44 @@ mod linux {
                 ("LD_LIBRARY_PATH".into(), library_path(&outer)),
             ]);
             assert!(gated_overrides(&environment, Some(Path::new("/usr/bin/bibcode"))).is_empty());
+        }
+
+        #[test]
+        fn extracted_appdir_launched_from_mounted_appimage_strips_its_own_root() {
+            let fixture = tempfile::tempdir().unwrap();
+            let mount = fixture.path().join(".mount_OtherAB12");
+            let inner = fixture.path().join("BiBCode.AppDir");
+            for directory in [&mount, &inner] {
+                std::fs::create_dir(directory).unwrap();
+            }
+            std::fs::write(inner.join("AppRun"), "launcher").unwrap();
+            // B inherits A's APPIMAGE and APPDIR; AppRun.wrapped prepends B's paths.
+            let environment = BTreeMap::from([
+                ("APPIMAGE".into(), "/opt/Other.AppImage".into()),
+                ("APPDIR".into(), mount.clone().into_os_string()),
+                (
+                    "LD_LIBRARY_PATH".into(),
+                    format!(
+                        "{}/usr/lib:{}/usr/lib:/host/keep",
+                        inner.display(),
+                        mount.display()
+                    )
+                    .into(),
+                ),
+            ]);
+            let overrides =
+                gated_overrides(&environment, Some(&inner.join("usr/bin/bibcode-desktop")));
+            assert!(
+                overrides.contains(&("LD_LIBRARY_PATH".into(), Some("/host/keep".into()))),
+                "an AppDir launched from a mounted AppImage must not keep its own libraries"
+            );
+            // Without AppRun beside usr/bin the executable adds no root.
+            std::fs::remove_file(inner.join("AppRun")).unwrap();
+            let kept = format!("{}/usr/lib:/host/keep", inner.display());
+            assert!(
+                gated_overrides(&environment, Some(&inner.join("usr/bin/bibcode-desktop")))
+                    .contains(&("LD_LIBRARY_PATH".into(), Some(kept.into())))
+            );
         }
 
         #[test]
