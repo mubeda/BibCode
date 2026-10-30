@@ -418,7 +418,7 @@ fn write_record(state_dir: &Path, pid: u32, dial_host: Option<&str>, port: u16, 
     std::fs::write(
         state_dir.join(crate::mcp::endpoint::ENDPOINT_RECORD_FILE),
         json!({
-            "version": 1, "pid": pid, "dialHost": dial_host, "port": port,
+            "version": RECORD_VERSION, "pid": pid, "dialHost": dial_host, "port": port,
             "bootId": "boot", "startedAt": "2026-10-30T00:00:00Z", "proofKey": hex(key),
         })
         .to_string(),
@@ -572,6 +572,139 @@ async fn a_listener_that_forwards_the_proof_to_the_real_server_fails_it() {
     );
     let error = refused(options(root.path())).await;
     assert!(error.starts_with("The program listening on"), "{error}");
+    server.shutdown();
+    server.join().await.expect("server joins");
+}
+
+/// A listener on `bind` that forwards every connection to `to`, recording what it was sent.
+async fn forwarder(
+    bind: std::net::SocketAddr,
+    to: std::net::SocketAddr,
+) -> Option<Arc<Mutex<Vec<u8>>>> {
+    let listener = TcpListener::bind(bind).await.ok()?;
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let recorded = seen.clone();
+    tokio::spawn(async move {
+        while let Ok((inbound, _)) = listener.accept().await {
+            let recorded = recorded.clone();
+            tokio::spawn(async move {
+                let Ok(outbound) = tokio::net::TcpStream::connect(to).await else {
+                    return;
+                };
+                let (mut inbound_read, mut inbound_write) = inbound.into_split();
+                let (mut outbound_read, mut outbound_write) = outbound.into_split();
+                tokio::spawn(async move {
+                    let _ = tokio::io::copy(&mut outbound_read, &mut inbound_write).await;
+                });
+                let mut buffer = vec![0_u8; 8192];
+                while let Ok(read) =
+                    tokio::io::AsyncReadExt::read(&mut inbound_read, &mut buffer).await
+                {
+                    if read == 0 {
+                        break;
+                    }
+                    recorded.lock().await.extend_from_slice(&buffer[..read]);
+                    if outbound_write.write_all(&buffer[..read]).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    Some(seen)
+}
+
+/// The relay's start, bounded: a relay that passed every check serves forever.
+async fn refused_in_time(options: RelayOptions) -> String {
+    tokio::time::timeout(Duration::from_secs(20), refused(options))
+        .await
+        .expect("the relay refused to start in time")
+}
+
+/// Another local user may listen on `[::1]:P` while BiBCode listens on `127.0.0.1:P`, and
+/// forward to it. The proof names the address as well as the port, and `--url` must name the
+/// record's listener, so the forwarder never receives a pairing link.
+#[tokio::test]
+async fn the_other_loopback_family_on_the_same_port_is_another_listener() {
+    let root = tempfile::tempdir().expect("root");
+    let server = start_server(root.path()).await;
+    let real = server.local_addr();
+    let state_dir = ServerConfig::new(root.path()).state_dir();
+    let record = EndpointRecord::read(&state_dir).unwrap().expect("record");
+    assert_eq!(record.dial_host.as_deref(), Some("127.0.0.1"));
+    let split = std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, real.port()));
+    let Some(seen) = forwarder(split, real).await else {
+        eprintln!("skipped: this host cannot listen on {split}");
+        server.shutdown();
+        server.join().await.expect("server joins");
+        return;
+    };
+    // Named with --url, it is not the record's listener.
+    let error = refused_in_time(RelayOptions {
+        url: Some(format!("http://{split}/").parse().unwrap()),
+        ..options(root.path())
+    })
+    .await;
+    assert!(error.contains("--url"), "{error}");
+    // Named by the record itself (a record only this user can write), the proof the real
+    // server signs for 127.0.0.1 does not verify for [::1].
+    write_record(
+        &state_dir,
+        std::process::id(),
+        Some("::1"),
+        real.port(),
+        &record.key().unwrap(),
+    );
+    let error = refused_in_time(options(root.path())).await;
+    assert!(error.starts_with("The program listening on"), "{error}");
+    let forwarded = String::from_utf8_lossy(&seen.lock().await).into_owned();
+    assert!(!forwarded.contains("/oauth/token"), "{forwarded}");
+    assert!(
+        !forwarded.to_ascii_lowercase().contains("authorization:"),
+        "{forwarded}"
+    );
+    assert_eq!(
+        mcp_links(root.path()).await,
+        0,
+        "no pairing link was minted"
+    );
+    server.shutdown();
+    server.join().await.expect("server joins");
+}
+
+/// `--url` may name the record's own listener, by its address or as `localhost`; the relay
+/// then dials the record's address, so `localhost` never resolves to another listener.
+#[tokio::test]
+async fn a_url_that_names_the_records_listener_is_served() {
+    let root = tempfile::tempdir().expect("root");
+    let server = start_server(root.path()).await;
+    let port = server.local_addr().port();
+    for url in [
+        format!("http://127.0.0.1:{port}/"),
+        format!("http://localhost:{port}"),
+    ] {
+        let mut relay = Running::start(RelayOptions {
+            url: Some(url.parse().unwrap()),
+            ..options(root.path())
+        });
+        relay
+            .send(json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
+            .await;
+        let listed = relay.line().await;
+        assert!(listed["result"]["tools"].is_array(), "{url}: {listed}");
+        relay.close().await.expect("relay ends");
+    }
+    // Another port is refused before any request.
+    let error = refused_in_time(RelayOptions {
+        url: Some(
+            format!("http://127.0.0.1:{}/", port.wrapping_add(1))
+                .parse()
+                .unwrap(),
+        ),
+        ..options(root.path())
+    })
+    .await;
+    assert!(error.contains("--url"), "{error}");
     server.shutdown();
     server.join().await.expect("server joins");
 }

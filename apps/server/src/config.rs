@@ -706,7 +706,8 @@ enum CliCommand {
 /// `--dev-url`.
 #[derive(Clone, Debug, Args)]
 pub struct McpArgs {
-    /// A loopback address that replaces the one in the server's endpoint record.
+    /// The loopback address to reach the server at. It must be the address in the server's
+    /// endpoint record, or `localhost` on its port.
     #[arg(long, value_name = "URL")]
     pub url: Option<Url>,
     /// A lower limit than Settings → Agents → Agent integrations → Agents may: read-only,

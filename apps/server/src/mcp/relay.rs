@@ -46,7 +46,7 @@ pub const REVOKED_MESSAGE: &str = "BiBCode ended this MCP connection's access. R
 pub struct RelayOptions {
     pub root: ResolvedDataRoot,
     pub dev_url: Option<Url>,
-    /// A loopback address that replaces the record's (slice 1).
+    /// The loopback address to reach the server at; it must name the record's listener.
     pub url: Option<Url>,
     /// A lower ceiling than the environment's `mcpServerAccess`.
     pub access: Option<McpAccess>,
@@ -185,6 +185,17 @@ fn check_loopback_url(url: &Url) -> Result<(), String> {
     }
 }
 
+/// Whether `url` names `listener`: its address, or `localhost`, on its port.
+fn names_listener(url: &Url, listener: std::net::SocketAddr) -> bool {
+    let host = match url.host() {
+        Some(url::Host::Domain("localhost")) => true,
+        Some(url::Host::Ipv4(address)) => std::net::IpAddr::V4(address) == listener.ip(),
+        Some(url::Host::Ipv6(address)) => std::net::IpAddr::V6(address) == listener.ip(),
+        _ => false,
+    };
+    host && url.port_or_known_default() == Some(listener.port())
+}
+
 struct Endpoint {
     base: Url,
 }
@@ -204,26 +215,28 @@ async fn discover(
         return Err(NO_SERVER_MESSAGE.to_owned());
     }
     let key = record.key().ok_or_else(|| NO_SERVER_MESSAGE.to_owned())?;
-    let base = match url {
-        Some(url) => url.clone(),
-        None => {
-            let host = record.dial_host.as_deref().ok_or_else(|| {
-                "This BiBCode server does not listen on this computer's loopback address."
-                    .to_owned()
-            })?;
-            let host = if host.contains(':') {
-                format!("[{host}]")
-            } else {
-                host.to_owned()
-            };
-            Url::parse(&format!("http://{host}:{}/", record.port))
-                .map_err(|error| error.to_string())?
-        }
-    };
+    // The exact listener the record names. The relay dials this address, never a name, so
+    // `localhost` cannot resolve to another listener on the same port.
+    let listener = record
+        .dial_host
+        .as_deref()
+        .and_then(|host| host.parse::<std::net::IpAddr>().ok())
+        .filter(std::net::IpAddr::is_loopback)
+        .map(|host| std::net::SocketAddr::new(host, record.port))
+        .ok_or_else(|| {
+            "This BiBCode server does not listen on this computer's loopback address.".to_owned()
+        })?;
+    if let Some(url) = url
+        && !names_listener(url, listener)
+    {
+        return Err(format!(
+            "--url {url} is not where this BiBCode server listens ({listener}). Leave out --url to use the server's own address."
+        ));
+    }
+    let base = Url::parse(&format!("http://{listener}/")).map_err(|error| error.to_string())?;
     let not_ours = || format!("The program listening on {base} is not this BiBCode server.");
     let mut nonce = [0_u8; 32];
     getrandom::fill(&mut nonce).map_err(|error| error.to_string())?;
-    let port = base.port_or_known_default().unwrap_or(80);
     let answer = http
         .post(
             base.join(PROOF_PATH.trim_start_matches('/'))
@@ -237,7 +250,7 @@ async fn discover(
         return Err(not_ours());
     }
     let answer: Value = answer.json().await.map_err(|_| not_ours())?;
-    let expected = proof(&key, &nonce, port);
+    let expected = proof(&key, &nonce, listener);
     let given = answer["proof"].as_str().and_then(unhex).unwrap_or_default();
     if !bool::from(subtle::ConstantTimeEq::ct_eq(
         given.as_slice(),

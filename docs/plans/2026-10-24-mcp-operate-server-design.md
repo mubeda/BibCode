@@ -1239,3 +1239,14 @@ updated on 2026-10-27.
 - **Not covered by a test in this slice:** a retry after a crash between reservation and
   enqueue, and a retry of a rejected command. Both rest on the existing command-admission
   replay, which the tools reach unchanged with the stored payloads.
+
+**Review fixes (2026-10-30):**
+
+- **The endpoint proof binds the listener's address.** The proof signed only the nonce and
+  port, and `--url` could name another loopback address, so a listener on `[::1]:P` that
+  forwarded to BiBCode on `127.0.0.1:P` passed it and would have received the pairing link.
+  The proof is now `HMAC(proofKey, "bibcode-mcp-endpoint-v2" ‖ nonce ‖ local address ‖ port)`
+  over the address the connection reached (an IPv4-mapped address counts as IPv4), and
+  `RECORD_VERSION` is 2. The relay dials the record's `dialHost` and `port` as an address,
+  never a name, and a `--url` must name that listener (`localhost` on its port is allowed).
+  `dialHost` is now the bind address itself for a loopback bind, not always `127.0.0.1`.

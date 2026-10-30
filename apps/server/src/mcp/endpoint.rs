@@ -4,10 +4,12 @@
 //! directory after it binds, as the runtime-guard owner, and removes it when it stops. The
 //! record holds a per-boot `proofKey` that exists nowhere else but server memory. Before the
 //! relay sends any credential, it posts a fresh nonce to `POST /mcp/endpoint-proof`, which
-//! answers `HMAC-SHA256(proofKey, "bibcode-mcp-endpoint-v1" ‖ nonce ‖ local port)`. The port
-//! is the one the connection reached, so a listener that forwards the nonce to the real server
-//! on another port gets a proof that does not verify. The route is unauthenticated, accepts
-//! only this host's peers, and reveals nothing secret: it signs a nonce the caller chose.
+//! answers `HMAC-SHA256(proofKey, "bibcode-mcp-endpoint-v2" ‖ nonce ‖ local address ‖ port)`.
+//! The address and port are the ones the connection reached, and the relay dials exactly the
+//! record's `dialHost` and `port`. A listener that forwards the nonce to the real server from
+//! another address or port, such as `[::1]:P` while BiBCode listens on `127.0.0.1:P`, gets a
+//! proof that does not verify. The route is unauthenticated, accepts only this host's peers,
+//! and reveals nothing secret: it signs a nonce the caller chose.
 
 use std::{
     io::{self, Write as _},
@@ -29,9 +31,9 @@ use uuid::Uuid;
 
 pub const ENDPOINT_RECORD_FILE: &str = "server-runtime.json";
 pub const PROOF_PATH: &str = "/mcp/endpoint-proof";
-/// The record version that first carries an MCP endpoint; a relay refuses an older one.
-pub const RECORD_VERSION: u32 = 1;
-const PROOF_CONTEXT: &[u8] = b"bibcode-mcp-endpoint-v1";
+/// The record version whose proof binds the listener's address; a relay refuses an older one.
+pub const RECORD_VERSION: u32 = 2;
+const PROOF_CONTEXT: &[u8] = b"bibcode-mcp-endpoint-v2";
 const NONCE_BYTES: usize = 32;
 
 /// A per-boot proof key.
@@ -43,13 +45,24 @@ pub fn new_proof_key() -> io::Result<ProofKey> {
     Ok(Arc::new(key))
 }
 
-/// The proof for `nonce` on a listener reached at `port`.
+/// The proof for `nonce` on a listener reached at `listener`. An IPv4 address mapped into
+/// IPv6, as a dual-stack listener sees it, is the IPv4 address.
 #[must_use]
-pub fn proof(key: &[u8; 32], nonce: &[u8], port: u16) -> [u8; 32] {
+pub fn proof(key: &[u8; 32], nonce: &[u8], listener: std::net::SocketAddr) -> [u8; 32] {
     let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts any key length");
     mac.update(PROOF_CONTEXT);
     mac.update(nonce);
-    mac.update(&port.to_be_bytes());
+    match listener.ip().to_canonical() {
+        std::net::IpAddr::V4(address) => {
+            mac.update(&[4]);
+            mac.update(&address.octets());
+        }
+        std::net::IpAddr::V6(address) => {
+            mac.update(&[6]);
+            mac.update(&address.octets());
+        }
+    }
+    mac.update(&listener.port().to_be_bytes());
     mac.finalize().into_bytes().into()
 }
 
@@ -69,16 +82,18 @@ pub fn unhex(text: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
-/// A loopback address that reaches a listener bound to `bind`: the same family's loopback for
-/// a wildcard or loopback bind, and `None` when it listens only on other interfaces.
+/// The loopback address that reaches a listener bound to `bind`: the bind address itself for a
+/// loopback bind, the same family's loopback for a wildcard bind, and `None` when it listens
+/// only on other interfaces.
 #[must_use]
-pub fn dial_host(bind: std::net::IpAddr) -> Option<&'static str> {
-    match bind {
-        std::net::IpAddr::V4(address) if address.is_unspecified() || address.is_loopback() => {
-            Some("127.0.0.1")
+pub fn dial_host(bind: std::net::IpAddr) -> Option<std::net::IpAddr> {
+    match bind.to_canonical() {
+        address if address.is_loopback() => Some(address),
+        std::net::IpAddr::V4(address) if address.is_unspecified() => {
+            Some(std::net::Ipv4Addr::LOCALHOST.into())
         }
-        std::net::IpAddr::V6(address) if address.is_unspecified() || address.is_loopback() => {
-            Some("::1")
+        std::net::IpAddr::V6(address) if address.is_unspecified() => {
+            Some(std::net::Ipv6Addr::LOCALHOST.into())
         }
         _ => None,
     }
@@ -231,7 +246,7 @@ pub(crate) async fn proof_http(
         return refuse(StatusCode::BAD_REQUEST, "nonce must be 32 bytes of hex.");
     };
     let mut response =
-        axum::Json(json!({ "proof": hex(&proof(&key, &nonce, local.port())) })).into_response();
+        axum::Json(json!({ "proof": hex(&proof(&key, &nonce, local)) })).into_response();
     response.headers_mut().insert(
         axum::http::header::CACHE_CONTROL,
         axum::http::HeaderValue::from_static("no-store"),
@@ -244,21 +259,47 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_proof_binds_the_port_and_the_nonce() {
+    fn the_proof_binds_the_address_the_port_and_the_nonce() {
         let key = [7_u8; 32];
         let nonce = [1_u8; 32];
-        assert_eq!(proof(&key, &nonce, 3773), proof(&key, &nonce, 3773));
-        assert_ne!(proof(&key, &nonce, 3773), proof(&key, &nonce, 3774));
-        assert_ne!(proof(&key, &nonce, 3773), proof(&key, &[2_u8; 32], 3773));
+        let at = |text: &str| text.parse::<std::net::SocketAddr>().unwrap();
+        let v4 = at("127.0.0.1:3773");
+        assert_eq!(proof(&key, &nonce, v4), proof(&key, &nonce, v4));
+        assert_ne!(
+            proof(&key, &nonce, v4),
+            proof(&key, &nonce, at("127.0.0.1:3774"))
+        );
+        assert_ne!(proof(&key, &nonce, v4), proof(&key, &[2_u8; 32], v4));
+        // The same port on the other family's loopback, or another loopback address, is
+        // another listener.
+        assert_ne!(
+            proof(&key, &nonce, v4),
+            proof(&key, &nonce, at("[::1]:3773"))
+        );
+        assert_ne!(
+            proof(&key, &nonce, v4),
+            proof(&key, &nonce, at("127.0.0.2:3773"))
+        );
+        // A dual-stack listener sees an IPv4 peer's address mapped into IPv6.
+        assert_eq!(
+            proof(&key, &nonce, v4),
+            proof(&key, &nonce, at("[::ffff:127.0.0.1]:3773"))
+        );
         assert_eq!(unhex(&hex(&nonce)).unwrap(), nonce);
     }
 
     #[test]
     fn a_wildcard_bind_dials_its_loopback_and_another_interface_none() {
-        assert_eq!(dial_host("0.0.0.0".parse().unwrap()), Some("127.0.0.1"));
-        assert_eq!(dial_host("::".parse().unwrap()), Some("::1"));
-        assert_eq!(dial_host("127.0.0.1".parse().unwrap()), Some("127.0.0.1"));
-        assert_eq!(dial_host("192.168.1.4".parse().unwrap()), None);
+        let dial_host =
+            |bind: &str| super::dial_host(bind.parse().unwrap()).map(|ip| ip.to_string());
+        let some = |text: &str| Some(text.to_owned());
+        assert_eq!(dial_host("0.0.0.0"), some("127.0.0.1"));
+        assert_eq!(dial_host("::"), some("::1"));
+        assert_eq!(dial_host("127.0.0.1"), some("127.0.0.1"));
+        // A loopback bind is dialed exactly where it listens.
+        assert_eq!(dial_host("127.0.0.2"), some("127.0.0.2"));
+        assert_eq!(dial_host("::1"), some("::1"));
+        assert_eq!(dial_host("192.168.1.4"), None);
     }
 
     #[test]
