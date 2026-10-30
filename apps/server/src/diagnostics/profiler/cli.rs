@@ -311,7 +311,7 @@ fn write_followed(
 }
 
 /// `value` as compact JSON and a newline: what `--json` prints.
-pub(super) fn write_json(out: &mut impl Write, value: &Value) -> io::Result<()> {
+pub(crate) fn write_json(out: &mut impl Write, value: &Value) -> io::Result<()> {
     value.serialize(&mut serde_json::Serializer::with_formatter(
         &mut *out,
         EscapeControls,
@@ -320,7 +320,7 @@ pub(super) fn write_json(out: &mut impl Write, value: &Value) -> io::Result<()> 
 }
 
 /// `value` as the same compact JSON as [`write_json`], without the newline.
-pub(super) fn to_json(value: &Value) -> String {
+pub(crate) fn to_json(value: &Value) -> String {
     let mut text = Vec::new();
     write_json(&mut text, value).expect("writing to a Vec cannot fail");
     text.pop();
@@ -504,7 +504,7 @@ fn text(value: &Value, key: &str, missing: &str) -> String {
         .map_or_else(|| missing.to_owned(), plain)
 }
 
-pub(super) fn plain(text: &str) -> String {
+pub(crate) fn plain(text: &str) -> String {
     text.chars()
         .map(|c| {
             if c.is_control() || is_hidden_format(c) {
