@@ -437,7 +437,10 @@ in-place relaunch runs as before.
 
 The gate checks a few variables before copying the full environment. A nonempty
 `APPIMAGE` and an absolute, non-root `APPDIR` activate isolation rooted in
-`APPDIR`. For an extracted AppDir without `APPIMAGE`, the root comes from the
+`APPDIR`; when the current executable is not under that `APPDIR` but has the
+extracted layout below, its `<root>` is a second root, because an extracted
+AppDir launched from a mounted AppImage inherits its `APPIMAGE` and `APPDIR`.
+For an extracted AppDir without `APPIMAGE`, the root comes from the
 current executable: `<root>/usr/bin/<name>` with `<root>/AppRun` present, and
 `<root>` not `/`. `APPDIR` does not choose that root, because the GTK AppRun hook
 keeps an inherited `APPDIR` while `AppRun.wrapped` builds loader paths from its
@@ -445,7 +448,7 @@ own location (#209). When an inherited `APPDIR` names a different absolute,
 non-root directory containing `AppRun`, it is a second root: an AppDir launched
 from another extracted AppDir keeps the outer AppDir's paths after its own. This
 supports `squashfs-root/AppRun` on Ubuntu without FUSE, a preset or missing
-`APPDIR`, stacked AppDir launches, and launchers that exec
+`APPDIR`, stacked AppDir and AppImage launches, and launchers that exec
 `usr/bin/bibcode-desktop` directly, while a stray `APPDIR` in an ordinary
 installation changes nothing. Once gated, the policy inspects every variable in
 the effective child environment and removes entries under those roots or
