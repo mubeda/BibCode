@@ -3188,7 +3188,15 @@ view), or free scrolling.
   scroll by the same amount, so the content stays where the reader sees it
   and no later scroll applies it; it also releases the anchor a recent data
   change locked, which was recorded before that adjustment and would apply it
-  a second time. A held request therefore never moves a reader who took over.
+  a second time. WebKit can run the glide off the page's thread and take a
+  step of it after the stop, over the stop and that scroll, while the rows no
+  longer hold the offset (#214). A key's scroll starts only after the keydown,
+  so a key takeover asks the method to hold a stop that committed an
+  adjustment (`holdStop`) until the browser next scrolls: a scroll that lands
+  between where the page saw the glide and the glide's target is undone, and
+  any other, such as the key's own, is left alone. The wheel,
+  touch and a press scroll at once and do not ask. A held request therefore
+  never moves a reader who took over.
 - **Bottom region.** LegendList keeps the list at its end
   (`maintainScrollAtEnd`) only while the timeline follows it and no sent turn
   is anchored (`resolveTimelineMaintainScrollAtEnd`). LegendList also scrolls

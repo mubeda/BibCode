@@ -1267,6 +1267,7 @@ function makeLegendList(options: FakeLegendListOptions = {}) {
     scrollToOffset: [] as unknown[],
     scrollToIndex: [] as unknown[],
     cancelScrollRequests: 0,
+    cancelScrollRequestInputs: [] as unknown[],
   };
   let maxScroll = options.laggingMaxScroll ?? Number.POSITIVE_INFINITY;
   const clampSteps = [...(options.clampSteps ?? [])];
@@ -1337,8 +1338,9 @@ function makeLegendList(options: FakeLegendListOptions = {}) {
         request.resolve();
       }
     },
-    cancelScrollRequests: () => {
+    cancelScrollRequests: (input?: unknown) => {
       calls.cancelScrollRequests += 1;
+      calls.cancelScrollRequestInputs.push(input);
       dropHeld();
     },
     /** A row grows by `by` px, as a diagram drawing in it would. */
@@ -2578,6 +2580,32 @@ describe("ChatView effects (captured and run manually)", () => {
       // Following goes on: nothing is withdrawn, and the settle follows the reply's end.
       expect(list.calls.cancelScrollRequests, key).toBe(0);
       expect(list.calls.scrollToOffset.at(-1), key).toEqual({ offset: 216, animated: false });
+      for (const cleanup of cleanups) cleanup();
+    }
+  });
+
+  it("asks LegendList to hold a key takeover's stop until the key's own scroll", async () => {
+    // A key's scroll starts after the keydown, so the next scroll the browser reports may be the
+    // glide's last step running over the stop (#214). A wheel or a press scrolls at once.
+    for (const [takeover, holdStop] of [
+      ["key", { holdStop: true }],
+      ["wheel", undefined],
+      ["pointerdown", undefined],
+    ] as const) {
+      const { list, cleanups, messageId, onAnchorReady } = await sendTallReply({
+        scrollHeight: 400,
+        clientHeight: 200,
+      });
+      onAnchorReady(messageId, 2);
+      list.scrollNode.scrollTop = 50;
+
+      if (takeover === "key") {
+        fireDocument("keydown", timelineKey("ArrowUp", ["button"]));
+      } else {
+        list.scrollNode.fire(takeover, { target: { closest: () => null } });
+      }
+
+      expect(list.calls.cancelScrollRequestInputs, takeover).toEqual([holdStop]);
       for (const cleanup of cleanups) cleanup();
     }
   });

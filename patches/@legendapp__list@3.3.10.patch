@@ -1,5 +1,5 @@
 diff --git a/react.js b/react.js
-index 5b171eb..15f69ba 100644
+index 5b171eb..2934929 100644
 --- a/react.js
 +++ b/react.js
 @@ -1978,2 +1978,8 @@ function updateScroll(ctx, newScroll, forceUpdate, options) {
@@ -89,7 +89,7 @@ index 5b171eb..15f69ba 100644
 -    const didRetargetInitialScroll = retargetActiveInitialScrollAtEnd(ctx);
 +    const didRetargetInitialScroll = retargetActiveInitialScrollAtEnd(ctx, insetDiff > 0);
      if (!didRetargetInitialScroll && wasWithinEndThreshold && (insetDiff > 0)) {
-@@ -7590,2 +7610,41 @@ function createImperativeHandle(ctx, scheduleImperativeScrollCommit) {
+@@ -7590,2 +7610,71 @@ function createImperativeHandle(ctx, scheduleImperativeScrollCommit) {
      }),
 +    // BiBCode patch: the reader took over the scroll. Withdraw the list's own scroll requests
 +    // so none runs over them later: a request still waiting for layout to settle, and the
@@ -100,11 +100,17 @@ index 5b171eb..15f69ba 100644
 +    // anchor a recent data change locked is released too: it was recorded before that
 +    // adjustment, and a later pass would otherwise apply the same adjustment again. Keeping the
 +    // list at its end stops as well, including a pass already queued for the next frame after a
-+    // row grew. With nothing under way, the method changes nothing.
-+    cancelScrollRequests: () => {
-+      var _a3;
++    // row grew. With nothing under way, the method changes nothing. The browser can run a glide
++    // off the page's thread and take a step of it after the stop, over the stop and the
++    // committed adjustment, while the rows no longer hold the offset: with `holdStop`, given when
++    // the reader's own scroll starts later, as a scroll key's does, the stop then holds until the
++    // browser next scrolls, and that scroll is undone when it lies on the glide's way.
++    cancelScrollRequests: (input) => {
++      var _a3, _b;
 +      const animating = !!((_a3 = state.scrollingTo) == null ? void 0 : _a3.animated);
++      const glideTarget = animating ? state.scrollingTo.targetOffset : void 0;
 +      const scroller = refScroller.current;
++      (_b = state.takeoverStopRelease) == null ? void 0 : _b.call(state);
 +      cancelImperativeScroll(state);
 +      state.mvcpAnchorLock = void 0;
 +      state.preservedEndAnchorCorrection = void 0;
@@ -126,13 +132,37 @@ index 5b171eb..15f69ba 100644
 +      state.scrollPending = observed;
 +      if (state.scrollAdjustHandler.pendingAdjust !== 0) {
 +        state.scrollAdjustHandler.commitPendingAdjust();
++        const target = scroller.getScrollEventTarget == null ? void 0 : scroller.getScrollEventTarget();
++        if (animating && (input == null ? void 0 : input.holdStop) && target && glideTarget !== void 0) {
++          const stop = state.scroll;
++          const low = Math.min(observed, glideTarget) - 1;
++          const high = Math.max(observed, glideTarget) + 1;
++          let timer;
++          const onScroll = () => {
++            release();
++            const offset = scroller.getCurrentScrollOffset();
++            if (Math.abs(offset - stop) > 1 && offset >= low && offset <= high) {
++              scroller.scrollTo({ animated: false, x: 0, y: stop });
++            }
++          };
++          const release = () => {
++            clearTimeout(timer);
++            target.removeEventListener("scroll", onScroll);
++            if (state.takeoverStopRelease === release) {
++              state.takeoverStopRelease = void 0;
++            }
++          };
++          state.takeoverStopRelease = release;
++          target.addEventListener("scroll", onScroll, { passive: true });
++          timer = setTimeout(release, 500);
++        }
 +      } else {
 +        updateScroll(ctx, observed, true, { markHasScrolled: false });
 +      }
 +    },
      scrollToOffset: (params) => runScrollWithPromise(() => {
 diff --git a/react.mjs b/react.mjs
-index cf549ca..8ed5bcf 100644
+index cf549ca..85c5847 100644
 --- a/react.mjs
 +++ b/react.mjs
 @@ -1957,2 +1957,8 @@ function updateScroll(ctx, newScroll, forceUpdate, options) {
@@ -222,7 +252,7 @@ index cf549ca..8ed5bcf 100644
 -    const didRetargetInitialScroll = retargetActiveInitialScrollAtEnd(ctx);
 +    const didRetargetInitialScroll = retargetActiveInitialScrollAtEnd(ctx, insetDiff > 0);
      if (!didRetargetInitialScroll && wasWithinEndThreshold && (insetDiff > 0)) {
-@@ -7569,2 +7589,41 @@ function createImperativeHandle(ctx, scheduleImperativeScrollCommit) {
+@@ -7569,2 +7589,71 @@ function createImperativeHandle(ctx, scheduleImperativeScrollCommit) {
      }),
 +    // BiBCode patch: the reader took over the scroll. Withdraw the list's own scroll requests
 +    // so none runs over them later: a request still waiting for layout to settle, and the
@@ -233,11 +263,17 @@ index cf549ca..8ed5bcf 100644
 +    // anchor a recent data change locked is released too: it was recorded before that
 +    // adjustment, and a later pass would otherwise apply the same adjustment again. Keeping the
 +    // list at its end stops as well, including a pass already queued for the next frame after a
-+    // row grew. With nothing under way, the method changes nothing.
-+    cancelScrollRequests: () => {
-+      var _a3;
++    // row grew. With nothing under way, the method changes nothing. The browser can run a glide
++    // off the page's thread and take a step of it after the stop, over the stop and the
++    // committed adjustment, while the rows no longer hold the offset: with `holdStop`, given when
++    // the reader's own scroll starts later, as a scroll key's does, the stop then holds until the
++    // browser next scrolls, and that scroll is undone when it lies on the glide's way.
++    cancelScrollRequests: (input) => {
++      var _a3, _b;
 +      const animating = !!((_a3 = state.scrollingTo) == null ? void 0 : _a3.animated);
++      const glideTarget = animating ? state.scrollingTo.targetOffset : void 0;
 +      const scroller = refScroller.current;
++      (_b = state.takeoverStopRelease) == null ? void 0 : _b.call(state);
 +      cancelImperativeScroll(state);
 +      state.mvcpAnchorLock = void 0;
 +      state.preservedEndAnchorCorrection = void 0;
@@ -259,6 +295,30 @@ index cf549ca..8ed5bcf 100644
 +      state.scrollPending = observed;
 +      if (state.scrollAdjustHandler.pendingAdjust !== 0) {
 +        state.scrollAdjustHandler.commitPendingAdjust();
++        const target = scroller.getScrollEventTarget == null ? void 0 : scroller.getScrollEventTarget();
++        if (animating && (input == null ? void 0 : input.holdStop) && target && glideTarget !== void 0) {
++          const stop = state.scroll;
++          const low = Math.min(observed, glideTarget) - 1;
++          const high = Math.max(observed, glideTarget) + 1;
++          let timer;
++          const onScroll = () => {
++            release();
++            const offset = scroller.getCurrentScrollOffset();
++            if (Math.abs(offset - stop) > 1 && offset >= low && offset <= high) {
++              scroller.scrollTo({ animated: false, x: 0, y: stop });
++            }
++          };
++          const release = () => {
++            clearTimeout(timer);
++            target.removeEventListener("scroll", onScroll);
++            if (state.takeoverStopRelease === release) {
++              state.takeoverStopRelease = void 0;
++            }
++          };
++          state.takeoverStopRelease = release;
++          target.addEventListener("scroll", onScroll, { passive: true });
++          timer = setTimeout(release, 500);
++        }
 +      } else {
 +        updateScroll(ctx, observed, true, { markHasScrolled: false });
 +      }
