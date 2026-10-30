@@ -1792,7 +1792,11 @@ Remote Server mode, the joined record's slow part (`server`, `network`, or
 - Outside agents reach `/mcp` from the same host only: `bibcode mcp` relays stdio
   to loopback after proving the listener with `POST /mcp/endpoint-proof`, an
   unauthenticated, loopback-only route that signs a caller's nonce and the local
-  port with the per-boot key in the owner-only `server-runtime.json`. A remote
+  address and port the connection reached with the per-boot key in the
+  owner-only `server-runtime.json`. The relay dials exactly the record's
+  `dialHost` and `port` (a `--url` must name that listener), so another
+  listener on the same port of the other loopback family, or one that
+  forwards to the real server, cannot pass the proof. A remote
   agent uses `ssh <host> bibcode mcp`. Remote Streamable HTTP for outside agents
   needs MCP OAuth and is not served.
 - Emulator, adb, and scrcpy sockets listen on loopback only; BiBCode never
