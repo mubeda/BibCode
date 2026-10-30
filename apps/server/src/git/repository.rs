@@ -2766,7 +2766,7 @@ impl GitRepository {
             return Ok(());
         }
         validate_pathspecs("GitVcsDriver.stageFiles", cwd, paths)?;
-        let mut args = strings(&["add", "--"]);
+        let mut args = strings(&[LITERAL_PATHSPECS, "add", "--"]);
         args.extend(paths.iter().cloned());
         self.run("GitVcsDriver.stageFiles", cwd, &args, cancellation)
             .await?;
@@ -2793,9 +2793,16 @@ impl GitRepository {
             )
             .await?;
         let mut args = if head.exit_code == 0 {
-            strings(&["restore", "--staged", "--"])
+            strings(&[LITERAL_PATHSPECS, "restore", "--staged", "--"])
         } else {
-            strings(&["rm", "--cached", "-r", "--ignore-unmatch", "--"])
+            strings(&[
+                LITERAL_PATHSPECS,
+                "rm",
+                "--cached",
+                "-r",
+                "--ignore-unmatch",
+                "--",
+            ])
         };
         args.extend(paths.iter().cloned());
         self.run("GitVcsDriver.unstageFiles", cwd, &args, cancellation)
@@ -2813,7 +2820,14 @@ impl GitRepository {
             return Ok(());
         }
         validate_pathspecs("GitVcsDriver.discardFiles", cwd, paths)?;
-        let mut list_args = strings(&["-c", "core.quotePath=false", "ls-files", "-z", "--"]);
+        let mut list_args = strings(&[
+            LITERAL_PATHSPECS,
+            "-c",
+            "core.quotePath=false",
+            "ls-files",
+            "-z",
+            "--",
+        ]);
         list_args.extend(paths.iter().cloned());
         let tracked = self
             .run(
@@ -2830,7 +2844,7 @@ impl GitRepository {
             .map(str::to_owned)
             .collect();
         if !tracked_paths.is_empty() {
-            let mut restore_args = strings(&["restore", "--worktree", "--"]);
+            let mut restore_args = strings(&[LITERAL_PATHSPECS, "restore", "--worktree", "--"]);
             restore_args.extend(tracked_paths);
             self.run(
                 "GitVcsDriver.discardFiles.restore",
@@ -2859,7 +2873,7 @@ impl GitRepository {
             .cloned()
             .collect();
         if !requested_untracked.is_empty() {
-            let mut clean_args = strings(&["clean", "-fd", "--"]);
+            let mut clean_args = strings(&[LITERAL_PATHSPECS, "clean", "-fd", "--"]);
             clean_args.extend(requested_untracked);
             self.run(
                 "GitVcsDriver.discardFiles.clean",
@@ -2882,7 +2896,14 @@ impl GitRepository {
             return Ok(Vec::new());
         }
         validate_pathspecs("GitManager.discard", cwd, paths)?;
-        let mut args = strings(&["-c", "core.quotePath=false", "ls-files", "-z", "--"]);
+        let mut args = strings(&[
+            LITERAL_PATHSPECS,
+            "-c",
+            "core.quotePath=false",
+            "ls-files",
+            "-z",
+            "--",
+        ]);
         args.extend(paths.iter().cloned());
         let tracked = self
             .run_read("GitManager.discard.tracked", cwd, &args, cancellation)
@@ -2905,7 +2926,7 @@ impl GitRepository {
             return Ok(());
         }
         validate_pathspecs("GitManager.discard", cwd, paths)?;
-        let mut args = strings(&["checkout", "HEAD", "--"]);
+        let mut args = strings(&[LITERAL_PATHSPECS, "checkout", "HEAD", "--"]);
         args.extend(paths.iter().cloned());
         self.run("GitManager.discard.restore", cwd, &args, cancellation)
             .await?;
@@ -11525,6 +11546,12 @@ fn parse_git_manager_head_commit(
     })
 }
 
+/// The global option every command that takes a caller's file paths runs with (#139 slice G,
+/// C5): each path is a literal file or folder name, so `:(glob)**`, `*.rs` or `:/` names a
+/// file that matches nothing, never pathspec magic or a wildcard over the tree. A folder still
+/// names every file under it. `validate_pathspecs` only refuses absolute and `..` paths.
+const LITERAL_PATHSPECS: &str = "--literal-pathspecs";
+
 pub(crate) fn validate_pathspecs(
     operation: &str,
     cwd: &Path,
@@ -13503,6 +13530,137 @@ mod clone_tests {
         assert!(
             !parent.join("b").exists(),
             "nothing is cloned where the path leads"
+        );
+    }
+}
+
+/// Pathspecs a caller passes are literal file paths (#139 slice G, C5): `:(glob)**` names a
+/// file that matches nothing, never the whole tree, while a folder still names its files.
+#[cfg(test)]
+mod literal_pathspec_tests {
+    use std::{fs, path::Path, process::Command};
+
+    use tokio_util::sync::CancellationToken;
+
+    use super::GitRepository;
+
+    fn git(cwd: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "BiBCode Test")
+            .env("GIT_AUTHOR_EMAIL", "bibcode@example.invalid")
+            .env("GIT_COMMITTER_NAME", "BiBCode Test")
+            .env("GIT_COMMITTER_EMAIL", "bibcode@example.invalid")
+            .output()
+            .expect("git starts");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    /// A repository with one commit of `a.txt` and `src/b.txt`, both since changed, and an
+    /// untracked `src/new.txt`.
+    fn repository() -> tempfile::TempDir {
+        let folder = tempfile::tempdir().expect("repository");
+        let root = folder.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        git(root, &["config", "core.autocrlf", "false"]);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("a.txt"), "a\n").unwrap();
+        fs::write(root.join("src/b.txt"), "b\n").unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "-q", "-m", "base"]);
+        fs::write(root.join("a.txt"), "a changed\n").unwrap();
+        fs::write(root.join("src/b.txt"), "b changed\n").unwrap();
+        fs::write(root.join("src/new.txt"), "new\n").unwrap();
+        folder
+    }
+
+    fn staged(root: &Path) -> String {
+        git(root, &["diff", "--cached", "--name-only"])
+    }
+
+    #[tokio::test]
+    async fn staging_takes_paths_literally_and_a_folder_still_stages_its_files() {
+        let folder = repository();
+        let root = folder.path();
+        let repository = GitRepository::default();
+        let token = CancellationToken::new();
+        for magic in [":(glob)**", "*.txt", ":/"] {
+            // Git refuses a literal path that matches nothing; either way nothing is staged.
+            let _ = repository.stage_files(root, &[magic.into()], &token).await;
+            assert_eq!(staged(root), "", "{magic} staged something");
+        }
+        repository
+            .stage_files(root, &["src".into()], &token)
+            .await
+            .expect("a folder stages");
+        assert_eq!(staged(root), "src/b.txt\nsrc/new.txt");
+    }
+
+    #[tokio::test]
+    async fn unstaging_takes_paths_literally() {
+        let folder = repository();
+        let root = folder.path();
+        git(root, &["add", "."]);
+        let repository = GitRepository::default();
+        let token = CancellationToken::new();
+        let _ = repository
+            .unstage_files(root, &[":(glob)**".into()], &token)
+            .await;
+        assert_eq!(staged(root), "a.txt\nsrc/b.txt\nsrc/new.txt");
+        repository
+            .unstage_files(root, &["src".into()], &token)
+            .await
+            .expect("a folder unstages");
+        assert_eq!(staged(root), "a.txt");
+    }
+
+    #[tokio::test]
+    async fn discarding_and_its_tracked_listing_take_paths_literally() {
+        let folder = repository();
+        let root = folder.path();
+        let repository = GitRepository::default();
+        let token = CancellationToken::new();
+        assert_eq!(
+            repository
+                .git_manager_tracked_paths(root, &[":(glob)**".into()], &token)
+                .await
+                .expect("listing"),
+            Vec::<String>::new()
+        );
+        let _ = repository
+            .git_manager_restore_tracked_paths(root, &[":(glob)**".into()], &token)
+            .await;
+        let _ = repository
+            .discard_files(root, &[":(glob)**".into()], &token)
+            .await;
+        assert_eq!(
+            fs::read_to_string(root.join("a.txt")).unwrap(),
+            "a changed\n"
+        );
+        assert!(root.join("src/new.txt").exists());
+        assert_eq!(
+            repository
+                .git_manager_tracked_paths(root, &["src".into()], &token)
+                .await
+                .expect("listing"),
+            ["src/b.txt"]
+        );
+        repository
+            .discard_files(root, &["src".into()], &token)
+            .await
+            .expect("a folder discards");
+        assert_eq!(fs::read_to_string(root.join("src/b.txt")).unwrap(), "b\n");
+        assert!(!root.join("src/new.txt").exists());
+        assert_eq!(
+            fs::read_to_string(root.join("a.txt")).unwrap(),
+            "a changed\n"
         );
     }
 }
