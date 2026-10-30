@@ -1,11 +1,26 @@
 # MCP for Outside Agents: Remaining Slices
 
-Status: Revision 3. Slices X2, X5, X6, X8 and R are revised and pending Codex re-review;
-every other slice is approved (2026-10-30). Each slice carries its own status line.
-Issue #139. Extends the approved slice-1 design
+Status: Approved 2026-10-30 (user pre-approval; reviewed by Codex and the advisor), every
+slice. X2, X5, X6, X8 and R are approved with the Revision 4 requirements below, which
+override their sections where they differ. Issue #139. Extends the approved slice-1 design
 (`docs/plans/2026-10-24-mcp-operate-server-design.md`, "slice 1" below) and does not
 replace it. Verified at `ba143353d4` (`origin/claude/issue-batch-after-v0.13.0`, draft
 PR #213). Line references are to that commit.
+
+## Revision 4 (2026-10-30)
+
+The Codex re-review of Revision 3 confirmed X5's transfer binding, X2's removal of raw
+logs, X6's clone owner and R's strict refresh reuse. It found one P1 and four P2s, each
+with a concrete fix. They are requirements on the writer of each slice, with a
+failing-first test each, rather than another design round:
+
+| Slice | Finding                                                                                                                                                                                | Requirement                                                                                                                                                                                          |
+| ----- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| R     | P1: the session-token verifier rejects a token whose `exp` differs from the stored expiry (`auth/service.rs:917`, `:952`), so a one-hour access token on a 30-day grant fails at once. | Check the grant's expiry and the access token's expiry separately. Test an immediate `/mcp` call after the exchange and a call after refresh.                                                        |
+| X6    | P2: a public repository's `.lfsconfig` `lfs.url` makes the checkout's LFS smudge filter download from another host, outside Git's protocol and curl settings.                          | Agent clones run with LFS smudge disabled (`GIT_LFS_SKIP_SMUDGE=1` and `-c filter.lfs.smudge= -c filter.lfs.process= -c filter.lfs.required=false`). Test a private LFS endpoint is never contacted. |
+| X6    | P2: SSH resolves the host again after the check, so DNS can move it to a private address that presents a trusted key.                                                                  | Refuse SSH for agent clones in this slice; agents clone over HTTPS, which is pinned. Record pinned SSH as a follow-up.                                                                               |
+| X2    | P2: a rejected `git.runStackedAction` records its client-supplied `action` text in the profiler event (`diagnostics/profiler/git_actions.rs:105`), which `profiler_events` returns.    | Record only a known action name, or `unknown`, and allowlist profiler event fields returned over MCP. Test a rejected-action marker never appears.                                                   |
+| X8    | P2: `profiler_findings` clamps to 100 newest-first (`diagnostics/profiler/mcp.rs:31`, `:295`), so a gap over 100 findings cannot be caught up.                                         | Add a cursor to `profiler_findings` (oldest-first from `since`, with `nextCursor`). Test a gap of more than 100 findings.                                                                            |
 
 ## Revision 3 (2026-10-30)
 
@@ -1381,7 +1396,7 @@ fingerprints.
 
 ## Slice X2: Diagnostics tools
 
-Status: Revised (Revision 3) — pending Codex re-review.
+Status: Approved 2026-10-30 with the Revision 4 requirements (user pre-approval; reviewed by Codex and the advisor).
 
 **Current behavior.** The profiler's tools exist only on the stdio `bibcode profiler mcp`
 server, as private pure functions over a disk `Reader`. The diagnostics RPCs are unary
@@ -1563,7 +1578,7 @@ client, moves nothing, and expires after 60 seconds; 17 pending intents are refu
 
 ## Slice X5: Workspace files
 
-Status: Revised (Revision 3) — pending Codex re-review.
+Status: Approved 2026-10-30 with the Revision 4 requirements (user pre-approval; reviewed by Codex and the advisor).
 
 All tools take `threadId`; the server resolves `cwd` (C5). Capability set `files`.
 
@@ -1650,7 +1665,7 @@ is unaffected by every switch.
 
 ## Slice X6: Clone
 
-Status: Revised (Revision 3) — pending Codex re-review.
+Status: Approved 2026-10-30 with the Revision 4 requirements (user pre-approval; reviewed by Codex and the advisor).
 
 | Tool               | Arguments                                                                                       | Maps to                                                                         | Hints      |
 | ------------------ | ----------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- | ---------- |
@@ -1813,7 +1828,7 @@ opened after the suggestion still receives it.
 
 ## Slice X8: Outbound webhooks and the Agent integrations tabs
 
-Status: Revised (Revision 3) — pending Codex re-review.
+Status: Approved 2026-10-30 with the Revision 4 requirements (user pre-approval; reviewed by Codex and the advisor).
 
 **Current behavior.** No webhook code exists. `reqwest` and `hmac` are dependencies, and
 `SecretStore` keeps 0600 plaintext files (see "Webhooks" above).
@@ -1929,7 +1944,7 @@ delivery still sees every transition through `changes_since`, and every finding 
 
 ## Slice R: Remote Streamable HTTP with MCP OAuth
 
-Status: Revised (Revision 3) — pending Codex re-review.
+Status: Approved 2026-10-30 with the Revision 4 requirements (user pre-approval; reviewed by Codex and the advisor).
 
 R lands last among the code slices. It inherits F0's `production/connect_mcp.rs` and the
 `bibcode thread` CLI's `lib.rs` and `config.rs` edits, which land on the batch branch
