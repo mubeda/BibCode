@@ -3369,6 +3369,31 @@ failure, and a stream that closes first (or is cancelled, or passes its budget) 
   reported as `requestId`), and loops `wait_for_thread` in 30 s slices for
   `--wait`.
 
+### Worktree tools
+
+The `worktrees` family (`mcp::tools::worktrees`) reaches the worktree catalog's
+handlers, so creation and removal keep their command claims, generation checks,
+`operation_runtime` and profiler coverage.
+
+| Tool                        | Maps to                                                                                                                                           | Scope   |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- | ------- |
+| `list_worktrees`            | `vcs.refreshWorktreeCatalog`: descriptors joined with `adoptedWorkspaces` by `worktreeKey`, paged by offset                                       | read    |
+| `create_worktree`           | `worktree.createManaged`, thread defaults capped by the ceiling                                                                                   | operate |
+| `get_worktree_removal_plan` | `worktree.getRemovalPlan` for the host thread's project                                                                                           | read    |
+| `remove_worktree`           | `worktree.remove` (`delete-git-worktree` or `cleanup-stale-registration`, `forceDirty = discardChanges`) or `worktree.removeFromBibCode` (detach) | operate |
+
+- **Host threads only.** A thread with no worktree path, or one that is not the
+  worktree's `workspace` thread, is refused with `McpNotAWorktreeError` before any
+  RPC.
+- **Retries.** Both mutations store their RPC payload (with its `commandId`) through
+  `ToolCall::commands`, so a retry replays it by the catalog's receipt: a removal
+  replay records no second `worktree.removal` profiler event. The stored row carries
+  the host thread's `runtimeMode` beside the payload, so an unaccepted creation still
+  meets the current ceiling. The thread is resolved only for a new request, since a
+  completed removal deletes it.
+- **Removal plan.** `remove_worktree` sends `planToken` and `expectedGeneration`
+  exactly as the agent passed them and never fetches a plan itself.
+
 ## Targeted Activity cancellation flow
 
 Targeted Activity control uses typed WebSocket RPC in browser and desktop

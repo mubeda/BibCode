@@ -3019,3 +3019,52 @@ in the threads family (`mcp/tools/threads.rs`); its tests are
   records (the projection's status and decision, and one answer event per retry), not a
   provider resuming. The revert test runs `OrchestrationEffects` over a real Git checkout
   with checkpoints, so the files are really restored.
+
+## W (worktree tools) implementation notes (2026-10-30)
+
+W was implemented on `claude/v0131-139-w`, from `claude/v0131-139-f0`. It adds
+`mcp/tools/worktrees.rs` (`list_worktrees`, `create_worktree`, `get_worktree_removal_plan`,
+`remove_worktree`) and `mcp_tools_tests/worktrees.rs`, with one registration line each in
+`mcp/tools/mod.rs`, `control::FAMILIES` and `mcp_tools_tests/mod.rs`.
+
+**Drift found:**
+
+- **Three removal modes, not two.** The web picks `cleanup-stale-registration` when a plan's
+  availability is `missing-registered` (`WorktreeRemovalDialog.tsx:328`); `delete` then
+  answers `stale-plan`, so an agent had no way to clear a worktree whose folder is gone.
+  `remove_worktree` takes `mode: cleanup` for it. `delete` and `cleanup` need `planToken`
+  and `expectedGeneration`; `detach` (`worktree.removeFromBibCode`, which takes neither)
+  ignores them and refuses `discardChanges` or `confirmRepositoryWidePrune`.
+- **No `managed` flag or change flags in `list_worktrees`.** The catalog snapshot has
+  neither; computing change flags would run Git once per worktree (up to 200 a page). Each
+  entry has `hostThreadId` (null when BiBCode tracks no thread for it), and the description
+  points to `get_worktree_removal_plan` and `git_status` for change counts.
+- **`McpNotAWorktreeError` also covers a non-host thread.** `resolve_removal_thread` accepts
+  only the `workspace` thread that owns the path, so a panel thread in a worktree is refused
+  with its `hostThreadId` named, not sent on to fail as `thread-not-found`.
+- **`currentGeneration` is not kept.** `rpc_failure` keeps `reason` but not the removal
+  error's `currentGeneration`; a stale plan asks the agent to read the plan again anyway.
+
+**Choices made while implementing:**
+
+- **Stored rows wrap the payload.** Each stored request is `{ commandId, runtimeMode?,
+  method?, payload }`. `check_unaccepted` reads `commandId` and a top-level `runtimeMode`,
+  so an unaccepted `create_worktree` replay still meets the current ceiling although
+  `worktree.createManaged` nests the mode under `threadDefaults` (`deny_unknown_fields`).
+  `remove_worktree` stores the method it chose and accepts only its two methods on replay.
+- **Removal resolves the thread only for a new request**, inside `fresh`: a completed
+  removal deletes the host thread, and a retry must replay, not fail
+  `McpThreadNotFoundError`. It passes `thread_id: None`, so no ceiling applies to removal
+  beyond "not read-only" (C6).
+- **`list_worktrees` always refreshes** (`reason` omitted, so `explicit`): `focus` can
+  return a cached snapshot from before a creation. Pages are offsets (`w:<n>`) over the
+  descriptors followed by host threads Git no longer lists.
+- **Tests run the real catalog.** The shared harness registers methods before its engine
+  exists, so the test registers forwarding handlers that call a registry built on that
+  engine afterwards; scope and admission still run on the harness's registry. Each test
+  creates its repository in its own temporary folder, so managed worktrees
+  (`<parent>/.bibcode-worktrees`) stay inside it. The profiler test runs in its own process
+  and counts exactly one `worktree.removal` event across a keyed removal and its replay.
+- **Docs.** `docs/user/mcp.md` gains a "Worktrees" subsection and
+  `docs/architecture/rpc-and-orchestration.md` a "Worktree tools" subsection. The user doc's
+  "Not available" bullet still lists worktree removal; slice Z rewrites that section.

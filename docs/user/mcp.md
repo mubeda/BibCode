@@ -63,6 +63,26 @@ can retry a call without starting a second turn.
 Codex stops a tool call after 60 seconds by default, so one wait lasts at most 50 seconds and
 an agent waits longer by calling it again.
 
+### Worktrees
+
+| Tool                        | What it does                                                                                                    |
+| --------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| `list_worktrees`            | A project's worktrees with path, branch, availability, primary and locked flags, and the thread that hosts each |
+| `create_worktree`           | Creates a worktree (on a new branch with `newBranch`) and its host thread, never above **Agents may**           |
+| `get_worktree_removal_plan` | What a removal would lose: uncommitted and untracked counts, locks, and other stale worktrees it would prune    |
+| `remove_worktree`           | Removes a worktree and its host thread; destructive                                                             |
+
+`remove_worktree` takes the `planToken` and `generation` the plan returned, so an agent has
+read the change counts first, and a worktree that changed since is refused. Its modes:
+
+- **`delete`** runs `git worktree remove`. It refuses uncommitted or untracked changes unless
+  `discardChanges` is true, which loses them for good.
+- **`cleanup`** clears Git's registration of a worktree whose folder is already gone.
+- **`detach`** removes the worktree from BiBCode only and keeps the folder and its changes.
+
+A removal finishes in BiBCode even if the agent's call is cancelled, and a retry with the
+same `clientRequestId` returns the first result without removing anything again.
+
 ## From a shell: `bibcode thread`
 
 `bibcode thread` calls the same tools from a terminal or a script. It runs on the host where
