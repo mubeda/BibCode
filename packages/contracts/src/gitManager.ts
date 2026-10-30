@@ -238,6 +238,12 @@ export const GitManagerOperationRequest = Schema.Union([
     force: Schema.Boolean,
     deleteRemote: Schema.Boolean,
   }),
+  /** Deletes `branch` on `remote` only; any local branch stays. */
+  Schema.TaggedStruct("remote-branch-delete", {
+    ...GitManagerOperationBase.fields,
+    remote: TrimmedNonEmptyStringSchema,
+    branch: TrimmedNonEmptyStringSchema,
+  }),
   Schema.TaggedStruct("fetch", {
     ...GitManagerOperationBase.fields,
     remote: TrimmedNonEmptyStringSchema,

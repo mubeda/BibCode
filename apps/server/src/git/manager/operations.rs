@@ -310,6 +310,13 @@ pub enum GitManagerOperationRequest {
         force: bool,
         delete_remote: bool,
     },
+    /// Deletes `branch` on `remote` only, leaving any local branch alone.
+    RemoteBranchDelete {
+        cwd: PathBuf,
+        project_id: String,
+        remote: String,
+        branch: String,
+    },
     Fetch {
         cwd: PathBuf,
         project_id: String,
@@ -467,6 +474,7 @@ impl GitManagerOperationRequest {
             Self::BranchCheckout { .. } => "branch-checkout",
             Self::BranchRename { .. } => "branch-rename",
             Self::BranchDelete { .. } => "branch-delete",
+            Self::RemoteBranchDelete { .. } => "remote-branch-delete",
             Self::Fetch { .. } => "fetch",
             Self::Pull { .. } => "pull",
             Self::Push { .. } => "push",
@@ -501,6 +509,7 @@ impl GitManagerOperationRequest {
             | Self::BranchCheckout { cwd, .. }
             | Self::BranchRename { cwd, .. }
             | Self::BranchDelete { cwd, .. }
+            | Self::RemoteBranchDelete { cwd, .. }
             | Self::Fetch { cwd, .. }
             | Self::Pull { cwd, .. }
             | Self::Push { cwd, .. }
@@ -531,11 +540,13 @@ impl GitManagerOperationRequest {
     #[must_use]
     /// Operations that can move a worktree's HEAD or change the branch set.
     /// The worktree catalog must rescan after them instead of waiting for its
-    /// poller; fetch, push, and stash operations leave every HEAD in place.
+    /// poller; fetch, push, remote branch deletion and stash operations leave every
+    /// HEAD in place.
     fn changes_worktree_heads(&self) -> bool {
         !matches!(
             self,
-            Self::Fetch { .. }
+            Self::RemoteBranchDelete { .. }
+                | Self::Fetch { .. }
                 | Self::Push { .. }
                 | Self::PublishBranch { .. }
                 | Self::ForcePush { .. }
@@ -552,6 +563,7 @@ impl GitManagerOperationRequest {
             | Self::BranchCheckout { project_id, .. }
             | Self::BranchRename { project_id, .. }
             | Self::BranchDelete { project_id, .. }
+            | Self::RemoteBranchDelete { project_id, .. }
             | Self::Fetch { project_id, .. }
             | Self::Pull { project_id, .. }
             | Self::Push { project_id, .. }
@@ -590,6 +602,7 @@ impl GitManagerOperationRequest {
                 }
                 | Self::BranchRename { .. }
                 | Self::BranchDelete { .. }
+                | Self::RemoteBranchDelete { .. }
                 | Self::Fetch { .. }
                 | Self::Pull { .. }
                 | Self::Push { .. }
@@ -1260,6 +1273,33 @@ async fn execute_branch_or_sync_operation(
             }
             outputs
         }
+        GitManagerOperationRequest::RemoteBranchDelete {
+            cwd,
+            remote,
+            branch,
+            ..
+        } => {
+            if !snapshot.remotes.iter().any(|known| known == remote) {
+                return Err(operation_error(
+                    operation,
+                    "invalid-request",
+                    "The remote is not one of this checkout's remotes.",
+                ));
+            }
+            if !is_branch_name(branch) {
+                return Err(operation_error(
+                    operation,
+                    "invalid-request",
+                    "The remote branch name is not a valid branch name.",
+                ));
+            }
+            one_output(
+                operation,
+                repository
+                    .git_manager_delete_remote_branch(cwd, remote, branch, cancellation)
+                    .await,
+            )?
+        }
         GitManagerOperationRequest::Fetch { cwd, remote, .. } => one_output(
             operation,
             repository
@@ -1713,6 +1753,30 @@ fn validate_revision(operation: &str, revision: &str) -> Result<(), GitManagerOp
         ));
     }
     Ok(())
+}
+
+/// Whether `name` is a branch name `git check-ref-format --branch` would accept, kept strict so
+/// a name can never be read as an option or a refspec: no leading `-` or `+`, no `:`, no whitespace,
+/// control or wildcard characters, no `..`, `@{`, `//`, and no part that starts with `.` or
+/// ends with `.lock`.
+#[must_use]
+pub(crate) fn is_branch_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 255
+        && name != "@"
+        && !name.starts_with(['-', '+', '/'])
+        && !name.ends_with(['/', '.'])
+        && !name.contains("..")
+        && !name.contains("@{")
+        && !name.contains("//")
+        && !name.chars().any(|character| {
+            character.is_control()
+                || character.is_whitespace()
+                || matches!(character, ' ' | '~' | '^' | ':' | '?' | '*' | '[' | '\\')
+        })
+        && name
+            .split('/')
+            .all(|part| !part.starts_with('.') && !part.ends_with(".lock"))
 }
 
 fn validate_revisions(
@@ -2273,6 +2337,7 @@ pub async fn discard_paths(
     cancellation: &CancellationToken,
 ) -> Result<DiscardOutcome, DiscardError> {
     validate_pathspecs("GitManager.discard", &request.cwd, &request.paths)?;
+    contain_discard_paths(&request.cwd, &request.paths).await?;
     let tracked = repository
         .git_manager_tracked_paths(&request.cwd, &request.paths, cancellation)
         .await?;
@@ -2330,6 +2395,47 @@ pub async fn discard_paths(
             .await?;
     }
     Ok(outcome)
+}
+
+/// Refuses every path whose folder resolves outside the checkout, before anything is trashed or
+/// restored (#139 slice G, C5): a symlinked folder inside the checkout that points elsewhere
+/// cannot route a discard outside it. The deepest folder that exists is the one resolved, so a
+/// deleted tracked file in a deleted folder still passes. A path that is itself a symlink is
+/// allowed: the link is what is discarded.
+async fn contain_discard_paths(cwd: &Path, paths: &[String]) -> Result<(), DiscardError> {
+    let refused = || {
+        DiscardError::Git(GitCommandError {
+            tag: "GitCommandError",
+            operation: "GitManager.discard".into(),
+            command: "git".into(),
+            cwd: cwd.to_string_lossy().into(),
+            diagnostics: None,
+            detail: "A discard path leaves the checkout through a symlinked folder.".into(),
+        })
+    };
+    let root = tokio::fs::canonicalize(cwd).await.map_err(|_| refused())?;
+    for path in paths {
+        let Some(parent) = Path::new(path)
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        else {
+            continue;
+        };
+        let mut folder = cwd.join(parent);
+        while tokio::fs::metadata(&folder).await.is_err() {
+            match folder.parent() {
+                Some(up) if up.starts_with(cwd) && up != folder => folder = up.to_path_buf(),
+                _ => return Err(refused()),
+            }
+        }
+        let resolved = tokio::fs::canonicalize(&folder)
+            .await
+            .map_err(|_| refused())?;
+        if !resolved.starts_with(&root) {
+            return Err(refused());
+        }
+    }
+    Ok(())
 }
 
 fn path_matches(requested: &str, candidate: &str) -> bool {
@@ -3501,5 +3607,154 @@ mod tests {
                 "base\n"
             );
         }
+    }
+
+    /// A symlinked folder inside the checkout that points elsewhere cannot route a discard
+    /// outside it (#139 slice G, C5): nothing is trashed or restored, for any path.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn discard_refuses_a_path_whose_folder_leaves_the_checkout() {
+        let fixture = tempfile::tempdir().expect("temporary repository");
+        let outside = tempfile::tempdir().expect("outside folder");
+        let trash_directory = tempfile::tempdir().expect("temporary trash");
+        git(fixture.path(), &["init", "-q", "-b", "main"]);
+        std::fs::write(fixture.path().join("tracked.txt"), "base\n").expect("base file");
+        git(fixture.path(), &["add", "tracked.txt"]);
+        git(fixture.path(), &["commit", "-q", "-m", "base"]);
+        std::fs::write(fixture.path().join("tracked.txt"), "changed\n").expect("change");
+        std::fs::write(outside.path().join("victim.txt"), "keep\n").expect("outside file");
+        std::os::unix::fs::symlink(outside.path(), fixture.path().join("link")).expect("link");
+        let trash = Arc::new(RecordingTrash {
+            destination: trash_directory.path().to_path_buf(),
+            trashed: Mutex::new(Vec::new()),
+        });
+        for paths in [
+            vec!["link/victim.txt".to_owned()],
+            vec!["tracked.txt".to_owned(), "link/victim.txt".to_owned()],
+            vec!["link/missing/deeper.txt".to_owned()],
+        ] {
+            let refused = discard_paths(
+                &GitRepository::default(),
+                trash.clone(),
+                DiscardRequest {
+                    cwd: fixture.path().to_path_buf(),
+                    paths: paths.clone(),
+                    permit_permanent: true,
+                },
+                &CancellationToken::new(),
+            )
+            .await;
+            assert!(refused.is_err(), "{paths:?} was discarded");
+        }
+        assert!(trash.trashed.lock().unwrap().is_empty());
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("victim.txt")).unwrap(),
+            "keep\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.path().join("tracked.txt")).unwrap(),
+            "changed\n",
+            "a refused call restores nothing"
+        );
+    }
+
+    #[test]
+    fn branch_names_can_never_be_options_or_refspecs() {
+        for name in [
+            "feature",
+            "feature/x-1",
+            "refs/heads/main",
+            "release/v1.2",
+            "a@b",
+        ] {
+            assert!(is_branch_name(name), "{name}");
+        }
+        for name in [
+            "",
+            "-x",
+            "--receive-pack=evil",
+            "a:b",
+            "+main",
+            "a b",
+            "a\tb",
+            "a..b",
+            "a@{1}",
+            "@",
+            "/a",
+            "a/",
+            "a.",
+            "a//b",
+            "a/.b",
+            "a.lock",
+            "a/b.lock/c",
+            "a~1",
+            "a^",
+            "a?",
+            "a*",
+            "a[",
+            "a\\b",
+            "a\u{7f}",
+        ] {
+            assert!(!is_branch_name(name), "{name:?}");
+        }
+    }
+
+    /// `remote-branch-delete` deletes only the remote branch (#139 slice G), and refuses a
+    /// remote the checkout does not have or a branch name that is not one.
+    #[tokio::test]
+    async fn remote_branch_delete_removes_only_the_remote_branch() {
+        let remote = tempfile::tempdir().expect("bare remote");
+        let fixture = tempfile::tempdir().expect("clone");
+        git(remote.path(), &["init", "-q", "--bare", "-b", "main"]);
+        git(fixture.path(), &["init", "-q", "-b", "main"]);
+        git(
+            fixture.path(),
+            &["remote", "add", "origin", &remote.path().to_string_lossy()],
+        );
+        std::fs::write(fixture.path().join("a.txt"), "a\n").expect("file");
+        git(fixture.path(), &["add", "a.txt"]);
+        git(fixture.path(), &["commit", "-q", "-m", "base"]);
+        git(fixture.path(), &["branch", "feature"]);
+        git(fixture.path(), &["push", "-q", "origin", "main", "feature"]);
+        let request: GitManagerOperationRequest = serde_json::from_value(serde_json::json!({
+            "_tag": "remote-branch-delete", "cwd": fixture.path(), "projectId": "p",
+            "remote": "origin", "branch": "feature",
+        }))
+        .expect("the request decodes");
+        assert_eq!(request.operation(), "remote-branch-delete");
+        assert!(request.is_implemented_through_phase_16());
+        let mut snapshot = operation_snapshot(fixture.path());
+        snapshot.remotes = vec!["origin".into()];
+        let repository = GitRepository::default();
+        let token = CancellationToken::new();
+        for (remote_name, branch) in [("upstream", "feature"), ("origin", "-x"), ("origin", "a:b")]
+        {
+            let refused = execute_branch_or_sync_operation(
+                &repository,
+                &snapshot,
+                &GitManagerOperationRequest::RemoteBranchDelete {
+                    cwd: fixture.path().to_path_buf(),
+                    project_id: "p".into(),
+                    remote: remote_name.into(),
+                    branch: branch.into(),
+                },
+                &token,
+            )
+            .await
+            .expect_err("refused");
+            assert_eq!(refused.code, "invalid-request", "{remote_name} {branch}");
+        }
+        execute_branch_or_sync_operation(&repository, &snapshot, &request, &token)
+            .await
+            .expect("the remote branch is deleted");
+        assert_eq!(
+            git(remote.path(), &["branch", "--format=%(refname:short)"]),
+            "main"
+        );
+        assert_eq!(
+            git(fixture.path(), &["branch", "--format=%(refname:short)"]),
+            "feature\nmain",
+            "the local branch stays"
+        );
     }
 }
