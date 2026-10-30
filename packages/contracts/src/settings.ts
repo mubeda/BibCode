@@ -253,6 +253,28 @@ export const McpServerAccess = Schema.Literals([
 export type McpServerAccess = typeof McpServerAccess.Type;
 export const DEFAULT_MCP_SERVER_ACCESS: McpServerAccess = "approval-required";
 
+/**
+ * The tool sets outside agents may use on this environment (#139, C8). Each turns a family of
+ * MCP tools on or off, live; terminals start off.
+ */
+export const McpCapabilities = Schema.Struct({
+  workspace: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
+  sourceControl: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
+  files: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
+  diagnostics: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
+  terminals: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+});
+export type McpCapabilities = typeof McpCapabilities.Type;
+
+export const McpCapabilitiesPatch = Schema.Struct({
+  workspace: Schema.optionalKey(Schema.Boolean),
+  sourceControl: Schema.optionalKey(Schema.Boolean),
+  files: Schema.optionalKey(Schema.Boolean),
+  diagnostics: Schema.optionalKey(Schema.Boolean),
+  terminals: Schema.optionalKey(Schema.Boolean),
+});
+export type McpCapabilitiesPatch = typeof McpCapabilitiesPatch.Type;
+
 export const ThreadEnvMode = Schema.Literals(["local", "worktree"]);
 export type ThreadEnvMode = typeof ThreadEnvMode.Type;
 
@@ -555,6 +577,7 @@ export const ServerSettings = Schema.Struct({
   mcpServerAccess: McpServerAccess.pipe(
     Schema.withDecodingDefault(Effect.succeed(DEFAULT_MCP_SERVER_ACCESS)),
   ),
+  mcpCapabilities: McpCapabilities.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
   automaticGitFetchInterval: Schema.DurationFromMillis.pipe(
     Schema.withDecodingDefault(
       Effect.succeed(Duration.toMillis(DEFAULT_AUTOMATIC_GIT_FETCH_INTERVAL)),
@@ -724,6 +747,7 @@ export const ServerSettingsPatch = Schema.Struct({
   enableDevicePreviews: Schema.optionalKey(Schema.Boolean),
   enableMcpServer: Schema.optionalKey(Schema.Boolean),
   mcpServerAccess: Schema.optionalKey(McpServerAccess),
+  mcpCapabilities: Schema.optionalKey(McpCapabilitiesPatch),
   automaticGitFetchInterval: Schema.optionalKey(Schema.DurationFromMillis),
   defaultThreadEnvMode: Schema.optionalKey(ThreadEnvMode),
   newWorktreesStartFromOrigin: Schema.optionalKey(Schema.Boolean),
