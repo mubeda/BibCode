@@ -11,6 +11,7 @@ current behavior.
 - [Workspace UI](./user/workspace-ui.md)
 - [Provider setup](./providers/README.md)
 - [Remote access](./user/remote-access.md)
+- [Outside agents over MCP](./user/mcp.md)
 - [Standalone server installation](./user/server-installation.md)
 - [Architecture overview](./architecture/overview.md)
 
@@ -20,6 +21,7 @@ current behavior.
 - [Workspace UI](./user/workspace-ui.md)
 - [Keybindings](./user/keybindings.md)
 - [Remote access](./user/remote-access.md)
+- [Outside agents over MCP](./user/mcp.md)
 - [Standalone server installation](./user/server-installation.md)
 - [Project data safety and recovery](./guides/project-data-recovery.md)
 - [Source control providers](./integrations/source-control-providers.md)
@@ -62,7 +64,7 @@ current behavior.
 - [Workspace layout](./reference/workspace-layout.md)
 - [Repository scripts](./reference/scripts.md)
 - [Repository skills](./skills/): the source of the agent skills
-  (`bibcode-profiler`, `bibcode-release`, `issue-delivery`) that the
+  (`bibcode-mcp`, `bibcode-profiler`, `bibcode-release`, `issue-delivery`) that the
   `.agents/skills/` and `.claude/skills/` stubs point to
 
 ## Historical material

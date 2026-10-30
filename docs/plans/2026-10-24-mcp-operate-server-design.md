@@ -1200,8 +1200,9 @@ updated on 2026-10-27.
 
 - **Settings placement.** The issue's 2026-10-27 edit moves the MCP row into the **MCP**
   tab of a **Settings → Agent integrations** section. This slice adds that section with
-  the MCP content only. Webhooks belong to the extended scope, so the tab bar arrives
-  with the second tab. The relay's off message names "Settings → Agent integrations → MCP
+  the MCP content only, on the existing Settings → Agents page (a section, not a new
+  route). Webhooks belong to the extended scope, so the tab bar arrives with the second
+  tab. The relay's off message names "Settings → Agents → Agent integrations → MCP
   server".
 - **`rmcp`.** The issue's 2026-10-27 note says to reevaluate the official Rust SDK before
   writing a third MCP framing. This slice writes none: `mcp/protocol.rs` replaces the
@@ -1210,3 +1211,31 @@ updated on 2026-10-27.
   provider. That test needs real provider CLIs and was not run here. The check is
   implemented and tested (no `Origin`, or this server's own origin, passes), and the
   untested provider launch is reported as a residual risk.
+
+**Choices made while implementing** (none changes a settled decision):
+
+- **`list_providers_and_models` maps to `server.getConfig`.** `server.getProviderCapabilities`
+  returns slash commands, skills and agents, not models; the models and the session
+  defaults are in the server config. That read is not long-running, so
+  `mcp.list_providers_and_models` is not either; the profiler rule "long-running when it
+  waits or any method it dispatches to is" is unchanged.
+- **Provider tools are long-running.** `mcp.preview_*` and `mcp.device_*` wait on a
+  page or an emulator (`device.open` already is), so they never raise `rpc.slow`.
+- **`read_thread` pages backwards.** Without a cursor it returns the newest page, and
+  `nextCursor` reads older messages, keyed on the same `(created_at, message_id)` index.
+- **The relay mints on its first request**, not at start, so the label can name the agent
+  from `clientInfo` (`MCP · <name>`). Every check before minting (setting, record, proof)
+  still runs at start.
+- **Malformed `/mcp` bodies get 400** with the JSON-RPC error, and a message without an
+  id is a notification (202), as the Streamable HTTP transport says; the old endpoint
+  answered both differently.
+- **A wait without `messageId`** also counts an admitted turn that has not started
+  (`turn_id IS NULL`, `running`) as work in progress, so it does not report a just-started
+  thread as idle.
+- **Launch command wrappers.** `@bibcode/shared/launchCommand` builds the SSH and WSL
+  wrappers, but the Settings row does not yet look up an SSH or WSL environment's target
+  through the desktop bridge. For an environment other than the primary one it shows the
+  server's own command and says to run it on that host or after `ssh <host> --`.
+- **Not covered by a test in this slice:** a retry after a crash between reservation and
+  enqueue, and a retry of a rejected command. Both rest on the existing command-admission
+  replay, which the tools reach unchanged with the stored payloads.

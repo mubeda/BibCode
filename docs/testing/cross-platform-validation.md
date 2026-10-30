@@ -1720,6 +1720,35 @@ packaged application:
 
 Do not run destructive worktree scenarios against a user repository.
 
+## Outside-agent MCP smoke
+
+Run on each desktop (macOS, Windows, Linux) and on a server, against a disposable
+project. The focused gates are `cargo test -p bibcode-server --lib -- mcp::
+mcp_tools_tests connect_mcp auth::service::tests::the_mcp` and
+`vp test run --project unit src/components/settings/AgentIntegrationsSection.test.tsx`
+from `apps/web`.
+
+1. In **Settings → Agents → Agent integrations**, check that **MCP server** is on,
+   **Agents may** reads Supervised, and the launch command names this install's
+   executable and data root (`--dev-url` for a development build).
+2. Use **Copy for Claude Code**, run it, restart Claude Code, and ask it to start a
+   thread in the project, wait for it, and show the diff. Expect one
+   **MCP · claude-code** row in **Authorized clients** while it runs, and none after
+   the agent exits.
+3. Run Codex with its default timeouts and ask for a `wait_for_thread` at
+   `timeoutMs: 50000`: it returns before Codex's 60 s tool timeout.
+4. Turn **MCP server** off during a wait: the wait ends with "turned off", a new
+   `bibcode mcp` exits naming the setting, and a provider's browser preview still
+   works. Turn it on: the agent's next call works without restarting it.
+5. Revoke the agent's row: its next call says to restart the MCP server.
+6. On Windows, run the desktop executable's `mcp` from an agent and check that
+   stdout carries only JSON-RPC (no console output mixed in). A Windows update
+   ends it with the app.
+7. Over SSH and in WSL, see [SSH environments](./ssh-environments.md#outside-agents-over-ssh).
+
+Record the agent versions, the protocol version each negotiated and every
+message shown in the execution report.
+
 ## Remote-server update scenario
 
 Exercise the controlled second host from both Settings and the sidebar in both

@@ -3267,6 +3267,48 @@ interrupting it, and a restore that fails is still recorded: the work log
 then says the conversation was rewound but the files were not restored. Every
 failure is a `checkpoint.revert.failed` activity.
 
+## Outside-agent thread tools
+
+The thread tools an outside agent calls on `/mcp` (#139, `mcp::control`) run inside
+the server. They reach the same handlers the UI uses through
+`RpcRegistry::invoke_local`, which checks the method's declared scope on the
+caller's session, takes its maintenance admission and runs the registered handler
+with its timing; `thread.turn.start` therefore goes through the durable ingress,
+workspace admission and receipt replay exactly as a WebSocket request does.
+
+| Tool                        | Maps to                                                                               | Scope   |
+| --------------------------- | ------------------------------------------------------------------------------------- | ------- |
+| `list_projects_and_threads` | the `subscribeShell` builder, paged by offset                                         | read    |
+| `list_providers_and_models` | `server.getConfig` providers and session defaults                                     | read    |
+| `start_thread`              | `thread.turn.start` with `bootstrap.createThread`                                     | operate |
+| `send_message`              | `thread.turn.start` with `queued: true`, then `thread.turn.steer` for `mode: "steer"` | operate |
+| `wait_for_thread`           | engine events and one targeted read                                                   | read    |
+| `read_thread`               | one keyset page of `projection_thread_messages` with `LIMIT`, texts cut in SQL        | read    |
+| `list_pending_requests`     | open questions and pending approvals, read directly                                   | read    |
+| `answer_question`           | `thread.user-input.respond`; approvals refused                                        | operate |
+| `interrupt_turn`            | `thread.turn.interrupt`                                                               | operate |
+| `get_turn_diff`             | `orchestration.getTurnDiff`, paged by file and offset                                 | read    |
+| `git_status`                | `vcs.refreshStatus` on the thread's folder                                            | read    |
+
+- **Retries.** With a `clientRequestId`, the first call stores the commands it built
+  in `mcp_tool_requests` (`INSERT OR IGNORE`, keyed by session and id, with the
+  argument digest). Every call with that key dispatches the stored payloads, so
+  command admission replays them by receipt state; other arguments under the same
+  key get `idempotency_conflict`. Rows older than 24 h are pruned on insert.
+- **Ceiling.** A start runs at most at the lower of the session's `mcp_access` and
+  `mcpServerAccess`; a send or an answer to a thread above it is refused, and
+  `read-only` hides and refuses every operate tool.
+- **Waiting.** `wait_for_thread` subscribes to `subscribe_events()` before its first
+  read, keeps only the thread's events, re-reads at most once per 100 ms burst, and
+  returns when the selected turn settles (or, without `messageId`, the thread is
+  idle with nothing waiting to start), needs a person, fails, or 50 s pass. The
+  reply is the selected turn's own `assistant_message_id`. A `progressToken` turns
+  the answer into `text/event-stream` with status-only `notifications/progress`.
+  Every way out drops the receiver.
+- **Bounds.** At most 8 calls and 4 waits per session and 32 waits per
+  environment. `enableMcpServer` off refuses calls with `McpServerDisabledError`
+  and ends waits; shutdown ends them right after the profiler starts stopping.
+
 ## Targeted Activity cancellation flow
 
 Targeted Activity control uses typed WebSocket RPC in browser and desktop

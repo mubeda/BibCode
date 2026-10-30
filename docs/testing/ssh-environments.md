@@ -335,6 +335,21 @@ it was already open):
 - Revoke the desktop's device on the host's Share tab: within 30 s the page's
   WebSocket closes.
 
+### Outside agents over SSH
+
+1. With the host's server running, register `claude mcp add bibcode -- ssh <host> bibcode mcp`
+   on the desktop machine (or copy it from **Settings → Agents → Agent integrations**
+   with the SSH environment selected) and restart Claude Code.
+2. Start a thread in a disposable project on the host and wait for it. No tunnel or
+   port forward is involved: `bibcode mcp` runs on the host and reaches its
+   loopback server.
+3. Restart the host's server (it may take another port): the agent's next call
+   works without restarting the agent.
+4. For a WSL environment, register
+   `wsl.exe -d <distro> --exec <server binary> mcp --base-dir <root>` and repeat.
+5. Exit the agent and check that the host lists no **MCP · …** row in Authorized
+   clients and no file in `<state dir>/mcp-clients/`.
+
 ### Cleanup
 
 1. Remove the environment on the desktop (row menu → **Remove server…**). This stops the

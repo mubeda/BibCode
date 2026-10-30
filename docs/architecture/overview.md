@@ -2007,8 +2007,17 @@ bounded memory, and works while the server is stopped.
   one approval there, or with the app closed through a diagnostics-only
   credential of its own, `download --remote` (see
   [Observability](../operations/observability.md#from-the-command-line)).
+  Its framing (protocol eras, version checks, result shapes and the 80,000
+  character cap) lives in `mcp/protocol.rs`, which `/mcp` shares.
 - **Skill.** [`docs/skills/bibcode-profiler/`](../skills/bibcode-profiler/SKILL.md)
   uses these readers to monitor, diagnose, and file deduplicated GitHub issues.
+- **MCP tool calls.** Each `/mcp` tool call is timed as `mcp.<tool>` (`rpc.timing`
+  and the hang check). `mcp.wait_for_thread`, every `mcp.preview_*` and
+  `mcp.device_*` call, and any `mcp.*` tool whose RPC method is long-running are
+  long-running; the thread tools' own RPC dispatches keep their RPC names' timing.
+  `/mcp` logs a failed call's tool, thread id and error type, never its arguments,
+  prompts or replies. The MCP service stops right after `begin_stopping()`, ending
+  every wait in flight, before the orchestration engine shuts down.
 
 ### Known limits
 
@@ -2035,8 +2044,9 @@ bounded memory, and works while the server is stopped.
   scripts.
 - The restart waiter of a Windows update treats a `bibcode-desktop.exe` with a
   window as the relaunched app, so the profiler's windowless `profiler mcp`
-  server and crash monitor do not count. The passive installer's preinstall
-  hook ends every same-user `bibcode-desktop.exe`, an MCP server included.
+  server, an outside agent's `mcp` relay and the crash monitor do not count. The
+  passive installer's preinstall hook ends every same-user `bibcode-desktop.exe`,
+  both MCP servers included; the agent restarts its MCP server afterwards.
 
 ## Device previews
 

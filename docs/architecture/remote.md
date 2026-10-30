@@ -1774,11 +1774,27 @@ Remote Server mode, the joined record's slow part (`server`, `network`, or
   Noise. A read-scope session can watch a device but cannot start, stop, or
   drive it: `device.open`, `device.close`, `device.input`, and `device.rotate`
   need `orchestration:operate`.
-- The `device_*` MCP tools, like `preview_*`, perform no per-call scope check:
-  a valid provider MCP credential is issued only when the server launches a
-  thread's provider, so holding it is the operate grant. Issuing MCP
-  credentials to a lower-privileged principal would require a scope check in
-  both tool families first.
+- `/mcp` serves two kinds of principal (#139). A **provider credential** is the
+  random bearer the server issues when it launches a thread's provider; it holds
+  `orchestration:read orchestration:operate` implicitly and reaches only the
+  `preview_*` and `device_*` tools. An **outside agent** presents an `mcp-client`
+  session (see [Environment authentication](../cloud/environment-auth.md#outside-agents-over-mcp))
+  and reaches only the thread tools. Every other bearer gets 401. Each tool is
+  registered in `mcp::control` with its principal kind and the required scope of
+  the RPC method it maps to, and every call checks both before the handler runs;
+  a call to the other kind's tool is a scope refusal.
+- `/mcp` refuses a request whose `Origin` is not this server's own (403). A
+  modern (2026-07-28) request must repeat its version, method and tool name in
+  `MCP-Protocol-Version`, `Mcp-Method` and `Mcp-Name` (400, `-32020`, on a
+  mismatch); an unknown modern method gets 404. Providers keep the legacy
+  `initialize` and `Mcp-Session-Id`; outside agents get no HTTP session, so a
+  restart or an off/on cycle loses nothing.
+- Outside agents reach `/mcp` from the same host only: `bibcode mcp` relays stdio
+  to loopback after proving the listener with `POST /mcp/endpoint-proof`, an
+  unauthenticated, loopback-only route that signs a caller's nonce and the local
+  port with the per-boot key in the owner-only `server-runtime.json`. A remote
+  agent uses `ssh <host> bibcode mcp`. Remote Streamable HTTP for outside agents
+  needs MCP OAuth and is not served.
 - Emulator, adb, and scrcpy sockets listen on loopback only; BiBCode never
   passes `adb -a`.
 
