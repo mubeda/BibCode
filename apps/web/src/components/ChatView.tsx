@@ -3995,8 +3995,16 @@ function ChatViewContent(props: ChatViewProps) {
 
   // Follows the end after new timeline entries render; an empty timeline has nothing to follow.
   // A composer height change follows again too, as it did when the geometry helpers were
-  // recreated with the height (#204).
-  useEffect(() => {
+  // recreated with the height (#204). It follows once in the commit, before the frame paints: a
+  // row inserted above the end at LegendList's size estimate, such as a finished reply's
+  // "Worked for" row, otherwise shows the end dropped by that estimate until a later frame
+  // (#208). LegendList has applied the new rows in its own layout effect by then. The pass two
+  // frames on follows rows that measure after the commit. A new thread's list waits for that
+  // pass, as the previous thread's follow state is reset only after this commit.
+  const followedTimelineThreadIdRef = useRef(activeThread?.id);
+  useLayoutEffect(() => {
+    const sameThread = followedTimelineThreadIdRef.current === activeThread?.id;
+    followedTimelineThreadIdRef.current = activeThread?.id;
     // The overlay height is never negative: comparing it makes the height an input, so a new
     // height follows again, as it did when the helpers were recreated with it. A `void` read is
     // compiled away and leaves the dependency "unnecessary", which stops the compiler.
@@ -4005,6 +4013,9 @@ function ChatViewContent(props: ChatViewProps) {
     }
     if (liveFollowUserScrollGenerationRef.current !== anchorUserScrollGenerationRef.current) {
       return;
+    }
+    if (sameThread) {
+      followTimelineLiveEnd();
     }
 
     let secondFrame: number | null = null;

@@ -2026,6 +2026,33 @@ describe("ChatView effects (captured and run manually)", () => {
     for (const cleanup of cleanups) cleanup();
   });
 
+  it("follows the end in the commit that renders new entries, before a frame paints", () => {
+    // A finished reply's "Worked for" row lands above it at LegendList's size estimate and drops
+    // the reply by that height; a follow two frames later leaves the drop painted (#208).
+    seedConnectedServerThread(makeThreadWithEarlierTurn());
+    renderServerRoute();
+    const list = installLegendList({ scroll: 0, scrollLength: 200, dataLength: 4, rowSize: 100 });
+    const frames: Array<() => void> = [];
+    vi.stubGlobal("requestAnimationFrame", (callback: (time: number) => void) => {
+      frames.push(() => callback(0));
+      return frames.length;
+    });
+
+    const cleanups = runEffects();
+    expect(list.calls.scrollToEnd).toEqual([{ animated: false }]);
+
+    // The pass two frames on still follows rows that measure after the commit.
+    for (let frame = 0; frame < 2; frame += 1) {
+      for (const run of frames.splice(0)) run();
+    }
+    expect(list.calls.scrollToEnd).toEqual([{ animated: false }, { animated: false }]);
+    vi.stubGlobal("requestAnimationFrame", (callback: (time: number) => void) => {
+      callback(0);
+      return 1;
+    });
+    for (const cleanup of cleanups) cleanup();
+  });
+
   it("follows the end again when a follow was clamped to a lagging content height", async () => {
     // The scroller has laid out only 100 px of the 216 the turn's end needs.
     const { list, cleanups, messageId, onAnchorReady } = await sendTallReply({
