@@ -3394,6 +3394,27 @@ handlers, so creation and removal keep their command claims, generation checks,
 - **Removal plan.** `remove_worktree` sends `planToken` and `expectedGeneration`
   exactly as the agent passed them and never fetches a plan itself.
 
+### Pull request tools
+
+`mcp::tools::pull_requests` resolves the thread's folder and calls the handlers the
+Pull Requests and Source Control panels use. Every tool is in the `sourceControl`
+set and marked open-world (and so long-running); none holds a wait slot.
+
+| Tool                  | Maps to                                                                          | Scope   |
+| --------------------- | -------------------------------------------------------------------------------- | ------- |
+| `list_pull_requests`  | `pullRequests.list` (newest first, no filters, the host's opaque cursor)         | read    |
+| `view_pull_request`   | `pullRequests.get` and `pullRequests.getChecks`, together; body cut at 16,000    | read    |
+| `pull_request_checks` | `pullRequests.getChecks`                                                         | read    |
+| `create_pull_request` | `git.runStackedAction` with `action: "create_pr"`, through `invoke_local_stream` | operate |
+| `update_pull_request` | `pullRequests.runAction` `editPullRequest`, then `setDraft`                      | operate |
+| `merge_pull_request`  | `pullRequests.runAction` `merge` with `bypass: false` and the agent's `headSha`  | operate |
+
+The three writes run through `ToolCall::recorded`. A create's `action_failed` is a
+typed `GitActionFailedError` (with its `phase`) recorded as `failed`; a stream that
+closes before `action_finished` is `unknown`. When the edit lands and the draft
+change does not, `update_pull_request` records `McpPartialOutcomeError` naming what
+changed. The merge is destructive, so it writes the `MCP destructive tool` line.
+
 ## Targeted Activity cancellation flow
 
 Targeted Activity control uses typed WebSocket RPC in browser and desktop
