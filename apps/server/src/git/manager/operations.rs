@@ -3335,7 +3335,10 @@ async fn native_trash_request(path: &Path) -> Result<ProcessRequest, TrashUnavai
         cwd,
         env: Vec::new(),
         stdin: None,
-        timeout: Duration::from_secs(30),
+        // On macOS a move into the trash is a rename, and Finder automation (before 15) can wait
+        // on an Automation consent nobody sees: give up soon, leaving the entry where it was.
+        // PowerShell's cold start on Windows keeps the longer budget.
+        timeout: Duration::from_secs(if cfg!(target_os = "macos") { 10 } else { 30 }),
         max_output_bytes: 64 * 1024,
         output_policy: OutputPolicy::Truncate,
         append_truncation_marker: false,
@@ -3353,6 +3356,19 @@ async fn native_trash_command(path: &Path) -> Result<(PathBuf, Vec<OsString>), T
 
 #[cfg(target_os = "macos")]
 async fn native_trash_command(path: &Path) -> Result<(PathBuf, Vec<OsString>), TrashUnavailable> {
+    // macOS 15 and later ship `trash`, which moves through the file manager without Finder
+    // automation, so it needs no Automation consent. It takes no `--`: only an absolute path,
+    // which cannot read as an option, is passed. `-s` makes a failed move a failure.
+    const TRASH: &str = "/usr/bin/trash";
+    if !path.is_absolute() {
+        return Err(TrashUnavailable);
+    }
+    if tokio::fs::try_exists(TRASH).await.unwrap_or(false) {
+        return Ok((
+            PathBuf::from(TRASH),
+            vec![OsString::from("-s"), path.into()],
+        ));
+    }
     Ok((
         PathBuf::from("/usr/bin/osascript"),
         vec![
@@ -3413,6 +3429,31 @@ mod tests {
 
     use super::*;
     use crate::git::GitRepository;
+
+    /// macOS's own `trash` (15 and later) moves through the file manager, with no Finder
+    /// automation, so it needs no Automation consent a server process cannot ask for and never
+    /// waits on one. It takes no `--`, so only an absolute path, which cannot read as an
+    /// option, is handed to it.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn macos_trash_uses_the_system_trash_command_without_finder() {
+        if !Path::new("/usr/bin/trash").exists() {
+            return;
+        }
+        let (command, args) = native_trash_command(Path::new("/tmp/folder/file.txt"))
+            .await
+            .unwrap();
+        assert_eq!(command, PathBuf::from("/usr/bin/trash"));
+        assert_eq!(args, ["-s", "/tmp/folder/file.txt"]);
+        assert_eq!(
+            native_trash_command(Path::new("-rf")).await,
+            Err(TrashUnavailable)
+        );
+        let request = native_trash_request(Path::new("/tmp/folder/file.txt"))
+            .await
+            .unwrap();
+        assert!(request.timeout <= Duration::from_secs(10));
+    }
 
     fn git_output(cwd: &Path, args: &[&str]) -> std::process::Output {
         Command::new("git")
