@@ -76,6 +76,29 @@ pub(crate) struct NewDelivery {
     pub(crate) event_id: String,
     pub(crate) event_type: String,
     pub(crate) body: String,
+    /// The endpoint's destination and filters this delivery was chosen under; the enqueue
+    /// drops it when they changed since (`None` skips the check).
+    pub(crate) addressed: Option<Fence>,
+}
+
+/// What decides where an endpoint's deliveries go and which events it gets: its URL,
+/// project filter and event list. An edit that changes it abandons the endpoint's queue.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Fence {
+    pub(crate) url: String,
+    pub(crate) project_id: Option<String>,
+    pub(crate) event_types_json: String,
+}
+
+impl Endpoint {
+    pub(crate) fn fence(&self) -> Fence {
+        Fence {
+            url: self.url.clone(),
+            project_id: self.project_id.clone(),
+            event_types_json: serde_json::to_string(&self.event_types)
+                .unwrap_or_else(|_| "[]".to_owned()),
+        }
+    }
 }
 
 /// How an attempt left its delivery.
@@ -390,11 +413,37 @@ impl Store {
                 let transaction = connection.transaction()?;
                 let now = now_iso();
                 {
+                    // The endpoint as it is now, in this transaction: a delivery chosen under
+                    // settings an edit has since replaced is dropped here, since the edit
+                    // abandoned whatever was queued before it.
+                    let mut current: HashMap<String, Option<Fence>> = HashMap::new();
+                    let mut read = transaction.prepare_cached(
+                        "SELECT url, project_id, event_types_json FROM webhook_endpoints WHERE endpoint_id = ?1 AND enabled = 1",
+                    )?;
                     let mut insert = transaction.prepare_cached(
                         "INSERT INTO webhook_deliveries (delivery_id, endpoint_id, event_id, event_type, body, state, attempts, next_attempt_ms, created_at, updated_at) \
                          VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 0, ?6, ?7, ?7)",
                     )?;
                     for delivery in &deliveries {
+                        if let Some(addressed) = &delivery.addressed {
+                            if !current.contains_key(&delivery.endpoint_id) {
+                                let fence = read
+                                    .query_row(params![delivery.endpoint_id], |row| {
+                                        Ok(Fence {
+                                            url: row.get(0)?,
+                                            project_id: row.get(1)?,
+                                            event_types_json: row.get(2)?,
+                                        })
+                                    })
+                                    .optional()?;
+                                current.insert(delivery.endpoint_id.clone(), fence);
+                            }
+                            if current.get(&delivery.endpoint_id).and_then(Option::as_ref)
+                                != Some(addressed)
+                            {
+                                continue;
+                            }
+                        }
                         insert.execute(params![
                             delivery.delivery_id,
                             delivery.endpoint_id,
@@ -430,22 +479,27 @@ impl Store {
                         .or_default()
                         .add(cursor.as_deref(), last_seen.as_deref());
                 }
+                // One batch per endpoint and enqueue, numbered from one counter, so a request
+                // acknowledges exactly the batches it announced.
                 for (endpoint, lost) in by_endpoint {
                     let key = dropped_key(&endpoint);
-                    let mut merged: Dropped = transaction
+                    let mut batches = read_batches(&transaction, &key)?;
+                    let seq = transaction
                         .query_row(
                             "SELECT value FROM webhook_state WHERE key = ?1",
-                            params![key],
+                            params![DROP_SEQ],
                             |row| row.get::<_, String>(0),
                         )
                         .optional()?
-                        .and_then(|text| serde_json::from_str(&text).ok())
-                        .unwrap_or_default();
-                    merged.merge(&lost);
+                        .and_then(|text| text.parse::<u64>().ok())
+                        .unwrap_or(0)
+                        + 1;
+                    set_state(&transaction, DROP_SEQ, &seq.to_string())?;
+                    batches.push(DropBatch { seq, lost });
                     set_state(
                         &transaction,
                         &key,
-                        &serde_json::to_string(&merged).unwrap_or_default(),
+                        &serde_json::to_string(&batches).unwrap_or_default(),
                     )?;
                 }
                 transaction.commit()?;
@@ -507,32 +561,52 @@ impl Store {
             .await
     }
 
-    /// What an endpoint lost to a full queue and was not yet told (`Dropped`, as JSON).
-    pub(crate) async fn dropped(&self, endpoint_id: &str) -> Result<Option<String>> {
+    /// What an endpoint lost to a full queue and was not yet told: the batches' numbers and
+    /// their sum.
+    pub(crate) async fn dropped(&self, endpoint_id: &str) -> Result<Option<(Vec<u64>, Dropped)>> {
         let key = dropped_key(endpoint_id);
         self.database
             .call(move |connection| {
-                Ok(connection
-                    .query_row(
-                        "SELECT value FROM webhook_state WHERE key = ?1",
-                        params![key],
-                        |row| row.get(0),
-                    )
-                    .optional()?)
+                let transaction = connection.transaction()?;
+                let batches = read_batches(&transaction, &key)?;
+                transaction.commit()?;
+                if batches.is_empty() {
+                    return Ok(None);
+                }
+                let mut sum = Dropped::default();
+                for batch in &batches {
+                    sum.merge(&batch.lost);
+                }
+                Ok(Some((batches.iter().map(|batch| batch.seq).collect(), sum)))
             })
             .await
     }
 
-    /// Forgets `announced` once a delivery carrying it arrived; a loss recorded meanwhile
-    /// changed the value and stays.
-    pub(crate) async fn clear_dropped(&self, endpoint_id: &str, announced: String) -> Result<()> {
+    /// Forgets the batches a delivered request announced; a batch recorded since stays.
+    pub(crate) async fn acknowledge_dropped(
+        &self,
+        endpoint_id: &str,
+        announced: Vec<u64>,
+    ) -> Result<()> {
         let key = dropped_key(endpoint_id);
         self.database
             .call(move |connection| {
-                connection.execute(
-                    "DELETE FROM webhook_state WHERE key = ?1 AND value = ?2",
-                    params![key, announced],
-                )?;
+                let transaction = connection.transaction()?;
+                let left: Vec<DropBatch> = read_batches(&transaction, &key)?
+                    .into_iter()
+                    .filter(|batch| !announced.contains(&batch.seq))
+                    .collect();
+                if left.is_empty() {
+                    transaction
+                        .execute("DELETE FROM webhook_state WHERE key = ?1", params![key])?;
+                } else {
+                    set_state(
+                        &transaction,
+                        &key,
+                        &serde_json::to_string(&left).unwrap_or_default(),
+                    )?;
+                }
+                transaction.commit()?;
                 Ok(())
             })
             .await
@@ -829,6 +903,30 @@ impl Store {
             })
             .await
     }
+}
+
+/// The counter that numbers drop batches.
+const DROP_SEQ: &str = "drop_seq";
+
+/// One enqueue's losses for one endpoint.
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+struct DropBatch {
+    seq: u64,
+    #[serde(flatten)]
+    lost: Dropped,
+}
+
+fn read_batches(transaction: &Transaction<'_>, key: &str) -> rusqlite::Result<Vec<DropBatch>> {
+    let text: Option<String> = transaction
+        .query_row(
+            "SELECT value FROM webhook_state WHERE key = ?1",
+            params![key],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(text
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default())
 }
 
 fn dropped_key(endpoint_id: &str) -> String {

@@ -334,9 +334,23 @@ impl Webhooks {
             .clone()
     }
 
-    /// Sends one delivery once and returns what happened, without recording it. It waits
-    /// for the endpoint's request in flight, if any, and adds `dropped` to the body while the
-    /// endpoint has deliveries lost to a full queue that it was not told about.
+    /// Waits for the endpoint's send lock (its request in flight, if any), unless `cancel`
+    /// fires first.
+    async fn take_turn(
+        &self,
+        endpoint_id: &str,
+        cancel: &CancellationToken,
+    ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        let lock = self.send_lock(endpoint_id);
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => None,
+            turn = lock.lock_owned() => Some(turn),
+        }
+    }
+
+    /// Sends one delivery once, after the endpoint's request in flight, and returns what
+    /// happened, without recording it (a test event and a redelivery).
     async fn attempt(
         &self,
         endpoint: &Endpoint,
@@ -345,14 +359,28 @@ impl Webhooks {
         body: &str,
         cancel: &CancellationToken,
     ) -> Attempt {
-        let lock = self.send_lock(&endpoint.id);
-        let _turn = tokio::select! {
-            biased;
-            () = cancel.cancelled() => {
-                return Attempt { status: None, failure: Some(Failure::Cancelled), latency_ms: 0 };
-            }
-            turn = lock.lock_owned() => turn,
+        let Some(_turn) = self.take_turn(&endpoint.id, cancel).await else {
+            return Attempt {
+                status: None,
+                failure: Some(Failure::Cancelled),
+                latency_ms: 0,
+            };
         };
+        self.attempt_holding_turn(endpoint, delivery_id, event_type, body, cancel)
+            .await
+    }
+
+    /// [`attempt`](Self::attempt) for a caller that holds the endpoint's send lock. It adds
+    /// `dropped` to the body while the endpoint has drop batches it was not told about, and a
+    /// 2xx acknowledges exactly the batches it carried.
+    async fn attempt_holding_turn(
+        &self,
+        endpoint: &Endpoint,
+        delivery_id: &str,
+        event_type: &str,
+        body: &str,
+        cancel: &CancellationToken,
+    ) -> Attempt {
         let dropped = match self.inner.store.dropped(&endpoint.id).await {
             Ok(dropped) => dropped,
             Err(error) => {
@@ -360,9 +388,9 @@ impl Webhooks {
                 None
             }
         };
-        let announced = dropped.as_deref().and_then(|dropped| {
+        let announced = dropped.as_ref().and_then(|(_, sum)| {
             let mut payload: serde_json::Map<String, Value> = serde_json::from_str(body).ok()?;
-            payload.insert("dropped".to_owned(), serde_json::from_str(dropped).ok()?);
+            payload.insert("dropped".to_owned(), serde_json::to_value(sum).ok()?);
             Some(Value::Object(payload).to_string())
         });
         let attempt = self
@@ -376,8 +404,12 @@ impl Webhooks {
             .await;
         if attempt.failure.is_none()
             && announced.is_some()
-            && let Some(dropped) = dropped
-            && let Err(error) = self.inner.store.clear_dropped(&endpoint.id, dropped).await
+            && let Some((batches, _)) = dropped
+            && let Err(error) = self
+                .inner
+                .store
+                .acknowledge_dropped(&endpoint.id, batches)
+                .await
         {
             tracing::warn!(%error, "could not clear a webhook endpoint's dropped deliveries");
         }
@@ -435,8 +467,28 @@ impl Webhooks {
         }
     }
 
-    /// One queued delivery, as the dispatcher sends it.
-    async fn deliver(&self, delivery: Delivery) {
+    /// One queued delivery, as the dispatcher sends it, with the endpoint's send lock when
+    /// the dispatcher already took it.
+    async fn deliver(&self, delivery: Delivery, turn: Option<tokio::sync::OwnedMutexGuard<()>>) {
+        // The token first: an edit committed before the reads below abandoned the row, and
+        // one committed after them cancels this token, so a row picked before an edit never
+        // goes to the edited destination.
+        let cancel = self.endpoint_token(&delivery.endpoint_id);
+        let _turn = match turn {
+            Some(turn) => turn,
+            None => match self.take_turn(&delivery.endpoint_id, &cancel).await {
+                Some(turn) => turn,
+                None => return,
+            },
+        };
+        match self.inner.store.delivery(&delivery.delivery_id).await {
+            Ok(Some(current)) if current.state == store::PENDING => {}
+            Ok(_) => return,
+            Err(error) => {
+                tracing::warn!(%error, "could not read a webhook delivery");
+                return;
+            }
+        }
         let endpoint = match self.inner.store.endpoint(&delivery.endpoint_id).await {
             Ok(Some(endpoint)) if endpoint.enabled => endpoint,
             Ok(_) => return,
@@ -445,9 +497,8 @@ impl Webhooks {
                 return;
             }
         };
-        let cancel = self.endpoint_token(&endpoint.id);
         let attempt = self
-            .attempt(
+            .attempt_holding_turn(
                 &endpoint,
                 &delivery.delivery_id,
                 &delivery.event_type,
@@ -721,6 +772,7 @@ impl Webhooks {
                     event_id: event.id.clone(),
                     event_type: event.event_type.to_owned(),
                     body: event.body(&self.inner.environment_id),
+                    addressed: Some(endpoint.fence()),
                 });
             }
         }
@@ -846,20 +898,32 @@ async fn run(webhooks: Webhooks) {
                 }
                 Err(error) => tracing::warn!(%error, "could not read webhook endpoints"),
             }
-            let room = MAX_IN_FLIGHT.saturating_sub(in_flight.len());
-            if room > 0 {
+            // A slot goes only to an endpoint whose send lock is free now: one held by a test
+            // event or a redelivery is skipped (its end wakes the loop), so a waiter never
+            // takes a slot from an endpoint that is ready.
+            let mut held: Vec<String> = Vec::new();
+            if in_flight.len() < MAX_IN_FLIGHT {
                 match inner
                     .store
-                    .due(now_ms(), busy.iter().cloned().collect(), room)
+                    .due(now_ms(), busy.iter().cloned().collect(), usize::MAX)
                     .await
                 {
                     Ok(due) => {
                         for delivery in due {
+                            if in_flight.len() >= MAX_IN_FLIGHT {
+                                break;
+                            }
+                            let Ok(turn) =
+                                webhooks.send_lock(&delivery.endpoint_id).try_lock_owned()
+                            else {
+                                held.push(delivery.endpoint_id.clone());
+                                continue;
+                            };
                             busy.insert(delivery.endpoint_id.clone());
                             let webhooks = webhooks.clone();
                             in_flight.spawn(async move {
                                 let endpoint = delivery.endpoint_id.clone();
-                                webhooks.deliver(delivery).await;
+                                webhooks.deliver(delivery, Some(turn)).await;
                                 endpoint
                             });
                         }
@@ -867,10 +931,12 @@ async fn run(webhooks: Webhooks) {
                     Err(error) => tracing::warn!(%error, "could not read due webhook deliveries"),
                 }
             }
-            if let Ok(Some(next)) = inner
-                .store
-                .next_due_ms(busy.iter().cloned().collect())
-                .await
+            // With every slot taken, the next completion wakes the loop, not a due time.
+            if in_flight.len() < MAX_IN_FLIGHT
+                && let Ok(Some(next)) = inner
+                    .store
+                    .next_due_ms(busy.iter().chain(&held).cloned().collect())
+                    .await
             {
                 let until = u64::try_from(next.saturating_sub(now_ms())).unwrap_or(0);
                 wait = wait.min(Duration::from_millis(until.max(50)));

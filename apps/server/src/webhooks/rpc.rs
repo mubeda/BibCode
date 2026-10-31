@@ -390,6 +390,7 @@ impl Webhooks {
             event_id: event.id.clone(),
             event_type: WEBHOOK_TEST.to_owned(),
             body: event.body(&self.inner.environment_id),
+            addressed: None,
         };
         self.send_now(&endpoint, delivery, false).await
     }
@@ -433,6 +434,7 @@ impl Webhooks {
             event_id: original.event_id,
             event_type: original.event_type,
             body: original.body,
+            addressed: None,
         };
         self.send_now(&endpoint, delivery, health).await
     }
