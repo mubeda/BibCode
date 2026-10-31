@@ -14,7 +14,7 @@ use crate::{
             Family, McpAccess, ProgressSink, ToolCall, ToolFuture, ToolResult, ToolSpec,
             object_schema,
         },
-        protocol::typed_tool_failure,
+        protocol::{tool_result, typed_tool_failure},
     },
     production::connect_mcp::{DeviceTools, PreviewInvoker, PreviewScope, device_tool_descriptors},
 };
@@ -269,28 +269,52 @@ async fn twin_call(call: &ToolCall<'_>, name: &str) -> ToolResult {
     if result["isError"] == true {
         Err(host_failure(result))
     } else {
-        Ok(result)
+        Ok(client_result(result))
     }
+}
+
+/// A provider result as every client tool returns one: its text through [`tool_result`] (at
+/// most 80,000 characters, else `truncated` and the standard note; hidden and control
+/// characters escaped), then its images unchanged. `structuredContent` stays raw, or becomes
+/// the note when the result is too long.
+fn client_result(mut result: Value) -> Value {
+    let mut shown = tool_result(result["structuredContent"].take(), &[]);
+    if let (Some(content), Some(provided)) = (
+        shown["content"].as_array_mut(),
+        result["content"].as_array_mut(),
+    ) {
+        content.extend(provided.drain(..).filter(|item| item["type"] == "image"));
+    }
+    shown
 }
 
 /// A preview host's failure keeps its own tag, which the provider result folds into its
 /// message (`"<tag>: <message>"`), and a missing host says how to get one.
 fn host_failure(result: Value) -> Value {
     let error = &result["structuredContent"]["error"];
+    // As every client failure: the message bounded, hidden and control characters replaced.
+    let own = || {
+        typed_tool_failure(
+            error["_tag"]
+                .as_str()
+                .unwrap_or("PreviewAutomationExecutionError"),
+            error["message"].as_str().unwrap_or_default(),
+        )
+    };
     if error["_tag"] != "PreviewAutomationExecutionError" {
-        return result;
+        return own();
     }
     let Some((tag, message)) = error["message"]
         .as_str()
         .and_then(|text| text.split_once(": "))
     else {
-        return result;
+        return own();
     };
     if !(tag.starts_with("PreviewAutomation")
         && tag.ends_with("Error")
         && tag.chars().all(|c| c.is_ascii_alphanumeric()))
     {
-        return result;
+        return own();
     }
     if tag == NO_HOST_TAG {
         typed_tool_failure(tag, &format!("{message} {OPEN_BIBCODE}"))
