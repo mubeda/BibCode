@@ -204,6 +204,9 @@ export const ProjectFileFailure = Schema.Literals([
   "hard_linked",
   // A write failed after emptying the file; `restored` says whether its old content came back.
   "write_failed",
+  // The trash refused an entry and its name was taken meanwhile, so it could not go back: it is
+  // in BiBCode's staging folder, at `stagedAt` under the folder `stagedIn` names.
+  "kept_in_staging",
 ]);
 export type ProjectFileFailure = typeof ProjectFileFailure.Type;
 
@@ -223,6 +226,11 @@ export const ProjectFileOperation = Schema.Literals([
 ]);
 export type ProjectFileOperation = typeof ProjectFileOperation.Type;
 
+// Where an entry kept in BiBCode's staging folder is: the workspace's Git directory, or the
+// server's state directory (for a folder that is no Git repository).
+export const ProjectTrashStagingFolder = Schema.Literals(["git-dir", "state-dir"]);
+export type ProjectTrashStagingFolder = typeof ProjectTrashStagingFolder.Type;
+
 type ProjectFileFailureContext = {
   readonly cwd: string;
   readonly relativePath: string;
@@ -233,6 +241,8 @@ type ProjectFileFailureContext = {
   readonly operationPath?: string;
   readonly leftAt?: string;
   readonly restored?: boolean;
+  readonly stagedAt?: string;
+  readonly stagedIn?: ProjectTrashStagingFolder;
   readonly cause?: unknown;
 };
 
@@ -401,7 +411,8 @@ export const ProjectDeleteEntryInput = Schema.Struct({
   cwd: TrimmedNonEmptyString,
   relativePath: TrimmedNonEmptyString.check(Schema.isMaxLength(PROJECT_ENTRY_PATH_MAX_LENGTH)),
   // Move the entry to the system trash instead of deleting it. Off unless set; a trash that cannot
-  // take it fails with `trash_unavailable` and leaves it in place.
+  // take it fails with `trash_unavailable` and leaves it in place, or with `kept_in_staging` when
+  // its name was taken meanwhile and it stays in BiBCode's staging folder.
   toTrash: Schema.optional(Schema.Boolean),
 });
 export type ProjectDeleteEntryInput = typeof ProjectDeleteEntryInput.Type;
@@ -423,6 +434,9 @@ export class ProjectDeleteEntryError extends Schema.TaggedError<ProjectDeleteEnt
     operationPath: Schema.optional(TrimmedNonEmptyString),
     // With `partially_removed`: the name, in the entry's own folder, where what is left now is.
     leftAt: Schema.optional(TrimmedNonEmptyString),
+    // With `kept_in_staging`: where the entry is, relative to the folder `stagedIn` names.
+    stagedAt: Schema.optional(TrimmedNonEmptyString),
+    stagedIn: Schema.optional(ProjectTrashStagingFolder),
     message: TrimmedNonEmptyString,
     cause: Schema.optional(Schema.Defect()),
   },

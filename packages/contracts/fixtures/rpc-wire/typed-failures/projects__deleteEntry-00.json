@@ -8,9 +8,10 @@
         "_tag": "Fail",
         "error": {
           "_tag": "ProjectDeleteEntryError",
-          "cwd": "U",
-          "relativePath": "�",
-          "message": ".v^Y$Dg7q_"
+          "cwd": "toString",
+          "failure": "trash_unavailable",
+          "resolvedPath": "bT-q?aU%H",
+          "message": "^"
         }
       }
     ]

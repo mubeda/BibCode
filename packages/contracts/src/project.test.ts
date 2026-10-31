@@ -193,6 +193,29 @@ describe("project RPC inputs", () => {
     expect(decoded.failure).toBe("partially_removed");
     expect(decoded.leftAt).toBe(".bibcode-delete-0f3a");
   });
+
+  it("says where a trashed entry that could not go back is kept", () => {
+    const decoded = decodeDeleteError({
+      _tag: "ProjectDeleteEntryError",
+      cwd: "/workspace",
+      relativePath: "a.txt",
+      failure: "kept_in_staging",
+      stagedAt: "bibcode-discard/0f3a/a.txt",
+      stagedIn: "git-dir",
+      message: "The trash could not take a.txt, and it could not be put back.",
+    });
+    expect(decoded.failure).toBe("kept_in_staging");
+    expect(decoded.stagedAt).toBe("bibcode-discard/0f3a/a.txt");
+    expect(decoded.stagedIn).toBe("git-dir");
+    expect(() =>
+      decodeDeleteError({
+        _tag: "ProjectDeleteEntryError",
+        failure: "kept_in_staging",
+        stagedIn: "elsewhere",
+        message: "x",
+      }),
+    ).toThrow();
+  });
 });
 
 describe("project RPC errors", () => {
