@@ -100,7 +100,7 @@ fn text(name: &str) -> Option<(&'static str, Value)> {
             object_schema(json!({ "hostThreadId": host }), &["hostThreadId"]),
         ),
         "send_panel_message" => (
-            "Sends a message from one thread of a worktree to another (a host and its panels, or two panels of one host), and BiBCode shows which thread it came from. It is queued behind a running turn; mode steer asks the running turn to take it now and falls back to queued. With includeLastReply, the source thread's last reply is quoted after text (at most 16000 characters of it). Returns the messageId to pass to wait_for_thread.",
+            "Sends a message from one thread of a worktree to another (a host and its panels, or two panels of one host), and BiBCode shows which thread it came from, so fromThreadId must be a thread you opened or whose latest message you sent. It is queued behind a running turn; mode steer asks the running turn to take it now and falls back to queued. With includeLastReply, the source thread's last reply is quoted after text (at most 16000 characters of it). Returns the messageId to pass to wait_for_thread.",
             object_schema(
                 json!({
                     "fromThreadId": thread,
@@ -295,6 +295,7 @@ impl ToolCall<'_> {
                     "These threads are not in one worktree: a panel message goes between a host thread and its panels, or between two panels of one host. Use send_message for any other thread.",
                 ));
             }
+            self.check_source_is_callers(&source).await?;
             self.check_thread_mode(&target.runtime_mode)?;
             let mut message = text.to_owned();
             if include_last_reply && let Some(quote) = self.last_reply_quote(&source).await? {
@@ -400,6 +401,50 @@ impl ToolCall<'_> {
                 "subscribers": published["subscribers"],
             }),
             &[],
+        ))
+    }
+
+    /// A panel message is labelled with its source, so the calling agent must own that thread:
+    /// it opened it (its `requester`), or it sent the thread's latest user message. Another
+    /// agent's panel, or a person's thread, is refused rather than named as the origin.
+    async fn check_source_is_callers(&self, source: &ProjectionThread) -> Result<(), Value> {
+        let caller = self.principal.principal.session_id.as_str();
+        if source
+            .requester
+            .as_ref()
+            .is_some_and(|requester| requester["actor"]["clientId"] == caller)
+        {
+            return Ok(());
+        }
+        let thread_id = source.thread_id.clone();
+        let last_sender = self
+            .control
+            .repositories()
+            .database()
+            .call(move |connection| {
+                use rusqlite::OptionalExtension;
+                Ok(connection
+                    .query_row(
+                        "SELECT actor_json FROM projection_thread_messages
+                          WHERE thread_id = ? AND role = 'user'
+                          ORDER BY created_at DESC, message_id DESC LIMIT 1",
+                        [thread_id],
+                        |row| row.get::<_, Option<String>>(0),
+                    )
+                    .optional()?
+                    .flatten())
+            })
+            .await
+            .map_err(storage_failure)?;
+        if last_sender
+            .and_then(|actor| serde_json::from_str::<Value>(&actor).ok())
+            .is_some_and(|actor| actor["clientId"] == caller)
+        {
+            return Ok(());
+        }
+        Err(typed_tool_failure(
+            "McpSourceThreadNotOwnedError",
+            "fromThreadId names a thread you did not open and whose latest message you did not send; a panel message can only come from your own thread. Use send_message to write to the thread instead.",
         ))
     }
 
