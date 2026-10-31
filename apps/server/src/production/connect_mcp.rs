@@ -29,7 +29,7 @@ use crate::{
 
 mod device_tools;
 pub use device_tools::DeviceTools;
-use device_tools::device_tool_descriptors;
+pub(crate) use device_tools::device_tool_descriptors;
 
 const RELAY_LINK_PROOF_TYP: &str = "bibcode-env-link+jwt";
 const RELAY_MINT_REQUEST_TYP: &str = "bibcode-cloud-mint+jwt";
@@ -396,9 +396,15 @@ impl ConnectMcpService {
         })
     }
 
-    /// Serves the outside-agent thread tools on `/mcp` too.
+    /// Serves the outside-agent thread tools on `/mcp` too, and lets their preview and device
+    /// twins use this service's preview host and devices.
     #[must_use]
     pub fn with_control(mut self, control: McpControl) -> Self {
+        control.attach_previews(crate::mcp::tools::previews::PreviewServices {
+            environment_id: self.config.environment_id.clone(),
+            invoker: self.preview.clone(),
+            devices: self.devices.clone(),
+        });
         self.control = Some(control);
         self
     }
