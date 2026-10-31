@@ -141,9 +141,22 @@ export function useAgentCommitLabels(environmentId: EnvironmentId): ReadonlyMap<
  * Fails when the server stopped nothing, so the person is not told it worked.
  */
 export async function stopMcpAgent(sessionId: AuthSessionId): Promise<void> {
-  if (!(await stopServerMcpClient(sessionId))) {
+  const answer = await stopServerMcpClient(sessionId);
+  if (!answer.revoked) {
     throw new Error(
       "BiBCode no longer knows this agent. Interrupt its threads from the thread itself.",
+    );
+  }
+  const failed = answer.failed ?? 0;
+  if (failed > 0) {
+    const total = failed + (answer.interrupted ?? 0);
+    throw new Error(
+      `The agent is revoked, but ${failed} of ${total} ${total === 1 ? "turn" : "turns"} could not be interrupted. Stop them from their threads.`,
+    );
+  }
+  if (answer.timedOut === true) {
+    throw new Error(
+      "The agent is revoked, and BiBCode is still interrupting its turns. Check its threads in a moment.",
     );
   }
 }

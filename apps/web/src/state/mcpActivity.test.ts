@@ -9,7 +9,15 @@ vi.mock("@bibcode/client-runtime/state/mcpActivity", () => ({
 vi.mock("./auth", () => ({ authEnvironment: { accessChanges: () => null } }));
 vi.mock("./environments", () => ({ usePrimaryEnvironment: () => null }));
 vi.mock("./query", () => ({ useEnvironmentQuery: () => ({ data: null }) }));
-const stopServerMcpClient = vi.hoisted(() => vi.fn(async (): Promise<boolean> => true));
+interface StopAnswer {
+  revoked: boolean;
+  interrupted?: number;
+  failed?: number;
+  timedOut?: boolean;
+}
+const stopServerMcpClient = vi.hoisted(() =>
+  vi.fn(async (): Promise<StopAnswer> => ({ revoked: true, interrupted: 0, failed: 0 })),
+);
 vi.mock("../environments/primary", () => ({
   revokeServerClientSession: vi.fn(),
   setServerMcpClientAccess: vi.fn(),
@@ -28,12 +36,21 @@ import {
 
 describe("stopMcpAgent", () => {
   it("fails when the server stopped nothing", async () => {
-    stopServerMcpClient.mockResolvedValueOnce(true);
+    stopServerMcpClient.mockResolvedValueOnce({ revoked: true, interrupted: 2, failed: 0 });
     await expect(stopMcpAgent(AuthSessionId.make("s-1"))).resolves.toBeUndefined();
-    stopServerMcpClient.mockResolvedValueOnce(false);
+    stopServerMcpClient.mockResolvedValueOnce({ revoked: false });
     await expect(stopMcpAgent(AuthSessionId.make("s-1"))).rejects.toThrow(
       "BiBCode no longer knows this agent",
     );
+  });
+
+  it("fails when an interrupt failed or did not finish in time", async () => {
+    stopServerMcpClient.mockResolvedValueOnce({ revoked: true, interrupted: 1, failed: 1 });
+    await expect(stopMcpAgent(AuthSessionId.make("s-1"))).rejects.toThrow(
+      "1 of 2 turns could not be interrupted",
+    );
+    stopServerMcpClient.mockResolvedValueOnce({ revoked: true, timedOut: true });
+    await expect(stopMcpAgent(AuthSessionId.make("s-1"))).rejects.toThrow("still interrupting");
   });
 });
 

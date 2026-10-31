@@ -362,6 +362,13 @@ export type AuthPairingOfferCancellationResult = typeof AuthPairingOfferCancella
 
 export const AuthClientSessionRevokeResult = Schema.Struct({
   revoked: Schema.Boolean,
+  /**
+   * With `interruptTurns` (Stop, #139 slice X1): the agent's turns interrupted, those whose
+   * interrupt failed, and whether the interrupts were still running when the server answered.
+   */
+  interrupted: Schema.optionalKey(Schema.Finite),
+  failed: Schema.optionalKey(Schema.Finite),
+  timedOut: Schema.optionalKey(Schema.Boolean),
 });
 export type AuthClientSessionRevokeResult = typeof AuthClientSessionRevokeResult.Type;
 
