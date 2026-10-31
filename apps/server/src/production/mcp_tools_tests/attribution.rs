@@ -561,6 +561,26 @@ async fn take_over_refuses_mutations_stops_owned_work_and_hand_back_restores_the
     );
     let refused = harness.call(&taken, "start_thread", basic_start()).await;
     assert_eq!(error_tag(&refused), "McpAccessCeilingError");
+    // The refusal names the take over, not Agents may, which a person did not change.
+    assert_eq!(
+        refused["structuredContent"]["error"]["message"],
+        "A person took over this agent; it is read-only until they hand it back."
+    );
+    // While Agents may is itself read-only, handing back would not help: it names Agents may.
+    harness
+        .settings
+        .send_modify(|settings| settings.access = McpAccess::ReadOnly);
+    let refused = harness.call(&taken, "start_thread", basic_start()).await;
+    assert!(
+        refused["structuredContent"]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Agents may"),
+        "{refused}"
+    );
+    harness
+        .settings
+        .send_modify(|settings| settings.access = McpAccess::FullAccess);
     let view = harness
         .auth
         .list_clients("person")

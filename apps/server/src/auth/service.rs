@@ -454,6 +454,8 @@ pub(crate) struct McpClientCredential {
     pub(crate) principal: Principal,
     pub(crate) access: Option<String>,
     pub(crate) resource: Option<String>,
+    /// A person took this agent over: its read-only access is theirs until Hand back.
+    pub(crate) taken_over: bool,
 }
 
 /// The tokens of a remote MCP grant, as the token endpoint returns them.
@@ -1034,7 +1036,7 @@ impl AuthService {
         &self,
         token: &str,
     ) -> Result<McpClientCredential, AuthError> {
-        let (principal, access, resource) = self
+        let (principal, access, resource, taken_over) = self
             .authenticate_session_token_with_resource(token, SessionTransport::Plain)
             .await?;
         if principal.subject != MCP_CLIENT_SUBJECT {
@@ -1044,6 +1046,7 @@ impl AuthService {
             principal,
             access,
             resource,
+            taken_over,
         })
     }
 
@@ -1052,7 +1055,7 @@ impl AuthService {
         token: &str,
         surface: SessionTransport,
     ) -> Result<(Principal, Option<String>), AuthError> {
-        let (principal, access, _) = self
+        let (principal, access, _, _) = self
             .authenticate_session_token_with_resource(token, surface)
             .await?;
         Ok((principal, access))
@@ -1062,7 +1065,7 @@ impl AuthService {
         &self,
         token: &str,
         surface: SessionTransport,
-    ) -> Result<(Principal, Option<String>, Option<String>), AuthError> {
+    ) -> Result<(Principal, Option<String>, Option<String>, bool), AuthError> {
         let claims: SessionClaims = self
             .signer
             .verify(token)
@@ -1105,6 +1108,7 @@ impl AuthService {
         }
         let access = record.mcp_access.clone();
         let resource = record.mcp_resource.clone();
+        let taken_over = record.mcp_access_hand_back.is_some();
         Ok((
             Principal {
                 session_id: claims.sid,
@@ -1116,6 +1120,7 @@ impl AuthService {
             },
             access,
             resource,
+            taken_over,
         ))
     }
 

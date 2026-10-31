@@ -506,6 +506,8 @@ pub struct ClientPrincipal {
     /// The resource (`<origin>/mcp`) a remote OAuth grant is bound to (slice R); `None` for
     /// the relay's and `bibcode thread`'s sessions, which reach this server directly.
     pub resource: Option<String>,
+    /// A person took this agent over (Take over); Hand back restores its ceiling.
+    pub taken_over: bool,
 }
 
 /// Progress notifications for one `tools/call`, sent on its own response stream.
@@ -696,6 +698,18 @@ impl McpControl {
             principal: credential.principal,
             ceiling,
             resource: credential.resource,
+            taken_over: credential.taken_over,
+        })
+    }
+
+    /// The refusal of a mutation while a person has taken this agent over, when Hand back
+    /// would lift it: Agents may above read-only. `None` otherwise, for the Agents may wording.
+    fn taken_over_refusal(&self, principal: &ClientPrincipal) -> Option<Value> {
+        (principal.taken_over && self.settings().access > McpAccess::ReadOnly).then(|| {
+            typed_tool_failure(
+                "McpAccessCeilingError",
+                "A person took over this agent; it is read-only until they hand it back.",
+            )
         })
     }
 
@@ -790,10 +804,12 @@ impl McpControl {
             );
         }
         if !spec.read_only && self.effective_ceiling(principal) == McpAccess::ReadOnly {
-            return typed_tool_failure(
-                "McpAccessCeilingError",
-                "This MCP connection is read-only (Settings → Agents → Agent integrations → Agents may).",
-            );
+            return self.taken_over_refusal(principal).unwrap_or_else(|| {
+                typed_tool_failure(
+                    "McpAccessCeilingError",
+                    "This MCP connection is read-only (Settings → Agents → Agent integrations → Agents may).",
+                )
+            });
         }
         let _admission = match self.admit(&principal.principal.session_id, spec.holds_wait_slot) {
             Ok(admission) => admission,
@@ -1144,6 +1160,9 @@ impl ToolCall<'_> {
     pub(crate) fn check_thread_mode(&self, runtime_mode: &str) -> Result<(), Value> {
         let ceiling = self.control.effective_ceiling(self.principal);
         if McpAccess::of_runtime_mode(runtime_mode) > ceiling {
+            if let Some(refusal) = self.control.taken_over_refusal(self.principal) {
+                return Err(refusal);
+            }
             return Err(typed_tool_failure(
                 "McpAccessCeilingError",
                 &format!(
