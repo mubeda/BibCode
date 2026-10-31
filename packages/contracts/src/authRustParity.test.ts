@@ -27,6 +27,8 @@ import {
   AuthPairingLink,
   AuthRevokeClientSessionInput,
   AuthSetMcpAccessInput,
+  AuthApproveMcpAuthorizationInput,
+  AuthDenyMcpAuthorizationInput,
   AuthRevokePairingLinkInput,
   AuthSessionState,
   AuthStandardClientScopes,
@@ -36,6 +38,7 @@ import {
 import {
   AuthClientSessionRevokeResult,
   AuthMcpAccessResult,
+  AuthMcpAuthorizationDecisionResult,
   AuthOtherClientSessionsRevokeResult,
   AuthPairingOfferCancellationResult,
   AuthPairingLinkRevokeResult,
@@ -156,6 +159,22 @@ const authRouteContract = [
     name: "setMcpAccess",
     method: "POST",
     path: "/api/auth/clients/mcp-access",
+    requestContentTypes: ["application/json"],
+    successStatuses: [200],
+    errorStatuses: [400, 401, 403, 500],
+  },
+  {
+    name: "approveMcpAuthorization",
+    method: "POST",
+    path: "/api/auth/mcp-authorizations/approve",
+    requestContentTypes: ["application/json"],
+    successStatuses: [200],
+    errorStatuses: [400, 401, 403, 500],
+  },
+  {
+    name: "denyMcpAuthorization",
+    method: "POST",
+    path: "/api/auth/mcp-authorizations/deny",
     requestContentTypes: ["application/json"],
     successStatuses: [200],
     errorStatuses: [400, 401, 403, 500],
@@ -341,6 +360,9 @@ const namedSchemas = {
   AuthClientSessionList,
   AuthClientSessionRevokeResult,
   AuthMcpAccessResult,
+  AuthApproveMcpAuthorizationInput,
+  AuthDenyMcpAuthorizationInput,
+  AuthMcpAuthorizationDecisionResult,
   AuthCancelPairingOfferInput,
   AuthCreatePairingCredentialInput,
   AuthCreatePairingOfferInput,
@@ -429,6 +451,14 @@ const expectedSamples = {
     request: "requests/client-mcp-access.json",
     success: "responses/client-mcp-access.json",
   },
+  approveMcpAuthorization: {
+    request: "requests/mcp-authorization-approve.json",
+    success: "responses/mcp-authorization-approve.json",
+  },
+  denyMcpAuthorization: {
+    request: "requests/mcp-authorization-deny.json",
+    success: "responses/mcp-authorization-deny.json",
+  },
   revokeOtherClients: { success: "responses/client-revoke-others.json" },
 } as const;
 
@@ -441,6 +471,8 @@ const expectedFixtures = [
   "requests/browser-session.json",
   "requests/client-mcp-access.json",
   "requests/client-revoke.json",
+  "requests/mcp-authorization-approve.json",
+  "requests/mcp-authorization-deny.json",
   "requests/pairing-create.json",
   "requests/pairing-offer-cancel.json",
   "requests/pairing-offer.json",
@@ -451,6 +483,8 @@ const expectedFixtures = [
   "responses/client-mcp-access.json",
   "responses/client-revoke-others.json",
   "responses/client-revoke.json",
+  "responses/mcp-authorization-approve.json",
+  "responses/mcp-authorization-deny.json",
   "responses/pairing-create.json",
   "responses/pairing-list.json",
   "responses/pairing-offer-cancel.json",
@@ -479,6 +513,22 @@ const fixtureDecoders = new Map<string, (value: unknown) => unknown>([
   [
     "responses/client-mcp-access.json",
     Schema.decodeUnknownSync(Schema.toCodecJson(AuthMcpAccessResult)),
+  ],
+  [
+    "requests/mcp-authorization-approve.json",
+    Schema.decodeUnknownSync(Schema.toCodecJson(AuthApproveMcpAuthorizationInput)),
+  ],
+  [
+    "requests/mcp-authorization-deny.json",
+    Schema.decodeUnknownSync(Schema.toCodecJson(AuthDenyMcpAuthorizationInput)),
+  ],
+  [
+    "responses/mcp-authorization-approve.json",
+    Schema.decodeUnknownSync(Schema.toCodecJson(AuthMcpAuthorizationDecisionResult)),
+  ],
+  [
+    "responses/mcp-authorization-deny.json",
+    Schema.decodeUnknownSync(Schema.toCodecJson(AuthMcpAuthorizationDecisionResult)),
   ],
   [
     "requests/pairing-create.json",
@@ -583,7 +633,7 @@ describe("Rust auth HTTP fixture parity", () => {
     const manifest = JSON.parse(NodeFS.readFileSync(manifestPath, "utf8")) as Manifest;
     expect(manifest.formatVersion).toBe(1);
     expect(manifest.routes).toEqual(currentRoutes());
-    expect(manifest.routes).toHaveLength(14);
+    expect(manifest.routes).toHaveLength(16);
     expect(
       manifest.routes.map(({ name, method, path, requestContentTypes, successes, errors }) => ({
         name,
